@@ -389,9 +389,12 @@ impl std::fmt::Display for CgroupPath {
 
 /// Host-side BPF map write performed during VM execution.
 ///
-/// The write is event-driven: the host polls for BPF map discoverability
-/// (scheduler loaded), then polls the SHM ring for scenario start, then
-/// writes.
+/// Applied by the host thread `freeze_coord::start_bpf_map_write` in three
+/// phases: build the guest-memory BPF-map accessor, resolve the `field`
+/// NAME to a byte offset via the target map's program BTF, then write.
+/// After the writes the host pushes `SIGNAL_BPF_WRITE_DONE` through
+/// virtio-console (`host_comms::request_bpf_map_write_done`) so a guest
+/// scenario gated on `Ctx::wait_for_map_write` unblocks.
 ///
 /// Construct with [`BpfMapWrite::new`], which const-asserts the
 /// `map_name_suffix` format at compile time. Direct struct-literal
@@ -400,7 +403,7 @@ impl std::fmt::Display for CgroupPath {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BpfMapWrite {
     map_name_suffix: &'static str,
-    offset: usize,
+    field: &'static str,
     value: u32,
 }
 
@@ -421,7 +424,15 @@ impl BpfMapWrite {
     ///   non-printable / control byte (no real BPF map name carries
     ///   those characters; NULL would truncate libbpf C-string
     ///   comparison)
-    pub const fn new(map_name_suffix: &'static str, offset: usize, value: u32) -> Self {
+    /// - `field` is empty (it names the VAR to write — a bare `.bss`/`.data`
+    ///   global like `"crash"`, or a dot-path into the value struct; the
+    ///   byte offset is resolved from the map's BTF value type at write
+    ///   time, so a raw offset can never land in struct padding)
+    /// - `field` starts or ends with `.`, or contains `..` (an empty
+    ///   path segment the BTF resolver could never match)
+    /// - `field` contains whitespace, `/`, `\`, or any non-printable /
+    ///   control byte (no real BTF VAR name carries those characters)
+    pub const fn new(map_name_suffix: &'static str, field: &'static str, value: u32) -> Self {
         let bytes = map_name_suffix.as_bytes();
         assert!(
             !bytes.is_empty(),
@@ -456,9 +467,45 @@ impl BpfMapWrite {
             );
             i += 1;
         }
+        // `field` names a VAR in the map's BTF value type — a bare global
+        // like `crash`, or a dot-path into the value struct
+        // (`sys_stat.avg_lat_cri`); the write-time resolver
+        // (`resolve_map_field_offset_width`) maps it to a byte offset. Mirror
+        // the WatchBpfMap::field gate (both feed the same resolver): non-empty,
+        // printable ASCII, no whitespace, no path separators. `.` IS allowed
+        // but must separate non-empty segments, so reject a leading / trailing
+        // / doubled `.` — an empty segment the resolver could never match. No
+        // leading-`.` section rule here (a VAR path is not a section name).
+        let fb = field.as_bytes();
+        assert!(!fb.is_empty(), "BpfMapWrite field must not be empty");
+        assert!(
+            fb[0] != b'.' && fb[fb.len() - 1] != b'.',
+            "BpfMapWrite field must not start or end with `.` (empty path segment)",
+        );
+        let mut j = 0;
+        while j < fb.len() {
+            let b = fb[j];
+            assert!(
+                b != b' ' && b != b'\t' && b != b'\n' && b != b'\r',
+                "BpfMapWrite field must not contain whitespace",
+            );
+            assert!(
+                b != b'/' && b != b'\\',
+                "BpfMapWrite field must not contain path separators",
+            );
+            assert!(
+                !(b == b'.' && j > 0 && fb[j - 1] == b'.'),
+                "BpfMapWrite field must not contain `..` (empty path segment)",
+            );
+            assert!(
+                b >= 0x20 && b < 0x7f,
+                "BpfMapWrite field must be printable ASCII only (no control bytes / NULL / high-bit chars)",
+            );
+            j += 1;
+        }
         Self {
             map_name_suffix,
-            offset,
+            field,
             value,
         }
     }
@@ -469,14 +516,222 @@ impl BpfMapWrite {
         self.map_name_suffix
     }
 
-    /// Byte offset within the map's value region.
-    pub const fn offset(&self) -> usize {
-        self.offset
+    /// The field to write within the matched map's value region: a bare
+    /// BTF VAR name (e.g. `"crash"`) or a dot-path into the value struct
+    /// (e.g. `"sys_stat.avg_lat_cri"`). The byte offset is resolved from
+    /// the map's BTF value type at write time.
+    pub const fn field(&self) -> &'static str {
+        self.field
     }
 
-    /// u32 value to write at `offset` inside the matched map.
+    /// u32 value to write into `field` inside the matched map.
     pub const fn value(&self) -> u32 {
         self.value
+    }
+}
+
+/// Aggregation for a [`WatchBpfMap`] target.
+///
+/// Picks how a watched field's per-tick reads collapse into run-level
+/// metric key(s). Choose by the field's semantic class: a GAUGE (a current
+/// level — fold as the mean) vs a monotonic COUNTER (an accumulating total —
+/// fold as the final value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BpfMapAgg {
+    /// A single scalar GAUGE field (e.g. a `.bss` global struct member like
+    /// `sys_stat.avg_lat_cri` — a current level such as latency-criticality
+    /// or headroom). Emits ONE metric key (`<prefix>_<label>`), folded as the
+    /// mean over the run's reporting samples. For a monotonic counter use
+    /// [`BpfMapAgg::ScalarCounter`] instead — a rising counter mean-folded
+    /// here reports a window-average below its final total.
+    Scalar,
+    /// A single scalar monotonic COUNTER field (e.g. a `.bss` global like
+    /// `ktstr_alloc_count` bumped via `__sync_fetch_and_add`). Emits ONE
+    /// metric key (`<prefix>_<label>`), folded as the value at the LAST
+    /// reporting sample — the accumulated total at the end of the monitoring
+    /// window, which is the meaningful count (not the mean of a rising
+    /// series).
+    ScalarCounter,
+    /// A per-CPU array field (a `BPF_MAP_TYPE_PERCPU_ARRAY` value member,
+    /// e.g. `cpu_ctx_stor.lat_headroom`). Emits TWO metric keys: the
+    /// cross-CPU mean (`<prefix>_<label>_avg`) and the cross-CPU spatial
+    /// max (`<prefix>_<label>_max`), each folded over the run's reporting
+    /// samples. The divisor is the count of CPUs that reported a value,
+    /// never the topology CPU count.
+    PerCpu,
+    /// A per-CPU array field that is a monotonic COUNTER (each CPU's slot
+    /// rises independently, e.g. a `BPF_MAP_TYPE_PERCPU_ARRAY` per-CPU event
+    /// tally). Emits ONE metric key (`<prefix>_<label>`), folded as the
+    /// CROSS-CPU SUM at the LAST reporting sample — the accumulated total
+    /// across all (reporting) CPUs at the end of the monitoring window, and
+    /// SUM-folded across runs like [`BpfMapAgg::ScalarCounter`]. Watch at u64
+    /// width: a too-narrow width truncates each per-CPU slot before the sum.
+    /// An offline CPU's accumulated count is excluded (only CPUs whose per-CPU
+    /// page is readable contribute). Use this for a rising per-CPU counter;
+    /// [`BpfMapAgg::PerCpu`] mean/max-folds (a gauge) and
+    /// [`BpfMapAgg::ScalarCounter`] is for a single scalar, not a per-CPU array.
+    PerCpuCounter,
+}
+
+/// Host-side, observer-effect-free read of a NAMED scheduler BPF-map field,
+/// surfaced as an assertable run-level metric.
+///
+/// The free-running host monitor resolves the field once (lazily, after the
+/// scheduler attaches and its maps appear) via BTF, then reads it each
+/// monitor tick WITHOUT freezing the guest — turning "the scheduler computed
+/// X" into an assertable metric. Read via
+/// [`crate::vmm::result::VmResult::run_metric`] under the key
+/// `<scheduler-obj>_<label>` (scalar, scalar-counter, or per-CPU-counter) or
+/// `<scheduler-obj>_<label>_{avg,max}` (per-CPU gauge), e.g.
+/// `scx_lavd_avg_lat_cri`, `scx_lavd_lat_headroom_avg`.
+/// `<scheduler-obj>` is libbpf's object name for the active scheduler, which
+/// can differ from its source / ops name (e.g. scx-ktstr's object is
+/// `bpf_bpf`). Each target's `label` must be unique within a test: duplicate
+/// labels resolve to one metric key and are rejected at VM build time.
+///
+/// Construct with [`WatchBpfMap::new`], which const-asserts the field
+/// formats at compile time. Direct struct-literal construction is rejected
+/// (fields are crate-private) so every constructed value passes the gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WatchBpfMap {
+    map_name_suffix: &'static str,
+    field: &'static str,
+    agg: BpfMapAgg,
+    label: &'static str,
+}
+
+impl WatchBpfMap {
+    /// Const constructor for use in `static`/`const` context.
+    ///
+    /// `map_name_suffix` matches a loaded BPF map by `ends_with` (kernel map
+    /// names truncate to 15 bytes). Unlike [`BpfMapWrite::new`] it does NOT
+    /// require a leading `.`: a watched map may be a section map (`.bss`)
+    /// OR a named map (`cpu_ctx_stor`). `field` is a dot-path into the map's
+    /// value type (`sys_stat.avg_lat_cri`, or a bare `lat_headroom`).
+    /// `label` is the metric-key leaf appended to the scheduler-obj prefix.
+    ///
+    /// # Panics
+    ///
+    /// Panics at compile time when any of `map_name_suffix` / `field` /
+    /// `label` is empty or carries whitespace, a path separator (`/`, `\`),
+    /// or a non-printable / control / high-bit byte. Additionally `field`
+    /// may not have a leading/trailing `.` or a doubled `..` (an empty path
+    /// segment the resolver could never match), and `label` may not contain
+    /// `.` at all (it is a single metric-key leaf, not a path).
+    pub const fn new(
+        map_name_suffix: &'static str,
+        field: &'static str,
+        agg: BpfMapAgg,
+        label: &'static str,
+    ) -> Self {
+        // map_name_suffix: non-empty, printable, no whitespace / separators.
+        // No leading-`.` requirement (matches both `.bss` and `cpu_ctx_stor`).
+        let s = map_name_suffix.as_bytes();
+        assert!(
+            !s.is_empty(),
+            "WatchBpfMap map_name_suffix must not be empty"
+        );
+        let mut i = 0;
+        while i < s.len() {
+            let b = s[i];
+            assert!(
+                b != b' ' && b != b'\t' && b != b'\n' && b != b'\r',
+                "WatchBpfMap map_name_suffix must not contain whitespace",
+            );
+            assert!(
+                b != b'/' && b != b'\\',
+                "WatchBpfMap map_name_suffix must not contain path separators",
+            );
+            assert!(
+                b >= 0x20 && b < 0x7f,
+                "WatchBpfMap map_name_suffix must be printable ASCII only",
+            );
+            i += 1;
+        }
+        // field: non-empty, printable, no whitespace / separators. `.` IS
+        // allowed (dot-path into the value struct) but must separate non-empty
+        // segments — a leading / trailing / doubled `.` is an empty segment
+        // the resolver could never match, so reject it at compile time.
+        let f = field.as_bytes();
+        assert!(!f.is_empty(), "WatchBpfMap field must not be empty");
+        assert!(
+            f[0] != b'.' && f[f.len() - 1] != b'.',
+            "WatchBpfMap field must not start or end with `.` (empty path segment)",
+        );
+        let mut i = 0;
+        while i < f.len() {
+            let b = f[i];
+            assert!(
+                b != b' ' && b != b'\t' && b != b'\n' && b != b'\r',
+                "WatchBpfMap field must not contain whitespace",
+            );
+            assert!(
+                b != b'/' && b != b'\\',
+                "WatchBpfMap field must not contain path separators",
+            );
+            assert!(
+                !(b == b'.' && i > 0 && f[i - 1] == b'.'),
+                "WatchBpfMap field must not contain `..` (empty path segment)",
+            );
+            assert!(
+                b >= 0x20 && b < 0x7f,
+                "WatchBpfMap field must be printable ASCII only",
+            );
+            i += 1;
+        }
+        // label: non-empty, printable, no whitespace / separators / dots
+        // (it is a single metric-key leaf).
+        let l = label.as_bytes();
+        assert!(!l.is_empty(), "WatchBpfMap label must not be empty");
+        let mut i = 0;
+        while i < l.len() {
+            let b = l[i];
+            assert!(
+                b != b' ' && b != b'\t' && b != b'\n' && b != b'\r',
+                "WatchBpfMap label must not contain whitespace",
+            );
+            assert!(
+                b != b'/' && b != b'\\',
+                "WatchBpfMap label must not contain path separators",
+            );
+            assert!(
+                b != b'.',
+                "WatchBpfMap label is a single metric-key leaf and must not contain `.`",
+            );
+            assert!(
+                b >= 0x20 && b < 0x7f,
+                "WatchBpfMap label must be printable ASCII only",
+            );
+            i += 1;
+        }
+        Self {
+            map_name_suffix,
+            field,
+            agg,
+            label,
+        }
+    }
+
+    /// The validated map-name suffix to match (via `ends_with`) against
+    /// loaded BPF maps (e.g. `".bss"`, `"cpu_ctx_stor"`).
+    pub const fn map_name_suffix(&self) -> &'static str {
+        self.map_name_suffix
+    }
+
+    /// The dot-path into the map's value type
+    /// (e.g. `"sys_stat.avg_lat_cri"` or `"lat_headroom"`).
+    pub const fn field(&self) -> &'static str {
+        self.field
+    }
+
+    /// How the per-tick reads aggregate into run-level metric key(s).
+    pub const fn agg(&self) -> BpfMapAgg {
+        self.agg
+    }
+
+    /// The metric-key leaf appended to the scheduler-obj prefix.
+    pub const fn label(&self) -> &'static str {
+        self.label
     }
 }
 
@@ -1292,14 +1547,29 @@ pub struct KtstrTestEntry {
     pub watchdog_timeout: Duration,
     /// Host-side BPF map writes to perform during VM execution.
     ///
-    /// Empty slice (the default) means "no writes." Setup failures
-    /// (accessor init, map resolution, probes-ready wait) abort before
-    /// any writes are attempted. Within the write phase itself, every
-    /// entry is attempted; individual write failures are logged but do
-    /// not abort remaining writes — partial success suppresses the
-    /// final signal to the guest so it times out rather than observing
-    /// half-applied state.
+    /// Empty slice (the default) means "no writes." The host thread
+    /// (`freeze_coord::start_bpf_map_write`) runs three phases: (1) build
+    /// the guest-memory BPF-map accessor once the kernel page tables are
+    /// up; (2) resolve every entry's `field` NAME to a byte offset + width
+    /// from the target map's program BTF; (3) write each resolved entry.
+    /// A phase-1/2 failure (accessor init, or a field that never resolves
+    /// within the deadline) aborts before phase 3 without signalling the
+    /// guest, which self-unblocks on its own `wait_for_map_write` timeout.
+    /// In phase 3 every resolved entry is attempted — a field whose width
+    /// is not the 4 bytes the `u32` value stores is skipped (logged), and
+    /// a failed write is logged — then `SIGNAL_BPF_WRITE_DONE` is pushed
+    /// to the guest UNCONDITIONALLY after the loop, so a skipped or failed
+    /// entry still unblocks the guest rather than leaving it to time out.
     pub bpf_map_write: &'static [&'static BpfMapWrite],
+    /// Named scheduler BPF-map fields to read observer-effect-free into
+    /// assertable run-level metrics. The free-running host monitor resolves
+    /// each [`WatchBpfMap`] lazily (after the scheduler attaches and its maps
+    /// appear) and reads it each tick without freezing the guest; the value
+    /// is folded run-level and exposed via
+    /// [`crate::vmm::result::VmResult::run_metric`] under
+    /// `<scheduler-obj>_<label>` (scalar/scalar-counter/per-CPU-counter) or
+    /// `_<label>_{avg,max}` (per-CPU gauge).
+    pub watch_bpf_maps: &'static [&'static WatchBpfMap],
     /// Pin vCPU threads to host cores matching the virtual topology's LLC
     /// structure, use 2MB hugepages for guest memory, NUMA mbind guest
     /// memory to pinned vCPU nodes, and promote vCPU threads to
@@ -1318,6 +1588,13 @@ pub struct KtstrTestEntry {
     /// available. The four host-side optimizations (vCPU pinning,
     /// hugepages, NUMA mbind, RT scheduling) apply.
     pub performance_mode: bool,
+    /// Enable the virtio-PCI transport: a host bridge at `00:00.0`
+    /// plus the PCI0 ECAM/CAM config-access windows. When `false`, no
+    /// PCI host bridge is exposed and the guest cmdline carries
+    /// `pci=off`. Surfaced by `#[ktstr_test(pci)]`; named to match the
+    /// attribute and the bare-bool-field convention (`host_only`,
+    /// `auto_repro`).
+    pub pci: bool,
     /// Decouple virtual topology from host hardware. When set:
     ///
     /// - The VM's virtual topology (`numa_nodes`, `llcs`, `cores`,
@@ -1349,6 +1626,32 @@ pub struct KtstrTestEntry {
     /// When true, the test expects run_ktstr_test to return Err.
     /// Disables auto_repro (no point probing a deliberately failing test).
     pub expect_err: bool,
+    /// When true, assert the scx scheduler SURVIVES the run — it must NOT
+    /// die or get ejected during any hold. The positive inverse of
+    /// [`Self::expect_err`].
+    ///
+    /// Survival is otherwise IMPLICIT: a scheduler that dies during a hold
+    /// records a `DetailKind::Scheduler*` fail via the scenario liveness
+    /// probe (`crate::scenario::ops` `build_sched_died_*`), which already
+    /// fails the run through the failure→Err→EXIT_FAIL path. Setting this
+    /// flag makes the intent explicit in source and attaches a survival-
+    /// specific failure explainer that names the asserted intent. It is
+    /// enforced for EVERY scenario: those driven through
+    /// `execute_defs`/`execute_steps`/`execute_scenario` re-check liveness
+    /// between steps and inside every hold, and a guest-side post-function
+    /// probe (`enforce_survives_storm_liveness`) re-checks once more after the
+    /// test function returns — so even a scenario that hand-rolls `Op`
+    /// dispatch without an `execute_*` driver actively fails if the scheduler
+    /// died or went down (scx state `disabling`/`disabled`) during the run.
+    ///
+    /// Mutually exclusive with both [`Self::expect_err`] (one demands
+    /// failure, the other survival) and [`Self::expect_auto_repro`] (both
+    /// invert the scheduler-death-fail signal — survives_storm forces it to
+    /// EXIT_FAIL, expect_auto_repro inverts a crash-with-repro fail to
+    /// PASS), and requires an active scheduler
+    /// ([`SchedulerSpec::has_active_scheduling`]); all three are rejected by
+    /// `validate`.
+    pub survives_storm: bool,
     /// When true, a terminal Inconclusive verdict (e.g. zero-denominator
     /// ratio gate that couldn't evaluate) routes to EXIT_PASS instead
     /// of EXIT_INCONCLUSIVE at the dispatch layer. The test process
@@ -1430,15 +1733,17 @@ pub struct KtstrTestEntry {
     /// with `host_only`: `validate` rejects the combination because
     /// `host_only` skips the VM boot that owns the disk lifecycle.
     pub disk: Option<crate::vmm::disk_config::DiskConfig>,
-    /// Optional virtio-net device attached to the VM (in-VMM loopback
-    /// backend). `None` (the default) boots without a NIC; `Some(cfg)`
-    /// calls `crate::vmm::KtstrVmBuilder::network` in
-    /// `crate::test_support::runtime::build_vm_builder_base`. Surfaced by
-    /// `#[ktstr_test(network = PATH)]`, `with_network`, or direct
-    /// construction. Mutually exclusive with `host_only`: `validate`
-    /// rejects the combination because `host_only` skips the VM boot that
-    /// owns the virtio-net device.
-    pub network: Option<crate::vmm::net_config::NetConfig>,
+    /// virtio-net devices attached to the VM (in-VMM loopback backend),
+    /// one per element. Empty (the default) boots without a NIC; each
+    /// element calls `crate::vmm::KtstrVmBuilder::network` in
+    /// `crate::test_support::runtime::build_vm_builder_base`. On x86_64
+    /// every element gets its own virtio-pci function (PCI slots 1..=N,
+    /// one INTx GSI apiece); aarch64 takes a single virtio-MMIO NIC (build()
+    /// errors on more than one). Surfaced by `#[ktstr_test(networks = [PATH, ...])]`,
+    /// `with_networks`, or direct construction. Mutually exclusive with
+    /// `host_only`: `validate` rejects a non-empty list because `host_only`
+    /// skips the VM boot that owns the virtio-net devices.
+    pub networks: &'static [crate::vmm::net_config::NetConfig],
     /// Host-side callback invoked after `vm.run()` returns, with
     /// access to the full `VmResult`. Runs on the HOST, not inside
     /// the guest. Use for assertions that need host-side state
@@ -1538,21 +1843,32 @@ pub struct KtstrTestEntry {
     /// one slot.
     pub post_vm_unconditional: Option<super::PostVmCallback>,
     /// Periodic snapshot count: when non-zero, the freeze
-    /// coordinator divides the 10%–90% slice of the workload
-    /// duration (anchored at the FIRST `MSG_TYPE_SCENARIO_START`
-    /// the coordinator observes) into `num_snapshots + 1` equal
-    /// intervals and fires a host-side `freeze_and_capture(false)`
-    /// at each of the `num_snapshots` interior boundaries —
-    /// e.g. `N = 1` lands a single capture at the workload's
-    /// midpoint (`start + 0.5·d`); `N = 3` lands captures at
-    /// `start + 0.3·d`, `start + 0.5·d`, `start + 0.7·d`. No
-    /// boundary lands at exactly `start + 0.1·d` or
-    /// `start + 0.9·d` — the buffers reserve those edges for
-    /// workload ramp-up / ramp-down. Each boundary is stored
-    /// under `"periodic_NNN"` (zero-padded 3-digit index) on the
-    /// host's [`crate::scenario::snapshot::SnapshotBridge`].
-    /// Anchoring at ScenarioStart means boot + verifier time do
-    /// not eat the budget. Pauses observed via
+    /// coordinator divides the 10 %–90 % slice of the capturable
+    /// window into `num_snapshots + 1` equal intervals and fires a
+    /// host-side
+    /// `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })`
+    /// at each of the
+    /// `num_snapshots` interior boundaries — e.g. `N = 1` lands a
+    /// single capture at the window midpoint; `N = 3` lands at
+    /// 0.3 / 0.5 / 0.7 of the window. No boundary lands at exactly
+    /// the 0.1 / 0.9 edges — the buffers reserve those for workload
+    /// ramp-up / ramp-down. Each boundary is stored under
+    /// `"periodic_NNN"` (zero-padded 3-digit index) on the host's
+    /// [`crate::scenario::snapshot::SnapshotBridge`]. The window is
+    /// `[max(scenario_start, prereqs_ready), scenario_start +
+    /// duration]`: the start floats to the prereq-ready moment
+    /// (kaslr + BPF-accessor attach) so cold-boot latency cannot
+    /// strand boundaries pre-ready, and the end is CLAMPED to the
+    /// workload end so captures never spill into post-workload
+    /// idle. On a WARM boot the start equals `scenario_start`, so
+    /// the window is the full `[start, start + d]` and the fractions
+    /// above apply as documented (`start + 0.3·d` etc., modulo
+    /// integer-ns truncation); on a COLD boot the
+    /// window starts later and is shorter, so the landings shift —
+    /// cross-run compares of the window-averaged keys
+    /// `avg_cpu_util_comp_scale` / `avg_task_lat_cri` should use
+    /// `--noise-adjust`. Boot + verifier time before ScenarioStart
+    /// does not eat the budget. Pauses observed via
     /// `MSG_TYPE_SCENARIO_PAUSE` / `MSG_TYPE_SCENARIO_RESUME` shift
     /// every un-fired boundary by the cumulative pause duration —
     /// the boundary clock is workload-time, not wall-clock, so a
@@ -1562,7 +1878,9 @@ pub struct KtstrTestEntry {
     /// boundary timestamps.
     ///
     /// **Capture cost.** Each periodic boundary fires the same
-    /// host-side `freeze_and_capture(false)` path that
+    /// host-side
+    /// `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })`
+    /// path that
     /// [`crate::scenario::ops::Op::CaptureSnapshot`] dispatches: every
     /// vCPU is parked under `FREEZE_RENDEZVOUS_TIMEOUT` (30 s
     /// hard ceiling), BPF maps are walked, the dump is serialised
@@ -1732,17 +2050,20 @@ impl KtstrTestEntry {
         extra_sched_args: &[],
         watchdog_timeout: Duration::from_secs(5),
         bpf_map_write: &[],
+        watch_bpf_maps: &[],
         performance_mode: false,
+        pci: false,
         no_perf_mode: false,
         duration: Duration::from_secs(12),
         expect_err: false,
+        survives_storm: false,
         allow_inconclusive: false,
         host_only: false,
         extra_include_files: &[],
         cleanup_budget: None,
         config_content: None,
         disk: None,
-        network: None,
+        networks: &[],
         post_vm: None,
         post_vm_unconditional: None,
         num_snapshots: 0,
@@ -1948,6 +2269,13 @@ impl KtstrTestEntry {
         self
     }
 
+    /// Override `watch_bpf_maps`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_watch_bpf_maps(mut self, watch_bpf_maps: &'static [&'static WatchBpfMap]) -> Self {
+        self.watch_bpf_maps = watch_bpf_maps;
+        self
+    }
+
     /// Override `performance_mode`.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn with_performance_mode(mut self, performance_mode: bool) -> Self {
@@ -1973,6 +2301,13 @@ impl KtstrTestEntry {
     #[must_use = "builder methods consume self; bind the result"]
     pub fn with_expect_err(mut self, expect_err: bool) -> Self {
         self.expect_err = expect_err;
+        self
+    }
+
+    /// Override [`Self::survives_storm`].
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_survives_storm(mut self, survives_storm: bool) -> Self {
+        self.survives_storm = survives_storm;
         self
     }
 
@@ -2043,22 +2378,22 @@ impl KtstrTestEntry {
         self
     }
 
-    /// Override `network`.
+    /// Override `networks` (one virtio-net device per element).
     ///
     /// Pairs with the `host_only = false` requirement enforced by
-    /// [`Self::validate`] — `host_only = true` with a `Some(..)` network
+    /// [`Self::validate`] — `host_only = true` with a non-empty list
     /// is rejected because host-only skips the VM boot that owns the
-    /// virtio-net device.
+    /// virtio-net devices.
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn with_network(mut self, network: crate::vmm::net_config::NetConfig) -> Self {
-        self.network = Some(network);
+    pub fn with_networks(mut self, networks: &'static [crate::vmm::net_config::NetConfig]) -> Self {
+        self.networks = networks;
         self
     }
 
-    /// Clear `network` (boot without a virtio-net device).
+    /// Clear `networks` (boot without a virtio-net device).
     #[must_use = "builder methods consume self; bind the result"]
-    pub fn without_network(mut self) -> Self {
-        self.network = None;
+    pub fn without_networks(mut self) -> Self {
+        self.networks = &[];
         self
     }
 
@@ -2530,6 +2865,20 @@ mod tests {
         (cgroups, topo)
     }
 
+    /// `WatchBpfMap::new` accepts the `PerCpuCounter` agg (pub-API surface); the
+    /// const-fn validates map/field/label format, not the agg, so the variant
+    /// is stored verbatim.
+    #[test]
+    fn watch_bpf_map_new_accepts_per_cpu_counter() {
+        let w = WatchBpfMap::new(
+            "cpu_ctx_stor",
+            "evt_count",
+            BpfMapAgg::PerCpuCounter,
+            "evt_count",
+        );
+        assert_eq!(w.agg, BpfMapAgg::PerCpuCounter);
+    }
+
     #[test]
     fn ktstr_test_entry_default_fields() {
         let d = KtstrTestEntry::DEFAULT;
@@ -2553,10 +2902,12 @@ mod tests {
         assert!(d.extra_sched_args.is_empty());
         assert_eq!(d.watchdog_timeout, Duration::from_secs(5));
         assert!(d.bpf_map_write.is_empty());
+        assert!(d.watch_bpf_maps.is_empty());
         assert!(!d.performance_mode);
         assert!(!d.no_perf_mode);
         assert_eq!(d.duration, Duration::from_secs(12));
         assert!(!d.expect_err);
+        assert!(!d.survives_storm);
         assert!(!d.host_only);
         // Payload slot defaults to None (scheduler-only entry); workloads
         // slice defaults to empty. Macro emits these as explicit None/&[]
@@ -3067,10 +3418,10 @@ mod tests {
             .expect("host_only=false + disk=Some must validate");
     }
 
-    /// `host_only=true` with `network=Some(..)` is rejected for the same
+    /// `host_only=true` with a non-empty `networks` is rejected for the same
     /// reason as disk: host_only skips the VM boot that owns the virtio-net
-    /// device lifecycle, so the NIC would never attach. Mirrors the disk
-    /// gate so the macro-surfaced `network =` attribute can't silently
+    /// device lifecycle, so the NICs would never attach. Mirrors the disk
+    /// gate so the macro-surfaced `networks =` attribute can't silently
     /// pair with `host_only`.
     #[test]
     fn validate_rejects_host_only_with_network() {
@@ -3081,16 +3432,16 @@ mod tests {
             name: "host_only_with_network",
             func: good_test_func,
             host_only: true,
-            network: Some(crate::vmm::net_config::NetConfig::default()),
+            networks: &[crate::vmm::net_config::NetConfig::DEFAULT],
             ..KtstrTestEntry::DEFAULT
         };
         let err = entry
             .validate()
-            .expect_err("host_only=true + network=Some must be rejected");
+            .expect_err("host_only=true + non-empty networks must be rejected");
         let msg = format!("{err}");
         assert!(
-            msg.contains("host_only=true") && msg.contains("network"),
-            "expected host_only+network diagnostic, got: {msg}",
+            msg.contains("host_only=true") && msg.contains("networks"),
+            "expected host_only+networks diagnostic, got: {msg}",
         );
         assert!(
             msg.contains("host_only_with_network"),
@@ -3098,7 +3449,7 @@ mod tests {
         );
     }
 
-    /// `host_only=true` with `network=None` is the legitimate host-side
+    /// `host_only=true` with an empty `networks` is the legitimate host-side
     /// shape (no NIC). Pins the happy path so a future edit to the gate
     /// doesn't flip polarity and reject legitimate host-only tests.
     #[test]
@@ -3110,17 +3461,17 @@ mod tests {
             name: "host_only_no_network",
             func: good_test_func,
             host_only: true,
-            network: None,
+            networks: &[],
             ..KtstrTestEntry::DEFAULT
         };
         entry
             .validate()
-            .expect("host_only=true + network=None must validate");
+            .expect("host_only=true + empty networks must validate");
     }
 
-    /// `host_only=false` (the default) with `network=Some(..)` is the
+    /// `host_only=false` (the default) with a non-empty `networks` is the
     /// canonical NIC-attached VM test. Pins that the gate fires only on
-    /// the host_only conflict, not on every `network=Some(..)` entry.
+    /// the host_only conflict, not on every NIC-bearing entry.
     #[test]
     fn validate_accepts_vm_with_network() {
         fn good_test_func(_: &Ctx) -> Result<AssertResult> {
@@ -3130,12 +3481,12 @@ mod tests {
             name: "vm_with_network",
             func: good_test_func,
             host_only: false,
-            network: Some(crate::vmm::net_config::NetConfig::default()),
+            networks: &[crate::vmm::net_config::NetConfig::DEFAULT],
             ..KtstrTestEntry::DEFAULT
         };
         entry
             .validate()
-            .expect("host_only=false + network=Some must validate");
+            .expect("host_only=false + non-empty networks must validate");
     }
 
     /// `validate()` rejects `cpu_budget = Some(0)` — a zero host-CPU
@@ -3599,6 +3950,94 @@ mod tests {
             msg.contains("bad_matches"),
             "error must name the offending entry: {msg}",
         );
+    }
+
+    /// `survives_storm = true` + `expect_err = true` is rejected at
+    /// validate (the programmatic path that bypasses the macro mutex) —
+    /// contradictory polarity. The expect_err mutex is checked before the
+    /// no-scheduler one, so this fires even on the DEFAULT (no-scheduler)
+    /// entry.
+    #[test]
+    fn validate_rejects_survives_storm_with_expect_err() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "bad_survives_expect_err",
+            func: good_test_func,
+            survives_storm: true,
+            expect_err: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("survives_storm + expect_err must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("survives_storm") && msg.contains("expect_err"),
+            "diagnostic must name both survives_storm and expect_err: {msg}",
+        );
+        assert!(
+            msg.contains("bad_survives_expect_err"),
+            "error must name the offending entry: {msg}",
+        );
+    }
+
+    /// `survives_storm = true` with no active scheduler (the DEFAULT
+    /// kernel-default) is rejected — nothing to die or be ejected.
+    #[test]
+    fn validate_rejects_survives_storm_without_active_scheduler() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "bad_survives_no_sched",
+            func: good_test_func,
+            survives_storm: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("survives_storm without an active scheduler must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("survives_storm") && msg.contains("scheduler"),
+            "diagnostic must name survives_storm and the missing scheduler: {msg}",
+        );
+    }
+
+    /// `survives_storm = true` + `expect_auto_repro = true` is rejected at
+    /// validate — both are inversion intents (survives_storm forces a
+    /// death fail to EXIT_FAIL; expect_auto_repro inverts a crash-with-repro
+    /// fail to PASS), contradictory like survives_storm + expect_err. The
+    /// macro twin is `macro_rejects_survives_storm_with_expect_auto_repro`.
+    #[test]
+    fn validate_rejects_survives_storm_with_expect_auto_repro() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "bad_survives_expect_auto_repro",
+            func: good_test_func,
+            survives_storm: true,
+            expect_auto_repro: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("survives_storm + expect_auto_repro must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("survives_storm") && msg.contains("expect_auto_repro"),
+            "diagnostic must name both survives_storm and expect_auto_repro: {msg}",
+        );
+    }
+
+    /// `with_survives_storm` setter roundtrips onto the entry.
+    #[test]
+    fn with_survives_storm_sets_field() {
+        let e = KtstrTestEntry::DEFAULT.with_survives_storm(true);
+        assert!(e.survives_storm);
     }
 
     /// Happy path: scx_bpf_error matchers paired with
@@ -4764,9 +5203,9 @@ mod tests {
     #[test]
     fn bpf_map_write_hashset_roundtrip() {
         use std::collections::HashSet;
-        let w1 = BpfMapWrite::new(".data", 0, 1);
-        let w2 = BpfMapWrite::new(".data", 4, 2);
-        let w3 = BpfMapWrite::new(".other", 0, 1);
+        let w1 = BpfMapWrite::new(".data", "crash", 1);
+        let w2 = BpfMapWrite::new(".data", "stall", 2);
+        let w3 = BpfMapWrite::new(".other", "crash", 1);
         let mut set: HashSet<BpfMapWrite> = HashSet::new();
         set.insert(w1);
         set.insert(w2);
@@ -4794,7 +5233,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "map_name_suffix must not be empty")]
     fn bpf_map_write_new_rejects_empty_suffix() {
-        let _ = BpfMapWrite::new("", 0, 0);
+        let _ = BpfMapWrite::new("", "crash", 0);
     }
 
     /// BPF section names start with `.` (`.bss`, `.data`, `.rodata`);
@@ -4802,19 +5241,19 @@ mod tests {
     #[test]
     #[should_panic(expected = "must start with `.`")]
     fn bpf_map_write_new_rejects_missing_dot_prefix() {
-        let _ = BpfMapWrite::new("bss", 0, 0);
+        let _ = BpfMapWrite::new("bss", "crash", 0);
     }
 
     #[test]
     #[should_panic(expected = "must not contain whitespace")]
     fn bpf_map_write_new_rejects_whitespace_in_suffix() {
-        let _ = BpfMapWrite::new(".b s", 0, 0);
+        let _ = BpfMapWrite::new(".b s", "crash", 0);
     }
 
     #[test]
     #[should_panic(expected = "must not contain path separators")]
     fn bpf_map_write_new_rejects_path_separator_in_suffix() {
-        let _ = BpfMapWrite::new(".bss/data", 0, 0);
+        let _ = BpfMapWrite::new(".bss/data", "crash", 0);
     }
 
     /// Valid construction round-trips through the getters. Pinned to
@@ -4822,10 +5261,71 @@ mod tests {
     /// caches a transformed value but forgets to update the getter).
     #[test]
     fn bpf_map_write_new_valid_round_trips() {
-        let w = BpfMapWrite::new(".bss", 16, 42);
+        let w = BpfMapWrite::new(".bss", "crash", 42);
         assert_eq!(w.map_name_suffix(), ".bss");
-        assert_eq!(w.offset(), 16);
+        assert_eq!(w.field(), "crash");
         assert_eq!(w.value(), 42);
+    }
+
+    /// Empty `field` names no VAR; the write-time BTF resolver would find
+    /// nothing. const-assert catches it at construction.
+    #[test]
+    #[should_panic(expected = "field must not be empty")]
+    fn bpf_map_write_new_rejects_empty_field() {
+        let _ = BpfMapWrite::new(".bss", "", 0);
+    }
+
+    /// A BTF VAR name carries no whitespace; a spaced `field` is a typo
+    /// that would never resolve.
+    #[test]
+    #[should_panic(expected = "field must not contain whitespace")]
+    fn bpf_map_write_new_rejects_whitespace_in_field() {
+        let _ = BpfMapWrite::new(".bss", "cr ash", 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "field must not contain path separators")]
+    fn bpf_map_write_new_rejects_path_separator_in_field() {
+        let _ = BpfMapWrite::new(".bss", "a/b", 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "field must be printable ASCII only")]
+    fn bpf_map_write_new_rejects_control_byte_in_field() {
+        let _ = BpfMapWrite::new(".bss", "cr\x01ash", 0);
+    }
+
+    /// `.` is a dot-path separator; a leading/trailing `.` is an empty
+    /// segment the BTF resolver could never match.
+    #[test]
+    #[should_panic(expected = "must not start or end with `.`")]
+    fn bpf_map_write_new_rejects_trailing_dot_in_field() {
+        let _ = BpfMapWrite::new(".bss", "crash.", 0);
+    }
+
+    /// The leading half of the same start/end-dot guard (sibling
+    /// `Sysctl::new` splits leading and trailing into separate pins; a
+    /// regression dropping only the leading check must not slip past).
+    #[test]
+    #[should_panic(expected = "must not start or end with `.`")]
+    fn bpf_map_write_new_rejects_leading_dot_in_field() {
+        let _ = BpfMapWrite::new(".bss", ".crash", 0);
+    }
+
+    /// A doubled `..` is an empty dot-path segment.
+    #[test]
+    #[should_panic(expected = "field must not contain `..`")]
+    fn bpf_map_write_new_rejects_doubled_dot_in_field() {
+        let _ = BpfMapWrite::new(".bss", "a..b", 0);
+    }
+
+    /// An interior `.` separates non-empty dot-path segments and IS
+    /// accepted — the field doc promises dot-paths (e.g.
+    /// `sys_stat.avg_lat_cri`); pins that a future validator over-tightening
+    /// to reject all `.` would break this.
+    #[test]
+    fn bpf_map_write_new_accepts_interior_dot_in_field() {
+        assert_eq!(BpfMapWrite::new(".bss", "a.b", 1).field(), "a.b");
     }
 
     #[test]
@@ -4939,25 +5439,25 @@ mod tests {
     #[test]
     #[should_panic(expected = "must be longer than a bare `.`")]
     fn bpf_map_write_new_rejects_bare_dot() {
-        let _ = BpfMapWrite::new(".", 0, 0);
+        let _ = BpfMapWrite::new(".", "crash", 0);
     }
 
     #[test]
     #[should_panic(expected = "must not start with `..`")]
     fn bpf_map_write_new_rejects_leading_double_dot() {
-        let _ = BpfMapWrite::new("..bss", 0, 0);
+        let _ = BpfMapWrite::new("..bss", "crash", 0);
     }
 
     #[test]
     #[should_panic(expected = "must be printable ASCII")]
     fn bpf_map_write_new_rejects_null_byte_in_suffix() {
-        let _ = BpfMapWrite::new(".bss\0", 0, 0);
+        let _ = BpfMapWrite::new(".bss\0", "crash", 0);
     }
 
     #[test]
     #[should_panic(expected = "must be printable ASCII")]
     fn bpf_map_write_new_rejects_control_byte_in_suffix() {
-        let _ = BpfMapWrite::new(".b\x01ss", 0, 0);
+        let _ = BpfMapWrite::new(".b\x01ss", "crash", 0);
     }
 
     /// Lock-step pin: `KtstrTestEntry::default()` must agree with
@@ -5037,6 +5537,22 @@ mod tests {
             assert!(
                 std::ptr::eq(*a, *b),
                 "bpf_map_write[{i}] pointer identity drift"
+            );
+        }
+        assert_eq!(
+            from_trait.watch_bpf_maps.len(),
+            from_const.watch_bpf_maps.len(),
+            "watch_bpf_maps count drift"
+        );
+        for (i, (a, b)) in from_trait
+            .watch_bpf_maps
+            .iter()
+            .zip(from_const.watch_bpf_maps.iter())
+            .enumerate()
+        {
+            assert!(
+                std::ptr::eq(*a, *b),
+                "watch_bpf_maps[{i}] pointer identity drift"
             );
         }
         assert_eq!(from_trait.performance_mode, from_const.performance_mode);
@@ -5347,65 +5863,87 @@ mod tests {
         );
     }
 
-    // -- with_network / without_network builder methods --
+    // -- with_networks / without_networks builder methods --
 
     #[test]
-    fn with_network_sets_some_and_carries_config() {
-        // Distinguishing MAC (!= DEFAULT 02:00:00:00:00:01) proves
-        // the setter stores the SUPPLIED config.
-        const MAC: [u8; 6] = [0x52, 0x54, 0x00, 0xab, 0xcd, 0xef];
-        let cfg = crate::vmm::net_config::NetConfig::DEFAULT.mac(MAC);
+    fn with_networks_carries_config_and_order() {
+        // Distinguishing MACs (!= DEFAULT 02:00:00:00:00:01) prove the
+        // setter stores the SUPPLIED list, in order. Two NICs pin the
+        // multi-element path.
+        const MAC0: [u8; 6] = [0x52, 0x54, 0x00, 0xab, 0xcd, 0xef];
+        const MAC1: [u8; 6] = [0x52, 0x54, 0x00, 0x11, 0x22, 0x33];
+        // A `const` slice binding promotes its borrow to `'static` (the
+        // `.mac()` const-fn call blocks ad-hoc promotion of an inline `&[..]`).
+        const NETS: &[crate::vmm::net_config::NetConfig] = &[
+            crate::vmm::net_config::NetConfig::DEFAULT.mac(MAC0),
+            crate::vmm::net_config::NetConfig::DEFAULT.mac(MAC1),
+        ];
         let entry = KtstrTestEntry::DEFAULT
             .with_name("net_setter")
-            .with_network(cfg);
-        let got = entry.network.expect("with_network must populate Some");
+            .with_networks(NETS);
         assert_eq!(
-            got.mac, MAC,
-            "with_network must carry the supplied NetConfig's MAC"
+            entry.networks.len(),
+            2,
+            "with_networks must store every NIC"
+        );
+        assert_eq!(
+            entry.networks[0].mac, MAC0,
+            "first NIC carries MAC0 in order"
+        );
+        assert_eq!(
+            entry.networks[1].mac, MAC1,
+            "second NIC carries MAC1 in order"
         );
         assert!(
-            KtstrTestEntry::DEFAULT.network.is_none(),
-            "DEFAULT must boot without a NIC; with_network is the only mutator here"
+            KtstrTestEntry::DEFAULT.networks.is_empty(),
+            "DEFAULT must boot without a NIC; with_networks is the only mutator here"
         );
     }
 
     #[test]
-    fn without_network_clears_to_none() {
-        let cfg = crate::vmm::net_config::NetConfig::DEFAULT;
+    fn without_networks_clears_to_empty() {
         let entry = KtstrTestEntry::DEFAULT
             .with_name("net_clear")
-            .with_network(cfg)
-            .without_network();
+            .with_networks(&[crate::vmm::net_config::NetConfig::DEFAULT])
+            .without_networks();
         assert!(
-            entry.network.is_none(),
-            "without_network must return the network field to None"
+            entry.networks.is_empty(),
+            "without_networks must return the networks field to empty"
         );
     }
 
-    /// `without_disk` does not touch `network` and vice versa — the
+    /// `without_disk` does not touch `networks` and vice versa — the
     /// two clearers are independent. Pins against a copy-paste
     /// regression where one clearer nulls the wrong field.
     #[test]
     fn disk_and_network_clearers_are_independent() {
-        // DiskConfig is Clone (not Copy), so build a fresh one per
-        // entry; NetConfig is Copy and can be reused.
-        let net = crate::vmm::net_config::NetConfig::DEFAULT.mac([0x52, 0x54, 0, 0, 0, 9]);
-        // Clear disk only: network must survive.
+        // DiskConfig is Clone (not Copy), so build a fresh one per entry;
+        // the NIC list is a `const` slice binding ('static-promoted — the
+        // `.mac()` const-fn call blocks ad-hoc promotion of an inline `&[..]`).
+        const NET: &[crate::vmm::net_config::NetConfig] =
+            &[crate::vmm::net_config::NetConfig::DEFAULT.mac([0x52, 0x54, 0, 0, 0, 9])];
+        // Clear disk only: networks must survive.
         let e1 = KtstrTestEntry::DEFAULT
             .with_name("indep_disk")
             .with_disk(crate::vmm::disk_config::DiskConfig::DEFAULT.capacity_mib(512))
-            .with_network(net)
+            .with_networks(NET)
             .without_disk();
         assert!(e1.disk.is_none(), "without_disk must clear disk");
-        assert!(e1.network.is_some(), "without_disk must NOT clear network");
-        // Clear network only: disk must survive.
+        assert!(
+            !e1.networks.is_empty(),
+            "without_disk must NOT clear networks"
+        );
+        // Clear networks only: disk must survive.
         let e2 = KtstrTestEntry::DEFAULT
             .with_name("indep_net")
             .with_disk(crate::vmm::disk_config::DiskConfig::DEFAULT.capacity_mib(512))
-            .with_network(net)
-            .without_network();
-        assert!(e2.network.is_none(), "without_network must clear network");
-        assert!(e2.disk.is_some(), "without_network must NOT clear disk");
+            .with_networks(NET)
+            .without_networks();
+        assert!(
+            e2.networks.is_empty(),
+            "without_networks must clear networks"
+        );
+        assert!(e2.disk.is_some(), "without_networks must NOT clear disk");
     }
 
     // -- with_num_snapshots builder method --

@@ -52,18 +52,17 @@ const STALL_AFTER_1S_SCHED: Scheduler = Scheduler::named("stall_after_1s")
 
 /// Host-side `post_vm` shared by the three scheduler-lifecycle tests
 /// (attach / replace / restart). Each runs the lifecycle Op then a
-/// short workload-free settle; on its own that only proves the Op
-/// chain didn't error — NOT that the post-op scheduler actually
-/// schedules. scx-ktstr runs in FULL mode (no `SCX_OPS_SWITCH_PARTIAL`),
-/// so every runnable fair-class guest task — init, kworkers, RCU
-/// kthreads, the runner — flows through `ktstr_dispatch`, which bumps
-/// `nr_dispatched` after `scx_bpf_dsq_move_to_local`. So
-/// `nr_dispatched > 0` at any
+/// workload-free settle sized to span the periodic-capture window (see
+/// each test's post-op Step); the Op chain completing only proves it
+/// didn't error — NOT that the post-op scheduler actually schedules.
+/// scx-ktstr runs in FULL mode (no `SCX_OPS_SWITCH_PARTIAL`), so every
+/// runnable fair-class guest task — init, kworkers, RCU kthreads, the
+/// runner — flows through `ktstr_dispatch`, which bumps `nr_dispatched`
+/// after `scx_bpf_dsq_move_to_local`. So `nr_dispatched > 0` at any
 /// periodic sample proves the bound scheduler ran its dispatch path
-/// (past the crash/stall/degrade/slow gates) on system traffic alone —
-/// no dedicated workload needed. A bind-without-dispatch regression (Op
-/// succeeds, scheduler never schedules) reads 0 across every sample and
-/// fails here.
+/// (past the crash/stall/degrade/slow gates) on system traffic. A
+/// bind-without-dispatch regression (Op succeeds, scheduler never
+/// schedules) reads 0 across every sample and fails here.
 fn assert_post_op_dispatch(result: &VmResult) -> Result<()> {
     let series = SampleSeries::from_drained_typed(
         result.snapshot_bridge.drain_ordered_with_stats(),
@@ -144,14 +143,22 @@ fn scheduler_replace_mid_experiment_swaps_via_staged_pack(ctx: &Ctx) -> Result<A
             vec![Op::replace_scheduler(&STAGED_ALT_SCHED)],
             HoldSpec::fixed(std::time::Duration::from_millis(500)),
         ),
-        // Post-swap settle window. The staged scheduler's bind to
-        // sched_ext gets verified by the spawn_scheduler_from_paths
-        // attach poll; this hold simply gives downstream metric
-        // capture a window to confirm the post-swap scheduler ran
-        // workload-free without panicking.
+        // Post-swap settle window, sized so the scenario spans the
+        // periodic-capture window. With num_snapshots=3 + duration_s=5,
+        // boundaries land at 0.3/0.5/0.7 * 5s = 1.5/2.5/3.5s of workload
+        // time (compute_periodic_boundaries_ns). The swap kills + respawns
+        // the scheduler ~1-2s in, so the host freeze coordinator drops +
+        // re-adopts its BPF accessor mid-scenario; a post-swap boundary
+        // can only fire (and be captured before the VM reboots) once the
+        // scenario runs past it. A 500ms settle ended the scenario before
+        // any post-swap boundary fired, so assert_post_op_dispatch saw
+        // periodic_fired=0. ~3.5s carries the scenario past the 3.5s
+        // boundary with capture+reboot margin, and also gives downstream
+        // metric capture a window to confirm the post-swap scheduler ran
+        // workload-free.
         Step::new(
             vec![],
-            HoldSpec::fixed(std::time::Duration::from_millis(500)),
+            HoldSpec::fixed(std::time::Duration::from_millis(3500)),
         ),
     ];
     execute_steps(ctx, steps)
@@ -207,12 +214,31 @@ fn scheduler_attach_from_cold_start_succeeds(ctx: &Ctx) -> Result<AssertResult> 
             vec![Op::attach_scheduler(&COLD_START_ALT_SCHED)],
             HoldSpec::fixed(std::time::Duration::from_millis(500)),
         ),
-        // Post-attach settle — the freshly-attached scheduler runs
-        // workload-free for a window so the live SCHED_PID monitor
-        // confirms it stays bound to sched_ext without panicking.
+        // Post-attach settle window, sized so the scenario spans the
+        // periodic-capture window. With num_snapshots=3 + duration_s=5,
+        // boundaries land at 0.3/0.5/0.7 * 5s = 1.5/2.5/3.5s of scenario
+        // time (compute_periodic_boundaries_ns), measured from
+        // scenario_start (stamped at the top of run_steps, before this
+        // attach). The periodic-capture prereqs (BPF map/prog accessor +
+        // KASLR offset) are kernel-image-level, not scheduler-dependent:
+        // the accessor is built from the vmlinux ELF + guest page tables
+        // early in guest boot, and a cold null->non-null attach is a
+        // Published transition that does NOT drop it (only Detached /
+        // RebindDisarmed do). So this attach causes no anchor shift; the
+        // boundaries are scenario-relative, just like the restart/replace
+        // tests. The hold's job is to keep the scenario alive past the
+        // last (3.5s) boundary so a sample fires + is captured before the
+        // VM reboots. Each step hold is clamped to scenario_start +
+        // ctx.duration by the .min(remaining) clamp in run_steps, so
+        // 4000ms fills the scenario to the 5s duration cap, giving the
+        // 3.5s sample maximum capture+reboot margin regardless of attach
+        // latency. A 500ms settle ended the scenario at ~1s, before any
+        // boundary, so assert_post_op_dispatch saw periodic_fired=0. The
+        // long settle also lets the live SCHED_PID monitor confirm the
+        // attached scheduler stays bound without panicking.
         Step::new(
             vec![],
-            HoldSpec::fixed(std::time::Duration::from_millis(500)),
+            HoldSpec::fixed(std::time::Duration::from_millis(4000)),
         ),
     ];
     execute_steps(ctx, steps)
@@ -414,14 +440,23 @@ fn scheduler_restart_mid_experiment_reattaches_cleanly(ctx: &Ctx) -> Result<Asse
             vec![Op::restart_scheduler()],
             HoldSpec::fixed(std::time::Duration::from_millis(500)),
         ),
-        // Post-restart settle window. The freshly-spawned boot
-        // scheduler's bind to sched_ext gets verified by the
-        // spawn helper's attach poll; this hold gives the live
-        // SCHED_PID monitor a window to confirm the post-restart
-        // scheduler runs workload-free without panicking.
+        // Post-restart settle window, sized so the scenario spans the
+        // periodic-capture window. With num_snapshots=3 + duration_s=5,
+        // boundaries land at 0.3/0.5/0.7 * 5s = 1.5/2.5/3.5s of workload
+        // time (compute_periodic_boundaries_ns). The boot scheduler is
+        // killed + respawned ~1-2s in, so the host freeze coordinator
+        // drops + re-adopts its BPF accessor mid-scenario; the prereq
+        // gate defers boundary[0] across that reset and a post-restart
+        // boundary can only fire (and be captured before the VM reboots)
+        // once the scenario runs past it. A 500ms settle ended the
+        // scenario before any post-restart boundary fired, so
+        // assert_post_op_dispatch saw periodic_fired=0. ~3.5s carries the
+        // scenario past the 3.5s boundary with capture+reboot margin, and
+        // also gives the live SCHED_PID monitor a window to confirm the
+        // post-restart scheduler runs workload-free.
         Step::new(
             vec![],
-            HoldSpec::fixed(std::time::Duration::from_millis(500)),
+            HoldSpec::fixed(std::time::Duration::from_millis(3500)),
         ),
     ];
     execute_steps(ctx, steps)

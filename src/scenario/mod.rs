@@ -380,9 +380,11 @@ pub struct Ctx<'a> {
     /// scenarios and by `execute_steps` as the default when no explicit
     /// checks are passed to `execute_steps_with`.
     pub assert: crate::assert::Assert,
-    /// **Runtime coordination.** When true, `execute_steps` polls SHM
-    /// signal slot 0 after writing the scenario start marker, blocking
-    /// until the host confirms its BPF map write is complete. Set
+    /// **Runtime coordination.** When true, `execute_steps` blocks after
+    /// writing the scenario start marker until the host confirms its BPF
+    /// map write is complete — waiting on the `bpf_map_write_done` latch
+    /// that `hvc0_poll_loop` sets when the host pushes
+    /// `SIGNAL_BPF_WRITE_DONE` over the virtio-console RX queue. Set
     /// automatically by the framework when a `KtstrTestEntry` declares
     /// `bpf_map_write`; custom scenarios typically do not flip this
     /// manually.
@@ -454,6 +456,14 @@ pub struct Ctx<'a> {
     /// `ctx.failure_dump_path()` and the host-side
     /// `result.failure_dump_path()` resolve to identical paths).
     pub entry_name: Option<&'static str>,
+    /// The run's variant hash (see `variant_hash_from_parts`),
+    /// stamped at the macro dispatch site alongside [`Self::entry_name`].
+    /// The body-side `failure_dump_path` / `wprof_pb_path` derivations
+    /// embed it as the `-{16-hex}` filename suffix so a gauntlet test's
+    /// per-preset dumps don't clobber and each matches its sidecar's
+    /// variant hash. `0` on a manually-built fixture (which has
+    /// `entry_name = None` and thus bails before reading this).
+    pub variant_hash: u64,
 }
 
 impl std::fmt::Debug for Ctx<'_> {
@@ -476,6 +486,7 @@ impl std::fmt::Debug for Ctx<'_> {
                 &self.current_step.load(std::sync::atomic::Ordering::Relaxed),
             )
             .field("entry_name", &self.entry_name)
+            .field("variant_hash", &self.variant_hash)
             .finish()
     }
 }
@@ -681,8 +692,8 @@ impl Ctx<'_> {
     }
 
     /// Per-test failure-dump sidecar path. Derives
-    /// `{sidecar_dir()}/{entry_name}.failure-dump.json` from the
-    /// macro-stamped [`Self::entry_name`] — the drift-safe
+    /// `{sidecar_dir()}/{entry_name}-{variant_hash:016x}.failure-dump.json`
+    /// from the macro-stamped [`Self::entry_name`] — the drift-safe
     /// replacement for the legacy pattern of hardcoding the test
     /// fn name as a string literal at the callsite.
     ///
@@ -716,18 +727,21 @@ impl Ctx<'_> {
                  .entry_name(...). Call ctx_builder.entry_name(name) \
                  explicitly, OR if this is a scenario unit-test fixture \
                  that has no test-entry context, derive the path inline \
-                 (sidecar_dir().join(format!(\"{{name}}.failure-dump.json\"))) \
+                 (sidecar_dir().join(format!(\"{{name}}-{{variant_hash:016x}}.failure-dump.json\"))) \
                  — the method form is for tests dispatched via \
                  #[ktstr_test], not for builder-driven fixtures."
             )
         })?;
-        Ok(crate::test_support::sidecar_dir().join(format!("{name}.failure-dump.json")))
+        Ok(crate::test_support::sidecar_dir().join(format!(
+            "{name}-{:016x}.failure-dump.json",
+            self.variant_hash
+        )))
     }
 
     /// Per-test wprof Perfetto-trace sidecar path. Mirror of
     /// [`Self::failure_dump_path`] for the wprof artifact —
-    /// derives `{sidecar_dir()}/{entry_name}.wprof.pb` from the
-    /// macro-stamped [`Self::entry_name`].
+    /// derives `{sidecar_dir()}/{entry_name}-{variant_hash:016x}.wprof.pb`
+    /// from the macro-stamped [`Self::entry_name`].
     ///
     /// Sibling to [`crate::vmm::VmResult::wprof_pb_path`] —
     /// the post-VM and pre-VM derivations produce identical paths.
@@ -748,7 +762,8 @@ impl Ctx<'_> {
                  for the manually-constructed-Ctx workaround."
             )
         })?;
-        Ok(crate::test_support::sidecar_dir().join(format!("{name}.wprof.pb")))
+        Ok(crate::test_support::sidecar_dir()
+            .join(format!("{name}-{:016x}.wprof.pb", self.variant_hash)))
     }
 
     #[cfg(feature = "wprof")]
@@ -761,7 +776,8 @@ impl Ctx<'_> {
                  the manually-constructed-Ctx workaround."
             )
         })?;
-        Ok(crate::test_support::sidecar_dir().join(format!("{name}.repro.wprof.pb")))
+        Ok(crate::test_support::sidecar_dir()
+            .join(format!("{name}-{:016x}.repro.wprof.pb", self.variant_hash)))
     }
 }
 
@@ -810,6 +826,7 @@ pub struct CtxBuilder<'a> {
     wait_for_map_write: bool,
     current_step: Arc<AtomicU16>,
     entry_name: Option<&'static str>,
+    variant_hash: u64,
 }
 
 impl<'a> CtxBuilder<'a> {
@@ -860,9 +877,10 @@ impl<'a> CtxBuilder<'a> {
         self
     }
 
-    /// When true, `execute_steps` polls the SHM signal slot after
-    /// writing the scenario start marker. See the field doc on
-    /// [`Ctx::wait_for_map_write`].
+    /// When true, `execute_steps` blocks on the `bpf_map_write_done`
+    /// latch (set on the host's `SIGNAL_BPF_WRITE_DONE` over
+    /// virtio-console RX) after writing the scenario start marker. See
+    /// the field doc on [`Ctx::wait_for_map_write`].
     #[must_use = "builder methods consume self; bind the result"]
     pub fn wait_for_map_write(mut self, v: bool) -> Self {
         self.wait_for_map_write = v;
@@ -908,6 +926,16 @@ impl<'a> CtxBuilder<'a> {
         self
     }
 
+    /// Stamp the run's variant hash (see `variant_hash_from_parts`) so the
+    /// body-side `failure_dump_path` / `wprof_pb_path` derivations embed
+    /// it as the `-{16-hex}` filename suffix. Set at the macro dispatch
+    /// site alongside [`Self::entry_name`]; ad-hoc fixtures leave it `0`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn variant_hash(mut self, hash: u64) -> Self {
+        self.variant_hash = hash;
+        self
+    }
+
     /// Materialise the configured [`Ctx`].
     #[must_use = "dropping a Ctx without running the scenario discards the test setup"]
     pub fn build(self) -> Ctx<'a> {
@@ -923,6 +951,7 @@ impl<'a> CtxBuilder<'a> {
             wait_for_map_write: self.wait_for_map_write,
             current_step: self.current_step,
             entry_name: self.entry_name,
+            variant_hash: self.variant_hash,
         }
     }
 }
@@ -948,6 +977,7 @@ impl<'a> Ctx<'a> {
             wait_for_map_write: false,
             current_step: Arc::new(AtomicU16::new(0)),
             entry_name: None,
+            variant_hash: 0,
         }
     }
 

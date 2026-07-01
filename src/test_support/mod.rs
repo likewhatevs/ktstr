@@ -51,6 +51,10 @@ use crate::scenario::Ctx;
 use anyhow::Result;
 
 mod args;
+// Re-exported for the workload-side CgroupChurn worker, which resolves the
+// same workload cgroup root the host-side setup uses but lives outside the
+// private `args` module's subtree.
+pub(crate) use args::resolve_cgroup_root;
 mod dispatch;
 mod entry;
 mod entry_validate;
@@ -121,8 +125,8 @@ pub(crate) use sidecar::{
     is_run_directory, is_sidecar_filename,
 };
 pub use sidecar::{
-    SidecarResult, collect_pool, detect_kernel_commit, newest_run_dir, repo_is_dirty, runs_root,
-    sidecar_dir, source_dir_for,
+    SidecarResult, collect_pool, detect_kernel_commit, format_run_artifact_footer, newest_run_dir,
+    repo_is_dirty, runs_root, sidecar_dir, source_dir_for,
 };
 
 pub use dispatch::{
@@ -132,9 +136,9 @@ pub use dispatch::{
     ktstr_test_early_dispatch, resolve_host_cgroup_parent, run_ktstr_test, sanitize_kernel_label,
 };
 pub use entry::{
-    BinaryKindJson, BpfMapWrite, CgroupPath, KTSTR_SCHEDULERS, KTSTR_TESTS, KtstrTestEntry,
-    MemSideCache, NumaDistance, NumaNode, Scheduler, SchedulerJson, SchedulerSpec, Sysctl,
-    Topology, TopologyConstraints, TopologyConstraintsJson, TopologyJson,
+    BinaryKindJson, BpfMapAgg, BpfMapWrite, CgroupPath, KTSTR_SCHEDULERS, KTSTR_TESTS,
+    KtstrTestEntry, MemSideCache, NumaDistance, NumaNode, Scheduler, SchedulerJson, SchedulerSpec,
+    Sysctl, Topology, TopologyConstraints, TopologyConstraintsJson, TopologyJson, WatchBpfMap,
     default_post_vm_periodic_fired, find_scheduler, find_test,
 };
 pub use eval::{KernelUnavailable, ResolveSource, resolve_scheduler, resolve_test_kernel};
@@ -157,7 +161,7 @@ pub use payload::{
 pub(crate) use payload::{RawPayloadOutput, WireMetricHint};
 pub(crate) use probe::maybe_dispatch_vm_test;
 pub(crate) use probe::{
-    finalize_probe_after_unwind, maybe_dispatch_vm_test_with_args,
+    PROBE_DRAIN_GRACE, finalize_probe_after_unwind, maybe_dispatch_vm_test_with_args,
     maybe_dispatch_vm_test_with_phase_a, propagate_rust_env_from_cmdline, start_probe_phase_a,
 };
 pub use probe_metrics::{

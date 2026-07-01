@@ -59,6 +59,10 @@ fn worker_report_serde_roundtrip() {
         wake_sample_total: 2,
         iteration_costs_ns: vec![3000, 4000, 5000],
         iteration_cost_sample_total: 3,
+        // Non-empty so the serde roundtrip proves the distinct timer reservoir
+        // survives (not just that empty == empty on both sides).
+        timer_latencies_ns: vec![6000, 7000],
+        timer_sample_total: 2,
         iterations: 10,
         schedstat_run_delay_ns: 500_000,
         schedstat_run_count: 20,
@@ -82,6 +86,8 @@ fn worker_report_serde_roundtrip() {
             cpus_used: [2usize].into_iter().collect(),
             wake_latencies_ns: vec![700, 900],
             wake_sample_total: 2,
+            timer_latencies_ns: vec![800, 850],
+            timer_sample_total: 2,
             run_delay_ns: 12_000,
             off_cpu_ns: 3_000,
             wall_ns: 8_000,
@@ -92,7 +98,10 @@ fn worker_report_serde_roundtrip() {
             vmstat_numa_pages_migrated: 2,
             max_gap_ms: 9,
             max_gap_cpu: 2,
+            schbench: None,
+            taobench: None,
         }],
+        taobench_whole: None,
     };
     let json = serde_json::to_string(&r).unwrap();
     let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -703,6 +712,8 @@ fn worker_report_serde_edge_cases() {
         wake_sample_total: 0,
         iteration_costs_ns: vec![],
         iteration_cost_sample_total: 0,
+        timer_latencies_ns: vec![],
+        timer_sample_total: 0,
         iterations: 0,
         schedstat_run_delay_ns: 0,
         schedstat_run_count: 0,
@@ -715,6 +726,7 @@ fn worker_report_serde_edge_cases() {
         group_idx: 0,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     };
     let json = serde_json::to_string(&r).unwrap();
     let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -739,6 +751,8 @@ fn worker_report_serde_edge_cases() {
         wake_sample_total: u64::MAX,
         iteration_costs_ns: vec![],
         iteration_cost_sample_total: u64::MAX,
+        timer_latencies_ns: vec![],
+        timer_sample_total: u64::MAX,
         iterations: u64::MAX,
         schedstat_run_delay_ns: u64::MAX,
         schedstat_run_count: u64::MAX,
@@ -751,6 +765,7 @@ fn worker_report_serde_edge_cases() {
         group_idx: usize::MAX,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     };
     let json = serde_json::to_string(&r).unwrap();
     let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -836,6 +851,8 @@ fn worker_report_debug_shows_field_values() {
         wake_sample_total: 0,
         iteration_costs_ns: vec![],
         iteration_cost_sample_total: 0,
+        timer_latencies_ns: vec![],
+        timer_sample_total: 0,
         iterations: 0,
         schedstat_run_delay_ns: 0,
         schedstat_run_count: 0,
@@ -848,6 +865,7 @@ fn worker_report_debug_shows_field_values() {
         group_idx: 0,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     };
     let s = format!("{:?}", r);
     assert!(s.contains("42"), "must show tid value");
@@ -1356,6 +1374,10 @@ fn fully_populated_report() -> WorkerReport {
         wake_sample_total: 4,
         iteration_costs_ns: vec![10, 20, 30],
         iteration_cost_sample_total: 3,
+        // Non-default so the wire-format fixture proves the distinct timer
+        // reservoir carries every byte through serde.
+        timer_latencies_ns: vec![6000, 7000],
+        timer_sample_total: 9,
         iterations: 1024,
         schedstat_run_delay_ns: 555_000,
         schedstat_run_count: 73,
@@ -1372,6 +1394,8 @@ fn fully_populated_report() -> WorkerReport {
             cpus_used: [1usize, 4, 6].into_iter().collect(),
             wake_latencies_ns: vec![500, 1500, 2500],
             wake_sample_total: 8,
+            timer_latencies_ns: vec![900, 950],
+            timer_sample_total: 5,
             run_delay_ns: 444_000,
             off_cpu_ns: 1_234_567,
             wall_ns: 9_876_543,
@@ -1382,7 +1406,10 @@ fn fully_populated_report() -> WorkerReport {
             vmstat_numa_pages_migrated: 13,
             max_gap_ms: 27,
             max_gap_cpu: 4,
+            schbench: None,
+            taobench: None,
         }],
+        taobench_whole: None,
     }
 }
 

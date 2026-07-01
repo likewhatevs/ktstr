@@ -205,7 +205,7 @@ fn write_with_timeout(path: &Path, data: &str, timeout: Duration) -> Result<()> 
 /// `cpuset.cpus`, etc.) at `mkdir` time with EINVAL / EEXIST. Those
 /// failures surface through the regular `fs::create_dir_all` /
 /// `fs::write` error chain.
-fn validate_cgroup_name(name: &str) -> Result<()> {
+pub(crate) fn validate_cgroup_name(name: &str) -> Result<()> {
     if name.is_empty() {
         bail!("cgroup name must not be empty");
     }

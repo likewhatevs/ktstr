@@ -23,15 +23,16 @@ mod scheduler;
 ///    inside it.
 ///
 /// Every attribute is optional. Most take a `key = value` form; the
-/// thirteen boolean attributes (`auto_repro`, `not_starved`, `isolation`,
-/// `performance_mode`, `no_perf_mode`, `requires_smt`, `expect_err`,
-/// `allow_inconclusive`, `fail_on_stall`, `host_only`, `ignore`, `kaslr`,
-/// `wprof`) also accept a bare form as shorthand for `= true` — e.g.
+/// sixteen boolean attributes (`auto_repro`, `expect_auto_repro`,
+/// `not_starved`, `isolation`, `performance_mode`, `pci`, `no_perf_mode`,
+/// `requires_smt`, `expect_err`, `survives_storm`, `allow_inconclusive`,
+/// `fail_on_stall`, `host_only`, `ignore`, `kaslr`, `wprof`) also accept a
+/// bare form as shorthand for `= true` — e.g.
 /// `#[ktstr_test(host_only)]` is equivalent to
-/// `#[ktstr_test(host_only = true)]`. Of the thirteen, `auto_repro`
+/// `#[ktstr_test(host_only = true)]`. Of the sixteen, `auto_repro`
 /// and `kaslr` are the two whose default is `true`, so the bare form
 /// is a no-op; `auto_repro = false` / `kaslr = false` are the only
-/// way to disable each. The other eleven default to `false`, so the
+/// way to disable each. The other fourteen default to `false`, so the
 /// bare form is the meaningful shorthand.
 ///
 /// The accepted attributes and their defaults are the fields of
@@ -63,7 +64,7 @@ mod scheduler;
 ///     teardown wall time; maps onto `KtstrTestEntry::cleanup_budget`
 ///     as `Duration::from_millis(N)`. Default: `None` (unenforced).
 ///   - `num_snapshots = N` — fire `N` periodic
-///     `freeze_and_capture(false)` boundaries inside the workload's
+///     `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` boundaries inside the workload's
 ///     10 %–90 % window, stored on the host
 ///     `SnapshotBridge` under `periodic_NNN`. `0` (default)
 ///     disables periodic capture entirely. Maps onto
@@ -155,10 +156,13 @@ mod scheduler;
 ///     `host_only` skips the VM boot that owns the device lifecycle,
 ///     so a `disk` attached under `host_only` would never bind;
 ///     `KtstrTestEntry::validate` rejects the pairing at runtime.
-///   - `network = PATH` — path to a `const NetConfig` attaching a
-///     virtio-net device (in-VMM loopback backend). Construct via
-///     `NetConfig::DEFAULT.mac(...)` or `NetConfig::DEFAULT` (const-fn
-///     chain). Maps onto `KtstrTestEntry::network`. Default: `None`
+///   - `networks = [PATH, ...]` — array of `const NetConfig` paths, one
+///     virtio-net device per element (in-VMM loopback backend). On x86_64
+///     each lands on its own virtio-pci function (PCI slots 1..=N, one INTx
+///     GSI apiece); aarch64 takes a single virtio-MMIO NIC (build() errors
+///     on more than one). Construct
+///     each via `NetConfig::DEFAULT.mac(...)` or `NetConfig::DEFAULT`
+///     (const-fn chain). Maps onto `KtstrTestEntry::networks`. Default: `[]`
 ///     (no NIC). Like `disk`, mutually exclusive with `host_only`.
 ///   - `config = EXPR` — inline scheduler config content, written
 ///     into the guest at the path declared by the scheduler's
@@ -192,6 +196,15 @@ mod scheduler;
 ///     Bare `\b` slips the gate (no word characters in `""`); see
 ///     `Assert::expect_scx_bpf_error_matches` for the operator
 ///     direction.
+///   - `survives_storm` — assert the scx scheduler SURVIVES the run
+///     (does not die or get ejected during any hold); the positive
+///     inverse of `expect_err`. Requires an active scheduler and is
+///     mutually exclusive with both `expect_err` and `expect_auto_repro`
+///     (rejected at macro-parse and by `KtstrTestEntry::validate`).
+///     Enforced on scenarios driven through `execute_defs` /
+///     `execute_steps` / `execute_scenario` (which run the scheduler
+///     liveness probe); a survival violation surfaces as a failing exit
+///     with a survival-specific explainer.
 ///   - `extra_include_files = ["PATH", "PATH", ...]` — host-side
 ///     file paths to bundle into the guest initramfs beyond what
 ///     the entry's `scheduler` / `payload` / `workloads` already
@@ -233,8 +246,9 @@ mod scheduler;
 /// `crate::host_only = true`) is rejected with a targeted message
 /// naming both valid forms with concrete examples — the macro only
 /// accepts bare single-segment idents because routing dispatches on
-/// the ident string against `BOOL_ATTR_NAMES` or the value-attr
-/// table. `#[ktstr_test(host_only(false))]` (parenthesised
+/// the ident string against `BOOL_ATTR_NAMES` or the value-attr match
+/// arms (enumerated in `VALUE_ATTR_NAMES`).
+/// `#[ktstr_test(host_only(false))]` (parenthesised
 /// arguments) is rejected with a separate targeted message naming
 /// the attribute and the two valid forms (`= value` or bare); the
 /// same diagnostic fires for `crate::host_only(false)` so the
@@ -510,6 +524,43 @@ mod tests {
         assert_eq!(ts.to_string(), quote! { Some(true) }.to_string());
     }
 
+    /// Pins the two attribute-name registries the unknown-attribute diagnostic
+    /// is derived from: they must be internally duplicate-free, disjoint (a
+    /// name is a bool flag XOR a value attr, never both), and sum to the full
+    /// accepted set. A maintainer adding an attribute to the wrong slice — or
+    /// to both — silently shifts the user-facing "expected:" list; this catches
+    /// it. (The complementary direction — a name in a slice with no handling
+    /// match arm — is guarded at parse time by the unknown-attribute catch-all
+    /// `assert!`.)
+    #[test]
+    fn attr_name_registries_disjoint_and_complete() {
+        use std::collections::HashSet;
+        let bool_names = ktstr_test::BOOL_ATTR_NAMES;
+        let value_names = ktstr_test::VALUE_ATTR_NAMES;
+        let bool_set: HashSet<&str> = bool_names.iter().copied().collect();
+        let value_set: HashSet<&str> = value_names.iter().copied().collect();
+        // No duplicates within either slice.
+        assert_eq!(
+            bool_set.len(),
+            bool_names.len(),
+            "BOOL_ATTR_NAMES has duplicate entries",
+        );
+        assert_eq!(
+            value_set.len(),
+            value_names.len(),
+            "VALUE_ATTR_NAMES has duplicate entries",
+        );
+        // Disjoint: an attribute is a bool flag XOR a value attr.
+        let overlap: Vec<&str> = bool_set.intersection(&value_set).copied().collect();
+        assert!(
+            overlap.is_empty(),
+            "BOOL_ATTR_NAMES and VALUE_ATTR_NAMES overlap: {overlap:?}",
+        );
+        // Cardinality pin: 16 bool + 49 value = 65 accepted attributes.
+        assert_eq!(bool_names.len(), 16, "bool attribute count changed");
+        assert_eq!(value_names.len(), 49, "value attribute count changed");
+    }
+
     /// Contract pin: `ktstr_test::AttrValues::default()` is the single source of
     /// truth for every `#[ktstr_test]` macro default since step 2/4 of
     /// the parse-loop refactor. Without a field-by-field positive
@@ -551,7 +602,7 @@ mod tests {
         assert!(d.post_vm.is_none());
         assert!(d.post_vm_unconditional.is_none());
         assert!(d.disk.is_none());
-        assert!(d.network.is_none());
+        assert!(d.networks.is_none());
 
         // -- Assert overrides --
         assert_eq!(d.not_starved, None);
@@ -900,6 +951,106 @@ mod tests {
             field_value_in_static_entry::<bool>(&out, "expect_auto_repro"),
             None,
             "omitted attribute must NOT emit any `expect_auto_repro` field — DEFAULT spread carries the false"
+        );
+    }
+
+    /// `#[ktstr_test(scheduler = SCHED, survives_storm)]` emits
+    /// `survives_storm: true`. Pins BOOL_ATTR_NAMES + assign_bool + codegen.
+    /// A scheduler token is present so the mutex does not reject.
+    #[test]
+    fn macro_parses_survives_storm_bare_to_true() {
+        let attr = quote! { scheduler = SCHED, survives_storm };
+        let item = quote! {
+            fn t(_: &ktstr::scenario::Ctx) -> anyhow::Result<ktstr::assert::AssertResult> {
+                Ok(ktstr::assert::AssertResult::pass())
+            }
+        };
+        let out = ktstr_test::ktstr_test_impl(attr, item)
+            .expect("bare survives_storm with a scheduler must parse");
+        assert_eq!(
+            field_value_in_static_entry::<bool>(&out, "survives_storm"),
+            Some(true),
+            "bare `survives_storm` must emit `survives_storm: true`"
+        );
+    }
+
+    /// `#[ktstr_test(survives_storm = false)]` emits `survives_storm: false`
+    /// and needs no scheduler (the mutex only fires on the true value).
+    #[test]
+    fn macro_parses_survives_storm_explicit_false() {
+        let attr = quote! { survives_storm = false };
+        let item = quote! {
+            fn t(_: &ktstr::scenario::Ctx) -> anyhow::Result<ktstr::assert::AssertResult> {
+                Ok(ktstr::assert::AssertResult::pass())
+            }
+        };
+        let out = ktstr_test::ktstr_test_impl(attr, item)
+            .expect("explicit-false survives_storm must parse");
+        assert_eq!(
+            field_value_in_static_entry::<bool>(&out, "survives_storm"),
+            Some(false),
+            "explicit `survives_storm = false` must emit `survives_storm: false`"
+        );
+    }
+
+    /// `survives_storm` + `expect_err` is rejected at macro parse —
+    /// contradictory polarity. Pins the `validate_survives_storm_mutex`
+    /// expect_err arm.
+    #[test]
+    fn macro_rejects_survives_storm_with_expect_err() {
+        let attr = quote! { scheduler = SCHED, survives_storm, expect_err = true };
+        let item = quote! {
+            fn t(_: &ktstr::scenario::Ctx) -> anyhow::Result<ktstr::assert::AssertResult> {
+                Ok(ktstr::assert::AssertResult::pass())
+            }
+        };
+        let err = ktstr_test::ktstr_test_impl(attr, item).unwrap_err();
+        assert!(
+            err.to_string().contains("survives_storm") && err.to_string().contains("expect_err"),
+            "diagnostic must name both survives_storm and expect_err: {err}"
+        );
+    }
+
+    /// `survives_storm` without a scheduler is rejected at macro parse —
+    /// the kernel default has no scx scheduler to die or be ejected.
+    #[test]
+    fn macro_rejects_survives_storm_without_scheduler() {
+        let attr = quote! { survives_storm };
+        let item = quote! {
+            fn t(_: &ktstr::scenario::Ctx) -> anyhow::Result<ktstr::assert::AssertResult> {
+                Ok(ktstr::assert::AssertResult::pass())
+            }
+        };
+        let err = ktstr_test::ktstr_test_impl(attr, item).unwrap_err();
+        assert!(
+            err.to_string().contains("survives_storm") && err.to_string().contains("scheduler"),
+            "diagnostic must name survives_storm and the missing scheduler: {err}"
+        );
+    }
+
+    /// `survives_storm` + `expect_auto_repro` is rejected at macro parse —
+    /// both are inversion intents (survives_storm forces a death fail to
+    /// EXIT_FAIL; expect_auto_repro inverts a crash-with-repro fail to
+    /// PASS). Feature-agnostic: `validate_cross_attr` runs the
+    /// survives_storm mutex (which fires on the `expect_auto_repro` arm)
+    /// BEFORE the `#[cfg(not(feature = "wprof"))]` wprof-required rejection,
+    /// so the diagnostic names both regardless of the `wprof` feature —
+    /// unlike the positive parse tests, which need `--features wprof` to
+    /// reach codegen successfully. The runtime twin is
+    /// `validate_rejects_survives_storm_with_expect_auto_repro`.
+    #[test]
+    fn macro_rejects_survives_storm_with_expect_auto_repro() {
+        let attr = quote! { scheduler = SCHED, wprof, survives_storm, expect_auto_repro };
+        let item = quote! {
+            fn t(_: &ktstr::scenario::Ctx) -> anyhow::Result<ktstr::assert::AssertResult> {
+                Ok(ktstr::assert::AssertResult::pass())
+            }
+        };
+        let err = ktstr_test::ktstr_test_impl(attr, item).unwrap_err();
+        assert!(
+            err.to_string().contains("survives_storm")
+                && err.to_string().contains("expect_auto_repro"),
+            "diagnostic must name both survives_storm and expect_auto_repro: {err}"
         );
     }
 

@@ -28,7 +28,7 @@ The full pipeline is implemented and tested end-to-end:
    via `KVM_SET_GUEST_DEBUG`.
 3. When the guest writes to the watched address, the corresponding
    debug exit fires and the host identifies which slot tripped.
-4. The coordinator captures via `freeze_and_capture` and stores
+4. The coordinator captures via `freeze_and_dispatch` and stores
    the report in the `SnapshotBridge` under the symbol tag.
 5. The report is also mirrored to a sidecar JSON file for
    post-hoc inspection.
@@ -156,10 +156,10 @@ a "cap exceeded" error:
 let steps = vec![
     Step::with_defs(vec![CgroupDef::named("cg").workers(2)], HoldSpec::FULL)
         .set_ops(vec![
-            Op::watch_snapshot("kernel.a"),
-            Op::watch_snapshot("kernel.b"),
-            Op::watch_snapshot("kernel.c"),
-            Op::watch_snapshot("kernel.d"),  // <-- cap exceeded
+            Op::watch_snapshot("sym_a"),
+            Op::watch_snapshot("sym_b"),
+            Op::watch_snapshot("sym_c"),
+            Op::watch_snapshot("sym_d"),  // <-- cap exceeded
         ]),
 ];
 let result = execute_steps(ctx, steps)?;

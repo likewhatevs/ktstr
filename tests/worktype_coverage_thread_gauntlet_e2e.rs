@@ -21,11 +21,13 @@
 //!
 //! Both arms assert liveness: spawn succeeds, at least one report comes
 //! back, and the workers recorded non-zero `work_units + iterations`.
-//! The CgroupChurn arm pre-creates the sibling cgroup directories its
-//! worker rotates through (`/sys/fs/cgroup/wt-cgroup-churn-<i>` for
-//! `i in 0..groups`) so the `cgroup.procs` write succeeds and the
-//! success branch of the dispatch arm is covered. The guest runs as
-//! root, so the directory creation has the required privilege.
+//! The CgroupChurn arm relies on the worker auto-creating its rotation
+//! cgroups (`<workload_root>/wt-cgroup-churn-<i>` for `i in 0..groups`,
+//! default root `/sys/fs/cgroup/ktstr`) at entry, then asserts those
+//! cgroups exist post-run so the `cgroup.procs` write success path is
+//! actually covered (not the open-failure fallback that liveness alone
+//! would mask). The guest runs as root, so the cgroup creation has the
+//! required privilege.
 
 use anyhow::Result;
 use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
@@ -105,21 +107,10 @@ fn worktype_clone_mode_gauntlet_covers_epoll_and_cgroup(_ctx: &Ctx) -> Result<As
     );
 
     // CgroupChurn is Fork-only: Thread-mode spawn is rejected because a
-    // tid write to cgroup.procs migrates the whole tgid. Pre-create the
-    // sibling cgroups the worker rotates through (groups = 2, so
-    // wt-cgroup-churn-0 and wt-cgroup-churn-1) so the cgroup.procs write
-    // hits its success path. The guest runs as root.
+    // tid write to cgroup.procs migrates the whole tgid. The worker now
+    // auto-creates the rotation cgroups under the workload root at entry,
+    // so no hand-setup is needed. The guest runs as root.
     let groups = 2usize;
-    for i in 0..groups {
-        let dir = format!("/sys/fs/cgroup/wt-cgroup-churn-{i}");
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            result.note(format!(
-                "CgroupChurn: create_dir_all({dir}) failed: {e}; the worker \
-                 falls back to the open-failure path (still bumps \
-                 iterations/work_units), so liveness is asserted regardless"
-            ));
-        }
-    }
 
     // Fork is the default clone mode; omit clone_mode so CgroupChurn
     // runs as Fork (each worker its own tgid).
@@ -135,6 +126,30 @@ fn worktype_clone_mode_gauntlet_covers_epoll_and_cgroup(_ctx: &Ctx) -> Result<As
         },
         &mut result,
     );
+
+    // Pin the auto-provisioning: the worker must have created each
+    // rotation cgroup under the resolved workload root (default
+    // /sys/fs/cgroup/ktstr), so the cgroup.procs writes hit the success
+    // path rather than the open-failure fallback that the liveness check
+    // above would otherwise mask. The cgroups persist post-run (workers
+    // exit; no remove), and this test body runs in the same guest as the
+    // forked workers, so it observes the dirs they created.
+    // This literal mirrors `churn_cgroup_name(i)` and the default
+    // `resolve_cgroup_root` in worker/mod.rs (a `tests/` crate cannot
+    // import those `pub(crate)`/private helpers). A name-format change
+    // there makes this path miss, so the assertion fails loudly.
+    for i in 0..groups {
+        let dir = format!("/sys/fs/cgroup/ktstr/wt-cgroup-churn-{i}");
+        if !std::path::Path::new(&dir).is_dir() {
+            result.record_fail(AssertDetail::new(
+                DetailKind::Other,
+                format!(
+                    "CgroupChurn: auto-created cgroup {dir} is missing — the \
+                     worker did not provision it under the workload root"
+                ),
+            ));
+        }
+    }
 
     Ok(result)
 }

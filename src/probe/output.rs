@@ -83,10 +83,10 @@ fn format_cpumask_display(cpumask_words: &[u64; 4], nr_cpus: Option<u32>) -> Str
 /// from after `start` to end-of-buffer — this is intentional and the
 /// truncated-payload recovery path in
 /// `crate::test_support::probe::extract_probe_output` depends on
-/// it: when the repro VM dies mid-`println!`, COM2 captures the
-/// `start` sentinel plus a partial JSON object but never gets to
-/// emit `end`, and the parser must still see the partial bytes to
-/// salvage what it can.
+/// it: when the repro VM dies mid-`println!`, the bulk-port stdout
+/// capture holds the `start` sentinel plus a partial JSON object but
+/// never gets the `end`, and the parser must still see the partial
+/// bytes to salvage what it can.
 // Used by test_support.rs; #[allow] suppresses false positive from binary crate.
 #[allow(dead_code)]
 pub(crate) fn extract_section(text: &str, start: &str, end: &str) -> String {

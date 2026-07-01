@@ -15,13 +15,23 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 use zerocopy::IntoBytes;
 
 use super::topology::apic_id;
-use crate::vmm::kvm::HIMEM_START;
+use crate::vmm::kvm::{
+    ACPI_PM_TMR_PORT, ACPI_PM1_CNT_PORT, ACPI_PM1_EVT_PORT, ACPI_SCI_IRQ, HIMEM_START,
+    PCI_ECAM_BASE, PCI_ECAM_SIZE, PCI_MMIO_BAR_BASE, PCI_MMIO_BAR_SIZE, virtio_blk_pci_gsi,
+    virtio_blk_pci_slot, virtio_net_gsi, virtio_net_pci_slot,
+};
 use crate::vmm::numa_mem::NumaMemoryLayout;
 use crate::vmm::topology::Topology;
+
+mod aml;
 
 // RSDP at fixed address in BIOS ROM area — firmware scans for it here.
 const RSDP_ADDR: u64 = 0x000E_0000;
 const RSDP_SIZE: u64 = 36;
+
+/// MCFG table size: 36-byte SDT header + 8 reserved + one 16-byte ECAM
+/// allocation (base u64, segment u16, start_bus u8, end_bus u8, reserved u32).
+const MCFG_SIZE: u64 = 36 + 8 + 16;
 
 /// Addresses and sizes of all ACPI tables after dynamic placement.
 #[derive(Debug, Clone, Copy)]
@@ -39,6 +49,8 @@ pub struct AcpiLayout {
     pub slit_size: u64,
     pub hmat_addr: u64,
     pub hmat_size: u64,
+    pub mcfg_addr: u64,
+    pub mcfg_size: u64,
     pub rsdt_addr: u64,
     pub rsdt_size: u64,
     pub xsdt_addr: u64,
@@ -258,6 +270,9 @@ pub fn setup_acpi(
     mem: &GuestMemoryMmap,
     topo: &Topology,
     numa_layout: &NumaMemoryLayout,
+    pci_enabled: bool,
+    nic_count: usize,
+    blk_attached: bool,
 ) -> Result<AcpiLayout> {
     let num_cpus = topo.total_cpus();
 
@@ -296,8 +311,55 @@ pub fn setup_acpi(
          would clobber guest RAM",
     );
 
+    // NIC axis: each virtio-net function takes one INTx GSI from the IOAPIC
+    // line budget (virtio_net_gsi maps 0..MAX_VIRTIO_NICS into {7,8,10..=23}).
+    // setup_acpi is a pub fn, so reject an out-of-range count here (the VM
+    // builder caps it too) rather than emit _PRT routes whose slot/GSI fall
+    // past virtio_net_pci_slot/virtio_net_gsi's valid range.
+    ensure!(
+        nic_count <= crate::vmm::kvm::MAX_VIRTIO_NICS,
+        "nic_count {nic_count} exceeds MAX_VIRTIO_NICS ({}) — the virtio-pci \
+         INTx GSI budget; each NIC needs a distinct IOAPIC line",
+        crate::vmm::kvm::MAX_VIRTIO_NICS,
+    );
+
     // Compute table sizes.
-    let dsdt_size: u64 = 36;
+    //
+    // DSDT body: when PCI is enabled it carries the _SB.PCI0 host-bridge AML;
+    // otherwise it is empty (a header-only DSDT, byte-identical to the
+    // pre-PCI table). dsdt_size is derived from the actual body length so the
+    // contiguous table placement and the FADT X_DSDT pointer stay correct.
+    let dsdt_body: Vec<u8> = if pci_enabled {
+        // One _PRT entry per virtio-net function: NIC i sits at PCI slot
+        // virtio_net_pci_slot(i) and routes INTA# -> virtio_net_gsi(i). Both
+        // are constant-driven (no literals here) so a retune of the slot/GSI
+        // allocator can't drift these routes. nic_count == 0 yields an empty
+        // route list (PCI enabled without a NIC): the DSDT carries the PCI0
+        // host bridge with no _PRT entries, which is correct — there is no
+        // device at any slot to consult.
+        let mut irq_routes: Vec<(u32, u32)> = (0..nic_count)
+            .map(|i| (virtio_net_pci_slot(i) as u32, virtio_net_gsi(i)))
+            .collect();
+        // virtio-blk INTx route (when a disk is attached): the block function
+        // sits at PCI slot virtio_blk_pci_slot() and routes INTA# ->
+        // virtio_blk_pci_gsi(). Constant-driven like the NIC routes. INTx is the
+        // guest's fallback if it declines MSI-X (the facade also advertises an
+        // MSI-X cap); the _PRT entry must exist so acpi_pci_irq_enable can set
+        // the device's pci_dev->irq either way.
+        if blk_attached {
+            irq_routes.push((virtio_blk_pci_slot() as u32, virtio_blk_pci_gsi()));
+        }
+        aml::pci_host_bridge_dsdt_body(
+            PCI_ECAM_BASE as u32,
+            PCI_ECAM_SIZE as u32,
+            PCI_MMIO_BAR_BASE as u32,
+            (PCI_MMIO_BAR_BASE + PCI_MMIO_BAR_SIZE - 1) as u32,
+            &irq_routes,
+        )
+    } else {
+        Vec::new()
+    };
+    let dsdt_size: u64 = 36 + dsdt_body.len() as u64;
 
     let madt_size = compute_madt_size(topo) as u64;
 
@@ -333,8 +395,11 @@ pub fn setup_acpi(
         0
     };
 
-    // Table count: FADT + MADT + SRAT + SLIT + optional HMAT.
-    let table_count: u64 = if emit_hmat { 5 } else { 4 };
+    // MCFG (PCI ECAM base description) is emitted only when PCI is enabled.
+    let mcfg_size: u64 = if pci_enabled { MCFG_SIZE } else { 0 };
+
+    // Table count: FADT + MADT + SRAT + SLIT + optional HMAT + optional MCFG.
+    let table_count: u64 = 4 + u64::from(emit_hmat) + u64::from(pci_enabled);
     let rsdt_size: u64 = 36 + table_count * 4;
     let xsdt_size: u64 = 36 + table_count * 8;
 
@@ -358,6 +423,9 @@ pub fn setup_acpi(
 
     let hmat_addr = cursor;
     cursor += hmat_size;
+
+    let mcfg_addr = cursor;
+    cursor += mcfg_size;
 
     let rsdt_addr = cursor;
     cursor += rsdt_size;
@@ -392,6 +460,8 @@ pub fn setup_acpi(
         slit_size,
         hmat_addr,
         hmat_size,
+        mcfg_addr,
+        mcfg_size,
         rsdt_addr,
         rsdt_size,
         xsdt_addr,
@@ -400,13 +470,16 @@ pub fn setup_acpi(
         rsdp_size: RSDP_SIZE,
     };
 
-    write_dsdt(mem, dsdt_addr)?;
+    write_dsdt(mem, dsdt_addr, &dsdt_body)?;
     write_madt(mem, topo, madt_addr)?;
     write_fadt(mem, &layout)?;
     write_srat(mem, topo, numa_layout, srat_addr)?;
     write_slit(mem, topo, slit_addr)?;
     if emit_hmat {
         write_hmat(mem, topo, numa_layout, hmat_addr)?;
+    }
+    if pci_enabled {
+        write_mcfg(mem, &layout)?;
     }
     write_rsdt(mem, &layout)?;
     write_xsdt(mem, &layout)?;
@@ -473,13 +546,41 @@ fn rsdt_entries(layout: &AcpiLayout) -> Vec<u64> {
     if layout.hmat_size > 0 {
         entries.push(layout.hmat_addr);
     }
+    if layout.mcfg_size > 0 {
+        entries.push(layout.mcfg_addr);
+    }
     entries
 }
 
-fn write_dsdt(mem: &GuestMemoryMmap, addr: u64) -> Result<()> {
-    let mut buf = vec![0u8; 36];
-    let hdr = SdtHeader::new(b"DSDT", 36, 2);
+/// MCFG — PCI Express memory-mapped configuration space base address
+/// description table (one ECAM allocation: base = `PCI_ECAM_BASE`, segment 0,
+/// buses [0, 0]). The guest's `pci_mcfg_lookup` reads this to map the ECAM
+/// window for extended config access (drivers/acpi/pci_mcfg.c).
+fn write_mcfg(mem: &GuestMemoryMmap, layout: &AcpiLayout) -> Result<()> {
+    let len = layout.mcfg_size as usize;
+    let mut buf = vec![0u8; len];
+    let hdr = SdtHeader::new(b"MCFG", len as u32, 1);
     buf[..36].copy_from_slice(hdr.as_bytes());
+    // bytes 36..44: reserved (zero). Allocation entry at offset 44:
+    buf[44..52].copy_from_slice(&PCI_ECAM_BASE.to_le_bytes()); // base address
+    buf[52..54].copy_from_slice(&0u16.to_le_bytes()); // PCI segment group 0
+    buf[54] = 0; // start bus number
+    // End bus: single bus, since PCI_ECAM_SIZE = ECAM_BYTES_PER_BUS (1 bus).
+    // If ECAM ever widens to N buses, derive end_bus = (PCI_ECAM_SIZE >> 20) - 1.
+    buf[55] = 0;
+    // bytes 56..60: reserved (zero).
+    set_sdt_checksum(&mut buf);
+    mem.write_slice(&buf, GuestAddress(layout.mcfg_addr))
+        .context("write MCFG")?;
+    Ok(())
+}
+
+fn write_dsdt(mem: &GuestMemoryMmap, addr: u64, body: &[u8]) -> Result<()> {
+    let len = 36 + body.len();
+    let mut buf = vec![0u8; len];
+    let hdr = SdtHeader::new(b"DSDT", len as u32, 2);
+    buf[..36].copy_from_slice(hdr.as_bytes());
+    buf[36..].copy_from_slice(body);
     set_sdt_checksum(&mut buf);
     mem.write_slice(&buf, GuestAddress(addr))
         .context("write DSDT")?;
@@ -494,9 +595,93 @@ fn write_fadt(mem: &GuestMemoryMmap, layout: &AcpiLayout) -> Result<()> {
     buf[40..44].copy_from_slice(&(layout.dsdt_addr as u32).to_le_bytes());
     // X_DSDT at offset 140 (64-bit)
     buf[140..148].copy_from_slice(&layout.dsdt_addr.to_le_bytes());
+    // FADT fixed-feature flags. PWR_BUTTON|SLP_BUTTON mark the power/sleep
+    // buttons as ABSENT-as-fixed-features (ktstr has no buttons; ACPI 6.x
+    // FADT bit4/bit5: set => not a fixed-hardware button). This intentionally
+    // diverges from qemu's i440fx/q35 model the PM blocks otherwise follow:
+    // qemu sets USE_PLATFORM_CLOCK (bit15, for a real ACPI PM timer) and leaves
+    // the button bits clear. ktstr clears USE_PLATFORM_CLOCK because its PM
+    // timer is a liveness-only stub (`acpi_pm_timer_value`, ~0.13% fast).
+    // init_acpi_pm_clocksource (drivers/clocksource/acpi_pm.c:208) never reads
+    // the FADT platform-clock flag — it gates on `pmtmr_ioport != 0` (set from
+    // the PM_TMR block we advertise), runs a monotonicity check + verify_pmtmr_
+    // rate, then clocksource_register_hz. But whether acpi_pm actually REGISTERS
+    // depends on the irqchip mode: verify_pmtmr_rate (acpi_pm.c:178) calibrates
+    // the PM timer against PIT channel 2 (mach_prepare_counter/mach_countup,
+    // I/O ports 0x61/0x42). On the full-irqchip path KVM's in-kernel PIT
+    // services those ports, so verify passes and acpi_pm registers; on the
+    // split-irqchip path there is no KVM PIT (kvm.rs setup_irqchip skips
+    // create_pit2), 0x61/0x42 fall through to 0xFF in exit_dispatch, the count
+    // loop terminates instantly, verify_pmtmr_rate returns -1, and
+    // init_acpi_pm_clocksource returns -ENODEV WITHOUT registering. Either way
+    // acpi_pm is never SELECTED for timekeeping (on full-irqchip it is
+    // rating-outranked by kvm-clock; on split-irqchip it is not registered), and
+    // ACPI-enable / PCI-INTx routing do not depend on it — the PM_TMR is
+    // advertised so ACPICA's PM-block/fixed-event init does not fault, not so
+    // acpi_pm registers. HW_REDUCED (bit20) stays clear — this is a
+    // full-ACPI FADT with the PM register blocks emitted below. Were it
+    // set, acpi_generic_reduced_hw_init (arch/x86/kernel/acpi/boot.c)
+    // would bypass only the legacy 8259 PIC + legacy timer
+    // (legacy_pic = &null_legacy_pic), NOT the MADT IOAPIC, so the
+    // IOAPIC-routed IRQs would survive regardless.
     let flags = FADT_F_PWR_BUTTON | FADT_F_SLP_BUTTON;
     buf[112..116].copy_from_slice(&flags.to_le_bytes());
-    buf[131] = 5;
+    buf[131] = 5; // FADT minor revision (header major revision 6 => ACPI 6.5)
+
+    // ACPI PM register blocks (non-hardware-reduced full ACPI; qemu
+    // i440fx/q35 model). Emitted for EVERY x86 guest, NOT gated on pci_enabled
+    // (unlike the DSDT `_PRT` + MCFG, which are PCI-specific): the AE_BAD_ADDRESS
+    // fault below is a fixed-event-init fault that hits ANY guest enabling ACPI
+    // (CONFIG_ACPI=y), independent of PCI — so the PM blocks must always be
+    // present, while PCI INTx routing only needs the `_PRT` when a NIC exists.
+    // Without these the guest's ACPICA faults
+    // (AE_BAD_ADDRESS) initializing fixed events, ACPI never enables, and
+    // PCI INTx falls back to legacy MP-table routing — which can't route the
+    // virtio-net PCI function. With them ACPI enables and routes PCI INTx via
+    // the DSDT `_PRT`. The cmdline virtio-MMIO console + serial IRQs route
+    // via the MADT IOAPIC, independent of the FADT HW_REDUCED bit (which
+    // would bypass only the 8259 PIC, not the IOAPIC; acpi_pci_irq_enable
+    // in drivers/acpi/pci_irq.c is itself reduced_hardware-independent).
+    // The ports are stub-emulated in exit_dispatch (no real power
+    // management). The X_* 64-bit GAS variants are left zero — ACPICA
+    // synthesizes them from these 32-bit legacy blocks: acpi_tb_convert_fadt
+    // (drivers/acpi/acpica/tbfadt.c) calls acpi_tb_init_generic_address for
+    // each X_ field and, when the X_ GAS address is zero and the legacy 32-bit
+    // block is non-zero, builds the GAS from the legacy block (space_id
+    // SYSTEM_IO). A zero legacy block is what acpi_hw_validate_register then
+    // rejects with AE_BAD_ADDRESS — which is exactly the fault this fix avoids.
+    // GPE0_BLK (offset 80) + GPE0_BLK_LEN (offset 92), and PM2_CNT
+    // (PM2_CNT_BLK @72 / PM2_CNT_LEN @90 — offset 91 is PM_TMR_LEN, written
+    // below), are intentionally left zero — ktstr emulates no GPE block or PM2
+    // control (it arms no general-purpose events), diverging from qemu's
+    // i440fx/q35 model, which populates GPE0_BLK for its PM device (qemu's
+    // microvm/no-GPE model leaves it zero, like ktstr). acpi_tb_convert_fadt
+    // (tbfadt.c) flags these
+    // SEPARATE_LENGTH/optional: a FULLY-zero optional block is silently
+    // accepted (the BIOS_WARNING fires only on a half-set address/length pair),
+    // and only the REQUIRED PM1a EVT/CNT blocks raise BIOS_ERROR when zero —
+    // both of those are populated above.
+    // SCI_INT: the inert SCI GSI (no fixed event / GPE is ever armed, so it
+    // never fires; no MADT ISO needed — see ACPI_SCI_IRQ).
+    buf[46..48].copy_from_slice(&ACPI_SCI_IRQ.to_le_bytes());
+    buf[56..60].copy_from_slice(&u32::from(ACPI_PM1_EVT_PORT).to_le_bytes()); // PM1a_EVT_BLK
+    buf[64..68].copy_from_slice(&u32::from(ACPI_PM1_CNT_PORT).to_le_bytes()); // PM1a_CNT_BLK
+    buf[76..80].copy_from_slice(&u32::from(ACPI_PM_TMR_PORT).to_le_bytes()); // PM_TMR_BLK
+    // PM1_EVT_LEN=4: a 4-byte PM1a event block. ACPICA splits it as two
+    // separate 16-bit registers — PM1_STATUS @ PM1a_EVT_BLK (0x600) and
+    // PM1_ENABLE @ PM1a_EVT_BLK + PM1_EVT_LEN/2 (0x602) — both served by the
+    // exit_dispatch PM stub's 0x600..0x606 range.
+    buf[88] = 4; // PM1_EVT_LEN (status u16 @ +0, enable u16 @ +2)
+    buf[89] = 2; // PM1_CNT_LEN (control u16)
+    buf[91] = 4; // PM_TMR_LEN (32-bit register; 24-bit counter)
+    // IA-PC Boot Architecture Flags (offset 109): bit1 = 8042 present (ktstr
+    // emulates the i8042 for reboot=k, so the guest probes it) | bit2 =
+    // VGA_NOT_PRESENT (ktstr emulates no VGA, so the guest must not probe the
+    // VGA I/O ports / legacy framebuffer). Only bit2 matches firecracker's
+    // microvm FADT, which sets 0x0004 (VGA_NOT_PRESENT alone); bit1 (8042) is
+    // ktstr-specific — firecracker has no i8042 so it leaves that bit clear.
+    buf[109..111].copy_from_slice(&0x0006u16.to_le_bytes());
+
     set_sdt_checksum(&mut buf);
     mem.write_slice(&buf, GuestAddress(layout.fadt_addr))
         .context("write FADT")?;

@@ -152,6 +152,21 @@ pub struct GauntletRow {
     /// local), this describes the run-environment provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_source: Option<String>,
+    /// Scheduler-resolution provenance carried from
+    /// [`crate::test_support::SidecarResult::resolve_source`] —
+    /// the snake_case discovery-path tag (`"auto_built"`,
+    /// `"target_debug"`, `"path"`, ...). `None` for sidecars produced
+    /// before the field existed (pre-1.0 disposable schema) and for skip
+    /// rows (no binary resolved). Surfaced via the typed
+    /// [`RowFilter::resolve_sources`] (`--resolve-source` /
+    /// `--a-resolve-source` / `--b-resolve-source`) for narrowing +
+    /// pairing — same opt-in policy as `run_source` — and listed by
+    /// `stats list-values`. Provenance, not identity: distinct
+    /// from `scheduler` / `kernel_commit` — it records HOW the scheduler
+    /// binary was found, so a reader can tell an auto-built-from-HEAD run
+    /// from a possibly-stale `target/` or `$PATH` binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolve_source: Option<String>,
     /// True when the underlying [`crate::assert::AssertResult::is_pass`] returned
     /// true at sidecar emission time — a real pass with at least one
     /// observed outcome and no Fail/Inconclusive/Skip. Mutually
@@ -179,6 +194,15 @@ pub struct GauntletRow {
     /// real regressions.
     #[serde(default)]
     pub inconclusive: bool,
+    /// True when this row's source run was an `expect_err` /
+    /// `expect_auto_repro` test whose actual scenario failure was
+    /// inverted to a pass — its telemetry is failure-mode-dominated
+    /// (short / stalled run), so [`compare_rows_by`] excludes it from
+    /// the regression math even though [`passed`](Self::passed) is now
+    /// `true`. Carried from `SidecarResult::expected_failure`;
+    /// OR-folded across a cohort in `group_and_average_by`.
+    #[serde(default)]
+    pub expected_failure: bool,
     /// Number of monitor samples this run was averaged over —
     /// the natural per-RUN weight for `Gauge(Avg)` metrics when
     /// folded across multiple runs at cross-RUN comparison time
@@ -300,21 +324,26 @@ pub struct GauntletRow {
     // the per-cgroup counters); `MetricDef::read` surfaces them via the ext
     // fallback. The `worst_` naming convention is documented on [`METRICS`].
     // NUMA fields.
-    /// Worst-case per-cgroup NUMA page-locality fraction (lowest
-    /// non-zero). Surfaced in [`METRICS`] under registry name
-    /// `worst_page_locality`; see the triples table on
-    /// [`METRICS`] for the registry/field/column rationale.
-    pub page_locality: f64,
-    /// Worst-case cross-node migration ratio. Surfaced in
-    /// [`METRICS`] under registry name
-    /// `worst_cross_node_migration_ratio`; see the triples table
-    /// on [`METRICS`] for the registry/field/column rationale.
-    pub cross_node_migration_ratio: f64,
+    // Neither NUMA roll-up is a typed GauntletRow column any longer:
+    // worst_page_locality is `MetricKind::WorstLowest` (NumaLocal/NumaTotal) and
+    // worst_cross_node_migration_ratio is `MetricKind::WorstCrossNodeRatio`, both
+    // ext-sourced (re-pooled from the per-phase NUMA carriers by
+    // populate_run_distribution_metrics); `MetricDef::read` surfaces them via the
+    // ext fallback, so no typed columns.
     /// Extensible metrics populated by scenarios and processed by the
     /// comparison pipeline. Keyed by metric name; looked up via
     /// [`metric_def`] when a matching entry exists in [`METRICS`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ext_metrics: BTreeMap<String, f64>,
+    /// The subset of [`Self::ext_metrics`] keys that are Dynamic monotonic
+    /// counters (the level-suffixed `lb_*`/`alb_*` schedstat deltas + any
+    /// `ScalarCounter` watched bpf field). These keys are not in the static
+    /// `METRICS` registry, so the cross-run aggregator (`fold_ext_metrics`)
+    /// consults this set to SUM-fold them instead of averaging — matching the
+    /// registered-Counter cross-run convention. Empty when the run has no
+    /// monitor or no Dynamic counter keys.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub ext_counter_keys: BTreeSet<String>,
     /// Per-phase metric buckets carried verbatim from the source
     /// sidecar's [`crate::assert::ScenarioStats::phases`]. Each
     /// [`crate::assert::PhaseBucket`] surfaces the metric values
@@ -487,6 +516,18 @@ pub struct RowFilter {
     /// [`crate::cache::KernelSource`] — those describe the kernel
     /// build's input, this describes the run-environment provenance.
     pub run_sources: Vec<String>,
+    /// Repeatable scheduler-resolution-source filter, OR-combined: a
+    /// row matches iff its `GauntletRow::resolve_source` equals ANY
+    /// entry. Empty vec disables the filter. A row whose
+    /// `resolve_source` is `None` (sidecar pre-dates the field, or a
+    /// skip resolved no binary) never matches a non-empty filter —
+    /// same opt-in semantic as `run_sources`. Values are the
+    /// [`crate::test_support::ResolveSource::as_str`] tags
+    /// (`"auto_built"`, `"target_debug"`, `"path"`, ...). Distinct from
+    /// `run_sources` (the run ENVIRONMENT): this is HOW the scheduler
+    /// binary was found. Backs the [`Dimension::ResolveSource`] slice
+    /// (`--resolve-source` / `--a-resolve-source` / `--b-resolve-source`).
+    pub resolve_sources: Vec<String>,
     /// Repeatable cpu-budget filter, OR-combined: a row matches iff its
     /// `GauntletRow::cpu_budget` (the effective host-CPU budget, as a
     /// decimal string) equals ANY entry. Empty vec disables the filter.
@@ -600,6 +641,22 @@ impl RowFilter {
                 .run_sources
                 .iter()
                 .any(|want| row_run_source == Some(want.as_str()));
+            if !any {
+                return false;
+            }
+        }
+        if !self.resolve_sources.is_empty() {
+            // OR-combined match against `GauntletRow::resolve_source`,
+            // mirroring the `run_sources` opt-in policy: a row whose
+            // `resolve_source` is `None` (sidecar pre-dates the field,
+            // or a skip resolved no binary) never matches a populated
+            // filter, so a `--resolve-source` argument demands a tagged
+            // row rather than acting as a wildcard.
+            let row_resolve_source = row.resolve_source.as_deref();
+            let any = self
+                .resolve_sources
+                .iter()
+                .any(|want| row_resolve_source == Some(want.as_str()));
             if !any {
                 return false;
             }

@@ -74,6 +74,13 @@ pub(crate) mod freeze_coord;
 pub(crate) mod initramfs_cache;
 pub(crate) mod net_config;
 pub(crate) mod numa_mem;
+// The virtio-PCI transport (host bridge, ECAM/CAM decode, config space) is
+// x86_64-only. aarch64 references only the `PciBus` TYPE — as an always-`None`
+// `Option` in the arch-neutral run loop — so the module compiles there but its
+// host-bridge/ECAM machinery is never called; allow that dead code on non-x86
+// (x86_64 lints the module fully — the allow is gated off there).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) mod pci;
 pub(crate) mod result;
 pub(crate) mod rust_init;
 pub(crate) mod sched_stats;
@@ -81,6 +88,12 @@ pub(crate) mod setup;
 pub(crate) mod vcpu;
 pub(crate) mod virtio_blk;
 pub(crate) mod virtio_console;
+// Shared MSI-X interrupt-delivery state (`MsixState`/`IrqSource`/`MsixRouteSink`)
+// for the virtio PCI facades (net + blk). The device cores use `MsixState` on all
+// arches, but its PCI-only constructors (`new`/`set_eventfd`) are wired only on
+// x86_64, so allow their dead code on non-x86 (x86_64 lints the module fully).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) mod virtio_msix;
 pub(crate) mod virtio_net;
 
 // Bulk transport modules. The wire format (`wire`), the host-side
@@ -149,8 +162,8 @@ pub(crate) use contention::{
 pub(crate) use pi_mutex::PiMutex;
 pub(crate) use terminal::TerminalRawGuard;
 pub(crate) use vcpu::{
-    BpfMapWriteParams, ImmediateExitHandle, register_vcpu_signal_handler, set_thread_cpumask,
-    vcpu_signal,
+    BpfMapWriteParams, ImmediateExitHandle, WatchBpfMapParams, register_vcpu_signal_handler,
+    set_thread_cpumask, vcpu_signal,
 };
 pub(crate) use vmlinux::find_vmlinux;
 
@@ -206,6 +219,13 @@ pub(crate) use x86_64::kvm::IoapicHandle;
 #[cfg(not(target_arch = "x86_64"))]
 pub(crate) enum IoapicHandle {}
 
+/// Full-irqchip shared GSI route owner ([`x86_64::kvm::FullIrqchipRouteOwner`]).
+/// x86-only: it owns the device MSI-X routes on the in-kernel-irqchip path and is
+/// referenced solely from x86-gated run/setup code, so there is no aarch64
+/// placeholder (the GIC routes device IRQs there).
+#[cfg(target_arch = "x86_64")]
+pub(crate) use x86_64::kvm::FullIrqchipRouteOwner;
+
 pub use topology::Topology;
 
 use anyhow::{Context, Result};
@@ -242,6 +262,13 @@ const DRAM_BASE: u64 = kvm::DRAM_START;
 /// start_bpf_map_write, run_bsp_loop, collect_results).
 pub struct KtstrVm {
     pub(crate) kernel: PathBuf,
+    /// Whether the guest exposes the virtio-PCI transport (PCI host bridge +
+    /// ECAM/CAM config access + the PCI ACPI tables). Off by default;
+    /// propagated to `KtstrKvm::pci_enabled` and gates the `pci=off` cmdline
+    /// token. x86_64-only in effect: aarch64 has no PCI transport, so the flag
+    /// is never propagated or read there — it stays for a uniform builder API.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    pub(crate) pci_enabled: bool,
     pub(crate) init_binary: Option<PathBuf>,
     pub(crate) scheduler_binary: Option<PathBuf>,
     /// Additional schedulers packed into the initramfs alongside
@@ -345,6 +372,13 @@ pub struct KtstrVm {
     /// before the guest is signaled via SHM slot 0, so the guest
     /// sees a single unblock regardless of how many writes ran.
     pub(crate) bpf_map_writes: Vec<BpfMapWriteParams>,
+    /// Named scheduler BPF-map fields to read observer-effect-free from the
+    /// free-running monitor into run-level metrics (lowered from the test
+    /// entry's `watch_bpf_maps`). The monitor resolves + reads each lazily
+    /// after the scheduler attaches; values surface via
+    /// [`crate::vmm::result::VmResult::run_metric`] under
+    /// `<scheduler-obj>_<label>` / `_<label>_{avg,max}`.
+    pub(crate) watch_bpf_maps: Vec<WatchBpfMapParams>,
     /// Performance mode: vCPU pinning to host LLCs, hugepage-backed
     /// guest memory, NUMA mbind, and RT scheduling on both
     /// architectures. On x86_64, additionally: KVM_HINTS_REALTIME
@@ -421,23 +455,24 @@ pub struct KtstrVm {
     /// Files to include in the guest initramfs at their archive paths.
     /// Each entry is (archive_path, host_path).
     pub(crate) include_files: Vec<(String, PathBuf)>,
-    /// v0 holds at most one DiskConfig; rendered as `/dev/vda`.
-    /// Vec retained for future multi-disk expansion. The backing
-    /// file is produced by the template-VM lifecycle (one-time
-    /// guest-side `mkfs.<fstype>` against a sparse image, cached
-    /// alongside the kernel; per-test reflink-copy at fan-out).
-    /// Per-test boots populate the backing via the `Raw` tempfile
-    /// or `Btrfs` cache-clone branches in
-    /// [`KtstrVm::init_virtio_blk`]; the disk-template-build VM
-    /// driver overrides both branches via
-    /// [`Self::template_staging_image`] so it can format a
-    /// host-staged image without re-entering its own cache.
-    pub(crate) disks: Vec<disk_config::DiskConfig>,
-    /// Optional network device. `None` skips virtio-net entirely:
-    /// no FDT node, no MMIO range, no IRQ. `Some(_)` attaches one
-    /// virtio-net device whose backend is the in-VMM loopback (TX
-    /// bytes echoed back into RX). v0 supports a single device.
-    pub(crate) network: Option<net_config::NetConfig>,
+    /// The optional single virtio-blk disk, rendered as `/dev/vda`. ktstr
+    /// wires one blk device; multi-disk would be N PCI functions (re-addable
+    /// pre-1.0). The backing file is produced by the template-VM lifecycle
+    /// (one-time guest-side `mkfs.<fstype>` against a sparse image, cached
+    /// alongside the kernel; per-test reflink-copy at fan-out). Per-test
+    /// boots populate the backing via the `Raw` tempfile or `Btrfs`
+    /// cache-clone branches in [`KtstrVm::open_blk_backing`]; the
+    /// disk-template-build VM driver overrides both branches via
+    /// [`Self::template_staging_image`] so it can format a host-staged
+    /// image without re-entering its own cache.
+    pub(crate) disk: Option<disk_config::DiskConfig>,
+    /// Network devices. Empty skips virtio-net entirely (no NIC function /
+    /// FDT node, no IRQ). Each entry attaches one virtio-net device whose
+    /// backend is the in-VMM loopback (TX bytes echoed back into RX). On
+    /// x86_64 each is a virtio-pci function on its own slot/GSI
+    /// (`kvm::virtio_net_pci_slot` / `kvm::virtio_net_gsi`, bounded by
+    /// `kvm::MAX_VIRTIO_NICS`); aarch64 supports a single virtio-MMIO NIC.
+    pub(crate) networks: Vec<net_config::NetConfig>,
     /// Internal-only override for `init_virtio_blk`'s per-test
     /// backing-file allocation. `Some(path)` makes the device open
     /// `path` directly instead of allocating a fresh `tempfile()`
@@ -518,17 +553,25 @@ pub struct KtstrVm {
     #[allow(dead_code)]
     pub(crate) workload_duration: Option<Duration>,
     /// Periodic snapshot count: when non-zero, the freeze
-    /// coordinator divides the 10%–90% slice of
-    /// [`Self::workload_duration`] into `num_snapshots`
-    /// equally-spaced boundaries (anchored at the first
-    /// `MSG_TYPE_SCENARIO_START` the coordinator observes) and
-    /// fires a host-side `freeze_and_capture(false)` at each one,
-    /// tagged `"periodic_NNN"` and stored on the host's
-    /// [`crate::scenario::snapshot::SnapshotBridge`]. `0` (the
-    /// default) disables the periodic-capture loop entirely.
-    /// Plumbed through [`KtstrVmBuilder::num_snapshots`]; the
-    /// test-entry plumbing comes from
-    /// [`crate::test_support::KtstrTestEntry::num_snapshots`].
+    /// coordinator slices the capturable window into `num_snapshots`
+    /// equally-spaced boundaries (a 10 % pre / 10 % post buffer
+    /// reserves the ramp edges) and fires a host-side
+    /// `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })`
+    /// at each one, tagged
+    /// `"periodic_NNN"` and stored on the host's
+    /// [`crate::scenario::snapshot::SnapshotBridge`]. The window is
+    /// `[max(scenario_start, prereqs_ready), scenario_start +
+    /// workload_duration]`: the start floats to the prereq-ready
+    /// moment so cold-boot accessor/attach latency cannot strand
+    /// boundaries in the already-past pre-ready region, and the end
+    /// is CLAMPED to the workload end so a cold-boot-late start
+    /// cannot push captures into post-workload idle. On a warm boot
+    /// the start equals `scenario_start`, so the window is the full
+    /// `[scenario_start, scenario_start + workload_duration]`. `0`
+    /// (the default) disables the periodic-capture loop entirely.
+    /// Plumbed through
+    /// [`KtstrVmBuilder::num_snapshots`]; the test-entry plumbing
+    /// comes from [`crate::test_support::KtstrTestEntry::num_snapshots`].
     pub(crate) num_snapshots: u32,
     /// Lazy on-demand BPF cast-analysis handle for the scheduler
     /// binary's embedded BPF object(s). Populated by
@@ -596,17 +639,18 @@ struct RunLocks {
     pinning_plan: Option<host_topology::PinningPlan>,
 }
 
-/// Human-readable summary of the userspace IOAPIC's device-IRQ routing
-/// failures, for `run_interactive`'s teardown. `None` when there were none.
-/// `n` is `IoapicHandle::routing_failures()` — the count of
-/// `KVM_SET_GSI_ROUTING` installs that errored, each leaving a
-/// guest-programmed device IRQ unrouted (the device hangs on first use).
-/// Surfaced in interactive mode because the operator's terminal shows the
-/// guest console, not the host's per-failure tracing, so an unrouted IRQ
-/// would otherwise be a silent device hang. x86-only: the userspace IOAPIC
-/// (and `IoapicHandle::routing_failures`) is split-irqchip-specific; on
-/// aarch64 `IoapicHandle` is an empty-enum placeholder (the GIC routes
-/// device IRQs directly), so there is nothing to summarize.
+/// Human-readable summary of device-IRQ routing-install failures, for
+/// `run_interactive`'s teardown. `None` when there were none. `n` is a count of
+/// `KVM_SET_GSI_ROUTING` installs that errored, each leaving a device IRQ
+/// unrouted (the device hangs on first use). Called for BOTH x86 route owners:
+/// the split-irqchip userspace IOAPIC (`IoapicHandle::routing_failures`) and the
+/// full-irqchip MSI-X route owner (`FullIrqchipRouteOwner::routing_failures`);
+/// the body is transport-neutral and summarizes either. Surfaced in interactive
+/// mode because the operator's terminal shows the guest console, not the host's
+/// per-failure tracing, so an unrouted IRQ would otherwise be a silent device
+/// hang. x86-only: both route owners are x86 (on aarch64 the GIC routes device
+/// IRQs directly and `IoapicHandle` is an empty-enum placeholder), so there is
+/// nothing to summarize.
 #[cfg(target_arch = "x86_64")]
 fn routing_failure_summary(n: u64) -> Option<String> {
     (n > 0).then(|| {
@@ -1020,11 +1064,11 @@ impl KtstrVm {
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
 
-        // Userspace IOAPIC handle for the split-irqchip path (>254 vCPUs),
+        // Userspace IOAPIC handle for the split-irqchip path (>254 max APIC ID),
         // mirroring run_vm: the device + the raw VM fd, threaded into
         // spawn_ap_threads + run_bsp_loop so the interactive shell's serial /
         // virtio-console IRQs route via the userspace IOAPIC. `None` for
-        // <=254 vCPUs (in-kernel IOAPIC).
+        // <=254 max APIC ID (in-kernel IOAPIC).
         // x86-only (mirrors run_vm): aarch64 has no userspace IOAPIC — the
         // GIC routes device IRQs and `IoapicHandle` is the uninhabited
         // placeholder — so the handle is always `None` there.
@@ -1037,6 +1081,41 @@ impl KtstrVm {
         });
         #[cfg(not(target_arch = "x86_64"))]
         let ioapic_handle: Option<Arc<crate::vmm::IoapicHandle>> = None;
+
+        // Full-irqchip shared GSI route owner (inverse of `ioapic_handle`):
+        // `Some` only on the full in-kernel irqchip path with PCI enabled, where
+        // it owns the device MSI-X routes. `install_defaults` installs an explicit
+        // default routing table route-identical to KVM's implicit one, so the
+        // legacy INTx routes survive the first MSI-X `KVM_SET_GSI_ROUTING`
+        // (whole-table replace). `None` on split-irqchip / non-PCI shells.
+        #[cfg(target_arch = "x86_64")]
+        let full_route_owner: Option<Arc<crate::vmm::FullIrqchipRouteOwner>> =
+            (!vm.split_irqchip && vm.pci_enabled).then(|| {
+                Arc::new(crate::vmm::FullIrqchipRouteOwner::new(
+                    std::os::unix::io::AsRawFd::as_raw_fd(&*vm.vm_fd),
+                ))
+            });
+        #[cfg(target_arch = "x86_64")]
+        if let Some(owner) = full_route_owner.as_ref() {
+            owner
+                .install_defaults()
+                .context("install full-irqchip default GSI routing")?;
+        }
+
+        // PCI host bridge handle (virtio-PCI transport), constructed only when
+        // this VM enables PCI; `None` keeps non-PCI shells byte-identical.
+        // Mirrors the run_vm construction. x86-only for now.
+        #[cfg(target_arch = "x86_64")]
+        let pci_bus_handle: Option<Arc<PiMutex<pci::PciBus>>> = if vm.pci_enabled {
+            Some(Arc::new(PiMutex::new(pci::PciBus::new(
+                kvm::PCI_ECAM_BASE,
+                kvm::PCI_ECAM_SIZE,
+            ))))
+        } else {
+            None
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let pci_bus_handle: Option<Arc<PiMutex<pci::PciBus>>> = None;
 
         // Virtio-console for shell I/O via /dev/hvc0.
         let mut vc = virtio_console::VirtioConsole::new();
@@ -1073,12 +1152,82 @@ impl KtstrVm {
                 .context("register virtio-console irqfd")?;
         }
 
-        // Optional virtio-blk for shell mode. `None` when the builder
-        // has no disks attached.
+        // Optional virtio-blk for shell mode. Transport is arch-split
+        // (mirrors virtio-net): x86_64 installs a virtio-pci function on
+        // `pci_bus_handle` (`virtio_blk_pci_slot()`, below); the MMIO handle is
+        // `None`, so the dispatch loops' MMIO blk arm goes inert and guest BAR
+        // accesses route through the PCI bus. The installed PciBus function owns
+        // the device Arc — shell mode needs neither counters (no `VmResult`) nor
+        // worker pause (no freeze coordinator); the INTx resample eventfd is kept
+        // alive below. aarch64 keeps the MMIO handle that drives the dispatch
+        // loops (aarch64 PCI is a later increment). `None` when no disk is
+        // attached.
+        #[cfg(target_arch = "x86_64")]
+        let virtio_blk: Option<Arc<PiMutex<virtio_blk::VirtioBlk>>> = None;
+        #[cfg(not(target_arch = "x86_64"))]
         let virtio_blk = self.init_virtio_blk(&vm)?;
 
-        // Optional virtio-net for shell mode. `None` when the builder
-        // has no `NetConfig` attached.
+        // Optional virtio-net for shell mode. Transport is arch-split
+        // (mirrors `run_vm`): x86_64 installs a virtio-pci function on
+        // `pci_bus_handle` (slot 1) and keeps the INTx resample eventfd
+        // alive for the run (KVM holds its raw fd); the MMIO handle is
+        // `None`, so the dispatch loops' MMIO net arm goes inert and
+        // guest BAR accesses route through the PCI bus. aarch64 keeps the
+        // MMIO handle that drives the dispatch loops (aarch64 PCI is a
+        // later increment). Shell mode discards the counters Arc (no
+        // `VmResult`). `None` when the builder has no `NetConfig`.
+        #[cfg(target_arch = "x86_64")]
+        let virtio_net: Option<Arc<PiMutex<virtio_net::VirtioNet>>> = None;
+        // The active GSI-route owner as the MSI-X route sink: `IoapicHandle` on
+        // split-irqchip, `FullIrqchipRouteOwner` on full (both impl
+        // `MsixRouteSink`). Threaded into `init_virtio_net_pci` so MSI-X is
+        // offered on both irqchip paths; cloned (Arc) so each owner stays
+        // available for the run loops + teardown routing diagnostics.
+        #[cfg(target_arch = "x86_64")]
+        let msix_sink: Option<Arc<dyn virtio_msix::MsixRouteSink>> = if vm.split_irqchip {
+            ioapic_handle
+                .clone()
+                .map(|h| h as Arc<dyn virtio_msix::MsixRouteSink>)
+        } else {
+            full_route_owner
+                .clone()
+                .map(|o| o as Arc<dyn virtio_msix::MsixRouteSink>)
+        };
+        #[cfg(target_arch = "x86_64")]
+        let _net_resample_evts: Vec<_> = match pci_bus_handle.as_ref() {
+            // One resample eventfd per NIC (Some only on the full-irqchip path);
+            // all are held alive for the shell run so KVM can de-assert each
+            // level GSI on guest EOI. Shell mode discards the counters.
+            Some(bus) => self
+                .init_virtio_net_pci(&vm, bus, msix_sink.clone())?
+                .into_iter()
+                .map(|h| h.resample_evt)
+                .collect(),
+            // No PCI bus => no NIC. The builder forces pci_enabled=true whenever
+            // a NetConfig is attached on x86_64, so this arm is only reached with
+            // no networks; assert that loudly so a future refactor decoupling
+            // networks from pci_enabled cannot silently drop NICs (no eth0).
+            None => {
+                debug_assert!(
+                    self.networks.is_empty(),
+                    "x86_64 NetConfig(s) attached but no PCI bus — NICs would be \
+                     silently dropped; pci_enabled must follow network()"
+                );
+                Vec::new()
+            }
+        };
+        // virtio-blk PCI install (x86_64). The device Arc is owned by the
+        // installed PciBus function; only the INTx resample eventfd is retained
+        // (held alive so KVM can de-assert the level GSI on guest EOI). `None`
+        // on split-irqchip or when no disk is attached.
+        #[cfg(target_arch = "x86_64")]
+        let _blk_resample_evt = match pci_bus_handle.as_ref() {
+            Some(bus) => self
+                .init_virtio_blk_pci(&vm, bus, msix_sink)?
+                .and_then(|h| h.resample_evt),
+            None => None,
+        };
+        #[cfg(not(target_arch = "x86_64"))]
         let virtio_net = self.init_virtio_net(&vm)?;
 
         // Non-interactive exec mode (--exec) does not need a TTY.
@@ -1182,6 +1331,7 @@ impl KtstrVm {
             virtio_blk.as_ref(),
             virtio_net.as_ref(),
             ioapic_handle.as_ref(),
+            pci_bus_handle.as_ref(),
             &kill,
             &kill_evt,
             &freeze,
@@ -1634,6 +1784,7 @@ impl KtstrVm {
             virtio_blk.as_ref(),
             virtio_net.as_ref(),
             ioapic_handle.as_ref(),
+            pci_bus_handle.as_ref(),
             &kill,
             &freeze,
             &watchpoint,
@@ -1723,6 +1874,18 @@ impl KtstrVm {
         #[cfg(target_arch = "x86_64")]
         if let Some(io) = &ioapic_handle
             && let Some(msg) = routing_failure_summary(io.routing_failures())
+        {
+            eprintln!("{msg}");
+        }
+
+        // Same surfacing for the full-irqchip MSI-X route owner (the inverse of
+        // ioapic_handle: Some only on the in-kernel-irqchip path). A failed
+        // KVM_SET_GSI_ROUTING for an MSI-X vector leaves that vector unrouted —
+        // the NIC hangs on first use — so an unrouted MSI-X install must not be
+        // silent on the operator's terminal in shell mode either.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(owner) = &full_route_owner
+            && let Some(msg) = routing_failure_summary(owner.routing_failures())
         {
             eprintln!("{msg}");
         }

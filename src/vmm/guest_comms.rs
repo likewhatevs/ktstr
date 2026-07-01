@@ -225,7 +225,13 @@ fn write_msg(msg_type: u32, payload: &[u8]) -> bool {
 /// `writev(2)` with two `iovec` slices, avoiding a per-call concat
 /// allocation. The host's [`super::bulk::HostAssembler`] tolerates
 /// partial frames in the byte stream, so any per-iovec virtqueue
-/// submissions reassemble correctly.
+/// submissions reassemble correctly. The kernel virtio_console driver
+/// caps each write at 32 KiB (`port_fops_write` does `count = min(32*1024,
+/// count)` and returns the capped byte count), so a frame larger than
+/// 32 KiB — e.g. a [`MsgType::WprofTraceChunk`] up to
+/// [`super::bulk::MAX_BULK_FRAME_PAYLOAD`] — ALWAYS spans multiple `writev`
+/// iterations; the `advance_slices` loop below is REQUIRED for correctness,
+/// not merely a partial-writev nicety.
 fn write_to_bulk_port(msg_type: u32, payload: &[u8]) -> bool {
     // Test-only: record that the guest-only write path was entered.
     // Reached only after `write_msg`'s `is_guest()` gate passes, so a
@@ -483,10 +489,68 @@ pub fn send_profraw(buf: &[u8]) {
     write_msg(MsgType::Profraw.wire_value(), buf);
 }
 
+/// Plan the bulk frames for a wprof trace of `buf`, splitting at `cap`
+/// bytes per frame: all but the last slice are tagged
+/// [`MsgType::WprofTraceChunk`], the last is the terminal
+/// [`MsgType::WprofTrace`]. An empty `buf` yields exactly one empty terminal
+/// `WprofTrace` frame (matching the pre-chunking single-frame behavior). A
+/// `buf` that fits in one `cap`-byte frame yields a lone terminal
+/// `WprofTrace` (no chunks), so the host reassembly
+/// ([`crate::test_support::wprof::reassemble_wprof_trace`]) is a no-op for it.
+///
+/// Split out from [`send_wprof_trace`] with `cap` as a parameter so the
+/// chunk→reassemble roundtrip is tested against the exact production split —
+/// production passes [`crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD`]; the
+/// roundtrip test passes a small cap for cheap multi-frame coverage plus the
+/// real cap at its boundary.
+///
+/// `cap` MUST be > 0 (`slice::chunks(0)` panics). Not reachable from any
+/// caller — production passes the non-zero `MAX_BULK_FRAME_PAYLOAD` const and
+/// tests pass fixed non-zero caps — so this is a `debug_assert`, not a guest-
+/// reachable check (`cap` is host-chosen, never guest input).
+#[cfg(feature = "wprof")]
+pub(crate) fn wprof_trace_frames(buf: &[u8], cap: usize) -> Vec<(u32, &[u8])> {
+    debug_assert!(
+        cap > 0,
+        "wprof_trace_frames: cap must be > 0 (chunks(0) panics)"
+    );
+    let mut it = buf.chunks(cap).peekable();
+    if it.peek().is_none() {
+        // Empty trace: one empty terminal frame.
+        return vec![(MsgType::WprofTrace.wire_value(), &buf[..0])];
+    }
+    let mut frames = Vec::new();
+    while let Some(chunk) = it.next() {
+        let msg_type = if it.peek().is_none() {
+            MsgType::WprofTrace.wire_value()
+        } else {
+            MsgType::WprofTraceChunk.wire_value()
+        };
+        frames.push((msg_type, chunk));
+    }
+    frames
+}
+
 /// Send a wprof Perfetto-format trace blob to the host.
+///
+/// A wprof `.pb` larger than the single-frame bulk-port ceiling
+/// ([`crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD`], 16 MiB) is split by
+/// [`wprof_trace_frames`] into `WprofTraceChunk` slices + a terminal
+/// `WprofTrace`; the host concatenates them to reconstruct the `.pb`. CHUNK,
+/// never cap — no trace bytes are dropped (an oversized single frame would
+/// otherwise be silently dropped by the host `HostAssembler`).
 #[cfg(feature = "wprof")]
 pub fn send_wprof_trace(buf: &[u8]) {
-    write_msg(MsgType::WprofTrace.wire_value(), buf);
+    let cap = crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD as usize;
+    for (msg_type, chunk) in wprof_trace_frames(buf, cap) {
+        if !write_msg(msg_type, chunk) {
+            eprintln!(
+                "ktstr: send_wprof_trace: bulk-port write failed at a {}-byte frame — wprof trace truncated",
+                chunk.len()
+            );
+            return;
+        }
+    }
 }
 
 /// Send a stimulus event from the guest step executor.
@@ -533,6 +597,51 @@ pub fn send_sched_exit(code: i32) {
     write_msg(MsgType::SchedExit.wire_value(), &code.to_le_bytes());
 }
 
+/// Send a scheduler-swap notification to the host. Payload: empty.
+///
+/// Emitted by `kill_current_scheduler` (Op::DetachScheduler /
+/// RestartScheduler / ReplaceScheduler) AFTER `wait_for_scx_disabled`
+/// returns — so the kernel has already NULLed `*scx_root`
+/// (`RCU_INIT_POINTER(scx_root, NULL)` precedes
+/// `scx_set_enable_state(SCX_DISABLED)` in kernel/sched/ext.c) and the
+/// prior scx_sched object is unlinked (`*scx_root` NULLed) and its
+/// slab is subject to RCU-grace-period reuse. The host's freeze
+/// coordinator decodes a CRC-valid frame and synchronously invalidates
+/// the periodic-capture accessor (so the accessor-init worker rebuilds
+/// against the next scheduler) rather than waiting up to one
+/// SCAN_INTERVAL for its scx_root watchpoint poll to notice the rebind.
+///
+/// A lost frame is non-fatal: the watchpoint poll still tears the stale
+/// accessor down within one SCAN_INTERVAL — the notify only collapses
+/// that defer window. Retries up to 5×100 ms to ride out a transient
+/// bulk-port hiccup, matching [`send_scenario_start`]; the port is
+/// long-open by Op-dispatch time so a retry rarely fires.
+///
+/// The 100 ms backoff is a bounded poll-retry, not an evented wait, and
+/// that is deliberate: the normal TX path blocks in the kernel's
+/// `wait_port_writable` (evented) and succeeds on the first attempt, so
+/// the loop only spins when `write_msg` returns false — i.e. the bulk-port
+/// node is not yet openable/connected or its cached fd was invalidated.
+/// Neither is a condition the guest can epoll on (device-node + multiport
+/// connection state), so a bounded re-open-and-retry is the only recovery
+/// — the same poll shape [`super::rust_init::send_sys_rdy_with_retry`]
+/// uses for the initial handshake.
+pub fn send_sched_swap_notify() {
+    for attempt in 0..5 {
+        if write_msg(MsgType::SchedSwapNotify.wire_value(), &[]) {
+            return;
+        }
+        if attempt + 1 < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    tracing::warn!(
+        "send_sched_swap_notify: 5 retries failed — bulk port write never \
+         succeeded; the host watchpoint poll will tear the stale \
+         periodic-capture accessor down within one SCAN_INTERVAL instead"
+    );
+}
+
 /// Send a scenario-start marker.
 ///
 /// `MSG_TYPE_SCENARIO_START` is load-bearing: the host's freeze
@@ -553,6 +662,14 @@ pub fn send_sched_exit(code: i32) {
 /// total budget, an order of magnitude under the periodic
 /// capture's typical inter-boundary spacing so retries don't
 /// shift downstream timing measurably.
+///
+/// The 100 ms backoff is a bounded poll-retry, not an evented wait —
+/// deliberate, for the same reason as [`send_sched_swap_notify`]: the
+/// normal TX blocks in the kernel's `wait_port_writable` (evented) and
+/// succeeds first try, so this loop only spins when `write_msg` returns
+/// false, i.e. the port is not yet openable/connected or its cached fd
+/// was invalidated — neither a state the guest can epoll on, so a bounded
+/// re-open-and-retry is the only recovery.
 pub fn send_scenario_start() {
     for attempt in 0..5 {
         if write_msg(MsgType::ScenarioStart.wire_value(), &[]) {
@@ -1558,6 +1675,17 @@ mod tests {
     fn send_scenario_start_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
         assert_no_bulk_write("send_scenario_start", send_scenario_start);
+    }
+
+    /// `send_sched_swap_notify` from host context suppresses the write.
+    /// Like `send_scenario_start` it retries the write up to 5 times
+    /// (4 × 100 ms sleeps) on a not-yet-open port; the host-context
+    /// gate must short-circuit EVERY attempt, so the write-path counter
+    /// stays put despite the retry loop.
+    #[test]
+    fn send_sched_swap_notify_from_host_context_is_noop() {
+        let _g = IsGuestOverrideGuard::new(false);
+        assert_no_bulk_write("send_sched_swap_notify", send_sched_swap_notify);
     }
 
     /// `send_scenario_end` from host context suppresses the write.

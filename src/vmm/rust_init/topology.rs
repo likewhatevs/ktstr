@@ -90,32 +90,107 @@ pub(crate) fn spawn_wprof_if_configured() -> Option<std::thread::JoinHandle<Opti
                     "/tmp/wprof.data".to_string(),
                 ]);
                 tracing::debug!(args = ?cmd_args, "spawning /bin/wprof");
-                let status = std::process::Command::new("/bin/wprof")
+                // Bounded wait for the wprof child. A wprof stranded by a
+                // crashing sched_ext scheduler — notably the 6.14
+                // bypass-drain stall after scx_bpf_error, where runnable
+                // tasks (including wprof's own) are not reliably migrated to
+                // fair — never reaches its capture-window exit, so a
+                // blocking `.status()` here would wedge guest teardown: no
+                // reboot, no wprof ship, no SCHED_EXIT, the guest just hangs
+                // to the host watchdog. Spawn + wait on the child's pidfd up
+                // to a deadline sized off the `-d` capture window (ms) plus a
+                // generous processing margin, kept under the host
+                // `WPROF_SHIP_GRACE` (30s) so the guest kills a wedged wprof
+                // and reboots within the host's grace. On the cap the trace
+                // is dropped (loudly) and teardown proceeds — a clean
+                // failure, never a hang. Mirrors `reap_child_bounded`.
+                let capture_ms = cmd_args
+                    .iter()
+                    .position(|a| a == "-d")
+                    .and_then(|i| cmd_args.get(i + 1))
+                    .and_then(|d| d.parse::<u64>().ok())
+                    .unwrap_or(500);
+                let deadline = std::time::Duration::from_millis(capture_ms)
+                    + std::time::Duration::from_secs(10);
+                let mut child = match std::process::Command::new("/bin/wprof")
                     .args(&cmd_args)
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::inherit())
-                    .status();
-                match status {
-                    Ok(s) if s.success() => match std::fs::read("/tmp/wprof.pb") {
-                        Ok(bytes) if !bytes.is_empty() => {
-                            tracing::debug!(pb_bytes = bytes.len(), "wprof trace captured");
-                            Some(bytes)
+                    .spawn()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(%e, "spawn /bin/wprof failed");
+                        return None;
+                    }
+                };
+                // Determine wprof's exit disposition, then ship the trace on
+                // FILE-PRESENCE (a non-empty /tmp/wprof.pb) regardless of exit
+                // disposition. wprof fflushes the COMPLETE .pb as the last step
+                // before main returns, so a wprof that finished its post-window
+                // emit but is slow or nonzero to EXIT — e.g. its userspace emit
+                // thread lost CPU to the concurrent auto-repro probe pipeline
+                // during the crash-bypass window — still yields a valid trace
+                // (the host validates shape via assert_wprof_pb_shape). On a
+                // timeout, SIGTERM first (wprof's handler sets its `exiting`
+                // flag, letting an in-progress emit flush), then a bounded
+                // secondary wait, then SIGKILL, so a nearly-done emit is not
+                // truncated. This is the reliability backstop; it perturbs no
+                // scheduling priority.
+                let pid = child.id() as libc::pid_t;
+                match crate::sync::pidfd_poll_exited(pid, deadline) {
+                    crate::sync::PidfdWait::Exited => {
+                        let _ = child.wait();
+                    }
+                    crate::sync::PidfdWait::TimedOut => {
+                        // wprof did not exit within the window — its userspace
+                        // emit thread lost CPU (e.g. to the concurrent auto-repro
+                        // probe pipeline during the crash-bypass window). SIGTERM
+                        // first: wprof's handler sets its `exiting` flag, letting
+                        // an in-progress emit fflush the .pb, then reap with a
+                        // bounded second wait, then hard-kill. The .pb read below
+                        // still recovers a completed-but-slow-to-exit emit.
+                        eprintln!(
+                            "ktstr: wprof exceeded {deadline:?}; SIGTERM to let its \
+                             emit flush, then reap"
+                        );
+                        // SAFETY: `pid` is this thread's own child; SIGTERM to a
+                        // live pid is well-defined and ESRCH on an already-reaped
+                        // pid is harmless (return value dropped).
+                        unsafe {
+                            libc::kill(pid, libc::SIGTERM);
                         }
-                        Ok(_) => {
-                            tracing::warn!("wprof exited OK but /tmp/wprof.pb is empty");
-                            None
+                        match crate::sync::pidfd_poll_exited(
+                            pid,
+                            std::time::Duration::from_secs(8),
+                        ) {
+                            crate::sync::PidfdWait::Exited => {
+                                let _ = child.wait();
+                            }
+                            _ => {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!(%e, "read /tmp/wprof.pb after successful run");
-                            None
+                    }
+                    crate::sync::PidfdWait::NoPidfd => {
+                        if !matches!(child.try_wait(), Ok(Some(_))) {
+                            let _ = child.kill();
                         }
-                    },
-                    Ok(s) => {
-                        tracing::warn!(exit = s.code(), "wprof exited non-zero");
+                        let _ = child.wait();
+                    }
+                }
+                match std::fs::read("/tmp/wprof.pb") {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        tracing::debug!(pb_bytes = bytes.len(), "wprof trace captured");
+                        Some(bytes)
+                    }
+                    Ok(_) => {
+                        eprintln!("ktstr: wprof produced no trace this run (/tmp/wprof.pb empty)");
                         None
                     }
                     Err(e) => {
-                        tracing::warn!(%e, "spawn /bin/wprof failed");
+                        eprintln!("ktstr: wprof produced no trace this run (/tmp/wprof.pb absent/unreadable: {e})");
                         None
                     }
                 }

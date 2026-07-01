@@ -192,6 +192,8 @@ fn host_context_populated_round_trips_via_json() {
         kernel_release: Some("6.11.0".to_string()),
         arch: Some("x86_64".to_string()),
         kernel_cmdline: Some("preempt=lazy transparent_hugepage=madvise".to_string()),
+        task_delayacct: Some(DelayacctState::On),
+        config_task_xacct: Some(XacctState::On),
         heap_state: Some(crate::host_heap::HostHeapState::test_fixture()),
     };
     let json = serde_json::to_string(&ctx).expect("serialize");
@@ -237,6 +239,8 @@ fn host_context_partial_none_round_trips_via_json() {
         numa_nodes: None,
         cpufreq_governor: BTreeMap::new(),
         kernel_cmdline: None,
+        task_delayacct: None,
+        config_task_xacct: None,
         heap_state: None,
     };
     let json = serde_json::to_string(&ctx).expect("serialize");
@@ -613,6 +617,8 @@ const HOST_CONTEXT_FIELDS: &[&str] = &[
     "cpufreq_governor",
     "sched_tunables",
     "heap_state",
+    "task_delayacct",
+    "config_task_xacct",
 ];
 
 /// Consume any value, returning `()`. Test-only helper used
@@ -668,6 +674,8 @@ fn struct_field_array(ctx: HostContext) -> [(); HOST_CONTEXT_FIELDS.len()] {
         kernel_release,
         arch,
         kernel_cmdline,
+        task_delayacct,
+        config_task_xacct,
         heap_state,
     } = ctx;
     [
@@ -687,6 +695,8 @@ fn struct_field_array(ctx: HostContext) -> [(); HOST_CONTEXT_FIELDS.len()] {
         drop_to_unit(kernel_release),
         drop_to_unit(arch),
         drop_to_unit(kernel_cmdline),
+        drop_to_unit(task_delayacct),
+        drop_to_unit(config_task_xacct),
         drop_to_unit(heap_state),
     ]
 }
@@ -711,12 +721,12 @@ fn struct_field_array(ctx: HostContext) -> [(); HOST_CONTEXT_FIELDS.len()] {
 #[allow(dead_code)]
 const _HOST_CONTEXT_FIELD_COUNT_PIN: () = {
     assert!(
-        HOST_CONTEXT_FIELDS.len() == 17,
+        HOST_CONTEXT_FIELDS.len() == 19,
         "HOST_CONTEXT_FIELDS cardinality drifted from the \
              HostContext struct — if a field was added, extend \
              HOST_CONTEXT_FIELDS, struct_field_array's destructure, \
              and struct_field_array's initializer together; then \
-             bump this literal from 17 to the new field count",
+             bump this literal to the new field count",
     );
 };
 
@@ -784,6 +794,8 @@ fn diff_renders_every_documented_field() {
         kernel_cmdline: Some("preempt=lazy".to_string()),
         sched_tunables: Some(tunables),
         heap_state: Some(heap),
+        task_delayacct: Some(DelayacctState::RuntimeOff),
+        config_task_xacct: Some(XacctState::Off),
         ..Default::default()
     };
     b.cpufreq_governor.insert(0, "performance".to_string());
@@ -843,6 +855,8 @@ fn format_human_field_order_is_stable() {
             "thp_enabled",
             "thp_defrag",
             "kernel_cmdline",
+            "task_delayacct",
+            "config_task_xacct",
             "cpufreq_governor",
             "sched_tunables",
             "heap_state",
@@ -878,6 +892,8 @@ fn format_human_default_renders_unknown_everywhere() {
         "thp_enabled",
         "thp_defrag",
         "kernel_cmdline",
+        "task_delayacct",
+        "config_task_xacct",
         "sched_tunables",
         "heap_state",
     ] {
@@ -1717,4 +1733,106 @@ fn host_context_thp_active_methods_extract_bracketed_choice() {
     assert_eq!(ctx.thp_enabled_active(), None);
     ctx.thp_defrag = Some("no brackets here".to_string());
     assert_eq!(ctx.thp_defrag_active(), None);
+}
+
+/// `parse_kconfig_xacct` classifies the three CONFIG_TASK_XACCT line
+/// states from decompressed kconfig text (the gz I/O is a thin wrapper
+/// around this pure parser).
+#[test]
+fn parse_kconfig_xacct_classifies_the_three_states() {
+    assert_eq!(
+        parse_kconfig_xacct("CONFIG_FOO=y\nCONFIG_TASK_XACCT=y\nCONFIG_BAR=m\n"),
+        XacctState::On,
+    );
+    assert_eq!(
+        parse_kconfig_xacct("CONFIG_FOO=y\n# CONFIG_TASK_XACCT is not set\n"),
+        XacctState::Off,
+    );
+    // Symbol absent entirely (a partial/foreign config) -> Unknown,
+    // which gates as measured so no false "absent" verdict is produced.
+    assert_eq!(
+        parse_kconfig_xacct("CONFIG_FOO=y\nCONFIG_BAR=m\n"),
+        XacctState::Unknown,
+    );
+    // Whole-line match: a substring inside another symbol must not
+    // false-match the `=y` case.
+    assert_eq!(
+        parse_kconfig_xacct("CONFIG_TASK_XACCT_EXTRA=y\n"),
+        XacctState::Unknown,
+    );
+}
+
+/// `read_task_delayacct_from` maps the sysctl file to the three
+/// delay-accounting states: absent file -> ConfigOff (the sysctl is
+/// registered only under CONFIG_TASK_DELAY_ACCT), "0" -> RuntimeOff,
+/// "1" -> On. Drives the production seam against a tempdir.
+#[test]
+fn read_task_delayacct_from_maps_the_three_states() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("task_delayacct");
+
+    // Absent file -> ConfigOff.
+    assert_eq!(read_task_delayacct_from(&path), DelayacctState::ConfigOff);
+
+    // "0" -> RuntimeOff (built in, runtime toggle off).
+    std::fs::write(&path, "0\n").expect("write");
+    assert_eq!(read_task_delayacct_from(&path), DelayacctState::RuntimeOff);
+
+    // "1" -> On.
+    std::fs::write(&path, "1\n").expect("write");
+    assert_eq!(read_task_delayacct_from(&path), DelayacctState::On);
+}
+
+/// `taskstats_active_from` reduces the two probe enums to the per-sub-family
+/// active flags — the counter-semantics crux. cpu_delay is active unless
+/// ConfigOff (it SURVIVES RuntimeOff — the gate is `!= ConfigOff`, NOT `== On`);
+/// delay_block needs On; xacct is active unless Off (Unknown -> active to avoid a
+/// false absent). All 3x3 combinations pinned.
+#[test]
+fn taskstats_active_from_reduces_every_combination() {
+    use DelayacctState::{ConfigOff, On as DOn, RuntimeOff};
+    use XacctState::{Off as XOff, On as XOn, Unknown};
+    // (delayacct, xacct) -> (cpu_delay, delay_block, xacct)
+    let cases = [
+        (ConfigOff, XOff, (false, false, false)),
+        (ConfigOff, XOn, (false, false, true)),
+        (ConfigOff, Unknown, (false, false, true)),
+        (RuntimeOff, XOff, (true, false, false)),
+        (RuntimeOff, XOn, (true, false, true)),
+        (RuntimeOff, Unknown, (true, false, true)),
+        (DOn, XOff, (true, true, false)),
+        (DOn, XOn, (true, true, true)),
+        (DOn, Unknown, (true, true, true)),
+    ];
+    for (d, x, (cpu, blk, xa)) in cases {
+        let a = taskstats_active_from(d, x);
+        assert_eq!(
+            (a.cpu_delay, a.delay_block, a.xacct),
+            (cpu, blk, xa),
+            "taskstats_active_from({d:?}, {x:?})",
+        );
+    }
+    // The crux, called out explicitly: RuntimeOff keeps cpu_delay measurable (the
+    // sched_info CPU block survives the toggle) but kills the resource-wait block.
+    let r = taskstats_active_from(RuntimeOff, XOn);
+    assert!(
+        r.cpu_delay && !r.delay_block,
+        "cpu_delay must survive RuntimeOff while delay_block must not",
+    );
+}
+
+/// `read_config_task_xacct_from` folds BOTH failure branches — an unreadable /
+/// absent file, and present-but-non-gzip (or truncated) content the GzDecoder
+/// rejects — to `XacctState::Unknown`, the no-config-exposed fallback that gates
+/// as active to avoid a false absent.
+#[test]
+fn read_config_task_xacct_from_unreadable_or_non_gz_is_unknown() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Absent file -> read error -> Unknown.
+    let absent = dir.path().join("config.gz");
+    assert_eq!(read_config_task_xacct_from(&absent), XacctState::Unknown);
+    // Present but not gzip (raw text, no gzip magic) -> GzDecoder error -> Unknown.
+    let raw = dir.path().join("config-raw.gz");
+    std::fs::write(&raw, b"CONFIG_TASK_XACCT=y\nnot actually gzip\n").expect("write");
+    assert_eq!(read_config_task_xacct_from(&raw), XacctState::Unknown);
 }

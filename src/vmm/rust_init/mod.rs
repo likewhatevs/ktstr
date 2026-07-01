@@ -100,7 +100,10 @@ const SCHED_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// diagnostics to stderr and exit on its own BEFORE the hard SIGKILL, so
 /// the kill doesn't truncate that output (`dump_sched_output` reads it).
 /// Bounded so a userspace hang can't wedge teardown; returns early the
-/// moment the scheduler exits. Only applied on a crash (dump_started).
+/// moment the scheduler exits. Applied on a crash, detected as EITHER the
+/// kernel exit dump having started (dump_started) OR the scheduler process
+/// still being alive once sched_ext has gone down (`scx_down` with its pid
+/// still owned).
 /// Sized for the USERSPACE flush, not the kernel dump: the kernel's scx
 /// exit dump is bounded and truncated in-kernel, but the scheduler's
 /// userspace flush of it to stderr (plus libbpf teardown) can run past a

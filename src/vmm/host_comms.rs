@@ -123,8 +123,9 @@ pub fn parse_tlv_stream(buf: &[u8]) -> BulkDrainResult {
             );
         }
         // Hostile-input guard: a `length` above the per-frame cap
-        // cannot come from any legitimate producer (every real
-        // payload sits well below 256 KiB) and would trigger an
+        // (16 MiB, MAX_BULK_FRAME_PAYLOAD) cannot come from any
+        // legitimate producer — the largest, a wprof trace chunk,
+        // lands AT the cap and never above — and would trigger an
         // oversized `Vec<u8>` allocation. Reject before the
         // payload-length sanity check below so a malformed
         // `u32::MAX` length does not even reach the
@@ -482,8 +483,9 @@ mod tests {
         }
     }
 
-    /// `is_coordinator_internal` flips on for the two control frames
-    /// every host-side bucketing path filters out. This is a
+    /// `is_coordinator_internal` flips on for the coordinator-internal
+    /// control frames every host-side bucketing path filters out. This
+    /// is a
     /// classifier-level test (mirrors the one in `wire::tests`) but
     /// pinning it here too guards the host_comms consumer from a
     /// future MsgType variant addition that silently joined the
@@ -491,7 +493,8 @@ mod tests {
     #[test]
     fn parsed_entries_match_is_coordinator_internal_classifier() {
         use super::super::wire::{
-            MSG_TYPE_SNAPSHOT_REQUEST, MSG_TYPE_SYS_RDY, MSG_TYPE_TEST_RESULT, MsgType,
+            MSG_TYPE_SCHED_SWAP_NOTIFY, MSG_TYPE_SNAPSHOT_REQUEST, MSG_TYPE_SYS_RDY,
+            MSG_TYPE_TEST_RESULT, MsgType,
         };
         let internal_raw = frame_bytes(MSG_TYPE_SNAPSHOT_REQUEST, &[0u8; 72]);
         let r = parse_tlv_stream(&internal_raw);
@@ -501,6 +504,12 @@ mod tests {
 
         let internal_sys_rdy = frame_bytes(MSG_TYPE_SYS_RDY, b"");
         let r = parse_tlv_stream(&internal_sys_rdy);
+        assert_eq!(r.entries.len(), 1);
+        let typed = MsgType::from_wire(r.entries[0].msg_type).unwrap();
+        assert!(typed.is_coordinator_internal());
+
+        let internal_swap = frame_bytes(MSG_TYPE_SCHED_SWAP_NOTIFY, b"");
+        let r = parse_tlv_stream(&internal_swap);
         assert_eq!(r.entries.len(), 1);
         let typed = MsgType::from_wire(r.entries[0].msg_type).unwrap();
         assert!(typed.is_coordinator_internal());

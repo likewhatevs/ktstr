@@ -73,7 +73,7 @@ use crate::sync::Latch;
 ///
 /// Without these gates, an AP-thread panic-unwind during the
 /// coordinator's lifetime can produce a UAF when the coordinator's
-/// `freeze_and_capture` pass-1 loop or `arm_user_watchpoint` writes
+/// `freeze_and_dispatch` pass-1 loop or `arm_user_watchpoint` writes
 /// through a freed `kvm_run` page.
 #[derive(Clone, Copy)]
 pub(crate) struct ImmediateExitHandle {
@@ -770,7 +770,7 @@ pub(crate) struct WatchpointSlot {
     /// wvr_base + 4)` of an armed slot on aarch64). The freeze
     /// coordinator's epoll loop polls all three `hit` flags with
     /// Acquire on each `WATCHPOINT` token wake, runs
-    /// `freeze_and_capture(false)` on any trip, and stores the
+    /// `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` on any trip, and stores the
     /// report under the registered tag in the bridge.
     pub(crate) hit: AtomicBool,
     /// Snapshot tag the bridge stores the captured report under.
@@ -828,6 +828,34 @@ impl WatchpointArm {
     /// synchronizes-with edge from the publisher's Release.
     pub(crate) fn mark_armed(&self) {
         self.any_armed.store(1, Ordering::Relaxed);
+    }
+
+    /// Disarm slot 0 (the freeze coordinator's
+    /// `*scx_root->exit_kind` watchpoint): clear `request_kva`, null
+    /// `kind_host_ptr`, then clear the sticky `hit`. Used whenever the
+    /// `scx_sched` the slot watches is being torn down — the scheduler
+    /// detach / rebind the scan-tick poll detects, AND the explicit
+    /// guest swap-notify the freeze coordinator processes synchronously
+    /// — so a stale DR0 can no longer fire into the now-RCU-freed (and
+    /// possibly slab-recycled) page.
+    ///
+    /// Store order is load-bearing: `request_kva` FIRST (Release), then
+    /// `kind_host_ptr` (Release), then `hit` (Release). Clearing
+    /// `request_kva` first makes a racing vCPU's Acquire load return 0
+    /// so its next `self_arm_watchpoint` reissues
+    /// `KVM_SET_GUEST_DEBUG` without slot 0's enable bits (clearing
+    /// DR0 / DR7 L0/G0) BEFORE the host pointer is nulled; an in-flight
+    /// `read_volatile` on the previously-observed pointer stays safe
+    /// because the host mapping (`vm.guest_mem`) outlives every vCPU
+    /// thread. Clearing `hit` prevents the late-trigger arm from
+    /// re-observing a stale fire from the scheduler whose teardown this
+    /// disarm closes out; real errors still latch via the BPF `.bss`
+    /// `err_triggered` path, which is independent of `hit`.
+    pub(crate) fn disarm(&self) {
+        self.request_kva.store(0, Ordering::Release);
+        self.kind_host_ptr
+            .store(std::ptr::null_mut(), Ordering::Release);
+        self.hit.store(false, Ordering::Release);
     }
 
     /// Latch `hit=true` AND wake the freeze coordinator's epoll loop
@@ -1443,8 +1471,31 @@ impl VcpuThread {
 #[derive(Clone)]
 pub(crate) struct BpfMapWriteParams {
     pub(crate) map_name_suffix: String,
-    pub(crate) offset: usize,
+    /// Name of the global to write, resolved to a byte offset against the
+    /// map's program BTF at write time (see
+    /// `freeze_coord::start_bpf_map_write` phase 2). Mirrors
+    /// `WatchBpfMapParams::field`; replaces a padding-fragile hardcoded
+    /// byte offset.
+    pub(crate) field: String,
     pub(crate) value: u32,
+}
+
+/// Owned runtime form of a [`crate::test_support::WatchBpfMap`] target —
+/// the coordinator/monitor's copy of a named scheduler BPF-map field to read
+/// observer-effect-free into a run-level metric. Lowered from the
+/// `&'static [&'static WatchBpfMap]` test-entry list (mirrors how
+/// [`BpfMapWriteParams`] lowers `BpfMapWrite`).
+#[derive(Clone)]
+pub(crate) struct WatchBpfMapParams {
+    /// Map-name suffix matched via `ends_with` (`.bss`, `cpu_ctx_stor`).
+    pub(crate) map_name_suffix: String,
+    /// Dot-path into the map's value type (`sys_stat.avg_lat_cri`, or a bare
+    /// member like `lat_headroom`).
+    pub(crate) field: String,
+    /// Scalar vs per-CPU aggregation.
+    pub(crate) agg: crate::test_support::BpfMapAgg,
+    /// Metric-key leaf appended to the scheduler-obj prefix.
+    pub(crate) label: String,
 }
 
 #[cfg(test)]

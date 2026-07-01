@@ -35,6 +35,16 @@ pub fn make_thread(pcomm: &str, comm: &str) -> ThreadState {
     t.cgroup = "/".into();
     t.policy = CategoricalString("SCHED_OTHER".into());
     t.cpu_affinity = CpuSet(vec![0, 1, 2, 3]);
+    // A normally-captured fixture thread: both capture-gated families are
+    // measured, so delay / jemalloc aggregates render as real (measured) values
+    // rather than the never-captured "-". For taskstats, "measured" is the
+    // query-Ok flag AND the per-sub-family active flags — all true here to model a
+    // fully-enabled host. Tests exercising the absent path override these to false.
+    t.taskstats_measured = true;
+    t.cpu_delay_active = true;
+    t.delay_block_active = true;
+    t.xacct_active = true;
+    t.jemalloc_measured = true;
     t
 }
 

@@ -84,11 +84,22 @@ pub(crate) fn format_monitor_section(
     }
 
     if let Some(ref ss) = s.schedstat_deltas {
+        // Per-second rates derived inline from the counters / the schedstat
+        // window. The cross-run-foldable forms live in the metric registry as
+        // *_per_sec Rates (Σnum/Σden); this single-run display computes the same
+        // quotient. 0.0 on a degenerate (single-sample) window.
+        let per_sec = |n: u64| {
+            if ss.total_schedstat_wall_sec > 0.0 {
+                n as f64 / ss.total_schedstat_wall_sec
+            } else {
+                0.0
+            }
+        };
         lines.push(format!(
             "schedstat: csw={} ({:.0}/s) run_delay={:.0}ns/s ttwu={} goidle={}",
             ss.total_sched_count,
-            ss.sched_count_rate,
-            ss.run_delay_rate,
+            per_sec(ss.total_sched_count),
+            per_sec(ss.total_run_delay),
             ss.total_ttwu_count,
             ss.total_sched_goidle,
         ));
@@ -146,6 +157,7 @@ pub(crate) fn trim_settle_samples(
         watchdog_observation: report.watchdog_observation,
         page_offset: report.page_offset,
         boot_wait_outcome: report.boot_wait_outcome,
+        scx_event_counters_supported: report.scx_event_counters_supported,
     }
 }
 

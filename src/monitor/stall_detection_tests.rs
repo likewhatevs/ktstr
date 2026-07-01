@@ -23,7 +23,9 @@ fn neg_tight_imbalance_threshold_catches_mild_imbalance() {
     };
     let samples: Vec<_> = (0..3u64)
         .map(|i| MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: i * 100,
             cpus: vec![
                 CpuSnapshot {
@@ -93,7 +95,9 @@ fn neg_tight_dsq_threshold_catches_small_depth() {
     };
     let samples: Vec<_> = (0..3u64)
         .map(|i| MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: i * 100,
             cpus: vec![
                 CpuSnapshot {
@@ -156,7 +160,9 @@ fn neg_stuck_detection_catches_frozen_rq_clock() {
     };
     let samples = vec![
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -172,7 +178,9 @@ fn neg_stuck_detection_catches_frozen_rq_clock() {
             ],
         },
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 200,
             cpus: vec![
                 CpuSnapshot {
@@ -221,7 +229,9 @@ fn stuck_count_accumulates_across_consecutive_windows() {
     // Pins removal of the per-RUN early break: the old 0/1 path stopped at
     // the first stuck window. cpu1 advances so each sample stays plausible.
     let mk = |ms: u64, rq1: u64| MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: ms,
         cpus: vec![
             CpuSnapshot {
@@ -250,7 +260,9 @@ fn stuck_count_accumulates_across_cpus_in_one_window() {
     // per-CPU inner early break: the old path stopped at the first stuck
     // CPU. cpu2 advances so the sample stays plausible.
     let mk = |ms: u64, rq2: u64| MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: ms,
         cpus: vec![
             CpuSnapshot {
@@ -289,7 +301,9 @@ fn neg_combined_imbalance_and_stuck_both_reported() {
     };
     let samples = vec![
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -305,7 +319,9 @@ fn neg_combined_imbalance_and_stuck_both_reported() {
             ],
         },
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 200,
             cpus: vec![
                 CpuSnapshot {
@@ -364,7 +380,9 @@ fn stuck_idle_cpu_exempt() {
     };
     let samples = vec![
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -380,7 +398,9 @@ fn stuck_idle_cpu_exempt() {
             ],
         },
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 200,
             cpus: vec![
                 CpuSnapshot {
@@ -428,7 +448,9 @@ fn stuck_idle_to_busy_not_exempt() {
     };
     let samples = vec![
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -444,7 +466,9 @@ fn stuck_idle_to_busy_not_exempt() {
             ],
         },
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 200,
             cpus: vec![
                 CpuSnapshot {
@@ -491,7 +515,9 @@ fn stuck_sustained_window_filters_transient() {
     // 3 samples: 2 consecutive stall pairs for cpu0, then clock advances.
     for i in 0..3u64 {
         samples.push(MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: i * 100,
             cpus: vec![
                 CpuSnapshot {
@@ -509,7 +535,9 @@ fn stuck_sustained_window_filters_transient() {
     }
     // Break the streak: clock advances in 4th sample.
     samples.push(MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 300,
         cpus: vec![
             CpuSnapshot {
@@ -551,7 +579,9 @@ fn stuck_sustained_window_catches_real_stuck() {
     // 4 samples = 3 consecutive stall pairs for cpu0. cpu1 advances.
     let samples: Vec<_> = (0..4u64)
         .map(|i| MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: i * 100,
             cpus: vec![
                 CpuSnapshot {
@@ -583,7 +613,9 @@ fn from_samples_idle_cpu_no_stuck() {
     // from_samples should not flag stall when both samples have
     // nr_running==0 on the stuck CPU.
     let s1 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![
             CpuSnapshot {
@@ -599,7 +631,9 @@ fn from_samples_idle_cpu_no_stuck() {
         ],
     };
     let s2 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 200,
         cpus: vec![
             CpuSnapshot {
@@ -629,7 +663,9 @@ fn stuck_below_sustained_passes() {
     };
     let samples = vec![
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -645,7 +681,9 @@ fn stuck_below_sustained_passes() {
             ],
         },
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 200,
             cpus: vec![
                 CpuSnapshot {
@@ -662,7 +700,9 @@ fn stuck_below_sustained_passes() {
         },
         // Clock recovers.
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 300,
             cpus: vec![
                 CpuSnapshot {
@@ -703,7 +743,9 @@ fn evaluate_suppresses_stuck_when_vcpu_preempted() {
     };
     let samples = vec![
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -721,7 +763,9 @@ fn evaluate_suppresses_stuck_when_vcpu_preempted() {
             ],
         },
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 200,
             cpus: vec![
                 CpuSnapshot {
@@ -751,6 +795,7 @@ fn evaluate_suppresses_stuck_when_vcpu_preempted() {
         watchdog_observation: None,
         page_offset: 0,
         boot_wait_outcome: BootWaitOutcome::NotConfigured,
+        scx_event_counters_supported: false,
     };
     let v = t.evaluate(&report);
     assert!(
@@ -774,7 +819,9 @@ fn evaluate_catches_stuck_when_vcpu_running() {
     };
     let samples = vec![
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -792,7 +839,9 @@ fn evaluate_catches_stuck_when_vcpu_running() {
             ],
         },
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 200,
             cpus: vec![
                 CpuSnapshot {
@@ -822,6 +871,7 @@ fn evaluate_catches_stuck_when_vcpu_running() {
         watchdog_observation: None,
         page_offset: 0,
         boot_wait_outcome: BootWaitOutcome::NotConfigured,
+        scx_event_counters_supported: false,
     };
     let v = t.evaluate(&report);
     assert!(!v.passed, "running vCPU stall must fail: {:?}", v.details);
@@ -839,7 +889,9 @@ fn evaluate_stuck_none_vcpu_time_falls_back_to_current_behavior() {
     };
     let samples = vec![
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -855,7 +907,9 @@ fn evaluate_stuck_none_vcpu_time_falls_back_to_current_behavior() {
             ],
         },
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 200,
             cpus: vec![
                 CpuSnapshot {
@@ -894,7 +948,9 @@ fn from_samples_suppresses_stuck_when_vcpu_preempted() {
     // from_samples_with_threshold should respect vcpu_cpu_time_ns
     // gating. Use explicit threshold to avoid host CONFIG_HZ dependency.
     let s1 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![
             CpuSnapshot {
@@ -912,7 +968,9 @@ fn from_samples_suppresses_stuck_when_vcpu_preempted() {
         ],
     };
     let s2 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 200,
         cpus: vec![
             CpuSnapshot {

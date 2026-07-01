@@ -1840,7 +1840,8 @@ fn download_stream_finalizes_sha256_over_streamed_bytes() {
     // hasher.update + last_progress reset on the typical
     // streaming path.
     let payload: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
-    let mut stream = super::DownloadStream::new(std::io::Cursor::new(payload.clone()));
+    let mut stream =
+        super::DownloadStream::with_progress(std::io::Cursor::new(payload.clone()), None);
     let mut sink: Vec<u8> = Vec::new();
     std::io::copy(&mut stream, &mut sink).expect("copy must drain Cursor");
     assert_eq!(
@@ -1881,6 +1882,7 @@ fn download_stream_errors_on_no_progress_timeout() {
         // is the only branch that can produce TimedOut.
         last_progress: std::time::Instant::now() - std::time::Duration::from_secs(3600),
         no_progress_timeout: std::time::Duration::from_millis(1),
+        progress: None,
     };
     let mut buf = [0u8; 16];
     let err = stream
@@ -1917,6 +1919,7 @@ fn download_stream_resets_progress_clock_on_byte_producing_read() {
         // watchdog check and the `inner.read()` call cannot
         // exceed 1s on any sane machine.
         no_progress_timeout: std::time::Duration::from_secs(60),
+        progress: None,
     };
     let mut buf = [0u8; 16];
     let n = stream.read(&mut buf).expect("first read must succeed");
@@ -1947,6 +1950,7 @@ fn download_stream_eof_does_not_reset_progress_clock() {
         // the EOF path updated it.
         last_progress: std::time::Instant::now() - std::time::Duration::from_secs(1800),
         no_progress_timeout: std::time::Duration::from_secs(7200),
+        progress: None,
     };
     let pre_progress = stream.last_progress;
     let mut buf = [0u8; 16];
@@ -1959,6 +1963,52 @@ fn download_stream_eof_does_not_reset_progress_clock() {
         "Ok(0) must NOT update last_progress — only byte-\
              producing reads count as progress",
     );
+}
+
+/// The download bar advances in lockstep with the bytes the
+/// `DownloadStream` accounts: after draining a known-size payload the
+/// bar's position equals both the payload length and the stream's
+/// `finalize()` byte count — no double-count, no drift. Exercises the
+/// production path (the decoder reads through `DownloadStream`, whose
+/// `read` calls `pb.inc(n)` beside its own `bytes_total += n`).
+#[test]
+fn download_stream_bar_position_equals_streamed_bytes() {
+    let payload = vec![7u8; 4096];
+    let pb = indicatif::ProgressBar::hidden();
+    pb.set_length(payload.len() as u64);
+    let mut stream = super::DownloadStream::with_progress(
+        std::io::Cursor::new(payload.clone()),
+        Some(pb.clone()),
+    );
+    let mut sink = Vec::new();
+    std::io::copy(&mut stream, &mut sink).expect("copy through the wrapped stream");
+    let (_, bytes_total) = stream.finalize();
+    assert_eq!(
+        pb.position(),
+        payload.len() as u64,
+        "bar must reach the payload length",
+    );
+    assert_eq!(
+        pb.position(),
+        bytes_total,
+        "bar position must equal the stream's accounted bytes (no double-count)",
+    );
+}
+
+/// With no Content-Length the attached bar has no length but still
+/// advances as a byte counter — the indeterminate-download arm.
+#[test]
+fn download_stream_advances_indeterminate_bar() {
+    let payload = vec![1u8; 1000];
+    let pb = indicatif::ProgressBar::hidden();
+    let mut stream = super::DownloadStream::with_progress(
+        std::io::Cursor::new(payload.clone()),
+        Some(pb.clone()),
+    );
+    let mut sink = Vec::new();
+    std::io::copy(&mut stream, &mut sink).expect("copy");
+    assert_eq!(pb.position(), payload.len() as u64);
+    assert_eq!(pb.length(), None, "no Content-Length ⇒ indeterminate bar");
 }
 
 // -- parse_sha256_for_file --
@@ -2519,7 +2569,7 @@ fn print_download_size_with_content_length_renders_mib() {
     );
 
     let (_, bytes) = crate::test_support::test_helpers::capture_stderr(|| {
-        print_download_size(&response, url, "ktstr");
+        print_download_size(&response, url, "ktstr", None);
     });
     let captured = String::from_utf8(bytes).expect("captured stderr must be utf-8");
     assert_eq!(
@@ -2559,7 +2609,7 @@ fn print_download_size_without_content_length_omits_mib() {
     );
 
     let (_, bytes) = crate::test_support::test_helpers::capture_stderr(|| {
-        print_download_size(&response, url, "cargo ktstr");
+        print_download_size(&response, url, "cargo ktstr", None);
     });
     let captured = String::from_utf8(bytes).expect("captured stderr must be utf-8");
     assert_eq!(
@@ -2780,4 +2830,198 @@ fn fetch_read_makefile_version_parses_and_guards() {
     // No Makefile at all -> None.
     std::fs::remove_file(dir.path().join("Makefile")).expect("rm Makefile");
     assert_eq!(super::read_makefile_version(dir.path()), None);
+}
+
+// -- git cache key + ls-remote ref pre-resolution --
+
+#[test]
+fn git_cache_key_embeds_ref_full_hash_arch_and_suffix() {
+    let h = "abc1234abc1234abc1234abc1234abc1234abc12";
+    let key = git_cache_key("for-next", h);
+    assert!(
+        key.starts_with(&format!("for-next-git-{h}-")),
+        "key must lead with the raw ref, the -git- marker, and the full commit hash: {key}"
+    );
+    let (arch, _) = arch_info();
+    assert!(
+        key.contains(&format!("-{arch}-kc")),
+        "key must carry the target arch before the kc suffix: {key}"
+    );
+}
+
+/// Two distinct commits sharing a 7-hex prefix must produce DIFFERENT
+/// cache keys — the FULL hash keys the entry, so a moved branch/tag tip
+/// whose new commit collides in the first 7 hex with the cached old
+/// commit can never hit the stale entry (closes the wrong-build-served
+/// class a 28-bit short prefix risked).
+#[test]
+fn git_cache_key_full_hash_distinguishes_7hex_prefix_collision() {
+    let a = "abc1234000000000000000000000000000000000";
+    let b = "abc1234ffffffffffffffffffffffffffffffffff";
+    assert_eq!(&a[..7], &b[..7], "fixture precondition: same 7-hex prefix");
+    assert_ne!(
+        git_cache_key("for-next", a),
+        git_cache_key("for-next", b),
+        "full-hash key must distinguish two commits sharing a 7-hex prefix",
+    );
+}
+
+#[test]
+fn ls_remote_commit_hash_uses_full_sha_directly_without_network() {
+    // A full 40-hex ref short-circuits the handshake (the bogus URL is
+    // never contacted) and is returned in full, lowercased to match
+    // git_clone's head rendering (the cache key needs the full id).
+    let sha = "1234567890abcdef1234567890abcdef12345678";
+    assert_eq!(
+        ls_remote_commit_hash("https://invalid.invalid/nope.git", sha),
+        Some(sha.to_string()),
+    );
+    let upper = "ABCDEF1234567890ABCDEF1234567890ABCDEF12";
+    assert_eq!(
+        ls_remote_commit_hash("https://invalid.invalid/nope.git", upper),
+        Some(upper.to_ascii_lowercase()),
+    );
+}
+
+/// Regression: `ls_remote_commit_hash` must resolve a BRANCH ref. The
+/// bug was gix's default `Options` (`prefix_from_spec_as_filter_on_remote
+/// = true`): over a protocol-v2 `ls-refs` it derives ref-prefix filters
+/// from the anonymous remote's refspecs, and with empty fetch specs +
+/// `fetch_tags = Included` that ls-refs prefix is `refs/tags` ONLY — so
+/// `refs/heads/*` never reach `remote_refs` and a branch ref resolves to
+/// `None`, defeating `resolve_git_kernel`'s clone-skip (every run
+/// re-cloned). The fix sets the flag `false`. A `Some(_)` here is only
+/// reachable once `refs/heads/for-next` reaches `remote_refs`, so
+/// reverting the flag turns this red — the sole test that pins the
+/// `ref_map` Options path (the `match_ref_commit_hash_*` unit tests feed
+/// synthetic ref vectors and never exercise it).
+///
+/// `#[ignore]`: hits the live sched_ext remote over the network (project
+/// convention for network-fetch tests). The filtering is protocol-v2
+/// `ls-refs` behavior — a v1 handshake advertises all refs, so a local
+/// v1 mock would not reproduce it. Run with `--run-ignored` on a
+/// networked host.
+#[test]
+#[ignore = "network: live ls-remote against git.kernel.org sched_ext (protocol v2)"]
+fn ls_remote_commit_hash_resolves_branch_over_v2() {
+    let url = "https://git.kernel.org/pub/scm/linux/kernel/git/tj/sched_ext.git";
+    let hash = ls_remote_commit_hash(url, "for-next")
+        .expect("for-next branch must resolve over v2 ls-refs — the prefix filter must be off");
+    assert_eq!(hash.len(), 40, "a full commit hash is 40 hex chars: {hash}");
+    assert!(
+        hash.bytes().all(|b| b.is_ascii_hexdigit()),
+        "commit hash must be hex: {hash}",
+    );
+}
+
+fn direct_ref(name: &str, hex: &str) -> gix::protocol::handshake::Ref {
+    gix::protocol::handshake::Ref::Direct {
+        full_ref_name: name.into(),
+        object: gix::hash::ObjectId::from_hex(hex.as_bytes()).expect("valid hex"),
+    }
+}
+
+#[test]
+fn match_ref_commit_hash_resolves_branch_tag_head_and_precedence() {
+    let a = "1111111111111111111111111111111111111111";
+    let b = "2222222222222222222222222222222222222222";
+    let c = "3333333333333333333333333333333333333333";
+
+    // Branch under refs/heads — returns the FULL commit hash.
+    let refs = vec![direct_ref("refs/heads/for-next", a)];
+    assert_eq!(match_ref_commit_hash(&refs, "for-next"), Some(a.into()));
+
+    // Lightweight tag (Direct under refs/tags).
+    let refs = vec![direct_ref("refs/tags/v6.10", b)];
+    assert_eq!(match_ref_commit_hash(&refs, "v6.10"), Some(b.into()));
+
+    // heads wins over tags for the same bare name (the probe's documented
+    // precedence; the rare divergence from the shallow clone is handled by
+    // the post-clone re-check — see match_ref_commit_hash).
+    let refs = vec![direct_ref("refs/tags/x", b), direct_ref("refs/heads/x", a)];
+    assert_eq!(match_ref_commit_hash(&refs, "x"), Some(a.into()));
+
+    // An explicit refs/ path matches exactly.
+    let refs = vec![direct_ref("refs/heads/main", c)];
+    assert_eq!(
+        match_ref_commit_hash(&refs, "refs/heads/main"),
+        Some(c.into())
+    );
+
+    // HEAD via a Symbolic ref resolves to its ultimate object.
+    let refs = vec![gix::protocol::handshake::Ref::Symbolic {
+        full_ref_name: "HEAD".into(),
+        target: "refs/heads/main".into(),
+        tag: None,
+        object: gix::hash::ObjectId::from_hex(c.as_bytes()).unwrap(),
+    }];
+    assert_eq!(match_ref_commit_hash(&refs, "HEAD"), Some(c.into()));
+
+    // No matching ref -> None.
+    let refs = vec![direct_ref("refs/heads/main", a)];
+    assert_eq!(match_ref_commit_hash(&refs, "does-not-exist"), None);
+}
+
+#[test]
+fn match_ref_commit_hash_annotated_tag_uses_peeled_commit_not_tag() {
+    // An annotated tag advertises Peeled { tag: <tag object>, object:
+    // <peeled commit> }. The key must use the peeled COMMIT (object):
+    // git_clone checks out the commit (HEAD = commit), so the tag
+    // object's hash would never match a clone-produced cache key.
+    let tag_obj = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let refs = vec![gix::protocol::handshake::Ref::Peeled {
+        full_ref_name: "refs/tags/v1.0".into(),
+        tag: gix::hash::ObjectId::from_hex(tag_obj.as_bytes()).unwrap(),
+        object: gix::hash::ObjectId::from_hex(commit.as_bytes()).unwrap(),
+    }];
+    assert_eq!(match_ref_commit_hash(&refs, "v1.0"), Some(commit.into()));
+}
+
+#[test]
+fn match_ref_commit_hash_skips_unborn() {
+    let refs = vec![gix::protocol::handshake::Ref::Unborn {
+        full_ref_name: "refs/heads/new".into(),
+        target: "refs/heads/new".into(),
+    }];
+    assert_eq!(match_ref_commit_hash(&refs, "new"), None);
+}
+
+#[test]
+fn is_full_sha_gate_recognizes_only_40_char_hex() {
+    // Exactly 40 hex chars (either case) is a sha -> fast path.
+    assert!(is_full_sha(&"a".repeat(40)), "40 lowercase hex is a sha");
+    assert!(is_full_sha(&"A".repeat(40)), "40 uppercase hex is a sha");
+    // Off-by-one lengths are names, not shas -> fall through to ls-remote.
+    assert!(!is_full_sha(&"a".repeat(39)), "39 chars is not a sha");
+    assert!(!is_full_sha(&"a".repeat(41)), "41 chars is not a sha");
+    // 40 chars but a non-hex byte is a ref name, not a sha.
+    assert!(
+        !is_full_sha(&format!("{}g", "a".repeat(39))),
+        "40-char non-hex is not a sha"
+    );
+}
+
+#[test]
+fn git_clone_rejects_raw_sha_git_ref_without_panic() {
+    // A raw 40-hex commit SHA must be rejected with an actionable error
+    // rather than the gix `with_ref_name(<object-id>)` panic. The check
+    // is at git_clone's entry, BEFORE any network, so the bogus URL is
+    // never contacted (the test is deterministic + offline).
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sha = "1234567890abcdef1234567890abcdef12345678";
+    let err = git_clone(
+        "https://invalid.invalid/nope.git",
+        sha,
+        tmp.path(),
+        "test",
+        None,
+    )
+    .err()
+    .expect("a raw SHA git_ref must be rejected, not cloned");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("raw commit SHA") && msg.contains("branch or tag"),
+        "the error must be actionable (use a branch or tag): {msg}"
+    );
 }

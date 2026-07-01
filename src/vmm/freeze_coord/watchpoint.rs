@@ -109,65 +109,31 @@ pub(super) fn republish_watchpoint_on_rebind(
         return WatchpointPublishResult::Unchanged;
     }
     if sched_kva == 0 {
-        // Disarm. Order: clear `request_kva` first so a racing
-        // vCPU's Acquire load returns 0 and `self_arm_watchpoint`
-        // re-issues `KVM_SET_GUEST_DEBUG` without slot 0's enable
-        // bits BEFORE we null the host pointer. The Release on
-        // `request_kva` synchronizes-with the vCPU's Acquire load;
-        // the host-ptr null happens-after on this thread but the
-        // vCPU may still hold the previously-observed (non-null)
-        // pointer for reads. That's safe: the previously armed
-        // slot is still backed by the host mapping (`vm.guest_mem`
-        // outlives every vCPU thread), and any in-flight
-        // `read_volatile` on the old pointer reads a stable host
-        // address even though the guest-side slab is freed. The
-        // `kind_host_ptr` null prevents future fires (after vCPUs
-        // have re-armed) from dereffing the old pointer.
-        watchpoint.request_kva.store(0, Ordering::Release);
-        watchpoint
-            .kind_host_ptr
-            .store(std::ptr::null_mut(), Ordering::Release);
-        // Also clear the sticky `hit` flag. The watchpoint fired
-        // on the kernel's `*scx_root->exit_kind` write that
-        // immediately precedes scx_root_disable's
-        // `RCU_INIT_POINTER(scx_root, NULL)` (see
-        // kernel/sched/ext.c:5735 scx_root_disable + L5859
-        // kobject_del); the fire is the in-progress teardown the
-        // disarm path is closing out. Leaving `hit = true` after
-        // a disarm causes the late-trigger arm at
-        // freeze_coord/mod.rs to re-observe `watchpoint_hit =
-        // true` next iteration AND see `request_kva = 0`, falling
-        // into the gate's "prereq missing → do not gate" fallback
-        // at L5600 — which produces a bogus Captured dump for
-        // every intentional Op::Detach / Op::Replace scx_disable.
-        // Real errors are still captured: the BPF
-        // `ktstr_err_exit_detected` latch (probe.bpf.c:687) sets
-        // BEFORE the scx_disable_workfn that runs scx_root_disable,
-        // so `bss_state == Triggered` fires the late-trigger arm
-        // via `compute_err_triggered` independently of
-        // `watchpoint.hit`.
-        watchpoint.hit.store(false, Ordering::Release);
+        // Scheduler detached (`*scx_root == 0`): the `scx_sched` the
+        // slot watched is RCU-freed (scx_root_disable's
+        // `RCU_INIT_POINTER(scx_root, NULL)`), so DR0 must not keep
+        // firing into the now-freed (and possibly slab-recycled) page.
+        // Disarm slot 0; the caller stores `last_sched_kva = 0` so the
+        // next scan tick republishes on the next attach. See
+        // [`WatchpointArm::disarm`] for the `request_kva`-first store
+        // ordering and the hit-clear rationale (a stale fire from this
+        // scheduler's teardown must not poison the next scheduler's
+        // late-trigger arm; real errors still latch via the BPF `.bss`
+        // `err_triggered` path, independent of `hit`).
+        watchpoint.disarm();
         return WatchpointPublishResult::Detached;
     }
     if last_sched_kva != 0 {
-        // A → B rebind: disarm-only this tick. Same store ordering
-        // as the detach disarm above (`request_kva = 0` first, then
-        // `kind_host_ptr = null`) for the same Release/Acquire
-        // reasons. Caller resets `last_sched_kva = 0` so the next
-        // scan-tick's `sched_kva != last_sched_kva` check sees
-        // `0 → B (non-zero)` and falls through to the publish path
-        // below, exactly like a fresh attach.
-        watchpoint.request_kva.store(0, Ordering::Release);
-        watchpoint
-            .kind_host_ptr
-            .store(std::ptr::null_mut(), Ordering::Release);
-        // Same rationale as the Detached arm above: the
-        // pre-rebind fire was on the OLD scheduler's exit_kind
-        // write during its scx_disable; leaving `hit = true`
-        // poisons the late-trigger arm on the new scheduler's
-        // first iteration. BPF bss latch independently catches
-        // real errors on the old scheduler.
-        watchpoint.hit.store(false, Ordering::Release);
+        // A → B rebind: disarm-only this tick — DR0 may still hold A's
+        // KVA between the publish and each vCPU's next
+        // `KVM_SET_GUEST_DEBUG` reissue. The caller resets
+        // `last_sched_kva = 0` so the next scan tick's `sched_kva !=
+        // last_sched_kva` check sees `0 → B (non-zero)` and falls
+        // through to the fresh-attach publish path below. Same disarm
+        // (and same hit-clear rationale — the pre-rebind fire was on
+        // the OLD scheduler's exit_kind write) as the Detached arm; see
+        // [`WatchpointArm::disarm`].
+        watchpoint.disarm();
         return WatchpointPublishResult::RebindDisarmed {
             previous: last_sched_kva,
             next: sched_kva,
@@ -244,5 +210,53 @@ pub(super) fn republish_watchpoint_on_rebind(
             }
         }
         None => WatchpointPublishResult::PublishDeferred { exit_kind_kva },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`WatchpointArm::disarm`] clears slot 0: `request_kva` → 0,
+    /// `kind_host_ptr` → null, `hit` → false. This is the teardown the
+    /// scan-tick Detached / RebindDisarmed arms AND the synchronous
+    /// sched-swap-notify path in `freeze_coord::run_vm` both rely on so
+    /// a stale DR0 cannot keep firing into a now-RCU-freed (and
+    /// possibly slab-recycled) `scx_sched` page and latch a phantom
+    /// failure dump. Regression-pins the swap-notify teardown's
+    /// watchpoint half (the rest — `cached_exit_kind_pa` /
+    /// `last_sched_kva` / the owned accessor — are run-loop locals
+    /// cleared inline alongside this call).
+    #[test]
+    fn disarm_clears_slot0_state() {
+        let wp = WatchpointArm::new().expect("WatchpointArm::new");
+        // Arm slot 0 with a plausible exit_kind KVA, a non-null host
+        // pointer, and a latched hit — the state a Published transition
+        // leaves behind. (disarm only stores/clears the pointer value;
+        // it never dereferences it, so a stack address is fine here.)
+        let mut dummy: u32 = 0;
+        wp.kind_host_ptr
+            .store(&mut dummy as *mut u32, Ordering::Release);
+        wp.request_kva
+            .store(0xffff_8000_dead_beef, Ordering::Release);
+        wp.hit.store(true, Ordering::Release);
+        wp.mark_armed();
+
+        wp.disarm();
+
+        assert_eq!(
+            wp.request_kva.load(Ordering::Acquire),
+            0,
+            "request_kva must clear so self_arm_watchpoint reissues without slot 0"
+        );
+        assert!(
+            wp.kind_host_ptr.load(Ordering::Acquire).is_null(),
+            "kind_host_ptr must null so latch_slot0_with_gate bails on a stale fire"
+        );
+        assert!(
+            !wp.hit.load(Ordering::Acquire),
+            "sticky hit must clear so the late-trigger arm doesn't re-fire on the \
+             closed-out scheduler's teardown write"
+        );
     }
 }

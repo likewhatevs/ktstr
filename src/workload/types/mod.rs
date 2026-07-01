@@ -72,7 +72,7 @@ impl WorkPhase {
 mod methods;
 mod work_type;
 
-pub use work_type::{CustomFn, WorkType, WorkerCtx};
+pub use work_type::{CustomCfg, CustomFn, WorkType, WorkerCtx};
 
 /// Spawn-time validation failures for [`WorkType`] preconditions.
 ///
@@ -123,6 +123,51 @@ pub enum WorkTypeValidationError {
          doc rationale in [`WorkType::IdleChurn`])."
     )]
     ZeroSleepDuration {
+        /// Index of the offending group in
+        /// `WorkloadConfig::composed` (primary group = 0).
+        group_idx: usize,
+    },
+    /// [`WorkType::TimerLatency`] with `interval_us == 0`. A zero interval never
+    /// advances the absolute deadline, collapsing the cyclictest loop to a tight
+    /// busy-spin rather than a timer-latency probe.
+    #[error(
+        "TimerLatency interval_us must be > 0 (group {group_idx}); a zero \
+         interval never advances the deadline and collapses the loop to a \
+         busy-spin (see [`WorkType::TimerLatency`] variant doc)"
+    )]
+    ZeroTimerInterval {
+        /// Index of the offending group in
+        /// `WorkloadConfig::composed` (primary group = 0).
+        group_idx: usize,
+    },
+    /// [`WorkType::NetTraffic`] with `frame_bytes` outside `[60, 1514]`. Below
+    /// 60 (`ETH_ZLEN`) there is no room for the L2 header the loopback echoes;
+    /// above 1514 (standard MTU + header) the frame exceeds the virtio-net MTU.
+    #[error(
+        "NetTraffic frame_bytes must be in [60, 1514] (got {frame_bytes}, group \
+         {group_idx}); below 60 there is no room for the Ethernet header and \
+         above 1514 exceeds the standard MTU (see [`WorkType::NetTraffic`] \
+         variant doc)"
+    )]
+    NetTrafficFrameBytes {
+        /// The offending `frame_bytes` value the caller supplied.
+        frame_bytes: u16,
+        /// Index of the offending group in
+        /// `WorkloadConfig::composed` (primary group = 0).
+        group_idx: usize,
+    },
+    /// [`WorkType::IrqWake`] with `frame_bytes` outside `[60, 1514]` — same bound
+    /// and reasoning as [`Self::NetTrafficFrameBytes`] (the IrqWake sender reuses
+    /// the NetTraffic frame builder).
+    #[error(
+        "IrqWake frame_bytes must be in [60, 1514] (got {frame_bytes}, group \
+         {group_idx}); below 60 there is no room for the Ethernet header and \
+         above 1514 exceeds the standard MTU (see [`WorkType::IrqWake`] variant \
+         doc)"
+    )]
+    IrqWakeFrameBytes {
+        /// The offending `frame_bytes` value the caller supplied.
+        frame_bytes: u16,
         /// Index of the offending group in
         /// `WorkloadConfig::composed` (primary group = 0).
         group_idx: usize,

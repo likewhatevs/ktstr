@@ -1,7 +1,7 @@
-//! `AssertResult::merge` and the per-field worst-wins / lowest-non-zero
-//! / sum aggregation rules for `ScenarioStats`. Every polarity is
-//! exercised in both directions so a sign-flip regression surfaces
-//! regardless of which side carries the worse value.
+//! `AssertResult::merge` and the per-field worst-wins / sum aggregation
+//! rules for `ScenarioStats`, plus the polarity-aware ext-metric min/max
+//! fold. Every polarity is exercised in both directions so a sign-flip
+//! regression surfaces regardless of which side carries the worse value.
 
 use super::tests_common::rpt;
 use super::*;
@@ -141,10 +141,11 @@ fn merge_accumulates_totals() {
 ///     merge order, preserving cardinality;
 ///   - pick the worst value of every merge-folded higher-is-worse
 ///     `worst_*` field across all merged cgroups;
-///   - pick the lowest-non-zero value of `worst_page_locality`
-///     (0.0 is the unreported sentinel, matching the accumulator-pass
-///     convention in `AssertResult::pass().merge(real)`);
 ///   - SUM `total_iterations` across all cgroups, not max it.
+///
+/// (`worst_page_locality` is NOT merge-folded — it re-pools run-level
+/// post-merge from the per-phase NUMA carriers; see
+/// `merge_repools_worst_page_locality_across_cgroups_measured_zero_wins`.)
 ///
 /// (The wake / run-delay distributions and the iteration efficiencies are
 /// no longer merge-folded — they re-pool post-merge; see the `repool_*`
@@ -172,9 +173,11 @@ fn merge_three_cgroups_worst_wins_and_iterations_sum() {
         };
         // The wake/run-delay and iteration-efficiency roll-ups are no longer
         // ScenarioStats fields (they are Distribution / WorstLowest, re-pooled
-        // post-merge); this test now covers only the merge-folded worst-wins
-        // (`worst_spread`, `worst_migration_ratio`, `worst_page_locality`),
-        // `total_iterations`, and the `cgroups.extend` accumulation.
+        // post-merge); this test now covers the merge-folded worst-wins
+        // (`worst_spread`, `worst_migration_ratio`), `total_iterations`, and the
+        // `cgroups.extend` accumulation (including each cgroup's per-cgroup
+        // `page_locality` surviving the merge — `worst_page_locality` itself
+        // re-pools post-merge from the per-phase carriers, covered elsewhere).
         AssertResult {
             outcomes: vec![],
             passes: vec![],
@@ -182,7 +185,6 @@ fn merge_three_cgroups_worst_wins_and_iterations_sum() {
                 total_iterations: total_iters,
                 worst_spread,
                 worst_migration_ratio: worst_mig,
-                worst_page_locality: page_locality,
                 cgroups: vec![cg],
                 ..ScenarioStats::default()
             },
@@ -210,16 +212,15 @@ fn merge_three_cgroups_worst_wins_and_iterations_sum() {
     assert_eq!(s.cgroups[0].total_iterations, 100);
     assert_eq!(s.cgroups[1].total_iterations, 200);
     assert_eq!(s.cgroups[2].total_iterations, 400);
+    // Each cgroup's per-cgroup `page_locality` telemetry survives the merge into
+    // stats.cgroups (the run-level worst re-pools from these post-merge):
+    assert_eq!(s.cgroups[0].page_locality, 0.8);
+    assert_eq!(s.cgroups[1].page_locality, 0.5);
+    assert_eq!(s.cgroups[2].page_locality, 0.9);
 
     // Worst-wins across 3 cgroups (higher-is-worse):
     assert_eq!(s.worst_spread, 20.0, "third cgroup's 20.0 is worst");
     assert_eq!(s.worst_migration_ratio, 0.3, "second cgroup's 0.3 is worst");
-    // Lower-is-worse rollup (`worst_page_locality`, `fold_lowest_nonzero`):
-    // every value is strictly positive so the 0-sentinel branch never wins.
-    assert_eq!(
-        s.worst_page_locality, 0.5,
-        "second cgroup's 0.5 is the lowest-non-zero — 0 sentinel never wins",
-    );
     // total_iterations SUMS across cgroups, not maxes:
     assert_eq!(
         s.total_iterations,
@@ -680,33 +681,858 @@ fn populate_run_pooled_iterations_per_cpu_sec_tiny_denominator_stays_finite() {
     );
 }
 
+/// Whole-run taobench qps + hit Rates re-pool across the run's Taobench
+/// cgroups via sum-of-ops and max-of-wall (the window is shared by the
+/// concurrent cohorts, so it is taken as MAX, never summed — a summed window
+/// would deflate every qps). With cg1 (fast 800, slow 200, 10 s) and cg2 (fast
+/// 300, slow 700, 8 s), the pool is fast 1100, slow 900, ops 2000, wall
+/// MAX(10,8) = 10 s, giving total 200/s, fast 110/s, slow 90/s, and hit
+/// 1100/2000 = 0.55. A summed-wall denominator (18 s) would give total roughly
+/// 111/s, so the MAX window is observable.
+#[test]
+fn populate_run_pooled_taobench_repools_across_cgroups() {
+    let tb = |fast: u64, slow: u64, secs: u64| {
+        Some(crate::workload::taobench::run::TaobenchStats {
+            get_cmds: fast + slow,
+            get_misses: slow,
+            fast_ops: fast,
+            slow_ops: slow,
+            elapsed_ns: secs * 1_000_000_000,
+        })
+    };
+    let cg1 = CgroupStats {
+        taobench_whole: tb(800, 200, 10),
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let cg2 = CgroupStats {
+        taobench_whole: tb(300, 700, 8),
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mk = |cg: &CgroupStats| AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: ScenarioStats {
+            cgroups: vec![cg.clone()],
+            ..ScenarioStats::default()
+        },
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    let mut acc = mk(&cg1);
+    acc.merge(mk(&cg2));
+    populate_run_pooled_taobench(&mut acc.stats);
+    let e = &acc.stats.ext_metrics;
+    // Counter components: Σ ops, MAX wall.
+    assert_eq!(e.get("total_taobench_ops").copied(), Some(2000.0));
+    assert_eq!(e.get("total_taobench_fast_ops").copied(), Some(1100.0));
+    assert_eq!(e.get("total_taobench_slow_ops").copied(), Some(900.0));
+    assert_eq!(
+        e.get("total_taobench_wall_sec").copied(),
+        Some(10.0),
+        "wall is MAX(10,8) = 10, not Σ = 18",
+    );
+    // Derived Rates = Σnum / Σden over the cohort.
+    assert_eq!(e.get("taobench_total_ops_per_sec").copied(), Some(200.0));
+    assert_eq!(e.get("taobench_fast_ops_per_sec").copied(), Some(110.0));
+    assert_eq!(e.get("taobench_slow_ops_per_sec").copied(), Some(90.0));
+    let hit = e
+        .get("taobench_hit_fraction")
+        .copied()
+        .expect("hit_fraction derived");
+    assert!(
+        (hit - 0.55).abs() < 1e-9,
+        "Σfast/Σops = 1100/2000 = 0.55, got {hit}",
+    );
+}
+
+/// No Taobench cgroup (every `taobench_whole` is `None`) → no keys written, so a
+/// non-taobench run stays distinct from a measured zero. Also covers the
+/// empty-cgroups case (the same `pooled == None` early return).
+#[test]
+fn populate_run_pooled_taobench_absent_without_taobench_cgroup() {
+    let cg = CgroupStats {
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mut stats = ScenarioStats {
+        cgroups: vec![cg],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_taobench(&mut stats);
+    assert!(
+        stats.ext_metrics.is_empty(),
+        "no taobench keys when no cgroup ran taobench",
+    );
+    // Empty cgroups vec: same early return, no keys.
+    let mut empty = ScenarioStats::default();
+    populate_run_pooled_taobench(&mut empty);
+    assert!(empty.ext_metrics.is_empty(), "no keys for empty cgroups");
+}
+
+/// `taobench_whole` present but `elapsed_ns == 0` (degenerate window): qps is
+/// undefined, so NEITHER components NOR rates are written (both-or-neither gate
+/// on the measured wall window).
+#[test]
+fn populate_run_pooled_taobench_absent_on_zero_wall() {
+    let cg = CgroupStats {
+        taobench_whole: Some(crate::workload::taobench::run::TaobenchStats {
+            get_cmds: 100,
+            get_misses: 10,
+            fast_ops: 90,
+            slow_ops: 10,
+            elapsed_ns: 0,
+        }),
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mut stats = ScenarioStats {
+        cgroups: vec![cg],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_taobench(&mut stats);
+    assert!(
+        stats.ext_metrics.is_empty(),
+        "no keys when the wall window is 0 (qps undefined)",
+    );
+}
+
+/// Wall window measured but ZERO ops completed (a cohort that issued no
+/// completions): the qps components/rates land at 0, but `taobench_hit_fraction`
+/// stays ABSENT — `derive_rate_metrics` skips its zero denominator (total ops
+/// 0), keeping a no-ops run distinct from a real 0.0 hit fraction. This is the
+/// per-metric gate: qps gated on the wall window, hit_fraction gated on
+/// completed ops via the derive's denominator guard.
+#[test]
+fn populate_run_pooled_taobench_hit_fraction_absent_when_no_ops() {
+    let cg = CgroupStats {
+        taobench_whole: Some(crate::workload::taobench::run::TaobenchStats {
+            get_cmds: 0,
+            get_misses: 0,
+            fast_ops: 0,
+            slow_ops: 0,
+            elapsed_ns: 5_000_000_000,
+        }),
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mut stats = ScenarioStats {
+        cgroups: vec![cg],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_taobench(&mut stats);
+    let e = &stats.ext_metrics;
+    // Components present (wall measured); qps = 0.
+    assert_eq!(e.get("total_taobench_ops").copied(), Some(0.0));
+    assert_eq!(e.get("total_taobench_wall_sec").copied(), Some(5.0));
+    assert_eq!(e.get("taobench_total_ops_per_sec").copied(), Some(0.0));
+    // hit_fraction ABSENT (0/0 skipped), not a false 0.0.
+    assert!(
+        !e.contains_key("taobench_hit_fraction"),
+        "hit_fraction absent when no ops completed",
+    );
+    // command_hit_rate likewise ABSENT — Σget_cmds == 0, so derive_rate_metrics
+    // skips its zero denominator (a no-lookups run is distinct from a real 0.0 hit
+    // rate). The components are present as measured zeros.
+    assert_eq!(e.get("total_taobench_get_cmds").copied(), Some(0.0));
+    assert_eq!(e.get("total_taobench_get_hits").copied(), Some(0.0));
+    assert!(
+        !e.contains_key("taobench_command_hit_rate"),
+        "command_hit_rate absent when no lookups issued",
+    );
+}
+
+/// The whole-run COMMAND-time hit (`taobench_command_hit_rate` = Σhits/Σcmds,
+/// hits = cmds − misses) is a DISTINCT axis from the RESPONSE-time
+/// `taobench_hit_fraction` (Σfast/Σcompleted): a request is counted at lookup
+/// (cmd/miss) and again at completion (fast/slow), and under open-loop arrival a
+/// lookup can be in flight (counted) before it completes, so `get_misses` need not
+/// equal `slow_ops`. Two cgroups whose two hit measurements diverge pin the new
+/// command-time components (Σ pool) and the derived rate, plus the divergence the
+/// feature exists to expose.
+#[test]
+fn populate_run_pooled_taobench_command_hit_diverges_from_response() {
+    let mk = |cmds: u64, misses: u64, fast: u64, slow: u64, secs: u64| {
+        Some(crate::workload::taobench::run::TaobenchStats {
+            get_cmds: cmds,
+            get_misses: misses,
+            fast_ops: fast,
+            slow_ops: slow,
+            elapsed_ns: secs * 1_000_000_000,
+        })
+    };
+    let cg1 = CgroupStats {
+        taobench_whole: mk(1000, 100, 850, 50, 10),
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let cg2 = CgroupStats {
+        taobench_whole: mk(2000, 400, 1500, 100, 10),
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mut stats = ScenarioStats {
+        cgroups: vec![cg1, cg2],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_taobench(&mut stats);
+    let e = &stats.ext_metrics;
+    // Command-time components pool by Σ; hits = Σcmds − Σmisses = 3000 − 500 = 2500.
+    assert_eq!(e.get("total_taobench_get_cmds").copied(), Some(3000.0));
+    assert_eq!(e.get("total_taobench_get_hits").copied(), Some(2500.0));
+    let cmd_hit = e
+        .get("taobench_command_hit_rate")
+        .copied()
+        .expect("command_hit_rate derived");
+    assert!(
+        (cmd_hit - 2500.0 / 3000.0).abs() < 1e-9,
+        "Σhits/Σcmds = 2500/3000 = 0.8333, got {cmd_hit}",
+    );
+    let resp_hit = e
+        .get("taobench_hit_fraction")
+        .copied()
+        .expect("hit_fraction derived");
+    assert!(
+        (resp_hit - 2350.0 / 2500.0).abs() < 1e-9,
+        "Σfast/Σcompleted = 2350/2500 = 0.94, got {resp_hit}",
+    );
+    assert!(
+        (cmd_hit - resp_hit).abs() > 0.05,
+        "command-time ({cmd_hit}) and response-time ({resp_hit}) hit DIVERGE — \
+         the reason both are registered whole-run keys",
+    );
+}
+
+/// A taobench per-phase per-cgroup carrier whose serve-latency `PlatStats` holds
+/// `lows` samples at `low_us` µs + `highs` samples at `high_us` µs (counters left
+/// zero). The taobench analog of [`schbench_wakeup_pc`].
+fn taobench_serve_pc(lows: u32, low_us: u32, highs: u32, high_us: u32) -> PhaseCgroupStats {
+    let mut serve = crate::workload::schbench::plat::PlatStats::default();
+    for _ in 0..lows {
+        serve.add_lat(low_us);
+    }
+    for _ in 0..highs {
+        serve.add_lat(high_us);
+    }
+    PhaseCgroupStats {
+        taobench: Some(crate::workload::taobench::run::TaobenchPhaseStats {
+            serve_lat: serve,
+            ..Default::default()
+        }),
+        ..PhaseCgroupStats::default()
+    }
+}
+
+/// populate_run_pooled_taobench_distribution re-pools the whole-run serve-latency
+/// percentile by UNIONING the per-cgroup serve `PlatStats` histograms and
+/// re-deriving — the percentile-OF-the-union, NOT a mean of per-cgroup
+/// percentiles. cg_a has 99 low serve samples (10 µs), cg_b has 1 high (10000 µs):
+/// the union p99 (rank 99 of 100 pooled) is a LOW bucket (~10 µs), whereas
+/// mean-of-per-cgroup-p99 would be ≈ (10 + 10000)/2 = 5005. The union MAX is the
+/// high sample (combine's max-of-max). Pins the cross-cgroup union + non-linearity
+/// (`schbench_phase` is a generic `PhaseBucket` builder, used here for taobench).
+#[test]
+fn populate_run_pooled_taobench_distribution_unions_cross_cgroup_percentile() {
+    let mut stats = ScenarioStats {
+        phases: vec![schbench_phase(
+            1,
+            vec![
+                ("cg_a", taobench_serve_pc(99, 10, 0, 0)),
+                ("cg_b", taobench_serve_pc(0, 0, 1, 10000)),
+            ],
+        )],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_taobench_distribution(&mut stats);
+    let e = &stats.ext_metrics;
+    let p99 = e
+        .get("taobench_serve_p99_us_whole")
+        .copied()
+        .expect("union p99 present");
+    assert!(
+        p99 < 1000.0,
+        "union p99 = percentile-of-pooled (~10 µs bucket), got {p99} \
+         (mean-of-per-cgroup-p99 would be ~5005)",
+    );
+    let max = e
+        .get("taobench_serve_max_us_whole")
+        .copied()
+        .expect("union max present");
+    assert!(
+        max > 5000.0,
+        "union max = max-of-max (the high sample's ~10000 µs bucket), got {max}",
+    );
+}
+
+/// The serve union spans PHASES, not only cgroups: the same cgroup contributes 99
+/// low serve samples in phase 1 and 1 high in phase 2. The whole-run p99 (rank 99
+/// of 100 pooled) is the LOW bucket — proving phase-1 samples are in the union —
+/// while the MAX is phase-2's high sample.
+#[test]
+fn populate_run_pooled_taobench_distribution_unions_cross_phase_percentile() {
+    let mut stats = ScenarioStats {
+        phases: vec![
+            schbench_phase(1, vec![("cg", taobench_serve_pc(99, 10, 0, 0))]),
+            schbench_phase(2, vec![("cg", taobench_serve_pc(0, 0, 1, 10000))]),
+        ],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_taobench_distribution(&mut stats);
+    let e = &stats.ext_metrics;
+    let p99 = e
+        .get("taobench_serve_p99_us_whole")
+        .copied()
+        .expect("union p99 present");
+    assert!(
+        p99 < 1000.0,
+        "cross-phase union p99 = percentile-of-pooled (~10 µs); phase-1 samples \
+         must be in the union, got {p99}",
+    );
+    let max = e
+        .get("taobench_serve_max_us_whole")
+        .copied()
+        .expect("union max present");
+    assert!(
+        max > 5000.0,
+        "cross-phase union max = phase-2's high sample (~10000 µs), got {max}",
+    );
+}
+
+/// Closed loop (or any run with no serve samples) writes NO serve `*_us_whole`
+/// keys — they read ABSENT, never a false 0. Covers both an empty-phases run and a
+/// phase whose taobench carrier has an empty serve histogram.
+#[test]
+fn populate_run_pooled_taobench_distribution_absent_without_serve_samples() {
+    // Empty phases: no carriers at all.
+    let mut empty = ScenarioStats::default();
+    populate_run_pooled_taobench_distribution(&mut empty);
+    assert!(
+        !empty
+            .ext_metrics
+            .contains_key("taobench_serve_p99_us_whole"),
+        "no serve keys for an empty run",
+    );
+    // A taobench carrier present but with an empty serve histogram (closed loop).
+    let mut stats = ScenarioStats {
+        phases: vec![schbench_phase(
+            1,
+            vec![("cg", taobench_serve_pc(0, 0, 0, 0))],
+        )],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_taobench_distribution(&mut stats);
+    assert!(
+        !stats
+            .ext_metrics
+            .contains_key("taobench_serve_p99_us_whole"),
+        "no serve keys when the histogram is empty (closed loop)",
+    );
+    assert!(
+        !stats
+            .ext_metrics
+            .contains_key("taobench_serve_max_us_whole"),
+        "no serve max key when the histogram is empty",
+    );
+}
+
+/// A schbench per-phase per-cgroup carrier with the given Class-3 raw pairs.
+fn schbench_pc(msg_rd: u64, msg_pc: u64, wkr_rd: u64, wkr_pc: u64, loops: u64) -> PhaseCgroupStats {
+    PhaseCgroupStats {
+        schbench: Some(crate::workload::schbench::run::SchbenchPhaseStats {
+            msg_run_delay_ns: msg_rd,
+            msg_pcount: msg_pc,
+            worker_run_delay_ns: wkr_rd,
+            worker_pcount: wkr_pc,
+            loop_count: loops,
+            ..Default::default()
+        }),
+        ..PhaseCgroupStats::default()
+    }
+}
+
+/// A schbench per-phase per-cgroup carrier whose wakeup PlatStats holds `lows`
+/// samples at `low_us` µs + `highs` samples at `high_us` µs (other streams empty).
+fn schbench_wakeup_pc(lows: u32, low_us: u32, highs: u32, high_us: u32) -> PhaseCgroupStats {
+    let mut p = crate::workload::schbench::plat::PlatStats::default();
+    for _ in 0..lows {
+        p.add_lat(low_us);
+    }
+    for _ in 0..highs {
+        p.add_lat(high_us);
+    }
+    PhaseCgroupStats {
+        schbench: Some(crate::workload::schbench::run::SchbenchPhaseStats {
+            wakeup: p,
+            ..Default::default()
+        }),
+        ..PhaseCgroupStats::default()
+    }
+}
+
+/// A PhaseBucket carrying the given per-cgroup schbench carriers.
+fn schbench_phase(step: u16, cgs: Vec<(&str, PhaseCgroupStats)>) -> PhaseBucket {
+    PhaseBucket {
+        step_index: step,
+        label: String::new(),
+        start_ms: 0,
+        end_ms: 0,
+        sample_count: 0,
+        metrics: std::collections::BTreeMap::new(),
+        per_cgroup: cgs.into_iter().map(|(n, c)| (n.to_string(), c)).collect(),
+    }
+}
+
+/// populate_run_pooled_schbench sums the Class-3 raw pairs across ALL phases AND
+/// ALL cgroups (the message / worker ROLES kept separate) and derives the two
+/// per-schedule run-delay Rates + the loop Counter. phase1: cg_a {msg 300/3,
+/// worker 500/1, 400 loops} + cg_b {worker 300/1, 600 loops}; phase2: cg_a {msg
+/// 100/97, worker 200/8}. Σ: msg 400/100, worker 1000/10, loops 1000 → msg 4
+/// ns/sched, worker 100 ns/sched (mean-of-ratios would give msg ~50.5).
+#[test]
+fn populate_run_pooled_schbench_repools_across_phases_and_cgroups() {
+    let mut stats = ScenarioStats {
+        phases: vec![
+            schbench_phase(
+                1,
+                vec![
+                    ("cg_a", schbench_pc(300, 3, 500, 1, 400)),
+                    ("cg_b", schbench_pc(0, 0, 300, 1, 600)),
+                ],
+            ),
+            schbench_phase(2, vec![("cg_a", schbench_pc(100, 97, 200, 8, 0))]),
+        ],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_schbench(&mut stats);
+    let e = &stats.ext_metrics;
+    // Counter components Σ across phases+cgroups, roles separate.
+    assert_eq!(
+        e.get("total_schbench_msg_run_delay_ns").copied(),
+        Some(400.0),
+    );
+    assert_eq!(e.get("total_schbench_msg_pcount").copied(), Some(100.0));
+    assert_eq!(
+        e.get("total_schbench_worker_run_delay_ns").copied(),
+        Some(1000.0),
+    );
+    assert_eq!(e.get("total_schbench_worker_pcount").copied(), Some(10.0));
+    assert_eq!(e.get("total_schbench_loops").copied(), Some(1000.0));
+    // Gate-Rates = Σrun_delay / Σpcount per role.
+    assert_eq!(
+        e.get("schbench_msg_run_delay_ns_per_sched").copied(),
+        Some(4.0),
+        "Σ400/Σ100 = 4 ns/sched",
+    );
+    assert_eq!(
+        e.get("schbench_worker_run_delay_ns_per_sched").copied(),
+        Some(100.0),
+        "Σ1000/Σ10 = 100 ns/sched",
+    );
+}
+
+/// Role gating: a carrier with only the worker role scheduled (msg_pcount == 0)
+/// emits the worker components + Rate and the loop Counter, but the message
+/// components + Rate stay ABSENT (never a 0/0 rate or a false-zero component).
+#[test]
+fn populate_run_pooled_schbench_role_gating_omits_unscheduled_role() {
+    let mut stats = ScenarioStats {
+        phases: vec![schbench_phase(
+            1,
+            vec![("cg", schbench_pc(0, 0, 200, 4, 50))],
+        )],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_schbench(&mut stats);
+    let e = &stats.ext_metrics;
+    assert_eq!(
+        e.get("schbench_worker_run_delay_ns_per_sched").copied(),
+        Some(50.0),
+        "200/4 = 50 ns/sched",
+    );
+    assert_eq!(e.get("total_schbench_loops").copied(), Some(50.0));
+    assert!(
+        !e.contains_key("total_schbench_msg_pcount"),
+        "message components absent when that role never scheduled",
+    );
+    assert!(
+        !e.contains_key("schbench_msg_run_delay_ns_per_sched"),
+        "message Rate absent (no 0/0)",
+    );
+}
+
+/// No schbench carrier anywhere → no keys (a non-schbench run stays distinct from
+/// a measured zero); empty phases likewise.
+#[test]
+fn populate_run_pooled_schbench_absent_without_schbench() {
+    let mut stats = ScenarioStats {
+        phases: vec![schbench_phase(1, vec![("cg", PhaseCgroupStats::default())])],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_schbench(&mut stats);
+    assert!(
+        stats.ext_metrics.is_empty(),
+        "no schbench keys when no carrier ran",
+    );
+    let mut empty = ScenarioStats::default();
+    populate_run_pooled_schbench(&mut empty);
+    assert!(empty.ext_metrics.is_empty(), "no keys for empty phases");
+}
+
+/// populate_run_pooled_schbench_distribution re-pools the whole-run percentile by
+/// UNIONING the per-cgroup PlatStats histograms and re-deriving — the
+/// percentile-OF-the-union, NOT a mean of per-cgroup percentiles. cg_a has 99 low
+/// wakeup samples (10 µs), cg_b has 1 high (10000 µs): the union p99 (rank 99 of
+/// 100 pooled samples) is a LOW bucket (~10 µs), whereas mean-of-per-cgroup-p99
+/// would be ≈ (10 + 10000)/2 = 5005. The union MAX is the high sample
+/// (combine's max-of-max). Pins the cross-cgroup union + the non-linearity.
+#[test]
+fn populate_run_pooled_schbench_distribution_unions_cross_cgroup_percentile() {
+    let mut stats = ScenarioStats {
+        phases: vec![schbench_phase(
+            1,
+            vec![
+                ("cg_a", schbench_wakeup_pc(99, 10, 0, 0)),
+                ("cg_b", schbench_wakeup_pc(0, 0, 1, 10000)),
+            ],
+        )],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_schbench_distribution(&mut stats);
+    let e = &stats.ext_metrics;
+    let p99 = e
+        .get("wakeup_p99_latency_us_whole")
+        .copied()
+        .expect("union p99 present");
+    assert!(
+        p99 < 1000.0,
+        "union p99 = percentile-of-pooled (~10 µs bucket), got {p99} \
+         (mean-of-per-cgroup-p99 would be ~5005)",
+    );
+    let max = e
+        .get("wakeup_max_latency_us_whole")
+        .copied()
+        .expect("union max present");
+    assert!(
+        max > 5000.0,
+        "union max = max-of-max (the high sample's ~10000 µs bucket), got {max}",
+    );
+    // request / rps streams had no samples → their keys are ABSENT (per-stream
+    // gate), never a false 0.
+    assert!(
+        !e.contains_key("request_p99_latency_us_whole"),
+        "request_*_whole absent when no request samples",
+    );
+    assert!(
+        !e.contains_key("rps_p50_whole"),
+        "rps_*_whole absent when no rps samples",
+    );
+}
+
+/// The union spans PHASES, not only cgroups: the same cgroup contributes 99 low
+/// wakeup samples in phase 1 and 1 high sample in phase 2. The whole-run p99 (rank
+/// 99 of the 100 pooled samples) is the LOW bucket — proving phase 1's samples are
+/// in the union — while the MAX is phase 2's high sample. Used alone, one phase
+/// would make p99 the high (≥ 1000) OR max the low (≤ 1000); both together pin the
+/// cross-phase union.
+#[test]
+fn populate_run_pooled_schbench_distribution_unions_cross_phase_percentile() {
+    let mut stats = ScenarioStats {
+        phases: vec![
+            schbench_phase(1, vec![("cg", schbench_wakeup_pc(99, 10, 0, 0))]),
+            schbench_phase(2, vec![("cg", schbench_wakeup_pc(0, 0, 1, 10000))]),
+        ],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_schbench_distribution(&mut stats);
+    let e = &stats.ext_metrics;
+    let p99 = e
+        .get("wakeup_p99_latency_us_whole")
+        .copied()
+        .expect("union p99 present");
+    assert!(
+        p99 < 1000.0,
+        "cross-phase union p99 = percentile-of-pooled (~10 µs); phase-1 samples \
+         must be in the union, got {p99}",
+    );
+    let max = e
+        .get("wakeup_max_latency_us_whole")
+        .copied()
+        .expect("union max present");
+    assert!(
+        max > 5000.0,
+        "cross-phase union max = phase-2's high sample (~10000 µs), got {max}",
+    );
+}
+
+/// Overflow-safety: the cross-cgroup PhaseCgroupStats::merge pools the
+/// guest-runtime monotonic counters with saturating arithmetic — a corrupt
+/// u64::MAX component saturates (an absurd-but-finite value) instead of
+/// debug-panicking / release-wrapping a derived metric to a small wrong number.
+#[test]
+fn phase_cgroup_merge_saturates_counter_overflow() {
+    let a = PhaseCgroupStats {
+        total_iterations: u64::MAX,
+        total_cpu_time_ns: u64::MAX,
+        total_migrations: u64::MAX,
+        numa_pages_local: u64::MAX,
+        numa_pages_total: u64::MAX,
+        wake_sample_total: u64::MAX,
+        timer_sample_total: u64::MAX,
+        ..PhaseCgroupStats::default()
+    };
+    let b = PhaseCgroupStats {
+        total_iterations: 5,
+        total_cpu_time_ns: 5,
+        total_migrations: 5,
+        numa_pages_local: 5,
+        numa_pages_total: 5,
+        wake_sample_total: 5,
+        timer_sample_total: 5,
+        ..PhaseCgroupStats::default()
+    };
+    let m = PhaseCgroupStats::merge(a, b);
+    assert_eq!(m.total_iterations, u64::MAX, "saturates, not wraps to 4");
+    assert_eq!(m.total_cpu_time_ns, u64::MAX);
+    assert_eq!(m.total_migrations, u64::MAX);
+    assert_eq!(m.numa_pages_local, u64::MAX);
+    assert_eq!(m.numa_pages_total, u64::MAX);
+    assert_eq!(m.wake_sample_total, u64::MAX);
+    assert_eq!(m.timer_sample_total, u64::MAX);
+}
+
+/// AssertResult::merge saturates the pooled run-level guest counters
+/// (total_migrations / total_iterations) rather than wrapping on a corrupt
+/// u64::MAX component. (total_workers / total_cpus are bounded topology counts,
+/// kept as plain `+=`.)
+#[test]
+fn assert_result_merge_saturates_run_level_counters() {
+    let mut a = AssertResult::pass();
+    a.stats.total_iterations = u64::MAX;
+    a.stats.total_migrations = u64::MAX;
+    let mut b = AssertResult::pass();
+    b.stats.total_iterations = 7;
+    b.stats.total_migrations = 7;
+    a.merge(b);
+    assert_eq!(a.stats.total_iterations, u64::MAX, "saturates, not wraps");
+    assert_eq!(a.stats.total_migrations, u64::MAX);
+}
+
+/// populate_run_pooled_schbench saturates its run-delay / pcount / loop pools on
+/// a corrupt u64::MAX component (matching the already-saturating
+/// SchbenchPhaseStats::merge); a wrapped sum would corrupt the gate-Rates and the
+/// loop Counter.
+#[test]
+fn populate_run_pooled_schbench_saturates_counter_overflow() {
+    let mut stats = ScenarioStats {
+        phases: vec![
+            schbench_phase(
+                1,
+                vec![(
+                    "cg",
+                    schbench_pc(u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+                )],
+            ),
+            schbench_phase(2, vec![("cg", schbench_pc(5, 5, 5, 5, 5))]),
+        ],
+        ..ScenarioStats::default()
+    };
+    populate_run_pooled_schbench(&mut stats);
+    let e = &stats.ext_metrics;
+    assert_eq!(
+        e.get("total_schbench_msg_run_delay_ns").copied(),
+        Some(u64::MAX as f64),
+        "msg run-delay pool saturates, not wraps",
+    );
+    assert_eq!(
+        e.get("total_schbench_loops").copied(),
+        Some(u64::MAX as f64),
+        "loop Counter pool saturates",
+    );
+}
+
+/// populate_run_pooled_iterations_per_cpu_sec folds with saturating arithmetic:
+/// two cgroups whose total_cpu_time_ns / total_iterations each approach u64::MAX
+/// sum to a saturated u64::MAX (a huge-but-finite total) rather than wrapping.
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_saturates_counter_overflow() {
+    let mut stats = ScenarioStats {
+        cgroups: vec![
+            CgroupStats {
+                total_cpu_time_ns: u64::MAX,
+                total_iterations: u64::MAX,
+                ..CgroupStats::default()
+            },
+            CgroupStats {
+                total_cpu_time_ns: u64::MAX,
+                total_iterations: 10,
+                ..CgroupStats::default()
+            },
+        ],
+        ..ScenarioStats::default()
+    };
+    super::run_metrics::populate_run_pooled_iterations_per_cpu_sec(&mut stats);
+    let e = &stats.ext_metrics;
+    assert_eq!(
+        e.get("total_iterations_pooled").copied(),
+        Some(u64::MAX as f64),
+        "summed_iters saturates, not wraps to 9",
+    );
+    assert_eq!(
+        e.get("total_cpu_time_sec").copied(),
+        Some(u64::MAX as f64 / 1e9),
+        "summed_ns saturates to a finite huge cpu-time-sec",
+    );
+}
+
+/// Build-path overflow-safety: cgroup_stats pools the per-worker WorkerReport
+/// counters — the FIRST cross-source fold, the one most exposed to a corrupt
+/// guest report — with saturating arithmetic. A u64::MAX component saturates
+/// instead of wrapping the per-cgroup total / migration-ratio to a small wrong
+/// number.
+#[test]
+fn cgroup_stats_saturates_per_worker_counter_overflow() {
+    let report = |iters: u64, mig: u64, cpu_ns: u64| crate::workload::WorkerReport {
+        iterations: iters,
+        migration_count: mig,
+        schedstat_cpu_time_ns: cpu_ns,
+        ..crate::workload::WorkerReport::default()
+    };
+    let reports = vec![report(u64::MAX, u64::MAX, u64::MAX), report(5, 5, 5)];
+    let cg = super::reductions::cgroup_stats(&reports);
+    assert_eq!(
+        cg.total_iterations,
+        u64::MAX,
+        "iterations pool saturates, not wraps to 4",
+    );
+    assert_eq!(cg.total_migrations, u64::MAX, "migration pool saturates");
+    assert_eq!(cg.total_cpu_time_ns, u64::MAX, "cpu-time pool saturates");
+}
+
+/// numa_agg_per_cgroup's cross-PHASE cross_node_migrated pool saturates: a
+/// corrupt u64::MAX migration count summed across phases clamps to u64::MAX (→ a
+/// huge-but-finite worst_cross_node_migration_ratio) rather than wrapping
+/// (u64::MAX + 5 → 4) to a tiny, silently-"good" ratio.
+#[test]
+fn numa_agg_cross_node_migrated_pool_saturates_counter_overflow() {
+    let pc = |migrated: u64| PhaseCgroupStats {
+        numa_pages_local: 50,
+        numa_pages_total: 100,
+        cross_node_migrated: migrated,
+        ..PhaseCgroupStats::default()
+    };
+    let mut stats = ScenarioStats {
+        phases: vec![
+            schbench_phase(1, vec![("cg", pc(u64::MAX))]),
+            schbench_phase(2, vec![("cg", pc(5))]),
+        ],
+        ..ScenarioStats::default()
+    };
+    populate_run_distribution_metrics(&mut stats);
+    let ratio = stats
+        .ext_metrics
+        .get("worst_cross_node_migration_ratio")
+        .copied()
+        .expect("worst_cross_node_migration_ratio present");
+    // saturated migrated (u64::MAX) / latest total (100) ≈ 1.8e17; a wrapped sum
+    // (u64::MAX + 5 → 4) would give 4/100 = 0.04.
+    assert!(
+        ratio > 1e10,
+        "cross-phase migrated pool saturates (huge ratio), got {ratio} \
+         (a wrapped sum would read ~0.04)",
+    );
+}
+
+/// assert_thresholds' max_migrations absolute-count gate saturates: a corrupt
+/// per-worker migration_count summing past u64::MAX clamps to u64::MAX so the
+/// gate FIRES, instead of wrapping to a small value that would silently PASS a
+/// limit it should fail.
+#[test]
+fn assert_thresholds_max_migrations_gate_saturates_not_wraps() {
+    let report = |mig: u64| crate::workload::WorkerReport {
+        migration_count: mig,
+        iterations: 1,
+        ..crate::workload::WorkerReport::default()
+    };
+    let reports = vec![report(u64::MAX), report(5)];
+    let thresholds = super::reductions::AbsoluteThresholds {
+        max_migrations: Some(1000),
+        ..Default::default()
+    };
+    let r = super::reductions::assert_thresholds(&reports, &thresholds);
+    assert!(
+        r.is_fail(),
+        "saturated total_mig (u64::MAX) > 1000 must FAIL the gate; a wrapped sum \
+         (u64::MAX + 5 → 4) would falsely pass",
+    );
+}
+
+/// run_metric(TotalMigrations / TotalIterations) saturates its cross-cgroup sum:
+/// two cgroups at u64::MAX read back u64::MAX, not a wrapped-small typed value.
+#[test]
+fn run_metric_total_counters_saturate_cross_cgroup() {
+    let cg = |mig: u64, iters: u64| CgroupStats {
+        total_migrations: mig,
+        total_iterations: iters,
+        ..CgroupStats::default()
+    };
+    let stats = ScenarioStats {
+        cgroups: vec![cg(u64::MAX, u64::MAX), cg(5, 5)],
+        ..ScenarioStats::default()
+    };
+    assert_eq!(
+        stats.run_metric(crate::stats::BuiltinMetric::TotalMigrations),
+        Some(u64::MAX as f64),
+        "total_migrations cross-cgroup typed read saturates",
+    );
+    assert_eq!(
+        stats.run_metric(crate::stats::BuiltinMetric::TotalIterations),
+        Some(u64::MAX as f64),
+        "total_iterations cross-cgroup typed read saturates",
+    );
+}
+
+/// PhaseBucket::cgroup_counter_total (the post_vm by-name read) saturates its
+/// cross-cgroup counter pool: two per-cgroup carriers at u64::MAX read back
+/// u64::MAX, not a wrapped-small value.
+#[test]
+fn cgroup_counter_total_saturates_cross_cgroup() {
+    let pc = |mig: u64| PhaseCgroupStats {
+        total_migrations: mig,
+        ..PhaseCgroupStats::default()
+    };
+    let bucket = schbench_phase(1, vec![("a", pc(u64::MAX)), ("b", pc(5))]);
+    assert_eq!(
+        bucket.cgroup_counter_total("total_migrations"),
+        Some(u64::MAX as f64),
+        "cross-cgroup counter pool saturates, not wraps",
+    );
+}
+
 #[test]
 fn merge_scenario_stats_worst_wins_and_iterations_sum() {
     // Aggregates-across-cgroups contract for the MERGE-FOLDED worst-wins
     // fields: each takes the larger value (higher-is-worse max) and
     // `total_iterations` sums. The wake-latency / run-delay roll-ups and the
     // wake-latency tail ratio are no longer merge-folded (they are derived
-    // `MetricKind`s re-pooled post-merge — see the `repool_*` tests); this
-    // covers `worst_spread`, `worst_migration_ratio`, and
-    // `worst_cross_node_migration_ratio`.
+    // `MetricKind`s re-pooled post-merge — see the `repool_*` tests, and
+    // `worst_cross_node_migration_ratio` likewise moved to the post-merge re-pool;
+    // this covers `worst_spread` and `worst_migration_ratio`.
     let mut a = AssertResult::pass();
     a.stats.total_iterations = 100;
     a.stats.worst_spread = 5.0;
     a.stats.worst_migration_ratio = 0.1;
-    a.stats.worst_cross_node_migration_ratio = 0.05;
 
     let mut b = AssertResult::pass();
     b.stats.total_iterations = 400;
     b.stats.worst_spread = 15.0;
     b.stats.worst_migration_ratio = 0.4;
-    b.stats.worst_cross_node_migration_ratio = 0.25;
 
     a.merge(b);
 
     assert_eq!(a.stats.total_iterations, 500);
     assert_eq!(a.stats.worst_spread, 15.0);
     assert_eq!(a.stats.worst_migration_ratio, 0.4);
-    assert_eq!(a.stats.worst_cross_node_migration_ratio, 0.25);
 }
 
 #[test]
@@ -714,16 +1540,14 @@ fn merge_scenario_stats_worst_wins_when_other_is_smaller() {
     // Symmetric case: when `other` reports smaller values, `self`
     // retains its larger worst. Covers the "self wins" branch of the
     // merge-folded scalar worst-comparisons: worst_spread,
-    // worst_migration_ratio, worst_cross_node_migration_ratio (all `.max()`)
-    // and the coupled worst_gap_ms/cpu guard. (Wake-latency / run-delay
-    // roll-ups and the wake-latency tail ratio moved to the post-merge
-    // re-pool — see the repool_* tests.)
+    // worst_migration_ratio (both `.max()`) and the coupled worst_gap_ms/cpu
+    // guard. (Wake-latency / run-delay roll-ups, the wake-latency tail ratio, and
+    // both NUMA roll-ups moved to the post-merge re-pool — see the repool_* tests.)
     let mut a = AssertResult::pass();
     a.stats.worst_spread = 30.0;
     a.stats.worst_gap_ms = 500;
     a.stats.worst_gap_cpu = 7;
     a.stats.worst_migration_ratio = 0.9;
-    a.stats.worst_cross_node_migration_ratio = 0.35;
     a.stats.total_iterations = 500;
 
     let mut b = AssertResult::pass();
@@ -731,7 +1555,6 @@ fn merge_scenario_stats_worst_wins_when_other_is_smaller() {
     b.stats.worst_gap_ms = 100;
     b.stats.worst_gap_cpu = 3;
     b.stats.worst_migration_ratio = 0.1;
-    b.stats.worst_cross_node_migration_ratio = 0.05;
     b.stats.total_iterations = 50;
 
     a.merge(b);
@@ -742,54 +1565,17 @@ fn merge_scenario_stats_worst_wins_when_other_is_smaller() {
     // index when `self` wins on `worst_gap_ms`.
     assert_eq!(a.stats.worst_gap_cpu, 7);
     assert_eq!(a.stats.worst_migration_ratio, 0.9);
-    assert_eq!(a.stats.worst_cross_node_migration_ratio, 0.35);
     // Totals always sum, independent of worst-wins direction.
     assert_eq!(a.stats.total_iterations, 550);
 }
 
-#[test]
-fn merge_worst_page_locality_lowest_non_zero() {
-    // `worst_page_locality` can't use plain `.min()` because 0.0
-    // is the "unreported" sentinel — a fresh cgroup with no NUMA
-    // readings would otherwise clobber a real reading from a
-    // reporting cgroup. The merge instead takes the lowest
-    // non-zero value.
-
-    // (a) self=0.0 (unreported) + other=0.8 (reported) → 0.8.
-    let mut a = AssertResult::pass();
-    a.stats.worst_page_locality = 0.0;
-    let mut b = AssertResult::pass();
-    b.stats.worst_page_locality = 0.8;
-    a.merge(b);
-    assert_eq!(
-        a.stats.worst_page_locality, 0.8,
-        "unreported self must adopt other's reading"
-    );
-
-    // (b) self=0.6 + other=0.8 → 0.6 (self's lower reading wins).
-    let mut a = AssertResult::pass();
-    a.stats.worst_page_locality = 0.6;
-    let mut b = AssertResult::pass();
-    b.stats.worst_page_locality = 0.8;
-    a.merge(b);
-    assert_eq!(
-        a.stats.worst_page_locality, 0.6,
-        "lower non-zero reading wins across cgroups"
-    );
-
-    // (c) self=0.8 (reported) + other=0.0 (unreported) → 0.8.
-    // Plain `.min()` would select 0.0 here — the guard rejects
-    // other's sentinel instead of overwriting self.
-    let mut a = AssertResult::pass();
-    a.stats.worst_page_locality = 0.8;
-    let mut b = AssertResult::pass();
-    b.stats.worst_page_locality = 0.0;
-    a.merge(b);
-    assert_eq!(
-        a.stats.worst_page_locality, 0.8,
-        "unreported other must not clobber self's reading"
-    );
-}
+// `worst_page_locality` no longer merge-folds as a typed field (the
+// `fold_lowest_nonzero` 0.0-sentinel path is removed). Its None-aware
+// re-pool over the per-phase NUMA carriers — where a MEASURED 0.0 wins the
+// lowest (the bug the sentinel masked) and an unmeasured cgroup is skipped —
+// is pinned by `merge_repools_worst_page_locality_across_cgroups_measured_zero_wins`
+// (in `tests_numa.rs`) and the read-side
+// `run_metric_numa_fields_latest_residency_summed_migrations_none_aware`.
 
 #[test]
 fn merge_ext_metrics_higher_is_worse_takes_max() {
@@ -1145,6 +1931,8 @@ fn assert_result_merge_per_phase_per_cgroup_unions_and_folds() {
             cpus_used: BTreeSet::from([0, 1]),
             wake_latencies_ns: vec![10, 20],
             wake_sample_total: 2,
+            timer_latencies_ns: vec![],
+            timer_sample_total: 0,
             run_delays_ns: vec![1_000],
             off_cpu_pcts: vec![5.0, 20.0],
             total_migrations: 3,
@@ -1156,6 +1944,9 @@ fn assert_result_merge_per_phase_per_cgroup_unions_and_folds() {
             max_gap_ms: 7,
             max_gap_cpu: 3,
             stripped: false,
+            metrics: std::collections::BTreeMap::new(),
+            schbench: None,
+            taobench: None,
         },
     );
     a_bucket.per_cgroup.insert(
@@ -1183,6 +1974,8 @@ fn assert_result_merge_per_phase_per_cgroup_unions_and_folds() {
             cpus_used: BTreeSet::from([1, 2]),
             wake_latencies_ns: vec![30],
             wake_sample_total: 1,
+            timer_latencies_ns: vec![],
+            timer_sample_total: 0,
             run_delays_ns: vec![2_000, 3_000],
             off_cpu_pcts: vec![3.0, 15.0],
             total_migrations: 2,
@@ -1194,6 +1987,9 @@ fn assert_result_merge_per_phase_per_cgroup_unions_and_folds() {
             max_gap_ms: 9,
             max_gap_cpu: 5,
             stripped: false,
+            metrics: std::collections::BTreeMap::new(),
+            schbench: None,
+            taobench: None,
         },
     );
     b_bucket.per_cgroup.insert(
@@ -1515,6 +2311,13 @@ fn merge_kind_enum_exhaustively_covers_metric_kind_variants() {
         MergeKind::NonCommutative,
     );
     assert_eq!(MetricKind::DeltaSum.merge_kind(), MergeKind::Commutative);
+    // PerPhaseDeltaSum's cross-cgroup same-step merge sums the per-cgroup
+    // CPU-time deltas (Commutative, like Counter); the SUM-cross-phase /
+    // MEAN-cross-run split lives at the fold sites, not in merge_kind.
+    assert_eq!(
+        MetricKind::PerPhaseDeltaSum.merge_kind(),
+        MergeKind::Commutative,
+    );
     assert_eq!(
         MetricKind::Rate {
             numerator: "n",
@@ -1523,6 +2326,36 @@ fn merge_kind_enum_exhaustively_covers_metric_kind_variants() {
         .merge_kind(),
         MergeKind::Recompute,
     );
+    // The derived kinds are all Recompute (re-derived post-merge, never folded
+    // from two ready-made values): the per-phase merge loop skips them
+    // (is_derived) and `populate_run_distribution_metrics` / `derive_phase_metrics`
+    // re-pool the value. Pin each so a new derived kind that forgets the Recompute
+    // arm fails here, not silently.
+    assert_eq!(
+        MetricKind::Distribution {
+            source: crate::stats::SampleSource::WakeLatencyNs,
+            reduction: crate::stats::SampleReduction::P99,
+        }
+        .merge_kind(),
+        MergeKind::Recompute,
+    );
+    assert_eq!(
+        MetricKind::WorstLowest {
+            numerator: crate::stats::WorstLowestNumerator::NumaLocal,
+            denominator: crate::stats::WorstLowestDenominator::NumaTotal,
+        }
+        .merge_kind(),
+        MergeKind::Recompute,
+    );
+    assert_eq!(
+        MetricKind::WakeLatencyTailRatio.merge_kind(),
+        MergeKind::Recompute,
+    );
+    assert_eq!(
+        MetricKind::WorstCrossNodeRatio.merge_kind(),
+        MergeKind::Recompute,
+    );
+    assert_eq!(MetricKind::PerPhase.merge_kind(), MergeKind::Recompute);
 }
 
 /// merge_matched_phase_buckets must INCLUDE a synthesized

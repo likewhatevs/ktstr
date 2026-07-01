@@ -245,16 +245,20 @@ fn phase_counter_delta_returns_last_minus_first() {
     );
 }
 
-/// `phase_counter_delta` returns `Some(0.0)` for a phase with
-/// exactly one finite sample (self-delta — the metric was
-/// observed but no per-phase change can be computed), and
-/// `None` only when zero samples are finite. The distinction
-/// matters for the bucket renderer: `Some(0.0)` paints "phase
-/// has data, delta is 0"; `None` paints "no data".
+/// `phase_counter_delta` returns `None` for a phase with FEWER THAN TWO
+/// finite samples — a delta is unmeasurable from 0 or 1 points. It returns
+/// `Some(0.0)` only for 2+ finite samples that are equal (a REAL measured
+/// zero: the counter did not advance). This is the sentinel-free
+/// absent-vs-measured-zero contract: a 1-sample phase is "delta
+/// unmeasurable" (absent), NOT a phantom 0 that would make a per-phase
+/// Counter claim read 0. The renderer's has-data distinction is carried by
+/// `PhaseBucket::sample_count` (see `expect_metric`), not by this value.
 #[test]
-fn phase_counter_delta_one_finite_sample_is_self_delta() {
-    assert_eq!(phase_counter_delta(&[42.0]), Some(0.0));
-    assert_eq!(phase_counter_delta(&[f64::NAN, 42.0, f64::NAN]), Some(0.0));
+fn phase_counter_delta_under_two_finite_samples_is_unmeasurable() {
+    // 1 finite sample (incl. surrounded by NaN) => None: no second point.
+    assert_eq!(phase_counter_delta(&[42.0]), None);
+    assert_eq!(phase_counter_delta(&[f64::NAN, 42.0, f64::NAN]), None);
+    // 0 finite => None (unchanged).
     assert_eq!(phase_counter_delta(&[]), None);
     assert_eq!(phase_counter_delta(&[f64::NAN, f64::INFINITY]), None);
 }
@@ -274,6 +278,1192 @@ fn phase_counter_delta_clamps_negative_to_zero_on_counter_reset() {
     );
 }
 
+/// The IRQ-counter `read_sample` arms fold the per-CPU `PerCpuTimeStats`
+/// into a cross-CPU SUM at each freeze. One Sample carrying a two-CPU
+/// `per_cpu_time` slice: `total_hardirqs` = 100+200, `total_softirq_net_rx`
+/// = 10+20 (the `SOFTIRQ_NET_RX` vector index), `total_irq_time_ns` =
+/// 5_000+7_000. Empty `per_cpu_time` -> `None` (loud-absent, distinct from a
+/// measured 0). Pins the fold + the softirq index + the empty-slice guard
+/// directly, without the bucket machinery.
+#[test]
+fn irq_read_sample_arms_sum_across_cpus() {
+    use crate::monitor::btf_offsets::{NR_SOFTIRQS, SOFTIRQ_NET_RX};
+    use crate::monitor::dump::{FailureDumpReport, PerCpuTimeStats};
+    use crate::scenario::sample::SampleSeries;
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+
+    let net_rx = |n: u64| {
+        let mut s = [0u64; NR_SOFTIRQS];
+        s[SOFTIRQ_NET_RX] = n;
+        s
+    };
+    let entry = DrainedSnapshotEntry {
+        tag: "periodic_000".to_string(),
+        report: FailureDumpReport {
+            per_cpu_time: vec![
+                PerCpuTimeStats {
+                    cpu: 0,
+                    irqs_sum: 100,
+                    softirqs: net_rx(10),
+                    cpustat_irq_ns: 5_000,
+                    ..Default::default()
+                },
+                PerCpuTimeStats {
+                    cpu: 1,
+                    irqs_sum: 200,
+                    softirqs: net_rx(20),
+                    cpustat_irq_ns: 7_000,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(100),
+        boundary_offset_ms: None,
+        step_index: Some(1),
+    };
+    let series = SampleSeries::from_drained_typed(vec![entry], None);
+    let sample = series.iter_samples().next().expect("one sample");
+    let read = |name: &str| {
+        crate::stats::metric_def(name)
+            .expect("registered metric")
+            .read_sample(&sample)
+    };
+    assert_eq!(
+        read("total_hardirqs"),
+        Some(300.0),
+        "cross-CPU sum of irqs_sum",
+    );
+    assert_eq!(
+        read("total_softirq_net_rx"),
+        Some(30.0),
+        "cross-CPU sum of softirqs[SOFTIRQ_NET_RX]",
+    );
+    assert_eq!(
+        read("total_irq_time_ns"),
+        Some(12_000.0),
+        "cross-CPU sum of cpustat_irq_ns",
+    );
+
+    let empty = DrainedSnapshotEntry {
+        tag: "periodic_001".to_string(),
+        report: FailureDumpReport::default(),
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(200),
+        boundary_offset_ms: None,
+        step_index: Some(1),
+    };
+    let empty_series = SampleSeries::from_drained_typed(vec![empty], None);
+    let empty_sample = empty_series.iter_samples().next().expect("one sample");
+    assert_eq!(
+        crate::stats::metric_def("total_hardirqs")
+            .expect("registered metric")
+            .read_sample(&empty_sample),
+        None,
+        "empty per_cpu_time -> None (loud-absent)",
+    );
+}
+
+/// Overflow-safety: the IRQ read_sample arms saturate their cross-CPU spatial
+/// sum — a corrupt/hostile per-CPU counter at u64::MAX reads back u64::MAX
+/// (clamped), not a wrapped-small per-freeze total a plain `.sum::<u64>()` would
+/// debug-panic / release-wrap to. Pins the 3 field shapes (count / softirq
+/// vector / cpustat-ns); the other arms fold identically.
+#[test]
+fn irq_read_sample_arms_saturate_on_per_cpu_overflow() {
+    use crate::monitor::btf_offsets::{NR_SOFTIRQS, SOFTIRQ_NET_RX};
+    use crate::monitor::dump::{FailureDumpReport, PerCpuTimeStats};
+    use crate::scenario::sample::SampleSeries;
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+
+    let net_rx = |n: u64| {
+        let mut s = [0u64; NR_SOFTIRQS];
+        s[SOFTIRQ_NET_RX] = n;
+        s
+    };
+    let entry = DrainedSnapshotEntry {
+        tag: "periodic_000".to_string(),
+        report: FailureDumpReport {
+            per_cpu_time: vec![
+                PerCpuTimeStats {
+                    cpu: 0,
+                    irqs_sum: u64::MAX,
+                    softirqs: net_rx(u64::MAX),
+                    cpustat_irq_ns: u64::MAX,
+                    ..Default::default()
+                },
+                PerCpuTimeStats {
+                    cpu: 1,
+                    irqs_sum: 5,
+                    softirqs: net_rx(5),
+                    cpustat_irq_ns: 5,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(100),
+        boundary_offset_ms: None,
+        step_index: Some(1),
+    };
+    let series = SampleSeries::from_drained_typed(vec![entry], None);
+    let sample = series.iter_samples().next().expect("one sample");
+    let read = |name: &str| {
+        crate::stats::metric_def(name)
+            .expect("registered metric")
+            .read_sample(&sample)
+    };
+    // u64::MAX + 5 saturates to u64::MAX (not wraps to 4); read as f64.
+    assert_eq!(
+        read("total_hardirqs"),
+        Some(u64::MAX as f64),
+        "irqs_sum spatial sum saturates, not wraps",
+    );
+    assert_eq!(
+        read("total_softirq_net_rx"),
+        Some(u64::MAX as f64),
+        "softirq spatial sum saturates",
+    );
+    assert_eq!(
+        read("total_irq_time_ns"),
+        Some(u64::MAX as f64),
+        "cpustat_irq_ns spatial sum saturates",
+    );
+}
+
+/// End-to-end per-phase fold for the IRQ Counter — the CI-runnable pair of
+/// the host-gated `irq_metrics_e2e` (no VM). A two-freeze `SampleSeries` with
+/// RISING per-CPU `irqs_sum` / NET_RX softirqs, both stamped the same step,
+/// builds one bucket carrying the cross-CPU last-minus-first DELTA
+/// (`total_hardirqs` = (400+500)-(100+200) = 600; `total_softirq_net_rx` =
+/// (40+60)-(10+20) = 70) plus the derived `hardirq_rate` = 600 / 3.0 s = 200
+/// (the wall-window co-insertion + `derive_rate_metrics`). The window is
+/// [1000, 4000] ms from `elapsed_ms` (no `boundary_offset_ms`), so
+/// `total_phase_wall_sec` = 3.0. A SINGLE-freeze phase yields `None` for the
+/// counter (a delta is unmeasurable from one point) and therefore no rate —
+/// proving the absent-vs-zero contract through the whole `read_sample` ->
+/// aggregate -> bucket pipeline.
+#[test]
+fn irq_counter_folds_per_phase_delta_and_rate() {
+    use crate::assert::build_phase_buckets;
+    use crate::monitor::btf_offsets::{NR_SOFTIRQS, SOFTIRQ_NET_RX};
+    use crate::monitor::dump::{FailureDumpReport, PerCpuTimeStats};
+    use crate::scenario::sample::SampleSeries;
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+
+    let cpu = |cpu: u32, irqs_sum: u64, net_rx: u64| {
+        let mut softirqs = [0u64; NR_SOFTIRQS];
+        softirqs[SOFTIRQ_NET_RX] = net_rx;
+        PerCpuTimeStats {
+            cpu,
+            irqs_sum,
+            softirqs,
+            ..Default::default()
+        }
+    };
+    let freeze = |tag: &str, elapsed_ms: u64, c0: PerCpuTimeStats, c1: PerCpuTimeStats| {
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: FailureDumpReport {
+                per_cpu_time: vec![c0, c1],
+                ..Default::default()
+            },
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: Some(elapsed_ms),
+            boundary_offset_ms: None,
+            step_index: Some(1),
+        }
+    };
+
+    // Two freezes 3_000 ms apart in the SAME stamped step -> one bucket.
+    let two = SampleSeries::from_drained_typed(
+        vec![
+            freeze("periodic_000", 1_000, cpu(0, 100, 10), cpu(1, 200, 20)),
+            freeze("periodic_001", 4_000, cpu(0, 400, 40), cpu(1, 500, 60)),
+        ],
+        None,
+    );
+    let buckets = build_phase_buckets(&two);
+    let bucket = buckets
+        .iter()
+        .find(|b| b.step_index == 1)
+        .expect("step-1 bucket present");
+    assert_eq!(
+        bucket.get("total_hardirqs"),
+        Some(600.0),
+        "cross-CPU last-minus-first: (400+500)-(100+200)",
+    );
+    assert_eq!(
+        bucket.get("total_softirq_net_rx"),
+        Some(70.0),
+        "cross-CPU NET_RX delta: (40+60)-(10+20)",
+    );
+    assert_eq!(
+        bucket.get("hardirq_rate"),
+        Some(200.0),
+        "600 hardirqs / 3.0 s capture window",
+    );
+
+    // A single freeze in the phase: the Counter delta is unmeasurable from
+    // one point -> None (NOT a phantom 0), so no rate is co-derived either.
+    let one = SampleSeries::from_drained_typed(
+        vec![freeze(
+            "periodic_000",
+            1_000,
+            cpu(0, 100, 10),
+            cpu(1, 200, 20),
+        )],
+        None,
+    );
+    let buckets = build_phase_buckets(&one);
+    let bucket = buckets
+        .iter()
+        .find(|b| b.step_index == 1)
+        .expect("step-1 bucket present");
+    assert_eq!(
+        bucket.get("total_hardirqs"),
+        None,
+        "single-freeze phase: counter delta unmeasurable -> None",
+    );
+    assert_eq!(
+        bucket.get("hardirq_rate"),
+        None,
+        "no counter component -> no rate co-insertion",
+    );
+}
+
+/// Run-level IRQ rate must NOT inflate on a MULTI-phase run (regression guard
+/// for the num/den time-base mismatch). The run-level numerator total_hardirqs
+/// is the DIRECT whole-run delta (populate_run_ext_metrics: read_sample over
+/// ALL freezes); the matching denominator total_phase_wall_sec must be the
+/// WHOLE-RUN freeze span (inserted by that same direct path), NOT the
+/// Σ-per-phase-capture span (which excludes the cross-capture gap the numerator
+/// counts). Two phases capturing [1s,4s] and [6s,9s] with the gap [4s,6s]
+/// carrying real (counted) IRQ activity: whole-run Δ = 900-100 = 800; whole-run
+/// span = 9-1 = 8 s → hardirq_rate = 100/s. The buggy Σ-phase denominator would
+/// be (4-1)+(9-6) = 6 s → 133.3/s (inflated 8/6). Calls BOTH run-level populate
+/// fns in eval order to pin the real production path.
+#[test]
+fn run_level_irq_rate_uses_whole_run_span_not_phase_sum() {
+    use crate::assert::{
+        build_phase_buckets, populate_run_ext_metrics, populate_run_ext_metrics_from_phases,
+    };
+    use crate::monitor::dump::{FailureDumpReport, PerCpuTimeStats};
+    use crate::scenario::sample::SampleSeries;
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+
+    let freeze = |tag: &str, elapsed_ms: u64, step: u16, irqs_sum: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: FailureDumpReport {
+            per_cpu_time: vec![PerCpuTimeStats {
+                cpu: 0,
+                irqs_sum,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(elapsed_ms),
+        boundary_offset_ms: None,
+        step_index: Some(step),
+    };
+    // Phase 1 captures at 1s,4s; gap 4s..6s (irqs_sum keeps rising — counted in
+    // the whole-run delta but in NO phase's within-window delta); phase 2 at
+    // 6s,9s. Monotonic irqs_sum across the whole run.
+    let series = SampleSeries::from_drained_typed(
+        vec![
+            freeze("periodic_000", 1_000, 1, 100),
+            freeze("periodic_001", 4_000, 1, 400),
+            freeze("periodic_002", 6_000, 2, 600),
+            freeze("periodic_003", 9_000, 2, 900),
+        ],
+        None,
+    );
+    let buckets = build_phase_buckets(&series);
+    let mut ext = std::collections::BTreeMap::new();
+    // Eval order: direct (whole-run) THEN phase-sum (the latter's wall/count
+    // inserts no-op via contains_key once the direct path has filled them).
+    populate_run_ext_metrics(&series, &mut ext);
+    populate_run_ext_metrics_from_phases(&buckets, &mut ext);
+
+    // Count = whole-run delta (direct), spanning the cross-capture gap.
+    assert_eq!(
+        ext.get("total_hardirqs").copied(),
+        Some(800.0),
+        "whole-run delta 900-100, not the Σ-per-phase 300+300=600",
+    );
+    // Denominator = whole-run freeze span (9-1=8 s), NOT Σ-per-phase (3+3=6 s).
+    assert_eq!(
+        ext.get("total_phase_wall_sec").copied(),
+        Some(8.0),
+        "whole-run span 8 s, not the Σ-per-phase 6 s",
+    );
+    // Rate = 800/8 = 100, NOT the inflated 800/6 = 133.3.
+    let rate = ext
+        .get("hardirq_rate")
+        .copied()
+        .expect("hardirq_rate derived at run level");
+    assert!(
+        (rate - 100.0).abs() < 1e-9,
+        "whole-run rate 800/8s=100, not the mismatched 800/6s=133.3; got {rate}",
+    );
+}
+
+/// The whole-run path SURVIVES the sparse multi-phase case where a
+/// Σ-per-phase numerator would VANISH. Two phases with ONE freeze each (2 total,
+/// at 1s and 9s): each phase's within-window delta is `None` (a delta needs >=2
+/// freezes), so a per-phase-summed numerator would be absent → no run-level
+/// rate. The direct whole-run path still measures Δ = 500-100 = 400 over the
+/// [1s,9s] = 8 s span → hardirq_rate = 50/s. The rate's floor is >=2 TOTAL
+/// freezes (== the count's floor), NOT >=2 per phase.
+#[test]
+fn run_level_irq_rate_survives_sparse_multi_phase() {
+    use crate::assert::{
+        build_phase_buckets, populate_run_ext_metrics, populate_run_ext_metrics_from_phases,
+    };
+    use crate::monitor::dump::{FailureDumpReport, PerCpuTimeStats};
+    use crate::scenario::sample::SampleSeries;
+    use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
+
+    let freeze = |tag: &str, elapsed_ms: u64, step: u16, irqs_sum: u64| DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: FailureDumpReport {
+            per_cpu_time: vec![PerCpuTimeStats {
+                cpu: 0,
+                irqs_sum,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(elapsed_ms),
+        boundary_offset_ms: None,
+        step_index: Some(step),
+    };
+    // One freeze per phase → each per-phase delta is unmeasurable.
+    let series = SampleSeries::from_drained_typed(
+        vec![
+            freeze("periodic_000", 1_000, 1, 100),
+            freeze("periodic_001", 9_000, 2, 500),
+        ],
+        None,
+    );
+    let buckets = build_phase_buckets(&series);
+    for b in &buckets {
+        assert_eq!(
+            b.get("total_hardirqs"),
+            None,
+            "single-freeze phase has no measurable per-phase counter delta",
+        );
+    }
+    let mut ext = std::collections::BTreeMap::new();
+    populate_run_ext_metrics(&series, &mut ext);
+    populate_run_ext_metrics_from_phases(&buckets, &mut ext);
+    // The whole-run path still measures Δ=400 over 8 s → 50/s. (A Σ-per-phase
+    // numerator would be absent here → no rate at all.)
+    assert_eq!(
+        ext.get("total_hardirqs").copied(),
+        Some(400.0),
+        "whole-run delta survives where per-phase deltas vanish",
+    );
+    assert_eq!(
+        ext.get("total_phase_wall_sec").copied(),
+        Some(8.0),
+        "whole-run span 9-1=8 s",
+    );
+    let rate = ext
+        .get("hardirq_rate")
+        .copied()
+        .expect("rate derives where a phase-summed numerator would vanish");
+    assert!((rate - 50.0).abs() < 1e-9, "400/8s=50; got {rate}");
+}
+
+// -- per-CPU IRQ spatial axis (max_cpu_hardirqs + concentration) --
+
+/// Build one periodic freeze with `per_cpu_time` = the given (cpu, irqs_sum)
+/// rows, stamped to `step`, anchored at `elapsed_ms`.
+fn irq_spatial_freeze(
+    tag: &str,
+    elapsed_ms: u64,
+    step: u16,
+    cpus: &[(u32, u64)],
+) -> crate::scenario::snapshot::DrainedSnapshotEntry {
+    use crate::monitor::dump::{FailureDumpReport, PerCpuTimeStats};
+    use crate::scenario::snapshot::MissingStatsReason;
+    crate::scenario::snapshot::DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: FailureDumpReport {
+            per_cpu_time: cpus
+                .iter()
+                .map(|&(cpu, irqs_sum)| PerCpuTimeStats {
+                    cpu,
+                    irqs_sum,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(elapsed_ms),
+        boundary_offset_ms: None,
+        step_index: Some(step),
+    }
+}
+
+/// Build a single (step-1) phase bucket from the freezes and read the per-CPU
+/// IRQ spatial metrics: (max_cpu_hardirqs, max_cpu_hardirq_concentration).
+fn irq_spatial_bucket(
+    freezes: Vec<crate::scenario::snapshot::DrainedSnapshotEntry>,
+) -> (Option<f64>, Option<f64>) {
+    let series = crate::scenario::sample::SampleSeries::from_drained_typed(freezes, None);
+    let buckets = crate::assert::build_phase_buckets(&series);
+    let b = buckets
+        .into_iter()
+        .find(|b| b.step_index == 1)
+        .expect("step-1 bucket present");
+    (
+        b.get("max_cpu_hardirqs"),
+        b.get("max_cpu_hardirq_concentration"),
+    )
+}
+
+/// T1 happy path: two freezes, two CPUs — cpu0 100→200 (Δ100), cpu1 200→500
+/// (Δ300). max_cpu_hardirqs = max(100, 300) = 300; concentration = 300 /
+/// mean(100, 300) = 300/200 = 1.5.
+#[test]
+fn max_cpu_hardirqs_happy_path() {
+    let (max, conc) = irq_spatial_bucket(vec![
+        irq_spatial_freeze("periodic_000", 1_000, 1, &[(0, 100), (1, 200)]),
+        irq_spatial_freeze("periodic_001", 4_000, 1, &[(0, 200), (1, 500)]),
+    ]);
+    assert_eq!(max, Some(300.0), "busiest CPU's delta (cpu1: 500-200)");
+    let conc = conc.expect("concentration present with 2 reporting CPUs");
+    assert!(
+        (conc - 1.5).abs() < 1e-9,
+        "300 / mean(100,300)=200 = 1.5; got {conc}",
+    );
+}
+
+/// T2 (load-bearing): the busiest CPU SHIFTS between freezes — cpu0 hot early,
+/// cpu1 hot late. first{cpu0:100,cpu1:50} last{cpu0:150,cpu1:400} → per-CPU
+/// deltas d0=50, d1=350 → max=350. This is NOT max(last)=400 − max(first)=100 =
+/// 300 (the broken spatial-max-then-delta the design forbids), NOT Σlast−Σfirst.
+/// Pins per-CPU-delta-THEN-max.
+#[test]
+fn max_cpu_hardirqs_uses_per_cpu_delta_not_totals_when_busiest_cpu_shifts() {
+    let (max, conc) = irq_spatial_bucket(vec![
+        irq_spatial_freeze("periodic_000", 1_000, 1, &[(0, 100), (1, 50)]),
+        irq_spatial_freeze("periodic_001", 4_000, 1, &[(0, 150), (1, 400)]),
+    ]);
+    assert_eq!(
+        max,
+        Some(350.0),
+        "max of per-CPU deltas (d1=350), NOT max(totals)=400-100=300",
+    );
+    let conc = conc.expect("concentration present");
+    assert!(
+        (conc - 1.75).abs() < 1e-9,
+        "350 / mean(50,350)=200 = 1.75; got {conc}",
+    );
+}
+
+/// T3: endpoints chosen by win() (boundary_offset/elapsed), NOT positional. The
+/// POSITIONAL-first freeze has a LATER win (4000) than the positional-last
+/// (1000); by_stamped_phase preserves drain order, so samples_in_phase is
+/// [win4000, win1000] (non-win-ordered). The fold must use the win-ordered
+/// endpoints (first=win1000, last=win4000) → positive delta. A naive
+/// .first()/.last() would compute win1000 − win4000 per CPU → saturating_sub
+/// clamps to 0 → max=0.
+#[test]
+fn max_cpu_hardirqs_uses_win_ordered_endpoints_not_positional() {
+    let (max, _) = irq_spatial_bucket(vec![
+        irq_spatial_freeze("periodic_000", 4_000, 1, &[(0, 500), (1, 300)]),
+        irq_spatial_freeze("periodic_001", 1_000, 1, &[(0, 100), (1, 50)]),
+    ]);
+    assert_eq!(
+        max,
+        Some(400.0),
+        "win-ordered cpu0 500-100=400 (max); positional .first()/.last() would clamp to 0",
+    );
+}
+
+/// T4 hotplug-skip: cpu1 present in the first freeze but ABSENT from the last
+/// (defensive intersection) → excluded from max+mean; only cpu0 (in both)
+/// contributes Δ=300-100=200. With a 1-CPU intersection the concentration is
+/// omitted.
+#[test]
+fn max_cpu_hardirqs_skips_cpu_absent_from_an_endpoint() {
+    let (max, conc) = irq_spatial_bucket(vec![
+        irq_spatial_freeze("periodic_000", 1_000, 1, &[(0, 100), (1, 9999)]),
+        irq_spatial_freeze("periodic_001", 4_000, 1, &[(0, 300)]),
+    ]);
+    assert_eq!(
+        max,
+        Some(200.0),
+        "only cpu0 (present in both freezes) contributes"
+    );
+    assert_eq!(conc, None, "1-CPU intersection → concentration omitted");
+}
+
+/// T5 <2-freeze → both absent: a single freeze yields no measurable per-CPU
+/// delta.
+#[test]
+fn max_cpu_hardirqs_none_for_single_freeze() {
+    let (max, conc) = irq_spatial_bucket(vec![irq_spatial_freeze(
+        "periodic_000",
+        1_000,
+        1,
+        &[(0, 100), (1, 200)],
+    )]);
+    assert_eq!(max, None, "single freeze → no per-CPU delta measurable");
+    assert_eq!(conc, None, "single freeze → no concentration");
+}
+
+/// T6 <2-CPU → concentration omitted, max kept: a single-CPU intersection makes
+/// max/mean == 1 a structural artifact (not a measurement), so the concentration
+/// key is omitted — but a per-CPU peak IS meaningful on one CPU, so
+/// max_cpu_hardirqs is kept.
+#[test]
+fn max_cpu_hardirq_concentration_omitted_for_single_cpu() {
+    let (max, conc) = irq_spatial_bucket(vec![
+        irq_spatial_freeze("periodic_000", 1_000, 1, &[(0, 100)]),
+        irq_spatial_freeze("periodic_001", 4_000, 1, &[(0, 700)]),
+    ]);
+    assert_eq!(max, Some(600.0), "cpu0 delta 700-100");
+    assert_eq!(conc, None, "1 CPU → concentration omitted (a trivial 1.0)");
+}
+
+/// T7 mean==0 → concentration absent, max a measured zero: two CPUs whose
+/// counters did not advance → every per-CPU delta is 0, so max_cpu_hardirqs is a
+/// REAL Some(0.0), but the concentration is absent (mean==0 would be a NaN). The
+/// max=measured-zero vs concentration=loud-absent distinction.
+#[test]
+fn max_cpu_hardirq_concentration_absent_when_no_irqs() {
+    let (max, conc) = irq_spatial_bucket(vec![
+        irq_spatial_freeze("periodic_000", 1_000, 1, &[(0, 500), (1, 500)]),
+        irq_spatial_freeze("periodic_001", 4_000, 1, &[(0, 500), (1, 500)]),
+    ]);
+    assert_eq!(
+        max,
+        Some(0.0),
+        "both CPUs' counters didn't advance → measured zero"
+    );
+    assert_eq!(
+        conc, None,
+        "mean==0 → concentration absent (no div-by-zero/NaN)"
+    );
+}
+
+/// Run-level: max_cpu_hardirqs auto-folds across phases as a Peak
+/// (max-across-phases) through populate_run_ext_metrics_from_phases — NO custom
+/// whole-run block (unlike the Counter metrics, a Peak's cross-phase MAX doesn't
+/// undercount the way a Counter SUM does, so the whole-run-direct path isn't
+/// needed). is_derived(Peak)==false so it isn't skipped, and
+/// aggregate_samples_weighted folds Peak by max. Two phases: phase1 busiest-CPU
+/// Δ=300, phase2 busiest-CPU Δ=900 → run-level = max(300, 900) = 900. (The
+/// direct read_sample path can't touch it — no read_sample arm — so there's no
+/// pre-emption.)
+#[test]
+fn max_cpu_hardirqs_run_level_auto_folds_max_across_phases() {
+    use crate::assert::{
+        build_phase_buckets, populate_run_ext_metrics, populate_run_ext_metrics_from_phases,
+    };
+    use crate::scenario::sample::SampleSeries;
+
+    let series = SampleSeries::from_drained_typed(
+        vec![
+            irq_spatial_freeze("periodic_000", 1_000, 1, &[(0, 100), (1, 200)]),
+            irq_spatial_freeze("periodic_001", 4_000, 1, &[(0, 200), (1, 500)]),
+            irq_spatial_freeze("periodic_002", 6_000, 2, &[(0, 1000), (1, 1000)]),
+            irq_spatial_freeze("periodic_003", 9_000, 2, &[(0, 1100), (1, 1900)]),
+        ],
+        None,
+    );
+    let buckets = build_phase_buckets(&series);
+    let mut ext = std::collections::BTreeMap::new();
+    populate_run_ext_metrics(&series, &mut ext);
+    populate_run_ext_metrics_from_phases(&buckets, &mut ext);
+    assert_eq!(
+        ext.get("max_cpu_hardirqs").copied(),
+        Some(900.0),
+        "Peak auto-folds max-across-phases: max(phase1 Δ=300, phase2 Δ=900)",
+    );
+    // max_cpu_hardirq_concentration (also Peak, no read_sample arm) rides the
+    // IDENTICAL auto-fold path: phase1 = 300/mean(100,300) = 1.5, phase2 =
+    // 900/mean(100,900) = 1.8 → run-level max(1.5, 1.8) = 1.8.
+    let conc = ext
+        .get("max_cpu_hardirq_concentration")
+        .copied()
+        .expect("concentration auto-folds to run-level too (also Peak)");
+    assert!(
+        (conc - 1.8).abs() < 1e-9,
+        "concentration auto-folds max-across-phases: max(1.5, 1.8) = 1.8; got {conc}",
+    );
+}
+
+// -- per-CPU NET_RX softirq spatial axis (max_cpu_softirq_net_rx +
+// concentration) — the softirq sibling of the hardirq axis above. Both run
+// through the SAME fold_per_cpu_spatial_max helper, so the shared gates
+// (win-ordered endpoints, cpu-field intersection, single-freeze/single-CPU/
+// no-activity loud-absent) are pinned by the hardirq tests above; these
+// softirq tests pin the softirqs[NET_RX] field accessor + the per-CPU-delta-
+// then-max ordering + the run-level Peak auto-fold for the new metric. --
+
+/// Build one periodic freeze with `per_cpu_time` = the given (cpu, net_rx) rows
+/// — each CPU's `softirqs[NET_RX]` set to net_rx — stamped to `step`, anchored at
+/// `elapsed_ms`. The softirq analog of `irq_spatial_freeze`.
+fn softirq_net_rx_freeze(
+    tag: &str,
+    elapsed_ms: u64,
+    step: u16,
+    cpus: &[(u32, u64)],
+) -> crate::scenario::snapshot::DrainedSnapshotEntry {
+    use crate::monitor::btf_offsets::SOFTIRQ_NET_RX;
+    use crate::monitor::dump::{FailureDumpReport, PerCpuTimeStats};
+    use crate::scenario::snapshot::MissingStatsReason;
+    crate::scenario::snapshot::DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: FailureDumpReport {
+            per_cpu_time: cpus
+                .iter()
+                .map(|&(cpu, net_rx)| {
+                    let mut c = PerCpuTimeStats {
+                        cpu,
+                        ..Default::default()
+                    };
+                    c.softirqs[SOFTIRQ_NET_RX] = net_rx;
+                    c
+                })
+                .collect(),
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(elapsed_ms),
+        boundary_offset_ms: None,
+        step_index: Some(step),
+    }
+}
+
+/// Build a single (step-1) phase bucket from the freezes and read the per-CPU
+/// NET_RX softirq spatial metrics. The softirq analog of `irq_spatial_bucket`.
+fn softirq_net_rx_bucket(
+    freezes: Vec<crate::scenario::snapshot::DrainedSnapshotEntry>,
+) -> (Option<f64>, Option<f64>) {
+    let series = crate::scenario::sample::SampleSeries::from_drained_typed(freezes, None);
+    let buckets = crate::assert::build_phase_buckets(&series);
+    let b = buckets
+        .into_iter()
+        .find(|b| b.step_index == 1)
+        .expect("step-1 bucket present");
+    (
+        b.get("max_cpu_softirq_net_rx"),
+        b.get("max_cpu_softirq_net_rx_concentration"),
+    )
+}
+
+/// Softirq happy path (mirrors `max_cpu_hardirqs_happy_path` with the NET_RX
+/// field): two freezes, two CPUs — cpu0 100→200 (Δ100), cpu1 200→500 (Δ300).
+/// max_cpu_softirq_net_rx = max(100, 300) = 300; concentration = 300 /
+/// mean(100, 300) = 1.5. Pins the `softirqs[NET_RX]` field accessor.
+#[test]
+fn max_cpu_softirq_net_rx_happy_path() {
+    let (max, conc) = softirq_net_rx_bucket(vec![
+        softirq_net_rx_freeze("periodic_000", 1_000, 1, &[(0, 100), (1, 200)]),
+        softirq_net_rx_freeze("periodic_001", 4_000, 1, &[(0, 200), (1, 500)]),
+    ]);
+    assert_eq!(
+        max,
+        Some(300.0),
+        "busiest CPU's NET_RX softirq delta (cpu1: 500-200)",
+    );
+    let conc = conc.expect("concentration present with 2 reporting CPUs");
+    assert!(
+        (conc - 1.5).abs() < 1e-9,
+        "300 / mean(100,300)=200 = 1.5; got {conc}",
+    );
+}
+
+/// The busiest CPU SHIFTS between freezes (the load-bearing per-CPU-delta-then-
+/// max case): cpu0 hot early, cpu1 hot late. first{cpu0:100,cpu1:50}
+/// last{cpu0:150,cpu1:400} → per-CPU deltas d0=50, d1=350 → max=350, NOT
+/// max(last)=400 − max(first)=100 = 300. Pins per-CPU-delta-THEN-max through the
+/// softirqs[NET_RX] accessor (the helper the hardirq tests pin).
+#[test]
+fn max_cpu_softirq_net_rx_uses_per_cpu_delta_when_busiest_cpu_shifts() {
+    let (max, conc) = softirq_net_rx_bucket(vec![
+        softirq_net_rx_freeze("periodic_000", 1_000, 1, &[(0, 100), (1, 50)]),
+        softirq_net_rx_freeze("periodic_001", 4_000, 1, &[(0, 150), (1, 400)]),
+    ]);
+    assert_eq!(
+        max,
+        Some(350.0),
+        "max of per-CPU NET_RX deltas (d1=350), NOT max(totals)=400-100=300",
+    );
+    let conc = conc.expect("concentration present");
+    assert!(
+        (conc - 1.75).abs() < 1e-9,
+        "350 / mean(50,350)=200 = 1.75; got {conc}",
+    );
+}
+
+/// Run-level: max_cpu_softirq_net_rx auto-folds across phases as a Peak
+/// (max-across-phases) via populate_run_ext_metrics_from_phases — same path as
+/// max_cpu_hardirqs (Peak, no read_sample arm). phase1 busiest Δ=300, phase2
+/// busiest Δ=900 → run-level max(300, 900) = 900. Pins the new MetricDef's Peak
+/// kind driving the auto-fold (the registry wiring).
+#[test]
+fn max_cpu_softirq_net_rx_run_level_auto_folds_max_across_phases() {
+    use crate::assert::{
+        build_phase_buckets, populate_run_ext_metrics, populate_run_ext_metrics_from_phases,
+    };
+    use crate::scenario::sample::SampleSeries;
+
+    let series = SampleSeries::from_drained_typed(
+        vec![
+            softirq_net_rx_freeze("periodic_000", 1_000, 1, &[(0, 100), (1, 200)]),
+            softirq_net_rx_freeze("periodic_001", 4_000, 1, &[(0, 200), (1, 500)]),
+            softirq_net_rx_freeze("periodic_002", 6_000, 2, &[(0, 1000), (1, 1000)]),
+            softirq_net_rx_freeze("periodic_003", 9_000, 2, &[(0, 1100), (1, 1900)]),
+        ],
+        None,
+    );
+    let buckets = build_phase_buckets(&series);
+    let mut ext = std::collections::BTreeMap::new();
+    populate_run_ext_metrics(&series, &mut ext);
+    populate_run_ext_metrics_from_phases(&buckets, &mut ext);
+    assert_eq!(
+        ext.get("max_cpu_softirq_net_rx").copied(),
+        Some(900.0),
+        "Peak auto-folds max-across-phases: max(phase1 Δ=300, phase2 Δ=900)",
+    );
+    let conc = ext
+        .get("max_cpu_softirq_net_rx_concentration")
+        .copied()
+        .expect("concentration auto-folds to run-level too (also Peak)");
+    assert!(
+        (conc - 1.8).abs() < 1e-9,
+        "concentration auto-folds max-across-phases: max(1.5, 1.8) = 1.8; got {conc}",
+    );
+}
+
+// -- per-cgroup PSI-irq spatial axis (max_cgroup_irq_pressure + concentration +
+// max_cgroup_psi_irq_avg10) — the cgroup sibling of the per-CPU axes above. The
+// two COUNTER metrics (irq_pressure + concentration) mirror the
+// fold_per_cpu_spatial_max gates (win-ordered endpoints, entity intersection,
+// single-freeze/single-entity/no-activity loud-absent) with `cgroup_kva` as the
+// per-CPU `cpu`-field analog and a /1000 ns→µs decode on each delta. The GAUGE
+// metric (avg10) diverges: an instantaneous reading, so it is present on a SINGLE
+// freeze (no delta/≥2 requirement) and folds a per-freeze spatial-max then a
+// cross-freeze temporal-max. --
+
+/// Build one periodic freeze with `cgroup_psi` = the given
+/// (cgroup_kva, total_ns, avg10_raw) leaf rows, stamped to `step`, anchored at
+/// `elapsed_ms`. Each leaf's serial_nr defaults to its cgroup_kva — a unique,
+/// stable-across-freezes identity for the no-KVA-reuse case; the KVA-reuse case
+/// (a distinct serial at the same KVA) uses `cgroup_psi_freeze_with_serial`. The
+/// cgroup analog of `irq_spatial_freeze`.
+fn cgroup_psi_freeze(
+    tag: &str,
+    elapsed_ms: u64,
+    step: u16,
+    leaves: &[(u64, u64, u64)],
+) -> crate::scenario::snapshot::DrainedSnapshotEntry {
+    use crate::monitor::cgroup_walk::CgroupPsiStat;
+    use crate::monitor::dump::FailureDumpReport;
+    use crate::scenario::snapshot::MissingStatsReason;
+    crate::scenario::snapshot::DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: FailureDumpReport {
+            cgroup_psi: leaves
+                .iter()
+                .map(|&(cgroup_kva, total_ns, avg10_raw)| CgroupPsiStat {
+                    cgroup_kva,
+                    total_ns,
+                    avg10_raw,
+                    // Default serial = the KVA: a unique identity that is stable
+                    // across freezes for the same leaf (the no-reuse case). The
+                    // reuse case sets a distinct serial via the _with_serial helper.
+                    serial_nr: cgroup_kva,
+                })
+                .collect(),
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(elapsed_ms),
+        boundary_offset_ms: None,
+        step_index: Some(step),
+    }
+}
+
+/// Build a freeze with EXPLICIT per-leaf serial_nr — the KVA-reuse case. Leaf
+/// rows are (cgroup_kva, serial_nr, total_ns, avg10_raw). Used to model a leaf
+/// whose freed slab KVA a new cgroup reused (same kva, different serial across
+/// freezes), which `cgroup_psi_freeze`'s serial==kva default cannot express.
+fn cgroup_psi_freeze_with_serial(
+    tag: &str,
+    elapsed_ms: u64,
+    step: u16,
+    leaves: &[(u64, u64, u64, u64)],
+) -> crate::scenario::snapshot::DrainedSnapshotEntry {
+    use crate::monitor::cgroup_walk::CgroupPsiStat;
+    use crate::monitor::dump::FailureDumpReport;
+    use crate::scenario::snapshot::MissingStatsReason;
+    crate::scenario::snapshot::DrainedSnapshotEntry {
+        tag: tag.to_string(),
+        report: FailureDumpReport {
+            cgroup_psi: leaves
+                .iter()
+                .map(
+                    |&(cgroup_kva, serial_nr, total_ns, avg10_raw)| CgroupPsiStat {
+                        cgroup_kva,
+                        total_ns,
+                        avg10_raw,
+                        serial_nr,
+                    },
+                )
+                .collect(),
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(elapsed_ms),
+        boundary_offset_ms: None,
+        step_index: Some(step),
+    }
+}
+
+/// Build a single (step-1) phase bucket from the freezes and read the per-cgroup
+/// PSI-irq spatial metrics:
+/// (max_cgroup_irq_pressure, max_cgroup_irq_pressure_concentration,
+/// max_cgroup_psi_irq_avg10). The cgroup analog of `irq_spatial_bucket`.
+fn cgroup_psi_bucket(
+    freezes: Vec<crate::scenario::snapshot::DrainedSnapshotEntry>,
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let series = crate::scenario::sample::SampleSeries::from_drained_typed(freezes, None);
+    let buckets = crate::assert::build_phase_buckets(&series);
+    let b = buckets
+        .into_iter()
+        .find(|b| b.step_index == 1)
+        .expect("step-1 bucket present");
+    (
+        b.get("max_cgroup_irq_pressure"),
+        b.get("max_cgroup_irq_pressure_concentration"),
+        b.get("max_cgroup_psi_irq_avg10"),
+    )
+}
+
+/// Happy path: two freezes, two leaf cgroups. A total 100_000→200_000 (Δ100_000
+/// ns = 100µs), B 200_000→500_000 (Δ300_000 ns = 300µs). max_cgroup_irq_pressure
+/// = max(100, 300) = 300µs; concentration = 300 / mean(100, 300) = 1.5. avg10 =
+/// max over freezes of max-across-leaves: freeze1 max(1%,2%)=2, freeze2
+/// max(3%,4%)=4 → 4%. Pins the ns→µs decode and the fixed-point avg10 decode.
+#[test]
+fn max_cgroup_irq_pressure_happy_path() {
+    let (max, conc, avg10) = cgroup_psi_bucket(vec![
+        cgroup_psi_freeze(
+            "periodic_000",
+            1_000,
+            1,
+            &[(0xA00, 100_000, 2048), (0xB00, 200_000, 4096)],
+        ),
+        cgroup_psi_freeze(
+            "periodic_001",
+            4_000,
+            1,
+            &[(0xA00, 200_000, 6144), (0xB00, 500_000, 8192)],
+        ),
+    ]);
+    assert_eq!(
+        max,
+        Some(300.0),
+        "busiest leaf's delta decoded to µs (B: (500_000-200_000)/1000)"
+    );
+    let conc = conc.expect("concentration present with 2 reporting leaves");
+    assert!(
+        (conc - 1.5).abs() < 1e-9,
+        "300 / mean(100,300)=200 = 1.5; got {conc}"
+    );
+    let avg10 = avg10.expect("avg10 gauge present");
+    assert!(
+        (avg10 - 4.0).abs() < 1e-9,
+        "max-across-freezes of max-across-leaves: max(2%,4%)=4; got {avg10}"
+    );
+}
+
+/// Load-bearing: the busiest leaf SHIFTS between freezes — A hot early, B hot
+/// late. first{A:100_000,B:50_000} last{A:150_000,B:400_000} → per-leaf deltas
+/// dA=50µs, dB=350µs → max=350µs. This is NOT max(last)=400_000 −
+/// max(first)=100_000 = 300µs (spatial-max-then-delta the design forbids). Pins
+/// per-leaf-delta-THEN-max on the cgroup axis.
+#[test]
+fn max_cgroup_irq_pressure_uses_per_leaf_delta_when_busiest_shifts() {
+    let (max, conc, _) = cgroup_psi_bucket(vec![
+        cgroup_psi_freeze(
+            "periodic_000",
+            1_000,
+            1,
+            &[(0xA00, 100_000, 0), (0xB00, 50_000, 0)],
+        ),
+        cgroup_psi_freeze(
+            "periodic_001",
+            4_000,
+            1,
+            &[(0xA00, 150_000, 0), (0xB00, 400_000, 0)],
+        ),
+    ]);
+    assert_eq!(
+        max,
+        Some(350.0),
+        "max of per-leaf deltas (dB=350µs), NOT max(totals)=400-100=300µs"
+    );
+    let conc = conc.expect("concentration present");
+    assert!(
+        (conc - 1.75).abs() < 1e-9,
+        "350 / mean(50,350)=200 = 1.75; got {conc}"
+    );
+}
+
+/// Endpoints chosen by win() (boundary_offset/elapsed), NOT positional. The
+/// POSITIONAL-first freeze has a LATER win (4000) than the positional-last
+/// (1000); a naive .first()/.last() would compute win1000 − win4000 per leaf →
+/// saturating_sub clamps to 0 → max=0. The win-ordered fold yields a positive
+/// delta. (Mirrors the per-CPU win-ordering test on the cgroup axis.)
+#[test]
+fn max_cgroup_irq_pressure_uses_win_ordered_endpoints_not_positional() {
+    let (max, _, _) = cgroup_psi_bucket(vec![
+        cgroup_psi_freeze(
+            "periodic_000",
+            4_000,
+            1,
+            &[(0xA00, 500_000, 0), (0xB00, 300_000, 0)],
+        ),
+        cgroup_psi_freeze(
+            "periodic_001",
+            1_000,
+            1,
+            &[(0xA00, 100_000, 0), (0xB00, 50_000, 0)],
+        ),
+    ]);
+    assert_eq!(
+        max,
+        Some(400.0),
+        "win-ordered A (500_000-100_000)/1000=400µs (max); positional would clamp to 0",
+    );
+}
+
+/// Leaf-churn skip: B present in the first freeze but ABSENT from the last
+/// (defensive cgroup_kva intersection) → excluded from max+mean; only A (in
+/// both) contributes Δ=(300_000-100_000)/1000=200µs. With a 1-leaf intersection
+/// the concentration is omitted. A leaf created/destroyed mid-phase.
+#[test]
+fn max_cgroup_irq_pressure_skips_leaf_absent_from_an_endpoint() {
+    let (max, conc, _) = cgroup_psi_bucket(vec![
+        cgroup_psi_freeze(
+            "periodic_000",
+            1_000,
+            1,
+            &[(0xA00, 100_000, 0), (0xB00, 9_999_000, 0)],
+        ),
+        cgroup_psi_freeze("periodic_001", 4_000, 1, &[(0xA00, 300_000, 0)]),
+    ]);
+    assert_eq!(
+        max,
+        Some(200.0),
+        "only A (present in both freezes) contributes"
+    );
+    assert_eq!(conc, None, "1-leaf intersection → concentration omitted");
+}
+
+/// The GAUGE/COUNTER divergence: a SINGLE freeze yields no measurable delta, so
+/// max_cgroup_irq_pressure + concentration are absent — but max_cgroup_psi_irq_avg10
+/// is an instantaneous reading, present on one freeze: max(1%,2%)=2%. This is the
+/// per-cgroup gauge's key difference from the per-CPU counter axes (which are all
+/// absent on a single freeze).
+#[test]
+fn max_cgroup_psi_irq_avg10_present_on_single_freeze_while_delta_absent() {
+    let (max, conc, avg10) = cgroup_psi_bucket(vec![cgroup_psi_freeze(
+        "periodic_000",
+        1_000,
+        1,
+        &[(0xA00, 100_000, 2048), (0xB00, 200_000, 4096)],
+    )]);
+    assert_eq!(max, None, "single freeze → no per-leaf delta measurable");
+    assert_eq!(conc, None, "single freeze → no concentration");
+    let avg10 = avg10.expect("avg10 is an instantaneous gauge, present on one freeze");
+    assert!(
+        (avg10 - 2.0).abs() < 1e-9,
+        "max-across-leaves of the lone freeze: max(1%,2%)=2; got {avg10}"
+    );
+}
+
+/// <2-leaf intersection → concentration omitted, max kept: a single-leaf
+/// intersection makes max/mean == 1 a structural artifact, so the concentration
+/// key is omitted — but a per-leaf peak IS meaningful on one leaf, so
+/// max_cgroup_irq_pressure is kept (A: (700_000-100_000)/1000=600µs).
+#[test]
+fn max_cgroup_irq_pressure_concentration_omitted_for_single_leaf() {
+    let (max, conc, _) = cgroup_psi_bucket(vec![
+        cgroup_psi_freeze("periodic_000", 1_000, 1, &[(0xA00, 100_000, 0)]),
+        cgroup_psi_freeze("periodic_001", 4_000, 1, &[(0xA00, 700_000, 0)]),
+    ]);
+    assert_eq!(max, Some(600.0), "A delta (700_000-100_000)/1000");
+    assert_eq!(conc, None, "1 leaf → concentration omitted (a trivial 1.0)");
+}
+
+/// mean==0 → concentration absent, max a measured zero: two leaves whose counters
+/// did not advance → every per-leaf delta is 0, so max_cgroup_irq_pressure is a
+/// REAL Some(0.0), but the concentration is absent (mean==0 would be a NaN). The
+/// max=measured-zero vs concentration=loud-absent distinction on the cgroup axis.
+#[test]
+fn max_cgroup_irq_pressure_concentration_absent_when_no_pressure() {
+    let (max, conc, _) = cgroup_psi_bucket(vec![
+        cgroup_psi_freeze(
+            "periodic_000",
+            1_000,
+            1,
+            &[(0xA00, 500_000, 0), (0xB00, 500_000, 0)],
+        ),
+        cgroup_psi_freeze(
+            "periodic_001",
+            4_000,
+            1,
+            &[(0xA00, 500_000, 0), (0xB00, 500_000, 0)],
+        ),
+    ]);
+    assert_eq!(
+        max,
+        Some(0.0),
+        "both leaves' counters didn't advance → measured zero"
+    );
+    assert_eq!(
+        conc, None,
+        "mean==0 → concentration absent (no div-by-zero/NaN)"
+    );
+}
+
+/// No reporting leaf in any freeze (psi_cgroups off / absent workload root → the
+/// walk captured nothing) → all three metrics loud-absent. The cgroup_psi gauge
+/// has no leaf to spatial-max, and there is no delta to fold.
+#[test]
+fn cgroup_psi_metrics_all_absent_when_no_leaf_reported() {
+    let (max, conc, avg10) = cgroup_psi_bucket(vec![
+        cgroup_psi_freeze("periodic_000", 1_000, 1, &[]),
+        cgroup_psi_freeze("periodic_001", 4_000, 1, &[]),
+    ]);
+    assert_eq!(max, None, "no leaf → no pressure delta");
+    assert_eq!(conc, None, "no leaf → no concentration");
+    assert_eq!(avg10, None, "no leaf → no avg10 gauge");
+}
+
+/// Run-level: all three cgroup metrics are Peak with no read_sample arm, so they
+/// auto-fold max-across-phases through populate_run_ext_metrics_from_phases (the
+/// max_cpu_hardirqs path). Two phases: phase1 busiest Δ=300µs / conc 1.5 / avg10
+/// 2%, phase2 busiest Δ=900µs / conc 1.8 / avg10 6% → run-level max(300,900)=900,
+/// max(1.5,1.8)=1.8, max(2,6)=6. Pins the three new MetricDefs' Peak kind driving
+/// the registry auto-fold (the gauge included).
+#[test]
+fn cgroup_psi_metrics_run_level_auto_fold_max_across_phases() {
+    use crate::assert::{
+        build_phase_buckets, populate_run_ext_metrics, populate_run_ext_metrics_from_phases,
+    };
+    use crate::scenario::sample::SampleSeries;
+
+    let series = SampleSeries::from_drained_typed(
+        vec![
+            cgroup_psi_freeze(
+                "periodic_000",
+                1_000,
+                1,
+                &[(0xA00, 100_000, 2048), (0xB00, 200_000, 4096)],
+            ),
+            cgroup_psi_freeze(
+                "periodic_001",
+                4_000,
+                1,
+                &[(0xA00, 200_000, 2048), (0xB00, 500_000, 4096)],
+            ),
+            cgroup_psi_freeze(
+                "periodic_002",
+                6_000,
+                2,
+                &[(0xA00, 1_000_000, 10240), (0xB00, 1_000_000, 12288)],
+            ),
+            cgroup_psi_freeze(
+                "periodic_003",
+                9_000,
+                2,
+                &[(0xA00, 1_100_000, 10240), (0xB00, 1_900_000, 12288)],
+            ),
+        ],
+        None,
+    );
+    let buckets = build_phase_buckets(&series);
+    let mut ext = std::collections::BTreeMap::new();
+    populate_run_ext_metrics(&series, &mut ext);
+    populate_run_ext_metrics_from_phases(&buckets, &mut ext);
+    assert_eq!(
+        ext.get("max_cgroup_irq_pressure").copied(),
+        Some(900.0),
+        "Peak auto-folds max-across-phases: max(phase1 Δ=300µs, phase2 Δ=900µs)",
+    );
+    let conc = ext
+        .get("max_cgroup_irq_pressure_concentration")
+        .copied()
+        .expect("concentration auto-folds run-level too (Peak)");
+    assert!(
+        (conc - 1.8).abs() < 1e-9,
+        "max(phase1 1.5, phase2 900/mean(100,900)=1.8) = 1.8; got {conc}",
+    );
+    let avg10 = ext
+        .get("max_cgroup_psi_irq_avg10")
+        .copied()
+        .expect("avg10 gauge auto-folds run-level too (Peak)");
+    assert!(
+        (avg10 - 6.0).abs() < 1e-9,
+        "max(phase1 2%, phase2 6%) = 6; got {avg10}",
+    );
+}
+
+/// KVA-reuse disambiguation by serial_nr: a leaf rmdir'd mid-phase whose freed
+/// slab KVA a NEW cgroup reused must NOT be correlated across freezes by
+/// cgroup_kva alone. Leaf B (kva 0xB00, serial 2, total 500_000) is replaced in
+/// the last freeze by a new cgroup C at the SAME kva 0xB00 with serial 3 and
+/// total 9_000_000 (cumulative from C's creation, unrelated to B). With
+/// cgroup_kva-only correlation the fold would difference C against B and report a
+/// bogus (9_000_000-500_000)/1000 = 8500µs delta. The (cgroup_kva, serial_nr)
+/// tuple drops the serial-mismatched 0xB00, so only A (kva 0xA00, serial 1 in
+/// both freezes) contributes its (200_000-100_000)/1000 = 100µs delta — max =
+/// 100µs (NOT 8500µs), concentration absent (1-leaf serial-matched intersection).
+/// This pins the cross-phase identity guard against slab-KVA reuse.
+#[test]
+fn max_cgroup_irq_pressure_disambiguates_reused_kva_by_serial() {
+    let (max, conc, _) = cgroup_psi_bucket(vec![
+        cgroup_psi_freeze_with_serial(
+            "periodic_000",
+            1_000,
+            1,
+            &[(0xA00, 1, 100_000, 0), (0xB00, 2, 500_000, 0)],
+        ),
+        cgroup_psi_freeze_with_serial(
+            "periodic_001",
+            4_000,
+            1,
+            &[(0xA00, 1, 200_000, 0), (0xB00, 3, 9_000_000, 0)],
+        ),
+    ]);
+    assert_eq!(
+        max,
+        Some(100.0),
+        "only A (kva+serial match in both freezes) contributes 100µs; the reused-KVA \
+         0xB00 (serial 2→3) is dropped, NOT differenced into a bogus 8500µs",
+    );
+    assert_eq!(
+        conc, None,
+        "1-leaf serial-matched intersection → concentration omitted",
+    );
+}
+
 /// `aggregate_samples_for_phase` dispatches Counter through
 /// `phase_counter_delta` (per-phase delta) and every other
 /// kind through `aggregate_samples` (flat-run semantic). Pins
@@ -282,7 +1472,8 @@ fn phase_counter_delta_clamps_negative_to_zero_on_counter_reset() {
 /// per-phase aggregator was introduced to fix.
 #[test]
 fn aggregate_samples_for_phase_returns_none_for_derived_kinds() {
-    // Derived kinds (Rate / Distribution / WorstLowest) are `is_derived`,
+    // Derived kinds (every `is_derived()`: Rate / Distribution / WorstLowest /
+    // WakeLatencyTailRatio / WorstCrossNodeRatio / PerPhase) are `is_derived`,
     // merge as Recompute, and have NO per-phase value: returning None keeps
     // them off the single-slice reducers within a run (their value is
     // produced post-merge by derive_rate_metrics /
@@ -309,6 +1500,9 @@ fn aggregate_samples_for_phase_returns_none_for_derived_kinds() {
             numerator: WorstLowestNumerator::Iterations,
             denominator: WorstLowestDenominator::NumWorkers,
         },
+        MetricKind::WakeLatencyTailRatio,
+        MetricKind::WorstCrossNodeRatio,
+        MetricKind::PerPhase,
     ] {
         assert!(kind.is_derived(), "{kind:?} must be is_derived");
         assert_eq!(kind.merge_kind(), MergeKind::Recompute);
@@ -547,6 +1741,55 @@ fn aggregate_samples_for_phase_returns_none_on_empty_or_all_nan() {
     );
 }
 
+/// `find_outliers` flags values ABOVE mean+2σ — a HIGH value is the anomaly —
+/// and reads ext-sourced `OUTLIER_METRICS` entries' absent values as a 0.0
+/// sentinel (`.unwrap_or(0.0)`). Both are correct ONLY when a high value is
+/// WORSE, i.e. every `OUTLIER_METRICS` entry is `LowerBetter`. The registry's
+/// Distribution⇒LowerBetter gate (`every_metric_has_kind_consistent_with_naming`)
+/// already covers the current ext entries — all Distribution-kind — but this
+/// guard binds the coupling to `OUTLIER_METRICS` membership directly and
+/// KIND-INDEPENDENTLY, so a future non-Distribution (Counter / Gauge)
+/// HigherBetter registry metric added here — read through the same 0.0-sentinel
+/// accessor — fails loudly instead of silently flagging unusually-GOOD scenarios
+/// as outliers and deflating the cohort 2σ baseline with a best-case 0.0.
+///
+/// Each entry carries an explicit `registry_key` (distinct from its display
+/// label — `spread`→`worst_spread`, `migrations`→`total_migrations`, …), so the
+/// guard resolves and polarity-checks all 13 entries, including the 9 typed ones
+/// whose short labels a display-name lookup could not resolve (so they went
+/// unchecked before). Those typed entries read GauntletRow fields directly
+/// (sidecar-zeroed, not the ext 0.0-sentinel), but `find_outliers` flags their
+/// HIGH tail identically, so they too must be LowerBetter.
+#[test]
+fn outlier_metrics_are_lower_better_in_registry() {
+    for (display, registry_key, _) in OUTLIER_METRICS {
+        // Every entry now names its registry key explicitly, so all 13 resolve —
+        // the typed entries via their cross-run `worst_*`/`total_*`/`max_*` names
+        // (which differ from the short display labels `spread`/`migrations`/…)
+        // and the ext entries via their self-named keys. None is skipped, so the
+        // 8 typed entries the display-name lookup previously could not resolve
+        // are now polarity-checked too. A `registry_key` absent from METRICS is
+        // itself a defect (a typo, or a dropped/renamed registry entry), so
+        // resolve-or-panic rather than silently continue.
+        let def = metric_def(registry_key).unwrap_or_else(|| {
+            panic!(
+                "OUTLIER_METRICS entry {display:?} names registry_key {registry_key:?}, \
+                 which is not in the METRICS registry — every outlier metric must map to a \
+                 registry entry whose polarity the guard can verify."
+            )
+        });
+        assert!(
+            matches!(def.polarity, crate::test_support::Polarity::LowerBetter),
+            "OUTLIER_METRICS entry {display:?} (registry_key {registry_key:?}) resolves to \
+             registry polarity {:?}, but outlier detection flags HIGH values and reads \
+             absent ext values as a 0.0 best-case sentinel — both require LowerBetter. A \
+             HigherBetter metric here silently corrupts outlier detection; make \
+             find_outliers polarity-aware before adding one.",
+            def.polarity,
+        );
+    }
+}
+
 /// Every entry in the `METRICS` registry must have a kind set.
 /// Pinned via the registry walk so a future entry that forgot
 /// to specify `kind` fails to compile (struct-literal
@@ -599,9 +1842,11 @@ fn every_metric_has_kind_consistent_with_naming() {
             );
         }
         // WorstLowest metrics are re-pooled by
-        // `populate_run_distribution_metrics`'s lowest-wins fold
-        // (`worst.is_none_or(|w| v < w)`), which treats the LOWEST per-cgroup
-        // value as the worst — correct ONLY for HigherBetter metrics.
+        // `populate_run_distribution_metrics`'s lowest-wins fold — the
+        // iterations-efficiency selectors via `worst.is_none_or(|w| v < w)` over
+        // `stats.cgroups`, `worst_page_locality` via `reduce(f64::min)` over the
+        // per-phase NUMA carriers — which treats the LOWEST per-cgroup value as
+        // the worst — correct ONLY for HigherBetter metrics.
         // Enforce the mirror of the Distribution gate so a future
         // LowerBetter WorstLowest cannot silently invert the regression
         // signal (select the least-bad cgroup, mask the starved one); such a
@@ -616,16 +1861,38 @@ fn every_metric_has_kind_consistent_with_naming() {
                 m.polarity,
             );
         }
-        // Rate metrics are derived ratios; name them `*_rate` or
-        // `*_per_*` so the registry reads as a rate at a glance.
+        // WorstCrossNodeRatio re-pools by `populate_run_distribution_metrics`'s
+        // MAX-wins fold (`reduce(f64::max)` over the per-phase NUMA carriers'
+        // per-cgroup churn ratio), which treats the HIGHEST per-cgroup value as
+        // the worst — correct ONLY for LowerBetter metrics (the polarity twin of
+        // the WorstLowest gate above). Enforce it so a future HigherBetter
+        // WorstCrossNodeRatio cannot silently invert the regression signal.
+        if matches!(m.kind, MetricKind::WorstCrossNodeRatio) {
+            assert_eq!(
+                m.polarity,
+                crate::test_support::Polarity::LowerBetter,
+                "WorstCrossNodeRatio-kind metric {:?} must be LowerBetter \
+                     (the highest-wins fold treats highest as worst); got {:?}",
+                m.name,
+                m.polarity,
+            );
+        }
+        // Rate metrics are derived ratios; name them `*_rate`, `*_per_*`, or —
+        // for a dimensionless pooled fraction/ratio of two counters — `*_fraction`
+        // / `*_ratio`, so the registry reads as a rate at a glance. (A pooled
+        // fraction like `ttwu_local_fraction` = Σlocal/Σcount IS a Rate: the
+        // cross-run fold must be ratio-of-sums, not mean-of-ratios.)
         if let MetricKind::Rate {
             numerator,
             denominator,
         } = m.kind
         {
             assert!(
-                m.name.ends_with("_rate") || m.name.contains("_per_"),
-                "Rate-kind metric must use *_rate or *_per_* naming, got {:?}",
+                m.name.ends_with("_rate")
+                    || m.name.contains("_per_")
+                    || m.name.ends_with("_fraction")
+                    || m.name.ends_with("_ratio"),
+                "Rate-kind metric must use *_rate / *_per_* / *_fraction / *_ratio naming, got {:?}",
                 m.name,
             );
             // Components must be registered AND not themselves Rate:
@@ -650,6 +1917,20 @@ fn every_metric_has_kind_consistent_with_naming() {
             }
         }
 
+        // PerRunDistribution metrics are whole-run percentile / min / max values
+        // (union-recomputed within-run, noise-compared per-run); name them
+        // `*_whole` so they read as the whole-run sibling of the per-phase
+        // percentile keys at a glance AND stay registry-distinct from those
+        // PerPhase names (one registry name = one kind). Polarity is per-metric
+        // (latency LowerBetter, rps HigherBetter), so it is NOT coupled here.
+        if matches!(m.kind, MetricKind::PerRunDistribution) {
+            assert!(
+                m.name.ends_with("_whole"),
+                "PerRunDistribution-kind metric must use *_whole naming, got {:?}",
+                m.name,
+            );
+        }
+
         // REVERSE gate: a metric NAMED like a per-second rate MUST be a
         // Rate, so a future per-second metric cannot silently ship as a
         // Gauge that averages ready-made ratios (the (r₁+r₂)/2 bug). Scoped
@@ -666,7 +1947,14 @@ fn every_metric_has_kind_consistent_with_naming() {
         let looks_like_rate = m.name.ends_with("_rate")
             || m.name.contains("_per_sec")
             || m.name.contains("_per_cpu_sec");
-        if looks_like_rate && m.name != "worst_iterations_per_cpu_sec" {
+        // taobench_hit_rate is the reference taobench server's own field name
+        // (1 - misses/cmds, a command-time hit FRACTION, not a per-second rate);
+        // it is MetricKind::PerPhase (skipped at the cross-run ext fold) so the
+        // mean-of-ratios bug this gate guards cannot apply.
+        if looks_like_rate
+            && m.name != "worst_iterations_per_cpu_sec"
+            && m.name != "taobench_hit_rate"
+        {
             assert!(
                 matches!(m.kind, MetricKind::Rate { .. }),
                 "metric {:?} is named like a per-second rate but is not \

@@ -43,6 +43,23 @@
 //!   - [`WorkType::EpollStorm`] / [`WorkType::CgroupChurn`] — Thread-only
 //!     and Fork-rejected respectively; driven by the sibling
 //!     `tests/worktype_coverage_thread_gauntlet_e2e.rs`.
+//!   - [`WorkType::CgroupAttachStorm`] — Fork-compatible, but needs a
+//!     sibling `dest` cgroup (created via `Op::add_cgroup`) that this
+//!     direct-spawn path does not provide; here it would no-op (the
+//!     dest is unresolvable). Driven by the dedicated
+//!     `tests/cgroup_attach_storm_e2e.rs`.
+//!   - [`WorkType::NetTraffic`] — Fork-compatible, but needs an attached
+//!     NIC (`#[ktstr_test(networks = [...])]`) that this direct-spawn path
+//!     does not provide; here it would no-op (no non-loopback interface).
+//!     Driven by the dedicated `tests/net_traffic_e2e.rs`.
+//!   - [`WorkType::IrqWake`] — like `NetTraffic`, needs an attached NIC the
+//!     direct-spawn path does not provide (here it would no-op); also a
+//!     paired sender/receiver (group of 2). Driven by the dedicated
+//!     `tests/irq_wake_e2e.rs`.
+//!   - [`WorkType::Schbench`] — driven by its own schbench engine (a
+//!     message-thread + worker-thread pool, not the generic
+//!     per-iteration worker body); covered by
+//!     `tests/performance_mode_e2e.rs`.
 
 use anyhow::Result;
 use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
@@ -373,6 +390,11 @@ fn worktype_fork_gauntlet_covers_all_arms(_ctx: &Ctx) -> Result<AssertResult> {
             },
             2,
         ),
+        &mut result,
+    );
+    run_arm(
+        "TimerLatency",
+        cfg(WorkType::TimerLatency { interval_us: 1000 }, 2),
         &mut result,
     );
     run_arm(

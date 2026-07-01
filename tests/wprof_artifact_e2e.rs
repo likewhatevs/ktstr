@@ -13,7 +13,7 @@
 //!   5. guest init's `spawn_wprof_if_configured` spawns wprof
 //!   6. on workload exit, guest sends `MsgType::WprofTrace`
 //!      with the Perfetto `.pb` bytes
-//!   7. host dispatch arm writes `{sidecar_dir}/{test_name}.wprof.pb`
+//!   7. host dispatch arm writes `{sidecar_dir}/{test_name}-{variant_hash}.wprof.pb`
 //!
 //! Any break in the chain surfaces as the `post_vm` assertion
 //! failing.
@@ -39,9 +39,15 @@ use ktstr::ktstr_test;
 use ktstr::prelude::{Scheduler, SchedulerSpec, VmResult, WorkType};
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
+use ktstr::test_support::BpfMapWrite;
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
+
+/// Host-injected crash trigger: the host writes `crash=1` to the
+/// scheduler's `.bss` global mid-run (offset resolved from the map's
+/// program BTF), making `ktstr_dispatch` call `scx_bpf_error`.
+static BPF_CRASH: BpfMapWrite = BpfMapWrite::new(".bss", "crash", 1);
 
 /// Boots scx-ktstr with wprof attached, runs a minimal SpinWait
 /// workload, then asserts the Perfetto `.pb` lands in the
@@ -87,4 +93,39 @@ fn wprof_artifact_lands_in_sidecar_on_scx_ktstr_primary(ctx: &Ctx) -> Result<Ass
     // Shape assertion runs in `assert_wprof_pb_landed`
     // above — host-side, with access to the sidecar file.
     Ok(result)
+}
+
+/// Primary-VM wprof grace under a real scheduler CRASH. The host writes
+/// `crash=1` to the scheduler's `.bss` mid-run (`bpf_map_write =
+/// BPF_CRASH`), so scx-ktstr calls `scx_bpf_error` and the primary VM
+/// takes an error-class exit (`expect_err = true`) — yet the primary
+/// `.wprof.pb` must still land.
+///
+/// This is the PRIMARY-path counterpart to `bpf_crash_auto_repro_e2e`
+/// (which exercises the AUTO-REPRO VM's grace). It pins that the freeze
+/// coordinator's bounded wprof-ship grace holds the primary VM open for
+/// the guest's Phase-5 trace ship despite (a) the error-class exit and
+/// (b) the concurrent guest SCHED_EXIT — which the SchedExit dispatch arm
+/// declines to promote while the ship is pending — and that the primary
+/// watchdog budget includes `WPROF_SHIP_GRACE` so the ship window fits
+/// inside the deadline. `assert_wprof_pb_landed` confirms the trace
+/// host-side.
+///
+/// `auto_repro = false` — this asserts the PRIMARY trace, not an
+/// auto-repro `.repro.wprof.pb`.
+#[ktstr_test(
+    scheduler = KTSTR_SCHED,
+    llcs = 1,
+    cores = 4,
+    threads = 1,
+    duration_s = 3,
+    watchdog_timeout_s = 15,
+    wprof,
+    auto_repro = false,
+    expect_err = true,
+    bpf_map_write = BPF_CRASH,
+    post_vm = VmResult::assert_wprof_pb_landed,
+)]
+fn wprof_artifact_lands_on_primary_despite_scheduler_crash(ctx: &Ctx) -> Result<AssertResult> {
+    ktstr::scenario::basic::custom_crash_light(ctx)
 }

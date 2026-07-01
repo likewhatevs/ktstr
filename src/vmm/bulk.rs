@@ -27,10 +27,13 @@ use super::wire::{FRAME_HEADER_SIZE, ShmMessage};
 /// Per-frame payload cap enforced by the host assembler.
 ///
 /// The on-wire `length` field is `u32` so a malformed or hostile guest
-/// can announce a 4 GiB payload. 256 KiB exceeds every real payload
-/// type — coverage `Profraw` blobs and LLM `RawPayloadOutput` JSON
-/// are well below this — and is large enough that legitimate guest
-/// traffic never trips it. The cap check fires only after the
+/// can announce a 4 GiB payload. The 16 MiB cap accommodates the largest
+/// legitimate producer — a [`crate::vmm::wire::MsgType::WprofTraceChunk`]
+/// slice, which `guest_comms::send_wprof_trace` splits at exactly this size
+/// so its frames land AT the cap (never above); every other producer
+/// (coverage `Profraw` blobs, LLM `RawPayloadOutput` JSON) sits far below
+/// it — yet it is small enough that a hostile multi-hundred-MiB or 4 GiB
+/// length is always rejected. The cap check fires only after the
 /// complete frame has accumulated in the buffer (header +
 /// `length` payload bytes), so a header arriving ahead of its
 /// payload via split writev is not falsely rejected. Once the full
@@ -184,21 +187,39 @@ impl HostAssembler {
                 // the post-completion check will accept them.
                 break;
             }
+            // Hostile-guest covert-channel guard: `_pad` is reserved and
+            // writers MUST set it to 0 (see `ShmMessage` doc). A non-zero
+            // value cannot come from a legitimate producer — surface it
+            // rather than silently ignoring potential covert-channel bytes.
+            // Checked here, once the full frame is buffered (the
+            // incomplete-payload break above returns first on a split
+            // frame), so a legitimately-split frame is not warned on twice.
+            // Not load-bearing for dispatch; warn and continue. Mirrors the
+            // same check in `super::host_comms::parse_tlv_stream`, but uses
+            // eprintln (not tracing::warn) to match this fn's oversized-drop
+            // diagnostic and surface under nextest's host-test capture.
+            if frame._pad != 0 {
+                eprintln!(
+                    "bulk assembler: non-zero _pad in frame header; possible hostile guest covert channel (msg_type={} length={} pad={})",
+                    frame.msg_type, frame.length, frame._pad
+                );
+            }
             if frame.length > MAX_BULK_FRAME_PAYLOAD {
                 // Hostile-guest defense: an announced length above
                 // the cap (4 GiB max via u32) cannot be a legitimate
-                // frame — every real producer's payload sits well
-                // below 256 KiB. We have now seen every byte the
+                // frame — the largest real producer is a wprof trace
+                // chunk, which `guest_comms::send_wprof_trace` splits at
+                // exactly MAX_BULK_FRAME_PAYLOAD so its frames land AT
+                // the cap and never above it; no producer emits a frame
+                // larger than the cap. We have now seen every byte the
                 // header claimed; drop the entire buffer (header +
                 // payload + any trailing residue) and resync. The
                 // announced length cannot be trusted to advance past
                 // the bogus payload, so partial bytes after this
                 // frame are also unparsable.
-                tracing::warn!(
-                    msg_type = frame.msg_type,
-                    length = frame.length,
-                    cap = MAX_BULK_FRAME_PAYLOAD,
-                    "bulk assembler: dropping oversized frame; resyncing"
+                eprintln!(
+                    "bulk assembler: dropping oversized frame; resyncing (msg_type={} length={} cap={})",
+                    frame.msg_type, frame.length, MAX_BULK_FRAME_PAYLOAD
                 );
                 resync = true;
                 break;

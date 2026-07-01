@@ -203,6 +203,32 @@ fn matrix_multiply_mismatched_len_panics_in_debug() {
     let mut work_units = 0u64;
     matrix_multiply(&mut data, 2, &mut work_units);
 }
+#[test]
+fn matrix_multiply_shared_2x2_against_reference() {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    // Same reference product as matrix_multiply_2x2_against_reference, but driven
+    // through the ATOMIC shared kernel: A=[[1,2],[3,4]] B=[[5,6],[7,8]] =>
+    // C=[[19,22],[43,50]]. Pins matrix_multiply_shared's m1/m2/m3 indexing -- a
+    // transposition or wrong stride would still pass the concurrency smoke
+    // (engine_split_runs_shared_matrix_concurrently), which only checks the loop
+    // ran (loop_count), not that the product is correct. Single-threaded, so the
+    // result is fully deterministic.
+    let size = 2;
+    let stride = size * size;
+    let data: Vec<AtomicU64> = (0..3 * stride).map(|_| AtomicU64::new(0)).collect();
+    // A region data[0..stride], B region data[stride..2*stride].
+    for (i, &v) in [1u64, 2, 3, 4, 5, 6, 7, 8].iter().enumerate() {
+        data[i].store(v, Relaxed);
+    }
+    let mut work_units = 0u64;
+    matrix_multiply_shared(&data, size, &mut work_units);
+    assert_eq!(data[2 * stride].load(Relaxed), 19);
+    assert_eq!(data[2 * stride + 1].load(Relaxed), 22);
+    assert_eq!(data[2 * stride + 2].load(Relaxed), 43);
+    assert_eq!(data[2 * stride + 3].load(Relaxed), 50);
+    // Read-back sink folds C[0] (=19) into work_units, like matrix_multiply.
+    assert_eq!(work_units, 19, "post-loop sink folds C[0] into work_units");
+}
 // -- RAII unit tests for the IO scratch / backing wrappers --
 //
 // Pin the contracts each Drop documents: DirectIoBuf returns a
@@ -1300,6 +1326,188 @@ fn read_sibling_pids_excludes_self() {
     );
 }
 
+/// CgroupChurn rotation paths are built under the resolved workload
+/// root (not the former hardcoded top-level path), as single-component leaf
+/// cgroups. Production (`cgroup_churn_paths` setup) and this test share
+/// `churn_cgroup_procs_paths`, so the layout is pinned at one site.
+#[test]
+fn churn_cgroup_procs_paths_are_under_the_root() {
+    assert_eq!(
+        churn_cgroup_procs_paths("/sys/fs/cgroup/ktstr", 2),
+        vec![
+            "/sys/fs/cgroup/ktstr/wt-cgroup-churn-0/cgroup.procs".to_string(),
+            "/sys/fs/cgroup/ktstr/wt-cgroup-churn-1/cgroup.procs".to_string(),
+        ]
+    );
+    // groups == 0 still yields one target (the .max(1) floor) so the
+    // dispatch arm's index-by-target is always in-bounds.
+    assert_eq!(churn_cgroup_procs_paths("/r", 0).len(), 1);
+    assert_eq!(churn_cgroup_name(3), "wt-cgroup-churn-3");
+}
+
+/// `parse_cgroup_rel` extracts the cgroup-v2 `0::/<rel>` path, and
+/// `read_self_cgroup_dir` maps it to `/sys/fs/cgroup<rel>`, returning
+/// `None` for the root cgroup so a worker never mistakes the root for a
+/// dedicated cgroup. Pins the parse + rel->dir mapping that
+/// `WorkerCtx::cgroup_dir` is built on (its only consumer).
+#[test]
+fn parse_cgroup_rel_and_self_dir_discipline() {
+    // A v2 single `0::` line yields the trimmed `<rel>`.
+    assert_eq!(
+        parse_cgroup_rel("0::/ktstr/cgA\n").as_deref(),
+        Some("/ktstr/cgA")
+    );
+    // The root cgroup line parses to "/".
+    assert_eq!(parse_cgroup_rel("0::/\n").as_deref(), Some("/"));
+    // A cgroup-v1-only file (no `0::` line) yields None.
+    assert_eq!(
+        parse_cgroup_rel("3:cpu,cpuacct:/foo\n1:name=systemd:/bar\n"),
+        None
+    );
+    // Hybrid host: v1 controller lines interleaved with the unified
+    // `0::` line — the `0::` line is found regardless of its position.
+    assert_eq!(
+        parse_cgroup_rel("3:cpu,cpuacct:/foo\n0::/ktstr/cgA\n1:name=systemd:/bar\n").as_deref(),
+        Some("/ktstr/cgA")
+    );
+    // The rel->dir mapping pinned deterministically on literals (the
+    // live check below only exercises whichever branch its own cgroup
+    // hits): the root maps to None — never a bogus "/sys/fs/cgroup" —
+    // and a dedicated rel maps under it.
+    assert_eq!(cgroup_dir_from_rel("/"), None);
+    // An empty rel (reachable from a `0::\n` literal via parse_cgroup_rel)
+    // also maps to None — never the bare /sys/fs/cgroup sentinel.
+    assert_eq!(cgroup_dir_from_rel(""), None);
+    assert_eq!(
+        cgroup_dir_from_rel("/ktstr/cgA"),
+        Some(std::path::PathBuf::from("/sys/fs/cgroup/ktstr/cgA"))
+    );
+    // The live process: read_self_cgroup_dir is either None (root /
+    // non-v2) or an absolute path strictly under /sys/fs/cgroup — never
+    // the bare "/sys/fs/cgroup" root sentinel.
+    if let Some(dir) = read_self_cgroup_dir() {
+        assert!(
+            dir.starts_with("/sys/fs/cgroup") && dir != std::path::Path::new("/sys/fs/cgroup"),
+            "read_self_cgroup_dir must be a dedicated cgroup dir, got {dir:?}"
+        );
+    }
+}
+
+/// WorkerCtx::open_sibling_cgroup_procs: resolves
+/// `cgroup_dir().parent()/<name>/cgroup.procs`, opens it write-mode (the
+/// writability precheck), rejects escaping names before any fs access, and
+/// surfaces NotFound (missing sibling / no cgroup_dir) loudly. Uses a
+/// synthetic cgroup tree under a tempdir (no real cgroupfs).
+#[test]
+fn open_sibling_cgroup_procs_resolves_opens_and_validates() {
+    use std::io::{ErrorKind, Write};
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let root = tmp.path().join("root");
+    let worker = root.join("worker");
+    std::fs::create_dir_all(&worker).unwrap();
+    std::fs::create_dir_all(root.join("dest")).unwrap();
+    std::fs::write(root.join("dest").join("cgroup.procs"), b"").unwrap();
+    let stop = AtomicBool::new(false);
+    let ctx = WorkerCtx::new(&stop, &[], &[], Some(&worker), CustomCfg::default());
+
+    // Resolves + opens the sibling's cgroup.procs write-mode.
+    let mut f = ctx
+        .open_sibling_cgroup_procs("dest")
+        .expect("dest sibling cgroup.procs must open write-mode");
+    assert!(f.write_all(b"").is_ok(), "the returned handle is writable");
+
+    // Missing sibling -> NotFound, with the resolved path enriched into the
+    // message (the .map_err layer the doc promises).
+    let miss = ctx.open_sibling_cgroup_procs("no_such").unwrap_err();
+    assert_eq!(miss.kind(), ErrorKind::NotFound);
+    assert!(
+        miss.to_string().contains("no_such/cgroup.procs"),
+        "the open error must name the resolved sibling path; got: {miss}"
+    );
+
+    // Escaping / malformed names rejected as InvalidInput (the
+    // validation-before-fs class — a dropped validation would instead surface
+    // these as NotFound, since parent.join(name) would resolve).
+    for bad in ["", "..", "a/../b", "/abs", ".hidden"] {
+        assert_eq!(
+            ctx.open_sibling_cgroup_procs(bad).unwrap_err().kind(),
+            ErrorKind::InvalidInput,
+            "name {bad:?} must be rejected as InvalidInput"
+        );
+    }
+
+    // No cgroup_dir (root / non-v2 worker) -> NotFound, never a fabricated path.
+    let ctx_root = WorkerCtx::new(&stop, &[], &[], None, CustomCfg::default());
+    assert_eq!(
+        ctx_root
+            .open_sibling_cgroup_procs("dest")
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotFound
+    );
+
+    // cgroup_dir == "/" (parent() is None) -> NotFound (the documented
+    // no-parent branch), not a malformed join.
+    let ctx_slash = WorkerCtx::new(
+        &stop,
+        &[],
+        &[],
+        Some(std::path::Path::new("/")),
+        CustomCfg::default(),
+    );
+    assert_eq!(
+        ctx_slash
+            .open_sibling_cgroup_procs("dest")
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotFound
+    );
+}
+
+/// An unwritable sibling `cgroup.procs` surfaces as PermissionDenied
+/// (errno-kind preserved). Gated on non-root — root bypasses DAC mode bits
+/// on a regular file, so the EACCES path is only observable unprivileged
+/// (ktstr's VM runs as root, where this skips).
+#[test]
+fn open_sibling_cgroup_procs_unwritable_is_permission_denied() {
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root bypasses the 0o400 mode bit; EACCES is unobservable.
+    }
+    use std::io::ErrorKind;
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let worker = tmp.path().join("root").join("worker");
+    let dest = tmp.path().join("root").join("dest");
+    std::fs::create_dir_all(&worker).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+    let procs = dest.join("cgroup.procs");
+    std::fs::write(&procs, b"").unwrap();
+    std::fs::set_permissions(&procs, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let stop = AtomicBool::new(false);
+    let ctx = WorkerCtx::new(&stop, &[], &[], Some(&worker), CustomCfg::default());
+    assert_eq!(
+        ctx.open_sibling_cgroup_procs("dest").unwrap_err().kind(),
+        ErrorKind::PermissionDenied
+    );
+}
+
+/// `custom_iterations_telltale` flags ONLY the `work_units > 0` +
+/// `iterations == 0` footgun shape (the naive-Custom-author trap the dispatch
+/// warn-once targets), and nothing else — so the advisory never fires on a
+/// balanced, throughput-only, or empty report.
+#[test]
+fn custom_iterations_telltale_flags_only_work_units_without_iterations() {
+    let mk = |work_units, iterations| WorkerReport {
+        work_units,
+        iterations,
+        ..Default::default()
+    };
+    assert!(custom_iterations_telltale(&mk(1000, 0)));
+    assert!(!custom_iterations_telltale(&mk(0, 1000)));
+    assert!(!custom_iterations_telltale(&mk(1000, 1000)));
+    assert!(!custom_iterations_telltale(&mk(0, 0)));
+}
+
 /// `WorkerCtx` accessors return the borrowed worker state verbatim,
 /// and `stop()` exposes the live flag — a flip is observable through
 /// the ctx. Pins the read-only contract a `Custom` worker relies on.
@@ -1308,7 +1516,8 @@ fn worker_ctx_accessors_return_borrowed_state() {
     let stop = AtomicBool::new(false);
     let cpus = [3usize, 7, 11];
     let siblings: [libc::pid_t; 2] = [100, 200];
-    let ctx = WorkerCtx::new(&stop, &cpus, &siblings);
+    let cg = std::path::Path::new("/sys/fs/cgroup/ktstr/cgA");
+    let ctx = WorkerCtx::new(&stop, &cpus, &siblings, Some(cg), CustomCfg::default());
     assert_eq!(
         ctx.cpus(),
         cpus.as_slice(),
@@ -1318,6 +1527,16 @@ fn worker_ctx_accessors_return_borrowed_state() {
         ctx.sibling_pids(),
         siblings.as_slice(),
         "sibling_pids() returns the borrowed peer set"
+    );
+    assert_eq!(
+        ctx.cgroup_dir(),
+        Some(cg),
+        "cgroup_dir() returns the borrowed cgroup path"
+    );
+    assert_eq!(
+        WorkerCtx::new(&stop, &cpus, &siblings, None, CustomCfg::default()).cgroup_dir(),
+        None,
+        "cgroup_dir() is None for the root / non-v2 case"
     );
     assert!(!ctx.stop().load(Ordering::Relaxed));
     stop.store(true, Ordering::Relaxed);
@@ -1369,6 +1588,7 @@ fn build_phase_slice_full_delta_math() {
         cpus.clone(),
         numa.clone(),
         (vec![11, 22, 33], 5), // wake (reservoir, total)
+        (vec![44, 55], 7),     // timer (reservoir, total)
     );
     assert_eq!(s.phase_epoch, 7);
     assert_eq!(s.wall_ns, 1_000_000);
@@ -1387,6 +1607,9 @@ fn build_phase_slice_full_delta_math() {
     assert_eq!(s.numa_pages, numa);
     assert_eq!(s.wake_latencies_ns, vec![11, 22, 33]);
     assert_eq!(s.wake_sample_total, 5);
+    // Timer reservoir flows through the distinct carrier exactly like wake.
+    assert_eq!(s.timer_latencies_ns, vec![44, 55]);
+    assert_eq!(s.timer_sample_total, 7);
 }
 
 /// `off_cpu_ns` saturates at 0 when the thread-CPU delta exceeds wall — a
@@ -1409,6 +1632,7 @@ fn build_phase_slice_off_cpu_saturates_at_zero() {
         0,
         BTreeSet::new(),
         BTreeMap::new(),
+        (vec![], 0),
         (vec![], 0),
     );
     assert_eq!(s.off_cpu_ns, 0);
@@ -1435,6 +1659,7 @@ fn build_phase_slice_missing_schedstat_is_zero() {
             0,
             BTreeSet::new(),
             BTreeMap::new(),
+            (vec![], 0),
             (vec![], 0),
         )
     };
@@ -1475,6 +1700,7 @@ fn build_phase_slice_counter_deltas_saturate() {
         0,
         BTreeSet::new(),
         BTreeMap::new(),
+        (vec![], 0),
         (vec![], 0),
     );
     assert_eq!(s.run_delay_ns, 0);

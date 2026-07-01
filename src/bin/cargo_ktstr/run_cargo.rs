@@ -14,6 +14,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use cargo_metadata::semver::Version;
+
 use crate::kernel::{encode_kernel_list, resolve_kernel_set};
 
 /// Cargo sub-argv that `run_test` passes to `run_cargo_sub`. Named
@@ -351,9 +353,9 @@ fn run_cargo_sub(
         }
     }
 
-    precompute_cast_cache();
-
     let target_dir_path = resolve_target_dir();
+
+    precompute_cast_cache(&target_dir_path);
 
     // BTF type anchor: if a prior build left .bpf.o files, extract
     // struct definitions from the BPF source tree and generate a
@@ -370,33 +372,62 @@ fn run_cargo_sub(
     }
 
     tracing::debug!("cargo ktstr: running {label}");
+    // Capture the run-start instant BEFORE the nextest build+run so
+    // the footer's mtime gate (`format_run_artifact_footer`) can
+    // distinguish this run's artifacts from stale ones left in a
+    // reused `{kernel}-{project_commit}` run directory. The build
+    // runs first, so genuine artifacts are written well after this
+    // instant.
+    let run_start = std::time::SystemTime::now();
+    // Stamp a per-invocation SESSION TOKEN so every child test
+    // process's `pre_clear_run_dir_once` spares sidecars written THIS
+    // run by peer processes. nextest is process-per-test and all
+    // tests sharing one {kernel}-{project_commit} dir would otherwise
+    // have a later process's pre-clear delete an earlier peer's fresh
+    // .ktstr.json — silent stats loss across the suite. The value is
+    // opaque (only per-invocation uniqueness matters); `run_start`
+    // nanos serve, and double as the footer's mtime boundary below.
+    if let Ok(d) = run_start.duration_since(std::time::UNIX_EPOCH) {
+        cmd.env(ktstr::KTSTR_RUN_EPOCH_ENV, d.as_nanos().to_string());
+    }
     let status = cmd
         .status()
         .map_err(|e| format!("spawn cargo {}: {e}", sub_argv.join(" ")))?;
     cleanup_shm();
-    // Surface where per-test debugging artefacts live so an operator
-    // investigating a failure does not have to grep through `target/`
-    // to find them. Every test that boots a VM may write any of the
-    // artefacts listed in the eprintln block below. The dir is per
-    // (kernel, project commit) so failures from different runs of
-    // the same test don't stomp each other. Printed on BOTH success
-    // and failure: even passing runs leave per-test stats sidecars
-    // — and wprof-tagged passing runs leave a Perfetto `.pb` trace
-    // — worth inspecting.
-    let sidecar_dir = ktstr::test_support::sidecar_dir();
-    eprintln!();
-    eprintln!("cargo ktstr: test outputs in:");
-    eprintln!("  {}", sidecar_dir.display());
-    eprintln!("    *.failure-dump.json       — VM-state JSON when a test crashed or asserted");
-    eprintln!("    *.repro.failure-dump.json — VM-state JSON from the auto-repro retry");
-    eprintln!("    *.ktstr.json              — per-scenario stats + scheduler metadata");
-    eprintln!("    *.wprof.pb                — Perfetto trace from #[ktstr_test(wprof)] tests");
-    eprintln!("    *.repro.wprof.pb          — Perfetto trace from the auto-repro retry");
-    eprintln!(
-        "  (run `cargo ktstr replay --dir {}` to step through a captured failure)",
-        sidecar_dir.display()
-    );
-    eprintln!();
+    // Surface per-test debugging artefacts: name each test that
+    // FAILED this run and the concrete path to each of its artifacts
+    // (failure dump, auto-repro dump, stats sidecar, wprof trace), so
+    // an operator does not have to guess which `*.failure-dump.json`
+    // in a reused run directory belongs to the test that just failed.
+    // `format_run_artifact_footer` scans every run dir under
+    // `runs_root()` and keeps only files written at/after `run_start`
+    // (mtime gate) — this excludes stale artifacts from a prior run
+    // at the same `{kernel}-{project_commit}` key, and captures the
+    // real output dir(s) for single-kernel AND gauntlet runs without
+    // re-deriving the leaf name from the orchestrator's env (which
+    // carries no `KTSTR_KERNEL`, unlike the child test processes).
+    let runs_root = ktstr::test_support::runs_root();
+    let footer = ktstr::test_support::format_run_artifact_footer(&runs_root, run_start);
+    if !footer.is_empty() {
+        eprint!("{footer}");
+    }
+    if !status.success() {
+        // nextest is the authoritative pass/fail signal. The footer
+        // above lists per-test artifacts for failures that produced
+        // them; a failure that left NO artifact — a build / vm.run
+        // error, a pre-build host error (kvm probe, kernel/scheduler
+        // resolve, validation), a host panic, or an unparseable guest
+        // result — never reaches the dump / sidecar write sites, so it
+        // has no entry above. Defer to the nextest summary for the
+        // authoritative failed-test set rather than implying the
+        // artifact list is exhaustive.
+        eprintln!(
+            "\ncargo ktstr: nextest reported failures (see its summary above); \
+             per-test artifacts for failures that produced them are listed above. \
+             Artifacts under {}.",
+            runs_root.display(),
+        );
+    }
     if status.success() {
         Ok(())
     } else {
@@ -410,11 +441,44 @@ fn run_cargo_sub(
     }
 }
 
-fn precompute_cast_cache() {
-    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
+/// Precompute cast analysis for the built scheduler binaries so the
+/// first test needing it doesn't pay the analysis cost inline.
+///
+/// `target_dir` is the resolved (absolute) cargo target dir, passed in
+/// rather than re-read from `CARGO_TARGET_DIR`/"target": in a Cargo
+/// workspace invoked from a member-dir CWD a relative "target" points
+/// at a package dir that holds no built binaries (they live under the
+/// shared workspace target), so the scan would silently find nothing.
+/// The caller resolves it once via [`resolve_target_dir`] and shares it
+/// with [`generate_btf_anchor`] — no extra `cargo metadata` spawn here.
+fn precompute_cast_cache(target_dir: &std::path::Path) {
+    let binaries = collect_scheduler_binaries(target_dir);
+    if binaries.is_empty() {
+        return;
+    }
+    eprintln!(
+        "cargo ktstr: precomputing cast analysis for {} scheduler binaries",
+        binaries.len()
+    );
+    for binary in binaries {
+        let path = binary.clone();
+        std::thread::spawn(move || {
+            ktstr::precompute_cast_analysis(&path);
+        });
+    }
+}
+
+/// Collect built scheduler binaries (`scx_*`, no extension) under
+/// `{target_dir}/{debug,release}`. The no-dot filter rejects build
+/// byproducts that share the `scx_` prefix (e.g. `scx_foo.d` depfiles,
+/// `scx_foo.rlib`); only the bare executable matches, and the
+/// `is_file` gate excludes same-named directories. Split out from
+/// [`precompute_cast_cache`] so the scan/filter is unit-testable
+/// without spawning the per-binary analysis threads.
+fn collect_scheduler_binaries(target_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut binaries = Vec::new();
     for profile in ["debug", "release"] {
-        let dir = std::path::Path::new(&target_dir).join(profile);
+        let dir = target_dir.join(profile);
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -431,19 +495,7 @@ fn precompute_cast_cache() {
             }
         }
     }
-    if binaries.is_empty() {
-        return;
-    }
-    eprintln!(
-        "cargo ktstr: precomputing cast analysis for {} scheduler binaries",
-        binaries.len()
-    );
-    for binary in binaries {
-        let path = binary.clone();
-        std::thread::spawn(move || {
-            ktstr::precompute_cast_analysis(&path);
-        });
-    }
+    binaries
 }
 
 fn generate_btf_anchor(target_dir: &std::path::Path, release: bool) -> Option<std::path::PathBuf> {
@@ -522,6 +574,62 @@ fn resolve_target_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("target")
 }
 
+/// Pin [`ktstr::KTSTR_RUNS_ROOT_ENV`] to the absolute cargo target
+/// dir's `ktstr` subdir so the orchestrator's footer / `stats` /
+/// `replay` reads AND the child test processes' sidecar writes resolve
+/// the SAME directory regardless of CWD.
+///
+/// Without this, [`ktstr::test_support::runs_root`] is CWD-relative
+/// (`{CARGO_TARGET_DIR or "target"}/ktstr`): in a Cargo workspace the
+/// test binaries run with CWD = the package dir (nextest), writing
+/// sidecars to `{package}/target/ktstr`, while this orchestrator —
+/// invoked from a different CWD (e.g. the workspace root) — scans
+/// elsewhere, so the post-run footer finds nothing.
+///
+/// Resolved ONCE here (a single `cargo metadata` via
+/// [`resolve_target_dir`]) and exported so child test processes
+/// inherit it; they never re-run `cargo metadata` (it would be one
+/// subprocess spawn per test process on the hot path). A relative
+/// target dir (a relative `CARGO_TARGET_DIR`, or the `"target"`
+/// fallback when `cargo metadata` is unavailable) is anchored to this
+/// process's cwd so the exported value is always absolute — cargo
+/// resolves a relative `CARGO_TARGET_DIR` against the cargo-invocation
+/// cwd, which is this orchestrator's cwd. No-ops only when already set
+/// non-empty (operator / test override) or when the cwd cannot be read.
+///
+/// SAFETY: called from `cargo-ktstr` `main` before any thread is
+/// spawned (alongside `blobs::install_env`), so the `set_var` has no
+/// concurrent env reader — see `blobs::install_env`'s safety doc.
+pub(crate) fn install_runs_root_env() {
+    if std::env::var_os(ktstr::KTSTR_RUNS_ROOT_ENV)
+        .filter(|v| !v.is_empty())
+        .is_some()
+    {
+        return;
+    }
+    let runs_root = resolve_target_dir().join("ktstr");
+    let runs_root = if runs_root.is_absolute() {
+        runs_root
+    } else {
+        // A relative root would leave the orchestrator and the child
+        // test processes resolving it against DIFFERENT cwds in a
+        // workspace (nextest runs each test with cwd = its package dir),
+        // reintroducing the empty-footer split. Anchor it to this
+        // process's cwd: cargo resolves a relative CARGO_TARGET_DIR
+        // against the cargo-invocation cwd, which is this orchestrator's
+        // cwd (build_cargo_command spawns cargo without overriding
+        // current_dir), so this matches where the artifacts land.
+        let Ok(cwd) = std::env::current_dir() else {
+            return;
+        };
+        cwd.join(runs_root)
+    };
+    // SAFETY: see the function doc — startup, before any threads.
+    unsafe {
+        std::env::set_var(ktstr::KTSTR_RUNS_ROOT_ENV, &runs_root);
+    }
+}
+
 fn cleanup_shm() {
     let Ok(dir) = std::fs::read_dir("/dev/shm") else {
         return;
@@ -553,6 +661,151 @@ fn cleanup_shm() {
     }
 }
 
+/// Outcome of comparing the cargo-ktstr CLI's own ktstr version with the
+/// `ktstr` dependency version the test project was built against.
+#[derive(Debug, PartialEq, Eq)]
+enum VersionGuard {
+    /// Versions match — proceed silently.
+    Ok,
+    /// Versions differ but the test's ktstr is OLDER than the CLI —
+    /// usually drivable, but the skew is worth surfacing.
+    Warn(String),
+    /// The test's ktstr is NEWER than the CLI — the CLI predates the API
+    /// the test was built against and cannot drive it; abort.
+    Error(String),
+}
+
+/// Pure CLI-vs-test ktstr-version comparison — the testable core of the
+/// version guard. Compares by semver PRECEDENCE (major.minor.patch +
+/// pre-release, IGNORING build metadata): ktstr is pre-1.0, where a minor
+/// bump is breaking, so any test > cli aborts.
+fn version_guard(cli: &Version, test: &Version) -> VersionGuard {
+    use std::cmp::Ordering;
+    // `cmp_precedence`, NOT the derived `Version::cmp`: the derived `Ord`
+    // includes build metadata as a final tie-breaker (and
+    // `BuildMetadata::EMPTY < non-empty`), so a `+build`-tagged path/git
+    // ktstr dep — the `cargo install --path .` flow this guard recommends —
+    // would compare unequal to a plain-version CLI and spuriously
+    // abort/warn two identical releases. Precedence ignores build metadata.
+    match test.cmp_precedence(cli) {
+        Ordering::Equal => VersionGuard::Ok,
+        Ordering::Less => VersionGuard::Warn(format!(
+            "the test was built against ktstr {test} but the cargo-ktstr CLI \
+             is {cli} — version skew. Align them (bump the test's ktstr \
+             dependency, or use a matching CLI) to avoid surprises."
+        )),
+        Ordering::Greater => VersionGuard::Error(format!(
+            "the test was built against ktstr {test} but the cargo-ktstr CLI \
+             is {cli} — the CLI is older than the ktstr the test depends on \
+             and cannot drive it. Upgrade the CLI: `cargo install ktstr` \
+             (or `cargo install --path .` in the ktstr repo)."
+        )),
+    }
+}
+
+/// The `ktstr` version the about-to-run test/bin targets actually LINK,
+/// resolved from the `cargo metadata` graph — NOT a `.max()` over all
+/// `ktstr` packages. ktstr is pre-1.0, so two `0.x` are
+/// semver-incompatible and cargo keeps BOTH in a dual-ktstr graph; a
+/// `.max()` would pick a higher TRANSITIVE ktstr the run's targets do not
+/// link and false-abort a compatible run — violating the contract below
+/// ("never block a run it cannot assess").
+///
+/// `None` (→ guard skips) when there is no resolve graph (`--no-deps`), or
+/// the root is not `ktstr` and has no linked `ktstr` dep. The root package
+/// itself being `ktstr` (the in-repo workspace, whose own bins/tests link
+/// itself) yields its own version. cargo metadata's resolve graph is
+/// per-PACKAGE, not per-target, so "which ktstr the test targets link"
+/// reduces to the root package's `ktstr` lib edge: `deps` (rename-aware),
+/// Normal/Development kind (a pure build-dep is not linked by tests).
+///
+/// LIMITATION: a platform-gated `ktstr` (a `[target.'cfg(...)'.dependencies]`
+/// edge) is matched by name regardless of `DepKindInfo.target`; host-triple
+/// `Platform` matching is intentionally omitted (it needs the full host cfg
+/// set). A cfg-gated ktstr test-driver dependency the host does not link is
+/// exotic; if hit, the failure direction is a false-abort — accepted over
+/// the matching complexity for that case.
+fn resolved_ktstr_version(meta: &cargo_metadata::Metadata) -> Option<&Version> {
+    let resolve = meta.resolve.as_ref()?;
+    // The run executes the targets of the root package, or — in a virtual
+    // workspace (no root package) — of every workspace member.
+    let root_ids: Vec<&cargo_metadata::PackageId> = match &resolve.root {
+        Some(root) => vec![root],
+        None => meta.workspace_members.iter().collect(),
+    };
+    for root_id in root_ids {
+        let Some(root_pkg) = meta.packages.iter().find(|p| &p.id == root_id) else {
+            continue;
+        };
+        // The root package may BE ktstr (the in-repo workspace).
+        if root_pkg.name == "ktstr" {
+            return Some(&root_pkg.version);
+        }
+        // Else: the ktstr the root's bins/tests link is its `ktstr` dep edge.
+        let Some(node) = resolve.nodes.iter().find(|n| &n.id == root_id) else {
+            continue;
+        };
+        for dep in &node.deps {
+            let Some(dep_pkg) = meta.packages.iter().find(|p| p.id == dep.pkg) else {
+                continue;
+            };
+            if dep_pkg.name != "ktstr" {
+                continue;
+            }
+            // A pure build-dependency edge is not linked by the test/bin
+            // targets; require a Normal/Development kind. Empty dep_kinds
+            // (older cargo metadata) → treat as a normal link.
+            let linked = dep.dep_kinds.is_empty()
+                || dep.dep_kinds.iter().any(|dk| {
+                    matches!(
+                        dk.kind,
+                        cargo_metadata::DependencyKind::Normal
+                            | cargo_metadata::DependencyKind::Development
+                    )
+                });
+            if linked {
+                return Some(&dep_pkg.version);
+            }
+        }
+    }
+    None
+}
+
+/// Guard CLI↔test ktstr-version skew before running the suite.
+///
+/// Reads the test project's RESOLVED `ktstr` dependency version (what the
+/// test binaries link) from `cargo metadata` and compares it with the
+/// CLI's own compiled-in version. Warns on any mismatch; errors —
+/// aborting the run — when the test's ktstr is newer than the CLI.
+///
+/// Best-effort: a project with no `ktstr` dependency, or a `cargo
+/// metadata` failure, skips the guard. The guard must never block a run
+/// it cannot assess — only one it can prove incompatible.
+fn check_ktstr_version_compat() -> Result<(), String> {
+    let cli = Version::parse(env!("CARGO_PKG_VERSION"))
+        .expect("cargo-ktstr's own CARGO_PKG_VERSION is valid semver");
+    let meta = match cargo_metadata::MetadataCommand::new().exec() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "ktstr version guard: cargo metadata failed; skipping");
+            return Ok(());
+        }
+    };
+    // The version the run's test/bin targets actually LINK (resolve-graph
+    // walk, not a `.max()` over the graph — see `resolved_ktstr_version`).
+    let Some(test) = resolved_ktstr_version(&meta) else {
+        // No linked `ktstr` (or no resolve graph) — running outside a
+        // ktstr-dependent project, or cannot assess; nothing to guard.
+        return Ok(());
+    };
+    match version_guard(&cli, test) {
+        VersionGuard::Ok => {}
+        VersionGuard::Warn(msg) => eprintln!("cargo ktstr: warning: {msg}"),
+        VersionGuard::Error(msg) => return Err(msg),
+    }
+    Ok(())
+}
+
 pub(crate) fn run_test(
     kernel: Vec<String>,
     no_perf_mode: bool,
@@ -563,6 +816,7 @@ pub(crate) fn run_test(
 ) -> Result<(), String> {
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     ktstr::cli::check_tools(&["cargo-nextest"]).map_err(|e| format!("{e:#}"))?;
+    check_ktstr_version_compat()?;
     run_cargo_sub(
         TEST_SUB_ARGV,
         "tests",
@@ -585,6 +839,10 @@ pub(crate) fn run_coverage(
 ) -> Result<(), String> {
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     ktstr::cli::check_tools(&["cargo-nextest", "cargo-llvm-cov"]).map_err(|e| format!("{e:#}"))?;
+    // `coverage` runs the SAME test suite (cargo llvm-cov nextest), so it
+    // hits the same CLI-too-old incompatibility `test` does — guard it
+    // identically.
+    check_ktstr_version_compat()?;
     run_cargo_sub(
         COVERAGE_SUB_ARGV,
         "coverage",
@@ -607,6 +865,13 @@ pub(crate) fn run_llvm_cov(
     // argument after the subcommand name, including any profile
     // selection. `release: false` / `release_scheduler: false` here
     // mean "don't inject a profile ourselves"; the user decides.
+    //
+    // No ktstr version guard here (unlike `test` / `coverage`): a
+    // passthrough subcommand like `llvm-cov report` does NOT rebuild or
+    // run the tests, so guarding would wrongly block a pure-report
+    // invocation under a version-skewed project. A `cargo ktstr llvm-cov
+    // nextest` that DOES run tests is the user's explicit raw-passthrough
+    // choice; they own the version in that case.
     run_cargo_sub(
         LLVM_COV_SUB_ARGV,
         "llvm-cov",
@@ -622,6 +887,337 @@ pub(crate) fn run_llvm_cov(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn v(s: &str) -> Version {
+        Version::parse(s).expect("test version literal is valid semver")
+    }
+
+    #[test]
+    fn version_guard_equal_is_ok() {
+        assert_eq!(version_guard(&v("0.19.0"), &v("0.19.0")), VersionGuard::Ok);
+    }
+
+    #[test]
+    fn version_guard_test_older_warns() {
+        // test 0.18 < CLI 0.19 -> warn (skew; the newer CLI can usually
+        // still drive an older test).
+        assert!(matches!(
+            version_guard(&v("0.19.0"), &v("0.18.0")),
+            VersionGuard::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn version_guard_test_newer_errors() {
+        // test 0.20 > CLI 0.19 -> error (the CLI predates the test's ktstr
+        // and cannot drive it).
+        assert!(matches!(
+            version_guard(&v("0.19.0"), &v("0.20.0")),
+            VersionGuard::Error(_)
+        ));
+    }
+
+    #[test]
+    fn version_guard_patch_delta_full_version_compare() {
+        // ktstr is pre-1.0, so the guard compares the full version — even
+        // a patch delta is significant. test newer-by-patch -> error;
+        // older-by-patch -> warn.
+        assert!(matches!(
+            version_guard(&v("0.19.0"), &v("0.19.1")),
+            VersionGuard::Error(_)
+        ));
+        assert!(matches!(
+            version_guard(&v("0.19.1"), &v("0.19.0")),
+            VersionGuard::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn version_guard_ignores_build_metadata() {
+        // Semver precedence ignores build metadata, so a `+build`-tagged
+        // path/git ktstr dep against a plain-version CLI is the SAME release
+        // — Ok, not a spurious abort/warn. Regression guard for the
+        // derived-`Ord` bug (it ordered `BuildMetadata::EMPTY < non-empty`,
+        // making these compare unequal: `0.19.0+abc` > `0.19.0` -> Error).
+        assert_eq!(
+            version_guard(&v("0.19.0"), &v("0.19.0+abc")),
+            VersionGuard::Ok,
+        );
+        assert_eq!(
+            version_guard(&v("0.19.0+abc"), &v("0.19.0")),
+            VersionGuard::Ok,
+        );
+    }
+
+    /// A `cargo metadata` Package JSON object with every required field
+    /// (Options as `null`, collections empty); only name/version/id/source
+    /// vary across the fixture's packages.
+    fn pkg_json(name: &str, version: &str, id: &str, source: &str) -> String {
+        format!(
+            r#"{{"name":"{name}","version":"{version}","id":"{id}","source":{source},"description":null,"dependencies":[],"license":null,"license_file":null,"targets":[],"features":{{}},"manifest_path":"/w/{name}/Cargo.toml","readme":null,"repository":null,"homepage":null,"documentation":null,"links":null,"publish":null,"default_run":null}}"#
+        )
+    }
+
+    /// Regression: in a dual-ktstr resolve graph,
+    /// `resolved_ktstr_version` must return the ktstr the ROOT's targets
+    /// LINK, not the `.max()` over the graph. The user project links ktstr
+    /// 0.16 directly while an unrelated dep pulls ktstr 0.20 transitively
+    /// (ktstr is pre-1.0, so the two semver-incompatible 0.x coexist).
+    /// `.max()` would pick 0.20 and false-abort a run the CLI can drive;
+    /// the walk must pick 0.16.
+    #[test]
+    fn resolved_ktstr_version_picks_linked_not_max() {
+        let crates_io = r#""registry+https://github.com/rust-lang/crates.io-index""#;
+        let root = "userproj 0.1.0 (path+file:///w/userproj)";
+        let k016 = "ktstr 0.16.0 (registry+https://github.com/rust-lang/crates.io-index)";
+        let k020 = "ktstr 0.20.0 (registry+https://github.com/rust-lang/crates.io-index)";
+        let other = "otherdep 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)";
+        let json = format!(
+            r#"{{
+              "packages":[{up},{a},{b},{o}],
+              "workspace_members":["{root}"],
+              "resolve":{{
+                "root":"{root}",
+                "nodes":[
+                  {{"id":"{root}","deps":[{{"name":"ktstr","pkg":"{k016}","dep_kinds":[{{"kind":null,"target":null}}]}},{{"name":"otherdep","pkg":"{other}","dep_kinds":[{{"kind":null,"target":null}}]}}],"dependencies":["{k016}","{other}"],"features":[]}},
+                  {{"id":"{other}","deps":[{{"name":"ktstr","pkg":"{k020}","dep_kinds":[{{"kind":null,"target":null}}]}}],"dependencies":["{k020}"],"features":[]}},
+                  {{"id":"{k016}","deps":[],"dependencies":[],"features":[]}},
+                  {{"id":"{k020}","deps":[],"dependencies":[],"features":[]}}
+                ]
+              }},
+              "workspace_root":"/w","target_directory":"/w/target","version":1
+            }}"#,
+            up = pkg_json("userproj", "0.1.0", root, "null"),
+            a = pkg_json("ktstr", "0.16.0", k016, crates_io),
+            b = pkg_json("ktstr", "0.20.0", k020, crates_io),
+            o = pkg_json("otherdep", "0.1.0", other, crates_io),
+        );
+        let meta: cargo_metadata::Metadata =
+            serde_json::from_str(&json).expect("fixture deserializes as cargo metadata");
+        assert_eq!(
+            resolved_ktstr_version(&meta),
+            Some(&v("0.16.0")),
+            "must pick the LINKED ktstr (root's direct dep), not the .max() (0.20.0)",
+        );
+    }
+
+    /// `resolved_ktstr_version` when the ROOT package IS ktstr (the in-repo
+    /// workspace, whose own bins/tests link itself) → its own version.
+    #[test]
+    fn resolved_ktstr_version_root_is_ktstr() {
+        let root = "ktstr 0.19.0 (path+file:///w)";
+        let json = format!(
+            r#"{{
+              "packages":[{k}],
+              "workspace_members":["{root}"],
+              "resolve":{{"root":"{root}","nodes":[{{"id":"{root}","deps":[],"dependencies":[],"features":[]}}]}},
+              "workspace_root":"/w","target_directory":"/w/target","version":1
+            }}"#,
+            k = pkg_json("ktstr", "0.19.0", root, "null"),
+        );
+        let meta: cargo_metadata::Metadata =
+            serde_json::from_str(&json).expect("fixture deserializes");
+        assert_eq!(resolved_ktstr_version(&meta), Some(&v("0.19.0")));
+    }
+
+    /// Never-false-abort: a ktstr edge that is ONLY a build-dependency
+    /// (the test/bin targets do not link it) must NOT be picked — yields
+    /// `None` so the guard SKIPS rather than aborting on an unlinked
+    /// version. This is the load-bearing safe-direction branch.
+    #[test]
+    fn resolved_ktstr_version_skips_build_only_edge() {
+        let crates_io = r#""registry+https://github.com/rust-lang/crates.io-index""#;
+        let root = "userproj 0.1.0 (path+file:///w/userproj)";
+        let kb = "ktstr 0.20.0 (registry+https://github.com/rust-lang/crates.io-index)";
+        let json = format!(
+            r#"{{
+              "packages":[{up},{k}],
+              "workspace_members":["{root}"],
+              "resolve":{{
+                "root":"{root}",
+                "nodes":[
+                  {{"id":"{root}","deps":[{{"name":"ktstr","pkg":"{kb}","dep_kinds":[{{"kind":"build","target":null}}]}}],"dependencies":["{kb}"],"features":[]}},
+                  {{"id":"{kb}","deps":[],"dependencies":[],"features":[]}}
+                ]
+              }},
+              "workspace_root":"/w","target_directory":"/w/target","version":1
+            }}"#,
+            up = pkg_json("userproj", "0.1.0", root, "null"),
+            k = pkg_json("ktstr", "0.20.0", kb, crates_io),
+        );
+        let meta: cargo_metadata::Metadata =
+            serde_json::from_str(&json).expect("fixture deserializes");
+        assert_eq!(
+            resolved_ktstr_version(&meta),
+            None,
+            "a build-only ktstr edge is not linked by test/bin targets — skip, not abort",
+        );
+    }
+
+    /// Virtual workspace: no root package (`resolve.root` = null) — the
+    /// walk falls back to every workspace member; a member linking ktstr
+    /// resolves to that version.
+    #[test]
+    fn resolved_ktstr_version_virtual_workspace_walks_members() {
+        let crates_io = r#""registry+https://github.com/rust-lang/crates.io-index""#;
+        let member = "memberproj 0.1.0 (path+file:///w/memberproj)";
+        let k = "ktstr 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)";
+        let json = format!(
+            r#"{{
+              "packages":[{m},{kp}],
+              "workspace_members":["{member}"],
+              "resolve":{{
+                "root":null,
+                "nodes":[
+                  {{"id":"{member}","deps":[{{"name":"ktstr","pkg":"{k}","dep_kinds":[{{"kind":null,"target":null}}]}}],"dependencies":["{k}"],"features":[]}},
+                  {{"id":"{k}","deps":[],"dependencies":[],"features":[]}}
+                ]
+              }},
+              "workspace_root":"/w","target_directory":"/w/target","version":1
+            }}"#,
+            m = pkg_json("memberproj", "0.1.0", member, "null"),
+            kp = pkg_json("ktstr", "0.17.0", k, crates_io),
+        );
+        let meta: cargo_metadata::Metadata =
+            serde_json::from_str(&json).expect("fixture deserializes");
+        assert_eq!(resolved_ktstr_version(&meta), Some(&v("0.17.0")));
+    }
+
+    /// Serialize env mutation across this binary's tests. nextest runs
+    /// tests as parallel threads in ONE process, and `set_var` is
+    /// process-global; the lib's `lock_env`/`EnvVarGuard` are
+    /// `pub(crate)` to the `ktstr` crate and unreachable from this
+    /// binary crate, so the orchestrator-env tests carry their own
+    /// lock + save/restore guard.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Save-and-restore guard for a single env var; restores the prior
+    /// value (or absence) on drop. Hold the [`env_lock`] for its life.
+    struct EnvVar {
+        key: &'static str,
+        prev: Option<OsString>,
+    }
+
+    impl EnvVar {
+        fn set(key: &'static str, val: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            // SAFETY: `env_lock` serializes env-mutating tests; no other
+            // test reads CARGO_TARGET_DIR / KTSTR_RUNS_ROOT concurrently.
+            unsafe { std::env::set_var(key, val) };
+            Self { key, prev }
+        }
+        fn remove(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            // SAFETY: see `set`.
+            unsafe { std::env::remove_var(key) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            // SAFETY: see `EnvVar::set`.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// The orchestrator stamps `KTSTR_RUNS_ROOT` = `{target}/ktstr`
+    /// (absolute) so child test processes' sidecar writes AND the
+    /// post-run footer reader resolve the SAME dir — the workspace
+    /// empty-footer fix. With an absolute `CARGO_TARGET_DIR` and no
+    /// pre-set override, `install_runs_root_env` must export that path.
+    #[test]
+    fn install_runs_root_env_stamps_absolute_target_subdir() {
+        let _lock = env_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _g0 = EnvVar::remove(ktstr::KTSTR_RUNS_ROOT_ENV);
+        let _g1 = EnvVar::set("CARGO_TARGET_DIR", tmp.path());
+        install_runs_root_env();
+        assert_eq!(
+            std::env::var_os(ktstr::KTSTR_RUNS_ROOT_ENV).map(std::path::PathBuf::from),
+            Some(tmp.path().join("ktstr")),
+            "orchestrator must export the absolute {{target}}/ktstr so the \
+             child writers and the footer reader agree on one dir",
+        );
+    }
+
+    /// A pre-set `KTSTR_RUNS_ROOT` (operator override, or a test that
+    /// pinned its own root) must win — `install_runs_root_env` no-ops
+    /// rather than clobbering it with the cargo target dir.
+    #[test]
+    fn install_runs_root_env_is_idempotent_when_already_set() {
+        let _lock = env_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let preset = tmp.path().join("operator-chosen-root");
+        let _g0 = EnvVar::set(ktstr::KTSTR_RUNS_ROOT_ENV, &preset);
+        let _g1 = EnvVar::set("CARGO_TARGET_DIR", tmp.path());
+        install_runs_root_env();
+        assert_eq!(
+            std::env::var_os(ktstr::KTSTR_RUNS_ROOT_ENV).map(std::path::PathBuf::from),
+            Some(preset),
+            "a pre-set KTSTR_RUNS_ROOT must survive install (no clobber)",
+        );
+    }
+
+    /// A RELATIVE `CARGO_TARGET_DIR` is anchored to the orchestrator's
+    /// cwd and exported ABSOLUTE — so child test processes (which run
+    /// with a different cwd under nextest in a workspace) resolve the
+    /// SAME runs root. A relative export would reintroduce the
+    /// empty-footer split.
+    #[test]
+    fn install_runs_root_env_absolutizes_relative_target() {
+        let _lock = env_lock();
+        let _g0 = EnvVar::remove(ktstr::KTSTR_RUNS_ROOT_ENV);
+        let _g1 = EnvVar::set("CARGO_TARGET_DIR", "relative/target");
+        install_runs_root_env();
+        let got = std::env::var_os(ktstr::KTSTR_RUNS_ROOT_ENV).map(std::path::PathBuf::from);
+        let expected = std::env::current_dir()
+            .unwrap()
+            .join("relative/target/ktstr");
+        assert_eq!(
+            got,
+            Some(expected),
+            "a relative CARGO_TARGET_DIR must be anchored to the orchestrator cwd \
+             and exported absolute, not skipped",
+        );
+    }
+
+    /// `collect_scheduler_binaries` returns only bare `scx_*`
+    /// executables under `{target}/{debug,release}`: build byproducts
+    /// sharing the prefix (`scx_foo.d`), non-`scx_` files, and
+    /// same-named directories are excluded; a missing profile dir is a
+    /// no-op (not an error).
+    #[test]
+    fn collect_scheduler_binaries_filters_to_bare_scx_executables() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No debug/release dirs yet -> nothing collected.
+        assert!(collect_scheduler_binaries(tmp.path()).is_empty());
+
+        let debug = tmp.path().join("debug");
+        std::fs::create_dir(&debug).unwrap();
+        std::fs::write(debug.join("scx_ktstr"), b"x").unwrap(); // collected
+        std::fs::write(debug.join("scx_ktstr.d"), b"x").unwrap(); // .d byproduct -> excluded
+        std::fs::write(debug.join("ktstr"), b"x").unwrap(); // no scx_ prefix -> excluded
+        std::fs::create_dir(debug.join("scx_subdir")).unwrap(); // dir -> excluded by is_file
+
+        assert_eq!(
+            collect_scheduler_binaries(tmp.path()),
+            vec![debug.join("scx_ktstr")],
+            "only the bare scx_* executable is collected",
+        );
+    }
 
     /// Truth table for the flag->scheduler-profile coupling:
     /// EITHER --release (everything release) or --release-scheduler

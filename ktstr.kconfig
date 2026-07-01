@@ -165,6 +165,60 @@ CONFIG_VIRTIO_CONSOLE=y
 CONFIG_VIRTIO_BLK=y
 CONFIG_VIRTIO_NET=y
 
+# -- PCI bus (virtio-PCI transport) --
+# The virtio-PCI transport exposes NICs (and future PCI devices) via a
+# host bridge at 00:00.0 plus an ECAM/CAM config space. PCI must be
+# compiled in for the guest to enumerate ANY of it; the per-VM
+# `pci=off` cmdline (appended when a test does not request PCI) gates
+# scanning at runtime, so a PCI-capable kernel is harmless for non-PCI
+# tests. x86_64_defconfig sets CONFIG_PCI=y, but pin it here so an
+# inherited-defconfig flip or an --extra-kconfig that strips it cannot
+# silently disable the transport — the failure mode would be a guest
+# with no /sys/bus/pci and every PCI device invisible. PCI_MMCONFIG
+# backs ECAM (extended config space, reg >= 256) which the VMM's MCFG
+# table and _SB.PCI0 DSDT window describe; it is `default y` on x86_64
+# when PCI + ACPI are set (arch/x86/Kconfig:2918) and pinned here for
+# the same defense-in-depth reason (base config still works CAM-only if
+# it is dropped). Both are x86 symbols; arm64 PCI uses
+# PCI_HOST_GENERIC, a later increment when arm64 virtio-PCI lands.
+#
+# ACPI is the linchpin of the x86 PCI transport: the guest parses the MCFG
+# (ECAM base), the _SB.PCI0 DSDT _PRT (PCI INTx -> GSI routing), and the
+# FADT PM register blocks only when ACPI is enabled. x86_64_defconfig sets
+# CONFIG_ACPI=y; pin it here for the same defense-in-depth reason — if an
+# inherited-defconfig flip or --extra-kconfig drops it, PCI_MMCONFIG
+# (default y only on PCI && ACPI) silently drops too (ECAM gone) and PCI
+# INTx falls back to legacy MP-table routing with no NIC entry
+# (pci_dev->irq==0 -> vp_find_vqs_intx request_irq fails -> virtnet_probe
+# -EINVAL) — the exact failure the FADT PM blocks + _PRT exist to fix, but
+# now silent. arm64 discovers devices via DT, so a compiled-in ACPI is
+# harmless there (its defconfig also sets =y); this pin is x86's foundation.
+CONFIG_ACPI=y
+CONFIG_PCI=y
+CONFIG_PCI_MMCONFIG=y
+# VIRTIO_PCI is the guest DRIVER that binds virtio devices on the PCI
+# transport: the virtio-net NIC enumerates as a PCI function, and only
+# this driver attaches to it (CONFIG_PCI is the bus; CONFIG_VIRTIO_NET
+# is the transport-agnostic net driver). Without it the guest sees the
+# PCI device but nothing binds, so the NIC's eth* interface never
+# appears. Pinned so an inherited-defconfig flip or an --extra-kconfig
+# strip surfaces as a build error rather than a silent in-guest bind
+# failure.
+CONFIG_VIRTIO_PCI=y
+
+# -- Networking --
+# PACKET: AF_PACKET sockets (net/packet/Kconfig:6 — "communicate directly
+# with network devices ... e.g. tcpdump"), the raw-frame device-level TX/RX
+# path rather than the kernel-internal IP layer. PACKET has no `depends on`
+# of its own (it sits under `if NET`); NET stays on because both arch
+# defconfigs set CONFIG_NET=y. Both defconfigs also already set
+# CONFIG_PACKET=y, so this line is a defense-in-depth pin (like the
+# RANDOMIZE_* pins above), not a first-time enable: it keeps an
+# inherited-defconfig flip from silently dropping the symbol the wide-SMP
+# net-IRQ e2e (tests/wide_smp_net_irq_e2e.rs) relies on (it opens an
+# AF_PACKET raw socket).
+CONFIG_PACKET=y
+
 # -- Filesystems --
 # Btrfs: optional, for DiskConfig::Btrfs when the template-VM
 # lifecycle lands. Requires crypto deps (CRC32, BLAKE2B, SHA256,
@@ -261,6 +315,21 @@ CONFIG_TASK_IO_ACCOUNTING=y
 # /proc/pressure/{io,memory,cpu,irq} via psi_proc_init() and
 # exposes per-cgroup *.pressure files.
 CONFIG_PSI=y
+
+# IRQ_TIME_ACCOUNTING: fine-grained IRQ time accounting. The kernel
+# timestamps each hardirq/softirq transition (irqtime_account_irq,
+# kernel/sched/cputime.c:57) and accounts that time separately instead of
+# charging it to the interrupted task; update_rq_clock_task subtracts the
+# resulting irq_delta (kernel/sched/core.c:817) so rq->clock_task EXCLUDES
+# IRQ time, and update_irq_load_avg feeds rq->avg_irq (core.c:840) — IRQ
+# time becomes a signal distinct from task runtime. Deps (init/Kconfig:614):
+# HAVE_IRQ_TIME_ACCOUNTING — selected by arch/x86/Kconfig:252 and
+# arch/arm64/Kconfig:212 — and !VIRT_CPU_ACCOUNTING_NATIVE, which can never
+# be set on x86_64/arm64 (its prereq HAVE_VIRT_CPU_ACCOUNTING is selected
+# only by s390/powerpc). x86_64_defconfig lacks the symbol so this enables
+# it there; arm64 defconfig already sets it, so on arm64 this is a
+# defense-in-depth pin. =y survives make defconfig + merge + olddefconfig.
+CONFIG_IRQ_TIME_ACCOUNTING=y
 
 # -- Disabled (would alter scheduler behavior) --
 # LOCKDEP: 10-100x lock overhead. Non-representative timing.

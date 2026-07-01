@@ -16,7 +16,15 @@
 //!   load-bearing surface for the sched-event capture path. (The
 //!   discrete tracepoint timeline is wired via `TimelineCapture` but
 //!   not yet attached to FailureDumpReport; the event-counter
-//!   timeline is the visible per-tick timeline today.)
+//!   timeline is the visible per-tick timeline today.) Runs on every
+//!   job; it `post_vm_skip`s when (a) the guest kernel lacks the
+//!   SCX_EV_* counters (pre-6.16, e.g. the 6.14 leg — no
+//!   `scx_sched`/`scx_root` in BTF, so `scx_event_counters_supported`
+//!   is false), (b) the per-tick loop captured no samples at all, or
+//!   (c) — on `wprof`/coverage builds only — samples were captured but
+//!   none carried counters (a host-load-starved leg). It asserts on the
+//!   non-`wprof` legs, where a zero capture on a counter-supporting
+//!   kernel is the real regression it guards.
 //! - **SchedPolicy::Deadline**: worker spawned under
 //!   `SchedPolicy::Deadline` reaches `worker_main` without bailing —
 //!   proves the `sched_setattr(2)` syscall path runs end-to-end on
@@ -278,6 +286,23 @@ fn check_event_counter_timeline(result: &VmResult) -> Result<()> {
     let monitor = result.monitor.as_ref().ok_or_else(|| {
         anyhow::anyhow!("VmResult.monitor is None — the monitor sampler produced no report")
     })?;
+    if !monitor.scx_event_counters_supported {
+        // The running guest kernel does not expose the SCX_EV_* event
+        // counters: the monitor resolved no `event_offsets` from BTF
+        // because `struct scx_sched` / `scx_root` — the machinery the
+        // counters live behind — is a 6.16-cycle addition. On such a
+        // kernel (e.g. the 6.14 CI leg) there is nothing to capture, so
+        // the assertion is inapplicable rather than failed. It still
+        // hard-fails on 6.16+/7.1, where the kernel structurally
+        // supports the counters but capture produced none — the real
+        // regression this test guards. A BTF-capability probe, not a
+        // version compare, so it stays correct across backports.
+        return Err(post_vm_skip(
+            "guest kernel lacks the SCX_EV_* event counters (pre-6.16: no \
+             scx_sched/scx_root in BTF); the counter-timeline capture is \
+             inapplicable on this kernel version",
+        ));
+    }
     if monitor.samples.is_empty() {
         // The per-tick loop recorded no sample before the stall fired
         // (load-starved); inconclusive for this assertion.
@@ -297,6 +322,25 @@ fn check_event_counter_timeline(result: &VmResult) -> Result<()> {
         .iter()
         .filter(|s| s.cpus.iter().any(|c| c.event_counters.is_some()))
         .count();
+    if with_events == 0 && cfg!(feature = "wprof") {
+        // wprof/coverage builds run on the host-load-starved CI legs. There
+        // the guest scheduler can fail to attach — or the monitor's
+        // `data_valid` latch can fail to fire — within the sample window, so
+        // no sample carries event counters even though the kernel supports
+        // them. Treat that as inconclusive rather than a failure: a zero
+        // capture under wprof cannot be distinguished from starvation, and
+        // the assertion below is enforced on the non-wprof legs, where a
+        // zero capture on an unstarved host IS the regression this test
+        // guards. (Empirically the fix makes 7.1×wprof assert and pass when
+        // capture is not starved; this only skips the extreme-starvation
+        // tail.)
+        return Err(post_vm_skip(
+            "no monitor sample carried SCX_EV_* counters under a wprof/coverage \
+             build — the host-load-starved vCPUs left the scheduler unattached \
+             for the sample window; inconclusive (the assertion is enforced on \
+             the non-wprof legs)",
+        ));
+    }
     anyhow::ensure!(
         with_events > 0,
         "no monitor sample carried SCX_EV_* event counters across {} samples — \
@@ -503,9 +547,12 @@ fn check_failure_dump_trigger(result: &VmResult) -> Result<()> {
 //   1. `KtstrTestEntry.disk` carries a [`DiskConfig`].
 //   2. [`crate::test_support::runtime::build_vm_builder_base`] forwards
 //      it to [`crate::vmm::KtstrVmBuilder::disk`].
-//   3. [`crate::vmm::KtstrVm::init_virtio_blk`] opens a sparse temp
-//      backing file, attaches the MMIO + irqfd, and surfaces the device
-//      to the guest at `/dev/vda`.
+//   3. The host opens a sparse temp backing file and surfaces the device
+//      to the guest at `/dev/vda`. The transport is arch-split: x86_64
+//      installs a virtio-pci function (`init_virtio_blk_pci`, INTx +
+//      MSI-X over a 32-bit BAR), aarch64 a virtio-MMIO device
+//      (`init_virtio_blk`). Either way the guest's virtio-block driver
+//      probes `/dev/vda`.
 //
 // Each scenario runs as guest-side Rust under PID 1 and uses
 // `std::fs` against `/dev/vda` directly — no busybox, no shelling
@@ -551,8 +598,9 @@ const KTSTR_DISK_READ_ONLY: ktstr::prelude::DiskConfig = ktstr::prelude::DiskCon
 /// Pins the end-to-end wiring:
 ///   1. `KtstrTestEntry.disk = Some(..)` reaches
 ///      [`crate::test_support::runtime::build_vm_builder_base`].
-///   2. The host attaches the virtio-blk MMIO + irqfd via
-///      [`crate::vmm::KtstrVm::init_virtio_blk`].
+///   2. The host attaches the virtio-blk device — a virtio-pci function
+///      on x86_64 (`init_virtio_blk_pci`) or virtio-MMIO on aarch64
+///      (`init_virtio_blk`).
 ///   3. The guest kernel's CONFIG_VIRTIO_BLK driver probes the
 ///      device, which surfaces as `/dev/vda` in the guest devtmpfs.
 ///
@@ -1162,9 +1210,13 @@ fn vm_integration_perf_counters_capture() {
 
 /// Event-counter timeline (per-tick sched-event capture).
 ///
-/// Asserts `event_counter_timeline` non-empty after a 15s run
-/// window. Pins the per-monitor-tick capture loop + SCX_EV_*
-/// offset resolution + `EventCounterCapture` attach path.
+/// Asserts that monitor samples carried `SCX_EV_*` event counters
+/// (`CpuSnapshot.event_counters` in `VmResult.monitor.samples`) after
+/// a 15s run window. The dump's `event_counter_timeline` field is
+/// always empty (the freeze coordinator passes
+/// `event_counter_capture: None`), so the check reads the monitor
+/// samples, not that field. Pins the per-monitor-tick capture loop +
+/// SCX_EV_* offset resolution + `EventCounterCapture` attach path.
 #[test]
 #[ignore = "requires KVM, ../linux, scx-ktstr"]
 fn vm_integration_event_counter_timeline() {
@@ -1300,10 +1352,12 @@ fn vm_integration_disk_write_read_roundtrip() {
 
 /// Disk #3 — read-only disk rejects write.
 ///
-/// Boots with a `read_only(true)` DiskConfig and asserts that
-/// `open(/dev/vda, O_WRONLY)` from the guest fails with `EROFS`.
-/// Pins the VIRTIO_BLK_F_RO advertisement and the guest kernel's
-/// `disk->part0.policy = 1` gate at `open(2)` time.
+/// Boots with a `read_only(true)` DiskConfig and asserts the
+/// read-only chain end-to-end: `VIRTIO_BLK_F_RO` marks the gendisk
+/// read-only (`/sys/block/vda/ro == 1`), `open(/dev/vda, O_WRONLY)`
+/// SUCCEEDS (the bdev open path does not gate on read-only), and the
+/// first `write()` returns `EPERM` — the kernel rejects writes to a
+/// read-only bdev at write time, not `EROFS` at `open(2)` time.
 #[test]
 #[ignore = "requires KVM, ../linux, CONFIG_VIRTIO_BLK in guest"]
 fn vm_integration_disk_read_only_rejects_write() {

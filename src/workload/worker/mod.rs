@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::affinity::{sched_getcpu, set_thread_affinity};
-use super::config::{AluWidth, FutexLockMode, MemPolicy, MpolFlags, SchedPolicy, WakeMechanism};
+use super::config::{
+    AluWidth, FutexLockMode, MemPolicy, MpolFlags, ReapMode, SchedPolicy, WakeMechanism,
+};
 use super::spawn::{
     FAN_OUT_POST_WAKE_SPIN_ITERS, FUTEX_WAIT_TIMEOUT, Migration, PhaseSlice, WorkerReport,
     apply_mempolicy_with_flags, apply_nice, build_nodemask, stop_requested,
@@ -127,6 +129,7 @@ fn build_phase_slice(
     cpus_used: std::collections::BTreeSet<usize>,
     numa_pages: std::collections::BTreeMap<usize, u64>,
     wake: (Vec<u64>, u64),
+    timer: (Vec<u64>, u64),
 ) -> PhaseSlice {
     let cpu_delta = cpu_end_ns.saturating_sub(cpu_start_ns);
     let (run_delay_ns, schedstat_cpu_time_ns) = match (schedstat_start, schedstat_end) {
@@ -140,6 +143,8 @@ fn build_phase_slice(
         cpus_used,
         wake_latencies_ns: wake.0,
         wake_sample_total: wake.1,
+        timer_latencies_ns: timer.0,
+        timer_sample_total: timer.1,
         run_delay_ns,
         off_cpu_ns: wall_ns.saturating_sub(cpu_delta),
         wall_ns,
@@ -150,6 +155,10 @@ fn build_phase_slice(
         vmstat_numa_pages_migrated: vmstat_migrated_end.saturating_sub(vmstat_migrated_start),
         max_gap_ms: max_gap_ns / 1_000_000,
         max_gap_cpu,
+        // Generic (non-schbench) drain path: the schbench engine emits its own
+        // PhaseSlices directly in the WorkType::Schbench arm.
+        schbench: None,
+        taobench: None,
     }
 }
 
@@ -221,6 +230,10 @@ unsafe fn futex_wait(futex_ptr: *mut u32, expected: u32, ts: &libc::timespec) {
 // without qualification, matching the pre-split call sites.
 mod io;
 use io::*;
+
+// AF_PACKET traffic sender for WorkType::NetTraffic, split out to keep this
+// file under the line budget. Items are qualified at the call site.
+mod net_traffic;
 
 /// Derive a worker's off-CPU time from its wall-clock and CPU-time
 /// totals: `off_cpu_ns = wall_time_ns - cpu_time_ns`, saturating at
@@ -466,6 +479,27 @@ pub(super) fn worker_main(
     }
     // Benchmarking: per-wakeup latency samples (reservoir-sampled) and iteration counter.
     let mut wake = WakeRec::new();
+    // TimerLatency (cyclictest) reservoir — a distinct WakeRec instance feeding
+    // the distinct timer_latencies_ns carrier, parallel to `wake`. Only the
+    // WorkType::TimerLatency arm pushes into it; every other variant leaves it
+    // empty (like `wake` for non-blocking variants).
+    let mut timer = WakeRec::new();
+    // Absolute monotonic deadline (ns) for the TimerLatency cyclictest loop:
+    // 0 = unseeded (seeded one interval out on the first TimerLatency cycle),
+    // then accumulated `+= interval_ns` so a late wake surfaces as latency
+    // (CO-free). CLOCK_MONOTONIC ns-since-boot is never 0, so 0 is a safe
+    // unseeded sentinel.
+    let mut timer_next_deadline_ns: u64 = 0;
+    // NetTraffic (AF_PACKET) sender — lazily opened on the first NetTraffic
+    // cycle (post-fork) and held across iterations. `None` + !failed = not yet
+    // attempted; `Some` = ready; failed = no NIC / setup error → LOUD no-op.
+    let mut net_sender: Option<net_traffic::NetTrafficSender> = None;
+    let mut net_setup_failed = false;
+    // IrqWake receiver — lazily opened on the first IrqWake cycle (post-fork) by
+    // the pos==1 worker; the pos==0 worker reuses `net_sender` above. Same
+    // None/!failed/Some/failed lifecycle as `net_sender`.
+    let mut irq_receiver: Option<net_traffic::IrqWakeReceiver> = None;
+    let mut irq_recv_setup_failed = false;
     // Per-iteration wall-clock compute duration samples
     // (reservoir-sampled at the same cap as wake_latencies_ns).
     // Populated by AluHot, SmtSiblingSpin, IpcVariance; all other
@@ -477,7 +511,7 @@ pub(super) fn worker_main(
     // once at start via sched_getaffinity (read_effective_cpus).
     // Custom: hand the user function a WorkerCtx. Affinity and
     // sched_policy are already applied above.
-    if let WorkType::Custom { run, .. } = &work_type {
+    if let WorkType::Custom { name, run, cfg, .. } = &work_type {
         // The ctx exposes the same effective cpuset and cgroup-sibling
         // pids the built-in affinity-churn variants compute, so a
         // custom probe need not re-roll sched_getaffinity or
@@ -485,8 +519,17 @@ pub(super) fn worker_main(
         // control to the user function.
         let cpus = read_effective_cpus();
         let sibling_pids = read_sibling_pids();
-        let ctx = WorkerCtx::new(stop, &cpus, &sibling_pids);
-        return run.call(&ctx);
+        let cgroup_dir = read_self_cgroup_dir();
+        let ctx = WorkerCtx::new(stop, &cpus, &sibling_pids, cgroup_dir.as_deref(), *cfg);
+        let report = run.call(&ctx);
+        // Telltale for the work_units-vs-iterations footgun: a closure that
+        // counted work but left the outer-loop counter at zero reads as zero
+        // throughput (total_iterations / the per-worker rates read
+        // `iterations`). Warn once; do not mutate the verbatim report.
+        if custom_iterations_telltale(&report) {
+            warn_custom_iterations_zero_once(name);
+        }
+        return report;
     }
 
     let affinity_churn_cpus: Vec<usize> = if matches!(
@@ -570,9 +613,31 @@ pub(super) fn worker_main(
     // on the next iteration.
     let cgroup_churn_paths: Vec<String> = if let WorkType::CgroupChurn { groups, .. } = &work_type {
         let groups_count = (*groups).max(1);
-        (0..groups_count)
-            .map(|i| format!("/sys/fs/cgroup/wt-cgroup-churn-{i}/cgroup.procs"))
-            .collect()
+        // Resolve the workload cgroup root the framework places test cgroups
+        // under (default /sys/fs/cgroup/ktstr; per-test override via
+        // `workload_root_cgroup` stamped into /workload_root_cgroup) — the same
+        // resolver the host-side CgroupManager uses, so the auto-created paths
+        // below and the dispatch paths agree by construction. (Previously a
+        // hardcoded top-level /sys/fs/cgroup/wt-cgroup-churn-<i> sat outside
+        // any managed root and was never created by the framework.)
+        let root = crate::test_support::resolve_cgroup_root(&[]);
+        // Auto-provision the rotation cgroups as LEAF cgroups under the root.
+        // `create_cgroup` on a single-component name validates + mkdirs and
+        // leaves the leaf's `cgroup.subtree_control` EMPTY (enable_subtree_cpuset
+        // no-ops for <2 components), which the kernel no-internal-process
+        // constraint requires: `cgroup_migrate_vet_dst` returns -EBUSY for a
+        // `cgroup.procs` migration into a dst whose subtree_control is set
+        // (kernel/cgroup/cgroup.c). Best-effort — a create failure (e.g. a
+        // non-root host-unit context) falls through to the dispatch arm's
+        // lazy-open warn-and-continue, so the variant stays observable.
+        let mgr = crate::cgroup::CgroupManager::new(&root);
+        for i in 0..groups_count {
+            let name = churn_cgroup_name(i);
+            if let Err(e) = mgr.create_cgroup(&name) {
+                tracing::warn!(?e, %name, %root, "CgroupChurn: auto-create failed");
+            }
+        }
+        churn_cgroup_procs_paths(&root, groups_count)
     } else {
         Vec::new()
     };
@@ -590,6 +655,67 @@ pub(super) fn worker_main(
     } else {
         (0..cgroup_churn_paths.len()).map(|_| None).collect()
     };
+
+    // CgroupAttachStorm: resolve the sibling `<dest>/cgroup.procs`
+    // migration target once — a SIBLING of the worker's own cgroup,
+    // resolved with the same helper `WorkerCtx::open_sibling_cgroup_procs`
+    // uses (the shared `read_self_cgroup_dir` resolver + name validation +
+    // `<parent>/<dest>/cgroup.procs`), so the built-in arm and the
+    // Custom-worker affordance address the same target by construction.
+    // Pre-flight its writability and, under `ReapMode::SigIgn`, install
+    // `SIGCHLD = SIG_IGN` once so each forked child auto-reaps concurrent
+    // with the parent's write. The path is resolved here; the dispatch arm
+    // caches the fd lazily and invalidates it on error (CgroupChurn
+    // posture).
+    let (cgroup_attach_storm_path, cgroup_attach_storm_writable): (
+        Option<std::path::PathBuf>,
+        bool,
+    ) = if let WorkType::CgroupAttachStorm { dest, reap } = &work_type {
+        match resolve_sibling_cgroup_procs(read_self_cgroup_dir().as_deref(), dest) {
+            Ok(path) => {
+                // Pre-flight writability (fail-loud per no-silent-drops): an
+                // unwritable dest migrates nothing and the scheduler
+                // "survives" vacuously. One warn + a no-op gate keeps the
+                // worker observable without panicking.
+                let writable = match std::fs::OpenOptions::new().write(true).open(&path) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        tracing::warn!(
+                            ?e,
+                            path = %path.display(),
+                            "CgroupAttachStorm: dest cgroup.procs not writable — storm will no-op"
+                        );
+                        false
+                    }
+                };
+                if writable && matches!(reap, ReapMode::SigIgn) {
+                    // SAFETY: signal disposition is process-local; this worker
+                    // is its own process under CloneMode::Fork (Thread mode is
+                    // rejected at spawn). SIG_IGN here auto-reaps only the
+                    // worker's own forked children; the spawn side waitpid's
+                    // the WORKER pid, which this disposition does not affect.
+                    unsafe {
+                        libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+                    }
+                }
+                (Some(path), writable)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    ?e,
+                    %dest,
+                    "CgroupAttachStorm: could not resolve sibling dest cgroup — storm will no-op"
+                );
+                (None, false)
+            }
+        }
+    } else {
+        (None, false)
+    };
+    // Lazy single-dest fd cache + a reusable child-pid scratch buffer so
+    // the dispatch arm allocates nothing per iteration after warm-up.
+    let mut cgroup_attach_storm_file: Option<std::fs::File> = None;
+    let mut cgroup_attach_storm_pid_buf = String::new();
 
     // NumaWorkingSetSweep: pre-compute one (nodemask, maxnode) pair
     // per entry in `target_nodes`. The dispatch arm rotates through
@@ -648,6 +774,9 @@ pub(super) fn worker_main(
     };
     let mut observed_change = false;
     let mut phase_slices: Vec<PhaseSlice> = Vec::new();
+    // Whole-run taobench aggregate (Some only when this is a Taobench worker),
+    // shipped in the report for the host-side run-level qps/hit Rate keys.
+    let mut taobench_whole: Option<crate::workload::taobench::run::TaobenchStats> = None;
     let mut phase_start = start;
     let mut phase_cpu_start = thread_cpu_time_ns();
     let mut phase_schedstat_start = schedstat_start;
@@ -1453,6 +1582,81 @@ pub(super) fn worker_main(
                 }
                 last_iter_time = Instant::now();
                 iterations += 1;
+            }
+            WorkType::Schbench { ref config } => {
+                // Run schbench's full message/worker thread topology to
+                // completion -- run() blocks until `stop` -- driven by this one
+                // ktstr worker process. The engine is phase-aware: it watches
+                // the shared `phase_epoch` and splits its histograms at each
+                // step boundary (e.g. scx -> detached-EEVDF), returning one
+                // SchbenchPhaseStats per phase. Each becomes a PhaseSlice here.
+                //
+                // The generic phase machinery never fires for Schbench: run()
+                // blocks until stop, so this outer loop runs exactly ONCE,
+                // `observed_change` stays false, and the generic drain-on-change
+                // / final drain are skipped. These hand-pushed slices are the
+                // only ones, so there is no double-count.
+                let progress = AtomicU64::new(0);
+                let pe = if phase_epoch.is_null() {
+                    None
+                } else {
+                    // SAFETY: `phase_epoch` is the shared per-phase word the
+                    // parent set up for this (backdrop) handle; valid for the
+                    // worker's lifetime and only read here (shared access).
+                    Some(unsafe { &*phase_epoch })
+                };
+                let outcome = crate::workload::schbench::run::run(config, stop, &progress, pe);
+                work_units = work_units.saturating_add(outcome.whole_run.loop_count);
+                for (epoch, stats) in outcome.phases {
+                    phase_slices.push(PhaseSlice {
+                        phase_epoch: epoch,
+                        schbench: Some(stats),
+                        ..Default::default()
+                    });
+                }
+                iterations += 1;
+                // run() owns the whole worker lifetime and only returns once
+                // `stop` is set, so this outer loop runs exactly once. break out
+                // BEFORE the generic drain block below: on fall-through it would
+                // fire spuriously — `cur_epoch` is the spawn-time epoch but the
+                // scenario bumped `phase_epoch` across steps during run(), so
+                // `epoch_changed` would push a generic PhaseSlice AND set
+                // `observed_change`, causing the post-loop final drain to push a
+                // second — both polluting the per-epoch buckets alongside the
+                // schbench slices above. The post-loop report build still runs.
+                break;
+            }
+            WorkType::Taobench { ref config } => {
+                // Mirror the Schbench arm: run() blocks until `stop`, is
+                // phase-aware (watches `phase_epoch`, splitting its per-phase op
+                // counters at each step boundary), and returns one
+                // TaobenchStats per phase. The generic phase machinery never
+                // fires (this loop runs exactly once); break before the generic
+                // drain so it cannot push a duplicate slice.
+                let progress = AtomicU64::new(0);
+                let pe = if phase_epoch.is_null() {
+                    None
+                } else {
+                    // SAFETY: as in the Schbench arm — `phase_epoch` is the
+                    // shared per-phase word the parent set up for this backdrop
+                    // handle; valid for the worker's lifetime, read-only here.
+                    Some(unsafe { &*phase_epoch })
+                };
+                let outcome = crate::workload::taobench::run::run(config, stop, &progress, pe);
+                work_units = work_units.saturating_add(outcome.whole_run.total_ops());
+                // Ship the engine's authoritative whole-run aggregate for the
+                // host-side run-level qps/hit Rate keys (one taobench run per
+                // worker — the arm breaks below, so this is set at most once).
+                taobench_whole = Some(outcome.whole_run);
+                for (epoch, stats) in outcome.phases {
+                    phase_slices.push(PhaseSlice {
+                        phase_epoch: epoch,
+                        taobench: Some(stats),
+                        ..Default::default()
+                    });
+                }
+                iterations += 1;
+                break;
             }
             WorkType::PageFaultChurn {
                 region_kib,
@@ -2522,15 +2726,16 @@ pub(super) fn worker_main(
             }
             WorkType::CgroupChurn { groups, cycle_ms } => {
                 // Rotate the worker's cgroup membership by writing
-                // tid to `wt-cgroup-churn-<i>/cgroup.procs` under
-                // the worker's parent cgroup. Drives
-                // `sched_move_task` and the `scx_cgroup_move_task`
-                // ops callback. The host-side scenario harness is
-                // responsible for creating the sibling cgroups; if
-                // they are absent the open() fails and the worker
-                // logs and continues spinning so the variant is
-                // observable but does not panic on a misconfigured
-                // topology.
+                // tid to `wt-cgroup-churn-<i>/cgroup.procs` under the
+                // resolved workload cgroup root (default
+                // /sys/fs/cgroup/ktstr, or the per-test
+                // `workload_root_cgroup`). Drives `sched_move_task`
+                // and the `scx_cgroup_move_task` ops callback. The
+                // worker auto-creates these leaf cgroups at entry (see
+                // the `cgroup_churn_paths` setup); if a create or open
+                // fails the worker logs and continues spinning so the
+                // variant is observable but does not panic on a
+                // misconfigured topology.
                 //
                 // The path strings and the `tid\n` write payload are
                 // pre-formatted at worker entry into
@@ -2604,6 +2809,132 @@ pub(super) fn worker_main(
                 spin_burst(&mut work_units, 256);
                 last_iter_time = Instant::now();
                 iterations += 1;
+            }
+            WorkType::CgroupAttachStorm { reap, .. } => {
+                // Fork a transient child and migrate it — the whole process
+                // — into the sibling `<dest>/cgroup.procs` by writing its
+                // pid, while the child immediately `_exit`s. The write drives
+                // `cgroup_attach_task`'s threadgroup walk →
+                // `TRACE_CGROUP_PATH(attach_task)` (kernel/cgroup/cgroup.c);
+                // racing the child's teardown is the leader-acquire surface a
+                // scheduler's cgroup-attach handler must survive. The dest
+                // path is resolved at worker entry; the fd is cached lazily
+                // and invalidated on error (mirrors CgroupChurn), and the
+                // child pid is formatted into a reused scratch buffer so the
+                // hot path allocates nothing after warm-up.
+                if !cgroup_attach_storm_writable {
+                    // The pre-flight warn already fired (fail-loud per
+                    // no-silent-drops). No-op the storm WITHOUT bumping
+                    // `work_units` so a caller can detect the vacuous
+                    // survive (work_units stays 0); advance `iterations`
+                    // and yield so the loop still progresses to the stop
+                    // check.
+                    unsafe {
+                        libc::sched_yield();
+                    }
+                    iterations += 1;
+                } else {
+                    let pid = unsafe { libc::fork() };
+                    match pid {
+                        -1 => {
+                            // EAGAIN under fork pressure — sched_yield to back
+                            // off, then count the cycle. Bumps the same
+                            // work_units + iterations as ForkExit's -1 arm but
+                            // adds a yield, since the storm forks at a higher
+                            // rate and benefits from ceding the CPU on EAGAIN.
+                            unsafe {
+                                libc::sched_yield();
+                            }
+                            work_units = std::hint::black_box(work_units.wrapping_add(1));
+                            iterations += 1;
+                        }
+                        0 => {
+                            // Child: async-signal-safe immediate exit, racing
+                            // the parent's write + (SigIgn) auto-reap.
+                            unsafe { libc::_exit(0) };
+                        }
+                        child => {
+                            // Parent: write the child pid to the sibling dest
+                            // `cgroup.procs` (lazy-open + invalidate on error,
+                            // like CgroupChurn).
+                            if cgroup_attach_storm_file.is_none()
+                                && let Some(path) = &cgroup_attach_storm_path
+                            {
+                                match std::fs::OpenOptions::new().write(true).open(path) {
+                                    Ok(f) => cgroup_attach_storm_file = Some(f),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            ?e,
+                                            path = %path.display(),
+                                            "CgroupAttachStorm open failed"
+                                        );
+                                    }
+                                }
+                            }
+                            if let Some(f) = cgroup_attach_storm_file.take() {
+                                use std::fmt::Write as _;
+                                use std::io::Write as _;
+                                cgroup_attach_storm_pid_buf.clear();
+                                // Infallible for `String`; reuses the buffer's
+                                // retained capacity after the first iteration.
+                                let _ = write!(cgroup_attach_storm_pid_buf, "{child}");
+                                match (&f).write_all(cgroup_attach_storm_pid_buf.as_bytes()) {
+                                    Ok(()) => {
+                                        cgroup_attach_storm_file = Some(f);
+                                    }
+                                    Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {
+                                        // Expected ReapMode::SigIgn-race
+                                        // outcome: the child `_exit`ed and
+                                        // auto-reaped before the migrate write
+                                        // resolved its pid, so the kernel
+                                        // resolves the pid via
+                                        // find_task_by_vpid -> NULL ->
+                                        // ERR_PTR(-ESRCH) (kernel/cgroup/
+                                        // cgroup.c, propagated through
+                                        // __cgroup_procs_write). The dest
+                                        // cgroup is still live, so KEEP the
+                                        // cached fd (no re-open) and do NOT
+                                        // warn — the write losing the race to
+                                        // the child exit is the storm working,
+                                        // not a failure. The fork+attempt is
+                                        // still counted as a cycle below.
+                                        cgroup_attach_storm_file = Some(f);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            ?e,
+                                            "CgroupAttachStorm write failed; invalidating cached fd"
+                                        );
+                                        // A genuine dead fd (e.g. -ENODEV from
+                                        // an rmdir'd dest kernfs node, surfaced
+                                        // by cgroup_kn_lock_live): dropping `f`
+                                        // closes it so the next iteration
+                                        // re-opens, picking up a recreate.
+                                    }
+                                }
+                            }
+                            match reap {
+                                ReapMode::Waitpid => {
+                                    // Non-racing control: block until the
+                                    // child is reaped, feeding the interval
+                                    // into the wake reservoir on the same
+                                    // contract as ForkExit's waitpid.
+                                    let mut status = 0i32;
+                                    let before_wait = Instant::now();
+                                    unsafe { libc::waitpid(child, &mut status, 0) };
+                                    wake.push(before_wait.elapsed().as_nanos() as u64);
+                                }
+                                ReapMode::SigIgn => {
+                                    // SIGCHLD = SIG_IGN (installed at entry)
+                                    // auto-reaps the child; the write above
+                                    // races its exit. Nothing to do here.
+                                }
+                            }
+                            work_units = std::hint::black_box(work_units.wrapping_add(1));
+                            iterations += 1;
+                        }
+                    }
+                }
             }
             WorkType::SignalStorm {
                 signals_per_iter,
@@ -3083,6 +3414,217 @@ pub(super) fn worker_main(
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
+            WorkType::TimerLatency { interval_us } => {
+                // Cyclictest absolute-deadline loop. The deadline accumulates
+                // (`timer_next_deadline_ns += interval_ns`, NOT `now + interval`)
+                // so a late wake surfaces AS latency instead of shifting the next
+                // period out — the coordinated-omission-free measurement
+                // cyclictest makes. `interval_us` is validated > 0 at spawn (a
+                // zero interval would never advance the deadline). One latency
+                // sample per cycle into the DISTINCT `timer` reservoir
+                // (timer_latencies_ns), never the shared `wake`.
+                //
+                // Kernel path: clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)
+                // → hrtimer_nanosleep(HRTIMER_MODE_ABS) → do_nanosleep
+                // schedule()s the task; on expiry hrtimer_wakeup →
+                // wake_up_process → try_to_wake_up re-runs it. The measured
+                // latency is the scheduler's wake-to-on-CPU delay for a
+                // timer-woken task.
+                let interval_ns = interval_us.saturating_mul(1_000);
+                // Seed the first absolute deadline one interval out. A failed
+                // CLOCK_MONOTONIC read (warned once in clock_gettime_ns) skips
+                // this cycle rather than recording a garbage latency; the outer
+                // loop retries.
+                if timer_next_deadline_ns == 0 {
+                    match clock_gettime_ns(libc::CLOCK_MONOTONIC) {
+                        Some(now_ns) => {
+                            timer_next_deadline_ns = now_ns.saturating_add(interval_ns);
+                        }
+                        None => {
+                            iterations += 1;
+                            continue;
+                        }
+                    }
+                }
+                let deadline = libc::timespec {
+                    tv_sec: (timer_next_deadline_ns / 1_000_000_000) as libc::time_t,
+                    tv_nsec: (timer_next_deadline_ns % 1_000_000_000) as libc::c_long,
+                };
+                // SAFETY: `deadline` is a valid timespec (tv_nsec in [0, 1e9) by
+                // construction); rmtp is null because TIMER_ABSTIME sleeps to the
+                // absolute deadline (no remaining-time bookkeeping on EINTR — the
+                // post-sleep stop check exits the loop).
+                let rc = unsafe {
+                    libc::clock_nanosleep(
+                        libc::CLOCK_MONOTONIC,
+                        libc::TIMER_ABSTIME,
+                        &deadline,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if stop_requested(stop) {
+                    iterations += 1;
+                    continue;
+                }
+                // Record latency only on a clean wake (rc == 0). A non-zero rc is
+                // EINTR (a signal landed — the stop check above handles
+                // shutdown); an interrupted sleep did not reach the deadline, so
+                // its "latency" is meaningless and must not enter the histogram.
+                if rc == 0
+                    && let Some(wake_ns) = clock_gettime_ns(libc::CLOCK_MONOTONIC)
+                {
+                    // Floor at 0: a wake observed at/before the deadline
+                    // (clock granularity) is 0 latency, never a wrapping u64
+                    // subtract — the same delta>=0 discipline the schbench
+                    // engine uses.
+                    timer.push(wake_ns.saturating_sub(timer_next_deadline_ns));
+                }
+                // Accumulate the absolute deadline by exactly one interval (never
+                // re-base on `now`) — the CO-free invariant.
+                timer_next_deadline_ns = timer_next_deadline_ns.saturating_add(interval_ns);
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
+            WorkType::NetTraffic {
+                interval_us,
+                frame_bytes,
+            } => {
+                // AF_PACKET traffic generator. The fd is opened lazily on the
+                // first cycle (post-fork — a pre-fork fd would be shared across
+                // workers) and held across iterations. No NIC / setup error →
+                // a LOUD no-op (warn once, work_units stays 0), per the variant
+                // contract. The send recipe lives in net_traffic.rs.
+                if net_sender.is_none() && !net_setup_failed {
+                    match net_traffic::NetTrafficSender::setup(frame_bytes) {
+                        Ok(s) => net_sender = Some(s),
+                        Err(e) => {
+                            net_traffic::warn_net_traffic_setup_failed_once(&e);
+                            net_setup_failed = true;
+                        }
+                    }
+                }
+                if let Some(sender) = net_sender.as_ref() {
+                    // Each frame is one virtio TX kick → one RX-completion
+                    // hardirq + NAPI softirq via the in-VMM loopback. Count
+                    // only successful sends (a timed-out full-ring send did no
+                    // work).
+                    if sender.send_one() {
+                        work_units = std::hint::black_box(work_units.wrapping_add(1));
+                    }
+                    // Optional pacing for a steady IRQ rate; interval_us == 0 is
+                    // a continuous burst (max softirq pressure). A workload
+                    // sleep, like IdleChurn — not a control-flow wait.
+                    if interval_us > 0 {
+                        let req = libc::timespec {
+                            tv_sec: (interval_us / 1_000_000) as libc::time_t,
+                            tv_nsec: ((interval_us % 1_000_000) * 1_000) as libc::c_long,
+                        };
+                        // SAFETY: req is a valid timespec; rmtp null (EINTR just
+                        // shortens the pause — the loop's stop check ends it).
+                        unsafe {
+                            libc::nanosleep(&req, std::ptr::null_mut());
+                        }
+                    }
+                } else {
+                    // No NIC: LOUD no-op (work_units stays 0; the warn already
+                    // fired). Yield so the loop still reaches the stop check
+                    // without busy-spinning — mirrors the CgroupAttachStorm
+                    // no-op.
+                    unsafe {
+                        libc::sched_yield();
+                    }
+                }
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
+            WorkType::IrqWake {
+                interval_us,
+                frame_bytes,
+            } => {
+                // Paired sender / receiver, split by `pos` (the shared-mem tuple;
+                // needs_shared_mem opts in solely to receive it). pos==0 reuses the
+                // NetTraffic AF_PACKET sender; pos==1 blocks in recvfrom and is
+                // woken from NET_RX softirq, recording the recvfrom block-to-return
+                // duration (a liveness proxy, not a precise wake-to-run latency —
+                // see below).
+                let pos = match futex {
+                    Some((_, pos)) => pos,
+                    None => break,
+                };
+                if pos == 0 {
+                    // Sender side: reuse the NetTraffic sender (lazy post-fork
+                    // setup; no NIC -> LOUD no-op). Each frame is a virtio TX kick
+                    // the in-VMM loopback echoes into the receiver's RX.
+                    if net_sender.is_none() && !net_setup_failed {
+                        match net_traffic::NetTrafficSender::setup(frame_bytes) {
+                            Ok(s) => net_sender = Some(s),
+                            Err(e) => {
+                                net_traffic::warn_irq_wake_setup_failed_once(&e);
+                                net_setup_failed = true;
+                            }
+                        }
+                    }
+                    if let Some(sender) = net_sender.as_ref() {
+                        if sender.send_one() {
+                            work_units = std::hint::black_box(work_units.wrapping_add(1));
+                        }
+                        // Optional pacing: interval_us == 0 saturates the softirq
+                        // budget (wake serviced by ksoftirqd); > 0 paces so the
+                        // wake runs inline in softirq. A workload sleep, not a
+                        // control-flow wait.
+                        if interval_us > 0 {
+                            let req = libc::timespec {
+                                tv_sec: (interval_us / 1_000_000) as libc::time_t,
+                                tv_nsec: ((interval_us % 1_000_000) * 1_000) as libc::c_long,
+                            };
+                            // SAFETY: req is a valid timespec; rmtp null (EINTR
+                            // just shortens the pause — the loop's stop check ends
+                            // it).
+                            unsafe {
+                                libc::nanosleep(&req, std::ptr::null_mut());
+                            }
+                        }
+                    } else {
+                        unsafe {
+                            libc::sched_yield();
+                        }
+                    }
+                } else {
+                    // Receiver side: block in recvfrom; the sender's frame arrives
+                    // via NET_RX softirq, whose sock_def_readable -> ttwu wakes us.
+                    // before_block -> recv -> wake.push records the block-to-return
+                    // duration: a LIVENESS proxy (a non-empty reservoir means
+                    // softirq-delivered frames scheduled the receiver), NOT a
+                    // precise wake-to-run latency — the magnitude includes the
+                    // inter-frame pacing wait, and at interval_us==0 a recv may
+                    // return an already-queued frame without blocking. The rising
+                    // softirq IRQ count is the authoritative "softirq fired" proof.
+                    if irq_receiver.is_none() && !irq_recv_setup_failed {
+                        match net_traffic::IrqWakeReceiver::setup() {
+                            Ok(r) => irq_receiver = Some(r),
+                            Err(e) => {
+                                net_traffic::warn_irq_wake_setup_failed_once(&e);
+                                irq_recv_setup_failed = true;
+                            }
+                        }
+                    }
+                    if let Some(receiver) = irq_receiver.as_mut() {
+                        let before_block = Instant::now();
+                        if receiver.recv_one() {
+                            wake.push(before_block.elapsed().as_nanos() as u64);
+                            work_units = std::hint::black_box(work_units.wrapping_add(1));
+                        }
+                        // A timed-out recv (no frame within SO_RCVTIMEO) records
+                        // nothing; the loop re-checks stop and re-blocks.
+                    } else {
+                        unsafe {
+                            libc::sched_yield();
+                        }
+                    }
+                }
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
             WorkType::AluHot { width } => {
                 // Resolve the configured width on first iteration.
                 // `Widest` picks the widest variant the host supports;
@@ -3343,6 +3885,7 @@ pub(super) fn worker_main(
                         std::mem::take(&mut phase_cpus_used),
                         phase_numa,
                         wake.drain_phase(),
+                        timer.drain_phase(),
                     ));
                     cur_epoch = new_epoch;
                     observed_change = true;
@@ -3468,6 +4011,7 @@ pub(super) fn worker_main(
             std::mem::take(&mut phase_cpus_used),
             numa_pages.clone(),
             wake.drain_phase(),
+            timer.drain_phase(),
         ));
     }
 
@@ -3487,6 +4031,8 @@ pub(super) fn worker_main(
         wake_sample_total: wake.run_total,
         iteration_costs_ns,
         iteration_cost_sample_total: iteration_cost_sample_count,
+        timer_latencies_ns: timer.run,
+        timer_sample_total: timer.run_total,
         iterations,
         schedstat_run_delay_ns: ss_delay_delta,
         schedstat_run_count: ss_ts_delta,
@@ -3527,6 +4073,7 @@ pub(super) fn worker_main(
         group_idx,
         affinity_error,
         phase_slices,
+        taobench_whole,
     }
 }
 
@@ -3639,25 +4186,142 @@ fn read_effective_cpus() -> Vec<usize> {
     }
 }
 
+/// Parse a cgroup-v2 relative path from the contents of
+/// `/proc/self/cgroup` — the single `0::/<rel>` line. Returns the
+/// `<rel>` portion (e.g. `/ktstr/cgA`), trimmed; `None` when no `0::`
+/// line is present (a cgroup-v1-only host). Pure so it is testable on a
+/// literal without a live `/proc`.
+fn parse_cgroup_rel(proc_self_cgroup: &str) -> Option<String> {
+    proc_self_cgroup
+        .lines()
+        .find_map(|l| l.strip_prefix("0::").map(|s| s.trim().to_string()))
+}
+
+/// The calling task's cgroup-v2 relative path, read from
+/// `/proc/self/cgroup`. `None` when the file is unreadable or carries no
+/// `0::` line. Single-sources the `0::` parse for [`read_sibling_pids`]
+/// and [`read_self_cgroup_dir`].
+fn read_self_cgroup_rel() -> Option<String> {
+    parse_cgroup_rel(&std::fs::read_to_string("/proc/self/cgroup").ok()?)
+}
+
+/// Map a cgroup-v2 relative path (as produced by [`parse_cgroup_rel`])
+/// to the absolute cgroup-v2 directory `/sys/fs/cgroup<rel>`. `None` for
+/// the root (`rel == "/"`) or an empty `rel` so the bare
+/// `/sys/fs/cgroup` root is never mistaken for a dedicated cgroup. Pure
+/// so both branches are testable on a literal.
+fn cgroup_dir_from_rel(rel: &str) -> Option<std::path::PathBuf> {
+    if rel == "/" || rel.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(format!("/sys/fs/cgroup{rel}")))
+}
+
+/// The calling worker's absolute cgroup-v2 directory
+/// (`/sys/fs/cgroup<rel>`), or `None` for the root cgroup (`rel == "/"`)
+/// or when cgroup v2 is unavailable. `None` — never a bogus
+/// `/sys/fs/cgroup` — so a caller never mistakes the root for a
+/// dedicated cgroup. Backs [`WorkerCtx::cgroup_dir`] (the production
+/// consumer); `pub(crate)` so the cross-module wiring regression-pin
+/// (`spawn::tests_lifecycle::custom_worker_receives_wired_ctx`) can
+/// assert the `worker_main` hand-off threads this value through.
+pub(crate) fn read_self_cgroup_dir() -> Option<std::path::PathBuf> {
+    cgroup_dir_from_rel(&read_self_cgroup_rel()?)
+}
+
+/// Resolve the `cgroup.procs` path of a SIBLING cgroup — a child of
+/// `cgroup_dir`'s parent named `name` — validating `name` first so a
+/// hostile `.`/`..`/absolute/NUL component cannot escape the parent via
+/// `Path::join`. `Err(InvalidInput)` for a bad name; `Err(NotFound)`
+/// when `cgroup_dir` is `None` (root / non-v2) or has no parent. Pure
+/// (no fs access) so both error branches are testable. Single-sources
+/// the sibling resolution shared by [`WorkerCtx::open_sibling_cgroup_procs`]
+/// (the Custom-worker affordance) and the
+/// [`WorkType::CgroupAttachStorm`]
+/// built-in dispatch arm so the two address the same target by
+/// construction.
+pub(crate) fn resolve_sibling_cgroup_procs(
+    cgroup_dir: Option<&std::path::Path>,
+    name: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    crate::cgroup::validate_cgroup_name(name)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+    let cg = cgroup_dir.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "open_sibling_cgroup_procs: worker has no resolvable cgroup-v2 \
+             dir (run it in a dedicated cgroup, not the root / a non-v2 host)",
+        )
+    })?;
+    let parent = cg.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "open_sibling_cgroup_procs: the worker's cgroup has no parent",
+        )
+    })?;
+    Ok(parent.join(name).join("cgroup.procs"))
+}
+
+/// The cgroup name a [`WorkType::CgroupChurn`] worker rotates target `i`
+/// through: `wt-cgroup-churn-<i>`. Single-sourced so auto-creation and
+/// path-building agree.
+fn churn_cgroup_name(i: usize) -> String {
+    format!("wt-cgroup-churn-{i}")
+}
+
+/// The per-target `cgroup.procs` paths a [`WorkType::CgroupChurn`] worker
+/// writes its tid to — `<root>/wt-cgroup-churn-<i>/cgroup.procs` for `i in
+/// 0..groups` (at least one). Shared by the worker dispatch and its unit
+/// test so the layout under the workload root is single-sourced.
+fn churn_cgroup_procs_paths(root: &str, groups: usize) -> Vec<String> {
+    (0..groups.max(1))
+        .map(|i| format!("{root}/{}/cgroup.procs", churn_cgroup_name(i)))
+        .collect()
+}
+
+/// True for the `work_units`-vs-`iterations` footgun shape: a `Custom`
+/// worker counted work (`work_units > 0`) but left the outer-loop counter
+/// at zero (`iterations == 0`), so headline throughput — which reads
+/// `WorkerReport::iterations` — reads zero. See the `WorkType::Custom`
+/// telemetry contract. Pure so it is testable on a literal report.
+fn custom_iterations_telltale(r: &WorkerReport) -> bool {
+    r.work_units > 0 && r.iterations == 0
+}
+
+/// Warn ONCE per process that a `Custom` worker returned the
+/// [`custom_iterations_telltale`] shape. Mirrors the `std::sync::Once`
+/// idiom of `warn_setpriority_failed_once`; advisory only — it inspects
+/// and prints, never mutates the verbatim report.
+fn warn_custom_iterations_zero_once(name: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "workload: Custom worker '{name}' returned work_units>0 but \
+             iterations==0; headline throughput (total_iterations / \
+             iterations_per_worker / iterations_per_cpu_sec) reads \
+             WorkerReport::iterations and will read zero — populate iterations \
+             (commonly = work_units). See the WorkType::Custom telemetry contract."
+        );
+    });
+}
+
 /// Read the calling worker's sibling pids from its cgroup's
 /// `cgroup.procs`, excluding the caller's own pid. Used by the
 /// [`WorkType::CrossAffinityChurn`] arm and by
 /// `WorkerCtx::sibling_pids` so a Custom worker gets the same peer
 /// set without re-deriving it from `/proc`+`/sys`.
 ///
-/// cgroup v2: `/proc/self/cgroup` is a single `0::/<rel>` line; the
-/// members live in `/sys/fs/cgroup<rel>/cgroup.procs`. The set is the
-/// worker's CGROUP membership, so this is only meaningful in a
-/// dedicated cgroup (see the `CrossAffinityChurn` doc). Any read
-/// error yields an empty set (the caller treats "no siblings" as a
-/// no-op).
+/// cgroup v2: `/proc/self/cgroup` is a single `0::/<rel>` line (parsed
+/// by [`read_self_cgroup_rel`]); the members live in
+/// `/sys/fs/cgroup<rel>/cgroup.procs`. The set is the worker's CGROUP
+/// membership, so this is only meaningful in a dedicated cgroup (see the
+/// `CrossAffinityChurn` doc). A missing `0::` line OR an unreadable
+/// `/proc/self/cgroup` falls back to the root (`/`); only a
+/// `cgroup.procs` read error yields an empty set (the caller treats
+/// "no siblings" as a no-op).
 pub(super) fn read_sibling_pids() -> Vec<libc::pid_t> {
     let me = unsafe { libc::getpid() };
-    let rel = std::fs::read_to_string("/proc/self/cgroup")
-        .unwrap_or_default()
-        .lines()
-        .find_map(|l| l.strip_prefix("0::").map(|s| s.trim().to_string()))
-        .unwrap_or_else(|| "/".to_string());
+    let rel = read_self_cgroup_rel().unwrap_or_else(|| "/".to_string());
     let procs_path = format!("/sys/fs/cgroup{rel}/cgroup.procs");
     std::fs::read_to_string(&procs_path)
         .unwrap_or_default()
@@ -3892,72 +4556,147 @@ pub(super) fn alu_hot_chain(width: AluWidth, steps: u64, work_units: &mut u64) {
 /// `&mut [u8]` and cast to `*mut u64`, which was UB because a
 /// `Vec<u8>` is only 1-byte aligned.
 ///
-/// Optimization-elimination barrier: every multiplicand load goes
-/// through `black_box`, the accumulator is `black_box`-clobbered
-/// before the write, and the C-region store uses `write_volatile`.
-/// Volatile is load-bearing on the write side: `matrix_buf` in
-/// `worker_main` is a process-local `Vec<u64>` whose C region (the
-/// upper third) is NEVER read by `matrix_multiply` or by any caller
-/// — every subsequent iteration overwrites the same C indices and
-/// the buffer is dropped at worker-exit without being inspected.
-/// LLVM is therefore free to mark the store dead and elide both the
-/// store AND the multiplication chain feeding it (load-load-mul-add
-/// dependency collapses to nothing without an observable sink). The
-/// per-load `black_box` and the post-mul `black_box(acc)` keep the
-/// arithmetic live, but a non-volatile write on a dead-output slot
-/// remains DCE-eligible. `write_volatile` makes the store non-
-/// elidable, so the compute path the workload claims to exercise
+/// Optimization-elimination barrier: the slice is `black_box`-clobbered
+/// ONCE at entry, the C-region store uses `write_volatile`, and one C value
+/// is read back into the observable `work_units`. `matrix_buf` in
+/// `worker_main` is a process-local `Vec<u64>` whose C region (the upper
+/// third) is NEVER read by `matrix_multiply` or any caller, and the A/B
+/// regions stay zero-initialized — so LLVM is otherwise free to (a) prove
+/// the loads are zero and fold the multiply to a constant, and (b) mark the
+/// store dead and elide the chain feeding it. The entry `black_box` makes
+/// the buffer opaque (kills the fold); the `write_volatile` makes the store
+/// non-elidable and the read-back gives the chain a load-bearing consumer
+/// (kills the DCE) — so the compute path the workload claims to exercise
 /// actually executes under `-O2`/`-O3`.
 ///
-/// `#[inline(never)]` matches `spin_burst` / `cache_rmw_loop` —
-/// forcing out-of-line keeps the volatile-store and per-iteration
-/// `black_box` wrappers visible as distinct boundaries the
-/// optimizer can't collapse against the caller's arithmetic.
+/// The barrier is on the SLICE, not per LOAD: a per-load `black_box` forces
+/// every operand through a register barrier, blocking the fused memory-operand
+/// `imul` and loop unrolling LLVM emits otherwise -- which de-optimized do_work
+/// ~1.3x vs schbench's `-O2` `do_some_math`. One entry barrier stays fold-safe
+/// while leaving the scalar inner loop intact, matching schbench's compute cost.
+/// The loop does NOT auto-vectorize either way (no SIMD `u64` multiply on the
+/// `x86-64-v3` target and the serial accumulator blocks SLP -- schbench's `-O2`
+/// kernel is likewise scalar `imul`), so the entry barrier costs no SIMD.
+///
+/// `#[inline(never)]` matches `spin_burst` / `cache_rmw_loop` — the boundary
+/// keeps the caller's zero-init from flowing in; the entry `black_box` closes
+/// the residual thin-LTO IPO path (`Cargo.toml` `lto = "thin"`).
 #[inline(never)]
 pub(super) fn matrix_multiply(data: &mut [u64], size: usize, work_units: &mut u64) {
     debug_assert_eq!(data.len(), 3 * size * size);
     let stride = size * size;
+    // Clobber the buffer ONCE so the optimizer treats it as opaque and cannot
+    // prove the zero-initialized A/B regions are all-zero (which would let it
+    // fold the multiply to a constant). #[inline(never)] hides the caller's
+    // zero-init across the call boundary; this also closes the residual
+    // thin-LTO IPO path (Cargo.toml `lto = "thin"`). Unlike a per-load
+    // black_box, one barrier on the slice leaves the inner loop's scalar
+    // codegen intact (fused memory-operand `imul`, unrolling) instead of
+    // forcing every operand through a register barrier.
+    let data = std::hint::black_box(data);
     for i in 0..size {
         for j in 0..size {
             let mut acc: u64 = 0;
             for k in 0..size {
-                acc = acc.wrapping_add(
-                    std::hint::black_box(data[i * size + k])
-                        .wrapping_mul(std::hint::black_box(data[stride + k * size + j])),
-                );
+                acc =
+                    acc.wrapping_add(data[i * size + k].wrapping_mul(data[stride + k * size + j]));
             }
-            // SAFETY: `2 * stride + i * size + j` is in-bounds for a
-            // slice of length `3 * stride` whenever `i, j < size`,
-            // which the surrounding `for` ranges enforce. The
-            // `debug_assert_eq!` above pins the length contract; the
-            // slice's element type (`u64`) is naturally aligned via
-            // `Vec<u64>` allocation. A non-volatile `data[idx] = ...`
-            // would be DCE-eligible because no later code reads the
-            // C region; the volatile store is the documented escape
-            // hatch.
+            // SAFETY: `2 * stride + i * size + j` is in-bounds for a slice of
+            // length `3 * stride` whenever `i, j < size`, which the surrounding
+            // `for` ranges enforce; the `debug_assert_eq!` above pins the length
+            // contract and `u64` is naturally aligned via the `Vec<u64>` backing.
+            // The volatile store makes the C-region write non-elidable, so the
+            // multiply chain feeding `acc` executes under `-O2`/`-O3` (no later
+            // code reads the C region, so a plain store would be DCE-eligible).
             unsafe {
-                std::ptr::write_volatile(
-                    &mut data[2 * stride + i * size + j] as *mut u64,
-                    std::hint::black_box(acc),
-                );
+                std::ptr::write_volatile(&mut data[2 * stride + i * size + j] as *mut u64, acc);
             }
         }
     }
-    // Defense-in-depth read-back sink: route a single C-region
-    // value back into `work_units` through `black_box`. The
-    // `write_volatile` above is the primary defense — volatility
-    // forces every store to materialize — but a future LLVM that
-    // reasons more aggressively about volatility provenance could
-    // still mark the entire C region as a write-only buffer whose
-    // contents the program never inspects, and elide the multiply
-    // chain feeding the volatile sink. By feeding one extracted
-    // value back into the observable `work_units` accumulator the
-    // multiply chain has a load-bearing consumer that flows into
-    // the worker report. `data[2 * stride]` is the first slot of
-    // the C region, in-bounds because `size >= 1` is enforced by
-    // the call site (the worker only invokes matrix_multiply when
-    // `matrix_size > 0`).
-    *work_units = work_units.wrapping_add(std::hint::black_box(data[2 * stride]));
+    // Defense-in-depth read-back sink: route one C-region value into the
+    // observable `work_units` so the multiply chain has a load-bearing consumer
+    // beyond the volatile store. `data[2 * stride]` is in-bounds because the
+    // caller only invokes matrix_multiply when `matrix_size > 0`.
+    *work_units = work_units.wrapping_add(data[2 * stride]);
+}
+
+/// Shared-matrix variant of [`matrix_multiply`] for schbench's `--split` shared
+/// matrix, which every worker thread writes concurrently. It mirrors what gcc and
+/// clang actually emit for schbench's shared `do_some_math` (`m3[..] = 0; for k:
+/// m3[..] += m1[..]*m2[..]`): the running sum is kept in a register, but both
+/// compilers STORE it to the shared C cell every `k` (`size^3` shared-C stores
+/// per matrix, not one) and do NOT reload it. The store is kept because
+/// `do_some_math` reads `m1`/`m2`/`m3` as offsets into one base pointer (its
+/// `data` param), so neither compiler can prove the `m3` store doesn't alias the
+/// next `k`'s `m1`/`m2` loads -- this is in-function aliasing (the SAME
+/// `do_some_math` schbench uses for the private matrix; one symbol, three call
+/// sites in the gcc binary), not anything specific to the shared global. That
+/// per-k store is the source of `--split`'s cross-core cache-line contention, so
+/// this kernel accumulates in a register AND stores `acc` to the shared C cell
+/// every `k`; storing once per cell would under-generate the contention split
+/// exists to model. (The private [`matrix_multiply`] does store once per cell --
+/// non-split, ktstr stays within schbench's gcc-vs-clang throughput envelope with
+/// no contention to amplify the difference, and a faithful per-k store there
+/// would need DCE-defeating volatile writes.) A and B are loaded each `k`
+/// (`size^3` shared loads); C is write-only in the loop. All accesses use
+/// `Ordering::Relaxed`: on x86-64 each lowers to a plain `MOV` (only read-modify-
+/// write atomics take `LOCK`), so the contention matches schbench's plain
+/// shared-memory race -- but it is sound (every concurrent access goes through an
+/// atomic, so there is no data race / no UB, unlike a plain shared `&mut` buffer;
+/// the C result races exactly as schbench's does, which the contention workload
+/// does not depend on).
+///
+/// No `black_box` / `write_volatile` / read-back barrier (unlike
+/// [`matrix_multiply`], whose barriers stop the optimizer constant-folding the
+/// zero-init A/B and DCE-ing the single C store on the single-thread plain path):
+/// an atomic `load(Relaxed)` is un-foldable and an atomic `store(Relaxed)` is
+/// un-elidable (a cross-thread-visible side effect), so the per-k C stores cannot
+/// be collapsed back to a single store. Neither this nor [`matrix_multiply`]
+/// auto-vectorizes (the serial accumulator reduction blocks SLP for both; there
+/// is no SIMD `u64` multiply on the `x86-64-v3` target -- verified by disassembly
+/// of ktstr and of gcc- and clang-built schbench).
+///
+/// Takes `&[AtomicU64]` (a shared ref, interior mutability), which is what lets
+/// every worker share one `Arc<[AtomicU64]>`. `#[inline(never)]` matches
+/// [`matrix_multiply`] so the per-call boundary cost is the same.
+#[inline(never)]
+pub(super) fn matrix_multiply_shared(
+    data: &[core::sync::atomic::AtomicU64],
+    size: usize,
+    work_units: &mut u64,
+) {
+    use core::sync::atomic::Ordering::Relaxed;
+    debug_assert_eq!(data.len(), 3 * size * size);
+    let stride = size * size;
+    for i in 0..size {
+        for j in 0..size {
+            // Mirror what gcc and clang actually emit for schbench's shared
+            // `do_some_math` (`m3[..] += m1[..]*m2[..]`): keep the running sum in
+            // a register, but STORE it to the shared C cell every k. Both keep the
+            // per-k store because m1/m2/m3 are offsets into one base pointer, so
+            // neither can prove the m3 store doesn't alias the next k's m1/m2
+            // loads (in-function aliasing -- the same do_some_math is used for the
+            // private matrix). That per-k store (size^3 shared-C stores per
+            // matrix, no reload) is the source of --split's cross-core cache
+            // contention, so we store `acc` every k; a single store per cell would
+            // under-generate it.
+            let c = &data[2 * stride + i * size + j];
+            c.store(0, Relaxed);
+            let mut acc: u64 = 0;
+            for k in 0..size {
+                let prod = data[i * size + k]
+                    .load(Relaxed)
+                    .wrapping_mul(data[stride + k * size + j].load(Relaxed));
+                acc = acc.wrapping_add(prod);
+                c.store(acc, Relaxed);
+            }
+        }
+    }
+    // Route one computed C value into the observable `work_units` for
+    // loop-accounting parity with `matrix_multiply` (NOT a DCE barrier -- the
+    // per-k atomic stores above are already non-elidable). In-bounds: the caller
+    // invokes this only when the shared matrix size is > 0.
+    *work_units = work_units.wrapping_add(data[2 * stride].load(Relaxed));
 }
 
 /// Write 1 byte to partner, poll for response, read, record wake latency.

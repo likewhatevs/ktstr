@@ -1399,6 +1399,107 @@ fn result_to_exit_code_inconclusive_maps_to_distinct_code() {
     assert_eq!(result_to_exit_code(Ok(inc2), true, false), 1);
 }
 
+/// Anti-drift truth table: `final_outcome(&r, e, a).to_exit_code()` MUST
+/// equal `result_to_exit_code(r, e, a)` for every (result, expect_err,
+/// allow_inconclusive). They are two encodings of one classification —
+/// the sidecar finalize records [`final_outcome`], nextest reads
+/// [`result_to_exit_code`] — so any divergence silently mis-records a
+/// test's pass/fail across the footer, `stats`, and `replay`. Covers the
+/// Ok arms (pass / skip / inconclusive) and the Err arms (plain + each
+/// marker), exercising `final_outcome`'s replicated first-match
+/// precedence and context-aware marker downcasts.
+#[test]
+fn final_outcome_projects_to_result_to_exit_code() {
+    use crate::assert::{AssertDetail, AssertResult, DetailKind};
+    type ResultBuilder = fn() -> Result<AssertResult>;
+    let cases: [(ResultBuilder, &str); 9] = [
+        (|| Ok(AssertResult::pass()), "ok_pass"),
+        (|| Ok(AssertResult::skip("skip reason")), "ok_skip"),
+        (
+            || {
+                Ok(AssertResult::inconclusive(AssertDetail::new(
+                    DetailKind::Benchmark,
+                    "zero-denominator",
+                )))
+            },
+            "ok_inconclusive",
+        ),
+        (|| Err(anyhow::anyhow!("plain failure")), "err_plain"),
+        (
+            || Err(anyhow::anyhow!("f").context(crate::test_support::eval::PostVmAssertionFailure)),
+            "err_post_vm_assertion",
+        ),
+        (
+            || {
+                Err(anyhow::anyhow!("f")
+                    .context(crate::test_support::eval::ExpectAutoReproSatisfied))
+            },
+            "err_expect_auto_repro_satisfied",
+        ),
+        (
+            || {
+                Err(anyhow::anyhow!("f")
+                    .context(crate::test_support::eval::ScxBpfErrorMatcherMismatch))
+            },
+            "err_scx_bpf_matcher_mismatch",
+        ),
+        (
+            || Err(anyhow::anyhow!("f").context(crate::test_support::eval::SchedulerBuildRefused)),
+            "err_scheduler_build_refused",
+        ),
+        (
+            || Err(anyhow::anyhow!("f").context(crate::test_support::eval::SurvivesStormViolated)),
+            "err_survives_storm_violated",
+        ),
+    ];
+    for (build, label) in cases {
+        for expect_err in [false, true] {
+            for allow_inconclusive in [false, true] {
+                let via_final =
+                    final_outcome(&build(), expect_err, allow_inconclusive).to_exit_code();
+                let via_dispatch = result_to_exit_code(build(), expect_err, allow_inconclusive);
+                assert_eq!(
+                    via_final, via_dispatch,
+                    "verdict drift: {label} expect_err={expect_err} \
+                     allow_inconclusive={allow_inconclusive}: final_outcome->{via_final} \
+                     result_to_exit_code->{via_dispatch}",
+                );
+            }
+        }
+    }
+}
+
+/// `Verdict::sidecar_bits` mapping + the Pass-vs-Skip distinction in
+/// `final_outcome`. The truth-table above asserts `to_exit_code()`
+/// equivalence, but `to_exit_code` collapses BOTH Pass and Skip to
+/// `EXIT_PASS` — so a Pass<->Skip drift in `final_outcome` is invisible
+/// there yet would set the WRONG persisted sidecar bits (passed vs
+/// skipped). This pins the four `sidecar_bits` tuples AND that
+/// `final_outcome` keeps Pass and Skip distinct (incl. Skip dominating
+/// `expect_err`).
+#[test]
+fn verdict_sidecar_bits_and_pass_vs_skip_distinction() {
+    use crate::assert::AssertResult;
+    assert_eq!(Verdict::Pass.sidecar_bits(), (true, false, false));
+    assert_eq!(Verdict::Skip.sidecar_bits(), (false, true, false));
+    assert_eq!(Verdict::Inconclusive.sidecar_bits(), (false, false, true));
+    assert_eq!(Verdict::Fail.sidecar_bits(), (false, false, false));
+
+    assert_eq!(
+        final_outcome(&Ok(AssertResult::pass()), false, false),
+        Verdict::Pass,
+    );
+    assert_eq!(
+        final_outcome(&Ok(AssertResult::skip("s")), false, false),
+        Verdict::Skip,
+    );
+    assert_eq!(
+        final_outcome(&Ok(AssertResult::skip("s")), true, false),
+        Verdict::Skip,
+        "Skip dominates expect_err (the test never evaluated)",
+    );
+}
+
 /// A Skip verdict maps to EXIT_PASS regardless of expect_err — the
 /// test never evaluated, so there is no guest failure to "expect."
 /// Regression guard: a `post_vm_skip` (e.g. a placeholder failure
@@ -1907,6 +2008,89 @@ fn result_to_exit_code_marker_arm_wins_over_expect_err_arm() {
     );
 }
 
+// -- result_to_exit_code: SurvivesStormViolated marker tests --
+//
+// Pin the dispatch-side EXIT_FAIL the survives_storm assertion produces.
+// The marker is attached by render_failure_verdict_message ONLY when
+// entry.survives_storm was set AND the failure carried a scheduler-death
+// DetailKind, so its presence alone is load-bearing (no flag param,
+// mirroring the other marker arms). The eval-side attach gate is exercised
+// in the eval tests; these pin the dispatch-arm contract + match order.
+
+/// Err with [`SurvivesStormViolated`] attached → the dispatch arm
+/// downcasts and forces [`EXIT_FAIL`].
+#[test]
+fn result_to_exit_code_survives_storm_violated_routes_to_fail() {
+    let err: Result<crate::assert::AssertResult> =
+        Err(anyhow::anyhow!("scheduler died during hold")
+            .context(crate::test_support::eval::SurvivesStormViolated));
+    assert_eq!(
+        result_to_exit_code(err, false, false),
+        EXIT_FAIL,
+        "SurvivesStormViolated marker must route Err → EXIT_FAIL"
+    );
+}
+
+/// Marker buried under more `.context()` layers → the context-aware
+/// `downcast_ref` still surfaces it (the anyhow-chain-walk footgun: a
+/// `chain().any(|c| c.is::<_>())` walk would miss the ContextError-boxed
+/// marker). The eval layer's surrounding context wrappers make
+/// nested-marker chains the production-typical shape.
+#[test]
+fn result_to_exit_code_survives_storm_violated_through_nested_context() {
+    let err: Result<crate::assert::AssertResult> =
+        Err(anyhow::anyhow!("scheduler died during hold")
+            .context(crate::test_support::eval::SurvivesStormViolated)
+            .context("run ktstr_test VM")
+            .context("dispatch wrapper"));
+    assert_eq!(
+        result_to_exit_code(err, false, false),
+        EXIT_FAIL,
+        "nested SurvivesStormViolated must still be found by the context-aware downcast_ref"
+    );
+}
+
+/// `expect_err = true` + SurvivesStormViolated → the survives_storm arm
+/// wins because it is positioned BEFORE the expect_err inversion arm in the
+/// dispatch match. The two are mutually exclusive at validate
+/// (survives_storm ⊕ expect_err), so this guards the order invariant for a
+/// programmatic path that bypassed the macro: a survival violation must
+/// never invert to PASS via expect_err. Falsifiable — without the
+/// survives_storm arm, the expect_err arm would route this Err to
+/// EXIT_PASS.
+#[test]
+fn result_to_exit_code_survives_storm_violated_wins_over_expect_err() {
+    let err: Result<crate::assert::AssertResult> =
+        Err(anyhow::anyhow!("scheduler died during hold")
+            .context(crate::test_support::eval::SurvivesStormViolated));
+    assert_eq!(
+        result_to_exit_code(err, true, false),
+        EXIT_FAIL,
+        "SurvivesStormViolated must win over the expect_err inversion (positioned before it)"
+    );
+}
+
+/// `SurvivesStormViolated` + `ExpectAutoReproSatisfied` both attached →
+/// the survives_storm arm wins (positioned BEFORE the ExpectAutoReproSatisfied
+/// arm), so the survival violation resolves to EXIT_FAIL and is NOT inverted
+/// to PASS. The two are mutually exclusive at validate (survives_storm ⊕
+/// expect_auto_repro), so this guards the order invariant for a programmatic
+/// path that bypassed the macro. Falsifiable — without the survives_storm arm
+/// (or if mispositioned after it), the ExpectAutoReproSatisfied arm would
+/// route this Err to EXIT_PASS.
+#[test]
+fn result_to_exit_code_survives_storm_violated_wins_over_expect_auto_repro() {
+    let err: Result<crate::assert::AssertResult> =
+        Err(anyhow::anyhow!("scheduler died during hold")
+            .context(crate::test_support::eval::ExpectAutoReproSatisfied)
+            .context(crate::test_support::eval::SurvivesStormViolated));
+    assert_eq!(
+        result_to_exit_code(err, false, false),
+        EXIT_FAIL,
+        "SurvivesStormViolated must win over ExpectAutoReproSatisfied (positioned before it)"
+    );
+}
+
 // -- result_to_exit_code: ScxBpfErrorMatcherMismatch (expect_err
 // arm) tests --
 //
@@ -1971,6 +2155,48 @@ fn result_to_exit_code_matcher_mismatch_through_nested_context_routes_to_fail() 
         result_to_exit_code(err, true, false),
         EXIT_FAIL,
         "nested ScxBpfErrorMatcherMismatch must still be downcast by anyhow's context-aware downcast_ref"
+    );
+}
+
+// -- result_to_exit_code: SchedulerBuildRefused (expect_err arm) tests --
+//
+// A failed orchestrated scheduler build the resolver refused to serve stale
+// carries the SchedulerBuildRefused marker; like the other host-side
+// hard-fail markers it must force EXIT_FAIL even under expect_err — a broken
+// build must never masquerade as the expect_err test's expected failure.
+
+/// `expect_err = true` + Err WITH the SchedulerBuildRefused marker → the
+/// dispatch guard forces [`EXIT_FAIL`], refusing the expect_err inversion.
+/// Without the marker (the bug this fixes) a build refusal would be a plain
+/// Err and the expect_err arm would invert it to a false PASS.
+#[test]
+fn result_to_exit_code_expect_err_with_scheduler_build_refused_routes_to_fail() {
+    let err: Result<crate::assert::AssertResult> =
+        Err(anyhow::anyhow!("cargo build -p scx_x failed")
+            .context(crate::test_support::eval::SchedulerBuildRefused));
+    assert_eq!(
+        result_to_exit_code(err, true, false),
+        EXIT_FAIL,
+        "expect_err must NOT invert a SchedulerBuildRefused failure to PASS"
+    );
+}
+
+/// Production-typical shape: the resolver attaches the marker INNER then wraps
+/// the operator-facing refusal message OUTER
+/// (`e.context(SchedulerBuildRefused).context("... refusing ...")`), so the
+/// marker is nested. anyhow's context-aware `downcast_ref` still finds it →
+/// [`EXIT_FAIL`] under expect_err.
+#[test]
+fn result_to_exit_code_scheduler_build_refused_through_nested_context_routes_to_fail() {
+    let err: Result<crate::assert::AssertResult> =
+        Err(anyhow::anyhow!("cargo build -p scx_x failed")
+            .context(crate::test_support::eval::SchedulerBuildRefused)
+            .context("ktstr_test: refusing to validate against a stale binary")
+            .context("dispatch wrapper"));
+    assert_eq!(
+        result_to_exit_code(err, true, false),
+        EXIT_FAIL,
+        "nested SchedulerBuildRefused must still be downcast and force EXIT_FAIL"
     );
 }
 

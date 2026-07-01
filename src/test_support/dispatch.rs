@@ -1127,8 +1127,9 @@ fn ok_to_exit_code(r: AssertResult, expect_err: bool, allow_inconclusive: bool) 
 /// cpu-budget → topology-unrepresentable → resource-contention →
 /// topology-insufficient, shared with the `#[ktstr_test]` macro body) runs
 /// FIRST, then the
-/// marker-typed guards (`PostVmAssertionFailure` →
-/// `ExpectAutoReproSatisfied`), then the `expect_err` inversion, then
+/// marker-typed guards (`PostVmAssertionFailure` → `SchedulerBuildRefused`
+/// → `SurvivesStormViolated` → `ExpectAutoReproSatisfied`), then the
+/// `expect_err` inversion, then
 /// the catch-all (the former `Err(e) => …` arm) operating on the
 /// now-owned `e`. Reordering these would change which guard fires for an
 /// error matching more than one guard. The host-insufficiency guard
@@ -1175,6 +1176,41 @@ fn err_to_exit_code(e: anyhow::Error, expect_err: bool, no_skip: bool) -> i32 {
         // run_ktstr_test_inner_impl); a raw `chain().any(is::<C>())`
         // would miss it (anyhow boxes context as ContextError<C,E>).
         eprintln!("{e:#}");
+        return EXIT_FAIL;
+    }
+    if e.downcast_ref::<crate::test_support::eval::SchedulerBuildRefused>()
+        .is_some()
+    {
+        // An orchestrated scheduler build expected to succeed FAILED and the
+        // resolver refused to validate against a possibly-stale pre-built
+        // binary (KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK unset). A host-side
+        // build-infra fault — always EXIT_FAIL, never inverted by expect_err
+        // (mirrors PostVmAssertionFailure above): an expect_err test must not
+        // let a broken build masquerade as the guest-side expected failure.
+        eprintln!("{e:#}");
+        return EXIT_FAIL;
+    }
+    if e.downcast_ref::<crate::test_support::eval::SurvivesStormViolated>()
+        .is_some()
+    {
+        // The marker rides ONLY when `entry.survives_storm` was set AND the
+        // failure cause was a scheduler death (see
+        // `render_failure_verdict_message`), so its presence alone proves the
+        // survival assertion was violated — no `survives_storm` param needed
+        // (mirrors the marker-presence arms for PostVmAssertionFailure /
+        // SchedulerBuildRefused / ExpectAutoReproSatisfied below). Force
+        // EXIT_FAIL with a survival-specific explainer. Positioned AFTER the
+        // host-insufficiency / PostVmAssertionFailure / SchedulerBuildRefused
+        // guards (a skip or host-side fault still dominates) but BEFORE the
+        // ExpectAutoReproSatisfied and expect_err inversion arms so a survival
+        // violation can never be inverted to PASS (defense-in-depth: the
+        // validate-time survives_storm/expect_err mutex already forbids that
+        // pairing). `downcast_ref` walks the anyhow context chain (the marker
+        // rides as `.context(...)`).
+        eprintln!(
+            "ktstr: FAIL: survives_storm asserted but the scheduler did not \
+             survive the run:\n{e:#}"
+        );
         return EXIT_FAIL;
     }
     if e.downcast_ref::<crate::test_support::eval::ExpectAutoReproSatisfied>()
@@ -1239,6 +1275,139 @@ fn err_to_exit_code(e: anyhow::Error, expect_err: bool, no_skip: bool) -> i32 {
     // at the top.)
     eprintln!("{e:#}");
     EXIT_FAIL
+}
+
+/// The final test verdict — the 4-state lattice `Fail > Inconclusive >
+/// Pass > Skip` that [`result_to_exit_code`] projects to a process exit
+/// code. Distinct from the exit code because the exit code collapses
+/// `Skip` into [`EXIT_PASS`]; the sidecar finalize ([`final_outcome`])
+/// needs all four to set the persisted `passed`/`skipped`/`inconclusive`
+/// bits to the POST-inversion outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    Pass,
+    Fail,
+    Skip,
+    Inconclusive,
+}
+
+impl Verdict {
+    /// Project to the process exit code, matching the
+    /// `EXIT_PASS`/`EXIT_FAIL`/`EXIT_INCONCLUSIVE` mapping
+    /// [`result_to_exit_code`] produces (Skip degenerates to
+    /// [`EXIT_PASS`]). Test-only: the anti-drift truth-table test
+    /// (`final_outcome_projects_to_result_to_exit_code`) is its sole
+    /// caller — production reads the [`Verdict`] directly via
+    /// [`Verdict::sidecar_bits`].
+    #[cfg(test)]
+    pub(crate) fn to_exit_code(self) -> i32 {
+        match self {
+            Verdict::Pass | Verdict::Skip => EXIT_PASS,
+            Verdict::Fail => EXIT_FAIL,
+            Verdict::Inconclusive => EXIT_INCONCLUSIVE,
+        }
+    }
+
+    /// The persisted-sidecar verdict bits `(passed, skipped,
+    /// inconclusive)` for this outcome. `Fail` is all-false (the
+    /// [`crate::test_support::SidecarResult::is_fail`] "none set"
+    /// encoding). Lets the sidecar finalize record the final verdict
+    /// without [`crate::test_support::sidecar`] depending on this enum.
+    pub(crate) fn sidecar_bits(self) -> (bool, bool, bool) {
+        match self {
+            Verdict::Pass => (true, false, false),
+            Verdict::Skip => (false, true, false),
+            Verdict::Inconclusive => (false, false, true),
+            Verdict::Fail => (false, false, false),
+        }
+    }
+}
+
+/// Classify a test result into the final [`Verdict`] — the same
+/// classification [`result_to_exit_code`] performs, as a 4-state value
+/// (it does not collapse `Skip` into `Pass` the way the exit code does)
+/// and WITHOUT the operator-facing `eprintln` diagnostics.
+///
+/// Used to record the FINAL (post-`expect_err` / post-marker) outcome on
+/// the sidecar so the footer, `stats` analysis, and `replay` reflect the
+/// test's real pass/fail (matching nextest's exit code) rather than the
+/// raw scenario verdict written mid-run.
+///
+/// MUST stay in lockstep with [`result_to_exit_code`]: the truth-table
+/// test `final_outcome_projects_to_result_to_exit_code` asserts
+/// `final_outcome(...).to_exit_code() == result_to_exit_code(...)` over a
+/// matrix including the marker-carrying error arms, so the two cannot
+/// drift. The arm order mirrors [`ok_to_exit_code`] / [`err_to_exit_code`]
+/// first-match precedence exactly.
+pub(crate) fn final_outcome(
+    result: &Result<AssertResult>,
+    expect_err: bool,
+    allow_inconclusive: bool,
+) -> Verdict {
+    let no_skip = std::env::var_os(crate::KTSTR_NO_SKIP_MODE_ENV).is_some();
+    match result {
+        Ok(r) => {
+            if r.is_skip() {
+                return Verdict::Skip;
+            }
+            if expect_err {
+                // expect_err on an Ok result is always a failure
+                // (expected an error, got a non-error verdict) — both the
+                // Pass and Inconclusive arms of ok_to_exit_code map here.
+                return Verdict::Fail;
+            }
+            if r.is_inconclusive() {
+                return if allow_inconclusive {
+                    Verdict::Pass
+                } else {
+                    Verdict::Inconclusive
+                };
+            }
+            Verdict::Pass
+        }
+        Err(e) => {
+            match classify_host_error(e, no_skip) {
+                HostClass::Skip { .. } => return Verdict::Skip,
+                HostClass::Fail { .. } => return Verdict::Fail,
+                HostClass::NotHostClass => {}
+            }
+            if e.downcast_ref::<crate::test_support::eval::PostVmAssertionFailure>()
+                .is_some()
+            {
+                return Verdict::Fail;
+            }
+            if e.downcast_ref::<crate::test_support::eval::SchedulerBuildRefused>()
+                .is_some()
+            {
+                return Verdict::Fail;
+            }
+            if e.downcast_ref::<crate::test_support::eval::SurvivesStormViolated>()
+                .is_some()
+            {
+                // Lockstep with err_to_exit_code's SurvivesStormViolated arm
+                // (same position: after SchedulerBuildRefused, before
+                // ExpectAutoReproSatisfied / expect_err) so the persisted
+                // sidecar verdict matches the exit code for a survival
+                // violation — including the defense-in-depth bypass case
+                // (marker + expect_err) the mutex normally forbids.
+                return Verdict::Fail;
+            }
+            if e.downcast_ref::<crate::test_support::eval::ExpectAutoReproSatisfied>()
+                .is_some()
+            {
+                return Verdict::Pass;
+            }
+            if expect_err {
+                if e.downcast_ref::<crate::test_support::eval::ScxBpfErrorMatcherMismatch>()
+                    .is_some()
+                {
+                    return Verdict::Fail;
+                }
+                return Verdict::Pass;
+            }
+            Verdict::Fail
+        }
+    }
 }
 
 /// Whether a base test entry is "ignored" (skipped by default).
@@ -2153,7 +2322,9 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
             bare_name,
         ));
         // See run_ktstr_test_inner for the sidecar-emission rationale.
-        record_skip_sidecar(entry);
+        // Plain (non-gauntlet) dispatch: no TopoOverride, so the skip
+        // records entry.topology (declared == booted for a plain test).
+        record_skip_sidecar(entry, None);
         return 0;
     }
 
@@ -2163,7 +2334,7 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
         ));
         // Skip sidecar so the perf-delta pool records the skip (excluded
         // from the A/B compare) rather than a phantom missing result.
-        record_skip_sidecar(entry);
+        record_skip_sidecar(entry, None);
         return 0;
     }
 
@@ -2237,6 +2408,14 @@ fn run_host_only_test_inner(entry: &KtstrTestEntry) -> Result<AssertResult> {
         .settle(std::time::Duration::ZERO)
         .assert(merged_assert)
         .entry_name(entry.name)
+        // host_only is host-side with no VM: the resolved topology is
+        // the declared entry.topology (resolve_vm_topology(entry, None)),
+        // so compute the variant hash directly rather than threading.
+        .variant_hash(super::sidecar::variant_hash_from_parts(
+            entry,
+            &entry.topology,
+            &super::args::current_work_type(),
+        ))
         .build();
     (entry.func)(&ctx)
 }
@@ -2397,7 +2576,10 @@ pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
             "{}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
             test_name,
         ));
-        record_skip_sidecar(entry);
+        // Gauntlet preset: record the preset's RESOLVED topology
+        // (Topology::from(&topo)) so this skip shares a variant_hash
+        // with a run of the same preset and distinguishes other presets.
+        record_skip_sidecar(entry, Some(&topo));
         return 0;
     }
 
@@ -2405,7 +2587,9 @@ pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
         crate::report::test_skip(format_args!(
             "{test_name}: KTSTR_PERF_ONLY is active and this test is not a performance_mode test",
         ));
-        record_skip_sidecar(entry);
+        // Gauntlet preset: record the preset's RESOLVED topology so the
+        // skip shares a variant_hash with a run of the same preset.
+        record_skip_sidecar(entry, Some(&topo));
         return 0;
     }
 

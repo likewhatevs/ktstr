@@ -25,7 +25,7 @@ mod work;
 mod workload;
 
 pub use mempolicy::{MemPolicy, MpolFlags};
-pub use sched::{AluWidth, FutexLockMode, SchedClass, SchedPolicy, WakeMechanism};
+pub use sched::{AluWidth, FutexLockMode, ReapMode, SchedClass, SchedPolicy, WakeMechanism};
 pub use work::WorkSpec;
 pub(crate) use work::validate_task_comm_string;
 pub use workload::WorkloadConfig;
@@ -135,6 +135,10 @@ pub mod defaults {
     // CgroupChurn
     pub const CGROUP_CHURN_GROUPS: usize = 2;
     pub const CGROUP_CHURN_CYCLE_MS: u64 = 100;
+    // CgroupAttachStorm — sentinel sibling-cgroup name used by
+    // `from_name("CgroupAttachStorm")`; the author sets a real `dest`
+    // (matching an `Op::add_cgroup`) before the storm migrates anything.
+    pub const CGROUP_ATTACH_STORM_DEST: &str = "dest";
     // SignalStorm
     pub const SIGNAL_STORM_SIGNALS_PER_ITER: u64 = 16;
     pub const SIGNAL_STORM_WORK_ITERS: u64 = 1024;
@@ -156,6 +160,28 @@ pub mod defaults {
     /// the variant doc describes; opt-in callers set the field to
     /// `true` directly to call `prctl(PR_SET_TIMERSLACK, 1)`.
     pub const IDLE_CHURN_PRECISE_TIMING: bool = false;
+    // TimerLatency
+    /// Default [`crate::workload::WorkType::TimerLatency`] inter-wake interval
+    /// (µs): 1000 = 1kHz, matching `cyclictest`'s default tick rate. The
+    /// absolute deadline advances by this each cycle.
+    pub const TIMER_LATENCY_INTERVAL_US: u64 = 1000;
+    // NetTraffic
+    /// Default [`crate::workload::WorkType::NetTraffic`] inter-frame interval
+    /// (µs): 0 = continuous (maximum TX-kick / softirq rate).
+    pub const NET_TRAFFIC_INTERVAL_US: u64 = 0;
+    /// Default [`crate::workload::WorkType::NetTraffic`] Ethernet frame size
+    /// (bytes): 60 = `ETH_ZLEN`, the minimum L2 frame sans FCS.
+    pub const NET_TRAFFIC_FRAME_BYTES: u16 = 60;
+    // IrqWake
+    /// Default [`crate::workload::WorkType::IrqWake`] inter-frame interval (µs):
+    /// 1000 (1 kHz) paces the sender so the receiver drains its queue and
+    /// genuinely blocks between frames — giving a usable (non-degenerate) wake
+    /// reservoir. `interval_us == 0` maximizes softirq load (serviced by
+    /// `ksoftirqd`) but degenerates the wake reservoir — see the variant doc.
+    pub const IRQ_WAKE_INTERVAL_US: u64 = 1000;
+    /// Default [`crate::workload::WorkType::IrqWake`] Ethernet frame size (bytes):
+    /// 60 = `ETH_ZLEN`, the minimum L2 frame sans FCS.
+    pub const IRQ_WAKE_FRAME_BYTES: u16 = 60;
     // AluHot
     /// Default for `WorkType::AluHot`'s `width` field. `Widest`
     /// resolves to the widest data-path the host supports at
@@ -228,10 +254,15 @@ pub(crate) fn resolve_work_type(
 /// | [`WorkType::ForkExit`]  | OK   | reject |
 ///
 /// `ForkExit + Thread` is rejected because the worker body calls
-/// `libc::fork()` from inside a thread of the parent's tgid; the
-/// child then calls `_exit(0)`, which the kernel routes through
-/// `do_exit`, tearing down the entire tgid (every sibling thread
-/// dies). Use [`CloneMode::Fork`] for [`WorkType::ForkExit`].
+/// `libc::fork()` from inside a thread of the multi-threaded harness:
+/// the fork duplicates only the calling thread, so any lock another
+/// thread holds at fork time stays locked forever in the child. The
+/// child only `_exit`s here — and `fork()` omits `CLONE_THREAD`, so the
+/// child is its own singleton tgid; its `_exit` invokes `exit_group(2)`,
+/// but that tgid has no sibling threads to tear down, so it ends only
+/// the child — but the fork/exit lifecycle is faithfully exercised only
+/// when each worker is its own process. Use [`CloneMode::Fork`] for
+/// [`WorkType::ForkExit`].
 ///
 /// Other Thread-mode interactions worth knowing:
 ///

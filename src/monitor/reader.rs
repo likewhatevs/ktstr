@@ -12,17 +12,21 @@
 //! The monitor loop (`monitor_loop`) periodically reads per-CPU
 //! runqueue state from guest memory and collects `MonitorSample`s.
 
+use super::bpf_map::{BpfMapAccessor, BpfMapInfo, GuestMemMapAccessorOwned};
+use super::bpf_prog::find_active_struct_ops_obj_no_target;
 use super::btf_offsets::{
-    CPU_MAX_IDLE_TYPES, KernelOffsets, SchedDomainOffsets, SchedDomainStatsOffsets,
-    SchedstatOffsets, ScxEventOffsets,
+    BpfProgOffsets, CPU_MAX_IDLE_TYPES, KernelOffsets, SchedDomainOffsets, SchedDomainStatsOffsets,
+    SchedstatOffsets, ScxEventOffsets, resolve_map_field_offset_width,
 };
 use super::{
-    CpuSnapshot, Kva, MonitorSample, RqSchedstat, SchedDomainSnapshot, SchedDomainStats,
-    ScxEventCounters,
+    BpfMapFieldSample, CpuSnapshot, Kva, MonitorSample, RqSchedstat, SchedDomainSnapshot,
+    SchedDomainStats, ScxEventCounters,
 };
 use crate::sync::MutexExt;
 
 use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
@@ -1346,6 +1350,11 @@ pub(crate) fn read_rq_stats(mem: &GuestMem, rq_pa: u64, offsets: &KernelOffsets)
         ),
         rq_clock: mem.read_u64(rq_pa, offsets.rq_clock),
         scx_flags: mem.read_u32(rq_pa, offsets.rq_scx + offsets.scx_rq_flags),
+        // PELT IRQ load: one u64 read at the resolved nested offset, or
+        // None when CONFIG_HAVE_SCHED_AVG_IRQ is off (offset unresolved).
+        avg_irq_util: offsets
+            .rq_avg_irq_util_avg
+            .map(|off| mem.read_u64(rq_pa, off)),
         event_counters: None,
         schedstat: None,
         vcpu_cpu_time_ns: None,
@@ -1991,6 +2000,16 @@ pub(crate) struct ProgStatsCtx {
     /// `start_kernel_map` so the IDR head's PA resolves correctly
     /// on KASLR kernels.
     pub phys_base: u64,
+    /// Live kernel page-table root (`cr3_cache`), re-read each sample
+    /// (masked `& !0xFFF` via `select_cr3`) to override the once-captured
+    /// `walk.cr3_pa` snapshot. Same cold-boot staleness as
+    /// `WatchBpfMapsCfg::cr3`: the snapshot can be the KASLR-fragile
+    /// `init_top_pgt` fallback when `cr3_cache` is unpublished at
+    /// construction, so the per-tick walk of the vmalloc-backed
+    /// `struct bpf_prog` would fail the whole run and `prog_stats` would
+    /// silently stay empty. The IDR walk re-runs every tick (no cached
+    /// accessor), so a live read each call suffices — no deferral needed.
+    pub cr3: std::sync::Arc<AtomicU64>,
 }
 
 /// Samples and optional watchdog observation returned by
@@ -2026,6 +2045,32 @@ pub(crate) struct MonitorLoopResult {
     /// the in-`monitor_loop` test path leaves it `NotConfigured`.
     /// Forwarded to [`super::MonitorReport::boot_wait_outcome`].
     pub(crate) boot_wait_outcome: super::BootWaitOutcome,
+    /// Whether the guest kernel structurally supports the `SCX_EV_*`
+    /// event counters (`KernelOffsets::event_offsets.is_some()`). Like
+    /// `boot_wait_outcome`, this is set by `start_monitor`'s closure —
+    /// which owns the resolved `KernelOffsets` — on the production path;
+    /// the in-`monitor_loop` returns leave it `false`. Forwarded to
+    /// [`super::MonitorReport::scx_event_counters_supported`].
+    pub(crate) scx_event_counters_supported: bool,
+}
+
+/// System-wide PSI-irq host-walk inputs: the resolved `struct psi_group`
+/// offsets + the pre-translated guest PA of the global `psi_system`. The
+/// monitor sample loop reads `total[PSI_AVGS][PSI_IRQ_FULL]` (cumulative IRQ
+/// stall ns) + `avg[PSI_IRQ_FULL][0]` (the 10s EWMA) at that PA and decodes
+/// into [`super::PsiIrqSample`]. `MonitorConfig::psi` is `Some` only when BOTH
+/// the offsets (CONFIG_IRQ_TIME_ACCOUNTING → `PSI_IRQ_FULL` in BTF) and the
+/// `psi_system` symbol resolve; otherwise the loop emits no
+/// `MonitorSample::psi_irq` (loud-absent).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PsiCaptureCfg {
+    /// Resolved `psi_group` offsets + the `PSI_IRQ_FULL` index.
+    pub offsets: super::btf_offsets::PsiGroupOffsets,
+    /// Guest PA of the global `psi_system` (`.data`), translated once at
+    /// monitor-thread setup via `text_kva_to_pa_with_base` (a kernel-image
+    /// global, not the direct map). Stable for the run — no per-sample
+    /// re-translation (unlike the per-CPU `runqueues` walk).
+    pub psi_system_pa: u64,
 }
 
 /// Configuration for the monitor sampling loop.
@@ -2087,6 +2132,10 @@ pub(crate) struct MonitorConfig<'a> {
     /// used unchanged (test path; production callers always populate
     /// this).
     pub rq_refresh: Option<&'a RqRefresh>,
+    /// PSI-irq host-walk inputs (psi_group offsets + the pre-translated
+    /// `psi_system` PA). `Some` only when both resolve; else the loop emits no
+    /// `psi_irq` sample (loud-absent). Owned (`Copy`), no lifetime tie.
+    pub psi: Option<PsiCaptureCfg>,
     /// Optional scheduler-attach watchdog reset. When `Some`, the
     /// loop reads `*scx_root` each iteration via
     /// [`WatchdogReset::scx_root_pa`] and, on the first 0 →
@@ -2105,6 +2154,12 @@ pub(crate) struct MonitorConfig<'a> {
     /// `None` (test path or kernels with no `scx_root` symbol)
     /// disables attach detection.
     pub watchdog_reset: Option<WatchdogReset<'a>>,
+    /// Named scheduler BPF-map fields to read observer-effect-free into
+    /// run-level metrics. `Some` only when the test declared
+    /// `watch_bpf_maps`; the loop lazily builds a guest-memory accessor from
+    /// it (post-attach) and reads each target per tick into
+    /// [`MonitorSample::bpf_map_fields`].
+    pub watch_bpf_maps: Option<&'a WatchBpfMapsCfg>,
 }
 
 /// Inputs the monitor needs to push a watchdog-reset deadline when
@@ -2133,6 +2188,362 @@ pub(crate) struct WatchdogReset<'a> {
     /// Duration::from_nanos(value)` as its hard deadline (capped
     /// at the original `timeout`-derived deadline).
     pub reset_ns: &'a AtomicU64,
+}
+
+/// One watched scheduler BPF-map field, in monitor-local form. Lowered from
+/// the test entry's `WatchBpfMap` at the coordinator boundary so the monitor
+/// layer does not depend on the test-support / vmm types.
+#[derive(Clone)]
+pub(crate) struct WatchBpfMapTarget {
+    /// Map-name suffix matched via `ends_with` (`.bss`, `cpu_ctx_stor`).
+    pub map_suffix: String,
+    /// Dot-path into the map value type (`sys_stat.avg_lat_cri` / `lat_headroom`).
+    pub field: String,
+    /// True for a per-CPU array field (emits `_avg` + `_max`); false for scalar.
+    pub per_cpu: bool,
+    /// True for a scalar monotonic counter (folded as the final reporting
+    /// sample's value); false for a scalar gauge (mean-folded). Ignored when
+    /// `per_cpu` is true.
+    pub counter: bool,
+    /// Metric-key leaf appended to the resolved scheduler-obj prefix.
+    pub label: String,
+}
+
+/// Inputs the free-running monitor needs to read named scheduler BPF-map
+/// fields observer-effect-free. Built once in `start_monitor` and borrowed by
+/// [`monitor_loop`]; the loop lazily builds a guest-memory map accessor from
+/// these (after the scheduler attaches) and reads each target per tick.
+pub(crate) struct WatchBpfMapsCfg {
+    /// The declared targets.
+    pub targets: Vec<WatchBpfMapTarget>,
+    /// Guest DRAM, Arc-shared with the loop's `&GuestMem`; the owned accessor
+    /// clones this Arc (same backing, no borrow conflict).
+    pub mem: Arc<GuestMem>,
+    /// vmlinux path (BTF sidecar cache key).
+    pub vmlinux: PathBuf,
+    /// Raw vmlinux bytes (re-parsed into a goblin ELF in-loop + BTF fallback).
+    pub vmlinux_data: Arc<Vec<u8>>,
+    /// Vmlinux BTF — the split-base for per-map program-BTF loads.
+    pub base_btf: Arc<btf_rs::Btf>,
+    /// Top-level page-table PA (CR3 / TTBR1) fallback, captured once at
+    /// construction. Used only when [`WatchBpfMapsCfg::cr3`] reads 0
+    /// (the `cr3_cache` is still unpublished).
+    pub cr3_pa: u64,
+    /// Live kernel page-table root (`cr3_cache`), re-read every
+    /// `sample()` tick and masked `& !0xFFF` via `select_cr3` (strip the
+    /// CR3 control bits \[11:0\]; the guest boots `mitigations=off` so bit
+    /// 12 is a real pgd-PA bit, preserved — NOT the KPTI user-pgd
+    /// selector). `cr3_cache` is a per-BSP-iteration refresh of whatever
+    /// task's CR3 the BSP last read; any task's pgd maps the kernel
+    /// upper-half (shared), so the masked value walks the vmalloc
+    /// `struct bpf_prog` / `.bss` correctly once published. It can land
+    /// AFTER `cr3_pa` was snapshotted at construction; on those (cold)
+    /// boots the snapshot is the KASLR-fragile `init_top_pgt` fallback
+    /// that fails every vmalloc page-table walk for the whole run, so the
+    /// active-struct_ops walk finds 0 progs and the watched `.bss` never
+    /// resolves. `sample()` therefore DEFERS the accessor build until this
+    /// is published (`!= 0`) — so BOTH the prog-discovery walk and the
+    /// `.bss` leaf read use the live root — and re-reads it for the
+    /// discovery `WalkContext` each tick. Mirrors the per-iteration
+    /// [`RqRefresh::kaslr_offset`] refresh (same boot-race class).
+    pub cr3: std::sync::Arc<AtomicU64>,
+    /// aarch64 TCR_EL1 (0 on x86_64), run-stable.
+    pub tcr_el1: u64,
+    /// x86 5-level paging flag.
+    pub l5: bool,
+    /// `prog_idr` head KVA (for the active-scheduler obj-prefix walk).
+    pub prog_idr_kva: u64,
+    /// Resolved BPF-prog struct offsets (for the obj-prefix walk).
+    pub prog_offsets: BpfProgOffsets,
+    /// Online CPU count (for per-CPU array reads).
+    pub num_cpus: u32,
+}
+
+/// A resolved watched target: the located map + leaf (offset, width) + the
+/// final metric-key base. Cached on first successful resolve.
+struct ResolvedWatch {
+    map: BpfMapInfo,
+    offset: usize,
+    width: usize,
+    per_cpu: bool,
+    counter: bool,
+    key_base: String,
+}
+
+/// Lazily resolves + reads the [`WatchBpfMapsCfg`] targets from the
+/// free-running monitor. The accessor and the scheduler-obj prefix are built
+/// once after the scheduler attaches (tolerating not-yet-present without
+/// error); each target's (map, offset, width) is cached on first resolve;
+/// subsequent ticks re-read only the leaf bytes.
+///
+/// Replace-safe: a mid-run `Op::ReplaceScheduler` frees the outgoing
+/// scheduler and attaches a new instance whose maps live at new KVAs. Each
+/// tick the watcher re-walks the active struct_ops once (one `prog_idr` walk
+/// feeding BOTH the metric-key prefix and the live used-map-KVA set); when
+/// that identity changes — the obj prefix or the used-map-KVA set — it drops
+/// all cached resolutions and rebinds each target to the suffix-matching map
+/// whose `map_kva` is in the live set. Binding by the live `used_map_kvas`
+/// (not just the name suffix) disambiguates the same-binary swap even when the
+/// outgoing `.bss` is pinned alive across the swap: both copies share the map
+/// name, but only the incoming instance's map is in the live struct_ops prog's
+/// `used_maps`. This mirrors the snapshot path's per-capture
+/// `identify_active_obj_from_struct_ops` walk + KVA filter.
+struct BpfMapWatcher<'a> {
+    cfg: &'a WatchBpfMapsCfg,
+    accessor: Option<GuestMemMapAccessorOwned>,
+    obj_prefix: Option<String>,
+    /// The live struct_ops prog's `used_maps` KVAs (each a `struct bpf_map`
+    /// KVA, matching [`BpfMapInfo::map_kva`]), SORTED for set comparison.
+    /// Re-read from the active-struct_ops walk each tick; a change signals an
+    /// `Op::ReplaceScheduler` swap and forces re-resolution. Targets bind only
+    /// to a map whose `map_kva` is in this set (the live instance).
+    live_map_kvas: Vec<u64>,
+    resolved: Vec<Option<ResolvedWatch>>,
+}
+
+/// Decode the first `width` bytes of `bytes` as a little-endian unsigned
+/// integer (width 1/2/4/8). `None` if `bytes` is shorter than `width` or the
+/// width is unsupported. The guest is little-endian (x86_64 / aarch64).
+fn le_uint(bytes: &[u8], width: usize) -> Option<u64> {
+    if !matches!(width, 1 | 2 | 4 | 8) || bytes.len() < width {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for (i, &b) in bytes[..width].iter().enumerate() {
+        v |= (b as u64) << (8 * i);
+    }
+    Some(v)
+}
+
+/// Among `maps` whose name ends with `suffix`, return the one whose `map_kva`
+/// is in `live_kvas` (the active struct_ops prog's `used_maps` set). This
+/// uniquely selects the LIVE scheduler instance when a same-binary
+/// `Op::ReplaceScheduler` leaves two identically-named maps coexisting (e.g. a
+/// pinned outgoing `.bss`): only the incoming instance's map is in the live
+/// set. Returns `None` when no live-set map matches the suffix.
+fn pick_live_map<'m>(
+    maps: &'m [BpfMapInfo],
+    suffix: &str,
+    live_kvas: &[u64],
+) -> Option<&'m BpfMapInfo> {
+    maps.iter()
+        .find(|m| m.name().ends_with(suffix) && live_kvas.contains(&m.map_kva))
+}
+
+/// True when the live struct_ops identity differs from the cached one -- the
+/// obj prefix changed OR the used-map-KVA SET changed (set comparison, so a
+/// reordering of `used_maps` entries does not false-trigger). A same-binary
+/// `Op::ReplaceScheduler` keeps the prefix but changes the KVA set, so the set
+/// is the load-bearing discriminator. `cached_sorted_kvas` is assumed sorted
+/// (the watcher keeps it so); `active_kvas` is sorted here for the compare.
+fn active_set_changed(
+    cached_prefix: Option<&str>,
+    cached_sorted_kvas: &[u64],
+    active_prefix: &str,
+    active_kvas: &[u64],
+) -> bool {
+    if cached_prefix != Some(active_prefix) {
+        return true;
+    }
+    if cached_sorted_kvas.len() != active_kvas.len() {
+        return true;
+    }
+    let mut cur = active_kvas.to_vec();
+    cur.sort_unstable();
+    cur != cached_sorted_kvas
+}
+
+/// Select the kernel page-table root PA for the per-tick vmalloc walk:
+/// the live `cr3_cache` value (masked) when published, else the
+/// once-captured `snapshot` fallback. Masks `& !0xFFF` to strip the CR3
+/// control bits \[11:0\] (PCID under CR4.PCIDE, else PWT/PCD) — matching
+/// the kernel's `CR3_ADDR_MASK` and the `guest.rs` `walk_cr3` derivation.
+/// The ktstr guest boots `mitigations=off` (KPTI/PTI disabled), so bit 12
+/// is a genuine pgd-PA address bit and MUST be preserved: clearing it (the
+/// KPTI-only `& !0x1FFF`) corrupts pgd PAs that are odd 4 KiB multiples.
+/// `live == 0` means `cr3_cache` is unpublished -> keep the snapshot.
+fn select_cr3(live: u64, snapshot: u64) -> u64 {
+    if live != 0 {
+        live & !0xFFFu64
+    } else {
+        snapshot
+    }
+}
+
+impl<'a> BpfMapWatcher<'a> {
+    fn new(cfg: &'a WatchBpfMapsCfg) -> Self {
+        let mut resolved = Vec::with_capacity(cfg.targets.len());
+        resolved.resize_with(cfg.targets.len(), || None);
+        Self {
+            cfg,
+            accessor: None,
+            obj_prefix: None,
+            live_map_kvas: Vec::new(),
+            resolved,
+        }
+    }
+
+    /// Read all resolvable targets this tick. Lazily builds the accessor +
+    /// obj-prefix + per-target resolution; returns the per-sample readings
+    /// (empty until the scheduler attaches and at least one target resolves).
+    /// The monitor produces `key_base` only; the `MonitorSummary` fold appends
+    /// `_avg`/`_max` for per-CPU targets.
+    fn sample(
+        &mut self,
+        page_offset: u64,
+        phys_base: u64,
+        start_kernel_map: u64,
+    ) -> Vec<BpfMapFieldSample> {
+        let cfg = self.cfg;
+        // Live kernel pgd PA from `cr3_cache`, refreshed every BSP
+        // iteration (freeze_coord). `0` = not yet published. BOTH walks
+        // below — struct-bpf_prog discovery AND the `.bss` leaf read (via
+        // the accessor) — translate vmalloc KVAs, which needs a CURRENT
+        // kernel pgd; the once-captured `cfg.cr3_pa` snapshot is the
+        // KASLR-fragile `init_top_pgt` fallback on a cold boot (cr3_cache
+        // still 0 at construction).
+        let live_cr3 = cfg.cr3.load(std::sync::atomic::Ordering::Acquire);
+        // Lazily build the owned accessor once phys_base/page tables are
+        // valid AND cr3_cache has published a live root. Building with the
+        // snapshot fallback would pin a bad cr3 for the accessor's whole
+        // life: `from_elf_with_hint` with a non-zero `phys_base` hint
+        // skips `resolve_phys_base` and builds successfully even on a bad
+        // cr3, so the `.bss` leaf read (vmalloc -> page-table walk via the
+        // accessor's stored cr3) would fail the entire run even after the
+        // discovery walk self-corrects. Defer until `live_cr3 != 0`; it
+        // lands in-window (scheduling = kernel mode). Pass the raw live
+        // cr3 — `from_elf_with_hint` masks it `& !0xFFF` (walk_cr3)
+        // internally. Tolerate failure (retry next tick).
+        if self.accessor.is_none() && live_cr3 != 0 {
+            self.accessor = goblin::elf::Elf::parse(&cfg.vmlinux_data)
+                .ok()
+                .and_then(|elf| {
+                    GuestMemMapAccessorOwned::from_elf_with_hint(
+                        Arc::clone(&cfg.mem),
+                        &elf,
+                        &cfg.vmlinux_data,
+                        &cfg.vmlinux,
+                        cfg.tcr_el1,
+                        live_cr3,
+                        phys_base,
+                    )
+                    .ok()
+                });
+        }
+        let Some(owned) = self.accessor.as_ref() else {
+            return Vec::new();
+        };
+        let accessor = owned.as_accessor();
+        // Re-resolve the active scheduler EACH tick from a single prog_idr walk
+        // that yields both the metric-key prefix and the live used-map-KVA set.
+        // `None` until a STRUCT_OPS scheduler attaches (or transiently mid-swap)
+        // -> emit nothing that tick.
+        // The struct-bpf_prog discovery walk needs the live kernel pgd
+        // (masked `& !0xFFF`); `select_cr3` falls back to the snapshot when
+        // cr3_cache is unpublished — in which case the accessor above is
+        // also still deferred, so this tick returns empty regardless.
+        let walk = WalkContext {
+            cr3_pa: select_cr3(live_cr3, cfg.cr3_pa),
+            page_offset,
+            l5: cfg.l5,
+            tcr_el1: cfg.tcr_el1,
+        };
+        let Some(active) = find_active_struct_ops_obj_no_target(
+            &cfg.mem,
+            walk,
+            cfg.prog_idr_kva,
+            &cfg.prog_offsets,
+            accessor.offsets(),
+            start_kernel_map,
+            phys_base,
+        ) else {
+            return Vec::new();
+        };
+        // An Op::ReplaceScheduler swap changes the live identity (obj prefix
+        // and/or the used-map-KVA set; same-binary swaps share the prefix, so
+        // the KVA set is the discriminator). On change, adopt the incoming
+        // identity and drop every cached resolution so targets rebind below via
+        // `pick_live_map` to a map whose `map_kva` is in the LIVE prog's
+        // used_maps. That used-maps membership filter -- not prog_idr eviction
+        // timing -- is what excludes a pinned outgoing `.bss`: the pin holds the
+        // outgoing MAP in map_idr, but that map is absent from the incoming
+        // prog's used_maps. (The outgoing struct_ops PROG also leaves prog_idr
+        // on process death, so the per-tick walk returns the incoming prog's
+        // set.)
+        if active_set_changed(
+            self.obj_prefix.as_deref(),
+            &self.live_map_kvas,
+            &active.obj_name,
+            &active.used_map_kvas,
+        ) {
+            self.obj_prefix = Some(active.obj_name.clone());
+            self.live_map_kvas = active.used_map_kvas.clone();
+            self.live_map_kvas.sort_unstable();
+            for slot in self.resolved.iter_mut() {
+                *slot = None;
+            }
+        }
+        let prefix = active.obj_name;
+        let maps = accessor.maps();
+        let mut out: Vec<BpfMapFieldSample> = Vec::new();
+        for (i, t) in cfg.targets.iter().enumerate() {
+            if self.resolved[i].is_none()
+                && let Some(map) = pick_live_map(&maps, &t.map_suffix, &self.live_map_kvas)
+            {
+                // Resolve the dot-path against the map's PROGRAM BTF (the
+                // scheduler's own types), falling back to vmlinux BTF.
+                let prog_btf = accessor.load_program_btf(map, &cfg.base_btf);
+                let btf = prog_btf.as_ref().unwrap_or(&cfg.base_btf);
+                if let Some((offset, width)) =
+                    resolve_map_field_offset_width(btf, map.btf_value_type_id, &t.field)
+                {
+                    self.resolved[i] = Some(ResolvedWatch {
+                        map: map.clone(),
+                        offset,
+                        width,
+                        per_cpu: t.per_cpu,
+                        counter: t.counter,
+                        key_base: format!("{prefix}_{}", t.label),
+                    });
+                }
+            }
+            let Some(r) = self.resolved[i].as_ref() else {
+                continue;
+            };
+            if r.per_cpu {
+                let per_cpu_bytes = accessor.read_percpu_array(&r.map, 0, cfg.num_cpus);
+                let vals: Vec<f64> = per_cpu_bytes
+                    .iter()
+                    .filter_map(|opt| {
+                        opt.as_ref()
+                            .and_then(|b| b.get(r.offset..r.offset + r.width))
+                            .and_then(|s| le_uint(s, r.width))
+                            .map(|u| u as f64)
+                    })
+                    .collect();
+                if !vals.is_empty() {
+                    out.push(BpfMapFieldSample {
+                        key_base: r.key_base.clone(),
+                        scalar: None,
+                        per_cpu: Some(vals),
+                        scalar_counter: false,
+                        per_cpu_counter: r.counter,
+                    });
+                }
+            } else if let Some(bytes) = accessor.read_value(&r.map, r.offset, r.width)
+                && let Some(u) = le_uint(&bytes, r.width)
+            {
+                out.push(BpfMapFieldSample {
+                    key_base: r.key_base.clone(),
+                    scalar: Some(u as f64),
+                    per_cpu: None,
+                    scalar_counter: r.counter,
+                    per_cpu_counter: false,
+                });
+            }
+        }
+        out
+    }
 }
 
 /// Run the monitor loop, sampling all CPUs at the given interval
@@ -2172,6 +2583,7 @@ pub(crate) fn monitor_loop(
     let perf_capture = cfg.perf_capture;
     let preemption_threshold_ns = cfg.preemption_threshold_ns;
     let prog_stats_ctx = cfg.prog_stats_ctx;
+    let psi = cfg.psi;
     // Mutable so the per-iteration refresh can update it once
     // `page_offset_base` becomes readable. Initialized from the
     // pre-loop resolved value, which on KASLR-randomized kernels
@@ -2209,16 +2621,6 @@ pub(crate) fn monitor_loop(
     let mut per_cpu_offsets_buf: Vec<u64> = prog_stats_ctx
         .map(|c| c.per_cpu_offsets.clone())
         .unwrap_or_default();
-    // Diagnostic counter for the refresh path. Emits per_cpu_offset[],
-    // rq_pas[], page_offset, runqueues_kva, mem.size, plus a direct
-    // rq_clock read, a phys_base probe, and a 16-byte hex dump for
-    // both the FIRST 5 iterations (catches initial state) AND the
-    // last 5 iterations of an assumed ~300-sample run (catches the
-    // post-guest-boot state). The early window distinguishes wrong
-    // pco_pa / wrong page_offset / wrong BTF rq_clock; the late
-    // window distinguishes "guest never wrote the BSS" from "writes
-    // are invisible to host monitor". Removed once probe-reload lands.
-    let mut diag_iter: u32 = 0;
     // Previous `page_offset_base` read, used by the stability gate
     // below. The bit-63 + canonical-half check alone is too loose:
     // mid-decompression garbage in the bzImage region can satisfy
@@ -2324,6 +2726,7 @@ pub(crate) fn monitor_loop(
                 page_offset: latched_page_offset,
                 preemption_threshold_ns,
                 boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
+                scx_event_counters_supported: false,
             };
         }
     };
@@ -2339,6 +2742,7 @@ pub(crate) fn monitor_loop(
             page_offset: latched_page_offset,
             preemption_threshold_ns,
             boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
+            scx_event_counters_supported: false,
         };
     }
     let epoll = match Epoll::new() {
@@ -2354,6 +2758,7 @@ pub(crate) fn monitor_loop(
                 page_offset: latched_page_offset,
                 preemption_threshold_ns,
                 boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
+                scx_event_counters_supported: false,
             };
         }
     };
@@ -2374,6 +2779,7 @@ pub(crate) fn monitor_loop(
             page_offset: latched_page_offset,
             preemption_threshold_ns,
             boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
+            scx_event_counters_supported: false,
         };
     }
     if let Err(e) = epoll.ctl(
@@ -2391,9 +2797,16 @@ pub(crate) fn monitor_loop(
             page_offset: latched_page_offset,
             preemption_threshold_ns,
             boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
+            scx_event_counters_supported: false,
         };
     }
     let mut epoll_buf = [EpollEvent::default(); 2];
+
+    // Watcher for named scheduler BPF-map fields (#[ktstr_test(watch_bpf_maps)]).
+    // `None` when no targets were declared; otherwise it lazily builds a
+    // guest-memory accessor + resolves each target after the scheduler attaches
+    // and reads them per tick into `MonitorSample::bpf_map_fields`.
+    let mut bpf_watcher = cfg.watch_bpf_maps.map(BpfMapWatcher::new);
 
     loop {
         if kill.load(Ordering::Acquire) {
@@ -2594,13 +3007,6 @@ pub(crate) fn monitor_loop(
             {
                 data_valid = true;
                 latched_page_offset = page_offset;
-                eprintln!(
-                    "DATA_VALID latched at iter={} page_offset={:#x} pco0={:#x} kaslr={:#x}",
-                    diag_iter,
-                    page_offset,
-                    fresh.first().copied().unwrap_or(0),
-                    kaslr_live,
-                );
             }
             rq_pas_buf = super::symbols::compute_rq_pas(
                 refresh.runqueues_kva,
@@ -2617,15 +3023,6 @@ pub(crate) fn monitor_loop(
                 resolve_event_pcpu_pas(mem, ev.scx_root_pa, &ev.event_offsets, &fresh, page_offset)
             });
             per_cpu_offsets_buf = fresh;
-
-            // Iteration counter — used by the DATA_VALID latch
-            // eprintln and the FINAL diagnostic after the loop. We
-            // dropped the per-iteration MONITOR/PHYS_BASE/HEX dumps
-            // because nextest's stderr capture made the 15
-            // eprintlns slower than the timerfd cadence and starved
-            // the loop down to a handful of samples per run.
-            // Saturating to avoid overflow on long runs.
-            diag_iter = diag_iter.saturating_add(1);
         }
 
         // Pre-validity short circuit: skip every guest-memory walk
@@ -2802,9 +3199,21 @@ pub(crate) fn monitor_loop(
         // a degenerate entry without minutes of phantom traversal.
         let prog_stats = if data_valid {
             prog_stats_ctx.map(|ctx| {
+                // Override the once-captured walk.cr3_pa snapshot with the
+                // live cr3 (masked `& !0xFFF`), falling back to the snapshot
+                // when cr3_cache is unpublished — same cold-boot staleness
+                // fix as the watch path. The IDR walk re-runs each tick, so
+                // no accessor-defer is needed (unlike the watcher).
+                let live_walk = WalkContext {
+                    cr3_pa: select_cr3(
+                        ctx.cr3.load(std::sync::atomic::Ordering::Acquire),
+                        ctx.walk.cr3_pa,
+                    ),
+                    ..ctx.walk
+                };
                 super::bpf_prog::walk_struct_ops_runtime_stats(
                     mem,
-                    ctx.walk,
+                    live_walk,
                     ctx.prog_idr_kva,
                     &ctx.offsets,
                     &per_cpu_offsets_buf,
@@ -2816,10 +3225,46 @@ pub(crate) fn monitor_loop(
             None
         };
 
+        // System-wide PSI-irq host-walk. `psi.psi_system_pa` is the
+        // pre-translated (`text_kva_to_pa_with_base`, once at setup) PA of the
+        // `psi_group psi_system` `.data` global — no per-iteration translation
+        // (unlike the per-CPU rq walk). Gated on `data_valid` so the run-level
+        // fold sees only workload-window pressure, matching the `cpus` /
+        // `prog_stats` samples. `*_off()` is `None` when
+        // `CONFIG_IRQ_TIME_ACCOUNTING` is off (BTF lacks `PSI_IRQ_FULL`) → no
+        // sample, the loud-absent path.
+        let psi_irq = if data_valid {
+            psi.and_then(|p| {
+                let total_off = p.offsets.total_irq_full_off()?;
+                let avg10_off = p.offsets.avg10_irq_full_off()?;
+                Some(super::PsiIrqSample {
+                    avg10_raw: mem.read_u64(p.psi_system_pa, avg10_off),
+                    total_ns: mem.read_u64(p.psi_system_pa, total_off),
+                })
+            })
+        } else {
+            None
+        };
+
+        // Named scheduler BPF-map field reads. Gated on `data_valid` (same as
+        // prog_stats / psi_irq) so only post-boot, post-attach readings fold
+        // into the run-level metrics; lazily resolves the maps the first time
+        // the scheduler is present.
+        let bpf_map_fields = if data_valid {
+            bpf_watcher
+                .as_mut()
+                .map(|w| w.sample(page_offset, phys_base, start_kernel_map))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         samples.push(MonitorSample {
+            bpf_map_fields,
             elapsed_ms: run_start.elapsed().as_millis() as u64,
             cpus: cpus.clone(),
             prog_stats,
+            psi_irq,
         });
 
         // Block until the next tick or a kill_evt write. -1 timeout
@@ -2853,62 +3298,6 @@ pub(crate) fn monitor_loop(
             }
         }
     }
-    // Final post-loop diagnostic — captures post-boot state once,
-    // after the kill flag flips. Distinguishes "guest never wrote
-    // __per_cpu_offset[]" from "writes invisible to host monitor"
-    // by re-reading the same PAs the early-window diag covered.
-    if let Some(refresh) = rq_refresh {
-        let fresh = super::symbols::read_per_cpu_offsets(mem, refresh.pco_pa, refresh.num_cpus);
-        let valid_samples = samples
-            .iter()
-            .filter(|s| s.cpus.iter().any(|c| c.rq_clock > 0))
-            .count();
-        let pob_pa_live = refresh.page_offset_base_pa.unwrap_or(0);
-        let pob_val = if pob_pa_live != 0 {
-            mem.read_u64(pob_pa_live, 0)
-        } else {
-            0
-        };
-        eprintln!(
-            "FINAL DIAG iters={iters} samples={samples} valid={valid} data_valid={dv} \
-             page_offset={po:#x} phys_base={pb:#x} start_kernel_map={skm:#x} \
-             pco_pa={pco_pa:#x} pob_pa={pob_pa:#x} pob_val={pob_val:#x} \
-             pco0={pco0:#x} pco1={pco1:#x} runqueues_kva={rq:#x} \
-             mem_size={ms:#x} rq_pa0={rq0:#x} kaslr_off={ko:#x}",
-            iters = diag_iter,
-            samples = samples.len(),
-            valid = valid_samples,
-            dv = data_valid,
-            po = page_offset,
-            pb = phys_base,
-            skm = cfg.start_kernel_map,
-            pco_pa = refresh.pco_pa,
-            pob_pa = pob_pa_live,
-            pob_val = pob_val,
-            pco0 = fresh.first().copied().unwrap_or(0),
-            pco1 = fresh.get(1).copied().unwrap_or(0),
-            rq = refresh.runqueues_kva,
-            ms = mem.size(),
-            ko = refresh
-                .kaslr_offset
-                .load(Ordering::Acquire)
-                .saturating_sub(1),
-            rq0 = rq_pas_buf.first().copied().unwrap_or(0),
-        );
-        if let Some(&rq0_pa) = rq_pas_buf.first() {
-            let raw_clock = mem.read_u64(rq0_pa, offsets.rq_clock);
-            let raw_nr_running = mem.read_u32(rq0_pa, offsets.rq_nr_running);
-            // Sanity: read first 8 bytes at rq0_pa (should be nr_running if offset 0 is correct)
-            let raw_first_8 = mem.read_u64(rq0_pa, 0);
-            // Read pco_pa itself to verify __per_cpu_offset[0] value
-            let pco0_verify = mem.read_u64(refresh.pco_pa, 0);
-            eprintln!(
-                "FINAL DIAG rq0: clock_off={} nr_off={} raw_clock={raw_clock} raw_nr={raw_nr_running} \
-                 raw_first_8={raw_first_8:#x} pco0_verify={pco0_verify:#x} rq0_pa={rq0_pa:#x} pco_pa={:#x}",
-                offsets.rq_clock, offsets.rq_nr_running, refresh.pco_pa,
-            );
-        }
-    }
     let shm_result = crate::vmm::host_comms::BulkDrainResult {
         entries: shm_entries,
     };
@@ -2919,6 +3308,7 @@ pub(crate) fn monitor_loop(
         page_offset: latched_page_offset,
         preemption_threshold_ns,
         boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
+        scx_event_counters_supported: false,
     }
 }
 
@@ -2928,6 +3318,119 @@ mod tests {
     use std::os::unix::thread::JoinHandleExt;
 
     const THRESHOLD_NS: u64 = 10_000_000;
+
+    /// `select_cr3` prefers the live `cr3_cache` value (masked `& !0xFFF`,
+    /// preserving bit 12 — the guest is mitigations=off so bit 12 is a real
+    /// pgd-PA bit) and falls back to the snapshot when unpublished (0). A
+    /// regression to the mask / live-precedence / fallback fails here in CI
+    /// without a booted VM (the watch e2e regression guard is host-gated).
+    #[test]
+    fn select_cr3_live_masked_else_snapshot() {
+        // Unpublished cr3_cache (0) -> snapshot fallback verbatim.
+        assert_eq!(select_cr3(0, 0xdead_b000), 0xdead_b000);
+        // Live cr3 wins over a non-zero snapshot.
+        assert_eq!(select_cr3(0x7_0000_0000, 0xdead_b000), 0x7_0000_0000);
+        // CR3 control bits \[11:0\] stripped; bit 12 PRESERVED (mitigations=off:
+        // bit 12 is a real pgd-PA bit, not the KPTI user-pgd selector — a
+        // `& !0x1FFF` mask would wrongly zero it and corrupt the pgd PA).
+        assert_eq!(select_cr3(0x7_0000_1abc, 0), 0x7_0000_1000);
+    }
+
+    /// `le_uint` decodes 1/2/4/8-byte little-endian unsigned integers and
+    /// rejects a short slice or an unsupported width (the watched-map reader
+    /// decodes leaf bytes by their BTF width).
+    #[test]
+    fn le_uint_decodes_supported_widths() {
+        assert_eq!(le_uint(&[0x34, 0x12], 2), Some(0x1234));
+        assert_eq!(le_uint(&[0x78, 0x56, 0x34, 0x12], 4), Some(0x1234_5678));
+        assert_eq!(le_uint(&[0xff], 1), Some(0xff));
+        assert_eq!(le_uint(&[1, 0, 0, 0, 0, 0, 0, 0], 8), Some(1), "8-byte LE",);
+        // Reads only `width` bytes even when more are present.
+        assert_eq!(le_uint(&[0x34, 0x12, 0xff, 0xff], 2), Some(0x1234));
+        // Short slice / unsupported width -> None.
+        assert_eq!(le_uint(&[0x12], 2), None);
+        assert_eq!(le_uint(&[1, 2, 3], 3), None);
+        assert_eq!(le_uint(&[], 0), None);
+    }
+
+    /// Build a minimal `BpfMapInfo` with a name + map_kva for the watcher
+    /// live-instance disambiguation tests.
+    fn map_for(name: &str, map_kva: u64) -> BpfMapInfo {
+        let (name_bytes, name_len) = crate::monitor::test_util::name_from_str(name);
+        BpfMapInfo {
+            name_bytes,
+            name_len,
+            map_kva,
+            ..Default::default()
+        }
+    }
+
+    /// `pick_live_map` binds a watch target to the LIVE instance's map when a
+    /// same-binary `Op::ReplaceScheduler` leaves two identically-named maps
+    /// coexisting (the pinned-outgoing case): only the incoming map's `map_kva`
+    /// is in the live used-map set, so it is chosen over the lower-address
+    /// outgoing copy a name-only scan would return first.
+    #[test]
+    fn pick_live_map_selects_the_live_copy_among_duplicates() {
+        let maps = vec![
+            map_for("bpf_bpf.bss", 0x1000), // outgoing (pinned, lower addr)
+            map_for("bpf_bpf.bss", 0x2000), // incoming (live)
+            map_for("bpf_bpf.data", 0x3000),
+        ];
+        let live = [0x2000u64, 0x3000];
+        let got = pick_live_map(&maps, ".bss", &live).expect("a live .bss");
+        assert_eq!(got.map_kva, 0x2000, "binds the incoming (live) .bss copy");
+    }
+
+    /// `pick_live_map` returns None when the suffix matches but no candidate is
+    /// in the live set, and when no name matches; Some for a single live match.
+    #[test]
+    fn pick_live_map_none_when_no_live_match() {
+        let maps = vec![map_for("bpf_bpf.bss", 0x1000)];
+        assert!(pick_live_map(&maps, ".bss", &[0x9999]).is_none());
+        assert!(pick_live_map(&maps, ".rodata", &[0x1000]).is_none());
+        assert_eq!(
+            pick_live_map(&maps, ".bss", &[0x1000]).map(|m| m.map_kva),
+            Some(0x1000),
+        );
+    }
+
+    /// `active_set_changed` detects an `Op::ReplaceScheduler` swap by the obj
+    /// prefix OR the used-map-KVA set, and is set-based (order-insensitive) so a
+    /// stable reordering of `used_maps` entries does not churn the cache.
+    #[test]
+    fn active_set_changed_detects_swap_set_based() {
+        // First resolve: no cached prefix -> changed.
+        assert!(active_set_changed(None, &[], "bpf_bpf", &[0x10, 0x20]));
+        // Same-binary swap: prefix unchanged, KVA set differs -> changed.
+        assert!(active_set_changed(
+            Some("bpf_bpf"),
+            &[0x10, 0x20],
+            "bpf_bpf",
+            &[0x30, 0x40],
+        ));
+        // Different obj prefix -> changed.
+        assert!(active_set_changed(
+            Some("bpf_bpf"),
+            &[0x10],
+            "scx_lavd",
+            &[0x10]
+        ));
+        // Identical set, active reordered (cached is sorted) -> NOT changed.
+        assert!(!active_set_changed(
+            Some("bpf_bpf"),
+            &[0x10, 0x20, 0x30],
+            "bpf_bpf",
+            &[0x30, 0x10, 0x20],
+        ));
+        // Different length -> changed.
+        assert!(active_set_changed(
+            Some("bpf_bpf"),
+            &[0x10, 0x20],
+            "bpf_bpf",
+            &[0x10],
+        ));
+    }
 
     #[test]
     fn evaluate_preempted_both_none_is_not_preempted() {
@@ -3025,7 +3528,9 @@ mod tests {
             start_kernel_map: super::super::symbols::START_KERNEL_MAP,
             phys_base: 0,
             rq_refresh: None,
+            psi: None,
             watchdog_reset: None,
+            watch_bpf_maps: None,
         }
     }
 
@@ -3039,6 +3544,7 @@ mod tests {
             scx_rq_local_dsq: 20,
             scx_rq_flags: 8,
             dsq_nr: 0,
+            rq_avg_irq_util_avg: None,
             event_offsets: None,
             schedstat_offsets: None,
             sched_domain_offsets: None,

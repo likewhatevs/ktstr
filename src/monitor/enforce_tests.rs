@@ -29,7 +29,9 @@ fn enforce_true_with_violation_yields_passed_false() {
     };
     let samples: Vec<_> = (0..4u64)
         .map(|i| MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: i * 100,
             cpus: vec![
                 CpuSnapshot {
@@ -91,7 +93,9 @@ fn enforce_false_with_violation_yields_passed_true_and_records_details() {
     };
     let samples: Vec<_> = (0..4u64)
         .map(|i| MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: i * 100,
             cpus: vec![
                 CpuSnapshot {

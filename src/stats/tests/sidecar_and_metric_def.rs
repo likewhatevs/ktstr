@@ -89,6 +89,118 @@ fn sidecar_to_row_carries_worst_iterations_per_cpu_sec_via_ext() {
     assert_eq!(def.read(&sidecar_to_row(&absent)), None);
 }
 
+/// The host-side monitor schedstat aggregates flow into
+/// `GauntletRow.ext_metrics` as the seven raw `Polarity::Informational`
+/// counters; each is registered so `MetricDef::read` surfaces it via the
+/// `|_| None` ext fallback and `classify_direction` returns `None` (never
+/// gated). When `schedstat_deltas` is `None` (CONFIG_SCHEDSTATS off) the
+/// keys are ABSENT, not 0 — a 0 would pollute the cross-run Counter sum and
+/// the Rate denominators.
+#[test]
+fn sidecar_to_row_carries_monitor_schedstat_ext_counters() {
+    use crate::monitor;
+    use crate::test_support;
+    let sc = test_support::SidecarResult {
+        monitor: Some(monitor::MonitorSummary {
+            schedstat_deltas: Some(monitor::SchedstatDeltas {
+                total_run_delay: 6000,
+                total_pcount: 3,
+                total_sched_count: 100,
+                total_yld_count: 5,
+                total_sched_goidle: 20,
+                total_ttwu_count: 200,
+                total_ttwu_local: 150,
+                total_schedstat_wall_sec: 2.0,
+            }),
+            ..Default::default()
+        }),
+        ..test_support::SidecarResult::test_fixture()
+    };
+    let row = sidecar_to_row(&sc);
+    for (name, want) in [
+        ("total_run_delay", 6000.0),
+        ("total_pcount", 3.0),
+        ("total_sched_count", 100.0),
+        ("total_yld_count", 5.0),
+        ("total_sched_goidle", 20.0),
+        ("total_ttwu_count", 200.0),
+        ("total_ttwu_local", 150.0),
+        // The per-second Rate denominator, co-inserted with the counters (the
+        // *_per_sec rates derive total_X / this in the cross-run fold).
+        ("total_schedstat_wall_sec", 2.0),
+    ] {
+        assert_eq!(
+            row.ext_metrics.get(name).copied(),
+            Some(want),
+            "{name} ext key"
+        );
+        let def = metric_def(name).unwrap_or_else(|| panic!("{name} registered"));
+        assert_eq!(
+            def.read(&row),
+            Some(want),
+            "{name} surfaced via ext fallback"
+        );
+        assert_eq!(
+            def.classify_direction(),
+            None,
+            "{name} is informational (never gates)"
+        );
+    }
+
+    // schedstat_deltas == None => keys ABSENT (not 0).
+    let no_sd = test_support::SidecarResult {
+        monitor: Some(monitor::MonitorSummary {
+            schedstat_deltas: None,
+            ..Default::default()
+        }),
+        ..test_support::SidecarResult::test_fixture()
+    };
+    let row2 = sidecar_to_row(&no_sd);
+    assert!(!row2.ext_metrics.contains_key("total_run_delay"));
+    assert!(!row2.ext_metrics.contains_key("total_ttwu_count"));
+}
+
+/// `avg_nr_running` (whole-run mean runqueue occupancy) flows from
+/// `MonitorSummary::avg_nr_running` into `GauntletRow.ext_metrics` as a
+/// registered `Gauge(Avg)` / LowerBetter metric, surfaced via the `|_| None`
+/// ext fallback. Absent (not 0.0) when the run has no monitor samples — a
+/// 0-sample run carries no occupancy signal.
+#[test]
+fn sidecar_to_row_carries_avg_nr_running_when_sampled() {
+    use crate::monitor;
+    use crate::test_support;
+    let sc = test_support::SidecarResult {
+        monitor: Some(monitor::MonitorSummary {
+            total_samples: 10,
+            avg_nr_running: 2.5,
+            ..Default::default()
+        }),
+        ..test_support::SidecarResult::test_fixture()
+    };
+    let row = sidecar_to_row(&sc);
+    assert_eq!(row.ext_metrics.get("avg_nr_running").copied(), Some(2.5));
+    let def = metric_def("avg_nr_running").expect("avg_nr_running registered");
+    assert_eq!(def.read(&row), Some(2.5));
+    // Directional (LowerBetter), NOT informational: classify_direction Some(true).
+    assert_eq!(def.classify_direction(), Some(true));
+
+    // No samples => ABSENT (MonitorSummary.avg_nr_running defaults to 0.0, but a
+    // 0-sample run has no occupancy signal — absent, not a false 0.0).
+    let no_samples = test_support::SidecarResult {
+        monitor: Some(monitor::MonitorSummary {
+            total_samples: 0,
+            avg_nr_running: 0.0,
+            ..Default::default()
+        }),
+        ..test_support::SidecarResult::test_fixture()
+    };
+    assert!(
+        !sidecar_to_row(&no_samples)
+            .ext_metrics
+            .contains_key("avg_nr_running")
+    );
+}
+
 #[test]
 fn sidecar_to_row_no_monitor() {
     use crate::test_support;
@@ -336,6 +448,43 @@ fn sidecar_to_row_propagates_run_source() {
     );
 }
 
+/// `sidecar_to_row` must copy `SidecarResult::resolve_source` into
+/// `GauntletRow::resolve_source` verbatim so the `--resolve-source`
+/// compare filter and `stats list-values` surface the discovery-path tag
+/// the sidecar writer recorded. A regression leaving the row field at
+/// `Option::default()` (`None`) would silently drop the resolve-source
+/// dimension. Mirrors `sidecar_to_row_propagates_run_source`; pinned for
+/// `None` and the canonical discovery-path tags.
+#[test]
+fn sidecar_to_row_propagates_resolve_source() {
+    use crate::test_support;
+    for tag in ["auto_built", "target_debug", "path"] {
+        let sc = test_support::SidecarResult {
+            test_name: format!("resolve_source_{tag}_test"),
+            topology: "1n1l2c1t".to_string(),
+            resolve_source: Some(tag.to_string()),
+            ..test_support::SidecarResult::test_fixture()
+        };
+        let row = sidecar_to_row(&sc);
+        assert_eq!(
+            row.resolve_source.as_deref(),
+            Some(tag),
+            "populated resolve_source `{tag}` must propagate verbatim",
+        );
+    }
+
+    let sc_none = test_support::SidecarResult {
+        test_name: "no_resolve_source_test".to_string(),
+        topology: "1n1l2c1t".to_string(),
+        resolve_source: None,
+        ..test_support::SidecarResult::test_fixture()
+    };
+    assert!(
+        sidecar_to_row(&sc_none).resolve_source.is_none(),
+        "absent resolve_source must propagate as None",
+    );
+}
+
 #[test]
 fn sidecar_to_row_no_stall() {
     use crate::monitor;
@@ -365,13 +514,13 @@ fn sidecar_to_row_no_stall() {
 ///
 /// Covers the `finite_or_zero` call sites in `sidecar_to_row`: the
 /// remaining direct [`ScenarioStats`] f64 fields (worst_spread,
-/// worst_migration_ratio, worst_page_locality,
-/// worst_cross_node_migration_ratio) plus
-/// `imbalance_ratio` from [`MonitorSummary`]. (The wake / run-delay
-/// roll-ups are now ext_metrics-sourced — non-finite ext entries are
-/// DROPPED, covered by `sidecar_to_row_drops_non_finite_ext_metrics`.) A
-/// missed call site would leave one assert comparing the non-finite input
-/// to 0.0 (NaN != 0.0, ±Infinity != 0.0) and fail the test.
+/// worst_migration_ratio) plus `imbalance_ratio` from [`MonitorSummary`].
+/// (The wake / run-delay and both NUMA roll-ups — `worst_page_locality`,
+/// `worst_cross_node_migration_ratio` — are now ext_metrics-sourced; non-finite
+/// ext entries are DROPPED, covered by
+/// `sidecar_to_row_drops_non_finite_ext_metrics`.) A missed call site would
+/// leave one assert comparing the non-finite input to 0.0 (NaN != 0.0,
+/// ±Infinity != 0.0) and fail the test.
 fn assert_all_direct_f64_fields_sanitized(non_finite: f64) {
     use crate::assert::ScenarioStats;
     use crate::monitor::MonitorSummary;
@@ -380,8 +529,6 @@ fn assert_all_direct_f64_fields_sanitized(non_finite: f64) {
         stats: ScenarioStats {
             worst_spread: non_finite,
             worst_migration_ratio: non_finite,
-            worst_page_locality: non_finite,
-            worst_cross_node_migration_ratio: non_finite,
             ..Default::default()
         },
         monitor: Some(MonitorSummary {
@@ -395,8 +542,6 @@ fn assert_all_direct_f64_fields_sanitized(non_finite: f64) {
         ("spread", row.spread),
         ("migration_ratio", row.migration_ratio),
         ("imbalance_ratio", row.imbalance_ratio),
-        ("page_locality", row.page_locality),
-        ("cross_node_migration_ratio", row.cross_node_migration_ratio),
     ] {
         assert_eq!(
             val, 0.0,
@@ -456,8 +601,7 @@ fn sidecar_to_row_preserves_subnormal_f64_in_direct_fields() {
     let sc = test_support::SidecarResult {
         stats: ScenarioStats {
             worst_spread: subnormal,
-            worst_page_locality: -subnormal,
-            worst_migration_ratio: subnormal,
+            worst_migration_ratio: -subnormal,
             ..Default::default()
         },
         ..test_support::SidecarResult::test_fixture()
@@ -468,12 +612,8 @@ fn sidecar_to_row_preserves_subnormal_f64_in_direct_fields() {
         "positive subnormal must pass through finite_or_zero unchanged",
     );
     assert_eq!(
-        row.page_locality, -subnormal,
-        "negative subnormal must pass through finite_or_zero unchanged",
-    );
-    assert_eq!(
-        row.migration_ratio, subnormal,
-        "subnormal on a second direct-f64 field must also pass through",
+        row.migration_ratio, -subnormal,
+        "negative subnormal on a second direct-f64 field must also pass through unchanged",
     );
     // Motivation check: subnormals serialize (unlike NaN / ±Inf,
     // serde_json emits them as standard decimal literals).
@@ -502,8 +642,6 @@ fn sidecar_to_row_direct_field_nan_does_not_touch_ext_metrics() {
             // Every remaining direct f64 field non-finite.
             worst_spread: f64::NAN,
             worst_migration_ratio: f64::INFINITY,
-            worst_page_locality: f64::INFINITY,
-            worst_cross_node_migration_ratio: f64::NEG_INFINITY,
             ext_metrics: ext.clone(),
             ..Default::default()
         },
@@ -514,7 +652,6 @@ fn sidecar_to_row_direct_field_nan_does_not_touch_ext_metrics() {
     // Direct-field collapse still works.
     assert_eq!(row.spread, 0.0);
     assert_eq!(row.migration_ratio, 0.0);
-    assert_eq!(row.page_locality, 0.0);
 
     // ext_metrics survives unchanged — same length, same keys,
     // same values.
@@ -745,8 +882,15 @@ fn metric_def_polarity_covers_all_entries() {
     // from the bool->Polarity adaptor.
     for m in METRICS.iter() {
         assert!(
-            matches!(m.polarity, Polarity::HigherBetter | Polarity::LowerBetter),
-            "metric {} produced non-binary polarity {:?}",
+            matches!(
+                m.polarity,
+                Polarity::HigherBetter | Polarity::LowerBetter | Polarity::Informational
+            ),
+            "metric {} produced unexpected polarity {:?} — only HigherBetter / \
+             LowerBetter (directional, gated) and Informational (directionless, \
+             never gated) are registered; TargetValue / Unknown are not used by \
+             any METRICS entry (Unknown stays the conservative default for \
+             UNclassified metrics, not a deliberate registry choice)",
             m.name,
             m.polarity
         );
@@ -923,6 +1067,24 @@ fn distribution_worstlowest_kind_json_shape_pinned() {
     ] {
         assert!(wl.contains(tok), "{tok} missing from {wl}");
     }
+    // The NUMA pairing (worst_page_locality's kind) — pins the NumaLocal /
+    // NumaTotal variant strings so a rename trips here, not the CLI output.
+    let numa = serde_json::to_string(&MetricKind::WorstLowest {
+        numerator: WorstLowestNumerator::NumaLocal,
+        denominator: WorstLowestDenominator::NumaTotal,
+    })
+    .expect("MetricKind serializes");
+    for tok in ["\"NumaLocal\"", "\"NumaTotal\""] {
+        assert!(numa.contains(tok), "{tok} missing from {numa}");
+    }
+    // worst_cross_node_migration_ratio's kind (a unit variant) — pin the variant
+    // string so a rename trips here, not the CLI output.
+    let xnode =
+        serde_json::to_string(&MetricKind::WorstCrossNodeRatio).expect("MetricKind serializes");
+    assert!(
+        xnode.contains("WorstCrossNodeRatio"),
+        "WorstCrossNodeRatio missing from {xnode}",
+    );
 }
 
 /// Iteration order of [`list_metrics`] matches [`METRICS`]
@@ -935,9 +1097,28 @@ fn list_metrics_text_preserves_registry_order() {
     let out = list_metrics(false).expect("text render must succeed");
     let mut last_pos = 0usize;
     for m in METRICS {
+        // Match m.name as a WHOLE name, not a substring of a longer one: a bare
+        // per-cgroup name (e.g. `migration_ratio`) is a substring of its
+        // run-level `worst_*` sibling (`worst_migration_ratio`), so a plain
+        // `find` would match the earlier `worst_` row and report a false
+        // out-of-order. Accept only an occurrence whose preceding char is not a
+        // name char (alphanumeric or `_`) — i.e. the start of a NAME-column cell.
         let pos = out
-            .find(m.name)
-            .unwrap_or_else(|| panic!("metric {} must appear in text output", m.name));
+            .match_indices(m.name)
+            .find(|(i, _)| {
+                *i == 0
+                    || !out[..*i]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            })
+            .map(|(i, _)| i)
+            .unwrap_or_else(|| {
+                panic!(
+                    "metric {} must appear as a whole name in text output",
+                    m.name
+                )
+            });
         assert!(
             pos >= last_pos,
             "metric {} appears before a prior metric — text output must \
@@ -983,6 +1164,7 @@ fn list_values_empty_pool_text_has_sentinel_per_dim() {
         "commit:",
         "kernel_commit:",
         "source:",
+        "resolve_source:",
         "cpu_budget:",
         "scheduler:",
         "topology:",
@@ -993,16 +1175,16 @@ fn list_values_empty_pool_text_has_sentinel_per_dim() {
             "text output must include heading for {dim}: {out}",
         );
     }
-    // Each dim should report the empty-pool sentinel exactly eight
+    // Each dim should report the empty-pool sentinel exactly nine
     // times — one per dim — so a regression that dropped the
     // sentinel for one dim falls out as a count mismatch.
     let sentinel_count = out.matches("(no sidecars in pool)").count();
     assert_eq!(
-        sentinel_count, 8,
+        sentinel_count, 9,
         "empty pool must surface the no-sidecars sentinel under every \
-             one of the 8 dims (kernel/commit/kernel_commit/source/\
-             cpu_budget/scheduler/topology/work_type); got {sentinel_count} \
-             occurrences in:\n{out}",
+             one of the 9 dims (kernel/commit/kernel_commit/source/\
+             resolve_source/cpu_budget/scheduler/topology/work_type); got \
+             {sentinel_count} occurrences in:\n{out}",
     );
 }
 
@@ -1019,6 +1201,7 @@ fn list_values_empty_pool_json_emits_empty_arrays() {
         "commit",
         "kernel_commit",
         "source",
+        "resolve_source",
         "cpu_budget",
         "scheduler",
         "topology",
@@ -1113,23 +1296,26 @@ fn list_values_text_dedupes_and_sorts_per_dim() {
     // kernel_commit set's None bucket renders one `unknown`
     // line as well. Total: 3 occurrences.
     //
-    // `run_source` is the fourth optional dim but does NOT
-    // contribute an `unknown` here: `list_values(_, Some(dir))`
-    // calls `apply_archive_source_override` on the loaded pool
-    // (the `--dir` flag treats the supplied root as an archive),
-    // which rewrites every `run_source: None` to
-    // `Some("archive")` BEFORE the dimension-set is built. Every
-    // fixture above leaves `run_source` at its `test_fixture`
-    // default (None), but they all surface as `archive` after
-    // the override — the run_source set never holds a None
-    // entry on this code path, so no `unknown` line is emitted
-    // for it.
+    // `run_source` is an optional dim but does NOT contribute an
+    // `unknown` here: `list_values(_, Some(dir))` calls
+    // `apply_archive_source_override` on the loaded pool (the `--dir`
+    // flag treats the supplied root as an archive), which rewrites
+    // every `run_source: None` to `Some("archive")` BEFORE the
+    // dimension-set is built. Every fixture above leaves `run_source`
+    // at its `test_fixture` default (None), but they all surface as
+    // `archive` after the override — the run_source set never holds a
+    // None entry on this code path, so no `unknown` line is emitted
+    // for it. `resolve_source` IS the fourth `unknown`-contributing
+    // optional dim: the archive override touches only `run_source`,
+    // so `resolve_source` (None on every fixture here) keeps its None
+    // entry and renders one `unknown` line. Total: kernel + commit +
+    // kernel_commit + resolve_source = 4.
     let unknown_count = out.matches("unknown").count();
     assert_eq!(
-        unknown_count, 3,
+        unknown_count, 4,
         "`unknown` must render once per optional dim with a None \
-             entry (kernel + commit + kernel_commit = 3); got \
-             {unknown_count} in:\n{out}",
+             entry (kernel + commit + kernel_commit + resolve_source = \
+             4); got {unknown_count} in:\n{out}",
     );
 
     // Sort: both schedulers in ascending lex order means
@@ -1236,12 +1422,14 @@ fn list_values_json_carries_null_for_optional_dims() {
             test_name: "t_known".to_string(),
             kernel_version: Some("6.14.2".to_string()),
             project_commit: Some("abcdef1".to_string()),
+            resolve_source: Some("auto_built".to_string()),
             ..SidecarResult::test_fixture()
         },
         SidecarResult {
             test_name: "t_unknown".to_string(),
             kernel_version: None,
             project_commit: None,
+            resolve_source: None,
             ..SidecarResult::test_fixture()
         },
     ];
@@ -1276,6 +1464,25 @@ fn list_values_json_carries_null_for_optional_dims() {
     assert!(
         commit.iter().any(|v| v.as_str() == Some("abcdef1")),
         "commit array must include the populated value abcdef1; got {commit:?}",
+    );
+
+    // resolve_source is the ninth list-values dimension (JSON key
+    // "resolve_source"); it carries null for the None fixture and the
+    // populated discovery-path tag for the other. Unlike run_source, the
+    // `--dir` archive override does NOT touch resolve_source, so the None
+    // entry stays null here.
+    let resolve = parsed
+        .get("resolve_source")
+        .expect("resolve_source key")
+        .as_array()
+        .unwrap();
+    assert!(
+        resolve.iter().any(|v| v.is_null()),
+        "resolve_source array must include a literal null for the None entry; got {resolve:?}",
+    );
+    assert!(
+        resolve.iter().any(|v| v.as_str() == Some("auto_built")),
+        "resolve_source array must include the populated tag auto_built; got {resolve:?}",
     );
 }
 
@@ -1317,16 +1524,18 @@ fn metric_def_read_named_fields() {
     row.fallback_count = 11;
     row.keep_last_count = 4;
     row.total_iterations = 1000;
-    row.page_locality = 0.8;
-    row.cross_node_migration_ratio = 0.1;
-    // Distribution roll-ups are ext_metrics-sourced now (accessor |_| None);
-    // read_metric resolves them via MetricDef::read's ext fallback.
+    // Distribution + WorstLowest + WorstCrossNodeRatio (worst_page_locality,
+    // worst_cross_node_migration_ratio) roll-ups are ext_metrics-sourced now
+    // (accessor |_| None); read_metric resolves them via MetricDef::read's ext
+    // fallback.
     for (name, v) in [
         ("worst_p99_wake_latency_us", 99.0),
         ("worst_median_wake_latency_us", 50.0),
         ("worst_wake_latency_cv", 0.5),
         ("worst_mean_run_delay_us", 25.0),
         ("worst_run_delay_us", 200.0),
+        ("worst_page_locality", 0.8),
+        ("worst_cross_node_migration_ratio", 0.1),
     ] {
         row.ext_metrics.insert(name.to_string(), v);
     }

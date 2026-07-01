@@ -217,26 +217,36 @@ fn repool_distribution_cross_source_arm_debug_asserts_in_test_build() {
         &empty_carriers,
         &[],
         &empty_carriers,
+        &[],
+        &empty_carriers,
         &[CgroupStats {
             cgroup_name: "a".to_string(),
+            // Measured (false would gate it out of the carrier-less fold before
+            // distribution_cgroup_reduction runs, so the cross-source arm —
+            // whose debug_assert this test pins — would never be reached).
+            wake_measured: true,
             ..CgroupStats::default()
         }],
         0,
     );
 }
 
-/// Distribution measured-zero contract: a cgroups-present cohort with NO
-/// carrier samples whose per-cgroup reductions are all 0.0 folds to
-/// `Some(0.0)` — a measured zero, NOT absence (matching the deleted
-/// 0.0-sentinel typed field). Contrast WorstLowest, which yields `None` for
-/// an all-`None` cohort. Guards against a future "zero-as-sentinel" refactor
-/// silently flipping a quiet run's Distribution from `Some(0.0)` to absent.
+/// Distribution measured-zero contract: a cohort whose cgroups DID measure the
+/// source (the `*_measured` flags are set) but whose per-cgroup reductions are
+/// all 0.0 folds to `Some(0.0)` — a real measured zero. Contrast the sibling
+/// `repool_distribution_no_measurement_cohort_is_absent_not_zero`, where
+/// unmeasured cgroups (no samples) yield absence. Guards against a future
+/// refactor collapsing a genuinely-measured quiet run's Distribution to absent.
 #[test]
 fn repool_distribution_all_zero_reductions_is_measured_zero_not_absent() {
     let cg = CgroupStats {
         cgroup_name: "x".to_string(),
         p99_wake_latency_us: 0.0,
         worst_run_delay_us: 0.0,
+        // Measured: this cohort recorded samples that genuinely reduced to 0.0
+        // (e.g. instant wakes / no queue delay), distinct from no-measurement.
+        wake_measured: true,
+        run_delay_measured: true,
         ..CgroupStats::default()
     };
     // Stripped/empty carrier named "x" -> "x" not in *_carriers -> the
@@ -246,7 +256,7 @@ fn repool_distribution_all_zero_reductions_is_measured_zero_not_absent() {
     assert_eq!(
         stats.ext_metrics.get("worst_p99_wake_latency_us").copied(),
         Some(0.0),
-        "all-zero-reduction cohort -> measured Some(0.0), not absent",
+        "measured cohort with 0.0 reductions -> Some(0.0), not absent",
     );
     assert_eq!(
         stats.ext_metrics.get("worst_run_delay_us").copied(),
@@ -259,6 +269,34 @@ fn repool_distribution_all_zero_reductions_is_measured_zero_not_absent() {
             .ext_metrics
             .contains_key("worst_iterations_per_worker"),
         "all-None WorstLowest cohort stays absent, distinct from Distribution's 0.0",
+    );
+}
+
+/// Distribution no-measurement contract (the carrier-less re-pool fix): a
+/// cohort with NO measurement for the source — every cgroup unmeasured
+/// (`*_measured` false) and empty carriers — yields ABSENCE (None), not a
+/// sentinel `Some(0.0)`. A percentile / mean over zero samples is undefined,
+/// and folding its 0.0 into the LowerBetter cross-run mean would falsely drag
+/// it toward "perfect". This pins the sibling of the measured-zero case above.
+#[test]
+fn repool_distribution_no_measurement_cohort_is_absent_not_zero() {
+    let cg = CgroupStats {
+        cgroup_name: "x".to_string(),
+        p99_wake_latency_us: 0.0,
+        worst_run_delay_us: 0.0,
+        // Unmeasured: no wake / run-delay samples (flags default false). The
+        // 0.0 reductions are not-measured sentinels, NOT measured zeros.
+        ..CgroupStats::default()
+    };
+    let mut stats = repool_stats(vec![("x", PhaseCgroupStats::default())], vec![cg]);
+    populate_run_distribution_metrics(&mut stats);
+    assert!(
+        !stats.ext_metrics.contains_key("worst_p99_wake_latency_us"),
+        "no-wake-measurement cohort must be ABSENT, not a false Some(0.0)",
+    );
+    assert!(
+        !stats.ext_metrics.contains_key("worst_run_delay_us"),
+        "no-run-delay-measurement cohort must be ABSENT, not a false Some(0.0)",
     );
 }
 
@@ -320,12 +358,16 @@ fn repool_distribution_falls_back_to_cgroup_reductions_when_stripped() {
         cgroup_name: "a".to_string(),
         p99_wake_latency_us: 30.0,
         worst_run_delay_us: 80.0,
+        wake_measured: true,
+        run_delay_measured: true,
         ..CgroupStats::default()
     };
     let cg1 = CgroupStats {
         cgroup_name: "b".to_string(),
         p99_wake_latency_us: 70.0,
         worst_run_delay_us: 50.0,
+        wake_measured: true,
+        run_delay_measured: true,
         ..CgroupStats::default()
     };
     // Phase carrier with EMPTY sample vecs (the stripped state). Named "a"
@@ -476,6 +518,7 @@ fn repool_distribution_folds_carrierless_backdrop_not_dropped() {
     let cg_bd = CgroupStats {
         cgroup_name: "bd".to_string(),
         p99_wake_latency_us: 500.0,
+        wake_measured: true,
         ..CgroupStats::default()
     };
     let mut stats = repool_stats(vec![("a", carrier_a)], vec![cg_a, cg_bd]);
@@ -519,6 +562,7 @@ fn repool_run_delay_folds_carrierless_backdrop_independently_of_wake() {
         cgroup_name: "bd".to_string(),
         mean_run_delay_us: 500.0, // no carrier → folds worst-wins
         worst_run_delay_us: 700.0,
+        run_delay_measured: true,
         ..CgroupStats::default()
     };
     let mut stats = repool_stats(vec![("a", carrier_a)], vec![cg_a, cg_bd]);

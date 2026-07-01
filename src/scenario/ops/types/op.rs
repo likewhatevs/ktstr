@@ -682,7 +682,7 @@ pub enum Op {
     /// **Already-attached behavior.** No framework-level idempotency
     /// guard: if a scheduler is already running, the kernel rejects
     /// the new attach at the `scx_enable_state() != SCX_DISABLED`
-    /// gate (`kernel/sched/ext.c:6621`, returns `-EBUSY`); the
+    /// gate (`kernel/sched/ext.c:6837`, returns `-EBUSY`); the
     /// spawned binary exits, no fresh publish lands, and the dispatch
     /// bails on the 30s publish-wait timeout. Use
     /// [`Op::DetachScheduler`] (then `AttachScheduler`) or
@@ -707,9 +707,11 @@ pub enum Op {
     /// isn't promoted into a test-fatal scheduler-died signal,
     /// writes `'S'` to `/proc/sysrq-trigger` to start the kernel-
     /// side `scx_disable` cascade asynchronously (avoiding the
-    /// D-state stall inside `bpf_scx_unreg`'s
+    /// D-state stall inside `scx_flush_disable_work`'s
     /// `kthread_flush_work(&sch->disable_work)` at
-    /// `kernel/sched/ext.c:7372-7381`), sends `SIGTERM` to the
+    /// `kernel/sched/ext.c:6145`, reached on the struct_ops detach
+    /// path via `bpf_scx_unreg` at `kernel/sched/ext.c:7666`), sends
+    /// `SIGTERM` to the
     /// scheduler pid, waits up to `SCHED_LIFECYCLE_KILL_GRACE` (10s)
     /// for the kernel BPF state to reach `SCX_DISABLED`, then
     /// clears the `SCHED_PID` atomic (defined in
@@ -988,6 +990,58 @@ pub enum Op {
         /// the Backdrop). Must be non-empty.
         cgroup: Cow<'static, str>,
     },
+    /// Re-steer a hardware IRQ to a single CPU by writing
+    /// `/proc/irq/<N>/smp_affinity_list` in the guest — the knob
+    /// that drives the kernel's `write_irq_affinity` →
+    /// `irq_set_affinity` → `irq_do_set_affinity` → irqchip
+    /// `set_affinity` path (`kernel/irq/proc.c`,
+    /// `kernel/irq/manage.c`). Use it to place a NIC's
+    /// RX-completion interrupt on a chosen CPU so the hardirq, the
+    /// `NET_RX` softirq it raises, and any task that path wakes all
+    /// land where the scenario wants them: the steering half of an
+    /// IRQ-locality test whose generating half is
+    /// [`crate::workload::WorkType::NetTraffic`] and whose observing
+    /// half is the per-CPU IRQ metric axis (`max_cpu_hardirqs`,
+    /// `max_cpu_softirq_net_rx`, and their `*_concentration` ratios).
+    ///
+    /// # In-guest file write, NOT a kernel-memory poke
+    ///
+    /// A write to the `irq_desc` affinity mask in kernel memory would
+    /// NOT re-route delivery — only the `smp_affinity_list` write
+    /// runs the full set-affinity path that reprograms the interrupt
+    /// controller (MSI-X message / IOAPIC RTE). So this Op is
+    /// dispatched as a plain `std::fs::write` from the executor
+    /// in-guest (mirroring the `/proc/sysrq-trigger` write
+    /// [`Op::DetachScheduler`] performs), NOT through the
+    /// kernel-memory rendezvous path of [`Op::WriteKernelHot`] /
+    /// [`Op::WriteKernelCold`].
+    ///
+    /// # Online-CPU requirement
+    ///
+    /// The kernel intersects the requested mask with
+    /// `cpu_online_mask` before programming the irqchip
+    /// (`irq_do_set_affinity`); a single-CPU target that is offline
+    /// leaves no online CPU in the mask and the write returns
+    /// `-EINVAL` (the `!cpumask_intersects(new_value,
+    /// cpu_online_mask)` arm of `write_irq_affinity`). The
+    /// dispatcher pre-checks `cpu` against
+    /// `/sys/devices/system/cpu/online` and bails with an actionable
+    /// message before the write, so an out-of-range / offline target
+    /// names the CPU instead of surfacing a bare `EINVAL`. IRQ
+    /// affinity is a system-wide property, NOT scoped to the writing
+    /// task's cpuset — the target need not be in the runner's
+    /// allowed set.
+    ///
+    /// Construct via [`Op::steer_irq`].
+    SteerIrq {
+        /// Which IRQ to steer — a literal Linux IRQ number or a
+        /// `/proc/interrupts` action-name label. See [`IrqSelector`].
+        irq: IrqSelector,
+        /// Target Linux processor number — the value written to
+        /// `smp_affinity_list`. Must be online (see the variant's
+        /// online-CPU requirement above).
+        cpu: usize,
+    },
 }
 
 /// Placement target for [`Op::Spawn`].
@@ -1058,6 +1112,66 @@ impl SpawnPlacement {
     /// composes inside `const` scenarios + builds.
     pub const fn runner_cgroup() -> Self {
         SpawnPlacement::RunnerCgroup
+    }
+}
+
+/// Which IRQ [`Op::SteerIrq`] targets.
+///
+/// Two ways to name the same hardware IRQ:
+///
+/// - [`ByNumber`](Self::ByNumber) — the literal Linux IRQ number (the
+///   leading column in `/proc/interrupts`, the `<N>` in
+///   `/proc/irq/<N>/`). Use when the scenario already resolved the
+///   number (e.g. via the per-NIC IRQ discovery a test does itself).
+/// - [`ByLabel`](Self::ByLabel) — the `/proc/interrupts` action name
+///   (the last whitespace token on the IRQ's line). The dispatcher
+///   scans `/proc/interrupts` for the first line whose last token
+///   equals the label and steers that IRQ. Use when the number is
+///   not known ahead of time but the device label is stable. On the
+///   virtio-MMIO transport ktstr boots, the NIC registers ONE shared
+///   IRQ whose action name is the bare device basename (e.g.
+///   `"virtio1"`), so that resolves uniquely. Limitation: the match
+///   is the line's last token only — a shared IRQ (a comma-separated
+///   action chain) matches just the LAST action, and a multi-word
+///   action name never matches. The match deliberately is not
+///   widened to any token because the per-CPU count / chip / hwirq
+///   columns would then false-match; steer by
+///   [`ByNumber`](Self::ByNumber) for a shared or multi-word-named
+///   IRQ.
+///
+/// # `#[non_exhaustive]`
+///
+/// `IrqSelector` is `#[non_exhaustive]` — see
+/// [`crate::non_exhaustive`] for the cross-crate pattern-match and
+/// construction rules shared by every such type. Prefer the
+/// [`by_number`](Self::by_number) / [`by_label`](Self::by_label)
+/// constructors over naming variants directly.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum IrqSelector {
+    /// The literal Linux IRQ number (the `/proc/interrupts` leading
+    /// column, the `<N>` in `/proc/irq/<N>/smp_affinity_list`).
+    ByNumber(u32),
+    /// The `/proc/interrupts` action-name label (the line's last
+    /// whitespace token) — resolved to an IRQ number at dispatch.
+    ByLabel(Cow<'static, str>),
+}
+
+impl IrqSelector {
+    /// Select an IRQ by its literal Linux IRQ number. Const so it
+    /// composes inside `const` scenarios + builds.
+    pub const fn by_number(irq: u32) -> Self {
+        IrqSelector::ByNumber(irq)
+    }
+
+    /// Select an IRQ by its `/proc/interrupts` action-name label
+    /// (the last whitespace token on the IRQ's line, e.g. a
+    /// virtio-net device basename like `"virtio1"`). Accepts any
+    /// string-like input (`&'static str`, `String`,
+    /// `Cow<'static, str>`), mirroring the cgroup-name constructor
+    /// convention on [`Op`].
+    pub fn by_label(label: impl Into<Cow<'static, str>>) -> Self {
+        IrqSelector::ByLabel(label.into())
     }
 }
 

@@ -136,6 +136,40 @@ impl std::fmt::Display for ScxBpfErrorMatcherMismatch {
 
 impl std::error::Error for ScxBpfErrorMatcherMismatch {}
 
+/// Marker error type attached as `anyhow::Context` to the `Err`
+/// `resolve_scheduler` returns when an orchestrated `cargo build -p
+/// <sched>` (expected to succeed in the non-cargo-test `Discover` path)
+/// FAILED and the operator did not set
+/// `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK` — the resolver refuses to
+/// validate the test against a possibly-stale pre-built binary.
+///
+/// Dispatch (`crate::test_support::dispatch`) downcasts the error chain
+/// for this marker and forces a hard FAIL EVEN under `expect_err = true`.
+/// The semantic boundary mirrors [`PostVmAssertionFailure`]: `expect_err`
+/// inverts a GUEST-side expected failure, but a build-infra failure is a
+/// HOST-side fault that must never masquerade as the expected guest
+/// failure — without the marker an `expect_err` test whose scheduler
+/// build broke would silently invert to PASS, re-creating the
+/// stale-validation hazard the refusal exists to eliminate. Same
+/// `anyhow::Context` attachment + `downcast_ref` chain-walk as the
+/// sibling markers; the dispatch guard sits with the other host-side
+/// hard-fail markers, before the `expect_err` inversion.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SchedulerBuildRefused;
+
+impl std::fmt::Display for SchedulerBuildRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "scheduler build refused — an orchestrated build expected to \
+             succeed failed; refusing to validate against a possibly-stale \
+             pre-built binary (expect_err inversion bypassed)"
+        )
+    }
+}
+
+impl std::error::Error for SchedulerBuildRefused {}
+
 /// Marker error type attached as `anyhow::Context` to the failure
 /// `Err` produced by `run_ktstr_test_inner_impl` when a host-side
 /// `post_vm` / `post_vm_unconditional` callback returned `Err`
@@ -237,6 +271,32 @@ impl std::fmt::Display for ExpectAutoReproSatisfied {
 }
 
 impl std::error::Error for ExpectAutoReproSatisfied {}
+
+/// Marker error type attached as `anyhow::Context` to the failure `Err`
+/// [`render_failure_verdict_message`]
+/// builds when `entry.survives_storm` is set AND the failing
+/// [`AssertResult`] carries a scheduler-death
+/// `DetailKind` (`SchedulerCrashed` / `SchedulerExitedCleanly` /
+/// `SchedulerDiedUnknownReason`). `err_to_exit_code` downcasts it and forces
+/// `EXIT_FAIL` with a survival-specific explainer, positioned BEFORE the
+/// [`ExpectAutoReproSatisfied`] / `expect_err` inversion arms so a survival
+/// violation can never be inverted to PASS (the validate-time
+/// `survives_storm`/`expect_err` mutex already forbids that combination;
+/// the ordering is defense-in-depth). Mirrors [`ScxBpfErrorMatcherMismatch`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SurvivesStormViolated;
+
+impl std::fmt::Display for SurvivesStormViolated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "survives_storm asserted but the scx scheduler did not survive \
+             the run — it died or was ejected during a hold"
+        )
+    }
+}
+
+impl std::error::Error for SurvivesStormViolated {}
 
 /// Combine the conditional and unconditional `post_vm` failure
 /// signals. When both callbacks fail in the same run, surface
@@ -450,8 +510,18 @@ pub(crate) fn invoke_post_vm_callback(
 /// tooling but cannot meaningfully handle a sidecar-write failure
 /// beyond logging it — the skip itself is still valid; only post-run
 /// stats tooling loses visibility.
-pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry) {
-    if let Err(e) = write_skip_sidecar(entry) {
+pub(crate) fn record_skip_sidecar(
+    entry: &KtstrTestEntry,
+    topo: Option<&crate::test_support::topo::TopoOverride>,
+) {
+    // Resolve the topology the run of this (entry, override) WOULD boot,
+    // via the same resolve_vm_topology the run path uses, so a preset's
+    // skip and run record the identical topology -> identical
+    // variant_hash -> the retry overwrites instead of coexisting. For a
+    // plain test (topo = None) this is entry.topology.
+    let (resolved_topology, _memory_mib) =
+        crate::test_support::runtime::resolve_vm_topology(entry, topo);
+    if let Err(e) = write_skip_sidecar(entry, &resolved_topology) {
         // Dual-emit at warn level: an unwritten skip sidecar costs
         // the run no correctness — the test still skipped — but
         // silently drops post-run stats tooling's visibility into

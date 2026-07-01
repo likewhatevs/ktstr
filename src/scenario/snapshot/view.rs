@@ -970,6 +970,17 @@ impl<'a> Snapshot<'a> {
         self.report.per_cpu_time.iter().find(|c| c.cpu == cpu)
     }
 
+    /// Per-cgroup PSI-irq rows for the test's workload cgroups, host-walked
+    /// from the cgroup hierarchy at this freeze (Phase A). One row per
+    /// workload-root leaf cgroup with per-cgroup PSI accounting enabled. Empty
+    /// when the capture was not wired, the workload root isn't present yet, or
+    /// `psi_cgroups_enabled` is off — loud-absent. RAW values; decoded + folded
+    /// at the metric layer (see
+    /// `crate::monitor::cgroup_walk::CgroupPsiStat`).
+    pub fn cgroup_psi(&self) -> &'a [crate::monitor::cgroup_walk::CgroupPsiStat] {
+        &self.report.cgroup_psi
+    }
+
     /// Per-NUMA-node event counter rows captured from
     /// `pglist_data->node_zones[]->vm_numa_event[]`. Empty until
     /// the host-side NUMA walker lands (see

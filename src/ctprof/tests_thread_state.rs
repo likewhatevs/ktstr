@@ -180,7 +180,12 @@ fn wire_format_identity_raw_primitives_deserialize_into_wrapped_thread_state() {
         "irq_delay_max_ns": 0,
         "irq_delay_min_ns": 0,
         "hiwater_rss_bytes": 0,
-        "hiwater_vm_bytes": 0
+        "hiwater_vm_bytes": 0,
+        "taskstats_measured": false,
+        "cpu_delay_active": false,
+        "delay_block_active": false,
+        "xacct_active": false,
+        "jemalloc_measured": false
     }"#;
     let t: ThreadState = serde_json::from_str(json).expect("deserialize");
     // One representative field per newtype family proves
@@ -207,6 +212,48 @@ fn wire_format_identity_raw_primitives_deserialize_into_wrapped_thread_state() {
     assert_eq!(
         t.cpu_affinity,
         crate::metric_types::CpuSet(vec![0, 1, 2, 3])
+    );
+    // The capture-mechanism flags are plain bools and round-trip by value: the
+    // wire carries `false`, so the deserialized thread must read `false` (not the
+    // struct `Default`, which is also false — pin a non-default below).
+    assert!(
+        !t.taskstats_measured,
+        "taskstats_measured must round-trip the wire's false",
+    );
+    assert!(
+        !t.jemalloc_measured,
+        "jemalloc_measured must round-trip the wire's false",
+    );
+    assert!(
+        !t.cpu_delay_active && !t.delay_block_active && !t.xacct_active,
+        "sub-family active flags must round-trip the wire's false (no serde-default)",
+    );
+
+    // And the true case round-trips too (proves each field is read, not defaulted):
+    // re-deserialize the same JSON with every capture/active flag flipped to true.
+    let json_true = json
+        .replace(
+            "\"taskstats_measured\": false",
+            "\"taskstats_measured\": true",
+        )
+        .replace("\"cpu_delay_active\": false", "\"cpu_delay_active\": true")
+        .replace(
+            "\"delay_block_active\": false",
+            "\"delay_block_active\": true",
+        )
+        .replace("\"xacct_active\": false", "\"xacct_active\": true")
+        .replace(
+            "\"jemalloc_measured\": false",
+            "\"jemalloc_measured\": true",
+        );
+    let t2: ThreadState = serde_json::from_str(&json_true).expect("deserialize true-flags");
+    assert!(
+        t2.taskstats_measured
+            && t2.cpu_delay_active
+            && t2.delay_block_active
+            && t2.xacct_active
+            && t2.jemalloc_measured,
+        "all capture + sub-family-active flags must round-trip a wire `true`",
     );
 }
 

@@ -159,7 +159,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! ktstr = "0.16"
+//! ktstr = "0.20.0"
 //! ```
 //!
 //! Lean dev-dep (drops the host-tooling crates: tikv-jemallocator,
@@ -168,7 +168,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! ktstr = { version = "0.16", default-features = false, features = ["llm"] }
+//! ktstr = { version = "0.20.0", default-features = false, features = ["llm"] }
 //! ```
 //!
 //! # Feature flags
@@ -508,9 +508,8 @@ pub mod topology;
 /// Re-exports from the otherwise-internal `monitor` module so the
 /// live-host capture binary, integration tests, and downstream
 /// consumers can invoke the bpf()-syscall data path, kernel
-/// auto-discovery, kallsyms parser, dmesg-scx parser, and the
-/// reproducer-generator translation layer without the `monitor`
-/// module's frozen-VM internals leaking into the public API.
+/// auto-discovery, kallsyms parser, and dmesg-scx parser without the
+/// `monitor` module's frozen-VM internals leaking into the public API.
 ///
 /// This module is the entry point for binaries and tests that
 /// consume the live-host capture pipeline.
@@ -520,18 +519,10 @@ pub mod live_host {
         BpfMapAccessor, BpfMapInfo,
     };
     pub use crate::monitor::bpf_syscall::BpfSyscallAccessor;
-    pub use crate::monitor::debug_capture::{
-        AffinityHint, CgroupHint, CtprofSampleRef, DEBUG_CAPTURE_SCHEMA, DebugCapture,
-        SchedPolicyHint, WorkTypeHint, WorkloadFingerprint, WorkloadGroupHint, project_fingerprint,
-    };
     pub use crate::monitor::dmesg_scx::{
         ScxExitEvent, ScxExitKind, StackSymbol, extract_stack_symbols, parse_kmsg_window,
     };
     pub use crate::monitor::live_host_kernel::{KallsymsTable, LiveHostKernelEnv, uname_release};
-    pub use crate::monitor::reproducer_gen::{
-        ReproducerNote, ReproducerSpec, generate_spec, render_ktstr_test_source,
-        render_run_file_source,
-    };
     pub use crate::monitor::timeline::{
         DEFAULT_SNAPSHOT_RING_DEPTH, IncrementalCapture, IncrementalSnapshot, SnapshotRing,
         TimelineCapture, TimelineEvent, TimelineEventRaw, parse_timeline_buf,
@@ -832,6 +823,7 @@ pub mod prelude {
     // no-stimulus-timeline case.
     pub use crate::cgroup::CgroupManager;
     pub use crate::claim;
+    pub use crate::claim_present;
     pub use crate::declare_scheduler;
     pub use crate::distributed_slice;
     pub use crate::host_context::HostContext;
@@ -839,9 +831,9 @@ pub mod prelude {
     pub use crate::ktstr_test;
     pub use crate::scenario::backdrop::Backdrop;
     pub use crate::scenario::ops::{
-        CgroupDef, CpusetSpec, HoldSpec, KernelTarget, KernelValue, KernelValueWidth, Op, Setup,
-        SpawnPlacement, Step, execute_defs, execute_scenario, execute_scenario_with, execute_steps,
-        execute_steps_with,
+        CgroupDef, CpusetSpec, HoldSpec, IrqSelector, KernelTarget, KernelValue, KernelValueWidth,
+        Op, Setup, SpawnPlacement, Step, execute_defs, execute_scenario, execute_scenario_with,
+        execute_steps, execute_steps_with,
     };
     pub use crate::scenario::payload_run::{PayloadHandle, PayloadRun};
     pub use crate::scenario::scenarios;
@@ -889,11 +881,12 @@ pub mod prelude {
     // `#[derive(Payload)]` is applied; it occupies the type
     // namespace, distinct from the derive macro re-exported above.
     pub use crate::test_support::{
-        BpfMapWrite, CgroupPath, EXIT_FAIL, EXIT_INCONCLUSIVE, EXIT_PASS, KTSTR_SCHEDULERS,
-        KTSTR_TESTS, KtstrTestEntry, MemSideCache, Metric, MetricBounds, MetricCheck, MetricHint,
-        MetricSource, MetricStream, NumaDistance, NumaNode, OutputFormat, Payload, PayloadKind,
-        PayloadMetrics, Polarity, Scheduler, SchedulerSpec, SidecarResult, Sysctl, Topology,
-        TopologyConstraints, extract_metrics, find_scheduler, find_test, sidecar_dir,
+        BpfMapAgg, BpfMapWrite, CgroupPath, EXIT_FAIL, EXIT_INCONCLUSIVE, EXIT_PASS,
+        KTSTR_SCHEDULERS, KTSTR_TESTS, KtstrTestEntry, MemSideCache, Metric, MetricBounds,
+        MetricCheck, MetricHint, MetricSource, MetricStream, NumaDistance, NumaNode, OutputFormat,
+        Payload, PayloadKind, PayloadMetrics, Polarity, Scheduler, SchedulerSpec, SidecarResult,
+        Sysctl, Topology, TopologyConstraints, WatchBpfMap, extract_metrics, find_scheduler,
+        find_test, sidecar_dir,
     };
     // The following items are intentionally NOT in the prelude. They
     // are binary-entry helpers (the `ktstr` / `cargo-ktstr` bins) or
@@ -936,9 +929,11 @@ pub mod prelude {
     pub use crate::scenario::host_stall::{StallDiagnostic, StallReport};
     pub use crate::vmm::wire::{KernelOpReplyPayload, KernelOpValue};
     pub use crate::workload::{
-        AffinityIntent, AluWidth, CloneMode, CustomFn, MemPolicy, Migration, MpolFlags,
-        ResolvedAffinity, SchedPolicy, WorkPhase, WorkSpec, WorkType, WorkTypeValidationError,
-        WorkerCtx, WorkerReport, WorkerReportClaim, WorkloadConfig, WorkloadHandle,
+        AffinityIntent, AluWidth, CloneMode, CustomCfg, CustomFn, FutexLockMode, MemPolicy,
+        Migration, MpolFlags, ReapMode, ResolvedAffinity, SchbenchConfig, SchedClass, SchedPolicy,
+        TaobenchConfig, TaobenchStats, WakeMechanism, WorkPhase, WorkSpec, WorkType,
+        WorkTypeValidationError, WorkerCtx, WorkerReport, WorkerReportClaim, WorkloadConfig,
+        WorkloadHandle,
     };
     // Surface `Phase` from the assert module (the scenario-step
     // bucket) so test authors can write `Phase::step(0)` /
@@ -948,6 +943,11 @@ pub mod prelude {
     // unambiguously means the scenario-phase bucket type users
     // reach for in `field.value_at_phase(Phase::step(0))` style.
     pub use crate::assert::Phase;
+    // Typed built-in metric ids (the discoverable, typo-proof catalog) + the
+    // `MetricId` hybrid that ALSO accepts a scheduler-runtime string — both flow
+    // through every metric accessor via `impl Into<MetricId>`. A misspelled
+    // built-in is a compile error, not a silent `None`.
+    pub use crate::stats::{BuiltinMetric, MetricId};
 }
 
 /// # KTSTR_* env-var empty-string contract
@@ -1058,6 +1058,45 @@ pub const KTSTR_KERNEL_COMMIT_ENV: &str = "KTSTR_KERNEL_COMMIT";
 /// and then invoke raw nextest. The dedicated orchestration
 /// marker discriminates the two cases.
 pub const KTSTR_ORCHESTRATED_ENV: &str = "KTSTR_ORCHESTRATED";
+
+/// Name of the environment variable carrying the `cargo ktstr test`
+/// SESSION EPOCH: nanoseconds since the Unix epoch, stamped ONCE by
+/// the orchestrator (`cargo_ktstr::run_cargo`) before it spawns
+/// nextest, inherited by every per-test child process.
+///
+/// `test_support::sidecar::pre_clear_run_dir_once` uses it as an
+/// opaque per-invocation session token: nextest is process-per-test
+/// and every test sharing one `{kernel}-{project_commit}` run
+/// directory would otherwise have a later process's pre-clear delete
+/// an earlier peer's freshly-written `{test}-{hash}.ktstr.json`
+/// (silent stats loss). The first process to clear a dir records
+/// this token in a `.ktstr_run_epoch` sentinel; a later peer whose
+/// token matches skips its wipe, sparing the peers' sidecars. Unset
+/// under raw `cargo nextest run` (no orchestrator) — pre-clear then
+/// falls back to its per-process wipe-everything behavior.
+pub const KTSTR_RUN_EPOCH_ENV: &str = "KTSTR_RUN_EPOCH";
+
+/// Name of the environment variable that pins the sidecar runs-root
+/// to an ABSOLUTE path, overriding the CWD-relative
+/// `{CARGO_TARGET_DIR or "target"}/ktstr` default of
+/// [`test_support::runs_root`].
+///
+/// The `cargo ktstr` orchestrator (`cargo-ktstr` main) stamps this
+/// once at startup to the cargo target dir's `ktstr` subdir (resolved
+/// via `cargo metadata`), so its post-run footer / `stats` / `replay`
+/// reads AND the child test processes' sidecar writes resolve the
+/// SAME directory regardless of CWD. Without it, in a Cargo workspace
+/// the test binaries (CWD = package dir, set by nextest) write to
+/// `{package}/target/ktstr` while the orchestrator (CWD = invocation
+/// dir) scans elsewhere, so the post-run footer finds nothing.
+///
+/// Set ONCE by the parent and inherited by every child test process —
+/// children never re-run `cargo metadata` (it would be one subprocess
+/// spawn per test process on the hot path). Unset under raw `cargo
+/// nextest run` (no orchestrator): [`test_support::runs_root`] falls
+/// back to its CWD-relative default, which is fine because raw nextest
+/// has no footer to mismatch.
+pub const KTSTR_RUNS_ROOT_ENV: &str = "KTSTR_RUNS_ROOT";
 
 /// Name of the environment variable that overrides the default
 /// host-mode cgroup parent (where `host_only` tests' workload
@@ -1688,6 +1727,20 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
 /// runs optimized while the harness keeps its dev-profile assertion
 /// thresholds and `catch_unwind` behavior; `--release` sets both.
 pub const KTSTR_SCHEDULER_PROFILE_ENV: &str = "KTSTR_SCHEDULER_PROFILE";
+
+/// Name of the presence-only opt-out env var that re-enables the
+/// pre-built-binary fallback after a FAILED orchestrated scheduler
+/// build. When set to a NON-EMPTY value, a failed `cargo build -p
+/// <sched>` in the non-cargo-test `Discover` path falls back to a
+/// sibling / `target/{debug,release}/` binary AS-IS instead of failing
+/// the test. Default (unset / empty) REFUSES the stale fallback so a
+/// build that fails for a new reason cannot silently validate the test
+/// against an old scheduler. Empty-string rejection mirrors
+/// `KTSTR_CARGO_TEST_MODE` (`cargo_test_mode_active`) — NOT the
+/// presence-only [`KTSTR_ORCHESTRATED_ENV`], which activates on an empty
+/// value — so a stray `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK=` cannot
+/// re-enable the hazard.
+pub const KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV: &str = "KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK";
 
 /// Build a cargo binary package and return its output path.
 ///

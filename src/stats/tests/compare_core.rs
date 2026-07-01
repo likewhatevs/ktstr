@@ -55,6 +55,120 @@ fn compare_rows_dual_gate_both_must_trigger() {
     assert_eq!(res2.unchanged, 1);
 }
 
+/// A metric jumping from a ~zero baseline to a value ABOVE its absolute
+/// gate must surface as a regression — not be hidden as "unchanged".
+/// Before the fix the relative delta was forced to `0.0` whenever the
+/// baseline was ~zero (a divide-by-zero dodge), which always failed the
+/// AND-gated relative threshold and silently classified every `0 ->
+/// large` jump as unchanged. The fix treats a value appearing from a
+/// ~zero baseline as an unbounded relative change (`rel_delta = +inf`),
+/// so the absolute gate alone decides.
+#[test]
+fn compare_rows_zero_baseline_jump_above_abs_gate_is_a_regression() {
+    // worst_spread: LowerBetter (higher_is_worse), default_abs = 5.0.
+    // 0.0 -> 10.0: delta 10.0 >= 5.0 clears the absolute gate; the
+    // ~zero baseline must NOT let the relative gate veto it.
+    let rows_a = vec![cmp_row("zbase", "tiny-1llc", true, 0.0, 0)];
+    let rows_b = vec![cmp_row("zbase", "tiny-1llc", true, 10.0, 0)];
+    let res = compare_rows_by(
+        &rows_a,
+        &rows_b,
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert_eq!(
+        res.regressions, 1,
+        "0 -> 10 worst_spread (>= abs gate 5.0) must be a regression, not \
+         hidden as unchanged by the zero-baseline relative veto",
+    );
+    assert_eq!(res.improvements, 0);
+    assert_eq!(res.unchanged, 0, "the jump must not be counted unchanged");
+    assert!(
+        res.findings
+            .iter()
+            .any(|f| f.metric.name == "worst_spread" && f.kind == FindingKind::Regression),
+        "a worst_spread Regression finding must be emitted; got {:?}",
+        res.findings
+            .iter()
+            .map(|f| (f.metric.name, f.delta))
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// Contrast: a ~zero-baseline jump BELOW the absolute gate stays
+/// unchanged. The absolute gate is the deciding gate from a zero
+/// baseline (the relative gate is satisfied by the `+inf` treatment); a
+/// sub-`default_abs` new value is noise, not a regression. Together with
+/// the sibling above-gate test this pins that the zero-baseline fix
+/// reduces the dual gate to "the absolute gate alone decides" — it does
+/// not flag every nonzero appearance.
+#[test]
+fn compare_rows_zero_baseline_jump_below_abs_gate_is_unchanged() {
+    // worst_spread default_abs = 5.0; 0.0 -> 3.0 is below it.
+    let rows_a = vec![cmp_row("zbase_small", "tiny-1llc", true, 0.0, 0)];
+    let rows_b = vec![cmp_row("zbase_small", "tiny-1llc", true, 3.0, 0)];
+    let res = compare_rows_by(
+        &rows_a,
+        &rows_b,
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert_eq!(
+        res.regressions, 0,
+        "0 -> 3 worst_spread (< abs gate 5.0) must stay unchanged",
+    );
+    assert_eq!(res.improvements, 0);
+    assert!(
+        res.findings.iter().all(|f| f.metric.name != "worst_spread"),
+        "no worst_spread finding for a sub-abs-gate zero-baseline jump; got {:?}",
+        res.findings
+            .iter()
+            .map(|f| (f.metric.name, f.delta))
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// Improvement direction of the zero-baseline fix: a HigherBetter metric
+/// rising from a ~zero baseline to a value above its absolute gate is an
+/// IMPROVEMENT, not "unchanged". The prior bug forced `rel_delta` to 0.0
+/// on a ~zero baseline, hiding zero-baseline jumps in BOTH directions;
+/// the sibling tests pin the regression direction, this pins the
+/// improvement direction so a future change that re-vetoed only the
+/// improvement path would be caught.
+#[test]
+fn compare_rows_zero_baseline_jump_above_abs_gate_is_an_improvement() {
+    // total_iterations: HigherBetter, Counter, default_abs = 100.0 (the only
+    // metric reading r.total_iterations). 0 -> 1000: delta +1000 >= 100
+    // clears the absolute gate; HigherBetter + delta > 0 => improvement.
+    let rows_a = vec![cmp_row("zbase_imp", "tiny-1llc", true, 0.0, 0)];
+    let rows_b = vec![cmp_row("zbase_imp", "tiny-1llc", true, 0.0, 1000)];
+    let res = compare_rows_by(
+        &rows_a,
+        &rows_b,
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert_eq!(
+        res.improvements, 1,
+        "0 -> 1000 total_iterations (>= abs gate 100, HigherBetter) must be \
+         an improvement, not hidden as unchanged",
+    );
+    assert_eq!(res.regressions, 0);
+    assert!(
+        res.findings
+            .iter()
+            .any(|f| f.metric.name == "total_iterations" && f.kind == FindingKind::Improvement),
+        "a total_iterations Improvement finding must be emitted; got {:?}",
+        res.findings
+            .iter()
+            .map(|f| (f.metric.name, f.delta))
+            .collect::<Vec<_>>(),
+    );
+}
+
 /// compare must NOT flag a sub-integer `stuck_count` difference as a
 /// regression. A-side cross-run mean 1.4 vs B-side 1.6 (true delta
 /// 0.2, well under `default_abs` = 1.0) classifies UNCHANGED. Before
@@ -115,7 +229,7 @@ fn compare_rows_genuine_stuck_count_regression_is_flagged() {
     assert!(
         res.findings
             .iter()
-            .any(|f| f.metric.name == "stuck_count" && f.is_regression),
+            .any(|f| f.metric.name == "stuck_count" && f.kind == FindingKind::Regression),
         "stuck_count must be the flagged regression",
     );
 }
@@ -147,7 +261,10 @@ fn compare_rows_synthetic_regression_and_improvement() {
     assert!(metrics.contains(&"worst_spread"));
     assert!(metrics.contains(&"total_iterations"));
     for d in &res.findings {
-        assert!(d.is_regression, "all reported deltas should be regressions");
+        assert!(
+            d.kind == FindingKind::Regression,
+            "all reported deltas should be regressions"
+        );
         assert_eq!(d.scenario, "test1");
         assert_eq!(d.topology, "tiny-1llc");
     }
@@ -163,7 +280,7 @@ fn compare_rows_synthetic_regression_and_improvement() {
     assert_eq!(res_imp.regressions, 0);
     assert_eq!(res_imp.improvements, 2);
     for d in &res_imp.findings {
-        assert!(!d.is_regression);
+        assert!(d.kind != FindingKind::Regression);
     }
 }
 
@@ -222,7 +339,7 @@ fn compare_rows_higher_is_worse_inversion() {
         .find(|d| d.metric.name == "total_iterations")
         .expect("total_iterations should produce a delta");
     assert!(
-        iters_delta.is_regression,
+        iters_delta.kind == FindingKind::Regression,
         "iterations decrease is a regression"
     );
     assert_eq!(iters_delta.delta, -500.0);
@@ -245,7 +362,10 @@ fn compare_rows_higher_is_worse_inversion() {
         .iter()
         .find(|d| d.metric.name == "worst_spread")
         .expect("worst_spread should produce a delta");
-    assert!(spread_up.is_regression, "spread increase is a regression");
+    assert!(
+        spread_up.kind == FindingKind::Regression,
+        "spread increase is a regression"
+    );
     assert_eq!(spread_up.delta, 20.0);
 
     let res_down = compare_rows_by(
@@ -261,7 +381,7 @@ fn compare_rows_higher_is_worse_inversion() {
         .find(|d| d.metric.name == "worst_spread")
         .expect("worst_spread should produce a delta");
     assert!(
-        !spread_down.is_regression,
+        spread_down.kind != FindingKind::Regression,
         "spread decrease is an improvement"
     );
     assert_eq!(spread_down.delta, -20.0);
@@ -437,7 +557,7 @@ fn compare_rows_threshold_override() {
         .iter()
         .find(|d| d.metric.name == "worst_spread")
         .expect("override 5% must surface 6% spread change");
-    assert!(spread_override.is_regression);
+    assert!(spread_override.kind == FindingKind::Regression);
     assert_eq!(spread_override.delta, 6.0);
 
     // The override does NOT loosen the abs gate. Move 1.0 -> 1.5:
@@ -530,8 +650,8 @@ fn wake_latency_tail_ratio_compares_via_ext_metrics() {
     let key = "worst_wake_latency_tail_ratio";
 
     // Absent ext key (the producer's sub-threshold / no-tail output): both
-    // sides read None, both collapse to 0.0 via unwrap_or(0.0), and the
-    // EPSILON guard classifies the delta as unchanged.
+    // sides read None, so the `(None, None)` arm skips the pair (no finding,
+    // no coverage diff).
     let low_a = make_row("tail_low", "tiny-1llc", true, 0.0);
     let low_b = make_row("tail_low", "tiny-1llc", true, 0.0);
     assert!(
@@ -580,23 +700,27 @@ fn wake_latency_tail_ratio_compares_via_ext_metrics() {
     );
 }
 
-/// Explicit None-branch pin on the `compare_rows` ext-fallback contract.
+/// Read-contract pin: a metric absent on BOTH sides reads `None` and the
+/// pair is skipped entirely (no verdict, no coverage diff).
 ///
-/// `compare_rows` calls `m.read(row)` for every metric and falls through
-/// `unwrap_or(0.0)` to the EPSILON-guard when the read is `None`. Since
-/// `worst_wake_latency_tail_ratio` is now ext-sourced with a `|_| None`
-/// accessor, an ABSENT ext key (the producer's sub-threshold output) is the
-/// None condition. The sibling `wake_latency_tail_ratio_compares_via_ext_metrics`
-/// exercises this embedded in the suppression semantic; this test pins the
-/// raw mechanism — a regression that dropped `unwrap_or(0.0)` and panicked
-/// on None, or that synthesized a value for an absent key, would fail here.
+/// `compare_rows` calls `m.read(row)` for every metric; `read` returns `None`
+/// for an absent metric. `worst_wake_latency_tail_ratio` is ext-sourced with a
+/// `|_| None` accessor, so an absent ext key (the producer's sub-threshold
+/// output) is the `None` condition. When BOTH sides read `None`, the
+/// `(None, None) => continue` arm skips the pair before any verdict or
+/// coverage-diff bookkeeping. This pins the `read()==None`-on-absent
+/// precondition the absent-vs-genuine-zero handling rests on: a regression
+/// that synthesized a value for an absent key (the old `unwrap_or(0.0)`) or
+/// panicked on `None` would fail here.
 ///
-/// Asserts the three observable consequences:
+/// Asserts:
 /// 1. `metric.read(&row)` returns `None` on both sides (no ext key).
 /// 2. `compare_rows` does NOT panic.
-/// 3. The resulting `CompareReport` classifies the pair as `unchanged`.
+/// 3. No finding AND no coverage diff — both-absent is skipped, distinct from
+///    one-sided-absent which IS a coverage diff (see
+///    `compare_rows_one_sided_absent_is_coverage_diff_not_verdict`).
 #[test]
-fn compare_rows_handles_none_from_absent_ext_key_as_zero() {
+fn compare_rows_both_absent_ext_key_reads_none_and_is_skipped() {
     let metric =
         metric_def("worst_wake_latency_tail_ratio").expect("tail ratio metric must be registered");
 
@@ -616,11 +740,9 @@ fn compare_rows_handles_none_from_absent_ext_key_as_zero() {
         "absent ext key must read None on B",
     );
 
-    // The call must not panic (a regression that dropped the
-    // `unwrap_or` would trip here), and the result must
-    // classify the pair as unchanged — both sides collapse to
-    // 0.0 via unwrap_or, then the `abs() < EPSILON` guard
-    // short-circuits without producing a finding.
+    // Both sides read None: the `(None, None) => continue` arm skips the pair
+    // before any verdict or coverage-diff bookkeeping — no panic, no finding,
+    // and (unlike one-sided-absent) no coverage diff.
     let report = compare_rows_by(
         std::slice::from_ref(&row_a),
         std::slice::from_ref(&row_b),
@@ -630,17 +752,20 @@ fn compare_rows_handles_none_from_absent_ext_key_as_zero() {
     );
     assert_eq!(
         report.regressions, 0,
-        "None accessor result must land as unchanged, not a regression",
+        "both-absent must not be a regression",
     );
     assert_eq!(
         report.improvements, 0,
-        "None accessor result must land as unchanged, not an improvement",
+        "both-absent must not be an improvement",
     );
     assert!(
         report.findings.is_empty(),
-        "no findings must be emitted when the accessor returns None; \
-             got: {:?}",
+        "no findings when the metric is absent on both sides; got: {:?}",
         report.findings,
+    );
+    assert!(
+        report.coverage_diffs.is_empty(),
+        "both-absent is skipped, NOT a coverage diff (that is one-sided-absent)",
     );
 }
 
@@ -968,7 +1093,10 @@ fn compare_rows_per_metric_policy_resolves_each_metric_independently() {
             .collect::<Vec<_>>(),
     );
     let spread_finding = spread_finding.unwrap();
-    assert!(spread_finding.is_regression, "6% > 5% → regression");
+    assert!(
+        spread_finding.kind == FindingKind::Regression,
+        "6% > 5% → regression"
+    );
 
     // worst_median_wake_latency_us has a 10% delta; under
     // default_percent = 20%, it must be unchanged (not in
@@ -1898,5 +2026,337 @@ fn check_no_duplicate_pairing_keys_bails_on_collision_and_names_side() {
     assert!(
         rendered.contains("--b-"),
         "bail must suggest a per-side filter to disambiguate; got: {rendered}",
+    );
+}
+
+// -- noise_findings (perf-delta --noise-adjust row-level core) tests --
+
+/// Three identical runs of one scenario carrying `worst_spread` (LowerBetter, via
+/// `spread`) + `total_iterations` (HigherBetter, via `iters`) — the two
+/// metric-bearing fields `cmp_row` sets. All-identical so each side's spread is 0
+/// (clean), isolating the cross-side direction classification.
+fn noise_side(scenario: &str, spread: f64, iters: u64) -> Vec<GauntletRow> {
+    vec![
+        cmp_row(scenario, "tiny-1llc", true, spread, iters),
+        cmp_row(scenario, "tiny-1llc", true, spread, iters),
+        cmp_row(scenario, "tiny-1llc", true, spread, iters),
+    ]
+}
+
+#[test]
+fn noise_findings_classifies_both_polarities() {
+    // Both polarities WORSEN: worst_spread (LowerBetter) rises 10->15;
+    // total_iterations (HigherBetter) drops 2000->1000. Both sides clean (spread
+    // 0), so each is a CONFIDENT regression.
+    let rep = noise_findings(
+        &noise_side("regress", 10.0, 2000),
+        &noise_side("regress", 15.0, 1000),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+    );
+    assert_eq!(rep.paired_scenarios, 1);
+    assert_eq!(
+        rep.regressions(),
+        2,
+        "LowerBetter rose + HigherBetter dropped = 2 regressions: {:?}",
+        rep.findings
+            .iter()
+            .map(|f| (f.metric.name, f.kind))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(rep.noisy(), 0);
+    assert!(rep.findings.iter().all(|f| f.kind == NoiseKind::Regression));
+
+    // Mirror: both polarities IMPROVE (worst_spread drops, total_iterations rises).
+    let rep = noise_findings(
+        &noise_side("improve", 15.0, 1000),
+        &noise_side("improve", 10.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+    );
+    assert_eq!(rep.regressions(), 0);
+    assert_eq!(
+        rep.findings
+            .iter()
+            .filter(|f| f.kind == NoiseKind::Improvement)
+            .count(),
+        2,
+        "LowerBetter dropped + HigherBetter rose = 2 improvements",
+    );
+}
+
+#[test]
+fn noise_findings_too_noisy_takes_precedence_over_regression() {
+    // A's worst_spread swings 10..20 (~67% relative spread, over the 1% gate), so
+    // even though B (30) is far higher (a worsening direction for LowerBetter), the
+    // metric is flagged NOISY, NOT counted as a confident regression.
+    let a = vec![
+        cmp_row("noisy", "tiny-1llc", true, 10.0, 2000),
+        cmp_row("noisy", "tiny-1llc", true, 20.0, 2000),
+        cmp_row("noisy", "tiny-1llc", true, 15.0, 2000),
+    ];
+    let rep = noise_findings(
+        &a,
+        &noise_side("noisy", 30.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+    );
+    let ws = rep
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "worst_spread")
+        .expect("worst_spread finding present");
+    assert_eq!(
+        ws.kind,
+        NoiseKind::Noisy,
+        "wide A spread -> NOISY, not REGRESSION"
+    );
+    assert_eq!(
+        rep.regressions(),
+        0,
+        "a too-noisy metric must not fail the gate"
+    );
+    // total_iterations is unchanged (2000 both sides) and clean -> omitted.
+    assert!(
+        rep.findings.iter().all(|f| f.metric.name == "worst_spread"),
+        "unchanged-and-clean metrics are omitted: {:?}",
+        rep.findings
+            .iter()
+            .map(|f| f.metric.name)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn noise_findings_skips_all_zero_and_omits_unchanged() {
+    // Both sides exactly 0 on every metric -> no signal -> no findings, but the
+    // scenario still counts as paired.
+    let rep = noise_findings(
+        &noise_side("zero", 0.0, 0),
+        &noise_side("zero", 0.0, 0),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+    );
+    assert!(
+        rep.findings.is_empty(),
+        "all-zero scenario yields no findings"
+    );
+    assert_eq!(rep.paired_scenarios, 1);
+
+    // Identical non-zero sides -> within-band, clean -> no findings either.
+    let rep = noise_findings(
+        &noise_side("same", 12.0, 1500),
+        &noise_side("same", 12.0, 1500),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+    );
+    assert!(
+        rep.findings.is_empty(),
+        "unchanged-clean scenario yields no findings"
+    );
+    assert_eq!((rep.regressions(), rep.noisy()), (0, 0));
+}
+
+/// A `Polarity::Informational` metric (the monitor `total_ttwu_count`) that
+/// moves significantly is classified `FindingKind::Informational` — it appears
+/// in the findings but is NEVER counted as a regression or improvement, so it
+/// never affects the exit basis (`report.regressions`). The gate-safety
+/// guarantee for the directionless schedstat counters: more wakeups must not
+/// read as a regression just because the workload did more work.
+#[test]
+fn compare_rows_informational_metric_shows_but_never_gates() {
+    let mk = |ttwu: f64| {
+        // spread (10.0) and total_iterations (100) identical both sides => no
+        // directional finding; only the informational ext counter moves.
+        let mut r = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+        r.ext_metrics.insert("total_ttwu_count".into(), ttwu);
+        r
+    };
+    let res = compare_rows_by(
+        &[mk(1000.0)],
+        &[mk(5000.0)],
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert_eq!(
+        res.regressions, 0,
+        "informational metric must not be a regression"
+    );
+    assert_eq!(res.improvements, 0, "...nor an improvement");
+    assert_eq!(
+        res.informational, 1,
+        "the 5x total_ttwu_count move is classified informational"
+    );
+    let f = res
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "total_ttwu_count")
+        .expect("total_ttwu_count finding present");
+    assert_eq!(f.kind, FindingKind::Informational);
+}
+
+/// A metric present on exactly ONE side of a paired row is a coverage
+/// difference, NOT a regression/improvement: recorded in `coverage_diffs`,
+/// never gated. Pre-fix, `read().unwrap_or(0.0)` coerced the absent side to
+/// 0.0 and the rel-gate read it as an unbounded change from a zero baseline —
+/// a phantom verdict for a directional metric (avg_nr_running is LowerBetter)
+/// that was simply not captured on one side.
+#[test]
+fn compare_rows_one_sided_absent_is_coverage_diff_not_verdict() {
+    // avg_nr_running is LowerBetter + ext-only; present on exactly one side.
+    let present = {
+        let mut r = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+        r.ext_metrics.insert("avg_nr_running".into(), 5.0);
+        r
+    };
+    let absent = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+
+    // A present (5.0), B absent: pre-fix a phantom LowerBetter improvement
+    // (5 -> 0); post-fix a coverage diff on side A.
+    let res = compare_rows_by(
+        std::slice::from_ref(&present),
+        std::slice::from_ref(&absent),
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert_eq!(
+        res.regressions, 0,
+        "one-sided-absent must not be a regression"
+    );
+    assert_eq!(res.improvements, 0, "...nor an improvement");
+    assert!(
+        !res.findings
+            .iter()
+            .any(|f| f.metric.name == "avg_nr_running"),
+        "no phantom avg_nr_running finding for a one-sided-absent metric"
+    );
+    assert_eq!(res.coverage_diffs.len(), 1, "recorded as a coverage diff");
+    assert_eq!(res.coverage_diffs[0].metric.name, "avg_nr_running");
+    assert_eq!(res.coverage_diffs[0].present_side, ComparePartition::A);
+    assert_eq!(res.coverage_diffs[0].value, 5.0);
+
+    // Mirror: A absent, B present (5.0) — pre-fix a phantom regression
+    // (0 -> 5, LowerBetter); post-fix a coverage diff on side B.
+    let res2 = compare_rows_by(
+        &[absent],
+        &[present],
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert_eq!(res2.regressions, 0, "mirror: not a regression");
+    assert_eq!(res2.improvements, 0);
+    assert_eq!(res2.coverage_diffs.len(), 1);
+    assert_eq!(res2.coverage_diffs[0].present_side, ComparePartition::B);
+}
+
+/// A metric absent on BOTH sides contributes nothing (no coverage diff, no
+/// finding). A metric present on both sides with a genuine zero on one side is
+/// NOT absent — it still goes through the dual-gate verdict (the
+/// present-0.0-vs-absent distinction the fix rests on).
+#[test]
+fn compare_rows_both_absent_skipped_present_zero_still_compared() {
+    let res_absent = compare_rows_by(
+        &[cmp_row("t", "tiny-1llc", true, 10.0, 100)],
+        &[cmp_row("t", "tiny-1llc", true, 10.0, 100)],
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert!(
+        res_absent.coverage_diffs.is_empty(),
+        "metric absent on both sides is not a coverage diff"
+    );
+    assert!(
+        !res_absent
+            .findings
+            .iter()
+            .any(|f| f.metric.name == "avg_nr_running"),
+        "metric absent on both sides produces no finding"
+    );
+
+    // Present-zero on A, present-nonzero on B: BOTH present (Some(0.0) vs
+    // Some(5.0)), a real comparison, not a coverage diff. 0 -> 5 on a
+    // LowerBetter metric is a regression.
+    let zero_a = {
+        let mut r = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+        r.ext_metrics.insert("avg_nr_running".into(), 0.0);
+        r
+    };
+    let nonzero_b = {
+        let mut r = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+        r.ext_metrics.insert("avg_nr_running".into(), 5.0);
+        r
+    };
+    let res_zero = compare_rows_by(
+        &[zero_a],
+        &[nonzero_b],
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert!(
+        res_zero.coverage_diffs.is_empty(),
+        "present-0.0 is NOT absent — no coverage diff"
+    );
+    assert_eq!(
+        res_zero.regressions, 1,
+        "0 -> 5 on a LowerBetter metric (both present) is a regression"
+    );
+}
+
+/// The coverage-diff SURFACING maps `present_side` to the right A/B label — a
+/// swapped match arm would mis-report which run has the metric. Tests the
+/// extracted `format_coverage_diff_lines` directly (print_summary_block's
+/// `println!` is not capturable) for both `ComparePartition::A` and `::B`.
+#[test]
+fn coverage_diff_lines_map_present_absent_labels_by_side() {
+    let present = {
+        let mut r = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+        r.ext_metrics.insert("avg_nr_running".into(), 5.0);
+        r
+    };
+    let absent = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+
+    // A present, B absent -> present_side A -> "in runA, absent in runB".
+    let report = compare_rows_by(
+        std::slice::from_ref(&present),
+        std::slice::from_ref(&absent),
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    let joined = format_coverage_diff_lines(&report, "runA", "runB").join("\n");
+    assert!(
+        joined.contains("avg_nr_running"),
+        "names the metric: {joined}"
+    );
+    assert!(
+        joined.contains("= 5.00 in 'runA'"),
+        "present value + side-A label (runA): {joined}"
+    );
+    assert!(
+        joined.contains("absent in 'runB'"),
+        "absent side is the OTHER label (runB): {joined}"
+    );
+
+    // Mirror: A absent, B present -> present_side B -> "in runB, absent in runA".
+    let report2 = compare_rows_by(
+        std::slice::from_ref(&absent),
+        std::slice::from_ref(&present),
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    let joined2 = format_coverage_diff_lines(&report2, "runA", "runB").join("\n");
+    assert!(
+        joined2.contains("= 5.00 in 'runB'"),
+        "present on side B maps to runB: {joined2}"
+    );
+    assert!(
+        joined2.contains("absent in 'runA'"),
+        "absent maps to runA: {joined2}"
     );
 }

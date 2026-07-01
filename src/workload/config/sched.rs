@@ -177,6 +177,30 @@ pub enum FutexLockMode {
     Plain,
 }
 
+/// How a [`WorkType::CgroupAttachStorm`](crate::workload::WorkType::CgroupAttachStorm)
+/// worker reaps the transient children it forks each iteration.
+///
+/// Carried as a typed enum rather than a `bool` so call sites name the
+/// choice explicitly (`SigIgn` / `Waitpid`) instead of a bare
+/// `reap: true` / `false`, and so the failure-dump diagnostic names it.
+/// The serde wire form is snake_case (`"sig_ign"` / `"waitpid"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReapMode {
+    /// Install `SIGCHLD = SIG_IGN` once at worker entry so each forked
+    /// child auto-reaps in its own exit path, concurrent with the
+    /// parent's `cgroup.procs` write. This reap-vs-write race is the
+    /// variant's reason to exist, so it is the default.
+    #[default]
+    SigIgn,
+    /// The parent blocking-`waitpid`s each child after writing its pid —
+    /// the non-racing control shape (mirrors the reaper in
+    /// [`WorkType::ForkExit`](crate::workload::WorkType::ForkExit)), so
+    /// the same primitive serves as an A/B baseline against the `SigIgn`
+    /// race.
+    Waitpid,
+}
+
 /// Wake mechanism between stages of a `WorkType::WakeChain`.
 ///
 /// Carried as a typed enum rather than a `bool` so call sites

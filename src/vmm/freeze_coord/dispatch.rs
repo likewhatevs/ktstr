@@ -3,11 +3,23 @@
 //! The freeze coordinator's TOKEN_TX epoll branch drives this module:
 //! after `bulk_assembler.feed(...)` returns a `BulkMessages` vec, the
 //! coordinator iterates each `BulkMessage` through
-//! [`dispatch_bulk_message`] and either pushes a verdict-bearing
-//! [`crate::vmm::wire::ShmEntry`] into the run-wide bucket OR triggers
-//! one of three coordinator-internal side effects (kill flag + eventfd
-//! flip on `SchedExit`, sys-rdy eventfd fire-once on `SysRdy`, decode
-//! and stash for later dispatch on `SnapshotRequest`).
+//! [`dispatch_bulk_message`], which returns a verdict-bearing
+//! [`crate::vmm::wire::ShmEntry`] for the run-wide bucket or `None`
+//! for a frame whose only dispatch effect is on `sinks`. The
+//! `None`-returning arms (no bucket entry) are `SysRdy` (fire-once
+//! sys-rdy eventfd), `SchedSwapNotify` (periodic-capture +
+//! watchpoint-invalidation latch), `KERN_ADDRS` (phys-base / KASLR
+//! stores + eventfds), and `SnapshotRequest` / `KernelOpRequest`
+//! (decode-and-stash of a request payload). Several arms return
+//! `Some` AND stamp `sinks`: `SchedExit` (`kill` flag + eventfd,
+//! bucketed only when `crc_ok`), `ScenarioStart` (scenario anchor +
+//! watchdog reset), `ScenarioPause` / `ScenarioResume` (watchdog
+//! pause / cumulative-pause), `ScenarioEnd` (watchdog reset), and
+//! `Stimulus` (host-side step-index mirror). For a variant without
+//! an explicit arm the catch-all consults
+//! [`crate::vmm::wire::MsgType::is_coordinator_internal`] — verbatim
+//! bucket push when it is false, silent drop when true. See the
+//! per-arm bodies for each arm's exact return and side effect.
 //!
 //! Splitting the dispatch out of the run-loop closure body lets test
 //! code drive arbitrary CRC-mangled frame sequences against a pure
@@ -53,6 +65,21 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// `epoll_wait` returns within microseconds rather than waiting
     /// up to one full poll interval.
     pub kill_evt: &'a Arc<EventFd>,
+    /// True when THIS run is a wprof run (`freeze_coord_wprof`). While
+    /// set, the SchedExit arm SKIPS the kill promotion: on a self-crash
+    /// the still-live guest sched-exit monitor sends SCHED_EXIT during
+    /// Phase 5 (before Phase 6 stops it), and an unconditional kill here
+    /// would tear the coordinator down before the guest's Phase-5 wprof
+    /// ship. Gating on the RUN being wprof (not on the grace deadline
+    /// already being armed) closes an arming-order race: the SchedExit
+    /// can be dispatched in the SAME coord iteration as — or before — the
+    /// error-exit arm sets `wprof_ship_deadline`, so a deadline snapshot
+    /// would be stale and promote the kill anyway. Instead the coord arms
+    /// the grace on the drained SchedExit (or the error-exit dump), and
+    /// terminates on the WprofTrace frame or the `WPROF_SHIP_GRACE`
+    /// backstop. The SchedExit verdict entry is still bucketed; only the
+    /// kill promotion holds off.
+    pub run_is_wprof: bool,
     /// Boot-complete signal. Promoted exactly once on the first
     /// CRC-valid empty-payload `MSG_TYPE_SYS_RDY` frame; the
     /// `Option::take` retains the host-side handle until that point
@@ -60,9 +87,19 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// hostile guest could in principle resend) skip the eventfd
     /// write.
     pub sys_rdy_evt: &'a mut Option<Arc<EventFd>>,
+    /// Scheduler-swap notification latch. Set `true` on a CRC-valid
+    /// `MSG_TYPE_SCHED_SWAP_NOTIFY` frame; the freeze coordinator's
+    /// run-loop reads-and-clears it each iteration and synchronously
+    /// invalidates the stale periodic-capture accessor (waking the
+    /// accessor-init worker to rebuild against the next scheduler)
+    /// rather than waiting up to one SCAN_INTERVAL for the scx_root
+    /// watchpoint poll to notice the rebind. A torn frame does NOT set
+    /// it (the CRC gate in the dispatch arm) so a garbled or hostile
+    /// frame cannot force a spurious mid-capture accessor rebuild.
+    pub sched_swap_notify: &'a std::sync::atomic::AtomicBool,
     /// Per-iteration accumulator for decoded
     /// `MSG_TYPE_SNAPSHOT_REQUEST` frames. Drained later in the run-
-    /// loop body where `freeze_and_capture` /
+    /// loop body where `freeze_and_dispatch` /
     /// `arm_user_watchpoint` are in scope. CRC-bad frames and
     /// malformed payloads (size mismatch, KIND_NONE, request_id == 0)
     /// never reach this Vec — [`decode_snapshot_request`] returns
@@ -70,7 +107,7 @@ pub(super) struct BulkDispatchSinks<'a> {
     pub snapshot_requests_pending: &'a mut Vec<SnapshotRequest>,
     /// Per-iteration accumulator for decoded
     /// `MSG_TYPE_KERNEL_OP_REQUEST` frames. Drained later in the run-
-    /// loop body where `freeze_and_capture` is in scope — each
+    /// loop body where `freeze_and_dispatch` is in scope — each
     /// pending kernel-op request triggers its own freeze rendezvous,
     /// runs `gmem.write_obj` / `gmem.read_obj` while every vCPU is
     /// parked, and ships the
@@ -134,16 +171,21 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// it and extends the deadline by the pause duration.
     pub watchdog_pause_ns: &'a std::sync::atomic::AtomicU64,
     /// First-`ScenarioStart` timestamp (nanos since `run_start`),
-    /// biased by `+1` so `0` means "not yet observed". The first
+    /// clamped to a `1` floor so `0` means "not yet observed" (a
+    /// boot-unreachable elapsed==0 maps to 1; every real stamp is
+    /// exact, not a `+1` shift). The first
     /// CRC-valid `MSG_TYPE_SCENARIO_START` frame stamps
-    /// `(run_start.elapsed().as_nanos() as u64).max(1)` here via
+    /// `u64::try_from(run_start.elapsed().as_nanos()).unwrap_or(u64::MAX).max(1)`
+    /// here via
     /// a one-shot `compare_exchange(0, ..)`; subsequent ScenarioStart
     /// frames (the guest may publish multiple if the workload
     /// re-runs) leave the prior stamp untouched. Consumed by the
-    /// freeze coordinator's periodic-capture loop to anchor the
-    /// 10%–90% workload-duration window for `KtstrTestEntry::num_snapshots`
-    /// boundaries — boot + verifier time before the first
-    /// ScenarioStart does not eat the budget.
+    /// freeze coordinator's periodic-capture loop as the window's END
+    /// anchor (`scenario_start + workload_duration`, clamped) and the
+    /// scenario-relative offset frame for `KtstrTestEntry::num_snapshots`
+    /// boundaries; the window START floats to the later of this stamp
+    /// and the prereq-ready moment. Boot + verifier time before the
+    /// first ScenarioStart does not eat the budget.
     pub scenario_start_ns: &'a std::sync::atomic::AtomicU64,
     /// Cumulative wall-clock pause time observed between matched
     /// `MSG_TYPE_SCENARIO_PAUSE` / `MSG_TYPE_SCENARIO_RESUME` pairs
@@ -199,6 +241,15 @@ pub(super) struct BulkDispatchSinks<'a> {
 ///   net against a hostile guest tacking smuggle bytes onto a SysRdy
 ///   frame past the [`crate::vmm::wire::MsgType::is_coordinator_internal`]
 ///   filter. Promotion is fire-once via [`Option::take`].
+/// * `MSG_TYPE_SCHED_SWAP_NOTIFY` latches the run-loop's synchronous
+///   periodic-capture + watchpoint-invalidation step ONLY when
+///   `msg.crc_ok && msg.payload.is_empty()` — the same empty-payload
+///   safety net as `SysRdy`, so a hostile guest cannot smuggle bytes
+///   past the [`crate::vmm::wire::MsgType::is_coordinator_internal`]
+///   filter under this tag. A torn frame must NOT latch: it would
+///   otherwise force a spurious accessor rebuild mid-capture. Unlike
+///   `SysRdy` the store is not fire-once — the coordinator run-loop
+///   reads-and-clears the latch (`swap(false)`) each iteration.
 /// * `MSG_TYPE_SNAPSHOT_REQUEST` decodes via [`decode_snapshot_request`]
 ///   ONLY when `msg.crc_ok`. The decoder additionally rejects
 ///   `request_id == 0`, `kind == SNAPSHOT_KIND_NONE`, and any
@@ -230,20 +281,39 @@ pub(super) fn dispatch_bulk_message(
             // instead of running until the watchdog deadline. CRC
             // failures DO NOT promote — a torn frame would otherwise
             // let a hostile guest force a false early exit.
+            // Skip the kill promotion on a wprof run (run_is_wprof): on a
+            // self-crash the still-live guest sched-exit monitor sends
+            // SCHED_EXIT during Phase 5. This frame can arrive in the SAME
+            // coord iteration as — or before — the error-exit arm sets the
+            // grace deadline, so gating on "grace already armed" would race
+            // and promote the kill anyway. Gate on the RUN being wprof
+            // instead; the coord arms the grace on this drained SchedExit
+            // (see the coord loop) or the error-exit dump, and terminates
+            // on the WprofTrace frame or the WPROF_SHIP_GRACE backstop.
+            // Promoting the kill here would tear the coordinator down
+            // before the Phase-5 wprof ship. The verdict entry is still
+            // bucketed below.
             if msg.crc_ok {
-                sinks.kill.store(true, Ordering::Release);
-                // EFD_NONBLOCK on a freshly-created eventfd never
-                // legitimately fails; log unconditionally so a future
-                // regression (e.g. the eventfd was closed by another
-                // owner) surfaces in the host log instead of silently
-                // swallowing the kill edge.
-                if let Err(e) = sinks.kill_evt.write(1) {
-                    tracing::warn!(
-                        err = %e,
-                        "freeze_coord: kill_evt write on SCHED_EXIT \
-                         promotion failed; the kill AtomicBool above is \
-                         still authoritative"
+                if sinks.run_is_wprof {
+                    eprintln!(
+                        "freeze_coord: SchedExit received; kill SKIPPED (wprof run; grace armed on drain)"
                     );
+                } else {
+                    eprintln!("freeze_coord: SchedExit received; kill PROMOTED");
+                    sinks.kill.store(true, Ordering::Release);
+                    // EFD_NONBLOCK on a freshly-created eventfd never
+                    // legitimately fails; log unconditionally so a future
+                    // regression (e.g. the eventfd was closed by another
+                    // owner) surfaces in the host log instead of silently
+                    // swallowing the kill edge.
+                    if let Err(e) = sinks.kill_evt.write(1) {
+                        tracing::warn!(
+                            err = %e,
+                            "freeze_coord: kill_evt write on SCHED_EXIT \
+                             promotion failed; the kill AtomicBool above is \
+                             still authoritative"
+                        );
+                    }
                 }
             }
             // SchedExit is verdict data — bucket only on CRC-valid
@@ -292,6 +362,24 @@ pub(super) fn dispatch_bulk_message(
             // SysRdy is coordinator-internal — do NOT bucket.
             None
         }
+        Some(crate::vmm::wire::MsgType::SchedSwapNotify) => {
+            // CRC-valid, EMPTY-payload swap-notify: latch the
+            // synchronous periodic-capture + watchpoint invalidation the
+            // coordinator's run-loop performs at the top of its next
+            // iteration. A torn frame must NOT latch — a garbled or
+            // hostile frame would otherwise force a spurious accessor
+            // rebuild mid-capture. The empty-payload gate mirrors the
+            // SysRdy safety net: the latch ignores payload bytes, so a
+            // hostile guest must not be able to smuggle bytes past the
+            // is_coordinator_internal filter under this tag.
+            // Coordinator-internal — do NOT bucket (mirrors SysRdy).
+            if msg.crc_ok && msg.payload.is_empty() {
+                sinks
+                    .sched_swap_notify
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            None
+        }
         _ if msg.msg_type == crate::vmm::wire::MSG_TYPE_KERN_ADDRS => {
             // Payload carries (via [`crate::vmm::wire::KernAddrs`]):
             //   [0..8]   phys_base + 1                (biased)
@@ -326,7 +414,19 @@ pub(super) fn dispatch_bulk_message(
                     sinks
                         .kern_phys_base
                         .store(biased_phys, std::sync::atomic::Ordering::Release);
-                    let _ = sinks.kern_phys_base_evt.write(1);
+                    // Mirror the SchedExit promotion's wake-failure logging:
+                    // the store above is authoritative, and the monitor also
+                    // polls, so a missed wake self-heals within a poll
+                    // interval — but surface the failure rather than dropping
+                    // the Result silently.
+                    if let Err(e) = sinks.kern_phys_base_evt.write(1) {
+                        tracing::warn!(
+                            err = %e,
+                            "freeze_coord: kern_phys_base_evt wake write failed; \
+                             the kern_phys_base store above is authoritative and \
+                             the monitor poll self-heals within a poll interval"
+                        );
+                    }
                 }
                 // Derive virt-KASLR from the guest-reported runtime
                 // `_text` KVA + the host's link-time KVA. Skip if
@@ -441,7 +541,18 @@ pub(super) fn dispatch_bulk_message(
                             std::sync::atomic::Ordering::Acquire,
                         ) {
                             Ok(_) => {
-                                let _ = sinks.kern_virt_kaslr_evt.write(1);
+                                // Same wake-failure discipline as the phys_base
+                                // arm above: the CAS is authoritative and the
+                                // monitor poll self-heals a missed wake.
+                                if let Err(e) = sinks.kern_virt_kaslr_evt.write(1) {
+                                    tracing::warn!(
+                                        err = %e,
+                                        "freeze_coord: kern_virt_kaslr_evt wake write \
+                                         failed; the kern_virt_kaslr CAS above is \
+                                         authoritative and the monitor poll self-heals \
+                                         within a poll interval"
+                                    );
+                                }
                             }
                             Err(existing) if existing != biased_offset => {
                                 let lstar_derived = existing.saturating_sub(1);
@@ -471,7 +582,7 @@ pub(super) fn dispatch_bulk_message(
         Some(crate::vmm::wire::MsgType::SnapshotRequest) => {
             // Decode and stash a CRC-valid SnapshotRequest for
             // dispatch later in this iteration's body.
-            // `freeze_and_capture` / `thaw_and_barrier` /
+            // `freeze_and_dispatch` / `thaw_and_barrier` /
             // `arm_user_watchpoint` are not in scope here. CRC-bad
             // frames are ignored (a torn frame would otherwise let a
             // hostile guest force a capture). Malformed payloads
@@ -489,7 +600,7 @@ pub(super) fn dispatch_bulk_message(
         Some(crate::vmm::wire::MsgType::KernelOpRequest) => {
             // Decode and stash a CRC-valid KernelOpRequest for
             // dispatch later in this iteration's body where
-            // `freeze_and_capture` + `gmem.write_obj` are in scope.
+            // `freeze_and_dispatch` + `gmem.write_obj` are in scope.
             //
             // CRC-bad frames drop without a reply: a CRC-failed
             // frame is BY DEFINITION corrupted — the embedded
@@ -556,10 +667,12 @@ pub(super) fn dispatch_bulk_message(
                 // One-shot stamp of scenario_start_ns at the FIRST
                 // observation, hoisted OUTSIDE the watchdog_reset
                 // gate so it fires even when the caller did not
-                // wire a workload-duration budget. Bias `+1` keeps
-                // 0 as the "unset" sentinel so the periodic-capture
-                // loop can distinguish "no scenario started yet"
-                // from "scenario started exactly at run_start".
+                // wire a workload-duration budget. The `.max(1)`
+                // clamps a (boot-unreachable) elapsed==0 to 1 so 0
+                // stays the "unset" sentinel — letting the periodic-
+                // capture loop distinguish "no scenario started yet"
+                // from "scenario started exactly at run_start"; every
+                // real stamp passes through unchanged (not a `+1` shift).
                 // `compare_exchange` (rather than `store`) makes
                 // the stamp idempotent — a guest that publishes
                 // ScenarioStart more than once (workload re-runs,
@@ -706,9 +819,9 @@ pub(super) fn dispatch_bulk_message(
         Some(other) if !other.is_coordinator_internal() => {
             // Every other typed verdict-bearing variant
             // (StepEnd, Exit, TestResult, Crash, PayloadMetrics,
-            // RawPayloadOutput, Profraw, Stdout, Stderr, SchedLog,
-            // Lifecycle, ExecExit, Dmesg, ProbeOutput) accumulates
-            // into the bucket verbatim. (ExecExit is listed for
+            // RawPayloadOutput, Profraw, WprofTrace, WprofTraceChunk,
+            // Stdout, Stderr, SchedLog, Lifecycle, ExecExit, Dmesg,
+            // ProbeOutput) accumulates into the bucket verbatim. (ExecExit is listed for
             // completeness but is shell-mode-only -- sent only by
             // `cargo ktstr shell --exec` and consumed host-side by
             // `KtstrVm::run_interactive`, not the freeze coordinator;

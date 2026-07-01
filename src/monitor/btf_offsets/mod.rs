@@ -45,6 +45,21 @@ pub use cpu_time::{
 // the qualified path; the renderer that materializes it is pending.
 #[allow(unused_imports)]
 pub use cpu_time::SOFTIRQ_NAMES;
+// Named softirq vector indices (compile-pinned to SOFTIRQ_NAMES in cpu_time.rs)
+// — the IRQ read_sample arms index `PerCpuTimeStats.softirqs[]` against
+// these, never bare literals.
+pub use cpu_time::{SOFTIRQ_NET_RX, SOFTIRQ_NET_TX, SOFTIRQ_SCHED, SOFTIRQ_TIMER};
+
+mod psi;
+// PSI-irq host-walk: offsets + decode for the global psi_system memory
+// walk. Consumers (the monitor sample loop) land alongside the walker; the
+// re-exports are kept here so the walker wires in without a follow-up `pub use`.
+pub use psi::{PsiGroupOffsets, decode_avg10_percent, decode_total_us};
+
+mod cgroup;
+// Per-cgroup PSI-irq host-walk (Phase A): the cgroup-hierarchy field
+// offsets the cgroup_walk module uses to locate each test cgroup's psi_group.
+pub use cgroup::CgroupWalkOffsets;
 
 mod numa;
 // NUMA event capture is pending: the wire shape and BTF resolver
@@ -116,7 +131,7 @@ pub(crate) fn load_btf_from_path(path: &Path) -> Result<Btf> {
 /// crashes through this path 2N times. Memoising on first read drops
 /// every subsequent call to a hash lookup + `Arc::clone`.
 ///
-/// `Arc<Btf>` is the storage form because `Btf` (`btf-rs` 1.1.1) does
+/// `Arc<Btf>` is the storage form because `Btf` (`btf-rs` 2.0.0) does
 /// not implement `Clone`; cloning the inner `Arc<BtfObj>` requires
 /// going through the constructor again. `Arc::clone` on the outer
 /// pointer is the cheap shared-handle path.
@@ -438,6 +453,12 @@ pub struct KernelOffsets {
     pub scx_rq_flags: usize,
     /// Offset of `nr` within `struct scx_dispatch_q`.
     pub dsq_nr: usize,
+    /// Offset of `avg_irq.util_avg` (the PELT IRQ load) within `struct rq` —
+    /// the SUM of the `avg_irq` (sched_avg) member offset and the `util_avg`
+    /// sub-offset. `None` when CONFIG_HAVE_SCHED_AVG_IRQ is off (the field is
+    /// absent from BTF); the per-CPU read then yields `avg_irq_util = None`
+    /// (loud-absent).
+    pub rq_avg_irq_util_avg: Option<usize>,
     /// Offsets for scx event counters. Resolved via `scx_sched.pcpu`
     /// (6.18+) or `scx_sched.event_stats_cpu` (6.16-6.17) fallback.
     /// None if BTF lacks both paths.
@@ -554,6 +575,18 @@ impl KernelOffsets {
             .context("btf: resolve type of scx_rq.local_dsq")?;
         let dsq_nr = member_byte_offset(btf, &dsq_struct, "nr")?;
 
+        // PELT IRQ load offset: struct rq -> avg_irq (sched_avg) ->
+        // util_avg. Optional — the closure returns None when avg_irq is absent
+        // (CONFIG_HAVE_SCHED_AVG_IRQ off), unlike the REQUIRED rq.scx above, so
+        // a kernel without IRQ-time PELT still resolves the rest of the offsets.
+        let rq_avg_irq_util_avg = (|| {
+            let (avg_irq_off, avg_irq_member) =
+                member_byte_offset_with_member(btf, &rq_struct, "avg_irq").ok()?;
+            let sched_avg_struct = resolve_member_struct(btf, &avg_irq_member).ok()?;
+            let util_avg_off = member_byte_offset(btf, &sched_avg_struct, "util_avg").ok()?;
+            Some(avg_irq_off + util_avg_off)
+        })();
+
         let event_offsets = resolve_event_offsets(btf).ok();
         let schedstat_offsets = resolve_schedstat_offsets(btf).ok();
         let sched_domain_offsets = resolve_sched_domain_offsets(btf, &rq_struct).ok();
@@ -568,6 +601,7 @@ impl KernelOffsets {
             scx_rq_local_dsq,
             scx_rq_flags,
             dsq_nr,
+            rq_avg_irq_util_avg,
             event_offsets,
             schedstat_offsets,
             sched_domain_offsets,
@@ -721,6 +755,48 @@ pub(crate) fn find_struct(btf: &Btf, name: &str) -> Result<(btf_rs::Struct, Stri
         Some((s, n, _)) => Ok((s, n)),
         None => bail!("btf: '{name}' exists but is not a struct"),
     }
+}
+
+/// Resolve a named enumerator's integer value from a BTF enum, or `None`
+/// when the enum type or the enumerator is absent from this BTF.
+///
+/// This is the config-gated loud-absent primitive: a `#[ifdef]`-gated
+/// enumerator (e.g. `PSI_IRQ_FULL` in `enum psi_states`, present only
+/// under `CONFIG_IRQ_TIME_ACCOUNTING`) is omitted from BTF when its
+/// config is off, so `None` distinguishes "this kernel doesn't have the
+/// feature" (→ a metric reads loud-absent) from "the field is present and
+/// measured a real value". The caller indexes a kernel array
+/// (`group->avg[PSI_IRQ_FULL]`, `group->total[..][PSI_IRQ_FULL]`) by the
+/// returned value rather than a bare literal, so an enum reorder on a
+/// future kernel is followed, not silently mis-indexed.
+///
+/// Handles both `BTF_KIND_ENUM` (`Type::Enum`, 32-bit values) and
+/// `BTF_KIND_ENUM64` (`Type::Enum64`, 64-bit), returning the value
+/// widened to `i64`. Mirrors [`find_struct`]'s `resolve_types_by_name`
+/// scan; member names resolve via [`Btf::resolve_name`] (both
+/// `EnumMember` and `Enum64Member` implement `BtfType`).
+pub(crate) fn enum_value(btf: &Btf, enum_name: &str, variant: &str) -> Option<i64> {
+    let types = btf.resolve_types_by_name(enum_name).ok()?;
+    for t in &types {
+        match t {
+            Type::Enum(e) => {
+                for m in &e.members {
+                    if btf.resolve_name(m).ok().as_deref() == Some(variant) {
+                        return Some(i64::from(m.val()));
+                    }
+                }
+            }
+            Type::Enum64(e) => {
+                for m in &e.members {
+                    if btf.resolve_name(m).ok().as_deref() == Some(variant) {
+                        return Some(m.val() as i64);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Outcome of [`find_struct_or_fwd`]: either a full struct definition
@@ -970,6 +1046,120 @@ pub(crate) fn nested_member_byte_offset(
     }
     // Unreachable: the is_last branch returns from inside the loop.
     bail!("btf: nested path '{path}' walk exited unexpectedly")
+}
+
+/// Byte width of an integer-typed BTF value, peeling modifier chains
+/// (`Const`/`Volatile`/`Typedef`/`Restrict`/`TypeTag`). `None` for a
+/// non-integer leaf — a watched scheduler map field is read as a little-endian
+/// integer, so a struct/pointer/float leaf is unsupported.
+fn int_byte_width(btf: &Btf, ty: btf_rs::Type) -> Option<usize> {
+    let mut t = ty;
+    for _ in 0..20 {
+        match t {
+            Type::Int(i) => return Some(i.size()),
+            Type::Const(_)
+            | Type::Volatile(_)
+            | Type::Typedef(_)
+            | Type::Restrict(_)
+            | Type::TypeTag(_) => {
+                t = btf.resolve_chained_type(t.as_btf_type()?).ok()?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Resolve a dot-path within `root` to `(byte_offset_from_root,
+/// leaf_int_width)`. Mirrors [`nested_member_byte_offset`]'s descent but also
+/// returns the leaf integer's BTF-declared byte size (so reads never hardcode
+/// a width). `None` on any resolve failure or a non-integer leaf.
+fn nested_member_offset_and_width(
+    btf: &Btf,
+    root: &btf_rs::Struct,
+    path: &str,
+) -> Option<(usize, usize)> {
+    let parts: Vec<&str> = path.split('.').collect();
+    if parts.is_empty() || parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    let mut current = root.clone();
+    let mut total: usize = 0;
+    for (i, part) in parts.iter().enumerate() {
+        let is_last = i == parts.len() - 1;
+        let (off, member) = member_byte_offset_with_member(btf, &current, part).ok()?;
+        total = total.checked_add(off)?;
+        if is_last {
+            // A bitfield leaf (sub-byte width, kind_flag==1) cannot be read as
+            // a whole little-endian integer without capturing neighbouring
+            // bits, so reject it rather than return a wrong value.
+            // (`member_byte_offset_with_member` already rejects a non-byte-
+            // aligned offset; this additionally rejects a byte-aligned offset
+            // with a sub-byte size.)
+            if member.bitfield_size().is_some() {
+                return None;
+            }
+            let leaf_ty = btf.resolve_chained_type(&member).ok()?;
+            return int_byte_width(btf, leaf_ty).map(|w| (total, w));
+        }
+        current = resolve_member_struct(btf, &member).ok()?;
+    }
+    None
+}
+
+/// Resolve a watched BPF-map field to its `(byte_offset, byte_width)` within
+/// the map's value type. `value_type_id` is `BpfMapInfo.btf_value_type_id`:
+/// either a `.bss`/`.data` DATASEC (the first path segment is a section
+/// variable) or a struct (a named-map value type, e.g. `struct cpu_ctx`).
+/// `path` is the dot-path (`sys_stat.avg_lat_cri`, or a bare member like
+/// `lat_headroom`). Width is the leaf integer's BTF-declared byte size
+/// (u16 -> 2, u32 -> 4). `None` on any resolve failure (zero type id, unknown
+/// section var / member, non-composite non-leaf segment, non-integer leaf, a
+/// bitfield leaf, or a non-byte-aligned member).
+pub(crate) fn resolve_map_field_offset_width(
+    btf: &Btf,
+    value_type_id: u32,
+    path: &str,
+) -> Option<(usize, usize)> {
+    if value_type_id == 0 || path.is_empty() {
+        return None;
+    }
+    match btf.resolve_type_by_id(value_type_id).ok()? {
+        Type::Datasec(ds) => {
+            // The first path segment names a variable in the section; any
+            // remaining segments index into that variable's struct.
+            let (first, rest) = match path.split_once('.') {
+                Some((a, b)) => (a, Some(b)),
+                None => (path, None),
+            };
+            for var_info in &ds.variables {
+                let Ok(Type::Var(var)) = btf.resolve_chained_type(var_info) else {
+                    continue;
+                };
+                if btf.resolve_name(&var).ok().as_deref() != Some(first) {
+                    continue;
+                }
+                let var_off = var_info.offset() as usize;
+                let var_ty = btf.resolve_chained_type(&var).ok()?;
+                return match rest {
+                    // The leaf IS the section variable (a scalar global).
+                    None => Some((var_off, int_byte_width(btf, var_ty)?)),
+                    // Descend into the variable's struct for the rest.
+                    Some(rest) => {
+                        let root = match var_ty {
+                            Type::Struct(s) | Type::Union(s) => s,
+                            _ => return None,
+                        };
+                        let (inner, w) = nested_member_offset_and_width(btf, &root, rest)?;
+                        Some((var_off.checked_add(inner)?, w))
+                    }
+                };
+            }
+            None
+        }
+        Type::Struct(s) | Type::Union(s) => nested_member_offset_and_width(btf, &s, path),
+        _ => None,
+    }
 }
 
 /// Byte offsets for reading struct rq schedstat fields from guest memory.

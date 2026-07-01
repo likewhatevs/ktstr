@@ -82,6 +82,16 @@ impl VirtioConsole {
         self.mem = Some(mem);
     }
 
+    // INVARIANT: VIRTIO_RING_F_EVENT_IDX is deliberately NOT advertised,
+    // and host->guest RX-redelivery correctness depends on that. Without
+    // EVENT_IDX the guest kicks the RX vq on every buffer refill
+    // (add_inbuf -> virtqueue_kick, unconditional; the device never sets
+    // VRING_USED_F_NO_NOTIFY), so the host's per-notify drain_pending_rx
+    // always sees fresh descriptors and undelivered bytes never strand.
+    // Adding EVENT_IDX here would let the guest suppress kicks the host
+    // did not arm — the host would then have to arm used-buffer
+    // notifications (avail_event) AND redeliver pending_rx on
+    // used-buffer-available, not just on q-notify (see drain_pending_rx).
     fn device_features(&self) -> u64 {
         (1u64 << VIRTIO_F_VERSION_1) | (1u64 << (VIRTIO_CONSOLE_F_MULTIPORT as u64))
     }
@@ -603,6 +613,13 @@ impl VirtioConsole {
     /// add F_MULTIPORT and `opened` gates atop the port-0 baseline.
     /// Only publish a chain when ALL writes for that chain
     /// succeeded; otherwise keep bytes in `pending_rx` for retry.
+    ///
+    /// Retry cadence relies on the guest kicking the RX vq on every
+    /// buffer refill — guaranteed only while EVENT_IDX stays
+    /// un-negotiated (see `device_features`). Bytes held here drain on
+    /// the next q-notify, which the guest always sends; there is no
+    /// used-buffer-available trigger, so negotiating EVENT_IDX would
+    /// strand undelivered bytes until it is added.
     fn drain_pending_rx(&mut self, port_id: usize) {
         let port_label = port_label(port_id);
         let (queue_idx, _) = port_queues(port_id);

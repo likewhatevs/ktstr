@@ -178,9 +178,10 @@ fn spawn_thread_clone_mode_runs_to_completion() {
     }
 }
 /// `CloneMode::Thread + WorkType::ForkExit` MUST bail at spawn
-/// time. Pin the diagnostic message names both the variant and
-/// the structural reason (forked child's `_exit` tears down the
-/// whole tgid via `do_exit`).
+/// time. Pin the diagnostic: it names both incompatible variants
+/// and the structural reason (a fork from a thread of the
+/// multi-threaded harness inherits sibling-held locks the child
+/// cannot release).
 #[test]
 fn spawn_thread_with_forkexit_rejected_at_spawn_time() {
     let config = WorkloadConfig {
@@ -233,6 +234,35 @@ fn spawn_thread_with_cgroupchurn_rejected_at_spawn_time() {
     assert!(
         msg.contains("CloneMode::Thread")
             && msg.contains("WorkType::CgroupChurn")
+            && msg.contains("CloneMode::Fork"),
+        "diagnostic must name both incompatible variants and the safe \
+         alternative: {msg}"
+    );
+}
+/// `CloneMode::Thread + WorkType::CgroupAttachStorm` MUST bail at
+/// spawn time. The storm installs `SIGCHLD = SIG_IGN` to auto-reap its
+/// forked children; a thread-group worker shares the harness `sighand`,
+/// so that install would corrupt the harness's own child reaping. Pin
+/// the diagnostic so a future change to the admission gate cannot
+/// silently regress; mirrors the ForkExit/CgroupChurn reject pins at
+/// this same admission site.
+#[test]
+fn spawn_thread_with_cgroup_attach_storm_rejected_at_spawn_time() {
+    let config = WorkloadConfig {
+        num_workers: 1,
+        clone_mode: CloneMode::Thread,
+        work_type: WorkType::cgroup_attach_storm("dest", ReapMode::SigIgn),
+        ..Default::default()
+    };
+    let result = WorkloadHandle::spawn(&config);
+    let err = match result {
+        Ok(_) => panic!("Thread + CgroupAttachStorm must bail at spawn"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("CloneMode::Thread")
+            && msg.contains("WorkType::CgroupAttachStorm")
             && msg.contains("CloneMode::Fork"),
         "diagnostic must name both incompatible variants and the safe \
          alternative: {msg}"

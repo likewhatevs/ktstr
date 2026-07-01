@@ -207,6 +207,31 @@ impl Verdict {
         }
     }
 
+    /// Open a presence-checked claim for a possibly-absent metric.
+    ///
+    /// Use this on the direct-claim path when the value comes from an
+    /// `Option`-returning lookup (e.g. `VmResult::phase_metric` or a
+    /// `ScenarioStats` accessor): a `None` (the metric was never
+    /// produced) records a LOUD `Fail` rather than panicking on
+    /// `.unwrap()` or silently passing a sentinel from
+    /// `.unwrap_or(0.0)`. On `Some(v)` the returned [`PresentClaim`]
+    /// behaves exactly like [`Self::claim`].
+    ///
+    /// Public so the [`claim_present!`](crate::claim_present) macro can
+    /// dispatch through it; prefer the macro so the label is
+    /// `stringify!`-derived (same `&'static str` discipline as
+    /// [`Self::claim`]).
+    #[doc(hidden)]
+    pub fn claim_present(&mut self, name: &'static str, value: Option<f64>) -> PresentClaim<'_> {
+        PresentClaim {
+            verdict: self,
+            name,
+            value,
+            kind: DetailKind::Other,
+            reason: None,
+        }
+    }
+
     /// Append an informational note to the underlying [`AssertResult`]
     /// without altering the verdict. Mirrors [`AssertResult::note`].
     pub fn note(&mut self, msg: impl Into<String>) -> &mut Self {
@@ -850,6 +875,188 @@ impl<'a> ClaimBuilder<'a, f64> {
     }
 }
 
+/// Per-claim builder for a possibly-absent (`Option`-valued) metric.
+/// Produced by [`Verdict::claim_present`] and the
+/// [`claim_present!`](crate::claim_present) macro. On `Some(v)` every
+/// comparator delegates to the value-bound [`ClaimBuilder`], so a
+/// present metric behaves EXACTLY like [`claim!`](crate::claim). On
+/// `None` the metric is absent — there is nothing to compare, so every
+/// comparator records a LOUD `Fail` (`<name>: metric absent`) rather
+/// than silently passing. This mirrors the no-guessed-value discipline
+/// of `MetricId::def` returning `None` for an unregistered key: an
+/// absent signal fails the gate, it does not vacuously satisfy it (the
+/// hazard of `metric.unwrap_or(0.0)`, where a missing metric becomes a
+/// sentinel that can pass a bound).
+#[must_use = "PresentClaim records nothing until a comparator is invoked"]
+pub struct PresentClaim<'a> {
+    verdict: &'a mut Verdict,
+    name: &'static str,
+    value: Option<f64>,
+    kind: DetailKind,
+    reason: Option<&'a str>,
+}
+
+impl<'a> PresentClaim<'a> {
+    /// Override the [`DetailKind`] recorded on failure (whether the
+    /// metric is absent OR present-but-out-of-bound). Mirrors
+    /// [`ClaimBuilder::kind`].
+    pub fn kind(mut self, kind: DetailKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Attach a rationale appended to the failure message as
+    /// `(reason)`. Mirrors [`ClaimBuilder::because`].
+    pub fn because(mut self, reason: &'a str) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
+    /// Record the absent-metric `Fail`. Shared by every comparator's
+    /// `None` arm.
+    fn record_absent(
+        verdict: &'a mut Verdict,
+        name: &str,
+        kind: DetailKind,
+        reason: Option<&str>,
+    ) -> &'a mut Verdict {
+        let msg = append_reason(
+            format!("{name}: metric absent (no value to compare)"),
+            reason,
+        );
+        verdict.record(ClaimOutcome::Fail { kind, message: msg });
+        verdict
+    }
+
+    /// Build the value-bound [`ClaimBuilder`] for the present case,
+    /// carrying the `kind` / `because` modifiers forward. Shared by
+    /// every comparator's `Some` arm so the present path is
+    /// behavior-identical to [`Verdict::claim`].
+    fn present(
+        verdict: &'a mut Verdict,
+        name: &'static str,
+        value: f64,
+        kind: DetailKind,
+        reason: Option<&'a str>,
+    ) -> ClaimBuilder<'a, f64> {
+        let mut cb = verdict.claim(name, value).kind(kind);
+        if let Some(r) = reason {
+            cb = cb.because(r);
+        }
+        cb
+    }
+
+    /// Present and `>= floor`; absent → `Fail`. See
+    /// [`ClaimBuilder::at_least`].
+    pub fn at_least(self, floor: f64) -> &'a mut Verdict {
+        let PresentClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
+        match value {
+            None => Self::record_absent(verdict, name, kind, reason),
+            Some(v) => Self::present(verdict, name, v, kind, reason).at_least(floor),
+        }
+    }
+
+    /// Present and `<= ceiling`; absent → `Fail`. See
+    /// [`ClaimBuilder::at_most`].
+    pub fn at_most(self, ceiling: f64) -> &'a mut Verdict {
+        let PresentClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
+        match value {
+            None => Self::record_absent(verdict, name, kind, reason),
+            Some(v) => Self::present(verdict, name, v, kind, reason).at_most(ceiling),
+        }
+    }
+
+    /// Present and `< ceiling`; absent → `Fail`. See [`ClaimBuilder::lt`].
+    pub fn lt(self, ceiling: f64) -> &'a mut Verdict {
+        let PresentClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
+        match value {
+            None => Self::record_absent(verdict, name, kind, reason),
+            Some(v) => Self::present(verdict, name, v, kind, reason).lt(ceiling),
+        }
+    }
+
+    /// Present and `> floor`; absent → `Fail`. See [`ClaimBuilder::gt`].
+    pub fn gt(self, floor: f64) -> &'a mut Verdict {
+        let PresentClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
+        match value {
+            None => Self::record_absent(verdict, name, kind, reason),
+            Some(v) => Self::present(verdict, name, v, kind, reason).gt(floor),
+        }
+    }
+
+    /// Present and within `[lo, hi]` (inclusive); absent → `Fail`. See
+    /// [`ClaimBuilder::between`].
+    pub fn between(self, lo: f64, hi: f64) -> &'a mut Verdict {
+        let PresentClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
+        match value {
+            None => Self::record_absent(verdict, name, kind, reason),
+            Some(v) => Self::present(verdict, name, v, kind, reason).between(lo, hi),
+        }
+    }
+
+    /// Present and within `tolerance` of `target`; absent → `Fail`. See
+    /// [`ClaimBuilder::near`].
+    pub fn near(self, target: f64, tolerance: f64) -> &'a mut Verdict {
+        let PresentClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
+        match value {
+            None => Self::record_absent(verdict, name, kind, reason),
+            Some(v) => Self::present(verdict, name, v, kind, reason).near(target, tolerance),
+        }
+    }
+
+    /// Present and finite (neither NaN nor ±∞); absent → `Fail`. See
+    /// [`ClaimBuilder::is_finite`].
+    pub fn is_finite(self) -> &'a mut Verdict {
+        let PresentClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
+        match value {
+            None => Self::record_absent(verdict, name, kind, reason),
+            Some(v) => Self::present(verdict, name, v, kind, reason).is_finite(),
+        }
+    }
+}
+
 /// Per-claim builder for `BTreeSet<T>` values. Same `kind` / `because`
 /// modifiers as [`ClaimBuilder`]; comparator surface is set-specific.
 #[must_use = "SetClaim records nothing until a comparator is invoked"]
@@ -1266,5 +1473,30 @@ impl<'a, T: std::fmt::Debug> SeqClaim<'a, T> {
 macro_rules! claim {
     ($verdict:expr, $value:expr) => {
         $verdict.claim(stringify!($value), $value)
+    };
+}
+
+/// Presence-checked sibling of [`claim!`] for a possibly-absent metric.
+///
+/// Expands to [`Verdict::claim_present`](crate::assert::Verdict::claim_present)
+/// with a `stringify!`-derived label (the same `&'static str` discipline
+/// as [`claim!`]). The argument is an `Option`-valued expression (e.g. a
+/// `phase_metric` lookup); a `None` records a LOUD `Fail`
+/// (`<expr>: metric absent`), a `Some(v)` behaves exactly like [`claim!`].
+///
+/// ```
+/// # use ktstr::{assert::Verdict, claim_present};
+/// let mut v = Verdict::new();
+/// let throughput: Option<f64> = Some(1500.0);
+/// claim_present!(v, throughput).at_least(1000.0);
+/// let missing: Option<f64> = None;
+/// claim_present!(v, missing).at_least(1.0); // records a Fail, not a panic
+/// let r = v.into_result();
+/// assert!(!r.is_pass()); // the absent metric failed the verdict
+/// ```
+#[macro_export]
+macro_rules! claim_present {
+    ($verdict:expr, $value:expr) => {
+        $verdict.claim_present(stringify!($value), $value)
     };
 }

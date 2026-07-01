@@ -560,6 +560,338 @@ fn phase_group_cpu_delta(
     measured.then_some(sum as f64)
 }
 
+/// Per-phase per-CPU spatial-max fold for a monotonic per-CPU counter: the
+/// BUSIEST CPU's delta over the phase (`max_key`) + the concentration ratio
+/// `max / mean` over the reporting CPUs (`concentration_key`). A custom
+/// per-CPU-delta fold — NOT a read_sample arm (read_sample yields the cross-CPU
+/// SUM as one f64, with no per-CPU vector). `field` selects the per-CPU counter
+/// (`|c| c.irqs_sum` for hardirqs, `|c| c.softirqs[NET_RX]` for NET_RX softirqs).
+///
+/// Endpoints are the earliest + latest freeze BY `win` (the SAME key the bucket
+/// window uses; `samples_in_phase` is NOT positionally ordered — the stimulus
+/// offset-remap can reorder it). The per-CPU delta is correlated by the
+/// per_cpu_time `cpu` FIELD (not vec position) over the CPUs present in BOTH
+/// endpoints; a CPU absent from either is skipped (hotplug defense — a no-op on
+/// ktstr's boot-fixed vCPU set, correct-by-construction if a hot-add Op lands).
+/// `saturating_sub` clamps a per-CPU counter regress (the kernel counters are
+/// monotonic; a regress would signal a reset). The per-CPU delta is taken
+/// FIRST, the spatial max SECOND — so a busiest CPU that SHIFTS across the phase
+/// is captured as max(per-CPU deltas), not a delta of spatial maxes.
+///
+/// Loud-absent: `max_key` needs at least 2 freezes spanning a positive `win`
+/// window and at least 1 defined-delta CPU; `concentration_key` ADDITIONALLY
+/// needs at least 2 defined-delta CPUs (a 1-CPU intersection makes max/mean == 1
+/// a structural artifact) and a positive mean (a NaN would fail the sidecar's
+/// is_finite insert-guard).
+fn fold_per_cpu_spatial_max(
+    metrics: &mut std::collections::BTreeMap<String, f64>,
+    samples_in_phase: &[crate::scenario::sample::Sample<'_>],
+    win: impl Fn(&crate::scenario::sample::Sample<'_>) -> Option<u64>,
+    field: impl Fn(&crate::monitor::dump::PerCpuTimeStats) -> u64,
+    max_key: &str,
+    concentration_key: &str,
+) {
+    let placed: Vec<(&crate::scenario::sample::Sample<'_>, u64)> = samples_in_phase
+        .iter()
+        .filter(|s| !s.snapshot.per_cpu_time().is_empty())
+        .filter_map(|s| win(s).map(|w| (s, w)))
+        .collect();
+    if let (Some(&(first_s, fw)), Some(&(last_s, lw))) = (
+        placed.iter().min_by_key(|(_, w)| *w),
+        placed.iter().max_by_key(|(_, w)| *w),
+    ) && fw < lw
+    {
+        // Per-CPU delta over the cpu-field intersection of the two endpoint
+        // freezes; clamp a regress to 0.
+        let deltas: Vec<f64> = first_s
+            .snapshot
+            .per_cpu_time()
+            .iter()
+            .filter_map(|c0| {
+                last_s
+                    .snapshot
+                    .per_cpu_time_at(c0.cpu)
+                    .map(|c1| field(c1).saturating_sub(field(c0)) as f64)
+            })
+            .collect();
+        if let Some(max) = deltas.iter().copied().reduce(f64::max) {
+            metrics.entry(max_key.to_string()).or_insert(max);
+            if deltas.len() >= 2 {
+                let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
+                if mean > 0.0 {
+                    metrics
+                        .entry(concentration_key.to_string())
+                        .or_insert(max / mean);
+                }
+            }
+        }
+    }
+}
+
+/// Per-CPU scx_layered util-compensation SCALE over a freeze span: the factor by
+/// which a CPU's useful-work (non-overhead) capacity is scaled up to compensate
+/// for IRQ / softirq / stolen time. Over the `first`->`last` cpustat delta,
+/// `scale = delta_total / available` where `delta_total` is the sum of ALL 8
+/// `kernel_cpustat[]` ns slots (user+nice+system+idle+iowait+irq+softirq+steal)
+/// and `available = delta_total - (irq + softirq + steal)`. Clamped to
+/// `[1.0, 20.0]`; `available == 0` (overhead consumed the whole window, or no
+/// forward progress) returns the floor `1.0` (no compensation) — scx_layered's
+/// `available > 0` guard, expressed over `u64` saturating deltas where `> 0`
+/// is `!= 0`.
+///
+/// Byte-faithful to scx_layered's `util_compensation` per-CPU compute. The
+/// ns-vs-µs unit is immaterial: the ratio cancels it (scx_layered reads /proc
+/// microseconds; here the host reads `kernel_cpustat` ns, the same slots
+/// `/proc/stat` formats from). Hostile-guest hardening: every per-slot delta is
+/// `saturating_sub` (a cpustat counter that regresses across the span — a
+/// CPU-hotplug reset, or a corrupt read — clamps to 0, never wraps to
+/// ~`u64::MAX`), exactly as scx_layered does. The one divergence from
+/// scx_layered: the 8-slot `delta_total` and 3-slot `overhead` sums use
+/// `saturating_add` (a hostile per-slot `u64::MAX` clamps the total, mirroring
+/// the per-CPU IRQ spatial sums in [`crate::stats::MetricDef::read_sample`]),
+/// where scx_layered combines its per-slot saturating-subs with plain `+` — its
+/// /proc inputs are trusted, ours are guest-controlled. With `overhead >= 0` the
+/// ratio is always `>= 1.0`, so the clamp's floor is belt-and-suspenders and the
+/// cap at 20.0 is the only active bound.
+pub(crate) fn cpu_util_comp_scale(
+    first: &crate::monitor::dump::PerCpuTimeStats,
+    last: &crate::monitor::dump::PerCpuTimeStats,
+) -> f64 {
+    let user = last.cpustat_user_ns.saturating_sub(first.cpustat_user_ns);
+    let nice = last.cpustat_nice_ns.saturating_sub(first.cpustat_nice_ns);
+    let system = last
+        .cpustat_system_ns
+        .saturating_sub(first.cpustat_system_ns);
+    let idle = last.cpustat_idle_ns.saturating_sub(first.cpustat_idle_ns);
+    let iowait = last
+        .cpustat_iowait_ns
+        .saturating_sub(first.cpustat_iowait_ns);
+    let irq = last.cpustat_irq_ns.saturating_sub(first.cpustat_irq_ns);
+    let softirq = last
+        .cpustat_softirq_ns
+        .saturating_sub(first.cpustat_softirq_ns);
+    let steal = last.cpustat_steal_ns.saturating_sub(first.cpustat_steal_ns);
+    let delta_total = [user, nice, system, idle, iowait, irq, softirq, steal]
+        .into_iter()
+        .fold(0u64, u64::saturating_add);
+    let overhead = irq.saturating_add(softirq).saturating_add(steal);
+    let available = delta_total.saturating_sub(overhead);
+    if available == 0 {
+        return 1.0;
+    }
+    (delta_total as f64 / available as f64).clamp(1.0, 20.0)
+}
+
+/// Per-phase mean ACROSS CPUs of the [`cpu_util_comp_scale`] over the
+/// `per_cpu_time` freeze span, inserted as `avg_cpu_util_comp_scale`. Endpoint
+/// selection (first/last by `win`), the cpu-field intersection (per-CPU paired
+/// by the `cpu` field; a CPU absent from either endpoint is skipped — hotplug
+/// churn), the saturating deltas, and the loud-absent discipline (no key when
+/// no CPU pairs or the window is degenerate, `fw == lw`) mirror
+/// [`fold_per_cpu_spatial_max`]. `Gauge(Avg)`, so it auto-folds to run-level
+/// (weighted mean across phases) and cross-run with no extra wiring.
+///
+/// Cross-boot caveat: `samples_in_phase` are the periodic freezes, whose
+/// window starts at `max(scenario-start, prereqs-ready)` — on a cold boot
+/// (accessor/attach lag) it starts later, so this key reflects a later
+/// workload sub-window. Across a cold/warm boot mix its cross-run magnitude
+/// shifts; use `--noise-adjust` (spread analysis absorbs the boot-timing
+/// jitter) for cross-run compares — a plain `--dual-run` single-pair compare
+/// of this key is advisory.
+fn fold_util_comp_scale(
+    metrics: &mut std::collections::BTreeMap<String, f64>,
+    samples_in_phase: &[crate::scenario::sample::Sample<'_>],
+    win: impl Fn(&crate::scenario::sample::Sample<'_>) -> Option<u64>,
+) {
+    let placed: Vec<(&crate::scenario::sample::Sample<'_>, u64)> = samples_in_phase
+        .iter()
+        .filter(|s| !s.snapshot.per_cpu_time().is_empty())
+        .filter_map(|s| win(s).map(|w| (s, w)))
+        .collect();
+    if let (Some(&(first_s, fw)), Some(&(last_s, lw))) = (
+        placed.iter().min_by_key(|(_, w)| *w),
+        placed.iter().max_by_key(|(_, w)| *w),
+    ) && fw < lw
+    {
+        // Per-CPU clamped scale over the cpu-field intersection of the two
+        // endpoint freezes, then the arithmetic mean across the reporting CPUs.
+        let scales: Vec<f64> = first_s
+            .snapshot
+            .per_cpu_time()
+            .iter()
+            .filter_map(|c0| {
+                last_s
+                    .snapshot
+                    .per_cpu_time_at(c0.cpu)
+                    .map(|c1| cpu_util_comp_scale(c0, c1))
+            })
+            .collect();
+        if !scales.is_empty() {
+            let mean = scales.iter().sum::<f64>() / scales.len() as f64;
+            metrics
+                .entry("avg_cpu_util_comp_scale".to_string())
+                .or_insert(mean);
+        }
+    }
+}
+
+/// Per-phase per-task latency-criticality aggregate from the scheduler's
+/// `sdt_alloc` arena (scx_lavd's `task_ctx.normalized_lat_cri`, `[0, 1024]`).
+/// Over every freeze's `sdt_allocations` walk, pulls each live task_ctx's
+/// `normalized_lat_cri` — a host-rendered arena field (BPF_MAP_TYPE_ARENA), NOT
+/// a kernel counter and NOT a BPF `.bss` field — and folds across (freeze,
+/// task): mean -> `avg_task_lat_cri`, max -> `max_task_lat_cri`.
+///
+/// A GAUGE: `normalized_lat_cri` is an instantaneous per-task value lavd
+/// recomputes each schedule (scx_lavd `lat_cri.bpf.c`), so the fold is over ALL
+/// samples (mean / max over every (freeze, task) observation), NOT a first/last
+/// delta like the cpustat folds. `normalized` (not raw `lat_cri`) for cross-run
+/// comparability — raw `lat_cri` is squared + waker/wakee-propagated +
+/// load-dependent, so its magnitude is not comparable across runs.
+///
+/// Loud-absent + scheduler-agnostic by construction: a non-lavd payload has no
+/// `normalized_lat_cri` member, so [`crate::monitor::btf_render::RenderedValue::get`]
+/// returns `None` and the entry is skipped; if no entry yields the field, no key
+/// is inserted (the "no key when absent" discipline the sibling folds use). The
+/// member name is the only gate (lavd-unique) — no scheduler-name hardcoding.
+///
+/// Cross-boot caveat: like `fold_util_comp_scale`, these are the periodic
+/// freezes, whose window starts later on a cold boot (the prereq-ready
+/// anchor), so `avg_task_lat_cri`'s cross-run magnitude shifts across a
+/// cold/warm boot mix; use `--noise-adjust` for cross-run compares —
+/// `--dual-run` single-pair is advisory.
+fn fold_lat_cri(
+    metrics: &mut std::collections::BTreeMap<String, f64>,
+    samples_in_phase: &[crate::scenario::sample::Sample<'_>],
+) {
+    let mut sum = 0.0f64;
+    let mut count = 0usize;
+    let mut max = f64::MIN;
+    for s in samples_in_phase {
+        for alloc in &s.snapshot.report().sdt_allocations {
+            for entry in &alloc.entries {
+                if let Some(v) = entry
+                    .payload
+                    .get("normalized_lat_cri")
+                    .and_then(|r| r.as_u64())
+                {
+                    let v = v as f64;
+                    sum += v;
+                    count += 1;
+                    if v > max {
+                        max = v;
+                    }
+                }
+            }
+        }
+    }
+    if count > 0 {
+        metrics
+            .entry("avg_task_lat_cri".to_string())
+            .or_insert(sum / count as f64);
+        metrics.entry("max_task_lat_cri".to_string()).or_insert(max);
+    }
+}
+
+/// Per-phase per-CGROUP spatial axis over the workload-leaf PSI-irq captured at
+/// each freeze (`Snapshot::cgroup_psi`). The per-cgroup analog of
+/// [`fold_per_cpu_spatial_max`], producing three Peak metrics:
+///
+/// - `max_cgroup_psi_irq_avg10`: the worst leaf's IRQ-full pressure GAUGE
+///   (decoded avg10 percent) — per-freeze max across leaves, then max across the
+///   phase's freezes. A gauge, so no delta/baseline (a spatial-max of an
+///   instantaneous reading, the `max_avg_irq_util` shape on the cgroup axis).
+/// - `max_cgroup_irq_pressure`: the busiest leaf's IRQ-full stall DELTA over the
+///   phase (decoded µs) — per-leaf (last - first) `total_ns`, correlated by
+///   `cgroup_kva`, then the spatial max. A monotonic Counter, so delta-FIRST
+///   then spatial-max (the `max_cpu_hardirqs` shape). Informational
+///   (workload-confounded magnitude).
+/// - `max_cgroup_irq_pressure_concentration`: `max_cgroup_irq_pressure` / the
+///   mean per-leaf delta over the SAME leaf set — the busiest cell's share (the
+///   isolation/steering signal). max/MEAN, LowerBetter (the
+///   `max_cpu_hardirq_concentration` shape). Absent when < 2 reporting leaves or
+///   mean == 0.
+///
+/// Endpoints + the leaf intersection + saturating + loud-absent rules mirror
+/// [`fold_per_cpu_spatial_max`] (the `(cgroup_kva, serial_nr)` pair is the
+/// per-CPU `cpu`-field analog — the serial_nr disambiguates a freed slab KVA
+/// reused by a NEW cgroup, which `cgroup_kva` alone cannot; a leaf absent from
+/// either endpoint is skipped — leaf churn / a cgroup created mid-phase). All
+/// three are Peak → they auto-fold max-across-phases to run-level and cross-run
+/// MAX, no extra wiring.
+fn fold_per_cgroup_psi(
+    metrics: &mut std::collections::BTreeMap<String, f64>,
+    samples_in_phase: &[crate::scenario::sample::Sample<'_>],
+    win: impl Fn(&crate::scenario::sample::Sample<'_>) -> Option<u64>,
+) {
+    use crate::monitor::btf_offsets::{decode_avg10_percent, decode_total_us};
+    // avg10 gauge: per-freeze max across leaves, then max across the freezes.
+    let avg10_peak = samples_in_phase
+        .iter()
+        .filter_map(|s| {
+            s.snapshot
+                .cgroup_psi()
+                .iter()
+                .map(|c| decode_avg10_percent(c.avg10_raw))
+                .reduce(f64::max)
+        })
+        .reduce(f64::max);
+    if let Some(v) = avg10_peak {
+        metrics
+            .entry("max_cgroup_psi_irq_avg10".to_string())
+            .or_insert(v);
+    }
+
+    // total-delta spatial-max + concentration. Earliest + latest freeze by `win`
+    // (the bucket-window key; samples_in_phase is not positionally ordered). The
+    // per-leaf delta is correlated by `(cgroup_kva, serial_nr)` over the leaves
+    // present in BOTH endpoints; a leaf absent from either is skipped. The
+    // serial_nr guards KVA REUSE: a leaf rmdir'd mid-phase whose freed slab KVA a
+    // NEW cgroup then reused would alias by KVA alone and yield a bogus
+    // cross-cgroup delta — a different serial_nr at the same KVA is treated as
+    // absent (dropped), not differenced. `saturating_sub` then clamps only a
+    // (rare) genuine same-cgroup counter regress. delta FIRST, spatial max
+    // SECOND — a busiest cell that shifts across the phase is captured as
+    // max(per-leaf deltas), not a delta of spatial maxes.
+    let placed: Vec<(&crate::scenario::sample::Sample<'_>, u64)> = samples_in_phase
+        .iter()
+        .filter(|s| !s.snapshot.cgroup_psi().is_empty())
+        .filter_map(|s| win(s).map(|w| (s, w)))
+        .collect();
+    if let (Some(&(first_s, fw)), Some(&(last_s, lw))) = (
+        placed.iter().min_by_key(|(_, w)| *w),
+        placed.iter().max_by_key(|(_, w)| *w),
+    ) && fw < lw
+    {
+        let deltas: Vec<f64> = first_s
+            .snapshot
+            .cgroup_psi()
+            .iter()
+            .filter_map(|c0| {
+                last_s
+                    .snapshot
+                    .cgroup_psi()
+                    .iter()
+                    .find(|c1| c1.cgroup_kva == c0.cgroup_kva && c1.serial_nr == c0.serial_nr)
+                    .map(|c1| decode_total_us(c1.total_ns.saturating_sub(c0.total_ns)))
+            })
+            .collect();
+        if let Some(max) = deltas.iter().copied().reduce(f64::max) {
+            metrics
+                .entry("max_cgroup_irq_pressure".to_string())
+                .or_insert(max);
+            if deltas.len() >= 2 {
+                let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
+                if mean > 0.0 {
+                    metrics
+                        .entry("max_cgroup_irq_pressure_concentration".to_string())
+                        .or_insert(max / mean);
+                }
+            }
+        }
+    }
+}
+
 /// Assemble [`PhaseBucket`]s from a pre-grouped phase map. Shared by
 /// [`build_phase_buckets`] (grouping by the bridge-stamped step_index)
 /// and [`build_phase_buckets_with_stimulus`] (grouping by the
@@ -666,6 +998,43 @@ fn buckets_from_grouped(
         if let Some(v) = phase_group_cpu_delta(&samples_in_phase, |t| t.utime, |t| t.signal_utime) {
             metrics.entry("user_time_ns".to_string()).or_insert(v);
         }
+        // Per-CPU spatial axes (busiest-CPU counter delta + concentration) over
+        // the per_cpu_time freezes: hardirqs (kstat.irqs_sum) and NET_RX softirqs
+        // (kstat.softirqs[NET_RX]). Both are monotonic per-CPU counters; the fold
+        // takes the per-CPU delta FIRST then the spatial max — see
+        // `fold_per_cpu_spatial_max` for the shared endpoint / cpu-field
+        // intersection / saturating / loud-absent rules.
+        fold_per_cpu_spatial_max(
+            &mut metrics,
+            &samples_in_phase,
+            win,
+            |c| c.irqs_sum,
+            "max_cpu_hardirqs",
+            "max_cpu_hardirq_concentration",
+        );
+        fold_per_cpu_spatial_max(
+            &mut metrics,
+            &samples_in_phase,
+            win,
+            |c| c.softirqs[crate::monitor::btf_offsets::SOFTIRQ_NET_RX],
+            "max_cpu_softirq_net_rx",
+            "max_cpu_softirq_net_rx_concentration",
+        );
+        // scx_layered util-compensation scale: per-CPU first->last cpustat delta
+        // -> clamped scale -> mean across CPUs (avg_cpu_util_comp_scale). Over
+        // the same per_cpu_time freezes as the spatial axes above, but a Gauge
+        // (per-CPU clamp-then-mean), not a spatial-max counter delta.
+        fold_util_comp_scale(&mut metrics, &samples_in_phase, win);
+        // scx_lavd per-task latency-criticality: mean/max of each live task_ctx's
+        // normalized_lat_cri ([0,1024]) over the sdt_alloc arena walk at every
+        // freeze (avg_task_lat_cri / max_task_lat_cri). A gauge folded over all
+        // (freeze, task) observations; loud-absent for non-lavd schedulers.
+        fold_lat_cri(&mut metrics, &samples_in_phase);
+        // Per-cgroup PSI-irq spatial axis: the busiest workload-leaf's IRQ-full
+        // stall delta + avg10 gauge + the cross-leaf concentration, over the
+        // cgroup_psi freezes (the host cgroup-walk capture). All Peak; auto-fold
+        // run-level.
+        fold_per_cgroup_psi(&mut metrics, &samples_in_phase, win);
         let mut bucket = PhaseBucket {
             step_index,
             label,
@@ -688,6 +1057,31 @@ fn buckets_from_grouped(
             monitor_to_window_offset_ms,
             preemption_threshold_ns,
         );
+        // Phase-wall denominators for the IRQ rates, co-inserted
+        // both-or-neither with the read_sample-folded IRQ numerators above so
+        // derive_rate_metrics pairs num/den from THIS bucket (never cross-paired
+        // with a stimulus event's total_phase_duration_sec — a distinct
+        // metric). The window is the CAPTURE span (start_ms/end_ms = first->last
+        // freeze offset), the same span the Counter numerators accrue over:
+        // self-consistent for the ns/ns fraction, and a capture-window rate for
+        // the per-second rates (the d/span factor cancels in an A/B compare with
+        // matched cadence). Gate on total_hardirqs (present iff per_cpu_time was
+        // captured; irqtime-independent, unlike total_irq_time_ns) + a positive
+        // window. ms->ns and ms->s scaling lives HERE (derive_rate_metrics does
+        // bare num/den). One insertion covers both derive sites:
+        // build_phase_buckets_with_stimulus folds over buckets_from_grouped's
+        // output, so its later re-derive sees these denominators too.
+        if bucket.metrics.contains_key("total_hardirqs") && bucket.end_ms > bucket.start_ms {
+            let wall_ms = (bucket.end_ms - bucket.start_ms) as f64;
+            bucket
+                .metrics
+                .entry("total_phase_wall_ns".to_string())
+                .or_insert(wall_ms * 1_000_000.0);
+            bucket
+                .metrics
+                .entry("total_phase_wall_sec".to_string())
+                .or_insert(wall_ms / 1000.0);
+        }
         // Derive Rate metrics AFTER every component source is folded in:
         // the METRICS reductions + system/user_time_ns above AND the
         // monitor-injected components (e.g. avg_imbalance_ratio, whose ONLY
@@ -816,6 +1210,17 @@ fn fold_monitor_into_bucket(
     };
     if let Some(v) = pm.avg_imbalance {
         put("avg_imbalance_ratio", v);
+    }
+    // avg_nr_running (Gauge(Avg)) is a monitor-axis signal (full-class
+    // rq.nr_running, no read_sample dispatch arm), so like avg_imbalance_ratio
+    // it is folded for EVERY monitor-bearing bucket (not gated on synthesized)
+    // — captured buckets have no other source for it. It feeds per-phase
+    // rendering + boundary change-detection only; the run-level value stays
+    // MonitorSummary::avg_nr_running (fold_run_level_ext), so the run-level ext
+    // re-pool (populate_run_ext_metrics_from_phases) SKIPS this key to avoid a
+    // double-source.
+    if let Some(v) = pm.avg_nr_running {
+        put("avg_nr_running", v);
     }
     // max_imbalance_ratio (Peak) and stuck_count (Counter) have NO read_sample
     // dispatch arm (both fall to `_ => None` in crate::stats read_sample), so

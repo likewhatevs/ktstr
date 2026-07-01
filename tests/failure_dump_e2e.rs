@@ -8,7 +8,9 @@
 //!
 //! The freeze coordinator writes the JSON-pretty `FailureDumpReport`
 //! to a per-test path inside the run's sidecar directory
-//! (`{sidecar_dir()}/{test_name}.failure-dump.json`). The test
+//! (`{sidecar_dir()}/{test_name}-{variant_hash:016x}.failure-dump.json`,
+//! variant-keyed so a gauntlet test's per-preset dumps don't clobber;
+//! read back via `result.failure_dump_path()`). The test
 //! framework's primary dispatch
 //! (`test_support::eval::run_ktstr_test_inner`) attaches that
 //! path on every VM builder it constructs — no env var required,
@@ -102,12 +104,14 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
         .and_then(|m| m.as_array())
         .ok_or_else(|| anyhow::anyhow!("dump JSON missing top-level `maps` array"))?;
 
-    // Find the scx-ktstr `.bss` map. libbpf composes
-    // `<obj_name>.bss` for the global-section map, and scx-ktstr's
-    // BPF object is `bpf` (per `scx-ktstr/build.rs`'s
-    // `enable_skel("src/bpf/main.bpf.c", "bpf")` call), so the dump
-    // should carry an entry whose name ends with `.bss` and is NOT
-    // one of the framework probes filtered by `KTSTR_INTERNAL_MAPS`.
+    // Find the scx-ktstr `.bss` map. libbpf composes `<obj_name>.bss`
+    // for the global-section map, and scx-ktstr's libbpf object is
+    // `bpf_bpf` (libbpf-cargo doubles the `enable_skel(..., "bpf")`
+    // stem; the generated bpf_skel.rs emits `.name("bpf_bpf")` +
+    // `.map("bpf_bpf.bss", ...)`), so the global-section map is
+    // `bpf_bpf.bss`. This lookup is name-agnostic — it just takes the
+    // first entry whose name ends with `.bss` and is NOT one of the
+    // framework probes filtered by `KTSTR_INTERNAL_MAPS`.
     let bss_map = maps
         .iter()
         .find(|m| {

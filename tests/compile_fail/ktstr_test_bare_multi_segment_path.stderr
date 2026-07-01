@@ -1,4 +1,4 @@
-error: unexpected multi-segment path `crate :: host_only` — `#[ktstr_test]` accepts either `key = value` for value attributes (e.g. `scheduler = MITOSIS`, `payload = FIO`, `llcs = 4`) or the bare single-segment form for bool attributes (auto_repro, expect_auto_repro, not_starved, isolation, performance_mode, no_perf_mode, requires_smt, expect_err, allow_inconclusive, fail_on_stall, host_only, ignore, kaslr, wprof)
+error: unexpected multi-segment path `crate :: host_only` — `#[ktstr_test]` accepts either `key = value` for value attributes (e.g. `scheduler = MITOSIS`, `payload = FIO`, `llcs = 4`) or the bare single-segment form for bool attributes (auto_repro, expect_auto_repro, not_starved, isolation, performance_mode, pci, no_perf_mode, requires_smt, expect_err, survives_storm, allow_inconclusive, fail_on_stall, host_only, ignore, kaslr, wprof)
  --> tests/compile_fail/ktstr_test_bare_multi_segment_path.rs:3:14
   |
 3 | #[ktstr_test(crate::host_only)]

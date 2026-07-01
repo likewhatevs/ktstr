@@ -23,10 +23,28 @@ pub struct ScenarioStats {
     pub worst_migration_ratio: f64,
     /// Sum of iteration counts across all cgroups.
     pub total_iterations: u64,
-    /// Worst page locality fraction across cgroups (lowest non-zero).
-    pub worst_page_locality: f64,
-    /// Worst cross-node migration ratio across cgroups (highest).
-    pub worst_cross_node_migration_ratio: f64,
+    // worst_page_locality is NO LONGER a typed field: it is
+    // `crate::stats::MetricKind::WorstLowest` (NumaLocal/NumaTotal), re-pooled
+    // None-aware post-merge by `populate_run_distribution_metrics` from the
+    // per-phase NUMA carriers (the lowest per-cgroup page_locality, a measured
+    // 0.0 winning) — the `worst_page_locality` method shared with
+    // `run_metric`. The deleted typed field folded via `fold_lowest_nonzero`,
+    // which SKIPPED a measured 0.0 and reported a better-than-worst cross-run
+    // value; the ext re-pool fixes both the field and the read surfaces at once.
+    // worst_cross_node_migration_ratio is NO LONGER a typed field: it is
+    // `crate::stats::MetricKind::WorstCrossNodeRatio`, re-pooled post-merge by
+    // `populate_run_distribution_metrics` from the per-phase NUMA carriers (the
+    // MAX per-cgroup cross-node churn ratio over the latest residency total) via
+    // the `worst_cross_node_migration_ratio` method shared with `run_metric`. The
+    // deleted typed `Gauge(Last)` field/GauntletRow column was merge-max-folded
+    // within-run but cross-run averaged each run's value over `passes_observed`
+    // (folding a NUMA-less passing run's 0.0 sentinel into the mean), AND
+    // diverged from `run_metric` (which already re-derived from the per-phase
+    // carriers) — so the sidecar and the in-test read gave different values on
+    // multi-phase runs. The ext re-pool writes no key for a never-measured run,
+    // so the MEAN divides only by runs that measured NUMA. A CHURN ratio
+    // (cumulative migration EVENTS / final-snapshot resident pages), so it can
+    // exceed 1.0; NOT a bounded `[0,1]` fraction.
     // worst_wake_latency_tail_ratio is NO LONGER a typed field: it is
     // `crate::stats::MetricKind::WakeLatencyTailRatio`, re-selected into
     // `ext_metrics` post-merge by `populate_run_distribution_metrics` (max
@@ -72,39 +90,15 @@ pub struct ScenarioStats {
 }
 
 impl ScenarioStats {
-    /// Look up the phase bucket for a phase index.
+    /// Look up the phase bucket for a [`Phase`] — `Phase::BASELINE` for the
+    /// pre-first-Step settle window, `Phase::step(k)` for the test author's
+    /// 0-indexed Step k. The typed `Phase` keeps the 1-indexed encoding (Step 0
+    /// lives at the underlying `step_index = 1`) invisible at the call site.
     ///
-    /// **Heads up:** `step_index = 0` returns the pre-Step BASELINE
-    /// settle window, NOT the first Step. The first Step the
-    /// scenario author wrote lives at `step_index = 1` per the
-    /// 1-indexed Step encoding. To look up the test author's "Step
-    /// N", pass `N + 1` — or use [`Self::step`] for an accessor
-    /// that takes the 0-indexed scenario Step number directly.
-    ///
-    /// Returns `None` when no bucket with that index exists
-    /// (single-phase scenario, scenario didn't reach the step, or
-    /// `step_index` past the last phase).
-    pub fn phase(&self, step_index: u16) -> Option<&PhaseBucket> {
-        self.phases.iter().find(|p| p.step_index == step_index)
-    }
-
-    /// Look up the phase bucket for a 0-indexed scenario Step
-    /// number — the natural index the test author used when
-    /// constructing `vec![step_a, step_b, step_c]` (Step A is
-    /// `scenario_step_idx = 0`, Step B is `1`, etc.).
-    ///
-    /// Internally translates to `step_index = scenario_step_idx + 1`
-    /// per the 1-indexed phase encoding (phase 0 is reserved for
-    /// BASELINE). Use this for the common "I want metrics for the
-    /// N-th Step I wrote" case; use [`Self::phase`] when you need
-    /// to address BASELINE explicitly or work in phase-index space.
-    ///
-    /// Returns `None` when the scenario didn't reach that Step or
-    /// `phases` is empty.
-    pub fn step(&self, scenario_step_idx: u16) -> Option<&PhaseBucket> {
-        scenario_step_idx
-            .checked_add(1)
-            .and_then(|phase_idx| self.phase(phase_idx))
+    /// Returns `None` when no bucket with that phase exists (single-phase
+    /// scenario, the scenario didn't reach that Step, or a phase past the last).
+    pub fn phase(&self, phase: Phase) -> Option<&PhaseBucket> {
+        self.phases.iter().find(|p| p.step_index == phase.as_u16())
     }
 
     /// Shortcut: look up a single metric value in a specific
@@ -113,22 +107,41 @@ impl ScenarioStats {
     ///     [`Self::phases`]),
     /// (b) the phase exists but had no finite samples for that
     ///     metric, OR
-    /// (c) `metric` is not a registered metric name (typo case —
-    ///     [`Self::is_known_metric`] surfaces it).
+    /// (c) `metric` is a dynamic [`crate::stats::MetricId`] key (a
+    ///     scheduler-runtime / payload string) not present in this phase's
+    ///     stores. A built-in [`crate::stats::BuiltinMetric`] cannot be a
+    ///     typo — that is a compile error — so this case needs a dynamic key.
+    ///
+    /// Two stores are checked: [`PhaseBucket::metrics`] (via
+    /// [`PhaseBucket::get`]) and, failing that, the cross-cgroup phase
+    /// SUM of a per-cgroup Counter ([`PhaseBucket::cgroup_counter_total`])
+    /// for `"total_migrations"` / `"total_iterations"` / `"total_cpu_time_ns"` —
+    /// registered `Counter`s with no per-sample source, so they live ONLY in the
+    /// per-cgroup carriers; without this fallback the pooled lookup
+    /// returned a silent `None` while the per-cgroup
+    /// [`Self::phase_cgroup_metric`] surfaced the value. Symmetric with
+    /// [`crate::vmm::VmResult::phase_metric`].
     ///
     /// Sentinel-free: `Some(0.0)` means the reducer produced a
     /// real zero from finite samples, NOT "missing data". See
     /// [`PhaseBucket::metrics`] for the registry source. When
-    /// debugging an unexpected `None`, gate the lookup on
-    /// [`Self::is_known_metric`] to distinguish typos from absent
-    /// data.
+    /// debugging an unexpected `None` on a dynamic key, check
+    /// [`crate::stats::MetricId::def`]`().is_some()` to tell an unregistered
+    /// key from absent data (built-in ids always resolve).
     ///
-    /// **Heads up:** same 1-indexed Step encoding as
-    /// [`Self::phase`] — `step_index = 0` is BASELINE, not the
-    /// first Step. Use [`Self::step_metric`] for the 0-indexed
-    /// scenario-Step lookup.
-    pub fn phase_metric(&self, step_index: u16, metric: &str) -> Option<f64> {
-        self.phase(step_index).and_then(|p| p.get(metric))
+    /// Pass `Phase::BASELINE` for the settle window or `Phase::step(k)` for the
+    /// test author's 0-indexed Step k — the typed `Phase` hides the 1-indexed
+    /// encoding (see [`Self::phase`]).
+    pub fn phase_metric(
+        &self,
+        phase: Phase,
+        metric: impl Into<crate::stats::MetricId>,
+    ) -> Option<f64> {
+        let metric = metric.into();
+        self.phase(phase).and_then(|p| {
+            p.get(metric.as_str())
+                .or_else(|| p.cgroup_counter_total(metric.as_str()))
+        })
     }
 
     /// Cross-cgroup balance: the ratio of the busiest cell's per-worker
@@ -176,49 +189,30 @@ impl ScenarioStats {
         Some(max / min)
     }
 
-    /// Shortcut: look up a single metric value in a 0-indexed
-    /// scenario Step. Sibling of [`Self::step`]. See [`Self::phase_metric`]
-    /// for the None-cause taxonomy and
-    /// [`Self::is_known_metric`] for typo-debugging.
-    pub fn step_metric(&self, scenario_step_idx: u16, metric: &str) -> Option<f64> {
-        self.step(scenario_step_idx).and_then(|p| p.get(metric))
-    }
-
-    /// True when `name` matches a registered metric (see
-    /// [`PhaseBucket::metrics`] for the registry source). Use to
-    /// disambiguate the typo None-cause from [`Self::phase_metric`]
-    /// / [`Self::step_metric`]: if the lookup returns `None` and
-    /// `is_known_metric(name) == false`, the metric name is a typo
-    /// (caller mistake), not missing data (legitimately-absent
-    /// samples).
-    pub fn is_known_metric(name: &str) -> bool {
-        crate::stats::METRICS.iter().any(|m| m.name == name)
-    }
-
-    /// Iterate the canonical metric names a test author may pass
-    /// to [`Self::phase_metric`] / [`Self::step_metric`]. Sourced
-    /// from the registry referenced by [`PhaseBucket::metrics`].
-    ///
-    /// Sample usage for an A/B scheduler-swap assertion that
-    /// compares every registered metric across two scenario Steps:
-    /// ```ignore
-    /// for metric in ScenarioStats::known_metrics() {
-    ///     let baseline = r.stats.step_metric(0, metric);
-    ///     let after_swap = r.stats.step_metric(2, metric);
-    ///     // ... compare per metric ...
-    /// }
-    /// ```
-    ///
-    /// Heads up: not every known name is phase-readable. The
-    /// `MetricKind::Distribution` / `MetricKind::WorstLowest` family
-    /// (`worst_*_wake_latency_*` / `worst_*_run_delay_*` /
-    /// `worst_iterations_per_*`) is RUN-LEVEL only — it never appears
-    /// in [`PhaseBucket::metrics`], so [`Self::phase_metric`] /
-    /// [`Self::step_metric`] return `None` for those names. Read them
-    /// via [`Self::run_metric`] instead. Iterating `known_metrics()`
-    /// through `step_metric` (as above) silently skips that family.
-    pub fn known_metrics() -> impl Iterator<Item = &'static str> {
-        crate::stats::METRICS.iter().map(|m| m.name)
+    /// Per-cgroup analog of [`Self::phase_metric`]: look up `metric` for a named
+    /// `cgroup` in a [`Phase`] (`Phase::BASELINE` / `Phase::step(k)`), via that
+    /// cgroup's per-phase carrier ([`PhaseCgroupStats::get`]), falling back to
+    /// [`PhaseCgroupStats::cgroup_counter`] for the per-cgroup Counters
+    /// `total_migrations`/`total_iterations`/`total_cpu_time_ns`. `None` when the
+    /// phase has no bucket, no carrier for `cgroup`, the carrier carried no finite
+    /// value for the metric, OR the metric is an unregistered dynamic key (a
+    /// built-in id is typo-proof; an unregistered [`crate::stats::MetricId`] has no
+    /// [`crate::stats::MetricId::def`], same as [`Self::phase_metric`]). The
+    /// N-cgroups-to-N-queryable-sets surface on the AssertResult-holding path (the
+    /// in-VM `post_vm` path uses [`crate::vmm::VmResult::phase_cgroup_metric`]).
+    pub fn phase_cgroup_metric(
+        &self,
+        phase: Phase,
+        cgroup: &str,
+        metric: impl Into<crate::stats::MetricId>,
+    ) -> Option<f64> {
+        let metric = metric.into();
+        self.phase(phase)
+            .and_then(|p| p.per_cgroup.get(cgroup))
+            .and_then(|pc| {
+                pc.get(metric.as_str())
+                    .or_else(|| pc.cgroup_counter(metric.as_str()))
+            })
     }
 
     /// True iff the scenario produced at least one Step-phase
@@ -227,20 +221,20 @@ impl ScenarioStats {
     /// pre-first-Step settle window).
     ///
     /// Use this to fail a phase-aware assertion BEFORE calling
-    /// [`Self::step`] / [`Self::step_metric`] on a scenario that
+    /// [`Self::phase`] with a `Phase::step(k)` on a scenario that
     /// silently never advanced past BASELINE: a test that declared
     /// no `Step`s, OR a scenario that bailed in setup before any
-    /// `Step` ran, would otherwise see [`Self::step`] return
-    /// `None` for every index and the test would either panic on
+    /// `Step` ran, would otherwise see [`Self::phase`] return
+    /// `None` for every Step and the test would either panic on
     /// `.expect(...)` or pass vacuously.
     ///
     /// ```ignore
     /// anyhow::ensure!(
     ///     r.stats.has_steps(),
     ///     "scenario produced no Step-phase buckets — \
-    ///      declare a Step or use Self::phase(0) for BASELINE",
+    ///      declare a Step or read Phase::BASELINE",
     /// );
-    /// let throughput = r.stats.step_metric(0, "throughput");
+    /// let throughput = r.stats.phase_metric(Phase::step(0), "throughput");
     /// ```
     pub fn has_steps(&self) -> bool {
         self.phases.iter().any(|p| p.step_index >= 1)
@@ -285,8 +279,9 @@ impl ScenarioStats {
     /// Sentinel-free, matching [`Self::phase_metric`]: `None` means
     /// the metric is absent from this run (no contributing cgroup or
     /// carrier, or a name not present in the map); `Some(0.0)` is a
-    /// real measured zero. Gate on [`Self::is_known_metric`] to tell a
-    /// typo from genuinely-absent data. (The map also carries any
+    /// real measured zero. Check [`crate::stats::MetricId::def`] on a dynamic
+    /// key to tell an unregistered key from genuinely-absent data (built-in
+    /// ids always resolve). (The map also carries any
     /// user-defined extensible-metric keys, plus the framework-internal
     /// Rate-component Counters — `total_phase_iterations` /
     /// `total_phase_duration_sec` / `total_iterations_pooled` /
@@ -294,32 +289,206 @@ impl ScenarioStats {
     /// `iteration_rate` / `iterations_per_cpu_sec` — all of which resolve
     /// here too; prefer the derived rate over its raw components.)
     ///
-    /// NOT resolved here (these are not in `ext_metrics`):
-    /// - the typed cross-cgroup fields — read them via their named
-    ///   struct fields ([`Self::worst_spread`],
-    ///   [`Self::worst_migration_ratio`], [`Self::worst_gap_ms`],
-    ///   [`Self::total_migrations`], [`Self::total_iterations`],
-    ///   [`Self::worst_page_locality`],
-    ///   [`Self::worst_cross_node_migration_ratio`]). They are
-    ///   `0.0`-sentinel f64 (no not-measured state), so exposing them
-    ///   here would split this method's sentinel-free contract.
-    ///   (`worst_wake_latency_tail_ratio` is NO LONGER in this group —
-    ///   it is now the `WakeLatencyTailRatio` ext key and IS resolved
-    ///   here via the ext lookup.)
+    /// RESOLVED here None-aware, ahead of the ext lookup, via a typed dispatch
+    /// (`typed_sentinel_metric`): the cross-cgroup metrics `worst_spread`,
+    /// `worst_migration_ratio`, `worst_gap_ms`, `total_migrations`,
+    /// `total_iterations`, `worst_page_locality`,
+    /// `worst_cross_node_migration_ratio`. The dispatch RE-DERIVES each from the
+    /// per-cgroup (`self.cgroups`) / per-phase (`self.phases[].per_cgroup`, the
+    /// NUMA metrics) carriers — `None` when no carrier measured it, `Some(0.0)`
+    /// for a measured zero — preserving the sentinel-free contract. The 5
+    /// non-NUMA metrics are 0.0-sentinel typed struct fields (a not-measured
+    /// carrier coerces to 0.0, indistinguishable from a measured zero, so the
+    /// re-derivation recovers the distinction); the two NUMA roll-ups
+    /// (`worst_page_locality`, `worst_cross_node_migration_ratio`) have no struct
+    /// field and re-pool purely from the per-phase NUMA carriers.
+    /// (`worst_wake_latency_tail_ratio` resolves via the ext lookup as the
+    /// `WakeLatencyTailRatio` key.)
+    ///
+    /// NOT resolved here (not in `ext_metrics`, no typed dispatch):
     /// - the monitor-sourced run-level metrics (`max_imbalance_ratio`,
     ///   `max_dsq_depth`, `stuck_count`, `total_fallback`,
     ///   `total_keep_last`), which `ScenarioStats` does not hold
-    ///   run-level — read those per-phase via [`Self::phase_metric`] /
-    ///   [`Self::step_metric`].
+    ///   run-level — read those per-phase via [`Self::phase_metric`].
     ///
-    /// So this does NOT cover the full registry: iterating
-    /// [`Self::known_metrics`] through it yields `None` for those typed
-    /// and monitor names. There is no single run-level by-name accessor
-    /// over the whole registry (the typed fields live on `ScenarioStats`
-    /// directly, the monitor metrics only per-phase); this resolves the
-    /// ext-sourced family, the one with no typed field.
-    pub fn run_metric(&self, name: &str) -> Option<f64> {
-        self.ext_metrics.get(name).copied()
+    /// So this resolves the ext-sourced family AND the typed cross-cgroup fields
+    /// (via the dispatch); only the monitor-sourced run-level metrics remain
+    /// unresolved here (`ScenarioStats` holds them only per-phase).
+    pub fn run_metric(&self, metric: impl Into<crate::stats::MetricId>) -> Option<f64> {
+        let id = metric.into();
+        // The sentinel-prone cross-cgroup run-level metrics re-derive None-aware
+        // from the per-cgroup / per-phase carriers, recovering the never-measured
+        // vs measured-zero distinction the 0.0-coerced struct fields (or, for
+        // worst_page_locality, the absent field) cannot carry. A non-sentinel id
+        // returns `None` from the dispatch and falls through to the ext-metrics map.
+        if let crate::stats::MetricId::Builtin(b) = &id
+            && let Some(resolved) = self.typed_sentinel_metric(*b)
+        {
+            return resolved;
+        }
+        self.ext_metrics.get(id.as_str()).copied()
+    }
+
+    /// Re-derive a typed run-level metric None-aware from the per-cgroup /
+    /// per-phase carriers — recovering the never-measured (`None`) vs
+    /// measured-zero (`Some(0.0)`) distinction a bare 0.0-sentinel `f64` cannot
+    /// carry. The 0.0-sentinel typed struct fields (`worst_spread`,
+    /// `worst_migration_ratio`, ...) coerce a not-measured carrier to 0.0 in
+    /// `scenario_stats_for_cgroup` (indistinguishable from a measured zero);
+    /// `worst_page_locality` is no longer a struct field at all — it re-pools
+    /// purely from the per-phase NUMA carriers (see below).
+    ///
+    /// Returns `None` when `m` is NOT one of the typed sentinel ids — the caller
+    /// then falls through to the ext-metrics lookup. `Some(None)` when `m` IS a
+    /// sentinel id but no contributing carrier exists (loud-absent). `Some(Some(v))`
+    /// for the re-derived value (a measured zero stays `Some(0.0)`).
+    ///
+    /// The 5 non-NUMA metrics source from `self.cgroups`, whose `Option` / counter
+    /// carriers preserve the measured-vs-unmeasured state. The 2 NUMA roll-ups
+    /// (`worst_page_locality`, `worst_cross_node_migration_ratio` — neither a
+    /// struct field) source from `self.phases[].per_cgroup`, for different
+    /// reasons: `page_locality` is structurally 0.0 on the `cgroup_stats` path
+    /// (it needs an expected-node set the reports-only builder lacks), so
+    /// `self.cgroups` cannot source it; `cross_node_migration_ratio` IS populated
+    /// on `cgroup_stats`, but only as a single pre-folded scalar that cannot carry
+    /// the cross-phase fold (SUM the per-phase migration-counter deltas over the
+    /// LATEST residency total), so it too re-pools from the per-phase
+    /// `PhaseCgroupStats` NUMA counters — which also single-sources it with the
+    /// ext/sidecar value. On a phase-less direct-assertion `AssertResult` (no NUMA
+    /// capture) both NUMA roll-ups read `None` (correct loud-absent).
+    fn typed_sentinel_metric(&self, m: crate::stats::BuiltinMetric) -> Option<Option<f64>> {
+        use crate::stats::BuiltinMetric as B;
+        Some(match m {
+            // worst_spread: highest spread over cgroups that measured it
+            // (CgroupStats::spread is already Option — None when no worker had
+            // measurable wall time). None iff no cgroup measured spread.
+            B::WorstSpread => self
+                .cgroups
+                .iter()
+                .filter_map(|c| c.spread)
+                .reduce(f64::max),
+            // worst_migration_ratio: highest migration ratio over cgroups that
+            // ran iterations (a 0.0 with total_iterations>0 is measured; with
+            // ==0 it is the rate-over-zero sentinel — never-measured).
+            B::WorstMigrationRatio => self
+                .cgroups
+                .iter()
+                .filter(|c| c.total_iterations > 0)
+                .map(|c| c.migration_ratio)
+                .reduce(f64::max),
+            // total_migrations / total_iterations: cross-cgroup SUMs. 0 is a real
+            // measured sum (cgroups ran, zero events); never-measured = no cgroups.
+            B::TotalMigrations => (!self.cgroups.is_empty()).then(|| {
+                self.cgroups
+                    .iter()
+                    .map(|c| c.total_migrations)
+                    .fold(0u64, u64::saturating_add) as f64
+            }),
+            B::TotalIterations => (!self.cgroups.is_empty()).then(|| {
+                self.cgroups
+                    .iter()
+                    .map(|c| c.total_iterations)
+                    .fold(0u64, u64::saturating_add) as f64
+            }),
+            // worst_gap_ms: longest gap over cgroups with workers (gap 0 with
+            // workers = measured "no gap observed"; never-measured = no workers).
+            B::WorstGapMs => self
+                .cgroups
+                .iter()
+                .filter(|c| c.num_workers > 0)
+                .map(|c| c.max_gap_ms as f64)
+                .reduce(f64::max),
+            // worst_page_locality: LOWEST per-cgroup locality (the worst cell) over
+            // cgroups that measured NUMA residency — a measured 0.0 (all pages
+            // off-node) is the worst and WINS the lowest fold. Shared with the
+            // ext/sidecar re-pool via worst_page_locality() so the typed read and
+            // the cross-run comparison value agree (the same fix replaces the
+            // fold_lowest_nonzero sentinel-skip on BOTH surfaces).
+            B::WorstPageLocality => self.worst_page_locality(),
+            // worst_cross_node_migration_ratio: highest cross-node churn ratio over
+            // cgroups that measured NUMA. Shared with the ext/sidecar re-pool via
+            // worst_cross_node_migration_ratio() so the typed read and the cross-run
+            // comparison value agree (the divergence the typed field had).
+            B::WorstCrossNodeMigrationRatio => self.worst_cross_node_migration_ratio(),
+            _ => return None,
+        })
+    }
+
+    /// Aggregate each cgroup's NUMA carriers across `self.phases` into
+    /// `(latest_local, latest_total, summed_migrated)`. The cross-phase fold is
+    /// ASYMMETRIC by counter class: `numa_pages_local` / `numa_pages_total` are
+    /// current-residency GAUGE snapshots (the live `/proc/.../numa_maps`
+    /// residency, recomputed each read), so the LATEST MEASURED phase's value is the run-end placement
+    /// — SUMMING across phases would multiply residency by the phase count (a
+    /// silent over-count); `cross_node_migrated` is a per-phase migration-counter
+    /// DELTA over disjoint intervals, so it SUMS to the run total. The shared
+    /// `latest_total` denominator serves both ratios (page_locality and
+    /// cross_node share one page total), matching `cgroup_stats`, which reads the
+    /// final-snapshot residency. One entry per cgroup that appeared in any phase.
+    ///
+    /// LATEST is None-aware: a later phase carrier that measured NO NUMA pages
+    /// (`numa_pages_total == 0` — an empty backdrop slice, a non-NUMA `WorkType`
+    /// phase, or a zero-worker carrier) does NOT overwrite an earlier MEASURED
+    /// residency. A bare overwrite would zero out the earlier snapshot, and the
+    /// `total > 0` filter in `worst_page_locality()` would then drop the cgroup
+    /// from the worst-pool — silently reporting a better-than-worst run-level
+    /// locality (the same measured-vs-unmeasured discipline the cross-cgroup fold
+    /// applies, extended to the cross-phase axis).
+    fn numa_agg_per_cgroup(&self) -> Vec<(u64, u64, u64)> {
+        let mut by_cg: std::collections::BTreeMap<&str, (u64, u64, u64)> =
+            std::collections::BTreeMap::new();
+        // self.phases is in step (chronological) order, so a later MEASURED
+        // phase's residency snapshot overwrites the earlier (LATEST wins); a
+        // not-measured (total == 0) phase leaves the prior snapshot intact. The
+        // migration deltas accumulate unconditionally (a 0 delta adds nothing).
+        for phase in &self.phases {
+            for (name, pc) in &phase.per_cgroup {
+                let e = by_cg.entry(name.as_str()).or_insert((0, 0, 0));
+                if pc.numa_pages_total > 0 {
+                    e.0 = pc.numa_pages_local;
+                    e.1 = pc.numa_pages_total;
+                }
+                // saturating: guest-runtime migration counter pooled across
+                // phases; never wrap the derived cross-node-migration ratio.
+                e.2 = e.2.saturating_add(pc.cross_node_migrated);
+            }
+        }
+        by_cg.into_values().collect()
+    }
+
+    /// The run-level WORST (lowest) per-cgroup page-locality fraction, re-pooled
+    /// None-aware from the per-phase NUMA carriers: the lowest
+    /// `page_locality_of(latest_local, latest_total)` over cgroups that measured
+    /// NUMA residency (`numa_pages_total > 0`) — a measured 0.0 (all pages
+    /// off-node) WINS the lowest; an all-unmeasured cohort yields `None`. Shared
+    /// by `run_metric`'s `WorstPageLocality` dispatch AND
+    /// `populate_run_distribution_metrics`'s ext/sidecar re-pool so the typed
+    /// read and the cross-run comparison value are byte-identical.
+    fn worst_page_locality(&self) -> Option<f64> {
+        self.numa_agg_per_cgroup()
+            .into_iter()
+            .filter(|&(_, total, _)| total > 0)
+            .map(|(local, total, _)| super::reductions::page_locality_of(local, total))
+            .reduce(f64::min)
+    }
+
+    /// The run-level WORST (highest) per-cgroup cross-node migration-churn ratio,
+    /// re-pooled from the per-phase NUMA carriers: the MAX
+    /// `cross_node_migration_ratio_of(summed_migrated, latest_total)` over cgroups
+    /// that measured NUMA residency (`numa_pages_total > 0`) — an all-unmeasured
+    /// cohort yields `None`. The polarity twin of `worst_page_locality` (LowerBetter
+    /// → highest-wins). Shared by `run_metric`'s `WorstCrossNodeMigrationRatio`
+    /// dispatch AND `populate_run_distribution_metrics`'s ext/sidecar re-pool so the
+    /// typed read and the cross-run comparison value are byte-identical (the typed
+    /// `Gauge(Last)` field diverged from this on multi-phase runs).
+    fn worst_cross_node_migration_ratio(&self) -> Option<f64> {
+        self.numa_agg_per_cgroup()
+            .into_iter()
+            .filter(|&(_, total, _)| total > 0)
+            .map(|(_, total, migrated)| {
+                super::reductions::cross_node_migration_ratio_of(migrated, total)
+            })
+            .reduce(f64::max)
     }
 }
 
@@ -407,12 +576,15 @@ pub fn populate_run_ext_metrics_from_phases(
         let Some(def) = crate::stats::metric_def(key) else {
             continue;
         };
-        // Derived metrics (Rate / Distribution / WorstLowest) are produced
+        // Derived metrics (every `is_derived()`: Rate / Distribution / WorstLowest /
+        // WakeLatencyTailRatio / WorstCrossNodeRatio / PerPhase) are produced
         // from their pooled components, not folded as per-phase values: skip
         // here. A Rate re-derives after the loop (Σnum/Σdenom over the folded
-        // components); Distribution / WorstLowest are re-pooled run-level by
+        // components); the distributional kinds (Distribution / WorstLowest /
+        // WakeLatencyTailRatio / WorstCrossNodeRatio) are re-pooled run-level by
         // `populate_run_distribution_metrics` (and never appear in
-        // phase.metrics anyway). Folding a ready-made derived value would lose
+        // phase.metrics anyway); PerPhase is re-derived by `derive_phase_metrics`.
+        // Folding a ready-made derived value would lose
         // the re-pool, and routing one into aggregate_samples_weighted within
         // a run is not its producer path.
         if def.kind.is_derived() {
@@ -432,6 +604,20 @@ pub fn populate_run_ext_metrics_from_phases(
         // captured buckets would leak both into ext_metrics on the common
         // path.)
         if TYPED_FIELD_NAMES.contains(&key.as_str()) {
+            continue;
+        }
+        // avg_nr_running is NOT typed-backed (no GauntletRow accessor), but its
+        // authoritative run-level value is MonitorSummary::avg_nr_running, folded
+        // by fold_run_level_ext. It is the one monitor-summary-fold key that ALSO
+        // appears in per-phase bucket.metrics (fold_monitor_into_bucket writes it
+        // for rendering). Skip it here so the per-phase re-pool never claims the
+        // run-level key: VmResult::run_metric runs this re-pool BEFORE
+        // fold_run_level_ext, and the fold's `or_insert` would then no-op,
+        // silently replacing the whole-run value with the per-phase weighted
+        // mean. Its per-phase PhaseBucket value still feeds rendering +
+        // change-detection. (TYPED_FIELD_NAMES is the typed-accessor analogue of
+        // this same skip rationale.)
+        if key == "avg_nr_running" {
             continue;
         }
         // Per-phase (value, sample_count) for the kind-aware fold.
@@ -465,6 +651,19 @@ pub fn populate_run_ext_metrics_from_phases(
         if pairs.is_empty() {
             continue;
         }
+        // PerPhaseDeltaSum folds cross-PHASE by SUM: the run-level value is the
+        // sum of the disjoint per-phase OBSERVED CPU-time deltas (a lower bound
+        // on total run CPU time — excludes head / tail / inter-phase-gap
+        // windows; see the MetricKind::PerPhaseDeltaSum doc). It is NOT routed
+        // through aggregate_samples_weighted, whose PerPhaseDeltaSum arm
+        // implements the CROSS-RUN unweighted mean — mean-folding the phases
+        // here would double-count duration (the bug this kind fixes). Weights
+        // (phase sample_count) are irrelevant to a sum.
+        if def.kind == crate::stats::MetricKind::PerPhaseDeltaSum {
+            let sum: f64 = pairs.iter().map(|(v, _)| v).sum();
+            target.insert(key.clone(), sum);
+            continue;
+        }
         if let Some(reduced) = crate::stats::aggregate_samples_weighted(&pairs, def.kind) {
             target.insert(key.clone(), reduced);
         }
@@ -473,6 +672,66 @@ pub fn populate_run_ext_metrics_from_phases(
     // rate is Σnumerator / Σdenominator (the components folded by their
     // own kinds above — a Counter numerator summed across phases).
     crate::stats::derive_rate_metrics(target);
+}
+
+/// Run the FULL run-level `ext_metrics` population sequence into `stats` — the
+/// single source of truth shared by the eval layer (`evaluate_vm_result`) and
+/// [`crate::vmm::VmResult::run_metric`], so the two produce byte-identical
+/// run-level ext maps for the same run. Reads `samples` + `stats.phases` +
+/// `stats.cgroups`, writes `stats.ext_metrics`, in the canonical order:
+/// 1. [`populate_run_ext_metrics`] — the `read_sample`-wired registry family
+///    (over every freeze in `samples`), then the whole-run wall + IRQ rates.
+/// 2. [`populate_run_ext_metrics_from_phases`] — the phase-only ext metrics
+///    whose `read_sample` is `None` (`avg_imbalance_ratio`, `iteration_rate`,
+///    `system_time_ns`, `user_time_ns`, the per-CPU IRQ spatial maxes, and the
+///    per-cgroup PSI-irq spatial maxes).
+/// 3. [`populate_run_pooled_iterations_per_cpu_sec`] — the pooled cross-cgroup
+///    `iterations_per_cpu_sec` Rate (from `stats.cgroups`).
+/// 4. [`populate_run_pooled_taobench`] — the whole-run taobench qps + hit Rates
+///    pooled cross-cgroup (from `stats.cgroups[].taobench_whole`).
+/// 5. [`populate_run_pooled_taobench_distribution`] — the taobench whole-run
+///    open-loop serve-latency `*_whole` percentiles (union of the per-phase
+///    per-cgroup serve `PlatStats` histograms, percentile re-derived over the union).
+/// 6. [`populate_run_pooled_schbench`] — the schbench whole-run loop Counter +
+///    role-separate run-delay gate-Rates (from
+///    `stats.phases[].per_cgroup[].schbench` raw pairs, summed over phases+cgroups).
+/// 7. [`populate_run_pooled_schbench_distribution`] — the schbench whole-run
+///    latency/rps `*_whole` percentiles (union of the per-phase per-cgroup
+///    `PlatStats` histograms, percentile re-derived over the union).
+/// 8. [`populate_run_distribution_metrics`] — the `Distribution` / `WorstLowest`
+///    / `WakeLatencyTailRatio` / `WorstCrossNodeRatio` re-pools (from
+///    `stats.phases[].per_cgroup` raw samples + `stats.cgroups`).
+///
+/// ORDER IS LOAD-BEARING: step 1 must precede step 2 so the whole-run wall +
+/// whole-run IRQ-counter deltas land before step 2's `contains_key` skip (the
+/// multi-phase-rate fix); steps 3-8 fold the per-cgroup roll-up after the
+/// per-phase families.
+///
+/// `stats.phases` SHOULD be the PRE-`derive_phase_metrics` fold (the host buckets
+/// with the guest per-cgroup carriers folded in, before the per-phase scalar
+/// derivation) — the exact phase shape the eval layer feeds to step 2, since the
+/// eval path runs `derive_phase_metrics` AFTER this call. Feeding the pre-derive
+/// fold reproduces the eval sequence by construction (eval-faithful). Post-derive
+/// phases (e.g. [`crate::vmm::VmResult::phase_buckets`]) yield the SAME map today —
+/// step 2 skips `is_derived` keys, and every pooled scalar `derive_phase_metrics`
+/// writes to `bucket.metrics` (the schbench / taobench scalars) is
+/// `MetricKind::PerPhase` (which `is_derived`), so step 2 drops them either way —
+/// but the pre-derive fold avoids DEPENDING on that skip: a pooled key ever
+/// registered as non-derived would be folded run-level under post-derive,
+/// diverging from the eval map, but not under pre-derive. Pass the pre-derive
+/// fold ([`crate::vmm::VmResult::run_metric`] uses `phase_buckets_pre_derive`).
+pub fn populate_run_ext_all(
+    stats: &mut ScenarioStats,
+    samples: &crate::scenario::sample::SampleSeries,
+) {
+    populate_run_ext_metrics(samples, &mut stats.ext_metrics);
+    populate_run_ext_metrics_from_phases(&stats.phases, &mut stats.ext_metrics);
+    populate_run_pooled_iterations_per_cpu_sec(stats);
+    populate_run_pooled_taobench(stats);
+    populate_run_pooled_taobench_distribution(stats);
+    populate_run_pooled_schbench(stats);
+    populate_run_pooled_schbench_distribution(stats);
+    populate_run_distribution_metrics(stats);
 }
 
 /// Inject the run-level POOLED `iterations_per_cpu_sec` Rate's two Counter
@@ -517,12 +776,15 @@ pub fn populate_run_pooled_iterations_per_cpu_sec(stats: &mut ScenarioStats) {
     // Exclude cgroups with no measured on-CPU time from BOTH sums (mirrors the
     // per-cgroup None-on-zero): crediting an unmeasured cgroup's iterations
     // against the measured cgroups' CPU-seconds would overstate efficiency.
+    // saturating fold: pool the guest-runtime cpu-time-ns / iteration counters
+    // across cgroups; a plain `.sum()` would debug-panic / release-wrap on a
+    // corrupt/hostile component, silently corrupting iterations_per_cpu_sec.
     let summed_ns: u64 = stats
         .cgroups
         .iter()
         .filter(|c| c.total_cpu_time_ns > 0)
         .map(|c| c.total_cpu_time_ns)
-        .sum();
+        .fold(0u64, u64::saturating_add);
     if summed_ns == 0 {
         return;
     }
@@ -531,7 +793,7 @@ pub fn populate_run_pooled_iterations_per_cpu_sec(stats: &mut ScenarioStats) {
         .iter()
         .filter(|c| c.total_cpu_time_ns > 0)
         .map(|c| c.total_iterations)
-        .sum();
+        .fold(0u64, u64::saturating_add);
     stats
         .ext_metrics
         .insert("total_iterations_pooled".to_string(), summed_iters as f64);
@@ -541,9 +803,383 @@ pub fn populate_run_pooled_iterations_per_cpu_sec(stats: &mut ScenarioStats) {
     crate::stats::derive_rate_metrics(&mut stats.ext_metrics);
 }
 
+/// Inject the whole-run taobench engine's qps + hit Rate components into
+/// `stats.ext_metrics`, pooled across the run's `WorkType::Taobench` cgroups.
+/// Each cgroup carries its workers' merged whole-run aggregate
+/// ([`crate::assert::CgroupStats::taobench_whole`]); this folds those across
+/// cgroups (Σ ops, MAX wall window — the window is shared by the concurrent
+/// cohorts, per `TaobenchStats::merge`) and writes the six `total_taobench_*`
+/// Counter components (`ops`, `fast_ops`, `slow_ops`, `wall_sec`, plus the
+/// command-time `get_cmds` / `get_hits`), from which
+/// `crate::stats::derive_rate_metrics` derives `taobench_total_ops_per_sec`,
+/// `taobench_fast_ops_per_sec`, `taobench_slow_ops_per_sec`, the response-time
+/// `taobench_hit_fraction` (Σfast/Σcompleted), and the command-time
+/// `taobench_command_hit_rate` (Σhits/Σcmds). The whole-run Rate keys are
+/// registered METRICS, so — unlike the per-phase `taobench_*_qps`
+/// (`MetricKind::PerPhase`, invisible to the whole-run cross-run fold) — they
+/// reach the perf-delta `--noise-adjust` spread analysis. The open-loop
+/// serve-latency distribution is a SEPARATE pool
+/// ([`populate_run_pooled_taobench_distribution`], the `*_us_whole` keys).
+///
+/// MUST run post-`merge` (after every cgroup-bearing merge has populated
+/// `stats.cgroups`), exactly like [`populate_run_pooled_iterations_per_cpu_sec`]:
+/// an earlier run would pool over an incomplete cgroup set. A run with no
+/// Taobench cgroup writes nothing (the pool is `None`) — the keys stay absent,
+/// keeping a non-taobench run distinct from a measured zero.
+///
+/// Both-or-neither (the `derive_rate_metrics` co-location invariant): all six
+/// components are inserted together, gated on a measured wall window
+/// (`elapsed_ns > 0`) — the qps denominator. The three per-second Rates then
+/// derive unconditionally (wall_sec > 0); `taobench_hit_fraction` =
+/// `total_taobench_fast_ops` / `total_taobench_ops` derives iff ops completed
+/// (`total_taobench_ops > 0`) and `taobench_command_hit_rate` =
+/// `total_taobench_get_hits` / `total_taobench_get_cmds` iff lookups issued
+/// (`get_cmds > 0`); `derive_rate_metrics` skips a zero-denominator rate, so a
+/// window-but-no-ops run gets qps=0 keys but no false hit fraction / hit rate.
+/// The ns→s `/1e9` is applied ONCE here (not in `derive_rate_metrics`, a bare
+/// num/den), mirroring `total_cpu_time_sec`. Cross-RUN the components SUM-fold
+/// (Counter), so each Rate re-pools as Σnumerator / Σdenominator over the cohort
+/// — the aggregate throughput / hit rate, not a mean of per-run values.
+pub fn populate_run_pooled_taobench(stats: &mut ScenarioStats) {
+    use crate::stats::{
+        TOTAL_TAOBENCH_FAST_OPS, TOTAL_TAOBENCH_GET_CMDS, TOTAL_TAOBENCH_GET_HITS,
+        TOTAL_TAOBENCH_OPS, TOTAL_TAOBENCH_SLOW_OPS, TOTAL_TAOBENCH_WALL_SEC,
+    };
+    // Pool the per-cgroup whole-run aggregates across the run's Taobench cgroups:
+    // Σ ops, MAX wall window (shared by the concurrent cohorts). `None` when no
+    // cgroup ran a Taobench worker.
+    let pooled = stats
+        .cgroups
+        .iter()
+        .filter_map(|c| c.taobench_whole.as_ref())
+        .fold(
+            None,
+            |acc: Option<crate::workload::taobench::run::TaobenchStats>, t| {
+                Some(match acc {
+                    Some(mut a) => {
+                        a.merge(t);
+                        a
+                    }
+                    None => *t,
+                })
+            },
+        );
+    let Some(w) = pooled else {
+        return;
+    };
+    let c = &w;
+    // qps is undefined without a measured wall window; write no components (so
+    // hit_fraction stays absent too) rather than a 0/0 rate.
+    if c.elapsed_ns == 0 {
+        return;
+    }
+    stats
+        .ext_metrics
+        .insert(TOTAL_TAOBENCH_OPS.to_string(), c.total_ops() as f64);
+    stats
+        .ext_metrics
+        .insert(TOTAL_TAOBENCH_FAST_OPS.to_string(), c.fast_ops as f64);
+    stats
+        .ext_metrics
+        .insert(TOTAL_TAOBENCH_SLOW_OPS.to_string(), c.slow_ops as f64);
+    stats.ext_metrics.insert(
+        TOTAL_TAOBENCH_WALL_SEC.to_string(),
+        c.elapsed_ns as f64 / 1e9,
+    );
+    // Command-time hit components: hits = cmds − misses (request-time). The Rate
+    // taobench_command_hit_rate = Σhits / Σcmds re-derives via derive_rate_metrics
+    // (skipped, hence absent, when no lookups issued). Diverges from the
+    // response-time taobench_hit_fraction under open-loop arrival.
+    stats
+        .ext_metrics
+        .insert(TOTAL_TAOBENCH_GET_CMDS.to_string(), c.get_cmds as f64);
+    stats.ext_metrics.insert(
+        TOTAL_TAOBENCH_GET_HITS.to_string(),
+        c.get_cmds.saturating_sub(c.get_misses) as f64,
+    );
+    crate::stats::derive_rate_metrics(&mut stats.ext_metrics);
+}
+
+/// Inject the taobench WHOLE-RUN open-loop serve-latency percentiles into
+/// `stats.ext_metrics` as the `taobench_serve_*_us_whole` keys, re-pooled
+/// run-level by UNIONING the per-phase per-cgroup serve `PlatStats` histograms
+/// (`stats.phases[].per_cgroup[].taobench.serve_lat`) across every step-attributed
+/// phase and every cgroup, then re-deriving each percentile / min / max over the
+/// merged histogram (`PlatStats::combine` is an associative bucket-count add, so
+/// the merged histogram is the faithful pooled sample set and the re-derived
+/// percentile is the percentile OF the union — NOT a mean of per-source
+/// percentiles). The taobench analog of
+/// [`populate_run_pooled_schbench_distribution`], with the same source: the
+/// BASELINE (epoch 0) and inter-step-gap (`u32::MAX`) epochs are excluded (they
+/// are dropped from `stats.phases` by `expand_backdrop_phase_buckets`), so this is
+/// the steady-state serve distribution over the measured steps — a faithful
+/// PerRunDistribution, distinct from the standalone driver's full-run histogram.
+///
+/// Runs in [`populate_run_ext_all`] (post-merge); reads the per-phase carriers
+/// (disjoint from the taobench counter pool) and writes distinct `*_whole` keys,
+/// so it is order-independent. Keys are written only when the merged histogram
+/// has samples (`sample_count() > 0`) — a closed-loop run (no serve samples)
+/// reads ABSENT, never a false 0. The keys are `MetricKind::PerRunDistribution`:
+/// noise-compared per-run by `crate::stats::noise_findings`, NEVER cross-run
+/// folded (a percentile of a union is not a mean of per-run percentiles, and the
+/// per-phase histograms are dropped at the cross-run boundary).
+pub fn populate_run_pooled_taobench_distribution(stats: &mut ScenarioStats) {
+    use crate::stats::{
+        TAOBENCH_SERVE_MAX_US_WHOLE, TAOBENCH_SERVE_MIN_US_WHOLE, TAOBENCH_SERVE_P50_US_WHOLE,
+        TAOBENCH_SERVE_P90_US_WHOLE, TAOBENCH_SERVE_P99_US_WHOLE, TAOBENCH_SERVE_P999_US_WHOLE,
+    };
+    use crate::workload::schbench::plat::{Pct, PlatStats};
+
+    // Union the per-phase per-cgroup serve histograms across the whole run.
+    let mut serve = PlatStats::default();
+    for phase in &stats.phases {
+        for pc in phase.per_cgroup.values() {
+            if let Some(t) = pc.taobench.as_ref() {
+                serve.combine(&t.serve_lat);
+            }
+        }
+    }
+    if serve.sample_count() == 0 {
+        return;
+    }
+    let q = serve.percentiles();
+    stats.ext_metrics.insert(
+        TAOBENCH_SERVE_P50_US_WHOLE.to_string(),
+        q.value_at(Pct::P50) as f64,
+    );
+    stats.ext_metrics.insert(
+        TAOBENCH_SERVE_P90_US_WHOLE.to_string(),
+        q.value_at(Pct::P90) as f64,
+    );
+    stats.ext_metrics.insert(
+        TAOBENCH_SERVE_P99_US_WHOLE.to_string(),
+        q.value_at(Pct::P99) as f64,
+    );
+    stats.ext_metrics.insert(
+        TAOBENCH_SERVE_P999_US_WHOLE.to_string(),
+        q.value_at(Pct::P999) as f64,
+    );
+    stats
+        .ext_metrics
+        .insert(TAOBENCH_SERVE_MIN_US_WHOLE.to_string(), q.min as f64);
+    stats
+        .ext_metrics
+        .insert(TAOBENCH_SERVE_MAX_US_WHOLE.to_string(), q.max as f64);
+}
+
+/// Inject the schbench whole-run Class-3 metrics — the loop Counter and the
+/// role-separate run-delay gate-Rate components — into `stats.ext_metrics`,
+/// summed across EVERY phase and EVERY cgroup from the per-phase
+/// `SchbenchPhaseStats` raw pairs (`stats.phases[].per_cgroup[].schbench`). The
+/// raw `(run_delay_ns, pcount)` pairs and `loop_count` are integer and
+/// associative, so summing across phases+cgroups gives the run-level totals; the
+/// two `*_run_delay_ns_per_sched` Rates then re-derive Σrun_delay/Σpcount (the
+/// sample-weighted per-schedule mean — NOT a mean of per-run means). The MESSAGE
+/// and WORKER thread roles pool SEPARATELY (different per-schedule wait
+/// populations — never cross-pool).
+///
+/// Runs in [`populate_run_ext_all`] (post-merge, after
+/// [`populate_run_pooled_taobench`]); reads the per-phase carriers (a disjoint
+/// source from the iterations/taobench pools) and writes distinct
+/// `total_schbench_*` / `schbench_*_run_delay_ns_per_sched` keys, so it is
+/// order-independent. A run with no schbench carrier writes nothing (keys stay
+/// absent — a non-schbench run is distinct from a measured zero).
+///
+/// Both-or-neither PER ROLE: each role's two Counter components are inserted only
+/// when that role was scheduled (`pcount > 0`), so `derive_rate_metrics` yields
+/// the role's gate-Rate iff it ran (never a 0/0); the two roles are independent
+/// (a worker-only run emits only the worker Rate). `total_schbench_loops` is
+/// always written when any schbench carrier ran (0 is a measured zero). Distinct
+/// from the per-phase `sched_delay_msg/worker_us` (mean-of-means parity,
+/// PerPhase display-only) — these Rates gate; no double-count. Cross-RUN the
+/// components SUM-fold (Counter), so each Rate re-pools Σrun_delay/Σpcount.
+pub fn populate_run_pooled_schbench(stats: &mut ScenarioStats) {
+    use crate::stats::{
+        TOTAL_SCHBENCH_LOOPS, TOTAL_SCHBENCH_MSG_PCOUNT, TOTAL_SCHBENCH_MSG_RUN_DELAY_NS,
+        TOTAL_SCHBENCH_WORKER_PCOUNT, TOTAL_SCHBENCH_WORKER_RUN_DELAY_NS,
+    };
+    let mut msg_run_delay_ns: u64 = 0;
+    let mut msg_pcount: u64 = 0;
+    let mut worker_run_delay_ns: u64 = 0;
+    let mut worker_pcount: u64 = 0;
+    let mut loops: u64 = 0;
+    let mut any = false;
+    for phase in &stats.phases {
+        for pc in phase.per_cgroup.values() {
+            if let Some(s) = pc.schbench.as_ref() {
+                any = true;
+                // saturating: guest-runtime run-delay-ns / pcount / loop
+                // counters pooled across phases+cgroups (matches the already-
+                // saturating SchbenchPhaseStats::merge); never wrap a gate-Rate.
+                msg_run_delay_ns = msg_run_delay_ns.saturating_add(s.msg_run_delay_ns);
+                msg_pcount = msg_pcount.saturating_add(s.msg_pcount);
+                worker_run_delay_ns = worker_run_delay_ns.saturating_add(s.worker_run_delay_ns);
+                worker_pcount = worker_pcount.saturating_add(s.worker_pcount);
+                loops = loops.saturating_add(s.loop_count);
+            }
+        }
+    }
+    if !any {
+        return;
+    }
+    stats
+        .ext_metrics
+        .insert(TOTAL_SCHBENCH_LOOPS.to_string(), loops as f64);
+    if msg_pcount > 0 {
+        stats.ext_metrics.insert(
+            TOTAL_SCHBENCH_MSG_RUN_DELAY_NS.to_string(),
+            msg_run_delay_ns as f64,
+        );
+        stats
+            .ext_metrics
+            .insert(TOTAL_SCHBENCH_MSG_PCOUNT.to_string(), msg_pcount as f64);
+    }
+    if worker_pcount > 0 {
+        stats.ext_metrics.insert(
+            TOTAL_SCHBENCH_WORKER_RUN_DELAY_NS.to_string(),
+            worker_run_delay_ns as f64,
+        );
+        stats.ext_metrics.insert(
+            TOTAL_SCHBENCH_WORKER_PCOUNT.to_string(),
+            worker_pcount as f64,
+        );
+    }
+    crate::stats::derive_rate_metrics(&mut stats.ext_metrics);
+}
+
+/// Inject the schbench whole-run DISTRIBUTIONAL metrics (the wakeup /
+/// request latency percentiles + min/max and the achieved-rps percentiles) into
+/// `stats.ext_metrics` as the `*_whole` keys, re-pooled run-level by UNIONING the
+/// per-phase per-cgroup `PlatStats` histograms
+/// (`stats.phases[].per_cgroup[].schbench.{wakeup,request,rps}`) across EVERY
+/// phase and EVERY cgroup, then re-deriving each percentile / min / max over the
+/// merged histogram. `PlatStats::combine` is an associative bucket-count add, so
+/// the merged histogram is the FAITHFUL union and the re-derived percentile is
+/// the percentile OF the pooled sample set — NOT a mean of per-phase / per-cgroup
+/// percentiles (the percentile operator is non-linear). This is the schbench
+/// histogram analog of [`populate_run_distribution_metrics`]'s raw-sample union.
+///
+/// Runs in [`populate_run_ext_all`] (post-merge, after
+/// [`populate_run_pooled_schbench`]); reads the per-phase carriers (disjoint from
+/// the iterations / taobench / schbench loop/run-delay pools) and writes distinct
+/// `*_whole` keys, so it is order-independent. Each stream's keys are written
+/// only when its merged histogram has samples (`sample_count() > 0`) — a stream
+/// with no samples (e.g. a sub-1s run with no rps samples) reads ABSENT, never a
+/// false 0 (mirrors the per-phase `write_schbench_scalars` gating and the
+/// carrier-less graceful degradation of [`populate_run_distribution_metrics`]).
+///
+/// The `*_whole` keys are `crate::stats::MetricKind::PerRunDistribution`:
+/// noise-compared per-run by `crate::stats::noise_findings` (each run's own p99),
+/// NEVER cross-RUN folded (a percentile of a union is not a mean of per-run
+/// percentiles, and the per-phase histograms are dropped at the cross-run
+/// boundary), so they are gated out of the cross-RUN ext fold and the within-run
+/// reducers (`is_derived`). Distinct names from the per-phase percentile keys
+/// (one registry name = one kind), produced solely here.
+pub fn populate_run_pooled_schbench_distribution(stats: &mut ScenarioStats) {
+    use crate::stats::{
+        SCHBENCH_REQUEST_MAX_US_WHOLE, SCHBENCH_REQUEST_MIN_US_WHOLE,
+        SCHBENCH_REQUEST_P50_US_WHOLE, SCHBENCH_REQUEST_P90_US_WHOLE,
+        SCHBENCH_REQUEST_P99_US_WHOLE, SCHBENCH_REQUEST_P999_US_WHOLE, SCHBENCH_RPS_MAX_WHOLE,
+        SCHBENCH_RPS_MIN_WHOLE, SCHBENCH_RPS_P20_WHOLE, SCHBENCH_RPS_P50_WHOLE,
+        SCHBENCH_RPS_P90_WHOLE, SCHBENCH_WAKEUP_MAX_US_WHOLE, SCHBENCH_WAKEUP_MIN_US_WHOLE,
+        SCHBENCH_WAKEUP_P50_US_WHOLE, SCHBENCH_WAKEUP_P90_US_WHOLE, SCHBENCH_WAKEUP_P99_US_WHOLE,
+        SCHBENCH_WAKEUP_P999_US_WHOLE,
+    };
+    use crate::workload::schbench::plat::{Pct, PlatStats};
+
+    // Union the per-stream histograms across ALL phases+cgroups (combine =
+    // associative bucket-count add → the faithful pooled histogram).
+    let mut wakeup = PlatStats::default();
+    let mut request = PlatStats::default();
+    let mut rps = PlatStats::default();
+    for phase in &stats.phases {
+        for pc in phase.per_cgroup.values() {
+            if let Some(s) = pc.schbench.as_ref() {
+                wakeup.combine(&s.wakeup);
+                request.combine(&s.request);
+                rps.combine(&s.rps);
+            }
+        }
+    }
+    // Latency streams: 4 percentiles + min/max, re-derived over the union, µs.
+    if wakeup.sample_count() > 0 {
+        let q = wakeup.percentiles();
+        stats.ext_metrics.insert(
+            SCHBENCH_WAKEUP_P50_US_WHOLE.to_string(),
+            q.value_at(Pct::P50) as f64,
+        );
+        stats.ext_metrics.insert(
+            SCHBENCH_WAKEUP_P90_US_WHOLE.to_string(),
+            q.value_at(Pct::P90) as f64,
+        );
+        stats.ext_metrics.insert(
+            SCHBENCH_WAKEUP_P99_US_WHOLE.to_string(),
+            q.value_at(Pct::P99) as f64,
+        );
+        stats.ext_metrics.insert(
+            SCHBENCH_WAKEUP_P999_US_WHOLE.to_string(),
+            q.value_at(Pct::P999) as f64,
+        );
+        stats
+            .ext_metrics
+            .insert(SCHBENCH_WAKEUP_MIN_US_WHOLE.to_string(), q.min as f64);
+        stats
+            .ext_metrics
+            .insert(SCHBENCH_WAKEUP_MAX_US_WHOLE.to_string(), q.max as f64);
+    }
+    if request.sample_count() > 0 {
+        let q = request.percentiles();
+        stats.ext_metrics.insert(
+            SCHBENCH_REQUEST_P50_US_WHOLE.to_string(),
+            q.value_at(Pct::P50) as f64,
+        );
+        stats.ext_metrics.insert(
+            SCHBENCH_REQUEST_P90_US_WHOLE.to_string(),
+            q.value_at(Pct::P90) as f64,
+        );
+        stats.ext_metrics.insert(
+            SCHBENCH_REQUEST_P99_US_WHOLE.to_string(),
+            q.value_at(Pct::P99) as f64,
+        );
+        stats.ext_metrics.insert(
+            SCHBENCH_REQUEST_P999_US_WHOLE.to_string(),
+            q.value_at(Pct::P999) as f64,
+        );
+        stats
+            .ext_metrics
+            .insert(SCHBENCH_REQUEST_MIN_US_WHOLE.to_string(), q.min as f64);
+        stats
+            .ext_metrics
+            .insert(SCHBENCH_REQUEST_MAX_US_WHOLE.to_string(), q.max as f64);
+    }
+    // RPS stream: PLIST_FOR_RPS = 20/50/90 + min/max (the schbench rps table).
+    if rps.sample_count() > 0 {
+        let r = rps.percentiles();
+        stats.ext_metrics.insert(
+            SCHBENCH_RPS_P20_WHOLE.to_string(),
+            r.value_at(Pct::P20) as f64,
+        );
+        stats.ext_metrics.insert(
+            SCHBENCH_RPS_P50_WHOLE.to_string(),
+            r.value_at(Pct::P50) as f64,
+        );
+        stats.ext_metrics.insert(
+            SCHBENCH_RPS_P90_WHOLE.to_string(),
+            r.value_at(Pct::P90) as f64,
+        );
+        stats
+            .ext_metrics
+            .insert(SCHBENCH_RPS_MIN_WHOLE.to_string(), r.min as f64);
+        stats
+            .ext_metrics
+            .insert(SCHBENCH_RPS_MAX_WHOLE.to_string(), r.max as f64);
+    }
+}
+
 /// Populate run-level DERIVED distributional metrics into
-/// `stats.ext_metrics`: every registered `MetricKind::Distribution`
-/// and `MetricKind::WorstLowest`. This is the SOLE
+/// `stats.ext_metrics`: every registered `MetricKind::Distribution`,
+/// `MetricKind::WorstLowest`, `MetricKind::WakeLatencyTailRatio`, and
+/// `MetricKind::WorstCrossNodeRatio`. This is the SOLE
 /// within-run producer of those metrics' values — they carry no per-phase
 /// sample slice and no cross-cgroup merge fold, and their registry accessors
 /// are `|_| None`, so `MetricDef::read` reads the value
@@ -628,6 +1264,10 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
     // samples are per-worker and never reservoir-capped (no `*_sample_total`), so
     // their length IS their population — pooled unweighted.
     let mut wake_pool: Vec<(u64, f64)> = Vec::new();
+    // Distinct timer-latency pool, population-WEIGHTED like
+    // wake_pool (reservoir-capped, so a >cap phase carries weight
+    // timer_sample_total/len for the cross-phase de-skew).
+    let mut timer_pool: Vec<(u64, f64)> = Vec::new();
     let mut run_delay_pool: Vec<u64> = Vec::new();
     // Names of cgroups that contributed NON-EMPTY samples to each pool. A
     // cgroup absent here — a backdrop epoch that fell on BASELINE / the
@@ -662,6 +1302,7 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
     // stats.cgroups entry still contributes via exactly one of {pool,
     // reduction-fold} — no double count.
     let mut wake_carriers: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut timer_carriers: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     let mut run_delay_carriers: std::collections::BTreeSet<&str> =
         std::collections::BTreeSet::new();
     for phase in &stats.phases {
@@ -694,6 +1335,21 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
                 wake_pool.extend(pcg.wake_latencies_ns.iter().map(|&v| (v, w)));
                 wake_carriers.insert(cgname.as_str());
             }
+            if !pcg.timer_latencies_ns.is_empty() {
+                // Population-weighted exactly like the wake pool: a >cap phase's
+                // capped samples each stand for timer_sample_total/len true
+                // wakes, restoring the cross-phase population proportion.
+                let len = pcg.timer_latencies_ns.len() as u64;
+                debug_assert!(
+                    pcg.timer_sample_total >= len,
+                    "timer_sample_total ({}) < reservoir len ({}): malformed carrier",
+                    pcg.timer_sample_total,
+                    len,
+                );
+                let w = pcg.timer_sample_total.max(len) as f64 / len as f64;
+                timer_pool.extend(pcg.timer_latencies_ns.iter().map(|&v| (v, w)));
+                timer_carriers.insert(cgname.as_str());
+            }
             if !pcg.run_delays_ns.is_empty() {
                 run_delay_pool.extend_from_slice(&pcg.run_delays_ns);
                 run_delay_carriers.insert(cgname.as_str());
@@ -701,6 +1357,7 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
         }
     }
     wake_pool.sort_unstable_by_key(|&(v, _)| v);
+    timer_pool.sort_unstable_by_key(|&(v, _)| v);
     run_delay_pool.sort_unstable();
     populate_run_distribution_metrics_from(
         &mut stats.ext_metrics,
@@ -715,11 +1372,38 @@ pub fn populate_run_distribution_metrics(stats: &mut ScenarioStats) {
         }),
         &wake_pool,
         &wake_carriers,
+        &timer_pool,
+        &timer_carriers,
         &run_delay_pool,
         &run_delay_carriers,
         &stats.cgroups,
         stats.total_iterations,
     );
+    // worst_page_locality (WorstLowest{NumaLocal,NumaTotal}) re-pools from the
+    // per-phase NUMA carriers, which the _from helper above cannot reach (it
+    // takes only stats.cgroups, and the reports-only CgroupStats hardcodes
+    // page_locality 0.0). Single-sourced with run_metric's WorstPageLocality via
+    // worst_page_locality(): the lowest per-cgroup page_locality over cgroups
+    // that measured NUMA residency (a measured 0.0 — all off-node — winning); an
+    // all-unmeasured cohort writes no key (absence preserved as a missing ext
+    // entry, never a 0.0 sentinel). numa_agg_per_cgroup()'s borrow ends before
+    // the insert.
+    if let Some(v) = stats.worst_page_locality() {
+        stats
+            .ext_metrics
+            .insert("worst_page_locality".to_string(), v);
+    }
+    // worst_cross_node_migration_ratio (WorstCrossNodeRatio) re-pools from the same
+    // per-phase NUMA carriers — the MAX per-cgroup churn ratio over the latest
+    // residency total — single-sourced with run_metric's WorstCrossNodeMigrationRatio
+    // via worst_cross_node_migration_ratio(); an all-unmeasured cohort writes no key
+    // (absence preserved). Not handled by the _from helper above (it has only
+    // stats.cgroups, and the metric is excluded from that filter).
+    if let Some(v) = stats.worst_cross_node_migration_ratio() {
+        stats
+            .ext_metrics
+            .insert("worst_cross_node_migration_ratio".to_string(), v);
+    }
 }
 
 /// Inner of [`populate_run_distribution_metrics`] taking the metric specs
@@ -736,12 +1420,14 @@ pub(crate) fn populate_run_distribution_metrics_from<'a>(
     metrics: impl Iterator<Item = (&'a str, crate::stats::MetricKind)>,
     wake_pool: &[(u64, f64)],
     wake_carriers: &std::collections::BTreeSet<&str>,
+    timer_pool: &[(u64, f64)],
+    timer_carriers: &std::collections::BTreeSet<&str>,
     run_delay_pool: &[u64],
     run_delay_carriers: &std::collections::BTreeSet<&str>,
     cgroups: &[CgroupStats],
     run_total_iterations: u64,
 ) {
-    use crate::stats::{MetricKind, SampleSource, WorstLowestDenominator};
+    use crate::stats::{MetricKind, SampleSource, WorstLowestDenominator, WorstLowestNumerator};
     for (name, kind) in metrics {
         let value: Option<f64> = match kind {
             MetricKind::Distribution { source, reduction } => {
@@ -763,28 +1449,33 @@ pub(crate) fn populate_run_distribution_metrics_from<'a>(
                 // (per-worker, never reservoir-capped, so length IS population, via
                 // reduce_sorted_distribution).
                 //
-                // CONTRACT (differs from WorstLowest and WakeLatencyTailRatio
-                // below, by design): a cohort with cgroups present but NO carrier
-                // samples whose per-cgroup reductions are all 0.0 (e.g. phases
-                // empty / no wake samples anywhere) folds to Some(0.0) — a
-                // measured zero, matching the deleted 0.0-sentinel typed field
-                // this replaced. The absent-vs-0.0 boundary is NOT purely
-                // source-type-driven: WorstLowest yields ABSENCE (None) for its
-                // all-None cohort because iterations_per_worker() /
-                // iterations_per_cpu_sec() return Option; and WakeLatencyTailRatio
-                // ALSO yields None when no cgroup has a tail, even though
-                // wake_latency_tail_ratio() is a 0.0-sentinel f64 like the
-                // Distribution reductions here — because a 0.0 ratio means "no
-                // measurable tail" (median <= 0, i.e. NOT measured), not a
-                // measured-zero percentile. So: Distribution emits Some(0.0) for a
-                // no-sample run (a real measured zero of the percentile);
-                // WorstLowest and WakeLatencyTailRatio emit None (no measurement).
+                // CONTRACT (now uniform with WorstLowest and WakeLatencyTailRatio
+                // below): a cohort with NO measurement for this source anywhere
+                // (empty carrier pool AND every non-carrier cgroup not-measured)
+                // yields ABSENCE (None), not Some(0.0). A percentile / mean over
+                // zero samples is undefined, not a measured zero — folding its
+                // 0.0 sentinel into the cross-run mean would, for the LowerBetter
+                // wake/timer/run-delay metrics, falsely drag the mean toward
+                // "perfect". The non-carrier fold below is gated on
+                // `cg.measured_for(source)` so an unmeasured cgroup contributes
+                // nothing; a non-carrier cgroup that DID measure (a genuine
+                // measured zero, e.g. workers that queued for no time) still
+                // contributes its real value. This matches WorstLowest (None when
+                // every iterations_per_*() is None) and WakeLatencyTailRatio (None
+                // when no cgroup has a tail) — every distributional kind now emits
+                // None for a no-measurement run.
                 let (mut v, carriers): (Option<f64>, &std::collections::BTreeSet<&str>) =
                     match source {
                         SampleSource::WakeLatencyNs => (
                             (!wake_pool.is_empty())
                                 .then(|| reduce_weighted_sorted_distribution(wake_pool, reduction)),
                             wake_carriers,
+                        ),
+                        SampleSource::TimerLatencyNs => (
+                            (!timer_pool.is_empty()).then(|| {
+                                reduce_weighted_sorted_distribution(timer_pool, reduction)
+                            }),
+                            timer_carriers,
                         ),
                         SampleSource::RunDelayNs => (
                             (!run_delay_pool.is_empty())
@@ -793,15 +1484,20 @@ pub(crate) fn populate_run_distribution_metrics_from<'a>(
                         ),
                     };
                 for cg in cgroups {
-                    if !carriers.contains(cg.cgroup_name.as_str()) {
+                    if !carriers.contains(cg.cgroup_name.as_str()) && cg.measured_for(source) {
                         let r = distribution_cgroup_reduction(cg, source, reduction);
                         v = Some(v.map_or(r, |acc| acc.max(r)));
                     }
                 }
                 v
             }
-            // numerator is always Iterations (the only variant); the
-            // denominator picks the per-cgroup efficiency method.
+            // The iterations-efficiency WorstLowest selectors (numerator
+            // Iterations) re-pool from the `stats.cgroups` counters here; the
+            // denominator picks the per-cgroup efficiency method. The
+            // page-locality selector (numerator NumaLocal) re-pools instead from
+            // the per-phase NUMA carriers in populate_run_distribution_metrics
+            // (this fn has only stats.cgroups, not stats.phases), so it is
+            // skipped here (the NumaLocal arm below returns None).
             //
             // In a MULTI-STEP scenario `AssertResult::merge` extends
             // `stats.cgroups` per (handle, step), so the same cgroup name
@@ -810,12 +1506,19 @@ pub(crate) fn populate_run_distribution_metrics_from<'a>(
             // preserves the deleted `fold_lowest_some` granularity exactly and
             // mirrors `populate_run_pooled_iterations_per_cpu_sec`, which sums
             // over the same per-(handle, step) entries.
-            MetricKind::WorstLowest { denominator, .. } => {
+            MetricKind::WorstLowest {
+                numerator: WorstLowestNumerator::Iterations,
+                denominator,
+            } => {
                 let mut worst: Option<f64> = None;
                 for cg in cgroups {
                     let per_cg = match denominator {
                         WorstLowestDenominator::NumWorkers => cg.iterations_per_worker(),
                         WorstLowestDenominator::CpuTimeNs => cg.iterations_per_cpu_sec(),
+                        // NumaTotal pairs only with the NumaLocal numerator
+                        // (handled in the NumaLocal arm below) — never with
+                        // Iterations.
+                        WorstLowestDenominator::NumaTotal => None,
                     };
                     // Lowest-wins, None-aware (the semantic the deleted
                     // `fold_lowest_some` carried in `AssertResult::merge`): a
@@ -829,6 +1532,12 @@ pub(crate) fn populate_run_distribution_metrics_from<'a>(
                 }
                 worst
             }
+            // page-locality (numerator NumaLocal): re-pooled from the per-phase
+            // NUMA carriers in populate_run_distribution_metrics, not here.
+            MetricKind::WorstLowest {
+                numerator: WorstLowestNumerator::NumaLocal,
+                ..
+            } => None,
             // Worst-cgroup wake-latency tail amplification: the MAX over each
             // cgroup's own p99/median ratio (`CgroupStats::wake_latency_tail_ratio`).
             // Emit NO key below the min-iterations noise floor (low-N ratios are
@@ -895,6 +1604,7 @@ pub(crate) fn reduce_sorted_distribution(
     use crate::stats::SampleReduction;
     match reduction {
         SampleReduction::P99 => percentile(sorted, 0.99) as f64 / 1000.0,
+        SampleReduction::P999 => percentile(sorted, 0.999) as f64 / 1000.0,
         SampleReduction::Median => percentile(sorted, 0.5) as f64 / 1000.0,
         SampleReduction::Cv => {
             let n = sorted.len() as f64;
@@ -984,6 +1694,7 @@ pub(crate) fn reduce_weighted_sorted_distribution(
     use crate::stats::SampleReduction;
     match reduction {
         SampleReduction::P99 => weighted_percentile(sorted, 0.99) as f64 / 1000.0,
+        SampleReduction::P999 => weighted_percentile(sorted, 0.999) as f64 / 1000.0,
         SampleReduction::Median => weighted_percentile(sorted, 0.5) as f64 / 1000.0,
         SampleReduction::Cv => {
             let total_w: f64 = sorted.iter().map(|&(_, w)| w).sum();
@@ -1044,7 +1755,7 @@ fn distribution_cgroup_reduction(
             SampleReduction::P99 => cg.p99_wake_latency_us,
             SampleReduction::Median => cg.median_wake_latency_us,
             SampleReduction::Cv => cg.wake_latency_cv,
-            SampleReduction::Mean | SampleReduction::Worst => {
+            SampleReduction::P999 | SampleReduction::Mean | SampleReduction::Worst => {
                 debug_assert!(false, "no CgroupStats wake reduction for {reduction:?}");
                 f64::NAN
             }
@@ -1052,11 +1763,24 @@ fn distribution_cgroup_reduction(
         SampleSource::RunDelayNs => match reduction {
             SampleReduction::Mean => cg.mean_run_delay_us,
             SampleReduction::Worst => cg.worst_run_delay_us,
-            SampleReduction::P99 | SampleReduction::Median | SampleReduction::Cv => {
+            SampleReduction::P99
+            | SampleReduction::P999
+            | SampleReduction::Median
+            | SampleReduction::Cv => {
                 debug_assert!(
                     false,
                     "no CgroupStats run-delay reduction for {reduction:?}"
                 );
+                f64::NAN
+            }
+        },
+        SampleSource::TimerLatencyNs => match reduction {
+            SampleReduction::Median => cg.median_timer_latency_us,
+            SampleReduction::P99 => cg.p99_timer_latency_us,
+            SampleReduction::P999 => cg.p999_timer_latency_us,
+            SampleReduction::Worst => cg.worst_timer_latency_us,
+            SampleReduction::Cv | SampleReduction::Mean => {
+                debug_assert!(false, "no CgroupStats timer reduction for {reduction:?}");
                 f64::NAN
             }
         },
@@ -1076,8 +1800,8 @@ fn distribution_cgroup_reduction(
 /// time) wins on the read path, and this fn fills the gap for
 /// registered metrics that have a `read_sample` wire but no typed
 /// GauntletRow field. Without this fill, `cargo ktstr stats compare`
-/// silently skips the metric (read returns None on both sides;
-/// the EPSILON guard drops the row).
+/// silently skips the metric (read returns None on both sides, so the
+/// `(None, None)` arm drops the pair).
 ///
 /// Per-phase reduction dispatch is described on [`PhaseBucket`];
 /// the cross-RUN fold here uses `crate::stats::aggregate_samples_for_phase`
@@ -1108,9 +1832,391 @@ pub fn populate_run_ext_metrics(
             target.insert(metric_def.name.to_string(), reduced);
         }
     }
+    // Run-level capture-window wall for the IRQ rates: the elapsed span of the
+    // per_cpu_time-bearing freezes — the SAME freezes the IRQ-counter numerators
+    // above were read_sampled from (whole-run last-minus-first via
+    // phase_counter_delta). Inserting it HERE (the direct/whole-run path) makes
+    // the run-level rate's numerator AND denominator share the whole-run span.
+    // Without it, derive_rate_metrics below finds the numerator but no
+    // denominator (total_phase_wall_sec has no read_sample arm), and the rate
+    // would instead be derived by populate_run_ext_metrics_from_phases over a
+    // Σ-per-phase-capture denominator — a NARROWER time base than this whole-run
+    // numerator (it excludes the inter-phase / cross-capture gaps the numerator
+    // counts), inflating the rate on MULTI-phase runs. Run-level analog of the
+    // per-phase assert::phase_build. Gated on total_hardirqs
+    // (irqtime-independent), so the count-rates derive even when
+    // CONFIG_IRQ_TIME_ACCOUNTING is off and total_irq_time_ns is absent. Min/max
+    // over the elapsed-bearing freezes: chronological periodic samples put the
+    // numerator's first/last reading at min/max elapsed, so num and den span the
+    // identical interval.
+    if target.contains_key("total_hardirqs") {
+        let irq_elapsed_ms: Vec<u64> = samples
+            .iter_samples()
+            .filter(|s| !s.snapshot.per_cpu_time().is_empty())
+            .filter_map(|s| s.elapsed_ms)
+            .collect();
+        if let (Some(first), Some(last)) = (
+            irq_elapsed_ms.iter().min().copied(),
+            irq_elapsed_ms.iter().max().copied(),
+        ) && last > first
+        {
+            let wall_ms = (last - first) as f64;
+            target
+                .entry("total_phase_wall_ns".to_string())
+                .or_insert(wall_ms * 1_000_000.0);
+            target
+                .entry("total_phase_wall_sec".to_string())
+                .or_insert(wall_ms / 1000.0);
+        }
+    }
     // Re-derive Rate metrics from the read_sample components just folded
     // in. populate_run_ext_metrics is pub and called standalone (tests,
     // and not only ahead of populate_run_ext_metrics_from_phases), so it
     // derives its own rates to stay self-contained.
     crate::stats::derive_rate_metrics(target);
+}
+
+/// Derive the per-phase scalar metrics ([`crate::stats::MetricKind::PerPhase`])
+/// for every cgroup carrier in each phase. Two families:
+///
+/// 1. NON-schbench carrier scalars (via [`write_carrier_scalars`], for EVERY
+///    cgroup regardless of work type): the wake/run-delay/off-cpu distributions
+///    + the migration/iterations/locality ratios + the carrier counters,
+///    written ONLY into each carrier's `PhaseCgroupStats::metrics` (per-cgroup,
+///    read via `phase_cgroup_metric`) — NO pooled [`PhaseBucket::metrics`]
+///    entry; their run-level aggregate is the `worst_*` ext-metrics key.
+/// 2. schbench scalars (via [`write_schbench_scalars`], only for cgroups
+///    carrying a `SchbenchPhaseStats`): written per-cgroup into
+///    `PhaseCgroupStats::metrics` AND, pooled across the phase's schbench
+///    carriers, into [`PhaseBucket::metrics`] (read via `phase_metric`).
+///    Percentiles MUST come from the POOLED histogram (combine the latency
+///    histograms + integer-add the run-delay raw pairs), never an average of
+///    per-cgroup percentiles; the run-delay means are ABSENT when `pcount == 0`
+///    so a never-scheduled class is not a false `0`.
+///
+/// MUST run POST-merge: the buckets are final and keyed by `step_index`, so a
+/// per-phase A/B claim reads the value via `phase_metric` /
+/// `phase_cgroup_metric`. It runs after the per-cgroup carriers are folded
+/// ([`fold_guest_per_cgroup_into_host_buckets`]) and after any
+/// [`merge_matched_phase_buckets`] — both SKIP is_derived keys (the `continue`
+/// in the merge loop), so deriving earlier would DROP the keys. Idempotent
+/// (overwrites the keys), so callers that rebuild buckets per call (e.g.
+/// `VmResult::phase_buckets`) may re-run it freely.
+// doc_lazy_continuation: pre-existing numbered-list wording surfaced by the clippy
+// 1.94 bump; renders fine. Suppress rather than reflow the prose.
+#[allow(clippy::doc_lazy_continuation)]
+pub(crate) fn derive_phase_metrics(phases: &mut [PhaseBucket]) {
+    use crate::workload::schbench::run::SchbenchPhaseStats;
+
+    for bucket in phases.iter_mut() {
+        // Derive the schbench scalars BOTH per cgroup (into pc.metrics — the
+        // per-cgroup set: N cgroups -> N queryable sets) AND pooled across the
+        // phase's cgroups (into bucket.metrics — the aggregate). Both go through the
+        // SAME reducer (write_schbench_scalars) from the SAME carriers, so the
+        // pooled set is the cross-cgroup re-pool of the per-cgroup carriers (a
+        // percentile re-derives from the pooled histogram via PlatStats::combine =
+        // bucket-count add, never averaged), and pooled == cross-cgroup re-pool.
+        let mut pooled: Option<SchbenchPhaseStats> = None;
+        let mut pooled_taobench: Option<crate::workload::taobench::run::TaobenchPhaseStats> = None;
+        for pc in bucket.per_cgroup.values_mut() {
+            // Non-schbench carrier-derived metrics (wake/run-delay/off-cpu
+            // distributions + the migration/iterations/locality ratios + the
+            // carrier counters), emitted for EVERY cgroup regardless of work
+            // type. Runs BEFORE the schbench block: `write_carrier_scalars`
+            // takes `&mut pc` (its summaries read many `pc` fields, then it
+            // writes `pc.metrics`), so it cannot share the iteration with the
+            // disjoint-field borrow the schbench block relies on.
+            write_carrier_scalars(pc);
+            // Disjoint field borrows: `s` reads pc.schbench, the reducer writes
+            // pc.metrics — different fields, so the immutable + mutable borrows of
+            // `*pc` coexist.
+            if let Some(s) = pc.schbench.as_ref() {
+                write_schbench_scalars(s, &mut pc.metrics);
+                // `take()` completes the borrow before the reassignment in both arms.
+                match pooled.take() {
+                    Some(mut acc) => {
+                        acc.merge(s);
+                        pooled = Some(acc);
+                    }
+                    None => pooled = Some(s.clone()),
+                }
+            }
+            // taobench per-phase: same disjoint-field-borrow pattern (`t` reads
+            // pc.taobench, the reducer writes pc.metrics) + pool across cgroups.
+            if let Some(t) = pc.taobench.as_ref() {
+                write_taobench_scalars(t, &mut pc.metrics);
+                match pooled_taobench.take() {
+                    Some(mut acc) => {
+                        acc.merge(t);
+                        pooled_taobench = Some(acc);
+                    }
+                    None => pooled_taobench = Some(t.clone()),
+                }
+            }
+        }
+        if let Some(p) = pooled {
+            write_schbench_scalars(&p, &mut bucket.metrics);
+        }
+        if let Some(t) = pooled_taobench {
+            write_taobench_scalars(&t, &mut bucket.metrics);
+        }
+    }
+}
+
+/// Write the per-phase per-cgroup NON-schbench DERIVED scalars from ONE
+/// carrier into `pc.metrics`, keyed by registry [`crate::stats::MetricDef`]
+/// name — the per-cgroup analog of the run-level reductions, single-sourced
+/// through the shared ratio helpers in [`crate::assert::reductions`] (so the
+/// per-cgroup value and the run-level `worst_*` fold agree by construction)
+/// and the carrier summary methods. Each gate mirrors the carrier's ABSENT
+/// discipline: an empty wake pool, a not-measured off-CPU state, a
+/// zero-worker cgroup, or a no-NUMA-pages cgroup emits no key (reads as
+/// missing, never a false 0); `migration_ratio` is ALWAYS present (a measured
+/// 0.0 when no iterations ran).
+///
+/// Unlike the schbench families, these families have NO pooled
+/// `PhaseBucket::metrics` entry at all: as PerPhase / is_derived metrics whose
+/// `read_sample` is `None`, the per-phase fold never writes them to
+/// `bucket.metrics`. Their run-level aggregate is the `worst_*` key
+/// `populate_run_distribution_metrics` writes into the run-level
+/// `ScenarioStats::ext_metrics` map; per-phase they are queryable ONLY per-cgroup
+/// via `pc.metrics`. So this writes ONLY `pc.metrics`, never `bucket.metrics` —
+/// the per-cgroup carrier value is authoritative for the per-cgroup question.
+///
+/// Takes `&mut PhaseCgroupStats` (not `(&pc, &mut pc.metrics)`): it reads many
+/// `pc` fields AND writes `pc.metrics`, so the summaries/ratios are bound to
+/// locals from `&*pc` first, then the `&mut pc.metrics` borrow is taken once.
+fn write_carrier_scalars(pc: &mut PhaseCgroupStats) {
+    use crate::assert::reductions::{
+        cross_node_migration_ratio_of, iterations_per_cpu_sec_of, iterations_per_worker_of,
+        migration_ratio_of, page_locality_of,
+    };
+    // Read everything from &*pc into locals BEFORE the &mut pc.metrics borrow.
+    let wake = pc.wake_summary().zip(pc.wake_cv());
+    let timer = pc.timer_summary();
+    let run_delay = pc.run_delay_summary();
+    let off_cpu = pc.off_cpu_summary();
+    let migration_ratio = migration_ratio_of(pc.total_migrations, pc.total_iterations);
+    let ipw = iterations_per_worker_of(pc.num_workers, pc.total_iterations);
+    let ipcs = iterations_per_cpu_sec_of(pc.num_workers, pc.total_cpu_time_ns, pc.total_iterations);
+    let numa = if pc.numa_pages_total > 0 {
+        Some((
+            page_locality_of(pc.numa_pages_local, pc.numa_pages_total),
+            cross_node_migration_ratio_of(pc.cross_node_migrated, pc.numa_pages_total),
+        ))
+    } else {
+        None
+    };
+
+    let m = &mut pc.metrics;
+    // WAKE — all three or none (wake_summary + wake_cv share the empty-pool gate).
+    if let Some(((p99, median), cv)) = wake {
+        m.insert("p99_wake_latency_us".to_string(), p99);
+        m.insert("median_wake_latency_us".to_string(), median);
+        m.insert("wake_latency_cv".to_string(), cv);
+    }
+    // TIMER — all three or none (timer_summary shares the empty-pool gate).
+    if let Some((median, p99, p999)) = timer {
+        m.insert("median_timer_latency_us".to_string(), median);
+        m.insert("p99_timer_latency_us".to_string(), p99);
+        m.insert("p999_timer_latency_us".to_string(), p999);
+    }
+    // RUN-DELAY — both or none.
+    if let Some((mean, worst)) = run_delay {
+        m.insert("mean_run_delay_us".to_string(), mean);
+        m.insert("max_run_delay_us".to_string(), worst);
+    }
+    // OFF-CPU — four or none (None == not-measured).
+    if let Some((avg, min, max, spread)) = off_cpu {
+        m.insert("avg_off_cpu_pct".to_string(), avg);
+        m.insert("min_off_cpu_pct".to_string(), min);
+        m.insert("max_off_cpu_pct".to_string(), max);
+        m.insert("off_cpu_spread_pct".to_string(), spread);
+    }
+    // RATIOS — migration_ratio ALWAYS (measured 0.0 when no iterations ran).
+    m.insert("migration_ratio".to_string(), migration_ratio);
+    if let Some(v) = ipw {
+        m.insert("iterations_per_worker".to_string(), v);
+    }
+    if let Some(v) = ipcs {
+        m.insert("iterations_per_cpu_sec".to_string(), v);
+    }
+    // NUMA ratios only when pages were observed (mirrors the carrier's
+    // numa_pages_total>0 gate; absent is more honest than a 0.0 default).
+    if let Some((locality, cross_node)) = numa {
+        m.insert("page_locality".to_string(), locality);
+        m.insert("cross_node_migration_ratio".to_string(), cross_node);
+    }
+}
+
+/// Write the per-phase schbench scalar metrics derived from ONE
+/// `SchbenchPhaseStats` (a single cgroup's carrier, or the cross-cgroup pool)
+/// into `out`, keyed by registry [`crate::stats::MetricDef`] name. The sole
+/// producer of these keys for both the per-cgroup ([`PhaseCgroupStats::metrics`])
+/// and pooled ([`PhaseBucket::metrics`]) maps — one derivation, no duplicated
+/// percentile / min/max / rps / sched-delay math. Each gate mirrors the carrier's
+/// ABSENT discipline: an empty histogram or a zero pcount emits no key (reads as
+/// missing, never a false 0); loop_count is always present (0 = a real measured
+/// no-cycles outcome).
+fn write_schbench_scalars(
+    p: &crate::workload::schbench::run::SchbenchPhaseStats,
+    out: &mut std::collections::BTreeMap<String, f64>,
+) {
+    use crate::stats::{
+        SCHBENCH_LOOP_COUNT, SCHBENCH_REQUEST_MAX_US, SCHBENCH_REQUEST_MIN_US,
+        SCHBENCH_REQUEST_P50_US, SCHBENCH_REQUEST_P90_US, SCHBENCH_REQUEST_P99_US,
+        SCHBENCH_REQUEST_P999_US, SCHBENCH_RPS_MAX, SCHBENCH_RPS_MIN, SCHBENCH_RPS_P20,
+        SCHBENCH_RPS_P50, SCHBENCH_RPS_P90, SCHBENCH_SCHED_DELAY_MSG_US,
+        SCHBENCH_SCHED_DELAY_WORKER_US, SCHBENCH_WAKEUP_MAX_US, SCHBENCH_WAKEUP_MIN_US,
+        SCHBENCH_WAKEUP_P50_US, SCHBENCH_WAKEUP_P90_US, SCHBENCH_WAKEUP_P99_US,
+        SCHBENCH_WAKEUP_P999_US,
+    };
+    use crate::workload::schbench::plat::Pct;
+
+    if p.wakeup.sample_count() > 0 {
+        let q = p.wakeup.percentiles();
+        out.insert(
+            SCHBENCH_WAKEUP_P50_US.to_string(),
+            q.value_at(Pct::P50) as f64,
+        );
+        out.insert(
+            SCHBENCH_WAKEUP_P90_US.to_string(),
+            q.value_at(Pct::P90) as f64,
+        );
+        out.insert(
+            SCHBENCH_WAKEUP_P99_US.to_string(),
+            q.value_at(Pct::P99) as f64,
+        );
+        out.insert(
+            SCHBENCH_WAKEUP_P999_US.to_string(),
+            q.value_at(Pct::P999) as f64,
+        );
+        out.insert(SCHBENCH_WAKEUP_MIN_US.to_string(), q.min as f64);
+        out.insert(SCHBENCH_WAKEUP_MAX_US.to_string(), q.max as f64);
+    }
+    if p.request.sample_count() > 0 {
+        let q = p.request.percentiles();
+        out.insert(
+            SCHBENCH_REQUEST_P50_US.to_string(),
+            q.value_at(Pct::P50) as f64,
+        );
+        out.insert(
+            SCHBENCH_REQUEST_P90_US.to_string(),
+            q.value_at(Pct::P90) as f64,
+        );
+        out.insert(
+            SCHBENCH_REQUEST_P99_US.to_string(),
+            q.value_at(Pct::P99) as f64,
+        );
+        out.insert(
+            SCHBENCH_REQUEST_P999_US.to_string(),
+            q.value_at(Pct::P999) as f64,
+        );
+        out.insert(SCHBENCH_REQUEST_MIN_US.to_string(), q.min as f64);
+        out.insert(SCHBENCH_REQUEST_MAX_US.to_string(), q.max as f64);
+    }
+    // Per-phase achieved-RPS distribution (the control thread's per-second samples
+    // attributed to this epoch). Gated on sample_count()>0 so a phase shorter than
+    // the ~1s control cadence reads ABSENT, never rps=0. schbench's RPS table is
+    // PLIST_FOR_RPS = 20/50/90 (schbench.c:130) + min/max.
+    if p.rps.sample_count() > 0 {
+        let r = p.rps.percentiles();
+        out.insert(SCHBENCH_RPS_P20.to_string(), r.value_at(Pct::P20) as f64);
+        out.insert(SCHBENCH_RPS_P50.to_string(), r.value_at(Pct::P50) as f64);
+        out.insert(SCHBENCH_RPS_P90.to_string(), r.value_at(Pct::P90) as f64);
+        out.insert(SCHBENCH_RPS_MIN.to_string(), r.min as f64);
+        out.insert(SCHBENCH_RPS_MAX.to_string(), r.max as f64);
+    }
+    // Sample-weighted run-delay mean (Σrun_delay / Σpcount), ns→µs; ABSENT when
+    // pcount==0 (a never-scheduled class) so it reads as missing, not 0.
+    if p.msg_pcount > 0 {
+        let mean_us = p.msg_run_delay_ns as f64 / p.msg_pcount as f64 / 1000.0;
+        out.insert(SCHBENCH_SCHED_DELAY_MSG_US.to_string(), mean_us);
+    }
+    if p.worker_pcount > 0 {
+        let mean_us = p.worker_run_delay_ns as f64 / p.worker_pcount as f64 / 1000.0;
+        out.insert(SCHBENCH_SCHED_DELAY_WORKER_US.to_string(), mean_us);
+    }
+    // loop_count is always present for a schbench carrier: 0 = no cycles ran (a real
+    // measured value; HigherBetter → worst), distinct from a non-schbench carrier
+    // which has no schbench data at all (the caller skips it).
+    out.insert(SCHBENCH_LOOP_COUNT.to_string(), p.loop_count as f64);
+}
+
+/// Write the per-phase taobench scalar metrics derived from ONE
+/// `TaobenchStats` (a single cgroup's carrier, or the cross-cgroup pool)
+/// into `out`, keyed by registry [`crate::stats::MetricDef`] name. The sole
+/// producer of these keys for both the per-cgroup ([`PhaseCgroupStats::metrics`])
+/// and pooled ([`PhaseBucket::metrics`]) maps. ABSENT discipline: the qps keys
+/// only when the wall window was measured (`elapsed_ns > 0`); hit_ratio only when
+/// ops completed (`total > 0`); hit_rate only when lookups were issued
+/// (`get_cmds > 0`) — a not-measured value reads as missing, never a false 0.
+fn write_taobench_scalars(
+    p: &crate::workload::taobench::run::TaobenchPhaseStats,
+    out: &mut std::collections::BTreeMap<String, f64>,
+) {
+    use crate::stats::{
+        TAOBENCH_FAST_QPS, TAOBENCH_HIT_RATE, TAOBENCH_HIT_RATIO, TAOBENCH_SLOW_QPS,
+        TAOBENCH_TOTAL_QPS,
+    };
+    let c = &p.counters;
+    let total = c.total_ops();
+    if c.elapsed_ns > 0 {
+        let secs = c.elapsed_ns as f64 / 1e9;
+        out.insert(TAOBENCH_TOTAL_QPS.to_string(), total as f64 / secs);
+        out.insert(TAOBENCH_FAST_QPS.to_string(), c.fast_ops as f64 / secs);
+        out.insert(TAOBENCH_SLOW_QPS.to_string(), c.slow_ops as f64 / secs);
+    }
+    if total > 0 {
+        out.insert(
+            TAOBENCH_HIT_RATIO.to_string(),
+            c.fast_ops as f64 / total as f64,
+        );
+    }
+    if c.get_cmds > 0 {
+        out.insert(
+            TAOBENCH_HIT_RATE.to_string(),
+            1.0 - (c.get_misses as f64 / c.get_cmds as f64),
+        );
+    }
+    // Per-phase serve-latency percentiles (open-loop only): the µs distribution
+    // pooled across this phase's cgroups, re-derived over the union histogram.
+    // Absent when no serve samples (closed loop, or a stream with no completions).
+    write_taobench_serve_scalars(&p.serve_lat, out);
+}
+
+/// Write the per-phase taobench serve-latency percentile scalars from a pooled
+/// `PlatStats` into `out` (registry keys), gated on `sample_count() > 0` so a
+/// closed-loop / no-sample carrier emits nothing (absent, never a false 0).
+fn write_taobench_serve_scalars(
+    serve: &crate::workload::schbench::plat::PlatStats,
+    out: &mut std::collections::BTreeMap<String, f64>,
+) {
+    use crate::stats::{
+        TAOBENCH_SERVE_MAX_US, TAOBENCH_SERVE_MIN_US, TAOBENCH_SERVE_P50_US, TAOBENCH_SERVE_P90_US,
+        TAOBENCH_SERVE_P99_US, TAOBENCH_SERVE_P999_US,
+    };
+    use crate::workload::schbench::plat::Pct;
+    if serve.sample_count() == 0 {
+        return;
+    }
+    let q = serve.percentiles();
+    out.insert(
+        TAOBENCH_SERVE_P50_US.to_string(),
+        q.value_at(Pct::P50) as f64,
+    );
+    out.insert(
+        TAOBENCH_SERVE_P90_US.to_string(),
+        q.value_at(Pct::P90) as f64,
+    );
+    out.insert(
+        TAOBENCH_SERVE_P99_US.to_string(),
+        q.value_at(Pct::P99) as f64,
+    );
+    out.insert(
+        TAOBENCH_SERVE_P999_US.to_string(),
+        q.value_at(Pct::P999) as f64,
+    );
+    out.insert(TAOBENCH_SERVE_MIN_US.to_string(), q.min as f64);
+    out.insert(TAOBENCH_SERVE_MAX_US.to_string(), q.max as f64);
 }

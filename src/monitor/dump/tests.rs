@@ -120,9 +120,11 @@ fn event_counter_sample_sums_across_cpus() {
         ..Default::default()
     };
     let sample = MonitorSample {
+        bpf_map_fields: Vec::new(),
         elapsed_ms: 100,
         cpus: vec![cpu_a, cpu_b],
         prog_stats: None,
+        psi_irq: None,
     };
     let folded = EventCounterSample::from_monitor_sample(&sample)
         .expect("at least one CPU has event_counters");
@@ -143,9 +145,11 @@ fn event_counter_sample_returns_none_when_no_cpu_has_counters() {
         ..Default::default()
     };
     let sample = MonitorSample {
+        bpf_map_fields: Vec::new(),
         elapsed_ms: 200,
         cpus: vec![cpu],
         prog_stats: None,
+        psi_irq: None,
     };
     assert!(EventCounterSample::from_monitor_sample(&sample).is_none());
 }
@@ -203,6 +207,7 @@ fn report_serde_roundtrip() {
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
+        cgroup_psi: Vec::new(),
         per_node_numa: Vec::new(),
         per_node_numa_unavailable: None,
         task_enrichments: Vec::new(),
@@ -361,6 +366,7 @@ fn failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: Some(super::REASON_PROG_ACCESSOR_UNAVAILABLE.into()),
         per_cpu_time: vec![PerCpuTimeStats::default(); 4],
+        cgroup_psi: Vec::new(),
         per_node_numa: vec![PerNodeNumaStats::default(); 2],
         per_node_numa_unavailable: Some(super::REASON_NO_NUMA_WALKER.into()),
         task_enrichments: Vec::new(),
@@ -469,6 +475,7 @@ fn dual_failure_dump_report_serialization_is_infallible_for_max_synthetic_input(
             prog_runtime_stats: Vec::new(),
             prog_runtime_stats_unavailable: Some(super::REASON_PROG_ACCESSOR_UNAVAILABLE.into()),
             per_cpu_time: vec![PerCpuTimeStats::default(); 2],
+            cgroup_psi: Vec::new(),
             per_node_numa: vec![PerNodeNumaStats::default(); 1],
             per_node_numa_unavailable: Some(super::REASON_NO_NUMA_WALKER.into()),
             task_enrichments: Vec::new(),
@@ -676,6 +683,7 @@ fn report_display_one_map_with_value() {
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
+        cgroup_psi: Vec::new(),
         per_node_numa: Vec::new(),
         per_node_numa_unavailable: None,
         task_enrichments: Vec::new(),
@@ -718,6 +726,7 @@ fn report_display_multiple_maps_separated() {
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
+        cgroup_psi: Vec::new(),
         per_node_numa: Vec::new(),
         per_node_numa_unavailable: None,
         task_enrichments: Vec::new(),
@@ -975,6 +984,7 @@ fn report_display_includes_vcpu_regs_section() {
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
+        cgroup_psi: Vec::new(),
         per_node_numa: Vec::new(),
         per_node_numa_unavailable: None,
         task_enrichments: Vec::new(),
@@ -1022,6 +1032,7 @@ fn report_display_pairs_maps_and_vcpu_regs_with_blank_line() {
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
+        cgroup_psi: Vec::new(),
         per_node_numa: Vec::new(),
         per_node_numa_unavailable: None,
         task_enrichments: Vec::new(),
@@ -1058,6 +1069,7 @@ fn report_display_empty_with_only_vcpu_regs_does_not_say_empty_dump() {
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
+        cgroup_psi: Vec::new(),
         per_node_numa: Vec::new(),
         per_node_numa_unavailable: None,
         task_enrichments: Vec::new(),
@@ -1109,6 +1121,7 @@ fn report_display_partial_with_populated_regs_and_empty_maps() {
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
+        cgroup_psi: Vec::new(),
         per_node_numa: Vec::new(),
         per_node_numa_unavailable: None,
         task_enrichments: Vec::new(),
@@ -1176,6 +1189,7 @@ fn dual_report_serde_roundtrip_with_early() {
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
+        cgroup_psi: Vec::new(),
         per_node_numa: Vec::new(),
         per_node_numa_unavailable: None,
         task_enrichments: Vec::new(),
@@ -1203,6 +1217,7 @@ fn dual_report_serde_roundtrip_with_early() {
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
+        cgroup_psi: Vec::new(),
         per_node_numa: Vec::new(),
         per_node_numa_unavailable: None,
         task_enrichments: Vec::new(),
@@ -1729,6 +1744,7 @@ fn prog_runtime_stats_serde_roundtrip_with_saturation() {
         ],
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
+        cgroup_psi: Vec::new(),
         per_node_numa: Vec::new(),
         per_node_numa_unavailable: None,
         task_enrichments: Vec::new(),
@@ -1804,6 +1820,7 @@ fn report_display_renders_prog_runtime_stats() {
         ],
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
+        cgroup_psi: Vec::new(),
         per_node_numa: Vec::new(),
         per_node_numa_unavailable: None,
         task_enrichments: Vec::new(),
@@ -1858,6 +1875,7 @@ fn report_display_only_prog_runtime_stats_does_not_say_empty_dump() {
         }],
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
+        cgroup_psi: Vec::new(),
         per_node_numa: Vec::new(),
         per_node_numa_unavailable: None,
         task_enrichments: Vec::new(),
@@ -9248,6 +9266,7 @@ fn event_counter_sample_saturates_at_i64_max_across_cpus() {
         ..Default::default()
     };
     let sample = MonitorSample {
+        bpf_map_fields: Vec::new(),
         elapsed_ms: 7,
         cpus: vec![
             CpuSnapshot {
@@ -9260,6 +9279,7 @@ fn event_counter_sample_saturates_at_i64_max_across_cpus() {
             },
         ],
         prog_stats: None,
+        psi_irq: None,
     };
     let folded = EventCounterSample::from_monitor_sample(&sample)
         .expect("at least one CPU has event_counters");

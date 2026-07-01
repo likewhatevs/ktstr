@@ -880,6 +880,55 @@ fn populate_run_ext_metrics_from_phases_folds_per_phase_keys() {
     );
 }
 
+/// PerPhaseDeltaSum (`system_time_ns` / `user_time_ns`) folds cross-PHASE by
+/// SUM, NOT the weighted mean a Gauge(Avg) uses: the phases partition the run
+/// timeline, so the run-level total is the sum of the disjoint per-phase
+/// CPU-time deltas. Distinct sample_counts (5, 15) make the three candidate
+/// folds numerically distinct — SUM = 8000, weighted-mean =
+/// (3000*5+5000*15)/20 = 4500, unweighted-mean = 4000 — so this pins SUM
+/// specifically (a regression to the old Gauge(Avg) weighted mean would read
+/// 4500, and routing through aggregate_finite's cross-RUN arm would read 4000).
+#[test]
+fn populate_run_ext_metrics_from_phases_sums_per_phase_delta_kind() {
+    use crate::assert::PhaseBucket;
+    use std::collections::BTreeMap;
+    let mut m0 = BTreeMap::new();
+    m0.insert("system_time_ns".to_string(), 3000.0);
+    let mut m1 = BTreeMap::new();
+    m1.insert("system_time_ns".to_string(), 5000.0);
+    let phases = vec![
+        PhaseBucket {
+            per_cgroup: Default::default(),
+            step_index: 1,
+            label: "Step[0]".to_string(),
+            start_ms: 0,
+            end_ms: 100,
+            sample_count: 5,
+            metrics: m0,
+        },
+        PhaseBucket {
+            per_cgroup: Default::default(),
+            step_index: 2,
+            label: "Step[1]".to_string(),
+            start_ms: 100,
+            end_ms: 200,
+            sample_count: 15,
+            metrics: m1,
+        },
+    ];
+    let mut target = BTreeMap::new();
+    crate::assert::populate_run_ext_metrics_from_phases(&phases, &mut target);
+    let sys = target
+        .get("system_time_ns")
+        .copied()
+        .expect("system_time_ns folded from per-phase");
+    assert!(
+        (sys - 8000.0).abs() < f64::EPSILON,
+        "PerPhaseDeltaSum must SUM disjoint per-phase deltas (3000+5000=8000), \
+         not weighted-mean (4500) or unweighted-mean (4000); got {sys}",
+    );
+}
+
 /// Run-level guard: populate_run_ext_metrics_from_phases must SKIP keys with
 /// a typed GauntletRow field (TYPED_FIELD_NAMES) so the phase fold never
 /// re-injects them into ext_metrics. The monitor fold writes max_imbalance_ratio +
@@ -920,6 +969,44 @@ fn populate_run_ext_metrics_from_phases_skips_typed_backed_keys() {
     assert!(
         !target.contains_key("stuck_count"),
         "stuck_count is typed-backed; must NOT leak into ext_metrics (the ext per-phase fold sum is <= the typed whole-run count, never a guaranteed duplicate)",
+    );
+}
+
+/// Run-level double-source guard: populate_run_ext_metrics_from_phases
+/// must SKIP avg_nr_running. Its authoritative run-level value is
+/// MonitorSummary::avg_nr_running (fold_run_level_ext); fold_monitor_into_bucket
+/// also writes it per-phase for rendering, so without the skip the per-phase
+/// re-pool would claim the run-level key — and in VmResult::run_metric the
+/// re-pool runs BEFORE fold_run_level_ext, whose `or_insert` would then no-op,
+/// silently replacing the whole-run value with the per-phase mean. The ext-only
+/// avg_imbalance_ratio must still fold (control).
+#[test]
+fn populate_run_ext_metrics_from_phases_skips_avg_nr_running() {
+    use crate::assert::PhaseBucket;
+    use std::collections::BTreeMap;
+    let mut m = BTreeMap::new();
+    m.insert("avg_imbalance_ratio".to_string(), 2.0); // ext-only -> folded
+    m.insert("avg_nr_running".to_string(), 5.0); // MonitorSummary-fold authority -> skipped
+    let phases = vec![PhaseBucket {
+        per_cgroup: Default::default(),
+        step_index: 1,
+        label: "Step[0]".to_string(),
+        start_ms: 0,
+        end_ms: 100,
+        sample_count: 5,
+        metrics: m,
+    }];
+    let mut target = BTreeMap::new();
+    crate::assert::populate_run_ext_metrics_from_phases(&phases, &mut target);
+    assert!(
+        target.contains_key("avg_imbalance_ratio"),
+        "avg_imbalance_ratio is ext-only and must be folded into ext_metrics",
+    );
+    assert!(
+        !target.contains_key("avg_nr_running"),
+        "avg_nr_running run-level value comes from fold_run_level_ext; the per-phase \
+         re-pool must NOT claim it (the fold's or_insert would no-op in \
+         VmResult::run_metric, replacing the whole-run value with the per-phase mean)",
     );
 }
 

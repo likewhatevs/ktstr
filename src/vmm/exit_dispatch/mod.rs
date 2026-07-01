@@ -13,7 +13,7 @@ use crate::sync::MutexExt;
 use crate::vmm::IoapicHandle;
 use crate::vmm::PiMutex;
 use crate::vmm::vcpu::{SCX_EXIT_ERROR_THRESHOLD, WatchpointArm, self_arm_watchpoint};
-use crate::vmm::{console, kvm, virtio_blk, virtio_console, virtio_net};
+use crate::vmm::{console, kvm, pci, virtio_blk, virtio_console, virtio_net};
 use kvm_ioctls::VcpuExit;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -881,6 +881,7 @@ pub(crate) fn vcpu_run_loop_unified(
     virtio_blk: Option<&Arc<PiMutex<virtio_blk::VirtioBlk>>>,
     virtio_net: Option<&Arc<PiMutex<virtio_net::VirtioNet>>>,
     ioapic: Option<&Arc<IoapicHandle>>,
+    pci_bus: Option<&Arc<PiMutex<pci::PciBus>>>,
     kill: &Arc<AtomicBool>,
     kill_evt: &Arc<EventFd>,
     freeze: &Arc<AtomicBool>,
@@ -1012,6 +1013,7 @@ pub(crate) fn vcpu_run_loop_unified(
                     virtio_blk.map(|a| a.as_ref()),
                     virtio_net.map(|a| a.as_ref()),
                     ioapic.map(|a| a.as_ref()),
+                    pci_bus.map(|a| a.as_ref()),
                     &mut exit,
                 ) {
                     Some(ExitAction::Continue) | None => {}
@@ -1281,12 +1283,13 @@ pub(crate) fn classify_exit(
     virtio_blk: Option<&PiMutex<virtio_blk::VirtioBlk>>,
     virtio_net: Option<&PiMutex<virtio_net::VirtioNet>>,
     ioapic: Option<&IoapicHandle>,
+    pci_bus: Option<&PiMutex<pci::PciBus>>,
     exit: &mut VcpuExit,
 ) -> Option<ExitAction> {
     match exit {
         #[cfg(target_arch = "x86_64")]
         VcpuExit::IoOut(port, data) => {
-            if dispatch_io_out(com1, com2, *port, data) {
+            if dispatch_io_out(com1, com2, pci_bus, *port, data) {
                 Some(ExitAction::Shutdown)
             } else {
                 Some(ExitAction::Continue)
@@ -1294,7 +1297,7 @@ pub(crate) fn classify_exit(
         }
         #[cfg(target_arch = "x86_64")]
         VcpuExit::IoIn(port, data) => {
-            dispatch_io_in(com1, com2, *port, data);
+            dispatch_io_in(com1, com2, pci_bus, *port, data);
             Some(ExitAction::Continue)
         }
         #[cfg(target_arch = "aarch64")]
@@ -1343,6 +1346,31 @@ pub(crate) fn classify_exit(
                     return Some(ExitAction::Continue);
                 }
             }
+            // PCI BAR windows (virtio-pci device register regions:
+            // common/notify/isr/device cfg). The guest drives a PCI
+            // function here after programming BAR0 + COMMAND.MEMORY; on
+            // x86 this is the NIC's transport (the MMIO net arm above is
+            // inert — the caller passes `virtio_net: None` when the NIC
+            // is on PCI). Hot path, so it precedes the cold ECAM range.
+            // The read takes a mutable bus lock because the virtio ISR
+            // region is read-to-clear.
+            if let Some(bus) = pci_bus {
+                let mut guard = bus.lock();
+                if guard.bar_mmio_contains(*addr) {
+                    guard.bar_mmio_read(*addr, data);
+                    return Some(ExitAction::Continue);
+                }
+            }
+            // PCI ECAM (extended config space, registers 0..4095). Cold: the
+            // guest reads config space during enumeration. Checked after the
+            // hot virtio ranges.
+            if let Some(bus) = pci_bus {
+                let guard = bus.lock();
+                if guard.ecam_contains(*addr) {
+                    guard.ecam_read(*addr, data);
+                    return Some(ExitAction::Continue);
+                }
+            }
             // Userspace IOAPIC (split-irqchip). Cold: the guest reads the
             // redirection table only during IRQ setup. Checked after the hot
             // virtio ranges so a virtio MMIO exit never reaches here.
@@ -1377,6 +1405,28 @@ pub(crate) fn classify_exit(
                 let base = kvm::VIRTIO_NET_MMIO_BASE;
                 if *addr >= base && *addr < base + virtio_net::VIRTIO_MMIO_SIZE {
                     vn.lock().mmio_write(*addr - base, data);
+                    return Some(ExitAction::Continue);
+                }
+            }
+            // PCI BAR windows (virtio-pci device register regions). The
+            // guest drives a PCI function here (notify/queue kicks land in
+            // the NOTIFY region); on x86 this is the NIC's transport (the
+            // MMIO net arm above is inert when the NIC is on PCI). Hot
+            // path, so it precedes the cold ECAM range.
+            if let Some(bus) = pci_bus {
+                let mut guard = bus.lock();
+                if guard.bar_mmio_contains(*addr) {
+                    guard.bar_mmio_write(*addr, data);
+                    return Some(ExitAction::Continue);
+                }
+            }
+            // PCI ECAM (extended config space). Cold: the guest writes config
+            // space during enumeration (BAR sizing, COMMAND). Checked after
+            // the hot virtio ranges.
+            if let Some(bus) = pci_bus {
+                let mut guard = bus.lock();
+                if guard.ecam_contains(*addr) {
+                    guard.ecam_write(*addr, data);
                     return Some(ExitAction::Continue);
                 }
             }
@@ -1425,18 +1475,110 @@ const I8042_CMD_PORT: u16 = 0x64;
 #[cfg(target_arch = "x86_64")]
 const I8042_CMD_RESET_CPU: u8 = 0xFE;
 
+/// PCI type-1 configuration I/O ports (x86): CONFIG_ADDRESS latch (0xCF8) and
+/// the CONFIG_DATA window (0xCFC..0xD00). The guest's `pci_direct_conf1`
+/// drives these for all base config (registers 0..255).
+#[cfg(target_arch = "x86_64")]
+const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
+#[cfg(target_arch = "x86_64")]
+const PCI_CONFIG_DATA: u16 = 0xCFC;
+
+/// The ACPI PM timer's current 24-bit value (3.579545 MHz, ~279 ns/tick),
+/// derived from the host monotonic clock so it advances. ktstr has no real
+/// PM hardware — the guest's clocksource is kvm-clock; this counter exists
+/// only so the FADT-advertised PM timer reads as a moving value (a stuck
+/// value trips the guest's clocksource watchdog).
+///
+/// vCPU-thread budget: this runs on the vCPU thread (a guest IN from the
+/// PM_TMR port), but `clock_gettime(CLOCK_MONOTONIC)` resolves via the vDSO
+/// (no syscall entry / kernel transition), so its worst-case latency is
+/// sub-microsecond — it cannot approach the freeze-rendezvous timeout and
+/// does not delay SIGRTMIN delivery.
+#[cfg(target_arch = "x86_64")]
+fn acpi_pm_timer_value() -> u32 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` writes only `ts` (a valid out-param) and reads
+    // no caller memory; CLOCK_MONOTONIC is always available on Linux.
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
+    let nanos = (ts.tv_sec as u64)
+        .wrapping_mul(1_000_000_000)
+        .wrapping_add(ts.tv_nsec as u64);
+    // 279 is a deliberate integer approximation of the 279.365 ns/tick period
+    // (3.579545 MHz) — the synthesized counter runs ~0.13% fast, accepted
+    // because it is liveness-only (the guest's clocksource watchdog wants a
+    // moving value; kvm-clock, not this, is the timekeeping source). The
+    // 24-bit mask matches the FADT leaving TMR_VAL_EXT clear (32-bit register,
+    // 24-bit counter). Because the value is recomputed from host-monotonic time
+    // on every read (not a stored counter), it ADVANCES across a freeze window
+    // — host time keeps running while vCPUs are paused — unlike kvm-clock, which
+    // is save/restored across freeze. Benign: acpi_pm is never the selected
+    // clocksource (rating-outranked by kvm-clock) and the only consumer is the
+    // watchdog, which wants forward motion, not freeze-consistency — and vCPUs
+    // are paused for the whole freeze window, so no watchdog comparison ever runs
+    // inside it to observe the host-monotonic advance.
+    ((nanos / 279) & 0x00FF_FFFF) as u32
+}
+
+/// True when `port` is one of the three ACPI PM register-block ports the FADT
+/// advertises: PM1a_EVT (0x600, len 4) and PM1a_CNT (0x604, len 2) are
+/// contiguous (0x600..0x606); PM_TMR (0x608, len 4) is disjoint
+/// (0x608..0x60C). The 0x606-0x607 gap between CNT and TMR is NOT advertised
+/// (PM1_CNT_LEN=2), so it is deliberately excluded — the guard claims exactly
+/// the advertised register footprint, leaving the gap free for any future I/O
+/// resource rather than shadowing it behind the PM stub.
+#[cfg(target_arch = "x86_64")]
+fn acpi_pm_port(port: u16) -> bool {
+    (kvm::ACPI_PM1_EVT_PORT..kvm::ACPI_PM1_CNT_PORT + 2).contains(&port)
+        || (kvm::ACPI_PM_TMR_PORT..kvm::ACPI_PM_TMR_PORT + 4).contains(&port)
+}
+
 /// Dispatch an I/O out to serial ports or system devices.
 /// Returns `true` if the caller should exit (system reset detected).
 #[cfg(target_arch = "x86_64")]
 fn dispatch_io_out(
     com1: &PiMutex<console::Serial>,
     com2: &PiMutex<console::Serial>,
+    pci_bus: Option<&PiMutex<pci::PciBus>>,
     port: u16,
     data: &[u8],
 ) -> bool {
     // I8042 reset: kernel writes 0xFE to port 0x64 during reboot.
     if port == I8042_CMD_PORT && data.first() == Some(&I8042_CMD_RESET_CPU) {
         return true;
+    }
+    // PCI type-1 CAM: CONFIG_ADDRESS (0xCF8, 4-byte latch) and CONFIG_DATA
+    // (0xCFC..0xD00 byte-addressable data window). CONFIG_ADDRESS is handled
+    // only as an aligned 4-byte access: the guest's pci_direct_conf1 always
+    // drives 0xCF8 with outl/inl (arch/x86/pci/direct.c). Any sub-dword write
+    // into 0xCF8..0xCFC (incl. the legacy outb(0x01, 0xCFB) poke in
+    // pci_check_type1, and a hypothetical len<4 write to 0xCF8 itself) is NOT
+    // latched — it falls through to the drop, which is harmless because
+    // pci_direct_conf1 never issues such an access. CONFIG_DATA, by contrast,
+    // accepts any sub-dword access within 0xCFC..0xD00 (the data window IS
+    // byte-addressable).
+    if let Some(bus) = pci_bus {
+        if port == PCI_CONFIG_ADDRESS && data.len() == 4 {
+            bus.lock()
+                .cam_set_address(u32::from_le_bytes([data[0], data[1], data[2], data[3]]));
+            return false;
+        }
+        if (PCI_CONFIG_DATA..PCI_CONFIG_DATA + 4).contains(&port) {
+            bus.lock()
+                .cam_data_write((port - PCI_CONFIG_DATA) as u8, data);
+            return false;
+        }
+    }
+    // ACPI PM register blocks (stub — no real power management). Every write
+    // is a no-op: PM1 status is write-1-to-clear of bits that never set; PM1
+    // enable arms fixed events ktstr never raises; PM1 control's SCI_EN is
+    // reported by the read stub regardless; the PM timer is read-only.
+    if acpi_pm_port(port) {
+        return false;
     }
     // Only lock the matching serial port based on port range.
     if (console::COM1_BASE..console::COM1_BASE + 8).contains(&port) {
@@ -1453,9 +1595,59 @@ fn dispatch_io_out(
 fn dispatch_io_in(
     com1: &PiMutex<console::Serial>,
     com2: &PiMutex<console::Serial>,
+    pci_bus: Option<&PiMutex<pci::PciBus>>,
     port: u16,
     data: &mut [u8],
 ) {
+    // PCI type-1 CAM reads: CONFIG_ADDRESS echoes the latched value (the
+    // guest's pci_check_type1 writes 0x80000000 and reads it back to confirm
+    // type-1 access is present); CONFIG_DATA reads the addressed register.
+    if let Some(bus) = pci_bus {
+        if port == PCI_CONFIG_ADDRESS && data.len() == 4 {
+            data.copy_from_slice(&bus.lock().cam_get_address().to_le_bytes());
+            return;
+        }
+        if (PCI_CONFIG_DATA..PCI_CONFIG_DATA + 4).contains(&port) {
+            bus.lock()
+                .cam_data_read((port - PCI_CONFIG_DATA) as u8, data);
+            return;
+        }
+    }
+    // ACPI PM register blocks (stateless stub — no real power management).
+    if acpi_pm_port(port) {
+        let val: u32 = if port == kvm::ACPI_PM1_CNT_PORT {
+            // PM1 control: report SCI_EN (bit0) set. ktstr leaves FADT
+            // SMI_CMD=0, so the guest's acpi_enable() returns AE_OK on its
+            // first acpi_hw_get_mode() check — acpi_hw_get_mode() reports
+            // ACPI_SYS_MODE_ACPI directly when smi_command==0
+            // (drivers/acpi/acpica/hwacpi.c) and acpi_hw_set_mode() is never
+            // called (evxfevnt.c). So this SCI_EN=1 read does NOT gate
+            // acpi_enable; it is belt-and-suspenders for any other ACPICA
+            // reader of PM1_CNT. A constant 1 needs no stored state (ktstr
+            // never disables ACPI — it reboots via the i8042). The EXACT-port
+            // match (==0x604) is deliberate, NOT a range: ACPICA reads PM1_CNT
+            // as a 16-bit register at the block base, so SCI_EN (bit0) lands in
+            // the low byte; the high byte (0x605) correctly reads 0 via the else
+            // arm. A range match would wrongly return SCI_EN=1 for a 0x605 read.
+            0x0001
+        } else if (kvm::ACPI_PM_TMR_PORT..kvm::ACPI_PM_TMR_PORT + 4).contains(&port) {
+            // PM timer: a moving 24-bit counter so the guest's clocksource
+            // watchdog doesn't flag it stuck (the guest's real clocksource is
+            // kvm-clock; this exists only so ACPI enumerates the timer).
+            acpi_pm_timer_value()
+        } else {
+            // PM1 status (PM1a_EVT_BLK @0x600, u16) and PM1 enable (@0x602, the
+            // upper half of the 4-byte PM1_EVT block) both fall here: no fixed
+            // event is ever pending or armed, so both registers read 0. A 2-byte
+            // guest access to either offset lands correctly within this arm
+            // (acpi_pm_port covers the whole 0x600..0x606 PM1 EVT+CNT range).
+            0
+        };
+        let bytes = val.to_le_bytes();
+        let n = data.len().min(4);
+        data[..n].copy_from_slice(&bytes[..n]);
+        return;
+    }
     match port {
         // I8042 status: return 0 (no data, buffer empty).
         I8042_CMD_PORT => {
@@ -1476,7 +1668,10 @@ fn dispatch_io_in(
         p if (console::COM2_BASE..console::COM2_BASE + 8).contains(&p) => {
             com2.lock().handle_in(port, data);
         }
-        _ => {}
+        // Unhandled port: return all-ones, the "no device responded" I/O
+        // convention. Leaving `data` untouched would surface the previous
+        // KVM_RUN buffer's stale bytes to the guest as a phantom read.
+        _ => data.fill(0xFF),
     }
 }
 

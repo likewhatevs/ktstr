@@ -60,6 +60,37 @@ pub fn custom_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, sched_mixed_steps(ctx))
 }
 
+/// Light workload for scheduler-DEATH tests: one cgroup of 4 `YieldHeavy`
+/// workers held for the scenario duration.
+///
+/// Deliberately light — few continuously-runnable tasks — so that when the
+/// sched_ext scheduler dies mid-run, the kernel's scheduler-disable
+/// (`scx_ops_disable`) bypass-drain has trivially few runnable tasks to
+/// migrate. Both death paths funnel through the same drain: an `scx_bpf_error`
+/// crash (host-injected via `bpf_map_write`, fires on any `ktstr_dispatch`
+/// call) AND a watchdog stall (`--stall-after`, which fires
+/// `SCX_EXIT_ERROR_STALL` on the scheduler's internal timer). A heavy runnable
+/// workload (e.g. [`custom_sched_mixed`]'s 12 SpinWait tasks) triggers the
+/// Linux 6.14 per-node global-DSQ bypass-drain livelock, which strands the
+/// whole guest until the host watchdog fires; that livelock is fixed upstream
+/// only in sched_ext/for-7.1 (per-CPU bypass DSQs + an interruptible aborting
+/// consume loop), so ktstr cannot patch it and instead keeps the death-test
+/// workload light. The death still fires, and the death -> scx exit ->
+/// auto-repro -> wprof-capture path is exercised identically, so no coverage
+/// is lost.
+pub fn custom_crash_light(ctx: &Ctx) -> Result<AssertResult> {
+    let ops = vec![
+        Op::add_cgroup("cg_0"),
+        Op::spawn_workers(
+            "cg_0",
+            WorkSpec::default()
+                .workers(4)
+                .work_type(WorkType::YieldHeavy),
+        ),
+    ];
+    execute_steps(ctx, vec![Step::new(ops, ctx.settled_hold(1.0))])
+}
+
 fn cgroup_pipe_io_steps(ctx: &Ctx) -> Vec<Step> {
     let mut ops = vec![Op::add_cgroup("cg_0"), Op::add_cgroup("cg_1")];
     for name in ["cg_0", "cg_1"] {
@@ -105,6 +136,7 @@ mod tests {
             wait_for_map_write: false,
             current_step: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
             entry_name: None,
+            variant_hash: 0,
         }
     }
 

@@ -120,11 +120,15 @@ test-doc:
 devdep-isolation:
     @just scripts::devdep-isolation
 
-# Run coverage. `extra-features` is passed to the cargo-ktstr build (so a
-# blob-embedding feature like `wprof` is provisioned — see `test`) AND
-# appended to the inner coverage feature list.
-coverage extra-features="":
-    cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr coverage -- --profile ci --lcov --output-path lcov.info --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} --exclude-from-report scx-ktstr
+# Run coverage against a kernel version. `kernel` is pinned like `test`
+# (`--kernel`), NOT auto-discovered: CI's coverage job must run the SAME kernel
+# as the test matrix, otherwise `just kernel-build` (no version) picks the latest
+# upstream kernel, which can diverge on config-gated layout (e.g. the psi enum
+# offsets) and scheduler behavior from the pinned test kernels. `extra-features`
+# is passed to the cargo-ktstr build (so a blob-embedding feature like `wprof` is
+# provisioned — see `test`) AND appended to the inner coverage feature list.
+coverage kernel extra-features="":
+    cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr coverage --kernel {{kernel}} -- --profile ci --lcov --output-path lcov.info --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} --exclude-from-report scx-ktstr
 
 # Show sccache statistics
 sccache-stats:

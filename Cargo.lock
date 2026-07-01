@@ -1420,6 +1420,7 @@ dependencies = [
  "gix-worktree-state 0.30.0",
  "gix-worktree-stream 0.32.0",
  "nonempty",
+ "prodash",
  "smallvec",
  "thiserror",
 ]
@@ -3701,7 +3702,7 @@ dependencies = [
 
 [[package]]
 name = "ktstr"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3709,6 +3710,7 @@ dependencies = [
  "base64",
  "blazesym",
  "btf-rs",
+ "cargo_metadata",
  "cc",
  "clap",
  "clap_complete",
@@ -3796,7 +3798,7 @@ dependencies = [
 
 [[package]]
 name = "ktstr-macros"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -615,6 +615,16 @@ fn custom_worker_receives_wired_ctx() {
             !ctx.sibling_pids().contains(&me),
             "ctx.sibling_pids() must exclude the worker's own pid {me}"
         );
+        // cgroup_dir() must be threaded through worker_main's hand-off —
+        // a regression passing None (or a wrong path) is caught here, not
+        // only by the synthetic accessor test. Equal because this runs in
+        // the spawned worker's own process-cgroup, the same
+        // /proc/self/cgroup worker_main read to compute the field.
+        assert_eq!(
+            ctx.cgroup_dir(),
+            crate::workload::worker::read_self_cgroup_dir().as_deref(),
+            "ctx.cgroup_dir() must equal the worker's resolved cgroup dir"
+        );
         while !stop_requested(ctx.stop()) {
             std::thread::sleep(Duration::from_millis(10));
         }

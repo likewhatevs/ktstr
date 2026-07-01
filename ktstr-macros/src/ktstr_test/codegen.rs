@@ -50,10 +50,11 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         workloads,
         staged_schedulers,
         bpf_map_write,
+        watch_bpf_maps,
         post_vm,
         post_vm_unconditional,
         disk,
-        network,
+        networks,
         not_starved,
         isolation,
         max_gap_ms,
@@ -94,10 +95,14 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         expect_auto_repro_set,
         performance_mode,
         performance_mode_set,
+        pci,
+        pci_set,
         no_perf_mode,
         no_perf_mode_set,
         expect_err,
         expect_err_set,
+        survives_storm,
+        survives_storm_set,
         allow_inconclusive,
         allow_inconclusive_set,
         host_only,
@@ -212,9 +217,21 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         None => quote! { ::core::option::Option::None },
     };
 
+    // `bpf_map_write = A` (one const) or `bpf_map_write = [A, B]` (several):
+    // each path is borrowed into a `&[&BpfMapWrite]` slice literal, so the
+    // one-element case reproduces the former single-const `&[&A]` output.
     let bpf_map_write_tokens = match &bpf_map_write {
-        Some(p) => quote! { &[&#p] },
-        None => quote! { &[] },
+        Some(paths) if !paths.is_empty() => quote! { &[ #(&#paths),* ] },
+        _ => quote! { &[] },
+    };
+
+    // `watch_bpf_maps = W` (one const) or `watch_bpf_maps = [W1, W2]`
+    // (several): each WatchBpfMap path is borrowed into a `&[&WatchBpfMap]`
+    // slice literal — the same single-or-array grammar as `bpf_map_write`,
+    // so the one-element case emits `&[&W]`.
+    let watch_bpf_maps_tokens = match &watch_bpf_maps {
+        Some(paths) if !paths.is_empty() => quote! { &[ #(&#paths),* ] },
+        _ => quote! { &[] },
     };
 
     // Emit `Option<&'static Payload>` for the primary payload. The
@@ -232,6 +249,15 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     let workload_refs: Vec<proc_macro2::TokenStream> =
         workloads_slice.iter().map(|p| quote! { &#p }).collect();
     let workloads_tokens = quote! { &[#(#workload_refs),*] };
+
+    // Emit `&'static [NetConfig]` for networks. Unlike workloads (a slice
+    // of `&Payload`), the entry field stores NetConfig BY VALUE (mirroring
+    // `sysctls: &[Sysctl]`); each user-supplied path is a `const NetConfig`
+    // embedded directly. Empty slice when the attribute is absent.
+    let networks_slice: &[syn::Path] = networks.as_deref().unwrap_or(&[]);
+    let network_vals: Vec<proc_macro2::TokenStream> =
+        networks_slice.iter().map(|p| quote! { #p }).collect();
+    let networks_tokens = quote! { &[#(#network_vals),*] };
 
     // Emit `&'static [&'static Scheduler]` for staged_schedulers.
     // Each user-supplied path is a `const Scheduler`; take `&` on
@@ -367,11 +393,17 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         quote! { bpf_map_write },
         quote! { #bpf_map_write_tokens },
     );
+    let watch_bpf_maps_field = entry_field(
+        watch_bpf_maps.is_some(),
+        quote! { watch_bpf_maps },
+        quote! { #watch_bpf_maps_tokens },
+    );
     let performance_mode_field = entry_field(
         performance_mode_set,
         quote! { performance_mode },
         quote! { #performance_mode },
     );
+    let pci_field = entry_field(pci_set, quote! { pci }, quote! { #pci });
     let no_perf_mode_field = entry_field(
         no_perf_mode_set,
         quote! { no_perf_mode },
@@ -391,6 +423,11 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         expect_err_set,
         quote! { expect_err },
         quote! { #expect_err },
+    );
+    let survives_storm_field = entry_field(
+        survives_storm_set,
+        quote! { survives_storm },
+        quote! { #survives_storm },
     );
     let allow_inconclusive_field = entry_field(
         allow_inconclusive_set,
@@ -445,7 +482,14 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     // at emission. The struct is `Clone` so spreading a const ref
     // into a `static` initializer works.
     let disk_field = some_wrapped_entry_field(&disk, quote! { disk });
-    let network_field = some_wrapped_entry_field(&network, quote! { network });
+    // `networks = [PATH, ...]` lands in `KtstrTestEntry::networks`
+    // (`&'static [NetConfig]`). Emit the slice only when the attribute is
+    // present; otherwise DEFAULT's empty slice stands.
+    let networks_field = entry_field(
+        networks.is_some(),
+        quote! { networks },
+        quote! { #networks_tokens },
+    );
 
     // `workload_root_cgroup = "/path"` lands in
     // `KtstrTestEntry::workload_root_cgroup` as
@@ -657,11 +701,14 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
             #extra_sched_args_field
             #watchdog_timeout_field
             #bpf_map_write_field
+            #watch_bpf_maps_field
             #performance_mode_field
+            #pci_field
             #no_perf_mode_field
             #duration_field
             #num_snapshots_field
             #expect_err_field
+            #survives_storm_field
             #allow_inconclusive_field
             #host_only_field
             #extra_include_files_field
@@ -670,7 +717,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
             #post_vm_unconditional_field
             #config_content_field
             #disk_field
-            #network_field
+            #networks_field
             #workload_root_cgroup_field
             ..::ktstr::test_support::KtstrTestEntry::DEFAULT
         };

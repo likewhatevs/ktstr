@@ -322,3 +322,118 @@ fn verdict_skip_records_skip_kind_with_reason() {
         skip_detail.message,
     );
 }
+
+/// `claim_better` orients "better" by the metric's registry polarity, and a
+/// metric with NO polarity (an unregistered / typo'd name) is Inconclusive — never
+/// a silent pass. Pins the wiring (polarity-via-`MetricId::def` + `better_outcome`)
+/// and the headline guardrail through `claim_better` itself; the doctest only covers
+/// the LowerBetter-pass path.
+#[test]
+fn claim_better_orients_by_polarity_and_quarantines_unregistered_metrics() {
+    use ktstr::prelude::BuiltinMetric;
+
+    // LowerBetter (latency): candidate WORSE than baseline -> Fail.
+    let mut v = Verdict::new();
+    v.claim_better(BuiltinMetric::WakeupP99LatencyUs, 60.0)
+        .than(50.0);
+    assert!(
+        v.into_result().is_fail(),
+        "LowerBetter: candidate 60 > baseline 50 is worse -> Fail",
+    );
+
+    // HigherBetter (loop_count): candidate better -> Pass.
+    let mut v = Verdict::new();
+    v.claim_better(BuiltinMetric::SchbenchLoopCount, 200.0)
+        .than(100.0);
+    assert!(
+        v.into_result().is_pass(),
+        "HigherBetter: candidate 200 > baseline 100 is better -> Pass",
+    );
+
+    // THE GUARDRAIL: an unregistered / typo'd metric name has no polarity ->
+    // Undirected -> Inconclusive, NOT a silent pass.
+    let mut v = Verdict::new();
+    v.claim_better("definitely_not_a_metric", 1.0).than(2.0);
+    let r = v.into_result();
+    assert!(
+        r.is_inconclusive(),
+        "an unregistered metric name has no 'better' direction -> Inconclusive, never a \
+         silent pass: {:?}",
+        r.outcomes,
+    );
+
+    // than_by (fractional margin): an exactly-10%-better LowerBetter candidate passes
+    // the 10% bar; a 5%-better one fails it.
+    let mut v = Verdict::new();
+    v.claim_better(BuiltinMetric::WakeupP99LatencyUs, 90.0)
+        .than_by(100.0, 0.10);
+    assert!(
+        v.into_result().is_pass(),
+        "90 is exactly 10% better than 100 -> passes .than_by(., 0.10)",
+    );
+    let mut v = Verdict::new();
+    v.claim_better(BuiltinMetric::WakeupP99LatencyUs, 95.0)
+        .than_by(100.0, 0.10);
+    assert!(
+        v.into_result().is_fail(),
+        "95 is only 5% better than 100 -> fails .than_by(., 0.10)",
+    );
+}
+
+/// `claim_present` fails LOUDLY on an absent (None) metric for ALL comparators
+/// (not just the at_least path the macro doctest covers), carries `.because` through
+/// the absent-Fail, and on Some is behavior-identical to `claim`. Pins the
+/// loud-on-absent guardrail + the modifier carry-through.
+#[test]
+fn claim_present_fails_loud_on_absent_across_comparators_and_carries_modifiers() {
+    use ktstr::claim_present;
+
+    // Absent (None) -> Fail on non-at_least comparators (the absent arm is uniform;
+    // pin a representative spread).
+    let mut v = Verdict::new();
+    let missing: Option<f64> = None;
+    claim_present!(v, missing).at_most(100.0);
+    assert!(
+        v.into_result().is_fail(),
+        "None.at_most -> loud Fail, not a vacuous pass",
+    );
+
+    let mut v = Verdict::new();
+    let missing: Option<f64> = None;
+    claim_present!(v, missing).between(1.0, 2.0);
+    assert!(v.into_result().is_fail(), "None.between -> loud Fail");
+
+    let mut v = Verdict::new();
+    let missing: Option<f64> = None;
+    claim_present!(v, missing).is_finite();
+    assert!(v.into_result().is_fail(), "None.is_finite -> loud Fail");
+
+    // Some(v) is behavior-identical to claim(): a passing bound passes, a failing
+    // bound fails.
+    let mut v = Verdict::new();
+    let present: Option<f64> = Some(1500.0);
+    claim_present!(v, present).at_least(1000.0);
+    assert!(
+        v.into_result().is_pass(),
+        "Some(1500).at_least(1000) -> Pass",
+    );
+
+    let mut v = Verdict::new();
+    let present: Option<f64> = Some(10.0);
+    claim_present!(v, present).at_least(1000.0);
+    assert!(v.into_result().is_fail(), "Some(10).at_least(1000) -> Fail");
+
+    // .because(reason) carries through the ABSENT arm into the failure message.
+    let mut v = Verdict::new();
+    let missing: Option<f64> = None;
+    claim_present!(v, missing)
+        .because("throughput probe")
+        .at_least(1.0);
+    let r = v.into_result();
+    assert!(r.is_fail(), "None.because(..).at_least -> Fail");
+    let msg = &r.failure_details().next().unwrap().message;
+    assert!(
+        msg.contains("metric absent") && msg.contains("(throughput probe)"),
+        "the absent-Fail message must name the absence AND carry the .because reason: {msg}",
+    );
+}

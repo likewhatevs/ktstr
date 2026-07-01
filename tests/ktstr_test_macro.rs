@@ -12,6 +12,30 @@ use ktstr::scenario::Ctx;
 /// fails at `cargo check` and the test that follows can't compile.
 const MACRO_TEST_DISK: DiskConfig = DiskConfig::DEFAULT.with_name("macro-test");
 
+/// Two const `BpfMapWrite`s so the `bpf_map_write = [A, B]` array-form
+/// macro arm below can reference them as paths. Pins the const-fn
+/// construction the `bpf_map_write` codegen borrows into a slice literal.
+const MACRO_TEST_WRITE_A: ktstr::test_support::BpfMapWrite =
+    ktstr::test_support::BpfMapWrite::new(".bss", "crash", 1);
+const MACRO_TEST_WRITE_B: ktstr::test_support::BpfMapWrite =
+    ktstr::test_support::BpfMapWrite::new(".bss", "stall", 2);
+
+/// Two const `WatchBpfMap`s so the `watch_bpf_maps = [A, B]` array-form
+/// macro arm below can reference them as paths. Pins the const-fn
+/// construction the `watch_bpf_maps` codegen borrows into a slice literal.
+const MACRO_TEST_WATCH_A: ktstr::test_support::WatchBpfMap = ktstr::test_support::WatchBpfMap::new(
+    ".bss",
+    "count_a",
+    ktstr::test_support::BpfMapAgg::ScalarCounter,
+    "a",
+);
+const MACRO_TEST_WATCH_B: ktstr::test_support::WatchBpfMap = ktstr::test_support::WatchBpfMap::new(
+    ".bss",
+    "count_b",
+    ktstr::test_support::BpfMapAgg::ScalarCounter,
+    "b",
+);
+
 /// Minimal ktstr_test that checks the macro compiles and the generated
 /// linkme registration + test wrapper resolve correctly from an
 /// integration test.
@@ -76,6 +100,38 @@ fn empty_workloads_compiles(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
+/// `bpf_map_write = [A, B]` (array form) must compile and expand to a
+/// two-element `&[&BpfMapWrite]`. Pins the multi-write attribute
+/// capability added alongside the single-const form (`bpf_map_write = A`,
+/// which every other bpf_map_write test still uses). `ignore` — the value
+/// is the COMPILE + codegen (the entry field), not a VM boot.
+#[ktstr_test(
+    llcs = 1,
+    cores = 1,
+    threads = 1,
+    bpf_map_write = [MACRO_TEST_WRITE_A, MACRO_TEST_WRITE_B],
+    ignore
+)]
+fn bpf_map_write_array_compiles(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
+/// `watch_bpf_maps = [A, B]` (array form) must compile and expand to a
+/// two-element `&[&WatchBpfMap]`. Pins the multi-watch attribute capability
+/// added alongside the single-const form (`watch_bpf_maps = W`, which
+/// scx_bpf_map_field_e2e uses). `ignore` — the value is the COMPILE + codegen
+/// (the entry field), not a VM boot.
+#[ktstr_test(
+    llcs = 1,
+    cores = 1,
+    threads = 1,
+    watch_bpf_maps = [MACRO_TEST_WATCH_A, MACRO_TEST_WATCH_B],
+    ignore
+)]
+fn watch_bpf_maps_array_compiles(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
 /// Pin the `#[ktstr_test(disk = PATH)]` macro arm — verifies the
 /// `disk = MACRO_TEST_DISK` syntax expands to a valid entry that
 /// links into the test registry. The test body just confirms the
@@ -126,6 +182,38 @@ fn entry_fields_match_attrs() {
     assert_eq!(entry.topology.cores_per_llc, 2);
     assert_eq!(entry.topology.threads_per_core, 1);
     assert_eq!(entry.memory_mib, 2048);
+}
+
+/// `bpf_map_write = [A, B]` expands to a two-element `&[&BpfMapWrite]`
+/// entry field — the multi-write attribute capability. VM-free: reads the
+/// registered entry and asserts the codegen borrowed both consts into the
+/// slice, in order (each resolved by field name, not a hardcoded offset).
+#[test]
+fn bpf_map_write_array_expands_to_two_elements() {
+    let entry = ktstr::test_support::find_test("bpf_map_write_array_compiles").unwrap();
+    assert_eq!(
+        entry.bpf_map_write.len(),
+        2,
+        "bpf_map_write = [A, B] must expand to a 2-element &[&BpfMapWrite]"
+    );
+    assert_eq!(entry.bpf_map_write[0].field(), "crash");
+    assert_eq!(entry.bpf_map_write[1].field(), "stall");
+}
+
+/// `watch_bpf_maps = [A, B]` expands to a two-element `&[&WatchBpfMap]` entry
+/// field — the multi-watch attribute capability (symmetry with bpf_map_write).
+/// VM-free: reads the registered entry and asserts the codegen borrowed both
+/// consts into the slice, in order.
+#[test]
+fn watch_bpf_maps_array_expands_to_two_elements() {
+    let entry = ktstr::test_support::find_test("watch_bpf_maps_array_compiles").unwrap();
+    assert_eq!(
+        entry.watch_bpf_maps.len(),
+        2,
+        "watch_bpf_maps = [A, B] must expand to a 2-element &[&WatchBpfMap]"
+    );
+    assert_eq!(entry.watch_bpf_maps[0].field(), "count_a");
+    assert_eq!(entry.watch_bpf_maps[1].field(), "count_b");
 }
 
 /// Check default attribute values.

@@ -68,7 +68,7 @@ fn classify_exit_aarch64_mmio_write_serial_is_continue() {
     let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
     let data = [b'Q'];
     let mut exit = VcpuExit::MmioWrite(kvm::SERIAL_MMIO_BASE, &data);
-    let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
+    let action = classify_exit(&com1, &com2, None, None, None, None, None, &mut exit);
     assert!(
         matches!(action, Some(ExitAction::Continue)),
         "aarch64 MmioWrite to serial must classify as Continue"
@@ -88,7 +88,7 @@ fn classify_exit_aarch64_mmio_read_unmapped_returns_0xff() {
     let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
     let mut buf = [0u8; 4];
     let mut exit = VcpuExit::MmioRead(0x10_0000, &mut buf);
-    let action = classify_exit(&com1, &com2, None, None, None, None, &mut exit);
+    let action = classify_exit(&com1, &com2, None, None, None, None, None, &mut exit);
     assert!(
         matches!(action, Some(ExitAction::Continue)),
         "Unmapped aarch64 MMIO read must classify as Continue"

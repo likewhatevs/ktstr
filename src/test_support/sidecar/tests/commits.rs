@@ -1,6 +1,6 @@
 use super::super::super::test_helpers::{EnvVarGuard, lock_env};
 use super::super::*;
-use super::find_single_sidecar_by_prefix;
+use super::{find_sidecars_by_prefix, find_single_sidecar_by_prefix};
 use crate::assert::AssertResult;
 use crate::scenario::Ctx;
 use anyhow::Result;
@@ -36,7 +36,7 @@ fn write_skip_sidecar_records_skip_mutex() {
         auto_repro: false,
         ..KtstrTestEntry::DEFAULT
     };
-    write_skip_sidecar(&entry).expect("skip sidecar must write");
+    write_skip_sidecar(&entry, &entry.topology).expect("skip sidecar must write");
 
     let path = find_single_sidecar_by_prefix(tmp.path(), "__skip_sidecar_test__-");
     let data = std::fs::read_to_string(&path).unwrap();
@@ -63,8 +63,18 @@ fn write_skip_sidecar_records_skip_mutex() {
         "skip sidecar must read exclusively as Skip — not Pass, Fail, or Inconclusive",
     );
     assert_eq!(
+        loaded.work_type,
+        crate::test_support::args::current_work_type(),
+        "the skip sidecar carries the SAME work_type a run of this config would \
+         (current_work_type), so a skip and a run of one config share a variant_hash \
+         and a retry overwrites the prior attempt instead of leaving two coexisting \
+         sidecars the footer would both flag — skips stay marked by skipped=true, not \
+         a work_type sentinel",
+    );
+    assert_ne!(
         loaded.work_type, "skipped",
-        "skip path uses the 'skipped' work_type bucket so grouping keeps the skip distinguishable",
+        "the 'skipped' work_type sentinel is retired; skips are identified by the \
+         skipped=true bool, and the work_type must match the run path's value",
     );
     // write_skip_sidecar shares the host-context capture with
     // write_sidecar (same `collect_host_context()` builder line)
@@ -91,6 +101,207 @@ fn write_skip_sidecar_records_skip_mutex() {
     assert!(
         host.kernel_release.is_some(),
         "write_skip_sidecar must capture kernel_release (syscall-sourced)",
+    );
+}
+
+/// Regression lock. The footer false-positive came from a flaky
+/// test that host-SKIPPED on one nextest attempt and RAN on the retry:
+/// the skip path hardcoded `work_type="skipped"` while the run used the
+/// real work_type, so the two sidecars got DIFFERENT variant_hashes,
+/// coexisted in the run dir, and `summarize_one_run_dir`'s any_fail OR
+/// flagged the test. Now both paths resolve work_type via
+/// `current_work_type`, so a skip and a run of ONE config share a
+/// variant_hash (and thus a filename) and the retry's run OVERWRITES the
+/// skip — one sidecar on disk, footer clean.
+///
+/// The lock is the second `find_single_sidecar_by_prefix`: if the hashes
+/// diverged again it would find TWO files and fail its `len == 1`
+/// assertion, naming both stale paths.
+#[test]
+fn skip_then_run_of_same_config_overwrites_one_sidecar() {
+    let _lock = lock_env();
+    let tmp = tempfile::Builder::new()
+        .prefix("ktstr-sidecar-skip-run-overwrite-test-")
+        .tempdir()
+        .expect("create tempdir");
+    let _env_sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, tmp.path());
+
+    fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+        Ok(AssertResult::pass())
+    }
+    let entry = KtstrTestEntry {
+        name: "__skip_run_overwrite__",
+        func: dummy,
+        auto_repro: false,
+        ..KtstrTestEntry::DEFAULT
+    };
+
+    // Attempt 1: pre-VM-boot host skip (e.g. ResourceContention).
+    write_skip_sidecar(&entry, &entry.topology).expect("skip sidecar must write");
+    let skip_path = find_single_sidecar_by_prefix(tmp.path(), "__skip_run_overwrite__-");
+    let skip: SidecarResult =
+        serde_json::from_str(&std::fs::read_to_string(&skip_path).unwrap()).unwrap();
+    assert!(skip.skipped, "attempt 1 is a skip");
+
+    // Attempt 2 (the retry): a real run of the SAME config. The run path
+    // forwards current_work_type() — the same value write_skip_sidecar
+    // resolved internally — so the variant_hash, and thus the filename,
+    // matches and this write overwrites attempt 1's file.
+    let vm_result = crate::vmm::VmResult::test_fixture();
+    let ok = AssertResult::pass();
+    write_sidecar(
+        &entry,
+        &vm_result,
+        &[],
+        &ok,
+        &crate::test_support::args::current_work_type(),
+        &[],
+        &entry.topology,
+    )
+    .unwrap();
+
+    // The retry OVERWROTE the skip: still exactly one sidecar for this
+    // test (find_single_sidecar_by_prefix asserts len == 1), at the same
+    // path, now reading as a run rather than a skip.
+    let run_path = find_single_sidecar_by_prefix(tmp.path(), "__skip_run_overwrite__-");
+    assert_eq!(
+        run_path, skip_path,
+        "the run's variant_hash must equal the skip's so the retry \
+         overwrites the SAME file — divergent hashes would coexist and the \
+         footer would flag the stale skip attempt",
+    );
+    let run: SidecarResult =
+        serde_json::from_str(&std::fs::read_to_string(&run_path).unwrap()).unwrap();
+    assert!(
+        !run.skipped && run.passed,
+        "the retry's run sidecar overwrote the skip — final on-disk state is the pass",
+    );
+    assert_eq!(
+        sidecar_variant_hash(&skip),
+        sidecar_variant_hash(&run),
+        "core invariant: a skip and a run of one config share a variant_hash",
+    );
+}
+
+/// Regression lock for the topology-gauntlet clobber. A gauntlet
+/// runs ONE entry under per-preset TopoOverrides, so the sidecar must
+/// record the RESOLVED (booted) topology, not the declared entry value
+/// — otherwise every preset shares one variant_hash and clobbers,
+/// leaving only the last preset's sidecar. Pins two invariants through
+/// the PRODUCTION writers:
+///   (a) two distinct resolved topologies for one entry produce two
+///       distinct variant_hashes, so both sidecars coexist (no clobber);
+///   (b) a preset's host-skip and its run record the SAME resolved
+///       topology, so they share a variant_hash and the run overwrites
+///       the skip (the skip-vs-run invariant, now for topology).
+#[test]
+fn resolved_topology_distinguishes_presets_and_unifies_skip_run() {
+    use crate::vmm::topology::Topology;
+    let _lock = lock_env();
+    let tmp = tempfile::Builder::new()
+        .prefix("ktstr-sidecar-resolved-topo-test-")
+        .tempdir()
+        .expect("create tempdir");
+    let _env_sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, tmp.path());
+
+    fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+        Ok(AssertResult::pass())
+    }
+    let vm_result = crate::vmm::VmResult::test_fixture();
+    let ok = AssertResult::pass();
+    // Two presets the gauntlet would boot from one entry. Distinct
+    // resolved topologies -> distinct Display strings -> distinct hashes.
+    let preset_a = Topology::new(1, 1, 1, 1);
+    let preset_b = Topology::new(2, 2, 2, 2);
+
+    // (a) Same entry, two resolved topologies -> two coexisting sidecars.
+    let entry = KtstrTestEntry {
+        name: "__resolved_topo_presets__",
+        func: dummy,
+        auto_repro: false,
+        ..KtstrTestEntry::DEFAULT
+    };
+    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[], &preset_a).unwrap();
+    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[], &preset_b).unwrap();
+    let files = find_sidecars_by_prefix(tmp.path(), "__resolved_topo_presets__-");
+    assert_eq!(
+        files.len(),
+        2,
+        "two distinct resolved topologies must yield two coexisting \
+         sidecars (no clobber) — recording the declared topology would \
+         collapse both presets to one file: {files:?}",
+    );
+
+    // (b) Same entry + same resolved topology, host-skip then run -> the
+    // run overwrites the skip (one sidecar, the final pass).
+    let entry2 = KtstrTestEntry {
+        name: "__resolved_topo_skiprun__",
+        func: dummy,
+        auto_repro: false,
+        ..KtstrTestEntry::DEFAULT
+    };
+    write_skip_sidecar(&entry2, &preset_a).unwrap();
+    write_sidecar(&entry2, &vm_result, &[], &ok, "SpinWait", &[], &preset_a).unwrap();
+    let after = find_single_sidecar_by_prefix(tmp.path(), "__resolved_topo_skiprun__-");
+    let sc: SidecarResult =
+        serde_json::from_str(&std::fs::read_to_string(&after).unwrap()).unwrap();
+    assert!(
+        !sc.skipped && sc.passed,
+        "the run overwrote the same-preset skip — final state is the pass",
+    );
+    assert_eq!(
+        sc.topology,
+        preset_a.to_string(),
+        "the sidecar records the RESOLVED topology, not the declared one",
+    );
+}
+
+/// The two variant-hash derivations MUST agree: `variant_hash_from_parts`
+/// (from entry + resolved topology + work_type — used for the dump
+/// filename and the Ctx/VmResult stamp BEFORE any sidecar exists) and
+/// `sidecar_variant_hash` (from a written `SidecarResult` — used for the
+/// sidecar filename). If they drifted, a gauntlet preset's dump and its
+/// sidecar would carry different variant keys and the footer could not
+/// correlate them. Both route through `variant_hash_of`; this pins the
+/// equality end-to-end through the real `write_sidecar`.
+#[test]
+fn variant_hash_from_parts_matches_sidecar_variant_hash() {
+    use crate::vmm::topology::Topology;
+    let _lock = lock_env();
+    let tmp = tempfile::Builder::new()
+        .prefix("ktstr-variant-hash-pin-")
+        .tempdir()
+        .expect("create tempdir");
+    let _env_sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, tmp.path());
+
+    fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+        Ok(AssertResult::pass())
+    }
+    let entry = KtstrTestEntry {
+        name: "__vh_pin__",
+        func: dummy,
+        auto_repro: false,
+        ..KtstrTestEntry::DEFAULT
+    };
+    let resolved = Topology::new(2, 2, 2, 2);
+    let work_type = "SpinWait";
+    let vm_result = crate::vmm::VmResult::test_fixture();
+    let ok = AssertResult::pass();
+    write_sidecar(&entry, &vm_result, &[], &ok, work_type, &[], &resolved).unwrap();
+
+    let path = find_single_sidecar_by_prefix(tmp.path(), "__vh_pin__-");
+    let sc: SidecarResult = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let from_parts = variant_hash_from_parts(&entry, &resolved, work_type);
+    assert_eq!(
+        sidecar_variant_hash(&sc),
+        from_parts,
+        "variant_hash_from_parts must equal sidecar_variant_hash for the same config",
+    );
+    // The on-disk sidecar filename embeds exactly that hash, so the dump
+    // (keyed by variant_hash_from_parts) and the sidecar share the key.
+    assert_eq!(
+        path.file_name().unwrap().to_str().unwrap(),
+        format!("__vh_pin__-{from_parts:016x}.ktstr.json"),
     );
 }
 
@@ -122,7 +333,7 @@ fn write_skip_sidecar_returns_err_when_dir_cannot_be_created() {
         auto_repro: false,
         ..KtstrTestEntry::DEFAULT
     };
-    let result = write_skip_sidecar(&entry);
+    let result = write_skip_sidecar(&entry, &entry.topology);
     assert!(
         result.is_err(),
         "skip sidecar write must return Err when the target is a regular file",
@@ -180,6 +391,7 @@ fn sidecar_payload_and_metrics_always_emit_when_empty() {
         passed: _,
         skipped: _,
         inconclusive: _,
+        expected_failure: _,
         stats: _,
         monitor,
         periodic_fired: _,
@@ -197,6 +409,7 @@ fn sidecar_payload_and_metrics_always_emit_when_empty() {
         host,
         cleanup_duration_ms,
         run_source,
+        resolve_source,
     } = loaded;
     assert!(payload.is_none());
     assert!(metrics.is_empty());
@@ -218,6 +431,12 @@ fn sidecar_payload_and_metrics_always_emit_when_empty() {
     assert!(
         run_source.is_none(),
         "absent run_source must round-trip as None, \
+         matching the symmetric serialize/deserialize \
+         contract enforced for every other nullable field",
+    );
+    assert!(
+        resolve_source.is_none(),
+        "absent resolve_source must round-trip as None, \
          matching the symmetric serialize/deserialize \
          contract enforced for every other nullable field",
     );
@@ -315,7 +534,16 @@ fn write_sidecar_records_entry_payload_name() {
     };
     let vm_result = crate::vmm::VmResult::test_fixture();
     let ok = AssertResult::pass();
-    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[]).unwrap();
+    write_sidecar(
+        &entry,
+        &vm_result,
+        &[],
+        &ok,
+        "SpinWait",
+        &[],
+        &entry.topology,
+    )
+    .unwrap();
 
     let path = find_single_sidecar_by_prefix(tmp.path(), "__payload_name_test__-");
     let data = std::fs::read_to_string(&path).unwrap();
@@ -372,7 +600,16 @@ fn write_sidecar_forwards_payload_metrics_slice() {
             exit_code: 2,
         },
     ];
-    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &metrics).unwrap();
+    write_sidecar(
+        &entry,
+        &vm_result,
+        &[],
+        &ok,
+        "SpinWait",
+        &metrics,
+        &entry.topology,
+    )
+    .unwrap();
 
     let path = find_single_sidecar_by_prefix(tmp.path(), "__metrics_slice_test__-");
     let data = std::fs::read_to_string(&path).unwrap();
@@ -423,7 +660,7 @@ fn write_skip_sidecar_records_entry_payload_name() {
         payload: Some(&STRESS),
         ..KtstrTestEntry::DEFAULT
     };
-    write_skip_sidecar(&entry).unwrap();
+    write_skip_sidecar(&entry, &entry.topology).unwrap();
 
     let path = find_single_sidecar_by_prefix(tmp.path(), "__skip_payload_name_test__-");
     let data = std::fs::read_to_string(&path).unwrap();
@@ -462,6 +699,8 @@ fn sidecar_variant_hash_excludes_host_context() {
         kernel_release: Some("6.11.0".to_string()),
         arch: Some("x86_64".to_string()),
         kernel_cmdline: Some("preempt=lazy".to_string()),
+        task_delayacct: Some(crate::host_context::DelayacctState::On),
+        config_task_xacct: Some(crate::host_context::XacctState::On),
         heap_state: None,
     };
     let without_host = SidecarResult {
@@ -723,6 +962,46 @@ fn sidecar_variant_hash_excludes_run_source() {
     );
 }
 
+/// `resolve_source` (the scheduler discovery-path tag) must not
+/// influence the variant hash. Two runs of the same semantic variant
+/// resolved via different paths — one auto-built from the workspace
+/// HEAD, one from a possibly-stale `target/` binary — must produce the
+/// same sidecar filename so `compare_partitions` can diff them across
+/// the resolution boundary. Mirrors the commit / run_source exclusion
+/// tests: covers `None` vs `Some` and two distinct populated tags so a
+/// regression distinguishing only one pair is still caught.
+#[test]
+fn sidecar_variant_hash_excludes_resolve_source() {
+    let none = SidecarResult {
+        topology: "1n1l2c1t".to_string(),
+        resolve_source: None,
+        ..SidecarResult::test_fixture()
+    };
+    let auto = SidecarResult {
+        topology: "1n1l2c1t".to_string(),
+        resolve_source: Some("auto_built".to_string()),
+        ..SidecarResult::test_fixture()
+    };
+    assert_eq!(
+        sidecar_variant_hash(&none),
+        sidecar_variant_hash(&auto),
+        "resolve_source must not influence variant hash — None vs \
+         Some(\"auto_built\") case",
+    );
+
+    let stale = SidecarResult {
+        topology: "1n1l2c1t".to_string(),
+        resolve_source: Some("target_debug".to_string()),
+        ..SidecarResult::test_fixture()
+    };
+    assert_eq!(
+        sidecar_variant_hash(&auto),
+        sidecar_variant_hash(&stale),
+        "resolve_source must not influence variant hash — \
+         Some(\"auto_built\") vs Some(\"target_debug\") case",
+    );
+}
+
 /// cpu_budget / vcpus must NOT influence the variant hash: a budget
 /// change is a different MEASUREMENT, separated downstream by the
 /// `Dimension::CpuBudget` pairing, not by shattering the identity bucket.
@@ -863,6 +1142,8 @@ fn sidecar_result_roundtrip_with_populated_host_context() {
         kernel_release: Some("6.11.0".to_string()),
         arch: Some("x86_64".to_string()),
         kernel_cmdline: Some("preempt=lazy isolcpus=1-3".to_string()),
+        task_delayacct: Some(crate::host_context::DelayacctState::On),
+        config_task_xacct: Some(crate::host_context::XacctState::On),
         heap_state: Some(crate::host_heap::HostHeapState::test_fixture()),
     };
     let sc = SidecarResult {
@@ -1008,6 +1289,16 @@ fn sidecars_in_a_run_carry_identical_host_context() {
             s.sched_tunables.is_some(),
             first.sched_tunables.is_some(),
             "sidecar {i}: sched_tunables presence flipped across sidecars",
+        );
+        assert_eq!(
+            s.task_delayacct.is_some(),
+            first.task_delayacct.is_some(),
+            "sidecar {i}: task_delayacct presence flipped across sidecars",
+        );
+        assert_eq!(
+            s.config_task_xacct.is_some(),
+            first.config_task_xacct.is_some(),
+            "sidecar {i}: config_task_xacct presence flipped across sidecars",
         );
     }
 }

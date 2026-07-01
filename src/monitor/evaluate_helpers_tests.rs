@@ -36,7 +36,9 @@ fn track_imbalance_and_dsq_reports_worst_cpu_not_first() {
     // worst per-sample depth is 5 on cpu1 — `worst_dsq_cpu` must point
     // to cpu1.
     let samples = vec![MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![
             CpuSnapshot {
@@ -76,12 +78,16 @@ fn track_imbalance_and_dsq_empty_cpus_records_non_violation() {
     let t = MonitorThresholds::default();
     let samples = vec![
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 100,
             cpus: vec![],
         },
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 200,
             cpus: vec![],
         },
@@ -105,7 +111,9 @@ fn track_stall_sizes_vec_to_max_cpu_count_across_samples() {
         ..Default::default()
     };
     let s1 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![CpuSnapshot {
             nr_running: 1,
@@ -115,7 +123,9 @@ fn track_stall_sizes_vec_to_max_cpu_count_across_samples() {
     };
     // Second sample has 3 CPUs — the tracker vec must size to 3.
     let s2 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 200,
         cpus: vec![
             CpuSnapshot {
@@ -161,7 +171,9 @@ fn track_stall_respects_vcpu_preemption_threshold() {
         ..Default::default()
     };
     let s1 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![CpuSnapshot {
             nr_running: 1,
@@ -171,7 +183,9 @@ fn track_stall_respects_vcpu_preemption_threshold() {
         }],
     };
     let s2 = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 200,
         cpus: vec![CpuSnapshot {
             nr_running: 1,
@@ -187,6 +201,7 @@ fn track_stall_respects_vcpu_preemption_threshold() {
         watchdog_observation: None,
         page_offset: 0,
         boot_wait_outcome: BootWaitOutcome::NotConfigured,
+        scx_event_counters_supported: false,
     };
     let stall = t.track_stall(&report);
     assert_eq!(stall.len(), 1);
@@ -226,7 +241,9 @@ fn track_event_rates_zero_interval_does_not_panic() {
     let t = MonitorThresholds::default();
     // Two samples with identical elapsed_ms → 0-second interval.
     let make = |fb| MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![CpuSnapshot {
             nr_running: 1,

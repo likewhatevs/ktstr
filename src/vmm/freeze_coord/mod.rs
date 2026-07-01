@@ -42,6 +42,10 @@ use super::vmlinux::{cached_vmlinux_bytes, find_vmlinux};
 use super::{
     KtstrVm, console, host_comms, vcpu_panic, virtio_blk, virtio_console, virtio_net, wire,
 };
+// MSI-X routing is x86_64-only (aarch64 uses GICv3 with no PCI MSI-X); its only
+// users are the `#[cfg(target_arch = "x86_64")]` PCI run-loop paths below.
+#[cfg(target_arch = "x86_64")]
+use super::virtio_msix;
 
 #[cfg(target_arch = "aarch64")]
 use super::aarch64::kvm;
@@ -78,7 +82,8 @@ use self::snapshot::{
 };
 use self::state::{
     BspExitReason, FREEZE_RENDEZVOUS_TIMEOUT, FreezeState, SnapshotRequest,
-    compute_periodic_boundaries_ns, periodic_tag,
+    compute_periodic_boundaries_ns, periodic_accessor_current, periodic_tag,
+    resolve_periodic_window,
 };
 use self::watchpoint::{WatchpointPublishResult, republish_watchpoint_on_rebind};
 
@@ -109,6 +114,101 @@ fn warn_kvm_clock_failure(ioctl_phase: &'static str, e: &std::io::Error) {
          (invalid flags on SET), or EBADF (fd closed). File an issue \
          with the error + kernel version if this fires repeatedly."
     );
+}
+
+/// Bounded grace a wprof run's error-exit teardown waits for the guest's
+/// LATE trace ship (guest Phase 5, `guest_comms::send_wprof_trace` over the
+/// bulk port) before killing the VM. The coordinator's error-exit arms set
+/// `wprof_ship_deadline = Instant::now() + WPROF_SHIP_GRACE`; it is also
+/// added to the primary VM's host watchdog budget in
+/// [`crate::test_support::runtime::vm_timeout_from_entry`] so a late crash
+/// still fits its full ship window inside the deadline (rather than the
+/// watchdog pre-empting the grace and synthesizing a spurious timeout).
+pub(crate) const WPROF_SHIP_GRACE: Duration = Duration::from_secs(30);
+
+/// Force run teardown from the coordinator: set the run-level kill flag
+/// and kick its eventfd so the BSP run loop (`kill.load`) and the
+/// `'coord:` loop guard (`freeze_coord_kill.load`) both observe the edge
+/// on their next wake.
+///
+/// The `write` Result is intentionally dropped: the only failure modes
+/// for an eventfd write are EAGAIN (counter saturated at `u64::MAX-1`, so
+/// the add would overflow — the wake is already signaled past saturation)
+/// and EBADF (fd torn down — the coord is already exiting). Both mean
+/// "kill is already observed or about to be"; no recovery is meaningful.
+fn trigger_freeze_coord_kill(kill: &AtomicBool, kill_evt: &EventFd) {
+    kill.store(true, Ordering::Release);
+    let _ = kill_evt.write(1);
+}
+
+/// True iff `msg` is the guest's wprof trace ship — a crc-valid,
+/// non-empty `MsgType::WprofTrace` frame. The coordinator's error-exit
+/// grace promotes the teardown the instant this returns true for a
+/// drained frame. A torn (`!crc_ok`), empty, or wrong-type frame is NOT
+/// the ship and must not terminate the grace early (notably a SchedExit,
+/// which the SchedExit dispatch arm declines to promote on a wprof run —
+/// see the `run_is_wprof` sink field — and which instead arms the grace
+/// via `is_sched_exit_frame` in the coord loop).
+fn is_wprof_ship_frame(msg: &crate::vmm::bulk::BulkMessage) -> bool {
+    msg.crc_ok && !msg.payload.is_empty() && msg.msg_type == crate::vmm::wire::MSG_TYPE_WPROF_TRACE
+}
+
+/// True iff an armed wprof-ship grace deadline has expired at `now`. The
+/// coordinator's per-iteration backstop kills the VM when this returns
+/// true — the bounded fallback if the guest wedges before shipping its
+/// trace. `None` (no grace armed) never kills; the boundary is inclusive
+/// (`now >= deadline`).
+fn wprof_grace_should_kill(deadline: Option<Instant>, now: Instant) -> bool {
+    deadline.is_some_and(|dl| now >= dl)
+}
+
+/// True iff `msg` is a crc-valid guest SCHED_EXIT frame. On a wprof run
+/// the coordinator arms the ship grace when it drains one of these
+/// (rather than promoting the kill in `dispatch_bulk_message`): a
+/// self-crash makes the guest sched-exit monitor send SCHED_EXIT during
+/// Phase 5, and treating it as a grace-arm (not a kill) holds the VM open
+/// for the guest's late wprof ship even if the error-exit watchpoint dump
+/// has not armed the grace yet (e.g. watchpoint unavailable). CRC-bad
+/// frames do not arm — a torn/hostile frame must not force the grace.
+fn is_sched_exit_frame(msg: &crate::vmm::bulk::BulkMessage) -> bool {
+    msg.crc_ok && msg.msg_type == crate::vmm::wire::MSG_TYPE_SCHED_EXIT
+}
+
+/// Extend the watchdog's reset deadline so it accommodates an armed
+/// wprof-ship grace. The watchdog fires at
+/// `effective_deadline = reset_deadline.max(hard_deadline)` where
+/// `reset_deadline = run_start + reset_ns`. `hard_deadline` already
+/// includes `WPROF_SHIP_GRACE` (via `vm_timeout_from_entry`), but a
+/// scheduler-attach / freeze reset can push `reset_deadline` PAST
+/// `hard_deadline`, masking the grace. Bumping `reset_ns` to at least
+/// `now - run_start + grace` guarantees the watchdog does not fire before
+/// the grace's own deadline, so a late crash's ship window is not
+/// pre-empted (and no spurious `timed_out` is synthesized). `max`-style:
+/// a larger existing reset is never shrunk.
+fn extend_watchdog_reset_for_grace(
+    reset_ns: &std::sync::atomic::AtomicU64,
+    run_start: Instant,
+    grace: Duration,
+) {
+    let target = run_start.elapsed().saturating_add(grace);
+    let encoded = u64::try_from(target.as_nanos()).unwrap_or(u64::MAX).max(1);
+    if encoded > reset_ns.load(Ordering::Acquire) {
+        reset_ns.store(encoded, Ordering::Release);
+    }
+}
+
+/// Arm the wprof-ship grace: extend the watchdog reset deadline to cover
+/// it (so the internal watchdog cannot pre-empt the grace — see
+/// [`extend_watchdog_reset_for_grace`]) and return the grace deadline.
+/// Called at every grace-arm site so the deadline and the watchdog
+/// extension always move together.
+fn arm_wprof_grace(
+    run_start: Instant,
+    reset_ns: &std::sync::atomic::AtomicU64,
+    grace: Duration,
+) -> Instant {
+    extend_watchdog_reset_for_grace(reset_ns, run_start, grace);
+    Instant::now() + grace
 }
 
 /// Three-way result of polling the BPF probe's `.bss` latch via the
@@ -926,6 +1026,43 @@ impl KtstrVm {
         #[cfg(not(target_arch = "x86_64"))]
         let ioapic_handle: Option<Arc<crate::vmm::IoapicHandle>> = None;
 
+        // Full-irqchip shared GSI route owner — the inverse of `ioapic_handle`:
+        // `Some` only on the full in-kernel irqchip path (`!split_irqchip`) with
+        // PCI enabled, where it owns the device MSI(-X) routes. `install_defaults`
+        // installs an EXPLICIT default routing table (IOAPIC pins 0..24 + PIC)
+        // route-identical to KVM's implicit default, so the legacy INTx routes
+        // survive the first MSI-X `KVM_SET_GSI_ROUTING` (a whole-table replace
+        // that would otherwise wipe them). `None` on split-irqchip (routes go via
+        // the userspace IOAPIC / `ioapic_handle`) and on non-PCI guests.
+        #[cfg(target_arch = "x86_64")]
+        let full_route_owner: Option<Arc<kvm::FullIrqchipRouteOwner>> = (!vm.split_irqchip
+            && vm.pci_enabled)
+            .then(|| Arc::new(kvm::FullIrqchipRouteOwner::new(vm.vm_fd.as_raw_fd())));
+        #[cfg(target_arch = "x86_64")]
+        if let Some(owner) = full_route_owner.as_ref() {
+            owner
+                .install_defaults()
+                .context("install full-irqchip default GSI routing")?;
+        }
+
+        // PCI host bridge handle for the virtio-PCI transport: the single-bus
+        // PCIe segment with ECAM/CAM config access, constructed only when this
+        // VM enables PCI. `None` keeps non-PCI guests byte-identical (no
+        // ECAM/CAM dispatch). Created here in the same scope as the other
+        // device handles so it threads into both the BSP loop and the per-AP
+        // spawn. x86-only for now (aarch64 PCI is design-only).
+        #[cfg(target_arch = "x86_64")]
+        let pci_bus_handle: Option<Arc<PiMutex<crate::vmm::pci::PciBus>>> = if vm.pci_enabled {
+            Some(Arc::new(PiMutex::new(crate::vmm::pci::PciBus::new(
+                kvm::PCI_ECAM_BASE,
+                kvm::PCI_ECAM_SIZE,
+            ))))
+        } else {
+            None
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let pci_bus_handle: Option<Arc<PiMutex<crate::vmm::pci::PciBus>>> = None;
+
         // Register serial EventFds with KVM's irqfd for interrupt-driven TX.
         // On x86 split-irqchip (>254 APIC IDs) the serial IRQ routes through
         // the userspace IOAPIC (ioapic_handle above is threaded into the run
@@ -1008,34 +1145,16 @@ impl KtstrVm {
             )
         };
 
-        // Probes-ready broadcast EventFd. Shared between the monitor
-        // thread's slot-1 wait and the bpf-map-write thread's
-        // accessor-init / map-discovery / probes-ready waits — all
-        // of which previously slept on independent 100-200 ms timers
-        // while polling guest kernel state via .bss latch reads.
-        // Replacing the bare sleeps with `poll(POLLIN)` against this
-        // eventfd lets ANY waiter that detects its own readiness
-        // condition write 1, immediately waking every other waiter
-        // for an early re-check. `EFD_NONBLOCK` keeps the writer's
-        // `write()` from stalling if the counter is already
-        // saturated; readers use `poll`, never `read`, so the level
-        // stays high once any writer has fired and the wake fans out
-        // to every cloned fd. `try_clone()` uses `dup(2)`, so all
-        // clones share the same kernel counter — the broadcast
-        // works across as many waiters as we hand out clones to.
+        // Probes-ready EventFd. Used solely by the bpf-map-write thread's
+        // phase 1 as a 200 ms `poll(POLLIN)` backoff while it polls guest
+        // kernel state (.bss latch reads); both bpf phases write it on
+        // success (phase 2 polls `kill_evt` instead — the fd goes
+        // level-high after the first write, so re-polling it would spin).
+        // `EFD_NONBLOCK` keeps `write()` from stalling at saturation, and
+        // readers `poll` (never `read`) so the level stays high once any
+        // writer fires. Moved directly into `start_bpf_map_write` (its only
+        // consumer), so no clone is needed.
         let probes_ready_evt = EventFd::new(EFD_NONBLOCK).context("create probes-ready EventFd")?;
-        let probes_ready_evt_for_monitor = probes_ready_evt
-            .try_clone()
-            .context("clone probes-ready EventFd for monitor")?;
-        let probes_ready_evt_for_bpf = probes_ready_evt
-            .try_clone()
-            .context("clone probes-ready EventFd for bpf-map-write")?;
-        // The original is unused once both consumers hold their own
-        // dup'd fds. Drop it eagerly so its file descriptor is freed
-        // immediately rather than at the end of the run; the clones
-        // share the same kernel counter via dup(2) and remain
-        // independent.
-        drop(probes_ready_evt);
 
         // Shared parked_evt: every vCPU thread + the virtio-blk
         // worker writes 1 to this counter-mode EventFd immediately
@@ -1060,21 +1179,110 @@ impl KtstrVm {
         // semantics as parked_evt.
         let thaw_evt = Arc::new(EventFd::new(EFD_NONBLOCK).context("create thaw EventFd")?);
 
-        // Optional virtio-blk: `None` when no disks are attached,
-        // `Some` when the builder has at least one `DiskConfig`.
-        // Constructed BEFORE we tear down vm.vcpus so the helper
-        // can still read `vm.guest_mem` and the irqchip state.
-        let virtio_blk = self.init_virtio_blk(&vm)?;
-        // Plumb the shared parked_evt into the device so its worker
-        // wakes the freeze coordinator's rendezvous on park.
-        if let Some(ref blk) = virtio_blk {
+        // virtio-blk is set up AFTER the PCI bus + MSI-X route sink (below),
+        // because its x86_64 transport is a virtio-pci function that needs both.
+        // See the arch-split block following the virtio-net setup. (Like
+        // virtio-net, it is constructed before vm.vcpus is torn down so the
+        // helper can still read `vm.guest_mem` and register irqfds on
+        // `vm.vm_fd`.)
+
+        // Optional virtio-net. The transport is arch-split:
+        //
+        // - x86_64: the NIC is a virtio-pci function installed on
+        //   `pci_bus_handle` (slot 1). There is no MMIO handle for the
+        //   dispatch loops to drive — guest BAR accesses route through
+        //   the PCI bus — so `virtio_net` stays `None` here (the MMIO
+        //   net arm in the dispatch loops goes inert), and the counters
+        //   Arc + INTx resample eventfd come back in `NetDeviceHandles`.
+        //   The resample fd MUST outlive the run (KVM holds its raw fd
+        //   to de-assert the level GSI on guest EOI); `_net_resample_evt`
+        //   keeps it alive through `run_bsp_loop`.
+        // - aarch64: the NIC stays on virtio-MMIO (aarch64 PCI is a
+        //   later increment); the handle drives the dispatch loops and
+        //   supplies the counters Arc.
+        //
+        // Same construction-before-vcpu-takedown rule as virtio-blk.
+        #[cfg(target_arch = "x86_64")]
+        let virtio_net: Option<Arc<PiMutex<virtio_net::VirtioNet>>> = None;
+        // The active GSI-route owner as the MSI-X route sink: `IoapicHandle` on
+        // split-irqchip, `FullIrqchipRouteOwner` on full (both impl
+        // `MsixRouteSink`). Threaded into `init_virtio_net_pci` so MSI-X is
+        // offered on both irqchip paths; cloned (Arc) so each owner stays
+        // available for the run loops + teardown routing diagnostics.
+        #[cfg(target_arch = "x86_64")]
+        let msix_sink: Option<Arc<dyn virtio_msix::MsixRouteSink>> = if vm.split_irqchip {
+            ioapic_handle
+                .clone()
+                .map(|h| h as Arc<dyn virtio_msix::MsixRouteSink>)
+        } else {
+            full_route_owner
+                .clone()
+                .map(|o| o as Arc<dyn virtio_msix::MsixRouteSink>)
+        };
+        // One (counters, resample_evt) pair per installed NIC. The resample fds
+        // (Some only on the full-irqchip path) are held alive in `_net_resample_evts`
+        // for the run (KVM holds each raw fd to de-assert its level GSI on EOI);
+        // the counters are snapshotted+aggregated into VmResult at collect time.
+        #[cfg(target_arch = "x86_64")]
+        let (virtio_net_counters, _net_resample_evts): (Vec<_>, Vec<_>) =
+            match pci_bus_handle.as_ref() {
+                Some(bus) => self
+                    .init_virtio_net_pci(&vm, bus, msix_sink.clone())?
+                    .into_iter()
+                    .map(|h| (h.counters, h.resample_evt))
+                    .unzip(),
+                None => (Vec::new(), Vec::new()),
+            };
+        #[cfg(not(target_arch = "x86_64"))]
+        let virtio_net = self.init_virtio_net(&vm)?;
+        #[cfg(not(target_arch = "x86_64"))]
+        let virtio_net_counters: Vec<_> = virtio_net
+            .as_ref()
+            .map(|d| d.lock().counters())
+            .into_iter()
+            .collect();
+
+        // Optional virtio-blk. Transport is arch-split (same pattern as
+        // virtio-net above), but virtio-blk runs a request worker the freeze
+        // coordinator pauses, so the run loop needs the device itself — not just
+        // counters. Two handles result:
+        //  - `virtio_blk`: the MMIO-dispatch routing handle. `None` on x86 (the
+        //    device is a PCI function; guest BAR accesses route through the PCI
+        //    bus, so the dispatch loops' MMIO blk arm goes inert), `Some` on
+        //    aarch64 (the MMIO transport).
+        //  - `blk_device`: the canonical device Arc for the freeze
+        //    pause/resume, counters, paused-handle, and parked-eventfd — set on
+        //    BOTH arches (on x86 it is the `BlkDeviceHandles::device` clone whose
+        //    sibling backs the PciBus function; on aarch64 it is the same Arc as
+        //    `virtio_blk`).
+        // On x86 the INTx resample eventfd is held alive for the run (KVM holds
+        // its raw fd to de-assert the level GSI on guest EOI).
+        // (mmio_routing_handle, canonical_device, intx_resample_evt). The inner
+        // types are `Option<Arc<PiMutex<VirtioBlk>>>` / `Option<EventFd>`,
+        // inferred from the arms + later use (a written-out tuple trips
+        // clippy::type_complexity, matching the `(Vec<_>, Vec<_>)` style the NIC
+        // counters use above).
+        #[cfg(target_arch = "x86_64")]
+        let (virtio_blk, blk_device, _blk_resample_evt): (Option<_>, Option<_>, Option<_>) =
+            match pci_bus_handle.as_ref() {
+                Some(bus) => match self.init_virtio_blk_pci(&vm, bus, msix_sink)? {
+                    Some(h) => (None, Some(h.device), h.resample_evt),
+                    None => (None, None, None),
+                },
+                None => (None, None, None),
+            };
+        #[cfg(not(target_arch = "x86_64"))]
+        let (virtio_blk, blk_device): (Option<_>, Option<_>) = {
+            let dev = self.init_virtio_blk(&vm)?;
+            (dev.clone(), dev)
+        };
+        // Plumb the shared parked_evt into the device (both transports) so its
+        // worker wakes the freeze coordinator's rendezvous on park. Lands before
+        // the deferred initial worker spawn (DRIVER_OK, after vCPUs start), so
+        // the first worker observes it.
+        if let Some(ref blk) = blk_device {
             blk.lock().set_parked_evt(parked_evt.clone());
         }
-
-        // Optional virtio-net: `None` when the builder has no
-        // `NetConfig` attached, `Some` when configured. Same
-        // construction-before-vcpu-takedown rule as virtio-blk.
-        let virtio_net = self.init_virtio_net(&vm)?;
 
         // Virtio-console for host→guest wake delivery. The setup_memory
         // path always emits the device's MMIO node on the kernel
@@ -1273,6 +1481,7 @@ impl KtstrVm {
             virtio_blk.as_ref(),
             virtio_net.as_ref(),
             ioapic_handle.as_ref(),
+            pci_bus_handle.as_ref(),
             &kill,
             &kill_evt,
             &freeze,
@@ -1444,7 +1653,6 @@ impl KtstrVm {
             run_start,
             vcpu_pthreads,
             perf_capture.clone(),
-            probes_ready_evt_for_monitor,
             Some(virtio_con.clone()),
             sys_rdy_evt.clone(),
             tcr_el1_cache.clone(),
@@ -1460,12 +1668,16 @@ impl KtstrVm {
         let watchdog_pause_for_coord = watchdog_pause_ns.clone();
         let workload_duration_for_coord = self.workload_duration;
         // First-ScenarioStart timestamp (nanos since `run_start`),
-        // biased by `+1` so `0` means "no ScenarioStart frame
-        // observed yet". The dispatch.rs ScenarioStart arm
-        // CAS-stamps this on the first frame so the periodic-
-        // snapshot loop in the coord run-loop can anchor the
-        // 10%–90% workload-duration window at the moment the guest
-        // workload actually starts (not at boot or at `run_start`).
+        // clamped to a `1` floor (via `.max(1)`) so `0` stays the
+        // "no ScenarioStart frame observed yet" sentinel — a
+        // boot-unreachable elapsed==0 maps to 1, every real stamp is
+        // exact (not a `+1` shift). The dispatch.rs ScenarioStart arm
+        // CAS-stamps this on the first frame; the periodic-snapshot
+        // loop in the coord run-loop uses it as the window END anchor
+        // (`scenario_start + workload_duration`, clamped) and the
+        // scenario-relative offset frame, while the window START
+        // floats to the later of this stamp and the prereq-ready
+        // moment — so neither boot nor `run_start` eats the budget.
         // `Arc<AtomicU64>` gives the coord thread shared ownership
         // with the dispatch sinks; both run in the same thread so
         // Relaxed ordering suffices, but the AtomicU64 keeps the
@@ -1474,6 +1686,14 @@ impl KtstrVm {
         let scenario_start_ns: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let scenario_start_ns_for_coord = scenario_start_ns.clone();
+        // Scheduler-swap notification latch. The dispatch.rs
+        // SchedSwapNotify arm sets it on a CRC-valid frame; the coord
+        // run-loop reads-and-clears it each iteration to synchronously
+        // invalidate the stale periodic-capture accessor on a swap Op.
+        // Same coord thread as the dispatch sinks, so Relaxed suffices
+        // — uniform with `scenario_start_ns`.
+        let sched_swap_notify_for_coord: Arc<std::sync::atomic::AtomicBool> =
+            Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Cumulative wall-clock pause time observed between
         // matched `MSG_TYPE_SCENARIO_PAUSE` / `MSG_TYPE_SCENARIO_RESUME`
         // pairs (nanoseconds). Periodic-snapshot boundaries are
@@ -1510,7 +1730,8 @@ impl KtstrVm {
         let bpf_write_handle = self.start_bpf_map_write(
             &vm,
             &kill,
-            probes_ready_evt_for_bpf,
+            &kill_evt,
+            probes_ready_evt,
             tcr_el1_cache.clone(),
             cr3_cache.clone(),
             virtio_con.clone(),
@@ -1656,7 +1877,10 @@ impl KtstrVm {
         // are automatically frozen when the vCPU rendezvous
         // completes (their `mmio_write` handlers must have already
         // returned for the vCPU to reach the parked state).
-        let freeze_coord_virtio_blk = virtio_blk.clone();
+        // Use `blk_device` (set on both transports), NOT `virtio_blk` (the
+        // MMIO-routing handle, `None` on x86): the coordinator must pause/resume
+        // the request worker regardless of how the guest reaches the device.
+        let freeze_coord_virtio_blk = blk_device.clone();
         // Lock-free `paused` flag handle. The freeze coordinator
         // polls the worker's parked-state in two paths (the
         // rendezvous timeout-diagnostic snapshot and the post-thaw
@@ -1672,7 +1896,7 @@ impl KtstrVm {
         // with the worker's parked-state stores that
         // `is_paused()` does.
         let freeze_coord_virtio_blk_paused: Option<Arc<AtomicBool>> =
-            virtio_blk.as_ref().map(|d| d.lock().paused_handle());
+            blk_device.as_ref().map(|d| d.lock().paused_handle());
         // Clone the virtio-console Arc into the coordinator so it
         // can drain port-1 bulk TLV bytes as the guest writes them
         // (event-driven via the tx_evt eventfd registered into the
@@ -1761,6 +1985,54 @@ impl KtstrVm {
         // [`monitor::dump::DualFailureDumpReport`]. Set by
         // `attempt_auto_repro` for the repro VM only.
         let freeze_coord_dual_snapshot = self.dual_snapshot;
+        // Whether this run captures a wprof trace. On an error-class scx
+        // exit the guest ships its wprof `.pb` LATE — the crash unwinds
+        // dispatch, then Phase 5 joins the wprof thread and sends the trace
+        // over the bulk port, then Phase 6 reboots (src/vmm/rust_init) — so
+        // the error-exit dump path below must NOT tear the VM down at the
+        // dump, or the `.wprof.pb` / `.repro.wprof.pb` artifact is dropped.
+        // Split to a plain bool so it crosses into the always-compiled
+        // coord closure regardless of the feature.
+        #[cfg(feature = "wprof")]
+        let freeze_coord_wprof = self.wprof.is_some();
+        #[cfg(not(feature = "wprof"))]
+        let freeze_coord_wprof = false;
+        // The test's workload-root cgroup path (host-held), for the
+        // per-cgroup PSI-irq walk's subtree filter. Defaults to the guest's
+        // resolve_cgroup_root default (/sys/fs/cgroup/ktstr) when unset, so the
+        // walk targets the same subtree the scenario created its cgroups under.
+        let freeze_coord_workload_root = self
+            .workload_root_cgroup
+            .clone()
+            .unwrap_or_else(|| "/sys/fs/cgroup/ktstr".to_string());
+        // Phase A precondition (loud check): the per-cgroup PSI walk filters
+        // to the workload-root subtree, so a scheduler cgroup nested UNDER the
+        // workload root would be mis-collected as a spurious workload leaf. The
+        // default is safe (no scheduler cgroup_parent → the scheduler inherits
+        // the root cgroup, outside the workload subtree). Warn if a config nests
+        // them — the confound is otherwise silent in the cross-cgroup fold.
+        if let Some(sched_parent) = self.scheduler_cgroup_parent.as_deref() {
+            let cgroup_rel = |p: &str| {
+                p.strip_prefix("/sys/fs/cgroup")
+                    .unwrap_or(p)
+                    .trim_matches('/')
+                    .to_string()
+            };
+            let sched_rel = cgroup_rel(sched_parent);
+            let wl_rel = cgroup_rel(&freeze_coord_workload_root);
+            if !wl_rel.is_empty()
+                && (sched_rel == wl_rel || sched_rel.starts_with(&format!("{wl_rel}/")))
+            {
+                tracing::warn!(
+                    scheduler_cgroup_parent = %sched_parent,
+                    workload_root = %freeze_coord_workload_root,
+                    "per-cgroup PSI-irq: scheduler cgroup is nested under the \
+                     workload root — its IRQ-servicing pressure will be mis-collected \
+                     as a workload leaf; place the scheduler cgroup outside the \
+                     workload root to keep the per-cgroup axis clean",
+                );
+            }
+        }
         // Half of the configured watchdog timeout, in nanoseconds.
         // Used by the dual-snapshot scanner to compare against each
         // task's runnable-age in jiffies (converted via the guest's
@@ -2300,8 +2572,13 @@ impl KtstrVm {
                 //      so the monitor thread observes the value
                 //      regardless of whether the guest's port-2
                 //      publish landed first.
-                //   3. Publishes the pair via `OnceLock::set`.
-                //   4. Exits — the OnceLock is read-only thereafter.
+                //   3. Publishes the pair by storing `Some(pair)` into
+                //      the `accessors_slot` `Mutex<Option<AccessorPair>>`.
+                //   4. Exits. The coordinator adopts via
+                //      `accessors_slot.lock().take()`; the slot is
+                //      re-populatable — the swap-notify teardown and the
+                //      watchpoint Detached / RebindDisarmed arms reset it
+                //      to `None` to force a fresh worker rebuild on a swap.
                 //
                 // The worker honors `freeze_coord_kill` between
                 // retries and bails immediately on shutdown so a
@@ -2316,8 +2593,9 @@ impl KtstrVm {
                 // `poll(kill_evt | accessor_reinit_evt, -1)` and
                 // re-enters the init-retry phase whenever the
                 // coordinator pulses `accessor_reinit_evt` (see the
-                // `WatchpointPublishResult::Detached` and
-                // `RebindDisarmed` arms in the coord-loop body).
+                // synchronous sched-swap-notify teardown and the
+                // `WatchpointPublishResult::Detached` / `RebindDisarmed`
+                // arms in the coord-loop body).
                 // Re-init drops the per-iteration 60 s budget — by
                 // the time the first re-init fires the guest has
                 // already booted to the point of having a live
@@ -2711,6 +2989,17 @@ impl KtstrVm {
                 let dump_cpu_time_offsets = dump_btf
                     .as_ref()
                     .and_then(|btf| crate::monitor::btf_offsets::CpuTimeOffsets::from_btf(btf).ok());
+                // Per-cgroup PSI-irq walk offsets (Phase A): the cgroup
+                // hierarchy field offsets + the shared psi_group offsets (a
+                // per-cgroup psi_group is the same struct as the system-wide
+                // psi_system). Either None → the per-cgroup capture is skipped
+                // (loud-absent).
+                let dump_cgroup_offsets = dump_btf.as_ref().and_then(|btf| {
+                    crate::monitor::btf_offsets::CgroupWalkOffsets::from_btf(btf).ok()
+                });
+                let dump_cgroup_psi_offsets = dump_btf.as_ref().and_then(|btf| {
+                    crate::monitor::btf_offsets::PsiGroupOffsets::from_btf(btf).ok()
+                });
                 let dump_cpu_time_symbols = vmlinux_data.as_deref()
                     .and_then(|data| crate::monitor::symbols::KernelSymbols::from_vmlinux_bytes(data).ok());
                 // SCX walker BTF sub-group offsets. Resolved once at
@@ -3256,23 +3545,35 @@ impl KtstrVm {
                 // is the precomputed list of `Instant` deadlines
                 // (encoded as nanos-since-`run_start`) at which the
                 // run-loop fires `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })`. Lazily
-                // built on the first iteration AFTER BOTH:
+                // built on the first iteration AFTER ALL:
                 //   1. `KtstrVm::num_snapshots > 0` (periodic capture
                 //      is requested), AND
                 //   2. `workload_duration_for_coord` is `Some(d)`
                 //      (the workload has a duration to slice), AND
-                //   3. `scenario_start_ns_for_coord` reads non-zero
-                //      (the first ScenarioStart frame has been
-                //      observed and stamped by the dispatch arm).
+                //   3. `periodic_prereqs_ready_ns != 0` (kaslr publish +
+                //      map accessor + prog accessor all first held,
+                //      stamped `.max(1)`), AND
+                //   4. a non-zero anchor is resolvable — `scenario_start_ns`
+                //      (the ScenarioStart frame stamped by the dispatch
+                //      arm) OR, if that is still 0, the `watchdog_reset`
+                //      fallback (the observed scheduler-attach time). While
+                //      the anchor reads 0 the build DEFERS (a 0 anchor
+                //      would invert the clamped window and 0-fire),
+                //      retrying until one source latches.
                 //
-                // Boundaries divide the 10%–90% workload window into
-                // `N + 1` equal intervals, producing `N` interior
-                // boundaries — `N == 1` lands a single sample at
-                // `start + 0.5 d` (midpoint); `N == 3` lands at
-                // 0.3 d, 0.5 d, 0.7 d. The 10% pre-boundary buffer
-                // and 10% post-boundary buffer give the workload
-                // ramp-up / ramp-down room without periodic samples
-                // landing on transient state.
+                // Boundaries divide the 10%–90% slice of the
+                // capturable window into `N + 1` equal intervals,
+                // producing `N` interior boundaries — `N == 1` lands
+                // a single sample at the span midpoint; `N == 3`
+                // lands at 0.3 / 0.5 / 0.7 of the span. On a warm
+                // boot window_start == anchor, so the span equals the
+                // workload duration `d` and the landings are
+                // `0.3 d / 0.5 d / 0.7 d`; on a cold boot window_start
+                // floats later and the fractions are of the shorter
+                // clamped span. The 10% pre-boundary buffer and 10%
+                // post-boundary buffer give the workload ramp-up /
+                // ramp-down room without periodic samples landing on
+                // transient state.
                 //
                 // `next_periodic_idx` tracks how many boundaries
                 // have already fired. When the gate
@@ -3291,6 +3592,15 @@ impl KtstrVm {
                 // time is ~uniform across the deferred burst and useless
                 // for per-phase attribution).
                 let mut periodic_anchor_ns: u64 = 0;
+                // run_start-relative ns at which ALL periodic-capture prereqs
+                // (kaslr publish + map accessor + prog accessor) first held.
+                // On a cold boot resolve_periodic_window floats window_start to
+                // this moment so no boundary lands in the already-elapsed
+                // pre-ready span (the cold-boot page-table walk + scx attach
+                // transient); the separate end-clamp (window_end =
+                // scenario_anchor + duration) is what keeps the window off
+                // post-workload idle. 0 = not yet ready.
+                let mut periodic_prereqs_ready_ns: u64 = 0;
                 let mut next_periodic_idx: u32 = 0;
                 // Consecutive parked-vCPU rendezvous failures during
                 // periodic capture. Reset to 0 on every successful
@@ -3340,6 +3650,24 @@ impl KtstrVm {
                 // requests and scenarios that don't await the gate.
                 let mut bsp_done_final_pass_start: Option<Instant> = None;
                 const DEFERRED_DRAIN_GRACE: Duration = Duration::from_secs(30);
+                // Bounded grace for a wprof run's LATE trace ship. On an
+                // error-class exit (Captured or Degraded) the coordinator
+                // captures the dump, thaws, and — for a non-wprof run —
+                // kills immediately. A wprof run ships its Perfetto `.pb`
+                // over the bulk port in guest Phase 5 AFTER the crash
+                // (`guest_comms::send_wprof_trace` -> `MsgType::WprofTrace`),
+                // then Phase 6 reboots — and that reboot can hang on some
+                // kernels, so waiting on `TOKEN_BSP_DONE` is not safe.
+                // Killing at capture time would tear the VM down before the
+                // ship. Instead the error-exit arms arm this deadline (they
+                // do NOT kill); `freeze_state == Done` blocks re-freeze, the
+                // `'coord:` guard keeps looping (kill unset => clause A of
+                // the guard holds), the TOKEN_TX drain promotes the kill the
+                // instant a crc-valid `WprofTrace` frame lands, and this
+                // deadline is the backstop if the guest wedges before
+                // shipping. `None` = no ship pending (non-wprof runs never
+                // arm it).
+                let mut wprof_ship_deadline: Option<Instant> = None;
                 // Mirror of `bsp_done_final_pass` for the SCHED_EXIT
                 // kill-promotion-without-bsp-done case: kill can be
                 // promoted by sources other than a clean BSP_DONE —
@@ -3369,6 +3697,19 @@ impl KtstrVm {
                         && !bsp_done_final_pass)
                     || (!freeze_coord_bsp_done.load(Ordering::Acquire)
                         && !sched_exit_final_pass)
+                    // wprof-ship grace stay-alive: while a grace deadline is
+                    // armed, keep looping regardless of a set kill /
+                    // bsp_done / sched_exit_final_pass, so a SCHED_EXIT- or
+                    // watchdog-set kill cannot break the loop before the
+                    // guest ships its Phase-5 wprof trace. edit-c (WprofTrace)
+                    // or the `wprof_grace_should_kill` backstop clears the
+                    // deadline and sets the kill; the NEXT top-of-loop check
+                    // then finds this clause false and exits via the normal
+                    // sched_exit_final_pass path. (The per-iteration backstop
+                    // bounds this at `WPROF_SHIP_GRACE`; an EINTR-continue
+                    // only defers it one wake, and no SIGRTMIN kicks occur
+                    // once the vCPUs are thawed for the grace.)
+                    || wprof_ship_deadline.is_some()
                 {
                     if freeze_coord_bsp_done.load(Ordering::Acquire) {
                         if bsp_done_final_pass {
@@ -3450,6 +3791,15 @@ impl KtstrVm {
                     {
                         let event_count = match epoll.wait(poll_ms, &mut events_buf) {
                             Ok(n) => n,
+                            // EINTR: retry the wait. This `continue` skips
+                            // this iteration's wprof-grace backstop
+                            // (`wprof_grace_should_kill`) and edit-c, but the
+                            // guard's `wprof_ship_deadline.is_some()`
+                            // stay-alive keeps the loop live so the next
+                            // successful epoll wake re-evaluates both. No
+                            // SIGRTMIN kicks occur once the vCPUs are thawed
+                            // for the grace, so an EINTR storm that could
+                            // indefinitely defer the backstop is not expected.
                             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                             Err(e) => {
                                 tracing::error!(
@@ -3570,6 +3920,7 @@ impl KtstrVm {
                                     let mut sinks = BulkDispatchSinks {
                                         kill: &freeze_coord_kill,
                                         kill_evt: &freeze_coord_kill_evt,
+                                        run_is_wprof: freeze_coord_wprof,
                                         sys_rdy_evt: &mut freeze_coord_sys_rdy_evt,
                                         snapshot_requests_pending:
                                             &mut snapshot_requests_pending,
@@ -3585,6 +3936,8 @@ impl KtstrVm {
                                         }),
                                         watchdog_pause_ns: watchdog_pause_for_coord.as_ref(),
                                         scenario_start_ns: scenario_start_ns_for_coord.as_ref(),
+                                        sched_swap_notify:
+                                            sched_swap_notify_for_coord.as_ref(),
                                         scenario_pause_cumulative_ns:
                                             scenario_pause_cumulative_for_coord.as_ref(),
                                         run_start,
@@ -3596,6 +3949,57 @@ impl KtstrVm {
                                         {
                                             bucket.push(entry);
                                         }
+                                    }
+                                    // wprof-ship grace arm on SCHED_EXIT: on a
+                                    // wprof run a drained crc-valid SCHED_EXIT
+                                    // (the guest self-crash monitor's frame,
+                                    // which `dispatch_bulk_message` no longer
+                                    // promotes to a kill) arms the grace if it
+                                    // is not already armed by the error-exit
+                                    // dump — holding the VM open for the
+                                    // guest's late Phase-5 wprof ship even
+                                    // when the exit_kind watchpoint dump has
+                                    // not (yet) fired (e.g. watchpoint
+                                    // unavailable). edit-c below then kills on
+                                    // the WprofTrace, or the WPROF_SHIP_GRACE
+                                    // backstop does.
+                                    if freeze_coord_wprof
+                                        && wprof_ship_deadline.is_none()
+                                        && drained.messages.iter().any(is_sched_exit_frame)
+                                    {
+                                        eprintln!(
+                                            "freeze-coord: SCHED_EXIT drained on wprof run; \
+                                             arming wprof ship grace ({WPROF_SHIP_GRACE:?})"
+                                        );
+                                        wprof_ship_deadline =
+                                            Some(arm_wprof_grace(run_start, &watchdog_reset_for_coord, WPROF_SHIP_GRACE));
+                                    }
+                                    // wprof-ship grace: if an error-exit arm
+                                    // (or the SCHED_EXIT arm above) armed
+                                    // `wprof_ship_deadline`, promote the
+                                    // kill the instant the guest's Phase-5
+                                    // wprof trace lands — a crc-valid,
+                                    // non-empty `MsgType::WprofTrace` frame —
+                                    // rather than waiting out the deadline or
+                                    // the guest reboot (which can hang). The
+                                    // frame is not coordinator-internal, so it
+                                    // also flowed into `bucket` above for
+                                    // `collect_results`; this block is only
+                                    // the teardown trigger. Clearing the
+                                    // deadline makes the per-iteration
+                                    // backstop below a no-op afterward.
+                                    if wprof_ship_deadline.is_some()
+                                        && drained.messages.iter().any(is_wprof_ship_frame)
+                                    {
+                                        eprintln!(
+                                            "freeze-coord: wprof trace received; \
+                                             kill triggered after ship"
+                                        );
+                                        trigger_freeze_coord_kill(
+                                            &freeze_coord_kill,
+                                            &freeze_coord_kill_evt,
+                                        );
+                                        wprof_ship_deadline = None;
                                     }
                                     // Append the verdict-bearing entries
                                     // to the shared bucket so
@@ -3632,11 +4036,98 @@ impl KtstrVm {
                         // condition + inner bsp_done check handle
                         // loop exit after the body completes.
                     }
+                    // wprof-ship grace backstop. Reached every iteration
+                    // after the epoll drain, before any conditional
+                    // `continue` in the loop body. The TOKEN_TX drain above
+                    // clears the deadline (and promotes the kill) the moment
+                    // the WprofTrace lands; this branch fires only if the
+                    // guest wedges before shipping, bounding the wait at
+                    // `WPROF_SHIP_GRACE`. Once the kill is set, the `'coord:`
+                    // guard runs one more pass (the
+                    // `!bsp_done && !sched_exit_final_pass` clause), sets
+                    // `sched_exit_final_pass`, then breaks — bounded
+                    // teardown, no hang.
+                    if wprof_grace_should_kill(wprof_ship_deadline, Instant::now()) {
+                        eprintln!(
+                            "freeze-coord: wprof-ship grace ({WPROF_SHIP_GRACE:?}) expired \
+                             without a trace; killing"
+                        );
+                        trigger_freeze_coord_kill(
+                            &freeze_coord_kill,
+                            &freeze_coord_kill_evt,
+                        );
+                        wprof_ship_deadline = None;
+                    }
+                    // Synchronous periodic-capture + watchpoint
+                    // invalidation on an explicit guest swap-notify
+                    // (Op::Detach / Restart / ReplaceScheduler). The
+                    // guest's `kill_current_scheduler` sends
+                    // `MSG_TYPE_SCHED_SWAP_NOTIFY` once `*scx_root` is NULL
+                    // (after `wait_for_scx_disabled`;
+                    // `RCU_INIT_POINTER(scx_root, NULL)` precedes
+                    // `scx_set_enable_state(SCX_DISABLED)` in
+                    // kernel/sched/ext.c scx_root_disable), so the prior
+                    // `scx_sched` object is unlinked (`*scx_root` NULLed)
+                    // and its slab is subject to RCU-grace-period reuse —
+                    // BOTH the owned accessor AND the slot-0 DR0 watchpoint
+                    // (armed on that object's `exit_kind` KVA) are stale.
+                    // Perform the FULL watchpoint-Detached teardown
+                    // synchronously, not just the accessor half:
+                    //   * disarm DR0 (`WatchpointArm::disarm`) + reset
+                    //     `last_sched_kva = 0`, so a stale DR0 cannot fire
+                    //     into the recycled slab (a `>= SCX_EXIT_ERROR`
+                    //     read would latch a phantom failure dump on a
+                    //     deliberate swap), and the next
+                    //     owned-accessor-present scan tick republishes as a
+                    //     fresh `0 -> B` attach;
+                    //   * clear `cached_exit_kind_pa`, so the scan-tick
+                    //     err-trigger probe and a rendezvous-timeout
+                    //     Degraded dump never read `exit_kind` from the
+                    //     recycled page;
+                    //   * drop the owned accessor + pulse
+                    //     `accessor_reinit_evt` so the accessor-init worker
+                    //     rebuilds against the next scheduler NOW (its
+                    //     `accessor_ready_evt` -> TOKEN_ACCESSOR_READY ->
+                    //     adopt path re-publishes it).
+                    // Doing only the accessor half is UNSOUND: this
+                    // teardown sets `owned_accessor = None`, which gates
+                    // OFF the watchpoint tick (the only other code that
+                    // disarms DR0 / clears `cached_exit_kind_pa`), so the
+                    // post-notify state MUST already be the Detached state.
+                    // Net effect: collapses the up-to-one-SCAN_INTERVAL
+                    // watchpoint-poll detection window to ~0. Read-and-
+                    // clear so it fires once per notify; ungated by
+                    // `scan_tick` (skipping the scan cadence is the point)
+                    // and idempotent against the poll's own later Detached
+                    // arm. A notify that lands after the poll already
+                    // detached (owned_accessor already None) re-runs this
+                    // body harmlessly; the only cost is an extra
+                    // accessor_reinit_evt pulse — the worker coalesces
+                    // pulses that arrive while it is parked into one
+                    // redundant rebuild, while a pulse landing mid-rebuild
+                    // costs one extra idempotent (live-state) rebuild.
+                    if sched_swap_notify_for_coord.swap(false, Ordering::Relaxed) {
+                        freeze_coord_watchpoint.disarm();
+                        last_sched_kva = 0;
+                        cached_exit_kind_pa = None;
+                        owned_accessor = None;
+                        owned_prog_accessor = None;
+                        *accessors_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                        let _ = accessor_reinit_evt.write(1);
+                        tracing::info!(
+                            target: "ktstr::failure_dump",
+                            "freeze-coord: sched-swap notify — synchronous \
+                             periodic-capture + watchpoint invalidation \
+                             (full Detached teardown; skipping the \
+                             watchpoint-poll detection window)"
+                        );
+                    }
                     // Adopt the worker-published accessor pair as
-                    // soon as it lands. Both halves of the pair land
-                    // atomically via `OnceLock::set` so a single
-                    // `get()` returns either both or neither — no
-                    // partial-Some shape to handle. The worker logs
+                    // soon as it lands. The worker stores `Some(pair)`
+                    // into the `accessors_slot` mutex in one shot, so a
+                    // single `lock().take()` returns either both halves
+                    // or neither — no partial-Some shape to handle. The
+                    // worker logs
                     // its own warn/eprintln on a permanent failure
                     // (60 s deadline exceeded), so the coordinator
                     // doesn't track separate retry counters here:
@@ -4155,11 +4646,9 @@ impl KtstrVm {
                                 // from silently caching across swaps.
                                 owned_accessor = None;
                                 owned_prog_accessor = None;
-                                if let Ok(mut g) = accessors_slot
+                                *accessors_slot
                                     .lock()
-                                {
-                                    *g = None;
-                                }
+                                    .unwrap_or_else(|e| e.into_inner()) = None;
                                 let _ = accessor_reinit_evt.write(1);
                             }
                             WatchpointPublishResult::RebindDisarmed {
@@ -4176,10 +4665,10 @@ impl KtstrVm {
                                 );
                                 last_sched_kva = 0;
                                 // Same rationale as the Detached arm:
-                                // the prior scx_sched is RCU-pending-
-                                // free and the cached PA can begin
-                                // reading recycled slab data. The
-                                // next iteration's Published arm
+                                // the prior scx_sched object is detached
+                                // and pending RCU free, and the cached PA
+                                // can begin reading recycled slab data.
+                                // The next iteration's Published arm
                                 // republishes for the new scheduler.
                                 cached_exit_kind_pa = None;
                                 // Refresh the owned BPF accessors for
@@ -4188,11 +4677,9 @@ impl KtstrVm {
                                 // rationale).
                                 owned_accessor = None;
                                 owned_prog_accessor = None;
-                                if let Ok(mut g) = accessors_slot
+                                *accessors_slot
                                     .lock()
-                                {
-                                    *g = None;
-                                }
+                                    .unwrap_or_else(|e| e.into_inner()) = None;
                                 let _ = accessor_reinit_evt.write(1);
                             }
                             WatchpointPublishResult::Published {
@@ -6172,6 +6659,53 @@ impl KtstrVm {
                                     }
                                     _ => None,
                                 };
+                                // Per-cgroup PSI-irq capture (Phase A).
+                                // Some only when guest memory, the cgroup +
+                                // psi_group offsets, and the cgrp_dfl_root
+                                // symbol all resolve. Pre-translate the
+                                // hierarchy root cgroup (cgrp_dfl_root +
+                                // offsetof(cgroup_root, cgrp)) here: text PA for
+                                // the entry read, KASLR-slid runtime KVA for the
+                                // children-list anchor compare (the scx_walker
+                                // runtime-head discipline). Every descendant is
+                                // direct-mapped, translated inside the walk.
+                                let cgroup_psi_capture = match (
+                                    freeze_coord_mem.as_deref(),
+                                    dump_cgroup_offsets.as_ref(),
+                                    dump_cgroup_psi_offsets.as_ref(),
+                                    dump_cpu_time_symbols.as_ref().and_then(|s| s.cgrp_dfl_root),
+                                ) {
+                                    (
+                                        Some(mem),
+                                        Some(cgroup_offsets),
+                                        Some(psi_offsets),
+                                        Some(cgrp_dfl_root_kva),
+                                    ) => {
+                                        let page_offset = dump_kernel.page_offset();
+                                        let kaslr_offset = kern_virt_kaslr
+                                            .load(std::sync::atomic::Ordering::Acquire)
+                                            .saturating_sub(1);
+                                        let link_root_kva = cgrp_dfl_root_kva
+                                            .wrapping_add(cgroup_offsets.cgroup_root_cgrp as u64);
+                                        let root_cgroup_pa =
+                                            dump_kernel.text_kva_to_pa(link_root_kva);
+                                        let root_cgroup_kva =
+                                            crate::monitor::symbols::slid_kernel_kva(
+                                                link_root_kva,
+                                                kaslr_offset,
+                                            );
+                                        Some(crate::monitor::dump::CgroupPsiCapture {
+                                            mem,
+                                            cgroup_offsets,
+                                            psi_offsets,
+                                            root_cgroup_kva,
+                                            root_cgroup_pa,
+                                            workload_root_path: &freeze_coord_workload_root,
+                                            page_offset,
+                                        })
+                                    }
+                                    _ => None,
+                                };
                                 // Force the lazy cast-analysis on this
                                 // dump's host coordinator thread (NOT a
                                 // vCPU thread — vCPUs are paused at the
@@ -6221,6 +6755,7 @@ impl KtstrVm {
                                         arena_offsets: dump_arena_offsets.as_ref(),
                                         prog_capture: prog_capture.as_ref(),
                                         cpu_time_capture: cpu_time_capture.as_ref(),
+                                        cgroup_psi_capture: cgroup_psi_capture.as_ref(),
                                         task_enrichment_capture: task_enrichment_capture
                                             .as_ref(),
                                         // Per-sample SCX_EV_* event counter
@@ -6336,6 +6871,7 @@ impl KtstrVm {
                                         "dump prerequisites unavailable".to_string(),
                                     ),
                                     per_cpu_time: Vec::new(),
+                                    cgroup_psi: Vec::new(),
                                     task_enrichments: Vec::new(),
                                     task_enrichments_unavailable: Some(
                                         "dump prerequisites unavailable".to_string(),
@@ -7657,8 +8193,25 @@ impl KtstrVm {
                     // 10% / 10% pre/post buffers in the boundary
                     // formula are the budget that absorbs this
                     // deferral lag.
+                    // Stamp the prereq-ready moment once (run_start-relative):
+                    // the moment all periodic-capture prereqs first hold, which
+                    // the boundary window anchors at on a cold boot so boundaries
+                    // fire in the capturable window instead of being stranded in
+                    // the already-past pre-ready region. Same three predicates the
+                    // fire-loop defers on. `.max(1)` keeps a (boot-unreachable)
+                    // elapsed==0 from colliding with the not-ready 0 sentinel.
+                    if periodic_prereqs_ready_ns == 0
+                        && kern_virt_kaslr_published()
+                        && owned_accessor.is_some()
+                        && owned_prog_accessor.is_some()
+                    {
+                        periodic_prereqs_ready_ns = u64::try_from(run_start.elapsed().as_nanos())
+                            .unwrap_or(u64::MAX)
+                            .max(1);
+                    }
                     if freeze_coord_num_snapshots > 0 && !periodic_abandoned {
                         if periodic_boundaries_ns.is_none()
+                            && periodic_prereqs_ready_ns != 0
                             && let Some(workload_d) = workload_duration_for_coord
                         {
                             // Anchor selection — preferring guest-stamped
@@ -7688,7 +8241,9 @@ impl KtstrVm {
                             // attach elapsed time (encoded in
                             // `watchdog_reset_ns` as
                             // `attach_elapsed_ns + workload_duration_ns`
-                            // — see `src/monitor/reader.rs::2515-2525`).
+                            // — see the `reset_ns.store` on the first non-NULL
+                            // `*scx_root` transition in `src/monitor/reader.rs`
+                            // (~2865)).
                             // The derived anchor is the moment the
                             // host saw `*scx_root` transition to
                             // non-NULL; that's the earliest meaningful
@@ -7716,20 +8271,46 @@ impl KtstrVm {
                                     );
                                 }
                             }
-                            if scenario_anchor != 0 {
+                            // resolve_periodic_window floats window_start to
+                            // max(scenario_anchor, prereqs_ready), CLAMPS
+                            // window_end to scenario_anchor + duration, and
+                            // returns None to DEFER while scenario_anchor is
+                            // still 0 — the inverted-window 0-fire guard (a 0
+                            // anchor would make window_end = 0 + d <
+                            // window_start, re-introducing the cold-boot
+                            // 0-sample flake, and stamp anchor_ns = 0,
+                            // mis-bucketing offsets). See the helper doc for
+                            // the full rationale. On defer we leave
+                            // periodic_boundaries_ns None and retry next
+                            // iteration once scenario_start_ns or the
+                            // watchdog_reset fallback supplies a non-zero
+                            // anchor; prereqs_ready stays stamped so no rework
+                            // is lost. anchor_ns is scenario_anchor (NOT
+                            // window_start) so boundary offsets stay
+                            // scenario-relative for build_phase_buckets. The
+                            // slicer self-guards the degenerate/tiny window
+                            // (returns empty).
+                            if let Some(window) = resolve_periodic_window(
+                                scenario_anchor,
+                                periodic_prereqs_ready_ns,
+                                workload_d.as_nanos() as u64,
+                            ) {
                                 let boundaries = compute_periodic_boundaries_ns(
-                                    scenario_anchor,
-                                    workload_d,
+                                    window.window_start_ns,
+                                    window.window_end_ns,
                                     freeze_coord_num_snapshots,
                                 );
                                 tracing::info!(
                                     target: "ktstr::failure_dump",
                                     num_snapshots = freeze_coord_num_snapshots,
                                     scenario_anchor_ns = scenario_anchor,
+                                    window_start_ns = window.window_start_ns,
+                                    window_end_ns = window.window_end_ns,
+                                    prereqs_ready_ns = periodic_prereqs_ready_ns,
                                     workload_duration_ns = workload_d.as_nanos() as u64,
                                     "freeze-coord: periodic snapshot boundaries computed"
                                 );
-                                periodic_anchor_ns = scenario_anchor;
+                                periodic_anchor_ns = window.anchor_ns;
                                 periodic_boundaries_ns = Some(boundaries);
                             }
                         }
@@ -7852,6 +8433,60 @@ impl KtstrVm {
                                          retrying next iteration"
                                     );
                                     break;
+                                }
+                                // Window-B guard: the gate above ensures
+                                // the accessor EXISTS, but a scheduler swap
+                                // (Op::ReplaceScheduler / a same-binary rebind)
+                                // the <= SCAN_INTERVAL scx_root watchpoint poll
+                                // has not yet processed leaves owned_accessor
+                                // bound to the PRIOR scheduler while *scx_root
+                                // already points at the new obj. Reading the
+                                // prior obj's .bss through the stale accessor
+                                // returns the PRIOR scheduler's counters, not
+                                // the live one's; and once the prior BPF
+                                // object's maps are released (map refcount -> 0
+                                // on scheduler-process exit / fd close — NOT
+                                // synchronously by scx_root_disable
+                                // (kernel/sched/ext.c), which only unlinks the
+                                // scx_sched and NULLs *scx_root), that .bss page
+                                // is recycled/zeroed, a silent nr_dispatched=0.
+                                // Read *scx_root NOW
+                                // and defer if it moved since the last watchpoint
+                                // republish (last_sched_kva); the next iteration
+                                // retries once the poll re-resolves the accessor
+                                // for the live scheduler. Mirrors the watchpoint
+                                // rebind detection but at the periodic boundary
+                                // so a sub-SCAN_INTERVAL swap cannot emit a stale
+                                // sample. Gated on scx_root being resolvable:
+                                // when the symbol/offsets/mem are absent the dump
+                                // degrades to a loud NoActiveScheduler, not a
+                                // silent 0, so no guard is needed there.
+                                if let Some(ref syms) = dump_cpu_time_symbols
+                                    && let Some(scx_root_kva) = syms.scx_root
+                                    && let Some(ref mem) = freeze_coord_mem
+                                    && let Some(ref acc) = owned_accessor
+                                {
+                                    let root_pa =
+                                        acc.guest_kernel().text_kva_to_pa(scx_root_kva);
+                                    let live_sched_kva = mem.read_u64(root_pa, 0);
+                                    if !periodic_accessor_current(last_sched_kva, live_sched_kva)
+                                    {
+                                        tracing::info!(
+                                            target: "ktstr::failure_dump",
+                                            idx = next_periodic_idx,
+                                            tag = %periodic_tag(next_periodic_idx),
+                                            last_sched_kva =
+                                                format_args!("{last_sched_kva:#x}"),
+                                            live_sched_kva =
+                                                format_args!("{live_sched_kva:#x}"),
+                                            "freeze-coord: periodic snapshot deferred \
+                                             (scheduler swap not yet re-resolved by the \
+                                             scx_root watchpoint poll; owned_accessor is \
+                                             stale for the live scx_root); retrying next \
+                                             iteration"
+                                        );
+                                        break;
+                                    }
                                 }
                                 let _gate_guard = match gate::OnDemandGateGuard::try_acquire(
                                     &freeze_coord_on_demand_in_flight,
@@ -9047,39 +9682,53 @@ impl KtstrVm {
                                     }
                                 }
                                 freeze_state = FreezeState::Done;
-                                // Error-class exit dump complete: tear
-                                // the run down immediately rather than
-                                // looping back to epoll_wait under EEVDF
-                                // fallback for the remainder of the
-                                // host-watchdog window. The dump is
-                                // already serialized and emitted above,
-                                // the probe ringbuf has drained by the
-                                // time sched_ext_exit fired, and serial
-                                // output is flushed — no useful work
-                                // remains in the post-exit window. Set
-                                // the run-level kill AtomicBool and kick
-                                // the eventfd so the BSP run loop
-                                // (kill.load) and this coord loop
-                                // (freeze_coord_kill.load at the
-                                // top of the `'coord:` while-guard
-                                // above) both observe the edge on
-                                // the next wake.
-                                tracing::info!(
-                                    "freeze-coord: kill triggered after \
-                                     error-exit dump capture"
-                                );
-                                freeze_coord_kill
-                                    .store(true, Ordering::Release);
-                                // The Result is intentionally dropped:
-                                // the only failure modes for eventfd
-                                // write are EAGAIN (counter at u64::MAX
-                                // — implies the wake is already
-                                // signaled past saturation) and EBADF
-                                // (fd torn down — implies coord is
-                                // already exiting). Both shapes mean
-                                // "kill is already observed or about
-                                // to be"; no recovery is meaningful.
-                                let _ = freeze_coord_kill_evt.write(1);
+                                // Error-class exit dump complete: the dump
+                                // is serialized and emitted above, the probe
+                                // ringbuf has drained by the time
+                                // sched_ext_exit fired, and serial output is
+                                // flushed.
+                                //
+                                // For a NON-wprof run no useful work remains
+                                // in the post-exit window: kill now (the BSP
+                                // run loop's `kill.load` and this loop's
+                                // `'coord:` guard both observe the edge on
+                                // the next wake) rather than looping back to
+                                // epoll_wait under EEVDF fallback for the
+                                // remainder of the host-watchdog window.
+                                //
+                                // A wprof run ships its trace LATE (see
+                                // `wprof_ship_deadline` at its declaration):
+                                // the guest sends the `.pb` over the bulk
+                                // port in Phase 5 after the crash, then Phase
+                                // 6 reboots (which can hang on some kernels).
+                                // Killing here would tear the VM down before
+                                // that ship, dropping the `.wprof.pb` /
+                                // `.repro.wprof.pb` the artifact needs. For
+                                // wprof, arm the bounded ship grace instead:
+                                // `freeze_state` is now `Done`, so the loop
+                                // keeps running WITHOUT re-freezing
+                                // (err-detection is gated on `!= Done`), the
+                                // TOKEN_TX drain promotes the kill the instant
+                                // the WprofTrace frame lands, and
+                                // `WPROF_SHIP_GRACE` is the backstop if the
+                                // guest wedges before shipping.
+                                if freeze_coord_wprof {
+                                    eprintln!(
+                                        "freeze-coord: error-exit dump captured (Captured); \
+                                         awaiting wprof ship (grace {WPROF_SHIP_GRACE:?})"
+                                    );
+                                    wprof_ship_deadline =
+                                        Some(arm_wprof_grace(run_start, &watchdog_reset_for_coord, WPROF_SHIP_GRACE));
+                                } else {
+                                    eprintln!(
+                                        "freeze-coord: kill triggered after \
+                                         error-exit dump capture"
+                                    );
+                                    trigger_freeze_coord_kill(
+                                        &freeze_coord_kill,
+                                        &freeze_coord_kill_evt,
+                                    );
+                                }
                             }
                             FreezeOutcome::Degraded(degraded) => {
                                 // Rendezvous timeout: emit the
@@ -9214,31 +9863,43 @@ impl KtstrVm {
                                     }
                                 }
                                 freeze_state = FreezeState::Done;
-                                // warn (not info) — Degraded means the
-                                // trigger fired but capture was lossy
-                                // (rendezvous timeout); the kill that
-                                // follows is forced teardown, not clean
-                                // shutdown. Cf. Captured arm above which
-                                // uses info for the canonical success
-                                // path. Operators monitoring scheduler-
-                                // test runs care about the Degraded
-                                // class — info would bury it.
-                                tracing::warn!(
-                                    "freeze-coord: kill triggered after \
-                                     degraded dump capture"
-                                );
-                                freeze_coord_kill
-                                    .store(true, Ordering::Release);
-                                // The Result is intentionally dropped —
-                                // same rationale as the Captured
-                                // arm's `freeze_coord_kill_evt.write`
-                                // kick above (EAGAIN at counter
-                                // saturation = already-signaled;
-                                // EBADF = coord exiting). Both
-                                // shapes mean "kill is already
-                                // observed or about to be"; no
-                                // recovery is meaningful.
-                                let _ = freeze_coord_kill_evt.write(1);
+                                // Degraded means the trigger fired but
+                                // capture was lossy (rendezvous timeout).
+                                // `warn` (not info) so operators monitoring
+                                // scheduler-test runs see the degraded class
+                                // — info would bury it; cf. the Captured arm
+                                // above which uses info for the canonical
+                                // success path.
+                                //
+                                // Same wprof late-ship handling as the
+                                // Captured arm: `thaw_and_barrier` already
+                                // ran, so the guest is thawed and can still
+                                // ship its trace over the bulk port in Phase
+                                // 5; `freeze_state` is now `Done` (no
+                                // re-freeze). For a non-wprof run the kill
+                                // below is forced teardown, not clean
+                                // shutdown. For wprof, arm the bounded ship
+                                // grace instead so the `.repro.wprof.pb` is
+                                // not dropped — the TOKEN_TX drain or the
+                                // `WPROF_SHIP_GRACE` backstop promotes the
+                                // kill.
+                                if freeze_coord_wprof {
+                                    eprintln!(
+                                        "freeze-coord: degraded dump captured (Degraded); \
+                                         awaiting wprof ship (grace {WPROF_SHIP_GRACE:?})"
+                                    );
+                                    wprof_ship_deadline =
+                                        Some(arm_wprof_grace(run_start, &watchdog_reset_for_coord, WPROF_SHIP_GRACE));
+                                } else {
+                                    eprintln!(
+                                        "freeze-coord: kill triggered after \
+                                         degraded dump capture"
+                                    );
+                                    trigger_freeze_coord_kill(
+                                        &freeze_coord_kill,
+                                        &freeze_coord_kill_evt,
+                                    );
+                                }
                             }
                             FreezeOutcome::Suppressed => {
                                 // Gate cross-reference decided no dump
@@ -9566,47 +10227,98 @@ impl KtstrVm {
                 // `num_snapshots > 0`, log the fired/total ratio so
                 // an operator reading the test's tracing output can
                 // tell at a glance whether the periodic-sampling
-                // path delivered. Three distinct shapes surface:
-                //   * `0/N` with no scenario_start_ns stamp — the
-                //     guest never published a CRC-valid
-                //     `MSG_TYPE_SCENARIO_START`, so boundaries were
-                //     never computed. Most commonly a guest that
-                //     crashed mid-boot or a workload that never
-                //     reached the host-comms phase.
-                //   * `0/N` with scenario_start_ns stamped — the
-                //     boundaries were computed but no boundary was
-                //     reached (very-short run, kill before first
-                //     boundary). The doc on
-                //     `KtstrTestEntry::num_snapshots` warns the
-                //     test author to assert `>= some_lower_bound`
-                //     rather than `== num_snapshots` exactly for
-                //     this case.
-                //   * `K/N` with `K < N` — the run terminated mid-
-                //     sequence. Same best-effort contract; tests
-                //     should assert `>= K` not `== N`.
+                // path delivered. The pipeline anchors on
+                // `scenario_start_ns` when a CRC-valid
+                // `MSG_TYPE_SCENARIO_START` was observed, else on the
+                // `watchdog_reset`-derived fallback (the observed
+                // scheduler-attach time); the summary keys on the
+                // fired count plus which anchor source was available.
+                // Three distinct shapes surface:
+                //   * `K/N` fired (`K >= 1`) — boundaries were
+                //     reached, so an anchor existed. When the primary
+                //     `scenario_start_ns` was never stamped the
+                //     `watchdog_reset` fallback supplied it and the
+                //     message says so. `K < N` means the run
+                //     terminated mid-sequence; the doc on
+                //     `KtstrTestEntry::num_snapshots` warns the test
+                //     author to assert `>= some_lower_bound` rather
+                //     than `== num_snapshots` for exactly this case.
+                //   * `0/N` with NEITHER anchor available (no
+                //     `scenario_start_ns` AND a zero `watchdog_reset`)
+                //     — periodic sampling never had a reference point.
+                //     Most commonly a guest that crashed mid-boot or a
+                //     workload that never reached the host-comms phase.
+                //     This is the lone `warn`.
+                //   * `0/N` with an anchor available (primary OR the
+                //     `watchdog_reset` fallback) but no boundary
+                //     reached — a very-short run or a kill before the
+                //     first boundary. Same best-effort contract.
                 if freeze_coord_num_snapshots > 0 {
                     let scenario_anchor =
                         scenario_start_ns_for_coord.load(Ordering::Acquire);
-                    if scenario_anchor == 0 {
-                        tracing::warn!(
-                            target: "ktstr::failure_dump",
-                            num_snapshots = freeze_coord_num_snapshots,
-                            fired = next_periodic_idx,
-                            "freeze-coord: 0/{} periodic snapshots fired — \
-                             scenario_start_ns never stamped (no CRC-valid \
-                             MSG_TYPE_SCENARIO_START observed). The guest most \
-                             likely crashed mid-boot or never reached the \
-                             host-comms phase; periodic sampling has no anchor",
-                            freeze_coord_num_snapshots,
-                        );
-                    } else {
+                    // The periodic pipeline anchors on `scenario_start_ns`
+                    // when a CRC-valid MSG_TYPE_SCENARIO_START was observed,
+                    // else on the `watchdog_reset`-derived fallback (the
+                    // observed scheduler-attach time). A non-zero
+                    // `watchdog_reset` means that fallback anchor was
+                    // derivable, so the summary must NOT report
+                    // "scenario_start_ns never stamped → no anchor" for a run
+                    // that actually anchored (and fired) via the fallback.
+                    let fallback_anchor =
+                        watchdog_reset_for_coord.load(Ordering::Acquire);
+                    if next_periodic_idx > 0 {
+                        // Snapshots demonstrably fired, so an anchor existed.
+                        // When the primary anchor was never stamped the
+                        // fallback (the only other source) supplied it — say
+                        // so rather than implying the primary path.
                         tracing::info!(
                             target: "ktstr::failure_dump",
                             num_snapshots = freeze_coord_num_snapshots,
                             fired = next_periodic_idx,
                             scenario_anchor_ns = scenario_anchor,
-                            "freeze-coord: {}/{} periodic snapshots fired",
+                            fallback_anchor_ns = fallback_anchor,
+                            "freeze-coord: {}/{} periodic snapshots fired{}",
                             next_periodic_idx,
+                            freeze_coord_num_snapshots,
+                            if scenario_anchor == 0 {
+                                " (anchored via the watchdog_reset fallback; \
+                                 scenario_start_ns was never stamped)"
+                            } else {
+                                ""
+                            },
+                        );
+                    } else if scenario_anchor == 0 && fallback_anchor == 0 {
+                        // No anchor from EITHER source: periodic sampling
+                        // never had a reference point. The guest most likely
+                        // crashed mid-boot or never reached the host-comms
+                        // phase.
+                        tracing::warn!(
+                            target: "ktstr::failure_dump",
+                            num_snapshots = freeze_coord_num_snapshots,
+                            fired = next_periodic_idx,
+                            "freeze-coord: 0/{} periodic snapshots fired — \
+                             neither scenario_start_ns (no CRC-valid \
+                             MSG_TYPE_SCENARIO_START observed) nor the \
+                             watchdog_reset fallback supplied an anchor; the \
+                             guest most likely crashed mid-boot or never \
+                             reached the host-comms phase",
+                            freeze_coord_num_snapshots,
+                        );
+                    } else {
+                        // An anchor was available (primary or fallback) but no
+                        // boundary was reached — a very short run or a kill
+                        // before the first boundary. Best-effort contract:
+                        // tests assert `>=` a lower bound, not
+                        // `== num_snapshots`.
+                        tracing::info!(
+                            target: "ktstr::failure_dump",
+                            num_snapshots = freeze_coord_num_snapshots,
+                            fired = next_periodic_idx,
+                            scenario_anchor_ns = scenario_anchor,
+                            fallback_anchor_ns = fallback_anchor,
+                            "freeze-coord: 0/{} periodic snapshots fired — an \
+                             anchor was available but no boundary was reached \
+                             (short run or kill before the first boundary)",
                             freeze_coord_num_snapshots,
                         );
                     }
@@ -9646,8 +10358,7 @@ impl KtstrVm {
                 // worker still running past this join would dereference
                 // freed memory through stale `Arc<GuestMem>` on its
                 // next `try_init_*` retry.
-                freeze_coord_kill.store(true, Ordering::Release);
-                let _ = freeze_coord_kill_evt.write(1);
+                trigger_freeze_coord_kill(&freeze_coord_kill, &freeze_coord_kill_evt);
                 if let Some(handle) = accessor_init_handle {
                     let jt = std::time::Instant::now();
                     let _ = handle.join();
@@ -9881,8 +10592,7 @@ impl KtstrVm {
                         }
                         // Propagate kill so handle_freeze's poll loop
                         // exits and the monitor + bpf-write threads stop.
-                        kill_for_watchdog.store(true, Ordering::Release);
-                        let _ = kill_evt_for_watchdog.write(1);
+                        trigger_freeze_coord_kill(&kill_for_watchdog, &kill_evt_for_watchdog);
                         if let Some(ref ie) = bsp_ie {
                             ie.set(1);
                             std::sync::atomic::fence(Ordering::Release);
@@ -10003,6 +10713,7 @@ impl KtstrVm {
                     virtio_blk.as_ref(),
                     virtio_net.as_ref(),
                     ioapic_handle.as_ref(),
+                    pci_bus_handle.as_ref(),
                     &kill,
                     &freeze,
                     &watchpoint,
@@ -10078,6 +10789,21 @@ impl KtstrVm {
             }
         }
 
+        // Same surfacing for the full-irqchip MSI-X route owner: a nonzero count
+        // means a guest-unmasked MSI-X vector never got its KVM route, so that
+        // vector did not deliver (the NIC would hang on first use of it).
+        #[cfg(target_arch = "x86_64")]
+        if let Some(owner) = full_route_owner.as_ref() {
+            let n = owner.routing_failures();
+            if n > 0 {
+                tracing::error!(
+                    count = n,
+                    "full-irqchip: {n} KVM_SET_GSI_ROUTING install(s) failed this \
+                     run — MSI-X vectors for those routes did not deliver"
+                );
+            }
+        }
+
         // Join the watchdog before dropping `bsp`. The watchdog holds an
         // ImmediateExitHandle pointing into bsp's kvm_run mmap. If bsp is
         // dropped first, the watchdog may write to unmapped memory.
@@ -10118,8 +10844,14 @@ impl KtstrVm {
         // handle onto `VmRunState` so `collect_results` can attach
         // it to `VmResult` without holding the device alive past
         // its current ownership.
-        let virtio_blk_counters = virtio_blk.as_ref().map(|d| d.lock().counters());
-        let virtio_net_counters = virtio_net.as_ref().map(|d| d.lock().counters());
+        // Read via `blk_device` (set on both transports), NOT `virtio_blk`
+        // (`None` on x86): the counters live in the shared device regardless of
+        // whether it is reached through MMIO (aarch64) or the PCI bus (x86).
+        let virtio_blk_counters = blk_device.as_ref().map(|d| d.lock().counters());
+        // `virtio_net_counters` was captured at device construction (the
+        // transport-split init above): on x86_64 from `NetDeviceHandles`
+        // (the PCI function owns the device core, so the `virtio_net`
+        // MMIO handle is `None` here), on aarch64 from the MMIO handle.
 
         // Best-effort final TCR_EL1 read from the post-exit BSP.
         // The BSP loop's lazy CAS already populates `tcr_el1_cache`
@@ -10253,6 +10985,7 @@ impl KtstrVm {
         virtio_blk: Option<&Arc<PiMutex<virtio_blk::VirtioBlk>>>,
         virtio_net: Option<&Arc<PiMutex<virtio_net::VirtioNet>>>,
         ioapic: Option<&Arc<crate::vmm::IoapicHandle>>,
+        pci_bus: Option<&Arc<PiMutex<crate::vmm::pci::PciBus>>>,
         kill: &Arc<AtomicBool>,
         kill_evt: &Arc<EventFd>,
         freeze: &Arc<AtomicBool>,
@@ -10289,6 +11022,7 @@ impl KtstrVm {
             let vblk_clone = virtio_blk.cloned();
             let vnet_clone = virtio_net.cloned();
             let ioapic_clone = ioapic.cloned();
+            let pci_bus_clone = pci_bus.cloned();
             let exited = Arc::new(AtomicBool::new(false));
             let exited_clone = exited.clone();
             let parked = Arc::new(AtomicBool::new(false));
@@ -10403,6 +11137,7 @@ impl KtstrVm {
                             vblk_clone.as_ref(),
                             vnet_clone.as_ref(),
                             ioapic_clone.as_ref(),
+                            pci_bus_clone.as_ref(),
                             &kill_clone,
                             &kill_evt_clone,
                             &freeze_clone,
@@ -10449,12 +11184,6 @@ impl KtstrVm {
     }
 
     /// Start the monitor thread if vmlinux is available.
-    ///
-    /// `probes_ready_evt` is the broadcast EventFd shared with the
-    /// bpf-map-write thread (see `run_vm`); the slot-1 wait below
-    /// `poll`s it instead of bare-sleeping, and writes 1 to it on
-    /// detection so any other waiter blocked in `poll` wakes
-    /// immediately and re-checks its own readiness condition.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn start_monitor(
         &self,
@@ -10464,7 +11193,6 @@ impl KtstrVm {
         run_start: Instant,
         vcpu_pthreads: Vec<libc::pthread_t>,
         perf_capture: Arc<Option<monitor::perf_counters::PerfCountersCapture>>,
-        _probes_ready_evt: EventFd,
         virtio_con: Option<Arc<PiMutex<virtio_console::VirtioConsole>>>,
         sys_rdy_evt: Option<Arc<EventFd>>,
         tcr_el1: Option<Arc<std::sync::atomic::AtomicU64>>,
@@ -10510,11 +11238,53 @@ impl KtstrVm {
         };
         let offsets = monitor::btf_offsets::KernelOffsets::from_btf(&btf);
         let prog_offsets = monitor::btf_offsets::BpfProgOffsets::from_btf(&btf).ok();
+        // System-wide PSI-irq host-walk offsets (psi_group total/avg + the
+        // PSI_IRQ_FULL index). `None` when CONFIG_IRQ_TIME_ACCOUNTING is off
+        // (PSI_IRQ_FULL absent from BTF) or psi_group is absent → loud-absent.
+        let psi_offsets = monitor::btf_offsets::PsiGroupOffsets::from_btf(&btf).ok();
         let symbols = monitor::symbols::KernelSymbols::from_elf(&elf);
 
         let (Ok(offsets), Ok(symbols)) = (offsets, symbols) else {
             return Ok(None);
         };
+        // BTF-capability probe for the `SCX_EV_*` event counters:
+        // `event_offsets` resolves only on kernels that expose the
+        // `struct scx_sched` / `scx_root` machinery the monitor walks to
+        // reach them (a 6.16-cycle addition); on older kernels (e.g.
+        // 6.14) it is `None`. Captured here where the resolved
+        // `KernelOffsets` is owned, then forwarded onto every
+        // `MonitorLoopResult` this closure produces so `MonitorReport`
+        // consumers can distinguish "counters absent because the kernel
+        // lacks them" from "counters empty because capture regressed".
+        let scx_event_counters_supported = offsets.event_offsets.is_some();
+
+        // `watch_bpf_maps` prep: the vmlinux BTF is the split-base for per-map
+        // program-BTF loads; `prog_offsets` is cloned because the
+        // `prog_stats_ctx` builder below consumes the original; the test
+        // entry's `WatchBpfMap` list is lowered to the monitor-local target
+        // form. All are moved into the monitor closure and consumed there
+        // only when the test declared watch targets.
+        let btf = Arc::new(btf);
+        let watch_prog_offsets = prog_offsets.clone();
+        let watch_targets: Vec<monitor::reader::WatchBpfMapTarget> = self
+            .watch_bpf_maps
+            .iter()
+            .map(|p| monitor::reader::WatchBpfMapTarget {
+                map_suffix: p.map_name_suffix.clone(),
+                field: p.field.clone(),
+                per_cpu: matches!(
+                    p.agg,
+                    crate::test_support::BpfMapAgg::PerCpu
+                        | crate::test_support::BpfMapAgg::PerCpuCounter
+                ),
+                counter: matches!(
+                    p.agg,
+                    crate::test_support::BpfMapAgg::ScalarCounter
+                        | crate::test_support::BpfMapAgg::PerCpuCounter
+                ),
+                label: p.label.clone(),
+            })
+            .collect();
 
         let mem = match vm.numa_layout.as_ref() {
             Some(layout) => monitor::reader::GuestMem::from_layout(layout, &vm.guest_mem),
@@ -10540,6 +11310,10 @@ impl KtstrVm {
                 unsafe { monitor::reader::GuestMem::new(host_base, mem_size) }
             }
         };
+        // Share guest DRAM between the sampling loop (which borrows `&*mem`)
+        // and the `watch_bpf_maps` watcher's owned map accessor (which holds
+        // an `Arc::clone`) — both read-only over the same backing.
+        let mem = Arc::new(mem);
         let num_cpus = self.topology.total_cpus();
         let kill_clone = kill.clone();
         let kill_evt_clone = kill_evt.clone();
@@ -10669,6 +11443,7 @@ impl KtstrVm {
                             page_offset: 0,
                             preemption_threshold_ns,
                             boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
+                            scx_event_counters_supported,
                         };
                     }
                     let kill_fd = kill_evt_clone.as_raw_fd();
@@ -10725,6 +11500,7 @@ impl KtstrVm {
                             page_offset: 0,
                             preemption_threshold_ns,
                             boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
+                            scx_event_counters_supported,
                         };
                     }
                 }
@@ -10745,54 +11521,13 @@ impl KtstrVm {
                     monitor::symbols::start_kernel_map_for_tcr(tcr_el1_value)
                         .unwrap_or(monitor::symbols::START_KERNEL_MAP);
 
-                // Resolve `phys_base` via a page-table walk through
-                // the live BSP CR3. After the sys_rdy wait above the
-                // BSP has populated `cr3_cache` via its lazy CAS —
-                // `__startup_64` / `__cpu_setup` runs strictly before
-                // userspace init emits SYS_RDY, and the BSP run loop
-                // has executed thousands of iterations by then so
-                // every iteration's CAS attempt has had a chance to
-                // observe a non-zero CR3.
-                //
-                // Race window: in cold-cache or coverage-instrumented
-                // builds the BSP can lag the kernel's userspace-init
-                // emission of SYS_RDY by tens of ms — the freeze
-                // coordinator promotes the SYS_RDY frame to the
-                // monitor's eventfd from its TLV dispatch, which
-                // runs on the freeze coord thread independent of
-                // BSP run-loop progress. If the monitor reads
-                // cr3_cache before the BSP has executed its first
-                // run-loop iteration's lazy CAS, cr3_value is 0
-                // and `phys_base` falls back to 0 for the entire
-                // run. On KASLR builds that turns every text-mapped
-                // PA derivation (pco_pa, scx_root_pa,
-                // page_offset_base_pa) into an out-of-DRAM address;
-                // every subsequent monitor read returns 0 and
-                // `data_valid` never latches. The guest-reported-
-                // phys_base wait below closes the window: by the time
-                // SYS_RDY fires the BSP has been in the run loop for
-                // hundreds of ms in steady state, so the vast
-                // majority of paths resolve on the first poll. Its
-                // bounded budget (30 iterations x 100 ms = 3 s) handles
-                // the pathological case where neither the guest-
-                // reported value nor the cr3-derived resolve ever
-                // returns (early-boot crash, kill before first
-                // iteration); in that case `phys_base` falls back to 0
-                // and the downstream `data_valid` gate keeps every
-                // walk safe.
-                // Wait for guest-reported phys_base. The guest
-                // reads it from /proc/iomem and writes
-                // `phys_base + 1` (biased +1 so the AtomicU64's
-                // initial 0 means "not yet received") to
-                // `/dev/vport0p2`; the host's virtio-console MMIO
-                // handler captures the value inline on the vCPU
-                // thread, independently of the TLV bulk port and the
-                // freeze coordinator's iter1 vmlinux load. The 3 s
-                // budget gives the kernel virtio_console driver time
-                // to complete its multiport handshake under cold-
-                // cache boots; on the fast path the value is already
-                // visible by the time SYS_RDY fires. No KASLR/PTI
-                // page-table walking is needed.
+                // Resolve the guest kernel's `phys_base` (the physical
+                // KASLR load displacement; 0 on non-KASLR boots), used to
+                // derive every kernel-text PA the monitor reads. Sourced
+                // from the guest's authoritative KERN_ADDRS publish, with
+                // a plausibility-gated CR3 page-table walk only as a last
+                // resort — see the inner comments for why the walk is not
+                // the primary path.
                 let phys_base = {
                     let mut pb = 0u64;
                     let pb_fd = {
@@ -10803,7 +11538,24 @@ impl KtstrVm {
                         use std::os::unix::io::AsRawFd;
                         kill_evt_clone.as_raw_fd()
                     };
-                    for _ in 0..30 {
+                    // Wait, event-driven, for the guest's AUTHORITATIVE phys_base.
+                    // rust_init (PID 1) reads it from /proc/iomem and publishes it
+                    // over KERN_ADDRS very early and ALWAYS (0 for a non-KASLR
+                    // kernel, the physical KASLR displacement otherwise), biased
+                    // by +1 into `kern_phys_base_shared` with a `kern_phys_base_evt`
+                    // signal. Block on that eventfd (waking the instant it lands,
+                    // kill-escapable) rather than racing an unreliable CR3
+                    // page-table walk: on a slow/cold boot the walk hits an
+                    // early/stale CR3 or an unpopulated page and reads GARBAGE
+                    // which, latched once into every text-mapped PA, leaves
+                    // data_valid unlatched so NO event_counters / schedstat / scx
+                    // state is captured for the whole run. The ~10s bound is only a
+                    // safety net for the guest-never-published case; warm boots
+                    // wake on the first iteration, and scx_root stays set for the
+                    // full stall-watchdog window (~20s+) so even a slow publish
+                    // leaves ample sampling overlap.
+                    let mut guest_published = false;
+                    for _ in 0..100 {
                         if kill_clone.load(std::sync::atomic::Ordering::Acquire) {
                             break;
                         }
@@ -10812,8 +11564,24 @@ impl KtstrVm {
                         );
                         if biased != 0 {
                             pb = biased.wrapping_sub(1);
+                            guest_published = true;
                             break;
                         }
+                        let mut pfds = [
+                            libc::pollfd { fd: pb_fd, events: libc::POLLIN, revents: 0 },
+                            libc::pollfd { fd: kill_fd, events: libc::POLLIN, revents: 0 },
+                        ];
+                        unsafe { libc::poll(pfds.as_mut_ptr(), 2, 100) };
+                    }
+                    // Last resort: the guest never published (channel failure /
+                    // early crash). Fall back to the CR3 page-table walk, but
+                    // accept its result ONLY if it is a plausible x86_64 KASLR
+                    // phys_base — non-zero, inside guest DRAM, and
+                    // CONFIG_PHYSICAL_ALIGN (2 MiB) aligned — never the high-half /
+                    // unaligned garbage a stale-CR3 walk can return.
+                    if !guest_published
+                        && !kill_clone.load(std::sync::atomic::Ordering::Acquire)
+                    {
                         let cr3_val = cr3.load(std::sync::atomic::Ordering::Acquire);
                         if cr3_val != 0 {
                             let l5 = monitor::symbols::resolve_pgtable_l5(
@@ -10822,16 +11590,11 @@ impl KtstrVm {
                             if let Some(v) = monitor::symbols::resolve_phys_base(
                                 &mem, &symbols, cr3_val, l5, tcr_el1_value,
                             )
-                                && v != 0 {
-                                    pb = v;
-                                    break;
-                                }
+                                && monitor::symbols::plausible_cr3_phys_base(v, mem.size())
+                            {
+                                pb = v;
+                            }
                         }
-                        let mut pfds = [
-                            libc::pollfd { fd: pb_fd, events: libc::POLLIN, revents: 0 },
-                            libc::pollfd { fd: kill_fd, events: libc::POLLIN, revents: 0 },
-                        ];
-                        unsafe { libc::poll(pfds.as_mut_ptr(), 2, 100) };
                     }
                     pb
                 };
@@ -10880,6 +11643,7 @@ impl KtstrVm {
                         page_offset: 0,
                         preemption_threshold_ns,
                         boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
+                        scx_event_counters_supported,
                     };
                 }
 
@@ -10980,6 +11744,7 @@ impl KtstrVm {
                         page_offset: 0,
                         preemption_threshold_ns,
                         boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
+                        scx_event_counters_supported,
                     };
                 }
 
@@ -11080,21 +11845,23 @@ impl KtstrVm {
                         .unwrap_or(0),
                 )
                 .unwrap_or(start_kernel_map_for_thread);
-                // Use the live BSP CR3 directly (it's already a PA;
-                // no `phys_base`-dependent translation needed). When
-                // the retry above timed out without observing a
-                // non-zero CR3, fall back to the text-symbol
-                // translation of `init_top_pgt` — historical
-                // behaviour, correct on non-KASLR boots. The earlier
-                // post-sys_rdy retry has already waited up to 500 ms
-                // for `cr3_cache` to land (warning if it didn't), so
-                // a second `cr3.load` here would observe the same
-                // value and the post-wait `resolve_phys_base` /
-                // `cr3_pa` derivations are folded back onto the
-                // pre-wait `cr3_value` / `phys_base` directly.
+                // Use the live BSP CR3 directly (it's already a PA; no
+                // `phys_base`-dependent translation needed): re-read
+                // `cr3_cache` here and strip its control bits. When the BSP
+                // never published a non-zero CR3, fall back to
+                // text-translating `init_top_pgt` — historical behaviour,
+                // correct on non-KASLR boots — using the `phys_base` the
+                // evented guest-publish loop above already resolved (with a
+                // plausibility-gated CR3 walk as its last resort).
                 let cr3_latest = cr3.load(std::sync::atomic::Ordering::Acquire);
                 let cr3_pa = if cr3_latest != 0 {
-                    cr3_latest & !0x1FFFu64
+                    // Strip only the CR3 control bits [11:0] (CR3_ADDR_MASK):
+                    // the guest boots mitigations=off (KPTI/PTI disabled) so
+                    // bit 12 is a real pgd-PA bit, NOT the PTI user-pgd
+                    // selector — clearing it corrupts pgd PAs that are odd
+                    // 4 KiB multiples. Mirrors guest.rs walk_cr3 +
+                    // resolve_phys_base's first (`& !0xFFF`) attempt.
+                    cr3_latest & !0xFFFu64
                 } else {
                     monitor::symbols::text_kva_to_pa_with_base(
                         symbols.init_top_pgt.unwrap_or(0),
@@ -11124,6 +11891,7 @@ impl KtstrVm {
                         page_offset: 0,
                         preemption_threshold_ns,
                         boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
+                        scx_event_counters_supported,
                     };
                 }
                 // aarch64 TCR_EL1 (granule + T1SZ) for the
@@ -11182,6 +11950,7 @@ impl KtstrVm {
                         offsets: prog_offsets,
                         start_kernel_map: start_kernel_map_post_wait,
                         phys_base,
+                        cr3: cr3.clone(),
                     })
                 });
 
@@ -11202,6 +11971,7 @@ impl KtstrVm {
                         page_offset: 0,
                         preemption_threshold_ns,
                         boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
+                        scx_event_counters_supported,
                     };
                 }
 
@@ -11222,6 +11992,34 @@ impl KtstrVm {
                         reset_ns: watchdog_reset_ns.as_ref(),
                     },
                 );
+                // Named-BPF-map watch config: present only when the test
+                // declared targets AND the BPF-prog offsets + `prog_idr`
+                // resolved (both required for the active-scheduler obj-prefix
+                // walk that keys the metrics). The watcher lazily builds a
+                // guest-memory accessor + reads each target per tick.
+                let watch_cfg = if watch_targets.is_empty() {
+                    None
+                } else {
+                    match (watch_prog_offsets, symbols.prog_idr) {
+                        (Some(prog_offsets), Some(prog_idr_kva)) => {
+                            Some(monitor::reader::WatchBpfMapsCfg {
+                                targets: watch_targets,
+                                mem: Arc::clone(&mem),
+                                vmlinux: vmlinux.clone(),
+                                vmlinux_data: Arc::clone(&vmlinux_data_arc),
+                                base_btf: Arc::clone(&btf),
+                                cr3_pa,
+                                cr3: cr3.clone(),
+                                tcr_el1: tcr_el1_val,
+                                l5,
+                                prog_idr_kva,
+                                prog_offsets,
+                                num_cpus,
+                            })
+                        }
+                        _ => None,
+                    }
+                };
                 let mon_cfg = monitor::reader::MonitorConfig {
                     // `event_pcpu_pas` left `None` here: the loop
                     // recomputes it each iteration via
@@ -11244,7 +12042,27 @@ impl KtstrVm {
                     start_kernel_map: start_kernel_map_post_wait,
                     phys_base,
                     rq_refresh: Some(&rq_refresh),
+                    // Enable the system-wide PSI-irq host-walk only when BOTH
+                    // the psi_group offsets (config on) and the psi_system
+                    // symbol resolve; else the loop emits no psi_irq sample.
+                    // `psi_system` is a kernel-image `.data` global, so its PA
+                    // is text-mapped once here (`text_kva_to_pa_with_base`,
+                    // mirroring `jiffies_64_pa` / `scx_root_pa_for_reset`) — not
+                    // per-sample. `start_kernel_map_post_wait` / `phys_base` are
+                    // the same bases `MonitorConfig::start_kernel_map` /
+                    // `phys_base` carry below.
+                    psi: psi_offsets.zip(symbols.psi_system).map(|(offsets, kva)| {
+                        monitor::reader::PsiCaptureCfg {
+                            offsets,
+                            psi_system_pa: monitor::symbols::text_kva_to_pa_with_base(
+                                kva,
+                                start_kernel_map_post_wait,
+                                phys_base,
+                            ),
+                        }
+                    }),
                     watchdog_reset: watchdog_reset_cfg,
+                    watch_bpf_maps: watch_cfg.as_ref(),
                 };
                 // `rq_pas` empty: the loop sources every per-CPU
                 // PA from `rq_refresh` per iteration so the static
@@ -11263,6 +12081,11 @@ impl KtstrVm {
                 // not inside monitor_loop (cfg.sys_rdy is None), so stamp
                 // the captured outcome onto the result here.
                 __mlr.boot_wait_outcome = boot_wait_outcome;
+                // Likewise the event-counter capability was decided from
+                // the `KernelOffsets` this closure owns, not inside
+                // monitor_loop; stamp it onto the result here so it
+                // survives to `MonitorReport`.
+                __mlr.scx_event_counters_supported = scx_event_counters_supported;
                 __mlr
             })
             .context("spawn monitor thread")?;
@@ -11274,18 +12097,20 @@ impl KtstrVm {
     ///
     /// Event-driven sequence:
     /// 1. Poll `BpfMapAccessorOwned::new` until kernel page tables are up
-    /// 2. Poll `find_map` until the scheduler's BPF maps are discoverable
+    /// 2. Poll for an ARRAY map whose program BTF resolves the requested
+    ///    field (disambiguates same-suffix `.bss` maps)
     /// 3. Write each queued value, then push `SIGNAL_BPF_WRITE_DONE`
     ///    through virtio-console RX so the guest's `hvc0_poll_loop`
     ///    sets the `bpf_map_write_done` latch; the scenario's
     ///    `wait_for_map_write` gate (`Ctx::wait_for_map_write=true`)
     ///    blocks on that latch until this thread fires.
     ///
-    /// `probes_ready_evt` is the broadcast EventFd shared with the
-    /// monitor thread (see `run_vm`); each phase below `poll`s it
-    /// instead of bare-sleeping, and writes 1 to it on detection so
-    /// the monitor (and any future waiter) wakes immediately to
-    /// re-check its own readiness condition.
+    /// `probes_ready_evt` is the EventFd created in `run_vm` and moved in
+    /// here — this thread is its sole consumer, so it is not cloned. Phase 1
+    /// polls it as a 200 ms backoff and both phases write it on success;
+    /// phase 2's retry backoff polls `kill_evt` instead, because the fd
+    /// stays level-high once written and re-polling it would spin. The
+    /// success-writes wake no other consumer.
     ///
     /// `virtio_con` is the shared virtio-console device used to push
     /// the host→guest wake byte after the writes land. Replaces the
@@ -11295,6 +12120,7 @@ impl KtstrVm {
         &self,
         vm: &kvm::KtstrKvm,
         kill: &Arc<AtomicBool>,
+        kill_evt: &Arc<EventFd>,
         probes_ready_evt: EventFd,
         tcr_el1: Option<Arc<std::sync::atomic::AtomicU64>>,
         cr3: Arc<std::sync::atomic::AtomicU64>,
@@ -11334,6 +12160,7 @@ impl KtstrVm {
             }
         };
         let kill_clone = kill.clone();
+        let kill_evt_clone = kill_evt.clone();
         let writes = self.bpf_map_writes.clone();
 
         let handle = std::thread::Builder::new()
@@ -11346,17 +12173,17 @@ impl KtstrVm {
 
                 // Phase 1: wait for BPF map accessor (kernel booted, page tables up).
                 //
-                // Sleeping is replaced by `poll(POLLIN)` against the
-                // shared `probes_ready_evt`: ANY waiter that detects
-                // its own readiness condition writes 1 to the eventfd
-                // and the level stays high (we never `read` here), so
-                // this loop wakes immediately on a sibling detection
-                // and re-tries the accessor construction. The 200 ms
-                // timeout preserves the prior cadence as an upper
-                // bound for kill / deadline observation when no other
-                // detector has fired yet. On successful construction
-                // we write 1 ourselves, fanning the wake out to the
-                // monitor and the later phases.
+                // Sleeping is replaced by `poll(POLLIN)` against
+                // `probes_ready_evt` as a 200 ms-bounded backoff. No
+                // sibling writes the fd before this phase succeeds (the
+                // monitor holds an unused clone; phase 2 polls `kill_evt`),
+                // so in practice it is level-low here and each poll blocks
+                // the full 200 ms — the bound is the upper limit for kill /
+                // deadline observation while the accessor is still
+                // unbuildable. On successful construction we write 1,
+                // leaving the fd level-high — but no later phase polls it
+                // (phase 2 backs off on `kill_evt`; phase 3 never polls it),
+                // so the write wakes no consumer.
                 let vmlinux_data_arc = match super::vmlinux::cached_vmlinux_bytes(&vmlinux) {
                     Some(d) => d,
                     None => {
@@ -11407,53 +12234,124 @@ impl KtstrVm {
                         }
                     }
                 };
-                let accessor = owned.as_accessor();
-
                 // Phase 2: resolve every queued map before signaling the
                 // guest. All-or-nothing: if any map fails to resolve
                 // within the deadline, the thread aborts without
-                // signaling slot 0. The guest then proceeds under its
+                // signaling the guest. The guest then proceeds under its
                 // own timeout rather than observing a partial setup.
                 // Running writes serially against partially-resolved
                 // maps would let a late-discovery failure leave the
-                // guest blocked waiting for slot 0 with no way to
+                // guest blocked in `wait_for_map_write` with no way to
                 // recover.
                 //
-                // Same `poll(POLLIN)` pattern as phase 1: wake on a
-                // sibling detection, fall back to the 200 ms cadence
-                // for kill / deadline coverage; write 1 on each
-                // successful map resolution to fan the wake out to
-                // the monitor and the still-pending phases.
+                // The retry backoff below polls `kill_evt`, NOT
+                // `probes_ready_evt` as phase 1 does: once any producer
+                // writes `probes_ready_evt` it stays level-high (never
+                // `read`), so polling it would return instantly and spin
+                // the per-iteration accessor rebind (see the backoff
+                // comment below). The success-write to `probes_ready_evt`
+                // at each resolution is retained but wakes no consumer
+                // today — the monitor holds an unused clone (see
+                // `start_monitor`).
+                // Parse the host vmlinux BTF once as the split-BTF base for the
+                // per-map program-BTF loads below. A scheduler's `.bss` globals
+                // live in its PROGRAM BTF (split on vmlinux); resolving the
+                // field NAME against that BTF yields the byte offset the
+                // compiler placed the var at, instead of a padding-fragile
+                // hardcoded constant. Mirrors the monitor read path
+                // (`monitor::reader` -> `resolve_map_field_offset_width`).
+                // Without a base BTF no field can resolve — abort (the guest
+                // proceeds under its own `wait_for_map_write` timeout, the same
+                // contract as a map-not-found abort below).
+                let base_btf = match monitor::btf_offsets::load_btf_from_elf(
+                    &vmlinux_elf,
+                    vmlinux_data,
+                    &vmlinux,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!(
+                            "bpf_map_write: vmlinux BTF parse failed, no field can resolve: {e:#}"
+                        );
+                        return;
+                    }
+                };
                 let retry_deadline =
                     std::time::Instant::now() + std::time::Duration::from_secs(30);
-                let mut resolved: Vec<(BpfMapWriteParams, monitor::bpf_map::BpfMapInfo)> =
+                let mut resolved: Vec<(BpfMapWriteParams, monitor::bpf_map::BpfMapInfo, usize, usize)> =
                     Vec::with_capacity(writes.len());
                 for params in writes.iter() {
                     let mut attempt = 0u32;
-                    let map_info = loop {
+                    // Multiple ARRAY maps can share a `.bss` suffix — the
+                    // scheduler's `bpf_bpf.bss` and the probe's `probe_bp.bss`
+                    // both end in `.bss` — so bind the map whose program BTF
+                    // actually RESOLVES the requested field, not the first by
+                    // IDR order. The read path's `pick_live_map` disambiguates
+                    // same-suffix maps by used-maps KVA identity; here we
+                    // disambiguate by which map's BTF resolves the field — a
+                    // different mechanism, sound because `crash`/`stall` are
+                    // unique to the single live scheduler. Retry until that map
+                    // appears (the scheduler may still be attaching), rebinding
+                    // a fresh accessor each iteration: within a SINGLE
+                    // accessor, `maps()` snapshots the map IDR once and caches
+                    // it (the per-accessor `maps_cache` is not invalidated on
+                    // later `maps()` calls), so a map created after that first
+                    // snapshot stays invisible to a REUSED accessor. Building
+                    // a fresh `as_accessor()` per iteration starts an empty
+                    // cache that re-walks the live IDR — do NOT hoist
+                    // `as_accessor()` out of this loop.
+                    let (map_info, offset, width) = loop {
                         attempt += 1;
-                        if let Some(info) = accessor.find_array_map(&params.map_name_suffix) {
+                        let accessor = owned.as_accessor();
+                        let hit = accessor.maps().into_iter().find_map(|m| {
+                            if m.map_type != monitor::bpf_map::BPF_MAP_TYPE_ARRAY
+                                || !m.name().ends_with(&params.map_name_suffix)
+                            {
+                                return None;
+                            }
+                            let prog_btf = accessor.load_program_btf(&m, &base_btf);
+                            let btf = prog_btf.as_ref().unwrap_or(&base_btf);
+                            monitor::btf_offsets::resolve_map_field_offset_width(
+                                btf,
+                                m.btf_value_type_id,
+                                &params.field,
+                            )
+                            .map(|(off, w)| (m, off, w))
+                        });
+                        if let Some(hit) = hit {
                             let _ = probes_ready_evt.write(1);
-                            break info;
+                            break hit;
                         }
                         if kill_clone.load(Ordering::Acquire) {
-                            eprintln!("bpf_map_write: VM exited during map search");
+                            eprintln!("bpf_map_write: VM exited during map/field search");
                             return;
                         }
                         if std::time::Instant::now() >= retry_deadline {
                             eprintln!(
-                                "bpf_map_write: map *{} not found after {} attempts",
-                                params.map_name_suffix, attempt,
+                                "bpf_map_write: field '{}' unresolved in any '{}' map after {} attempts",
+                                params.field, params.map_name_suffix, attempt,
                             );
                             return;
                         }
-                        poll_eventfd_until_ready_or_timeout(&probes_ready_evt, 200);
+                        // Back off ~200 ms before re-walking the IDR, waking
+                        // early on kill. Poll `kill_evt` rather than the shared,
+                        // never-drained `probes_ready_evt` (which stays
+                        // level-high once any producer writes it, so polling it
+                        // returns instantly and would spin the per-iteration
+                        // accessor rebind — an uncached IDR walk + program-BTF
+                        // reparse against guest memory — at max rate). `kill_evt`
+                        // is low until VM teardown, so this blocks the full
+                        // timeout during a normal scheduler attach and wakes
+                        // immediately on kill; the `kill_clone` load above is
+                        // the authoritative exit (the eventfd is a best-effort
+                        // wake, matching the other freeze-coord worker loops).
+                        poll_eventfd_until_ready_or_timeout(&kill_evt_clone, 200);
                     };
                     eprintln!(
-                        "bpf_map_write: map '{}' found after {} attempts",
-                        map_info.name(), attempt,
+                        "bpf_map_write: field '{}' resolved to map '{}' off={} width={} after {} attempts",
+                        params.field, map_info.name(), offset, width, attempt,
                     );
-                    resolved.push((params.clone(), map_info));
+                    resolved.push((params.clone(), map_info, offset, width));
                 }
 
                 // Phase 3: run every queued write.
@@ -11464,6 +12362,13 @@ impl KtstrVm {
                 // signal-slot infrastructure. The writes now race
                 // against probe attachment; replacing the rendezvous
                 // with a virtio-console signal is a follow-up.
+
+                // Rebind a fresh accessor for the writes. As in the retry
+                // loop, `maps()`/`load_program_btf` snapshot the map IDR once
+                // per accessor, so a reused one could carry a stale snapshot;
+                // `read`/`write_value_u32` below address each map by the
+                // `BpfMapInfo` captured in phase 2, so any live accessor works.
+                let accessor = owned.as_accessor();
 
                 // Log all maps for diagnostic visibility.
                 let all_maps = accessor.maps();
@@ -11477,13 +12382,35 @@ impl KtstrVm {
                         .join(", "),
                 );
 
-                for (params, map_info) in &resolved {
-                    let before = accessor.read_value_u32(map_info, params.offset);
-                    let ok = accessor.write_value_u32(map_info, params.offset, params.value);
-                    let after = accessor.read_value_u32(map_info, params.offset);
+                for (params, map_info, offset, width) in &resolved {
+                    // `write_value_u32` is a fixed 4-byte store; a field of a
+                    // different width would truncate or clobber adjacent bytes.
+                    // crash/stall are `volatile int` (4 bytes) — skip loudly
+                    // rather than silently mis-write any non-4-byte field (the
+                    // `BpfMapWrite` value is a `u32`). NOTE: a skipped write
+                    // still lets `request_bpf_map_write_done` fire below
+                    // (signalling the guest all writes completed). This
+                    // asymmetry vs phase 2's all-or-nothing resolution abort
+                    // is deliberate: phase 2 aborts BEFORE signalling because
+                    // it cannot proceed, whereas here the map/field DID
+                    // resolve — withholding the signal would hang the guest in
+                    // `wait_for_map_write` with no recovery, so a loud skip +
+                    // a completed handshake is preferred. Unreachable for the
+                    // 4-byte crash/stall fields today; the eprintln surfaces
+                    // it if a future non-4-byte field is queued.
+                    if *width != 4 {
+                        eprintln!(
+                            "bpf_map_write: field '{}' width {} != 4 in map '{}' — skipping (value is u32)",
+                            params.field, width, map_info.name(),
+                        );
+                        continue;
+                    }
+                    let before = accessor.read_value_u32(map_info, *offset);
+                    let ok = accessor.write_value_u32(map_info, *offset, params.value);
+                    let after = accessor.read_value_u32(map_info, *offset);
                     eprintln!(
-                        "bpf_map_write: map '{}' write={} (value={} offset={} before={:?} after={:?})",
-                        map_info.name(), ok, params.value, params.offset, before, after,
+                        "bpf_map_write: map '{}' field '{}' off={} write={} (value={} before={:?} after={:?})",
+                        map_info.name(), params.field, offset, ok, params.value, before, after,
                     );
                 }
 
@@ -11564,6 +12491,7 @@ impl KtstrVm {
         virtio_blk: Option<&Arc<PiMutex<virtio_blk::VirtioBlk>>>,
         virtio_net: Option<&Arc<PiMutex<virtio_net::VirtioNet>>>,
         ioapic: Option<&Arc<crate::vmm::IoapicHandle>>,
+        pci_bus: Option<&Arc<PiMutex<crate::vmm::pci::PciBus>>>,
         kill: &Arc<AtomicBool>,
         freeze: &Arc<AtomicBool>,
         watchpoint: &Arc<WatchpointArm>,
@@ -11854,6 +12782,7 @@ impl KtstrVm {
                         virtio_blk.map(|a| a.as_ref()),
                         virtio_net.map(|a| a.as_ref()),
                         ioapic.map(|a| a.as_ref()),
+                        pci_bus.map(|a| a.as_ref()),
                         &mut exit,
                     ) {
                         Some(ExitAction::Continue) | None => {}
@@ -12113,6 +13042,7 @@ impl KtstrVm {
                     page_offset,
                     preemption_threshold_ns,
                     boot_wait_outcome,
+                    scx_event_counters_supported,
                 }) => {
                     // `preemption_threshold_ns` was resolved once
                     // inside `start_monitor` (and threaded through
@@ -12135,6 +13065,7 @@ impl KtstrVm {
                         watchdog_observation,
                         page_offset,
                         boot_wait_outcome,
+                        scx_event_counters_supported,
                     };
                     (Some(report), drain)
                 }
@@ -12380,6 +13311,10 @@ impl KtstrVm {
             success: !timed_out && exit_code == 0,
             vcpus: self.vcpus,
             cpu_budget: self.effective_cpu_budget,
+            // Stamped None here; the host eval layer
+            // (run_ktstr_test_inner_impl) sets the scheduler's discovery
+            // path post-run. The VM run does not resolve the binary.
+            resolve_source: None,
             // Default false at construction — set true (when applicable)
             // by the eval-layer inversion site that runs AFTER
             // evaluate_vm_result, preserving the original success +
@@ -12417,7 +13352,9 @@ impl KtstrVm {
             // dumps, watchdog timeouts, and the normal exit path
             // all see fully-up-to-date counters.
             virtio_blk_counters: run.virtio_blk_counters.as_deref().map(|c| c.snapshot()),
-            virtio_net_counters: run.virtio_net_counters.as_deref().map(|c| c.snapshot()),
+            virtio_net_counters: virtio_net::VirtioNetCountersSnapshot::aggregate(
+                run.virtio_net_counters.iter().map(|c| c.snapshot()),
+            ),
             snapshot_bridge: run.snapshot_bridge,
             stats_client,
             periodic_fired: run.periodic_fired,
@@ -12438,6 +13375,10 @@ impl KtstrVm {
             // Leaving it `None` here is correct; the eval-layer
             // stamping happens before any post_vm callback runs.
             entry_name: None,
+            // Variant hash stamped by the eval layer (eval/mod.rs) after
+            // vm.run() returns, alongside entry_name; freeze_coord is
+            // entry-agnostic, so `0` here is correct and overwritten.
+            variant_hash: 0,
             // Empty cache: the single bridge drain is deferred to the
             // first `captures_series()` call on the host (post_vm or
             // evaluate_vm_result). See the `periodic_series_cache`
@@ -12651,6 +13592,84 @@ mod exit_kind_warrants_dump_tests {
         // None = the exit_kind KVA no longer translates (scheduler torn
         // down); there is no state to capture, so suppress.
         assert!(!exit_kind_warrants_dump(None));
+    }
+}
+
+#[cfg(test)]
+mod wprof_grace_tests {
+    //! Unit coverage for the wprof-ship grace predicates the
+    //! coordinator's error-exit grace relies on: [`is_wprof_ship_frame`]
+    //! (which drained frame ends the grace), [`is_sched_exit_frame`]
+    //! (which drained frame ARMS the grace on a wprof run), and
+    //! [`wprof_grace_should_kill`] (the bounded deadline backstop).
+    use super::{is_sched_exit_frame, is_wprof_ship_frame, wprof_grace_should_kill};
+    use crate::vmm::bulk::BulkMessage;
+    use crate::vmm::wire::{MSG_TYPE_SCHED_EXIT, MSG_TYPE_WPROF_TRACE};
+    use std::time::{Duration, Instant};
+
+    fn frame(msg_type: u32, payload: &[u8], crc_ok: bool) -> BulkMessage {
+        BulkMessage {
+            msg_type,
+            payload: payload.to_vec().into(),
+            crc_ok,
+        }
+    }
+
+    #[test]
+    fn is_wprof_ship_frame_accepts_only_valid_nonempty_wprof() {
+        assert!(
+            is_wprof_ship_frame(&frame(MSG_TYPE_WPROF_TRACE, b"pb", true)),
+            "a crc-valid non-empty WprofTrace IS the ship"
+        );
+        assert!(
+            !is_wprof_ship_frame(&frame(MSG_TYPE_WPROF_TRACE, b"pb", false)),
+            "torn CRC must not end the grace — a garbled/hostile frame is not the ship"
+        );
+        assert!(
+            !is_wprof_ship_frame(&frame(MSG_TYPE_WPROF_TRACE, b"", true)),
+            "empty payload carries no trace — not the ship"
+        );
+        assert!(
+            !is_wprof_ship_frame(&frame(MSG_TYPE_SCHED_EXIT, b"x", true)),
+            "a SchedExit is not the ship — it must not terminate the grace early"
+        );
+    }
+
+    #[test]
+    fn is_sched_exit_frame_accepts_only_crc_valid_sched_exit() {
+        assert!(
+            is_sched_exit_frame(&frame(MSG_TYPE_SCHED_EXIT, b"\0\0\0\0", true)),
+            "a crc-valid SCHED_EXIT arms the grace on a wprof run"
+        );
+        assert!(
+            !is_sched_exit_frame(&frame(MSG_TYPE_SCHED_EXIT, b"\0\0\0\0", false)),
+            "torn CRC must not arm the grace — a garbled/hostile frame is not a SCHED_EXIT"
+        );
+        assert!(
+            !is_sched_exit_frame(&frame(MSG_TYPE_WPROF_TRACE, b"pb", true)),
+            "a WprofTrace is not a SCHED_EXIT"
+        );
+    }
+
+    #[test]
+    fn wprof_grace_should_kill_only_on_expired_armed_deadline() {
+        let now = Instant::now();
+        assert!(
+            !wprof_grace_should_kill(None, now),
+            "no grace armed => never kill"
+        );
+        assert!(
+            !wprof_grace_should_kill(Some(now + Duration::from_secs(30)), now),
+            "future deadline => hold the grace open"
+        );
+        assert!(
+            wprof_grace_should_kill(Some(now - Duration::from_millis(1)), now),
+            "expired deadline => kill (bounded fallback)"
+        );
+        assert!(
+            wprof_grace_should_kill(Some(now), now),
+            "deadline exactly now => kill (inclusive >= boundary)"
+        );
     }
 }
 

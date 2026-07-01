@@ -82,6 +82,24 @@
 
 mod device;
 
+// virtio-MMIO transport facade for `VirtioNet` (decode-only; drives the
+// transport-neutral core API in `device`). A sibling submodule so it
+// reaches device state ONLY through the `pub(crate)` semantic methods,
+// never the private fields.
+mod mmio;
+
+// virtio-pci-modern transport facade: presents the device as a PCI function
+// (config space + vendor caps + BAR regions) driving the same core API. The
+// generic PCI primitives live in `crate::vmm::pci`; this is the virtio-net
+// glue that maps the BAR sub-regions to the core ops.
+// The facade is x86_64-only functionality: it compiles on all arches (it needs
+// only the arch-neutral PciBus + virtio_msix, and its compilation keeps the
+// shared PCI config-space helpers live) but is wired into a PciBus only on
+// x86_64, so on aarch64 the whole module is unused — allow that there. x86_64
+// still lints it fully (the allow is gated to non-x86).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+mod pci;
+
 mod counters;
 
 #[cfg(test)]
@@ -112,3 +130,9 @@ pub(crate) use device::*;
 // path for upstream re-exports (vmm/mod.rs, lib.rs).
 pub use counters::{VirtioNetCounters, VirtioNetCountersSnapshot};
 pub use device::{VIRTIO_MMIO_SIZE, VirtioNet};
+// The virtio-pci function wrapper — setup installs it into the PciBus on x86_64.
+// The facade compiles on all arches (it needs only the arch-neutral PciBus +
+// virtio_msix), but nothing installs it on aarch64 (no PCI), so the re-export is
+// unused there.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_imports))]
+pub(crate) use pci::VirtioNetPci;

@@ -7,6 +7,7 @@
 tests/*/target/
 tests/*/Cargo.lock
 *.profraw
+/lcov.info
 doc/guide/book/
 .build-cache/
 *.swp

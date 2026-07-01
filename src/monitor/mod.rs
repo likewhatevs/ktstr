@@ -21,7 +21,7 @@ pub mod bpf_syscall;
 pub mod btf_offsets;
 pub mod btf_render;
 pub(crate) mod cast_analysis;
-pub mod debug_capture;
+pub mod cgroup_walk;
 pub mod dmesg_scx;
 pub mod dump;
 pub mod guest;
@@ -30,7 +30,6 @@ pub(crate) mod kva_io;
 pub mod live_host_kernel;
 pub mod perf_counters;
 pub mod reader;
-pub mod reproducer_gen;
 pub mod runnable_scan;
 pub mod scx_static_alloc;
 pub mod scx_walker;
@@ -290,7 +289,7 @@ pub fn find_test_vmlinux() -> Option<std::path::PathBuf> {
             // `resolve_btf(None)` still tries the local-tree / sysfs
             // fallbacks — a test running with a stale env pointer
             // shouldn't be any worse off than a test with no env set.
-            crate::cli::resolve_cached_kernel(&id, "ktstr test")
+            crate::cli::resolve_cached_kernel(&id, "ktstr test", None)
                 .ok()
                 .and_then(|p| p.into_os_string().into_string().ok())
         }
@@ -379,6 +378,22 @@ pub struct MonitorReport {
     #[doc(hidden)]
     #[serde(default)]
     pub boot_wait_outcome: BootWaitOutcome,
+    /// Whether the running guest kernel structurally supports the
+    /// `SCX_EV_*` sched_ext event counters, decided by whether the
+    /// monitor resolved their BTF offsets (`event_offsets.is_some()`).
+    /// The counters — and the `struct scx_sched` / `scx_root` machinery
+    /// the monitor walks to reach them — are a 6.16-cycle addition, so a
+    /// kernel older than 6.16 (e.g. 6.14) resolves no offsets and this
+    /// is `false`. A BTF-capability probe rather than a version compare,
+    /// so it stays correct across backports. `false` means "no event
+    /// counters exist to capture"; `true` means the kernel exposes them,
+    /// so an empty `event_counters` across the whole run is a capture
+    /// regression rather than an absent feature. Event-counter
+    /// regression tests skip when this is `false` and assert only when
+    /// it is `true`.
+    #[doc(hidden)]
+    #[serde(default)]
+    pub scx_event_counters_supported: bool,
 }
 
 /// Observation of the `scx_sched.watchdog_timeout` override,
@@ -446,15 +461,93 @@ pub struct MonitorSample {
     /// None when no struct_ops programs are loaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prog_stats: Option<Vec<bpf_prog::ProgRuntimeStats>>,
+    /// System-wide PSI-irq pressure at this sample, host-walked from
+    /// the global `psi_system` (the cgroup-hierarchy root — system-wide, the
+    /// `/proc/pressure/irq` framing; per-cgroup IRQ pressure is a separate
+    /// axis). `None` when `psi_system` / `PSI_IRQ_FULL` is absent
+    /// (`CONFIG_IRQ_TIME_ACCOUNTING` off) — loud-absent. Raw kernel values;
+    /// decoded at the [`MonitorSummary`] fold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psi_irq: Option<PsiIrqSample>,
+    /// Watched scheduler BPF-map fields read at this sample (one entry per
+    /// declared [`crate::test_support::WatchBpfMap`] target that has resolved).
+    /// Empty until the scheduler attaches and its maps appear (lazy
+    /// resolution) and when no targets are declared. Folded run-level at
+    /// [`MonitorSummary`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bpf_map_fields: Vec<BpfMapFieldSample>,
+}
+
+/// System-wide PSI-irq pressure read from `psi_system` at one monitor sample.
+/// RAW kernel values, decoded at the [`MonitorSummary`] fold via
+/// [`crate::monitor::btf_offsets::decode_avg10_percent`] /
+/// [`crate::monitor::btf_offsets::decode_total_us`]: the run-level
+/// `psi_irq_full_avg10` is the mean of the decoded `avg10` (Gauge), and
+/// `total_irq_pressure_us` is the end-start delta of the decoded `total`
+/// (Counter).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct PsiIrqSample {
+    /// Raw `psi_system.avg[PSI_IRQ_FULL][0]` — the 10s EWMA in fixed-point
+    /// (percent × `FIXED_1`=2048); decode via `decode_avg10_percent`.
+    pub avg10_raw: u64,
+    /// Raw `psi_system.total[PSI_AVGS][PSI_IRQ_FULL]` — cumulative IRQ stall
+    /// ns; the run-level metric is its end-start delta (decode via
+    /// `decode_total_us`).
+    pub total_ns: u64,
+}
+
+/// One watched scheduler BPF-map field ([`crate::test_support::WatchBpfMap`])
+/// captured at a single monitor sample, read observer-effect-free (the live
+/// host reads the running guest's map memory; no VM freeze). Values are
+/// decoded to `f64` at read time (the field's BTF width — u16/u32 — is
+/// resolved once when the map first appears). Exactly one of `scalar` /
+/// `per_cpu` is `Some`, matching the target's [`crate::test_support::BpfMapAgg`].
+/// Folded run-level at [`MonitorSummary`]: a gauge `scalar` -> mean across
+/// reporting samples; a counter `scalar` (`scalar_counter`) -> the value at
+/// the last reporting sample; a gauge `per_cpu` -> cross-(CPU, sample) mean
+/// (`_avg`) + spatial max (`_max`); a counter `per_cpu` (`per_cpu_counter`)
+/// -> the cross-CPU SUM at the last reporting sample (one key, the total).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BpfMapFieldSample {
+    /// Final metric-key base `<scheduler-obj>_<label>` (e.g.
+    /// `scx_lavd_lat_headroom`). The fold appends `_avg`/`_max` for per-CPU;
+    /// scalar uses the base verbatim.
+    pub key_base: String,
+    /// Scalar field value (a `.bss` global struct member) at this sample.
+    /// Mutually exclusive with `per_cpu`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scalar: Option<f64>,
+    /// Per-CPU field values (a `PERCPU_ARRAY` value member), reporting CPUs
+    /// only. Mutually exclusive with `scalar`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_cpu: Option<Vec<f64>>,
+    /// True when `scalar` is a monotonic counter
+    /// ([`crate::test_support::BpfMapAgg::ScalarCounter`]): the run-level fold
+    /// takes the value at the last reporting sample (the accumulated total)
+    /// instead of the mean. `false` (the serde default) folds `scalar` as the
+    /// mean (a gauge). Applies only to `scalar`; for a per-CPU counter use
+    /// `per_cpu_counter`.
+    #[serde(default)]
+    pub scalar_counter: bool,
+    /// True when `per_cpu` is a monotonic counter
+    /// ([`crate::test_support::BpfMapAgg::PerCpuCounter`]): the run-level fold
+    /// takes the CROSS-CPU SUM at the last reporting sample (the accumulated
+    /// total across reporting CPUs) and emits ONE key. `false` (the serde
+    /// default) folds `per_cpu` as the gauge mean (`_avg`) + spatial max
+    /// (`_max`). Ignored when `scalar` is `Some`.
+    #[serde(default)]
+    pub per_cpu_counter: bool,
 }
 
 impl MonitorSample {
-    /// Create a sample with no prog_stats.
+    /// Create a sample with no prog_stats / psi_irq.
     pub fn new(elapsed_ms: u64, cpus: Vec<CpuSnapshot>) -> Self {
         Self {
             elapsed_ms,
             cpus,
             prog_stats: None,
+            psi_irq: None,
+            bpf_map_fields: Vec::new(),
         }
     }
 
@@ -516,6 +609,14 @@ pub struct CpuSnapshot {
     pub rq_clock: u64,
     /// sched_ext flags for this CPU (`scx_rq.flags`).
     pub scx_flags: u32,
+    /// PELT IRQ load average (`rq.avg_irq.util_avg`), an INSTANTANEOUS gauge in
+    /// `[0, SCHED_CAPACITY_SCALE=1024]`. `None` when CONFIG_HAVE_SCHED_AVG_IRQ
+    /// is off (the field is absent from BTF, so the offset resolves to None).
+    /// Sampled per periodic monitor tick (the dense gauge axis), NOT a freeze
+    /// counter; the run-level `avg_irq_util` / `max_avg_irq_util` metrics are
+    /// folded from this in `MonitorSummary`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_irq_util: Option<u64>,
     /// scx event counters (cumulative). None when event counter
     /// offsets are unavailable or scx_root is not set.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -632,17 +733,22 @@ pub struct SchedDomainStats {
     /// `sd->lb_balanced[CPU_MAX_IDLE_TYPES]`: load balance calls that
     /// found no imbalance.
     pub lb_balanced: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
-    /// `sd->lb_imbalance_load[CPU_MAX_IDLE_TYPES]`: times imbalance was
-    /// load-based.
+    /// `sd->lb_imbalance_load[CPU_MAX_IDLE_TYPES]`: cumulative LOAD-based
+    /// imbalance MAGNITUDE (capacity-scaled load), summed via
+    /// `schedstat_add(env->imbalance)` over `migrate_load` balance attempts —
+    /// an accumulated magnitude, NOT a count of attempts.
     pub lb_imbalance_load: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
-    /// `sd->lb_imbalance_util[CPU_MAX_IDLE_TYPES]`: times imbalance was
-    /// utilization-based.
+    /// `sd->lb_imbalance_util[CPU_MAX_IDLE_TYPES]`: cumulative UTILIZATION-based
+    /// imbalance MAGNITUDE (PELT util), summed via `schedstat_add` over
+    /// `migrate_util` attempts — accumulated magnitude, not a count.
     pub lb_imbalance_util: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
-    /// `sd->lb_imbalance_task[CPU_MAX_IDLE_TYPES]`: times imbalance was
-    /// task-count-based.
+    /// `sd->lb_imbalance_task[CPU_MAX_IDLE_TYPES]`: cumulative TASK-COUNT
+    /// imbalance, summed via `schedstat_add` over `migrate_task` attempts —
+    /// accumulated task-count delta, not a count of attempts.
     pub lb_imbalance_task: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
-    /// `sd->lb_imbalance_misfit[CPU_MAX_IDLE_TYPES]`: times imbalance was
-    /// due to misfit task.
+    /// `sd->lb_imbalance_misfit[CPU_MAX_IDLE_TYPES]`: cumulative MISFIT
+    /// imbalance, summed via `schedstat_add` over `migrate_misfit` attempts
+    /// (1 per misfit migration) — accumulated magnitude, not a count.
     pub lb_imbalance_misfit: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
     /// `sd->lb_gained[CPU_MAX_IDLE_TYPES]`: tasks pulled during load balance.
     pub lb_gained: [u32; btf_offsets::CPU_MAX_IDLE_TYPES],
@@ -740,6 +846,27 @@ pub struct MonitorSummary {
     pub avg_nr_running: f64,
     /// Average local DSQ depth per CPU across valid samples.
     pub avg_local_dsq_depth: f64,
+    /// Mean PELT IRQ load (`rq.avg_irq.util_avg`, 0..=1024) across the CPUs
+    /// and valid samples that REPORTED it. `None` when no sample carried an
+    /// avg_irq reading (CONFIG_HAVE_SCHED_AVG_IRQ off) — loud-absent, never a
+    /// false 0.0. The divisor is the reporting-CPU-reading count, NOT
+    /// all CPU readings.
+    pub avg_irq_util: Option<f64>,
+    /// Peak (max across CPUs and samples) PELT IRQ load. `None` when no sample
+    /// reported avg_irq (same gate as `avg_irq_util`).
+    pub max_avg_irq_util: Option<f64>,
+    /// Mean system-wide PSI-irq `full` avg10 pressure (percent, 0..=100) across
+    /// the monitor samples that REPORTED it (host-walked from `psi_system`).
+    /// `None` when no sample carried a PSI-irq reading (CONFIG_PSI /
+    /// CONFIG_IRQ_TIME_ACCOUNTING off, or no `psi_system` symbol) — loud-absent,
+    /// never a false 0.0. The run-level `psi_irq_full_avg10` gauge.
+    pub psi_irq_full_avg10: Option<f64>,
+    /// Cumulative system-wide PSI-irq `full` stall over the monitoring window
+    /// (microseconds): the end-start delta of `total[PSI_AVGS][PSI_IRQ_FULL]`
+    /// across the first/last samples that reported PSI-irq. `None` under the
+    /// same gate as `psi_irq_full_avg10`. The run-level `total_irq_pressure_us`
+    /// counter.
+    pub total_irq_pressure_us: Option<f64>,
     /// Aggregate event counter deltas over the monitoring window.
     /// None when event counters are not available.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -748,10 +875,25 @@ pub struct MonitorSummary {
     /// None when CONFIG_SCHEDSTATS is not enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedstat_deltas: Option<SchedstatDeltas>,
+    /// Per-domain-level CFS load-balance counter deltas over the monitoring
+    /// window, summed across CPUs by domain level name. None when no sample
+    /// carried sched_domains data (CONFIG_SCHEDSTATS off, or a pre-domain-
+    /// capture kernel). See [`SchedDomainLbDelta`] for the scx-marginal caveat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sched_domain_lb: Option<Vec<SchedDomainLbDelta>>,
     /// Per-program BPF callback profile over the monitoring window.
     /// None when no struct_ops programs are loaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prog_stats_deltas: Option<Vec<ProgStatsDelta>>,
+    /// Folded watched-scheduler-BPF-map-field metrics over the monitoring
+    /// window: one entry per Dynamic run-level metric key (a scalar target
+    /// emits one key; a per-CPU target emits `_avg` + `_max`). None when no
+    /// [`crate::test_support::WatchBpfMap`] target was declared OR none
+    /// resolved (the scheduler never attached / the map never appeared) —
+    /// loud-absent, so `run_metric` returns None and an assertion fails
+    /// rather than reading a false 0.0. See [`BpfMapFieldValue`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bpf_map_fields: Option<Vec<BpfMapFieldValue>>,
 }
 
 /// Per-program BPF callback profile computed from first/last monitor samples.
@@ -767,22 +909,49 @@ pub struct ProgStatsDelta {
     pub nsecs_per_call: f64,
 }
 
+/// A folded watched-scheduler-BPF-map-field metric: a Dynamic run-level metric
+/// key and its value, ready to insert into the run-level ext map. Built by
+/// [`MonitorSummary::from_samples`] from the per-sample [`BpfMapFieldSample`]s
+/// and surfaced via [`MonitorSummary::fold_run_level_ext`] (and thus
+/// [`crate::vmm::result::VmResult::run_metric`]). A scalar gauge target yields
+/// one value (`<prefix>_<label>`, the mean over reporting samples); a scalar
+/// counter target yields one value (`<prefix>_<label>`, the last reporting
+/// sample's value); a per-CPU target yields two (`_avg` = cross-(CPU, sample)
+/// mean, `_max` = spatial max).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BpfMapFieldValue {
+    /// The Dynamic run-level metric key (e.g. `scx_lavd_avg_lat_cri`,
+    /// `scx_lavd_lat_headroom_avg`).
+    pub key: String,
+    /// The folded value.
+    pub value: f64,
+    /// True when this key is a monotonic counter (a `ScalarCounter` scalar
+    /// target). Counter keys SUM-fold ACROSS runs (matching registered
+    /// counters); gauge / per-CPU keys mean-fold. Carried into
+    /// [`MonitorSummary::fold_run_level_ext`]'s counter-key set so the
+    /// cross-run aggregator (`stats::group::fold_ext_metrics`) sums them
+    /// instead of averaging. `#[serde(default)]` matches the module's other
+    /// evolving serialized fields (`scalar_counter`, `page_offset`, …): a stale
+    /// sidecar lacking the field degrades to `false` (mean-fold, the pre-
+    /// counter-fold behavior) rather than hard-failing the whole deserialize.
+    #[serde(default)]
+    pub is_counter: bool,
+}
+
 /// Aggregate schedstat deltas computed from first/last monitor samples.
 ///
 /// All values are summed across CPUs and represent the delta over the
-/// monitoring window. Rates are per second.
+/// monitoring window. `total_schedstat_wall_sec` carries that window's span in
+/// seconds — the denominator for the per-second schedstat Rate metrics
+/// (`*_per_sec`, derived in the metric registry).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SchedstatDeltas {
     /// Total scheduling delay increase (ns) across all CPUs.
     pub total_run_delay: u64,
-    /// Run delay per second (ns/s) across all CPUs.
-    pub run_delay_rate: f64,
     /// Total pcount increase across all CPUs.
     pub total_pcount: u64,
-    /// Total context switch increase across all CPUs.
+    /// Total schedule() invocation increase (`rq.sched_count`) across all CPUs.
     pub total_sched_count: u64,
-    /// Context switches per second across all CPUs.
-    pub sched_count_rate: f64,
     /// Total yield count increase across all CPUs.
     pub total_yld_count: u64,
     /// Total go-idle count increase across all CPUs.
@@ -791,6 +960,60 @@ pub struct SchedstatDeltas {
     pub total_ttwu_count: u64,
     /// Total ttwu_local count increase across all CPUs.
     pub total_ttwu_local: u64,
+    /// Monitor-window span in seconds (last-first schedstat-bearing sample) —
+    /// the denominator for the per-second schedstat Rate metrics; 0.0 on a
+    /// degenerate single-sample window.
+    pub total_schedstat_wall_sec: f64,
+}
+
+/// Per-domain-level CFS load-balance counter deltas over the monitoring window.
+///
+/// `struct sched_domain` is per-CPU (the kernel allocates one per CPU per
+/// topology level — kernel/sched/topology.c `__sdt_alloc`), so each counter
+/// here is SUMMED across every CPU's domain at the given level: the total CFS
+/// load-balance activity at that level, analogous to the per-CPU rq schedstat
+/// sum. Levels are keyed by NAME (SMT/CLS/MC/PKG/NUMA), not the CPU-relative
+/// domain index. Each value is the first→last delta over the window; the
+/// per-idle-type arrays (CPU_NOT_IDLE/CPU_IDLE/CPU_NEWLY_IDLE) are summed
+/// across all three.
+///
+/// All fields are monotonic counters. NOTE (scx-marginal): under a switch-all
+/// sched_ext scheduler the fair runqueues are near-empty, so `lb_count` keeps
+/// ticking while the move counters (`lb_gained` / `lb_imbalance_*` / `alb_pushed`)
+/// stay ~0 — these observe CFS-class balancing, not the scx scheduler's own
+/// (BPF) placement. Useful on stock-CFS scenarios and residual fair-class tasks.
+///
+/// The four `lb_imbalance_*` accumulators are kept SEPARATE (not summed into
+/// one) because the kernel routes `env->imbalance` into them by migration type
+/// and each carries a different, incommensurable unit — capacity-scaled load /
+/// PELT utilization / task count / misfit. Summing them would be dimensionally
+/// meaningless (dominated by the load/util magnitudes, with task/misfit lost),
+/// so a delta on a combined value would have no consistent interpretation.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SchedDomainLbDelta {
+    /// Domain level name (`sd->name`): SMT / CLS / MC / PKG / NUMA.
+    pub level: String,
+    /// `sd->lb_count` summed over idle types + CPUs: load-balance attempts.
+    pub lb_count: u64,
+    /// `sd->lb_failed` summed: attempts that found imbalance but moved no task
+    /// (balance friction; higher is worse).
+    pub lb_failed: u64,
+    /// `sd->lb_gained` summed: tasks pulled during load balance.
+    pub lb_gained: u64,
+    /// `sd->lb_imbalance_load` summed (idle types + CPUs): cumulative
+    /// capacity-scaled LOAD imbalance magnitude. Same-unit accumulator — see
+    /// the struct doc for why the four variants are not summed together.
+    pub lb_imbalance_load: u64,
+    /// `sd->lb_imbalance_util` summed: cumulative PELT-UTILIZATION imbalance.
+    pub lb_imbalance_util: u64,
+    /// `sd->lb_imbalance_task` summed: cumulative TASK-COUNT imbalance.
+    pub lb_imbalance_task: u64,
+    /// `sd->lb_imbalance_misfit` summed: cumulative MISFIT imbalance.
+    pub lb_imbalance_misfit: u64,
+    /// `sd->alb_count` summed: active-load-balance (migration-thread) attempts.
+    pub alb_count: u64,
+    /// `sd->alb_pushed` summed: tasks pushed via active load balancing.
+    pub alb_pushed: u64,
 }
 
 /// Aggregate event counter statistics computed from first/last samples.
@@ -839,6 +1062,109 @@ impl MonitorSummary {
         Self::from_samples_with_threshold(samples, 0)
     }
 
+    /// Fold this summary's run-level ext-only monitor metrics into `ext`:
+    /// `avg_nr_running`, the PELT IRQ load pair (`avg_irq_util` /
+    /// `max_avg_irq_util`), and the PSI-irq pair (`psi_irq_full_avg10` /
+    /// `total_irq_pressure_us`). A no-op when `total_samples == 0` (a 0-sample
+    /// run carries no occupancy / IRQ signal — absent, never a false 0.0). The
+    /// `Option` fields insert only on `Some` (loud-absent on a kernel without the
+    /// source: non-HAVE_SCHED_AVG_IRQ, or no CONFIG_PSI / CONFIG_IRQ_TIME_ACCOUNTING).
+    /// `entry().or_insert()` so a value already placed by an earlier populator
+    /// wins. The fixed ext keys (avg_nr_running, the IRQ/PSI pair) are disjoint
+    /// from the read_sample- and phase-folded keys; the Dynamic keys are
+    /// scheduler-obj-prefixed (`<obj>_<label>`) or level-suffixed (`lb_*_<lvl>`)
+    /// so collisions with the fixed set are not constructed. Shared by
+    /// `stats::sidecar_to_row`
+    /// (the perf-delta sidecar row) and `VmResult::run_metric` (the in-test
+    /// accessor) so the key list + loud-absent guard cannot drift between the two
+    /// surfaces.
+    ///
+    /// Value-only convenience for callers that don't need the cross-run
+    /// counter-key set (`VmResult::run_metric`, unit tests). Delegates to
+    /// [`Self::fold_run_level_ext_with_counter_keys`].
+    pub(crate) fn fold_run_level_ext(&self, ext: &mut std::collections::BTreeMap<String, f64>) {
+        let mut counter_keys = std::collections::BTreeSet::new();
+        self.fold_run_level_ext_with_counter_keys(ext, &mut counter_keys);
+    }
+
+    /// Like [`Self::fold_run_level_ext`] but also collects the emitted Dynamic
+    /// monotonic-counter keys into `counter_keys` (the level-suffixed
+    /// `lb_*`/`alb_*` schedstat deltas + any `ScalarCounter` bpf field); gauge
+    /// keys (`avg_nr_running`, the IRQ / PSI pair, per-CPU `_avg`/`_max`) are
+    /// omitted. The cross-run aggregator (`stats::group::fold_ext_metrics`)
+    /// SUM-folds the counter keys instead of averaging them, matching the
+    /// registered-Counter cross-run convention. Used by `stats::sidecar_to_row`
+    /// to populate `GauntletRow::ext_counter_keys`.
+    pub(crate) fn fold_run_level_ext_with_counter_keys(
+        &self,
+        ext: &mut std::collections::BTreeMap<String, f64>,
+        counter_keys: &mut std::collections::BTreeSet<String>,
+    ) {
+        if self.total_samples == 0 {
+            return;
+        }
+        ext.entry("avg_nr_running".to_string())
+            .or_insert(self.avg_nr_running);
+        if let Some(v) = self.avg_irq_util {
+            ext.entry("avg_irq_util".to_string()).or_insert(v);
+        }
+        if let Some(v) = self.max_avg_irq_util {
+            ext.entry("max_avg_irq_util".to_string()).or_insert(v);
+        }
+        if let Some(v) = self.psi_irq_full_avg10 {
+            ext.entry("psi_irq_full_avg10".to_string()).or_insert(v);
+        }
+        if let Some(v) = self.total_irq_pressure_us {
+            ext.entry("total_irq_pressure_us".to_string()).or_insert(v);
+        }
+        // Per-domain-level CFS load-balance counters: one key set per topology
+        // level present in the run, level-suffixed (e.g. lb_failed_mc). These
+        // are Dynamic ext keys — the level set is host-topology-dependent
+        // (SMT/CLS/MC/PKG/NUMA), so a fixed typed-metric enum would be
+        // incomplete; absent levels emit nothing. All Counter-kind. See
+        // [`SchedDomainLbDelta`] for the scx-marginal caveat.
+        if let Some(domains) = &self.sched_domain_lb {
+            for d in domains {
+                let lvl = d.level.to_ascii_lowercase();
+                // All sched_domain load-balance fields are deltas of kernel
+                // monotonic counters (see [`SchedDomainLbDelta`]) -> Dynamic
+                // Counter keys that SUM-fold across runs. The four imbalance
+                // accumulators stay SEPARATE keys — each a distinct,
+                // incommensurable unit (load / util / task / misfit), never
+                // summed INTO one key — but each individually SUM-folds across
+                // runs like the other counters.
+                for (suffix, val) in [
+                    ("lb_count", d.lb_count),
+                    ("lb_failed", d.lb_failed),
+                    ("lb_gained", d.lb_gained),
+                    ("lb_imbalance_load", d.lb_imbalance_load),
+                    ("lb_imbalance_util", d.lb_imbalance_util),
+                    ("lb_imbalance_task", d.lb_imbalance_task),
+                    ("lb_imbalance_misfit", d.lb_imbalance_misfit),
+                    ("alb_count", d.alb_count),
+                    ("alb_pushed", d.alb_pushed),
+                ] {
+                    let k = format!("{suffix}_{lvl}");
+                    counter_keys.insert(k.clone());
+                    ext.entry(k).or_insert(val as f64);
+                }
+            }
+        }
+        // Watched scheduler BPF-map fields: Dynamic, scheduler-obj-prefixed
+        // keys built at fold time (the target/scheduler set is runtime, so a
+        // fixed typed-metric enum cannot enumerate them — same rationale as
+        // the level-suffixed sched_domain_lb keys above). Absent targets emit
+        // nothing (loud-absent).
+        if let Some(fields) = &self.bpf_map_fields {
+            for f in fields {
+                if f.is_counter {
+                    counter_keys.insert(f.key.clone());
+                }
+                ext.entry(f.key.clone()).or_insert(f.value);
+            }
+        }
+    }
+
     /// Like [`from_samples`](Self::from_samples) but uses an explicit
     /// preemption threshold (ns) for stall detection. Pass 0 to derive
     /// the threshold from the guest kernel's `CONFIG_HZ` by calling
@@ -861,6 +1187,13 @@ impl MonitorSummary {
         let mut sum_local_dsq_depth: f64 = 0.0;
         let mut valid_sample_count: usize = 0;
         let mut total_cpu_readings: usize = 0;
+        // PELT IRQ load: mean + peak over the CPUs/samples that REPORTED
+        // avg_irq_util (a gate-aware Option — absent on non-HAVE_SCHED_AVG_IRQ
+        // kernels). Divisor is `avg_irq_readings`, NOT total_cpu_readings, so a
+        // kernel where only some/no CPUs report it is not diluted/false-zeroed.
+        let mut sum_avg_irq: f64 = 0.0;
+        let mut max_avg_irq: f64 = 0.0;
+        let mut avg_irq_readings: usize = 0;
 
         for sample in samples {
             if sample.cpus.is_empty() || !sample_looks_valid(sample) {
@@ -872,6 +1205,14 @@ impl MonitorSummary {
                 sum_nr_running += cpu.nr_running as f64;
                 sum_local_dsq_depth += cpu.local_dsq_depth as f64;
                 total_cpu_readings += 1;
+                if let Some(u) = cpu.avg_irq_util {
+                    let u = u as f64;
+                    sum_avg_irq += u;
+                    if u > max_avg_irq {
+                        max_avg_irq = u;
+                    }
+                    avg_irq_readings += 1;
+                }
             }
             let ratio = sample.imbalance_ratio();
             sum_imbalance_ratio += ratio;
@@ -895,6 +1236,10 @@ impl MonitorSummary {
         } else {
             0.0
         };
+        // Loud-absent: None (not 0.0) when no CPU reported avg_irq, preserving
+        // the absent-vs-measured-zero distinction.
+        let avg_irq_util = (avg_irq_readings > 0).then(|| sum_avg_irq / avg_irq_readings as f64);
+        let max_avg_irq_util = (avg_irq_readings > 0).then_some(max_avg_irq);
 
         // Stuck count: number of (CPU, consecutive-sample-pair)
         // observations whose rq_clock did not advance. Skip invalid samples.
@@ -928,9 +1273,38 @@ impl MonitorSummary {
             }
         }
 
+        // System-wide PSI-irq pressure (host-walked from `psi_system`, one
+        // reading per sample). `psi_irq_full_avg10` is the MEAN of the decoded
+        // avg10 EWMA (percent) across the samples that reported PSI-irq — a
+        // Gauge. `total_irq_pressure_us` is the end-start delta of the
+        // cumulative `total` ns (decoded to µs) — a Counter; `saturating_sub`
+        // guards a counter reset (the accumulator is monotonic, but a PSI /
+        // scheduler reset would rewind it). Both `None` when no sample reported
+        // PSI-irq (loud-absent), preserving the absent-vs-measured-zero
+        // distinction. Decoupled from the cpu-validity gate above: the reading
+        // is a singleton `.data` global, captured only on `data_valid` samples.
+        let psi_samples: Vec<&PsiIrqSample> =
+            samples.iter().filter_map(|s| s.psi_irq.as_ref()).collect();
+        let psi_irq_full_avg10 = (!psi_samples.is_empty()).then(|| {
+            let sum: f64 = psi_samples
+                .iter()
+                .map(|p| btf_offsets::decode_avg10_percent(p.avg10_raw))
+                .sum();
+            sum / psi_samples.len() as f64
+        });
+        let total_irq_pressure_us =
+            psi_samples
+                .first()
+                .zip(psi_samples.last())
+                .map(|(first, last)| {
+                    btf_offsets::decode_total_us(last.total_ns.saturating_sub(first.total_ns))
+                });
+
         let event_deltas = Self::compute_event_deltas(samples);
         let schedstat_deltas = Self::compute_schedstat_deltas(samples);
+        let sched_domain_lb = Self::compute_sched_domain_deltas(samples);
         let prog_stats_deltas = Self::compute_prog_stats_deltas(samples);
+        let bpf_map_fields = Self::compute_bpf_map_field_deltas(samples);
 
         Self {
             total_samples: samples.len(),
@@ -940,9 +1314,15 @@ impl MonitorSummary {
             avg_imbalance_ratio,
             avg_nr_running,
             avg_local_dsq_depth,
+            avg_irq_util,
+            max_avg_irq_util,
+            psi_irq_full_avg10,
+            total_irq_pressure_us,
             event_deltas,
             schedstat_deltas,
+            sched_domain_lb,
             prog_stats_deltas,
+            bpf_map_fields,
         }
     }
 
@@ -1055,30 +1435,125 @@ impl MonitorSummary {
         let total_ttwu_local = sum_field_u32(last, |ss| ss.ttwu_local)
             .saturating_sub(sum_field_u32(first, |ss| ss.ttwu_local));
 
+        // Window span over the SAME first/last schedstat-bearing samples the
+        // total_* deltas span — the provenance-correct per-second denominator
+        // (a different window than the IRQ total_phase_wall_sec, so this carries
+        // its own). The registry per-second Rates divide the total_* numerators
+        // by this; 0.0 on a single-sample window disables the rate (Rate
+        // derivation skips a zero/non-finite denominator).
         let duration_ms = last.elapsed_ms.saturating_sub(first.elapsed_ms);
         let duration_secs = duration_ms as f64 / 1000.0;
-        let run_delay_rate = if duration_secs > 0.0 {
-            total_run_delay as f64 / duration_secs
-        } else {
-            0.0
-        };
-        let sched_count_rate = if duration_secs > 0.0 {
-            total_sched_count as f64 / duration_secs
-        } else {
-            0.0
-        };
 
         Some(SchedstatDeltas {
             total_run_delay,
-            run_delay_rate,
             total_pcount,
             total_sched_count,
-            sched_count_rate,
             total_yld_count,
             total_sched_goidle,
             total_ttwu_count,
             total_ttwu_local,
+            total_schedstat_wall_sec: duration_secs,
         })
+    }
+
+    /// Compute per-domain-level load-balance counter deltas from the sample
+    /// series. Returns None if no sample carries sched_domains data.
+    ///
+    /// `struct sched_domain` is per-CPU, so the counters for a given level
+    /// NAME are summed across every CPU's domain at that level (the total
+    /// balancing activity at the level), keyed by name because the domain
+    /// INDEX is CPU-relative and not stable across CPUs. The per-idle-type
+    /// arrays are summed across all three idle types. Only domains whose
+    /// CONFIG_SCHEDSTATS `stats` block is present contribute.
+    fn compute_sched_domain_deltas(samples: &[MonitorSample]) -> Option<Vec<SchedDomainLbDelta>> {
+        let has_domains = |s: &MonitorSample| {
+            s.cpus.iter().any(|c| {
+                c.sched_domains
+                    .as_ref()
+                    .is_some_and(|ds| ds.iter().any(|d| d.stats.is_some()))
+            })
+        };
+        let first = samples.iter().find(|s| has_domains(s))?;
+        let last = samples.iter().rev().find(|s| has_domains(s))?;
+
+        // Sum the curated counters per level NAME across all CPUs' domains in
+        // one sample.
+        fn per_level(
+            sample: &MonitorSample,
+        ) -> std::collections::BTreeMap<String, SchedDomainLbDelta> {
+            let sum3 = |a: &[u32; btf_offsets::CPU_MAX_IDLE_TYPES]| -> u64 {
+                a.iter().map(|&v| v as u64).sum()
+            };
+            let mut acc: std::collections::BTreeMap<String, SchedDomainLbDelta> =
+                std::collections::BTreeMap::new();
+            for cpu in &sample.cpus {
+                let Some(domains) = cpu.sched_domains.as_ref() else {
+                    continue;
+                };
+                for d in domains {
+                    let Some(st) = d.stats.as_ref() else {
+                        continue;
+                    };
+                    let e = acc
+                        .entry(d.name.clone())
+                        .or_insert_with(|| SchedDomainLbDelta {
+                            level: d.name.clone(),
+                            ..SchedDomainLbDelta::default()
+                        });
+                    e.lb_count += sum3(&st.lb_count);
+                    e.lb_failed += sum3(&st.lb_failed);
+                    e.lb_gained += sum3(&st.lb_gained);
+                    // The four imbalance accumulators stay separate — each is a
+                    // different unit (load / util / task / misfit); summing them
+                    // would be dimensionally meaningless.
+                    e.lb_imbalance_load += sum3(&st.lb_imbalance_load);
+                    e.lb_imbalance_util += sum3(&st.lb_imbalance_util);
+                    e.lb_imbalance_task += sum3(&st.lb_imbalance_task);
+                    e.lb_imbalance_misfit += sum3(&st.lb_imbalance_misfit);
+                    e.alb_count += st.alb_count as u64;
+                    e.alb_pushed += st.alb_pushed as u64;
+                }
+            }
+            acc
+        }
+
+        let first_lv = per_level(first);
+        let last_lv = per_level(last);
+        if last_lv.is_empty() {
+            return None;
+        }
+
+        // first→last delta per level. Topology is static so a level in `last`
+        // is normally in `first` too; a missing baseline is treated as 0.
+        // saturating_sub guards a counter reset / first-absent.
+        let out: Vec<SchedDomainLbDelta> = last_lv
+            .into_iter()
+            .map(|(name, last_v)| {
+                let f = first_lv.get(&name);
+                let base = |sel: fn(&SchedDomainLbDelta) -> u64| f.map(sel).unwrap_or(0);
+                SchedDomainLbDelta {
+                    lb_count: last_v.lb_count.saturating_sub(base(|d| d.lb_count)),
+                    lb_failed: last_v.lb_failed.saturating_sub(base(|d| d.lb_failed)),
+                    lb_gained: last_v.lb_gained.saturating_sub(base(|d| d.lb_gained)),
+                    lb_imbalance_load: last_v
+                        .lb_imbalance_load
+                        .saturating_sub(base(|d| d.lb_imbalance_load)),
+                    lb_imbalance_util: last_v
+                        .lb_imbalance_util
+                        .saturating_sub(base(|d| d.lb_imbalance_util)),
+                    lb_imbalance_task: last_v
+                        .lb_imbalance_task
+                        .saturating_sub(base(|d| d.lb_imbalance_task)),
+                    lb_imbalance_misfit: last_v
+                        .lb_imbalance_misfit
+                        .saturating_sub(base(|d| d.lb_imbalance_misfit)),
+                    alb_count: last_v.alb_count.saturating_sub(base(|d| d.alb_count)),
+                    alb_pushed: last_v.alb_pushed.saturating_sub(base(|d| d.alb_pushed)),
+                    level: name,
+                }
+            })
+            .collect();
+        Some(out)
     }
 
     /// Compute per-program callback profile from first/last samples
@@ -1118,6 +1593,122 @@ impl MonitorSummary {
         } else {
             Some(deltas)
         }
+    }
+
+    /// Fold the per-sample watched BPF-map field reads
+    /// ([`MonitorSample::bpf_map_fields`]) into run-level Dynamic metrics.
+    /// Grouped by `key_base`: a scalar GAUGE target yields one value (mean
+    /// over the reporting samples, key `key_base`); a scalar COUNTER target
+    /// (`scalar_counter`) yields one value (the LAST reporting sample's value,
+    /// key `key_base` — the accumulated total at end-of-window); a per-CPU
+    /// target yields two (`<key_base>_avg` = mean over all reporting (CPU,
+    /// sample) readings, `<key_base>_max` = spatial max across them). The
+    /// gauge/per-CPU divisor is the count of reporting readings, never the
+    /// topology CPU/sample count, so a kernel/scheduler that never reported a
+    /// target is loud-absent (no key) rather than a false 0.0. `None` when no
+    /// target reported in any sample. `BTreeMap` keys give a deterministic
+    /// metric ordering.
+    fn compute_bpf_map_field_deltas(samples: &[MonitorSample]) -> Option<Vec<BpfMapFieldValue>> {
+        use std::collections::BTreeMap;
+        struct Acc {
+            scalar_sum: f64,
+            scalar_n: usize,
+            scalar_last: f64,
+            scalar_counter: bool,
+            pc_sum: f64,
+            pc_n: usize,
+            pc_max: f64,
+            pc_counter: bool,
+            pc_last_sum: f64,
+        }
+        let mut accs: BTreeMap<&str, Acc> = BTreeMap::new();
+        for s in samples {
+            for f in &s.bpf_map_fields {
+                let a = accs.entry(f.key_base.as_str()).or_insert(Acc {
+                    scalar_sum: 0.0,
+                    scalar_n: 0,
+                    scalar_last: 0.0,
+                    scalar_counter: false,
+                    pc_sum: 0.0,
+                    pc_n: 0,
+                    pc_max: f64::NEG_INFINITY,
+                    pc_counter: false,
+                    pc_last_sum: 0.0,
+                });
+                if let Some(v) = f.scalar {
+                    a.scalar_sum += v;
+                    a.scalar_n += 1;
+                    a.scalar_last = v;
+                    a.scalar_counter = f.scalar_counter;
+                }
+                if let Some(vs) = &f.per_cpu {
+                    if f.per_cpu_counter {
+                        // Per-CPU monotonic counter: this sample's cross-CPU
+                        // total; the last NON-EMPTY sample wins. Guard the empty
+                        // case (the live reader never emits an empty per-CPU
+                        // sample, but a deserialized sidecar could): an all-empty
+                        // target emits no key (loud-absent, no phantom 0.0), and
+                        // an empty last sample falls back to the prior non-empty
+                        // sum (the last successful read, like the scalar path).
+                        if !vs.is_empty() {
+                            a.pc_counter = true;
+                            a.pc_last_sum = vs.iter().copied().sum();
+                        }
+                    } else {
+                        for &v in vs {
+                            a.pc_sum += v;
+                            a.pc_n += 1;
+                            if v > a.pc_max {
+                                a.pc_max = v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut out: Vec<BpfMapFieldValue> = Vec::new();
+        for (key_base, a) in accs {
+            if a.scalar_n > 0 {
+                // Counter -> last reporting sample's value (accumulated total);
+                // gauge -> mean over the reporting samples.
+                let value = if a.scalar_counter {
+                    a.scalar_last
+                } else {
+                    a.scalar_sum / a.scalar_n as f64
+                };
+                out.push(BpfMapFieldValue {
+                    key: key_base.to_string(),
+                    value,
+                    is_counter: a.scalar_counter,
+                });
+            }
+            if a.pc_counter {
+                // Per-CPU counter: the accumulated cross-CPU total at the last
+                // non-empty reporting sample (ONE key, is_counter -> SUM-folds
+                // across runs). pc_counter is set only by a non-empty per-CPU
+                // sample (guarded above), so this is loud-absent — no key when
+                // nothing reported.
+                out.push(BpfMapFieldValue {
+                    key: key_base.to_string(),
+                    value: a.pc_last_sum,
+                    is_counter: true,
+                });
+            } else if a.pc_n > 0 {
+                // Per-CPU gauge keys are a mean (`_avg`) and a spatial peak
+                // (`_max`), not counters — they mean-fold across runs.
+                out.push(BpfMapFieldValue {
+                    key: format!("{key_base}_avg"),
+                    value: a.pc_sum / a.pc_n as f64,
+                    is_counter: false,
+                });
+                out.push(BpfMapFieldValue {
+                    key: format!("{key_base}_max"),
+                    value: a.pc_max,
+                    is_counter: false,
+                });
+            }
+        }
+        if out.is_empty() { None } else { Some(out) }
     }
 }
 

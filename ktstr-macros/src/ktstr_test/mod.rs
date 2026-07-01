@@ -21,7 +21,7 @@ pub(crate) fn option_tokens<T: ToTokens>(opt: &Option<T>) -> proc_macro2::TokenS
 /// Extract a [`syn::Path`] from an attribute value, returning a focused
 /// error spanned to the offending expression when the user supplied
 /// something other than a path (an int, a string, an array, …).
-/// Collapses the six `"scheduler" | "payload" | "bpf_map_write" | "post_vm" |
+/// Collapses the five `"scheduler" | "payload" | "post_vm" |
 /// "post_vm_unconditional" | "disk"` parse arms onto a single shape.
 fn expect_path_value(value: &syn::Expr, error_hint: &str) -> Result<syn::Path, syn::Error> {
     match value {
@@ -34,7 +34,7 @@ fn expect_path_value(value: &syn::Expr, error_hint: &str) -> Result<syn::Path, s
 /// `[A, B, C]`. The two diagnostic hints distinguish the array-shape
 /// failure (the whole value is not an array) from the per-element
 /// failure (one entry is not a path). Collapses the `"workloads" |
-/// "staged_schedulers"` parse arms.
+/// "staged_schedulers" | "networks"` parse arms.
 fn expect_array_of_paths(
     value: &syn::Expr,
     array_error_hint: &str,
@@ -52,6 +52,33 @@ fn expect_array_of_paths(
         }
     }
     Ok(entries)
+}
+
+/// Accept EITHER a single path (`A`) OR a `[A, B, ...]` array of paths,
+/// returning `Vec<syn::Path>` — a single path yields a one-element vec.
+/// Used by `bpf_map_write` and `watch_bpf_maps`, each of which may
+/// declare one const (`= A`) or several (`= [A, B]`); codegen borrows
+/// each entry into `&[&…]`, so the one-element vec reproduces the former
+/// single-const behaviour exactly. `error_hint` covers both the wrong
+/// top-level shape and a non-path array element.
+fn expect_path_or_array_of_paths(
+    value: &syn::Expr,
+    error_hint: &str,
+) -> Result<Vec<syn::Path>, syn::Error> {
+    match value {
+        syn::Expr::Path(ep) => Ok(vec![ep.path.clone()]),
+        syn::Expr::Array(ea) => {
+            let mut entries = Vec::with_capacity(ea.elems.len());
+            for elem in &ea.elems {
+                match elem {
+                    syn::Expr::Path(ep) => entries.push(ep.path.clone()),
+                    _ => return Err(syn::Error::new_spanned(elem, error_hint)),
+                }
+            }
+            Ok(entries)
+        }
+        _ => Err(syn::Error::new_spanned(value, error_hint)),
+    }
 }
 
 /// Extract the [`String`] value of a `Lit::Str` attribute and
@@ -229,8 +256,8 @@ fn inherited_constraint_tokens(
 /// against the known attribute list, so multi-segment paths can never
 /// resolve. The diagnostic names both correct forms with three
 /// concrete value-attr examples (a scheduler path, a payload path, an
-/// integer) plus the full enumeration of the 10 bool attrs that
-/// accept the bare form, so the operator can identify their fix
+/// integer) plus the full enumeration of the bool attrs (BOOL_ATTR_NAMES)
+/// that accept the bare form, so the operator can identify their fix
 /// directly from the error text.
 fn multi_segment_attr_error(path: &syn::Path) -> syn::Error {
     let path_repr = path.to_token_stream().to_string();
@@ -297,21 +324,92 @@ pub(crate) const DEFAULT_MEMORY_MIB: u32 = 2048;
 /// matching default in [`AttrValues::default`]); (4) the codegen
 /// gate that conditionally emits the new field; (5) `KtstrTestEntry`
 /// + its `DEFAULT` in `src/test_support/entry.rs` (cross-crate).
-const BOOL_ATTR_NAMES: &[&str] = &[
+pub(crate) const BOOL_ATTR_NAMES: &[&str] = &[
     "auto_repro",
     "expect_auto_repro",
     "not_starved",
     "isolation",
     "performance_mode",
+    "pci",
     "no_perf_mode",
     "requires_smt",
     "expect_err",
+    "survives_storm",
     "allow_inconclusive",
     "fail_on_stall",
     "host_only",
     "ignore",
     "kaslr",
     "wprof",
+];
+
+/// Canonical list of value-taking attributes the `#[ktstr_test]` parser
+/// accepts (the `key = value` forms — paths, strings, integers, floats,
+/// arrays). Companion to [`BOOL_ATTR_NAMES`]; the two together are the full
+/// accepted set the unknown-attribute diagnostic suggests. The NameValue
+/// match arms in [`ktstr_test_impl`] are the matching per-attr dispatch; this
+/// slice mirrors their idents. Adding a new value attribute touches: (1) this
+/// slice; (2) the matching arm (an own arm, or the integer/float/array group
+/// pattern); (3) the matching field(s) on [`AttrValues`] (and the matching
+/// default in [`AttrValues::default`]); (4) the codegen that emits the field.
+/// The unknown-attribute catch-all `assert!`s that no name in either slice
+/// reaches it (a name here with no handling arm is a const-vs-dispatch
+/// divergence), and a unit test pins disjointness from [`BOOL_ATTR_NAMES`]
+/// plus the total cardinality.
+pub(crate) const VALUE_ATTR_NAMES: &[&str] = &[
+    // Path / string / token (own arms):
+    "scheduler",
+    "payload",
+    "workloads",
+    "staged_schedulers",
+    "bpf_map_write",
+    "watch_bpf_maps",
+    "post_vm",
+    "post_vm_unconditional",
+    "disk",
+    "networks",
+    "config",
+    "expect_scx_bpf_error_contains",
+    "expect_scx_bpf_error_matches",
+    "wprof_args",
+    "workload_root_cgroup",
+    // Array-of-path/string (own arms):
+    "extra_sched_args",
+    "extra_include_files",
+    // Integer (group pattern):
+    "llcs",
+    "cores",
+    "threads",
+    "numa_nodes",
+    "memory_mib",
+    "sustained_samples",
+    "max_gap_ms",
+    "watchdog_timeout_s",
+    "duration_s",
+    "max_local_dsq_depth",
+    "min_numa_nodes",
+    "min_llcs",
+    "min_cpus",
+    "max_llcs",
+    "max_numa_nodes",
+    "max_cpus",
+    "cpu_budget",
+    "max_p99_wake_latency_ns",
+    "cleanup_budget_ms",
+    "num_snapshots",
+    // Float (group pattern):
+    "max_imbalance_ratio",
+    "max_fallback_rate",
+    "max_keep_last_rate",
+    "max_spread_pct",
+    "max_throughput_cv",
+    "min_work_rate",
+    "max_wake_latency_cv",
+    "min_iteration_rate",
+    "max_migration_ratio",
+    "min_page_locality",
+    "max_cross_node_migration_ratio",
+    "max_slow_tier_ratio",
 ];
 
 /// Owned bundle of every `#[ktstr_test]` attribute slot. The parse
@@ -354,11 +452,12 @@ pub(crate) struct AttrValues {
     pub(crate) payload: Option<syn::Path>,
     pub(crate) workloads: Option<Vec<syn::Path>>,
     pub(crate) staged_schedulers: Option<Vec<syn::Path>>,
-    pub(crate) bpf_map_write: Option<syn::Path>,
+    pub(crate) bpf_map_write: Option<Vec<syn::Path>>,
+    pub(crate) watch_bpf_maps: Option<Vec<syn::Path>>,
     pub(crate) post_vm: Option<syn::Path>,
     pub(crate) post_vm_unconditional: Option<syn::Path>,
     pub(crate) disk: Option<syn::Path>,
-    pub(crate) network: Option<syn::Path>,
+    pub(crate) networks: Option<Vec<syn::Path>>,
     // -- Assert overrides (Option<T>) --
     pub(crate) not_starved: Option<bool>,
     pub(crate) isolation: Option<bool>,
@@ -403,10 +502,14 @@ pub(crate) struct AttrValues {
     pub(crate) expect_auto_repro_set: bool,
     pub(crate) performance_mode: bool,
     pub(crate) performance_mode_set: bool,
+    pub(crate) pci: bool,
+    pub(crate) pci_set: bool,
     pub(crate) no_perf_mode: bool,
     pub(crate) no_perf_mode_set: bool,
     pub(crate) expect_err: bool,
     pub(crate) expect_err_set: bool,
+    pub(crate) survives_storm: bool,
+    pub(crate) survives_storm_set: bool,
     pub(crate) allow_inconclusive: bool,
     pub(crate) allow_inconclusive_set: bool,
     pub(crate) host_only: bool,
@@ -455,10 +558,11 @@ impl Default for AttrValues {
             workloads: None,
             staged_schedulers: None,
             bpf_map_write: None,
+            watch_bpf_maps: None,
             post_vm: None,
             post_vm_unconditional: None,
             disk: None,
-            network: None,
+            networks: None,
             // Assert overrides
             not_starved: None,
             isolation: None,
@@ -502,10 +606,14 @@ impl Default for AttrValues {
             expect_auto_repro_set: false,
             performance_mode: false,
             performance_mode_set: false,
+            pci: false,
+            pci_set: false,
             no_perf_mode: false,
             no_perf_mode_set: false,
             expect_err: false,
             expect_err_set: false,
+            survives_storm: false,
+            survives_storm_set: false,
             allow_inconclusive: false,
             allow_inconclusive_set: false,
             host_only: false,
@@ -553,6 +661,10 @@ impl AttrValues {
                 self.performance_mode = value;
                 self.performance_mode_set = true;
             }
+            "pci" => {
+                self.pci = value;
+                self.pci_set = true;
+            }
             "no_perf_mode" => {
                 self.no_perf_mode = value;
                 self.no_perf_mode_set = true;
@@ -564,6 +676,10 @@ impl AttrValues {
             "expect_err" => {
                 self.expect_err = value;
                 self.expect_err_set = true;
+            }
+            "survives_storm" => {
+                self.survives_storm = value;
+                self.survives_storm_set = true;
             }
             "allow_inconclusive" => {
                 self.allow_inconclusive = value;
@@ -691,6 +807,44 @@ fn validate_expect_auto_repro_mutex(attrs: &AttrValues) -> syn::Result<()> {
              nothing to relaunch and the assertion could never be \
              satisfied. Add a scheduler = ... attribute or drop \
              expect_auto_repro = true.",
+        ));
+    }
+    Ok(())
+}
+
+/// Reject `survives_storm` combinations the assertion cannot honor:
+/// `survives_storm = true` with `expect_err = true` (contradictory — one
+/// demands the run pass with the scheduler alive, the other demands it
+/// fail), and `survives_storm = true` with no scheduler (the kernel default
+/// has no scx scheduler to die/eject, so survival is vacuous). Mirrors
+/// [`validate_expect_auto_repro_mutex`]; called only when `survives_storm`
+/// is set. The runtime `KtstrTestEntry::validate` re-checks both for
+/// programmatically-built entries that bypass the macro.
+fn validate_survives_storm_mutex(attrs: &AttrValues) -> syn::Result<()> {
+    if attrs.expect_err {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "survives_storm = true and expect_err = true are mutually \
+             exclusive — survives_storm asserts the scheduler SURVIVES (the \
+             run passes), expect_err asserts the run FAILS. Pick one.",
+        ));
+    }
+    if attrs.expect_auto_repro {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "survives_storm = true and expect_auto_repro = true are mutually \
+             exclusive — survives_storm forces a scheduler-death failure to \
+             EXIT_FAIL, while expect_auto_repro inverts a crash-with-repro \
+             failure to PASS. Pick one.",
+        ));
+    }
+    if attrs.scheduler.is_none() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "survives_storm = true requires a scheduler — the kernel default \
+             (EEVDF) has no scx scheduler to die or be ejected, so survival \
+             is vacuous. Add a scheduler = ... attribute or drop \
+             survives_storm.",
         ));
     }
     Ok(())
@@ -830,8 +984,12 @@ fn validate_cross_attr(attrs: &AttrValues) -> syn::Result<()> {
     // Defense-in-depth coverage matrix (compile-time here +
     // programmatic-construction runtime check in
     // `src/test_support/entry.rs::validate`):
-    //   - host_only + disk         : runtime-only (macro doesn't
-    //                                 expose `disk` attribute)
+    //   - host_only + disk         : runtime-only (validate_host_only_mutex
+    //                                 below gates only scheduler/num_snapshots/
+    //                                 auto_repro, not disk; the conflict is
+    //                                 caught in `entry::validate`)
+    //   - host_only + networks     : runtime-only (same as disk — caught in
+    //                                 `entry::validate`, not compile-time)
     //   - host_only + scheduler    : BOTH (runtime matches against
     //                                 `SchedulerSpec::Eevdf` variant —
     //                                 spec-safe value comparison vs
@@ -862,6 +1020,9 @@ fn validate_cross_attr(attrs: &AttrValues) -> syn::Result<()> {
     }
     if attrs.expect_auto_repro_set && attrs.expect_auto_repro {
         validate_expect_auto_repro_mutex(attrs)?;
+    }
+    if attrs.survives_storm_set && attrs.survives_storm {
+        validate_survives_storm_mutex(attrs)?;
     }
     if (attrs.expect_scx_bpf_error_contains_tokens.is_some()
         || attrs.expect_scx_bpf_error_matches_tokens.is_some())
@@ -1100,9 +1261,17 @@ pub(crate) fn ktstr_test_impl(
                         )?);
                     }
                     "bpf_map_write" => {
-                        attrs.bpf_map_write = Some(expect_path_value(
+                        attrs.bpf_map_write = Some(expect_path_or_array_of_paths(
                             value,
-                            "expected path for bpf_map_write (e.g. BPF_CRASH)",
+                            "expected a BpfMapWrite path or [A, B] array for \
+                             bpf_map_write (e.g. BPF_CRASH or [WRITE_A, WRITE_B])",
+                        )?);
+                    }
+                    "watch_bpf_maps" => {
+                        attrs.watch_bpf_maps = Some(expect_path_or_array_of_paths(
+                            value,
+                            "expected a WatchBpfMap path or [A, B] array for \
+                             watch_bpf_maps (e.g. WATCH or [WATCH_A, WATCH_B])",
                         )?);
                     }
                     "post_vm" => {
@@ -1127,13 +1296,14 @@ pub(crate) fn ktstr_test_impl(
                              or similar const-fn chain",
                         )?);
                     }
-                    "network" => {
-                        attrs.network = Some(expect_path_value(
+                    "networks" => {
+                        attrs.networks = Some(expect_array_of_paths(
                             value,
-                            "expected path for network (e.g. MY_NET \
-                             where MY_NET is a `const NetConfig`); \
-                             construct via `NetConfig::DEFAULT.mac(...)` \
-                             or similar const-fn chain",
+                            "expected array of NetConfig paths for networks \
+                             (e.g. [NET_A, NET_B]); each is a `const NetConfig` \
+                             constructed via `NetConfig::DEFAULT.mac(...)` or a \
+                             similar const-fn chain",
+                            "expected NetConfig path in networks array",
                         )?);
                     }
                     "config" => {
@@ -1423,10 +1593,31 @@ pub(crate) fn ktstr_test_impl(
                         ));
                     }
                     _ => {
+                        // The unknown-attribute "expected:" list is DERIVED from
+                        // the two name registries (sorted for a scannable
+                        // diagnostic), not hand-maintained. A name in either
+                        // registry must have matched an arm above; reaching here
+                        // with such a name is a const-vs-dispatch divergence — the
+                        // same soft-invariant the bool path guards via the
+                        // BOOL_ATTR_NAMES `assert!`.
+                        let s = ident.as_str();
+                        assert!(
+                            !BOOL_ATTR_NAMES.contains(&s) && !VALUE_ATTR_NAMES.contains(&s),
+                            "internal: `{ident}` is a known attribute (in \
+                             BOOL_ATTR_NAMES/VALUE_ATTR_NAMES) but reached the \
+                             unknown-attribute arm — const-vs-dispatch divergence",
+                        );
+                        let mut expected: Vec<&str> = BOOL_ATTR_NAMES
+                            .iter()
+                            .chain(VALUE_ATTR_NAMES)
+                            .copied()
+                            .collect();
+                        expected.sort_unstable();
                         return Err(syn::Error::new_spanned(
                             path,
                             format!(
-                                "unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mib, scheduler, staged_schedulers, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, expect_scx_bpf_error_contains, expect_scx_bpf_error_matches, extra_sched_args, extra_include_files, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, cpu_budget, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, bpf_map_write, expect_err, allow_inconclusive, host_only, ignore, cleanup_budget_ms, post_vm, post_vm_unconditional, config, disk, network, num_snapshots, wprof, wprof_args"
+                                "unknown attribute `{ident}`, expected: {}",
+                                expected.join(", "),
                             ),
                         ));
                     }
@@ -1434,8 +1625,8 @@ pub(crate) fn ktstr_test_impl(
             }
             Meta::Path(p) => {
                 // Sugar: a bare bool attr (e.g. `#[ktstr_test(host_only)]`)
-                // is equivalent to `key = true`. Only the ten bool
-                // attributes accept this form; bare ints/floats/paths
+                // is equivalent to `key = true`. Only the bool
+                // attributes (BOOL_ATTR_NAMES) accept this form; bare ints/floats/paths
                 // still error so a typo on a non-bool attr ("threads"
                 // instead of "threads = 4") routes to a targeted
                 // diagnostic rather than the generic Meta catch-all.

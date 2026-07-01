@@ -332,14 +332,31 @@ pub(crate) fn accessor_ready_latch() -> Arc<Latch> {
 ///
 /// `trace_stop` is the trace_pipe reader's stop flag. The graceful
 /// shutdown handler sets it so the reader enters drain mode.
-pub(crate) fn start_hvc0_poll(trace_stop: Option<Arc<AtomicBool>>) -> Option<Arc<AtomicBool>> {
+///
+/// `probe_drain` carries the probe pipeline's `stop` + `output_done`
+/// handles (present only when a probe stack is attached — the
+/// auto-repro repro VM). The graceful-shutdown handler drains it so any
+/// crash-arg probe output captured so far is emitted before the guest
+/// reboots. The payload travels the virtio bulk port, not COM2:
+/// `emit_probe_payload` `println!`s it to stdout, which
+/// `redirect_stdio_to_bulk_port` has dup2'd onto a forwarder pipe that
+/// ships `MsgType::Stdout` frames over the bulk port; the host recovers
+/// it when it drains that port at teardown. On a repro scenario that
+/// HANGS inside the test function this is the ONLY drain site — the
+/// trigger / Phase-6b / scheduler-death drains all require the run to
+/// make progress — so without it the captured events are lost to the
+/// watchdog reboot.
+pub(crate) fn start_hvc0_poll(
+    trace_stop: Option<Arc<AtomicBool>>,
+    probe_drain: Option<super::scheduler::ProbeDrain>,
+) -> Option<Arc<AtomicBool>> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
 
     std::thread::Builder::new()
         .name("hvc0-poll".into())
         .spawn(move || {
-            hvc0_poll_loop(&stop_clone, trace_stop.as_deref());
+            hvc0_poll_loop(&stop_clone, trace_stop.as_deref(), probe_drain.as_ref());
         })
         .ok();
 
@@ -364,9 +381,14 @@ pub(crate) fn start_hvc0_poll(trace_stop: Option<Arc<AtomicBool>>) -> Option<Arc
 ///      on observing one, fires [`bpf_map_write_done_latch`] so the
 ///      scenario's `wait_for_map_write` gate resumes.
 ///   3. scans every drained hvc0 byte for `SIGNAL_VC_SHUTDOWN`; on
-///      observing one, drives graceful shutdown (set `trace_stop`,
+///      observing one, drives graceful shutdown (drain the probe
+///      pipeline so it emits over the bulk port, set `trace_stop`,
 ///      disable tracing, flush stdio + serial) and breaks.
-fn hvc0_poll_loop(stop: &AtomicBool, trace_stop: Option<&AtomicBool>) {
+fn hvc0_poll_loop(
+    stop: &AtomicBool,
+    trace_stop: Option<&AtomicBool>,
+    probe_drain: Option<&super::scheduler::ProbeDrain>,
+) {
     use std::os::unix::io::AsRawFd;
 
     // Open the virtio-console wake fd. Failure here used to be
@@ -392,6 +414,44 @@ fn hvc0_poll_loop(stop: &AtomicBool, trace_stop: Option<&AtomicBool>) {
             return;
         }
     };
+    // /dev/hvc0 is an hvc tty whose kernel-default termios has ICANON
+    // set. N_TTY canonical mode only makes input visible to
+    // poll(POLLIN)/read() on a line boundary: __receive_buf returns
+    // before the EPOLLIN wake when `icanon && !L_EXTPROC`, and
+    // input_available_p reports readable only once canon_head advances
+    // (on a `\n`/EOL). The host's wake bytes (SIGNAL_VC_DUMP,
+    // SIGNAL_BPF_WRITE_DONE, SIGNAL_ACCESSOR_READY, SIGNAL_VC_SHUTDOWN)
+    // are single non-newline bytes, so in canonical mode they sit in the
+    // canon buffer and never wake this loop. hvc registers
+    // TTY_DRIVER_REAL_RAW, but n_tty_set_termios forces real_raw=0 while
+    // ICANON is set, so the driver flag is inert until userspace clears
+    // ICANON. Put the fd in raw mode (clearing ICANON) so every byte is
+    // immediately poll-visible — mirrors the COM2 raw-mode setup in
+    // `modes.rs`. The host-side virtio-console delivery is already
+    // correct (RX descriptors are posted at probe, the byte is written
+    // and the guest IRQ is raised); this gate is purely the guest
+    // reader's line discipline, so the fix belongs here, not host-side.
+    // A tcgetattr/tcsetattr failure is logged rather than swallowed:
+    // without raw mode the loop reverts to canonical gating and silently
+    // misses single-byte wakes — the exact silent hang this exists to
+    // kill — so the failure must be diagnosable.
+    match nix::sys::termios::tcgetattr(&hvc0) {
+        Ok(mut tio) => {
+            nix::sys::termios::cfmakeraw(&mut tio);
+            if let Err(e) =
+                nix::sys::termios::tcsetattr(&hvc0, nix::sys::termios::SetArg::TCSANOW, &tio)
+            {
+                write_com2(&format!(
+                    "ktstr-init: hvc0 raw-mode tcsetattr failed: {e}; poll loop \
+                     stays canonical and may miss single-byte wake signals"
+                ));
+            }
+        }
+        Err(e) => write_com2(&format!(
+            "ktstr-init: hvc0 raw-mode tcgetattr failed: {e}; poll loop stays \
+             canonical and may miss single-byte wake signals"
+        )),
+    }
     let poll_timeout_ms: PollTimeout = 1000u16.into();
 
     while !stop.load(Ordering::Acquire) {
@@ -470,6 +530,24 @@ fn hvc0_poll_loop(stop: &AtomicBool, trace_stop: Option<&AtomicBool>) {
         }
         if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_VC_SHUTDOWN) {
             tracing::info!("ktstr-init: shutdown request received, draining");
+            // Drain the probe pipeline FIRST so any crash-arg probe events
+            // captured so far are EMITTED (via println! -> the stdout
+            // forwarder -> the bulk port) before this handler returns. On a
+            // repro scenario that hung inside the test function this is the
+            // only drain site (the trigger / Phase-6b / scheduler-death drains
+            // all require progress). The subsequent stdout().flush() below
+            // pushes the emitted bytes into the forwarder pipe; the forwarder
+            // ships them over the bulk port while the BSP is still alive in the
+            // soft window, and the host's teardown port-drain recovers any
+            // residual. This handler does NOT force_reboot (it only breaks), so
+            // the forwarder keeps running until the host kills the VM —
+            // delivery must not be made reboot-dependent without first joining
+            // the forwarder. The 2.5s bound fits inside the watchdog's 3s
+            // soft-shutdown window so the flush + tcdrain below also run before
+            // the hard deadline; on a wedged probe the watchdog hard deadline
+            // (BSP kick + host port-drain) is the ultimate net, so the bound is
+            // a courtesy cap, not the operative one.
+            drain_probe_for_shutdown(probe_drain, std::time::Duration::from_millis(2500));
             if let Some(ts) = trace_stop {
                 ts.store(true, Ordering::Release);
             }
@@ -489,6 +567,40 @@ fn hvc0_poll_loop(stop: &AtomicBool, trace_stop: Option<&AtomicBool>) {
             break;
         }
     }
+}
+
+/// Drain the probe pipeline on graceful shutdown: request the probe thread to
+/// stop, then wait (bounded by `timeout`) for it to emit its payload and signal
+/// `output_done`. Returns `true` if `output_done` was observed within the bound
+/// (or no probe drain is attached — a no-op), `false` on timeout.
+///
+/// `output_done` means the probe thread's `emit_probe_payload` `println!`s
+/// returned — i.e. the `PROBE_OUTPUT_*` payload is in the stdout forwarder pipe,
+/// NOT that the host has received it. Delivery is asynchronous: the detached
+/// stdout forwarder (`redirect_stdio_to_bulk_port`) ships the bytes over the
+/// virtio bulk port, and the host recovers them when it drains that port at
+/// teardown. This is correct here because the caller (the `SIGNAL_VC_SHUTDOWN`
+/// handler) does NOT force_reboot, so the forwarder stays alive to ship the
+/// chunk. We deliberately do NOT join the forwarder (unlike a reference VMM such
+/// as libkrun, whose console teardown joins its tx thread) — the guest never
+/// self-reboots on this path, so the host's teardown port-drain is the catch.
+///
+/// Bounded because this runs on the watchdog's soft-shutdown path: the watchdog
+/// hard deadline is the outer safety net, so this uses a tight bound (2500ms)
+/// fitting that 3s window. `drain_probe_pipeline` ALSO bounds its wait, but at
+/// the larger `PROBE_DRAIN_GRACE` (30s) — the pre-dispatch early-bail paths have
+/// no watchdog window, so they ride the host's VM-deadline grace instead. Here
+/// the watchdog net is the very thing that triggered this drain, so the tighter
+/// bound is required.
+fn drain_probe_for_shutdown(
+    probe_drain: Option<&super::scheduler::ProbeDrain>,
+    timeout: std::time::Duration,
+) -> bool {
+    let Some(pd) = probe_drain else {
+        return true;
+    };
+    pd.stop.store(true, Ordering::Release);
+    pd.output_done.wait_timeout(timeout)
 }
 
 /// Stop handle for the sched-exit monitor. Carries the
@@ -587,14 +699,20 @@ impl SchedExitStop {
 /// child exits (pidfd POLLIN edge from the kernel's `do_notify_pidfd`)
 /// or the cleanup site fires the stop-eventfd. `/proc/{pid}` is
 /// re-checked post-wake to catch the rare "pidfd opened after kernel
-/// reaped" race. When `suppress_com2` is false (normal mode), writes
-/// MSG_TYPE_SCHED_EXIT to the bulk port and dumps the scheduler log
-/// to COM2. The host detects the bulk message and can terminate the
-/// VM early. When `suppress_com2` is true (probes active), both the
-/// SCHED_EXIT signal and COM2 dump are suppressed — the probe
-/// pipeline handles crash detection via tp_btf/sched_ext_exit
-/// instead, and the VM must stay alive for the probe thread to emit
-/// output.
+/// reaped" race. On the scheduler's exit two things are gated
+/// independently:
+///   - `suppress_sched_log` gates the scheduler-log dump only: false
+///     (normal mode) dumps the log over the bulk port (`dump_sched_output`
+///     -> `send_sched_log`); true (probes active) instead waits on the
+///     probe thread's `output_done` latch — keeping the VM alive until the
+///     probe has emitted its payload — and skips the dump (the probe
+///     pipeline handles crash detection via tp_btf/sched_ext_exit).
+///   - the SCHED_EXIT signal (MSG_TYPE_SCHED_EXIT, which lets the host
+///     terminate the VM early) is then sent UNLESS the `stop` flag is set
+///     (a host-initiated kill, where the exit is expected). It is gated by
+///     `stop`, NOT by `suppress_sched_log` — so with probes active and a
+///     genuine crash it still fires, but only after the `output_done` wait
+///     above, so the probe payload is already out.
 ///
 /// Uses procfs instead of waitpid because SIGCHLD is SIG_IGN (the kernel
 /// auto-reaps children, making waitpid return ECHILD).
@@ -612,7 +730,7 @@ impl SchedExitStop {
 pub(crate) fn start_sched_exit_monitor(
     sched_pid: Option<u32>,
     log_path: Option<&str>,
-    suppress_com2: Arc<AtomicBool>,
+    suppress_sched_log: Arc<AtomicBool>,
     probe_output_done: Option<Arc<crate::sync::Latch>>,
 ) -> Option<SchedExitStop> {
     let pid = sched_pid?;
@@ -756,7 +874,7 @@ pub(crate) fn start_sched_exit_monitor(
                     !Path::new(&proc_path).exists()
                 };
                 if exited {
-                    if suppress_com2.load(Ordering::Acquire) {
+                    if suppress_sched_log.load(Ordering::Acquire) {
                         // Probes active: wait event-driven on the
                         // probe thread's `output_done` latch.
                         // Outer wall-clock VM timeout is the
@@ -922,4 +1040,74 @@ pub(crate) fn exec_shell_line(line: &str) -> Result<(), ()> {
     }
     tracing::error!(line, "ktstr-init: unsupported command");
     Err(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::scheduler::ProbeDrain;
+    use super::drain_probe_for_shutdown;
+    use crate::sync::Latch;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// `drain_probe_for_shutdown` is the bounded probe drain the
+    /// graceful-shutdown (watchdog soft-shutdown) handler runs so captured
+    /// crash-arg probe output reaches the host (emitted over the virtio bulk
+    /// port) before the guest reboots — the only drain site for a repro
+    /// scenario that hangs inside the test function.
+    /// Host-runnable (no VM): drives a synthetic [`ProbeDrain`] so CI without
+    /// `/dev/kvm` actively proves the drain logic instead of relying on the
+    /// VM-gated repro e2e (which SKIPs there; see the "skipping e2e masks bugs"
+    /// lesson). Pins: (1) no drain attached → no-op `true`; (2) output already
+    /// emitted → returns `true` immediately AND requested stop; (3) probe wedged
+    /// (`output_done` never set) → returns `false` within the bound but still
+    /// requested stop (the probe thread is told to wind down regardless).
+    #[test]
+    fn drain_probe_for_shutdown_requests_stop_and_is_bounded() {
+        // (1) no drain → no-op true.
+        assert!(drain_probe_for_shutdown(None, Duration::from_secs(5)));
+
+        // (2) output already emitted → immediate true + stop requested.
+        let stop = Arc::new(AtomicBool::new(false));
+        let output_done = Arc::new(Latch::new());
+        output_done.set();
+        let pd = ProbeDrain {
+            stop: stop.clone(),
+            output_done,
+        };
+        let start = std::time::Instant::now();
+        assert!(drain_probe_for_shutdown(Some(&pd), Duration::from_secs(5)));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "an already-set output_done returns immediately"
+        );
+        assert!(
+            stop.load(Ordering::Acquire),
+            "drain requested the probe thread to stop"
+        );
+
+        // (3) wedged probe (output_done never set) → false within the bound,
+        //     stop still requested. A short bound keeps the test fast; the wait
+        //     is an evented condvar wait_timeout, not a poll-sleep.
+        let stop = Arc::new(AtomicBool::new(false));
+        let pd = ProbeDrain {
+            stop: stop.clone(),
+            output_done: Arc::new(Latch::new()),
+        };
+        let start = std::time::Instant::now();
+        assert!(!drain_probe_for_shutdown(
+            Some(&pd),
+            Duration::from_millis(50)
+        ));
+        assert!(
+            start.elapsed() >= Duration::from_millis(40),
+            "the wait actually blocked for the bound rather than returning early: {:?}",
+            start.elapsed()
+        );
+        assert!(
+            stop.load(Ordering::Acquire),
+            "drain requests stop even when the probe is wedged"
+        );
+    }
 }

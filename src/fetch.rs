@@ -465,12 +465,24 @@ fn reject_html_response(response: &reqwest::blocking::Response, url: &str) -> Re
 ///
 /// `cli_label` prefixes the diagnostic line so the message matches the
 /// binary the user invoked (`"ktstr"` vs `"cargo ktstr"`).
-fn print_download_size(response: &reqwest::blocking::Response, url: &str, cli_label: &str) {
-    if let Some(len) = response.content_length() {
+fn print_download_size(
+    response: &reqwest::blocking::Response,
+    url: &str,
+    cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
+) {
+    let line = if let Some(len) = response.content_length() {
         let mib = len as f64 / (1024.0 * 1024.0);
-        eprintln!("{cli_label}: downloading {url} ({mib:.1} MiB)");
+        format!("{cli_label}: downloading {url} ({mib:.1} MiB)")
     } else {
-        eprintln!("{cli_label}: downloading {url}");
+        format!("{cli_label}: downloading {url}")
+    };
+    // Route through the progress group so the line coordinates with
+    // concurrent bars on a TTY (and still reaches piped/CI stderr when
+    // the group is hidden); raw `eprintln!` when no group is present.
+    match mp {
+        Some(fp) => fp.println(&line),
+        None => eprintln!("{line}"),
     }
 }
 
@@ -547,22 +559,37 @@ struct DownloadStream<R: Read> {
     /// timeouts in tests) lands without touching the watchdog
     /// logic.
     no_progress_timeout: Duration,
+    /// Optional indicatif download bar, advanced by `inc(n)` on
+    /// every byte-producing read in lockstep with `bytes_total`.
+    /// `None` is the no-bar path (non-TTY, or no progress group
+    /// threaded in) and carries zero per-read overhead beyond the
+    /// `Option` check. Advancing here — the single byte-accounting
+    /// site — guarantees `bar.position() == finalize().1`, so the
+    /// bar can never drift from the bytes the hasher and watchdog
+    /// observed.
+    progress: Option<indicatif::ProgressBar>,
 }
 
 impl<R: Read> DownloadStream<R> {
-    /// Construct a fresh streaming wrapper around `inner` with the
-    /// production no-progress budget. `last_progress` is set to
-    /// "now" so the watchdog clock starts at construction; the
-    /// downstream decoder may take an indeterminate amount of time
-    /// between construction and the first `read()`, but ANY actual
-    /// progress resets the clock.
-    fn new(inner: R) -> Self {
+    /// Construct a streaming wrapper around `inner` with the production
+    /// no-progress budget, optionally attaching an indicatif progress
+    /// bar. `last_progress` is set to "now" so the watchdog clock starts
+    /// at construction; the downstream decoder may take an indeterminate
+    /// time before the first `read()`, but any actual progress resets
+    /// the clock. The optional bar is advanced by `inc(n)` on every
+    /// byte-producing read (see the `progress` field); `progress = None`
+    /// is the non-TTY / no-group path (no bar). The bar is a pure
+    /// observer — it never affects the watchdog gate or the streaming
+    /// sha256, so a stalled or truncated download still surfaces its
+    /// error unchanged.
+    fn with_progress(inner: R, progress: Option<indicatif::ProgressBar>) -> Self {
         Self {
             inner,
             hasher: Sha256::new(),
             bytes_total: 0,
             last_progress: Instant::now(),
             no_progress_timeout: DOWNLOAD_NO_PROGRESS_TIMEOUT,
+            progress,
         }
     }
 
@@ -609,6 +636,12 @@ impl<R: Read> Read for DownloadStream<R> {
                 self.hasher.update(&buf[..n]);
                 self.bytes_total += n as u64;
                 self.last_progress = Instant::now();
+                // Advance the bar in lockstep with `bytes_total` (same
+                // `n`, same reads) so `position()` and `finalize().1`
+                // never diverge. No-op when no bar is attached.
+                if let Some(pb) = &self.progress {
+                    pb.inc(n as u64);
+                }
                 Ok(n)
             }
             Err(e) => Err(e),
@@ -863,6 +896,7 @@ fn download_stable_tarball(
     dest_dir: &Path,
     cli_label: &str,
     skip_sha256: bool,
+    mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<PathBuf> {
     let major = major_version(version)?;
     let tarball_name = format!("linux-{version}.tar.xz");
@@ -883,9 +917,20 @@ fn download_stable_tarball(
         anyhow::bail!("download {url}: HTTP {}", response.status());
     }
     reject_html_response(&response, &url)?;
-    print_download_size(&response, &url, cli_label);
+    print_download_size(&response, &url, cli_label, mp);
+    // Capture the total before `response` is moved into the stream so a
+    // determinate (percent + ETA) bar can be built; `None` when the
+    // server sent no Content-Length, in which case the bar degrades to
+    // a live byte counter.
+    let total = response.content_length();
 
-    eprintln!("{cli_label}: extracting tarball (xz)");
+    // Route status lines through the progress group (see
+    // `print_download_size`); `eprintln!` when no group is threaded in.
+    let status = |line: &str| match mp {
+        Some(fp) => fp.println(line),
+        None => eprintln!("{line}"),
+    };
+    status(&format!("{cli_label}: extracting tarball (xz)"));
     // Stage extraction inside `dest_dir` (same filesystem) so the
     // final `fs::rename` into place is atomic and a verification
     // failure leaves `dest_dir` untouched. A bad mirror that serves
@@ -895,7 +940,8 @@ fn download_stable_tarball(
     // sweeps every entry the malicious archive deposited.
     let staging =
         tempfile::TempDir::new_in(dest_dir).with_context(|| "create extraction staging dir")?;
-    let stream = DownloadStream::new(response);
+    let download_bar = mp.map(|fp| fp.download_bar(version, total));
+    let stream = DownloadStream::with_progress(response, download_bar.as_ref().map(|b| b.bar()));
     let decoder = xz2::read::XzDecoder::new(stream);
     let mut archive = tar::Archive::new(decoder);
     archive
@@ -908,9 +954,16 @@ fn download_stable_tarball(
     // unpack so we don't compute over a partial stream.
     let stream = archive.into_inner().into_inner();
     let (actual_hex, bytes_total) = stream.finalize();
+    // Download is complete (every byte streamed) — clear the bar
+    // before emitting the verification status so the two don't overlap.
+    if let Some(bar) = &download_bar {
+        bar.finish();
+    }
     if let Some(expected) = expected_sha256.as_deref() {
         verify_sha256(&actual_hex, expected, &url)?;
-        eprintln!("{cli_label}: sha256 verified ({bytes_total} bytes, hash {actual_hex})");
+        status(&format!(
+            "{cli_label}: sha256 verified ({bytes_total} bytes, hash {actual_hex})"
+        ));
     } else if !skip_sha256 {
         // Skip path already emitted its bespoke bypass warning
         // before the download; firing again here under "no
@@ -979,6 +1032,7 @@ fn download_rc_tarball(
     version: &str,
     dest_dir: &Path,
     cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<PathBuf> {
     let url = format!("https://git.kernel.org/torvalds/t/linux-{version}.tar.gz");
     tracing::info!(%url, "downloading RC kernel tarball (requires network)");
@@ -998,9 +1052,17 @@ fn download_rc_tarball(
         anyhow::bail!("download {url}: HTTP {}", response.status());
     }
     reject_html_response(&response, &url)?;
-    print_download_size(&response, &url, cli_label);
+    print_download_size(&response, &url, cli_label, mp);
+    // RC tarballs are gitweb-generated and often arrive without a
+    // Content-Length, so `total` is frequently `None` and the bar
+    // degrades to a live byte counter (rate, no ETA).
+    let total = response.content_length();
 
-    eprintln!("{cli_label}: extracting tarball (gzip)");
+    let status = |line: &str| match mp {
+        Some(fp) => fp.println(line),
+        None => eprintln!("{line}"),
+    };
+    status(&format!("{cli_label}: extracting tarball (gzip)"));
     // Stage extraction inside `dest_dir` (same filesystem) so the
     // final atomic rename keeps `dest_dir` clean when a bad mirror
     // serves a wrong-version archive or sneaks stray top-level
@@ -1009,7 +1071,8 @@ fn download_rc_tarball(
     // only defence against a hostile gitweb response.
     let staging =
         tempfile::TempDir::new_in(dest_dir).with_context(|| "create extraction staging dir")?;
-    let stream = DownloadStream::new(response);
+    let download_bar = mp.map(|fp| fp.download_bar(version, total));
+    let stream = DownloadStream::with_progress(response, download_bar.as_ref().map(|b| b.bar()));
     let decoder = flate2::read::GzDecoder::new(stream);
     let mut archive = tar::Archive::new(decoder);
     archive
@@ -1023,6 +1086,9 @@ fn download_rc_tarball(
     // re-fetch.
     let stream = archive.into_inner().into_inner();
     let (actual_hex, bytes_total) = stream.finalize();
+    if let Some(bar) = &download_bar {
+        bar.finish();
+    }
     tracing::warn!(
         url = %url,
         bytes = bytes_total,
@@ -1049,18 +1115,23 @@ fn download_rc_tarball(
 /// the RC path always runs unverified and emits its own warning,
 /// so `skip_sha256` is a no-op on the RC arm. `--source` and
 /// `--git` callers do not reach this function at all.
+///
+/// `mp` is the progress group the determinate download bar is added
+/// to; `None` disables the bar (the single-shot `kernel build` paths
+/// and unit tests pass `None`).
 pub fn download_tarball(
     client: &Client,
     version: &str,
     dest_dir: &Path,
     cli_label: &str,
     skip_sha256: bool,
+    mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<AcquiredSource> {
     let (arch, _) = arch_info();
     let source_dir = if is_rc(version) {
-        download_rc_tarball(client, version, dest_dir, cli_label)?
+        download_rc_tarball(client, version, dest_dir, cli_label, mp)?
     } else {
-        download_stable_tarball(client, version, dest_dir, cli_label, skip_sha256)?
+        download_stable_tarball(client, version, dest_dir, cli_label, skip_sha256, mp)?
     };
 
     Ok(AcquiredSource {
@@ -1331,18 +1402,180 @@ fn probe_latest_patch(client: &Client, prefix: &str, cli_label: &str) -> Result<
     }
 }
 
+/// Cache key for a git-cloned kernel: the raw user ref verbatim, the
+/// resolved commit's FULL hash, the target arch, and the
+/// kconfig-fragment suffix. The SINGLE construction site, shared by
+/// [`git_clone`] (post-clone, from `head_id`) and the pre-clone
+/// ls-remote cache probe in `resolve_git_kernel` — a drift between the
+/// two would make the probe miss the entry the clone wrote and defeat
+/// the clone-skip.
+///
+/// The FULL 40-hex commit hash keys the entry (not a 7-hex prefix): a
+/// branch/tag tip moves over time, so the `{git_ref}` segment alone
+/// cannot distinguish successive commits — only the hash does. A 7-hex
+/// (28-bit) prefix would let a moved tip whose new commit shares the
+/// first 7 hex with the cached old commit hit the stale entry and serve
+/// the wrong kernel build under the new ref. The full id removes that
+/// collision class; the probe and clone both render full lowercase hex
+/// before any truncation, so keying on it is drift-free.
+pub fn git_cache_key(git_ref: &str, commit_hash: &str) -> String {
+    let (arch, _) = arch_info();
+    format!(
+        "{git_ref}-git-{commit_hash}-{arch}-kc{}",
+        crate::cache_key_suffix()
+    )
+}
+
+/// Resolve `git_ref` to its tip COMMIT's full hash among the `refs` a
+/// remote advertised, for the pre-clone cache probe. Precedence: an
+/// explicit `refs/` path, else `refs/heads/{ref}`, else
+/// `refs/tags/{ref}`, else `HEAD`. For an annotated tag (`Ref::Peeled`)
+/// the peeled commit (`object`) is used, never the tag object;
+/// `Ref::Unborn` carries no commit and is skipped. `None` when no ref
+/// matches. Pure over `refs` so the precedence + tag-peeling are
+/// unit-testable without a network handshake.
+///
+/// This is a best-effort guess at the commit a clone would land on; it
+/// does NOT perfectly mirror the shallow clone in every case. This probe
+/// applies heads-before-tags precedence, whereas the shallow clone
+/// ([`git_clone`], `DepthAtRemote(1)`) resolves the bare ref via gix's
+/// DWIM across heads AND tags and errors `RefNameAmbiguous` when a remote
+/// advertises both a branch and a tag of that name — where this probe
+/// instead returns the branch commit. A mismatch only costs a redundant
+/// clone (the post-clone re-check in `resolve_git_kernel` is
+/// authoritative); it never serves a wrong build, since [`git_cache_key`]
+/// embeds the full commit hash returned here.
+fn match_ref_commit_hash(refs: &[gix::protocol::handshake::Ref], git_ref: &str) -> Option<String> {
+    let pick = |target: &str| -> Option<gix::hash::ObjectId> {
+        refs.iter().find_map(|r| {
+            let (name, object) = match r {
+                gix::protocol::handshake::Ref::Peeled {
+                    full_ref_name,
+                    object,
+                    ..
+                }
+                | gix::protocol::handshake::Ref::Direct {
+                    full_ref_name,
+                    object,
+                }
+                | gix::protocol::handshake::Ref::Symbolic {
+                    full_ref_name,
+                    object,
+                    ..
+                } => (full_ref_name, object),
+                gix::protocol::handshake::Ref::Unborn { .. } => return None,
+            };
+            (*name == target).then_some(*object)
+        })
+    };
+    let object = git_ref
+        .starts_with("refs/")
+        .then(|| pick(git_ref))
+        .flatten()
+        .or_else(|| pick(&format!("refs/heads/{git_ref}")))
+        .or_else(|| pick(&format!("refs/tags/{git_ref}")))
+        .or_else(|| (git_ref == "HEAD").then(|| pick("HEAD")).flatten())?;
+    Some(format!("{object}"))
+}
+
+/// True when `git_ref` is a full 40-char hex commit id — recognizable
+/// as a sha without a remote handshake. A 39/41-char ref, or any
+/// 40-char ref carrying a non-hex byte, is a name (branch/tag) and
+/// falls through to ls-remote. Case is not normalized here (the caller
+/// lowercases the full hash to match `git_clone`'s rendering).
+fn is_full_sha(git_ref: &str) -> bool {
+    git_ref.len() == 40 && git_ref.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Resolve `git_ref` to its tip commit's FULL hash WITHOUT cloning, via
+/// an ls-remote handshake, so [`crate::cli::resolve_git_kernel`] can
+/// probe the cache before the expensive full clone. Returns `None`
+/// (best-effort) on ANY failure — network, auth, or an unadvertised ref
+/// — so the caller falls through to the clone, which resolves the ref
+/// authoritatively.
+///
+/// A full 40-hex `git_ref` is taken directly (no handshake): it matches
+/// [`git_clone`]'s post-clone `head_id` byte-for-byte (gix `Id` /
+/// `ObjectId` `Display` both emit the full lowercase hex), so it builds
+/// the key a sha-clone would write — see [`git_cache_key`]. [`git_clone`]
+/// currently REJECTS a raw-sha `git_ref` (a bare commit cannot be
+/// fetched), so for a sha this probe always misses and the clone then
+/// surfaces the actionable error; the branch is kept because it avoids a
+/// handshake on that reject path and is ready for a future sha-capable
+/// clone. It trusts the hex verbatim (no remote validation) — harmless
+/// while sha-clone is rejected, since an unbuildable sha has no cache
+/// entry. The ad-hoc bare repo (`gix::init` on a tempdir) carries no
+/// working tree and fetches no pack; `ref_map` lists every advertised ref
+/// (remote-side ref-prefix filtering is disabled — see the body) without
+/// fetching a pack. See `match_ref_commit_hash` for the rare branch/tag
+/// same-name caveat where this guess and the clone diverge.
+pub fn ls_remote_commit_hash(url: &str, git_ref: &str) -> Option<String> {
+    if is_full_sha(git_ref) {
+        return Some(git_ref.to_ascii_lowercase());
+    }
+    let tmp = tempfile::TempDir::new().ok()?;
+    let repo = gix::init(tmp.path()).ok()?;
+    let remote = repo.remote_at(url).ok()?;
+    let conn = remote.connect(gix::remote::Direction::Fetch).ok()?;
+    let (refmap, _handshake) = conn
+        .ref_map(
+            gix::progress::Discard,
+            gix::remote::ref_map::Options {
+                // ls-remote semantics: list EVERY advertised ref. gix's
+                // default (`prefix_from_spec_as_filter_on_remote = true`)
+                // derives protocol-v2 `ls-refs` `ref-prefix` filters from the
+                // remote's fetch refspecs; an anonymous `remote_at` has none,
+                // and `fetch_tags = Included` injects only `refs/tags/*`, so
+                // the server returns TAGS ONLY and `refs/heads/*` never
+                // arrive — a branch `git_ref` then resolves to `None` and the
+                // clone-skip never fires (every run re-clones). Disabling the
+                // remote-side filter returns all refs, so a branch, tag, or
+                // HEAD `git_ref` all resolve.
+                prefix_from_spec_as_filter_on_remote: false,
+                ..Default::default()
+            },
+        )
+        .ok()?;
+    match_ref_commit_hash(&refmap.remote_refs, git_ref)
+}
+
 /// Clone a git repository with shallow depth.
 ///
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
+///
+/// `mp` is the progress group a determinate clone bar is added to;
+/// `None` disables the bar and passes `gix::progress::Discard` to gix
+/// exactly as before (the single-shot `kernel build` paths and unit
+/// tests pass `None`). The bar shows real object/file counts + ETA
+/// during the receiving / resolving / checkout phases that gix reports
+/// a bounded total for; see the `crate::cli::progress` module.
 pub fn git_clone(
     url: &str,
     git_ref: &str,
     dest_dir: &Path,
     cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<AcquiredSource> {
-    let (arch, _) = arch_info();
-    eprintln!("{cli_label}: cloning {url} (ref: {git_ref}, depth: 1)");
+    // A raw 40-hex commit SHA cannot be cloned here: gix's
+    // `prepare_clone(...).with_ref_name(<object-id>)` panics at
+    // `fetch_then_checkout` (gix `clone/access.rs`), and fetching a bare
+    // commit needs server-side allow-sha-in-want support this path does
+    // not implement. Reject with an actionable error (use a branch or
+    // tag) rather than panic. Placed at the single clone entry so every
+    // caller (auto-discovery + `kernel build`) is covered.
+    if is_full_sha(git_ref) {
+        anyhow::bail!(
+            "git+{url}#{git_ref}: cannot fetch a kernel by raw commit SHA — \
+             use a branch or tag name instead (the resolved commit is recorded \
+             in the cache key after a branch/tag clone)"
+        );
+    }
+    let cloning = format!("{cli_label}: cloning {url} (ref: {git_ref}, depth: 1)");
+    match mp {
+        Some(fp) => fp.println(&cloning),
+        None => eprintln!("{cloning}"),
+    }
 
     let clone_dir = dest_dir.join("linux");
 
@@ -1354,28 +1587,48 @@ pub fn git_clone(
         .with_ref_name(Some(git_ref))
         .with_context(|| "set ref name")?;
 
-    let (mut checkout, _outcome) = prep
-        .fetch_then_checkout(
-            gix::progress::Discard,
-            &std::sync::atomic::AtomicBool::new(false),
-        )
-        .with_context(|| "clone fetch")?;
+    // Drive a determinate clone bar from gix's progress tree (see
+    // [`crate::cli::progress::CloneProgress`]). `None` when no progress
+    // group is threaded in; the gix calls then pass `Discard` exactly
+    // as before. One interrupt flag (never set) is shared by both
+    // phases, matching the prior per-call `AtomicBool::new(false)`.
+    let clone_progress = mp.map(|fp| fp.clone_progress(git_ref));
+    let interrupt = std::sync::atomic::AtomicBool::new(false);
 
-    let (_repo, _outcome) = checkout
-        .main_worktree(
-            gix::progress::Discard,
-            &std::sync::atomic::AtomicBool::new(false),
-        )
-        .with_context(|| "checkout")?;
+    let (mut checkout, _outcome) = match &clone_progress {
+        Some(cp) => prep
+            .fetch_then_checkout(cp.item(), &interrupt)
+            .with_context(|| "clone fetch")?,
+        None => prep
+            .fetch_then_checkout(gix::progress::Discard, &interrupt)
+            .with_context(|| "clone fetch")?,
+    };
+
+    let (_repo, _outcome) = match &clone_progress {
+        Some(cp) => checkout
+            .main_worktree(cp.item(), &interrupt)
+            .with_context(|| "checkout")?,
+        None => checkout
+            .main_worktree(gix::progress::Discard, &interrupt)
+            .with_context(|| "checkout")?,
+    };
+
+    // Clone + checkout done — stop the poll thread, join it, clear the
+    // bar. On any error path above, `clone_progress` is dropped
+    // instead, and its `Drop` performs the same shutdown (leak-proof).
+    if let Some(cp) = clone_progress {
+        cp.finish();
+    }
 
     let repo = gix::open(&clone_dir).with_context(|| "open cloned repo")?;
     let head = repo.head_id().with_context(|| "read HEAD")?;
-    let short_hash = format!("{}", head).chars().take(7).collect::<String>();
+    // FULL commit hash keys the cache (see `git_cache_key` — a 7-hex
+    // prefix risks a moved-tip collision serving a stale build); the
+    // 7-hex `short_hash` is kept only for the human-facing source record.
+    let commit_hash = format!("{head}");
+    let short_hash = commit_hash.chars().take(7).collect::<String>();
 
-    let cache_key = format!(
-        "{git_ref}-git-{short_hash}-{arch}-kc{}",
-        crate::cache_key_suffix()
-    );
+    let cache_key = git_cache_key(git_ref, &commit_hash);
 
     // Record the kernel version from the checked-out source Makefile, as
     // local_source does — the worktree is fully checked out here, so a

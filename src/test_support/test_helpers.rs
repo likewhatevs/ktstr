@@ -80,6 +80,44 @@ pub(crate) fn isolated_cache_dir() -> IsolatedCacheDir {
     IsolatedCacheDir { _guard: guard, tmp }
 }
 
+/// Tempdir bound as the process-wide `KTSTR_SIDECAR_DIR`. While the
+/// returned value is live, the production sidecar / failure-dump /
+/// wprof writes that the eval and probe code paths perform via
+/// [`crate::test_support::sidecar::sidecar_dir`] land in the tempdir
+/// instead of the real `{runs_root}/{kernel}-{commit}` dir — so a unit
+/// test that drives those paths never pollutes the real runs directory
+/// (whose stray fail-verdict fixtures would otherwise surface as
+/// phantom failures in the `cargo ktstr test` footer). The eval unit
+/// tests reach only the `.ktstr.json` write (`evaluate_vm_result`);
+/// the dump/wprof writes belong to other callers (e.g. probe tests).
+///
+/// Both fields are held only for their `Drop`: `_guard` restores
+/// `KTSTR_SIDECAR_DIR` to its prior value and `_tmp` removes the
+/// directory. Field order is load-bearing (Rust drops fields in
+/// declaration order, see [`IsolatedCacheDir`]): `_guard` drops first
+/// (restoring the env var) and `_tmp` second (removing the directory),
+/// so the env var never points at a deleted dir mid-teardown.
+///
+/// Callers must hold [`lock_env`] for the guard's full lifetime — the
+/// save/restore pair is process-wide and races with any concurrent
+/// env-touching test in the same binary.
+pub(crate) struct IsolatedSidecarDir {
+    _guard: EnvVarGuard,
+    _tmp: TempDir,
+}
+
+/// Create a fresh tempdir and point `KTSTR_SIDECAR_DIR` at it so
+/// production sidecar writes land there, not the real runs dir. See
+/// [`IsolatedSidecarDir`] for drop semantics; hold [`lock_env`].
+pub(crate) fn isolated_sidecar_dir() -> IsolatedSidecarDir {
+    let tmp = TempDir::new().expect("tempdir for isolated sidecar dir");
+    let guard = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, tmp.path());
+    IsolatedSidecarDir {
+        _guard: guard,
+        _tmp: tmp,
+    }
+}
+
 /// True when `dir` resolves to a discoverable git repository
 /// via `gix::discover`'s upward walk. Useful for tests that
 /// need to distinguish "the operator pointed at a non-git
@@ -242,6 +280,7 @@ pub(crate) fn make_vm_result(
         success: !timed_out && exit_code == 0,
         vcpus: 1,
         cpu_budget: 1,
+        resolve_source: None,
         expect_auto_repro_satisfied: false,
         exit_code,
         duration: std::time::Duration::from_secs(1),
@@ -266,6 +305,7 @@ pub(crate) fn make_vm_result(
         periodic_target: 0,
         kern_kaslr_offset: 0,
         entry_name: None,
+        variant_hash: 0,
         periodic_series_cache: std::sync::OnceLock::new(),
     }
 }

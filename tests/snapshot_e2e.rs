@@ -187,9 +187,13 @@ fn watch_snapshot_op_drives_register_callback() {
 
     let steps = vec![Step {
         setup: Vec::<ktstr::scenario::ops::CgroupDef>::new().into(),
+        // Op::watch_snapshot resolves a VERBATIM vmlinux ELF symbol (the names
+        // `nm vmlinux` prints; see Op::WatchSnapshot) — NOT a scheduler BPF
+        // .bss global (that is the Snapshot::map / map-watch path, exercised in
+        // scx_bpf_map_field_e2e.rs). Use real vmlinux symbols here.
         ops: vec![
-            Op::watch_snapshot("bss.scx_ktstr.alloc_count"),
-            Op::watch_snapshot("kernel.jiffies"),
+            Op::watch_snapshot("jiffies_64"),
+            Op::watch_snapshot("scx_watchdog_timestamp"),
         ],
         hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
@@ -201,8 +205,8 @@ fn watch_snapshot_op_drives_register_callback() {
     );
     let recorded = attempts.lock().unwrap().clone();
     assert_eq!(recorded.len(), 2);
-    assert_eq!(recorded[0], "bss.scx_ktstr.alloc_count");
-    assert_eq!(recorded[1], "kernel.jiffies");
+    assert_eq!(recorded[0], "jiffies_64");
+    assert_eq!(recorded[1], "scx_watchdog_timestamp");
     assert_eq!(bridge_handle.watch_count(), 2);
 }
 
@@ -221,10 +225,10 @@ fn watch_snapshot_op_max_3_per_scenario_errors_fourth() {
     let steps = vec![Step {
         setup: Vec::<ktstr::scenario::ops::CgroupDef>::new().into(),
         ops: vec![
-            Op::watch_snapshot("kernel.a"),
-            Op::watch_snapshot("kernel.b"),
-            Op::watch_snapshot("kernel.c"),
-            Op::watch_snapshot("kernel.d"),
+            Op::watch_snapshot("sym_a"),
+            Op::watch_snapshot("sym_b"),
+            Op::watch_snapshot("sym_c"),
+            Op::watch_snapshot("sym_d"),
         ],
         hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
@@ -244,11 +248,8 @@ fn watch_snapshot_op_max_3_per_scenario_errors_fourth() {
 #[test]
 fn watch_snapshot_op_unresolvable_symbol_bails_immediately() {
     let cb: CaptureCallback = Arc::new(|_| Some(FailureDumpReport::default()));
-    let reg: WatchRegisterCallback = Arc::new(|symbol: &str| {
-        Err(format!(
-            "symbol '{symbol}' did not resolve via BTF + kallsyms"
-        ))
-    });
+    let reg: WatchRegisterCallback =
+        Arc::new(|symbol: &str| Err(format!("symbol '{symbol}' not found in vmlinux ELF symtab")));
     let bridge = SnapshotBridge::new(cb).with_watch_register(reg);
     let _g = bridge.set_thread_local();
 
@@ -259,16 +260,16 @@ fn watch_snapshot_op_unresolvable_symbol_bails_immediately() {
 
     let steps = vec![Step {
         setup: Vec::<ktstr::scenario::ops::CgroupDef>::new().into(),
-        ops: vec![Op::watch_snapshot("kernel.absent_symbol")],
+        ops: vec![Op::watch_snapshot("no_such_vmlinux_symbol")],
         hold: HoldSpec::fixed(std::time::Duration::from_millis(1)),
     }];
     let result = execute_steps(&ctx, steps).expect("execute_steps returns Ok with stamped error");
     assert!(result.is_fail(), "unresolvable symbol must fail the step");
     let detail = result
         .failure_details()
-        .find(|d| d.message.contains("did not resolve"))
+        .find(|d| d.message.contains("not found in vmlinux"))
         .expect("AssertResult must surface the resolution error");
-    assert!(detail.message.contains("absent_symbol"));
+    assert!(detail.message.contains("no_such_vmlinux_symbol"));
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +435,8 @@ static __KTSTR_ENTRY_SNAPSHOT_OP_IN_VM: ktstr::test_support::KtstrTestEntry =
 /// callback. Test invokes scx-ktstr with `--stall-after=1` so the
 /// scheduler's `tp_btf/sched_ext_exit` handler fires
 /// `SCX_EXIT_ERROR_STALL`, the freeze coordinator dumps the live
-/// scheduler `.bss` to `{sidecar_dir()}/{test_name}.failure-dump.json`,
+/// scheduler `.bss` to the variant-keyed
+/// `{sidecar_dir()}/{test_name}-{variant_hash:016x}.failure-dump.json`,
 /// and the test reads that file back, deserializes into a
 /// `FailureDumpReport`, manually drives `bridge.capture("exit_kind")`
 /// to simulate the watchpoint fire, and walks the captured snapshot's

@@ -3,8 +3,8 @@
 //! When a scheduler crash is observed in a ktstr_test VM, the framework
 //! boots a second "repro" VM with BPF kprobes/fentries attached to the
 //! functions that appeared in the crash stack. Probe output is
-//! serialized on the guest (COM2) and deserialized + formatted on the
-//! host where DWARF is available.
+//! serialized on the guest (bulk port, via the stdout forwarder) and
+//! deserialized + formatted on the host where DWARF is available.
 //!
 //! Probe attachment runs in two phases:
 //! - **Phase A** ([`start_probe_phase_a`]) attaches kprobes, fexits,
@@ -25,7 +25,8 @@ use std::time::{Duration, Instant};
 use crate::assert::AssertResult;
 
 use super::args::{
-    extract_probe_stack_arg, extract_test_fn_arg, extract_work_type_arg, resolve_cgroup_root,
+    extract_probe_stack_arg, extract_test_fn_arg, extract_variant_hash_arg, extract_work_type_arg,
+    resolve_cgroup_root,
 };
 use super::entry::find_test;
 use super::output::{extract_sched_ext_dump, print_assert_result};
@@ -100,7 +101,8 @@ fn parse_rust_env_from_cmdline(cmdline: &str) -> Vec<(&'static str, &str)> {
     out
 }
 
-/// Delimiters for probe output in guest COM2 (written by emit_probe_payload).
+/// Delimiters for probe output, emitted by emit_probe_payload via println! to
+/// the bulk-port stdout forwarder.
 pub(crate) const PROBE_OUTPUT_START: &str = "===PROBE_OUTPUT_START===";
 pub(crate) const PROBE_OUTPUT_END: &str = "===PROBE_OUTPUT_END===";
 
@@ -457,10 +459,12 @@ fn extract_not_attached_reason(
 /// here too would write the same payload twice and make
 /// `llvm-profdata merge` double-count the counters.
 ///
-/// Mirrors the primary VM's per-frame dispatch in
-/// `crate::test_support::eval::run_ktstr_test_inner_impl`. Only
-/// the persistable-to-disk variants unique to this path are
-/// replicated here — Stimulus, PayloadMetrics, and RawPayloadOutput
+/// Mirrors the primary VM's wprof reassembly in
+/// `crate::test_support::eval::run_ktstr_test_inner_impl` — both call
+/// [`crate::test_support::wprof::reassemble_wprof_trace`] over the full
+/// bulk drain so a chunked trace is concatenated, not truncated to its
+/// terminal frame. Only the wprof trace unique to this path is
+/// persisted here — Stimulus, PayloadMetrics, and RawPayloadOutput
 /// frames from the auto-repro run are intentionally NOT extracted
 /// because they're a duplicate of the primary's and the verdict
 /// context only applies to the primary's drain.
@@ -481,6 +485,11 @@ fn extract_not_attached_reason(
 /// `sidecar_dir()`'s by binary lineage. Within a single binary,
 /// `KtstrTestEntry::name` is unique per test fn (the
 /// `#[ktstr_test]` macro derives it from the fn's module-path).
+///
+/// Gated on `wprof`: the only artifact written here is the wprof trace, and
+/// the reassembly helper lives in the wprof-gated `test_support::wprof`
+/// module. A non-wprof build skips both the fn and its call site.
+#[cfg(feature = "wprof")]
 fn write_auto_repro_sidecar_artifacts(
     entry: &KtstrTestEntry,
     repro_result: &crate::vmm::result::VmResult,
@@ -488,29 +497,51 @@ fn write_auto_repro_sidecar_artifacts(
     let Some(drain) = repro_result.guest_messages.as_ref() else {
         return;
     };
-    for bulk_entry in &drain.entries {
-        let kind = crate::vmm::wire::MsgType::from_wire(bulk_entry.msg_type);
-        if let Some(crate::vmm::wire::MsgType::WprofTrace) = kind
-            && bulk_entry.crc_ok
-            && !bulk_entry.payload.is_empty()
-        {
-            let wprof_path = crate::test_support::sidecar::sidecar_dir()
-                .join(format!("{}.repro.wprof.pb", entry.name));
-            if let Err(e) = std::fs::create_dir_all(
-                wprof_path
-                    .parent()
-                    .expect("sidecar_dir join always has parent"),
-            ) {
-                eprintln!("ktstr_test: auto-repro: create sidecar dir for wprof trace: {e}",);
-            } else if let Err(e) = std::fs::write(&wprof_path, &bulk_entry.payload) {
-                eprintln!(
-                    "ktstr_test: auto-repro: write wprof trace to {}: {e}",
-                    wprof_path.display(),
-                );
-            }
+    // Reassemble the (possibly chunked) wprof trace: the guest ships a trace
+    // larger than one bulk frame as N-1 WprofTraceChunk slices followed by a
+    // terminal WprofTrace; `reassemble_wprof_trace` concatenates them in
+    // arrival order and returns `None` when no terminal frame arrived or the
+    // trace is empty (skip-on-absent, matching the pre-chunking behavior).
+    if let Some(pb) = crate::test_support::wprof::reassemble_wprof_trace(&drain.entries) {
+        // Variant-keyed name matching VmResult::repro_wprof_pb_path
+        // (the reader the expect_auto_repro inversion resolves).
+        // repro_result.variant_hash is stamped by attempt_auto_repro
+        // to the primary's host-authoritative hash; the
+        // writer==reader invariant is pinned by a regression test.
+        let wprof_path = crate::test_support::sidecar::sidecar_dir().join(format!(
+            "{}-{:016x}.repro.wprof.pb",
+            entry.name, repro_result.variant_hash
+        ));
+        if let Err(e) = std::fs::create_dir_all(
+            wprof_path
+                .parent()
+                .expect("sidecar_dir join always has parent"),
+        ) {
+            eprintln!("ktstr_test: auto-repro: create sidecar dir for wprof trace: {e}",);
+        } else if let Err(e) = std::fs::write(&wprof_path, &pb) {
+            eprintln!(
+                "ktstr_test: auto-repro: write wprof trace to {}: {e}",
+                wprof_path.display(),
+            );
         }
     }
 }
+
+/// Extra host-deadline budget the auto-repro VM gets beyond the workload
+/// timeout, covering the post-trigger probe-drain tail: after the fentry
+/// trigger fires, `run_probe_skeleton` reads the `probe_data` map, serializes
+/// the per-function arg payload, and flushes it (framed by `PROBE_OUTPUT_END`)
+/// over the bulk port before `force_reboot`. The base host timeout
+/// ([`vm_timeout_from_entry`](super::runtime::vm_timeout_from_entry)) is sized
+/// for the workload only, so without this grace a slow or large drain can hit
+/// the deadline mid-flush — the host then extracts a truncated, terminator-less
+/// payload, fails to parse it, and drops a fully-captured arg set as
+/// "auto-repro: no probe data". Sized well above the worst-case drain of the
+/// bounded `probe_data` map (so a slow host or a large captured-function set
+/// still flushes the terminator in time); it is a CAP, not a fixed wait — the
+/// guest force-reboots when the drain completes, so over-sizing costs nothing
+/// on the success path and only bounds a genuinely hung guest.
+pub(crate) const PROBE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Build and configure the auto-repro VM builder: resolve staged
 /// schedulers, construct the base builder, point the failure-dump sink
@@ -578,8 +609,16 @@ fn build_repro_vm_builder(
         no_perf_mode,
     );
 
+    // The repro VM has a post-trigger probe-drain tail the primary's budget does
+    // not cover (probe_data map readout + arg-payload serialize + PROBE_OUTPUT_END
+    // flush over the bulk port + force_reboot). Override the base host deadline to
+    // add a bounded drain grace so the watchdog cannot fire mid-flush and truncate
+    // the captured-arg payload (which the host would then fail to parse and drop
+    // as "auto-repro: no probe data"). See PROBE_DRAIN_GRACE.
+    builder = builder.timeout(super::runtime::vm_timeout_from_entry(entry) + PROBE_DRAIN_GRACE);
+
     // Set the auto-repro failure-dump sink to a `.repro` sibling
-    // of the primary's `{name}.failure-dump.json` so the auto-repro
+    // of the primary's `{name}-{variant_hash}.failure-dump.json` so the auto-repro
     // VM's dump (if it fires again) lands alongside, not on top of,
     // the just-failed primary's dump. Both files survive in the
     // sidecar dir for primary-vs-repro comparison. The setter is
@@ -591,8 +630,19 @@ fn build_repro_vm_builder(
     // auto-repro path: `build_vm_builder_base` deliberately does
     // not attach a path, so the primary dump is never touched
     // during auto-repro.
-    let repro_dump_path =
-        super::sidecar::sidecar_dir().join(format!("{}.repro.failure-dump.json", entry.name));
+    // Same authoritative variant hash the primary uses (same entry +
+    // resolved topology + work_type), so the repro dump is variant-keyed
+    // to match its sidecar and a gauntlet preset's repro dump doesn't
+    // clobber a sibling's.
+    let variant_hash = super::sidecar::variant_hash_from_parts(
+        entry,
+        &vm_topology,
+        &super::args::current_work_type(),
+    );
+    let repro_dump_path = super::sidecar::sidecar_dir().join(format!(
+        "{}-{variant_hash:016x}.repro.failure-dump.json",
+        entry.name
+    ));
     builder = builder.failure_dump_path(&repro_dump_path);
 
     // Repro VM gets the dual-snapshot freeze coordinator. The
@@ -686,13 +736,13 @@ fn build_repro_vm_builder(
     Some((builder, repro_dump_path))
 }
 
-/// Attempt auto-repro: extract stack functions from COM2 scheduler output
-/// or COM1 kernel console (fallback), boot a second VM with BPF probes
+/// Attempt auto-repro: extract stack functions from the repro VM's scheduler
+/// log or COM1 kernel console (fallback), boot a second VM with BPF probes
 /// attached, and return formatted probe data. When no stack functions are
 /// available (e.g. BPF text error without backtrace), falls back to
 /// dynamic BPF program discovery in the repro VM.
-/// `console_output` is COM1 kernel console text, used when COM2 has no
-/// extractable functions (e.g. scheduler died before writing output).
+/// `console_output` is COM1 kernel console text, used when the scheduler log
+/// has no extractable functions (e.g. scheduler died before writing output).
 ///
 /// Returns `None` if repro cannot be attempted or yields no data.
 ///
@@ -721,21 +771,21 @@ pub(crate) fn attempt_auto_repro(
     // regression in a single phase is invisible against the aggregate.
     let auto_repro_start = Instant::now();
 
-    // Extract scheduler log from COM2 output.
+    // Extract scheduler log from the repro VM's captured output.
     let has_sched_start = first_vm_output.contains(SCHED_OUTPUT_START);
     let has_sched_end = first_vm_output.contains(SCHED_OUTPUT_END);
     eprintln!(
-        "ktstr_test: auto-repro: COM2 length={} has_sched_start={has_sched_start} has_sched_end={has_sched_end}",
+        "ktstr_test: auto-repro: captured-output length={} has_sched_start={has_sched_start} has_sched_end={has_sched_end}",
         first_vm_output.len(),
     );
     // `parse_sched_output_partial` accepts a missing SCHED_OUTPUT_END
     // (scheduler crashed mid-run, never wrote the closing delimiter)
     // and falls back to the slice from SCHED_OUTPUT_START to end of
-    // buffer. Discarding partial COM2 output and skipping straight to
+    // buffer. Discarding partial scheduler-log output and skipping straight to
     // COM1 would lose the crash stack the probe pipeline needs.
     let sched_output = parse_sched_output_partial(first_vm_output);
 
-    // Extract function names from COM2 scheduler log first, then
+    // Extract function names from the scheduler log first, then
     // fall back to COM1 kernel console (which has kernel backtraces
     // including sched_ext_dump output).
     let stack_funcs = if let Some(sched) = sched_output {
@@ -743,17 +793,17 @@ pub(crate) fn attempt_auto_repro(
         if funcs.is_empty() {
             if has_sched_start && !has_sched_end {
                 eprintln!(
-                    "ktstr_test: auto-repro: no functions from partial COM2 (missing \
-                     SCHED_OUTPUT_END), trying COM1",
+                    "ktstr_test: auto-repro: no functions from partial scheduler log \
+                     (missing SCHED_OUTPUT_END), trying COM1",
                 );
             } else {
-                eprintln!("ktstr_test: auto-repro: no functions from COM2, trying COM1");
+                eprintln!("ktstr_test: auto-repro: no functions from scheduler log, trying COM1");
             }
             extract_stack_functions_all(console_output)
         } else {
             if has_sched_start && !has_sched_end {
                 eprintln!(
-                    "ktstr_test: auto-repro: extracted {} functions from partial COM2 \
+                    "ktstr_test: auto-repro: extracted {} functions from partial scheduler log \
                      (missing SCHED_OUTPUT_END)",
                     funcs.len(),
                 );
@@ -761,7 +811,9 @@ pub(crate) fn attempt_auto_repro(
             funcs
         }
     } else {
-        eprintln!("ktstr_test: auto-repro: no scheduler output on COM2, trying COM1");
+        eprintln!(
+            "ktstr_test: auto-repro: no scheduler output on the scheduler-log channel, trying COM1"
+        );
         extract_stack_functions_all(console_output)
     };
     let func_names: Vec<String> = stack_funcs.iter().map(|f| f.raw_name.clone()).collect();
@@ -776,10 +828,25 @@ pub(crate) fn attempt_auto_repro(
     // backtrace), still boot the repro VM. The guest-side discover_bpf_symbols()
     // dynamically finds the scheduler's BPF programs. Pass a sentinel value
     // so extract_probe_stack_arg returns Some and the guest probe path activates.
+    // Host-authoritative variant hash (same entry + resolved topology +
+    // work_type as the primary VM → same hash). Threaded to the guest so
+    // its in-VM Ctx repro paths match the host's, AND stamped onto
+    // repro_result after the run (below) so the host-side repro sidecar
+    // writers and the expect_auto_repro inversion resolve the same
+    // `-{hash}` artifact names. resolve_vm_topology also runs inside
+    // build_repro_vm_builder; it is a pure deterministic fn of the same
+    // inputs, so the two computations agree.
+    let (vm_topology, _) = super::runtime::resolve_vm_topology(entry, topo);
+    let variant_hash = super::sidecar::variant_hash_from_parts(
+        entry,
+        &vm_topology,
+        &super::args::current_work_type(),
+    );
     let mut guest_args = vec![
         "run".to_string(),
         "--ktstr-test-fn".to_string(),
         entry.name.to_string(),
+        format!("--ktstr-variant-hash={variant_hash:016x}"),
     ];
     if !is_stall {
         let probe_arg = if func_names.is_empty() {
@@ -830,7 +897,7 @@ pub(crate) fn attempt_auto_repro(
     // wall time lives here; per-phase guest-side breakdown is emitted
     // by the probe pipeline inside the guest itself.
     let run_start = Instant::now();
-    let repro_result = match vm.run() {
+    let mut repro_result = match vm.run() {
         Ok(r) => r,
         Err(e) => {
             eprintln!("ktstr_test: auto-repro: VM run failed: {e:#}");
@@ -848,6 +915,14 @@ pub(crate) fn attempt_auto_repro(
         "auto_repro: vm_run",
     );
     drop(vm);
+
+    // Stamp the host-authoritative variant hash onto the repro result.
+    // vm.run() builds the VmResult entry-agnostic (variant_hash=0), just
+    // as the primary path does before the eval layer stamps it
+    // (eval/mod.rs). Without this the repro sidecar writers + the
+    // expect_auto_repro inversion would resolve `-0000000000000000`
+    // names while the artifact carries the real `-{hash}`.
+    repro_result.variant_hash = variant_hash;
 
     format_repro_output(
         entry,
@@ -875,23 +950,25 @@ fn format_repro_output(
     auto_repro_start: Instant,
     repro_dump_path: &Path,
 ) -> Option<String> {
-    // Write the auto-repro VM's sidecar artifacts (wprof Perfetto
-    // trace + profraw coverage) BEFORE classify_repro_vm_status
-    // consumes the drain for lifecycle signalling. Mirrors the
-    // primary VM's crate::test_support::eval per-frame dispatch but writes wprof under
-    // `${entry.name}.repro.wprof.pb` so primary + repro artifacts
-    // coexist on disk (matches the `.repro.` infix every other
-    // repro-VM sidecar already uses). Without this hop the
-    // auto-repro VM's wprof bytes would be silently dropped — the
-    // host already paid the capture cost in the guest, throwing the
-    // data away would mask exactly the bug the auto-repro VM was
-    // booted to reproduce.
+    // Write the auto-repro VM's wprof Perfetto trace BEFORE
+    // classify_repro_vm_status consumes the drain for lifecycle
+    // signalling. Reassembles the (possibly chunked) trace like the
+    // primary VM's `crate::test_support::eval` wprof handler but writes it
+    // under `${entry.name}-${variant_hash}.repro.wprof.pb` so primary +
+    // repro artifacts coexist on disk (matches the `.repro.` infix every
+    // other repro-VM sidecar already uses). Without this hop the auto-repro
+    // VM's wprof bytes would be silently dropped — the host already paid the
+    // capture cost in the guest, throwing the data away would mask exactly
+    // the bug the auto-repro VM was booted to reproduce. wprof-gated: the
+    // only sidecar written here is the wprof trace (profraw from the repro
+    // run is persisted centrally by `crate::vmm::KtstrVm::run`, not here).
+    #[cfg(feature = "wprof")]
     write_auto_repro_sidecar_artifacts(entry, repro_result);
 
-    // Forward guest stderr (COM1) and COM2 probe lines when verbose.
+    // Forward guest stderr (COM1) and bulk-port stdout probe lines when verbose.
     if verbose() {
         eprintln!(
-            "ktstr_test: auto-repro: COM1 stderr length={} COM2 stdout length={}",
+            "ktstr_test: auto-repro: COM1 stderr length={} stdout length={}",
             repro_result.stderr.len(),
             repro_result.output.len(),
         );
@@ -904,7 +981,7 @@ fn format_repro_output(
                 in_probe = true;
             }
             if in_probe {
-                eprintln!("  repro-vm-com2: {line}");
+                eprintln!("  repro-vm-stdout: {line}");
             }
         }
     }
@@ -1036,7 +1113,7 @@ fn format_repro_output(
     Some(out)
 }
 
-/// Extract probe JSON from guest COM2, deserialize, and format on the
+/// Extract probe JSON from the guest's bulk-port stdout, deserialize, and format on the
 /// host where vmlinux (DWARF) is available for source locations.
 ///
 /// `partial_dump_path` (when `Some`) names a file under the sidecar
@@ -1337,7 +1414,7 @@ pub(crate) fn format_probe_diagnostics(
     // ProbeHandle setup): every name in `filter_dropped` is a member
     // of the original `raw_functions` whose count became
     // `stack_extracted`, so `filter_dropped.len() <= stack_extracted`.
-    // `PipelineDiagnostics` is serde-serialized over COM2 though, and
+    // `PipelineDiagnostics` is serde-serialized into the probe payload (bulk-port stdout) though, and
     // the format runs on the failure-reporting path. `saturating_sub`
     // keeps a corrupt or partial payload from masking the real failure
     // with a subtract-with-overflow panic during diagnostic rendering.
@@ -1511,7 +1588,7 @@ pub(crate) fn format_probe_diagnostics(
 }
 
 /// Guest-side dispatch: check for `--ktstr-test-fn=NAME` in args, run the
-/// registered function, write the result to SHM and stdout (COM2),
+/// registered function, write the result to SHM and stdout (bulk port),
 /// and exit. Profraw data is flushed via `try_flush_profraw()`
 /// inline on both the success and failure paths before
 /// `std::process::exit()` is invoked.
@@ -1654,6 +1731,12 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         .assert(merged_assert)
         .wait_for_map_write(!entry.bpf_map_write.is_empty())
         .entry_name(entry.name)
+        // Host-threaded authoritative variant hash (see
+        // extract_variant_hash_arg); `0` only if the guest was invoked
+        // without it, in which case the entry_name=Some bail does not
+        // fire but the path simply carries the 0 suffix — production
+        // always injects it (run_ktstr_test_inner_impl).
+        .variant_hash(extract_variant_hash_arg(args).unwrap_or(0))
         .build();
 
     // Send SCENARIO_START so the host-side watchdog resets its hard
@@ -1667,7 +1750,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         crate::vmm::guest_comms::send_scenario_start();
     }
 
-    let result = match (entry.func)(&ctx) {
+    let mut result = match (entry.func)(&ctx) {
         Ok(r) => r,
         Err(e) => {
             let r = AssertResult::fail_msg(format!("{e:#}"));
@@ -1675,6 +1758,10 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
             return Some(1);
         }
     };
+    // survives_storm: re-check scheduler liveness here so a non-execute_*
+    // scenario that hand-rolls Op dispatch (running no in-hold liveness probe)
+    // still fails if the scheduler died during the run.
+    enforce_survives_storm_liveness(&mut result, entry.survives_storm);
 
     let exit_code = exit_code_for_result(&result);
     publish_result_and_collect(&result, probe_stop, probe_handle);
@@ -1788,7 +1875,7 @@ fn setup_probe_handle(stack_input: &str, pipeline: &ProbePipeline) -> Option<Pro
         };
         // Serialize probe output after the trigger fires or stop
         // is signaled. Runs before the thread returns so output
-        // reaches COM2 even if the main thread is blocked.
+        // reaches the host (bulk-port stdout) even if the main thread is blocked.
         emit_probe_payload(
             events.as_deref().unwrap_or(&[]),
             emit_fn_names,
@@ -1830,7 +1917,7 @@ type ProbeThreadResult = (
 /// needs on the stop side: function-name registry for event rendering,
 /// pipeline diagnostics captured before skeleton spawn, the
 /// `output_done` flag the thread flips when it has already written
-/// `PROBE_PAYLOAD_*` to COM2, and the param-name / render-hint maps
+/// `PROBE_OUTPUT_START`/`PROBE_OUTPUT_END` to the bulk port (stdout), and the param-name / render-hint maps
 /// used to pretty-print parameters.
 struct ProbeHandle {
     thread: std::thread::JoinHandle<ProbeThreadResult>,
@@ -1846,7 +1933,7 @@ struct ProbeHandle {
 /// Groups the three signals the probe setup path has to hand to its
 /// worker thread: `stop` (main thread asks the probe thread to shut
 /// down), `output_done` (probe thread tells the main thread it has
-/// already emitted `PROBE_PAYLOAD_*`), and `probes_ready` (probe
+/// already emitted `PROBE_OUTPUT_START`/`PROBE_OUTPUT_END`), and `probes_ready` (probe
 /// thread signals the main thread that kprobes/kfentries have
 /// attached). `stop` is an `AtomicBool` because the probe thread's
 /// ring-buffer poll loop checks it via `load(Acquire)` between
@@ -2166,6 +2253,12 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
         .assert(merged_assert)
         .wait_for_map_write(!entry.bpf_map_write.is_empty())
         .entry_name(entry.name)
+        // Host-threaded authoritative variant hash (see
+        // extract_variant_hash_arg); `0` only if the guest was invoked
+        // without it, in which case the entry_name=Some bail does not
+        // fire but the path simply carries the 0 suffix — production
+        // always injects it (run_ktstr_test_inner_impl).
+        .variant_hash(extract_variant_hash_arg(args).unwrap_or(0))
         .build();
 
     // Build the ProbeHandle up front from the destructured Phase A
@@ -2187,7 +2280,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
     if crate::vmm::guest_comms::is_guest() {
         crate::vmm::guest_comms::send_scenario_start();
     }
-    let result = match (entry.func)(&ctx) {
+    let mut result = match (entry.func)(&ctx) {
         Ok(r) => r,
         Err(e) => {
             let r = AssertResult::fail_msg(format!("{e:#}"));
@@ -2195,6 +2288,10 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
             return Some(1);
         }
     };
+    // survives_storm: re-check scheduler liveness here so a non-execute_*
+    // scenario that hand-rolls Op dispatch (running no in-hold liveness probe)
+    // still fails if the scheduler died during the run.
+    enforce_survives_storm_liveness(&mut result, entry.survives_storm);
 
     let exit_code = exit_code_for_result(&result);
     publish_result_and_collect(&result, stop, Some(handle));
@@ -2292,7 +2389,7 @@ fn run_phase_b_attach(
     }
 }
 
-/// Serialized probe data sent from guest to host via COM2.
+/// Serialized probe data sent from guest to host via the bulk port (stdout).
 /// The host deserializes and formats with kernel_dir for source locations.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct ProbeBytes {
@@ -2320,7 +2417,7 @@ pub(crate) struct ProbeBytesDiagnostics {
     pub skeleton: crate::probe::process::ProbeDiagnostics,
 }
 
-/// Serialize probe payload to stdout (COM2) between delimiters.
+/// Serialize probe payload to stdout (bulk port) between delimiters.
 /// Resolves BPF source locations from loaded programs before serializing.
 ///
 /// Skips the BPF symbol discovery + source-loc resolution walk when
@@ -2553,6 +2650,43 @@ fn exit_code_for_result(result: &AssertResult) -> i32 {
     }
 }
 
+/// When `survives_storm` is asserted, actively re-check scheduler liveness at
+/// the guest-side test-function choke point and fold a scheduler-death fail into
+/// `result` if the scheduler died/went down and `result` does not already carry
+/// one. Closes the vacuous-pass hole for `survives_storm` scenarios whose test
+/// function hand-rolls `Op` dispatch without an `execute_*` driver: those run no
+/// in-hold liveness probe, so a scheduler that died mid-test would otherwise
+/// leave a passing `AssertResult` and the host's `survives_storm` marker (which
+/// keys on a `Scheduler*` detail) would never attach. For `execute_*` scenarios
+/// the in-hold probe already recorded the death, so the already-present guard
+/// makes this a no-op (no double-record). Folding the fail makes
+/// `result.is_pass()` false, which drops the dispatch exit code to 1 and lets
+/// the host eval attach the `SurvivesStormViolated` marker.
+fn enforce_survives_storm_liveness(result: &mut AssertResult, survives_storm: bool) {
+    use crate::assert::DetailKind;
+    if !survives_storm {
+        return;
+    }
+    // An execute_* in-hold probe already attributed the death — don't double-record.
+    let already_recorded = result.failure_details().any(|d| {
+        matches!(
+            d.kind,
+            DetailKind::SchedulerCrashed
+                | DetailKind::SchedulerExitedCleanly
+                | DetailKind::SchedulerDiedUnknownReason
+        )
+    });
+    if already_recorded {
+        return;
+    }
+    if let Some(kind) = crate::scenario::ops::sched_liveness_failure_kind() {
+        result.record_fail(crate::assert::AssertDetail::new(
+            kind,
+            crate::assert::format_sched_died_survives_storm(),
+        ));
+    }
+}
+
 /// Flush profraw, publish the assert result to guest stdout, then
 /// either STASH the probe stop+handle for deferred collection (when
 /// running as the guest VM's PID 1, where Phase 6 scheduler
@@ -2602,7 +2736,7 @@ fn collect_and_print_probe_data(
         Err(payload) => {
             // Stamp the panic payload onto a fresh diagnostics
             // record. Without this, the empty events vec + default
-            // diag emitted on the host COM2 channel is byte-for-byte
+            // diag emitted on the host via the bulk-port stdout channel is byte-for-byte
             // identical to a clean run where the trigger simply
             // never fired — the host can't tell that the probe
             // thread crashed and would silently record the test as

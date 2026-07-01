@@ -62,8 +62,12 @@ Add ktstr as a dev-dependency:
 
 ```toml
 [dev-dependencies]
-ktstr = { version = "0.16" }
+ktstr = { version = "0.20.0" }
 ```
+
+To host a ktstr test in an external scheduler crate (gated behind a
+feature so ktstr stays out of normal builds), see [Host a ktstr test in
+an external scheduler crate](recipes/test-new-scheduler.md#9-host-a-ktstr-test-in-an-external-scheduler-crate).
 
 ## Kernel discovery
 

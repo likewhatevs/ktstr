@@ -29,8 +29,9 @@ use crate::workload::{AffinityIntent, ResolvedAffinity, WorkSpec, WorkloadConfig
 
 use super::setup::{append_placement_log, apply_setup};
 use super::{
-    CgroupDef, CpusetSpec, KernelTarget, KernelValue, KernelValueWidth, Op, PayloadEntry,
-    PayloadSource, ScenarioState, SpawnPlacement, validate_known_flags, validate_mempolicy_cpuset,
+    CgroupDef, CpusetSpec, IrqSelector, KernelTarget, KernelValue, KernelValueWidth, Op,
+    PayloadEntry, PayloadSource, ScenarioState, SpawnPlacement, validate_known_flags,
+    validate_mempolicy_cpuset,
 };
 
 /// Latched once `Op::CaptureSnapshot` / `Op::WatchSnapshot` observes a
@@ -122,6 +123,7 @@ pub(super) fn apply_ops(
             Op::ReplaceScheduler { scheduler } => apply_replace_scheduler(scheduler)?,
             Op::PinBpfMap { name } => apply_pin_bpf_map(state, name)?,
             Op::CaptureCgroupProcs { tag, cgroup } => apply_capture_cgroup_procs(ctx, tag, cgroup)?,
+            Op::SteerIrq { irq, cpu } => apply_steer_irq(irq, *cpu)?,
         }
     }
     Ok(())
@@ -1074,7 +1076,7 @@ fn apply_watch_snapshot(symbol: &str) -> Result<()> {
         //      exit; the vCPU dispatcher identifies the
         //      slot and latches `WatchpointSlot::hit`. The
         //      coordinator then runs
-        //      `freeze_and_capture(false)` and stores the
+        //      `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` and stores the
         //      report on the bridge keyed by the symbol.
         let registered =
             crate::scenario::snapshot::with_active_bridge(|b| b.register_watch(symbol));
@@ -1397,6 +1399,123 @@ fn apply_capture_cgroup_procs(ctx: &Ctx, tag: &str, cgroup: &str) -> Result<()> 
     Ok(())
 }
 
+/// `Op::SteerIrq` body: re-route a hardware IRQ to a single CPU by
+/// writing `/proc/irq/<N>/smp_affinity_list` in the guest. Resolves
+/// the IRQ number from the [`IrqSelector`], pre-checks the target CPU
+/// against the online set (the kernel's `write_irq_affinity` rejects
+/// a mask with no online CPU — `-EINVAL`), then writes. The write is
+/// the only re-steering mechanism: it runs the kernel's full
+/// set-affinity path that reprograms the irqchip; a kernel-memory
+/// poke of the affinity mask would not (see [`Op::SteerIrq`]).
+fn apply_steer_irq(irq_sel: &IrqSelector, cpu: usize) -> Result<()> {
+    let irq = resolve_irq_number(irq_sel)?;
+    // Online pre-check BEFORE the write. The kernel intersects the
+    // requested mask with `cpu_online_mask` in `irq_do_set_affinity`
+    // and `write_irq_affinity` returns -EINVAL when the single-CPU
+    // target leaves no online CPU; bailing here names the offending
+    // CPU instead of surfacing a bare EINVAL from the write. IRQ
+    // affinity is system-wide, so this checks online — NOT the
+    // runner's cpuset (a steer to a CPU outside the runner's allowed
+    // set is valid).
+    let online = read_online_cpus()?;
+    if !online.iter().any(|&c| c as usize == cpu) {
+        anyhow::bail!(
+            "Op::SteerIrq(irq={irq}, cpu={cpu}): CPU {cpu} is not online \
+             (online CPUs: {online:?}); the kernel intersects the IRQ \
+             affinity mask with cpu_online_mask, so steering to an offline \
+             or out-of-range CPU would fail with -EINVAL"
+        );
+    }
+    let path = format!("/proc/irq/{irq}/smp_affinity_list");
+    std::fs::write(&path, cpu.to_string()).with_context(|| {
+        format!(
+            "Op::SteerIrq(irq={irq}, cpu={cpu}): writing {path:?} failed \
+             (IRQ may not exist, or may reject userspace affinity — \
+             per-CPU IRQs and `no_irq_affinity` return -EPERM)"
+        )
+    })?;
+    tracing::info!(irq, cpu, "Op::SteerIrq: steered IRQ to CPU");
+    Ok(())
+}
+
+/// Resolve an [`IrqSelector`] to a literal Linux IRQ number.
+/// [`IrqSelector::ByNumber`] passes through; [`IrqSelector::ByLabel`]
+/// reads `/proc/interrupts` and matches the action-name label via
+/// [`resolve_irq_label`].
+fn resolve_irq_number(sel: &IrqSelector) -> Result<u32> {
+    match sel {
+        IrqSelector::ByNumber(n) => Ok(*n),
+        IrqSelector::ByLabel(label) => {
+            let text = std::fs::read_to_string("/proc/interrupts").with_context(|| {
+                format!("Op::SteerIrq: reading /proc/interrupts to resolve IRQ label {label:?}")
+            })?;
+            resolve_irq_label(&text, label)
+        }
+    }
+}
+
+/// Find the Linux IRQ number whose `/proc/interrupts` action name
+/// (the last whitespace token on the line) equals `label`. Returns
+/// the first matching line's leading IRQ number. Split out as a free
+/// function over the file contents so the parse is unit-testable
+/// without a populated `/proc/interrupts`.
+///
+/// Matches the line's LAST token only: a shared IRQ (comma-separated
+/// action chain in `show_interrupts`) matches just the last action,
+/// and a multi-word action name never matches. Widening to any token
+/// would false-match the per-CPU count / chip / hwirq columns, so
+/// `IrqSelector::ByNumber` is the escape hatch for a shared or
+/// multi-word-named IRQ. This parse intentionally mirrors the
+/// test-only `wide_smp_irq::device_irq_by_action_name`; they cannot
+/// share a helper today because that file compiles into the
+/// integration-test crate (no `pub(crate)` visibility) and exposing
+/// this resolver as `pub` would pollute the test-author surface.
+pub(crate) fn resolve_irq_label(proc_interrupts: &str, label: &str) -> Result<u32> {
+    if label.is_empty() {
+        anyhow::bail!(
+            "Op::SteerIrq: IRQ label is empty; supply a /proc/interrupts \
+             action name (the last whitespace token on the IRQ's line, e.g. \
+             a virtio-net device basename like \"virtio1\") or use \
+             IrqSelector::by_number"
+        );
+    }
+    for line in proc_interrupts.lines() {
+        let Some((lhs, rhs)) = line.split_once(':') else {
+            continue;
+        };
+        if rhs.split_whitespace().last() == Some(label) {
+            return lhs.trim().parse::<u32>().map_err(|e| {
+                anyhow::anyhow!(
+                    "Op::SteerIrq: /proc/interrupts line for label {label:?} has \
+                     a non-numeric IRQ column {:?}: {e}",
+                    lhs.trim()
+                )
+            });
+        }
+    }
+    anyhow::bail!(
+        "Op::SteerIrq: no /proc/interrupts line with action-name label \
+         {label:?}; check the label against the last column of \
+         /proc/interrupts (it varies with device probe order, e.g. \
+         \"virtio0\" vs \"virtio1\") or steer by number"
+    )
+}
+
+/// The online Linux processor numbers, read from
+/// `/sys/devices/system/cpu/online` (cpulist format, e.g. `"0-3"`).
+/// Used by [`apply_steer_irq`] to reject an offline / out-of-range
+/// target before the `smp_affinity_list` write.
+fn read_online_cpus() -> Result<Vec<u32>> {
+    let text = std::fs::read_to_string("/sys/devices/system/cpu/online")
+        .context("Op::SteerIrq: reading /sys/devices/system/cpu/online")?;
+    crate::cpu_util::parse_cpu_list(text.trim()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Op::SteerIrq: /sys/devices/system/cpu/online is empty or malformed: {:?}",
+            text.trim()
+        )
+    })
+}
+
 /// Fold runs of adjacent [`Op::WriteKernelCold`] singleton ops
 /// into one merged `Op::WriteKernelCold` with the concatenated
 /// `writes` vec. Caller-supplied multi-write `Op::WriteKernelCold`
@@ -1698,15 +1817,14 @@ fn wait_for_scx_disabled(timeout: std::time::Duration) -> Result<std::time::Dura
 
     // Evented wake sources managed by kernfs_evented_wait:
     //   - inotify on /sys/kernel/sched_ext/ for IN_DELETE (fires
-    //     when scx_root_disable's kobject_del at
-    //     kernel/sched/ext.c:5859 removes the "root" entry)
+    //     when scx_root_disable's kobject_del (kernel/sched/ext.c)
+    //     removes the "root" entry)
     //   - POLLPRI on /sys/kernel/sched_ext/state (future-proofed
     //     for kernels that add `sysfs_notify` on the attribute)
     //
-    // REQUIRED CADENCE. Verified at kernel/sched/ext.c:5735
-    // scx_root_disable: between kobject_del (L5859, fires
-    // IN_DELETE) and the state flip (L5865,
-    // scx_set_enable_state(SCX_DISABLED)) the kernel does
+    // REQUIRED CADENCE. Verified in kernel/sched/ext.c
+    // scx_root_disable: between kobject_del (fires IN_DELETE) and
+    // the state flip (scx_set_enable_state(SCX_DISABLED)) the kernel does
     // free_kick_syncs() + mutex_unlock(&scx_enable_mutex) + the
     // atomic_xchg. Sub-microsecond gap in the common case but
     // theoretically present, AND scx emits NO further event for
@@ -1855,6 +1973,18 @@ fn kill_current_scheduler(op_label: &str) -> Result<libc::pid_t> {
         "scx state reached 'disabled' after SIGTERM",
     );
     crate::vmm::rust_init::set_sched_pid(0);
+    // Notify the host that the scheduler has been swapped out. By here
+    // `wait_for_scx_disabled` has returned, so the kernel NULLed
+    // `*scx_root` (`RCU_INIT_POINTER(scx_root, NULL)` precedes
+    // `scx_set_enable_state(SCX_DISABLED)` in kernel/sched/ext.c) and
+    // the prior scx_sched object is unlinked (`*scx_root` NULLed) and
+    // its slab is subject to RCU-grace-period reuse — the host's
+    // owned periodic-capture accessor is now stale. The frame lets the
+    // freeze coordinator invalidate that accessor synchronously rather
+    // than waiting up to one SCAN_INTERVAL for its scx_root watchpoint
+    // poll to notice the rebind. Best-effort: a lost frame falls back
+    // to the poll-driven teardown (see `send_sched_swap_notify`).
+    crate::vmm::guest_comms::send_sched_swap_notify();
     Ok(pid)
 }
 
@@ -1902,6 +2032,26 @@ fn spawn_scheduler_for_op(
 pub(super) fn dispatch_attach_scheduler(
     scheduler: &'static crate::test_support::Scheduler,
 ) -> Result<()> {
+    // Precondition: Op::AttachScheduler attaches a sched_ext scheduler,
+    // and the kernel permits only one enabled at a time — `scx_enable`
+    // returns -EBUSY unless `scx_enable_state() == SCX_DISABLED`
+    // (kernel/sched/ext.c). This Op does NOT detach the current scheduler
+    // (see the doc above: callers Detach first to swap), so if one is
+    // already up the spawned child's enable would -EBUSY and
+    // `poll_scx_attached` could read the OLD scheduler's `state ==
+    // enabled` as a false Attached. Mirror the kernel guard and fail fast
+    // + clearly. `None` (no sched_ext sysfs state — boot had a
+    // kernel-builtin scheduler) and `Disabled` (first attach / post-Detach
+    // quiesced) both proceed; `Enabling`/`Enabled`/`Disabling` bail.
+    if let Some(state) = scx_state()
+        && state != ScxState::Disabled
+    {
+        anyhow::bail!(
+            "Op::AttachScheduler requires no sched_ext scheduler currently \
+             enabled (sched_ext state is {state:?}); issue Op::DetachScheduler \
+             first, or use Op::ReplaceScheduler to swap atomically"
+        );
+    }
     // Serialize against any in-flight worker publish BEFORE the
     // dispatcher captures `seqno_before`. The accessor-init worker
     // has a 60 s boot budget for its first publish; if the user's

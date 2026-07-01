@@ -177,6 +177,8 @@ pub(super) fn stub_custom_fn(_ctx: &WorkerCtx) -> WorkerReport {
         wake_sample_total: 0,
         iteration_costs_ns: vec![],
         iteration_cost_sample_total: 0,
+        timer_latencies_ns: vec![],
+        timer_sample_total: 0,
         iterations: 0,
         schedstat_run_delay_ns: 0,
         schedstat_run_count: 0,
@@ -189,6 +191,7 @@ pub(super) fn stub_custom_fn(_ctx: &WorkerCtx) -> WorkerReport {
         group_idx: 0,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     }
 }
 pub(super) fn custom_spin_fn(ctx: &WorkerCtx) -> WorkerReport {
@@ -217,6 +220,8 @@ pub(super) fn custom_spin_fn(ctx: &WorkerCtx) -> WorkerReport {
         wake_sample_total: 0,
         iteration_costs_ns: vec![],
         iteration_cost_sample_total: 0,
+        timer_latencies_ns: vec![],
+        timer_sample_total: 0,
         iterations: work_units,
         schedstat_run_delay_ns: 0,
         schedstat_run_count: 0,
@@ -229,6 +234,7 @@ pub(super) fn custom_spin_fn(ctx: &WorkerCtx) -> WorkerReport {
         group_idx: 0,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     }
 }
 /// Ready-file path shared between [`ignores_sigusr1_fn`] and

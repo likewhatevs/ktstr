@@ -805,14 +805,39 @@ fn build_phase_buckets_integration_with_scenario_stats_phase_accessor() {
         phases,
         ..Default::default()
     };
-    assert_eq!(stats.phase(0).map(|p| p.label.as_str()), Some("BASELINE"));
-    assert_eq!(stats.phase(1).map(|p| p.label.as_str()), Some("Step[0]"));
-    assert_eq!(stats.phase(2).map(|p| p.label.as_str()), Some("Step[1]"));
-    assert_eq!(stats.phase(3), None);
-    // `step(0)` is the scenario-side 0-indexed accessor: maps to
-    // phase index 1 (scenario Step 0 lives at step_index 1).
-    assert_eq!(stats.step(0).map(|p| p.label.as_str()), Some("Step[0]"));
-    assert_eq!(stats.step(1).map(|p| p.label.as_str()), Some("Step[1]"));
+    assert_eq!(
+        stats
+            .phase(crate::assert::Phase::BASELINE)
+            .map(|p| p.label.as_str()),
+        Some("BASELINE")
+    );
+    assert_eq!(
+        stats
+            .phase(crate::assert::Phase::step(0))
+            .map(|p| p.label.as_str()),
+        Some("Step[0]")
+    );
+    assert_eq!(
+        stats
+            .phase(crate::assert::Phase::step(1))
+            .map(|p| p.label.as_str()),
+        Some("Step[1]")
+    );
+    assert_eq!(stats.phase(crate::assert::Phase::step(2)), None);
+    // Phase::step(0) is the scenario's first Step (the typed accessor hides the
+    // 1-indexed encoding: Step 0 lives at the underlying step_index 1).
+    assert_eq!(
+        stats
+            .phase(crate::assert::Phase::step(0))
+            .map(|p| p.label.as_str()),
+        Some("Step[0]")
+    );
+    assert_eq!(
+        stats
+            .phase(crate::assert::Phase::step(1))
+            .map(|p| p.label.as_str()),
+        Some("Step[1]")
+    );
 }
 
 // ---------- Phase newtype ----------
@@ -945,4 +970,310 @@ fn phase_bucket_expect_metric_returns_value_when_present() {
         ..Default::default()
     };
     assert_eq!(bucket.expect_metric("throughput"), 42.5);
+}
+
+// ---------- avg_cpu_util_comp_scale (scx_layered util-compensation) ----------
+
+/// Build a `PerCpuTimeStats` with the eight `cpustat[]` ns slots set explicitly
+/// (order: user, nice, system, idle, iowait, irq, softirq, steal); other fields
+/// default. In-crate construction of the `#[non_exhaustive]` type.
+#[allow(clippy::too_many_arguments)]
+fn cpustat_row(
+    cpu: u32,
+    user: u64,
+    nice: u64,
+    system: u64,
+    idle: u64,
+    iowait: u64,
+    irq: u64,
+    softirq: u64,
+    steal: u64,
+) -> crate::monitor::dump::PerCpuTimeStats {
+    crate::monitor::dump::PerCpuTimeStats {
+        cpu,
+        cpustat_user_ns: user,
+        cpustat_nice_ns: nice,
+        cpustat_system_ns: system,
+        cpustat_idle_ns: idle,
+        cpustat_iowait_ns: iowait,
+        cpustat_irq_ns: irq,
+        cpustat_softirq_ns: softirq,
+        cpustat_steal_ns: steal,
+        ..Default::default()
+    }
+}
+
+/// The pure per-CPU scale mirrors scx_layered's `compute_scale(delta_total,
+/// overhead)`: split a window of `delta_total` ns into `overhead` ns of IRQ and
+/// the rest idle, so `scale = delta_total / (delta_total - overhead)`. Pins the
+/// six scx_layered util_compensation reference cases: (1000,0)->1.0,
+/// (1000,500)->2.0, (1000,900)->10.0, (1000,950)->20.0, (1000,980)->20.0 (ratio
+/// 50 clamped to the 20.0 cap), (1000,1000)->1.0 (available 0 -> the floor).
+#[test]
+fn cpu_util_comp_scale_matches_scx_layered_reference_cases() {
+    let zero = crate::monitor::dump::PerCpuTimeStats {
+        cpu: 0,
+        ..Default::default()
+    };
+    // overhead carried in irq; the remaining available carried in idle.
+    let case = |delta_total: u64, overhead: u64| {
+        let last = cpustat_row(0, 0, 0, 0, delta_total - overhead, 0, overhead, 0, 0);
+        crate::assert::cpu_util_comp_scale(&zero, &last)
+    };
+    assert!((case(1000, 0) - 1.0).abs() < 1e-9, "no overhead -> 1.0");
+    assert!((case(1000, 500) - 2.0).abs() < 1e-9, "50% overhead -> 2.0");
+    assert!(
+        (case(1000, 900) - 10.0).abs() < 1e-9,
+        "90% overhead -> 10.0"
+    );
+    assert!(
+        (case(1000, 950) - 20.0).abs() < 1e-9,
+        "95% overhead -> 20.0 (cap)"
+    );
+    assert!(
+        (case(1000, 980) - 20.0).abs() < 1e-9,
+        "98% overhead -> ratio 50 clamped to 20.0"
+    );
+    assert!(
+        (case(1000, 1000) - 1.0).abs() < 1e-9,
+        "all overhead -> available 0 -> 1.0 floor"
+    );
+}
+
+/// `delta_total` sums ALL 8 cpustat slots; `overhead` is exactly
+/// irq+softirq+steal. Every one of the 8 slots is set to a DISTINCT non-zero
+/// value, so dropping any slot from `delta_total`, dropping any of the three
+/// from `overhead`, or swapping a slot between the two groups moves the result
+/// off 2.0. Window: user 100 + nice 150 + system 200 + idle 250 + iowait 300
+/// (available 1000); irq 120 + softirq 380 + steal 500 (overhead 1000) ->
+/// delta_total 2000, available 1000, scale 2.0.
+#[test]
+fn cpu_util_comp_scale_uses_all_eight_slots_and_three_overhead_slots() {
+    let zero = crate::monitor::dump::PerCpuTimeStats {
+        cpu: 0,
+        ..Default::default()
+    };
+    let last = cpustat_row(0, 100, 150, 200, 250, 300, 120, 380, 500);
+    // delta_total = 100+150+200+250+300 (available 1000) + 120+380+500
+    // (overhead 1000) = 2000; available = 1000; scale = 2000/1000 = 2.0.
+    assert!((crate::assert::cpu_util_comp_scale(&zero, &last) - 2.0).abs() < 1e-9);
+}
+
+/// A cpustat counter that REGRESSES across the span (a CPU-hotplug reset, or a
+/// corrupt/hostile guest read where last < first) saturates each delta to 0
+/// rather than wrapping to ~`u64::MAX`: delta_total 0 -> available 0 -> the 1.0
+/// floor, no panic, no wrap-driven garbage scale.
+#[test]
+fn cpu_util_comp_scale_saturates_regressing_counters_to_floor() {
+    let first = cpustat_row(0, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000);
+    let last = crate::monitor::dump::PerCpuTimeStats {
+        cpu: 0,
+        ..Default::default()
+    };
+    assert_eq!(crate::assert::cpu_util_comp_scale(&first, &last), 1.0);
+}
+
+/// A hostile per-slot `u64::MAX` must not overflow-panic the `delta_total` /
+/// `overhead` saturating sums — the result is a finite clamped scale, not a
+/// panic. (Here every slot saturates: delta_total and overhead both pin to
+/// `u64::MAX`, so available 0 -> the 1.0 floor.)
+#[test]
+fn cpu_util_comp_scale_saturates_hostile_max_slot_no_panic() {
+    let zero = crate::monitor::dump::PerCpuTimeStats {
+        cpu: 0,
+        ..Default::default()
+    };
+    let last = cpustat_row(
+        0,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+    );
+    let s = crate::assert::cpu_util_comp_scale(&zero, &last);
+    assert!(
+        s.is_finite() && (1.0..=20.0).contains(&s),
+        "hostile max slots -> finite clamped scale, got {s}"
+    );
+}
+
+/// End-to-end through `build_phase_buckets`: two `per_cpu_time` freezes in one
+/// phase, two CPUs with distinct per-CPU scales, asserts the fold injects
+/// `avg_cpu_util_comp_scale` as the MEAN across CPUs (not the max or sum).
+/// First freeze all-zero; last freeze CPU0 idle 500 / irq 500 -> scale 2.0,
+/// CPU1 idle 250 / irq 750 -> available 250, delta_total 1000 -> scale 4.0;
+/// mean = 3.0. Pins the wiring between `fold_util_comp_scale` (phase_build) and
+/// the first->last per_cpu_time freeze span.
+#[test]
+fn build_phase_buckets_injects_avg_cpu_util_comp_scale_mean_across_cpus() {
+    use crate::monitor::dump::{FailureDumpReport, PerCpuTimeStats, SCHEMA_SINGLE};
+
+    fn entry(tag: &str, elapsed_ms: u64, rows: Vec<PerCpuTimeStats>) -> DrainedSnapshotEntry {
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: FailureDumpReport {
+                schema: SCHEMA_SINGLE.to_string(),
+                per_cpu_time: rows,
+                ..Default::default()
+            },
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: Some(elapsed_ms),
+            boundary_offset_ms: None,
+            step_index: Some(1),
+        }
+    }
+    let row = |cpu, idle, irq| PerCpuTimeStats {
+        cpu,
+        cpustat_idle_ns: idle,
+        cpustat_irq_ns: irq,
+        ..Default::default()
+    };
+    let drained = vec![
+        entry("periodic_000", 100, vec![row(0, 0, 0), row(1, 0, 0)]),
+        entry(
+            "periodic_001",
+            200,
+            vec![row(0, 500, 500), row(1, 250, 750)],
+        ),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("Step[0] bucket present");
+    let got = step0.metrics.get("avg_cpu_util_comp_scale").copied();
+    assert_eq!(
+        got,
+        Some(3.0),
+        "mean of per-CPU scales (2.0, 4.0) = 3.0, got {got:?}"
+    );
+}
+
+// ---------- avg_task_lat_cri / max_task_lat_cri (scx_lavd per-task lat_cri) ----
+
+/// Build an sdt_alloc snapshot entry whose BTF-rendered payload carries a
+/// `normalized_lat_cri` u16 member (the scx_lavd task_ctx field), so the
+/// `fold_lat_cri` arena walk extracts it via `RenderedValue::get`.
+fn lat_cri_entry(value: u64) -> crate::monitor::sdt_alloc::SdtAllocEntry {
+    use crate::monitor::btf_render::{RenderedMember, RenderedValue};
+    crate::monitor::sdt_alloc::SdtAllocEntry {
+        idx: 0,
+        genn: 0,
+        user_addr: 0,
+        payload: RenderedValue::Struct {
+            type_name: Some("task_ctx".to_string()),
+            members: vec![RenderedMember {
+                name: "normalized_lat_cri".to_string(),
+                value: RenderedValue::Uint { bits: 16, value },
+            }],
+        },
+    }
+}
+
+/// End-to-end through `build_phase_buckets`: two per-phase freezes each carrying
+/// an sdt_alloc snapshot with per-task `normalized_lat_cri` values, asserts
+/// `fold_lat_cri` injects `avg_task_lat_cri` (mean over (freeze, task)) +
+/// `max_task_lat_cri` (max). Freeze 1: [100, 200]; freeze 2: [300, 400] ->
+/// mean (100+200+300+400)/4 = 250, max 400. Pins the gauge fold across ALL
+/// samples (not first/last) and the cross-(freeze, task) mean+max.
+#[test]
+fn build_phase_buckets_injects_task_lat_cri_mean_and_max() {
+    use crate::monitor::dump::{FailureDumpReport, SCHEMA_SINGLE};
+    use crate::monitor::sdt_alloc::SdtAllocatorSnapshot;
+
+    fn entry(tag: &str, elapsed_ms: u64, lat_cris: &[u64]) -> DrainedSnapshotEntry {
+        let alloc = SdtAllocatorSnapshot {
+            allocator_name: "scx_task_allocator".to_string(),
+            entries: lat_cris.iter().map(|&v| lat_cri_entry(v)).collect(),
+            ..Default::default()
+        };
+        DrainedSnapshotEntry {
+            tag: tag.to_string(),
+            report: FailureDumpReport {
+                schema: SCHEMA_SINGLE.to_string(),
+                sdt_allocations: vec![alloc],
+                ..Default::default()
+            },
+            stats: Err(MissingStatsReason::NoSchedulerBinary),
+            elapsed_ms: Some(elapsed_ms),
+            boundary_offset_ms: None,
+            step_index: Some(1),
+        }
+    }
+    let drained = vec![
+        entry("periodic_000", 100, &[100, 200]),
+        entry("periodic_001", 200, &[300, 400]),
+    ];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("Step[0] bucket present");
+    assert_eq!(
+        step0.metrics.get("avg_task_lat_cri").copied(),
+        Some(250.0),
+        "mean of (100,200,300,400) over (freeze, task) = 250"
+    );
+    assert_eq!(
+        step0.metrics.get("max_task_lat_cri").copied(),
+        Some(400.0),
+        "max over (freeze, task) = 400"
+    );
+}
+
+/// Loud-absent: an arena payload WITHOUT a `normalized_lat_cri` member (a
+/// non-lavd scheduler's task_ctx) yields NO lat_cri key — `RenderedValue::get`
+/// returns None, the fold inserts nothing. Pins the member-name-only gate (no
+/// scheduler-name hardcoding) and the absent-vs-zero distinction.
+#[test]
+fn build_phase_buckets_lat_cri_absent_for_non_lavd_payload() {
+    use crate::monitor::btf_render::{RenderedMember, RenderedValue};
+    use crate::monitor::dump::{FailureDumpReport, SCHEMA_SINGLE};
+    use crate::monitor::sdt_alloc::{SdtAllocEntry, SdtAllocatorSnapshot};
+
+    let alloc = SdtAllocatorSnapshot {
+        allocator_name: "scx_task_allocator".to_string(),
+        entries: vec![SdtAllocEntry {
+            idx: 0,
+            genn: 0,
+            user_addr: 0,
+            payload: RenderedValue::Struct {
+                type_name: Some("other_taskc".to_string()),
+                members: vec![RenderedMember {
+                    name: "some_other_field".to_string(),
+                    value: RenderedValue::Uint { bits: 32, value: 7 },
+                }],
+            },
+        }],
+        ..Default::default()
+    };
+    let drained = vec![DrainedSnapshotEntry {
+        tag: "periodic_000".to_string(),
+        report: FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            sdt_allocations: vec![alloc],
+            ..Default::default()
+        },
+        stats: Err(MissingStatsReason::NoSchedulerBinary),
+        elapsed_ms: Some(100),
+        boundary_offset_ms: None,
+        step_index: Some(1),
+    }];
+    let samples = SampleSeries::from_drained_typed(drained, None);
+    let phases = crate::assert::build_phase_buckets(&samples);
+    let step0 = phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("Step[0] bucket present");
+    assert!(
+        !step0.metrics.contains_key("avg_task_lat_cri"),
+        "non-lavd payload (no normalized_lat_cri member) must not emit the key"
+    );
+    assert!(!step0.metrics.contains_key("max_task_lat_cri"));
 }

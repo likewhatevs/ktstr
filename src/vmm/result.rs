@@ -84,6 +84,16 @@ pub struct VmResult {
     /// Below `vcpus` means host overcommit, which confounds the
     /// guest-scheduler timing metrics.
     pub cpu_budget: u32,
+    /// How the userspace scheduler binary was resolved for this run —
+    /// the snake_case `crate::test_support::ResolveSource::as_str` tag
+    /// (`"auto_built"`, `"target_debug"`, `"path"`, ...). Stamped by the
+    /// host eval layer (`run_ktstr_test_inner_impl`) AFTER the run,
+    /// alongside `entry_name` / `variant_hash`, then carried to the
+    /// sidecar `resolve_source` stamp the same way `vcpus` / `cpu_budget`
+    /// are. `None` for VmResults built outside the host eval path (the
+    /// freeze coordinator, test fixtures) — those resolve no scheduler
+    /// binary.
+    pub resolve_source: Option<String>,
     /// True when the `#[ktstr_test(expect_auto_repro)]` attribute set
     /// `expect_auto_repro = true` on the entry AND the auto-repro
     /// path fired with a valid repro artifact during the run — the
@@ -247,17 +257,20 @@ pub struct VmResult {
     #[allow(dead_code)]
     pub virtio_blk_counters: Option<VirtioBlkCountersSnapshot>,
     /// Host-side virtio-net device counters, snapshotted after the
-    /// guest has exited. `Some(_)` when the builder attached a
-    /// network via `super::KtstrVmBuilder::network`; `None` when
-    /// no network was configured and
-    /// `super::KtstrVm::init_virtio_net` returned `None`. The
-    /// device increments its internal `AtomicU64` counters on the
+    /// guest has exited — the cross-NIC AGGREGATE (field-wise
+    /// saturating sum via `VirtioNetCountersSnapshot::aggregate`) over
+    /// every attached NIC. `Some(_)` when the builder attached one or
+    /// more networks via `super::KtstrVmBuilder::network`; `None` when
+    /// no network was configured (the aggregate over an empty NIC set).
+    /// Each NIC's device increments its own `AtomicU64` counters on the
     /// vCPU thread inside `process_tx_loopback`; by the time
     /// `collect_results` constructs the [`VmResult`] every vCPU has
-    /// joined and no further mutation can occur. The snapshot is
-    /// taken at that point — readers see plain `u64` fields holding
-    /// the final cumulative totals; no atomic load is needed on the
-    /// consumer side.
+    /// joined and no further mutation can occur. The per-NIC snapshots
+    /// are summed at that point — readers see plain `u64` fields holding
+    /// the final cumulative totals across all NICs; no atomic load is
+    /// needed on the consumer side. Per-NIC IRQ-delivery observability
+    /// comes from the per-CPU / per-IRQ metrics axis, not these
+    /// device-internal loopback counters.
     ///
     /// The counter struct exposes thirteen `AtomicU64` fields, each
     /// bumped across the TX-drain path rooted at `process_tx_loopback`
@@ -454,6 +467,14 @@ pub struct VmResult {
     /// hardcoded literal silently, where the method-form derives
     /// from this field automatically.
     pub entry_name: Option<&'static str>,
+    /// The run's variant hash (see `variant_hash_from_parts`),
+    /// stamped alongside [`Self::entry_name`] after `vm.run()` returns.
+    /// The post-VM `failure_dump_path` / `wprof_pb_path` derivations
+    /// embed it as the `-{16-hex}` filename suffix so a gauntlet test's
+    /// per-preset dumps don't clobber and each matches its sidecar's
+    /// variant hash. `0` on a synthesized/fixture result (which has
+    /// `entry_name = None` and thus bails before reading this).
+    pub variant_hash: u64,
     /// Memoized single drain of [`Self::snapshot_bridge`].
     ///
     /// The snapshot bridge yields each capture exactly once, but two
@@ -758,6 +779,33 @@ impl VmResult {
     /// no carriers and returns the host-rebuilt buckets alone (the prior
     /// behavior).
     pub fn phase_buckets(&self) -> Vec<crate::assert::PhaseBucket> {
+        let mut buckets = self.phase_buckets_pre_derive();
+        // Derive the per-phase scalars into the now-final (post-fold) buckets so
+        // a per-phase A/B claim reads them via phase_metric / phase_cgroup_metric:
+        // the non-schbench carrier scalars (every cgroup) into each pc.metrics,
+        // and the schbench scalars into pc.metrics + the pooled bucket.metrics.
+        // A no-op only when no phase carries a per-cgroup carrier; must run
+        // post-fold (the merge skips is_derived keys, so an earlier derive would
+        // be dropped).
+        crate::assert::derive_phase_metrics(&mut buckets);
+        buckets
+    }
+
+    /// The pre-`derive_phase_metrics` phase fold: host buckets from
+    /// [`Self::periodic_series`] + [`Self::stimulus_timeline`] with the guest
+    /// per-cgroup carriers folded in, BEFORE the per-phase scalar derivation
+    /// [`Self::phase_buckets`] applies. This is the exact phase state the eval
+    /// layer feeds to the run-level ext-metrics population
+    /// (`populate_run_ext_metrics_from_phases` runs on the pre-derive phases;
+    /// `derive_phase_metrics` runs AFTER, inside `evaluate_vm_result`), so
+    /// [`Self::run_metric`] reuses it to reproduce that sequence by construction
+    /// (eval-faithful): post-derive phases yield the same run-level map today (the
+    /// run-level phase fold skips `is_derived` keys, and the pooled scalars
+    /// `derive_phase_metrics` adds are all `PerPhase`), but the pre-derive fold
+    /// avoids depending on that skip, so a pooled key ever registered as
+    /// non-derived cannot diverge `run_metric` from the eval map. Non-destructive
+    /// on the snapshot bridge, like [`Self::phase_buckets`].
+    fn phase_buckets_pre_derive(&self) -> Vec<crate::assert::PhaseBucket> {
         let host = crate::assert::build_phase_buckets_with_stimulus(
             &self.periodic_series(),
             &self.stimulus_timeline(),
@@ -794,8 +842,9 @@ impl VmResult {
 
     /// One framework-computed per-phase metric for `phase` — the
     /// metric-name analog of [`Self::step_throughput`] /
-    /// [`Self::throughput_ratio`]. Resolves `metric` (a
-    /// `crate::stats::METRICS` registry name) from the folded
+    /// [`Self::throughput_ratio`]. Resolves `metric` (any `impl Into<MetricId>` —
+    /// a typed `BuiltinMetric`, typo-proof, or a dynamic scheduler-runtime
+    /// string) from the folded
     /// [`Self::phase_buckets`] bucket for `phase`, checking two stores:
     /// 1. [`crate::assert::PhaseBucket::metrics`] (via
     ///    [`crate::assert::PhaseBucket::get`]) — the host-folded
@@ -806,7 +855,8 @@ impl VmResult {
     /// 2. failing that, the cross-cgroup phase sum of a per-cgroup Counter
     ///    ([`crate::assert::PhaseBucket::cgroup_counter_total`]) for the
     ///    keys whose value lives ONLY in the per-cgroup carriers —
-    ///    `"total_migrations"` and `"total_iterations"`. These are
+    ///    `"total_migrations"`, `"total_iterations"`, and
+    ///    `"total_cpu_time_ns"`. These are
     ///    registered `Counter`s with no per-sample source
     ///    (`crate::stats::MetricDef::read_sample` returns `None`), so
     ///    they never reach `metrics`; without this fallback
@@ -836,11 +886,221 @@ impl VmResult {
     /// started-but-uncaptured step (a `StepStart` with zero captures) DOES
     /// produce a synthesized bucket, so `phase_metric` returns its
     /// stimulus-derived `iteration_rate` rather than `None`.
-    pub fn phase_metric(&self, phase: crate::assert::Phase, metric: &str) -> Option<f64> {
+    ///
+    /// ```ignore
+    /// // Typed (typo-proof) is the primary form; a dynamic scheduler-runtime
+    /// // string is the escape hatch through the SAME call.
+    /// let p99 = result.phase_metric(Phase::step(0), BuiltinMetric::WakeupP99LatencyUs);
+    /// let custom = result.phase_metric(Phase::step(0), "scx_layered_layer0_util");
+    /// ```
+    pub fn phase_metric(
+        &self,
+        phase: crate::assert::Phase,
+        metric: impl Into<crate::stats::MetricId>,
+    ) -> Option<f64> {
+        let metric = metric.into();
         self.phase_buckets()
             .into_iter()
             .find(|b| b.step_index == phase.as_u16())
-            .and_then(|b| b.get(metric).or_else(|| b.cgroup_counter_total(metric)))
+            .and_then(|b| {
+                b.get(metric.as_str())
+                    .or_else(|| b.cgroup_counter_total(metric.as_str()))
+            })
+    }
+
+    /// One run-level extensible ("ext") metric by name — the whole-run analog of
+    /// [`Self::phase_metric`], for a `post_vm` callback asserting a run-level
+    /// aggregate (e.g. `avg_irq_util`, `max_cpu_hardirqs`,
+    /// `worst_p99_wake_latency_us`, `iterations_per_cpu_sec`). SELF-COMPUTES the
+    /// run-level `ext_metrics` map exactly as the framework's `evaluate_vm_result`
+    /// does — a [`VmResult`](Self) carries no stored run-level stats (`post_vm`
+    /// runs BEFORE the host populates them) — by replaying the shared
+    /// [`crate::assert::populate_run_ext_all`] sequence over
+    /// [`Self::periodic_series`], the pre-derive phase fold
+    /// (`phase_buckets_pre_derive`), and the guest per-cgroup `stats.cgroups`.
+    /// The result is byte-identical to the run-level `ext_metrics` the sidecar
+    /// records for this run.
+    ///
+    /// Resolves the ext-sourced family that
+    /// [`crate::assert::ScenarioStats::run_metric`] (the post-merge host
+    /// accessor) resolves — the `read_sample`-wired registry metrics, the
+    /// phase-only ext metrics (`avg_imbalance_ratio`, `iteration_rate`,
+    /// `system_time_ns`, `user_time_ns`, the IRQ counters/rates, the per-CPU
+    /// spatial maxes `max_cpu_hardirqs` / `max_cpu_softirq_net_rx` and their
+    /// concentrations), the pooled `iterations_per_cpu_sec`, and the run-level
+    /// `Distribution` / `WorstLowest` / `WakeLatencyTailRatio` / `WorstCrossNodeRatio`
+    /// re-pools — and for
+    /// those keys the two accessors return identical values (this one
+    /// self-computes pre-merge, the other reads the stored post-merge map).
+    ///
+    /// ADDITIONALLY resolves the 5 ext-only run-level MONITOR metrics from
+    /// [`Self::monitor`]'s summary: `avg_nr_running`, `avg_irq_util`,
+    /// `max_avg_irq_util`, `psi_irq_full_avg10`, `total_irq_pressure_us` (folded
+    /// via `MonitorSummary::fold_run_level_ext`, shared with the sidecar row).
+    /// These DIVERGE from [`crate::assert::ScenarioStats::run_metric`], which has
+    /// no `MonitorReport` to fold and returns `None` for them — the one place the
+    /// two accessors differ.
+    ///
+    /// RESOLVED here None-aware (via the delegated `ScenarioStats::run_metric`
+    /// typed dispatch): the cross-cgroup metrics `worst_spread`,
+    /// `worst_migration_ratio`, `worst_gap_ms`, `total_migrations`,
+    /// `total_iterations`, `worst_page_locality`,
+    /// `worst_cross_node_migration_ratio`. The dispatch re-derives each from the
+    /// carriers (the per-cgroup `stats.cgroups` + the per_cgroup-folded
+    /// `stats.phases` this method builds) — `None` when no carrier measured it,
+    /// `Some(0.0)` for a measured zero. The 5 non-NUMA metrics are 0.0-sentinel
+    /// typed struct fields (re-derived because the field cannot carry the
+    /// measured-vs-unmeasured distinction); the two NUMA roll-ups
+    /// (`worst_page_locality`, `worst_cross_node_migration_ratio`) have no struct
+    /// field and re-pool purely from the per-phase NUMA carriers.
+    ///
+    /// NOT resolved here:
+    /// - the typed-backed monitor run-level metrics (`max_imbalance_ratio`,
+    ///   `max_dsq_depth`, `stuck_count`, `total_fallback`, `total_keep_last`) —
+    ///   these have typed `GauntletRow` fields (not ext-only); read them
+    ///   per-phase via [`Self::phase_metric`].
+    ///
+    /// Sentinel-free, matching [`Self::phase_metric`]: `None` means the metric is
+    /// absent from this run (no populator produced it, or a name not in the map);
+    /// `Some(0.0)` is a real measured zero. Check [`crate::stats::MetricId::def`]
+    /// on a dynamic key to distinguish an unregistered key from genuinely-absent
+    /// data (built-in ids always resolve).
+    ///
+    /// A host-only run (no guest verdict — [`Self::guest_assert_result`] `Err`)
+    /// resolves the SampleSeries + phase families but no per-cgroup pooled /
+    /// distribution keys (no per-cgroup data exists), the same absence
+    /// [`crate::assert::ScenarioStats::run_metric`] documents.
+    ///
+    /// Non-destructive: reads the memoized snapshot-bridge drain
+    /// ([`Self::periodic_series`] / [`Self::phase_buckets`]) and the
+    /// already-drained `guest_messages`, so it composes with [`Self::phase_metric`]
+    /// in one `post_vm` callback.
+    ///
+    /// ```ignore
+    /// let irq = result.run_metric(BuiltinMetric::AvgIrqUtil);
+    /// let custom = result.run_metric("scx_layered_layer0_util");
+    /// ```
+    pub fn run_metric(&self, metric: impl Into<crate::stats::MetricId>) -> Option<f64> {
+        let metric = metric.into();
+        let mut stats = crate::assert::ScenarioStats {
+            phases: self.phase_buckets_pre_derive(),
+            cgroups: self
+                .guest_assert_result()
+                .map(|g| g.stats.cgroups)
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        crate::assert::populate_run_ext_all(&mut stats, &self.periodic_series());
+        // Fold the run-level ext-only monitor metrics (avg_nr_running + the PELT
+        // IRQ load pair + the PSI-irq pair) from the stored MonitorReport
+        // summary. populate_run_ext_all can't produce them — they're
+        // MonitorSummary-sourced, not phase/series-folded — but VmResult holds
+        // self.monitor, so (unlike ScenarioStats::run_metric, which has no
+        // monitor) this accessor CAN resolve them. Shared with
+        // group::sidecar_to_row via fold_run_level_ext.
+        if let Some(report) = self.monitor.as_ref() {
+            report.summary.fold_run_level_ext(&mut stats.ext_metrics);
+        }
+        // Delegate to ScenarioStats::run_metric: it resolves the typed
+        // 0.0-sentinel cross-cgroup fields None-aware from the carriers
+        // (stats.cgroups + the per_cgroup-folded stats.phases, both populated
+        // above) ahead of the ext lookup — so the typed fields resolve here too,
+        // matching ScenarioStats::run_metric. The monitor metrics folded into
+        // stats.ext_metrics above resolve via that method's ext fallback.
+        stats.run_metric(metric)
+    }
+
+    /// Polarity-aware "is the `candidate` phase better than the `baseline` phase
+    /// on `metric`?" comparator — the per-phase A/B primitive for "assert
+    /// scheduler X beats EEVDF across phases" (e.g. an scx Step vs the EEVDF
+    /// Step after `Op::DetachScheduler`). Resolves both per-phase values via
+    /// [`Self::phase_metric`] and the metric's polarity via
+    /// `crate::stats::metric_def`, then returns a
+    /// [`crate::assert::temporal::BetterThanPhase`] builder whose terminal
+    /// (`better_than` / `by_at_least`) records the outcome into `verdict`.
+    /// "Better" is oriented from the registry polarity, so the SAME call works
+    /// for a LowerBetter latency (`BuiltinMetric::WakeupP99LatencyUs`) and a
+    /// HigherBetter throughput (`BuiltinMetric::SchbenchLoopCount`) with no
+    /// caller-specified direction.
+    ///
+    /// A post_vm callback collapses the verdict to its `anyhow::Result` via
+    /// [`crate::assert::Verdict::into_anyhow_or_log`], which bails on a Fail OR
+    /// an Inconclusive — so a missing metric (a phase with no schbench carrier),
+    /// an undirected metric, or a zero-baseline fractional-margin comparison
+    /// does NOT silently pass.
+    pub fn better_across_phases<'v>(
+        &self,
+        verdict: &'v mut crate::assert::Verdict,
+        baseline: crate::assert::Phase,
+        candidate: crate::assert::Phase,
+        metric: impl Into<crate::stats::MetricId>,
+    ) -> crate::assert::temporal::BetterThanPhase<'v> {
+        let metric = metric.into();
+        crate::assert::temporal::BetterThanPhase::new(
+            metric.as_str().to_string(),
+            verdict,
+            baseline,
+            candidate,
+            self.phase_metric(baseline, metric.clone()),
+            self.phase_metric(candidate, metric.clone()),
+            metric.def().map(|m| m.polarity),
+            None, // pooled producer — no per-cgroup scope label
+        )
+    }
+
+    /// One per-phase, PER-CGROUP derived metric — the per-cgroup analog of
+    /// [`Self::phase_metric`], answering "metric M of cgroup C in phase P" as
+    /// readily as the phase aggregate (the N-cgroups-to-N-queryable-sets goal).
+    /// Resolves `metric` (any `impl Into<MetricId>` — a typed `BuiltinMetric` or
+    /// a dynamic scheduler-runtime string) from this
+    /// cgroup's per-phase carrier via [`crate::assert::PhaseCgroupStats::get`] (its
+    /// derived `metrics` map), falling back to
+    /// [`crate::assert::PhaseCgroupStats::cgroup_counter`] for the per-cgroup
+    /// Counters `total_migrations`/`total_iterations`/`total_cpu_time_ns` (carrier
+    /// fields, not derived) — symmetric with [`Self::phase_metric`]'s
+    /// `cgroup_counter_total` fallback.
+    /// `None` when `phase` has no bucket, the bucket has no carrier for `cgroup`, or
+    /// the carrier carried no finite value for the metric — sentinel-free, distinct
+    /// from a real `Some(0.0)`.
+    pub fn phase_cgroup_metric(
+        &self,
+        phase: crate::assert::Phase,
+        cgroup: &str,
+        metric: impl Into<crate::stats::MetricId>,
+    ) -> Option<f64> {
+        let metric = metric.into();
+        self.phase_cgroup(phase, cgroup).and_then(|pc| {
+            pc.get(metric.as_str())
+                .or_else(|| pc.cgroup_counter(metric.as_str()))
+        })
+    }
+
+    /// Per-cgroup analog of [`Self::better_across_phases`]: "is `metric` of
+    /// `cgroup` better in the `candidate` phase than the `baseline` phase?",
+    /// oriented from the registry polarity. Reuses the SAME
+    /// [`crate::assert::temporal::BetterThanPhase`] comparator/verdict machinery;
+    /// only value resolution is re-scoped from the pooled aggregate to the named
+    /// cgroup, so a missing carrier / undirected metric / zero-baseline margin
+    /// collapses to Inconclusive (not a silent pass), exactly as the pooled form.
+    pub fn better_across_phases_cgroup<'v>(
+        &self,
+        verdict: &'v mut crate::assert::Verdict,
+        baseline: crate::assert::Phase,
+        candidate: crate::assert::Phase,
+        cgroup: &str,
+        metric: impl Into<crate::stats::MetricId>,
+    ) -> crate::assert::temporal::BetterThanPhase<'v> {
+        let metric = metric.into();
+        crate::assert::temporal::BetterThanPhase::new(
+            metric.as_str().to_string(),
+            verdict,
+            baseline,
+            candidate,
+            self.phase_cgroup_metric(baseline, cgroup, metric.clone()),
+            self.phase_cgroup_metric(candidate, cgroup, metric.clone()),
+            metric.def().map(|m| m.polarity),
+            Some(cgroup.to_string()), // per-cgroup scope label for the diagnostics
+        )
     }
 
     /// Minimal "nothing happened" fixture for tests that exercise
@@ -869,6 +1129,7 @@ impl VmResult {
             success: true,
             vcpus: 1,
             cpu_budget: 1,
+            resolve_source: None,
             expect_auto_repro_satisfied: false,
             exit_code: 0,
             duration: Duration::from_secs(1),
@@ -890,12 +1151,13 @@ impl VmResult {
             periodic_target: 0,
             kern_kaslr_offset: 0,
             entry_name: None,
+            variant_hash: 0,
             periodic_series_cache: std::sync::OnceLock::new(),
         }
     }
 
     /// Per-test sidecar path for the `.wprof.pb` artifact:
-    /// `{sidecar_dir()}/{entry_name}.wprof.pb`.
+    /// `{sidecar_dir()}/{entry_name}-{variant_hash:016x}.wprof.pb`.
     #[cfg(feature = "wprof")]
     pub fn wprof_pb_path(&self) -> anyhow::Result<std::path::PathBuf> {
         let name = self.entry_name.ok_or_else(|| {
@@ -910,7 +1172,8 @@ impl VmResult {
                  before calling .wprof_pb_path()."
             )
         })?;
-        Ok(crate::test_support::sidecar_dir().join(format!("{name}.wprof.pb")))
+        Ok(crate::test_support::sidecar_dir()
+            .join(format!("{name}-{:016x}.wprof.pb", self.variant_hash)))
     }
 
     /// Per-test sidecar path for the `.repro.wprof.pb` artifact.
@@ -928,12 +1191,13 @@ impl VmResult {
                  manually before calling."
             )
         })?;
-        Ok(crate::test_support::sidecar_dir().join(format!("{name}.repro.wprof.pb")))
+        Ok(crate::test_support::sidecar_dir()
+            .join(format!("{name}-{:016x}.repro.wprof.pb", self.variant_hash)))
     }
 
     /// Per-test failure-dump sidecar path. Derives
-    /// `{sidecar_dir()}/{entry_name}.failure-dump.json` from
-    /// the macro-stamped [`Self::entry_name`].
+    /// `{sidecar_dir()}/{entry_name}-{variant_hash:016x}.failure-dump.json`
+    /// from the macro-stamped [`Self::entry_name`].
     ///
     /// # Sibling to
     /// [`crate::scenario::Ctx::failure_dump_path`]
@@ -967,7 +1231,10 @@ impl VmResult {
                  assign entry_name manually before calling."
             )
         })?;
-        Ok(crate::test_support::sidecar_dir().join(format!("{name}.failure-dump.json")))
+        Ok(crate::test_support::sidecar_dir().join(format!(
+            "{name}-{:016x}.failure-dump.json",
+            self.variant_hash
+        )))
     }
 
     /// Concatenated guest `/dev/kmsg` content forwarded via
@@ -1200,7 +1467,7 @@ pub(crate) struct VmRunState {
     /// finally the BPF verifier-stat read inside
     /// [`super::KtstrVm::collect_results`].
     pub(crate) cleanup_start: Instant,
-    /// Cloned counter handle from [`super::KtstrVm::init_virtio_blk`]
+    /// Cloned counter handle from `KtstrVm::init_virtio_blk`
     /// when a disk was attached, captured before the device-arc is
     /// dropped so [`super::KtstrVm::collect_results`] can snapshot
     /// it into [`VmResult::virtio_blk_counters`]. The device worker
@@ -1213,20 +1480,20 @@ pub(crate) struct VmRunState {
     /// loads the final cumulative state into a plain-u64 snapshot
     /// before storing on the public `VmResult`.
     pub(crate) virtio_blk_counters: Option<Arc<VirtioBlkCounters>>,
-    /// Cloned counter handle from [`super::KtstrVm::init_virtio_net`]
-    /// when a network was attached, captured before the device-arc
-    /// is dropped so [`super::KtstrVm::collect_results`] can
-    /// snapshot it into [`VmResult::virtio_net_counters`]. Same
-    /// Arc-handoff + snapshot-at-assignment pattern as
-    /// `virtio_blk_counters` above.
-    pub(crate) virtio_net_counters: Option<Arc<VirtioNetCounters>>,
+    /// Cloned per-NIC counter handles from the net device init
+    /// (`init_virtio_net` on aarch64 / `init_virtio_net_pci` on x86_64, both
+    /// arch-gated), one per attached NIC, captured before the device arcs are
+    /// dropped so [`super::KtstrVm::collect_results`] can snapshot and aggregate
+    /// them into [`VmResult::virtio_net_counters`] via
+    /// [`VirtioNetCountersSnapshot::aggregate`]. Empty when no NIC is attached.
+    pub(crate) virtio_net_counters: Vec<Arc<VirtioNetCounters>>,
     /// Snapshot bridge owning every report captured during the run.
     /// The freeze coordinator clones this bridge into its closure
     /// state; on every guest-side
     /// [`crate::vmm::wire::MSG_TYPE_SNAPSHOT_REQUEST`] frame the
     /// coordinator's TOKEN_TX handler decoded with kind
     /// [`crate::vmm::wire::SNAPSHOT_KIND_CAPTURE`], the dispatch runs
-    /// `freeze_and_capture(false)` and stores the resulting
+    /// `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` and stores the resulting
     /// `FailureDumpReport` here keyed by the snapshot name. After
     /// VM exit, [`super::KtstrVm::collect_results`] forwards the
     /// bridge onto [`VmResult::snapshot_bridge`] so the test code
@@ -1954,18 +2221,20 @@ mod tests {
     fn vm_result_wprof_pb_path_returns_writer_mirror_path() {
         let r = VmResult {
             entry_name: Some("vm_result_wprof_pb_path_returns_writer_mirror_path_fixture"),
+            variant_hash: 0xab,
             ..VmResult::test_fixture()
         };
         let path = r.wprof_pb_path().expect("Some entry_name must Ok");
-        // The path's file_name must exactly match `<entry_name>.wprof.pb`
-        // — the writer in `run_ktstr_test_inner_impl` uses the same `format!("{}.wprof.pb",
-        // entry.name)` pattern. A divergence here would mean the
-        // method derives a different path than the writer wrote to,
-        // surfacing as ENOENT in the post_vm callback.
+        // The path's file_name must exactly match
+        // `<entry_name>-<variant_hash:016x>.wprof.pb` — the writer uses
+        // the same variant-keyed pattern (the wprof writer reads this
+        // very method). A divergence would mean the method derives a
+        // different path than the writer wrote to, surfacing as ENOENT in
+        // the post_vm callback.
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap();
         assert_eq!(
             file_name,
-            "vm_result_wprof_pb_path_returns_writer_mirror_path_fixture.wprof.pb",
+            "vm_result_wprof_pb_path_returns_writer_mirror_path_fixture-00000000000000ab.wprof.pb",
         );
     }
 
@@ -1986,13 +2255,14 @@ mod tests {
     fn vm_result_repro_wprof_pb_path_returns_writer_mirror_path() {
         let r = VmResult {
             entry_name: Some("vm_result_repro_wprof_pb_path_fixture"),
+            variant_hash: 0xab,
             ..VmResult::test_fixture()
         };
         let path = r.repro_wprof_pb_path().expect("Some entry_name must Ok");
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap();
         assert_eq!(
             file_name,
-            "vm_result_repro_wprof_pb_path_fixture.repro.wprof.pb"
+            "vm_result_repro_wprof_pb_path_fixture-00000000000000ab.repro.wprof.pb"
         );
     }
 

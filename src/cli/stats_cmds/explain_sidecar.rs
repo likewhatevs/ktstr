@@ -111,11 +111,11 @@ struct NoneCatalogEntry {
 /// field MUST update this catalog; the
 /// `none_catalog_covers_every_option_field` test enforces
 /// `SIDECAR_NONE_CATALOG.len() == EXPECTED_OPTION_FIELD_COUNT`
-/// (a hand-coded `10`) and asserts the projection helper
+/// (a hand-coded `11`) and asserts the projection helper
 /// enumerates the same field names in the same order. A new
 /// `Option` field on `SidecarResult` requires bumping the
 /// constant, extending [`project_optional_fields`]'s array
-/// (which has compile-checked length `10` and will fail to
+/// (which has compile-checked length `11` and will fail to
 /// compile on a missing entry), and adding a catalog row.
 const SIDECAR_NONE_CATALOG: &[NoneCatalogEntry] = &[
     NoneCatalogEntry {
@@ -126,6 +126,21 @@ const SIDECAR_NONE_CATALOG: &[NoneCatalogEntry] = &[
              enrichment (e.g. --version probe or ELF-note read on \
              the resolved scheduler binary)"],
         fix: None,
+    },
+    NoneCatalogEntry {
+        field: "resolve_source",
+        classification: NoneClassification::Actionable,
+        causes: &[
+            "the sidecar predates the `resolve_source` field (added when \
+             scheduler-resolution provenance began being recorded), so it \
+             falls back to None via serde's tolerate-absence rule",
+            "a pre-VM-boot skip: no scheduler binary was resolved, so there \
+             is no discovery path to record",
+        ],
+        fix: Some(
+            "re-run the test to regenerate the sidecar — a real run records \
+             the scheduler's discovery path",
+        ),
     },
     NoneCatalogEntry {
         field: "project_commit",
@@ -250,7 +265,7 @@ const SIDECAR_NONE_CATALOG: &[NoneCatalogEntry] = &[
 /// same order as [`SIDECAR_NONE_CATALOG`].
 ///
 /// Hand-written rather than derived because:
-/// - Only the 10 `Option<T>` fields are diagnostic surface; the
+/// - Only the 11 `Option<T>` fields are diagnostic surface; the
 ///   non-`Option` fields (`test_name`, `passed`, `stats`, etc.)
 ///   are always populated by deserialize and would clutter the
 ///   output without adding signal.
@@ -260,14 +275,15 @@ const SIDECAR_NONE_CATALOG: &[NoneCatalogEntry] = &[
 ///
 /// A future schema addition that introduces a new `Option<T>`
 /// field on `SidecarResult` MUST update this projection; the
-/// `[(_, _); 10]` array literal makes the length compile-checked
+/// `[(_, _); 11]` array literal makes the length compile-checked
 /// — adding an entry without updating the length is a compile
 /// error — and the `none_catalog_covers_every_option_field` test
 /// asserts the catalog and projection enumerate the same names
 /// in the same order.
-fn project_optional_fields(sc: &crate::test_support::SidecarResult) -> [(&'static str, bool); 10] {
+fn project_optional_fields(sc: &crate::test_support::SidecarResult) -> [(&'static str, bool); 11] {
     [
         ("scheduler_commit", sc.scheduler_commit.is_some()),
+        ("resolve_source", sc.resolve_source.is_some()),
         ("project_commit", sc.project_commit.is_some()),
         ("payload", sc.payload.is_some()),
         ("monitor", sc.monitor.is_some()),
@@ -702,7 +718,7 @@ mod tests {
     /// the projected-fields helper must enumerate the same set.
     #[test]
     fn none_catalog_covers_every_option_field() {
-        const EXPECTED_OPTION_FIELD_COUNT: usize = 10;
+        const EXPECTED_OPTION_FIELD_COUNT: usize = 11;
         assert_eq!(
             SIDECAR_NONE_CATALOG.len(),
             EXPECTED_OPTION_FIELD_COUNT,
@@ -775,7 +791,13 @@ mod tests {
                 .iter()
                 .map(|e| (e.field, e.fix))
                 .collect();
-        let must_fix = ["project_commit", "kernel_commit", "host", "run_source"];
+        let must_fix = [
+            "project_commit",
+            "kernel_commit",
+            "host",
+            "run_source",
+            "resolve_source",
+        ];
         let must_not_fix = [
             "scheduler_commit",
             "payload",
@@ -888,7 +910,7 @@ mod tests {
     }
 
     /// Happy path: one fixture sidecar (every Option None). Text
-    /// output must list ALL ten fields under "none fields" with
+    /// output must list ALL eleven fields under "none fields" with
     /// classifications + at least one cause string per entry.
     #[test]
     fn explain_sidecar_text_lists_all_none_fields_for_fixture() {
@@ -905,8 +927,8 @@ mod tests {
         assert!(out.contains("walked 1"), "header must report walked: {out}");
         assert!(out.contains("parsed 1"), "header must report parsed: {out}");
         assert!(
-            out.contains("none fields (10)"),
-            "fixture has every Option as None — count must be 10: {out}",
+            out.contains("none fields (11)"),
+            "fixture has every Option as None — count must be 11: {out}",
         );
         for entry in SIDECAR_NONE_CATALOG {
             assert!(
@@ -1094,7 +1116,7 @@ mod tests {
             out.contains("payload"),
             "populated `payload` must appear: {out}",
         );
-        assert!(out.contains("none fields (7)"), "must report 7 None: {out}",);
+        assert!(out.contains("none fields (8)"), "must report 8 None: {out}",);
     }
 
     /// Per-sidecar text output: `arch:` line surfaces under each
@@ -1385,8 +1407,8 @@ mod tests {
         let _: serde_json::Value = serde_json::from_str(&out).expect("output must be valid JSON");
     }
 
-    /// Partial population: 7 of 10 Options populated; report shows
-    /// "populated optional fields (7)" + "none fields (3)".
+    /// Partial population: 7 of 11 Options populated; report shows
+    /// "populated optional fields (7)" + "none fields (4)".
     #[test]
     fn explain_sidecar_text_handles_partial_population() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1408,11 +1430,11 @@ mod tests {
         let out = explain_sidecar("run-partial-pop", Some(tmp.path()), false).unwrap();
         assert!(
             out.contains("populated optional fields (7)"),
-            "7 of 10 Options populated must be reflected in the count: {out}",
+            "7 of 11 Options populated must be reflected in the count: {out}",
         );
         assert!(
-            out.contains("none fields (3)"),
-            "3 of 10 Options remain None — must report (3): {out}",
+            out.contains("none fields (4)"),
+            "4 of 11 Options remain None — must report (4): {out}",
         );
     }
 
@@ -1694,6 +1716,7 @@ mod tests {
         sc.kernel_commit = Some("cccc333".to_string());
         sc.cleanup_duration_ms = Some(123);
         sc.run_source = Some("local".to_string());
+        sc.resolve_source = Some("auto_built".to_string());
         sc.monitor = Some(crate::monitor::MonitorSummary::default());
         sc.kvm_stats = Some(crate::vmm::KvmStatsTotals::default());
         sc.host = Some(crate::host_context::HostContext::test_fixture());
@@ -1756,6 +1779,9 @@ mod tests {
         let _lock = lock_env();
         let tmp = tempfile::tempdir().unwrap();
         let _env_target = EnvVarGuard::set("CARGO_TARGET_DIR", tmp.path());
+        // Clear the orchestrator's KTSTR_RUNS_ROOT so runs_root() resolves
+        // via CARGO_TARGET_DIR (the default this test pins).
+        let _env_runs_root = EnvVarGuard::remove(crate::KTSTR_RUNS_ROOT_ENV);
         let _env_sidecar = EnvVarGuard::remove(crate::KTSTR_SIDECAR_DIR_ENV);
         let runs_root = tmp.path().join("ktstr");
         let run_dir = runs_root.join("run-default-root");
@@ -1850,6 +1876,7 @@ mod tests {
             ("host", NoneClassification::Actionable),
             ("cleanup_duration_ms", NoneClassification::Actionable),
             ("run_source", NoneClassification::Actionable),
+            ("resolve_source", NoneClassification::Actionable),
         ];
         assert_eq!(
             expected_pairs.len(),

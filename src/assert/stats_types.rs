@@ -220,6 +220,39 @@ pub struct CgroupStats {
     /// [`WorkerReport::wake_latencies_ns`] directly if per-worker
     /// CV is needed.
     pub wake_latency_cv: f64,
+    /// Whether any worker in this cgroup recorded a wake-latency sample.
+    /// `false` makes the wake reductions above (`p99_wake_latency_us`,
+    /// `median_wake_latency_us`, `wake_latency_cv`) a not-measured sentinel
+    /// `0.0` rather than a measured zero — a percentile over zero samples is
+    /// undefined, not "instant wakes". The run-level distributional re-pool
+    /// (`populate_run_distribution_metrics`) reads this to EXCLUDE a
+    /// no-wake-sample cgroup from the cross-run mean instead of folding its
+    /// `0.0` in (which, for the LowerBetter wake metrics, would falsely drag
+    /// the mean toward "perfect"). Same not-measured-vs-measured-zero
+    /// discipline the off-CPU% `Option` fields above carry.
+    pub wake_measured: bool,
+    /// Median timer-latency across all workers (microseconds) — the
+    /// [`crate::workload::WorkType::TimerLatency`] cyclictest probe's per-cgroup
+    /// pooled reduction over
+    /// [`crate::workload::WorkerReport::timer_latencies_ns`]. `0.0` when no
+    /// worker recorded timer samples.
+    pub median_timer_latency_us: f64,
+    /// 99th-percentile timer-latency across all workers (microseconds). See
+    /// [`Self::median_timer_latency_us`].
+    pub p99_timer_latency_us: f64,
+    /// 99.9th-percentile (deep-tail) timer-latency across all workers
+    /// (microseconds). See [`Self::median_timer_latency_us`].
+    pub p999_timer_latency_us: f64,
+    /// Worst (maximum) timer-latency across all workers (microseconds). See
+    /// [`Self::median_timer_latency_us`].
+    pub worst_timer_latency_us: f64,
+    /// Whether any worker in this cgroup recorded a timer-latency sample.
+    /// `false` makes the timer reductions above a not-measured sentinel `0.0`
+    /// (no [`crate::workload::WorkType::TimerLatency`] worker ran), distinct
+    /// from a measured zero. Read by the run-level re-pool to EXCLUDE a
+    /// no-timer-sample cgroup from the cross-run mean. Mirrors
+    /// [`Self::wake_measured`] for the timer carrier.
+    pub timer_measured: bool,
     /// Sum of iteration counts across all workers.
     pub total_iterations: u64,
     /// Sum of per-worker on-CPU time (nanoseconds), from each worker's
@@ -236,6 +269,22 @@ pub struct CgroupStats {
     pub mean_run_delay_us: f64,
     /// Worst schedstat run delay across workers (microseconds).
     pub worst_run_delay_us: f64,
+    /// Whether this cgroup had any worker to measure run-delay from
+    /// (`!run_delays.is_empty()`, i.e. `num_workers > 0`) — `false` only for a
+    /// worker-less cgroup, keeping a degenerate empty cohort from folding a
+    /// sentinel `0.0` into the cross-run run-delay mean. Unlike wake/timer
+    /// (per-sample streams a running worker may never emit), run-delay is one
+    /// `sched_info.run_delay` value per worker, always present once a worker
+    /// exists: a worker that never queued reads a real measured `0.0`, not a
+    /// no-measurement sentinel. `sched_info.run_delay` accumulates whenever
+    /// `CONFIG_SCHED_INFO` is built in (compile-time — forced on in ktstr,
+    /// `select`ed by both `CONFIG_SCHEDSTATS` and `CONFIG_TASK_DELAY_ACCT`),
+    /// with no gate on the runtime `kernel.sched_schedstats` key (that key
+    /// gates only the `schedstat_*` rq/se aggregates, never `run_delay`), so
+    /// run-delay is genuinely measured on every ktstr run and worker-presence
+    /// is the correct measured predicate. Mirrors [`Self::wake_measured`] for
+    /// the run-delay carrier.
+    pub run_delay_measured: bool,
     /// Fraction of pages on the expected NUMA node(s) (0.0-1.0).
     /// Derived from `/proc/self/numa_maps` and the worker's
     /// [`MemPolicy`](crate::workload::MemPolicy).
@@ -243,6 +292,33 @@ pub struct CgroupStats {
     /// Cross-node page migration ratio from `/proc/vmstat`
     /// `numa_pages_migrated` delta divided by total allocated pages.
     pub cross_node_migration_ratio: f64,
+    /// Whole-run taobench engine COUNTER aggregate pooled across this cgroup's
+    /// [`crate::workload::WorkType::Taobench`] workers (Σ ops, MAX wall window —
+    /// the window is shared by concurrent workers, per
+    /// [`crate::workload::WorkerReport::taobench_whole`]). `None` for every
+    /// non-taobench cgroup. A RAW carrier, like [`Self::total_iterations`] /
+    /// [`Self::total_cpu_time_ns`] — not a reduced ratio: the run-level
+    /// cross-cgroup pool [`crate::assert::populate_run_pooled_taobench`] folds it
+    /// into the `total_taobench_*` Counter components and the derived
+    /// `taobench_*_per_sec` / `taobench_hit_fraction` / `taobench_command_hit_rate`
+    /// Rates in [`Self::ext_metrics`] (whole-run keys visible to `--noise-adjust`
+    /// spread, unlike the per-phase `taobench_*_qps` which are
+    /// `MetricKind::PerPhase`). Whole-run, NOT summable from the per-phase
+    /// `PhaseCgroupStats::taobench` carriers (per-phase `elapsed_ns` is
+    /// MAX-merged across concurrent threads, so summing phase windows is the
+    /// wrong qps denominator), so the engine's authoritative whole-run aggregate
+    /// is shipped from the worker. Holds COUNTERS only
+    /// ([`TaobenchStats`](crate::workload::taobench::run::TaobenchStats)) — the
+    /// serve-latency histogram is per-phase data on `PhaseCgroupStats::taobench`,
+    /// and the whole-run serve distribution (`taobench_serve_*_us_whole`) is the
+    /// union of those per-phase histograms. `pub` (every `CgroupStats` field is
+    /// `pub` and the struct is preluded, so a test author can read the counters).
+    /// `#[claim(skip)]`: a raw aggregate carrier, not a test-author claim
+    /// surface — assertions run against the host-derived run-level `taobench_*`
+    /// Rate / serve-latency metrics, mirroring
+    /// [`crate::workload::WorkerReport::taobench_whole`].
+    #[claim(skip)]
+    pub taobench_whole: Option<crate::workload::taobench::run::TaobenchStats>,
     /// Extensible metrics for the generic comparison pipeline.
     pub ext_metrics: BTreeMap<String, f64>,
 }
@@ -331,14 +407,28 @@ pub struct PhaseCgroupStats {
     /// the only source of the true wakeup population once `wake_latencies_ns` is
     /// reservoir-clamped, and it is for REPORTING, not the CV denominator.
     pub wake_sample_total: u64,
+    /// Pooled per-timer-cycle latency samples (ns) across the cgroup's
+    /// [`crate::workload::WorkType::TimerLatency`] workers in the phase,
+    /// un-reduced so median / p99 / p999 / worst re-pool over the combined set.
+    /// Reservoir-capped at `MAX_WAKE_SAMPLES` on same-name-carrier merge exactly
+    /// like `wake_latencies_ns` (population-weighted >cap); `timer_sample_total`
+    /// carries the true pre-cap population. Distinct carrier from
+    /// `wake_latencies_ns`.
+    pub timer_latencies_ns: Vec<u64>,
+    /// True timer-cycle count before reservoir clamping (`timer_latencies_ns` is
+    /// capped), so the re-pool reports the real population. Mirrors
+    /// `wake_sample_total` for the timer carrier.
+    pub timer_sample_total: u64,
     /// Pooled per-worker schedstat run-delay samples (RAW ns) for the phase,
     /// un-reduced so mean / worst run-delay re-pool over the combined set; the
     /// re-pool converts ns → µs to match [`CgroupStats`]'s run-delay-µs fields.
     /// Stored as raw kernel ns (like `wake_latencies_ns`), not pre-converted,
     /// per the raw-component thesis. GRANULARITY: unlike `wake_latencies_ns`
-    /// (one per WAKEUP), each entry here is ONE per-worker value — the
-    /// worker's cumulative `sched_info.run_delay` delta over its execution
-    /// (`schedstat_run_delay_ns`, end−start). So the pool size is the worker
+    /// (one per WAKEUP), each entry here is ONE per-worker value — that
+    /// worker's `sched_info.run_delay` delta over the carrier's window: the
+    /// whole-run `schedstat_run_delay_ns` (end−start) for the step-local
+    /// carrier, or the per-phase delta for the backdrop slice carrier. So the
+    /// pool size is the worker
     /// count, the mean is the average per-worker total queued-to-run delay, and
     /// `worst_run_delay_us` selects the single worker with the largest total
     /// queued-to-run delay (NOT the worst single dispatch).
@@ -375,22 +465,34 @@ pub struct PhaseCgroupStats {
     /// `CLOCK_THREAD_CPUTIME_ID` time behind `off_cpu_pcts` (different sample
     /// point; not byte-identical), so do not cross-wire the two in a re-pool.
     pub total_cpu_time_ns: u64,
-    /// Pages on the expected NUMA node(s) — page-locality numerator. A genuine
-    /// per-thread numa_maps count (Counter, SUM across workers/sources).
+    /// Pages on the expected NUMA node(s) — page-locality numerator. A per-task
+    /// `/proc/self/numa_maps` residency GAUGE (current snapshot of the task's mm,
+    /// recomputed each read — the kernel zeroes and re-walks the page tables),
+    /// SPATIALLY summed across the cgroup's workers within a phase: disjoint-mm
+    /// under the `CloneMode::Fork` default (the true cgroup total), but
+    /// `CloneMode::Thread` siblings share one mm and the SUM over-counts shared
+    /// pages once per thread (caveat inherited from `WorkerReport::numa_pages`).
+    /// The CROSS-PHASE fold takes the LATEST measured snapshot (see
+    /// `numa_agg_per_cgroup`), never a sum (summing residency across phases
+    /// over-counts by the phase count).
     pub numa_pages_local: u64,
     /// Total allocated pages — the SHARED denominator for BOTH page_locality
     /// (`numa_pages_local` / this) AND cross_node_migration_ratio
-    /// (`cross_node_migrated` / this). A genuine per-thread numa_maps count
-    /// (Counter, SUM); the kernel computes both ratios over the identical page
-    /// total, so one field serves both — a separate cross_node_total would
-    /// invite a silent desync.
+    /// (`cross_node_migrated` / this). A per-task `/proc/self/numa_maps` residency
+    /// GAUGE (same class/folds as `numa_pages_local`: within-phase SUM across
+    /// workers — disjoint-mm under the `CloneMode::Fork` default, Thread-mode
+    /// over-count caveat inherited from `WorkerReport::numa_pages` — cross-phase
+    /// LATEST snapshot); the kernel computes both ratios over the identical page
+    /// total, so one field serves both — a separate cross_node_total would invite
+    /// a silent desync.
     pub numa_pages_total: u64,
     /// Cross-node migrated pages — cross_node_migration_ratio numerator
     /// (denominator is `numa_pages_total`). A SYSTEM-WIDE
-    /// `/proc/vmstat numa_pages_migrated` delta each worker observes
-    /// redundantly, so this is a PEAK (MAX across workers/sources), NOT a
-    /// Counter — summing would inflate it by the worker count (mirrors
-    /// [`CgroupStats`]'s deliberate max-fold of the same quantity).
+    /// `/proc/vmstat numa_pages_migrated` monotonic-COUNTER delta each worker
+    /// observes redundantly, so the within-phase fold is MAX across
+    /// workers/sources (summing would inflate it by the worker count — mirrors
+    /// [`CgroupStats`]'s deliberate max-fold); the CROSS-PHASE fold SUMs the
+    /// per-phase deltas over disjoint intervals to the run total.
     pub cross_node_migrated: u64,
     /// Longest scheduling gap (ms) across the cgroup's workers in the phase,
     /// coupled with `max_gap_cpu`. A Peak folded as an ARGMAX of the (ms, cpu)
@@ -411,6 +513,45 @@ pub struct PhaseCgroupStats {
     /// only on a carrier that actually HAD samples to drop; ORs across `merge` so
     /// a merged carrier is stripped if either input was.
     pub stripped: bool,
+    /// Per-cgroup DERIVED scalar metrics for this (phase, cgroup), keyed by
+    /// `crate::stats::MetricDef` name — the per-cgroup analog of
+    /// [`PhaseBucket::metrics`] (which is the pooled-across-cgroups set). Populated
+    /// post-fold by `derive_phase_metrics` (both the schbench per-phase family AND
+    /// the non-schbench families — wake p99/median/cv, mean/max run-delay,
+    /// avg/min/max/spread off-CPU%, and the migration / iterations / locality
+    /// ratios) from the SAME reducers that fill
+    /// the pooled map, so a
+    /// test can query "metric M of cgroup C in phase P" as readily as the phase
+    /// aggregate (N cgroups -> N queryable sets + the pooled aggregate). DERIVED, not a
+    /// raw component: `PhaseCgroupStats::merge` leaves it empty and it is (re)derived
+    /// POST-merge, exactly as the pooled map skips is_derived keys in
+    /// `merge_matched_phase_buckets`. ALWAYS serialized (no `skip_serializing_if`):
+    /// PhaseCgroupStats rides the postcard bulk-TLV port, a NON-self-describing
+    /// POSITIONAL format — a conditionally-omitted field desyncs the byte stream and
+    /// corrupts the fields after it (here `schbench`), so the field must always be
+    /// present. No `serde(default)` either: pre-1.0, old sidecar/cache data is
+    /// disposable and regenerates (no compat shim). Read via [`Self::get`]; the
+    /// `crate::Claim` derive skips a `BTreeMap` field (matching
+    /// [`PhaseBucket::metrics`], which has no Claim accessor either).
+    pub metrics: std::collections::BTreeMap<String, f64>,
+    /// Per-phase schbench engine metrics for a `WorkType::Schbench` backdrop
+    /// cgroup (`None` for every non-schbench carrier). Pooled across the
+    /// cgroup's workers by [`PhaseCgroupStats::merge`] (histogram
+    /// bucket-add + integer-add of the run-delay raw pairs). The schbench
+    /// per-phase derivation reads it, pools across cgroups, and derives the
+    /// per-phase percentile / run-delay-mean / loop-count scalars into
+    /// [`PhaseBucket::metrics`]. `pub(crate)`: the element type is `pub(crate)`
+    /// and a per-phase carrier is internal — test authors read `PhaseBucket`,
+    /// not this. Non-`pub` so the `crate::Claim` derive skips it (a percentile
+    /// histogram has no meaningful scalar claim accessor).
+    pub(crate) schbench: Option<crate::workload::schbench::run::SchbenchPhaseStats>,
+    /// Per-phase taobench engine metrics for a `WorkType::Taobench` backdrop
+    /// cgroup (`None` for every non-taobench carrier). Pooled across the cgroup's
+    /// workers by [`PhaseCgroupStats::merge`] (counter-add, wall-window MAX, serve
+    /// histograms unioned). The taobench per-phase derivation reads it, pools
+    /// across cgroups, and derives the per-phase qps / hit-ratio / serve-latency
+    /// scalars into [`PhaseBucket::metrics`]. `pub(crate)`: an internal carrier.
+    pub(crate) taobench: Option<crate::workload::taobench::run::TaobenchPhaseStats>,
 }
 
 impl PhaseCgroupStats {
@@ -421,14 +562,19 @@ impl PhaseCgroupStats {
     ///   per-source reductions;
     /// - the CPU set (`cpus_used`) UNIONs;
     /// - genuine Counters (`num_workers`, `wake_sample_total`,
-    ///   `total_migrations`, `total_iterations`, `total_cpu_time_ns`,
-    ///   `numa_pages_local`, `numa_pages_total`) SUM — `num_workers` included,
-    ///   because a multi-`WorkSpec` cgroup emits one carrier per handle covering
-    ///   DISJOINT worker subsets, so summing reproduces the pooled count (see
-    ///   the `num_workers` field doc);
-    /// - the one Peak, `cross_node_migrated`, takes the MAX (a system-wide
-    ///   vmstat delta observed redundantly per worker, so summing would inflate
-    ///   it);
+    ///   `total_migrations`, `total_iterations`, `total_cpu_time_ns`) SUM —
+    ///   `num_workers` included, because a multi-`WorkSpec` cgroup emits one
+    ///   carrier per handle covering DISJOINT worker subsets, so summing
+    ///   reproduces the pooled count (see the `num_workers` field doc);
+    /// - the residency GAUGEs (`numa_pages_local`, `numa_pages_total`) also SUM
+    ///   here — the WITHIN-PHASE spatial sum across the cgroup's workers
+    ///   (disjoint-mm under the `CloneMode::Fork` default; Thread-mode shares one
+    ///   mm and over-counts, the caveat inherited from `WorkerReport::numa_pages`),
+    ///   NOT a cross-phase sum (the cross-phase fold takes the LATEST snapshot in
+    ///   `numa_agg_per_cgroup`);
+    /// - `cross_node_migrated`, a system-wide vmstat monotonic-Counter delta each
+    ///   worker observes redundantly, takes the MAX across workers (summing would
+    ///   inflate it); its cross-phase fold SUMs the per-phase deltas;
     /// - the COUPLED worst gap (`max_gap_ms`, `max_gap_cpu`) folds as an
     ///   ARGMAX — the pair from whichever side has the larger ms (b's on tie,
     ///   matching the builders' `max_by_key` last-wins) so the gap and its CPU
@@ -469,6 +615,22 @@ impl PhaseCgroupStats {
                 cap,
             )
         };
+        // Same bounded merge for the distinct timer reservoir:
+        // <=cap concatenation is value-for-value; >cap a population-weighted
+        // reservoir merge keeps it an unbiased sample of the combined population.
+        let timer_latencies_ns = if a.timer_latencies_ns.len() + b.timer_latencies_ns.len() <= cap {
+            let mut v = a.timer_latencies_ns;
+            v.extend(b.timer_latencies_ns);
+            v
+        } else {
+            Self::weighted_merge_reservoirs(
+                &a.timer_latencies_ns,
+                a.timer_sample_total,
+                &b.timer_latencies_ns,
+                b.timer_sample_total,
+                cap,
+            )
+        };
         let mut run_delays_ns = a.run_delays_ns;
         run_delays_ns.extend(b.run_delays_ns);
         let mut off_cpu_pcts = a.off_cpu_pcts;
@@ -488,22 +650,111 @@ impl PhaseCgroupStats {
         } else {
             (a.max_gap_ms, a.max_gap_cpu)
         };
+        // Per-phase schbench: OR-with-combine. Both Some → merge the pooled
+        // histograms + integer-add the run-delay raw pairs / loop_count
+        // (SchbenchPhaseStats::merge, the SAME associative+commutative op the
+        // guest engine uses to pool across message threads); one Some → carry
+        // it; both None (non-schbench cgroup) → None.
+        let schbench = match (a.schbench, b.schbench) {
+            (Some(mut x), Some(y)) => {
+                x.merge(&y);
+                Some(x)
+            }
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
+        };
+        // Per-phase taobench: OR-with-merge — both Some → counter-add + wall-window
+        // MAX + serve-latency histogram union (TaobenchPhaseStats::merge, the SAME
+        // op the guest engine pools with); one Some → carry; both None
+        // (non-taobench cgroup) → None.
+        let taobench = match (a.taobench, b.taobench) {
+            (Some(mut x), Some(y)) => {
+                x.merge(&y);
+                Some(x)
+            }
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
+        };
+        // saturating_add: pool the guest-runtime monotonic counters/times (the
+        // sample totals, migrations, iterations, cpu-time-ns, numa pages) across
+        // cgroups. Overflow is physically unreachable for honest data (real
+        // counts << u64::MAX), but a corrupt/hostile guest value would otherwise
+        // debug-panic or release-wrap to a silently-wrong derived metric;
+        // saturating is exact for every in-range value. num_workers is a
+        // ktstr-configured TOPOLOGY count (bounded by the guest CPU count, not a
+        // runtime accumulator), so it cannot overflow and keeps plain `+`.
+        // cross_node_migrated pools as MAX (a system-wide vmstat snapshot shared
+        // by the concurrent cgroups), not a sum.
         PhaseCgroupStats {
             num_workers: a.num_workers + b.num_workers,
             cpus_used,
             wake_latencies_ns,
-            wake_sample_total: a.wake_sample_total + b.wake_sample_total,
+            wake_sample_total: a.wake_sample_total.saturating_add(b.wake_sample_total),
+            timer_latencies_ns,
+            timer_sample_total: a.timer_sample_total.saturating_add(b.timer_sample_total),
             run_delays_ns,
             off_cpu_pcts,
-            total_migrations: a.total_migrations + b.total_migrations,
-            total_iterations: a.total_iterations + b.total_iterations,
-            total_cpu_time_ns: a.total_cpu_time_ns + b.total_cpu_time_ns,
-            numa_pages_local: a.numa_pages_local + b.numa_pages_local,
-            numa_pages_total: a.numa_pages_total + b.numa_pages_total,
+            total_migrations: a.total_migrations.saturating_add(b.total_migrations),
+            total_iterations: a.total_iterations.saturating_add(b.total_iterations),
+            total_cpu_time_ns: a.total_cpu_time_ns.saturating_add(b.total_cpu_time_ns),
+            numa_pages_local: a.numa_pages_local.saturating_add(b.numa_pages_local),
+            numa_pages_total: a.numa_pages_total.saturating_add(b.numa_pages_total),
             cross_node_migrated: a.cross_node_migrated.max(b.cross_node_migrated),
             max_gap_ms,
             max_gap_cpu,
             stripped: a.stripped || b.stripped,
+            // DERIVED, not a raw component: left EMPTY here and (re)derived post-merge
+            // by derive_phase_metrics (the fold runs derive AFTER merging, the
+            // same reason the pooled map skips is_derived keys in
+            // merge_matched_phase_buckets). Folding stale per-operand metrics would
+            // double-count; the post-merge re-derive is the sole producer.
+            metrics: std::collections::BTreeMap::new(),
+            schbench,
+            taobench,
+        }
+    }
+
+    /// Look up this cgroup's per-phase DERIVED value for `metric_name` — the
+    /// per-cgroup analog of [`PhaseBucket::get`] (see [`Self::metrics`]). `None`
+    /// when this cgroup carried no finite samples for the metric (the ABSENT
+    /// discipline), distinct from `Some(0.0)` (a real reducer zero).
+    pub fn get(&self, metric_name: &str) -> Option<f64> {
+        self.metrics.get(metric_name).copied()
+    }
+
+    /// Like [`Self::get`] but panics citing the metric keys actually present when
+    /// the metric is absent — use when the caller knows this cgroup MUST carry the
+    /// metric in the phase.
+    pub fn expect_metric(&self, metric_name: &str) -> f64 {
+        self.get(metric_name).unwrap_or_else(|| {
+            panic!(
+                "PhaseCgroupStats::expect_metric: metric '{}' absent from this \
+                 per-cgroup carrier (num_workers={}, stripped={}); keys present: {:?}. \
+                 Causes: (a) the cgroup produced no finite samples for it; (b) metric \
+                 name typo; (c) a non-schbench carrier has no schbench keys.",
+                metric_name,
+                self.num_workers,
+                self.stripped,
+                self.metrics.keys().collect::<Vec<_>>(),
+            )
+        })
+    }
+
+    /// The per-cgroup analog of [`PhaseBucket::cgroup_counter_total`] for the
+    /// three per-cgroup Counters that live ONLY on the carrier (no derived
+    /// `metrics` entry): `total_migrations`, `total_iterations`, and
+    /// `total_cpu_time_ns`. Lets
+    /// [`crate::vmm::VmResult::phase_cgroup_metric`] expose them by metric name
+    /// symmetrically with the pooled [`crate::vmm::VmResult::phase_metric`]
+    /// `cgroup_counter_total` fallback (the pooled `_total` suffix marks the
+    /// cross-cgroup SUM; this per-cgroup form returns one cgroup's value). `None`
+    /// for any other name (derived metrics are read via [`Self::get`]).
+    pub fn cgroup_counter(&self, name: &str) -> Option<f64> {
+        match name {
+            "total_migrations" => Some(self.total_migrations as f64),
+            "total_iterations" => Some(self.total_iterations as f64),
+            "total_cpu_time_ns" => Some(self.total_cpu_time_ns as f64),
+            _ => None,
         }
     }
 
@@ -650,6 +901,55 @@ impl PhaseCgroupStats {
         Some((p99, median))
     }
 
+    /// Timer-latency reduction for the per-phase metric emission:
+    /// `(median_us, p99_us, p999_us)` over the pooled
+    /// [`Self::timer_latencies_ns`] (nearest-rank, ns→µs), or `None` when the
+    /// pool is empty (the not-measured state — `write_carrier_scalars` omits all
+    /// three timer keys together). Reproduces the per-cgroup
+    /// [`crate::assert::cgroup_stats`] timer reductions value-for-value below the
+    /// reservoir cap (distribution-equivalent above it), exactly like
+    /// [`Self::wake_summary`]. The run-level WORST (max) is NOT here — it comes
+    /// from the cross-phase re-pool (`populate_run_distribution_metrics`).
+    pub fn timer_summary(&self) -> Option<(f64, f64, f64)> {
+        if self.timer_latencies_ns.is_empty() {
+            return None;
+        }
+        let mut sorted = self.timer_latencies_ns.clone();
+        sorted.sort_unstable();
+        let median = percentile(&sorted, 0.5) as f64 / 1000.0;
+        let p99 = percentile(&sorted, 0.99) as f64 / 1000.0;
+        let p999 = percentile(&sorted, 0.999) as f64 / 1000.0;
+        Some((median, p99, p999))
+    }
+
+    /// Wake-latency coefficient of variation (stddev / mean) over the pooled
+    /// [`Self::wake_latencies_ns`] (`n = len`), or `None` when the pool is
+    /// empty (the not-measured state — so the `run_metrics` carrier writer
+    /// omits all three wake keys together). `Some(0.0)` when
+    /// the mean is zero is a MEASURED zero. Reproduces [`cgroup_stats`]'s
+    /// `wake_latency_cv` value-for-value for the ≤cap pool (`Σv` in `u64`,
+    /// same accumulation); above `MAX_WAKE_SAMPLES` the pool is a
+    /// distribution-preserving reservoir subsample, so the CV is then
+    /// distribution-equivalent, not byte-identical.
+    pub fn wake_cv(&self) -> Option<f64> {
+        if self.wake_latencies_ns.is_empty() {
+            return None;
+        }
+        let n = self.wake_latencies_ns.len() as f64;
+        let mean_ns = self.wake_latencies_ns.iter().sum::<u64>() as f64 / n;
+        if mean_ns > 0.0 {
+            let variance = self
+                .wake_latencies_ns
+                .iter()
+                .map(|&v| (v as f64 - mean_ns).powi(2))
+                .sum::<f64>()
+                / n;
+            Some(variance.sqrt() / mean_ns)
+        } else {
+            Some(0.0)
+        }
+    }
+
     /// Run-delay reduction for the per-phase render:
     /// `(mean_us, worst_us)` over the per-worker [`Self::run_delays_ns`] (raw
     /// ns), or `None` when empty. Divides ns→µs ONCE on the summed / maxed ns.
@@ -700,6 +1000,20 @@ impl CgroupStats {
         }
     }
 
+    /// Whether this cgroup measured the given distribution `source`. Gates the
+    /// run-level carrier-less re-pool in [`populate_run_distribution_metrics`]
+    /// so a cgroup that recorded no samples for `source` contributes ABSENCE
+    /// (leaving the fold `None` when no cgroup measured it), not a sentinel
+    /// `0.0`. See [`Self::wake_measured`] / [`Self::timer_measured`] /
+    /// [`Self::run_delay_measured`].
+    pub fn measured_for(&self, source: crate::stats::SampleSource) -> bool {
+        match source {
+            crate::stats::SampleSource::WakeLatencyNs => self.wake_measured,
+            crate::stats::SampleSource::TimerLatencyNs => self.timer_measured,
+            crate::stats::SampleSource::RunDelayNs => self.run_delay_measured,
+        }
+    }
+
     /// Throughput per parallel degree:
     /// `total_iterations / num_workers`. `None` when
     /// `num_workers == 0` (no worker reported, so per-worker
@@ -723,11 +1037,7 @@ impl CgroupStats {
     /// comparisons hold scenario, topology, and work_type constant
     /// before reading this method.
     pub fn iterations_per_worker(&self) -> Option<f64> {
-        if self.num_workers > 0 {
-            Some(self.total_iterations as f64 / self.num_workers as f64)
-        } else {
-            None
-        }
+        crate::assert::reductions::iterations_per_worker_of(self.num_workers, self.total_iterations)
     }
 
     /// Worker iterations per CPU-second of on-CPU time consumed by this
@@ -748,10 +1058,11 @@ impl CgroupStats {
     /// CPU-time EFFICIENCY; for the cross-cell ALLOCATION balance use
     /// [`ScenarioStats::cgroup_balance_ratio`] over `iterations_per_worker`.
     pub fn iterations_per_cpu_sec(&self) -> Option<f64> {
-        if self.num_workers == 0 || self.total_cpu_time_ns == 0 {
-            return None;
-        }
-        Some(self.total_iterations as f64 / (self.total_cpu_time_ns as f64 / 1e9))
+        crate::assert::reductions::iterations_per_cpu_sec_of(
+            self.num_workers,
+            self.total_cpu_time_ns,
+            self.total_iterations,
+        )
     }
 }
 
@@ -960,7 +1271,7 @@ impl PhaseBucket {
     /// typo" (positive sample_count but the key isn't in `metrics`).
     ///
     /// ```ignore
-    /// let bucket = r.stats.step(0).expect("Step[0] phase");
+    /// let bucket = r.stats.phase(Phase::step(0)).expect("Step[0] phase");
     /// let throughput = bucket.expect_metric("throughput");
     /// ```
     pub fn expect_metric(&self, metric_name: &str) -> f64 {
@@ -973,8 +1284,9 @@ impl PhaseBucket {
                  metric (sample_count==0 means no captures landed in the \
                  phase at all; sample_count>0 means captures landed but \
                  the metric extracted no finite values from them); \
-                 (b) metric name typo (verify against \
-                 ScenarioStats::is_known_metric / known_metrics).",
+                 (b) metric name typo — built-ins are typed via \
+                 crate::stats::BuiltinMetric (a typo is a compile \
+                 error); a dynamic key resolves via crate::stats::MetricId::def.",
                 metric_name,
                 self.step_index,
                 self.label,
@@ -986,7 +1298,7 @@ impl PhaseBucket {
 
     /// Cross-cgroup phase total for a per-cgroup Counter metric that lives
     /// in [`Self::per_cgroup`] but never in [`Self::metrics`] — currently
-    /// `"total_migrations"` and `"total_iterations"`.
+    /// `"total_migrations"`, `"total_iterations"`, and `"total_cpu_time_ns"`.
     ///
     /// These are registered `MetricKind::Counter`s
     /// (`crate::stats::METRICS`) whose per-sample source is absent
@@ -1002,11 +1314,16 @@ impl PhaseBucket {
     ///
     /// `None` when the phase has no `per_cgroup` carriers (NOT measured —
     /// distinct from a measured `Some(0.0)` when carriers exist but counted
-    /// zero) or `name` is not one of the per-cgroup-sourced counters. Both
-    /// keys are in `TYPED_FIELD_NAMES`, so surfacing them here never
-    /// double-sources the run-level `ext_metrics`
-    /// (`populate_run_ext_metrics_from_phases` skips them; the typed
-    /// `GauntletRow` accessor stays the single run-level authority).
+    /// zero) or `name` is not one of the per-cgroup-sourced counters.
+    /// Surfacing them here never double-sources the run-level `ext_metrics`,
+    /// but by two different mechanisms: `total_migrations` / `total_iterations`
+    /// are in `TYPED_FIELD_NAMES` (`populate_run_ext_metrics_from_phases` skips
+    /// them; the typed `GauntletRow` accessor stays the single run-level
+    /// authority), while `total_cpu_time_ns` is NOT in `TYPED_FIELD_NAMES` —
+    /// it is safe because it is never written into any pooled `metrics` map
+    /// (its `MetricDef` accessor and `read_sample` both return `None`, so no
+    /// run-level fold ever picks it up; it lives only on the per-cgroup
+    /// carrier).
     ///
     /// Counterpart to [`Self::get`] (which reads `metrics` only).
     /// [`crate::vmm::VmResult::phase_metric`] falls back to this so a
@@ -1016,12 +1333,20 @@ impl PhaseBucket {
         let field: fn(&PhaseCgroupStats) -> u64 = match name {
             "total_migrations" => |c| c.total_migrations,
             "total_iterations" => |c| c.total_iterations,
+            "total_cpu_time_ns" => |c| c.total_cpu_time_ns,
             _ => return None,
         };
         if self.per_cgroup.is_empty() {
             return None;
         }
-        Some(self.per_cgroup.values().map(field).sum::<u64>() as f64)
+        // saturating: overflow-safe cross-cgroup pool of the guest counter for
+        // the post_vm by-name read (a wrapped sum would read silently-small).
+        Some(
+            self.per_cgroup
+                .values()
+                .map(field)
+                .fold(0u64, u64::saturating_add) as f64,
+        )
     }
 }
 
@@ -1097,12 +1422,15 @@ pub(crate) fn merge_matched_phase_buckets(a: PhaseBucket, b: PhaseBucket) -> Pha
     let mut keys: std::collections::BTreeSet<&String> = a.metrics.keys().collect();
     keys.extend(b.metrics.keys());
     for key in keys {
-        // Derived metrics (Rate / Distribution / WorstLowest) are NOT merged
+        // Derived metrics (every `is_derived()`: Rate / Distribution / WorstLowest /
+        // WakeLatencyTailRatio / WorstCrossNodeRatio / PerPhase) are NOT merged
         // here: a Rate re-derives from the merged components in the post-pass
-        // below, and Distribution / WorstLowest are re-pooled run-level by
+        // below; the distributional kinds (Distribution / WorstLowest /
+        // WakeLatencyTailRatio / WorstCrossNodeRatio) re-pool run-level by
         // `populate_run_distribution_metrics` (they never appear in
         // phase.metrics — `aggregate_samples_for_phase` returns None — so this
-        // skip is also a structural guard). Folding a ready-made derived value
+        // skip is also a structural guard); PerPhase is re-derived by
+        // `derive_phase_metrics`. Folding a ready-made derived value
         // would lose the re-pool.
         if crate::stats::metric_def(key).is_some_and(|m| m.kind.is_derived()) {
             continue;
@@ -1153,7 +1481,7 @@ pub(crate) fn merge_matched_phase_buckets(a: PhaseBucket, b: PhaseBucket) -> Pha
         label: a.label,
         start_ms: a.start_ms.min(b.start_ms),
         end_ms: a.end_ms.max(b.end_ms),
-        sample_count: a.sample_count + b.sample_count,
+        sample_count: a.sample_count.saturating_add(b.sample_count),
         metrics,
         per_cgroup,
     }
@@ -1283,10 +1611,16 @@ fn merge_metric_values(
 ) -> f64 {
     use crate::stats::{GaugeAgg, MetricKind};
     match kind {
-        // Counter (cumulative) and DeltaSum (sum of per-read deltas)
-        // both merge across AssertResults by summing the reduced values
-        // (commutative — see MetricKind::merge_kind).
-        Some(MetricKind::Counter) | Some(MetricKind::DeltaSum) => a + b,
+        // Counter (cumulative) and DeltaSum (sum of per-read deltas) merge
+        // across AssertResults by summing the reduced values (commutative — see
+        // MetricKind::merge_kind). PerPhaseDeltaSum shares the `a + b` arm, but
+        // it is a run-wide POOLED per-phase scalar (injected once into the host
+        // bucket, never per-cgroup), so this same-step-index merge is the
+        // defensive path only — two real PerPhaseDeltaSum values are never
+        // summed here.
+        Some(MetricKind::Counter)
+        | Some(MetricKind::DeltaSum)
+        | Some(MetricKind::PerPhaseDeltaSum) => a + b,
         Some(MetricKind::Peak) | Some(MetricKind::Gauge(GaugeAgg::Max)) => a.max(b),
         Some(MetricKind::Gauge(GaugeAgg::Avg)) => {
             // Weight by sample_count, floored at 1: a sample_count==0
@@ -1310,17 +1644,24 @@ fn merge_metric_values(
         Some(MetricKind::Gauge(GaugeAgg::Last)) | Some(MetricKind::Timestamp) => {
             if b_end_ms > a_end_ms { b } else { a }
         }
-        // Derived kinds (Rate / Distribution / WorstLowest) are skipped in
-        // the merge loop (see `merge_matched_phase_buckets`'s `is_derived`
-        // continue) and produced post-merge (`derive_rate_metrics` /
-        // `populate_run_distribution_metrics`), so a derived value never
+        // Derived kinds (every `is_derived()`: Rate / Distribution / WorstLowest /
+        // WakeLatencyTailRatio / WorstCrossNodeRatio / PerPhase /
+        // PerRunDistribution) are skipped in the merge loop (see
+        // `merge_matched_phase_buckets`'s `is_derived` continue) and produced
+        // post-merge (`derive_rate_metrics` / `populate_run_distribution_metrics`
+        // / `populate_run_pooled_schbench_distribution`), so a derived value never
         // reaches this per-value merge — folding a ready-made derived value
-        // would lose the re-pool.
+        // would lose the re-pool. (PerRunDistribution is additionally run-level
+        // only: it never appears in a PhaseBucket, so it cannot reach this
+        // per-phase-bucket merge at all.)
         Some(MetricKind::Rate { .. })
         | Some(MetricKind::Distribution { .. })
         | Some(MetricKind::WorstLowest { .. })
-        | Some(MetricKind::WakeLatencyTailRatio) => unreachable!(
-            "derived metrics (Rate/Distribution/WorstLowest/WakeLatencyTailRatio) are produced post-merge, not merged as values"
+        | Some(MetricKind::WakeLatencyTailRatio)
+        | Some(MetricKind::WorstCrossNodeRatio)
+        | Some(MetricKind::PerPhase)
+        | Some(MetricKind::PerRunDistribution) => unreachable!(
+            "derived metrics (Rate/Distribution/WorstLowest/WakeLatencyTailRatio/WorstCrossNodeRatio/PerPhase/PerRunDistribution) are produced post-merge, not merged as values"
         ),
         // Unregistered metric: commutative mean fallback. Sum
         // would over-count Gauge values; max would lose Counter

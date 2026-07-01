@@ -291,6 +291,23 @@ pub(crate) enum KtstrCommand {
         /// CONFIG axis B side — see `--a-scheduler`.
         #[arg(long, requires = "a_scheduler", conflicts_with_all = ["base", "base_ref", "dual_run"])]
         b_scheduler: Option<String>,
+        /// Self-tuning noise mode: run each side N times and decide significance
+        /// from the observed per-side spread — B's mean leaving A's `[min, max]`
+        /// band — instead of a fixed `--threshold`. Flags a metric whose relative
+        /// spread exceeds `--noise-spread-threshold` as too noisy to trust.
+        /// Implies the dual-run production, looped N times; commit axis only
+        /// (needs `--kernel`).
+        #[arg(
+            long,
+            value_name = "N",
+            conflicts_with_all = ["a_scheduler", "b_scheduler", "threshold", "policy", "dual_run"],
+        )]
+        noise_adjust: Option<usize>,
+        /// Per-side relative-spread limit in percent above which `--noise-adjust`
+        /// flags a metric too noisy to trust (default 1.0). Requires
+        /// `--noise-adjust`.
+        #[arg(long, requires = "noise_adjust")]
+        noise_spread_threshold: Option<f64>,
         /// Suppress the per-phase delta tables entirely. Mutually
         /// exclusive with every other phase flag.
         #[arg(
@@ -326,9 +343,10 @@ pub(crate) enum KtstrCommand {
         )]
         phase: Option<u16>,
         /// Per-row relative-delta gate for the per-phase tables:
-        /// suppress paired rows whose `|delta| / max(|a|, 1.0) < PCT /
-        /// 100.0`. Independent from `--threshold`. Mutually exclusive
-        /// with `--no-phases`.
+        /// suppress paired rows whose `|delta| / |a| < PCT / 100.0`
+        /// (a value from a ~zero baseline is an unbounded relative
+        /// change and is always shown). Independent from `--threshold`.
+        /// Mutually exclusive with `--no-phases`.
         #[arg(
             long = "phase-threshold",
             help_heading = "Phase rendering",
@@ -743,9 +761,9 @@ pub(crate) enum StatsCommand {
     ///
     /// Walks every run directory under `runs_root()` (or `--dir`),
     /// pools the sidecars, and reports the set of distinct values
-    /// found across all eight filterable dimensions: `kernel`,
-    /// `commit`, `kernel_commit`, `source`, `cpu_budget`,
-    /// `scheduler`, `topology`, and `work_type`. The JSON keys `commit` and `source` map to the
+    /// found across all nine filterable dimensions: `kernel`,
+    /// `commit`, `kernel_commit`, `source`, `resolve_source`,
+    /// `cpu_budget`, `scheduler`, `topology`, and `work_type`. The JSON keys `commit` and `source` map to the
     /// internal `SidecarResult::project_commit` /
     /// `SidecarResult::run_source` fields; the per-side filter
     /// flags spell `--project-commit` / `--run-source` on the
@@ -758,8 +776,8 @@ pub(crate) enum StatsCommand {
     ///
     /// Default output renders one block per dimension with values
     /// one per line; `--json` emits a single JSON object keyed by
-    /// dimension name. The four optional dimensions (`kernel`,
-    /// `commit`, `kernel_commit`, `source`) surface absent values
+    /// dimension name. The five optional dimensions (`kernel`,
+    /// `commit`, `kernel_commit`, `source`, `resolve_source`) surface absent values
     /// as the textual sentinel `unknown` in the table shape and as
     /// JSON `null` in the JSON shape.
     ListValues {
@@ -1141,6 +1159,26 @@ pub(crate) enum StatsCommand {
         /// tag.
         #[arg(long = "run-source", action = ArgAction::Append)]
         run_source: Vec<String>,
+        /// Repeatable OR-combined filter on the sidecar's
+        /// `resolve_source` field — HOW the scheduler binary was
+        /// resolved for the run (e.g. `--resolve-source auto_built`,
+        /// `--resolve-source target_debug`). `--resolve-source A
+        /// --resolve-source B` keeps rows whose `resolve_source` equals
+        /// A OR B; strict equality, no prefix matching. Rows whose
+        /// `resolve_source` is `None` (sidecar pre-dates the field, or a
+        /// skip resolved no binary) NEVER match a populated filter —
+        /// same opt-in policy as `--run-source`.
+        ///
+        /// Distinct from `--run-source` (the run ENVIRONMENT
+        /// local/ci/archive): this is the scheduler discovery PATH. Tags
+        /// are the `ResolveSource::as_str` values ("auto_built" =
+        /// built-from-HEAD this run; "target_debug"/"target_release"/
+        /// "sibling_dir"/"path"/"env_var"/"path_lookup" = possibly-stale;
+        /// "not_found" = kernel-supplied). Combine with
+        /// `--a-resolve-source` / `--b-resolve-source` to contrast (e.g.
+        /// auto-built vs stale-target runs of the same scenarios).
+        #[arg(long = "resolve-source", action = ArgAction::Append)]
+        resolve_source: Vec<String>,
         /// Filter to runs whose effective host-CPU budget (the count of
         /// host CPUs the guest vCPU threads ran on) equals this value
         /// (`--cpu-budget 32`, repeatable / OR-combined). cpu-budget is a
@@ -1173,6 +1211,8 @@ pub(crate) enum StatsCommand {
         a_kernel_commit: Vec<String>,
         #[arg(long = "a-run-source", action = ArgAction::Append)]
         a_run_source: Vec<String>,
+        #[arg(long = "a-resolve-source", action = ArgAction::Append)]
+        a_resolve_source: Vec<String>,
         #[arg(long = "a-cpu-budget", action = ArgAction::Append)]
         a_cpu_budget: Vec<String>,
         #[arg(long = "a-scheduler", action = ArgAction::Append)]
@@ -1201,6 +1241,8 @@ pub(crate) enum StatsCommand {
         b_kernel_commit: Vec<String>,
         #[arg(long = "b-run-source", action = ArgAction::Append)]
         b_run_source: Vec<String>,
+        #[arg(long = "b-resolve-source", action = ArgAction::Append)]
+        b_resolve_source: Vec<String>,
         #[arg(long = "b-cpu-budget", action = ArgAction::Append)]
         b_cpu_budget: Vec<String>,
         #[arg(long = "b-scheduler", action = ArgAction::Append)]
@@ -1291,8 +1333,9 @@ pub(crate) enum StatsCommand {
         phase: Option<u16>,
 
         /// Per-row relative-delta gate for the per-phase tables.
-        /// Suppresses paired rows whose
-        /// `|delta| / max(|a|, 1.0) < PCT / 100.0`.
+        /// Suppresses paired rows whose `|delta| / |a| < PCT / 100.0`
+        /// (a value from a ~zero baseline is an unbounded relative
+        /// change and is always shown).
         ///
         /// `0` shows every paired row; positive values widen
         /// the gate to suppress small deltas. ABSENCE shows

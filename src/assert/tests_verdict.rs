@@ -682,6 +682,8 @@ fn claim_against_worker_report_via_derived_accessors() {
         wake_sample_total: 5,
         iteration_costs_ns: vec![],
         iteration_cost_sample_total: 0,
+        timer_latencies_ns: vec![],
+        timer_sample_total: 0,
         iterations: 1000,
         schedstat_run_delay_ns: 0,
         schedstat_run_count: 0,
@@ -694,6 +696,7 @@ fn claim_against_worker_report_via_derived_accessors() {
         group_idx: 0,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     };
 
     let mut v = Verdict::new();

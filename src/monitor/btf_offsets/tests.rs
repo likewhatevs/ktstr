@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::btf_blob::{CastSynBitMember, CastSynMember, CastSynType, cast_build_btf};
 
 #[test]
 fn parse_rq_offsets_from_vmlinux() {
@@ -1651,4 +1652,241 @@ fn cached_vmlinux_btf_hits_on_second_call() {
         "cached_vmlinux_btf must return the same Arc on every call once populated; \
          got fresh allocations, indicating the cache hit path did not fire",
     );
+}
+
+// -- watch_bpf_map field resolver (resolve_map_field_offset_width) --
+
+/// Build a BTF string section (leading NUL + NUL-terminated names) and return
+/// it alongside each name's byte offset, so the synthetic-BTF tests below
+/// reference names by resolved offset rather than hand-counted constants.
+fn build_strtab(names: &[&str]) -> (Vec<u8>, Vec<u32>) {
+    let mut s = vec![0u8];
+    let mut offs = Vec::with_capacity(names.len());
+    for n in names {
+        offs.push(s.len() as u32);
+        s.extend_from_slice(n.as_bytes());
+        s.push(0);
+    }
+    (s, offs)
+}
+
+/// A named-map value type (e.g. `struct cpu_ctx`): the dot-path is a direct
+/// member walk and the leaf width is the member integer's BTF size.
+#[test]
+fn resolve_map_field_offset_width_struct_value_type() {
+    let (strings, off) = build_strtab(&["cpu_ctx", "lat_headroom", "lat_cri", "u32", "u16"]);
+    let (cpu_ctx, lat_headroom, lat_cri, u32n, u16n) = (off[0], off[1], off[2], off[3], off[4]);
+    let types = vec![
+        CastSynType::Int {
+            name_off: u32n,
+            size: 4,
+            encoding: 0,
+            offset: 0,
+            bits: 32,
+        }, // id 1
+        CastSynType::Int {
+            name_off: u16n,
+            size: 2,
+            encoding: 0,
+            offset: 0,
+            bits: 16,
+        }, // id 2
+        CastSynType::Struct {
+            name_off: cpu_ctx,
+            size: 16,
+            members: vec![
+                CastSynMember {
+                    name_off: lat_headroom,
+                    type_id: 1,
+                    byte_offset: 8,
+                },
+                CastSynMember {
+                    name_off: lat_cri,
+                    type_id: 2,
+                    byte_offset: 12,
+                },
+            ],
+        }, // id 3
+    ];
+    let btf = Btf::from_bytes(&cast_build_btf(&types, &strings)).expect("synthetic btf");
+    // The struct value type id is 3.
+    assert_eq!(
+        resolve_map_field_offset_width(&btf, 3, "lat_headroom"),
+        Some((8, 4))
+    );
+    assert_eq!(
+        resolve_map_field_offset_width(&btf, 3, "lat_cri"),
+        Some((12, 2))
+    );
+    assert_eq!(resolve_map_field_offset_width(&btf, 3, "nope"), None);
+    assert_eq!(resolve_map_field_offset_width(&btf, 3, ""), None);
+    assert_eq!(
+        resolve_map_field_offset_width(&btf, 0, "lat_headroom"),
+        None
+    );
+}
+
+/// A `.bss` DATASEC value type: the first path segment is a section variable
+/// (`sys_stat`) and the remaining segments index into its struct, with the
+/// section-relative var offset added to the member offset.
+#[test]
+fn resolve_map_field_offset_width_bss_datasec_dotpath() {
+    let (strings, off) = build_strtab(&["u32", "sys_stat_t", "avg_lat_cri", "sys_stat", ".bss"]);
+    let (u32n, sys_stat_t, avg_lat_cri, sys_stat_var, bss) =
+        (off[0], off[1], off[2], off[3], off[4]);
+    let types = vec![
+        CastSynType::Int {
+            name_off: u32n,
+            size: 4,
+            encoding: 0,
+            offset: 0,
+            bits: 32,
+        }, // id 1
+        CastSynType::Struct {
+            name_off: sys_stat_t,
+            size: 64,
+            members: vec![CastSynMember {
+                name_off: avg_lat_cri,
+                type_id: 1,
+                byte_offset: 4,
+            }],
+        }, // id 2: struct sys_stat
+        CastSynType::Var {
+            name_off: sys_stat_var,
+            type_id: 2,
+            linkage: 1,
+        }, // id 3: global sys_stat
+        CastSynType::Datasec {
+            name_off: bss,
+            size: 256,
+            vars: vec![(3, 128, 64)],
+        }, // id 4: .bss
+    ];
+    let btf = Btf::from_bytes(&cast_build_btf(&types, &strings)).expect("synthetic btf");
+    // The .bss DATASEC value type id is 4; the var sits at section offset 128
+    // and avg_lat_cri at member offset 4 -> 132, width 4.
+    assert_eq!(
+        resolve_map_field_offset_width(&btf, 4, "sys_stat.avg_lat_cri"),
+        Some((132, 4))
+    );
+    // Unknown section var, and present var with a missing member, both bail.
+    assert_eq!(resolve_map_field_offset_width(&btf, 4, "nope.x"), None);
+    assert_eq!(
+        resolve_map_field_offset_width(&btf, 4, "sys_stat.nope"),
+        None
+    );
+}
+
+/// A `.bss` DATASEC value type whose section variable is a BARE SCALAR
+/// (`int crash`, not a struct) queried with NO dot-path: the resolver
+/// returns the var's section offset and the scalar's own width. This is the
+/// exact arm the host BPF-map write path resolves through for the
+/// scheduler's `crash`/`stall` `.bss` globals
+/// (`BpfMapWrite::new(".bss", "crash", …)`); the sibling dotpath test above
+/// only covers the struct-descend arm, and the struct-value test only the
+/// named-struct arm.
+#[test]
+fn resolve_map_field_offset_width_bss_datasec_bare_scalar() {
+    let (strings, off) = build_strtab(&["int", "crash", ".bss"]);
+    let (intn, crash_var, bss) = (off[0], off[1], off[2]);
+    let types = vec![
+        CastSynType::Int {
+            name_off: intn,
+            size: 4,
+            encoding: 1, // BTF_INT_SIGNED, like a C `int`
+            offset: 0,
+            bits: 32,
+        }, // id 1: int
+        CastSynType::Var {
+            name_off: crash_var,
+            type_id: 1,
+            linkage: 1,
+        }, // id 2: global `crash`
+        CastSynType::Datasec {
+            name_off: bss,
+            size: 256,
+            vars: vec![(2, 216, 4)],
+        }, // id 3: .bss
+    ];
+    let btf = Btf::from_bytes(&cast_build_btf(&types, &strings)).expect("synthetic btf");
+    // The .bss DATASEC value type id is 3; `crash` sits at section offset
+    // 216 and is a 4-byte scalar -> Some((216, 4)).
+    assert_eq!(
+        resolve_map_field_offset_width(&btf, 3, "crash"),
+        Some((216, 4))
+    );
+    // An unknown bare var bails.
+    assert_eq!(resolve_map_field_offset_width(&btf, 3, "nope"), None);
+    // A dot-path into a scalar (no struct to descend) bails.
+    assert_eq!(resolve_map_field_offset_width(&btf, 3, "crash.x"), None);
+}
+
+/// The resolver rejects a non-integer leaf (a struct member) and a bitfield
+/// leaf — both documented `None` outcomes — but still descends THROUGH a
+/// struct member to an integer leaf.
+#[test]
+fn resolve_map_field_offset_width_rejects_non_int_and_bitfield_leaves() {
+    // outer { inner: struct inner_t @ 4 }, inner_t { x: u32 @ 0 }.
+    let (strings, off) = build_strtab(&["u32", "inner_t", "x", "outer_t", "inner"]);
+    let (u32n, inner_t, x, outer_t, inner) = (off[0], off[1], off[2], off[3], off[4]);
+    let types = vec![
+        CastSynType::Int {
+            name_off: u32n,
+            size: 4,
+            encoding: 0,
+            offset: 0,
+            bits: 32,
+        }, // id 1
+        CastSynType::Struct {
+            name_off: inner_t,
+            size: 4,
+            members: vec![CastSynMember {
+                name_off: x,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        }, // id 2
+        CastSynType::Struct {
+            name_off: outer_t,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: inner,
+                type_id: 2,
+                byte_offset: 4,
+            }],
+        }, // id 3
+    ];
+    let btf = Btf::from_bytes(&cast_build_btf(&types, &strings)).expect("synthetic btf");
+    // Leaf `inner` is a struct, not an integer -> None.
+    assert_eq!(resolve_map_field_offset_width(&btf, 3, "inner"), None);
+    // ...but descending through it to the integer `x` works: 4 + 0, width 4.
+    assert_eq!(
+        resolve_map_field_offset_width(&btf, 3, "inner.x"),
+        Some((4, 4))
+    );
+
+    // A bitfield leaf (sub-byte width) -> None.
+    let (bstrings, boff) = build_strtab(&["u32", "flags_t", "bit"]);
+    let (bu32, flags_t, bit) = (boff[0], boff[1], boff[2]);
+    let btypes = vec![
+        CastSynType::Int {
+            name_off: bu32,
+            size: 4,
+            encoding: 0,
+            offset: 0,
+            bits: 32,
+        }, // id 1
+        CastSynType::BitfieldStruct {
+            name_off: flags_t,
+            size: 4,
+            members: vec![CastSynBitMember {
+                name_off: bit,
+                type_id: 1,
+                bit_offset: 0,
+                bitfield_size: 4,
+            }],
+        }, // id 2
+    ];
+    let bbtf = Btf::from_bytes(&cast_build_btf(&btypes, &bstrings)).expect("synthetic btf");
+    assert_eq!(resolve_map_field_offset_width(&bbtf, 2, "bit"), None);
 }

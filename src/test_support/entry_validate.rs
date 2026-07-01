@@ -85,12 +85,12 @@ impl crate::test_support::KtstrTestEntry {
                 self.name,
             );
         }
-        if self.host_only && self.network.is_some() {
+        if self.host_only && !self.networks.is_empty() {
             anyhow::bail!(
-                "KtstrTestEntry '{}'.host_only=true with network=Some(..) — \
+                "KtstrTestEntry '{}'.host_only=true with networks=[..] — \
                  host_only skips the VM boot that owns the virtio-net \
-                 device lifecycle, so the NIC would never be attached. \
-                 Drop one of host_only or network.",
+                 device lifecycle, so the NICs would never be attached. \
+                 Drop one of host_only or networks.",
                 self.name,
             );
         }
@@ -230,6 +230,32 @@ impl crate::test_support::KtstrTestEntry {
                 self.name,
             );
         }
+        if self.survives_storm && self.expect_err {
+            anyhow::bail!(
+                "KtstrTestEntry '{}' sets both survives_storm and expect_err — \
+                 contradictory: survives_storm asserts the run passes with the \
+                 scheduler alive, expect_err asserts the run fails. Pick one.",
+                self.name,
+            );
+        }
+        if self.survives_storm && self.expect_auto_repro {
+            anyhow::bail!(
+                "KtstrTestEntry '{}' sets both survives_storm and \
+                 expect_auto_repro — contradictory: survives_storm forces a \
+                 scheduler-death failure to EXIT_FAIL, expect_auto_repro \
+                 inverts a crash-with-repro failure to PASS. Pick one.",
+                self.name,
+            );
+        }
+        if self.survives_storm && !self.scheduler.has_active_scheduling() {
+            anyhow::bail!(
+                "KtstrTestEntry '{}' sets survives_storm with no active scx \
+                 scheduler — the kernel default has no scheduler to eject, so \
+                 survival is vacuous. Declare a scheduler = ... or drop \
+                 survives_storm.",
+                self.name,
+            );
+        }
         Ok(())
     }
 
@@ -257,7 +283,7 @@ impl crate::test_support::KtstrTestEntry {
             // host_only skips the VM boot that owns the freeze
             // coordinator's run-loop. Without that loop there is no
             // thread to stamp `scenario_start_ns`, no thread to fire
-            // `freeze_and_capture(false)` at each boundary, and no
+            // `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` at each boundary, and no
             // `SnapshotBridge` plumbed onto a `VmResult` for the
             // test author to drain post-run. The combination is
             // unsatisfiable; reject at validate time so a

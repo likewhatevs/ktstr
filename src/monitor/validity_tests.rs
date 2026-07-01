@@ -26,7 +26,9 @@ fn data_looks_valid_normal() {
 fn data_looks_valid_all_same_clocks() {
     let samples = vec![
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 100,
             cpus: vec![
                 CpuSnapshot {
@@ -40,7 +42,9 @@ fn data_looks_valid_all_same_clocks() {
             ],
         },
         MonitorSample {
+            bpf_map_fields: Vec::new(),
             prog_stats: None,
+            psi_irq: None,
             elapsed_ms: 200,
             cpus: vec![
                 CpuSnapshot {
@@ -60,7 +64,9 @@ fn data_looks_valid_all_same_clocks() {
 #[test]
 fn data_looks_valid_dsq_over_ceiling() {
     let samples = vec![MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![CpuSnapshot {
             local_dsq_depth: 50000,
@@ -76,7 +82,9 @@ fn data_looks_valid_dsq_over_ceiling() {
 #[test]
 fn imbalance_ratio_empty_cpus() {
     let s = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 0,
         cpus: vec![],
     };
@@ -86,7 +94,9 @@ fn imbalance_ratio_empty_cpus() {
 #[test]
 fn imbalance_ratio_single_cpu() {
     let s = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 0,
         cpus: vec![CpuSnapshot {
             nr_running: 5,
@@ -99,7 +109,9 @@ fn imbalance_ratio_single_cpu() {
 #[test]
 fn imbalance_ratio_balanced() {
     let s = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 0,
         cpus: vec![
             CpuSnapshot {
@@ -118,7 +130,9 @@ fn imbalance_ratio_balanced() {
 #[test]
 fn imbalance_ratio_imbalanced() {
     let s = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 0,
         cpus: vec![
             CpuSnapshot {
@@ -137,7 +151,9 @@ fn imbalance_ratio_imbalanced() {
 #[test]
 fn imbalance_ratio_zero_min() {
     let s = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 0,
         cpus: vec![
             CpuSnapshot {
@@ -159,7 +175,9 @@ fn imbalance_ratio_zero_min() {
 #[test]
 fn sum_event_field_none_when_no_counters() {
     let s = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 0,
         cpus: vec![CpuSnapshot::default(), CpuSnapshot::default()],
     };
@@ -169,7 +187,9 @@ fn sum_event_field_none_when_no_counters() {
 #[test]
 fn sum_event_field_sums_across_cpus() {
     let s = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 0,
         cpus: vec![
             CpuSnapshot {
@@ -194,7 +214,9 @@ fn sum_event_field_sums_across_cpus() {
 #[test]
 fn sum_event_field_mixed_some_none() {
     let s = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 0,
         cpus: vec![
             CpuSnapshot {
@@ -215,7 +237,9 @@ fn sum_event_field_mixed_some_none() {
 #[test]
 fn sample_looks_valid_normal() {
     let s = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![CpuSnapshot {
             local_dsq_depth: 5,
@@ -228,7 +252,9 @@ fn sample_looks_valid_normal() {
 #[test]
 fn sample_looks_valid_at_ceiling() {
     let s = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![CpuSnapshot {
             local_dsq_depth: DSQ_PLAUSIBILITY_CEILING,
@@ -241,7 +267,9 @@ fn sample_looks_valid_at_ceiling() {
 #[test]
 fn sample_looks_valid_over_ceiling() {
     let s = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![CpuSnapshot {
             local_dsq_depth: DSQ_PLAUSIBILITY_CEILING + 1,
@@ -254,7 +282,9 @@ fn sample_looks_valid_over_ceiling() {
 #[test]
 fn sample_looks_valid_empty_cpus() {
     let s = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![],
     };
@@ -264,7 +294,9 @@ fn sample_looks_valid_empty_cpus() {
 #[test]
 fn sample_looks_valid_zero_initialized() {
     let s = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 0,
         cpus: vec![CpuSnapshot::default(), CpuSnapshot::default()],
     };
@@ -275,7 +307,9 @@ fn sample_looks_valid_zero_initialized() {
 #[test]
 fn sample_looks_valid_multiple_cpus_one_over() {
     let s = MonitorSample {
+        bpf_map_fields: Vec::new(),
         prog_stats: None,
+        psi_irq: None,
         elapsed_ms: 100,
         cpus: vec![
             CpuSnapshot {

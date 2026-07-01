@@ -13,8 +13,10 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::workload::config::{
-    AluWidth, FutexLockMode, SchedClass, WakeMechanism, humantime_serde_helper,
+    AluWidth, FutexLockMode, ReapMode, SchedClass, WakeMechanism, humantime_serde_helper,
 };
+use crate::workload::schbench::run::SchbenchConfig;
+use crate::workload::taobench::run::TaobenchConfig;
 
 use crate::workload::WorkerReport;
 
@@ -74,24 +76,115 @@ impl PartialEq for CustomFn {
     }
 }
 
+/// Plain-old-data config payload for [`WorkType::Custom`]. Every field is
+/// `Copy` (integers / bools / a fixed byte array) so the whole struct
+/// survives `fork()` byte-faithfully in the child address space — no heap
+/// pointer, no shared mapping required. Read post-fork by the worker
+/// dispatch and handed to the closure via [`WorkerCtx::cfg`].
+///
+/// Variable-length data is intentionally NOT supported here: a `Vec` /
+/// `String` field stores a heap pointer; across `fork` the pointer is
+/// copied verbatim but the backing buffer is copy-on-write PRIVATE (not
+/// shared), so the child sees its own duplicate, never the parent's live
+/// data. For variable-length or genuinely shared state, allocate a
+/// `MAP_SHARED` region in the test body and pass its address through a
+/// `u64` slot (see `tests/preempt_regression.rs`); small inline blobs fit
+/// in `blob` + `blob_len`.
+///
+/// Slot meanings are caller-defined — the framework cannot know the schema
+/// of an arbitrary user closure, so it provides indexed typed arrays the
+/// test author assigns meaning to (e.g. `u64s[0]` = a shared region
+/// address). Construct with [`CustomCfg::default`] + the chainable setters.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CustomCfg {
+    /// General-purpose 64-bit slots (a common use: a `MAP_SHARED` region
+    /// address as a `u64`).
+    pub u64s: [u64; 4],
+    /// General-purpose pointer-width slots (sizes, counts, indices).
+    pub usizes: [usize; 4],
+    /// General-purpose signed 32-bit slots (nice levels, fds, flags).
+    pub i32s: [i32; 4],
+    /// General-purpose boolean flags.
+    pub bools: [bool; 4],
+    /// Fixed inline byte blob for small variable-length payloads; the valid
+    /// prefix length is [`Self::blob_len`].
+    pub blob: [u8; 32],
+    /// Number of valid leading bytes in [`Self::blob`] (`0..=32`).
+    pub blob_len: usize,
+}
+
+impl CustomCfg {
+    /// Set slot `i` of [`Self::u64s`], returning `self` for chaining.
+    ///
+    /// # Panics
+    /// Panics if `i >= 4` (the array length).
+    pub const fn u64_slot(mut self, i: usize, v: u64) -> Self {
+        self.u64s[i] = v;
+        self
+    }
+
+    /// Set slot `i` of [`Self::usizes`], returning `self` for chaining.
+    ///
+    /// # Panics
+    /// Panics if `i >= 4` (the array length).
+    pub const fn usize_slot(mut self, i: usize, v: usize) -> Self {
+        self.usizes[i] = v;
+        self
+    }
+
+    /// Set slot `i` of [`Self::i32s`], returning `self` for chaining.
+    ///
+    /// # Panics
+    /// Panics if `i >= 4` (the array length).
+    pub const fn i32_slot(mut self, i: usize, v: i32) -> Self {
+        self.i32s[i] = v;
+        self
+    }
+
+    /// Set slot `i` of [`Self::bools`], returning `self` for chaining.
+    ///
+    /// # Panics
+    /// Panics if `i >= 4` (the array length).
+    pub const fn bool_slot(mut self, i: usize, v: bool) -> Self {
+        self.bools[i] = v;
+        self
+    }
+
+    /// Copy up to 32 bytes into [`Self::blob`] and set [`Self::blob_len`].
+    /// Input longer than 32 bytes is truncated to 32. Non-`const` (unlike
+    /// the integer/bool slot setters) because it copies a runtime slice,
+    /// which a `const fn` cannot express today.
+    pub fn blob(mut self, bytes: &[u8]) -> Self {
+        let n = bytes.len().min(self.blob.len());
+        self.blob[..n].copy_from_slice(&bytes[..n]);
+        self.blob_len = n;
+        self
+    }
+}
+
 /// Execution context handed to a [`WorkType::Custom`] worker function.
 ///
 /// Exposes the worker's stop flag plus the parts of its runtime
 /// environment a scheduler probe most often needs — its effective
-/// cpuset and its cgroup-sibling pids — so a custom worker does not
-/// re-roll `sched_getaffinity` or `cgroup.procs` parsing. All three
-/// are captured once, at worker entry, before the work loop runs.
+/// cpuset, its cgroup-sibling pids, its own cgroup-v2 directory, and a
+/// fork-safe [`CustomCfg`] payload — plus `open_sibling_cgroup_procs()` to
+/// open a sibling cgroup's `cgroup.procs`, so a custom worker does not
+/// re-roll `sched_getaffinity`, `cgroup.procs`, or `/proc/self/cgroup`
+/// parsing. The captured fields are read once, at worker entry, before
+/// the work loop runs.
 ///
 /// Borrowed, not owned: the framework constructs a `WorkerCtx`
 /// pointing at stack-local data in `worker_main` and passes it by
 /// reference for the duration of the call. A worker that needs the
-/// sibling set or cpuset to outlive a single read should copy what
-/// it needs out of the returned slices.
+/// sibling set, cpuset, or cgroup dir to outlive a single read should
+/// copy what it needs out of the returned slices / path.
 #[derive(Copy, Clone, Debug)]
 pub struct WorkerCtx<'a> {
     stop: &'a AtomicBool,
     cpus: &'a [usize],
     sibling_pids: &'a [libc::pid_t],
+    cgroup_dir: Option<&'a std::path::Path>,
+    cfg: CustomCfg,
 }
 
 impl<'a> WorkerCtx<'a> {
@@ -102,11 +195,15 @@ impl<'a> WorkerCtx<'a> {
         stop: &'a AtomicBool,
         cpus: &'a [usize],
         sibling_pids: &'a [libc::pid_t],
+        cgroup_dir: Option<&'a std::path::Path>,
+        cfg: CustomCfg,
     ) -> Self {
         WorkerCtx {
             stop,
             cpus,
             sibling_pids,
+            cgroup_dir,
+            cfg,
         }
     }
 
@@ -135,6 +232,75 @@ impl<'a> WorkerCtx<'a> {
     #[inline]
     pub fn sibling_pids(&self) -> &[libc::pid_t] {
         self.sibling_pids
+    }
+
+    /// The worker's own cgroup-v2 directory (`/sys/fs/cgroup<rel>`),
+    /// captured at entry from `/proc/self/cgroup` — or `None` when the
+    /// worker runs in the root cgroup or cgroup v2 is unavailable. A
+    /// Custom worker that needs to address a sibling cgroup (write its
+    /// `cgroup.procs`, read a peer's members) resolves the target from
+    /// here instead of re-parsing `/proc/self/cgroup` itself. `None`,
+    /// never a bogus `/sys/fs/cgroup`, so the root is never mistaken for
+    /// a dedicated cgroup.
+    #[inline]
+    pub fn cgroup_dir(&self) -> Option<&std::path::Path> {
+        self.cgroup_dir
+    }
+
+    /// The [`CustomCfg`] payload declared on this worker's
+    /// [`WorkType::Custom`] (or [`CustomCfg::default`] — all-zero — when
+    /// the worker was built with [`WorkType::custom`] rather than
+    /// [`WorkType::custom_with`]). Copy POD, inherited byte-faithfully
+    /// across `fork`, so a Custom closure reads its per-worker config from
+    /// here instead of a `static`/global.
+    #[inline]
+    pub fn cfg(&self) -> CustomCfg {
+        self.cfg
+    }
+
+    /// Open the `cgroup.procs` of a cgroup under this worker's cgroup parent
+    /// for writing — the ready-to-use migration target a Custom worker needs
+    /// without re-parsing `/proc/self/cgroup` or hand-rolling a writability
+    /// precheck. Resolves to `cgroup_dir().parent()/<name>/cgroup.procs`: a
+    /// single-component `name` is a sibling of this worker's cgroup, a
+    /// multi-component `name` a nested descendant of that parent.
+    ///
+    /// The write-mode open IS the precheck: a successful return means the
+    /// sibling's `cgroup.procs` exists and was openable for write. The
+    /// kernel checks `cgroup.procs` WRITE permission at write time (against
+    /// the open-time credentials), so a returned `File` can still fail on
+    /// the actual write — the caller must handle write errors too.
+    ///
+    /// # Errors
+    /// - `InvalidInput` if `name` is empty, absolute, contains a NUL, or has
+    ///   a `.`/`..`/leading-dot/empty path component (rejected before any fs
+    ///   access, so a hostile name cannot escape the parent via join).
+    /// - `NotFound` if the worker has no resolvable cgroup-v2 dir (root /
+    ///   non-v2 — run it in a dedicated cgroup) or its cgroup has no parent.
+    /// - the underlying open error (`NotFound` for a missing sibling,
+    ///   `PermissionDenied` for an unwritable one, …) with `ErrorKind`
+    ///   preserved and the resolved path in the message.
+    pub fn open_sibling_cgroup_procs(&self, name: &str) -> std::io::Result<std::fs::File> {
+        // Resolve + validate via the shared sibling resolver — single-sourced
+        // with the `WorkType::CgroupAttachStorm` built-in dispatch arm so both
+        // address the same `<parent>/<name>/cgroup.procs` target by
+        // construction. `name` is user-supplied; the resolver rejects a
+        // `.`/`..`/absolute/NUL component (which would escape the parent via
+        // `Path::join`) before any fs access. The write-mode open below IS the
+        // precheck.
+        let path = crate::workload::worker::resolve_sibling_cgroup_procs(self.cgroup_dir(), name)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "open_sibling_cgroup_procs({name:?}) -> {}: {e}",
+                        path.display()
+                    ),
+                )
+            })
     }
 }
 
@@ -205,16 +371,16 @@ impl<'a> WorkerCtx<'a> {
 /// up automatically without editing a parallel list.
 #[derive(Debug, Clone, PartialEq, strum::VariantNames, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-// `#[serde(bound(...))]` overrides the auto-derived lifetime bound. The
-// `Custom` variant is `#[serde(skip)]` (it carries a non-portable `fn`
-// pointer + a `&'static str` name), but the derive still walks every
-// variant's field types to compute the implied `Deserialize<'de>`
-// bound. Without this override the compiler infers `'de: 'static`
-// from `Custom { name: &'static str }`, which makes the type
-// unusable from any non-`'static` deserializer (i.e. all real
-// deserializers). Explicit empty bounds tell serde to skip the
-// auto-inference; the skipped variant is never deserialized so no
-// `&'static str` ever needs to be reconstructed.
+// `#[serde(bound(...))]` overrides serde's auto-derived bounds. The
+// `Custom` variant is `#[serde(skip)]` — it carries a non-portable `fn`
+// pointer (`CustomFn`) plus a `String` name and a `CustomCfg` payload —
+// but the derive still walks every variant's field types when computing
+// the implied `Deserialize<'de>` bound. `CustomFn` is a raw fn pointer
+// and does not implement `Deserialize`, so without the explicit empty
+// bound the derive would require `CustomFn: Deserialize` and `WorkType`
+// would not deserialize at all. The empty bounds skip the auto-inference;
+// the skipped variant is never (de)serialized, so its fields never need
+// reconstruction.
 #[serde(bound(deserialize = ""))]
 pub enum WorkType {
     /// Tight CPU spin loop (1024 iterations per cycle).
@@ -309,7 +475,7 @@ pub enum WorkType {
     },
     /// Rapid fork+_exit cycling. Each iteration forks a child that
     /// immediately calls _exit(0). Parent waitpid's then repeats.
-    /// Exercises wake_up_new_task, do_exit, wait_task_zombie.
+    /// Exercises wake_up_new_task, exit_group/do_group_exit, wait_task_zombie.
     ForkExit,
     /// Cycle nice level from -20 to 19 across iterations. Each
     /// iteration: spin_burst → setpriority → yield. Exercises
@@ -386,6 +552,29 @@ pub enum WorkType {
         operations: usize,
         sleep_usec: u64,
     },
+    /// schbench's default-mode benchmark, re-expressed natively (the
+    /// `schbench_rs` port). One worker process runs schbench's
+    /// message-thread / worker-thread topology with native threads: message
+    /// threads batch-wake worker threads (measuring scheduler wakeup latency),
+    /// and each worker think-sleeps then does matrix work under a per-CPU lock
+    /// (measuring request latency). The carried [`SchbenchConfig`] sets the
+    /// thread counts, cache footprint, think-time, and locking; build it with
+    /// [`SchbenchConfig::default`] plus its chainable setters. Use a single
+    /// ktstr worker (`workers(1)`) -- the message/worker parallelism is this
+    /// variant's internal thread topology, not ktstr worker processes.
+    Schbench { config: SchbenchConfig },
+    /// A bounded, evicting key-value cache workload, re-expressed natively (the
+    /// `taobench_rs` port of the taobench object-cache benchmark). One worker
+    /// process runs a closed-loop client population over an in-process sharded
+    /// cache: a fast in-cache hit path and a slow backing-store-miss path (a
+    /// dispatcher-thread sleep), driven to a steady-state hit ratio by sizing the
+    /// key range against the cache capacity. The carried [`TaobenchConfig`] sets
+    /// the thread counts, cache capacity, target hit ratio, and slow-path
+    /// latency; build it with [`TaobenchConfig::default`] plus its chainable
+    /// setters. Use a single ktstr worker (`workers(1)`) -- the client/fast/slow
+    /// parallelism is this variant's internal thread topology, not ktstr worker
+    /// processes.
+    Taobench { config: TaobenchConfig },
     /// Rapid page fault cycling. Workers mmap a `region_kib` KiB region with
     /// `MADV_NOHUGEPAGE` (forcing 4 KiB pages), touch `touches_per_cycle`
     /// random pages via write faults, then `MADV_DONTNEED` to zap PTEs and
@@ -428,6 +617,22 @@ pub enum WorkType {
     /// compute wake-latency percentiles will produce zero/degenerate
     /// numbers against a `Custom` report that did not record them.
     ///
+    /// **`work_units` vs `iterations` — which assertion reads which:** the
+    /// two `WorkerReport` counters are NOT interchangeable. Headline
+    /// throughput — `CgroupStats::total_iterations` and the derived rates
+    /// `iterations_per_worker` / `iterations_per_cpu_sec` and
+    /// `migration_ratio` — sums `WorkerReport::iterations`, NOT `work_units`.
+    /// The default fairness/starvation gate (`assert_not_starved` and the
+    /// `min_work_units` floor) and `assert_throughput_parity` read
+    /// `WorkerReport::work_units`, NOT `iterations`. Populate BOTH (set them
+    /// equal when the closure has a single loop counter, as the `custom_spin_fn`
+    /// fixture does), or set each to the quantity the assertions you
+    /// target will read. A report with `work_units > 0, iterations == 0`
+    /// passes the starvation gate but reports zero throughput, so
+    /// `claim_total_iterations(..).at_least(N)` silently fails; the inverse
+    /// (`iterations > 0, work_units == 0`) reports throughput but the
+    /// starvation gate flags every worker.
+    ///
     /// **Process-group lifecycle (per `CloneMode`):**
     ///
     /// _Fork mode_ — every worker calls `setpgid(0, 0)` immediately
@@ -465,13 +670,18 @@ pub enum WorkType {
     /// disposition table, the file descriptor table, cwd, and
     /// every other process-scoped attribute with every sibling
     /// worker AND with the test harness. Do NOT call
-    /// `_exit()`/`exit()`, `fork()`/`vfork()`/`clone()`,
-    /// `setpgid()`/`setsid()`, `execve()`, `chdir()`/`chroot()`,
-    /// `setresuid()`/`setresgid()`, `prctl(PR_SET_*)` or any other
-    /// process-scoping syscall — these affect the entire process,
-    /// including all sibling workers and the test runner itself,
-    /// and will produce silent cross-worker corruption,
-    /// unexpected test-harness exits, or both. The supported
+    /// `_exit()`/`exit()`, `setpgid()`/`setsid()`, `execve()`,
+    /// `chdir()`/`chroot()`, `setresuid()`/`setresgid()`,
+    /// `prctl(PR_SET_*)` or any other process-scoping syscall —
+    /// these affect the entire process, including all sibling
+    /// workers and the test harness itself, and will produce silent
+    /// cross-worker corruption, unexpected test-harness exits, or
+    /// both. `fork()`/`vfork()`/`clone()` are equally unsupported but
+    /// for a distinct reason: a fork from a thread of this
+    /// multi-threaded process duplicates only the calling thread, so
+    /// any lock another thread holds at fork time (glibc malloc
+    /// arena, internal mutexes) stays locked forever in the child.
+    /// The supported
     /// shutdown contract is: observe the `&AtomicBool` argument's
     /// `stop.load()` flag and return the [`WorkerReport`] when it
     /// flips. This is a runtime contract, not a static check —
@@ -494,15 +704,23 @@ pub enum WorkType {
     /// # Construction
     ///
     /// Prefer the [`WorkType::custom`] constructor — it takes a
-    /// bare `fn` pointer and transparently wraps it in [`CustomFn`]:
-    /// `WorkType::custom("my_workload", my_fn)`. Struct-literal
-    /// construction requires the wrap explicitly: `WorkType::Custom
-    /// { name: "my_workload".into(), run: CustomFn(my_fn) }`. The
-    /// constructor path is the supported user-facing API; the
-    /// struct-literal form exists for test-internal construction
-    /// where the call site already deals with the newtype directly.
+    /// bare `fn` pointer and transparently wraps it in [`CustomFn`],
+    /// defaulting `cfg` to [`CustomCfg::default`]:
+    /// `WorkType::custom("my_workload", my_fn)`. To pass a fork-safe
+    /// config payload, use [`WorkType::custom_with`] with a [`CustomCfg`]
+    /// (Copy POD; for variable-length / shared state pass a `MAP_SHARED`
+    /// region address through a `u64` slot). Struct-literal construction
+    /// requires the wrap explicitly: `WorkType::Custom { name:
+    /// "my_workload".into(), run: CustomFn(my_fn), cfg:
+    /// CustomCfg::default() }`. The constructor path is the supported
+    /// user-facing API; the struct-literal form exists for test-internal
+    /// construction where the call site already deals with the newtype.
     #[serde(skip)]
-    Custom { name: String, run: CustomFn },
+    Custom {
+        name: String,
+        run: CustomFn,
+        cfg: CustomCfg,
+    },
     /// One waker, N waiters on a SINGLE global futex word, repeated
     /// in batches with a sleep gap. Distinct from
     /// [`FutexFanOut`](Self::FutexFanOut) which uses one futex per
@@ -791,22 +1009,87 @@ pub enum WorkType {
     /// write lock and exercises the per-class `sched_move_task` /
     /// `task_change_group` callbacks. Zero coverage today.
     ///
-    /// Sibling cgroups must already exist under the worker's parent
-    /// cgroup with names `wt-cgroup-churn-<i>` for `i in
-    /// 0..groups`; the test harness or scenario setup creates them.
-    /// Each iteration the worker writes its tid to the next sibling
-    /// in rotation. `worker_group_size = None` (any worker count
+    /// The worker auto-creates the rotation cgroups
+    /// `wt-cgroup-churn-<i>` for `i in 0..groups` under the workload
+    /// cgroup root (default `/sys/fs/cgroup/ktstr`, or the per-test
+    /// `#[ktstr_test(workload_root_cgroup = "/path")]` root) at entry,
+    /// as empty leaf cgroups (no `subtree_control`) so they accept
+    /// `cgroup.procs` migration. Each iteration the worker writes its
+    /// tid to the next sibling in rotation. `worker_group_size = None`
+    /// (any worker count
     /// valid; each worker rotates independently). Per-iteration
     /// budget is one `write` syscall to `cgroup.procs`.
     CgroupChurn {
-        /// Number of sibling cgroups to rotate through. The harness
-        /// creates `wt-cgroup-churn-0` … `wt-cgroup-churn-(groups-1)`
-        /// before spawn.
+        /// Number of sibling cgroups to rotate through. The worker
+        /// auto-creates `wt-cgroup-churn-0` …
+        /// `wt-cgroup-churn-(groups-1)` under the workload root at
+        /// entry.
         groups: usize,
         /// Wall-clock interval between cgroup rewrites (ms). Lower
         /// values increase contention on `cgroup_threadgroup_rwsem`
         /// and the per-class `task_change_group` paths.
         cycle_ms: u64,
+    },
+    /// Each iteration the worker `fork`s a transient child and migrates
+    /// it — the whole process — into a sibling cgroup by writing the
+    /// child's pid to `<dest>/cgroup.procs`, while the child immediately
+    /// `_exit`s. The `cgroup.procs` write drives the kernel's
+    /// threadgroup-wide attach path: `cgroup_procs_write` →
+    /// `cgroup_attach_task(dst, leader, threadgroup=true)` walks
+    /// `while_each_thread(leader, task)` and migrates every member of the
+    /// tgid, then fires `TRACE_CGROUP_PATH(attach_task, …)`
+    /// (`kernel/cgroup/cgroup.c`). A whole-process `cgroup.procs` write of
+    /// an *exiting* child is the leader-acquire race a `tp_btf` /
+    /// `cgroup_attach_task` BPF handler must survive — migrating a task
+    /// that is concurrently tearing down.
+    ///
+    /// Distinct from both sibling primitives, and not expressible by
+    /// either:
+    /// - [`ForkExit`](Self::ForkExit) forks and `waitpid`s its child but
+    ///   never writes `cgroup.procs` — no migration, no attach path.
+    /// - [`CgroupChurn`](Self::CgroupChurn) writes its *own* tid to
+    ///   rotate cgroups but never forks — no transient-child leader race.
+    ///
+    /// `reap` ([`ReapMode`]) selects the disposition that decides whether
+    /// the migration races the child's teardown:
+    /// [`SigIgn`](ReapMode::SigIgn) (default) installs `SIGCHLD = SIG_IGN`
+    /// once so children auto-reap concurrent with the write — the race;
+    /// [`Waitpid`](ReapMode::Waitpid) blocking-reaps each child after the
+    /// write — a non-racing A/B control.
+    ///
+    /// `dest` is the name of a cgroup that must already exist under the
+    /// worker cgroup's parent, typically created via
+    /// [`Op::add_cgroup`](crate::scenario::ops::Op::add_cgroup). The target
+    /// resolves to `<worker-cgroup>.parent()/<dest>/cgroup.procs` from
+    /// the worker's resolved cgroup-v2 dir (the same resolution
+    /// [`WorkerCtx::open_sibling_cgroup_procs`] uses), so the worker must
+    /// run in a dedicated cgroup — not the root. A single-component `dest`
+    /// names a sibling of the worker cgroup; a multi-component `dest`
+    /// (e.g. `a/b`) addresses a nested descendant of that parent. If
+    /// `dest` cannot be resolved or its `cgroup.procs` is not writable the
+    /// worker logs a warning once and the storm no-ops (a vacuous
+    /// "scheduler survived" is surfaced loudly, never silently);
+    /// `work_units` stays zero so a caller can detect the no-op.
+    ///
+    /// Exclusive to [`CloneMode::Fork`](crate::workload::CloneMode::Fork):
+    /// the worker installs `SIGCHLD = SIG_IGN` to auto-reap its forked
+    /// children (under [`ReapMode::SigIgn`]), and a thread-group worker
+    /// shares the harness `sighand`, so that install would corrupt the
+    /// harness's own child reaping; fork from a thread of the harness is
+    /// also fragile. [`CloneMode::Thread`](crate::workload::CloneMode::Thread)
+    /// is therefore rejected at spawn. `worker_group_size = None` (any
+    /// worker count valid; each worker storms independently).
+    CgroupAttachStorm {
+        /// Name of the cgroup whose `cgroup.procs` each forked child is
+        /// migrated into, resolved relative to the worker cgroup's parent
+        /// (a single-component name is a sibling; a multi-component name a
+        /// nested descendant). Must already exist (e.g. via
+        /// [`Op::add_cgroup`](crate::scenario::ops::Op::add_cgroup)).
+        dest: String,
+        /// How the worker reaps the children it forks — the race
+        /// ([`SigIgn`](ReapMode::SigIgn)) or the control
+        /// ([`Waitpid`](ReapMode::Waitpid)).
+        reap: ReapMode,
     },
     /// Paired workers signal each other with `kill(partner,
     /// SIGUSR1)`. Each worker installs a SIGUSR1 handler via
@@ -1390,6 +1673,146 @@ pub enum WorkType {
         /// in via the struct-literal form
         /// `WorkType::IdleChurn { ..., precise_timing: true }`.
         precise_timing: bool,
+    },
+    /// Cyclictest-style timer-latency probe. Each worker sleeps to an ABSOLUTE
+    /// deadline via `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, next)` and
+    /// records the wake latency = observed wake time − the deadline (floored at
+    /// 0), accumulating `next += interval` (NOT `now + interval`) so a late wake
+    /// shows up AS latency instead of pushing the next period out — the
+    /// coordinated-omission-free measurement `cyclictest(8)` makes.
+    ///
+    /// **Kernel path:** `clock_nanosleep(TIMER_ABSTIME)` →
+    /// `hrtimer_nanosleep(HRTIMER_MODE_ABS)` → `do_nanosleep`
+    /// (`kernel/time/hrtimer.c`): `schedule()` blocks the task; on expiry
+    /// `hrtimer_wakeup` → `wake_up_process` → `try_to_wake_up` re-runs it. The
+    /// latency is the scheduler's wake-to-on-CPU delay for a timer-woken task —
+    /// the canonical real-time-determinism signal.
+    ///
+    /// **vs [`IdleChurn`](Self::IdleChurn):** IdleChurn does a RELATIVE
+    /// `nanosleep(sleep_duration)` after a CPU burst and measures resume
+    /// OVERHEAD against an `Instant` deadline — an idle/run duty cycle that
+    /// frees CPUs for borrowing. TimerLatency does an absolute-deadline sleep
+    /// with no CPU burst and measures the timer wake-LATENCY distribution
+    /// (`timer_latency_p50/p99/p999_us` + worst), the RT-determinism shape. Use
+    /// IdleChurn to free CPUs; use TimerLatency to measure wake-up jitter under
+    /// load. Here the SLEEPING task is the one woken (self-timer-wake).
+    ///
+    /// **Metrics:** the per-cycle latency feeds the distinct `timer_latencies_ns`
+    /// reservoir (NOT the shared `wake_latencies_ns`), so a TimerLatency run's
+    /// `timer_latency_p99_us` never blurs with the blocking variants'
+    /// `p99_wake_latency_us`. Guest-resident (an intrinsic latency probe — the
+    /// documented observer-effect exception).
+    ///
+    /// `worker_group_size = None` (any worker count; each worker runs an
+    /// independent cyclictest loop). Pin workers to dedicated CPUs
+    /// (e.g. [`crate::workload::AffinityIntent`]) to measure per-CPU wake
+    /// jitter. Default 1000µs (1kHz, cyclictest's default) — see
+    /// [`crate::workload::config::defaults::TIMER_LATENCY_INTERVAL_US`].
+    TimerLatency {
+        /// Inter-wake interval in microseconds — the absolute deadline advances
+        /// by this each cycle (`next += interval_us`). 1000 (1kHz) matches
+        /// `cyclictest`'s default; smaller intervals raise the wake frequency
+        /// (and the sample count per second). Validated `> 0` at spawn (a zero
+        /// interval never advances the deadline and busy-spins).
+        interval_us: u64,
+    },
+    /// AF_PACKET traffic generator that drives the virtio-net NIC's RX
+    /// hardirq and NAPI softirq. Each worker opens an `AF_PACKET` /
+    /// `SOCK_RAW` socket bound to the single non-loopback (virtio-net)
+    /// interface, brings it administratively up, and sends self-addressed
+    /// L2 frames in a loop. Every `sendto` is a virtio TX kick; the v0
+    /// in-VMM-loopback backend echoes the frame straight into RX and raises
+    /// the guest's RX-completion interrupt, so the workload generates real
+    /// per-CPU hardirq + softirq load for the scheduler to absorb.
+    ///
+    /// **Kernel path:** `sendto` → `packet_sendmsg` → `dev_queue_xmit` (an
+    /// L2 inject that bypasses the IP stack) → virtio-net `start_xmit` →
+    /// `virtqueue_notify` (an MMIO QUEUE_NOTIFY that exits to the host). The
+    /// host loopback echoes TX→RX and signals the RX virtqueue; the guest
+    /// virtio-mmio ISR runs `vring_interrupt` → `skb_recv_done` →
+    /// `virtqueue_napi_schedule`, raising `NET_RX_SOFTIRQ` (drained by
+    /// `virtnet_poll` in softirq context). NAPI coalesces, so a tight burst
+    /// yields fewer hardirqs but sustained softirq work.
+    ///
+    /// **Why AF_PACKET, not IP traffic:** a guest sending to its own IP is
+    /// routed to `lo` (`RTN_LOCAL`) and never reaches the NIC, raising zero
+    /// virtio IRQs. Only an `AF_PACKET` raw socket bound to the interface
+    /// drives a real TX kick. Requires `CONFIG_PACKET=y` (`ktstr.kconfig`)
+    /// and `CAP_NET_ADMIN` for the interface-up ioctl — ktstr always runs as
+    /// root, so the capability is present.
+    ///
+    /// **Precondition:** a NIC must be attached via
+    /// `#[ktstr_test(networks = [...])]` with a [`crate::prelude::NetConfig`].
+    /// With no non-loopback interface present the worker is a LOUD no-op: it
+    /// warns once and returns `work_units == 0` rather than silently doing
+    /// nothing.
+    ///
+    /// `worker_group_size = None` (any worker count; each worker drives the
+    /// shared NIC independently). Frames sent are reported as `work_units` /
+    /// `iterations`; the IRQ-side signals (`rq->avg_irq`, per-CPU softirq
+    /// time, `/proc/interrupts`) are observed separately, not by this
+    /// variant.
+    NetTraffic {
+        /// Inter-frame pause in microseconds. `0` (the default) sends
+        /// continuously — the maximum TX-kick rate, i.e. maximum softirq
+        /// pressure (NAPI coalesces the hardirqs). A value `> 0` paces the
+        /// loop to approximately `1_000_000 / interval_us` frames per second
+        /// for a steady, controlled IRQ rate.
+        interval_us: u64,
+        /// Ethernet frame size in bytes. Default 60 (`ETH_ZLEN`, the minimum
+        /// L2 frame sans FCS). Validated to `[60, 1514]` (minimum frame ..
+        /// standard MTU + header) at spawn.
+        frame_bytes: u16,
+    },
+    /// Paired sender/receiver that wakes a blocked task from NET_RX **softirq**
+    /// (or ksoftirqd) context — the genuine "woken from softirq" wake that
+    /// [`Self::TimerLatency`] (a hardirq hrtimer wake) and [`Self::NetTraffic`] (a
+    /// wakee-less sender) do not exercise. Each pair: one worker reuses the
+    /// [`Self::NetTraffic`] sender (self-addressed `AF_PACKET` / `SOCK_RAW` frames
+    /// on the virtio-net NIC), the other BLOCKS in `recvfrom` on the same socket
+    /// and records a wake-presence sample per delivered frame.
+    ///
+    /// **Kernel path (the wake):** the sender's frame arrives via the virtio RX
+    /// IRQ, which only schedules NAPI (`vring_interrupt` → `skb_recv_done` →
+    /// `__napi_schedule`); delivery + wake run in the `NET_RX_SOFTIRQ` handler
+    /// `net_rx_action` → `virtnet_poll` → `packet_rcv` → `sk_data_ready` =
+    /// `sock_def_readable` → `wake_up_interruptible_sync_poll`, which `ttwu`s the
+    /// receiver blocked in `__skb_wait_for_more_packets`. At a low rate the softirq
+    /// runs inline (on the receiving CPU at `irq_exit`); at saturation
+    /// (`interval_us == 0`) the softirq budget is exceeded and the work — and the
+    /// wake — defers to `ksoftirqd`. The regime is kernel-decided by rate, not a
+    /// flag. The wake is NEVER in hardirq context (the virtio ISR only schedules
+    /// NAPI).
+    ///
+    /// **Precondition + no-NIC behavior:** like [`Self::NetTraffic`] — needs a NIC
+    /// via `#[ktstr_test(networks = [...])]`; with no non-loopback interface the pair
+    /// is a LOUD no-op (warn once, `work_units == 0`).
+    ///
+    /// **What the wake reservoir means:** `worker_group_size = Some(2)` — workers
+    /// spawn in sender/receiver pairs (even count enforced at spawn). The receiver
+    /// pushes each `recvfrom` block-to-return duration into the wake reservoir
+    /// (`wake_latencies_ns`). A NON-EMPTY reservoir is a LIVENESS signal — softirq-
+    /// delivered frames scheduled the receiver to run — NOT a precise wake-to-run
+    /// latency: the magnitude is a block-duration proxy dominated by the
+    /// inter-frame pacing wait, and when the queue never empties (`interval_us ==
+    /// 0`) a `recvfrom` may return an already-queued frame WITHOUT blocking, so a
+    /// sample need not correspond to a softirq wake at all. The authoritative
+    /// "softirq fired" proof is the rising IRQ-observability count
+    /// (`total_softirq_net_rx`, `rq->avg_irq`, PSI-irq), not the reservoir.
+    IrqWake {
+        /// Inter-frame pause (µs) on the sender. Default **1000** (1 kHz): paces
+        /// the sender so the receiver drains its queue and genuinely blocks
+        /// between frames — each frame is then a real empty-queue block woken by
+        /// the next NET_RX softirq, giving a usable (non-degenerate) wake
+        /// reservoir. `0` sends continuously (maximum softirq load, serviced by
+        /// `ksoftirqd`) but the receive queue rarely empties, so `recvfrom` mostly
+        /// returns an already-queued frame without blocking and the wake reservoir
+        /// degenerates to near-zero block durations. A larger `> 0` value lowers
+        /// the rate. Paces the sender side only; the receiver always blocks.
+        interval_us: u64,
+        /// Ethernet frame size in bytes. Default 60 (`ETH_ZLEN`). Validated to
+        /// `[60, 1514]` at spawn.
+        frame_bytes: u16,
     },
     /// Sustained high-IPC ALU workload. Each worker runs four
     /// independent multiply chains in parallel, with

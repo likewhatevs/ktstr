@@ -278,6 +278,12 @@ fn dual_run(
     kernel: &str,
     filter: Option<&str>,
 ) -> Result<()> {
+    // runs_root() is absolute under the cargo-ktstr orchestrator
+    // (install_runs_root_env stamps KTSTR_RUNS_ROOT), so this join
+    // yields that shared dir — Path::join discards `repo_root` against
+    // an absolute rhs, and both the baseline worktree child and HEAD
+    // inherit KTSTR_RUNS_ROOT and write there. join() also anchors the
+    // relative raw-nextest fallback to repo_root; correct for both.
     let runs_root_abs = repo_root.join(ktstr::test_support::runs_root());
     let leaf = baseline_sidecar_leaf(&runs_root_abs, baseline_short);
     let wt_dir = worktree_checkout_dir(&std::env::temp_dir(), baseline_short);
@@ -335,6 +341,84 @@ fn dual_run(
     Ok(())
 }
 
+/// `--noise-adjust N` run-production: like [`dual_run`] but loops, writing each
+/// of the N baseline + N HEAD runs into its OWN sidecar leaf so the N runs per
+/// side accumulate. Two runs of the same test+config write the SAME sidecar
+/// filename — the variant hash covers run-INDEPENDENT identity only (topology /
+/// scheduler / payload / work_type / sysctls / kargs) — so a single shared leaf would
+/// last-writer-wins OVERWRITE all but the final run, collapsing N samples to 1.
+/// (The `KTSTR_SIDECAR_DIR` override these children set ALSO disables the run-epoch
+/// pre_clear, so that is not the mechanism.) Distinct per-run leaves give distinct
+/// dirs -> distinct files -> all N survive. All leaves live under the shared
+/// runs-root, so the noise
+/// compare's pool scan finds them and partitions by `project_commit`
+/// (baseline=A, HEAD=B), not by leaf. The detached baseline worktree is created
+/// once and removed on return via [`WorktreeGuard`]. A non-zero child exit is
+/// logged, not fatal (some `performance_mode` failures are expected; the
+/// sidecars that landed are still comparable).
+fn noise_dual_run(
+    repo_root: &Path,
+    baseline_full_hex: &str,
+    baseline_short: &str,
+    head_short: &str,
+    kernel: &str,
+    filter: Option<&str>,
+    runs: usize,
+) -> Result<()> {
+    let runs_root_abs = repo_root.join(ktstr::test_support::runs_root());
+    let wt_dir = worktree_checkout_dir(&std::env::temp_dir(), baseline_short);
+    let kernel_arg = resolve_kernel_for_children(repo_root, kernel);
+
+    let add = Command::new("git")
+        .current_dir(repo_root)
+        .args(worktree_add_argv(&wt_dir, baseline_full_hex))
+        .status()
+        .with_context(|| format!("spawn `git worktree add` for baseline {baseline_short}"))?;
+    if !add.success() {
+        anyhow::bail!(
+            "`git worktree add {} {baseline_full_hex}` failed ({add}) — \
+             a leftover worktree from a prior run may need `git worktree prune`",
+            wt_dir.display(),
+        );
+    }
+    let _guard = WorktreeGuard {
+        repo_root: repo_root.to_path_buf(),
+        wt_dir: wt_dir.clone(),
+    };
+
+    for i in 0..runs {
+        // Per-run leaves: two runs of the same test+config share a variant-hashed
+        // filename, so a single leaf would overwrite all but the last; distinct
+        // dirs keep all N. The compare still partitions by project_commit
+        // (baseline vs HEAD), not by leaf name.
+        let base_leaf = runs_root_abs.join(format!("perf-delta-noise-base-{baseline_short}-{i}"));
+        let head_leaf = runs_root_abs.join(format!("perf-delta-noise-head-{head_short}-{i}"));
+        println!("perf-delta --noise-adjust: run {}/{runs}", i + 1);
+
+        let bs = Command::new("cargo")
+            .current_dir(&wt_dir)
+            .args(perf_test_argv(&kernel_arg, filter))
+            .envs(baseline_child_env(&base_leaf))
+            .status()
+            .with_context(|| format!("spawn baseline `cargo ktstr test` (noise run {i})"))?;
+        if !bs.success() {
+            eprintln!("perf-delta --noise-adjust: warning: baseline run {i} exited {bs}");
+        }
+
+        let hs = Command::new("cargo")
+            .current_dir(repo_root)
+            .args(perf_test_argv(&kernel_arg, filter))
+            .env(ktstr::KTSTR_PERF_ONLY_ENV, "1")
+            .env(ktstr::KTSTR_SIDECAR_DIR_ENV, &head_leaf)
+            .status()
+            .with_context(|| format!("spawn HEAD `cargo ktstr test` (noise run {i})"))?;
+        if !hs.success() {
+            eprintln!("perf-delta --noise-adjust: warning: HEAD run {i} exited {hs}");
+        }
+    }
+    Ok(())
+}
+
 /// CLI args for `cargo ktstr perf-delta`.
 pub(crate) struct PerfDeltaArgs<'a> {
     /// `--base <commit>` override (skips merge-base).
@@ -372,6 +456,17 @@ pub(crate) struct PerfDeltaArgs<'a> {
     pub a_scheduler: Option<&'a str>,
     /// `--b-scheduler <Y>` — CONFIG axis B side. See [`Self::a_scheduler`].
     pub b_scheduler: Option<&'a str>,
+    /// `--noise-adjust <N>` — run each side N times and decide significance from
+    /// the observed per-side spread (B's mean leaving A's `[min, max]` band)
+    /// instead of a fixed threshold; flag a metric whose relative spread exceeds
+    /// [`Self::noise_spread_threshold`]. Commit axis only — it implies the
+    /// dual-run production, looped N times. `None` = the default single-run
+    /// threshold compare.
+    pub noise_adjust: Option<usize>,
+    /// `--noise-spread-threshold <PCT>` — the per-side relative-spread limit (in
+    /// percent) above which `--noise-adjust` flags a metric as too noisy to
+    /// trust. Defaults to `1.0` when `--noise-adjust` is set.
+    pub noise_spread_threshold: Option<f64>,
 }
 
 /// Build the CONFIG-axis (scheduler A vs B at the SAME commit) compare
@@ -488,6 +583,32 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
         args.filter.unwrap_or("all performance_mode tests")
     );
 
+    // Noise-adjusted axis: produce N runs per side (looped dual-run into
+    // per-run leaves), then compare from the observed spread instead of a fixed
+    // threshold. Commit axis only.
+    if let Some(n) = args.noise_adjust {
+        let kernel = args
+            .kernel
+            .context("--noise-adjust requires --kernel (the kernel both perf runs boot)")?;
+        noise_dual_run(
+            &cwd,
+            &baseline_oid.to_hex().to_string(),
+            &baseline,
+            &head,
+            kernel,
+            args.filter,
+            n,
+        )?;
+        let threshold = args.noise_spread_threshold.unwrap_or(1.0);
+        let build = crate::stats::BuildCompareFilters {
+            a_project_commit: vec![baseline.clone()],
+            b_project_commit: vec![head.clone()],
+            ..Default::default()
+        };
+        let (filter_a, filter_b) = build.build();
+        return cli::compare_partitions_noise(&filter_a, &filter_b, None, threshold);
+    }
+
     if args.dual_run {
         let kernel = args
             .kernel
@@ -505,6 +626,8 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
         // rather than letting the compare bail on an empty pool. HEAD
         // runs the same selection, so a zero-baseline implies no delta
         // is computable regardless of HEAD's output.
+        // Absolute runs_root() (orchestrator-stamped) makes this join
+        // return the shared dir; relative falls back anchored to cwd.
         let leaf = baseline_sidecar_leaf(&cwd.join(ktstr::test_support::runs_root()), &baseline);
         if count_sidecars(&leaf) == 0 {
             println!(

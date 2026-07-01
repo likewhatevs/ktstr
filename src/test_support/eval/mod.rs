@@ -41,7 +41,8 @@ pub(crate) use llm_extract::host_side_llm_extract;
 pub use post_vm::post_vm_skip;
 pub(crate) use post_vm::{
     ExpectAutoReproSatisfied, HostSkipRequest, LLM_MODEL_LOAD_FAILED_PREFIX,
-    PostVmAssertionFailure, ScxBpfErrorMatcherMismatch, record_skip_sidecar, run_post_vm_callbacks,
+    PostVmAssertionFailure, SchedulerBuildRefused, ScxBpfErrorMatcherMismatch,
+    SurvivesStormViolated, record_skip_sidecar, run_post_vm_callbacks,
     should_skip_on_llm_model_load_failure,
 };
 mod reporting;
@@ -213,7 +214,7 @@ pub(crate) fn run_ktstr_test_inner(
         // sidecar. Not strictly idempotent — a second write refreshes
         // run_id and timestamp — but the skip classification round-trips
         // identically, so stats tooling sees the same outcome.
-        record_skip_sidecar(entry);
+        record_skip_sidecar(entry, topo);
     }
     // `expect_auto_repro = true` inversion: when the primary VM
     // failed AND the auto-repro VM landed a shape-valid
@@ -238,7 +239,7 @@ pub(crate) fn run_ktstr_test_inner(
     // only `ExpectAutoReproSatisfied` with no post_vm failure converts
     // to `Ok(pass)`. The diagnostic surfaces via the `eprintln!` and
     // the per-test stderr capture's original failure trail.
-    match result {
+    let final_result = match result {
         Err(e) => {
             if e.downcast_ref::<PostVmAssertionFailure>().is_some() {
                 Err(e)
@@ -250,7 +251,92 @@ pub(crate) fn run_ktstr_test_inner(
             }
         }
         Ok(r) => Ok(r),
+    };
+    // Finalize the persisted artifacts to the test's FINAL
+    // (post-inversion) verdict — the same `result_to_exit_code` projects
+    // to the exit code nextest reads — so the footer / `stats` / `replay`
+    // never surface a passing `expect_err` / `expect_auto_repro` test as a
+    // failure. `final_outcome` mirrors `result_to_exit_code` (pinned by a
+    // truth-table test) so the persisted verdict matches the exit code.
+    let (passed, skipped, inconclusive) = crate::test_support::dispatch::final_outcome(
+        &final_result,
+        entry.expect_err,
+        entry.allow_inconclusive,
+    )
+    .sidecar_bits();
+    // This run's variant hash — same (entry, resolved topology,
+    // work_type) the impl keyed the dump filename with — so suppression
+    // targets THIS variant's dumps, never a sibling preset's.
+    //
+    // LOCKSTEP: this is the SECOND host site computing the variant hash;
+    // the first is `run_ktstr_test_inner_impl` (the dump-filename + the
+    // --ktstr-variant-hash thread + the VmResult stamp). Both derive it
+    // from variant_hash_from_parts(entry, resolve_vm_topology(entry,
+    // topo).0, current_work_type()) — all pure of the same inputs, so the
+    // two agree. A change to either site's topology/work_type resolution
+    // MUST change the other, or suppression would target a different file
+    // than the dump writer wrote.
+    let variant_hash = super::sidecar::variant_hash_from_parts(
+        entry,
+        &super::runtime::resolve_vm_topology(entry, topo).0,
+        &super::args::current_work_type(),
+    );
+    match crate::test_support::sidecar::take_last_sidecar_path() {
+        // A sidecar was written (the guest produced a parseable result):
+        // overwrite its raw verdict with the final one and set
+        // `expected_failure` so `stats compare` still excludes the
+        // failure-mode-dominated telemetry of an inverted failure.
+        Some(path) => crate::test_support::sidecar::finalize_sidecar_verdict(
+            &path,
+            passed,
+            skipped,
+            inconclusive,
+        ),
+        // No sidecar was written — the run crashed BEFORE the guest
+        // produced a parseable result (e.g. an `expect_err` test with a
+        // host-triggered BPF crash). The freeze coordinator still wrote
+        // an unconditional failure-dump; if the FINAL verdict is a
+        // pass/skip (the failure was expected and inverted), that dump
+        // would otherwise surface this PASSING test as FAILED via the
+        // footer's dump-only trigger. Suppress it so the footer matches
+        // nextest's pass. A genuine pre-sidecar failure (final = Fail)
+        // keeps its dump and is still flagged.
+        None if passed || skipped => {
+            crate::test_support::sidecar::suppress_failure_dumps(entry.name, variant_hash)
+        }
+        None => {}
     }
+    final_result
+}
+
+/// Per-test primary failure-dump sidecar path — the variant-hashed
+/// name the freeze-coord writer sink (`primary_dump_path`) and the
+/// exit-kind reader (`read_primary_exit_kind`) both key. Shared so the
+/// writer and reader cannot drift to different names (the drift that
+/// silently killed exit-kind detection).
+fn primary_failure_dump_path(entry_name: &str, variant_hash: u64) -> std::path::PathBuf {
+    crate::test_support::sidecar::sidecar_dir().join(format!(
+        "{entry_name}-{variant_hash:016x}.failure-dump.json"
+    ))
+}
+
+/// Read the primary VM's `scx_sched_state.exit_kind` from its
+/// failure-dump JSON. `None` when the dump is absent/unparseable or
+/// lacks the field — the caller treats `None` as "not a stall" and
+/// takes the conservative probe-attach path. Reads the SAME
+/// `primary_failure_dump_path` the dump is written under, so a stall
+/// exit is actually detectable (pre-fix an un-hashed read name never
+/// matched the written dump, leaving this permanently `None`).
+fn read_primary_exit_kind(entry_name: &str, variant_hash: u64) -> Option<u64> {
+    let dump_path = primary_failure_dump_path(entry_name, variant_hash);
+    std::fs::read_to_string(&dump_path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .and_then(|v| {
+            v.get("scx_sched_state")
+                .and_then(|s| s.get("exit_kind"))
+                .and_then(|k| k.as_u64())
+        })
 }
 
 /// Write a placeholder `failure-dump.json` at `path` when the file
@@ -259,8 +345,8 @@ pub(crate) fn run_ktstr_test_inner(
 /// real BPF-state dump (pre-attach failures: send_sys_rdy timeout,
 /// VM boot failure, scheduler binary load failure, post_vm callback
 /// failure) so the spec promise ("every failed test writes
-/// `<test_name>.failure-dump.json` to the sidecar dir") survives
-/// those code paths too.
+/// `<test_name>-<variant_hash>.failure-dump.json` to the sidecar dir")
+/// survives those code paths too.
 ///
 /// The placeholder's `is_placeholder: true` field lets downstream
 /// tooling (stats compare, sidecar walkers) distinguish a stub
@@ -393,7 +479,11 @@ fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vm
 /// to `OVERCOMMIT_SKIP_RATIO` — so a 256-vCPU guest at the ~1.3x of the
 /// design-target runner validates boot (and the auto-repro hop) there
 /// rather than silently skipping.
-fn overcommit_skip(entry: &KtstrTestEntry, host_cpus: &[usize]) -> Option<AssertResult> {
+fn overcommit_skip(
+    entry: &KtstrTestEntry,
+    host_cpus: &[usize],
+    topo: Option<&TopoOverride>,
+) -> Option<AssertResult> {
     let reason = super::runtime::overcommit_skip_reason(
         entry.topology.total_cpus(),
         host_cpus.len(),
@@ -401,7 +491,7 @@ fn overcommit_skip(entry: &KtstrTestEntry, host_cpus: &[usize]) -> Option<Assert
         entry.expect_auto_repro,
     )?;
     crate::report::test_skip(format_args!("{}: {reason}", entry.name));
-    record_skip_sidecar(entry);
+    record_skip_sidecar(entry, topo);
     Some(AssertResult::skip(reason))
 }
 
@@ -481,14 +571,14 @@ fn run_ktstr_test_inner_impl(
         // not just the ones that made it to the VM-run site. A sidecar
         // write failure is logged but not propagated: the skip itself
         // is still valid — only post-run stats tooling loses visibility.
-        record_skip_sidecar(entry);
+        record_skip_sidecar(entry, topo);
         return Ok(AssertResult::skip(REASON));
     }
     if super::runtime::perf_only_skips_entry(entry) {
         const REASON: &str =
             "KTSTR_PERF_ONLY is active and this test is not a performance_mode test";
         crate::report::test_skip(format_args!("{}: {REASON}", entry.name));
-        record_skip_sidecar(entry);
+        record_skip_sidecar(entry, topo);
         return Ok(AssertResult::skip(REASON));
     }
     // Auto-skip a default/no-perf overcommit so severe the guest boot
@@ -497,7 +587,7 @@ fn run_ktstr_test_inner_impl(
     // the full rationale; it skips ONLY the auto-collapse case past
     // `OVERCOMMIT_SKIP_RATIO`, so an explicit `cpu_budget` and the CI
     // ~1.3x case both RUN and are validated here, never masked.
-    if let Some(skip) = overcommit_skip(entry, &host_cpus) {
+    if let Some(skip) = overcommit_skip(entry, &host_cpus, topo) {
         return Ok(skip);
     }
     ensure_kvm()?;
@@ -510,18 +600,18 @@ fn run_ktstr_test_inner_impl(
     // blocked during the multi-second extraction phase. `None`
     // on non-cache kernels — those don't need coordination.
     let kernel_lock = acquire_test_kernel_lock_if_cached(&kernel)?;
-    // Drop the ResolveSource on this path — the downstream sites (VM
-    // builder, auto_repro) only need the PathBuf. Consumers that want
-    // provenance (sidecar stamping, cache-key construction) must call
-    // resolve_scheduler directly on the same spec; the source is
-    // stable across identical inputs within a single process run.
-    let scheduler = resolve_scheduler(&entry.scheduler.binary)?.0;
+    // Capture the scheduler's ResolveSource (the discovery path) so the
+    // sidecar records where this run's binary came from — write_sidecar
+    // stamps it into SidecarResult::resolve_source below. The downstream
+    // sites (VM builder, auto_repro) take only the PathBuf; the source is
+    // a Copy enum that rides to the sidecar write unchanged.
+    let (scheduler, scheduler_resolve_source) = resolve_scheduler(&entry.scheduler.binary)?;
     let resolved_staged = resolve_staged_schedulers_strict(entry, |spec| {
         resolve_scheduler(spec).map(|(opt, _src)| opt)
     })?;
     let ktstr_bin = crate::resolve_current_exe()?;
 
-    let guest_args = vec![
+    let mut guest_args = vec![
         "run".to_string(),
         "--ktstr-test-fn".to_string(),
         entry.name.to_string(),
@@ -531,6 +621,23 @@ fn run_ktstr_test_inner_impl(
 
     let (vm_topology, memory_mib) = super::runtime::resolve_vm_topology(entry, topo);
 
+    // The run's variant hash, from the SAME six fields the sidecar
+    // hashes (resolved topology + scheduler/payload/work_type/sysctls/
+    // kargs). Computed once here and used for BOTH the failure-dump
+    // filename (so a gauntlet test's per-preset dumps don't clobber and
+    // each dump matches its sidecar's variant hash) AND the VmResult
+    // stamp below (for the post-VM `failure_dump_path` mirror). work_type
+    // is resolved identically to the write_sidecar path.
+    let work_type = super::args::current_work_type();
+    let variant_hash = super::sidecar::variant_hash_from_parts(entry, &vm_topology, &work_type);
+    // Thread the HOST's authoritative variant hash to the guest so the
+    // in-VM scenario Ctx's `failure_dump_path` / `wprof_pb_path` mirror
+    // the host's variant-keyed artifact paths exactly. The guest cannot
+    // recompute it: its argv lacks --ktstr-work-type and its topology is
+    // sysfs-observed (TestTopology), which need not render byte-identical
+    // to the host's resolved topology. One authoritative value, threaded.
+    guest_args.push(format!("--ktstr-variant-hash={variant_hash:016x}"));
+
     let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
 
     // Pre-clear stale failure-dump files before the primary VM
@@ -538,8 +645,9 @@ fn run_ktstr_test_inner_impl(
     // not be masked by the prior failure's leftovers — the E2E
     // test (`tests/failure_dump_e2e.rs`) reads from the primary
     // path and an operator inspecting the sidecar dir looks at
-    // both. Both files are scoped per-test (`{name}.failure-
-    // dump.json` and `{name}.repro.failure-dump.json`), so we can
+    // both. Both files are variant-keyed per test
+    // (`{name}-{variant_hash}.failure-dump.json` and
+    // `{name}-{variant_hash}.repro.failure-dump.json`), so we can
     // safely unlink both from this single primary-dispatch
     // entry — auto-repro fires only after a primary failure
     // emits a dump, so any repro file present here is stale by
@@ -548,10 +656,11 @@ fn run_ktstr_test_inner_impl(
     // coord's own write would overwrite a stale file in
     // practice; the warn flags permission / fs anomalies for the
     // operator).
-    let primary_dump_path =
-        super::sidecar::sidecar_dir().join(format!("{}.failure-dump.json", entry.name));
-    let repro_dump_path =
-        super::sidecar::sidecar_dir().join(format!("{}.repro.failure-dump.json", entry.name));
+    let primary_dump_path = primary_failure_dump_path(entry.name, variant_hash);
+    let repro_dump_path = super::sidecar::sidecar_dir().join(format!(
+        "{}-{variant_hash:016x}.repro.failure-dump.json",
+        entry.name
+    ));
     for stale in [&primary_dump_path, &repro_dump_path] {
         match std::fs::remove_file(stale) {
             Ok(()) => {}
@@ -587,7 +696,8 @@ fn run_ktstr_test_inner_impl(
         no_perf_mode,
     )
     .failure_dump_path(primary_dump_path.clone())
-    .performance_mode(entry.performance_mode);
+    .performance_mode(entry.performance_mode)
+    .pci(entry.pci);
 
     // Merge order: default_checks -> scheduler.assert -> per-test assert.
     let merged_assert = crate::assert::Assert::default_checks()
@@ -973,8 +1083,13 @@ fn run_ktstr_test_inner_impl(
     #[cfg(feature = "wprof")]
     if entry.wprof {
         let sidecar = crate::test_support::sidecar_dir();
-        let _ = std::fs::remove_file(sidecar.join(format!("{}.wprof.pb", entry.name)));
-        let _ = std::fs::remove_file(sidecar.join(format!("{}.repro.wprof.pb", entry.name)));
+        let _ = std::fs::remove_file(
+            sidecar.join(format!("{}-{:016x}.wprof.pb", entry.name, variant_hash)),
+        );
+        let _ = std::fs::remove_file(sidecar.join(format!(
+            "{}-{:016x}.repro.wprof.pb",
+            entry.name, variant_hash
+        )));
     }
 
     let vm = match builder.build() {
@@ -988,7 +1103,7 @@ fn run_ktstr_test_inner_impl(
                 || super::is_topology_insufficient(&e)
                 || super::is_perf_mode_unavailable(&e)
             {
-                record_skip_sidecar(entry);
+                record_skip_sidecar(entry, topo);
             }
             return Err(e.context("build ktstr_test VM"));
         }
@@ -1001,7 +1116,7 @@ fn run_ktstr_test_inner_impl(
                 || super::is_topology_insufficient(&e)
                 || super::is_perf_mode_unavailable(&e)
             {
-                record_skip_sidecar(entry);
+                record_skip_sidecar(entry, topo);
             }
             return Err(e.context("run ktstr_test VM"));
         }
@@ -1016,6 +1131,17 @@ fn run_ktstr_test_inner_impl(
     // loud when the derivation methods are called without a stamped
     // name.
     result.entry_name = Some(entry.name);
+    // Stamp the run's variant hash alongside entry_name (freeze_coord
+    // builds the VmResult entry-agnostic with variant_hash = 0). The
+    // post-VM `failure_dump_path` / `wprof_pb_path` mirrors embed it so
+    // they resolve to the SAME variant-keyed paths the inline writer +
+    // wprof writer use.
+    result.variant_hash = variant_hash;
+    // Stamp the scheduler-resolution provenance captured pre-boot (the
+    // discovery path the binary was found via) so write_sidecar carries
+    // it into SidecarResult::resolve_source — mirrors entry_name /
+    // variant_hash above (eval-layer fields the VM run does not set).
+    result.resolve_source = Some(scheduler_resolve_source.as_str().to_string());
     // When the primary VM failed but the freeze coordinator never
     // wrote the real failure-dump (i.e. pre-attach failures:
     // send_sys_rdy timeout, VM boot failure, scheduler binary load
@@ -1024,8 +1150,9 @@ fn run_ktstr_test_inner_impl(
     // emit a placeholder dump at the documented path so operators
     // querying `find target/ktstr -name '*.failure-dump.json'` always
     // see SOMETHING when a test failed. Spec-promise parity: the
-    // sidecar dir guarantees one `<test_name>.failure-dump.json`
-    // per failed run regardless of whether real BPF state could be
+    // sidecar dir guarantees one
+    // `<test_name>-<variant_hash>.failure-dump.json` per failed run
+    // regardless of whether real BPF state could be
     // captured. The `is_placeholder: true` field on
     // [`crate::monitor::dump::FailureDumpReport`] lets downstream
     // tooling (stats compare, sidecar walkers) distinguish a stub
@@ -1081,26 +1208,30 @@ fn run_ktstr_test_inner_impl(
     // debugging operator sees both regressions on the first pass.
     #[cfg(feature = "wprof")]
     if let Some(ref bulk) = result.guest_messages {
-        for bulk_entry in &bulk.entries {
-            if crate::vmm::wire::MsgType::from_wire(bulk_entry.msg_type)
-                == Some(crate::vmm::wire::MsgType::WprofTrace)
-                && bulk_entry.crc_ok
-                && !bulk_entry.payload.is_empty()
-            {
-                let wprof_path =
-                    crate::test_support::sidecar_dir().join(format!("{}.wprof.pb", entry.name));
-                if let Err(e) = std::fs::create_dir_all(
-                    wprof_path
-                        .parent()
-                        .expect("sidecar_dir join always has parent"),
-                ) {
-                    eprintln!("ktstr_test: create sidecar dir for wprof trace: {e}");
-                } else if let Err(e) = std::fs::write(&wprof_path, &bulk_entry.payload) {
-                    eprintln!(
-                        "ktstr_test: write wprof trace to {}: {e}",
-                        wprof_path.display()
-                    );
+        // Reassemble the trace (any WprofTraceChunk frames + the terminal
+        // WprofTrace) and write it once; a single-frame trace reassembles to
+        // that one frame's payload. Resolve the path via the reader's fn
+        // (VmResult::wprof_pb_path) so this authoritative pre-pass writer
+        // matches the reader by construction — no format! literal to drift.
+        // The eval layer stamped result.variant_hash above, so this resolves
+        // to the same `-{hash}` name variant_hash carries.
+        if let Some(pb) = crate::test_support::wprof::reassemble_wprof_trace(&bulk.entries) {
+            match result.wprof_pb_path() {
+                Ok(wprof_path) => {
+                    if let Err(e) = std::fs::create_dir_all(
+                        wprof_path
+                            .parent()
+                            .expect("sidecar_dir join always has parent"),
+                    ) {
+                        eprintln!("ktstr_test: create sidecar dir for wprof trace: {e}");
+                    } else if let Err(e) = std::fs::write(&wprof_path, &pb) {
+                        eprintln!(
+                            "ktstr_test: write wprof trace to {}: {e}",
+                            wprof_path.display()
+                        );
+                    }
                 }
+                Err(e) => eprintln!("ktstr_test: wprof pre-pass path unresolved: {e}"),
             }
         }
     }
@@ -1198,10 +1329,12 @@ fn run_ktstr_test_inner_impl(
     // scenario-end terminal boundary) via the single shared accessor —
     // the SAME timeline a post_vm callback gets, so the production eval
     // and any out-of-tree re-derivation can never disagree on the last
-    // step's iteration_rate boundary. The bulk loop below handles only
-    // the remaining message kinds (Profraw / WprofTrace / PayloadMetrics
-    // / RawPayloadOutput); Stimulus + ScenarioEnd are consumed by
-    // stimulus_timeline().
+    // step's iteration_rate boundary. The bulk loop below per-entry
+    // handles PayloadMetrics + RawPayloadOutput (and streams Stderr);
+    // Profraw and WprofTrace/WprofTraceChunk are no-ops there (Profraw is
+    // persisted centrally in `crate::vmm::KtstrVm::run`; the wprof `.pb` is
+    // written by the #[cfg(feature="wprof")] pre-pass above). Stimulus +
+    // ScenarioEnd are consumed by stimulus_timeline().
     let stimulus_events = result.stimulus_timeline();
     let mut payload_metrics: Vec<crate::test_support::PayloadMetrics> = Vec::new();
     let mut raw_outputs: Vec<crate::test_support::RawPayloadOutput> = Vec::new();
@@ -1216,34 +1349,6 @@ fn run_ktstr_test_inner_impl(
         for bulk_entry in &bulk.entries {
             let kind = crate::vmm::wire::MsgType::from_wire(bulk_entry.msg_type);
             match kind {
-                Some(crate::vmm::wire::MsgType::WprofTrace) => {
-                    // wprof Perfetto trace captured during the
-                    // guest's auto-repro window. Write next to the
-                    // failure-dump JSON so the operator finds both
-                    // in the same per-test directory. NOTE: the
-                    // pre-pass above already wrote this file before
-                    // post_vm fired; this arm rewrites the same
-                    // bytes to the same path (idempotent) so that
-                    // a future bulk-drain consumer added here keeps
-                    // the WprofTrace handling colocated with the
-                    // rest of MsgType dispatch.
-                    if bulk_entry.crc_ok && !bulk_entry.payload.is_empty() {
-                        let wprof_path = crate::test_support::sidecar_dir()
-                            .join(format!("{}.wprof.pb", entry.name));
-                        if let Err(e) = std::fs::create_dir_all(
-                            wprof_path
-                                .parent()
-                                .expect("sidecar_dir join always has parent"),
-                        ) {
-                            eprintln!("ktstr_test: create sidecar dir for wprof trace: {e}");
-                        } else if let Err(e) = std::fs::write(&wprof_path, &bulk_entry.payload) {
-                            eprintln!(
-                                "ktstr_test: write wprof trace to {}: {e}",
-                                wprof_path.display()
-                            );
-                        }
-                    }
-                }
                 Some(crate::vmm::wire::MsgType::PayloadMetrics) => {
                     if bulk_entry.crc_ok {
                         match postcard::from_bytes::<crate::test_support::PayloadMetrics>(
@@ -1287,7 +1392,15 @@ fn run_ktstr_test_inner_impl(
                 // lookup in collect_results, lifecycle classifier,
                 // sched_log concatenator, etc.). No per-entry side effect
                 // here. (Stderr is NOT in this arm — it has its own arm
-                // below that streams to host stderr.)
+                // below that streams to host stderr.) WprofTrace +
+                // WprofTraceChunk are no-ops here: the #[cfg(feature="wprof")]
+                // pre-pass above (the `result.guest_messages` block) is the
+                // SOLE writer of the `.wprof.pb` — it reassembles the full
+                // trace once via `reassemble_wprof_trace(&bulk.entries)` and
+                // resolves the path through `VmResult::wprof_pb_path`, the same
+                // resolver the reader uses, so writer and reader cannot drift.
+                // A per-entry write here would be a redundant full-file
+                // rewrite, so both wprof variants fall through to this no-op.
                 Some(
                     crate::vmm::wire::MsgType::Stimulus
                     | crate::vmm::wire::MsgType::StepEnd
@@ -1306,6 +1419,8 @@ fn run_ktstr_test_inner_impl(
                     | crate::vmm::wire::MsgType::Dmesg
                     | crate::vmm::wire::MsgType::ProbeOutput
                     | crate::vmm::wire::MsgType::SnapshotReply
+                    | crate::vmm::wire::MsgType::WprofTrace
+                    | crate::vmm::wire::MsgType::WprofTraceChunk
                     | crate::vmm::wire::MsgType::Crash,
                 ) => {}
                 Some(crate::vmm::wire::MsgType::Stderr) => {
@@ -1323,7 +1438,8 @@ fn run_ktstr_test_inner_impl(
                 Some(crate::vmm::wire::MsgType::SnapshotRequest)
                 | Some(crate::vmm::wire::MsgType::KernelOpRequest)
                 | Some(crate::vmm::wire::MsgType::KernelOpReply)
-                | Some(crate::vmm::wire::MsgType::SysRdy) => {}
+                | Some(crate::vmm::wire::MsgType::SysRdy)
+                | Some(crate::vmm::wire::MsgType::SchedSwapNotify) => {}
                 None => {
                     tracing::warn!(
                         msg_type = bulk_entry.msg_type,
@@ -1368,7 +1484,7 @@ fn run_ktstr_test_inner_impl(
     {
         let reason = format!("{err:#}");
         crate::report::test_skip(format_args!("{}: {}", entry.name, reason));
-        record_skip_sidecar(entry);
+        record_skip_sidecar(entry, topo);
         return Ok(AssertResult::skip(reason));
     }
 
@@ -1392,7 +1508,7 @@ fn run_ktstr_test_inner_impl(
         should_skip_on_llm_model_load_failure(&host_extract_failures, post_vm_err.is_some())
     {
         crate::report::test_skip(format_args!("{}: {}", entry.name, skip_reason));
-        record_skip_sidecar(entry);
+        record_skip_sidecar(entry, topo);
         return Ok(AssertResult::skip(skip_reason));
     }
 
@@ -1419,18 +1535,12 @@ fn run_ktstr_test_inner_impl(
     // through to running the probe (the conservative choice — probe
     // attachment on a true stall is a slowdown, not a correctness
     // hazard).
-    let primary_exit_kind = {
-        let dump_path =
-            super::sidecar::sidecar_dir().join(format!("{}.failure-dump.json", entry.name));
-        std::fs::read_to_string(&dump_path)
-            .ok()
-            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
-            .and_then(|v| {
-                v.get("scx_sched_state")
-                    .and_then(|s| s.get("exit_kind"))
-                    .and_then(|k| k.as_u64())
-            })
-    };
+    // Reads the primary dump's exit_kind from the SAME variant-hashed
+    // path the writer keys (see `read_primary_exit_kind`). Pre-fix this
+    // read used an un-hashed name that never matched the written dump,
+    // so primary_exit_kind was always None and the is_stall detection
+    // below was dead. None => not a stall => conservative probe-attach.
+    let primary_exit_kind = read_primary_exit_kind(entry.name, variant_hash);
     // Did the primary VM emit its `PayloadStarting` lifecycle frame?
     // Computed before constructing repro_fn so the closure can capture
     // it. The flag gates the "PRIMARY DID NOT REACH WORKLOAD" label
@@ -1882,31 +1992,27 @@ fn populate_run_stats_and_folded_timeline(
         host_phase_buckets,
         guest_phase_buckets,
     );
-    crate::assert::populate_run_ext_metrics(
-        early_periodic_series,
-        &mut check_result.stats.ext_metrics,
-    );
-    crate::assert::populate_run_ext_metrics_from_phases(
-        &check_result.stats.phases,
-        &mut check_result.stats.ext_metrics,
-    );
-    // Pooled cross-cgroup CPU-time efficiency (the cross-cgroup re-pool):
-    // sum total_iterations / total_cpu_time over the MEASURED merged
-    // cgroups (those with on-CPU time; mirrors the per-cgroup None-on-zero)
-    // and derive iterations_per_cpu_sec. MUST run here — AFTER the
-    // cgroup-bearing merges (check_result.stats.cgroups is complete) and
-    // BEFORE the sidecar write — so the worst-by-polarity merge fold never
-    // sees its components. The trailing monitor-verdict merge below is
-    // verdict-only (inconclusive with empty stats), so it is safe to follow.
-    crate::assert::populate_run_pooled_iterations_per_cpu_sec(&mut check_result.stats);
-    // Run-level distributional re-pool (Distribution + WorstLowest kinds):
-    // pool the per-cgroup raw sample sets in stats.phases across phases +
-    // cgroups and recompute the wake / run-delay distributions, and select
-    // the lowest-wins iteration efficiencies from stats.cgroups counters.
-    // MUST run here for the same reason as the pooled rate above — AFTER the
-    // per-cgroup carrier fold + cgroup merges, BEFORE the sidecar write — so
-    // these ext_metrics keys are the sole source for the |_| None accessors.
-    crate::assert::populate_run_distribution_metrics(&mut check_result.stats);
+    // Populate the full run-level ext_metrics family (the read_sample registry
+    // metrics, the phase-only fold, the pooled iterations_per_cpu_sec, and the
+    // Distribution / WorstLowest re-pools) in the canonical order — the SAME
+    // sequence VmResult::run_metric self-computes, so an in-test run_metric read
+    // matches what the sidecar records. MUST run here: AFTER the cgroup-bearing
+    // merges (check_result.stats.cgroups is complete) and the per-cgroup carrier
+    // fold above, BEFORE the sidecar write, and BEFORE the derive_phase_metrics
+    // below — it feeds on the PRE-derive phases (the eval-faithful input shape
+    // VmResult::run_metric reuses; post-derive yields the same map today via the
+    // is_derived skip, but pre-derive avoids depending on it). The trailing
+    // monitor-verdict merge below is verdict-only (inconclusive, empty stats),
+    // so it is safe to follow. See populate_run_ext_all for the step order.
+    crate::assert::populate_run_ext_all(&mut check_result.stats, early_periodic_series);
+    // Per-phase scalars: derive into each phase bucket from the folded per_cgroup
+    // carriers (post-fold, so the merge's is_derived skip can't drop them) — the
+    // non-schbench carrier scalars (every cgroup) into each pc.metrics, and the
+    // schbench scalars into pc.metrics + the pooled bucket.metrics. A no-op only
+    // when no phase carries a per-cgroup carrier. Mirrors the
+    // VmResult::phase_buckets derive so the sidecar / timeline render and the
+    // per-phase A/B claim agree.
+    crate::assert::derive_phase_metrics(&mut check_result.stats.phases);
 
     // POST-fold timeline for this (guest-AssertResult) path: rebuild from
     // the folded `check_result.stats.phases` so the per-cgroup sub-block
@@ -2098,8 +2204,28 @@ fn render_failure_verdict_message(
     // a failure into a pass). When the matcher matched (or was
     // unset), the normal expect_err inversion path applies.
     let err = anyhow::anyhow!("{msg}");
-    if matcher_mismatch {
+    let err = if matcher_mismatch {
         err.context(ScxBpfErrorMatcherMismatch)
+    } else {
+        err
+    };
+    // When `survives_storm` is asserted AND this failure's cause is a
+    // scheduler death (a Scheduler* DetailKind recorded by the scenario
+    // liveness probe — the same kinds the console-dump gate above keys on),
+    // wrap with [`SurvivesStormViolated`] so the dispatch layer forces
+    // EXIT_FAIL with a survival-specific explainer before any inversion arm.
+    // Gated on the death kind so an unrelated Fail in the same AssertResult
+    // does not trip the survival marker.
+    let sched_died = check_result.failure_details().any(|d| {
+        matches!(
+            d.kind,
+            crate::assert::DetailKind::SchedulerCrashed
+                | crate::assert::DetailKind::SchedulerExitedCleanly
+                | crate::assert::DetailKind::SchedulerDiedUnknownReason
+        )
+    });
+    if entry.survives_storm && sched_died {
+        err.context(SurvivesStormViolated)
     } else {
         err
     }
@@ -2534,9 +2660,7 @@ fn evaluate_vm_result(
         // A sidecar write failure is logged but not propagated: the test
         // verdict itself is still valid — only post-run stats tooling
         // loses visibility.
-        let args: Vec<String> = std::env::args().collect();
-        let work_type =
-            super::args::extract_work_type_arg(&args).unwrap_or_else(|| "SpinWait".to_string());
+        let work_type = super::args::current_work_type();
         if let Err(e) = write_sidecar(
             entry,
             result,
@@ -2544,6 +2668,7 @@ fn evaluate_vm_result(
             &check_result,
             &work_type,
             payload_metrics,
+            topo,
         ) {
             eprintln!("ktstr_test: {e:#}");
         }

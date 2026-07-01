@@ -185,7 +185,7 @@ pub struct VirtioNetCounters {
     /// publish a used-ring entry and the publish itself failed.
     pub(crate) rx_add_used_failures: AtomicU64,
     /// Cumulative count of `Error::InvalidAvailRingIndex` events
-    /// observed across both queues. Bumped each time the
+    /// observed across all queues. Bumped each time the
     /// virtio-queue iter() rejects an avail.idx whose distance from
     /// `next_avail` exceeds the queue size — a hostile or buggy
     /// guest condition.
@@ -213,6 +213,25 @@ pub struct VirtioNetCounters {
     /// produce zero additional bumps until the guest performs a
     /// virtio reset.
     pub(crate) invalid_avail_idx_count: AtomicU64,
+    /// Cumulative count of successful control-vq `VIRTIO_NET_CTRL_MQ` /
+    /// `VQ_PAIRS_SET` commands (the device updated `curr_queue_pairs` and
+    /// wrote `VIRTIO_NET_OK`). Per-event counter — observability of how many
+    /// times the guest (re)activated a multiqueue pair count.
+    pub(crate) ctrl_mq_set: AtomicU64,
+    /// Cumulative count of control-vq chains the device could not satisfy:
+    /// malformed shape (no device-writable status descriptor, too few
+    /// readable command bytes), an unknown `(class, cmd)`, or a
+    /// `virtqueue_pairs` outside `[1, queue_pairs]`. The device answers
+    /// `VIRTIO_NET_ERR` when a writable status descriptor exists, else drops
+    /// the chain (no `add_used` — the guest cannot observe a status it posted
+    /// no buffer for). Per-event hostile/buggy-guest counter; the control-vq
+    /// analog of `tx_chain_invalid`.
+    pub(crate) ctrl_chain_invalid: AtomicU64,
+    /// Cumulative count of control-vq status-write or `add_used` failures
+    /// (the status byte's GPA or the used-ring address is unmapped).
+    /// Queue-state breakage distinct from `ctrl_chain_invalid` (a malformed
+    /// request); the control-vq analog of `tx_add_used_failures`.
+    pub(crate) ctrl_add_used_failures: AtomicU64,
 }
 
 impl VirtioNetCounters {
@@ -333,6 +352,25 @@ impl VirtioNetCounters {
         self.invalid_avail_idx_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one successful control-vq `VQ_PAIRS_SET` (the device updated
+    /// `curr_queue_pairs` and wrote `VIRTIO_NET_OK`). Bumped only after the
+    /// status write succeeds.
+    pub(crate) fn record_ctrl_mq_set(&self) {
+        self.ctrl_mq_set.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one control-vq chain the device could not satisfy (malformed
+    /// shape, unknown `(class, cmd)`, or out-of-range `virtqueue_pairs`).
+    pub(crate) fn record_ctrl_chain_invalid(&self) {
+        self.ctrl_chain_invalid.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one control-vq status-write or `add_used` failure (queue-state
+    /// breakage). Distinct from `record_ctrl_chain_invalid`.
+    pub(crate) fn record_ctrl_add_used_failure(&self) {
+        self.ctrl_add_used_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read the cumulative count of TX chains successfully looped to
     /// RX. Per-event counter: bumped exactly once per TX chain that
     /// completed both halves of the loopback.
@@ -436,6 +474,24 @@ impl VirtioNetCounters {
         self.invalid_avail_idx_count.load(Ordering::Relaxed)
     }
 
+    /// Read the cumulative count of successful control-vq `VQ_PAIRS_SET`
+    /// commands.
+    pub fn ctrl_mq_set(&self) -> u64 {
+        self.ctrl_mq_set.load(Ordering::Relaxed)
+    }
+
+    /// Read the cumulative count of control-vq chains the device could not
+    /// satisfy (malformed shape, unknown command, or out-of-range pairs).
+    pub fn ctrl_chain_invalid(&self) -> u64 {
+        self.ctrl_chain_invalid.load(Ordering::Relaxed)
+    }
+
+    /// Read the cumulative count of control-vq status-write / `add_used`
+    /// failures (queue-state breakage).
+    pub fn ctrl_add_used_failures(&self) -> u64 {
+        self.ctrl_add_used_failures.load(Ordering::Relaxed)
+    }
+
     /// Freeze every atomic into a plain-u64 snapshot for the
     /// host-side post-mortem path in [`crate::vmm::VmResult`].
     /// virtio-net is single-threaded — `process_tx_loopback` runs
@@ -459,6 +515,9 @@ impl VirtioNetCounters {
             tx_add_used_failures: self.tx_add_used_failures(),
             rx_add_used_failures: self.rx_add_used_failures(),
             invalid_avail_idx_count: self.invalid_avail_idx_count(),
+            ctrl_mq_set: self.ctrl_mq_set(),
+            ctrl_chain_invalid: self.ctrl_chain_invalid(),
+            ctrl_add_used_failures: self.ctrl_add_used_failures(),
         }
     }
 }
@@ -492,4 +551,173 @@ pub struct VirtioNetCountersSnapshot {
     pub tx_add_used_failures: u64,
     pub rx_add_used_failures: u64,
     pub invalid_avail_idx_count: u64,
+    pub ctrl_mq_set: u64,
+    pub ctrl_chain_invalid: u64,
+    pub ctrl_add_used_failures: u64,
+}
+
+impl VirtioNetCountersSnapshot {
+    /// Sum per-NIC snapshots into one device-level total. Every field is a
+    /// monotonic counter, so the cross-NIC fold is a field-wise saturating sum
+    /// (saturating per the project's overflow-safe-arithmetic rule, though a
+    /// real run never approaches u64::MAX). Returns `None` for an empty
+    /// iterator, so a NIC-less run reports no counters — preserving the
+    /// single-NIC `Option<VirtioNetCountersSnapshot>` semantics of
+    /// [`crate::vmm::VmResult::virtio_net_counters`]. A multi-NIC guest's N
+    /// per-NIC snapshots aggregate here; per-NIC IRQ-delivery observability
+    /// comes from the per-CPU / per-IRQ(GSI) metrics axis, not these
+    /// device-internal loopback counters, so the cross-NIC sum loses no
+    /// capability.
+    pub(crate) fn aggregate(
+        snapshots: impl IntoIterator<Item = VirtioNetCountersSnapshot>,
+    ) -> Option<VirtioNetCountersSnapshot> {
+        let mut iter = snapshots.into_iter();
+        let mut acc = iter.next()?;
+        for s in iter {
+            acc.tx_packets = acc.tx_packets.saturating_add(s.tx_packets);
+            acc.tx_bytes = acc.tx_bytes.saturating_add(s.tx_bytes);
+            acc.rx_packets = acc.rx_packets.saturating_add(s.rx_packets);
+            acc.rx_bytes = acc.rx_bytes.saturating_add(s.rx_bytes);
+            acc.tx_dropped_no_rx_buffer = acc
+                .tx_dropped_no_rx_buffer
+                .saturating_add(s.tx_dropped_no_rx_buffer);
+            acc.tx_dropped_rx_poisoned = acc
+                .tx_dropped_rx_poisoned
+                .saturating_add(s.tx_dropped_rx_poisoned);
+            acc.tx_chain_invalid = acc.tx_chain_invalid.saturating_add(s.tx_chain_invalid);
+            acc.tx_oversize_dropped = acc
+                .tx_oversize_dropped
+                .saturating_add(s.tx_oversize_dropped);
+            acc.rx_chain_invalid = acc.rx_chain_invalid.saturating_add(s.rx_chain_invalid);
+            acc.rx_write_failed = acc.rx_write_failed.saturating_add(s.rx_write_failed);
+            acc.tx_add_used_failures = acc
+                .tx_add_used_failures
+                .saturating_add(s.tx_add_used_failures);
+            acc.rx_add_used_failures = acc
+                .rx_add_used_failures
+                .saturating_add(s.rx_add_used_failures);
+            acc.invalid_avail_idx_count = acc
+                .invalid_avail_idx_count
+                .saturating_add(s.invalid_avail_idx_count);
+            acc.ctrl_mq_set = acc.ctrl_mq_set.saturating_add(s.ctrl_mq_set);
+            acc.ctrl_chain_invalid = acc.ctrl_chain_invalid.saturating_add(s.ctrl_chain_invalid);
+            acc.ctrl_add_used_failures = acc
+                .ctrl_add_used_failures
+                .saturating_add(s.ctrl_add_used_failures);
+        }
+        Some(acc)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A snapshot whose 16 fields each carry a DISTINCT offset from `base`, so
+    /// a copy-paste misfold (summing the wrong field) yields a detectably wrong
+    /// total in `aggregate_sums_every_field`.
+    fn snap(base: u64) -> VirtioNetCountersSnapshot {
+        VirtioNetCountersSnapshot {
+            tx_packets: base + 1,
+            tx_bytes: base + 2,
+            rx_packets: base + 3,
+            rx_bytes: base + 4,
+            tx_dropped_no_rx_buffer: base + 5,
+            tx_dropped_rx_poisoned: base + 6,
+            tx_chain_invalid: base + 7,
+            tx_oversize_dropped: base + 8,
+            rx_chain_invalid: base + 9,
+            rx_write_failed: base + 10,
+            tx_add_used_failures: base + 11,
+            rx_add_used_failures: base + 12,
+            invalid_avail_idx_count: base + 13,
+            ctrl_mq_set: base + 14,
+            ctrl_chain_invalid: base + 15,
+            ctrl_add_used_failures: base + 16,
+        }
+    }
+
+    #[test]
+    fn aggregate_empty_is_none() {
+        assert_eq!(
+            VirtioNetCountersSnapshot::aggregate(std::iter::empty()),
+            None,
+            "a NIC-less run reports no counters"
+        );
+    }
+
+    #[test]
+    fn aggregate_single_is_identity() {
+        let a = snap(1000);
+        assert_eq!(
+            VirtioNetCountersSnapshot::aggregate([a.clone()]),
+            Some(a),
+            "one NIC aggregates to itself"
+        );
+    }
+
+    #[test]
+    fn aggregate_sums_every_field() {
+        let a = snap(1000);
+        let b = snap(2000);
+        let got = VirtioNetCountersSnapshot::aggregate([a.clone(), b.clone()])
+            .expect("two snapshots aggregate to Some");
+        // Build the expected total field-wise; equality over the whole struct
+        // proves all 16 fields fold (none dropped, none cross-folded).
+        let want = VirtioNetCountersSnapshot {
+            tx_packets: a.tx_packets + b.tx_packets,
+            tx_bytes: a.tx_bytes + b.tx_bytes,
+            rx_packets: a.rx_packets + b.rx_packets,
+            rx_bytes: a.rx_bytes + b.rx_bytes,
+            tx_dropped_no_rx_buffer: a.tx_dropped_no_rx_buffer + b.tx_dropped_no_rx_buffer,
+            tx_dropped_rx_poisoned: a.tx_dropped_rx_poisoned + b.tx_dropped_rx_poisoned,
+            tx_chain_invalid: a.tx_chain_invalid + b.tx_chain_invalid,
+            tx_oversize_dropped: a.tx_oversize_dropped + b.tx_oversize_dropped,
+            rx_chain_invalid: a.rx_chain_invalid + b.rx_chain_invalid,
+            rx_write_failed: a.rx_write_failed + b.rx_write_failed,
+            tx_add_used_failures: a.tx_add_used_failures + b.tx_add_used_failures,
+            rx_add_used_failures: a.rx_add_used_failures + b.rx_add_used_failures,
+            invalid_avail_idx_count: a.invalid_avail_idx_count + b.invalid_avail_idx_count,
+            ctrl_mq_set: a.ctrl_mq_set + b.ctrl_mq_set,
+            ctrl_chain_invalid: a.ctrl_chain_invalid + b.ctrl_chain_invalid,
+            ctrl_add_used_failures: a.ctrl_add_used_failures + b.ctrl_add_used_failures,
+        };
+        assert_eq!(got, want, "every field is a field-wise sum");
+    }
+
+    /// A snapshot with EVERY field at u64::MAX.
+    fn maxed() -> VirtioNetCountersSnapshot {
+        VirtioNetCountersSnapshot {
+            tx_packets: u64::MAX,
+            tx_bytes: u64::MAX,
+            rx_packets: u64::MAX,
+            rx_bytes: u64::MAX,
+            tx_dropped_no_rx_buffer: u64::MAX,
+            tx_dropped_rx_poisoned: u64::MAX,
+            tx_chain_invalid: u64::MAX,
+            tx_oversize_dropped: u64::MAX,
+            rx_chain_invalid: u64::MAX,
+            rx_write_failed: u64::MAX,
+            tx_add_used_failures: u64::MAX,
+            rx_add_used_failures: u64::MAX,
+            invalid_avail_idx_count: u64::MAX,
+            ctrl_mq_set: u64::MAX,
+            ctrl_chain_invalid: u64::MAX,
+            ctrl_add_used_failures: u64::MAX,
+        }
+    }
+
+    #[test]
+    fn aggregate_saturates_every_field_on_overflow() {
+        // saturating_add must clamp at u64::MAX for EVERY field, never wrap to a
+        // small value (a wrapped counter reads as a phantom near-zero total).
+        // Seed all 16 at u64::MAX and fold a second snapshot that adds >= 1 to
+        // each (snap(0) => fields 1..=16): a single field reverted to
+        // wrapping/plain add would wrap below u64::MAX and fail the whole-struct
+        // equality, so this guards the saturating contract on all 16 folds.
+        let max = maxed();
+        let got = VirtioNetCountersSnapshot::aggregate([max.clone(), snap(0)])
+            .expect("two snapshots aggregate");
+        assert_eq!(got, max, "every field must saturate at u64::MAX, not wrap");
+    }
 }

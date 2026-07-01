@@ -8,6 +8,7 @@ mod kernel_cmd;
 mod kernel_list;
 mod locks;
 mod parse;
+pub(crate) mod progress;
 mod resolve;
 mod stats_cmds;
 mod util;
@@ -40,8 +41,8 @@ pub use resolve::{
 };
 
 pub use stats_cmds::{
-    compare_partitions, explain_sidecar, list_metrics, list_runs, list_values, print_stats_report,
-    show_host, show_run_host, show_thresholds,
+    compare_partitions, compare_partitions_noise, explain_sidecar, list_metrics, list_runs,
+    list_values, print_stats_report, show_host, show_run_host, show_thresholds,
 };
 
 pub use locks::list_locks;
@@ -49,6 +50,16 @@ pub use locks::list_locks;
 pub use util::{
     Spinner, new_table, new_wrapped_table, restore_sigpipe_default, stderr_color, stdout_color,
 };
+
+/// `FetchProgress` is the public handle the `ktstr` / `cargo-ktstr`
+/// binaries construct to render kernel-fetch progress (the parallel
+/// `resolve_kernel_set` and the single-shot `kernel build` paths).
+/// It must be `pub` (not `pub(crate)`) because those call sites live
+/// in the binary crates and thread `&FetchProgress` into the library
+/// resolvers — the same lib/bin-boundary reason [`Spinner`] is `pub`.
+/// The child-bar types (`DownloadBar`, `CloneProgress`) stay
+/// `pub(crate)`: only the in-crate fetch path constructs them.
+pub use progress::FetchProgress;
 
 /// Re-export of the internal `vmm::host_topology::CpuCap` type so
 /// the `ktstr` and `cargo-ktstr` CLI binaries (which import this

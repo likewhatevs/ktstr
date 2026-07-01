@@ -372,23 +372,53 @@ fn assert_page_locality_method_fail() {
 
 // -- ScenarioStats NUMA merge tests --
 
+/// `worst_page_locality` is no longer a typed field folded in `merge`; it
+/// re-pools None-aware over the per-phase NUMA carriers POST-merge. This pins
+/// the cross-cgroup-merge property: two handles (separate `AssertResult`s)
+/// each carrying one cgroup's per-phase NUMA in the same step merge their
+/// `per_cgroup` carriers into one phase, and the run-level worst re-pools over
+/// the COMBINED cohort — with a MEASURED 0.0 (all pages off-node, the worst
+/// cell) winning the lowest rather than being skipped as an unreported
+/// sentinel (the `fold_lowest_nonzero` read-side bug this migration removes).
 #[test]
-fn assert_result_merge_numa_worst_page_locality() {
-    let mut a = AssertResult::pass();
-    a.stats.worst_page_locality = 0.9;
-    let mut b = AssertResult::pass();
-    b.stats.worst_page_locality = 0.7;
-    a.merge(b);
-    assert!((a.stats.worst_page_locality - 0.7).abs() < f64::EPSILON);
-}
+fn merge_repools_worst_page_locality_across_cgroups_measured_zero_wins() {
+    use crate::stats::BuiltinMetric as B;
+    let pc = |local: u64, total: u64| PhaseCgroupStats {
+        numa_pages_local: local,
+        numa_pages_total: total,
+        ..Default::default()
+    };
+    let with_cgroup = |name: &str, pcs: PhaseCgroupStats| {
+        let mut r = AssertResult::pass();
+        let mut bucket = PhaseBucket {
+            step_index: 1,
+            ..Default::default()
+        };
+        bucket.per_cgroup.insert(name.to_string(), pcs);
+        r.stats.phases = vec![bucket];
+        r
+    };
+    // Handle A: cgroup "A" healthy 0.8 (800/1000). Handle B: cgroup "B" all
+    // off-node — a MEASURED 0.0 (0/1000). The merge unions {A} and {B} into one
+    // step's `per_cgroup`, so the post-merge re-pool sees both and B's 0.0 wins.
+    let mut a = with_cgroup("A", pc(800, 1000));
+    a.merge(with_cgroup("B", pc(0, 1000)));
+    assert_eq!(
+        a.stats.run_metric(B::WorstPageLocality),
+        Some(0.0),
+        "post-merge re-pool sees BOTH cgroups; B's measured 0.0 wins the lowest",
+    );
 
-#[test]
-fn assert_result_merge_numa_zero_locality_ignored() {
-    let mut a = AssertResult::pass();
-    a.stats.worst_page_locality = 0.9;
-    let b = AssertResult::pass();
-    a.merge(b);
-    assert!((a.stats.worst_page_locality - 0.9).abs() < f64::EPSILON);
+    // None-aware across the merge: a merged cgroup that never measured NUMA
+    // (numa_pages_total == 0) is skipped, so the other handle's measured value
+    // is the run-level worst — not a 0.0 sentinel clobbering it.
+    let mut a = with_cgroup("A", pc(700, 1000));
+    a.merge(with_cgroup("B", pc(0, 0)));
+    assert_eq!(
+        a.stats.run_metric(B::WorstPageLocality),
+        Some(0.7),
+        "an unmeasured (total == 0) merged cgroup is skipped, not a 0.0 sentinel",
+    );
 }
 
 #[test]
@@ -401,8 +431,16 @@ fn cgroup_stats_numa_defaults() {
 #[test]
 fn scenario_stats_numa_defaults() {
     let s = ScenarioStats::default();
-    assert_eq!(s.worst_page_locality, 0.0);
-    assert_eq!(s.worst_cross_node_migration_ratio, 0.0);
+    // Neither NUMA roll-up is a typed field — a default (phase-less)
+    // ScenarioStats has no NUMA carriers, so both re-pool to None.
+    assert_eq!(
+        s.run_metric(crate::stats::BuiltinMetric::WorstPageLocality),
+        None
+    );
+    assert_eq!(
+        s.run_metric(crate::stats::BuiltinMetric::WorstCrossNodeMigrationRatio),
+        None
+    );
 }
 
 // -- parse_vmstat_numa_pages_migrated tests --
@@ -588,16 +626,59 @@ fn assert_cross_node_migration_method_fail() {
     assert!(r.is_fail());
 }
 
-// -- ScenarioStats cross-node migration merge --
+// -- ScenarioStats cross-node migration merge re-pool --
 
+/// worst_cross_node_migration_ratio is no longer a typed field merge-folded in
+/// `merge`; it re-pools MAX-wins over the per-phase NUMA carriers POST-merge (the
+/// polarity twin of worst_page_locality's lowest-wins). Two handles, each carrying
+/// one cgroup's per-phase NUMA in the same step, merge their `per_cgroup`
+/// carriers; the run-level worst re-pools the highest per-cgroup churn ratio over
+/// the COMBINED cohort. None-aware: a cgroup that measured no NUMA pages
+/// (`numa_pages_total == 0`) is skipped.
 #[test]
-fn assert_result_merge_worst_cross_node_migration() {
-    let mut a = AssertResult::pass();
-    a.stats.worst_cross_node_migration_ratio = 0.05;
-    let mut b = AssertResult::pass();
-    b.stats.worst_cross_node_migration_ratio = 0.15;
-    a.merge(b);
-    assert!((a.stats.worst_cross_node_migration_ratio - 0.15).abs() < f64::EPSILON);
+fn merge_repools_worst_cross_node_migration_ratio_across_cgroups_max_wins() {
+    use crate::stats::BuiltinMetric as B;
+    let pc = |total: u64, migr: u64| PhaseCgroupStats {
+        numa_pages_total: total,
+        cross_node_migrated: migr,
+        ..Default::default()
+    };
+    let with_cgroup = |name: &str, pcs: PhaseCgroupStats| {
+        let mut r = AssertResult::pass();
+        let mut bucket = PhaseBucket {
+            step_index: 1,
+            ..Default::default()
+        };
+        bucket.per_cgroup.insert(name.to_string(), pcs);
+        r.stats.phases = vec![bucket];
+        r
+    };
+    // Handle A: cgroup "A" 50/1000 = 0.05. Handle B: cgroup "B" 150/1000 = 0.15 —
+    // the worst (highest). The merge unions {A} and {B} into one step's per_cgroup,
+    // so the post-merge re-pool sees both and B's 0.15 wins (max).
+    let mut a = with_cgroup("A", pc(1000, 50));
+    a.merge(with_cgroup("B", pc(1000, 150)));
+    let r = a
+        .stats
+        .run_metric(B::WorstCrossNodeMigrationRatio)
+        .expect("measured cohort yields a value");
+    assert!(
+        (r - 0.15).abs() < 1e-9,
+        "post-merge re-pool sees BOTH cgroups; B's 0.15 wins the max; got {r}",
+    );
+
+    // None-aware: a merged cgroup that never measured NUMA (numa_pages_total == 0)
+    // is skipped, so the other handle's measured value is the run-level worst.
+    let mut a = with_cgroup("A", pc(1000, 70));
+    a.merge(with_cgroup("B", pc(0, 0)));
+    let r = a
+        .stats
+        .run_metric(B::WorstCrossNodeMigrationRatio)
+        .expect("one measured cgroup yields a value");
+    assert!(
+        (r - 0.07).abs() < 1e-9,
+        "an unmeasured (total == 0) merged cgroup is skipped; A's 0.07 is the worst; got {r}",
+    );
 }
 
 // -- AssertPlan: cross-node migration aggregation --
@@ -782,9 +863,19 @@ fn cgroup_numa_telemetry_populates_without_a_check() {
         "cross_node_migration_ratio must populate; got {}",
         cg.cross_node_migration_ratio,
     );
-    assert_eq!(r.stats.worst_page_locality, cg.page_locality);
+    // Neither NUMA roll-up is a typed field: both re-pool from the per-phase NUMA
+    // carriers, which the direct-assert (`assert_cgroup_with_numa`) path does not
+    // populate (it builds stats.cgroups, not stats.phases), so the run-level worst
+    // is None here — the per-cgroup `cg.page_locality` / `cg.cross_node_migration_ratio`
+    // above are the telemetry this path surfaces.
     assert_eq!(
-        r.stats.worst_cross_node_migration_ratio,
-        cg.cross_node_migration_ratio,
+        r.stats
+            .run_metric(crate::stats::BuiltinMetric::WorstPageLocality),
+        None,
+    );
+    assert_eq!(
+        r.stats
+            .run_metric(crate::stats::BuiltinMetric::WorstCrossNodeMigrationRatio),
+        None,
     );
 }

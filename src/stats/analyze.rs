@@ -8,23 +8,37 @@ use super::*;
 /// via the `df!` column name.
 pub(crate) type MetricAccessor = fn(&GauntletRow) -> f64;
 
-/// Pinned list of `(display_name, accessor)` for every metric that
-/// outlier detection considers. The display name appears in
+/// Pinned list of `(display_name, registry_key, accessor)` for every
+/// metric that outlier detection considers. `display_name` appears in
 /// [`Outlier`] output verbatim ("scenario: imbalance 4.5 ..."); the
-/// accessor pulls the f64 value off a `GauntletRow`. Mirrors the
-/// `metrics` slice the old polars code keyed off DataFrame column
-/// names, so the outlier set surfaces the same metrics under the same
-/// names.
-const OUTLIER_METRICS: &[(&str, MetricAccessor)] = &[
-    ("spread", |r| r.spread),
-    ("gap_ms", |r| r.gap_ms as f64),
-    ("migrations", |r| r.migrations as f64),
-    ("migration_ratio", |r| r.migration_ratio),
-    ("imbalance", |r| r.imbalance_ratio),
-    ("dsq_depth", |r| r.max_dsq_depth as f64),
-    ("stuck", |r| r.stuck_count),
-    ("fallback", |r| r.fallback_count as f64),
-    ("keep_last", |r| r.keep_last_count as f64),
+/// accessor pulls the f64 value off a `GauntletRow`. `registry_key` is
+/// the `METRICS`-registry entry whose polarity governs this metric — the
+/// `outlier_metrics_are_lower_better_in_registry` guard reads it to
+/// prove every entry is `LowerBetter` (outlier detection flags the HIGH
+/// tail and reads absent ext values as a 0.0 best-case sentinel, so a
+/// `HigherBetter` entry would silently corrupt detection). `registry_key`
+/// is distinct from `display_name` because the typed entries carry short
+/// labels (`spread`, `migrations`, `imbalance`) that do NOT match their
+/// cross-run registry names (`worst_spread`, `total_migrations`,
+/// `max_imbalance_ratio`); each ext entry's label already IS its registry
+/// key. `migration_ratio` resolves to `worst_migration_ratio` (the
+/// cross-run Gauge entry reading `r.migration_ratio`), NOT the PerPhase
+/// `migration_ratio` entry — the typed-field accessor and the cross-run
+/// registry entry must name the same measurement. Mirrors the `metrics`
+/// slice the old polars code keyed off DataFrame column names, so the
+/// outlier set surfaces the same metrics under the same names.
+pub(crate) const OUTLIER_METRICS: &[(&str, &str, MetricAccessor)] = &[
+    ("spread", "worst_spread", |r| r.spread),
+    ("gap_ms", "worst_gap_ms", |r| r.gap_ms as f64),
+    ("migrations", "total_migrations", |r| r.migrations as f64),
+    ("migration_ratio", "worst_migration_ratio", |r| {
+        r.migration_ratio
+    }),
+    ("imbalance", "max_imbalance_ratio", |r| r.imbalance_ratio),
+    ("dsq_depth", "max_dsq_depth", |r| r.max_dsq_depth as f64),
+    ("stuck", "stuck_count", |r| r.stuck_count),
+    ("fallback", "total_fallback", |r| r.fallback_count as f64),
+    ("keep_last", "total_keep_last", |r| r.keep_last_count as f64),
     // Distribution-kind roll-ups are ext_metrics-sourced (no typed field):
     // read them through the ext map, 0.0 when absent (the prior typed-field
     // default), mirroring the deleted `worst_*` accessors. The 0.0-on-absent
@@ -44,25 +58,29 @@ const OUTLIER_METRICS: &[(&str, MetricAccessor)] = &[
     // metric added here would NOT be benign (a 0.0 would depress the baseline
     // AND could itself read as a low outlier). So the two consumers diverge by
     // design, not by accident.
-    ("worst_p99_wake_latency_us", |r| {
-        r.ext_metrics
-            .get("worst_p99_wake_latency_us")
-            .copied()
-            .unwrap_or(0.0)
-    }),
-    ("worst_wake_latency_cv", |r| {
+    (
+        "worst_p99_wake_latency_us",
+        "worst_p99_wake_latency_us",
+        |r| {
+            r.ext_metrics
+                .get("worst_p99_wake_latency_us")
+                .copied()
+                .unwrap_or(0.0)
+        },
+    ),
+    ("worst_wake_latency_cv", "worst_wake_latency_cv", |r| {
         r.ext_metrics
             .get("worst_wake_latency_cv")
             .copied()
             .unwrap_or(0.0)
     }),
-    ("worst_mean_run_delay_us", |r| {
+    ("worst_mean_run_delay_us", "worst_mean_run_delay_us", |r| {
         r.ext_metrics
             .get("worst_mean_run_delay_us")
             .copied()
             .unwrap_or(0.0)
     }),
-    ("worst_run_delay_us", |r| {
+    ("worst_run_delay_us", "worst_run_delay_us", |r| {
         r.ext_metrics
             .get("worst_run_delay_us")
             .copied()
@@ -193,7 +211,10 @@ pub(crate) fn find_outliers(rows: &[GauntletRow]) -> Vec<Outlier> {
     }
 
     let mut outliers = Vec::new();
-    for &(name, accessor) in OUTLIER_METRICS {
+    // `registry_key` governs only the polarity guard
+    // (`outlier_metrics_are_lower_better_in_registry`); detection itself
+    // uses `name` (the display label) and `accessor`.
+    for &(name, _registry_key, accessor) in OUTLIER_METRICS {
         let overall_mean = mean(pass_rows.iter().map(|r| accessor(r)));
         let overall_std = std_dev(pass_rows.iter().map(|r| accessor(r)));
         // Drop metrics with std below epsilon. The cohort produced no
@@ -603,11 +624,12 @@ pub(crate) fn sorted_run_entries(root: &std::path::Path) -> std::io::Result<Vec<
 /// Pool every sidecar under the runs root (or `dir` when set) and
 /// emit the distinct values present on each filterable dimension.
 ///
-/// Eight dimensions are reported: `kernel` (from
+/// Nine dimensions are reported: `kernel` (from
 /// `SidecarResult::kernel_version`), `scheduler`, `topology`,
 /// `work_type`, `commit` (from `SidecarResult::project_commit`),
 /// `kernel_commit` (from `SidecarResult::kernel_commit`), `source`
-/// (from `SidecarResult::run_source`), and `cpu_budget` (from
+/// (from `SidecarResult::run_source`), `resolve_source` (from
+/// `SidecarResult::resolve_source`), and `cpu_budget` (from
 /// `SidecarResult::cpu_budget`). The dimension catalogue here matches
 /// what `cargo ktstr stats compare` accepts as `--X` and `--a-X` /
 /// `--b-X` filter flags — the command exists so an operator can answer
@@ -622,10 +644,10 @@ pub(crate) fn sorted_run_entries(root: &std::path::Path) -> std::io::Result<Vec<
 /// of only skips renders the `(all runs skipped — no budget recorded)`
 /// sentinel rather than `null` / `unknown`.
 ///
-/// `kernel_version`, `project_commit`, `kernel_commit`, and
-/// `run_source` are `Option<String>` on the source sidecar;
-/// absence is reported as a literal JSON `null` in the JSON
-/// shape and the textual sentinel `unknown` in the table shape.
+/// `kernel_version`, `project_commit`, `kernel_commit`,
+/// `run_source`, and `resolve_source` are `Option<String>` on the
+/// source sidecar; absence is reported as a literal JSON `null` in
+/// the JSON shape and the textual sentinel `unknown` in the table shape.
 /// The set is sorted by the type's natural ordering (`BTreeSet`);
 /// `None` collates before any populated value in `Option<String>`
 /// ordering, so `null` / `unknown` always lands at the top of the
@@ -633,8 +655,9 @@ pub(crate) fn sorted_run_entries(root: &std::path::Path) -> std::io::Result<Vec<
 ///
 /// `json=true` emits a JSON object keyed by dimension name with
 /// arrays of values (with `null` interleaved for absent
-/// `kernel`, `commit`, `kernel_commit`, or `source` entries —
-/// the four optional dimensions); `json=false` emits a
+/// `kernel`, `commit`, `kernel_commit`, `source`, or
+/// `resolve_source` entries — the five optional dimensions);
+/// `json=false` emits a
 /// per-dimension human-readable block with the values one per
 /// line.
 ///
@@ -661,6 +684,7 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
     let mut project_commits: BTreeSet<Option<String>> = BTreeSet::new();
     let mut kernel_commits: BTreeSet<Option<String>> = BTreeSet::new();
     let mut run_sources: BTreeSet<Option<String>> = BTreeSet::new();
+    let mut resolve_sources: BTreeSet<Option<String>> = BTreeSet::new();
     let mut cpu_budgets: BTreeSet<u32> = BTreeSet::new();
     let mut schedulers: BTreeSet<String> = BTreeSet::new();
     let mut topologies: BTreeSet<String> = BTreeSet::new();
@@ -671,6 +695,7 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
         project_commits.insert(sc.project_commit.clone());
         kernel_commits.insert(sc.kernel_commit.clone());
         run_sources.insert(sc.run_source.clone());
+        resolve_sources.insert(sc.resolve_source.clone());
         // 0 = skip rows (never booted); exclude — they carry no budget.
         if sc.cpu_budget != 0 {
             cpu_budgets.insert(sc.cpu_budget);
@@ -709,6 +734,13 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
                 None => serde_json::Value::Null,
             })
             .collect();
+        let resolve_sources_json: Vec<serde_json::Value> = resolve_sources
+            .iter()
+            .map(|opt| match opt {
+                Some(s) => serde_json::Value::String(s.clone()),
+                None => serde_json::Value::Null,
+            })
+            .collect();
         // JSON keys stay as `commit` / `source` — operator-visible
         // wire contract for `cargo ktstr stats list-values --json`
         // does not rename when the internal field/variable does.
@@ -724,6 +756,7 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
             "commit": project_commits_json,
             "kernel_commit": kernel_commits_json,
             "source": run_sources_json,
+            "resolve_source": resolve_sources_json,
             "cpu_budget": cpu_budgets.iter().collect::<Vec<_>>(),
             "scheduler": schedulers.iter().collect::<Vec<_>>(),
             "topology": topologies.iter().collect::<Vec<_>>(),
@@ -775,6 +808,7 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
     render_opt_set(&mut out, "commit:", &project_commits);
     render_opt_set(&mut out, "kernel_commit:", &kernel_commits);
     render_opt_set(&mut out, "source:", &run_sources);
+    render_opt_set(&mut out, "resolve_source:", &resolve_sources);
     out.push_str("cpu_budget:\n");
     if cpu_budgets.is_empty() {
         // cpu_budgets excludes budget-0 skip rows, so an empty set on a

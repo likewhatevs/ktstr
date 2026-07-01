@@ -10,7 +10,7 @@ fn test_layout(topo: &Topology, mib: u32) -> NumaMemoryLayout {
 
 fn test_setup(mem: &GuestMemoryMmap, topo: &Topology, mib: u32) -> AcpiLayout {
     let layout = test_layout(topo, mib);
-    setup_acpi(mem, topo, &layout).unwrap()
+    setup_acpi(mem, topo, &layout, false, 0, false).unwrap()
 }
 
 fn read_table(mem: &GuestMemoryMmap, addr: u64) -> Vec<u8> {
@@ -72,8 +72,8 @@ fn acpi_rejects_slit_dominated_overflow_at_extreme_numa() {
         distances: None,
     };
     let layout = test_layout(&topo, 512);
-    let err =
-        setup_acpi(&mem, &topo, &layout).expect_err("512-NUMA SLIT must overflow the ISA hole");
+    let err = setup_acpi(&mem, &topo, &layout, false, 0, false)
+        .expect_err("512-NUMA SLIT must overflow the ISA hole");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("SLIT alone") && msg.contains("ISA hole"),
@@ -98,7 +98,7 @@ fn acpi_rejects_cpu_table_overflow_at_extreme_vcpu_count() {
         distances: None,
     };
     let layout = test_layout(&topo, 256);
-    let err = setup_acpi(&mem, &topo, &layout)
+    let err = setup_acpi(&mem, &topo, &layout, false, 0, false)
         .expect_err("4096-vCPU ACPI CPU tables must overflow the ISA hole");
     let msg = format!("{err:#}");
     assert!(
@@ -122,7 +122,7 @@ fn acpi_rejects_total_overflow_when_slit_alone_fits() {
         distances: None,
     };
     let layout = test_layout(&topo, 361);
-    let err = setup_acpi(&mem, &topo, &layout)
+    let err = setup_acpi(&mem, &topo, &layout, false, 0, false)
         .expect_err("361-NUMA total tables must overflow the ISA hole");
     let msg = format!("{err:#}");
     assert!(
@@ -333,6 +333,231 @@ fn rsdt_table_pointers() {
     mem.read_slice(&mut entry, GuestAddress(l.rsdt_addr + 48))
         .unwrap();
     assert_eq!(u32::from_le_bytes(entry), l.slit_addr as u32);
+}
+
+/// `setup_acpi` with the PCI transport enabled (MCFG + the `_SB.PCI0` /
+/// `_PRT` DSDT body), the integration path the booted-guest NIC e2es exercise
+/// but no unit test covered (every other `test_setup` runs `pci_enabled=false`).
+fn test_setup_pci(
+    mem: &GuestMemoryMmap,
+    topo: &Topology,
+    mib: u32,
+    nic_count: usize,
+) -> AcpiLayout {
+    let layout = test_layout(topo, mib);
+    setup_acpi(mem, topo, &layout, true, nic_count, false).unwrap()
+}
+
+#[test]
+fn pci_enabled_emits_mcfg_and_prt_dsdt() {
+    let topo = Topology {
+        llcs: 1,
+        cores_per_llc: 1,
+        threads_per_core: 1,
+        numa_nodes: 1,
+        nodes: None,
+        distances: None,
+    };
+    // Non-PCI baseline: header-only DSDT, no MCFG, 4-entry RSDT.
+    let mem_base = test_mem(16);
+    let base = test_setup(&mem_base, &topo, 256);
+    assert_eq!(base.dsdt_size, 36, "non-PCI DSDT is header-only");
+    assert_eq!(base.mcfg_size, 0, "non-PCI emits no MCFG");
+    let base_rsdt = read_table(&mem_base, base.rsdt_addr);
+    assert_eq!(
+        (base_rsdt.len() - 36) / 4,
+        4,
+        "non-PCI RSDT: FADT/MADT/SRAT/SLIT only",
+    );
+
+    // PCI-enabled: the DSDT carries the host-bridge AML (with _PRT), and the
+    // MCFG (ECAM base) is emitted and linked into RSDT/XSDT.
+    let mem = test_mem(16);
+    let l = test_setup_pci(&mem, &topo, 256, 1);
+    assert!(
+        l.dsdt_size > 36,
+        "PCI DSDT carries the host-bridge AML body"
+    );
+    let dsdt = read_table(&mem, l.dsdt_addr);
+    let dsdt_has = |needle: &[u8]| dsdt.windows(needle.len()).any(|w| w == needle);
+    assert!(
+        dsdt_has(b"_PRT"),
+        "PCI DSDT contains the _PRT routing object"
+    );
+    assert!(
+        dsdt_has(&[0x0C, 0x41, 0xD0, 0x0A, 0x08]),
+        "PCI DSDT contains the PNP0A08 host-bridge _HID",
+    );
+
+    // MCFG: signature, zero checksum, ECAM base at offset 44.
+    assert!(l.mcfg_size > 0, "MCFG emitted when PCI enabled");
+    let mcfg = read_table(&mem, l.mcfg_addr);
+    assert_eq!(&mcfg[..4], b"MCFG");
+    let sum: u8 = mcfg.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+    assert_eq!(sum, 0, "MCFG checksum must be zero");
+    assert_eq!(
+        u64::from_le_bytes(mcfg[44..52].try_into().unwrap()),
+        PCI_ECAM_BASE,
+        "MCFG allocation base must be the ECAM window base",
+    );
+
+    // RSDT/XSDT gain the MCFG entry (5 = FADT/MADT/SRAT/SLIT/MCFG); MCFG is
+    // last (rsdt_entries appends it after the optional HMAT).
+    let rsdt = read_table(&mem, l.rsdt_addr);
+    let n = (rsdt.len() - 36) / 4;
+    assert_eq!(n, 5, "PCI RSDT adds MCFG to the 4 base tables");
+    let last = u32::from_le_bytes(rsdt[36 + (n - 1) * 4..36 + n * 4].try_into().unwrap());
+    assert_eq!(last as u64, l.mcfg_addr, "MCFG is the last RSDT entry");
+    let xsdt = read_table(&mem, l.xsdt_addr);
+    assert_eq!(
+        (xsdt.len() - 36) / 8,
+        5,
+        "PCI XSDT adds MCFG (8-byte entries)"
+    );
+
+    // The full contiguous pack still ends within the ISA hole.
+    assert!(
+        l.xsdt_addr + l.xsdt_size <= HIMEM_START,
+        "ACPI tables must pack within the ISA hole",
+    );
+}
+
+#[test]
+fn pci_with_hmat_table_count() {
+    // pci + hmat (multi-NUMA) guards the table_count = 4 + hmat + pci
+    // arithmetic and the rsdt_entries append order (MCFG after HMAT).
+    let mem = test_mem(16);
+    let topo = Topology {
+        llcs: 4,
+        cores_per_llc: 2,
+        threads_per_core: 1,
+        numa_nodes: 2,
+        nodes: None,
+        distances: None,
+    };
+    let l = test_setup_pci(&mem, &topo, 256, 1);
+    assert!(l.hmat_size > 0, "HMAT emitted for multi-NUMA");
+    assert!(l.mcfg_size > 0, "MCFG emitted for PCI");
+    let rsdt = read_table(&mem, l.rsdt_addr);
+    let n = (rsdt.len() - 36) / 4;
+    assert_eq!(n, 6, "FADT/MADT/SRAT/SLIT/HMAT/MCFG");
+    let last = u32::from_le_bytes(rsdt[36 + (n - 1) * 4..36 + n * 4].try_into().unwrap());
+    assert_eq!(
+        last as u64, l.mcfg_addr,
+        "MCFG is the last RSDT entry, appended after HMAT",
+    );
+    assert!(
+        l.xsdt_addr + l.xsdt_size <= HIMEM_START,
+        "ACPI tables must pack within the ISA hole",
+    );
+}
+
+/// setup_acpi with N NICs emits one DSDT `_PRT` routing package per NIC, each
+/// at `(virtio_net_pci_slot(i), virtio_net_gsi(i))`. Decodes the real DSDT
+/// (not the aml encoder in isolation) with the expected (slot, GSI) DERIVED
+/// from the allocator, so the SCI-skip at i>=2 (NIC 2 -> GSI 10, not 9) is
+/// proven to flow allocator -> setup_acpi -> DSDT. nic_count=3 exercises the
+/// skip; the aml `prt_emits_one_entry_per_route` test covers the encoder.
+#[test]
+fn setup_acpi_emits_one_prt_route_per_nic() {
+    use crate::vmm::kvm::{virtio_net_gsi, virtio_net_pci_slot};
+    let topo = Topology {
+        llcs: 1,
+        cores_per_llc: 1,
+        threads_per_core: 1,
+        numa_nodes: 1,
+        nodes: None,
+        distances: None,
+    };
+    let mem = test_mem(16);
+    let l = test_setup_pci(&mem, &topo, 256, 3);
+    let dsdt = read_table(&mem, l.dsdt_addr);
+    let contains = |needle: &[u8]| dsdt.windows(needle.len()).any(|w| w == needle);
+    for i in 0..3usize {
+        let slot = virtio_net_pci_slot(i) as u32;
+        let gsi = virtio_net_gsi(i);
+        // Inner routing package (mirror prt_entry_encoding): Package(4) of
+        // Address DWord (slot<<16)|0xFFFF, Pin Zero, Source Zero, SourceIndex
+        // GSI byte. GSI 7..23 always encodes as a Byte (0x0A prefix).
+        let entry = [
+            0x12, 0x0B, 0x04, // PackageOp, PkgLength, NumElements=4
+            0x0C, 0xFF, 0xFF, slot as u8, 0x00, // Address DWord (slot)
+            0x00, // Pin = INTA#
+            0x00, // Source = static GSI routing
+            0x0A, gsi as u8, // SourceIndex = GSI (Byte)
+        ];
+        assert!(
+            contains(&entry),
+            "DSDT _PRT must route NIC {i} at slot {slot} -> GSI {gsi}",
+        );
+    }
+}
+
+#[test]
+fn setup_acpi_emits_blk_prt_route_when_disk_attached() {
+    use crate::vmm::kvm::{virtio_blk_pci_gsi, virtio_blk_pci_slot};
+    let topo = Topology {
+        llcs: 1,
+        cores_per_llc: 1,
+        threads_per_core: 1,
+        numa_nodes: 1,
+        nodes: None,
+        distances: None,
+    };
+    let mem = test_mem(16);
+    let layout = test_layout(&topo, 256);
+    // PCI enabled, no NICs, one disk attached: the only _PRT entry is the
+    // virtio-blk function's INTx route.
+    let l = setup_acpi(&mem, &topo, &layout, true, 0, true).unwrap();
+    let dsdt = read_table(&mem, l.dsdt_addr);
+    let contains = |needle: &[u8]| dsdt.windows(needle.len()).any(|w| w == needle);
+    let slot = virtio_blk_pci_slot() as u32;
+    let gsi = virtio_blk_pci_gsi();
+    // GSI 6 (VIRTIO_BLK_IRQ) encodes as an ACPI Byte (0x0A prefix), like the
+    // NIC GSIs 7..23 in `setup_acpi_emits_one_prt_route_per_nic`.
+    let entry = [
+        0x12, 0x0B, 0x04, // PackageOp, PkgLength, NumElements=4
+        0x0C, 0xFF, 0xFF, slot as u8, 0x00, // Address DWord (slot << 16 | 0xFFFF)
+        0x00, // Pin = INTA#
+        0x00, // Source = static GSI routing
+        0x0A, gsi as u8, // SourceIndex = GSI (Byte)
+    ];
+    assert!(
+        contains(&entry),
+        "DSDT _PRT must route the virtio-blk function at slot {slot} -> GSI {gsi}",
+    );
+    // The _PRT package declares exactly one entry (no NICs).
+    let prt_pos = dsdt
+        .windows(4)
+        .position(|w| w == b"_PRT")
+        .expect("_PRT present when a disk is attached");
+    assert_eq!(
+        dsdt[prt_pos + 6],
+        0x01,
+        "_PRT holds exactly one entry (the blk route) with nic_count=0",
+    );
+}
+
+#[test]
+fn setup_acpi_emits_no_blk_prt_route_without_disk() {
+    let topo = Topology {
+        llcs: 1,
+        cores_per_llc: 1,
+        threads_per_core: 1,
+        numa_nodes: 1,
+        nodes: None,
+        distances: None,
+    };
+    let mem = test_mem(16);
+    let layout = test_layout(&topo, 256);
+    // PCI enabled, no NICs, no disk: the host bridge carries no _PRT (no INTx
+    // device at any slot).
+    let l = setup_acpi(&mem, &topo, &layout, true, 0, false).unwrap();
+    let dsdt = read_table(&mem, l.dsdt_addr);
+    assert!(
+        !dsdt.windows(4).any(|w| w == b"_PRT"),
+        "no NIC and no disk => no _PRT entries",
+    );
 }
 
 #[test]
@@ -743,6 +968,106 @@ fn fadt_hw_reduced_flags() {
 }
 
 #[test]
+fn fadt_pm_register_blocks() {
+    // Non-hardware-reduced full ACPI needs populated PM register blocks.
+    // With them zero, ACPICA faults (AE_BAD_ADDRESS) initializing fixed
+    // events, ACPI never enables, and PCI INTx falls back to legacy MP-table
+    // routing that can't route the virtio-net PCI function. Pin every PM-block
+    // field so a regression that zeroes them is caught at unit time, not by a
+    // booted-guest e2e.
+    let mem = test_mem(16);
+    let topo = Topology {
+        llcs: 1,
+        cores_per_llc: 1,
+        threads_per_core: 1,
+        numa_nodes: 1,
+        nodes: None,
+        distances: None,
+    };
+    let l = test_setup(&mem, &topo, 256);
+    let mut fadt = [0u8; 276];
+    mem.read_slice(&mut fadt, GuestAddress(l.fadt_addr))
+        .unwrap();
+    // SCI_INT (offset 46): GSI 9, the conventional SCI line.
+    assert_eq!(u16::from_le_bytes(fadt[46..48].try_into().unwrap()), 9);
+    // PM1a_EVT_BLK / PM1a_CNT_BLK / PM_TMR_BLK (offsets 56/64/76): 32-bit
+    // legacy I/O port addresses. Must be non-zero or ACPICA faults.
+    assert_eq!(
+        u32::from_le_bytes(fadt[56..60].try_into().unwrap()),
+        u32::from(ACPI_PM1_EVT_PORT)
+    );
+    assert_eq!(
+        u32::from_le_bytes(fadt[64..68].try_into().unwrap()),
+        u32::from(ACPI_PM1_CNT_PORT)
+    );
+    assert_eq!(
+        u32::from_le_bytes(fadt[76..80].try_into().unwrap()),
+        u32::from(ACPI_PM_TMR_PORT)
+    );
+    // PM1_EVT_LEN / PM1_CNT_LEN / PM_TMR_LEN (offsets 88/89/91).
+    assert_eq!(fadt[88], 4);
+    assert_eq!(fadt[89], 2);
+    assert_eq!(fadt[91], 4);
+    // The optional SEPARATE_LENGTH blocks are deliberately left fully zero
+    // (acpi_tb_convert_fadt silently accepts a fully-zero optional block; ktstr
+    // emulates no PM2 control or GPE block). Pin them so a regression that
+    // populated one — which acpi_tb_convert_fadt would then validate and could
+    // fault on a malformed pair — is caught: PM2_CNT_BLK@72 / GPE0_BLK@80 (u32),
+    // PM2_CNT_LEN@90 / GPE0_BLK_LEN@92 (u8).
+    assert_eq!(
+        u32::from_le_bytes(fadt[72..76].try_into().unwrap()),
+        0,
+        "PM2_CNT_BLK"
+    );
+    assert_eq!(
+        u32::from_le_bytes(fadt[80..84].try_into().unwrap()),
+        0,
+        "GPE0_BLK"
+    );
+    assert_eq!(fadt[90], 0, "PM2_CNT_LEN");
+    assert_eq!(fadt[92], 0, "GPE0_BLK_LEN");
+    // IA-PC Boot Architecture Flags (offset 109): bit1 = i8042 present,
+    // bit2 = VGA not present.
+    assert_eq!(
+        u16::from_le_bytes(fadt[109..111].try_into().unwrap()),
+        0x0006
+    );
+}
+
+#[test]
+fn fadt_extended_gas_blocks_are_zero() {
+    // We populate ONLY the legacy 32-bit I/O-port PM blocks (offsets 56/64/76)
+    // and leave every 64-bit extended GAS field zero. ACPICA's
+    // acpi_tb_convert_fadt (drivers/acpi/acpica/tbfadt.c) synthesizes the X_*
+    // GAS from the legacy block whenever the X_ address is zero and the legacy
+    // block is non-zero. Populating BOTH risks an inconsistent pair that
+    // acpi_tb_convert_fadt warns on (legacy-vs-X mismatch); zeroing the X_
+    // blocks is the spec-clean way to let ACPICA derive them. Pin that the
+    // X_PM*/X_GPE*/SLEEP_*/HypervisorVendorId region (offset 148 to the end of
+    // the 276-byte ACPI-6 FADT) stays all-zero so a regression that starts
+    // writing a partial GAS is caught here.
+    let mem = test_mem(16);
+    let topo = Topology {
+        llcs: 1,
+        cores_per_llc: 1,
+        threads_per_core: 1,
+        numa_nodes: 1,
+        nodes: None,
+        distances: None,
+    };
+    let l = test_setup(&mem, &topo, 256);
+    let mut fadt = [0u8; 276];
+    mem.read_slice(&mut fadt, GuestAddress(l.fadt_addr))
+        .unwrap();
+    assert!(
+        fadt[148..].iter().all(|&b| b == 0),
+        "extended GAS region (offset 148..) must be zero so ACPICA synthesizes \
+         X_* blocks from the legacy ports; found {:?}",
+        &fadt[148..]
+    );
+}
+
+#[test]
 fn fadt_minor_version() {
     let mem = test_mem(16);
     let topo = Topology {
@@ -1115,7 +1440,7 @@ fn hmat_emitted_with_cxl() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0, false).unwrap();
     assert!(l.hmat_size > 0, "HMAT must be emitted with CXL nodes");
 }
 
@@ -1124,7 +1449,7 @@ fn hmat_checksum() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0, false).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
     let sum: u8 = hmat.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
     assert_eq!(sum, 0, "HMAT checksum must be zero");
@@ -1135,7 +1460,7 @@ fn hmat_header_fields() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0, false).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
     assert_eq!(&hmat[..4], b"HMAT");
     assert_eq!(hmat[8], 2, "HMAT revision must be 2");
@@ -1151,7 +1476,7 @@ fn hmat_mpda_count_and_flags() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0, false).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
 
     let num_targets = layout.regions().len();
@@ -1183,7 +1508,7 @@ fn hmat_mpda_cxl_initiator() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0, false).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
 
     let mut offset = 40;
@@ -1217,7 +1542,7 @@ fn hmat_sllbi_latency_and_bandwidth() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0, false).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
 
     let num_targets = layout.regions().len();
@@ -1248,7 +1573,7 @@ fn hmat_sllbi_cxl_entries_differ() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0, false).unwrap();
     let hmat = read_table(&mem, l.hmat_addr);
 
     let num_targets = layout.regions().len();
@@ -1281,7 +1606,7 @@ fn hmat_rsdt_xsdt_include_pointer() {
     let topo = Topology::with_nodes(4, 1, &CXL_NODES);
     let mem = test_mem(16);
     let layout = NumaMemoryLayout::compute(&topo, 640, 0, None).unwrap();
-    let l = setup_acpi(&mem, &topo, &layout).unwrap();
+    let l = setup_acpi(&mem, &topo, &layout, false, 0, false).unwrap();
 
     // RSDT should have 5 entries (FADT, MADT, SRAT, SLIT, HMAT).
     let rsdt = read_table(&mem, l.rsdt_addr);

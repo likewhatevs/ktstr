@@ -444,6 +444,111 @@ fn derived_division_by_zero_returns_none() {
     );
 }
 
+/// Capture-gated-absence fix: when a thread's delay-accounting / jemalloc family
+/// was NOT captured (the absent-as-0 defaults stand, `*_measured == false`), the
+/// run-level aggregate of that family is `Aggregated::Absent`, NOT a sentinel
+/// `Sum(0)`. So the derived sums (`total_offcpu_delay_ns`, `live_heap_estimate`)
+/// short-circuit to None (rendered "-") instead of computing "0" from the
+/// sentinel — which on a one-sided-unmeasured compare would read as a huge false
+/// delta. This is the sibling of `derived_division_by_zero_returns_none`, where
+/// a MEASURED all-zero thread (`make_thread` sets `*_measured == true`) keeps
+/// `total_offcpu_delay_ns == Some(0.0)`: measured-zero vs not-measured.
+#[test]
+fn derived_sums_absent_when_family_unmeasured() {
+    let mut t = make_thread("p", "w");
+    // Same all-zero values as make_thread's defaults, but the families are
+    // explicitly NOT captured — the bug's trigger.
+    t.taskstats_measured = false;
+    t.jemalloc_measured = false;
+    let diff = compare(
+        &snap_with(vec![t.clone()]),
+        &snap_with(vec![t]),
+        &CompareOptions::default(),
+    );
+    for name in ["total_offcpu_delay_ns", "live_heap_estimate"] {
+        let row = diff
+            .derived_rows
+            .iter()
+            .find(|r| r.metric_name == name)
+            .unwrap_or_else(|| panic!("{name} row present"));
+        assert!(
+            row.baseline.is_none(),
+            "{name} must be None (absent) when its family was not captured — \
+             not a sentinel 0 that reads as a measured zero; got {:?}",
+            row.baseline,
+        );
+        assert!(
+            row.delta.is_none(),
+            "{name} delta must be None when the family is unmeasured on both sides",
+        );
+    }
+}
+
+/// Per-sub-family Absent propagates through `compare()` to the DERIVED rows,
+/// ASYMMETRICALLY: a candidate whose delayacct runtime toggle is off
+/// (`delay_block_active == false`) but whose `cpu_delay` + xacct sub-families stay
+/// active renders the resource-wait-derived `total_offcpu_delay_ns` as "-" on that
+/// side (its inputs are Absent), while the `cpu_delay`-derived `avg_cpu_delay_ns`
+/// stays a real value on BOTH sides. Pins that the gate is per-sub-family
+/// end-to-end (not whole-family) and that `cpu_delay` survives the runtime toggle.
+#[test]
+fn derived_per_subfamily_absent_is_asymmetric_across_compare() {
+    // Baseline: a fully-enabled host — every sub-family measured, real values.
+    let mut a = make_thread("p", "w");
+    a.cpu_delay_count = crate::metric_types::MonotonicCount(10);
+    a.cpu_delay_total_ns = crate::metric_types::MonotonicNs(5_000);
+    a.blkio_delay_total_ns = crate::metric_types::MonotonicNs(3_000);
+    // Candidate: delayacct runtime toggle OFF — cpu_delay + xacct still active, the
+    // resource-wait categories NOT measured.
+    let mut b = make_thread("p", "w");
+    b.delay_block_active = false;
+    b.cpu_delay_count = crate::metric_types::MonotonicCount(12);
+    b.cpu_delay_total_ns = crate::metric_types::MonotonicNs(6_000);
+
+    let diff = compare(
+        &snap_with(vec![a]),
+        &snap_with(vec![b]),
+        &CompareOptions::default(),
+    );
+
+    // total_offcpu_delay_ns (resource-wait sum): baseline measured, candidate
+    // Absent — the asymmetric per-sub-family boundary.
+    let offcpu = diff
+        .derived_rows
+        .iter()
+        .find(|r| r.metric_name == "total_offcpu_delay_ns")
+        .expect("total_offcpu_delay_ns row present");
+    assert!(
+        offcpu.baseline.is_some(),
+        "baseline total_offcpu_delay_ns measured; got {:?}",
+        offcpu.baseline,
+    );
+    assert!(
+        offcpu.candidate.is_none(),
+        "candidate total_offcpu_delay_ns must be Absent (delay_block off); got {:?}",
+        offcpu.candidate,
+    );
+    assert!(
+        offcpu.delta.is_none(),
+        "one-sided-absent total_offcpu_delay_ns delta must be None",
+    );
+
+    // avg_cpu_delay_ns (cpu_delay family — a DIFFERENT sub-family): measured on
+    // BOTH sides, unaffected by the delay_block toggle.
+    let avgcpu = diff
+        .derived_rows
+        .iter()
+        .find(|r| r.metric_name == "avg_cpu_delay_ns")
+        .expect("avg_cpu_delay_ns row present");
+    assert!(
+        avgcpu.baseline.is_some() && avgcpu.candidate.is_some(),
+        "avg_cpu_delay_ns must stay measured on both sides (cpu_delay survives the \
+         runtime toggle); got baseline={:?} candidate={:?}",
+        avgcpu.baseline,
+        avgcpu.candidate,
+    );
+}
+
 /// Mode rule with a deterministic tie-break: when two
 /// values share the top count, the lexicographically
 /// smaller one wins. Pin the rule so the rendered output

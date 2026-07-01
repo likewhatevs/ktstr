@@ -224,7 +224,7 @@ impl VmlinuxSymbolCache {
 /// vCPU TID), differing only in that arming does NOT request a
 /// freeze — vCPUs immediately re-enter `KVM_RUN` after the arm.
 ///
-/// `bsp_alive` is the same Acquire-bool the freeze_and_capture
+/// `bsp_alive` is the same Acquire-bool the freeze_and_dispatch
 /// closure consults: a `false` reading means the BSP `VcpuFd` is
 /// gone and writing through `bsp_ie_handle` would touch unmapped
 /// memory. The Arc is borrowed (not a snapshot) so each gated site
@@ -471,7 +471,7 @@ pub(super) fn arm_user_watchpoint(
     // is harmless on its own, but the surrounding contract relies
     // on the bsp_alive bool being authoritative for all BSP-touching
     // operations in this function. Loading fresh keeps the contract
-    // honest and matches the freeze_and_capture pattern at the
+    // honest and matches the freeze_and_dispatch pattern at the
     // mod.rs pass-2 site.
     if bsp_alive.load(Ordering::Acquire) {
         // SAFETY: bsp_alive is Acquire-loaded immediately above;
@@ -592,6 +592,20 @@ mod snapshot_tagged_path_tests {
         let base = Path::new("/tmp/run/coord.failure-dump.json");
         let out = snapshot_tagged_path(base, "mid_run");
         assert_eq!(out, PathBuf::from("/tmp/run/coord.snapshot.mid_run.json"));
+    }
+
+    /// Variant-keyed dump base ({test}-{16-hex}.failure-dump.json): the
+    /// `.failure-dump` suffix strip is prefix-agnostic, so the variant
+    /// hash flows through to the snapshot tagged path verbatim — no code
+    /// change was needed for variant-keyed dumps, only this pin.
+    #[test]
+    fn strips_failure_dump_suffix_preserving_variant_hash() {
+        let base = Path::new("/tmp/run/scx_t-000000000000000a.failure-dump.json");
+        let out = snapshot_tagged_path(base, "mid_run");
+        assert_eq!(
+            out,
+            PathBuf::from("/tmp/run/scx_t-000000000000000a.snapshot.mid_run.json")
+        );
     }
 
     /// Tag with a path-traversal character (`/`) is sanitised to
@@ -1244,7 +1258,7 @@ mod arm_user_watchpoint_tests {
         }
         // Simulate the coordinator's slot-fire reset for slot 1.
         // Production performs this `Release` store inside the
-        // freeze coordinator's `freeze_and_capture` path after a
+        // freeze coordinator's `freeze_and_dispatch` path after a
         // user-slot dump completes; the test models the
         // post-reset state directly so the arm path is exercised
         // in isolation.

@@ -209,6 +209,28 @@ pub enum MsgType {
     /// failure-dump JSON so the operator picks it up alongside the
     /// rest of the per-test debugging artefacts.
     WprofTrace,
+    /// Guest→host wprof trace CHUNK (payload: a ≤`MAX_BULK_FRAME_PAYLOAD`
+    /// slice of the `.pb`). A wprof trace larger than the single-frame
+    /// bulk-port ceiling is split into ordered `WprofTraceChunk` frames
+    /// terminated by a final [`Self::WprofTrace`] frame (the last slice);
+    /// the host concatenates the chunk payloads in arrival order and
+    /// appends the terminal `WprofTrace` payload to reconstruct the `.pb`.
+    /// A trace that fits in one frame ships as a lone `WprofTrace` (no
+    /// chunks) — the reassembly is a no-op for that fast path.
+    ///
+    /// Like the `Stdout`/`Stderr`/`SchedLog` transports, a large blob is
+    /// split across frames and concatenated on the host. It DIVERGES from
+    /// them in using a distinct terminal frame type rather than uniform
+    /// same-type frames: a Perfetto `.pb` is useless if truncated (a partial
+    /// protobuf still passes the leading-tag/size shape check but decodes to
+    /// garbage), whereas partial stdout is still useful. The terminal frame
+    /// lets the host distinguish a complete trace (terminal present → write
+    /// the `.pb`) from a transport that tore mid-ship (chunks but no terminal
+    /// → write nothing, so the post_vm `.pb`-landed assert fails loudly
+    /// instead of shipping a plausible-but-corrupt artifact). Stdout/SchedLog
+    /// need no such marker — their in-band `SCHED_OUTPUT_START/END` content
+    /// delimiters, not the framing, bound their payloads.
+    WprofTraceChunk,
     /// Guest→host system-ready signal (payload: empty).
     ///
     /// Emitted by the guest's `ktstr_guest_init` after
@@ -219,11 +241,28 @@ pub enum MsgType {
     /// promotes a CRC-valid SYS_RDY frame into the monitor's
     /// boot-complete eventfd, so the monitor's pre-sample
     /// `epoll_wait` returns within microseconds rather than
-    /// waiting for the 30 s fallback timeout. Replaces an earlier
+    /// waiting for the 5 s fallback timeout. Replaces an earlier
     /// trigger that fired on the first port-0 TX byte (kernel
     /// printk via `/dev/hvc0`), which depended on incidental
     /// console traffic rather than an explicit readiness signal.
     SysRdy,
+    /// Guest→host scheduler-swap notification (payload: empty).
+    ///
+    /// Emitted by the guest's `kill_current_scheduler`
+    /// (`Op::DetachScheduler` / `RestartScheduler` / `ReplaceScheduler`)
+    /// AFTER `wait_for_scx_disabled` returns, so by the time the host
+    /// observes the frame the kernel has already NULLed `*scx_root`
+    /// (`RCU_INIT_POINTER(scx_root, NULL)` precedes
+    /// `scx_set_enable_state(SCX_DISABLED)` in kernel/sched/ext.c) and
+    /// the prior scx_sched object is unlinked (`*scx_root` NULLed) and
+    /// its slab is subject to RCU-grace-period reuse. The freeze
+    /// coordinator decodes a CRC-valid frame and SYNCHRONOUSLY
+    /// invalidates the periodic-capture accessor (mirroring the
+    /// watchpoint poll's Detached teardown) rather than waiting up to
+    /// one SCAN_INTERVAL for the poll to notice the rebind — collapsing
+    /// the post-swap periodic-capture defer window. Coordinator-internal:
+    /// carries no test verdict.
+    SchedSwapNotify,
 }
 
 impl MsgType {
@@ -245,11 +284,13 @@ impl MsgType {
             MsgType::RawPayloadOutput => MSG_TYPE_RAW_PAYLOAD_OUTPUT,
             MsgType::Profraw => MSG_TYPE_PROFRAW,
             MsgType::WprofTrace => MSG_TYPE_WPROF_TRACE,
+            MsgType::WprofTraceChunk => MSG_TYPE_WPROF_TRACE_CHUNK,
             MsgType::SnapshotRequest => MSG_TYPE_SNAPSHOT_REQUEST,
             MsgType::SnapshotReply => MSG_TYPE_SNAPSHOT_REPLY,
             MsgType::KernelOpRequest => MSG_TYPE_KERNEL_OP_REQUEST,
             MsgType::KernelOpReply => MSG_TYPE_KERNEL_OP_REPLY,
             MsgType::SysRdy => MSG_TYPE_SYS_RDY,
+            MsgType::SchedSwapNotify => MSG_TYPE_SCHED_SWAP_NOTIFY,
             MsgType::Stdout => MSG_TYPE_STDOUT,
             MsgType::Stderr => MSG_TYPE_STDERR,
             MsgType::SchedLog => MSG_TYPE_SCHED_LOG,
@@ -279,11 +320,13 @@ impl MsgType {
             MSG_TYPE_RAW_PAYLOAD_OUTPUT => Some(MsgType::RawPayloadOutput),
             MSG_TYPE_PROFRAW => Some(MsgType::Profraw),
             MSG_TYPE_WPROF_TRACE => Some(MsgType::WprofTrace),
+            MSG_TYPE_WPROF_TRACE_CHUNK => Some(MsgType::WprofTraceChunk),
             MSG_TYPE_SNAPSHOT_REQUEST => Some(MsgType::SnapshotRequest),
             MSG_TYPE_SNAPSHOT_REPLY => Some(MsgType::SnapshotReply),
             MSG_TYPE_KERNEL_OP_REQUEST => Some(MsgType::KernelOpRequest),
             MSG_TYPE_KERNEL_OP_REPLY => Some(MsgType::KernelOpReply),
             MSG_TYPE_SYS_RDY => Some(MsgType::SysRdy),
+            MSG_TYPE_SCHED_SWAP_NOTIFY => Some(MsgType::SchedSwapNotify),
             MSG_TYPE_STDOUT => Some(MsgType::Stdout),
             MSG_TYPE_STDERR => Some(MsgType::Stderr),
             MSG_TYPE_SCHED_LOG => Some(MsgType::SchedLog),
@@ -322,6 +365,10 @@ impl MsgType {
     ///   - [`MsgType::SysRdy`] — its only semantic is the eventfd
     ///     promotion that releases the monitor's pre-sample
     ///     `epoll_wait`.
+    ///   - [`MsgType::SchedSwapNotify`] — its only semantic is the
+    ///     synchronous periodic-capture accessor teardown the freeze
+    ///     coordinator performs on a CRC-valid frame; carries no test
+    ///     verdict.
     pub const fn is_coordinator_internal(self) -> bool {
         matches!(
             self,
@@ -330,6 +377,7 @@ impl MsgType {
                 | MsgType::KernelOpRequest
                 | MsgType::KernelOpReply
                 | MsgType::SysRdy
+                | MsgType::SchedSwapNotify
         )
     }
 }
@@ -449,6 +497,12 @@ pub const MSG_TYPE_PROFRAW: u32 = 0x5052_4157; // "PRAW"
 /// [`crate::test_support::sidecar_dir`] alongside the JSON dump.
 pub const MSG_TYPE_WPROF_TRACE: u32 = 0x5750_5246; // "WPRF"
 
+/// Guest→host wprof trace CHUNK (one ordered slice of a `.pb` too large
+/// for a single bulk frame; the stream is terminated by a
+/// [`MSG_TYPE_WPROF_TRACE`] frame carrying the final slice). See
+/// [`MsgType::WprofTraceChunk`].
+pub const MSG_TYPE_WPROF_TRACE_CHUNK: u32 = 0x5750_5243; // "WPRC"
+
 /// Guest→host on-demand snapshot request
 /// (payload: [`SnapshotRequestPayload`]).
 pub const MSG_TYPE_SNAPSHOT_REQUEST: u32 = 0x534e_5251; // "SNRQ"
@@ -465,6 +519,17 @@ pub const MSG_TYPE_SNAPSHOT_REPLY: u32 = 0x534e_5250; // "SNRP"
 /// `MSG_TYPE_SYS_RDY` frame into the monitor's boot-complete
 /// eventfd. See [`MsgType::SysRdy`] for the protocol contract.
 pub const MSG_TYPE_SYS_RDY: u32 = 0x5352_4459; // "SRDY"
+
+/// Guest→host scheduler-swap notification (payload: empty).
+///
+/// Tag spelled `"SCSW"` (SCheduler SWap) in hex digits; on-wire bytes
+/// (LE) are `0x57 0x53 0x43 0x53` (`"WSCS"` byte-by-byte). Emitted by
+/// the guest's `kill_current_scheduler` after `wait_for_scx_disabled`
+/// returns (so `*scx_root` is already NULL); the freeze coordinator
+/// synchronously invalidates the periodic-capture accessor on a
+/// CRC-valid frame. See [`MsgType::SchedSwapNotify`] for the protocol
+/// contract.
+pub const MSG_TYPE_SCHED_SWAP_NOTIFY: u32 = 0x5343_5357; // "SCSW"
 
 /// Guest→host stdout chunk (payload: opaque UTF-8 bytes).
 ///
@@ -878,7 +943,7 @@ pub const SNAPSHOT_REASON_MAX: usize = 512;
 pub const SNAPSHOT_KIND_NONE: u32 = 0;
 
 /// Snapshot request kind: capture-now. The host runs
-/// `freeze_and_capture(false)` and stores the resulting
+/// `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` and stores the resulting
 /// `FailureDumpReport` on the bridge keyed by the request tag.
 pub const SNAPSHOT_KIND_CAPTURE: u32 = 1;
 
@@ -1472,11 +1537,13 @@ mod tests {
             MSG_TYPE_RAW_PAYLOAD_OUTPUT,
             MSG_TYPE_PROFRAW,
             MSG_TYPE_WPROF_TRACE,
+            MSG_TYPE_WPROF_TRACE_CHUNK,
             MSG_TYPE_SNAPSHOT_REQUEST,
             MSG_TYPE_SNAPSHOT_REPLY,
             MSG_TYPE_KERNEL_OP_REQUEST,
             MSG_TYPE_KERNEL_OP_REPLY,
             MSG_TYPE_SYS_RDY,
+            MSG_TYPE_SCHED_SWAP_NOTIFY,
             MSG_TYPE_STDOUT,
             MSG_TYPE_STDERR,
             MSG_TYPE_SCHED_LOG,
@@ -1545,11 +1612,13 @@ mod tests {
             MsgType::RawPayloadOutput,
             MsgType::Profraw,
             MsgType::WprofTrace,
+            MsgType::WprofTraceChunk,
             MsgType::SnapshotRequest,
             MsgType::SnapshotReply,
             MsgType::KernelOpRequest,
             MsgType::KernelOpReply,
             MsgType::SysRdy,
+            MsgType::SchedSwapNotify,
             MsgType::Stdout,
             MsgType::Stderr,
             MsgType::SchedLog,
@@ -1602,6 +1671,10 @@ mod tests {
         assert_eq!(MsgType::Profraw.wire_value(), MSG_TYPE_PROFRAW);
         assert_eq!(MsgType::WprofTrace.wire_value(), MSG_TYPE_WPROF_TRACE);
         assert_eq!(
+            MsgType::WprofTraceChunk.wire_value(),
+            MSG_TYPE_WPROF_TRACE_CHUNK
+        );
+        assert_eq!(
             MsgType::SnapshotRequest.wire_value(),
             MSG_TYPE_SNAPSHOT_REQUEST
         );
@@ -1622,11 +1695,16 @@ mod tests {
         assert_eq!(MsgType::ExecExit.wire_value(), MSG_TYPE_EXEC_EXIT);
         assert_eq!(MsgType::Dmesg.wire_value(), MSG_TYPE_DMESG);
         assert_eq!(MsgType::ProbeOutput.wire_value(), MSG_TYPE_PROBE_OUTPUT);
+        assert_eq!(
+            MsgType::SchedSwapNotify.wire_value(),
+            MSG_TYPE_SCHED_SWAP_NOTIFY
+        );
     }
 
     /// `is_coordinator_internal` flips on for SnapshotRequest,
-    /// SnapshotReply, KernelOpRequest, KernelOpReply, and SysRdy
-    /// and stays off for every test-verdict-bearing variant. The
+    /// SnapshotReply, KernelOpRequest, KernelOpReply, SysRdy, and
+    /// SchedSwapNotify and stays off for every test-verdict-bearing
+    /// variant. The
     /// Reply variants are host→guest only on port-1 RX; a guest TX
     /// frame stamped with one of those tags is illegitimate and
     /// must be dropped rather than bucketed as a phantom verdict
@@ -1645,6 +1723,7 @@ mod tests {
             MsgType::KernelOpRequest,
             MsgType::KernelOpReply,
             MsgType::SysRdy,
+            MsgType::SchedSwapNotify,
         ];
         let verdict = [
             MsgType::Stimulus,
@@ -1661,6 +1740,7 @@ mod tests {
             MsgType::RawPayloadOutput,
             MsgType::Profraw,
             MsgType::WprofTrace,
+            MsgType::WprofTraceChunk,
             MsgType::Stdout,
             MsgType::Stderr,
             MsgType::SchedLog,
@@ -1681,6 +1761,21 @@ mod tests {
                 "{v:?} carries test verdict data and must NOT be filtered out"
             );
         }
+    }
+
+    /// `MsgType::SchedSwapNotify` round-trips `wire_value` →
+    /// `from_wire`, carries the stable `"SCSW"` (0x5343_5357)
+    /// discriminant, and is classified coordinator-internal so the
+    /// freeze coord's mid-run filter and `collect_results`'s post-run
+    /// drain both drop it rather than bucketing a phantom verdict.
+    #[test]
+    fn sched_swap_notify_round_trips() {
+        assert_eq!(
+            MsgType::from_wire(MsgType::SchedSwapNotify.wire_value()),
+            Some(MsgType::SchedSwapNotify)
+        );
+        assert_eq!(MsgType::SchedSwapNotify.wire_value(), 0x5343_5357);
+        assert!(MsgType::SchedSwapNotify.is_coordinator_internal());
     }
 
     /// `LifecyclePhase` round-trips through `wire_value` →

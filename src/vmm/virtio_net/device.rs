@@ -12,24 +12,22 @@ use virtio_bindings::virtio_config::{
     VIRTIO_CONFIG_S_FAILED, VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_CONFIG_S_NEEDS_RESET,
     VIRTIO_F_VERSION_1,
 };
-use virtio_bindings::virtio_ids::VIRTIO_ID_NET;
-use virtio_bindings::virtio_mmio::{
-    VIRTIO_MMIO_CONFIG_GENERATION, VIRTIO_MMIO_DEVICE_FEATURES, VIRTIO_MMIO_DEVICE_FEATURES_SEL,
-    VIRTIO_MMIO_DEVICE_ID, VIRTIO_MMIO_DRIVER_FEATURES, VIRTIO_MMIO_DRIVER_FEATURES_SEL,
-    VIRTIO_MMIO_INT_CONFIG, VIRTIO_MMIO_INT_VRING, VIRTIO_MMIO_INTERRUPT_ACK,
-    VIRTIO_MMIO_INTERRUPT_STATUS, VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_QUEUE_AVAIL_HIGH,
-    VIRTIO_MMIO_QUEUE_AVAIL_LOW, VIRTIO_MMIO_QUEUE_DESC_HIGH, VIRTIO_MMIO_QUEUE_DESC_LOW,
-    VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_MMIO_QUEUE_NUM, VIRTIO_MMIO_QUEUE_NUM_MAX,
-    VIRTIO_MMIO_QUEUE_READY, VIRTIO_MMIO_QUEUE_SEL, VIRTIO_MMIO_QUEUE_USED_HIGH,
-    VIRTIO_MMIO_QUEUE_USED_LOW, VIRTIO_MMIO_STATUS, VIRTIO_MMIO_VENDOR_ID, VIRTIO_MMIO_VERSION,
+// Only the two interrupt-status bits the core sets (`signal_used` /
+// `signal_queue_poisoned`) remain here; the MMIO register-offset
+// constants moved to the `mmio` facade with `mmio_read`/`mmio_write`.
+use virtio_bindings::virtio_mmio::{VIRTIO_MMIO_INT_CONFIG, VIRTIO_MMIO_INT_VRING};
+use virtio_bindings::virtio_net::{
+    VIRTIO_NET_CTRL_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MIN, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
+    VIRTIO_NET_ERR, VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_MAC, VIRTIO_NET_F_MQ, VIRTIO_NET_OK,
 };
-use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 use virtio_queue::{DescriptorChain, Error as VirtioQueueError, Queue, QueueOwnedT, QueueT};
 use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::counters::VirtioNetCounters;
+use crate::vmm::PiMutex;
 use crate::vmm::net_config::NetConfig;
+use crate::vmm::virtio_msix::{IrqSource, MsixState};
 
 pub(crate) const MMIO_MAGIC: u32 = 0x7472_6976; // "virt" in LE
 pub(crate) const MMIO_VERSION: u32 = 2; // virtio 1.x MMIO
@@ -40,12 +38,32 @@ pub(crate) const VENDOR_ID: u32 = 0;
 /// `exit_dispatch` can use a single constant per device class.
 pub const VIRTIO_MMIO_SIZE: u64 = 0x1000;
 
-/// Two queues: RX index 0, TX index 1. Order is the kernel's
-/// `init_vqs` order (`drivers/net/virtio_net.c`); changing the order
-/// would have the guest probe mismatched queues.
+/// Virtqueue layout: data queues interleave per the kernel `init_vqs`
+/// order (`drivers/net/virtio_net.c` rxq2vq/txq2vq) — pair `i` has its RX
+/// at even index `2i` and TX at odd index `2i+1`; multiqueue
+/// (`NetConfig::queue_pairs > 1`) adds a trailing control vq at index
+/// `2 * queue_pairs`. `NUM_QUEUES` is the single-pair baseline (RX 0 +
+/// TX 1, no control vq) — the device default; the live per-device queue
+/// count is `VirtioNet::queues.len()`, and the MSI-X table is sized from it
+/// (`num_queues + 1`: one vector per virtqueue plus config).
 pub(crate) const NUM_QUEUES: usize = 2;
 pub(crate) const QUEUE_MAX_SIZE: u16 = 256;
+/// Maximum queue-pairs a NIC may offer; `NetConfig::queue_pairs` is clamped to
+/// `[1, MAX_QUEUE_PAIRS]`. Bounds the virtqueue count so the highest virtqueue
+/// INDEX — the control vq at `2 * queue_pairs` (= 512 at the cap) — stays within
+/// the PCI notify region (`pci::REGION_SIZE / pci::NOTIFY_OFF_MULTIPLIER` = 1024
+/// slots) and keeps the per-device queue allocation sane. 256 pairs is 513
+/// virtqueues TOTAL (2*256 data + 1 control; top index 512), far exceeding
+/// realistic per-node steering needs while leaving notify-region headroom.
+pub(crate) const MAX_QUEUE_PAIRS: u16 = 256;
+
+/// Single-pair (pair 0) RX/TX virtqueue indices — RX at 0, TX at 1. Used by
+/// the unit tests, which exercise the single-pair loopback path; production
+/// code computes per-pair indices (`2*pair` / `2*pair+1`) in
+/// `process_tx_loopback`, so these constants are test-only.
+#[cfg(test)]
 pub(crate) const RXQ: usize = 0;
+#[cfg(test)]
 pub(crate) const TXQ: usize = 1;
 
 /// Header length the guest expects on every RX delivery and emits on
@@ -132,8 +150,12 @@ pub(crate) struct VirtioNetConfig {
     /// status"). The field stays zero in this struct; reads past the
     /// populated layout return zero anyway.
     pub(crate) status: u16,
-    /// Multiqueue pair count. Gated on `VIRTIO_NET_F_MQ`. v0 does NOT
-    /// advertise MQ, so this field is unread.
+    /// Multiqueue pair count. Gated on `VIRTIO_NET_F_MQ`. Populated with the
+    /// offered `queue_pairs` when multiqueue is advertised (`queue_pairs > 1`
+    /// on an MSI-X transport — see `device_features`); the guest reads it at
+    /// probe (`virtnet_probe`, gated on F_MQ) to size its queue set. Left zero
+    /// for a single-pair device, where F_MQ is not advertised so the field is
+    /// unread (don't populate config space for an unadvertised feature).
     pub(crate) max_virtqueue_pairs: u16,
     /// Initial MTU. Gated on `VIRTIO_NET_F_MTU`. v0 does NOT advertise
     /// MTU, so this field is unread.
@@ -183,7 +205,29 @@ const _: () = assert!(VIRTIO_NET_CONFIG_SIZE == 12);
 /// inside `mmio_write(QUEUE_NOTIFY)`. See parent module docs for the
 /// no-worker-thread rationale.
 pub struct VirtioNet {
-    queues: [Queue; NUM_QUEUES],
+    /// Data + control virtqueues. Length is `2 * queue_pairs` (the data
+    /// vqs) plus one trailing control vq when multiqueue is offered
+    /// (`queue_pairs > 1`). Data vqs are interleaved per the kernel
+    /// `rxq2vq`/`txq2vq` ordering (`drivers/net/virtio_net.c`): vq `2i` =
+    /// RX of pair `i`, vq `2i+1` = TX of pair `i`; the control vq, when
+    /// present, is the last index (`2 * queue_pairs`). A `Vec` rather than
+    /// a fixed array because the pair count is per-device
+    /// (`NetConfig::queue_pairs`). For the default single pair the layout
+    /// is byte-identical to the pre-multiqueue device: `[RX(0), TX(1)]`,
+    /// no control vq.
+    queues: Vec<Queue>,
+    /// Queue-pairs offered to the guest (`NetConfig::queue_pairs`, clamped
+    /// to `>= 1`). Reported in config space as `max_virtqueue_pairs` and
+    /// gates `VIRTIO_NET_F_MQ` + `VIRTIO_NET_F_CTRL_VQ` (offered only when
+    /// `> 1`). The guest reads this at probe and commits to
+    /// `min(num_online_cpus, queue_pairs)` pairs.
+    queue_pairs: u16,
+    /// Active queue-pair count, set by the guest via the control vq
+    /// (`VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET`). Starts at `1` (virtio-net's
+    /// probe default — the guest sends `VQ_PAIRS_SET` to raise it) and is
+    /// bounded to `[1, queue_pairs]` by the cvq consumer. A kick on a TX
+    /// queue of an inactive pair (`>= curr_queue_pairs`) is inert.
+    curr_queue_pairs: u16,
     queue_select: u32,
     device_features_sel: u32,
     driver_features_sel: u32,
@@ -238,8 +282,17 @@ pub struct VirtioNet {
     /// if `VIRTIO_NET_F_STATUS` is later advertised) requires
     /// generation tracking off the vCPU thread.
     config_generation: u32,
-    /// Eventfd for KVM irqfd — signals guest interrupt.
+    /// Eventfd for KVM irqfd — signals guest interrupt on the INTx path.
     irq_evt: EventFd,
+    /// Shared MSI-X delivery state, `Some` only on the PCI transport once the
+    /// facade installs it via [`Self::set_msix_state`]; `None` for virtio-MMIO
+    /// and aarch64 (INTx-only). When `Some` AND [`MsixState::enabled`], the
+    /// signal paths route the interrupt through the guest-assigned MSI-X vector
+    /// instead of `irq_evt`. Shared (`Arc<PiMutex<…>>`) with the PCI facade,
+    /// which mutates it from config-space decode and owns the KVM GSI-route side;
+    /// the lock is uncontended in practice — every access (facade config writes
+    /// and these core signals) is on the vCPU thread under the `PciBus` lock.
+    msix: Option<Arc<PiMutex<MsixState>>>,
     /// Guest memory reference. Set once at VM init by `set_mem` before
     /// any vCPU runs (and therefore before any QUEUE_NOTIFY can fire).
     /// Wrapped in `Arc<OnceLock<…>>` to mirror virtio-blk's pattern:
@@ -260,10 +313,11 @@ pub struct VirtioNet {
     /// buggy caller that issues N notifies before `set_mem` would
     /// flood the log with N copies of the same line.
     mem_unset_warned: Arc<AtomicBool>,
-    /// Static config-space content (mac + zeroed STATUS/MQ/MTU).
-    /// Built at construction from `NetConfig`; the bytes are
-    /// `byte_valued` and copied directly into the MMIO read response
-    /// when the guest reads at offsets `0x100..0x100+config_size`.
+    /// Static config-space content: mac, plus `max_virtqueue_pairs` when
+    /// multiqueue is offered (`queue_pairs > 1`); STATUS/MTU stay zero (those
+    /// features are not advertised). Built at construction from `NetConfig`;
+    /// the bytes are `byte_valued` and copied directly into the MMIO read
+    /// response when the guest reads at offsets `0x100..0x100+config_size`.
     config: VirtioNetConfig,
     /// Cumulative event counters. `Arc` so external monitor observers
     /// can read them without holding any device borrow.
@@ -277,7 +331,7 @@ pub struct VirtioNet {
     tx_frame_scratch: Vec<u8>,
     /// Per-queue sticky "this queue's avail-ring iterator is
     /// structurally broken; stop calling `iter()` on it" flags,
-    /// indexed by `RXQ` / `TXQ`. Set ONLY when the corresponding
+    /// indexed by virtqueue index. Set ONLY when the corresponding
     /// queue's avail-ring iterator returns `Err(_)` — most commonly
     /// `Error::InvalidAvailRingIndex` (avail.idx more than
     /// `queue.size` ahead of `next_avail`, virtio-v1.2 §2.7.13.3
@@ -342,7 +396,7 @@ pub struct VirtioNet {
     /// the drain off-thread would need to convert these flags
     /// (along with `device_status` and `interrupt_status`) to
     /// atomic types as part of that migration.
-    queue_poisoned: [bool; NUM_QUEUES],
+    queue_poisoned: Vec<bool>,
 }
 
 impl VirtioNet {
@@ -350,11 +404,25 @@ impl VirtioNet {
     pub fn new(config: NetConfig) -> Self {
         let irq_evt =
             EventFd::new(libc::EFD_NONBLOCK).expect("failed to create virtio-net irq eventfd");
+        // Clamp to [spec minimum (VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MIN = 1),
+        // MAX_QUEUE_PAIRS] — a 0 becomes a single pair; an over-large request
+        // is bounded so the queue allocation and the highest notify offset stay
+        // within range.
+        let queue_pairs = config.queue_pairs.clamp(1, MAX_QUEUE_PAIRS);
+        // 2 data vqs per pair (interleaved RX/TX), plus one control vq when
+        // multiqueue is offered (queue_pairs > 1 → F_CTRL_VQ). The single-pair
+        // default builds exactly [RX(0), TX(1)] — byte-identical to the
+        // pre-multiqueue device, no control vq.
+        let num_queues = queue_pairs as usize * 2 + usize::from(queue_pairs > 1);
+        let queues: Vec<Queue> = (0..num_queues)
+            .map(|_| Queue::new(QUEUE_MAX_SIZE).expect("valid queue size"))
+            .collect();
         VirtioNet {
-            queues: [
-                Queue::new(QUEUE_MAX_SIZE).expect("valid queue size"),
-                Queue::new(QUEUE_MAX_SIZE).expect("valid queue size"),
-            ],
+            queues,
+            queue_pairs,
+            // virtio-net's probe default; the guest raises it via the control
+            // vq (VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET).
+            curr_queue_pairs: 1,
             queue_select: 0,
             device_features_sel: 0,
             driver_features_sel: 0,
@@ -363,23 +431,36 @@ impl VirtioNet {
             interrupt_status: 0,
             config_generation: 0,
             irq_evt,
+            msix: None,
             mem: Arc::new(OnceLock::new()),
             mem_unset_warned: Arc::new(AtomicBool::new(false)),
             config: VirtioNetConfig {
                 mac: config.mac,
                 status: 0,
-                max_virtqueue_pairs: 0,
+                // Valid only under VIRTIO_NET_F_MQ (offered iff > 1). For a
+                // single pair the bit is not advertised, so the guest never
+                // reads this field — zero is correct (don't populate config
+                // space for an unadvertised feature).
+                max_virtqueue_pairs: if queue_pairs > 1 { queue_pairs } else { 0 },
                 mtu: 0,
             },
             counters: Arc::new(VirtioNetCounters::default()),
             tx_frame_scratch: Vec::with_capacity(MAX_FRAME_SIZE),
-            queue_poisoned: [false; NUM_QUEUES],
+            queue_poisoned: vec![false; num_queues],
         }
     }
 
     /// Eventfd for KVM irqfd registration.
     pub fn irq_evt(&self) -> &EventFd {
         &self.irq_evt
+    }
+
+    /// Install the shared MSI-X delivery state (PCI transport only). The facade
+    /// holds the other `Arc` clone and configures it from config-space writes;
+    /// the core reaches it from the signal paths when MSI-X is enabled. INTx
+    /// transports (virtio-MMIO, aarch64) never call this and stay `None`.
+    pub(crate) fn set_msix_state(&mut self, msix: Arc<PiMutex<MsixState>>) {
+        self.msix = Some(msix);
     }
 
     /// Set guest memory reference. Must be called before starting
@@ -407,6 +488,595 @@ impl VirtioNet {
         Arc::clone(&self.counters)
     }
 
+    // ===================== transport-neutral core API =====================
+    //
+    // Semantic register/queue operations shared by every transport
+    // facade (virtio-MMIO in `mmio.rs`, virtio-pci-modern in `pci.rs`).
+    // Each method is ONE logical operation with its spec gate
+    // (`queue_config_allowed` / `features_write_allowed`) applied
+    // INSIDE the method, so a facade can never bypass a gate by poking
+    // a field — the fields stay private to this module and the facades
+    // (sibling submodules) reach them only through these `pub(crate)`
+    // ops. Facades own only the transport-specific decode (which
+    // offset / cap field maps to which op, and the access width); ALL
+    // device behaviour (the status FSM, feature negotiation, queue ring
+    // assembly, notify, interrupt bookkeeping) lives here exactly once,
+    // so the two transports cannot drift.
+
+    /// Current device-status FSM bits (virtio-v1.2 §2.1).
+    pub(crate) fn device_status(&self) -> u32 {
+        self.device_status
+    }
+
+    /// Pending interrupt-status bits (cleared by [`Self::ack_interrupt`]).
+    pub(crate) fn interrupt_status(&self) -> u32 {
+        self.interrupt_status
+    }
+
+    /// Config-space generation counter (v0 holds zero — see the field).
+    pub(crate) fn config_generation(&self) -> u32 {
+        self.config_generation
+    }
+
+    /// Number of virtqueues the device exposes: `2 * queue_pairs` data
+    /// queues, plus a trailing control vq when multiqueue is offered
+    /// (`queue_pairs > 1`). The PCI common-cfg `num_queues` register serves
+    /// this (see the facade's `CC_NUM_QUEUES`) so the guest sets up exactly
+    /// the virtqueues that exist.
+    pub(crate) fn num_queues(&self) -> usize {
+        self.queues.len()
+    }
+
+    /// Active queue-pair count (`curr_queue_pairs`). Starts at 1 and is only
+    /// raised by a well-formed `VQ_PAIRS_SET` on the control vq, bounded to
+    /// `[1, queue_pairs]` by [`Self::eval_ctrl_chain`]. Test-only window onto
+    /// the invariant that hostile control-vq input can never push it out of
+    /// range (exercised by the cvq chain-mutation proptest).
+    #[cfg(test)]
+    pub(crate) fn curr_queue_pairs(&self) -> u16 {
+        self.curr_queue_pairs
+    }
+
+    /// Offered device features for the latched select window
+    /// (`device_features_sel`): window 0 = bits 0..31, window 1 = bits
+    /// 32..63, any other window = 0. The guest writes the select
+    /// register then reads this window.
+    pub(crate) fn device_features_window(&self) -> u32 {
+        match self.device_features_sel {
+            0 => self.device_features() as u32,
+            1 => (self.device_features() >> 32) as u32,
+            _ => 0,
+        }
+    }
+
+    /// Immutable max ring size of the selected queue (0 if the selector is out
+    /// of range). This is the advertised ceiling, NOT the guest-configured size
+    /// — the PCI common-cfg `queue_size` register serves [`Self::queue_size`]
+    /// (the configured value), not this. Used only to seed the reset value.
+    pub(crate) fn queue_max_size(&self) -> u32 {
+        self.selected_queue()
+            .map(|i| self.queues[i].max_size() as u32)
+            .unwrap_or(0)
+    }
+
+    /// Actual ring size the guest configured for the selected queue (0 if the
+    /// selector is out of range). The virtio-pci common-cfg `queue_size`
+    /// register is read-write (virtio-v1.2 §4.1.4.3): `virtio_queue::Queue`
+    /// initializes and resets it to `max_size` (queue.rs:288/353) and
+    /// `set_size` stores the guest's value, so a read-back returns the
+    /// currently-configured size — what the PCI facade must serve, not the
+    /// immutable max.
+    pub(crate) fn queue_size(&self) -> u32 {
+        self.selected_queue()
+            .map(|i| self.queues[i].size() as u32)
+            .unwrap_or(0)
+    }
+
+    /// Ready flag of the selected queue (0 if the selector is out of range).
+    pub(crate) fn queue_ready(&self) -> u32 {
+        self.selected_queue()
+            .map(|i| self.queues[i].ready() as u32)
+            .unwrap_or(0)
+    }
+
+    /// `queue_notify_off` for the selected queue: notify offsets map in queue
+    /// order, so it equals the (in-range) selector index, and 0 for an
+    /// out-of-range selector. Clamped — unlike the raw `queue_select`
+    /// read-back — so a guest that latched a bogus selector cannot read back a
+    /// notify offset outside the advertised range and compute a wild notify
+    /// address. The out-of-range clamp value (0) aliases queue 0's (RX) real
+    /// offset; this is harmless because safety rests on `notify_queue` driving
+    /// the loopback only for a TX-queue kick on an active pair, not on this
+    /// read-back value — a guest reading back 0 cannot drive a stray drain.
+    /// The returned index pairs with
+    /// `pci::NOTIFY_OFF_MULTIPLIER` (wire address = index × multiplier).
+    pub(crate) fn queue_notify_off(&self) -> u32 {
+        self.selected_queue().map(|i| i as u32).unwrap_or(0)
+    }
+
+    /// Selected queue's assembled 64-bit (desc, avail, used) ring addresses,
+    /// or `None` if the selector is out of range. The PCI common-cfg programs
+    /// each as two 32-bit halves (LO then HI via the kernel's
+    /// `vp_iowrite64_twopart`); this reads back the merged values so a test
+    /// can pin that the high dword lands in the high 32 bits (not dropped or
+    /// swapped with the low half). Test-only: the production transports never
+    /// read the ring addresses back (the guest owns them), so this would be
+    /// dead code outside `cfg(test)`.
+    #[cfg(test)]
+    pub(crate) fn selected_queue_ring_addrs(&self) -> Option<(u64, u64, u64)> {
+        self.selected_queue().map(|i| {
+            (
+                self.queues[i].desc_table(),
+                self.queues[i].avail_ring(),
+                self.queues[i].used_ring(),
+            )
+        })
+    }
+
+    /// Latched device-feature-select window — read back by the PCI
+    /// common-cfg `device_feature_select` register (the MMIO transport
+    /// never reads it back, but the PCI facade serves a register read).
+    pub(crate) fn device_features_sel(&self) -> u32 {
+        self.device_features_sel
+    }
+
+    /// Latched driver-feature-select window — read back by the PCI
+    /// common-cfg `driver_feature_select` register.
+    pub(crate) fn driver_features_sel(&self) -> u32 {
+        self.driver_features_sel
+    }
+
+    /// Latched queue selector. The PCI common-cfg `queue_select`
+    /// read-back returns it, and `queue_notify_off` equals it (notify
+    /// offsets map in queue order, so the selected queue's notify
+    /// offset is its index).
+    pub(crate) fn queue_select(&self) -> u32 {
+        self.queue_select
+    }
+
+    /// Copy `data.len()` bytes of device config space starting at byte
+    /// `offset` (offset 0 = `mac[0]`). Reads past the populated layout
+    /// return zero (virtio-v1.2 §4.2.2.2).
+    pub(crate) fn config_bytes(&self, offset: usize, data: &mut [u8]) {
+        // SAFETY: `VirtioNetConfig` is `ByteValued` — every bit pattern
+        // of the underlying bytes is a valid value, so viewing it as a
+        // byte slice is sound.
+        let config_bytes = self.config.as_slice();
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte = config_bytes.get(offset + i).copied().unwrap_or(0);
+        }
+    }
+
+    /// Latch the device-feature-select window index (ungated).
+    pub(crate) fn set_device_features_sel(&mut self, sel: u32) {
+        self.device_features_sel = sel;
+    }
+
+    /// Latch the driver-feature-select window index (ungated).
+    pub(crate) fn set_driver_features_sel(&mut self, sel: u32) {
+        self.driver_features_sel = sel;
+    }
+
+    /// Latch the queue selector (ungated).
+    pub(crate) fn set_queue_select(&mut self, sel: u32) {
+        self.queue_select = sel;
+    }
+
+    /// Merge `val` into the negotiated driver features at the latched
+    /// driver-feature-select window. No-op once features are locked
+    /// (`features_write_allowed` false), per virtio-v1.2 §3.1.1.
+    pub(crate) fn set_driver_features_window(&mut self, val: u32) {
+        if !self.features_write_allowed() {
+            return;
+        }
+        match self.driver_features_sel {
+            0 => self.driver_features = (self.driver_features & 0xFFFF_FFFF_0000_0000) | val as u64,
+            1 => {
+                self.driver_features =
+                    (self.driver_features & 0x0000_0000_FFFF_FFFF) | ((val as u64) << 32)
+            }
+            _ => {}
+        }
+    }
+
+    /// Set the selected queue's ring size. Gated on
+    /// `queue_config_allowed` (pre-DRIVER_OK only); ignored otherwise.
+    pub(crate) fn set_queue_size(&mut self, size: u16) {
+        if !self.queue_config_allowed() {
+            return;
+        }
+        if let Some(i) = self.selected_queue() {
+            self.queues[i].set_size(size);
+        }
+    }
+
+    /// Set the selected queue's ready flag. Gated on
+    /// `queue_config_allowed`; ignored otherwise.
+    pub(crate) fn set_queue_ready(&mut self, ready: bool) {
+        if !self.queue_config_allowed() {
+            return;
+        }
+        if let Some(i) = self.selected_queue() {
+            self.queues[i].set_ready(ready);
+        }
+    }
+
+    /// Set the selected queue's descriptor-table address (low and/or
+    /// high 32 bits; `None` leaves that half unchanged). Gated on
+    /// `queue_config_allowed`; ignored otherwise.
+    pub(crate) fn set_queue_desc_addr(&mut self, lo: Option<u32>, hi: Option<u32>) {
+        if !self.queue_config_allowed() {
+            return;
+        }
+        if let Some(i) = self.selected_queue() {
+            self.queues[i].set_desc_table_address(lo, hi);
+        }
+    }
+
+    /// Set the selected queue's avail-ring (driver-area) address.
+    /// Gated on `queue_config_allowed`; ignored otherwise.
+    pub(crate) fn set_queue_avail_addr(&mut self, lo: Option<u32>, hi: Option<u32>) {
+        if !self.queue_config_allowed() {
+            return;
+        }
+        if let Some(i) = self.selected_queue() {
+            self.queues[i].set_avail_ring_address(lo, hi);
+        }
+    }
+
+    /// Set the selected queue's used-ring (device-area) address. Gated
+    /// on `queue_config_allowed`; ignored otherwise.
+    pub(crate) fn set_queue_used_addr(&mut self, lo: Option<u32>, hi: Option<u32>) {
+        if !self.queue_config_allowed() {
+            return;
+        }
+        if let Some(i) = self.selected_queue() {
+            self.queues[i].set_used_ring_address(lo, hi);
+        }
+    }
+
+    /// Notify the device that the guest kicked queue `queue_idx`.
+    ///
+    /// Data virtqueues interleave per the kernel rxq2vq/txq2vq ordering: RX
+    /// of pair `i` at even index `2i`, TX at odd `2i+1`. Only a TX kick
+    /// drives the loopback (TX→RX of the same pair); an RX kick is a no-op
+    /// (the next TX picks up newly posted RX buffers). A TX kick on an
+    /// inactive pair (`pair >= curr_queue_pairs`) is inert: the guest must
+    /// not transmit on a pair it has not activated via the control vq
+    /// (`VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET`), and the legacy-INTx
+    /// single-asserter invariant (see the PCI facade module doc) requires no
+    /// second independent TX asserter. The control vq — present only when
+    /// multiqueue is offered (`queue_pairs > 1`) — is the trailing index
+    /// (`2 * queue_pairs`) and routes to [`Self::process_ctrl_queue`].
+    pub(crate) fn notify_queue(&mut self, queue_idx: u32) {
+        let idx = queue_idx as usize;
+        // Control vq (offered iff multiqueue): the trailing index.
+        if self.queue_pairs > 1 && idx == self.queue_pairs as usize * 2 {
+            self.process_ctrl_queue();
+            return;
+        }
+        // Data vq: a TX kick (odd index) on an active pair drives the
+        // loopback. RX kicks (even) and inactive / out-of-range pairs are
+        // no-ops (the `pair < curr_queue_pairs` gate bounds the index).
+        if idx % 2 == 1 {
+            let pair = idx / 2;
+            if pair < self.curr_queue_pairs as usize {
+                self.process_tx_loopback(pair);
+            }
+        }
+    }
+
+    /// Process the control virtqueue (index `2 * queue_pairs`, present only
+    /// when multiqueue is offered). The sole command class v1 handles is
+    /// `VIRTIO_NET_CTRL_MQ` / `VQ_PAIRS_SET`, which sets the active
+    /// queue-pair count (`curr_queue_pairs`).
+    ///
+    /// Chain layout (`struct virtio_net_ctrl_hdr` uapi doc + virtio-v1.2
+    /// §5.1.6.5.1): the header is the first sg entry and the ack/status the
+    /// LAST, command data in between. `virtnet_send_command_reply`
+    /// (drivers/net/virtio_net.c) builds three descriptors — readable hdr
+    /// (`class u8`, `cmd u8`), readable payload (`virtio_net_ctrl_mq`:
+    /// `virtqueue_pairs __virtio16`, LE under VERSION_1), writable status
+    /// (`u8`). The guest confirms by polling the cvq used ring
+    /// (`virtnet_send_command_reply`, :3579) then reading
+    /// `status == VIRTIO_NET_OK`, so the device MUST write the status byte and
+    /// `add_used` is gated on that write succeeding (the F15 rule — never
+    /// publish a chain whose status the guest cannot observe). The
+    /// `curr_queue_pairs` state change is likewise applied ONLY after a
+    /// successful `add_used`, so device and guest never disagree on the active
+    /// count. Processing is gated on the guest having negotiated
+    /// `VIRTIO_NET_F_CTRL_VQ` (the feature the cvq embodies) in addition to
+    /// DRIVER_OK.
+    ///
+    /// Hostile-input defense, three classes:
+    ///   - bad COMMAND (too few readable bytes, unknown `(class, cmd)`, or
+    ///     `virtqueue_pairs` outside `[1, queue_pairs]`) → `VIRTIO_NET_ERR` via
+    ///     the status descriptor, `curr_queue_pairs` unchanged. Recoverable; no
+    ///     NEEDS_RESET (qemu NAKs these too).
+    ///   - no device-writable status descriptor → dropped WITHOUT `add_used`
+    ///     (F15); the cvq stays usable for the next command. Recoverable; no
+    ///     NEEDS_RESET (a documented divergence from qemu, which `virtio_error`s
+    ///     this — see `eval_ctrl_chain`).
+    ///   - dead RING (`iter()` structural error) → poison + NEEDS_RESET (the
+    ///     device-death class, matching the data path and qemu's structural
+    ///     `virtio_error`).
+    ///
+    /// Never an out-of-bounds read or write. Matches cloud-hypervisor's
+    /// validate-then-ACK control-queue model.
+    fn process_ctrl_queue(&mut self) {
+        // DRIVER_OK gate (as in process_tx_loopback): ignore a kick before
+        // the driver finished initialisation.
+        if self.device_status & VIRTIO_CONFIG_S_DRIVER_OK == 0 {
+            return;
+        }
+        // F_CTRL_VQ gate: the control vq IS that feature, so process it only if
+        // the guest negotiated the bit. A guest that accepted F_MQ but declined
+        // F_CTRL_VQ (non-conformant — virtnet BUG_ONs without it) has no cvq, so
+        // a kick at this index is spurious; ignore it rather than act on a
+        // feature the guest did not negotiate. (Harmless even unguarded —
+        // validate+ack only, and the curr_queue_pairs mutation is gated on a
+        // successful publish below — but the device must honor the negotiated
+        // feature set.)
+        if self.driver_features & (1u64 << VIRTIO_NET_F_CTRL_VQ) == 0 {
+            return;
+        }
+        let cvq_idx = self.queue_pairs as usize * 2;
+        // Clone the `Arc<OnceLock>` once (a cheap atomic bump) so the borrow
+        // of guest memory does not freeze the rest of `self` — same pattern
+        // as `process_tx_loopback`.
+        let mem_arc = Arc::clone(&self.mem);
+        let Some(mem) = mem_arc.get() else {
+            return;
+        };
+        // The control vq is poisoned like any data queue: a structural
+        // iter() error is non-recoverable until a guest virtio reset.
+        if self.queue_poisoned[cvq_idx] {
+            return;
+        }
+        let mut had_used_ring_publish = false;
+        // The false->true cvq-poison transition observed during THIS drain (a
+        // structural iter() error). Mirrors the data path's tx/rx_just_poisoned:
+        // the NEEDS_RESET signal fires once per transition, post-loop, AFTER any
+        // pending used-ring publishes. The entry gate above (`queue_poisoned[cvq_idx]`
+        // early-return) already makes a re-kick on an already-poisoned cvq a no-op,
+        // so reaching the poison arm IS the transition.
+        let mut cvq_just_poisoned = false;
+        loop {
+            // Two-step iter()-then-drop pop, mirroring `pop_and_capture_tx`
+            // so the queue borrow is scoped to one statement.
+            enum IterStep<C> {
+                Chain(C),
+                Empty,
+                Poisoned(VirtioQueueError),
+            }
+            let step: IterStep<_> = {
+                let q = &mut self.queues[cvq_idx];
+                match q.iter(mem) {
+                    Ok(mut it) => match it.next() {
+                        Some(c) => IterStep::Chain(c),
+                        None => IterStep::Empty,
+                    },
+                    Err(e) => IterStep::Poisoned(e),
+                }
+            };
+            let chain = match step {
+                IterStep::Empty => break,
+                IterStep::Poisoned(err) => {
+                    // A structural iter() error (corrupt avail/desc ring)
+                    // permanently disables the control vq — every later iter()
+                    // would re-error. Poison it (same rule as the data queues;
+                    // cloud-hypervisor convergence) AND set NEEDS_RESET post-loop
+                    // (status bit only — `mark_needs_reset`; the data path fires
+                    // the full `signal_queue_poisoned`, but the cvq is polled so
+                    // the inert config interrupt is skipped). This is the SAME
+                    // device-death class qemu signals: its virtqueue_pop routes
+                    // every structural ring fault through virtio_error →
+                    // VIRTIO_CONFIG_S_NEEDS_RESET (hw/virtio/virtio.c). A STATUS
+                    // read then sees the device needs reset. (The guest's cvq
+                    // poller spins on virtqueue_is_broken, NOT device_status, so
+                    // this does not unblock a self-corrupted-ring guest — it is
+                    // the honest host-visible signal + data-path parity, not a
+                    // hang fix.) This differs from a malformed *command*
+                    // (eval_ctrl_chain → VIRTIO_NET_ERR) and a no-writable-status
+                    // *chain* (dropped, ring still usable): those are recoverable
+                    // and do NOT set NEEDS_RESET — only a dead ring does.
+                    self.queue_poisoned[cvq_idx] = true;
+                    self.counters.record_invalid_avail_idx();
+                    cvq_just_poisoned = true;
+                    tracing::warn!(
+                        err = %err,
+                        "virtio-net control-vq iter() failed; poisoning + \
+                         NEEDS_RESET until guest reset (any structural queue \
+                         error is non-recoverable)"
+                    );
+                    break;
+                }
+                IterStep::Chain(c) => c,
+            };
+            let head = chain.head_index();
+            // Parse + validate the chain off the queue borrow.
+            let Some((status_addr, ack, new_pairs)) = self.eval_ctrl_chain(chain, mem) else {
+                // No device-writable status descriptor: the guest posted no
+                // buffer to observe a reply, so the F15 rule forbids add_used.
+                // Drop the chain (it stays owned by the device until reset).
+                self.counters.record_ctrl_chain_invalid();
+                continue;
+            };
+            // Write the 1-byte ack BEFORE add_used — the guest reads its
+            // status from this descriptor.
+            if let Err(e) = mem.write_slice(&[ack], status_addr) {
+                // Status GPA unmapped: do NOT add_used (the guest can't see
+                // the reply). Queue-state breakage, not a malformed request.
+                self.counters.record_ctrl_add_used_failure();
+                tracing::warn!(
+                    %e,
+                    "virtio-net control-vq status write failed (unmapped GPA); \
+                     dropping chain"
+                );
+                continue;
+            }
+            // A rejected command (NAK) is the event regardless of whether the
+            // status publish lands — distinct from a publish failure, and both
+            // can co-occur on a malformed-AND-unmapped chain (mirrors the data
+            // path's rx_chain_invalid + rx_add_used_failures). Count it now.
+            if new_pairs.is_none() {
+                self.counters.record_ctrl_chain_invalid();
+            }
+            // Publish: the device wrote 1 byte (the status) to a writable
+            // descriptor, so used.len = 1 (virtio-v1.2 §2.7.8.2). The guest
+            // confirms a control command by polling the cvq USED RING
+            // (virtnet_send_command_reply, drivers/net/virtio_net.c:3579 —
+            // `while (!virtqueue_get_buf(cvq) ...)`) and only then reads the
+            // status byte. So the active-pair-count state change is applied
+            // ONLY after a successful add_used: a failed publish means the guest
+            // never observes completion, and committing curr_queue_pairs there
+            // would leave device and guest disagreeing on the active count.
+            // Mirrors tx_add_used, which bumps tx_packets only on add_used Ok.
+            match self.queues[cvq_idx].add_used(mem, head, 1) {
+                Ok(()) => {
+                    had_used_ring_publish = true;
+                    if let Some(pairs) = new_pairs {
+                        self.curr_queue_pairs = pairs;
+                        self.counters.record_ctrl_mq_set();
+                    }
+                }
+                Err(e) => {
+                    self.counters.record_ctrl_add_used_failure();
+                    tracing::warn!(
+                        head,
+                        %e,
+                        "virtio-net control-vq add_used failed (used-ring \
+                         address unmapped)"
+                    );
+                }
+            }
+        }
+        // `virtnet_send_command` polls the control-vq used ring (it does not
+        // block on an interrupt), so a signal is not required for
+        // correctness; fire one when the used ring advanced for parity with
+        // the data path (and so a guest that armed the cvq callback wakes).
+        // Ordered BEFORE the poison signal so the guest observes any prior
+        // completions before the device-death notice.
+        if had_used_ring_publish {
+            self.signal_used(cvq_idx);
+        }
+        // Structural-poison device-death signal: set NEEDS_RESET, STATUS-BIT
+        // ONLY, once per false->true transition. Status-only (not the data
+        // path's full signal_queue_poisoned) because the cvq is POLLED — the
+        // guest spins on the cvq used ring (virtnet_send_command_reply) and arms
+        // no cvq callback, so the INT_CONFIG/irqfd kick would wake nothing and
+        // only fire the shared vring vector spuriously. A STATUS read still sees
+        // the device-death state (data-path + qemu parity). Ordered after
+        // signal_used so any prior completions are visible first. Only the
+        // dead-ring case reaches here; a malformed command (NAK) or a
+        // no-writable-status drop leaves the cvq usable and does not signal.
+        if cvq_just_poisoned {
+            self.mark_needs_reset();
+        }
+    }
+
+    /// Walk a control-vq `chain`: collect the leading readable command bytes
+    /// (header + payload) and locate the first device-writable status
+    /// descriptor. Returns `Some((status_addr, ack, new_pairs))` — the GPA to
+    /// write the 1-byte status to, the status byte itself, and the validated
+    /// new active-pair count (`Some` only for a well-formed `VQ_PAIRS_SET`
+    /// within `[1, queue_pairs]`). Returns `None` only when there is no
+    /// device-writable status descriptor (the guest posted no buffer to
+    /// observe a reply) — the caller then drops the chain WITHOUT `add_used`
+    /// (the F15 rule) and leaves the cvq usable for the next command. A read
+    /// error or short/unknown command yields `Some((.., VIRTIO_NET_ERR, None))`
+    /// so the device still NAKs through the status descriptor when one exists.
+    ///
+    /// Descriptor ORDER is not enforced: readable command bytes are collected
+    /// wherever they appear (even after the writable status desc), which is safe
+    /// because the 4-byte `CTRL_CMD_BYTES` cap bounds the read and every
+    /// assembled command is validated below. A conformant guest emits
+    /// readable-then-writable (`virtnet_send_command_reply`); a reordered
+    /// hostile chain cannot escape the cap or the validation.
+    ///
+    /// Divergence from qemu: on a malformed chain SHAPE — no writable status
+    /// (qemu's "missing headers", hw/net/virtio-net.c:1563) — qemu calls
+    /// `virtio_error` (device-kill → NEEDS_RESET); we instead drop the single
+    /// malformed chain and keep the cvq alive for subsequent commands (the ring
+    /// is still walkable, so this is recoverable, unlike a dead ring). A bad
+    /// COMMAND (unknown class/cmd, out-of-range pairs) is NOT a divergence —
+    /// qemu NAKs via the status byte too. Only a dead RING (iter() error in
+    /// `process_ctrl_queue`) signals NEEDS_RESET, matching qemu's
+    /// structural-fault `virtio_error`.
+    fn eval_ctrl_chain(
+        &self,
+        chain: DescriptorChain<&GuestMemoryMmap>,
+        mem: &GuestMemoryMmap,
+    ) -> Option<(GuestAddress, u8, Option<u16>)> {
+        // class(1) + cmd(1) + virtqueue_pairs(2) = 4 bytes is all
+        // VQ_PAIRS_SET needs; cap the readable collection at that so a
+        // hostile chain cannot force an unbounded read.
+        const CTRL_CMD_BYTES: usize = 4;
+        let mut cmd = [0u8; CTRL_CMD_BYTES];
+        let mut cmd_len = 0usize;
+        let mut status: Option<GuestAddress> = None;
+        for desc in chain {
+            if desc.is_write_only() {
+                // The status descriptor. Record the FIRST writable one with
+                // room for the 1-byte status; ignore any extras.
+                if status.is_none() && desc.len() >= 1 {
+                    status = Some(desc.addr());
+                }
+                continue;
+            }
+            // Readable command bytes — take only what still fits in `cmd`.
+            if cmd_len < CTRL_CMD_BYTES {
+                let want = (CTRL_CMD_BYTES - cmd_len).min(desc.len() as usize);
+                if want > 0
+                    && mem
+                        .read_slice(&mut cmd[cmd_len..cmd_len + want], desc.addr())
+                        .is_ok()
+                {
+                    cmd_len += want;
+                }
+                // A read failure leaves `cmd_len` short → the validation
+                // below fails → VIRTIO_NET_ERR (still written to the status
+                // descriptor when one exists).
+            }
+        }
+        // No writable status descriptor → the guest cannot observe a reply →
+        // the chain is unusable; the caller drops it without add_used.
+        let status_addr = status?;
+        // Validate: full 4 command bytes, class == CTRL_MQ, cmd ==
+        // VQ_PAIRS_SET.
+        if cmd_len < CTRL_CMD_BYTES
+            || u32::from(cmd[0]) != VIRTIO_NET_CTRL_MQ
+            || u32::from(cmd[1]) != VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET
+        {
+            return Some((status_addr, VIRTIO_NET_ERR as u8, None));
+        }
+        // virtqueue_pairs is `__virtio16` — little-endian under VERSION_1
+        // (which our device requires). The offered `queue_pairs` is the
+        // binding upper limit (always <= VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MAX).
+        let pairs = u16::from_le_bytes([cmd[2], cmd[3]]);
+        if u32::from(pairs) < VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MIN || pairs > self.queue_pairs {
+            return Some((status_addr, VIRTIO_NET_ERR as u8, None));
+        }
+        Some((status_addr, VIRTIO_NET_OK as u8, Some(pairs)))
+    }
+
+    /// Clear the interrupt-status bits the guest acknowledged.
+    pub(crate) fn ack_interrupt(&mut self, val: u32) {
+        self.interrupt_status &= !val;
+    }
+
+    /// Apply a device-status write: `0` resets the device, any other
+    /// value drives the status FSM via [`Self::set_status`].
+    pub(crate) fn write_status(&mut self, val: u32) {
+        if val == 0 {
+            self.reset();
+        } else {
+            self.set_status(val);
+        }
+    }
+
+    // =================== end transport-neutral core API ===================
+
     /// Feature bits advertised to the guest.
     ///
     /// - `VIRTIO_F_VERSION_1`: modern virtio. Mandatory for the
@@ -417,12 +1087,51 @@ impl VirtioNet {
     ///   `NetConfig` is one of the few values an operator wants to
     ///   pin across runs (for AF_PACKET capture correlation).
     fn device_features(&self) -> u64 {
-        (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_NET_F_MAC)
+        let mut features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_NET_F_MAC);
+        // Multiqueue is offered only when (a) the device was built with >1
+        // pair AND (b) the transport carries MSI-X (the PCI facade wired
+        // `msix`; virtio-MMIO leaves it `None`). Two reasons, neither a
+        // strand-safety claim:
+        //   1. Per-queue IRQ steering is the POINT of multiqueue here and needs
+        //      a distinct interrupt vector per queue — only MSI-X supplies
+        //      that. On a shared INTx/MMIO level line every queue lands on one
+        //      IRQ, so multiqueue buys nothing for steering. With MSI-X each data
+        //      vq gets its OWN vector + GSI (the guest's EACH policy); SHARED is
+        //      the guest's fallback when its queue count exceeds the per-NIC
+        //      vector budget, served transparently by the per-queue signal path.
+        //   2. The future async-RX backend (TAP/AF_PACKET/threaded-NAPI) will
+        //      move RX completion off the vCPU thread and break the legacy-INTx
+        //      single-asserter invariant, needing the active resample handler
+        //      (a follow-up; see the PCI facade module doc). Gating MQ on MSI-X
+        //      keeps that work out of the multiqueue path.
+        // NOTE: the gate is "MSI-X capability offered", NOT "guest enabled
+        // MSI-X". A guest can negotiate F_MQ and still fall back to a shared
+        // INTx line (vp_find_vqs tries three MSI-X policies, then
+        // vp_find_vqs_intx, drivers/virtio/virtio_pci_common.c:542). That is
+        // sound in v0: every used-ring assert originates on the vCPU thread in
+        // process_tx_loopback (single asserter), and the guest's shared-IRQ
+        // handler vp_vring_interrupt iterates EVERY vq, scheduling NAPI per vq
+        // (virtio_pci_common.c:83-98, "Notify all virtqueues on an interrupt"),
+        // so one coalesced level assert drains all queues — nothing strands.
+        // F_MQ also requires the control vq: the guest activates pairs via
+        // VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET on the cvq, and without F_CTRL_VQ
+        // `virtnet_probe` (drivers/net/virtio_net.c) clamps max_queue_pairs to
+        // 1. At a single pair, or on a non-MSI-X transport, neither bit is
+        // offered — keeping the device byte-identical to the pre-multiqueue
+        // facade.
+        if self.queue_pairs > 1 && self.msix.is_some() {
+            features |= (1u64 << VIRTIO_NET_F_MQ) | (1u64 << VIRTIO_NET_F_CTRL_VQ);
+        }
+        features
     }
 
     fn selected_queue(&self) -> Option<usize> {
         let idx = self.queue_select as usize;
-        if idx < NUM_QUEUES { Some(idx) } else { None }
+        if idx < self.queues.len() {
+            Some(idx)
+        } else {
+            None
+        }
     }
 
     // Net does not negotiate VIRTIO_RING_F_EVENT_IDX so the combined
@@ -466,7 +1175,22 @@ impl VirtioNet {
     // delivery. The guest does NOT poll this register. We log any
     // errno so a failed write surfaces in tracing rather than
     // silently disappearing.
-    fn signal_used(&mut self) {
+    fn signal_used(&mut self, queue: usize) {
+        // MSI-X path (PCI, once the guest enabled it): deliver the VRING source
+        // to virtqueue `queue`'s guest-assigned vector (per-queue IRQ steering).
+        // MSI-X does not use the INTx ISR (`interrupt_status`) — the kernel's
+        // per-vector handlers never read it (drivers/virtio/virtio_pci_common.c:
+        // the ISR read is INTx-only) — so the bit-set + line write below are
+        // skipped. On INTx every queue collapses to the one shared line
+        // (`queue` ignored); the guest's shared handler vp_vring_interrupt
+        // drains all virtqueues per kick.
+        if let Some(msix) = &self.msix {
+            let mut m = msix.lock();
+            if m.enabled() {
+                m.signal(IrqSource::Vring { queue });
+                return;
+            }
+        }
         self.interrupt_status |= VIRTIO_MMIO_INT_VRING;
         if let Err(e) = self.irq_evt.write(1) {
             tracing::warn!(%e, "virtio-net irq_evt.write failed");
@@ -517,19 +1241,49 @@ impl VirtioNet {
     /// drained by the guest's prior IRQ handler). The counter and
     /// signal must be event-once per false→true transition.
     fn signal_queue_poisoned(&mut self) {
-        self.device_status |= VIRTIO_CONFIG_S_NEEDS_RESET;
+        // NEEDS_RESET is guest-visible device state, set regardless of the
+        // interrupt transport (the operator's `mmio_read(STATUS)` surfaces it
+        // even if no interrupt is delivered).
+        self.mark_needs_reset();
+        // MSI-X path (PCI, once enabled): deliver the CONFIG source to its
+        // guest-assigned vector. As in `signal_used`, MSI-X skips the INTx ISR
+        // (`interrupt_status`) — the kernel's config-change handler is its own
+        // MSI-X vector and never reads the ISR byte.
+        if let Some(msix) = &self.msix {
+            let mut m = msix.lock();
+            if m.enabled() {
+                m.signal(IrqSource::Config);
+                return;
+            }
+        }
         self.interrupt_status |= VIRTIO_MMIO_INT_CONFIG;
-        // SAFETY: EAGAIN requires counter saturation at u64::MAX-1
+        // Recoverability: EAGAIN requires counter saturation at u64::MAX-1
         // (~1.8e19 unobserved kicks) — implausible. EBADF means
         // the fd closed during shutdown. The NEEDS_RESET +
         // INT_CONFIG bits above are the enduring guest-visible
         // signals: even if this write fails, the operator's
         // `mmio_read(STATUS)` still surfaces NEEDS_RESET. We log
         // any errno so a failed write surfaces in tracing rather
-        // than silently disappearing.
+        // than silently disappearing. (Not a `SAFETY:` note — the write
+        // is a safe call; SAFETY is reserved for unsafe blocks/impls.)
         if let Err(e) = self.irq_evt.write(1) {
             tracing::warn!(%e, "virtio-net irq_evt.write failed (poison signal)");
         }
+    }
+
+    /// Set the guest-visible `VIRTIO_CONFIG_S_NEEDS_RESET` device-status bit
+    /// (virtio-v1.2 §2.1.1 bit 0x40) WITHOUT delivering an interrupt.
+    /// Idempotent (bitwise OR); the caller gates on the false→true poison
+    /// transition. Used for the control-vq structural poison: an
+    /// INT_CONFIG/irqfd kick is inert there because the guest POLLS the cvq
+    /// (no cvq callback; `virtnet_config_changed_work` only toggles link
+    /// carrier, and `vq->broken` is never set by a config-change) — a kick
+    /// would wake nothing and only fire the shared vring vector spuriously. The
+    /// operator's `mmio_read(STATUS)` still surfaces the device-death state, for
+    /// data-path + qemu parity. The data path uses [`Self::signal_queue_poisoned`]
+    /// instead (its consumer, NAPI, is IRQ-gated and needs the interrupt).
+    fn mark_needs_reset(&mut self) {
+        self.device_status |= VIRTIO_CONFIG_S_NEEDS_RESET;
     }
 
     /// True when device_status has progressed past FEATURES_OK but
@@ -560,7 +1314,13 @@ impl VirtioNet {
     /// invokes this function and returns; the freeze-rendezvous
     /// timeout is never at risk because there is no syscall to block
     /// SIGRTMIN delivery on.
-    fn process_tx_loopback(&mut self) {
+    fn process_tx_loopback(&mut self, pair: usize) {
+        // Pair `pair`'s data virtqueues interleave per the kernel
+        // rxq2vq/txq2vq ordering: RX at even index `2*pair`, TX at odd index
+        // `2*pair+1`. The caller (`notify_queue`) invokes this only for an
+        // active pair's TX kick.
+        let rx_idx = pair * 2;
+        let tx_idx = pair * 2 + 1;
         // DRIVER_OK gate per virtio-v1.2 §2.1.2: the device MUST NOT
         // process virtqueue requests until the driver has finished
         // initialisation by writing DRIVER_OK. A guest writing
@@ -608,15 +1368,16 @@ impl VirtioNet {
         // just breaks naturally — no need for a special outer
         // gate.
         //
-        // `had_used_ring_publish` tracks whether ANY queue's
-        // used-ring index advanced during this drain (TX add_used
-        // OR RX add_used succeeded somewhere). The irqfd kick at
-        // the end is gated on this flag rather than on RX delivery
-        // alone: a malformed RX chain whose `add_used(head, 0)`
-        // succeeded ALSO needs a kick, otherwise the guest's NAPI
-        // never observes the empty completion and the descriptor
-        // sits unrecycled in the used ring until a virtio reset.
-        let mut had_used_ring_publish = false;
+        // Per-queue used-ring advance tracking for the per-queue MSI-X
+        // signal: `tx_advanced` ⇔ this pair's TX queue (tx_idx) advanced its
+        // used ring (a TX completion — including a malformed-chain recycle whose
+        // `add_used(head, 0)` succeeded, which the guest's NAPI must still see);
+        // `rx_advanced` ⇔ the RX queue (rx_idx) advanced (a delivery or an empty
+        // completion). Each fires its OWN queue's vector post-loop so a per-queue
+        // IRQ lands on that queue's affined CPU. On INTx both collapse to the one
+        // shared line (signal_used ignores the index there).
+        let mut tx_advanced = false;
+        let mut rx_advanced = false;
         // `tx_just_poisoned` / `rx_just_poisoned`: the false→true
         // transition observed during THIS drain. The signal +
         // counter bump are gated on the transition, not on the
@@ -640,14 +1401,14 @@ impl VirtioNet {
         // `try_loopback_to_rx` (taking the RX borrow), then close
         // the loop iteration with a TX `add_used`.
         loop {
-            let pop_outcome = self.pop_and_capture_tx(mem);
+            let pop_outcome = self.pop_and_capture_tx(mem, tx_idx);
             let chain_outcome = match pop_outcome {
                 TxPopOutcome::Empty => break,
                 TxPopOutcome::JustPoisoned => {
                     // Hostile-guest TX-side iter() error —
                     // `pop_and_capture_tx` performed the false→true
                     // transition, bumped the counter, and set
-                    // `queue_poisoned[TXQ] = true`. No chain was
+                    // `queue_poisoned[tx_idx] = true`. No chain was
                     // popped. Break the drain (TX cannot make
                     // forward progress until reset). Signal handled
                     // post-loop alongside any RX poison transition,
@@ -667,19 +1428,15 @@ impl VirtioNet {
                 // count we use for rx_bytes (truncation vs full),
                 // and the TX add_used at the end of this iteration
                 // determines whether tx_packets bumps at all.
-                let outcome = self.try_loopback_to_rx(mem, len);
-                self.handle_rx_loopback_outcome(
-                    outcome,
-                    &mut had_used_ring_publish,
-                    &mut rx_just_poisoned,
-                );
+                let outcome = self.try_loopback_to_rx(mem, len, rx_idx);
+                self.handle_rx_loopback_outcome(outcome, &mut rx_advanced, &mut rx_just_poisoned);
             }
             // else: chain was malformed and tx_chain_invalid was
             // already bumped inside `pop_and_capture_tx`. Neither
             // `tx_packets` nor `rx_packets` advances on this path.
             // Still mark used so the guest doesn't hang.
 
-            self.tx_add_used(mem, head, frame_len, &mut had_used_ring_publish);
+            self.tx_add_used(mem, head, frame_len, &mut tx_advanced, tx_idx);
 
             // Partial-RX-poison handling: if the RX-side `iter()`
             // just transitioned false→true this iteration (set by
@@ -704,26 +1461,39 @@ impl VirtioNet {
         }
 
         // Post-loop ordered signal sequence:
-        //   1. signal_used() if any used-ring advance happened, so
-        //      the guest's NAPI wakes to observe TX completions and
-        //      RX deliveries from THIS drain. Must come BEFORE the
-        //      poison signal — a missed signal_used would strand
-        //      whatever completions the guest could still consume
-        //      (TX completions are still actionable even if RX is
-        //      poisoned).
-        //   2. signal_queue_poisoned() exactly once if either side
-        //      transitioned false→true during this drain. Sets
-        //      NEEDS_RESET in device_status + INT_CONFIG in
-        //      interrupt_status (both idempotent under bitwise-OR
-        //      — single call is correct whether one or both
-        //      queues just poisoned), and writes the irqfd.
-        //      Spec-compliant per virtio-v1.2 (config interrupt
-        //      paired with NEEDS_RESET) and matches
-        //      cloud-hypervisor. counter-mode irqfd coalesces
-        //      signal_used + signal_queue_poisoned into a single
-        //      guest-visible IRQ when they both fire.
-        if had_used_ring_publish {
-            self.signal_used();
+        //   1. Per-queue used-ring signal — fire EACH advanced queue's OWN
+        //      vector (rx_idx, tx_idx) so the guest's per-queue NAPI wakes on
+        //      that queue's affined CPU (the point of per-queue MSI-X). Must
+        //      come BEFORE the poison signal — a missed used signal would strand
+        //      completions the guest can still consume (TX completions are
+        //      actionable even if RX is poisoned). On INTx both collapse to the
+        //      one shared line; the guest's vp_vring_interrupt drains all vqs, so
+        //      the (at most two) kicks are harmless.
+        //   2. signal_queue_poisoned() exactly once if either side transitioned
+        //      false→true during this drain. Sets NEEDS_RESET in device_status +
+        //      INT_CONFIG in interrupt_status (idempotent under bitwise-OR — one
+        //      call is correct whether one or both queues just poisoned) + writes
+        //      the irqfd. Spec-compliant per virtio-v1.2 (config interrupt paired
+        //      with NEEDS_RESET) and matches cloud-hypervisor. Counter-mode irqfd
+        //      coalesces the used + poison signals into one guest-visible IRQ
+        //      when they both fire on the same vector.
+        // MSI-X: fire EACH advanced queue's OWN vector (per-node steering) so a
+        // per-queue IRQ lands on that queue's affined CPU. INTx: every queue
+        // shares one line, so a single assert per drain is correct and
+        // sufficient — the guest's vp_vring_interrupt drains ALL vqs per IRQ —
+        // and coalescing avoids a redundant second eventfd write, preserving the
+        // one-kick-per-drain invariant the legacy level path relies on (multiqueue
+        // is gated on MSI-X in device_features, so the INTx branch only ever sees
+        // the single pair; the queue index is ignored there).
+        if self.msix.as_ref().is_some_and(|m| m.lock().enabled()) {
+            if rx_advanced {
+                self.signal_used(rx_idx);
+            }
+            if tx_advanced {
+                self.signal_used(tx_idx);
+            }
+        } else if rx_advanced || tx_advanced {
+            self.signal_used(rx_idx);
         }
         if tx_just_poisoned || rx_just_poisoned {
             self.signal_queue_poisoned();
@@ -790,7 +1560,7 @@ impl VirtioNet {
                 // `try_loopback_to_rx` performed the
                 // false→true RX poison transition, bumped
                 // `invalid_avail_idx_count`, and set
-                // `queue_poisoned[RXQ] = true`. The
+                // `queue_poisoned[rx_idx] = true`. The
                 // TX-captured frame is dropped (nothing to
                 // deliver into) — record the drop. TX
                 // add_used below still runs so the in-flight
@@ -844,6 +1614,7 @@ impl VirtioNet {
         head: u16,
         frame_len: Option<usize>,
         had_used_ring_publish: &mut bool,
+        tx_idx: usize,
     ) {
         // Mark the TX chain used. TX descriptors are
         // device-readable, so used_len is 0 — the device wrote
@@ -860,7 +1631,7 @@ impl VirtioNet {
         // (the guest never sees the completion). Failed TX add_used
         // bumps `tx_add_used_failures` instead, keeping the
         // per-event counter taxonomy 1:1 with observable events.
-        let q = &mut self.queues[TXQ];
+        let q = &mut self.queues[tx_idx];
         match q.add_used(mem, head, 0) {
             Ok(()) => {
                 if let Some(len) = frame_len {
@@ -897,14 +1668,14 @@ impl VirtioNet {
     /// return the chain head index plus the captured frame length.
     ///
     /// Returns `Empty` when the TX queue is empty OR when the
-    /// per-queue `queue_poisoned[TXQ]` flag is already set (the
+    /// per-queue `queue_poisoned[tx_idx]` flag is already set (the
     /// entry gate short-circuits with `Empty` rather than a
     /// dedicated "AlreadyPoisoned" variant — the drain loop's
     /// only legal action is to break, and `Empty` already conveys
     /// that). Returns `JustPoisoned` when the TX `iter()`
     /// observed any structural error for the FIRST time —
     /// `invalid_avail_idx_count` is bumped and
-    /// `queue_poisoned[TXQ]` is set; the caller breaks the drain
+    /// `queue_poisoned[tx_idx]` is set; the caller breaks the drain
     /// and the post-loop signal handler fires.
     /// Returns `Chain(TxChainOutcome { frame_len: None })` when the
     /// chain is malformed — the caller must still `add_used` the
@@ -919,13 +1690,13 @@ impl VirtioNet {
     /// and returns `None`, which masks the structural violation as
     /// "no chain available" and lets every subsequent kick re-trip
     /// the same error. Mirror of the virtio-blk drain pattern.
-    fn pop_and_capture_tx(&mut self, mem: &GuestMemoryMmap) -> TxPopOutcome {
+    fn pop_and_capture_tx(&mut self, mem: &GuestMemoryMmap, tx_idx: usize) -> TxPopOutcome {
         // Two phases: pop one TX chain (entry poison-gate +
         // iter()-pull), then walk its descriptors skipping the
         // 12-byte header and capturing the frame bytes into
         // `tx_frame_scratch`. Split out so each phase stays under the
         // function-size guard; the per-phase bodies are unchanged.
-        let (chain, head) = match self.pop_tx_chain(mem) {
+        let (chain, head) = match self.pop_tx_chain(mem, tx_idx) {
             Ok(v) => v,
             Err(outcome) => return outcome,
         };
@@ -941,6 +1712,7 @@ impl VirtioNet {
     fn pop_tx_chain<'a>(
         &mut self,
         mem: &'a GuestMemoryMmap,
+        tx_idx: usize,
     ) -> Result<(DescriptorChain<&'a GuestMemoryMmap>, u16), TxPopOutcome> {
         // Per-queue poison gate. If the TX queue's flag is already
         // set, return Empty so the drain loop breaks naturally —
@@ -951,7 +1723,7 @@ impl VirtioNet {
         // gate ensures counter and signal happen only on the
         // false→true crossing, not on every kick. Re-kicks are
         // benign no-ops.
-        if self.queue_poisoned[TXQ] {
+        if self.queue_poisoned[tx_idx] {
             return Err(TxPopOutcome::Empty);
         }
         // Step 1: pull one chain out of the queue. The chain holds
@@ -986,7 +1758,7 @@ impl VirtioNet {
             Poisoned(VirtioQueueError),
         }
         let step: IterStep<_> = {
-            let q = &mut self.queues[TXQ];
+            let q = &mut self.queues[tx_idx];
             match q.iter(mem) {
                 Ok(mut iter) => match iter.next() {
                     Some(c) => IterStep::Chain(c),
@@ -1016,7 +1788,7 @@ impl VirtioNet {
                 // the caller breaks the drain and the post-loop
                 // signal handler fires `signal_queue_poisoned`
                 // exactly once.
-                self.queue_poisoned[TXQ] = true;
+                self.queue_poisoned[tx_idx] = true;
                 self.counters.record_invalid_avail_idx();
                 tracing::warn!(
                     err = %err,
@@ -1207,19 +1979,24 @@ impl VirtioNet {
     ///
     /// Returns one of [`LoopbackOutcome`]'s variants — see the
     /// enum doc for the per-variant routing rules.
-    fn try_loopback_to_rx(&mut self, mem: &GuestMemoryMmap, frame_len: usize) -> LoopbackOutcome {
+    fn try_loopback_to_rx(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        frame_len: usize,
+        rx_idx: usize,
+    ) -> LoopbackOutcome {
         // Three phases: pop one RX chain (entry poison-gate +
         // iter()-pull), walk its descriptors writing the header +
         // frame bytes, then finalize (counter routing, header
         // rollback on failure, add_used). Split out so each phase
         // stays under the function-size guard; the per-phase bodies
         // are unchanged.
-        let (chain, head) = match self.pop_rx_chain(mem) {
+        let (chain, head) = match self.pop_rx_chain(mem, rx_idx) {
             Ok(v) => v,
             Err(outcome) => return outcome,
         };
         let walk = self.write_rx_chain(chain, mem, frame_len);
-        self.finalize_rx(walk, head, mem, frame_len)
+        self.finalize_rx(walk, head, mem, frame_len, rx_idx)
     }
 
     /// Pop one chain off the RX queue.
@@ -1232,6 +2009,7 @@ impl VirtioNet {
     fn pop_rx_chain<'a>(
         &mut self,
         mem: &'a GuestMemoryMmap,
+        rx_idx: usize,
     ) -> Result<(DescriptorChain<&'a GuestMemoryMmap>, u16), LoopbackOutcome> {
         // Per-queue poison gate (RX side). If the RX queue's flag
         // is already set, return `RxAlreadyPoisoned` without
@@ -1240,7 +2018,7 @@ impl VirtioNet {
         // gate. RX poison must not stop TX from continuing to
         // drain — the caller still does TX add_used in this
         // iteration even when RX is poisoned.
-        if self.queue_poisoned[RXQ] {
+        if self.queue_poisoned[rx_idx] {
             return Err(LoopbackOutcome::RxAlreadyPoisoned);
         }
         // Pull one chain out of the RX queue. Same two-step
@@ -1253,7 +2031,7 @@ impl VirtioNet {
             Poisoned(VirtioQueueError),
         }
         let step: IterStep<_> = {
-            let q = &mut self.queues[RXQ];
+            let q = &mut self.queues[rx_idx];
             if !q.ready() {
                 // Driver hasn't published RX buffers yet (init not
                 // complete). Drop the frame; future TX after RX is
@@ -1278,12 +2056,12 @@ impl VirtioNet {
                 // Hostile- or buggy-guest poison on the RX queue —
                 // first time. Mirror the TX-side handling: perform
                 // the false→true transition (set
-                // `queue_poisoned[RXQ]`, bump the per-event counter,
+                // `queue_poisoned[rx_idx]`, bump the per-event counter,
                 // log), return `JustRxPoisoned`. Re-kicks
                 // against the now-poisoned queue take the entry
                 // gate above (returns `RxAlreadyPoisoned`) so the
                 // counter and signal are event-once.
-                self.queue_poisoned[RXQ] = true;
+                self.queue_poisoned[rx_idx] = true;
                 self.counters.record_invalid_avail_idx();
                 tracing::warn!(
                     err = %err,
@@ -1468,6 +2246,7 @@ impl VirtioNet {
         head: u16,
         mem: &GuestMemoryMmap,
         frame_len: usize,
+        rx_idx: usize,
     ) -> LoopbackOutcome {
         if let Some(reason) = walk.chain_invalid {
             // Malformed RX chain: the frame is dropped, the chain
@@ -1541,7 +2320,7 @@ impl VirtioNet {
             // poison is reserved for `iter()` errors only. See the
             // doc on the success-branch add_used match for the
             // full rationale.
-            let add_used_ok = match self.queues[RXQ].add_used(mem, head, 0) {
+            let add_used_ok = match self.queues[rx_idx].add_used(mem, head, 0) {
                 Ok(()) => true,
                 Err(e) => {
                     self.counters.record_rx_add_used_failure();
@@ -1612,7 +2391,7 @@ impl VirtioNet {
         // NEEDS_RESET. Poison is reserved for `iter()` errors
         // (cloud-hypervisor convergence: structural avail.idx
         // violations only).
-        match self.queues[RXQ].add_used(mem, head, walk.bytes_written) {
+        match self.queues[rx_idx].add_used(mem, head, walk.bytes_written) {
             Ok(()) => LoopbackOutcome::Delivered {
                 l2_bytes_written: l2_bytes,
             },
@@ -1715,7 +2494,7 @@ struct RxWriteResult {
 ///     (most commonly `InvalidAvailRingIndex`; cloud-hypervisor
 ///     pattern treats every structural queue error uniformly).
 ///     `invalid_avail_idx_count` was bumped and
-///     `queue_poisoned[RXQ]` JUST transitioned false→true.
+///     `queue_poisoned[rx_idx]` JUST transitioned false→true.
 ///     Caller records the transition; post-loop signal fires.
 ///     This is the ONLY path that poisons the RX queue.
 ///   - `RxAlreadyPoisoned`: RX queue's poison flag was already
@@ -1742,7 +2521,7 @@ enum LoopbackOutcome {
 ///     commonly `InvalidAvailRingIndex`; cloud-hypervisor pattern
 ///     treats every structural queue error uniformly).
 ///     `invalid_avail_idx_count` was bumped and
-///     `queue_poisoned[TXQ]` JUST transitioned false→true. The
+///     `queue_poisoned[tx_idx]` JUST transitioned false→true. The
 ///     caller breaks the drain loop and the post-loop signal
 ///     handler fires `signal_queue_poisoned`. Re-kicks against
 ///     an already-poisoned TX queue return `Empty` (not
@@ -1769,195 +2548,15 @@ struct TxChainOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// MMIO register dispatch
+// Device-status FSM + reset
 // ---------------------------------------------------------------------------
+//
+// The MMIO transport facade (`mmio_read` / `mmio_write`) lives in the
+// sibling `mmio.rs` submodule; it decodes the MMIO register layout onto
+// the transport-neutral core API above. `set_status` / `reset` are the
+// shared FSM core it drives via `write_status`.
 
 impl VirtioNet {
-    /// Handle MMIO read at `offset` within the device's MMIO region.
-    pub fn mmio_read(&self, offset: u64, data: &mut [u8]) {
-        // Config-space reads (offsets 0x100..) may be 1, 2, 4, or 8
-        // bytes wide depending on the field's type per virtio-v1.2
-        // §4.2.2.2; serve them from the static config struct's bytes
-        // first so a 1-byte MAC read or 2-byte STATUS read returns
-        // the right value rather than the 0xff "non-4-byte" sentinel.
-        if offset >= 0x100 {
-            self.read_config_space(offset - 0x100, data);
-            return;
-        }
-
-        // Register-space reads are 4 bytes wide. Anything else is a
-        // protocol violation — return 0xff bytes (matches virtio-blk
-        // and virtio-console).
-        if data.len() != 4 {
-            for b in data.iter_mut() {
-                *b = 0xff;
-            }
-            return;
-        }
-        let val: u32 = match offset as u32 {
-            VIRTIO_MMIO_MAGIC_VALUE => MMIO_MAGIC,
-            VIRTIO_MMIO_VERSION => MMIO_VERSION,
-            VIRTIO_MMIO_DEVICE_ID => VIRTIO_ID_NET,
-            VIRTIO_MMIO_VENDOR_ID => VENDOR_ID,
-            VIRTIO_MMIO_DEVICE_FEATURES => {
-                let page = self.device_features_sel;
-                if page == 0 {
-                    self.device_features() as u32
-                } else if page == 1 {
-                    (self.device_features() >> 32) as u32
-                } else {
-                    0
-                }
-            }
-            VIRTIO_MMIO_QUEUE_NUM_MAX => self
-                .selected_queue()
-                .map(|i| self.queues[i].max_size() as u32)
-                .unwrap_or(0),
-            VIRTIO_MMIO_QUEUE_READY => self
-                .selected_queue()
-                .map(|i| self.queues[i].ready() as u32)
-                .unwrap_or(0),
-            VIRTIO_MMIO_INTERRUPT_STATUS => self.interrupt_status,
-            VIRTIO_MMIO_STATUS => self.device_status,
-            VIRTIO_MMIO_CONFIG_GENERATION => self.config_generation,
-            _ => 0,
-        };
-        tracing::debug!(offset, val, "virtio-net mmio_read");
-        data.copy_from_slice(&val.to_le_bytes());
-    }
-
-    /// Serve `data.len()` bytes from config space at `offset` within
-    /// the config region (offset 0 = `mac[0]`, offset 6 = `status`
-    /// low byte, etc.). Reads past the populated layout return zero
-    /// per virtio-v1.2 §4.2.2.2.
-    fn read_config_space(&self, offset: u64, data: &mut [u8]) {
-        // SAFETY: `VirtioNetConfig` is `ByteValued` — every bit
-        // pattern of the underlying bytes is a valid value, so
-        // viewing it as a byte slice is sound.
-        let config_bytes = self.config.as_slice();
-        let start = offset as usize;
-        for (i, byte) in data.iter_mut().enumerate() {
-            let cfg_idx = start + i;
-            *byte = config_bytes.get(cfg_idx).copied().unwrap_or(0);
-        }
-    }
-
-    /// Handle MMIO write at `offset` within the device's MMIO region.
-    pub fn mmio_write(&mut self, offset: u64, data: &[u8]) {
-        // Config-space writes are silently ignored (this device is
-        // not driver-configurable; STATUS/MQ/MTU are read-only).
-        // Matches virtio-console; virtio-v1.2 §4.2.2.2 ("the device
-        // MAY ignore writes to config space").
-        if offset >= 0x100 {
-            tracing::debug!(
-                offset,
-                len = data.len(),
-                "virtio-net config-space write ignored"
-            );
-            return;
-        }
-
-        if data.len() != 4 {
-            return;
-        }
-        let val = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        tracing::debug!(offset, val, "virtio-net mmio_write");
-        match offset as u32 {
-            VIRTIO_MMIO_DEVICE_FEATURES_SEL => self.device_features_sel = val,
-            VIRTIO_MMIO_DRIVER_FEATURES_SEL => self.driver_features_sel = val,
-            VIRTIO_MMIO_DRIVER_FEATURES => {
-                if !self.features_write_allowed() {
-                    return;
-                }
-                let page = self.driver_features_sel;
-                if page == 0 {
-                    self.driver_features =
-                        (self.driver_features & 0xFFFF_FFFF_0000_0000) | val as u64;
-                } else if page == 1 {
-                    self.driver_features =
-                        (self.driver_features & 0x0000_0000_FFFF_FFFF) | ((val as u64) << 32);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_SEL => self.queue_select = val,
-            VIRTIO_MMIO_QUEUE_NUM if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_size(val as u16);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_READY if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_ready(val == 1);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_NOTIFY => {
-                let idx = val as usize;
-                if idx == TXQ {
-                    self.process_tx_loopback();
-                }
-                // RXQ notify (guest posted new RX buffers): no
-                // immediate work — the next TX will pick up any new
-                // buffer. virtio-blk and virtio-console drain their
-                // pending data on the matching queue notify, but
-                // here there is no pending RX to deliver outside a
-                // TX-induced loopback. A future TAP/AF_PACKET
-                // backend would drain pending host->guest frames on
-                // RXQ notify.
-            }
-            VIRTIO_MMIO_INTERRUPT_ACK => {
-                // Clear the bits the guest ACKed in `interrupt_status`.
-                // No `virtio_update_irq` equivalent is needed: the
-                // irqfd is edge-triggered (each `irq_evt.write(1)`
-                // raises one GSI delivery; KVM's `kvm_irqfd_resampler`
-                // is not wired here because we never claim shared
-                // legacy IRQs). The kernel's
-                // `vm_interrupt`+`vp_modern_get_status` handshake
-                // (drivers/virtio/virtio_mmio.c) does NOT need a
-                // device-side notification on ACK — it just clears
-                // its own view of the bits and moves on. virtio-blk
-                // and virtio-console use the same shape.
-                self.interrupt_status &= !val;
-            }
-            VIRTIO_MMIO_STATUS => {
-                if val == 0 {
-                    self.reset();
-                } else {
-                    self.set_status(val);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DESC_LOW if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_desc_table_address(Some(val), None);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DESC_HIGH if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_desc_table_address(None, Some(val));
-                }
-            }
-            VIRTIO_MMIO_QUEUE_AVAIL_LOW if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_avail_ring_address(Some(val), None);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_AVAIL_HIGH if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_avail_ring_address(None, Some(val));
-                }
-            }
-            VIRTIO_MMIO_QUEUE_USED_LOW if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_used_ring_address(Some(val), None);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_USED_HIGH if self.queue_config_allowed() => {
-                if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_used_ring_address(None, Some(val));
-                }
-            }
-            _ => {}
-        }
-    }
-
     /// Validate and apply a status transition per virtio-v1.2 §3.1.1.
     /// The driver must not clear bits. Each phase requires the
     /// previous phase's bits to be set. Invalid transitions are
@@ -2074,7 +2673,7 @@ impl VirtioNet {
     /// they persist across re-binds for monotonic operator
     /// observability, matching the virtio-blk pattern.
     ///
-    /// Clears `queue_poisoned[..]` for both queues: the guest
+    /// Clears `queue_poisoned[..]` for all queues: the guest
     /// issued a virtio reset, which is the only documented escape
     /// from a poisoned-queue state (per the field's invariant —
     /// see [`Self::queue_poisoned`]). The
@@ -2090,7 +2689,19 @@ impl VirtioNet {
         self.driver_features_sel = 0;
         self.driver_features = 0;
         self.tx_frame_scratch.clear();
-        self.queue_poisoned = [false; NUM_QUEUES];
+        // Clear the per-queue poison flags in place (the offered queue count
+        // is fixed at construction, so the Vec length is preserved).
+        self.queue_poisoned.fill(false);
+        // The active pair count returns to the probe default (1); the guest
+        // re-sends VQ_PAIRS_SET on re-probe to raise it.
+        self.curr_queue_pairs = 1;
+        // Virtio reset returns the MSI-X vector assignments to NO_VECTOR
+        // (virtio-v1.2 §4.1.4.3); the PCI-level MSI-X cap (enable, table, PBA,
+        // registered eventfds) persists — only PCI/FLR reset clears it. INTx
+        // transports have no MSI-X state (None) and skip this.
+        if let Some(msix) = &self.msix {
+            msix.lock().reset_virtio_assignments();
+        }
         for q in &mut self.queues {
             q.reset();
         }

@@ -344,11 +344,28 @@ pub(crate) fn ktstr_guest_init() -> ! {
             // convert \n to \r\n. Without this, every newline in
             // command output gains a spurious \r visible to the host.
             let stdout_fd = unsafe { BorrowedFd::borrow_raw(1) };
-            if let Ok(mut termios) = tcgetattr(stdout_fd) {
-                termios
-                    .output_flags
-                    .remove(nix::sys::termios::OutputFlags::OPOST);
-                let _ = tcsetattr(stdout_fd, SetArg::TCSANOW, &termios);
+            // A tcgetattr/tcsetattr failure is logged rather than
+            // swallowed: without OPOST cleared, every newline gains a
+            // spurious carriage return visible to the host, with no
+            // other signal for the cause.
+            match tcgetattr(stdout_fd) {
+                Ok(mut termios) => {
+                    termios
+                        .output_flags
+                        .remove(nix::sys::termios::OutputFlags::OPOST);
+                    if let Err(e) = tcsetattr(stdout_fd, SetArg::TCSANOW, &termios) {
+                        tracing::warn!(
+                            err = %e,
+                            "ktstr-init: shell-exec stdout OPOST-disable tcsetattr \
+                             failed; newlines may gain a spurious carriage return"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    err = %e,
+                    "ktstr-init: shell-exec stdout tcgetattr failed; skipping OPOST \
+                     disable (newlines may gain a spurious carriage return)"
+                ),
             }
             // [`with_sigchld_default`] flips SIGCHLD to SIG_DFL
             // for the closure body so `Command::status()` (which
@@ -509,11 +526,11 @@ pub(crate) fn ktstr_guest_init() -> ! {
     exec_shell_script("/sched_enable");
     // Plumb the probe pipeline's `stop` + `output_done` into
     // `start_scheduler` so the early-bail paths (Died / not
-    // attached / spawn error) can drain probe JSON to COM2 before
-    // calling `force_reboot()`. Without the drain, every path that
-    // crashes the scheduler before the test dispatches loses its
-    // probe payload to the reboot — exactly the diagnostic the
-    // probes were attached to capture.
+    // attached / spawn error) can drain probe JSON over the bulk port
+    // (via the stdout forwarder) before calling `force_reboot()`.
+    // Without the drain, every path that crashes the scheduler before
+    // the test dispatches loses its probe payload to the reboot —
+    // exactly the diagnostic the probes were attached to capture.
     let probe_drain = probe_phase_a.as_ref().map(|pa| ProbeDrain {
         stop: pa.pipeline.stop.clone(),
         output_done: pa.pipeline.output_done.clone(),
@@ -524,7 +541,16 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // Phase 4: hvc0 polling + trace pipe (background threads).
     let _s_phase4 = tracing::debug_span!("phase4_vc_poll").entered();
     let (trace_stop, trace_handle) = start_trace_pipe();
-    let vc_poll_stop = start_hvc0_poll(trace_stop.clone());
+    // Thread the probe pipeline's `stop` + `output_done` into the hvc0 poll
+    // loop so its graceful-shutdown (watchdog soft-shutdown) handler can drain
+    // captured crash-arg probe output (emitted over the virtio bulk port via
+    // the stdout forwarder) before the guest reboots — the only drain site for
+    // a repro scenario that hangs inside the test function.
+    let hvc0_probe_drain = probe_phase_a.as_ref().map(|pa| ProbeDrain {
+        stop: pa.pipeline.stop.clone(),
+        output_done: pa.pipeline.output_done.clone(),
+    });
+    let vc_poll_stop = start_hvc0_poll(trace_stop.clone(), hvc0_probe_drain);
     drop(_s_phase4);
 
     // Phase 4b: Scheduler death monitor.
@@ -532,9 +558,13 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // the test, the thread writes MSG_TYPE_SCHED_EXIT via bulk port so the host
     // can detect early death without waiting for the watchdog.
     //
-    // When probes are active, suppress COM2 log dump to avoid
-    // interleaving with probe JSON output on the same serial port.
-    let suppress_com2 = Arc::new(AtomicBool::new(probes_active));
+    // When probes are active, `suppress_sched_log` suppresses only the
+    // bulk-port scheduler-log dump (the monitor waits on the probe's
+    // output_done instead, keeping the VM alive for the probe to emit its
+    // payload); the probe pipeline handles crash detection via
+    // tp_btf/sched_ext_exit. The SCHED_EXIT signal is gated independently by
+    // the stop flag (host-initiated kill), not by this flag.
+    let suppress_sched_log = Arc::new(AtomicBool::new(probes_active));
     let probe_output_done = probe_phase_a
         .as_ref()
         .map(|pa| pa.pipeline.output_done.clone());
@@ -554,10 +584,10 @@ pub(crate) fn ktstr_guest_init() -> ! {
     let boot_stop = start_sched_exit_monitor(
         sched_child.as_ref().map(|c| c.id()),
         sched_log_path.as_deref(),
-        suppress_com2.clone(),
+        suppress_sched_log.clone(),
         probe_output_done.clone(),
     );
-    install_initial_sched_exit_monitor(boot_stop, suppress_com2, probe_output_done);
+    install_initial_sched_exit_monitor(boot_stop, suppress_sched_log, probe_output_done);
 
     // Phase 5: Dispatch.
     let _s_phase5 = tracing::debug_span!("phase5_dispatch").entered();
@@ -624,13 +654,24 @@ pub(crate) fn ktstr_guest_init() -> ! {
         // userspace diagnostics to its stderr log. Give it a brief
         // BOUNDED grace to finish writing and exit on its own BEFORE the
         // hard kill, so SIGKILL doesn't truncate that output
-        // (`dump_sched_output` below reads the stderr log). Gated on
-        // dump_started (the `sched_ext_dump:` tracepoint fires only on an
-        // error exit) so clean runs pay nothing; the grace returns early
-        // the moment the scheduler exits, and is bounded
-        // (`SCHED_KILL_GRACE`) so a userspace hang can't wedge teardown.
-        let exited_in_grace =
-            scx_dump_started_latch().is_set() && reap_child_bounded(child, SCHED_KILL_GRACE);
+        // (`dump_sched_output` below reads the stderr log). The grace
+        // runs when EITHER the `sched_ext_dump:` tracepoint has been seen
+        // (dump_started) OR the scheduler has actually crashed
+        // (`scx_down()` with the pid still owned — a clean
+        // `Op::DetachScheduler` clears the pid first, so it stays off this
+        // path). The dump-started latch alone is insufficient: it is set
+        // only once the trace_pipe reader observes the marker, which under
+        // `wprof` CPU pressure can lag the crash long enough that this
+        // teardown SIGKILLs the scheduler before it writes its
+        // `scx_bpf_error` reason — truncating the very corpus the crash
+        // tests match on. Clean runs pay nothing (neither condition
+        // holds); the grace returns early the moment the scheduler exits,
+        // and is bounded (`SCHED_KILL_GRACE`) so a userspace hang can't
+        // wedge teardown.
+        let sched_crashed =
+            crate::vmm::rust_init::sched_pid().is_some() && crate::scenario::ops::scx_down();
+        let exited_in_grace = (scx_dump_started_latch().is_set() || sched_crashed)
+            && reap_child_bounded(child, SCHED_KILL_GRACE);
         if !exited_in_grace {
             let _ = child.kill();
             // Bounded, evented reap. A SIGKILL'd scheduler normally exits

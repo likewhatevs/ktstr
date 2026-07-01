@@ -1,0 +1,7 @@
+error: survives_storm = true requires a scheduler — the kernel default (EEVDF) has no scx scheduler to die or be ejected, so survival is vacuous. Add a scheduler = ... attribute or drop survives_storm.
+ --> tests/compile_fail/ktstr_test_survives_storm_without_scheduler.rs:6:1
+  |
+6 | #[ktstr_test(survives_storm)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

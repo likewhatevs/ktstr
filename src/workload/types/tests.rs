@@ -34,6 +34,8 @@ fn stub_custom_fn(_ctx: &WorkerCtx) -> WorkerReport {
         wake_sample_total: 0,
         iteration_costs_ns: vec![],
         iteration_cost_sample_total: 0,
+        timer_latencies_ns: vec![],
+        timer_sample_total: 0,
         iterations: 0,
         schedstat_run_delay_ns: 0,
         schedstat_run_count: 0,
@@ -46,6 +48,7 @@ fn stub_custom_fn(_ctx: &WorkerCtx) -> WorkerReport {
         group_idx: 0,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     }
 }
 
@@ -304,6 +307,81 @@ fn mutex_contention_needs_shared_mem() {
 #[test]
 fn mutex_contention_no_cache_buf() {
     assert!(!WorkType::mutex_contention(4, 256, 1024).needs_cache_buf());
+}
+// -- CgroupAttachStorm tests --
+
+#[test]
+fn cgroup_attach_storm_name_roundtrip() {
+    let wt = WorkType::from_name("CgroupAttachStorm").unwrap();
+    assert_eq!(wt.name(), "CgroupAttachStorm");
+}
+#[test]
+fn cgroup_attach_storm_from_name_defaults() {
+    let wt = WorkType::from_name("CgroupAttachStorm").unwrap();
+    match wt {
+        WorkType::CgroupAttachStorm { dest, reap } => {
+            assert_eq!(dest, "dest");
+            assert_eq!(reap, ReapMode::SigIgn);
+        }
+        _ => panic!("expected CgroupAttachStorm"),
+    }
+}
+#[test]
+fn cgroup_attach_storm_group_size_none() {
+    let wt = WorkType::cgroup_attach_storm("dest", ReapMode::SigIgn);
+    assert_eq!(wt.worker_group_size(), None);
+}
+#[test]
+fn cgroup_attach_storm_ctor_field_equality() {
+    let wt = WorkType::cgroup_attach_storm("sib", ReapMode::Waitpid);
+    match wt {
+        WorkType::CgroupAttachStorm { dest, reap } => {
+            assert_eq!(dest, "sib");
+            assert_eq!(reap, ReapMode::Waitpid);
+        }
+        _ => panic!("expected CgroupAttachStorm"),
+    }
+}
+/// Both `ReapMode` values roundtrip through JSON with `dest` (a
+/// `String`, not `Cow<'static, str>`) preserved — pinning that the
+/// owned-string field does not re-impose serde's `'de: 'static` bound
+/// the `#[serde(bound(deserialize = ""))]` escape exists to drop.
+#[test]
+fn cgroup_attach_storm_serde_roundtrip_both_reap_modes() {
+    for reap in [ReapMode::SigIgn, ReapMode::Waitpid] {
+        let wt = WorkType::cgroup_attach_storm("dst", reap);
+        let json = serde_json::to_string(&wt).unwrap();
+        let back: WorkType = serde_json::from_str(&json).unwrap();
+        match back {
+            WorkType::CgroupAttachStorm { dest, reap: r } => {
+                assert_eq!(dest, "dst");
+                assert_eq!(r, reap);
+            }
+            _ => panic!("roundtrip lost CgroupAttachStorm variant"),
+        }
+    }
+}
+/// `ReapMode` serializes snake_case and defaults to `SigIgn` (the race
+/// shape — the variant's reason to exist).
+#[test]
+fn reap_mode_serde_snake_case_and_default() {
+    assert_eq!(
+        serde_json::to_string(&ReapMode::SigIgn).unwrap(),
+        r#""sig_ign""#
+    );
+    assert_eq!(
+        serde_json::to_string(&ReapMode::Waitpid).unwrap(),
+        r#""waitpid""#
+    );
+    assert_eq!(
+        serde_json::from_str::<ReapMode>(r#""sig_ign""#).unwrap(),
+        ReapMode::SigIgn
+    );
+    assert_eq!(
+        serde_json::from_str::<ReapMode>(r#""waitpid""#).unwrap(),
+        ReapMode::Waitpid
+    );
+    assert_eq!(ReapMode::default(), ReapMode::SigIgn);
 }
 /// `WorkPhase` Duration fields serialize as humantime strings, not
 /// `{secs, nanos}` objects. Pins the readable wire format that
@@ -641,10 +719,13 @@ fn suggest_rejects_whitespace_padded_inputs() {
 
 #[test]
 fn work_type_all_names_count() {
-    // 39 = 20 historical + 2 fundamental + 7 pathology + 5 coverage-gap
-    //    + 1 idle-transition + 3 compute-primitive + 1 cross-affinity
-    //    (CrossAffinityChurn) variant.
-    assert_eq!(WorkType::ALL_NAMES.len(), 39);
+    // `ALL_NAMES` is derived by `strum::VariantNames` from the `WorkType`
+    // enum, so its length is exactly the variant count (currently 45,
+    // including the serde-skipped `Custom`, which strum still names).
+    // Pinning it catches a variant added or removed without the parallel
+    // `name()` / `from_name()` / dispatch maintenance; bump it when the
+    // variant set changes intentionally.
+    assert_eq!(WorkType::ALL_NAMES.len(), 45);
 }
 
 #[test]
@@ -803,7 +884,7 @@ mod partial_eq {
         }
         let cf = CustomFn(marker);
         let stop = AtomicBool::new(false);
-        let ctx = WorkerCtx::new(&stop, &[], &[]);
+        let ctx = WorkerCtx::new(&stop, &[], &[], None, CustomCfg::default());
         let via_call = cf.call(&ctx);
         assert_eq!(
             via_call.work_units, 0xdeadbeef,
@@ -832,6 +913,95 @@ mod partial_eq {
         let b = WorkType::custom("x", g);
         assert_eq!(a, a2, "same fn ptr + same name → equal");
         assert_ne!(a, b, "different fn ptr → unequal even with same name");
+    }
+
+    #[test]
+    fn custom_cfg_default_is_zero() {
+        let d = CustomCfg::default();
+        assert_eq!(d.u64s, [0u64; 4]);
+        assert_eq!(d.usizes, [0usize; 4]);
+        assert_eq!(d.i32s, [0i32; 4]);
+        assert_eq!(d.bools, [false; 4]);
+        assert_eq!(d.blob, [0u8; 32]);
+        assert_eq!(d.blob_len, 0);
+    }
+
+    #[test]
+    fn custom_cfg_setters_chain() {
+        let c = CustomCfg::default()
+            .u64_slot(0, 7)
+            .usize_slot(1, 9)
+            .i32_slot(2, -3)
+            .bool_slot(3, true)
+            .blob(b"hi");
+        assert_eq!(c.u64s[0], 7);
+        assert_eq!(c.usizes[1], 9);
+        assert_eq!(c.i32s[2], -3);
+        assert!(c.bools[3]);
+        assert_eq!(&c.blob[..2], b"hi");
+        assert_eq!(c.blob_len, 2);
+        // A blob longer than 32 bytes truncates to 32.
+        let big = CustomCfg::default().blob(&[0xAB; 64]);
+        assert_eq!(big.blob_len, 32);
+        assert_eq!(big.blob, [0xAB; 32]);
+    }
+
+    #[test]
+    fn custom_with_carries_cfg() {
+        let cfg = CustomCfg::default().u64_slot(0, 0xDEAD);
+        match WorkType::custom_with("x", stub_custom_fn, cfg) {
+            WorkType::Custom { cfg: got, .. } => assert_eq!(got, cfg),
+            other => panic!("custom_with must build a Custom variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn custom_defaults_cfg() {
+        match WorkType::custom("x", stub_custom_fn) {
+            WorkType::Custom { cfg, .. } => assert_eq!(cfg, CustomCfg::default()),
+            other => panic!("custom must build a Custom variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn custom_partial_eq_includes_cfg() {
+        let a = WorkType::custom_with("x", stub_custom_fn, CustomCfg::default().u64_slot(0, 1));
+        let a2 = WorkType::custom_with("x", stub_custom_fn, CustomCfg::default().u64_slot(0, 1));
+        let b = WorkType::custom_with("x", stub_custom_fn, CustomCfg::default().u64_slot(0, 2));
+        assert_eq!(a, a2, "same name + fn + cfg → equal");
+        assert_ne!(a, b, "same name + fn but different cfg → unequal");
+    }
+
+    #[test]
+    fn worker_ctx_exposes_cfg() {
+        let stop = AtomicBool::new(false);
+        let cfg = CustomCfg::default().u64_slot(0, 0xBEEF);
+        let ctx = WorkerCtx::new(&stop, &[], &[], None, cfg);
+        assert_eq!(ctx.cfg().u64s[0], 0xBEEF);
+        assert_eq!(ctx.cfg(), cfg);
+    }
+
+    #[test]
+    fn custom_cfg_is_hashset_key() {
+        use std::collections::HashSet;
+        // Eq + Hash (all fields are integer/bool/array — no float) let
+        // CustomCfg key a set, matching the POD-config sibling AluWidth
+        // (config/sched.rs), which also derives Eq + Hash.
+        let mut s = HashSet::new();
+        s.insert(CustomCfg::default());
+        s.insert(CustomCfg::default().u64_slot(0, 1));
+        assert!(s.contains(&CustomCfg::default()));
+        assert!(s.contains(&CustomCfg::default().u64_slot(0, 1)));
+        assert!(!s.contains(&CustomCfg::default().u64_slot(0, 2)));
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn custom_cfg_slot_setter_panics_out_of_range() {
+        // Indexed slot setters panic past the array length (documented
+        // `# Panics`); the arrays are length 4, so index 4 is out of range.
+        let _ = CustomCfg::default().u64_slot(4, 1);
     }
 
     #[test]

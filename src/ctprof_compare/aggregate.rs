@@ -47,6 +47,7 @@ use std::fmt;
 /// scalar — so the numeric is optional and rows without one
 /// fall to the bottom of the default sort.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Aggregated {
     /// Group-wide sum produced by the
     /// [`super::AggRule::SumCount`] / [`super::AggRule::SumNs`] /
@@ -102,6 +103,24 @@ pub enum Aggregated {
         total: usize,
     },
     Affinity(AffinitySummary),
+    /// The metric's capture-gated family was NOT measured for any thread in the
+    /// group — the taskstats genetlink query failed for every thread (the
+    /// query-level `ThreadState::taskstats_measured` flag is false: CONFIG_TASKSTATS
+    /// off / no CAP_NET_ADMIN / query raced exit), or — for the jemalloc byte
+    /// counters — no thread's per-thread probe READ succeeded (non-jemalloc
+    /// process, probe could not attach, or the read failed) — distinct from a
+    /// measured zero. (A sub-family disabled while the query still succeeds — e.g.
+    /// CONFIG_TASK_XACCT off, or the `kernel.task_delayacct` sysctl off, with the
+    /// other family on — now IS Absent: the measured predicate ANDs the per-thread
+    /// query-Ok with the per-sub-family active flag baked from host probes. See the
+    /// `taskstats_measured` field doc.) Produced by [fn@super::aggregate]'s
+    /// caller when the family has a
+    /// measured predicate, the bucket is non-empty, and no contributing thread
+    /// captured it. `numeric()` returns `None`, so a derived metric consuming it
+    /// (e.g. `total_offcpu_delay_ns`, `live_heap_estimate`) short-circuits to
+    /// absent rather than computing from a sentinel `0`, and the renderer prints
+    /// "-" rather than "0". A MEASURED zero stays `Sum(0)` and renders "0".
+    Absent,
 }
 
 /// CPU-affinity aggregation result.
@@ -131,6 +150,9 @@ impl Aggregated {
                 Some((*min as f64 + *max as f64) / 2.0)
             }
             Aggregated::Mode { .. } => None,
+            // Capture-gated family not measured for the group → no scalar, so a
+            // consuming derived metric short-circuits to absent ("-").
+            Aggregated::Absent => None,
             Aggregated::Affinity(s) => {
                 // Number of allowed CPUs is the natural scalar. When
                 // the group is uniform, `min_cpus == max_cpus`; when
@@ -242,6 +264,11 @@ impl fmt::Display for Aggregated {
                     write!(f, "{}-{} cpus (mixed)", s.min_cpus, s.max_cpus)
                 }
             }
+            // Not-measured marker. The unit-suffixed render path
+            // (`scale::format_value_cell`) special-cases Absent to a bare "-"
+            // (no unit ladder); this bare Display is the fallback for any other
+            // consumer, so it carries no unit either.
+            Aggregated::Absent => write!(f, "-"),
         }
     }
 }
@@ -329,6 +356,14 @@ pub(super) fn merge_aggregated_into(existing: &mut Aggregated, val: &Aggregated)
                 _ => None,
             };
         }
+        // Not-measured marker — measured wins. An Absent `existing` is replaced
+        // by `val` (so a measured group's value survives a fudge merge with an
+        // unmeasured one; both-Absent stays Absent since `val` is also Absent);
+        // an Absent `val` contributes nothing to a measured `existing`. This
+        // keeps a fudged row's measured-ness as "any contributor measured it",
+        // matching the aggregate-level rule.
+        (existing_slot @ Aggregated::Absent, v) => *existing_slot = v.clone(),
+        (_, Aggregated::Absent) => {}
         _ => {}
     }
 }

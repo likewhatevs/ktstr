@@ -3,6 +3,7 @@
 //! Split from rust_init.rs; the shared consts/statics/imports live in the
 //! parent module (`super`), reached via the glob below.
 use super::*;
+use crate::scenario::ops::{ScxState, scx_state};
 
 /// Outcome of [`poll_startup`].
 #[derive(Debug)]
@@ -16,15 +17,20 @@ pub(crate) enum StartupStatus {
 /// Outcome of [`poll_scx_attached`].
 #[derive(Debug, PartialEq, Eq)]
 enum ScxAttachStatus {
-    /// sched_ext root kobject exposes a non-empty `ops` attribute —
-    /// scheduler registered and its ops name is populated.
+    /// sched_ext is registered AND fully enabled: `root/ops` is non-empty
+    /// AND `/sys/kernel/sched_ext/state` reads `enabled` — the scheduler
+    /// finished `scx_enable` (ops.init ran, every task was initialized, the
+    /// kernel set `SCX_ENABLED`), not merely registered. See
+    /// `scx_attach_ready`.
     Attached,
     /// Poll window closed. At least one read of `root/ops` succeeded
     /// (the kernel supports sched_ext and the kset exists), but the
-    /// file never became non-empty before the timeout. Typically
-    /// means the scheduler process is alive but has not finished
-    /// `scx_alloc_and_add_sched` — often a BPF verifier reject, an
-    /// ops-mismatch, or a slow userspace init path.
+    /// attach never completed before the timeout: either `root/ops`
+    /// stayed empty (scheduler never registered) or it registered but
+    /// `/sys/kernel/sched_ext/state` never reached `enabled` — stuck in
+    /// `enabling`, or the enable FAILED and the state moved on to
+    /// `disabling`/`disabled`. Typically a BPF verifier reject, an
+    /// ops-mismatch, a slow init, or an ops.init/enable failure.
     Timeout,
     /// Every read of `root/ops` returned `Err`. Either the kernel
     /// lacks sched_ext support entirely or the sysfs tree has not
@@ -35,23 +41,45 @@ enum ScxAttachStatus {
 }
 
 impl ScxAttachStatus {
-    /// True when the scheduler registered successfully. Equivalent to
-    /// the pre-enum `bool` return value.
+    /// True when the scheduler is registered AND fully enabled (see
+    /// `ScxAttachStatus::Attached`).
     fn is_attached(&self) -> bool {
         matches!(self, ScxAttachStatus::Attached)
     }
 }
 
+/// True when sched_ext is both REGISTERED (`root/ops` content non-empty) and
+/// fully ENABLED (`/sys/kernel/sched_ext/state` reads "enabled", i.e. `state`
+/// is `Some(ScxState::Enabled)`).
+///
+/// The kernel adds the `root` kobject — making `root/ops` non-empty — EARLY in
+/// `scx_root_enable_workfn` (kernel/sched/ext.c), BEFORE it runs `ops.init`,
+/// initializes every task, and performs the final `SCX_ENABLING` ->
+/// `SCX_ENABLED` transition (`scx_tryset_enable_state`). Gating attach on
+/// `root/ops` alone therefore reports "attached" while the scheduler is still
+/// ENABLING, letting the workload (and the host monitor's first reads) run
+/// against a half-up scheduler — a silent wrong result. Requiring
+/// `state == Some(ScxState::Enabled)` closes that race; it also rejects a
+/// registered-but-FAILED enable, where the state goes `ENABLING` ->
+/// `DISABLING` -> `DISABLED` and the ops-only check would mis-report attached.
+///
+/// Pure over its inputs so the predicate is unit-testable without a live scx
+/// scheduler; `poll_scx_attached` supplies the live `root/ops` contents and the
+/// `scx_state` reading.
+pub(crate) fn scx_attach_ready(root_ops_contents: &str, state: Option<ScxState>) -> bool {
+    !root_ops_contents.trim().is_empty() && state == Some(ScxState::Enabled)
+}
+
 /// Poll `/sys/kernel/sched_ext/root/ops` at `interval` cadence for up
 /// to `timeout`.
 ///
-/// Returns [`ScxAttachStatus::Attached`] as soon as the file is
-/// non-empty (a scheduler is registered and its ops struct has a
-/// populated name). When the window closes without a successful
-/// attachment, distinguishes [`Timeout`](ScxAttachStatus::Timeout)
-/// (reads succeeded but the file never became non-empty — the
-/// scheduler did not finish registering) from
-/// [`SysfsAbsent`](ScxAttachStatus::SysfsAbsent) (every read
+/// Returns [`ScxAttachStatus::Attached`] once `root/ops` is non-empty
+/// AND `/sys/kernel/sched_ext/state` reads `enabled` — registered AND
+/// fully enabled (see `scx_attach_ready`). When the window closes
+/// without that, distinguishes [`Timeout`](ScxAttachStatus::Timeout)
+/// (`root/ops` reads succeeded but attach never completed — never
+/// registered, or registered but never reached `enabled`) from
+/// [`SysfsAbsent`](ScxAttachStatus::SysfsAbsent) (every `root/ops` read
 /// errored — the kernel lacks sched_ext sysfs entirely).
 ///
 /// The sysfs path is built in two steps by the kernel:
@@ -65,16 +93,17 @@ impl ScxAttachStatus {
 ///   attribute is registered on `scx_ktype` via `scx_sched_groups`;
 ///   `scx_attr_ops_show` emits `sch->ops.name` through `sysfs_emit`.
 ///
-/// Semantics we can claim based on the kernel flow above: a non-empty
-/// `root/ops` proves the scheduler completed `scx_alloc_and_add_sched`
-/// — the scx_sched struct is allocated, `sch->ops = *ops` has copied
-/// the userspace-provided ops (including `name`), and the kobject is
-/// registered with the kset. The kobject add happens BEFORE any BPF
-/// callback (`ops.init`, `ops.enable`, `ops.runnable`, etc.) runs, so
-/// a non-empty read does NOT prove those callbacks validated. Use
-/// this poll only to confirm "scheduler registered and name
-/// populated"; verify BPF callback success via monitor telemetry or
-/// the scheduler's own exit kind.
+/// Semantics: a non-empty `root/ops` proves the scheduler completed
+/// `scx_alloc_and_add_sched` (scx_sched allocated, `sch->ops = *ops`
+/// copied the ops including `name`, kobject registered with the kset),
+/// but the kobject add happens BEFORE `ops.init`, per-task init, and the
+/// `SCX_ENABLED` transition — so a non-empty `root/ops` does NOT prove
+/// the scheduler is live. This poll therefore ALSO requires
+/// `/sys/kernel/sched_ext/state` == `enabled` (via `scx_state`), so a
+/// returned `Attached` means the BPF enable completed and the workload
+/// can run against a fully-up scheduler. (Crash/exit detection AFTER
+/// enable is still the caller's job — monitor telemetry or the
+/// scheduler's own exit kind.)
 ///
 /// Separate from [`poll_startup`] (which watches the child process
 /// state): a scheduler can be `Alive` from the process-waitpid
@@ -102,7 +131,14 @@ fn poll_scx_attached(
         });
         if read_outcome.is_ok() {
             ever_read_ok = true;
-            if !buf.trim().is_empty() {
+            // Attached only when REGISTERED (non-empty root/ops) AND fully
+            // ENABLED (state == "enabled"): the kernel adds root/ops early in
+            // scx_root_enable_workfn, before ops.init / per-task init / the
+            // SCX_ENABLED transition, so root/ops alone races a still-ENABLING
+            // scheduler. scx_state() re-reads /sys/kernel/sched_ext/state each
+            // call (cheap; the cadence below drives the ENABLING->ENABLED
+            // re-check on kernels that do not sysfs_notify the transition).
+            if scx_attach_ready(&buf, scx_state()) {
                 return Some(());
             }
         }
@@ -117,13 +153,16 @@ fn poll_scx_attached(
     //     kobject_init_and_add(..., "root"))
     //
     // BELT-AND-BRACES CADENCE: the helper's `cadence` parameter caps
-    // each poll(2) at `interval`. Verified at kernel/sched/ext.c:6380
-    // scx_alloc_and_add_sched — `sch->ops = *ops` runs BEFORE
-    // `kobject_init_and_add(..., "root")`, so by IN_CREATE wake time
-    // the attribute reads non-empty. The cadence is defense-in-depth
-    // against (a) future kernel reordering, (b) inotify event loss
-    // under pressure, (c) out-of-band kobject creation without
-    // ops.name pre-population.
+    // each poll(2) at `interval`. In scx_alloc_and_add_sched
+    // `sch->ops = *ops` runs BEFORE `kobject_init_and_add(..., "root")`,
+    // so by IN_CREATE wake time `root/ops` reads non-empty. The cadence
+    // is ALSO load-bearing for the state==`enabled` half of the
+    // predicate: the `enabling`->`enabled` transition (later in
+    // scx_root_enable_workfn) is not `sysfs_notify`'d and fires no
+    // inotify event on this dir, so the periodic cadence re-check is what
+    // observes it. Plus defense-in-depth against (a) future kernel
+    // reordering, (b) inotify event loss under pressure, (c) out-of-band
+    // kobject creation without ops.name pre-population.
     let outcome = kernfs_evented_wait(
         "/sys/kernel/sched_ext/",
         AddWatchFlags::IN_CREATE | AddWatchFlags::IN_MOVED_TO,
@@ -282,35 +321,65 @@ pub(crate) fn poll_startup(
 
 /// Probe-pipeline drain handles passed to [`start_scheduler`] so the
 /// early-bail paths (scheduler Died, not Attached, spawn Err) can
-/// flush probe output to COM2 before calling `force_reboot()`. The
-/// success path's drain runs in [`start_sched_exit_monitor`]
-/// instead — it sees the scheduler exit notification and waits on
-/// `output_done` there.
+/// flush probe output before calling `force_reboot()`, and to the hvc0
+/// graceful-shutdown handler so it can drain on the watchdog
+/// soft-shutdown path. The success path's drain runs in
+/// [`start_sched_exit_monitor`] instead — it sees the scheduler exit
+/// notification and waits on `output_done` there. The payload travels
+/// the virtio bulk port (the probe thread `println!`s it to stdout,
+/// which `redirect_stdio_to_bulk_port` ships over the bulk port), NOT
+/// COM2; the host recovers it when it drains that port.
 pub(crate) struct ProbeDrain {
     /// Probe-thread stop request. Setting this wakes the probe
     /// thread out of its ring-buffer poll loop; the thread then
     /// emits its payload and sets `output_done`.
     pub(crate) stop: Arc<AtomicBool>,
-    /// One-shot signal: set by the probe thread after writing
-    /// `PROBE_PAYLOAD_END` to COM2. Waited on event-driven; the
-    /// outer VM wall-clock timeout is the only safety net for a
-    /// hung probe (per the queue-management policy: don't add
-    /// arbitrary local timeouts when an event source exists).
+    /// One-shot signal: set by the probe thread after `println!`ing
+    /// `PROBE_OUTPUT_END` (the payload goes to stdout → the bulk-port
+    /// forwarder, not COM2). Waited on with a BOUNDED cap on both drain
+    /// paths: the early-bail paths cap at `PROBE_DRAIN_GRACE` (30s, the
+    /// host's VM-deadline grace — they have no watchdog window of their own);
+    /// the hvc0 shutdown drain uses a tighter bound fitting the 3s watchdog
+    /// window. On the cap the host recovers the partial payload
+    /// (`extract_probe_output`).
     pub(crate) output_done: Arc<crate::sync::Latch>,
 }
 
-/// Drain the probe pipeline: signal stop, then block on
-/// `output_done`. Called from each early-bail path in
-/// [`start_scheduler`] before `force_reboot()` so the probe
-/// payload (or the diagnostic-only payload the probe thread emits
-/// on a forced stop) reaches COM2's host-side capture buffer.
+/// Drain the probe pipeline: signal stop, then wait (bounded by `timeout`) for
+/// `output_done`. Called from each early-bail path in [`start_scheduler`] before
+/// `force_reboot()` so the probe payload (or the diagnostic-only payload the
+/// probe thread emits on a forced stop) reaches the host — emitted over the
+/// virtio bulk port by the stdout forwarder, recovered when the host drains it.
+/// Returns `true` if `output_done` was observed within `timeout` (or no probe
+/// stack was supplied — a no-op), `false` on the cap. Bounded so a hung probe
+/// thread cannot wedge the bail until the coarse outer VM wall-clock — the prior
+/// unbounded `output_done.wait()` relied on that wall-clock as its only net.
 ///
-/// `drain` is `None` when no probe stack was supplied — every
-/// caller is a no-op in that case.
-fn drain_probe_pipeline(drain: Option<&ProbeDrain>) {
-    let Some(d) = drain else { return };
+/// The early-bail callers pass the auto-repro probe-drain budget
+/// ([`crate::test_support::PROBE_DRAIN_GRACE`], 30s) — the same grace the
+/// host already adds to the VM deadline for the probe drain, so the guest cap
+/// stays within the host's window (over-sized on success: the guest force-reboots
+/// the moment the drain completes). The hvc0 soft-shutdown drain
+/// (`dump::drain_probe_for_shutdown`) uses its own tighter bound that
+/// fits the 3 s watchdog window — a different outer budget, so NOT shared. On the
+/// cap the payload may be truncated, but it is loudly absent: the host's
+/// `extract_probe_output` recovers the complete events captured before the
+/// terminator and persists the partial.
+///
+/// `drain` is `None` when no probe stack was supplied — every caller is a
+/// no-op in that case.
+fn drain_probe_pipeline(drain: Option<&ProbeDrain>, timeout: std::time::Duration) -> bool {
+    let Some(d) = drain else { return true };
     d.stop.store(true, Ordering::Release);
-    d.output_done.wait();
+    let drained = d.output_done.wait_timeout(timeout);
+    if !drained {
+        tracing::warn!(
+            ?timeout,
+            "probe drain hit the cap before PROBE_OUTPUT_END; the probe payload may be \
+             truncated (the host recovers the partial)"
+        );
+    }
+    drained
 }
 
 /// Wait up to `timeout` for `child` to exit (evented via `pidfd_open` +
@@ -662,10 +731,10 @@ pub(crate) fn spawn_scheduler_from_paths(
                 "",
             );
             crate::vmm::guest_comms::send_exit(1);
-            // Drain the probe pipeline before reboot so
-            // PROBE_OUTPUT_END hits COM2 ahead of force_reboot.
+            // Drain the probe pipeline before reboot so PROBE_OUTPUT_END
+            // is emitted over the bulk port ahead of force_reboot.
             // No-op when no probe stack was supplied.
-            drain_probe_pipeline(probe_drain.as_ref());
+            drain_probe_pipeline(probe_drain.as_ref(), crate::test_support::PROBE_DRAIN_GRACE);
             force_reboot();
         }
         Err(SpawnSchedulerError::StartupDied { log_path }) => {
@@ -681,7 +750,7 @@ pub(crate) fn spawn_scheduler_from_paths(
                 "",
             );
             crate::vmm::guest_comms::send_exit(1);
-            drain_probe_pipeline(probe_drain.as_ref());
+            drain_probe_pipeline(probe_drain.as_ref(), crate::test_support::PROBE_DRAIN_GRACE);
             force_reboot();
         }
         Err(SpawnSchedulerError::NotAttached { reason, log_path }) => {
@@ -691,8 +760,95 @@ pub(crate) fn spawn_scheduler_from_paths(
                 reason,
             );
             crate::vmm::guest_comms::send_exit(1);
-            drain_probe_pipeline(probe_drain.as_ref());
+            drain_probe_pipeline(probe_drain.as_ref(), crate::test_support::PROBE_DRAIN_GRACE);
             force_reboot();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `scx_attach_ready` (the attach predicate) is true ONLY when the
+    /// scheduler is both registered (non-empty `root/ops`) AND fully enabled
+    /// (`state == Enabled`). A registered-but-still-ENABLING scheduler — the
+    /// race window where the kernel added `root/ops` but has not yet set
+    /// `SCX_ENABLED` — is NOT reported attached; nor is a failed enable
+    /// (`Disabling`/`Disabled`) or a missing state read. Exhaustive over the
+    /// state axis and the empty/non-empty `root/ops` axis.
+    #[test]
+    fn scx_attach_ready_requires_registered_and_enabled() {
+        // Registered + enabled -> the one true case.
+        assert!(scx_attach_ready("ktstr_ops\n", Some(ScxState::Enabled)));
+        // Registered but mid-enable / failed-enable / absent state -> NOT ready
+        // (the race + failed-enable cases the old ops-only predicate mis-reported
+        // as attached).
+        assert!(!scx_attach_ready("ktstr_ops\n", Some(ScxState::Enabling)));
+        assert!(!scx_attach_ready("ktstr_ops\n", Some(ScxState::Disabling)));
+        assert!(!scx_attach_ready("ktstr_ops\n", Some(ScxState::Disabled)));
+        assert!(!scx_attach_ready("ktstr_ops\n", None));
+        // Not registered (empty / whitespace-only root/ops) -> NOT ready even
+        // when state reads enabled (a stale/foreign enable without our ops).
+        assert!(!scx_attach_ready("", Some(ScxState::Enabled)));
+        assert!(!scx_attach_ready("   \n", Some(ScxState::Enabled)));
+        assert!(!scx_attach_ready("", None));
+    }
+
+    fn probe_drain() -> ProbeDrain {
+        ProbeDrain {
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            output_done: std::sync::Arc::new(crate::sync::Latch::new()),
+        }
+    }
+
+    /// The early-bail drain is BOUNDED: an unset `output_done` (a hung probe
+    /// thread) returns `false` at the cap instead of blocking forever (the prior
+    /// `output_done.wait()` was unbounded). Asserts `stop` was
+    /// signaled and the call returned well inside the cap (a short test cap so
+    /// the test is fast).
+    #[test]
+    fn drain_probe_pipeline_caps_on_unset_output_done() {
+        let pd = probe_drain();
+        let t0 = std::time::Instant::now();
+        let drained = drain_probe_pipeline(Some(&pd), std::time::Duration::from_millis(20));
+        assert!(
+            !drained,
+            "unset output_done -> cap-hit -> false (not a hang)"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "returned at the cap, did not wait unbounded"
+        );
+        assert!(
+            pd.stop.load(std::sync::atomic::Ordering::Acquire),
+            "stop signaled to wake the probe thread"
+        );
+    }
+
+    /// `output_done` already set (PROBE_OUTPUT_END emitted) -> returns `true`
+    /// immediately, well inside the cap: the drain-until-marker (early-return)
+    /// half is preserved. A 60s cap we never approach pins "returns on the
+    /// marker, not the cap".
+    #[test]
+    fn drain_probe_pipeline_returns_early_on_output_done() {
+        let pd = probe_drain();
+        pd.output_done.set();
+        let t0 = std::time::Instant::now();
+        let drained = drain_probe_pipeline(Some(&pd), std::time::Duration::from_secs(60));
+        assert!(drained, "set output_done -> true");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "returned on the marker, not after the 60s cap"
+        );
+    }
+
+    /// No probe stack -> no-op, returns `true` (every caller is a no-op).
+    #[test]
+    fn drain_probe_pipeline_none_is_noop() {
+        assert!(drain_probe_pipeline(
+            None,
+            std::time::Duration::from_millis(1)
+        ));
     }
 }

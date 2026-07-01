@@ -395,14 +395,35 @@ impl AssertResult {
                 // drop, so the render distinguishes "stripped for size" from a
                 // carrier that genuinely measured nothing (already-empty vecs
                 // stay not-stripped).
+                // schbench per-phase histograms (wakeup + request, ~19 KiB each)
+                // also multiply by carrier count, so a many-carrier overflow
+                // with schbench carriers present must drop them too (a
+                // worker_count>1 schbench cgroup can emit several). Dropping
+                // schbench loses only the per-phase schbench percentiles (the
+                // derivation finds None → emits no key → the claim reads the
+                // metric as ABSENT, a loud degradation), never the verdict.
+                let schbench_samples = pc
+                    .schbench
+                    .as_ref()
+                    .map(|s| {
+                        s.wakeup.sample_count() + s.request.sample_count() + s.rps.sample_count()
+                    })
+                    .unwrap_or(0);
                 let had_samples = !pc.wake_latencies_ns.is_empty()
+                    || !pc.timer_latencies_ns.is_empty()
                     || !pc.run_delays_ns.is_empty()
-                    || !pc.off_cpu_pcts.is_empty();
-                dropped +=
-                    pc.wake_latencies_ns.len() + pc.run_delays_ns.len() + pc.off_cpu_pcts.len();
+                    || !pc.off_cpu_pcts.is_empty()
+                    || schbench_samples > 0;
+                dropped += pc.wake_latencies_ns.len()
+                    + pc.timer_latencies_ns.len()
+                    + pc.run_delays_ns.len()
+                    + pc.off_cpu_pcts.len()
+                    + schbench_samples as usize;
                 pc.wake_latencies_ns = Vec::new();
+                pc.timer_latencies_ns = Vec::new();
                 pc.run_delays_ns = Vec::new();
                 pc.off_cpu_pcts = Vec::new();
+                pc.schbench = None;
                 if had_samples {
                     pc.stripped = true;
                 }
@@ -524,35 +545,20 @@ impl AssertResult {
     /// Skip survives only when both inputs were Skip-only because a
     /// Pass or Inconclusive entry in either side beats Skip.
     pub fn merge(&mut self, mut other: AssertResult) {
-        /// Lowest-non-zero fold: `*self_field` becomes `other_field`
-        /// when `other_field` is strictly positive AND either
-        /// `*self_field` is zero (uninitialized sentinel) or
-        /// `other_field` is strictly smaller than `*self_field`.
-        ///
-        /// This is NOT `f64::min` — a plain min would let an
-        /// unreported cgroup (`0.0` sentinel) clobber a real
-        /// reading from another cgroup, treating "no data yet" as
-        /// "worst possible." The accumulator pattern
-        /// `AssertResult::pass().merge(real)` starts with 0.0 from
-        /// `Default`, and a plain min would destroy any positive
-        /// reading folded in — so every lowest-is-worse rollup
-        /// uses this fold to treat 0.0 as a sentinel rather than a
-        /// real measurement.
-        fn fold_lowest_nonzero(self_field: &mut f64, other_field: f64) {
-            if other_field > 0.0 && (*self_field == 0.0 || other_field < *self_field) {
-                *self_field = other_field;
-            }
-        }
-
         self.outcomes.extend(other.outcomes);
         self.passes.extend(other.passes);
         self.info_notes.extend(other.info_notes);
         let s = &mut self.stats;
         let o = &other.stats;
+        // total_workers / total_cpus are ktstr-configured TOPOLOGY counts
+        // (bounded by the guest CPU count), so plain `+=`. total_migrations /
+        // total_iterations are guest-runtime monotonic counters pooled across VM
+        // results: saturating_add so a corrupt/hostile value can't wrap to a
+        // silently-wrong run-level total (exact for every in-range value).
         s.total_workers += o.total_workers;
         s.total_cpus += o.total_cpus;
-        s.total_migrations += o.total_migrations;
-        s.total_iterations += o.total_iterations;
+        s.total_migrations = s.total_migrations.saturating_add(o.total_migrations);
+        s.total_iterations = s.total_iterations.saturating_add(o.total_iterations);
         s.worst_spread = s.worst_spread.max(o.worst_spread);
         s.worst_migration_ratio = s.worst_migration_ratio.max(o.worst_migration_ratio);
         // worst_p99/median/cv wake-latency + mean/worst run-delay are no
@@ -560,9 +566,11 @@ impl AssertResult {
         // post-merge from the per-cgroup raw samples by
         // `populate_run_distribution_metrics` (the pooled-distribution
         // percentile, not a max of per-cgroup reductions).
-        s.worst_cross_node_migration_ratio = s
-            .worst_cross_node_migration_ratio
-            .max(o.worst_cross_node_migration_ratio);
+        // worst_cross_node_migration_ratio is no longer folded here: it is
+        // `MetricKind::WorstCrossNodeRatio`, re-pooled post-merge by
+        // `populate_run_distribution_metrics` from the per-phase NUMA carriers
+        // (the MAX per-cgroup churn ratio over the latest residency total), so the
+        // sidecar value agrees with run_metric's re-derivation.
         // worst_wake_latency_tail_ratio is no longer folded here: it is
         // `MetricKind::WakeLatencyTailRatio`, re-selected post-merge by
         // `populate_run_distribution_metrics` (the max over the merged
@@ -578,9 +586,11 @@ impl AssertResult {
             s.worst_gap_ms = o.worst_gap_ms;
             s.worst_gap_cpu = o.worst_gap_cpu;
         }
-        // NUMA page locality: lowest-non-zero fold — see
-        // `fold_lowest_nonzero` above for the sentinel convention.
-        fold_lowest_nonzero(&mut s.worst_page_locality, o.worst_page_locality);
+        // worst_page_locality is no longer folded here: it is
+        // `MetricKind::WorstLowest` (NumaLocal/NumaTotal), re-pooled post-merge
+        // by `populate_run_distribution_metrics` from the per-phase NUMA carriers
+        // (a measured 0.0 — all pages off-node — wins the lowest; the buggy
+        // `fold_lowest_nonzero` that skipped it as a sentinel is removed).
         // Merge extensible metrics: take worst per key according to
         // each metric's polarity in the MetricDef registry. For
         // `higher_is_worse: true` the worst is max; for
@@ -1040,13 +1050,15 @@ impl AssertPlan {
         // telemetry. The (locality, total, local) triple is reused by that
         // check below so the value is computed once.
         let page_locality = numa_nodes.map(|nodes| {
+            // saturating: overflow-safe pool of per-worker per-node page counts
+            // (a corrupt component must not wrap the page-locality numerator/denom).
             let mut total: u64 = 0;
             let mut local: u64 = 0;
             for w in reports {
                 for (&node, &count) in &w.numa_pages {
-                    total += count;
+                    total = total.saturating_add(count);
                     if nodes.contains(&node) {
-                        local += count;
+                        local = local.saturating_add(count);
                     }
                 }
             }
@@ -1186,8 +1198,16 @@ impl AssertPlan {
         page_locality: Option<(f64, u64, u64)>,
     ) {
         if let Some(max_ratio) = self.max_migration_ratio {
-            let total_mig: u64 = reports.iter().map(|w| w.migration_count).sum();
-            let total_iters: u64 = reports.iter().map(|w| w.iterations).sum();
+            // saturating: overflow-safe pool of the per-worker migration / iteration
+            // counters that feed the migration-ratio verdict.
+            let total_mig: u64 = reports
+                .iter()
+                .map(|w| w.migration_count)
+                .fold(0u64, u64::saturating_add);
+            let total_iters: u64 = reports
+                .iter()
+                .map(|w| w.iterations)
+                .fold(0u64, u64::saturating_add);
             if total_iters == 0 {
                 r.record_inconclusive(AssertDetail::new(
                     DetailKind::Migration,
@@ -1264,8 +1284,13 @@ impl AssertPlan {
             // cgroup-wide total of allocated pages.
             let total_pages: u64 = reports
                 .iter()
-                .map(|w| w.numa_pages.values().sum::<u64>())
-                .sum();
+                .map(|w| {
+                    w.numa_pages
+                        .values()
+                        .copied()
+                        .fold(0u64, u64::saturating_add)
+                })
+                .fold(0u64, u64::saturating_add);
             let migrated_pages: u64 = reports
                 .iter()
                 .map(|w| w.vmstat_numa_pages_migrated)
@@ -1291,7 +1316,11 @@ impl AssertPlan {
                 if w.numa_pages.is_empty() {
                     continue;
                 }
-                let total: u64 = w.numa_pages.values().sum();
+                let total: u64 = w
+                    .numa_pages
+                    .values()
+                    .copied()
+                    .fold(0u64, u64::saturating_add);
                 if total > 0 {
                     evaluated += 1;
                     r.merge(assert_slow_tier_ratio(
@@ -1335,8 +1364,8 @@ pub(crate) fn assert_slow_tier_ratio(
     let slow_pages: u64 = numa_pages
         .iter()
         .filter(|(node, _)| !cpu_nodes.contains(node))
-        .map(|(_, count)| count)
-        .sum();
+        .map(|(_, &count)| count)
+        .fold(0u64, u64::saturating_add);
     let ratio = slow_pages as f64 / total_pages as f64;
     if ratio > max_ratio {
         r.record_fail(AssertDetail::new(

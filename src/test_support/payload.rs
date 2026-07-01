@@ -759,8 +759,21 @@ pub enum Polarity {
     /// runtime in both debug and release.
     TargetValue(f64),
     /// Direction not declared; the metric is recorded but not
-    /// classified as regression-relevant.
+    /// classified as regression-relevant. This is the CONSERVATIVE
+    /// default for an UNCLASSIFIED metric: the comparison path treats
+    /// it as higher-is-worse (see `MetricDef::higher_is_worse` /
+    /// `classify_direction`) so a real regression in a metric someone
+    /// forgot to classify is still caught rather than silently ignored.
     Unknown,
+    /// Deliberately directionless: the metric is recorded and DISPLAYED
+    /// in comparisons but is NEVER classified as a regression or
+    /// improvement and NEVER affects the exit code. Distinct from
+    /// [`Polarity::Unknown`] (the conservative higher-is-worse default
+    /// for *unclassified* metrics): `Informational` is the explicit
+    /// "this counter has no good/bad direction" choice — e.g. wakeup /
+    /// context-switch / yield counts, where more is neither inherently
+    /// better nor worse. `classify_direction` returns `None` for it.
+    Informational,
 }
 
 impl Polarity {
@@ -1001,6 +1014,60 @@ impl MetricCheck {
     /// missing-metric failures.
     pub const fn exit_code_eq(expected: i32) -> MetricCheck {
         MetricCheck::ExitCodeEq(expected)
+    }
+
+    /// Typed sibling of [`Self::min`] — a typo-proof `BuiltinMetric` instead of a
+    /// registry-name string. `const` (via `BuiltinMetric::wire_name`) so it
+    /// composes in `const` payload-check tables exactly like [`Self::min`]. Use
+    /// this for a registered built-in metric; keep [`Self::min`] for the dynamic
+    /// keyspace (dotted LLM-extraction paths, scheduler-runtime keys).
+    ///
+    /// ```
+    /// use ktstr::prelude::*;
+    /// // The typed checks compose into a `const` table — exactly the
+    /// // `&'static [MetricCheck]` a `Payload` carries in `default_checks`:
+    /// const CHECKS: &[MetricCheck] = &[
+    ///     MetricCheck::min_builtin(BuiltinMetric::TaobenchTotalQps, 1000.0),
+    ///     MetricCheck::exists_builtin(BuiltinMetric::SchbenchLoopCount),
+    /// ];
+    /// assert_eq!(CHECKS.len(), 2);
+    /// ```
+    pub const fn min_builtin(metric: crate::stats::BuiltinMetric, value: f64) -> MetricCheck {
+        MetricCheck::Min {
+            metric: metric.wire_name(),
+            value,
+        }
+    }
+
+    /// Typed sibling of [`Self::max`] — see [`Self::min_builtin`].
+    pub const fn max_builtin(metric: crate::stats::BuiltinMetric, value: f64) -> MetricCheck {
+        MetricCheck::Max {
+            metric: metric.wire_name(),
+            value,
+        }
+    }
+
+    /// Typed sibling of [`Self::range`] — see [`Self::min_builtin`]. Same
+    /// reversed-bounds construction panic as [`Self::range`].
+    pub const fn range_builtin(
+        metric: crate::stats::BuiltinMetric,
+        lo: f64,
+        hi: f64,
+    ) -> MetricCheck {
+        assert!(
+            lo <= hi,
+            "MetricCheck::range_builtin: lo must be <= hi (reversed bounds are an empty interval)"
+        );
+        MetricCheck::Range {
+            metric: metric.wire_name(),
+            lo,
+            hi,
+        }
+    }
+
+    /// Typed sibling of [`Self::exists`] — see [`Self::min_builtin`].
+    pub const fn exists_builtin(metric: crate::stats::BuiltinMetric) -> MetricCheck {
+        MetricCheck::Exists(metric.wire_name())
     }
 }
 
@@ -1244,6 +1311,87 @@ pub(crate) struct RawPayloadOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metric_check_builtin_constructors_carry_the_wire_name() {
+        use crate::stats::BuiltinMetric;
+        // The typed const constructors store the same wire name as the &str
+        // form, so a built-in payload check is typo-proof without changing the
+        // stored key. (MetricCheck is Copy, not PartialEq, so match on the arm.)
+        match MetricCheck::min_builtin(BuiltinMetric::TaobenchTotalQps, 1000.0) {
+            MetricCheck::Min { metric, value } => {
+                assert_eq!(metric, "taobench_total_qps");
+                assert_eq!(value, 1000.0);
+            }
+            other => panic!("min_builtin must produce Min, got {other:?}"),
+        }
+        match MetricCheck::max_builtin(BuiltinMetric::TaobenchSlowQps, 5.0) {
+            MetricCheck::Max { metric, value } => {
+                assert_eq!(metric, "taobench_slow_qps");
+                assert_eq!(value, 5.0);
+            }
+            other => panic!("max_builtin must produce Max, got {other:?}"),
+        }
+        match MetricCheck::range_builtin(BuiltinMetric::WakeupP99LatencyUs, 1.0, 2.0) {
+            MetricCheck::Range { metric, lo, hi } => {
+                assert_eq!(metric, "wakeup_p99_latency_us");
+                assert_eq!((lo, hi), (1.0, 2.0));
+            }
+            other => panic!("range_builtin must produce Range, got {other:?}"),
+        }
+        match MetricCheck::exists_builtin(BuiltinMetric::SchbenchLoopCount) {
+            MetricCheck::Exists(metric) => assert_eq!(metric, "schbench_loop_count"),
+            other => panic!("exists_builtin must produce Exists, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn metric_check_builtin_constructors_compose_into_a_const_default_checks_table() {
+        use crate::stats::BuiltinMetric;
+        // The *_builtin constructors are `const fn`, so a typed check table is a
+        // plain `const` `&'static [MetricCheck]` — exactly the type of
+        // `Payload::default_checks`. This pins const-composition (the property the
+        // `const fn` buys) and documents the intended usage: a typo-proof
+        // default_checks table built from BuiltinMetric variants, not bare strings.
+        const CHECKS: &[MetricCheck] = &[
+            MetricCheck::min_builtin(BuiltinMetric::TaobenchTotalQps, 1000.0),
+            MetricCheck::max_builtin(BuiltinMetric::TaobenchSlowQps, 5.0),
+            MetricCheck::range_builtin(BuiltinMetric::WakeupP99LatencyUs, 1.0, 2.0),
+            MetricCheck::exists_builtin(BuiltinMetric::SchbenchLoopCount),
+        ];
+        // Same wire names the string constructors would store, in declaration order.
+        assert_eq!(CHECKS.len(), 4);
+        assert!(matches!(
+            CHECKS[0],
+            MetricCheck::Min {
+                metric: "taobench_total_qps",
+                ..
+            }
+        ));
+        assert!(matches!(
+            CHECKS[1],
+            MetricCheck::Max {
+                metric: "taobench_slow_qps",
+                ..
+            }
+        ));
+        assert!(matches!(
+            CHECKS[2],
+            MetricCheck::Range {
+                metric: "wakeup_p99_latency_us",
+                ..
+            }
+        ));
+        assert!(matches!(
+            CHECKS[3],
+            MetricCheck::Exists("schbench_loop_count")
+        ));
+
+        // The typed table is a `&'static [MetricCheck]` (the const's lifetime is
+        // elided) — it drops straight into a Payload's default_checks slot (the
+        // composition the const fn enables).
+        const _: &[MetricCheck] = CHECKS;
+    }
 
     #[test]
     fn payload_kernel_default_const_is_scheduler_kind() {
@@ -1646,6 +1794,20 @@ mod tests {
     #[should_panic(expected = "lo must be <= hi")]
     fn check_range_reversed_bounds_panics_at_construction() {
         let _ = MetricCheck::range("iops", 100.0, 50.0);
+    }
+
+    /// `MetricCheck::range_builtin` carries the same reversed-bounds construction
+    /// panic as [`MetricCheck::range`] (the typed sibling shares the `lo <= hi`
+    /// assert), so the typed payload-check path fails just as loudly on a
+    /// reversed range as the string form.
+    #[test]
+    #[should_panic(expected = "lo must be <= hi")]
+    fn check_range_builtin_reversed_bounds_panics_at_construction() {
+        let _ = MetricCheck::range_builtin(
+            crate::stats::BuiltinMetric::WakeupP99LatencyUs,
+            100.0,
+            50.0,
+        );
     }
 
     /// Equal bounds (`lo == hi`) describe a single-point interval —

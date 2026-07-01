@@ -21,7 +21,7 @@ use std::time::Duration;
 use super::host_topology;
 use super::net_config;
 use super::topology::{self, Topology};
-use super::vcpu::BpfMapWriteParams;
+use super::vcpu::{BpfMapWriteParams, WatchBpfMapParams};
 use super::{KtstrVm, disk_config};
 
 /// Builder for [`super::KtstrVm`].
@@ -71,21 +71,30 @@ pub struct KtstrVmBuilder {
     pub(crate) watchdog_timeout: Option<Duration>,
     pub(crate) rendezvous_timeout: Option<Duration>,
     bpf_map_writes: Vec<BpfMapWriteParams>,
+    watch_bpf_maps: Vec<WatchBpfMapParams>,
     pub(crate) performance_mode: bool,
+    /// Whether to expose the virtio-PCI transport in the guest. See the
+    /// `pci` setter.
+    pub(crate) pci_enabled: bool,
     no_perf_mode: bool,
     sched_enable_cmds: Vec<String>,
     sched_disable_cmds: Vec<String>,
     include_files: Vec<(String, PathBuf)>,
     /// v0 holds at most one DiskConfig; rendered as `/dev/vda`.
-    /// Vec retained for future multi-disk expansion. See
-    /// [`super::KtstrVm::disks`].
-    disks: Vec<disk_config::DiskConfig>,
-    /// Optional network device. `None` skips virtio-net entirely
-    /// (no FDT node, no MMIO range, no IRQ). `Some(_)` attaches one
-    /// virtio-net device with the given config; the in-VMM loopback
-    /// backend echoes TX bytes back to RX. v0 supports a single
-    /// device. See [`super::KtstrVm::network`].
-    network: Option<net_config::NetConfig>,
+    /// The optional single virtio-blk disk (set by `.disk()`). ktstr wires one
+    /// blk device; a single backing disk suffices for scheduler tests.
+    /// Multi-disk would mean N virtio-blk PCI functions (mirroring multi-NIC)
+    /// and can be re-introduced pre-1.0 if a real consumer appears. See
+    /// [`super::KtstrVm::disk`].
+    disk: Option<disk_config::DiskConfig>,
+    /// Network devices (appended by `.network()`). Empty skips virtio-net
+    /// entirely (no PCI NIC function / FDT node, no IRQ). Each entry attaches
+    /// one virtio-net device; the in-VMM loopback backend echoes TX bytes back
+    /// to RX. On x86_64 each NIC is a virtio-pci function on its own slot/GSI
+    /// (`kvm::virtio_net_pci_slot` / `kvm::virtio_net_gsi`), bounded by
+    /// `kvm::MAX_VIRTIO_NICS`; aarch64 supports a single MMIO NIC. See
+    /// [`super::KtstrVm::networks`].
+    networks: Vec<net_config::NetConfig>,
     /// Busybox bytes to pack at `bin/busybox`. `None` skips packing
     /// (test-mode VMs do not need shell utilities). `Some(bytes)`
     /// embeds the provided bytes — the library never owns busybox
@@ -124,7 +133,7 @@ pub struct KtstrVmBuilder {
     /// the full contract; the builder field flows through `build`
     /// unchanged.
     dual_snapshot: bool,
-    /// When set, [`super::KtstrVm::init_virtio_blk`] opens this path
+    /// When set, `KtstrVm::init_virtio_blk` opens this path
     /// directly as the virtio-blk backing file instead of allocating
     /// a fresh `tempfile()` (Raw branch) or invoking
     /// [`super::disk_template::ensure_template`] (Btrfs branch). The
@@ -241,13 +250,15 @@ impl Default for KtstrVmBuilder {
             watchdog_timeout: Some(Duration::from_secs(5)),
             rendezvous_timeout: None,
             bpf_map_writes: Vec::new(),
+            watch_bpf_maps: Vec::new(),
             performance_mode: false,
+            pci_enabled: false,
             no_perf_mode: false,
             sched_enable_cmds: Vec::new(),
             sched_disable_cmds: Vec::new(),
             include_files: Vec::new(),
-            disks: Vec::new(),
-            network: None,
+            disk: None,
+            networks: Vec::new(),
             busybox_bytes: None,
             #[cfg(feature = "wprof")]
             wprof: None,
@@ -519,11 +530,23 @@ impl KtstrVmBuilder {
     }
 
     /// Number of equally-spaced periodic snapshots to fire inside
-    /// the workload's 10%–90% window. `0` (the default) disables
-    /// periodic capture entirely. The freeze coordinator anchors
-    /// the window at the first `MSG_TYPE_SCENARIO_START` it sees,
-    /// so boot + verifier time do not eat the budget. Each fire
-    /// runs the same `freeze_and_capture(false)` path the
+    /// the capturable window's 10%–90% slice. `0` (the default)
+    /// disables periodic capture entirely. The window is
+    /// `[max(scenario_start, prereqs_ready), scenario_start +
+    /// workload_duration]`: the start floats to the prereq-ready
+    /// moment (kaslr + BPF-accessor attach) so cold-boot latency
+    /// cannot strand boundaries pre-ready, and the end is CLAMPED
+    /// to the workload end so captures never spill into
+    /// post-workload idle. On a warm boot the start equals
+    /// `scenario_start`, so the window is the full
+    /// `[scenario_start, scenario_start + workload_duration]` and
+    /// boot + verifier time do not eat the budget; on a cold boot
+    /// the window starts later and is shorter, so cross-run compares
+    /// of the window-averaged keys `avg_cpu_util_comp_scale` /
+    /// `avg_task_lat_cri` should use `--noise-adjust`. Each fire
+    /// runs the same
+    /// `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })`
+    /// path the
     /// on-demand `Op::CaptureSnapshot` handler uses and stores under
     /// `"periodic_NNN"` on the host's
     /// [`crate::scenario::snapshot::SnapshotBridge`]. Bounded above
@@ -593,20 +616,54 @@ impl KtstrVmBuilder {
 
     /// Schedule a host-side write into a named BPF map after the
     /// scheduler is loaded. `map_name_suffix` is matched against
-    /// `bpf_map.name` (kernel truncates to 15 chars); `offset` is
-    /// the byte offset within the array-map value region; `value`
-    /// is a `u32` written in native byte order.
+    /// `bpf_map.name` (kernel truncates to 15 chars); `field` names a
+    /// global in the map's section (e.g. `"crash"`, `"stall"`), resolved
+    /// to a byte offset against the map's program BTF at write time so
+    /// the offset tracks the compiler's `.bss` layout instead of a
+    /// fragile hardcoded constant; `value` is a `u32` written
+    /// little-endian (via `to_ne_bytes`, which is LE on the x86_64 /
+    /// aarch64 hosts ktstr targets — the guest reads the `.bss` global as
+    /// a plain LE int).
     ///
     /// Repeated calls queue additional writes; all queued writes run
     /// sequentially on the same `BpfMapAccessor` after the scheduler
     /// attaches, with a single guest-side unblock once every write
     /// completes. Order of calls is preserved.
-    #[allow(dead_code)]
-    pub fn bpf_map_write(mut self, map_name_suffix: &str, offset: usize, value: u32) -> Self {
+    pub fn bpf_map_write(mut self, map_name_suffix: &str, field: &str, value: u32) -> Self {
         self.bpf_map_writes.push(BpfMapWriteParams {
             map_name_suffix: map_name_suffix.to_string(),
-            offset,
+            field: field.to_string(),
             value,
+        });
+        self
+    }
+
+    /// Register a named scheduler BPF-map field to read observer-effect-free
+    /// from the free-running monitor into a run-level metric. Mirrors
+    /// [`Self::bpf_map_write`]; the monitor resolves + reads each target
+    /// lazily after the scheduler attaches.
+    pub fn watch_bpf_map(
+        mut self,
+        map_name_suffix: &str,
+        field: &str,
+        agg: crate::test_support::BpfMapAgg,
+        label: &str,
+    ) -> Self {
+        // A target's run-level metric key is `<scheduler-obj>_<label>`; the obj
+        // prefix is uniform per run, so two targets with the same label resolve
+        // to one key and collide in the fold — silently averaging (same agg) or
+        // flipping the fold class (gauge vs counter). Reject duplicate labels
+        // loudly at build time rather than emit a wrong metric.
+        assert!(
+            !self.watch_bpf_maps.iter().any(|p| p.label == label),
+            "duplicate watch_bpf_maps label {label:?}: two targets resolve to the \
+             same run-level metric key — declare distinct labels",
+        );
+        self.watch_bpf_maps.push(WatchBpfMapParams {
+            map_name_suffix: map_name_suffix.to_string(),
+            field: field.to_string(),
+            agg,
+            label: label.to_string(),
         });
         self
     }
@@ -630,6 +687,16 @@ impl KtstrVmBuilder {
     #[allow(dead_code)]
     pub fn performance_mode(mut self, enabled: bool) -> Self {
         self.performance_mode = enabled;
+        self
+    }
+
+    /// Expose the virtio-PCI transport in the guest: a PCI host bridge with
+    /// ECAM + legacy CAM config access and the PCI ACPI tables (MCFG + a
+    /// `_SB.PCI0` host bridge in the DSDT). Off by default — the guest boots
+    /// with `pci=off` and only the virtio-MMIO devices (console/block).
+    #[allow(dead_code)]
+    pub fn pci(mut self, enabled: bool) -> Self {
+        self.pci_enabled = enabled;
         self
     }
 
@@ -670,7 +737,7 @@ impl KtstrVmBuilder {
     /// at `/dev/vda`.
     ///
     /// Per-test backing is allocated by
-    /// [`super::KtstrVm::init_virtio_blk`]:
+    /// `KtstrVm::init_virtio_blk`:
     /// - `Filesystem::Raw` (the default): a fresh sparse
     ///   `tempfile()` per test, the kernel reclaims storage on
     ///   device drop.
@@ -708,7 +775,14 @@ impl KtstrVmBuilder {
     /// operators see the constraint at first use rather than
     /// debugging a cryptic ioctl errno.
     pub fn disk(mut self, disk: disk_config::DiskConfig) -> Self {
-        self.disks = vec![disk];
+        self.disk = Some(disk);
+        // On x86_64 the disk is a virtio-pci function (see `init_virtio_blk_pci`)
+        // and needs the host bridge + ECAM; aarch64 routes it over virtio-MMIO
+        // (no PCI yet), so leave pci_enabled untouched there. Mirrors `network()`.
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.pci_enabled = true;
+        }
         self
     }
 
@@ -722,17 +796,30 @@ impl KtstrVmBuilder {
     /// sockets bound by `ifindex` are the path that exercises the
     /// virtio device.
     ///
-    /// v0 supports a single device; calling this method twice
-    /// overwrites the prior `NetConfig`. Reached via the
-    /// `#[ktstr_test(network = ...)]` attribute
-    /// (`test_support::runtime::build_vm_builder_base` calls this when the
-    /// entry sets `network`), or directly by raw-library callers.
+    /// APPENDS a NIC; call it once per device. On x86_64 each NIC is a
+    /// virtio-pci function on its own slot/GSI, so the count is bounded by
+    /// `kvm::MAX_VIRTIO_NICS` (enforced at [`Self::build`], which errors on
+    /// overflow rather than silently dropping); aarch64 supports a single MMIO
+    /// NIC (build errors on >1). On x86_64 attaching a NIC enables the PCI host
+    /// bridge automatically — the transport is an implementation detail the
+    /// test author does not select. aarch64 keeps the virtio-MMIO NIC transport
+    /// (aarch64 PCI is a later increment), so PCI stays off there. Reached via
+    /// the `#[ktstr_test(networks = [...])]` attribute
+    /// (`test_support::runtime::build_vm_builder_base` calls this per entry
+    /// NIC), or directly by raw-library callers.
     pub fn network(mut self, network: net_config::NetConfig) -> Self {
-        self.network = Some(network);
+        self.networks.push(network);
+        // On x86_64 a NIC is a virtio-pci function and needs the host
+        // bridge + ECAM; aarch64 routes the NIC over virtio-MMIO (no PCI
+        // yet), so leave pci_enabled untouched there.
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.pci_enabled = true;
+        }
         self
     }
 
-    /// Override [`super::KtstrVm::init_virtio_blk`]'s per-test
+    /// Override `KtstrVm::init_virtio_blk`'s per-test
     /// backing-file allocation with `path`. Internal-only: this is
     /// the seam the disk-template-build VM driver
     /// (`super::disk_template::build_template_via_vm`) uses to
@@ -895,6 +982,25 @@ impl KtstrVmBuilder {
         anyhow::ensure!(t.cores_per_llc > 0, "cores_per_llc must be > 0");
         anyhow::ensure!(t.threads_per_core > 0, "threads_per_core must be > 0");
         anyhow::ensure!(t.numa_nodes > 0, "numa_nodes must be > 0");
+        // NIC count is bounded by the transport: x86_64 routes each NIC over a
+        // virtio-pci function on its own INTx GSI, capped by the IOAPIC line
+        // budget ([`kvm::MAX_VIRTIO_NICS`]); aarch64's single virtio-MMIO slot
+        // takes one. Error loudly rather than silently dropping NICs past the
+        // limit (the .network() setter appends unconditionally).
+        #[cfg(target_arch = "x86_64")]
+        anyhow::ensure!(
+            self.networks.len() <= super::kvm::MAX_VIRTIO_NICS,
+            "too many NICs: {} attached, max {} (virtio-pci INTx GSI budget)",
+            self.networks.len(),
+            super::kvm::MAX_VIRTIO_NICS,
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        anyhow::ensure!(
+            self.networks.len() <= 1,
+            "aarch64 supports a single virtio-MMIO NIC ({} attached); \
+             multi-NIC needs the PCI transport (x86_64)",
+            self.networks.len(),
+        );
         // `memory_mib == Some(0)` would forward a literal `-m 0` to the
         // VMM backend (KVM rejects it at ioctl time with an opaque
         // error). Catch it here with a clear message so the caller
@@ -981,7 +1087,19 @@ impl KtstrVmBuilder {
             watchdog_timeout: self.watchdog_timeout,
             rendezvous_timeout: self.rendezvous_timeout,
             bpf_map_writes: self.bpf_map_writes,
+            watch_bpf_maps: self.watch_bpf_maps,
             performance_mode: self.performance_mode,
+            // A NIC or disk is a virtio-pci function on x86_64, so any attached
+            // network OR disk implies the PCI transport — enforce the invariant
+            // at the sole KtstrVm construction point so no assembly path (or a
+            // stray `.pci(false)`) can yield a non-empty `networks` or an
+            // attached `disk` with
+            // pci_enabled=false, which would emit `pci=off` and skip installing
+            // the NICs / disk (the guest would see no eth0 / no `/dev/vda`).
+            // aarch64 keeps both on virtio-MMIO.
+            pci_enabled: self.pci_enabled
+                || (cfg!(target_arch = "x86_64")
+                    && (!self.networks.is_empty() || self.disk.is_some())),
             no_perf_mode,
             pinning_plan,
             mbind_node_map,
@@ -990,8 +1108,8 @@ impl KtstrVmBuilder {
             sched_enable_cmds: self.sched_enable_cmds,
             sched_disable_cmds: self.sched_disable_cmds,
             include_files: self.include_files,
-            disks: self.disks,
-            network: self.network,
+            disk: self.disk,
+            networks: self.networks,
             busybox_bytes: self.busybox_bytes,
             #[cfg(feature = "wprof")]
             wprof: self.wprof,
@@ -1651,6 +1769,71 @@ mod tests {
             .scheduler_binary("/nonexistent/scheduler")
             .build();
         assert!(result.is_err());
+    }
+
+    /// x86_64: build() rejects more than `MAX_VIRTIO_NICS` NICs (the virtio-pci
+    /// INTx GSI budget) BEFORE any VM spawn, and exactly `MAX_VIRTIO_NICS` does
+    /// NOT trip the cap. Pins the advertised limit — `.network()` appends
+    /// unconditionally, so the cap is the only guard against routing a NIC to a
+    /// GSI past the IOAPIC line budget.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn builder_rejects_more_than_max_virtio_nics() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let net = crate::vmm::net_config::NetConfig::DEFAULT;
+
+        // MAX + 1 NICs: rejected, naming the cap.
+        let mut over = KtstrVmBuilder::default().kernel(&exe);
+        for _ in 0..=crate::vmm::kvm::MAX_VIRTIO_NICS {
+            over = over.network(net);
+        }
+        // KtstrVm has no Debug, so match rather than expect_err.
+        let msg = match over.build() {
+            Ok(_) => panic!("MAX+1 NICs must be rejected"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            msg.contains("too many NICs") && msg.contains("max"),
+            "expected NIC-cap diagnostic, got: {msg}"
+        );
+
+        // Exactly MAX NICs must NOT trip the cap (this minimal fixture may fail
+        // later for other reasons, but never on the NIC budget).
+        let mut at_cap = KtstrVmBuilder::default().kernel(&exe);
+        for _ in 0..crate::vmm::kvm::MAX_VIRTIO_NICS {
+            at_cap = at_cap.network(net);
+        }
+        if let Err(e) = at_cap.build() {
+            let m = format!("{e:#}");
+            assert!(
+                !m.contains("too many NICs"),
+                "MAX NICs must not trip the cap, got: {m}"
+            );
+        }
+    }
+
+    /// aarch64: build() rejects more than one NIC — the virtio-MMIO transport
+    /// installs a single NIC; multi-NIC needs the x86_64 PCI transport. Pins
+    /// the arch-specific advertised limit.
+    #[test]
+    #[cfg(not(target_arch = "x86_64"))]
+    fn builder_rejects_multiple_nics_on_aarch64() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let net = crate::vmm::net_config::NetConfig::DEFAULT;
+        // KtstrVm has no Debug, so match rather than expect_err.
+        let msg = match KtstrVmBuilder::default()
+            .kernel(&exe)
+            .network(net)
+            .network(net)
+            .build()
+        {
+            Ok(_) => panic!("2 NICs on aarch64 must be rejected"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            msg.contains("single virtio-MMIO NIC"),
+            "expected aarch64 single-NIC diagnostic, got: {msg}"
+        );
     }
 
     #[test]

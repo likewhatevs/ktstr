@@ -11,6 +11,53 @@ use super::super::test_helpers::{EnvVarGuard, lock_env, sched_entry};
 use super::*;
 use tempfile::TempDir;
 
+// -- read_primary_exit_kind (failure-dump exit-kind reader) --
+
+/// Regression pin for the auto-repro stall detector's failure-dump
+/// read. The writer sink and this reader share
+/// `primary_failure_dump_path`, so a dump written at that hashed path
+/// is found, and `scx_sched_state.exit_kind` (a `u32`) serializes as a
+/// JSON number the `.as_u64()` extraction reads back. A non-zero
+/// variant hash proves the hash keys the name; a different hash
+/// resolves nothing. Pre-fix the reader used an un-hashed name that
+/// never matched the written dump, so exit-kind detection was dead.
+#[test]
+fn read_primary_exit_kind_reads_stall_from_writer_path() {
+    let _env_lock = crate::test_support::test_helpers::lock_env();
+    let tmp = TempDir::new().expect("tempdir");
+    let _sidecar = crate::test_support::test_helpers::EnvVarGuard::set(
+        crate::KTSTR_SIDECAR_DIR_ENV,
+        tmp.path(),
+    );
+    let name = "exit_kind_reader_fixture";
+    let hash = 0xab_u64;
+    let scx = crate::monitor::scx_walker::ScxSchedState {
+        exit_kind: crate::probe::scx_defs::EXIT_ERROR_STALL as u32,
+        ..Default::default()
+    };
+    let dump = serde_json::json!({
+        "scx_sched_state": serde_json::to_value(&scx).expect("serialize ScxSchedState"),
+    });
+    std::fs::write(
+        primary_failure_dump_path(name, hash),
+        serde_json::to_string(&dump).expect("serialize dump"),
+    )
+    .expect("write failure-dump fixture");
+    // Writer and reader share primary_failure_dump_path → the hashed
+    // dump is found and exit_kind (u32 -> JSON number) extracts as u64.
+    assert_eq!(
+        read_primary_exit_kind(name, hash),
+        Some(crate::probe::scx_defs::EXIT_ERROR_STALL),
+        "reader must find the stall exit_kind at the writer's hashed path",
+    );
+    // A different variant hash keys a different name -> nothing resolves.
+    assert_eq!(
+        read_primary_exit_kind(name, 0xcd),
+        None,
+        "a different variant hash must not resolve this dump",
+    );
+}
+
 // -- write_placeholder_failure_dump_if_missing --
 //
 // Pins the spec-promise that every failed test leaves a JSON
@@ -814,12 +861,15 @@ fn failing_vm_result_with_name(name: &'static str) -> crate::vmm::VmResult {
 }
 
 #[cfg(feature = "wprof")]
-fn write_valid_repro_artifact(sidecar_dir: &std::path::Path, name: &str) {
+/// Write a shape-valid repro wprof `.pb` at the EXACT path the
+/// inversion resolves (`VmResult::repro_wprof_pb_path`), so the test's
+/// writer and the code-under-test's reader agree by construction — no
+/// hardcoded `{name}[-hash].repro.wprof.pb` literal to drift.
+fn write_valid_repro_artifact(path: &std::path::Path) {
     use crate::test_support::wprof::{PERFETTO_TRACE_PACKETS_TAG, WPROF_PB_MIN_BYTES};
     let mut bytes = vec![PERFETTO_TRACE_PACKETS_TAG];
     bytes.resize(WPROF_PB_MIN_BYTES, 0);
-    let path = sidecar_dir.join(format!("{name}.repro.wprof.pb"));
-    std::fs::write(&path, &bytes).expect("write valid repro artifact");
+    std::fs::write(path, &bytes).expect("write valid repro artifact");
 }
 
 #[cfg(feature = "wprof")]
@@ -833,8 +883,8 @@ fn apply_expect_auto_repro_inversion_no_op_when_attr_unset() {
     );
     let entry = sched_entry("attr_unset");
     assert!(!entry.expect_auto_repro, "fixture must leave attr false");
-    write_valid_repro_artifact(dir.path(), "attr_unset");
     let mut result = failing_vm_result_with_name("attr_unset");
+    write_valid_repro_artifact(&result.repro_wprof_pb_path().expect("resolve repro path"));
     apply_expect_auto_repro_inversion(&entry, &mut result);
     assert!(
         !result.expect_auto_repro_satisfied,
@@ -852,12 +902,12 @@ fn apply_expect_auto_repro_inversion_no_op_when_success_true() {
         dir.path().to_str().expect("utf8 tempdir"),
     );
     let entry = expect_auto_repro_entry("success_true");
-    write_valid_repro_artifact(dir.path(), "success_true");
     let mut result = crate::vmm::VmResult {
         success: true,
         entry_name: Some("success_true"),
         ..crate::vmm::VmResult::test_fixture()
     };
+    write_valid_repro_artifact(&result.repro_wprof_pb_path().expect("resolve repro path"));
     apply_expect_auto_repro_inversion(&entry, &mut result);
     assert!(
         !result.expect_auto_repro_satisfied,
@@ -916,11 +966,14 @@ fn apply_expect_auto_repro_inversion_no_op_when_artifact_truncated() {
         dir.path().to_str().expect("utf8 tempdir"),
     );
     let entry = expect_auto_repro_entry("artifact_truncated");
+    let mut result = failing_vm_result_with_name("artifact_truncated");
     let mut bytes = vec![PERFETTO_TRACE_PACKETS_TAG];
     bytes.resize(WPROF_PB_MIN_BYTES - 1, 0);
-    std::fs::write(dir.path().join("artifact_truncated.repro.wprof.pb"), &bytes)
-        .expect("write truncated artifact");
-    let mut result = failing_vm_result_with_name("artifact_truncated");
+    std::fs::write(
+        result.repro_wprof_pb_path().expect("resolve repro path"),
+        &bytes,
+    )
+    .expect("write truncated artifact");
     apply_expect_auto_repro_inversion(&entry, &mut result);
     assert!(
         !result.expect_auto_repro_satisfied,
@@ -939,11 +992,14 @@ fn apply_expect_auto_repro_inversion_no_op_when_artifact_wrong_tag() {
         dir.path().to_str().expect("utf8 tempdir"),
     );
     let entry = expect_auto_repro_entry("artifact_wrong_tag");
+    let mut result = failing_vm_result_with_name("artifact_wrong_tag");
     let mut bytes = vec![0xff]; // any byte != PERFETTO_TRACE_PACKETS_TAG
     bytes.resize(WPROF_PB_MIN_BYTES, 0);
-    std::fs::write(dir.path().join("artifact_wrong_tag.repro.wprof.pb"), &bytes)
-        .expect("write wrong-tag artifact");
-    let mut result = failing_vm_result_with_name("artifact_wrong_tag");
+    std::fs::write(
+        result.repro_wprof_pb_path().expect("resolve repro path"),
+        &bytes,
+    )
+    .expect("write wrong-tag artifact");
     apply_expect_auto_repro_inversion(&entry, &mut result);
     assert!(
         !result.expect_auto_repro_satisfied,
@@ -961,8 +1017,8 @@ fn apply_expect_auto_repro_inversion_sets_field_on_valid_artifact() {
         dir.path().to_str().expect("utf8 tempdir"),
     );
     let entry = expect_auto_repro_entry("valid_artifact");
-    write_valid_repro_artifact(dir.path(), "valid_artifact");
     let mut result = failing_vm_result_with_name("valid_artifact");
+    write_valid_repro_artifact(&result.repro_wprof_pb_path().expect("resolve repro path"));
     apply_expect_auto_repro_inversion(&entry, &mut result);
     assert!(
         result.expect_auto_repro_satisfied,

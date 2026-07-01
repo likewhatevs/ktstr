@@ -40,8 +40,9 @@
 //!
 //! Variants intentionally excluded:
 //!   - `ForkExit` — bails at spawn under Thread mode (the worker
-//!     calls `_exit` which tears down the whole tgid). Coverage
-//!     for the rejection lives in
+//!     calls `fork()` from a thread of the multi-threaded harness,
+//!     inheriting sibling-held locks the child cannot release).
+//!     Coverage for the rejection lives in
 //!     `spawn_thread_with_forkexit_rejected_at_spawn_time`.
 //!   - `WakeChain { wake: Pipe }` — covered by the standalone
 //!     thread-mode test `wake_chain_pipe_thread_mode_bootstrap_throughput`

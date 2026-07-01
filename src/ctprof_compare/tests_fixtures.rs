@@ -24,6 +24,17 @@ pub(super) fn make_thread(pcomm: &str, comm: &str) -> ThreadState {
         policy: CategoricalString("SCHED_OTHER".into()),
         nice: OrdinalI32(0),
         cpu_affinity: CpuSet(vec![0, 1, 2, 3]),
+        // A normally-captured fixture thread: both capture-gated families are
+        // measured, so the delay / jemalloc aggregates are real (a zero stays a
+        // measured Sum(0), not Absent). For taskstats, "measured" is the query-Ok
+        // flag AND the per-sub-family active flags — all set true here to model a
+        // fully-enabled host. Tests that exercise the UNMEASURED path (whole-query
+        // or a single disabled sub-family) override these to false explicitly.
+        taskstats_measured: true,
+        cpu_delay_active: true,
+        delay_block_active: true,
+        xacct_active: true,
+        jemalloc_measured: true,
         ..ThreadState::default()
     }
 }

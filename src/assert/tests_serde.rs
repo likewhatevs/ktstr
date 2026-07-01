@@ -243,13 +243,33 @@ fn cgroup_stats_missing_required_field_rejected_by_deserialize() {
         "p99_wake_latency_us",
         "median_wake_latency_us",
         "wake_latency_cv",
+        "wake_measured",
+        "median_timer_latency_us",
+        "p99_timer_latency_us",
+        "p999_timer_latency_us",
+        "worst_timer_latency_us",
+        "timer_measured",
         "total_iterations",
         "total_cpu_time_ns",
         "mean_run_delay_us",
         "worst_run_delay_us",
+        "run_delay_measured",
         "page_locality",
         "cross_node_migration_ratio",
         "ext_metrics",
+    ];
+    // The legitimately-optional wire fields, where a missing key maps to `None`:
+    // the off-CPU% `Option<f64>` family ("not measured"), and `taobench_whole`
+    // (`Option<TaobenchStats>`, `None` for a non-Taobench cgroup). serde maps a
+    // missing key on an `Option` field to `None`, the correct absent semantic, so
+    // these are legitimately optional on the wire. Every other emitted field is a
+    // required scalar.
+    const OPTIONAL_FIELDS: &[&str] = &[
+        "avg_off_cpu_pct",
+        "min_off_cpu_pct",
+        "max_off_cpu_pct",
+        "spread",
+        "taobench_whole",
     ];
     // `wake_latency_tail_ratio` and `iterations_per_worker` are
     // method-only on CgroupStats and DO NOT appear in the JSON
@@ -261,6 +281,20 @@ fn cgroup_stats_missing_required_field_rejected_by_deserialize() {
         serde_json::Value::Object(m) => m,
         other => panic!("expected object, got {other:?}"),
     };
+
+    // Completeness guard: every emitted wire field must be classified as either
+    // required or (Option) optional. This catches the inverse drift the
+    // per-field loop below misses — a NEW struct field that nobody added to
+    // REQUIRED_FIELDS would otherwise silently escape the strict-schema check
+    // (exactly how the `*_measured` bools and the timer reductions slipped).
+    for key in full.keys() {
+        assert!(
+            REQUIRED_FIELDS.contains(&key.as_str()) || OPTIONAL_FIELDS.contains(&key.as_str()),
+            "CgroupStats wire field `{key}` is in neither REQUIRED_FIELDS nor \
+             OPTIONAL_FIELDS — a new field escaped the strict-schema test; \
+             classify it (required scalar, or Option → optional)",
+        );
+    }
 
     for field in REQUIRED_FIELDS {
         let mut obj = full.clone();
@@ -315,16 +349,15 @@ fn scenario_stats_missing_required_scalar_rejected_by_deserialize() {
         "worst_gap_cpu",
         "worst_migration_ratio",
         "total_iterations",
-        "worst_page_locality",
-        "worst_cross_node_migration_ratio",
         // The wake / run-delay (worst_p99/median/cv, worst_mean_run_delay_us,
         // worst_run_delay_us), iteration-efficiency
-        // (worst_iterations_per_worker/_per_cpu_sec), and wake-latency
-        // tail-ratio (worst_wake_latency_tail_ratio) roll-ups are intentionally
-        // omitted: they are no longer typed ScenarioStats fields — they are
-        // `MetricKind::Distribution` / `WorstLowest` / `WakeLatencyTailRatio`
-        // metrics re-pooled into `ext_metrics` post-merge by
-        // `populate_run_distribution_metrics`.
+        // (worst_iterations_per_worker/_per_cpu_sec), both NUMA roll-ups
+        // (worst_page_locality, worst_cross_node_migration_ratio), and
+        // wake-latency tail-ratio (worst_wake_latency_tail_ratio) roll-ups are
+        // intentionally omitted: they are no longer typed ScenarioStats fields —
+        // they are `MetricKind::Distribution` / `WorstLowest` /
+        // `WorstCrossNodeRatio` / `WakeLatencyTailRatio` metrics re-pooled into
+        // `ext_metrics` post-merge by `populate_run_distribution_metrics`.
         "ext_metrics",
     ];
 

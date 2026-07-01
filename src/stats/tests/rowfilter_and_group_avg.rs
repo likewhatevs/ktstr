@@ -410,6 +410,42 @@ fn row_filter_run_sources_or_combined_matches_any_listed() {
     );
 }
 
+/// Repeatable `--resolve-source A --resolve-source B` is OR-combined: a
+/// row matches iff its `resolve_source` equals ANY listed entry; a row
+/// whose `resolve_source` is `None` never matches a populated filter.
+/// Mirror of `row_filter_run_sources_or_combined_matches_any_listed` for
+/// the `resolve_source` dimension.
+#[test]
+fn row_filter_resolve_sources_or_combined_matches_any_listed() {
+    let mut row_auto = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
+    row_auto.resolve_source = Some("auto_built".to_string());
+    let mut row_debug = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
+    row_debug.resolve_source = Some("target_debug".to_string());
+    let mut row_path = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
+    row_path.resolve_source = Some("path".to_string());
+    let row_none = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
+    let filter = RowFilter {
+        resolve_sources: vec!["auto_built".to_string(), "target_debug".to_string()],
+        ..RowFilter::default()
+    };
+    assert!(
+        filter.matches(&row_auto),
+        "first listed resolve_source must match",
+    );
+    assert!(
+        filter.matches(&row_debug),
+        "second listed resolve_source must match",
+    );
+    assert!(
+        !filter.matches(&row_path),
+        "resolve_source outside the listed set must reject",
+    );
+    assert!(
+        !filter.matches(&row_none),
+        "None resolve_source must never match a populated filter (opt-in policy)",
+    );
+}
+
 /// `--run-source` and `--kernel-commit` filter on DISTINCT row
 /// fields. Pins the field non-aliasing: a row whose
 /// `run_source` matches but whose `kernel_commit` does not
@@ -580,13 +616,12 @@ fn paint_metrics(row: &mut GauntletRow, spread: f64, gap_ms: u64, migrations: u6
     row.fallback_count = migrations as i64;
     row.keep_last_count = -(migrations as i64);
     row.total_iterations = iters;
-    row.page_locality = 1.0 - spread / 100.0;
-    row.cross_node_migration_ratio = spread / 200.0;
-    // The wake / run-delay / iteration-efficiency roll-ups are now
-    // ext_metrics-sourced (Distribution / WorstLowest); paint them there so
-    // the cross-RUN ext fold (group_and_average_by → aggregate_finite)
-    // exercises them: the percentile / CV / mean reductions and the
-    // WorstLowest selectors MEAN-fold cross-RUN, worst_run_delay_us
+    // The wake / run-delay / iteration-efficiency / NUMA roll-ups are now
+    // ext_metrics-sourced (Distribution / WorstLowest / WorstCrossNodeRatio); paint
+    // them there so the cross-RUN ext fold (group_and_average_by → aggregate_finite)
+    // exercises them: the percentile / CV / mean reductions and the WorstLowest /
+    // WorstCrossNodeRatio selectors (`worst_page_locality`, `worst_iterations_*`,
+    // `worst_cross_node_migration_ratio`) MEAN-fold cross-RUN, worst_run_delay_us
     // (Worst) MAX-folds.
     for (name, v) in [
         ("worst_p99_wake_latency_us", spread * 2.0),
@@ -596,6 +631,8 @@ fn paint_metrics(row: &mut GauntletRow, spread: f64, gap_ms: u64, migrations: u6
         ("worst_run_delay_us", (gap_ms * 2) as f64),
         ("worst_iterations_per_worker", iters as f64 / 10.0),
         ("worst_iterations_per_cpu_sec", iters as f64 / 5.0),
+        ("worst_page_locality", 1.0 - spread / 100.0),
+        ("worst_cross_node_migration_ratio", spread / 200.0),
     ] {
         row.ext_metrics.insert(name.to_string(), v);
     }
@@ -747,6 +784,30 @@ fn group_and_average_multi_pass_kind_aware_fold() {
             .copied(),
         Some(100.0),
     );
+    // WorstLowest worst_page_locality cross-RUN MEAN through the ext fold:
+    // 1.0 - spread/100 = 0.9/0.8/0.7; (0.9 + 0.8 + 0.7)/3 = 0.8 (float-approx).
+    let pl = ar
+        .row
+        .ext_metrics
+        .get("worst_page_locality")
+        .copied()
+        .expect("worst_page_locality present");
+    assert!(
+        (pl - 0.8).abs() < 1e-9,
+        "worst_page_locality cross-RUN MEAN ~0.8, got {pl}",
+    );
+    // WorstCrossNodeRatio worst_cross_node_migration_ratio cross-RUN MEAN through
+    // the ext fold: spread/200 = 0.05/0.10/0.15; (0.05 + 0.10 + 0.15)/3 = 0.10.
+    let xnode = ar
+        .row
+        .ext_metrics
+        .get("worst_cross_node_migration_ratio")
+        .copied()
+        .expect("worst_cross_node_migration_ratio present");
+    assert!(
+        (xnode - 0.10).abs() < 1e-9,
+        "worst_cross_node_migration_ratio cross-RUN MEAN ~0.10, got {xnode}",
+    );
     // CV mean (spread/50 = 0.2/0.4/0.6 → 0.4) is float-approximate.
     let cv = ar
         .row
@@ -757,6 +818,337 @@ fn group_and_average_multi_pass_kind_aware_fold() {
     assert!(
         (cv - 0.4).abs() < 1e-9,
         "worst_wake_latency_cv cross-RUN MEAN ~0.4, got {cv}",
+    );
+}
+
+/// The two monitor schedstat Rates re-derive Σnumerator / Σdenominator
+/// across runs (the `MetricKind::Rate` pooled fold), NOT a mean of per-run
+/// ratios. Two runs with deliberately different per-run ratios make the two
+/// estimators disagree, so this pins the pooled form:
+///   A: run_delay 1000 / pcount 1 = 1000; ttwu 1/1   = 1.0
+///   B: run_delay 1000 / pcount 9 = ~111; ttwu 1/99  = ~0.0101
+///   mean-of-ratios run_delay = 555.5  vs  pooled Σ/Σ = 2000/10 = 200
+///   mean-of-ratios ttwu      = 0.505  vs  pooled Σ/Σ = 2/100  = 0.02
+#[test]
+fn group_and_average_schedstat_rates_pool_sigma_over_sigma() {
+    let mk = |run_delay: f64, pcount: f64, local: f64, count: f64| {
+        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        r.ext_metrics.insert("total_run_delay".into(), run_delay);
+        r.ext_metrics.insert("total_pcount".into(), pcount);
+        r.ext_metrics.insert("total_ttwu_local".into(), local);
+        r.ext_metrics.insert("total_ttwu_count".into(), count);
+        r
+    };
+    let out = group_and_average_by(
+        &[mk(1000.0, 1.0, 1.0, 1.0), mk(1000.0, 9.0, 1.0, 99.0)],
+        LEGACY_PAIRING_DIMS,
+    );
+    assert_eq!(out.len(), 1);
+    let row = &out[0].row;
+    // Counter ext components SUM-fold across runs.
+    assert_eq!(
+        row.ext_metrics.get("total_run_delay").copied(),
+        Some(2000.0)
+    );
+    assert_eq!(row.ext_metrics.get("total_pcount").copied(), Some(10.0));
+    assert_eq!(
+        row.ext_metrics.get("total_ttwu_count").copied(),
+        Some(100.0)
+    );
+    assert_eq!(row.ext_metrics.get("total_ttwu_local").copied(), Some(2.0));
+    // Rates re-derive Σ/Σ (the pooled mean), NOT the per-run mean-of-ratios.
+    let per_sched = metric_def("total_run_delay_ns_per_sched")
+        .unwrap()
+        .read(row)
+        .expect("rate derived post-fold");
+    assert!(
+        (per_sched - 200.0).abs() < 1e-6,
+        "Σrun_delay/Σpcount = 200, got {per_sched} (mean-of-ratios would be 555.5)",
+    );
+    let frac = metric_def("ttwu_local_fraction")
+        .unwrap()
+        .read(row)
+        .expect("rate derived post-fold");
+    assert!(
+        (frac - 0.02).abs() < 1e-9,
+        "Σlocal/Σcount = 0.02, got {frac} (mean-of-ratios would be 0.505)",
+    );
+}
+
+/// `sched_goidle_fraction` = Σsched_goidle / Σsched_count — the load-normalized
+/// go-idle rate added for --noise-adjust spread. Derives per-run from the raw
+/// counter ext keys, and pools Σ/Σ across runs (the `MetricKind::Rate` fold),
+/// NOT a mean of per-run ratios.
+#[test]
+fn sched_goidle_fraction_derives_and_pools_sigma_over_sigma() {
+    let mk = |goidle: f64, count: f64| {
+        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        r.ext_metrics.insert("total_sched_goidle".into(), goidle);
+        r.ext_metrics.insert("total_sched_count".into(), count);
+        r
+    };
+    // Single run: 30 goidle / 100 schedules = 0.30.
+    let one = group_and_average_by(&[mk(30.0, 100.0)], LEGACY_PAIRING_DIMS);
+    let frac = metric_def("sched_goidle_fraction")
+        .unwrap()
+        .read(&one[0].row)
+        .expect("rate derived");
+    assert!((frac - 0.30).abs() < 1e-9, "30/100 = 0.30, got {frac}");
+
+    // Two runs with different per-run ratios → pooled Σ/Σ, not mean-of-ratios.
+    // A: 1/1 = 1.0; B: 1/99 ≈ 0.0101; mean-of-ratios ≈ 0.505; pooled = 2/100 = 0.02.
+    let out = group_and_average_by(&[mk(1.0, 1.0), mk(1.0, 99.0)], LEGACY_PAIRING_DIMS);
+    let pooled = metric_def("sched_goidle_fraction")
+        .unwrap()
+        .read(&out[0].row)
+        .expect("rate derived post-fold");
+    assert!(
+        (pooled - 0.02).abs() < 1e-9,
+        "Σgoidle/Σcount = 0.02, got {pooled} (mean-of-ratios would be 0.505)",
+    );
+}
+
+/// Whole-run taobench qps + hit Rates derive per-run from their Counter ext
+/// components and pool Σ/Σ across runs (the `MetricKind::Rate` cross-run fold),
+/// NOT a mean of per-run qps. Unequal wall windows make the two disagree: run A
+/// 900 fast + 100 slow over 1 s, run B 100 fast + 2900 slow over 99 s. Σfast
+/// 1000, Σslow 3000, Σops 4000, Σwall 100 s → total 40/s, fast 10/s, slow 30/s,
+/// hit 1000/4000 = 0.25; the mean-of-ratios would give ~515 / ~451 / ~65 / 0.47.
+#[test]
+fn taobench_whole_run_rates_derive_and_pool_sigma_over_sigma() {
+    let mk = |fast: f64, slow: f64, wall: f64| {
+        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        r.ext_metrics
+            .insert("total_taobench_ops".into(), fast + slow);
+        r.ext_metrics.insert("total_taobench_fast_ops".into(), fast);
+        r.ext_metrics.insert("total_taobench_slow_ops".into(), slow);
+        r.ext_metrics.insert("total_taobench_wall_sec".into(), wall);
+        r
+    };
+    let read = |row: &_, name: &str| metric_def(name).unwrap().read(row).expect("rate derived");
+
+    // Single run: 900 fast + 100 slow over 1 s.
+    let one = group_and_average_by(&[mk(900.0, 100.0, 1.0)], LEGACY_PAIRING_DIMS);
+    assert_eq!(read(&one[0].row, "taobench_total_ops_per_sec"), 1000.0);
+    assert_eq!(read(&one[0].row, "taobench_fast_ops_per_sec"), 900.0);
+    assert_eq!(read(&one[0].row, "taobench_slow_ops_per_sec"), 100.0);
+    assert!((read(&one[0].row, "taobench_hit_fraction") - 0.9).abs() < 1e-9);
+
+    // Two runs, unequal walls → pooled Σ/Σ, not mean-of-ratios.
+    let out = group_and_average_by(
+        &[mk(900.0, 100.0, 1.0), mk(100.0, 2900.0, 99.0)],
+        LEGACY_PAIRING_DIMS,
+    );
+    assert_eq!(out.len(), 1);
+    let row = &out[0].row;
+    // Counter components SUM-fold across runs.
+    assert_eq!(
+        row.ext_metrics.get("total_taobench_ops").copied(),
+        Some(4000.0)
+    );
+    assert_eq!(
+        row.ext_metrics.get("total_taobench_fast_ops").copied(),
+        Some(1000.0),
+    );
+    assert_eq!(
+        row.ext_metrics.get("total_taobench_slow_ops").copied(),
+        Some(3000.0),
+    );
+    assert_eq!(
+        row.ext_metrics.get("total_taobench_wall_sec").copied(),
+        Some(100.0),
+    );
+    // Rates re-derive Σ/Σ (the pooled cohort throughput), NOT mean-of-ratios.
+    let total = read(row, "taobench_total_ops_per_sec");
+    assert!(
+        (total - 40.0).abs() < 1e-9,
+        "Σops/Σwall = 4000/100 = 40, got {total} (mean-of-ratios ~515)",
+    );
+    assert!((read(row, "taobench_fast_ops_per_sec") - 10.0).abs() < 1e-9);
+    assert!((read(row, "taobench_slow_ops_per_sec") - 30.0).abs() < 1e-9);
+    let hit = read(row, "taobench_hit_fraction");
+    assert!(
+        (hit - 0.25).abs() < 1e-9,
+        "Σfast/Σops = 1000/4000 = 0.25, got {hit} (mean-of-ratios ~0.47)",
+    );
+}
+
+/// Per-second schedstat rates (pcount_per_sec + run_delay_per_sec et al.) derive
+/// total_X / total_schedstat_wall_sec and pool Σ/Σ across runs (the Rate
+/// cross-run fold), NOT a mean of per-run rates. Unequal windows make the two
+/// disagree: run A pcount 1000 over 1 s (1000/s), run B pcount 1000 over 99 s
+/// (~10/s). Σpcount 2000, Σwall 100 s → 20/s; the mean-of-rates would give
+/// ~505/s. This duration-weighting is exactly why the rate exists — to compare a
+/// differing-duration cohort raw counts cannot.
+#[test]
+fn schedstat_per_second_rates_derive_and_pool_sigma_over_sigma() {
+    let mk = |pcount: f64, run_delay: f64, wall: f64| {
+        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        r.ext_metrics.insert("total_pcount".into(), pcount);
+        r.ext_metrics.insert("total_run_delay".into(), run_delay);
+        r.ext_metrics
+            .insert("total_schedstat_wall_sec".into(), wall);
+        r
+    };
+    let read = |row: &_, name: &str| metric_def(name).unwrap().read(row).expect("rate derived");
+
+    // Single run: 1000 pcount + 6000 ns run_delay over 2 s.
+    let one = group_and_average_by(&[mk(1000.0, 6000.0, 2.0)], LEGACY_PAIRING_DIMS);
+    assert!((read(&one[0].row, "pcount_per_sec") - 500.0).abs() < 1e-9); // 1000/2
+    assert!((read(&one[0].row, "run_delay_per_sec") - 3000.0).abs() < 1e-9); // 6000/2
+
+    // Two runs, unequal windows → pooled Σ/Σ, not mean-of-rates.
+    let out = group_and_average_by(
+        &[mk(1000.0, 1000.0, 1.0), mk(1000.0, 1000.0, 99.0)],
+        LEGACY_PAIRING_DIMS,
+    );
+    assert_eq!(out.len(), 1);
+    let row = &out[0].row;
+    // Numerators + the wall-sec denominator are Counters → SUM-fold.
+    assert_eq!(row.ext_metrics.get("total_pcount").copied(), Some(2000.0));
+    assert_eq!(
+        row.ext_metrics.get("total_schedstat_wall_sec").copied(),
+        Some(100.0),
+    );
+    // Σpcount/Σwall = 2000/100 = 20/s (duration-weighted), NOT the mean-of-rates
+    // ((1000 + ~10.1)/2 ≈ 505).
+    let rate = read(row, "pcount_per_sec");
+    assert!(
+        (rate - 20.0).abs() < 1e-9,
+        "Σpcount/Σwall = 2000/100 = 20, got {rate} (mean-of-rates ~505)",
+    );
+    // run_delay_per_sec likewise: Σ2000 / Σ100 = 20 ns/s.
+    assert!((read(row, "run_delay_per_sec") - 20.0).abs() < 1e-9);
+}
+
+/// schbench whole-run Class-3 gate-Rates (role-separate run-delay per-schedule
+/// means) + the loop Counter pool Σ/Σ and Σ across runs from their Counter ext
+/// components, NOT a mean of per-run rates, and the two thread ROLES pool
+/// independently. Run A: msg 300 ns / 3 sched, worker 800 ns / 2 sched, 1000
+/// loops; run B: msg 100 ns / 97 sched, worker 200 ns / 8 sched, 3000 loops.
+/// Pooled: msg Σ400/Σ100 = 4 ns/sched, worker Σ1000/Σ10 = 100 ns/sched, loops Σ
+/// = 4000; the mean-of-ratios would give msg ~50.5, worker ~212.5.
+#[test]
+fn schbench_class3_rates_derive_and_pool_sigma_over_sigma() {
+    let mk = |msg_rd: f64, msg_pc: f64, wkr_rd: f64, wkr_pc: f64, loops: f64| {
+        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        r.ext_metrics
+            .insert("total_schbench_msg_run_delay_ns".into(), msg_rd);
+        r.ext_metrics
+            .insert("total_schbench_msg_pcount".into(), msg_pc);
+        r.ext_metrics
+            .insert("total_schbench_worker_run_delay_ns".into(), wkr_rd);
+        r.ext_metrics
+            .insert("total_schbench_worker_pcount".into(), wkr_pc);
+        r.ext_metrics.insert("total_schbench_loops".into(), loops);
+        r
+    };
+    let read = |row: &_, name: &str| metric_def(name).unwrap().read(row).expect("metric present");
+
+    // Single run: msg 300/3 = 100, worker 800/2 = 400, loops 1000.
+    let one = group_and_average_by(&[mk(300.0, 3.0, 800.0, 2.0, 1000.0)], LEGACY_PAIRING_DIMS);
+    assert!((read(&one[0].row, "schbench_msg_run_delay_ns_per_sched") - 100.0).abs() < 1e-9);
+    assert!((read(&one[0].row, "schbench_worker_run_delay_ns_per_sched") - 400.0).abs() < 1e-9);
+    assert_eq!(read(&one[0].row, "total_schbench_loops"), 1000.0);
+
+    // Two runs → pooled Σ/Σ (role-separate) + Σ loops, NOT mean-of-ratios.
+    let out = group_and_average_by(
+        &[
+            mk(300.0, 3.0, 800.0, 2.0, 1000.0),
+            mk(100.0, 97.0, 200.0, 8.0, 3000.0),
+        ],
+        LEGACY_PAIRING_DIMS,
+    );
+    assert_eq!(out.len(), 1);
+    let row = &out[0].row;
+    // Counter components SUM-fold per role (kept separate).
+    assert_eq!(
+        row.ext_metrics
+            .get("total_schbench_msg_run_delay_ns")
+            .copied(),
+        Some(400.0),
+    );
+    assert_eq!(
+        row.ext_metrics.get("total_schbench_msg_pcount").copied(),
+        Some(100.0),
+    );
+    assert_eq!(
+        row.ext_metrics
+            .get("total_schbench_worker_run_delay_ns")
+            .copied(),
+        Some(1000.0),
+    );
+    assert_eq!(
+        row.ext_metrics.get("total_schbench_worker_pcount").copied(),
+        Some(10.0),
+    );
+    assert_eq!(
+        row.ext_metrics.get("total_schbench_loops").copied(),
+        Some(4000.0),
+    );
+    // Gate-Rates re-derive Σrun_delay/Σpcount per role (NOT mean-of-per-run-means).
+    let msg = read(row, "schbench_msg_run_delay_ns_per_sched");
+    assert!(
+        (msg - 4.0).abs() < 1e-9,
+        "Σ400/Σ100 = 4 ns/sched, got {msg} (mean-of-ratios ~50.5)",
+    );
+    let wkr = read(row, "schbench_worker_run_delay_ns_per_sched");
+    assert!(
+        (wkr - 100.0).abs() < 1e-9,
+        "Σ1000/Σ10 = 100 ns/sched, got {wkr} (mean-of-ratios ~212.5)",
+    );
+}
+
+/// schbench whole-run `*_whole` percentiles (MetricKind::PerRunDistribution) must
+/// NOT be cross-run folded — a mean of per-run p99s ≠ the p99 of the pooled
+/// sample set, and the per-phase histograms are dropped at the cross-run boundary
+/// so there is no pooled set to re-derive. fold_ext_metrics skips them; each
+/// run's own p99 reaches compare ONLY via the per-run noise path. Two runs with
+/// different p99s → the averaged group carries NO wakeup_p99_latency_us_whole key.
+#[test]
+fn schbench_whole_percentile_is_not_cross_run_folded() {
+    let mk = |p99: f64| {
+        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        r.ext_metrics
+            .insert("wakeup_p99_latency_us_whole".into(), p99);
+        r
+    };
+    let out = group_and_average_by(&[mk(10.0), mk(1000.0)], LEGACY_PAIRING_DIMS);
+    assert_eq!(out.len(), 1);
+    assert!(
+        !out[0]
+            .row
+            .ext_metrics
+            .contains_key("wakeup_p99_latency_us_whole"),
+        "PerRunDistribution must be skipped in the cross-run averaged fold \
+         (mean-of-p99 is not p99-of-pooled); it reaches compare only per-run via noise_findings",
+    );
+}
+
+/// `avg_nr_running` (Gauge(Avg) ext key) folds cross-run as the
+/// SAMPLE-WEIGHTED pooled mean — Σ(avg_i × samples_i) / Σ samples_i, weighted by
+/// run_sample_count — NOT the unweighted arithmetic mean a typed field would
+/// give. Two runs with very different sample counts make the two disagree.
+#[test]
+fn group_and_average_avg_nr_running_is_sample_weighted_mean() {
+    // Run A: avg 2.0 over 10 samples; Run B: avg 4.0 over 90 samples.
+    // weighted   = (2*10 + 4*90) / (10+90) = 380/100 = 3.8
+    // unweighted = (2 + 4) / 2 = 3.0  (what a typed mean-fold would give)
+    let mk = |avg: f64, samples: usize| {
+        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        r.run_sample_count = samples;
+        r.ext_metrics.insert("avg_nr_running".into(), avg);
+        r
+    };
+    let out = group_and_average_by(&[mk(2.0, 10), mk(4.0, 90)], LEGACY_PAIRING_DIMS);
+    assert_eq!(out.len(), 1);
+    let v = metric_def("avg_nr_running")
+        .unwrap()
+        .read(&out[0].row)
+        .expect("avg_nr_running present after fold");
+    assert!(
+        (v - 3.8).abs() < 1e-9,
+        "sample-weighted pooled mean = 3.8, got {v} (unweighted would be 3.0)",
     );
 }
 
@@ -822,6 +1214,31 @@ fn group_and_average_tail_ratio_excludes_omitting_run_and_is_unweighted() {
     );
 }
 
+/// PerPhaseDeltaSum (`system_time_ns` / `user_time_ns`) folds cross-RUN by the
+/// UNWEIGHTED mean over the runs that emitted the key: each run contributes one
+/// per-phase-summed total, NOT weighted by `run_sample_count` (the monitor
+/// capture count, an unrelated population). With run_sample_counts of 1000 and
+/// 1 the unweighted mean (6000) and a sample-weighted mean (~7996) are
+/// numerically distinct, pinning the unweighted fold specifically.
+#[test]
+fn group_and_average_per_phase_delta_sum_is_unweighted_mean_cross_run() {
+    let key = "system_time_ns";
+    let mut a = make_row("t", "tiny-1llc", true, 0.0);
+    a.run_sample_count = 1000;
+    a.ext_metrics.insert(key.to_string(), 8000.0);
+    let mut b = make_row("t", "tiny-1llc", true, 0.0);
+    b.run_sample_count = 1;
+    b.ext_metrics.insert(key.to_string(), 4000.0);
+    let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0].row.ext_metrics.get(key).copied(),
+        Some(6000.0),
+        "unweighted mean over the 2 runs (8000+4000)/2=6000 — NOT a \
+             run_sample_count-weighted mean (1000 vs 1 → ~7996)",
+    );
+}
+
 /// `group_and_average_by` propagates `run_sample_count` to the
 /// aggregated row's `run_sample_count` as the SUM of
 /// contributor weights so a downstream consumer that further
@@ -869,6 +1286,37 @@ fn group_and_average_ext_metrics_gauge_avg_weighted_by_run_sample_count() {
     assert!(
         (mean - 25.0).abs() < f64::EPSILON,
         "expected weighted mean 25.0, got {mean}",
+    );
+}
+
+/// A passing run that emitted a Gauge(Avg) ext key but recorded zero monitor
+/// samples (run_sample_count == 0) must still contribute ONE observation to the
+/// cross-RUN weighted mean — never be silently zero-weighted out of a mixed
+/// cohort. Pins the .max(1) weight floor in `Accumulator::observe` (matching the
+/// floors in run_metrics.rs `populate_run_ext_metrics_from_phases` and
+/// stats_types.rs `merge_metric_values`). row a (weight 0 -> floored to 1,
+/// value 10) + row b (weight 10, value 30): (10*1 + 30*10) / (1 + 10) = 28.18.
+/// Without the floor, a is dropped (weight 0) and the mean collapses to b's 30.0.
+#[test]
+fn group_and_average_gauge_avg_floors_zero_sample_count_weight() {
+    let mut a = make_row("t", "tiny-1llc", true, 0.0);
+    a.run_sample_count = 0;
+    a.ext_metrics.insert("avg_dsq_depth".to_string(), 10.0);
+    let mut b = make_row("t", "tiny-1llc", true, 0.0);
+    b.run_sample_count = 10;
+    b.ext_metrics.insert("avg_dsq_depth".to_string(), 30.0);
+    let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
+    assert_eq!(out.len(), 1);
+    let mean = out[0]
+        .row
+        .ext_metrics
+        .get("avg_dsq_depth")
+        .copied()
+        .expect("ext_metrics propagates avg_dsq_depth aggregate");
+    assert!(
+        (mean - (310.0 / 11.0)).abs() < 1e-9,
+        "weight-0 run must be floored to weight 1, not dropped: \
+         expected (10*1 + 30*10)/11 = 28.18, got {mean}",
     );
 }
 
@@ -1496,7 +1944,7 @@ fn group_and_average_then_compare_rows_yields_regression_on_means() {
         .iter()
         .find(|f| f.metric.name == "worst_spread")
         .expect("worst_spread must regress on aggregated means");
-    assert!(spread.is_regression);
+    assert!(spread.kind == FindingKind::Regression);
     assert_eq!(spread.val_a, 12.0, "mean of [10, 12, 14] = 12");
     assert_eq!(spread.val_b, 30.0, "mean of [28, 30, 32] = 30");
     assert_eq!(spread.delta, 18.0);

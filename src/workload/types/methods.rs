@@ -6,11 +6,15 @@
 
 use std::time::Duration;
 
-use crate::workload::config::{AluWidth, FutexLockMode, SchedClass, WakeMechanism, defaults};
+use crate::workload::config::{
+    AluWidth, FutexLockMode, ReapMode, SchedClass, WakeMechanism, defaults,
+};
+use crate::workload::schbench::run::SchbenchConfig;
+use crate::workload::taobench::run::TaobenchConfig;
 
 use crate::workload::WorkerReport;
 
-use super::{WorkPhase, WorkType, WorkTypeValidationError, WorkerCtx};
+use super::{CustomCfg, WorkPhase, WorkType, WorkTypeValidationError, WorkerCtx};
 
 impl WorkType {
     /// PascalCase names for all built-in variants, matching the enum arm names.
@@ -47,6 +51,8 @@ impl WorkType {
             WorkType::CrossAffinityChurn { .. } => "CrossAffinityChurn",
             WorkType::PolicyChurn { .. } => "PolicyChurn",
             WorkType::FanOutCompute { .. } => "FanOutCompute",
+            WorkType::Schbench { .. } => "Schbench",
+            WorkType::Taobench { .. } => "Taobench",
             WorkType::PageFaultChurn { .. } => "PageFaultChurn",
             WorkType::MutexContention { .. } => "MutexContention",
             WorkType::Custom { name, .. } => name.as_str(),
@@ -58,6 +64,7 @@ impl WorkType {
             WorkType::WakeChain { .. } => "WakeChain",
             WorkType::NumaWorkingSetSweep { .. } => "NumaWorkingSetSweep",
             WorkType::CgroupChurn { .. } => "CgroupChurn",
+            WorkType::CgroupAttachStorm { .. } => "CgroupAttachStorm",
             WorkType::SignalStorm { .. } => "SignalStorm",
             WorkType::PreemptStorm { .. } => "PreemptStorm",
             WorkType::EpollStorm { .. } => "EpollStorm",
@@ -66,6 +73,9 @@ impl WorkType {
             WorkType::AluHot { .. } => "AluHot",
             WorkType::SmtSiblingSpin => "SmtSiblingSpin",
             WorkType::IpcVariance { .. } => "IpcVariance",
+            WorkType::TimerLatency { .. } => "TimerLatency",
+            WorkType::NetTraffic { .. } => "NetTraffic",
+            WorkType::IrqWake { .. } => "IrqWake",
         }
     }
 
@@ -123,6 +133,12 @@ impl WorkType {
                 cache_footprint_kib: defaults::FAN_OUT_COMPUTE_CACHE_FOOTPRINT_KIB,
                 operations: defaults::FAN_OUT_COMPUTE_OPERATIONS,
                 sleep_usec: defaults::FAN_OUT_COMPUTE_SLEEP_USEC,
+            }),
+            "Schbench" => Some(WorkType::Schbench {
+                config: SchbenchConfig::default(),
+            }),
+            "Taobench" => Some(WorkType::Taobench {
+                config: TaobenchConfig::default(),
             }),
             "PageFaultChurn" => Some(WorkType::PageFaultChurn {
                 region_kib: defaults::PAGE_FAULT_CHURN_REGION_KIB,
@@ -183,6 +199,10 @@ impl WorkType {
                 groups: defaults::CGROUP_CHURN_GROUPS,
                 cycle_ms: defaults::CGROUP_CHURN_CYCLE_MS,
             }),
+            "CgroupAttachStorm" => Some(WorkType::CgroupAttachStorm {
+                dest: defaults::CGROUP_ATTACH_STORM_DEST.into(),
+                reap: ReapMode::default(),
+            }),
             "SignalStorm" => Some(WorkType::SignalStorm {
                 signals_per_iter: defaults::SIGNAL_STORM_SIGNALS_PER_ITER,
                 work_iters: defaults::SIGNAL_STORM_WORK_ITERS,
@@ -213,6 +233,17 @@ impl WorkType {
                 hot_iters: defaults::IPC_VARIANCE_HOT_ITERS,
                 cold_iters: defaults::IPC_VARIANCE_COLD_ITERS,
                 period_iters: defaults::IPC_VARIANCE_PERIOD_ITERS,
+            }),
+            "TimerLatency" => Some(WorkType::TimerLatency {
+                interval_us: defaults::TIMER_LATENCY_INTERVAL_US,
+            }),
+            "NetTraffic" => Some(WorkType::NetTraffic {
+                interval_us: defaults::NET_TRAFFIC_INTERVAL_US,
+                frame_bytes: defaults::NET_TRAFFIC_FRAME_BYTES,
+            }),
+            "IrqWake" => Some(WorkType::IrqWake {
+                interval_us: defaults::IRQ_WAKE_INTERVAL_US,
+                frame_bytes: defaults::IRQ_WAKE_FRAME_BYTES,
             }),
             // Sequence requires explicit phases; no default from_name.
             _ => None,
@@ -330,6 +361,10 @@ impl WorkType {
             // from host topology) or [`AffinityIntent::Exact`]
             // (caller-supplied CPU IDs).
             WorkType::SmtSiblingSpin => Some(2),
+            // IrqWake: paired sender / receiver (group of 2, even count). pos==0
+            // sends self-addressed frames, pos==1 blocks in recvfrom and records a
+            // liveness sample (block-to-return duration) per delivered frame.
+            WorkType::IrqWake { .. } => Some(2),
             _ => None,
         }
     }
@@ -343,7 +378,9 @@ impl WorkType {
     /// classify itself as RT or CFS. Allocating a single 4-byte
     /// MAP_SHARED region per group is the cheapest way to get
     /// `pos` plumbed through worker_main without a wider dispatch
-    /// contract change.
+    /// contract change. `IrqWake` opts in for the same reason:
+    /// `pos == 0` is the frame sender, `pos == 1` the receiver that
+    /// blocks in `recvfrom` — neither touches the futex word.
     pub fn needs_shared_mem(&self) -> bool {
         matches!(
             self,
@@ -360,6 +397,7 @@ impl WorkType {
                 | WorkType::SignalStorm { .. }
                 | WorkType::PreemptStorm { .. }
                 | WorkType::EpollStorm { .. }
+                | WorkType::IrqWake { .. }
         )
     }
 
@@ -513,6 +551,24 @@ impl WorkType {
             operations,
             sleep_usec,
         }
+    }
+
+    /// The `schbench_rs` workload (schbench's default mode), configured by
+    /// `config`. Build the config with [`SchbenchConfig::default`] plus its
+    /// chainable setters, e.g.
+    /// `WorkType::schbench(SchbenchConfig::default().message_threads(2))`. Use
+    /// with a single ktstr worker; see the [`WorkType::Schbench`] variant doc.
+    pub const fn schbench(config: SchbenchConfig) -> Self {
+        WorkType::Schbench { config }
+    }
+
+    /// The `taobench_rs` workload (a bounded, evicting key-value cache),
+    /// configured by `config`. Build the config with [`TaobenchConfig::default`]
+    /// plus its chainable setters, e.g.
+    /// `WorkType::taobench(TaobenchConfig::default().target_hit_pct(95))`. Use
+    /// with a single ktstr worker; see the [`WorkType::Taobench`] variant doc.
+    pub const fn taobench(config: TaobenchConfig) -> Self {
+        WorkType::Taobench { config }
     }
 
     /// Rapid page fault cycling with `spin_iters` CPU work between cycles.
@@ -699,6 +755,22 @@ impl WorkType {
         WorkType::CgroupChurn { groups, cycle_ms }
     }
 
+    /// Construct a [`WorkType::CgroupAttachStorm`].
+    ///
+    /// `dest` is the sibling cgroup name each forked child is migrated
+    /// into; it must already exist at run time (e.g. created via
+    /// [`Op::add_cgroup`](crate::scenario::ops::Op::add_cgroup)). Non-`const`
+    /// because `Into::<String>::into` allocates (mirrors
+    /// [`custom`](Self::custom)). Validation fires at spawn time, not
+    /// construction time; see the [`WorkType::CgroupAttachStorm`] variant
+    /// doc for preconditions.
+    pub fn cgroup_attach_storm(dest: impl Into<String>, reap: ReapMode) -> Self {
+        WorkType::CgroupAttachStorm {
+            dest: dest.into(),
+            reap,
+        }
+    }
+
     /// Construct a [`WorkType::SignalStorm`].
     ///
     /// Validation fires at spawn time, not construction time; see
@@ -788,6 +860,39 @@ impl WorkType {
         WorkType::AluHot { width }
     }
 
+    /// Construct a [`WorkType::TimerLatency`] with an inter-cycle interval
+    /// (`interval_us`, the `cyclictest` `-i` analogue). `interval_us == 0` is
+    /// rejected at spawn (`validate_workload_admission`); pass a non-zero
+    /// period. See the [`WorkType::TimerLatency`] variant doc.
+    pub const fn timer_latency(interval_us: u64) -> Self {
+        WorkType::TimerLatency { interval_us }
+    }
+
+    /// Construct a [`WorkType::NetTraffic`] with an inter-frame interval
+    /// (`interval_us`; `0` = continuous burst) and Ethernet `frame_bytes`.
+    /// `frame_bytes` is validated to `[60, 1514]` at spawn, not here; see the
+    /// [`WorkType::NetTraffic`] variant doc.
+    pub const fn net_traffic(interval_us: u64, frame_bytes: u16) -> Self {
+        WorkType::NetTraffic {
+            interval_us,
+            frame_bytes,
+        }
+    }
+
+    /// Construct a [`WorkType::IrqWake`] — a paired sender/receiver where the
+    /// receiver blocks in `recvfrom` and is woken from NET_RX softirq context.
+    /// `interval_us` paces the sender (default 1000 µs gives the receiver a clean
+    /// empty-queue block per frame; `0` maximizes softirq load into `ksoftirqd`
+    /// but degenerates the wake reservoir); `frame_bytes` is validated to
+    /// `[60, 1514]` at spawn. Spawn an even worker count (group size 2). See the
+    /// [`WorkType::IrqWake`] variant doc.
+    pub const fn irq_wake(interval_us: u64, frame_bytes: u16) -> Self {
+        WorkType::IrqWake {
+            interval_us,
+            frame_bytes,
+        }
+    }
+
     /// Construct a [`WorkType::IpcVariance`] with explicit hot,
     /// cold, and period iteration counts.
     ///
@@ -832,8 +937,10 @@ impl WorkType {
     /// `run` receives a [`WorkerCtx`] exposing the worker's stop flag
     /// (flipped per-mode: the SIGUSR1 handler for `CloneMode::Fork`, a
     /// per-worker `AtomicBool` for `CloneMode::Thread`) plus its
-    /// effective cpuset and cgroup-sibling pids, and must return a
-    /// [`WorkerReport`] when the stop flag becomes `true`. The
+    /// effective cpuset, cgroup-sibling pids, own cgroup-v2 dir, and a
+    /// default-zero [`CustomCfg`] payload (use [`Self::custom_with`] to pass
+    /// a non-default cfg), and must return a [`WorkerReport`] when the stop
+    /// flag becomes `true`. The
     /// framework handles fork / thread spawn, cgroup placement,
     /// affinity, scheduling policy, and signal setup (Fork mode only);
     /// `run` owns only the work loop.
@@ -847,6 +954,24 @@ impl WorkType {
         WorkType::Custom {
             name: name.into(),
             run: super::work_type::CustomFn(run),
+            cfg: CustomCfg::default(),
+        }
+    }
+
+    /// Like [`Self::custom`] but carries a [`CustomCfg`] payload, surfaced
+    /// to the closure via [`WorkerCtx::cfg`]. The payload is Copy POD,
+    /// inherited byte-faithfully across `fork`, so a Custom worker reads its
+    /// per-worker config from `ctx.cfg()` instead of a `static` / global —
+    /// see `tests/preempt_regression.rs` for the shared-futex pattern.
+    pub fn custom_with(
+        name: impl Into<String>,
+        run: fn(&WorkerCtx) -> WorkerReport,
+        cfg: CustomCfg,
+    ) -> Self {
+        WorkType::Custom {
+            name: name.into(),
+            run: super::work_type::CustomFn(run),
+            cfg,
         }
     }
 }

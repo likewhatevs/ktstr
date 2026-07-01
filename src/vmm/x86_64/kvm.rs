@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
 use kvm_bindings::{
     KVM_CAP_HALT_POLL, KVM_CAP_SPLIT_IRQCHIP, KVM_CAP_X2APIC_API, KVM_CAP_X86_DISABLE_EXITS,
-    KVM_CLOCK_TSC_STABLE, KVM_IRQ_ROUTING_MSI, KVM_PIT_SPEAKER_DUMMY,
+    KVM_CLOCK_TSC_STABLE, KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_IRQCHIP_IOAPIC,
+    KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, KVM_PIT_SPEAKER_DUMMY,
     KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK, KVM_X2APIC_API_USE_32BIT_IDS,
     KVM_X86_DISABLE_EXITS_HLT, KVM_X86_DISABLE_EXITS_PAUSE, KvmIrqRouting, kvm_enable_cap,
     kvm_irq_routing, kvm_irq_routing_entry, kvm_irq_routing_entry__bindgen_ty_1,
-    kvm_irq_routing_msi, kvm_irq_routing_msi__bindgen_ty_1, kvm_pit_config,
+    kvm_irq_routing_irqchip, kvm_irq_routing_msi, kvm_irq_routing_msi__bindgen_ty_1,
+    kvm_pit_config,
 };
 use kvm_ioctls::{Cap, Kvm, VcpuFd, VmFd};
 use std::mem::ManuallyDrop;
@@ -55,20 +57,232 @@ pub(crate) const VIRTIO_BLK_MMIO_BASE: u64 = MMIO_GAP_START + 0x1000;
 /// Each virtio-mmio device occupies `VIRTIO_MMIO_SIZE = 0x1000`.
 pub(crate) const VIRTIO_NET_MMIO_BASE: u64 = MMIO_GAP_START + 0x2000;
 
+/// IOAPIC MMIO base. Lives inside the MMIO gap; the PCI windows below must
+/// avoid it. Mirrors the canonical definitions (ioapic.rs `IOAPIC_BASE`, acpi
+/// MADT `IOAPIC_ADDR`) for the compile-time disjointness checks.
+const IOAPIC_MMIO_BASE: u64 = 0xFEC0_0000;
+
+/// Local APIC / MSI MMIO base. Also inside the gap; the PCI windows avoid it.
+/// Mirrors acpi `LAPIC_ADDR`.
+const LAPIC_MMIO_BASE: u64 = 0xFEE0_0000;
+
+/// PCI ECAM (Enhanced Configuration Access Mechanism) window base. Holds one
+/// PCI bus (256 functions × 4 KiB = 1 MiB), carved from the MMIO gap above the
+/// three virtio-mmio device pages and below the IOAPIC. The ACPI MCFG table
+/// publishes this base to the guest, which maps it for extended config access.
+pub(crate) const PCI_ECAM_BASE: u64 = 0xE000_0000;
+
+/// PCI ECAM window size: one bus.
+pub(crate) const PCI_ECAM_SIZE: u64 = crate::vmm::pci::ECAM_BYTES_PER_BUS;
+
+/// PCI 32-bit MMIO BAR window base. Device BARs are placed here; sits above
+/// the ECAM window and below the IOAPIC. Advertised to the guest via the DSDT
+/// `_SB.PCI0` `_CRS` so Linux assigns BARs within it.
+pub(crate) const PCI_MMIO_BAR_BASE: u64 = PCI_ECAM_BASE + PCI_ECAM_SIZE;
+
+/// PCI 32-bit MMIO BAR window size: from the BAR base up to the IOAPIC.
+pub(crate) const PCI_MMIO_BAR_SIZE: u64 = IOAPIC_MMIO_BASE - PCI_MMIO_BAR_BASE;
+
+// Compile-time PCI address-space disjointness. x86_64 had no equivalent
+// (only struct-size asserts), so this block is new: the ECAM and BAR windows
+// must lie within the MMIO gap, above the three virtio-mmio device pages
+// [MMIO_GAP_START, MMIO_GAP_START + 0x3000), not overlap each other, and end
+// before both the IOAPIC and the LAPIC/MSI region (both inside the gap).
+const _: () = {
+    assert!(PCI_ECAM_BASE >= MMIO_GAP_START + 0x3000);
+    assert!(PCI_ECAM_BASE + PCI_ECAM_SIZE <= PCI_MMIO_BAR_BASE);
+    assert!(PCI_MMIO_BAR_BASE + PCI_MMIO_BAR_SIZE <= IOAPIC_MMIO_BASE);
+    assert!(PCI_ECAM_BASE + PCI_ECAM_SIZE <= LAPIC_MMIO_BASE);
+    assert!(PCI_MMIO_BAR_BASE + PCI_MMIO_BAR_SIZE <= LAPIC_MMIO_BASE);
+    assert!(IOAPIC_MMIO_BASE < MMIO_GAP_END);
+    assert!(LAPIC_MMIO_BASE < MMIO_GAP_END);
+};
+
 /// GSI for virtio-console. On the in-kernel-irqchip path the in-kernel
 /// IOAPIC routes this GSI; on split-irqchip (>254 APIC IDs) the userspace
 /// IOAPIC translates the guest's RTE for it into an MSI route.
 pub(crate) const VIRTIO_CONSOLE_IRQ: u32 = 5;
 
-/// GSI for virtio-block. Routed via the in-kernel IOAPIC (<=254) or the
-/// userspace IOAPIC (split-irqchip, >254). The IOAPIC's 24-line cap leaves
-/// ample free slots after COM1=4, COM2=3, virtio-console=5, virtio-blk=6.
+/// GSI for virtio-block. Routed via the in-kernel IOAPIC (<=254 max APIC ID)
+/// or the userspace IOAPIC (split-irqchip, >254 max APIC ID). The IOAPIC's
+/// 24-line cap leaves ample free slots after COM1=4, COM2=3, virtio-console=5,
+/// virtio-blk=6.
 pub(crate) const VIRTIO_BLK_IRQ: u32 = 6;
 
-/// GSI for virtio-net. Routed via the in-kernel IOAPIC (<=254) or the
-/// userspace IOAPIC (split-irqchip, >254); well within the IOAPIC's
-/// 24-line cap.
-pub(crate) const VIRTIO_NET_IRQ: u32 = 7;
+/// Maximum number of virtio-net NICs on the PCI bus (x86_64). Bounded by the
+/// IOAPIC's 24-line budget for INTx: each NIC needs one INTx GSI disjoint from
+/// the reserved lines (PIT GSI2, COM2=3, COM1=4, virtio-console=5,
+/// virtio-blk=6, SCI=9), leaving 7,8,10..=23 = 16 usable. (Per-queue MSI-X
+/// routes do not consume IOAPIC pins, so MSI-X does not lift this cap; it also
+/// bounds the per-NIC MSI-X GSI budget — see [`MSIX_VECTORS_PER_NIC`].) The
+/// builder rejects more than this many `.network()` calls.
+pub(crate) const MAX_VIRTIO_NICS: usize = 16;
+
+/// PCI slot (bus 0) for virtio-net NIC `index` (0-based): slot 0 is the host
+/// bridge, NICs take slots 1..=MAX_VIRTIO_NICS. One source of truth shared by
+/// the install site (`PciBus::add_function`) and the DSDT `_PRT` route, so the
+/// routed slot always matches the installed slot.
+pub(crate) const fn virtio_net_pci_slot(index: usize) -> usize {
+    1 + index
+}
+
+/// INTx GSI for virtio-net NIC `index` (0-based). Routed via the in-kernel
+/// IOAPIC (<=254 max APIC ID) or the userspace IOAPIC (split-irqchip, >254 max
+/// APIC ID). Allocated from 7 upward, SKIPPING the SCI GSI ([`ACPI_SCI_IRQ`]=9,
+/// which the guest programs at acpi_enable), so the NIC lines stay disjoint from
+/// COM2=3/COM1=4/console=5/blk=6/SCI=9: index 0->7, 1->8, 2->10, ... 15->23 (the
+/// IOAPIC's last line). The NIC delivers legacy INTx on this GSI (level,
+/// active-low); the DSDT `_PRT` routes `(virtio_net_pci_slot(index), INTA#)`
+/// here. PCI device GSIs deliberately get NO MADT Interrupt Source Override: an
+/// ISO overrides only the ISA-bus IRQ->GSI identity/polarity defaults, and these
+/// are PCI lines whose level/active-low polarity the guest programs from `_PRT`
+/// via acpi_pci_irq_enable (the lone MADT ISO is IRQ0->GSI2 for the PIT).
+pub(crate) const fn virtio_net_gsi(index: usize) -> u32 {
+    let raw = 7 + index as u32;
+    // Skip the SCI line: every GSI at or above it shifts up by one.
+    if raw >= ACPI_SCI_IRQ as u32 {
+        raw + 1
+    } else {
+        raw
+    }
+}
+
+/// KVM's hard cap on GSI routing-table entries and the exclusive upper bound on
+/// any routed GSI: `kvm_set_irq_routing` rejects `gsi >= KVM_MAX_IRQ_ROUTES`
+/// (virt/kvm/irqchip.c) and the `KVM_SET_GSI_ROUTING` ioctl rejects a table with
+/// more than this many entries (virt/kvm/kvm_main.c). 4096 per
+/// include/linux/kvm_host.h. Hardcoded — the value is not in the uapi headers
+/// (the host also surfaces it via the `KVM_CAP_IRQ_ROUTING` extension) — and
+/// guarded by the const-asserts below.
+pub(crate) const KVM_MAX_IRQ_ROUTES: usize = 4096;
+
+/// Per-NIC MSI-X GSI budget: the stride between NICs' vector ranges and the
+/// per-NIC cap on advertised MSI-X vectors. Each NIC's table vectors occupy
+/// `[NUM_IOAPIC_PINS + nic*MSIX_VECTORS_PER_NIC, +MSIX_VECTORS_PER_NIC)`,
+/// disjoint across NICs. Sized as the largest stride for which even
+/// `MAX_VIRTIO_NICS` fully-populated NICs fit KVM's route table
+/// (`NUM_IOAPIC_PINS + MAX_VIRTIO_NICS * stride <= KVM_MAX_IRQ_ROUTES`), so the
+/// host never overflows the table and no config needs a runtime bail. With the
+/// 24-pin IOAPIC base and 16 NICs this is `(4096 - 24) / 16 = 254`. The device
+/// caps its advertised vector count at this (and at the MSI-X table-page
+/// capacity [`crate::vmm::virtio_msix::MSIX_TABLE_MAX`]); a NIC wanting more
+/// queue-pairs than `254` vectors allow (> 126 pairs) falls back to the guest's
+/// SHARED vector policy, which the per-queue signal path serves transparently.
+pub(crate) const MSIX_VECTORS_PER_NIC: usize =
+    (KVM_MAX_IRQ_ROUTES - NUM_IOAPIC_PINS as usize) / MAX_VIRTIO_NICS;
+
+// The per-NIC GSI budget must not exceed the device's MSI-X table-page capacity
+// (the device cannot advertise more vectors than its one-page table holds, so
+// MsixState::new caps num_vectors at this stride knowing it is the binding one).
+const _: () = assert!(
+    MSIX_VECTORS_PER_NIC <= crate::vmm::virtio_msix::MSIX_TABLE_MAX,
+    "per-NIC MSI-X GSI budget exceeds the device MSI-X table-page capacity"
+);
+// All NICs' vector ranges plus the IOAPIC pin range must fit KVM's routing
+// table (every routed GSI < KVM_MAX_IRQ_ROUTES); the floor division above makes
+// this hold, and the assert pins it against a future MAX_VIRTIO_NICS bump.
+const _: () = assert!(
+    NUM_IOAPIC_PINS as usize + MAX_VIRTIO_NICS * MSIX_VECTORS_PER_NIC <= KVM_MAX_IRQ_ROUTES,
+    "virtio-net MSI-X GSIs overflow the KVM routing table"
+);
+
+/// MSI-X vector GSI for virtio-net NIC `nic` (0-based), table vector `vector`
+/// (`vector < MSIX_VECTORS_PER_NIC`). MSI-X vectors deliver as
+/// `KVM_IRQ_ROUTING_MSI` routes, which — unlike INTx IOAPIC routes — are NOT
+/// bounded by the 24-pin IOAPIC budget, only by [`KVM_MAX_IRQ_ROUTES`]. So the
+/// MSI-X GSIs live ABOVE the IOAPIC pin range, disjoint from every INTx GSI
+/// ([`virtio_net_gsi`] ∈ [7, 24)): `NUM_IOAPIC_PINS + nic*MSIX_VECTORS_PER_NIC +
+/// vector`. Each NIC's range is `MSIX_VECTORS_PER_NIC` wide, so the ranges are
+/// disjoint and the highest GSI (`NUM_IOAPIC_PINS + MAX_VIRTIO_NICS *
+/// MSIX_VECTORS_PER_NIC - 1`) stays below the budget. The host registers one
+/// irqfd per (NIC, vector) at this GSI at VM bring-up (an irqfd may be assigned
+/// to a GSI with no route yet — virt/kvm/eventfd.c `irqfd_update` leaves the
+/// cache inactive); the MSI route is installed on the guest's vector-unmask edge
+/// by the route owner, which refreshes the irqfd's cached entry via
+/// `kvm_irq_routing_update`.
+pub(crate) const fn virtio_net_msix_gsi(nic: usize, vector: usize) -> u32 {
+    NUM_IOAPIC_PINS as u32 + (nic * MSIX_VECTORS_PER_NIC + vector) as u32
+}
+
+/// PCI slot (bus 0) for the single virtio-block PCI function: after the NIC
+/// slots (1..=MAX_VIRTIO_NICS), so blk takes slot `MAX_VIRTIO_NICS + 1`. One
+/// source of truth shared by `PciBus::add_function` and the DSDT `_PRT`.
+pub(crate) const fn virtio_blk_pci_slot() -> usize {
+    1 + MAX_VIRTIO_NICS
+}
+
+/// INTx GSI for the virtio-block PCI function: reuses [`VIRTIO_BLK_IRQ`] (=6) —
+/// the IOAPIC pin the MMIO blk transport uses. On the x86 PCI path blk is on PCI
+/// (not MMIO), so that pin is free; the DSDT `_PRT` routes
+/// `(virtio_blk_pci_slot(), INTA#)` here (level, active-low, programmed by the
+/// guest via acpi_pci_irq_enable, like the NIC INTx lines).
+pub(crate) const fn virtio_blk_pci_gsi() -> u32 {
+    VIRTIO_BLK_IRQ
+}
+
+/// Per-device MSI-X GSI budget for the virtio-block PCI function — the cap on its
+/// advertised vectors. blk is single-queue (advertises `num_queues + 1` = 2),
+/// so the budget is the GSIs left after the IOAPIC pins and all NIC MSI-X ranges
+/// (`[24 + 16*254, 4096)` = 8 GSIs); ample for 2 vectors. Caps `MsixState::new`.
+pub(crate) const MSIX_VECTORS_PER_BLK: usize =
+    KVM_MAX_IRQ_ROUTES - NUM_IOAPIC_PINS as usize - MAX_VIRTIO_NICS * MSIX_VECTORS_PER_NIC;
+
+/// MSI-X vector GSI for the virtio-block PCI function, table vector `vector`
+/// (`vector < MSIX_VECTORS_PER_BLK`). Lives ABOVE the IOAPIC pins AND every NIC
+/// MSI-X range, disjoint from both: `NUM_IOAPIC_PINS + MAX_VIRTIO_NICS *
+/// MSIX_VECTORS_PER_NIC + vector`. A single blk device, so no per-device stride.
+pub(crate) const fn virtio_blk_pci_msix_gsi(vector: usize) -> u32 {
+    (NUM_IOAPIC_PINS as usize + MAX_VIRTIO_NICS * MSIX_VECTORS_PER_NIC + vector) as u32
+}
+
+// The blk MSI-X range plus the IOAPIC pins and all NIC MSI-X ranges must fit
+// KVM's routing table. By construction MSIX_VECTORS_PER_BLK is exactly the
+// remainder, so the total equals KVM_MAX_IRQ_ROUTES; pinned against a future
+// MAX_VIRTIO_NICS / MSIX_VECTORS_PER_NIC change.
+const _: () = assert!(
+    NUM_IOAPIC_PINS as usize + MAX_VIRTIO_NICS * MSIX_VECTORS_PER_NIC + MSIX_VECTORS_PER_BLK
+        <= KVM_MAX_IRQ_ROUTES,
+    "virtio-blk MSI-X GSIs overflow the KVM routing table"
+);
+// blk advertises num_queues + 1 = 2 vectors; the budget must hold them and not
+// exceed the MSI-X table-page capacity.
+const _: () = assert!(
+    MSIX_VECTORS_PER_BLK >= 2 && MSIX_VECTORS_PER_BLK <= crate::vmm::virtio_msix::MSIX_TABLE_MAX,
+    "virtio-blk MSI-X GSI budget must hold >=2 vectors and fit the table page"
+);
+
+/// GSI the FADT advertises as the ACPI SCI (system control interrupt). The
+/// non-hardware-reduced FADT must name one; ktstr never arms a fixed event or
+/// a GPE block, so the SCI never fires — this GSI is reserved (inert) and has
+/// no MADT Interrupt Source Override (an ISO declaring it level/active-low
+/// would only matter if the SCI could fire). Inert does NOT mean untouched:
+/// the guest still PROGRAMS the GSI-9 IOAPIC RTE (level/active-low) during
+/// `acpi_enable` (acpi_os_install_interrupt_handler / acpi_sci_ioapic_setup),
+/// and on the split-irqchip path that triggers a KVM_SET_GSI_ROUTING rebuild
+/// for GSI 9 — but the line maps to no device irqfd, so the programmed route
+/// delivers nothing. Named here so its disjointness from the device GSIs is
+/// checkable in one place: serial COM1=4/COM2=3, virtio-MMIO console=5,
+/// virtio-blk [`VIRTIO_BLK_IRQ`]=6, virtio-net base GSI 7 (`virtio_net_gsi(0)`)
+/// — 9 collides with none. If a fixed event or GPE is ever armed, add a MADT ISO
+/// declaring this GSI level/active-low.
+pub(crate) const ACPI_SCI_IRQ: u16 = 9;
+
+/// ACPI PM register-block I/O ports (non-hardware-reduced FADT). The guest's
+/// ACPICA writes/reads these during `acpi_enable` + fixed-event init; ktstr
+/// emulates them as stateless stubs (no real power management). Advertising
+/// them is what lets ACPI FULLY enable — required so the guest routes PCI
+/// INTx via the DSDT `_PRT` (`acpi_pci_irq_enable`); a partially-enabled
+/// ACPI (zeroed PM blocks → `AE_BAD_ADDRESS`) aborts and falls back to
+/// legacy MP-table PCI IRQ routing, which has no NIC entry. Layout (qemu
+/// i440fx/q35 model — full ACPI + PM blocks + legacy IRQs, NOT the
+/// firecracker/cloud-hypervisor hardware-reduced microvm path which drops
+/// the legacy 8259 IRQs ktstr's cmdline virtio-MMIO devices depend on):
+///   PM1 event block  (4 bytes: status u16 @ +0, enable u16 @ +2)
+///   PM1 control block (2 bytes: SCI_EN bit0)
+///   PM timer block    (4 bytes: 24-bit free-running counter)
+pub(crate) const ACPI_PM1_EVT_PORT: u16 = 0x600;
+pub(crate) const ACPI_PM1_CNT_PORT: u16 = 0x604;
+pub(crate) const ACPI_PM_TMR_PORT: u16 = 0x608;
 
 /// E820 memory type: usable RAM.
 pub(crate) const E820_RAM: u32 = 1;
@@ -131,7 +345,7 @@ pub struct KtstrKvm {
     pub(crate) split_irqchip: bool,
     /// Userspace IOAPIC device, present only on the split-irqchip path.
     /// The run loops wrap it in an [`IoapicHandle`] (device + raw VM fd) to
-    /// service IOAPIC MMIO and reprogram MSI routes; `None` for <=254-vCPU
+    /// service IOAPIC MMIO and reprogram MSI routes; `None` for <=254-max-APIC-ID
     /// guests, which use the in-kernel IOAPIC.
     pub(crate) ioapic: Option<Arc<PiMutex<Ioapic>>>,
     /// Whether hugepages were requested at construction time.
@@ -152,6 +366,11 @@ pub struct KtstrKvm {
     /// take `LOCK_EX` and truncate the segment while the guest still
     /// holds pages that fault through the backing file.
     pub(crate) cow_overlay_guards: Vec<crate::vmm::initramfs::CowOverlayGuard>,
+    /// Whether this VM exposes the virtio-PCI transport (a PCI host bridge with
+    /// ECAM/CAM config access). `false` keeps the guest on virtio-MMIO only —
+    /// no PCI ACPI tables, `pci=off` retained — byte-identical to a non-PCI
+    /// boot. Set when a NIC is placed on PCI (or by a transport test).
+    pub(crate) pci_enabled: bool,
 }
 
 impl Drop for KtstrKvm {
@@ -317,6 +536,7 @@ impl KtstrKvm {
             performance_mode,
             _reservation: reservation,
             cow_overlay_guards: Vec::new(),
+            pci_enabled: false,
         })
     }
 
@@ -368,7 +588,7 @@ impl KtstrKvm {
         }
 
         // Userspace IOAPIC device for the split-irqchip path (no in-kernel
-        // IOAPIC there). `None` for <=254-vCPU guests. The run loops build an
+        // IOAPIC there). `None` for <=254-max-APIC-ID guests. The run loops build an
         // IoapicHandle around this to translate guest RTE writes into MSI
         // routes; see `super::ioapic` and `IoapicHandle`.
         Ok(split_irqchip.then(|| Arc::new(PiMutex::new(Ioapic::new()))))
@@ -653,7 +873,7 @@ impl KtstrKvm {
 /// Companion to the safe-wrapper boot-time probe above — used by
 /// the freeze coordinator (see [`crate::vmm::freeze_coord`]) for
 /// the freeze rendezvous save/restore where the coordinator's
-/// `freeze_and_capture` + `thaw_and_barrier` sibling closures
+/// `freeze_and_dispatch` + `thaw_and_barrier` sibling closures
 /// can't borrow `&vm.vm_fd` (vm is consumed by a downstream closure
 /// in the same scope) and therefore use the raw fd (Copy) cached
 /// at coord-thread spawn time.
@@ -809,26 +1029,274 @@ fn build_device_msi_routing(routes: &[(u32, MsiRoute)]) -> Result<KvmIrqRouting>
     Ok(routing)
 }
 
+/// Build a `KVM_SET_GSI_ROUTING` table for the FULL-irqchip path: the explicit
+/// x86 default routes (IOAPIC pins for GSI 0..24, plus 8259 PIC master/slave for
+/// GSI 0..16) FOLLOWED BY the device MSI routes. Required because
+/// `KVM_SET_GSI_ROUTING` is a whole-table replace — installing only the MSI
+/// routes would wipe KVM's implicit default IOAPIC/PIC routes and break INTx
+/// delivery (console / blk / serial). Replicates the kernel's own
+/// `default_routing` (arch/x86/kvm/irq.c: `ROUTING_ENTRY2` = IOAPIC + PIC for
+/// GSI 0..16, `ROUTING_ENTRY1` = IOAPIC-only for GSI 16..24; PIC pin = gsi % 8,
+/// master for gsi < 8 else slave) so the explicit table is route-identical to
+/// the implicit default, then appends one `KVM_IRQ_ROUTING_MSI` per device
+/// vector.
+fn build_full_irqchip_routing(msi_routes: &[(u32, MsiRoute)]) -> Result<KvmIrqRouting> {
+    const N_IOAPIC_PINS: u32 = 24;
+    const N_PIC_PINS: u32 = 16;
+    let total = N_IOAPIC_PINS as usize + N_PIC_PINS as usize + msi_routes.len();
+    let mut routing = KvmIrqRouting::new(total).map_err(|e| {
+        anyhow::anyhow!("allocate kvm_irq_routing for {total} full-irqchip routes: {e:?}")
+    })?;
+    let irqchip = |gsi: u32, chip: u32, pin: u32| kvm_irq_routing_entry {
+        gsi,
+        type_: KVM_IRQ_ROUTING_IRQCHIP,
+        flags: 0,
+        pad: 0,
+        u: kvm_irq_routing_entry__bindgen_ty_1 {
+            irqchip: kvm_irq_routing_irqchip { irqchip: chip, pin },
+        },
+    };
+    let slice = routing.as_mut_slice();
+    let mut i = 0;
+    // IOAPIC pins 0..24 (gsi == pin) — the IOAPIC half of every default entry.
+    for gsi in 0..N_IOAPIC_PINS {
+        slice[i] = irqchip(gsi, KVM_IRQCHIP_IOAPIC, gsi);
+        i += 1;
+    }
+    // 8259 PIC for GSI 0..16: master (0..8) / slave (8..16), pin = gsi % 8.
+    for gsi in 0..N_PIC_PINS {
+        let chip = if gsi < 8 {
+            KVM_IRQCHIP_PIC_MASTER
+        } else {
+            KVM_IRQCHIP_PIC_SLAVE
+        };
+        slice[i] = irqchip(gsi, chip, gsi % 8);
+        i += 1;
+    }
+    // Device MSI routes (same entry shape as `build_device_msi_routing`).
+    for (gsi, msi) in msi_routes {
+        slice[i] = kvm_irq_routing_entry {
+            gsi: *gsi,
+            type_: KVM_IRQ_ROUTING_MSI,
+            flags: 0,
+            pad: 0,
+            u: kvm_irq_routing_entry__bindgen_ty_1 {
+                msi: kvm_irq_routing_msi {
+                    address_lo: msi.address_lo,
+                    address_hi: msi.address_hi,
+                    data: msi.data,
+                    __bindgen_anon_1: kvm_irq_routing_msi__bindgen_ty_1 { pad: 0 },
+                },
+            },
+        };
+        i += 1;
+    }
+    Ok(routing)
+}
+
+/// Full-irqchip shared GSI route owner. Holds the device MSI routes and installs
+/// the COMPLETE routing table — the explicit IOAPIC/PIC defaults from
+/// [`build_full_irqchip_routing`] PLUS the MSI routes — via `KVM_SET_GSI_ROUTING`
+/// on every change. Because that ioctl is a whole-table replace, ONE owner holds
+/// every MSI-capable device's routes on the full-irqchip path; the split-irqchip
+/// path routes through [`IoapicHandle`] instead. Constructed `Some` only when
+/// `!split_irqchip` (the inverse of `IoapicHandle`). [`Self::install_defaults`]
+/// runs once at VM init to replace KVM's implicit default routing with a
+/// route-identical EXPLICIT table, so INTx keeps working once MSI routes are
+/// added. Cloned (`Arc`) into each MSI-X-capable PCI function, which calls
+/// [`Self::set_route`] on a vector mask/unmask edge.
+pub(crate) struct FullIrqchipRouteOwner {
+    vm_fd_raw: i32,
+    /// Device MSI routes keyed by GSI. The 40 default IOAPIC/PIC routes are
+    /// constant (re-emitted by the builder each install); only these change.
+    routes: PiMutex<Vec<(u32, MsiRoute)>>,
+    /// Count of failed `KVM_SET_GSI_ROUTING` installs (a failure leaves a device
+    /// IRQ unrouted — it will not deliver). Read at teardown for diagnostics.
+    routing_failures: std::sync::atomic::AtomicU64,
+    /// The route set most recently installed; skips the redundant
+    /// (SRCU-grace-period) ioctl when an install would be byte-identical. Mirrors
+    /// [`IoapicHandle`]'s `last_installed` dedup. A separate lock from `routes`
+    /// so the route snapshot is taken + the `routes` lock released BEFORE the
+    /// install ioctl (keeps the slow ioctl off any other vCPU's `set_route`).
+    last_installed: PiMutex<Option<Vec<(u32, MsiRoute)>>>,
+}
+
+impl FullIrqchipRouteOwner {
+    pub(crate) fn new(vm_fd_raw: i32) -> Self {
+        FullIrqchipRouteOwner {
+            vm_fd_raw,
+            routes: PiMutex::new(Vec::new()),
+            routing_failures: std::sync::atomic::AtomicU64::new(0),
+            last_installed: PiMutex::new(None),
+        }
+    }
+
+    /// Install the complete table (explicit defaults + the current MSI routes).
+    /// Called once at VM init (no MSI routes yet → defaults only) so the explicit
+    /// table replaces KVM's implicit default before any device adds a route.
+    pub(crate) fn install_defaults(&self) -> Result<()> {
+        let snapshot = self.routes.lock().clone();
+        self.install_snapshot(snapshot, |r| {
+            kvm_set_gsi_routing_via_raw_fd(self.vm_fd_raw, r)
+        })
+    }
+
+    /// Set (`Some`) or clear (`None`) the device MSI route for `gsi`, then
+    /// reinstall the complete table. The route snapshot is taken under the
+    /// `routes` lock, which is released before the install ioctl.
+    pub(crate) fn set_route(&self, gsi: u32, route: Option<MsiRoute>) -> Result<()> {
+        let snapshot = {
+            let mut routes = self.routes.lock();
+            routes.retain(|(g, _)| *g != gsi);
+            if let Some(m) = route {
+                routes.push((gsi, m));
+            }
+            routes.clone()
+        };
+        self.install_snapshot(snapshot, |r| {
+            kvm_set_gsi_routing_via_raw_fd(self.vm_fd_raw, r)
+        })
+    }
+
+    /// Build the full table from `snapshot` and install it via `install` (unless
+    /// byte-identical to the last install). The seam exists only so a host-side
+    /// test injects a counting/failing installer; production passes the real
+    /// `KVM_SET_GSI_ROUTING`. `install` runs at most once → `FnOnce`.
+    fn install_snapshot(
+        &self,
+        snapshot: Vec<(u32, MsiRoute)>,
+        install: impl FnOnce(&KvmIrqRouting) -> std::io::Result<()>,
+    ) -> Result<()> {
+        let mut last = self.last_installed.lock();
+        if last.as_deref() == Some(snapshot.as_slice()) {
+            return Ok(());
+        }
+        let routing = build_full_irqchip_routing(&snapshot)?;
+        if let Err(e) = install(&routing) {
+            self.routing_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(anyhow::anyhow!("KVM_SET_GSI_ROUTING (full-irqchip): {e}"));
+        }
+        *last = Some(snapshot);
+        Ok(())
+    }
+
+    /// Failed-install count, for teardown diagnostics.
+    pub(crate) fn routing_failures(&self) -> u64 {
+        self.routing_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Translate a guest-composed MSI message from the `virt_ext_dest_id` encoding
+/// into the format KVM decodes, so MSI-X delivers to APIC IDs > 255 WITHOUT
+/// interrupt remapping. A guest with `KVM_FEATURE_MSI_EXT_DEST_ID` advertised
+/// (we set it for wide-SMP — see `host_topology`) and no IOMMU composes a >255
+/// destination by packing `dest[14:8]` into `address_lo` bits `[11:5]` (the
+/// "virt-destid" field; `address_hi` stays 0) — Linux `__irq_msi_compose_msg`
+/// (arch/x86/kernel/apic/apic.c). But KVM, under `KVM_X2APIC_API_USE_32BIT_IDS`
+/// (which we enable), reads the extended destination from `address_hi[31:8]` and
+/// ignores those `address_lo` bits — so a verbatim guest message decodes to
+/// `destid_0_7` only (e.g. 256 & 0xff = 0 → APIC 0), silently mis-delivering.
+/// Move the virt-destid bits into `address_hi` (`[11:5] << 3` lands them at
+/// `address_hi[14:8]`, matching `(dest>>8)<<8` — the exact format
+/// [`Ioapic::redtbl_to_msi`] already emits for INTx and KVM decodes).
+///
+/// Guards (mirrors cloud-hypervisor `translate_msi_ext_dest_id` / qemu
+/// `kvm_swizzle_msi_ext_dest_id`): only swizzle when `address_hi == 0` (an
+/// already-translated message, or a host-composed IOAPIC route whose
+/// `address_hi` redtbl_to_msi set for dest>255, is left untouched — no
+/// double-swizzle) and the interrupt-format bit (`address_lo` bit 4 —
+/// `x86_msi_addr_lo.reserved_1`, set as `dmar_format` only by the IR/remappable
+/// path; bit 3, not this, is `redirect_hint`) is clear (never rewrite a
+/// remappable-format message; the kernel sets `virt_destid` only when it is
+/// clear). A dest ≤ 255 has no virt-destid bits set, so the swizzle is a no-op
+/// there.
+fn translate_msi_ext_dest_id(address_lo: u32, address_hi: u32) -> (u32, u32) {
+    /// `address_lo` bit 4 — the interrupt-format / `dmar_format` bit (kernel
+    /// `x86_msi_addr_lo.reserved_1` in the compatibility format, set only by the
+    /// IR/remappable path; not `redirect_hint`, which is bit 3). Matches qemu's
+    /// `MSI_ADDR_DEST_IDX_SHIFT` ext-dest gate.
+    const MSI_ADDR_RF_BIT: u32 = 0x10;
+    /// `address_lo` bits `[11:5]` — the guest's virt-destid (`dest[14:8]`) field.
+    const MSI_ADDR_VIRT_DESTID: u32 = 0xfe0;
+    if address_hi == 0 && address_lo & MSI_ADDR_RF_BIT == 0 {
+        let ext = address_lo & MSI_ADDR_VIRT_DESTID;
+        (address_lo & !MSI_ADDR_VIRT_DESTID, address_hi | (ext << 3))
+    } else {
+        (address_lo, address_hi)
+    }
+}
+
+/// Build an [`MsiRoute`] from a guest-composed MSI-X message tuple, applying the
+/// `virt_ext_dest_id` → KVM swizzle ([`translate_msi_ext_dest_id`]) so the
+/// route's destination survives KVM decode for APIC IDs > 255. Shared by both
+/// [`MsixRouteSink`](crate::vmm::virtio_msix::MsixRouteSink) impls (the two
+/// per-irqchip-mode route owners) so the guest-message → KVM-route conversion is
+/// identical on both paths.
+fn msi_route_from_guest_msg(address_lo: u32, address_hi: u32, data: u32) -> MsiRoute {
+    let (address_lo, address_hi) = translate_msi_ext_dest_id(address_lo, address_hi);
+    MsiRoute {
+        address_lo,
+        address_hi,
+        data,
+    }
+}
+
+/// Bridge the full-irqchip route owner to the transport-neutral
+/// [`crate::vmm::virtio_msix::MsixRouteSink`] the virtio-net PCI facade calls on a
+/// vector mask/unmask edge: map the guest's MSI message dwords into an
+/// [`MsiRoute`] (applying the ext-dest swizzle, [`msi_route_from_guest_msg`]) and
+/// (un)install it via the inherent [`Self::set_route`]. Errors are counted in
+/// `routing_failures` (read at teardown), not propagated — a config-space MMIO
+/// write has no error channel back to the guest.
+impl crate::vmm::virtio_msix::MsixRouteSink for FullIrqchipRouteOwner {
+    fn set_route(&self, gsi: u32, msg: Option<(u32, u32, u32)>) {
+        let route = msg.map(|(lo, hi, data)| msi_route_from_guest_msg(lo, hi, data));
+        let _ = FullIrqchipRouteOwner::set_route(self, gsi, route);
+    }
+}
+
 /// Owns the userspace IOAPIC device plus the cached raw VM fd needed to
 /// reprogram KVM's MSI routing table. Cloned (via `Arc`) into each AP run
 /// loop on the split-irqchip path; `None` on the in-kernel-irqchip path
-/// (<=254 vCPUs), where the kernel IOAPIC delivers device IRQs directly.
+/// (<=254 max APIC ID), where the kernel IOAPIC delivers device IRQs directly.
+///
+/// On split-irqchip this is the SINGLE owner of the whole KVM GSI routing
+/// table (`KVM_SET_GSI_ROUTING` is a whole-table replace), holding BOTH halves:
+/// the userspace IOAPIC's RTE→MSI translations ([`Ioapic::gsi_routes`], GSIs
+/// `0..NUM_IOAPIC_PINS`) AND the device MSI-X routes (`msix_routes`, GSIs
+/// `>= NUM_IOAPIC_PINS`) installed via [`crate::vmm::virtio_msix::MsixRouteSink`]
+/// on a vector mask/unmask edge. Both halves are `KVM_IRQ_ROUTING_MSI` entries
+/// built by [`build_device_msi_routing`] — split-irqchip has no in-kernel
+/// IOAPIC/PIC, so (unlike [`FullIrqchipRouteOwner`]) it never emits the explicit
+/// irqchip defaults. Every install rebuilds the COMBINED table from both halves
+/// (see [`Self::install_combined`]) so a change to one never drops the other
+/// from the whole-table replace.
 pub(crate) struct IoapicHandle {
     ioapic: Arc<PiMutex<Ioapic>>,
     vm_fd_raw: i32,
     /// Count of failed `KVM_SET_GSI_ROUTING` installs. A failure leaves a
     /// guest-programmed device IRQ unrouted — it will not deliver and the
-    /// device hangs on first use. Bumped in `mmio_write`, read at teardown
-    /// (`routing_failures`) so a hung-device test reports the count instead of
-    /// an opaque timeout.
+    /// device hangs on first use. Bumped on every failed install (an IOAPIC RTE
+    /// write OR an MSI-X route edge), read at teardown (`routing_failures`) so a
+    /// hung-device test reports the count instead of an opaque timeout.
     routing_failures: std::sync::atomic::AtomicU64,
-    /// The route set most recently installed via `KVM_SET_GSI_ROUTING`.
-    /// `mmio_write` skips the install ioctl (which waits an SRCU grace
-    /// period) when the freshly-computed `gsi_routes()` set is byte-identical
-    /// — the guest programs each 64-bit RTE as two 32-bit MMIO writes, and
-    /// the high-word write of a still-masked entry yields the same
-    /// `is_masked`-filtered route set as before it, so roughly half the
-    /// per-RTE installs are redundant. Guarded by its own mutex, not the
+    /// Device MSI-X routes keyed by GSI (`>= NUM_IOAPIC_PINS`), the second half
+    /// of the combined table. Maintained by [`Self::set_route_with`] (retain +
+    /// push, mirroring [`FullIrqchipRouteOwner`]'s `routes`) on each vector
+    /// mask/unmask edge; appended to the IOAPIC half in [`Self::install_combined`].
+    /// A separate lock from `ioapic` so the two halves are snapshotted
+    /// independently (never both held) — no lock-order inversion between the
+    /// IOAPIC-write and MSI-X-edge install paths.
+    msix_routes: PiMutex<Vec<(u32, MsiRoute)>>,
+    /// The COMBINED route set most recently installed via `KVM_SET_GSI_ROUTING`
+    /// (IOAPIC translations ++ device MSI-X routes). An install skips the ioctl
+    /// (which waits an SRCU grace period) when the freshly-rebuilt combined set
+    /// is byte-identical — the guest programs each 64-bit IOAPIC RTE as two
+    /// 32-bit MMIO writes, and the high-word write of a still-masked entry
+    /// yields the same `is_masked`-filtered IOAPIC half as before it, so roughly
+    /// half the per-RTE installs are redundant. Guarded by its own mutex, not the
     /// `ioapic` lock: the compare + ioctl + cache update run as one critical
     /// section so the cache can never diverge from KVM's actual routing table
     /// under concurrent IOAPIC programming, while the `ioapic` lock is
@@ -852,6 +1320,7 @@ impl IoapicHandle {
             ioapic,
             vm_fd_raw,
             routing_failures: std::sync::atomic::AtomicU64::new(0),
+            msix_routes: PiMutex::new(Vec::new()),
             last_installed: PiMutex::new(None),
         }
     }
@@ -862,12 +1331,16 @@ impl IoapicHandle {
     }
 
     /// Service a guest MMIO write of the IOAPIC window. If the write changed
-    /// a redirection entry, rebuild the full MSI routing table and install it
-    /// — unless it is byte-identical to the last install, in which case the
-    /// (SRCU-grace-period) ioctl is skipped (see the `last_installed` cache).
+    /// a redirection entry, rebuild the COMBINED MSI routing table — the IOAPIC
+    /// translations PLUS the current device MSI-X routes (see
+    /// [`Self::install_combined`]) — and install it, unless it is byte-identical
+    /// to the last install, in which case the (SRCU-grace-period) ioctl is
+    /// skipped (see the `last_installed` cache).
     ///
-    /// The route snapshot is taken under the `ioapic` lock, which is then
-    /// released; the compare + ioctl + cache update run under the separate
+    /// The IOAPIC-half snapshot is taken under the `ioapic` lock atomically with
+    /// the change-detection (so it matches the write that triggered it); the
+    /// `ioapic` lock is then released, the MSI-X half appended under its own
+    /// lock, and the compare + ioctl + cache update run under the separate
     /// `last_installed` lock. So a slow install never stalls another vCPU's
     /// IOAPIC MMIO access (the `ioapic` lock is free during the ioctl), and
     /// the cache stays consistent with KVM's table — installs serialize on
@@ -905,20 +1378,23 @@ impl IoapicHandle {
     }
 
     /// [`Self::mmio_write`] with the routing install injected as `install`,
-    /// so a host-side test drives the dedup + cache-on-success logic with a
-    /// counting/failing closure instead of a live KVM fd. The production
-    /// caller passes the real `KVM_SET_GSI_ROUTING` installer. `install` runs
-    /// at most once per call — only when the write changed a route AND the
-    /// set differs from `last_installed` — hence `FnOnce`. (No reference VMM
-    /// exposes such a seam or unit-tests this path; they re-install
-    /// unconditionally — see the `last_installed` divergence note.)
+    /// so a host-side test drives the combined-table dedup + cache-on-success
+    /// logic with a counting/failing closure instead of a live KVM fd. The
+    /// production caller passes the real `KVM_SET_GSI_ROUTING` installer.
+    /// `install` runs at most once per call — only when the write changed a
+    /// route AND the resulting combined set differs from `last_installed` —
+    /// hence `FnOnce`. (No reference VMM exposes such a seam or unit-tests this
+    /// path; they re-install unconditionally — see the `last_installed`
+    /// divergence note.)
     fn mmio_write_with(
         &self,
         offset: u64,
         data: &[u8],
         install: impl FnOnce(&KvmIrqRouting) -> std::io::Result<()>,
     ) -> Result<()> {
-        let routes = {
+        // Snapshot the IOAPIC half atomically with the change-detection (one
+        // `ioapic` critical section), then release the lock before the install.
+        let ioapic_routes = {
             let mut io = self.ioapic.lock();
             if io.mmio_write(offset, data) {
                 Some(io.gsi_routes())
@@ -926,24 +1402,79 @@ impl IoapicHandle {
                 None
             }
         };
-        if let Some(routes) = routes {
-            let mut last = self.last_installed.lock();
-            if last.as_deref() == Some(routes.as_slice()) {
-                // Unchanged from the last successful install — skip the
-                // whole-table replace and its SRCU grace period.
-                return Ok(());
-            }
-            let routing = build_device_msi_routing(&routes)?;
-            if let Err(e) = install(&routing) {
-                self.routing_failures
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Err(anyhow::anyhow!("KVM_SET_GSI_ROUTING: {e}"));
-            }
-            // Cache only after a successful install so a failed ioctl never
-            // makes a later identical attempt skip a needed retry.
-            *last = Some(routes);
+        match ioapic_routes {
+            Some(routes) => self.install_combined(routes, install),
+            None => Ok(()),
         }
+    }
+
+    /// Append the current device MSI-X routes to the given IOAPIC-half snapshot,
+    /// rebuild the COMBINED `KVM_IRQ_ROUTING_MSI` table
+    /// ([`build_device_msi_routing`] — NO in-kernel-irqchip defaults; the
+    /// split-irqchip path has no in-kernel IOAPIC/PIC, unlike
+    /// [`FullIrqchipRouteOwner`]), and install it via `install` unless
+    /// byte-identical to the last successful install. The caller passes the
+    /// IOAPIC half already snapshotted (atomically with its own change-detection
+    /// on the MMIO path, freshly on the MSI-X path); the MSI-X half is read here
+    /// under its own lock — never while holding `ioapic`, so the two halves are
+    /// never both locked and the MMIO-write and MSI-X-edge paths cannot invert
+    /// lock order. The compare + ioctl + cache run under `last_installed` alone;
+    /// cache-on-success-only so a failed install never makes a later identical
+    /// attempt skip a needed retry. Either trigger rebuilds the whole combined
+    /// table, so a change to one half never drops the other from the
+    /// whole-table replace. `install` runs at most once → `FnOnce`.
+    fn install_combined(
+        &self,
+        ioapic_routes: Vec<(u32, MsiRoute)>,
+        install: impl FnOnce(&KvmIrqRouting) -> std::io::Result<()>,
+    ) -> Result<()> {
+        let combined = {
+            let mut c = ioapic_routes;
+            c.extend(self.msix_routes.lock().iter().cloned());
+            c
+        };
+        let mut last = self.last_installed.lock();
+        if last.as_deref() == Some(combined.as_slice()) {
+            // Unchanged from the last successful install — skip the
+            // whole-table replace and its SRCU grace period.
+            return Ok(());
+        }
+        let routing = build_device_msi_routing(&combined)?;
+        if let Err(e) = install(&routing) {
+            self.routing_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(anyhow::anyhow!("KVM_SET_GSI_ROUTING: {e}"));
+        }
+        // Cache only after a successful install so a failed ioctl never
+        // makes a later identical attempt skip a needed retry.
+        *last = Some(combined);
         Ok(())
+    }
+
+    /// Set (`Some`) or clear (`None`) the device MSI-X route for `gsi` (the
+    /// second half of the combined table), then reinstall the combined table via
+    /// `install`. The `msix_routes` mutation runs under its own lock (released
+    /// before the install); [`Self::install_combined`] then snapshots the IOAPIC
+    /// half separately — neither lock is held across the other or across the
+    /// ioctl. The seam exists only so a host-side test injects a counting/failing
+    /// installer; production reaches this via the
+    /// [`crate::vmm::virtio_msix::MsixRouteSink`] impl with the real
+    /// `KVM_SET_GSI_ROUTING` installer. `install` runs at most once → `FnOnce`.
+    fn set_route_with(
+        &self,
+        gsi: u32,
+        route: Option<MsiRoute>,
+        install: impl FnOnce(&KvmIrqRouting) -> std::io::Result<()>,
+    ) -> Result<()> {
+        {
+            let mut routes = self.msix_routes.lock();
+            routes.retain(|(g, _)| *g != gsi);
+            if let Some(m) = route {
+                routes.push((gsi, m));
+            }
+        }
+        let ioapic_routes = self.ioapic.lock().gsi_routes();
+        self.install_combined(ioapic_routes, install)
     }
 
     /// Service a `KVM_EXIT_IOAPIC_EOI` for `vector` (clears remote-IRR on a
@@ -984,9 +1515,143 @@ impl IoapicHandle {
     }
 }
 
+/// Bridge the split-irqchip route owner to the transport-neutral
+/// [`crate::vmm::virtio_msix::MsixRouteSink`] the virtio-net PCI facade calls on a
+/// vector mask/unmask edge: map the guest's MSI message dwords into an
+/// [`MsiRoute`] and (un)install it via the inherent [`Self::set_route_with`],
+/// which rebuilds the COMBINED IOAPIC + MSI-X table. Errors are counted in
+/// `routing_failures` (read at teardown), not propagated — a config-space MMIO
+/// write has no error channel back to the guest. Mirrors the identical bridge on
+/// [`FullIrqchipRouteOwner`]; the two are the per-irqchip-mode route owners
+/// (split → `IoapicHandle`, full → `FullIrqchipRouteOwner`).
+impl crate::vmm::virtio_msix::MsixRouteSink for IoapicHandle {
+    fn set_route(&self, gsi: u32, msg: Option<(u32, u32, u32)>) {
+        let route = msg.map(|(lo, hi, data)| msi_route_from_guest_msg(lo, hi, data));
+        let fd = self.vm_fd_raw;
+        let _ = self.set_route_with(gsi, route, move |routing| {
+            kvm_set_gsi_routing_via_raw_fd(fd, routing)
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-NIC GSI/slot allocators are the single source of truth the
+    /// whole multi-NIC stack routes through (the install loop in setup, the
+    /// DSDT `_PRT` routes in acpi). Pin their invariants directly so a
+    /// regression — dropping the SCI skip, an off-by-one past the IOAPIC line
+    /// budget, or changing the base — fails here at compile-test time rather
+    /// than silently mis-routing INTx in a booted guest.
+    #[test]
+    fn virtio_net_gsi_slot_allocation_invariants() {
+        let gsis: Vec<u32> = (0..MAX_VIRTIO_NICS).map(virtio_net_gsi).collect();
+
+        // (a) every GSI within the IOAPIC line budget.
+        for (i, &g) in gsis.iter().enumerate() {
+            assert!(
+                u64::from(g) < NUM_IOAPIC_PINS,
+                "virtio_net_gsi({i}) = {g} exceeds the IOAPIC budget ({NUM_IOAPIC_PINS})",
+            );
+        }
+
+        // (b) disjoint from every reserved line: PIT=2, COM2=3, COM1=4,
+        //     virtio-MMIO console=5, virtio-blk=6, ACPI SCI=9.
+        let reserved = [
+            2u32,
+            3,
+            4,
+            VIRTIO_CONSOLE_IRQ,
+            VIRTIO_BLK_IRQ,
+            ACPI_SCI_IRQ as u32,
+        ];
+        for &g in &gsis {
+            assert!(
+                !reserved.contains(&g),
+                "virtio_net_gsi produced {g}, colliding with a reserved line {reserved:?}",
+            );
+        }
+
+        // (c) all distinct and (d) the exact set {7,8,10..=23} = (7..24) minus
+        //     the skipped SCI line.
+        let set: std::collections::BTreeSet<u32> = gsis.iter().copied().collect();
+        assert_eq!(set.len(), gsis.len(), "GSIs must be distinct: {gsis:?}");
+        let mut want: std::collections::BTreeSet<u32> = (7..NUM_IOAPIC_PINS as u32).collect();
+        want.remove(&(ACPI_SCI_IRQ as u32));
+        assert_eq!(set, want, "GSI set must be (7..24) minus the SCI line");
+
+        // (e) slots 0..MAX map to 1..=MAX (slot 0 reserved for the host bridge).
+        let slots: Vec<usize> = (0..MAX_VIRTIO_NICS).map(virtio_net_pci_slot).collect();
+        let want_slots: Vec<usize> = (1..=MAX_VIRTIO_NICS).collect();
+        assert_eq!(
+            slots, want_slots,
+            "slots must be 1..=MAX_VIRTIO_NICS (slot 0 = host bridge)",
+        );
+    }
+
+    /// MSI-X vector GSIs ([`virtio_net_msix_gsi`]) live ABOVE the IOAPIC pin
+    /// range (MSI routes are bounded only by KVM_MAX_IRQ_ROUTES, not the 24-pin
+    /// IOAPIC budget), are disjoint from every INTx GSI + reserved line, are
+    /// globally unique across (NIC, vector), and fit the KVM routing budget. A
+    /// regression — overlapping the IOAPIC range, colliding with an INTx GSI, or
+    /// a non-unique mapping — would silently misroute an MSI-X vector.
+    #[test]
+    fn virtio_net_msix_gsi_invariants() {
+        let intx: std::collections::BTreeSet<u32> =
+            (0..MAX_VIRTIO_NICS).map(virtio_net_gsi).collect();
+        let reserved = [
+            2u32,
+            3,
+            4,
+            VIRTIO_CONSOLE_IRQ,
+            VIRTIO_BLK_IRQ,
+            ACPI_SCI_IRQ as u32,
+        ];
+
+        // Walk the FULL per-NIC vector budget (not just a single-pair count): the
+        // disjointness/uniqueness/budget invariants must hold for every vector a
+        // NIC could ever advertise.
+        let mut seen = std::collections::BTreeSet::new();
+        for nic in 0..MAX_VIRTIO_NICS {
+            for v in 0..MSIX_VECTORS_PER_NIC {
+                let g = virtio_net_msix_gsi(nic, v);
+                // (a) above the IOAPIC pin range.
+                assert!(
+                    u64::from(g) >= NUM_IOAPIC_PINS,
+                    "msix_gsi(nic={nic}, v={v}) = {g} is inside the IOAPIC range"
+                );
+                // (b) disjoint from every INTx GSI and reserved line.
+                assert!(!intx.contains(&g), "msix_gsi {g} collides with an INTx GSI");
+                assert!(
+                    !reserved.contains(&g),
+                    "msix_gsi {g} collides with a reserved line"
+                );
+                // (c) globally unique across (NIC, vector).
+                assert!(
+                    seen.insert(g),
+                    "msix_gsi {g} duplicated at (nic={nic}, v={v})"
+                );
+                // (d) within the KVM routing budget (every routed GSI < the cap).
+                assert!(
+                    (g as usize) < KVM_MAX_IRQ_ROUTES,
+                    "msix_gsi {g} exceeds KVM_MAX_IRQ_ROUTES"
+                );
+            }
+        }
+        // Contiguous block [NUM_IOAPIC_PINS, NUM_IOAPIC_PINS + N*stride).
+        assert_eq!(*seen.iter().next().unwrap(), NUM_IOAPIC_PINS as u32);
+        assert_eq!(
+            *seen.iter().next_back().unwrap(),
+            NUM_IOAPIC_PINS as u32 + (MAX_VIRTIO_NICS * MSIX_VECTORS_PER_NIC) as u32 - 1
+        );
+        // The whole budget — IOAPIC pins plus every NIC's full vector range —
+        // fits below the KVM routing-table cap, so no config overflows it.
+        assert!(
+            NUM_IOAPIC_PINS as usize + MAX_VIRTIO_NICS * MSIX_VECTORS_PER_NIC <= KVM_MAX_IRQ_ROUTES,
+            "per-NIC MSI-X GSI budget overflows the KVM routing table"
+        );
+    }
 
     /// `IoapicHandle` dedups a redundant GSI-routing install (skips the
     /// ioctl when the route set is byte-identical to the last successful
@@ -1066,6 +1731,162 @@ mod tests {
         );
     }
 
+    /// On split-irqchip `IoapicHandle` owns the COMBINED routing table: the
+    /// userspace-IOAPIC RTE translations PLUS the device MSI-X routes. Either
+    /// trigger — an IOAPIC RTE write (`mmio_write_with`) or an MSI-X route edge
+    /// (`set_route_with`) — rebuilds the whole table from both halves, so a
+    /// change to one half never drops the other from the `KVM_SET_GSI_ROUTING`
+    /// whole-table replace. Drives both seams with a capturing installer that
+    /// records the installed GSI set.
+    #[test]
+    fn ioapic_handle_combines_ioapic_and_msix_routes_each_edge_preserves_the_other() {
+        use crate::vmm::x86_64::ioapic::{IOREGSEL, IOWIN, REG_REDTBL_BASE};
+        use std::cell::RefCell;
+        use std::collections::BTreeSet;
+
+        let handle = IoapicHandle::new(std::sync::Arc::new(PiMutex::new(Ioapic::new())), -1);
+        // The GSI set of the most recent install (the whole-table replace).
+        let last: RefCell<BTreeSet<u32>> = RefCell::new(BTreeSet::new());
+
+        // Program an IOAPIC pin's RTE to `vector`, unmasked (mask bit clear) — a
+        // route change → install; capture the installed whole-table GSI set.
+        let program_pin = |pin: u32, vector: u32| {
+            let lo_reg = (REG_REDTBL_BASE + 2 * pin) as u8;
+            handle
+                .mmio_write_with(IOREGSEL, &[lo_reg], |r| {
+                    *last.borrow_mut() = r.as_slice().iter().map(|e| e.gsi).collect();
+                    Ok(())
+                })
+                .unwrap();
+            handle
+                .mmio_write_with(IOWIN, &vector.to_le_bytes(), |r| {
+                    *last.borrow_mut() = r.as_slice().iter().map(|e| e.gsi).collect();
+                    Ok(())
+                })
+                .unwrap();
+        };
+        let msi = |data: u32| MsiRoute {
+            address_lo: 0xFEE0_0000,
+            address_hi: 0,
+            data,
+        };
+        let set_msix = |gsi: u32, route: Option<MsiRoute>| {
+            handle
+                .set_route_with(gsi, route, |r| {
+                    *last.borrow_mut() = r.as_slice().iter().map(|e| e.gsi).collect();
+                    Ok(())
+                })
+                .unwrap();
+        };
+
+        // 1) IOAPIC pin 6 only → the table has the IOAPIC half.
+        program_pin(6, 0x40);
+        assert_eq!(
+            *last.borrow(),
+            BTreeSet::from([6]),
+            "an IOAPIC RTE install carries the IOAPIC half"
+        );
+
+        // 2) Add an MSI-X route at GSI 25 → the table now has BOTH halves
+        //    (the MSI-X edge appends to, not replaces, the IOAPIC half).
+        set_msix(25, Some(msi(0x4001)));
+        assert_eq!(
+            *last.borrow(),
+            BTreeSet::from([6, 25]),
+            "an MSI-X edge appends to — does not replace — the IOAPIC half"
+        );
+
+        // 3) Program another IOAPIC pin (7) → the MSI-X half SURVIVES the
+        //    whole-table replace triggered by the IOAPIC change.
+        program_pin(7, 0x41);
+        assert_eq!(
+            *last.borrow(),
+            BTreeSet::from([6, 7, 25]),
+            "an IOAPIC change must not drop the MSI-X half"
+        );
+
+        // 4) Remove the MSI-X route (None) → the IOAPIC half SURVIVES; only the
+        //    MSI-X GSI is dropped.
+        set_msix(25, None);
+        assert_eq!(
+            *last.borrow(),
+            BTreeSet::from([6, 7]),
+            "removing an MSI-X route drops only its GSI, keeping the IOAPIC half"
+        );
+    }
+
+    /// The MSI-X route edge (`set_route_with`) reuses the same combined-table
+    /// dedup + cache-on-success-only logic as the IOAPIC path: an identical
+    /// route set skips the (SRCU-grace) ioctl, and a failed install neither
+    /// caches nor poisons a later identical retry. Drives the `install` FnOnce
+    /// seam with an injected counting/failing closure (no live KVM fd).
+    #[test]
+    fn ioapic_handle_msix_set_route_dedups_and_caches_on_success_only() {
+        use std::cell::Cell;
+
+        let handle = IoapicHandle::new(std::sync::Arc::new(PiMutex::new(Ioapic::new())), -1);
+        let installs = Cell::new(0u32);
+        let msi = |data: u32| MsiRoute {
+            address_lo: 0xFEE0_0000,
+            address_hi: 0,
+            data,
+        };
+
+        // First MSI-X route at GSI 25 (empty IOAPIC half) → install #1.
+        handle
+            .set_route_with(25, Some(msi(0x4000)), |_r| {
+                installs.set(installs.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(installs.get(), 1, "the first MSI-X route installs");
+
+        // Identical route → the combined table is byte-identical → dedup.
+        handle
+            .set_route_with(25, Some(msi(0x4000)), |_r| {
+                installs.set(installs.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(installs.get(), 1, "an identical MSI-X route dedups");
+
+        // Changed route (data 0x4001) with a FAILING installer → attempts
+        // (count 2), errors, counts the failure, and must NOT cache.
+        assert!(
+            handle
+                .set_route_with(25, Some(msi(0x4001)), |_r| {
+                    installs.set(installs.get() + 1);
+                    Err(std::io::Error::other("injected install failure"))
+                })
+                .is_err(),
+            "an injected install failure propagates as an error"
+        );
+        assert_eq!(
+            installs.get(),
+            2,
+            "the changed MSI-X route attempts an install"
+        );
+        assert_eq!(
+            handle.routing_failures(),
+            1,
+            "the failed MSI-X install is counted"
+        );
+
+        // Retry the SAME changed route with a succeeding installer → re-installs
+        // (count 3), proving the failed install did not poison the cache.
+        handle
+            .set_route_with(25, Some(msi(0x4001)), |_r| {
+                installs.set(installs.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            installs.get(),
+            3,
+            "a failed MSI-X install must not poison the cache — the identical retry re-installs"
+        );
+    }
+
     #[test]
     fn build_device_msi_routing_lays_out_fam_entries() {
         let routes = vec![
@@ -1110,6 +1931,198 @@ mod tests {
         let mut routing = build_device_msi_routing(&[]).expect("empty routing");
         assert_eq!(routing.as_mut_slice().len(), 0, "no entries for empty set");
     }
+
+    /// `FullIrqchipRouteOwner::install_snapshot` dedups a byte-identical reinstall
+    /// AND caches only on success (a failed install must not poison a later
+    /// identical retry) — the same invariants the IoapicHandle test guards, on
+    /// the new full-irqchip owner. Drives the `install` FnOnce seam with an
+    /// injected counting/failing closure (no live KVM fd).
+    #[test]
+    fn full_irqchip_route_owner_dedups_and_caches_on_success_only() {
+        use std::cell::Cell;
+        let owner = FullIrqchipRouteOwner::new(-1);
+        let installs = Cell::new(0u32);
+        let route_a = vec![(
+            24u32,
+            MsiRoute {
+                address_lo: 0xFEE0_0000,
+                address_hi: 0,
+                data: 0x4000,
+            },
+        )];
+        let route_b = vec![(
+            24u32,
+            MsiRoute {
+                address_lo: 0xFEE0_0000,
+                address_hi: 0,
+                data: 0x4001, // different data → different route set than A
+            },
+        )];
+
+        owner
+            .install_snapshot(route_a.clone(), |_r| {
+                installs.set(installs.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(installs.get(), 1, "first install runs");
+
+        // Byte-identical reinstall → dedup, no ioctl.
+        owner
+            .install_snapshot(route_a.clone(), |_r| {
+                installs.set(installs.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(installs.get(), 1, "byte-identical reinstall dedups");
+
+        // Changed route set with a FAILING installer → attempts (count 2),
+        // errors, and must NOT cache route_b.
+        assert!(
+            owner
+                .install_snapshot(route_b.clone(), |_r| {
+                    installs.set(installs.get() + 1);
+                    Err(std::io::Error::other("injected install failure"))
+                })
+                .is_err(),
+            "an injected install failure propagates as an error"
+        );
+        assert_eq!(
+            installs.get(),
+            2,
+            "the changed route set attempts an install"
+        );
+        assert_eq!(owner.routing_failures(), 1, "the failed install is counted");
+
+        // Retry the SAME route_b with a succeeding installer: because the failed
+        // install did not cache route_b, this re-installs (count 3) rather than
+        // dedup-skip — a failed install must not wedge a device behind a poisoned
+        // cache.
+        owner
+            .install_snapshot(route_b.clone(), |_r| {
+                installs.set(installs.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            installs.get(),
+            3,
+            "a failed install must not poison the cache — the identical retry re-installs"
+        );
+    }
+
+    /// `build_full_irqchip_routing` emits the explicit x86 default routing (24
+    /// IOAPIC pins for GSI 0..24 + 16 PIC master/slave for GSI 0..16) followed by
+    /// the device MSI routes — byte-route-identical to the kernel's
+    /// `default_routing` (arch/x86/kvm/irq.c) so the first MSI-X
+    /// KVM_SET_GSI_ROUTING does not drop the legacy INTx routes.
+    #[test]
+    fn build_full_irqchip_routing_lays_out_defaults_plus_msi() {
+        let msi = vec![(
+            24u32,
+            MsiRoute {
+                address_lo: 0xFEE0_1000,
+                address_hi: 0,
+                data: 0x0000_4030,
+            },
+        )];
+        let mut routing = build_full_irqchip_routing(&msi).expect("build full-irqchip routing");
+        let entries = routing.as_mut_slice();
+        assert_eq!(entries.len(), 24 + 16 + 1, "24 IOAPIC + 16 PIC + 1 MSI");
+
+        // IOAPIC pins: GSI 0..24, irqchip = IOAPIC, pin == gsi.
+        for gsi in 0..24u32 {
+            let e = &entries[gsi as usize];
+            assert_eq!(e.gsi, gsi, "IOAPIC entry {gsi} gsi");
+            assert_eq!(e.type_, KVM_IRQ_ROUTING_IRQCHIP, "IOAPIC entry {gsi} type");
+            // SAFETY: built as the `.irqchip` union variant in build_full_irqchip_routing.
+            let c = unsafe { e.u.irqchip };
+            assert_eq!(c.irqchip, KVM_IRQCHIP_IOAPIC, "IOAPIC entry {gsi} chip");
+            assert_eq!(c.pin, gsi, "IOAPIC entry {gsi} pin == gsi");
+        }
+        // PIC: GSI 0..16, master (<8) / slave, pin = gsi % 8.
+        for gsi in 0..16u32 {
+            let e = &entries[24 + gsi as usize];
+            assert_eq!(e.gsi, gsi, "PIC entry {gsi} gsi");
+            assert_eq!(e.type_, KVM_IRQ_ROUTING_IRQCHIP, "PIC entry {gsi} type");
+            // SAFETY: built as the `.irqchip` union variant.
+            let c = unsafe { e.u.irqchip };
+            let want = if gsi < 8 {
+                KVM_IRQCHIP_PIC_MASTER
+            } else {
+                KVM_IRQCHIP_PIC_SLAVE
+            };
+            assert_eq!(c.irqchip, want, "PIC entry {gsi} master/slave");
+            assert_eq!(c.pin, gsi % 8, "PIC entry {gsi} pin == gsi%8");
+        }
+        // MSI route appended after the 40 defaults, carrying the dwords verbatim.
+        let e = &entries[40];
+        assert_eq!(e.gsi, 24, "MSI entry gsi");
+        assert_eq!(e.type_, KVM_IRQ_ROUTING_MSI, "MSI entry type");
+        // SAFETY: built as the `.msi` union variant.
+        let m = unsafe { e.u.msi };
+        assert_eq!(m.address_lo, 0xFEE0_1000, "MSI address_lo verbatim");
+        assert_eq!(m.data, 0x0000_4030, "MSI data verbatim");
+    }
+
+    /// [`translate_msi_ext_dest_id`] moves a guest's `virt_ext_dest_id` high
+    /// destination bits (address_lo `[11:5]`) into address_hi `[31:8]` so KVM's
+    /// `x86_msi_msg_get_destid` (which reads the extended dest from address_hi
+    /// under `KVM_X2APIC_API_USE_32BIT_IDS`) decodes the full APIC ID > 255. The
+    /// post-swizzle address_hi must byte-match what [`Ioapic::redtbl_to_msi`]
+    /// emits for the same dest — INTx and swizzled MSI-X produce the identical
+    /// KVM route, so both deliver to the same APIC.
+    #[test]
+    fn translate_msi_ext_dest_id_swizzles_virt_destid_into_addr_hi() {
+        // dest 256: guest packs dest>>8 = 1 into virt_destid (addr_lo [11:5] =
+        // 1<<5 = 0x20), destid_0_7 = 256 & 0xff = 0, addr_hi = 0.
+        let (lo, hi) = translate_msi_ext_dest_id(0xFEE0_0000 | 0x20, 0);
+        assert_eq!(
+            hi, 0x100,
+            "dest>>8 lands at addr_hi[31:8] (destid_8_31 LSB)"
+        );
+        assert_eq!(lo & 0xfe0, 0, "virt-destid bits cleared from addr_lo");
+        // == redtbl_to_msi's (dest>>8)<<8 for dest 256 → INTx and MSI-X agree.
+        assert_eq!(
+            hi,
+            (256u32 >> 8) << 8,
+            "matches the host-composed INTx addr_hi"
+        );
+
+        // Max virt_ext_dest_id dest (0x7FFF, the <0x8000 cap): dest>>8 = 0x7F →
+        // virt_destid = 0x7F << 5 = 0xFE0 → addr_hi = 0x7F << 8 = 0x7F00.
+        let (_lo, hi) = translate_msi_ext_dest_id(0xFEE0_0000 | 0xFE0, 0);
+        assert_eq!(
+            hi, 0x7F00,
+            "full 7-bit virt-destid range swizzles correctly"
+        );
+
+        // dest <= 255: no virt-destid bits set → no-op.
+        let lo_in = 0xFEE0_0000 | (200u32 << 12); // destid_0_7 = 200, no [11:5]
+        assert_eq!(
+            translate_msi_ext_dest_id(lo_in, 0),
+            (lo_in, 0),
+            "a <=255 dest (no virt-destid bits) is unchanged"
+        );
+
+        // Already-composed addr_hi (e.g. a host-built IOAPIC route from
+        // redtbl_to_msi for dest>255) is left untouched — no double-swizzle.
+        assert_eq!(
+            translate_msi_ext_dest_id(0xFEE0_0000 | 0x20, 0x100),
+            (0xFEE0_0000 | 0x20, 0x100),
+            "addr_hi != 0 skips the swizzle (no double-translate)"
+        );
+
+        // Interrupt-format bit (addr_lo bit 4 = dmar_format) set → a
+        // remappable-format message we must never rewrite; left untouched even
+        // with addr_hi == 0.
+        assert_eq!(
+            translate_msi_ext_dest_id(0xFEE0_0000 | 0x10 | 0x20, 0),
+            (0xFEE0_0000 | 0x10 | 0x20, 0),
+            "the RF bit skips the swizzle"
+        );
+    }
+
     use std::os::fd::AsRawFd;
     use vm_memory::GuestMemory;
 

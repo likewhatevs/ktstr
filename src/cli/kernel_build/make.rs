@@ -3,7 +3,7 @@
 //! Wall-clock-bounded [`run_make`] (used for non-build invocations
 //! like `defconfig` / `olddefconfig` / `mrproper`) and pipe-drained
 //! [`run_make_with_output`] (used for the full build path so the
-//! merged stdout+stderr can stream through a spinner). The shared
+//! merged stdout+stderr can stream through the progress group). The shared
 //! [`poll_child_with_timeout`] polling loop is extracted so timeout
 //! mechanics can be exercised against synthetic
 //! [`std::process::Child`] fixtures without spawning real `make`,
@@ -15,8 +15,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-
-use super::super::util::Spinner;
 
 /// Run make in a kernel directory under a wall-clock timeout.
 ///
@@ -171,7 +169,7 @@ pub(super) fn drain_lines_lossy(
     Ok(captured)
 }
 
-/// Run make with merged stdout+stderr piped through a spinner.
+/// Run make with merged stdout+stderr piped through the progress group.
 ///
 /// Creates a single pipe via `nix::unistd::pipe2(O_CLOEXEC)`, hands
 /// the write end to the child's stdout AND stderr (a clone), and
@@ -185,9 +183,10 @@ pub(super) fn drain_lines_lossy(
 /// buffer. Same merged-stream semantics that `sh -c "make … 2>&1"`
 /// gives, without the shell-out.
 ///
-/// When a spinner is active, each line is printed via `println()`
-/// so the spinner redraws below the output. When no spinner,
-/// output is captured and shown only on failure.
+/// When a progress group is supplied, each line is printed via
+/// `crate::cli::FetchProgress::println` (which lands above the live
+/// bars, or on stderr when the group is hidden). When `None`, output
+/// is captured and shown only on failure.
 ///
 /// Pipe-read I/O errors propagate via `Err` rather than silently
 /// ending the read loop. The prior line-iterator formulation
@@ -198,7 +197,7 @@ pub(super) fn drain_lines_lossy(
 /// context naming the merged-stream read, so a broken-pipe or EIO
 /// during make's output is caught at the call site.
 ///
-/// Lines observed by `spinner.println()` and retained in the
+/// Lines observed by the progress group's `println` and retained in the
 /// on-failure replay buffer are LF-normalized: `drain_lines_lossy`
 /// strips the trailing `\n`, and a preceding `\r` (the CRLF form
 /// Make emits on some toolchain + terminal combinations) is
@@ -211,7 +210,7 @@ pub(super) fn drain_lines_lossy(
 pub fn run_make_with_output(
     kernel_dir: &Path,
     args: &[&str],
-    spinner: Option<&Spinner>,
+    progress: Option<&crate::cli::FetchProgress>,
 ) -> Result<()> {
     let (read_fd, write_fd) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
         .context("create pipe for merged make stdout+stderr")?;
@@ -245,8 +244,8 @@ pub fn run_make_with_output(
     // UTF-8.
     let reader = std::io::BufReader::new(std::fs::File::from(read_fd));
     let captured = match drain_lines_lossy(reader, |line| {
-        if let Some(sp) = spinner {
-            sp.println(line);
+        if let Some(p) = progress {
+            p.println(line);
         }
     }) {
         Ok(v) => v,
@@ -275,7 +274,7 @@ pub fn run_make_with_output(
     Ok(())
 }
 
-/// Build the kernel with output piped through a spinner.
+/// Build the kernel with output piped through the progress group.
 ///
 /// `jobs_override` supplies the `-jN` count when set (used by
 /// `kernel_build_pipeline` under `--cpu-cap` to keep gcc's
@@ -283,7 +282,7 @@ pub fn run_make_with_output(
 /// falls back to `std::thread::available_parallelism`.
 pub fn make_kernel_with_output(
     kernel_dir: &Path,
-    spinner: Option<&Spinner>,
+    progress: Option<&crate::cli::FetchProgress>,
     jobs_override: Option<usize>,
 ) -> Result<()> {
     let nproc = jobs_override.unwrap_or_else(|| {
@@ -293,7 +292,7 @@ pub fn make_kernel_with_output(
     });
     let args = build_make_args(nproc);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    run_make_with_output(kernel_dir, &arg_refs, spinner)
+    run_make_with_output(kernel_dir, &arg_refs, progress)
 }
 
 /// Build the make arguments for a kernel build.

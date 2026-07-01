@@ -3,18 +3,17 @@ use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, Step, execute_steps};
-use ktstr::workload::{WorkType, WorkerCtx, WorkerReport};
+use ktstr::workload::{CustomCfg, WorkType, WorkerCtx, WorkerReport};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
-/// MAP_SHARED futex word. All workers forked from the same parent
-/// inherit this mapping and contend on the same physical page.
-static mut FUTEX_PTR: *mut u32 = std::ptr::null_mut();
-
-/// Allocate the shared futex word before forking workers.
-/// Must be called exactly once from the parent process.
-fn init_shared_futex() {
+/// Allocate the shared futex word in the test process before workers
+/// fork; returns its address. The `MAP_SHARED` page is inherited by every
+/// forked worker at the same virtual address, so passing the address
+/// through a [`CustomCfg`] `u64` slot (Copy POD) reaches each worker
+/// post-fork — no `static`/global needed.
+fn init_shared_futex() -> u64 {
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -28,8 +27,8 @@ fn init_shared_futex() {
     assert_ne!(ptr, libc::MAP_FAILED, "mmap failed for shared futex");
     unsafe {
         std::ptr::write_bytes(ptr as *mut u8, 0, std::mem::size_of::<u32>());
-        FUTEX_PTR = ptr as *mut u32;
     }
+    ptr as u64
 }
 
 /// Combined lock-holding + page-faulting workload.
@@ -48,15 +47,20 @@ fn fault_under_lock(ctx: &WorkerCtx) -> WorkerReport {
     let mut work_units = 0u64;
     let mut iterations = 0u64;
 
-    let futex_ptr = unsafe { FUTEX_PTR };
-    if futex_ptr.is_null() {
+    // Config arrives via CustomCfg (Copy POD inherited across fork): the
+    // shared MAP_SHARED futex address in u64s[0], the fault region size in
+    // usizes[0], touches-per-hold in usizes[1]. Replaces the former
+    // `static mut FUTEX_PTR` + hardcoded consts.
+    let cfg = ctx.cfg();
+    let futex_addr = cfg.u64s[0];
+    let region_size: usize = cfg.usizes[0];
+    let touches_per_hold: usize = cfg.usizes[1];
+    if futex_addr == 0 || region_size == 0 {
         return zeroed_report(tid, start);
     }
+    let futex_ptr = futex_addr as *mut u32;
     let atom = unsafe { &*(futex_ptr as *const AtomicU32) };
-
-    let region_size: usize = 256 * 1024; // 256 KB
-    let page_count = region_size / 4096;
-    let touches_per_hold = 32usize;
+    let page_count = (region_size / 4096).max(1);
 
     let ptr = unsafe {
         libc::mmap(
@@ -171,6 +175,8 @@ fn fault_under_lock(ctx: &WorkerCtx) -> WorkerReport {
         wake_sample_total: 0,
         iteration_costs_ns: vec![],
         iteration_cost_sample_total: 0,
+        timer_latencies_ns: vec![],
+        timer_sample_total: 0,
         iterations,
         schedstat_run_delay_ns: 0,
         schedstat_run_count: 0,
@@ -183,6 +189,7 @@ fn fault_under_lock(ctx: &WorkerCtx) -> WorkerReport {
         group_idx: 0,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     }
 }
 
@@ -203,6 +210,8 @@ fn zeroed_report(tid: libc::pid_t, start: Instant) -> WorkerReport {
         wake_sample_total: 0,
         iteration_costs_ns: vec![],
         iteration_cost_sample_total: 0,
+        timer_latencies_ns: vec![],
+        timer_sample_total: 0,
         iterations: 0,
         schedstat_run_delay_ns: 0,
         schedstat_run_count: 0,
@@ -215,6 +224,7 @@ fn zeroed_report(tid: libc::pid_t, start: Instant) -> WorkerReport {
         group_idx: 0,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     }
 }
 
@@ -228,8 +238,14 @@ fn zeroed_report(tid: libc::pid_t, start: Instant) -> WorkerReport {
 /// run delay on the affected kernel.
 #[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn preempt_regression_fault_under_load(ctx: &Ctx) -> Result<AssertResult> {
-    init_shared_futex();
-    let fault_lock_wt = WorkType::custom("fault_under_lock", fault_under_lock);
+    let futex_addr = init_shared_futex();
+    // Pass the shared-futex address + fault-region geometry through the
+    // fork-safe CustomCfg payload (replaces the former `static mut`).
+    let cfg = CustomCfg::default()
+        .u64_slot(0, futex_addr)
+        .usize_slot(0, 256 * 1024) // region_size: 256 KB
+        .usize_slot(1, 32); // touches_per_hold
+    let fault_lock_wt = WorkType::custom_with("fault_under_lock", fault_under_lock, cfg);
 
     let steps = vec![Step::with_defs(
         vec![

@@ -9,7 +9,7 @@ repository = "https://github.com/likewhatevs/ktstr"
 
 [package]
 name = "ktstr"
-version = "0.18.0"
+version = "0.20.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -23,6 +23,13 @@ exclude = [".build-cache/", "doc/guide/book/", ".github/", ".githooks/", ".confi
 
 [dependencies]
 anyhow = "1"
+# Resolves the test project's `ktstr` dependency version (the version a
+# test was built against) for the `cargo ktstr test` CLI↔test version
+# guard. Only referenced from the cargo-ktstr bin tree (run_cargo.rs);
+# gated behind `cli-bins` so a `default-features = false` library
+# consumer drops it. Re-exports `semver`, so the guard uses
+# `cargo_metadata::semver::Version` (one semver source, no version skew).
+cargo_metadata = { version = "0.19", optional = true }
 clap = { version = "4", features = ["derive"] }
 # Shell-completions generator for the `ktstr completions` /
 # `cargo ktstr completions` subcommands. Only referenced from the
@@ -46,7 +53,7 @@ crc32fast = "1.5"
 # requirements, no format-pinning headaches.
 postcard = { version = "1", features = ["use-std"] }
 itoa = "1"
-gix = { version = "0.83", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation", "status", "revision"] }
+gix = { version = "0.83", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation", "status", "revision", "progress-tree"] }
 reqwest = { version = "0.13", features = ["blocking"] }
 tar = "0.4"
 tempfile = "3"
@@ -106,7 +113,7 @@ virtio-queue = "0.17"
 vm-superio = "0.8.1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 linkme = "0.3"
-ktstr-macros = { version = "0.18.0", path = "ktstr-macros" }
+ktstr-macros = { version = "0.20.0", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
 # Memory-map /proc/self/exe in `try_flush_profraw` instead of reading
 # the whole binary into a Vec<u8>. Coverage-instrumented test binaries
@@ -366,10 +373,11 @@ integration = ["cli-bins"]
 # `default-features = false`:
 #
 #   [dev-dependencies]
-#   ktstr = { version = "0.13", default-features = false, features = ["llm"] }
+#   ktstr = { version = "0.20.0", default-features = false, features = ["llm"] }
 cli-bins = [
     "dep:tikv-jemallocator",
     "dep:clap_complete",
+    "dep:cargo_metadata",
     "dep:tree-sitter",
     "dep:tree-sitter-c",
     "export",
@@ -502,6 +510,16 @@ name = "ktstr-jemalloc-alloc-worker"
 path = "src/bin/jemalloc_alloc_worker.rs"
 required-features = ["cli-bins", "integration"]
 
+[[bin]]
+name = "ktstr-schbench-validate"
+path = "src/bin/schbench_validate.rs"
+required-features = ["cli-bins", "integration"]
+
+[[bin]]
+name = "ktstr-taobench-validate"
+path = "src/bin/taobench_validate.rs"
+required-features = ["cli-bins", "integration"]
+
 [[test]]
 name = "ktstr_sched_tests"
 
@@ -552,6 +570,3 @@ required-features = ["integration"]
 [[test]]
 name = "ctprof_pipeline_e2e"
 required-features = ["integration"]
-
-[[test]]
-name = "live_host_pipeline_e2e"

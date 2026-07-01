@@ -66,12 +66,12 @@ static SCHED_EXIT_MONITOR_SLOT: OnceLock<std::sync::Mutex<Option<SchedExitStop>>
 /// Boot-captured context that
 /// [`restart_sched_exit_monitor_with_log`] needs to re-supply when
 /// it spawns a fresh monitor against the post-Op scheduler PID.
-/// `suppress_com2` + `probe_output_done` are determined at boot
+/// `suppress_sched_log` + `probe_output_done` are determined at boot
 /// (based on whether the probe stack is active) and don't change
 /// across Op dispatches — capturing once at install time keeps
 /// the restart helper signature minimal.
 struct SchedExitMonitorBootCtx {
-    suppress_com2: Arc<AtomicBool>,
+    suppress_sched_log: Arc<AtomicBool>,
     probe_output_done: Option<Arc<crate::sync::Latch>>,
 }
 
@@ -88,13 +88,13 @@ static SCHED_EXIT_MONITOR_BOOT_CTX: OnceLock<SchedExitMonitorBootCtx> = OnceLock
 /// populates it via [`restart_sched_exit_monitor_with_log`].
 pub(crate) fn install_initial_sched_exit_monitor(
     boot_stop: Option<SchedExitStop>,
-    suppress_com2: Arc<AtomicBool>,
+    suppress_sched_log: Arc<AtomicBool>,
     probe_output_done: Option<Arc<crate::sync::Latch>>,
 ) {
     let slot = SCHED_EXIT_MONITOR_SLOT.get_or_init(|| std::sync::Mutex::new(None));
     *slot.lock().unwrap() = boot_stop;
     let _ = SCHED_EXIT_MONITOR_BOOT_CTX.set(SchedExitMonitorBootCtx {
-        suppress_com2,
+        suppress_sched_log,
         probe_output_done,
     });
 }
@@ -144,7 +144,7 @@ pub(crate) fn sched_exit_monitor_slot_is_empty() -> bool {
 /// Restart) pass the seq-suffixed path from
 /// `staged_scheduler_log_path`.
 ///
-/// Uses the boot-captured `suppress_com2` + `probe_output_done`
+/// Uses the boot-captured `suppress_sched_log` + `probe_output_done`
 /// so the new monitor behaves identically to the boot monitor. If
 /// the boot ctx was never installed (degenerate test environment
 /// where `install_initial_sched_exit_monitor` never ran) the
@@ -169,7 +169,7 @@ pub(crate) fn restart_sched_exit_monitor_with_log(log_path: Option<&str>) {
     *guard = start_sched_exit_monitor(
         sched_pid().map(|p| p as u32),
         log_path,
-        ctx.suppress_com2.clone(),
+        ctx.suppress_sched_log.clone(),
         ctx.probe_output_done.clone(),
     );
 }

@@ -340,6 +340,11 @@ pub struct WorkerReport {
     /// (kill/waitpid/Pid::from_raw).
     pub tid: i32,
     /// Cumulative work iterations (incremented by `spin_burst` or I/O loops).
+    /// Read by the fairness/starvation gate (`assert_not_starved` /
+    /// `min_work_units`) and `assert_throughput_parity`; NOT summed into
+    /// `CgroupStats::total_iterations`, which reads [`iterations`](Self::iterations).
+    /// A `Custom` worker that wants throughput assertions must also populate
+    /// [`iterations`](Self::iterations).
     pub work_units: u64,
     /// Thread CPU time from `CLOCK_THREAD_CPUTIME_ID` (ns).
     pub cpu_time_ns: u64,
@@ -437,7 +442,24 @@ pub struct WorkerReport {
     /// observed" read this field; distribution computations read
     /// `iteration_costs_ns` directly.
     pub iteration_cost_sample_total: u64,
-    /// Outer-loop iteration count.
+    /// Per-timer-cycle latency samples (ns) for
+    /// [`crate::workload::WorkType::TimerLatency`]: the observed
+    /// `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)` wake time minus the
+    /// absolute deadline, floored at 0. Reservoir-clamped to at most
+    /// `MAX_WAKE_SAMPLES`, distinct from `wake_latencies_ns` so cyclictest-style
+    /// timer latency does not blur with the blocking variants' wake latency.
+    /// `vec![]` for every non-`TimerLatency` variant.
+    pub timer_latencies_ns: Vec<u64>,
+    /// Total timer-cycle observations, INCLUDING any the reservoir dropped —
+    /// the true population for unbiased cross-phase weighting. Mirrors
+    /// [`wake_sample_total`](Self::wake_sample_total) for `timer_latencies_ns`.
+    pub timer_sample_total: u64,
+    /// Outer-loop iteration count. What `CgroupStats::total_iterations` sums
+    /// and what the derived throughput rates (`iterations_per_worker` /
+    /// `iterations_per_cpu_sec`) and `migration_ratio` divide by; NOT read by
+    /// the starvation gate, which reads [`work_units`](Self::work_units). A
+    /// `Custom` worker that wants the starvation / `min_work_units` gate
+    /// honored must also populate [`work_units`](Self::work_units).
     pub iterations: u64,
     /// Delta of /proc/self/schedstat field 2 (run_delay) over the work loop.
     pub schedstat_run_delay_ns: u64,
@@ -597,6 +619,25 @@ pub struct WorkerReport {
     /// carry their own `#[derive(Claim)]`.
     #[claim(skip)]
     pub phase_slices: Vec<PhaseSlice>,
+    /// Whole-run taobench COUNTER aggregate — `Some` only for a Taobench worker,
+    /// `None` otherwise. Shipped so the host can derive run-level qps/hit Rate keys
+    /// (`taobench_*_ops_per_sec` / `taobench_hit_fraction` /
+    /// `taobench_command_hit_rate`) for `--noise-adjust` spread analysis. The
+    /// per-phase `PhaseSlice::taobench` carriers feed the per-phase metrics + the
+    /// serve-latency distribution; this whole-run carrier holds COUNTERS only
+    /// ([`TaobenchStats`](crate::workload::taobench::run::TaobenchStats)) — the
+    /// serve histogram is per-phase data, and the per-phase `elapsed_ns` is
+    /// MAX-merged across concurrent threads so summing phase windows is the wrong
+    /// qps denominator, hence the engine's authoritative whole-run counter
+    /// aggregate is shipped directly. Appended LAST (after `phase_slices`) to keep
+    /// the positional postcard decode order of every prior field unchanged. `pub`
+    /// (every `WorkerReport` field is `pub`, so external custom workers can
+    /// struct-literal construct it via [`crate::workload::WorkType::custom`]; a
+    /// non-taobench worker sets `None`). `#[claim(skip)]`: framework wire plumbing,
+    /// not a test-author claim surface; assertions run against the host-derived
+    /// run-level `taobench_*` Rate metrics.
+    #[claim(skip)]
+    pub taobench_whole: Option<crate::workload::taobench::run::TaobenchStats>,
 }
 
 /// Per-phase telemetry for one backdrop worker over one scenario
@@ -632,6 +673,15 @@ pub struct PhaseSlice {
     /// reservoir dropped — the true population for unbiased
     /// cross-phase weighting.
     pub wake_sample_total: u64,
+    /// Per-timer-cycle latency samples (ns) recorded during this phase by a
+    /// [`crate::workload::WorkType::TimerLatency`] worker, reservoir-clamped to
+    /// `MAX_PHASE_WAKE_SAMPLES` (like `wake_latencies_ns`). Distinct carrier so
+    /// timer latency does not blur with wake latency.
+    pub timer_latencies_ns: Vec<u64>,
+    /// Total timer-cycle observations during this phase, INCLUDING any the
+    /// reservoir dropped — the true population for unbiased cross-phase
+    /// weighting. Mirrors `wake_sample_total` for `timer_latencies_ns`.
+    pub timer_sample_total: u64,
     /// `/proc/self/schedstat` run_delay (field 2) delta over this phase (ns).
     pub run_delay_ns: u64,
     /// Off-CPU time during this phase (ns): `wall_ns − cpu_time` over
@@ -662,6 +712,27 @@ pub struct PhaseSlice {
     /// `max_gap_ms` as an argmax pair (a bare max would desync the gap
     /// from its CPU).
     pub max_gap_cpu: usize,
+    /// Per-phase schbench engine metrics, present ONLY for a
+    /// `WorkType::Schbench` backdrop worker (`None` for every other work
+    /// type — the generic drain leaves it `None`). Carries the phase's merged
+    /// wakeup/request histograms + run-delay raw pairs; the host re-pools these
+    /// across workers ([`crate::workload::schbench::run::SchbenchPhaseStats`])
+    /// and derives per-phase percentiles into `PhaseBucket.metrics`.
+    /// `pub(crate)`: an internal carrier (test authors read `PhaseBucket`, not
+    /// `PhaseSlice`) whose element type is `pub(crate)`. Integer-only, so it
+    /// preserves `PhaseSlice`'s `Eq`.
+    pub(crate) schbench: Option<crate::workload::schbench::run::SchbenchPhaseStats>,
+    /// Per-phase taobench engine metrics, present ONLY for a
+    /// `WorkType::Taobench` backdrop worker (`None` for every other work type —
+    /// the generic drain leaves it `None`). Carries the phase's request- and
+    /// response-time op counters plus the open-loop serve-latency histogram
+    /// ([`crate::workload::taobench::run::TaobenchPhaseStats`]); the host derives
+    /// per-phase qps / hit-ratio / serve-latency percentiles into
+    /// `PhaseBucket.metrics`. `pub(crate)`: an internal carrier (test authors read
+    /// `PhaseBucket`, not `PhaseSlice`). `PhaseSlice`'s `Eq` is preserved because
+    /// `PlatStats` is `Eq` (the schbench carrier above already holds histograms),
+    /// not because the field is integer-only.
+    pub(crate) taobench: Option<crate::workload::taobench::run::TaobenchPhaseStats>,
 }
 
 /// Reason a sentinel [`WorkerReport`] was synthesized — attached to
@@ -1820,6 +1891,32 @@ pub(super) fn validate_workload_admission(group: &GroupParams) -> Result<()> {
             }
             .into());
         }
+    }
+    if let WorkType::TimerLatency { interval_us } = group.work_type
+        && interval_us == 0
+    {
+        return Err(WorkTypeValidationError::ZeroTimerInterval {
+            group_idx: group.group_idx,
+        }
+        .into());
+    }
+    if let WorkType::NetTraffic { frame_bytes, .. } = group.work_type
+        && !(60..=1514).contains(&frame_bytes)
+    {
+        return Err(WorkTypeValidationError::NetTrafficFrameBytes {
+            frame_bytes,
+            group_idx: group.group_idx,
+        }
+        .into());
+    }
+    if let WorkType::IrqWake { frame_bytes, .. } = group.work_type
+        && !(60..=1514).contains(&frame_bytes)
+    {
+        return Err(WorkTypeValidationError::IrqWakeFrameBytes {
+            frame_bytes,
+            group_idx: group.group_idx,
+        }
+        .into());
     }
     Ok(())
 }
@@ -3362,24 +3459,35 @@ impl WorkloadHandle {
         for group in &groups {
             // Thread mode + ForkExit is incompatible. ForkExit's worker
             // body calls `libc::fork()` from inside `worker_main` to
-            // exercise wake_up_new_task / do_exit / wait_task_zombie;
-            // under [`CloneMode::Thread`] the worker is a thread inside
-            // the parent's tgid, so its `fork()` produces a child that
-            // shares tgid with the parent and every sibling thread. The
-            // child then calls `libc::_exit(0)` which the kernel routes
-            // through `do_exit` — and `do_exit` for a thread-group leader
-            // tears down the whole tgid (every worker thread dies). This
-            // converts the workload into a fratricidal sibling kill on
-            // the very first ForkExit iteration. Reject at spawn time
-            // with an actionable diagnostic; CloneMode::Fork is the
-            // correct choice for ForkExit and will continue to work.
+            // exercise the fork -> exit -> wait lifecycle. Under
+            // [`CloneMode::Thread`] the worker is one thread of the
+            // harness's multi-threaded tgid, and a `fork()` from a thread
+            // of a multi-threaded process duplicates ONLY the calling
+            // thread: any lock another harness thread holds at fork time
+            // (glibc malloc arena, internal mutexes) stays locked forever
+            // in the child, which has no thread left to release it. The
+            // child here only `_exit`s (async-signal-safe), so it survives
+            // this in practice — but the hazard is real and the
+            // fork -> exit primitive is faithfully exercised only when each
+            // worker is its own process. (The child does NOT share the
+            // harness tgid: `fork()` omits CLONE_THREAD, so copy_process
+            // gives it group_leader=self / tgid=pid, a fresh singleton
+            // group. Its `libc::_exit(0)` issues exit_group(2) ->
+            // `do_group_exit` -> `zap_other_threads`, but a singleton tgid
+            // has no other threads for `zap_other_threads` to SIGKILL, so
+            // the teardown ends only the child; the harness tgid is
+            // untouched.) Reject at spawn with an actionable diagnostic;
+            // CloneMode::Fork gives each worker its own tgid and a
+            // lock-clean address space.
             if matches!(dispatch, Dispatch::Thread) && matches!(group.work_type, WorkType::ForkExit)
             {
                 anyhow::bail!(
                     "CloneMode::Thread is incompatible with WorkType::ForkExit \
-                     (group {}) — ForkExit forks inside the worker, which under \
-                     a thread-group worker tears down every sibling thread on \
-                     the child's _exit. Use CloneMode::Fork for ForkExit workloads.",
+                     (group {}) — ForkExit forks inside the worker, and a fork \
+                     from a thread of the multi-threaded harness inherits \
+                     sibling-held locks the child cannot release; only a \
+                     separate process faithfully exercises the fork/exit \
+                     lifecycle. Use CloneMode::Fork for ForkExit workloads.",
                     group.group_idx,
                 );
             }
@@ -3443,16 +3551,49 @@ impl WorkloadHandle {
                     group.group_idx,
                 );
             }
+            // Thread mode + CgroupAttachStorm is incompatible because the
+            // worker installs `SIGCHLD = SIG_IGN` at entry (under
+            // ReapMode::SigIgn) to auto-reap its forked children. Under
+            // [`CloneMode::Thread`] the worker is a pthread of the harness
+            // thread group and shares the harness `sighand` (CLONE_THREAD
+            // implies CLONE_SIGHAND), so that install changes SIGCHLD
+            // disposition for the WHOLE harness process — corrupting the
+            // harness's own child reaping — not just this worker. (fork()
+            // from a thread of the multithreaded harness is also fragile;
+            // the forked child is safe here only because it does nothing
+            // but `_exit`.) Under [`CloneMode::Fork`] each worker is its
+            // own process with a private sighand, so the SIG_IGN install
+            // and the forked-child lifecycle stay confined to that worker.
+            // Note: the storm writes the forked CHILD's pid (its own tgid)
+            // to cgroup.procs, so — unlike CgroupChurn's own-tid write —
+            // the migration never moves the harness; the hazard is the
+            // shared-sighand SIG_IGN install, not tgid migration. Reject at
+            // spawn time with an actionable diagnostic.
+            if matches!(dispatch, Dispatch::Thread)
+                && matches!(group.work_type, WorkType::CgroupAttachStorm { .. })
+            {
+                anyhow::bail!(
+                    "CloneMode::Thread is incompatible with WorkType::CgroupAttachStorm \
+                     (group {}) — the worker installs SIGCHLD=SIG_IGN to auto-reap its \
+                     forked children, but a thread-group worker shares the harness \
+                     sighand, so that install corrupts the harness's own child reaping. \
+                     Use CloneMode::Fork for CgroupAttachStorm workloads so each worker \
+                     has its own process and private sighand.",
+                    group.group_idx,
+                );
+            }
             // Dispatch-agnostic admission rules
             // (worker_group_size divisibility, chain depth >= 2,
             // IdleChurn / IpcVariance zero-rejections) live in
             // [`validate_workload_admission`] and are shared with
             // [`Self::spawn_pcomm_cgroup`]. The
             // CloneMode-vs-WorkType compat checks above stay
-            // dispatch-specific because their reasoning differs
-            // per dispatch (Thread+ForkExit vs pcomm+ForkExit are
-            // rejected for different reasons; Fork+EpollStorm has
-            // no pcomm equivalent).
+            // dispatch-specific because each dispatch path gates
+            // independently: Thread+ForkExit (here) and pcomm+ForkExit
+            // ([`Self::spawn_pcomm_cgroup`]) reject for the SAME reason
+            // (a fork from a thread of a multi-threaded process inherits
+            // sibling-held locks the child cannot release) via separate
+            // per-path gates; Fork+EpollStorm has no pcomm equivalent.
             validate_workload_admission(group)?;
         }
 

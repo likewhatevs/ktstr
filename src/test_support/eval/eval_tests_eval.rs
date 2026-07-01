@@ -5,8 +5,9 @@ use super::super::output::{
     STAGE_INIT_NOT_STARTED, STAGE_INIT_STARTED_NO_PAYLOAD, STAGE_PAYLOAD_STARTED_NO_RESULT,
 };
 use super::super::test_helpers::{
-    EVAL_TOPO, EnvVarGuard, build_assert_result, eevdf_entry, isolated_cache_dir, lifecycle_drain,
-    lock_env, make_vm_result, make_vm_result_with_assert, no_repro, sched_entry,
+    EVAL_TOPO, EnvVarGuard, build_assert_result, eevdf_entry, isolated_cache_dir,
+    isolated_sidecar_dir, lifecycle_drain, lock_env, make_vm_result, make_vm_result_with_assert,
+    no_repro, sched_entry,
 };
 use super::*;
 use crate::assert::{AssertDetail, DetailKind};
@@ -302,6 +303,8 @@ fn eval_sched_ext_dump_included() {
 
 #[test]
 fn eval_check_result_passed_returns_ok() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(true, vec![]);
     let entry = eevdf_entry("__eval_pass__");
     let result = make_vm_result_with_assert("", "", 0, false, &assert);
@@ -325,6 +328,8 @@ fn eval_check_result_passed_returns_ok() {
 
 #[test]
 fn eval_check_result_skip_returns_ok() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     // Regression: an in-VM scenario skip (AssertResult::skip — e.g. the
     // booted topology is below the scenario's CPU/LLC floor) must
     // project to Ok so the exit-code path maps it to EXIT_PASS, NOT be
@@ -355,6 +360,8 @@ fn eval_check_result_skip_returns_ok() {
 
 #[test]
 fn eval_check_result_failed_includes_details() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![
@@ -397,6 +404,8 @@ fn eval_check_result_failed_includes_details() {
 /// `bail!` error string downstream.
 #[test]
 fn eval_cleanup_budget_overshoot_folds_failing_detail() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(true, vec![]);
     let mut entry = eevdf_entry("__eval_cleanup_overshoot__");
     entry.cleanup_budget = Some(std::time::Duration::from_secs(1));
@@ -441,6 +450,8 @@ fn eval_cleanup_budget_overshoot_folds_failing_detail() {
 /// [`eval_cleanup_budget_equal_passes`].
 #[test]
 fn eval_cleanup_budget_under_passes() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(true, vec![]);
     let mut entry = eevdf_entry("__eval_cleanup_under__");
     entry.cleanup_budget = Some(std::time::Duration::from_secs(5));
@@ -474,6 +485,8 @@ fn eval_cleanup_budget_under_passes() {
 /// {<, ==, >} comparator triplet.
 #[test]
 fn eval_cleanup_budget_equal_passes() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(true, vec![]);
     let mut entry = eevdf_entry("__eval_cleanup_equal__");
     entry.cleanup_budget = Some(std::time::Duration::from_secs(5));
@@ -500,6 +513,8 @@ fn eval_cleanup_budget_equal_passes() {
 
 #[test]
 fn eval_assert_failure_includes_sched_log() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![AssertDetail::new(
@@ -538,6 +553,8 @@ fn eval_assert_failure_includes_sched_log() {
 
 #[test]
 fn eval_assert_failure_has_fingerprint() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![AssertDetail::new(DetailKind::Stuck, "stuck 3000ms")],
@@ -634,6 +651,8 @@ fn eval_no_result_has_fingerprint() {
 
 #[test]
 fn eval_no_sched_output_no_fingerprint() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(false, vec![AssertDetail::new(DetailKind::Stuck, "stuck")]);
     let entry = eevdf_entry("__eval_no_fp__");
     let result = make_vm_result_with_assert("", "", 0, false, &assert);
@@ -658,6 +677,8 @@ fn eval_no_sched_output_no_fingerprint() {
 
 #[test]
 fn eval_monitor_fail_has_fingerprint() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let pass_assert = build_assert_result(true, vec![]);
     let error_line = "Error: imbalance detected internally";
     let output = format!("{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",);
@@ -677,6 +698,7 @@ fn eval_monitor_fail_has_fingerprint() {
                         schedstat: None,
                         vcpu_cpu_time_ns: None,
                         vcpu_perf: None,
+                        avg_irq_util: None,
                         sched_domains: None,
                     },
                     crate::monitor::CpuSnapshot {
@@ -689,6 +711,7 @@ fn eval_monitor_fail_has_fingerprint() {
                         schedstat: None,
                         vcpu_cpu_time_ns: None,
                         vcpu_perf: None,
+                        avg_irq_util: None,
                         sched_domains: None,
                     },
                 ],
@@ -701,6 +724,7 @@ fn eval_monitor_fail_has_fingerprint() {
         success: true,
         vcpus: 1,
         cpu_budget: 1,
+        resolve_source: None,
         expect_auto_repro_satisfied: false,
         exit_code: 0,
         duration: std::time::Duration::from_secs(1),
@@ -714,6 +738,7 @@ fn eval_monitor_fail_has_fingerprint() {
             watchdog_observation: None,
             page_offset: 0,
             boot_wait_outcome: crate::monitor::BootWaitOutcome::NotConfigured,
+            scx_event_counters_supported: false,
         }),
         guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
             entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
@@ -736,6 +761,7 @@ fn eval_monitor_fail_has_fingerprint() {
         periodic_target: 0,
         kern_kaslr_offset: 0,
         entry_name: None,
+        variant_hash: 0,
         periodic_series_cache: std::sync::OnceLock::new(),
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES
@@ -1008,6 +1034,8 @@ fn eval_crash_message_from_field() {
 
 #[test]
 fn eval_sched_exit_includes_console() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![AssertDetail::new(
@@ -1040,6 +1068,8 @@ fn eval_sched_exit_includes_console() {
 
 #[test]
 fn eval_sched_exit_includes_monitor() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![AssertDetail::new(
@@ -1052,6 +1082,7 @@ fn eval_sched_exit_includes_monitor() {
         success: false,
         vcpus: 1,
         cpu_budget: 1,
+        resolve_source: None,
         expect_auto_repro_satisfied: false,
         exit_code: 1,
         duration: std::time::Duration::from_secs(1),
@@ -1074,6 +1105,7 @@ fn eval_sched_exit_includes_monitor() {
             watchdog_observation: None,
             page_offset: 0,
             boot_wait_outcome: crate::monitor::BootWaitOutcome::NotConfigured,
+            scx_event_counters_supported: false,
         }),
         guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
             entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
@@ -1096,6 +1128,7 @@ fn eval_sched_exit_includes_monitor() {
         periodic_target: 0,
         kern_kaslr_offset: 0,
         entry_name: None,
+        variant_hash: 0,
         periodic_series_cache: std::sync::OnceLock::new(),
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES;
@@ -1120,6 +1153,8 @@ fn eval_sched_exit_includes_monitor() {
 
 #[test]
 fn eval_monitor_fail_includes_sched_log() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let pass_assert = build_assert_result(true, vec![]);
     let output = format!("{SCHED_OUTPUT_START}\nscheduler debug output here\n{SCHED_OUTPUT_END}",);
     let entry = sched_entry("__eval_monitor_fail_sched__");
@@ -1140,6 +1175,7 @@ fn eval_monitor_fail_includes_sched_log() {
                         schedstat: None,
                         vcpu_cpu_time_ns: None,
                         vcpu_perf: None,
+                        avg_irq_util: None,
                         sched_domains: None,
                     },
                     crate::monitor::CpuSnapshot {
@@ -1152,6 +1188,7 @@ fn eval_monitor_fail_includes_sched_log() {
                         schedstat: None,
                         vcpu_cpu_time_ns: None,
                         vcpu_perf: None,
+                        avg_irq_util: None,
                         sched_domains: None,
                     },
                 ],
@@ -1164,6 +1201,7 @@ fn eval_monitor_fail_includes_sched_log() {
         success: true,
         vcpus: 1,
         cpu_budget: 1,
+        resolve_source: None,
         expect_auto_repro_satisfied: false,
         exit_code: 0,
         duration: std::time::Duration::from_secs(1),
@@ -1177,6 +1215,7 @@ fn eval_monitor_fail_includes_sched_log() {
             watchdog_observation: None,
             page_offset: 0,
             boot_wait_outcome: crate::monitor::BootWaitOutcome::NotConfigured,
+            scx_event_counters_supported: false,
         }),
         guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
             entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
@@ -1199,6 +1238,7 @@ fn eval_monitor_fail_includes_sched_log() {
         periodic_target: 0,
         kern_kaslr_offset: 0,
         entry_name: None,
+        variant_hash: 0,
         periodic_series_cache: std::sync::OnceLock::new(),
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES
@@ -1247,6 +1287,8 @@ fn eval_monitor_fail_includes_sched_log() {
 ///    loudly.
 #[test]
 fn phase_buckets_equals_stats_phases_and_post_vm_read_does_not_starve() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let pass_assert = build_assert_result(true, vec![]);
     let entry = sched_entry("__eval_phase_buckets_eq__");
     let result = crate::vmm::VmResult {
@@ -1319,6 +1361,8 @@ fn phase_buckets_equals_stats_phases_and_post_vm_read_does_not_starve() {
 /// subset of `stats.phases`), so this `assert_eq!` would have failed.
 #[test]
 fn phase_buckets_equals_stats_phases_with_guest_per_cgroup_carriers() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     // Passing guest AssertResult carrying a per-cgroup carrier at
     // step_index=1; the captures below stamp the same step_index, so the
     // carrier takes the matched arm and unions its per_cgroup into that bucket.
@@ -1395,6 +1439,715 @@ fn phase_buckets_equals_stats_phases_with_guest_per_cgroup_carriers() {
     );
 }
 
+/// A guest `AssertResult` carrying ONE measured cgroup (counters + wake/run-delay
+/// reductions), TLV-encoded into a [`crate::vmm::VmResult`] with three stamped
+/// periodic captures. The shared fixture for the `run_metric` parity / boundary
+/// tests below: its `stats.cgroups` drives the pooled `iterations_per_cpu_sec`
+/// (family 4) and the `WorstLowest` / Distribution re-pools (family 5) — the
+/// families `VmResult::run_metric` must reconstruct from the guest cgroups.
+#[cfg(test)]
+fn run_metric_fixture(cg: crate::assert::CgroupStats) -> crate::vmm::VmResult {
+    let mut guest_assert = build_assert_result(true, vec![]);
+    guest_assert.stats.cgroups = vec![cg];
+    let result = crate::vmm::VmResult {
+        success: true,
+        guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
+            entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                &guest_assert,
+            )],
+        }),
+        periodic_fired: 3,
+        periodic_target: 3,
+        ..crate::vmm::VmResult::test_fixture()
+    };
+    for i in 0..3 {
+        result.snapshot_bridge.store_with_stats_and_step(
+            &format!("periodic_{i}"),
+            crate::monitor::dump::FailureDumpReport::default(),
+            None,
+            Some(i as u64 * 100),
+            None,
+            1,
+        );
+    }
+    result
+}
+
+/// LOAD-BEARING PARITY: `VmResult::run_metric` self-computes the SAME
+/// run-level `ext_metrics` `evaluate_vm_result` writes — for every key the eval
+/// path produces, `run_metric` resolves the identical value. Exercises the
+/// families that need the guest per-cgroup roll-up (pooled
+/// `iterations_per_cpu_sec` + the `WorstLowest` / Distribution re-pools), the
+/// reconstruction that makes `run_metric` possible: `check_result.stats.cgroups`
+/// equals `guest_assert_result().stats.cgroups` (the host adds no cgroups —
+/// `evaluate_verdict_folds` merges only empty-cgroup `fail()`s, and
+/// `populate_run_stats_and_folded_timeline` writes `phases`/`ext_metrics`, never
+/// `cgroups`), so `run_metric` replays the eval sequence over the guest cgroups +
+/// pre-derive phase fold to the byte-identical map.
+#[test]
+fn run_metric_equals_evaluate_run_level_ext() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    let result = run_metric_fixture(crate::assert::CgroupStats {
+        cgroup_name: "cellA".to_string(),
+        num_workers: 4,
+        total_iterations: 1000,
+        total_cpu_time_ns: 2_000_000_000,
+        p99_wake_latency_us: 80.0,
+        median_wake_latency_us: 20.0,
+        wake_latency_cv: 0.5,
+        mean_run_delay_us: 10.0,
+        worst_run_delay_us: 40.0,
+        ..Default::default()
+    });
+    let entry = sched_entry("__eval_run_metric_parity__");
+    let stimulus = result.stimulus_timeline();
+    let ar = evaluate_vm_result(
+        &entry,
+        &result,
+        &crate::assert::Assert::NO_OVERRIDES,
+        &stimulus,
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    )
+    .expect("pass guest verdict on the success arm returns Ok");
+    assert!(
+        !ar.stats.ext_metrics.is_empty(),
+        "the measured-cgroup fixture must produce run-level ext keys",
+    );
+    // Family-4 anchor: the pooled rate is a real ratio in the eval map.
+    assert_eq!(
+        ar.stats.ext_metrics.get("iterations_per_cpu_sec").copied(),
+        Some(500.0),
+        "1000 iters / 2.0 cpu-sec = 500 — the pooled rate must be in the eval map",
+    );
+    // FULL-MAP forward parity: every key evaluate produced resolves via
+    // run_metric to the identical value (self-computed pre-merge == stored
+    // post-merge).
+    for (k, v) in &ar.stats.ext_metrics {
+        assert_eq!(
+            result.run_metric(k.as_str()),
+            Some(*v),
+            "run_metric({k}) must equal the eval-layer ext value",
+        );
+    }
+    // The typed Into<MetricId> path resolves the same value as the &str path.
+    assert_eq!(
+        result.run_metric(crate::stats::BuiltinMetric::IterationsPerCpuSec),
+        Some(500.0),
+    );
+    // A registered ext metric this run did not produce -> None (loud-absent,
+    // not a false 0.0).
+    assert_eq!(result.run_metric("total_hardirqs"), None);
+}
+
+/// NON-DESTRUCTIVE: `run_metric` composes with `phase_metric` /
+/// `phase_buckets` in one `post_vm` — the memoized snapshot-bridge drain means a
+/// `run_metric` read does not starve the others (the latent double-drain class),
+/// and `run_metric` is idempotent across interleaved bridge-draining accessors.
+#[test]
+fn run_metric_is_non_destructive_alongside_phase_reads() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    let result = run_metric_fixture(crate::assert::CgroupStats {
+        cgroup_name: "cellA".to_string(),
+        num_workers: 2,
+        total_iterations: 600,
+        total_cpu_time_ns: 3_000_000_000,
+        ..Default::default()
+    });
+    let first = result.run_metric("iterations_per_cpu_sec");
+    // Interleave the other bridge-draining accessors.
+    let _pm = result.phase_metric(crate::assert::Phase::step(0), "system_time_ns");
+    let _buckets = result.phase_buckets();
+    let second = result.run_metric("iterations_per_cpu_sec");
+    assert_eq!(first, Some(200.0), "600 iters / 3.0 cpu-sec = 200");
+    assert_eq!(
+        first, second,
+        "run_metric must be idempotent across interleaved drains (memoized, no starve)",
+    );
+}
+
+/// LOUD-ABSENT: `None` means absent (an unregistered key, or a registered
+/// key this run did not produce); `Some(0.0)` means a real measured zero — never
+/// conflated. A cgroup with zero iterations over positive on-CPU time makes
+/// `iterations_per_cpu_sec` a measured `Some(0.0)`.
+#[test]
+fn run_metric_loud_absent_distinct_from_measured_zero() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    let result = run_metric_fixture(crate::assert::CgroupStats {
+        cgroup_name: "idle".to_string(),
+        num_workers: 1,
+        total_iterations: 0,
+        total_cpu_time_ns: 1_000_000_000,
+        ..Default::default()
+    });
+    // measured zero (0 iters over 1.0 cpu-sec) -> Some(0.0)
+    assert_eq!(result.run_metric("iterations_per_cpu_sec"), Some(0.0));
+    // unregistered dynamic key -> None
+    assert_eq!(result.run_metric("scx_totally_made_up_key"), None);
+    // registered ext metric this run did not produce -> None
+    assert_eq!(result.run_metric("total_hardirqs"), None);
+}
+
+/// `run_metric` boundary: the typed cross-cgroup fields now RESOLVE None-aware
+/// (re-derived from the carriers, distinguishing measured from never-measured),
+/// the ext-sourced pooled rate resolves, and the monitor-sourced run-level
+/// metrics remain per-phase-only (`None` here) — matching
+/// `ScenarioStats::run_metric`'s boundary.
+#[test]
+fn run_metric_resolves_typed_excludes_monitor_metrics() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    let result = run_metric_fixture(crate::assert::CgroupStats {
+        cgroup_name: "cellA".to_string(),
+        num_workers: 4,
+        total_iterations: 1000,
+        total_cpu_time_ns: 2_000_000_000,
+        total_migrations: 50,
+        ..Default::default()
+    });
+    // typed cross-cgroup fields now resolve None-aware: total_migrations is a
+    // cross-cgroup SUM (one cgroup, 50) — a measured value, not absent.
+    assert_eq!(result.run_metric("total_migrations"), Some(50.0));
+    // worst_spread is None-aware ABSENT: this fixture's cgroup set no spread
+    // (CgroupStats::spread == None — no worker had measurable wall time), so the
+    // re-derive reports not-measured, distinct from a measured 0.0.
+    assert_eq!(result.run_metric("worst_spread"), None);
+    // monitor-sourced run-level — per-phase only, not in this accessor.
+    assert_eq!(result.run_metric("max_imbalance_ratio"), None);
+    assert_eq!(result.run_metric("stuck_count"), None);
+    // the ext-sourced pooled rate IS resolved (1000 iters / 2 s).
+    assert_eq!(result.run_metric("iterations_per_cpu_sec"), Some(500.0));
+}
+
+/// HOST-ONLY / EMPTY: a `VmResult` with no guest verdict and no captures
+/// (`guest_assert_result` `Err`, empty series) yields `None` for every metric,
+/// no panic — the degraded path AssertResult::run_metric also documents.
+#[test]
+fn run_metric_host_only_run_yields_none() {
+    let result = crate::vmm::VmResult::test_fixture();
+    assert_eq!(result.run_metric("iterations_per_cpu_sec"), None);
+    assert_eq!(result.run_metric("total_hardirqs"), None);
+    assert_eq!(result.run_metric("worst_p99_wake_latency_us"), None);
+    assert_eq!(result.run_metric("scx_made_up"), None);
+}
+
+/// ABSENT RATE: a pooled rate whose denominator is absent (zero on-CPU time
+/// across cgroups) is NOT produced — `run_metric` returns `None`, never an `inf`
+/// or `NaN` (the summed-zero early return + both-or-neither component insert).
+#[test]
+fn run_metric_absent_rate_is_none_not_inf() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    let result = run_metric_fixture(crate::assert::CgroupStats {
+        cgroup_name: "nocpu".to_string(),
+        num_workers: 1,
+        total_iterations: 500,
+        total_cpu_time_ns: 0,
+        ..Default::default()
+    });
+    let v = result.run_metric("iterations_per_cpu_sec");
+    assert_eq!(v, None, "zero-denominator rate must be absent, not inf/NaN");
+}
+
+/// Production-hook pin: `VmResult::phase_buckets()` — the method a per-phase A/B
+/// claim reads via `phase_metric` — must DERIVE the schbench per-phase scalars
+/// into `PhaseBucket.metrics`. A guest carrier with a `SchbenchPhaseStats` at
+/// step_index=1 must surface e.g. `wakeup_p99_latency_us` in that bucket's
+/// metrics. Guards the WIRING (a refactor that dropped the
+/// `derive_phase_metrics` call at the `phase_buckets()` site would keep
+/// every direct-derive unit test green while production silently stopped
+/// emitting the metrics — the mirror-tests-pin-nothing class). Also exercises
+/// the schbench carrier's postcard roundtrip guest→host (the TLV entry below).
+#[test]
+fn phase_buckets_derives_schbench_perphase_metrics() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    // A schbench carrier: 100-sample wakeup histogram (99×10µs + 1×10000µs, so
+    // p99 = 10µs), msg run-delay 50000ns over 5 schedules, loop_count 42.
+    let mut wakeup = crate::workload::schbench::plat::PlatStats::default();
+    for _ in 0..99 {
+        wakeup.add_lat(10);
+    }
+    wakeup.add_lat(10_000);
+    let schbench = crate::workload::schbench::run::SchbenchPhaseStats {
+        wakeup,
+        request: crate::workload::schbench::plat::PlatStats::default(),
+        rps: crate::workload::schbench::plat::PlatStats::default(),
+        msg_run_delay_ns: 50_000,
+        msg_pcount: 5,
+        worker_run_delay_ns: 0,
+        worker_pcount: 0,
+        loop_count: 42,
+    };
+    let mut guest_assert = build_assert_result(true, vec![]);
+    let mut pc = std::collections::BTreeMap::new();
+    pc.insert(
+        "cg".to_string(),
+        crate::assert::PhaseCgroupStats {
+            schbench: Some(schbench),
+            ..Default::default()
+        },
+    );
+    guest_assert.stats.phases = vec![crate::assert::PhaseBucket {
+        step_index: 1,
+        label: "Step[0]".to_string(),
+        start_ms: u64::MAX,
+        end_ms: 0,
+        sample_count: 0,
+        metrics: std::collections::BTreeMap::new(),
+        per_cgroup: pc,
+    }];
+    let result = crate::vmm::VmResult {
+        success: true,
+        guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
+            entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                &guest_assert,
+            )],
+        }),
+        periodic_fired: 3,
+        periodic_target: 3,
+        ..crate::vmm::VmResult::test_fixture()
+    };
+    for i in 0..3 {
+        result.snapshot_bridge.store_with_stats_and_step(
+            &format!("periodic_{i}"),
+            crate::monitor::dump::FailureDumpReport::default(),
+            None,
+            Some(i as u64 * 100),
+            None,
+            1,
+        );
+    }
+    let buckets = result.phase_buckets();
+    let step0 = buckets
+        .iter()
+        .find(|b| b.step_index == 1)
+        .expect("a Step[0] bucket from the stamped captures");
+    // The production hook derived the schbench per-phase scalars (and the carrier
+    // survived the postcard TLV roundtrip).
+    assert_eq!(
+        step0.metrics.get("wakeup_p99_latency_us"),
+        Some(&10.0),
+        "phase_buckets() must derive the schbench per-phase metrics (production hook)",
+    );
+    assert_eq!(step0.metrics.get("schbench_loop_count"), Some(&42.0));
+    assert_eq!(step0.metrics.get("sched_delay_msg_us"), Some(&10.0));
+    // worker pcount 0 -> ABSENT, request empty -> ABSENT (no false zeros).
+    assert!(!step0.metrics.contains_key("sched_delay_worker_us"));
+    assert!(!step0.metrics.contains_key("request_p99_latency_us"));
+}
+
+/// Wiring pin for VmResult::better_across_phases — the per-phase A/B
+/// primitive. Two phases carry schbench wakeup p99 = 10µs (scx, step_index 1)
+/// vs 100µs (EEVDF, step_index 2); the comparator must orient "better" from the
+/// LowerBetter polarity (registry) so scx (candidate) beats EEVDF (baseline)
+/// and the reverse framing fails, and a metric absent in a phase is
+/// Inconclusive→Err (no silent pass). Guards that better_across_phases resolves
+/// both phases via phase_metric + the polarity via metric_def and records the
+/// right verdict — a swapped baseline/candidate or wrong polarity source fails
+/// here, not in the pure better_outcome unit tests.
+#[test]
+fn better_across_phases_orients_by_polarity_end_to_end() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    // A schbench carrier whose wakeup p99 == `us` (100 identical samples) and
+    // whose loop_count == `loops` (the HigherBetter throughput key).
+    let carrier = |us: u32, loops: u64| {
+        let mut wakeup = crate::workload::schbench::plat::PlatStats::default();
+        for _ in 0..100 {
+            wakeup.add_lat(us);
+        }
+        crate::assert::PhaseCgroupStats {
+            schbench: Some(crate::workload::schbench::run::SchbenchPhaseStats {
+                wakeup,
+                request: crate::workload::schbench::plat::PlatStats::default(),
+                rps: crate::workload::schbench::plat::PlatStats::default(),
+                msg_run_delay_ns: 0,
+                msg_pcount: 0,
+                worker_run_delay_ns: 0,
+                worker_pcount: 0,
+                loop_count: loops,
+            }),
+            ..Default::default()
+        }
+    };
+    let phase_bucket = |idx: u16, us: u32, loops: u64| {
+        let mut pc = std::collections::BTreeMap::new();
+        pc.insert("cg".to_string(), carrier(us, loops));
+        crate::assert::PhaseBucket {
+            step_index: idx,
+            label: format!("Step[{}]", idx - 1),
+            start_ms: u64::MAX,
+            end_ms: 0,
+            sample_count: 0,
+            metrics: std::collections::BTreeMap::new(),
+            per_cgroup: pc,
+        }
+    };
+    let mut guest_assert = build_assert_result(true, vec![]);
+    // scx (step_index 1): p99 10µs, loop_count 200; EEVDF (step_index 2): p99
+    // 100µs, loop_count 50. scx wins on BOTH a LowerBetter (latency) and a
+    // HigherBetter (throughput) key.
+    guest_assert.stats.phases = vec![phase_bucket(1, 10, 200), phase_bucket(2, 100, 50)];
+    let result = crate::vmm::VmResult {
+        success: true,
+        guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
+            entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                &guest_assert,
+            )],
+        }),
+        periodic_fired: 4,
+        periodic_target: 4,
+        ..crate::vmm::VmResult::test_fixture()
+    };
+    // Stamp captures in BOTH steps so phase_buckets() builds step_index 1 and 2.
+    for &(i, step) in &[(0u64, 1u16), (1, 1), (2, 2), (3, 2)] {
+        result.snapshot_bridge.store_with_stats_and_step(
+            &format!("periodic_{i}"),
+            crate::monitor::dump::FailureDumpReport::default(),
+            None,
+            Some(i * 100),
+            None,
+            step,
+        );
+    }
+    let scx = crate::assert::Phase::step(0); // step_index 1
+    let eevdf = crate::assert::Phase::step(1); // step_index 2
+    // scx (candidate) p99 10µs is strictly better than EEVDF (baseline) 100µs.
+    let mut v = crate::assert::Verdict::new();
+    result
+        .better_across_phases(&mut v, eevdf, scx, "wakeup_p99_latency_us")
+        .better_than();
+    assert!(
+        v.into_anyhow_or_log().is_ok(),
+        "scx p99 10µs is strictly better than EEVDF 100µs (LowerBetter)"
+    );
+    // Reverse framing: EEVDF (candidate) is NOT better than scx (baseline) -> Err.
+    let mut v2 = crate::assert::Verdict::new();
+    result
+        .better_across_phases(&mut v2, scx, eevdf, "wakeup_p99_latency_us")
+        .better_than();
+    assert!(
+        v2.into_anyhow_or_log().is_err(),
+        "EEVDF p99 100µs is not better than scx 10µs"
+    );
+    // A metric absent in the phases (empty request histogram -> request keys
+    // never derived) is Inconclusive -> Err, never a silent pass.
+    let mut v3 = crate::assert::Verdict::new();
+    result
+        .better_across_phases(&mut v3, eevdf, scx, "request_p99_latency_us")
+        .better_than();
+    assert!(
+        v3.into_anyhow_or_log().is_err(),
+        "absent metric -> inconclusive -> Err (no silent pass)"
+    );
+    // HigherBetter through production: schbench_loop_count is HigherBetter, so
+    // scx (candidate, loop 200) beats EEVDF (baseline, loop 50) — proving the
+    // SAME call orients a HigherBetter metric, direction from the registry (not
+    // just the LowerBetter latency above).
+    let mut v4 = crate::assert::Verdict::new();
+    result
+        .better_across_phases(&mut v4, eevdf, scx, "schbench_loop_count")
+        .better_than();
+    assert!(
+        v4.into_anyhow_or_log().is_ok(),
+        "scx loop_count 200 > EEVDF 50 (HigherBetter)"
+    );
+    let mut v5 = crate::assert::Verdict::new();
+    result
+        .better_across_phases(&mut v5, scx, eevdf, "schbench_loop_count")
+        .better_than();
+    assert!(
+        v5.into_anyhow_or_log().is_err(),
+        "EEVDF loop_count 50 is not > scx 200"
+    );
+    // by_at_least(margin) through production: scx p99 10µs is a 90% improvement
+    // over EEVDF 100µs — clears a 50% margin, falls short of a 95% margin.
+    let mut v6 = crate::assert::Verdict::new();
+    result
+        .better_across_phases(&mut v6, eevdf, scx, "wakeup_p99_latency_us")
+        .by_at_least(0.5);
+    assert!(
+        v6.into_anyhow_or_log().is_ok(),
+        "90% improvement clears a 50% margin"
+    );
+    let mut v7 = crate::assert::Verdict::new();
+    result
+        .better_across_phases(&mut v7, eevdf, scx, "wakeup_p99_latency_us")
+        .by_at_least(0.95);
+    assert!(
+        v7.into_anyhow_or_log().is_err(),
+        "90% improvement is short of a 95% margin"
+    );
+}
+
+/// Per-cgroup query API end-to-end through the production VmResult path:
+/// VmResult::phase_cgroup_metric reads the NAMED cgroup (distinct per cgroup, not
+/// the pool), the counter fallback exposes total_migrations, the None taxonomy
+/// holds, and better_across_phases_cgroup orients per-cgroup (opposite outcomes for
+/// two cgroups proves it reads the named one, not the aggregate).
+#[test]
+fn phase_cgroup_metric_and_better_across_phases_cgroup_end_to_end() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    let carrier = |us: u32, loops: u64, migs: u64| {
+        let mut wakeup = crate::workload::schbench::plat::PlatStats::default();
+        for _ in 0..100 {
+            wakeup.add_lat(us);
+        }
+        crate::assert::PhaseCgroupStats {
+            schbench: Some(crate::workload::schbench::run::SchbenchPhaseStats {
+                wakeup,
+                request: crate::workload::schbench::plat::PlatStats::default(),
+                rps: crate::workload::schbench::plat::PlatStats::default(),
+                msg_run_delay_ns: 0,
+                msg_pcount: 0,
+                worker_run_delay_ns: 0,
+                worker_pcount: 0,
+                loop_count: loops,
+            }),
+            total_migrations: migs,
+            ..Default::default()
+        }
+    };
+    // Two cgroups per phase with DISTINCT values, so a per-cgroup lookup is
+    // distinguishable from the pooled aggregate.
+    let phase_bucket = |idx: u16, a: (u32, u64, u64), b: (u32, u64, u64)| {
+        let mut pc = std::collections::BTreeMap::new();
+        pc.insert("cg_a".to_string(), carrier(a.0, a.1, a.2));
+        pc.insert("cg_b".to_string(), carrier(b.0, b.1, b.2));
+        crate::assert::PhaseBucket {
+            step_index: idx,
+            label: format!("Step[{}]", idx - 1),
+            start_ms: u64::MAX,
+            end_ms: 0,
+            sample_count: 0,
+            metrics: std::collections::BTreeMap::new(),
+            per_cgroup: pc,
+        }
+    };
+    let mut guest_assert = build_assert_result(true, vec![]);
+    // step 1 (scx): cg_a loop 200 / cg_b loop 80; step 2 (eevdf): cg_a loop 50 / cg_b loop 90.
+    guest_assert.stats.phases = vec![
+        phase_bucket(1, (10, 200, 7), (50, 80, 3)),
+        phase_bucket(2, (100, 50, 4), (40, 90, 9)),
+    ];
+    let result = crate::vmm::VmResult {
+        success: true,
+        guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
+            entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                &guest_assert,
+            )],
+        }),
+        periodic_fired: 4,
+        periodic_target: 4,
+        ..crate::vmm::VmResult::test_fixture()
+    };
+    for &(i, step) in &[(0u64, 1u16), (1, 1), (2, 2), (3, 2)] {
+        result.snapshot_bridge.store_with_stats_and_step(
+            &format!("periodic_{i}"),
+            crate::monitor::dump::FailureDumpReport::default(),
+            None,
+            Some(i * 100),
+            None,
+            step,
+        );
+    }
+    let scx = crate::assert::Phase::step(0); // step_index 1
+    let eevdf = crate::assert::Phase::step(1); // step_index 2
+    // phase_cgroup_metric reads the NAMED cgroup, distinct per cgroup (not pooled).
+    assert_eq!(
+        result.phase_cgroup_metric(scx, "cg_a", "schbench_loop_count"),
+        Some(200.0)
+    );
+    assert_eq!(
+        result.phase_cgroup_metric(scx, "cg_b", "schbench_loop_count"),
+        Some(80.0)
+    );
+    // Counter fallback (carrier field, not a derived metric): cg_a step-1 migrations 7.
+    assert_eq!(
+        result.phase_cgroup_metric(scx, "cg_a", "total_migrations"),
+        Some(7.0)
+    );
+    // None taxonomy: missing cgroup, typo metric.
+    assert_eq!(
+        result.phase_cgroup_metric(scx, "missing", "schbench_loop_count"),
+        None
+    );
+    assert_eq!(
+        result.phase_cgroup_metric(scx, "cg_a", "not_a_metric"),
+        None
+    );
+    // better_across_phases_cgroup orients per-cgroup: cg_a scx loop 200 > eevdf 50
+    // (HigherBetter) -> better; the reverse framing -> Err.
+    let mut v = crate::assert::Verdict::new();
+    result
+        .better_across_phases_cgroup(&mut v, eevdf, scx, "cg_a", "schbench_loop_count")
+        .better_than();
+    assert!(
+        v.into_anyhow_or_log().is_ok(),
+        "cg_a scx loop 200 > eevdf 50 (HigherBetter)"
+    );
+    let mut v2 = crate::assert::Verdict::new();
+    result
+        .better_across_phases_cgroup(&mut v2, scx, eevdf, "cg_a", "schbench_loop_count")
+        .better_than();
+    assert!(
+        v2.into_anyhow_or_log().is_err(),
+        "cg_a eevdf loop 50 is not > scx 200"
+    );
+    // The per-cgroup orientation for cg_b is OPPOSITE (scx loop 80 < eevdf 90), so
+    // scx is NOT better for cg_b — proving the lookup reads cg_b, not the pool.
+    let mut v3 = crate::assert::Verdict::new();
+    result
+        .better_across_phases_cgroup(&mut v3, eevdf, scx, "cg_b", "schbench_loop_count")
+        .better_than();
+    assert!(
+        v3.into_anyhow_or_log().is_err(),
+        "cg_b scx loop 80 is not > eevdf 90 (distinct from cg_a)"
+    );
+}
+
+/// ScenarioStats per-cgroup lookups (the AssertResult-holding path):
+/// phase_cgroup_metric reads a named cgroup's derived metric for a Phase, falls
+/// back to the carrier Counters, and returns None for a missing cgroup / typo
+/// metric / missing phase.
+#[test]
+fn scenario_stats_phase_cgroup_metric_and_counter_fallback() {
+    let _lock = lock_env();
+    let mut ar = build_assert_result(true, vec![]);
+    let mut metrics = std::collections::BTreeMap::new();
+    metrics.insert("schbench_loop_count".to_string(), 10.0);
+    let mut pc = std::collections::BTreeMap::new();
+    pc.insert(
+        "cg_a".to_string(),
+        crate::assert::PhaseCgroupStats {
+            metrics,
+            total_migrations: 7,
+            ..Default::default()
+        },
+    );
+    ar.stats.phases = vec![crate::assert::PhaseBucket {
+        step_index: 1,
+        label: "Step[0]".to_string(),
+        start_ms: u64::MAX,
+        end_ms: 0,
+        sample_count: 0,
+        metrics: std::collections::BTreeMap::new(),
+        per_cgroup: pc,
+    }];
+    // phase_cgroup_metric via Phase::step(0) (the scenario's first Step); reads the derived map.
+    assert_eq!(
+        ar.stats
+            .phase_cgroup_metric(crate::assert::Phase::step(0), "cg_a", "schbench_loop_count"),
+        Some(10.0)
+    );
+    // Counter fallback (carrier field, not derived).
+    assert_eq!(
+        ar.stats
+            .phase_cgroup_metric(crate::assert::Phase::step(0), "cg_a", "total_migrations"),
+        Some(7.0)
+    );
+    // None: missing cgroup / typo metric / missing phase.
+    assert_eq!(
+        ar.stats.phase_cgroup_metric(
+            crate::assert::Phase::step(0),
+            "missing",
+            "schbench_loop_count"
+        ),
+        None
+    );
+    assert_eq!(
+        ar.stats
+            .phase_cgroup_metric(crate::assert::Phase::step(0), "cg_a", "not_a_metric"),
+        None
+    );
+    assert_eq!(
+        ar.stats
+            .phase_cgroup_metric(crate::assert::Phase::step(8), "cg_a", "schbench_loop_count"),
+        None
+    );
+}
+
+/// Pooled-path counter symmetry (the AssertResult-holding path): ScenarioStats
+/// phase_metric resolves the per-cgroup Counters total_migrations /
+/// total_iterations as the cross-cgroup SUM via PhaseBucket::cgroup_counter_total,
+/// symmetric with the per-cgroup phase_cgroup_metric (which surfaces each cgroup's
+/// own value) and with VmResult::phase_metric. These two Counters have read_sample
+/// == None, so they live ONLY in the per-cgroup carriers (never in
+/// PhaseBucket.metrics); without the fallback the pooled lookup returned a silent
+/// None while the per-cgroup sibling surfaced the value.
+#[test]
+fn scenario_stats_phase_metric_pools_per_cgroup_counters() {
+    let _lock = lock_env();
+    let mut ar = build_assert_result(true, vec![]);
+    let mut pc = std::collections::BTreeMap::new();
+    pc.insert(
+        "cg_a".to_string(),
+        crate::assert::PhaseCgroupStats {
+            total_migrations: 7,
+            total_iterations: 100,
+            ..Default::default()
+        },
+    );
+    pc.insert(
+        "cg_b".to_string(),
+        crate::assert::PhaseCgroupStats {
+            total_migrations: 4,
+            total_iterations: 50,
+            ..Default::default()
+        },
+    );
+    ar.stats.phases = vec![crate::assert::PhaseBucket {
+        step_index: 1,
+        label: "Step[0]".to_string(),
+        start_ms: u64::MAX,
+        end_ms: 0,
+        sample_count: 0,
+        metrics: std::collections::BTreeMap::new(),
+        per_cgroup: pc,
+    }];
+    // Pooled lookup resolves the carrier-only Counters as the cross-cgroup SUM.
+    assert_eq!(
+        ar.stats
+            .phase_metric(crate::assert::Phase::step(0), "total_migrations"),
+        Some(11.0)
+    ); // 7 + 4
+    assert_eq!(
+        ar.stats
+            .phase_metric(crate::assert::Phase::step(0), "total_iterations"),
+        Some(150.0)
+    ); // 100 + 50
+    // Per-cgroup sibling surfaces each cgroup's own value (the symmetry the fix restores).
+    assert_eq!(
+        ar.stats
+            .phase_cgroup_metric(crate::assert::Phase::step(0), "cg_a", "total_migrations"),
+        Some(7.0)
+    );
+    assert_eq!(
+        ar.stats
+            .phase_cgroup_metric(crate::assert::Phase::step(0), "cg_b", "total_migrations"),
+        Some(4.0)
+    );
+    // typo metric / missing phase -> None (sentinel-free).
+    assert_eq!(
+        ar.stats
+            .phase_metric(crate::assert::Phase::step(0), "not_a_metric"),
+        None
+    );
+    assert_eq!(
+        ar.stats
+            .phase_metric(crate::assert::Phase::step(8), "total_migrations"),
+        None
+    );
+}
+
 /// Eval REORDER wiring: on the GUEST-FAIL path the failure message's
 /// timeline is built from the POST-fold `check_result.stats.phases`
 /// (folded_timeline), so the per-cgroup sub-block AND orphan not-measured
@@ -1407,6 +2160,8 @@ fn phase_buckets_equals_stats_phases_with_guest_per_cgroup_carriers() {
 /// otherwise green.
 #[test]
 fn evaluate_failure_message_renders_per_cgroup_via_folded_timeline() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     use crate::timeline::StimulusEvent;
     // A FAILING guest AssertResult -> evaluate_vm_result takes the failure arm
     // (returns Err with the rendered message).
@@ -1524,6 +2279,8 @@ fn evaluate_failure_message_renders_per_cgroup_via_folded_timeline() {
 /// from_phase_buckets path.
 #[test]
 fn evaluate_synthesizes_phase_buckets_for_uncaptured_steps() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     use crate::timeline::StimulusEvent;
     let pass_assert = build_assert_result(true, vec![]);
     let entry = sched_entry("__eval_synthesize_uncaptured__");
@@ -1603,6 +2360,8 @@ fn evaluate_synthesizes_phase_buckets_for_uncaptured_steps() {
 /// check_result.stats.phases (the durable sidecar telemetry).
 #[test]
 fn evaluate_folds_guest_per_cgroup_into_host_phase_buckets() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     use crate::timeline::StimulusEvent;
     let mut guest_assert = build_assert_result(true, vec![]);
     let mut per_cgroup = std::collections::BTreeMap::new();
@@ -2109,6 +2868,8 @@ ktstr-1 [001] 0.501: sched_ext_dump:   apply_cell_config returned -EINVAL
 /// fixture leaves `info_notes` empty.
 #[test]
 fn eval_failure_renders_info_notes_section() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let mut assert = build_assert_result(
         false,
         vec![AssertDetail::new(DetailKind::Stuck, "stuck 9000ms")],
@@ -2160,6 +2921,8 @@ fn eval_failure_renders_info_notes_section() {
 /// value so the index loop is proven to run for both cgroups.
 #[test]
 fn eval_failure_renders_stats_section_with_spread_na() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let mut assert = build_assert_result(
         false,
         vec![AssertDetail::new(DetailKind::Unfair, "spread too wide")],
@@ -2244,6 +3007,8 @@ fn eval_failure_renders_stats_section_with_spread_na() {
 /// the no-parseable-result arm.
 #[test]
 fn eval_failure_repro_section_on_guest_fail() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![AssertDetail::new(DetailKind::Stuck, "worker 0 stuck")],
@@ -2282,6 +3047,8 @@ fn eval_failure_repro_section_on_guest_fail() {
 /// returned Some — so NO `--- auto-repro ---` section renders.
 #[test]
 fn eval_failure_no_repro_section_without_active_scheduling() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![AssertDetail::new(DetailKind::Stuck, "worker 0 stuck")],
@@ -2323,6 +3090,8 @@ fn eval_failure_no_repro_section_without_active_scheduling() {
 /// the merged verdict is inconclusive.
 #[test]
 fn eval_monitor_inconclusive_folds_into_verdict() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let pass_assert = build_assert_result(true, vec![]);
     let entry = sched_entry("__eval_monitor_inconclusive__");
     // 30 samples, 2 CPUs each, ALL with rq_clock == 1000 -> after the
@@ -2343,6 +3112,7 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
                         schedstat: None,
                         vcpu_cpu_time_ns: None,
                         vcpu_perf: None,
+                        avg_irq_util: None,
                         sched_domains: None,
                     },
                     crate::monitor::CpuSnapshot {
@@ -2355,6 +3125,7 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
                         schedstat: None,
                         vcpu_cpu_time_ns: None,
                         vcpu_perf: None,
+                        avg_irq_util: None,
                         sched_domains: None,
                     },
                 ],
@@ -2367,6 +3138,7 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
         success: true,
         vcpus: 1,
         cpu_budget: 1,
+        resolve_source: None,
         expect_auto_repro_satisfied: false,
         exit_code: 0,
         duration: std::time::Duration::from_secs(1),
@@ -2380,6 +3152,7 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
             watchdog_observation: None,
             page_offset: 0,
             boot_wait_outcome: crate::monitor::BootWaitOutcome::NotConfigured,
+            scx_event_counters_supported: false,
         }),
         guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
             entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
@@ -2402,6 +3175,7 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
         periodic_target: 0,
         kern_kaslr_offset: 0,
         entry_name: None,
+        variant_hash: 0,
         periodic_series_cache: std::sync::OnceLock::new(),
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES
@@ -2455,6 +3229,8 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
 /// is_pass=false`, so the failure-render block runs.
 #[test]
 fn eval_inconclusive_verdict_word_in_header() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let mut assert = build_assert_result(true, vec![]);
     assert.merge(crate::assert::AssertResult::inconclusive(
         AssertDetail::new(DetailKind::Other, "zero-denominator metric"),
@@ -2508,6 +3284,8 @@ fn eval_inconclusive_verdict_word_in_header() {
 /// setting `expect_err = true` pins the substring-not-found text).
 #[test]
 fn eval_scx_bpf_error_matcher_mismatch_wraps_context() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(true, vec![]);
     let mut entry = sched_entry("__eval_scx_matcher_mismatch__");
     entry.expect_err = true;
@@ -2550,6 +3328,8 @@ fn eval_scx_bpf_error_matcher_mismatch_wraps_context() {
 /// `Ok`, so there would be no `Err` to inspect.
 #[test]
 fn eval_no_matcher_no_mismatch_context() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![AssertDetail::new(DetailKind::Stuck, "independent failure")],
@@ -2589,6 +3369,8 @@ fn eval_no_matcher_no_mismatch_context() {
 /// text from that block's `format!("post_vm callback returned Err: {err:#}")`.
 #[test]
 fn eval_post_vm_err_folds_into_guest_pass() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(true, vec![]);
     let entry = eevdf_entry("__eval_post_vm_fold__");
     let result = make_vm_result_with_assert("", "", 0, false, &assert);
@@ -2627,6 +3409,8 @@ fn eval_post_vm_err_folds_into_guest_pass() {
 /// host-extract detail in the details block.
 #[test]
 fn eval_host_extract_failures_fold_into_guest_pass() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(true, vec![]);
     let entry = eevdf_entry("__eval_host_extract_fold__");
     let result = make_vm_result_with_assert("", "", 0, false, &assert);
@@ -2740,6 +3524,7 @@ fn eval_sched_log_truncates_over_200_lines() {
 #[test]
 fn eval_failure_renders_bug_summary_line_via_closure() {
     let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(false, vec![AssertDetail::new(DetailKind::Stuck, "stuck")]);
     let output =
         format!("{SCHED_OUTPUT_START}\nscx_bpf_error: cell config invalid\n{SCHED_OUTPUT_END}",);
@@ -2791,6 +3576,8 @@ fn eval_failure_renders_bug_summary_line_via_closure() {
 /// missing-samples line renders (`fired < target` true).
 #[test]
 fn eval_failure_renders_periodic_samples_section() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(false, vec![AssertDetail::new(DetailKind::Stuck, "stuck")]);
     let entry = eevdf_entry("__eval_periodic_section__");
     let result = crate::vmm::VmResult {
@@ -2850,6 +3637,8 @@ fn eval_failure_renders_periodic_samples_section() {
 /// `"{n} temporal assertion entry(ies):"` push.
 #[test]
 fn eval_failure_renders_temporal_assertions_section() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![AssertDetail::new(
@@ -2952,6 +3741,8 @@ fn eval_noresult_eevdf_with_sched_output_suppresses_console_section() {
 /// the rendered failure message carries no monitor section.
 #[test]
 fn eval_sched_fail_with_no_monitor_omits_monitor_section() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
     let assert = build_assert_result(
         false,
         vec![AssertDetail::new(DetailKind::Stuck, "worker 0 stuck")],

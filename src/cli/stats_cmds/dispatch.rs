@@ -87,6 +87,19 @@ pub fn compare_partitions(
     )
 }
 
+/// Noise-adjusted variant of [`compare_partitions`]: keeps every per-run row,
+/// summarizes each side's spread, and gates on B's mean leaving A's observed
+/// band rather than a fixed threshold. See `crate::stats::compare_partitions_noise`
+/// for the full contract.
+pub fn compare_partitions_noise(
+    filter_a: &RowFilter,
+    filter_b: &RowFilter,
+    dir: Option<&Path>,
+    spread_threshold_pct: f64,
+) -> Result<i32> {
+    crate::stats::compare_partitions_noise(filter_a, filter_b, dir, spread_threshold_pct)
+}
+
 /// Collect the current host context via
 /// [`crate::host_context::collect_host_context`] and render it as
 /// a human-readable multi-line report via

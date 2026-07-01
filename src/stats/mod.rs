@@ -9,18 +9,22 @@
 //! per-scenario means, outlier rankings, and dimension summaries
 //! without polars's ~30-40 transitive crates.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 mod analyze;
 mod compare;
 mod group;
 mod metric;
+mod metric_id;
+mod noise;
 mod row;
 
 pub use analyze::*;
 pub use compare::*;
 pub use group::*;
 pub use metric::*;
+pub use metric_id::*;
+pub use noise::*;
 pub use row::*;
 
 #[cfg(test)]

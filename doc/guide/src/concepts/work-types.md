@@ -53,6 +53,8 @@ pub enum WorkType {
         operations: usize,
         sleep_usec: u64,
     },
+    Schbench { config: SchbenchConfig },                // schbench's message/worker wakeup + request-latency benchmark, re-expressed natively.
+    Taobench { config: TaobenchConfig },                // taobench's GET-dominated KV object-cache (fast-hit / slow-miss tiers), re-expressed natively.
     AsymmetricWaker {                                   // Paired workers in mismatched scheduling classes share one futex word.
         waker_class: SchedClass,
         wakee_class: SchedClass,
@@ -74,6 +76,11 @@ pub enum WorkType {
         inter_batch_ms: u64,
     },
 
+    // Timer + NIC/IRQ wakeups (the AF_PACKET variants need #[ktstr_test(network = ...)])
+    TimerLatency { interval_us: u64 },                  // cyclictest-style: absolute-deadline hrtimer (hardirq) wake; measures timer wake-to-run latency.
+    NetTraffic { interval_us: u64, frame_bytes: u16 },  // AF_PACKET self-traffic generator -> virtio-net RX hardirq + NAPI softirq (no wakee).
+    IrqWake { interval_us: u64, frame_bytes: u16 },     // Paired sender/receiver; receiver blocked in recvfrom is woken from NET_RX softirq context.
+
     // Compound / sequence
     Sequence { first: WorkPhase, rest: Vec<WorkPhase> }, // Loop through ordered phases (Spin / Sleep / Yield / Io / AluHot).
 
@@ -85,6 +92,7 @@ pub enum WorkType {
     PolicyChurn { spin_iters: u64 },                    // Cycle SCHED_OTHER -> BATCH -> IDLE (-> FIFO/RR if CAP_SYS_NICE).
     NumaMigrationChurn { period_ms: u64 },              // Rotate sched_setaffinity across NUMA nodes.
     CgroupChurn { groups: usize, cycle_ms: u64 },       // Cycle cgroup membership between sibling cgroups.
+    CgroupAttachStorm { dest: String, reap: ReapMode }, // Fork a transient child, migrate it into a sibling cgroup.procs, child _exit's (attach-path leader race).
 
     // Memory pressure / NUMA
     PageFaultChurn {                                    // mmap NOHUGEPAGE -> touch random pages -> MADV_DONTNEED, repeat.
@@ -138,15 +146,18 @@ pub enum WorkType {
     },
 
     // User-supplied
-    Custom {                                            // User-supplied work function (name + fn pointer).
+    Custom {                                            // User-supplied work function (name, fn pointer, config).
         name: String,
         run: CustomFn,                                  // newtype over fn(&WorkerCtx) -> WorkerReport
+        cfg: CustomCfg,                                 // fork-safe Copy POD config payload
     },
 }
 ```
 
 > **Imports:** `WorkType`, `WorkPhase`, `SchedPolicy`, `AluWidth`,
-> `WorkSpec`, and `WorkloadConfig` are in `ktstr::prelude::*`.
+> `WorkSpec`, `WorkloadConfig`, `SchbenchConfig` (the `Schbench`
+> config), and `ReapMode` (the `CgroupAttachStorm` reap mode) are in
+> `ktstr::prelude::*`.
 > (Note: the prelude also exports an unrelated `Phase` from
 > `crate::assert` — the temporal-assertion phase bucket. The
 > `WorkType::Sequence` variant uses `WorkPhase`, not `Phase`.) The
@@ -198,6 +209,7 @@ time via `WorkType::ipc_variance`.
 | Scheduling class transitions | `PolicyChurn` |
 | Page fault / TLB pressure | `PageFaultChurn` |
 | Lock contention / convoy effect | `MutexContention` |
+| Wakeup + request latency (schbench parity) | `Schbench` |
 | Arbitrary user-defined workload | `Custom` |
 
 ## Variants
@@ -270,6 +282,25 @@ messenger per group stamps a `CLOCK_MONOTONIC` timestamp then wakes
 iterations of naive matrix multiply over a `cache_footprint_kib`-sized
 working set (three square matrices of u64, O(n^3)). Requires
 `num_workers` divisible by `fan_out + 1`.
+
+**`Schbench`** -- schbench's default-mode benchmark re-expressed natively
+(the `schbench_rs` port): message threads batch-wake worker threads
+(measuring scheduler wakeup latency), and each worker think-sleeps then
+does matrix work under a per-CPU lock (measuring request latency).
+Carries a `SchbenchConfig` (build it with `SchbenchConfig::default()`
+plus its chainable setters) that maps schbench's
+`-m`/`-t`/`-F`/`-n`/`-s`/`-L`/`-R`/`-A`/`-p` flags onto config fields; see
+the `SchbenchConfig` rustdoc for the full schbench(8) CLI-parity table —
+which flags map to fields, which are set by ktstr topology, and which one
+schbench mode (`-C` calibrate) is not ported. The `--split` knob
+(`split_percent`) partitions the cache footprint into a per-thread
+private matrix and one process-global shared matrix all workers contend
+on, reproducing cross-core cache contention. The `-p`/`--pipe` knob
+(`pipe_transfer_bytes`) instead swaps the matrix work for schbench's
+memory-transfer simulation: the waker and the woken worker each memset a
+per-thread page over the same handshake, reporting transfer throughput.
+Use a single ktstr worker (`workers(1)`); the message/worker parallelism
+is this variant's internal thread topology, not ktstr worker processes.
 
 **`Sequence`** -- compound work pattern: loop through phases in order,
 repeat. Each phase runs for its specified duration before the next
@@ -344,10 +375,14 @@ lock-holder preemption cascading stalls, and futex wait/wake
 contention paths. Requires `num_workers` divisible by `contenders`.
 
 **`Custom`** -- user-supplied work function. The `run` function pointer
-receives a `&WorkerCtx` (exposing the stop flag via `ctx.stop()` — a
-`&AtomicBool` set by SIGUSR1 in `CloneMode::Fork` — plus `ctx.cpus()`
-and `ctx.sibling_pids()`) and returns a `WorkerReport` when the stop
-flag becomes `true`. The
+receives a `&WorkerCtx` exposing the stop flag via `ctx.stop()` (a
+`&AtomicBool` set by SIGUSR1 in `CloneMode::Fork`), plus `ctx.cpus()`,
+`ctx.sibling_pids()`, `ctx.cgroup_dir()` (the worker's own cgroup-v2
+dir, or `None` in the root cgroup / when cgroup v2 is unavailable), and
+`ctx.cfg()` (the fork-safe `CustomCfg` config payload — default-zero
+unless the work type was built with `WorkType::custom_with`). It returns
+a `WorkerReport` when the stop flag becomes
+`true`. The
 framework handles fork, cgroup placement, affinity, scheduling policy,
 and signal setup; the user function owns the work loop and all
 `WorkerReport` field population. Framework telemetry (migration
@@ -372,6 +407,14 @@ before returning the `WorkerReport`.
 Function pointers (`fn(&WorkerCtx) -> WorkerReport`) are fork-safe
 because they carry no captured state across the fork boundary. Closures
 are not supported. Cannot be constructed via `WorkType::from_name()`.
+
+To pass per-worker configuration without a closure (or an unsafe
+`static`), build the work type with `WorkType::custom_with(name, run,
+cfg)` and read it via `ctx.cfg()`. `CustomCfg` is a Copy POD payload
+(integer / bool / fixed-array slots) inherited byte-faithfully across
+`fork`; for variable-length or genuinely shared state, allocate a
+`MAP_SHARED` region and pass its address through a `u64` slot —
+`tests/preempt_regression.rs` does this for a shared futex word.
 
 ```rust,ignore
 use std::sync::atomic::Ordering;

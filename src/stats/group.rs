@@ -1,9 +1,9 @@
 use super::*;
 
-/// One of the eight dimensions that compose a `GauntletRow`'s
+/// One of the nine dimensions that compose a `GauntletRow`'s
 /// identity in the comparison pipeline: `kernel`, `scheduler`,
 /// `topology`, `work-type`, `project-commit`, `kernel-commit`,
-/// `run-source`, `cpu-budget`. Each maps to the corresponding
+/// `run-source`, `resolve-source`, `cpu-budget`. Each maps to the corresponding
 /// `RowFilter` field and `GauntletRow` field; the dimension
 /// model lets `compare_partitions` derive its slicing dims and
 /// dynamic pairing key without hardcoding the dimension list at
@@ -22,7 +22,7 @@ use super::*;
 /// matches the order operators read in the CLI flags
 /// (`--kernel` / `--scheduler` / `--topology` / `--work-type` /
 /// `--project-commit` / `--kernel-commit` / `--run-source` /
-/// `--cpu-budget`), so generated labels and error messages list
+/// `--resolve-source` / `--cpu-budget`), so generated labels and error messages list
 /// dims in a stable, predictable order.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Dimension {
@@ -33,6 +33,7 @@ pub enum Dimension {
     ProjectCommit,
     KernelCommit,
     RunSource,
+    ResolveSource,
     CpuBudget,
 }
 
@@ -49,6 +50,7 @@ impl Dimension {
         Dimension::ProjectCommit,
         Dimension::KernelCommit,
         Dimension::RunSource,
+        Dimension::ResolveSource,
         Dimension::CpuBudget,
     ];
 
@@ -80,6 +82,7 @@ impl Dimension {
             Dimension::ProjectCommit => "project-commit",
             Dimension::KernelCommit => "kernel-commit",
             Dimension::RunSource => "run-source",
+            Dimension::ResolveSource => "resolve-source",
             Dimension::CpuBudget => "cpu-budget",
         }
     }
@@ -107,7 +110,7 @@ pub(crate) const LEGACY_PAIRING_DIMS: &[Dimension] = &[Dimension::Topology, Dime
 /// Comparison shape per dimension: every dim uses the same
 /// SORTED-DEDUPED `Vec<&str>` comparison — order and multiplicity
 /// don't matter (`--a-kernel 6.14 --a-kernel 6.15` and
-/// `--b-kernel 6.15 --b-kernel 6.14` are NOT a slice). All eight
+/// `--b-kernel 6.15 --b-kernel 6.14` are NOT a slice). All nine
 /// dimensions are repeatable Vec filters; the previously
 /// `Option<String>`-typed `scheduler` / `topology` / `work_type`
 /// dims were promoted to `Vec<String>` so the operator-visible
@@ -138,6 +141,9 @@ pub fn derive_slicing_dims(filter_a: &RowFilter, filter_b: &RowFilter) -> Vec<Di
             }
             Dimension::RunSource => {
                 sorted_dedup(&filter_a.run_sources) != sorted_dedup(&filter_b.run_sources)
+            }
+            Dimension::ResolveSource => {
+                sorted_dedup(&filter_a.resolve_sources) != sorted_dedup(&filter_b.resolve_sources)
             }
             Dimension::CpuBudget => {
                 sorted_dedup(&filter_a.cpu_budgets) != sorted_dedup(&filter_b.cpu_budgets)
@@ -190,6 +196,7 @@ pub(crate) fn render_side_label(
             Dimension::ProjectCommit => render_vec_dim(&filter.project_commits, bare_label),
             Dimension::KernelCommit => render_vec_dim(&filter.kernel_commits, bare_label),
             Dimension::RunSource => render_vec_dim(&filter.run_sources, bare_label),
+            Dimension::ResolveSource => render_vec_dim(&filter.resolve_sources, bare_label),
             Dimension::CpuBudget => render_vec_dim(&filter.cpu_budgets, bare_label),
         };
         parts.push(part);
@@ -261,6 +268,7 @@ impl PairingKey {
                 Dimension::ProjectCommit => commit_pairing_key_part(&row.commit),
                 Dimension::KernelCommit => commit_pairing_key_part(&row.kernel_commit),
                 Dimension::RunSource => row.run_source.clone().unwrap_or_default(),
+                Dimension::ResolveSource => row.resolve_source.clone().unwrap_or_default(),
                 // Cross-budget rows never pair: a row's budget value
                 // becomes part of its pairing key (None -> empty, distinct
                 // from any real budget). A skip (None) only pairs with
@@ -454,6 +462,7 @@ struct Accumulator<'a> {
     any_skipped: bool,
     any_failed: bool,
     any_inconclusive: bool,
+    any_expected_failure: bool,
     // Tracks whether contributors disagree on the `-dirty`
     // suffix for the project_commit / kernel_commit dimensions.
     // `any_*_clean` is true if any contributor's value is the
@@ -495,8 +504,12 @@ struct Accumulator<'a> {
     sum_fallback_count: i64,
     sum_keep_last_count: i64,
     sum_total_iterations: u64,
-    sum_page_locality: f64,
-    sum_cross_node_mig: f64,
+    // sum_page_locality + sum_cross_node_mig removed: both NUMA roll-ups are now
+    // ext-sourced (worst_page_locality = WorstLowest, worst_cross_node_migration_ratio
+    // = WorstCrossNodeRatio), re-pooled from the per-phase carriers and
+    // cross-run-MEAN-folded via the ext fold like the other migrated worst_*
+    // selectors — not typed GauntletRow columns, so no per-row group-average
+    // accumulators.
     // Per-row MAX-fold for Peak-kind fields. Per
     // `MetricKind::Peak` contract, cross-RUN aggregation
     // surfaces the worst-instant observed across the cohort —
@@ -516,6 +529,12 @@ struct Accumulator<'a> {
     // fall back to arithmetic mean — same legacy semantic the
     // previous (sum, u32) shape produced.
     ext_pairs: BTreeMap<String, Vec<(f64, usize)>>,
+    // Union of the Dynamic monotonic-counter ext keys across contributors
+    // (`GauntletRow::ext_counter_keys`). `fold_ext_metrics` SUM-folds these
+    // instead of averaging — they are not in the static `METRICS` registry, so
+    // `metric_def` can't classify them. Carried onto the aggregated row so a
+    // second-level cross-RUN fold keeps SUM-folding them.
+    ext_counter_keys: BTreeSet<String>,
     // Sum of `run_sample_count` across contributors. Carries
     // through to the aggregated row's `run_sample_count` so a
     // downstream cross-RUN consumer that further folds these
@@ -547,6 +566,7 @@ impl<'a> Accumulator<'a> {
             any_skipped: false,
             any_failed: false,
             any_inconclusive: false,
+            any_expected_failure: false,
             any_project_clean: false,
             any_project_dirty: false,
             any_kernel_clean: false,
@@ -560,12 +580,11 @@ impl<'a> Accumulator<'a> {
             sum_fallback_count: 0,
             sum_keep_last_count: 0,
             sum_total_iterations: 0,
-            sum_page_locality: 0.0,
-            sum_cross_node_mig: 0.0,
             max_gap_ms: 0,
             max_imbalance_ratio: 0.0,
             max_max_dsq_depth: 0,
             ext_pairs: BTreeMap::new(),
+            ext_counter_keys: BTreeSet::new(),
             sum_run_sample_count: 0,
         }
     }
@@ -595,6 +614,15 @@ impl<'a> Accumulator<'a> {
             &mut self.any_kernel_dirty,
             &mut self.first_kernel_base,
         );
+        if row.expected_failure {
+            // An expect_err / expect_auto_repro run inverted to a pass:
+            // OR the flag so the aggregated row stays OUT of the
+            // ab-compare regression math (its telemetry is
+            // failure-mode-dominated). Its metrics may still fold into
+            // the cohort sums below, but compare_rows_by excludes any
+            // expected_failure row, so the aggregate is never read.
+            self.any_expected_failure = true;
+        }
         if row.is_skip() {
             self.any_skipped = true;
             self.skips_observed += 1;
@@ -627,8 +655,6 @@ impl<'a> Accumulator<'a> {
         self.sum_total_iterations = self
             .sum_total_iterations
             .saturating_add(row.total_iterations);
-        self.sum_page_locality += row.page_locality;
-        self.sum_cross_node_mig += row.cross_node_migration_ratio;
         // Peak-kind typed fields: cross-RUN aggregation surfaces
         // the worst-instant observed across the cohort, NOT the
         // arithmetic mean (which dilutes a single peak across
@@ -641,12 +667,26 @@ impl<'a> Accumulator<'a> {
         self.sum_run_sample_count = self
             .sum_run_sample_count
             .saturating_add(row.run_sample_count);
+        // Floor the cross-RUN weight at 1: a passing run that emitted this ext
+        // key contributes one observation to a Gauge(Avg) weighted mean, never
+        // zero-weighted out of a mixed cohort. A run with run_sample_count==0
+        // (e.g. snapshot-bridge-sourced metrics with no monitor samples) would
+        // otherwise be silently dropped from the mean. Matches the .max(1) floors
+        // at run_metrics.rs (populate_run_ext_metrics_from_phases) and
+        // stats_types.rs (merge_metric_values).
         for (k, v) in &row.ext_metrics {
             self.ext_pairs
                 .entry(k.clone())
                 .or_default()
-                .push((*v, row.run_sample_count));
+                .push((*v, row.run_sample_count.max(1)));
         }
+        // Union the Dynamic monotonic-counter key tags across contributors.
+        // Load-bearing, NOT merely defensive: per-run bpf-field resolution (and
+        // which topology levels are present) can vary within a pairing group, so
+        // a key tagged in only some rows must still be recognized as a counter
+        // for the whole group. fold_ext_metrics SUM-folds the union, not means.
+        self.ext_counter_keys
+            .extend(row.ext_counter_keys.iter().cloned());
     }
 
     /// Emit the folded [`AveragedGroup`] for this group. Identity
@@ -696,12 +736,14 @@ impl<'a> Accumulator<'a> {
             &acc.first.kernel_commit,
         );
         // ext_metrics is built BEFORE the struct so Rate keys can be
-        // re-derived from the folded components as a post-pass. ONLY Rate is
-        // skipped here: its components survive cross-RUN as their own ext keys
-        // so it re-derives Σnum/Σdenom (folding two ready-made ratios would
+        // re-derived from the folded components as a post-pass. Rate and PerPhase
+        // are skipped here: Rate's components survive cross-RUN as their own ext
+        // keys so it re-derives Σnum/Σdenom (folding two ready-made ratios would
         // lose the re-pool, and routing a Rate through
-        // aggregate_samples_weighted would hit the aggregate_finite guard).
-        // Distribution / WorstLowest are NOT skipped — their raw components do
+        // aggregate_samples_weighted would hit the aggregate_finite guard);
+        // PerPhase is a per-phase-only scalar with no cross-RUN aggregate.
+        // Distribution / WorstLowest / WakeLatencyTailRatio / WorstCrossNodeRatio
+        // are NOT skipped — their raw components do
         // NOT survive cross-RUN (phases are dropped), so there is no pooled set
         // to re-derive; they fall through to aggregate_samples_weighted and
         // fold by kind (MEAN for the percentile / CV / mean reductions and
@@ -712,7 +754,7 @@ impl<'a> Accumulator<'a> {
         // arithmetic mean, the legacy (sum, count) semantic. Skip a key whose
         // reduction is None (every value NaN — defensive post sidecar_to_row
         // sanitize).
-        let ext_metrics = fold_ext_metrics(acc.ext_pairs);
+        let ext_metrics = fold_ext_metrics(acc.ext_pairs, &acc.ext_counter_keys);
         let aggregated = GauntletRow {
             scenario: acc.first.scenario.clone(),
             topology: acc.first.topology.clone(),
@@ -722,6 +764,7 @@ impl<'a> Accumulator<'a> {
             commit: project_commit_rendered,
             kernel_commit: kernel_commit_rendered,
             run_source: acc.first.run_source.clone(),
+            resolve_source: acc.first.resolve_source.clone(),
             // First-seen budget metadata, like scheduler/kernel_version
             // above. When CpuBudget is a PAIRING dim it is part of the
             // group key, so every contributor shares one budget and the
@@ -756,6 +799,7 @@ impl<'a> Accumulator<'a> {
             passed: !acc.any_failed && !acc.any_inconclusive && !acc.any_skipped && n > 0,
             skipped: !acc.any_failed && !acc.any_inconclusive && acc.any_skipped,
             inconclusive: !acc.any_failed && acc.any_inconclusive,
+            expected_failure: acc.any_expected_failure,
             // Sum across contributors so the aggregated row's
             // weight is the cohort's total sample population. A
             // downstream consumer that further folds these
@@ -776,9 +820,11 @@ impl<'a> Accumulator<'a> {
             fallback_count: round_i64(acc.sum_fallback_count),
             keep_last_count: round_i64(acc.sum_keep_last_count),
             total_iterations: round_u64(acc.sum_total_iterations),
-            page_locality: acc.sum_page_locality / denom,
-            cross_node_migration_ratio: acc.sum_cross_node_mig / denom,
             ext_metrics,
+            // Carry the Dynamic counter-key tags forward so a second-level
+            // cross-RUN fold of these already-aggregated rows keeps SUM-folding
+            // them (the SUM-of-SUMs stays a SUM).
+            ext_counter_keys: acc.ext_counter_keys,
             // Phase buckets do not aggregate cleanly across an
             // averaged group: two contributors might run different
             // scenarios with different phase counts, and per-phase
@@ -804,29 +850,53 @@ impl<'a> Accumulator<'a> {
 }
 
 /// Fold one group's accumulated per-ext-metric (value, weight) pairs
-/// into the aggregated row's `ext_metrics` map. ONLY Rate is skipped
-/// in the kind dispatch: its components survive cross-RUN as their own
-/// ext keys so it re-derives Σnum/Σdenom (folding two ready-made
-/// ratios would lose the re-pool, and routing a Rate through
-/// aggregate_samples_weighted would hit the aggregate_finite guard).
-/// Distribution / WorstLowest are NOT skipped — their raw components do
+/// into the aggregated row's `ext_metrics` map. Rate, PerPhase, and
+/// PerRunDistribution are skipped in the kind dispatch: Rate's components
+/// survive cross-RUN as their own ext keys so it re-derives Σnum/Σdenom
+/// (folding two ready-made ratios would lose the re-pool, and routing a Rate
+/// through aggregate_samples_weighted would hit the aggregate_finite guard);
+/// PerPhase is a per-phase-only scalar with no cross-RUN aggregate;
+/// PerRunDistribution is a whole-run percentile/min/max that CANNOT be
+/// cross-RUN folded (a percentile of a union is not a mean of per-run
+/// percentiles, and the per-phase histograms are dropped cross-RUN so there is
+/// no pooled set to re-derive) — its only cross-RUN consumer is the per-run
+/// noise-compare (`noise_findings`), so it must never be averaged here.
+/// Distribution / WorstLowest / WakeLatencyTailRatio / WorstCrossNodeRatio
+/// are NOT skipped — their raw components do
 /// NOT survive cross-RUN (phases are dropped), so there is no pooled set
 /// to re-derive; they fall through to aggregate_samples_weighted and
 /// fold by kind (MEAN for the percentile / CV / mean reductions and
 /// every WorstLowest, MAX for SampleReduction::Worst — the
 /// aggregate_finite arms). Dispatch by registered MetricKind so
 /// Gauge(Avg) gets the weighted-mean fold (matches the per-phase merge
-/// contract); unregistered names (no metric_def) fall back to
-/// arithmetic mean, the legacy (sum, count) semantic. Skip a key whose
+/// contract); an unregistered name (no metric_def) folds by `counter_keys`: a
+/// Dynamic monotonic-counter key (lb_*/alb_* schedstat delta, ScalarCounter bpf
+/// field) SUM-folds (matching the registered-Counter convention), every other
+/// unregistered name falls back to arithmetic mean, the legacy (sum, count)
+/// semantic. Skip a key whose
 /// reduction is None (every value NaN — defensive post sidecar_to_row
 /// sanitize). Rate metrics are then re-derived from the folded
 /// components (Σnum/Σdenom) as a post-pass.
-fn fold_ext_metrics(ext_pairs: BTreeMap<String, Vec<(f64, usize)>>) -> BTreeMap<String, f64> {
+fn fold_ext_metrics(
+    ext_pairs: BTreeMap<String, Vec<(f64, usize)>>,
+    counter_keys: &BTreeSet<String>,
+) -> BTreeMap<String, f64> {
     let mut ext_metrics: std::collections::BTreeMap<String, f64> = ext_pairs
         .into_iter()
         .filter_map(|(k, pairs)| {
             if let Some(def) = metric_def(&k) {
-                if matches!(def.kind, MetricKind::Rate { .. }) {
+                // Rate re-derives from its folded components (post-pass below);
+                // PerPhase is a per-phase-only scalar with no meaningful
+                // cross-RUN aggregate — both are skipped here. The PerPhase skip
+                // is also load-bearing: a PerPhase key reaching
+                // aggregate_samples_weighted would hit aggregate_finite's
+                // unreachable!() arm. (PerPhase keys should never reach here —
+                // populate_run_ext_metrics_from_phases skips is_derived keys —
+                // so this is defensive belt-and-suspenders.)
+                if matches!(
+                    def.kind,
+                    MetricKind::Rate { .. } | MetricKind::PerPhase | MetricKind::PerRunDistribution
+                ) {
                     return None;
                 }
                 aggregate_samples_weighted(&pairs, def.kind).map(|v| (k, v))
@@ -836,7 +906,17 @@ fn fold_ext_metrics(ext_pairs: BTreeMap<String, Vec<(f64, usize)>>) -> BTreeMap<
                     None
                 } else {
                     let sum: f64 = pairs.iter().map(|(v, _)| *v).sum();
-                    Some((k, sum / n as f64))
+                    // A Dynamic monotonic-counter key (lb_*/alb_* schedstat delta
+                    // or a ScalarCounter bpf field) SUM-folds across runs,
+                    // matching the registered-Counter convention (aggregate_finite's
+                    // Counter arm). Untagged keys (gauges, per-CPU _avg/_max) keep
+                    // the legacy arithmetic-mean fold.
+                    let v = if counter_keys.contains(&k) {
+                        sum
+                    } else {
+                        sum / n as f64
+                    };
+                    Some((k, v))
                 }
             }
         })
@@ -966,11 +1046,10 @@ pub fn group_and_average_by(
 ///
 /// The 0.0 substitution is indistinguishable from a legitimate 0.0
 /// measurement for metrics whose natural zero carries its own signal.
-/// Two direct f64 fields are especially affected — note in-tree producers
-/// already guard the typical divide-by-zero path (`assert.rs` emits
-/// `0.0` for migration_ratio when `total_iters == 0` and `1.0` for
-/// page_locality when `total == 0`), so a NaN reaching this boundary
-/// indicates an upstream producer outside those guards (e.g. an
+/// One direct f64 field is especially affected — note the in-tree producer
+/// already guards the typical divide-by-zero path (`assert.rs` emits
+/// `0.0` for migration_ratio when `total_iters == 0`), so a NaN reaching
+/// this boundary indicates an upstream producer outside that guard (e.g. an
 /// external `ext_metrics` contributor, or a schedstat arithmetic
 /// edge that slipped past a guard):
 ///
@@ -978,12 +1057,10 @@ pub fn group_and_average_by(
 ///   migrated" (ideal locality). A sanitized NaN collapses to the
 ///   same value and reads as *falsely good* — a downstream regression
 ///   gate sees "perfect locality" where the truth is "no data".
-/// - `page_locality`: higher-better. A real 0.0 means "no local-node
-///   accesses". A sanitized NaN collapses to the same value and
-///   reads as *falsely bad* — a downstream regression gate sees
-///   "everything cross-node" where the truth is "no data". The
-///   polarity is opposite to `migration_ratio`: the two failure
-///   modes push the comparison in opposite directions.
+///   (`page_locality` is NO LONGER a finite_or_zero typed field: it is the
+///   ext-sourced `worst_page_locality` WorstLowest metric, re-pooled from the
+///   per-phase NUMA carriers, so a non-finite value is DROPPED via the ext path —
+///   absence preserved — not coerced to a falsely-bad 0.0 here.)
 ///
 /// The reclassified wake-latency / run-delay distributions (e.g.
 /// `worst_wake_latency_cv`) are NO LONGER direct f64 fields — they flow
@@ -1012,6 +1089,83 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         }
     };
 
+    // Build ext_metrics from the in-guest payload map (dropping the
+    // walk-truncation sentinel + non-finite values), then layer in the
+    // host-side monitor schedstat aggregates below.
+    let mut ext_metrics: BTreeMap<String, f64> = sc
+        .stats
+        .ext_metrics
+        .iter()
+        .filter_map(|(k, &v)| {
+            if crate::test_support::is_truncation_sentinel_name(k) {
+                return None;
+            }
+            if v.is_finite() {
+                Some((k.clone(), v))
+            } else {
+                tracing::warn!(
+                    test = %sc.test_name,
+                    metric = %k,
+                    value = v,
+                    "dropping non-finite ext_metric; serde_json rejects NaN/Infinity",
+                );
+                None
+            }
+        })
+        .collect();
+    // System-wide schedstat aggregates, read host-side from guest memory
+    // at freeze (zero observer effect; `MonitorSummary::schedstat_deltas`,
+    // summed across CPUs over the run). Keys ABSENT when CONFIG_SCHEDSTATS
+    // is off (schedstat_deltas == None): absent != 0 for a no-data run, and
+    // a 0 would pollute the cross-run Counter SUM and the Rate denominators
+    // (`total_run_delay_ns_per_sched`, `ttwu_local_fraction`). All seven
+    // insert under one `if let` so each Rate's numerator/denominator pair is
+    // always co-present (derive_rate_metrics needs both). `u64 -> f64` is
+    // exact below 2^53 and inherently finite, so these skip the finite
+    // filter the payload keys go through. The registry entries are
+    // `Polarity::Informational` (raw counts) + two `MetricKind::Rate`
+    // derivations; see [`crate::stats::METRICS`].
+    if let Some(sd) = sc
+        .monitor
+        .as_ref()
+        .and_then(|m| m.schedstat_deltas.as_ref())
+    {
+        ext_metrics.insert("total_run_delay".to_string(), sd.total_run_delay as f64);
+        ext_metrics.insert("total_pcount".to_string(), sd.total_pcount as f64);
+        ext_metrics.insert("total_sched_count".to_string(), sd.total_sched_count as f64);
+        ext_metrics.insert("total_yld_count".to_string(), sd.total_yld_count as f64);
+        ext_metrics.insert(
+            "total_sched_goidle".to_string(),
+            sd.total_sched_goidle as f64,
+        );
+        ext_metrics.insert("total_ttwu_count".to_string(), sd.total_ttwu_count as f64);
+        ext_metrics.insert("total_ttwu_local".to_string(), sd.total_ttwu_local as f64);
+        // Per-second Rate denominator: the schedstat-window span, co-inserted
+        // both-or-neither with the total_* numerators above so every *_per_sec
+        // schedstat Rate has its matching-window denominator present (the
+        // derive_rate_metrics num+den co-presence invariant; the same window the
+        // total_* deltas span, so num/den share a time base).
+        ext_metrics.insert(
+            "total_schedstat_wall_sec".to_string(),
+            sd.total_schedstat_wall_sec,
+        );
+    }
+    // Run-level ext-only monitor metrics (avg_nr_running + the PELT IRQ load
+    // pair + the PSI-irq pair), folded from the run's MonitorSummary. Inserted
+    // only when the run has monitor samples (a 0-sample run carries no
+    // occupancy / IRQ signal — absent, not a false 0.0); the IRQ fields insert
+    // only on Some (loud-absent on a kernel without the source). Shared with
+    // VmResult::run_metric via fold_run_level_ext so the key list + loud-absent
+    // guard can't drift between the sidecar row and the in-test accessor.
+    // Dynamic monotonic-counter ext keys (lb_*/alb_* schedstat deltas + any
+    // ScalarCounter bpf field) collected alongside the values so the cross-run
+    // fold SUM-folds them (they are not in the static METRICS registry, so
+    // metric_def can't classify them — see fold_ext_metrics).
+    let mut ext_counter_keys = BTreeSet::new();
+    if let Some(m) = sc.monitor.as_ref() {
+        m.fold_run_level_ext_with_counter_keys(&mut ext_metrics, &mut ext_counter_keys);
+    }
+
     GauntletRow {
         scenario: sc.test_name.clone(),
         topology: sc.topology.clone(),
@@ -1021,6 +1175,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         commit: sc.project_commit.clone(),
         kernel_commit: sc.kernel_commit.clone(),
         run_source: sc.run_source.clone(),
+        resolve_source: sc.resolve_source.clone(),
         // 0 = skip rows (never booted) -> None: skips carry no budget
         // identity, so they don't pair into a "budget 0" bucket.
         cpu_budget: (sc.cpu_budget != 0).then_some(sc.cpu_budget),
@@ -1028,6 +1183,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         passed: sc.is_pass(),
         skipped: sc.is_skip(),
         inconclusive: sc.is_inconclusive(),
+        expected_failure: sc.expected_failure,
         run_sample_count: sc.monitor.as_ref().map(|m| m.total_samples).unwrap_or(0),
         spread: finite_or_zero("spread", sc.stats.worst_spread),
         gap_ms: sc.stats.worst_gap_ms,
@@ -1059,43 +1215,15 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
             .map(|e| e.total_dispatch_keep_last)
             .unwrap_or(0),
         total_iterations: sc.stats.total_iterations,
-        page_locality: finite_or_zero("page_locality", sc.stats.worst_page_locality),
-        cross_node_migration_ratio: finite_or_zero(
-            "cross_node_migration_ratio",
-            sc.stats.worst_cross_node_migration_ratio,
-        ),
-        // Non-finite entries would also break `serde_json::to_string`,
-        // but the map shape makes "substitute 0.0" ambiguous (the entry
-        // might legitimately be 0.0 for a different scenario). Drop the
-        // entry entirely so the non-finite value can't be confused with
-        // a real zero datapoint.
-        //
-        // Also drop the walk-depth truncation sentinel
-        // [`crate::test_support::WALK_TRUNCATION_SENTINEL_NAME`]:
-        // it is diagnostic metadata from the JSON-walker depth cap,
-        // not a scenario metric, and must not participate in A/B
-        // comparison output.
-        ext_metrics: sc
-            .stats
-            .ext_metrics
-            .iter()
-            .filter_map(|(k, &v)| {
-                if crate::test_support::is_truncation_sentinel_name(k) {
-                    return None;
-                }
-                if v.is_finite() {
-                    Some((k.clone(), v))
-                } else {
-                    tracing::warn!(
-                        test = %sc.test_name,
-                        metric = %k,
-                        value = v,
-                        "dropping non-finite ext_metric; serde_json rejects NaN/Infinity",
-                    );
-                    None
-                }
-            })
-            .collect(),
+        // Built above: in-guest payload ext keys (non-finite values and
+        // the walk-truncation sentinel dropped — a dropped non-finite must
+        // not be confused with a real 0.0, and the sentinel is JSON-walker
+        // diagnostic metadata, not a scenario metric) plus the host-side
+        // monitor schedstat aggregates.
+        ext_metrics,
+        // Which of the Dynamic ext keys are monotonic counters (SUM-fold
+        // cross-run); empty when there is no monitor / no counter keys.
+        ext_counter_keys,
         // Carry per-phase buckets verbatim from the source
         // ScenarioStats. The bucket structure has already been
         // reduced by the host-side phase aggregator (Counter via

@@ -30,7 +30,7 @@ use crate::sync::MutexExt;
 /// per-request reply completion (an eventfd / mpsc receiver paired
 /// with the doorbell registration). The freeze coordinator's
 /// epoll loop wakes on the doorbell eventfd, reads the tag, runs
-/// `freeze_and_capture`, and signals the reply completion with
+/// `freeze_and_dispatch`, and signals the reply completion with
 /// the resulting `Option<FailureDumpReport>`.
 ///
 /// On-demand captures are orthogonal to the error-trigger
@@ -1092,7 +1092,7 @@ impl SnapshotBridge {
 
     /// Store a pre-built [`FailureDumpReport`] under `name`,
     /// bypassing the capture callback. Used by the host-side freeze
-    /// coordinator after it runs `freeze_and_capture(false)` and
+    /// coordinator after it runs `freeze_and_dispatch(FreezeMode::Capture { gate_on_exit_kind: false })` and
     /// wants to publish the resulting report on the bridge for the
     /// test author to drain post-VM-exit.
     ///

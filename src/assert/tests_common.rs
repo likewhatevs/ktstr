@@ -31,6 +31,8 @@ pub fn rpt(
         wake_sample_total: 0,
         iteration_costs_ns: vec![],
         iteration_cost_sample_total: 0,
+        timer_latencies_ns: vec![],
+        timer_sample_total: 0,
         iterations: 0,
         schedstat_run_delay_ns: 0,
         schedstat_run_count: 0,
@@ -43,6 +45,7 @@ pub fn rpt(
         group_idx: 0,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     }
 }
 
@@ -68,6 +71,8 @@ pub fn rpt_with_latencies(
         wake_sample_total: 0,
         iteration_costs_ns: vec![],
         iteration_cost_sample_total: 0,
+        timer_latencies_ns: vec![],
+        timer_sample_total: 0,
         iterations,
         schedstat_run_delay_ns: 0,
         schedstat_run_count: 0,
@@ -80,5 +85,6 @@ pub fn rpt_with_latencies(
         group_idx: 0,
         affinity_error: None,
         phase_slices: vec![],
+        taobench_whole: None,
     }
 }

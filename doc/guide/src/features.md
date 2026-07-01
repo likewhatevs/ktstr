@@ -13,7 +13,7 @@ examples.
 
 ktstr's runtime dispatches to per-kernel-version fallback paths for
 the watchdog timeout and event counters. CI explicitly exercises
-6.14 and 7.0 on both x86_64 and aarch64. On 7.1+ kernels the watchdog
+6.14 and 7.1 on both x86_64 and aarch64. On 7.1+ kernels the watchdog
 override uses `scx_sched.watchdog_timeout` via BTF detection;
 older kernels use the static `scx_watchdog_timeout` symbol.
 
@@ -329,7 +329,7 @@ cumulative worker iteration counts.
 <summary><b>Periodic capture + temporal assertions</b> — cadenced sampling across the workload window with monotonicity, rate, steady-state, convergence, and ratio patterns</summary>
 
 `#[ktstr_test(num_snapshots = N)]` fires `N` host-side
-`freeze_and_capture` boundaries inside the workload's 10 %–90 %
+`freeze_and_dispatch` boundaries inside the workload's 10 %–90 %
 window, anchored at the first `MSG_TYPE_SCENARIO_START`. Each
 capture is stored on the `SnapshotBridge` under `periodic_NNN`
 along with the parallel scx_stats JSON observed pre-freeze and a
@@ -422,8 +422,21 @@ that single-run assertions miss.
 - `total_migrations` / `worst_migration_ratio` — cross-CPU migration volume
 - `max_imbalance_ratio` — runqueue length imbalance
 - `worst_p99_wake_latency_us` — tail wake-to-run latency
-- `worst_mean_run_delay_us` — mean schedstat run delay
+- `worst_mean_run_delay_us` — workload-thread mean schedstat run delay
 - `total_iterations` — throughput
+- `total_run_delay_ns_per_sched` — system-wide per-schedule mean runqueue-wait
+  delay (duration-invariant; the all-task system-wide analog of
+  `worst_mean_run_delay_us`)
+- `ttwu_local_fraction` — wakeup locality (share of wakeups kept on the waking CPU)
+
+The system-wide schedstat metrics are read host-side from guest memory at
+freeze, so they add zero observer effect. Alongside the gated metrics above,
+the raw schedstat counters (`total_run_delay`, `total_pcount`,
+`total_ttwu_count`, `total_ttwu_local`, `total_sched_count`, `total_yld_count`,
+`total_sched_goidle`) are surfaced as directionless **informational** metrics —
+shown in comparisons for context but never gated (more wakeups or
+context-switches is neither inherently better nor worse). For the full registry,
+run `cargo ktstr stats list-metrics`.
 
 </details>
 

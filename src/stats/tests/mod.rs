@@ -12,9 +12,11 @@ fn make_row(scenario: &str, topo: &str, passed: bool, spread: f64) -> GauntletRo
         commit: None,
         kernel_commit: None,
         run_source: None,
+        resolve_source: None,
         skipped: false,
         passed,
         inconclusive: false,
+        expected_failure: false,
         run_sample_count: 0,
         spread,
         gap_ms: 50,
@@ -26,9 +28,8 @@ fn make_row(scenario: &str, topo: &str, passed: bool, spread: f64) -> GauntletRo
         fallback_count: 0,
         keep_last_count: 0,
         total_iterations: 0,
-        page_locality: 0.0,
-        cross_node_migration_ratio: 0.0,
         ext_metrics: BTreeMap::new(),
+        ext_counter_keys: BTreeSet::new(),
         phases: Vec::new(),
     }
 }
@@ -56,9 +57,11 @@ fn make_filter_row(
         commit: None,
         kernel_commit: None,
         run_source: None,
+        resolve_source: None,
         passed: true,
         skipped: false,
         inconclusive: false,
+        expected_failure: false,
         run_sample_count: 0,
         spread: 0.0,
         gap_ms: 0,
@@ -70,9 +73,8 @@ fn make_filter_row(
         fallback_count: 0,
         keep_last_count: 0,
         total_iterations: 0,
-        page_locality: 0.0,
-        cross_node_migration_ratio: 0.0,
         ext_metrics: BTreeMap::new(),
+        ext_counter_keys: BTreeSet::new(),
         phases: Vec::new(),
     }
 }
@@ -81,5 +83,6 @@ mod aggregation_and_analyze;
 mod compare_core;
 mod compare_phase;
 mod dims_pairing_runs;
+mod dynamic_counter_fold;
 mod rowfilter_and_group_avg;
 mod sidecar_and_metric_def;

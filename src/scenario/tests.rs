@@ -466,6 +466,7 @@ fn split_half_even() {
         wait_for_map_write: false,
         current_step: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         entry_name: None,
+        variant_hash: 0,
     };
     let (a, b) = split_half(&ctx);
     // Last CPU reserved for cgroup 0 → 7 usable, split 3/4
@@ -489,6 +490,7 @@ fn split_half_small() {
         wait_for_map_write: false,
         current_step: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         entry_name: None,
+        variant_hash: 0,
     };
     let (a, b) = split_half(&ctx);
     assert_eq!(a.len() + b.len(), 2);
@@ -510,6 +512,7 @@ fn dfl_wl_propagates_workers() {
         wait_for_map_write: false,
         current_step: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         entry_name: None,
+        variant_hash: 0,
     };
     let wl = dfl_wl(&ctx);
     assert_eq!(wl.num_workers, 7);
@@ -1574,11 +1577,14 @@ fn ctx_failure_dump_path_returns_sidecar_named_path() {
     let (cgroups, topo) = ctx_method_test_fixture();
     let ctx = Ctx::builder(&cgroups, &topo)
         .entry_name("ctx_method_fixture_test_fn")
+        .variant_hash(0xab)
         .build();
     let path = ctx
         .failure_dump_path()
         .expect("entry_name stamped → path derivation succeeds");
-    let suffix = "ctx_method_fixture_test_fn.failure-dump.json";
+    // The variant hash is embedded as the -{16-hex} suffix so a gauntlet
+    // test's per-preset dumps don't clobber.
+    let suffix = "ctx_method_fixture_test_fn-00000000000000ab.failure-dump.json";
     assert!(
         path.ends_with(suffix),
         "expected path to end with {suffix:?}; got {}",
@@ -1611,11 +1617,12 @@ fn ctx_wprof_pb_path_returns_sidecar_named_path() {
     let (cgroups, topo) = ctx_method_test_fixture();
     let ctx = Ctx::builder(&cgroups, &topo)
         .entry_name("ctx_method_fixture_wprof_fn")
+        .variant_hash(0xab)
         .build();
     let path = ctx
         .wprof_pb_path()
         .expect("entry_name stamped → path derivation succeeds");
-    let suffix = "ctx_method_fixture_wprof_fn.wprof.pb";
+    let suffix = "ctx_method_fixture_wprof_fn-00000000000000ab.wprof.pb";
     assert!(
         path.ends_with(suffix),
         "expected path to end with {suffix:?}; got {}",
@@ -1642,11 +1649,12 @@ fn ctx_repro_wprof_pb_path_returns_sidecar_named_path() {
     let (cgroups, topo) = ctx_method_test_fixture();
     let ctx = Ctx::builder(&cgroups, &topo)
         .entry_name("ctx_method_fixture_repro_fn")
+        .variant_hash(0xab)
         .build();
     let path = ctx
         .repro_wprof_pb_path()
         .expect("entry_name stamped → path derivation succeeds");
-    let suffix = "ctx_method_fixture_repro_fn.repro.wprof.pb";
+    let suffix = "ctx_method_fixture_repro_fn-00000000000000ab.repro.wprof.pb";
     assert!(
         path.ends_with(suffix),
         "expected path to end with {suffix:?}; got {}",
