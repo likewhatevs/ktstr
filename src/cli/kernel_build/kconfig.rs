@@ -444,15 +444,6 @@ const VALIDATE_CONFIG_CRITICAL: &[(&str, &str)] = &[
          every PCI device invisible instead of a clear build error",
     ),
     (
-        "CONFIG_PCI_MMCONFIG",
-        "backs ECAM (extended config space, reg >= 256) which the MCFG table and _SB.PCI0 DSDT \
-         window describe and the PCI enumeration e2e exercises (a host-bridge-class device is \
-         sized to 4096-byte config and read at reg 0x100 via ECAM). default-y on x86_64 when \
-         PCI + ACPI are set, but an --extra-kconfig that strips it would silently drop ECAM — \
-         base config still works over CAM, so the loss is invisible until an extended-config \
-         access (the e2e, or a future MSI-X device) fails",
-    ),
-    (
         "CONFIG_VIRTIO_PCI",
         "the guest virtio-PCI DRIVER that binds the virtio-net NIC (a PCI function). Without it \
          the guest enumerates the PCI device but no driver attaches, so eth* never appears and \
@@ -461,6 +452,36 @@ const VALIDATE_CONFIG_CRITICAL: &[(&str, &str)] = &[
          transport-agnostic net driver)",
     ),
 ];
+
+/// Critical `.config` options that exist only in `arch/x86` Kconfig, so they are
+/// required only when cargo-ktstr targets x86_64 (which builds an x86_64 kernel).
+///
+/// `CONFIG_PCI_MMCONFIG` (x86 MMCONFIG-based ECAM, `arch/x86/Kconfig`) has no
+/// arm64 counterpart — arm64 ECAM is `PCI_HOST_GENERIC` — so on an arm64 build
+/// `make` drops the unknown symbol and validating it would be a guaranteed false
+/// failure. `ktstr.kconfig` still requests it as `=y` (a no-op on arm64).
+#[cfg(target_arch = "x86_64")]
+const VALIDATE_CONFIG_CRITICAL_X86: &[(&str, &str)] = &[(
+    "CONFIG_PCI_MMCONFIG",
+    "backs ECAM (extended config space, reg >= 256) which the MCFG table and _SB.PCI0 DSDT \
+     window describe and the PCI enumeration e2e exercises (a host-bridge-class device is \
+     sized to 4096-byte config and read at reg 0x100 via ECAM). default-y on x86_64 when \
+     PCI + ACPI are set, but an --extra-kconfig that strips it would silently drop ECAM — \
+     base config still works over CAM, so the loss is invisible until an extended-config \
+     access (the e2e, or a future MSI-X device) fails",
+)];
+
+/// The critical `.config` options to validate for the arch that cargo-ktstr targets:
+/// the arch-neutral [`VALIDATE_CONFIG_CRITICAL`] plus, on x86_64, the x86-only
+/// [`VALIDATE_CONFIG_CRITICAL_X86`]. Single source of truth for both the
+/// post-build check and its tests, so the two never drift.
+fn critical_config_options() -> Vec<(&'static str, &'static str)> {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+    let mut opts = VALIDATE_CONFIG_CRITICAL.to_vec();
+    #[cfg(target_arch = "x86_64")]
+    opts.extend_from_slice(VALIDATE_CONFIG_CRITICAL_X86);
+    opts
+}
 
 /// Validate the output .config for critical options that the kconfig
 /// fragment requested but the kernel build system may have silently
@@ -488,7 +509,8 @@ pub fn validate_kernel_config(kernel_dir: &std::path::Path) -> Result<()> {
     let existing: std::collections::HashSet<&str> = config.lines().map(str::trim).collect();
 
     let mut missing = Vec::new();
-    for &(option, hint) in VALIDATE_CONFIG_CRITICAL {
+    let critical = critical_config_options();
+    for &(option, hint) in &critical {
         let enabled = format!("{option}=y");
         if !existing.contains(enabled.as_str()) {
             missing.push((option, hint));
@@ -525,7 +547,7 @@ mod tests {
     #[test]
     fn critical_options_are_in_embedded_kconfig() {
         let fragment = crate::EMBEDDED_KCONFIG;
-        for &(option, _) in VALIDATE_CONFIG_CRITICAL {
+        for &(option, _) in &critical_config_options() {
             let enabled = format!("{option}=y");
             assert!(
                 fragment.lines().any(|l| l.trim() == enabled),
@@ -542,7 +564,7 @@ mod tests {
         // Every critical option present => validation passes. Generated from
         // VALIDATE_CONFIG_CRITICAL (not a hand-picked subset) so the test stays
         // complete as the critical list grows.
-        let content: String = VALIDATE_CONFIG_CRITICAL
+        let content: String = critical_config_options()
             .iter()
             .map(|(option, _)| format!("{option}=y\n"))
             .collect();
@@ -598,7 +620,8 @@ mod tests {
         // hand-picked subset) so the test stays complete — and keeps testing
         // trim on the whole set — as the critical list grows.
         let mut content = String::new();
-        for (i, (option, _)) in VALIDATE_CONFIG_CRITICAL.iter().enumerate() {
+        let critical = critical_config_options();
+        for (i, (option, _)) in critical.iter().enumerate() {
             if i % 2 == 0 {
                 content.push_str(&format!("{option}=y\r\n")); // CRLF
             } else {
