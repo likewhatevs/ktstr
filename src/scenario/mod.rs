@@ -738,8 +738,8 @@ impl Ctx<'_> {
 
     /// Per-test wprof Perfetto-trace sidecar path. Mirror of
     /// [`Self::failure_dump_path`] for the wprof artifact —
-    /// derives `{sidecar_dir()}/{entry_name}.wprof.pb` from the
-    /// macro-stamped [`Self::entry_name`].
+    /// derives `{sidecar_dir()}/{entry_name}-{variant_hash:016x}.wprof.pb`
+    /// from the macro-stamped [`Self::entry_name`].
     ///
     /// Sibling to [`crate::vmm::VmResult::wprof_pb_path`] —
     /// the post-VM and pre-VM derivations produce identical paths.

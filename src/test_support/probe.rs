@@ -496,8 +496,15 @@ fn write_auto_repro_sidecar_artifacts(
             && bulk_entry.crc_ok
             && !bulk_entry.payload.is_empty()
         {
-            let wprof_path = crate::test_support::sidecar::sidecar_dir()
-                .join(format!("{}.repro.wprof.pb", entry.name));
+            // Variant-keyed name matching VmResult::repro_wprof_pb_path
+            // (the reader the expect_auto_repro inversion resolves).
+            // repro_result.variant_hash is stamped by attempt_auto_repro
+            // to the primary's host-authoritative hash; the
+            // writer==reader invariant is pinned by a regression test.
+            let wprof_path = crate::test_support::sidecar::sidecar_dir().join(format!(
+                "{}-{:016x}.repro.wprof.pb",
+                entry.name, repro_result.variant_hash
+            ));
             if let Err(e) = std::fs::create_dir_all(
                 wprof_path
                     .parent()
@@ -815,10 +822,25 @@ pub(crate) fn attempt_auto_repro(
     // backtrace), still boot the repro VM. The guest-side discover_bpf_symbols()
     // dynamically finds the scheduler's BPF programs. Pass a sentinel value
     // so extract_probe_stack_arg returns Some and the guest probe path activates.
+    // Host-authoritative variant hash (same entry + resolved topology +
+    // work_type as the primary VM → same hash). Threaded to the guest so
+    // its in-VM Ctx repro paths match the host's, AND stamped onto
+    // repro_result after the run (below) so the host-side repro sidecar
+    // writers and the expect_auto_repro inversion resolve the same
+    // `-{hash}` artifact names. resolve_vm_topology also runs inside
+    // build_repro_vm_builder; it is a pure deterministic fn of the same
+    // inputs, so the two computations agree.
+    let (vm_topology, _) = super::runtime::resolve_vm_topology(entry, topo);
+    let variant_hash = super::sidecar::variant_hash_from_parts(
+        entry,
+        &vm_topology,
+        &super::args::current_work_type(),
+    );
     let mut guest_args = vec![
         "run".to_string(),
         "--ktstr-test-fn".to_string(),
         entry.name.to_string(),
+        format!("--ktstr-variant-hash={variant_hash:016x}"),
     ];
     if !is_stall {
         let probe_arg = if func_names.is_empty() {
@@ -869,7 +891,7 @@ pub(crate) fn attempt_auto_repro(
     // wall time lives here; per-phase guest-side breakdown is emitted
     // by the probe pipeline inside the guest itself.
     let run_start = Instant::now();
-    let repro_result = match vm.run() {
+    let mut repro_result = match vm.run() {
         Ok(r) => r,
         Err(e) => {
             eprintln!("ktstr_test: auto-repro: VM run failed: {e:#}");
@@ -887,6 +909,14 @@ pub(crate) fn attempt_auto_repro(
         "auto_repro: vm_run",
     );
     drop(vm);
+
+    // Stamp the host-authoritative variant hash onto the repro result.
+    // vm.run() builds the VmResult entry-agnostic (variant_hash=0), just
+    // as the primary path does before the eval layer stamps it
+    // (eval/mod.rs). Without this the repro sidecar writers + the
+    // expect_auto_repro inversion would resolve `-0000000000000000`
+    // names while the artifact carries the real `-{hash}`.
+    repro_result.variant_hash = variant_hash;
 
     format_repro_output(
         entry,

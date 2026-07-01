@@ -2439,9 +2439,10 @@ fn wprof_frame(payload: &[u8], crc_ok: bool) -> crate::vmm::wire::ShmEntry {
     }
 }
 
-/// CRC-OK WprofTrace frame writes `${entry.name}.repro.wprof.pb`
-/// to sidecar_dir with the exact payload bytes. Pins the
-/// no-silent-drop contract on the wprof bulk-drain dispatch arm.
+/// CRC-OK WprofTrace frame writes
+/// `${entry.name}-${variant_hash:016x}.repro.wprof.pb` to sidecar_dir
+/// with the exact payload bytes. Pins the no-silent-drop contract on
+/// the wprof bulk-drain dispatch arm.
 #[test]
 fn write_auto_repro_sidecar_artifacts_writes_wprof_pb() {
     let _env_lock = crate::test_support::test_helpers::lock_env();
@@ -2456,7 +2457,7 @@ fn write_auto_repro_sidecar_artifacts_writes_wprof_pb() {
     write_auto_repro_sidecar_artifacts(&entry, &result);
     let pb = tmp
         .path()
-        .join("write_auto_repro_wprof_fixture.repro.wprof.pb");
+        .join("write_auto_repro_wprof_fixture-0000000000000000.repro.wprof.pb");
     assert!(pb.exists(), "expected wprof .pb at {}", pb.display());
     assert_eq!(
         std::fs::read(&pb).expect("read wprof .pb"),
@@ -2481,11 +2482,40 @@ fn write_auto_repro_sidecar_artifacts_skips_crc_bad_wprof() {
     write_auto_repro_sidecar_artifacts(&entry, &result);
     let pb = tmp
         .path()
-        .join("write_auto_repro_crc_bad_fixture.repro.wprof.pb");
+        .join("write_auto_repro_crc_bad_fixture-0000000000000000.repro.wprof.pb");
     assert!(
         !pb.exists(),
         "crc_ok=false WprofTrace must NOT produce a sidecar file at {}",
         pb.display(),
+    );
+}
+
+/// Regression pin: the writer's on-disk repro wprof name must equal
+/// `VmResult::repro_wprof_pb_path()` — the path the expect_auto_repro
+/// inversion resolves. The non-zero `variant_hash` proves the hash
+/// VALUE flows into the name, so a writer that drops or re-derives a
+/// diverging name (the bug this fix closed) fails here.
+#[cfg(feature = "wprof")]
+#[test]
+fn write_auto_repro_sidecar_artifacts_name_matches_resolver() {
+    let _env_lock = crate::test_support::test_helpers::lock_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _sidecar = crate::test_support::test_helpers::EnvVarGuard::set(
+        crate::KTSTR_SIDECAR_DIR_ENV,
+        tmp.path(),
+    );
+    let entry = crate::test_support::test_helpers::eevdf_entry("name_matches_resolver_fixture");
+    let result = crate::vmm::result::VmResult {
+        entry_name: Some("name_matches_resolver_fixture"),
+        variant_hash: 0xab,
+        ..vm_result_with_drain(vec![wprof_frame(b"\x0a\x02hi", true)])
+    };
+    write_auto_repro_sidecar_artifacts(&entry, &result);
+    let resolver_path = result.repro_wprof_pb_path().expect("resolve repro path");
+    assert!(
+        resolver_path.exists(),
+        "writer must write at the resolver path {} (writer==reader)",
+        resolver_path.display(),
     );
 }
 

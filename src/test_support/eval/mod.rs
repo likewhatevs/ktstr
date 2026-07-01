@@ -1055,8 +1055,13 @@ fn run_ktstr_test_inner_impl(
     #[cfg(feature = "wprof")]
     if entry.wprof {
         let sidecar = crate::test_support::sidecar_dir();
-        let _ = std::fs::remove_file(sidecar.join(format!("{}.wprof.pb", entry.name)));
-        let _ = std::fs::remove_file(sidecar.join(format!("{}.repro.wprof.pb", entry.name)));
+        let _ = std::fs::remove_file(
+            sidecar.join(format!("{}-{:016x}.wprof.pb", entry.name, variant_hash)),
+        );
+        let _ = std::fs::remove_file(sidecar.join(format!(
+            "{}-{:016x}.repro.wprof.pb",
+            entry.name, variant_hash
+        )));
     }
 
     let vm = match builder.build() {
@@ -1180,8 +1185,19 @@ fn run_ktstr_test_inner_impl(
                 && bulk_entry.crc_ok
                 && !bulk_entry.payload.is_empty()
             {
-                let wprof_path =
-                    crate::test_support::sidecar_dir().join(format!("{}.wprof.pb", entry.name));
+                // Resolve via the reader's path fn (VmResult::wprof_pb_path,
+                // which the primary .wprof.pb shape-check in result.rs also
+                // uses) so this authoritative pre-pass writer matches the
+                // reader by construction — no format! literal to drift. The
+                // eval layer stamped result.variant_hash above, so this
+                // resolves to the same `-{hash}` name variant_hash carries.
+                let wprof_path = match result.wprof_pb_path() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("ktstr_test: wprof pre-pass path unresolved: {e}");
+                        break;
+                    }
+                };
                 if let Err(e) = std::fs::create_dir_all(
                     wprof_path
                         .parent()
@@ -1321,8 +1337,17 @@ fn run_ktstr_test_inner_impl(
                     // the WprofTrace handling colocated with the
                     // rest of MsgType dispatch.
                     if bulk_entry.crc_ok && !bulk_entry.payload.is_empty() {
+                        // Keep this literal in sync with
+                        // VmResult::wprof_pb_path (the reader). This arm
+                        // shares the general bulk-drain dispatch and is NOT
+                        // #[cfg(wprof)]-gated, so it cannot call the
+                        // wprof-gated resolver like the pre-pass above does;
+                        // it is also a redundant idempotent rewrite of the
+                        // pre-pass file, so a drift here would only produce a
+                        // stray file — the reader resolves the pre-pass
+                        // writer's resolver-built name.
                         let wprof_path = crate::test_support::sidecar_dir()
-                            .join(format!("{}.wprof.pb", entry.name));
+                            .join(format!("{}-{:016x}.wprof.pb", entry.name, variant_hash));
                         if let Err(e) = std::fs::create_dir_all(
                             wprof_path
                                 .parent()

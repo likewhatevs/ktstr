@@ -814,12 +814,15 @@ fn failing_vm_result_with_name(name: &'static str) -> crate::vmm::VmResult {
 }
 
 #[cfg(feature = "wprof")]
-fn write_valid_repro_artifact(sidecar_dir: &std::path::Path, name: &str) {
+/// Write a shape-valid repro wprof `.pb` at the EXACT path the
+/// inversion resolves (`VmResult::repro_wprof_pb_path`), so the test's
+/// writer and the code-under-test's reader agree by construction — no
+/// hardcoded `{name}[-hash].repro.wprof.pb` literal to drift.
+fn write_valid_repro_artifact(path: &std::path::Path) {
     use crate::test_support::wprof::{PERFETTO_TRACE_PACKETS_TAG, WPROF_PB_MIN_BYTES};
     let mut bytes = vec![PERFETTO_TRACE_PACKETS_TAG];
     bytes.resize(WPROF_PB_MIN_BYTES, 0);
-    let path = sidecar_dir.join(format!("{name}.repro.wprof.pb"));
-    std::fs::write(&path, &bytes).expect("write valid repro artifact");
+    std::fs::write(path, &bytes).expect("write valid repro artifact");
 }
 
 #[cfg(feature = "wprof")]
@@ -833,8 +836,8 @@ fn apply_expect_auto_repro_inversion_no_op_when_attr_unset() {
     );
     let entry = sched_entry("attr_unset");
     assert!(!entry.expect_auto_repro, "fixture must leave attr false");
-    write_valid_repro_artifact(dir.path(), "attr_unset");
     let mut result = failing_vm_result_with_name("attr_unset");
+    write_valid_repro_artifact(&result.repro_wprof_pb_path().expect("resolve repro path"));
     apply_expect_auto_repro_inversion(&entry, &mut result);
     assert!(
         !result.expect_auto_repro_satisfied,
@@ -852,12 +855,12 @@ fn apply_expect_auto_repro_inversion_no_op_when_success_true() {
         dir.path().to_str().expect("utf8 tempdir"),
     );
     let entry = expect_auto_repro_entry("success_true");
-    write_valid_repro_artifact(dir.path(), "success_true");
     let mut result = crate::vmm::VmResult {
         success: true,
         entry_name: Some("success_true"),
         ..crate::vmm::VmResult::test_fixture()
     };
+    write_valid_repro_artifact(&result.repro_wprof_pb_path().expect("resolve repro path"));
     apply_expect_auto_repro_inversion(&entry, &mut result);
     assert!(
         !result.expect_auto_repro_satisfied,
@@ -916,11 +919,14 @@ fn apply_expect_auto_repro_inversion_no_op_when_artifact_truncated() {
         dir.path().to_str().expect("utf8 tempdir"),
     );
     let entry = expect_auto_repro_entry("artifact_truncated");
+    let mut result = failing_vm_result_with_name("artifact_truncated");
     let mut bytes = vec![PERFETTO_TRACE_PACKETS_TAG];
     bytes.resize(WPROF_PB_MIN_BYTES - 1, 0);
-    std::fs::write(dir.path().join("artifact_truncated.repro.wprof.pb"), &bytes)
-        .expect("write truncated artifact");
-    let mut result = failing_vm_result_with_name("artifact_truncated");
+    std::fs::write(
+        result.repro_wprof_pb_path().expect("resolve repro path"),
+        &bytes,
+    )
+    .expect("write truncated artifact");
     apply_expect_auto_repro_inversion(&entry, &mut result);
     assert!(
         !result.expect_auto_repro_satisfied,
@@ -939,11 +945,14 @@ fn apply_expect_auto_repro_inversion_no_op_when_artifact_wrong_tag() {
         dir.path().to_str().expect("utf8 tempdir"),
     );
     let entry = expect_auto_repro_entry("artifact_wrong_tag");
+    let mut result = failing_vm_result_with_name("artifact_wrong_tag");
     let mut bytes = vec![0xff]; // any byte != PERFETTO_TRACE_PACKETS_TAG
     bytes.resize(WPROF_PB_MIN_BYTES, 0);
-    std::fs::write(dir.path().join("artifact_wrong_tag.repro.wprof.pb"), &bytes)
-        .expect("write wrong-tag artifact");
-    let mut result = failing_vm_result_with_name("artifact_wrong_tag");
+    std::fs::write(
+        result.repro_wprof_pb_path().expect("resolve repro path"),
+        &bytes,
+    )
+    .expect("write wrong-tag artifact");
     apply_expect_auto_repro_inversion(&entry, &mut result);
     assert!(
         !result.expect_auto_repro_satisfied,
@@ -961,8 +970,8 @@ fn apply_expect_auto_repro_inversion_sets_field_on_valid_artifact() {
         dir.path().to_str().expect("utf8 tempdir"),
     );
     let entry = expect_auto_repro_entry("valid_artifact");
-    write_valid_repro_artifact(dir.path(), "valid_artifact");
     let mut result = failing_vm_result_with_name("valid_artifact");
+    write_valid_repro_artifact(&result.repro_wprof_pb_path().expect("resolve repro path"));
     apply_expect_auto_repro_inversion(&entry, &mut result);
     assert!(
         result.expect_auto_repro_satisfied,

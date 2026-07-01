@@ -1157,7 +1157,7 @@ impl VmResult {
     }
 
     /// Per-test sidecar path for the `.wprof.pb` artifact:
-    /// `{sidecar_dir()}/{entry_name}.wprof.pb`.
+    /// `{sidecar_dir()}/{entry_name}-{variant_hash:016x}.wprof.pb`.
     #[cfg(feature = "wprof")]
     pub fn wprof_pb_path(&self) -> anyhow::Result<std::path::PathBuf> {
         let name = self.entry_name.ok_or_else(|| {

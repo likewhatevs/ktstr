@@ -1358,9 +1358,9 @@ pub(crate) struct FailedTest {
     /// this test, sorted — one per gauntlet variant (distinct
     /// variant hashes coexist). Empty for a dump-only failure.
     pub(crate) stats_sidecars: Vec<PathBuf>,
-    /// `{test}.wprof.pb`.
+    /// `{test}-{variant_hash}.wprof.pb`.
     pub(crate) wprof: Option<PathBuf>,
-    /// `{test}.repro.wprof.pb` (auto-repro retry).
+    /// `{test}-{variant_hash}.repro.wprof.pb` (auto-repro retry).
     pub(crate) repro_wprof: Option<PathBuf>,
     /// True when ANY of this test's variant sidecars is `is_fail()`,
     /// so `cargo ktstr replay --filter <name>` (which selects from

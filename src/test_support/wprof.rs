@@ -7,7 +7,10 @@
 //! host-side dispatch arm in
 //! `test_support::eval::run_ktstr_test_inner`'s wprof handler writes
 //! a `.wprof.pb` file per test run under
-//! `{sidecar_dir()}/{test_name}.wprof.pb`.
+//! `{sidecar_dir()}/{test_name}-{variant_hash:016x}.wprof.pb` — the
+//! variant hash keys the artifact to the resolved variant so sibling
+//! gauntlet presets of the same test do not clobber each other (same
+//! convention as the `.repro.failure-dump.json` sidecar).
 //!
 //! Assertions on the `.pb` MUST run host-side via the
 //! `#[ktstr_test(post_vm = ...)]` callback, NOT inside the guest
@@ -81,7 +84,8 @@ pub fn assert_wprof_pb_shape(path: &Path) -> anyhow::Result<()> {
              KtstrTestEntry::wprof → primary VM builder.wprof(Some(config)) \
              at src/test_support/eval/mod.rs → KTSTR_WPROF_ARGS cmdline → \
              guest spawn_wprof_if_configured → send_wprof_trace → host \
-             MsgType::WprofTrace arm → sidecar_dir.join(\"<name>.wprof.pb\")",
+             MsgType::WprofTrace arm → \
+             sidecar_dir.join(\"<name>-<variant_hash:016x>.wprof.pb\")",
             path.display(),
         )
     })?;
