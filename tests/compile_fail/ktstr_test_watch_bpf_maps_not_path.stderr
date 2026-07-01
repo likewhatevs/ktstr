@@ -1,0 +1,5 @@
+error: expected a WatchBpfMap path or [A, B] array for watch_bpf_maps (e.g. WATCH or [WATCH_A, WATCH_B])
+ --> tests/compile_fail/ktstr_test_watch_bpf_maps_not_path.rs:3:31
+  |
+3 | #[ktstr_test(watch_bpf_maps = 42)]
+  |                               ^^

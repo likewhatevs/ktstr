@@ -45,12 +45,12 @@ const KTSTR_SCHED: Scheduler =
 /// mean of the rising series). The resulting metric key is
 /// `<scheduler-obj>_<label>` = `bpf_bpf_alloc_count` (scx-ktstr's obj prefix is
 /// `bpf_bpf`, from its kernel-visible `bpf_bpf.bss` global-section map).
-const WATCH: &[&WatchBpfMap] = &[&WatchBpfMap::new(
+const WATCH: WatchBpfMap = WatchBpfMap::new(
     ".bss",
     "ktstr_alloc_count",
     BpfMapAgg::ScalarCounter,
     "alloc_count",
-)];
+);
 
 /// Host-side check that the watched `.bss` field surfaced as a run-level metric.
 fn assert_watch(result: &VmResult) -> Result<()> {

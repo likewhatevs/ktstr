@@ -1,4 +1,4 @@
-error: expected path for bpf_map_write (e.g. BPF_CRASH)
+error: expected a BpfMapWrite path or [A, B] array for bpf_map_write (e.g. BPF_CRASH or [WRITE_A, WRITE_B])
  --> tests/compile_fail/ktstr_test_bpf_map_write_not_path.rs:3:30
   |
 3 | #[ktstr_test(bpf_map_write = 42)]

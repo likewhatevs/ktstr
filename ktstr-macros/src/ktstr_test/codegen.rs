@@ -225,12 +225,13 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         _ => quote! { &[] },
     };
 
-    // `watch_bpf_maps = LAVD_LAT` where the const is already a
-    // `&[&WatchBpfMap]` slice — pass it through verbatim (unlike
-    // `bpf_map_write`, which borrows each declared const into a slice).
+    // `watch_bpf_maps = W` (one const) or `watch_bpf_maps = [W1, W2]`
+    // (several): each WatchBpfMap path is borrowed into a `&[&WatchBpfMap]`
+    // slice literal — the same single-or-array grammar as `bpf_map_write`,
+    // so the one-element case emits `&[&W]`.
     let watch_bpf_maps_tokens = match &watch_bpf_maps {
-        Some(p) => quote! { #p },
-        None => quote! { &[] },
+        Some(paths) if !paths.is_empty() => quote! { &[ #(&#paths),* ] },
+        _ => quote! { &[] },
     };
 
     // Emit `Option<&'static Payload>` for the primary payload. The

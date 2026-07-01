@@ -21,9 +21,8 @@ pub(crate) fn option_tokens<T: ToTokens>(opt: &Option<T>) -> proc_macro2::TokenS
 /// Extract a [`syn::Path`] from an attribute value, returning a focused
 /// error spanned to the offending expression when the user supplied
 /// something other than a path (an int, a string, an array, …).
-/// Collapses the seven `"scheduler" | "payload" | "bpf_map_write" |
-/// "watch_bpf_maps" | "post_vm" | "post_vm_unconditional" | "disk"` parse
-/// arms onto a single shape.
+/// Collapses the five `"scheduler" | "payload" | "post_vm" |
+/// "post_vm_unconditional" | "disk"` parse arms onto a single shape.
 fn expect_path_value(value: &syn::Expr, error_hint: &str) -> Result<syn::Path, syn::Error> {
     match value {
         syn::Expr::Path(ep) => Ok(ep.path.clone()),
@@ -57,11 +56,11 @@ fn expect_array_of_paths(
 
 /// Accept EITHER a single path (`A`) OR a `[A, B, ...]` array of paths,
 /// returning `Vec<syn::Path>` — a single path yields a one-element vec.
-/// Used by `bpf_map_write`, which may declare one const
-/// (`bpf_map_write = A`) or several (`bpf_map_write = [A, B]`); codegen
-/// wraps each entry in `&[&…]`, so the one-element vec reproduces the
-/// former single-const behaviour exactly. `error_hint` covers both the
-/// wrong top-level shape and a non-path array element.
+/// Used by `bpf_map_write` and `watch_bpf_maps`, each of which may
+/// declare one const (`= A`) or several (`= [A, B]`); codegen borrows
+/// each entry into `&[&…]`, so the one-element vec reproduces the former
+/// single-const behaviour exactly. `error_hint` covers both the wrong
+/// top-level shape and a non-path array element.
 fn expect_path_or_array_of_paths(
     value: &syn::Expr,
     error_hint: &str,
@@ -454,7 +453,7 @@ pub(crate) struct AttrValues {
     pub(crate) workloads: Option<Vec<syn::Path>>,
     pub(crate) staged_schedulers: Option<Vec<syn::Path>>,
     pub(crate) bpf_map_write: Option<Vec<syn::Path>>,
-    pub(crate) watch_bpf_maps: Option<syn::Path>,
+    pub(crate) watch_bpf_maps: Option<Vec<syn::Path>>,
     pub(crate) post_vm: Option<syn::Path>,
     pub(crate) post_vm_unconditional: Option<syn::Path>,
     pub(crate) disk: Option<syn::Path>,
@@ -1269,9 +1268,10 @@ pub(crate) fn ktstr_test_impl(
                         )?);
                     }
                     "watch_bpf_maps" => {
-                        attrs.watch_bpf_maps = Some(expect_path_value(
+                        attrs.watch_bpf_maps = Some(expect_path_or_array_of_paths(
                             value,
-                            "expected path to a &[&WatchBpfMap] for watch_bpf_maps",
+                            "expected a WatchBpfMap path or [A, B] array for \
+                             watch_bpf_maps (e.g. WATCH or [WATCH_A, WATCH_B])",
                         )?);
                     }
                     "post_vm" => {
