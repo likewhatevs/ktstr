@@ -344,11 +344,28 @@ pub(crate) fn ktstr_guest_init() -> ! {
             // convert \n to \r\n. Without this, every newline in
             // command output gains a spurious \r visible to the host.
             let stdout_fd = unsafe { BorrowedFd::borrow_raw(1) };
-            if let Ok(mut termios) = tcgetattr(stdout_fd) {
-                termios
-                    .output_flags
-                    .remove(nix::sys::termios::OutputFlags::OPOST);
-                let _ = tcsetattr(stdout_fd, SetArg::TCSANOW, &termios);
+            // A tcgetattr/tcsetattr failure is logged rather than
+            // swallowed: without OPOST cleared, every newline gains a
+            // spurious carriage return visible to the host, with no
+            // other signal for the cause.
+            match tcgetattr(stdout_fd) {
+                Ok(mut termios) => {
+                    termios
+                        .output_flags
+                        .remove(nix::sys::termios::OutputFlags::OPOST);
+                    if let Err(e) = tcsetattr(stdout_fd, SetArg::TCSANOW, &termios) {
+                        tracing::warn!(
+                            err = %e,
+                            "ktstr-init: shell-exec stdout OPOST-disable tcsetattr \
+                             failed; newlines may gain a spurious carriage return"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    err = %e,
+                    "ktstr-init: shell-exec stdout tcgetattr failed; skipping OPOST \
+                     disable (newlines may gain a spurious carriage return)"
+                ),
             }
             // [`with_sigchld_default`] flips SIGCHLD to SIG_DFL
             // for the closure body so `Command::status()` (which

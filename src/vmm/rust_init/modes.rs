@@ -523,9 +523,26 @@ pub(crate) fn spawn_shell_with_pty() {
     // characters like tab (0x09) are consumed by the line discipline
     // instead of being forwarded through the proxy to the PTY.
     let stdin_fd = unsafe { BorrowedFd::borrow_raw(0) };
-    if let Ok(mut termios) = tcgetattr(stdin_fd) {
-        cfmakeraw(&mut termios);
-        let _ = tcsetattr(stdin_fd, SetArg::TCSANOW, &termios);
+    // A tcgetattr/tcsetattr failure is logged rather than swallowed:
+    // without raw mode the line discipline consumes special chars (the
+    // degradation this setup prevents) with no other signal. Mirrors
+    // the logged hvc0 raw-mode setup in dump.rs.
+    match tcgetattr(stdin_fd) {
+        Ok(mut termios) => {
+            cfmakeraw(&mut termios);
+            if let Err(e) = tcsetattr(stdin_fd, SetArg::TCSANOW, &termios) {
+                tracing::warn!(
+                    err = %e,
+                    "ktstr-init: COM2 raw-mode tcsetattr failed; line discipline \
+                     may consume special chars instead of forwarding to the PTY"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            err = %e,
+            "ktstr-init: COM2 raw-mode tcgetattr failed; skipping raw-mode setup \
+             (line discipline may consume special chars)"
+        ),
     }
 
     // Proxy between COM2 (fd 0 for input, fd 1 for output) and PTY master.
