@@ -196,8 +196,8 @@ pub fn is_kernel_unavailable(e: &anyhow::Error) -> bool {
 ///
 /// `pub(crate)` because every consumer (this module, the
 /// production parser at [`parse_kernel_list`], and the encoder
-/// helpers in `cargo-ktstr` that thread labels through
-/// `parse_kernel_list`) lives inside the workspace; no external
+/// helpers in `cargo-ktstr` that emit the wire format
+/// `parse_kernel_list` decodes) lives inside the workspace; no external
 /// surface is needed today. If a future external consumer needs
 /// to construct a `SanitizedKernelLabel` directly, expose
 /// `Self::new` as `pub` then — but the private inner stays a
@@ -1058,7 +1058,7 @@ fn ok_to_exit_code(r: AssertResult, expect_err: bool, allow_inconclusive: bool) 
     // detects the HostSkipRequest marker, reports via report::test_skip,
     // and returns Ok(AssertResult::skip) → this guard maps it to
     // EXIT_PASS. is_skip() is true only when `outcomes` is non-empty and
-    // every outcome is Outcome::Skip (assert/mod.rs); the empty-outcomes
+    // every outcome is Outcome::Skip (assert/plan.rs); the empty-outcomes
     // Pass identity has is_skip()==false and falls through to the
     // trailing `EXIT_PASS`.
     if r.is_skip() {
@@ -1694,7 +1694,7 @@ fn list_tests_all(ignored_only: bool) {
 ///   `[6.14, 6.16]` inclusive.
 /// - [`crate::kernel_path::KernelId::Path`] / [`crate::kernel_path::KernelId::CacheKey`] / [`crate::kernel_path::KernelId::Git`]:
 ///   sanitized-label equality — the producer-side encoder
-///   (`cargo_ktstr/kernel/wire_format.rs`) emits a deterministic
+///   (`src/bin/cargo_ktstr/kernel/wire_format.rs`) emits a deterministic
 ///   label per variant (`path_…`, `git_owner_repo_ref`, version
 ///   prefix from cache key), so identical specs on both sides
 ///   produce identical sanitized labels.
@@ -2429,9 +2429,10 @@ fn run_host_only_test_inner(entry: &KtstrTestEntry) -> Result<AssertResult> {
 /// env-override path and `build_host_cgroup_manager` for the
 /// cgroup-v2 Mode B/C delegation wire-up.
 ///
-/// `pub` so integration tests can pin against it instead of mirroring
-/// the literal in their own assertion strings (tests/host_mode_e2e.rs
-/// uses this to assert the resolve cascade's fallback). Treat as the
+/// `pub` so tests can pin against it instead of mirroring
+/// the literal in their own assertion strings (the
+/// `resolve_host_cgroup_parent_*` unit tests in `dispatch_tests.rs`
+/// assert unset/empty env falls back to this const). Treat as the
 /// canonical default — operators set `KTSTR_HOST_CGROUP_PARENT` to
 /// override.
 pub const DEFAULT_HOST_CGROUP_PARENT: &str = "/sys/fs/cgroup/ktstr";

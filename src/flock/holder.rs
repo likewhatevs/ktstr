@@ -5,7 +5,8 @@
 //!  - [`holder_info_for_pid`] — read `/proc/{pid}/cmdline`, shape it
 //!    for a [`super::HolderInfo`] (lossy UTF-8, `\0 → space`, truncate
 //!    to [`CMDLINE_MAX_CHARS`] with `…` suffix). Missing /
-//!    permission-denied / racing /proc entries fall back to
+//!    permission-denied / racing /proc entries — and an empty
+//!    cmdline (kernel threads) — fall back to
 //!    `"<cmdline unavailable>"` so the PID still surfaces.
 //!  - [`format_holder_list`] — render a `&[HolderInfo]` for inclusion
 //!    in an operator-facing error string. Empty list yields the
@@ -15,8 +16,9 @@
 
 use super::HolderInfo;
 
-/// Cmdline truncation limit. Matches the 100-char cap shared with the
-/// rest of the crate's user-facing diagnostic output.
+/// Cmdline truncation limit: 100 chars, so a rendered holder line
+/// stays single-line. Referenced by `HolderInfo`'s doc in
+/// [`super::HolderInfo`].
 const CMDLINE_MAX_CHARS: usize = 100;
 
 /// Diagnostic text for lock-holder error messages when /proc/locks
@@ -29,8 +31,9 @@ pub(crate) const NO_HOLDERS_RECORDED: &str = "<none recorded>";
 /// Read and shape `/proc/{pid}/cmdline` for a [`HolderInfo`].
 /// `\0` → ` `, lossy UTF-8, truncated to [`CMDLINE_MAX_CHARS`] with
 /// `…` suffix on overflow. Missing / racing / permission-denied on
-/// `/proc/{pid}/cmdline` produces `"<cmdline unavailable>"` — the
-/// pid still carries diagnostic value even without the command.
+/// `/proc/{pid}/cmdline` — and a successfully-read but empty cmdline
+/// (kernel threads) — produce `"<cmdline unavailable>"`; the pid
+/// still carries diagnostic value even without the command.
 pub(super) fn holder_info_for_pid(pid: u32) -> HolderInfo {
     let raw = match std::fs::read(format!("/proc/{pid}/cmdline")) {
         Ok(bytes) => bytes,

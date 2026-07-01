@@ -564,7 +564,7 @@ pub const MSG_TYPE_SCHED_LOG: u32 = 0x5343_4c47; // "SCLG"
 /// `SCHEDULER_NOT_ATTACHED` sentinel strings.
 pub const MSG_TYPE_LIFECYCLE: u32 = 0x4c49_4645; // "LIFE"
 
-/// Guest→host kernel address parameters (payload: 16 bytes LE).
+/// Guest→host kernel address parameters (payload: 24 bytes LE).
 ///
 /// Sent BEFORE `MSG_TYPE_SYS_RDY` so the monitor has `phys_base`
 /// and `page_offset_base` before its first sample iteration.
@@ -620,8 +620,9 @@ pub struct KernAddrs {
     /// Symbol KVA of the guest's `page_offset_base` global (NOT the
     /// runtime value the symbol points at — host dereferences via
     /// `monitor::symbols::text_kva_to_pa_with_base` + `read_u64` once
-    /// it has `phys_base` resolved). Populated by
-    /// `vmm::rust_init::build_kern_addrs` reading `/proc/kallsyms`.
+    /// it has `phys_base` resolved). Read by
+    /// `crate::vmm::guest_comms::read_kernel_page_offset_base_from_kallsyms`
+    /// (called from `vmm::rust_init::init`) from `/proc/kallsyms`.
     /// Storage class: `.data..ro_after_init` per
     /// `arch/x86/kernel/head64.c:63` — written during
     /// `kernel_randomize_memory()` in `start_kernel`, frozen after
@@ -1142,7 +1143,7 @@ pub enum KernelOpTarget {
     /// sleeping tasks (which is our validation gate). TaskField
     /// rejects non-SCX tasks before reaching this field anyway.
     ///
-    /// Seven-layer task validation before any write/read lands:
+    /// Eight-layer task validation before any write/read lands:
     /// 1. `task->pid == requested_pid` (anti-mismatch),
     /// 2. `task->start_time` within
     ///    `[expected_start_time_ns, expected_start_time_ns + 10ms)`
@@ -1159,14 +1160,14 @@ pub enum KernelOpTarget {
     ///    `include/linux/sched/ext.h:227`),
     /// 6. `task->sched_class == &ext_sched_class` (the canonical
     ///    SCX-managed gate),
-    /// 7. `task->start_boottime != 0` (anti-slab-recycle: a
+    /// 7. (REMOVED) a former `task->policy == SCHED_EXT` gate: SCX
+    ///    claims fair-policy tasks via `sched_class` without changing
+    ///    `task->policy`, so a policy check would wrongly reject
+    ///    SCX-managed tasks that forked under `SCHED_NORMAL`. The
+    ///    number is kept so the surviving gates retain their labels.
+    /// 8. `task->start_boottime != 0` (anti-slab-recycle: a
     ///    freshly-zeroed slab page reads zero; live tasks have this
     ///    set to non-zero `ktime_get_boottime_ns()` at fork).
-    ///
-    /// (A former `task->policy == SCHED_EXT` gate was removed: SCX
-    /// claims fair-policy tasks via `sched_class` without changing
-    /// `task->policy`, so a policy check would wrongly reject
-    /// SCX-managed tasks that forked under `SCHED_NORMAL`.)
     TaskField {
         /// Guest-side PID of the target task. Both leaders and
         /// non-leader threads are addressable via the dispatcher's

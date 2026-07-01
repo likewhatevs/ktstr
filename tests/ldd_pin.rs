@@ -149,7 +149,7 @@ fn ktstr_binary_dynamic_deps_pinned() {
     // Harden the libgcc_s check: the presence gate above proves
     // the NAME appears somewhere in the ldd output, but NOT that
     // the dynamic loader actually resolved it to a real file. An
-    // ldd line shaped `libgcc_s.so.1 => not found (0x0)` would
+    // ldd line shaped `libgcc_s.so.1 => not found` would
     // satisfy `contains("libgcc_s.so")` yet crash at runtime on
     // the first unwind. Pin the `=>` resolution form AND verify
     // the resolved path exists as a regular file on disk — belt

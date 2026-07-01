@@ -34,21 +34,6 @@ pub struct PayloadTypeChoice {
 ///   3. No match or still ambiguous → return 0 to fall back to a hex
 ///      dump.
 ///
-/// `base_btf` is the optional base BTF (vmlinux for split program
-/// BTFs) used to filter out base-BTF type ids from the candidate set.
-/// The program BTF the renderer threads in is built via
-/// [`btf_rs::Btf::from_split_bytes`] with vmlinux as base; the base's
-/// type ids occupy the low end of the id space (1..base_nr_types),
-/// and `Btf::resolve_type_by_id` walks them first. Without filtering,
-/// a vmlinux struct of the same byte size as the scheduler's payload
-/// (e.g. some `*_ctx` of size 16) can win the size-match step and
-/// then propagate the wrong layout into the renderer. btf-rs 1.1.1
-/// does not expose `base_nr_types()` directly, so the filter resolves
-/// each candidate id in `base_btf` and excludes it when the
-/// resolution succeeds — base-resolvable ids are by definition base
-/// types. `None` skips the filter (test BTFs without a base, or
-/// callers that genuinely want every match).
-///
 /// The function is intentionally conservative: a wrong type id renders
 /// nonsense field names; falling back to hex always shows the operator
 /// raw bytes they can decode by hand. The returned reason string is
@@ -68,8 +53,11 @@ pub fn discover_payload_btf_id(
     }
     let mut size_matches: Vec<(u32, String)> = Vec::new();
 
-    // btf-rs 1.1.1 has no public "list all types" iterator, so probe
-    // ids 1..N. BTF type ids are dense within a single object's BTF
+    // btf-rs 2.0.0 exposes `Btf::type_iter()`, but we keep the
+    // explicit id-probe loop because it lets us early-bail on a run
+    // of consecutive lookup failures rather than materializing the
+    // whole type table. Probe ids 1..N. BTF type ids are dense
+    // within a single object's BTF
     // section (libbpf assigns them sequentially during compile), and
     // for split BTF the program-BTF ids start at `base_nr_types + 1`
     // contiguously. A run of CONSECUTIVE_FAIL_CAP failed lookups
@@ -95,16 +83,6 @@ pub fn discover_payload_btf_id(
                     && let Ok(name) = btf.resolve_name(&s)
                     && !name.is_empty()
                 {
-                    // Base-BTF filter: exclude vmlinux structs from
-                    // the candidate set. The base BTF's
-                    // `resolve_type_by_id` succeeds only for ids it
-                    // owns (its own `obj` table — base-only BTFs
-                    // have `self.base = None`, so the lookup never
-                    // delegates further). A success here proves
-                    // the type lives in base BTF — drop it. `None`
-                    // (test fixtures without a base, or production
-                    // callers that pass `None`) keeps the full id
-                    // range.
                     size_matches.push((tid, name));
                 }
             }

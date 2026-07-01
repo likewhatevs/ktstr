@@ -3,7 +3,8 @@
 //!
 //! All `Display` impls for [`super::FailureDumpReport`],
 //! [`super::DualFailureDumpReport`], [`super::FailureDumpReportAny`],
-//! [`super::FailureDumpMap`], [`super::FailureDumpEntry`],
+//! [`super::DegradedFailureDumpReport`], [`super::FailureDumpMap`],
+//! [`super::FailureDumpEntry`],
 //! [`super::FailureDumpArrayEntry`], [`super::FailureDumpPercpuEntry`],
 //! and [`super::FailureDumpPercpuHashEntry`] live here so the type
 //! definitions in [`super`] stay focused on the data shape and the
@@ -810,7 +811,7 @@ impl std::fmt::Display for FailureDumpEntry {
     /// ```text
     /// entry: key=<rendered key>
     ///   value: <rendered value>
-    ///   payload TypeName:
+    ///   .data TypeName:
     ///     field=val   field=val   field=val
     /// ```
     ///
@@ -819,7 +820,7 @@ impl std::fmt::Display for FailureDumpEntry {
     /// in the dump output. `value:` is also a label introducing
     /// the rendered value (which carries its own `TypeName{...}`
     /// or breadcrumb form). The optional payload follows the
-    /// breadcrumb pattern: `payload <rendered>` where the value's
+    /// breadcrumb pattern: `.data <rendered>` where the value's
     /// own Type breadcrumb completes the line.
     ///
     /// The renderer is invoked with `depth = 1` for the value and
@@ -854,9 +855,9 @@ impl std::fmt::Display for FailureDumpEntry {
         // tid / tptr / data fields) and then the typed payload —
         // matching the order a kernel-side debugger would inspect:
         // chase the pointer, then read the dereferenced struct.
-        // The space after `payload` lets the rendered value's own
+        // The space after `.data` lets the rendered value's own
         // `TypeName:` breadcrumb (or inline `Type{...}` form) read
-        // as `payload TypeName:` on the same line.
+        // as `.data TypeName:` on the same line.
         if let Some(p) = &self.payload {
             f.write_str("\n  .data ")?;
             write_value_at_depth(f, p, 1)?;
@@ -1027,8 +1028,8 @@ impl std::fmt::Display for FailureDumpPercpuEntry {
             } else if cpus.windows(2).all(|w| w[1] == w[0] + 1) {
                 // Contiguity: every adjacent pair differs by 1.
                 // The endpoint-only `last - first + 1 == len` check
-                // would falsely accept e.g. [0, 2, 4, 6] (span 7,
-                // len 4 — never contiguous) if a duplicate or
+                // would falsely accept e.g. [0, 1, 1, 3] (span 4,
+                // len 4, yet non-contiguous) if a duplicate or
                 // gap somehow slipped past collection; `windows`
                 // is robust to construction errors.
                 format!("cpus {}-{}", cpus[0], cpus.last().unwrap())

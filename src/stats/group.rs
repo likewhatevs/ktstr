@@ -1047,8 +1047,9 @@ pub fn group_and_average_by(
 /// The 0.0 substitution is indistinguishable from a legitimate 0.0
 /// measurement for metrics whose natural zero carries its own signal.
 /// One direct f64 field is especially affected — note the in-tree producer
-/// already guards the typical divide-by-zero path (`assert.rs` emits
-/// `0.0` for migration_ratio when `total_iters == 0`), so a NaN reaching
+/// already guards the typical divide-by-zero path
+/// (`assert::reductions::migration_ratio_of` emits `0.0` for
+/// migration_ratio when `total_iterations == 0`), so a NaN reaching
 /// this boundary indicates an upstream producer outside that guard (e.g. an
 /// external `ext_metrics` contributor, or a schedstat arithmetic
 /// edge that slipped past a guard):
@@ -1118,13 +1119,16 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
     // summed across CPUs over the run). Keys ABSENT when CONFIG_SCHEDSTATS
     // is off (schedstat_deltas == None): absent != 0 for a no-data run, and
     // a 0 would pollute the cross-run Counter SUM and the Rate denominators
-    // (`total_run_delay_ns_per_sched`, `ttwu_local_fraction`). All seven
+    // (`total_pcount`, `total_ttwu_count`). All seven
     // insert under one `if let` so each Rate's numerator/denominator pair is
     // always co-present (derive_rate_metrics needs both). `u64 -> f64` is
     // exact below 2^53 and inherently finite, so these skip the finite
     // filter the payload keys go through. The registry entries are
-    // `Polarity::Informational` (raw counts) + two `MetricKind::Rate`
-    // derivations; see [`crate::stats::METRICS`].
+    // `Polarity::Informational` Counter raw components that feed nine
+    // `MetricKind::Rate` derivations (per-schedule: total_run_delay_ns_per_sched,
+    // ttwu_local_fraction, sched_goidle_fraction; per-second: run_delay_per_sec,
+    // pcount_per_sec, sched_count_per_sec, yld_count_per_sec, ttwu_count_per_sec,
+    // sched_goidle_per_sec); see [`crate::stats::METRICS`].
     if let Some(sd) = sc
         .monitor
         .as_ref()

@@ -61,10 +61,10 @@ pub(super) enum WatchpointPublishResult {
     PublishDeferred { exit_kind_kva: u64 },
 }
 
-/// Read `*scx_root` via `mem.read_u64(root_pa, 0)` and drive the
-/// watchpoint publish state machine. Pure function over
-/// `last_sched_kva` and the resolved `sched_kva` — the caller owns
-/// the cache and the read.
+/// Drive the watchpoint publish state machine over the resolved
+/// `sched_kva` (= `*scx_root`, read by the caller). Pure function
+/// over `last_sched_kva` and the resolved `sched_kva` — the caller
+/// owns the cache and the read.
 ///
 /// # Store ordering
 ///
@@ -88,7 +88,7 @@ pub(super) enum WatchpointPublishResult {
 /// !=B)` and returns [`WatchpointPublishResult::RebindDisarmed`] —
 /// caller resets cache to 0 but DOES NOT publish B. Tick N+1
 /// observes `sched_kva = B` with `last_sched_kva = 0` and falls
-/// into the fresh-attach `Published` arm. The 100 ms scan interval
+/// into the fresh-attach `Published` arm. The 250 ms scan interval
 /// is much larger than worst-case KVM_RUN slice, so every vCPU has
 /// re-armed (or at least exited and re-entered KVM_RUN) by the
 /// next tick — DR0 is cleared before B is published.
@@ -142,9 +142,10 @@ pub(super) fn republish_watchpoint_on_rebind(
     // 0 → non-zero: fresh attach (or post-rebind republish).
     // exit_kind field KVA = base of scx_sched (vmalloc/slab) +
     // BTF-resolved field offset. The kernel writes a 4-byte
-    // atomic_t at this address via `atomic_set` in scx_exit; the
-    // hardware watchpoint catches every such write regardless of
-    // the SCX_EXIT_* class.
+    // atomic_t at this address via `atomic_try_cmpxchg` in
+    // scx_claim_exit (error classes) / scx_disable_workfn
+    // (SCX_EXIT_DONE); the hardware watchpoint catches every such
+    // write regardless of the SCX_EXIT_* class.
     let exit_kind_kva = sched_kva.wrapping_add(exit_kind_offset as u64);
     // Translate the field's KVA to a host pointer so the vCPU
     // thread can `read_volatile` the post-store value at fire time

@@ -220,8 +220,9 @@ mod tests {
         // without holding the mutex (the pre-fix debug_assert bug in
         // release builds), concurrent increments would race and the
         // final count would be < 10_000. The unconditional assert
-        // panics on lock failure and the abort() in Drop panics on
-        // unlock failure, so any guard-violation surfaces loudly.
+        // panics on lock failure and the abort() in Drop terminates
+        // the process (SIGABRT) on unlock failure, so any
+        // guard-violation surfaces loudly.
         let m = Arc::new(PiMutex::new(0u64));
         let threads: Vec<_> = (0..10)
             .map(|_| {

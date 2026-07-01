@@ -62,10 +62,10 @@ fn probe_summary_dominant_tag_picks_highest_count() {
 /// comparison at all.
 ///
 /// Also covers `readlink-failure` symmetrically — both
-/// non-actionable attach tags are filtered, only one is in
-/// the production code's matches! arm but the test doubles
-/// up to keep the contract from quietly degrading to "only
-/// jemalloc-not-found is filtered."
+/// non-actionable attach tags are named in the production
+/// `matches!` arm; the test doubles up to keep the contract
+/// from quietly degrading to "only jemalloc-not-found is
+/// filtered."
 #[test]
 fn probe_summary_dominant_tag_filters_non_actionable_attach_tags() {
     // jemalloc-not-found dominates by count but is filtered.

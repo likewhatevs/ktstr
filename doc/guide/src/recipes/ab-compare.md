@@ -121,8 +121,9 @@ without any per-run directory bookkeeping.
 Use
 `cargo ktstr stats list-values --dir DIR` to enumerate the
 distinct values of every filterable dimension (`kernel`,
-`commit`, `kernel_commit`, `source`, `scheduler`, `topology`,
-`work_type`) present in the pool, so per-side filters target
+`commit`, `kernel_commit`, `source`, `resolve_source`,
+`cpu_budget`, `scheduler`, `topology`, `work_type`) present in the
+pool, so per-side filters target
 real values. The `commit` and `source` keys map to the
 internal `SidecarResult::project_commit` / `run_source` fields;
 the per-side filter flags spell as `--a-project-commit` /
@@ -154,7 +155,7 @@ dimension is part of the dynamic *pairing key* the comparison
 joins on. Slicing on `project-commit` alone joins each
 baseline scenario with its matching experimental counterpart
 on every other dimension (kernel, kernel-commit, run-source,
-scheduler, topology, work_type).
+resolve-source, cpu-budget, scheduler, topology, work_type).
 
 Other slicing axes work the same way:
 

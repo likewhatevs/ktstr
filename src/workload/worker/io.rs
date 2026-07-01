@@ -130,9 +130,9 @@ impl DirectIoBuf {
     }
 
     /// Raw pointer to the buffer head. Used as the `pread`/`pwrite`
-    /// `buf` argument. Returns `*mut u8` because the `pwrite` call
-    /// site needs `*mut c_void` cast and `pread` needs the same
-    /// — matches `NonNull::as_ptr` convention.
+    /// `buf` argument. Returns `*mut u8` because the `pread` call
+    /// site needs a `*mut c_void` cast; `pwrite` down-casts the same
+    /// pointer to `*const c_void` — matches `NonNull::as_ptr` convention.
     pub(super) fn as_ptr(&self) -> *mut u8 {
         self.ptr.as_ptr()
     }
@@ -196,8 +196,9 @@ pub(super) fn open_io_backing(extra_flags: libc::c_int, tid: libc::pid_t) -> Opt
         .to_string();
     // One-shot per-worker warn that the fallback path is in use.
     // The `tracing` crate has no `warn_once!` macro, so the
-    // codebase's idiom (also used in `VirtioBlk::process_requests`
-    // for `mem_unset_warned`) is an `AtomicBool::swap(true)` guard
+    // codebase's idiom (also used for `mem_unset_warned` in the
+    // virtio-blk drain path — `drain_inline` in test, the worker
+    // loop in production) is an `AtomicBool::swap(true)` guard
     // around `tracing::warn!`. Each forked worker process gets its
     // own copy of this static at fork time, so the warn fires
     // exactly once per worker even though the function is called
@@ -305,9 +306,10 @@ pub(super) fn rand_io_offset(rng_state: &mut u64, capacity_bytes: u64) -> u64 {
 
 /// Compute the per-worker stripe base offset for sequential writes.
 /// `tid % IO_NUM_STRIPES` selects the stripe index; `stripe_size`
-/// is `capacity / IO_NUM_STRIPES`. Result is sector-aligned because
-/// `capacity` is a sector-aligned device size and the divisor is a
-/// power of 2.
+/// is `capacity / IO_NUM_STRIPES` masked down to a multiple of
+/// `IO_SECTOR_SIZE` (`& !(IO_SECTOR_SIZE - 1)`). Result is
+/// sector-aligned because `stripe_idx * stripe_size` is then a
+/// multiple of the sector size.
 pub(super) fn stripe_base(tid: libc::pid_t, capacity_bytes: u64) -> u64 {
     let stripe_size = (capacity_bytes / IO_NUM_STRIPES) & !(IO_SECTOR_SIZE - 1);
     let stripe_idx = (tid as u64) % IO_NUM_STRIPES;

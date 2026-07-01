@@ -1,5 +1,5 @@
-//! Reproducer for the sibling-reported scx_mitosis periodic-capture
-//! 0-fire bug. Sibling's claim: when a scheduler runs with
+//! Reproducer for a reported scx_mitosis periodic-capture
+//! 0-fire bug. The claim: when a scheduler runs with
 //! `--cell-parent-cgroup /path` in `sched_args` AND the test sets
 //! `workload_root_cgroup = "/path"` matching, periodic captures
 //! silently 0-fire even after the workload_root_cgroup + scheduler

@@ -130,9 +130,10 @@ The string passed to `Op::watch_snapshot` must match a vmlinux ELF
 symtab entry exactly; otherwise the step fails with
 `symbol '...' not found in vmlinux symtab`. The
 `register_watch` callback on a host-side test bridge can accept any
-shape it wants — the e2e tests in `tests/snapshot_e2e.rs` use
-`"kernel.a"` / `"kernel.b"` / etc. for the cap-enforcement test and
-`"exit_kind"` for the in-VM test — but the `Op::watch_snapshot` ops
+shape it wants — e.g. the host-side unit test in
+`src/scenario/snapshot/tests.rs` registers `"kernel.a"` / `"kernel.b"`,
+while the cap-enforcement e2e in `tests/snapshot_e2e.rs` uses `"sym_a"`
+/ `"sym_b"` / `"sym_c"` / `"sym_d"` — but the `Op::watch_snapshot` ops
 that flow through the production pipeline (in-VM scenarios with no
 host-side bridge override) must use a verbatim ELF symbol.
 
@@ -210,7 +211,7 @@ three remaining user slots after slot 0 is held back.
 
 For tests that want the failure dump produced by `SCX_EXIT_ERROR`,
 nothing needs to be declared; the trigger fires automatically and
-the dump is written to `{sidecar_dir()}/{test_name}.failure-dump.json`.
+the dump is written to `{sidecar_dir()}/{test_name}-{variant_hash:016x}.failure-dump.json`.
 The watch-snapshot in-VM test in `tests/snapshot_e2e.rs` reads that
 file back and feeds it through the [`Snapshot`] accessor as a way
 to demonstrate the full read path.

@@ -868,7 +868,9 @@ fn cast_chase_kernel_fwd_target_resolved_via_bridge() {
 /// header skip), renders the payload struct, and `cast_ptr` emits
 /// `cast_annotation: "cast→arena (sdt_alloc)"` because
 /// `outcome.sdt_alloc_resolved == true` for the deferred-resolve
-/// path (line ~3031 in `mod.rs`).
+/// path (`sdt_alloc_resolved: true` set in `chase_arena_pointer`
+/// at line ~4075, surfaced by the `cast_ptr` call in
+/// `render_cast_pointer`'s arena branch at line ~4358 in `mod.rs`).
 ///
 /// Pins the new STX-flow renderer path: a regression that broke
 /// the deferred-resolve special case would surface as either a
@@ -1271,7 +1273,7 @@ fn cast_chase_default_is_already_rendered_returns_false() {
 /// analyzer hinted Arena (the STX-flow sentinel only emits with
 /// `addr_space: Arena`) but the runtime value falls outside the
 /// arena window so `is_arena_addr` returns false and the kernel
-/// arm fires. The kernel arm's special case at line ~3390 of
+/// arm fires. The kernel arm's special case at line ~4385 of
 /// `mod.rs` recognises `target_type_id == 0` as the cgx-bridge
 /// sentinel and surfaces a skip reason explaining the
 /// analyzer/runtime mismatch — without a BTF id there is no way
@@ -1348,7 +1350,7 @@ fn cast_chase_kernel_target_type_id_zero_falls_through_with_mismatch_reason() {
          mismatch; got: {reason}",
     );
     // Kernel-arm path: `cast_ptr` is called with `sdt_alloc_resolved = false`
-    // (line ~3401 in mod.rs), so the annotation reflects the actual
+    // (line ~4395 in mod.rs), so the annotation reflects the actual
     // path taken (kernel) without the sdt_alloc suffix.
     assert_eq!(
         cast_annotation.as_deref(),
@@ -1654,7 +1656,9 @@ fn cross_btf_fwd_resolve_renders_cgx_body_through_sibling_btf() {
 /// sdt_alloc bridge dormant (no `arena_type_at` entry for the
 /// kernel value), `chase_arena_pointer` is NOT invoked but the
 /// kernel arm shares the same `try_cross_btf_fwd_resolve` shortcut
-/// (line ~3447 in `mod.rs`): a sibling BTF whose
+/// (reached via the kernel-arm `resolve_chase_target` call at line
+/// ~4405, which invokes `try_cross_btf_fwd_resolve` at line ~3632
+/// in `mod.rs`): a sibling BTF whose
 /// [`MemReader::cross_btf_resolve_fwd`] override matches the Fwd
 /// name surfaces the body, the kernel read fires against the
 /// sibling-BTF's resolved type id, and the rendered subtree
@@ -1742,9 +1746,11 @@ fn cast_chase_kernel_cross_btf_fwd_resolve_succeeds() {
     let btf_sib = Arc::new(Btf::from_bytes(&blob_sib).expect("sibling BTF parses"));
 
     // Kernel value outside any arena window — the dispatcher
-    // routes to the kernel arm. Use the kernel direct-map range
-    // so the plausibility-gate sanity holds (top byte 0xff would
-    // trigger the freed-slab heuristic).
+    // routes to the kernel arm. The direct-map KVA is chosen so
+    // `is_arena_addr` returns false; the plausibility gate passes
+    // because the read CONTENT's first qword (0xBEEF) has top byte
+    // 0x00, not because of the address (the gate inspects the read
+    // content, not the KVA).
     const KVA: u64 = 0xffff_8000_0001_2000;
     let outer_bytes = KVA.to_le_bytes().to_vec();
     // Sibling kern_target body: marker = 0xBEEF.

@@ -165,7 +165,7 @@ pub fn resolve_test_kernel() -> Result<PathBuf> {
 /// Returns `true` iff `rendered` contains BOTH `"timed out after"` and
 /// `"flock LOCK_"`. The two substrings together are the helper's
 /// internal contract for a flock-acquisition timeout — see
-/// `flock.rs`'s bail format
+/// `flock/acquire.rs`'s bail format
 /// `"flock {LOCK_EX|LOCK_SH} on {context} timed out after ..."`.
 ///
 /// Pinned via the unit test
@@ -228,9 +228,10 @@ pub(crate) fn acquire_test_kernel_lock_if_cached(
     };
     let resolved_root = match crate::cache::CacheDir::default_root() {
         Ok(p) => p,
-        // Cache root unresolvable (no HOME / no XDG / env points at a
-        // nonexistent path): no cache exists, so `kernel_path` cannot
-        // be an entry.
+        // Cache root unresolvable (no HOME and no XDG_CACHE_HOME, or
+        // non-UTF-8 KTSTR_CACHE_DIR): no cache exists, so `kernel_path`
+        // cannot be an entry. (A cache root that resolves but is absent
+        // on disk is handled by the canonicalize() arm below.)
         Err(_) => return Ok(None),
     };
     let resolved_root_canon = match resolved_root.canonicalize() {

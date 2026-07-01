@@ -24,7 +24,8 @@
 //!    rendered into [`AssertDetail::message`] match `stringify!` of
 //!    the input tokens.
 //! 3. `Verdict::into_result` produces an `AssertResult` whose
-//!    `passed`/`details` correctly reflect the claim outcomes — a
+//!    `outcomes` / `is_pass()` / `failure_details()` correctly reflect
+//!    the claim outcomes — a
 //!    failed verdict surfaces a detail naming the field via the
 //!    derive-generated `stringify!(field)` label, not a hand-typed
 //!    string.
@@ -142,7 +143,7 @@ fn verdict_failing_claims_label_with_stringify_tokens() {
     let mut v = Verdict::new();
 
     // Force a failure on the typed accessor route: ceiling far below
-    // any real wall_time_ns (a 150ms run is at least 100µs even on a
+    // any real wall_time_ns (a 200ms run is at least 100µs even on a
     // pathologically slow host). Detail message must contain
     // "wall_time_ns" -- the field name from `stringify!(wall_time_ns)`
     // in the derive-generated method body.

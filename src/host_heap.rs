@@ -308,7 +308,7 @@ pub fn collect() -> HostHeapState {
     // does not poison `arenas.narenas`. `arenas.narenas` is
     // initialized at jemalloc startup (typically `4 * ncpus`) and
     // always readable on a libjemalloc-linked build regardless of
-    // `--enable-stats`. `Option::from(r.ok())` lands Err as None.
+    // `--enable-stats`. `.ok().map(|v| v as _)` lands Err as None.
     let active_bytes = tikv_jemalloc_ctl::stats::active::read()
         .ok()
         .map(|v| v as u64);
@@ -508,8 +508,8 @@ mod tests {
     /// allocated`, `resident >= active`, `mapped >= active` all
     /// hold trivially (`0 >= 0`, small >= 0, small >= 0). They do
     /// NOT validate jemalloc behavior — they are tautologies.
-    /// Real invariant coverage lives in each shipped ktstr binary
-    /// (ktstr, cargo-ktstr, ktstr-jemalloc-probe), which inherit
+    /// Real invariant coverage lives in the shipped ktstr binaries
+    /// that link the ktstr library and so inherit
     /// `tikv_jemallocator::Jemalloc` as the `#[global_allocator]`
     /// from `src/lib.rs`; a
     /// live production run of any of those binaries exercises the

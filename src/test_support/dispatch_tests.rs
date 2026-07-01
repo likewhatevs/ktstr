@@ -418,7 +418,7 @@ fn host_capacity_returns_plausible_triple() {
 fn for_each_gauntlet_variant_skips_presets_exceeding_host_capacity() {
     // Pass host_cpus=1/host_llcs=1 against the preset list: every
     // current preset has total_cpus >= 4 (see `gauntlet_presets()`
-    // in src/vm.rs), so every preset fails
+    // in src/gauntlet.rs), so every preset fails
     // `TopologyConstraints::accepts` and `visit` must never be
     // called. Any entry works since the constraint check runs
     // before the visit — use the test dummy.

@@ -97,7 +97,7 @@ impl Filesystem {
     /// front:
     ///
     /// - `mkfs_binary_name` (here) — the `mkfs.<fstype>` binary name.
-    /// - `mkfs_package_hint` in `src/vmm/disk_template.rs` — the
+    /// - `mkfs_package_hint` in `src/vmm/disk_template/mod.rs` — the
     ///   distro-package hint surfaced in the "binary not found"
     ///   diagnostic (e.g. `btrfs-progs` for `Btrfs`), used by
     ///   [`crate::vmm::disk_template::locate_host_mkfs`].
@@ -219,8 +219,8 @@ impl Filesystem {
 /// # Constraint summary
 ///
 /// Both rules are enforced by [`DiskThrottle::validate`] (run by
-/// `crate::vmm::KtstrVmBuilder::build` before the backing file is
-/// allocated):
+/// `init_virtio_blk` and its x86 sibling
+/// `init_virtio_blk_pci` before the backing file is allocated):
 ///
 /// - `*_burst_capacity` must be `>= *_refill_rate` when both are
 ///   set; a capacity below the refill rate would silently cap the
@@ -731,7 +731,8 @@ impl DiskConfig {
     ///
     /// No-op for `Filesystem::Raw` disks (there is nothing to
     /// mount). The flag is honored at cmdline-emission time in
-    /// `crate::vmm::KtstrVmBuilder::build`: when set, the
+    /// `crate::vmm::KtstrVm::build_guest_cmdline` (via
+    /// `disk_auto_mount_cmdline_tokens`): when set, the
     /// `KTSTR_DISK0_FS` / `KTSTR_DISK0_MOUNT` / `KTSTR_DISK0_RO`
     /// tokens are not emitted, and the guest's
     /// `crate::vmm::rust_init::auto_mount_data_disks` short-
@@ -1411,7 +1412,7 @@ mod tests {
 
     /// Pin downcast through anyhow: `DiskThrottle::validate` returns
     /// `Result<(), DiskThrottleValidationError>`, but production
-    /// callers (e.g. [`crate::vmm::KtstrVmBuilder::build`]) wrap the
+    /// callers (e.g. `init_virtio_blk`) wrap the
     /// failure in `anyhow::Error`. Library consumers that need to
     /// pattern-match on the failure variant must therefore
     /// `downcast_ref::<DiskThrottleValidationError>()` through the
@@ -1424,8 +1425,8 @@ mod tests {
     /// site, which doesn't exist in-tree yet.
     ///
     /// The chain wraps with `.context(...)` to mirror the production
-    /// shape at [`crate::vmm::KtstrVm::init_virtio_blk`] (in
-    /// `src/vmm/setup.rs`) so the downcast walks through the same
+    /// shape at `init_virtio_blk` (in
+    /// `src/vmm/setup/mod.rs`) so the downcast walks through the same
     /// context layer real callers see.
     #[test]
     fn disk_throttle_validation_error_downcasts_through_anyhow() {
@@ -1436,7 +1437,7 @@ mod tests {
             .validate()
             .expect_err("burst < iops rejected");
         // Wrap in anyhow exactly like the production callsite does
-        // (KtstrVm::init_virtio_blk in src/vmm/setup.rs:
+        // (KtstrVm::init_virtio_blk in src/vmm/setup/mod.rs:
         // anyhow!(e).context("invalid disk throttle")).
         let wrapped = anyhow::anyhow!(typed).context("invalid disk throttle");
         // The typed variant must be reachable through the anyhow

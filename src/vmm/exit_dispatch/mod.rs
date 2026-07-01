@@ -865,7 +865,8 @@ fn latch_slot0_with_gate(watchpoint: &WatchpointArm) {
 /// the kernel side; userspace must re-enter KVM_RUN to commit it.
 /// After draining, the thread sets `parked=true` (Release-ordered so
 /// the host's subsequent guest-memory reads happen-after the
-/// drain), then polls freeze on park_timeout. The Acquire load on
+/// drain), then waits for thaw by polling the thaw/kill eventfds
+/// (`park_timeout(10 ms)` backstop). The Acquire load on
 /// `parked` from the freeze coordinator IS the memory barrier that
 /// makes external-thread guest-memory reads correct on weakly
 /// ordered architectures (matches Cloud Hypervisor's pause
@@ -978,10 +979,14 @@ pub(crate) fn vcpu_run_loop_unified(
                 // KVM_EXIT_DEBUG fires when the armed hardware
                 // data-write watchpoint trips on a guest write to
                 // `*scx_root->exit_kind`. The kernel writes the
-                // field on BOTH error transitions
-                // (`scx_error -> SCX_EXIT_ERROR/_BPF/_STALL >=
-                // 1024`) AND clean shutdown
-                // (`scx_unregister -> SCX_EXIT_DONE = 1`). Only the
+                // field on BOTH error transitions (an error-class
+                // kind >= 1024: SCX_EXIT_ERROR via the `scx_error`
+                // macro, SCX_EXIT_ERROR_BPF via `scx_bpf_error`,
+                // SCX_EXIT_ERROR_STALL via the runnable-stall
+                // watchdog) AND clean shutdown
+                // (`scx_disable_workfn -> SCX_EXIT_DONE = 1`,
+                // reached via the `.unreg` callback
+                // `bpf_scx_unreg`). Only the
                 // error transitions should trigger the failure-dump
                 // freeze; firing on every clean test exit is a
                 // regression. Read the post-store value from the
@@ -1087,11 +1092,14 @@ pub(crate) fn vcpu_run_loop_unified(
 /// is skipped.
 ///
 /// After the drain, the thread sets `parked=true` with Release
-/// ordering and polls freeze on `park_timeout(10ms)` until the
-/// coordinator clears it. The thaw path uses no explicit unpark —
-/// the 10ms park_timeout cadence picks up the cleared freeze flag
-/// within at most 10 ms, which is well below the dump latency
-/// budget.
+/// ordering, then waits for thaw by polling `[thaw_evt, kill_evt]`
+/// via `libc::poll` with a 100 ms backstop. The coordinator writes
+/// `thaw_evt` alongside `freeze.store(false, Release)`, so the wake
+/// is explicit; the 100 ms backstop bounds latency if the eventfd
+/// edge is lost (counter overflow / EAGAIN). `park_timeout(10 ms)`
+/// is only the fallback when no `thaw_evt` is plumbed (all-None
+/// callers). The `freeze.load(Acquire)` re-check at the top of the
+/// loop is the source of truth for whether to keep parking.
 ///
 /// `kill` is honoured throughout: a shutdown signal during the park
 /// loop wins over freeze and the function returns to the caller's

@@ -244,7 +244,7 @@ fn validate_task_layer_order_start_time_before_dead() {
 /// Migrated from `tests/oru64_rmw_e2e.rs` (gated skeleton); the
 /// dispatcher narrowed OrU64 to OrU32 because the canonical
 /// scheduler-flags use case (`struct scx_rq.flags`) is u32 per
-/// `kernel/sched/sched.h:802`. Test runs as a host-side unit
+/// `kernel/sched/sched.h:803`. Test runs as a host-side unit
 /// test against `build_test_kernel`'s synthetic guest memory —
 /// no VM boot — because the RMW correctness is pure dispatcher
 /// arithmetic.

@@ -60,6 +60,8 @@ pub struct WorkerReport {
     pub wake_sample_total: u64,
     pub iteration_costs_ns: Vec<u64>,
     pub iteration_cost_sample_total: u64,
+    pub timer_latencies_ns: Vec<u64>,
+    pub timer_sample_total: u64,
     pub iterations: u64,
     pub schedstat_run_delay_ns: u64,
     pub schedstat_run_count: u64,
@@ -71,6 +73,8 @@ pub struct WorkerReport {
     pub is_messenger: bool,
     pub group_idx: usize,
     pub affinity_error: Option<String>,
+    pub phase_slices: Vec<PhaseSlice>,
+    pub taobench_whole: Option<TaobenchStats>,
 }
 
 pub enum WorkerExitInfo {
@@ -220,7 +224,7 @@ Three fields worth calling out explicitly:
 
 ### Benchmarking fields
 
-Workers collect two categories of timing data:
+Workers collect several categories of timing data:
 
 **Per-wakeup latency** (`wake_latencies_ns`): timestamp-based samples
 recorded around blocking operations. Populated for work types with a
@@ -237,6 +241,14 @@ Each sample is in nanoseconds; most work types use
 `Instant::elapsed()` across the blocking call, while FanOutCompute
 uses `clock_gettime(CLOCK_MONOTONIC)` to measure against the
 messenger's pre-wake timestamp.
+
+**Timer-cycle latency** (`timer_latencies_ns` / `timer_sample_total`):
+per-cycle jitter for `WorkType::TimerLatency` — the observed
+`clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)` wake time minus the
+absolute deadline, floored at 0. Kept in a distinct reservoir (capped
+at `MAX_WAKE_SAMPLES`) so cyclictest-style timer latency never blurs
+with the blocking variants' wake latency; `vec![]` for every
+non-`TimerLatency` variant.
 
 **schedstat deltas**: read from `/proc/self/schedstat` at work-loop
 start and end. Three fields:

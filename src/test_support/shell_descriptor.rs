@@ -1,22 +1,23 @@
 //! Shared `ShellTestDescriptor` for the `--ktstr-shell-test=<NAME>`
 //! probe wire format.
 //!
-//! Producer: [`crate::test_support::dispatch`]'s
-//! `maybe_dispatch_shell_test` serializes a fully-populated descriptor
-//! to stdout when a test binary is probed.
+//! Producer: `dispatch::maybe_dispatch_shell_test` serializes a
+//! fully-populated descriptor to stdout when a test binary is probed.
 //!
 //! Consumer: `cargo_ktstr::misc::shell::resolve_shell_from_test_entry`
 //! deserializes the stdout, then `run_shell` passes the descriptor's
 //! fields to [`crate::run_shell`] so the shell VM mirrors the test's
 //! topology, scheduler, wprof, and performance settings.
 //!
-//! Every field carries `#[serde(default)]` so older `cargo-ktstr`
-//! binaries can deserialize JSON emitted by a newer test binary that
-//! adds a field: the unknown-to-the-old field is simply absent from
-//! the deserialized struct's view, and existing fields remain
-//! populated. The reverse direction (newer cargo-ktstr reading older
-//! JSON without a field that the new code added) also works via the
-//! same defaults.
+//! Older `cargo-ktstr` binaries can deserialize JSON emitted by a
+//! newer test binary that adds a field because the derived
+//! `Deserialize` impl ignores unknown fields (no
+//! `#[serde(deny_unknown_fields)]`): the field the old struct doesn't
+//! know about is dropped, and existing fields remain populated. The
+//! reverse direction (newer `cargo-ktstr` reading older JSON that
+//! lacks a field the new code added) works because every field carries
+//! `#[serde(default)]`, which supplies a default for each missing
+//! field.
 
 use serde::{Deserialize, Serialize};
 

@@ -80,8 +80,10 @@ fn run_cargo_ktstr_shell_inner(
 /// visible STDERR delimiter so failure diagnostics make the
 /// stream split unambiguous. The shell-mode lifecycle marker
 /// pattern routes both init-side writes (via `/proc/1/fd/1`)
-/// and the payload's stdout through the same virtio-console
-/// pipeline, so most assertions search the combined view; the
+/// and the payload's stdout through the same init-fd-1 console
+/// pipeline (virtio-console `/dev/hvc0` when available, COM2
+/// `/dev/ttyS1` otherwise), so most assertions search the
+/// combined view; the
 /// delimiter survives in panic messages so a reader can tell
 /// which stream the marker landed in.
 pub fn combined_output(out: &std::process::Output) -> String {

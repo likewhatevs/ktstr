@@ -13,13 +13,17 @@
 //!    the prog-runtime-stats capture in `dump_state`.
 //! 3. The per-CPU offset array — read once via
 //!    [`crate::monitor::symbols::read_per_cpu_offsets`] and cached
-//!    for the rest of the run; gated on every entry being non-zero so
-//!    a partially-online VM doesn't poison the cache with a CPU 0
+//!    for the rest of the run; gated on every entry having bit 63
+//!    set (kernel-half pointer) so a partially-online VM doesn't
+//!    poison the cache with a CPU 0
 //!    alias for not-yet-online CPUs (the rq PA invariant).
 //!
-//! All three retry blocks share the same `(mem, vmlinux, tcr_el1,
-//! cr3)` input shape, which is the GuestKernel handshake context the
-//! coordinator captures at run_vm scope. Lifting them into named
+//! The two accessor retry blocks share the same `(mem, data,
+//! vmlinux, tcr_el1, cr3, phys_base_hint)` input shape, which is the
+//! GuestKernel handshake context the coordinator captures at run_vm
+//! scope; the per-CPU-offset helper instead takes `(mem,
+//! per_cpu_offset_kva, tcr_el1, phys_base, num_cpus)`. Lifting them
+//! into named
 //! `pub(super) fn` lets unit tests drive the boot-race window
 //! deterministically: a test constructs a `GuestMem` and feeds
 //! controlled `(tcr, cr3)` snapshots through `try_init_*` to assert
@@ -29,11 +33,13 @@
 //! # No state-machine semantics change
 //!
 //! Each `try_init_*` is byte-for-byte identical to the inline
-//! retry block: same Acquire load on the cr3 / tcr_el1 atoms (the
+//! retry block: the two accessor helpers load cr3 and tcr_el1 with
+//! Acquire while the per-CPU-offset helper loads only tcr_el1 (the
 //! cr3 cache may flip mid-run as the BSP loop refines the
 //! page-table root, so the load happens INSIDE the helper —
 //! capturing it pre-call would freeze a stale value), same gate on
-//! every per-CPU offset slot being non-zero before caching. The
+//! every per-CPU offset slot having bit 63 set (kernel-half
+//! pointer) before caching. The
 //! accessor helpers return the constructor's `anyhow::Result`
 //! verbatim so the caller can capture the most recent error
 //! message and surface it as a warn after enough retries (the
@@ -112,7 +118,8 @@ pub(super) fn try_init_owned_prog_accessor_with_hint(
 }
 
 /// Resolve and cache the per-CPU offset array. Returns `Some(offsets)`
-/// only when every slot is non-zero so a partially-online VM does
+/// only when every slot has bit 63 set (kernel-half pointer) so a
+/// partially-online VM does
 /// not poison the cache with a CPU 0 alias for not-yet-online CPUs
 /// (rq PA invariant; fix for `compute_rq_pas` wraparound when a
 /// `pco_offset == 0` is fed downstream). Returns `None` when:
@@ -120,14 +127,15 @@ pub(super) fn try_init_owned_prog_accessor_with_hint(
 /// * `per_cpu_offset_kva == 0` (caller's symbol cache had no entry
 ///   for `__per_cpu_offset` — typically a stripped vmlinux image),
 ///   OR
-/// * any slot is still zero (caller leaves cache `None`, retries
-///   next scan tick).
+/// * any slot fails the bit-63 (kernel-half) gate — a still-zero
+///   slot or a non-zero-but-bit-63-clear value like `0x3` (caller
+///   leaves cache `None`, retries next scan tick).
 ///
 /// Takes a pre-resolved `per_cpu_offset_kva` from the coordinator's
 /// `dump_cpu_time_symbols` cache instead of re-running
 /// `KernelSymbols::from_vmlinux` on every scan tick. The previous
 /// in-helper parse re-read the entire vmlinux ELF (50 MB+) and re-
-/// built every symbol-table entry every 100 ms while waiting for
+/// built every symbol-table entry every 250 ms while waiting for
 /// the per-CPU areas to come up — visible as ~MB/s of constant
 /// post-boot file I/O on every ktstr run. The KVA is fixed at
 /// kernel link time and the caller already resolved it once at

@@ -3,11 +3,14 @@
 //! override) and surface the A/B commit pair the existing
 //! `stats compare` engine pairs on.
 //!
-//! v0 (this increment): baseline resolution + reporting the resolved
-//! `(baseline, head)` commit pair and the perf-test selector. The
-//! dual-run (run perf-mode tests at HEAD and at the baseline in a gix
-//! worktree, then invoke `compare_partitions`) is the follow-up
-//! increment — see task: mergebase perf-delta.
+//! Baseline resolution (`select_base` / `resolve_baseline`) feeds two
+//! compare axes in `run`: the COMMIT axis (HEAD vs baseline, partitioned
+//! by `project_commit`) and the CONFIG axis (`--a-scheduler` vs
+//! `--b-scheduler` at the same commit, partitioned by `scheduler`). The
+//! `--dual-run` and `--noise-adjust` paths PRODUCE both commits'
+//! `performance_mode` sidecars — checking the baseline out in a detached
+//! `git worktree` (shelled, because `gix` 0.83 has no worktree-creation
+//! API) before invoking `compare_partitions` / `compare_partitions_noise`.
 
 /// How the baseline commit (the "compare-current-to" point) is resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]

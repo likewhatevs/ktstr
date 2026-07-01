@@ -1,11 +1,13 @@
 //! Structural tests for `#[derive(Payload)]`.
 //!
 //! These live in their own test crate rather than
-//! `ktstr_test_macro.rs` because that file carries `#[ktstr_test]`
-//! entries whose `#[ctor]` discovery routes nextest's `--list`
-//! through `ktstr_main`, hiding plain `#[test]` functions.
-//! Isolating the struct-only tests here keeps them visible to the
-//! standard Rust test harness.
+//! `ktstr_test_macro.rs` to keep the struct-only `Payload`-derive
+//! tests grouped and free of the `#[ktstr_test]` harness/`#[ctor]`
+//! machinery. Plain `#[test]` functions are not hidden by a
+//! `#[ktstr_test]`-carrying binary: the ctor's `--list` branch calls
+//! `list_plain_tests` / `ktstr_list_only` (see
+//! `src/test_support/dispatch.rs`), which surface plain `#[test]`
+//! items to nextest.
 
 use ktstr::test_support::{MetricCheck, OutputFormat, PayloadKind, Polarity};
 

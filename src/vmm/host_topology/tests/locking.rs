@@ -330,11 +330,12 @@ fn resource_lock_service_cpu_contention() {
 ///
 /// Pin the spread shape across a window of 100 consecutive pids:
 ///   * every pid's offset must fit in `[0, max_start)`;
-///   * the unique-offset count must exceed half the input
-///     range (50 for 100 pids), so adjacent pids don't all
-///     collapse to the same offset;
+///   * the unique-offset count must reach most of the
+///     33-offset space (assert >= 25), so adjacent pids
+///     don't all collapse to the same offset;
 ///   * the average gap between consecutive pids' offsets
-///     must exceed 1 (the trivial `pid % max_start` baseline).
+///     must exceed 5 (the trivial `pid % max_start` baseline
+///     produces a gap of 1).
 ///
 /// `max_start = 33` is chosen so the ideal uniform spread
 /// would visit every offset 100/33 ≈ 3 times; the unique
@@ -483,10 +484,11 @@ fn acquire_llc_plan_none_cap_reserves_thirty_percent_cpus() {
         (vec![8, 9], 0),
     ]);
 
-    // synthetic() needs >= num_cpus >= num_llcs; the distance
-    // function is never invoked with target_cpus >= sum-of-allowed
-    // (the planner's short-circuit at plan_from_snapshots), so
-    // the TestTopology's shape doesn't matter beyond "valid".
+    // synthetic() requires num_cpus >= num_llcs > 0. All 5
+    // synthetic LLCs sit on NUMA node 0, so the seed-node walk in
+    // plan_from_snapshots fills before any cross-node spill and the
+    // distance closure's shape can't change the selection — the
+    // TestTopology only needs to be a valid synthetic().
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
 
     let plan = acquire_llc_plan(&topo, &test_topo, None)

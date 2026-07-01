@@ -10,9 +10,11 @@
 //!
 //! Helpers `build_per_node_map` and `acquire_slot_with_locks` live next
 //! to `build()` because they execute as part of the build pipeline:
-//! both are called only from `build()` and `validate_performance_mode`,
-//! and they cooperate with the [`super::host_topology`] flock primitives
-//! to reserve the LLC slots the resulting VM will pin against.
+//! `build_per_node_map` is called from `resolve_run_plans` and
+//! `acquire_slot_with_locks` from `validate_performance_mode` (neither
+//! directly from `build()`), and they cooperate with the
+//! [`super::host_topology`] flock primitives to reserve the LLC slots
+//! the resulting VM will pin against.
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -331,7 +333,6 @@ impl KtstrVmBuilder {
     /// same guest path. The packing pipeline (follow-up work)
     /// rejects such duplicates at build time as the
     /// final-line-of-defense beyond the validate gate.
-    #[allow(dead_code)] // production callers (runtime plumb) wire up in follow-up work
     pub fn staged_scheduler(
         mut self,
         name: impl Into<String>,
@@ -757,7 +758,7 @@ impl KtstrVmBuilder {
     /// [`super::disk_template::cache_root`]) so operators can
     /// inspect what's been built, GC stale entries by hand, and warm
     /// the cache out-of-band by running a Btrfs test once. The cache
-    /// is keyed by `(filesystem_tag, capacity_mib)` and the
+    /// is keyed by `(filesystem_tag, capacity_mib, mkfs_version_fingerprint)` and the
     /// directory layout is `<cache>/disk_templates/<key>/template.img`
     /// — see [`super::disk_template`] module docs for the full encoding.
     ///
@@ -1034,8 +1035,7 @@ impl KtstrVmBuilder {
         // no CAP_BPF) defers until the failure-dump path first
         // calls
         // [`super::cast_analysis_load::LazyCastMap::get_full`]
-        // (production accessor — `.get()` is `#[allow(dead_code)]`
-        // and used only by the lazy-handle unit tests).
+        // (the sole accessor).
         // Schedulers whose tests pass never trigger analyzer
         // work — the dominant case for nextest's process-per-test
         // execution model where steady-state tests boot a VM,
@@ -1189,8 +1189,8 @@ impl KtstrVmBuilder {
             //
             // The CLI binaries reject `--cpu-cap` + bypass at parse
             // time (see `ktstr::cli::CPU_CAP_HELP` and the Shell/
-            // kernel-build dispatch checks in bin/ktstr.rs and
-            // bin/cargo-ktstr.rs), but library consumers building
+            // kernel-build dispatch checks in src/bin/ktstr.rs and
+            // src/bin/cargo-ktstr.rs), but library consumers building
             // a `KtstrVmBuilder` directly with both env vars set
             // would silently lose the cap under a bare `if bypass
             // { return None-plan }`. Mirror the CLI check here so

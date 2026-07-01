@@ -491,7 +491,7 @@ fn assert_discriminant(op: Op, want: u32, name: &str) {
 /// `op_discriminant_payload_ops`,
 /// `op_discriminant_freeze_snapshot_kernel_ops`,
 /// `op_discriminant_scheduler_ops`); their union covers every Op
-/// variant (discriminants 0..=26) exactly once, in source order.
+/// variant (discriminants 0..=27) exactly once, in source order.
 #[test]
 fn op_discriminant_cgroup_ops() {
     assert_discriminant(Op::AddCgroup { name: "a".into() }, 0, "AddCgroup");
@@ -656,7 +656,7 @@ fn op_discriminant_freeze_snapshot_kernel_ops() {
 }
 
 /// Discriminant pin for the scheduler-control Op variants plus
-/// `PinBpfMap`/`CaptureCgroupProcs` (discriminants 21..=26). See
+/// `PinBpfMap`/`CaptureCgroupProcs`/`SteerIrq` (discriminants 21..=27). See
 /// [`op_discriminant_cgroup_ops`] for the full pin rationale.
 #[test]
 fn op_discriminant_scheduler_ops() {
@@ -8990,8 +8990,9 @@ fn move_all_tasks_preserves_state_when_move_tasks_fails() {
 }
 
 /// Companion to `move_all_tasks_preserves_state_when_move_tasks_fails`:
-/// the step→backdrop ownership-transfer site at the handler
-/// L2727 rename_handles call must ALSO not run when move_tasks
+/// the step→backdrop ownership-transfer site — the
+/// `rename_handles` call in `apply_move_all_tasks` — must ALSO
+/// not run when move_tasks
 /// fails mid-loop. Pins the cross-state-slot atomicity contract
 /// — a regression that ran the transfer before the move loop
 /// would push the handle into backdrop_state.handles even
@@ -9069,9 +9070,9 @@ fn move_all_tasks_step_to_backdrop_failure_preserves_step_ownership() {
 /// Companion to `move_all_tasks_preserves_state_when_move_tasks_fails`:
 /// when MULTIPLE handles are keyed under `from`, a mid-loop
 /// move_tasks failure must leave ALL handles keyed under
-/// `from` (per the handler comment at L2697-2705: "the kernel
-/// side may still be partially migrated, but the in-process
-/// tracking does not also drift"). The first N-1 batches
+/// `from` (per the handler comment in `apply_move_all_tasks`:
+/// "the kernel side may still be partially migrated ... but the
+/// in-process tracking does not also drift"). The first N-1 batches
 /// migrated kernel-side; the Nth failed; rename_handles never
 /// ran for any of them. Subsequent ops looking up `from` find
 /// the same set as pre-op. Pins the all-or-nothing in-process

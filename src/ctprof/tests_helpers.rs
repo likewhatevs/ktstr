@@ -10,7 +10,7 @@
 use std::path::Path;
 
 // ------------------------------------------------------------
-// Synthetic-tree tests (H1-H5)
+// Synthetic-tree tests (H1-H2 + parse-summary)
 //
 // Stage a tempdir shaped like `/proc/<tgid>/{comm,
 // task/<tid>/{stat,schedstat,status,io,sched,comm,cgroup}}`
@@ -21,9 +21,9 @@ use std::path::Path;
 
 /// Build a synthetic `/proc` under `root` carrying exactly one
 /// thread. Writes every file capture walks so every counter
-/// on `ThreadState` round-trips with a known value. `cpus` is
-/// the `Cpus_allowed_list` value (a range string the
-/// `parse_cpu_list` helper decodes).
+/// on `ThreadState` round-trips with a known value. The
+/// `Cpus_allowed_list` value is fixed at "0-3" (decoded by
+/// `crate::cpu_util::parse_cpu_list`).
 pub(super) fn stage_synthetic_proc(root: &Path, tgid: i32, tid: i32, pcomm: &str, comm: &str) {
     use std::fs;
     let tgid_dir = root.join(tgid.to_string());

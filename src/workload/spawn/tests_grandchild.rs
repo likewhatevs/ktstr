@@ -144,7 +144,8 @@ fn stop_and_collect_reaps_grandchildren_from_multiple_workers() {
 /// Panic-path variant: the Custom closure panics after forking
 /// its grandchild. Under `panic = "unwind"` the worker's
 /// `std::panic::catch_unwind` (around the child body in the
-/// forked-child path of `WorkloadHandle::spawn`) catches the
+/// forked-child path reached via `WorkloadHandle::spawn` ->
+/// `spawn_group`) catches the
 /// panic and the child hits `libc::_exit(1)` directly — no
 /// abort. Under `panic = "abort"`
 /// SIGABRT fires before catch_unwind runs. Either way the
@@ -186,7 +187,7 @@ fn stop_and_collect_reaps_grandchild_from_panicking_custom_closure() {
     );
     // Sentinel-mapping audit: the panicking worker cannot
     // serialize a WorkerReport to the pipe, so
-    // `stop_and_collect`'s JSON-parse branch must fall into
+    // `stop_and_collect`'s postcard-parse branch must fall into
     // the sentinel path. The `exit_info` carried on the
     // sentinel depends on the compile-time panic strategy:
     //   - Under `panic = "abort"` (release profile), the
@@ -203,7 +204,7 @@ fn stop_and_collect_reaps_grandchild_from_panicking_custom_closure() {
     assert_eq!(
         r.work_units, 0,
         "sentinel must be zeroed; non-zero work_units would mean \
-         a worker-authored report leaked through the JSON-parse \
+         a worker-authored report leaked through the postcard-parse \
          branch despite the panic",
     );
     assert!(
@@ -228,7 +229,7 @@ fn stop_and_collect_reaps_grandchild_from_panicking_custom_closure() {
 }
 /// Drop-path variant: the caller drops the handle WITHOUT calling
 /// `stop_and_collect`. The `impl Drop for WorkloadHandle`
-/// (src/workload.rs) is responsible for killpg'ing every worker
+/// (src/workload/spawn/mod.rs) is responsible for killpg'ing every worker
 /// process group, then SIGKILLing each leader and waitpid'ing it.
 /// Without the Drop-path killpg, any long-running grandchild
 /// would orphan onto init and leak past the test. Pins the
@@ -300,8 +301,8 @@ fn stop_and_collect_reaps_grandchild_from_graceful_custom_closure() {
     // cleanly via `wait_for_deadline`'s stop-observed early-exit,
     // the worker `_exit(0)`s well within the 5s collection
     // deadline — completes in a few hundred milliseconds
-    // (500ms auto-start sleep + SIGUSR1 + 10ms wait_for_deadline
-    // poll + worker serialize/_exit + WNOHANG reap). The
+    // (SIGUSR1 delivery + 10ms wait_for_deadline poll + worker
+    // serialize/_exit + WNOHANG reap). The
     // StillAlive escalation branch, by contrast, waits the full
     // 5s deadline before SIGKILL. A <2s ceiling rules out
     // StillAlive escalation (~5s+) while leaving generous slack

@@ -3,7 +3,7 @@ use super::*;
 
 /// Empty pending-rx → drain is a no-op. No queue access, no
 /// add_used, no signal_used. Pins the `if pending.is_empty()`
-/// fast-exit at the head of `drain_port1_pending_rx`.
+/// fast-exit at the head of `drain_pending_rx`.
 #[test]
 fn drain_port1_pending_rx_empty_pending_is_noop() {
     let mut dev = VirtioConsole::new();
@@ -27,7 +27,7 @@ fn drain_port1_pending_rx_empty_pending_is_noop() {
 
     assert!(
         dev.ports[1].pending_rx.is_empty(),
-        "precondition: port1_pending_rx must start empty"
+        "precondition: ports[1].pending_rx must start empty"
     );
     let int_before = dev.interrupt_status;
 
@@ -48,7 +48,7 @@ fn drain_port1_pending_rx_empty_pending_is_noop() {
 }
 
 /// DRIVER_OK gate: bytes pushed before DRIVER_OK stay in
-/// `port1_pending_rx`. A regression that walked the queue
+/// `ports[1].pending_rx`. A regression that walked the queue
 /// pre-DRIVER_OK would let the device read descriptor addresses
 /// the driver has not yet committed (virtio-v1.2 §3.1.1).
 #[test]
@@ -68,7 +68,7 @@ fn drain_port1_pending_rx_defers_without_driver_ok() {
     // Walk FSM up to S_FEAT only — STOP before S_OK. Configure
     // q4 and mark it ready (allowed in S_FEAT..S_OK per
     // `queue_config_allowed`). The DRIVER_OK gate at the head of
-    // `drain_port1_pending_rx` must still defer.
+    // `drain_pending_rx` must still defer.
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
     write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0);
@@ -122,7 +122,7 @@ fn drain_port1_pending_rx_defers_without_driver_ok() {
 /// F_MULTIPORT runtime gate: even with DRIVER_OK and the queue
 /// ready, if the driver did not negotiate F_MULTIPORT then q4
 /// should not be walked. Pins the
-/// `if !self.multiport_negotiated()` guard at line ~903.
+/// `if !self.multiport_negotiated()` guard at line ~643.
 #[test]
 fn drain_port1_pending_rx_defers_without_multiport() {
     let mut dev = VirtioConsole::new();
@@ -171,7 +171,7 @@ fn drain_port1_pending_rx_defers_without_multiport() {
         !dev.multiport_negotiated(),
         "precondition: F_MULTIPORT must NOT be negotiated"
     );
-    // Set port_opened[1] directly so the multiport gate is the
+    // Set ports[1].opened directly so the multiport gate is the
     // ONLY gate the test exercises (hostile guest pretend-state).
     dev.ports[1].opened = true;
 
@@ -191,14 +191,14 @@ fn drain_port1_pending_rx_defers_without_multiport() {
     assert_eq!(used_idx, 0, "F_MULTIPORT gate must skip add_used");
 }
 
-/// `port_opened[1]` gate: with DRIVER_OK + F_MULTIPORT but BEFORE
+/// `ports[1].opened` gate: with DRIVER_OK + F_MULTIPORT but BEFORE
 /// the guest has sent `PORT_OPEN(id=1, value=1)` on c_ovq, port 1
 /// has no userspace reader. The kernel's port-1 buffer-pool
 /// allocation only completes after PORT_OPEN; pushing bytes
 /// through descriptors that exist before the open lets the
 /// kernel discard them with no userspace consumer (per
 /// drivers/char/virtio_console.c `port_fops_open`). Pins the
-/// `if !self.port_opened[1]` guard at line ~911.
+/// `if !self.ports[1].opened` guard at line ~658.
 ///
 /// After the guest opens the port via PORT_OPEN, the deferred
 /// drain runs (the open transition itself triggers it at line
@@ -220,11 +220,11 @@ fn drain_port1_pending_rx_defers_until_port_open() {
     dev.set_mem(mem.clone());
     wire_port1_rxq_to_mock(&mut dev, &mock);
 
-    // Port 1 not yet opened — the `port_opened[1]` gate must
+    // Port 1 not yet opened — the `ports[1].opened` gate must
     // defer.
     assert!(
         !dev.ports[1].opened,
-        "precondition: port_opened[1] must be false"
+        "precondition: ports[1].opened must be false"
     );
 
     dev.ports[1].pending_rx.extend(payload.iter().copied());
@@ -234,15 +234,18 @@ fn drain_port1_pending_rx_defers_until_port_open() {
     assert_eq!(
         dev.ports[1].pending_rx.len(),
         payload.len(),
-        "port_opened[1] gate must defer when guest has not opened port 1"
+        "ports[1].opened gate must defer when guest has not opened port 1"
     );
     let used_idx_before: u16 = mem
         .read_obj(mock.used_addr().checked_add(2).unwrap())
         .expect("read used.idx before open");
-    assert_eq!(used_idx_before, 0, "port_opened[1] gate must skip add_used");
+    assert_eq!(
+        used_idx_before, 0,
+        "ports[1].opened gate must skip add_used"
+    );
 
     // Now drive PORT_OPEN(id=1, value=1). The handler at line
-    // ~1268 calls drain_port1_pending_rx on the closed→open
+    // ~1072 calls drain_pending_rx on the closed→open
     // transition, which now must drain.
     open_port1(&mut dev);
 
@@ -271,7 +274,7 @@ fn drain_port1_pending_rx_defers_until_port_open() {
 /// coordinator may push reply bytes during the brief window
 /// before `set_mem` lands) must not crash and must hold the
 /// bytes for retry. Pins the `match self.mem.as_ref() { ... None
-/// => return }` arm at line ~918.
+/// => return }` arm at line ~666.
 #[test]
 fn drain_port1_pending_rx_defers_without_mem() {
     let mut dev = VirtioConsole::new();
@@ -296,7 +299,7 @@ fn drain_port1_pending_rx_defers_without_mem() {
 
 /// Queue-not-ready gate: bytes stay pending if PORT1_RXQ has not
 /// been marked ready by the driver. Pins the
-/// `!self.queues[PORT1_RXQ].ready()` guard at line ~928. The
+/// `!self.queues[PORT1_RXQ].ready()` guard at line ~677. The
 /// driver writes QUEUE_READY=1 only after the desc/avail/used
 /// addresses are committed; reading the queue before that point
 /// would walk uninitialized state.
@@ -330,7 +333,7 @@ fn drain_port1_pending_rx_defers_when_queue_not_ready() {
 /// Single-descriptor write-only chain: happy-path baseline for
 /// the torn-write tests below. Pins that a normal drain delivers
 /// the payload to the descriptor buffer, drains
-/// `port1_pending_rx`, advances `used.idx`, and signals the
+/// `ports[1].pending_rx`, advances `used.idx`, and signals the
 /// guest via INT_VRING + irq_evt.
 #[test]
 fn drain_port1_pending_rx_single_descriptor_happy_path() {
@@ -391,10 +394,10 @@ fn drain_port1_pending_rx_single_descriptor_happy_path() {
 /// the torn-write branch.
 ///
 /// Pins the four invariants of the torn-write recovery (lines
-/// ~983-997):
+/// ~735-753):
 /// (a) `chain_torn = true` triggers `q.add_used(mem, head, 0)`
 ///     — used.idx advances to 1, but the published `len` is 0;
-/// (b) bytes stay in `port1_pending_rx` (the
+/// (b) bytes stay in `ports[1].pending_rx` (the
 ///     `drain(..consumed_offset)` is in the non-torn branch, so
 ///     a torn chain does NOT consume bytes);
 /// (c) the drain loop breaks (no further chains processed for
@@ -475,9 +478,9 @@ fn drain_port1_pending_rx_torn_write_publishes_head_with_zero_len() {
     // (b) Bytes stay in pending_rx. The first descriptor's
     // partial write does not consume bytes from the deque
     // because the torn branch skips the
-    // `drain(..consumed_offset)` call (line ~1009 is in the
+    // `drain(..consumed_offset)` call (line ~766 is in the
     // success branch, after the `if chain_torn { ... break; }`
-    // arm at line ~983).
+    // arm at line ~735).
     assert_eq!(
         dev.ports[1].pending_rx.len(),
         payload.len(),
@@ -495,7 +498,7 @@ fn drain_port1_pending_rx_torn_write_publishes_head_with_zero_len() {
     // (d) signal_used must NOT have been called: total_written
     // stays 0 for the torn chain, so the
     // `if total_written > 0 { signal_used() }` branch at line
-    // ~1012 is skipped.
+    // ~789 is skipped.
     assert_eq!(
         dev.interrupt_status, int_before,
         "torn-only chain must not trigger signal_used (total_written=0)"
@@ -510,7 +513,7 @@ fn drain_port1_pending_rx_torn_write_publishes_head_with_zero_len() {
 /// Torn-write breaks the drain loop: even when MORE chains are
 /// available in the avail ring, a torn first chain stops the
 /// drain immediately. Pins the `break` after `add_used(0)` at
-/// line ~996. A regression that continued to the next chain
+/// line ~752. A regression that continued to the next chain
 /// would (1) interleave torn-recovery with success traffic,
 /// confusing failure-mode analysis, and (2) potentially deliver
 /// bytes out of order if the torn chain's bytes were retried

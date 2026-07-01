@@ -1,7 +1,7 @@
 //! VM-backed end-to-end test for the
 //! [`Op::CaptureCgroupProcs`] dispatch path.
 //!
-//! The MockCgroupOps unit tests in `src/scenario/ops/mod.rs`
+//! The MockCgroupOps unit tests in `src/scenario/ops/tests.rs`
 //! (`op_capture_cgroup_procs_records_snapshot_on_active_bridge`,
 //! `op_capture_cgroup_procs_propagates_read_procs_error`,
 //! `op_capture_cgroup_procs_empty_tag_bails_before_read`,

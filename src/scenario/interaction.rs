@@ -62,10 +62,10 @@ pub fn custom_cgroup_imbalance_mixed_workload(ctx: &Ctx) -> Result<AssertResult>
 /// with the heavy/light assignment swapped from the prior phase.
 /// The per-Step auto-teardown at every step boundary IS the
 /// "stop + respawn" event — there's no cross-step reference so no
-/// Backdrop is needed. A Backdrop migration would fight the new
-/// `Op::stop_cgroup` / `Op::MoveAllTasks` guards that protect
-/// persistent workers from step-local teardown, so this scenario
-/// stays on `execute_steps`.
+/// Backdrop is needed. A Backdrop migration would fight the
+/// `Op::MoveAllTasks` Backdrop->step-local guard (dispatch.rs) that
+/// protects persistent workers from step-local teardown, so this
+/// scenario stays on `execute_steps`.
 pub fn custom_cgroup_load_oscillation(ctx: &Ctx) -> Result<AssertResult> {
     let heavy_cg = |name: &'static str| CgroupDef::named(name).workers(ctx.workers_per_cgroup * 2);
     let light_cg = |name: &'static str| {

@@ -14,7 +14,7 @@ use super::*;
 
 /// Allocator-return → STX path: a `BPF_PSEUDO_CALL` flagged by
 /// `SubprogReturn` seeds R0 to `ArenaU64FromAlloc`; the
-/// subsequent `STX [R1+8] = R0` records `(M, 8)` as an Arena
+/// subsequent `STX [R6+8] = R0` records `(M, 8)` as an Arena
 /// finding with `target_type_id == 0`. The renderer's
 /// `resolve_arena_type` bridge resolves the actual payload type
 /// at chase time.
@@ -415,15 +415,19 @@ fn stx_flow_conflict_with_kptr_drops_both() {
 /// uniquely-resolved struct id (when shape inference resolves)
 /// — not the deferred-resolve sentinel.
 ///
-/// Pre-fix: the LDX alias-tracking arm at
-/// [`Analyzer::handle_ldx`] re-typed any LDX off a slot already
-/// in `arena_stx_findings` to `RegState::ArenaU64FromAlloc`,
-/// which suppressed downstream access recording (the arena arm
-/// in `handle_ldx` drops dst without populating patterns) — so
-/// even when struct shape uniquely identified the target,
-/// `target_type_id` stayed 0. Post-fix the LDX always emits
-/// `LoadedU64Field`, downstream LDXs through it record the
-/// access pattern, and shape inference resolves the target the
+/// The LDX alias-tracking arm at [`Analyzer::handle_ldx`]
+/// distinguishes two cases. When the LDXed slot is already in
+/// `arena_stx_findings`, the arm emits
+/// `RegState::ArenaU64FromAlloc { source: Some((parent, off)) }`;
+/// otherwise it emits
+/// `RegState::LoadedU64Field { source_struct_id, field_offset }`.
+/// In both cases a downstream LDX through the register records
+/// the access into `patterns[(source_struct_id, field_offset)]`
+/// — the `ArenaU64FromAlloc { source: Some }` arm populates
+/// patterns just as the `LoadedU64Field` arm does — so when the
+/// struct shape uniquely identifies the target, shape inference
+/// at finalize overwrites the STX-flow's deferred-resolve
+/// sentinel (`target_type_id == 0`) with the concrete BTF id the
 /// renderer can chase against without consulting the
 /// `MemReader::resolve_arena_type` bridge. The bridge stays in
 /// place for slots whose access pattern doesn't uniquely
@@ -489,14 +493,18 @@ fn stx_flow_resolves_target_via_shape_inference_under_alias_tracking() {
     let pseudo_call = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, 0);
     // Phase 1 — shape-inference accesses for (P, 8). Both passes
     // record the same pattern: the LDX at PC 0 emits
-    // `LoadedU64Field{P, 8}` regardless of whether
-    // `arena_stx_findings` already contains the slot, and
-    // downstream LDXs through that register record accesses
+    // `LoadedU64Field{P, 8}` on the first pass (slot not yet in
+    // `arena_stx_findings`) and `ArenaU64FromAlloc { source:
+    // Some((P, 8)) }` on carryover passes (slot already tagged
+    // from the prior pass's STX). In both cases downstream LDXs
+    // through that register record accesses
     // (0, 8) and (8, 8) into `patterns[(P, 8)]`. Q is the
     // unique candidate matching both accesses (it has u64@0
     // and u64@8, size 16), so finalize's intersection resolves
     // `target_type_id = q_id`.
-    //   r2 = LDX[r1 + 8]   ; LoadedU64Field{P, 8}
+    //   r2 = LDX[r1 + 8]   ; LoadedU64Field{P, 8} (pass 0) /
+    //                        ArenaU64FromAlloc{source:Some(P,8)}
+    //                        (carryover)
     //   r3 = LDX[r2 + 0]   ; records access (0, 8)
     //   r4 = LDX[r2 + 8]   ; records access (8, 8)
     // Phase 2 — preserve r1 across the call clobber by stashing
@@ -547,15 +555,6 @@ fn stx_flow_resolves_target_via_shape_inference_under_alias_tracking() {
     );
 }
 
-/// Long stream of `BPF_LD_IMM64` two-slot instructions back-to-
-/// back, terminated by `exit`. Every `lo` slot sets `skip_next`,
-/// and every `hi` slot is the upper-immediate placeholder that
-/// the analyzer must not interpret. Verifies the
-/// `skip_next`-driven decode path does not run off the end of the
-/// slice or misaccount its position when the program is densely
-/// packed with two-slot ops. Also exercises the same pattern in
-/// `jump_targets`'s pre-pass — both must agree on which slots are
-/// second-half placeholders.
 /// Helper: build a BTF blob carrying:
 ///   - `u64` (id 1)
 ///   - struct `M` (id 2) with one `u64 cgx_raw` member at byte

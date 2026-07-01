@@ -888,14 +888,15 @@ pub(crate) fn acquire_template_lock(key: &str) -> Result<std::os::fd::OwnedFd> {
 ///
 /// The realistic source of an `EEXIST` here is leftover staging
 /// debris from a previous run that crashed before unlinking its
-/// per-test fan-out file. The caller's tempfile name embeds a pid
-/// (mkstemp-style); a prior ktstr peer that crashed mid-test (SIGKILL,
+/// per-test fan-out file. The caller's dest name embeds a pid plus
+/// a timestamp-and-random suffix (`.per-test-<pid>-<ns>-<rnd>.img`);
+/// a prior ktstr peer that crashed mid-test (SIGKILL,
 /// host reboot, OOM kill, panic before the per-test cleanup ran)
 /// can leave its dest file in place. If the operating system later
 /// reuses the same pid for a new ktstr process and that process
 /// happens to generate a tempfile name colliding with the leaked
 /// file's name, the `O_EXCL` open trips on the leftover. PID reuse
-/// alone does not collide — the mkstemp randomization disambiguates
+/// alone does not collide — the timestamp+random suffix disambiguates
 /// most cases — but the check is `O_EXCL` precisely to surface the
 /// rare collision as a hard error rather than a silent overwrite.
 ///

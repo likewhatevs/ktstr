@@ -168,9 +168,11 @@ fn thread_integration_spin_wait(ctx: &Ctx) -> Result<AssertResult> {
 /// signals through the per-pair futex word. Pins the shared
 /// address-space futex semantics under the guest kernel: both
 /// workers must report `wake_latencies_ns` non-empty and
-/// `work_units > 0`. Because thread workers share the parent's
-/// mm, the futex word is automatically shared without explicit
-/// MAP_SHARED — a regression that breaks the per-pair allocation
+/// `work_units > 0`. The per-pair futex word is a
+/// parent-allocated `MAP_SHARED` anonymous region
+/// (`WorkloadHandle::futex_ptrs`); thread workers reach it
+/// through the shared address space they inherit from the
+/// parent — a regression that breaks the per-pair allocation
 /// would surface as zero latency samples.
 #[ktstr_test(
     llcs = 1,

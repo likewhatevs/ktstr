@@ -179,7 +179,7 @@ fn assert_page_locality_exact_threshold() {
 /// that produced no NUMA pages must FAIL the locality gate, not
 /// flip to Inconclusive.
 ///
-/// Rationale (`page_locality` doc, mod.rs L170-178): reporting
+/// Rationale (`page_locality` doc, types.rs L134-144): reporting
 /// `1.0` for zero observed pages would silently green broken runs
 /// that produced no NUMA signal; the function deliberately
 /// returns `0.0` instead, and the gate compares it against the

@@ -17,8 +17,8 @@
 //! in `validation.md` alongside this module.
 //!
 //! Modules: [`run`] (the engine — a bounded sharded cache with eviction, client
-//! load threads, fast-hit worker threads and slow-miss dispatcher threads, and
-//! per-phase stats reduction).
+//! threads that generate load and serve the fast in-cache hit path, slow-miss
+//! dispatcher threads, and per-phase stats reduction).
 
 pub(crate) mod run;
 

@@ -22,7 +22,7 @@
 //!    contract lives in one place; the numeric arms delegate to
 //!    the typed traits in [`crate::metric_types`]
 //!    (`Summable::sum_across`, `Maxable::max_across`,
-//!    `Rangeable::range_across`, `Modeable::mode_across`).
+//!    `Rangeable::range_across`).
 //!
 //! 3. [`collect_smaps_rollup`] / [`collect_smaps_rollup_hierarchical`]
 //!    — pull the per-process smaps_rollup map (from the leader
@@ -91,7 +91,8 @@ use super::{
 /// `Shared_*` etc. each accumulate via `saturating_add` —
 /// memory quantities are additive across the merged bucket.
 /// `saturating_add` mirrors the cumulative-counter merge policy
-/// elsewhere in this module (cpu_usage_usec, throttled_usec); a
+/// elsewhere in ctprof_compare (`cgroup_merge.rs`: `usage_usec`,
+/// `throttled_usec`); a
 /// u64 byte-count overflow implies more than 16 EiB of resident
 /// memory across the bucket, well past any realistic host.
 ///
@@ -107,7 +108,7 @@ use super::{
 /// emission characteristic. `Pss` stays the precise read for a
 /// merged bucket's resident footprint because the kernel
 /// proportionally divides shared pages across mappers
-/// (`fs/proc/task_mmu.c::smap_account`); operators tracking actual
+/// (`fs/proc/task_mmu.c::smaps_account`); operators tracking actual
 /// memory pressure should prefer `Pss` over `Rss + Shared_*`
 /// arithmetic on collapsed buckets.
 ///
@@ -401,10 +402,14 @@ pub fn build_groups(
             metrics.insert(m.name.to_string(), agg);
         }
         let cgroup_stats = if group_by == GroupBy::Cgroup {
-            // Pick the first sampled thread's (flattened) cgroup
-            // path and look up its enrichment. All threads in the
-            // bucket share the flattened key by construction, so
-            // the first is representative.
+            // Pick the first sampled thread's raw cgroup path and
+            // look up its enrichment. `snap.cgroup_stats` is keyed
+            // by raw cgroup paths, so the lookup uses `t.cgroup`
+            // verbatim (flattening produces a separate map and is
+            // not written back here). When a flatten/tighten
+            // pattern collapses several raw cgroups into one
+            // bucket, the first thread's raw cgroup is used as the
+            // representative enrichment.
             threads
                 .first()
                 .and_then(|t| snap.cgroup_stats.get(&t.cgroup).cloned())
@@ -454,12 +459,14 @@ pub fn build_groups(
 
 /// Aggregate one metric across a slice of threads per its rule.
 ///
-/// Each `Sum*` / `Max*` / `Range*` / `Mode*` arm dispatches
+/// Each `Sum*` / `Max*` / `Range*` arm dispatches
 /// through the trait method on the typed newtype defined in
 /// [`crate::metric_types`] — `sum_across` for [`Summable`],
-/// `max_across` for [`Maxable`], `range_across` for [`Rangeable`],
-/// `mode_across` for [`Modeable`] — then unwraps to the
-/// untyped scalar that [`Aggregated`] carries today; the
+/// `max_across` for [`Maxable`], `range_across` for [`Rangeable`]
+/// — then unwraps to the
+/// untyped scalar that [`Aggregated`] carries today; the `Mode*`
+/// arms instead route through [`mode_aggregate`] (tally-based),
+/// not a trait method; the
 /// unit-aware format dispatch (which would read the registry's
 /// `unit` tag rather than the wrapper type) is not implemented
 /// yet, so `Aggregated` stays scalar-shaped after this phase.
@@ -483,13 +490,12 @@ pub fn build_groups(
 ///   `Option<Range<Self>>`; the dispatch collapses `None` to
 ///   `Aggregated::OrdinalRange { min: 0, max: 0 }` at the call
 ///   boundary.
-/// - `Modeable::mode_across` returns
-///   `Option<(Self, count, total)>`; the dispatch collapses
-///   `None` to `Aggregated::Mode { value: "", count: 0, total }`
-///   where `total` is the bucket size (which is non-zero only
-///   when threads exist but the iterator was emptied — for
-///   `aggregate`, total tracks the bucket size directly so the
-///   `None` arm always carries `total: threads.len()`).
+/// - The `Mode*` arms call [`mode_aggregate`], which builds a
+///   per-value tally map; an empty bucket yields
+///   `Aggregated::Mode { tallies: (empty), total }` where `total`
+///   is the bucket size (`aggregate` passes `threads.len()`
+///   directly). The mode/count are derived on demand via
+///   [`Aggregated::mode_value`] / [`Aggregated::mode_count`].
 ///
 /// Downstream delta math therefore sees a well-defined value
 /// at every join boundary regardless of which side of a
@@ -500,19 +506,19 @@ pub fn build_groups(
 /// [`Rangeable`]: crate::metric_types::Rangeable
 /// [`Modeable`]: crate::metric_types::Modeable
 ///
-/// Mode-arm dispatch helper used by `aggregate`. Routes a typed
-/// iterator of [`crate::metric_types::CategoricalString`] through
-/// `mode_across`, then projects the result onto
-/// [`Aggregated::Mode`] with the supplied `total` (the number of
-/// threads in the bucket). Empty buckets surface as
-/// `Aggregated::Mode { value: "", count: 0, total }` matching the
-/// historical empty-bucket contract — downstream delta math sees
+/// Mode-arm dispatch helper used by `aggregate`. Builds a
+/// per-value tally map (`BTreeMap<String, usize>`) over a typed
+/// iterator of [`crate::metric_types::CategoricalString`] and
+/// returns [`Aggregated::Mode`] with the supplied `total` (the
+/// number of threads in the bucket). Empty buckets surface as
+/// `Aggregated::Mode { tallies: (empty), total }` — downstream
+/// delta math sees
 /// a well-defined value at the join boundary regardless of which
 /// side carried zero threads. Lifts the otherwise-identical
 /// match arms for [`AggRule::Mode`], [`AggRule::ModeChar`], and
 /// [`AggRule::ModeBool`] into one site so a future refactor that
-/// changes the empty-bucket contract or the `mode_across` return
-/// shape only edits one place.
+/// changes the empty-bucket contract or the tally shape only
+/// edits one place.
 fn mode_aggregate(
     total: usize,
     items: impl IntoIterator<Item = crate::metric_types::CategoricalString>,
@@ -607,9 +613,9 @@ fn measured_predicate(m: &CtprofMetricDef) -> Option<fn(&ThreadState) -> bool> {
 }
 
 pub fn aggregate(rule: AggRule, threads: &[&ThreadState]) -> Aggregated {
-    // `Modeable` is imported in `mode_aggregate`; the Mode arms
-    // route through that helper so the trait doesn't need to be
-    // in scope here. `CategoricalString` is still needed because
+    // `Modeable` is not used anywhere in this module: the Mode
+    // arms tally directly in `mode_aggregate` rather than calling
+    // `mode_across`. `CategoricalString` is still needed because
     // the ModeChar / ModeBool arms construct one for the
     // coercion path before passing the iterator to
     // `mode_aggregate`.
@@ -737,8 +743,10 @@ pub fn aggregate(rule: AggRule, threads: &[&ThreadState]) -> Aggregated {
 }
 
 /// Collapse dynamic segments of a cgroup path per every pattern
-/// in `patterns`. A pattern is a glob (`*` matches one segment,
-/// `**` matches multiple) where the literal portions are preserved
+/// in `patterns`. A pattern is a glob matched with glob's default
+/// `MatchOptions` (`require_literal_separator = false`), so `*` is
+/// NOT segment-bounded — it matches across `/` just like `**`. The
+/// literal portions are preserved
 /// and the wildcard portions are replaced with the wildcard token
 /// itself. Example: pattern `/kubepods/*/workload` applied to
 /// `/kubepods/pod-abc/workload` produces `/kubepods/*/workload`,

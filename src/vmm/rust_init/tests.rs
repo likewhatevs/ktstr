@@ -646,7 +646,8 @@ fn kill_scheduler_process_ignoring_sigterm_child_escalates_to_sigkill() {
 }
 
 /// kill_scheduler_process MUST NOT mutate SCHED_PID — the design
-/// at L320-327 of rust_init.rs explicitly keeps the helper
+/// contract on `kill_scheduler_process` (see its `# Pid lifecycle
+/// semantic` doc in process.rs) explicitly keeps the helper
 /// generic-pid (no implicit singleton-pid assumption) and defers
 /// SCHED_PID ownership to the dispatcher (the future
 /// Op::DetachScheduler arm). This test pins that contract against
@@ -695,8 +696,9 @@ fn kill_scheduler_process_does_not_mutate_sched_pid() {
 }
 
 /// SIGCHLD signal disposition is process-wide, so the
-/// `with_sigchld_default_*` and `poll_startup_under_sigign_*`
-/// regression tests must serialize. Without this lock, two
+/// `with_sigchld_default_*`, `poll_startup_*_under_sigchld_ignore`,
+/// `kill_scheduler_process_*`, and `sched_pid_*` regression tests
+/// must serialize. Without this lock, two
 /// concurrent `libc::signal(SIGCHLD, ...)` calls from different
 /// test threads could leave SIGCHLD in an unexpected state when
 /// either test inspects or restores it. Acquired via

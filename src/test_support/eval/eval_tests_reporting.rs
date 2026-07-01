@@ -323,24 +323,6 @@ fn placeholder_dump_production_call_sites_are_failure_gated() {
     );
 }
 
-/// Pin `bug_summary_line()` as positional arg 2 — immediately
-/// after `fingerprint_line` — in every failure-message
-/// `format!()` call. The 4 failure paths in `evaluate_vm_result`
-/// (assert-fail, monitor-fail, timeout, no-result) each render
-/// their stderr message via a `format!()` whose first two
-/// positionals are `fingerprint_line` then `bug_summary_line()`,
-/// so the operator scanning a CI log sees the BUG SUMMARY at
-/// the top of the error block where the eye stops on the first
-/// few lines. A regression that swaps the order, drops the
-/// call, or moves it past `entry.name`/`topo` would push the
-/// BUG SUMMARY below the test-name / topology line — exactly
-/// the location the redesign moved it out of.
-///
-/// Fragile to source refactors: a refactor that wraps the
-/// failure-message format!() blocks in a helper function would
-/// drop the per-site positional check. In that case, the
-/// helper itself takes both args by position; update this test
-/// to walk the helper's `format!()` instead.
 /// Strip a single leading `{name}` named-argument span from a
 /// format-string literal so `assert!(starts_with("\"{}{}"))`
 /// passes when the format string begins with `"{name}{}{}..."`.
@@ -370,6 +352,24 @@ fn strip_named_arg_prefix(s: &str) -> String {
     format!("\"{}", &rest[end + 1..])
 }
 
+/// Pin `bug_summary_line()` as positional arg 2 — immediately
+/// after `fingerprint_line` — in every failure-message
+/// `format!()` call. The 4 failure paths in `evaluate_vm_result`
+/// (assert-fail, monitor-fail, timeout, no-result) each render
+/// their stderr message via a `format!()` whose first two
+/// positionals are `fingerprint_line` then `bug_summary_line()`,
+/// so the operator scanning a CI log sees the BUG SUMMARY at
+/// the top of the error block where the eye stops on the first
+/// few lines. A regression that swaps the order, drops the
+/// call, or moves it past `entry.name`/`topo` would push the
+/// BUG SUMMARY below the test-name / topology line — exactly
+/// the location the redesign moved it out of.
+///
+/// Fragile to source refactors: a refactor that wraps the
+/// failure-message format!() blocks in a helper function would
+/// drop the per-site positional check. In that case, the
+/// helper itself takes both args by position; update this test
+/// to walk the helper's `format!()` instead.
 #[test]
 fn bug_summary_line_immediately_follows_fingerprint_line_in_all_failure_messages() {
     let src = include_str!("mod.rs");

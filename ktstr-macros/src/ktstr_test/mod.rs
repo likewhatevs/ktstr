@@ -962,7 +962,7 @@ fn validate_cross_attr(attrs: &AttrValues) -> syn::Result<()> {
     // effect — same compile-time cross-attr shape as the
     // `performance_mode` ↔ `no_perf_mode` mutex above. The
     // programmatic-construction path (bypassing the macro) is guarded at
-    // runtime in `src/test_support/entry.rs::validate`.
+    // runtime in `src/test_support/entry_validate.rs::validate`.
     if attrs.cpu_budget.is_some() && !(attrs.no_perf_mode_set && attrs.no_perf_mode) {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
@@ -983,7 +983,7 @@ fn validate_cross_attr(attrs: &AttrValues) -> syn::Result<()> {
     //
     // Defense-in-depth coverage matrix (compile-time here +
     // programmatic-construction runtime check in
-    // `src/test_support/entry.rs::validate`):
+    // `src/test_support/entry_validate.rs::validate`):
     //   - host_only + disk         : runtime-only (validate_host_only_mutex
     //                                 below gates only scheduler/num_snapshots/
     //                                 auto_repro, not disk; the conflict is
@@ -1036,7 +1036,7 @@ fn validate_cross_attr(attrs: &AttrValues) -> syn::Result<()> {
              expected-error tests. Drop the matcher (if you want any failure \
              to count) or set expect_err = true (if you want this specific \
              error to be the expected bug). The runtime check at \
-             entry.rs::validate enforces the same invariant for \
+             entry_validate.rs::validate enforces the same invariant for \
              programmatic-construction paths that bypass the macro.",
         ));
     }

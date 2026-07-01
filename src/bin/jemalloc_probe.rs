@@ -104,8 +104,10 @@ use serde::Serialize;
 
 // Source-share the engine via `#[path]` rather than `use ktstr::host_thread_probe::*`.
 // Linking the ktstr library into this binary would pull in the
-// library's early-dispatch ctor (`test_support::dispatch::ktstr_test_early_dispatch`,
-// tagged `#[ctor::ctor]`) plus the rest of the crate, bloating the
+// library's early-dispatch load-time constructor
+// (`ctor::declarative::ctor!` wrapping
+// `test_support::dispatch::ktstr_test_early_dispatch`) plus the rest
+// of the crate, bloating the
 // initramfs image and adding `.init_array` work that can stall the
 // probe's cross-process timing. `#[path]` compiles the same source
 // file into this bin crate directly — zero linker cost, same
@@ -178,9 +180,11 @@ fn format_comm_suffix(comm: Option<&str>) -> String {
 ///   probe emits one entry in the top-level `snapshots` array with
 ///   `interval_ms` absent.
 /// - **Multi-snapshot**: `--snapshots N --interval-ms MS` for
-///   `N > 1`. The probe resolves jemalloc symbols + enumerates tids
-///   ONCE up-front, then performs N attach/read/detach cycles per
-///   tid separated by `interval_ms` of sleep. The setup (ELF/DWARF
+///   `N > 1`. The probe resolves jemalloc symbols ONCE up-front,
+///   then per snapshot re-enumerates the target's tids (so threads
+///   spawned mid-run become visible) and performs an
+///   attach/read/detach cycle per tid, separated by `interval_ms` of
+///   sleep. The setup (ELF/DWARF
 ///   parse) is amortized across all N snapshots. Threads are NOT
 ///   held stopped between snapshots — each tid is detached before
 ///   the inter-snapshot sleep so the target workload continues to

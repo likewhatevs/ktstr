@@ -26,7 +26,8 @@
 //! stdout/stderr across the SHM ring, and the host's
 //! `crate::test_support::eval::host_side_llm_extract` runs `extract_via_llm`
 //! post-VM-exit. As a consequence, `ctx.payload(&SCHBENCH).run()`
-//! returns a `PayloadMetrics` with `metrics: vec![]` inside the
+//! returns `(AssertResult, PayloadMetrics)`, and the
+//! `PayloadMetrics` element carries `metrics: vec![]` inside the
 //! guest test body — extraction is deferred. The body therefore
 //! cannot inspect individual metrics here. The framework owns the
 //! sanity checks below.
@@ -42,15 +43,21 @@
 //!    points at a bypass: the value reached the LlmExtract slot
 //!    without traversing the LLM walker).
 //!
-//! Workload-specific assertions (minimum metric count, sign,
-//! magnitude bounds, semantic ranges) are intentionally NOT
-//! enforced at the framework level — those vary per payload
-//! (schbench's > 5 latency rows vs a hypothetical single-throughput
-//! benchmark, or schbench's non-negative microseconds vs a
-//! delta-emitting payload that legitimately reports negative deltas)
-//! and require a per-payload validation API that ktstr does not yet
-//! expose. See `crate::test_support::eval::validate_llm_extraction` for the host-side
-//! enforcement.
+//! Workload-specific bounds (minimum metric count, sign, magnitude)
+//! are intentionally NOT enforced at the framework level — those vary
+//! per payload (schbench's latency rows vs a hypothetical
+//! single-throughput benchmark, or schbench's non-negative
+//! microseconds vs a delta-emitting payload that legitimately reports
+//! negative deltas). They are declared per-payload via
+//! [`MetricBounds`](ktstr::test_support::MetricBounds) on the
+//! payload's `metric_bounds` field (`min_count` / `value_min` /
+//! `value_max`) and enforced host-side by `validate_metric_bounds`
+//! inside `host_side_llm_extract`; only per-metric semantic ranges
+//! are not yet a bound class. This test's [`SCHBENCH`] fixture
+//! declares no `metric_bounds`, so only the universal invariants
+//! above apply here. See
+//! `crate::test_support::eval::validate_llm_extraction` for the
+//! host-side enforcement of those universal invariants.
 //!
 //! **Stability disclaimer**: passing this test does NOT mean
 //! `LlmExtract` output is run-to-run stable for regression
@@ -64,7 +71,7 @@
 //!
 //! Model availability: tests here lazy-load the LLM model on the
 //! first `extract_via_llm` invocation (see `load_inference` in
-//! `src/test_support/model.rs`). With `KTSTR_MODEL_OFFLINE=1` and a
+//! `src/test_support/model/mod.rs`). With `KTSTR_MODEL_OFFLINE=1` and a
 //! cold cache, the load fails and `host_side_llm_extract` appends an
 //! `LlmExtract model load failed` detail. Inference itself is
 //! multi-minute on host CPU regardless of cache state, so the
@@ -100,7 +107,7 @@ use ktstr::scenario::Ctx;
 #[ktstr_test(llcs = 1, cores = 2, threads = 1, memory_mib = 2048, payload = SCHBENCH, ignore = true)]
 fn model_loaded_llm_extract_schbench(ctx: &Ctx) -> Result<AssertResult> {
     let (assert_result, _metrics) = ctx.payload(&SCHBENCH).run()?;
-    // For `OutputFormat::LlmExtract` payloads, `metrics.metrics` is
+    // For `OutputFormat::LlmExtract` payloads, `_metrics.metrics` is
     // intentionally empty inside the guest body — extraction is
     // deferred host-side. Forwarding `assert_result` lets the host's
     // `host_side_llm_extract` populate the metric set, apply the

@@ -8,8 +8,8 @@
 //!
 //! # Public surface
 //!
-//! `TokenBucket` is the single throttle primitive; `VirtioBlk` and
-//! its worker each hold one for IOPS and one for bandwidth, both
+//! `TokenBucket` is the single throttle primitive; the worker's
+//! `BlkWorkerState` holds one for IOPS and one for bandwidth, both
 //! materialised from a [`DiskThrottle`] config via
 //! `buckets_from_throttle`. The full type-level rationale —
 //! overconsumption policy, non-blocking invariants, why throttle

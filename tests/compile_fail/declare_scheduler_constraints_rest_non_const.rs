@@ -1,4 +1,4 @@
-// `validate_constraints_expr` must recurse into the struct
+// `validate_const_eligible` must recurse into the struct
 // literal's `..rest` spread. Without recursion, a non-const
 // expression in the rest slot (`..build_helper()`) would slip past
 // the outer Struct shape and surface as a deep const-eval failure

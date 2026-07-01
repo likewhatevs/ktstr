@@ -11,7 +11,7 @@
 //!
 //! These types are declarative — the corresponding kernel-call
 //! helpers live in the [`crate::workload::worker`] submodule
-//! (`set_sched_policy` in `worker/sched.rs`, `apply_sched_class`).
+//! (`set_sched_policy` in `worker/sched.rs`, `SchedClass::to_policy`).
 
 use std::time::Duration;
 
@@ -241,11 +241,11 @@ pub enum WakeMechanism {
 /// # Current behaviour
 ///
 /// All widths run the same four-stream scalar multiply path;
-/// the width selector is preserved on the wire and on
-/// [`WorkerReport`](crate::workload::WorkerReport) so a
-/// downstream classifier can distinguish runs that requested
-/// SIMD from runs that requested scalar even though the
-/// dispatch is uniform.
+/// the width selector is preserved on the wire (the
+/// `WorkType::AluHot` / `WorkPhase::AluHot` config carries
+/// `width`) so a downstream classifier can distinguish runs
+/// that requested SIMD from runs that requested scalar even
+/// though the dispatch is uniform.
 ///
 /// # Default semantics
 ///
@@ -317,11 +317,10 @@ pub enum AluWidth {
     /// AMX tile multiply chain (x86_64 server SKUs with AMX-INT8
     /// or AMX-BF16). The widest data-path on x86_64; uses XFD
     /// gating in the kernel
-    /// (`arch/x86/kernel/traps.c::handle_xfd_event` raises the
-    /// #NM trap, then
-    /// `arch/x86/kernel/fpu/xstate.c::__xfd_enable_feature`
-    /// allocates the dynamic XSAVE area) so the first AMX
-    /// instruction triggers a #NM fault and the kernel allocates
+    /// (the first AMX instruction raises a #NM trap that
+    /// `arch/x86/kernel/traps.c::handle_xfd_event` handles,
+    /// calling `arch/x86/kernel/fpu/xstate.c::__xfd_enable_feature`
+    /// to allocate the dynamic XSAVE area) so the kernel allocates
     /// the dynamic XSAVE area lazily — adds a one-time per-task
     /// latency spike on first use.
     ///
@@ -356,7 +355,7 @@ pub enum AluWidth {
 /// `WorkType::AsymmetricWaker` consumes when it wants to
 /// describe a waker / wakee pair without specifying priority
 /// values. When a per-worker class is applied,
-/// `apply_sched_class` maps the variant to the equivalent
+/// `SchedClass::to_policy` maps the variant to the equivalent
 /// [`SchedPolicy`] (using a default priority where applicable)
 /// and routes through `set_sched_policy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -407,7 +406,8 @@ const RT_DEFAULT_PRIO: u32 = 50;
 impl SchedClass {
     /// Resolve to an equivalent [`SchedPolicy`]. `Rt` uses
     /// `RT_DEFAULT_PRIO`; `Deadline` uses the minimum-bandwidth
-    /// reservation (1us runtime over 1ms period — passes
+    /// reservation (1us runtime, 1ms deadline, 10ms period —
+    /// passes
     /// `__checkparam_dl` and the default sysctl bounds).
     /// `Ext` maps to `SchedPolicy::Normal` because there is no
     /// userspace `SCHED_EXT` constant in libc; tests that want

@@ -338,12 +338,13 @@ fn redirect_pattern_for(
 }
 
 /// Detect whether the running binary has LLVM compiler-rt's profile
-/// runtime linked in by probing for `__llvm_profile_runtime` —
-/// the symbol that
-/// `compiler-rt/lib/profile/InstrProfilingRuntime.cpp` defines as
-/// `INSTR_PROF_PROFILE_RUNTIME_VAR`. Coverage-instrumented binaries
-/// link this symbol; non-instrumented binaries (e.g. `cargo-ktstr`
-/// in a normal release build) do not.
+/// runtime linked in by probing `.symtab` for the buffer-API entry
+/// points `__llvm_profile_write_buffer` /
+/// `__llvm_profile_get_size_for_buffer` (see the inline comment below
+/// for why these function symbols are used rather than the bare
+/// `__llvm_profile_runtime` marker, which `--gc-sections` can strip).
+/// Coverage-instrumented binaries link these symbols; non-instrumented
+/// binaries (e.g. `cargo-ktstr` in a normal release build) do not.
 ///
 /// Probes via the symtab walk that profraw flushing already uses
 /// (the symbol has hidden visibility, so dlsym would not find it).

@@ -153,9 +153,9 @@ fn snapshot_real_capture_op_watch_snapshot(ctx: &ktstr::scenario::Ctx) -> Result
 /// when either:
 /// - `report.active_obj_name` IS Some but doesn't appear in any
 ///   global-section map prefix (walker drift), OR
-/// - `Snapshot::active()` returns NoActiveScheduler in a capture
-///   that contains both `scx_sched_state` AND at least one global-
-///   section map (the projection failed to resolve).
+/// - `Snapshot::active()` returns NoActiveScheduler in a non-
+///   placeholder capture that has at least one global-section map
+///   (the projection failed to resolve).
 fn assert_active_obj_name_resolved(result: &VmResult) -> Result<()> {
     let captured = result.snapshot_bridge.drain();
     anyhow::ensure!(
@@ -188,14 +188,14 @@ fn assert_active_obj_name_resolved(result: &VmResult) -> Result<()> {
             );
         }
         // Snapshot::active() — the user-facing API — must resolve a
-        // non-None active_obj for a capture that has both scx state
-        // and global-section maps. The projection uses
+        // non-None active_obj for a capture that has global-section
+        // maps. The projection uses
         // active_obj_name as the principled tiebreaker (walker-
         // populated) and falls back to "exactly one global prefix"
         // (heuristic). Either path closes the test.
         anyhow::ensure!(
             !global_obj_names.is_empty(),
-            "snapshot '{tag}' has scx state but no global-section maps — \
+            "snapshot '{tag}' has no global-section maps — \
              the active-scheduler resolution has no obj to land on"
         );
         let view = ktstr::scenario::snapshot::Snapshot::new(report);

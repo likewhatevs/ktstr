@@ -25,25 +25,30 @@ use super::payload::{Metric, PayloadMetrics};
 /// tid appearing in the prefix" — so a caller can issue a precise
 /// diagnostic instead of a blanket "not found".
 pub enum ThreadLookup {
-    /// `snapshots.{snap_idx}.threads.N.tid == worker_tid` and
-    /// `snapshots.{snap_idx}.threads.N.allocated_bytes` are both
+    /// `snapshots.{snap_idx}.threads.N.Ok.tid == worker_tid` and
+    /// `snapshots.{snap_idx}.threads.N.Ok.allocated_bytes` are both
     /// present. Returns the observed counter plus the companion
     /// `deallocated_bytes` (if emitted).
     Found {
         allocated_bytes: u64,
         deallocated_bytes: Option<u64>,
     },
-    /// Probe emitted a `snapshots.{snap_idx}.threads.N.tid` matching
-    /// `worker_tid`, but no `snapshots.{snap_idx}.threads.N.allocated_bytes`
-    /// sibling. The probe hit an error on that thread — typically
-    /// an `error` entry replaces the counter fields.
+    /// Probe emitted a `snapshots.{snap_idx}.threads.N.{Ok,Err}.tid`
+    /// matching `worker_tid`, but no
+    /// `snapshots.{snap_idx}.threads.N.Ok.allocated_bytes` sibling.
+    /// Either the tid was on the `Err` arm (`.Err.tid`), where the
+    /// probe hit an error on that thread and `error`/`error_kind`
+    /// replace the counter fields, or it was on the `Ok` arm but the
+    /// `allocated_bytes` sibling was absent.
     MissingAllocatedBytes,
-    /// No `snapshots.{snap_idx}.threads.N.tid == worker_tid` entry in
-    /// the flat metric list. Probe did not visit the worker at all.
+    /// No `snapshots.{snap_idx}.threads.N.{Ok,Err}.tid == worker_tid`
+    /// entry in the flat metric list. Probe did not visit the worker
+    /// at all.
     TidAbsent,
     /// The flat metric list contained at least [`MAX_SCAN_INDEX`]
-    /// contiguous `snapshots.{snap_idx}.threads.N.tid` entries, none
-    /// of which matched `worker_tid`, and the scan hit the cap
+    /// contiguous `snapshots.{snap_idx}.threads.N.{Ok,Err}.tid`
+    /// entries, none of which matched `worker_tid`, and the scan hit
+    /// the cap
     /// before reaching the array terminator. The worker's tid may
     /// exist at a later index and be invisible to the scan.
     /// Distinct from `TidAbsent` — this outcome means the lookup is

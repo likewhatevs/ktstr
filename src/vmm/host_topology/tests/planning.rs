@@ -108,7 +108,7 @@ fn cpu_cap_resolve_non_numeric_env_errors() {
 }
 
 /// Env var set to `"0"` flows through `CpuCap::new(0)` and
-/// surfaces the same "--cpu-cap must be ≥ 1 (got 0)" error.
+/// surfaces the same "--cpu-cap must be ≥ 1 CPU (got 0)" error.
 /// Regression guard: typos like `KTSTR_CPU_CAP=0` must NOT
 /// silently fall back to "no cap".
 #[test]
@@ -292,10 +292,11 @@ fn acquire_llc_plan_rejects_cap_over_allowed_cpus() {
 // `sandbox_degraded_display_text` (includes RootCgroupRefused),
 // `parent_controllers_include_missing_file`, and
 // `read_cpuset_effective_missing_file_returns_none`. The
-// try_create RootCgroupRefused guard requires a test-only seam
-// over `read_self_cgroup_path` which doesn't exist yet — tracked
-// for a future iteration; the variant's Display is already
-// covered.
+// try_create RootCgroupRefused path is regression-tested via the
+// `is_root_cgroup` seam test
+// (`is_root_cgroup_handles_slash_empty_and_whitespace` in
+// src/vmm/cgroup_sandbox.rs), in addition to the variant's
+// Display coverage.
 // ---------------------------------------------------------------
 
 // ---------------------------------------------------------------

@@ -91,7 +91,8 @@ pub fn apply_wprof_memory_floor(raw_mib: u32, wprof: bool) -> u32 {
 /// guest.
 ///
 /// The args render to the kernel cmdline as
-/// `KTSTR_WPROF_ARGS=<space-joined>`; guest init parses them and
+/// `KTSTR_WPROF_ARGS=<args joined with ASCII Unit Separator `\x1F`>`
+/// (see [`WprofConfig::args_cmdline`]); guest init parses them and
 /// invokes `/bin/wprof` with those args during auto-repro.
 #[derive(Debug, Clone)]
 pub struct WprofConfig {

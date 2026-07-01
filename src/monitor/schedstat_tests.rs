@@ -1,5 +1,5 @@
-//! Unit tests for `SchedstatDeltas` aggregation in
-//! `MonitorSummary::from_samples`.
+//! Unit tests for `SchedstatDeltas` and per-domain `SchedDomainLbDelta`
+//! aggregation in `MonitorSummary::from_samples`.
 //! Co-located via the sibling `*_tests.rs` pattern.
 
 #![cfg(test)]

@@ -6,16 +6,22 @@
 //! pick named values out of `std::env::args()` without getting in the
 //! way of the harness's own flag handling.
 //!
-//! All helpers accept a `&[String]` slice and return either the first
-//! matching value or `None`. They are intentionally lenient: they only
-//! recognize the `--ktstr-*=VALUE` form (or, for `--ktstr-test-fn`,
+//! The `extract_*` helpers accept a `&[String]` slice and return the
+//! first matching value or `None`. They are intentionally lenient: they
+//! only recognize the `--ktstr-*=VALUE` form (or, for `--ktstr-test-fn`,
 //! also the space-separated form) and ignore unknown flags entirely.
 //! That keeps the dispatch path inert for binaries that aren't built
 //! against ktstr.
 //!
-//! [`resolve_cgroup_root`] is the one outlier: it sources the path from
-//! the initramfs-mounted `/sched_args` file first, then falls back to
-//! the process argv. Used only from guest-side dispatch to derive the
+//! The remaining helpers have their own signatures and flag namespace:
+//! [`current_work_type`] takes no argument (it reads `std::env::args()`
+//! itself) and returns a `String`; the `--cell-parent-cgroup` helpers
+//! ([`parse_cell_parent_cgroup`], [`cell_parent_path_is_valid`]) parse
+//! and validate that flag rather than the `--ktstr-*` form.
+//!
+//! [`resolve_cgroup_root`] is a further outlier: it sources the path
+//! from the initramfs-mounted `/sched_args` file first, then falls back
+//! to the process argv. Used only from guest-side dispatch to derive the
 //! cgroup manager root for the running test.
 
 /// Extract the test function name from `--ktstr-test-fn=NAME` or

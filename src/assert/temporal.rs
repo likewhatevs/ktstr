@@ -18,7 +18,7 @@
 //!      stay inside `[mean·(1-tol), mean·(1+tol)]`.
 //!   5. `converges_to(target, tol, deadline_ms)` — three
 //!      consecutive samples land inside `[target-tol, target+tol]`
-//!      before `deadline_ms`.
+//!      at or before `deadline_ms`.
 //!   6. `always_true` — boolean invariant at every sample
 //!      (`SeriesField<bool>` only).
 //!   7. `ratio_within(other, lo, hi)` — cross-field correlation
@@ -33,17 +33,6 @@ use crate::scenario::snapshot::{SnapshotError, SnapshotResult};
 
 use super::{AssertDetail, DetailKind, Outcome, Verdict};
 
-/// Per-sample column extracted from a
-/// [`SampleSeries`](crate::scenario::sample::SampleSeries). Each
-/// slot is a [`SnapshotResult<T>`] so a missing or
-/// type-mismatched field does NOT abort the whole projection — it
-/// surfaces at the temporal-assertion site as a per-sample error
-/// the caller decides how to handle.
-///
-/// The label, tags, and per-sample timestamps are carried so
-/// failure-path messages name the offending sample without the
-/// caller re-threading the series. Tags and elapsed-ms vectors
-/// are always the same length as `values`.
 /// Per-sample triple `(tag, elapsed_ms, &value)` yielded by
 /// [`SeriesField::iter_full`] and stored in the per-phase buckets
 /// returned by [`SeriesField::by_phase`].
@@ -71,6 +60,17 @@ fn fmt_elapsed_num(elapsed_ms: Option<u64>) -> String {
     }
 }
 
+/// Per-sample column extracted from a
+/// [`SampleSeries`](crate::scenario::sample::SampleSeries). Each
+/// slot is a [`SnapshotResult<T>`] so a missing or
+/// type-mismatched field does NOT abort the whole projection — it
+/// surfaces at the temporal-assertion site as a per-sample error
+/// the caller decides how to handle.
+///
+/// The label, tags, and per-sample timestamps are carried so
+/// failure-path messages name the offending sample without the
+/// caller re-threading the series. Tags and elapsed-ms vectors
+/// are always the same length as `values`.
 #[derive(Debug, Clone)]
 #[must_use = "SeriesField records nothing until a temporal pattern is invoked"]
 pub struct SeriesField<T> {
@@ -339,8 +339,8 @@ impl<T> SeriesField<T> {
     /// Yields entries in the same order as the underlying
     /// `Vec<SnapshotResult<T>>` storage; tags and elapsed-ms
     /// vectors are guaranteed equal-length to `values` by
-    /// [`Self::from_parts`]'s `assert_eq!` checks (which run in
-    /// both debug and release builds).
+    /// [`Self::from_parts_with_phases_opt`]'s `assert_eq!` checks
+    /// (which run in both debug and release builds).
     pub fn iter_full(&self) -> impl Iterator<Item = (&str, Option<u64>, &SnapshotResult<T>)> {
         self.tags
             .iter()
@@ -1803,7 +1803,7 @@ impl SeriesField<f64> {
             match slot {
                 // A non-finite value (NaN/inf) cannot be band-checked
                 // — `v < lo` is always false for NaN — and a single
-                // NaN poisons the mean (1320), making `lo`/`hi` NaN so
+                // NaN poisons the mean (line 1864), making `lo`/`hi` NaN so
                 // EVERY sample slips past the band and the assertion
                 // silently PASSES. Treat a non-finite value as a gap,
                 // like a projection error: drop it from the band
@@ -2325,10 +2325,6 @@ fn maybe_log_pass_temporal<F: FnOnce() -> String>(
         tracing::info!(target: "ktstr::assert::temporal", "{m}");
     }
 }
-
-// Bridge into Verdict's internal AssertResult — added below as an
-// associated method on Verdict so the temporal module does not
-// reach into internals from a sibling.
 
 #[allow(dead_code)]
 fn _silence_snapshot_error_import(_: SnapshotError) {}
@@ -3397,7 +3393,7 @@ mod tests {
         // `series.stats(...)` projection will produce a per-sample
         // `Err(SnapshotError::MissingStats { tag: "periodic_001" })`
         // for that row (see SampleSeries::stats at
-        // src/scenario/sample.rs lines 275-280) — the analogue of
+        // src/scenario/sample/stats.rs lines 65-67) — the analogue of
         // the placeholder path producing PlaceholderSample. The
         // outer rows carry concrete JSON so their projection slot
         // is Ok; only the middle row exercises the MissingStats
@@ -4248,7 +4244,7 @@ mod tests {
         // earlier=0 → Inconclusive with "earlier value is 0".
         // earlier_f == 0 means the baseline measured zero; the
         // ratio later/earlier is undefined (INSTRUMENT-derived
-        // zero denominator). Pre-#434 this was Fail; post-#434
+        // zero denominator). This was previously Fail; now
         // the gate cannot evaluate so the verdict is neither
         // pass nor fail.
         let f = SeriesField::<f64>::from_parts_with_phases(

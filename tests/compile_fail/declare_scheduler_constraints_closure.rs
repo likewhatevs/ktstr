@@ -1,4 +1,4 @@
-// Pins the catchall arm of `validate_constraints_expr`. A closure
+// Pins the catchall arm of `validate_const_eligible`. A closure
 // expression `|| TopologyConstraints::DEFAULT` parses as
 // `Expr::Closure`, which is not const-eligible and falls into the
 // catchall arm. The diagnostic is the shorter base message

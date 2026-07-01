@@ -477,11 +477,14 @@ fn apply_spawn(
             )?;
             // for_scenario_engine pins Fork in the constructor
             // so the runtime assert that used to live here is
-            // redundant.  WorkSpec::pcomm is intentionally
-            // dropped on this path — see WorkSpec::pcomm doc:
-            // Fork-mode worker pcomm derives from the parent
-            // process's name, not from WorkSpec, so the
-            // pcomm field has no effect for spawn ops.
+            // redundant.  A pcomm-bearing WorkSpec is REJECTED
+            // here, not silently dropped: for_scenario_engine
+            // bails when `work.pcomm.is_some()` and the `?` on
+            // the next line propagates that error. Fork-mode
+            // spawns leave `task->group_leader->comm` at the
+            // runner binary name, so pcomm can't take effect on
+            // this path — use CgroupDef::pcomm or
+            // WorkloadHandle::spawn_pcomm_cgroup to drive it.
             let wl =
                 WorkloadConfig::for_scenario_engine(&work, n, affinity, work.work_type.clone())?;
             let mut h = WorkloadHandle::spawn(&wl)?;
@@ -1364,7 +1367,7 @@ fn apply_capture_cgroup_procs(ctx: &Ctx, tag: &str, cgroup: &str) -> Result<()> 
         // the actionable missing-bridge diagnostic behind any
         // unrelated read failure (e.g. flaky cgroupfs); the
         // pattern matches Op::Spawn(SpawnPlacement::Cgroup(""))
-        // bail-before-spawn at L2540-2553.
+        // bail-before-spawn at L423-429.
         if crate::scenario::snapshot::with_active_bridge(|_| ()).is_none() {
             anyhow::bail!(
                 "Op::CaptureCgroupProcs(tag={tag:?}, cgroup={cgroup:?}): \
@@ -2164,7 +2167,7 @@ pub(super) fn dispatch_replace_scheduler(
     // failure-dump output goes to the new scheduler's own file.
     crate::vmm::rust_init::restart_sched_exit_monitor_with_log(Some(&log));
     // Quiesce the worker before capturing the baseline seqno.
-    // Symmetric with Op::AttachScheduler's wait at L3377-3382:
+    // Symmetric with Op::AttachScheduler's wait at L2074:
     // without this gate, a coord scan tick that fired during
     // kill_current_scheduler (which can take up to
     // SCHED_LIFECYCLE_KILL_GRACE = 10 s) may still be in a

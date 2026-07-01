@@ -362,7 +362,7 @@ fn build_layout_index_skips_bitfields_in_candidates() {
 fn union_works_like_struct_for_layout_and_member_lookup() {
     // BTF:
     //   id 1: u64
-    //   id 2: T (struct, kptr target) { u64 x @ 0 }
+    //   id 2: T (struct, kptr target) { u64 x @ 8 }
     //   id 3: T*
     //   id 4: P (UNION) { u64 slot @ 16 }
     //   id 5: SourceU (struct) { u64 f @ 8 }

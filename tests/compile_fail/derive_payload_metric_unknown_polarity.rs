@@ -1,8 +1,9 @@
 // `#[metric(polarity = Nonsense)]` — an unrecognized polarity ident
-// must fail to compile. The macro accepts only the four `Polarity`
+// must fail to compile. The macro accepts four of the five `Polarity`
 // variants (`HigherBetter`, `LowerBetter`, `Unknown`, and
-// `TargetValue(<float>)`); anything else is rejected with a pointer
-// to the expected variants so typos surface at compile time.
+// `TargetValue(<float>)`); `Informational` is not accepted via the
+// attribute, and a bare unrecognized ident is rejected with
+// `unknown polarity `<ident>`` so typos surface at compile time.
 use ktstr::Payload;
 
 #[derive(Payload)]

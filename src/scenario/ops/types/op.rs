@@ -386,16 +386,15 @@ pub enum Op {
     /// (each request waits for the previous freeze's vCPUs to
     /// fully resume before issuing).
     ///
-    /// **Guest → host wire.** Locked at an in-kernel ioeventfd
-    /// doorbell at a dedicated MMIO GPA inside the MMIO gap
-    /// (e.g. `MMIO_GAP_START + 0x3000`). The guest writes the tag
-    /// into a small SHM-resident slot and then writes the doorbell
-    /// GPA via the existing `/dev/mem` mmap pattern that the SHM
-    /// ring already uses. KVM dispatches in-kernel
-    /// (`KVM_IOEVENTFD`) without a vCPU userspace exit, the
-    /// freeze coordinator wakes on `eventfd_signal`, and the
+    /// **Guest → host wire.** In-guest scenarios submit the request
+    /// over the virtio-console port-1 TLV stream: `request_snapshot`
+    /// builds a `SnapshotRequestPayload` and writes it via
+    /// `write_msg(MsgType::SnapshotRequest, ...)` to `/dev/vport0p1`
+    /// (`src/vmm/guest_comms.rs`). The host coordinator decodes the
+    /// `MSG_TYPE_SNAPSHOT_REQUEST` frame, runs
+    /// `freeze_and_dispatch(FreezeMode::Capture { .. })`, and the
     /// installed `CaptureCallback` returns the resulting report
-    /// through a paired reply completion. See
+    /// through a paired reply frame. See
     /// [`CaptureCallback`](crate::scenario::snapshot::CaptureCallback)
     /// for the full protocol.
     ///
@@ -537,7 +536,7 @@ pub enum Op {
     /// constructor wraps a 1-element vec.
     ///
     /// **Dispatch.** The executor's arm calls
-    /// `dispatch_kernel_op_request` (`src/scenario/ops/mod.rs:3717`), which
+    /// `dispatch_kernel_op_request` (`src/scenario/ops/dispatch.rs:2386`), which
     /// uses the in-process `SnapshotBridge` callback when one is
     /// installed (the test-fixture seam) and falls back to the
     /// virtio-console port-1 wire path (`MsgType::KernelOpRequest`)
@@ -574,7 +573,7 @@ pub enum Op {
     /// or chained singletons.
     ///
     /// **Dispatch.** The executor's arm calls
-    /// `dispatch_kernel_op_request` (`src/scenario/ops/mod.rs:3717`), which
+    /// `dispatch_kernel_op_request` (`src/scenario/ops/dispatch.rs:2386`), which
     /// uses the in-process `SnapshotBridge` callback when one is
     /// installed (the test-fixture seam) and falls back to the
     /// virtio-console port-1 wire path (`MsgType::KernelOpRequest`)
@@ -672,7 +671,7 @@ pub enum Op {
     /// and wait for it to publish its first BPF object accessors.
     ///
     /// **Dispatch** (`dispatch_attach_scheduler` at
-    /// `src/scenario/ops/mod.rs:3510`): waits up to 60s for the
+    /// `src/scenario/ops/dispatch.rs:2032`): waits up to 60s for the
     /// accessor-init worker to quiesce (handles the case where the
     /// boot scheduler's first publish is still in flight), captures
     /// the pre-spawn publish seqno, spawns the staged scheduler
@@ -702,7 +701,7 @@ pub enum Op {
     /// Detach the currently-running scheduler.
     ///
     /// **Dispatch** (`dispatch_detach_scheduler` →
-    /// `kill_current_scheduler` at `src/scenario/ops/mod.rs:3386`):
+    /// `kill_current_scheduler` at `src/scenario/ops/dispatch.rs:1896`):
     /// stops the host's sched_exit_monitor so the intentional kill
     /// isn't promoted into a test-fatal scheduler-died signal,
     /// writes `'S'` to `/proc/sysrq-trigger` to start the kernel-
@@ -740,7 +739,7 @@ pub enum Op {
     /// [`Op::ReplaceScheduler`] with the same staged spec.
     ///
     /// **Dispatch** (`dispatch_restart_scheduler` at
-    /// `src/scenario/ops/mod.rs:3589`): kills the current scheduler
+    /// `src/scenario/ops/dispatch.rs:2129`): kills the current scheduler
     /// via the shared `kill_current_scheduler` helper, spawns the
     /// boot scheduler from the hardcoded `/scheduler` + `/sched_args`
     /// paths with log at `/tmp/sched.log`, then re-installs the
@@ -763,7 +762,7 @@ pub enum Op {
     /// meaning. Use [`Op::AttachScheduler`] for the first attach.
     ///
     /// **Dispatch** (`dispatch_replace_scheduler` at
-    /// `src/scenario/ops/mod.rs:3616`): kills the current scheduler
+    /// `src/scenario/ops/dispatch.rs:2153`): kills the current scheduler
     /// via the shared `kill_current_scheduler` helper, spawns the
     /// named staged scheduler binary from
     /// `/staging/schedulers/<name>/`, re-installs the
@@ -837,9 +836,10 @@ pub enum Op {
     /// ID walk (including `EPERM` from missing `CAP_SYS_ADMIN`), so
     /// such errors surface as the no-matching-map case rather than
     /// a distinct EPERM error — acceptable because ktstr always runs
-    /// as root inside the guest, so the CAP_SYS_ADMIN gate at
-    /// `kernel/bpf/syscall.c:4741` is always satisfied and the EPERM
-    /// path is unreachable in practice.
+    /// as root inside the guest, so the CAP_SYS_ADMIN gates at
+    /// `kernel/bpf/syscall.c:4761` (`BPF_MAP_GET_NEXT_ID` walk) and
+    /// `:4869` (`BPF_MAP_GET_FD_BY_ID`) are always satisfied and the
+    /// EPERM path is unreachable in practice.
     ///
     /// **Example.**
     /// ```ignore
@@ -1423,17 +1423,17 @@ impl CpusetSpec {
 ///   back to the host TSC unexpectedly. Atomic bit-set without
 ///   read-back is provided by [`KernelValue::OrU32`] — the RMW
 ///   variant whose width matches `struct scx_rq.flags` (`u32`
-///   at `kernel/sched/sched.h:802`). Note there is no
+///   at `kernel/sched/sched.h:803`). Note there is no
 ///   `OrU64` sibling: a 64-bit RMW at this field address would
 ///   corrupt the adjacent `u32 nr_immed` field at
-///   `kernel/sched/sched.h:803`. Width is the variant tag, so
+///   `kernel/sched/sched.h:804`. Width is the variant tag, so
 ///   wrong-width writes are a compile-time error rather than a
 ///   silent field-overflow bug at runtime. Pair `OrU32(SCX_RQ_CLK_VALID)`
 ///   with the prior `U64(clock_val)` write in a single
 ///   `Op::WriteKernelCold` batch so both land under one freeze
 ///   rendezvous and the kernel's documented
 ///   write-clock-BEFORE-OR-flag ordering (per
-///   `kernel/sched/sched.h:1843-1848` `scx_rq_clock_update`)
+///   `kernel/sched/sched.h:1848-1854` `scx_rq_clock_update`)
 ///   holds.
 /// * **`scx-ktstr` private bss / per-CPU scratch** — the
 ///   fixture scheduler exposes a dedicated write surface for
@@ -1500,14 +1500,14 @@ pub enum KernelTarget {
         cpu: u32,
     },
     /// Per-task field of `struct task_struct` — SCX-managed tasks
-    /// only (the dispatcher's L6+L7 validation gates reject non-SCX
+    /// only (the dispatcher's L6 sched_class gate rejects non-SCX
     /// tasks). Resolved at dispatch by walking `init_task.tasks`
     /// plus each leader's `signal->thread_head` to locate the task
     /// with matching `pid` AND matching `expected_start_time_ns`
     /// (anti-PID-reuse identity), then adding the BTF-resolved
     /// nested-path byte offset of `field` within `task_struct`.
     /// See `crate::vmm::wire::KernelOpTarget::TaskField` for the
-    /// 8-layer validation chain the dispatcher applies.
+    /// 7-layer validation chain the dispatcher applies.
     ///
     /// `expected_start_time_ns` is `task->start_time` captured at
     /// WorkSpec spawn time. Get it via
@@ -1527,7 +1527,7 @@ pub enum KernelTarget {
         /// SCX-only fields recommended (e.g. `"scx.dsq_vtime"`,
         /// `"start_boottime"`). `"se.vruntime"` writes are
         /// silently discarded by EEVDF's `place_entity` on enqueue
-        /// (`kernel/sched/fair.c:5329-5414` since 6.6) AND rejected
+        /// (`kernel/sched/fair.c:5381-5514` since 6.6) AND rejected
         /// by the SCX-only class gate; do not use.
         field: Cow<'static, str>,
     },
@@ -1601,9 +1601,9 @@ impl KernelTarget {
     /// sysconf(_SC_CLK_TCK)`.
     ///
     /// `field` is dot-separated nested-member path. The dispatcher
-    /// applies an 8-layer validation chain (pid match, start_time
+    /// applies a 7-layer validation chain (pid match, start_time
     /// identity, lifetime, on_rq=0, scx queued-empty, ext
-    /// sched_class, SCHED_EXT policy, start_boottime != 0) before
+    /// sched_class, start_boottime != 0) before
     /// the write/read lands — see
     /// `crate::vmm::wire::KernelOpTarget::TaskField` for the full
     /// contract.
@@ -1614,7 +1614,7 @@ impl KernelTarget {
     /// `"start_boottime"` (task fork timestamp).
     ///
     /// **Do NOT write `"se.vruntime"`.** EEVDF's `place_entity`
-    /// (`kernel/sched/fair.c:5329-5414`, since 6.6) overwrites
+    /// (`kernel/sched/fair.c:5381-5514`, since 6.6) overwrites
     /// `se->vruntime` on every enqueue; direct vruntime writes are
     /// silently discarded for sleeping tasks (our validation gate).
     /// CFS-class tasks are rejected before reaching the write
@@ -1709,9 +1709,9 @@ pub enum KernelValue {
     /// **No `OrU64` sibling exists by design.** The canonical
     /// scheduler-flags use case ([`KernelValue::OrU32`] →
     /// `struct scx_rq.flags`) is on a `u32` field per
-    /// `kernel/sched/sched.h:802`; a 64-bit RMW at that address
+    /// `kernel/sched/sched.h:803`; a 64-bit RMW at that address
     /// would corrupt the adjacent `u32 nr_immed` field at
-    /// `kernel/sched/sched.h:803`. If a future u64 RMW use case
+    /// `kernel/sched/sched.h:804`. If a future u64 RMW use case
     /// emerges with a verified width, add the variant then.
     U64(u64),
     /// Variable-length byte payload. Written non-atomically; the
@@ -1726,11 +1726,11 @@ pub enum KernelValue {
     /// into it, and writes the new value back. Width is u32 — the
     /// canonical use case is OR-ing a single-bit kernel flag (e.g.
     /// `SCX_RQ_CLK_VALID = 1 << 5`) into `struct scx_rq.flags`,
-    /// declared `u32` at `kernel/sched/sched.h:802` inside the
+    /// declared `u32` at `kernel/sched/sched.h:803` inside the
     /// struct opened at L793. A 64-bit RMW at a u32 field address
     /// would either silently truncate the upper 32 bits or
     /// corrupt the adjacent `u32 nr_immed` field at
-    /// `kernel/sched/sched.h:803`, so the variant tag itself
+    /// `kernel/sched/sched.h:804`, so the variant tag itself
     /// picks the width and rules out width mismatch at the call
     /// site.
     ///
@@ -1779,7 +1779,7 @@ pub enum KernelValue {
     /// guest write races our RMW for single-op use cases. The
     /// `SCX_RQ_CLK_VALID` case specifically requires
     /// **write-clock-BEFORE-OR-flag** ordering per the kernel's
-    /// own `scx_rq_clock_update` at `kernel/sched/sched.h:1843-1848`
+    /// own `scx_rq_clock_update` at `kernel/sched/sched.h:1848-1854`
     /// (which does `WRITE_ONCE(rq->scx.clock, val)` then
     /// `smp_store_release(&rq->scx.flags, flags |
     /// SCX_RQ_CLK_VALID)`); a host-side caller that wants the

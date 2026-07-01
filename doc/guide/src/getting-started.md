@@ -51,8 +51,9 @@ two binaries.
 
 `cargo install --locked ktstr`
 installs the two user-facing binaries (`ktstr` host-side CLI and
-`cargo-ktstr` dev workflow plugin). The two test-fixture binaries
-(`ktstr-jemalloc-probe`, `ktstr-jemalloc-alloc-worker`) the crate's
+`cargo-ktstr` dev workflow plugin). The four test-fixture binaries
+(`ktstr-jemalloc-probe`, `ktstr-jemalloc-alloc-worker`,
+`ktstr-schbench-validate`, `ktstr-taobench-validate`) the crate's
 integration tests spawn require the non-default `integration`
 feature, so a default install excludes them.
 
@@ -258,9 +259,10 @@ return assertion results. `Ctx` provides the guest topology
 
 ### What gets checked
 
-**Nothing, by default.** `Assert::default_checks()` is the all-`None`
+**Nothing, by default.** `Assert::default_checks()` is the no-overrides
 identity (`Self::NO_OVERRIDES`) — every worker check, fairness check,
-monitor threshold, and starvation gate is **opt-in**. A bare
+monitor threshold, and starvation gate is unset/off, so all are
+**opt-in**. A bare
 `#[ktstr_test]` boots the VM, runs the scenario, and reports `pass`
 even if the scheduler stalled, starved workers, or never dispatched
 a task.

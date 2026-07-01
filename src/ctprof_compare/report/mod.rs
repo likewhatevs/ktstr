@@ -4,7 +4,7 @@
 //! Each section emits through a dedicated submodule so the
 //! orchestrator below stays a slim sequencer:
 //!
-//! - [`primary`] — `## Primary metrics` table (52 non-taskstats
+//! - [`primary`] — `## Primary metrics` table (53 non-taskstats
 //!   rows + 34 taskstats rows). Three layouts based on
 //!   [`GroupBy`]: hierarchical cgroup + pcomm + comm tree
 //!   under [`GroupBy::All`], one-table-per-parent under

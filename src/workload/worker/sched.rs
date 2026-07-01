@@ -79,7 +79,7 @@ pub(super) fn parse_schedstat_line(data: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// Print a single "schedstat unavailable" warning for the lifetime
-/// of the process. The workload spawns `N_WORKERS` threads, each of
+/// of the process. The workload spawns N worker threads, each of
 /// which calls `read_schedstat` twice; without a gate this would
 /// emit up to `2N` duplicate lines on a kernel without
 /// `CONFIG_SCHED_INFO`.
@@ -393,8 +393,9 @@ pub(super) fn set_sched_policy(pid: libc::pid_t, policy: SchedPolicy) -> Result<
             //   value; the kernel rejects unknown flag bits with
             //   EINVAL.
             // - The kernel copies `attr` into kernel space inside
-            //   the syscall (`copy_struct_from_user` in
-            //   kernel/sched/syscalls.c) and does not retain a
+            //   the syscall (`sched_copy_attr` in
+            //   kernel/sched/syscalls.c, via `copy_struct_from_user`)
+            //   and does not retain a
             //   reference to our stack memory after the syscall
             //   returns, so the borrow only needs to outlive the
             //   single syscall.

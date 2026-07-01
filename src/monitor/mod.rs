@@ -674,7 +674,8 @@ pub struct RqSchedstat {
 /// Domains are ordered from lowest (e.g. SMT, level 0) to highest
 /// (e.g. NUMA, level N) following the kernel's `sd->parent` chain.
 /// `newidle_call`, `newidle_success`, and `newidle_ratio` are `None`
-/// on 6.16+ where the kernel removed these fields.
+/// when the kernel lacks these fields (added in 7.0; backported to
+/// 6.18.5+, 6.12.65+; not present on 6.16-6.18.4).
 /// CONFIG_SCHEDSTATS load balancing stats are in the optional `stats`
 /// field.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]

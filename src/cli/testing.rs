@@ -1,7 +1,8 @@
 //! Shared test helpers for the `cli/` test modules.
 //!
-//! Tests across `kernel_list.rs`, `stats_cmds/`, and elsewhere
-//! follow the same on-disk layout boilerplate: open a tempdir,
+//! Tests in `stats_cmds/` (and any future `cli/` test that
+//! diagnoses sidecars) follow the same on-disk layout
+//! boilerplate: open a tempdir,
 //! create a `<tmp>/<run-name>/` directory, write one or more
 //! `.ktstr.json` files into it, call `explain_sidecar(<run-name>,
 //! Some(tmp.path()), ...)`. The helpers below collapse that
@@ -65,7 +66,7 @@ pub(super) fn write_corrupt_sidecar(
 /// `Vec<T>` field names on [`crate::test_support::SidecarResult`].
 /// These fields are hard-required (serde fails deserialize on
 /// absence) and serialize as `[]` when empty — distinct from
-/// the 10 `Option<T>` fields the diagnostic surface enumerates.
+/// the 11 `Option<T>` fields the diagnostic surface enumerates.
 /// The catalog and projection helper MUST never surface these
 /// names, since "missing Option" and "empty Vec" are different
 /// invariants.

@@ -2356,6 +2356,10 @@ fn merge_kind_enum_exhaustively_covers_metric_kind_variants() {
         MergeKind::Recompute,
     );
     assert_eq!(MetricKind::PerPhase.merge_kind(), MergeKind::Recompute);
+    assert_eq!(
+        MetricKind::PerRunDistribution.merge_kind(),
+        MergeKind::Recompute,
+    );
 }
 
 /// merge_matched_phase_buckets must INCLUDE a synthesized

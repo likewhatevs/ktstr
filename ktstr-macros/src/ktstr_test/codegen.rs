@@ -469,7 +469,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     // `post_vm_unconditional` has no default — when the attribute
     // omits it, the field stays `None` (matching `KtstrTestEntry::DEFAULT`)
     // and the unconditional dispatch arm at
-    // `src/test_support/eval.rs` is a no-op for that entry.
+    // `src/test_support/eval/post_vm.rs` is a no-op for that entry.
     let post_vm_unconditional_field =
         some_wrapped_entry_field(&post_vm_unconditional, quote! { post_vm_unconditional });
     // `config = EXPR` lands in `KtstrTestEntry::config_content`, which

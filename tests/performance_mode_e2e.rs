@@ -62,7 +62,7 @@ fn assert_perphase_metrics_survive_detach(result: &VmResult) -> Result<()> {
 // duration_s budgets the in-scenario hold window: run_step clamps each Fixed
 // hold to `(scenario_start + duration_s) - now` (ops/mod.rs), so it must cover
 // Step0 (4s) + the detach op + Step1 (4s). Op::DetachScheduler waits up to the
-// 10s SCX_DISABLED grace (SCHED_LIFECYCLE_KILL_GRACE, dispatch.rs:1526), so a
+// 10s SCX_DISABLED grace (SCHED_LIFECYCLE_KILL_GRACE, dispatch.rs:1645), so a
 // slow detach would otherwise truncate the EEVDF hold to ~0 and starve Gate 1.
 // 24s covers 4 + 10(worst detach) + 4 with margin. watchdog_timeout_s lifts the
 // VM hard deadline -- max(watchdog_timeout, duration) plus boot headroom

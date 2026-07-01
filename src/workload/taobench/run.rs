@@ -417,8 +417,9 @@ impl Shard {
             None => false,
         }
     }
-    /// Insert a freshly-built value for `k` (only called on a miss, so `k` is
-    /// absent), FIFO-evicting down to `cap`.
+    /// Insert a freshly-built value for `k` — called at warmup and on a miss,
+    /// where `k` is absent; the `is_none()` guard keeps it correct even if `k`
+    /// is already present. FIFO-evicts down to `cap`.
     fn insert(&mut self, k: u64, v: Box<[u8]>) {
         if self.map.insert(k, v).is_none() {
             self.fifo.push_back(k);

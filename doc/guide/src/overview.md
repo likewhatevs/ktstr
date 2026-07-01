@@ -73,13 +73,16 @@ Two principles drive ktstr's architecture:
 
 **Fidelity without overhead** -- every test boots a real Linux kernel
 in a KVM VM with real cgroups and real BPF programs. No mocking, no
-containers, no shared state. The VMM is minimal and PCI-free: two
-16550 serial ports (COM1 for kernel console, COM2 for crash
-diagnostics) and three virtio-MMIO devices (virtio-console for the
-host↔guest TLV stream on port-1 — used for scenario dispatch and
-result envelopes — plus virtio-blk for file-backed block storage
-with optional btrfs templates and virtio-net for in-VMM L2 loopback
-used by network workload tests).
+containers, no shared state. The VMM is minimal: two 16550 serial
+ports (COM1 for kernel console, COM2 for crash diagnostics) and a
+virtio-console (virtio-MMIO on every arch) for the host↔guest TLV
+stream on port-1 — used for scenario dispatch and result envelopes —
+plus virtio-blk for file-backed block storage with optional btrfs
+templates and virtio-net for in-VMM L2 loopback used by network
+workload tests. On x86_64 virtio-blk and virtio-net are virtio-PCI
+functions behind a host bridge with ECAM/CAM config-access windows
+(auto-enabled by attaching a disk or NIC, or via `.pci(true)`); on
+aarch64 they use virtio-MMIO.
 
 **Direct access over tooling layers** -- the host-side monitor reads
 guest memory directly via BTF (BPF Type Format)-resolved struct
@@ -118,12 +121,12 @@ scenario with BPF probes attached to the crash-path functions. See
 `ktstr` and `cargo-ktstr` are the two user-facing `[[bin]]`
 targets in the crate; install them with
 `cargo install --locked ktstr`.
-The crate also defines two test-fixture `[[bin]]` targets —
-`ktstr-jemalloc-probe` and `ktstr-jemalloc-alloc-worker` —
-used by the `tests/jemalloc_probe_tests.rs` integration tests.
-They require the non-default `integration` feature, so a default
-`cargo install` builds only the two user-facing binaries and never
-places the fixtures on `$PATH`.
+The crate also defines four test-fixture `[[bin]]` targets —
+`ktstr-jemalloc-probe`, `ktstr-jemalloc-alloc-worker`,
+`ktstr-schbench-validate`, and `ktstr-taobench-validate` —
+used by the integration tests. They require the non-default
+`integration` feature, so a default `cargo install` builds only the
+two user-facing binaries and never places the fixtures on `$PATH`.
 
 ## Kernel config
 

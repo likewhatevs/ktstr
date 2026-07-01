@@ -286,11 +286,12 @@ pub(super) fn decompress_capped(bytes: &[u8], max_decompressed: u64) -> anyhow::
 
 /// Canonical file extension for a serialized snapshot.
 ///
-/// `dead_code` allow: referenced from a doc comment in the
-/// `metric_types` overview. The
-/// extension is hardcoded as the literal `"ctprof.zst"` at every
-/// production write/load site (the CLI accepts any path the
-/// operator supplies and the renderer reads via
+/// `dead_code` allow: no production code references this
+/// constant — the only reference is a roundtrip test.
+/// [`write`](CtprofSnapshot::write) and
+/// [`CtprofSnapshot::load`] take a caller-supplied path and
+/// neither constructs the extension (the CLI accepts any path
+/// the operator supplies and the renderer reads via
 /// [`CtprofSnapshot::load`]). Kept as a named constant so a future
 /// caller that needs to construct paths from scratch has the
 /// canonical token available without re-typing the literal.
@@ -852,18 +853,18 @@ pub(super) enum ParseDottedNs {
 ///
 /// Returns `Err(ParseDottedNs::Negative)` when EITHER:
 /// - the trimmed integer part starts with `-` (kernel emitted
-///   `-5.000000` for a magnitude ≥ 1ms negative SPLIT_NS via
-///   `%Ld`), OR
-/// - the trimmed fractional part starts with `-` (kernel
-///   emitted `0.-000500` for a sub-millisecond negative
-///   SPLIT_NS — `%Ld` on the `(x / 1_000_000)` integer part
-///   yields `0` with no sign for x in `(-1_000_000, 0)`, and
-///   `%06ld` on the `(x % 1_000_000)` remainder yields the
-///   `-`). The sub-millisecond shape is the COMMON case for
-///   clock-skew bugs because most schedstat deltas land
-///   sub-millisecond — missing it would defeat the
-///   negative-detection contract on the bulk of real
-///   negatives.
+///   `-5.000000` for a magnitude ≥ 1ms negative SPLIT_NS: for
+///   x < 0, `nsec_high` returns `-nsec` — a negative long long
+///   — so `%14Ld` on the integer side carries the sign), OR
+/// - the trimmed fractional part starts with `-`. The kernel
+///   never emits this shape: `nsec_low` (kernel/sched/debug.c)
+///   negates via `nsec = -nsec` before `do_div` and returns an
+///   unsigned `long`, so `%06ld` on the fractional side is
+///   always positive and a sub-millisecond negative prints as
+///   `0.000500` — indistinguishable from a genuine positive.
+///   This fractional-side check therefore catches no real
+///   kernel output; it defends only against synthetic/fixture
+///   input that injects a `0.-NNNNNN` shape.
 ///
 /// The caller records the bump in the per-snapshot
 /// [`CtprofParseSummary::negative_dotted_values`] before
@@ -883,16 +884,16 @@ pub(super) fn parsed_ns_from_dotted(value: &str) -> Result<u64, ParseDottedNs> {
         if ms_trimmed.starts_with('-') {
             return Err(ParseDottedNs::Negative);
         }
-        // Sub-millisecond negative: kernel `%06ld` on a negative
-        // remainder yields a leading `-` on the fractional side
-        // even when the integer side is `0`. `0.-000500` is the
-        // canonical shape for SPLIT_NS of a small (>-1ms)
-        // negative — the integer-only check above misses it,
-        // and it is the COMMON case for clock-skew bugs since
-        // most schedstat deltas land sub-millisecond. Check the
-        // fractional side BEFORE the chars().take(6) truncation
-        // would otherwise swallow a sign-only fractional like
-        // `-`.
+        // Fractional-side negative: the kernel never emits this
+        // shape. `nsec_low` (kernel/sched/debug.c) does
+        // `nsec = -nsec` before `do_div` and returns an unsigned
+        // `long`, so `%06ld` on the fractional side is always
+        // positive — a sub-millisecond negative prints as
+        // `0.000500`, not `0.-000500`. This check defends only
+        // against synthetic/fixture input that injects a
+        // sign-only fractional. Check it BEFORE the
+        // chars().take(6) truncation would otherwise swallow a
+        // sign-only fractional like `-`.
         if ns_str.trim_start().starts_with('-') {
             return Err(ParseDottedNs::Negative);
         }

@@ -138,7 +138,7 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
 
 /// Borrowed view of the `StatsCommand::Compare` variant's fields,
 /// passed to [`run_stats_compare`]. A single struct keeps the
-/// dispatch-to-helper boundary a 1:1 field handoff (vs a 34-arg
+/// dispatch-to-helper boundary a 1:1 field handoff (vs a 37-arg
 /// positional call); every field is a borrow because the dispatcher
 /// matches on `&Option<StatsCommand>` so the variant is never owned.
 struct CompareArgs<'a> {
@@ -362,7 +362,7 @@ fn run_stats_compare(args: CompareArgs<'_>) -> Result<(), String> {
 }
 
 /// Match the on-disk `project_commit` / `kernel_commit` shape:
-/// `^[0-9a-f]{7,40}(-dirty)?$`. Used to gate the rev_parse-Err
+/// `^[0-9a-fA-F]{7,40}(-dirty)?$`. Used to gate the rev_parse-Err
 /// warning in [`resolve_commit_specs`] so legitimate literal
 /// hashes (the common case for `--project-commit abc1234`) do
 /// not produce noisy "did not resolve as a revspec" lines.
@@ -1002,7 +1002,7 @@ mod tests {
             .committer_or_set_generic_fallback()
             .expect("committer fallback");
         // Author fallback: mirror the committer-fallback pattern from
-        // gix-0.81 `committer_or_set_generic_fallback` against the
+        // gix-0.83 `committer_or_set_generic_fallback` against the
         // Author keys.
         {
             use gix::config::tree::gitoxide;

@@ -576,8 +576,8 @@ fn pairing_key_from_row_includes_resolve_source_when_pairing() {
 
 /// `PairingKey::from_row` includes the row's cpu_budget when CpuBudget
 /// is a pairing dim — so cross-budget rows NEVER pair — and excludes
-/// it when CpuBudget is the slicing dim. This is the whole point of
-/// A 4-CPU-budget run and a 32-CPU-budget run measure different
+/// it when CpuBudget is the slicing dim. This is deliberate: a
+/// 4-CPU-budget run and a 32-CPU-budget run measure different
 /// things and must not be silently compared.
 #[test]
 fn pairing_key_from_row_includes_cpu_budget_when_pairing() {

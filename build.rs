@@ -46,7 +46,7 @@ fn main() {
     // file is absent OR the stored hash differs from the current
     // BTF's hash. Operators who need to force regen unconditionally
     // still have `cargo clean` as the escape hatch. The algorithm
-    // mirrors `src/test_support/sidecar.rs::sidecar_variant_hash`
+    // mirrors `src/test_support/sidecar/mod.rs::sidecar_variant_hash`
     // so the project uses a single stable hash family.
     println!("cargo:rerun-if-env-changed=KTSTR_KERNEL");
     println!("cargo:rerun-if-changed=src/kernel_path.rs");
@@ -317,7 +317,7 @@ int main(void) {{
     //  - `KTSTR_BUSYBOX_BIN=<path>` copies a pre-built busybox binary
     //    directly into `$OUT_DIR/busybox`, skipping fetch + compile.
     //    `cargo-ktstr` sets it (via `run_cargo.rs`) to the busybox it
-    //    already embedded and extracted (`bin/cargo_ktstr/blobs.rs`),
+    //    already embedded and extracted (`src/bin/cargo_ktstr/blobs.rs`),
     //    so a downstream `cargo ktstr test` reuses that binary instead
     //    of re-fetching. Falls through to the fetch path when the path
     //    is unset / missing / 0-byte. Precedence: SKIP > BIN > TARBALL
@@ -1081,7 +1081,7 @@ fn generate_shift_registry(out_dir: &std::path::Path) {
 /// 64-bit SipHash-1-3 of `bytes`. Used to detect BTF content drift
 /// between `vmlinux.h` regenerations.
 ///
-/// Algorithm mirrors `src/test_support/sidecar.rs::sidecar_variant_hash`
+/// Algorithm mirrors `src/test_support/sidecar/mod.rs::sidecar_variant_hash`
 /// — `SipHasher13::new_with_keys(0, 0)` + `h.write(bytes)` +
 /// `h.finish()`. Zero keys are deliberate: this is a drift hash, not
 /// a DoS-mitigation hash, and stable (key-less) output lets a future

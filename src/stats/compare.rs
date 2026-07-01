@@ -80,12 +80,14 @@ pub(crate) struct CoverageDiff {
 /// `regressions` and `improvements` count significant entries in
 /// `findings`; `unchanged` counts metrics that fell below the dual
 /// gate; `excluded_pairs` counts paired (scenario, topology, work_type)
-/// row pairs where either side is not a real pass — `fail`,
-/// `inconclusive`, and `skip` rows all route here. The field name
-/// captures "excluded from regression math" rather than encoding any
-/// of the three excluded states, because the per-side disposition
-/// (which side, which state) is recoverable from the individual
-/// `GauntletRow::is_*` accessors when the operator drills in.
+/// row pairs where either side is excluded from regression math —
+/// `fail`, `inconclusive`, `skip`, or an inverted `expected_failure`
+/// run (which passes but carries failure-mode-dominated telemetry) all
+/// route here. The field name captures "excluded from regression math"
+/// rather than encoding any of the four excluded states, because the
+/// per-side disposition (which side, which state) is recoverable from
+/// the individual `GauntletRow::is_*` / `expected_failure` accessors
+/// when the operator drills in.
 /// `new_in_b`
 /// counts B-side rows whose key has no match on the A side; the
 /// converse is `removed_from_a`. The filter (when set) applies to
@@ -136,8 +138,9 @@ pub(crate) struct CompareReport {
 /// Which side of an A/B comparison a row belongs to. Typed surface
 /// for the per-phase rows so new code does not propagate the
 /// `"A"` / `"B"` string-literal pattern the scalar-finding path
-/// uses (string siting cited at L4011-4012 etc., kept as-is for
-/// the existing call sites).
+/// uses (kept as-is at the existing `"A"` / `"B"` call sites in this
+/// module — `render_side_label`, `zero_match_diagnostic`, and
+/// `check_no_duplicate_pairing_keys`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub(crate) enum ComparePartition {
     A,
@@ -176,7 +179,7 @@ pub(crate) struct PhaseDeltaRow {
     /// column.
     pub label: String,
     /// Registry entry the delta was computed against. Carries the
-    /// `MetricKind` (Counter / Peak / Gauge / Timestamp) the
+    /// `MetricKind` (e.g. Counter / Peak / Gauge / DeltaSum) the
     /// phase aggregator used to fold the per-sample readings into
     /// the per-phase value, plus the `Polarity` the renderer uses
     /// to classify the delta direction.
@@ -689,11 +692,15 @@ pub(crate) fn compare_rows_by(
         };
 
         // Drop from regression math when either side is a skip,
-        // inconclusive, or failure. Skips carry no executed metrics
+        // inconclusive, failure, or an inverted expected_failure run.
+        // Skips carry no executed metrics
         // (the run didn't happen); inconclusive runs ran but lacked
         // signal to evaluate (zero-denominator ratio gate); failures
         // carry telemetry dominated by the failure mode (short run,
-        // stalled workload), not the scheduler's behavior —
+        // stalled workload), not the scheduler's behavior. An
+        // expected_failure run has `passed == true` but its telemetry
+        // is likewise failure-mode-dominated (short / stalled run), so
+        // it is excluded despite passing —
         // comparing any of these against a real run produces
         // meaningless deltas.
         if row_a.is_fail()
@@ -1287,7 +1294,7 @@ pub(crate) fn render_dirty_warning(
     let mut dirty_project: BTreeSet<&str> = BTreeSet::new();
     for row in rows_a.iter().chain(rows_b.iter()) {
         // `ends_with` matches the producer contract: `detect_kernel_commit`
-        // and `detect_project_commit` (sidecar.rs:851, :983) append
+        // and `detect_project_commit` (src/test_support/sidecar/mod.rs) append
         // `-dirty` as a SUFFIX to the 7-char hex via
         // `format!("{short_hash}-dirty")`, so the dirty marker is
         // always tail-positioned. `contains` would also match a
@@ -2395,7 +2402,7 @@ fn print_summary_block(
     if report.excluded_pairs > 0 {
         println!(
             "  {} pairing-key row pair(s) excluded from regression math because one \
-             or both sides did not pass (failed, inconclusive, or skipped)",
+             or both sides was excluded (failed, inconclusive, skipped, or an inverted expected-failure run)",
             report.excluded_pairs,
         );
     }

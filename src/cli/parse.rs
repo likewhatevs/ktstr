@@ -23,7 +23,7 @@ use anyhow::{Result, bail};
 /// Consolidating the parse + validate in one helper eliminates the
 /// identical 4-arm `parts[i].parse().map_err(...)` block that the two
 /// binary entry points (`src/bin/ktstr.rs` Command::Shell and
-/// `src/bin/cargo-ktstr.rs` `run_shell`) would otherwise drift on.
+/// `src/bin/cargo_ktstr/misc/shell.rs` `run_shell`) would otherwise drift on.
 /// Error shape is `anyhow::Error`; callers that need a `String` (like
 /// cargo-ktstr's `Result<(), String>` surface) bridge via
 /// `.map_err(|e| format!("{e:#}"))` at the call site.
@@ -144,7 +144,7 @@ pub fn parse_disk_size_mib(s: &str) -> Result<u32> {
 }
 
 /// Help text for the `--disk <SIZE>` shell flag, shared between
-/// `cargo ktstr shell` (`src/bin/cargo-ktstr.rs`) and
+/// `cargo ktstr shell` (`src/bin/cargo_ktstr/cli.rs`) and
 /// `ktstr shell` (`src/bin/ktstr.rs`) so a future tweak lands in
 /// one place. Mirrors the [`super::CPU_CAP_HELP`] pattern.
 pub const DISK_HELP: &str = "Attach a raw virtio-blk disk to /dev/vda. \
@@ -343,7 +343,7 @@ mod tests {
     }
 
     /// Zero is rejected — a 0-byte disk is a configuration footgun
-    /// (every IO IOERRs per `DiskConfig::with_options`).
+    /// (every IO IOERRs per `VirtioBlk::with_options`).
     #[test]
     fn parse_disk_size_mib_rejects_zero() {
         let err = parse_disk_size_mib("0mib").expect_err("zero must fail");

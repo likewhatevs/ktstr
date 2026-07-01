@@ -141,11 +141,13 @@ pub enum GroupBy {
 pub struct CompareOptions {
     pub group_by: GroupByOrDefault,
     /// Glob patterns that collapse dynamic cgroup path segments
-    /// to a canonical form before grouping. Applied in listed
-    /// order; each pattern that matches a thread's cgroup path
-    /// rewrites the matched segments with the literal portions
-    /// of the pattern. See `flatten_cgroup_path` for the
-    /// rewrite rule and examples.
+    /// to a canonical form before grouping. Tried in listed
+    /// order; the first pattern that matches a thread's cgroup
+    /// path replaces the whole path with the pattern string, so
+    /// paths differing only in wildcard-matched segments collapse
+    /// onto one key. A path matching no pattern is returned
+    /// verbatim. See `flatten_cgroup_path` for the rewrite rule
+    /// and examples.
     ///
     /// Independent of [`Self::no_cg_normalize`] — explicit
     /// glob patterns apply first; auto-normalization (token-based)
@@ -318,7 +320,8 @@ pub enum AggRule {
     MaxPeak(fn(&ThreadState) -> crate::metric_types::PeakNs),
     /// Maximum across the group of a [`PeakBytes`] field — the
     /// byte-typed twin of `MaxPeak`. Used for taskstats-sourced
-    /// lifetime memory watermarks (`hiwater_rss`, `hiwater_vm`).
+    /// lifetime memory watermarks (`hiwater_rss_bytes`,
+    /// `hiwater_vm_bytes`).
     /// `xacct_add_tsk` (`kernel/tsacct.c::xacct_add_tsk`, lines
     /// 99-104) reads the watermark out of the SHARED `mm_struct`
     /// via `get_mm_hiwater_rss(mm)` / `get_mm_hiwater_vm(mm)`, so

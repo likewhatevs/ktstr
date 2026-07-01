@@ -785,7 +785,8 @@ fn throttle_stall_event_idx_retry_routes_through_gate() {
 
 /// Throttle stall on the bytes bucket alone (iops bucket
 /// unlimited). DiskThrottle with `bytes_per_sec=Some(512)` and
-/// `iops=None` accepts 1 request per second worth of bytes; a
+/// `iops=None` supplies 512 bytes-tokens per second.
+///
 /// Overconsumption policy: when `n > capacity` the
 /// throttle gate is `available >= 0` (not `available >= n`),
 /// so an oversized request whose chain is the FIRST one this
@@ -907,13 +908,14 @@ fn throttle_bytes_request_exceeds_capacity_stalls() {
     );
 }
 
-/// When BOTH buckets fail, drain_bracket_impl picks the longer
-/// of the two waits via `ops_wait.max(bytes_wait)`. Drain the
-/// bytes bucket only (ops bucket has plenty of headroom), and
-/// verify the stall produces a wait_nanos that reflects the
-/// bytes deficit. Drives the inline path so we can reach
-/// `drain_bracket_impl` directly and observe the
-/// `DrainOutcome::ThrottleStalled` value.
+/// `drain_bracket_impl` picks the longer of the two waits via
+/// `ops_wait.max(bytes_wait)`. Drain the bytes bucket only (the
+/// ops bucket has plenty of headroom, so `ops_ok=true` and
+/// `ops_wait=0`); the `.max()` therefore reduces to `bytes_wait`.
+/// Drives the inline path, which discards the returned
+/// `DrainOutcome`; the stall is observed via the public counters
+/// (`throttled_count`, `io_errors`), not by inspecting
+/// `DrainOutcome::ThrottleStalled`.
 #[test]
 fn throttle_both_buckets_max_wait() {
     let cap = 4096u64;
@@ -993,12 +995,13 @@ fn throttle_both_buckets_max_wait() {
         1,
         "two-bucket stall bumps throttled_count exactly once",
     );
-    // The bytes deficit is the bottleneck — 2048 bytes at
-    // 1024/sec = 2_000_000_000 ns. The wait_nanos must be at
-    // least the bytes deficit: ops would never produce a
-    // longer wait at iops=10 vs a single op (deficit 1 op /
-    // 10 per sec = 100_000_000 ns), so max(ops_wait,
-    // bytes_wait) = bytes_wait. The internal stall_outcome is
+    // The bytes deficit is the bottleneck. After consume(2048)
+    // from a fresh available=1024, available=-1024. For need
+    // 2048 > capacity 1024 the deficit is -available = 1024
+    // tokens, so bytes_wait = 1024 * 1e9 / 1024 = 1_000_000_000
+    // ns. The ops bucket is undrained (available=10 >= 1), so
+    // ops_ok=true and ops_wait=0; max(ops_wait, bytes_wait) =
+    // bytes_wait = 1_000_000_000 ns. The internal stall_outcome is
     // not directly exposed; we observe the consequence via
     // throttled_count and that the chain stayed in avail.
     // (Direct wait_nanos observation lives in the
@@ -1434,7 +1437,8 @@ fn throttle_stall_mid_batch_three_chains() {
 /// and an unlimited iops bucket, a FLUSH chain completes
 /// without stalling — `data_len = 0` for FLUSH, and the
 /// can_consume(0) check on the bytes bucket short-circuits to
-/// true via TokenBucket's `if self.available >= n`. Pins that
+/// true via TokenBucket's `if n == 0 { return true; }` early
+/// return (before any `available` comparison). Pins that
 /// FLUSH is exempt from bytes-bucket exhaustion (it does no
 /// data IO).
 #[test]

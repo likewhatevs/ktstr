@@ -754,9 +754,11 @@ fn host_side_llm_extract_json_zero_leaves_not_conflated_with_llm_placeholder() {
 /// `MetricCheck::Min` / `MetricCheck::Exists` evaluations with a
 /// "metric not found" message that hides the real cause.
 ///
-/// Setup: an LlmExtract pair at index 7 (raw + matching PM)
-/// arrives intact; an additional empty PM at index 99 has no
-/// matching raw. The orphan-PM scan flags index 99.
+/// Setup: two empty-metrics PMs at indices 7 and 99, neither
+/// with a matching raw. The raws (at 10 and 20, themselves
+/// unmatched) only satisfy the non-empty `raw_outputs` gate so
+/// the orphan-PM scan runs. The scan flags BOTH 7 and 99 in a
+/// single combined detail.
 #[cfg(feature = "llm")]
 #[test]
 fn host_side_llm_extract_orphan_pm_with_no_matching_raw_surfaces() {

@@ -102,7 +102,7 @@ const MAX_NODES_PER_LIST: u32 = 4096;
 ///   `walk_task_enrichment` during dump_state — but their presence
 ///   is the gate for the capture's existence.
 ///
-/// `_owned_accessor` carries the [`crate::monitor::guest::GuestKernel`]
+/// `owned_accessor` carries the [`crate::monitor::guest::GuestKernel`]
 /// (sched_class + lock-slowpath registry resolution reads its
 /// vmlinux symtab); `scx_owned` carries the SCX walker's per-CPU rq
 /// arrays + `scx_root_kva`; `offsets` carries the BTF offsets the
@@ -310,8 +310,9 @@ pub(crate) fn build(
     //
     // Single HashMap probe via .get() per task — pre-fix this did
     // contains_key + get which double-hashed each task_kva. The
-    // .map() over Option<&Option<u64>> collapses both axes (entry
-    // present? running_pc populated?) into the constructed entry.
+    // match on runnable_on_cpu.get()'s Option<&Option<u64>> collapses
+    // both axes (entry present? running_pc populated?) into the
+    // constructed entry.
     let tasks: Vec<TaskWalkerEntry> = all_task_kvas
         .into_iter()
         .map(|task_kva| match runnable_on_cpu.get(&task_kva) {

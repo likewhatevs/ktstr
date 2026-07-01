@@ -77,8 +77,8 @@ const KTSTR_SCHED: Scheduler =
 /// addition inflates the scan without requiring a test-side update.
 /// File-name pattern matches `src/vmm/freeze_coord/snapshot.rs`'s
 /// `snapshot_tagged_path` (pub(super), so reproduced here). The
-/// production helper strips `.failure-dump.json` from the stem before
-/// appending `.snapshot.{safe_tag}.json` (snapshot.rs:385,398-399),
+/// production helper strips `.failure-dump` from the file stem before
+/// appending `.snapshot.{safe_tag}.{ext}` (snapshot.rs:507,519-522),
 /// so the prefix-and-suffix match here aligns.
 #[track_caller]
 fn snapshot_sibling_files(test_name: &str) -> Vec<std::path::PathBuf> {

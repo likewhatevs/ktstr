@@ -176,7 +176,7 @@ fn poll_scx_attached(
         KernfsWaitOutcome::Done(()) => ScxAttachStatus::Attached,
         KernfsWaitOutcome::NoEventedSource => {
             // Both attr fd open and inotify_add_watch failed. We
-            // target kernel 6.12+ where kernfs + inotify are
+            // target kernel 6.16+ where kernfs + inotify are
             // universally present, so /sys/kernel/sched_ext/ is
             // fundamentally missing or broken. Surface as
             // SysfsAbsent; the log makes the operator-actionable
@@ -458,9 +458,12 @@ pub(crate) enum SpawnSchedulerError {
     /// (the dead pid was published optimistically at spawn so the
     /// sched_exit_monitor caller path could install against a known
     /// id; the StartupDied branch never gets that far so the spawn
-    /// helper owns the rollback). The process is already reaped via
-    /// `poll_startup`'s internal `try_wait`. No manual cleanup
-    /// required by the caller.
+    /// helper owns the rollback). The dead child is auto-reaped by
+    /// the kernel because PID 1 runs SIGCHLD=`SIG_IGN` (see
+    /// [`poll_startup`]'s doc and [`ktstr_guest_init`]);
+    /// `poll_startup` only observes the exit via pidfd POLLIN, it
+    /// does not reap. No manual `wait`/`try_wait` required by the
+    /// caller.
     StartupDied { log_path: String },
 
     /// Process is alive past the liveness window but
@@ -615,8 +618,10 @@ pub(crate) fn try_spawn_scheduler(
         std::time::Duration::from_secs(1),
     ) {
         StartupStatus::Died => {
-            // Process already exited — SIGCHLD reaped via poll_startup's
-            // try_wait. SCHED_PID still points at the dead pid; clear so a
+            // Process already exited — the dead child is auto-reaped by
+            // the kernel under SIGCHLD=SIG_IGN (poll_startup only observes
+            // the exit via pidfd POLLIN, it does not reap). SCHED_PID still
+            // points at the dead pid; clear so a
             // subsequent Op dispatch's sched_pid() returns None instead of
             // the stale dead/recycled id. The pid was published optimistically
             // at spawn so the sched_exit_monitor caller path can install

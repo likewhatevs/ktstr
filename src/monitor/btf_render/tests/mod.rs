@@ -8,9 +8,10 @@ use super::*;
 /// monitor code relies on, so tests don't drift onto a different
 /// resolution path that masks bugs in the production loader.
 ///
-/// Returns `None` only when `find_test_vmlinux` decides to skip;
-/// it surfaces a `test_skip` message in that path so the user sees
-/// the reason rather than a silent no-op.
+/// Returns `None` when `find_test_vmlinux` skips (surfacing a
+/// `test_skip` message in that path so the user sees the reason) or
+/// when `load_btf_from_path` fails to load/parse the BTF (via `.ok()`,
+/// silently).
 fn test_btf() -> Option<Btf> {
     let path = crate::monitor::find_test_vmlinux()?;
     crate::monitor::btf_offsets::load_btf_from_path(&path).ok()
@@ -18,7 +19,7 @@ fn test_btf() -> Option<Btf> {
 
 /// Compact constructor for [`RenderedValue::Enum`] in tests.
 /// Mirrors the `uint_v` helper in `scenario::snapshot`'s test module — folds
-/// the 5-field struct literal (now that `is_signed` is part of the
+/// the 4-field struct literal (now that `is_signed` is part of the
 /// shape) into a one-line call so fixture sites stay readable as
 /// the variant grows.
 fn enum_v(bits: u32, value: i64, variant: Option<&str>, is_signed: bool) -> RenderedValue {
@@ -46,7 +47,7 @@ pub(crate) use crate::test_support::btf_blob::{
 
 // -- render_bitfield coverage --
 //
-// render_bitfield (mod.rs ~4490) decodes a struct bitfield member. It
+// render_bitfield decodes a struct bitfield member. It
 // is reached from render_member only when the owning struct has
 // kind_flag == 1 and the member width > 0, which the synthetic builder
 // expresses via CastSynType::BitfieldStruct + CastSynBitMember. The

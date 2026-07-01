@@ -2552,7 +2552,7 @@ fn acquire_test_kernel_lock_if_cached_returns_none_outside_cache() {
 ///
 /// The test feeds the seam a representative shared-lock-timeout
 /// rendering (matching the literal format produced at
-/// `flock.rs::try_flock_with_deadline` — `"flock LOCK_SH on
+/// `flock/acquire.rs::acquire_flock_with_timeout` — `"flock LOCK_SH on
 /// {context} timed out after {timeout:?}"`) and the
 /// exclusive-lock equivalent. A negative-control string lacking
 /// the `"flock LOCK_"` marker must NOT match — that protects
@@ -2599,7 +2599,7 @@ fn flock_timeout_substring_classification_pins_seam() {
     );
 }
 
-// -- timed-out arm: scheduler-exited reason override (the `timeout_reason` block in evaluate_vm_result's `if result.timed_out` arm) --
+// -- timed-out arm: scheduler-exited reason override (the `timeout_reason` block in `render_no_result_message`'s `if result.timed_out` arm, reached via evaluate_vm_result) --
 
 /// Timed-out run whose stderr carries an scx-disable kmsg anchor with
 /// a NON-EMPTY parenthesized body: `parse_kmsg_window` parses the

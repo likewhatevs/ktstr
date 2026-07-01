@@ -55,7 +55,7 @@ fn neg_tight_imbalance_threshold_catches_mild_imbalance() {
     };
     let v = t.evaluate(&report);
     assert!(!v.passed, "imbalance=1.5 must fail threshold=1.0");
-    // Format: "imbalance ratio 1.5 exceeded threshold 1.0 for 2 consecutive samples (ending at sample 2)"
+    // Format: "imbalance ratio 1.5 exceeded threshold 1.0 for 3 consecutive samples (ending at sample 2)"
     let detail = v
         .failure_details()
         .find(|d| d.contains("imbalance"))
@@ -131,7 +131,7 @@ fn neg_tight_dsq_threshold_catches_small_depth() {
     };
     let v = t.evaluate(&report);
     assert!(!v.passed, "dsq_depth=3 must fail threshold=1");
-    // Format: "local DSQ depth 3 on cpu0 exceeded threshold 1 for 2 consecutive samples (ending at sample 2)"
+    // Format: "local DSQ depth 3 on cpu0 exceeded threshold 1 for 3 consecutive samples (ending at sample 2)"
     let detail = v
         .failure_details()
         .find(|d| d.contains("DSQ depth"))

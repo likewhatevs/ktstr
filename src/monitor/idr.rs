@@ -17,9 +17,10 @@ pub(crate) const XA_CHUNK_SIZE: u64 = 64;
 /// SLAB allocations live in the direct mapping (PAGE_OFFSET..PAGE_END).
 /// vmalloc'd and module addresses require a page table walk.
 ///
-/// `cr3_pa` / `page_offset` / `l5` / `tcr_el1` mirror the signature
-/// of [`GuestMem::translate_kva`]; on x86_64 `tcr_el1` is ignored,
-/// on aarch64 `l5` is ignored.
+/// `cr3_pa` / `l5` / `tcr_el1` mirror the signature of
+/// [`GuestMem::translate_kva`]; on x86_64 `tcr_el1` is ignored,
+/// on aarch64 `l5` is ignored. `page_offset` is used only for the
+/// direct-mapping `kva_to_pa` fast path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn translate_any_kva(
     mem: &GuestMem,

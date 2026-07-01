@@ -37,8 +37,8 @@ const STOP_FD_WRITE_MAX_RETRIES: u32 = 4;
 /// surface the failure-path itself; it does NOT promise the
 /// worker will exit (only the join timeout does).
 ///
-/// `device_id` is the per-device tracing tuple (stop_fd raw fd,
-/// instance_id, capacity_sectors) so a warn can correlate to
+/// `raw_fd`, `instance_id`, and `capacity_sectors` are the
+/// per-device tracing fields so a warn can correlate to
 /// the wedged device without the caller plumbing the same
 /// fields through. Free function (not method) so the borrow is
 /// limited to the EventFd reference; the caller still owns
@@ -168,9 +168,11 @@ pub(crate) const RESET_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// thread (timeout, helper failure).
 pub(crate) enum JoinWithTimeoutOutcome {
     /// Worker exited normally and yielded its `BlkWorkerState`.
-    /// `dead_code` allow: the carried state is consumed only by
-    /// `stop_worker_and_reclaim_state` (cfg(not(test))). Under
-    /// `cargo check --tests` no reader exists, but
+    /// `dead_code` allow: the carried state is consumed by
+    /// `stop_worker_and_reclaim_state` (returns the state) and by
+    /// the Drop impl's `Joined` arm (reads
+    /// `currently_stalled`/`counters`), both `cfg(not(test))`.
+    /// Under `cargo check --tests` no reader exists, but
     /// `join_worker_with_timeout` still constructs the variant
     /// and the value matters for production reset.
     #[allow(dead_code)]
@@ -251,8 +253,9 @@ pub(crate) fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> &str {
 ///
 /// # Resource retention on timeout
 ///
-/// `BlkWorkerState` owns a `File`, an `Arc<VirtioBlkCounters>`,
-/// two scratch `Vec`s, and two `TokenBucket`s. On timeout these
+/// `BlkWorkerState` owns a `Box<dyn Backing>`, an
+/// `Arc<VirtioBlkCounters>`, one scratch `Vec`
+/// (`all_descs_scratch`), and two `TokenBucket`s. On timeout these
 /// are reclaimed only when the worker thread finally exits; if it
 /// does not, they outlive the device. This is the explicit trade
 /// chosen over blocking a vCPU thread indefinitely. (The worker

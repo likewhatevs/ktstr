@@ -329,12 +329,14 @@ impl CgroupDef {
 
     /// Set [`WorkSpec::num_workers`] on `works[0]` (Group I).
     ///
-    /// `n` MUST be `>= 1`. `n == 0` is rejected at
-    /// [`WorkloadConfig::validate`](crate::workload::WorkloadConfig::validate) time with an actionable
-    /// diagnostic — a zero-worker spawn would silently produce
-    /// no workload load, vacuously passing scheduler assertions
-    /// that rely on observable contention. Pass `n >= 1`; for
-    /// fraction-of-cpuset sizing use [`Self::workers_pct`].
+    /// `n` MUST be `>= 1`. `n == 0` is rejected at apply-setup time
+    /// by `resolve_num_workers` (before any worker spawn) with an
+    /// actionable diagnostic naming the cgroup;
+    /// [`WorkloadConfig::validate`](crate::workload::WorkloadConfig::validate)
+    /// is the downstream defense-in-depth gate. A zero-worker spawn
+    /// would silently produce no workload load, vacuously passing
+    /// scheduler assertions that rely on observable contention. Pass
+    /// `n >= 1`; for fraction-of-cpuset sizing use [`Self::workers_pct`].
     #[must_use = "builder methods consume self; bind the result"]
     pub fn workers(mut self, n: usize) -> Self {
         self.ensure_default_work();

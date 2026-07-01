@@ -90,8 +90,9 @@ When workers use a [`MemPolicy`](mem-policy.md), ktstr collects NUMA
 page placement data and checks it against thresholds:
 
 **Page locality** -- `assert_page_locality()` checks the fraction of
-pages residing on the expected NUMA node(s). Expected nodes are derived
-from the worker's `MemPolicy::node_set()` at evaluation time. Page
+pages residing on the expected NUMA node(s). Expected nodes are the
+cgroup's cpuset NUMA-node set, derived from the resolved cpuset via
+`TestTopology::numa_nodes_for_cpuset(cpuset)` at evaluation time. Page
 counts come from `WorkerReport::numa_pages` (parsed from
 `/proc/self/numa_maps`). Returns 0.0 when no pages are observed -- a
 zero-allocation workload is treated as zero-locality (not vacuously

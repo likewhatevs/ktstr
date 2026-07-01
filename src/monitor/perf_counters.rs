@@ -5,9 +5,9 @@
 //! `exclude_host=1`, the kernel toggles the EVENTSEL_ENABLE bit on/off
 //! at every guest entry and exit so the counter only ticks while the
 //! vCPU thread is executing inside the guest. Verified at
-//! `arch/x86/events/intel/core.c:5080` (`if (event->attr.exclude_host)
+//! `arch/x86/events/intel/core.c:5120-5121` (`if (event->attr.exclude_host)
 //! arr[idx].host &= ~ARCH_PERFMON_EVENTSEL_ENABLE;`) and
-//! `arch/x86/events/intel/core.c:5090-5093` (`core_pmu_enable_event`
+//! `arch/x86/events/intel/core.c:5130-5134` (`core_pmu_enable_event`
 //! skips enable when `exclude_host` is set). KVM's
 //! `intel_guest_get_msrs` is what flips the bit at VMENTER/VMEXIT.
 //!
@@ -21,7 +21,7 @@
 //!
 //! Cost is zero in-guest: hardware PMU counters are partitioned at the
 //! VMCS/VMCB level. The host-side cost is one read per (vCPU, counter)
-//! per monitor tick — an `lseek+read` syscall pair returning 24 bytes.
+//! per monitor tick — a single `read` syscall returning 24 bytes.
 //!
 //! Per-fd `read()` returns three u64s when
 //! `PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING`
@@ -67,9 +67,9 @@ pub struct VcpuPerfSample {
     pub cache_misses: u64,
     /// `PERF_COUNT_HW_BRANCH_MISSES` raw count.
     pub branch_misses: u64,
-    /// Wall-clock ns the kernel allocated to this counter (sum across
-    /// all counters; reflects how long the event was attached to the
-    /// task). When equal to `time_running` the counter was never
+    /// Wall-clock ns this event was enabled on the task, captured from
+    /// the cycles fd (see the struct-level note on per-counter
+    /// capture). When equal to `time_running` the counter was never
     /// multiplexed.
     pub time_enabled_ns: u64,
     /// ns the counter was actually scheduled on a hardware PMU slot.
@@ -249,7 +249,7 @@ impl PerfCountersCapture {
     /// Caller decides what to do on partial failure. The current
     /// monitor integration falls back to "no perf data" wholesale —
     /// individual per-vCPU error tracking would clutter the
-    /// `CpuSnapshot.perf` field's "all-or-nothing per sample"
+    /// `CpuSnapshot.vcpu_perf` field's "all-or-nothing per sample"
     /// invariant.
     pub fn open(tids: &[libc::pid_t]) -> io::Result<Self> {
         let mut per_vcpu = Vec::with_capacity(tids.len());

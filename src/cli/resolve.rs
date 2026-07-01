@@ -244,7 +244,7 @@ pub fn cache_lookup(
     // warning on any local hit whose entry was stored via the
     // strip-fallback path. The remote-lookup path here funnels
     // downloads through `CacheDir::store`, which runs its own strip
-    // pipeline and reports via eprintln at store time — so the
+    // pipeline and reports via `tracing::warn!` at store time — so the
     // warning coverage is uniform across local and remote cache
     // hits without an additional check here.
     if let Some(entry) = cache.lookup(cache_key) {
@@ -682,7 +682,7 @@ fn filter_and_sort_range(
 /// [`crate::KTSTR_KERNEL_ENV`] export.
 ///
 /// The cache key embeds `REF` verbatim alongside the resolved tip
-/// `short_hash`, so two invocations with identical-sha-different-`REF`
+/// commit's full 40-hex hash, so two invocations with identical-sha-different-`REF`
 /// spellings remain distinct cache entries (collapsing those to one is
 /// separate future work — see [`crate::kernel_path::KernelId::Git`]).
 ///
@@ -801,7 +801,10 @@ pub struct KernelDirOutcome {
     ///   [`crate::fetch::compose_local_cache_key`]); boot image at
     ///   `<dir>/<image_name>`.
     /// - Dirty tree: canonical source-tree directory, boot image at
-    ///   `<dir>/arch/<arch>/boot/<image_name>`.
+    ///   `<dir>/arch/x86/boot/bzImage` (x86_64) or
+    ///   `<dir>/arch/arm64/boot/Image` (aarch64) — the kernel
+    ///   build-tree arch subdir (`x86`/`arm64`), not the
+    ///   arch_info() name (`x86_64`/`aarch64`).
     ///
     /// Both shapes are valid inputs to
     /// [`crate::kernel_path::find_image_in_dir`].
@@ -854,7 +857,10 @@ pub struct KernelDirOutcome {
 ///     (`is_dirty` short-circuit at the cache-store boundary) and
 ///     returns the source-tree image. `outcome.dir` is the
 ///     canonical source-tree directory (boot image at
-///     `<source>/arch/<arch>/boot/<image_name>`),
+///     `<source>/arch/x86/boot/bzImage` (x86_64) or
+///     `<source>/arch/arm64/boot/Image` (aarch64) — the kernel
+///     build-tree arch subdir (`x86`/`arm64`), not the
+///     arch_info() name),
 ///     `outcome.cache_hit` is `None`, `outcome.is_dirty` is
 ///     `true`. Callers use the dirty flag to mark the run as
 ///     non-reproducible in test reports — e.g. `cargo-ktstr`'s

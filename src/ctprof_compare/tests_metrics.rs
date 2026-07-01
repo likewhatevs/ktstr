@@ -1568,8 +1568,8 @@ fn sort_diff_rows_by_keys_within_group_uses_registry_order() {
         sort_by_delta: None,
     };
     // Use four metrics from the scheduling block in their
-    // registry order: run_time_ns (idx 6), wait_time_ns (7),
-    // timeslices (8), nr_wakeups (11). Insert in
+    // registry order: run_time_ns (idx 10), wait_time_ns (11),
+    // timeslices (12), nr_wakeups (15). Insert in
     // REVERSE-registry order so a regression that orders by
     // input/sort-spec/lexicographic would surface as a
     // visibly wrong metric_order assertion.

@@ -10,7 +10,7 @@ use super::*;
 // A hostile or buggy guest that re-sends either message would
 // re-enqueue PORT_ADD / CONSOLE_PORT / PORT_OPEN / PORT_NAME and
 // grow `control_out` without bound, exhausting host memory. The
-// device gates each repeat behind `device_ready` / `port_readied`
+// device gates each repeat behind `device_ready` / `ports[id].readied`
 // flags; these tests pin the gates against regressions.
 // ----------------------------------------------------------------
 
@@ -63,7 +63,7 @@ fn handle_device_ready_repeat_ignored() {
 /// PORT_READY repeat for the same port must be ignored — the
 /// second message must NOT re-enqueue
 /// CONSOLE_PORT/PORT_NAME/PORT_OPEN. Pins the
-/// `if self.port_readied[id as usize]` early-return at
+/// `if self.ports[id as usize].readied` early-return at
 /// handle_control_event (the PORT_READY arm). Mirrors the
 /// DEVICE_READY gate but per-port — readying port 0 twice would
 /// otherwise enqueue 6 frames (3 per call) instead of 3.
@@ -79,7 +79,7 @@ fn handle_port_ready_repeat_ignored_port0() {
     });
     assert!(
         dev.ports[0].readied,
-        "port_readied[0] must be set after first PORT_READY"
+        "ports[0].readied must be set after first PORT_READY"
     );
     let after_first = dev.control_out.len();
     assert_eq!(
@@ -137,7 +137,7 @@ fn handle_port_ready_repeat_ignored_port1() {
 
 /// PORT_READY for port 0 must NOT inhibit a subsequent PORT_READY
 /// for port 1 — the gate is per-port, not global. Pins the array
-/// indexing in `port_readied[id as usize]`. A regression that
+/// indexing in `ports[id as usize].readied`. A regression that
 /// used a single global flag would let only one port's announce
 /// frames go through.
 #[test]
@@ -171,7 +171,7 @@ fn handle_port_ready_per_port_not_global() {
 /// announce-frame enqueue. value=0 is the kernel's
 /// `add_port` failed signal (drivers/char/virtio_console.c
 /// `add_port` error path). Pins the early-return without
-/// setting `port_readied[id]` so a future legitimate PORT_READY
+/// setting `ports[id].readied` so a future legitimate PORT_READY
 /// (after recovery) is not blocked by the gate.
 #[test]
 fn handle_port_ready_value_zero_skipped() {
@@ -185,12 +185,12 @@ fn handle_port_ready_value_zero_skipped() {
         dev.control_out.is_empty(),
         "PORT_READY value=0 must NOT enqueue announce frames",
     );
-    // port_readied[0] must remain false — the early-return for
+    // ports[0].readied must remain false — the early-return for
     // value=0 happens BEFORE the gate flag is set, so a future
     // PORT_READY value=1 can still complete.
     assert!(
         !dev.ports[0].readied,
-        "PORT_READY value=0 must NOT set port_readied — the kernel \
+        "PORT_READY value=0 must NOT set ports[id].readied — the kernel \
          may legitimately retry with value=1 after the host fixes \
          the underlying issue",
     );
@@ -228,14 +228,14 @@ fn handle_port_ready_value_zero_then_one_completes() {
 
 /// PORT_READY for an unknown port id (>= NUM_PORTS) must be
 /// ignored. The existing `handle_port_ready_unknown_port_ignored`
-/// covers value=1; this pins the port id bounds check is the
-/// outer gate (rejected before the value-check or repeat-check).
-/// Verifies port_readied stays all-false and control_out is empty.
+/// covers value=1; this pins that the port-id bounds check gates
+/// before the repeat-check (the value-check runs first).
+/// Verifies ports[id].readied stays all-false and control_out is empty.
 #[test]
 fn handle_port_ready_unknown_port_state_unchanged() {
     let mut dev = VirtioConsole::new();
     dev.handle_control_event(VirtioConsoleControl {
-        id: NUM_PORTS, // first invalid id (NUM_PORTS == 2)
+        id: NUM_PORTS, // first invalid id (NUM_PORTS == 3)
         event: VIRTIO_CONSOLE_PORT_READY,
         value: 1,
     });
@@ -251,7 +251,7 @@ fn handle_port_ready_unknown_port_state_unchanged() {
 /// PORT_OPEN for an unknown port id (>= NUM_PORTS) must be
 /// ignored. Pins the `if id >= NUM_PORTS` gate at the head of
 /// the PORT_OPEN arm. Without the gate, an out-of-bounds
-/// `port_opened[id as usize]` index would panic with
+/// `self.ports[id as usize].opened` index would panic with
 /// "index out of bounds" — far worse than a tracing warning.
 #[test]
 fn handle_port_open_unknown_port_ignored() {

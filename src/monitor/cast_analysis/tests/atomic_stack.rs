@@ -376,8 +376,9 @@ fn atomic_store_rel_preserves_src_and_dst() {
 /// `BPF_STORE_REL` through `r10` writes the stack slot at
 /// `[r10 + off]`. Even though STORE_REL has no per-register
 /// clobber effect, the stack-slot invalidation arm at the head
-/// of `handle_atomic` runs unconditionally for every atomic
-/// flavor when `dst == r10`. A prior spill of a typed pointer
+/// of `handle_atomic` runs for every atomic flavor except
+/// LOAD_ACQ when `dst == r10` (STORE_REL is not that exception).
+/// A prior spill of a typed pointer
 /// into the slot is overwritten by the release store, so a
 /// subsequent reload through `r10` must NOT resurrect the
 /// pre-store-release typed-pointer state.
@@ -579,9 +580,9 @@ fn atomic_xor_fetch_clobbers_src() {
 
 /// `BPF_ATOMIC` with `BPF_W` (4-byte) size targeting `[r10+off]`
 /// must invalidate the stack slot the same way a DW atomic does.
-/// Per `handle_atomic`, the stack-invalidation arm runs
-/// unconditionally on `dst == r10` regardless of the size bits
-/// in the opcode — a 4-byte atomic write into a slot that
+/// Per `handle_atomic`, the stack-invalidation arm runs on
+/// `dst == r10` for non-LOAD_ACQ atomics regardless of the size
+/// bits in the opcode — a 4-byte atomic write into a slot that
 /// formerly held a 64-bit typed pointer truncates the slot's
 /// content. A subsequent DW reload must NOT resurrect the
 /// pre-atomic typed-pointer state.

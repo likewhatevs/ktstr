@@ -28,7 +28,7 @@ fn enforce_defaults_to_false() {
         "enforce must default to false (report-only mode)"
     );
     let d = MonitorThresholds::new();
-    assert!(!d.enforce, "DEFAULT.enforce must match default()");
+    assert!(!d.enforce, "new().enforce must match default()");
 }
 
 #[test]
@@ -38,7 +38,7 @@ fn thresholds_default_values() {
     // "passes by default" across every test that inherits
     // defaults via `Assert::default_checks()` + per-scheduler
     // merge. If a default moves, the rationale belongs in the
-    // doc comment on `DEFAULT` first; the test failure then
+    // doc comment on `new()` first; the test failure then
     // prompts the rationale update.
     let t = MonitorThresholds::default();
     assert!(
@@ -66,7 +66,7 @@ fn thresholds_default_values() {
 
 #[test]
 fn thresholds_default_matches_const() {
-    // `Default::default()` and `DEFAULT` must agree — the impl
+    // `Default::default()` and `new()` must agree — the impl
     // forwards, but the forward is a single expression that a
     // drive-by refactor could break.
     let a = MonitorThresholds::default();

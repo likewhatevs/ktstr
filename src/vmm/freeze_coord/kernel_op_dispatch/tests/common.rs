@@ -2,7 +2,7 @@ use super::super::*;
 
 // ---- Shared synthetic-guest-memory fixtures ----
 //
-// These build a host-side `GuestKernel` over a stack buffer so the
+// These build a host-side `GuestKernel` over a caller-owned buffer so the
 // dispatcher's production read/write paths run with no VM boot and no
 // BTF. Reused by `task_field` (validation chain) and `dispatch_arms`
 // (Symbol/Direct/Kva arms + batch + walker).
@@ -113,9 +113,10 @@ pub(super) fn build_test_kernel(
     buf: &mut [u8],
     symbols: std::collections::HashMap<String, u64>,
 ) -> crate::monitor::guest::GuestKernel {
-    // SAFETY: buf outlives the kernel by virtue of caller keeping
-    // it on the stack; GuestMem::new requires the backing buffer
-    // remain valid for the GuestMem's lifetime.
+    // SAFETY: buf outlives the kernel because the caller's owning
+    // `Vec` is dropped after the returned `GuestKernel`; GuestMem::new
+    // requires the backing buffer remain valid for the GuestMem's
+    // lifetime.
     let mem = unsafe {
         std::sync::Arc::new(crate::monitor::reader::GuestMem::new(
             buf.as_mut_ptr(),

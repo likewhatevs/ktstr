@@ -7,10 +7,12 @@ use super::*;
 
 /// Single-descriptor TX chain on port 2: one device-readable
 /// segment with a known byte pattern lands verbatim in
-/// `port2_tx_buf` (observable via `drain_port2_bulk`). Pins the
-/// PORT2_TXQ branch of the queue_idx routing match in
-/// `process_tx_into` (line ~668): a regression that mis-routed
-/// to `port0_tx_buf` or `port1_tx_buf` would surface here.
+/// `ports[2].tx_buf` (observable via `drain_port2_bulk`). Pins
+/// the PORT2_TXQ routing: `queue_to_port` (in `mmio_write`) maps
+/// the queue index to `process_tx(port_id)`, which uses
+/// `port_queues(port_id)` and writes to `ports[port_id].tx_buf`.
+/// A regression that mis-routed to `ports[0].tx_buf` or
+/// `ports[1].tx_buf` would surface here.
 #[test]
 fn port2_tx_single_descriptor_lands_in_port2_buf() {
     let mut dev = VirtioConsole::new();
@@ -68,10 +70,10 @@ fn port2_tx_single_descriptor_lands_in_port2_buf() {
 }
 
 /// Multi-descriptor port-2 TX chain: four 4 KiB segments
-/// concatenate in `port2_tx_buf` in chain order. Mirrors
+/// concatenate in `ports[2].tx_buf` in chain order. Mirrors
 /// `port1_tx_multi_descriptor_chain_concatenates` — pins that
-/// the per-descriptor staged-scratch append path for PORT2_TXQ
-/// (line ~668-694) preserves byte boundaries and chain order.
+/// the per-descriptor staged-scratch append path in `process_tx`
+/// preserves byte boundaries and chain order.
 /// The host's stats client expects scx_stats responses to arrive
 /// as contiguous newline-delimited JSON; chain-order corruption
 /// would tear the JSON across response boundaries.
@@ -168,7 +170,7 @@ fn port2_tx_oversize_descriptor_truncates_to_tx_desc_max() {
 /// Port 2 TX rejected without DRIVER_OK: mirrors
 /// `port1_tx_rejected_without_driver_ok`. Walks the FSM only to
 /// FEATURES_OK, configures PORT2_TXQ, plants a chain, fires the
-/// notify; the gate at the head of `process_tx_into` must drop
+/// notify; the gate at the head of `process_tx` must drop
 /// the notify with no observable side effects.
 #[test]
 fn port2_tx_rejected_without_driver_ok() {
@@ -229,7 +231,7 @@ fn port2_tx_rejected_without_driver_ok() {
 
     assert!(
         dev.drain_port2_bulk().is_empty(),
-        "port2_tx_buf must remain empty — DRIVER_OK gate must \
+        "ports[2].tx_buf must remain empty — DRIVER_OK gate must \
          reject pre-DRIVER_OK notify",
     );
     let used_idx: u16 = mem
@@ -246,7 +248,8 @@ fn port2_tx_rejected_without_driver_ok() {
 }
 
 /// Port 2 TX rejected without F_MULTIPORT: PORT2_TXQ is
-/// multiport-only (line 576 in `process_tx_into`). A guest that
+/// multiport-only (the `port_id != 0 && !self.multiport_negotiated()`
+/// gate in `process_tx`). A guest that
 /// reaches DRIVER_OK without negotiating F_MULTIPORT must not
 /// have its PORT2_TXQ notifies serviced — the legacy single-
 /// console path never exercises port 2.
@@ -305,7 +308,7 @@ fn port2_tx_rejected_without_multiport() {
 
     assert!(
         dev.drain_port2_bulk().is_empty(),
-        "port2_tx_buf must remain empty — F_MULTIPORT gate must \
+        "ports[2].tx_buf must remain empty — F_MULTIPORT gate must \
          reject the notify",
     );
     let used_idx: u16 = mem
@@ -456,8 +459,8 @@ fn port0_vs_port1_vs_port2_tx_routes_to_correct_buffer() {
 }
 
 /// Port 2 TX wakes `stats_tx_evt` (NOT `tx_evt`). Pins the
-/// queue_idx == PORT2_TXQ branch in `process_tx_into` (lines
-/// 768-772). A regression that fired `tx_evt` for port 2 would
+/// `port_id == 2` eventfd branch in `process_tx`. A regression
+/// that fired `tx_evt` for port 2 would
 /// wake the freeze coordinator's TOKEN_TX handler on every
 /// scheduler-stats response, contending on the device mutex.
 /// A regression that fired `stats_tx_evt` for ports 0/1 would
@@ -624,10 +627,10 @@ fn handle_device_ready_enqueues_port_add_for_port_2() {
 /// `PORT_READY` for id=2 enqueues `PORT_NAME` (with `PORT2_NAME`)
 /// then `PORT_OPEN` — same order as port 1 (PORT_NAME before
 /// PORT_OPEN keeps udev sysfs symlink creation ahead of any
-/// userspace `/dev/vport0p2` open). Pins the `id == 1 || id == 2`
-/// branch in `handle_control_event` PORT_READY (line ~1782) and
-/// the `match id { ... 2 => PORT2_NAME, ... }` lookup at
-/// line ~1794.
+/// userspace `/dev/vport0p2` open). Pins the non-console (`else`
+/// of `id == 0`) PORT_READY branch in `handle_control_event`
+/// and the `self.ports[id as usize].name` lookup (each `Port` is
+/// constructed with its name, `Port::new(PORT2_NAME)` for id=2).
 #[test]
 fn handle_port_ready_port2_name_then_open() {
     let mut dev = VirtioConsole::new();
@@ -638,7 +641,7 @@ fn handle_port_ready_port2_name_then_open() {
     });
     assert!(
         dev.ports[2].readied,
-        "port_readied[2] must be set after PORT_READY for id=2"
+        "ports[2].readied must be set after PORT_READY for id=2"
     );
     // Bulk-port pattern: PORT_NAME then PORT_OPEN, 2 frames.
     assert_eq!(
@@ -673,19 +676,20 @@ fn handle_port_ready_port2_name_then_open() {
     }
 }
 
-/// `PORT_OPEN(id=2, value=1)` flips `port_opened[2]` from false
+/// `PORT_OPEN(id=2, value=1)` flips `ports[2].opened` from false
 /// to true; `value=0` flips it back. Pins the array-index path
-/// in `handle_control_event` PORT_OPEN (line ~1814-1816) for
-/// id=2 specifically. Without this test, a regression that
-/// scoped the index update to `id < 2` would leave port_opened[2]
-/// stuck at false and the port-2 RX gate would defer all bytes
+/// in `handle_control_event` PORT_OPEN
+/// (`self.ports[id as usize].opened = now_open`) for id=2
+/// specifically. Without this test, a regression that scoped the
+/// index update to `id < 2` would leave `ports[2].opened` stuck
+/// at false and the port-2 RX gate would defer all bytes
 /// indefinitely.
 #[test]
 fn handle_port_open_tracks_state_for_port_2() {
     let mut dev = VirtioConsole::new();
     assert!(
         !dev.ports[2].opened,
-        "precondition: port_opened[2] must start false"
+        "precondition: ports[2].opened must start false"
     );
     dev.handle_control_event(VirtioConsoleControl {
         id: 2,
@@ -694,7 +698,7 @@ fn handle_port_open_tracks_state_for_port_2() {
     });
     assert!(
         dev.ports[2].opened,
-        "PORT_OPEN(value=1) for id=2 must set port_opened[2]"
+        "PORT_OPEN(value=1) for id=2 must set ports[2].opened"
     );
     dev.handle_control_event(VirtioConsoleControl {
         id: 2,
@@ -703,12 +707,12 @@ fn handle_port_open_tracks_state_for_port_2() {
     });
     assert!(
         !dev.ports[2].opened,
-        "PORT_OPEN(value=0) for id=2 must clear port_opened[2]"
+        "PORT_OPEN(value=0) for id=2 must clear ports[2].opened"
     );
 }
 
 /// `PORT_READY` for id=2 with value=0 must NOT set
-/// `port_readied[2]` and must NOT enqueue announce frames —
+/// `ports[2].readied` and must NOT enqueue announce frames —
 /// same semantics as the port-0 / port-1 value=0 paths. Pins
 /// that the value=0 early-return precedes the per-port gate
 /// flag for id=2.
@@ -726,7 +730,7 @@ fn handle_port_ready_port2_value_zero_skipped() {
     );
     assert!(
         !dev.ports[2].readied,
-        "PORT_READY(id=2, value=0) must NOT set port_readied[2] — \
+        "PORT_READY(id=2, value=0) must NOT set ports[2].readied — \
          a future legitimate value=1 must still complete",
     );
 }
@@ -766,14 +770,14 @@ fn handle_port_ready_repeat_ignored_port2() {
 // Reset coverage for port-2 specific state.
 // ----------------------------------------------------------------
 
-/// `reset()` clears `port_opened[2]`, `port_readied[2]`, and
-/// `port2_pending_rx`, but PRESERVES `port2_tx_buf` (host-side
-/// capture buffer, mirrors port 0 / port 1). Extends
+/// `reset()` clears `ports[2].opened`, `ports[2].readied`, and
+/// `ports[2].pending_rx`, but PRESERVES `ports[2].tx_buf`
+/// (host-side capture buffer, mirrors port 0 / port 1). Extends
 /// `reset_clears_all_state` with explicit port-2 coverage. A
-/// regression that cleared `port2_tx_buf` would discard
+/// regression that cleared `ports[2].tx_buf` would discard
 /// scheduler-stats responses captured at reset time before
 /// `final_drain` could surface them; a regression that did NOT
-/// clear `port2_pending_rx` would let stale request bytes leak
+/// clear `ports[2].pending_rx` would let stale request bytes leak
 /// into a fresh probe. The `device_ready` reset is implicit in
 /// `reset_clears_all_state`; this test focuses on the port-2
 /// specific fields.
@@ -792,37 +796,40 @@ fn reset_clears_port2_state_preserves_port2_tx_buf() {
     // Reset.
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, 0);
 
-    // port2_tx_buf survives — it's the host-side capture buffer
-    // for `final_drain`. Mirrors `port{0,1}_tx_buf` semantics in
+    // ports[2].tx_buf survives — it's the host-side capture buffer
+    // for `final_drain`. Mirrors `ports[0,1].tx_buf` semantics in
     // the existing `reset_clears_all_state` test.
     assert_eq!(
         dev.ports[2].tx_buf.iter().copied().collect::<Vec<u8>>(),
         b"leftover2",
-        "port2_tx_buf must survive reset (host-side capture buffer)",
+        "ports[2].tx_buf must survive reset (host-side capture buffer)",
     );
-    // port2_pending_rx is cleared: pending host→guest bytes have
+    // ports[2].pending_rx is cleared: pending host→guest bytes have
     // no post-reset consumer (the kernel's port-2 reader has
     // already torn down).
     assert!(
         dev.ports[2].pending_rx.is_empty(),
-        "port2_pending_rx must be cleared on reset (no post-reset consumer)",
+        "ports[2].pending_rx must be cleared on reset (no post-reset consumer)",
     );
-    // port_opened[2] and port_readied[2] reset to false. The
+    // ports[2].opened and ports[2].readied reset to false. The
     // existing array assertion in `reset_clears_all_state` covers
     // this implicitly via `[false; NUM_PORTS as usize]`; this
     // explicit pin avoids dependence on NUM_PORTS happening to
     // equal 3.
-    assert!(!dev.ports[2].opened, "port_opened[2] must reset to false",);
-    assert!(!dev.ports[2].readied, "port_readied[2] must reset to false",);
+    assert!(!dev.ports[2].opened, "ports[2].opened must reset to false",);
+    assert!(
+        !dev.ports[2].readied,
+        "ports[2].readied must reset to false",
+    );
 }
 
 // ----------------------------------------------------------------
-// Port 2 RX (PORT2_RXQ / drain_port2_pending_rx) chain-level tests.
+// Port 2 RX (PORT2_RXQ / drain_pending_rx(2)) chain-level tests.
 // ----------------------------------------------------------------
 
 /// Empty pending-rx → drain is a no-op. Pins the
-/// `if pending.is_empty()` fast-exit at the head of
-/// `drain_port2_pending_rx`.
+/// `if self.ports[port_id].pending_rx.is_empty()` fast-exit at
+/// the head of `drain_pending_rx` (the port-2 case).
 #[test]
 fn drain_port2_pending_rx_empty_pending_is_noop() {
     let mut dev = VirtioConsole::new();
@@ -843,7 +850,7 @@ fn drain_port2_pending_rx_empty_pending_is_noop() {
 
     assert!(
         dev.ports[2].pending_rx.is_empty(),
-        "precondition: port2_pending_rx must start empty"
+        "precondition: ports[2].pending_rx must start empty"
     );
     let int_before = dev.interrupt_status;
 
@@ -862,14 +869,14 @@ fn drain_port2_pending_rx_empty_pending_is_noop() {
     );
 }
 
-/// `port_opened[2]` gate: with DRIVER_OK + F_MULTIPORT but BEFORE
+/// `ports[2].opened` gate: with DRIVER_OK + F_MULTIPORT but BEFORE
 /// the guest has sent `PORT_OPEN(id=2, value=1)` on c_ovq, port 2
 /// has no userspace reader. Pins the
-/// `if !self.port_opened[2]` guard in `drain_port2_pending_rx`.
-/// After the guest opens port 2 via PORT_OPEN, the deferred
-/// drain runs (the open transition itself triggers it via the
-/// `2 => self.drain_port2_pending_rx()` arm at line ~1829);
-/// the bytes must then land in the queue.
+/// `if port_id != 0 && !self.ports[port_id].opened` guard in
+/// `drain_pending_rx`. After the guest opens port 2 via PORT_OPEN,
+/// the deferred drain runs (the PORT_OPEN handler's
+/// `now_open && !was_open && id != 0` block calls
+/// `drain_pending_rx(id)`); the bytes must then land in the queue.
 #[test]
 fn drain_port2_pending_rx_defers_until_port_open() {
     let mut dev = VirtioConsole::new();
@@ -890,7 +897,7 @@ fn drain_port2_pending_rx_defers_until_port_open() {
     // Port 2 not yet opened — gate must defer.
     assert!(
         !dev.ports[2].opened,
-        "precondition: port_opened[2] must be false"
+        "precondition: ports[2].opened must be false"
     );
 
     dev.ports[2].pending_rx.extend(payload.iter().copied());
@@ -899,16 +906,18 @@ fn drain_port2_pending_rx_defers_until_port_open() {
     assert_eq!(
         dev.ports[2].pending_rx.len(),
         payload.len(),
-        "port_opened[2] gate must defer when guest has not opened port 2"
+        "ports[2].opened gate must defer when guest has not opened port 2"
     );
     let used_idx_before: u16 = mem
         .read_obj(mock.used_addr().checked_add(2).unwrap())
         .expect("read used.idx before open");
-    assert_eq!(used_idx_before, 0, "port_opened[2] gate must skip add_used");
+    assert_eq!(
+        used_idx_before, 0,
+        "ports[2].opened gate must skip add_used"
+    );
 
-    // Now drive PORT_OPEN(id=2, value=1). The handler at line
-    // ~1829 calls drain_port2_pending_rx on the closed→open
-    // transition.
+    // Now drive PORT_OPEN(id=2, value=1). The PORT_OPEN handler
+    // calls drain_pending_rx(id) on the closed→open transition.
     open_port2(&mut dev);
 
     assert!(
@@ -933,7 +942,7 @@ fn drain_port2_pending_rx_defers_until_port_open() {
 
 /// Single-descriptor write-only chain on port 2: happy-path
 /// baseline. Pins that a normal drain delivers the payload to
-/// the descriptor buffer, drains `port2_pending_rx`, advances
+/// the descriptor buffer, drains `ports[2].pending_rx`, advances
 /// `used.idx`, and signals the guest via INT_VRING + irq_evt.
 /// Mirrors `drain_port1_pending_rx_single_descriptor_happy_path`.
 #[test]
@@ -988,11 +997,11 @@ fn drain_port2_pending_rx_single_descriptor_happy_path() {
 /// two write-only descriptors where the second points at
 /// unmapped guest memory. `mem.write_slice` fails on the second
 /// descriptor, triggering the torn-write branch in
-/// `drain_port2_pending_rx`.
+/// `drain_pending_rx`.
 ///
 /// Pins:
 /// (a) chain head add_used'd with len=0 (used.idx == 1);
-/// (b) bytes preserved in `port2_pending_rx` for retry;
+/// (b) bytes preserved in `ports[2].pending_rx` for retry;
 /// (c) drain loop breaks (any further chain remains unconsumed);
 /// (d) signal_used NOT called (total_written stays 0).
 ///

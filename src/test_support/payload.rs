@@ -709,7 +709,7 @@ pub enum OutputFormat {
     ///
     /// **Host-only, deferred extraction.** Unlike `Json`, the LLM
     /// extraction does NOT run inside the guest VM — the model
-    /// (~2.4 GiB) does not fit in guest RAM and the cache lives on
+    /// (~2.55 GiB) does not fit in guest RAM and the cache lives on
     /// the host. Inside the guest, `ctx.payload(P).run()` returns
     /// empty metrics; the captured raw stdout/stderr ship across
     /// the SHM ring as a `MSG_TYPE_RAW_PAYLOAD_OUTPUT` entry, and
@@ -1250,7 +1250,7 @@ impl From<&MetricHint> for WireMetricHint {
 /// Emitted by the guest alongside an empty
 /// [`PayloadMetrics`] so the host can run the
 /// LLM-backed extraction post-VM-exit. LLM extraction never runs in
-/// the guest: the model (~2.4 GiB) does not fit in guest VM RAM, and
+/// the guest: the model (~2.55 GiB) does not fit in guest VM RAM, and
 /// the cache lives on the host. Each `RawPayloadOutput` carries a
 /// `payload_index` matching the empty-metrics `PayloadMetrics`
 /// slot's `payload_index`. The host pairs them by equal index, not
@@ -1904,8 +1904,8 @@ mod tests {
     /// Round-trip a [`RawPayloadOutput`] carrying NON-empty stdout
     /// AND non-empty stderr through serde_json::to_vec /
     /// from_slice — the wire format the guest's
-    /// `emit_raw_payload_output_to_shm` actually uses on the SHM ring
-    /// (see src/scenario/payload_run.rs `emit_raw_payload_output_to_shm`).
+    /// `emit_raw_payload_output` actually uses on the SHM ring
+    /// (see src/scenario/payload_run.rs `emit_raw_payload_output`).
     /// Pins the wire-format invariant for the deferred LlmExtract
     /// path: both raw streams MUST survive the guest→host transport,
     /// because the host's `host_side_llm_extract` runs the model

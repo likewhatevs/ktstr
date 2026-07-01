@@ -271,13 +271,13 @@ fn entry_bare_mixed_bool_attrs() {
 }
 
 // ---------------------------------------------------------------------------
-// Bare-form coverage for every bool attribute. The macro's Meta::Path arm
-// routes each of the 10 bool attrs by string match — pin each one so a typo
-// regression in any arm gets caught by `cargo test --test ktstr_test_macro`.
+// Bare-form coverage for the bool attributes. The macro's Meta::Path arm
+// routes each of the 16 bool attrs by string match — pin the ones below so a
+// typo regression in their arm gets caught by `cargo test --test ktstr_test_macro`.
 // ---------------------------------------------------------------------------
 
 // Cannot pair bare `auto_repro` with `host_only = true` — the macro's
-// auto_repro-vs-host_only mutex check (lib.rs) rejects the combo at
+// auto_repro-vs-host_only mutex check (ktstr_test/mod.rs) rejects the combo at
 // compile time. Omit host_only here; this fixture only registers an
 // entry that the test below looks up via find_test, never invokes.
 #[ktstr_test(auto_repro)]

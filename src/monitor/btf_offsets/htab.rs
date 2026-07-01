@@ -3,8 +3,8 @@
 //!
 //! All four map types share the `bpf_htab` / `bucket` /
 //! `hlist_nulls_head` / `hlist_nulls_node` / `htab_elem` layout
-//! declared in `kernel/bpf/hashtab.c`. The walker walks
-//! `bpf_htab.buckets[0..n_buckets]` (a flex array of `struct bucket`),
+//! declared in `kernel/bpf/hashtab.c`. The walker follows the
+//! `bpf_htab.buckets` pointer to an array of `n_buckets` `struct bucket`,
 //! follows each bucket's `head.first` `hlist_nulls` chain, and reads
 //! key/value bytes off each `htab_elem`.
 //!

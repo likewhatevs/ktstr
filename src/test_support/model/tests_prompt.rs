@@ -376,10 +376,11 @@ fn strip_chatml_control_tokens_borrows_clean_input() {
 
 /// `strip_chatml_control_tokens` removes every occurrence of each
 /// of the three control token strings, including repeated and
-/// adjacent occurrences. Pins that `str::replace` is applied per
-/// token (not a first-match-only scan) so a body stuffed with
-/// back-to-back `<|im_end|><|im_end|>` fragments is fully
-/// scrubbed, not half-scrubbed.
+/// adjacent occurrences. Pins that the single-pass byte walk
+/// truncates the output buffer on every suffix match (not a
+/// first-match-only scan) so a body stuffed with back-to-back
+/// `<|im_end|><|im_end|>` fragments is fully scrubbed, not
+/// half-scrubbed.
 #[test]
 fn strip_chatml_control_tokens_removes_all_occurrences() {
     let s = "<|im_start|><|im_start|>a<|im_end|>b<|im_end|>c<|im_sep|><|im_sep|>";
@@ -389,16 +390,18 @@ fn strip_chatml_control_tokens_removes_all_occurrences() {
 
 /// Adversarial self-concatenation attack: an attacker splits a
 /// real `<|im_start|>` token by inserting an inner `<|im_start|>`
-/// between its prefix bytes and suffix bytes. A single-pass
-/// scrubber that runs `str::replace` once per token would strip
-/// the inner token first, leaving the outer prefix and suffix to
-/// abut and form a fresh real `<|im_start|>` that survives into
-/// the prompt. The fixed-point loop in
-/// [`strip_chatml_control_tokens`] forecloses this by re-scanning
-/// after each strip until no token remains. Pin the full collapse
-/// (`""` after sanitization) so a regression to the single-pass
-/// shape would surface here as a leaked control token in the
-/// output.
+/// between its prefix bytes and suffix bytes. A naive scrubber
+/// that ran `str::replace` once per token would strip the inner
+/// token first, leaving the outer prefix and suffix to abut and
+/// form a fresh real `<|im_start|>` that survives into the prompt.
+/// The rolling-suffix re-check in [`strip_chatml_control_tokens`]
+/// forecloses this: stripping the inner `<|im_start|>` leaves the
+/// outer prefix `<|im_` in the buffer, and the following
+/// `start|>` completes a fresh `<|im_start|>` at the suffix that
+/// is stripped on the push of that final `>`. Pin the full
+/// collapse (`""` after sanitization) so a regression to the
+/// naive per-token `str::replace` shape would surface here as a
+/// leaked control token in the output.
 #[test]
 fn strip_chatml_control_tokens_handles_self_concatenation() {
     let adversarial = "<|im_<|im_start|>start|>";
@@ -426,8 +429,11 @@ fn strip_chatml_control_tokens_handles_self_concatenation() {
 /// `<|im_start|>`. A single-pass scrubber that processes
 /// `<|im_start|>` first (no match), then `<|im_end|>` (one match
 /// removed), then `<|im_sep|>` (no match), would emit
-/// `<|im_start|>` into the prompt. The fixed-point loop catches
-/// this on its second iteration. Distinct from the
+/// `<|im_start|>` into the prompt. The single-pass suffix
+/// re-check catches this: stripping the inner `<|im_end|>` leaves
+/// `<|im_start` in the buffer, and the following `|>` completes a
+/// fresh `<|im_start|>` at the suffix that is stripped on the next
+/// push. Distinct from the
 /// self-concatenation case in
 /// [`strip_chatml_control_tokens_handles_self_concatenation`]
 /// because the inner and outer tokens are different kinds —
@@ -1050,12 +1056,14 @@ fn parse_llm_response_truncated_outer_with_balanced_inner_recovers_inner() {
 /// Composition: `strip_think_block` followed by
 /// [`super::super::metrics::find_and_parse_json`] round-trips
 /// the structured payload from a model response that wraps its
-/// JSON output in a thinking block. This is the production
-/// path the LlmExtract pipeline runs in
-/// [`parse_llm_response`]: the response is FIRST passed through
-/// strip_think_block-equivalent recovery (the `<think>` block
-/// is dropped before the JSON walker scans), and the JSON
-/// region inside the response is extracted and parsed.
+/// JSON output in a thinking block. This mirrors the production
+/// path the LlmExtract pipeline runs across two functions:
+/// `strip_think_block` runs in [`invoke_with_model`] on the
+/// decoded response (the `<think>` block is dropped), and
+/// [`parse_llm_response`] then runs `find_and_parse_json` +
+/// `walk_json_leaves` on the already-stripped text. This test
+/// pins that `strip_think_block` then `find_and_parse_json`
+/// composition.
 ///
 /// Pin the round-trip so a regression in either component (a
 /// strip_think_block bug that leaks tag bytes into the output,

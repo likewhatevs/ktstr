@@ -217,7 +217,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 ///
 /// Returns `(name, resolved_host_path, sched_args)` tuples in the
 /// SAME order as `entry.staged_schedulers` iteration. Ordering is
-/// load-bearing: the future initramfs packer iterates the result
+/// load-bearing: the initramfs packer iterates the result
 /// to emit per-scheduler `/staging/schedulers/<name>/` archive
 /// entries, and parent-directory dependencies are encounter-order
 /// sensitive. Tests pin the order-preservation against a future

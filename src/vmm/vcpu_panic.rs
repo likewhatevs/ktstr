@@ -214,10 +214,12 @@ pub(crate) struct VcpuPanicCtx {
     /// Companion eventfd for `exited`. Same rationale as `kill_evt`
     /// but bound to the per-thread `exited` flag. For the BSP
     /// thread `exited` IS `bsp_done`, so this is the bsp_done_evt
-    /// the freeze coordinator polls; for AP threads the freeze
-    /// coordinator does not poll per-AP exited via epoll (joins
-    /// happen after `run.kill = true` covers all APs), so AP
-    /// callers leave this `None`.
+    /// the freeze coordinator polls; for AP threads this is the
+    /// per-AP `VcpuThread::exit_evt`, which the parent's AP-join
+    /// loop polls via epoll (the `VcpuThread::wait_for_exit`
+    /// fast-wake path) — so the panic-hook write wakes that join
+    /// loop, not the freeze coordinator, and AP callers pass
+    /// `Some`.
     pub(crate) exited_evt: Option<Arc<EventFd>>,
     /// kvm_run-mmap-liveness flag. `true` means the thread's
     /// `VcpuFd` (and its `MAP_SHARED` `kvm_run` mapping that

@@ -111,11 +111,12 @@ fn populate_run_ext_metrics_empty_series_inserts_nothing() {
 }
 
 /// `populate_run_ext_metrics` never overwrites a key already
-/// present in `target` — a typed GauntletRow field that produced
-/// a value via the MetricDef accessor stays untouched. Pins the
-/// "fill the gap, never clobber" contract: cross-RUN comparison
-/// expects the typed-field value when present and the
-/// helper-computed value only when not.
+/// present in `target` — the `contains_key` guard
+/// (src/assert/run_metrics.rs:1818) skips any key that is already
+/// set, so a pre-populated value survives untouched. Pins the
+/// "fill the gap, never clobber" contract: a value present on the
+/// read path wins, and the helper computes a value only when the
+/// key is absent.
 #[test]
 fn populate_run_ext_metrics_does_not_overwrite_existing_keys() {
     let samples = SampleSeries::from_drained_typed(Vec::new(), None);
@@ -378,10 +379,10 @@ fn build_phase_buckets_stuck_count_excludes_cross_window_stall_pair() {
     );
 }
 
-/// Tester B14 BLOCKING: avg_dsq_depth end-to-end pin through
+/// End-to-end pin of avg_dsq_depth through
 /// the registry → build_phase_buckets → PhaseBucket.metrics
 /// path. Without this, a regression where the read_sample
-/// dispatch arm at src/stats.rs returns None silently produces
+/// dispatch arm at src/stats/metric.rs returns None silently produces
 /// an empty per-phase entry — operator-visible drop. Synthetic
 /// Snapshot DSQ states produce a known mean across local-cpu
 /// entries.
@@ -450,7 +451,7 @@ fn build_phase_buckets_avg_dsq_depth_from_snapshot_dsq_states() {
     );
 }
 
-/// Tester B15 BLOCKING: iteration_rate per-phase population via
+/// iteration_rate per-phase population via
 /// build_phase_buckets_with_stimulus. Synthetic StimulusEvents
 /// with total_iterations deltas at known boundaries produce a
 /// known per-phase rate.

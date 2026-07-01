@@ -247,8 +247,12 @@ fn write_memory_stat_table<W: fmt::Write>(
             // where baseline equals candidate. With 71 keys ×
             // N cgroups the table is dominated by unchanged
             // values; surfacing only the movers cuts output
-            // ~10x for typical runs. Treats absent and
-            // explicit 0 as equal (both render as "0" / "-").
+            // ~10x for typical runs. `av`/`bv` are `Option<u64>`
+            // compared directly, so a row suppresses only when the
+            // two values are exactly equal (both absent, or both the
+            // same present value). An absent key on one side vs. a
+            // present value (including explicit 0) on the other is
+            // not equal and renders (e.g. `0 → -`).
             if av == bv {
                 continue;
             }

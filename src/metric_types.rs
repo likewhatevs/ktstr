@@ -150,8 +150,9 @@
 //!   `policy` is the only example. The `state` char
 //!   and `ext_enabled` bool fields stay unwrapped on
 //!   [`crate::ctprof::ThreadState`]; the
-//!   [`crate::ctprof_compare::AggRule::Mode`] accessor coerces
-//!   them through `String` via `to_string()`/`Display` at the call
+//!   [`crate::ctprof_compare::AggRule::ModeChar`] and
+//!   [`crate::ctprof_compare::AggRule::ModeBool`] accessors coerce
+//!   them through `String` via `to_string()` at the call
 //!   site. If a second bool field appears, promote both to a
 //!   dedicated `CategoricalBool` wrapper rather than continuing the
 //!   ad-hoc coercion.
@@ -277,9 +278,10 @@ pub struct MonotonicCount(pub u64);
 /// `struct sched_statistics` (`include/linux/sched.h`) as
 /// `s64`. The capture pipeline parses these via
 /// `parsed_ns_from_dotted` in [`crate::ctprof`], which
-/// returns `None` on negative dotted values; the capture-site
-/// `unwrap_or(0)` then collapses `None` to zero before the
-/// wrapper is constructed. The `u64` backing here is therefore
+/// returns `Err(ParseDottedNs::Negative)` on negative dotted
+/// values; the `parse_sched` closure maps that to `None`, and the
+/// capture-site `unwrap_or(0)` then collapses `None` to zero
+/// before the wrapper is constructed. The `u64` backing here is therefore
 /// safe because the parser path guarantees non-negative input
 /// — NOT because the kernel field type promises non-negative.
 /// Any new writer that bypasses `parsed_ns_from_dotted` must
@@ -437,8 +439,9 @@ pub struct DeadCounter(pub u64);
 /// (`include/linux/sched.h`); `wait_max`, `sleep_max`,
 /// `block_max`, and `slice_max` are `u64`. The capture pipeline
 /// parses every dotted-ms.ns value via `parsed_ns_from_dotted`
-/// in [`crate::ctprof`], which returns `None` on negative
-/// dotted values; the capture-site `unwrap_or(0)` then collapses
+/// in [`crate::ctprof`], which returns `Err(ParseDottedNs::Negative)`
+/// on negative dotted values; the `parse_sched` closure maps that
+/// to `None`, and the capture-site `unwrap_or(0)` then collapses
 /// `None` to zero before the wrapper is constructed. The `u64`
 /// backing here is therefore safe even for `exec_max` because
 /// the parser path guarantees non-negative input — NOT because
@@ -623,8 +626,8 @@ pub struct OrdinalU64(pub u64);
 /// [`CategoricalString`] field on
 /// [`crate::ctprof::ThreadState`]. The
 /// `state: char` and `ext_enabled: bool` fields stay unwrapped
-/// — the `AggRule::Mode` accessor coerces them through `String`
-/// via `to_string()`/`Display` at the call site. If a second
+/// — the `AggRule::ModeChar` and `AggRule::ModeBool` accessors
+/// coerce them through `String` via `to_string()` at the call site. If a second
 /// bool-valued metric appears, promote both to a dedicated
 /// `CategoricalBool` wrapper rather than continuing the ad-hoc
 /// coercion.
@@ -1444,9 +1447,9 @@ mod tests {
     /// are deliberately NOT Maxable: a static `assert_maxable<T>()`
     /// helper would refuse to compile against `MonotonicCount` /
     /// `MonotonicNs` / `ClockTicks` / `Bytes`. The
-    /// `compile_fail_*` tests under `tests/compile_fail/` pin the
-    /// negative side empirically; this test pins the positive
-    /// side.
+    /// `metric_types_*_not_maxable` fixtures under
+    /// `tests/compile_fail/` pin the negative side empirically;
+    /// this test pins the positive side.
     #[test]
     fn maxable_implemented_for_peaks_and_gauges() {
         fn assert_maxable<T: Maxable>() {}

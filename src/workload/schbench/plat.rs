@@ -78,7 +78,7 @@ fn plat_idx_to_val(idx: usize) -> u32 {
 /// :112). The ~19 KiB `plat` array is HEAP-boxed (`Box<[u32; PLAT_NR]>`), not
 /// inline: this type is the per-phase wire carrier and rides inside
 /// `PhaseSlice` / `PhaseCgroupStats`, which serde constructs on the stack
-/// during (de)serialization — an inline 19 KiB array (×2 in
+/// during (de)serialization — an inline 19 KiB array (×3 in
 /// `SchbenchPhaseStats`) overflows the bounded test/worker thread stack in
 /// serde's recursive descent. Boxing keeps the struct pointer-sized; the
 /// behavior is byte-identical to schbench's inline `unsigned int plat[]`.

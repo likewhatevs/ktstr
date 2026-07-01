@@ -111,8 +111,9 @@ fn worker_exits_2_on_bytes_zero() {
 }
 
 /// Missing positional `<BYTES>` must exit with code 5 (argument
-/// parse failure). Covers the argv-absent branch of the
-/// `expect() → exit(5)` refactor.
+/// parse failure). Covers the argv-absent branch that exits 5 (the
+/// parse-error branch is covered by
+/// `worker_exits_5_on_non_numeric_bytes_arg`).
 #[test]
 fn worker_exits_5_on_missing_bytes_arg() {
     assert_worker_exits(&[], &[], 5, "missing BYTES");
@@ -184,7 +185,7 @@ fn worker_exits_4_on_ready_marker_write_fail() {
 /// tikv-jemallocator's default build prefixes the symbol table with
 /// `_rjem_` (the `unprefixed_malloc_on_supported_platforms` Cargo
 /// feature is NOT enabled in this workspace — see `Cargo.toml`'s
-/// `tikv-jemallocator = { version = "0.6", features = ["stats"] }`
+/// `tikv-jemallocator = { version = "0.6", features = ["stats"], optional = true }`
 /// stanza), so the generic `MALLOC_CONF` is not read by the
 /// in-process jemalloc copy. Setting both variants keeps the test
 /// robust against a future feature flip that unprefixes the symbols.

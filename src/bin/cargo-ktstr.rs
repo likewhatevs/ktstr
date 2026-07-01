@@ -1,7 +1,8 @@
 //! Cargo-integrated `cargo ktstr <SUB>` binary entry point.
 //!
-//! This file is the bin target itself: the global jemalloc allocator,
-//! tracing init, SIGPIPE restore, top-level [`clap::Parser`] dispatch,
+//! This file is the bin target itself: the inherited global jemalloc
+//! allocator, tracing init, SIGPIPE restore, top-level [`clap::Parser`]
+//! dispatch,
 //! and the `KtstrCommand` match arm that fans out to each subcommand
 //! handler. The handlers themselves live in submodules under
 //! `src/bin/cargo_ktstr/`:
@@ -19,8 +20,13 @@
 //! - `run_cargo` — `test`, `coverage`, `llvm-cov` dispatchers that
 //!   wrap `cargo nextest` with the kernel/topology
 //!   gauntlet wire format.
+//! - `perf_delta` — `perf-delta` dispatcher that resolves the
+//!   baseline commit a perf run is compared against and
+//!   surfaces the A/B commit pair.
+//! - `replay` — `replay` dispatcher that re-runs the failing
+//!   subset of a prior sidecar pool.
 //! - `stats`  — `stats compare` subcommand that diffs
-//!   `target/stats/` JSON across two kernel/scheduler
+//!   `target/ktstr/` JSON across two kernel/scheduler
 //!   build commits.
 //! - `verifier` — `verifier` subcommand that runs a scheduler
 //!   binary under the BPF-stats verifier and renders

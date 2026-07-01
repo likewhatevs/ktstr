@@ -57,7 +57,7 @@ pub use util::{
 /// It must be `pub` (not `pub(crate)`) because those call sites live
 /// in the binary crates and thread `&FetchProgress` into the library
 /// resolvers — the same lib/bin-boundary reason [`Spinner`] is `pub`.
-/// The child-bar types (`DownloadBar`, `CloneProgress`) stay
+/// The child-bar types (`GroupBar`, `CloneProgress`) stay
 /// `pub(crate)`: only the in-crate fetch path constructs them.
 pub use progress::FetchProgress;
 

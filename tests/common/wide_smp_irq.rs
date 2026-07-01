@@ -3,10 +3,10 @@
 //! A wide/sparse topology mints APIC IDs above 255 (the MSI ext-dest-id
 //! threshold); these helpers pin a device's IRQ to such a vCPU and read
 //! its per-CPU interrupt count to prove the >255 destination route
-//! actually delivered. Shared by `wide_smp_device_irq_e2e.rs` (virtio-blk)
-//! and `wide_smp_net_irq_e2e.rs` (virtio-net) — the userspace-IOAPIC +
-//! KVM_SET_GSI_ROUTING path is device-agnostic, so only each device's
-//! IRQ-discovery + drive differ; the APIC-ID/IRQ-count scaffolding is one.
+//! actually delivered. `#[path]`-included by the virtio-net and virtio-blk
+//! IRQ e2es — the userspace-IOAPIC + KVM_SET_GSI_ROUTING path is
+//! device-agnostic, so only each device's IRQ-discovery + drive differ; the
+//! APIC-ID/IRQ-count scaffolding is one.
 //!
 //! `#[path]`-included (not a `mod common` tree) so each test pulls in only
 //! this file, matching the `common/cpulist.rs` convention.
@@ -123,8 +123,7 @@ pub fn irq_count(irq: u32, cpu: usize) -> Result<u64> {
 
 /// The single non-loopback network interface (the virtio-net NIC). Skips
 /// `lo`; the NIC is the one interface backed by a device (a `device` symlink
-/// under its sysfs node). Shared by the virtio-net e2es (wide_smp_net_irq +
-/// net_traffic).
+/// under its sysfs node). Shared by the virtio-net e2es.
 #[allow(dead_code)]
 pub fn virtio_net_iface() -> Result<String> {
     for ent in fs::read_dir("/sys/class/net")? {
@@ -283,7 +282,8 @@ pub fn iface_up(fd: i32, iface: &str) -> Result<()> {
         ifr.ifr_name[i] = b as libc::c_char;
     }
     // SAFETY: ifr_name is set; SIOCGIFFLAGS reads current flags into the
-    // ifru_flags union arm, SIOCSIFFLAGS writes them back with IFF_UP set.
+    // ifru_flags union arm, SIOCSIFFLAGS writes them back with
+    // IFF_UP | IFF_RUNNING set.
     let rc = unsafe { libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut ifr) };
     ensure!(
         rc == 0,

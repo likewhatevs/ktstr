@@ -41,11 +41,13 @@ use serde::Serialize;
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
 #[stat(top)]
 pub struct KtstrStats {
-    /// Cumulative count of successful `scx_bpf_dsq_move_to_local`
-    /// calls in `ktstr_dispatch`. Increments after the move
-    /// returns, so `--stall` and `--slow` skip-paths do not bump
-    /// the counter.
-    #[stat(desc = "Number of successful dispatches via SHARED_DSQ")]
+    /// Cumulative count of `scx_bpf_dsq_move_to_local` calls in
+    /// `ktstr_dispatch`, bumped unconditionally after the call
+    /// regardless of whether a task was moved (the kfunc's bool
+    /// return is ignored). Increments after the move returns, so
+    /// the `--stall`, `--slow`, and `--degrade` skip-paths do not
+    /// bump the counter.
+    #[stat(desc = "Number of dispatch moves attempted via SHARED_DSQ")]
     pub nr_dispatched: u64,
     /// Cumulative count of `ktstr_enqueue` invocations. Bumps on
     /// every callback regardless of which DSQ the task lands in
@@ -74,8 +76,10 @@ pub struct KtstrStats {
 }
 
 /// Build the `StatsServerData` instance the scheduler hands to
-/// `StatsServer::new`. The "top" verb dispatches each incoming
-/// stats request through the channel pair the main run loop owns:
+/// `StatsServer::new`. The op registered under the "top" target
+/// (the default target an untargeted "stats" request resolves to)
+/// dispatches each incoming stats request through the channel pair
+/// the main run loop owns:
 /// the request triggers a fresh BPF .bss read on the userspace
 /// thread, which sends the new `KtstrStats` instance back over
 /// the response channel.

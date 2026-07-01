@@ -46,7 +46,7 @@ impl SampleSeries {
     /// Project the series along the stats axis. The closure
     /// receives each sample's stats JSON (when present) and
     /// returns a [`SnapshotResult<T>`]. Samples whose `stats` is
-    /// `Err(reason)` get a `Err(MissingStats { reason })` slot —
+    /// `Err(reason)` get a `Err(MissingStats { tag, reason })` slot —
     /// temporal assertions surface that as a per-sample
     /// missing-stats failure rather than vacuously skipping it,
     /// so a coverage gap is never silent and the operator sees

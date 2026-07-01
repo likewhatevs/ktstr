@@ -20,8 +20,8 @@ use crate::kernel::resolve_kernel_image;
 /// format. The caller writes the result to stderr immediately before
 /// VM boot.
 ///
-/// `operator_include_count` is the length of the operator's `-i / -i`
-/// flag vec. `desc.extra_include_files.len()` is the test's own
+/// `operator_include_count` is the length of the operator's `-i /
+/// --include-files` flag vec. `desc.extra_include_files.len()` is the test's own
 /// include count. Both are UNIONed before being passed to the VM,
 /// but they're surfaced separately in the banner so an operator can
 /// see whether they accidentally dropped a `-i` flag.

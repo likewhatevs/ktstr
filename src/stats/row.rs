@@ -60,7 +60,7 @@ pub struct GauntletRow {
     /// Scheduler binary name carried from the source sidecar
     /// (`SidecarResult::scheduler`). Surfaced through the substring
     /// filter in [`compare_rows_by`] and the typed
-    /// `RowFilter::scheduler` so users can narrow A/B comparisons
+    /// `RowFilter::schedulers` so users can narrow A/B comparisons
     /// by scheduler name.
     pub scheduler: String,
     /// Kernel version carried from the source sidecar
@@ -423,12 +423,12 @@ impl GauntletRow {
 /// empty by default; populated fields are AND-combined ACROSS
 /// fields, with field-internal OR/AND semantics described per-field
 /// below. Applied via `apply_row_filters` in `compare_partitions`
-/// before the rows reach `compare_rows`.
+/// before the rows reach `compare_rows_by`.
 ///
 /// Match semantics:
 /// - `scheduler` / `topology` / `work_type` — STRICT EQUALITY against
 ///   the row's corresponding field. The sibling substring filter on
-///   `compare_rows` (`-E`) stays as the only fuzzy-match knob;
+///   `compare_rows_by` (`-E`) stays as the only fuzzy-match knob;
 ///   typed fields are exact so a `--scheduler scx_rusty` filter does
 ///   NOT spuriously match `scx_rusty_alt`.
 /// - `kernels` — repeatable, OR-combined: a row matches iff its

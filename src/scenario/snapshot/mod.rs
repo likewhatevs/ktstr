@@ -26,7 +26,7 @@
 //!    constructs [`Snapshot`] views to assert against rendered
 //!    values:
 //!    `snapshot.var("nr_cpus_onln").as_u64()? > 0`,
-//!    `snapshot.map("scx_per_task")?.find(|e| e.get("tid").as_i64()? == pid)?`.
+//!    `snapshot.map("scx_per_task")?.find(|e| e.get("tid").as_i64().map_or(false, |t| t == pid))`.
 //!
 //! # On-demand vs error-trigger captures
 //!
@@ -43,53 +43,40 @@
 //! issuing the next freeze request, mirroring the rendezvous
 //! invariants the error-trigger path already obeys.
 //!
-//! # Guest → host wire: ioeventfd doorbell (locked)
+//! # Guest → host wire: virtio-console port-1 TLV request/reply
 //!
-//! The guest-driven capture trigger uses an in-kernel ioeventfd
-//! doorbell, NOT a synchronous MMIO `BusDevice` arm. Per user
-//! direction:
+//! The guest-driven capture trigger rides the virtio-console bulk
+//! port (`/dev/vport0p1`), not an ioeventfd/MMIO doorbell.
 //!
-//! 1. Host registers an ioeventfd at a dedicated MMIO GPA inside
-//!    the existing MMIO gap (e.g. `MMIO_GAP_START + 0x3000`) via
-//!    `KVM_IOEVENTFD`. The exact GPA is arch-dependent —
-//!    `MMIO_GAP_START + 0x3000` on x86_64,
-//!    `VIRTIO_NET_MMIO_BASE + VIRTIO_MMIO_SIZE` on aarch64. The
-//!    fd is owned by the freeze coordinator and polled alongside
-//!    its existing wake sources.
-//! 2. Guest [`Op::CaptureSnapshot`](crate::scenario::ops::Op::CaptureSnapshot)
-//!    handler `mmap`s `/dev/mem` to reach the doorbell GPA (same
-//!    pattern the SHM ring already uses) and writes the tag value
-//!    plus a serial counter into a small per-call slot, then
-//!    writes the doorbell. KVM dispatches the write in-kernel and
-//!    raises the eventfd; the vCPU thread does NOT exit to
-//!    userspace for the doorbell write itself.
-//! 3. The freeze coordinator wakes on `eventfd_signal`, reads the
-//!    tag from the slot, runs `freeze_and_dispatch`, builds the
-//!    `crate::monitor::dump::FailureDumpReport`, and stores it on the bridge keyed by
-//!    that tag. Reply to the guest is implicit — the
-//!    [`SnapshotBridge::capture`] callback installed in the
-//!    executor's thread-local blocks on a per-request reply
-//!    eventfd / completion channel paired with the doorbell.
+//! 1. The guest [`Op::CaptureSnapshot`](crate::scenario::ops::Op::CaptureSnapshot)
+//!    handler calls
+//!    `crate::vmm::guest_comms::request_snapshot` with
+//!    `crate::vmm::wire::SNAPSHOT_KIND_CAPTURE`, the capture
+//!    `name` as the tag, and a timeout. `request_snapshot`
+//!    allocates a per-request `request_id`, builds a
+//!    `SnapshotRequestPayload { request_id, kind, tag }`, and
+//!    sends it as a TLV frame over the port-1 TX writer.
+//! 2. The host freeze coordinator services the request, builds the
+//!    `crate::monitor::dump::FailureDumpReport`, and stores it on
+//!    its [`SnapshotBridge`] keyed by the tag.
+//! 3. `request_snapshot` blocks reading TLV reply frames from the
+//!    same `O_RDWR` fd until it observes one whose payload
+//!    `request_id` matches, then returns a
+//!    `crate::vmm::wire::SnapshotRequestResult`.
 //!
-//! This shape keeps the capture trigger off the vCPU userspace
-//! exit path (cleaner — no MMIO `BusDevice` round-trip) and is
-//! extensible to higher-rate triggers without redesigning the
-//! wire. The [`SnapshotBridge`] surface defined below is the
-//! integration point; `ioeventfd` is the wake mechanism that
-//! drives the `CaptureCallback` from the guest side. The guest
+//! The guest
 //! [`Op::WatchSnapshot`](crate::scenario::ops::Op::WatchSnapshot)
-//! registration uses the same doorbell at scenario setup
-//! (separate tag namespace) so symbol resolution + user
-//! watchpoint slot allocation happen on the host without a vCPU
-//! userspace exit.
+//! registration uses the same port-1 stream with
+//! `crate::vmm::wire::SNAPSHOT_KIND_WATCH`.
 //!
-//! # No-bridge fallback
+//! # No-bridge path
 //!
-//! When `Op::CaptureSnapshot` runs in a context with no installed bridge
-//! (e.g. unit tests that exercise the executor without spinning up
-//! a VM), the op is a no-op with a `tracing::warn!`. Existing
-//! scenarios that do not declare snapshot ops keep working
-//! unchanged.
+//! When `Op::CaptureSnapshot` runs with no installed bridge, the op
+//! fails loudly rather than skipping (per the no-silent-drops
+//! policy): in-guest it routes through the port-1 transport and
+//! `bail`s on a transport failure (including a latched-dead
+//! transport); in host_only mode with no test-fixture bridge it
+//! `bail`s with a "not supported in host_only mode" error.
 //!
 //! # Field accessor traversal
 //!
@@ -120,12 +107,12 @@
 //! | Method                | What it does                                                     |
 //! |-----------------------|------------------------------------------------------------------|
 //! | `.as_u64()`/`.as_i64()`/`.as_f64()`/`.as_bool()` | Typed scalar extract.                  |
-//! | `.as_str()`           | UTF-8 string extract (Enum variant / JSON string).               |
+//! | `.as_str()`           | UTF-8 string extract (SnapshotField / JsonField only; Enum variant / JSON string). |
 //! | `.as_u64_array()` / `.as_u32_array()` / `.as_i64_array()` / `.as_f64_array()` / `.as_bool_array()` | Element-typed array extract. |
 //! | `.get(path)`          | Dotted-path walk (`"a.b.c"`); returns a typed sub-view.          |
 //! | `.member(name)`       | Single-step struct-member walk (RenderedValue only; no dots).    |
 //! | `.index(i)`           | Array element by 0-indexed position (RenderedValue only).        |
-//! | `.raw()`              | Drop into the underlying RenderedValue for raw Option-returning navigation. |
+//! | `.raw()`              | Drop into the wrapper's underlying value for raw Option-returning navigation (RenderedValue for SnapshotField, serde_json::Value for JsonField). |
 //!
 //! The wrapper types ([`SnapshotField`], [`JsonField`]) return
 //! `Result` with rich [`SnapshotError`] context; the raw

@@ -18,9 +18,9 @@
 
 /// `cargo ktstr model fetch` — download + SHA-check the default model
 /// into the user's cache. Wraps `ktstr::test_support::ensure` with a
-/// human-readable progress line; the status is printed after so
-/// users can see the final cache path regardless of whether the
-/// fetch did any work.
+/// human-readable progress line; the resolved cache path is printed
+/// on success so users see it regardless of whether the fetch
+/// downloaded anything.
 pub(crate) fn run_model_fetch() -> Result<(), String> {
     let spec = ktstr::test_support::DEFAULT_MODEL;
     match ktstr::test_support::ensure(&spec) {

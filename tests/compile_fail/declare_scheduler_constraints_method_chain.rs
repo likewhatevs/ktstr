@@ -1,4 +1,5 @@
-// Pins the MethodCall arm of `validate_constraints_expr`. A method
+// Pins the MethodCall arm of `validate_const_eligible` under
+// `ConstEligibility::StructLiteralOnly`. A method
 // chain like `TopologyConstraints::DEFAULT.clone()` parses as
 // `Expr::MethodCall` and must be rejected at expand time with the
 // call-hint version of the diagnostic.

@@ -3,9 +3,13 @@
 //!
 //! Both `cache` and `vmm::initramfs` parse an ELF with the `object`
 //! crate's `Builder`, mark sections for deletion, and serialize the
-//! result. The per-section filter differs — the cache uses a
-//! whitelist, the initramfs a blacklist — but the read/mark/write
-//! pipeline is identical.
+//! result. The shared `rewrite` primitive drives both
+//! `cache::strip_debug_prefix` and `vmm::initramfs::strip_debug_sections`,
+//! which are name-based blacklists (delete sections whose name
+//! matches). The cache's whitelist keep-list
+//! (`cache::strip_keep_list`) is a separate implementation that
+//! inlines its own `Builder::read`/mark/`Builder::write` and does
+//! not go through `rewrite`.
 
 use object::build::elf::Builder;
 
@@ -164,9 +168,8 @@ mod tests {
         assert_eq!(sym.name().expect("symbol name is UTF-8"), "test_sym");
     }
 
-    /// ELF constant value pin — `rewrite` and `cache::strip_keep_list`
-    /// assume the ABI constants `SHT_NOBITS == 8` and
-    /// `SHF_EXECINSTR == 0x4`. Upstream would not change the numeric
+    /// ELF constant value pin — `cache::strip_keep_list` assumes the
+    /// ABI constants `SHT_NOBITS == 8` and `SHF_EXECINSTR == 0x4`. Upstream would not change the numeric
     /// values (the ELF spec fixes them) but could rename the constants
     /// or change their types; this test catches both.
     #[test]

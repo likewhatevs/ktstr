@@ -17,7 +17,7 @@
 //!
 //! [`OutputFormat::LlmExtract`] is HOST-ONLY. The guest-side
 //! `extract_metrics` short-circuits the LlmExtract arm to an empty
-//! metric set so the guest never loads the ~2.4 GiB local model into
+//! metric set so the guest never loads the ~2.55 GiB local model into
 //! its constrained VM RAM. The captured raw stdout/stderr are shipped
 //! over the SHM ring as a `MSG_TYPE_RAW_PAYLOAD_OUTPUT` entry; the
 //! host's `crate::test_support::eval` post-VM-exit pipeline calls
@@ -46,7 +46,7 @@ use crate::test_support::{Metric, MetricSource, MetricStream, OutputFormat, Pola
 ///
 /// [`OutputFormat::LlmExtract`] returns an empty `Vec` from this
 /// function regardless of `output`. The LLM-backed extraction does
-/// NOT run here: the guest does not load the 2.4 GiB model, and the
+/// NOT run here: the guest does not load the ~2.55 GiB model, and the
 /// host runs `extract_via_llm` post-VM-exit on the raw output that
 /// the guest shipped over the SHM ring. Callers that need
 /// LlmExtract metrics must consume the host-extracted result through
@@ -493,7 +493,7 @@ mod tests {
     /// `extract_metrics` short-circuits the `OutputFormat::LlmExtract`
     /// arm to `Ok(Vec::new())` regardless of input. The LLM-backed
     /// extraction has moved host-side: the guest-facing `evaluate()`
-    /// path does NOT load the 2.4 GiB model into VM RAM. Pinning this
+    /// path does NOT load the ~2.55 GiB model into VM RAM. Pinning this
     /// invariant here ensures a future refactor cannot reintroduce
     /// the in-VM model load by silently re-routing the LlmExtract arm
     /// back through `super::model::extract_via_llm`.

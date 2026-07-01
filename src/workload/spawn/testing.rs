@@ -11,7 +11,7 @@
 // subset. Without the allow, fixtures unused by the importing
 // file would warn even though every fixture is used by at
 // least one test file in this directory. The audit alternative
-// (per-fixture imports in every tests_*.rs) trades 13 file
+// (per-fixture imports in every tests_*.rs) trades 14 file
 // churn points for the warning, with no behavioral payoff.
 #![allow(dead_code)]
 
@@ -75,9 +75,10 @@ pub(super) fn spawn_and_collect_after(
 // test binary through the fork's copied state — do not fire.
 
 /// Count open file descriptors for the calling process by
-/// listing `/proc/self/fd/`. The directory iterator itself holds
-/// one fd while open; the snapshot is taken after the iterator
-/// drops, so the count reflects steady state.
+/// listing `/proc/self/fd/`. The `ReadDir`'s own directory fd is
+/// open during `count()`, so the returned value includes it (+1).
+/// This constant offset cancels in the baseline-vs-after diff the
+/// spawn-guard tests use.
 pub(super) fn count_open_fds() -> usize {
     std::fs::read_dir("/proc/self/fd")
         .map(|d| d.count())
@@ -93,17 +94,12 @@ pub(super) fn any_zombie_child() -> bool {
     let ret = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
     ret > 0
 }
-/// Lower RLIMIT_NPROC to the current process count so any `fork`
-/// in this child returns -1 with EAGAIN. Returns true on success.
+/// Set RLIMIT_NPROC to 0 so the next `fork` in this child returns
+/// -1 with EAGAIN. Returns true on success.
 pub(super) fn set_rlimit_nproc_zero_headroom() -> bool {
-    // Setting rlim_cur to 1 would block even our own existing
-    // thread spawns; setting it to the current process's uid
-    // usage is what reliably triggers EAGAIN on the next fork.
-    // getrusage does not expose that counter; instead use a
-    // small value just high enough for the ktstr test binary's
-    // baseline and no more. Empirically, setting rlim_cur == 0
-    // causes fork to return EAGAIN because the kernel rejects
-    // the new-process creation against the per-uid cap.
+    // Setting rlim_cur == 0 causes fork to return EAGAIN because
+    // the kernel rejects the new-process creation against the
+    // per-uid cap.
     let rl = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -426,8 +422,8 @@ pub(super) fn read_grandchild_gpid_from_pidfile(
         if Instant::now() >= read_deadline {
             panic!(
                 "pidfile {pidfile:?} stayed empty for 3s after exists() \
-                 returned true — writer may have crashed between O_TRUNC \
-                 and write",
+                 returned true — writer may have crashed between fs::write \
+                 and fs::rename",
             );
         }
         std::thread::sleep(Duration::from_millis(10));

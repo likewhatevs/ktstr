@@ -388,7 +388,7 @@ pub(crate) fn read_kernel_version_from_metadata_sidecar(
 ///   and misc boot allocations (page tables, slab bootstrap, hash tables).
 ///
 /// - `compressed_initrd`: memblock-reserved by `reserve_initrd_mem()`
-///   (`init/initramfs.c:642`: `memblock_reserve(start, size)`) until
+///   (`init/initramfs.c:640`: `memblock_reserve(start, size)`) until
 ///   `free_initrd_mem()` after `unpack_to_rootfs` completes.
 ///
 /// - struct page array: `P / 64` bytes. Each 4KB page requires a

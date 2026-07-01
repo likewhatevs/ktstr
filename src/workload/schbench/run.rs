@@ -1358,7 +1358,7 @@ fn mean_sched_delay((run_delay, pcount): (u64, u64)) -> u64 {
 /// histograms (snapshot-and-reset, so the next phase starts clean) and push a
 /// [`PhaseSnapshot`] tagged `epoch`, carrying the schedstat run-delay/pcount
 /// delta (`ss_end − ss_start`) and this thread's `loop_count` for the phase.
-/// Mirrors the worker/mod.rs:3327-3374 backdrop drain-on-change. For the
+/// Mirrors the worker/mod.rs:3858-3894 backdrop drain-on-change. For the
 /// message thread the histograms are unwritten (taken empty) and `loop_count`
 /// is 0; an empty histogram folds harmlessly host-side ([`PlatStats::combine`]).
 ///
@@ -2235,8 +2235,9 @@ pub(crate) fn run(
 mod tests {
     use super::*;
 
-    /// Lightweight node for stack stress tests (ThreadData is ~38 KiB, too
-    /// heavy to allocate by the thousand).
+    /// Lightweight node for stack stress tests (ThreadData is far heavier —
+    /// two boxed `PlatStats` histograms plus per-thread state — too heavy to
+    /// allocate by the thousand).
     struct TestNode {
         next: AtomicPtr<TestNode>,
     }

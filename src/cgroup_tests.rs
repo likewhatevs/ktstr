@@ -104,8 +104,8 @@ fn cleanup_all_skips_non_dir_entries() {
 /// `root/mid/leaf/` plus `root/sibling/`, invokes
 /// [`cleanup_recursive`] directly on `root`, and verifies every
 /// directory is gone. Exercises the recursive call inside
-/// [`for_each_child_dir`] that item 7's `cleanup_recursive`
-/// function-pointer arg drives.
+/// [`for_each_child_dir`], which `cleanup_recursive` drives via a
+/// closure that threads `walk_root` through the recursion.
 #[test]
 fn cleanup_recursive_removes_nested_dirs_depth_first() {
     let _tempdir_keep_alive = make_inline_tempdir("nested");

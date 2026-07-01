@@ -128,7 +128,7 @@ pub struct SchedDomainStatsOffsets {
 }
 
 /// Number of idle types for array-indexed sched_domain stats fields.
-/// `CPU_MAX_IDLE_TYPES = 3`: CPU_NOT_IDLE, CPU_IDLE, CPU_NEWLY_IDLE.
+/// `CPU_MAX_IDLE_TYPES = 3`: __CPU_NOT_IDLE, CPU_IDLE, CPU_NEWLY_IDLE.
 pub const CPU_MAX_IDLE_TYPES: usize = 3;
 
 /// Resolve BTF offsets for sched_domain tree walking and stats.

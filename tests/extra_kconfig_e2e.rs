@@ -55,8 +55,10 @@ use std::process::Command;
 /// Path to the linux source tree used by the E2E test.
 ///
 /// Resolved at runtime (the binary doesn't move between compile and
-/// run) so a missing tree produces a clean skip rather than a
-/// `compile_error!`. The convention is `../linux` relative to the
+/// run) so a missing tree fails the test at runtime with an
+/// actionable prerequisite message (the `assert!` in
+/// `extra_kconfig_e2e_validate_rejects_disabled_bpf_syscall`) rather
+/// than a `compile_error!`. The convention is `../linux` relative to the
 /// ktstr crate root (matching the kernel build patterns used
 /// throughout the project).
 fn linux_source_dir() -> PathBuf {

@@ -278,8 +278,10 @@ Enabled by `--no-perf-mode` / `KTSTR_NO_PERF_MODE=1`. Every
 no-perf-mode VM goes through `acquire_llc_plan`: the reservation
 is `LOCK_SH` across a NUMA-aware, consolidation-aware set of
 LLCs, sized to meet the CPU budget — either `--cpu-cap N` (or
-`KTSTR_CPU_CAP=N`) if set, or 30% of the calling process's
-sched_getaffinity cpuset (minimum 1) if not. The flock granularity
+`KTSTR_CPU_CAP=N`) if set, or the no-perf default `max(30% of the
+calling process's sched_getaffinity cpuset, min(vcpus, allowed))`
+(floored at 1) if not — so a wide VM's vCPU threads are not
+host-oversubscribed by a flat 30% mask. The flock granularity
 stays per-LLC; `plan.cpus` holds EXACTLY the budget (partial-take
 on the last LLC when the budget falls mid-LLC). Multiple
 no-perf-mode VMs coexist on the same LLCs because shared locks
@@ -423,7 +425,8 @@ serializes the excess via the flock retry.
 `--no-perf-mode` (or `KTSTR_NO_PERF_MODE=1`) forces
 `performance_mode=false`. The result is **tier 2 above** — a
 CPU-capped `LOCK_SH` reservation (either explicit `--cpu-cap N`
-or the 30%-of-allowed default). The feature differences
+or the no-perf default `max(30% of allowed, min(vcpus, allowed))`).
+The feature differences
 relative to tier 1 are:
 
 - **LLC flock mode** — tier 1 holds `LOCK_EX` on each reserved LLC;
@@ -462,10 +465,11 @@ Available via:
 - `cargo ktstr shell --no-perf-mode`
 - `KTSTR_NO_PERF_MODE=1` (any value; presence is sufficient)
 
-`--cpu-cap N` is the **CLI flag** for `ktstr shell`, `cargo ktstr
-shell`, and `cargo ktstr kernel build` only — `cargo ktstr test`,
-`cargo ktstr coverage`, and `cargo ktstr llvm-cov` do NOT carry the
-flag. For the test/coverage/llvm-cov paths the cap is set via the
-`KTSTR_CPU_CAP` environment variable (the env var is read by every
-VM-builder call site). When absent, the 30%-of-allowed default
-applies automatically.
+`--cpu-cap N` is the **CLI flag** for `ktstr shell`, `ktstr kernel
+build`, `cargo ktstr shell`, and `cargo ktstr kernel build` only —
+`cargo ktstr test`, `cargo ktstr coverage`, and `cargo ktstr llvm-cov`
+do NOT carry the flag. For the test/coverage/llvm-cov paths the cap is
+set via the `KTSTR_CPU_CAP` environment variable (the env var is read
+by every VM-builder call site). When absent, the no-perf VM default
+`max(30% of allowed, min(vcpus, allowed))` applies automatically (the
+kernel-build path uses a flat 30%-of-allowed default).

@@ -5,11 +5,12 @@
 //! the verify script asserts on dev-dep isolation, not on this code's
 //! behavior.
 
-/// Sample prod function. The verify script searches `nm`'s output for
-/// `ktstr::` symbols, so this function's mangled name (containing the
-/// crate name `ktstr_devdep_fixture`) tests that search's specificity —
-/// a regression that searched for the substring "ktstr" instead of a
-/// `ktstr::` namespace path would false-positive on this symbol.
+/// Sample prod function — an unused lib-crate stub. The bin
+/// (`src/main.rs`) does not use the lib crate, so this function is dead
+/// code and its symbol is not linked into `target/release/devdep-fixture`,
+/// the binary the verify script scans (`nm -C --defined-only`, filtering
+/// for `ktstr::`). It therefore does not currently exercise the search's
+/// specificity.
 pub fn fixture_greeting() -> &'static str {
     "devdep-fixture prod surface"
 }

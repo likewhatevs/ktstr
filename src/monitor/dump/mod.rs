@@ -1,7 +1,7 @@
 //! BPF map state dump for scheduler-failure post-mortem.
 //!
 //! [`dump_state`] is invoked by the freeze coordinator after the vCPU
-//! rendezvous succeeds (see `src/vmm/mod.rs`). It enumerates every
+//! rendezvous succeeds (see `src/vmm/freeze_coord/mod.rs`). It enumerates every
 //! BPF map in the guest via [`BpfMapAccessor::maps`], filters out
 //! ktstr-internal probes (the framework's own probe and fentry skel
 //! maps), and dispatches per map type:
@@ -2481,7 +2481,7 @@ fn decode_probe_counters_snapshot(
         "ktstr_pcpu_counters",
     )? as usize;
 
-    // Read the entire array as one slab — 256 * 17 * 128 = 544 KB.
+    // Read the entire array as one slab — 256 * 15 * 128 = 480 KiB.
     // A single slab read is cheaper than 256 * 17 individual reads
     // through the page-walking accessor; the read primitive
     // tolerates over-large requests (truncates at the map's
@@ -2896,12 +2896,12 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
 
                 // 3. Per-CPU local DSQ walk runs unconditionally —
                 //    `rq->scx.local_dsq` is initialized at boot
-                //    (init_dsq from kernel/sched/ext.c:7772 for every
+                //    (init_dsq from kernel/sched/ext.c:4581 for every
                 //    possible CPU) and survives scheduler teardown,
                 //    so it produces data even when *scx_root is NULL.
                 //    This is the data source that survives
                 //    scx_bypass's runnable_list drain
-                //    (kernel/sched/ext.c:5304-5404) during teardown.
+                //    (kernel/sched/ext.c:5448-5548) during teardown.
                 let walk_local_dsqs_t0 = std::time::Instant::now();
                 let mut dsqs: Vec<super::scx_walker::DsqState> = Vec::new();
                 if !deadline_exceeded(&mut truncated_at_us)

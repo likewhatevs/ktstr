@@ -1,6 +1,9 @@
-//! `format_sched_died_*` template pins. The three helpers are
-//! the single source of truth for emitter-side message
-//! formatting; every production site goes through them. These
+//! `format_sched_died_*` template pins. The step/workload helpers
+//! (`format_sched_died_after_step`, `_after_all_steps`,
+//! `_during_workload`) are the single source of truth for the
+//! step/workload sched-died templates; the sibling
+//! `format_sched_died_survives_storm` covers the survives_storm
+//! post-function probe. These
 //! tests pin the exact message templates so operators grepping
 //! stderr can keep stable anchors, and the numeric formatting
 //! (step N of M, `{:.1}s`). The structural detection path —

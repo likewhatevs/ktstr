@@ -38,8 +38,9 @@
 //!     writes. Validating the framework's instrumentation against
 //!     `Custom` would test the closure, not the framework.
 //!   - `Sequence` — composed of phases, not a leaf variant; the
-//!     phase-walk test in `src/workload/types/tests.rs` covers
-//!     the dispatch correctness.
+//!     `spawn_sequence_produces_work` test in
+//!     `src/workload/spawn/tests_integration.rs` covers the
+//!     dispatch correctness.
 
 use anyhow::Result;
 use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
@@ -208,7 +209,8 @@ fn validation_futex_ping_pong_populates_wake_latencies(ctx: &Ctx) -> Result<Asse
 /// `MutexContention` MUST populate `iterations` and `work_units`
 /// under multi-worker contention. The variant's contract is a
 /// shared mutex serializing critical sections; with `contenders >
-/// 1`, every iteration drains a shared queue and bumps both
+/// 1`, every iteration acquires the shared lock word (CAS /
+/// FUTEX_WAIT), runs the critical section, releases, and bumps both
 /// counters per acquire/release cycle. A regression that breaks
 /// the futex-fast-path acquisition or the lock release branch
 /// would surface here as zero iterations across all contenders.

@@ -15,10 +15,10 @@
 //! 4. The scheduler's response — also a `\n`-terminated JSON line —
 //!    travels back through the same path: scheduler writes the Unix
 //!    socket; relay forwards it to `/dev/vport0p2`; the device
-//!    accumulates the bytes in `port2_tx_buf` and signals
+//!    accumulates the bytes in `ports[2].tx_buf` and signals
 //!    `stats_tx_evt`.
 //! 5. The drainer thread this client owns wakes on `stats_tx_evt`,
-//!    drains `port2_tx_buf`, and either appends the bytes to the
+//!    drains `ports[2].tx_buf`, and either appends the bytes to the
 //!    response buffer (if a request is in flight) or discards them
 //!    (logging the discard count).
 //! 6. [`SchedStatsClient::request_raw`] blocks on a [`Condvar`]
@@ -86,7 +86,7 @@ const CAP_OVERFLOW_ERROR_REPLY: &[u8] = b"{\"ktstr_relay_error\":\"response cap 
 /// scx_stats requests are JSON command lines (`{"req":"stats"}\n`
 /// and similar); 256 KiB is far above any legitimate request size.
 /// Caps the per-request `queue_input_port2` allocation so a buggy
-/// caller can't grow the device's `port2_pending_rx` deque without
+/// caller can't grow the device's `ports[2].pending_rx` deque without
 /// bound on a single push.
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 
@@ -500,9 +500,9 @@ impl SchedStatsClient {
     ///
     /// Residual portion — bytes that arrive after pre-drain release:
     /// `VirtioConsole::process_tx` (port-id 2, defined in
-    /// virtio_console.rs) runs only when the vCPU services a
+    /// virtio_console/device/mod.rs) runs only when the vCPU services a
     /// QUEUE_NOTIFY MMIO write on port-2 TX (q7 per the multiport
-    /// queue numbering in virtio_console.rs). The guest can
+    /// queue numbering in virtio_console/mod.rs). The guest can
     /// publish a chain to the avail ring + issue NOTIFY BEFORE
     /// our pre-drain, but the vCPU MMIO handler may not have run
     /// yet (e.g. coming out of a freeze rendezvous that paused
@@ -599,7 +599,7 @@ impl SchedStatsClient {
     /// mutex critical section to the queue_input_port2 call.
     ///
     /// Drop any host→guest bytes that are still sitting in
-    /// `port2_pending_rx` from a prior request that was abandoned
+    /// `ports[2].pending_rx` from a prior request that was abandoned
     /// mid-push (e.g. a freeze rendezvous landed before the guest
     /// read those bytes). Without this clear, the new request
     /// would be concatenated onto the dead tail of the previous
@@ -743,11 +743,11 @@ impl SchedStatsClient {
     ///    `response_buf` from prior request's partial-newline
     ///    consumption — the post-newline tail per `split_off`
     ///    semantics in the wait-loop's success arm).
-    /// 3. [`Self::request_raw`] clears stale `port2_pending_rx`
+    /// 3. [`Self::request_raw`] clears stale `ports[2].pending_rx`
     ///    (host→guest) at request start — bytes from a prior
     ///    request abandoned mid-push would otherwise concatenate
     ///    onto the new request line.
-    /// 4. [`Self::request_raw`] pre-drains `port2_tx_buf`
+    /// 4. [`Self::request_raw`] pre-drains `ports[2].tx_buf`
     ///    (guest→host) BEFORE flipping `in_flight=true`
     ///    (stale-bytes race-close — bytes already in the buffer
     ///    that the drainer would otherwise misattribute to the
@@ -830,7 +830,7 @@ impl<'a> Drop for InFlightGuard<'a> {
 /// Drainer-thread main loop. Runs until `kill_drainer` fires (the
 /// last `Arc<ClientShared>` clone has dropped) OR `cancel_evt`
 /// fires (the run-wide kill flag was set, e.g. watchdog timeout).
-/// Drains `port2_tx_buf` on every `stats_tx_evt` wake; appends to
+/// Drains `ports[2].tx_buf` on every `stats_tx_evt` wake; appends to
 /// the response buffer when a request is in flight, discards
 /// otherwise. On either kill edge, performs a final
 /// `cvar.notify_all()` so any blocked `request_raw` wakes,

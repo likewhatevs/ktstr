@@ -1,14 +1,14 @@
 //! Host-side `scx_static` bump-allocator walker.
 //!
 //! `scx_static` is the program-lifetime bump allocator declared in the
-//! upstream scx tree at `lib/sdt_alloc.bpf.c` (line 577 — the
+//! upstream scx tree at `lib/sdt_alloc.bpf.c` (line 581 — the
 //! `struct scx_static scx_static;` global). It is distinct from the
 //! per-instance `scx_allocator` walked by [`super::sdt_alloc`]: the
 //! per-instance allocator hands out fixed-stride slots via a 3-level
 //! radix tree with per-slot headers; `scx_static` hands out
 //! variable-size, header-less allocations from a flat arena region by
 //! advancing a single `off` pointer (see
-//! `scx_static_alloc_internal` in `lib/sdt_alloc.bpf.c:580-657`).
+//! `scx_static_alloc_internal` in `lib/sdt_alloc.bpf.c:584-661`).
 //!
 //! # Why a separate walker
 //!
@@ -40,8 +40,9 @@
 //! the bytes, and what BTF struct that site emitted). The cast
 //! analyzer in [`crate::monitor::cast_analysis`] already tracks
 //! `scx_static_alloc_internal` calls (see the
-//! `ARENA_ALLOC_KFUNC_NAMES` allowlist at
-//! `crate::vmm::cast_analysis_load:1034`) and emits a `CastHit` with
+//! `ALLOC_SUBPROG_NAMES` allowlist in
+//! `crate::vmm::cast_analysis_load::reloc`, consulted by
+//! `build_subprog_returns`) and emits a `CastHit` with
 //! `target_type_id == 0` when shape inference is ambiguous — the
 //! deferred-resolve path the renderer falls into. The analyzer does
 //! NOT today emit a `(call_site_pc, expected_type_id, expected_size)`
@@ -60,8 +61,8 @@
 //! The bump allocator never frees individual allocations — it rolls
 //! forward to a fresh `bpf_arena_alloc_pages` region when the current
 //! `(memory, off + alloc_bytes)` would exceed `max_alloc_bytes` (see
-//! `lib/sdt_alloc.bpf.c:609-649`). Old regions are abandoned in place
-//! (the verifier comment at line 614-617 calls this out: "No free
+//! `lib/sdt_alloc.bpf.c:613-653`). Old regions are abandoned in place
+//! (the in-source comment at lines 618-621 calls this out: "No free
 //! operation so just forget about the previous allocation memory").
 //! Only the CURRENT region is reachable through the live `memory`
 //! pointer; old regions are unreachable arena pages whose pgoffs the
@@ -76,7 +77,7 @@
 //! The freeze coordinator pauses every vCPU before this walker runs,
 //! so `scx_static.memory` and `scx_static.off` are stable. The
 //! bump allocator updates `scx_static.off` AFTER deciding the
-//! allocation will fit (see `lib/sdt_alloc.bpf.c:651-652`:
+//! allocation will fit (see `lib/sdt_alloc.bpf.c:655-656`:
 //! `ptr = (void __arena *)(addr + padding); scx_static.off += alloc_bytes;`),
 //! so a frozen snapshot may observe a transient state where a caller
 //! has just received a pointer but `off` has not yet been advanced.
@@ -121,19 +122,23 @@ pub const SCX_STATIC_STRUCT_SIZE: usize = 24;
 /// Sanity cap on `max_alloc_bytes` (per-region size) the walker will
 /// trust.
 ///
-/// `lib/sdt_alloc.bpf.c::scx_static_init` (line 660-678) takes
+/// `lib/sdt_alloc.bpf.c::scx_static_init` (line 664-682) takes
 /// `alloc_pages` and computes `max_bytes = alloc_pages * PAGE_SIZE`,
 /// then `bpf_arena_alloc_pages` allocates that many pages from the
 /// arena. The arena window is at most 4 GiB
-/// (`bpf_arena_map_alloc` clamps to `SZ_4G`), so any `max_alloc_bytes`
-/// at or above 4 GiB is structurally impossible — a torn snapshot or
-/// uninitialized struct could surface a wild value, and the walker
-/// rejects anything at or above this bound.
+/// (`arena_map_alloc` rejects `vm_range > SZ_4G`), so any
+/// `max_alloc_bytes` at or above 4 GiB exceeds any realistic arena
+/// window — the kernel permits at most `SZ_4G`, reached only by an
+/// all-pages region. A torn snapshot or uninitialized struct could
+/// surface a wild value, and the walker rejects anything at or above
+/// this bound (conservatively rejecting the exact-4-GiB edge the
+/// kernel would allow).
 const MAX_REASONABLE_REGION_BYTES: u64 = 1u64 << 32;
 
 /// Sanity cap on `off` (high-water mark within a region) the walker
 /// will trust. `off` is bounded above by `max_alloc_bytes` per the
-/// bump allocator's overflow check at line 596-601 / 609. The walker
+/// bump allocator's overflow check at line 600 (per-request fit) /
+/// 613 (roll-forward). The walker
 /// rejects `off > max_alloc_bytes` as a torn-snapshot signal.
 ///
 /// Documented as a derived constant rather than a literal: the
@@ -216,7 +221,7 @@ impl ScxStaticOffsets {
 ///   of the region's first byte (`scx_static.memory`'s low 32 bits;
 ///   the high 32 bits are constant inside one arena window so the
 ///   low-32 keying matches the per-pass `ArenaSlotIndex` convention
-///   in `crate::monitor::dump::render_map::ArenaSlotInfo`).
+///   in `crate::monitor::dump::render_map::ArenaSlotIndex`).
 /// - `size` — the high-water mark `off`. Bytes in
 ///   `[start_low32, start_low32 + size)` are the live-allocated span;
 ///   bytes past `start_low32 + size` (within the same region's
@@ -462,7 +467,7 @@ where
 /// 3. `memory == 0` → reject (`scx_static_init` has not run).
 /// 4. `off > max_alloc_bytes` → reject (impossible in the
 ///    bump allocator's invariant — the overflow check at
-///    `lib/sdt_alloc.bpf.c:609` rejects allocations that would
+///    `lib/sdt_alloc.bpf.c:613` rejects allocations that would
 ///    cross `max_alloc_bytes`, so a torn snapshot is the only way
 ///    `off` can exceed the cap).
 fn read_one_scx_static(
@@ -697,7 +702,7 @@ mod tests {
 
     /// `max_alloc_bytes >= 4 GiB` → reject. A near-4-GiB value is
     /// structurally impossible (the arena window is capped at 4 GiB
-    /// by `bpf_arena_map_alloc::SZ_4G`); pinning the rejection so a
+    /// by `arena_map_alloc::SZ_4G`); pinning the rejection so a
     /// future drift to a wider arena window must explicitly raise
     /// the cap rather than silently accept the wild value.
     #[test]

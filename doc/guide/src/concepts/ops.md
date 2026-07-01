@@ -35,6 +35,7 @@ stay compatible across ktstr version bumps that add new variants:
 | `AttachScheduler` / `DetachScheduler` / `RestartScheduler` / `ReplaceScheduler` | Manage the live scheduler in the guest mid-scenario. `ReplaceScheduler` swaps to a different staged scheduler binary (declared via the `#[ktstr_test(staged_schedulers = [...])]` attribute). |
 | `PinBpfMap` | Open a BPF map fd by name and hold a refcount for the scenario lifetime (keeps a same-binary-swap window's `.bss` alive across `ReplaceScheduler`) |
 | `CaptureCgroupProcs` | Read a cgroup's `cgroup.procs` (thread-group-leader PIDs) and store them on the active `SnapshotBridge` under a tag |
+| `SteerIrq` | Re-steer a hardware IRQ to a single CPU by writing `/proc/irq/<N>/smp_affinity_list`. The IRQ is named by an `IrqSelector` (a literal Linux IRQ number or a `/proc/interrupts` action-name label); the target CPU must be online. IRQ affinity is system-wide, not scoped to the runner's cpuset. Constructor sugar: `Op::steer_irq`. |
 
 Op constructors accept string literals directly (no `.into()` needed):
 
@@ -92,8 +93,8 @@ docstring at `Op::MoveAllTasks` for the asymmetric-ownership table.
 `FreezeCgroup`, `UnfreezeCgroup`, `CaptureSnapshot`, `WatchSnapshot`,
 `WriteKernelHot`, `WriteKernelCold`, `ReadKernelHot`, `ReadKernelCold`,
 `AttachScheduler`, `DetachScheduler`, `RestartScheduler`,
-`ReplaceScheduler`, `PinBpfMap`, `CaptureCgroupProcs`) with none of the
-inner fields, so it is `Copy` and cheap to pass around — framework
+`ReplaceScheduler`, `PinBpfMap`, `CaptureCgroupProcs`, `SteerIrq`) with
+none of the inner fields, so it is `Copy` and cheap to pass around — framework
 code maps each variant to a unique bit index via `OpKind::bit_index()`
 to build the per-step `op_kinds` bitmask. Framework code uses `OpKind`
 when it only cares WHICH operation ran (per-op statistics, stimulus-event

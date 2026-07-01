@@ -3,13 +3,14 @@
 //!
 //! Two callers feed this module:
 //! - thread / process axes ([`super::GroupBy::Comm`] /
-//!   [`super::GroupBy::Pcomm`]) and the smaps_rollup keying use
-//!   [`pattern_key`] / [`pattern_counts_union`] /
-//!   [`pattern_display_label`].
-//! - the cgroup axis applies a three-layer pipeline
-//!   ([`apply_systemd_template`] →
-//!   [`cgroup_skeleton_tokens`] → [`tighten_group`]) wrapped by
-//!   [`cgroup_normalize_skeleton`].
+//!   [`super::GroupBy::Pcomm`]) use [`pattern_key`] /
+//!   [`pattern_counts_union`] / [`pattern_display_label`]; the
+//!   smaps_rollup keying uses only [`pattern_key`].
+//! - the cgroup axis applies a three-layer pipeline: layers 1-2
+//!   ([`apply_systemd_template`] → [`cgroup_skeleton_tokens`]) are
+//!   wrapped by [`cgroup_normalize_skeleton`]; layer 3
+//!   ([`tighten_group`]) runs separately in
+//!   [`crate::ctprof_compare::build_groups`].
 //!
 //! The rules are pure (no kernel introspection, no IO) so they
 //! sit in their own module without pulling the data-type or
@@ -285,9 +286,12 @@ pub(super) fn cgroup_skeleton_tokens(post_l1: &str) -> (String, Vec<String>) {
 }
 
 /// Cgroup layer 3 (tighten): for a multi-member group sharing the
-/// same Layer-2 skeleton, revert any token position whose value is
-/// identical across every member to its literal form. Positions
-/// that vary across members keep their Layer-2 placeholder.
+/// same Layer-2 skeleton, revert a token position to its literal
+/// form only when its value is identical across every member AND
+/// that value is a pure literal (`classify_token` returns it
+/// unchanged). Positions that vary across members, or whose
+/// constant value is instance-classified (`{N}` / `{H}` /
+/// `prefix{N}` / `{N}suffix`), keep their Layer-2 placeholder.
 ///
 /// Members carry both their post-Layer-1 path (used to recover
 /// separator runs verbatim from a representative member) and their

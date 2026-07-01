@@ -135,7 +135,7 @@ static __KTSTR_ENTRY_CYCLE_COLLAPSE: KtstrTestEntry = KtstrTestEntry {
     ..KtstrTestEntry::DEFAULT
 };
 
-// -- demo_verifier_fail_verify: BPF load rejection via --fail-verify --
+// -- verifier BPF-load-rejection scenarios: --fail-verify and --verify-loop --
 
 const FAIL_SCHED: Scheduler =
     Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));

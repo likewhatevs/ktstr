@@ -109,10 +109,10 @@ pub enum Column {
     Delta,
     /// Percentage delta (compare only).
     Pct,
-    /// Single-cell `<baseline> -> <candidate> (<delta>)`
-    /// (compare only). Mutually exclusive with
-    /// `Baseline`/`Candidate`/`Delta`/`Pct` — the arrow form
-    /// fuses them.
+    /// Single-cell `<baseline> -> <candidate>` (compare only).
+    /// Mutually exclusive with `Baseline`/`Candidate` (the arrow
+    /// cell already shows both); coexists with `Delta`/`Pct`,
+    /// which remain separate numeric columns.
     Arrow,
     /// Aggregated value cell (show only).
     Value,
@@ -121,8 +121,8 @@ pub enum Column {
     Tags,
     /// Relative uptime: group age as a percentage of the oldest
     /// thread in the snapshot. 100% = as old as the oldest
-    /// thread, 0% = just spawned. Color gradient: green ≥50%,
-    /// red <50% (>2x younger than the oldest).
+    /// thread, 0% = just spawned. Color gradient: green ≥75%,
+    /// yellow 50–75%, red <50% (>2x younger than the oldest).
     Uptime,
     /// Sort-by metric summary column. Shows the --sort-by metric's
     /// baseline→candidate (delta%) per group. Only present when
@@ -146,7 +146,7 @@ impl Column {
             Column::Value => "value",
             Column::Tags => "tags",
             Column::Uptime => "uptime",
-            Column::SortBy => "sort-by", // overridden dynamically in colored_header
+            Column::SortBy => "sort-by", // overridden dynamically in colored_header_with_sort
         }
     }
 
@@ -166,7 +166,7 @@ impl Column {
             Column::Value => "value",
             Column::Tags => "tags",
             Column::Uptime => "%uptime",
-            Column::SortBy => "sort-by", // overridden dynamically in colored_header
+            Column::SortBy => "sort-by", // overridden dynamically in colored_header_with_sort
         }
     }
 }
@@ -483,7 +483,7 @@ pub fn warn_cgroup_only_sections_under_non_cgroup(sections: &[Section], group_by
 /// The `--group-by` axis is rendered via [`group_by_cli_name`]
 /// so the operator-facing label matches the clap value-enum
 /// spelling they typed (`pcomm` / `cgroup` / `comm` /
-/// `comm-exact`).
+/// `comm-exact` / `all`).
 pub(crate) fn format_cgroup_only_section_warning(section: Section, group_by: GroupBy) -> String {
     format!(
         "section '{}' requires --group-by cgroup; omitted under --group-by {}",

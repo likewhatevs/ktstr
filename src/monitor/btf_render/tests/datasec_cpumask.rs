@@ -23,10 +23,11 @@ use super::*;
 // the test is designed to catch.
 
 /// Locate the `.bss` Datasec type id in the probe BTF.
-/// `resolve_types_by_name(".bss")` returns a list of types named
-/// `.bss`; libbpf normally emits exactly one `BTF_KIND_DATASEC`,
-/// but the resolver returns Vec<Type> so we scan for the
-/// Datasec variant. Returns `(btf, ds_id)` or panics if the
+/// `resolve_ids_by_name(".bss")` returns the list of type ids
+/// named `.bss`; libbpf normally emits exactly one
+/// `BTF_KIND_DATASEC`, but the resolver returns `Vec<u32>`, so we
+/// resolve each id via `resolve_type_by_id` and keep the Datasec
+/// variant. Returns `(btf, ds_id)` or panics if the
 /// build fixture is missing.
 fn load_probe_btf_and_bss_id() -> (Btf, u32) {
     let probe_obj = std::path::PathBuf::from(env!("OUT_DIR")).join("probe.o");
@@ -438,7 +439,7 @@ fn try_render_cpumask_bits_partial_trailing_bytes_ignored() {
     // because n_words = 12/8 = 1.
     let mut bytes = [0u8; 12];
     bytes[0..8].copy_from_slice(&1u64.to_le_bytes());
-    // Trailing 4 bytes hold bit 0 (cpu 32 if read as a word)
+    // Trailing 4 bytes hold bit 0 (cpu 64 if read as a word)
     // but should NOT be parsed.
     bytes[8] = 0xff;
     let v = try_render_cpumask_bits(&bytes, u32::MAX);
@@ -525,9 +526,10 @@ fn try_render_cpumask_bits_max_cpus_zero_yields_empty_list() {
 
 /// Cap matches the actual mask width (max_cpus=64, all 64 bits
 /// set in word 0): every bit must surface. A regression that
-/// used `>=` for the per-bit cap (clipping the last bit) would
-/// produce "0-62" instead of "0-63". Pins the upper-edge
-/// off-by-one.
+/// clipped one bit early (an off-by-one such as `cpu + 1 >=
+/// max_cpus`, or using `max_cpus - 1`) would produce "0-62"
+/// instead of "0-63". Pins the upper-edge off-by-one on the
+/// correct `cpu >= max_cpus` cap.
 #[test]
 fn try_render_cpumask_bits_max_cpus_matches_word_width_keeps_all_bits() {
     let bits: u64 = u64::MAX;
@@ -589,8 +591,8 @@ fn mem_reader_custom_nr_cpu_ids_returns_overridden_value() {
 /// rendering a cpumask-family struct. With max_cpus=8 supplied
 /// by the reader, garbage bits beyond cpu 7 are dropped —
 /// the `let max_cpus = mem.map(|m| m.nr_cpu_ids())`
-/// in `render_struct` (btf_render.rs) wires the reader value
-/// through to `try_render_cpumask_bits`. A regression that
+/// in `render_struct` (btf_render/mod.rs) wires the reader
+/// value through to `try_render_cpumask_bits`. A regression that
 /// passed `u32::MAX` instead would surface phantom cpus 8..63.
 #[test]
 fn render_value_with_mem_caps_cpumask_at_reader_nr_cpu_ids() {

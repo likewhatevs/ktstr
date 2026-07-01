@@ -14,7 +14,7 @@
 //!   never reaches `post_vm` in that case. Reaching `post_vm` =
 //!   both pin Steps applied without bailing.
 //! - **Idempotent same-name re-pin.** The second pin Step's no-op
-//!   semantic at `src/scenario/ops/mod.rs`'s `Op::PinBpfMap` arm
+//!   semantic in `src/scenario/ops/dispatch.rs`'s `apply_pin_bpf_map`
 //!   (`Entry::Vacant` skip) is exercised: a literal second open
 //!   would still succeed against the live map but the no-op path
 //!   is what production callers hit and must work.

@@ -1879,7 +1879,7 @@ mod tests {
         assert_eq!(llc.num_cores(), 0);
     }
 
-    // -- TestTopology + LlcInfo PartialEq + Eq (B1) --
+    // -- TestTopology + LlcInfo PartialEq + Eq --
 
     #[test]
     fn test_topology_partial_eq_equal_for_same_spec() {

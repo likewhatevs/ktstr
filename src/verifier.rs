@@ -9,17 +9,20 @@
 //! - [`normalize_verifier_line`] — strip variable register state annotations
 //! - [`detect_cycle`] / [`collapse_cycles`] — loop iteration compression
 //! - [`build_b_map`] / [`build_diff_rows`] — A/B comparison helpers
-//! - `SCHED_OUTPUT_START` / `SCHED_OUTPUT_END` — COM2 delimiters
-//!   written by the guest's rust_init around the scheduler log region;
+//! - `SCHED_OUTPUT_START` / `SCHED_OUTPUT_END` — delimiters the
+//!   guest's rust_init emits over the bulk port (as `MSG_TYPE_SCHED_LOG`
+//!   frames) around the scheduler log region;
 //!   `parse_sched_output` extracts the enclosed block
 
 use std::collections::HashMap;
 
-/// Delimiter written to COM2 by the guest's rust_init immediately
-/// before the scheduler log block. Paired with [`SCHED_OUTPUT_END`].
+/// Delimiter the guest's rust_init emits over the bulk port (as a
+/// `MSG_TYPE_SCHED_LOG` frame) immediately before the scheduler log
+/// block. Paired with [`SCHED_OUTPUT_END`].
 pub(crate) const SCHED_OUTPUT_START: &str = "===SCHED_OUTPUT_START===";
-/// Delimiter written to COM2 by the guest's rust_init immediately
-/// after the scheduler log block. Paired with [`SCHED_OUTPUT_START`].
+/// Delimiter the guest's rust_init emits over the bulk port (as a
+/// `MSG_TYPE_SCHED_LOG` frame) immediately after the scheduler log
+/// block. Paired with [`SCHED_OUTPUT_START`].
 pub(crate) const SCHED_OUTPUT_END: &str = "===SCHED_OUTPUT_END===";
 
 /// Extract the scheduler log from guest output between
@@ -383,7 +386,7 @@ pub fn detect_cycle(lines: &[&str]) -> Option<(usize, usize, usize)> {
         .map(|(i, _)| i)
         .collect();
 
-    // Try strides 1..3 to handle anchors appearing K times per cycle.
+    // Try strides 1..=3 to handle anchors appearing K times per cycle.
     for stride in 1..=3usize {
         if positions.len() <= stride {
             continue;

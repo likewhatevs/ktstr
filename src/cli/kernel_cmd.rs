@@ -136,7 +136,7 @@ pub enum KernelCommand {
         /// # Critical-symbol protection
         ///
         /// After build, [`super::validate_kernel_config`] rejects entries
-        /// that disabled symbols required by ktstr (CONFIG_BPF,
+        /// that disabled symbols required by ktstr (CONFIG_BPF_SYSCALL,
         /// CONFIG_DEBUG_INFO_BTF, CONFIG_FTRACE,
         /// CONFIG_SCHED_CLASS_EXT, etc.). The error names
         /// `--extra-kconfig` as the likely cause when extras were
@@ -224,8 +224,8 @@ pub enum KernelCommand {
 /// image (test/coverage need BTF, `ktstr shell` reuses the cache
 /// entry for kconfig discovery). A bare `bzImage`/`Image` passed
 /// directly carries neither, so silently accepting it would produce
-/// hard-to-diagnose mid-run failures. The verifier and
-/// `cargo ktstr shell` accept raw images because their flows do not
+/// hard-to-diagnose mid-run failures.
+/// `cargo ktstr shell` accepts raw images because its flow does not
 /// need that companion metadata; see [`KERNEL_HELP_RAW_OK`].
 pub const KERNEL_HELP_NO_RAW: &str = "Kernel identifier: a source directory \
      path (e.g. `../linux`), a version (`6.14.2`, or major.minor prefix \
@@ -244,7 +244,7 @@ pub const KERNEL_HELP_NO_RAW: &str = "Kernel identifier: a source directory \
      kernel only — pass exactly one `--kernel`.";
 
 /// Help text for `--kernel` in contexts that accept raw image files:
-/// `cargo ktstr verifier` and `cargo ktstr shell`. Matches
+/// `cargo ktstr shell`. Matches
 /// `KernelResolvePolicy { accept_raw_image: true, .. }`. See
 /// [`KERNEL_HELP_NO_RAW`] for the converse and the rationale for
 /// the asymmetry.
@@ -375,8 +375,12 @@ pub const KERNEL_LIST_LONG_ABOUT: &str = concat!(
     "                               check this field before trusting `eol`.\n",
     "  entries                      array of per-entry objects. Each\n",
     "                               element is either a VALID entry (full\n",
-    "                               field set) or a CORRUPT entry (only\n",
-    "                               `key`, `path`, `error`). Detect\n",
+    "                               field set) or a CORRUPT entry\n",
+    "                               (`key`, `path`, `error`,\n",
+    "                               `error_kind`). `error` is the\n",
+    "                               human-readable reason; `error_kind`\n",
+    "                               the machine-readable classifier.\n",
+    "                               Detect\n",
     "                               corruption by the presence of `error`.\n",
     "\n",
     "Valid entry fields: key, path, version (nullable), source, arch,\n",

@@ -594,9 +594,12 @@ impl NumaMemoryLayout {
             //     access_ok failure on userspace_addr; bad slot ID;
             //     bad gpa_start (virt/kvm/kvm_main.c:2025-2038).
             //   - EEXIST: requested slot overlaps an existing one
-            //     (virt/kvm/kvm_main.c:2101).
+            //     (virt/kvm/kvm_main.c:2094, the -EEXIST return under
+            //     the kvm_check_memslot_overlap check).
             //   - EIO: kernel WARN-on-impossible-state path
-            //     (virt/kvm/kvm_main.c:2065, arch/x86 mmu.c).
+            //     (virt/kvm/kvm_main.c:2057-2058, the -EIO return under
+            //     WARN_ON_ONCE(kvm->nr_memslot_pages < old->npages);
+            //     arch/x86 mmu.c).
             //   - EFAULT: arm64/riscv guest-phys-bounds violation
             //     (arch/arm64/kvm/mmu.c, arch/riscv/kvm/mmu.c).
             let mem_region = kvm_bindings::kvm_userspace_memory_region {

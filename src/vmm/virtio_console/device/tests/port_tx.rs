@@ -4,11 +4,12 @@ use super::*;
 // ----------------------------------------------------------------
 // Chain-level MockSplitQueue tests for the port 1 TX path.
 //
-// These exercise `process_tx_into(PORT1_TXQ, ...)` end-to-end via
-// the real virtio-queue descriptor walker — MockSplitQueue plants
-// a chain in guest memory, MMIO QUEUE_NOTIFY fires, and the
-// device's process_port1_tx walks the chain, copies device-readable
-// descriptor data into `port1_tx_buf`, and add_useds the chain.
+// These exercise `process_tx(port_id)` for the port-1 TX path
+// end-to-end via the real virtio-queue descriptor walker —
+// MockSplitQueue plants a chain in guest memory, MMIO QUEUE_NOTIFY
+// fires, and the device's process_tx walks the chain, copies
+// device-readable descriptor data into `ports[1].tx_buf`, and
+// add_useds the chain.
 //
 // The handler-level tests above bypass the queue walker and only
 // pin MMIO/FSM/control surface; these tests pin the production
@@ -17,7 +18,7 @@ use super::*;
 // chain-parsing logic is the highest-risk code on the bulk path:
 // a hostile or malformed chain that handler-level tests can't
 // construct (multi-segment, mixed-direction, length-cap edges)
-// is exactly what the production `process_tx_into` walker has
+// is exactly what the production `process_tx` walker has
 // to reject without panicking. Without these chain tests every
 // chain-shape regression has to wait for an end-to-end VM run
 // to surface.
@@ -25,9 +26,9 @@ use super::*;
 
 /// Single-descriptor TX chain on port 1: one device-readable
 /// segment with a known byte pattern lands verbatim in
-/// `port1_tx_buf`. Pins the simplest happy-path: chain pop →
+/// `ports[1].tx_buf`. Pins the simplest happy-path: chain pop →
 /// non-write_only branch → `mem.read_slice` → append to
-/// `port1_tx_buf` → add_used → `signal_used`. `drain_bulk()`
+/// `ports[1].tx_buf` → add_used → `signal_used`. `drain_bulk()`
 /// returns the bytes to confirm the routing accumulator was the
 /// port-1 buffer (not port 0).
 #[test]
@@ -52,7 +53,7 @@ fn port1_tx_single_descriptor_lands_in_port1_buf() {
 
     write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, PORT1_TXQ as u32);
 
-    // Bytes must have landed in port1_tx_buf, observable via
+    // Bytes must have landed in ports[1].tx_buf, observable via
     // drain_bulk.
     let drained = dev.drain_bulk();
     assert_eq!(
@@ -60,9 +61,9 @@ fn port1_tx_single_descriptor_lands_in_port1_buf() {
         payload.to_vec(),
         "port 1 TX must deliver the descriptor's bytes to drain_bulk verbatim",
     );
-    // Port 0 buffer must be untouched — the routing match on
-    // queue_idx (PORT0_TXQ vs PORT1_TXQ in process_tx_into)
-    // must have steered to port1_tx_buf.
+    // Port 0 buffer must be untouched — process_tx was called
+    // with port_id=1 (resolved from PORT1_TXQ by queue_to_port in
+    // mmio_write), steering the bytes to ports[1].tx_buf.
     assert!(
         dev.drain_output().is_empty(),
         "port 0 TX buffer must remain empty when only port 1 was notified",
@@ -215,9 +216,9 @@ fn port1_tx_multi_descriptor_chain_concatenates() {
 /// publishes `len > 32 KiB` (max u32 = 4 GiB worst case) is
 /// hostile or buggy; the device caps each descriptor at 32 KiB
 /// to bound the per-chain heap allocation. Pins the
-/// `(desc.len() as usize).min(TX_DESC_MAX)` clamp at
-/// `process_tx_into` line ~379 and the `dst.resize(start +
-/// dlen, 0)` allocation. Without the cap, a single bogus
+/// `(desc.len() as usize).min(TX_DESC_MAX)` clamp in `process_tx`
+/// (src/vmm/virtio_console/device/mod.rs:205) and the
+/// `tx_scratch.resize(dlen, 0)` staging buffer. Without the cap, a single bogus
 /// descriptor could trigger a multi-GiB Vec allocation.
 #[test]
 fn port1_tx_oversize_descriptor_truncates_to_tx_desc_max() {
@@ -267,7 +268,7 @@ fn port1_tx_oversize_descriptor_truncates_to_tx_desc_max() {
 
 /// Port 1 TX with DRIVER_OK NOT set: the device must drop the
 /// notify silently. Pins the spec gate at the head of
-/// `process_tx_into`: virtio-v1.2 §3.1.1 forbids the device
+/// `process_tx`: virtio-v1.2 §3.1.1 forbids the device
 /// from accessing virtqueue memory before DRIVER_OK because
 /// queue addresses written during FEATURES_OK are not yet
 /// committed by the driver. A regression that lifted the gate
@@ -299,7 +300,7 @@ fn port1_tx_rejected_without_driver_ok() {
     // Walk FSM only up to S_FEAT — STOP before S_OK. Configure
     // the queue and mark it ready (which is allowed in the
     // S_FEAT..S_OK window per `queue_config_allowed`). The
-    // process_tx_into gate should still drop the notify because
+    // process_tx gate should still drop the notify because
     // VIRTIO_CONFIG_S_DRIVER_OK is not in device_status.
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
@@ -343,7 +344,7 @@ fn port1_tx_rejected_without_driver_ok() {
     );
 
     // Fire the notify. The DRIVER_OK gate at the top of
-    // process_tx_into must early-return with no observable side
+    // process_tx must early-return with no observable side
     // effects.
     write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, PORT1_TXQ as u32);
 
@@ -378,9 +379,9 @@ fn port1_tx_rejected_without_driver_ok() {
 
 /// Port 0 vs port 1 TX routing: bytes from port 0 land in
 /// port0_tx_buf and bytes from port 1 land in port1_tx_buf.
-/// Pins the queue_idx → buffer dispatch in process_tx_into:
-/// `match queue_idx { PORT0_TXQ => &mut self.port0_tx_buf,
-/// PORT1_TXQ => &mut self.port1_tx_buf, ... }`. A regression
+/// Pins the queue_idx→port_id map (`queue_to_port`) that routes
+/// QUEUE_NOTIFY to `process_tx(port_id)`, which appends to
+/// `self.ports[port_id].tx_buf`. A regression
 /// that swapped the buffers would corrupt the host-side
 /// stdout stream with TLV bytes (or vice versa) — neither
 /// surface would parse correctly.
@@ -516,7 +517,7 @@ fn port0_tx_vs_port1_tx_routes_to_correct_buffer() {
     );
 }
 
-/// Port 1 TX `process_tx_into` honours the per-call cumulative
+/// Port 1 TX `process_tx` honours the per-call cumulative
 /// byte cap (`TX_PER_CALL_MAX`). With 9 chains of `TX_DESC_MAX`
 /// bytes each (= 9 × 32 KiB = 288 KiB), the first 8 chains
 /// drain to `port1_tx_buf` (cumulative 256 KiB hits the cap)

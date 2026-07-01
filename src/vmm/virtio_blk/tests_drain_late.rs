@@ -517,7 +517,7 @@ fn serial_constant_is_id_bytes_long() {
 /// - On drain 1, `num_added=1` after the chain publishes;
 ///   `needs_notification` sees `next_used=1`, `old=0`,
 ///   `used_event=2`, formula: `(1 - 2 - 1) < (1 - 0)` →
-///   `u16::MAX - 2 < 1` → false (wrapping arithmetic). So
+///   `u16::MAX - 1 < 1` → false (wrapping arithmetic). So
 ///   drain 1 is suppressed.
 ///
 /// A regression that didn't reset `num_added` (or that

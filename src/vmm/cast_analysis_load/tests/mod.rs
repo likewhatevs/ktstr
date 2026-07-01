@@ -1,11 +1,15 @@
-//! Error-path coverage for the host-side BPF cast-analysis driver.
+//! Test coverage for the host-side BPF cast-analysis loader.
 //!
-//! Every public function in this module returns an empty
-//! [`CastMap`] (or an empty `Vec<FuncEntry>`) on malformed input;
-//! tests below exercise each early-return so an unintentionally
-//! tightened gate (one that panics or aborts) shows up as a test
-//! failure rather than a runtime crash on a stripped scheduler
-//! binary.
+//! The child modules `index`, `parse`, and `patch` (declared at the
+//! bottom of this file) exercise the loader's reloc/patch/builder
+//! functions on both malformed and well-formed input. Return types
+//! under test include [`CastMap`], `Vec<FuncEntry>`,
+//! `Vec<SubprogReturn>`, `Vec<DatasecPointer>`, `Option<u64>`, and
+//! unit. Error-path tests exercise each early-return so an
+//! unintentionally tightened gate (one that panics or aborts) shows
+//! up as a test failure rather than a runtime crash on a stripped
+//! scheduler binary; happy-path and end-to-end tests confirm the
+//! functions produce the expected output on valid fixtures.
 //!
 //! Fixtures are byte arrays built in-test with the
 //! `build_elf64` helper — minimal ELF64 little-endian, only

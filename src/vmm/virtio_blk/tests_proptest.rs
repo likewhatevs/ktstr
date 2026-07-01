@@ -67,7 +67,7 @@ struct FuzzDesc {
 /// well-exercised.
 ///
 /// `len` ranges past `VIRTIO_BLK_SIZE_MAX = 1 MiB` so the SIZE_MAX
-/// gate is exercised. The `0..=8 MiB` range generates enough
+/// gate is exercised. The `0..8 MiB` range generates enough
 /// over-cap descriptors to randomly trip the gate without making
 /// every chain trivially over-cap.
 ///
@@ -203,8 +203,8 @@ fn snapshot_counters(dev: &VirtioBlk) -> CounterSnapshot {
 /// AND drained-at-construction so any chain reaching the
 /// per-request throttle gate stalls. Used by the throttle-stall
 /// proptest below to exercise the rollback path
-/// (`set_next_avail` rewind, `currently_stalled` true→true /
-/// false→true transitions, `throttled_count` event recording)
+/// (`set_next_avail` rewind, `currently_stalled` false→true
+/// transition, `throttled_count` event recording)
 /// against random well-formed chains.
 ///
 /// Mirrors `build_fuzz_fixture` but swaps the throttle and
@@ -272,7 +272,8 @@ struct WellFormedChain {
     /// signal focused.
     sector: u64,
     /// Data-segment count. 1..=8 is the practical range that
-    /// stresses the data-length aggregation (`data_len.iter().sum()`)
+    /// stresses the data-length aggregation
+    /// (`data_segments.iter().map(|d| d.len).sum()`)
     /// and the throttle's bytes-bucket path. T_FLUSH ignores
     /// this — it gets header + status only.
     ///
@@ -285,8 +286,8 @@ struct WellFormedChain {
     /// Per-segment length in 512-byte sectors (1..=4). The
     /// total payload is bounded above by 8 sectors via the
     /// strategy's interaction (n_data_segments × seg_sectors
-    /// ≤ 8 enforced at materialisation time by clamping the
-    /// final segment).
+    /// ≤ 8 enforced at materialisation time by capping the
+    /// segment count to floor(8 / seg_sectors)).
     seg_sectors: u32,
 }
 
@@ -318,7 +319,8 @@ fn well_formed_chain_strategy() -> impl Strategy<Value = WellFormedChain> {
 /// Memory layout (deterministic so failure shrinking is
 /// reproducible):
 ///   - 0x4000: header (16 bytes)
-///   - 0x5000: data segments (back-to-back, 0x200-aligned)
+///   - 0x5000: data segments (0x800-strided, 0x200-aligned;
+///     contiguous only when seg_sectors == 4)
 ///   - 0xC000: status byte (sentinel-pre-fill 0xEE)
 ///
 /// All within the 1 MiB guest memory region so the device
@@ -717,10 +719,14 @@ proptest! {
     /// direction-violation gate and the INDIRECT path. The
     /// device must reject INDIRECT chains gracefully (the
     /// `virtio-queue` parser switches to indirect-table mode
-    /// pointed at `addr`, which for this test is unmapped, so
-    /// `read_obj` fails and the iterator yields no descs →
-    /// chain dropped with io_errors). Direction-mismatch
-    /// flags are caught by the production direction gate.
+    /// pointed at `addr` = 0x5000, which is MAPPED, so the
+    /// `read_obj` of the indirect table succeeds and reads back
+    /// zeroed guest memory — a single zero-length, read-only
+    /// descriptor. The resulting chain has no write-only status
+    /// descriptor, so the device drops it via the
+    /// no-status-descriptor branch and bumps io_errors).
+    /// Direction-mismatch flags are caught by the production
+    /// direction gate.
     ///
     /// All paths must produce a defined status byte (S_OK,
     /// S_IOERR, or S_UNSUPP) OR a chain drop (used.idx
@@ -850,13 +856,11 @@ proptest! {
     ///    so no chain successfully consumed tokens).
     /// 4. If throttled_count fired: status sentinel (0xEE)
     ///    UNCHANGED at status_addr (no publish_completion
-    ///    ran); used.idx UNCHANGED (no add_used); next_avail
-    ///    rewound to the pre-notify cursor value (the
-    ///    wrap-aware rollback).
+    ///    ran); next_avail rewound to the pre-notify cursor
+    ///    value (the wrap-aware rollback).
     /// 5. If io_errors fired (pre-throttle gate): status byte
     ///    is one of {0xEE sentinel if status_addr drop path,
-    ///    S_IOERR otherwise}, and used.idx advanced by AT MOST
-    ///    1.
+    ///    S_IOERR otherwise}.
     #[test]
     fn throttle_stall_under_random_chain_shapes_holds_invariants(
         chain in well_formed_chain_strategy(),

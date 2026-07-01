@@ -11,11 +11,11 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 // scx tag whose `lib/` API matches the `scx_*` symbols declared by
-// the bundled `scx_utils-bpf_h/lib/sdt_task.h` that scx_cargo 1.1.0
+// the bundled `scx_utils-bpf_h/lib/sdt_task.h` that scx_cargo 1.1.1
 // installs into OUT_DIR. Tags ≤ v1.0.11 ship the older `sdt_*` API
 // (the rename to `scx_*` first appeared at v1.0.12, verified by
 // reading `lib/sdt_task.bpf.c` at both tags); pinning to a pre-rename
-// tag would link-fail against scx_cargo 1.1.0 headers. This constant
+// tag would link-fail against scx_cargo 1.1.1 headers. This constant
 // is the single source of truth; bumping it triggers a re-fetch via
 // the `.scx-tag` sentinel comparison in `scx_lib_complete`.
 const SCX_TAG: &str = "v1.1.0";

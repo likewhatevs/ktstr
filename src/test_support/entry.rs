@@ -3185,7 +3185,8 @@ mod tests {
 
     // -- staged_schedulers validation tests --
     //
-    // KtstrTestEntry::validate at L1556 walks staged_schedulers and
+    // KtstrTestEntry::validate (in entry_validate.rs, via
+    // validate_basics_and_staging) walks staged_schedulers and
     // enforces (a) per-name shape rules via the delegated
     // validate_staged_scheduler_name + (b) within-set uniqueness
     // via the BTreeSet insert. Both are silent-data-loss classes

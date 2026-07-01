@@ -29,6 +29,9 @@
 //!   set of [`MetricHint`](ktstr::test_support::MetricHint)s
 //!   describing the canonical read/write throughput + latency paths.
 //!   Extracted metrics land with correct polarity/unit automatically.
+//! - [`SCHBENCH_JSON`] is a second `OutputFormat::Json` fixture —
+//!   schbench via `--json -`, so extraction goes through the JSON
+//!   walker rather than the LLM pipeline.
 //! - [`STRESS_NG`] uses `OutputFormat::ExitCode` with a single
 //!   `exit_code_eq(0)` default — stress-ng reports via exit code
 //!   (bogo_ops land in stderr and are not machine-extractable
@@ -42,11 +45,12 @@
 //!   — identical to [`SCHBENCH`] in every other field, exercising
 //!   the derive's `LlmExtract("hint")` call form and the
 //!   hint-threading path through
-//!   [`extract_via_llm`](ktstr::test_support::model::extract_via_llm).
+//!   `extract_via_llm`.
 //!
 //! All fixtures use short, stable `name` fields matching their
-//! binary names — except FIO_JSON (`"fio_json"`) and
-//! SCHBENCH_HINTED (`"schbench_hinted"`), which use distinct
+//! binary names — except FIO_JSON (`"fio_json"`), SCHBENCH_JSON
+//! (`"schbench_json"`), and SCHBENCH_HINTED (`"schbench_hinted"`),
+//! which use distinct
 //! names so they can coexist with FIO and SCHBENCH respectively
 //! under the pairwise-dedup rule on `#[ktstr_test(workloads =
 //! [...])]`. The binary names themselves (`"fio"`, `"stress-ng"`,
@@ -71,16 +75,20 @@
 //!   cgroups contribute the same ext_metric, the merge consults the
 //!   crate-internal `MetricDef` from the `METRICS` registry. Names
 //!   absent from the registry (the case for any Unknown metric not
-//!   also registered at crate scope) default to `higher_is_worse=true`
-//!   and merge by taking the max — conservative for regressions, but
-//!   NOT a declared polarity for the metric.
-//! - **`cargo ktstr test-stats` cross-run comparison** — the
-//!   crate-internal `compare_runs` iterates the `METRICS` registry
+//!   also registered at crate scope) fall through to
+//!   `crate::stats::infer_higher_is_worse`, which infers polarity from
+//!   name substrings: throughput/iops-style names fold with `min`
+//!   (higher-is-better), latency/error/`_us`-style names fold with
+//!   `max` (higher-is-worse), and only names matching no token default
+//!   to `higher_is_worse=true` (max) — NOT a declared polarity for the
+//!   metric.
+//! - **`cargo ktstr stats compare` cross-run comparison** — the
+//!   crate-internal `compare_rows_by` iterates the `METRICS` registry
 //!   only, so Unknown metrics extracted purely via `MetricHint`
 //!   absence are NOT classified as regression or improvement. They
 //!   are recorded to the sidecar for later manual inspection; to
 //!   surface them in a comparison verdict, register a `MetricDef` in
-//!   `src/stats.rs` or add a `MetricHint` on the payload with an
+//!   `src/stats/metric.rs` or add a `MetricHint` on the payload with an
 //!   explicit polarity.
 
 use ktstr::Payload;
@@ -256,7 +264,7 @@ pub struct StressNgPayload;
 /// contract on
 /// [`OutputFormat`](ktstr::test_support::OutputFormat) (documented
 /// on [`PayloadRun::run`](ktstr::scenario::payload_run::PayloadRun::run)),
-/// [`extract_via_llm`](ktstr::test_support::model::extract_via_llm)
+/// `extract_via_llm`
 /// is invoked against stdout first — for this fixture that yields
 /// zero metrics because stdout is empty — and then re-invoked
 /// against stderr since the stdout pass produced nothing and
@@ -299,7 +307,7 @@ pub struct SchbenchPayload;
 /// [`OutputFormat::LlmExtract(Some(...))`](ktstr::test_support::OutputFormat::LlmExtract),
 /// and the stored `&'static str` is inserted between the template
 /// and the stdout block as a `Focus:` directive by
-/// [`extract_via_llm`](ktstr::test_support::model::extract_via_llm)
+/// `extract_via_llm`
 /// when the fixture runs — steering the model toward the stat the
 /// scheduler regression cares about instead of whatever numeric
 /// leaf the model picks first.
@@ -353,7 +361,7 @@ pub struct SchbenchHintedPayload;
 ///    `"schbench"` in all three.
 /// 2. **`output`** — `OutputFormat::Json` rather than `LlmExtract`,
 ///    so extraction goes through `find_and_parse_json` +
-///    `walk_json_leaves` and bypasses the 2.44 GiB model load
+///    `walk_json_leaves` and bypasses the ~2.55 GiB model load
 ///    altogether. Tests that only want schbench metrics (no
 ///    scheduler-regression narrative) save minutes of CPU time by
 ///    picking this over [`SCHBENCH`].

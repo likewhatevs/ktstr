@@ -491,13 +491,12 @@ fn sidecar_payload_and_metrics_roundtrip_populated() {
     );
 }
 
-/// `write_sidecar` must populate `payload` from `entry.payload`
-/// so a test declaring a binary payload writes the payload name
-/// into the sidecar even when no payload-metrics have been
-/// threaded in yet. This pins the half-wired state the
-/// follow-up WOs will extend: stats tooling that already groups
-/// by payload name sees the grouping key on the sidecar
-/// immediately.
+/// `write_sidecar` records `entry.payload`'s name into
+/// `SidecarResult.payload` regardless of whether payload-metrics
+/// were captured, so a test declaring a binary payload writes the
+/// payload name into the sidecar even when no payload-metrics are
+/// passed. Stats tooling that groups by payload name sees the
+/// grouping key on the sidecar immediately.
 #[test]
 fn write_sidecar_records_entry_payload_name() {
     use crate::test_support::{OutputFormat, Payload, PayloadKind};
@@ -551,14 +550,14 @@ fn write_sidecar_records_entry_payload_name() {
     assert_eq!(loaded.payload.as_deref(), Some("fio"));
     assert!(
         loaded.metrics.is_empty(),
-        "metrics stay empty until a Ctx-level accumulator lands",
+        "payload set, no payload-metrics passed -> metrics serialize as empty",
     );
 }
 
-/// `write_sidecar` must forward the `payload_metrics` slice
-/// into `SidecarResult.metrics` unmodified — once the
-/// follow-up Ctx-accumulator WO lands, stats tooling will see
-/// every `ctx.payload(X).run()` invocation's output in order.
+/// `write_sidecar` forwards the `payload_metrics` slice into
+/// `SidecarResult.metrics` unmodified, preserving per-invocation
+/// order, so stats tooling reads every `ctx.payload(X).run()`
+/// invocation's output in order.
 #[test]
 fn write_sidecar_forwards_payload_metrics_slice() {
     use crate::test_support::{Metric, MetricSource, MetricStream, PayloadMetrics, Polarity};
@@ -1029,7 +1028,7 @@ fn sidecar_variant_hash_excludes_cpu_budget() {
          of the same variant must bucket together (separated by the \
          CpuBudget Dimension, not the identity hash)",
     );
-    // vcpus exclusion (the field docs name this test as the pin for BOTH):
+    // vcpus exclusion (the sidecar_variant_hash fn doc names this test as
     // vary ONLY the numeric vcpus field, holding the hashed `topology`
     // STRING and cpu_budget equal, and assert the hash is unchanged. The
     // topology string is deliberately identical to `overcommit` so only

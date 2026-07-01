@@ -98,9 +98,10 @@ pub enum KernelId {
     /// Git source: clone `url`, check out `git_ref` (a branch or tag),
     /// stored verbatim by `KernelId::parse` with no remote contact. At
     /// cache-resolution time `resolve_git_kernel` ls-remote-resolves
-    /// `git_ref` to its tip's short hash and probes the cache before
-    /// cloning, so a re-run against an unchanged tip skips the clone. The
-    /// cache key embeds `git_ref` verbatim alongside that short hash;
+    /// `git_ref` to its tip's full commit hash and probes the cache
+    /// before cloning, so a re-run against an unchanged tip skips the
+    /// clone. The cache key embeds `git_ref` verbatim alongside that full
+    /// commit hash;
     /// collapsing identical-sha-different-spelling refs to one
     /// content-addressed `(URL, resolved_sha)` entry remains future work.
     ///
@@ -112,9 +113,9 @@ pub enum KernelId {
         /// Remote URL (https or git@).
         url: String,
         /// Branch or tag name. Stored verbatim by `parse`;
-        /// ls-remote-resolved to its tip short hash at cache-resolution
-        /// time (see `resolve_git_kernel`) so a cached build is reused
-        /// without re-cloning. A raw 40-hex commit SHA is rejected at
+        /// ls-remote-resolved to its tip's full commit hash at
+        /// cache-resolution time (see `resolve_git_kernel`) so a cached
+        /// build is reused without re-cloning. A raw 40-hex commit SHA is rejected at
         /// clone time (not supported — see the variant doc).
         git_ref: String,
     },
@@ -371,7 +372,8 @@ pub(crate) fn decompose_version_for_compare(s: &str) -> Option<(u64, u64, u64, u
 ///
 /// Cases handled:
 /// - `"~"` → `$HOME`
-/// - `"~/"` → `$HOME/`
+/// - `"~/"` → `$HOME` (same as bare `"~"`; the empty suffix
+///   after `~/` yields no trailing separator)
 /// - `"~/linux"` → `$HOME/linux`
 /// - `"~user/..."` → unchanged (std has no `getpwnam`; a
 ///   different-user expansion would require shelling out, which
@@ -437,9 +439,11 @@ fn expand_tilde(s: &str) -> std::path::PathBuf {
 /// Returns `None` if the procfs entry is unreadable, empty, or missing.
 /// Callers that need the release string for `/lib/modules/{release}/…`
 /// fallbacks use this rather than shelling out to `uname -r`: the
-/// procfs entry exposes the same value the kernel returns from the
-/// uname(2) syscall (see linux/kernel/sys.c: `override_release`) and
-/// only costs a small read.
+/// procfs entry exposes the raw utsname release (served by
+/// `proc_do_uts_string` in linux/kernel/utsname_sysctl.c), the same
+/// field uname(2) reads — modulo the UNAME26 personality shim
+/// `override_release` applies on the uname(2) path only — and only
+/// costs a small read.
 fn kernel_release_from_procfs() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .ok()

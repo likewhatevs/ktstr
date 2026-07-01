@@ -1791,7 +1791,7 @@ fn memoized_inference_concurrent_first_call_loads_exactly_once() {
 // output.
 //
 // These tests drive `encoding_rs::UTF_8.new_decoder()` directly
-// (the same API as `extract_via_llm`'s `encoding_rs::UTF_8.new_decoder()`
+// (the same API as `invoke_with_model`'s `encoding_rs::UTF_8.new_decoder()`
 // stream-decode call) without loading
 // the model, pinning the decoder's contract independent of any
 // upstream llama-cpp-2 changes. A regression that swapped the

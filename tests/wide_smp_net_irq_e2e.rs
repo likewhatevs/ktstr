@@ -3,14 +3,16 @@
 //!
 //! Companion to `wide_smp_device_irq_e2e.rs` (virtio-blk). The >255
 //! ext-dest routing is device-agnostic (the same userspace-IOAPIC +
-//! `KVM_SET_GSI_ROUTING` path for every virtio device), so virtio-blk
-//! already proves the route resolves a >255 destination. This adds the
-//! virtio-net device-type leg: it boots a sparse topology whose APIC IDs
-//! reach 433, attaches a NIC via the `networks = [...]` test attribute, pins the
-//! virtio-net IRQ to a vCPU with APIC ID >= 256, drives the in-VMM
-//! TX-loopback over an AF_PACKET raw socket, and asserts that vCPU's
-//! interrupt count rose — proving virtio-net's own RX-completion IRQ
-//! routes through the >255 destination encoding too.
+//! `KVM_SET_GSI_ROUTING` path for every virtio device), but virtio-blk
+//! cannot prove it: its request-queue IRQ is a blk-mq MANAGED MSI-X
+//! interrupt whose delivery CPU is kernel-chosen and not userspace-pinnable.
+//! virtio-net's MSI-X vectors are REGULAR (non-managed, userspace-pinnable),
+//! so this test is the DETERMINISTIC >255 proof: it boots a sparse topology
+//! whose APIC IDs reach 433, attaches a NIC via the `networks = [...]` test
+//! attribute, pins the virtio-net IRQ to a vCPU with APIC ID >= 256, drives
+//! the in-VMM TX-loopback over an AF_PACKET raw socket, and asserts that
+//! vCPU's interrupt count rose — proving virtio-net's own RX-completion IRQ
+//! routes through the >255 destination encoding.
 //!
 //! Why AF_PACKET: the v0 virtio-net backend is in-VMM loopback (TX bytes
 //! echoed straight into RX). IP-layer self-traffic never reaches the NIC
@@ -75,8 +77,10 @@ fn net_irq_delivers_to_apic_id_above_255(_ctx: &Ctx) -> Result<AssertResult> {
     let (irq, dev_name) = virtio_net_irq(&iface)?;
 
     // Pick a vCPU with APIC ID >= 256 and pin the NIC IRQ to it (x2APIC
-    // physical mode → the RTE carries that exact APIC ID, exercising the
-    // >255 ext-dest encoding for virtio-net specifically).
+    // physical mode → the guest programs that exact APIC ID into the MSI-X
+    // table entry's address fields (`address_hi.destid_8_31`), installed as a
+    // KVM MSI route, exercising the >255 ext-dest encoding for virtio-net
+    // specifically).
     let (target_cpu, target_apic) = find_apic_above_255()?;
     pin_irq_to_cpu(irq, target_cpu)?;
 

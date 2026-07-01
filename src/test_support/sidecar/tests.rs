@@ -351,9 +351,9 @@ fn sidecar_result_roundtrip() {
     };
     let json = serde_json::to_string_pretty(&sc).unwrap();
     let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
-    // Exhaustive destructure — `SidecarResult` is `non_exhaustive`
-    // only across crates, but in-crate destructure still requires
-    // every field to appear by name. Adding a field to
+    // Exhaustive destructure — an in-crate struct-literal
+    // destructure without `..` requires every field to appear by
+    // name. Adding a field to
     // `SidecarResult` without extending this pattern fails to
     // compile here, forcing the author to make an explicit
     // roundtrip-coverage decision at the same time they introduce
@@ -768,9 +768,9 @@ fn sidecar_result_roundtrip_no_monitor() {
 /// that tolerance is part of the asymmetric contract documented
 /// at the module level — writer always emits, reader tolerates
 /// absence on `Option`s. The sibling
-/// `serialize_always_emits_option_keys` tests pin the writer
-/// side; this loop pins the reader side for non-`Option` fields
-/// only.
+/// `sidecar_payload_and_metrics_always_emit_when_empty` test pins
+/// the writer side; this loop pins the reader side for
+/// non-`Option` fields only.
 #[test]
 fn sidecar_result_missing_required_field_rejected_by_deserialize() {
     // Table-driven expansion covering every non-`Option` field of
@@ -782,11 +782,11 @@ fn sidecar_result_missing_required_field_rejected_by_deserialize() {
     // `#[serde(default)]` needed — it's a builtin rule), so
     // removing e.g. `payload: Option<String>` from the JSON
     // yields `None` on the parsed struct rather than a rejection.
-    // The module doc at src/test_support/sidecar.rs promises
+    // The module doc at src/test_support/sidecar/mod.rs promises
     // "required on deserialize" for Option fields, but that's
     // enforced at the writer (always-emitted) side, not the
-    // parser side. The `serialize_always_emits_option_keys`
-    // sibling tests pin the writer half; this test pins the
+    // parser side. The `sidecar_payload_and_metrics_always_emit_when_empty`
+    // sibling test pins the writer half; this test pins the
     // parser-side strictness for every non-Option field.
     //
     // Old single-field-sentinel form (checking only `test_name`)
@@ -1448,7 +1448,8 @@ fn pre_clear_run_dir_once_silent_on_missing_dir() {
 /// `pre_clear_run_dir_once` reaps orphaned atomic-write staging
 /// files in the same shallow sweep as live sidecars. Pins the
 /// staging-cleanup invariant documented at
-/// `pre_clear_run_dir_once`'s in-line comment block (line ~2317):
+/// `pre_clear_run_dir_once`'s in-line comment block (mod.rs,
+/// wipe loop, ~line 3261):
 /// a writer that died between `write` and `rename` in
 /// `serialize_and_write_sidecar` leaves a
 /// `<test>-<hash>.ktstr.json.tmp.<pid>.<run_id>` artifact;

@@ -42,8 +42,8 @@ fn display_format_default_is_full() {
 /// exclusive with `baseline` / `candidate` only (the arrow
 /// cell visually replaces those columns; pairing them
 /// would render the same data twice). `arrow + delta + %`
-/// is allowed and mirrors the format-default for
-/// `DisplayFormat::Arrow`.
+/// is allowed; the `DisplayFormat::Arrow` format-default
+/// additionally carries an Uptime column.
 #[test]
 fn parse_columns_round_trips_arrow_form() {
     let spec = "group,threads,metric,arrow";
@@ -101,8 +101,9 @@ fn parse_columns_empty_returns_empty_vec() {
 /// `baseline` or `candidate` — the arrow cell visually
 /// replaces those two columns, so pairing them would render
 /// the same data twice. Pairing `arrow` with `delta` or `%`
-/// is allowed and mirrors the format-default column set for
-/// `DisplayFormat::Arrow`. The error message names the
+/// is allowed; those columns are the numeric subset of the
+/// `DisplayFormat::Arrow` format-default (which also carries
+/// an Uptime column). The error message names the
 /// constraint so the operator can recover.
 #[test]
 fn parse_columns_rejects_arrow_with_redundant_columns() {
@@ -121,9 +122,10 @@ fn parse_columns_rejects_arrow_with_redundant_columns() {
 }
 
 /// `arrow + delta + %` round-trips cleanly through
-/// [`parse_columns`] — it matches the default column set
-/// for `DisplayFormat::Arrow` and must be expressible from a
-/// user-supplied `--columns` spec.
+/// [`parse_columns`] — it is the numeric subset of the
+/// `DisplayFormat::Arrow` default column set (which also
+/// carries a trailing Uptime column) and must be expressible
+/// from a user-supplied `--columns` spec.
 #[test]
 fn parse_columns_accepts_arrow_with_delta_and_pct() {
     let spec = "group,threads,metric,arrow,delta,%";

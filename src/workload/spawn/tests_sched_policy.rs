@@ -1,4 +1,4 @@
-//! Spawn-pipeline tests — sched_policy group.
+//! Spawn-pipeline tests — deadline / wait-for-file helpers.
 
 #![cfg(test)]
 #![allow(unused_imports)]

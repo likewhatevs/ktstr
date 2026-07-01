@@ -629,7 +629,7 @@ fn drop_to_unit<T>(_: T) {}
 
 /// Exhaustive destructure of an owned [`HostContext`] into a
 /// fixed-size array whose length is statically typed as
-/// [`HOST_CONTEXT_FIELDS.len()`]. Never called at runtime
+/// [`HOST_CONTEXT_FIELDS`]`.len()`. Never called at runtime
 /// (marked dead_code) — exists purely to cross-enforce the
 /// three cardinalities that must agree whenever
 /// [`HostContext`] grows a field.

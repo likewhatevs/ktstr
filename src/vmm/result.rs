@@ -184,8 +184,9 @@ pub struct VmResult {
     /// side.
     ///
     /// The counter struct exposes nine `AtomicU64` fields, each
-    /// bumped from `drain_bracket_impl` (in `src/vmm/virtio_blk/device.rs`)
-    /// via the `VirtioBlkCounters::record_*` helpers. Per-request
+    /// bumped from `drain_bracket_impl` (in `src/vmm/virtio_blk/drain.rs`)
+    /// via the `VirtioBlkCounters::record_*` helpers (defined in
+    /// `src/vmm/virtio_blk/counters.rs`). Per-request
     /// cumulative counters, per-event cumulative counters, and
     /// per-request live gauges are kept distinct per the
     /// counter-taxonomy doc on `VirtioBlkCounters`:
@@ -272,10 +273,12 @@ pub struct VmResult {
     /// comes from the per-CPU / per-IRQ metrics axis, not these
     /// device-internal loopback counters.
     ///
-    /// The counter struct exposes thirteen `AtomicU64` fields, each
+    /// The counter struct exposes sixteen `AtomicU64` fields, each
     /// bumped across the TX-drain path rooted at `process_tx_loopback`
     /// (several are bumped inside the `pop_and_capture_tx` /
-    /// `try_loopback_to_rx` helpers it calls):
+    /// `try_loopback_to_rx` helpers it calls; the three `ctrl_*`
+    /// counters are bumped on the control-vq path, not the TX-drain
+    /// path):
     ///
     ///   - `tx_packets` — count of TX chains whose L2 frame was
     ///     captured (`frame_len = Some`) AND whose TX `add_used`
@@ -338,6 +341,21 @@ pub struct VmResult {
     ///     `queue_poisoned` flag short-circuits subsequent kicks
     ///     so one guest fault produces exactly one bump regardless
     ///     of how many notifications follow before reset.
+    ///   - `ctrl_mq_set` — cumulative count of successful control-vq
+    ///     `VIRTIO_NET_CTRL_MQ` / `VQ_PAIRS_SET` commands (the device
+    ///     updated `curr_queue_pairs` and wrote `VIRTIO_NET_OK`).
+    ///     Per-event counter.
+    ///   - `ctrl_chain_invalid` — cumulative count of control-vq
+    ///     chains the device could not satisfy: malformed shape (no
+    ///     device-writable status descriptor, too few readable command
+    ///     bytes), an unknown `(class, cmd)`, or a `virtqueue_pairs`
+    ///     outside `[1, queue_pairs]`. Per-event hostile/buggy-guest
+    ///     counter; the control-vq analog of `tx_chain_invalid`.
+    ///   - `ctrl_add_used_failures` — cumulative count of control-vq
+    ///     status-write or `add_used` failures (the status byte's GPA
+    ///     or the used-ring address is unmapped). Queue-state breakage
+    ///     distinct from `ctrl_chain_invalid`; the control-vq analog
+    ///     of `tx_add_used_failures`.
     ///
     /// Counters are cumulative for the device's lifetime — a guest
     /// driver re-bind (writing `STATUS=0`) does NOT zero them.

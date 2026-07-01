@@ -1,17 +1,20 @@
 //! VM-backed end-to-end test for the
-//! `Op::Spawn(SpawnPlacement::Cgroup(""))` empty-string bail at
-//! `src/scenario/ops/mod.rs::apply_ops`.
+//! `Op::Spawn(SpawnPlacement::Cgroup(""))` empty-string bail in
+//! `src/scenario/ops/dispatch.rs::apply_spawn` (the
+//! `SpawnPlacement::Cgroup` arm).
 //!
-//! The unit-test layer pins the bail logic with mocked
-//! `CgroupOps`; this e2e test boots a real VM and proves the
-//! bail also fires in the production scenario-engine path —
-//! before `WorkloadHandle::spawn` burns clone(2) syscalls,
-//! before any cgroup-fs write. A regression that moved the
-//! check after spawn would still pass the unit test (mock
-//! never observes the wasted spawn) but would fail this test
-//! because the bail returns from the scenario engine with a
-//! specific diagnostic string AND a clean teardown — workers
-//! never reach the cgroup-fs layer.
+//! No unit test drives this Op::Spawn bail; this e2e is its
+//! sole pin. The analogous empty-cgroup bail on
+//! `Op::CaptureCgroupProcs` is unit-pinned with mocked
+//! `CgroupOps` (src/scenario/ops/tests.rs:
+//! `op_capture_cgroup_procs_empty_cgroup_bails_before_read`) as
+//! a mirror. This e2e boots a real VM and proves the bail fires
+//! in the production scenario-engine path — before
+//! `WorkloadHandle::spawn` burns clone(2) syscalls, before any
+//! cgroup-fs write. A regression that moved the check after
+//! spawn would fail this test because the bail returns from the
+//! scenario engine with a specific diagnostic string AND a
+//! clean teardown — workers never reach the cgroup-fs layer.
 //!
 //! Expected behavior:
 //! - `execute_scenario` returns `Ok(AssertResult::fail(...))` —
@@ -20,8 +23,8 @@
 //! - A failure detail contains
 //!   `"Op::Spawn(SpawnPlacement::Cgroup): cgroup name is empty"`
 //!   plus the actionable redirect to `SpawnPlacement::runner_cgroup()`
-//! - No cgroup-fs side effects (no `cg_test` dir created — the
-//!   scenario never reaches the cgroup-fs layer)
+//! - No cgroup-fs side effects (no cgroup dir created for the
+//!   empty name — the scenario never reaches the cgroup-fs layer)
 //!
 //! The test runs under `auto_repro = false` because the bail
 //! IS the expected outcome — re-running in an auto-repro VM

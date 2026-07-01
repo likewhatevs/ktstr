@@ -1124,12 +1124,13 @@ fn compare_rows_per_metric_policy_resolves_each_metric_independently() {
     );
 }
 
-/// `compare_rows` uses `Iterator::find` to locate the A-side
-/// match for each B-side row, so when `rows_a` contains two
+/// `compare_rows_by` builds a `HashMap<PairingKey, &GauntletRow>`
+/// from `rows_a` via `entry(key).or_insert(row_a)`, then looks up
+/// each B-side row with `get`, so when `rows_a` contains two
 /// entries with the same `(scenario, topology, work_type)` key
-/// the first one wins. Lock that contract in: the second
-/// duplicate must be ignored even though it would change the
-/// verdict.
+/// the first (earlier-iterated) one wins. Lock that contract in:
+/// the second duplicate must be ignored even though it would
+/// change the verdict.
 #[test]
 fn compare_rows_duplicate_key_first_match_wins() {
     // First A-side entry has spread=10 (would yield a regression

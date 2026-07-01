@@ -11,9 +11,9 @@
 //! (pcomm) hosting `ThreadPool` worker threads.
 //!
 //! The `post_vm` callback gates on the same host-visible signals
-//! used in [`worker_properties_e2e`](super::worker_properties_e2e):
+//! used in the `worker_properties_e2e` test:
 //! a regression in the partitioner, container fork, leader's
-//! `prctl(PR_SET_NAME)`, per-thread spawn, or bincode report stream
+//! `prctl(PR_SET_NAME)`, per-thread spawn, or postcard report stream
 //! collapses one of `timed_out` / `crash_message` / `exit_code` /
 //! `success`.
 
@@ -42,7 +42,7 @@ fn assert_pcomm_ran_clean(result: &VmResult) -> Result<()> {
         result.crash_message.is_none(),
         "guest panicked during the run — `crash_message` = {:?}; a \
          regression in `spawn_pcomm_cgroup` (leader fork, \
-         `prctl(PR_SET_NAME)`, per-thread spawn, or bincode report \
+         `prctl(PR_SET_NAME)`, per-thread spawn, or postcard report \
          stream) would surface here",
         result.crash_message,
     );

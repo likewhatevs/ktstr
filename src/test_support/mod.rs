@@ -20,11 +20,14 @@
 //!
 //! # Module layout
 //!
-//! Implementation is split across 18 production submodules
+//! Implementation is split across 20 production submodules
 //! re-exported at `test_support::*` for a flat public API: `args`
 //! (CLI argument extraction), `dispatch` (ktstr / cargo-ktstr CLI
-//! entry points), `entry` (scheduler + test-entry types), `eval`
-//! (host-side VM result evaluation), `metrics` (payload stdout →
+//! entry points), `entry` (scheduler + test-entry types),
+//! `entry_validate` (`KtstrTestEntry::validate` + phase helpers split
+//! out of `entry.rs`), `eval`
+//! (host-side VM result evaluation), `host_class` (shared
+//! host-insufficiency error classification), `metrics` (payload stdout →
 //! `Metric` list), `model` (LLM backend + model cache), `output`
 //! (guest-output and console parsing), `payload` (`Payload` /
 //! `MetricCheck` / `Metric` / `Polarity`), `probe` (auto-repro and
@@ -104,7 +107,7 @@ mod topo;
 pub type PostVmCallback = fn(&crate::vmm::VmResult) -> anyhow::Result<()>;
 
 // extract_probe_stack_arg and extract_work_type_arg are reached in
-// production via `super::args::` (probe.rs, eval/mod.rs); the re-export here
+// production via `super::args::` (probe.rs); the re-export here
 // preserves the flat-namespace invariant so `test_support::X` resolves
 // uniformly across all CLI arg extractors.
 #[cfg(feature = "export")]

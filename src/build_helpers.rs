@@ -65,7 +65,7 @@ where
 /// Reuse a pre-built blob binary that `cargo-ktstr` already embedded
 /// and extracted, instead of fetching + compiling our own. `cargo-ktstr`
 /// bakes the compiled busybox / wprof into its binary
-/// (`bin/cargo_ktstr/blobs.rs` `BUSYBOX_BYTES` / `WPROF_BYTES`),
+/// (`src/bin/cargo_ktstr/blobs.rs` `BUSYBOX_BYTES` / `WPROF_BYTES`),
 /// extracts them to disk at startup, and hands the child build their
 /// paths via `KTSTR_BUSYBOX_BIN` / `KTSTR_WPROF_BIN`; copying that
 /// binary into `$OUT_DIR/{blob_name}` is byte-equivalent to a local

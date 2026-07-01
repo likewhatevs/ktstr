@@ -2,8 +2,8 @@
 //! subcommands.
 //!
 //! All three subcommands share the `cargo nextest`/`cargo
-//! llvm-cov` execve plumbing, the `--no-perf-mode` env-var pass-
-//! through, and the multi-kernel
+//! llvm-cov` execve plumbing, the `--no-perf-mode` /
+//! `--no-skip-mode` env-var pass-throughs, and the multi-kernel
 //! [`ktstr::KTSTR_KERNEL_LIST_ENV`] export. The differences live
 //! in the leading `cargo` subcommand argv (`{nextest run}` vs
 //! `{llvm-cov nextest}` vs `{llvm-cov}`) and the optional
@@ -109,7 +109,7 @@ fn prebuilt_blob_bin_envs(
 /// All three subcommands share the same plumbing: resolve `--kernel`
 /// to a flat `(label, kernel_dir)` set, propagate `--no-perf-mode`
 /// via an env var, optionally prepend `--cargo-profile release`,
-/// append the user's trailing args, and `cmd.exec()` once. The
+/// append the user's trailing args, and `cmd.status()` once. The
 /// cargo subcommand name (`["nextest","run"]` vs `["llvm-cov",
 /// "nextest"]` vs `["llvm-cov"]`) and the log / error-message
 /// prefix are the only static differences.
@@ -140,10 +140,6 @@ fn prebuilt_blob_bin_envs(
 /// still gets a valid path. The test binary's `--list` / `--exact`
 /// handlers prefer `KTSTR_KERNEL_LIST` when set.
 ///
-/// `release` is always `false` for the raw `llvm-cov` passthrough —
-/// that subcommand hands every argument to the user, so the profile
-/// is set via the user's trailing args (or not at all). `test` and
-/// `coverage` wire their `--release` flag through to this argument.
 /// The `KTSTR_SCHEDULER_PROFILE` value the scheduler-under-test build
 /// should use given the two CLI flags: `Some("release")` when EITHER
 /// `--release` (everything release) or `--release-scheduler` (only the

@@ -487,7 +487,7 @@ fn rendezvous_done_on_zero_expected() {
 /// the drop, an in-flight AP ack that arrived just before
 /// (parked_count = expected_parks - 1) now satisfies the
 /// reduced expected. Pins the in-loop re-check at production
-/// lines ~3285 against a regression that would force one more
+/// lines ~5937 against a regression that would force one more
 /// poll iteration before observing completion.
 #[test]
 fn rendezvous_done_after_worker_drop_decrements_expected() {

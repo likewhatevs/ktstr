@@ -594,7 +594,7 @@ fn compare_rows_by_skips_phase_pass_when_either_side_phases_empty() {
 /// Values chosen to clear the per-phase dual-gate (the same
 /// `|delta| < default_abs || rel_delta < default_rel` gate
 /// the scalar pass uses inside its per-metric loop in
-/// `compare_rows_by`). max_dsq_depth has
+/// `push_scalar_findings`). max_dsq_depth has
 /// default_abs=10.0 / default_rel=0.50; total_iterations has
 /// default_abs=100.0 / default_rel=0.10. The 10→25 (delta=15)
 /// and 200→400 (delta=200) deltas both clear both gates, so
@@ -680,7 +680,7 @@ fn compare_rows_by_phase_deltas_skip_informational_metrics() {
 
 /// per-phase pass honors the dual-gate semantic the
 /// scalar pass uses inside its per-metric loop in
-/// `compare_rows_by` (`|delta| < default_abs ||
+/// `push_scalar_findings` (`|delta| < default_abs ||
 /// rel_delta < default_rel`). Sub-threshold deltas are still
 /// emitted into `phase_deltas` (programmatic consumers see
 /// every paired comparison) but their `is_regression` flag

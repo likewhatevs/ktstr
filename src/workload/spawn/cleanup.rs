@@ -1,6 +1,6 @@
 //! Forked-child cleanup helpers shared across [`super::SpawnGuard`]'s
-//! drop path, mid-spawn early-bail, and `stop_and_collect`'s per-child
-//! SIGKILL escalation.
+//! drop path, mid-spawn early-bail, and `stop_and_collect`'s and
+//! `WorkloadHandle::sigkill_workers`'s per-child SIGKILL escalation.
 //!
 //! Each helper centralises a duplicated cleanup pattern from `mod.rs`
 //! so a future addition (new signal, new fd-class to close, new errno
@@ -17,7 +17,7 @@ use nix::unistd::Pid;
 
 /// Silently close every fd in `fds` that is `>= 0`. Negative-fd
 /// entries (sentinel values for "this slot was never opened" inside
-/// `ChildHandle::report_fd` / `start_fd`) are skipped so callers can
+/// `ForkedChild::report_fd` / `start_fd`) are skipped so callers can
 /// mix opened and never-opened fds in the same slice without
 /// special-casing each one. `EBADF` from a double-close is swallowed
 /// because the cleanup paths share fd state with the success path
@@ -35,10 +35,11 @@ pub(super) fn close_fds_silently(fds: &[RawFd]) {
 /// Send `signal` to `pid` AND to the process group led by `pid` via
 /// `killpg(2)`. Used in `stop_and_collect`'s per-child SIGKILL
 /// escalation: the worker fork tree includes any grandchildren the
-/// worker spawned (e.g. `WakeChain`'s pipeline stages), and the
-/// framework's `setsid()` boundary in the worker child means a
+/// worker spawned (e.g. a `WorkType::Custom` body that forks helpers), and the
+/// framework's `setpgid(0, 0)` boundary (each worker becomes its own
+/// process-group leader) means a
 /// direct `kill(pid, ...)` reaches only the leader. The paired
-/// `killpg` fans out to every process in the leader's session group
+/// `killpg` fans out to every process in the leader's process group
 /// so the fork tree dies as a unit, not "leader gone, orphans
 /// reparented to init."
 ///

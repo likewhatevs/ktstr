@@ -152,10 +152,10 @@ fn store_atomic_idempotent_on_existing_entry() {
     // If a peer published between lookup() and store_atomic(),
     // the second store_atomic returns the existing path rather
     // than raising. This test uses Filesystem::Raw, whose
-    // superblock_magic() is None, so F1's content re-validate is
+    // superblock_magic() is None, so the content re-validate is
     // skipped and the legacy discard-ours early return holds (the
     // existing entry wins, ours is discarded). On Filesystem::Btrfs,
-    // F1 re-validates the existing magic and REPLACES a stale entry
+    // store_atomic re-validates the existing magic and REPLACES a stale entry
     // instead — see store_atomic_replaces_stale_invalid_btrfs_entry.
     let tmp = tempfile::tempdir().expect("create tempdir");
     let _guard =
@@ -188,7 +188,7 @@ fn store_atomic_idempotent_on_existing_entry() {
 /// `<key>.tmp.<pid>` patterns, not the in-flight name the caller
 /// chose for `src_path`).
 ///
-/// Uses `Filesystem::Raw` (superblock_magic() == None) so F1's content
+/// Uses `Filesystem::Raw` (superblock_magic() == None) so the content
 /// re-validate is skipped and the discard-ours-with-unlink path runs;
 /// on `Filesystem::Btrfs` a stale existing entry would be replaced
 /// instead (see store_atomic_replaces_stale_invalid_btrfs_entry).
@@ -221,12 +221,12 @@ fn store_atomic_unlinks_src_on_idempotent_early_return() {
 
 #[test]
 fn store_atomic_replaces_stale_invalid_btrfs_entry() {
-    // F1: when a Btrfs cache entry already exists but is STALE (no
+    // When a Btrfs cache entry already exists but is STALE (no
     // valid superblock magic), store_atomic must REPLACE it with the
     // freshly-built image — NOT discard the rebuild and re-bless the
-    // stale entry. Pins the exact failure mode #10 fixed (a 2-day-old
+    // stale entry. Pins the exact failure mode fixed here (a 2-day-old
     // all-zero template survived every rebuild because the discard-ours
-    // early return kept it). FAILS on the pre-F1 code.
+    // early return kept it). FAILS on the pre-fix code.
     let tmp = tempfile::tempdir().expect("create tempdir");
     let _guard =
         crate::test_support::test_helpers::EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());

@@ -171,7 +171,7 @@ mod scheduler;
 ///     Maps onto `KtstrTestEntry::config_content`. Required when
 ///     the scheduler declares `config_file_def`; rejected when the
 ///     scheduler does not. The pairing is enforced at compile time
-///     via a `const` assertion against `Payload::config_file_def`,
+///     via a `const` assertion against `Scheduler::config_file_def`,
 ///     and again at runtime by `KtstrTestEntry::validate` so direct
 ///     programmatic-entry construction sees the same gate.
 ///   - `expect_scx_bpf_error_contains = EXPR` — literal-substring
@@ -567,9 +567,9 @@ mod tests {
     /// assertion a maintainer editing the [`Default`] impl can shift
     /// any user-visible default (auto_repro, kaslr, memory_mib, the
     /// gauntlet caps, etc.) with zero test feedback. Same precedent
-    /// as `host_mode_default_cgroup_parent_resolves` in
-    /// tests/host_mode_e2e.rs pinning a runtime const against
-    /// production source.
+    /// as `resolve_host_cgroup_parent_env_unset_returns_default` in
+    /// src/test_support/dispatch_tests.rs pinning a runtime const
+    /// against production source.
     #[test]
     fn attr_values_default_matches_documented_macro_defaults() {
         let d = ktstr_test::AttrValues::default();

@@ -641,7 +641,9 @@ impl GuestMem {
     /// entry).
     ///
     /// `N` must match the width of the scalar caller. `read_volatile_bytes`
-    /// reads byte-by-byte, so the access does not require `N`-alignment.
+    /// uses a natural-width `read_volatile` only when `ptr` is aligned and
+    /// otherwise falls back to a per-byte volatile loop, so the access does
+    /// not require `N`-alignment.
     fn read_scalar<const N: usize>(&self, pa: u64, offset: usize) -> [u8; N] {
         let Some(addr) = pa.checked_add(offset as u64) else {
             return [0; N];
@@ -2088,7 +2090,8 @@ pub(crate) struct MonitorConfig<'a> {
     /// observe schedulers that attach mid-run.
     pub event_pcpu_pas: Option<&'a [u64]>,
     /// Reactive dump configuration. When a sustained threshold violation is
-    /// detected, writes the dump request flag to guest SHM to trigger a
+    /// detected, pushes the `SIGNAL_VC_DUMP` wake byte through the attached
+    /// virtio-console RX queue (via `host_comms::request_dump`) to trigger a
     /// SysRq-D dump inside the guest.
     pub dump_trigger: Option<&'a DumpTrigger>,
     /// Optional watchdog timeout override to install before sampling
@@ -5610,9 +5613,10 @@ mod tests {
         // (sd_ttwu_move_balance=232 + 4 bytes for that u32 + 8 bytes
         // guard = 244) rounded up to the next multiple of 8. The
         // readers go through `GuestMem::read_u32` / `read_u64`, which
-        // call `read_volatile_bytes<N>` — per-byte volatile reads that
-        // are always 1-aligned and recompose the integer via
-        // `from_ne_bytes`, so misaligned PAs are safe. The 8-alignment
+        // call `read_volatile_bytes<N>` — a natural-width `read_volatile`
+        // when the ptr is aligned and a per-byte (1-aligned) volatile
+        // fallback otherwise, recomposing the integer via `from_ne_bytes`,
+        // so misaligned PAs are safe. The 8-alignment
         // baked into this stride is therefore no longer load-bearing
         // for correctness; it remains because every real kernel
         // sched_domain is `__randomize_layout`-aligned past u64 and

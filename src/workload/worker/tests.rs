@@ -796,8 +796,9 @@ fn reservoir_push_uniform_sampling() {
 #[test]
 fn reservoir_push_cap_zero() {
     // Zero-capacity reservoir: buf.len() < 0 is never true (usize),
-    // falls through to else branch where random_range(0..1) returns 0,
-    // and 0 < 0 is false — sample is discarded.
+    // falls through to else branch where the xorshift64 draw is taken
+    // mod count (r % 1 == 0), and 0 < 0 (idx < cap) is false — sample
+    // is discarded.
     let mut buf = Vec::new();
     let mut count = 0u64;
     for i in 0..10 {

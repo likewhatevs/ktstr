@@ -31,9 +31,10 @@ fn validate_kva_target_rejects_zero() {
     assert!(err.contains("0x0"));
 }
 
-/// User-half max (canonical 4-level user-half top).
-/// Pins that a bit-63 only check is insufficient; the
-/// threshold-based check catches this case.
+/// User-half max (canonical 4-level user-half top, all
+/// sub-canonical bits set). Pins that this top-of-user-half
+/// address still rejects, since it sits below the kernel-half
+/// threshold.
 #[test]
 fn validate_kva_target_rejects_user_half_max() {
     let kva = 0x0000_7FFF_FFFF_FFFF;

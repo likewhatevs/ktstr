@@ -201,8 +201,10 @@ fn idle_churn_min_valid_durations_pass_validation() {
 /// observable assertion, and slack effects only become visible
 /// in wake-latency distributions for sub-50µs sleeps which
 /// require longer runs than this smoke test allocates.
-/// `default_timer_slack_ns` per
-/// `init/init_task.c:172` is 50_000ns, so a 5ms sleep already
+/// `timer_slack_ns` per
+/// `init/init_task.c:173` (`.timer_slack_ns = 50000`) is 50_000ns
+/// (a task's `default_timer_slack_ns` inherits it via
+/// `kernel/fork.c:2177`), so a 5ms sleep already
 /// drowns the slack signal in the dispatch arm's
 /// `resume_overhead = elapsed.saturating_sub(sleep_duration)`
 /// computation; this test only proves the prctl call doesn't

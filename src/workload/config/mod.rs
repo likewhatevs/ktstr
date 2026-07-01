@@ -4,7 +4,8 @@
 //! serde) without crossing the kernel boundary itself: [`WorkloadConfig`]
 //! and its [`WorkSpec`] composed entries, the per-knob enums
 //! ([`SchedPolicy`], [`SchedClass`], [`MemPolicy`], [`MpolFlags`],
-//! [`CloneMode`], [`FutexLockMode`], [`WakeMechanism`], [`AluWidth`]),
+//! [`CloneMode`], [`FutexLockMode`], [`WakeMechanism`], [`ReapMode`],
+//! [`AluWidth`]),
 //! the [`defaults`] constants `WorkType::from_name` consults, the
 //! [`humantime_serde_helper`] module the duration fields cite, and the
 //! [`resolve_work_type`] selector. The corresponding kernel-call

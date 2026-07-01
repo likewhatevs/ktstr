@@ -44,9 +44,13 @@
 //!
 //! # LlmExtract extraction pipeline
 //!
-//! [`extract_via_llm`] is the runtime entry point called by
-//! [`extract_metrics`](crate::test_support::extract_metrics) when a
-//! payload's [`crate::test_support::OutputFormat::LlmExtract`] fires:
+//! [`extract_via_llm`] is the host-side runtime entry point, run
+//! post-VM-exit by the eval LlmExtract pipeline
+//! (`crate::test_support::eval::host_side_llm_extract`) for
+//! [`crate::test_support::OutputFormat::LlmExtract`] payloads;
+//! [`extract_metrics`](crate::test_support::extract_metrics) itself
+//! short-circuits the `LlmExtract` arm to an empty `Vec` and does not
+//! dispatch here:
 //!
 //! 1. [`compose_prompt`] assembles `{LLM_EXTRACT_PROMPT_TEMPLATE}\n\n{focus}STDOUT:\n{body}`.
 //! 2. `load_inference` (module-private) routes the GGUF model
@@ -268,7 +272,8 @@ pub(crate) enum InferenceError {
 /// — surfacing all of it in an error chain would crowd the
 /// rendering downstream consumers print. 64 bytes is enough to
 /// fingerprint which prompt category triggered the failure
-/// (compose_prompt always opens with the literal
+/// (the `wrap_chatml_no_think` wrapper — which is what
+/// `fit_prompt_to_context` tokenizes — always opens with the literal
 /// `<|im_start|>user\n` ChatML header).
 const PROMPT_EXCERPT_BYTES: usize = 64;
 
@@ -298,7 +303,7 @@ fn prompt_excerpt(prompt: &str) -> String {
 /// without keeping the outer mutex locked. There is no inner
 /// per-model lock — `LlamaModel` is `Send + Sync` (see upstream
 /// `unsafe impl Send for LlamaModel` / `unsafe impl Sync for
-/// LlamaModel` at `llama-cpp-2-0.1.145/src/model.rs:177,179`) and
+/// LlamaModel` at `llama-cpp-2-0.1.146/src/model.rs:177,179`) and
 /// every method `invoke_with_model` calls on the model
 /// (`new_context`, `is_eog_token`, `str_to_token`, `token_to_piece`)
 /// takes `&self`, so concurrent generation passes share the cached
@@ -384,7 +389,7 @@ fn prompt_excerpt(prompt: &str) -> String {
 /// the model (`new_context`, `is_eog_token`, `str_to_token`,
 /// `token_to_piece`) takes `&self`, and `LlamaModel` is
 /// `Send + Sync` per upstream's `unsafe impl` declarations
-/// (`llama-cpp-2-0.1.145/src/model.rs:177,179`). Concurrent
+/// (`llama-cpp-2-0.1.146/src/model.rs:177,179`). Concurrent
 /// callers each hold the same `Arc<CachedInference>` and run their
 /// generation passes in parallel — a 2-5 minute inference under
 /// one caller no longer blocks every other caller from starting
@@ -1320,10 +1325,11 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
     // that trade-off for responsiveness, but `ensure()` is the
     // integrity gate. The cost is one full SHA-256 walk per
     // `ensure()` call against an existing cache entry (~10 s for
-    // the 2.55 GiB Qwen3-4B pin); the prefetch at nextest
-    // bootstrap amortises this over every test in the binary, and
-    // the in-test cache reuses the post-ensure `ModelStatus` so
-    // the walk fires at most once per process run.
+    // the 2.55 GiB Qwen3-4B pin); the walk fires at most once per
+    // process because `load_inference` (which calls `ensure`) runs
+    // behind `memoized_inference`'s `MODEL_CACHE`, whose
+    // `Arc<Result<LoadedInference, String>>` is populated exactly
+    // once per process run.
     let root = resolve_cache_root()?;
     let path = root.join(spec.file_name);
     let verdict = compute_sha_verdict(&path, spec, false)?;
@@ -1660,7 +1666,7 @@ fn fetch(spec: &ModelSpec, final_path: &std::path::Path) -> Result<PathBuf> {
         );
     }
     // Stream the body straight into the tempfile via `std::io::copy`
-    // so a 400 MiB model doesn't first materialize in a heap Vec.
+    // so a 2.55 GiB model doesn't first materialize in a heap Vec.
     // `response` implements `std::io::Read`; the tempfile handle
     // from `NamedTempFile` implements `Write`. A buffer-then-write
     // approach would hold the full body in memory.
@@ -2039,7 +2045,8 @@ const SAMPLE_LEN: usize = 512;
 ///
 /// Promoted to a module-level `const` so the prompt-budget
 /// arithmetic in `invoke_with_model` and the
-/// `n_ctx_budget_*` test fixtures share one source of truth.
+/// `context_budget_arithmetic_holds` test fixture share one source of
+/// truth.
 const N_CTX_TOKENS: usize = 2048;
 
 /// Per-invocation token budget for the prompt — the prompt's
@@ -2304,7 +2311,7 @@ fn invoke_with_model(state: &LoadedInference, prompt: &str) -> anyhow::Result<St
     //
     // Threading: `LlamaContextParams::default()` caps both
     // `n_threads` and `n_threads_batch` at 4 (see upstream
-    // `llama-cpp-2-0.1.145/src/context/params/get_set.rs:154` and
+    // `llama-cpp-2-0.1.146/src/context/params/get_set.rs:154` and
     // `:184`). Inference is matmul-bound for every quantized layer
     // pass, so on any host with more than 4 cores the default
     // strands the matmul on a fraction of the box — the prompt

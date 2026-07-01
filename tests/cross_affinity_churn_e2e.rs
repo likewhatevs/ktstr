@@ -56,7 +56,10 @@ fn cross_affinity_churn_runs_in_vm(ctx: &Ctx) -> Result<AssertResult> {
                 // spawns+moves+starts WorkSpecs serially in declaration
                 // order, so the flippers find the FutexPingPong workers
                 // already in cgroup.procs; reversing the order would
-                // make these flippers a silent no-op (no siblings yet).
+                // leave the flippers with only their co-flippers as
+                // siblings — the eight FutexPingPong targets would not
+                // yet be in cgroup.procs, so the intended cross-WorkSpec
+                // churn would not happen.
                 .work(
                     WorkSpec::default()
                         .workers(2)

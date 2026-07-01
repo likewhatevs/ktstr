@@ -532,9 +532,9 @@ impl VirtioBlk {
             // FAILED appears alongside other unrecognised new bits —
             // those are protocol violations unrelated to the
             // legitimate FAILED signal and fall through to the
-            // FSM-ladder match below. Mirrors virtio_console.rs's
-            // FAILED early-accept pattern at the same location in its
-            // set_status.
+            // FSM-ladder match below. Mirrors
+            // virtio_console/device/mod.rs's FAILED early-accept
+            // pattern at the same location in its set_status.
             if new_bits == VIRTIO_CONFIG_S_FAILED {
                 // CAS against the snapshot for the same race-safety
                 // reason as the valid-FSM-transition store below: the
@@ -872,7 +872,7 @@ impl VirtioBlk {
         // NEEDS_RESET bit re-set itself between Phase 1 and Phase 2.
         // `mem_unset_warned` is deferred to Phase 3 for the same
         // reason: the worker thread does
-        // `mem_unset_warned.swap(true, Relaxed)` (worker.rs:788)
+        // `mem_unset_warned.swap(true, Relaxed)` (worker.rs:815)
         // when it observes a missing GuestMemory, and clearing the
         // latch in Phase 1 would let a worker swap-true between
         // Phase 1 and Phase 2 — leaving the latch stuck `true` for
@@ -972,7 +972,7 @@ impl VirtioBlk {
         // log line, not a quiet drop based on a latch from a
         // previous lifetime). Deferred to Phase 3 so the worker
         // (which is the only thread that swaps the latch to
-        // `true` at worker.rs:788) is joined first — clearing in
+        // `true` at worker.rs:815) is joined first — clearing in
         // Phase 1 would race a live worker swap-true and leave
         // the latch stuck `true` for the next driver session,
         // silencing the wiring-bug warning we explicitly want.

@@ -29,7 +29,7 @@ projection + assertion surface only.
 `SampleSeries` is the ordered sequence of `(tag, report, stats,
 elapsed_ms)` tuples drained from the bridge after the VM exits. Build
 it from
-[`SnapshotBridge::drain_ordered_with_stats`](snapshots.md#wiring-the-bridge):
+[`SnapshotBridge::drain_ordered_with_stats`](periodic-capture.md):
 
 ```rust,ignore
 use ktstr::prelude::*;

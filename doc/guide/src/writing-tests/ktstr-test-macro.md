@@ -56,14 +56,14 @@ the function inside it.
 ## Attributes
 
 All attributes are optional with defaults. Most take `key = value`;
-the fifteen bool attributes (`auto_repro`, `expect_auto_repro`,
-`not_starved`, `isolation`, `performance_mode`, `no_perf_mode`,
+the sixteen bool attributes (`auto_repro`, `expect_auto_repro`,
+`not_starved`, `isolation`, `performance_mode`, `pci`, `no_perf_mode`,
 `requires_smt`, `expect_err`, `survives_storm`, `allow_inconclusive`,
 `fail_on_stall`, `host_only`, `ignore`, `kaslr`, `wprof`) also accept a
 bare form as shorthand for `= true` — `#[ktstr_test(host_only)]` is equivalent to
 `#[ktstr_test(host_only = true)]`. `auto_repro` and `kaslr` default to
 `true`, so bare `auto_repro` / `kaslr` is a no-op; use
-`auto_repro = false` / `kaslr = false` to disable. The other thirteen
+`auto_repro = false` / `kaslr = false` to disable. The other fourteen
 default to `false` (or `None`), so the bare form is the meaningful
 shorthand for those.
 
@@ -101,7 +101,7 @@ not `value * 1_000_000`.
 
 The host VM timeout adds vCPU-scaled boot headroom to the test's
 `watchdog_timeout`/`duration` base, and the guest's send-sys-rdy
-retry budget scales the same way: `min(30s, 10s + vcpus * 150ms)`.
+retry budget scales the same way: `min(90s, 10s + vcpus * 150ms)`.
 A 126-vCPU test gets 28.9 s for the virtio-console multiport
 handshake; tests are not expected to override either knob.
 
@@ -111,7 +111,7 @@ handshake; tests are not expected to override either knob.
 |---|---|---|
 | `scheduler = CONST` | `&Scheduler::EEVDF` | Rust const path to a `&'static Scheduler`. The bare const emitted by `declare_scheduler!` (e.g. `MY_SCHED`) is the expected form. The default `Scheduler::EEVDF` runs tests under the kernel's default scheduler (EEVDF on Linux 6.6+) so tests without an explicit `scheduler =` run under the kernel default. |
 | `extra_sched_args = [...]` | `[]` | Extra CLI args for the scheduler, appended after `Scheduler::sched_args`. |
-| `watchdog_timeout_s` | 5 | scx watchdog override (seconds). Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels (BTF-detected) and via the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override logs a `tracing::warn!` and continues without overriding. |
+| `watchdog_timeout_s` | 4 | scx watchdog override (seconds). Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels (BTF-detected) and via the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override logs a `tracing::warn!` and continues without overriding. |
 
 ### Payloads
 
@@ -186,8 +186,9 @@ example.
 | `expect_auto_repro` | `false` | Assert that auto-repro actually ran on a scheduler crash (pins that the auto-repro path itself works). |
 | `kaslr` | `true` | Boot the guest kernel with KASLR enabled (`CONFIG_RANDOMIZE_BASE=y` + `CONFIG_RANDOMIZE_MEMORY=y`, no `nokaslr` karg). Set to `false` to opt out per-test — appends `nokaslr` to the kernel command line. Scheduler-wide opt-out is available via `Scheduler::kargs(&["nokaslr"])`. |
 | `performance_mode` | `false` | Pin vCPUs to host cores, hugepages, NUMA mbind, RT scheduling, LLC exclusivity validation |
+| `pci` | `false` | Expose the virtio-PCI transport: a host bridge at `00:00.0` plus the PCI ECAM/CAM config-access windows. When `false`, no PCI host bridge is exposed and the guest cmdline carries `pci=off`. On x86_64, attaching a `disk` or `networks` device auto-enables this (virtio-blk / virtio-net are virtio-PCI functions there), so the attribute is only needed to force the bridge on without a device. |
 | `no_perf_mode` | `false` | Decouple the virtual topology from host hardware: build the VM with the declared `numa_nodes` / `llcs` / `cores` / `threads` even on smaller hosts; skip vCPU pinning, hugepages, NUMA mbind, RT scheduling, and KVM exit suppression; relax gauntlet preset filtering to the single "host has enough total CPUs" check. Mutually exclusive with `performance_mode = true` (rejected at compile time by the `#[ktstr_test]` proc macro; `KtstrTestEntry::validate` provides a second-line gate for programmatic-entry construction). Equivalent to setting `KTSTR_NO_PERF_MODE=1` per-test — either source forces the no-perf path. See [Performance Mode](../concepts/performance-mode.md#tier-2-no-perf-mode-with-cpu-cap-reservation). |
-| `duration_s` | 12 | Per-scenario duration in seconds |
+| `duration_s` | 2 | Per-scenario duration in seconds |
 | `cpu_budget = N` | `None` | Explicit host-CPU mask size for no-perf mode (must be > 0); overrides the auto-derived budget. An explicit `--cpu-cap` / `KTSTR_CPU_CAP` still takes precedence. |
 | `expect_err` | `false` | Test expects `run_ktstr_test` to return `Err`; disables auto-repro |
 | `survives_storm` | `false` | Assert the scx scheduler SURVIVES the run (does not die or get ejected during any hold) — the positive inverse of `expect_err`. Requires an active scheduler; mutually exclusive with `expect_err` and `expect_auto_repro` (rejected at compile time and by `KtstrTestEntry::validate`). Enforced on scenarios driven through `execute_defs` / `execute_steps` / `execute_scenario` (which run the liveness probe); a survival violation surfaces as EXIT_FAIL with a survival-specific explainer. |
@@ -196,7 +197,7 @@ example.
 | `watch_bpf_maps = CONST` (or `[A, B]`) | empty | Rust const path to a `WatchBpfMap`, or a `[A, B]` array of them; the entry field is a slice and the macro borrows each declared path into it (one path yields a one-element slice). The free-running host monitor reads each named scheduler BPF-map field observer-effect-free into a run-level metric. Read it back with `result.run_metric("<scheduler-obj>_<label>")` (scalar) or `"<scheduler-obj>_<label>_{avg,max}"` (per-CPU). See [Watching scheduler BPF-map fields](#watching-scheduler-bpf-map-fields). |
 | `host_only` | `false` | Run the test function directly on the host instead of inside a VM. Use for tests that need host tools (e.g. cargo, nested VMs) unavailable in the guest initramfs. |
 | `disk = CONST` | `None` | Rust const path to a `const DiskConfig`; attaches a virtio-blk device whose backing the framework owns (a tempfile for `Raw`, a FICLONE-cloned template for `Btrfs`). Construct via `DiskConfig::DEFAULT` chained setters (e.g. `.with_name("data")`). Mutually exclusive with `host_only = true`. |
-| `network = CONST` | `None` | Rust const path to a `const NetConfig`; attaches a virtio-net device. Construct via `NetConfig::DEFAULT` chained setters. |
+| `networks = [CONST, …]` | `[]` | Array of `const NetConfig` const paths; each attaches a virtio-net device. Construct via `NetConfig::DEFAULT` chained setters. On x86_64 each NIC is a virtio-PCI function (slots `1..=N`); aarch64 supports at most one. |
 | `wprof = bool` | `false` | Attach the wprof BPF tracer to the workload VM. Requires the `wprof` cargo feature. |
 | `wprof_args = "..."` | `None` | Space-separated wprof CLI args. Requires `wprof = true` and the `wprof` cargo feature. |
 | `staged_schedulers = [PATH, ...]` | `[]` | Additional `&'static Scheduler` consts staged into the VM alongside the primary `scheduler`. Required for tests that invoke `Op::ReplaceScheduler` / `Op::AttachScheduler` — the framework packs every binary into the guest at boot so a runtime swap has its target on disk. |
@@ -412,4 +413,4 @@ Resolution is lazy: the maps appear only after the scheduler attaches, so the
 monitor retries until the named map is present, then caches the resolved
 offset/width and re-reads only the leaf bytes each tick.
 
-[`VmResult::run_metric`]: https://docs.rs/ktstr/latest/ktstr/vmm/result/struct.VmResult.html#method.run_metric
+[`VmResult::run_metric`]: https://docs.rs/ktstr/latest/ktstr/prelude/struct.VmResult.html#method.run_metric

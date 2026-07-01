@@ -424,10 +424,13 @@ fn phase_cgroup_stats_caps_pooled_wake_latencies() {
         (mean - 59_999.5).abs() < 3000.0,
         "reservoir mean {mean} tracks population mean 59999.5 (statistical tolerance)",
     );
-    // (2) DETERMINISTIC bound: the reservoir holds 100k of 120k values, excluding
-    // only 20k, so by pigeonhole min ≤ 20000 and max ≥ 99999 → range ≥ 99999
-    // ALWAYS. Assert > 90_000 (comfortably inside the guaranteed 99999, never a
-    // flake) to catch a constant/degenerate fill.
+    // (2) DETERMINISTIC bound: the reservoir is a 100k-element subset of the
+    // 120k-wide contiguous range {0..119999}. Any 100k-element subset of that
+    // range spans at least 99999 (the minimal-span subset is a block of 100000
+    // consecutive integers) → range ≥ 99999 ALWAYS. (The individual extremes
+    // min ≤ 20000 and max ≥ 99999 only bound range ≥ 79999; the contiguous-span
+    // argument is what gives the full 99999.) Assert > 90_000 (comfortably inside
+    // the guaranteed 99999, never a flake) to catch a constant/degenerate fill.
     let min = *pcs.wake_latencies_ns.iter().min().unwrap();
     let max = *pcs.wake_latencies_ns.iter().max().unwrap();
     assert!(

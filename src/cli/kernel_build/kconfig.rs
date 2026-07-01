@@ -208,7 +208,7 @@ pub fn append_extra_kconfig_suffix(cache_key: &mut String, extra: Option<&str>) 
 /// not set` directives count as overrides.
 pub(super) fn warn_extra_kconfig_overrides_baked_in(extra: &str, cli_label: &str) {
     // Build a per-symbol map of the baked-in declarations once.
-    // `EMBEDDED_KCONFIG` is small (<200 lines per ktstr.kconfig)
+    // `EMBEDDED_KCONFIG` is small (~370 lines per ktstr.kconfig)
     // so a single pass is cheap.
     let mut baked: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for raw in EMBEDDED_KCONFIG.lines() {
@@ -497,8 +497,9 @@ pub fn validate_kernel_config(kernel_dir: &std::path::Path) -> Result<()> {
     // Build a HashSet of trimmed `.config` lines once, then probe
     // each critical option in O(1). The previous formulation
     // walked `config.lines()` once per critical option (O(N×M)
-    // with M≈6 critical options and N≈5000 .config lines), which
-    // turned every kernel-build pipeline into a 30K-line scan.
+    // with M≈11 critical options (10 arch-neutral + 1 x86-only)
+    // and N≈5000 .config lines), which turned every kernel-build
+    // pipeline into a ~55K-line scan.
     // Trimming each line matches `all_fragment_lines_present`'s
     // configure-time behavior so the same `.config` parses
     // identically across both checks — without trim, a

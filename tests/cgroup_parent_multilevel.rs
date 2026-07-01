@@ -1,5 +1,7 @@
 //! VM-backed integration test for multi-level
-//! `--cell-parent-cgroup` paths.
+//! [`crate::test_support::Scheduler::cgroup_parent`] paths
+//! (materialised guest-side via `/scheduler_cgroup_parent` ->
+//! [`crate::vmm::rust_init::create_scheduler_cgroup_parent_from_file`]).
 //!
 //! Boots a guest with a 3-level cgroup_parent
 //! (`/ktstr-multi-l1/l2/l3`) and reads back every ancestor's
@@ -124,19 +126,20 @@ fn cgroup_parent_three_levels_writes_subtree_control_at_every_ancestor(
     }
     // Confirm the leaf directory itself exists. mkdir_p creates
     // it via repeated `mkdir(2)` calls; a missing directory here
-    // proves create_cgroup_parent_from_sched_args never reached
-    // its mkdir_p arm — i.e. the `--cell-parent-cgroup` argument
-    // wasn't parsed out of /sched_args.
+    // proves create_scheduler_cgroup_parent_from_file never reached
+    // its mkdir_p arm — i.e. the scheduler's cgroup_parent wasn't
+    // stamped into /scheduler_cgroup_parent (or the guest failed to
+    // read it).
     let leaf = "/sys/fs/cgroup/ktstr-multi-l1/l2/l3";
     if !std::path::Path::new(leaf).is_dir() {
         return Ok(AssertResult::fail(AssertDetail::new(
             DetailKind::Other,
             format!(
                 "leaf cgroup {leaf} does not exist. \
-                 create_cgroup_parent_from_sched_args should have \
-                 parsed `--cell-parent-cgroup /ktstr-multi-l1/l2/l3` \
-                 from /sched_args and called mkdir_p before the \
-                 scheduler started."
+                 create_scheduler_cgroup_parent_from_file should have \
+                 read `/scheduler_cgroup_parent` (= /ktstr-multi-l1/l2/l3, \
+                 stamped from Scheduler::cgroup_parent) and called \
+                 mkdir_p before the scheduler started."
             ),
         )));
     }

@@ -754,7 +754,8 @@ fn group_and_average_multi_pass_kind_aware_fold() {
             .copied(),
         Some(200.0),
     );
-    // worst_run_delay_us is the SOLE Worst Distribution: cross-RUN it
+    // worst_run_delay_us is a Worst-reduction Distribution (alongside
+    // worst_timer_latency_us): cross-RUN it
     // folds by MAX (the peak survives), NOT mean — gap_ms*2 = 200/400/600
     // → MAX 600 (a MEAN would give 400). Pins the Worst arm AND its
     // ordering before the general Distribution MEAN arm in aggregate_finite.
@@ -821,7 +822,8 @@ fn group_and_average_multi_pass_kind_aware_fold() {
     );
 }
 
-/// The two monitor schedstat Rates re-derive Σnumerator / Σdenominator
+/// The two per-SCHEDULE monitor schedstat Rates this test pins
+/// (total_run_delay_ns_per_sched + ttwu_local_fraction) re-derive Σnumerator / Σdenominator
 /// across runs (the `MetricKind::Rate` pooled fold), NOT a mean of per-run
 /// ratios. Two runs with deliberately different per-run ratios make the two
 /// estimators disagree, so this pins the pooled form:

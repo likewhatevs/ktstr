@@ -746,7 +746,7 @@ fn parallel_attach_kprobes<'a, 'obj>(
 ///
 /// The fentry skeleton exposes four indexed programs
 /// (`ktstr_fentry_0`..`ktstr_fentry_3`) matching the 4-slot batch
-/// model in `bpf/ktstr.bpf.c`. Call sites previously spelled the
+/// model in `src/bpf/fentry_probe.bpf.c`. Call sites previously spelled the
 /// full 4-arm `match slot { ... }` inline; routing through this
 /// family of helpers keeps the dispatch in one place so a future
 /// slot addition is a one-line change per helper instead of
@@ -845,7 +845,7 @@ fn disable_slot_programs(
 
 /// Write the per-slot rodata fields (`ktstr_fentry_func_idx_N`,
 /// `ktstr_fentry_is_kernel_N`) for slot 0..=3. Mirrors the BPF
-/// side's positional `rodata` layout in `bpf/ktstr.bpf.c`.
+/// side's positional `rodata` layout in `src/bpf/fentry_probe.bpf.c`.
 ///
 /// No-op for slot indices outside 0..=3.
 fn set_rodata_slot(
@@ -1922,13 +1922,12 @@ pub fn run_probe_skeleton(
                 // increment of `ktstr_miss_log_idx`. Aligned
                 // u64 loads are atomic on every supported
                 // arch; the BPF write order
-                // (`ktstr_miss_log[idx] = ip` BEFORE the
-                // increment of `ktstr_miss_log_idx`) means a
-                // volatile read of `[..miss_idx]` covers
-                // entries that were already written, modulo a
-                // race where the BPF writer fills slot `n`
-                // and the userspace reader re-reads
-                // `miss_idx` ahead of the write. We tolerate
+                // (increment of `ktstr_miss_log_idx` via
+                // `__sync_fetch_and_add` BEFORE the store
+                // `ktstr_miss_log[idx] = ip`) means a
+                // volatile read of `[..miss_idx]` may cover a
+                // slot whose index was already reserved but
+                // whose store has not yet landed. We tolerate
                 // that race: a stale-zero entry is harmless
                 // diagnostic noise compared with the
                 // alternative (compiler-hoisted loads of

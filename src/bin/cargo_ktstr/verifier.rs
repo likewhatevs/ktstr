@@ -1,8 +1,9 @@
 //! `cargo ktstr verifier` subcommand: thin wrapper around
 //! `cargo nextest run` filtered to the `verifier/` test-name prefix.
 //!
-//! Each test binary that links ktstr-test-support and has at least
-//! one `declare_scheduler!` declaration emits one nextest test per
+//! Each test binary that links the `ktstr` crate's `test_support`
+//! module and has at least one `declare_scheduler!` declaration
+//! emits one nextest test per
 //! (declared scheduler × kernel-list entry × accepted gauntlet
 //! preset) cell. The lister + cell handler live in
 //! `src/test_support/dispatch.rs::list_verifier_cells_all` and

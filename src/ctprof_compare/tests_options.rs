@@ -672,9 +672,10 @@ fn sort_key_none_delta_rows_sink_to_bottom() {
     assert!(diff.rows[policy_idx].delta.is_none());
 }
 
-/// `aggregate(Mode, &[])` returns `Mode { value: "", count:
-/// 0, total: 0 }` via the empty-iterator tail of
-/// `Modeable::mode_across`.
+/// `aggregate(Mode, &[])` returns `Mode { tallies: {}, total:
+/// 0 }` — `mode_aggregate` builds an empty tally map directly
+/// for an empty bucket; `mode_value()`/`mode_count()` then
+/// derive `""`/`0` from the empty map.
 #[test]
 fn aggregate_mode_on_empty_threads_is_empty() {
     let empty: Vec<&ThreadState> = vec![];
@@ -696,8 +697,9 @@ fn aggregate_mode_on_empty_threads_is_empty() {
 /// fixture and assert all three produce
 /// `Aggregated::Mode { value, count, total }` with `total
 /// == 3` and a count >= 1, pinning the helper's projection
-/// shape (value+count+total triple from `mode_across`, then
-/// total override from the supplied `threads.len()`).
+/// shape: `mode_aggregate` counts occurrences into a tally map
+/// and carries the supplied `threads.len()` verbatim as `total`;
+/// `mode_value`/`mode_count` derive the winner on demand.
 #[test]
 fn mode_aggregate_helper_dispatches_all_three_arms() {
     use crate::metric_types::CategoricalString;

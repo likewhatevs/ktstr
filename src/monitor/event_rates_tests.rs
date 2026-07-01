@@ -163,10 +163,11 @@ fn thresholds_event_rate_interrupted_resets() {
     }
     // Clean interval: same fallback -> rate = 0.
     samples.push(sample_with_events(300, 2500, 20, 0));
-    // 3 more samples = 2 intervals of high fallback rate (not 3).
-    // The fallback delta for the first interval covers sample 3->4,
-    // which is (30-20)/0.1 = 100/s (violating), then 4->5 is also
-    // violating. That's 2 intervals, below sustained=3.
+    // 2 more samples = 2 intervals of high fallback rate (not 3).
+    // Production sums select_cpu_fallback across the 2 CPUs, so the
+    // interval 3->4 rate is (80-40)/0.1 = 400/s (per-CPU fallback goes
+    // 20 -> 40), violating; interval 4->5 is also violating. That's 2
+    // intervals, below sustained=3.
     for i in 0..2u64 {
         samples.push(sample_with_events(
             400 + i * 100,

@@ -32,9 +32,11 @@
 //! ## How the test exercises kvm_clock save/restore
 //!
 //! Each `Op::ReadKernelCold` triggers a freeze rendezvous; the
-//! freeze coord saves guest TSC via `KVM_GET_CLOCK` before parking
-//! vCPUs and restores via `KVM_SET_CLOCK` with elapsed wall time
-//! after thaw. The two reads bracket a 3s hold; a regression that
+//! freeze coord saves the guest kvm_clock via `KVM_GET_CLOCK`
+//! after all vCPUs park-ack, then restores it (flags=0, no elapsed
+//! adjustment) via `KVM_SET_CLOCK` before the thaw gate flips — so
+//! the guest sees the freeze duration as instant. The two reads
+//! bracket a 3s hold; a regression that
 //! corrupts the save/restore polarity surfaces as T1 < T0; a
 //! regression that injects extra time surfaces as T1 - T0 >> 30s.
 //!
@@ -85,13 +87,15 @@ const TAG_T1: &str = "clock_t1";
     post_vm = assert_clock_advance,
 )]
 fn kvm_clock_freeze_clock_advance(ctx: &Ctx) -> Result<AssertResult> {
-    // Oversubscribe vCPUs 4:1 with spinners so the scheduler MUST
-    // round-robin dispatch on every CPU — each context switch
-    // calls `update_rq_clock()`, which is what advances rq.clock.
-    // A single spinner per CPU stays running but rarely triggers a
-    // dispatch, so rq.clock advances only when scx-ktstr's tick
-    // observation fires (rare). Oversubscription forces continuous
-    // dispatch.
+    // Oversubscribe vCPUs 4:1 with yield-heavy workers so the
+    // scheduler MUST round-robin dispatch on every CPU — each
+    // context switch calls `update_rq_clock()`, which is what
+    // advances rq.clock. YieldHeavy workers sched_yield every
+    // iteration; 4:1 oversubscription keeps every CPU's runqueue
+    // continuously non-empty so each yield forces a context switch
+    // (each calling update_rq_clock), driving steady rq.clock
+    // advance rather than relying on sparse scx-ktstr tick
+    // observation.
     let total_cpus = ctx.topo.total_cpus();
     let config = WorkloadConfig {
         num_workers: total_cpus * 4,

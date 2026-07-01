@@ -18,9 +18,9 @@
 //!    construction options.
 //!
 //! 2. Runtime-allocated `&'static str` values work in the field,
-//!    not just compile-time string literals — confirming the
-//!    `Box::leak` pattern (the only way to construct a `'static`
-//!    string from a runtime path) round-trips correctly. This is
+//!    not just compile-time string literals — confirming the leak
+//!    pattern (`Box::leak` here; `String::leak` / `Vec::leak` are
+//!    equivalent) round-trips correctly. This is
 //!    the realistic shape for any test author who needs to compute
 //!    a fixture path at runtime rather than hard-code it.
 

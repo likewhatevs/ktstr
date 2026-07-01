@@ -81,9 +81,15 @@ const BPF_BTF_GET_FD_BY_ID: u32 = 0x13;
 /// `BPF_OBJ_NAME_LEN` from `include/uapi/linux/bpf.h`.
 const BPF_OBJ_NAME_LEN: usize = 16;
 
-/// 4 KiB — page size for arena mmap. Matches `arena.c`'s
-/// `PAGE_SIZE` (the kernel arena allocator works at 4 KiB granularity
-/// regardless of host THP/hugetlb config).
+/// Page size for arena mmap. `arena.c` operates at the host kernel's
+/// base `PAGE_SIZE` (`arena_map_alloc` computes
+/// `vm_range = max_entries * PAGE_SIZE`; `arena_vm_fault` uses
+/// `apply_to_page_range`/`flush_vmap_cache` at `PAGE_SIZE` stride).
+/// That is arch-dependent: 4 KiB on x86_64, 16 KiB/64 KiB on aarch64
+/// (base granule, distinct from THP/hugetlb). This hardcoded 4096 is
+/// only correct on 4K-granule hosts; the guest-memory backend instead
+/// parameterizes page size at runtime via `guest_page_size(tcr_el1)`
+/// (`src/monitor/arena.rs`).
 const ARENA_PAGE_SIZE: usize = 4096;
 
 /// Maximum total bytes the arena snapshot reads via mmap, mirroring the
@@ -91,10 +97,13 @@ const ARENA_PAGE_SIZE: usize = 4096;
 /// `max_entries` from inducing a multi-GiB read.
 const MAX_ARENA_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Maximum number of arena pages enumerated sequentially before the
-/// walker switches to a stride-probe sweep. Mirrors the
-/// `MAX_ARENA_PAGES` cap on the guest-memory side so both backends
-/// produce comparable snapshot extents.
+/// Maximum number of arena pages the mmap span covers. Pages beyond
+/// this cap are truncated (surfaced via [`ArenaSnapshot::truncated`]),
+/// not stride-probed — mmap already covers the whole window, so this
+/// backend has no stride sweep. The guest-memory backend uses a
+/// separate sequential cap (`MAX_ARENA_PAGES = 4096` in
+/// `src/monitor/arena.rs`) plus a stride-probe sweep for pages past
+/// that cap; the two constants differ.
 const MAX_ARENA_PAGES: u64 = 16 * 1024;
 
 // `bpf_attr` is a uapi union with many command-specific shapes. Rather
@@ -568,7 +577,7 @@ impl BpfMapAccessor for BpfSyscallAccessor {
         // `bpf_struct_ops_map_lookup_elem` returns -EINVAL
         // (`kernel/bpf/bpf_struct_ops.c:518`), but the syscall path
         // `bpf_struct_ops_map_sys_lookup_elem`
-        // (`kernel/bpf/bpf_struct_ops.c::struct_ops_map_sys_lookup_elem`)
+        // (`kernel/bpf/bpf_struct_ops.c::bpf_struct_ops_map_sys_lookup_elem`)
         // implements its own lookup, copying the kernel's
         // `bpf_struct_ops_value` (refcnt + state + the registered
         // kernel struct) into the userspace buffer. The kernel-only
@@ -803,9 +812,11 @@ impl BpfMapAccessor for BpfSyscallAccessor {
         let key_sz = map.key_size as usize;
         let val_sz = map.value_size as usize;
         // Kernel returns nr_cpus * round_up_8(value_size) bytes per
-        // lookup (`bpf_percpu_hash_copy` -> `pcpu_copy_value`); same
-        // 8-byte stride as PERCPU_ARRAY. The buffer must be sized to
-        // the full stride or the kernel writes past it.
+        // lookup (`bpf_percpu_hash_copy` copies each CPU slot via
+        // `copy_map_value_long` at a `round_up(value_size, 8)`
+        // stride); same 8-byte stride as PERCPU_ARRAY. The buffer
+        // must be sized to the full stride or the kernel writes past
+        // it.
         let stride = (val_sz + 7) & !7;
         let buf_total = (num_cpus as usize).saturating_mul(stride);
         let mut out: super::bpf_map::PerCpuHashEntries = Vec::new();
@@ -918,14 +929,13 @@ impl BpfMapAccessor for BpfSyscallAccessor {
             };
         }
 
-        // mmap the arena fd at offset 0 over the declared span. The
-        // kernel's arena_vm_fault populates pages on first access;
-        // unmapped pgoffs return SIGBUS — we use MAP_POPULATE so the
-        // kernel walks every present page eagerly (without
-        // allocating new ones). Sparse pgoffs that have never been
-        // touched by the BPF program raise SIGBUS on first read —
-        // we install a sigbus handler that longjmps out, marking
-        // those pages as unmapped.
+        // mmap the arena fd at offset 0 over the declared span with
+        // PROT_READ + MAP_SHARED. This only reserves the window; the
+        // kernel's arena_vm_fault populates pages on demand. Pages
+        // whose pgoff was never touched by the BPF program are not
+        // resident, so instead of reading them (and risking a fault)
+        // we use mincore() below to filter to the resident set and
+        // read only those.
         //
         // Capping the mmap span at MAX_ARENA_PAGES * 4 KiB matches
         // the sequential-prefix cap on the guest-memory side; the
@@ -966,12 +976,9 @@ impl BpfMapAccessor for BpfSyscallAccessor {
         }
 
         let mut pages: Vec<ArenaPage> = Vec::new();
-        // Read every page out of the mmap. Pages whose pgoff was
-        // never populated by the BPF program will raise SIGBUS;
-        // install a sigaction with a setjmp longjmp to recover.
-        // We do NOT install the handler here — instead we use
-        // mincore() to filter out pages that aren't present, then
-        // read only the present ones. mincore returns 0 for
+        // Read the resident pages out of the mmap. We use mincore()
+        // to filter out pages that aren't present, then read only the
+        // present ones. mincore returns 0 for
         // resident pages, < 0 on error.
         let mut residency = vec![0u8; walk_pages as usize];
         let mincore_ret = unsafe { libc::mincore(addr, walk_bytes, residency.as_mut_ptr()) };

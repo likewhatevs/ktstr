@@ -34,7 +34,7 @@ pub const ENQ_CLEAR_OPSS: u64 = 1 << 56;
 pub const ENQ_DSQ_PRIQ: u64 = 1 << 57;
 pub const ENQ_NESTED: u64 = 1 << 58;
 
-/// All known enqueue flags with their names.
+/// Enqueue flags ktstr decodes, with their names.
 pub const ENQ_FLAG_NAMES: &[(u64, &str)] = &[
     (ENQ_WAKEUP, "WAKEUP"),
     (ENQ_HEAD, "HEAD"),
@@ -60,7 +60,7 @@ pub const EXIT_ERROR: u64 = 1024;
 pub const EXIT_ERROR_BPF: u64 = 1025;
 pub const EXIT_ERROR_STALL: u64 = 1026;
 
-/// All known exit kinds with their names.
+/// Exit kinds ktstr decodes, with their names.
 pub const EXIT_KIND_NAMES: &[(u64, &str)] = &[
     (EXIT_NONE, "NONE"),
     (EXIT_DONE, "DONE"),
@@ -98,7 +98,7 @@ pub const OPS_DISPATCHING: u64 = 3;
 pub const TASK_QUEUED: u64 = 1 << 0;
 pub const TASK_RESET_RUNNABLE_AT: u64 = 1 << 2;
 pub const TASK_DEQD_FOR_SLEEP: u64 = 1 << 3;
-// State bits [8:9]
+// State bits [10:8]
 pub const TASK_STATE_SHIFT: u32 = 8;
 pub const TASK_STATE_MASK: u64 = 3;
 pub const TASK_STATE_INIT: u64 = 1;

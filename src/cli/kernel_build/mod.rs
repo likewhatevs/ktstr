@@ -9,9 +9,11 @@
 //!   [`append_extra_kconfig_suffix`]), pre/post warning passes
 //!   over user fragments, and the post-build critical-options
 //!   check ([`validate_kernel_config`]).
-//! - `build` — top-level orchestrator ([`kernel_build_pipeline`])
-//!   and its two-phase reservation acquisition
-//!   (`acquire_build_reservation`, `acquire_source_tree_lock`).
+//! - `build` — top-level orchestrator ([`kernel_build_pipeline`]),
+//!   its two-phase reservation acquisition
+//!   (`acquire_build_reservation`: LLC flock + cgroup sandbox), and
+//!   the source-tree flock helper (`acquire_source_tree_lock`) that
+//!   serializes parallel builds against the same on-disk source tree.
 
 mod build;
 mod kconfig;

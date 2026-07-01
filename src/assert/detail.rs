@@ -87,7 +87,7 @@ pub enum DetailKind {
     SchedulerEvent,
     /// Temporal assertion failure on a periodic-capture
     /// [`SampleSeries`](crate::scenario::sample::SampleSeries).
-    /// One of the six built-in patterns
+    /// One of the seven built-in patterns
     /// (`nondecreasing` / `strictly_increasing`, `rate_within`,
     /// `steady_within`, `converges_to`, `always_true`,
     /// `ratio_within`) or a per-sample scalar comparator
@@ -505,7 +505,7 @@ pub const COMPARATOR_VOCABULARY: &[&str] = &[
 /// existing test (typical test fires <100 claims; pathological hot-
 /// loop tests in the tree fire under 5_000) while bounding the
 /// worst-case wire size to ~3 MB — well under the 16 MiB
-/// `MAX_BULK_FRAME_PAYLOAD` per vmm/bulk.rs:53.
+/// `MAX_BULK_FRAME_PAYLOAD` per vmm/bulk.rs:56.
 pub const MAX_RECORDED_PASSES: usize = 10_000;
 
 /// Sentinel `PassDetail.name` value used by the truncation record
@@ -833,8 +833,10 @@ impl From<&str> for NoteValue {
 ///
 /// Any change to the variant order or list MUST be accompanied
 /// by an update to `tests_assert.rs::outcome_serde_externally_tagged_*`
-/// (which pins both the JSON shape and the postcard byte
-/// sequence) so a silent-shift regression trips at test time.
+/// (which pins the JSON shape and the postcard roundtrip) and
+/// `tests_assert.rs::outcome_postcard_variant_index_byte_sentinel`
+/// (which pins the leading variant-index byte) so a silent-shift
+/// regression trips at test time.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Outcome {
     // Wire-format-stable: variant indices encode into postcard

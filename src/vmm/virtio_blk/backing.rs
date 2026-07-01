@@ -71,9 +71,10 @@ pub(crate) trait Backing: Send {
     /// Vectored positional write — `pwritev(2)`. Returns bytes
     /// written; may be short (`0 < n < total`) on ENOSPC mid-write or
     /// a signal-interrupted partial. The write retry loop in
-    /// `handle_write_vectored_impl` advances the iovecs past `n` and
-    /// re-issues until the full request lands, treating only `Ok(0)`
-    /// (zero forward progress) or `Err` as a genuine failure.
+    /// `handle_write_vectored_impl` advances the iovecs past `n` on a
+    /// short positive return and re-issues on `Err(Interrupted)`
+    /// (bounded by `MAX_EINTR_RETRIES`), treating only `Ok(0)` (zero
+    /// forward progress) or a non-interrupt `Err` as a genuine failure.
     ///
     /// # Safety
     /// As [`Backing::preadv`].

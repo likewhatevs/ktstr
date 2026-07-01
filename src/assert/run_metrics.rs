@@ -577,7 +577,8 @@ pub fn populate_run_ext_metrics_from_phases(
             continue;
         };
         // Derived metrics (every `is_derived()`: Rate / Distribution / WorstLowest /
-        // WakeLatencyTailRatio / WorstCrossNodeRatio / PerPhase) are produced
+        // WakeLatencyTailRatio / WorstCrossNodeRatio / PerPhase / PerRunDistribution)
+        // are produced
         // from their pooled components, not folded as per-phase values: skip
         // here. A Rate re-derives after the loop (Σnum/Σdenom over the folded
         // components); the distributional kinds (Distribution / WorstLowest /

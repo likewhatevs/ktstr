@@ -84,7 +84,7 @@ pub(crate) fn decorate_path_label_for_dirty(base_label: &str, is_dirty: bool) ->
 ///   PREFIX is the source tag, with `{discriminator}` being the
 ///   git short_hash of the source tree (or the literal `unknown`
 ///   when the tree is not a git repo, see
-///   `crate::fetch::local_source`). Label is `local_{hash6}`,
+///   `ktstr::fetch::local_source`). Label is `local_{hash6}`,
 ///   where `{hash6}` is the 6-char prefix of the discriminator —
 ///   collapsing every local entry to bare `"local"` would erase
 ///   distinct local trees from the operator-visible label and
@@ -221,8 +221,8 @@ pub(crate) fn encode_kernel_list(resolved: &[(String, PathBuf)]) -> Result<Strin
     // into garbage.
     //
     // Producers feeding this helper today (the encoder family
-    // around `path_kernel_label` / `git_kernel_label` /
-    // `version_kernel_label`) never emit either character in
+    // around `path_kernel_label` / `git_kernel_label` / the inline
+    // `v.clone()` version label) never emit either character in
     // practice — basenames are `[a-zA-Z0-9._-]+`, version
     // strings have `[0-9.-]`, and git labels are
     // `git_{owner}_{repo}_{ref}` with hash-stripped refs. The
@@ -403,10 +403,11 @@ pub(crate) fn dedupe_resolved(resolved: Vec<(String, PathBuf)>) -> Vec<(String, 
 
 /// Detect two distinct producer-side labels that normalize to the
 /// same nextest identifier via [`ktstr::test_support::sanitize_kernel_label`].
-/// A collision would shatter two cache directories under one test-
-/// name suffix, so the dispatch-side label-to-dir map in
-/// `parse_kernel_list` would silently retain only the last entry
-/// and every prior collision would route to the wrong kernel.
+/// A collision would make two distinct kernels share one sanitized
+/// suffix, so the downstream first-match lookup on the dispatch side
+/// (`kernel_list.iter().find(|k| k.sanitized.as_str() == kernel_label)`)
+/// would silently route every colliding label to the FIRST matching
+/// entry, misrouting the others.
 ///
 /// On collision: returns `Err(message)` naming both labels and the
 /// shared sanitized form so the operator can disambiguate the

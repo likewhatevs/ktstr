@@ -1,4 +1,4 @@
-//! Probe output decoders: DSQ IDs, cpumasks, enq/kick/exit/ops flags, and named-value formatting.
+//! Probe output decoders: DSQ IDs, cpumasks, enq/kick flags, exit/ops states, and named-value formatting.
 
 use super::scx_defs::*;
 

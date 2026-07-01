@@ -377,11 +377,13 @@ fn pcomm_zero_workers_no_container_spawn() {
 /// PID via the same SIGKILL+waitpid pattern the SpawnGuard /
 /// WorkloadHandle Drop already use for fork children.
 ///
-/// `start()` is called explicitly before drop so the worker
-/// threads have begun executing and produced observable Tgid
-/// state via `worker_pids()`. The brief sleep gives the
-/// per-thread Release publish time to land before the Acquire
-/// load in `worker_pids()`.
+/// `start()` is called explicitly before drop so the container
+/// observes its start-byte handshake and spawns its worker
+/// threads, making the forked leader a live, reapable process
+/// before drop. The brief sleep gives the container time to
+/// reach that point. `worker_pids()` here returns the container
+/// leader pid from the plain `children` pid field (no atomic
+/// load), so it does not depend on any per-thread tid publish.
 #[test]
 fn pcomm_handle_drop_reaps_container() {
     let works = vec![pcomm_spec(2, "dropme")];
@@ -400,10 +402,12 @@ fn pcomm_handle_drop_reaps_container() {
         "first worker pid must be published post-start; got {first_pid}",
     );
     // Leader PID. Under spawn_pcomm_cgroup the handle's children
-    // entry holds the leader's pid directly (the parent never
-    // observes the per-thread tids), so worker_pids()[0] IS the
-    // leader pid. Verify by reading /proc/<pid>/status: a
-    // single-thread tgid leader has Tgid == its own pid.
+    // entry holds the forked leader's pid directly (pushed by
+    // spawn_pcomm_container as ForkedChild.pid), and worker_pids()
+    // yields the children pids before any thread tids, so
+    // worker_pids()[0] IS the container leader pid. The leader is
+    // the thread-group leader of its inner worker threads; the
+    // parent never observes those per-thread tids.
     let leader_pid = first_pid;
     drop(h);
     // After drop the leader must be dead. kill(pid, 0) returns

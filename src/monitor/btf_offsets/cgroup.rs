@@ -43,8 +43,10 @@ use super::{find_struct, member_byte_offset};
 /// BTF-resolved byte offsets for the cgroup-hierarchy walk that locates a
 /// cgroup's `struct psi_group`. Resolved once at monitor-thread setup;
 /// `Err` only when a required struct/field is absent (a kernel without
-/// `CONFIG_CGROUPS`, without `CONFIG_PSI` → no `cgroup.psi` field, or a
-/// stripped vmlinux), in which case the per-cgroup axis reads loud-absent.
+/// `CONFIG_CGROUPS`, or a stripped vmlinux), in which case the per-cgroup
+/// axis reads loud-absent. `cgroup.psi` is an unconditional pointer member
+/// (always BTF-resolvable); it reads NULL at runtime, not `Err`, when
+/// per-cgroup PSI is off.
 #[derive(Debug, Clone, Copy)]
 pub struct CgroupWalkOffsets {
     /// `offsetof(struct cgroup, self)` — the embedded `cgroup_subsys_state`.
@@ -59,8 +61,11 @@ pub struct CgroupWalkOffsets {
     /// `offsetof(struct cgroup, psi)` — the `struct psi_group *` POINTER.
     /// Reading it yields the per-cgroup psi_group KVA, or 0/NULL when
     /// `psi_cgroups_enabled` is off (loud-absent: that cgroup contributes no
-    /// per-cgroup PSI sample). Resolving this field at all gates on
-    /// `CONFIG_PSI` (the field is absent from BTF when PSI is off → `Err`).
+    /// per-cgroup PSI sample). The `psi` member is an unconditional pointer
+    /// field of `struct cgroup` (not `#ifdef`-guarded), so BTF always emits it
+    /// and this offset always resolves; under `CONFIG_PSI=n` only the pointee
+    /// `struct psi_group` degrades to empty and the pointer reads NULL at
+    /// runtime (loud-absent), not `Err`.
     pub cgroup_psi: usize,
     /// `offsetof(struct cgroup_subsys_state, sibling)` — the `list_head`
     /// linking a css into its parent's `children` list. A child cgroup is
@@ -94,8 +99,9 @@ pub struct CgroupWalkOffsets {
 
 impl CgroupWalkOffsets {
     /// Resolve the cgroup-walk offsets from a pre-loaded BTF object. `Err`
-    /// when any required struct/field is absent (no `CONFIG_CGROUPS`, no
-    /// `CONFIG_PSI` so `struct cgroup` lacks `psi`, or a stripped vmlinux) —
+    /// when any required struct/field is absent (no `CONFIG_CGROUPS`, or a
+    /// stripped vmlinux; `cgroup.psi` is an unconditional pointer member that
+    /// always resolves, reading NULL at runtime when per-cgroup PSI is off) —
     /// the freeze coordinator `.ok()`s it, so absence disables the per-cgroup
     /// capture (loud-absent), mirroring [`super::PsiGroupOffsets::from_btf`].
     pub fn from_btf(btf: &Btf) -> Result<Self> {

@@ -214,7 +214,7 @@ pub fn format_entry_row(
 ///   consumers must check this field before trusting `eol`.
 /// - `entries`: heterogeneous array; each element is either a valid
 ///   entry (object with the full field set) or a corrupt entry
-///   (object with only `key`, `path`, and `error`). Corrupt entries
+///   (object with `key`, `path`, `error`, and `error_kind`). Corrupt entries
 ///   have a structurally different shape — consumers should detect the
 ///   `"error"` key and branch.
 ///
@@ -987,8 +987,9 @@ mod tests {
         assert_eq!(keys, vec!["c_mid"]);
     }
 
-    /// Bucket-by-version retention: keep=1 with 4 entries split
-    /// across two versions retains the newest from EACH version.
+    /// Constructs a single `ListedEntry::Valid` with the given key,
+    /// version, and extra-kconfig-hash (no ktstr-kconfig-hash), by
+    /// delegating to `mk_valid_bucketed_full`.
     fn mk_valid_bucketed(
         key: &str,
         version: Option<&str>,

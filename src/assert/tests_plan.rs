@@ -166,8 +166,8 @@ fn plan_default_all_checks_disabled() {
 
 #[test]
 fn assert_plan_default_equals_new() {
-    // Default impl calls new(). Check field-by-field equivalence
-    // and that both produce identical assert_cgroup results.
+    // new() calls the derived Default::default(). Check field-by-field
+    // equivalence and that both produce identical assert_cgroup results.
     let d = AssertPlan::default();
     let n = AssertPlan::new();
     assert_eq!(d.not_starved, n.not_starved);

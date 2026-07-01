@@ -1,6 +1,6 @@
 //! schbench's per-CPU lock stressor, ported faithfully from `schbench.c`
 //! (`struct per_cpu_lock` :93, `lock_this_cpu` :1340, the init loop :1882, the
-//! `pthread_mutex_unlock` in `do_work` :1411). Each CPU gets a
+//! `pthread_mutex_unlock` in `do_work` :1412). Each CPU gets a
 //! `pthread_mutex_t`; a worker locks the mutex for the CPU it is currently
 //! running on, holds it across its matrix work, then unlocks. Under
 //! lock-holder preemption, other workers that land on that CPU spin on its
@@ -117,7 +117,7 @@ impl PerCpuLocks {
     /// The returned [`PerCpuLockGuard`]'s scope is the critical section,
     /// matching schbench's `lock = lock_this_cpu(); ...;
     /// pthread_mutex_unlock(lock)` bracket in `do_work` (`schbench.c:1387`,
-    /// `:1411`). Per the module-level fidelity note, the per-CPU association
+    /// `:1412`). Per the module-level fidelity note, the per-CPU association
     /// holds only at the moment of acquire.
     pub(crate) fn lock_this_cpu(&self) -> PerCpuLockGuard<'_> {
         loop {
@@ -187,7 +187,7 @@ impl Drop for PerCpuLockGuard<'_> {
         // `self.lock`, so this thread holds it; the mutex is stably located in
         // the parent `PerCpuLocks`, which outlives the guard ('a). Faithful to
         // schbench's `pthread_mutex_unlock(lock)` at the end of `do_work`
-        // (`schbench.c:1411`).
+        // (`schbench.c:1412`).
         unsafe { libc::pthread_mutex_unlock(self.lock) };
     }
 }

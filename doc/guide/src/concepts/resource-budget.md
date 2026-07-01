@@ -19,8 +19,10 @@ the allowed-CPU set** (minimum 1 CPU; `default_cpu_budget`).
 No-perf-mode VMs instead size to `max(30%, min(vcpus, allowed))`
 (`no_perf_cpu_budget`) so a wide VM's vCPU threads are not
 host-oversubscribed by a 30% mask. A per-test `cpu_budget` knob
-(`#[ktstr_test]`) overrides the auto-size, clamped to `[1, allowed]`;
-an explicit `--cpu-cap` / `KTSTR_CPU_CAP` still wins outright. The
+(`#[ktstr_test]`) overrides the auto-size, floored at 1; a value above
+`allowed` is a hard error (`CpuBudgetUnsatisfiable`), not silently
+clamped down. An explicit `--cpu-cap` / `KTSTR_CPU_CAP` still wins
+outright. The
 30% floor keeps `sched_setaffinity` safe under cgroup-restricted CI
 runners (CI hosts, systemd slices, sudo-under-a-limited-cpuset) where
 the process cannot run on every online CPU even if sysfs lists them.
@@ -90,7 +92,7 @@ diagnostic.
 `acquire_llc_plan(topo, test_topo, cpu_cap)` runs three phases:
 
 1. **DISCOVER** — for every LLC, stat the canonical
-   `/tmp/ktstr-llc-{N}.lock`, read `/proc/locks` once, and build a
+   `{KTSTR_LOCK_DIR or /tmp}/ktstr-llc-{N}.lock`, read `/proc/locks` once, and build a
    snapshot of holders per LLC. No flocks are taken.
 2. **PLAN** — rank LLCs (eligible = at least one allowed CPU):
    consolidation (prefer LLCs with existing holders) first, then

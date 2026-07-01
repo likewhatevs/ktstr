@@ -86,10 +86,11 @@ fn spawn_with_composed_rejects_none_num_workers() {
         "diagnostic must name the failure cause; got: {msg}",
     );
 }
-/// Composed [`WorkSpec::affinity`] resolution: only `Inherit`
-/// and `Exact` are reachable from spawn() — topology-aware
-/// variants need scenario-level state (TestTopology, cpuset)
-/// that bare `spawn()` does not have.
+/// Composed [`WorkSpec::affinity`] resolution: only `Inherit`,
+/// `Exact`, and `RandomSubset` are reachable from spawn() — the
+/// topology-aware variants (`SingleCpu`, `LlcAligned`,
+/// `CrossCgroup`, `SmtSiblingPair`) need scenario-level state
+/// (TestTopology, cpuset) that bare `spawn()` does not have.
 #[test]
 fn spawn_with_composed_rejects_topology_affinity() {
     let config = WorkloadConfig::default()
@@ -280,7 +281,7 @@ fn affinity_intent_random_subset_serde_roundtrip() {
 }
 /// Serde JSON roundtrip for `AffinityIntent::RandomSubset`
 /// embedded in `WorkloadConfig`. Mirrors the table-driven serde
-/// pattern used for `WorkType` (#307): asserts the pool's CPU set
+/// pattern used for `WorkType`: asserts the pool's CPU set
 /// and `count` field survive serialize → JSON → deserialize.
 /// Empty-pool / zero-count cases are excluded — those are
 /// rejected at the spawn-time gate (see

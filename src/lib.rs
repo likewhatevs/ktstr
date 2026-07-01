@@ -715,9 +715,12 @@ pub use ktstr_macros::ktstr_test;
 /// Grouped into a single hidden module so that `use ktstr::*;` pulls
 /// in one module name instead of two leading-underscore items.
 /// Consumers of `#[ktstr_test]` should not reference anything under
-/// this path — the macro expansion names these crates via
-/// `::ktstr::__private::ctor` / `serde_json` and the set may change
-/// without notice. (`linkme` lives at the public crate root —
+/// this path — the `#[ktstr_test]` macro registers via
+/// `::ktstr::distributed_slice` / `::ktstr::linkme`; the `ctor` /
+/// `serde_json` re-exports here serve downstream test-author code
+/// (pre-`main()` setup and sidecar parsing) and ktstr's own
+/// declarative-ctor sites, and the set may change without notice.
+/// (`linkme` lives at the public crate root —
 /// [`ktstr::linkme`](crate::linkme) — since the macro now emits the
 /// public path.)
 #[doc(hidden)]
@@ -1476,7 +1479,7 @@ pub const KTSTR_JEMALLOC_ALLOC_WORKER_BINARY_ENV: &str = "KTSTR_JEMALLOC_ALLOC_W
 /// Name of the environment variable that opts into per-assertion
 /// PASS logging in the verdict pipeline. Read once per call at
 /// [`crate::assert::claim::Verdict::new`] via the
-/// `log_passes_default` helper at src/assert/claim.rs L45-50:
+/// `log_passes_default` helper in src/assert/claim.rs:
 /// the reader is `!(v.is_empty() || v == "0")`, so empty and
 /// the literal `"0"` disable; any other value (`"1"`, `"true"`,
 /// `"yes"`, even `"false"` because it isn't `"0"`) enables.

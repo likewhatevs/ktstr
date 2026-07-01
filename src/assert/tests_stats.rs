@@ -334,8 +334,8 @@ fn wire_format_omits_derived_ratio_keys() {
 ///   should be finite (not produce NaN/Inf) even under
 ///   degenerate inputs. Since `total_iterations` is `u64`, the
 ///   non-finite-input path applies only when `num_workers == 0`
-///   (guard branch returns 0.0) — tested via the existing
-///   `workers-zero-guard` fixture; this test adds a positive-
+///   (guard branch returns `None`) — covered by
+///   `derived_ratio_methods_compute_tail_and_throughput`; this test adds a positive-
 ///   workers-with-max-u64 check to pin that the cast math
 ///   doesn't silently overflow a giant iteration count.
 #[test]

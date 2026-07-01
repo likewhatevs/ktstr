@@ -21,7 +21,7 @@ fn scenario_with_checks(ctx: &Ctx, checks: &Assert) -> Result<AssertResult> {
 // KtstrTestEntry registered in KTSTR_TESTS.
 //
 // perf: performance_mode value (true/false)
-// negative: when true, passes --degrade, expects failure, uses 4 workers
+// negative: when true, passes --degrade and expects failure
 
 macro_rules! gate_test {
     ($name:ident, perf: $perf:expr, negative: $neg:expr, $checks:expr) => {

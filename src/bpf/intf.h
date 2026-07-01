@@ -112,9 +112,10 @@ enum event_type {
  */
 #define TL_EVT_PI_BOOST 4
 /* Lock contention begin event from `lock:contention_begin`
- * tracepoint (always available, no `CONFIG_LOCK_STAT` gate —
- * kernel/locking/lockdep.c emits it unconditionally on any
- * waiter-side contention path). Fires whenever a task waits on
+ * tracepoint (always available, no `CONFIG_LOCK_STAT` gate — the
+ * lock primitives under kernel/locking/ (mutex.c, rwsem.c,
+ * qspinlock.c, rtmutex.c, etc.) emit it on any waiter-side
+ * contention path; lockdep.c is NOT an emit site). Fires whenever a task waits on
  * a contended mutex / rwsem / spinlock; gives the host-side
  * timeline a per-lock contention sequence to correlate with
  * scheduling stalls.
@@ -145,11 +146,12 @@ enum event_type {
  *     prev_pid       = `p->pid`
  *     next_pid       = 0 (unused)
  *     a              = `dest_cpu`
- *     b              = `task_cpu(p)` (orig_cpu, BTF-read)
+ *     b              = `wake_cpu` (orig_cpu at migrate, BTF-read — the
+ *                      code reads `wake_cpu`, not `task_cpu(p)`)
  *   TL_EVT_WAKEUP:
  *     prev_pid       = `p->pid`
  *     next_pid       = 0 (unused)
- *     a              = `task_cpu(p)` (target CPU at wakeup)
+ *     a              = `wake_cpu` (target CPU at wakeup)
  *     b              = 0 (unused)
  *
  * `cpu` is the host CPU the tracepoint fired on (`bpf_get_smp_processor_id()`).

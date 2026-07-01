@@ -1,5 +1,5 @@
 //! `declare_scheduler!` implementation: parses the scheduler-definition
-//! DSL into a `Scheduler` const, validating kernel/binary sources,
+//! DSL into a `Scheduler` static, validating kernel/binary sources,
 //! const-eligibility, and topology constraints. The
 //! `#[proc_macro] declare_scheduler` entry point lives in `lib.rs` (Rust
 //! requires proc-macro fns at the crate root); this module holds the

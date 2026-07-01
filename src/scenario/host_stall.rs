@@ -92,8 +92,8 @@ pub const STALL_WINDOW: usize = 4;
 
 /// Snapshot of the two scheduler counters this monitor watches.
 ///
-/// Mirrors what `kernel/sched/debug.c::print_task` writes to
-/// `/proc/<pid>/sched`. Both fields are cumulative since task
+/// Mirrors what `kernel/sched/debug.c::proc_sched_show_task`
+/// writes to `/proc/<pid>/sched`. Both fields are cumulative since task
 /// creation; the monitor tracks deltas between consecutive
 /// samples rather than absolute values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -130,7 +130,7 @@ pub struct SchedSample {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StallDiagnostic {
     /// `/proc/<pid>/wchan` — kernel symbol the task is sleeping
-    /// in, or empty when the task is runnable.
+    /// in, or `0` when the task is runnable / wchan is unresolvable.
     pub wchan: String,
     /// `/proc/<pid>/syscall` — first field is the syscall number
     /// the task is blocked in (or `running` when on-CPU).
@@ -444,8 +444,8 @@ pub fn stall_predicate(samples: &[SchedSample]) -> bool {
 
 /// Parse `/proc/<pid>/sched` content into a [`SchedSample`].
 ///
-/// The kernel format (per `kernel/sched/debug.c::print_task` and
-/// `proc_sched_show_task`) is:
+/// The kernel format (per `kernel/sched/debug.c::proc_sched_show_task`)
+/// is:
 ///
 /// ```text
 /// <comm> (<pid>, #threads: N)
@@ -455,7 +455,7 @@ pub fn stall_predicate(samples: &[SchedSample]) -> bool {
 /// nr_switches                    :              42
 /// nr_voluntary_switches          :              30
 /// ...
-/// sum_exec_runtime               :     1234567.89   (or integer ns on older kernels)
+/// se.sum_exec_runtime            :        1234.567890
 /// ...
 /// ```
 ///
@@ -463,11 +463,11 @@ pub fn stall_predicate(samples: &[SchedSample]) -> bool {
 /// `:`. The parser extracts the two named keys and ignores
 /// everything else; missing keys yield `None`.
 ///
-/// `sum_exec_runtime` is reported in nanoseconds by
-/// `kernel/sched/debug.c::print_one_lat` since 2008
-/// (`fec0b04e8b73`). Older kernels emit the same field as a
-/// fractional-seconds float; this parser handles both by accepting
-/// either an integer or a float and normalizing to nanoseconds.
+/// `se.sum_exec_runtime` is emitted as fractional milliseconds by
+/// `kernel/sched/debug.c::proc_sched_show_task` via the `PN` macro
+/// (`SPLIT_NS` divides the ns value by 1_000_000 and formats with 6
+/// decimal places). This parser reads it as an f64 in ms and
+/// multiplies by 1_000_000 to recover nanoseconds.
 pub fn parse_sched_file(content: &str) -> Option<(u64, u64)> {
     let mut nr_switches: Option<u64> = None;
     let mut sum_exec_runtime_ns: Option<u64> = None;

@@ -257,8 +257,8 @@ fn apply_nice_invokes_setpriority() {
 ///
 /// Reading via /proc rather than `getpriority` because the
 /// worker is in a child process; `getpriority(PRIO_PROCESS, pid)`
-/// would also work but /proc/stat field 19 is the canonical
-/// observation point used elsewhere in the crate's tests.
+/// would also work, but reading /proc/stat field 19 observes the
+/// child's nice cross-process without a getpriority syscall.
 #[test]
 fn worker_nice_applied_via_setpriority() {
     let config = WorkloadConfig {
@@ -479,12 +479,12 @@ fn stop_and_collect_sentinel_exits_for_sigusr1_ignoring_worker() {
     let _ = std::fs::remove_file(&ready_path);
     assert_eq!(reports.len(), 1);
     let r = &reports[0];
-    // Sentinel path: the worker never wrote JSON to the pipe
-    // (because it ignored SIGUSR1 + ran past the deadline), so
-    // the report is the zeroed sentinel shape. work_units = 0
-    // confirms the sentinel construction at stop_and_collect's
-    // `serde_json::from_slice` Err branch, not a worker-authored
-    // report leaking through.
+    // Sentinel path: the worker never wrote its postcard report
+    // to the pipe (because it ignored SIGUSR1 + ran past the
+    // deadline), so the report is the zeroed sentinel shape.
+    // work_units = 0 confirms the sentinel construction at
+    // stop_and_collect's `postcard::from_bytes` Err branch, not a
+    // worker-authored report leaking through.
     assert_eq!(
         r.work_units, 0,
         "sentinel sidecar must be zeroed; non-zero work_units means \

@@ -27,7 +27,7 @@
 //!    counter-shaped key/value map.
 //!
 //! All entry points are `pub(super)` — every consumer is the
-//! [`super::flatten_cgroup_stats`] orchestrator in mod.rs. Per-
+//! [`super::flatten_cgroup_stats`] orchestrator in compare.rs. Per-
 //! field policy rationale lives on the individual fns.
 
 use std::collections::BTreeMap;
@@ -48,8 +48,11 @@ pub(super) fn merge_cgroup_cpu(agg: &mut CgroupCpuStats, src: &CgroupCpuStats) {
     agg.max_quota_us = merge_max_option(agg.max_quota_us, src.max_quota_us);
     agg.max_period_us = agg.max_period_us.max(src.max_period_us);
     // `weight` and `weight_nice` are aliases of the same kernel
-    // knob (`kernel/sched/core.c::sched_weight_to_nice` /
-    // `nice_to_weight`). Apply the SAME merge policy to both —
+    // knob: `kernel/sched/core.c` reads both from the same
+    // `tg_weight(css_tg(css))` (`cpu_weight_read_u64` /
+    // `cpu_weight_nice_read_s64`), and `cpu_weight_nice_write_s64`
+    // maps nice to weight via the `sched_prio_to_weight[]` table
+    // (NICE_TO_PRIO / PRIO_TO_NICE). Apply the SAME merge policy to both —
     // asymmetric merging would render a `weight=10, weight_nice=None`
     // bucket as if its contributors disagreed when they cannot
     // (the kernel writes both atomically). Use `merge_max_option`
@@ -69,7 +72,7 @@ pub(super) fn merge_cgroup_cpu(agg: &mut CgroupCpuStats, src: &CgroupCpuStats) {
 /// Merge two [`CgroupMemoryStats`]. `current` is instantaneous
 /// RSS — `max` matches the existing memory_current policy.
 /// Limits (`max`, `high`) use max-for-limits, floors (`low`,
-/// `min`) use min-for-floors per Q4. `stat` is a heterogeneous
+/// `min`) use min-for-floors. `stat` is a heterogeneous
 /// map (counters + gauges) — see [`merge_memory_stat`] for the
 /// per-key policy. `events` is purely counter-shaped — sum
 /// per-key via [`merge_kv_counters`].
@@ -223,7 +226,7 @@ pub(super) fn merge_kv_counters(agg: &mut BTreeMap<String, u64>, src: &BTreeMap<
 /// regression detection. `total_usec` is cumulative microseconds
 /// of stall time, additive across the merged cgroups —
 /// `saturating_add` matches the existing `throttled_usec`
-/// flatten policy directly above.
+/// flatten policy in `merge_cgroup_cpu`.
 pub(super) fn merge_psi(a: Psi, b: Psi) -> Psi {
     Psi {
         cpu: merge_psi_resource(a.cpu, b.cpu),

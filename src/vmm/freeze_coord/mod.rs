@@ -831,7 +831,7 @@ pub(super) enum FreezeMode<'a> {
 /// - `retain_tag`: set by the late-trigger Degraded / Suppressed
 ///   arms when their tagged-sibling write fails, so the drain
 ///   lands the recovered file at the operator-correct path rather
-///   than the default NEVER_FIRED tag (per N8-2 / #72).
+///   than the default NEVER_FIRED tag.
 ///
 /// Excluded from the guard (verified to NOT need panic-safe
 /// preservation):
@@ -1113,7 +1113,8 @@ impl KtstrVm {
         // host owns the entire capture pipeline.
         // Allocate the accessor-init worker's publish-seqno + worker-
         // state atomics here so the snapshot bridge below adopts the
-        // same Arc the worker (spawned much later at L2237+) bumps on
+        // same Arc the worker (the `vmm-accessor-init` worker,
+        // spawned much later) bumps on
         // every successful publish / state transition. The dispatch
         // for `Op::ReplaceScheduler` / `Op::AttachScheduler` reads the
         // seqno via the thread-local bridge and waits for it to
@@ -2323,7 +2324,7 @@ impl KtstrVm {
         // existing slot value).
         let kern_virt_kaslr_for_bsp = kern_virt_kaslr.clone();
         // Clone the publish-EventFd for the BSP MSR_LSTAR-derive path
-        // (mirrors the KERN_ADDRS-side write at dispatch.rs:427) so
+        // (mirrors the KERN_ADDRS-side write at dispatch.rs:547) so
         // both publishers signal the same eventfd on successful CAS.
         // No production consumer epolls this fd today, but the
         // asymmetry would foot-gun a future change that does.
@@ -2340,11 +2341,11 @@ impl KtstrVm {
         let rendezvous_timeout = self.rendezvous_timeout.unwrap_or(FREEZE_RENDEZVOUS_TIMEOUT);
         // Cache vm.vm_fd's raw fd (Copy = i32) before the
         // freeze-coord spawn. The spawned closure is `move ||` —
-        // capturing vm directly would consume it and break L8888
+        // capturing vm directly would consume it and break L10885
         // construction of VmRunState. The raw fd is owned by
         // `vm.vm_fd` (in the outer scope) and stays valid for the
         // entire `run_vm` lifetime; coord-thread joins via
-        // `freeze_coord_handle.join()` at L8825 before vm drops.
+        // `freeze_coord_handle.join()` at L10832 before vm drops.
         // Used by the kvm_clock save/restore path inside
         // freeze_and_dispatch + thaw_and_barrier closures via
         // [`kvm_get_clock_via_raw_fd`] +
@@ -2363,7 +2364,7 @@ impl KtstrVm {
                 // we have a cr3_pa / page_offset / l5 view).
                 struct RunnableScanCtx {
                     /// KVA of the kernel's global `scx_tasks` LIST_HEAD
-                    /// (`kernel/sched/ext.c:47`). The walker reads
+                    /// (`kernel/sched/ext.c:48`). The walker reads
                     /// `scx_tasks.next` via the runtime kernel image
                     /// base ([`Self::start_kernel_map`]) and
                     /// container_of's each list entry back to its
@@ -2381,8 +2382,8 @@ impl KtstrVm {
                     offsets: crate::monitor::btf_offsets::RunnableScanOffsets,
                     jiffies_64_pa: u64,
                     /// PA of `scx_watchdog_timestamp`
-                    /// (`kernel/sched/ext.c:94`). The kernel's
-                    /// `scx_tick` (`kernel/sched/ext.c:3409`) compares
+                    /// (`kernel/sched/ext.c:93`). The kernel's
+                    /// `scx_tick` (`kernel/sched/ext.c:3492`) compares
                     /// `jiffies - scx_watchdog_timestamp` against the
                     /// scheduler's `watchdog_timeout` and fires
                     /// `SCX_EXIT_ERROR_STALL` when the workqueue
@@ -2767,7 +2768,7 @@ impl KtstrVm {
                                             // capture into the final scenario step (collapsing
                                             // the per-phase pipeline to one bucket). The KASLR
                                             // text offset still arrives via KERN_ADDRS for the
-                                            // kaslr publish gate (~L7751); only the map-accessor
+                                            // kaslr publish gate (~L8204); only the map-accessor
                                             // build is unblocked here. The host runs the guest
                                             // same-arch under KVM, so cfg!(target_arch) is the
                                             // guest arch. x86_64 keeps waiting for the real
@@ -4275,7 +4276,7 @@ impl KtstrVm {
                             // (cpu_time, prog_runtime_stats, scx)
                             // resolves to wrong KVAs and reads zero
                             // values from random pages. Sibling
-                            // `compute_rq_pas` at L4101-4127 uses
+                            // `compute_rq_pas` at L4827 uses
                             // `kernel.text_kva_to_pa` which threads
                             // the live `phys_base` from the accessor
                             // — same source-of-truth.
@@ -5703,13 +5704,15 @@ impl KtstrVm {
                                     + if worker_was_running { 1 } else { 0 };
                             let deadline = Instant::now() + rendezvous_timeout;
                             // Sub-deadline for the virtio-blk worker
-                            // ack. `device.rs::stop_worker_and_reclaim_state`
-                            // (and any sibling shutdown path) writes
-                            // `paused.store(false, Release)` BEFORE
+                            // ack. The `Drop` shutdown path
+                            // (`lifecycle.rs`) and its reset sibling
+                            // (`control.rs::stop_worker_and_reclaim_state`)
+                            // write `paused.store(false, Release)` BEFORE
                             // signalling stop_fd and joining the
-                            // worker — see lines around device.rs
-                            // 3561 (`self.paused.store(false,
-                            // Ordering::Release)` + `signal_worker_stop`).
+                            // worker — see `lifecycle.rs:427`
+                            // (`self.paused.store(false,
+                            // Ordering::Release)`) + `lifecycle.rs:436`
+                            // (`signal_worker_stop`).
                             // Between that store and the worker
                             // exiting (with no further `paused=true`
                             // store on the shutdown path), the
@@ -5727,7 +5730,7 @@ impl KtstrVm {
                             // cache (the same envelope
                             // `DROP_JOIN_TIMEOUT` (1 s) commits to
                             // for the worker join in
-                            // `device.rs`). If the worker hasn't
+                            // `lifecycle.rs`). If the worker hasn't
                             // parked within 1 s, it's likely
                             // mid-shutdown (signal_worker_stop
                             // pre-clears paused=false). Dropping
@@ -6068,7 +6071,7 @@ impl KtstrVm {
                                 // rather than Degraded — Capture-mode's
                                 // Degraded carries vcpu_regs +
                                 // DegradedFailureDumpReport which the
-                                // L6614 ColdOp caller cannot consume
+                                // L8119 ColdOp caller cannot consume
                                 // (it expects KernelOp). Build a typed
                                 // error reply naming the rendezvous
                                 // failure so the wire reply correlates
@@ -6234,7 +6237,7 @@ impl KtstrVm {
                             // the Capture-mode exit-kind gate + dump
                             // pipeline below. Returns
                             // FreezeOutcome::KernelOp(reply) directly so
-                            // the L6614 stub-replacement call site can
+                            // the L8119 stub-replacement call site can
                             // frame the wire reply without traversing the
                             // dump path. Capture mode falls through.
                             if let FreezeMode::ColdOp(req) = &mode {
@@ -6246,7 +6249,7 @@ impl KtstrVm {
                                         req,
                                     )
                                 } else {
-                                    // Caller at L6614 should gate on
+                                    // Caller at L8119 should gate on
                                     // owned_accessor.is_some() before
                                     // invoking; defensive error frame if
                                     // it slipped through unset. No panic
@@ -6841,11 +6844,11 @@ impl KtstrVm {
                                 // the cpu_time walker's prereqs are
                                 // strictly tied to BOTH of the partial-
                                 // path triggers (cf. cpu_time_capture
-                                // construction at L5923):
+                                // construction at L6615):
                                 //   - if we're here because
                                 //     `owned_accessor.is_none()`,
                                 //     `prog_per_cpu_offsets` is also None
-                                //     (its lazy-init at L3569 gates on
+                                //     (its lazy-init at L4229 gates on
                                 //     owned_accessor.is_some() so
                                 //     `phys_base` is the real KASLR
                                 //     displacement, not the bootstrap 0
@@ -6854,9 +6857,9 @@ impl KtstrVm {
                                 //     under KASLR-on guests).
                                 //   - if we're here because `dump_btf.is_none()`,
                                 //     `dump_cpu_time_offsets` (BTF-derived
-                                //     at L2580) is also None.
+                                //     at L2989) is also None.
                                 // Either way the cpu_time_capture 4-prereq
-                                // match at L5923 falls to `None` and the
+                                // match at L6615 falls to `None` and the
                                 // walker can't run. Hardcoded empty here
                                 // matches that result without re-walking
                                 // the prereqs at this site.
@@ -8038,7 +8041,7 @@ impl KtstrVm {
                             //     incomplete" from "publish complete
                             //     with offset 0".
                             // Same pattern as the WATCH-deferral at
-                            // L6864-6900; defer + drain when both
+                            // L7767; defer + drain when both
                             // prerequisites land.
                             tracing::info!(
                                 request_id = req.request_id,
@@ -8230,8 +8233,8 @@ impl KtstrVm {
                             // workload-start.
                             //
                             // Fallback: a scheduler that breaks the
-                            // bulk port (the sibling-reported
-                            // scx_mitosis cell-mode case where the
+                            // bulk port (the scx_mitosis cell-mode
+                            // case where the
                             // guest never gets to / completes
                             // send_scenario_start) leaves
                             // scenario_start_ns at 0 forever and the
@@ -8367,8 +8370,8 @@ impl KtstrVm {
                                 // loss class bug — the field is
                                 // populated but every counter is
                                 // 0). Same rationale as the ColdOp
-                                // gate at L7198 and the WATCH gate
-                                // at L7166: defer until the
+                                // gate at L8013 and the WATCH gate
+                                // at L7767: defer until the
                                 // publisher (BSP MSR_LSTAR on
                                 // x86_64 OR guest-channel KERN_ADDRS
                                 // on both arches) lands. Under
@@ -8382,10 +8385,10 @@ impl KtstrVm {
                                 //
                                 // `owned_accessor` is the second
                                 // half of the prereq set: the FULL
-                                // dump path at L5770 only enters
+                                // dump path at L6479 only enters
                                 // when the accessor is adopted;
                                 // otherwise the dump falls through
-                                // to the PARTIAL path at L6075
+                                // to the PARTIAL path at L6838
                                 // which hard-codes `per_cpu_time:
                                 // Vec::new()` and skips every other
                                 // walker output (maps, prog
@@ -8929,7 +8932,7 @@ impl KtstrVm {
                         // silent-mis-attribution this stamping was
                         // meant to prevent. Acquire pairs with the
                         // scenario writer's Release at
-                        // `src/scenario/ops/mod.rs:903`.
+                        // `src/scenario/ops/mod.rs:1194`.
                         let trip_phase_step_index =
                             freeze_coord_current_step.load(Ordering::Acquire);
                         // User watchpoint has no while-frozen work,
@@ -12511,7 +12514,9 @@ impl KtstrVm {
         // via `msr_kaslr::read_and_derive` on x86_64 between vCPU
         // run iterations; on success it CAS-publishes the
         // `(offset + 1)` here so the monitor + dump pipelines
-        // (`freeze_coord/mod.rs:9130` and `freeze_coord/mod.rs:5202`)
+        // (the dump-path `CpuTimeCapture` construction and the
+        // monitor's `RqRefresh` / `text_kva_to_pa_with_base` sites
+        // in `start_monitor`)
         // can resolve per-CPU `rq` / `kernel_cpustat` / `kstat`
         // KVAs under `CONFIG_RANDOMIZE_BASE=y`. The guest-channel
         // KERN_ADDRS path also CAS-publishes here (from the coord
@@ -12654,7 +12659,7 @@ impl KtstrVm {
             // MSR_LSTAR from the TD-emulated allow-list.
             // Fail-loud, not silent-garbage. The
             // `is_retryable()` / `LstarUnsupported` gate at
-            // msr_kaslr.rs:209-225 surfaces this as
+            // msr_kaslr.rs:243 surfaces this as
             // `LstarDeriveError`; the wait-loop falls through to
             // the guest-channel KERN_ADDRS `_text` publisher
             // (`dispatch.rs`) or the `nokaslr` cmdline arg
@@ -12677,7 +12682,7 @@ impl KtstrVm {
                     .is_ok()
             {
                 // Mirror the KERN_ADDRS-path evt fire at
-                // dispatch.rs:427 so any future epoll-on-publish
+                // dispatch.rs:547 so any future epoll-on-publish
                 // consumer (none today, but the eventfd is in
                 // the run-loop fdset and the asymmetry would
                 // foot-gun a future change). No-op on signal-fd
@@ -12891,7 +12896,7 @@ impl KtstrVm {
     /// favors skipping the walk entirely.
     ///
     /// Sibling to the inline check at `stats_client`
-    /// construction (~L1126) which uses `self.scheduler_binary.
+    /// construction (~L1386) which uses `self.scheduler_binary.
     /// is_some()` directly — both gates ask the same
     /// "is there a userspace BPF binary attached" question
     /// and share the same answer.

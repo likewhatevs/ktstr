@@ -180,7 +180,7 @@ readiness gates between host and guest.
 </details>
 
 <details>
-<summary><b>39 work types</b> — configurable workload profiles for different scheduling pressures</summary>
+<summary><b>45 work types</b> — configurable workload profiles for different scheduling pressures</summary>
 
 Workers are `fork()`ed processes placed in cgroups:
 
@@ -195,6 +195,7 @@ Workers are `fork()`ed processes placed in cgroups:
 - `IoConvoy` — interleaved sequential pwrite + random pread with periodic fdatasync (O_DIRECT)
 - `Bursty` — CPU burst then sleep (parameterized via `Duration`)
 - `IdleChurn` — CPU burst then `nanosleep` (hrtimer + idle-class path)
+- `TimerLatency` — cyclictest-style periodic wake via `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)`; per-cycle jitter feeds the `timer_latencies_ns` reservoir
 - `PipeIo` — CPU burst then pipe exchange (cross-CPU wake placement)
 - `FutexPingPong` — paired futex wait/wake (non-WF_SYNC)
 - `FutexFanOut` — 1:N fan-out wake
@@ -209,6 +210,7 @@ Workers are `fork()`ed processes placed in cgroups:
 - `PolicyChurn` — cycle SCHED_OTHER → BATCH → IDLE (→ FIFO/RR with CAP_SYS_NICE)
 - `NumaMigrationChurn` — rotate sched_setaffinity across NUMA nodes
 - `CgroupChurn` — cycle cgroup membership between sibling cgroups
+- `CgroupAttachStorm` — rapid fork + migrate each child into a destination cgroup's `cgroup.procs` (attach storm)
 - `FanOutCompute` — messenger/worker fan-out with matrix-multiply compute
 - `AsymmetricWaker` — paired workers in mismatched scheduling classes share one futex word
 - `WakeChain` — ring of waker-wakee hops (Pipe with WF_SYNC, or Futex)
@@ -219,9 +221,13 @@ Workers are `fork()`ed processes placed in cgroups:
 - `MutexContention` — N-way futex mutex contention
 - `PriorityInversion` — three-tier lock contention (Pi or Plain futex)
 - `ProducerConsumerImbalance` — unbalanced producer/consumer pipeline (queue grows)
-- `SignalStorm` — paired workers fire tkill(partner, SIGUSR1) between CPU bursts
+- `SignalStorm` — paired workers fire tkill(partner, SIGUSR2) between CPU bursts
 - `PreemptStorm` — one SCHED_FIFO worker preempts CFS spinners at ~kHz
 - `RtStarvation` — SCHED_FIFO workers monopolise CPU; SCHED_NORMAL workers starve
+- `Schbench` — schbench default-mode benchmark re-expressed natively (message/worker threads; request-latency measurement)
+- `Taobench` — bounded, evicting key-value object-cache benchmark (closed-loop clients over a sharded in-process cache; fast hit path + slow backing-miss path)
+- `NetTraffic` — AF_PACKET traffic generator driving the virtio-net NIC's RX hardirq + NAPI softirq
+- `IrqWake` — paired sender/receiver; the receiver blocks in `recvfrom` and is woken from NET_RX softirq context
 - `Custom` — user-supplied work function
 
 See [WorkType](concepts/work-types.md).

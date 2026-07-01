@@ -46,8 +46,9 @@
 //! host's `/bin/sh` AND `/bin/cat` via `extra_include_files`,
 //! landing at `/include-files/sh` + `/include-files/cat` inside
 //! the guest. `/include-files` is prepended to the guest's
-//! `PATH` by [`build_include_path`](crate::vmm::rust_init), so
-//! [`Payload::binary`](ktstr::Payload::binary) with `binary =
+//! `PATH` by `build_include_path` (a `pub(crate)` helper in
+//! ktstr's guest init), so
+//! [`Payload::binary`](ktstr::test_support::Payload::binary) with `binary =
 //! "sh"` resolves cleanly via `Command::new("sh")`'s PATH
 //! lookup, and the inline `cat /proc/self/cgroup` invocation
 //! inside the probe script resolves via sh's own PATH lookup.
@@ -113,7 +114,7 @@ fn op_runpayload_places_child_in_cgroup_before_exec(ctx: &Ctx) -> Result<AssertR
     // placement is the focus of the assertion.
     let backdrop = Backdrop::new().push_op(Op::add_cgroup("cg_dst"));
     // The shell snippet runs as the payload's `execve`d body.
-    // First action: `cat /proc/self/cgroup > /tmp/...` —
+    // The cgroup read: `cat /proc/self/cgroup > /tmp/...` —
     // captures the cgroup membership of the just-`execve`d
     // process. If the framework's handshake correctly placed
     // the child in `cg_dst` BEFORE releasing it to `execve`,
@@ -176,7 +177,7 @@ fn op_runpayload_places_child_in_cgroup_before_exec(ctx: &Ctx) -> Result<AssertR
     let line = snapshot.trim();
     // Build the expected line: literal `0::` prefix (the
     // cgroup-v2 hierarchy id + empty-controller marker that
-    // `cgroup_show_path` in kernel/cgroup/cgroup.c always
+    // `proc_cgroup_show` in kernel/cgroup/cgroup.c always
     // emits) followed by the test's declared
     // `workload_root_cgroup` + `/cg_dst`. `parent_path()` is
     // rooted under `/sys/fs/cgroup` for the guest-VM context

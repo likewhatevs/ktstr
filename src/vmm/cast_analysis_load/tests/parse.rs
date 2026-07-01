@@ -76,13 +76,10 @@ fn btf_str_at_offset_at_boundary_returns_none() {
 }
 
 /// 7. No null terminator in the slice from `base..strtab_end`:
-///    the function returns the whole tail as a string. Use a
-///    payload that ends without a `\0` to hit the `unwrap_or`
-///    branch — the result is still valid UTF-8, exercising the
-///    "no null terminator within bounds" path that produces a
-///    string instead of `None`. The closer case for `None` is
-///    invalid UTF-8 bytes; emit those to confirm `from_utf8`
-///    rejection.
+///    the search hits the `unwrap_or(strtab_end)` branch and the
+///    whole tail is taken as the candidate string. This test's
+///    tail is `[0xff, 0xff]` — invalid UTF-8 — so `from_utf8`
+///    rejects it and the function returns `None`.
 #[test]
 fn btf_str_at_no_null_terminator_invalid_utf8_returns_none() {
     // Strings: 0xff is not valid UTF-8 as a leading byte and
@@ -195,8 +192,8 @@ fn parse_btf_ext_record_size_too_small_returns_empty() {
     let elf = goblin::elf::Elf::parse(&blob).unwrap();
     let bases = HashMap::new();
 
-    // hdr_len=24, func_info_off=0, func_info_len=4 (just the
-    // record_size field). record_size=4 < 8 → reject.
+    // hdr_len=24, func_info_off=0, func_info_len=8 (record_size
+    // field + 4 trailing bytes). record_size=4 < 8 → reject.
     let mut data = vec![0u8; 32];
     data[0..2].copy_from_slice(&0xEB9F_u16.to_le_bytes());
     data[4..8].copy_from_slice(&24u32.to_le_bytes()); // hdr_len
@@ -361,7 +358,7 @@ fn smoke_symtab_helpers_compile() {
             SecSpec::new(".strtab", sh::SHT_STRTAB).data(strtab),
             SecSpec::new(".symtab", sh::SHT_SYMTAB)
                 .data(symtab)
-                .link(2) // sh_link → strtab is user-section index 2 = shdr index 3? wait
+                .link(2) // sh_link → .strtab is shdr index 2
                 .entsize(24),
         ],
         h::EM_X86_64,
@@ -859,7 +856,7 @@ fn cached_cast_analysis_recovers_arena_cast_end_to_end() {
 
 /// Cache hit by content: two calls on the same bytes (different
 /// paths) return the same `Arc<CastAnalysisOutput>`. Proves the
-/// cache is content-keyed (SHA-256), not path-keyed.
+/// cache is content-keyed (ahash of the file bytes), not path-keyed.
 #[test]
 fn cached_cast_analysis_returns_same_arc_for_same_content() {
     let blob = build_recovers_arena_cast_outer_elf();

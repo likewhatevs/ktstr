@@ -479,9 +479,8 @@ fn cast_intercept_parent_type_id_none_does_not_crash() {
         panic!(
             "parent_type_id=None must short-circuit the intercept and \
              render as Uint; got {v:?}. A failure here means \
-             render_member's `let parent = parent_type_id?` guard at \
-             `parent_type_id.and_then(...)` guard in render_member \
-             was bypassed."
+             render_member's `parent_type_id.and_then(...)` intercept \
+             guard was bypassed."
         );
     };
     assert_eq!(bits, 64);

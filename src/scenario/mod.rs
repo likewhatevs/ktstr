@@ -170,7 +170,7 @@ impl<'a> CgroupGroup<'a> {
     /// subsequent [`set_cpuset`](crate::cgroup::CgroupOps::set_cpuset)
     /// write lands. Direct CgroupGroup users (the `custom_*` scenarios
     /// in [`crate::scenario::nested`] / [`crate::scenario::stress`])
-    /// don't go through [`run_scenario`](crate::scenario::ops::execute_steps)'s
+    /// don't go through `run_scenario`'s
     /// controller-resolution hook, so the controller enable has to
     /// happen here. The setup call is idempotent on real cgroupfs (a
     /// `+cpuset` write into `cgroup.subtree_control` that already
@@ -298,8 +298,9 @@ impl Drop for CgroupGroup<'_> {
 /// Runtime context passed to scenario functions.
 ///
 /// Provides access to cgroup management, topology information, and
-/// test configuration. Custom scenarios (`Action::Custom`) receive
-/// this as their sole parameter.
+/// test configuration. Custom scenarios are functions receiving this
+/// `Ctx` as their sole parameter (e.g. the `custom_*` fns in
+/// [`crate::scenario::nested`] / [`crate::scenario::stress`]).
 ///
 /// # Method groups
 ///
@@ -493,43 +494,6 @@ impl std::fmt::Debug for Ctx<'_> {
 
 impl Ctx<'_> {
     /// Read the live scheduler identity published by the
-    ///
-    /// `Ctx::sched_pid` documents `None` as the "no scheduler
-    /// configured" state, and the liveness sites destructure with
-    /// `if let Some(pid)`. Nothing in the builder, however, prevents
-    /// a caller from passing `Some(0)` or a negative pid — an easy
-    /// mistake for callers used to the workload module's internal
-    /// 0-sentinel pid slot (see the note on `sched_pid` above — the
-    /// sentinel lives on a module-private `AtomicI32` in
-    /// `src/workload.rs`, not on this `Option<pid_t>`). A bare
-    /// `Some(0)` would reach
-    /// `process_alive`, which returns `false` for any pid `<= 0`,
-    /// and the liveness sites would then bail with `scheduler died`
-    /// even though no scheduler was ever running — a false
-    /// positive that turns a misconfiguration into a misleading
-    /// scheduler-death diagnostic.
-    ///
-    /// Centralising the filter here means every liveness callsite
-    /// (`run_scenario` post-settle bail, workload-phase polling,
-    /// `setup_cgroups` post-settle bail) uses the same predicate:
-    /// only a positive pid is "configured". Callers must use this
-    /// accessor rather than destructuring `sched_pid` directly.
-    ///
-    /// A `Some(n)` where `n <= 0` is a caller bug — the builder
-    /// documents `None` as the unconfigured shape, and every
-    /// positive value flows through unchanged. When the accessor
-    /// squashes such a value to `None`, it emits a `tracing::warn!`
-    /// naming the offending pid so the misuse surfaces in
-    /// structured logs instead of manifesting downstream as a
-    /// silent "scheduler died" verdict or, worse, a `kill(0, …)`
-    /// reaching the caller's own process group. The warn is
-    /// bounded: there are exactly three callsites
-    /// (`run_scenario` post-settle bail, workload-phase polling,
-    /// `setup_cgroups` post-settle bail), so the volume is O(3)
-    /// per scenario run even for a sustained
-    /// misconfiguration — tight enough to leave in place without
-    /// a rate limiter.
-    /// Read the live scheduler identity published by the
     /// `Op::AttachScheduler` / `Op::ReplaceScheduler` /
     /// `Op::DetachScheduler` dispatch arms. Returns `None` when no
     /// scheduler is currently attached (the pre-attach state at
@@ -566,7 +530,7 @@ impl Ctx<'_> {
     /// mistake for callers used to the workload module's internal
     /// 0-sentinel pid slot (see the note on `sched_pid` above — the
     /// sentinel lives on a module-private `AtomicI32` in
-    /// `src/workload.rs`, not on this `Option<pid_t>`). A bare
+    /// `src/workload/`, not on this `Option<pid_t>`). A bare
     /// `Some(0)` would reach
     /// `process_alive`, which returns `false` for any pid `<= 0`,
     /// and the liveness sites would then bail with `scheduler died`
@@ -574,11 +538,12 @@ impl Ctx<'_> {
     /// positive that turns a misconfiguration into a misleading
     /// scheduler-death diagnostic.
     ///
-    /// Centralising the filter here means every liveness callsite
-    /// (`run_scenario` post-settle bail, workload-phase polling,
-    /// `setup_cgroups` post-settle bail) uses the same predicate:
-    /// only a positive pid is "configured". Callers must use this
-    /// accessor rather than destructuring `sched_pid` directly.
+    /// Centralising the filter here keeps the sole production
+    /// caller — `setup_cgroups`'s post-settle bail — on a single
+    /// predicate: only a positive pid is "configured". The
+    /// `run_scenario` post-settle bail and workload-phase polling
+    /// take a live `crate::vmm::rust_init::sched_pid()` read
+    /// instead of this snapshot accessor.
     ///
     /// A `Some(n)` where `n <= 0` is a caller bug — the builder
     /// documents `None` as the unconfigured shape, and every
@@ -588,12 +553,10 @@ impl Ctx<'_> {
     /// structured logs instead of manifesting downstream as a
     /// silent "scheduler died" verdict or, worse, a `kill(0, …)`
     /// reaching the caller's own process group. The warn is
-    /// bounded: there are exactly three callsites
-    /// (`run_scenario` post-settle bail, workload-phase polling,
-    /// `setup_cgroups` post-settle bail), so the volume is O(3)
-    /// per scenario run even for a sustained
-    /// misconfiguration — tight enough to leave in place without
-    /// a rate limiter.
+    /// bounded: the sole production caller is `setup_cgroups`'s
+    /// post-settle bail, so the volume is O(1) per scenario run
+    /// even for a sustained misconfiguration — tight enough to
+    /// leave in place without a rate limiter.
     pub(crate) fn active_sched_pid(&self) -> Option<libc::pid_t> {
         match self.sched_pid {
             Some(p) if p > 0 => Some(p),
@@ -786,7 +749,7 @@ impl Ctx<'_> {
 /// Scenario unit tests reach for a [`Ctx`] with sane defaults so they
 /// can exercise scenario logic without booting a VM. The direct
 /// struct-literal construction at ~14 call sites forces every test to
-/// repeat the full 9-field init and keeps diverging defaults in sync
+/// repeat the full 12-field init and keeps diverging defaults in sync
 /// by hand; this builder centralises those defaults and keeps required
 /// fields (borrowed `cgroups`/`topo`) in their types.
 ///
@@ -1043,12 +1006,6 @@ where
     Ok(handles)
 }
 
-/// Resolve an [`AffinityIntent`] to a concrete [`ResolvedAffinity`] for workers
-/// in a cgroup with the given effective cpuset.
-///
-/// When a cpuset is active, affinity masks are intersected with it so the
-/// effective `sched_setaffinity` mask matches what the kernel will enforce.
-/// Without a cpuset, the full topology is used.
 /// Resolve a [`WorkSpec`]'s `num_workers`, falling back to `default_n` when unset,
 /// and reject `num_workers=0`.
 ///

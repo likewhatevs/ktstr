@@ -170,19 +170,19 @@ fn parse_cpu_list(s: &str) -> anyhow::Result<Vec<usize>> {
 }
 
 /// Pin the opt-in scaling contract end-to-end:
-/// `WorkSpec::workers_pct(1.0)` in host_only mode would resolve
-/// to the host CPU count because host_only routes topology through
-/// `TestTopology::from_system`. The internal
-/// `WorkSpec::resolve_workers_pct` is `pub(crate)` — not callable
-/// from an integration test — so this pin reduces to the upstream
-/// invariant: the topology the ctx exposes (`ctx.topo.all_cpus()`)
-/// matches `usable_cpuset()`'s size. That count is what
-/// `apply_setup`'s `resolve_workers_pct` call would use as the
-/// `cpuset_cpus` argument when the CgroupDef inherits the
-/// topology-default cpuset. So asserting `all_cpus().len() ==
-/// usable_cpuset().len()` (when no operator CPU restriction is in
-/// play) proves a workers_pct(1.0) workload would scale to the
-/// host CPU count.
+/// `WorkSpec::workers_pct(1.0)` in host_only mode resolves to
+/// `usable_cpuset().len()` because host_only routes topology through
+/// `TestTopology::from_system`. That is the host CPU count minus the
+/// one CPU reserved for the root cgroup when the host has more than 2
+/// CPUs (`usable_cpus` returns `cpus[..len - 1]` for `len > 2`, all
+/// CPUs otherwise). The internal `WorkSpec::resolve_workers_pct` is
+/// `pub(crate)` — not callable from an integration test — so this pin
+/// reduces to the upstream invariant: the size the ctx exposes as
+/// `usable_cpuset()` is what `apply_setup` feeds `resolve_workers_pct`
+/// as its `cpuset_cpus` argument when the CgroupDef inherits the
+/// topology-default cpuset. `ceil(usable_cpuset().len() * 1.0)` then
+/// equals `usable_cpuset().len()`, so a workers_pct(1.0) workload
+/// spawns one worker per usable CPU.
 #[ktstr_test(host_only)]
 fn host_mode_workers_pct_scales_to_host_cpu_count(
     ctx: &Ctx,

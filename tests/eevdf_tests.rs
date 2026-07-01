@@ -32,7 +32,8 @@ fn eevdf_empty_run_exits_under_watchdog(_ctx: &Ctx) -> Result<AssertResult> {
 ///
 /// Spawns `2x total_cpus` workers each running independent
 /// [`WorkType::Bursty`] cycles (1ms `spin_burst` followed by a 0ms
-/// sleep — see `workload.rs` `WorkType::Bursty` arm). The workers
+/// sleep — see the `WorkType::Bursty` run-loop arm in
+/// `src/workload/worker/mod.rs`). The workers
 /// share no lock and do not coordinate; the contention is purely for
 /// CPU time on an oversubscribed run queue. With sane scheduling,
 /// EEVDF rotates workers fairly enough that each thread's longest gap
@@ -49,12 +50,17 @@ fn eevdf_empty_run_exits_under_watchdog(_ctx: &Ctx) -> Result<AssertResult> {
 /// regression. Lowering it risks flakes; raising it past ~3s would
 /// hide the PREEMPT_LAZY-class regressions this test guards.
 ///
-/// `max_spread_pct = 80.0` is a RELAXATION that overrides the default
-/// 15% starvation-spread threshold from `Assert::default_checks()`
-/// (which enables `not_starved=true`, running `assert_not_starved`
-/// with `spread_threshold_pct() = 15%` in release builds — see
-/// `spread_threshold_pct()` and the spread-vs-limit comparison in
-/// `assert_not_starved` in `src/assert.rs`). With 8 workers
+/// `max_spread_pct = 80.0` enables the sole spread check that runs.
+/// `Assert::default_checks()` returns `NO_OVERRIDES`, leaving
+/// `not_starved` off, so the default 15% starvation-spread threshold
+/// (`record_default_fairness`, applied only inside the `not_starved`
+/// arm of `AssertPlan::eval_fairness`) never runs. Setting
+/// `max_spread_pct=80.0` turns on the custom-threshold spread arm in
+/// `eval_fairness`, which gates on its own field independently of
+/// `not_starved` — see `spread_threshold_pct()` (`= 15%` in release
+/// builds) in `src/assert/types.rs` and the spread-vs-limit comparison
+/// in `assert_not_starved` / `record_default_fairness` in
+/// `src/assert/reductions.rs`. With 8 workers
 /// oversubscribing 4 CPUs and 1ms bursts, EEVDF spread at sub-slice
 /// granularity routinely exceeds 15% on healthy runs; 80% is wide
 /// enough to absorb that variance while still catching a fully

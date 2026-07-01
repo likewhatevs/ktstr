@@ -1466,7 +1466,7 @@ fn list_values_json_carries_null_for_optional_dims() {
         "commit array must include the populated value abcdef1; got {commit:?}",
     );
 
-    // resolve_source is the ninth list-values dimension (JSON key
+    // resolve_source is the fifth list-values dimension (JSON key
     // "resolve_source"); it carries null for the None fixture and the
     // populated discovery-path tag for the other. Unlike run_source, the
     // `--dir` archive override does NOT touch resolve_source, so the None

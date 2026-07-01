@@ -2,15 +2,15 @@
 //! Exercises the kaslr_offset thread-through in kernel_op_dispatch.rs
 //! on both the read AND the write paths via:
 //!
-//! 1. Symbol read — `jiffies_64` (.bss u64); validates the kernel-
+//! 1. Symbol read — `jiffies_64` (.data u64); validates the kernel-
 //!    text slide path for an in-image global.
 //! 2. Symbol write round-trip — `panic_on_oops` (kernel/panic.c, u32);
 //!    read pre, write sentinel, read post. Pin: post == SENTINEL.
 //!    Mutation is harmless past test teardown (controls oops behavior
 //!    only).
 //! 3. Per-CPU OrU32 round-trip — `runqueues.scx.flags` cpu 0; HIGH_BIT
-//!    is reserved test space (scx-ktstr writes low bits per
-//!    `enum scx_rq_flags`). Pin: post & HIGH_BIT == HIGH_BIT AND
+//!    is reserved test space (sched_ext core touches only the low bits
+//!    defined by `enum scx_rq_flags`). Pin: post & HIGH_BIT == HIGH_BIT AND
 //!    (post ^ pre) == HIGH_BIT (no scheduler-side bits drifted).
 //!
 //! All assertions are EXPLICIT-VALUE (no panic-on-bad-read). The
@@ -153,8 +153,8 @@ fn assert_jiffies_read(result: &VmResult) -> Result<()> {
 // =========================================================================
 // Op::WriteKernelCold(per_cpu_field, OrU32) round-trip — exercises the
 // per-CPU write path under KASLR-on. Target: runqueues.scx.flags cpu 0;
-// HIGH_BIT (bit 31) is reserved test space (scx-ktstr touches low bits
-// only per `enum scx_rq_flags`).
+// HIGH_BIT (bit 31) is reserved test space (sched_ext core touches the
+// low bits only per `enum scx_rq_flags`).
 // =========================================================================
 
 const TAG_PCPU_PRE: &str = "rq_flags_pre";
@@ -218,7 +218,8 @@ fn assert_rq_flags_or_roundtrip(result: &VmResult) -> Result<()> {
     anyhow::ensure!(
         (post_v ^ pre_v) == HIGH_BIT,
         "post ^ pre = {:#x}, expected {HIGH_BIT:#x} — other bits \
-         changed mid-rendezvous; FULL hold did not block vCPUs.",
+         changed between the write and post-read rendezvous while \
+         vCPUs ran (each cold op is a separate rendezvous).",
         post_v ^ pre_v
     );
     Ok(())
@@ -227,7 +228,7 @@ fn assert_rq_flags_or_roundtrip(result: &VmResult) -> Result<()> {
 // =========================================================================
 // rq.cpu ground-truth — exercises the per-CPU read path under KASLR-on
 // for TWO distinct CPUs (cpu 0 + cpu 1). The field rq.cpu is set ONCE
-// by init_idle at boot to the CPU index. Pin: cpu0_read == 0 AND
+// by sched_init at boot to the CPU index. Pin: cpu0_read == 0 AND
 // cpu1_read == 1. Without cpu1 the cpu0==0 assertion is vacuous (any
 // wrong-PA zero would also match).
 // =========================================================================

@@ -322,7 +322,8 @@ fn output_from_expr(expr: &syn::Expr) -> syn::Result<proc_macro2::TokenStream> {
 /// `polarity` accepts bare idents `HigherBetter`, `LowerBetter`,
 /// `Unknown`, and the call form `TargetValue(<float literal>)`. The
 /// float literal is stamped into a `Polarity::TargetValue(lit)` so
-/// the generated const is const-evaluable.
+/// the generated const is const-evaluable. The `Informational`
+/// variant is not accepted via the derive.
 fn parse_metric_attr(attr: &syn::Attribute) -> syn::Result<(String, proc_macro2::TokenStream)> {
     let mut name: Option<String> = None;
     let mut polarity: Option<proc_macro2::TokenStream> = None;
@@ -400,9 +401,11 @@ fn expr_has_check_prefix(expr: &syn::Expr) -> bool {
 }
 
 /// Translate the user-facing `polarity = ...` expression to a
-/// fully-qualified `Polarity` variant. Accepts the four enum
-/// variants in bare-ident form (`HigherBetter`, `LowerBetter`,
-/// `Unknown`) or as `TargetValue(<float>)`.
+/// fully-qualified `Polarity` variant. Accepts four of the five
+/// `Polarity` variants: the bare idents `HigherBetter`, `LowerBetter`,
+/// `Unknown`, and the call form `TargetValue(<float>)`. The fifth
+/// variant `Informational` is not accepted via the derive; any other
+/// ident is rejected as an unknown polarity.
 fn polarity_from_expr(expr: &syn::Expr) -> syn::Result<proc_macro2::TokenStream> {
     match expr {
         syn::Expr::Path(ep) => {

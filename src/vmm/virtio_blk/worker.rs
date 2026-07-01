@@ -9,20 +9,23 @@
 //! # Public surface (within `super`)
 //!
 //! - [`worker_thread_main`] — the production worker entry point.
-//!   Spawned by `VirtioBlk::with_options` and `respawn_worker`;
-//!   joined by `Drop` and `reset_engine_spawned` via the
-//!   `JoinHandle<BlkWorkerState>` payload.
+//!   Spawned by `respawn_worker` (control.rs); the initial spawn
+//!   is deferred from `VirtioBlk::with_options` to the guest's
+//!   first DRIVER_OK via `consume_pending_respawn` → `respawn_worker`.
+//!   `with_options` only seeds `respawn_pending`; it does not spawn
+//!   the thread. Joined by `Drop` and `reset_engine_spawned` via
+//!   the `JoinHandle<BlkWorkerState>` payload.
 //! - [`StallAction`] / [`decide_stall_action`] — pure mapping from
 //!   `DrainOutcome` to next-step action; tested in
-//!   `super::tests` without spawning a worker.
+//!   `self::tests` without spawning a worker.
 //! - [`WorkerDispatchAction`] / [`worker_dispatch_event`] — pure
 //!   mapping from `(EventSet, token)` to dispatch decision; tested
-//!   in `super::tests` without constructing an `Epoll`.
+//!   in `self::tests` without constructing an `Epoll`.
 //! - [`clamp_retry_nanos`], [`RETRY_TIMER_MAX_NANOS`] — retry-timer
-//!   bounds; pinned by `super::tests`.
+//!   bounds; pinned by `self::tests`.
 //! - Token discriminators: [`KICK_TOKEN`], [`STOP_TOKEN`],
 //!   [`THROTTLE_TOKEN`] — also referenced by
-//!   `super::tests::worker_dispatch_event_*` cases.
+//!   `self::tests::worker_dispatch_*` cases.
 //!
 //! # Threading model
 //!
@@ -39,8 +42,8 @@
 //! caller thread) so the worker code in this file is gated on
 //! `cfg(not(test))`. The pure helpers (`decide_stall_action`,
 //! `worker_dispatch_event`, `clamp_retry_nanos`) and their tokens
-//! are always-compiled so the test block in the parent module can
-//! exercise them without the worker thread.
+//! are always-compiled so this file's own `#[cfg(test)] mod tests`
+//! block can exercise them without the worker thread.
 
 #[cfg(not(test))]
 use std::os::unix::io::AsRawFd;
@@ -728,11 +731,14 @@ pub(crate) fn worker_thread_main(
                         );
                     }
                     // Park until the coordinator clears the flag.
-                    // `park_timeout(10ms)` is the same poll cadence
-                    // the vCPU rendezvous uses — short enough that
-                    // resume is responsive, long enough that an
-                    // unwoken park does not spin-burn the worker
-                    // CPU. Acquire-load synchronizes-with the
+                    // `park_timeout(10ms)` is a backstop for
+                    // responsive resume — short enough that resume
+                    // is responsive, long enough that an unwoken
+                    // park does not spin-burn the worker CPU. The
+                    // vCPU rendezvous's production path is a 100 ms
+                    // `libc::poll` backstop (exit_dispatch); its
+                    // 10 ms `park_timeout` only applies in the
+                    // no-thaw_evt fallback arm. Acquire-load synchronizes-with the
                     // coordinator's `paused.store(false, Release)`
                     // in [`VirtioBlk::resume`].
                     while paused.load(Ordering::Acquire) {

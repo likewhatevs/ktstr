@@ -523,7 +523,7 @@ fn stats_no_data() {
     // Pin the read path to an empty directory via KTSTR_SIDECAR_DIR
     // so the test is independent of whatever sits under the
     // developer's target/ktstr/. Bare `cargo ktstr stats` honors
-    // KTSTR_SIDECAR_DIR (cli.rs print_stats_report). With nothing
+    // KTSTR_SIDECAR_DIR (cli::print_stats_report honors it). With nothing
     // there to read the empty-state notice goes to stderr and
     // stdout stays clean.
     let tmp = tempfile::tempdir().unwrap();
@@ -574,7 +574,7 @@ fn kernel_list_json() {
 
 /// `cargo ktstr shell --no-perf-mode --cpu-cap N` under
 /// KTSTR_BYPASS_LLC_LOCKS=1 must fail with the "resource contract"
-/// substring. Pins the rejection at bin/cargo-ktstr.rs:851.
+/// substring. Pins the rejection at src/bin/cargo_ktstr/misc/shell.rs:184.
 #[test]
 fn cargo_ktstr_shell_cpu_cap_with_bypass_errors() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -589,7 +589,7 @@ fn cargo_ktstr_shell_cpu_cap_with_bypass_errors() {
 
 /// `cargo ktstr kernel build --cpu-cap N` under
 /// KTSTR_BYPASS_LLC_LOCKS=1 must fail with the "resource contract"
-/// substring. Pins the rejection at bin/cargo-ktstr.rs:729.
+/// substring. Pins the rejection at src/bin/cargo_ktstr/kernel/mod.rs:720.
 #[test]
 fn cargo_ktstr_kernel_build_cpu_cap_with_bypass_errors() {
     let tmp = tempfile::TempDir::new().unwrap();

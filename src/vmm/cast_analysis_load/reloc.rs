@@ -433,7 +433,8 @@ pub(crate) fn build_datasec_pointers(
     // R_BPF_64_64 = 1 per linux `tools/lib/bpf/libbpf_internal.h`.
     // goblin's reloc constants table does not expose BPF reloc
     // types, so the numeric value is inlined here. Same gating
-    // libbpf applies in `bpf_program__resolve_map_value_relos`.
+    // libbpf applies in `bpf_program__record_reloc` (classifies
+    // `RELO_DATA`) and `bpf_object__relocate_data`'s `RELO_DATA` arm.
     const R_BPF_64_64: u32 = 1;
     // BPF_LD | BPF_DW | BPF_IMM opcode byte (= 0x18 per linux
     // uapi `bpf.h`). Used to gate the relocation: a reloc against
@@ -584,7 +585,7 @@ pub(crate) fn find_datasec_btf_id(btf: &Btf, name: &str) -> Option<u32> {
 /// `BTF_KIND_FUNC` types (with `BTF_FUNC_EXTERN` linkage). We don't
 /// need to descend the DATASEC explicitly: every FUNC referenced by
 /// `.ksyms` is also indexed in the program BTF's name → id map (see
-/// `btf-rs::BtfObj::resolve_ids_by_name`), so a name-keyed lookup is
+/// `btf_rs::Btf::resolve_ids_by_name`), so a name-keyed lookup is
 /// enough. We still filter the result to FUNCs with extern linkage
 /// to avoid colliding with a same-named static helper that happens
 /// to share the symbol name.
@@ -721,7 +722,7 @@ pub(crate) fn patch_kfunc_calls(
 /// relocation against an `STT_FUNC` symbol whose containing section
 /// is one of the program text sections we concatenated into
 /// `text_concat`. Without patching, the cast analyzer's
-/// `crate::monitor::cast_analysis::Analyzer::analyze` computes
+/// `crate::monitor::cast_analysis::Analyzer::run` computes
 /// `callee_pc = pc + 1 + insn.imm = pc + 1 + (-1) = pc` and
 /// inserts the caller's R1..R5 snapshot into `caller_arg_types`
 /// at the call site itself instead of at the callee's entry PC.
@@ -1027,7 +1028,7 @@ pub(crate) fn parse_btf_ext_func_entries(
             _ => break,
         }
         // Resolve section name via the BTF string table — per kernel
-        // libbpf (tools/lib/bpf/libbpf.c:3328), `.BTF.ext`
+        // libbpf `bpf_object__init_btf` (`btf__name_by_offset`), `.BTF.ext`
         // `sec_name_off` indexes the BTF strtab, NOT the ELF
         // section-header strtab. The BTF strtab starts at
         // `hdr_len + str_off` within the `.BTF` blob.

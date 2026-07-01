@@ -4403,7 +4403,7 @@ fn failure_dump_entry_payload_skipped_when_none() {
 /// (key/value) must come before the deref'd payload, matching how
 /// a kernel-side debugger would inspect: chase the pointer, then
 /// read the dereferenced struct. The format uses
-/// `payload <rendered>` (with a space, no colon) so the value's
+/// `.data <rendered>` (with a space, no colon) so the value's
 /// own breadcrumb completes the line.
 #[test]
 fn failure_dump_entry_display_renders_payload_after_value() {
@@ -7027,10 +7027,10 @@ fn entry_display_value_falls_to_multi_line_when_too_wide() {
 #[test]
 fn entry_display_payload_renders_below_value() {
     // Payload value renders below the entry on its own indented
-    // line. The Display impl uses `\n  payload <rendered>` (with
+    // line. The Display impl uses `\n  .data <rendered>` (with
     // a space, no colon) so the value's own breadcrumb completes
-    // the line as `payload TypeName:` for multi-line structs or
-    // just `payload <scalar>` for scalars.
+    // the line as `.data TypeName:` for multi-line structs or
+    // just `.data <scalar>` for scalars.
     let entry = FailureDumpEntry {
         key: Some(make_small_struct("k", &[("a", 1)])),
         key_hex: "01".into(),
@@ -8470,7 +8470,7 @@ fn identify_active_obj_fallback_with_two_distinct_schedulers_returns_first_itera
 /// `active_map_kvas` whitelist and the consumer's downstream
 /// `live_var()` would then surface
 /// [`super::super::super::scenario::snapshot::SnapshotError::AmbiguousVar`]
-/// (the originally reported bug from the scx_mitosis swap test:
+/// (the bug from the scx_mitosis swap test:
 /// `AmbiguousVar { found_in: ["bpf_bpf.bss", "bpf_bpf.bss"] }`).
 /// Phase 1 must detect the multi-copy case and fall through to
 /// Phase 2 so the walker publishes a disambiguating KVA whitelist.

@@ -1054,7 +1054,8 @@ fn spawn_custom_produces_work() {
 /// pair (existing test
 /// `stop_and_collect_reaps_grandchild_from_panicking_custom_closure`
 /// pins the fork mode's panic shape). This regression guard
-/// proves the new D5 incompatibility check does NOT also reject
+/// proves the CloneMode/WorkType compatibility gate (the
+/// Thread+ForkExit rejection in spawn::mod) does NOT also reject
 /// the legitimate Fork+ForkExit combination.
 #[test]
 fn spawn_fork_with_forkexit_succeeds() {
@@ -1589,8 +1590,9 @@ fn worker_report_postcard_all_exit_info_variants_roundtrip() {
 /// Roundtrip a `WorkerReport::default()` shape through postcard.
 /// Production sentinels are constructed via
 /// `WorkerReport { ..WorkerReport::default() }` with select fields
-/// overridden (mod.rs uses this shape at the catch_unwind arm,
-/// pcomm-decode-failure arm, and pcomm-empty-payload arm). A
+/// overridden (mod.rs uses this shape at the worker decode-failure
+/// arm, the pcomm cardinality-mismatch arm, and the pcomm
+/// no-decodable-report arm). A
 /// silent codec regression on the default shape would corrupt
 /// every sentinel without surfacing in tests that only encode
 /// fully-populated reports.

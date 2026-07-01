@@ -79,7 +79,7 @@ fn merge_kv_counters_per_key_sum() {
 }
 
 /// `merge_memory_stat` per-key dispatch: gauge keys (per
-/// [`MEMORY_STAT_GAUGE_KEYS`]) take max; counter keys take
+/// `MEMORY_STAT_GAUGE_KEYS`) take max; counter keys take
 /// saturating_add. Summing instantaneous pool sizes
 /// (anon, file, slab) overstates the merged-bucket gauge,
 /// so the gauge keys take max instead.

@@ -110,8 +110,12 @@ extern "C" fn terminal_restore_signal_handler(sig: libc::c_int) {
 /// Any signal not in the handled set is bypassed — the guard does
 /// NOT install a handler for it, so termios is not restored on
 /// delivery.
-/// Neither the Drop path nor the SA_RESETHAND handler fires in these
-/// cases, leaving the terminal in raw mode after process exit:
+/// For the cases below the guard's automatic restore does not run at
+/// delivery time; the per-case consequences vary and are documented
+/// inline (SIGSEGV/BUS/ILL, the SIGUSR/ALRM/PIPE group,
+/// `exit`/`_exit`, and SIGKILL leave the terminal in raw mode, while
+/// SIGTSTP restores via Drop at scope exit and SIGHUP restoration is
+/// moot):
 /// - **SIGSEGV / SIGBUS / SIGILL**: synchronous hardware-fault
 ///   signals that fire from corrupted process state where
 ///   `tcsetattr` is unsafe; deliberately left uncaught. The kernel's

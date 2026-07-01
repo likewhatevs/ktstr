@@ -16,7 +16,7 @@
 //!    `PANIC:` line on COM2 that lands in `crash_message`.
 //!
 //! The `post_vm` callback runs on the host after `vm.run()` returns
-//! and gates on those three host-visible signals — the strongest
+//! and gates on those host-visible signals — the strongest
 //! proof available to the host that the worker dispatch actually
 //! applied the cgroup-level defaults.
 

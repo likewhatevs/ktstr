@@ -468,8 +468,8 @@ mod tests {
             distances: None,
         };
         let features = extract_features(&entry, &topo, false, "basic_test");
-        // Should have bits set for scheduler hash, cpu bucket 0, llc bucket 0,
-        // duration bucket 0, workers bucket 0, no gauntlet flag.
+        // Should have bits set for scheduler hash, cpu bucket 0 (2 CPUs),
+        // llc bucket 0 (1 LLC), duration bucket 2 (12s), no gauntlet flag.
         assert_eq!(features & (1 << GAUNTLET_SHIFT), 0);
         // SMT off
         assert_eq!(features & (1 << SMT_SHIFT), 0);

@@ -33,8 +33,7 @@ use super::*;
 /// added, removed, or reshaped at any time, and old sidecars must
 /// be regenerated after upgrades (re-running the affected tests
 /// produces a fresh sidecar). Per the project's pre-1.0 no-compat
-/// stance ([`crate::scenario`] module-level doc), no
-/// `#[serde(default)]` shims are added for old payloads.
+/// stance, no `#[serde(default)]` shims are added for old payloads.
 #[must_use = "test verdict is lost if not checked"]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AssertResult {
@@ -45,10 +44,12 @@ pub struct AssertResult {
     /// [`Self::skip`] / [`Self::fail`] constructors).
     ///
     /// **Empty `outcomes` is the Pass identity** — [`Self::pass`]
-    /// constructs with `outcomes: vec![]`, [`Self::outcome`] folds
-    /// the vec via [`Outcome::merge`] starting from
-    /// [`Outcome::Pass`], so a never-touched accumulator naturally
-    /// resolves to Pass without any allocation. `record_pass()` is
+    /// constructs with `outcomes: vec![]`, and [`Self::outcome`]
+    /// resolves an empty `outcomes` to [`Outcome::Pass`] via the
+    /// ordered `Fail > Inconclusive > Pass > Skip` precedence (NOT a
+    /// fold via [`Outcome::merge`]; see [`Self::outcome`]), so a
+    /// never-touched accumulator naturally resolves to Pass without
+    /// any allocation. `record_pass()` is
     /// for the rare case where a test explicitly records a passing
     /// check (e.g. per-check helpers that document what passed);
     /// `pass()` is the zero-state "nothing failed so far"
@@ -504,7 +505,8 @@ pub struct PhaseCgroupStats {
     /// companion. Folded together with `max_gap_ms`, never independently.
     pub max_gap_cpu: usize,
     /// True when this carrier's raw sample vectors (`wake_latencies_ns` /
-    /// `run_delays_ns` / `off_cpu_pcts`) were dropped by
+    /// `timer_latencies_ns` / `run_delays_ns` / `off_cpu_pcts`, plus the
+    /// `schbench` histograms) were dropped by
     /// `AssertResult::strip_phase_cgroup_samples` to fit the size-limited guest
     /// bulk frame — distinct from a carrier that genuinely measured no samples.
     /// The reduced counters survive; only the per-phase distribution render

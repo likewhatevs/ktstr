@@ -6,7 +6,8 @@ use super::*;
 //
 // These tests exercise the analyzer's `BPF_OP_CALL` plain-helper
 // arm. The arm fires when `src_reg == 0` (helper-call pseudo per
-// linux uapi `bpf.h`), `imm == BPF_FUNC_map_lookup_elem` (== 1),
+// linux uapi `bpf.h`) and `imm == BPF_FUNC_map_lookup_elem` (== 1)
+// or `imm == BPF_FUNC_map_lookup_percpu_elem` (== 195),
 // and the saved-pre-clobber R1 was a [`RegState::DatasecPointer`]
 // into a `BTF_KIND_DATASEC` named `.maps`. The analyzer types R0
 // as `Pointer{value_struct_id}` only when the targeted map's BTF
@@ -42,10 +43,6 @@ enum MapValueShape {
     Struct,
     U64,
     Typedef,
-    #[allow(dead_code)] // Void shape is reserved for a follow-up
-    // void-pointee assertion; the existing tests do not exercise
-    // it directly because the U64 case already covers the
-    // `resolve_to_struct_id` reject path.
     Void,
 }
 
@@ -268,7 +265,8 @@ fn helper_map_lookup_elem_no_map_metadata_keeps_r0_unknown() {
 /// Helper allowlist gate: a non-`bpf_map_lookup_elem` helper id
 /// (e.g. `BPF_FUNC_get_current_task = 35`) must NOT seed R0 even
 /// when R1 is a valid `.maps` DatasecPointer. The arm keys on
-/// `imm == BPF_FUNC_map_lookup_elem` exactly.
+/// `imm == BPF_FUNC_map_lookup_elem` or
+/// `imm == BPF_FUNC_map_lookup_percpu_elem`.
 #[test]
 fn helper_not_in_allowlist_keeps_r0_unknown() {
     let (blob, datasec_id, var_off, _value_sid, parent_id) =
@@ -1167,12 +1165,14 @@ fn cross_function_u64_param_inherits_caller_pointer_type() {
     let blob = build_btf(&types, &strings);
     let btf = Btf::from_bytes(&blob).unwrap();
     let m_id = 2;
-    // Caller at PC 0..2: R1 = Pointer{M}, BPF_PSEUDO_CALL to callee at PC 4.
-    // Callee at PC 4..6 (func_entry): FuncProto says param 0 is u64,
-    // but caller had R1 = Pointer{M}. Cross-function propagation
-    // should type R1 as Pointer{M} in the callee. Then:
-    // PC 4: (func entry, R1 = Pointer{M} via caller propagation)
-    // PC 5: STX [R1 + 8] = R6 (R6 = ArenaU64FromAlloc from seed)
+    // Caller at PC 0..2: R1 = Pointer{M}, BPF_PSEUDO_CALL to callee at PC 3.
+    // Callee at PC 3..6 (func_entry via FuncEntry insn_offset=3):
+    // FuncProto says param 0 is u64, but caller had R1 = Pointer{M}.
+    // Cross-function propagation should type R1 as Pointer{M} in the
+    // callee. Then:
+    // PC 3: func entry (R1 = Pointer{M} via caller propagation); save R1 to R6.
+    // PC 4: inner alloc call -> R0 = ArenaU64FromAlloc from seed.
+    // PC 5: STX [R6 + 8] = R0.
     // PC 6: EXIT
     let insns = vec![
         // PC 0: caller func entry (via FuncEntry at pc=0)
@@ -1261,7 +1261,7 @@ fn cross_function_u64_param_inherits_caller_pointer_type() {
 ///   pc 6: r3 = r10             ; value pointer = &V on the stack
 ///   pc 7: r3 += -24
 ///   pc 8: call helper(BPF_FUNC_map_update_elem)
-///                              ; FUTURE FEATURE: walks V's u64
+///                              ; the update_elem arm walks V's u64
 ///                              ; fields, sees stack_slot[-16] is
 ///                              ; ArenaU64FromAlloc, tags map's
 ///                              ; (V, 8) as arena-backed.
@@ -1269,9 +1269,9 @@ fn cross_function_u64_param_inherits_caller_pointer_type() {
 ///   pc 11: call helper(BPF_FUNC_map_lookup_elem)
 ///                              ; R0 = Pointer{V}.
 ///   pc 12: ldx r2 = *(u64 *)(r0 + 8)
-///                              ; FUTURE FEATURE: V.field is the
-///                              ; map's tagged arena field, so r2
-///                              ; takes ArenaU64FromAlloc instead
+///                              ; V.field is the map's tagged arena
+///                              ; field, so the LDX arm re-types r2
+///                              ; as ArenaU64FromAlloc instead
 ///                              ; of LoadedU64Field{V, 8}.
 ///   pc 13: stx *(u64 *)(r6 + 0) = r2
 ///                              ; records (P, 0) -> Arena via the
@@ -1289,10 +1289,9 @@ fn cross_function_u64_param_inherits_caller_pointer_type() {
 /// Helper id 2 is `BPF_FUNC_map_update_elem` per linux uapi
 /// `bpf.h` (`FN(map_update_elem, 2, ##ctx)`); helper id 1 is
 /// `BPF_FUNC_map_lookup_elem`. Both are plain helpers (`src_reg
-/// == 0`). The numeric literal 2 is used here directly because
-/// the analyzer does not yet expose a `BPF_FUNC_MAP_UPDATE_ELEM`
-/// constant — that constant is part of the feature this test
-/// guards.
+/// == 0`). The numeric literal 2 is used here directly to keep the
+/// test independent of the analyzer's `BPF_FUNC_MAP_UPDATE_ELEM`
+/// constant (defined in `mod.rs`).
 #[test]
 fn helper_map_update_then_lookup_propagates_arena_through_map_value() {
     // BTF: u64(1), V(2, u64@8), P(3, u64@0), Ptr->V(4),
@@ -1402,9 +1401,9 @@ fn helper_map_update_then_lookup_propagates_arena_through_map_value() {
     let mov_r3_from_r10 = mov_x(3, 10);
     let r3_minus_24 = mk_insn(BPF_CLASS_ALU64 | BPF_OP_ADD, 3, 0, 0, -24);
     // BPF_FUNC_map_update_elem == 2 per linux uapi `bpf.h`
-    // (`FN(map_update_elem, 2, ...)`). The analyzer does not yet
-    // export a BPF_FUNC_MAP_UPDATE_ELEM constant — that addition
-    // is part of the feature this test guards.
+    // (`FN(map_update_elem, 2, ...)`). The numeric literal 2 is
+    // used here directly to keep the test independent of the
+    // analyzer's BPF_FUNC_MAP_UPDATE_ELEM constant (`mod.rs`).
     let call_update = helper_call(2);
     let [ld_lo_post, ld_hi_post] = ld_imm64(1, var_off as i32);
     let call_lookup = helper_call(BPF_FUNC_MAP_LOOKUP_ELEM);
@@ -1493,13 +1492,13 @@ fn helper_map_update_then_lookup_propagates_arena_through_map_value() {
     // arena-STX finding uses (see
     // `stx_flow_alloc_return_records_arena_finding`).
     //
-    // Until the map-value propagation feature lands, this test
-    // fails — the analyzer treats `bpf_map_update_elem` as an
-    // ordinary helper that clobbers R0..=R5 without inspecting
-    // R3's pointee, so V's (2, 8) slot never receives the arena
-    // tag, the post-lookup LDX produces `LoadedU64Field{V, 8}`
-    // instead of `ArenaU64FromAlloc`, and the final STX records
-    // nothing in `arena_stx_findings`. Reference is V's id
+    // The update_elem arm inspects R3's pointee: it matches the
+    // saved R3 as `RegState::FrameAddr` and calls
+    // `bridge_map_value_spill`, which walks V's u64 fields, reads
+    // the arena-tagged stack slot at r3_base+8 (= r10-16), and tags
+    // V's (2, 8) slot as arena-backed. The post-lookup LDX then
+    // re-types r2 as `ArenaU64FromAlloc`, and the final STX records
+    // `(P, 0) -> Arena` in `arena_stx_findings`. Reference is V's id
     // (2) for the Var var_off==0 → the_map → V layout.
     let _ = v_id;
     assert_eq!(
@@ -1600,13 +1599,14 @@ fn cross_function_fixpoint_callee_before_caller() {
     //         R2 = ArenaU64FromAlloc (from caller_arg_types, pass 2)
     //   PC 1: EXIT
     //
-    // Caller at PC 2..5 (AFTER callee):
-    //   PC 2: FuncEntry. R1 = Pointer{Parent} from FuncProto.
-    //   PC 2: allocator call → R0 = ArenaU64FromAlloc
-    //   PC 3: R2 = R0 (move arena result to R2 for callee arg)
-    //   PC 4: BPF_PSEUDO_CALL to callee (PC 0). imm = -5.
+    // Caller at PC 2..7 (AFTER callee):
+    //   PC 2: FuncEntry. R1 = Pointer{Parent} from FuncProto; save R1 to R6.
+    //   PC 3: allocator call → R0 = ArenaU64FromAlloc
+    //   PC 4: R2 = R0 (move arena result to R2 for callee arg)
+    //   PC 5: R1 = R6 (restore parent ptr)
+    //   PC 6: BPF_PSEUDO_CALL to callee (PC 0). imm = -7.
     //         caller_arg_types[0] = [Pointer{Parent}, ArenaU64FromAlloc, ...]
-    //   PC 5: EXIT
+    //   PC 7: EXIT
     let alloc_call = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, 0);
     let callee_call = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, -7);
 

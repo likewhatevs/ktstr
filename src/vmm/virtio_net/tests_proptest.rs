@@ -61,9 +61,8 @@ const RX_BUF_BASE: u64 = 0x9000; // 0x9000..0xC000 — RX descriptor target buff
 
 /// Per-queue size for proptest fixtures. 16 is enough to hold every
 /// proptest-generated chain (≤8 descriptors per chain by `MAX_CHAIN_LEN`)
-/// with room to spare for the rings, and small enough that the avail-ring
-/// modulo (queue_size - 1) wraps cleanly when the proptest fires
-/// repeated cases inside a single shrink-loop.
+/// with room to spare for the rings, all of which fit comfortably
+/// within the 1 MiB `GUEST_MEM_SIZE` region.
 const PROPTEST_QUEUE_SIZE: u16 = 16;
 
 /// Maximum chain length per proptest case. The kernel virtio-net driver
@@ -297,11 +296,14 @@ fn plant_well_formed_rx_chain(mem: &GuestMemoryMmap) {
 // Counter snapshot
 // ----------------------------------------------------------------------------
 
-/// Snapshot of every counter the device mutates. Captures the full event
-/// taxonomy from `VirtioNetCounters` so the "something happened" check
-/// stays exhaustive — a regression that introduced a new code path
-/// without bumping any existing counter would fail the forward-progress
-/// invariant.
+/// Snapshot of every DATA-PATH counter the device mutates: the 13
+/// TX/RX loopback + shared `invalid_avail_idx_count` fields of
+/// `VirtioNetCounters`. The 3 control-vq counters (`ctrl_mq_set`,
+/// `ctrl_chain_invalid`, `ctrl_add_used_failures`) are captured
+/// separately by [`CvqCounterSnapshot`]. Keeping this data-path check
+/// exhaustive means a regression that introduced a new data-path code
+/// path without bumping any existing counter would fail the
+/// forward-progress invariant.
 #[derive(Default, Clone, Copy, Debug)]
 struct CounterSnapshot {
     tx_packets: u64,

@@ -199,7 +199,7 @@ impl VirtioBlkCounters {
     /// Concretely:
     ///
     /// - **Pre-publish gates that bump io_errors then call
-    ///   `publish_completion`**: SEG_MAX reject, bad header,
+    ///   `publish_completion`**: bad header,
     ///   header-read failure, SIZE_MAX reject, zero-data,
     ///   sub-sector data_len, direction violation. Each of these
     ///   records one io_errors event for the validation
@@ -284,7 +284,8 @@ impl VirtioBlkCounters {
     /// Decrement the live "currently waiting for tokens" gauge,
     /// saturating at 0. Called by `drain_bracket_impl` when the
     /// worker observes a successful drain after a prior stall, by
-    /// `reset_engine_*` on a reset that strands a stalled chain,
+    /// `reset_engine_inline` / `respawn_worker` on a reset that
+    /// strands a stalled chain,
     /// and by `Drop` on device destruction while the
     /// rollback-stalled flag is still set. The per-worker
     /// `currently_stalled` flag gates the transition so a paired

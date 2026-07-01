@@ -636,7 +636,8 @@ impl SidecarResult {
 ///
 /// Single source of truth for "is this file a sidecar?" — used
 /// by [`collect_sidecars_with_errors`]'s parsing walker and by
-/// `crate::cli::count_sidecar_files`'s file-count walker. Both
+/// the explain-sidecar file-count walker
+/// (`crate::cli::stats_cmds::explain_sidecar::count_sidecar_files`). Both
 /// walkers MUST agree on the predicate so `walked` (count) and
 /// `valid + errors` (parse outcomes) reconcile against each
 /// other; a divergence would let a file count toward `walked`
@@ -2507,7 +2508,9 @@ fn kernel_commit_for_sidecar() -> Option<String> {
 /// other's output.
 ///
 /// Uses [`siphasher::sip::SipHasher13`] with zero keys for the same
-/// stability reason as the initramfs cache keys — the discriminator
+/// cross-toolchain stability reason as the other zero-keyed
+/// SipHasher13 sites (`build.rs`, `runtime.rs` `content_hash`) —
+/// the discriminator
 /// must be the same across Rust toolchain versions or downstream
 /// tooling that groups variants by filename breaks.
 ///
@@ -3345,9 +3348,9 @@ fn is_sidecar_staging_filename(path: &std::path::Path) -> bool {
 /// inside the locked section that somehow survived the RAII
 /// drop, etc.) and surfacing that as an actionable error beats
 /// hanging the test run indefinitely. The timeout is asymmetric
-/// with the cache-store 60 s timeout because cache-store waits
-/// for tens of test runs to drain whereas this lock waits for
-/// at most one peer write.
+/// with the cache-store 300 s (5 minute) timeout because
+/// cache-store waits for tens of test runs to drain whereas this
+/// lock waits for at most one peer write.
 const RUN_DIR_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Compute the per-run-key flock sentinel path for `dir`.

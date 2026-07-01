@@ -23,7 +23,7 @@
 //!   form on every platform (matches the
 //!   [`src_file_size_guard`] convention).
 //! - `fn_name` is the function name as written in source. For impl
-//!   methods, the entry uses `"<Type>::method"` form so a single
+//!   methods, the entry uses `"Type::method"` form so a single
 //!   file with multiple impls on different types disambiguates per
 //!   method. For trait impl methods, the entry uses
 //!   `"<Type as Trait>::method"` form. For free functions the bare
@@ -80,7 +80,7 @@ const DEFAULT_FN_MAX_LINES: usize = 200;
 ///
 /// - `file` — path relative to `<repo>/src/`, forward-slash form.
 /// - `fn_name` — bare function name for free functions;
-///   `"<Type>::method"` for inherent impl methods;
+///   `"Type::method"` for inherent impl methods;
 ///   `"<Type as Trait>::method"` for trait impl methods.
 /// - `line_count` — brace-token span line count at the time the
 ///   entry was added (`end_line - start_line + 1`).
@@ -328,7 +328,7 @@ fn collect_functions(file: &Path) -> Vec<(String, usize)> {
         // A parse failure (likely a build-time-only file or a
         // macro-heavy file syn can't handle) is non-fatal — the
         // guard's purpose is to catch mega-functions, not police
-        // parser coverage. Surface as a Note for the operator via
+        // parser coverage. Surface as a warning for the operator via
         // stderr but do not flip the test.
         Err(e) => {
             eprintln!(

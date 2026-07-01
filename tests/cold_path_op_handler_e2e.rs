@@ -1,12 +1,14 @@
 //! Consolidated end-to-end coverage of the cold-path
 //! [`Op::WriteKernelCold`] / [`Op::ReadKernelCold`] dispatch path
-//! under scx-ktstr. Exercises the three resolution arms the v1
-//! dispatcher implements:
+//! under scx-ktstr. Exercises three of the resolution arms the
+//! dispatcher implements (the dispatcher also implements
+//! [`KernelTarget::Direct`] and [`KernelTarget::Kva`], not exercised
+//! here):
 //!
 //! - [`KernelTarget::TaskField`] — per-task `task_struct` field
-//!   writes under the dispatcher's 8-layer SCX validation chain
+//!   writes under the dispatcher's 7-layer SCX validation chain
 //!   (pid match, `start_time` identity, lifetime, `on_rq == 0`,
-//!   scx queued-empty, `ext_sched_class`, `policy == SCHED_EXT`,
+//!   scx queued-empty, `ext_sched_class`,
 //!   `start_boottime != 0`). Seeds an SCX-managed worker's
 //!   `scx.dsq_vtime` to ~30 days and asserts the read-back value
 //!   either equals the seed or has advanced forward (no regression).

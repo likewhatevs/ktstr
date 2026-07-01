@@ -793,7 +793,8 @@ fn build_id_hex_rejects_non_hex_inputs() {
 /// actually emits — the `{:02x}` byte-by-byte hex encoding,
 /// always lowercase, always even length. Pinned shapes cover
 /// the byte-count range of every build-id format the
-/// toolchain emits today (md5 → 16 chars, sha1 → 40, sha256
+/// toolchain emits today (md5 → 16 bytes → 32 chars, sha1 →
+/// 40, sha256
 /// → 64 with `--build-id=sha256`).
 #[test]
 fn build_id_hex_accepts_lowercase_hex() {

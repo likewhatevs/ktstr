@@ -42,10 +42,12 @@ pub(crate) use wire_format::{
 ///   - Clean source tree, cache miss → build, store at
 ///     `local-{hash7}-{arch}-kc{suffix}`, return cache entry dir
 ///     with `is_dirty=false`.
-///   - Clean source tree, cache hit → skip build, emit a stderr
-///     line referencing the user's raw input path, the resolved
-///     cache key, and the build age, then return cache entry dir
-///     with `is_dirty=false`.
+///   - Clean source tree, cache hit → skip build, log a
+///     `tracing::info!` cache-hit line referencing the user's raw
+///     input path, the resolved cache key, and the build age
+///     (rendered on stderr only when `RUST_LOG` enables the `info`
+///     level; suppressed under the default `warn` filter), then
+///     return cache entry dir with `is_dirty=false`.
 ///   - Dirty source tree → build in source, skip cache store,
 ///     return canonical source dir with `is_dirty=true`. The
 ///     caller appends `_dirty` to the kernel label so the test
@@ -58,8 +60,8 @@ pub(crate) use wire_format::{
 /// layout (`<dir>/arch/<arch>/boot/<image_name>`) are both probed.
 ///
 /// `raw_input` is the verbatim user-supplied `--kernel` argument
-/// before canonicalization — used in the cache-hit stderr line so
-/// the operator sees the path they actually typed (e.g.
+/// before canonicalization — used in the cache-hit `tracing::info!`
+/// line so the operator sees the path they actually typed (e.g.
 /// `../linux`) rather than the resolved canonical form, and in
 /// the resolve-failure error so a typo names whatever the user
 /// supplied.

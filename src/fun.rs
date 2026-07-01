@@ -11,8 +11,8 @@
 //! This is a CONTEXT-HYGIENE feature, not a security feature. Real
 //! pids, cpu ids, cgroup names, and process comms are not sensitive
 //! per se — they are just noisy when fed to an LLM that does not
-//! need them. Replacing them with `swift-otter`-style names lets
-//! the reader reason about "swift-otter migrated from CPU 3 to CPU 7"
+//! need them. Replacing them with `agile-otter`-style names lets
+//! the reader reason about "agile-otter migrated from CPU 3 to CPU 7"
 //! without learning anything internal about whatever pid that
 //! actually was.
 //!
@@ -33,9 +33,9 @@
 //!
 //!   - [`Funifier::petname_for`] turns a string identifier (cgroup
 //!     name, process comm, scheduler name, ...) into a deterministic
-//!     `adjective-animal` pair like `"swift-otter"`.
+//!     `adjective-animal` pair like `"agile-otter"`.
 //!   - [`Funifier::numeric_id`] turns a u64 identifier (pid, tid, cpu,
-//!     cgroup id, ...) into another u64 via an HMAC-keyed permutation.
+//!     cgroup id, ...) into another u64 via a SipHash-2-4 keyed permutation.
 //!     The mapping is deterministic per `(seed, category, n)` so
 //!     cross-references inside a dump survive.
 //!
@@ -78,9 +78,10 @@ pub struct Funifier {
     /// 16-byte SipHash key. SipHash-2-4 is a keyed PRF; 128-bit key
     /// is enough for the LLM-context-hygiene goal (we are not
     /// defending against an attacker, only against accidental
-    /// context pollution). Derived either from a CSPRNG
-    /// ([`Self::ephemeral`]) or from an HMAC of a user-supplied
-    /// seed plus [`FUN_PEPPER`] ([`Self::with_seed`]).
+    /// context pollution). Derived either from SHA-256 over the
+    /// process pid and a ns timestamp ([`Self::ephemeral`]) or
+    /// from SHA-256 over [`FUN_PEPPER`] and a user-supplied seed
+    /// ([`Self::with_seed`]).
     key: [u8; 16],
 }
 
@@ -92,8 +93,10 @@ impl Funifier {
     /// "produce a fun version of this output" without any need to
     /// reproduce the mapping later.
     ///
-    /// Reads from /dev/urandom via the standard `getrandom`
-    /// syscall path (through `rand::thread_rng`).
+    /// Derives the key from SHA-256 over the process pid and a
+    /// nanosecond timestamp; no rand/getrandom dependency (see
+    /// body comment). Two instances in one process differ only
+    /// via the ns timestamp.
     pub fn ephemeral() -> Self {
         // SHA-256 over (process pid, monotonic ns) for the
         // ephemeral key. Avoids depending on a specific rand-crate
@@ -169,8 +172,10 @@ impl Funifier {
     /// Examples (with a fixed seed):
     /// ```ignore
     /// let f = Funifier::with_seed("demo");
-    /// f.petname_for("comm", "ktstr_test_main");  // "swift-otter"
-    /// f.petname_for("comm", "scx_simple");       // "fluffy-badger"
+    /// // Each call yields an adjective-animal pair; the exact
+    /// // pair is seed-dependent.
+    /// f.petname_for("comm", "ktstr_test_main");
+    /// f.petname_for("comm", "scx_simple");
     /// ```
     pub fn petname_for(&self, category: &str, payload: &str) -> String {
         let h = self.keyed_hash(category.as_bytes(), payload.as_bytes());
@@ -345,11 +350,11 @@ impl Funifier {
             // failure-dump enrichment.
             | "uid" | "euid" | "ruid" | "suid" | "fsuid"
             | "gid" | "egid" | "rgid" | "sgid" | "fsgid"
-            // /proc/[pid]/status `Tgid:` and `Pid:` are signed
-            // pid_t (i32) but most schemas representing them in
-            // unsigned form use u32. The *_set/u32 listing keeps
-            // them in the narrow path so the masked output fits
-            // a downstream u32 cast.
+            // Kernel-namespace uid/gid resolved forms. Linux
+            // kuid_t/kgid_t wrap unsigned int (u32), so the
+            // whole-key match keeps them in the 32-bit-masked
+            // narrow path so the masked output fits a downstream
+            // u32 cast.
             | "kuid" | "kgid"
         ) {
             return true;

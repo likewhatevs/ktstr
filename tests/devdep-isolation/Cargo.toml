@@ -23,10 +23,13 @@ publish = false
 # rust-toolchain.toml when building from inside the workspace tree.
 
 # Empty `[workspace]` makes this crate its own workspace root, breaking
-# inheritance from the parent ktstr `[workspace]`. Without this the
-# fixture would compile every time the parent workspace builds (and
-# share resolver/profile settings with it), defeating the "isolated
-# downstream perspective" the test is checking.
+# inheritance from the parent ktstr `[workspace]`. The parent lists
+# explicit `members` (`.`, `ktstr-macros`, `scx-ktstr`) that do not
+# include this fixture, but the crate still sits inside the parent tree;
+# without this stanza, running cargo from inside the fixture dir would
+# error ("current package believes it's in a workspace when it is not")
+# and it would share resolver/profile settings with the parent,
+# defeating the "isolated downstream perspective" the test is checking.
 [workspace]
 
 [dependencies]

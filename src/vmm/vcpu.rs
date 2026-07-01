@@ -641,13 +641,13 @@ pub(crate) struct ApFreezeHandles {
 /// the freeze coordinator polls alongside the BPF .bss latch.
 ///
 /// Why a hardware watchpoint: the BPF .bss poll requires a full
-/// guest-memory page-walk every 100 ms iteration AND a parallel BPF
+/// guest-memory page-walk every 250 ms iteration AND a parallel BPF
 /// program writing the latch. The watchpoint is delivered
 /// synchronously by hardware the instant the kernel sets `exit_kind`
 /// (e.g. `kernel/sched/ext.c` `scx_exit` path), with no host-side
 /// polling overhead and no dependency on the probe BPF program being
 /// loaded. It also fires on ANY exit_kind transition — including
-/// SCX_EXIT_BPF / SCX_EXIT_STALL paths the .bss probe might miss
+/// SCX_EXIT_ERROR_BPF / SCX_EXIT_ERROR_STALL paths the .bss probe might miss
 /// when its tp_btf hook ran before the kernel teardown.
 /// The .bss path remains because the watchpoint can be unavailable
 /// (no `scx_root` symbol on pre-6.16, BTF stripped of `scx_sched`,

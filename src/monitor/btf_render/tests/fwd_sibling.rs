@@ -420,7 +420,7 @@ fn cast_chase_kernel_target_fwd_resolves_to_complete_struct_sibling() {
 /// struct/union declarations (rare but legal); collapsing across
 /// aggregate kinds would mis-render the wrong layout. Verifies
 /// the Fwd shortcut respects [`btf_rs::Fwd::is_struct`] /
-/// [`is_union`].
+/// `is_union`.
 #[test]
 fn fwd_shortcut_rejects_aggregate_kind_mismatch() {
     let mut strings: Vec<u8> = vec![0];

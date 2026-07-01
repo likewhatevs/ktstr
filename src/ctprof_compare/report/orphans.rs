@@ -3,8 +3,9 @@
 //!
 //! Three rendered blocks:
 //!
-//! - **Fudged cgroup matches** — N:1 cgroup merges the operator
-//!   asked the fudge stage to produce. Rendered FIRST so they
+//! - **Fudged cgroup matches** — N:1 cgroup merges the fudge
+//!   stage produces automatically under [`GroupBy::All`] when
+//!   both orphan lists are non-empty. Rendered FIRST so they
 //!   surface above the orphan lists; they are the most
 //!   informative output and putting them after the orphans
 //!   buries them under noise.

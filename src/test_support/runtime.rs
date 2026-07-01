@@ -129,7 +129,8 @@ pub(crate) fn verbose() -> bool {
 /// True when `KTSTR_NO_PERF_MODE` is set to a NON-EMPTY value.
 ///
 /// Centralises the perf-mode-disabled check used by the dispatch
-/// gauntlet routes (`run_named_test`, `run_gauntlet_test` in
+/// gauntlet routes (`run_named_test`, `run_gauntlet_test`, and the
+/// verifier-cell listing route `list_verifier_cells_all`, all in
 /// `super::dispatch`) and the eval entry path
 /// (`super::eval::run_ktstr_test_inner_impl`). All four sites
 /// previously called `std::env::var("KTSTR_NO_PERF_MODE").is_ok()`
@@ -151,11 +152,11 @@ pub(crate) fn no_perf_mode_active() -> bool {
 /// True when `KTSTR_BYPASS_LLC_LOCKS` is set to a NON-EMPTY value.
 ///
 /// Centralises the bypass check used at 7 reader sites:
-/// `vmm/builder.rs:909`, `cli/kernel_build/build.rs:102` +
-/// `:473` (the inverse `!bypass_llc_locks_active()` form),
-/// `bin/cargo_ktstr/kernel/mod.rs:694`,
-/// `bin/cargo_ktstr/misc/shell.rs:199`, and `bin/ktstr.rs:592` +
-/// `:1744`. All sites previously spelled the same
+/// `vmm/builder.rs:1199`, `cli/kernel_build/build.rs:102` +
+/// `:488` (the latter the inverse `!bypass_llc_locks_active()`
+/// form), `bin/cargo_ktstr/kernel/mod.rs:720`,
+/// `bin/cargo_ktstr/misc/shell.rs:181`, and `bin/ktstr.rs:652` +
+/// `:1267`. All sites previously spelled the same
 /// `.ok().is_some_and(|v| !v.is_empty())` inline; centralising
 /// eliminates the drift hazard and matches the
 /// `no_perf_mode_active` shape so the empty-string contract is
@@ -309,8 +310,8 @@ pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
         parts.push(karg.to_string());
     }
     // Per-test KASLR opt-out (see `KtstrTestEntry.kaslr` doc). The base
-    // cmdline at `src/vmm/setup.rs` does NOT inject `nokaslr` by default —
-    // KASLR is on. A test that needs determinism sets `kaslr = false` in
+    // cmdline `base_guest_cmdline` at `src/vmm/setup/mod.rs` does NOT
+    // inject `nokaslr` by default — KASLR is on. A test that needs determinism sets `kaslr = false` in
     // its `#[ktstr_test]` attribute; that lands the token here, where it
     // composes with any operator-supplied `Scheduler::kargs(&["nokaslr"])`
     // above (kernel parses the flag as a bool; duplicates are harmless).
@@ -492,8 +493,9 @@ fn cgroup_parent_example(entry: &KtstrTestEntry) -> String {
 pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<String>) {
     // Fail-fast on a malformed user-supplied `--cell-parent-cgroup`
     // value before the auto-inject branch. The host-side consumer
-    // `resolve_cgroup_root` (used by the probe/setup path at
-    // `probe.rs::run_scenario_probe`) interpolates the value into a
+    // `resolve_cgroup_root` (defined in `test_support::args`, used by
+    // the probe/setup path at `probe.rs::build_dispatch_ctx_parts`)
+    // interpolates the value into a
     // `/sys/fs/cgroup{path}` literal and hands the result to
     // `CgroupManager::new`, which has NO host-root guard — any path
     // that doesn't start with `/` lands inside the host cgroup root
@@ -2406,7 +2408,7 @@ mod tests {
 
     #[test]
     fn vm_timeout_from_entry_scales_headroom_with_topology() {
-        // The B2 reporter's case: numa=1, llcs=7, cores=9, threads=2 → 126 vCPUs.
+        // A reported case: numa=1, llcs=7, cores=9, threads=2 → 126 vCPUs.
         // sys_rdy_budget_ms(126) = 28_900 ms (10_000 base + 126×150) →
         // vm_boot_headroom = 38.9 s. base = max(5 s watchdog, 12 s
         // duration, 1 s) = 12 s → total = 50.9 s.
@@ -2607,7 +2609,7 @@ mod tests {
     fn sys_rdy_budget_ms_scales_linearly_in_band() {
         // 10_000 ms base + vcpus × 150, in the band below the 90 s cap.
         assert_eq!(sys_rdy_budget_ms(67), 20_050);
-        // The reporter's 126-vCPU case lands at 28.9 s.
+        // The 126-vCPU case lands at 28.9 s.
         assert_eq!(sys_rdy_budget_ms(126), 28_900);
         // 256-vCPU wide-SMP gets its FULL additive budget (48.4 s) — the
         // case the old 30 s cap truncated to 30 s, starving the boot.

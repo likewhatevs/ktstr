@@ -129,6 +129,7 @@ identical work for no signal.
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 | `--no-skip-mode` | off | Convert resource-contention and host-topology-insufficient skips into hard test failures (exit `1` instead of `0`). Default behavior skips so a contended runner does not fail tests that simply could not start; setting this flag opts into "if the test cannot run, the test fails". Exports `KTSTR_NO_SKIP_MODE=1` for the test binary. |
 | `--release` | off | Build and run tests with the release profile (`--cargo-profile release` to nextest). Release mode applies **stricter assertion thresholds** (`gap_threshold_ms` 2000 vs debug's 3000, `spread_threshold_pct` 15% vs debug's 35%) — tests that barely pass in debug may fail under `--release`. `catch_unwind`-based tests and tests gated on `#[cfg(debug_assertions)]` are skipped. |
+| `--release-scheduler` | off | Build the scheduler-under-test (a `SchedulerSpec::Discover` package) with the release profile while keeping the harness/test binary on the dev profile. Decouples scheduler optimization from the harness's assertion thresholds and `panic`/`catch_unwind` behavior — the right setting for a perf test that wants an optimized scheduler but normal harness behavior. Implied by `--release`; exports `KTSTR_SCHEDULER_PROFILE=release`. |
 
 ### What it does (path mode only)
 
@@ -265,8 +266,8 @@ values. CI gates and dashboards triage runs by exit code:
 
 | Code | Verdict      | Meaning                                                                                                                                                |
 |------|--------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `0`  | Pass / Skip  | All assertions passed, or the test never ran (host topology insufficient, resource contention). Skip degenerates to Pass at the process boundary.      |
-| `1`  | Fail         | At least one assertion failed; OR a requested host guarantee is impossible — `performance_mode` on a host too small for the topology (`PerfModeUnavailable`), or an explicit per-test `cpu_budget` / `--cpu-cap` the host cannot satisfy (`CpuBudgetUnsatisfiable`) — both hard errors, NOT the skips in the `0` row; OR `expect_err = true` and the test produced a Pass / Inconclusive (an `expect_err` test whose gate could not evaluate is unsatisfied just as it would be on a Pass). |
+| `0`  | Pass / Skip  | All assertions passed, or the test never ran (host topology insufficient, resource contention, or `performance_mode` unavailable on a host too small for the topology). These host-insufficiency skips degenerate to Pass at the process boundary — unless `--no-skip-mode` / `KTSTR_NO_SKIP_MODE` promotes them to exit `1`. |
+| `1`  | Fail         | At least one assertion failed; OR an explicit per-test `cpu_budget` / `--cpu-cap` the host cannot satisfy (`CpuBudgetUnsatisfiable`, an unconditional hard error — NOT the host-insufficiency skips in the `0` row); OR a host-insufficiency skip (`PerfModeUnavailable`, resource contention, topology insufficient) run under `--no-skip-mode` / `KTSTR_NO_SKIP_MODE`; OR `expect_err = true` and the test produced a Pass / Inconclusive (an `expect_err` test whose gate could not evaluate is unsatisfied just as it would be on a Pass). |
 | `2`  | Inconclusive | A zero-denominator ratio gate could not evaluate — the workload produced no signal to ratio against, so neither pass nor fail is truthful.             |
 
 Exit code `2` is the silent-pass guard: a Pass at a `≤ threshold`
@@ -343,6 +344,7 @@ cargo ktstr coverage -- --workspace --lcov --output-path lcov.info # lcov output
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 | `--no-skip-mode` | off | Convert resource-contention and host-topology-insufficient skips into hard test failures. Same semantics as on `test`; exports `KTSTR_NO_SKIP_MODE=1` for the test binary. |
 | `--release` | off | Collect coverage with the release profile (`--cargo-profile release` to llvm-cov nextest). Same stricter-threshold caveats as `test --release` — release mode applies `gap_threshold_ms=2000` / `spread_threshold_pct=15%`, and skips `catch_unwind`-based tests along with `#[cfg(debug_assertions)]`-gated tests. |
+| `--release-scheduler` | off | Build the scheduler-under-test with the release profile while keeping the harness on the dev profile (same contract as `cargo ktstr test --release-scheduler`). Implied by `--release`; exports `KTSTR_SCHEDULER_PROFILE=release`. |
 
 Requires `cargo-llvm-cov` and the `llvm-tools-preview` rustup
 component:
@@ -815,8 +817,9 @@ cargo ktstr stats list-metrics --json       # JSON array
 List the distinct values present per filterable dimension in the
 sidecar pool. Walks every run directory under `target/ktstr/`
 (or `--dir`), pools the sidecars, and reports per-dimension sets
-for all eight dimensions: `kernel`, `commit`, `kernel_commit`,
-`source`, `cpu_budget`, `scheduler`, `topology`, and `work_type`.
+for all nine dimensions: `kernel`, `commit`, `kernel_commit`,
+`source`, `resolve_source`, `cpu_budget`, `scheduler`, `topology`, and
+`work_type`.
 The `commit` and `source` keys map to the internal
 `SidecarResult::project_commit` / `run_source` fields; the JSON
 wire keys keep the shorter spellings. `cpu_budget` is the only
@@ -846,6 +849,7 @@ dimension name with arrays of values:
   "commit": [null, "abcdef1", "abcdef1-dirty"],
   "kernel_commit": [null, "kabcde7", "kabcde7-dirty"],
   "source": [null, "ci", "local"],
+  "resolve_source": [null, "auto_built", "target_debug"],
   "cpu_budget": [4, 16],
   "scheduler": ["eevdf", "scx_rusty"],
   "topology": ["1n2l4c1t", "1n4l2c1t"],
@@ -1081,14 +1085,14 @@ cargo ktstr stats compare \
 
 **Symmetric sugar.** Shared `--X` flags (`--kernel`, `--scheduler`,
 `--topology`, `--work-type`, `--project-commit`, `--kernel-commit`,
-`--run-source`, `--cpu-budget`) pin BOTH sides to the same value(s).
-Per-side `--a-X` / `--b-X` flags REPLACE the corresponding shared
-`--X` value for that side only — "more-specific replaces" semantics.
-So `--kernel 6.14 --a-kernel 6.13` puts A on 6.13 and B on 6.14.
-Together the eight slicing dimensions (`kernel`, `scheduler`,
-`topology`, `work-type`, `project-commit`, `kernel-commit`,
-`run-source`, `cpu-budget`) cover every typed axis the comparison
-can contrast on.
+`--run-source`, `--resolve-source`, `--cpu-budget`) pin BOTH sides to
+the same value(s). Per-side `--a-X` / `--b-X` flags REPLACE the
+corresponding shared `--X` value for that side only — "more-specific
+replaces" semantics. So `--kernel 6.14 --a-kernel 6.13` puts A on 6.13
+and B on 6.14. Together the nine slicing dimensions (`kernel`,
+`scheduler`, `topology`, `work-type`, `project-commit`,
+`kernel-commit`, `run-source`, `resolve-source`, `cpu-budget`) cover
+every typed axis the comparison can contrast on.
 
 `cpu-budget` (the effective host-CPU budget a run's vCPU threads ran
 on) is a PAIRING dimension by default: even without any `--cpu-budget`
@@ -1155,11 +1159,12 @@ applies to `--a-kernel` / `--b-kernel`.
 **Discovering filter values.** Run
 [`cargo ktstr stats list-values`](#list-values) before
 crafting a `compare` invocation to see what `kernel`, `commit`,
-`kernel_commit`, `source`, `cpu_budget`, `scheduler`, `topology`,
-and `work_type` values the sidecar pool actually carries; passing a
+`kernel_commit`, `source`, `resolve_source`, `cpu_budget`,
+`scheduler`, `topology`, and `work_type` values the sidecar pool
+actually carries; passing a
 `--a-kernel 6.20` against an empty pool fails downstream with
 "no rows match filter A" and `list-values` is the upstream
-answer to "what have I got?". `list-values` reports all eight
+answer to "what have I got?". `list-values` reports all nine
 filterable dimensions; the JSON keys `commit` and `source` map
 to the per-side filter flags `--project-commit` and
 `--run-source`.
@@ -1180,6 +1185,7 @@ missing and what each absence means.
 | `--project-commit HASH` (repeatable) | -- | Pin BOTH sides to listed `project_commit` value(s) (7-char hex, optional `-dirty` suffix). Also accepts git revspecs (`HEAD`, `HEAD~N`, tags, branches, `A..B` ranges) resolved against the project repo into the same 7-char short hashes; see `--help` for details. Filters the ktstr framework commit; the scheduler binary's commit (`SidecarResult::scheduler_commit`) is not currently exposed as a filter. |
 | `--kernel-commit HASH` (repeatable) | -- | Pin BOTH sides to listed `kernel_commit` value(s) (7-char hex, optional `-dirty` suffix). Also accepts git revspecs (`HEAD`, `HEAD~N`, tags, branches, `A..B` ranges) resolved against the kernel repo (`gix::open` against `KTSTR_KERNEL`'s path); see `--help` for details. Filters the kernel SOURCE TREE commit (`SidecarResult::kernel_commit`), distinct from the kernel release version (`--kernel`): two runs of the same `kernel_version` with different `kernel_commit` values represent the same release rebuilt from different trees. Rows whose `kernel_commit` is `None` (KTSTR_KERNEL pointed at a non-git path, the underlying source was Tarball / Git rather than a `Local` tree, or the gix probe failed) NEVER match a populated filter. |
 | `--run-source NAME` (repeatable) | -- | Pin BOTH sides to listed run-environment source(s). Filters `SidecarResult::run_source` set by `detect_run_source` at sidecar-write time: `"local"` for developer runs, `"ci"` when `KTSTR_CI` was set, or rewritten to `"archive"` at load time when `--dir` points at a non-default pool root. Rows whose `run_source` is `None` (sidecar pre-dates the field) NEVER match a populated filter — same opt-in policy as `--kernel` / `--project-commit` / `--kernel-commit`. Combine per-side `--a-run-source ci --b-run-source local` to contrast CI runs against developer runs of the same scenarios. |
+| `--resolve-source NAME` (repeatable) | -- | Pin BOTH sides to listed scheduler-resolution source(s) — HOW the scheduler binary was discovered for the run (`SidecarResult::resolve_source`; e.g. `auto_built`, `target_debug`, `target_release`, `sibling_dir`, `path`, `env_var`, `path_lookup`, `not_found`). OR-combined, strict equality. Distinct from `--run-source` (the run ENVIRONMENT): this is the scheduler discovery PATH. Rows whose `resolve_source` is `None` (sidecar pre-dates the field, or a skip resolved no binary) NEVER match a populated filter — same opt-in policy as `--run-source`. Combine per-side `--a-resolve-source auto_built --b-resolve-source target_debug` to contrast auto-built vs stale-target runs. |
 | `--cpu-budget N` (repeatable) | -- | Pin BOTH sides to listed effective host-CPU budget(s) — the number of host CPUs the run's vCPU threads ran on (`SidecarResult::cpu_budget`, decimal). `cpu_budget` is a PAIRING dimension: even without this flag, two runs of different budgets never pair, so a budget-confined run is never silently compared against a roomy one. Rows with no recorded budget (skip rows that never booted) never match. Use the per-side `--a-cpu-budget` / `--b-cpu-budget` to deliberately contrast budgets, and prefer the overcommit-invariant `worst_iterations_per_cpu_sec` metric over raw timing when you do. |
 | `--a-kernel VER` (repeatable) | -- | A-side kernel filter. Replaces the shared `--kernel` for the A side only. |
 | `--a-scheduler NAME` (repeatable) | -- | A-side scheduler filter, OR-combined. Replaces the shared `--scheduler` value for the A side only. |
@@ -1188,6 +1194,7 @@ missing and what each absence means.
 | `--a-project-commit HASH` (repeatable) | -- | A-side project-commit filter. Replaces the shared `--project-commit` for the A side only. |
 | `--a-kernel-commit HASH` (repeatable) | -- | A-side kernel-commit filter. Replaces the shared `--kernel-commit` for the A side only. |
 | `--a-run-source NAME` (repeatable) | -- | A-side run-source filter. Replaces the shared `--run-source` for the A side only. |
+| `--a-resolve-source NAME` (repeatable) | -- | A-side resolve-source filter. Replaces the shared `--resolve-source` for the A side only. |
 | `--a-cpu-budget N` (repeatable) | -- | A-side cpu-budget filter. Replaces the shared `--cpu-budget` for the A side only. Use with `--b-cpu-budget` to contrast two host-CPU budgets. |
 | `--b-kernel VER` (repeatable) | -- | B-side kernel filter. Replaces the shared `--kernel` for the B side only. |
 | `--b-scheduler NAME` (repeatable) | -- | B-side scheduler filter, OR-combined. Replaces the shared `--scheduler` value for the B side only. |
@@ -1196,6 +1203,7 @@ missing and what each absence means.
 | `--b-project-commit HASH` (repeatable) | -- | B-side project-commit filter. Replaces the shared `--project-commit` for the B side only. |
 | `--b-kernel-commit HASH` (repeatable) | -- | B-side kernel-commit filter. Replaces the shared `--kernel-commit` for the B side only. |
 | `--b-run-source NAME` (repeatable) | -- | B-side run-source filter. Replaces the shared `--run-source` for the B side only. |
+| `--b-resolve-source NAME` (repeatable) | -- | B-side resolve-source filter. Replaces the shared `--resolve-source` for the B side only. |
 | `--b-cpu-budget N` (repeatable) | -- | B-side cpu-budget filter. Replaces the shared `--cpu-budget` for the B side only. Use with `--a-cpu-budget` to contrast two host-CPU budgets. |
 | `--no-average` | off | Disable averaging. Each sidecar stays distinct; bails with an actionable error when multiple sidecars on the same side share the same pairing key (since pairing across sides becomes ambiguous). |
 | `--threshold PCT` | per-metric `default_rel` | Uniform relative significance threshold in percent. Overrides the per-metric `default_rel` for every metric; the absolute gate is always per-metric and cannot be tuned from the CLI. Mutually exclusive with `--policy`. |
@@ -1319,6 +1327,8 @@ exits `0` — an empty perf set is "nothing to compare", not a failure.
 | `-E, --filter EXPR` | all `performance_mode` | Nextest filter narrowing within the `performance_mode` set. |
 | `--threshold PCT` | registry defaults | Uniform relative regression gate (percent). Mutually exclusive with `--policy`. |
 | `--policy PATH` | registry defaults | Per-metric threshold JSON. Mutually exclusive with `--threshold`. Schema: see [`stats compare`](#stats). |
+| `--noise-adjust N` | off | Self-tuning noise mode (commit axis only; requires `--kernel`): run each side N times and decide significance from the observed per-side spread — B's mean leaving A's `[min, max]` band — instead of a fixed `--threshold`. Implies dual-run production looped N times. Conflicts with `--a-scheduler`/`--b-scheduler`, `--threshold`, `--policy`, and `--dual-run`. |
+| `--noise-spread-threshold PCT` | `1.0` | Per-side relative-spread limit (percent) above which `--noise-adjust` flags a metric too noisy to trust. Requires `--noise-adjust`. |
 | `--a-scheduler X` / `--b-scheduler Y` | — | CONFIG axis: compare two scheduler configs at the same commit (partitioned by `scheduler`). Both required together; conflict with the commit-axis flags `--base`/`--base-ref`/`--dual-run`. |
 | `--no-phases` / `--phases-only` / `--steps-only` / `--phase N` / `--phase-threshold PCT` | full per-phase render | Per-phase output projection (render-only; does not change the verdict). Same flags as `stats compare`. |
 
@@ -1469,8 +1479,9 @@ semantics.
 cargo install --locked ktstr   # the two user-facing binaries
 ```
 
-The two test-fixture binaries (`ktstr-jemalloc-probe`,
-`ktstr-jemalloc-alloc-worker`) require the non-default `integration`
+The four test-fixture binaries (`ktstr-jemalloc-probe`,
+`ktstr-jemalloc-alloc-worker`, `ktstr-schbench-validate`,
+`ktstr-taobench-validate`) require the non-default `integration`
 feature, so a default `cargo install` builds only `ktstr` and
 `cargo-ktstr` and never places the fixtures on `$PATH`.
 

@@ -26,7 +26,7 @@ fn worker_group_size_wake_chain() {
 }
 /// `WakeChain { wake: WakeMechanism::Pipe }` must dispatch
 /// the bootstrap byte ONLY at stage 0. The dispatch site
-/// (`workload.rs::worker_main` pipe-mode arm) gates the
+/// (`worker/mod.rs::worker_main` pipe-mode arm) gates the
 /// first-iteration `libc::write` behind both `iterations == 0`
 /// AND `pos == 0`. A regression that drops `pos == 0` would
 /// have every stage fire its bootstrap byte simultaneously at
@@ -63,7 +63,8 @@ fn worker_group_size_wake_chain() {
 /// bootstrap-once invariant by failing catastrophically when
 /// the guard is dropped, and does not exercise normal
 /// operation. Normal-operation coverage lives in
-/// [`spawn_thread_with_wake_chain_pipe`] and similar.
+/// [`super::tests_thread_mode::spawn_thread_with_wake_chain_pipe`]
+/// and similar.
 #[test]
 fn wake_chain_pipe_bootstrap_once_invariant() {
     // DEPTH=4 is load-bearing: with depth=2 the buggy total
@@ -370,8 +371,7 @@ fn pathology_wake_chain_iterates() {
 /// `WorkType::WakeChain { wake: WakeMechanism::Pipe }` smoke test. Drives the
 /// anon-pipe ring path so the kernel `wake_up_interruptible_sync_poll`
 /// → `__wake_up_sync_key` → `WF_SYNC` chain runs end-to-end.
-/// Asserts every worker iterates at least once; the rigorous
-/// WF_SYNC-fired assertion lives in #294.
+/// Asserts every worker iterates at least once.
 #[test]
 fn pathology_wake_chain_sync_iterates() {
     let cfg = WorkloadConfig {
@@ -616,9 +616,9 @@ fn wake_chain_spawn_accepts_positive_multiples_of_depth() {
     }
 }
 /// `WakeChain { wake: WakeMechanism::Pipe }` stop responsiveness. Pins the
-/// FIX 1 contract: workers blocked in the pipe `read` must
-/// re-check `stop_requested` via the `poll(POLLIN, 100ms)`
-/// loop and exit cleanly. `stop_and_collect` must complete
+/// stop-responsiveness contract: workers blocked in the pipe
+/// `read` re-check `stop_requested` via the `poll(POLLIN, 100ms)`
+/// loop (worker/mod.rs) and exit cleanly. `stop_and_collect` must complete
 /// within 500 ms (well under the SIGUSR1 escalation deadline)
 /// and every worker must report `completed == true`.
 #[test]

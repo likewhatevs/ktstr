@@ -114,8 +114,9 @@ fn note_value_survives_serde_roundtrip() {
 /// Empty `measurements` is present in the wire format as `{}`.
 /// `skip_serializing_if` was removed because AssertResult is
 /// serialized with postcard (positional) — skipping a field on
-/// serialize misaligns the deserializer. `#[serde(default)]`
-/// handles old sidecars that lack the key.
+/// serialize misaligns the deserializer. Per the pre-1.0
+/// no-compat stance, old sidecars lacking the key are
+/// regenerated rather than defaulted.
 #[test]
 fn empty_measurements_present_in_wire_format() {
     let r = AssertResult::pass();

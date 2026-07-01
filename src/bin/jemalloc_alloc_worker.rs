@@ -64,7 +64,8 @@ use std::time::Duration;
 // (`src/worker_ready.rs`) via `#[path]` rather than `use ktstr::...`.
 // Linking the ktstr library into this binary would pull in the
 // library's early-dispatch ctor (`test_support::dispatch::ktstr_test_early_dispatch`,
-// tagged `#[ctor::ctor]`) plus the rest of the crate, bloating the
+// declared via `ctor::declarative::ctor!` — a pre-main `.init_array`
+// constructor) plus the rest of the crate, bloating the
 // initramfs image and adding `.init_array` work that can stall the
 // probe's cross-process timing. `#[path]` compiles the same source
 // file into this bin crate directly — zero linker cost, same

@@ -10,14 +10,14 @@
 //!    suid-stripped or root-but-no-HOME process produces a clear error
 //!    rather than writing into `/root/.cache/...` by accident.
 //!    [`path_inside_cache_root`] is the cache-membership predicate used
-//!    by callers (notably the model resolver and BTF probe) to decide
+//!    by callers (notably the BTF probe) to decide
 //!    whether a path on disk is "ours" before applying cache-aware
 //!    invalidation.
 //!
 //! 2. **Source-tree DWARF re-routing.** [`prefer_source_tree_for_dwarf`]
-//!    short-circuits the cache when the operator's cwd happens to be a
-//!    kernel source tree whose vmlinux is full-fat (matching the cached
-//!    one's identity). Combined with [`recover_local_source_tree`]
+//!    short-circuits the cache when a cache entry's persisted source
+//!    tree still holds a vmlinux matching the cached one's identity
+//!    (size + mtime). Combined with [`recover_local_source_tree`]
 //!    (which reads `metadata.json` to find the canonical source path
 //!    for a cached entry), this lets `cargo ktstr test` reuse the
 //!    operator's tree directly and avoid stripping debug info from a

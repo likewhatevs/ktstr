@@ -53,7 +53,7 @@ pub(crate) struct ScxWalkerOwned {
     /// vmlinux). The task-enrichment capture walks this list as
     /// the primary task source — it survives the per-rq
     /// runnable_list drain that scheduler teardown triggers
-    /// (`scx_bypass`, kernel/sched/ext.c:5304-5404).
+    /// (`scx_bypass`, kernel/sched/ext.c:5448-5548).
     pub(crate) scx_tasks_kva: u64,
     /// Runtime virtual KASLR slide. `scx_tasks_kva` is the LINK-TIME
     /// symbol value; the global list's `.next` pointers are runtime
@@ -293,9 +293,9 @@ mod tests {
 
     /// Build an owned accessor whose `GuestKernel` reports the
     /// default test `PAGE_OFFSET`. `build` reads only
-    /// `guest_kernel().page_offset()` from the accessor (and never
-    /// on the degraded arm), so an empty synthetic memory + symbol
-    /// set suffices.
+    /// `guest_kernel().page_offset()` from the accessor (a stored
+    /// scalar, unused on the degraded arm), so an empty synthetic
+    /// memory + symbol set suffices.
     fn test_accessor() -> GuestMemMapAccessorOwned {
         // SAFETY: `Box::leak` gives a `'static` backing buffer, so the
         // pointer GuestMem holds stays valid for the returned
@@ -550,7 +550,7 @@ mod tests {
     /// under a non-zero `kaslr_offset`. Before the KASLR slide was
     /// threaded into both helpers, they silently omitted it and
     /// produced identical (wrong) PAs — the prior cross-checks at
-    /// L257 / L281 pass `kaslr_offset = 0` to both sides, so they
+    /// L342 / L366 pass `kaslr_offset = 0` to both sides, so they
     /// would not detect an asymmetry where one side picks up the new
     /// arg and the other doesn't. The shared helper + this test
     /// together pin the contract: a future change that drops the

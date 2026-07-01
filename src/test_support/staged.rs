@@ -23,7 +23,8 @@
 /// The list is intentionally narrow — only names the guest init
 /// actually reads (see `src/vmm/rust_init/scheduler.rs` for the
 /// `/scheduler` binary spawn in `spawn_scheduler_from_paths`,
-/// `src/vmm/initramfs.rs:1007-1016` for the suffix file shapes).
+/// `build_suffix` in `src/vmm/initramfs.rs` (~1150-1191) for the
+/// suffix file shapes).
 /// Adding a name here is a behavior change for every existing
 /// scheduler whose `name` happens to match; expand cautiously.
 pub(crate) const RESERVED_SCHEDULER_NAMES: &[&str] = &[
@@ -38,8 +39,10 @@ pub(crate) const RESERVED_SCHEDULER_NAMES: &[&str] = &[
 
 /// Maximum byte length for a staged scheduler `name`. Caps the
 /// composed cpio entry path `staging/schedulers/<name>/sched_args`
-/// well under the kernel's PATH_MAX (4096) so a malformed-archive
-/// bail at `init/initramfs.c:296` never surfaces — instead
+/// well under the kernel's PATH_MAX (4096) so the kernel cpio
+/// extractor's over-length-name skip at `init/initramfs.c:296`
+/// (`if (name_len > PATH_MAX) return 0;` — a silent no-extract,
+/// not an error) never fires — instead
 /// [`validate_staged_scheduler_name`] rejects the over-length name
 /// with a sharp error. 128 chosen to comfortably exceed every
 /// real-world scheduler name (typically 10-30 bytes, e.g.
@@ -73,8 +76,9 @@ pub(crate) fn validate_staged_scheduler_name(who: &str, sched_name: &str) -> any
              the cap is {MAX_STAGED_SCHEDULER_NAME_LEN} bytes so the \
              composed `staging/schedulers/<name>/sched_args` path stays \
              well under the kernel's PATH_MAX cpio limit \
-             (init/initramfs.c rejects names > PATH_MAX with a malformed-\
-             archive bail; the cap surfaces a cleaner error here)",
+             (init/initramfs.c silently skips names > PATH_MAX \
+             (do_header return 0, no extract); the cap surfaces a \
+             cleaner host-side error here)",
             len = sched_name.len(),
         );
     }
@@ -127,33 +131,32 @@ pub(crate) fn validate_staged_scheduler_name(who: &str, sched_name: &str) -> any
 /// gate which calls the validator on every staged entry before any
 /// path expansion fires.
 //
-// `#[allow(dead_code)]` because the runtime dispatch path that
-// translates `/staging/schedulers/<name>/scheduler` back into a
-// `spawn` is not yet wired; only the cpio-archive view (no
-// leading `/`) has a production consumer today via
-// [`staged_scheduler_archive_dir`]. Tests in this module
-// exercise the guest-path helpers as they land; the allow
-// becomes a no-op the moment the runtime spawn dispatch wires up.
-#[allow(dead_code)]
+// Reached from production via [`staged_scheduler_binary_path`] and
+// [`staged_scheduler_args_path`], which the Op::AttachScheduler /
+// Op::ReplaceScheduler dispatch calls
+// (`src/scenario/ops/dispatch.rs` dispatch_attach_scheduler /
+// dispatch_replace_scheduler) before handing the paths to
+// `spawn_scheduler_for_op` -> `try_spawn_scheduler`.
 pub(crate) fn staged_scheduler_dir(sched_name: &str) -> String {
     format!("/staging/schedulers/{sched_name}")
 }
 
 /// Guest path of the staged scheduler binary itself.
 /// `<dir>/scheduler` mirrors the boot-time `/scheduler` shape so
-/// the future dispatch code path can reuse the existing
-/// `Path::new("/scheduler").exists()` pattern against the staged
-/// path with no shape divergence.
-#[allow(dead_code)] // see staged_scheduler_dir
+/// the dispatch code path reuses the existing
+/// `Path::new(binary_path).exists()` pattern against the staged
+/// path with no shape divergence (`try_spawn_scheduler`,
+/// `src/vmm/rust_init/scheduler.rs:551`).
 pub(crate) fn staged_scheduler_binary_path(sched_name: &str) -> String {
     format!("{}/scheduler", staged_scheduler_dir(sched_name))
 }
 
 /// Guest path of the staged scheduler's args file. `<dir>/sched_args`
-/// mirrors the boot-time `/sched_args` shape — the future spawn
-/// code reads CLI args from this file with the same parser as the
-/// boot scheduler launch.
-#[allow(dead_code)] // see staged_scheduler_dir
+/// mirrors the boot-time `/sched_args` shape — the spawn code
+/// (`try_spawn_scheduler`) reads CLI args from this file with the
+/// same parser as the boot scheduler launch
+/// (`spawn_scheduler_from_paths` also routes through
+/// `try_spawn_scheduler`).
 pub(crate) fn staged_scheduler_args_path(sched_name: &str) -> String {
     format!("{}/sched_args", staged_scheduler_dir(sched_name))
 }

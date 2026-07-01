@@ -1142,8 +1142,7 @@ fn place_tx_chain(mem: &GuestMemoryMmap, layout: &TestLayout, payload: &[u8]) {
 }
 
 /// Place one RX chain: a single write-only descriptor at RX_BUF
-/// covering 64 bytes (large enough for the 12-byte header + ~52 byte
-/// payload).
+/// covering 256 bytes (ample for the 12-byte header + payload).
 fn place_rx_chain(mem: &GuestMemoryMmap, layout: &TestLayout) {
     // VRING_DESC_F_WRITE = 2: device-writable.
     write_desc(mem, layout.rx_desc, 0, layout.rx_buf, 256, 2, 0);
@@ -1168,9 +1167,14 @@ fn loopback_delivers_tx_payload_to_rx_with_zero_header() {
     // Read back the RX buffer: 12-byte virtio header + payload.
     // Header layout per `virtio_net_hdr_v1` (12 bytes): bytes 0..10
     // zero (no GSO/csum/data-valid), bytes 10..12 LE u16 = 1
-    // (`num_buffers`). num_buffers MUST be 1 because we don't
-    // negotiate VIRTIO_NET_F_MRG_RXBUF — a num_buffers=0 header
-    // would make virtnet_receive_mergeable wait for a non-existent
+    // (`num_buffers`). With this device's feature set (no
+    // VIRTIO_NET_F_MRG_RXBUF — `device_features` offers only
+    // VERSION_1 + F_MAC) the guest takes the `receive_small` path,
+    // which never reads num_buffers, so num_buffers=1 is
+    // forward-compat hardening: once MRG_RXBUF is later negotiated,
+    // `receive_mergeable` (drivers/net/virtio_net.c) reads
+    // `hdr->num_buffers` and loops `while (--num_buf)`, so a
+    // num_buffers=0 header would make it wait for a non-existent
     // continuation buffer.
     let mut delivered = vec![0u8; VIRTIO_NET_HDR_LEN + payload.len()];
     mem.read_slice(&mut delivered, GuestAddress(layout.rx_buf))

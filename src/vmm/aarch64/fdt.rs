@@ -158,8 +158,9 @@ pub fn create_fdt(
     // KVM_ARM_VCPU_PMU_V3 feature bit is masked out of vcpu_init,
     // so the in-kernel PMU emulation never runs; advertising the
     // FDT node anyway would have the guest pmuv3 driver attach to
-    // PPI 23, fail to receive any events, and log a noisy attach
-    // failure. Omitting the node lets the driver silently skip.
+    // the PMU PPI (PPI 7, global intid 23), fail to receive any
+    // events, and log a noisy attach failure. Omitting the node
+    // lets the driver silently skip.
     if has_pmu {
         write_pmu(&mut fdt)?;
     }
@@ -1536,8 +1537,9 @@ mod tests {
     /// omission proves the no-PMU-host gating in `create_fdt` honors
     /// the threaded boolean: on a host where KVM masks
     /// KVM_ARM_VCPU_PMU_V3 out of vcpu_init, advertising the FDT node
-    /// would have the guest pmuv3 driver attach to PPI 23, fail to
-    /// receive any events, and log a noisy attach failure. The test
+    /// would have the guest pmuv3 driver attach to the PMU PPI (PPI 7,
+    /// global intid 23), fail to receive any events, and log a noisy
+    /// attach failure. The test
     /// drives `create_fdt` directly with `has_pmu=false` because the
     /// `test_fdt` shim hard-codes `true`.
     #[test]

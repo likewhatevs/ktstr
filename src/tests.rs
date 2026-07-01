@@ -219,10 +219,13 @@ fn find_kernel_skips_stale_cache_entry() {
 /// the prefix breaks these equalities, catching the serialized-
 /// form change that would otherwise go silent.
 ///
-/// Lives in lib.rs (not in `worker_ready.rs`) because that file
-/// is dual-compiled via `#[path]` into the worker bin; a
-/// `#[cfg(test)] mod tests` inside it would duplicate the test
-/// into both the lib test binary and the bin test binary.
+/// These literal pins are duplicated from `worker_ready.rs`'s own
+/// `#[cfg(test)] mod tests`, which pins the identical marker-path
+/// format (`worker_ready_marker_path_decimal_pid_suffix` and
+/// `worker_ready_marker_prefix_literal`). That in-file `mod tests`
+/// reaches its items via `super::`, which resolves to this file's
+/// own items identically under both the lib and bin compilation
+/// paths, so it does not divide lib vs. bin.
 #[test]
 fn worker_ready_marker_path_format_is_stable() {
     use crate::worker_ready::{WORKER_READY_MARKER_PREFIX, worker_ready_marker_path};
@@ -536,7 +539,8 @@ fn cache_key_suffix_with_extra_some_differs_from_bare_suffix() {
 /// Production format-string shape assertion: the suffix
 /// `cache_key_suffix_with_extra(Some(...))` produces must be
 /// exactly the literal `format!("{baked}-xkc{extra_hash}")`
-/// cargo-ktstr.rs uses to build its tarball cache key. Pins
+/// that `cache_key_suffix_with_extra` (in `src/lib.rs`) emits and
+/// the bin cache-key call sites wrap. Pins
 /// the structural mirror so a refactor that changed the
 /// helper's format would surface here as a divergence from
 /// the production call site.
@@ -550,8 +554,10 @@ fn cache_key_suffix_with_extra_matches_production_format_string() {
     assert_eq!(
         helper, expected,
         "helper output must match production format `{{baked}}-xkc{{extra}}` \
-             (cargo-ktstr.rs builds the tarball cache key with the same shape \
-             via `{{ver}}-tarball-{{arch}}-kc{{cache_key_suffix_with_extra(...)}}`)"
+             (src/bin/cargo_ktstr/kernel/mod.rs builds the tarball cache key \
+             with the same shape via \
+             `{{ver}}-tarball-{{arch}}-kc{{cache_key_suffix_with_extra(...)}}`, \
+             mirrored in src/bin/ktstr.rs)"
     );
 }
 

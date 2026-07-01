@@ -335,19 +335,6 @@ pub fn send_exit(code: i32) {
     write_msg(MsgType::Exit.wire_value(), &code.to_le_bytes());
 }
 
-/// Send a test result to the host. Payload: postcard-encoded
-/// [`crate::assert::AssertResult`].
-///
-/// Frames with [`MsgType::TestResult`]. Guest and host both use
-/// `postcard` so layout never diverges; the host's
-/// `crate::test_support::output::parse_assert_result_from_drain`
-/// decodes with the same library.
-///
-/// Required: `result` MUST round-trip through postcard without
-/// erroring — every field is owned `String` / `bool` / nested
-/// `serde::Serialize` derives, so the only failure path is OOM
-/// during the `Vec<u8>` allocation, which the surrounding eprintln
-/// guards against silent loss.
 /// What to emit for an `AssertResult` over a `max`-byte bulk frame — the pure
 /// graceful-degradation decision, factored out of [`send_test_result`] (which
 /// owns the `write_msg` side effect) so the size-class branch selection is
@@ -417,6 +404,19 @@ fn classify_test_result(
     })
 }
 
+/// Send a test result to the host. Payload: postcard-encoded
+/// [`crate::assert::AssertResult`].
+///
+/// Frames with [`MsgType::TestResult`]. Guest and host both use
+/// `postcard` so layout never diverges; the host's
+/// `crate::test_support::output::parse_assert_result_from_drain`
+/// decodes with the same library.
+///
+/// Required: `result` MUST round-trip through postcard without
+/// erroring — every field is owned `String` / `bool` / nested
+/// `serde::Serialize` derives, so the only failure path is OOM
+/// during the `Vec<u8>` allocation, which the surrounding eprintln
+/// guards against silent loss.
 pub fn send_test_result(result: &crate::assert::AssertResult) {
     let max = crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD as usize;
     match classify_test_result(result, max) {
@@ -650,7 +650,7 @@ pub fn send_sched_swap_notify() {
 /// capture loop reads as the anchor for boundary computation). A
 /// silent loss here means `periodic_fired` stays at 0 regardless
 /// of how many boundaries the workload should have crossed — the
-/// failure mode the sibling-Claude mitosis report surfaced.
+/// failure mode this guards against.
 ///
 /// `send_sys_rdy` already retries until the bulk-port multiport
 /// handshake completes, so by Phase 5 the port is normally
@@ -1039,11 +1039,6 @@ static SNAPSHOT_REQUEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static KERNEL_OP_REQUEST_COUNTER: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(1);
 
-/// Cached read-side handle on `/dev/vport0p1`. Reused across snapshot
-/// requests so the kernel's port-1 read queue refills only once per
-/// guest process. `OnceLock<Option<File>>` so a not-yet-ready open
-/// (multiport handshake still in flight) does not pin the slot to
-/// None — the next call retries.
 /// Number of fast-poll iterations at the start of
 /// [`bounded_read_exact`] before escalating to the slow-poll cadence.
 /// Four iterations of 100µs gives ~400µs of fast-path coverage,

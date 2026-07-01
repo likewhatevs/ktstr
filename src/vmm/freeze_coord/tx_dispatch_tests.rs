@@ -321,11 +321,13 @@ fn sched_swap_notify_latches_only_on_valid_crc() {
 /// CRC-bad SCHED_EXIT must NOT bucket. Without the `if msg.crc_ok`
 /// gate at the bucket-push site, a torn or hostile-guest SCHED_EXIT
 /// would surface in `BulkDrainResult.entries` with `crc_ok=false`. No
-/// downstream consumer filters SchedExit entries on `crc_ok` — the
-/// only post-collect filter sites are `MSG_TYPE_STIMULUS && crc_ok`,
-/// `MSG_TYPE_EXIT && crc_ok`, and `Stdout|Stderr` skipping
-/// `!e.crc_ok`. A torn SchedExit therefore would have surfaced
-/// verbatim. This test pins the filter at the dispatch site.
+/// downstream consumer filters SchedExit entries on `crc_ok`: the
+/// post-collect drain sites gate other message types (e.g.
+/// `MSG_TYPE_EXIT && crc_ok` in `collect_results`), and the sole
+/// SchedExit `crc_ok` gate (`is_sched_exit_frame`) runs on a
+/// pre-collect `BulkMessage`, not on `BulkDrainResult.entries`. A torn
+/// SchedExit therefore would have surfaced verbatim. This test pins the
+/// filter at the dispatch site.
 #[test]
 fn sched_exit_torn_crc_does_not_bucket() {
     let mut a = HostAssembler::new();

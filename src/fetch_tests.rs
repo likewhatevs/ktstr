@@ -679,14 +679,14 @@ fn inspect_local_source_state_detects_mid_build_modification() {
 /// the URL-injection seam and proves the non-singleton
 /// `Client` skips [`RELEASES_CACHE`] and reaches
 /// [`fetch_releases`] with the supplied URL.
-/// [`fetch_releases`]'s GET-and-parse mechanics — the same
-/// function the bypass branch invokes with whatever URL is
-/// threaded in, and that production callers reach on cache
+/// [`fetch_releases`]'s parse mechanics — the same
+/// [`parse_releases_body`] call the bypass branch runs on the
+/// response body, which production callers reach on cache
 /// miss (with [`RELEASES_URL`] pinned by the
 /// [`cached_releases_with`] wrapper) — are covered
 /// deterministically by
 /// [`fetch_releases_against_localhost_mock_returns_parsed`]
-/// against a TcpListener mock with an injected URL, plus the
+/// via a direct [`parse_releases_body`] call, plus the
 /// `fetch_releases_*` family of error-path tests
 /// (HTTP 500, malformed JSON, missing array, partial rows,
 /// empty array, extra fields, connection refused). Together
@@ -719,6 +719,9 @@ fn inspect_local_source_state_detects_mid_build_modification() {
 /// tests in `cli.rs` bypass the network by calling
 /// `filter_and_sort_range` directly with synthetic
 /// releases. The
+/// `expand_kernel_range`-shaped tests in `src/cli/resolve.rs`
+/// bypass the network by calling `filter_and_sort_range`
+/// directly with synthetic releases. The
 /// `is_shared_client_recognizes_process_singleton` and
 /// `is_shared_client_rejects_test_constructed_clients`
 /// tests touch [`SHARED_CLIENT`] but not
@@ -1066,7 +1069,7 @@ fn cached_releases_with_non_singleton_bypasses_cache() {
         }"#;
     let (_server, mock_url, _mock) = mock_releases(200, mock_body);
 
-    // Build a non-singleton client via the shared 5s-timeout
+    // Build a non-singleton client via the shared 60s-timeout
     // builder helper. The address differs from
     // `shared_client()`'s OnceLock-stored address, so
     // `is_shared_client(&non_singleton)` returns false and
@@ -1197,23 +1200,18 @@ fn mock_releases(status: usize, body: &str) -> (mockito::ServerGuard, String, mo
     (server, url, mock)
 }
 
-/// [`fetch_releases`] issues a real HTTP GET against the
-/// `url` it's handed, parses the response body as
-/// `releases.json`, and returns the structured
-/// `Vec<Release>`. Replaces the prior 1ms-connect-timeout
-/// bypass-arm assertion that required a real kernel.org
-/// reach with a deterministic localhost TcpListener mock —
-/// no real network, no flake on slow connect, exit shape
-/// pinned to "Ok with synthetic data".
+/// [`parse_releases_body`] parses a canned `releases.json`
+/// string into a structured `Vec<Release>`. Drives the parse
+/// path directly on a literal body — no network, no
+/// [`fetch_releases`] invocation, exit shape pinned to "Ok
+/// with synthetic data".
 ///
-/// Covers [`fetch_releases`]'s GET-and-parse mechanics — the
-/// same function [`cached_releases_with_url`]'s bypass branch
-/// invokes with whatever URL is threaded in, and the same
-/// function production callers reach on cache miss (with
-/// [`RELEASES_URL`] pinned by the [`cached_releases_with`]
-/// wrapper). The bypass-branch routing decision (non-singleton
+/// Covers the parse half of [`fetch_releases`]'s GET-and-parse
+/// path — the same [`parse_releases_body`] call that
+/// [`fetch_releases`] runs on the response body. The GET half,
+/// and the bypass-branch routing decision (non-singleton
 /// reaches `fetch_releases` with the supplied URL, NOT
-/// [`RELEASES_CACHE`]) is verified separately by
+/// [`RELEASES_CACHE`]), are verified separately by
 /// [`is_shared_client_rejects_test_constructed_clients`]
 /// (predicate-level) and by
 /// [`cached_releases_with_non_singleton_bypasses_cache`]
@@ -1264,6 +1262,7 @@ fn test_client() -> reqwest::blocking::Client {
 /// order: same length, same `moniker`, and same `version` for
 /// every index. Shared between the cache-routing tests
 /// (`cached_releases_routing_singleton_path`,
+/// `series_resolution_routing_through_cache`,
 /// `cached_releases_with_non_singleton_bypasses_cache`) so the
 /// "cache contains the byte-equal synthetic" sanity check has
 /// one definition. Catches the regression where a peer test
@@ -1835,7 +1834,7 @@ fn is_shared_client_returns_false_when_uninit() {
 /// against the one-shot baseline.
 #[test]
 fn download_stream_finalizes_sha256_over_streamed_bytes() {
-    // Synthetic payload large enough that a default 4 KiB read
+    // Synthetic payload large enough that the default read
     // buffer cycles through `read` many times — exercises the
     // hasher.update + last_progress reset on the typical
     // streaming path.

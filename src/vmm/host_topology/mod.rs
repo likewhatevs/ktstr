@@ -371,11 +371,11 @@ impl HostTopology {
     // on top of these queries:
     //
     // - Perf-mode distributes virtual NUMA nodes across host NUMA
-    //   nodes with modulo rotation; uses primitive 1 + 2 (group-by-node
-    //   + eligibility-by-capacity). No distance lookup.
+    //   nodes with modulo rotation; uses primitive 2
+    //   (eligibility-by-capacity). No distance lookup.
     // - Consolidation seeds from a scored LLC list then greedily
     //   expands within the seed's node, spilling to nearest-by-distance
-    //   when needed; uses primitive 1 + 2 + 3.
+    //   when needed; uses primitive 3 (plus llc_numa_node).
     //
     // Kept as small orthogonal queries rather than a single mega-selector
     // — the two algorithms genuinely do different things, but they both
@@ -633,13 +633,15 @@ impl HostTopology {
     /// claim) — stricter than the prior floor-based check, so the
     /// "+1" guest nodes always land on a node with capacity.
     ///
-    /// Implementation composes [`Self::host_llcs_by_numa_node`] +
-    /// [`Self::numa_nodes_with_capacity`] — the same group-by-node + eligibility
-    /// queries the `--cpu-cap` consolidation PLAN phase uses. The two
-    /// callers' SELECTION algorithms differ (perf-mode does modulo
-    /// rotation of guest onto host nodes; consolidation does
-    /// score-driven greedy expansion), but the underlying topology
-    /// lookups are the same.
+    /// Implementation composes [`Self::numa_nodes_with_capacity`],
+    /// which iterates the memoized `host_node_llcs` map. The
+    /// `--cpu-cap` consolidation PLAN phase instead composes
+    /// [`Self::numa_nodes_sorted_by_distance`] plus
+    /// [`Self::llc_numa_node`], so the two callers share the memoized
+    /// `host_node_llcs` map rather than the same accessor calls. The
+    /// two callers' SELECTION algorithms also differ: perf-mode does
+    /// modulo rotation of guest onto host nodes; consolidation does
+    /// score-driven greedy expansion.
     pub(crate) fn numa_aware_llc_order(
         &self,
         numa_nodes: u32,
@@ -1139,9 +1141,10 @@ impl CpuCap {
 
 /// Per-LLC discover snapshot: identity + current holder set.
 /// Constructed by [`discover_llc_snapshots`] before the PLAN phase.
-/// `pub(crate)` because the `ktstr locks` observational command
-/// renders holder lists via the same snapshot structure; external
-/// callers have no reason to construct one.
+/// `pub(crate)` so the in-crate PLAN pipeline and this module's tests
+/// can construct and inspect it; the `ktstr locks` observational
+/// command shares only [`crate::flock::HolderInfo`], not this
+/// structure. External callers have no reason to construct one.
 #[derive(Debug, Clone)]
 pub(crate) struct LlcSnapshot {
     /// Host LLC index — matches [`HostTopology::llc_groups`] ordering.
@@ -1248,9 +1251,10 @@ const TOCTOU_RETRY_DELAYS: [std::time::Duration; ACQUIRE_MAX_TOCTOU_RETRIES as u
 /// `mountinfo` is the `/proc/self/mountinfo` text read once per
 /// `acquire_llc_plan` invocation at [`acquire_llc_plan_with_acquire_fn`]
 /// and threaded through here so a host with N LLCs pays for exactly
-/// one mountinfo read per DISCOVER pass (DISCOVER is called twice
-/// on the TOCTOU-exhausted diagnostic path, hence caching at the
-/// plan level rather than per snapshot walk).
+/// one mountinfo read per DISCOVER pass (DISCOVER runs once per retry
+/// attempt — up to ACQUIRE_MAX_TOCTOU_RETRIES+1 — plus once on the
+/// retry-exhausted diagnostic path, up to 5 passes, hence caching at
+/// the plan level rather than per snapshot walk).
 ///
 /// Returns `Ok(snapshots)` on success. Propagates opening + stat
 /// errors so a missing `/tmp` or permission failure surfaces
@@ -1616,8 +1620,9 @@ where
     // Every DISCOVER pass re-uses this text to derive per-LLC
     // /proc/locks needles (major:minor:inode). Without this cache, a
     // host with N LLCs would re-read mountinfo N× per DISCOVER pass,
-    // and DISCOVER itself runs up to twice (once per attempt + once
-    // on the retry-exhausted diagnostic path). Mount points are
+    // and DISCOVER itself runs up to ACQUIRE_MAX_TOCTOU_RETRIES+1
+    // times in the retry loop, plus once on the retry-exhausted
+    // diagnostic path (up to 5 total). Mount points are
     // effectively static during a plan acquisition — a bind mount
     // changing under us mid-acquire is a host-reconfiguration event
     // that invalidates every parallel acquirer anyway, not something

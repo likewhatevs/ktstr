@@ -724,7 +724,8 @@ impl PayloadHandle {
         // open. Without this killpg-before-drain step the reader
         // threads would block forever waiting for descendants to
         // release the pipes — the same blocking-pipe failure mode
-        // that try_wait at line 798-802 guards against. `Child::wait`
+        // that try_wait's kill_payload_process_group step guards
+        // against. `Child::wait`
         // caches the exit status so the second call inside
         // `wait_and_capture` returns immediately without a syscall.
         if let Err(e) = child.wait() {
@@ -808,8 +809,9 @@ impl PayloadHandle {
                 // the process group, `wait_and_capture` would block
                 // forever on the read syscall waiting for those
                 // descendants to release the pipes. This mirrors the
-                // kill() path at line 726 which always SIGKILLs the
-                // group before draining — the only difference here is
+                // kill() path's kill_payload_process_group call which
+                // always SIGKILLs the group before draining — the
+                // only difference here is
                 // the leader has already exited, so killpg is reaping
                 // descendants only.
                 kill_payload_process_group(
@@ -2887,7 +2889,7 @@ mod tests {
     /// Signal-terminated payloads report `exit_code = -1` because
     /// `std::process::ExitStatus::code()` returns `None` on
     /// signal death and the spawn layer maps that to `-1` (see
-    /// `spawn_foreground`). A user who expects the signal-death
+    /// `spawn_and_wait`). A user who expects the signal-death
     /// case can assert `MetricCheck::exit_code_eq(-1)`, and the pre-pass
     /// comparison must pass under exact `i32` equality.
     #[test]

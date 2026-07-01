@@ -18,9 +18,11 @@
 //!    [`DEFAULT_SNAPSHOT_RING_DEPTH`] constant pins the storage
 //!    budget at 60 entries.
 //!
-//! Both surfaces compose into [`super::dump::DumpContext`] as
-//! optional captures so frozen-VM and live-host pipelines can
-//! supply (or omit) them independently.
+//! Both surfaces are defined and re-exported from the crate root
+//! (see `crate::prelude`) but not yet wired into the dump pipeline:
+//! [`super::dump::DumpContext`] has no field for either capture, and
+//! every item here carries `#[allow(dead_code)]`. Consuming them is
+//! a follow-up.
 //!
 //! # Layout pinning
 //!
@@ -74,8 +76,8 @@ pub struct TimelineEventRaw {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(tag = "kind")]
-#[allow(dead_code)] // wired into FailureDumpReport.timeline_events;
-// freeze coordinator populates via TimelineCapture.
+#[allow(dead_code)] // re-exported for consumers; not yet wired into
+// the dump pipeline.
 pub enum TimelineEvent {
     /// `tp_btf/sched_switch`. The kernel switched from `prev_pid`
     /// to `next_pid` on `cpu` at `ts` (boot-time ns).
@@ -250,9 +252,10 @@ fn decode_raw(raw: &TimelineEventRaw) -> TimelineEvent {
 /// At dump time the coordinator constructs this with the drained
 /// raw bytes (concatenated 40-byte records, in ringbuf order) plus
 /// the BSS-side drop count. The dump consumer parses the buffer
-/// into [`TimelineEvent`] values and surfaces both alongside
-/// `super::dump::FailureDumpReport::timeline_events` /
-/// `timeline_drops`.
+/// into [`TimelineEvent`] values. This capture is not yet consumed
+/// by the dump pipeline; the BSS-side drop count is surfaced today
+/// via [`super::dump::ProbeBssCounters::timeline_drops`] (reached
+/// through `super::dump::FailureDumpReport::probe_counters`).
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub struct TimelineCapture<'a> {
@@ -383,10 +386,10 @@ impl SnapshotRing {
 /// Capture handle the freeze coordinator passes into the dump
 /// pipeline when periodic incremental snapshots are enabled.
 ///
-/// At dump time the renderer drains [`Self::snapshots`] and emits
-/// each snapshot as a [`super::dump::FailureDumpReport`]-shaped
-/// record under
-/// `super::dump::FailureDumpReport::incremental_snapshots`.
+/// Defined for a future dump-pipeline integration; not yet consumed
+/// by any renderer ([`super::dump::FailureDumpReport`] has no
+/// incremental-snapshot field, and this type carries
+/// `#[allow(dead_code)]`).
 /// `None` capture means the freeze coordinator wasn't running the
 /// periodic loop — typical for one-shot dumps where the
 /// dual-snapshot delta is enough.

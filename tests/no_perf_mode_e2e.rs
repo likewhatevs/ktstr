@@ -3,7 +3,7 @@
 //! `no_perf_mode = true` decouples the requested virtual topology
 //! from the host hardware at runtime. With it set, the framework
 //! routes through `acquire_llc_plan` to reserve a small host CPU
-//! pool and KVM oversubscribes the requested vCPUs (here 64) onto
+//! pool and KVM oversubscribes the requested vCPUs (here 8) onto
 //! that pool, instead of `compute_pinning` which would 1:1 map
 //! vCPUs to host CPUs and require the host to physically provide
 //! them. That oversubscription path is what lets the test run on
@@ -11,7 +11,7 @@
 //!
 //! A regression that breaks the `no_perf_mode` plumbing through
 //! the macro (see the `no_perf_mode` arm in
-//! `ktstr-macros/src/lib.rs` and `KtstrTestEntry::no_perf_mode` in
+//! `ktstr-macros/src/ktstr_test/mod.rs` and `KtstrTestEntry::no_perf_mode` in
 //! `entry.rs`) or the runtime branch that picks `acquire_llc_plan`
 //! over `compute_pinning` collapses one of the host-visible
 //! signals checked below — either the host fails to acquire CPUs
@@ -21,7 +21,7 @@
 //! The `post_vm` callback runs on the host after `vm.run()` returns
 //! and gates on `timed_out`, `crash_message`, `exit_code`, and
 //! `success` — the strongest proof available to the host that the
-//! oversubscription path acquired CPUs and booted the 64-vCPU
+//! oversubscription path acquired CPUs and booted the 8-vCPU
 //! guest cleanly.
 //!
 //! The named cgroup with two workers exercises the standard
@@ -41,7 +41,7 @@ const KTSTR_SCHED: Scheduler =
     Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
 /// Host-side gate: a clean run means `acquire_llc_plan` reserved a
-/// host CPU pool, KVM oversubscribed 64 vCPUs onto it, and the
+/// host CPU pool, KVM oversubscribed 8 vCPUs onto it, and the
 /// in-VM scenario completed without faulting. Any regression in
 /// `no_perf_mode` plumbing or in the runtime branch that picks
 /// `acquire_llc_plan` over `compute_pinning` collapses one of
@@ -79,14 +79,11 @@ fn assert_no_perf_mode_ran_clean(result: &VmResult) -> Result<()> {
     Ok(())
 }
 
-/// Boots a real guest with `no_perf_mode = true`, declaring a wild
-/// virtual topology (8 LLCs × 4 cores × 2 threads = 64 vCPUs) that
+/// Boots a real guest with `no_perf_mode = true`, declaring a
+/// virtual topology (2 LLCs × 2 cores × 2 threads = 8 vCPUs) that
 /// exercises `acquire_llc_plan` instead of `compute_pinning`,
 /// proving the `no_perf_mode` plumbing from macro attribute
 /// through `KtstrTestEntry` to the VM builder works end-to-end.
-/// A multi-LLC topology (2 LLCs × 2 cores × 2 threads = 8 vCPUs)
-/// is sufficient to exercise the LLC plan path without requiring
-/// excessive boot time on contended hosts.
 #[ktstr_test(
     scheduler = KTSTR_SCHED,
     no_perf_mode = true,

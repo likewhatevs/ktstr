@@ -64,10 +64,12 @@ pub(crate) enum KtstrCommand {
         no_perf_mode: bool,
         /// Promote hardware-driven test SKIPS to hard failures.
         /// `ResourceContention` (no LLC slot currently free / KVM fd
-        /// budget exhausted -- transient) and `TopologyInsufficient`
-        /// (the VM can't boot on this host) skips become exit 1 instead
-        /// of silent passes. (Perf-mode and explicit cpu-budget hard
-        /// errors already fail and are NOT gated by this flag.) For CI
+        /// budget exhausted -- transient), `TopologyInsufficient`
+        /// (the VM can't boot on this host), and `PerfModeUnavailable`
+        /// (performance_mode on a too-small host) skips become exit 1
+        /// instead of silent passes. (Only an explicit cpu-budget the
+        /// host can't satisfy, `CpuBudgetUnsatisfiable`, is an
+        /// unconditional hard error NOT gated by this flag.) For CI
         /// environments
         /// where the hardware IS expected to support every test —
         /// a skip means the CI config is wrong, not that the test
@@ -231,12 +233,14 @@ pub(crate) enum KtstrCommand {
         #[arg(long)]
         exec: bool,
     },
-    /// Resolve the baseline commit a perf run is compared against — the
-    /// branch merge-base, a PR target via `$GITHUB_BASE_REF`, or an
-    /// explicit `--base` override — and report the A/B commit pair the
-    /// regression compare pairs on. v0 reports the resolution; the
-    /// dual-run (perf-mode tests at HEAD and at the baseline) + the
-    /// `stats compare` regression verdict are a follow-up increment.
+    /// Compare `performance_mode` test metrics between HEAD and a
+    /// baseline commit, exiting non-zero when a metric regresses past
+    /// its threshold. Resolves the baseline (branch merge-base, a PR
+    /// target via `$GITHUB_BASE_REF`, or an explicit `--base`), then
+    /// either compares already-pooled sidecars or (with `--dual-run`)
+    /// produces both commits' runs first and compares them, reusing the
+    /// `stats compare` regression engine to pair on scenario and emit
+    /// the verdict.
     PerfDelta {
         /// Override the baseline commit directly (skips merge-base). The
         /// testability / cached-baseline knob: diff HEAD against any

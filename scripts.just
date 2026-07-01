@@ -72,8 +72,8 @@ devdep-isolation:
         // (-C) so we match the `ktstr::` namespace rather than the
         // fixture's own `ktstr_devdep_fixture::` symbols.
         let bin = format!("{fixture}/target/release/devdep-fixture");
-        // Confirm cargo produced the artifact. verify.sh checked the exec
-        // bit; we check presence, which is what the nm step actually needs
+        // Confirm cargo produced the artifact. We check presence, not the
+        // exec bit, which is what the nm step actually needs
         // -- nm reads the symbol table off the file without executing it (a
         // non-executable ELF analyzes fine), and a missing/unreadable file
         // still fails here or at nm.

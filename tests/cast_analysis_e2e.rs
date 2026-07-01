@@ -3,7 +3,7 @@
 //! Boots scx-ktstr with `--stall-after=1`, lets the SCX watchdog
 //! latch `SCX_EXIT_ERROR_STALL`, and inspects the freeze
 //! coordinator's `FailureDumpReport` to verify that the host-side
-//! cast analysis (`src/monitor/cast_analysis.rs`) actually rewrote
+//! cast analysis (`src/monitor/cast_analysis/mod.rs`) actually rewrote
 //! plain `u64` fields into typed-pointer renders that the dump
 //! pipeline chased through to the target struct's contents.
 //!
@@ -17,9 +17,10 @@
 //!    `analyze_casts`, and caches the resulting
 //!    `CastAnalysisOutput` (cast map + cross-BTF index).
 //! 3. The freeze coordinator threads
-//!    `CastAnalysisOutput.cast_map` into `DumpContext::cast_map`
-//!    and `CastAnalysisOutput.fwd_index` + `btfs` into
-//!    `DumpContext::cross_btf` for the dump pass.
+//!    `CastAnalysisOutput.cast_maps.first()` into
+//!    `DumpContext::cast_map` and `CastAnalysisOutput.fwd_index`
+//!    + `btfs` into `DumpContext::cross_btf_fwd_index` for the
+//!    dump pass.
 //! 4. The BPF program in `scx-ktstr/src/bpf/main.bpf.c` is
 //!    constructed so its bytecode contains the patterns the
 //!    analyzer detects on two distinct cross-domain paths:
@@ -67,7 +68,7 @@
 //! contents, NOT raw u64 integers." The tests below enforce that
 //! end-to-end, against the actual JSON the freeze coordinator
 //! writes, not against synthetic BTF or stub readers (the unit
-//! tests in `src/monitor/btf_render/tests.rs` already cover those
+//! tests in `src/monitor/btf_render/tests/` already cover those
 //! shapes). Each assertion fails loudly with the full payload if a
 //! gate misses, so a regression in any layer of the pipeline (cast
 //! analyzer, BPF builder, freeze rendezvous, render_cast_pointer,

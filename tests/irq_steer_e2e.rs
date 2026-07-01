@@ -15,14 +15,17 @@
 //!
 //! The selector is [`IrqSelector::by_label`] resolved against the
 //! guest's real `/proc/interrupts`, exercising the in-guest
-//! label→IRQ resolution path end-to-end. ktstr boots the NIC on the
-//! virtio-MMIO transport, which registers ONE shared IRQ whose action
-//! name is the bare device basename (e.g. `virtio1`), so the single
-//! IRQ resolves uniquely AND carries every RX completion — the
-//! `c1 > c0` assertion below relies on that single-queue shape.
-//! (Were virtio-net multiqueue + per-queue MSI-X added, a single
-//! steered IRQ would carry only its queue's share and this assertion
-//! would need revisiting.) The label-parse edge
+//! label→IRQ resolution path end-to-end. This test runs a single-queue
+//! NIC, which registers ONE shared IRQ whose action name is the bare
+//! device basename (e.g. `virtio1`): on x86_64 the NIC is a virtio-PCI
+//! function delivered via INTx (split-irqchip), on aarch64 it is
+//! virtio-MMIO — both yield that single basename-named line. So the
+//! single IRQ resolves uniquely AND carries every RX completion — the
+//! `c1 > c0` assertion below relies on that single-queue shape. With
+//! multiqueue + per-queue MSI-X (already supported on the PCI transport,
+//! see `virtio_net_multiqueue_e2e`), a single steered IRQ would carry
+//! only its queue's share and this assertion would need revisiting. The
+//! label-parse edge
 //! cases and the offline-CPU / unresolvable-label bail-before-write
 //! guards are pinned by the CI-runnable unit tests in
 //! `src/scenario/ops/tests.rs` (`resolve_irq_label_*`,
@@ -42,8 +45,9 @@ use std::time::Duration;
 mod wide_smp_irq;
 use wide_smp_irq::{irq_count, virtio_net_iface, virtio_net_irq};
 
-/// virtio-net with a deterministic locally-administered MAC, distinct from the
-/// other IRQ/NetTraffic e2e MACs so the VMs never alias on a shared host.
+/// virtio-net with a deterministic locally-administered MAC (last byte chosen
+/// for unmistakable traces; each VM is isolated via in-VMM loopback, so a
+/// collision is harmless regardless).
 const NET_TEST_STEER: NetConfig = NetConfig::DEFAULT.mac([0x52, 0x54, 0x00, 0x4e, 0x54, 0x03]);
 
 /// Steer the NIC IRQ to CPU 1, generate NetTraffic, and assert CPU 1

@@ -1157,7 +1157,7 @@ fn percpu_array_get_without_narrow_explains() {
 }
 
 /// The scx_pcpu fixture has per_cpu = [Some(11), Some(22), None,
-/// Some(44)] (snapshot.rs synthetic_report). Per-CPU aggregators
+/// Some(44)] (synthetic_report, tests.rs). Per-CPU aggregators
 /// skip the None slot at index 2 and sum / max / min the others.
 #[test]
 fn snapshot_entry_cpu_sum_u64_skips_none_slots() {
@@ -2057,7 +2057,7 @@ fn snapshot_bridge_store_with_stats_overwrite_clears_stale_values() {
 /// `store_with_stats_and_step` populates the parallel
 /// `SnapshotStore.step_index` map and `drain_ordered_with_stats`
 /// surfaces it via `DrainedSnapshotEntry::step_index`. Pins the
-/// step-stamped path's round-trip per plan_17 §3.4.
+/// step-stamped path's round-trip.
 #[test]
 fn snapshot_bridge_store_with_stats_and_step_round_trips() {
     let cb: CaptureCallback = Arc::new(|_| None);

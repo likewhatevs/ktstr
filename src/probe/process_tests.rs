@@ -355,11 +355,13 @@ fn build_field_keys_max_six_params() {
 // (1024) the field is 0 because the exit can fire from
 // kworker / sysrq context where `current` is unrelated.
 //
-// The target_tptr filter in run_probe_skeleton drops events
-// whose `task_ptr` (sourced from args[0]) is 0, suppressing
-// probe output when the BPF side declined to provide a
-// causal task. These tests pin the host-side filter against
-// both sides of that contract.
+// The `causal_tptr` filter in run_probe_skeleton returns
+// None for events whose `task_ptr` (sourced from args[0]) is
+// 0, dropping the verified-stitch path. run_probe_skeleton
+// then falls back to frequency-grouped candidate task_ptrs
+// and suppresses probe output entirely only when no candidate
+// task_ptrs remain. These tests pin the host-side filter
+// against both sides of that contract.
 //
 // SCX_EXIT_ERROR enum values (mirrored from kernel
 // ext_internal.h, also defined in src/bpf/intf.h):

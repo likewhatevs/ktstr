@@ -33,29 +33,7 @@ use super::*;
 /// which conflated a `Json` payload that legitimately produced zero
 /// metrics (no numeric leaves) with an `LlmExtract` placeholder.
 ///
-/// `shm_drops` is the
-/// [`crate::vmm::host_comms::BulkDrainResult`] counter — total
-/// messages the guest's `shm_write` dropped (ring full, or
-/// overflow paths that should not fire in practice). Post-multiport
-/// and post-COM2-crash-migration, the SHM ring carries only
-/// pre-port-open early-boot writes from `write_msg`'s fallback path
-/// (panic-hook crash diagnostics now travel via COM2;
-/// `RawPayloadOutput` and `PayloadMetrics` travel via the
-/// virtio-console bulk port which uses backpressure rather than
-/// drops). So a non-zero `shm_drops` no longer indicates LlmExtract
-/// data loss; it means the early-boot SHM channel overflowed. The
-/// detail still surfaces when `raw_outputs` is non-empty so an
-/// LlmExtract test author sees the early-boot signal alongside the
-/// rest of their extraction failures, but the failure framing has
-/// shifted from "LlmExtract truncation" to "early-boot SHM ring
-/// overflow."
-///
 /// Failure shape:
-/// - Early-boot SHM ring overflow with LlmExtract in use: a single
-///   detail naming the drops counter so the test author knows to
-///   investigate the early-boot fallback or expand the SHM region.
-///   The detail does NOT block the rest of the host-side extraction
-///   path — the raw outputs that DID arrive still get processed.
 /// - Model load fails (e.g. `KTSTR_MODEL_OFFLINE=1` with cold cache,
 ///   SHA mismatch on a corrupted cached GGUF): append a single
 ///   `LlmExtract model load failed: <reason>` detail. metrics

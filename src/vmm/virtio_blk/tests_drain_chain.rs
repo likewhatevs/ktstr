@@ -18,14 +18,15 @@ use vm_memory::Address;
 // MockSplitQueue chain-level tests against process_requests.
 //
 // These exercise the descriptor-chain parsing path
-// (`process_requests` in virtio_blk.rs) that the handler-level
+// (`drain_bracket_impl` in drain.rs, driven by
+// `process_requests` in device.rs) that the handler-level
 // tests above skip. The handler tests bypass virtio-queue's
 // descriptor walker entirely; these drive the full pipeline:
 // MockSplitQueue plants a chain → MMIO QUEUE_NOTIFY fires →
 // `process_requests` walks the chain → handler runs → status
 // byte + add_used → UsedRing reflects completion.
 //
-// Coverage: the chain-shape classifier in `process_requests`
+// Coverage: the chain-shape classifier in `drain_bracket_impl`
 // (header detection, status detection, data-segment collection),
 // the throttle integration, the pre-throttle classification (RO
 // writes / RO flushes / unknown types), and `add_used`'s used-ring
@@ -639,8 +640,9 @@ fn process_requests_write_chain_all_zero_len_segments_is_zero_byte_ok() {
 /// Mirror of `process_requests_write_chain_all_zero_len_segments_is_zero_byte_ok`
 /// on the T_IN read path: a malformed/hostile chain whose data
 /// segments are all `len == 0` (a conforming guest never emits it)
-/// reaches the read vectored helper, where empty iovecs trigger the
-/// 0-byte early-return (device.rs) → S_OK, 0 bytes. Pins the read
+/// reaches the read vectored helper, where the empty-iovec branch
+/// skips the preadv and records a 0-byte read (device.rs) → S_OK,
+/// 0 bytes. Pins the read
 /// side of the same accepted-as-0-byte branch.
 #[test]
 fn process_requests_read_chain_all_zero_len_segments_is_zero_byte_ok() {
@@ -713,7 +715,7 @@ fn process_requests_read_chain_all_zero_len_segments_is_zero_byte_ok() {
 
 /// Drive a chain with an UNKNOWN request type through
 /// `process_requests`. The dispatch table pre-classifies any
-/// req_type outside `T_IN`/`T_OUT`/`T_FLUSH` as
+/// req_type outside `T_IN`/`T_OUT`/`T_FLUSH`/`T_GET_ID` as
 /// VIRTIO_BLK_S_UNSUPP. Verifies:
 /// - status byte is VIRTIO_BLK_S_UNSUPP (2), NOT IOERR (1),
 /// - the chain still completes (used ring updated),
@@ -930,8 +932,9 @@ fn process_requests_status_not_writable_drops_chain() {
     mem.write_slice(&[0xEEu8], status_addr).unwrap();
     write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
     // Last descriptor lacks WRITE flag — disqualifies it as
-    // status. The parser reads it as a (degenerate) data
-    // segment and finds no status descriptor.
+    // status. status_addr stays None and the drain drops the
+    // chain at the no-status gate before the data-segment slice
+    // is bound (drain.rs).
     let descs = [
         RawDescriptor::from(SplitDescriptor::new(
             header_addr.0,

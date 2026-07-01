@@ -230,7 +230,7 @@ Each drained tuple unpacks into a `Sample<'_>` view (via
 ```rust,ignore
 for sample in series.iter_samples() {
     let tag: &str          = sample.tag;          // e.g. "periodic_001"
-    let elapsed_ms: u64    = sample.elapsed_ms;   // ms since run_start
+    let elapsed_ms: Option<u64> = sample.elapsed_ms; // ms since run_start (None if unstamped)
     let snap: Snapshot<'_> = sample.snapshot;     // BPF state view
     let stats: Result<&serde_json::Value, &MissingStatsReason>
                            = sample.stats;         // typed scx_stats result

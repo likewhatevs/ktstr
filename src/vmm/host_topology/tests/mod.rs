@@ -2,30 +2,31 @@ use super::*;
 
 // ─── SYNTHETIC-TOPOLOGY OFFSET CONVENTION ────────────────────
 //
-// Tests in this module that touch real `/tmp/ktstr-llc-*.lock`
-// files choose LLC indices in the 90000..=99999 range to avoid
-// collision with any real host's LLC count (modern server
-// sockets top out around 1024 LLCs). Per-test offsets are
-// subdivided by 100:
-//   90000-90999: acquire_resource_locks / per-CPU path tests
-//   91000-91999: reserved (former per-CPU-window tests, removed)
-//   92000-92999: reserved
-//   93000-93999: acquire_llc_plan (none-cap, EX-peer, SH-peer)
-//                — each sub-test picks its own sub-range
-//                (93000-93099, 93100-93199, …) so leaked state
-//                from a panicking prior test doesn't cross-
-//                contaminate.
-//   94000-94099: acquire_llc_plan cross-node spill (mems union
-//                invariant, I1).
-//   94100-99999: reserved for future LLC-level tests.
-// Tests that build a HostTopology in memory but do NOT touch
-// real /tmp paths use small indices (0, 1, 2, …) because no
-// cross-process collision is possible.
+// Flock-path tests in this module install a per-test lockfile
+// prefix guard — [`LlcLockPrefixGuard`], [`CpuLockPrefixGuard`],
+// or the [`LockPrefixesGuard`] bundle — which redirects their
+// lockfiles into a per-test `TempDir` via
+// [`LLC_LOCK_PREFIX_OVERRIDE`] / [`CPU_LOCK_PREFIX_OVERRIDE`].
+// `llc_lock_path` / `cpu_lock_path` (in the parent module) honor
+// that override instead of the production `{lock_dir}/ktstr-llc-`
+// / `{lock_dir}/ktstr-cpu-` prefix, so lockfiles land in the
+// test's own tempdir. Cross-process collision on a real
+// `/tmp/ktstr-llc-*.lock` is therefore impossible regardless of
+// the index a test picks.
 //
-// When adding a new test that flocks under /tmp, pick an
-// unused 100-entry sub-range in 90000-99999 and document the
-// claim in a comment at the test site so the next author
-// doesn't accidentally re-use it.
+// The 9xxxx LLC/CPU indices that remain in some tests
+// (locking.rs 90xxx; planning.rs retry seam 93500/93501/93600,
+// cargo-test-mode bypass 95100/95200) are a legacy/organizational
+// convention and double as synthetic CPU IDs / LLC indices —
+// they are NOT a collision-avoidance requirement, since the
+// prefix guards already isolate the lockfile pool. Newer
+// acquire_llc_plan tests use small indices (0, 1, 2, …) under a
+// prefix guard instead.
+//
+// When adding a new test that flocks, install a prefix guard
+// (default to [`LockPrefixesGuard`] when in doubt) so the
+// lockfiles land in a per-test tempdir; the specific index no
+// longer needs to dodge a high range.
 // ─────────────────────────────────────────────────────────────
 
 /// Collect the distinct host NUMA node IDs the given CPUs belong

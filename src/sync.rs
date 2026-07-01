@@ -152,7 +152,8 @@ pub(crate) enum PidfdWait {
 /// Wait up to `timeout` for process `pid` to exit, evented via
 /// `pidfd_open(2)` + `poll(2)` — no busy-poll, no signal sent, no reap.
 /// The shared core of ktstr's bounded teardown reaps (the scheduler
-/// reap and the worker reap): a SIGKILLed-but-wedged process — e.g. one
+/// reap, the worker reap, and the wprof-trace reap): a
+/// SIGKILLed-but-wedged process — e.g. one
 /// stuck uninterruptible in a syscall (a worker mid-`affine_move_task`
 /// migration during a crash/bypass window) — cannot take its pending
 /// signal until the syscall returns, so an unbounded

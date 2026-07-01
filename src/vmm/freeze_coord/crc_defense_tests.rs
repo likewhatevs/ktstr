@@ -1,7 +1,7 @@
 //! Unit coverage for the TOKEN_TX dispatch's CRC-gated promotion
 //! and decode paths.
 //!
-//! Two production gates inside [`dispatch_bulk_message`] inspect each
+//! Three production gates inside [`dispatch_bulk_message`] inspect each
 //! `BulkMessage` the streaming [`crate::vmm::bulk::HostAssembler`]
 //! yields from the virtio-console port-1 TX byte stream:
 //!

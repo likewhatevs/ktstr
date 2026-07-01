@@ -2,7 +2,8 @@
 //! `AssertResult`: round-trip + strict-schema rejection of any
 //! omitted required field. No `#[serde(default)]` shims — sidecar
 //! data is disposable per the project pre-1.0 stance, so every
-//! field is required on the wire.
+//! field is required on the wire, except `ScenarioStats::phases`
+//! (`#[serde(default)]`, absent => empty vec).
 
 use super::*;
 
@@ -391,11 +392,11 @@ fn scenario_stats_missing_required_scalar_rejected_by_deserialize() {
 }
 
 /// Strict-schema rejection: an `AssertResult` JSON with a
-/// required field omitted (here: `passed`) must fail
+/// required field omitted (here: `outcomes`) must fail
 /// deserialization. `AssertResult` has NO `Default` derive and no
 /// `#[serde(default)]` — every field is required on the wire.
-/// Pinned so a regression that softens any of passed / skipped /
-/// details / stats trips this test.
+/// Pinned so a regression that softens any of outcomes / passes /
+/// stats / measurements / info_notes trips this test.
 #[test]
 fn assert_result_missing_required_field_rejected_by_deserialize() {
     // All five `AssertResult` fields are wire-required (the struct

@@ -187,7 +187,7 @@ pub(super) fn try_save(
     btf_count: usize,
     alloc_size_types: &[(u64, String)],
 ) {
-    // Symmetric with get_full's read-side collapse (mod.rs:401/431):
+    // Symmetric with get_full's read-side collapse (mod.rs:401/442):
     // a result with no cast entries AND an empty fwd index loads back
     // as None, so persisting it only wastes a disk write plus a
     // recompute on every subsequent run. Skip the write. (alloc_size_types

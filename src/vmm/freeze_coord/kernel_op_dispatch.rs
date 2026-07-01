@@ -581,9 +581,10 @@ fn struct_name_for_per_cpu_symbol(symbol: &str) -> Result<&'static str, String> 
 /// **KASLR-on contract**: `kaslr_offset` is the runtime virt-KASLR
 /// slide produced by the freeze coordinator's
 /// `coord_kaslr_offset()` accessor (snapshot of the
-/// `kern_virt_kaslr` Arc published by the MSR_LSTAR-derive at
-/// `mod.rs:10843-10854` AND/OR the KERN_ADDRS `_text` path at
-/// `dispatch.rs:388-396`). Both publishers converge on the same Arc
+/// `kern_virt_kaslr` Arc (created at `mod.rs:1612`, snapshotted by
+/// the `coord_kaslr_offset` closure at `mod.rs:2544`) published by the
+/// MSR_LSTAR-derive path AND/OR the KERN_ADDRS `_text`
+/// `compare_exchange` at `dispatch.rs:537`). Both publishers converge on the same Arc
 /// via CAS; the accessor's `saturating_sub(1)` bias yields 0 when
 /// (a) not yet published (boot-race window) or (b) published as 0
 /// (nokaslr cmdline / `#[ktstr_test(kaslr = false)]`). Passing
@@ -802,7 +803,7 @@ const START_TIME_PROC_TICK_NS: u64 = 10_000_000;
 /// - `pid`: `task_struct.pid` (`pid_t`, kernel-side `int` = 4 bytes,
 ///   `include/linux/sched.h`). L1 pid-equality check.
 /// - `start_time`: `task_struct.start_time` (`u64`, ns since boot)
-///   at `include/linux/sched.h:1127`. Set ONCE at fork by
+///   at `include/linux/sched.h:1134`. Set ONCE at fork by
 ///   `copy_process` via `ktime_get_ns()`. L2 anti-PID-reuse identity
 ///   check.
 /// - `state`: `task_struct.__state` (`unsigned int` = 4 bytes) at
@@ -813,12 +814,12 @@ const START_TIME_PROC_TICK_NS: u64 = 10_000_000;
 ///   0 when the task is sleeping (the L4 invariant).
 /// - `scx_dsq`: `task_struct.scx.dsq` (`struct scx_dispatch_q *` =
 ///   8 bytes) — nested through `task_struct.scx` + offset of `dsq`
-///   in `sched_ext_entity` (`include/linux/sched/ext.h:211`). NULL
+///   in `sched_ext_entity` (`include/linux/sched/ext.h:188`). NULL
 ///   when task is not queued in any SCX DSQ (L5 part 1).
 /// - `scx_runnable_node`: `task_struct.scx.runnable_node`
 ///   (`struct list_head`) — nested through `task_struct.scx` +
 ///   offset of `runnable_node` in `sched_ext_entity`
-///   (`include/linux/sched/ext.h:227`, `/* rq->scx.runnable_list */`).
+///   (`include/linux/sched/ext.h:203`, `/* rq->scx.runnable_list */`).
 ///   Empty (next == &self) when task is NOT linked into any per-rq
 ///   runnable_list. Independent of `scx.dsq` per
 ///   `include/linux/sched/ext.h` (L5 part 2).
@@ -827,10 +828,10 @@ const START_TIME_PROC_TICK_NS: u64 = 10_000_000;
 ///   Pointer identity-compared against `ext_sched_class` KVA for
 ///   the L6 SCX-only check.
 /// - `start_boottime`: `task_struct.start_boottime` (`u64` = 8 bytes)
-///   at sched.h:1130 ("Boot based time in nsecs"). Set by `copy_process`
+///   at sched.h:1137 ("Boot based time in nsecs"). Set by `copy_process`
 ///   at fork via `ktime_get_boottime_ns()`. L8 anti-slab-recycle.
 /// - `tasks`: `task_struct.tasks` (`struct list_head` = 16 bytes,
-///   only the .next offset matters) at sched.h:954. Used by the
+///   only the .next offset matters) at sched.h:958. Used by the
 ///   leader walker for `container_of` math anchored at `init_task.tasks`.
 /// - `signal`: `task_struct.signal` (`struct signal_struct *` = 8
 ///   bytes). Per-leader pointer; the leader's signal struct holds
@@ -839,7 +840,7 @@ const START_TIME_PROC_TICK_NS: u64 = 10_000_000;
 ///   within `struct signal_struct`. Combined with the dereferenced
 ///   `signal` pointer to address the per-thread list anchor.
 /// - `thread_node`: `task_struct.thread_node` (`struct list_head`) at
-///   sched.h:1094. Per-task linkage into `signal->thread_head`.
+///   sched.h:1101. Per-task linkage into `signal->thread_head`.
 ///   Used by the per-thread walker for `container_of` math.
 struct TaskValidationOffsets {
     pid: usize,
@@ -1258,15 +1259,15 @@ fn thread_pa_or_node(
 ///    (`include/linux/sched.h:118`); writing through it would
 ///    corrupt the dying-task state machine.
 /// 4. **runqueue safety**: `task->on_rq == 0`. Per
-///    `task_on_rq_queued` (`kernel/sched/sched.h:2399`) the value
+///    `task_on_rq_queued` (`kernel/sched/sched.h:2412`) the value
 ///    is 0 when the task is sleeping. CFS's red-black tree keys on
 ///    `se.vruntime`; mutating it while the task is queued
 ///    (on_rq=TASK_ON_RQ_QUEUED=1 or TASK_ON_RQ_MIGRATING=2) corrupts
 ///    tree ordering.
 /// 5. **SCX queued-anywhere safety**: `task->scx.dsq == NULL` AND
 ///    `task->scx.runnable_node` is list-empty (next == &self). The
-///    `dsq` pointer (`include/linux/sched/ext.h:211`) tracks current
-///    DSQ residence; the `runnable_node` (L227 `/* rq->scx.runnable_list */`)
+///    `dsq` pointer (`include/linux/sched/ext.h:188`) tracks current
+///    DSQ residence; the `runnable_node` (L203 `/* rq->scx.runnable_list */`)
 ///    tracks per-rq runnable bookkeeping INDEPENDENT of `dsq`. Both
 ///    must be empty to safely modify scheduler-bookkeeping fields.
 /// 6. **SCX-only sched_class**: `task->sched_class ==
@@ -1278,9 +1279,10 @@ fn thread_pa_or_node(
 ///    ordering key in the modern kernel.
 /// 7. (REMOVED). The previous gate required
 ///    `task->policy & ~SCHED_RESET_ON_FORK == SCHED_EXT` per
-///    `include/uapi/linux/sched.h:121` as belt-and-suspenders for
-///    L6, but it does not hold: `kernel/sched/ext.c::scx_init_task`
-///    / `scx_enable_task` set `task->sched_class = &ext_sched_class`
+///    `include/uapi/linux/sched.h:131` as belt-and-suspenders for
+///    L6, but it does not hold: `kernel/sched/core.c::sched_fork`
+///    / `kernel/sched/ext.c::scx_root_enable_workfn` (and
+///    `scx_root_disable`) set `task->sched_class = &ext_sched_class`
 ///    when SCX takes over a fair-policy task without modifying
 ///    `task->policy`, so a worker forked under `SCHED_NORMAL` keeps
 ///    `policy=0` even after SCX claims it. L6 (sched_class pointer
@@ -1358,7 +1360,8 @@ fn validate_task_for_field_op(
             "validate_task: task pid={target_pid} is on_rq={on_rq} (TASK_ON_RQ_QUEUED \
              or MIGRATING); writing scheduler fields would corrupt rb-tree / DSQ \
              ordering. Test author must use a blocking workload pattern \
-             (`WorkType::FutexPingPong`, `WorkType::WaitOnFutex`, `WorkType::Sleep`) \
+             (`WorkType::FutexPingPong`, `WorkType::FutexFanOut`, or \
+             `WorkPhase::Sleep` inside a `WorkType::Sequence`) \
              so the worker is sleeping at cold-op time"
         ));
     }
@@ -1369,9 +1372,9 @@ fn validate_task_for_field_op(
         return Err(format!(
             "validate_task: task pid={target_pid} has scx.dsq={scx_dsq_ptr:#x} (queued \
              on an SCX DSQ); modifying ordering keys while queued mangles ordering \
-             per include/linux/sched/ext.h:248-254 (dsq_vtime warning). Test author \
+             per include/linux/sched/ext.h:228-231 (dsq_vtime warning). Test author \
              must use a blocking workload pattern \
-             (`WorkType::FutexPingPong`, `WorkType::WaitOnFutex`, `WorkType::Sleep`)"
+             (`WorkType::FutexPingPong`, `WorkType::FutexFanOut`, `WorkPhase::Sleep`)"
         ));
     }
     // scx.runnable_node is a list_head; "empty" means next == &self
@@ -1387,8 +1390,8 @@ fn validate_task_for_field_op(
             "validate_task: task pid={target_pid} scx.runnable_node is linked \
              (next={runnable_node_next:#x} != self={runnable_node_kva:#x}); task is \
              on a per-rq runnable_list. Test author must use a blocking workload \
-             pattern (`WorkType::FutexPingPong`, `WorkType::WaitOnFutex`, \
-             `WorkType::Sleep`)"
+             pattern (`WorkType::FutexPingPong`, `WorkType::FutexFanOut`, \
+             `WorkPhase::Sleep`)"
         ));
     }
 
@@ -1401,14 +1404,16 @@ fn validate_task_for_field_op(
              SCX-managed tasks only (CFS / RT / DL / stop / idle classes have \
              different vtime semantics — EEVDF's place_entity overwrites se.vruntime \
              on enqueue, RT/DL have RT_BANDWIDTH instant-throttle hazards). Spawn \
-             the worker under `SchedPolicy::Ext` to make it SCX-managed"
+             the worker under `SchedPolicy::Normal` and load a sched_ext \
+             scheduler (scx-ktstr) so its BPF dispatch claims the worker"
         ));
     }
 
     // L7 (REMOVED): `task->policy == SCHED_EXT` was a belt-and-
     // suspenders gate for L6 but it does not actually hold for SCX-
-    // managed tasks. `kernel/sched/ext.c::scx_init_task` /
-    // `scx_enable_task` set `task->sched_class = &ext_sched_class`
+    // managed tasks. `kernel/sched/core.c::sched_fork` /
+    // `kernel/sched/ext.c::scx_root_enable_workfn` (and
+    // `scx_root_disable`) set `task->sched_class = &ext_sched_class`
     // when SCX takes over a fair-policy task but does NOT modify
     // `task->policy` — a worker forked under `SCHED_NORMAL` keeps
     // `policy=0` (SCHED_NORMAL) even after SCX claims it. Requiring
@@ -1676,7 +1681,7 @@ mod tests {
         const ENTRY_IDX: usize = 0;
         let helper_reason = oru32_read_rejection_reason(MASK);
         // dispatch_read_batch wraps per-entry errors as
-        // `entry[N]: <reason>` (see L122). Compose what the batch
+        // `entry[N]: <reason>` (see L277). Compose what the batch
         // dispatcher would emit and pin error_reply produces it
         // unchanged.
         let batch_reason = format!("entry[{ENTRY_IDX}]: {helper_reason}");

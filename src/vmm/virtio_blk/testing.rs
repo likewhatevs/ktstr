@@ -4,8 +4,9 @@
 //! one test file would need to construct a `VirtioBlk`, build a backing
 //! file, plant a chain, or drive the FSM lives here. Each helper is
 //! `pub(super)` so it is visible to sibling test modules
-//! (`device::tests`, `worker::tests`, `throttle::tests`, the integration
-//! tests in `mod.rs`) without leaking outside the `virtio_blk` module.
+//! (the `tests_fsm`, `tests_handler`, `tests_drain_*`, `tests_atomics`,
+//! and `tests_poison` sibling modules and `pci`'s test module) without
+//! leaking outside the `virtio_blk` module.
 //!
 //! No test bodies live here — only fixtures. Tests that own a fixture
 //! exclusively (e.g. `setup_iops1_drained_chain` is read by the
@@ -13,9 +14,9 @@
 //! `pub(super)` keeps the door open for a future test in another sibling
 //! to consume the same fixture without a copy.
 //!
-//! `cfg(test)` gated at the module-declaration site (`mod testing;`
-//! in `mod.rs`); this file itself is not gated so rust-analyzer can
-//! still resolve the module path during cfg(test) builds.
+//! `cfg(test)` gated at the module-declaration site (`#[cfg(test)]
+//! mod testing;` in `mod.rs`) and additionally gated inside the file
+//! with `#![cfg(test)]` below.
 #![cfg(test)]
 #![allow(dead_code)]
 

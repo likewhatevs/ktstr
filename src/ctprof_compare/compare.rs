@@ -21,7 +21,7 @@
 //!
 //! 2. [`emit_fudged_rows`] handles the N:1 fudge merge: every
 //!    candidate group matched to a single baseline group has its
-//!    metrics merged via `super::merge_aggregated_into`; one
+//!    metrics merged via `aggregate::merge_aggregated_into`; one
 //!    row per metric is then emitted with the merged candidate
 //!    side. Display key carries the `[fudged: <leaf>]` marker
 //!    so the renderer can flag the merged row visually.

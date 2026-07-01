@@ -268,9 +268,10 @@ impl KtstrKvm {
             // is the host-INDEPENDENT VMM-layout limit, so a future skip
             // matcher cannot misclassify it. Routes to EXIT_FAIL via the
             // dedicated is_topology_unrepresentable hard-fail arm in
-            // result_to_exit_code (and the matching macro host_class_arms
-            // panic), placed above the expect_err inversion and the skip
-            // arms — it is not a skip type.
+            // result_to_exit_code (and the matching `HostClass::Fail =>
+            // panic!` arm in the `#[ktstr_test]`-generated body, via
+            // classify_host_error), placed above the expect_err inversion
+            // and the skip arms — it is not a skip type.
             return Err(anyhow::Error::new(
                 crate::vmm::host_topology::TopologyUnrepresentable {
                     reason: format!(

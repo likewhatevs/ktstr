@@ -200,9 +200,11 @@ Map discovery walks the kernel's `map_idr` xarray:
 `find_map` searches by name suffix (e.g. `".bss"` matches
 `"mitosis.bss"`) and returns the first name-matching map of any
 type. The sibling `find_array_map` applies the same suffix match
-but returns only `BPF_MAP_TYPE_ARRAY` maps (the value-region
-read/write path needs `value_kva`, which is populated only for
-ARRAY maps). Use `maps()` to enumerate all maps without filtering.
+but returns only `BPF_MAP_TYPE_ARRAY` maps — the ARRAY filter is the
+intended value-region read/write target. (`value_kva` is populated for
+both `BPF_MAP_TYPE_ARRAY` and `BPF_MAP_TYPE_STRUCT_OPS` maps, but the
+inline-value read/write path narrows to ARRAY.) Use `maps()` to
+enumerate all maps without filtering.
 
 Value access for `BPF_MAP_TYPE_ARRAY` maps reads/writes the inline
 `bpf_array.value` flex array at the BTF-resolved offset. The value

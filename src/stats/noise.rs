@@ -4,7 +4,7 @@
 //! relative threshold, which conflates a real regression with run-to-run
 //! measurement noise: a scheduling-dominated metric can swing several percent
 //! between identical runs (e.g. schbench pipe throughput — see
-//! `workload/schbench/validation.md`), tripping a fixed 1-5% threshold on noise
+//! `src/workload/schbench/validation.md`), tripping a fixed 1-5% threshold on noise
 //! alone. The noise-adjusted mode runs each side N times and decides from the
 //! OBSERVED spread instead:
 //!

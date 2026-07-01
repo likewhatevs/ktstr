@@ -35,7 +35,7 @@ use super::{find_struct, member_byte_offset};
 /// `translate_any_kva` to read the four position/mask fields.
 ///
 /// Capacity is derived from `mask + 1` — see
-/// `bpf_ringbuf_area_alloc` in `kernel/bpf/ringbuf.c` which sets
+/// `bpf_ringbuf_alloc` in `kernel/bpf/ringbuf.c` which sets
 /// `rb->mask = data_sz - 1` for a power-of-two `data_sz`. Pending
 /// bytes is `producer_pos - consumer_pos` (both monotonically advancing
 /// 64-bit counters; the kernel uses unsigned wraparound subtraction
@@ -117,7 +117,8 @@ pub struct BpfStackmapOffsets {
     /// Offset of `data` flex array within `struct stack_map_bucket`.
     /// Each PC is 8 bytes when `BPF_F_STACK_BUILD_ID` is unset; for
     /// build-id stacks each entry is a `struct bpf_stack_build_id`
-    /// (32 bytes per the BUILD_BUG_ON in `stack_map_alloc:107`).
+    /// (32 bytes: `__s32 status` + `build_id[BPF_BUILD_ID_SIZE=20]` +
+    /// a `__u64` union, per its definition in `include/uapi/linux/bpf.h`).
     pub smb_data: usize,
 }
 

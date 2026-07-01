@@ -63,8 +63,9 @@ use anyhow::{Context, Result, anyhow};
 /// [`super::bpf_syscall::BpfSyscallAccessor`] for the duration of
 /// the dump.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // wired from the debug capture binary; the
-// freeze-VM pipeline doesn't use this struct.
+#[allow(dead_code)] // public via crate::live_host; the lib's own
+// compilation graph never constructs it (only the
+// tests/live_host_inside_vm.rs integration test does).
 pub struct LiveHostKernelEnv {
     /// Output of `uname -r` — the running kernel's release string
     /// (e.g. "6.16.0-1234-generic"). Used to interpolate paths
@@ -181,13 +182,13 @@ fn locate_vmlinux_elf(release: &str) -> Option<PathBuf> {
             return Some(p.to_path_buf());
         }
     }
-    // ktstr kernel cache — defer to the cache module's resolver.
-    // The cache root is computed by [`crate::cache::cache_root`] but
-    // we only consult the per-release entry shape: cache_root /
-    // <key> / vmlinux. Without a cache key we can't address a
-    // specific build, so we fall through here and let the live-host
-    // caller specify a kernel cache entry explicitly when they
-    // know one matches.
+    // ktstr kernel cache — defer to the disk-template cache resolver.
+    // The cache root is computed by
+    // [`crate::vmm::disk_template::cache_root`] but we only consult
+    // the per-release entry shape: <cache root> / <key> / vmlinux.
+    // Without a cache key we can't address a specific build, so we
+    // fall through here and let the live-host caller specify a kernel
+    // cache entry explicitly when they know one matches.
     None
 }
 

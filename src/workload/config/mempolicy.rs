@@ -66,7 +66,7 @@ impl MpolFlags {
     pub const NUMA_BALANCING: Self = Self(1 << 13);
 
     /// Test-only raw-bit constructor. Lets unknown-bit guards
-    /// (e.g. `validate_mempolicy_cpuset` in src/scenario/ops.rs)
+    /// (e.g. `validate_mempolicy_cpuset` in src/scenario/ops/mod.rs)
     /// be tested against bit patterns that are not reachable via
     /// the documented `STATIC_NODES | RELATIVE_NODES |
     /// NUMA_BALANCING` constants. Production callers must use the

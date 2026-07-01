@@ -1,9 +1,14 @@
 //! Virtio-net device with in-VMM loopback backend.
 //!
-//! Two virtqueues (RX index 0, TX index 1), no multiqueue, no control
-//! virtqueue. Advertised features: `VIRTIO_F_VERSION_1` (mandatory)
-//! plus `VIRTIO_NET_F_MAC` (so the guest binds a deterministic MAC
-//! rather than a random one). MMIO register layout per virtio-v1.2
+//! The single-pair baseline is two virtqueues (RX index 0, TX index
+//! 1), no control virtqueue. A multiqueue device (`queue_pairs > 1` on
+//! an MSI-X transport) instead builds `2 * queue_pairs` interleaved
+//! per-pair data vqs (vq `2i` = RX of pair `i`, vq `2i+1` = TX) plus a
+//! trailing control vq at index `2 * queue_pairs`. Advertised features:
+//! `VIRTIO_F_VERSION_1` (mandatory) plus `VIRTIO_NET_F_MAC` (so the
+//! guest binds a deterministic MAC rather than a random one) always,
+//! and `VIRTIO_NET_F_MQ` + `VIRTIO_NET_F_CTRL_VQ` only under multiqueue
+//! (`queue_pairs > 1` on an MSI-X transport). MMIO register layout per virtio-v1.2
 //! §4.2.2; net-specific config space at offsets `0x100..` is served
 //! from a [`VirtioNetConfig`] struct whose `repr(C, packed)` layout
 //! mirrors the kernel uapi `struct virtio_net_config` byte-for-byte
@@ -24,9 +29,8 @@
 //! `vi->hdr_len` (=12) before handing the frame to the network
 //! stack.
 //!
-//! On the `num_buffers` byte: with our negotiated feature set
-//! (`VIRTIO_F_VERSION_1` + `VIRTIO_NET_F_MAC` only, NOT
-//! `VIRTIO_NET_F_MRG_RXBUF`), the kernel's `receive_buf`
+//! On the `num_buffers` byte: our negotiated feature set never
+//! includes `VIRTIO_NET_F_MRG_RXBUF`, so the kernel's `receive_buf`
 //! dispatcher takes the `receive_small` path
 //! (`drivers/net/virtio_net.c::receive_small`), which subtracts
 //! `vi->hdr_len` from `len` and never reads the `num_buffers`
@@ -50,8 +54,8 @@
 //! `process_tx_loopback` reads a TX chain, strips the 12-byte
 //! header, captures the L2 frame into a per-device scratch buffer,
 //! marks the TX chain used (no bytes written back; TX descriptors
-//! are device-readable), then synthesizes an RX delivery: locks the
-//! RX queue, pops one chain, writes the 12-byte virtio header
+//! are device-readable), then synthesizes an RX delivery: pops one
+//! RX chain, writes the 12-byte virtio header
 //! (num_buffers=1) followed by the frame data, marks the RX chain
 //! used, and signals the irqfd. The guest's TX kick therefore
 //! produces a guest TX completion AND a guest RX interrupt in the
@@ -73,8 +77,9 @@
 //! the vCPU thread inside `mmio_write(QUEUE_NOTIFY)`. The work is
 //! a guest-memory read and write — no host syscalls, no backing
 //! file, no blocking. The round-trip latency is bounded by the
-//! frame size (capped at `MAX_FRAME_SIZE` per chain — an over-size
-//! chain is dropped before any copy) and the irqfd write. Bounded
+//! frame size (the copy is bounded by `MAX_FRAME_SIZE` per chain — the
+//! over-cap descriptor is dropped before its allocation) and the irqfd
+//! write. Bounded
 //! vCPU thread work below the
 //! freeze-rendezvous timeout means no worker is needed; future
 //! upgrade to a TAP/AF_PACKET backend would migrate the loopback

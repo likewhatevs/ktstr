@@ -11,12 +11,14 @@
 //!  - The per-run-key sidecar-write locks in
 //!    `crate::test_support::sidecar` (run-dir parent + .locks/{leaf}
 //!    convention).
-//!  - The kernel-build serialization lock in [`crate::cli`]
-//!    (`source-{path_hash}.lock` under the cache root).
+//!  - [`crate::vmm::disk_template`]'s per-template-key cache-entry
+//!    lock (`acquire_template_lock`, `LOCK_EX` with a remediation
+//!    hint).
 //!
-//! All three share the timeout-with-holder-list error shape that
-//! `crate::test_support::eval::is_flock_timeout_message` keys on to
-//! classify a flock timeout as a SKIP rather than a hard FAIL.
+//! These share the timeout-with-holder-list error shape that
+//! `crate::test_support::eval::kernel::is_flock_timeout_message`
+//! keys on to classify a flock timeout as a SKIP rather than a
+//! hard FAIL.
 
 use anyhow::Result;
 use std::os::fd::OwnedFd;
@@ -76,8 +78,10 @@ const FLOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 /// facing recovery hint ("A peer cargo ktstr test process is
 /// writing sidecars …; wait for it to finish or kill it, then
 /// retry."). Use `None` when the timeout itself is the only
-/// signal (the cache surface today — operators triage via the
-/// holder PID list and decide whether to wait or kill).
+/// signal (the cache shared-lock surface `acquire_shared_lock`
+/// today — operators triage via the holder PID list and decide
+/// whether to wait or kill; the cache store-lock and
+/// disk_template both pass `Some`).
 ///
 /// Returns:
 ///  - `Ok(OwnedFd)` on successful acquire. Caller drops the fd to
@@ -256,8 +260,9 @@ mod tests {
 
     /// `remediation = Some(...)` appends the operator-facing recovery
     /// hint to the timeout error; `None` omits it. The sidecar
-    /// surface uses `Some` (peer-write recovery instructions) and
-    /// the cache surface uses `None` (operator triages via holder
+    /// surface, the cache store-lock, and disk_template use `Some`
+    /// (peer-write / stale-lock recovery instructions); only the
+    /// cache shared-lock uses `None` (operator triages via holder
     /// PID list). This test pins the contract end-to-end so a
     /// regression that ignores `remediation` (or always appends it
     /// even on `None`) surfaces here.
@@ -327,8 +332,9 @@ mod tests {
     /// thread requests `LOCK_SH` with a short timeout, the helper
     /// times out and bails with the literal format produced at
     /// `acquire_flock_with_timeout`'s deadline arm. Both
-    /// `LOCK_EX → LOCK_SH` (the cache-entry path) and
-    /// `LOCK_EX → LOCK_EX` (the kernel-build path) are exercised so
+    /// `LOCK_EX → LOCK_SH` (the cache shared-lock path) and
+    /// `LOCK_EX → LOCK_EX` (the cache store-lock / sidecar /
+    /// disk-template path) are exercised so
     /// a regression that affects only one mode label still trips
     /// the assertion.
     #[test]

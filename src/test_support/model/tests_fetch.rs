@@ -130,11 +130,11 @@ fn check_sha256_matches_abc() {
     assert!(check_sha256(tmp.path(), expected).unwrap());
 }
 
-/// Multi-chunk file (larger than a single read buffer)
-/// exercises the streaming `Read`-loop branch of `check_sha256`
-/// (vs the single-buffer fast path for small files). 192 KiB of
-/// repeated "a" bytes is large enough to cross any reasonable
-/// BufReader default (8 KiB) multiple times; the expected SHA
+/// Multi-chunk file (larger than `check_sha256`'s fixed 64 KiB
+/// read buffer, `[0u8; 64 * 1024]` at mod.rs:1834) exercises
+/// its `Read`-loop over more than one buffer's worth of bytes.
+/// 192 KiB of repeated "a" bytes crosses the 64 KiB buffer
+/// multiple times (196608 / 65536 = 3 reads); the expected SHA
 /// is computed once here from a known constant so the test
 /// remains deterministic.
 #[test]
@@ -142,7 +142,7 @@ fn check_sha256_matches_multi_chunk_file() {
     use sha2::{Digest, Sha256};
     let tmp = tempfile::NamedTempFile::new().unwrap();
     // 192 KiB of 'a' bytes. 192 * 1024 = 196_608; several
-    // 64 KiB BufReader refills.
+    // 64 KiB buffer refills.
     let data: Vec<u8> = std::iter::repeat_n(b'a', 192 * 1024).collect();
     std::fs::write(tmp.path(), &data).unwrap();
     // Compute the expected digest in-process so the test does
@@ -574,7 +574,7 @@ fn ensure_under_offline_bails_on_stale_cache_sha_mismatch() {
 /// (Mismatches arm) and
 /// `ensure_in_offline_mode_fails_loudly_when_uncached` (NotCached arm) so
 /// all three remediation branches of the offline-gate `match`
-/// at model.rs:ensure are pinned. A regression that folded
+/// in `ensure` are pinned. A regression that folded
 /// CheckFailed into the stale-cache branch would surface the
 /// bytes-mismatch diagnostic ("do not match") and hide the
 /// filesystem-level failure ("could not complete").
@@ -646,7 +646,7 @@ fn ensure_under_offline_bails_on_check_failed_cache() {
         "expected offline-gate bail on CheckFailed cache, got: {rendered}"
     );
     // The CheckFailed arm's bail wording is the discriminator.
-    // Matches model.rs:ensure:"SHA-256 check could not complete".
+    // Matches `ensure`'s "SHA-256 check could not complete".
     assert!(
         rendered.contains("SHA-256 check could not complete"),
         "expected CheckFailed branch wording \
@@ -705,10 +705,11 @@ fn fetch_timeout_for_size_small_artifact_hits_floor() {
     assert_eq!(got, std::time::Duration::from_secs(60));
 }
 
-/// `fetch_timeout_for_size` for the model (2400 MiB —
+/// `fetch_timeout_for_size` for the model (~2.55 GiB —
 /// `DEFAULT_MODEL.size_bytes`) is well above the 180 MB
-/// crossover so the proportional term wins: `(2400 × 1024 ×
-/// 2740937888 / 3_000_000 = 913` seconds (integer division).
+/// crossover so the proportional term wins: `2740937888 /
+/// 3_000_000 = 913` seconds (integer division), max(60 s
+/// floor), min(1800 s ceiling).
 /// Pins the proportional branch — a regression that
 /// clamped the timeout (e.g. re-introduced a fixed 900 s
 /// ceiling) would surface here, and so would a divisor-unit
@@ -1048,15 +1049,17 @@ fn ensure_free_space_bails_when_space_insufficient() {
 }
 
 /// Pin the IEC human-readable rendering for
-/// `DEFAULT_MODEL.size_bytes` (2400 MiB):
+/// `DEFAULT_MODEL.size_bytes` (~2.55 GiB):
 /// `HumanBytes(2740937888)` lands as `"2.55 GiB"`, and
-/// `HumanBytes(2640 * 1024 * 1024)` — the size plus the 10%
-/// margin — lands as `"2.58 GiB"`. This does NOT go through
+/// `HumanBytes(3015031676)` — the size plus the 10%
+/// margin (`2740937888 + 2740937888 / 10`) — lands as
+/// `"2.81 GiB"`. This does NOT go through
 /// `ensure_free_space` because a real tempdir filesystem
-/// trivially clears a 2.58 GiB gate and the error path never
+/// trivially clears a 2.81 GiB gate and the error path never
 /// fires. The test instead pins the formatter's exact string so
 /// a regression that swapped to `DecimalBytes` (SI prefixes,
-/// `"2.77 GB"` for 2640 MiB) or to raw bytes would surface here.
+/// `"3.02 GB"` for the margin value) or to raw bytes would
+/// surface here.
 /// Sourced from `DEFAULT_MODEL.size_bytes` so a pin rotation
 /// that updates the const but forgets the test is caught by
 /// drift between the assertion and the rendered string instead

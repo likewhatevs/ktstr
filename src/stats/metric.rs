@@ -196,14 +196,16 @@ pub enum MetricKind {
     /// whose quotient is the intended rate unit (the component
     /// registration owns the unit choice; this variant does not scale).
     ///
-    /// `derive_rate_metrics` runs as a post-pass at the seven aggregation
+    /// `derive_rate_metrics` runs as a post-pass at the nine aggregation
     /// sites where the components co-locate in one map: the two per-phase
     /// builds (`buckets_from_grouped`, `build_phase_buckets_with_stimulus`),
     /// the cross-phase bucket merge (`merge_matched_phase_buckets`), the
     /// three cross-RUN ext-metrics reducers (`populate_run_ext_metrics`,
     /// `populate_run_ext_metrics_from_phases`, and `group_and_average_by`),
-    /// and the cross-CGROUP pooled re-pool
-    /// (`crate::assert::populate_run_pooled_iterations_per_cpu_sec`).
+    /// and the cross-CGROUP pooled re-pools
+    /// (`crate::assert::populate_run_pooled_iterations_per_cpu_sec`,
+    /// `crate::assert::populate_run_pooled_taobench`,
+    /// `crate::assert::populate_run_pooled_schbench`).
     /// The cross-CGROUP `AssertResult::merge` ext-metrics fold itself uses
     /// worst-case polarity (min/max) and is NOT a re-pool site; the pooled
     /// re-pool runs separately after it, at the eval layer, reading
@@ -1009,14 +1011,16 @@ pub fn phase_counter_delta(samples: &[f64]) -> Option<f64> {
 /// `metrics[rate] = metrics[numerator] / metrics[denominator]`.
 ///
 /// This is the SOLE producer of a Rate metric's value. It runs as a
-/// post-pass at seven aggregation sites where the components co-locate in
+/// post-pass at nine aggregation sites where the components co-locate in
 /// one map: the two per-phase builds, the cross-phase bucket merge, the
 /// three cross-RUN ext-metrics reducers (`populate_run_ext_metrics`,
 /// `populate_run_ext_metrics_from_phases`, `group_and_average_by`), and the
-/// cross-CGROUP pooled re-pool
+/// cross-CGROUP pooled re-pools
 /// (`crate::assert::populate_run_pooled_iterations_per_cpu_sec`, run
 /// post-`merge` at the eval layer to re-pool `iterations_per_cpu_sec` across a
-/// run's cgroups). At each, the components are
+/// run's cgroups, plus `crate::assert::populate_run_pooled_taobench` and
+/// `crate::assert::populate_run_pooled_schbench` for the taobench/schbench
+/// whole-run Rates). At each, the components are
 /// pooled FIRST by their own kinds (a `Counter` numerator summed), then
 /// the rate is re-derived — so for `Counter / Counter` the result is
 /// `Σnumerator / Σdenominator`, the correct re-pool rather than a mean of
@@ -1102,9 +1106,14 @@ impl MetricDef {
     /// reading.
     ///
     /// Wired per-sample arms (return `Some`): `max_dsq_depth` /
-    /// `avg_dsq_depth` from `sample.snapshot`'s DSQ-walker and
+    /// `avg_dsq_depth` from `sample.snapshot`'s DSQ-walker,
     /// `total_fallback` / `total_keep_last` from its SCX events
-    /// region. Every other registered metric falls to `_ => None`
+    /// region, and the IRQ/steal cross-CPU sums `total_hardirqs`,
+    /// `total_softirq_net_rx` / `total_softirq_net_tx` /
+    /// `total_softirq_timer` / `total_softirq_sched`,
+    /// `total_irq_time_ns`, `total_softirq_time_ns`, and
+    /// `total_steal_time_ns` from its `per_cpu_time`. Every other
+    /// registered metric falls to `_ => None`
     /// here, for one of three reasons: (1) it is a MONITOR-axis
     /// signal with no guest-`Snapshot` shape (`stuck_count`,
     /// `max_imbalance_ratio`, `avg_imbalance_ratio`) — folded
@@ -1127,7 +1136,7 @@ impl MetricDef {
     pub fn read_sample(&self, sample: &crate::scenario::sample::Sample<'_>) -> Option<f64> {
         // Per-metric dispatch by registry name. Only the metrics
         // whose value is genuinely a per-sample reading are wired;
-        // the remaining 16 entries in the METRICS registry are
+        // every other entry in the METRICS registry is
         // cross-cgroup folds or run-level distributional re-pools
         // computed host-side at `evaluate_vm_result` time
         // (worst-spread / worst-gap-ms fold; the
@@ -1178,7 +1187,7 @@ impl MetricDef {
             // Cumulative `select_cpu_fallback` counter at the
             // freeze instant. The host's event-counter walker
             // builds a per-tick timeline of CPU-summed counters
-            // (`EventCounterSample` at src/monitor/dump/mod.rs:442);
+            // (`EventCounterSample` at src/monitor/dump/mod.rs:477);
             // `.last()` gives the cumulative reading at the most
             // recent tick within this freeze's capture window.
             // Counter-kind reduction folds `last - first` across
@@ -2896,9 +2905,9 @@ pub static METRICS: &[MetricDef] = &[
         // Derivation of `abs = 10`: this metric is PER-WORKER. In-tree
         // fixtures span `workers_per_cgroup` from 1 through 8 (see
         // the KtstrTestEntry declarations under src/scenario/*.rs and
-        // tests/*.rs); `KtstrTestEntry::DEFAULT.workers_per_cgroup`
-        // is 2, with scenario-level overrides commonly picking 4 or
-        // 8. A per-worker floor of 10 therefore corresponds to
+        // tests/*.rs); `CtxBuilder`'s `workers_per_cgroup`
+        // defaults to 1, with scenario-level overrides raising it. A
+        // per-worker floor of 10 therefore corresponds to
         // aggregate regressions of 10-80 total iterations across the
         // supported worker counts — high enough that a lightly-
         // loaded scheduler's jitter does not flag a regression, low
@@ -3594,12 +3603,12 @@ pub static METRICS: &[MetricDef] = &[
     // sentinel (plat.rs `if min==0 || us<min`) treats 0 as "unset" — a 0 sets min=0 but
     // the next sample replaces it (e.g. [100,0,200] -> min=200), so min reads 0 only
     // when a 0 is the last min-lowering sample. (2) Across cgroups, PlatStats::combine's
-    // `other.min != 0` guard (plat.rs:227 — correct for latency, where 0 means empty)
+    // `other.min != 0` guard (plat.rs:230 — correct for latency, where 0 means empty)
     // skips a starved cgroup's min=0 when pooling, so a 0-rps cgroup pooled with a
     // nonzero one leaves rps_min nonzero. rps_min is thus a trustworthy worst-second
     // floor only absent 0-seconds. Sustained starvation (0-seconds >= 20% of the
     // window) still shows in rps_p20, which reads the pooled histogram's bucket 0
-    // (folded unconditionally, plat.rs:221) in both cases; a single 0-second in a longer
+    // (folded unconditionally, plat.rs:223-224) in both cases; a single 0-second in a longer
     // window is below p20 and lost from rps_min — invisible to both. Faithful to
     // schbench's add_lat min sentinel.
     MetricDef {
@@ -3812,7 +3821,7 @@ pub static METRICS: &[MetricDef] = &[
     // `write_carrier_scalars`), never from a `GauntletRow`. BARE per-cgroup
     // names (NOT the run-level `worst_*`): a single cgroup's value is not a
     // "worst across cgroups", and reusing `worst_*` would collide
-    // `is_known_metric` with the run-level selector. Thresholds mirror the
+    // `metric_def` with the run-level selector. Thresholds mirror the
     // analogous `worst_*` entries. (`iterations_per_cpu_sec` is intentionally
     // absent — it is already a Rate entry above; the per-cgroup value resolves
     // through that name without a second registration.)
@@ -4117,9 +4126,9 @@ pub(crate) fn metrics_without_suppressed(
 ///   like `jobs.0.read.iops` from the schbench LlmExtract path
 ///   should fold the same way.
 /// - Tokens that signal LowerBetter (returned `true`):
-///   `latency`, `delay`, `gap`, `stall`, `stuck`, `cv`, `error`,
+///   `latency`, `delay`, `_gap`, `stall`, `stuck`, `_cv`, `error`,
 ///   `fail`, `drop`, `spread`, `_us`, `_ms`, `_ns`, `migration_ratio`,
-///   `imbalance`. These are the polarity signals from the existing
+///   `imbalance`, `_depth`, `dsq`. These are the polarity signals from the existing
 ///   registered LowerBetter entries (`worst_p99_wake_latency_us`,
 ///   `worst_run_delay_us`, `worst_gap_ms`, `stuck_count`,
 ///   `worst_wake_latency_cv`, `worst_spread`, `worst_migration_ratio`,

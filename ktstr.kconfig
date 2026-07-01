@@ -17,22 +17,28 @@ CONFIG_RANDOMIZE_BASE=y
 
 # CONFIG_RANDOMIZE_MEMORY=y randomizes `page_offset_base`, `vmalloc_base`,
 # and `vmemmap_base` at boot — independent of the kernel-image text/data
-# slide which CONFIG_RANDOMIZE_BASE=y above controls. The runtime
-# `page_offset_base` is recovered host-side by reading the symbol via
-# the guest's `/proc/kallsyms` path in `src/vmm/rust_init.rs build_kern_addrs`,
-# shipping the value through `KernAddrs.page_offset_base` (`src/vmm/wire.rs`),
-# and consuming it in `monitor::symbols::kva_to_pa` — the host falls back
-# to `DEFAULT_PAGE_OFFSET` only when `KernAddrs.page_offset_base == 0`
-# (operator escape via `kargs = ["nokaslr"]` on the scheduler decl or
-# `#[ktstr_test(kaslr = false, ...)]` on individual tests). The
+# slide which CONFIG_RANDOMIZE_BASE=y above controls. The host resolves the
+# runtime `page_offset_base` from the `page_offset_base` symbol
+# (`monitor::symbols`, via `symbols::page_offset_base_kva` and
+# `kva_to_pa` / `resolve_page_offset`), falling back to `DEFAULT_PAGE_OFFSET`
+# when the symbol is absent (aarch64) or unreadable. The guest also reads
+# the runtime KVA from `/proc/kallsyms`
+# (`guest_comms::read_kernel_page_offset_base_from_kallsyms`, called from
+# `src/vmm/rust_init/init.rs`) and ships it in `KernAddrs.page_offset_base`
+# (`src/vmm/wire.rs`), but the host KERN_ADDRS handler
+# (`src/vmm/freeze_coord/dispatch.rs`) currently consumes only `phys_base`
+# and `kernel_text_runtime_kva` — that wire slot is unused. Operators opt
+# out with `kargs = ["nokaslr"]` on the scheduler decl or
+# `#[ktstr_test(kaslr = false, ...)]` per test. The
 # `kaslr_page_offset_derivation_nonzero` e2e test guards the runtime value:
-# `(page_offset_base - 0xffff_8880_0000_0000) % (1 << 30) == 0 &&
-# page_offset_base != 0xffff_8880_0000_0000` (PUD-aligned slot per
-# arch/x86/mm/kaslr.c::kernel_randomize_memory; ~1/30000 rerun risk on
-# the legitimate slot-0 randomization outcome). Pinning =y here so an
-# inherited defconfig flip can't silently degrade the test back into a
-# tautology where the buggy and fixed direct-map paths agree on the
-# compile-time default.
+# `page_offset_base` must lie in `[default_page_offset, VADDR_END)` and be
+# PUD-aligned (1 GiB) relative to `default_page_offset` — the L4 base
+# `0xffff_8880_0000_0000` or the L5 base `0xff11_0000_0000_0000` depending
+# on paging mode (per arch/x86/mm/kaslr.c::kernel_randomize_memory). The
+# ~1/30000 slot-0 outcome (`page_offset_base == default_page_offset`) only
+# warns; it does not fail. Pinning =y here so an inherited defconfig flip
+# can't silently degrade the test back into a tautology where the buggy
+# and fixed direct-map paths agree on the compile-time default.
 CONFIG_RANDOMIZE_MEMORY=y
 
 # CONFIG_GCC_PLUGIN_RANDSTRUCT=n keeps `struct task_struct` field order
@@ -43,7 +49,7 @@ CONFIG_RANDOMIZE_MEMORY=y
 # defense-in-depth: a kernel built without BTF coverage for `task_struct`
 # (extremely stripped vmlinux) combined with RANDSTRUCT would silently
 # read garbage at the wrong byte offsets — the TaskField dispatcher's
-# 6-layer validation would catch obvious corruption (pid mismatch,
+# 8-layer validation would catch obvious corruption (pid mismatch,
 # start_boottime=0) but a fortuitous match could land an undetected
 # write. Disabling RANDSTRUCT removes the dependence on BTF coverage
 # for the task_struct subset that TaskField writes.

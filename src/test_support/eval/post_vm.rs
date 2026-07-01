@@ -405,35 +405,6 @@ mod post_vm_skip_tests {
     }
 }
 
-/// Invoke a `post_vm` / `post_vm_unconditional` callback with panic
-/// catch. Converts a panic to `anyhow::Error` so the panic message
-/// surfaces in the test failure output AND the rest of the
-/// post-VM teardown (`write_placeholder_failure_dump_if_missing`,
-/// `drop(vm)` releasing CPU/LLC flocks + guest memory + kernel-cache
-/// reader flock) still runs.
-///
-/// Without the catch, a panicking callback would unwind past the
-/// placeholder-dump emission and past `drop(vm)`, leaking VM
-/// resources (flocks, guest memory) until process exit or the next
-/// test's drop reclaims them. Same hazard for `Ok` returns from
-/// callbacks that subsequently panic in their inner state — both
-/// paths fold into this single guard.
-///
-/// `label` is woven into the error message so the operator sees
-/// which callback panicked (`post_vm` vs `post_vm_unconditional`)
-/// when both are wired and both fire.
-///
-/// Returns `Some(err)` when the callback returns `Err` OR panics;
-/// returns `None` when the callback returns `Ok(())`. Mirrors the
-/// shape `.err()` produces from `Result` so the caller's
-/// `.and_then(|cb| ...)` flows unchanged.
-///
-/// Under `panic = "abort"` (release builds — see `Cargo.toml
-/// [profile.release]`), `catch_unwind` is a no-op: a panic aborts
-/// the process before this function returns. The wrap is still
-/// safe — `catch_unwind` is always defined, just inert — and the
-/// debug builds get the leak protection that exposes regressions
-/// before they ship.
 /// Dispatch the entry's `post_vm` + `post_vm_unconditional`
 /// callbacks and combine their failure signals.
 ///
@@ -479,6 +450,35 @@ pub(crate) fn run_post_vm_callbacks(
     combine_post_vm_errs(conditional, unconditional)
 }
 
+/// Invoke a `post_vm` / `post_vm_unconditional` callback with panic
+/// catch. Converts a panic to `anyhow::Error` so the panic message
+/// surfaces in the test failure output AND the rest of the
+/// post-VM teardown (`write_placeholder_failure_dump_if_missing`,
+/// `drop(vm)` releasing CPU/LLC flocks + guest memory + kernel-cache
+/// reader flock) still runs.
+///
+/// Without the catch, a panicking callback would unwind past the
+/// placeholder-dump emission and past `drop(vm)`, leaking VM
+/// resources (flocks, guest memory) until process exit or the next
+/// test's drop reclaims them. Same hazard for `Ok` returns from
+/// callbacks that subsequently panic in their inner state — both
+/// paths fold into this single guard.
+///
+/// `label` is woven into the error message so the operator sees
+/// which callback panicked (`post_vm` vs `post_vm_unconditional`)
+/// when both are wired and both fire.
+///
+/// Returns `Some(err)` when the callback returns `Err` OR panics;
+/// returns `None` when the callback returns `Ok(())`. Mirrors the
+/// shape `.err()` produces from `Result` so the caller's
+/// `.and_then(|cb| ...)` flows unchanged.
+///
+/// Under `panic = "abort"` (release builds — see `Cargo.toml
+/// [profile.release]`), `catch_unwind` is a no-op: a panic aborts
+/// the process before this function returns. The wrap is still
+/// safe — `catch_unwind` is always defined, just inert — and the
+/// debug builds get the leak protection that exposes regressions
+/// before they ship.
 pub(crate) fn invoke_post_vm_callback(
     cb: super::super::PostVmCallback,
     result: &crate::vmm::VmResult,

@@ -17,7 +17,7 @@
 //! percent delta; interpretation (regression vs improvement) is
 //! scheduler-specific and left to the user. This deliberately
 //! diverges from the gauntlet stats comparison in `crate::stats`,
-//! which DOES classify each metric (`Finding::is_regression`,
+//! which DOES classify each metric (`Finding::kind`,
 //! `CompareReport::{regressions, improvements, unchanged}`):
 //! ctprof_compare emits no verdict.
 

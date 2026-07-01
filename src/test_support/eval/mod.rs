@@ -1176,7 +1176,8 @@ fn run_ktstr_test_inner_impl(
     // `post_vm_unconditional` bypasses this gate entirely): skip
     // post_vm when the guest already reported a hard `Fail`
     // `AssertResult` (e.g. `sched_died_during_hold` recorded
-    // mid-step at `src/scenario/ops/mod.rs::966`). The host's
+    // mid-step via `build_sched_died_during_hold` in
+    // `src/scenario/ops/mod.rs`). The host's
     // typical post_vm body asserts on workload-derived state
     // (`snapshot_bridge`, `periodic_fired`, …) — that state is
     // structurally missing when the scheduler died before the
@@ -1887,7 +1888,7 @@ fn evaluate_verdict_folds(
     // timeout is NOT a `None` case — `run_bsp_loop` exits cleanly
     // with `timed_out = true` and `collect_results` still
     // populates `cleanup_duration` to `Some(_)`, per the field
-    // contract documented at `src/vmm/mod.rs` for
+    // contract documented at `src/vmm/result.rs` for
     // `VmResult::cleanup_duration`. The surrounding error path
     // (BSP panic propagation, pre-BSP setup `Err`) already
     // produces a failure verdict in the absent-measurement case,
@@ -2127,7 +2128,7 @@ fn render_failure_verdict_message(
     // emit site in this crate tags its `AssertDetail` with one
     // of those variants (see the ops.rs / scenario/mod.rs call
     // sites plus the `format_sched_died_*` helpers in
-    // `assert.rs`), so filtering by kind is sufficient — the
+    // `src/assert/detail.rs`), so filtering by kind is sufficient — the
     // prior `is_scheduler_death()` prefix-match fallback was
     // removed once every production emitter was audited as
     // kind-tagging its details. `verbose()` forces the
@@ -2344,7 +2345,7 @@ fn render_no_result_message(
         // why the deadline fired. Append the four knobs the host
         // watchdog actually consulted: the host VM timeout (the
         // value the watchdog deadline was anchored to,
-        // `max(watchdog_timeout, duration)` per
+        // `max(watchdog_timeout, duration, 1s)` per
         // `vm_timeout_from_entry`), the scheduler watchdog timeout
         // (`entry.watchdog_timeout`, the scx_sched.watchdog_timeout
         // override applied to the guest kernel), the workload

@@ -40,8 +40,9 @@
 //! zero-denominator gate produced no signal, so re-running the
 //! same scenario would just reproduce the non-measurement (see
 //! the function-level doc on `select_failed_names` for the full
-//! rationale). The four mutually-exclusive bits `(passed,
-//! skipped, inconclusive, fail)` are pinned by the SidecarResult
+//! rationale). The four mutually-exclusive states `(passed,
+//! skipped, inconclusive, fail)` — three stored bits plus the
+//! derived all-false Fail state — are pinned by the SidecarResult
 //! contract; `write_skip_sidecar` emits a Skip row as
 //! `passed=false, skipped=true, inconclusive=false`, so a Skip
 //! is correctly excluded by both the `!skipped` and `!passed`
@@ -372,8 +373,9 @@ pub(crate) fn classify_replay<'a>(
 /// Render the outcome-diff summary to stderr (the narrative
 /// stream — stdout stays clean for the dry-run filter path,
 /// which is the primary pipeable surface). Header line carries
-/// the counts; per-test lines name each PERSISTENT/DROPPED
-/// entry so the operator can drill in without parsing nextest
+/// the counts; per-test lines name each
+/// PERSISTENT/INCONCLUSIVE/DROPPED/MIXED entry so the operator
+/// can drill in without parsing nextest
 /// output. FIXED entries are aggregated to a count only to
 /// keep the diff short on healthy days; the operator who wants
 /// per-test FIXED detail can grep the live nextest output above.
@@ -483,7 +485,7 @@ fn render_outcome_diff(outcomes: &BTreeMap<&str, ReplayOutcome>) {
 ///   inline and can correlate it with persistent/mixed outcomes
 ///   above.
 ///
-/// Non-exhaustive matching is intentional inside the renderer —
+/// Exhaustive matching is intentional inside the renderer —
 /// every variant has a distinct user-visible string and a future
 /// fourth variant would need explicit handling.
 #[derive(Debug, PartialEq, Eq)]
@@ -543,7 +545,7 @@ pub(crate) fn extract_captured_host(
 /// test process.
 ///
 /// Implementation: defers all field-level comparison to
-/// [`HostContext::diff`] at host_context.rs:480. That function
+/// [`HostContext::diff`] at host_context.rs:642. That function
 /// already handles every dimension of the struct (CPU identity,
 /// memory, NUMA, kernel uname triple, cmdline, sched tunables,
 /// THP, cpufreq governors) plus the `Option` / `BTreeMap` edge

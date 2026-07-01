@@ -381,8 +381,8 @@ pub(super) fn worker_main(
     // the hot-path issues no per-iteration allocator calls.
     let mut io_buf: Option<DirectIoBuf> = None;
     // Per-worker xorshift PRNG state for IoRandRead / IoConvoy.
-    // Seeded from `tid * GOLDEN_RATIO_64` (the same Weyl-sequence
-    // golden-ratio increment glibc's `nrand48` family uses) so
+    // Seeded from `tid * GOLDEN_RATIO_64` (the golden-ratio
+    // `2^64 / phi` Weyl / multiplicative-spread constant) so
     // a tid of 0 still produces a non-zero seed. Kept on the
     // stack (not heap) — pure scalar state.
     let mut io_rng: u64 = (tid as u64).wrapping_mul(GOLDEN_RATIO_64);
@@ -1461,9 +1461,11 @@ pub(super) fn worker_main(
                 // visible in user space even if the kernel missed
                 // the advance. Little-endian x86_64 / aarch64
                 // targets guarantee the low 4 bytes of the u64
-                // live at offset 0 (enforced by a compile_error!
-                // elsewhere in this file); big-endian would flip
-                // the layout and is rejected at build time.
+                // live at offset 0 (enforced by the
+                // `#[cfg(not(target_endian = "little"))]
+                // compile_error!` in the parent `workload/mod.rs`);
+                // big-endian would flip the layout and is rejected
+                // at build time.
                 //
                 // Use Release/Acquire ordering so that when workers
                 // observe the generation advance, the matching
@@ -4409,10 +4411,9 @@ pub(super) fn cache_rmw_loop(buf: &mut [u8], stride: usize, iters: u64, work_uni
 /// Weyl-sequence increment derived from the golden ratio,
 /// `2^64 / phi`. Used wherever the worker needs a per-thread RNG
 /// seed or a multiplicative spread constant that avoids the
-/// degenerate "all zero" case on tid `0`. Same value glibc's
-/// `nrand48` family uses; promoting it to a named constant lets
-/// every call site reference one source instead of re-typing the
-/// 64-bit literal.
+/// degenerate "all zero" case on tid `0`. Promoting it to a named
+/// constant lets every call site reference one source instead of
+/// re-typing the 64-bit literal.
 pub(super) const GOLDEN_RATIO_64: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Per-iteration multiply-chain step count for [`WorkType::AluHot`].
@@ -4445,8 +4446,8 @@ pub(super) fn resolve_alu_width(requested: AluWidth) -> AluWidth {
         // the unstable `x86_amx_intrinsics` feature gate so it is
         // not probed here on stable; an explicit
         // `AluWidth::Amx` request downgrades to the next-widest
-        // available variant. See follow-up #309 for the AMX
-        // detection path under nightly / future stabilization.
+        // available variant. AMX detection under nightly / future
+        // stabilization is a follow-up.
         let widest = if std::is_x86_feature_detected!("avx512f") {
             AluWidth::Vec512
         } else if std::is_x86_feature_detected!("avx2") {

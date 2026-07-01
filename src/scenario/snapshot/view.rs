@@ -256,12 +256,14 @@ impl<'a> Snapshot<'a> {
     ///
     /// When the raw scan finds 2+ hits AND the snapshot is not
     /// already narrowed by [`Self::active`] (i.e.
-    /// `self.active_obj` is `None`), `var()` invokes
-    /// `self.active().and_then(|s| s.var(name))` and returns
-    /// THAT result directly — whether [`SnapshotField::Value`],
+    /// `self.active_obj` is `None`), `var()` calls
+    /// [`Self::active`]: on `Ok` it returns `active.var(name)`
+    /// directly — whether [`SnapshotField::Value`],
     /// [`SnapshotError::VarNotFound`], or
     /// [`SnapshotError::AmbiguousVar`] persisting after the
-    /// live filter narrowed. The fallback exists so post-
+    /// live filter narrowed; on `Err` it falls through to the
+    /// pre-filter [`SnapshotError::AmbiguousVar`] (see next
+    /// section). The fallback exists so post-
     /// [`crate::scenario::ops::Op::ReplaceScheduler`] callers
     /// who name a global by string don't have to know about
     /// [`Self::live_var`] explicitly — the principled
@@ -512,8 +514,9 @@ impl<'a> Snapshot<'a> {
             }
         }
         // Principled fast path: when the freeze-coord captured a
-        // non-None `active_obj_name` via the struct_ops map ↔
-        // scx_root KVA match, prefer that even if multiple obj
+        // non-None `active_obj_name` via the target-free prog_idr
+        // walker (`prog_idr → prog aux->used_maps → global-section
+        // sibling map`; no scx_root), prefer that even if multiple obj
         // prefixes show up in `obj_names`. The KVA whitelist
         // (`active_map_kvas`) pairs with the obj-name filter in
         // `maps_iter` — when populated, same-binary multi-copy
@@ -567,10 +570,11 @@ impl<'a> Snapshot<'a> {
             (multiple, _) => Err(SnapshotError::NoActiveScheduler {
                 reason: format!(
                     "snapshot has {} BPF objects with global-section maps \
-                     ({:?}) and the principled *scx_root walker could not \
-                     identify the active obj at capture time (scx_root \
-                     unresolved, no matching struct_ops map, or the matched \
-                     obj has no global-section maps in this capture) — use \
+                     ({:?}) and the principled target-free prog_idr walker \
+                     could not identify the active obj at capture time (no \
+                     alive struct_ops prog with a `<obj>.bss/.data/.rodata` \
+                     sibling in used_maps, or an empty used_maps whitelist) — \
+                     use \
                      Snapshot::vars(name) to enumerate every copy or \
                      Snapshot::map(\"<obj>.<section>\") to address a specific \
                      scheduler's bss directly",
@@ -616,7 +620,8 @@ impl<'a> Snapshot<'a> {
     /// snapshot to one scheduler's maps. When [`Self::active`] cannot
     /// pick a single scheduler — multiple BPF objects with
     /// global-section maps are present AND the principled
-    /// `*scx_root → struct_ops map → obj prefix` walker did not
+    /// `prog_idr → prog aux->used_maps → global-section map → obj prefix`
+    /// walker did not
     /// identify the live one — it errors with
     /// [`SnapshotError::NoActiveScheduler`] (the exact `reason` field
     /// is the long-form message constructed at the bail site listing
@@ -1141,8 +1146,9 @@ fn format_multi_copy_reason(prefix: &str, bss: usize, data: usize, rodata: usize
     let detail = parts.join(", ");
     format!(
         "snapshot has multiple same-name copies of {prefix}'s global-section maps \
-         ({detail}) and the principled *scx_root walker did not publish an \
-         active_map_kvas whitelist to disambiguate (transient swap window where \
+         ({detail}) and the principled target-free prog_idr walker did not \
+         publish an active_map_kvas whitelist to disambiguate (transient swap \
+         window where \
          the accessor-init worker has not yet republished, or the walker is \
          unavailable on this kernel build) — use \
          `series.live_bpf_vars_via([\"name\"], pickers::max_by_sum_u64)` for \

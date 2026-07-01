@@ -42,9 +42,15 @@ fn fixture_pairs() -> (Vec<String>, Vec<String>) {
 ///
 /// 1. An `.rs` fixture added without its `.stderr` snapshot — a
 ///    contributor wrote a new compile-fail case but forgot to run
-///    `TRYBUILD=overwrite just compile-fail` to land the snapshot,
-///    so the driver would silently auto-write the snapshot on its
-///    next run instead of failing on the missing pin.
+///    `TRYBUILD=overwrite just compile-fail` to land the snapshot.
+///    This inventory test catches that cheaply and by default,
+///    whereas the `compile_fail` driver is `#[ignore]` and so does
+///    not run in a normal test pass. When the driver IS run under
+///    trybuild's default (Wip) mode, a missing `.stderr` is written
+///    to a `wip/` directory (not the pinned path) with a printed
+///    NOTE, and the driver then fails rather than landing the
+///    pinned snapshot; only `TRYBUILD=overwrite` writes the real
+///    `.stderr`.
 ///
 /// 2. An `.stderr` snapshot left over after its `.rs` was deleted
 ///    — typically a rename without removing the old snapshot.

@@ -99,8 +99,11 @@ pub(super) fn snap_pair_for_display() -> (CtprofSnapshot, CtprofSnapshot) {
 }
 
 /// Helper: build a leader thread with a populated smaps_rollup
-/// map. The `tid == tgid` shape lets the leader-dedup gate
-/// inside `collect_smaps_rollup` admit the row.
+/// map. The `tid == tgid` shape models a real process leader
+/// (matching the capture-side leader-dedup contract); the row is
+/// admitted by `collect_smaps_rollup` because its
+/// `smaps_rollup_kib` map is non-empty (the only gate in
+/// `collect_smaps_rollup_inner`).
 pub(super) fn smaps_thread(pcomm: &str, tgid: u32, rss_kib: u64, pss_kib: u64) -> ThreadState {
     let mut t = ThreadState {
         tid: tgid,

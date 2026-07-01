@@ -13,31 +13,32 @@
 //! `kernel_op_dispatch` BTF-gated dispatch tests
 //! (`resolve_per_cpu_field_pa`, `resolve_and_validate_task_field`)
 //! can build the same blobs. The renderer suites consume it through a
-//! `pub use crate::test_support::btf_blob::*` re-export in their `mod`,
-//! so their `super::*` imports keep resolving unchanged.
+//! `pub(crate) use crate::test_support::btf_blob::{CastSynBitMember,
+//! CastSynMember, CastSynType, cast_build_btf}` re-export in their
+//! `mod`, so their `super::*` imports keep resolving unchanged.
 
 const CAST_BTF_MAGIC: u16 = 0xEB9F;
 const CAST_BTF_VERSION: u8 = 1;
 const CAST_BTF_HEADER_LEN: u32 = 24;
 const CAST_BTF_KIND_INT: u32 = 1;
-/// `BTF_KIND_PTR` per `btf-rs::obj::resolve` — kind 2 maps to
+/// `BTF_KIND_PTR` per `btf-rs` — kind 2 maps to
 /// `Type::Ptr`. Used by the Fwd-pointee chase tests so the Type::Ptr
 /// arm hits a forward-declared pointee.
 const CAST_BTF_KIND_PTR: u32 = 2;
 const CAST_BTF_KIND_STRUCT: u32 = 4;
-/// `BTF_KIND_FWD` per `btf-rs::obj::resolve` — kind 7 maps to
+/// `BTF_KIND_FWD` per `btf-rs` — kind 7 maps to
 /// `Type::Fwd`. Used by the Fwd-pointee chase tests; libbpf emits
 /// this for structs whose body lives in a separate BTF (e.g.
 /// `struct sdt_data` defined in the sdt_alloc library and referenced
 /// from a scheduler that doesn't include the full body).
 const CAST_BTF_KIND_FWD: u32 = 7;
-/// `BTF_KIND_TYPEDEF` per `btf-rs::obj::resolve` — kind 8 maps to
+/// `BTF_KIND_TYPEDEF` per `btf-rs` — kind 8 maps to
 /// `Type::Typedef`. Used by the modifier-chain integration test.
 const CAST_BTF_KIND_TYPEDEF: u32 = 8;
-/// `BTF_KIND_CONST` per `btf-rs::obj::resolve` — kind 10 maps to
+/// `BTF_KIND_CONST` per `btf-rs` — kind 10 maps to
 /// `Type::Const`. Used by the modifier-chain integration test.
 const CAST_BTF_KIND_CONST: u32 = 10;
-/// `BTF_KIND_TYPE_TAG` per `btf-rs::obj::resolve` — kind 18 maps to
+/// `BTF_KIND_TYPE_TAG` per `btf-rs` — kind 18 maps to
 /// `Type::TypeTag`. Models a `__kptr` tag wrapping a pointer, the
 /// realistic shape of a `struct bpf_cpumask __kptr *` member/global.
 const CAST_BTF_KIND_TYPE_TAG: u32 = 18;

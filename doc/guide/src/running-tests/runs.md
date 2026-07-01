@@ -176,9 +176,10 @@ tree copied off a CI host). They do NOT consult
    Per-side filters (`--a-*` / `--b-*`) partition the sidecar pool
    into two sides; shared filters (`--kernel`, `--scheduler`,
    `--project-commit`, `--kernel-commit`, `--run-source`, etc.)
-   pin both sides. The eight slicing dimensions are `kernel`,
+   pin both sides. The nine slicing dimensions are `kernel`,
    `scheduler`, `topology`, `work-type`, `project-commit`,
-   `kernel-commit`, `run-source`, and `cpu-budget`; differing on
+   `kernel-commit`, `run-source`, `resolve-source`, and `cpu-budget`;
+   differing on
    any subset of them defines the A/B contrast. Per-metric deltas are
    computed using the unified `MetricDef` registry (polarity,
    absolute and relative thresholds). Output is colored: red for
@@ -251,14 +252,14 @@ Every failed test writes a JSON failure-dump file alongside the
 sidecar:
 
 ```text
-{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{commit}/{test_name}.failure-dump.json
+{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{commit}/{test_name}-{variant_hash:016x}.failure-dump.json
 ```
 
 The full dump (BPF state, per-vCPU registers, scheduler exit reason,
 map contents) is produced by the freeze coordinator when the
 scheduler attached AND its exit path triggered — the
 post-mortem snapshot path. Auto-repro runs additionally write a
-sibling `{test_name}.repro.failure-dump.json` containing the
+sibling `{test_name}-{variant_hash:016x}.repro.failure-dump.json` containing the
 auto-repro VM's own post-mortem snapshot (same schema as the
 primary, with the additional `early` snapshot when the entry
 enables dual-snapshot capture).

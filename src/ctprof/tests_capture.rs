@@ -172,8 +172,9 @@ fn assert_synthetic_thread_state(t: &ThreadState) {
     // nr_migrations_cold / nr_wakeups_passive are no longer
     // surfaced on ThreadState — the kernel never increments
     // them so the registry was the wrong place for them; the
-    // synthetic fixture still emits the lines to exercise the
-    // parser's silent-drop on unknown keys), the four *_sum
+    // synthetic fixture still emits the nr_wakeups_idle /
+    // nr_migrations_cold lines to exercise the parser's
+    // silent-drop on unknown keys), the four *_sum
     // fractional-parse fields, the five *_max fractional-parse
     // fields, and the ext.enabled bool.
     assert_eq!(t.nr_wakeups, MonotonicCount(11));
@@ -706,7 +707,7 @@ fn capture_with_corrupt_status_zeroes_status_fields_and_empty_affinity() {
 }
 
 /// G4d — missing `io` file (CONFIG_TASK_IO_ACCOUNTING off
-/// at kernel build) leaves all 6 byte counters at zero.
+/// at kernel build) leaves all 7 io counters at zero.
 /// Pins that the capture continues without io data rather
 /// than failing the whole snapshot.
 #[test]

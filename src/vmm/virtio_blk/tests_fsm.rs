@@ -87,8 +87,9 @@ fn reset_bumps_config_generation() {
     // to invalidate its cached read.
     let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
     let gen0 = read_reg(&dev, VIRTIO_MMIO_CONFIG_GENERATION);
-    // Drive through a full status handshake then write 0 to
-    // trigger reset.
+    // Advance the FSM one step (S_ACK) then write 0 to trigger
+    // reset. STATUS=0 triggers reset() from any state, so no full
+    // handshake is required.
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, 0);
     let gen1 = read_reg(&dev, VIRTIO_MMIO_CONFIG_GENERATION);
@@ -167,10 +168,9 @@ fn reset_rebuilds_throttle_buckets() {
 /// Reset clears the request queue's next_avail / used.idx
 /// state. Direct verification: walk through a status
 /// handshake, then call reset and observe the queue back at
-/// its initial avail-cursor. (The QueueT API doesn't expose
-/// `next_avail()` directly except via `set_next_avail` round
-/// trip; we use the test-mode `Queue` alias which does have
-/// `next_avail()` accessible via methods.)
+/// its initial avail-cursor via the `QueueT::next_avail()`
+/// accessor, a trait method available on both `Queue` and
+/// `QueueSync`.
 #[test]
 fn reset_clears_queue_next_avail() {
     let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
@@ -1507,10 +1507,10 @@ fn queue_desc_addr_requires_features_ok() {
     assert_eq!(dev.worker.queues[0].desc_table(), 0x1000);
 }
 
-/// Reads of unknown register offsets return 0 (the catchall
-/// `_ => 0` arm in `mmio_read`). 0x300 sits beyond every defined
-/// MMIO offset and below the 0x100 config-space split, so it's a
-/// pure unknown-register probe. Mirrors
+/// Reads of unknown offsets return 0. 0x300 is above the 0x100
+/// config-space split, so `mmio_read` routes it to
+/// `read_blk_config(0x200)`, which is past the 24-byte config
+/// struct and zero-fills per virtio-v1.2 §4.2.2.2. Mirrors
 /// `virtio_console::unknown_register_returns_zero`.
 #[test]
 fn unknown_register_returns_zero() {
@@ -1570,10 +1570,11 @@ fn status_skip_acknowledge_rejected() {
 
 /// Idempotent re-write of the current `device_status` is a
 /// no-op — the value is unchanged AND no rejection diagnostic
-/// fires. Standard drivers (the kernel virtio_mmio /
-/// virtio_pci `vp_finalize_features` path) write
-/// `STATUS = old | NEW_BIT` and re-read; an MMIO probe path
-/// may also issue a duplicate write of the current status.
+/// fires. Standard drivers write `STATUS = old | NEW_BIT` via
+/// the kernel's `virtio_add_status` (drivers/virtio/virtio.c:
+/// `set_status(dev, get_status(dev) | status)`, invoked from
+/// `virtio_features_ok`) and re-read; an MMIO probe path may
+/// also issue a duplicate write of the current status.
 /// Pinning this contract prevents a spurious "illegal FSM
 /// transition" warn from polluting operator logs on a
 /// well-formed driver. Distinct from

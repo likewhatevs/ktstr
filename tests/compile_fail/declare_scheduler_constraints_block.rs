@@ -1,8 +1,8 @@
-// `validate_constraints_expr` Block expressions are rejected
-// outright. Block contents can contain let-bindings and arbitrary
-// statements that the validator can't walk reliably; operators who
-// want a single value can drop the braces (write `100` not
-// `{ 100 }`).
+// `validate_const_eligible` rejects Block expressions outright for
+// the `constraints` field. Block contents can contain let-bindings
+// and arbitrary statements that the validator can't walk reliably;
+// operators who want a single value can drop the braces (write `100`
+// not `{ 100 }`).
 use ktstr::declare_scheduler;
 #[allow(unused_imports)]
 use ktstr::test_support::TopologyConstraints;

@@ -1,6 +1,7 @@
 // Pins the `requires_smt` cross-field check arm against the
 // default topology. Default threads_per_core = 1 (no SMT);
-// `requires_smt = true` excludes any host without SMT.
+// `requires_smt = true` excludes any gauntlet preset
+// topology whose threads_per_core < 2.
 use ktstr::declare_scheduler;
 #[allow(unused_imports)]
 use ktstr::test_support::TopologyConstraints;

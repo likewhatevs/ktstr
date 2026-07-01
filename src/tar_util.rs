@@ -1,4 +1,4 @@
-//! Shared tar-archive helpers for [`crate::export`] and
+//! Shared tar-archive helpers for `crate::export` and
 //! [`crate::remote_cache`] — the only two crate sites that build
 //! tar archives in memory.
 //!

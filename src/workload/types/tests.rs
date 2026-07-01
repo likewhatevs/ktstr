@@ -432,11 +432,15 @@ fn phase_duration_serializes_as_humantime() {
 /// `#[serde(skip)]` and covered by
 /// [`worktype_custom_serialize_errors_skipped_variant`].
 ///
-/// Comparison uses re-serialized JSON strings rather than
-/// `PartialEq` because `WorkType` does not derive `PartialEq`
-/// (its `Custom` variant carries a non-comparable `fn`
-/// pointer). The same pattern is used in
-/// [`workload_config_default_roundtrips`] below.
+/// Comparison is on the re-serialized JSON wire form (`json`
+/// vs `json2`) because that is exactly what this serde
+/// roundtrip verifies: the bytes on the wire survive a
+/// deserialize/re-serialize cycle unchanged. (`WorkType` does
+/// derive `PartialEq` — via `CustomFn`'s manual impl — so a
+/// direct value comparison is possible; it just would not test
+/// the wire form.) The same re-serialization pattern covers
+/// `Sequence` and `AluHot` in the explicit block later in this
+/// test.
 #[test]
 fn worktype_serde_roundtrip_table_driven() {
     // `Sequence` and `Custom` are exempt from the from_name

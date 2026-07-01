@@ -125,8 +125,8 @@ pub(super) const SIZEOF_SDT_ID: usize = 8;
 /// will trust.
 ///
 /// `lib/sdt_alloc.bpf.c::pool_set_size` checks `data_size % 8 == 0`
-/// and bails on zero; `scx_alloc_init` rounds up to 8 then ensures
-/// the chunk fits in `PAGE_SIZE`. So a real `elem_size` is always
+/// and bails on `nr_pages == 0`; `scx_alloc_init` rounds up to 8 then
+/// ensures the chunk fits in `PAGE_SIZE`. So a real `elem_size` is always
 /// `[16, 4096]` for non-degenerate allocators (16-byte minimum =
 /// `sizeof(sdt_data) + 8`-byte minimum payload after `round_up(...,
 /// 8)`). A torn snapshot or an uninitialized struct could surface a

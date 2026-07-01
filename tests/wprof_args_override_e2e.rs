@@ -12,7 +12,7 @@
 //!      replaces `WprofConfig::args` (whose default comes from
 //!      `WprofConfig::default_args()`) with the override split
 //!      by whitespace
-//!   3. `src/vmm/setup.rs`'s cmdline builder appends
+//!   3. `src/vmm/setup/mod.rs`'s cmdline builder appends
 //!      `KTSTR_WPROF_ARGS=<joined>` to the guest cmdline
 //!   4. Guest `/proc/cmdline` therefore exposes the verbatim
 //!      `KTSTR_WPROF_ARGS=<literal>` token — readable by this
@@ -34,7 +34,8 @@
 //! `post_vm` callback runs HOST-side after `vm.run()` returns
 //! with `.wprof.pb` already on disk. The shape check is
 //! inherited from the shared
-//! `common::wprof_assertions::assert_wprof_pb_shape` helper
+//! `ktstr::test_support::wprof::assert_wprof_pb_shape` helper,
+//! invoked via `VmResult::assert_wprof_pb_landed`
 //! (size ≥ 4096 bytes + first byte 0x0a) so an override that
 //! propagates but produces a broken trace is caught here too.
 //!
@@ -63,8 +64,11 @@ const KTSTR_SCHED: Scheduler =
 /// substring overlap with the default-args signature impossible.
 ///
 /// MUST match the `wprof_args = "..."` literal in the attribute
-/// below — the macro only accepts a `Lit::Str` for `wprof_args`,
-/// so a const can't be referenced from inside the attribute.
+/// below. The macro accepts either a `Lit::Str` or a path to a
+/// `const &'static str` for `wprof_args` (ktstr-macros
+/// src/ktstr_test/mod.rs), but OVERRIDE_ARGS is a `&[&str]` slice,
+/// not a `&'static str`, so it can't be passed to the attribute
+/// directly — hence the duplicated joined literal.
 /// Drift between the two surfaces as the cmdline-contains
 /// assertion failing at runtime.
 const OVERRIDE_ARGS: &[&str] = &[
@@ -116,11 +120,12 @@ fn wprof_args_override_propagates_to_guest_cmdline(ctx: &Ctx) -> Result<AssertRe
     let mut result = execute_steps(ctx, steps)?;
 
     // Read the guest's /proc/cmdline. `KTSTR_WPROF_ARGS=<args>`
-    // is appended by `src/vmm/setup.rs` from
+    // is appended by `src/vmm/setup/mod.rs` from
     // `WprofConfig::args_cmdline()`; the override flows through
     // `attach_wprof_if_requested`'s `config.args = custom_args
-    // .split_whitespace()...` and the cmdline write joins back
-    // with single spaces. This is the ONE check that legitimately
+    // .split_whitespace()...` and the cmdline write joins with the
+    // ASCII Unit Separator (\x1F) via `WprofConfig::args_cmdline()`.
+    // This is the ONE check that legitimately
     // belongs in the guest body — `/proc/cmdline` is guest-local
     // procfs, readable here without crossing the host boundary.
     let cmdline = match std::fs::read_to_string("/proc/cmdline") {

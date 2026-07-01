@@ -1,8 +1,8 @@
 //! `cargo ktstr funify` — replace non-metric JSON values with
 //! deterministic adjective-animal petnames.
 //!
-//! Reads JSON from `--input PATH`, stdin (when no path given), or
-//! the literal `-` sentinel; routes the parsed value through
+//! Reads JSON from the positional INPUT path, stdin (when no path
+//! given), or the literal `-` sentinel; routes the parsed value through
 //! [`ktstr::fun::funify_json`] under either a deterministic
 //! seed-derived [`ktstr::fun::Funifier::with_seed`] or a process-
 //! ephemeral [`ktstr::fun::Funifier::ephemeral`]; serializes the
@@ -23,8 +23,8 @@ use std::path::PathBuf;
 /// process-fresh ephemeral key — every invocation produces a
 /// different fun name for the same input.
 ///
-/// Errors are returned as `String` (matching the existing
-/// `Result<(), String>` shape every other run_* helper uses), so
+/// Errors are returned as `String` (matching the
+/// `Result<(), String>` shape most run_* helpers use), so
 /// the dispatch site's `error: {e:#}` formatter handles them
 /// uniformly.
 pub(crate) fn run_funify(

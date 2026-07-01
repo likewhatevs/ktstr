@@ -304,8 +304,9 @@ fn display_anonymous_member_uses_anon_marker() {
 #[test]
 fn display_nested_struct_renders_inline_when_small() {
     // Outer struct with one nested-Struct field — both small
-    // enough to fit inline. Nested-struct value renders via
-    // `try_render_inline_string`, packed into the outer's
+    // enough to fit inline. The nested struct renders via its own
+    // Display (write_struct's nested-Struct pre-render, mod.rs),
+    // then `try_inline_from_rendered` packs it into the outer's
     // inline form: `outer{child=inner{a=1}}`. No newlines.
     let inner = RenderedValue::Struct {
         type_name: Some("inner".into()),
@@ -331,9 +332,10 @@ fn display_nested_struct_breaks_to_multiline_past_inline_budget() {
     // STRUCT_INLINE_WIDTH_BUDGET (120), `try_inline_from_rendered`
     // returns None and `write_struct` falls through to the
     // breadcrumb form. The outer wrapping then sees `\n` in the
-    // child's pre-rendered string (line ~601 in mod.rs) and also
-    // bails to multi-line, so the rendered output must contain
-    // newlines.
+    // child's pre-rendered string (write_struct's nested-Struct
+    // pre-render emits None when it contains a newline, mod.rs)
+    // and also bails to multi-line, so the rendered output must
+    // contain newlines.
     //
     // 20 u64 members named `field_NN` with value 3735928559
     // (0xdeadbeef as decimal — `RenderedValue::Uint` renders as
@@ -387,7 +389,8 @@ fn display_array_scalars_inline() {
     // every slot populated and starting at index 0, the array
     // collapses to plain `[v1, v2, v3]` (no run brackets) —
     // run brackets are reserved for sparse / gapped arrays.
-    // bits>=32 Uints render as hex via write_array_element.
+    // bits>=32 Uints render as hex via the render_elem closure in
+    // the Array Display arm (mod.rs).
     let v = RenderedValue::Array {
         len: 3,
         elements: vec![

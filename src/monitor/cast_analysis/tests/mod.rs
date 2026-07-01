@@ -18,9 +18,15 @@ fn push_name(s: &mut Vec<u8>, name: &str) -> u32 {
 // with a small writer and parse it via Btf::from_bytes. The
 // BTF wire format (header + type section + string section) is
 // documented in linux Documentation/bpf/btf.rst. The helpers
-// below cover only the kinds the cast analyzer needs to see:
-// BTF_KIND_INT (1), BTF_KIND_PTR (2), BTF_KIND_STRUCT (4),
-// BTF_KIND_FUNC (12), BTF_KIND_FUNC_PROTO (13).
+// below synthesize the BTF kinds the cast-analysis tests
+// exercise: BTF_KIND_INT (1), BTF_KIND_PTR (2),
+// BTF_KIND_ARRAY (3), BTF_KIND_STRUCT (4) (including the
+// kind_flag=1 bitfield form), BTF_KIND_UNION (5),
+// BTF_KIND_FWD (7), BTF_KIND_TYPEDEF (8),
+// BTF_KIND_VOLATILE (9), BTF_KIND_CONST (10),
+// BTF_KIND_FUNC (12), BTF_KIND_FUNC_PROTO (13),
+// BTF_KIND_VAR (14), BTF_KIND_DATASEC (15) (see the
+// SynType variants below).
 
 const BTF_MAGIC: u16 = 0xEB9F;
 const BTF_VERSION: u8 = 1;

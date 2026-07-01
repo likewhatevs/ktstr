@@ -78,7 +78,7 @@ const SHARED_LOCK_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// 5 minutes covers a `store` peer's full critical section in the
 /// worst case: under heavy parallelism N concurrent runners may
 /// contend on the SAME `cache_key`, where the head writer holds
-/// `LOCK_EX` while it copies the boot image, runs the 3-stage
+/// `LOCK_EX` while it copies the boot image, runs the two-stage
 /// vmlinux strip pipeline ([`super::vmlinux_strip::strip_vmlinux_debug`]),
 /// writes `metadata.json`, and finishes the
 /// [`super::housekeeping::atomic_swap_dirs`] swap. A real vmlinux
@@ -458,7 +458,7 @@ impl CacheDir {
     ///    `tmp/<image_name>` via `fs::copy`.
     /// 6. **Strip and copy vmlinux (if supplied).** When
     ///    `artifacts.vmlinux` is `Some`, `strip_vmlinux_debug`
-    ///    runs the 3-stage strip pipeline and the result is written
+    ///    runs the two-stage strip pipeline and the result is written
     ///    to `tmp/vmlinux`. **Strip-fallback rationale:** if the
     ///    strip pipeline returns an error (e.g. an unrecognised ELF
     ///    layout from a future toolchain or an exotic config), the

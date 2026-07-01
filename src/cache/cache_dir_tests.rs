@@ -2835,11 +2835,12 @@ fn cache_content_matches_asymmetric_none_misses() {
 /// Direct unit test on the contract: `lookup_silent` must not
 /// emit the unstripped-vmlinux warn even when the entry is in
 /// the warn-eligible state. Drives the contract through the
-/// public `lookup` (which DOES warn) and a private inspection
-/// of the warned-keys static is unavailable, so the test
-/// instead pins the OBSERVABLE: a `lookup_silent` followed by
-/// a `lookup` for the same key BOTH proceed without dedup
-/// suppressing the second call's warn. If `lookup_silent` had
+/// public `lookup` (which DOES warn). The `warned_keys` static
+/// is process-wide and shared across all tests, so inspecting
+/// it directly would be polluted; the test instead pins the
+/// OBSERVABLE: a `lookup_silent` followed by a `lookup` for the
+/// same (unique) key BOTH proceed without dedup suppressing the
+/// second call's warn. If `lookup_silent` had
 /// burned the dedup slot, the subsequent `lookup` would be
 /// silent and the test would fail.
 #[tracing_test::traced_test]

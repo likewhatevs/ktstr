@@ -354,7 +354,7 @@ fn assert_benchmarks_wake_latency_cv_zero_mean_yields_inconclusive() {
 // source CgroupStats fields. The run-level surface that re-pools them
 // (the deleted `r.stats.worst_*` roll-ups, now ext-sourced Distribution
 // metrics) is covered separately: `repool_distribution_value_for_value_
-// with_cgroup_stats` (tests_phase_bucket.rs) pins that a single-cgroup
+// with_cgroup_stats` (tests_phase_bucket/repool.rs) pins that a single-cgroup
 // run's run-level pooled value reproduces these cgroup_stats reductions.
 
 #[test]

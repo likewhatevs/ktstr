@@ -296,7 +296,9 @@ pub fn collect_workload_cgroup_psi(
         // is_leaf is a SEPARATE single read, deliberately NOT folded into
         // children_of: an empty children_of result can mean "leaf" OR "budget
         // exhausted", and conflating them would misclassify a budget-truncated
-        // non-leaf as a leaf and read its ancestor's PSI. is_leaf is bounded by
+        // non-leaf as a leaf and read that non-leaf container's OWN PSI (the DFS
+        // reads the popped node's own psi pointer), leaving its real leaf
+        // descendants uncaptured. is_leaf is bounded by
         // the budget-bounded stack (one read per popped node).
         if is_leaf(off, kva, pa, mem) {
             if let Some(stat) = read_cgroup_psi(mem, off, psi_off, page_offset, kva, pa) {

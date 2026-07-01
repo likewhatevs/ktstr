@@ -31,7 +31,7 @@ pub(crate) struct LlcLockRow {
 }
 
 /// One per-CPU-lock row. `numa_node` carries the host NUMA node the
-/// CPU lives on, looked up via [`crate::topology::TestTopology`]'s
+/// CPU lives on, looked up via [`crate::vmm::host_topology::HostTopology`]'s
 /// `cpu_to_node` map; `None` when the sysfs probe failed and the
 /// host topology is unavailable.
 #[derive(Debug, serde::Serialize)]

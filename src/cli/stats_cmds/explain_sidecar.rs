@@ -1,6 +1,6 @@
 //! Per-sidecar `Option`-field absence diagnostic surface.
 //!
-//! Holds [`explain_sidecar`] (the `cargo ktstr stats explain` entry
+//! Holds [`explain_sidecar`] (the `cargo ktstr stats explain-sidecar` entry
 //! point), the static catalog ([`SIDECAR_NONE_CATALOG`]) cataloging
 //! every `Option<T>` field on
 //! [`crate::test_support::SidecarResult`] with cause prose +
@@ -60,7 +60,7 @@ impl NoneClassification {
 /// diagnostic surface stays in lockstep with the on-disk schema.
 ///
 /// Each entry was derived from the rustdoc on the corresponding
-/// field in `src/test_support/sidecar.rs` — see the per-field
+/// field in `src/test_support/sidecar/mod.rs` — see the per-field
 /// references at the catalog site for the source of truth. This
 /// catalog is static (no live probing): explain-sidecar's purpose
 /// is post-hoc archive diagnosis, not live debugging, and dynamic
@@ -105,7 +105,7 @@ struct NoneCatalogEntry {
 /// `SidecarResult` reads top-to-bottom.
 ///
 /// Causes prose is sourced FROM the per-field rustdoc on
-/// `SidecarResult` — see `src/test_support/sidecar.rs` for the
+/// `SidecarResult` — see `src/test_support/sidecar/mod.rs` for the
 /// single source of truth on what each `None` means. A future
 /// schema change that adds, removes, or renames an `Option`
 /// field MUST update this catalog; the

@@ -13,7 +13,7 @@
 //!    `crate::cache::CacheDir::acquire_shared_lock` and friends).
 //!  - Per-source-tree build locks at
 //!    `{cache_root}/.locks/source-{path_hash}.lock` (see
-//!    `crate::cli::acquire_source_tree_lock`) — serialize concurrent
+//!    `crate::cli::kernel_build::build::acquire_source_tree_lock`) — serialize concurrent
 //!    `make` invocations against the same kernel source checkout.
 //!  - Observational enumeration from `ktstr locks --json` — a
 //!    read-only scan that does NOT acquire flocks; reads

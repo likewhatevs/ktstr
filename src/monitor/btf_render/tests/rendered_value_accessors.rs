@@ -190,9 +190,9 @@ fn rendered_value_as_u64_signed_enum_positive_value() {
 ///
 /// Probes one unsigned kernel enum + one signed kernel enum (with
 /// a fallback signed candidate if the primary is absent):
-///   - `hrtimer_mode` (include/linux/hrtimer.h:35): all variants
-///     non-negative (0..=0x0b, HRTIMER_MODE_ABS through
-///     HRTIMER_MODE_REL_PINNED_HARD), expected `is_signed = false`.
+///   - `hrtimer_mode` (include/linux/hrtimer.h:43): all variants
+///     non-negative (0..=0x10, HRTIMER_MODE_ABS through
+///     HRTIMER_MODE_LAZY_REARM), expected `is_signed = false`.
 ///   - `perf_event_state` (include/linux/perf_event.h:680): includes
 ///     `PERF_EVENT_STATE_DEAD = -5`, expected `is_signed = true` so
 ///     the renderer sign-extends correctly.
@@ -228,8 +228,8 @@ fn render_value_inner_propagates_btf_enum_signedness() {
                 assert!(
                     !is_signed,
                     "hrtimer_mode has no negative variants (HRTIMER_MODE_ABS..\
-                     HRTIMER_MODE_REL_PINNED_HARD = 0..=0x0b at \
-                     include/linux/hrtimer.h:35) — BTF must mark it unsigned, \
+                     HRTIMER_MODE_LAZY_REARM = 0..=0x10 at \
+                     include/linux/hrtimer.h:43) — BTF must mark it unsigned, \
                      got is_signed=true (renderer dropped the kind_flag bit)"
                 );
                 assert_eq!(

@@ -27,8 +27,9 @@
 //! the same single-CPU placement.
 //!
 //! Every arm is asserted live: each does
-//! unconditional per-iteration work (a `spin_burst` plus an
-//! `iterations` bump) regardless of host topology — including
+//! unconditional per-iteration work (a `spin_burst` and/or an
+//! `iterations` bump — TimerLatency bumps only `iterations`)
+//! regardless of host topology — including
 //! [`WorkType::CrossAffinityChurn`], whose cgroup-sibling affinity
 //! toggle no-ops on this direct-spawn path (no dedicated `CgroupDef`)
 //! but is a side effect, not a liveness gate.
@@ -41,7 +42,7 @@
 //!   - [`WorkType::WakeChain`] — covered by
 //!     `tests/worktype_eevdf_validation.rs`.
 //!   - [`WorkType::EpollStorm`] / [`WorkType::CgroupChurn`] — Thread-only
-//!     and Fork-rejected respectively; driven by the sibling
+//!     and Fork-only respectively; driven by the sibling
 //!     `tests/worktype_coverage_thread_gauntlet_e2e.rs`.
 //!   - [`WorkType::CgroupAttachStorm`] — Fork-compatible, but needs a
 //!     sibling `dest` cgroup (created via `Op::add_cgroup`) that this
@@ -425,7 +426,7 @@ fn worktype_fork_gauntlet_covers_all_arms(_ctx: &Ctx) -> Result<AssertResult> {
         &mut result,
     );
     // CrossAffinityChurn does an unconditional spin_burst (work_units)
-    // plus an iterations bump every loop (worker/mod.rs:1185,1219); the
+    // plus an iterations bump every loop (worker/mod.rs:1376,1405); the
     // cgroup-sibling affinity toggle is a side effect that no-ops here
     // (no dedicated CgroupDef on this direct-spawn path), not a liveness
     // gate — so it records work regardless.

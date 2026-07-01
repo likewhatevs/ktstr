@@ -369,7 +369,8 @@ fn parse_perf_delta_flags_and_defaults() {
 /// Build a `cargo ktstr <subcommand> -- <passthrough...>` invocation,
 /// parse it, and assert that the trailing args round-trip verbatim
 /// into the variant's `args` Vec without spuriously populating any
-/// of the named flags (`--kernel`, `--no-perf-mode`, `--release`).
+/// of the named flags (`--kernel`, `--no-perf-mode`, `--no-skip-mode`,
+/// `--release`, `--release-scheduler`).
 ///
 /// `subcommand` must be one of the passthrough-bearing subcommands:
 /// `test`, `nextest` (alias), `coverage`, `llvm-cov`. Other
@@ -2610,7 +2611,7 @@ fn completions_zsh_contains_subcommands() {
     let output = String::from_utf8(buf).expect("completions should be valid UTF-8");
     // clap_complete's zsh generator emits each subcommand as a
     // `'NAME:HELP'` describe-list entry (see `add_subcommands`
-    // in clap_complete-4.6.1/src/aot/shells/zsh.rs:163). The
+    // in clap_complete-4.6.5/src/aot/shells/zsh.rs:163). The
     // `'<name>:` prefix pin identifies an actual subcommand
     // completion, not an incidental substring match inside
     // rendered doc text.
@@ -2643,7 +2644,7 @@ fn completions_zsh_contains_subcommands() {
     );
     // `LlvmCov` variant renders as the kebab-case `llvm-cov`
     // subcommand (clap derive default rename — see
-    // clap_derive-4.6.0/src/item.rs:27 `DEFAULT_CASING =
+    // clap_derive-4.6.1/src/item.rs:27 `DEFAULT_CASING =
     // CasingStyle::Kebab`). Pinned with the same `'name:`
     // prefix so an accidental doc-text match doesn't mask a
     // missing registration.

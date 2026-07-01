@@ -30,8 +30,8 @@ pub(crate) fn name_from_str(s: &str) -> ([u8; BPF_OBJ_NAME_LEN], u8) {
 /// monitor check: `nr_running=2` on both CPUs, small
 /// `local_dsq_depth`, advancing `rq_clock`. Used as the
 /// "no-violation baseline" by `thresholds_tests`,
-/// `validity_tests`, `event_rates_tests`, and
-/// `schedstat_tests` — keeping it in one place avoids drift
+/// `validity_tests`, `event_rates_tests`, `schedstat_tests`,
+/// and `evaluate_helpers_tests` — keeping it in one place avoids drift
 /// between copies that would silently change what "balanced"
 /// means across test modules.
 pub(crate) fn balanced_sample(elapsed_ms: u64, clock_base: u64) -> MonitorSample {

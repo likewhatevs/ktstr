@@ -237,7 +237,9 @@ pub struct DisplayOptions {
     pub metrics: Vec<&'static str>,
     /// Maximum rendered lines per section. Sections whose table
     /// output exceeds this limit are truncated with a notice.
-    /// `0` means unlimited (no truncation). Default `750`.
+    /// `0` means unlimited (no truncation). Populated from the
+    /// CLI `--limit` arg (default `500`); the struct's `Default`
+    /// is `0` (unlimited).
     pub section_line_limit: usize,
 }
 
@@ -248,7 +250,7 @@ pub struct CtprofCompareArgs {
     pub baseline: std::path::PathBuf,
     /// Candidate snapshot (`.ctprof.zst`) from `ktstr ctprof capture -o`.
     pub candidate: std::path::PathBuf,
-    /// Grouping key. `pcomm` (default) aggregates per process
+    /// Grouping key. `pcomm` aggregates per process
     /// name with token-based pattern normalization (so
     /// `worker-{0..N}` parent processes cluster into one
     /// `worker-{N}` bucket); `cgroup` per cgroup path; `comm`
@@ -257,8 +259,11 @@ pub struct CtprofCompareArgs {
     /// alpha-prefix-digits collapse into placeholders so
     /// `tokio-worker-{0..N}` and `kworker/u8:7` cluster); use
     /// `--no-thread-normalize` to disable that collapse and group
-    /// by literal `comm` / `pcomm` instead. `comm-exact` is a
-    /// synonym for `comm --no-thread-normalize`.
+    /// by literal `comm` / `pcomm` instead. `comm-exact`
+    /// disables thread-axis normalization only — its smaps keys
+    /// stay pcomm-pattern normalized — unlike `comm
+    /// --no-thread-normalize`, which also keys smaps literally
+    /// per-PID; see `GroupBy::CommExact`.
     ///
     /// Under `all` (default): also activates fudging — pairs
     /// of cgroups with renamed-but-identical thread populations
@@ -322,20 +327,22 @@ pub struct CtprofCompareArgs {
     ///
     /// Affects only the per-thread metric table and the
     /// derived-metrics section. The `## smaps_rollup`
-    /// sub-table sorts process rows independently by total Rss
-    /// descending (its own built-in default; see
-    /// [`write_diff`]); a future flag could expose that knob,
+    /// sub-table sorts process rows independently by absolute
+    /// Rss delta descending (tiebreak: max-Rss, then name; see
+    /// `sorted_smaps_process_keys`); a future flag could expose that knob,
     /// but `--sort-by` does not propagate to it today.
     ///
     /// Parsed by [`parse_sort_by`] into [`CompareOptions::sort_by`].
     #[arg(long, default_value = "", help_heading = "Display")]
     pub sort_by: String,
-    /// Per-row column layout. `full` (default) emits the
+    /// Per-row column layout. `full` emits the
     /// seven-column form; `delta-only` drops baseline +
     /// candidate; `no-pct` drops the percentage column;
     /// `arrow` collapses baseline / candidate into one
     /// `baseline -> candidate` cell paired with separate Delta
     /// and Pct columns; `pct-only` keeps just the percentage.
+    /// `arrow` (default) collapses baseline / candidate into
+    /// one cell paired with Delta and Pct columns.
     /// `--columns` (below) overrides the format's default
     /// column set when both are present.
     #[arg(long, value_enum, default_value_t = DisplayFormat::Arrow, help_heading = "Display")]
@@ -344,7 +351,8 @@ pub struct CtprofCompareArgs {
     /// default) means "use the column set selected by
     /// --display-format." Valid names: `group`, `threads`,
     /// `metric`, `baseline`, `candidate`, `delta`, `%`,
-    /// `arrow`. Order in the spec is the rendered order.
+    /// `arrow`, `tags`, `uptime`. Order in the spec is the
+    /// rendered order.
     /// Example: `--columns metric,delta,%`. Applies to the
     /// `primary` section's per-metric table only; secondary
     /// tables (cgroup-stats, smaps-rollup, etc.) have fixed
@@ -678,10 +686,10 @@ fn write_metrics_table<W: fmt::Write>(w: &mut W) -> fmt::Result {
     let mut table = crate::cli::new_table();
     table.set_header(vec!["metric", "tags", "description"]);
     for m in CTPROF_METRICS {
-        // Strip the bare metric name off the rendered display
-        // form so the `tags` column carries only the bracketed
-        // suffixes — keeps the table scannable. When the metric
-        // has no tags, the cell is empty.
+        // metric_tags renders only the bracketed
+        // sched_class / [dead] / config_gate suffixes into the
+        // `tags` column — keeps the table scannable. When the
+        // metric has no tags, the cell is empty.
         let tags = metric_tags(m);
         table.add_row(vec![m.name.to_string(), tags, m.description.to_string()]);
     }

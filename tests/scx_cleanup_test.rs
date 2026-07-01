@@ -11,17 +11,17 @@ const SCX_CLEANUP_SCHED: Scheduler =
 /// workload, and exits cleanly. Counterpart to
 /// `eevdf_empty_run_exits_under_watchdog` in `tests/eevdf_tests.rs`.
 ///
-/// Where the EEVDF version exercises the no-scheduler-attached
-/// trace_pipe drain path (`iter->pos == 0` in
-/// `start_trace_pipe`'s reader), this version exercises the
-/// scheduler-attached drain path: scx-ktstr's `sched_ext_dump`
-/// tracepoint emits events as the scheduler attaches and the BSP
-/// boots, so by the time the host-side teardown runs `iter->pos
-/// > 0` and the reader takes the second branch in the cleanup
-/// loop. A regression that breaks either branch lands either as
+/// Unlike the EEVDF version, this test boots WITH the scx-ktstr
+/// scheduler attached, but it exercises the same non-blocking
+/// poll-based `trace_pipe` reader (`start_trace_pipe`) on the
+/// scheduler-attached teardown path. On a clean run no
+/// `sched_ext_dump` event fires — that tracepoint emits only as a
+/// one-shot exit dump, and clean runs never start one — so the
+/// reader forwards nothing and joins within one poll cycle of the
+/// stop flag. A regression that re-wedges teardown lands either as
 /// a `cleanup_budget_ms = 5000` overshoot (caught by
 /// `evaluate_vm_result` against
-/// [`ktstr::vmm::VmResult::cleanup_duration`]) or, in the
+/// [`ktstr::prelude::VmResult::cleanup_duration`]) or, in the
 /// catastrophic case, as a host VM timeout
 /// (`vm_timeout_from_entry` in `src/test_support/runtime.rs`). The
 /// cleanup duration is also persisted to the sidecar so stats

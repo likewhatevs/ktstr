@@ -998,7 +998,7 @@ mod tests {
         let mut s = Serial::default();
         let mut buf = [0u8; 1];
         s.handle_in(COM1_BASE + MSR, &mut buf);
-        // vm-superio defaults MSR to DEFAULT_MODEM_STATUS (DCD).
+        // vm-superio defaults MSR to DEFAULT_MODEM_STATUS (DSR|CTS|DCD); this test masks to the DCD bit.
         // Kernel autoconfig probes MSR in loopback mode, so default doesn't matter.
         assert_eq!(buf[0] & 0x80, 0x80);
     }

@@ -2531,12 +2531,12 @@ fn take_deferred_probe() -> Option<DeferredProbe> {
 /// `false` on timeout or when the file is unreadable (kernels
 /// without sched_ext or non-root probes can't read it).
 ///
-/// `disabled` means the kernel's `scx_disable_irq_workfn` ran to
-/// completion — which is exactly the path that calls
-/// `scx_claim_exit` and fires `trace_sched_ext_exit`. Polling for
-/// this transition is the most reliable signal that the trigger
-/// tracepoint has fired (or never will, in which case the timeout
-/// is the correct signal).
+/// `disabled` is set by `scx_set_enable_state(SCX_DISABLED)` at the
+/// tail of `scx_root_disable`, which runs strictly after
+/// `scx_claim_exit` (called from `scx_vexit`/`scx_disable`) fired
+/// `trace_sched_ext_exit`. Polling for this transition is the most
+/// reliable signal that the trigger tracepoint has fired (or never
+/// will, in which case the timeout is the correct signal).
 ///
 /// Polls every 50 ms — short enough to bound the post-test
 /// finalisation latency, long enough that the per-iteration
@@ -2619,11 +2619,12 @@ pub(crate) fn finalize_probe_after_unwind() {
         // loop's BSS check.
         //
         // No grace sleep after `wait_for_sched_disabled` returns
-        // true: the kernel's `scx_disable_irq_workfn` calls
-        // `scx_claim_exit` (which fires `trace_sched_ext_exit`)
-        // BEFORE `scx_set_enable_state(SCX_DISABLED)`, so a
-        // `state == disabled` observation establishes a
-        // happens-after relationship with the BPF handler's CAS
+        // true: the kernel's `scx_claim_exit` (called from
+        // `scx_vexit`/`scx_disable`) fires `trace_sched_ext_exit`
+        // BEFORE `scx_set_enable_state(SCX_DISABLED)` runs at the
+        // tail of `scx_root_disable`, so a `state == disabled`
+        // observation establishes a happens-after relationship
+        // with the BPF handler's CAS
         // on `ktstr_err_exit_detected` and the ringbuf-event
         // commit. The probe poll loop already breaks on
         // `bss_triggered` without needing `stop` set; setting

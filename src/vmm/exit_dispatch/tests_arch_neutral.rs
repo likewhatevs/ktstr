@@ -3,10 +3,13 @@ use super::*;
 #[test]
 fn classify_exit_hlt_returns_none() {
     // VcpuExit::Hlt is the AP-thread idle marker — classify_exit
-    // returns None to signal "caller handles the kill-flag check
-    // and continues". Pinning here so a future change that
-    // accidentally maps Hlt to ExitAction::Continue (which would
-    // skip the per-iteration kill recheck) is caught.
+    // returns None for it (mod.rs). In production Hlt never reaches
+    // classify_exit: both callers intercept it before the call
+    // (vcpu_run_loop_unified, run_bsp_loop). This pins the
+    // documented Hlt→None classification. (Callers treat None and
+    // Some(ExitAction::Continue) identically — the same empty match
+    // arm — and re-check the kill flag unconditionally at loop-top,
+    // so remapping Hlt to Continue would not skip a kill recheck.)
     let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
     let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
     let mut exit = VcpuExit::Hlt;
@@ -29,7 +32,8 @@ fn classify_exit_shutdown_variant_is_shutdown() {
 #[test]
 fn classify_exit_system_event_shutdown_is_shutdown() {
     // KVM_SYSTEM_EVENT_SHUTDOWN (1) is the PSCI-style clean shutdown
-    // signal both arches surface for guest-initiated reboot. Must
+    // signal both arches surface for guest-initiated poweroff/shutdown
+    // (reboot is RESET=2, covered by the sibling test). Must
     // classify as Shutdown so the run loop stops the BSP and APs.
     let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
     let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
@@ -68,8 +72,9 @@ fn classify_exit_system_event_unknown_type_is_continue() {
     let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
     let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
     let data: [u64; 0] = [];
-    // 99 is well outside KVM_SYSTEM_EVENT_{SHUTDOWN, RESET, CRASH,
-    // WAKEUP, S2IDLE, SUSPEND} — picked to defend against future
+    // 99 is well outside KVM_SYSTEM_EVENT_{SHUTDOWN=1, RESET=2,
+    // CRASH=3, WAKEUP=4, SUSPEND=5, SEV_TERM=6, TDX_FATAL=7} per
+    // include/uapi/linux/kvm.h — picked to defend against future
     // expansion of the legitimate set without flipping this test.
     let mut exit = VcpuExit::SystemEvent(99, &data);
     let action = classify_exit(&com1, &com2, None, None, None, None, None, &mut exit);

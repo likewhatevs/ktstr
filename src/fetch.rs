@@ -70,9 +70,10 @@ const SHARED_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// # Panics
 ///
 /// Panics on the first call if `Client::builder().build()` fails to
-/// construct a client. The documented failure modes are TLS backend
+/// construct a client. Documented failure modes include TLS backend
 /// initialization (e.g. rustls/native-tls subsystem unreachable) and
-/// are treated as setup bugs rather than runtime errors. The
+/// system-resolver config load failure; both are treated as setup
+/// bugs rather than runtime errors. The
 /// `expect` here, rather than propagating the error, mirrors the
 /// inherited behavior of `reqwest::blocking::Client::new()` (which
 /// is itself an infallible wrapper around `builder().build().expect`).
@@ -507,9 +508,10 @@ const DOWNLOAD_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
 ///    when more than [`DOWNLOAD_NO_PROGRESS_TIMEOUT`] elapses
 ///    between byte-producing reads. Without this, a CDN edge that
 ///    keepalives the socket but stops delivering body bytes would
-///    leave the download blocked indefinitely (reqwest's per-read
-///    timeout reset on every empty wakeup, and the connect-phase
-///    timeout already passed during handshake). The check fires
+///    only surface after reqwest's per-request read timeout
+///    ([`DOWNLOAD_REQUEST_READ_TIMEOUT`], 300s), which bounds a
+///    single stalled `read()`; the watchdog applies the tighter
+///    60s no-progress bound across successive reads. The check fires
 ///    BEFORE the inner `read()` so a stalled inner reader cannot
 ///    out-block the watchdog.
 ///

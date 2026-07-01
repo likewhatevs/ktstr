@@ -531,9 +531,10 @@ impl WorkType {
     /// the number of waiters to wake. Realistic values are tens of
     /// workers; sched-test topologies that need more than `i32::MAX`
     /// (~2.1B) receivers per messenger are not expressible.
-    /// `WorkloadHandle::spawn` clamps the cast to `i32::MAX` so a
-    /// pathological `usize` input wakes all-available instead of
-    /// wrapping to a negative (FUTEX_WAKE broadcasts when passed a
+    /// The worker's `futex_wake` call site clamps the cast via
+    /// `clamp_futex_wake_n` (`worker/mod.rs`) so a pathological
+    /// `usize` input wakes at most `i32::MAX` waiters instead of
+    /// wrapping to a negative N (FUTEX_WAKE broadcasts when passed a
     /// negative N on some kernels, which would wake every waiter on
     /// the futex rather than just this messenger's receivers).
     ///

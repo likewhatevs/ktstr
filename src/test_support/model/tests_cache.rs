@@ -10,7 +10,7 @@ fn resolve_cache_root_honors_ktstr_cache_dir() {
     // `std::env::set_var` is process-wide. `lock_env()`
     // serializes the save/mutate/restore window against every
     // other env-touching test in this crate so concurrent
-    // runners in sidecar.rs / crate::test_support::eval don't race on
+    // runners in sidecar/tests.rs / crate::test_support::eval don't race on
     // KTSTR_CACHE_DIR. Poisoned-lock recovery is handled
     // inside `lock_env()` itself, so a panic inside the
     // critical section is safe to recover through.
@@ -538,7 +538,7 @@ fn status_captures_io_error_for_unreadable_cached_file() {
     // subsequent File::open inside check_sha256 hits EACCES.
     // The file itself remains in the directory (metadata.is_file
     // still returns true), so status() enters the is_file arm
-    // rather than the `_ => (false, false, None)` fallback.
+    // rather than the `_ => ShaVerdict::NotCached` fallback.
     std::fs::set_permissions(&on_disk, std::fs::Permissions::from_mode(0o000)).unwrap();
 
     // DAC-bypass probe: if an open against the just-chmod'd file
@@ -1146,7 +1146,7 @@ fn remove_mtime_size_sidecar_is_idempotent() {
 /// parallelism would make `std::thread::sleep(2s)` a flake
 /// magnet, so use `utimes` to jump mtime forward without
 /// wall-clock waits. Test-only; mirrors the similar helper in
-/// sidecar.rs.
+/// sidecar/tests.rs.
 fn filetime_set(path: &std::path::Path, new_mtime: std::time::SystemTime) {
     use std::os::unix::ffi::OsStrExt;
     let secs = new_mtime

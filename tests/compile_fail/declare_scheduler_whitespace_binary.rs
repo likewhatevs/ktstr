@@ -2,7 +2,9 @@
 // `lit.is_empty()` check accepted `" "` (single space) which flowed
 // to runtime as `SchedulerSpec::Discover(" ")` and failed
 // confusingly inside `build_and_find_binary(" ")`. The
-// `lit.trim().is_empty()` check rejects empty AND whitespace-only.
+// `check_visible_lit` guard (via `is_visibly_empty`) rejects empty,
+// whitespace-only, AND invisible-only (ZWSP/BOM/bidi) binary literals
+// at macro time.
 use ktstr::declare_scheduler;
 
 declare_scheduler!(WHITESPACE_BINARY, {

@@ -1,5 +1,5 @@
 //! End-to-end coverage of the per-snapshot scheduler-identity stamp
-//! built in [`FailureDumpReport::active_map_kvas`](ktstr::monitor::dump::FailureDumpReport)
+//! built in [`FailureDumpReport::active_map_kvas`](ktstr::prelude::FailureDumpReport)
 //! paired with the KVA-aware filter in
 //! [`Snapshot::active`](ktstr::scenario::snapshot::Snapshot::active).
 //!
@@ -61,7 +61,8 @@
 //! happens to land a periodic capture inside the multi-bss window.
 //! Use `HoldSpec::fixed` (NOT `HoldSpec::frac`) for the post-swap
 //! hold so dispatch latency doesn't eat the hold budget via the
-//! `.min(remaining)` clamp at `ops/mod.rs:1305-1307`.
+//! `.min(remaining)` clamp at `ops/mod.rs:1708` (Frac branch at
+//! `ops/mod.rs:1702`).
 
 use anyhow::Result;
 use ktstr::assert::AssertResult;
@@ -310,9 +311,9 @@ fn live_var_resolves_across_same_binary_swap(ctx: &Ctx) -> Result<AssertResult> 
         // — the multi-bss disambiguation path
         // (identify_active_obj_from_struct_ops's target-free walker)
         // is exercised on every post-swap capture. HoldSpec::fixed
-        // avoids the frac-based clamp at ops/mod.rs:1305-1307 that
-        // would collapse the post-swap hold to ~0 if dispatch
-        // overran.
+        // avoids the frac-based clamp at ops/mod.rs:1708 (Frac
+        // branch at ops/mod.rs:1702) that would collapse the
+        // post-swap hold to ~0 if dispatch overran.
         Step::with_op(
             Op::replace_scheduler(&STAGED_ALT_SCHED),
             HoldSpec::fixed(Duration::from_secs(12)),

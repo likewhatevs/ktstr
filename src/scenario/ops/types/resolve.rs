@@ -197,8 +197,9 @@ impl CpusetSpec {
                 let end = (len as f64 * ef) as usize;
                 // Guard against inverted Range (start_frac > end_frac)
                 // — `&usable[start..end]` panics when start > end even
-                // if both are clamped to `len`. `start.min(end)` keeps
-                // the slice empty in that case instead of panicking.
+                // if both are clamped to `len`. `e = end.min(len).max(s)`
+                // clamps `e` up to `s`, so when start > end the slice is
+                // empty (`usable[s..s]`) instead of panicking.
                 let s = start.min(len);
                 let e = end.min(len).max(s);
                 usable[s..e].iter().copied().collect()
@@ -234,8 +235,8 @@ impl CpusetSpec {
                     return BTreeSet::new();
                 }
                 let chunk = usable.len() / of;
-                // Clamp non-finite / out-of-range frac to 0 so the
-                // overlap computation stays bounded.
+                // Clamp finite frac to [0.0, 1.0]; map non-finite frac
+                // to 0.0, so the overlap computation stays bounded.
                 let frac = if frac.is_finite() {
                     frac.clamp(0.0, 1.0)
                 } else {

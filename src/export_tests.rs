@@ -938,13 +938,14 @@ fn generate_preamble_prepends_config_addition_prefix() {
 /// `crate::test_support::eval::run_ktstr_test_inner_impl`:
 /// `--config <path>` (and any `config_file_def`-templated arg)
 /// is pushed FIRST, then `append_base_sched_args` (which
-/// includes `--cell-parent-cgroup` auto-inject) is appended
-/// LAST. The export must match this ordering so clap parsers
-/// with order-sensitive semantics behave identically across
-/// both paths. Scheduler with `cgroup_parent =
-/// Some("/order_pin_parent")` exercises the auto-inject so
-/// the test has a concrete base-args anchor to compare
-/// against. Regression here means a future change reverted to
+/// appends the scheduler's `sched_args` then the per-test
+/// `extra_sched_args`, with no `--cell-parent-cgroup`
+/// auto-inject) is appended LAST. The export must match this
+/// ordering so clap parsers with order-sensitive semantics
+/// behave identically across both paths. The scheduler pins
+/// `--cell-parent-cgroup` explicitly via `sched_args` (with
+/// `cgroup_parent: None`) so the test has a concrete
+/// base-args anchor to compare against. Regression here means a future change reverted to
 /// suffix-position config additions and broke argv ordering
 /// parity.
 #[test]

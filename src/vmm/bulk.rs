@@ -57,21 +57,22 @@ pub const MAX_BULK_FRAME_PAYLOAD: u32 = 16 * 1024 * 1024;
 
 /// One complete message extracted from the bulk byte stream.
 ///
-/// `payload` is read by external consumers via the public bulk API;
-/// internal lib code only inspects `msg_type` + `crc_ok` for the
-/// SCHED_EXIT promotion gate. `#[allow(dead_code)]` mirrors the
-/// pattern on `VmResult::virtio_blk_counters` and `Snapshot` accessor
-/// types — fields part of the public surface that the lib build
-/// does not internally read.
+/// Internal lib code reads all three fields: the freeze
+/// coordinator's [`super::freeze_coord`] dispatch path inspects
+/// `msg_type` + `crc_ok` to gate every verdict/side-effect arm and
+/// reads `payload` (empty-payload gates, `KernAddrs`/`StimulusEvent`
+/// decode, and `payload.to_vec()` into each [`super::wire::ShmEntry`]);
+/// the `is_*_frame` helpers read `msg_type` + `crc_ok`. `payload`
+/// is also read by external consumers via the public bulk API.
 ///
-/// `payload` is `Arc<[u8]>` so cloning a `BulkMessage` (e.g. when
-/// the freeze coordinator stashes parsed frames into the shared
-/// `bulk_messages` buffer for `collect_results`) is a refcount bump
-/// rather than a heap allocation + memcpy of the full payload bytes.
-/// The single per-frame allocation still occurs inside
-/// [`HostAssembler::feed`] when the assembler materialises the
-/// payload from its accumulator buffer; downstream cloning is
-/// O(1).
+/// `payload` is `Arc<[u8]>`, so the single per-frame allocation
+/// occurs inside [`HostAssembler::feed`] when the assembler
+/// materialises the payload from its accumulator buffer, and any
+/// clone of the `Arc<[u8]>` (or of a `BulkMessage`) is an O(1)
+/// refcount bump rather than a heap allocation + memcpy. The
+/// coordinator's `BulkMessage` → `ShmEntry` stash does not take
+/// that clone: it `to_vec()`-copies `payload` into the `Vec<u8>`
+/// field of `ShmEntry`, a fresh heap allocation + memcpy.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct BulkMessage {
@@ -224,15 +225,17 @@ impl HostAssembler {
                 resync = true;
                 break;
             }
-            // Materialise the payload as `Arc<[u8]>` so subsequent
-            // clones (the freeze coordinator's stash from
-            // `BulkMessage` into the shared `ShmEntry` buffer) are
-            // refcount bumps rather than heap allocations + memcpy.
-            // `Arc::<[u8]>::from(&[u8])` performs a single
-            // allocation + copy of the slice contents into a
-            // refcounted boxed slice — same cost as the previous
-            // `to_vec()`, but every downstream `clone()` becomes
-            // O(1).
+            // Materialise the payload as `Arc<[u8]>` so any clone of
+            // the `Arc` (or of the whole `BulkMessage`) is an O(1)
+            // refcount bump rather than a heap allocation + memcpy.
+            // `Arc::<[u8]>::from(&[u8])` performs a single allocation
+            // + copy of the slice contents into a refcounted boxed
+            // slice — same cost as the previous `to_vec()`. Note the
+            // freeze coordinator's `BulkMessage` → `ShmEntry` stash
+            // does NOT take this clone: it `to_vec()`-copies `payload`
+            // into `ShmEntry`'s `Vec<u8>` field (a fresh alloc +
+            // memcpy), so the O(1)-clone benefit accrues only to a
+            // consumer that clones the `Arc`/`BulkMessage`.
             let payload: Arc<[u8]> = Arc::from(&self.buf[hdr_end..payload_end]);
             let computed = crc32fast::hash(&payload);
             let crc_ok = computed == frame.crc32;
@@ -704,12 +707,11 @@ mod tests {
     }
 
     /// Payload type round-trip: the assembler emits each
-    /// `BulkMessage::payload` as `Arc<[u8]>` so downstream clones
-    /// (e.g. the freeze coordinator's
-    /// `BulkMessage` → `ShmEntry` stash) become refcount bumps
-    /// rather than per-frame heap allocations. Pin the contract
-    /// so a future revert to `Vec<u8>` re-introduces the per-clone
-    /// allocation cost it was migrated away from.
+    /// `BulkMessage::payload` as `Arc<[u8]>`, so cloning the `Arc`
+    /// shares the underlying allocation instead of deep-copying the
+    /// bytes. Pin the contract so a future revert to `Vec<u8>`
+    /// re-introduces the per-clone allocation cost it was migrated
+    /// away from.
     #[test]
     fn payload_is_arc_slice() {
         let mut a = HostAssembler::new();

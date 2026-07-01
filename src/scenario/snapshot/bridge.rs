@@ -281,8 +281,9 @@ pub(super) struct SnapshotStore {
     /// stored under the same tag in `reports`. Periodic captures
     /// populate this when a stats client is wired and the request
     /// succeeds; on-demand / watchpoint paths leave the entry
-    /// absent. Sample::stats reads `stats.get(tag)` — `None` is the
-    /// expected shape for non-periodic tags or when the scheduler
+    /// absent. `drain_ordered_with_stats` `remove`s the per-tag slot
+    /// and surfaces it as `Sample::stats`; an absent/`None` slot is
+    /// the expected shape for non-periodic tags or when the scheduler
     /// stats request failed.
     pub(super) stats: HashMap<String, Result<serde_json::Value, super::error::MissingStatsReason>>,
     /// Elapsed milliseconds since `run_start` at the moment the
@@ -797,9 +798,11 @@ impl SnapshotBridge {
             // kernel-scheduling-tick latency. Distinct from the
             // accessor_ready_evt the coord drains (no second-
             // consumer race). Reaching poll_dispatcher_wake without
-            // an installed wake fd panics — the early-return at L679
-            // gates this branch on accessor_worker_state.is_some()
-            // and with_accessor_state stores both together.
+            // an installed wake fd panics — the `(Some, Some)` match
+            // / `return Ok(0)` at the top of this function gates this
+            // branch on both accessor_publish_seqno and
+            // accessor_worker_state being present, and
+            // with_accessor_state stores both together.
             let remaining = deadline.saturating_duration_since(now);
             self.poll_dispatcher_wake(remaining);
         }

@@ -21,8 +21,8 @@
 //!    `cgroup_limits_cell`, `format_delta_cell`) — render-only
 //!    entry points that consume an [`super::Aggregated`] / scalar
 //!    plus a ladder and produce the `String` cell that feeds
-//!    `comfy_table` rows in the parent module's `write_diff` /
-//!    `write_show` paths.
+//!    `comfy_table` rows in the parent module's `write_diff`
+//!    path and the `ktstr` binary's `write_show` path.
 //!
 //! All of this is pure formatting; no underlying numeric values
 //! used for sort order or delta math are mutated here.
@@ -55,7 +55,8 @@ use super::{Aggregated, DerivedValue};
 ///   nanoseconds.
 /// - [`Bytes`](Self::Bytes): B → KiB → MiB → GiB → TiB. IEC binary
 ///   prefixes (×1024) for byte counts. Used for
-///   `AggRule::SumBytes` and any byte-typed derived metric.
+///   `AggRule::SumBytes`, `AggRule::MaxPeakBytes`, and any
+///   byte-typed derived metric.
 /// - [`Ticks`](Self::Ticks): ticks → Kticks (×1e3) → Mticks (×1e6).
 ///   Decimal prefixes for clock-tick counts
 ///   (`utime_clock_ticks`, `stime_clock_ticks`); the unit
@@ -272,7 +273,7 @@ pub fn format_derived_delta_cell(d: f64, ladder: ScaleLadder, is_ratio: bool) ->
 /// Render an `Option<u64>` cgroup limit as either `max` (no
 /// limit / kernel emitted the literal `max` token) or the
 /// auto-scaled value. Used for `memory.max`, `memory.high`,
-/// `memory.low`, `memory.min`, `pids.max`, `cpu.max` quota.
+/// `pids.max`.
 /// Mirrors the kernel's own display: `cat memory.max` prints
 /// `max` when no cap is set, a u64 byte count otherwise.
 pub fn format_optional_limit(v: Option<u64>, ladder: ScaleLadder) -> String {
