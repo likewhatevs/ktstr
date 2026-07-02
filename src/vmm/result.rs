@@ -1575,7 +1575,7 @@ pub(crate) struct VmRunState {
     /// them into `VmResult::guest_messages` alongside the post-exit
     /// `drain_bulk` and the post-mortem SHM CRASH-ring drain.
     /// Without this stash every EXIT / TEST / PAYLOAD_METRICS /
-    /// RAW_PAYLOAD_OUTPUT / PROFRAW frame consumed by the coord
+    /// PROFRAW frame consumed by the coord
     /// would vanish — only the leftover bytes that arrived on
     /// `port1_tx_buf` after the coord exited would reach the
     /// verdict, and a typical run would surface no metrics.

@@ -522,7 +522,7 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
     use crate::host_context::HostContext;
     use crate::monitor::MonitorSummary;
     use crate::monitor::bpf_prog::ProgVerifierStats;
-    use crate::test_support::{Metric, MetricSource, MetricStream, PayloadMetrics, Polarity};
+    use crate::test_support::{Metric, MetricStream, PayloadMetrics, Polarity};
     use crate::timeline::StimulusEvent;
 
     let sc = SidecarResult {
@@ -542,7 +542,6 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
                 value: 42.0,
                 polarity: Polarity::HigherBetter,
                 unit: "audits".to_string(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             }],
             exit_code: 7,

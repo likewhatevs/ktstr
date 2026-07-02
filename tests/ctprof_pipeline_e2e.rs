@@ -71,7 +71,6 @@ static JEMALLOC_ALLOC_WORKER: Payload = Payload::new(
     &[],
     false,
     None,
-    None,
 );
 
 /// Drive the pipeline inside the guest:

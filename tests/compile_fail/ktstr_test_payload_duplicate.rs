@@ -12,7 +12,6 @@ const FIO: Payload = Payload::new(
     &[],
     false,
     None,
-    None,
 );
 
 #[allow(dead_code)]
@@ -25,7 +24,6 @@ const STRESS: Payload = Payload::new(
     &[],
     &[],
     false,
-    None,
     None,
 );
 

@@ -1,112 +1,11 @@
-//! Host-side post_vm plumbing: the LlmExtract model-load skip sentinel,
-//! the post_vm error marker types (ScxBpfErrorMatcherMismatch,
+//! Host-side post_vm plumbing: the post_vm error marker types
+//! (ScxBpfErrorMatcherMismatch,
 //! PostVmAssertionFailure, HostSkipRequest, ExpectAutoReproSatisfied),
 //! the conditional/unconditional callback combiner + dispatch, the
 //! post_vm_skip helper, and skip-sidecar recording. Split out of
 //! eval/mod.rs to keep the module under the size ceiling.
 
 use super::*;
-
-/// Sentinel prefix on the `AssertDetail` message that
-/// [`host_side_llm_extract`] emits when the host-side LLM model could
-/// not load (cold-cache offline, or a cached GGUF incompatible with the
-/// linked llama.cpp). The `run_ktstr_test` caller routes on this prefix
-/// to SKIP the test rather than fail it — an unloadable model is an
-/// unmet prerequisite (the extraction cannot run), not a test failure.
-/// Single source of truth shared by the emit site and the caller's
-/// skip check.
-pub(crate) const LLM_MODEL_LOAD_FAILED_PREFIX: &str = "LlmExtract model load failed: ";
-
-/// Decide whether an unloadable host LLM model should SKIP the test (vs
-/// fail it). Returns `Some(skip_reason)` when the host-side extraction
-/// failed only because the model could not load
-/// ([`LLM_MODEL_LOAD_FAILED_PREFIX`]) AND no host-side `post_vm` callback
-/// failed — an unloadable model is an unmet prerequisite, not a test
-/// failure. Returns `None` (fall through to the normal verdict) when
-/// there is no model-load failure, OR a `post_vm` callback failed: a real
-/// host-side regression DOMINATES a missing-prereq skip and must never be
-/// masked by it. Pure so the skip-vs-fail precedence is unit-tested
-/// without the full eval pipeline.
-pub(crate) fn should_skip_on_llm_model_load_failure(
-    host_extract_failures: &[crate::assert::AssertDetail],
-    post_vm_failed: bool,
-) -> Option<String> {
-    if post_vm_failed {
-        return None;
-    }
-    host_extract_failures
-        .iter()
-        .find(|d| d.message.starts_with(LLM_MODEL_LOAD_FAILED_PREFIX))
-        .map(|d| d.message.clone())
-}
-
-#[cfg(test)]
-mod should_skip_on_llm_model_load_failure_tests {
-    //! Truth table for the LLM-model-load skip-vs-fail precedence. Locks
-    //! in that an unloadable model skips, but a host-side post_vm failure
-    //! dominates (no skip — a real regression is never masked), and a
-    //! non-model failure never skips. A revert of any arm flips a cell.
-    use super::{LLM_MODEL_LOAD_FAILED_PREFIX, should_skip_on_llm_model_load_failure};
-    use crate::assert::{AssertDetail, DetailKind};
-
-    fn model_load_failure() -> AssertDetail {
-        AssertDetail::new(
-            DetailKind::Other,
-            format!("{LLM_MODEL_LOAD_FAILED_PREFIX}cold-cache offline"),
-        )
-    }
-
-    #[test]
-    fn model_load_failure_no_post_vm_skips() {
-        // Unmet prerequisite + no host-side regression → SKIP.
-        let failures = vec![model_load_failure()];
-        assert!(should_skip_on_llm_model_load_failure(&failures, false).is_some());
-    }
-
-    #[test]
-    fn model_load_failure_with_post_vm_does_not_skip() {
-        // A post_vm regression dominates the missing-prereq skip → FAIL
-        // (None: fall through to the verdict).
-        let failures = vec![model_load_failure()];
-        assert!(should_skip_on_llm_model_load_failure(&failures, true).is_none());
-    }
-
-    #[test]
-    fn non_model_failure_does_not_skip() {
-        // A non-model-load failure (a real assertion failure) must not be
-        // masked as a skip.
-        let failures = vec![AssertDetail::new(
-            DetailKind::Other,
-            "metric out of declared range".to_string(),
-        )];
-        assert!(should_skip_on_llm_model_load_failure(&failures, false).is_none());
-    }
-
-    #[test]
-    fn no_failures_does_not_skip() {
-        assert!(should_skip_on_llm_model_load_failure(&[], false).is_none());
-    }
-
-    #[test]
-    fn model_load_failure_among_others_skips() {
-        // `.find` scans all entries: a model-load failure that is not the
-        // first detail still triggers the skip, and the returned reason is
-        // the prefix-bearing one (pins the iteration, not just `[0]`).
-        let failures = vec![
-            AssertDetail::new(
-                DetailKind::Other,
-                "metric out of declared range".to_string(),
-            ),
-            model_load_failure(),
-        ];
-        let skip = should_skip_on_llm_model_load_failure(&failures, false);
-        assert!(
-            skip.as_deref()
-                .is_some_and(|m| m.starts_with(LLM_MODEL_LOAD_FAILED_PREFIX)),
-            "the model-load detail (2nd in the vec) must be found + returned; got {skip:?}",
-        );
-    }
-}
 
 /// Marker error type attached as `anyhow::Context` to the failure
 /// `Err` produced when an scx_bpf_error matcher
@@ -219,7 +118,7 @@ impl std::error::Error for PostVmAssertionFailure {}
 /// needs (e.g. a load-starved VM whose BPF probe never attached, so
 /// the failure dump is a placeholder), as opposed to a real
 /// regression. The eval fn detects this marker (context-aware
-/// `downcast_ref`, near the LLM-model skip gate) and returns
+/// `downcast_ref`, at the `HostSkipRequest` gate) and returns
 /// [`crate::assert::AssertResult::skip`] instead of folding the `Err`
 /// into the verdict.
 ///
@@ -344,65 +243,6 @@ pub(crate) fn combine_post_vm_errs(
 /// `combine_post_vm_errs`): a skip request never masks a regression.
 pub fn post_vm_skip(reason: impl Into<String>) -> anyhow::Error {
     anyhow::anyhow!("{}", reason.into()).context(HostSkipRequest)
-}
-
-#[cfg(test)]
-mod post_vm_skip_tests {
-    //! Locks in the post_vm→skip mechanism. `post_vm_skip` attaches the
-    //! [`HostSkipRequest`] marker (found by the context-aware
-    //! `downcast_ref` the eval gate uses); `combine_post_vm_errs`
-    //! preserves a lone skip request but lets a genuine sibling failure
-    //! DOMINATE — a skip request must never mask a real regression. A
-    //! revert of either the marker attach or the both-skip gate flips a
-    //! cell here.
-    use super::{HostSkipRequest, PostVmAssertionFailure, combine_post_vm_errs, post_vm_skip};
-
-    fn real_fail() -> anyhow::Error {
-        anyhow::anyhow!("real host-side regression").context(PostVmAssertionFailure)
-    }
-
-    #[test]
-    fn post_vm_skip_carries_marker() {
-        assert!(
-            post_vm_skip("inconclusive: placeholder dump")
-                .downcast_ref::<HostSkipRequest>()
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn combine_lone_unconditional_skip_preserved() {
-        let c = combine_post_vm_errs(None, Some(post_vm_skip("ph"))).unwrap();
-        assert!(c.downcast_ref::<HostSkipRequest>().is_some());
-    }
-
-    #[test]
-    fn combine_lone_conditional_skip_preserved() {
-        let c = combine_post_vm_errs(Some(post_vm_skip("ph")), None).unwrap();
-        assert!(c.downcast_ref::<HostSkipRequest>().is_some());
-    }
-
-    #[test]
-    fn combine_both_skip_yields_skip() {
-        let c = combine_post_vm_errs(Some(post_vm_skip("a")), Some(post_vm_skip("b"))).unwrap();
-        assert!(c.downcast_ref::<HostSkipRequest>().is_some());
-    }
-
-    #[test]
-    fn combine_skip_plus_real_fail_does_not_skip() {
-        // A genuine failure alongside a skip request collapses to a
-        // failure: the combined Err must NOT carry HostSkipRequest, so the
-        // eval gate folds it as a failure (re-attaching PostVmAssertionFailure)
-        // rather than skipping — a regression is never masked.
-        let c = combine_post_vm_errs(Some(post_vm_skip("ph")), Some(real_fail())).unwrap();
-        assert!(c.downcast_ref::<HostSkipRequest>().is_none());
-    }
-
-    #[test]
-    fn combine_real_fail_plus_skip_does_not_skip() {
-        let c = combine_post_vm_errs(Some(real_fail()), Some(post_vm_skip("ph"))).unwrap();
-        assert!(c.downcast_ref::<HostSkipRequest>().is_none());
-    }
 }
 
 /// Dispatch the entry's `post_vm` + `post_vm_unconditional`
@@ -540,5 +380,64 @@ pub(crate) fn record_skip_sidecar(
             err = %rendered,
             "skip-sidecar write failed — stats tooling will not see this skip",
         );
+    }
+}
+
+#[cfg(test)]
+mod post_vm_skip_tests {
+    //! Locks in the post_vm→skip mechanism. `post_vm_skip` attaches the
+    //! [`HostSkipRequest`] marker (found by the context-aware
+    //! `downcast_ref` the eval gate uses); `combine_post_vm_errs`
+    //! preserves a lone skip request but lets a genuine sibling failure
+    //! DOMINATE — a skip request must never mask a real regression. A
+    //! revert of either the marker attach or the both-skip gate flips a
+    //! cell here.
+    use super::{HostSkipRequest, PostVmAssertionFailure, combine_post_vm_errs, post_vm_skip};
+
+    fn real_fail() -> anyhow::Error {
+        anyhow::anyhow!("real host-side regression").context(PostVmAssertionFailure)
+    }
+
+    #[test]
+    fn post_vm_skip_carries_marker() {
+        assert!(
+            post_vm_skip("inconclusive: placeholder dump")
+                .downcast_ref::<HostSkipRequest>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn combine_lone_unconditional_skip_preserved() {
+        let c = combine_post_vm_errs(None, Some(post_vm_skip("ph"))).unwrap();
+        assert!(c.downcast_ref::<HostSkipRequest>().is_some());
+    }
+
+    #[test]
+    fn combine_lone_conditional_skip_preserved() {
+        let c = combine_post_vm_errs(Some(post_vm_skip("ph")), None).unwrap();
+        assert!(c.downcast_ref::<HostSkipRequest>().is_some());
+    }
+
+    #[test]
+    fn combine_both_skip_yields_skip() {
+        let c = combine_post_vm_errs(Some(post_vm_skip("a")), Some(post_vm_skip("b"))).unwrap();
+        assert!(c.downcast_ref::<HostSkipRequest>().is_some());
+    }
+
+    #[test]
+    fn combine_skip_plus_real_fail_does_not_skip() {
+        // A genuine failure alongside a skip request collapses to a
+        // failure: the combined Err must NOT carry HostSkipRequest, so the
+        // eval gate folds it as a failure (re-attaching PostVmAssertionFailure)
+        // rather than skipping — a regression is never masked.
+        let c = combine_post_vm_errs(Some(post_vm_skip("ph")), Some(real_fail())).unwrap();
+        assert!(c.downcast_ref::<HostSkipRequest>().is_none());
+    }
+
+    #[test]
+    fn combine_real_fail_plus_skip_does_not_skip() {
+        let c = combine_post_vm_errs(Some(real_fail()), Some(post_vm_skip("ph"))).unwrap();
+        assert!(c.downcast_ref::<HostSkipRequest>().is_none());
     }
 }

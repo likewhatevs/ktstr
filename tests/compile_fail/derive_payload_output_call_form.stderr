@@ -1,0 +1,5 @@
+error: output formats take no arguments; use a bare `Json` or `ExitCode`
+ --> tests/compile_fail/derive_payload_output_call_form.rs:4:34
+  |
+4 | #[payload(binary = "x", output = Json())]
+  |                                  ^^^^^^

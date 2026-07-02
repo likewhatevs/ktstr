@@ -13,7 +13,7 @@
 //! `jemalloc_alloc_worker_exit_codes.rs` for the intercept
 //! rationale).
 
-use ktstr::test_support::{Metric, MetricSource, MetricStream, PayloadMetrics, Polarity};
+use ktstr::test_support::{Metric, MetricStream, PayloadMetrics, Polarity};
 
 // --- Helpers (standalone copies of ktstr::test_support::probe_metrics helpers) ---
 
@@ -77,7 +77,6 @@ fn metric(name: &str, value: f64) -> Metric {
         value,
         polarity: Polarity::Unknown,
         unit: String::new(),
-        source: MetricSource::Json,
         stream: MetricStream::Stdout,
     }
 }

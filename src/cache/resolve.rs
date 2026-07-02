@@ -5,7 +5,7 @@
 //! 1. **Cache-root resolution.** [`resolve_cache_root_with_suffix`]
 //!    runs the env cascade (`KTSTR_CACHE_DIR` → `$XDG_CACHE_HOME` →
 //!    `$HOME/.cache`) that turns a per-cache `suffix` (e.g. `kernels`,
-//!    `models`) into an absolute cache directory path. HOME validation
+//!    `disk_templates`) into an absolute cache directory path. HOME validation
 //!    ([`validate_home_for_cache`]) gates the third fallback so a
 //!    suid-stripped or root-but-no-HOME process produces a clear error
 //!    rather than writing into `/root/.cache/...` by accident.
@@ -34,7 +34,7 @@ use super::housekeeping::read_metadata;
 use super::metadata::KernelSource;
 
 /// Resolve the cache root directory path with a per-cache `suffix`
-/// (`"kernels"` for the kernel cache, `"models"` for the model cache).
+/// (`"kernels"` for the kernel cache, `"disk_templates"` for disk-template images).
 ///
 /// Resolution cascade:
 /// 1. `KTSTR_CACHE_DIR` (with non-UTF-8 bail). The override returns

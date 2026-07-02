@@ -285,13 +285,12 @@ mod tests {
     use super::*;
 
     fn metric(name: &str, value: f64) -> Metric {
-        use super::super::payload::{MetricSource, MetricStream, Polarity};
+        use super::super::payload::{MetricStream, Polarity};
         Metric {
             name: name.to_owned(),
             value,
             polarity: Polarity::Unknown,
             unit: String::new(),
-            source: MetricSource::Json,
             stream: MetricStream::Stdout,
         }
     }

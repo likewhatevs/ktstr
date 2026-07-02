@@ -1,5 +1,5 @@
 //! Integration smoke tests for the FIO / FIO_JSON / STRESS_NG /
-//! SCHBENCH / SCHBENCH_HINTED payload fixtures.
+//! SCHBENCH_JSON payload fixtures.
 //!
 //! The fixtures themselves live under `tests/common/fixtures.rs`
 //! because they are test scaffolding, not shipped API. This test
@@ -15,10 +15,9 @@
 
 mod common;
 
-use common::fixtures::{FIO, FIO_JSON, SCHBENCH, SCHBENCH_HINTED, STRESS_NG};
+use common::fixtures::{FIO, FIO_JSON, SCHBENCH_JSON, STRESS_NG};
 use ktstr::test_support::{
-    MetricCheck, MetricHint, MetricSource, MetricStream, OutputFormat, PayloadKind, Polarity,
-    extract_metrics,
+    MetricCheck, MetricHint, MetricStream, OutputFormat, PayloadKind, Polarity, extract_metrics,
 };
 
 /// FIO is a binary-kind payload named "fio" with JSON output.
@@ -98,10 +97,10 @@ fn stress_ng_identity_fields_are_stable() {
     ));
 }
 
-/// Smoke test: FIO's extraction pipeline produces Json-sourced
-/// metrics from a realistic fio JSON payload. Exercises the
-/// OutputFormat::Json branch of extract_metrics end-to-end
-/// against the fixture's declared output format.
+/// Smoke test: FIO's extraction pipeline produces metrics from a
+/// realistic fio JSON payload. Exercises the OutputFormat::Json
+/// branch of extract_metrics end-to-end against the fixture's
+/// declared output format.
 #[test]
 fn fio_extract_metrics_smoke_from_realistic_json() {
     let stdout = r#"{
@@ -119,13 +118,6 @@ fn fio_extract_metrics_smoke_from_realistic_json() {
     assert_eq!(by_name.get("jobs.0.write.iops"), Some(&78.9));
     assert_eq!(by_name.get("jobs.0.read.lat_ns.mean"), Some(&500.0));
     assert_eq!(by_name.get("jobs.0.write.lat_ns.mean"), Some(&2500.0));
-    for m in &metrics {
-        assert_eq!(
-            m.source,
-            MetricSource::Json,
-            "fixture declares Json output; every metric must land with Json source tag"
-        );
-    }
 }
 
 /// Smoke test: STRESS_NG's exit-code format produces an empty
@@ -141,100 +133,45 @@ fn stress_ng_extract_metrics_smoke_returns_empty() {
     );
 }
 
-/// SCHBENCH identity fields are pinned so tests relying on the
-/// fixture can detect silent drift.
+/// SCHBENCH_JSON identity fields are pinned so tests relying on the
+/// fixture can detect silent drift. `--json -` is baked into
+/// default_args so a bare run produces a JSON body on stdout.
 #[test]
-fn schbench_identity_fields_are_stable() {
-    assert_eq!(SCHBENCH.name, "schbench");
-    assert!(matches!(SCHBENCH.kind, PayloadKind::Binary("schbench")));
-    assert!(matches!(SCHBENCH.output, OutputFormat::LlmExtract(None)));
-    assert_eq!(
-        SCHBENCH.default_args,
-        &["--runtime", "5", "--message-threads", "2"]
-    );
-    assert!(SCHBENCH.metrics.is_empty());
-    assert_eq!(SCHBENCH.default_checks.len(), 1);
+fn schbench_json_identity_fields_are_stable() {
+    assert_eq!(SCHBENCH_JSON.name, "schbench_json");
     assert!(matches!(
-        SCHBENCH.default_checks[0],
+        SCHBENCH_JSON.kind,
+        PayloadKind::Binary("schbench"),
+    ));
+    assert!(matches!(SCHBENCH_JSON.output, OutputFormat::Json));
+    assert_eq!(
+        SCHBENCH_JSON.default_args,
+        &["--runtime", "5", "--message-threads", "2", "--json", "-"]
+    );
+    assert_eq!(SCHBENCH_JSON.default_checks.len(), 1);
+    assert!(matches!(
+        SCHBENCH_JSON.default_checks[0],
         MetricCheck::ExitCodeEq(0)
     ));
 }
 
-/// SCHBENCH_HINTED is the hint-carrying sibling of [`SCHBENCH`].
-/// Its `output` must decode to `LlmExtract(Some(...))` with the
-/// exact hint string baked into the fixture — the round-trip from
-/// derive-macro call form (`LlmExtract("hint")`) through the
-/// emitted `const` and into [`OutputFormat`] is the path this test
-/// pins. A silent drop of the hint at the macro layer, a
-/// re-interpretation at the emit layer, or a structural change
-/// to [`OutputFormat`] that loses the `Option<&'static str>`
-/// payload surfaces here, not at runtime inside extract_via_llm.
-///
-/// The hint string itself ("wakeup latency percentiles") is the
-/// fixture's invariant: it is deliberately asserted by
-/// value — not by `matches!(.., Some(_))` — so a future refactor
-/// that accidentally substitutes, truncates, or duplicates the
-/// hint breaks this assertion rather than landing a quietly
-/// wrong prompt. Every other field (`kind`, `default_args`,
-/// `default_checks`, `metrics`) must match SCHBENCH exactly,
-/// since the two fixtures are defined to differ in only `name`
-/// and `output`.
+/// SCHBENCH_JSON's metric hints pin the schbench JSON schema keys
+/// (`write_json_stats` in schbench.c). Latency percentiles are
+/// LowerBetter, request-per-second is HigherBetter.
 #[test]
-fn schbench_hinted_output_carries_hint_through_derive() {
-    assert_eq!(SCHBENCH_HINTED.name, "schbench_hinted");
-    assert!(matches!(
-        SCHBENCH_HINTED.kind,
-        PayloadKind::Binary("schbench"),
-    ));
-    match SCHBENCH_HINTED.output {
-        OutputFormat::LlmExtract(Some(hint)) => {
-            assert_eq!(hint, "wakeup latency percentiles");
-        }
-        other => panic!("expected OutputFormat::LlmExtract(Some(hint)), got {other:?}",),
-    }
-    assert_eq!(
-        SCHBENCH_HINTED.default_args, SCHBENCH.default_args,
-        "hinted fixture must differ from SCHBENCH only in name and output",
-    );
-    assert_eq!(
-        SCHBENCH_HINTED.metrics.len(),
-        SCHBENCH.metrics.len(),
-        "hinted fixture must differ from SCHBENCH only in name and output",
-    );
-    assert_eq!(
-        SCHBENCH_HINTED.default_checks.len(),
-        SCHBENCH.default_checks.len(),
-        "hinted fixture must differ from SCHBENCH only in name and output",
-    );
-    assert!(SCHBENCH_HINTED.metrics.is_empty());
-    assert_eq!(SCHBENCH_HINTED.default_checks.len(), 1);
-    assert!(matches!(
-        SCHBENCH_HINTED.default_checks[0],
-        MetricCheck::ExitCodeEq(0),
-    ));
-}
+fn schbench_json_metric_hints_pin_schema_keys() {
+    let by_name: std::collections::BTreeMap<&str, &MetricHint> =
+        SCHBENCH_JSON.metrics.iter().map(|m| (m.name, m)).collect();
 
-/// SCHBENCH and SCHBENCH_HINTED share the same binary ("schbench")
-/// but use distinct `name` fields. The `name` is threaded through
-/// every log + error context in [`PayloadRun`](ktstr::scenario::payload_run::PayloadRun)
-/// (e.g. `spawn payload '{name}'`, `reap payload '{name}'`,
-/// `with_context(|| format!("… payload '{name}'"))` sites) and into
-/// the `Debug` impl on `Payload`, so if both fixtures shared a name
-/// a run that used both would emit log lines that could not be
-/// attributed to the right fixture after the fact. Asserting the
-/// distinction here pins the log-attribution contract so a rename
-/// that collapsed the two fixtures into a single `name` breaks
-/// this test rather than surfacing as ambiguous log output.
-#[test]
-fn schbench_and_schbench_hinted_have_distinct_names() {
-    assert_ne!(SCHBENCH.name, SCHBENCH_HINTED.name);
-    let PayloadKind::Binary(b1) = SCHBENCH.kind else {
-        panic!("SCHBENCH must be a Binary-kind payload, not Scheduler");
-    };
-    let PayloadKind::Binary(b2) = SCHBENCH_HINTED.kind else {
-        panic!("SCHBENCH_HINTED must be a Binary-kind payload, not Scheduler");
-    };
-    assert_eq!(b1, b2, "hinted fixture must point at same binary");
+    let rps = by_name.get("int.rps_pct50.0").expect("rps hint");
+    assert_eq!(rps.polarity, Polarity::HigherBetter);
+    assert_eq!(rps.unit, "rps");
+
+    let wl99 = by_name
+        .get("int.wakeup_latency_pct99.0")
+        .expect("wakeup p99 hint");
+    assert_eq!(wl99.polarity, Polarity::LowerBetter);
+    assert_eq!(wl99.unit, "us");
 }
 
 /// No fixture is a scheduler-kind payload — they must not
@@ -245,8 +182,7 @@ fn fixtures_are_not_scheduler_kind() {
     assert!(!FIO.is_scheduler());
     assert!(!FIO_JSON.is_scheduler());
     assert!(!STRESS_NG.is_scheduler());
-    assert!(!SCHBENCH.is_scheduler());
-    assert!(!SCHBENCH_HINTED.is_scheduler());
+    assert!(!SCHBENCH_JSON.is_scheduler());
 }
 
 /// Polarity hints flow through `extract_metrics` via the
@@ -284,34 +220,23 @@ fn fixtures_default_checks_pin_exit_code_gate() {
             MetricCheck::ExitCodeEq(0)
         ));
         assert!(matches!(
-            SCHBENCH.default_checks[0],
+            SCHBENCH_JSON.default_checks[0],
             MetricCheck::ExitCodeEq(0)
-        ));
-        assert!(matches!(
-            SCHBENCH_HINTED.default_checks[0],
-            MetricCheck::ExitCodeEq(0),
         ));
     };
     assert!(!FIO.default_checks.is_empty());
     assert!(!FIO_JSON.default_checks.is_empty());
     assert!(!STRESS_NG.default_checks.is_empty());
-    assert!(!SCHBENCH.default_checks.is_empty());
-    assert!(!SCHBENCH_HINTED.default_checks.is_empty());
+    assert!(!SCHBENCH_JSON.default_checks.is_empty());
 }
 
 /// Identity-tag every fixture's output format so a consumer
-/// reading this file sees the cases side-by-side — Json,
-/// ExitCode, LlmExtract(None), and LlmExtract(Some(_)) — the
-/// three canonical acquisition paths plus the hint-carrying
-/// subvariant of the LLM path.
+/// reading this file sees the cases side-by-side — Json and
+/// ExitCode, the two acquisition paths.
 #[test]
-fn fixture_output_formats_span_json_exit_code_and_llm_extract() {
+fn fixture_output_formats_span_json_and_exit_code() {
     assert!(matches!(FIO.output, OutputFormat::Json));
     assert!(matches!(FIO_JSON.output, OutputFormat::Json));
     assert!(matches!(STRESS_NG.output, OutputFormat::ExitCode));
-    assert!(matches!(SCHBENCH.output, OutputFormat::LlmExtract(None)));
-    assert!(matches!(
-        SCHBENCH_HINTED.output,
-        OutputFormat::LlmExtract(Some(_)),
-    ));
+    assert!(matches!(SCHBENCH_JSON.output, OutputFormat::Json));
 }

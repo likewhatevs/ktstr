@@ -464,7 +464,7 @@ fn extract_not_attached_reason(
 /// [`crate::test_support::wprof::reassemble_wprof_trace`] over the full
 /// bulk drain so a chunked trace is concatenated, not truncated to its
 /// terminal frame. Only the wprof trace unique to this path is
-/// persisted here — Stimulus, PayloadMetrics, and RawPayloadOutput
+/// persisted here — Stimulus and PayloadMetrics
 /// frames from the auto-repro run are intentionally NOT extracted
 /// because they're a duplicate of the primary's and the verdict
 /// context only applies to the primary's drain.

@@ -31,7 +31,7 @@ use super::wire::{FRAME_HEADER_SIZE, ShmMessage};
 /// legitimate producer — a [`crate::vmm::wire::MsgType::WprofTraceChunk`]
 /// slice, which `guest_comms::send_wprof_trace` splits at exactly this size
 /// so its frames land AT the cap (never above); every other producer
-/// (coverage `Profraw` blobs, LLM `RawPayloadOutput` JSON) sits far below
+/// (coverage `Profraw` blobs) sits far below
 /// it — yet it is small enough that a hostile multi-hundred-MiB or 4 GiB
 /// length is always rejected. The cap check fires only after the
 /// complete frame has accumulated in the buffer (header +

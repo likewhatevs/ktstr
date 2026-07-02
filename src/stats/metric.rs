@@ -4123,7 +4123,7 @@ pub(crate) fn metrics_without_suppressed(
 ///   `locality`, `_score`, `goodput`. The scheduler-test fixture's
 ///   `total_iterations` and `worst_iterations_per_worker` already
 ///   carry this polarity in the registry; a payload-author metric
-///   like `jobs.0.read.iops` from the schbench LlmExtract path
+///   like `jobs.0.read.iops` from the schbench JSON path
 ///   should fold the same way.
 /// - Tokens that signal LowerBetter (returned `true`):
 ///   `latency`, `delay`, `_gap`, `stall`, `stuck`, `_cv`, `error`,

@@ -374,13 +374,10 @@ pub fn declare_scheduler(input: TokenStream) -> TokenStream {
 ///
 /// - `name = "..."` — short name used in logs and sidecar records.
 ///   Defaults to the binary name.
-/// - `output = Json | ExitCode | LlmExtract("hint")` — how the
-///   framework extracts metrics from the payload's stdout. The
-///   variant names match the `OutputFormat` enum and the `Polarity`
-///   kwarg grammar. Defaults to `ExitCode`. The `LlmExtract` form
-///   accepts an optional string literal focus hint appended to the
-///   default LLM prompt; bare `LlmExtract` with no parenthesized
-///   argument is a shorthand for `LlmExtract()` (no hint).
+/// - `output = Json | ExitCode` — how the framework extracts
+///   metrics from the payload's stdout. The variant names match the
+///   `OutputFormat` enum and the `Polarity` kwarg grammar. Defaults
+///   to `ExitCode`.
 ///
 /// # Optional outer attributes
 ///

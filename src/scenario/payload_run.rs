@@ -52,7 +52,7 @@ use anyhow::{Context, Result, anyhow};
 use crate::assert::{AssertDetail, AssertResult, DetailKind};
 use crate::scenario::Ctx;
 use crate::test_support::{
-    Metric, MetricCheck, OutputFormat, Payload, PayloadKind, PayloadMetrics, extract_metrics,
+    Metric, MetricCheck, Payload, PayloadKind, PayloadMetrics, extract_metrics,
 };
 
 /// Per-process monotonic counter for payload-invocation indexing.
@@ -60,13 +60,9 @@ use crate::test_support::{
 /// Increments once per `.run()` / `.wait()` / `.kill()` /
 /// `.try_wait()` terminal call (whichever produces the
 /// [`crate::test_support::PayloadMetrics`] emission). Each guest VM is a fresh process, so
-/// the counter starts at 0 every test boot. Stamped onto both
-/// [`PayloadMetrics::payload_index`] and
-/// [`crate::test_support::RawPayloadOutput::payload_index`] so the
-/// host pairs raw output to its empty-metrics slot by equal index
-/// rather than emission order — emission-order pairing would
-/// conflate a `Json` payload that legitimately produced zero
-/// metrics with an `LlmExtract` placeholder.
+/// the counter starts at 0 every test boot. Stamped onto
+/// [`PayloadMetrics::payload_index`] so the host preserves
+/// per-invocation identity independent of SHM emission order.
 ///
 /// `Ordering::Relaxed` is sufficient: the counter's only consumer
 /// is the same thread that incremented (the emit happens inside
@@ -218,8 +214,8 @@ impl<'a> PayloadRun<'a> {
 
     /// Blocking foreground run. Spawns the payload binary, waits
     /// for it to exit, extracts metrics from its output per the
-    /// payload's [`OutputFormat`] (stdout-primary with stderr
-    /// fallback for `Json` / `LlmExtract`; no extraction for
+    /// payload's [`OutputFormat`](crate::test_support::OutputFormat) (stdout-primary with stderr
+    /// fallback for `Json`; no extraction for
     /// `ExitCode`), and evaluates declared [`MetricCheck`]s into an
     /// [`AssertResult`]. See the module-level
     /// `# Stdout-primary, stderr-fallback metric extraction`
@@ -346,59 +342,14 @@ fn payload_binary(payload: &Payload) -> Result<&'static str> {
 /// document whose bytes span both. Stderr is still passed separately
 /// to [`evaluate_checks`] so the exit-code-mismatch detail renders
 /// stderr without stdout prefix.
-///
-/// `OutputFormat::LlmExtract` is HOST-ONLY. The guest does NOT load
-/// the ~2.4 GiB local model into VM RAM (the cache lives on the host
-/// and the model exceeds the test VM's memory budget). For LlmExtract
-/// payloads this function:
-///
-/// 1. Skips [`extract_metrics`] entirely — no model dispatch reaches
-///    any guest call graph.
-/// 2. Emits a `MSG_TYPE_RAW_PAYLOAD_OUTPUT`(crate::vmm::wire::MSG_TYPE_RAW_PAYLOAD_OUTPUT)
-///    SHM message carrying both raw stdout and stderr plus the
-///    payload's hint and exit code.
-/// 3. Emits a paired `MSG_TYPE_PAYLOAD_METRICS` SHM message with
-///    `metrics: vec![]` so per-invocation ordering still aligns with
-///    sidecar entries.
-/// 4. Evaluates `MetricCheck::ExitCodeEq` checks guest-side and returns
-///    the resulting [`AssertResult`] (passing when no ExitCodeEq
-///    check is declared or every declared one matches `exit_code`).
-///    Metric-level checks (`Min`/`Max`/`Range`/`Exists`) cannot be
-///    evaluated guest-side and hard-assert. The authoritative
-///    metric verdict is computed host-side post-VM-exit by
-///    `crate::test_support::eval` after running
-///    `crate::test_support::model::extract_via_llm` on the
-///    captured text and applying the universal LlmExtract invariants
-///    + the payload's `default_checks`.
-///
-/// Test bodies for LlmExtract payloads must be thin wrappers
-/// (`Ok(assert_result)`) — they cannot inspect `metrics.metrics`
-/// directly because extraction is deferred host-side. Runtime
-/// `.check(...)` for `ExitCodeEq` is honored guest-side; runtime
-/// `.check(...)` for metric-level variants hard-asserts at
-/// `evaluate_llm_extract_deferred`. Declare metric checks via
-/// `default_checks` on the `Payload` instead so the host can apply
-/// them.
 fn evaluate(
     payload: &Payload,
     checks: &[MetricCheck],
     output: SpawnOutput,
 ) -> (AssertResult, PayloadMetrics) {
-    if let OutputFormat::LlmExtract(hint) = payload.output {
-        return evaluate_llm_extract_deferred(
-            output,
-            hint,
-            payload.metrics,
-            payload.metric_bounds,
-            checks,
-        );
-    }
-    // `extract_metrics` is infallible for ExitCode + Json (the only
-    // remaining variants the guest evaluates). The Result return type
-    // is preserved so the host-side pipeline — which will call
-    // `extract_metrics` against `OutputFormat::Json` on the stdout
-    // captured before sidecar write — keeps a uniform signature with
-    // the LlmExtract dispatcher in `model::extract_via_llm`.
+    // `extract_metrics` is infallible for both `ExitCode` and `Json`
+    // (the two OutputFormat variants); the `Result` return type is
+    // preserved only for a uniform call signature.
     let stdout_result = extract_metrics(
         &output.stdout,
         &payload.output,
@@ -417,10 +368,8 @@ fn evaluate(
         //   difference.
         // * `Json`: BENEFITS from the fallback. The motivating case
         //   is schbench-like payloads that write structured output
-        //   to stderr only (see `SchbenchPayload` in
+        //   to stderr only (see `SchbenchJsonPayload` in
         //   tests/common/fixtures.rs for the long-form rationale).
-        // * `LlmExtract` is short-circuited above and never reaches
-        //   this branch.
         //
         // The streams are never merged — fallback replaces, not
         // concatenates — so an upstream that genuinely writes to
@@ -465,141 +414,11 @@ fn evaluate(
 /// Forwards the underlying `send_payload_metrics` boolean: `true`
 /// when the frame was written, `false` when the bulk port was not
 /// open, the write failed, or the call ran in host context (the
-/// `assert_guest_context` early-return). The two emit call sites in
-/// `evaluate`/`evaluate_llm_extract_deferred` discard it at
-/// statement position; the boolean exists so the host-context no-op
-/// is observable to a test.
+/// `assert_guest_context` early-return). The emit call site in
+/// `evaluate` discards it at statement position; the boolean exists
+/// so the host-context no-op is observable to a test.
 fn emit_payload_metrics(pm: &PayloadMetrics) -> bool {
     crate::vmm::guest_comms::send_payload_metrics(pm)
-}
-
-/// Emit a `RawPayloadOutput` on the guest-to-host bulk data
-/// channel (virtio-console port 1) under
-/// `MSG_TYPE_RAW_PAYLOAD_OUTPUT`(crate::vmm::wire::MSG_TYPE_RAW_PAYLOAD_OUTPUT).
-///
-/// Mirrors [`emit_payload_metrics`]'s shape — postcard encoding and
-/// backpressure live inside the typed sender.
-fn emit_raw_payload_output(raw: &crate::test_support::RawPayloadOutput) {
-    crate::vmm::guest_comms::send_raw_payload_output(raw);
-}
-
-/// Guest-side post-exit pipeline for `OutputFormat::LlmExtract`
-/// payloads. Skips every model-loading code path and ships the
-/// captured raw output across the SHM ring for host-side extraction.
-///
-/// LLM extraction is HOST-ONLY: the model (~2.4 GiB) does not fit in
-/// the test VM's RAM budget and the cache lives on the host. The
-/// host's `crate::test_support::eval` post-VM-exit pipeline drains the SHM ring,
-/// matches `payload_index` between the
-/// `MSG_TYPE_RAW_PAYLOAD_OUTPUT` and `MSG_TYPE_PAYLOAD_METRICS`
-/// messages emitted by this invocation, runs
-/// `crate::test_support::model::extract_via_llm` stdout-primary
-/// with a stderr-fallback retry, and replaces the empty `metrics`
-/// vec on the matched [`crate::test_support::PayloadMetrics`] slot with the extracted
-/// result before the sidecar write.
-///
-/// Both messages emitted from this invocation carry the SAME
-/// `payload_index` allocated below from the per-process counter —
-/// the host's `HashMap<payload_index, vec position>` pairing is
-/// independent of SHM emission order or interleaving. Raw-output is
-/// still emitted FIRST, then the empty payload-metrics, so a reader
-/// scanning the SHM ring in order sees the pair adjacent; that
-/// adjacency is observability, not pairing semantics.
-///
-/// MetricCheck handling: `MetricCheck::ExitCodeEq` is evaluated guest-side here
-/// via [`exit_code_mismatch_detail`] because the exit code is
-/// available in `output.exit_code`; the resulting detail (if any) is
-/// folded into the returned `AssertResult`. Metric-level checks
-/// (`Min`/`Max`/`Range`/`Exists`) cannot be evaluated guest-side —
-/// metrics are extracted host-side post-VM-exit — and a runtime
-/// `.check(...)` for any of those variants on a LlmExtract payload
-/// hard-asserts. Test authors must declare metric checks via
-/// `default_checks` on the `Payload`, not via the runtime builder.
-///
-/// Polarity / unit classification: `metric_hints` carries the
-/// payload's `metrics: &[MetricHint]` slice in owned-strings form
-/// ([`crate::test_support::WireMetricHint`]) so the host's
-/// `crate::test_support::eval` post-VM-exit pipeline can call
-/// [`resolve_polarities_owned`] against the host-extracted
-/// [`Metric`] set. The guest's `&'static [MetricHint]` cannot
-/// round-trip through SHM, so the conversion happens here at the
-/// emit boundary; an unhinted payload (`metric_hints: &[]`) ships
-/// an empty `Vec<WireMetricHint>` and the host treats every
-/// extracted metric as [`crate::test_support::Polarity::Unknown`].
-fn evaluate_llm_extract_deferred(
-    output: SpawnOutput,
-    hint: Option<&'static str>,
-    metric_hints: &'static [crate::test_support::MetricHint],
-    metric_bounds: Option<&'static crate::test_support::MetricBounds>,
-    checks: &[MetricCheck],
-) -> (AssertResult, PayloadMetrics) {
-    let bad: Vec<String> = checks
-        .iter()
-        .filter(|c| !matches!(c, MetricCheck::ExitCodeEq(_)))
-        .map(|c| match c {
-            MetricCheck::Min { metric, value } => {
-                format!("Min {{ metric: {metric:?}, value: {value} }}")
-            }
-            MetricCheck::Max { metric, value } => {
-                format!("Max {{ metric: {metric:?}, value: {value} }}")
-            }
-            MetricCheck::Range { metric, lo, hi } => {
-                format!("Range {{ metric: {metric:?}, lo: {lo}, hi: {hi} }}")
-            }
-            MetricCheck::Exists(metric) => format!("Exists({metric:?})"),
-            // `ExitCodeEq` is filtered out above; keep an explicit
-            // unreachable arm so a future MetricCheck variant added on
-            // the LlmExtract-acceptable side surfaces here at
-            // compile time rather than rendering as a fallback
-            // Debug.
-            MetricCheck::ExitCodeEq(_) => unreachable!(
-                "ExitCodeEq is filtered out of the bad list above; \
-                 this arm is exhaustive-match coverage for the variant"
-            ),
-        })
-        .collect();
-    assert!(
-        bad.is_empty(),
-        "metric-level .check() on LlmExtract payloads cannot be evaluated guest-side; \
-         declare these as default_checks on the Payload instead. Forbidden: [{}]",
-        bad.join(", "),
-    );
-
-    let exit_code = output.exit_code;
-    // Single index allocated for the pair — both messages emitted
-    // from this invocation share it so the host can match them
-    // independent of emission order or interleaving.
-    let payload_index = next_payload_index();
-    let raw = crate::test_support::RawPayloadOutput {
-        payload_index,
-        stdout: output.stdout,
-        stderr: output.stderr,
-        hint: hint.map(str::to_string),
-        metric_hints: metric_hints
-            .iter()
-            .map(crate::test_support::WireMetricHint::from)
-            .collect(),
-        // `MetricBounds` is `Copy`, so the static reference's
-        // payload value rides through SHM by value. `None` means
-        // the payload declared no per-payload bounds — the host
-        // skips the bounds-validation pass for this entry.
-        metric_bounds: metric_bounds.copied(),
-    };
-    emit_raw_payload_output(&raw);
-
-    let payload_metrics = PayloadMetrics {
-        payload_index,
-        metrics: Vec::new(),
-        exit_code,
-    };
-    emit_payload_metrics(&payload_metrics);
-
-    let mut result = AssertResult::pass();
-    if let Some(detail) = exit_code_mismatch_detail(checks, exit_code, &raw.stderr) {
-        result.merge(AssertResult::fail(detail));
-    }
-
-    (result, payload_metrics)
 }
 
 // ---------------------------------------------------------------------------
@@ -1073,42 +892,6 @@ fn resolve_polarities(metrics: &mut [Metric], payload: &Payload) {
     }
 }
 
-/// Owned-strings counterpart to [`resolve_polarities`]: applies the
-/// guest-supplied [`crate::test_support::WireMetricHint`] table to a
-/// host-extracted [`Metric`] set.
-///
-/// Used by the `OutputFormat::LlmExtract` host-side pipeline in
-/// `crate::test_support::eval` — the model-driven extraction runs
-/// after VM exit, so the original `&Payload`'s
-/// `&'static [MetricHint]` is unreachable on the host. The guest
-/// converts the static slice to `Vec<WireMetricHint>` at LlmExtract
-/// emit time (in [`evaluate_llm_extract_deferred`]) and ships it
-/// inside [`crate::test_support::RawPayloadOutput::metric_hints`].
-///
-/// Semantics match [`resolve_polarities`] exactly:
-/// - Empty hints OR empty metrics → no-op fast-path.
-/// - Duplicate hint names → HashMap last-insertion wins.
-/// - Duplicate metric names → each occurrence receives the hint.
-/// - Unhinted metric names → [`crate::test_support::Polarity::Unknown`] + empty unit
-///   (left unchanged from the value the caller provided).
-#[cfg(feature = "llm")]
-pub(crate) fn resolve_polarities_owned(
-    metrics: &mut [Metric],
-    hints: &[crate::test_support::WireMetricHint],
-) {
-    if hints.is_empty() || metrics.is_empty() {
-        return;
-    }
-    let table: std::collections::HashMap<&str, &crate::test_support::WireMetricHint> =
-        hints.iter().map(|h| (h.name.as_str(), h)).collect();
-    for metric in metrics {
-        if let Some(hint) = table.get(metric.name.as_str()) {
-            metric.polarity = hint.polarity;
-            metric.unit = hint.unit.clone();
-        }
-    }
-}
-
 /// Evaluate [`MetricCheck`]s against a [`crate::test_support::PayloadMetrics`] and fold the
 /// verdict into an [`AssertResult`].
 ///
@@ -1130,12 +913,9 @@ pub(crate) fn resolve_polarities_owned(
 fn evaluate_checks(checks: &[MetricCheck], pm: &PayloadMetrics, stderr: &str) -> AssertResult {
     let mut result = AssertResult::pass();
     // Pre-pass: exit-code checks first. Delegates to
-    // `exit_code_mismatch_detail` so the detail's kind + message
-    // stay in lockstep with the host-side ExitCodeEq evaluation that
-    // applies to `OutputFormat::LlmExtract` payloads after the host's
-    // raw-output-driven extraction completes. Short-circuit on
-    // mismatch — a bad exit probably means the metric extraction
-    // found nothing useful.
+    // `exit_code_mismatch_detail` for the detail's kind + message.
+    // Short-circuit on mismatch — a bad exit probably means the
+    // metric extraction found nothing useful.
     if let Some(detail) = exit_code_mismatch_detail(checks, pm.exit_code, stderr) {
         result.merge(AssertResult::fail(detail));
         return result;
@@ -1233,11 +1013,9 @@ fn missing_metric(metric: &str) -> AssertDetail {
 /// `ExitCodeEq` check is declared, or when every declared one
 /// matches the observed exit code.
 ///
-/// Shared between [`evaluate_checks`]'s pre-pass and the host-side
-/// LlmExtract evaluation in `crate::test_support::eval` so the two
-/// sites produce bit-identical details for the same inputs — without
-/// this helper they would drift on kind, message format, or the
-/// "which MetricCheck wins" order.
+/// Factored out of [`evaluate_checks`]'s pre-pass so the exit-code
+/// mismatch detail has one source of truth for kind, message format,
+/// and the "which MetricCheck wins" order.
 fn exit_code_mismatch_detail(
     checks: &[MetricCheck],
     actual_exit_code: i32,
@@ -2380,7 +2158,7 @@ fn spawn_child(
 
 /// Per-stream cap on captured child output. 16 MiB covers every
 /// realistic benchmark stdout in the crate (typical schbench /
-/// stress-ng / LLM-extract flows emit kilobytes to low-hundreds-of-KB)
+/// stress-ng flows emit kilobytes to low-hundreds-of-KB)
 /// with multiple orders of magnitude of slack, while cutting off
 /// OOM pressure from a pathological payload that prints unbounded
 /// GBs. Output past the cap is truncated, not errored, so downstream
@@ -2410,8 +2188,8 @@ pub(crate) const MAX_CAPTURED_STREAM_BYTES: u64 = 16 * 1024 * 1024;
 /// Each reader thread wraps its source in
 /// `Read::take(MAX_CAPTURED_STREAM_BYTES)` — see the constant's
 /// rationale — so a runaway child cannot OOM the host. The tail
-/// past the cap is discarded; `compose_prompt` / metric pipelines
-/// always receive a bounded buffer.
+/// past the cap is discarded; the metric-extraction pipeline
+/// always receives a bounded buffer.
 fn wait_and_capture(child: &mut std::process::Child) -> Result<SpawnOutput> {
     let stdout_handle = child.stdout.take().map(|out| {
         std::thread::spawn(move || -> std::io::Result<(String, bool)> {
@@ -2516,7 +2294,7 @@ fn drain_capped(src: impl std::io::Read, label: &'static str) -> std::io::Result
 mod tests {
     use super::*;
     use crate::cgroup::CgroupManager;
-    use crate::test_support::{MetricSource, MetricStream, OutputFormat, Polarity, Scheduler};
+    use crate::test_support::{MetricStream, OutputFormat, Polarity, Scheduler};
     use crate::topology::TestTopology;
 
     // Minimal Ctx builder fixture for tests — no VM boot.
@@ -2551,7 +2329,6 @@ mod tests {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     const EEVDF_SCHED_PAYLOAD: Payload = Payload {
@@ -2564,7 +2341,6 @@ mod tests {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     #[test]
@@ -3144,7 +2920,6 @@ mod tests {
                 value: 50.0,
                 polarity: Polarity::HigherBetter,
                 unit: String::new(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             }],
             exit_code: 0,
@@ -3169,7 +2944,6 @@ mod tests {
                 value: 1000.0,
                 polarity: Polarity::LowerBetter,
                 unit: String::new(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             }],
             exit_code: 0,
@@ -3194,7 +2968,6 @@ mod tests {
                 value: 150.0,
                 polarity: Polarity::Unknown,
                 unit: String::new(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             }],
             exit_code: 0,
@@ -3228,7 +3001,6 @@ mod tests {
                 value: f64::NAN,
                 polarity: Polarity::HigherBetter,
                 unit: String::new(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             }],
             exit_code: 0,
@@ -3258,7 +3030,6 @@ mod tests {
                 value: f64::NAN,
                 polarity: Polarity::LowerBetter,
                 unit: String::new(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             }],
             exit_code: 0,
@@ -3289,7 +3060,6 @@ mod tests {
                 value: f64::NAN,
                 polarity: Polarity::Unknown,
                 unit: String::new(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             }],
             exit_code: 0,
@@ -3327,7 +3097,6 @@ mod tests {
                 value: 5000.0,
                 polarity: Polarity::HigherBetter,
                 unit: String::new(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             }],
             exit_code: 0,
@@ -3362,7 +3131,6 @@ mod tests {
                 value: 100.0,
                 polarity: Polarity::HigherBetter,
                 unit: String::new(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             }],
             exit_code: 0,
@@ -3404,7 +3172,6 @@ mod tests {
                 value: 75.0,
                 polarity: Polarity::HigherBetter,
                 unit: String::new(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             }],
             exit_code: 0,
@@ -3441,7 +3208,6 @@ mod tests {
                 value: 0.0,
                 polarity: Polarity::LowerBetter,
                 unit: String::new(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             }],
             exit_code: 0,
@@ -3467,7 +3233,6 @@ mod tests {
                 value: -0.0,
                 polarity: Polarity::Unknown,
                 unit: String::new(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             }],
             exit_code: 0,
@@ -3530,7 +3295,6 @@ mod tests {
             value: 100.0,
             polarity: Polarity::Unknown,
             unit: String::new(),
-            source: MetricSource::Json,
             stream: MetricStream::Stdout,
         }];
         const HINTED: Payload = Payload {
@@ -3547,7 +3311,6 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
-            metric_bounds: None,
         };
         resolve_polarities(&mut metrics, &HINTED);
         assert_eq!(metrics[0].polarity, Polarity::HigherBetter);
@@ -3597,7 +3360,6 @@ mod tests {
                 include_files: &[],
                 uses_parent_pgrp: false,
                 known_flags: None,
-                metric_bounds: None,
             };
             let handle = PayloadRun::new(ctx, &SLEEPER).spawn().expect("spawn sleep");
             let (_result, metrics) = handle.kill().expect("kill+collect");
@@ -3620,7 +3382,6 @@ mod tests {
                 include_files: &[],
                 uses_parent_pgrp: false,
                 known_flags: None,
-                metric_bounds: None,
             };
             let mut handle = PayloadRun::new(ctx, &SLEEPER).spawn().expect("spawn sleep");
             // Not yet exited.
@@ -3669,7 +3430,6 @@ mod tests {
             value: 1.0,
             polarity: Polarity::Unknown,
             unit: String::new(),
-            source: MetricSource::Json,
             stream: MetricStream::Stdout,
         }];
         resolve_polarities(&mut metrics, &FIO_BINARY);
@@ -3693,7 +3453,6 @@ mod tests {
                     value: 10.0,
                     polarity: Polarity::HigherBetter,
                     unit: String::new(),
-                    source: MetricSource::Json,
                     stream: MetricStream::Stdout,
                 },
                 Metric {
@@ -3701,7 +3460,6 @@ mod tests {
                     value: 900.0,
                     polarity: Polarity::LowerBetter,
                     unit: String::new(),
-                    source: MetricSource::Json,
                     stream: MetricStream::Stdout,
                 },
                 Metric {
@@ -3709,7 +3467,6 @@ mod tests {
                     value: 200.0,
                     polarity: Polarity::Unknown,
                     unit: String::new(),
-                    source: MetricSource::Json,
                     stream: MetricStream::Stdout,
                 },
             ],
@@ -3770,7 +3527,6 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
-            metric_bounds: None,
         };
         with_ctx("/nonexistent", |ctx| {
             // Fresh builder inherits both default checks in order.
@@ -3835,7 +3591,6 @@ mod tests {
                     value: 12345.0,
                     polarity: Polarity::HigherBetter,
                     unit: "iops".to_string(),
-                    source: MetricSource::Json,
                     stream: MetricStream::Stdout,
                 },
                 Metric {
@@ -3843,7 +3598,6 @@ mod tests {
                     value: 500.0,
                     polarity: Polarity::LowerBetter,
                     unit: "ns".to_string(),
-                    source: MetricSource::LlmExtract,
                     stream: MetricStream::Stdout,
                 },
             ],
@@ -3859,7 +3613,6 @@ mod tests {
             assert_eq!(a.value, b.value);
             assert_eq!(a.polarity, b.polarity);
             assert_eq!(a.unit, b.unit);
-            assert_eq!(a.source, b.source);
         }
     }
 
@@ -3870,7 +3623,7 @@ mod tests {
     /// invariant the prior linear scan had.
     #[test]
     fn resolve_polarities_applies_hints_by_name_lookup() {
-        use crate::test_support::{Metric, MetricHint, MetricSource, MetricStream, Polarity};
+        use crate::test_support::{Metric, MetricHint, MetricStream, Polarity};
         static PAYLOAD: crate::test_support::Payload = crate::test_support::Payload {
             name: "hinted",
             kind: crate::test_support::PayloadKind::Binary("x"),
@@ -3894,7 +3647,6 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
-            metric_bounds: None,
         };
         let mut ms = vec![
             Metric {
@@ -3902,7 +3654,6 @@ mod tests {
                 value: 1.0,
                 polarity: Polarity::Unknown,
                 unit: String::new(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             },
             Metric {
@@ -3910,7 +3661,6 @@ mod tests {
                 value: 2.0,
                 polarity: Polarity::Unknown,
                 unit: String::new(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             },
             Metric {
@@ -3918,7 +3668,6 @@ mod tests {
                 value: 3.0,
                 polarity: Polarity::Unknown,
                 unit: String::new(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             },
         ];
@@ -3946,7 +3695,7 @@ mod tests {
     /// the new value.
     #[test]
     fn resolve_polarities_duplicate_hint_names_last_wins() {
-        use crate::test_support::{Metric, MetricHint, MetricSource, MetricStream, Polarity};
+        use crate::test_support::{Metric, MetricHint, MetricStream, Polarity};
         static PAYLOAD: crate::test_support::Payload = crate::test_support::Payload {
             name: "dup_hints",
             kind: crate::test_support::PayloadKind::Binary("x"),
@@ -3968,14 +3717,12 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
-            metric_bounds: None,
         };
         let mut ms = vec![Metric {
             name: "iops".into(),
             value: 1.0,
             polarity: Polarity::Unknown,
             unit: String::new(),
-            source: MetricSource::Json,
             stream: MetricStream::Stdout,
         }];
         resolve_polarities(&mut ms, &PAYLOAD);
@@ -3991,7 +3738,7 @@ mod tests {
     /// unit so downstream regression reports are consistent.
     #[test]
     fn resolve_polarities_duplicate_metric_names_each_gets_hint() {
-        use crate::test_support::{Metric, MetricHint, MetricSource, MetricStream, Polarity};
+        use crate::test_support::{Metric, MetricHint, MetricStream, Polarity};
         static PAYLOAD: crate::test_support::Payload = crate::test_support::Payload {
             name: "dup_metrics",
             kind: crate::test_support::PayloadKind::Binary("x"),
@@ -4006,7 +3753,6 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
-            metric_bounds: None,
         };
         let mut ms = vec![
             Metric {
@@ -4014,7 +3760,6 @@ mod tests {
                 value: 1.0,
                 polarity: Polarity::Unknown,
                 unit: String::new(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             },
             Metric {
@@ -4022,7 +3767,6 @@ mod tests {
                 value: 2.0,
                 polarity: Polarity::Unknown,
                 unit: String::new(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             },
         ];
@@ -4035,7 +3779,7 @@ mod tests {
 
     #[test]
     fn resolve_polarities_empty_inputs_are_noop() {
-        use crate::test_support::{Metric, MetricSource, MetricStream, Polarity};
+        use crate::test_support::{Metric, MetricStream, Polarity};
         static NO_HINTS: crate::test_support::Payload = crate::test_support::Payload {
             name: "no_hints",
             kind: crate::test_support::PayloadKind::Binary("x"),
@@ -4046,14 +3790,12 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
-            metric_bounds: None,
         };
         let mut ms = vec![Metric {
             name: "anything".into(),
             value: 1.0,
             polarity: Polarity::Unknown,
             unit: String::new(),
-            source: MetricSource::Json,
             stream: MetricStream::Stdout,
         }];
         resolve_polarities(&mut ms, &NO_HINTS);
@@ -4065,222 +3807,6 @@ mod tests {
         let mut empty: Vec<Metric> = vec![];
         resolve_polarities(&mut empty, &NO_HINTS);
         assert!(empty.is_empty());
-    }
-
-    // -- resolve_polarities_owned tests --
-    //
-    // Owned-strings counterpart used by the LlmExtract host-side
-    // pipeline. Behavior must match `resolve_polarities` exactly:
-    // unhinted unchanged, hinted stamped, duplicate hint names
-    // last-wins, duplicate metric names each receive the hint, empty
-    // inputs no-op. The tests construct the same shapes the
-    // `resolve_polarities` tests pin so a regression that splits the
-    // two helpers' semantics is caught here.
-
-    /// Hinted metric receives the polarity + unit from the owned
-    /// hint slice. Mirrors `resolve_polarities_applies_hints` for
-    /// the LlmExtract path.
-    #[cfg(feature = "llm")]
-    #[test]
-    fn resolve_polarities_owned_applies_hints() {
-        use crate::test_support::{Metric, MetricSource, MetricStream, Polarity, WireMetricHint};
-        let hints = vec![
-            WireMetricHint {
-                name: "iops".to_string(),
-                polarity: Polarity::HigherBetter,
-                unit: "iops".to_string(),
-            },
-            WireMetricHint {
-                name: "lat_ns".to_string(),
-                polarity: Polarity::LowerBetter,
-                unit: "ns".to_string(),
-            },
-        ];
-        let mut ms = vec![
-            Metric {
-                name: "iops".into(),
-                value: 1.0,
-                polarity: Polarity::Unknown,
-                unit: String::new(),
-                source: MetricSource::LlmExtract,
-                stream: MetricStream::Stdout,
-            },
-            Metric {
-                name: "unhinted".into(),
-                value: 2.0,
-                polarity: Polarity::Unknown,
-                unit: String::new(),
-                source: MetricSource::LlmExtract,
-                stream: MetricStream::Stdout,
-            },
-            Metric {
-                name: "lat_ns".into(),
-                value: 3.0,
-                polarity: Polarity::Unknown,
-                unit: String::new(),
-                source: MetricSource::LlmExtract,
-                stream: MetricStream::Stdout,
-            },
-        ];
-        resolve_polarities_owned(&mut ms, &hints);
-        assert_eq!(ms[0].polarity, Polarity::HigherBetter);
-        assert_eq!(ms[0].unit, "iops");
-        assert_eq!(ms[1].polarity, Polarity::Unknown);
-        assert_eq!(ms[1].unit, "");
-        assert_eq!(ms[2].polarity, Polarity::LowerBetter);
-        assert_eq!(ms[2].unit, "ns");
-    }
-
-    /// Duplicate hint names: HashMap last-insertion wins. Mirrors
-    /// `resolve_polarities_duplicate_hint_names_last_wins` so a
-    /// switch to first-wins or multimap surfaces here.
-    #[cfg(feature = "llm")]
-    #[test]
-    fn resolve_polarities_owned_duplicate_hint_names_last_wins() {
-        use crate::test_support::{Metric, MetricSource, MetricStream, Polarity, WireMetricHint};
-        let hints = vec![
-            WireMetricHint {
-                name: "iops".to_string(),
-                polarity: Polarity::HigherBetter,
-                unit: "iops".to_string(),
-            },
-            WireMetricHint {
-                name: "iops".to_string(),
-                polarity: Polarity::LowerBetter,
-                unit: "overridden".to_string(),
-            },
-        ];
-        let mut ms = vec![Metric {
-            name: "iops".into(),
-            value: 1.0,
-            polarity: Polarity::Unknown,
-            unit: String::new(),
-            source: MetricSource::LlmExtract,
-            stream: MetricStream::Stdout,
-        }];
-        resolve_polarities_owned(&mut ms, &hints);
-        assert_eq!(ms[0].polarity, Polarity::LowerBetter);
-        assert_eq!(ms[0].unit, "overridden");
-    }
-
-    /// Duplicate metric names: each occurrence gets the same hint.
-    /// Mirrors `resolve_polarities_duplicate_metric_names_each_gets_hint`.
-    #[cfg(feature = "llm")]
-    #[test]
-    fn resolve_polarities_owned_duplicate_metric_names_each_gets_hint() {
-        use crate::test_support::{Metric, MetricSource, MetricStream, Polarity, WireMetricHint};
-        let hints = vec![WireMetricHint {
-            name: "iops".to_string(),
-            polarity: Polarity::HigherBetter,
-            unit: "iops".to_string(),
-        }];
-        let mut ms = vec![
-            Metric {
-                name: "iops".into(),
-                value: 1.0,
-                polarity: Polarity::Unknown,
-                unit: String::new(),
-                source: MetricSource::LlmExtract,
-                stream: MetricStream::Stdout,
-            },
-            Metric {
-                name: "iops".into(),
-                value: 2.0,
-                polarity: Polarity::Unknown,
-                unit: String::new(),
-                source: MetricSource::LlmExtract,
-                stream: MetricStream::Stdout,
-            },
-        ];
-        resolve_polarities_owned(&mut ms, &hints);
-        for m in &ms {
-            assert_eq!(m.polarity, Polarity::HigherBetter);
-            assert_eq!(m.unit, "iops");
-        }
-    }
-
-    /// Empty hints OR empty metrics → fast-path no-op. Pins both
-    /// branches of the early return so a regression that always
-    /// builds the HashMap (or always touches metrics) breaks here.
-    #[cfg(feature = "llm")]
-    #[test]
-    fn resolve_polarities_owned_empty_inputs_are_noop() {
-        use crate::test_support::{Metric, MetricSource, MetricStream, Polarity};
-        // Empty hints, non-empty metrics: leaves metrics untouched.
-        let no_hints: Vec<crate::test_support::WireMetricHint> = vec![];
-        let mut ms = vec![Metric {
-            name: "anything".into(),
-            value: 1.0,
-            polarity: Polarity::Unknown,
-            unit: String::new(),
-            source: MetricSource::LlmExtract,
-            stream: MetricStream::Stdout,
-        }];
-        resolve_polarities_owned(&mut ms, &no_hints);
-        assert_eq!(ms[0].polarity, Polarity::Unknown);
-        assert_eq!(ms[0].unit, "");
-
-        // Non-empty hints, empty metrics: no panic, no allocation
-        // observable from the outside.
-        let hints = vec![crate::test_support::WireMetricHint {
-            name: "iops".to_string(),
-            polarity: Polarity::HigherBetter,
-            unit: "iops".to_string(),
-        }];
-        let mut empty: Vec<Metric> = vec![];
-        resolve_polarities_owned(&mut empty, &hints);
-        assert!(empty.is_empty());
-    }
-
-    /// Round-trip test: build a `WireMetricHint` from a
-    /// `&'static [MetricHint]` (the conversion path used by the
-    /// guest's `evaluate_llm_extract_deferred` at LlmExtract emit
-    /// time) and verify the owned form produces identical
-    /// post-resolution metrics. Pins the From impl + the helper as
-    /// behaviorally equivalent across the SHM boundary.
-    #[cfg(feature = "llm")]
-    #[test]
-    fn resolve_polarities_owned_matches_from_metric_hint_conversion() {
-        use crate::test_support::{
-            Metric, MetricHint, MetricSource, MetricStream, Polarity, WireMetricHint,
-        };
-        static STATIC_HINTS: &[MetricHint] = &[
-            MetricHint {
-                name: "iops",
-                polarity: Polarity::HigherBetter,
-                unit: "iops",
-            },
-            MetricHint {
-                name: "lat_ns",
-                polarity: Polarity::LowerBetter,
-                unit: "ns",
-            },
-        ];
-        let owned: Vec<WireMetricHint> = STATIC_HINTS.iter().map(WireMetricHint::from).collect();
-
-        let mut ms = vec![
-            Metric {
-                name: "iops".into(),
-                value: 1.0,
-                polarity: Polarity::Unknown,
-                unit: String::new(),
-                source: MetricSource::LlmExtract,
-                stream: MetricStream::Stdout,
-            },
-            Metric {
-                name: "lat_ns".into(),
-                value: 1.0,
-                polarity: Polarity::Unknown,
-                unit: String::new(),
-                source: MetricSource::LlmExtract,
-                stream: MetricStream::Stdout,
-            },
-        ];
-        resolve_polarities_owned(&mut ms, &owned);
-        assert_eq!(ms[0].polarity, Polarity::HigherBetter);
-        assert_eq!(ms[0].unit, "iops");
-        assert_eq!(ms[1].polarity, Polarity::LowerBetter);
-        assert_eq!(ms[1].unit, "ns");
     }
 
     /// In host (test) context the bulk port is not open and
@@ -4402,7 +3928,6 @@ mod tests {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     /// Well-behaved case: stdout carries the JSON document; stderr
@@ -4448,7 +3973,7 @@ mod tests {
     /// keep stdout canonical; an all-stderr metric set is a review
     /// hint that the payload may be violating the channel
     /// convention). A regression that stamped `Stdout` on every
-    /// Metric regardless of source would silence that review
+    /// Metric regardless of which stream it came from would silence that review
     /// signal without changing the metric values themselves — this
     /// test pins the attribution end-to-end so the regression
     /// cannot slip past the existing value-only asserts on the
@@ -4709,7 +4234,6 @@ mod tests {
                 include_files: &[],
                 uses_parent_pgrp: false,
                 known_flags: None,
-                metric_bounds: None,
             };
             let handle = PayloadRun::new(ctx, &MULTI_SLEEPER)
                 .spawn()
@@ -4772,7 +4296,6 @@ mod tests {
                 include_files: &[],
                 uses_parent_pgrp: false,
                 known_flags: None,
-                metric_bounds: None,
             };
             let handle = PayloadRun::new(ctx, &MULTI_SLEEPER)
                 .spawn()
@@ -4833,7 +4356,6 @@ mod tests {
                 include_files: &[],
                 uses_parent_pgrp: true,
                 known_flags: None,
-                metric_bounds: None,
             };
             let handle = PayloadRun::new(ctx, &PARENT_PGRP_SLEEPER)
                 .spawn()
@@ -5402,283 +4924,6 @@ mod tests {
                 panic!("worker thread disconnected without reporting",)
             }
         }
-    }
-
-    // -- guest-side LlmExtract dispatch tests --
-    //
-    // Pin the contract documented on `evaluate` and
-    // `evaluate_llm_extract_deferred`: an `OutputFormat::LlmExtract`
-    // payload must NOT run guest-side metric extraction. The model
-    // (~2.4 GiB) does not fit in the test VM's RAM budget, so the
-    // guest pipeline must defer extraction to the host. The visible
-    // contract from a test author's perspective is "the
-    // `PayloadMetrics` returned from evaluate has empty `metrics`,
-    // regardless of stdout/stderr content" — the host fills in the
-    // metrics after VM exit by reading the paired `RawPayloadOutput`
-    // from the SHM ring and running `extract_via_llm`.
-    //
-    // These tests bypass the actual VM boot by calling `evaluate`
-    // directly with a synthetic `SpawnOutput`. SHM emits inside
-    // `evaluate` are no-ops in the test process (see
-    // `crate::vmm::guest_comms::write_msg` early-return on
-    // uninitialized SHM).
-
-    /// LlmExtract payload constant — used by the guest-side
-    /// dispatch tests to drive `evaluate` down the
-    /// `evaluate_llm_extract_deferred` arm.
-    const LLM_EXTRACT_PAYLOAD: Payload = Payload {
-        name: "llm_payload",
-        kind: PayloadKind::Binary("llm_payload"),
-        output: OutputFormat::LlmExtract(None),
-        default_args: &[],
-        default_checks: &[],
-        metrics: &[],
-        include_files: &[],
-        uses_parent_pgrp: false,
-        known_flags: None,
-        metric_bounds: None,
-    };
-
-    /// LlmExtract payload with a focus hint — pins that the hint
-    /// rides through the deferral path into the emitted
-    /// `RawPayloadOutput` rather than getting consumed guest-side.
-    /// Used by `evaluate_llm_extract_deferred_skips_extract_metrics_with_hint`.
-    const LLM_EXTRACT_HINT_PAYLOAD: Payload = Payload {
-        name: "llm_hint_payload",
-        kind: PayloadKind::Binary("llm_hint_payload"),
-        output: OutputFormat::LlmExtract(Some("focus on iops")),
-        default_args: &[],
-        default_checks: &[],
-        metrics: &[],
-        include_files: &[],
-        uses_parent_pgrp: false,
-        known_flags: None,
-        metric_bounds: None,
-    };
-
-    /// `evaluate` on a `LlmExtract` payload must NOT run
-    /// `extract_metrics` — the metrics field of the returned
-    /// [`crate::test_support::PayloadMetrics`] MUST be empty regardless of the stdout
-    /// content. Even when stdout carries a JSON document with
-    /// numeric leaves (which `extract_metrics` would happily
-    /// extract for an `OutputFormat::Json` payload), the LlmExtract
-    /// dispatch arm short-circuits the extraction call entirely.
-    ///
-    /// Setup: stdout carries a JSON object with two numeric leaves
-    /// — `iops=4242` and `latency=10`. If the guest had erroneously
-    /// called `extract_metrics`, the returned PayloadMetrics would
-    /// hold two metrics. The dispatch contract demands zero.
-    ///
-    /// This is the load-bearing pin for the host-side migration:
-    /// any regression that re-introduces guest-side LLM extraction
-    /// (or accidentally treats LlmExtract like Json on the
-    /// extraction axis) surfaces here as a non-empty metrics vec.
-    #[test]
-    fn evaluate_llm_extract_does_not_extract_from_stdout() {
-        let output = SpawnOutput {
-            stdout: r#"{"iops": 4242, "latency": 10}"#.to_string(),
-            stderr: String::new(),
-            exit_code: 0,
-        };
-        let (assert_result, pm) = evaluate(&LLM_EXTRACT_PAYLOAD, &[], output);
-        assert!(
-            pm.metrics.is_empty(),
-            "guest evaluate() on an LlmExtract payload must NOT call extract_metrics; \
-             metrics MUST be empty even when stdout carries extractable JSON. \
-             Got metrics: {:?}",
-            pm.metrics,
-        );
-        assert_eq!(
-            pm.exit_code, 0,
-            "exit_code must still propagate through the deferral arm",
-        );
-        assert!(
-            assert_result.is_pass(),
-            "no checks declared and no exit-code mismatch — verdict must pass; \
-             got {assert_result:?}",
-        );
-    }
-
-    /// Mirror of `evaluate_llm_extract_does_not_extract_from_stdout`
-    /// with stderr carrying the JSON document and stdout empty —
-    /// the schbench-style shape that drives the host's stderr
-    /// fallback. The guest's deferral path must NOT pull metrics
-    /// from EITHER stream — both stdout and stderr ride out to the
-    /// host as raw text, and the host owns the stdout-primary /
-    /// stderr-fallback decision after extracting via the LLM.
-    ///
-    /// A regression that ran extract_metrics on stderr inside the
-    /// guest deferral arm (perhaps in a misguided "fallback should
-    /// always work" refactor) would surface here as a non-empty
-    /// metrics vec — the test would then see latency=42 in the
-    /// returned PM, contradicting the deferral contract.
-    #[test]
-    fn evaluate_llm_extract_does_not_extract_from_stderr_either() {
-        let output = SpawnOutput {
-            stdout: String::new(),
-            stderr: r#"{"latency": 42, "rps": 999}"#.to_string(),
-            exit_code: 0,
-        };
-        let (_, pm) = evaluate(&LLM_EXTRACT_PAYLOAD, &[], output);
-        assert!(
-            pm.metrics.is_empty(),
-            "LlmExtract deferral arm must not run extract_metrics on stderr either; \
-             both streams ride raw to the host. Got metrics: {:?}",
-            pm.metrics,
-        );
-    }
-
-    /// `evaluate` on an LlmExtract payload propagates exit_code and
-    /// stamps it on the returned [`crate::test_support::PayloadMetrics`]. Pins that the
-    /// deferral arm doesn't accidentally zero or stub the exit_code
-    /// field — host-side `MetricCheck::ExitCodeEq` evaluation reads this
-    /// field, so a regression that lost the exit_code on the
-    /// LlmExtract path would silently turn every ExitCodeEq check
-    /// into a "process exited 0" judgment.
-    #[test]
-    fn evaluate_llm_extract_propagates_exit_code() {
-        for code in [0, 1, 42, 137] {
-            let output = SpawnOutput {
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: code,
-            };
-            let (_, pm) = evaluate(&LLM_EXTRACT_PAYLOAD, &[], output);
-            assert_eq!(
-                pm.exit_code, code,
-                "deferral arm must propagate exit_code unchanged; expected {code}",
-            );
-            assert!(
-                pm.metrics.is_empty(),
-                "deferral arm must keep metrics empty even on non-zero exit",
-            );
-        }
-    }
-
-    /// Same dispatch path with a hint variant: `LlmExtract(Some(_))`.
-    /// The hint is consumed inside `evaluate_llm_extract_deferred`
-    /// (it ships into `RawPayloadOutput::hint` for the host's
-    /// `extract_via_llm` to pick up), so the guest-visible behavior
-    /// is identical to the no-hint case: zero metrics in the
-    /// returned `PayloadMetrics`. Pins the hint variant doesn't
-    /// accidentally trigger extraction (e.g. via a regression that
-    /// hard-coded `LlmExtract(None)` in the dispatcher arm).
-    #[test]
-    fn evaluate_llm_extract_with_hint_returns_empty_metrics() {
-        let output = SpawnOutput {
-            stdout: r#"{"iops": 100, "latency": 5}"#.to_string(),
-            stderr: r#"{"alt": 99}"#.to_string(),
-            exit_code: 0,
-        };
-        let (_, pm) = evaluate(&LLM_EXTRACT_HINT_PAYLOAD, &[], output);
-        assert!(
-            pm.metrics.is_empty(),
-            "LlmExtract(Some(hint)) must skip extraction same as LlmExtract(None); \
-             got metrics: {:?}",
-            pm.metrics,
-        );
-    }
-
-    /// The deferral arm honors `MetricCheck::ExitCodeEq` guest-side: a
-    /// matching exit code passes; a mismatch produces a fail
-    /// AssertResult with a detail describing the mismatch. Pins
-    /// that the only check kind permitted on LlmExtract is still
-    /// evaluated guest-side — host-only check evaluation would
-    /// drop the ExitCodeEq verdict for tests that never reach the
-    /// host's check runner.
-    ///
-    /// The `evaluate_llm_extract_deferred` doc says metric-level
-    /// `.check(...)` calls hard-assert; that hard-assert is
-    /// covered by a sibling test below. This test pins the success
-    /// branch (matching exit) and the failure branch (mismatching
-    /// exit) on the only allowed runtime-check variant.
-    #[test]
-    fn evaluate_llm_extract_honors_exit_code_eq_check() {
-        // Match: exit=0, check=0 → passes.
-        let output = SpawnOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: 0,
-        };
-        let (assert_result, pm) = evaluate(
-            &LLM_EXTRACT_PAYLOAD,
-            &[MetricCheck::exit_code_eq(0)],
-            output,
-        );
-        assert!(
-            assert_result.is_pass(),
-            "matching ExitCodeEq must pass on LlmExtract deferral arm; got {assert_result:?}",
-        );
-        assert!(pm.metrics.is_empty());
-
-        // Mismatch: exit=1, check=0 → fails with a detail.
-        let output = SpawnOutput {
-            stdout: String::new(),
-            stderr: "stderr lives in the failure detail".to_string(),
-            exit_code: 1,
-        };
-        let (assert_result, _) = evaluate(
-            &LLM_EXTRACT_PAYLOAD,
-            &[MetricCheck::exit_code_eq(0)],
-            output,
-        );
-        assert!(
-            !assert_result.is_pass(),
-            "mismatching ExitCodeEq must produce a failing AssertResult on the deferral arm",
-        );
-        assert!(
-            !assert_result.outcomes.is_empty(),
-            "exit-code mismatch must surface at least one AssertDetail; got: {assert_result:?}",
-        );
-    }
-
-    /// Hard-assert contract: a runtime metric-level
-    /// `.check(MetricCheck::Min)` on an LlmExtract payload triggers the
-    /// `assert!(bad.is_empty(), ...)` panic in
-    /// `evaluate_llm_extract_deferred`. Pins the developer-error
-    /// boundary so a future regression that silently dropped the
-    /// metric check (instead of panicking) would surface here as
-    /// a "no panic" failure.
-    ///
-    /// The doc explicitly says: "metric-level .check() on
-    /// LlmExtract payloads cannot be evaluated guest-side; declare
-    /// these as default_checks on the Payload instead." Guarding
-    /// the panic ensures that misuse fails loudly at the point of
-    /// the misuse, not silently at sidecar-write time.
-    ///
-    /// Uses `catch_unwind` so the test process survives the panic
-    /// and we can assert on the panic message. `#[cfg(panic =
-    /// "unwind")]` is required because catch_unwind is unusable
-    /// under `panic = "abort"` (the release profile sets abort).
-    #[test]
-    #[cfg(panic = "unwind")]
-    fn evaluate_llm_extract_panics_on_metric_level_runtime_check() {
-        let output = SpawnOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: 0,
-        };
-        // Wrap the call in catch_unwind; the assertion fires inside
-        // evaluate_llm_extract_deferred → evaluate.
-        let result = std::panic::catch_unwind(|| {
-            evaluate(
-                &LLM_EXTRACT_PAYLOAD,
-                &[MetricCheck::min("iops", 1.0)],
-                output,
-            )
-        });
-        let payload = result.expect_err("metric-level check on LlmExtract must panic");
-        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-            (*s).to_string()
-        } else if let Some(s) = payload.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            String::new()
-        };
-        assert!(
-            msg.contains("metric-level .check()") || msg.contains("LlmExtract"),
-            "panic message must surface the developer-error guidance; got: {msg}",
-        );
     }
 
     /// LIFO-drop pin for [`SigchldScope`]'s save-and-restore chain.

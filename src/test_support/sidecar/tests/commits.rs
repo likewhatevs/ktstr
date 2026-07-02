@@ -450,7 +450,7 @@ fn sidecar_payload_and_metrics_always_emit_when_empty() {
 /// would lose the per-payload provenance the design requires).
 #[test]
 fn sidecar_payload_and_metrics_roundtrip_populated() {
-    use crate::test_support::{Metric, MetricSource, MetricStream, PayloadMetrics, Polarity};
+    use crate::test_support::{Metric, MetricStream, PayloadMetrics, Polarity};
     let pm = PayloadMetrics {
         payload_index: 0,
         metrics: vec![Metric {
@@ -458,7 +458,6 @@ fn sidecar_payload_and_metrics_roundtrip_populated() {
             value: 5000.0,
             polarity: Polarity::HigherBetter,
             unit: "iops".to_string(),
-            source: MetricSource::Json,
             stream: MetricStream::Stdout,
         }],
         exit_code: 0,
@@ -518,7 +517,6 @@ fn write_sidecar_records_entry_payload_name() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
@@ -560,7 +558,7 @@ fn write_sidecar_records_entry_payload_name() {
 /// invocation's output in order.
 #[test]
 fn write_sidecar_forwards_payload_metrics_slice() {
-    use crate::test_support::{Metric, MetricSource, MetricStream, PayloadMetrics, Polarity};
+    use crate::test_support::{Metric, MetricStream, PayloadMetrics, Polarity};
 
     let _lock = lock_env();
     let tmp = tempfile::Builder::new()
@@ -588,7 +586,6 @@ fn write_sidecar_forwards_payload_metrics_slice() {
                 value: 1200.0,
                 polarity: Polarity::HigherBetter,
                 unit: "iops".to_string(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             }],
             exit_code: 0,
@@ -646,7 +643,6 @@ fn write_skip_sidecar_records_entry_payload_name() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     fn dummy(_ctx: &Ctx) -> Result<AssertResult> {

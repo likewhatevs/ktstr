@@ -811,47 +811,6 @@ skipped during the walk.
 
 **Fix:** Verify the directory contains the files you expect.
 
-## Model load failed
-
-```text
-GGUF model load failed at /home/.../models/Qwen3-4B-Q4_K_M.gguf. The
-file may be corrupt or incompatible with the linked llama.cpp version
-— delete the file and re-run `cargo ktstr model fetch` to download
-a fresh copy. Check stderr for the upstream llama.cpp rejection reason.
-```
-
-The host-side LLM extraction backend (`OutputFormat::LlmExtract`)
-could not load the cached GGUF weights. The cached file is either
-corrupt (partial download, disk error) or incompatible with the
-linked llama.cpp version.
-
-**Diagnose:**
-
-- Re-run with `RUST_LOG=llama-cpp-2=info` (or `=debug` for more
-  detail) to surface llama.cpp's own rejection reason on stderr.
-  The first call to the inference engine routes
-  `llama_cpp_2::send_logs_to_tracing` events through the tracing
-  subscriber under target `"llama-cpp-2"` (literal hyphens — see
-  [Environment Variables](reference/environment-variables.md) for
-  the EnvFilter shape).
-- `cargo ktstr model status` reports the cache path and verdict
-  (`Matches`, `Mismatches`, `CheckFailed`, `NotCached`).
-
-**Fix:**
-
-- Delete the cached file and re-fetch:
-  `cargo ktstr model clean && cargo ktstr model fetch`. `clean`
-  removes both the GGUF artifact and its `.mtime-size` warm-cache
-  sidecar; `fetch` re-downloads from the pinned URL and SHA-checks
-  the result.
-- If `model status` reports `Mismatches`, the local file's hash
-  diverged from the pinned digest — re-run `cargo ktstr model fetch`,
-  which atomically re-downloads into a tempfile and renames it over
-  the corrupt cache entry (an explicit `clean` is only required under
-  `KTSTR_MODEL_OFFLINE`, which refuses the network re-fetch).
-- If you set `KTSTR_MODEL_OFFLINE=1`, unset it for the re-fetch.
-  See [`cargo ktstr model`](running-tests/cargo-ktstr.md#model).
-
 ## Flock timeout / NFS rejection
 
 ```text

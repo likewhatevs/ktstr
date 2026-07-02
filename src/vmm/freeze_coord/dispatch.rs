@@ -263,7 +263,7 @@ pub(super) struct BulkDispatchSinks<'a> {
 ///
 /// Non-SchedExit verdict frames (Stimulus, ScenarioStart,
 /// ScenarioEnd, Exit, TestResult, Crash, PayloadMetrics,
-/// RawPayloadOutput, Profraw, Stdout, Stderr, SchedLog, Lifecycle,
+/// Profraw, Stdout, Stderr, SchedLog, Lifecycle,
 /// ExecExit, Dmesg, ProbeOutput) accumulate even when `crc_ok` is
 /// false — the host-side consumers filter on per-type contract.
 /// SchedExit is the lone exception: its kill-flag promotion makes a
@@ -828,7 +828,7 @@ pub(super) fn dispatch_bulk_message(
         Some(other) if !other.is_coordinator_internal() => {
             // Every other typed verdict-bearing variant
             // (StepEnd, Exit, TestResult, Crash, PayloadMetrics,
-            // RawPayloadOutput, Profraw, WprofTrace, WprofTraceChunk,
+            // Profraw, WprofTrace, WprofTraceChunk,
             // Stdout, Stderr, SchedLog, Lifecycle, ExecExit, Dmesg,
             // ProbeOutput) accumulates into the bucket verbatim. (ExecExit is listed for
             // completeness but is shell-mode-only -- sent only by

@@ -123,7 +123,7 @@ handshake; tests are not expected to override either knob.
 
 See [Payload Definitions](scheduler-definitions.md#derive-payload) for
 authoring new `Payload` fixtures; `tests/common/fixtures.rs` carries
-reusable examples (`SCHBENCH`, `SCHBENCH_HINTED`, `SCHBENCH_JSON`).
+reusable examples (`FIO`, `FIO_JSON`, `STRESS_NG`, `SCHBENCH_JSON`).
 
 ### Checking
 

@@ -40,7 +40,7 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = { version = "4", optional = true }
 crc32fast = "1.5"
 # Binary serialization for bulk-port TLV payloads (AssertResult,
-# PayloadMetrics, RawPayloadOutput, WorkerReport) and sidecar disk
+# PayloadMetrics, WorkerReport) and sidecar disk
 # persistence (cast_analysis_load). Pre-1.0 — old sidecar /
 # baseline data is disposable; re-running tests regenerates the
 # cache.
@@ -250,43 +250,15 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 # colored, indoc) so only the library trait is pulled in.
 grex = { version = "1.4", default-features = false, optional = true }
 # SHA-256 for one-shot digest verification of downloaded artifacts
-# (fetch.rs), cache-key fingerprinting (disk_template.rs), seeded
-# key derivation (fun.rs), and model-cache integrity checks
-# (test_support/model). Not on the test hot path.
+# (fetch.rs), cache-key fingerprinting (disk_template.rs), and seeded
+# key derivation (fun.rs). Not on the test hot path.
 sha2 = "0.11"
-# Lowercase hex encoding for SHA-256 digest comparisons in the
-# model-cache verify path.
+# Lowercase hex encoding for SHA-256 digest comparisons.
 hex = "0.4"
-# Local inference backend for `OutputFormat::LlmExtract`. CPU-only —
-# `openmp` enables OpenMP-parallel matmul (no GPU offload). The GGUF
-# carries its own tokenizer surface, so no separate tokenizer crate is
-# needed. The `sampler` feature enables the `LlamaSampler` builder API
-# (`greedy()`, `accept()`, `sample()`) used by `invoke_with_model`.
-# Build dep on cmake — the linked llama.cpp C++ sources are built from
-# source via `llama-cpp-sys-2`'s build script.
-#
-# Gated behind the `llm` feature (in `default` to preserve behavior,
-# but `--no-default-features` consumers can drop it). When the
-# feature is off, the entire `test_support::model` module is
-# compiled out, and downstream callers in `eval.rs`, `payload_run.rs`,
-# and `cargo-ktstr` are gated alongside it.
-llama-cpp-2 = { version = "0.1.145", default-features = false, features = ["openmp", "sampler"], optional = true }
-# Stateful UTF-8 decoder required by `LlamaModel::token_to_piece` —
-# a single token may carry a partial multi-byte UTF-8 sequence and
-# only a stateful decoder can stitch consecutive tokens into valid
-# UTF-8 without dropping bytes. Already a transitive dep of
-# `llama-cpp-2`; pinned as a direct dep so the call site's intent is
-# explicit and survives a future llama-cpp-2 reorganization that
-# changes its re-export surface. Tied to the same `llm` feature.
-encoding_rs = { version = "0.8", optional = true }
-# Error-enum derives for the `InferenceError` type that
-# `load_inference` and `invoke_with_model` return. Already a
-# transitive dep via `llama-cpp-2`'s own thiserror-derived error
-# types; promoted to a direct dep so the migration's
-# `#[derive(thiserror::Error)]` site is explicit. Pinned at the v2
-# series to match what `llama-cpp-2` already pulls in (v2.0.18);
-# v2's `#[source]` attribute matches the structured-error
-# pattern this crate's error-handling design favors.
+# Error-enum derives (`#[derive(thiserror::Error)]`) for the crate's
+# structured error types (disk_config, topology, workload types).
+# v2's `#[source]` attribute matches the structured-error pattern
+# this crate's error-handling design favors.
 thiserror = "2"
 
 # Compiled regex patterns for the token-based pattern_key
@@ -352,7 +324,7 @@ panic = "abort"
 debug = "line-tables-only"
 
 [features]
-default = ["llm", "cli-bins"]
+default = ["cli-bins"]
 # `integration` pulls `cli-bins` because the jemalloc introspection
 # fixtures (`ktstr-jemalloc-{probe,alloc-worker}`, gated on cli-bins +
 # integration) are `env!(CARGO_BIN_EXE_…)`'d by their e2es, and cargo
@@ -380,7 +352,7 @@ integration = ["cli-bins"]
 # `default-features = false`:
 #
 #   [dev-dependencies]
-#   ktstr = { version = "0.21.0", default-features = false, features = ["llm"] }
+#   ktstr = { version = "0.21.0", default-features = false }
 cli-bins = [
     "dep:tikv-jemallocator",
     "dep:clap_complete",
@@ -400,14 +372,6 @@ export = ["dep:base64"]
 # compiles libbpf + blazesym (requires git, make, gcc, clang,
 # elfutils-devel, zlib-devel on the host; takes several minutes).
 wprof = ["ktstr-macros/wprof"]
-# Local-CPU LLM extraction (`OutputFormat::LlmExtract`) via the
-# bundled Qwen3-4B GGUF. Pulls in `llama-cpp-2` (compiles llama.cpp
-# C++ via cmake — minutes of build time on a cold cache) plus
-# `encoding_rs`. Default-ON to preserve current behavior; consumers
-# wanting a leaner library (no LLM inference path) can
-# `--no-default-features` and re-enable just the features they want
-# (e.g. `cargo build --no-default-features --features remote-cache,pretty-labels`).
-llm = ["dep:llama-cpp-2", "dep:encoding_rs"]
 # Pretty thread-name labels in `ctprof_compare` output. Enables
 # `grex` regex synthesis to render multi-member buckets as a
 # minimal regex (e.g. `tokio-runtime-worker-[0-3]`). With this
@@ -487,7 +451,7 @@ flate2 = "1"
 libbpf-cargo = "0.26"
 reqwest = { version = "0.13", features = ["blocking"] }
 # SHA-256 for build-script tarball integrity verification (busybox
-# pin in build.rs). Same crate the runtime uses for model artifact
+# pin in build.rs). Same crate the runtime uses for artifact
 # verification — single algorithm across every hashing site.
 sha2 = "0.11"
 # Stable hash for BTF content drift detection in build.rs.

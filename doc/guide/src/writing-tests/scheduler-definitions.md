@@ -549,7 +549,7 @@ For richer binary payloads (custom default args, declared
 `#[derive(Payload)]` on a marker struct — the derive generates
 the matching `const` via the same non-exhaustive-preserving
 construction path. `tests/common/fixtures.rs` has worked
-examples — `SCHBENCH`, `SCHBENCH_HINTED`, `SCHBENCH_JSON` —
+examples — `FIO`, `FIO_JSON`, `STRESS_NG`, `SCHBENCH_JSON` —
 suitable as reference shapes to copy.
 
 ### Quick reference: `Payload` fields
@@ -560,7 +560,7 @@ populated by `Payload::binary` + the derive's builder methods:
 
 - `name: &'static str` — display name that appears in sidecar
   JSON, stats tables, and test filtering. Distinct from the
-  binary name (`kind`) so e.g. `SCHBENCH_HINTED` can run the
+  binary name (`kind`) so e.g. `SCHBENCH_JSON` can run the
   same `schbench` binary with a different label.
 - `kind: PayloadKind` — either `Binary(executable_name)` (for
   test payloads like `schbench`) or `Scheduler(&'static Scheduler)`
@@ -570,9 +570,8 @@ populated by `Payload::binary` + the derive's builder methods:
   `#[ktstr_test(scheduler = MY_SCHED)]` slot takes the bare
   `Scheduler` ref without a Payload wrapper.
 - `output: OutputFormat` — how to interpret the payload's
-  stdout/stderr. `ExitCode` (status code only), `Json` (parse
-  numeric leaves), or `LlmExtract(Option<&'static str>)` (route
-  through a local LLM with an optional hint).
+  stdout/stderr. `ExitCode` (status code only) or `Json` (parse
+  numeric leaves).
 - `default_args: &'static [&'static str]` — CLI args prepended
   to every invocation. Per-test `ctx.payload(...).args(...)`
   appends after these.
@@ -583,12 +582,6 @@ populated by `Payload::binary` + the derive's builder methods:
 - `metrics: &'static [MetricHint]` — declared metrics the
   payload emits (name, unit, polarity). Drives `list-metrics`
   and comparison thresholds.
-- `metric_bounds: Option<&'static MetricBounds>` — optional
-  per-metric host-side bounds applied AFTER the payload exits.
-  Consumed by `LlmExtract` payloads (where extraction runs
-  host-side post-VM-exit); `Json` and `ExitCode` payloads
-  ignore this field and route assertions through
-  `default_checks` instead.
 - `include_files: &'static [&'static str]` — extra files
   packaged into the guest alongside the binary (config files,
   datasets).

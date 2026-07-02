@@ -2241,7 +2241,7 @@ impl KtstrVm {
         // and drains the per-frame `BulkMessage` values. Without
         // this buffer those messages would be discarded after the
         // SCHED_EXIT scan, leaving `collect_results` blind to every
-        // EXIT / TEST / PAYLOAD_METRICS / RAW_PAYLOAD_OUTPUT /
+        // EXIT / TEST / PAYLOAD_METRICS /
         // PROFRAW frame the guest already published mid-run. The
         // post-exit `drain_bulk()` only catches what arrived AFTER
         // the coordinator stopped draining — not the bulk of a
@@ -13086,7 +13086,7 @@ impl KtstrVm {
 
         // Drain the virtio-console port-1 TX accumulator: the guest
         // wrote bulk TLV-framed messages (STIMULUS, EXIT, SCHED_EXIT,
-        // PAYLOAD_METRICS, RAW_PAYLOAD_OUTPUT, etc.) to
+        // PAYLOAD_METRICS, etc.) to
         // `/dev/vport0p1`; the host side accumulated them into
         // `port1_tx_buf` and we parse them here through
         // `parse_tlv_stream`. Port-1 uses backpressure rather than
@@ -13133,7 +13133,7 @@ impl KtstrVm {
         // those parsed frames stash here on every drain so
         // `collect_results` can recover them after the coord has
         // joined. Without this merge every guest-side EXIT / TEST
-        // / PAYLOAD_METRICS / RAW_PAYLOAD_OUTPUT / PROFRAW frame
+        // / PAYLOAD_METRICS / PROFRAW frame
         // consumed mid-run would be silently lost — `drain_bulk()`
         // above only catches what arrived AFTER the coord stopped
         // polling, which on a typical run is empty. Mid-run

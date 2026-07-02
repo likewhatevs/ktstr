@@ -27,9 +27,8 @@
 //!     boundary pins) → `src/vmm/wire.rs` (this file)
 //!   - `KernelOpRequestPayload` / `KernelOpReplyPayload`
 //!     → 4 tests → `src/vmm/wire.rs` (this file)
-//!   - `PayloadMetrics` / `RawPayloadOutput`
-//!     → `payload_metrics_postcard_roundtrip` /
-//!     `raw_payload_output_postcard_roundtrip`
+//!   - `PayloadMetrics`
+//!     → `payload_metrics_postcard_roundtrip`
 //!     → `src/test_support/payload.rs`
 //!   - `WorkloadConfig` → `payload_roundtrip`
 //!     → `src/test_support/payload.rs`
@@ -140,9 +139,6 @@ pub enum MsgType {
     /// Per-payload-invocation metrics (payload: postcard-encoded
     /// `PayloadMetrics`).
     PayloadMetrics,
-    /// Raw stdout/stderr captured from an LlmExtract payload (payload:
-    /// postcard-encoded `RawPayloadOutput`).
-    RawPayloadOutput,
     /// Coverage profraw blob.
     Profraw,
     /// Guest→host stdout chunk. Payload: opaque UTF-8 bytes. Each
@@ -281,7 +277,6 @@ impl MsgType {
             MsgType::SchedExit => MSG_TYPE_SCHED_EXIT,
             MsgType::Crash => MSG_TYPE_CRASH,
             MsgType::PayloadMetrics => MSG_TYPE_PAYLOAD_METRICS,
-            MsgType::RawPayloadOutput => MSG_TYPE_RAW_PAYLOAD_OUTPUT,
             MsgType::Profraw => MSG_TYPE_PROFRAW,
             MsgType::WprofTrace => MSG_TYPE_WPROF_TRACE,
             MsgType::WprofTraceChunk => MSG_TYPE_WPROF_TRACE_CHUNK,
@@ -317,7 +312,6 @@ impl MsgType {
             MSG_TYPE_SCHED_EXIT => Some(MsgType::SchedExit),
             MSG_TYPE_CRASH => Some(MsgType::Crash),
             MSG_TYPE_PAYLOAD_METRICS => Some(MsgType::PayloadMetrics),
-            MSG_TYPE_RAW_PAYLOAD_OUTPUT => Some(MsgType::RawPayloadOutput),
             MSG_TYPE_PROFRAW => Some(MsgType::Profraw),
             MSG_TYPE_WPROF_TRACE => Some(MsgType::WprofTrace),
             MSG_TYPE_WPROF_TRACE_CHUNK => Some(MsgType::WprofTraceChunk),
@@ -481,10 +475,6 @@ pub const MSG_TYPE_CRASH: u32 = 0x4352_5348; // "CRSH"
 /// Per-payload-invocation metrics
 /// (payload: postcard-encoded `crate::test_support::PayloadMetrics`).
 pub const MSG_TYPE_PAYLOAD_METRICS: u32 = 0x504d_4554; // "PMET"
-
-/// Raw stdout/stderr captured from an LlmExtract payload
-/// (payload: postcard-encoded `crate::test_support::RawPayloadOutput`).
-pub const MSG_TYPE_RAW_PAYLOAD_OUTPUT: u32 = 0x5241_574f; // "RAWO"
 
 /// Coverage profraw blob (payload: raw `.profraw` bytes serialized by
 /// `__llvm_profile_write_buffer`).
@@ -1535,7 +1525,6 @@ mod tests {
             MSG_TYPE_SCHED_EXIT,
             MSG_TYPE_CRASH,
             MSG_TYPE_PAYLOAD_METRICS,
-            MSG_TYPE_RAW_PAYLOAD_OUTPUT,
             MSG_TYPE_PROFRAW,
             MSG_TYPE_WPROF_TRACE,
             MSG_TYPE_WPROF_TRACE_CHUNK,
@@ -1610,7 +1599,6 @@ mod tests {
             MsgType::SchedExit,
             MsgType::Crash,
             MsgType::PayloadMetrics,
-            MsgType::RawPayloadOutput,
             MsgType::Profraw,
             MsgType::WprofTrace,
             MsgType::WprofTraceChunk,
@@ -1664,10 +1652,6 @@ mod tests {
         assert_eq!(
             MsgType::PayloadMetrics.wire_value(),
             MSG_TYPE_PAYLOAD_METRICS
-        );
-        assert_eq!(
-            MsgType::RawPayloadOutput.wire_value(),
-            MSG_TYPE_RAW_PAYLOAD_OUTPUT
         );
         assert_eq!(MsgType::Profraw.wire_value(), MSG_TYPE_PROFRAW);
         assert_eq!(MsgType::WprofTrace.wire_value(), MSG_TYPE_WPROF_TRACE);
@@ -1738,7 +1722,6 @@ mod tests {
             MsgType::SchedExit,
             MsgType::Crash,
             MsgType::PayloadMetrics,
-            MsgType::RawPayloadOutput,
             MsgType::Profraw,
             MsgType::WprofTrace,
             MsgType::WprofTraceChunk,

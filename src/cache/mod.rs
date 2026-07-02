@@ -70,8 +70,8 @@ pub use crate::kernel_path::KernelId;
 
 // Crate-internal API re-exports for callers in other modules:
 // path_inside_cache_root (monitor/btf_offsets),
-// resolve_cache_root_with_suffix (test_support/model,
-// vmm/disk_template, vmm/cast_analysis_load), resolve_lock_dir
+// resolve_cache_root_with_suffix (vmm/disk_template,
+// vmm/cast_analysis_load), resolve_lock_dir
 // (vmm/host_topology, cli/locks).
 pub(crate) use resolve::{
     path_inside_cache_root, resolve_cache_root_with_suffix, resolve_lock_dir,

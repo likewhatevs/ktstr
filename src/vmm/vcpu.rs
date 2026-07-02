@@ -13,9 +13,7 @@
 //!
 //! Affinity helpers ([`pin_current_thread`], [`set_thread_cpumask`])
 //! and RT priority ([`set_rt_priority`]) live here too — they're
-//! shared between the BSP / AP run loops and the host-side
-//! `LlmExtract` pipeline (which broadens its own mask after a
-//! perf-mode VM run).
+//! shared between the BSP / AP run loops.
 
 use std::os::unix::io::AsRawFd;
 use std::os::unix::thread::JoinHandleExt;
@@ -349,11 +347,9 @@ fn cpu_set_diag_context() -> (usize, std::borrow::Cow<'static, str>) {
 /// which would otherwise call `sched_setaffinity` with an empty
 /// mask and block the thread forever.
 ///
-/// `pub(crate)` so non-vmm consumers (the host-side LlmExtract
-/// pipeline in `test_support::eval`) can use the same primitive
-/// to broaden the calling thread's mask before running inference,
-/// which would otherwise inherit a perf-mode single-CPU pin from
-/// the just-finished VM run.
+/// `pub(crate)` so the sibling vmm modules (the BSP/AP run loops in
+/// `freeze_coord`, the shell-mode BSP in `vmm::mod`, and the
+/// virtio-blk worker) can share the same affinity primitive.
 pub(crate) fn set_thread_cpumask(cpus: &[usize], label: &str) {
     // Build the cpuset by adding every CPU we can. A bad CPU
     // (out-of-range for `CpuSet`'s static bitmap, currently 1024 on

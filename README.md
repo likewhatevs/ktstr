@@ -294,8 +294,8 @@ struct (uppercased, `Payload` suffix stripped).
 use ktstr::prelude::*;
 
 #[derive(Payload)]
-#[payload(binary = "schbench", output = LlmExtract)]
-#[default_args("--runtime", "5", "--message-threads", "2")]
+#[payload(binary = "schbench", output = Json)]
+#[default_args("--runtime", "5", "--message-threads", "2", "--json", "-")]
 #[default_check(exit_code_eq(0))]
 pub struct SchbenchPayload;
 
@@ -311,7 +311,7 @@ See
 for the `#[derive(Payload)]` macro and the full field surface
 (`default_args`, `default_checks`, `metrics`, `include_files`).
 This repo's `tests/common/fixtures.rs` carries reusable
-in-tree examples (`SCHBENCH`, `SCHBENCH_HINTED`, `SCHBENCH_JSON`)
+in-tree examples (`FIO`, `FIO_JSON`, `STRESS_NG`, `SCHBENCH_JSON`)
 that other ktstr tests inside this repo import via `mod common`;
 they are not part of the published `ktstr` crate.
 
@@ -414,9 +414,6 @@ cargo ktstr kernel build --source ~/linux                  # build from local so
 cargo ktstr kernel build --git URL --ref v6.14             # shallow-clone a git tree
 cargo ktstr kernel list                                    # list cached kernels (shows (EOL) tags)
 cargo ktstr kernel clean --keep 3                          # keep 3 most recent
-cargo ktstr model fetch                                    # prefetch the LlmExtract model
-cargo ktstr model status                                   # report whether a SHA-checked model is cached
-cargo ktstr model clean                                    # drop cached model + warm-cache sidecar
 cargo ktstr verifier                                       # BPF verifier sweep (auto-discover kernel)
 cargo ktstr verifier --kernel 6.14.2 --kernel 6.15.0       # sweep across multiple kernels
 cargo ktstr stats                                          # aggregate gauntlet sidecars

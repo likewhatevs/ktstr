@@ -107,49 +107,6 @@ fn derive_payload_target_value_negative_and_integer() {
     assert_eq!(TARGET_VALUE.metrics[1].polarity, Polarity::TargetValue(0.0));
 }
 
-/// `output = LlmExtract` (bare-ident shorthand) resolves to
-/// `LlmExtract(None)`.
-#[derive(ktstr::Payload)]
-#[payload(binary = "spec_cpu", output = LlmExtract)]
-#[allow(dead_code)]
-struct SpecCpuPayload;
-
-#[test]
-fn derive_payload_llm_extract_bare_is_no_hint() {
-    assert!(matches!(SPEC_CPU.output, OutputFormat::LlmExtract(None)));
-}
-
-/// `output = LlmExtract("hint")` emits `LlmExtract(Some("hint"))`
-/// so the value carries through to the runtime prompt.
-#[derive(ktstr::Payload)]
-#[payload(binary = "bench_with_hint", output = LlmExtract("focus on throughput"))]
-#[allow(dead_code)]
-struct BenchHintedPayload;
-
-#[test]
-fn derive_payload_llm_extract_call_carries_hint() {
-    match BENCH_HINTED.output {
-        OutputFormat::LlmExtract(Some(hint)) => {
-            assert_eq!(hint, "focus on throughput");
-        }
-        other => panic!("expected LlmExtract(Some(..)), got {other:?}"),
-    }
-}
-
-/// Empty `LlmExtract()` call = no hint.
-#[derive(ktstr::Payload)]
-#[payload(binary = "bench_empty_call", output = LlmExtract())]
-#[allow(dead_code)]
-struct BenchEmptyCallPayload;
-
-#[test]
-fn derive_payload_llm_extract_empty_call_has_no_hint() {
-    assert!(matches!(
-        BENCH_EMPTY_CALL.output,
-        OutputFormat::LlmExtract(None),
-    ));
-}
-
 /// Struct name with NO `Payload` suffix: the derive converts the
 /// full CamelCase ident to SCREAMING_SNAKE and uses that as the
 /// const name. `StressNg` → `STRESS_NG`.
@@ -269,7 +226,7 @@ fn derive_payload_accepts_qualified_check_prefix() {
 }
 
 /// Explicit `output = ExitCode` must parse through the same
-/// PascalCase output grammar as `Json` / `LlmExtract` and emit a
+/// PascalCase output grammar as `Json` and emit a
 /// Payload whose `.output == OutputFormat::ExitCode`. The default
 /// (no `output =` kwarg) also lands at `ExitCode`, but a future
 /// change that silently promoted an absent `output` to

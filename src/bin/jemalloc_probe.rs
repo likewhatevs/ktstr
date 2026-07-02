@@ -1055,10 +1055,10 @@ fn synthesize_payload_metrics(
     exit_code: i32,
     payload_index: usize,
 ) -> Result<ktstr::test_support::PayloadMetrics> {
-    use ktstr::test_support::{MetricSource, MetricStream, PayloadMetrics, walk_json_leaves};
+    use ktstr::test_support::{MetricStream, PayloadMetrics, walk_json_leaves};
     let value = serde_json::to_value(out)
         .context("serialize ProbeOutput to serde_json::Value for sidecar append")?;
-    let mut metrics = walk_json_leaves(&value, MetricSource::Json, MetricStream::Stdout);
+    let mut metrics = walk_json_leaves(&value, MetricStream::Stdout);
     for m in &mut metrics {
         m.name = format!("{SIDECAR_METRIC_PREFIX}.{}", m.name);
         apply_probe_metric_hints(m);
@@ -2355,7 +2355,7 @@ mod tests {
 
     #[test]
     fn sidecar_append_preserves_prepopulated_metrics() {
-        use ktstr::test_support::{Metric, MetricSource, MetricStream, PayloadMetrics, Polarity};
+        use ktstr::test_support::{Metric, MetricStream, PayloadMetrics, Polarity};
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.ktstr.json");
@@ -2369,7 +2369,6 @@ mod tests {
                 value: 12345.0,
                 polarity: Polarity::HigherBetter,
                 unit: "ops".to_string(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             }],
             exit_code: 0,
@@ -2381,7 +2380,6 @@ mod tests {
                 value: 42.0,
                 polarity: Polarity::LowerBetter,
                 unit: "us".to_string(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             }],
             exit_code: 0,
@@ -2484,13 +2482,12 @@ mod tests {
 
     #[test]
     fn apply_probe_metric_hints_classifies_byte_counters() {
-        use ktstr::test_support::{Metric, MetricSource, MetricStream, Polarity};
+        use ktstr::test_support::{Metric, MetricStream, Polarity};
         let mut alloc = Metric {
             name: "jemalloc_probe.snapshots.0.threads.0.allocated_bytes".to_string(),
             value: 1024.0,
             polarity: Polarity::Unknown,
             unit: String::new(),
-            source: MetricSource::Json,
             stream: MetricStream::Stdout,
         };
         apply_probe_metric_hints(&mut alloc);
@@ -2502,7 +2499,6 @@ mod tests {
             value: 512.0,
             polarity: Polarity::Unknown,
             unit: String::new(),
-            source: MetricSource::Json,
             stream: MetricStream::Stdout,
         };
         apply_probe_metric_hints(&mut dealloc);
@@ -2514,7 +2510,6 @@ mod tests {
             value: 42.0,
             polarity: Polarity::Unknown,
             unit: String::new(),
-            source: MetricSource::Json,
             stream: MetricStream::Stdout,
         };
         apply_probe_metric_hints(&mut tid);
@@ -2526,7 +2521,6 @@ mod tests {
             value: 999.0,
             polarity: Polarity::Unknown,
             unit: String::new(),
-            source: MetricSource::Json,
             stream: MetricStream::Stdout,
         };
         apply_probe_metric_hints(&mut extra);
@@ -2537,7 +2531,6 @@ mod tests {
             value: 0.0,
             polarity: Polarity::Unknown,
             unit: String::new(),
-            source: MetricSource::Json,
             stream: MetricStream::Stdout,
         };
         apply_probe_metric_hints(&mut dextra);

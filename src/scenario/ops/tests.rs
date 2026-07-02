@@ -256,7 +256,6 @@ fn validate_known_flags_accepts_listed_long_flags() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: Some(&["runtime", "threads", "verbose"]),
-        metric_bounds: None,
     };
     let args: Vec<String> = vec![
         "--runtime=30".into(),
@@ -294,7 +293,6 @@ fn validate_known_flags_fails_fast_on_first_unknown() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: Some(&["runtime", "threads", "verbose"]),
-        metric_bounds: None,
     };
     let args = vec!["--runtime=30".into(), "--threds".into(), "--verbose".into()];
     let err = validate_known_flags(&WITH_ALLOWLIST, &args)
@@ -324,7 +322,6 @@ fn validate_known_flags_rejects_unknown_long_flag() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: Some(&["runtime", "threads"]),
-        metric_bounds: None,
     };
     // "threds" is a typo for "threads" — the exact failure
     // the allowlist exists to catch.
@@ -358,7 +355,6 @@ fn validate_known_flags_none_is_permissive() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     let args: Vec<String> = vec![
         "--anything".into(),
@@ -383,7 +379,6 @@ fn op_discriminant_unique() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     let ops: Vec<Op> = vec![
         Op::AddCgroup { name: "a".into() },
@@ -567,7 +562,6 @@ fn op_discriminant_payload_ops() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     assert_discriminant(
         Op::RunPayload {
@@ -1423,7 +1417,6 @@ fn holdspec_loop_arm_drain_on_err_kills_live_payload_via_kill_not_drop() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     let mock = MockCgroupOps::new();
@@ -3752,7 +3745,6 @@ fn cgroup_def_workload_stores_payload() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     let def = CgroupDef::named("cg_0").workload(&FIO);
     let p = def.payload.expect("workload was attached");
@@ -3791,7 +3783,6 @@ fn drain_payload_handles_for_cgroup_removes_matching_only() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     let cgroups = CgroupManager::new("/nonexistent");
@@ -3844,7 +3835,6 @@ fn step_with_payload_emits_runpayload_op() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     let step = Step::with_payload(&FIO, HoldSpec::fixed(Duration::from_millis(50)));
     assert_eq!(step.ops.len(), 1);
@@ -3880,7 +3870,6 @@ fn op_payload_constructors_produce_expected_variants() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     let op = Op::run_payload(&FIO, ["--warmup"]);
@@ -3990,7 +3979,6 @@ fn op_runpayload_writes_pid_to_named_cgroup_via_placement_trait() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     let ops = vec![Op::RunPayload {
@@ -4047,7 +4035,6 @@ fn op_runpayload_without_cgroup_does_not_place() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     let ops = vec![Op::RunPayload {
@@ -4087,7 +4074,6 @@ fn cgroupdef_workload_with_payload_places_in_def_name() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     let defs = vec![CgroupDef::named("cg_def").workload(&TRUE_BIN)];
@@ -4192,7 +4178,6 @@ fn runpayload_placement_uses_def_name_not_resolved_path() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     // MockCgroupOps's parent_path() is "/mock/cgroup" (see
@@ -4254,7 +4239,6 @@ fn op_runpayload_unknown_cgroup_currently_silently_places_via_trait() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     let ops = vec![Op::RunPayload {
@@ -4501,7 +4485,6 @@ fn apply_ops_run_then_kill_consumes_handle() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     mock_setup_state!(mock, topo, ctx, state);
@@ -4535,7 +4518,6 @@ fn apply_ops_run_duplicate_payload_name_bails() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     mock_setup_state!(mock, topo, ctx, state);
@@ -4595,7 +4577,6 @@ fn apply_ops_run_rejects_payload_already_owned_by_cgroup_def() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     mock_setup_state!(mock, topo, ctx, state);
@@ -4701,7 +4682,6 @@ fn apply_ops_error_does_not_lose_live_payload_handles() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     apply_ops_test(&ctx, &mut state, &[Op::run_payload(&SLEEP, ["3600"])]).expect("spawn");
@@ -5324,7 +5304,6 @@ fn apply_ops_run_duplicate_name_different_cgroups_allowed() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     push_fake_payload_entry(
@@ -5381,7 +5360,6 @@ fn take_payload_by_composite_key_matches_exact_cgroup() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     push_fake_payload_entry(
@@ -5430,7 +5408,6 @@ fn take_payload_by_bare_name_reports_ambiguous_cgroups() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     push_fake_payload_entry(
@@ -5478,7 +5455,6 @@ fn take_payload_by_bare_name_succeeds_on_single_copy() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     push_fake_payload_entry(
@@ -5518,7 +5494,6 @@ fn apply_ops_bare_wait_and_kill_ambiguity_hint_names_full_constructor() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup!(mock, topo, ctx);
 

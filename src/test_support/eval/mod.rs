@@ -33,17 +33,11 @@ use super::sidecar::{write_sidecar, write_skip_sidecar};
 use super::topo::TopoOverride;
 use super::{KtstrTestEntry, SchedulerSpec, Topology};
 mod kernel;
-#[cfg(feature = "llm")]
-mod llm_extract;
 mod post_vm;
-#[cfg(feature = "llm")]
-pub(crate) use llm_extract::host_side_llm_extract;
 pub use post_vm::post_vm_skip;
 pub(crate) use post_vm::{
-    ExpectAutoReproSatisfied, HostSkipRequest, LLM_MODEL_LOAD_FAILED_PREFIX,
-    PostVmAssertionFailure, SchedulerBuildRefused, ScxBpfErrorMatcherMismatch,
-    SurvivesStormViolated, record_skip_sidecar, run_post_vm_callbacks,
-    should_skip_on_llm_model_load_failure,
+    ExpectAutoReproSatisfied, HostSkipRequest, PostVmAssertionFailure, SchedulerBuildRefused,
+    ScxBpfErrorMatcherMismatch, SurvivesStormViolated, record_skip_sidecar, run_post_vm_callbacks,
 };
 mod reporting;
 mod scheduler;
@@ -89,22 +83,6 @@ pub(crate) const ERR_NO_TEST_FUNCTION_OUTPUT: &str =
 /// `eval_crash_in_output_says_guest_crashed`, `eval_crash_eevdf_says_guest_crashed`,
 /// and `eval_crash_message_from_field`.
 pub(crate) const ERR_GUEST_CRASHED_PREFIX: &str = "guest crashed:";
-
-// ---------------------------------------------------------------------------
-// Host-side OutputFormat::LlmExtract resolution
-// ---------------------------------------------------------------------------
-//
-// The guest's `payload_run::evaluate_llm_extract_deferred` ships
-// raw stdout/stderr across the SHM ring under
-// `MSG_TYPE_RAW_PAYLOAD_OUTPUT` and emits an empty-metrics
-// `PayloadMetrics` placeholder under `MSG_TYPE_PAYLOAD_METRICS` for
-// every `OutputFormat::LlmExtract` invocation. The guest does NOT
-// load the local model into VM RAM (the model is ~2.55 GiB; the test
-// VM's RAM budget cannot accommodate it). The host runs
-// `extract_via_llm` here, after VM exit, on the captured text — same
-// stdout-primary / stderr-fallback contract that previously lived in
-// the prior in-VM extraction path — and replaces the empty `metrics` vec on
-// the paired `PayloadMetrics` with the extracted result.
 
 // ---------------------------------------------------------------------------
 // Host-state save/restore guards for the VM-run path
@@ -596,9 +574,10 @@ fn run_ktstr_test_inner_impl(
     // kernel lives in one). Prevents a concurrent
     // `cargo ktstr kernel build` from swapping the entry under
     // the VM mid-run. Dropped explicitly after VM exit (before
-    // LLM inference) so concurrent kernel rebuilds aren't
-    // blocked during the multi-second extraction phase. `None`
-    // on non-cache kernels — those don't need coordination.
+    // the post-VM-exit eval work: sidecar write, auto-repro, and
+    // post_vm callbacks) so concurrent kernel rebuilds aren't
+    // blocked while that runs. `None` on non-cache kernels —
+    // those don't need coordination.
     let kernel_lock = acquire_test_kernel_lock_if_cached(&kernel)?;
     // Capture the scheduler's ResolveSource (the discovery path) so the
     // sidecar records where this run's binary came from — write_sidecar
@@ -1252,47 +1231,15 @@ fn run_ktstr_test_inner_impl(
     }
 
     // Release VM resources (CPU/LLC flocks, guest memory) before
-    // the multi-second LLM inference so concurrent peers can
-    // acquire the same LLC slots during extraction.
+    // the post-VM-exit eval work (sidecar write, auto-repro,
+    // post_vm callbacks) so concurrent peers can acquire the same
+    // LLC slots while that runs.
     let post_vm_t = std::time::Instant::now();
     drop(vm);
     // Release the kernel-cache reader flock — the VM no longer
     // maps the kernel image, so concurrent `cargo ktstr kernel
     // build` can proceed.
     drop(kernel_lock);
-
-    // Broaden the calling thread's CPU mask before
-    // `host_side_llm_extract` runs. After `vm.run()` the
-    // BSP / vCPU 0 thread carries either:
-    //   - a single-CPU pin (perf-mode path: the vmm `vm.run`
-    //     entry calls `pin_current_thread` to nail the BSP to one
-    //     CPU for ipi-latency stability) — LLM inference on 1 CPU
-    //     is dramatically slow (10x+ in throughput) and gives the
-    //     other free host CPUs no work, OR
-    //   - a multi-CPU LLC-aware mask (no-perf-mode path: the vmm
-    //     applies `set_thread_cpumask` against the
-    //     `no_perf_plan.cpus` set so the BSP can roam within an
-    //     LLC) — already pool-style, but narrower than the
-    //     host-allowed cpuset.
-    // Inference is a host-side post-VM-exit phase that doesn't
-    // share the VM's measurement contract; it should use whatever
-    // CPUs the host process is permitted on (cgroup cpuset / sudo
-    // -u limits / CI runner allocation), which is exactly what
-    // `host_allowed_cpus()` returns via `sched_getaffinity(0)`.
-    // Use no-perf-mode cpuset for inference: `set_thread_cpumask`
-    // against the broader host-allowed pool is the no-perf-mode
-    // primitive applied to a wider set than any single LLC-plan
-    // would carve out.
-    //
-    // Empty `host_allowed_cpus()` (sched_getaffinity unavailable,
-    // procfs fallback failed) skips the call rather than masking
-    // to zero CPUs (which would block forever); inference inherits
-    // whatever the test left behind. Logged as a warning by
-    // `set_thread_cpumask` itself if the syscall fails.
-    let host_cpus = crate::vmm::host_topology::host_allowed_cpus();
-    if !host_cpus.is_empty() {
-        crate::vmm::set_thread_cpumask(&host_cpus, "test");
-    }
 
     // Log verifier stats count for visibility.
     if !result.verifier_stats.is_empty() {
@@ -1313,32 +1260,20 @@ fn run_ktstr_test_inner_impl(
     }
 
     // Extract profraw from SHM ring buffer and collect stimulus
-    // events + per-payload metrics + raw outputs from
-    // `OutputFormat::LlmExtract` payloads.
+    // events + per-payload metrics.
     //
-    // Pairing contract: every guest-side payload-pipeline emit
-    // (one per `.run()` / `.wait()` / `.kill()` / `.try_wait()`
-    // terminal call) allocates one `payload_index` from
-    // `payload_run`'s per-process counter and stamps it onto the
-    // emitted `PayloadMetrics`. LlmExtract invocations additionally
-    // emit a `RawPayloadOutput` carrying the SAME index. Non-
-    // LlmExtract payloads emit only the `PayloadMetrics`. The host
-    // pairs an LlmExtract `RawPayloadOutput` to its empty-metrics
-    // companion by EQUAL `payload_index`, not by emission order —
-    // see `host_side_llm_extract` for the pairing implementation.
     // Complete per-phase stimulus timeline (step-start frames + the
     // scenario-end terminal boundary) via the single shared accessor —
     // the SAME timeline a post_vm callback gets, so the production eval
     // and any out-of-tree re-derivation can never disagree on the last
     // step's iteration_rate boundary. The bulk loop below per-entry
-    // handles PayloadMetrics + RawPayloadOutput (and streams Stderr);
+    // handles PayloadMetrics (and streams Stderr);
     // Profraw and WprofTrace/WprofTraceChunk are no-ops there (Profraw is
     // persisted centrally in `crate::vmm::KtstrVm::run`; the wprof `.pb` is
     // written by the #[cfg(feature="wprof")] pre-pass above). Stimulus +
     // ScenarioEnd are consumed by stimulus_timeline().
     let stimulus_events = result.stimulus_timeline();
     let mut payload_metrics: Vec<crate::test_support::PayloadMetrics> = Vec::new();
-    let mut raw_outputs: Vec<crate::test_support::RawPayloadOutput> = Vec::new();
     if let Some(ref bulk) = result.guest_messages {
         // Per-frame typed dispatch on the bucketed bulk drain.
         // Mirrors the freeze coord's TOKEN_TX exhaustive match —
@@ -1359,18 +1294,6 @@ fn run_ktstr_test_inner_impl(
                             Err(e) => {
                                 eprintln!("ktstr_test: decode payload metrics from bulk port: {e}")
                             }
-                        }
-                    }
-                }
-                Some(crate::vmm::wire::MsgType::RawPayloadOutput) => {
-                    if bulk_entry.crc_ok {
-                        match postcard::from_bytes::<crate::test_support::RawPayloadOutput>(
-                            &bulk_entry.payload,
-                        ) {
-                            Ok(raw) => raw_outputs.push(raw),
-                            Err(e) => eprintln!(
-                                "ktstr_test: decode raw payload output from bulk port: {e}"
-                            ),
                         }
                     }
                 }
@@ -1453,25 +1376,6 @@ fn run_ktstr_test_inner_impl(
         }
     }
 
-    // Host-side `OutputFormat::LlmExtract` resolution. For every
-    // RawPayloadOutput drained from the bulk port, look up its
-    // `payload_index` in the PayloadMetrics slice, run the
-    // LLM-backed extraction on the host, and replace the empty
-    // `metrics` vec on the matched slot with the extracted result.
-    // The model lives at the host's cache and the guest VM never
-    // had it, so this is the only correct place for the call.
-    //
-    // Pairing is by explicit `payload_index` equality, not emission
-    // order — emission order would conflate a `Json` payload that
-    // produced zero numeric leaves with an LlmExtract placeholder.
-    // Returns a flat `Vec<AssertDetail>` of host-side failures
-    // (model unavailable, universal invariant violation, orphan
-    // raw outputs) for the test verdict to fold in.
-    #[cfg(feature = "llm")]
-    let host_extract_failures = host_side_llm_extract(&mut payload_metrics, &raw_outputs);
-    #[cfg(not(feature = "llm"))]
-    let host_extract_failures: Vec<crate::assert::AssertDetail> = Vec::new();
-
     // Gate-skip on a post_vm `HostSkipRequest`: a host-side callback
     // determined the run is inconclusive (the VM could not produce the
     // artifact the assertion needs — e.g. a load-starved VM whose BPF
@@ -1487,30 +1391,6 @@ fn run_ktstr_test_inner_impl(
         crate::report::test_skip(format_args!("{}: {}", entry.name, reason));
         record_skip_sidecar(entry, topo);
         return Ok(AssertResult::skip(reason));
-    }
-
-    // Gate-skip on an unloadable host LLM model. The model lives
-    // host-side (it is too large to ship into the guest) and is a hard
-    // prerequisite for any LlmExtract payload: when it cannot load
-    // (cold-cache offline, or a cached GGUF incompatible with the linked
-    // llama.cpp), the extraction never runs and the test's metrics are
-    // unfulfillable. The prior code folded this into the verdict as a
-    // failure, failing the whole test on a missing prereq; convert that
-    // same whole-test path to a SKIP so the suite passes where a
-    // compatible model is present and skips where it is not. Re-fetching
-    // cannot help — the incompatibility is with the linked llama.cpp, not
-    // a stale download.
-    // The skip-vs-fail decision — including the rule that a host-side
-    // post_vm failure DOMINATES (no skip), so a real regression is never
-    // masked by a missing model — is should_skip_on_llm_model_load_failure
-    // (truth-tabled). A post_vm Err is folded into the verdict below and
-    // carries the PostVmAssertionFailure marker downstream.
-    if let Some(skip_reason) =
-        should_skip_on_llm_model_load_failure(&host_extract_failures, post_vm_err.is_some())
-    {
-        crate::report::test_skip(format_args!("{}: {}", entry.name, skip_reason));
-        record_skip_sidecar(entry, topo);
-        return Ok(AssertResult::skip(skip_reason));
     }
 
     // auto_repro is enabled when:
@@ -1584,7 +1464,6 @@ fn run_ktstr_test_inner_impl(
         &merged_assert,
         &stimulus_events,
         &payload_metrics,
-        &host_extract_failures,
         &vm_topology,
         &repro_fn,
         post_vm_err.as_ref(),
@@ -1832,38 +1711,23 @@ fn precompute_failure_sections(
     )
 }
 
-/// Fold the verdict inputs (host-extract failures, the `post_vm` callback's
-/// Err, the cleanup-budget overrun, and the reproducer-mode `scx_bpf_error`
+/// Fold the verdict inputs (the `post_vm` callback's Err, the
+/// cleanup-budget overrun, and the reproducer-mode `scx_bpf_error`
 /// matcher) into `check_result`. Returns whether the matcher contributed a
 /// mismatch detail (`matcher_mismatch`) so the caller wraps the failure Err
 /// with [`ScxBpfErrorMatcherMismatch`].
-#[allow(clippy::too_many_arguments)]
 fn evaluate_verdict_folds(
     check_result: &mut AssertResult,
     entry: &KtstrTestEntry,
     result: &vmm::VmResult,
     merged_assert: &crate::assert::Assert,
-    host_extract_failures: &[crate::assert::AssertDetail],
     post_vm_err: Option<&anyhow::Error>,
     sched_log_input: &str,
     dump_section: &str,
 ) -> bool {
-    // Fold host-side LlmExtract failures into the guest's
-    // AssertResult before the sidecar write so per-run stats
-    // tooling sees the host-extracted verdict, not the guest's
-    // placeholder pass(). Each host-side failure is appended as
-    // an `AssertDetail` exactly as if it had been raised inside
-    // the guest's `evaluate_checks` — same kind, same prose
-    // shape — so failure-rendering downstream is uniform across
-    // sources.
-    for detail in host_extract_failures {
-        check_result.merge(AssertResult::fail(detail.clone()));
-    }
-
     // Fold the host-side `post_vm` callback's Err into the
-    // verdict so it flows through the same failure path as
-    // host-extract failures and the guest-stamped check
-    // result. The downstream failure formatter renders the
+    // verdict so it flows through the same failure path as the
+    // guest-stamped check result. The downstream failure formatter renders the
     // `--- scheduler log ---` / `--- sched_ext dump ---` /
     // `--- monitor ---` sections + dispatches `repro_fn`
     // (auto-repro) from this single point — no parallel
@@ -2532,13 +2396,6 @@ fn eval_monitor_thresholds(
 /// is the per-invocation accumulator drained from the guest SHM ring;
 /// the sidecar writer receives it verbatim so stats tooling sees one
 /// entry per `ctx.payload(X).run()` / `.spawn().wait()`.
-///
-/// `host_extract_failures` carries the universal-invariant +
-/// model-load failures produced by [`host_side_llm_extract`] when
-/// the run's `OutputFormat::LlmExtract` payloads were resolved on
-/// the host. The folded details are appended to the test's
-/// AssertResult so a host-side LlmExtract failure surfaces in the
-/// same failure-rendering pipeline as a guest-emitted check failure.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_vm_result(
     entry: &KtstrTestEntry,
@@ -2546,7 +2403,6 @@ fn evaluate_vm_result(
     merged_assert: &crate::assert::Assert,
     stimulus_events: &[StimulusEvent],
     payload_metrics: &[crate::test_support::PayloadMetrics],
-    host_extract_failures: &[crate::assert::AssertDetail],
     topo: &Topology,
     repro_fn: &dyn Fn(&str) -> Option<String>,
     // Optional Err captured from `KtstrTestEntry::post_vm` so the
@@ -2644,7 +2500,6 @@ fn evaluate_vm_result(
             entry,
             result,
             merged_assert,
-            host_extract_failures,
             post_vm_err,
             sched_log_input,
             &dump_section,
@@ -2761,7 +2616,5 @@ mod eval_tests;
 mod eval_tests_eval;
 #[cfg(test)]
 mod eval_tests_inner;
-#[cfg(test)]
-mod eval_tests_llm;
 #[cfg(test)]
 mod eval_tests_reporting;

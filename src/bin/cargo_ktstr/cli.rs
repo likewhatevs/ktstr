@@ -1,7 +1,7 @@
 //! CLI argument types for the `cargo ktstr` binary.
 //!
 //! Houses the clap-derived `Cargo` / `CargoSub` / `Ktstr` /
-//! `KtstrCommand` / `ModelCommand` / `StatsCommand` enums and structs
+//! `KtstrCommand` / `StatsCommand` enums and structs
 //! the binary entry point parses against. Pulled out of
 //! [`super`] so the parent file stays focused on dispatch and
 //! sub-helpers — the clap derive expansion is bulky enough to
@@ -363,21 +363,6 @@ pub(crate) enum KtstrCommand {
         #[command(subcommand)]
         command: KernelCommand,
     },
-    /// Manage the LLM model cache used by `OutputFormat::LlmExtract`
-    /// payloads. `fetch` downloads the default pinned model to
-    /// `~/.cache/ktstr/models/` (respecting `KTSTR_CACHE_DIR` /
-    /// `XDG_CACHE_HOME`); `status` reports whether a SHA-checked copy
-    /// is already cached; `clean` deletes the cached artifact and
-    /// its `.mtime-size` warm-cache sidecar.
-    ///
-    /// Only available when ktstr is built with the `llm` feature
-    /// (on by default; absent under `--no-default-features` builds
-    /// that omit `--features llm`).
-    #[cfg(feature = "llm")]
-    Model {
-        #[command(subcommand)]
-        command: ModelCommand,
-    },
     /// Collect BPF verifier statistics for declared schedulers.
     ///
     /// Spawns `cargo nextest run -E 'test(/^verifier/)'` (waited on
@@ -707,23 +692,6 @@ pub(crate) enum KtstrCommand {
         #[arg(long, help = ktstr::cli::DISK_HELP)]
         disk: Option<String>,
     },
-}
-
-#[cfg(feature = "llm")]
-#[derive(Subcommand)]
-pub(crate) enum ModelCommand {
-    /// Download the default pinned model and check its SHA-256.
-    /// No-op when the cache already holds a SHA-checked copy.
-    /// Respects `KTSTR_MODEL_OFFLINE` — set to `1` to refuse network
-    /// fetches.
-    Fetch,
-    /// Print the cache path for the default model and whether a
-    /// SHA-checked copy is already present.
-    Status,
-    /// Delete the cached GGUF artifact and its `.mtime-size`
-    /// warm-cache sidecar. Subsequent `model fetch` re-downloads
-    /// the pin from scratch. No-op when nothing is cached.
-    Clean,
 }
 
 // `clippy::large_enum_variant` triggers because clap's argument

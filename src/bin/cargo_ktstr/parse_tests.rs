@@ -42,7 +42,7 @@ use ktstr::cache::{CacheArtifacts, CacheDir, CacheEntry, KernelMetadata};
 use ktstr::cli;
 use ktstr::cli::KernelCommand;
 
-use crate::cli::{Cargo, CargoSub, KtstrCommand, ModelCommand, StatsCommand};
+use crate::cli::{Cargo, CargoSub, KtstrCommand, StatsCommand};
 
 // -- DRY helpers for the parse-only test surface --
 //
@@ -3154,72 +3154,6 @@ fn kernel_list_long_about_exposes_range_mode_json_keys() {
          scripted consumers know to dispatch on the presence of the \
          `range` key: got: {about:?}",
     );
-}
-
-// -- try_get_matches_from: model subcommand --
-//
-// `cargo ktstr model <fetch|status|clean>` pins each
-// `ModelCommand` variant — a regression that renamed a subcommand
-// or restructured the enum surfaces here at parse time.
-
-/// `cargo ktstr model fetch` resolves to `ModelCommand::Fetch`.
-#[test]
-fn parse_model_fetch() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from(["cargo", "ktstr", "model", "fetch"])
-        .unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Model { command } = k.command else {
-        panic!("expected Model");
-    };
-    assert!(matches!(command, ModelCommand::Fetch));
-}
-
-/// `cargo ktstr model status` resolves to `ModelCommand::Status`.
-#[test]
-fn parse_model_status() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from(["cargo", "ktstr", "model", "status"])
-        .unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Model { command } = k.command else {
-        panic!("expected Model");
-    };
-    assert!(matches!(command, ModelCommand::Status));
-}
-
-/// `cargo ktstr model clean` resolves to `ModelCommand::Clean`.
-#[test]
-fn parse_model_clean() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from(["cargo", "ktstr", "model", "clean"])
-        .unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Model { command } = k.command else {
-        panic!("expected Model");
-    };
-    assert!(matches!(command, ModelCommand::Clean));
-}
-
-/// `cargo ktstr model` without a subcommand must fail at parse
-/// time — the enum carries no Option<ModelCommand>, so clap
-/// requires one of the three.
-#[test]
-fn parse_model_missing_subcommand_rejected() {
-    let rejected = Cargo::try_parse_from(["cargo", "ktstr", "model"]);
-    assert!(
-        rejected.is_err(),
-        "model must require a subcommand (fetch/status/clean)",
-    );
-}
-
-/// `cargo ktstr model unknown` rejects unknown subcommand names —
-/// pins the closed enum shape so a typo doesn't fall through to
-/// a different code path.
-#[test]
-fn parse_model_unknown_subcommand_rejected() {
-    let rejected = Cargo::try_parse_from(["cargo", "ktstr", "model", "wat"]);
-    assert!(rejected.is_err(), "model must reject unknown subcommands",);
 }
 
 // -- try_get_matches_from: funify subcommand --

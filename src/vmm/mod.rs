@@ -100,7 +100,7 @@ pub(crate) mod virtio_net;
 // streaming assembler (`bulk`), the guest-side typed senders
 // (`guest_comms`), and the host-side typed consumers (`host_comms`)
 // each carry a single responsibility. Production data (STIMULUS /
-// EXIT / SCHED_EXIT / PAYLOAD_METRICS / RAW_PAYLOAD_OUTPUT /
+// EXIT / SCHED_EXIT / PAYLOAD_METRICS /
 // SCENARIO_*) flows through the virtio-console port-1 TLV stream,
 // and crash diagnostics travel via COM2.
 pub(crate) mod bulk;

@@ -89,9 +89,8 @@ data channel. Carries scenario markers (`MSG_TYPE_SCENARIO_START`,
 `MSG_TYPE_SCENARIO_END`), test results (`MSG_TYPE_TEST_RESULT`),
 exit codes (`MSG_TYPE_EXIT`), stimulus events (`MSG_TYPE_STIMULUS`),
 scheduler exit notifications (`MSG_TYPE_SCHED_EXIT`), profraw
-coverage data (`MSG_TYPE_PROFRAW`), per-payload-invocation metrics
-(`MSG_TYPE_PAYLOAD_METRICS`), and raw LlmExtract output
-(`MSG_TYPE_RAW_PAYLOAD_OUTPUT`). Each TLV frame has a CRC32 for
+coverage data (`MSG_TYPE_PROFRAW`), and per-payload-invocation
+metrics (`MSG_TYPE_PAYLOAD_METRICS`). Each TLV frame has a CRC32 for
 integrity checking.
 
 ## Virtio devices
@@ -125,7 +124,7 @@ functions use MSI-X when the guest negotiates it, falling back to INTx
   Port 0 carries the interactive `/dev/hvc0` console alongside the
   COM1/COM2 16550 serial ports; port 1 carries the guest-to-host TLV
   stream that delivers exit code, test result, per-payload metrics,
-  raw payload outputs, profraw, and scheduler exit notifications;
+  profraw, and scheduler exit notifications;
   port 2 is a transparent byte-pipe relay carrying scx_stats request
   bytes from the host to the in-guest relay thread and the
   scheduler's responses back. Advertises

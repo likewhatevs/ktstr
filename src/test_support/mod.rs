@@ -20,7 +20,7 @@
 //!
 //! # Module layout
 //!
-//! Implementation is split across 20 production submodules
+//! Implementation is split across 19 production submodules
 //! re-exported at `test_support::*` for a flat public API: `args`
 //! (CLI argument extraction), `dispatch` (ktstr / cargo-ktstr CLI
 //! entry points), `entry` (scheduler + test-entry types),
@@ -28,7 +28,7 @@
 //! out of `entry.rs`), `eval`
 //! (host-side VM result evaluation), `host_class` (shared
 //! host-insufficiency error classification), `metrics` (payload stdout →
-//! `Metric` list), `model` (LLM backend + model cache), `output`
+//! `Metric` list), `output`
 //! (guest-output and console parsing), `payload` (`Payload` /
 //! `MetricCheck` / `Metric` / `Polarity`), `probe` (auto-repro and
 //! BPF probe pipeline), `probe_metrics` (host-side BPF map
@@ -64,8 +64,6 @@ mod entry_validate;
 mod eval;
 mod host_class;
 mod metrics;
-#[cfg(feature = "llm")]
-mod model;
 mod output;
 // Reachable crate-wide (vmm::VmResult::guest_assert_result parses the guest
 // AssertResult from its own drained guest_messages via this helper, mirroring
@@ -151,17 +149,11 @@ pub use metrics::{
     MAX_WALK_DEPTH, WALK_TRUNCATION_SENTINEL_NAME, extract_metrics, is_truncation_sentinel_name,
     walk_json_leaves,
 };
-#[cfg(feature = "llm")]
-pub use model::{
-    CleanReport, DEFAULT_MODEL, LLM_DEBUG_RESPONSES_ENV, ModelSpec, ModelStatus, OFFLINE_ENV,
-    ShaVerdict, clean, ensure, status,
-};
 pub(crate) use output::extract_panic_message;
 pub use payload::{
-    Metric, MetricBounds, MetricCheck, MetricHint, MetricSource, MetricStream, OutputFormat,
-    Payload, PayloadKind, PayloadMetrics, Polarity,
+    Metric, MetricCheck, MetricHint, MetricStream, OutputFormat, Payload, PayloadKind,
+    PayloadMetrics, Polarity,
 };
-pub(crate) use payload::{RawPayloadOutput, WireMetricHint};
 pub(crate) use probe::maybe_dispatch_vm_test;
 pub(crate) use probe::{
     PROBE_DRAIN_GRACE, finalize_probe_after_unwind, maybe_dispatch_vm_test_with_args,

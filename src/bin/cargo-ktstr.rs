@@ -8,7 +8,7 @@
 //! `src/bin/cargo_ktstr/`:
 //!
 //! - `cli`    — clap-derived `Cargo` / `CargoSub` / `Ktstr` /
-//!   `KtstrCommand` / `ModelCommand` / `StatsCommand`
+//!   `KtstrCommand` / `StatsCommand`
 //!   types that drive argument parsing and shell
 //!   completion generation.
 //! - `kernel` — `--kernel <SPEC>` resolution shared by the `shell`,
@@ -32,8 +32,7 @@
 //!   binary under the BPF-stats verifier and renders
 //!   per-program verified-instruction counts.
 //! - `misc`   — smaller subcommand dispatchers, one submodule per
-//!   CLI verb: `shell`, `completions`, `funify`,
-//!   `model {fetch,status,clean}`, `export`.
+//!   CLI verb: `shell`, `completions`, `funify`, `export`.
 //! - `parse_tests` (test-only) — clap parse-shape coverage: every
 //!   `KtstrCommand` variant gets at least one test that
 //!   pins flag wiring + conflict/requires constraints.
@@ -76,8 +75,6 @@ mod parse_tests;
 use clap::Parser;
 use ktstr::cli::KernelCommand;
 
-#[cfg(feature = "llm")]
-use crate::cli::ModelCommand;
 use crate::cli::{Cargo, CargoSub, KtstrCommand};
 
 fn main() {
@@ -110,7 +107,7 @@ fn main() {
     // Mirror `ktstr`'s tracing init (src/bin/ktstr.rs main()) so
     // `tracing::warn!` calls inside `cli::` / `test_support::` surface
     // on stderr instead of being silently dropped. Default to `warn`
-    // so normal CLI invocations (kernel build, model fetch, etc.) stay
+    // so normal CLI invocations (kernel build, shell, etc.) stay
     // quiet; users who want finer detail set `RUST_LOG=info,debug,...`.
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -260,8 +257,6 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
         | KtstrCommand::Export { .. }
         | KtstrCommand::Locks { .. }
         | KtstrCommand::Shell { .. }) => dispatch_admin_command(cmd),
-        #[cfg(feature = "llm")]
-        cmd @ KtstrCommand::Model { .. } => dispatch_admin_command(cmd),
     }
 }
 
@@ -303,12 +298,6 @@ fn dispatch_admin_command(command: KtstrCommand) -> Result<(), String> {
                 force,
                 corrupt_only,
             } => ktstr::cli::kernel_clean(keep, force, corrupt_only).map_err(|e| format!("{e:#}")),
-        },
-        #[cfg(feature = "llm")]
-        KtstrCommand::Model { command } => match command {
-            ModelCommand::Fetch => misc::run_model_fetch(),
-            ModelCommand::Status => misc::run_model_status(),
-            ModelCommand::Clean => misc::run_model_clean(),
         },
         KtstrCommand::Verifier { kernel, raw } => verifier::run_verifier(kernel, raw),
         KtstrCommand::Funify {

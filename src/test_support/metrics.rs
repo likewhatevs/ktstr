@@ -14,19 +14,8 @@
 //! [`OutputFormat::ExitCode`] returns an empty metric set; exit-code
 //! pass/fail is handled by the `MetricCheck::ExitCodeEq` pre-pass
 //! elsewhere.
-//!
-//! [`OutputFormat::LlmExtract`] is HOST-ONLY. The guest-side
-//! `extract_metrics` short-circuits the LlmExtract arm to an empty
-//! metric set so the guest never loads the ~2.55 GiB local model into
-//! its constrained VM RAM. The captured raw stdout/stderr are shipped
-//! over the SHM ring as a `MSG_TYPE_RAW_PAYLOAD_OUTPUT` entry; the
-//! host's `crate::test_support::eval` post-VM-exit pipeline calls
-//! [`crate::test_support::model::extract_via_llm`] on the captured
-//! text and threads the resulting metrics back into the
-//! [`PayloadMetrics`](crate::test_support::PayloadMetrics) slot the
-//! guest emitted alongside.
 
-use crate::test_support::{Metric, MetricSource, MetricStream, OutputFormat, Polarity};
+use crate::test_support::{Metric, MetricStream, OutputFormat, Polarity};
 
 /// Extract metrics from a payload's captured output per its declared
 /// [`OutputFormat`].
@@ -44,16 +33,6 @@ use crate::test_support::{Metric, MetricSource, MetricStream, OutputFormat, Pola
 /// [`MetricCheck`](crate::test_support::MetricCheck) evaluation reports each
 /// referenced metric as missing rather than failing the whole run.
 ///
-/// [`OutputFormat::LlmExtract`] returns an empty `Vec` from this
-/// function regardless of `output`. The LLM-backed extraction does
-/// NOT run here: the guest does not load the ~2.55 GiB model, and the
-/// host runs `extract_via_llm` post-VM-exit on the raw output that
-/// the guest shipped over the SHM ring. Callers that need
-/// LlmExtract metrics must consume the host-extracted result through
-/// the `crate::test_support::eval` pipeline. The `hint` carried on the
-/// `LlmExtract(Option<&'static str>)` payload is preserved on the
-/// raw-output SHM message for the host extractor to consume.
-///
 /// # Known truncation point: depth cap
 ///
 /// The `Json` arm routes through [`walk_json_leaves`], which enforces
@@ -68,9 +47,7 @@ use crate::test_support::{Metric, MetricSource, MetricStream, OutputFormat, Pola
 /// for a metric with that name. Practical upper bound: 64 is well
 /// below serde_json's default parse recursion limit (128) and
 /// covers every realistic payload schema observed in the crate
-/// (fio maxes out around depth 8, schbench around depth 3). The same
-/// cap applies to the host-side LlmExtract pipeline that runs the
-/// model response through this module's walker.
+/// (fio maxes out around depth 8, schbench around depth 3).
 pub fn extract_metrics(
     output: &str,
     format: &OutputFormat,
@@ -79,20 +56,8 @@ pub fn extract_metrics(
     match format {
         OutputFormat::ExitCode => Ok(Vec::new()),
         OutputFormat::Json => Ok(find_and_parse_json(output)
-            .map(|v| walk_json_leaves(&v, MetricSource::Json, stream))
+            .map(|v| walk_json_leaves(&v, stream))
             .unwrap_or_default()),
-        // LlmExtract is host-only — the guest captures raw text and
-        // ships it across the SHM ring; the host runs
-        // `extract_via_llm` post-VM-exit. Returning an empty vec here
-        // is the no-op the guest's `evaluate()` short-circuits past
-        // when emitting `MSG_TYPE_RAW_PAYLOAD_OUTPUT`, and is also
-        // the correct value for any non-payload-pipeline caller that
-        // happens to invoke `extract_metrics` against an LlmExtract
-        // format on the host (e.g. unit tests for the dispatcher
-        // shape) — those callers should reach for
-        // `crate::test_support::model::extract_via_llm` directly when
-        // they want the LLM-backed extraction.
-        OutputFormat::LlmExtract(_) => Ok(Vec::new()),
     }
 }
 
@@ -118,9 +83,7 @@ pub fn extract_metrics(
 /// not merge or concatenate subsequent balanced regions. Payloads
 /// that emit multiple JSON documents per run therefore lose all
 /// but the first; authors needing full capture should switch the
-/// payload to a wrapper that emits a single aggregate document
-/// (or use `OutputFormat::LlmExtract` to consolidate prose +
-/// multiple JSONs through the model pipeline).
+/// payload to a wrapper that emits a single aggregate document.
 pub(crate) fn find_and_parse_json(output: &str) -> Option<serde_json::Value> {
     // Fast path: whole input is a single JSON document.
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(output.trim()) {
@@ -223,17 +186,13 @@ fn extract_json_region(s: &str) -> Option<&str> {
 ///   [`is_truncation_sentinel_name`] (the predicate, not the
 ///   literal string) so a sentinel-name rewording lands in one
 ///   place.
-pub fn walk_json_leaves(
-    value: &serde_json::Value,
-    source: MetricSource,
-    stream: MetricStream,
-) -> Vec<Metric> {
+pub fn walk_json_leaves(value: &serde_json::Value, stream: MetricStream) -> Vec<Metric> {
     let mut out = Vec::new();
     // Single reusable path buffer: children push their segment,
     // recurse, then truncate back. O(total_path_chars) work across
     // the whole walk instead of O(depth × path_chars) per leaf.
     let mut path = String::new();
-    walk(value, &mut path, 0, source, stream, &mut out);
+    walk(value, &mut path, 0, stream, &mut out);
     out
 }
 
@@ -304,7 +263,6 @@ fn walk(
     value: &serde_json::Value,
     path: &mut String,
     depth: usize,
-    source: MetricSource,
     stream: MetricStream,
     out: &mut Vec<Metric>,
 ) {
@@ -326,7 +284,6 @@ fn walk(
             value: depth as f64,
             polarity: Polarity::Unknown,
             unit: String::new(),
-            source,
             stream,
         });
         return;
@@ -339,7 +296,7 @@ fn walk(
                     path.push('.');
                 }
                 path.push_str(k);
-                walk(v, path, depth + 1, source, stream, out);
+                walk(v, path, depth + 1, stream, out);
                 path.truncate(saved_len);
             }
         }
@@ -354,7 +311,7 @@ fn walk(
                 // fmt::Write impl (infallible for String).
                 use std::fmt::Write;
                 let _ = write!(path, "{i}");
-                walk(v, path, depth + 1, source, stream, out);
+                walk(v, path, depth + 1, stream, out);
                 path.truncate(saved_len);
             }
         }
@@ -371,7 +328,6 @@ fn walk(
                     value: f,
                     polarity: Polarity::Unknown,
                     unit: String::new(),
-                    source,
                     stream,
                 });
             }
@@ -415,7 +371,6 @@ mod tests {
         assert!(names.contains(&"iops"));
         assert!(names.contains(&"lat_ns"));
         for metric in &m {
-            assert_eq!(metric.source, MetricSource::Json);
             assert_eq!(metric.polarity, Polarity::Unknown);
             assert_eq!(metric.unit, "");
         }
@@ -488,51 +443,6 @@ mod tests {
         let s = "[1, 2, 3]";
         let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert_eq!(m.len(), 3);
-    }
-
-    /// `extract_metrics` short-circuits the `OutputFormat::LlmExtract`
-    /// arm to `Ok(Vec::new())` regardless of input. The LLM-backed
-    /// extraction has moved host-side: the guest-facing `evaluate()`
-    /// path does NOT load the ~2.55 GiB model into VM RAM. Pinning this
-    /// invariant here ensures a future refactor cannot reintroduce
-    /// the in-VM model load by silently re-routing the LlmExtract arm
-    /// back through `super::model::extract_via_llm`.
-    ///
-    /// Both the `None` (no-hint) and `Some(hint)` payload shapes are
-    /// covered together — neither must trigger any model-side code
-    /// path. If a future change splits the dispatch by hint presence,
-    /// the assertion would surface the regression before it hit a
-    /// guest VM.
-    #[test]
-    fn llm_extract_returns_empty_unconditionally() {
-        // No env-var locking, no model::reset() — this test covers a
-        // pure constant-return contract; if the assertion ever
-        // requires environment manipulation again, the LlmExtract
-        // arm has been re-wired back through `extract_via_llm` and
-        // the host-only invariant has been broken.
-        for (label, format) in [
-            ("no-hint", OutputFormat::LlmExtract(None)),
-            (
-                "with-hint",
-                OutputFormat::LlmExtract(Some("focus on latency")),
-            ),
-        ] {
-            for input in [
-                "",
-                "anything",
-                r#"{"latency_us": 42}"#,
-                "schbench-shaped percentile table\n50.0%: 100ns\n",
-            ] {
-                let m = extract_metrics(input, &format, MetricStream::Stdout)
-                    .unwrap_or_else(|e| panic!("{label}: extract_metrics returned Err: {e}"));
-                assert!(
-                    m.is_empty(),
-                    "{label}: LlmExtract arm must short-circuit to empty Vec; \
-                     got {} metric(s) for input {input:?}",
-                    m.len(),
-                );
-            }
-        }
     }
 
     #[test]
@@ -722,50 +632,30 @@ mod tests {
     #[test]
     fn walk_json_leaves_polarity_is_unknown_before_hint_resolution() {
         let v: serde_json::Value = serde_json::from_str(r#"{"a": 1}"#).unwrap();
-        let m = walk_json_leaves(&v, MetricSource::Json, MetricStream::Stdout);
+        let m = walk_json_leaves(&v, MetricStream::Stdout);
         assert_eq!(m[0].polarity, Polarity::Unknown);
     }
 
-    #[test]
-    fn walk_json_leaves_tags_source() {
-        let v: serde_json::Value = serde_json::from_str(r#"{"a": 1}"#).unwrap();
-        let json_tagged = walk_json_leaves(&v, MetricSource::Json, MetricStream::Stdout);
-        assert_eq!(json_tagged[0].source, MetricSource::Json);
-        let llm_tagged = walk_json_leaves(&v, MetricSource::LlmExtract, MetricStream::Stdout);
-        assert_eq!(llm_tagged[0].source, MetricSource::LlmExtract);
-    }
-
-    /// `stream` attribution is orthogonal to `source`: every cross
-    /// product of (`Json`/`LlmExtract`) × (`Stdout`/`Stderr`) must
-    /// round-trip through the walker, and the stream field on the
-    /// emitted `Metric` must match the argument. Pins the
-    /// orthogonality contract asserted in the [`MetricStream`]
-    /// docstring so a regression that silently coupled the two
-    /// axes (e.g. forced `LlmExtract` to always stamp `Stdout`)
-    /// fails here.
+    /// `stream` attribution must round-trip through the walker for
+    /// both `Stdout` and `Stderr`, and the stream field on the
+    /// emitted `Metric` must match the argument. Pins the stream
+    /// contract asserted in the [`MetricStream`] docstring.
     ///
     /// Exercises BOTH walker branches: the object-recurse branch
     /// (via `{"a": 1}`) AND the array-recurse branch (via
     /// `[{"a": 1}, {"b": 2}]`) — a regression that stamped the
     /// stream only on one branch's emitted metrics would pass the
     /// object fixture but fail the array leaves. The array
-    /// fixture also doubles coverage (two leaves per call) so the
-    /// cross-product's 4 stream×source combos each produce 2
-    /// assertions, catching any leaf-specific drift.
+    /// fixture also doubles coverage (two leaves per call).
     #[test]
-    fn walk_json_leaves_tags_stream_orthogonally_to_source() {
+    fn walk_json_leaves_tags_stream() {
         let obj: serde_json::Value = serde_json::from_str(r#"{"a": 1}"#).unwrap();
         let arr: serde_json::Value = serde_json::from_str(r#"[{"a": 1}, {"b": 2}]"#).unwrap();
         for (fixture_label, value, expected_len) in
             [("object", &obj, 1_usize), ("array", &arr, 2_usize)]
         {
-            for (src, stream) in [
-                (MetricSource::Json, MetricStream::Stdout),
-                (MetricSource::Json, MetricStream::Stderr),
-                (MetricSource::LlmExtract, MetricStream::Stdout),
-                (MetricSource::LlmExtract, MetricStream::Stderr),
-            ] {
-                let tagged = walk_json_leaves(value, src, stream);
+            for stream in [MetricStream::Stdout, MetricStream::Stderr] {
+                let tagged = walk_json_leaves(value, stream);
                 assert_eq!(
                     tagged.len(),
                     expected_len,
@@ -774,12 +664,6 @@ mod tests {
                     tagged.len(),
                 );
                 for (i, m) in tagged.iter().enumerate() {
-                    assert_eq!(
-                        m.source, src,
-                        "{fixture_label} leaf {i}: source tag must \
-                         match the argument ({src:?}); got {:?}",
-                        m.source,
-                    );
                     assert_eq!(
                         m.stream, stream,
                         "{fixture_label} leaf {i}: stream tag must \
@@ -1146,7 +1030,7 @@ mod tests {
             m.insert("x".to_string(), value);
             value = serde_json::Value::Object(m);
         }
-        let metrics = walk_json_leaves(&value, MetricSource::Json, MetricStream::Stdout);
+        let metrics = walk_json_leaves(&value, MetricStream::Stdout);
         let real_leaves: Vec<_> = metrics
             .iter()
             .filter(|m| m.name != WALK_TRUNCATION_SENTINEL_NAME)
@@ -1185,7 +1069,7 @@ mod tests {
             m.insert("x".to_string(), value);
             value = serde_json::Value::Object(m);
         }
-        let metrics = walk_json_leaves(&value, MetricSource::Json, MetricStream::Stdout);
+        let metrics = walk_json_leaves(&value, MetricStream::Stdout);
         assert_eq!(metrics.len(), 1, "boundary leaf must be preserved");
         assert_eq!(metrics[0].value, 42.0);
     }
@@ -1214,7 +1098,7 @@ mod tests {
                 "only_child": 5.0
             }
         });
-        let metrics = walk_json_leaves(&value, MetricSource::Json, MetricStream::Stdout);
+        let metrics = walk_json_leaves(&value, MetricStream::Stdout);
         let by_name: std::collections::BTreeMap<&str, f64> =
             metrics.iter().map(|m| (m.name.as_str(), m.value)).collect();
         assert_eq!(by_name.get("shallow"), Some(&1.0));
@@ -1241,7 +1125,7 @@ mod tests {
                 [[5.0, 6.0], [7.0, 8.0]]
             ]
         });
-        let metrics = walk_json_leaves(&value, MetricSource::Json, MetricStream::Stdout);
+        let metrics = walk_json_leaves(&value, MetricStream::Stdout);
         let names: Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
         // 8 leaves in lexicographic index order.
         assert_eq!(names.len(), 8);
@@ -1282,7 +1166,7 @@ mod tests {
             m.insert("a".to_string(), value);
             value = serde_json::Value::Object(m);
         }
-        let metrics = walk_json_leaves(&value, MetricSource::Json, MetricStream::Stdout);
+        let metrics = walk_json_leaves(&value, MetricStream::Stdout);
         assert!(
             metrics.is_empty(),
             "Null leaves must produce no metrics (and no truncation sentinel), \
@@ -1304,13 +1188,11 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
-            metric_bounds: None,
         };
         let stdout = r#"{"throughput": 42.5}"#;
         let m = extract_metrics(stdout, &EXAMPLE_PAYLOAD.output, MetricStream::Stdout).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "throughput");
         assert_eq!(m[0].value, 42.5);
-        assert_eq!(m[0].source, MetricSource::Json);
     }
 }

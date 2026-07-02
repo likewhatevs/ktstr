@@ -102,8 +102,8 @@ use crate::vmm::disk_config::Filesystem;
 
 /// Cache subdirectory suffix passed to
 /// [`crate::cache::resolve_cache_root_with_suffix`]. Distinct from
-/// `"kernels"` (kernel image cache) and `"models"` (LLM cache) so
-/// the three flavors share a parent root via `KTSTR_CACHE_DIR` /
+/// `"kernels"` (kernel image cache) and `"cast_analysis"` (cast-analysis
+/// cache) so the three flavors share a parent root via `KTSTR_CACHE_DIR` /
 /// `XDG_CACHE_HOME` without colliding on filesystem paths.
 const CACHE_SUFFIX: &str = "disk_templates";
 

@@ -71,7 +71,6 @@ static JEMALLOC_ALLOC_WORKER: Payload = Payload::new(
     &[],
     false,
     None,
-    None,
 );
 
 static JEMALLOC_ALLOC_WORKER_CHURN: Payload = Payload::new(
@@ -83,7 +82,6 @@ static JEMALLOC_ALLOC_WORKER_CHURN: Payload = Payload::new(
     &[],
     &[],
     false,
-    None,
     None,
 );
 

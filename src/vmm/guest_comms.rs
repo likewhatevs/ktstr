@@ -189,7 +189,7 @@ fn try_open_bulk_port() -> Option<std::fs::File> {
 /// bulk port is not yet open (multiport handshake still in flight),
 /// the writev failed, or the call originated from host context. The
 /// existing fire-and-forget callers (Exit, TestResult, PayloadMetrics,
-/// Profraw, Stimulus, RawPayloadOutput, SchedExit, ScenarioStart,
+/// Profraw, Stimulus, SchedExit, ScenarioStart,
 /// ScenarioEnd, SnapshotRequest) discard the return at statement
 /// position — only the [`send_sys_rdy`]/[`send_kern_addrs`] retry
 /// loop in `vmm::rust_init::send_sys_rdy_with_retry` observes it.
@@ -570,21 +570,6 @@ pub fn send_stimulus(payload: &[u8]) {
 /// still alive.
 pub fn send_step_end(payload: &[u8]) {
     write_msg(MsgType::StepEnd.wire_value(), payload);
-}
-
-/// Send raw stdout/stderr from an LlmExtract payload. Payload:
-/// postcard-encoded [`crate::test_support::RawPayloadOutput`].
-///
-/// Frames with [`MsgType::RawPayloadOutput`].
-pub(crate) fn send_raw_payload_output(raw: &crate::test_support::RawPayloadOutput) {
-    match postcard::to_stdvec(raw) {
-        Ok(bytes) => {
-            write_msg(MsgType::RawPayloadOutput.wire_value(), &bytes);
-        }
-        Err(e) => {
-            eprintln!("ktstr: postcard-encode RawPayloadOutput for bulk-port emit: {e}");
-        }
-    }
 }
 
 /// Send a scheduler-process exit notification. Payload: 4-byte LE i32
@@ -1636,21 +1621,6 @@ mod tests {
     fn send_stimulus_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
         assert_no_bulk_write("send_stimulus", || send_stimulus(&[0u8; 24]));
-    }
-
-    /// `send_raw_payload_output` from host context suppresses the write.
-    #[test]
-    fn send_raw_payload_output_from_host_context_is_noop() {
-        let _g = IsGuestOverrideGuard::new(false);
-        let raw = crate::test_support::RawPayloadOutput {
-            payload_index: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-            hint: None,
-            metric_hints: vec![],
-            metric_bounds: None,
-        };
-        assert_no_bulk_write("send_raw_payload_output", || send_raw_payload_output(&raw));
     }
 
     /// `send_sched_exit` from host context suppresses the write.

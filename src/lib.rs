@@ -155,7 +155,7 @@
 //! # Library usage
 //!
 //! Default install (full feature set — includes the installed
-//! `ktstr` / `cargo-ktstr` bins' deps and the local LLM extractor):
+//! `ktstr` / `cargo-ktstr` bins' deps):
 //!
 //! ```toml
 //! [dev-dependencies]
@@ -163,18 +163,15 @@
 //! ```
 //!
 //! Lean dev-dep (drops the host-tooling crates: tikv-jemallocator,
-//! clap_complete, tree-sitter, tree-sitter-c, base64; keeps the
-//! `OutputFormat::LlmExtract` path):
+//! clap_complete, tree-sitter, tree-sitter-c, base64):
 //!
 //! ```toml
 //! [dev-dependencies]
-//! ktstr = { version = "0.21.0", default-features = false, features = ["llm"] }
+//! ktstr = { version = "0.21.0", default-features = false }
 //! ```
 //!
 //! # Feature flags
 //!
-//! - **`llm`** (default) — `OutputFormat::LlmExtract` via bundled
-//!   Qwen3-4B GGUF. Pulls in `llama-cpp-2` (cmake C++ build).
 //! - **`cli-bins`** (default) — umbrella for deps used only by the
 //!   four `src/bin/*.rs` entry points and the matching test-binary
 //!   dispatch hooks. Pulls in `tikv-jemallocator`, `clap_complete`,
@@ -885,11 +882,10 @@ pub mod prelude {
     // namespace, distinct from the derive macro re-exported above.
     pub use crate::test_support::{
         BpfMapAgg, BpfMapWrite, CgroupPath, EXIT_FAIL, EXIT_INCONCLUSIVE, EXIT_PASS,
-        KTSTR_SCHEDULERS, KTSTR_TESTS, KtstrTestEntry, MemSideCache, Metric, MetricBounds,
-        MetricCheck, MetricHint, MetricSource, MetricStream, NumaDistance, NumaNode, OutputFormat,
-        Payload, PayloadKind, PayloadMetrics, Polarity, Scheduler, SchedulerSpec, SidecarResult,
-        Sysctl, Topology, TopologyConstraints, WatchBpfMap, extract_metrics, find_scheduler,
-        find_test, sidecar_dir,
+        KTSTR_SCHEDULERS, KTSTR_TESTS, KtstrTestEntry, MemSideCache, Metric, MetricCheck,
+        MetricHint, MetricStream, NumaDistance, NumaNode, OutputFormat, Payload, PayloadKind,
+        PayloadMetrics, Polarity, Scheduler, SchedulerSpec, SidecarResult, Sysctl, Topology,
+        TopologyConstraints, WatchBpfMap, extract_metrics, find_scheduler, find_test, sidecar_dir,
     };
     // The following items are intentionally NOT in the prelude. They
     // are binary-entry helpers (the `ktstr` / `cargo-ktstr` bins) or

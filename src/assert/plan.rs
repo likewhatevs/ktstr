@@ -603,7 +603,7 @@ impl AssertResult {
         // polarity from name substrings (e.g. `*_iops`,
         // `*_latency_us`). Without the inference, a payload-author
         // throughput metric — e.g. `jobs.0.read.iops` from
-        // `OutputFormat::LlmExtract` — would fold with `max`,
+        // `OutputFormat::Json` — would fold with `max`,
         // keeping the BETTER (higher) value across cgroups and
         // masking a cgroup that fell behind. The inference returns a
         // higher-is-worse default when no token matches, so genuinely

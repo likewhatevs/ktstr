@@ -3,7 +3,7 @@
 `cargo ktstr` is a cargo plugin for kernel build, cache, and test
 workflow. Subcommands in `--help` order: `test` (alias: `nextest`),
 `coverage`, `llvm-cov`, `stats`, `replay`, `perf-delta`, `kernel`,
-`model`, `verifier`, `funify` (alias: `costume`), `completions`,
+`verifier`, `funify` (alias: `costume`), `completions`,
 `show-host`, `show-thresholds`, `export`, `locks`, `shell`.
 
 ## test
@@ -552,59 +552,6 @@ cargo ktstr kernel clean --corrupt-only --force   # remove only corrupt entries
 | `--keep N` | Keep the N most recent VALID cached kernels. Corrupt entries (metadata missing or unparseable, image file absent) are always candidates for removal regardless of this value — a corrupt entry never consumes a keep slot. Mutually exclusive with `--corrupt-only`. |
 | `--force` | Skip confirmation prompt. Required in non-interactive contexts. |
 | `--corrupt-only` | Remove only corrupt cache entries (metadata missing or unparseable, image file absent). Valid entries are left untouched regardless of `--force`. Useful for clearing broken entries after an interrupted build without risking the curated set of good kernels. Mutually exclusive with `--keep`. |
-
-## model
-
-Manage the LLM model cache used by `OutputFormat::LlmExtract`
-payloads. `fetch` downloads the default pinned model into the
-ktstr model cache; `status` reports whether a SHA-checked copy
-is already cached; `clean` deletes the cached artifact plus
-its warm-cache sidecar.
-
-```sh
-cargo ktstr model fetch                          # download + SHA-check (no-op if cached)
-cargo ktstr model status                         # report cache path + verdict
-cargo ktstr model clean                          # delete cached artifact + sidecar
-```
-
-`fetch` is a no-op when the cache already holds a SHA-checked
-copy. Respects `KTSTR_MODEL_OFFLINE=1` — set to refuse network
-fetches. Cache root resolution: `KTSTR_CACHE_DIR` (if set),
-then `$XDG_CACHE_HOME/ktstr/models/`, then
-`$HOME/.cache/ktstr/models/`.
-
-`status` prints four fields and adds a one-line annotation
-when the verdict is anything other than `Matches` (a clean
-hit gets no annotation):
-
-| Field | Description |
-|---|---|
-| `model:` | Model file name (the pinned default; e.g. `Qwen3-4B-Q4_K_M.gguf`). |
-| `path:` | Absolute cache path (`{cache_root}/models/{file}`) the producer reads at LlmExtract time. |
-| `cached:` | `true` if an entry exists at `path:`, `false` otherwise. |
-| `checked:` | `true` if the cached entry's SHA-256 matches the pinned digest. |
-
-The annotation distinguishes four verdicts: `NotCached` (no
-entry — emit a `cargo ktstr model fetch` hint plus the
-expected download size), `CheckFailed` (cached entry could
-not be SHA-checked due to an I/O error — re-fetch),
-`Mismatches` (cached entry hash does not match the pinned
-digest — re-fetch), `Matches` (silent — the all-clear path).
-Re-fetch is the shared remediation tail for every cached-but-
-not-Matches branch.
-
-`clean` removes both the GGUF artifact at
-`{cache_root}/models/{file_name}` and its `.mtime-size`
-warm-cache sidecar (a small companion file the SHA fast-path
-uses to skip re-hashing on subsequent `status` calls). Per-
-file output names what was deleted with an IEC-prefixed size
-in parentheses (`removed /path/to/Qwen3-4B-Q4_K_M.gguf (2.34
-GiB)`); a final `freed N total` line sums the artifact and
-sidecar bytes. A no-op clean (nothing cached) prints a single
-`no cached model found at {path}` line so an idempotent re-run
-produces a clear "nothing to do" outcome instead of two
-"(absent)" lines. Subsequent `cargo ktstr model fetch`
-re-downloads the pin from scratch.
 
 ## verifier
 
