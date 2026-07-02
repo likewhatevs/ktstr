@@ -402,6 +402,17 @@ pub enum LifecyclePhase {
     /// reason suffix lives in the bytes after the 1-byte phase
     /// header.
     SchedulerNotAttached,
+    /// The injected verifier workload dispatched: after attach, at least
+    /// one worker of the `--ktstr-verifier-workload` run made forward
+    /// progress on-CPU (a positive, scheduler-agnostic dispatch proof).
+    /// Emitted by `ktstr_guest_init` Phase 5 only when a verifier-workload
+    /// run recorded a worker with non-zero `iterations` under a confirmed
+    /// SCHED_EXT policy (so a fair-class fallback cannot false-confirm).
+    /// Given a `PayloadStarting` frame, the ABSENCE of this frame means the
+    /// scheduler attached (sched_ext `enabled`) but never dispatched the
+    /// workload — a distinct, worse failure than never attaching. Carries
+    /// an empty suffix. Has no legacy COM2 sentinel equivalent.
+    WorkloadDispatched,
 }
 
 impl LifecyclePhase {
@@ -414,6 +425,7 @@ impl LifecyclePhase {
             LifecyclePhase::PayloadStarting => 2,
             LifecyclePhase::SchedulerDied => 3,
             LifecyclePhase::SchedulerNotAttached => 4,
+            LifecyclePhase::WorkloadDispatched => 5,
         }
     }
 
@@ -427,6 +439,7 @@ impl LifecyclePhase {
             2 => Some(LifecyclePhase::PayloadStarting),
             3 => Some(LifecyclePhase::SchedulerDied),
             4 => Some(LifecyclePhase::SchedulerNotAttached),
+            5 => Some(LifecyclePhase::WorkloadDispatched),
             _ => None,
         }
     }
@@ -1773,6 +1786,7 @@ mod tests {
             LifecyclePhase::PayloadStarting,
             LifecyclePhase::SchedulerDied,
             LifecyclePhase::SchedulerNotAttached,
+            LifecyclePhase::WorkloadDispatched,
         ];
         for p in all {
             let v = p.wire_value();
@@ -1800,6 +1814,7 @@ mod tests {
         assert_eq!(LifecyclePhase::PayloadStarting.wire_value(), 2);
         assert_eq!(LifecyclePhase::SchedulerDied.wire_value(), 3);
         assert_eq!(LifecyclePhase::SchedulerNotAttached.wire_value(), 4);
+        assert_eq!(LifecyclePhase::WorkloadDispatched.wire_value(), 5);
     }
 
     /// `SnapshotRequestPayload` round-trips through bytes — guards

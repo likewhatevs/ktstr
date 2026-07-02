@@ -1234,12 +1234,23 @@ pub const KTSTR_VERIFIER_RAW_ENV: &str = "KTSTR_VERIFIER_RAW";
 /// The `cargo ktstr verifier` dispatcher creates the dir, exports this
 /// var (inherited by the spawned `cargo nextest run` and thus by every
 /// cell process), and after nextest returns reads the records back to
-/// render the per-(scheduler × kernel) summary table. Unset
+/// render the per-(topology × scheduler) summary grid. Unset
 /// when a verifier cell runs outside the dispatcher (a hand-driven
 /// `--exact verifier/...`): the cell then simply skips the record write.
 /// Single source of truth so the name is not spelled by hand at the
 /// writer (cell) and reader (dispatcher) ends.
 pub const KTSTR_VERIFIER_RESULT_DIR_ENV: &str = "KTSTR_VERIFIER_RESULT_DIR";
+
+/// Name of the environment variable carrying the operator's
+/// `cargo ktstr verifier --scheduler <NAME>` filter. Set by the
+/// dispatcher in `src/bin/cargo_ktstr/verifier.rs`; read by
+/// `crate::test_support::dispatch`'s verifier cell emission, which
+/// skips every declared scheduler whose `name` does not equal the value
+/// so the sweep runs one scheduler across topologies instead of the
+/// full declared-scheduler matrix. Unset, every declared scheduler is
+/// swept. Single source of truth so the writer (dispatcher) and reader
+/// (emission) do not spell the name by hand.
+pub const KTSTR_VERIFIER_SCHEDULER_ENV: &str = "KTSTR_VERIFIER_SCHEDULER";
 
 /// Name of the environment variable that forces ktstr to skip the
 /// `perf_event_open` access check + the

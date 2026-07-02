@@ -416,28 +416,34 @@ pub(crate) enum KtstrCommand {
     ///
     /// Spawns `cargo nextest run -E 'test(/^verifier/) & !test(/^verifier::/)'`
     /// (waited on via `Command::status()`, not `execvp`) — the filter
-    /// matches the `verifier/<sched>/<kernel>` cells but excludes the
-    /// verifier module's own `verifier::tests::*` unit tests. Each test
-    /// binary that links ktstr-test-support and has at least one
+    /// matches the `verifier/<sched>/<kernel>/<preset>` cells but excludes
+    /// the verifier module's own `verifier::tests::*` unit tests. Each
+    /// test binary that links ktstr-test-support and has at least one
     /// `declare_scheduler!` declaration emits one nextest test per
-    /// (declared scheduler × declared kernel) cell — one cell, not one
-    /// per topology, because `verified_insns` is topology-independent.
-    /// Each cell boots a VM on the smallest topology the scheduler's
-    /// constraints accept, loads the scheduler's BPF programs (the real
-    /// kernel verifier runs), and reports per-program
-    /// verified-instruction counts via host-side memory introspection.
-    /// A cell PASSes only when the scheduler both verifies AND turns on:
-    /// the in-guest attach gate confirms `/sys/kernel/sched_ext/state`
-    /// reached `enabled`, so a scheduler that loads but never attaches
-    /// FAILs.
-    /// Each cell boots with performance mode disabled (`verified_insns`
+    /// (declared scheduler × declared kernel × accepted topology preset)
+    /// cell — the sweep runs each scheduler ACROSS topologies, because
+    /// whether it attaches and dispatches is topology-dependent (a
+    /// scheduler can attach on one topology and wedge on another). Each
+    /// cell boots a VM on the topology named in the cell, loads the
+    /// scheduler's BPF programs (the real kernel verifier runs), and
+    /// reports per-program verified-instruction counts via host-side
+    /// memory introspection.
+    /// A cell PASSes only when the scheduler verifies (BPF loads),
+    /// attaches (the in-guest gate confirms `/sys/kernel/sched_ext/state`
+    /// reached `enabled`), AND dispatches an injected SpinWait workload
+    /// (the guest confirms a worker made forward progress after attach).
+    /// A scheduler that loads but never attaches, or attaches but never
+    /// dispatches a runnable task, FAILs.
+    /// Every cell boots with performance mode disabled (`verified_insns`
     /// is perf-mode-independent), so it takes only a shared (LOCK_SH) LLC
     /// reservation and parallel cells no longer starve each other on the
     /// LLC lock (a `performance_mode` peer's LOCK_EX can still defer a
     /// cell, resolved by nextest retry). Eevdf + KernelBuiltin scheduler
     /// variants are skipped at cell-emission time (no userspace binary to
-    /// verify). After nextest finishes, a scheduler × kernel PASS/FAIL
-    /// summary table is printed.
+    /// verify). `--scheduler <NAME>` restricts the sweep to a single
+    /// declared scheduler across topologies. After nextest finishes, one
+    /// `verified_insns` table per scheduler (rows = kernel, cols = BPF
+    /// program) and a topology × scheduler PASS/FAIL grid are printed.
     ///
     /// The `declare_scheduler!` cells that carry a userspace scheduler
     /// live in integration test targets, so forward the build features to
@@ -465,6 +471,14 @@ pub(crate) enum KtstrCommand {
         /// --nextest-profile`).
         #[arg(long)]
         nextest_profile: Option<String>,
+        /// Restrict the sweep to a single declared scheduler by name
+        /// (the `declare_scheduler!` `name`). Omitted, every declared
+        /// scheduler is swept across topologies. The name must be a
+        /// declared BPF scheduler (`binary` / `binary_path`); `eevdf`
+        /// and `kernel_builtin` schedulers have no BPF to verify and are
+        /// never emitted, so naming one matches no cell.
+        #[arg(long)]
+        scheduler: Option<String>,
         /// cargo/nextest flags forwarded verbatim to the inner
         /// `cargo nextest run` — feature selection (`--features
         /// integration,wprof`), `--cargo-profile`, etc. No `--` separator

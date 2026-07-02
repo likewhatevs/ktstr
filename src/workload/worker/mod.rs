@@ -297,7 +297,14 @@ pub(super) fn worker_main(
     } else {
         None
     };
-    let _ = set_sched_policy(tid, sched_policy);
+    // Record (do not bail on) the policy-set result: the worker still
+    // runs on failure (matching the affinity soft-fail above), but the
+    // verifier dispatch probe needs to know a SCHED_EXT set was rejected
+    // so a worker that stayed SCHED_OTHER is not miscounted as dispatch
+    // proof. `Normal` is a no-op and yields `None`.
+    let sched_policy_error: Option<String> = set_sched_policy(tid, sched_policy)
+        .err()
+        .map(|e| format!("{e:#}"));
     apply_mempolicy_with_flags(&mem_policy, mpol_flags);
     if let Some(n) = nice {
         apply_nice(n);
@@ -4074,6 +4081,7 @@ pub(super) fn worker_main(
         ) && futex.map(|(_, p)| p == 0).unwrap_or(false),
         group_idx,
         affinity_error,
+        sched_policy_error,
         phase_slices,
         taobench_whole,
     }

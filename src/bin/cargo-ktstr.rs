@@ -326,8 +326,9 @@ fn dispatch_admin_command(command: KtstrCommand) -> Result<(), String> {
             raw,
             profile,
             nextest_profile,
+            scheduler,
             args,
-        } => verifier::run_verifier(kernel, raw, profile, nextest_profile, args),
+        } => verifier::run_verifier(kernel, raw, profile, nextest_profile, scheduler, args),
         KtstrCommand::Funify {
             input,
             seed,

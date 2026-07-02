@@ -600,7 +600,16 @@ pub(crate) fn ktstr_guest_init() -> ! {
     let wprof_handle = spawn_wprof_if_configured();
 
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
-    let code = if let Some(pa) = probe_phase_a {
+    let code = if crate::test_support::is_verifier_workload(&args) {
+        // Verifier sweep VM: no `#[ktstr_test]` body to dispatch. Instead
+        // run the dispatch probe — spawn a SpinWait workload and, on
+        // confirmed worker progress after the scheduler attached, emit a
+        // `WorkloadDispatched` frame. Exit 1 like the no-test-fn path: the
+        // host verifier verdict keys on lifecycle frames, never on the
+        // guest exit code (which is 1 even on the verifier success path).
+        super::verifier_workload::run_and_confirm_dispatch();
+        1
+    } else if let Some(pa) = probe_phase_a {
         crate::test_support::maybe_dispatch_vm_test_with_phase_a(&args, pa).unwrap_or(1)
     } else {
         crate::test_support::maybe_dispatch_vm_test_with_args(&args).unwrap_or(1)

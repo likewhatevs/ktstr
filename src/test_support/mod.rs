@@ -112,9 +112,9 @@ pub type PostVmCallback = fn(&crate::vmm::VmResult) -> anyhow::Result<()>;
 pub(crate) use args::extract_export_output_arg;
 #[allow(unused_imports)]
 pub(crate) use args::{
-    CellParentCgroupArg, cell_parent_path_is_valid, extract_export_test_arg,
-    extract_probe_stack_arg, extract_shell_test_arg, extract_test_fn_arg, extract_topo_arg,
-    extract_work_type_arg, parse_cell_parent_cgroup,
+    CellParentCgroupArg, VERIFIER_WORKLOAD_FLAG, cell_parent_path_is_valid,
+    extract_export_test_arg, extract_probe_stack_arg, extract_shell_test_arg, extract_test_fn_arg,
+    extract_topo_arg, extract_work_type_arg, is_verifier_workload, parse_cell_parent_cgroup,
 };
 #[allow(unused_imports)]
 pub(crate) use runtime::{append_base_sched_args, content_hash, scratch_dir, sys_rdy_budget_ms};

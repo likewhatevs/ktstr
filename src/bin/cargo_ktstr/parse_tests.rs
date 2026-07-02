@@ -2589,11 +2589,12 @@ fn parse_kernel_clean_keep() {
 
 // -- try_get_matches_from: verifier --
 //
-// The verifier subcommand takes only --kernel (repeatable) and --raw.
-// The scheduler binary set is discovered from `declare_scheduler!`
-// registrations in linked test binaries, not from a CLI flag — the
-// matrix is driven by the test binary's `KTSTR_SCHEDULERS`
-// distributed slice.
+// The verifier subcommand's native flags are --kernel (repeatable),
+// --raw, --profile, --nextest-profile, and --scheduler. The declared
+// scheduler set is discovered from `declare_scheduler!` registrations
+// in linked test binaries (the matrix is driven by the test binary's
+// `KTSTR_SCHEDULERS` distributed slice); --scheduler narrows that
+// sweep to a single declared scheduler by name.
 
 #[test]
 fn parse_verifier_bare() {
@@ -2649,6 +2650,36 @@ fn parse_verifier_with_raw() {
     };
     assert!(kernel.is_empty());
     assert!(raw, "--raw must lift the flag to true");
+}
+
+#[test]
+fn parse_verifier_scheduler_defaults_none() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "verifier"]).unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Verifier { scheduler, .. } = k.command else {
+        panic!("expected Verifier");
+    };
+    assert!(
+        scheduler.is_none(),
+        "bare verifier must default --scheduler to None (full declared-scheduler sweep)",
+    );
+}
+
+#[test]
+fn parse_verifier_with_scheduler() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "verifier", "--scheduler", "scx-ktstr"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Verifier { scheduler, .. } = k.command else {
+        panic!("expected Verifier");
+    };
+    assert_eq!(
+        scheduler.as_deref(),
+        Some("scx-ktstr"),
+        "--scheduler lifts the single-scheduler sweep filter",
+    );
 }
 
 /// The trailing `args` forward cargo/nextest flags to the inner
@@ -2766,33 +2797,6 @@ fn parse_verifier_with_profiles() {
         args,
         vec!["--features".to_string(), "integration".to_string()],
         "a passthrough flag AFTER the native profiles still lands in args",
-    );
-}
-
-/// `--scheduler` was removed when the verifier sweep moved to
-/// `declare_scheduler!`-driven discovery — verifier has no native
-/// `--scheduler`. Since verifier is a passthrough subcommand
-/// (`trailing_var_arg`), the removed flag is now FORWARDED into
-/// `args` (the inner `cargo nextest run` rejects it downstream),
-/// not clap-rejected. Pinning that it lands in `args` still trips
-/// if a future agent re-adds `--scheduler` as a NATIVE flag: a
-/// native `--scheduler` would consume the value and leave `args`
-/// empty, failing this assertion.
-#[test]
-fn parse_verifier_scheduler_flag_forwarded_not_native() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from(["cargo", "ktstr", "verifier", "--scheduler", "scx_rustland"])
-        .unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Verifier { args, .. } = k.command else {
-        panic!("expected Verifier");
-    };
-    assert_eq!(
-        args,
-        vec!["--scheduler", "scx_rustland"],
-        "--scheduler has no native verifier flag; trailing_var_arg forwards it \
-         into `args` (nextest rejects it downstream). A future NATIVE re-add \
-         would consume the value and empty `args`, tripping this pin.",
     );
 }
 

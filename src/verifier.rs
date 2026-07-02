@@ -670,6 +670,31 @@ fn attach_outcome_from_messages(
     }
 }
 
+/// Whether the guest confirmed workload dispatch: at least one
+/// `WorkloadDispatched` lifecycle frame (crc-ok, non-empty payload) in
+/// the run's bulk-port frames. Emitted by `ktstr_guest_init` Phase 5 only
+/// when the injected SpinWait workload recorded a worker with non-zero
+/// `iterations` under a confirmed SCHED_EXT policy (`sched_policy_error`
+/// is None) after the scheduler attached — so a fair-class fallback
+/// cannot false-confirm — a positive, scheduler-agnostic proof the
+/// scheduler dispatched a task onto a CPU.
+/// Corrupt frames (`crc_ok == false`) and empty payloads are skipped. A
+/// `None` `guest_messages` (no frames at all) is `false`.
+fn dispatch_confirmed_from_messages(
+    guest_messages: Option<&crate::vmm::host_comms::BulkDrainResult>,
+) -> bool {
+    let Some(drain) = guest_messages else {
+        return false;
+    };
+    drain.entries.iter().any(|e| {
+        e.msg_type == crate::vmm::wire::MSG_TYPE_LIFECYCLE
+            && e.crc_ok
+            && !e.payload.is_empty()
+            && crate::vmm::wire::LifecyclePhase::from_wire(e.payload[0])
+                == Some(crate::vmm::wire::LifecyclePhase::WorkloadDispatched)
+    })
+}
+
 /// Result of collecting verifier output from a VM run.
 pub struct VerifierVmResult {
     /// Per-program verifier statistics from host-side memory
@@ -679,13 +704,30 @@ pub struct VerifierVmResult {
     /// verifier instruction traces when BPF load fails.
     pub scheduler_log: String,
     /// Whether the scheduler positively confirmed attach. Derived from
-    /// the guest's lifecycle frames ([`AttachOutcome`]). A verifier cell
-    /// PASSes only when this is [`AttachOutcome::Attached`] (the guest
-    /// reached its post-attach dispatch phase): verification alone
-    /// (non-empty `stats`) is not enough — a scheduler whose BPF loads
-    /// but never reaches sched_ext `enabled`, or a guest that vanishes
-    /// before the dispatch phase, is a real failure.
+    /// the guest's lifecycle frames ([`AttachOutcome`]). Attach is
+    /// necessary but NOT sufficient for a cell PASS: this must be
+    /// [`AttachOutcome::Attached`] (the guest reached its post-attach
+    /// dispatch phase) AND [`Self::dispatched`] must be true. Verification
+    /// alone (non-empty `stats`) is not enough — a scheduler whose BPF
+    /// loads but never reaches sched_ext `enabled`, or a guest that
+    /// vanishes before the dispatch phase, is a real failure.
     pub attach: AttachOutcome,
+    /// Whether the guest confirmed the injected verifier workload
+    /// dispatched — a `WorkloadDispatched` lifecycle frame, emitted by
+    /// `ktstr_guest_init` Phase 5 when the SpinWait probe recorded a
+    /// worker with non-zero `iterations` under a confirmed SCHED_EXT
+    /// policy after attach (so a fair-class fallback cannot false-confirm).
+    /// A cell PASSes only
+    /// when this is true AND [`Self::attach`] is
+    /// [`AttachOutcome::Attached`]: a scheduler that turns on (sched_ext
+    /// `enabled`) but never dispatches a runnable task is a real, distinct
+    /// failure — worse than never attaching — that the attach verdict
+    /// alone cannot catch. Derived from the run's lifecycle frames;
+    /// scheduler-agnostic — the probe runs as SCHED_EXT, so the BPF
+    /// scheduler dispatches it under any switch mode (full or
+    /// `SCX_OPS_SWITCH_PARTIAL`) and non-zero worker progress proves
+    /// dispatch, unlike an scx-specific `nr_dispatched` counter.
+    pub dispatched: bool,
     /// The host watchdog fired (hard-deadline hang) before the guest
     /// exited. Orthogonal to [`Self::attach`]: the attach verdict already
     /// fails a guest that vanished BEFORE the dispatch phase — an early
@@ -697,6 +739,45 @@ pub struct VerifierVmResult {
     /// on it too — but NOT on the guest exit code, which is `1` even on
     /// the verifier success path (no `#[ktstr_test]` body to dispatch).
     pub timed_out: bool,
+}
+
+impl VerifierVmResult {
+    /// The verifier cell PASS/FAIL verdict: `Ok(())` when the scheduler
+    /// verified its BPF, attached (sched_ext `enabled`), AND dispatched
+    /// the injected workload; `Err(reason)` naming the first failing gate
+    /// otherwise. Gate order — `timed_out` (a post-attach teardown hang),
+    /// then attach (did it turn on?), then dispatch (did it schedule a
+    /// task?) — so the root-cause failure is reported first: an attach
+    /// failure is named before the dispatch gate it necessarily also
+    /// trips. Does NOT key on the guest exit code, which is `1` even on
+    /// the verifier success path (no `#[ktstr_test]` body to dispatch).
+    pub fn cell_verdict(&self) -> Result<(), String> {
+        // A hard-deadline hang. The attach verdict (Unconfirmed) already
+        // fails a guest that vanished BEFORE the dispatch phase (an early
+        // panic reboots via panic=-1 with timed_out=false), so this
+        // catches the orthogonal case: a guest that wedges AFTER attaching,
+        // during teardown.
+        if self.timed_out {
+            return Err("VM timed out (hung after attach, before exit)".to_string());
+        }
+        // PASS requires the scheduler to have turned ON, not just to have
+        // loaded + verified its BPF.
+        if let Some(reason) = self.attach.failure_reason() {
+            return Err(format!("scheduler did not turn on — {reason}"));
+        }
+        // PASS also requires DISPATCH: the guest injects a SpinWait
+        // workload after attach and only emits WorkloadDispatched when a
+        // SCHED_EXT worker makes forward progress. A scheduler that turns
+        // on but never dispatches a runnable task is a distinct, worse
+        // failure the attach gate can't catch.
+        if !self.dispatched {
+            return Err(
+                "scheduler attached but did not dispatch the injected workload (0 iterations)"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Boot a VM and collect verifier statistics via host-side memory
@@ -711,9 +792,10 @@ pub struct VerifierVmResult {
 /// shape carried in the per-scheduler `--ktstr-list-schedulers`
 /// JSON. The named fields force callers to spell every dimension
 /// at the call site, preventing position-swap misorders. The sole
-/// caller is the sweep cell handler, which passes the per-scheduler
-/// topology `verifier_preset` selects — the smallest gauntlet preset
-/// the scheduler's constraints accept.
+/// caller is the sweep cell handler (`crate::test_support::dispatch`'s
+/// `run_verifier_cell`), which passes the topology of the gauntlet
+/// preset named in the cell — the verifier sweeps each scheduler across
+/// every preset its constraints accept under no_perf_mode.
 pub fn collect_verifier_output(
     sched_bin: &std::path::Path,
     ktstr_bin: &std::path::Path,
@@ -759,6 +841,11 @@ pub fn collect_verifier_output(
         .init_binary(ktstr_bin)
         .scheduler_binary(sched_bin)
         .sched_args(&sched_args)
+        // Boot the guest into the verifier dispatch probe: the sweep VM
+        // has no `#[ktstr_test]` body, so Phase 5 spawns a SpinWait
+        // workload and emits `WorkloadDispatched` on confirmed progress.
+        // The PASS verdict requires that frame in addition to attach.
+        .run_args(&[crate::test_support::VERIFIER_WORKLOAD_FLAG.to_string()])
         .topology(validated)
         .memory_mib(2048)
         .timeout(std::time::Duration::from_secs(120))
@@ -795,11 +882,13 @@ pub fn collect_verifier_output(
         .collect();
 
     let attach = attach_outcome_from_messages(result.guest_messages.as_ref());
+    let dispatched = dispatch_confirmed_from_messages(result.guest_messages.as_ref());
 
     Ok(VerifierVmResult {
         stats,
         scheduler_log,
         attach,
+        dispatched,
         timed_out: result.timed_out,
     })
 }
@@ -845,7 +934,16 @@ pub fn format_verifier_output(label: &str, result: &VerifierVmResult, raw: bool)
         out.push_str("  scheduler: UNKNOWN — VM timed out before exit\n");
     } else {
         match result.attach.failure_reason() {
-            None => out.push_str("  scheduler: attached (sched_ext enabled)\n"),
+            None => {
+                out.push_str("  scheduler: attached (sched_ext enabled)\n");
+                if result.dispatched {
+                    out.push_str("  dispatch: confirmed (injected workload ran)\n");
+                } else {
+                    out.push_str(
+                        "  dispatch: NOT CONFIRMED — attached but injected workload made no progress\n",
+                    );
+                }
+            }
             Some(reason) => out.push_str(&format!("  scheduler: NOT ATTACHED — {reason}\n")),
         }
     }
@@ -924,24 +1022,26 @@ pub fn format_verifier_diff(
 /// (via `write_cell_record`) into the directory named by
 /// [`crate::KTSTR_VERIFIER_RESULT_DIR_ENV`]; after nextest returns the
 /// dispatcher reads them back (via [`read_cell_records`]) and renders the
-/// per-(scheduler × kernel) summary table. A cell is one
-/// (scheduler, kernel): the topology is a per-scheduler internal choice
-/// (`verifier_preset` in `test_support::dispatch`), not a result axis —
-/// `verified_insns` is topology-independent.
+/// per-(topology × scheduler) summary table. A cell is one
+/// (scheduler, kernel, topology): the verifier sweeps each declared
+/// scheduler across topologies, so topology IS a result axis — a
+/// scheduler can pass on one topology and fail on another.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VerifierCellRecord {
     /// Declared scheduler name (the `<sched>` cell-name segment).
     pub scheduler: String,
     /// Sanitized kernel label (the `<kernel>` cell-name segment).
     pub kernel: String,
+    /// Gauntlet topology preset (the `<preset>` cell-name segment).
+    pub topology: String,
     /// Whether the cell passed (exit 0 from the cell handler).
     pub passed: bool,
 }
 
 /// Map a cell's full name to a filesystem-safe record filename: every
 /// non-alphanumeric byte becomes `_`. The input is the cell's full name
-/// (`verifier/<sched>/<kernel>`, unique per cell), so the mapping is
-/// unique per cell — a nextest RETRY of the same cell overwrites its
+/// (`verifier/<sched>/<kernel>/<preset>`, unique per cell), so the
+/// mapping is unique per cell — a nextest RETRY of the same cell overwrites its
 /// own prior record, so the FINAL attempt's outcome wins (a cell that
 /// failed then passed on retry records PASS).
 fn cell_record_filename(full_name: &str) -> String {
@@ -954,8 +1054,8 @@ fn cell_record_filename(full_name: &str) -> String {
 }
 
 /// Write a cell's PASS/FAIL record into `dir`. Parses `full_name`
-/// (`verifier/<sched>/<kernel>`); a name that does not fit that shape
-/// is skipped (the cell already errored on the malformed name).
+/// (`verifier/<sched>/<kernel>/<preset>`); a name that does not fit that
+/// shape is skipped (the cell already errored on the malformed name).
 /// Best-effort: a write failure is logged and swallowed — the summary
 /// table is a convenience over the per-cell nextest output, so a lost
 /// record must never turn an otherwise-passing cell into a failure.
@@ -968,13 +1068,14 @@ pub(crate) fn write_cell_record(dir: &std::path::Path, full_name: &str, passed: 
     let Some(rest) = full_name.strip_prefix("verifier/") else {
         return;
     };
-    let parts: Vec<&str> = rest.splitn(2, '/').collect();
-    if parts.len() != 2 {
+    let parts: Vec<&str> = rest.splitn(3, '/').collect();
+    if parts.len() != 3 {
         return;
     }
     let record = VerifierCellRecord {
         scheduler: parts[0].to_string(),
         kernel: parts[1].to_string(),
+        topology: parts[2].to_string(),
         passed,
     };
     let path = dir.join(cell_record_filename(full_name));
@@ -1011,13 +1112,14 @@ pub fn read_cell_records(dir: &std::path::Path) -> Vec<VerifierCellRecord> {
         .collect()
 }
 
-/// Render the per-cell records into a summary table: one row per
-/// scheduler, one column per kernel, each cell `PASS` / `FAIL` (or `-`
-/// when that scheduler did not run against that kernel — e.g. its
-/// `declare_scheduler!` kernel filter excluded it). With a single kernel
-/// the table is a `scheduler | <kernel>` PASS/FAIL list; with multiple
-/// kernels it is a scheduler × kernel matrix. Returns `None` for an
-/// empty record set (the caller prints nothing).
+/// Render the per-cell records into a summary table: one row per topology
+/// preset, one column per distinct (scheduler, kernel) pair, each cell
+/// ✅ / ❌ (or `-` when that scheduler/kernel did not run that
+/// topology — e.g. its constraints rejected the preset). With a single
+/// kernel the columns are labeled by scheduler only; with multiple
+/// kernels each column is `scheduler @ kernel` so the kernel axis stays
+/// visible. Returns `None` for an empty record set (the caller prints
+/// nothing).
 ///
 /// Rows and columns are BTreeSet-sorted so the same run renders the same
 /// table (shell-pipeline stable). The header line carries a ✅/❌
@@ -1027,33 +1129,44 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
         return None;
     }
     use std::collections::{BTreeMap, BTreeSet};
-    let mut rows: BTreeSet<String> = BTreeSet::new(); // schedulers
-    let mut cols: BTreeSet<String> = BTreeSet::new(); // kernels
-    let mut cell: BTreeMap<(String, String), bool> = BTreeMap::new(); // (scheduler, kernel) -> passed
+    let mut cols: BTreeSet<(String, String)> = BTreeSet::new(); // (scheduler, kernel)
+    let mut rows: BTreeSet<String> = BTreeSet::new(); // topology presets
+    let mut cell: BTreeMap<(String, String, String), bool> = BTreeMap::new(); // (topology, scheduler, kernel) -> passed
     let (mut n_pass, mut n_fail) = (0usize, 0usize);
     for r in records {
-        rows.insert(r.scheduler.clone());
-        cols.insert(r.kernel.clone());
-        cell.insert((r.scheduler.clone(), r.kernel.clone()), r.passed);
+        cols.insert((r.scheduler.clone(), r.kernel.clone()));
+        rows.insert(r.topology.clone());
+        cell.insert(
+            (r.topology.clone(), r.scheduler.clone(), r.kernel.clone()),
+            r.passed,
+        );
         if r.passed {
             n_pass += 1;
         } else {
             n_fail += 1;
         }
     }
+    let single_kernel = cols.iter().map(|(_, k)| k).collect::<BTreeSet<_>>().len() == 1;
+    let col_label = |sched: &str, kernel: &str| -> String {
+        if single_kernel {
+            sched.to_string()
+        } else {
+            format!("{sched} @ {kernel}")
+        }
+    };
 
     let mut table = crate::cli::new_table();
-    let mut header: Vec<String> = vec!["scheduler".to_string()];
-    for kernel in &cols {
-        header.push(kernel.clone());
+    let mut header: Vec<String> = vec!["topology".to_string()];
+    for (sched, kernel) in &cols {
+        header.push(col_label(sched, kernel));
     }
     table.set_header(header);
-    for sched in &rows {
-        let mut line: Vec<String> = vec![sched.clone()];
-        for kernel in &cols {
-            let text = match cell.get(&(sched.clone(), kernel.clone())) {
-                Some(true) => "PASS",
-                Some(false) => "FAIL",
+    for topo in &rows {
+        let mut line: Vec<String> = vec![topo.clone()];
+        for (sched, kernel) in &cols {
+            let text = match cell.get(&(topo.clone(), sched.clone(), kernel.clone())) {
+                Some(true) => "✅",
+                Some(false) => "❌",
                 None => "-",
             };
             line.push(text.to_string());
@@ -1074,19 +1187,19 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// A malformed cell name is skipped (no record); a well-formed
-    /// 2-segment cell records; and a nextest RETRY of the same cell
-    /// overwrites its own prior record so the FINAL outcome wins
-    /// (fail-then-pass -> PASS).
+    /// 3-segment cell records (scheduler/kernel/topology); and a nextest
+    /// RETRY of the same cell overwrites its own prior record so the
+    /// FINAL outcome wins (fail-then-pass -> PASS).
     #[test]
     fn cell_record_write_read_roundtrip_and_retry_overwrites() {
         let dir = std::env::temp_dir().join(format!("ktstr-verif-rec-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mk temp dir");
-        // Malformed: no verifier/ prefix, and a single-segment name (no
-        // '/' after the prefix) — both skipped.
+        // Malformed: no verifier/ prefix, and a 2-segment name (no
+        // <preset> after the kernel) — both skipped.
         write_cell_record(&dir, "not_a_cell", true);
-        write_cell_record(&dir, "verifier/onlyone", true);
+        write_cell_record(&dir, "verifier/only/two", true);
         // Well-formed cell: fail, then a retry passes -> overwrites.
-        let name = "verifier/scx_a/kernel_6_14";
+        let name = "verifier/scx_a/kernel_6_14/tiny-1llc";
         write_cell_record(&dir, name, false);
         write_cell_record(&dir, name, true);
         let recs = read_cell_records(&dir);
@@ -1097,6 +1210,7 @@ mod tests {
         );
         assert_eq!(recs[0].scheduler, "scx_a");
         assert_eq!(recs[0].kernel, "kernel_6_14");
+        assert_eq!(recs[0].topology, "tiny-1llc");
         assert!(
             recs[0].passed,
             "final retry outcome (PASS) wins over the earlier FAIL"
@@ -1104,36 +1218,36 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The summary table: scheduler rows × kernel columns, PASS/FAIL +
-    /// tally; a single kernel yields one data column; an empty record
-    /// set renders nothing.
+    /// The summary table: topology rows × scheduler columns, ✅/❌ +
+    /// tally; a single kernel labels columns by scheduler only; an empty
+    /// record set renders nothing.
     #[test]
     fn render_result_table_matrix_tally_and_empty() {
         let recs = vec![
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_14".into(),
+                topology: "tiny-1llc".into(),
                 passed: true,
             },
             VerifierCellRecord {
-                scheduler: "scx_b".into(),
+                scheduler: "scx_a".into(),
                 kernel: "kernel_6_14".into(),
+                topology: "large-4llc".into(),
                 passed: false,
             },
         ];
         let out = render_result_table(&recs).expect("non-empty records -> Some");
+        assert!(out.contains("verifier summary: 1 ✅  1 ❌"), "tally: {out}");
+        // topology rows + scheduler-only column label (single kernel).
         assert!(
-            out.contains("verifier summary: 1 PASS, 1 FAIL"),
-            "tally: {out}"
+            out.contains("topology") && out.contains("tiny-1llc") && out.contains("large-4llc"),
+            "topology rows: {out}"
         );
-        // scheduler rows + the kernel label as the single data column.
+        assert!(out.contains("scx_a"), "column labeled by scheduler: {out}");
         assert!(
-            out.contains("scheduler") && out.contains("kernel_6_14"),
-            "header: {out}"
-        );
-        assert!(
-            out.contains("scx_a") && out.contains("scx_b"),
-            "one row per scheduler: {out}"
+            !out.contains(" @ "),
+            "single-kernel table labels columns by scheduler only: {out}"
         );
         // The emoji must render in the GRID CELLS, not merely the tally
         // line: locate each topology's row and assert its cell glyph
@@ -1157,32 +1271,34 @@ mod tests {
         assert!(render_result_table(&[]).is_none(), "empty -> None");
     }
 
-    /// Multiple kernels -> one column per kernel; a scheduler that ran
-    /// against only one kernel shows `-` in the other's column.
+    /// Multiple kernels -> columns carry the kernel ('scheduler @ kernel');
+    /// a (scheduler, kernel) that did not run a given topology shows `-`.
     #[test]
     fn render_result_table_multi_kernel_columns_and_missing_cell() {
         let recs = vec![
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_14".into(),
+                topology: "tiny-1llc".into(),
                 passed: true,
             },
             VerifierCellRecord {
-                scheduler: "scx_b".into(),
+                scheduler: "scx_a".into(),
                 kernel: "kernel_6_15".into(),
+                topology: "smt-2llc".into(),
                 passed: true,
             },
         ];
         let out = render_result_table(&recs).expect("Some");
-        // Both kernels are columns; scx_a/kernel_6_15 and
-        // scx_b/kernel_6_14 never ran, so each row carries a '-'.
+        // Multi-kernel columns include the kernel; each (sched,kernel) ran
+        // only one topology, so the other topology row shows '-'.
         assert!(
-            out.contains("kernel_6_14") && out.contains("kernel_6_15"),
-            "each kernel is a column: {out}",
+            out.contains("scx_a @ kernel_6_14") && out.contains("scx_a @ kernel_6_15"),
+            "multi-kernel columns include the kernel: {out}",
         );
         assert!(
             out.contains('-'),
-            "a scheduler absent for a kernel renders '-': {out}"
+            "a (sched,kernel) absent for a topology renders '-': {out}"
         );
         assert!(out.contains("verifier summary: 2 ✅  0 ❌"), "tally: {out}");
     }
@@ -1315,6 +1431,116 @@ mod tests {
         }
     }
 
+    /// dispatch_confirmed_from_messages: true only when a crc-ok,
+    /// non-empty WorkloadDispatched frame is present; false for None / no
+    /// such frame / corrupt / empty / non-LIFECYCLE.
+    #[test]
+    fn dispatch_confirmed_from_lifecycle_frames() {
+        use crate::vmm::host_comms::BulkDrainResult;
+        use crate::vmm::wire::{LifecyclePhase, MSG_TYPE_LIFECYCLE, ShmEntry};
+
+        let frame = |phase: LifecyclePhase| -> ShmEntry {
+            ShmEntry {
+                msg_type: MSG_TYPE_LIFECYCLE,
+                payload: vec![phase.wire_value()],
+                crc_ok: true,
+            }
+        };
+        let drain = |entries: Vec<ShmEntry>| BulkDrainResult { entries };
+
+        // No frames at all -> false.
+        assert!(!dispatch_confirmed_from_messages(None));
+
+        // PayloadStarting but no WorkloadDispatched -> false (attached,
+        // never dispatched).
+        let attached_only = drain(vec![frame(LifecyclePhase::PayloadStarting)]);
+        assert!(!dispatch_confirmed_from_messages(Some(&attached_only)));
+
+        // WorkloadDispatched present -> true.
+        let dispatched = drain(vec![
+            frame(LifecyclePhase::PayloadStarting),
+            frame(LifecyclePhase::WorkloadDispatched),
+        ]);
+        assert!(dispatch_confirmed_from_messages(Some(&dispatched)));
+
+        // Corrupt crc / empty payload / non-LIFECYCLE WorkloadDispatched
+        // frames are skipped and must not confirm dispatch.
+        let corrupt = ShmEntry {
+            msg_type: MSG_TYPE_LIFECYCLE,
+            payload: vec![LifecyclePhase::WorkloadDispatched.wire_value()],
+            crc_ok: false,
+        };
+        let empty = ShmEntry {
+            msg_type: MSG_TYPE_LIFECYCLE,
+            payload: Vec::new(),
+            crc_ok: true,
+        };
+        let non_lifecycle = ShmEntry {
+            msg_type: MSG_TYPE_LIFECYCLE + 1,
+            payload: vec![LifecyclePhase::WorkloadDispatched.wire_value()],
+            crc_ok: true,
+        };
+        for skipped in [corrupt, empty, non_lifecycle] {
+            let d = drain(vec![skipped]);
+            assert!(
+                !dispatch_confirmed_from_messages(Some(&d)),
+                "a corrupt/empty/non-LIFECYCLE frame must not confirm dispatch",
+            );
+        }
+    }
+
+    /// VerifierVmResult::cell_verdict gate order + messages: timed_out >
+    /// attach failure > dispatch failure > PASS.
+    #[test]
+    fn cell_verdict_gate_order_and_messages() {
+        let base = |attach: AttachOutcome, dispatched: bool, timed_out: bool| VerifierVmResult {
+            stats: Vec::new(),
+            scheduler_log: String::new(),
+            attach,
+            dispatched,
+            timed_out,
+        };
+
+        // Verified + attached + dispatched, no hang -> PASS.
+        assert_eq!(
+            base(AttachOutcome::Attached, true, false).cell_verdict(),
+            Ok(()),
+        );
+
+        // Attached but 0-dispatch -> FAIL naming the dispatch gate.
+        let no_dispatch = base(AttachOutcome::Attached, false, false).cell_verdict();
+        assert!(
+            no_dispatch
+                .as_ref()
+                .unwrap_err()
+                .contains("did not dispatch"),
+            "dispatch gate must name the failure: {no_dispatch:?}",
+        );
+
+        // Attach failure -> FAIL naming attach, even if dispatched is
+        // (defensively) true.
+        let attach_fail = base(AttachOutcome::Died, true, false).cell_verdict();
+        assert!(
+            attach_fail.as_ref().unwrap_err().contains("did not turn on"),
+            "attach gate must win over dispatch: {attach_fail:?}",
+        );
+
+        // timed_out wins over everything, even a clean attach + dispatch.
+        let hung = base(AttachOutcome::Attached, true, true).cell_verdict();
+        assert!(
+            hung.as_ref().unwrap_err().contains("timed out"),
+            "timed_out must win: {hung:?}",
+        );
+
+        // Attach failure outranks a co-present dispatch failure (root
+        // cause reported first).
+        let both = base(AttachOutcome::Died, false, false).cell_verdict();
+        assert!(
+            both.as_ref().unwrap_err().contains("did not turn on"),
+            "attach failure reported before dispatch failure: {both:?}",
+        );
+    }
+
     /// AttachOutcome::failure_reason surfaces (None when attached, the
     /// distinct Died / NotAttached reasons otherwise).
     #[test]
@@ -1353,6 +1579,7 @@ mod tests {
             stats: Vec::new(),
             scheduler_log: String::new(),
             attach: AttachOutcome::Attached,
+            dispatched: false,
             timed_out: true,
         };
         let out = format_verifier_output("verifier", &result, false);
@@ -1363,6 +1590,31 @@ mod tests {
         assert!(
             !out.contains("scheduler: attached"),
             "timed-out run must not claim attached: {out}",
+        );
+    }
+
+    /// An attached-but-not-dispatched run shows the attach line AND a
+    /// "dispatch: NOT CONFIRMED" line — the signal that the scheduler
+    /// turned on but never dispatched the injected workload.
+    /// Guards the `format_verifier_output` dispatched==false render branch,
+    /// which the snapshot tests (dispatched==true / Died) do not reach.
+    #[test]
+    fn format_verifier_output_attached_not_dispatched_shows_not_confirmed() {
+        let result = VerifierVmResult {
+            stats: Vec::new(),
+            scheduler_log: String::new(),
+            attach: AttachOutcome::Attached,
+            dispatched: false,
+            timed_out: false,
+        };
+        let out = format_verifier_output("verifier", &result, false);
+        assert!(
+            out.contains("scheduler: attached"),
+            "attached run must show the attach line: {out}",
+        );
+        assert!(
+            out.contains("dispatch: NOT CONFIRMED"),
+            "attached-but-not-dispatched must render the NOT CONFIRMED signal: {out}",
         );
     }
 
@@ -2121,6 +2373,7 @@ libbpf: failed to load BPF skeleton 'ktstr_ops': -22
             ],
             scheduler_log: String::new(),
             attach: AttachOutcome::Attached,
+            dispatched: true,
             timed_out: false,
         };
         insta::assert_snapshot!(format_verifier_output("default", &result, false));
@@ -2143,6 +2396,7 @@ processed 42 insns (limit 1000000) max_states_per_insn 1 total_states 10 peak_st
             // A load log present means the scheduler printed a verifier
             // trace then exited — the SchedulerDied failure path.
             attach: AttachOutcome::Died,
+            dispatched: false,
             timed_out: false,
         };
         insta::assert_snapshot!(format_verifier_output("llc+steal", &result, false));

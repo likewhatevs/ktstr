@@ -599,6 +599,19 @@ pub struct WorkerReport {
     /// Option<…> tag (one byte) is the only overhead on the
     /// success path.
     pub affinity_error: Option<String>,
+    /// `set_sched_policy` failure text (`{e:#}`), or `None` when the
+    /// per-worker scheduling-policy set succeeded (or the policy was the
+    /// `Normal` no-op). Load-bearing for the verifier dispatch probe: a
+    /// probe worker configured `SchedPolicy::Ext` whose
+    /// `sched_setattr(SCHED_EXT)` was rejected (e.g. the scheduler set
+    /// `scx.disallow` on it) stays SCHED_OTHER, so its `iterations`
+    /// progress does NOT prove the BPF scheduler dispatched it —
+    /// `run_and_confirm_dispatch` excludes any worker with a
+    /// `sched_policy_error` from the dispatch proof. Sentinel reports
+    /// synthesised by [`WorkloadHandle::stop_and_collect`] leave this
+    /// `None` (no policy set was attempted). Same positional-serde
+    /// reasoning as [`Self::affinity_error`]: no `skip_serializing_if`.
+    pub sched_policy_error: Option<String>,
     /// Per-phase telemetry slices for a backdrop (persistent) worker
     /// that spanned multiple scenario steps. EMPTY for step-local
     /// workers and for any backdrop worker that observed no phase

@@ -183,6 +183,24 @@ pub(crate) fn extract_export_output_arg(args: &[String]) -> Option<&str> {
     None
 }
 
+/// The bare boolean flag that marks a guest run as a verifier-workload
+/// dispatch probe. Written onto the guest `run_args` by
+/// [`crate::verifier::collect_verifier_output`] and detected here by
+/// [`is_verifier_workload`]. Single source of truth so the writer (host
+/// dispatcher) and reader (guest init) never spell the flag by hand.
+pub(crate) const VERIFIER_WORKLOAD_FLAG: &str = "--ktstr-verifier-workload";
+
+/// Whether [`VERIFIER_WORKLOAD_FLAG`] is present in the argument list.
+/// Consumed at `ktstr_guest_init` Phase 5: instead of dispatching a
+/// `#[ktstr_test]` body (the verifier sweep VM has none) it runs the
+/// SpinWait dispatch probe and, on confirmed worker progress after the
+/// scheduler attaches, emits a
+/// [`crate::vmm::wire::LifecyclePhase::WorkloadDispatched`] frame. A bare
+/// boolean flag — presence is the whole signal, no value.
+pub(crate) fn is_verifier_workload(args: &[String]) -> bool {
+    args.iter().any(|a| a == VERIFIER_WORKLOAD_FLAG)
+}
+
 /// Canonical name for the cgroup-parent flag scx schedulers accept.
 /// The auto-inject (`runtime::append_base_sched_args`), the guest's
 /// boot-time cgroup-tree creator (`vmm::rust_init`), and this guest-
@@ -466,6 +484,26 @@ mod tests {
     fn extract_test_fn_arg_space_form_empty_args() {
         let args: Vec<String> = vec![];
         assert!(extract_test_fn_arg(&args).is_none());
+    }
+
+    // -- is_verifier_workload --
+
+    #[test]
+    fn is_verifier_workload_present() {
+        let args = vec!["/init".into(), VERIFIER_WORKLOAD_FLAG.to_string()];
+        assert!(is_verifier_workload(&args));
+    }
+
+    #[test]
+    fn is_verifier_workload_absent() {
+        let args = vec!["/init".into(), "--ktstr-test-fn=foo".into()];
+        assert!(!is_verifier_workload(&args));
+    }
+
+    #[test]
+    fn is_verifier_workload_empty_args() {
+        let args: Vec<String> = vec![];
+        assert!(!is_verifier_workload(&args));
     }
 
     // -- extract_probe_stack_arg --

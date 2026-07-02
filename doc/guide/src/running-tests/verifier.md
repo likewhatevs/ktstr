@@ -1,10 +1,12 @@
 # BPF Verifier
 
-The verifier sweep boots every declared scheduler in a KVM VM and
-checks two things against the real kernel: that each scheduler's BPF
-programs pass the kernel verifier (capturing per-program
-`verified_insns`), and that the scheduler actually turns on — attaches
-as the active sched_ext scheduler.
+The verifier sweep boots every declared scheduler in a KVM VM, across
+a range of topologies, and checks three things against the real
+kernel: that each scheduler's BPF programs pass the kernel verifier
+(capturing per-program `verified_insns`), that the scheduler actually
+turns on — attaches as the active sched_ext scheduler — and that it
+dispatches an injected workload (a task makes forward progress after
+attach).
 
 ## Design
 
@@ -34,6 +36,9 @@ cargo ktstr verifier --kernel ../linux
 # Sweep across multiple kernels (each cell runs against its own).
 cargo ktstr verifier --kernel 6.14.2 --kernel 6.15.0
 
+# Sweep a single declared scheduler across topologies (skip the rest).
+cargo ktstr verifier --scheduler scx-ktstr
+
 # Print the raw verifier log without cycle collapse.
 cargo ktstr verifier --raw
 ```
@@ -52,21 +57,28 @@ binaries themselves.
 
 1. **Cell emission** — every test binary that links the
    ktstr test support and contains at least one
-   `declare_scheduler!` declaration emits a `verifier/<sched>/<kernel>: test`
-   listing for each (declared scheduler × kernel-list entry) pair —
-   ONE cell per pair, not one per topology. `verified_insns` is fixed
-   at BPF load and topology-independent, and the attach check needs
-   only one topology, so each cell runs on the smallest gauntlet
-   preset the scheduler's constraints accept. A scheduler whose
-   constraints accept no preset on this host emits no cell.
+   `declare_scheduler!` declaration emits a
+   `verifier/<sched>/<kernel>/<preset>: test` listing for each
+   (declared scheduler × kernel-list entry × accepted topology preset)
+   cell. The sweep runs each scheduler ACROSS topologies because two
+   things vary with topology: `verified_insns` (a scheduler that bakes
+   topology-derived config like `nr_cpus` into `.rodata` hands the
+   verifier different known constants, so it processes a different
+   instruction count per topology) and whether a scheduler attaches and
+   dispatches (a scheduler can attach on one topology and wedge on
+   another — odd LLC counts, wide CPU counts, SMT). Every cell boots in
+   no_perf_mode, so a
+   preset is emitted only when the scheduler's constraints accept it
+   under `accepts_no_perf_mode`. A scheduler whose constraints accept no
+   preset on this host emits no cell; `--scheduler <NAME>` restricts the
+   sweep to a single declared scheduler.
 
 2. **Per-cell dispatch** — nextest invokes the test binary once
-   per cell with `--exact verifier/<sched>/<kernel>`.
+   per cell with `--exact verifier/<sched>/<kernel>/<preset>`.
    The binary's `#[ctor]` intercepts the prefix, parses the cell
-   name into its two components, resolves the scheduler binary and
-   kernel directory, derives the per-scheduler topology (the smallest
-   preset the scheduler accepts), and boots a single VM dedicated to
-   that cell.
+   name into its three components, resolves the scheduler binary and
+   kernel directory, looks up the named gauntlet preset for its
+   topology, and boots a single VM dedicated to that cell.
 
 3. **Verifier collection** — inside the VM, the scheduler
    loads its BPF programs via `scx_ops_load!`; the real kernel
@@ -78,7 +90,7 @@ binaries themselves.
    markers — over the virtio-console bulk port when available,
    falling back to the COM2 console stream otherwise.
 
-4. **Attach check** — the guest init already runs a scheduler
+4. **Attach + dispatch check** — the guest init runs a scheduler
    attach gate on every boot: it confirms the scheduler process
    survived BPF load and that `/sys/kernel/sched_ext/state` reached
    `enabled`. The kernel sets `enabled` only after `ops.init`,
@@ -87,17 +99,28 @@ binaries themselves.
    scheduling — not merely that its BPF loaded. On failure the guest
    sends a `SchedulerDied` / `SchedulerNotAttached` lifecycle frame;
    the cell consumes that verdict and FAILs. The check is
-   positive-confirmation: a cell PASSes only when the guest reaches its
-   post-attach dispatch phase (a `PayloadStarting` frame), so a guest
-   that vanishes early — e.g. a kernel panic that reboots without
-   emitting any frame — also FAILs rather than passing by default. This
-   is scheduler-agnostic (kernel sysfs state), so it holds for every
-   declared scheduler.
+   positive-confirmation: attach is confirmed only when the guest
+   reaches its post-attach dispatch phase (a `PayloadStarting` frame),
+   so a guest that vanishes early — e.g. a kernel panic that reboots
+   without emitting any frame — FAILs rather than passing by default.
+   Then, because the verifier VM has no `#[ktstr_test]` body, Phase 5
+   injects a SpinWait workload sized to the guest's online CPUs and,
+   when a worker makes forward progress (proof the scheduler dispatched
+   a task onto a CPU), emits a `WorkloadDispatched` frame. A cell PASSes
+   only when BOTH frames arrive: a scheduler that attaches but never
+   dispatches a runnable task is a distinct, worse failure the attach
+   gate alone cannot catch. The probe workers run as SCHED_EXT, so the
+   BPF scheduler dispatches them under any switch mode (full or
+   `SCX_OPS_SWITCH_PARTIAL`); both checks are scheduler-agnostic (kernel
+   sysfs state + generic SCHED_EXT worker progress), so they hold for
+   every declared scheduler.
 
-5. **Rendering** — a per-program summary (with the attach status),
-   the verifier log with cycle collapse (or raw, with `--raw`), and,
-   after nextest returns, a scheduler × kernel PASS/FAIL summary
-   table.
+5. **Rendering** — a per-program summary (with the attach + dispatch
+   status), the verifier log with cycle collapse (or raw, with
+   `--raw`), and, after nextest returns, one `verified_insns` table per
+   declared scheduler (rows = kernel, cols = BPF program, cell = the
+   count across topologies) followed by a topology × scheduler PASS/FAIL
+   grid.
 
 Eevdf + KernelBuiltin scheduler variants have no userspace
 binary to load BPF programs from, so they are skipped at
@@ -110,16 +133,20 @@ a successful kernel-label lookup — i.e. under the
 defense-in-depth for a direct `--exact verifier/<eevdf>/...`
 invocation.
 
-## Matrix dimension + per-scheduler filter
+## Matrix dimensions + filters
 
-The verifier sweep matrix is driven by the operator's `--kernel`
-set, not by per-scheduler `declare_scheduler!` declarations. The
-dispatcher always exports `KTSTR_KERNEL_LIST`
-(`label1=path1;label2=path2;...`) to the nextest invocation —
-even with no `--kernel` flag it synthesizes a single entry from
-the auto-discovered kernel. The test binary's lister walks that
-list as the matrix dimension and emits one cell per (declared
-scheduler × kernel-list entry).
+The verifier sweep matrix has three dimensions: declared scheduler,
+kernel, and topology preset. The kernel axis is driven by the
+operator's `--kernel` set, not by per-scheduler `declare_scheduler!`
+declarations: the dispatcher always exports `KTSTR_KERNEL_LIST`
+(`label1=path1;label2=path2;...`) to the nextest invocation — even with
+no `--kernel` flag it synthesizes a single entry from the
+auto-discovered kernel. The topology axis is the set of gauntlet
+presets whose topology each scheduler's constraints accept under
+no_perf_mode. The test binary's lister walks these dimensions and emits
+one cell per (declared scheduler × kernel-list entry × accepted
+topology preset). `--scheduler <NAME>` narrows the scheduler axis to a
+single declared scheduler.
 
 Each scheduler's `declare_scheduler!` `kernels = [...]`
 declaration acts as a **per-scheduler filter** on the matrix:
@@ -144,8 +171,9 @@ declaration acts as a **per-scheduler filter** on the matrix:
 # Scheduler filter: 6.14.2 ∈ [6.14, 6.16] ✓
 #                   6.15.0 ∈ [6.14, 6.16] ✓
 #                   6.17.0 ∈ [6.14, 6.16] ✗ — rejected
-# Cells emitted: verifier/<sched>/kernel_6_14_2
-#                verifier/<sched>/kernel_6_15_0
+# Cells emitted (one per accepted topology preset, e.g. tiny-1llc):
+#                verifier/<sched>/kernel_6_14_2/<preset>
+#                verifier/<sched>/kernel_6_15_0/<preset>
 cargo ktstr verifier --kernel 6.14.2 --kernel 6.15.0 --kernel 6.17.0
 
 # No --kernel: dispatcher auto-discovers one kernel via the
@@ -176,6 +204,7 @@ An attach-status line, then a per-program summary line:
 
 ```text
   scheduler: attached (sched_ext enabled)
+  dispatch: confirmed (injected workload ran)
   ktstr_enqueue                              verified_insns=500
 ```
 
@@ -211,17 +240,33 @@ the `format_verifier_output` rendering branch.
 
 ### Summary tables
 
-After nextest returns, `cargo ktstr verifier` prints a
-scheduler × kernel PASS/FAIL matrix (one row per declared
-scheduler, one column per kernel; `-` where a scheduler's
-`kernels` filter excluded that kernel). `PASS` means the
-scheduler both verified and turned on; `FAIL` means it did not:
+After nextest returns, `cargo ktstr verifier` prints two views.
+
+First, one `verified_insns` table per declared scheduler: rows are
+kernel version, columns are BPF program, and each cell is that
+program's `verified_insns` summarized across the topologies that ran
+it — a single number when topology-flat, `lo..hi` when it varies, `-`
+when that program reported no stats on that kernel:
 
 ```text
-verifier summary: 2 PASS, 0 FAIL
- scheduler   linux-6.14
- scx_ktstr   PASS
- scx_other   PASS
+verifier verified_insns (per scheduler; rows: kernel, cols: BPF program, cell: range across topologies):
+
+scx_ktstr:
+ kernel         ktstr_dispatch  ktstr_enqueue
+ kernel_6_14_2  1200            500
+```
+
+Then a topology × scheduler PASS/FAIL grid (one row per topology, one
+column per scheduler — or per `scheduler @ kernel` when the sweep spans
+multiple kernels; `-` where a scheduler emitted no cell for that
+topology). ✅ means the scheduler verified, turned on, AND dispatched
+the injected workload; ❌ means it did not:
+
+```text
+verifier summary: 4 ✅  0 ❌
+ topology    scx_ktstr   scx_other
+ tiny-1llc   ✅          ✅
+ tiny-2llc   ✅          ✅
 ```
 
 ## Cycle collapse algorithm

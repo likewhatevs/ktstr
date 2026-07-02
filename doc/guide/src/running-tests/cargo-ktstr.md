@@ -563,34 +563,42 @@ Collect BPF verifier statistics for every scheduler declared via
 `declare_scheduler!` in the workspace's test binaries. Spawns
 `cargo nextest run -E 'test(/^verifier/) & !test(/^verifier::/)'` (the
 `verifier/...` cells only, not the verifier module's `verifier::tests::*`
-unit tests) and lets nextest fan out per (scheduler × kernel-list entry)
-cell — one cell per pair (not per topology; `verified_insns` is
-topology-independent), each on the smallest topology the scheduler's
-constraints accept. Each cell boots its own VM with performance mode
-disabled (its `verified_insns` count is perf-mode-independent, so cells
-take only a shared `LOCK_SH` LLC reservation and no longer starve each
-other on the LLC lock; a `performance_mode` peer's `LOCK_EX` can still
-defer a cell, resolved by nextest retry), loads the scheduler's BPF
-programs, reports per-program verified instruction counts from host-side
-memory introspection, and asserts the scheduler turns on (the guest
-attach gate confirms sched_ext `enabled`). A cell PASSes only when the
-scheduler both verifies AND attaches. After the run, a scheduler × kernel
-PASS/FAIL summary table is printed.
+unit tests) and lets nextest fan out per (scheduler × kernel-list entry ×
+accepted topology preset) cell — the sweep runs each scheduler ACROSS
+topologies, because whether it attaches and dispatches is
+topology-dependent (a scheduler can attach on one topology and wedge on
+another). Each cell boots its own VM on the topology named in the cell,
+with performance mode disabled (its `verified_insns` count is
+perf-mode-independent, so cells take only a shared `LOCK_SH` LLC
+reservation and no longer starve each other on the LLC lock; a
+`performance_mode` peer's `LOCK_EX` can still defer a cell, resolved by
+nextest retry), loads the scheduler's BPF programs, and reports
+per-program verified instruction counts from host-side memory
+introspection. A cell PASSes only when the scheduler verifies (BPF
+loads), attaches (the guest gate confirms sched_ext `enabled`), AND
+dispatches an injected SpinWait workload (the guest confirms a worker
+made forward progress after attach). After the run, one `verified_insns`
+table per scheduler (rows = kernel, cols = BPF program, cell = the count
+across topologies) and a topology × scheduler PASS/FAIL grid are
+printed.
 
 ```sh
 cargo ktstr verifier                              # auto-discover kernel
 cargo ktstr verifier --kernel ../linux            # pin to one kernel
 cargo ktstr verifier --kernel 6.14 --kernel 7.0   # multi-kernel sweep
+cargo ktstr verifier --scheduler scx-ktstr        # one scheduler across topologies
 cargo ktstr verifier --raw                        # raw verifier log
 ```
 
-There are no `--scheduler` / `--scheduler-bin` flags: the sweep
-discovers schedulers from the `KTSTR_SCHEDULERS` distributed
-slice populated by `declare_scheduler!`. To exclude a scheduler
-from the sweep, omit it from the test binary (or declare it with
-`SchedulerSpec::Eevdf` / `SchedulerSpec::KernelBuiltin` — both
-are skipped at cell-emission time because neither has a
-userspace binary to verify).
+The sweep discovers schedulers from the `KTSTR_SCHEDULERS`
+distributed slice populated by `declare_scheduler!`. `--scheduler
+<NAME>` restricts the sweep to a single declared scheduler (matched
+by its `declare_scheduler!` `name`) across topologies; omitted, every
+declared scheduler is swept. To exclude a scheduler entirely, omit it
+from the test binary (or declare it with `SchedulerSpec::Eevdf` /
+`SchedulerSpec::KernelBuiltin` — both are skipped at cell-emission
+time because neither has a userspace binary to verify, so naming one
+with `--scheduler` matches no cell).
 
 `--kernel` is repeatable; cargo-ktstr always exports
 `KTSTR_KERNEL_LIST` to the nextest invocation (synthesizing a
@@ -598,7 +606,7 @@ single entry from auto-discovery when no `--kernel` is passed).
 Each scheduler's `kernels = [...]` declaration acts as a
 per-scheduler filter on the operator-supplied set; an empty (or
 omitted) `kernels` field accepts every entry. See [BPF Verifier:
-Matrix dimension + per-scheduler filter](verifier.md#matrix-dimension--per-scheduler-filter)
+Matrix dimensions + filters](verifier.md#matrix-dimensions--filters)
 for the full filter contract.
 
 `--raw` exports `KTSTR_VERIFIER_RAW=1`; the cell handler reads
@@ -611,6 +619,7 @@ for the rendering details.
 |------|-------------|
 | `--kernel ID` (repeatable) | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#REF`). Raw image files (`bzImage`/`Image`) are NOT accepted — the verifier needs the cached `vmlinux` and kconfig fragment alongside the image. Source directories auto-build; version strings auto-download on cache miss. When absent, resolves via cache then filesystem, falling back to auto-download. Raw images are accepted only on `cargo ktstr shell`. |
 | `--raw` | Print raw verifier output without cycle collapse. |
+| `--scheduler NAME` | Restrict the sweep to a single declared scheduler (its `declare_scheduler!` `name`) across topologies. Omitted, every declared scheduler is swept. A name matching no declared BPF scheduler fails loud with an empty result set. Sets `KTSTR_VERIFIER_SCHEDULER` for the inner `cargo nextest run`. |
 | `--profile NAME` | Cargo BUILD profile for the scheduler-under-test (see `cargo ktstr test --profile`). Omitted, the scheduler builds `release`. Sets `KTSTR_SCHEDULER_PROFILE` for the inner `cargo nextest run`. |
 | `--nextest-profile NAME` | Nextest TEST profile forwarded to the inner `cargo nextest run` as `--profile <NAME>` (see `cargo ktstr test --nextest-profile`). |
 

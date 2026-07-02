@@ -944,9 +944,10 @@ pub fn send_sched_log(buf: &[u8]) {
 /// per-VM lifecycle bucket instead of substring-matching on COM2
 /// output.
 ///
-/// Required: phase wire value MUST be in 1..=4. The 0 byte is
-/// reserved as the host-side "unknown" sentinel and is rejected
-/// by [`LifecyclePhase::from_wire`].
+/// Required: `phase` is a recognised [`LifecyclePhase`] discriminant
+/// (currently wire values 1..=5). The 0 byte is reserved as the
+/// host-side "unknown" sentinel and is rejected by
+/// [`LifecyclePhase::from_wire`].
 pub fn send_lifecycle(phase: LifecyclePhase, reason: &str) {
     let mut buf = Vec::with_capacity(1 + reason.len());
     buf.push(phase.wire_value());
