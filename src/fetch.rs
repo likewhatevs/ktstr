@@ -1402,16 +1402,16 @@ pub fn is_major_minor_prefix(s: &str) -> bool {
 /// E.g., "6.12" → "6.12.81", "6" → "6.19.12" (highest 6.x.y).
 ///
 /// Scans all monikers in releases.json except linux-next. If no
-/// match is found (EOL series, absent from releases.json), parses
-/// cdn.kernel.org's `sha256sums.asc` manifest to find the highest
-/// patch — see `latest_patch_from_sha256sums`.
+/// match is found (EOL series, absent from releases.json), resolves
+/// the highest patch from the linux-stable tree's git tags — see
+/// `latest_patch_from_git_tags`.
 ///
 /// When `client` is the process-wide [`shared_client`] singleton,
 /// routes through `RELEASES_CACHE`; other clients bypass the
 /// cache via pointer-equality and exercise `fetch_releases`
 /// directly — see `cached_releases_with` for details. Cache
-/// scope is releases.json only; the EOL-series `sha256sums.asc`
-/// fallback in `latest_patch_from_sha256sums` always hits the network.
+/// scope is releases.json only; the EOL-series git-tag fallback in
+/// `latest_patch_from_git_tags` always hits the network.
 ///
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
@@ -1445,73 +1445,80 @@ pub fn fetch_version_for_prefix(client: &Client, prefix: &str, cli_label: &str) 
 
     eprintln!(
         "{cli_label}: {prefix}.x not in releases.json (EOL series); \
-         resolving via cdn.kernel.org sha256sums.asc"
+         resolving latest patch via git.kernel.org tags"
     );
-    latest_patch_from_sha256sums(client, prefix, cli_label)
+    latest_patch_from_git_tags(STABLE_TREE_URL, prefix, cli_label)
 }
 
-/// Find the latest patch version for an EOL series (absent from
-/// releases.json) by parsing cdn.kernel.org's `sha256sums.asc`.
+/// Resolve an EOL series' latest patch by ls-remote-ing the
+/// linux-stable tree's `refs/tags/v{prefix}.{patch}` tags and taking
+/// the highest patch.
 ///
-/// The `v{major}.x/` directory index is NOT a viable source —
-/// cdn.kernel.org serves no directory listing (a GET 404s, and HEAD
-/// is not a dependable existence probe on the CDN). `sha256sums.asc`,
-/// by contrast, is a real served file: a historical manifest with one
-/// `<64-hex-digest>  <filename>` line per released artifact, covering
-/// every `linux-{major}.{minor}.{patch}.tar.xz` of the major series
-/// including EOL series. Parse it for the highest patch of `prefix`.
-///
-/// The resolved version's `.tar.xz` may itself be pruned from cdn
-/// (only each maintained series' latest tarball is retained), so the
-/// download path falls back to a git-tag clone when the tarball 404s
-/// — see [`download_tarball`] and [`TarballNotFound`].
-fn latest_patch_from_sha256sums(client: &Client, prefix: &str, cli_label: &str) -> Result<String> {
-    let major = major_version(prefix)?;
-    let url = sha256sums_url(major);
-    eprintln!("{cli_label}: resolving {prefix}.x from {url}");
-    let manifest = fetch_sha256sums_from_url(client, &url)?;
-
-    match latest_patch_in_manifest(&manifest, prefix) {
+/// This is the RELIABLE EOL-resolution source. cdn.kernel.org is not
+/// usable here: its `v{major}.x/` directory index 404s, and its
+/// `sha256sums.asc` is served inconsistently per CDN edge (200 from
+/// some nodes, 404 from others — the 404 nodes break CI runners while
+/// the tarball fetch on those same nodes still succeeds). The stable
+/// tree's `vX.Y.Z` tags ARE the authoritative release list, reached
+/// over the SAME git.kernel.org host the EOL git-tag clone already
+/// uses (see [`git_clone_tag`]) — so resolution and download share one
+/// dependency, with no cdn involvement.
+fn latest_patch_from_git_tags(url: &str, prefix: &str, cli_label: &str) -> Result<String> {
+    eprintln!("{cli_label}: resolving {prefix}.x release tags via {url}");
+    let refs = ls_remote_refs(url)
+        .with_context(|| format!("ls-remote {url} for {prefix}.x release tags"))?;
+    match max_tag_patch(refs.iter().map(ref_full_name), prefix) {
         Some(patch) => {
             let version = format!("{prefix}.{patch}");
-            eprintln!("{cli_label}: latest {prefix}.x kernel (from sha256sums.asc): {version}");
+            eprintln!("{cli_label}: latest {prefix}.x kernel (from git tags): {version}");
             Ok(version)
         }
-        None => anyhow::bail!("no linux-{prefix}.* tarball listed in {url}"),
+        None => anyhow::bail!("no v{prefix}.* release tags found at {url}"),
     }
 }
 
-/// Highest patch level of `prefix` named in a `sha256sums.asc` body.
+/// The advertised full ref name (`refs/...`), as raw bytes, of a
+/// protocol handshake ref.
+fn ref_full_name(r: &gix::protocol::handshake::Ref) -> &[u8] {
+    use gix::protocol::handshake::Ref::{Direct, Peeled, Symbolic, Unborn};
+    match r {
+        Peeled { full_ref_name, .. }
+        | Direct { full_ref_name, .. }
+        | Symbolic { full_ref_name, .. }
+        | Unborn { full_ref_name, .. } => full_ref_name.as_ref(),
+    }
+}
+
+/// Highest `{patch}` among `refs/tags/v{prefix}.{patch}` ref names.
 ///
-/// Scans each `<64-hex-digest>  <filename>` line for
-/// `linux-{prefix}.{patch}.tar.xz` and returns the greatest `{patch}`.
-/// Pure (no network) so it is unit-testable against a synthetic
-/// manifest — mirrors [`parse_sha256_for_file`].
+/// gix folds an annotated tag's peeled entry into a single
+/// `Ref::Peeled` whose `full_ref_name` is the BASE name — no `^{}`
+/// suffix — and a lightweight tag arrives as a `Ref::Direct` with the
+/// base name too, so every tag advertises its base
+/// `refs/tags/v{prefix}.{patch}` name for the needle to match. The
+/// `^{}` strip below is therefore a defensive no-op on real gix output
+/// (it only affects a raw wire ref name gix never emits; the base
+/// entry supplies the patch regardless). Pure (no network) so it is
+/// unit-testable with synthetic ref names.
 ///
-/// The trailing `.` in the `linux-{prefix}.` needle prevents a `6.14`
-/// prefix from matching a `6.140` series (`linux-6.140.` contains no
-/// `linux-6.14.` substring). Only `.tar.xz` names count — `.tar.sign`
-/// / `.tar.gz` / patch lines lack the `.tar.xz` suffix after the patch
-/// number and are skipped.
-fn latest_patch_in_manifest(manifest: &str, prefix: &str) -> Option<u32> {
-    let needle = format!("linux-{prefix}.");
-    let mut best_patch: Option<u32> = None;
-    for line in manifest.lines() {
-        let Some(pos) = line.find(&needle) else {
+/// The trailing `.` in the `refs/tags/v{prefix}.` needle keeps a
+/// `6.14` prefix from matching a `6.140` series, and the numeric-only
+/// patch tail rejects `-rc` and other non-release tags.
+fn max_tag_patch<'a>(ref_names: impl Iterator<Item = &'a [u8]>, prefix: &str) -> Option<u32> {
+    let needle = format!("refs/tags/v{prefix}.");
+    let mut best: Option<u32> = None;
+    for name in ref_names {
+        let Some(rest) = name.strip_prefix(needle.as_bytes()) else {
             continue;
         };
-        let after = &line[pos + needle.len()..];
-        let Some(dot) = after.find(".tar.xz") else {
-            continue;
-        };
-        let patch_str = &after[..dot];
-        if let Ok(patch) = patch_str.parse::<u32>()
-            && best_patch.is_none_or(|b| patch > b)
+        let rest = rest.strip_suffix(b"^{}").unwrap_or(rest);
+        if let Ok(s) = std::str::from_utf8(rest)
+            && let Ok(patch) = s.parse::<u32>()
         {
-            best_patch = Some(patch);
+            best = Some(best.map_or(patch, |b| b.max(patch)));
         }
     }
-    best_patch
+    best
 }
 
 /// Cache key for a git-cloned kernel: the raw user ref verbatim, the
@@ -1616,15 +1623,31 @@ fn is_full_sha(git_ref: &str) -> bool {
 /// handshake on that reject path and is ready for a future sha-capable
 /// clone. It trusts the hex verbatim (no remote validation) — harmless
 /// while sha-clone is rejected, since an unbuildable sha has no cache
-/// entry. The ad-hoc bare repo (`gix::init` on a tempdir) carries no
-/// working tree and fetches no pack; `ref_map` lists every advertised ref
-/// (remote-side ref-prefix filtering is disabled — see the body) without
-/// fetching a pack. See `match_ref_commit_hash` for the rare branch/tag
-/// same-name caveat where this guess and the clone diverge.
+/// entry. The ref advertisement is fetched by `ls_remote_refs` (no
+/// pack). See `match_ref_commit_hash` for the rare branch/tag same-name
+/// caveat where this guess and the clone diverge.
 pub fn ls_remote_commit_hash(url: &str, git_ref: &str) -> Option<String> {
     if is_full_sha(git_ref) {
         return Some(git_ref.to_ascii_lowercase());
     }
+    match_ref_commit_hash(&ls_remote_refs(url)?, git_ref)
+}
+
+/// ls-remote `url` and return EVERY advertised ref WITHOUT fetching a
+/// pack. Best-effort: `None` on any failure (network, auth). Shared by
+/// [`ls_remote_commit_hash`] (resolve one ref → commit) and
+/// [`latest_patch_from_git_tags`] (highest `v{prefix}.{patch}` tag).
+///
+/// The ad-hoc bare repo (`gix::init` on a tempdir) carries no working
+/// tree and fetches no pack. Remote-side ref-prefix filtering is
+/// DISABLED: gix's default (`prefix_from_spec_as_filter_on_remote =
+/// true`) derives protocol-v2 `ls-refs` `ref-prefix` filters from the
+/// remote's fetch refspecs; an anonymous `remote_at` has none, and
+/// `fetch_tags = Included` injects only `refs/tags/*`, so the server
+/// would return TAGS ONLY and `refs/heads/*` would never arrive.
+/// Disabling the filter returns all refs, so a branch, tag, or HEAD
+/// all resolve.
+fn ls_remote_refs(url: &str) -> Option<Vec<gix::protocol::handshake::Ref>> {
     let tmp = tempfile::TempDir::new().ok()?;
     let repo = gix::init(tmp.path()).ok()?;
     let remote = repo.remote_at(url).ok()?;
@@ -1633,22 +1656,12 @@ pub fn ls_remote_commit_hash(url: &str, git_ref: &str) -> Option<String> {
         .ref_map(
             gix::progress::Discard,
             gix::remote::ref_map::Options {
-                // ls-remote semantics: list EVERY advertised ref. gix's
-                // default (`prefix_from_spec_as_filter_on_remote = true`)
-                // derives protocol-v2 `ls-refs` `ref-prefix` filters from the
-                // remote's fetch refspecs; an anonymous `remote_at` has none,
-                // and `fetch_tags = Included` injects only `refs/tags/*`, so
-                // the server returns TAGS ONLY and `refs/heads/*` never
-                // arrive — a branch `git_ref` then resolves to `None` and the
-                // clone-skip never fires (every run re-clones). Disabling the
-                // remote-side filter returns all refs, so a branch, tag, or
-                // HEAD `git_ref` all resolve.
                 prefix_from_spec_as_filter_on_remote: false,
                 ..Default::default()
             },
         )
         .ok()?;
-    match_ref_commit_hash(&refmap.remote_refs, git_ref)
+    Some(refmap.remote_refs)
 }
 
 /// Shallow-clone a git repository at a BRANCH ref.

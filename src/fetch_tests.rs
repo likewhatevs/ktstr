@@ -855,7 +855,7 @@ fn cached_releases_routing_singleton_path() {
 ///   for a sub-2-segment input (the `else` arm).
 /// - `fetch_version_for_prefix` selects the highest in-cache
 ///   patch for a known prefix WITHOUT reaching the
-///   `latest_patch_from_sha256sums` network fallback (the `6.14`
+///   `latest_patch_from_git_tags` network fallback (the `6.14`
 ///   series is present in the cache, so the `best.is_some()` early
 ///   return fires).
 #[test]
@@ -964,9 +964,9 @@ fn series_resolution_routing_through_cache() {
 
     // The `6.14` series is in the cache, so the selection loop
     // finds `6.14.2` and returns via the `best.is_some()` arm —
-    // it must NOT fall through to the latest_patch_from_sha256sums
+    // it must NOT fall through to the latest_patch_from_git_tags
     // network fallback. A regression that skipped the cache hit
-    // would attempt a real cdn.kernel.org sha256sums.asc GET.
+    // would attempt a real git.kernel.org ls-remote.
     let resolved = super::fetch_version_for_prefix(client, "6.14", "test")
         .expect("present series must resolve from cache without network");
     assert_eq!(
@@ -2091,63 +2091,66 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  linux-6.14.3.t
     );
 }
 
-// -- latest_patch_in_manifest --
+// -- max_tag_patch --
 
-/// `latest_patch_in_manifest` returns the numerically-highest patch
-/// of the prefix from a sha256sums.asc body — the EOL-series
-/// resolution path (releases.json omits EOL series, so 6.14 must be
-/// recovered from the manifest). Entries are interleaved and out of
-/// order to prove the max loop, not line order, decides.
+/// `max_tag_patch` returns the numerically-highest patch among
+/// `refs/tags/v{prefix}.{patch}` ref names — the EOL-series resolution
+/// path (releases.json omits EOL series, so 6.14 is recovered from the
+/// stable tree's git tags via ls-remote, cdn-independent). Refs are
+/// interleaved + out of order to prove the max loop (not order)
+/// decides. gix folds an annotated tag into a single base-named
+/// `Ref::Peeled`, so `refs/tags/v6.14.11` is the real advertised
+/// shape; the extra `v6.14.11^{}` entry is a DEFENSIVE raw-wire shape
+/// gix never emits (it exercises the `^{}` strip) and must still
+/// resolve to patch 11 via the base entry.
 #[test]
-fn latest_patch_in_manifest_returns_highest_patch() {
-    let manifest = "\
------BEGIN PGP SIGNED MESSAGE-----
-Hash: SHA256
-
-aaaa  linux-6.14.1.tar.xz
-bbbb  linux-6.14.11.tar.xz
-cccc  linux-6.14.2.tar.xz
-dddd  linux-6.12.94.tar.xz
------BEGIN PGP SIGNATURE-----
-";
+fn max_tag_patch_returns_highest_patch() {
+    let refs: &[&[u8]] = &[
+        b"refs/tags/v6.14.1",
+        b"refs/tags/v6.14.11",
+        b"refs/tags/v6.14.11^{}",
+        b"refs/tags/v6.14.2",
+        b"refs/tags/v6.12.94",
+        b"refs/heads/master",
+    ];
     assert_eq!(
-        super::latest_patch_in_manifest(manifest, "6.14"),
+        super::max_tag_patch(refs.iter().copied(), "6.14"),
         Some(11),
         "must select the numerically-highest 6.14 patch (11), not the \
              lexically-highest (2) nor the last-listed",
     );
 }
 
-/// The `linux-{prefix}.` needle's trailing dot keeps a `6.1` prefix
-/// from matching the `6.14` / `6.12` series, and only `.tar.xz`
-/// artifacts count (`.tar.gz` / `.tar.sign` / patch files lack the
-/// `.tar.xz` suffix after the patch number).
+/// The `refs/tags/v{prefix}.` needle's trailing dot keeps a `6.1`
+/// prefix from matching the `6.14` / `6.12` series, and a non-numeric
+/// patch tail (an `-rc` pre-release tag) is rejected.
 #[test]
-fn latest_patch_in_manifest_boundary_and_suffix() {
-    let manifest = "\
-aaaa  linux-6.14.11.tar.xz
-bbbb  linux-6.12.94.tar.xz
-cccc  linux-6.1.140.tar.xz
-dddd  linux-6.1.99.tar.gz
-eeee  linux-6.1.50.tar.xz
-";
+fn max_tag_patch_boundary_and_rc() {
+    let refs: &[&[u8]] = &[
+        b"refs/tags/v6.14.11",
+        b"refs/tags/v6.12.94",
+        b"refs/tags/v6.1.140",
+        b"refs/tags/v6.1.99-rc1",
+        b"refs/tags/v6.1.50",
+    ];
     assert_eq!(
-        super::latest_patch_in_manifest(manifest, "6.1"),
+        super::max_tag_patch(refs.iter().copied(), "6.1"),
         Some(140),
-        "prefix 6.1 must exclude 6.14/6.12 (dot boundary) and the \
-             .tar.gz entry (only .tar.xz counts), leaving max(140, 50)",
+        "prefix 6.1 must exclude 6.14/6.12 (dot boundary) and the -rc \
+             tag (non-numeric patch), leaving max(140, 50)",
     );
 }
 
-/// A prefix with no `.tar.xz` entry returns None — the caller turns
-/// that into a hard "no tarball listed" error.
+/// A prefix with no matching release tag returns None — the caller
+/// turns that into a hard "no release tags" error. A same-series
+/// BRANCH (`refs/heads/linux-6.14.y`) must NOT be mistaken for a tag.
 #[test]
-fn latest_patch_in_manifest_absent_prefix_returns_none() {
-    let manifest = "aaaa  linux-6.12.94.tar.xz\n";
+fn max_tag_patch_absent_prefix_returns_none() {
+    let refs: &[&[u8]] = &[b"refs/tags/v6.12.94", b"refs/heads/linux-6.14.y"];
     assert_eq!(
-        super::latest_patch_in_manifest(manifest, "6.14"),
+        super::max_tag_patch(refs.iter().copied(), "6.14"),
         None,
-        "a prefix with no matching .tar.xz entry must return None",
+        "no v6.14.* release TAG -> None; the 6.14.y branch is not a tag",
     );
 }
 
@@ -2383,7 +2386,7 @@ fn mock_tarball(status: usize, body: &str) -> (mockito::ServerGuard, String, moc
 /// real `download_stable_tarball_from_url` status gate against a
 /// localhost mock (`skip_sha256 = true`, so no sha256sums.asc fetch is
 /// attempted). Without this the 404→marker path is unproven — the pure
-/// `latest_patch_in_manifest` tests say nothing about the routing.
+/// `max_tag_patch` tests say nothing about the tarball-download routing.
 #[test]
 #[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
 fn download_stable_tarball_404_returns_tarball_not_found_marker() {
@@ -3227,5 +3230,29 @@ fn git_clone_tag_shallow_clones_stable_tag() {
             crate::cache::KernelSource::Git { .. }
         ),
         "git_clone_tag must record a Git KernelSource",
+    );
+}
+
+/// `latest_patch_from_git_tags` resolves an EOL series to its highest
+/// patch via a real git.kernel.org ls-remote of the linux-stable tree
+/// — the cdn-independent resolution the CI runners need (cdn serves
+/// `sha256sums.asc` as 404 on some edges even where its tarballs 200).
+/// Network (ls-remote only, no pack fetch), so #[ignore]; this is the
+/// empirical guard for the resolution the pure `max_tag_patch` tests
+/// cannot provide (they don't touch the network).
+#[test]
+#[ignore = "network: ls-remote git.kernel.org linux-stable for v6.14.* tags; run with --run-ignored on a connected host"]
+fn latest_patch_from_git_tags_resolves_eol_series() {
+    let v = super::latest_patch_from_git_tags(
+        "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git",
+        "6.14",
+        "test",
+    )
+    .expect("must resolve the latest 6.14.x from stable-tree tags");
+    // 6.14 is EOL and frozen at 6.14.11 (no further releases), so the
+    // resolver must return exactly that — not a lower patch, not an -rc.
+    assert_eq!(
+        v, "6.14.11",
+        "EOL 6.14 must resolve to its final patch 6.14.11 via git tags",
     );
 }
