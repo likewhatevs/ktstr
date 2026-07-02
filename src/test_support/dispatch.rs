@@ -1991,7 +1991,10 @@ fn list_verifier_cells_all() {
 /// `--exact verifier/<eevdf>/...` invocation outside nextest
 /// (the only path that bypasses the emission-time filter); in
 /// that case they emit a `SKIP` banner + exit 0.
-fn run_verifier_cell_inner(full_name: &str) -> i32 {
+fn run_verifier_cell_inner(
+    full_name: &str,
+    out_stats: &mut Vec<crate::verifier::ProgStats>,
+) -> i32 {
     use super::SchedulerSpec;
 
     let rest = match full_name.strip_prefix("verifier/") {
@@ -2164,13 +2167,19 @@ fn run_verifier_cell_inner(full_name: &str) -> i32 {
             // attach → dispatch, root cause first) and never keys on the
             // guest exit code, which is 1 even on the verifier success
             // path (no #[ktstr_test] body to dispatch).
-            match result.cell_verdict() {
+            let code = match result.cell_verdict() {
                 Ok(()) => 0,
                 Err(reason) => {
                     eprintln!("ktstr verifier: cell {full_name} FAILED: {reason}");
                     1
                 }
-            }
+            };
+            // Hand the per-program verified_insns out to the record writer
+            // so the dispatcher can render the instruction-count tables.
+            // Only this arm has stats; every earlier return (skip, kernel
+            // resolution error, build failure) leaves out_stats empty.
+            *out_stats = result.stats;
+            code
         }
         Err(e) => {
             eprintln!("ktstr verifier: cell {full_name} FAILED: {e:#}");
@@ -2189,9 +2198,15 @@ fn run_verifier_cell_inner(full_name: &str) -> i32 {
 /// overwrites the cell's own record (deterministic filename), so the
 /// final attempt's outcome is the one that lands in the table.
 fn run_verifier_cell(full_name: &str) -> i32 {
-    let code = run_verifier_cell_inner(full_name);
+    let mut stats = Vec::new();
+    let code = run_verifier_cell_inner(full_name, &mut stats);
     if let Some(dir) = std::env::var_os(crate::KTSTR_VERIFIER_RESULT_DIR_ENV) {
-        crate::verifier::write_cell_record(std::path::Path::new(&dir), full_name, code == 0);
+        crate::verifier::write_cell_record(
+            std::path::Path::new(&dir),
+            full_name,
+            code == 0,
+            &stats,
+        );
     }
     code
 }

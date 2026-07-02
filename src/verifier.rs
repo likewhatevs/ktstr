@@ -120,6 +120,7 @@ pub struct VerifierStats {
 }
 
 /// Per-program verifier statistics collected from a VM run.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProgStats {
     /// Program name as registered with the kernel.
     pub name: String,
@@ -1036,6 +1037,14 @@ pub struct VerifierCellRecord {
     pub topology: String,
     /// Whether the cell passed (exit 0 from the cell handler).
     pub passed: bool,
+    /// Per-program stats (program name + its `verified_insns` count)
+    /// captured for this cell, copied from the VM run's
+    /// [`VerifierVmResult::stats`]. Empty when the cell failed before
+    /// producing stats. Drives the per-scheduler `verified_insns` tables
+    /// ([`render_instruction_count_tables`], rows = kernel, cols = BPF
+    /// program, cell = the count summarized across topologies) that the
+    /// dispatcher prints before the PASS/FAIL grid.
+    pub stats: Vec<ProgStats>,
 }
 
 /// Map a cell's full name to a filesystem-safe record filename: every
@@ -1064,7 +1073,12 @@ fn cell_record_filename(full_name: &str) -> String {
 /// `test_support::dispatch` (same crate); the reader side
 /// ([`read_cell_records`] / [`render_result_table`]) is `pub` for the
 /// `cargo-ktstr` binary crate.
-pub(crate) fn write_cell_record(dir: &std::path::Path, full_name: &str, passed: bool) {
+pub(crate) fn write_cell_record(
+    dir: &std::path::Path,
+    full_name: &str,
+    passed: bool,
+    stats: &[ProgStats],
+) {
     let Some(rest) = full_name.strip_prefix("verifier/") else {
         return;
     };
@@ -1077,6 +1091,7 @@ pub(crate) fn write_cell_record(dir: &std::path::Path, full_name: &str, passed: 
         kernel: parts[1].to_string(),
         topology: parts[2].to_string(),
         passed,
+        stats: stats.to_vec(),
     };
     let path = dir.join(cell_record_filename(full_name));
     match serde_json::to_vec(&record) {
@@ -1110,6 +1125,26 @@ pub fn read_cell_records(dir: &std::path::Path) -> Vec<VerifierCellRecord> {
         .filter_map(|e| std::fs::read(e.path()).ok())
         .filter_map(|bytes| serde_json::from_slice::<VerifierCellRecord>(&bytes).ok())
         .collect()
+}
+
+/// Column labeling for [`render_result_table`]'s PASS/FAIL grid: with a
+/// single kernel, label a column by its scheduler alone; with multiple
+/// kernels, disambiguate as `scheduler @ kernel`. Only that renderer
+/// uses this; [`render_instruction_count_tables`] labels its columns by
+/// BPF-program name and its rows by kernel version, so it does not share
+/// this rule.
+fn verifier_col_label(
+    cols: &std::collections::BTreeSet<(String, String)>,
+) -> impl Fn(&str, &str) -> String {
+    use std::collections::BTreeSet;
+    let single_kernel = cols.iter().map(|(_, k)| k).collect::<BTreeSet<_>>().len() == 1;
+    move |sched: &str, kernel: &str| {
+        if single_kernel {
+            sched.to_string()
+        } else {
+            format!("{sched} @ {kernel}")
+        }
+    }
 }
 
 /// Render the per-cell records into a summary table: one row per topology
@@ -1146,14 +1181,7 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
             n_fail += 1;
         }
     }
-    let single_kernel = cols.iter().map(|(_, k)| k).collect::<BTreeSet<_>>().len() == 1;
-    let col_label = |sched: &str, kernel: &str| -> String {
-        if single_kernel {
-            sched.to_string()
-        } else {
-            format!("{sched} @ {kernel}")
-        }
-    };
+    let col_label = verifier_col_label(&cols);
 
     let mut table = crate::cli::new_table();
     let mut header: Vec<String> = vec!["topology".to_string()];
@@ -1178,6 +1206,88 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
     ))
 }
 
+/// Render one `verified_insns` table per declared scheduler. Within each
+/// scheduler's section: rows = kernel version, columns = BPF program, and
+/// each cell is that program's `verified_insns` for the (scheduler,
+/// kernel) summarized ACROSS the topologies that ran it — a single number
+/// when topology-invariant, `lo..hi` when it varies (`-` when that program
+/// reported no stats on that kernel).
+///
+/// `verified_insns` is the verifier's PROCESSED-instruction count
+/// (`env->insn_processed`) — fixed per load, but NOT topology-invariant
+/// (a scheduler whose verification path depends on topology-derived
+/// `.rodata`, e.g. `nr_cpus`, processes a different count per topology).
+/// So topology is folded into the cell as a range rather than shown as its
+/// own (usually all-identical) axis; the axes it genuinely varies on — BPF
+/// program (x) and kernel version (y) — are the table axes, sectioned per
+/// declared scheduler. Identical-binary declarations are sectioned
+/// separately on purpose (they are run separately). Returns `None` when no
+/// record carries any per-program stats (the caller prints nothing).
+///
+/// Schedulers, kernels, and programs are BTree-sorted so the same run
+/// renders the same output (shell-pipeline stable). The range drops which
+/// topology produced which count; a per-topology breakdown is a separate
+/// detailed view, not this summary.
+pub fn render_instruction_count_tables(records: &[VerifierCellRecord]) -> Option<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    // scheduler -> kernel -> program -> (min, max) verified_insns across
+    // the topologies that ran it. Topology is folded into the (min, max)
+    // range: a flat scheduler has min == max (one number), a
+    // topology-sensitive one has min < max (`lo..hi`).
+    let mut by_sched: BTreeMap<String, BTreeMap<String, BTreeMap<String, (u32, u32)>>> =
+        BTreeMap::new();
+    // scheduler -> the union of program names it reported (the columns).
+    let mut sched_progs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for r in records {
+        for s in &r.stats {
+            let span = by_sched
+                .entry(r.scheduler.clone())
+                .or_default()
+                .entry(r.kernel.clone())
+                .or_default()
+                .entry(s.name.clone())
+                .or_insert((s.verified_insns, s.verified_insns));
+            span.0 = span.0.min(s.verified_insns);
+            span.1 = span.1.max(s.verified_insns);
+            sched_progs
+                .entry(r.scheduler.clone())
+                .or_default()
+                .insert(s.name.clone());
+        }
+    }
+    if by_sched.is_empty() {
+        return None;
+    }
+
+    let mut out = String::from(
+        "\nverifier verified_insns (per scheduler; rows: kernel, cols: BPF program, \
+         cell: range across topologies):\n",
+    );
+    for (sched, kernels) in &by_sched {
+        let progs = &sched_progs[sched];
+        let mut table = crate::cli::new_table();
+        let mut header: Vec<String> = vec!["kernel".to_string()];
+        for p in progs {
+            header.push(p.clone());
+        }
+        table.set_header(header);
+        for (kernel, prog_map) in kernels {
+            let mut line: Vec<String> = vec![kernel.clone()];
+            for p in progs {
+                let text = match prog_map.get(p) {
+                    Some((lo, hi)) if lo == hi => lo.to_string(),
+                    Some((lo, hi)) => format!("{lo}..{hi}"),
+                    None => "-".to_string(),
+                };
+                line.push(text);
+            }
+            table.add_row(line);
+        }
+        out.push_str(&format!("\n{sched}:\n{table}\n"));
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1196,12 +1306,24 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mk temp dir");
         // Malformed: no verifier/ prefix, and a 2-segment name (no
         // <preset> after the kernel) — both skipped.
-        write_cell_record(&dir, "not_a_cell", true);
-        write_cell_record(&dir, "verifier/only/two", true);
+        write_cell_record(&dir, "not_a_cell", true, &[]);
+        write_cell_record(&dir, "verifier/only/two", true, &[]);
         // Well-formed cell: fail, then a retry passes -> overwrites.
         let name = "verifier/scx_a/kernel_6_14/tiny-1llc";
-        write_cell_record(&dir, name, false);
-        write_cell_record(&dir, name, true);
+        write_cell_record(&dir, name, false, &[]);
+        // The retry passes and carries per-program verified_insns, so the
+        // final record has both the PASS outcome and the stats.
+        let stats = [
+            ProgStats {
+                name: "ktstr_dispatch".into(),
+                verified_insns: 321,
+            },
+            ProgStats {
+                name: "ktstr_enqueue".into(),
+                verified_insns: 123,
+            },
+        ];
+        write_cell_record(&dir, name, true, &stats);
         let recs = read_cell_records(&dir);
         assert_eq!(
             recs.len(),
@@ -1215,6 +1337,9 @@ mod tests {
             recs[0].passed,
             "final retry outcome (PASS) wins over the earlier FAIL"
         );
+        // Per-program verified_insns survive the JSON roundtrip and reflect
+        // the final (retry) write, not the earlier stat-less fail.
+        assert_eq!(recs[0].stats, stats, "stats roundtrip via serde");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1229,12 +1354,14 @@ mod tests {
                 kernel: "kernel_6_14".into(),
                 topology: "tiny-1llc".into(),
                 passed: true,
+                stats: vec![],
             },
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_14".into(),
                 topology: "large-4llc".into(),
                 passed: false,
+                stats: vec![],
             },
         ];
         let out = render_result_table(&recs).expect("non-empty records -> Some");
@@ -1281,12 +1408,14 @@ mod tests {
                 kernel: "kernel_6_14".into(),
                 topology: "tiny-1llc".into(),
                 passed: true,
+                stats: vec![],
             },
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_15".into(),
                 topology: "smt-2llc".into(),
                 passed: true,
+                stats: vec![],
             },
         ];
         let out = render_result_table(&recs).expect("Some");
@@ -1301,6 +1430,139 @@ mod tests {
             "a (sched,kernel) absent for a topology renders '-': {out}"
         );
         assert!(out.contains("verifier summary: 2 ✅  0 ❌"), "tally: {out}");
+    }
+
+    /// Per-scheduler verified_insns tables: one section per declared
+    /// scheduler; within it rows = kernel version, columns = BPF program,
+    /// each cell that program's verified_insns across the topologies that
+    /// ran it — a single number when topology-invariant, `lo..hi` when it
+    /// varies. A (kernel, program) that reported no stats shows `-`; an
+    /// empty record set renders nothing.
+    #[test]
+    fn instruction_count_tables_per_scheduler_kernel_program_range() {
+        let recs = vec![
+            // scx_a / kernel_6_14 on two topologies with IDENTICAL counts
+            // -> the cell collapses to a single number (topology-flat).
+            VerifierCellRecord {
+                scheduler: "scx_a".into(),
+                kernel: "kernel_6_14".into(),
+                topology: "tiny".into(),
+                passed: true,
+                stats: vec![
+                    ProgStats {
+                        name: "ktstr_dispatch".into(),
+                        verified_insns: 128,
+                    },
+                    ProgStats {
+                        name: "ktstr_enqueue".into(),
+                        verified_insns: 64,
+                    },
+                ],
+            },
+            VerifierCellRecord {
+                scheduler: "scx_a".into(),
+                kernel: "kernel_6_14".into(),
+                topology: "large".into(),
+                passed: true,
+                stats: vec![
+                    ProgStats {
+                        name: "ktstr_dispatch".into(),
+                        verified_insns: 128,
+                    },
+                    ProgStats {
+                        name: "ktstr_enqueue".into(),
+                        verified_insns: 64,
+                    },
+                ],
+            },
+            // scx_a / kernel_6_15: ktstr_dispatch DIFFERS across topologies
+            // -> `lo..hi` range; ktstr_enqueue is absent on this kernel
+            // -> `-` in that column's kernel_6_15 row.
+            VerifierCellRecord {
+                scheduler: "scx_a".into(),
+                kernel: "kernel_6_15".into(),
+                topology: "tiny".into(),
+                passed: true,
+                stats: vec![ProgStats {
+                    name: "ktstr_dispatch".into(),
+                    verified_insns: 130,
+                }],
+            },
+            VerifierCellRecord {
+                scheduler: "scx_a".into(),
+                kernel: "kernel_6_15".into(),
+                topology: "large".into(),
+                passed: true,
+                stats: vec![ProgStats {
+                    name: "ktstr_dispatch".into(),
+                    verified_insns: 150,
+                }],
+            },
+            // scx_b: a separate section (its own declaration).
+            VerifierCellRecord {
+                scheduler: "scx_b".into(),
+                kernel: "kernel_6_14".into(),
+                topology: "tiny".into(),
+                passed: true,
+                stats: vec![ProgStats {
+                    name: "ktstr_dispatch".into(),
+                    verified_insns: 200,
+                }],
+            },
+        ];
+        let out = render_instruction_count_tables(&recs).expect("stats present -> Some");
+        // One section per declared scheduler.
+        assert!(
+            out.contains("scx_a:") && out.contains("scx_b:"),
+            "one section per declared scheduler: {out}"
+        );
+        // Columns = BPF programs; rows = kernel version.
+        assert!(
+            out.contains("ktstr_dispatch") && out.contains("ktstr_enqueue"),
+            "BPF-program columns: {out}"
+        );
+        assert!(
+            out.contains("kernel_6_14") && out.contains("kernel_6_15"),
+            "kernel-version rows: {out}"
+        );
+        // Topology folded into the cell as a range: flat -> "128",
+        // varies across topologies -> "130..150".
+        assert!(
+            out.contains("128"),
+            "topology-flat cell is a single number: {out}"
+        );
+        assert!(
+            out.contains("130..150"),
+            "topology-varying cell is a lo..hi range: {out}"
+        );
+        assert!(
+            out.contains("64") && out.contains("200"),
+            "other counts render: {out}"
+        );
+        // ktstr_enqueue reported no stats on kernel_6_15 -> `-`.
+        assert!(
+            out.contains('-'),
+            "a (kernel, program) with no stats renders '-': {out}"
+        );
+        // Topology is NOT a table axis (folded into the range), so no
+        // topology label appears in the output.
+        assert!(
+            !out.contains("tiny") && !out.contains("large"),
+            "topology is not a table axis: {out}"
+        );
+
+        // No record carries stats -> nothing to render.
+        let bare = vec![VerifierCellRecord {
+            scheduler: "scx_a".into(),
+            kernel: "kernel_6_14".into(),
+            topology: "tiny".into(),
+            passed: false,
+            stats: vec![],
+        }];
+        assert!(
+            render_instruction_count_tables(&bare).is_none(),
+            "no stats -> None"
+        );
     }
 
     // -----------------------------------------------------------------------

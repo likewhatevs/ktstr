@@ -204,6 +204,9 @@ pub(crate) fn run_verifier(
     // stay visible. Best-effort: no records (e.g. 0 cells ran) -> the
     // renderers return None and nothing prints.
     let records = ktstr::verifier::read_cell_records(&result_dir);
+    if let Some(tables) = ktstr::verifier::render_instruction_count_tables(&records) {
+        print!("{tables}");
+    }
     if let Some(table) = ktstr::verifier::render_result_table(&records) {
         print!("{table}");
     }
