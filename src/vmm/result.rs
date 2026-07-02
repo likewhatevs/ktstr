@@ -1282,6 +1282,33 @@ impl VmResult {
             .join("\n")
     }
 
+    /// The scheduler's captured log — its stderr, including any libbpf /
+    /// BPF-verifier output — extracted from the bulk-port
+    /// `MSG_TYPE_SCHED_LOG` frames in [`Self::guest_messages`]. Empty when
+    /// no scheduler log was captured (no scheduler was spawned, or the
+    /// framed markers never arrived).
+    ///
+    /// Mirrors the extraction [`crate::verifier::collect_verifier_output`]
+    /// performs: concatenate the `SchedLog` chunks, slice the span from the
+    /// first `SCHED_OUTPUT_START` to the last `SCHED_OUTPUT_END` (spanning
+    /// any intervening markers when the guest staged more than one log),
+    /// and fall back to `output` when the bulk-port drain carried no
+    /// `SchedLog` frames (a kernel without the bulk port). Lets a post_vm
+    /// callback assert on what the scheduler logged — e.g. a libbpf
+    /// verifier-reject — without reaching into the crate-internal wire
+    /// types.
+    pub fn scheduler_log(&self) -> String {
+        let merged = crate::verifier::concat_sched_log_chunks(self.guest_messages.as_ref());
+        let source = if merged.is_empty() {
+            &self.output
+        } else {
+            &merged
+        };
+        crate::verifier::parse_sched_output(source)
+            .unwrap_or("")
+            .to_string()
+    }
+
     /// The host watchdog-override readback (`expected_jiffies` =
     /// host-written, `observed_jiffies` = read back from guest memory).
     /// `None` when the scheduler never attached (no readback recorded).
@@ -1604,6 +1631,58 @@ pub(crate) struct VmRunState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// scheduler_log() concatenates the bulk-port SchedLog frames and
+    /// slices the `SCHED_OUTPUT_START`/`END`-bracketed content (mirroring
+    /// collect_verifier_output). A CRC-bad frame is dropped; with no valid
+    /// SchedLog frames and an empty `output`, the log is empty. CI-runnable
+    /// (no VM) — pins the accessor the demo_verifier post_vm assertions
+    /// depend on, so a boot-path capture regression is caught even when the
+    /// host-gated e2e cells skip under resource contention.
+    #[test]
+    fn scheduler_log_extracts_bracketed_content_and_drops_crc_bad() {
+        use crate::vmm::host_comms::BulkDrainResult;
+        use crate::vmm::wire::{MSG_TYPE_SCHED_LOG, ShmEntry};
+
+        let framed = "===SCHED_OUTPUT_START===\n\
+            libbpf: prog 'ktstr_dispatch': BPF program load failed: -EACCES\n\
+            -- BEGIN PROG LOAD LOG --\n0: (b7) r0 = 0\n-- END PROG LOAD LOG --\n\
+            ===SCHED_OUTPUT_END===\n";
+        let mut result = VmResult::test_fixture();
+        result.guest_messages = Some(BulkDrainResult {
+            entries: vec![ShmEntry {
+                msg_type: MSG_TYPE_SCHED_LOG,
+                payload: framed.as_bytes().to_vec(),
+                crc_ok: true,
+            }],
+        });
+        let log = result.scheduler_log();
+        assert!(
+            log.contains("-- BEGIN PROG LOAD LOG --"),
+            "libbpf verifier-reject marker survives extraction: {log}"
+        );
+        assert!(
+            log.contains("BPF program load failed"),
+            "scheduler stderr content present: {log}"
+        );
+        assert!(
+            !log.contains("SCHED_OUTPUT_START"),
+            "wire brackets stripped by parse_sched_output: {log}"
+        );
+
+        // A CRC-bad SchedLog frame is dropped; with no valid frames the
+        // merged stream is empty and `output` (empty here) is the fallback,
+        // so scheduler_log() is empty.
+        let mut bad = VmResult::test_fixture();
+        bad.guest_messages = Some(BulkDrainResult {
+            entries: vec![ShmEntry {
+                msg_type: MSG_TYPE_SCHED_LOG,
+                payload: framed.as_bytes().to_vec(),
+                crc_ok: false,
+            }],
+        });
+        assert_eq!(bad.scheduler_log(), "", "crc-bad frame dropped -> empty");
+    }
 
     /// A StepStart/StepEnd/terminal `StimulusEvent` for the
     /// `step_throughput_in` pairing tests.

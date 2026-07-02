@@ -1,5 +1,6 @@
 use anyhow::Result;
 use ktstr::assert::AssertResult;
+use ktstr::prelude::VmResult;
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps_with};
 use ktstr::test_support::{KtstrTestEntry, Scheduler, SchedulerSpec};
@@ -149,6 +150,25 @@ fn scenario_fail_verify(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps_with(ctx, steps, None)
 }
 
+/// Pin the SPECIFIC verifier rejection these cells demonstrate. Both
+/// --fail-verify and --verify-loop make the BPF verifier reject
+/// ktstr_dispatch, so libbpf wraps the kernel verifier trace in
+/// `-- BEGIN PROG LOAD LOG --` in the scheduler's captured log. Asserting
+/// that marker proves the reject actually happened (not merely "some
+/// failure"), catching a changed failure mode. Wired as
+/// `post_vm_unconditional` so it runs even though these cells `expect_err`
+/// -- that hook bypasses the guest-fail suppression, and an Err here is a
+/// hard failure `expect_err` does not invert.
+fn assert_verifier_rejected(result: &VmResult) -> Result<()> {
+    let log = result.scheduler_log();
+    anyhow::ensure!(
+        log.contains("-- BEGIN PROG LOAD LOG --"),
+        "scheduler log missing the libbpf verifier-reject marker \
+         `-- BEGIN PROG LOAD LOG --`; got:\n{log}"
+    );
+    Ok(())
+}
+
 #[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_FAIL_VERIFY: KtstrTestEntry = KtstrTestEntry {
@@ -156,6 +176,7 @@ static __KTSTR_ENTRY_FAIL_VERIFY: KtstrTestEntry = KtstrTestEntry {
     func: scenario_fail_verify,
     scheduler: &FAIL_SCHED,
     extra_sched_args: &["--fail-verify"],
+    post_vm_unconditional: Some(assert_verifier_rejected),
     duration: std::time::Duration::from_secs(5),
     // The scheduler deliberately fails to load its BPF (--fail-verify
     // injects a verifier-rejected null store), so the guest diagnoses a
@@ -180,6 +201,7 @@ static __KTSTR_ENTRY_VERIFY_REJECT: KtstrTestEntry = KtstrTestEntry {
     func: scenario_fail_verify,
     scheduler: &FAIL_SCHED,
     extra_sched_args: &["--verify-loop"],
+    post_vm_unconditional: Some(assert_verifier_rejected),
     duration: std::time::Duration::from_secs(5),
     // Same expected-outcome as the --fail-verify sibling: --verify-loop
     // makes the BPF verifier reject ktstr_dispatch (an unrolled loop
