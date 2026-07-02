@@ -3181,3 +3181,51 @@ fn git_clone_rejects_raw_sha_git_ref_without_panic() {
         "the error must be actionable (use a branch or tag): {msg}"
     );
 }
+
+/// `git_clone_tag` shallow-clones a linux-stable annotated TAG — the
+/// EOL-kernel recovery path. A plain `with_ref_name` shallow clone
+/// forces `refs/heads/{ref}` and fails on a tag with "None of the
+/// refspec(s) matched"; the appended `+refs/tags/{tag}:refs/heads/{tag}`
+/// refspec fixes it. This can ONLY be validated by a real clone — the
+/// failure is a runtime refspec mismatch, invisible at compile time and
+/// to source-level review — so it is the empirical guard for the fix.
+/// Network + a ~200MB shallow fetch of the linux-stable tree, hence
+/// #[ignore] (run with --run-ignored on a connected, uncontended host).
+#[test]
+#[ignore = "network: shallow git-tag clone of linux-stable v6.14.11 (~200MB); run with --run-ignored on a connected host"]
+fn git_clone_tag_shallow_clones_stable_tag() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let acquired = super::git_clone_tag(
+        "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git",
+        "v6.14.11",
+        tmp.path(),
+        "test",
+        None,
+    )
+    .expect(
+        "git_clone_tag must shallow-clone the v6.14.11 tag, not fail with \
+         'None of the refspec(s) matched'",
+    );
+    // A real linux source tree must be checked out at the tag.
+    let makefile = acquired.source_dir.join("Makefile");
+    assert!(
+        makefile.exists(),
+        "cloned tree must contain a top-level Makefile: {}",
+        acquired.source_dir.display(),
+    );
+    // The Makefile version fields must read exactly 6.14.11, proving the
+    // checkout landed on the tag (not HEAD or the series branch tip).
+    let mk = std::fs::read_to_string(&makefile).expect("read cloned Makefile");
+    assert!(
+        mk.contains("PATCHLEVEL = 14") && mk.contains("SUBLEVEL = 11"),
+        "cloned Makefile must be 6.14.11 (PATCHLEVEL=14, SUBLEVEL=11)",
+    );
+    // The recorded source must be git-shaped (kernel_source::git).
+    assert!(
+        matches!(
+            acquired.kernel_source,
+            crate::cache::KernelSource::Git { .. }
+        ),
+        "git_clone_tag must record a Git KernelSource",
+    );
+}

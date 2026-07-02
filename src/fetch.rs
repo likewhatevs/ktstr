@@ -1226,7 +1226,7 @@ pub fn download_tarball(
                     Some(fp) => fp.println(&msg),
                     None => eprintln!("{msg}"),
                 }
-                git_clone(STABLE_TREE_URL, &tag, dest_dir, cli_label, mp)?.source_dir
+                git_clone_tag(STABLE_TREE_URL, &tag, dest_dir, cli_label, mp)?.source_dir
             }
             Err(e) => return Err(e),
         }
@@ -1651,7 +1651,7 @@ pub fn ls_remote_commit_hash(url: &str, git_ref: &str) -> Option<String> {
     match_ref_commit_hash(&refmap.remote_refs, git_ref)
 }
 
-/// Clone a git repository with shallow depth.
+/// Shallow-clone a git repository at a BRANCH ref.
 ///
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
@@ -1662,12 +1662,54 @@ pub fn ls_remote_commit_hash(url: &str, git_ref: &str) -> Option<String> {
 /// tests pass `None`). The bar shows real object/file counts + ETA
 /// during the receiving / resolving / checkout phases that gix reports
 /// a bounded total for; see the `crate::cli::progress` module.
+///
+/// For a TAG ref use [`git_clone_tag`]: gix's shallow clone only
+/// resolves branches via `with_ref_name` — see `git_clone_inner`.
 pub fn git_clone(
     url: &str,
     git_ref: &str,
     dest_dir: &Path,
     cli_label: &str,
     mp: Option<&crate::cli::FetchProgress>,
+) -> Result<AcquiredSource> {
+    git_clone_inner(url, git_ref, dest_dir, cli_label, mp, None)
+}
+
+/// Shallow-clone a git repository at a TAG ref (e.g. `v6.14.11`).
+///
+/// gix's shallow clone routes the ref through `Category::LocalBranch`
+/// (`refs/heads/`) in its single-branch-shallow path
+/// (`gix::clone::fetch`), so a tag never matches on the remote and the
+/// fetch fails with "None of the refspec(s) matched". This appends a
+/// `+refs/tags/{tag}:refs/heads/{tag}` refspec so the tag is fetched
+/// into the local branch ref the checkout resolves. Used to recover
+/// EOL / pruned kernels from the linux-stable tree — see
+/// [`download_tarball`]'s `TarballNotFound` fallback.
+pub fn git_clone_tag(
+    url: &str,
+    tag: &str,
+    dest_dir: &Path,
+    cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
+) -> Result<AcquiredSource> {
+    let extra_refspec = format!("+refs/tags/{tag}:refs/heads/{tag}");
+    git_clone_inner(url, tag, dest_dir, cli_label, mp, Some(extra_refspec))
+}
+
+/// Shared shallow-clone implementation for [`git_clone`] (branch) and
+/// [`git_clone_tag`] (tag).
+///
+/// `extra_refspec`, when `Some`, is appended to the remote's fetch
+/// refspecs via `configure_remote` before the fetch (the tag path uses
+/// it to fetch `refs/tags/*`). `None` leaves the branch clone
+/// byte-identical to the historical behavior.
+fn git_clone_inner(
+    url: &str,
+    git_ref: &str,
+    dest_dir: &Path,
+    cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
+    extra_refspec: Option<String>,
 ) -> Result<AcquiredSource> {
     // A raw 40-hex commit SHA cannot be cloned here: gix's
     // `prepare_clone(...).with_ref_name(<object-id>)` panics at
@@ -1698,6 +1740,20 @@ pub fn git_clone(
         ))
         .with_ref_name(Some(git_ref))
         .with_context(|| "set ref name")?;
+
+    // Tag path only: gix's single-branch-shallow fetch derives its
+    // refspec from `with_ref_name` via Category::LocalBranch
+    // (`refs/heads/{ref}`), which never matches a `refs/tags/*` ref.
+    // Append the caller's `+refs/tags/{tag}:refs/heads/{tag}` so the
+    // tag is fetched into the branch ref the checkout resolves.
+    // `with_refspecs` APPENDS (keeping gix's own single-branch spec),
+    // so a branch clone that reaches here would still match its spec —
+    // but the branch path passes `None` and skips this entirely.
+    if let Some(spec) = extra_refspec {
+        prep = prep.configure_remote(move |remote| {
+            Ok(remote.with_refspecs(Some(spec.as_str()), gix::remote::Direction::Fetch)?)
+        });
+    }
 
     // Drive a determinate clone bar from gix's progress tree (see
     // [`crate::cli::progress::CloneProgress`]). `None` when no progress
