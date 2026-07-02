@@ -26,10 +26,11 @@
 //! !test(/^verifier::/)` — the `verifier/...` cells, NOT the verifier
 //! module's own `verifier::tests::*` unit tests, which also start with
 //! "verifier"). The trailing `args` are forwarded verbatim to that
-//! `cargo nextest run` — feature selection (`cargo ktstr verifier
-//! --features integration,wprof`, no `--` separator) reaches the
-//! integration-gated `declare_scheduler!` cell build; the
-//! scheduler-under-test builds release by default, and each cell boots
+//! `cargo nextest run` (a nextest filterset, `--cargo-profile`, ..., no
+//! `--` separator). The `declare_scheduler!` verifier cells carry no
+//! `required-features`, so they build without a feature flag — no
+//! `--features` passthrough is needed to collect verifier statistics.
+//! The scheduler-under-test builds release by default, and each cell boots
 //! with performance mode disabled (its `verified_insns` count is
 //! perf-mode-independent, so cells take only a shared LLC reservation
 //! and no longer starve each other on the LLC lock — see
@@ -57,12 +58,11 @@ use crate::kernel::{
 /// Dispatch the `cargo ktstr verifier` subcommand.
 ///
 /// The trailing `args` are forwarded verbatim to the inner
-/// `cargo nextest run` — the path for feature selection
-/// (`cargo ktstr verifier --features integration,wprof`), which the
-/// integration-gated `declare_scheduler!` cells require to compile.
-/// Without the feature passthrough the integration-gated cells never
-/// compile, so the cell-only filter matches nothing and the command
-/// collects no verifier statistics.
+/// `cargo nextest run` (a nextest filterset, `--cargo-profile`, ...).
+/// The `declare_scheduler!` verifier cells carry no `required-features`,
+/// so they build without a feature flag — no `--features` passthrough is
+/// needed for the cell-only filter to match and collect verifier
+/// statistics.
 ///
 /// `profile` is the scheduler-under-test's cargo BUILD profile
 /// (`--profile <NAME>`): set as `KTSTR_SCHEDULER_PROFILE` so

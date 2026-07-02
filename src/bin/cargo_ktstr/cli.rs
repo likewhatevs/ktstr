@@ -445,12 +445,11 @@ pub(crate) enum KtstrCommand {
     /// `verified_insns` table per scheduler (rows = kernel, cols = BPF
     /// program) and a topology × scheduler PASS/FAIL grid are printed.
     ///
-    /// The `declare_scheduler!` cells that carry a userspace scheduler
-    /// live in integration test targets, so forward the build features to
-    /// nextest — e.g. `cargo ktstr verifier --kernel ../linux --features
-    /// integration,wprof` (no `--` needed). Without the feature
-    /// passthrough those cells never compile and the cell-only filter
-    /// matches nothing. The scheduler-under-test builds release by default.
+    /// The `declare_scheduler!` verifier cells carry no `required-features`,
+    /// so they build without a feature flag — no `--features` passthrough
+    /// is needed for the sweep to find them. Trailing args are forwarded
+    /// verbatim to nextest (a filterset, `--cargo-profile`, ...). The
+    /// scheduler-under-test builds release by default.
     Verifier {
         /// Repeatable. See [`KERNEL_HELP_NO_RAW`] for accepted shapes
         /// (path / version / cache key / range / git source). Overrides
@@ -480,8 +479,8 @@ pub(crate) enum KtstrCommand {
         #[arg(long)]
         scheduler: Option<String>,
         /// cargo/nextest flags forwarded verbatim to the inner
-        /// `cargo nextest run` — feature selection (`--features
-        /// integration,wprof`), `--cargo-profile`, etc. No `--` separator
+        /// `cargo nextest run` — a nextest filterset, `--cargo-profile`,
+        /// etc. No `--` separator
         /// is required, but place them AFTER the native flags (`--kernel`
         /// / `--raw` / `--profile` / `--nextest-profile`): the trailing
         /// capture starts at the first unrecognized token, so a
