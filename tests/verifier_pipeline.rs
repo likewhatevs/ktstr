@@ -157,6 +157,19 @@ static __KTSTR_ENTRY_FAIL_VERIFY: KtstrTestEntry = KtstrTestEntry {
     scheduler: &FAIL_SCHED,
     extra_sched_args: &["--fail-verify"],
     duration: std::time::Duration::from_secs(5),
+    // The scheduler deliberately fails to load its BPF (--fail-verify
+    // injects a verifier-rejected null store), so the guest diagnoses a
+    // BPF-load rejection and never dispatches the workload -- that load
+    // failure is the EXPECTED outcome of this demonstration cell. Invert
+    // the guest-side failure verdict to PASS; otherwise the cell
+    // hard-fails whenever it actually runs (it previously only "passed"
+    // by skipping under LLC-lock contention, masking the hard failure).
+    expect_err: true,
+    // No auto-repro: the BPF-load rejection is the EXPECTED outcome, so
+    // reproducing it in a second probe VM is wasted work -- and on cold
+    // topos that extra boot compounded the timing pressure that first
+    // surfaced this cell's flake.
+    auto_repro: false,
     ..KtstrTestEntry::DEFAULT
 };
 
@@ -168,5 +181,19 @@ static __KTSTR_ENTRY_VERIFY_REJECT: KtstrTestEntry = KtstrTestEntry {
     scheduler: &FAIL_SCHED,
     extra_sched_args: &["--verify-loop"],
     duration: std::time::Duration::from_secs(5),
+    // Same expected-outcome as the --fail-verify sibling: --verify-loop
+    // makes the BPF verifier reject ktstr_dispatch (an unrolled loop
+    // then a verifier-rejected null store), so the scheduler never binds
+    // and the guest diagnoses a BPF-load rejection. That load failure is
+    // the EXPECTED outcome, so invert the guest-side failure verdict to
+    // PASS. The slow reject also crosses the 1s liveness gate on cold
+    // topos (StartupDied->NotAttached), but both frames now invert
+    // identically, so the timing no longer flips the verdict.
+    expect_err: true,
+    // No auto-repro: the BPF-load rejection is the EXPECTED outcome, so
+    // reproducing it in a second probe VM is wasted work -- and on cold
+    // topos that extra boot compounded the timing pressure that first
+    // surfaced this cell's flake.
+    auto_repro: false,
     ..KtstrTestEntry::DEFAULT
 };
