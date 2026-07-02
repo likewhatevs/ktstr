@@ -16,8 +16,8 @@
 //! - [`SchedPolicy`] -- Linux scheduling policy for a worker process
 //! - [`MemPolicy`] -- NUMA memory placement policy for worker processes
 //!
-//! See the [WorkSpec Types](https://likewhatevs.github.io/ktstr/guide/concepts/work-types.html)
-//! and [Worker Processes](https://likewhatevs.github.io/ktstr/guide/architecture/workers.html)
+//! See the [WorkSpec Types](https://ktstr.dev/guide/concepts/work-types.html)
+//! and [Worker Processes](https://ktstr.dev/guide/architecture/workers.html)
 //! chapters of the guide.
 //!
 //! # Module layout

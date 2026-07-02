@@ -29,7 +29,9 @@ Without a `scheduler` attribute, tests run under EEVDF. See
 ## Library API
 
 The `ktstr::prelude` module re-exports the types needed for writing
-tests. Declare cgroups and workloads as data with `CgroupDef`:
+tests — see the full [API reference (rustdoc)](https://ktstr.dev/rustdoc/ktstr/)
+for every workspace crate. Declare cgroups and workloads as data with
+`CgroupDef`:
 
 ```rust,ignore
 use ktstr::prelude::*;

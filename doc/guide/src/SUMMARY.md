@@ -62,3 +62,4 @@
 - [Troubleshooting](troubleshooting.md)
 - [Environment Variables](reference/environment-variables.md)
 - [ctprof](reference/ctprof.md)
+- [API Reference](reference/api.md)

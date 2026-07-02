@@ -171,7 +171,7 @@ tuned for scheduler testing (sched_ext, BPF, kprobes, minimal boot).
 
 Create a file in your crate's `tests/` directory (e.g.
 `tests/sched_test.rs`) and write a `#[ktstr_test]` function. The
-[`prelude`](https://likewhatevs.github.io/ktstr/api/ktstr/prelude/index.html)
+[`prelude`](https://ktstr.dev/rustdoc/ktstr/prelude/index.html)
 module re-exports the types you need.
 
 The simplest test uses a canned scenario. `AssertResult` carries the

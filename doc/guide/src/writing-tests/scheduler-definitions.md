@@ -530,17 +530,17 @@ slots — `#[ktstr_test(scheduler = MY_SCHED)]` takes a bare
 
 ### `#[non_exhaustive]` and construction rules
 
-`Payload` is `#[non_exhaustive]` (see [`crate::non_exhaustive`](https://likewhatevs.github.io/ktstr/api/ktstr/non_exhaustive/index.html)).
+`Payload` is `#[non_exhaustive]` (see [`crate::non_exhaustive`](https://ktstr.dev/rustdoc/ktstr/non_exhaustive/index.html)).
 Downstream crates **cannot** use struct-literal construction —
 a future ktstr bump can add fields without breaking callers
 only if everyone constructs through the provided associated
 functions:
 
-- [`Payload::binary(name, binary)`](https://likewhatevs.github.io/ktstr/api/ktstr/test_support/struct.Payload.html#method.binary)
+- [`Payload::binary(name, binary)`](https://ktstr.dev/rustdoc/ktstr/test_support/struct.Payload.html#method.binary)
   — minimal binary-kind `Payload` with exit-code-only defaults
   (no declared args, checks, metrics, or include files). Fills
   `name`, sets `kind = PayloadKind::Binary(binary)`.
-- [`Payload::new(...)`](https://likewhatevs.github.io/ktstr/api/ktstr/test_support/struct.Payload.html#method.new)
+- [`Payload::new(...)`](https://ktstr.dev/rustdoc/ktstr/test_support/struct.Payload.html#method.new)
   — full positional constructor; the [`#[derive(Payload)]`](#derive-payload)
   macro emits a call to this internally.
 

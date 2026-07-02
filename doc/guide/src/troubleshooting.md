@@ -254,7 +254,7 @@ complete failure output format and auto-repro walkthrough.
 ## send_sys_rdy timeout
 
 ```text
-WARN ktstr::vmm::rust_init: ktstr-init: send_sys_rdy failed within boot budget; see https://likewhatevs.github.io/ktstr/guide/troubleshooting.html#send_sys_rdy-timeout budget_ms=11200 vcpus=8 elapsed_ms=11342 port_exists=false kern_addrs_sent=false
+WARN ktstr::vmm::rust_init: ktstr-init: send_sys_rdy failed within boot budget; see https://ktstr.dev/guide/troubleshooting.html#send_sys_rdy-timeout budget_ms=11200 vcpus=8 elapsed_ms=11342 port_exists=false kern_addrs_sent=false
 ```
 
 The guest-side `ktstr-init` sends a `MSG_TYPE_SYS_RDY` TLV frame

@@ -9,9 +9,9 @@
 //! captured console, monitor samples, and drained guest messages.
 //!
 //! See the [VMM architecture
-//! page](https://likewhatevs.github.io/ktstr/guide/architecture/vmm.html)
+//! page](https://ktstr.dev/guide/architecture/vmm.html)
 //! for the boot flow and the [Performance Mode
-//! page](https://likewhatevs.github.io/ktstr/guide/concepts/performance-mode.html)
+//! page](https://ktstr.dev/guide/concepts/performance-mode.html)
 //! for the isolation options the builder exposes.
 //!
 //! # Module layout

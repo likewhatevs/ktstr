@@ -3,8 +3,8 @@
 [![CI](https://github.com/likewhatevs/ktstr/actions/workflows/ci.yml/badge.svg)](https://github.com/likewhatevs/ktstr/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/likewhatevs/ktstr/graph/badge.svg?token=E7GRAO2KZM)](https://codecov.io/gh/likewhatevs/ktstr)
 [![crates.io](https://img.shields.io/crates/v/ktstr.svg)](https://crates.io/crates/ktstr)
-[![tutorial](https://img.shields.io/badge/docs-tutorial-blue)](https://likewhatevs.github.io/ktstr/guide/tutorial.html)
-[![api](https://img.shields.io/badge/docs-api-blue)](https://likewhatevs.github.io/ktstr/api/ktstr/)
+[![tutorial](https://img.shields.io/badge/docs-tutorial-blue)](https://ktstr.dev/guide/tutorial.html)
+[![api](https://img.shields.io/badge/docs-api-blue)](https://ktstr.dev/rustdoc/ktstr/)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](https://github.com/likewhatevs/ktstr/issues)
 
 > **Early stage.** APIs, CLI, and internals are actively evolving.
@@ -44,7 +44,7 @@ automates this:
   handles the rest.
 - **Automated assertions** -- checks for starvation, cgroup
   isolation violations, and CPU time fairness. No manual inspection.
-- **[Gauntlet](https://likewhatevs.github.io/ktstr/guide/running-tests/gauntlet.html)** --
+- **[Gauntlet](https://ktstr.dev/guide/running-tests/gauntlet.html)** --
   one `#[ktstr_test]` expands across topology presets (4-252 vCPUs,
   1-15 LLCs, optional SMT and multi-NUMA), filtered by per-test
   constraints. Multi-kernel runs (`--kernel A --kernel B`) add the
@@ -59,7 +59,7 @@ automates this:
 - **Auto-repro** -- on failure, reruns the scenario with BPF probes
   on the crash call chain, capturing arguments and struct state at
   each call site.
-- **[Features](https://likewhatevs.github.io/ktstr/guide/features.html)** --
+- **[Features](https://ktstr.dev/guide/features.html)** --
   testing, observability, debugging, and infrastructure.
 
 ## Installation
@@ -141,7 +141,7 @@ it does not build or run on other platforms.
   step runs `validate_kernel_config` which requires `CONFIG_SCHED_CLASS_EXT`
   (present from 6.12); kernels older than that fail the check at
   build time rather than running with a missing scheduler class.
-  See [Supported kernels](https://likewhatevs.github.io/ktstr/guide/features.html#supported-kernels).
+  See [Supported kernels](https://ktstr.dev/guide/features.html#supported-kernels).
   Prebuilt kernels resolved via `KTSTR_KERNEL` must contain a
   vmlinux with embedded BTF.
 
@@ -160,7 +160,7 @@ for the dynamic-link path if you're modifying the workspace.
 
 **Test files** go in `tests/` as standard Rust integration tests. Use `#[ktstr_test]` from `ktstr::prelude::*`.
 
-See the [getting started guide](https://likewhatevs.github.io/ktstr/guide/getting-started.html) for kernel discovery and building a test kernel.
+See the [getting started guide](https://ktstr.dev/guide/getting-started.html) for kernel discovery and building a test kernel.
 
 ## Quick start
 
@@ -187,7 +187,7 @@ fn two_cgroups(ctx: &Ctx) -> Result<AssertResult> {
 Each test boots a KVM VM, creates the declared cgroups and workers,
 runs the workload, and checks for starvation and fairness. For
 canned scenarios, see `scenarios::steady` in the
-[getting started guide](https://likewhatevs.github.io/ktstr/guide/getting-started.html).
+[getting started guide](https://ktstr.dev/guide/getting-started.html).
 
 ### Define a scheduler
 
@@ -226,7 +226,7 @@ Topologies display as `NnNlNcNt` (e.g. `1n2l4c1t`). In
 4, threads = 1, numa_nodes = 1`. Unset dimensions inherit from the
 scheduler's topology. For non-uniform NUMA, see
 `Topology::with_nodes()` in the
-[topology guide](https://likewhatevs.github.io/ktstr/guide/concepts/topology.html).
+[topology guide](https://ktstr.dev/guide/concepts/topology.html).
 
 `sched_args = [...]` are CLI args prepended to every test using
 this scheduler. Per-test `#[ktstr_test(extra_sched_args = [...])]`
@@ -307,7 +307,7 @@ fn schbench_under_my_sched(ctx: &Ctx) -> Result<AssertResult> {
 ```
 
 See
-[Payload Definitions](https://likewhatevs.github.io/ktstr/guide/writing-tests/scheduler-definitions.html#derive-payload)
+[Payload Definitions](https://ktstr.dev/guide/writing-tests/scheduler-definitions.html#derive-payload)
 for the `#[derive(Payload)]` macro and the full field surface
 (`default_args`, `default_checks`, `metrics`, `include_files`).
 This repo's `tests/common/fixtures.rs` carries reusable
@@ -335,7 +335,7 @@ asks for.
 
 Requires `/dev/kvm` accessible to the invoking user. On most
 distros that means adding the user to the `kvm` group; the
-[Troubleshooting](https://likewhatevs.github.io/ktstr/guide/troubleshooting.html#devkvm-not-accessible)
+[Troubleshooting](https://ktstr.dev/guide/troubleshooting.html#devkvm-not-accessible)
 page covers permission errors and nested-virt setup for CI
 runners.
 
@@ -382,7 +382,7 @@ zero iterations, zero pages, zero wake events) separately from
 `ktstr::prelude::{EXIT_PASS, EXIT_FAIL, EXIT_INCONCLUSIVE}`
 for tooling that drives the harness programmatically.
 
-See the [verdict outcomes guide](https://likewhatevs.github.io/ktstr/guide/concepts/checking.html#verdict-outcomes)
+See the [verdict outcomes guide](https://ktstr.dev/guide/concepts/checking.html#verdict-outcomes)
 for the full four-state lattice (`Fail > Inconclusive > Pass > Skip`)
 and CI-gate patterns.
 
@@ -469,17 +469,17 @@ without the test harness, use `cargo ktstr export`.
 
 ## Documentation
 
-**[Zero to ktstr](https://likewhatevs.github.io/ktstr/guide/tutorial.html)** --
+**[Zero to ktstr](https://ktstr.dev/guide/tutorial.html)** --
 hands-on tutorial: define a scheduler, write a test, run it.
 
-**[Guide](https://likewhatevs.github.io/ktstr/guide/)** -- getting started, concepts,
+**[Guide](https://ktstr.dev/guide/)** -- getting started, concepts,
 writing tests, recipes, architecture.
 
-**[ctprof reference](https://likewhatevs.github.io/ktstr/guide/reference/ctprof.html)** --
+**[ctprof reference](https://ktstr.dev/guide/reference/ctprof.html)** --
 metric registry, aggregation rules, taskstats kconfig gating,
 adding-a-metric guide.
 
-**[API docs](https://likewhatevs.github.io/ktstr/api/ktstr/)** -- rustdoc for all workspace crates.
+**[API docs](https://ktstr.dev/rustdoc/ktstr/)** -- rustdoc for all workspace crates.
 
 ## Contributing
 

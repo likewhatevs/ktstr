@@ -274,7 +274,7 @@ pub(crate) fn send_sys_rdy_with_retry(
                 port_exists = port_exists_snapshot,
                 kern_addrs_sent,
                 "ktstr-init: send_sys_rdy failed within boot budget; \
-                 see https://likewhatevs.github.io/ktstr/guide/troubleshooting.html#send_sys_rdy-timeout",
+                 see https://ktstr.dev/guide/troubleshooting.html#send_sys_rdy-timeout",
             );
             return;
         }

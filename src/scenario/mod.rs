@@ -45,8 +45,8 @@
 //! Naming an APPEND method `set_X` (or a REPLACE method `push_X`)
 //! mis-encodes the semantics and is a defect — flag at review.
 //!
-//! See the [Scenarios](https://likewhatevs.github.io/ktstr/guide/concepts/scenarios.html)
-//! and [Writing Tests](https://likewhatevs.github.io/ktstr/guide/writing-tests.html)
+//! See the [Scenarios](https://ktstr.dev/guide/concepts/scenarios.html)
+//! and [Writing Tests](https://ktstr.dev/guide/writing-tests.html)
 //! chapters of the guide.
 
 pub mod affinity;

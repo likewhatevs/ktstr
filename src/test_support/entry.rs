@@ -1044,7 +1044,7 @@ pub struct Scheduler {
     /// zero-overrides baseline) chained through the `Assert` builder
     /// methods. The `Assert` builder surface (every overridable
     /// threshold + scheduler-tunable knob) is documented at the
-    /// [Checking](https://likewhatevs.github.io/ktstr/guide/concepts/checking.html)
+    /// [Checking](https://ktstr.dev/guide/concepts/checking.html)
     /// guide chapter; see [`crate::assert::Assert`] for the full
     /// per-method threshold list.
     pub assert: crate::assert::Assert,

@@ -5,7 +5,7 @@
 //! single declaration. [`execute_steps()`] runs a step sequence with
 //! scheduler liveness checks and stimulus event recording.
 //!
-//! See the [Ops and Steps](https://likewhatevs.github.io/ktstr/guide/concepts/ops.html)
+//! See the [Ops and Steps](https://ktstr.dev/guide/concepts/ops.html)
 //! chapter for a guide.
 //!
 //! # Cgroup tooling at a glance

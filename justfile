@@ -173,9 +173,9 @@ book-serve:
 site: docs api-docs
     #!/usr/bin/env bash
     set -euo pipefail
-    mkdir -p _site/guide _site/api
+    mkdir -p _site/guide _site/rustdoc
     cp -r doc/guide/book/html/* _site/guide/
-    cp -r target/doc/* _site/api/
+    cp -r target/doc/* _site/rustdoc/
     cat > _site/index.html <<'HTML'
     <!DOCTYPE html>
     <meta http-equiv="refresh" content="0; url=guide/">

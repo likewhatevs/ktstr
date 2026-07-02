@@ -11,7 +11,7 @@
 //! in the [`idr`] module) through page table translation. No guest
 //! cooperation is needed.
 //!
-//! See the [Monitor](https://likewhatevs.github.io/ktstr/guide/architecture/monitor.html)
+//! See the [Monitor](https://ktstr.dev/guide/architecture/monitor.html)
 //! chapter of the guide.
 
 pub mod arena;

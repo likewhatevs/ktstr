@@ -18,7 +18,7 @@ description = "Test harness for Linux process schedulers"
 readme = "README.md"
 keywords = ["sched_ext", "scheduler", "testing", "bpf", "linux"]
 categories = ["development-tools::testing"]
-documentation = "https://likewhatevs.github.io/ktstr/api/ktstr/"
+documentation = "https://ktstr.dev/rustdoc/ktstr/"
 exclude = [".build-cache/", "doc/guide/book/", ".github/", ".githooks/", ".config/"]
 
 [dependencies]

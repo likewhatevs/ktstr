@@ -1,6 +1,6 @@
 //! Gauntlet topology presets.
 //!
-//! See the [Gauntlet](https://likewhatevs.github.io/ktstr/guide/running-tests/gauntlet.html)
+//! See the [Gauntlet](https://ktstr.dev/guide/running-tests/gauntlet.html)
 //! chapter of the guide.
 
 use crate::vmm::Topology;
