@@ -1083,6 +1083,39 @@ fn collect_sidecars_skips_non_ktstr_json() {
 }
 
 #[test]
+fn collect_sidecars_with_errors_counts_stale_for_summary() {
+    // A valid sidecar loads; stale/unparseable ones are dropped from the
+    // returned Vec and counted in parse_errors. That count drives the
+    // single aggregated `warn_skipped_sidecars` summary that replaced the
+    // per-file skip spam -- lock it in so a regression that stops counting
+    // (or starts admitting stale data into the pool) is caught.
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let tmp = tmp_dir.path();
+    let sc = SidecarResult {
+        test_name: "ok".to_string(),
+        ..SidecarResult::test_fixture()
+    };
+    std::fs::write(
+        tmp.join("ok.ktstr.json"),
+        serde_json::to_string(&sc).unwrap(),
+    )
+    .unwrap();
+    // Two stale sidecars: invalid JSON, and valid JSON missing the
+    // SidecarResult schema (the schema-drift case behind the user report).
+    std::fs::write(tmp.join("bad1.ktstr.json"), "not json").unwrap();
+    std::fs::write(tmp.join("bad2.ktstr.json"), r#"{"unrelated":true}"#).unwrap();
+    let (sidecars, parse_errors, io_errors) = collect_sidecars_with_errors(tmp);
+    assert_eq!(sidecars.len(), 1, "only the valid sidecar loads");
+    assert_eq!(sidecars[0].test_name, "ok");
+    assert_eq!(
+        parse_errors.len(),
+        2,
+        "both stale sidecars are counted (drives the aggregated skip summary)"
+    );
+    assert!(io_errors.is_empty());
+}
+
+#[test]
 fn sidecar_result_work_type_field() {
     let sc = SidecarResult {
         work_type: "Bursty".to_string(),

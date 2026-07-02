@@ -655,11 +655,41 @@ pub(crate) fn is_sidecar_filename(path: &std::path::Path) -> bool {
 /// into subdirectories to handle per-job gauntlet layouts.
 ///
 /// Convenience wrapper over [`collect_sidecars_with_errors`] for
-/// callers that only need the parsed sidecars and not the
-/// per-file parse-failure list. The eprintln-driven diagnostic
-/// path is preserved unchanged inside the underlying walker.
+/// single-directory callers that only need the parsed sidecars and not
+/// the per-file parse-failure list. Emits ONE aggregated
+/// [`warn_skipped_sidecars`] summary for that directory when stale
+/// sidecars were dropped. Multi-directory walkers must NOT use this in a
+/// loop (it would print one summary per directory) — they call
+/// [`collect_sidecars_with_errors`] per directory and aggregate the counts
+/// into a single summary (see `collect_pool`).
 pub(crate) fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
-    collect_sidecars_with_errors(dir).0
+    let (sidecars, parse_errors, _io_errors) = collect_sidecars_with_errors(dir);
+    warn_skipped_sidecars(dir, parse_errors.len());
+    sidecars
+}
+
+/// Emit a single aggregated summary for the stale/unparseable sidecars a
+/// walk skipped, or nothing when `skipped == 0`. Sidecars written before a
+/// schema field was added fail to deserialize and are dropped (sidecar data
+/// is disposable — re-running regenerates it); this collapses what would
+/// otherwise be one `eprintln!` per file into one line. Per-file detail
+/// stays available through [`collect_sidecars_with_errors`]'s parse-error
+/// Vec, which `cargo ktstr stats explain-sidecar` renders.
+///
+/// `pub(crate)` so multi-directory walkers outside this module (e.g.
+/// `stats::analyze::sorted_run_entries`) can accumulate `parse_errors.len()`
+/// across run directories and emit ONE pool-wide summary rather than one
+/// per directory.
+pub(crate) fn warn_skipped_sidecars(dir: &std::path::Path, skipped: usize) {
+    if skipped > 0 {
+        eprintln!(
+            "ktstr_test: skipped {skipped} stale sidecar(s) under {} (older \
+             schema — re-run the affected tests to regenerate; \
+             `cargo ktstr stats explain-sidecar --run <run>` shows per-file \
+             detail)",
+            dir.display(),
+        );
+    }
 }
 
 /// Per-file parse-failure record returned by
@@ -734,9 +764,10 @@ pub(crate) fn enriched_parse_error_message_for_test(
 /// returns `None` for any other shape so consumers can branch on
 /// "enrichment exists" without re-implementing the match.
 ///
-/// Pulled out of [`collect_sidecars_with_errors`]'s hot path so
-/// the eprintln-side prose and the structured-channel
-/// `enriched` carry identical text.
+/// Pulled out of [`collect_sidecars_with_errors`]'s parse path so the
+/// enrichment prose is computed in one place and stored in the returned
+/// [`SidecarParseError`]'s `enriched_message` field — parse failures are
+/// surfaced only through that Vec, not a separate stderr channel.
 ///
 /// Matching on the Display text is deliberate: serde's typed-error
 /// surface for `missing field "X"` is not stable across
@@ -768,18 +799,16 @@ fn enriched_parse_error_message(path: &std::path::Path, raw_error: &str) -> Opti
 /// one level into subdirectories to handle per-job gauntlet
 /// layouts.
 ///
-/// Surfaces parse failures in two channels:
-/// - `eprintln!` to stderr (preserved for the operator-facing
-///   pre-1.0 disposable-sidecar diagnostic — emits the enriched
-///   prose for the host-missing schema-drift case, the raw serde
-///   message otherwise).
-/// - The returned parse-errors vec, capturing a
-///   [`SidecarParseError`] record (named fields `path`,
-///   `raw_error`, `enriched_message`) for structured callers
-///   (`explain-sidecar`'s walker output). Both raw and enriched
-///   are exposed so dashboard consumers can pick: raw for
-///   parse-error grepping, enriched for human-facing remediation
-///   prose.
+/// Parse failures are captured ONLY in the returned parse-errors vec —
+/// this walker no longer logs per file. Each failure is a
+/// [`SidecarParseError`] record (named fields `path`, `raw_error`,
+/// `enriched_message`) for structured callers (`explain-sidecar`'s walker
+/// output). Both raw and enriched are exposed so dashboard consumers can
+/// pick: raw for parse-error grepping, enriched for human-facing
+/// remediation prose. Callers that only need the sidecars aggregate
+/// `parse_errors.len()` and emit one [`warn_skipped_sidecars`] summary
+/// (see [`collect_sidecars`] / `collect_pool`) rather than one line per
+/// file.
 ///
 /// IO failures (third return) get a single eprintln line plus a
 /// structured [`SidecarIoError`] record. Distinguished from
@@ -839,14 +868,11 @@ pub(crate) fn collect_sidecars_with_errors(
             Err(e) => {
                 let raw = e.to_string();
                 let enriched = enriched_parse_error_message(path, &raw);
-                // eprintln channel: emit the enriched prose when
-                // it applies, the raw serde message otherwise.
-                // Identical text flows through both channels —
-                // both go through `enriched_parse_error_message`.
-                match &enriched {
-                    Some(prose) => eprintln!("{prose}"),
-                    None => eprintln!("ktstr_test: skipping {}: {raw}", path.display()),
-                }
+                // Capture (do not log) the per-file skip: callers emit one
+                // aggregated `warn_skipped_sidecars` summary so a directory
+                // of stale sidecars produces a single line, not a flood.
+                // `cargo ktstr stats explain-sidecar --run <run>` renders the
+                // per-file detail (raw + enriched remediation) from this Vec.
                 parse_errs.push(SidecarParseError {
                     path: path.to_path_buf(),
                     raw_error: raw,
@@ -915,8 +941,10 @@ pub(crate) fn collect_sidecars_with_errors(
 /// `{kernel}-{project_commit}` by [`sidecar_dir`] where
 /// `{project_commit}` is the project tree's HEAD short hex with
 /// `-dirty` suffix when the worktree differs from HEAD) and
-/// concatenates the sidecars each
-/// one yields via `collect_sidecars`. The result is a flat
+/// concatenates the sidecars each one yields via
+/// `collect_sidecars_with_errors` (per directory, so the per-directory
+/// stale-sidecar skip counts aggregate into one pool-wide summary). The
+/// result is a flat
 /// `Vec<SidecarResult>` covering every recorded run on disk —
 /// `cargo ktstr stats compare`'s pool-driven sourcing reads it
 /// once, applies the typed `--a-*` / `--b-*` filters in memory,
@@ -928,9 +956,10 @@ pub(crate) fn collect_sidecars_with_errors(
 ///
 /// Returns an empty Vec when `root` does not exist or contains no
 /// run directories. Per-run failure (a corrupt sidecar, a partial
-/// directory) prints a per-file `eprintln!` from
-/// `collect_sidecars` and continues — pool-collection never
-/// aborts on a single bad file.
+/// directory) is counted and skipped — pool-collection never aborts
+/// on a single bad file, and emits ONE aggregated
+/// `warn_skipped_sidecars` summary for the whole walk rather than a
+/// per-file line.
 ///
 /// Performance: this is a full filesystem walk over `root`. On a
 /// host with many archived runs (dozens to hundreds), each
@@ -953,6 +982,7 @@ pub fn collect_pool(root: &std::path::Path) -> Vec<SidecarResult> {
         }
     };
     let mut pool = Vec::new();
+    let mut skipped = 0usize;
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
@@ -967,14 +997,19 @@ pub fn collect_pool(root: &std::path::Path) -> Vec<SidecarResult> {
         };
         let path = entry.path();
         if path.is_dir() {
-            // `collect_sidecars` already handles "one level of
-            // subdirectories for per-job gauntlet layouts" inside
-            // each run directory, so the two-level
-            // `{root}/{run_dir}/{job_subdir}` shape works without
-            // a third walker level.
-            pool.extend(collect_sidecars(&path));
+            // `collect_sidecars_with_errors` already handles "one level of
+            // subdirectories for per-job gauntlet layouts" inside each run
+            // directory, so the two-level `{root}/{run_dir}/{job_subdir}`
+            // shape works without a third walker level. Use the
+            // error-returning variant (not `collect_sidecars`, which emits
+            // its own per-directory summary) so the skip counts aggregate
+            // into ONE pool-wide summary below.
+            let (sidecars, parse_errors, _io_errors) = collect_sidecars_with_errors(&path);
+            pool.extend(sidecars);
+            skipped += parse_errors.len();
         }
     }
+    warn_skipped_sidecars(root, skipped);
     pool
 }
 
