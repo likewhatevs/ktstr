@@ -185,7 +185,7 @@ fn validate_task_rejects_non_ext_sched_class() {
         .expect_err("non-ext sched_class must reject");
     assert!(err.contains(&format!("sched_class={fair_kva:#x}")));
     assert!(err.contains("SCX-managed tasks only"));
-    assert!(err.contains("SchedPolicy::Ext"));
+    assert!(err.contains("SchedPolicy::Normal"));
 }
 
 /// L8 (start_boottime == 0): probable slab-recycle survivor that

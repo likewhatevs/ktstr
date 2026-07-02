@@ -1,7 +1,7 @@
 error[E0277]: `CpuSet` is not Summable — summing it would conflate semantic categories or temporal windows
-  --> tests/compile_fail/metric_types_cpu_set_not_summable.rs:11:24
+  --> tests/compile_fail/metric_types_cpu_set_not_summable.rs:12:24
    |
-11 |     require_summable::<ktstr::metric_types::CpuSet>();
+12 |     require_summable::<ktstr::metric_types::CpuSet>();
    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^ this metric type cannot be summed across a group
    |
    = help: the trait `Summable` is not implemented for `CpuSet`
@@ -26,8 +26,8 @@ help: the following other types implement trait `Summable`
    | impl_summable_only_u64!(Bytes);
    | ------------------------------ in this macro invocation
 note: required by a bound in `require_summable`
-  --> tests/compile_fail/metric_types_cpu_set_not_summable.rs:8:24
+  --> tests/compile_fail/metric_types_cpu_set_not_summable.rs:9:24
    |
- 8 | fn require_summable<T: ktstr::metric_types::Summable>() {}
+ 9 | fn require_summable<T: ktstr::metric_types::Summable>() {}
    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `require_summable`
    = note: this error originates in the macro `impl_summable_only_u64` (in Nightly builds, run with -Z macro-backtrace for more info)

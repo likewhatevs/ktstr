@@ -1,5 +1,5 @@
 error: declare_scheduler!: `constraints` must be a const-evaluable expression (emitted into a `pub static`). Use a struct literal `TopologyConstraints { ..TopologyConstraints::DEFAULT }`, a struct literal spreading a const-fn constructor like `TopologyConstraints { ..TopologyConstraints::new() }`, or a const path like `TopologyConstraints::DEFAULT`. Non-const helper calls and method chains are not const-eligible and would fail with a deep const-eval diagnostic at the spread site.
-  --> tests/compile_fail/declare_scheduler_constraints_method_chain.rs:12:19
+  --> tests/compile_fail/declare_scheduler_constraints_method_chain.rs:13:19
    |
-12 |     constraints = TopologyConstraints::DEFAULT.clone(),
+13 |     constraints = TopologyConstraints::DEFAULT.clone(),
    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
