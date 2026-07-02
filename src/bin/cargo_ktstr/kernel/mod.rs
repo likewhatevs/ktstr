@@ -178,10 +178,10 @@ pub(crate) fn canonicalize_cache_dir(cache_dir: PathBuf) -> PathBuf {
 /// `Version` ids before calling here) to a `(label, dir)` tuple.
 ///
 /// Extracted from `resolve_kernel_set`'s rayon body so the per-
-/// spec match arm is one function call rather than five inline
-/// arms duplicated across the parallel and sequential paths.
-/// Each non-Range arm here mirrors what the original sequential
-/// loop did.
+/// spec match arm is one shared function rather than five inline
+/// arms: [`resolve_one_spec`] fans a Range out to per-version
+/// `Version` ids and calls here once per version (all on the same
+/// bounded rayon pool), and every other spec calls here once.
 ///
 /// Range fan-out lives on the caller because the
 /// `expand_kernel_range` step yields a `Vec<String>` that has to
@@ -392,18 +392,22 @@ pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBu
 /// own lock and finds the just-written entry, skipping the
 /// redundant build.
 ///
-/// `flat_map_iter` flattens Range expansion under one rayon
-/// worker: this fn resolves every version of a single
-/// Range spec sequentially via `.map(...).collect::<Vec<_>>()`
-/// before returning the Vec, so a 5-version range
-/// serializes its five resolves against itself within one
-/// worker. Peer specs (other top-level `--kernel` arguments)
-/// still parallelize across workers — only versions WITHIN
-/// one Range are serial. The serialization is acceptable
-/// because the per-version build phase is already serialized
-/// at the LLC-flock layer (see comment above), so the lost
-/// intra-range download overlap is a small fraction of total
-/// wall time on multi-version Range invocations.
+/// A Range spec expands to N versions; this fn resolves them
+/// concurrently via [`resolve_versions_parallel`] rather than
+/// serializing versions against itself. That is the same
+/// parallelism peer specs (other top-level `--kernel` arguments)
+/// already get: builds do NOT serialize against each other (the
+/// LLC flock is shared — see above), and each expanded version is
+/// a distinct tarball cache key hitting its own per-key store
+/// lock, so a range's versions are as independent as separate
+/// `--kernel` flags.
+///
+/// Fail-fast is unchanged from the pre-parallel form: the helper's
+/// `collect` gathers every version's `Result`, then the outer
+/// `collect::<Result<_, _>>` in `resolve_specs_parallel` aborts on
+/// the first Err it observes — which version surfaces is not
+/// deterministic under concurrency, but a single failure still
+/// aborts the whole resolve just as the sequential loop did.
 fn resolve_one_spec(
     trimmed: String,
     mp: &ktstr::cli::FetchProgress,
@@ -412,7 +416,7 @@ fn resolve_one_spec(
 
     // Validation runs first so an inverted Range bails
     // before any I/O — same diagnostic timing the
-    // sequential loop preserved.
+    // pre-parallel loop preserved.
     let id = KernelId::parse(&trimmed);
     if let Err(e) = id.validate() {
         return vec![Err(format!("--kernel {id}: {e}"))];
@@ -420,18 +424,45 @@ fn resolve_one_spec(
     match id {
         KernelId::Range { start, end, .. } => {
             match ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr") {
-                Ok(versions) => versions
-                    .into_iter()
-                    .map(|ver| {
-                        resolve_one_with_progress(KernelId::Version(ver.clone()), mp)
-                            .map_err(|e| format!("resolve kernel {ver}: {e}"))
-                    })
-                    .collect::<Vec<_>>(),
+                Ok(versions) => resolve_versions_parallel(versions, |ver| {
+                    resolve_one_with_progress(KernelId::Version(ver.to_string()), mp)
+                        .map_err(|e| format!("resolve kernel {ver}: {e}"))
+                }),
                 Err(e) => vec![Err(format!("{e:#}"))],
             }
         }
         other => vec![resolve_one_with_progress(other, mp)],
     }
+}
+
+/// Resolve every version of an expanded Range concurrently,
+/// preserving input (version) order in the returned Vec.
+///
+/// `Vec::into_par_iter` is an `IndexedParallelIterator`, so
+/// `collect` writes each result into its input slot — the output
+/// is in the same order as `versions` regardless of which worker
+/// finishes first (so a downstream `resolved[0] -> KTSTR_KERNEL`
+/// choice stays deterministic). The nested `into_par_iter` runs on
+/// whatever rayon pool the caller is installed under
+/// ([`resolve_specs_parallel`]'s bounded pool), sharing it via
+/// work-stealing rather than spawning a second pool, so
+/// `KTSTR_KERNEL_PARALLELISM` still bounds total width. `collect`
+/// gathers EVERY version's `Result` (Ok and Err alike); the
+/// caller's outer `collect::<Result<_, _>>` is what aborts the
+/// cohort on the first Err.
+///
+/// The per-version `resolve` closure is injected so this
+/// concurrency + order contract can be unit-tested without
+/// network / build I/O.
+fn resolve_versions_parallel<R>(
+    versions: Vec<String>,
+    resolve: R,
+) -> Vec<Result<(String, PathBuf), String>>
+where
+    R: Fn(&str) -> Result<(String, PathBuf), String> + Sync,
+{
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    versions.into_par_iter().map(|ver| resolve(&ver)).collect()
 }
 
 /// `resolve_one` plus per-resolve progress feedback.
@@ -473,14 +504,14 @@ fn resolve_one_with_progress(
 /// detection.
 ///
 /// Result-collecting fail-fast: rayon's `collect` on
-/// `Result<_, _>` short-circuits on the first error, so a
-/// single failed spec aborts the rest. This matches the
-/// pre-parallel loop's `?` propagation; the operator sees
-/// the first failure even though peers may still be in
-/// flight (their cleanup is owned by their tempdirs going
-/// out of scope, see `download_and_cache_version` /
-/// `resolve_git_kernel` for the `tempfile::TempDir`-driven
-/// teardown).
+/// `Result<_, _>` aborts on the first Err it observes — which
+/// failing spec surfaces is not deterministic under concurrency —
+/// discarding the other in-flight results. A single failure still
+/// aborts the whole resolve, matching the pre-parallel loop's `?`
+/// propagation (that loop surfaced errors in spec order). Peers
+/// still in flight clean up via their tempdirs going out of scope
+/// (see `download_and_cache_version` / `resolve_git_kernel` for
+/// the `tempfile::TempDir`-driven teardown).
 fn resolve_specs_parallel(
     specs: &[String],
     mp: &ktstr::cli::FetchProgress,
@@ -1025,6 +1056,67 @@ mod tests {
             "internal: resolve_one called with Range 6.10..6.12; \
              caller must expand Range via `expand_kernel_range` and \
              call `resolve_one` per version",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // resolve_versions_parallel — intra-range concurrency contract
+    // ---------------------------------------------------------------
+    //
+    // The Range arm of `resolve_one_spec` resolves expanded versions
+    // through this helper. Its two guarantees — output order == input
+    // order, and every version attempted (no inner short-circuit) —
+    // are what the doc asserts and what a downstream `resolved[0] ->
+    // KTSTR_KERNEL` choice relies on. Real Range resolves need network
+    // + build, so the per-version resolver is injected here to exercise
+    // the concurrency contract in isolation.
+
+    /// `Vec::into_par_iter` is indexed, so `collect` restores input
+    /// order regardless of completion order. A regression that swapped
+    /// the helper to an unindexed adaptor (e.g. `par_bridge`) would
+    /// shuffle the output and fail this.
+    #[test]
+    fn resolve_versions_parallel_preserves_input_order() {
+        let versions: Vec<String> = (0..64).map(|i| format!("6.{i}")).collect();
+        let out = resolve_versions_parallel(versions.clone(), |ver| {
+            Ok((
+                ver.to_string(),
+                std::path::PathBuf::from(format!("/fake/{ver}")),
+            ))
+        });
+        let labels: Vec<String> = out.into_iter().map(|r| r.unwrap().0).collect();
+        assert_eq!(
+            labels, versions,
+            "parallel resolve must return results in input (version) order"
+        );
+    }
+
+    /// The helper's `collect` gathers EVERY version's `Result` — it
+    /// does NOT short-circuit on the first Err (that is the caller's
+    /// outer `collect::<Result<_, _>>`'s job). So a failing version
+    /// leaves all N resolves attempted and its Err at its input index.
+    #[test]
+    fn resolve_versions_parallel_attempts_every_version_and_keeps_error_position() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let versions: Vec<String> = (0..32).map(|i| format!("6.{i}")).collect();
+        let attempts = AtomicUsize::new(0);
+        let out = resolve_versions_parallel(versions.clone(), |ver| {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            if ver == "6.7" {
+                Err(format!("boom {ver}"))
+            } else {
+                Ok((ver.to_string(), std::path::PathBuf::from(ver)))
+            }
+        });
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            versions.len(),
+            "every version must be attempted; the inner collect does not short-circuit"
+        );
+        assert_eq!(out.len(), versions.len());
+        assert!(
+            out.iter().enumerate().all(|(i, r)| (i == 7) == r.is_err()),
+            "only the 6.7 slot (input index 7) is Err; order preserved"
         );
     }
 
