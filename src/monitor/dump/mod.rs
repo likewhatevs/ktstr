@@ -3437,12 +3437,11 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
             };
             let payload_size =
                 elem_size.saturating_sub(sdt_offsets.data_header_size as u64) as usize;
-            // Pass the vmlinux base BTF so the heuristic excludes
-            // base-BTF type ids (kernel `*_ctx` structs of the same
-            // size as the scheduler's payload) from the candidate
-            // set. Without this filter the size-match arm could win
-            // on a vmlinux struct whose layout has nothing to do
-            // with the scheduler's allocator slot.
+            // `prog_btf` is split BTF: the scheduler's program types
+            // layered on the vmlinux base. `discover_payload_btf_id`
+            // probes only the program section's id range (via
+            // `Btf::split`), so vmlinux base `*_ctx` structs of the
+            // same size cannot shadow the scheduler's payload struct.
             let choice = discover_payload_btf_id(prog_btf, payload_size, &var_name);
 
             let snap = walk_sdt_allocator(

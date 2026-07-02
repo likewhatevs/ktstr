@@ -19,7 +19,7 @@
 //! 3. The freeze coordinator threads
 //!    `CastAnalysisOutput.cast_maps.first()` into
 //!    `DumpContext::cast_map` and `CastAnalysisOutput.fwd_index`
-//!    + `btfs` into `DumpContext::cross_btf_fwd_index` for the
+//!    plus `btfs` into `DumpContext::cross_btf_fwd_index` for the
 //!    dump pass.
 //! 4. The BPF program in `scx-ktstr/src/bpf/main.bpf.c` is
 //!    constructed so its bytecode contains the patterns the
@@ -92,13 +92,14 @@ const KTSTR_SCHED: Scheduler =
 /// cast intercept lives under `entries[].payload`. Returns the JSON
 /// value for the map; bails with a diagnostic if it cannot be found.
 fn find_task_storage_map(dump: &serde_json::Value) -> Result<&serde_json::Value> {
-    // BPF_MAP_TYPE_TASK_STORAGE = 23 in `enum bpf_map_type`. The
+    // BPF_MAP_TYPE_TASK_STORAGE = 29 in `enum bpf_map_type`
+    // (include/uapi/linux/bpf.h; 23 is BPF_MAP_TYPE_STACK). The
     // failure-dump JSON exposes the map_type integer verbatim from
     // libbpf, so we filter on that rather than the libbpf-name
     // (`scx_task_map` is the BPF-side var name; the kernel-side
     // info.name may carry a BTF section prefix on some libbpf
     // versions).
-    const BPF_MAP_TYPE_TASK_STORAGE: u64 = 23;
+    const BPF_MAP_TYPE_TASK_STORAGE: u64 = 29;
     let maps = dump
         .get("maps")
         .and_then(|m| m.as_array())

@@ -700,6 +700,7 @@ impl std::fmt::Display for FailureDumpMap {
         }
         if let Some(arena) = &self.arena {
             let total_pages = arena.pages.len();
+            let total_kib: usize = arena.pages.iter().map(|p| p.bytes.len()).sum::<usize>() / 1024;
             let nonzero = arena
                 .pages
                 .iter()
@@ -707,9 +708,8 @@ impl std::fmt::Display for FailureDumpMap {
                 .count();
             write!(
                 f,
-                "\narena: {total_pages} pages captured ({} KiB), \
+                "\narena: {total_pages} pages captured ({total_kib} KiB), \
                  {nonzero} non-zero (see sdt_alloc section + JSON for typed data)",
-                total_pages * 4,
             )?;
             if arena.truncated {
                 write!(f, " (truncated, {} declared)", arena.declared_pages)?;

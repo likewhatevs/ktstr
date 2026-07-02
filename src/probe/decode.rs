@@ -225,9 +225,13 @@ pub(crate) fn decode_named_value_hinted(
             }
             let state = (v >> TASK_STATE_SHIFT) & TASK_STATE_MASK;
             match state {
+                // NONE (0) = task carries no scx state; render nothing.
+                TASK_STATE_NONE => {}
+                TASK_STATE_INIT_BEGIN => parts.push("INIT_BEGIN"),
                 TASK_STATE_INIT => parts.push("INIT"),
                 TASK_STATE_READY => parts.push("READY"),
                 TASK_STATE_ENABLED => parts.push("ENABLED"),
+                TASK_STATE_DEAD => parts.push("DEAD"),
                 _ => {}
             }
             if parts.is_empty() {
@@ -576,12 +580,17 @@ mod tests {
     }
 
     #[test]
-    fn task_state_constants_sequential() {
-        assert_eq!(TASK_STATE_INIT, 1);
-        assert_eq!(TASK_STATE_READY, 2);
-        assert_eq!(TASK_STATE_ENABLED, 3);
-        // Mask covers all three states.
-        assert_eq!(TASK_STATE_MASK, 3);
+    fn task_state_constants_match_kernel_scx_ent_flags() {
+        // Kernel enum scx_ent_flags (include/linux/sched/ext.h):
+        // NONE=0, INIT_BEGIN=1, INIT=2, READY=3, ENABLED=4, DEAD=5,
+        // with SCX_TASK_STATE_BITS=3 (mask 7 within bits [10:8]).
+        assert_eq!(TASK_STATE_NONE, 0);
+        assert_eq!(TASK_STATE_INIT_BEGIN, 1);
+        assert_eq!(TASK_STATE_INIT, 2);
+        assert_eq!(TASK_STATE_READY, 3);
+        assert_eq!(TASK_STATE_ENABLED, 4);
+        assert_eq!(TASK_STATE_DEAD, 5);
+        assert_eq!(TASK_STATE_MASK, 7);
     }
 
     // -- additional decode tests --

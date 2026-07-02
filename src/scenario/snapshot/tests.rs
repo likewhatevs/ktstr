@@ -2237,6 +2237,74 @@ fn snapshot_bridge_store_with_stats_and_step_evicts_boundary_offset_in_lockstep(
     }
 }
 
+/// `drain()` (the non-stats variant) must clear the parallel
+/// `boundary_offset_ms` map. It returns only reports, so a stranded
+/// offset is invisible to its own caller — but a re-used bridge whose
+/// next capture re-uses a tag via the plain `store()` path (whose
+/// new-insert branch never removes a stale offset) would inherit the
+/// previous run's offset and mis-attribute the phase boundary. Pin
+/// that `drain()` scrubs the offset so a re-used tag starts clean.
+#[test]
+fn drain_clears_boundary_offset_so_reused_tag_does_not_inherit_stale_offset() {
+    let cb: CaptureCallback = Arc::new(|_| None);
+    let bridge = SnapshotBridge::new(cb);
+    // First run: a periodic capture carrying a phase-boundary offset.
+    bridge.store_with_stats_and_step(
+        "periodic_000",
+        FailureDumpReport::default(),
+        Some(Ok(serde_json::json!({"run": 1}))),
+        Some(0),
+        Some(1_500),
+        1,
+    );
+    // Non-stats drain: returns reports, drops the parallel metadata.
+    let _ = bridge.drain();
+    // Second run re-uses the tag via plain store() (no offset), which
+    // hits store_internal's new-insert branch — the branch that never
+    // removes a stale boundary_offset entry.
+    bridge.store("periodic_000", FailureDumpReport::default());
+    let drained = bridge.drain_ordered_with_stats();
+    let e = drained
+        .iter()
+        .find(|e| e.tag == "periodic_000")
+        .expect("re-used tag resident after second store");
+    assert_eq!(
+        e.boundary_offset_ms, None,
+        "drain() must clear boundary_offset_ms; a re-used tag must not \
+         inherit the previous run's stale phase-boundary offset",
+    );
+}
+
+/// Same invariant as the `drain()` test above, for the insertion-
+/// ordered `drain_ordered()` variant — it too must scrub
+/// `boundary_offset_ms` so a re-used tag does not inherit a stale
+/// phase-boundary offset.
+#[test]
+fn drain_ordered_clears_boundary_offset_so_reused_tag_does_not_inherit_stale_offset() {
+    let cb: CaptureCallback = Arc::new(|_| None);
+    let bridge = SnapshotBridge::new(cb);
+    bridge.store_with_stats_and_step(
+        "periodic_000",
+        FailureDumpReport::default(),
+        Some(Ok(serde_json::json!({"run": 1}))),
+        Some(0),
+        Some(1_500),
+        1,
+    );
+    let _ = bridge.drain_ordered();
+    bridge.store("periodic_000", FailureDumpReport::default());
+    let drained = bridge.drain_ordered_with_stats();
+    let e = drained
+        .iter()
+        .find(|e| e.tag == "periodic_000")
+        .expect("re-used tag resident after second store");
+    assert_eq!(
+        e.boundary_offset_ms, None,
+        "drain_ordered() must clear boundary_offset_ms; a re-used tag \
+         must not inherit the previous run's stale phase-boundary offset",
+    );
+}
+
 // ---------- stats_path JSON accessor ----------
 
 /// `stats_path` walks a JSON object along a dotted path and

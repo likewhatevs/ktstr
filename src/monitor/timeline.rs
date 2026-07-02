@@ -111,18 +111,18 @@ pub enum TimelineEvent {
         target_cpu: u32,
     },
     /// PI boost. Probe-context tid `prober_tid`; boosted task
-    /// `pid`. Old/new prio + sched-class id encoded as
-    /// (prio_u32 | (class_u32 << 32)). Field layout per
-    /// `src/bpf/intf.h::TL_EVT_PI_BOOST`.
+    /// `pid`. `old_prio`/`new_prio` are the boosted task's effective
+    /// kernel priority (signed `int`) before and after the boost.
+    /// Scheduling-class transitions are counted separately via the
+    /// `pi_class_changes` counter, not carried in this record. Field
+    /// layout per `src/bpf/intf.h::TL_EVT_PI_BOOST`.
     PiBoost {
         ts: u64,
         cpu: u32,
         prober_tid: u32,
         pid: u32,
-        old_prio: u32,
-        old_class_id: u32,
-        new_prio: u32,
-        new_class_id: u32,
+        old_prio: i32,
+        new_prio: i32,
     },
     /// Lock contention begin. `tid` is the waiter; `lock_kva` is
     /// the lock's kernel virtual address; `flags` carries the
@@ -212,19 +212,20 @@ fn decode_raw(raw: &TimelineEventRaw) -> TimelineEvent {
             target_cpu: raw.a as u32,
         },
         tl_evt::PI_BOOST => {
-            let old_prio = (raw.a & 0xffff_ffff) as u32;
-            let old_class_id = (raw.a >> 32) as u32;
-            let new_prio = (raw.b & 0xffff_ffff) as u32;
-            let new_class_id = (raw.b >> 32) as u32;
+            // The producer widens the signed kernel prio to u64 via
+            // (u64)(s64)prio; truncating back to i32 recovers the
+            // original signed value. No class id is packed in the high
+            // bits — class transitions surface via the pi_class_changes
+            // counter, not this record.
+            let old_prio = raw.a as i32;
+            let new_prio = raw.b as i32;
             TimelineEvent::PiBoost {
                 ts: raw.ts,
                 cpu: raw.cpu,
                 prober_tid: raw.prev_pid,
                 pid: raw.next_pid,
                 old_prio,
-                old_class_id,
                 new_prio,
-                new_class_id,
             }
         }
         tl_evt::LOCK_CONTEND => TimelineEvent::LockContend {
@@ -543,11 +544,15 @@ mod tests {
         }
     }
 
-    /// PiBoost record splits a/b into (prio | class_id<<32) pairs.
+    /// PiBoost carries the signed kernel prio in a/b, widened to u64
+    /// by the producer via `(u64)(s64)prio`. The decoder truncates
+    /// back to i32 — a negative prio (task boosted into the RT band)
+    /// must round-trip, which the old `(prio | class_id<<32)` split
+    /// corrupted by reading the sign-extension bits as a class id.
     #[test]
     fn parse_pi_boost_record() {
-        let old_a = 120u64 | (3u64 << 32); // prio=120, class_id=3 (rt)
-        let new_b = 100u64 | (1u64 << 32); // prio=100, class_id=1 (cfs)
+        let old_a = (120i32 as i64) as u64; // prio=120 (normal band)
+        let new_b = (-1i32 as i64) as u64; // prio=-1 (sign-extended)
         let bytes = raw(tl_evt::PI_BOOST, 2, 4_000_000, 10, 11, old_a, new_b);
         let ev = parse_timeline_record(&bytes).unwrap();
         match ev {
@@ -555,17 +560,13 @@ mod tests {
                 prober_tid,
                 pid,
                 old_prio,
-                old_class_id,
                 new_prio,
-                new_class_id,
                 ..
             } => {
                 assert_eq!(prober_tid, 10);
                 assert_eq!(pid, 11);
                 assert_eq!(old_prio, 120);
-                assert_eq!(old_class_id, 3);
-                assert_eq!(new_prio, 100);
-                assert_eq!(new_class_id, 1);
+                assert_eq!(new_prio, -1);
             }
             other => panic!("expected PiBoost, got {other:?}"),
         }
@@ -722,9 +723,7 @@ mod tests {
                 prober_tid: 1,
                 pid: 2,
                 old_prio: 120,
-                old_class_id: 3,
                 new_prio: 100,
-                new_class_id: 1,
             },
             TimelineEvent::LockContend {
                 ts: 5,

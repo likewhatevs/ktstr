@@ -406,8 +406,7 @@ const RT_DEFAULT_PRIO: u32 = 50;
 impl SchedClass {
     /// Resolve to an equivalent [`SchedPolicy`]. `Rt` uses
     /// `RT_DEFAULT_PRIO`; `Deadline` uses the minimum-bandwidth
-    /// reservation (1us runtime, 1ms deadline, 10ms period —
-    /// passes
+    /// reservation (2us runtime, 1ms deadline, 10ms period — passes
     /// `__checkparam_dl` and the default sysctl bounds).
     /// `Ext` maps to `SchedPolicy::Normal` because there is no
     /// userspace `SCHED_EXT` constant in libc; tests that want
@@ -425,13 +424,13 @@ impl SchedClass {
     }
 
     /// Minimum-bandwidth `SCHED_DEADLINE` reservation that passes
-    /// `__checkparam_dl`'s `runtime >= DL_SCALE` floor and the
-    /// kernel's default `sched_deadline_period_min_us` (100us).
-    /// 1us runtime, 1ms deadline, 10ms period — bandwidth fraction
-    /// 0.0001, well below admission-control limits.
+    /// `__checkparam_dl`'s `runtime >= (1 << DL_SCALE)` (1024ns)
+    /// floor and the kernel's default `sched_deadline_period_min_us`
+    /// (100us). 2us runtime, 1ms deadline, 10ms period — bandwidth
+    /// fraction 0.0002, well below admission-control limits.
     pub const fn default_deadline_reservation() -> SchedPolicy {
         SchedPolicy::Deadline {
-            runtime: Duration::from_micros(1),
+            runtime: Duration::from_micros(2),
             deadline: Duration::from_millis(1),
             period: Duration::from_millis(10),
         }

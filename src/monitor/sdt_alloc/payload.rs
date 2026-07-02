@@ -53,28 +53,34 @@ pub fn discover_payload_btf_id(
     }
     let mut size_matches: Vec<(u32, String)> = Vec::new();
 
-    // btf-rs 2.0.0 exposes `Btf::type_iter()`, but we keep the
-    // explicit id-probe loop because it lets us early-bail on a run
-    // of consecutive lookup failures rather than materializing the
-    // whole type table. Probe ids 1..N. BTF type ids are dense
-    // within a single object's BTF
-    // section (libbpf assigns them sequentially during compile), and
-    // for split BTF the program-BTF ids start at `base_nr_types + 1`
-    // contiguously. A run of CONSECUTIVE_FAIL_CAP failed lookups
-    // indicates the table is exhausted; bailing early is the
-    // performance fix for the prior pattern that walked all
-    // MAX_BTF_ID_PROBE (100k) ids when only a few hundred existed.
+    // For split BTF — the scheduler's program types layered on the
+    // vmlinux base — probe ONLY the program section's id range so
+    // vmlinux base structs of the same size (kernel `*_ctx` structs,
+    // etc.) cannot shadow the scheduler's payload struct. `Btf::split`
+    // returns the program section for split BTF (None otherwise) and
+    // its `type_id_range` starts at `base_nr_types + 1`; for non-split
+    // BTF the whole object is the candidate set.
     //
-    // The hard ceiling [`MAX_BTF_ID_PROBE`] still bounds the worst
-    // case (sparse-id table, defensive). Real ktstr program BTFs
-    // top out in the low thousands of types; 64 consecutive failures
-    // is generous (a sparse gap of 64 in a contiguous BTF means the
-    // generator is broken in a way the heuristic can't help with).
+    // Within that range we keep an explicit id-probe loop (rather than
+    // `Btf::type_iter`) so a run of CONSECUTIVE_FAIL_CAP consecutive
+    // lookup failures early-bails on a sparse-id table. `probe_scan_end`
+    // bounds the WINDOW to MAX_BTF_ID_PROBE ids from `first_id` — for
+    // split BTF `first_id` is base-relative (`base_nr_types + 1`), so an
+    // ABSOLUTE ceiling would scan zero ids once the vmlinux base exceeds
+    // MAX_BTF_ID_PROBE (real DEBUG_INFO_BTF kernels carry 80k-160k+ base
+    // types). Real ktstr program BTFs top out in the low thousands, so
+    // the window normally covers the whole program range.
     const CONSECUTIVE_FAIL_CAP: u32 = 64;
 
-    let mut tid: u32 = 1;
+    let (first_id, last_id) = match btf.split() {
+        Some(prog) => prog.type_id_range(),
+        None => btf.base().type_id_range(),
+    };
+    let scan_end = probe_scan_end(first_id, last_id);
+
+    let mut tid: u32 = first_id.max(1);
     let mut consecutive_fail: u32 = 0;
-    while tid < MAX_BTF_ID_PROBE {
+    while tid <= scan_end {
         match btf.resolve_type_by_id(tid) {
             Ok(ty) => {
                 consecutive_fail = 0;
@@ -176,5 +182,49 @@ pub fn discover_payload_btf_id(
                 reason: format!("ambiguous: {n} candidates"),
             }
         }
+    }
+}
+
+/// Inclusive upper id for the probe scan window. Bounds the NUMBER of
+/// ids probed to [`MAX_BTF_ID_PROBE`] starting at `first_id`, rather
+/// than an absolute id ceiling: for split BTF `first_id` is
+/// base-relative (`base_nr_types + 1`), so an absolute ceiling would
+/// scan zero ids once the vmlinux base exceeds MAX_BTF_ID_PROBE. Also
+/// clamped to `last_id` (the section's real last id).
+fn probe_scan_end(first_id: u32, last_id: u32) -> u32 {
+    last_id.min(first_id.saturating_add(MAX_BTF_ID_PROBE).saturating_sub(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_scan_end_bounds_window_not_absolute_id() {
+        // Small base (non-split or tiny base): the window dwarfs the
+        // program range, so the scan end is simply `last_id`.
+        assert_eq!(probe_scan_end(1, 50), 50);
+        assert_eq!(probe_scan_end(3, 500), 500);
+
+        // Large base pushes first_id past the absolute cap. An absolute
+        // `MAX_BTF_ID_PROBE - 1` (= 99_999) ceiling would be < first_id
+        // → an empty scan window → every split payload silently
+        // unresolved (the empty-scan regression). The window-relative
+        // bound must still reach the program range.
+        let first = MAX_BTF_ID_PROBE + 1; // 100_001, base ~100k types
+        let last = first + 4; // a 5-type program section
+        let end = probe_scan_end(first, last);
+        assert_eq!(end, last, "window must cover the full program range");
+        assert!(
+            end >= first,
+            "scan window must reach first_id even when the base exceeds \
+             MAX_BTF_ID_PROBE (got end={end}, first={first})"
+        );
+
+        // A corrupt/huge last_id is bounded to MAX_BTF_ID_PROBE ids
+        // from first_id (defensive window cap).
+        assert_eq!(probe_scan_end(10, u32::MAX), 10 + MAX_BTF_ID_PROBE - 1);
+        // saturating arithmetic guards first_id near u32::MAX.
+        assert_eq!(probe_scan_end(u32::MAX, u32::MAX), u32::MAX - 1);
     }
 }

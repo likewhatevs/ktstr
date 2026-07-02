@@ -81,16 +81,61 @@ const BPF_BTF_GET_FD_BY_ID: u32 = 0x13;
 /// `BPF_OBJ_NAME_LEN` from `include/uapi/linux/bpf.h`.
 const BPF_OBJ_NAME_LEN: usize = 16;
 
-/// Page size for arena mmap. `arena.c` operates at the host kernel's
-/// base `PAGE_SIZE` (`arena_map_alloc` computes
-/// `vm_range = max_entries * PAGE_SIZE`; `arena_vm_fault` uses
-/// `apply_to_page_range`/`flush_vmap_cache` at `PAGE_SIZE` stride).
-/// That is arch-dependent: 4 KiB on x86_64, 16 KiB/64 KiB on aarch64
-/// (base granule, distinct from THP/hugetlb). This hardcoded 4096 is
-/// only correct on 4K-granule hosts; the guest-memory backend instead
-/// parameterizes page size at runtime via `guest_page_size(tcr_el1)`
-/// (`src/monitor/arena.rs`).
+/// Fallback arena page size (4 KiB), used only if
+/// `sysconf(_SC_PAGESIZE)` fails — which it cannot on Linux. The real
+/// unit is the host kernel's base `PAGE_SIZE`: `arena_map_alloc`
+/// computes `vm_range = max_entries * PAGE_SIZE` and `arena_vm_fault`
+/// faults at `PAGE_SIZE` stride, both arch-dependent (4 KiB on x86_64,
+/// 16 KiB/64 KiB on aarch64 base granule, distinct from THP/hugetlb).
+/// `read_arena_pages` reads the live value via `host_page_size` so the
+/// mmap length matches the kernel's `user_vm_end` on every arch; the
+/// guest-memory backend parameterizes page size the same way via
+/// `guest_page_size(tcr_el1)` (`src/monitor/arena.rs`).
 const ARENA_PAGE_SIZE: usize = 4096;
+
+/// Page size of the kernel that owns the arena fd, via
+/// `sysconf(_SC_PAGESIZE)`. `read_arena_pages` mmaps the arena fd in
+/// the process holding it, so that process always runs on the arena's
+/// own kernel — the guest VM kernel in the in-guest monitor path
+/// (where scx-ktstr's arena lives), or the host kernel in live-host
+/// mode. That kernel created the arena with `vm_range = max_entries *
+/// PAGE_SIZE`, so this is exactly the unit that makes the mmap length
+/// match `user_vm_end`. Falls back to `ARENA_PAGE_SIZE` (4 KiB) only
+/// if the query fails, which it cannot on Linux.
+fn host_page_size() -> usize {
+    // SAFETY: `sysconf` with a valid name has no preconditions and
+    // writes through no pointer.
+    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if v > 0 { v as usize } else { ARENA_PAGE_SIZE }
+}
+
+/// mmap placement for an arena read: `(addr_hint, flags, length)`
+/// where `addr_hint == 0` means NULL (let the kernel choose the VA).
+///
+/// When the arena was created with a nonzero `map_extra` (scx
+/// schedulers do, via `lib/arena_map.h`), the kernel pins
+/// `user_vm_start`/`user_vm_end`, and `arena_map_mmap`
+/// (`kernel/bpf/arena.c`) rejects any mapping whose start != map_extra
+/// OR whose end != map_extra + full arena span with `-EBUSY`. So the
+/// read must land at exactly `map_extra` with `MAP_FIXED_NOREPLACE`
+/// and span the full `declared_bytes` — not the capped read window.
+/// When `user_vm_start == 0` the kernel adopts our VA, so a NULL hint
+/// plus the capped prefix is correct and bounds host address-space use.
+fn arena_mmap_placement(
+    user_vm_start: u64,
+    declared_bytes: usize,
+    read_bytes: usize,
+) -> (usize, i32, usize) {
+    if user_vm_start != 0 {
+        (
+            user_vm_start as usize,
+            libc::MAP_SHARED | libc::MAP_FIXED_NOREPLACE,
+            declared_bytes,
+        )
+    } else {
+        (0, libc::MAP_SHARED, read_bytes)
+    }
+}
 
 /// Maximum total bytes the arena snapshot reads via mmap, mirroring the
 /// guest-memory backend's `MAX_VM_RANGE_BYTES`. Keeps a runaway
@@ -901,12 +946,18 @@ impl BpfMapAccessor for BpfSyscallAccessor {
             return ArenaSnapshot::default();
         }
 
-        // Compute declared span. Same caps as the guest-memory side
-        // for cross-backend parity.
-        let declared_bytes_raw = (map.max_entries as u64).saturating_mul(ARENA_PAGE_SIZE as u64);
+        // The kernel sizes the arena as `max_entries * PAGE_SIZE`
+        // (`arena_map_alloc`) at the host base page size; read it at
+        // runtime so the span — and the mmap length below — match what
+        // the kernel pinned as `user_vm_end`. A hardcoded 4 KiB would
+        // under-size the mapping on a 16 KiB-granule host and trip
+        // `arena_map_mmap`'s `user_vm_end` check (-EBUSY). Same caps as
+        // the guest-memory side for cross-backend parity.
+        let page_size = host_page_size();
+        let declared_bytes_raw = (map.max_entries as u64).saturating_mul(page_size as u64);
         let span_capped = declared_bytes_raw > MAX_ARENA_BYTES;
         let declared_bytes = declared_bytes_raw.min(MAX_ARENA_BYTES);
-        let declared_pages = declared_bytes / ARENA_PAGE_SIZE as u64;
+        let declared_pages = declared_bytes / page_size as u64;
 
         // Use map_extra as the user_vm_start anchor. BPF programs
         // see arena addresses at this base (lib/arena_map.h hardcodes
@@ -929,42 +980,54 @@ impl BpfMapAccessor for BpfSyscallAccessor {
             };
         }
 
-        // mmap the arena fd at offset 0 over the declared span with
-        // PROT_READ + MAP_SHARED. This only reserves the window; the
-        // kernel's arena_vm_fault populates pages on demand. Pages
-        // whose pgoff was never touched by the BPF program are not
-        // resident, so instead of reading them (and risking a fault)
-        // we use mincore() below to filter to the resident set and
-        // read only those.
-        //
-        // Capping the mmap span at MAX_ARENA_PAGES * 4 KiB matches
-        // the sequential-prefix cap on the guest-memory side; the
-        // tail isn't stride-probed here because mmap covers the
-        // whole window already. The `truncated` flag on
-        // ArenaSnapshot still fires when the cap kicks in, for
-        // operator visibility.
-        let walk_pages = declared_pages.min(MAX_ARENA_PAGES);
-        let walk_bytes = (walk_pages as usize) * ARENA_PAGE_SIZE;
-        let truncated = declared_pages > walk_pages;
+        // The read window is capped at MAX_ARENA_PAGES so a huge arena
+        // can't drive an unbounded mincore/read loop; `truncated`
+        // surfaces the cap. mincore() below filters to the resident set
+        // (arena_vm_fault populates pages on demand, so pages the BPF
+        // program never touched are absent) and we read only those.
+        let read_pages = declared_pages.min(MAX_ARENA_PAGES);
+        let read_bytes = (read_pages as usize) * page_size;
+        let truncated = declared_pages > read_pages;
 
-        // SAFETY: mmap with PROT_READ + MAP_SHARED on the arena fd
-        // is exactly what the kernel exports for arena maps. The
-        // `arena_map_mmap` op (`kernel/bpf/arena.c::arena_map_mmap`)
-        // is the userspace mmap entry point; passing length =
-        // walk_bytes and offset 0 maps the prefix.
+        // Placement: when map_extra was set at arena creation the
+        // kernel pinned user_vm_start/user_vm_end, so the read must map
+        // the FULL arena at exactly map_extra (MAP_FIXED_NOREPLACE) or
+        // arena_map_mmap returns -EBUSY. See `arena_mmap_placement`.
+        let (hint, mmap_flags, mmap_bytes) =
+            arena_mmap_placement(user_vm_start, declared_bytes as usize, read_bytes);
+
+        // SAFETY: mmap with PROT_READ + MAP_SHARED on an arena fd is
+        // exactly what `arena_map_mmap` (`kernel/bpf/arena.c`) exports;
+        // offset 0 is required (the op rejects a nonzero vm_pgoff).
+        // MAP_FIXED_NOREPLACE places the mapping at the kernel-blessed
+        // VA without clobbering an existing one (fails EEXIST instead).
         let addr = unsafe {
             libc::mmap(
-                ptr::null_mut(),
-                walk_bytes,
+                if hint == 0 {
+                    ptr::null_mut()
+                } else {
+                    hint as *mut libc::c_void
+                },
+                mmap_bytes,
                 libc::PROT_READ,
-                libc::MAP_SHARED,
+                mmap_flags,
                 pinned.fd.as_raw_fd(),
                 0,
             )
         };
         if addr == libc::MAP_FAILED {
-            // mmap rejected — return an empty snapshot with the
-            // declared/truncation hints filled in for visibility.
+            // mmap rejected (e.g. -EBUSY if the arena's user VA is
+            // pinned elsewhere, EEXIST if map_extra's VA is already
+            // mapped in this process). Log it: a silently empty arena
+            // snapshot reads as "arena is empty" when it is actually
+            // unreadable — exactly how the prior NULL-hint bug hid.
+            let err = std::io::Error::last_os_error();
+            tracing::warn!(
+                user_vm_start = format_args!("{user_vm_start:#x}"),
+                mmap_bytes,
+                error = %err,
+                "read_arena_pages: mmap of arena fd failed; returning empty snapshot"
+            );
             return ArenaSnapshot {
                 pages: Vec::new(),
                 truncated,
@@ -980,8 +1043,8 @@ impl BpfMapAccessor for BpfSyscallAccessor {
         // to filter out pages that aren't present, then read only the
         // present ones. mincore returns 0 for
         // resident pages, < 0 on error.
-        let mut residency = vec![0u8; walk_pages as usize];
-        let mincore_ret = unsafe { libc::mincore(addr, walk_bytes, residency.as_mut_ptr()) };
+        let mut residency = vec![0u8; read_pages as usize];
+        let mincore_ret = unsafe { libc::mincore(addr, read_bytes, residency.as_mut_ptr()) };
         if mincore_ret == 0 {
             for (idx, &resident) in residency.iter().enumerate() {
                 if resident & 1 == 0 {
@@ -989,15 +1052,15 @@ impl BpfMapAccessor for BpfSyscallAccessor {
                     // populated by the BPF program. Skip.
                     continue;
                 }
-                let page_addr = (addr as usize) + idx * ARENA_PAGE_SIZE;
+                let page_addr = (addr as usize) + idx * page_size;
                 // SAFETY: page is resident per mincore; reading
-                // ARENA_PAGE_SIZE bytes is in-bounds.
-                let mut buf = vec![0u8; ARENA_PAGE_SIZE];
+                // page_size bytes is in-bounds.
+                let mut buf = vec![0u8; page_size];
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         page_addr as *const u8,
                         buf.as_mut_ptr(),
-                        ARENA_PAGE_SIZE,
+                        page_size,
                     );
                 }
                 // user_vm_start comes from the BPF map's map_extra
@@ -1006,7 +1069,7 @@ impl BpfMapAccessor for BpfSyscallAccessor {
                 // past u64::MAX. Skip the page rather than emit a
                 // wrapped address that consumers would treat as
                 // legitimate.
-                let Some(idx_offset) = (idx as u64).checked_mul(ARENA_PAGE_SIZE as u64) else {
+                let Some(idx_offset) = (idx as u64).checked_mul(page_size as u64) else {
                     continue;
                 };
                 let Some(user_addr) = user_vm_start.checked_add(idx_offset) else {
@@ -1022,7 +1085,7 @@ impl BpfMapAccessor for BpfSyscallAccessor {
         // SAFETY: we created this mapping above and aren't using it
         // after this point.
         unsafe {
-            libc::munmap(addr, walk_bytes);
+            libc::munmap(addr, mmap_bytes);
         }
 
         ArenaSnapshot {
@@ -1512,6 +1575,28 @@ mod tests {
         let capped = acc_max.read_arena_pages(&arena_max, &offsets);
         assert!(capped.span_capped, "u32::MAX max_entries must cap the span");
         assert_eq!(capped.user_vm_start, 0x2000);
+    }
+
+    #[test]
+    fn arena_mmap_placement_map_extra_pins_full_span_fixed_noreplace() {
+        // map_extra set (nonzero user_vm_start): the read must land at
+        // exactly map_extra and span the FULL declared arena (not the
+        // capped read window) with MAP_FIXED_NOREPLACE, or
+        // arena_map_mmap returns -EBUSY on the user_vm_start/end check.
+        let (hint, flags, len) = arena_mmap_placement(0x1_0000_0000, 8192, 4096);
+        assert_eq!(hint, 0x1_0000_0000, "hint must be map_extra, not NULL");
+        assert_eq!(flags, libc::MAP_SHARED | libc::MAP_FIXED_NOREPLACE);
+        assert_eq!(len, 8192, "full declared span, not the capped read window");
+    }
+
+    #[test]
+    fn arena_mmap_placement_no_map_extra_uses_null_capped_prefix() {
+        // map_extra == 0: the kernel adopts our VA, so a NULL hint and
+        // the capped read window are correct.
+        let (hint, flags, len) = arena_mmap_placement(0, 8192, 4096);
+        assert_eq!(hint, 0, "NULL hint — kernel chooses the VA");
+        assert_eq!(flags, libc::MAP_SHARED);
+        assert_eq!(len, 4096, "capped read window, not the full declared span");
     }
 
     /// `load_program_btf` returns `None` immediately when

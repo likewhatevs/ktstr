@@ -1360,15 +1360,16 @@ impl SnapshotBridge {
     }
 
     /// Take ownership of the captured snapshots, leaving the bridge
-    /// empty. Drops any periodic-capture stats / elapsed metadata
-    /// stored alongside reports — callers that need the stats JSON
-    /// or per-sample timestamp must use
+    /// empty. Drops any periodic-capture stats / elapsed / boundary-
+    /// offset metadata stored alongside reports — callers that need
+    /// the stats JSON or per-sample timestamp must use
     /// [`Self::drain_ordered_with_stats`] instead.
     pub fn drain(&self) -> HashMap<String, FailureDumpReport> {
         let mut store = self.snapshots.lock_unpoisoned();
         store.order.clear();
         store.stats.clear();
         store.elapsed_ms.clear();
+        store.boundary_offset_ms.clear();
         store.step_index.clear();
         std::mem::take(&mut store.reports)
     }
@@ -1397,11 +1398,12 @@ impl SnapshotBridge {
         let mut store = self.snapshots.lock_unpoisoned();
         let order = std::mem::take(&mut store.order);
         let mut reports = std::mem::take(&mut store.reports);
-        // Stats / elapsed / step_index are dropped with the bridge —
-        // callers that need the parallel data must use
-        // `drain_ordered_with_stats` instead.
+        // Stats / elapsed / boundary_offset / step_index are dropped
+        // with the bridge — callers that need the parallel data must
+        // use `drain_ordered_with_stats` instead.
         store.stats.clear();
         store.elapsed_ms.clear();
+        store.boundary_offset_ms.clear();
         store.step_index.clear();
         let mut out: Vec<(String, FailureDumpReport)> = Vec::with_capacity(order.len());
         for tag in order {

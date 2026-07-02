@@ -98,9 +98,14 @@ pub const OPS_DISPATCHING: u64 = 3;
 pub const TASK_QUEUED: u64 = 1 << 0;
 pub const TASK_RESET_RUNNABLE_AT: u64 = 1 << 2;
 pub const TASK_DEQD_FOR_SLEEP: u64 = 1 << 3;
-// State bits [10:8]
+// State bits [10:8] — kernel enum scx_ent_flags
+// (include/linux/sched/ext.h): SCX_TASK_STATE_BITS=3, so the mask is
+// 7<<8 and the states run 0..=5.
 pub const TASK_STATE_SHIFT: u32 = 8;
-pub const TASK_STATE_MASK: u64 = 3;
-pub const TASK_STATE_INIT: u64 = 1;
-pub const TASK_STATE_READY: u64 = 2;
-pub const TASK_STATE_ENABLED: u64 = 3;
+pub const TASK_STATE_MASK: u64 = 7;
+pub const TASK_STATE_NONE: u64 = 0;
+pub const TASK_STATE_INIT_BEGIN: u64 = 1;
+pub const TASK_STATE_INIT: u64 = 2;
+pub const TASK_STATE_READY: u64 = 3;
+pub const TASK_STATE_ENABLED: u64 = 4;
+pub const TASK_STATE_DEAD: u64 = 5;

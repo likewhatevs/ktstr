@@ -189,15 +189,6 @@ fn host_mode_workers_pct_scales_to_host_cpu_count(
 ) -> Result<AssertResult, anyhow::Error> {
     let all_cpus = ctx.topo.all_cpus().len();
     let usable = ctx.topo.usable_cpuset().len();
-    if usable != all_cpus {
-        return Ok(AssertResult::fail_msg(format!(
-            "ctx.topo.usable_cpuset().len()={usable} != all_cpus().len()={all_cpus}: \
-             the operator restricted CPUs via KTSTR_NO_PERF_MODE / KTSTR_CPU_CAP \
-             or a sched_setaffinity policy, so this test cannot prove that \
-             workers_pct(1.0) scales to ALL host CPUs. Unset CPU restrictions \
-             or skip this test."
-        )));
-    }
     if all_cpus < 4 {
         // Test environment limitation: cargo-ktstr's no_perf_mode +
         // mount-namespace sandbox narrows sysfs and sched_getaffinity
@@ -216,6 +207,25 @@ fn host_mode_workers_pct_scales_to_host_cpu_count(
              sched_getaffinity); the workers_pct scaling check cannot \
              reliably trigger. Run on a real-host CI with >= 4 visible \
              CPUs to gate."
+        )));
+    }
+    // Real multi-CPU host visible (>= 4). `usable_cpus` reserves the
+    // last CPU for the root cgroup when the host has > 2 CPUs, so the
+    // usable set is exactly `all_cpus - 1`. workers_pct(1.0) resolves
+    // to `usable_cpuset().len()` (the cpuset `apply_setup` feeds
+    // `resolve_workers_pct`), so pinning `usable == all_cpus - 1` with
+    // `all_cpus >= 4` proves host_only routed topology through
+    // `from_system` (the real host count), not the VM-default fallback
+    // — and that a workers_pct(1.0) workload therefore spawns one
+    // worker per usable host CPU.
+    let expected_usable = all_cpus - 1;
+    if usable != expected_usable {
+        return Ok(AssertResult::fail_msg(format!(
+            "ctx.topo.usable_cpuset().len()={usable} != all_cpus().len()-1={expected_usable} \
+             (the last CPU is reserved for the root cgroup when > 2 CPUs). The \
+             usable set diverged from the topology default — an operator CPU \
+             restriction (KTSTR_NO_PERF_MODE / KTSTR_CPU_CAP / a sched_setaffinity \
+             policy) intersected it. Unset the restriction or skip this test."
         )));
     }
     Ok(AssertResult::pass())
