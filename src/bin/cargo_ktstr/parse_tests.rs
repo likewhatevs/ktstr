@@ -194,7 +194,10 @@ fn parse_perf_delta_flags_and_defaults() {
             nextest_profile,
             args,
         } => {
-            assert!(args.is_empty(), "bare perf-delta parses no cargo passthrough");
+            assert!(
+                args.is_empty(),
+                "bare perf-delta parses no cargo passthrough"
+            );
             assert!(base.is_none() && base_ref.is_none() && filter.is_none());
             assert_eq!(default_branch, "main");
             assert!(kernel.is_none());
@@ -649,10 +652,7 @@ fn parse_test_with_nextest_profile_flag() {
         profile.is_none(),
         "`--nextest-profile` must NOT set --profile (the scheduler build profile)"
     );
-    assert!(
-        !release,
-        "`--nextest-profile` alone must NOT set --release"
-    );
+    assert!(!release, "`--nextest-profile` alone must NOT set --release");
 }
 
 /// Pin `trailing_var_arg` args forwarded verbatim after `--`.
@@ -2921,7 +2921,11 @@ fn parse_replay_all_flags_and_passthrough() {
         Some(std::path::Path::new("/tmp/archived-runs")),
         "--dir round-trips to Some(PathBuf)"
     );
-    assert_eq!(filter.as_deref(), Some("scheduler_"), "-E filter round-trips");
+    assert_eq!(
+        filter.as_deref(),
+        Some("scheduler_"),
+        "-E filter round-trips"
+    );
     assert!(exec, "--exec lifts the flag to true");
     assert_eq!(profile.as_deref(), Some("dev"), "--profile round-trips");
     assert_eq!(

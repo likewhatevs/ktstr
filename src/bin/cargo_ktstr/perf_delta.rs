@@ -930,7 +930,14 @@ mod tests {
         // Filter only, appended as `test`'s trailing args.
         assert_eq!(
             perf_test_argv("6.14", Some("test(perf_smoke)"), None, None, &[]),
-            expect(&["ktstr", "test", "--kernel", "6.14", "-E", "test(perf_smoke)"]),
+            expect(&[
+                "ktstr",
+                "test",
+                "--kernel",
+                "6.14",
+                "-E",
+                "test(perf_smoke)"
+            ]),
         );
         // Passthrough forwarded verbatim AFTER the filter, so feature
         // selection reaches BOTH baseline and HEAD `cargo ktstr test`.
