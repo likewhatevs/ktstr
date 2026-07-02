@@ -63,7 +63,7 @@ Add ktstr as a dev-dependency:
 
 ```toml
 [dev-dependencies]
-ktstr = { version = "0.20.0" }
+ktstr = { version = "0.21.0" }
 ```
 
 To host a ktstr test in an external scheduler crate (gated behind a

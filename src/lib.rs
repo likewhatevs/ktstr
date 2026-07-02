@@ -159,7 +159,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! ktstr = "0.20.0"
+//! ktstr = "0.21.0"
 //! ```
 //!
 //! Lean dev-dep (drops the host-tooling crates: tikv-jemallocator,
@@ -168,7 +168,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! ktstr = { version = "0.20.0", default-features = false, features = ["llm"] }
+//! ktstr = { version = "0.21.0", default-features = false, features = ["llm"] }
 //! ```
 //!
 //! # Feature flags
