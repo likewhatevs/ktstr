@@ -290,8 +290,14 @@ struct RunPlans {
 }
 
 impl KtstrVmBuilder {
-    /// Path to the guest kernel: either a source directory (the VMM
-    /// extracts `arch/*/boot/{bzImage,Image}`) or a prebuilt image.
+    /// Path to the guest kernel IMAGE file (a prebuilt `bzImage` /
+    /// `Image`); [`build`](Self::build) loads it verbatim and does NOT
+    /// extract a source tree, so a directory here fails at load with
+    /// "Unable to read bzImage header". For a source-tree ROOT use
+    /// [`kernel_dir`](Self::kernel_dir) (resolves `arch/<arch>/boot/…`),
+    /// or resolve the image yourself first (e.g.
+    /// `crate::kernel_path::find_image_in_dir`, which also handles the
+    /// cache `<dir>/bzImage` layout).
     pub fn kernel(mut self, path: impl Into<PathBuf>) -> Self {
         self.kernel = Some(path.into());
         self

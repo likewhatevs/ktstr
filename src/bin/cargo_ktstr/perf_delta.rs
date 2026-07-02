@@ -180,22 +180,60 @@ fn worktree_remove_argv(wt_dir: &Path) -> Vec<String> {
     ]
 }
 
-/// `cargo ktstr test --kernel <k> [-E <filter>]` argv (after the
-/// `cargo` program name). The baseline child runs the SAME selection
-/// as HEAD; `KTSTR_PERF_ONLY` in the env (see [`baseline_child_env`])
-/// restricts both ends to `performance_mode` tests, and `-E` narrows
-/// within that set.
-fn perf_test_argv(kernel: &str, filter: Option<&str>) -> Vec<String> {
+/// `cargo ktstr test --kernel <k> [-E <filter>] [<passthrough>...]` argv
+/// (after the `cargo` program name). The baseline child runs the SAME
+/// selection as HEAD; `KTSTR_PERF_ONLY` in the env (see
+/// [`baseline_child_env`]) restricts both ends to `performance_mode`
+/// tests, and `-E` narrows within that set.
+///
+/// `filter` (`-E`) and `passthrough` (the user's cargo/nextest flags,
+/// e.g. `--features integration,wprof`) become the inner `test`'s
+/// `trailing_var_arg`, which `run_cargo_sub` forwards verbatim to
+/// `cargo nextest run`. Forwarding to BOTH sides is load-bearing: a
+/// delta computed across mismatched feature selections is not a
+/// like-for-like comparison, and — before this — the baseline/HEAD
+/// `cargo ktstr test` built with default features, so feature-gated
+/// `performance_mode` tests produced no sidecars and the compare found
+/// nothing.
+///
+/// `profile` (`--profile <NAME>`, the scheduler BUILD profile) and
+/// `nextest_profile` (`--nextest-profile <NAME>`, the nextest test
+/// profile) are emitted as NATIVE `cargo ktstr test` flags — right after
+/// `--kernel <k>` and BEFORE the `-E` / passthrough trailing capture,
+/// which starts at the first unrecognized token. Omitting `profile`
+/// leaves the scheduler at its release default (see
+/// [`ktstr::build_and_find_binary`]); both are forwarded to BOTH sides so
+/// baseline and HEAD build identically.
+fn perf_test_argv(
+    kernel: &str,
+    filter: Option<&str>,
+    profile: Option<&str>,
+    nextest_profile: Option<&str>,
+    passthrough: &[String],
+) -> Vec<String> {
     let mut v = vec![
         "ktstr".to_string(),
         "test".to_string(),
         "--kernel".to_string(),
         kernel.to_string(),
     ];
+    // Native `cargo ktstr test` flags MUST precede the trailing capture
+    // (`-E` / passthrough): clap starts the `trailing_var_arg` group at
+    // the first unrecognized token, so a native flag placed after `-E`
+    // would be swallowed into the passthrough.
+    if let Some(p) = profile {
+        v.push("--profile".to_string());
+        v.push(p.to_string());
+    }
+    if let Some(np) = nextest_profile {
+        v.push("--nextest-profile".to_string());
+        v.push(np.to_string());
+    }
     if let Some(f) = filter {
         v.push("-E".to_string());
         v.push(f.to_string());
     }
+    v.extend(passthrough.iter().cloned());
     v
 }
 
@@ -274,12 +312,16 @@ fn resolve_kernel_for_children(repo_root: &Path, kernel: &str) -> String {
 ///
 /// `gix` 0.83 has no worktree-creation API (only list/inspect), so the
 /// worktree is managed by shelling `git worktree add/remove`.
+#[allow(clippy::too_many_arguments)]
 fn dual_run(
     repo_root: &Path,
     baseline_full_hex: &str,
     baseline_short: &str,
     kernel: &str,
     filter: Option<&str>,
+    profile: Option<&str>,
+    nextest_profile: Option<&str>,
+    passthrough: &[String],
 ) -> Result<()> {
     // runs_root() is absolute under the cargo-ktstr orchestrator
     // (install_runs_root_env stamps KTSTR_RUNS_ROOT), so this join
@@ -316,7 +358,13 @@ fn dual_run(
     println!("perf-delta: running baseline {baseline_short} perf tests in worktree");
     let baseline_status = Command::new("cargo")
         .current_dir(&wt_dir)
-        .args(perf_test_argv(&kernel_arg, filter))
+        .args(perf_test_argv(
+            &kernel_arg,
+            filter,
+            profile,
+            nextest_profile,
+            passthrough,
+        ))
         .envs(baseline_child_env(&leaf))
         .status()
         .with_context(|| format!("spawn baseline `cargo ktstr test` in {}", wt_dir.display()))?;
@@ -331,7 +379,13 @@ fn dual_run(
     println!("perf-delta: running HEAD perf tests in the working tree");
     let head_status = Command::new("cargo")
         .current_dir(repo_root)
-        .args(perf_test_argv(&kernel_arg, filter))
+        .args(perf_test_argv(
+            &kernel_arg,
+            filter,
+            profile,
+            nextest_profile,
+            passthrough,
+        ))
         .env(ktstr::KTSTR_PERF_ONLY_ENV, "1")
         .status()
         .context("spawn HEAD `cargo ktstr test`")?;
@@ -359,6 +413,7 @@ fn dual_run(
 /// once and removed on return via [`WorktreeGuard`]. A non-zero child exit is
 /// logged, not fatal (some `performance_mode` failures are expected; the
 /// sidecars that landed are still comparable).
+#[allow(clippy::too_many_arguments)]
 fn noise_dual_run(
     repo_root: &Path,
     baseline_full_hex: &str,
@@ -366,6 +421,9 @@ fn noise_dual_run(
     head_short: &str,
     kernel: &str,
     filter: Option<&str>,
+    profile: Option<&str>,
+    nextest_profile: Option<&str>,
+    passthrough: &[String],
     runs: usize,
 ) -> Result<()> {
     let runs_root_abs = repo_root.join(ktstr::test_support::runs_root());
@@ -400,7 +458,13 @@ fn noise_dual_run(
 
         let bs = Command::new("cargo")
             .current_dir(&wt_dir)
-            .args(perf_test_argv(&kernel_arg, filter))
+            .args(perf_test_argv(
+                &kernel_arg,
+                filter,
+                profile,
+                nextest_profile,
+                passthrough,
+            ))
             .envs(baseline_child_env(&base_leaf))
             .status()
             .with_context(|| format!("spawn baseline `cargo ktstr test` (noise run {i})"))?;
@@ -410,7 +474,13 @@ fn noise_dual_run(
 
         let hs = Command::new("cargo")
             .current_dir(repo_root)
-            .args(perf_test_argv(&kernel_arg, filter))
+            .args(perf_test_argv(
+                &kernel_arg,
+                filter,
+                profile,
+                nextest_profile,
+                passthrough,
+            ))
             .env(ktstr::KTSTR_PERF_ONLY_ENV, "1")
             .env(ktstr::KTSTR_SIDECAR_DIR_ENV, &head_leaf)
             .status()
@@ -470,6 +540,24 @@ pub(crate) struct PerfDeltaArgs<'a> {
     /// percent) above which `--noise-adjust` flags a metric as too noisy to
     /// trust. Defaults to `1.0` when `--noise-adjust` is set.
     pub noise_spread_threshold: Option<f64>,
+    /// `--profile <NAME>` — the scheduler-under-test's cargo BUILD profile,
+    /// forwarded to BOTH sides' `cargo ktstr test` so baseline and HEAD
+    /// build the scheduler identically. `None` leaves it at the release
+    /// default. Only meaningful on the run-producing paths (`--dual-run` /
+    /// `--noise-adjust`); [`run`] rejects it on the paths that run no tests.
+    pub profile: Option<&'a str>,
+    /// `--nextest-profile <NAME>` — the nextest test profile, forwarded to
+    /// BOTH sides' `cargo ktstr test`. Only meaningful on the run-producing
+    /// paths; [`run`] rejects it on the paths that run no tests.
+    pub nextest_profile: Option<&'a str>,
+    /// cargo/nextest flags forwarded verbatim to BOTH sides' `cargo ktstr
+    /// test` → `cargo nextest run` (e.g. `--features integration,wprof`);
+    /// no `--` separator required (but native flags must precede it — see
+    /// the CLI `args` doc). Only meaningful on the run-producing paths
+    /// (`--dual-run` / `--noise-adjust`); [`run`] rejects a non-empty
+    /// passthrough on the cached-baseline / config-axis paths (which run
+    /// no tests) rather than silently dropping it.
+    pub passthrough: &'a [String],
 }
 
 /// Build the CONFIG-axis (scheduler A vs B at the SAME commit) compare
@@ -530,6 +618,30 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
     // resolver (same as `stats compare`); shared by both axes.
     let policy = cli::ComparisonPolicy::from_cli_flags(args.threshold, args.policy)
         .context("resolve --threshold / --policy")?;
+
+    // Fail loud rather than SILENTLY DROP the build-shaping flags: the
+    // cargo/nextest passthrough AND `--profile` / `--nextest-profile` only
+    // reach a `cargo ktstr test` run on the run-PRODUCING paths
+    // (--dual-run / --noise-adjust N). The config-axis and cached-baseline
+    // compares run no tests, so any of these there would vanish with no
+    // effect — surface the misuse instead.
+    let runs_tests = args.dual_run || args.noise_adjust.is_some();
+    if !runs_tests
+        && (!args.passthrough.is_empty()
+            || args.profile.is_some()
+            || args.nextest_profile.is_some())
+    {
+        anyhow::bail!(
+            "build-shaping flags (cargo/nextest passthrough {:?}, --profile {:?}, \
+             --nextest-profile {:?}) are only applied by the run-producing paths \
+             (--dual-run / --noise-adjust N); this invocation compares already-pooled \
+             sidecars and runs no tests, so they would be ignored. Add --dual-run \
+             (or --noise-adjust N), or drop the flags.",
+            args.passthrough,
+            args.profile,
+            args.nextest_profile,
+        );
+    }
 
     // Config axis short-circuit: no gix / repo needed (same commit).
     let has_commit_axis_flag = args.dual_run || args.base.is_some() || args.base_ref.is_some();
@@ -600,6 +712,9 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
             &head,
             kernel,
             args.filter,
+            args.profile,
+            args.nextest_profile,
+            args.passthrough,
             n,
         )?;
         let threshold = args.noise_spread_threshold.unwrap_or(1.0);
@@ -622,6 +737,9 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
             &baseline,
             kernel,
             args.filter,
+            args.profile,
+            args.nextest_profile,
+            args.passthrough,
         )?;
         // If the baseline run produced no sidecars, no `performance_mode`
         // tests were selected (none are defined yet, or the `-E` filter
@@ -800,26 +918,94 @@ mod tests {
     }
 
     #[test]
-    fn perf_test_argv_appends_filter_only_when_present() {
+    fn perf_test_argv_appends_filter_and_passthrough() {
+        let expect = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let feat = ["--features".to_string(), "integration,wprof".to_string()];
+
+        // No filter, no passthrough.
         assert_eq!(
-            perf_test_argv("6.14", None),
-            vec![
-                "ktstr".to_string(),
-                "test".to_string(),
-                "--kernel".to_string(),
-                "6.14".to_string(),
-            ],
+            perf_test_argv("6.14", None, None, None, &[]),
+            expect(&["ktstr", "test", "--kernel", "6.14"]),
         );
+        // Filter only, appended as `test`'s trailing args.
         assert_eq!(
-            perf_test_argv("6.14", Some("test(perf_smoke)")),
-            vec![
-                "ktstr".to_string(),
-                "test".to_string(),
-                "--kernel".to_string(),
-                "6.14".to_string(),
-                "-E".to_string(),
-                "test(perf_smoke)".to_string(),
-            ],
+            perf_test_argv("6.14", Some("test(perf_smoke)"), None, None, &[]),
+            expect(&["ktstr", "test", "--kernel", "6.14", "-E", "test(perf_smoke)"]),
+        );
+        // Passthrough forwarded verbatim AFTER the filter, so feature
+        // selection reaches BOTH baseline and HEAD `cargo ktstr test`.
+        assert_eq!(
+            perf_test_argv("6.14", Some("test(perf_smoke)"), None, None, &feat),
+            expect(&[
+                "ktstr",
+                "test",
+                "--kernel",
+                "6.14",
+                "-E",
+                "test(perf_smoke)",
+                "--features",
+                "integration,wprof",
+            ]),
+        );
+        // Passthrough with no filter.
+        assert_eq!(
+            perf_test_argv("6.14", None, None, None, &feat),
+            expect(&[
+                "ktstr",
+                "test",
+                "--kernel",
+                "6.14",
+                "--features",
+                "integration,wprof",
+            ]),
+        );
+    }
+
+    /// `--profile` / `--nextest-profile` are emitted as NATIVE `cargo
+    /// ktstr test` flags AFTER `--kernel <k>` and BEFORE the `-E` /
+    /// passthrough trailing capture — otherwise clap's `trailing_var_arg`
+    /// group (which starts at the first unrecognized token, e.g. `-E`)
+    /// would swallow them into the passthrough and they'd reach nextest
+    /// as raw args instead of selecting the profiles.
+    #[test]
+    fn perf_test_argv_emits_profiles_before_trailing_capture() {
+        let expect = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let feat = ["--features".to_string(), "integration".to_string()];
+
+        // Both profiles, with filter + passthrough: profiles precede `-E`.
+        assert_eq!(
+            perf_test_argv("6.14", Some("test(perf)"), Some("dev"), Some("ci"), &feat),
+            expect(&[
+                "ktstr",
+                "test",
+                "--kernel",
+                "6.14",
+                "--profile",
+                "dev",
+                "--nextest-profile",
+                "ci",
+                "-E",
+                "test(perf)",
+                "--features",
+                "integration",
+            ]),
+        );
+        // Scheduler profile only, no filter/passthrough.
+        assert_eq!(
+            perf_test_argv("6.14", None, Some("dev"), None, &[]),
+            expect(&["ktstr", "test", "--kernel", "6.14", "--profile", "dev"]),
+        );
+        // Nextest profile only.
+        assert_eq!(
+            perf_test_argv("6.14", None, None, Some("ci"), &[]),
+            expect(&[
+                "ktstr",
+                "test",
+                "--kernel",
+                "6.14",
+                "--nextest-profile",
+                "ci",
+            ]),
         );
     }
 

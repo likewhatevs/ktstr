@@ -158,14 +158,16 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
             no_perf_mode,
             no_skip_mode,
             release,
-            release_scheduler,
+            profile,
+            nextest_profile,
             args,
         } => run_cargo::run_test(
             kernel,
             no_perf_mode,
             no_skip_mode,
             release,
-            release_scheduler,
+            profile,
+            nextest_profile,
             args,
         ),
         KtstrCommand::Coverage {
@@ -173,14 +175,16 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
             no_perf_mode,
             no_skip_mode,
             release,
-            release_scheduler,
+            profile,
+            nextest_profile,
             args,
         } => run_cargo::run_coverage(
             kernel,
             no_perf_mode,
             no_skip_mode,
             release,
-            release_scheduler,
+            profile,
+            nextest_profile,
             args,
         ),
         KtstrCommand::LlvmCov {
@@ -190,13 +194,25 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
             args,
         } => run_cargo::run_llvm_cov(kernel, no_perf_mode, no_skip_mode, args),
         KtstrCommand::Stats { ref command } => stats::run_stats(command),
-        KtstrCommand::Replay { dir, filter, exec } => {
-            match replay::run_replay(dir.as_deref(), filter.as_deref(), exec) {
-                Ok(0) => Ok(()),
-                Ok(code) => std::process::exit(code),
-                Err(e) => Err(format!("{e:#}")),
-            }
-        }
+        KtstrCommand::Replay {
+            dir,
+            filter,
+            exec,
+            profile,
+            nextest_profile,
+            args,
+        } => match replay::run_replay(
+            dir.as_deref(),
+            filter.as_deref(),
+            exec,
+            profile.as_deref(),
+            nextest_profile.as_deref(),
+            &args,
+        ) {
+            Ok(0) => Ok(()),
+            Ok(code) => std::process::exit(code),
+            Err(e) => Err(format!("{e:#}")),
+        },
         KtstrCommand::PerfDelta {
             base,
             base_ref,
@@ -215,8 +231,12 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
             steps_only,
             phase,
             phase_threshold,
+            profile,
+            nextest_profile,
+            args: passthrough,
         } => {
             let args = perf_delta::PerfDeltaArgs {
+                passthrough: &passthrough,
                 base: base.as_deref(),
                 base_ref: base_ref.as_deref(),
                 filter: filter.as_deref(),
@@ -229,6 +249,8 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
                 b_scheduler: b_scheduler.as_deref(),
                 noise_adjust,
                 noise_spread_threshold,
+                profile: profile.as_deref(),
+                nextest_profile: nextest_profile.as_deref(),
                 phase_display: ktstr::cli::PhaseDisplayOptions {
                     no_phases,
                     phases_only,
@@ -299,7 +321,13 @@ fn dispatch_admin_command(command: KtstrCommand) -> Result<(), String> {
                 corrupt_only,
             } => ktstr::cli::kernel_clean(keep, force, corrupt_only).map_err(|e| format!("{e:#}")),
         },
-        KtstrCommand::Verifier { kernel, raw } => verifier::run_verifier(kernel, raw),
+        KtstrCommand::Verifier {
+            kernel,
+            raw,
+            profile,
+            nextest_profile,
+            args,
+        } => verifier::run_verifier(kernel, raw, profile, nextest_profile, args),
         KtstrCommand::Funify {
             input,
             seed,

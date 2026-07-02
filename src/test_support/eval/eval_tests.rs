@@ -748,10 +748,11 @@ fn per_name_scheduler_env_derivation() {
 }
 
 /// The profile-aware target-dir probe order: with
-/// `prefer_release` the release dir is probed first (so a
-/// `--release-scheduler` run prefers `target/release/` over a stale
-/// `target/debug/` binary); otherwise debug-first (preserves the
-/// prior order). Pins the reorder branch without staging a CWD.
+/// `prefer_release` the release dir is probed first (so a scheduler on
+/// the release default — or `--profile release` — prefers
+/// `target/release/` over a stale `target/debug/` binary); otherwise
+/// debug-first (`--profile dev`). Pins the reorder branch without
+/// staging a CWD.
 #[test]
 fn target_dir_probe_order_prefers_profile_match() {
     let rel = super::scheduler::target_dir_probe_order(true);

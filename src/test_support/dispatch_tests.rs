@@ -2886,6 +2886,47 @@ fn list_verifier_cells_all_no_schedulers_emits_no_cells() {
     );
 }
 
+/// Pure parse of `[workspace] members`: `.` maps to the root package
+/// name, other members' last path component is the package name, and a
+/// non-member (a fixture scheduler) is absent.
+#[test]
+fn parse_workspace_member_packages_maps_dot_and_dirs() {
+    let toml = "\
+[workspace]
+members = [\".\", \"ktstr-macros\", \"scx-ktstr\", \"nested/pkg\"]
+resolver = \"2\"
+";
+    let pkgs = parse_workspace_member_packages(toml, "ktstr");
+    assert!(pkgs.contains("ktstr"), "`.` maps to the root package name");
+    assert!(pkgs.contains("ktstr-macros"));
+    assert!(pkgs.contains("scx-ktstr"));
+    assert!(pkgs.contains("pkg"), "nested member -> last path component");
+    assert!(
+        !pkgs.contains("scx-full"),
+        "a non-member fixture scheduler is absent",
+    );
+    assert_eq!(pkgs.len(), 4);
+}
+
+/// Regression pin for the verifier fixture-gate: parsed from the REAL
+/// baked workspace `Cargo.toml`, the set includes the real scheduler
+/// package (its cells emit) and EXCLUDES the macro-expansion fixture
+/// scheduler names from tests/declare_scheduler.rs (their cells are
+/// gated out of the sweep so `--run-ignored` doesn't fail on
+/// `cargo build -p <fixture>`).
+#[test]
+fn workspace_packages_includes_real_scheduler_excludes_fixtures() {
+    let pkgs = workspace_packages();
+    assert!(
+        pkgs.contains("scx-ktstr"),
+        "the real scheduler package must be a workspace member (emits verifier cells)",
+    );
+    assert!(
+        !pkgs.contains("scx-full") && !pkgs.contains("scx-ee") && !pkgs.contains("scx-both"),
+        "declare_scheduler.rs fixture schedulers must NOT be workspace members (cells gated out)",
+    );
+}
+
 // ---------------------------------------------------------------
 // run_verifier_cell — scheduler-not-found branch (post-check_kvm)
 // ---------------------------------------------------------------

@@ -129,7 +129,8 @@ identical work for no signal.
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 | `--no-skip-mode` | off | Convert resource-contention and host-topology-insufficient skips into hard test failures (exit `1` instead of `0`). Default behavior skips so a contended runner does not fail tests that simply could not start; setting this flag opts into "if the test cannot run, the test fails". Exports `KTSTR_NO_SKIP_MODE=1` for the test binary. |
 | `--release` | off | Build and run tests with the release profile (`--cargo-profile release` to nextest). Release mode applies **stricter assertion thresholds** (`gap_threshold_ms` 2000 vs debug's 3000, `spread_threshold_pct` 15% vs debug's 35%) — tests that barely pass in debug may fail under `--release`. `catch_unwind`-based tests and tests gated on `#[cfg(debug_assertions)]` are skipped. |
-| `--release-scheduler` | off | Build the scheduler-under-test (a `SchedulerSpec::Discover` package) with the release profile while keeping the harness/test binary on the dev profile. Decouples scheduler optimization from the harness's assertion thresholds and `panic`/`catch_unwind` behavior — the right setting for a perf test that wants an optimized scheduler but normal harness behavior. Implied by `--release`; exports `KTSTR_SCHEDULER_PROFILE=release`. |
+| `--profile NAME` | release | Cargo BUILD profile for the scheduler-under-test (a `SchedulerSpec::Discover` package): drives `cargo build -p <scheduler> --profile <NAME>` via the `KTSTR_SCHEDULER_PROFILE` env. Omitted, the scheduler builds `release` — an optimized scheduler is the only sensible default. INDEPENDENT of `--release` (the harness build profile): pass `--profile dev` for a fast unoptimized scheduler build, or any custom `[profile.<name>]`. Distinct from `--nextest-profile` (the nextest test profile). |
+| `--nextest-profile NAME` | nextest default | Nextest TEST profile (`.config/nextest.toml`), forwarded to nextest as `--profile <NAME>` (retry / timeout / output settings). Distinct from `--profile` (the scheduler's cargo BUILD profile) and `--release` (the harness's cargo build profile). |
 
 ### What it does (path mode only)
 
@@ -314,6 +315,8 @@ failures against the new code" workflow.
 | `--dir PATH` | `target/ktstr/` | Override the sidecar root. Same semantics as `cargo ktstr stats compare --dir`. |
 | `-E, --filter SUBSTR` | -- | Substring filter on `test_name` (case-sensitive). |
 | `--exec` | dry-run | Invoke `cargo nextest run` with the computed filter instead of printing it. |
+| `--profile NAME` | release | Cargo BUILD profile for the scheduler-under-test (see `cargo ktstr test --profile`). Only meaningful with `--exec` (the dry-run path runs nothing). |
+| `--nextest-profile NAME` | nextest default | Nextest TEST profile forwarded to the re-run `cargo nextest run` as `--profile <NAME>`. Only meaningful with `--exec`. |
 
 ## coverage
 
@@ -344,7 +347,8 @@ cargo ktstr coverage -- --workspace --lcov --output-path lcov.info # lcov output
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 | `--no-skip-mode` | off | Convert resource-contention and host-topology-insufficient skips into hard test failures. Same semantics as on `test`; exports `KTSTR_NO_SKIP_MODE=1` for the test binary. |
 | `--release` | off | Collect coverage with the release profile (`--cargo-profile release` to llvm-cov nextest). Same stricter-threshold caveats as `test --release` — release mode applies `gap_threshold_ms=2000` / `spread_threshold_pct=15%`, and skips `catch_unwind`-based tests along with `#[cfg(debug_assertions)]`-gated tests. |
-| `--release-scheduler` | off | Build the scheduler-under-test with the release profile while keeping the harness on the dev profile (same contract as `cargo ktstr test --release-scheduler`). Implied by `--release`; exports `KTSTR_SCHEDULER_PROFILE=release`. |
+| `--profile NAME` | release | Cargo BUILD profile for the scheduler-under-test (see `cargo ktstr test --profile`). Omitted, the scheduler builds `release`; INDEPENDENT of `--release`. |
+| `--nextest-profile NAME` | nextest default | Nextest TEST profile forwarded to `cargo llvm-cov nextest` as `--profile <NAME>` (see `cargo ktstr test --nextest-profile`). |
 
 Requires `cargo-llvm-cov` and the `llvm-tools-preview` rustup
 component:
@@ -597,6 +601,8 @@ for the rendering details.
 |------|-------------|
 | `--kernel ID` (repeatable) | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#REF`). Raw image files (`bzImage`/`Image`) are NOT accepted — the verifier needs the cached `vmlinux` and kconfig fragment alongside the image. Source directories auto-build; version strings auto-download on cache miss. When absent, resolves via cache then filesystem, falling back to auto-download. Raw images are accepted only on `cargo ktstr shell`. |
 | `--raw` | Print raw verifier output without cycle collapse. |
+| `--profile NAME` | Cargo BUILD profile for the scheduler-under-test (see `cargo ktstr test --profile`). Omitted, the scheduler builds `release`. Sets `KTSTR_SCHEDULER_PROFILE` for the inner `cargo nextest run`. |
+| `--nextest-profile NAME` | Nextest TEST profile forwarded to the inner `cargo nextest run` as `--profile <NAME>` (see `cargo ktstr test --nextest-profile`). |
 
 See [BPF Verifier](verifier.md) for the cell-based dispatch
 design and output format, and
@@ -1268,6 +1274,8 @@ exits `0` — an empty perf set is "nothing to compare", not a failure.
 |------|---------|-------------|
 | `--dual-run` | off | Produce both runs via a baseline worktree before comparing (else compare already-pooled sidecars). |
 | `--kernel SPEC` | — | Kernel both runs boot. Required with `--dual-run`. Same `--kernel` form as `cargo ktstr test`. |
+| `--profile NAME` | release | Cargo BUILD profile for the scheduler-under-test on BOTH sides' `cargo ktstr test` (see `cargo ktstr test --profile`). Only meaningful on the run-producing path (`--dual-run` / `--noise-adjust`). |
+| `--nextest-profile NAME` | nextest default | Nextest TEST profile forwarded to BOTH sides' `cargo ktstr test`. Only meaningful on the run-producing path (`--dual-run` / `--noise-adjust`). |
 | `--base COMMIT` | — | Explicit baseline commit-ish (skips merge-base). |
 | `--base-ref REF` | — | Ref to merge-base against. |
 | `--default-branch BRANCH` | `main` | Merge-base target when no `--base`/`--base-ref`/`$GITHUB_BASE_REF`. |

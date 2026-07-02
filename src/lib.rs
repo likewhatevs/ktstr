@@ -1716,15 +1716,20 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
     Ok(kernel_path::find_image(None, release_ref))
 }
 
-/// Name of the environment variable selecting the build profile for a
-/// `SchedulerSpec::Discover` scheduler built on demand by
-/// [`build_and_find_binary`]. `"release"` builds the scheduler-under-
-/// test with the release profile; any other value (or unset) uses the
-/// default dev profile. This DECOUPLES the scheduler-under-test's
-/// profile from the harness/test binary's compile profile:
-/// `cargo ktstr test --release-scheduler` sets this so the scheduler
-/// runs optimized while the harness keeps its dev-profile assertion
-/// thresholds and `catch_unwind` behavior; `--release` sets both.
+/// Name of the environment variable selecting the cargo build profile
+/// for a `SchedulerSpec::Discover` scheduler built on demand by
+/// [`build_and_find_binary`]. Holds a cargo profile NAME; unset / empty
+/// means the RELEASE default (see `build_and_find_binary` — a debug
+/// sched_ext scheduler is never the intended thing to test). Set by
+/// `cargo ktstr <cmd> --profile <NAME>` (on `test` / `coverage` /
+/// `verifier` / `perf-delta` / `replay`), or exported directly to pick a
+/// non-default profile. This is INDEPENDENT of the harness `--release`
+/// (`--cargo-profile release` to nextest), which selects the harness/test
+/// binary's compile profile and does NOT touch this var — DECOUPLING the
+/// scheduler-under-test's profile from the harness profile: the scheduler
+/// runs optimized by default while the harness keeps its dev-profile
+/// assertion thresholds and `catch_unwind` behavior unless its own build
+/// profile is set separately.
 pub const KTSTR_SCHEDULER_PROFILE_ENV: &str = "KTSTR_SCHEDULER_PROFILE";
 
 /// Name of the presence-only opt-out env var that re-enables the
@@ -1741,6 +1746,68 @@ pub const KTSTR_SCHEDULER_PROFILE_ENV: &str = "KTSTR_SCHEDULER_PROFILE";
 /// re-enable the hazard.
 pub const KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV: &str = "KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK";
 
+/// The cargo build profile NAME for the scheduler-under-test:
+/// [`KTSTR_SCHEDULER_PROFILE_ENV`] when set non-empty, else the
+/// `"release"` default. Single source of the default so
+/// [`build_and_find_binary`] (which builds it) and the `Discover`
+/// fallback probe (which locates a pre-built one) never disagree on
+/// which `target/<dir>/` the scheduler lands in.
+pub(crate) fn scheduler_profile_name() -> String {
+    resolve_scheduler_profile(std::env::var(KTSTR_SCHEDULER_PROFILE_ENV).ok())
+}
+
+/// Pure resolution of the scheduler build-profile NAME from the raw
+/// [`KTSTR_SCHEDULER_PROFILE_ENV`] value: a non-empty value verbatim,
+/// else the `"release"` default. An empty string is treated as UNSET —
+/// so a stray `--profile ""` / `KTSTR_SCHEDULER_PROFILE=` can never make
+/// [`build_and_find_binary`] run `cargo build --profile ""` (which would
+/// resolve the artifact under an empty-named profile dir). Split from
+/// [`scheduler_profile_name`] so the empty / unset / named cases are
+/// unit-testable without mutating process env.
+fn resolve_scheduler_profile(env_val: Option<String>) -> String {
+    env_val
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "release".to_string())
+}
+
+#[cfg(test)]
+mod scheduler_profile_tests {
+    use super::resolve_scheduler_profile;
+
+    /// The scheduler build-profile default: unset AND empty both fall
+    /// back to `release` (empty is treated as unset so a stray
+    /// `--profile ""` / `KTSTR_SCHEDULER_PROFILE=` cannot build under an
+    /// empty-named profile dir); a non-empty name passes through verbatim
+    /// (`dev`, `release`, or any custom `[profile.<name>]`). Pins the
+    /// exact regressions [`resolve_scheduler_profile`] guards — dropping
+    /// the `.filter(!is_empty)` (empty → empty name) or flipping the
+    /// default flips a case.
+    #[test]
+    fn resolve_scheduler_profile_defaults_and_passthrough() {
+        assert_eq!(
+            resolve_scheduler_profile(None),
+            "release",
+            "unset -> release default"
+        );
+        assert_eq!(
+            resolve_scheduler_profile(Some(String::new())),
+            "release",
+            "empty string is treated as unset -> release, never an empty profile name",
+        );
+        assert_eq!(
+            resolve_scheduler_profile(Some("dev".into())),
+            "dev",
+            "named profile passes through verbatim"
+        );
+        assert_eq!(resolve_scheduler_profile(Some("release".into())), "release");
+        assert_eq!(
+            resolve_scheduler_profile(Some("custom".into())),
+            "custom",
+            "custom [profile.<name>] passes through unchanged",
+        );
+    }
+}
+
 /// Build a cargo binary package and return its output path.
 ///
 /// Runs from the ktstr crate's manifest directory (which is also the
@@ -1748,16 +1815,25 @@ pub const KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV: &str = "KTSTR_SCHEDULER_ALLO
 /// unification (e.g. vendored libbpf-sys) is always in effect,
 /// regardless of the calling process's working directory.
 ///
-/// Honors [`KTSTR_SCHEDULER_PROFILE_ENV`]: when set to `"release"` the
-/// build adds `--release`, so the returned artifact path resolves under
-/// `target/release/` — letting the scheduler-under-test be built
-/// release-profile independently of how the calling test binary was
-/// compiled.
+/// The scheduler-under-test is built with the RELEASE profile by
+/// DEFAULT: a debug sched_ext scheduler is far slower and its BPF
+/// verifier instruction counts differ, so it is never the intended thing
+/// to test. [`KTSTR_SCHEDULER_PROFILE_ENV`] overrides the profile name
+/// (set by `cargo ktstr <cmd> --profile <NAME>`); an unset / empty value
+/// keeps the release default. The build passes `cargo build --profile
+/// <name>` verbatim (`dev` = the default profile, `release` == `--release`,
+/// any custom `[profile.<name>]`), so the returned artifact path resolves
+/// under the matching `target/<dir>/`.
 pub fn build_and_find_binary(package: &str) -> anyhow::Result<std::path::PathBuf> {
-    let mut build_args: Vec<&str> = vec!["build", "-p", package, "--message-format=json"];
-    if std::env::var(KTSTR_SCHEDULER_PROFILE_ENV).as_deref() == Ok("release") {
-        build_args.push("--release");
-    }
+    let profile = scheduler_profile_name();
+    let build_args: Vec<String> = vec![
+        "build".into(),
+        "-p".into(),
+        package.into(),
+        "--message-format=json".into(),
+        "--profile".into(),
+        profile,
+    ];
     let output = std::process::Command::new("cargo")
         .args(&build_args)
         .current_dir(env!("CARGO_MANIFEST_DIR"))

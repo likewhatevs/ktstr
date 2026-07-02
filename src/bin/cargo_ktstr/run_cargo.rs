@@ -10,6 +10,14 @@
 //! `--cargo-profile release` injection on the test/coverage
 //! paths. [`run_cargo_sub`] folds the shared shape; thin
 //! per-subcommand wrappers fix the argv constants.
+//!
+//! test/coverage additionally accept `--profile <NAME>` (the
+//! scheduler-under-test's cargo BUILD profile, forwarded via the
+//! [`ktstr::KTSTR_SCHEDULER_PROFILE_ENV`] env) and `--nextest-profile
+//! <NAME>` (the nextest test profile, emitted as nextest's own
+//! `--profile`); the raw `llvm-cov` passthrough sets neither. `--profile`
+//! is INDEPENDENT of `--release` (`--cargo-profile release`, the harness
+//! build profile).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -140,37 +148,25 @@ fn prebuilt_blob_bin_envs(
 /// still gets a valid path. The test binary's `--list` / `--exact`
 /// handlers prefer `KTSTR_KERNEL_LIST` when set.
 ///
-/// The `KTSTR_SCHEDULER_PROFILE` value the scheduler-under-test build
-/// should use given the two CLI flags: `Some("release")` when EITHER
-/// `--release` (everything release) or `--release-scheduler` (only the
-/// scheduler) is set, else `None` (default dev profile). Pure so the
-/// flag->env coupling is unit-testable — `run_cargo_sub` itself execs
-/// cargo and can't be inspected directly.
-fn scheduler_profile_env(release: bool, release_scheduler: bool) -> Option<&'static str> {
-    (release || release_scheduler).then_some("release")
-}
-
 /// Assemble the cargo `Command` argv + the flag-gated env vars that are
-/// driven purely by the CLI flags — `--cargo-profile release` injection,
-/// the `--no-perf-mode` / `--no-skip-mode` env passthroughs, and the
-/// scheduler-profile env. Split out of [`run_cargo_sub`] as a pure
-/// `Command` factory (no `std::env` reads, no fs, no exec) so the argv
-/// ordering and the flag->env coupling are unit-testable via the stable
-/// [`Command::get_args`] / [`Command::get_envs`] APIs; `run_cargo_sub`
-/// itself execs cargo and can't be inspected directly.
-///
-/// `scheduler_profile` is the already-resolved
-/// [`scheduler_profile_env`] result, threaded in so this builder wires
-/// it without re-deriving the truth table — the wiring (Some -> set the
-/// env, None -> leave it absent) is what these tests pin.
+/// driven purely by the CLI flags — `--cargo-profile release` injection
+/// (`--release`, the HARNESS profile), the nextest test profile
+/// (`--nextest-profile` -> nextest `--profile`), the scheduler build
+/// profile (`--profile` -> `KTSTR_SCHEDULER_PROFILE`), and the
+/// `--no-perf-mode` / `--no-skip-mode` env passthroughs. Split out of
+/// [`run_cargo_sub`] as a pure `Command` factory (no `std::env` reads, no
+/// fs, no exec) so the argv ordering and the flag->argv/env coupling are
+/// unit-testable via the stable [`Command::get_args`] /
+/// [`Command::get_envs`] APIs; `run_cargo_sub` itself execs cargo and
+/// can't be inspected directly.
 ///
 /// `--cargo-profile release` is prepended BEFORE the user's trailing
 /// `args` so the profile selection applies to the whole invocation.
 /// nextest reads `--cargo-profile` directly; `cargo llvm-cov nextest`
 /// forwards it to its inner nextest invocation. For `cargo llvm-cov
 /// <sub>` (the raw-passthrough binding) the caller passes `release ==
-/// false`, so the release arg is never injected — the raw path relies on
-/// user-supplied `--release` / `--profile`.
+/// false` and `profile` / `nextest_profile` `None`, so nothing is
+/// injected — the raw path relies on user-supplied flags.
 ///
 /// The `std::env`-reading envs (prebuilt-blob paths, `LLVM_PROFILE_FILE`
 /// profraw injection) and the kernel-resolution envs are layered on by
@@ -179,15 +175,22 @@ fn scheduler_profile_env(release: bool, release_scheduler: bool) -> Option<&'sta
 fn build_cargo_command(
     sub_argv: &[&str],
     release: bool,
+    profile: Option<&str>,
+    nextest_profile: Option<&str>,
     no_perf_mode: bool,
     no_skip_mode: bool,
-    scheduler_profile: Option<&str>,
     args: &[String],
 ) -> Command {
     let mut cmd = Command::new("cargo");
     cmd.args(sub_argv);
     if release {
         cmd.args(["--cargo-profile", "release"]);
+    }
+    // `--nextest-profile <NAME>` selects the NEXTEST test profile
+    // (`.config/nextest.toml`); nextest's own flag for it is `--profile`,
+    // and `cargo llvm-cov nextest` forwards it to its inner nextest.
+    if let Some(np) = nextest_profile {
+        cmd.args(["--profile", np]);
     }
     cmd.args(args);
     if no_perf_mode {
@@ -196,13 +199,13 @@ fn build_cargo_command(
     if no_skip_mode {
         cmd.env(ktstr::KTSTR_NO_SKIP_MODE_ENV, "1");
     }
-    // Build the scheduler-under-test release when either `--release`
-    // (everything release) or `--release-scheduler` (only the scheduler,
-    // harness stays dev) is set. The test binary's `build_and_find_binary`
-    // reads this and adds `--release` to its `cargo build -p <scheduler>`,
-    // decoupling the scheduler profile from the harness profile.
-    if let Some(profile) = scheduler_profile {
-        cmd.env(ktstr::KTSTR_SCHEDULER_PROFILE_ENV, profile);
+    // `--profile <NAME>` selects the scheduler-under-test's cargo BUILD
+    // profile: `build_and_find_binary` reads `KTSTR_SCHEDULER_PROFILE` and
+    // passes `cargo build -p <scheduler> --profile <name>`. Absent -> that
+    // build defaults the scheduler to `release`. This is independent of
+    // the harness `--release` (`--cargo-profile release`) above.
+    if let Some(p) = profile {
+        cmd.env(ktstr::KTSTR_SCHEDULER_PROFILE_ENV, p);
     }
     cmd
 }
@@ -258,15 +261,17 @@ fn run_cargo_sub(
     no_perf_mode: bool,
     no_skip_mode: bool,
     release: bool,
-    release_scheduler: bool,
+    profile: Option<String>,
+    nextest_profile: Option<String>,
     args: Vec<String>,
 ) -> Result<(), String> {
     let mut cmd = build_cargo_command(
         sub_argv,
         release,
+        profile.as_deref(),
+        nextest_profile.as_deref(),
         no_perf_mode,
         no_skip_mode,
-        scheduler_profile_env(release, release_scheduler),
         &args,
     );
 
@@ -807,7 +812,8 @@ pub(crate) fn run_test(
     no_perf_mode: bool,
     no_skip_mode: bool,
     release: bool,
-    release_scheduler: bool,
+    profile: Option<String>,
+    nextest_profile: Option<String>,
     args: Vec<String>,
 ) -> Result<(), String> {
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
@@ -820,7 +826,8 @@ pub(crate) fn run_test(
         no_perf_mode,
         no_skip_mode,
         release,
-        release_scheduler,
+        profile,
+        nextest_profile,
         args,
     )
 }
@@ -830,7 +837,8 @@ pub(crate) fn run_coverage(
     no_perf_mode: bool,
     no_skip_mode: bool,
     release: bool,
-    release_scheduler: bool,
+    profile: Option<String>,
+    nextest_profile: Option<String>,
     args: Vec<String>,
 ) -> Result<(), String> {
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
@@ -846,7 +854,8 @@ pub(crate) fn run_coverage(
         no_perf_mode,
         no_skip_mode,
         release,
-        release_scheduler,
+        profile,
+        nextest_profile,
         args,
     )
 }
@@ -859,8 +868,9 @@ pub(crate) fn run_llvm_cov(
 ) -> Result<(), String> {
     // `llvm-cov` is raw passthrough — the user supplies every
     // argument after the subcommand name, including any profile
-    // selection. `release: false` / `release_scheduler: false` here
-    // mean "don't inject a profile ourselves"; the user decides.
+    // selection. `release: false` / `profile: None` / `nextest_profile:
+    // None` here mean "don't inject any profile ourselves"; the user
+    // decides via the raw args.
     //
     // No ktstr version guard here (unlike `test` / `coverage`): a
     // passthrough subcommand like `llvm-cov report` does NOT rebuild or
@@ -875,7 +885,8 @@ pub(crate) fn run_llvm_cov(
         no_perf_mode,
         no_skip_mode,
         false,
-        false,
+        None,
+        None,
         args,
     )
 }
@@ -1215,19 +1226,6 @@ mod tests {
         );
     }
 
-    /// Truth table for the flag->scheduler-profile coupling:
-    /// EITHER --release (everything release) or --release-scheduler
-    /// (scheduler only) yields `Some("release")`; neither yields `None`
-    /// (dev). A regression narrowing the guard to drop the `release ||`
-    /// (so --release stops building the scheduler release) flips a cell.
-    #[test]
-    fn scheduler_profile_env_truth_table() {
-        assert_eq!(scheduler_profile_env(false, false), None);
-        assert_eq!(scheduler_profile_env(true, false), Some("release"));
-        assert_eq!(scheduler_profile_env(false, true), Some("release"));
-        assert_eq!(scheduler_profile_env(true, true), Some("release"));
-    }
-
     /// Byte-exact pin on the three `*_SUB_ARGV` constants that drive
     /// `run_test`, `run_coverage`, and `run_llvm_cov` into
     /// `run_cargo_sub`. A regression that re-ordered the Coverage
@@ -1371,9 +1369,10 @@ mod tests {
         let cmd = build_cargo_command(
             TEST_SUB_ARGV,
             true,
-            false,
-            false,
             None,
+            None,
+            false,
+            false,
             &["-E".to_string(), "test(foo)".to_string()],
         );
         let argv: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
@@ -1401,9 +1400,10 @@ mod tests {
         let cmd = build_cargo_command(
             LLVM_COV_SUB_ARGV,
             false,
-            false,
-            false,
             None,
+            None,
+            false,
+            false,
             &["report".to_string()],
         );
         let argv: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
@@ -1420,7 +1420,7 @@ mod tests {
     #[test]
     fn build_cargo_command_perf_and_skip_env_gates() {
         // perf=true, skip=false → only KTSTR_NO_PERF_MODE="1".
-        let cmd = build_cargo_command(TEST_SUB_ARGV, false, true, false, None, &[]);
+        let cmd = build_cargo_command(TEST_SUB_ARGV, false, None, None, true, false, &[]);
         let map = cmd_env_map(&cmd);
         assert_eq!(
             map.get(std::ffi::OsStr::new(ktstr::KTSTR_NO_PERF_MODE_ENV)),
@@ -1429,7 +1429,7 @@ mod tests {
         assert!(!map.contains_key(std::ffi::OsStr::new(ktstr::KTSTR_NO_SKIP_MODE_ENV)));
 
         // perf=false, skip=true → only KTSTR_NO_SKIP_MODE="1".
-        let cmd = build_cargo_command(TEST_SUB_ARGV, false, false, true, None, &[]);
+        let cmd = build_cargo_command(TEST_SUB_ARGV, false, None, None, false, true, &[]);
         let map = cmd_env_map(&cmd);
         assert_eq!(
             map.get(std::ffi::OsStr::new(ktstr::KTSTR_NO_SKIP_MODE_ENV)),
@@ -1438,28 +1438,58 @@ mod tests {
         assert!(!map.contains_key(std::ffi::OsStr::new(ktstr::KTSTR_NO_PERF_MODE_ENV)));
     }
 
-    /// The `scheduler_profile` Option result is wired into the
-    /// `KTSTR_SCHEDULER_PROFILE` env: `Some("release")` sets the var to
-    /// "release"; `None` leaves it absent. `scheduler_profile_env` has
-    /// its own truth-table test; this pins the WIRING (correct var name +
+    /// The `profile` Option (the `--profile <NAME>` scheduler BUILD
+    /// profile) is wired into the `KTSTR_SCHEDULER_PROFILE` env:
+    /// `Some("dev")` sets the var to "dev"; `None` leaves it absent (the
+    /// scheduler build then defaults to release inside
+    /// `build_and_find_binary`). Pins the WIRING (correct var name +
     /// value, and the absent corner) that a dropped `.env()` call would
-    /// pass past the pure-fn test.
+    /// otherwise slip through.
     #[test]
-    fn build_cargo_command_scheduler_profile_env_wired_from_flags() {
-        // release=false, release_scheduler=true → Some("release").
-        let profile = scheduler_profile_env(false, true);
-        let cmd = build_cargo_command(TEST_SUB_ARGV, false, false, false, profile, &[]);
+    fn build_cargo_command_scheduler_profile_wired_from_flag() {
+        // Some("dev") → var set to "dev".
+        let cmd = build_cargo_command(TEST_SUB_ARGV, false, Some("dev"), None, false, false, &[]);
         let map = cmd_env_map(&cmd);
         assert_eq!(
             map.get(std::ffi::OsStr::new(ktstr::KTSTR_SCHEDULER_PROFILE_ENV)),
-            Some(&Some(std::ffi::OsString::from("release"))),
+            Some(&Some(std::ffi::OsString::from("dev"))),
         );
 
-        // release=false, release_scheduler=false → None, var absent.
-        let profile = scheduler_profile_env(false, false);
-        let cmd = build_cargo_command(TEST_SUB_ARGV, false, false, false, profile, &[]);
+        // None → var absent (scheduler build defaults to release).
+        let cmd = build_cargo_command(TEST_SUB_ARGV, false, None, None, false, false, &[]);
         let map = cmd_env_map(&cmd);
         assert!(!map.contains_key(std::ffi::OsStr::new(ktstr::KTSTR_SCHEDULER_PROFILE_ENV)));
+    }
+
+    /// The `nextest_profile` Option (the `--nextest-profile <NAME>`
+    /// NEXTEST test profile) is emitted as a `--profile <NAME>` argv token
+    /// AFTER `sub_argv` and BEFORE the user's trailing args — nextest and
+    /// `cargo llvm-cov nextest` read `--profile` to select the test
+    /// profile. `None` injects nothing. Byte-exact argv pins the token
+    /// name + placement; a regression emitting the wrong flag, or
+    /// appending after the user args, flips the vector.
+    #[test]
+    fn build_cargo_command_nextest_profile_injects_profile_flag() {
+        // Some("ci") → `--profile ci` after sub_argv, before user args.
+        let cmd = build_cargo_command(
+            TEST_SUB_ARGV,
+            false,
+            None,
+            Some("ci"),
+            false,
+            false,
+            &["-E".to_string(), "test(foo)".to_string()],
+        );
+        let argv: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            argv,
+            ["nextest", "run", "--profile", "ci", "-E", "test(foo)"].map(std::ffi::OsStr::new),
+        );
+
+        // None → no `--profile` token.
+        let cmd = build_cargo_command(TEST_SUB_ARGV, false, None, None, false, false, &[]);
+        let argv: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(argv, ["nextest", "run"].map(std::ffi::OsStr::new));
     }
 
     // -- kernel_set_or_bail --

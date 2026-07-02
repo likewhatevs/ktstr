@@ -87,22 +87,28 @@ pub(crate) enum KtstrCommand {
         /// `Cargo.toml [profile.release]`). Tests gated on
         /// `#[cfg(debug_assertions)]` also skip.
         ///
-        /// `--release` builds BOTH the harness/test binary AND the
-        /// scheduler-under-test release; use `--release-scheduler` to
-        /// build only the scheduler release while keeping the harness on
-        /// the dev profile.
+        /// `--release` builds the harness/test binary with the release
+        /// profile. The scheduler-under-test builds release by default
+        /// regardless of this flag; override its profile with
+        /// `--profile <NAME>`.
         #[arg(long)]
         release: bool,
-        /// Build the scheduler-under-test (a `SchedulerSpec::Discover`
-        /// package) with the release profile while keeping the
-        /// harness/test binary on its current (dev) profile. Decouples
-        /// the scheduler's optimization from the harness's assertion
-        /// thresholds + `panic`/`catch_unwind` behavior — the right
-        /// setting for a perf test that wants an optimized scheduler but
-        /// normal harness behavior. Implied by `--release` (which builds
-        /// everything release); sets `KTSTR_SCHEDULER_PROFILE=release`.
+        /// Cargo BUILD profile for the scheduler-under-test (a
+        /// `SchedulerSpec::Discover` package): drives `cargo build -p
+        /// <scheduler> --profile <NAME>` via `KTSTR_SCHEDULER_PROFILE`.
+        /// Omitted, the scheduler builds `release` — an optimized
+        /// scheduler is the only sensible default. Pass `--profile dev`
+        /// for a fast unoptimized scheduler build, or any custom profile
+        /// from `Cargo.toml`. Independent of the harness `--release`.
         #[arg(long)]
-        release_scheduler: bool,
+        profile: Option<String>,
+        /// NEXTEST test profile (`.config/nextest.toml`), forwarded to
+        /// nextest as `--profile <NAME>`. Selects retry / timeout /
+        /// output settings for the run. Distinct from `--profile` (the
+        /// scheduler's cargo BUILD profile) and `--release` (the
+        /// harness's cargo build profile).
+        #[arg(long)]
+        nextest_profile: Option<String>,
         /// Arguments passed through to cargo nextest run.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -138,12 +144,15 @@ pub(crate) enum KtstrCommand {
         /// skipped because release sets `panic = "abort"`.
         #[arg(long)]
         release: bool,
-        /// Build the scheduler-under-test release while keeping the
-        /// harness on the dev profile (see `cargo ktstr test
-        /// --release-scheduler`). Implied by `--release`; sets
-        /// `KTSTR_SCHEDULER_PROFILE=release`.
+        /// Cargo BUILD profile for the scheduler-under-test (see `cargo
+        /// ktstr test --profile`). Omitted, the scheduler builds
+        /// `release`. Independent of the harness `--release`.
         #[arg(long)]
-        release_scheduler: bool,
+        profile: Option<String>,
+        /// NEXTEST test profile forwarded to `cargo llvm-cov nextest` as
+        /// `--profile <NAME>` (see `cargo ktstr test --nextest-profile`).
+        #[arg(long)]
+        nextest_profile: Option<String>,
         /// Arguments passed through to cargo llvm-cov nextest.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -232,6 +241,26 @@ pub(crate) enum KtstrCommand {
         /// before committing to the re-run.
         #[arg(long)]
         exec: bool,
+        /// Cargo BUILD profile for the scheduler-under-test (see `cargo
+        /// ktstr test --profile`). Omitted, the scheduler builds
+        /// `release`. Only meaningful with `--exec` (the dry-run path
+        /// runs nothing).
+        #[arg(long)]
+        profile: Option<String>,
+        /// NEXTEST test profile forwarded to the re-run `cargo nextest
+        /// run` as `--profile <NAME>` (see `cargo ktstr test
+        /// --nextest-profile`). Only meaningful with `--exec`.
+        #[arg(long)]
+        nextest_profile: Option<String>,
+        /// cargo/nextest flags forwarded verbatim to `cargo nextest run`
+        /// when `--exec` re-runs the failed tests (`--features …`,
+        /// `--cargo-profile …`). No `--` separator required, but place
+        /// them AFTER the native flags (`--dir` / `--filter` / `--exec` /
+        /// `--profile` / `--nextest-profile`): the trailing capture starts
+        /// at the first unrecognized token. Ignored on the dry-run path,
+        /// which prints only the filter expression.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Compare `performance_mode` test metrics between HEAD and a
     /// baseline commit, exiting non-zero when a metric regresses past
@@ -357,6 +386,26 @@ pub(crate) enum KtstrCommand {
             conflicts_with = "no_phases"
         )]
         phase_threshold: Option<f64>,
+        /// Cargo BUILD profile for the scheduler-under-test on BOTH
+        /// sides' `cargo ktstr test` (see `cargo ktstr test --profile`).
+        /// Omitted, the scheduler builds `release`. Only meaningful on the
+        /// dual-run / noise-adjust production path (the cached-baseline
+        /// path runs nothing).
+        #[arg(long)]
+        profile: Option<String>,
+        /// NEXTEST test profile forwarded to BOTH sides' `cargo ktstr
+        /// test` as `--nextest-profile <NAME>` (see `cargo ktstr test
+        /// --nextest-profile`). Only meaningful on the dual-run /
+        /// noise-adjust production path.
+        #[arg(long)]
+        nextest_profile: Option<String>,
+        /// cargo/nextest flags forwarded verbatim to BOTH sides'
+        /// `cargo ktstr test` on the dual-run / noise-adjust production
+        /// path (e.g. `--features integration,wprof`). No `--` separator
+        /// required, but place them AFTER the native flags: the trailing
+        /// capture starts at the first unrecognized token.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Manage cached kernel images.
     Kernel {
@@ -375,6 +424,14 @@ pub(crate) enum KtstrCommand {
     /// per-program verified-instruction counts via host-side memory
     /// introspection. Eevdf + KernelBuiltin scheduler variants are
     /// skipped at cell-emission time (no userspace binary to verify).
+    ///
+    /// The `declare_scheduler!` cells that carry a userspace scheduler
+    /// live in integration test targets, so forward the build features to
+    /// nextest — e.g. `cargo ktstr verifier --kernel ../linux --features
+    /// integration,wprof` (no `--` needed). Without the feature
+    /// passthrough those cells never compile and the verifier-prefix
+    /// filter matches only the module's unit tests. The scheduler-under-
+    /// test builds release by default.
     Verifier {
         /// Repeatable. See [`KERNEL_HELP_NO_RAW`] for accepted shapes
         /// (path / version / cache key / range / git source). Overrides
@@ -384,6 +441,26 @@ pub(crate) enum KtstrCommand {
         /// Print raw verifier output without formatting.
         #[arg(long)]
         raw: bool,
+        /// Cargo BUILD profile for the scheduler-under-test (see `cargo
+        /// ktstr test --profile`). Omitted, the scheduler builds
+        /// `release`. Sets `KTSTR_SCHEDULER_PROFILE` for the inner
+        /// `cargo nextest run`.
+        #[arg(long)]
+        profile: Option<String>,
+        /// NEXTEST test profile forwarded to the inner `cargo nextest
+        /// run` as `--profile <NAME>` (see `cargo ktstr test
+        /// --nextest-profile`).
+        #[arg(long)]
+        nextest_profile: Option<String>,
+        /// cargo/nextest flags forwarded verbatim to the inner
+        /// `cargo nextest run` — feature selection (`--features
+        /// integration,wprof`), `--cargo-profile`, etc. No `--` separator
+        /// is required, but place them AFTER the native flags (`--kernel`
+        /// / `--raw` / `--profile` / `--nextest-profile`): the trailing
+        /// capture starts at the first unrecognized token, so a
+        /// passthrough flag placed before a native one swallows it.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Throw a costume party for a JSON dump — replaces every
     /// non-metric value with a deterministic `adjective-animal`

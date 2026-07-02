@@ -136,7 +136,11 @@ fn parse_perf_delta_flags_and_defaults() {
             steps_only,
             phase,
             phase_threshold,
+            profile,
+            nextest_profile,
+            args,
         } => {
+            assert!(args.is_empty(), "no cargo passthrough on this invocation");
             assert_eq!(base.as_deref(), Some("abc123"));
             assert_eq!(base_ref.as_deref(), Some("release"));
             assert_eq!(filter.as_deref(), Some("perf::"));
@@ -155,6 +159,10 @@ fn parse_perf_delta_flags_and_defaults() {
             assert!(
                 noise_adjust.is_none() && noise_spread_threshold.is_none(),
                 "no --noise-adjust on this invocation",
+            );
+            assert!(
+                profile.is_none() && nextest_profile.is_none(),
+                "no --profile / --nextest-profile on this invocation",
             );
         }
         _ => panic!("expected PerfDelta"),
@@ -182,7 +190,11 @@ fn parse_perf_delta_flags_and_defaults() {
             steps_only,
             phase,
             phase_threshold,
+            profile,
+            nextest_profile,
+            args,
         } => {
+            assert!(args.is_empty(), "bare perf-delta parses no cargo passthrough");
             assert!(base.is_none() && base_ref.is_none() && filter.is_none());
             assert_eq!(default_branch, "main");
             assert!(kernel.is_none());
@@ -198,6 +210,10 @@ fn parse_perf_delta_flags_and_defaults() {
                 "phase flags default off (full per-phase render)",
             );
             assert!(noise_adjust.is_none() && noise_spread_threshold.is_none());
+            assert!(
+                profile.is_none() && nextest_profile.is_none(),
+                "bare perf-delta defaults --profile / --nextest-profile to None",
+            );
         }
         _ => panic!("expected PerfDelta"),
     }
@@ -366,11 +382,49 @@ fn parse_perf_delta_flags_and_defaults() {
     );
 }
 
+/// `--profile <NAME>` (scheduler BUILD profile) and `--nextest-profile
+/// <NAME>` (nextest test profile) round-trip on `perf-delta`. `run`
+/// forwards both to BOTH sides' `cargo ktstr test` on the run-producing
+/// paths; this pins the clap binding so a dropped/renamed derive arg
+/// surfaces at parse time.
+#[test]
+fn parse_perf_delta_with_profiles() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "perf-delta",
+        "--dual-run",
+        "--kernel",
+        "6.14",
+        "--profile",
+        "dev",
+        "--nextest-profile",
+        "ci",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::PerfDelta {
+        profile,
+        nextest_profile,
+        ..
+    } = k.command
+    else {
+        panic!("expected PerfDelta");
+    };
+    assert_eq!(profile.as_deref(), Some("dev"), "--profile round-trips");
+    assert_eq!(
+        nextest_profile.as_deref(),
+        Some("ci"),
+        "--nextest-profile round-trips"
+    );
+}
+
 /// Build a `cargo ktstr <subcommand> -- <passthrough...>` invocation,
 /// parse it, and assert that the trailing args round-trip verbatim
 /// into the variant's `args` Vec without spuriously populating any
 /// of the named flags (`--kernel`, `--no-perf-mode`, `--no-skip-mode`,
-/// `--release`, `--release-scheduler`).
+/// `--release`, `--profile`, `--nextest-profile`).
 ///
 /// `subcommand` must be one of the passthrough-bearing subcommands:
 /// `test`, `nextest` (alias), `coverage`, `llvm-cov`. Other
@@ -389,7 +443,8 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             no_perf_mode,
             no_skip_mode,
             release,
-            release_scheduler,
+            profile,
+            nextest_profile,
             args,
         } => {
             assert!(
@@ -409,8 +464,12 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
                 "bare `--` passthrough must not spuriously set --release",
             );
             assert!(
-                !release_scheduler,
-                "bare `--` passthrough must not spuriously set --release-scheduler",
+                profile.is_none(),
+                "bare `--` passthrough must not spuriously set --profile",
+            );
+            assert!(
+                nextest_profile.is_none(),
+                "bare `--` passthrough must not spuriously set --nextest-profile",
             );
             assert_eq!(args, expected);
         }
@@ -419,7 +478,8 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             no_perf_mode,
             no_skip_mode,
             release,
-            release_scheduler,
+            profile,
+            nextest_profile,
             args,
         } => {
             assert!(
@@ -439,8 +499,12 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
                 "bare `--` passthrough must not spuriously set --release",
             );
             assert!(
-                !release_scheduler,
-                "bare `--` passthrough must not spuriously set --release-scheduler",
+                profile.is_none(),
+                "bare `--` passthrough must not spuriously set --profile",
+            );
+            assert!(
+                nextest_profile.is_none(),
+                "bare `--` passthrough must not spuriously set --nextest-profile",
             );
             assert_eq!(args, expected);
         }
@@ -526,33 +590,68 @@ fn parse_test_with_release_flag() {
     assert!(release, "`--release` must set `release=true`");
 }
 
-/// `--release-scheduler` on `test` parses to `KtstrCommand::Test {
-/// release_scheduler: true, .. }` so `run_test` exports
-/// `KTSTR_SCHEDULER_PROFILE=release` (building the scheduler-under-test
-/// release while the harness stays on the dev profile). It is
-/// INDEPENDENT of `--release` — passing only `--release-scheduler` must
-/// leave `release=false` so the harness/test binary stays dev.
+/// `--profile <NAME>` on `test` parses to `KtstrCommand::Test {
+/// profile: Some(NAME), .. }` so `run_test` exports
+/// `KTSTR_SCHEDULER_PROFILE=<NAME>` (the scheduler-under-test's cargo
+/// BUILD profile). It is INDEPENDENT of `--release` — passing only
+/// `--profile dev` must leave `release=false` so the harness/test binary
+/// stays on its default profile. Omitting `--profile` leaves
+/// `profile=None` (the scheduler build then defaults to release inside
+/// `build_and_find_binary`).
 #[test]
-fn parse_test_with_release_scheduler_flag() {
+fn parse_test_with_profile_flag() {
     let Cargo {
         command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from(["cargo", "ktstr", "test", "--release-scheduler"])
+    } = Cargo::try_parse_from(["cargo", "ktstr", "test", "--profile", "dev"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Test {
+        release, profile, ..
+    } = k.command
+    else {
+        panic!("expected Test");
+    };
+    assert_eq!(
+        profile.as_deref(),
+        Some("dev"),
+        "`--profile dev` must set profile=Some(\"dev\")"
+    );
+    assert!(
+        !release,
+        "`--profile` alone must NOT set --release (the harness stays on its default)"
+    );
+}
+
+/// `--nextest-profile <NAME>` on `test` parses to `KtstrCommand::Test {
+/// nextest_profile: Some(NAME), .. }` so `run_cargo_sub` forwards nextest
+/// `--profile <NAME>` (the nextest test profile). Independent of both
+/// `--profile` (the scheduler BUILD profile) and `--release`.
+#[test]
+fn parse_test_with_nextest_profile_flag() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "test", "--nextest-profile", "ci"])
         .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Test {
         release,
-        release_scheduler,
+        profile,
+        nextest_profile,
         ..
     } = k.command
     else {
         panic!("expected Test");
     };
+    assert_eq!(
+        nextest_profile.as_deref(),
+        Some("ci"),
+        "`--nextest-profile ci` must set nextest_profile=Some(\"ci\")"
+    );
     assert!(
-        release_scheduler,
-        "`--release-scheduler` must set release_scheduler=true"
+        profile.is_none(),
+        "`--nextest-profile` must NOT set --profile (the scheduler build profile)"
     );
     assert!(
         !release,
-        "`--release-scheduler` alone must NOT set --release (the harness stays dev)"
+        "`--nextest-profile` alone must NOT set --release"
     );
 }
 
@@ -615,7 +714,8 @@ fn parse_nextest_alias_with_kernel_and_no_perf_mode() {
         no_perf_mode,
         no_skip_mode,
         release,
-        release_scheduler,
+        profile,
+        nextest_profile,
         args,
     } = k.command
     else {
@@ -626,8 +726,12 @@ fn parse_nextest_alias_with_kernel_and_no_perf_mode() {
     assert!(!no_skip_mode);
     assert!(!release, "bare invocation must default --release to false");
     assert!(
-        !release_scheduler,
-        "bare invocation must default --release-scheduler to false"
+        profile.is_none(),
+        "bare invocation must default --profile to None"
+    );
+    assert!(
+        nextest_profile.is_none(),
+        "bare invocation must default --nextest-profile to None"
     );
     assert!(args.is_empty());
 }
@@ -664,30 +768,46 @@ fn parse_coverage_with_release_flag() {
     assert!(release, "`--release` must set `release=true`");
 }
 
-/// `--release-scheduler` on `coverage` parses independently of
-/// `--release` (mirrors `parse_test_with_release_scheduler_flag` for
-/// the Coverage variant — both flags are settable on both subcommands).
+/// `--profile` / `--nextest-profile` on `coverage` parse independently
+/// of `--release` (mirrors `parse_test_with_profile_flag` /
+/// `parse_test_with_nextest_profile_flag` for the Coverage variant —
+/// all three flags are settable on both subcommands).
 #[test]
-fn parse_coverage_with_release_scheduler_flag() {
+fn parse_coverage_with_profile_flags() {
     let Cargo {
         command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from(["cargo", "ktstr", "coverage", "--release-scheduler"])
-        .unwrap_or_else(|e| panic!("{e}"));
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "coverage",
+        "--profile",
+        "dev",
+        "--nextest-profile",
+        "ci",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Coverage {
         release,
-        release_scheduler,
+        profile,
+        nextest_profile,
         ..
     } = k.command
     else {
         panic!("expected Coverage");
     };
-    assert!(
-        release_scheduler,
-        "`--release-scheduler` must set release_scheduler=true on coverage"
+    assert_eq!(
+        profile.as_deref(),
+        Some("dev"),
+        "`--profile dev` must set profile=Some(\"dev\") on coverage"
+    );
+    assert_eq!(
+        nextest_profile.as_deref(),
+        Some("ci"),
+        "`--nextest-profile ci` must set nextest_profile=Some(\"ci\") on coverage"
     );
     assert!(
         !release,
-        "`--release-scheduler` alone must NOT set --release"
+        "`--profile`/`--nextest-profile` alone must NOT set --release"
     );
 }
 
@@ -726,7 +846,8 @@ fn parse_coverage_with_kernel_and_no_perf_mode() {
         no_perf_mode,
         no_skip_mode,
         release,
-        release_scheduler,
+        profile,
+        nextest_profile,
         args,
     } = k.command
     else {
@@ -737,8 +858,12 @@ fn parse_coverage_with_kernel_and_no_perf_mode() {
     assert!(!no_skip_mode);
     assert!(!release, "bare invocation must default --release to false");
     assert!(
-        !release_scheduler,
-        "bare invocation must default --release-scheduler to false"
+        profile.is_none(),
+        "bare invocation must default --profile to None"
+    );
+    assert!(
+        nextest_profile.is_none(),
+        "bare invocation must default --nextest-profile to None"
     );
     assert_eq!(args, vec!["--workspace"]);
 }
@@ -2307,28 +2432,31 @@ fn parse_kernel_build_force_clean_and_extra_kconfig_compose() {
 /// Non-build subcommands that accept `--extra-kconfig` would
 /// silently produce wrong cache lookups. The flag is `kernel
 /// build`-only at the configuration layer; this test pins the
-/// parse-level reject for the subcommands that have CLEAN clap
-/// surfaces (no `trailing_var_arg` passthrough).
+/// parse-level reject for `shell` — the one CLEAN clap surface
+/// with no `trailing_var_arg` passthrough — while the sibling
+/// passthrough tests pin that the passthrough subcommands forward
+/// it downstream instead.
 ///
 /// Subcommands and their behavior:
-/// - `verifier`: REJECTS at parse time (no trailing_var_arg).
-///   Pin via `try_parse_from` returning `Err`.
 /// - `shell`: REJECTS at parse time (no trailing_var_arg).
 ///   Pin via `try_parse_from` returning `Err`.
-/// - `test` / `coverage` / `llvm-cov`: PASSTHROUGH via
-///   `args: Vec<String>` with `trailing_var_arg = true,
+/// - `verifier` / `test` / `coverage` / `llvm-cov`: PASSTHROUGH
+///   via `args: Vec<String>` with `trailing_var_arg = true,
 ///   allow_hyphen_values = true`. Clap forwards `--extra-kconfig
-///   ...` as positional args to `cargo nextest run` (or
+///   ...` as trailing args to `cargo nextest run` (or
 ///   `cargo llvm-cov`), which then rejects it as an unknown
 ///   cargo flag — but at the cargo subprocess layer, NOT at
 ///   parse time. This is a structural property of clap's
 ///   trailing-var-arg shape and is consistent across every
-///   passthrough subcommand on `cargo ktstr`. We do NOT pin
-///   these as parse errors because that's not where the
-///   rejection actually happens.
+///   passthrough subcommand on `cargo ktstr`. We pin these as
+///   args-capture, NOT parse errors, because that is the actual
+///   shape — the rejection happens downstream in the cargo
+///   subprocess.
 #[test]
-fn parse_extra_kconfig_rejected_on_verifier_subcommand() {
-    let m = Cargo::try_parse_from([
+fn parse_extra_kconfig_passes_through_verifier_subcommand_to_args_vec() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
         "cargo",
         "ktstr",
         "verifier",
@@ -2336,11 +2464,18 @@ fn parse_extra_kconfig_rejected_on_verifier_subcommand() {
         "../linux",
         "--extra-kconfig",
         "/tmp/x.kconfig",
-    ]);
-    assert!(
-        m.is_err(),
-        "--extra-kconfig must be rejected on `cargo ktstr verifier` \
-         (verifier has no trailing_var_arg, so unknown flags fail at parse time)",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Verifier { args, .. } = k.command else {
+        panic!("expected KtstrCommand::Verifier");
+    };
+    assert_eq!(
+        args,
+        vec!["--extra-kconfig", "/tmp/x.kconfig"],
+        "verifier has no native --extra-kconfig, so trailing_var_arg forwards \
+         it into `args` (the inner cargo nextest run rejects it downstream) — \
+         verifier is a passthrough subcommand like test/coverage, NOT a \
+         clean-surface reject like shell",
     );
 }
 
@@ -2465,7 +2600,7 @@ fn parse_verifier_bare() {
     let Cargo {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "verifier"]).unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Verifier { kernel, raw } = k.command else {
+    let KtstrCommand::Verifier { kernel, raw, .. } = k.command else {
         panic!("expected Verifier");
     };
     assert!(
@@ -2481,7 +2616,7 @@ fn parse_verifier_with_kernel_single() {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "verifier", "--kernel", "6.14.2"])
         .unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Verifier { kernel, raw } = k.command else {
+    let KtstrCommand::Verifier { kernel, raw, .. } = k.command else {
         panic!("expected Verifier");
     };
     assert_eq!(kernel, vec!["6.14.2"]);
@@ -2496,7 +2631,7 @@ fn parse_verifier_with_kernel_repeatable() {
         "cargo", "ktstr", "verifier", "--kernel", "6.14.2", "--kernel", "6.15.0",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Verifier { kernel, raw } = k.command else {
+    let KtstrCommand::Verifier { kernel, raw, .. } = k.command else {
         panic!("expected Verifier");
     };
     assert_eq!(kernel, vec!["6.14.2", "6.15.0"]);
@@ -2509,59 +2644,295 @@ fn parse_verifier_with_raw() {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "verifier", "--raw"])
         .unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Verifier { kernel, raw } = k.command else {
+    let KtstrCommand::Verifier { kernel, raw, .. } = k.command else {
         panic!("expected Verifier");
     };
     assert!(kernel.is_empty());
     assert!(raw, "--raw must lift the flag to true");
 }
 
+/// The trailing `args` forward cargo/nextest flags to the inner
+/// `cargo nextest run` with NO `--` separator — the headline of the
+/// verifier feature-passthrough fix. clap's `trailing_var_arg` +
+/// `allow_hyphen_values` captures `--features integration` into `args`
+/// once the preceding native flag (`--kernel`) has consumed its value.
+#[test]
+fn parse_verifier_forwards_flags_without_separator() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "verifier",
+        "--kernel",
+        "../linux",
+        "--features",
+        "integration",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Verifier {
+        kernel, raw, args, ..
+    } = k.command
+    else {
+        panic!("expected Verifier");
+    };
+    assert_eq!(kernel, vec!["../linux"], "--kernel parsed as a native flag");
+    assert!(!raw);
+    assert_eq!(
+        args,
+        vec!["--features".to_string(), "integration".to_string()],
+        "cargo/nextest flags forward into `args` with no `--` separator",
+    );
+}
+
+/// Ordering caveat: `trailing_var_arg` capture begins at the FIRST
+/// unrecognized token, so a passthrough flag placed BEFORE the native
+/// flags swallows them. Pins clap's behavior so a future clap bump (or
+/// an arg-order change) can't silently regress the "native flags first"
+/// contract the `args` doc states — the failure mode a reviewer flagged.
+#[test]
+fn parse_verifier_passthrough_before_native_flag_swallows_it() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "verifier",
+        "--features",
+        "integration",
+        "--kernel",
+        "../linux",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Verifier { kernel, args, .. } = k.command else {
+        panic!("expected Verifier");
+    };
+    assert!(
+        kernel.is_empty(),
+        "--kernel placed AFTER a passthrough flag is swallowed into args, not parsed as a native flag",
+    );
+    assert_eq!(
+        args,
+        vec![
+            "--features".to_string(),
+            "integration".to_string(),
+            "--kernel".to_string(),
+            "../linux".to_string(),
+        ],
+        "trailing capture starts at the first unrecognized token and swallows everything after it",
+    );
+}
+
+/// `--profile <NAME>` (scheduler BUILD profile) and `--nextest-profile
+/// <NAME>` (nextest test profile) round-trip as native Verifier flags.
+/// Placed BEFORE the trailing capture, they parse as `Some(_)` while a
+/// following passthrough flag (`--features`) still lands in `args`.
+#[test]
+fn parse_verifier_with_profiles() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "verifier",
+        "--kernel",
+        "../linux",
+        "--profile",
+        "dev",
+        "--nextest-profile",
+        "ci",
+        "--features",
+        "integration",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Verifier {
+        kernel,
+        profile,
+        nextest_profile,
+        args,
+        ..
+    } = k.command
+    else {
+        panic!("expected Verifier");
+    };
+    assert_eq!(kernel, vec!["../linux"]);
+    assert_eq!(profile.as_deref(), Some("dev"), "--profile round-trips");
+    assert_eq!(
+        nextest_profile.as_deref(),
+        Some("ci"),
+        "--nextest-profile round-trips"
+    );
+    assert_eq!(
+        args,
+        vec!["--features".to_string(), "integration".to_string()],
+        "a passthrough flag AFTER the native profiles still lands in args",
+    );
+}
+
 /// `--scheduler` was removed when the verifier sweep moved to
-/// `declare_scheduler!`-driven discovery. Pin that the flag stays
-/// rejected so a future agent who reintroduces it without
-/// rebuilding the sweep dispatch trips this test.
+/// `declare_scheduler!`-driven discovery — verifier has no native
+/// `--scheduler`. Since verifier is a passthrough subcommand
+/// (`trailing_var_arg`), the removed flag is now FORWARDED into
+/// `args` (the inner `cargo nextest run` rejects it downstream),
+/// not clap-rejected. Pinning that it lands in `args` still trips
+/// if a future agent re-adds `--scheduler` as a NATIVE flag: a
+/// native `--scheduler` would consume the value and leave `args`
+/// empty, failing this assertion.
 #[test]
-fn parse_verifier_scheduler_flag_rejected() {
-    let rejected =
-        Cargo::try_parse_from(["cargo", "ktstr", "verifier", "--scheduler", "scx_rustland"]);
-    assert!(
-        rejected.is_err(),
-        "--scheduler must be rejected — the flag was removed when the \
-         verifier sweep moved to declare_scheduler!-driven discovery",
+fn parse_verifier_scheduler_flag_forwarded_not_native() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "verifier", "--scheduler", "scx_rustland"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Verifier { args, .. } = k.command else {
+        panic!("expected Verifier");
+    };
+    assert_eq!(
+        args,
+        vec!["--scheduler", "scx_rustland"],
+        "--scheduler has no native verifier flag; trailing_var_arg forwards it \
+         into `args` (nextest rejects it downstream). A future NATIVE re-add \
+         would consume the value and empty `args`, tripping this pin.",
     );
 }
 
-/// `--all-profiles` was removed alongside the flag-profile sweep.
-/// Pin the parse-time rejection so a future agent who re-adds the
-/// argument without rebuilding the sweep surface trips this test
-/// instead of silently shipping a dead flag.
+/// `--all-profiles` was removed alongside the flag-profile sweep;
+/// verifier has no native flag for it. As a passthrough subcommand
+/// verifier FORWARDS it into `args` (nextest rejects it downstream)
+/// rather than clap-rejecting. Pinning the args-capture still trips
+/// a future native re-add (which would not land in `args`).
 #[test]
-fn parse_verifier_all_profiles_rejected() {
-    let rejected = Cargo::try_parse_from(["cargo", "ktstr", "verifier", "--all-profiles"]);
-    assert!(
-        rejected.is_err(),
-        "--all-profiles must be rejected — the flag-profile sweep \
-         was removed from the verifier subcommand",
+fn parse_verifier_all_profiles_forwarded_not_native() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "verifier", "--all-profiles"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Verifier { args, .. } = k.command else {
+        panic!("expected Verifier");
+    };
+    assert_eq!(
+        args,
+        vec!["--all-profiles"],
+        "--all-profiles is not a native verifier flag; trailing_var_arg \
+         forwards it into `args`. A future native re-add would empty `args`.",
     );
 }
 
-/// `--profiles` was removed alongside the flag-profile sweep. Pin
-/// the parse-time rejection so a future agent who re-adds the
-/// argument without rebuilding the sweep surface trips this test
-/// instead of silently shipping a dead flag.
+/// `--profiles` was removed alongside the flag-profile sweep;
+/// verifier has no native flag for it. Passthrough verifier
+/// FORWARDS it (with its value) into `args`; nextest rejects it
+/// downstream. Pinning the args-capture still trips a future native
+/// re-add.
 #[test]
-fn parse_verifier_profiles_filter_rejected() {
-    let rejected = Cargo::try_parse_from([
+fn parse_verifier_profiles_filter_forwarded_not_native() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
         "cargo",
         "ktstr",
         "verifier",
         "--profiles",
         "default,llc,llc+steal",
-    ]);
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Verifier { args, .. } = k.command else {
+        panic!("expected Verifier");
+    };
+    assert_eq!(
+        args,
+        vec!["--profiles", "default,llc,llc+steal"],
+        "--profiles is not a native verifier flag; trailing_var_arg forwards it \
+         and its value into `args`. A future native re-add would consume the \
+         value and empty `args`.",
+    );
+}
+
+// -- try_get_matches_from: replay --
+
+/// Bare `cargo ktstr replay` parses to the Replay variant with every
+/// field at its default: no `--dir` / `--filter`, `--exec` off, no
+/// `--profile` / `--nextest-profile`, empty passthrough `args`.
+#[test]
+fn parse_replay_defaults() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "replay"]).unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Replay {
+        dir,
+        filter,
+        exec,
+        profile,
+        nextest_profile,
+        args,
+    } = k.command
+    else {
+        panic!("expected Replay");
+    };
+    assert!(dir.is_none(), "bare replay defaults --dir to None");
+    assert!(filter.is_none(), "bare replay defaults --filter to None");
+    assert!(!exec, "bare replay defaults --exec off (dry-run)");
+    assert!(profile.is_none(), "bare replay defaults --profile to None");
     assert!(
-        rejected.is_err(),
-        "--profiles must be rejected — the flag-profile sweep \
-         was removed from the verifier subcommand",
+        nextest_profile.is_none(),
+        "bare replay defaults --nextest-profile to None"
+    );
+    assert!(args.is_empty(), "bare replay parses no passthrough");
+}
+
+/// Full round-trip: `--dir`, `-E` filter, `--exec`, `--profile`,
+/// `--nextest-profile`, and a trailing passthrough flag all populate on
+/// a single invocation. The native flags precede the trailing capture,
+/// so `--features` (unrecognized) lands in `args` while the profiles
+/// parse as `Some(_)`.
+#[test]
+fn parse_replay_all_flags_and_passthrough() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "replay",
+        "--dir",
+        "/tmp/archived-runs",
+        "-E",
+        "scheduler_",
+        "--exec",
+        "--profile",
+        "dev",
+        "--nextest-profile",
+        "ci",
+        "--features",
+        "integration",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Replay {
+        dir,
+        filter,
+        exec,
+        profile,
+        nextest_profile,
+        args,
+    } = k.command
+    else {
+        panic!("expected Replay");
+    };
+    assert_eq!(
+        dir.as_deref(),
+        Some(std::path::Path::new("/tmp/archived-runs")),
+        "--dir round-trips to Some(PathBuf)"
+    );
+    assert_eq!(filter.as_deref(), Some("scheduler_"), "-E filter round-trips");
+    assert!(exec, "--exec lifts the flag to true");
+    assert_eq!(profile.as_deref(), Some("dev"), "--profile round-trips");
+    assert_eq!(
+        nextest_profile.as_deref(),
+        Some("ci"),
+        "--nextest-profile round-trips"
+    );
+    assert_eq!(
+        args,
+        vec!["--features".to_string(), "integration".to_string()],
+        "a passthrough flag AFTER the native flags lands in args",
     );
 }
 

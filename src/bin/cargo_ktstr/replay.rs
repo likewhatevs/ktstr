@@ -131,11 +131,24 @@ const EMPTY_POOL_FILTER: &str = "test(/^__ktstr_no_failures_to_replay__$/)";
 /// computed filter; otherwise the filter is printed and the
 /// caller can pipe it into nextest themselves.
 ///
+/// `profile` (`--profile <NAME>`, the scheduler BUILD profile) and
+/// `nextest_profile` (`--nextest-profile <NAME>`, the nextest test
+/// profile) shape the `--exec` re-run only — the dry-run path runs no
+/// tests. `profile` omitted leaves the scheduler at its release default.
+///
 /// Returns `Ok(0)` on a clean dry-run or successful exec.
 /// Returns `Ok(N)` with nextest's exit code when `exec` is set
 /// and nextest exits non-zero. Returns `Err` only for genuine
 /// errors (unreadable sidecar root, nextest spawn failure).
-pub(crate) fn run_replay(dir: Option<&Path>, filter: Option<&str>, exec: bool) -> Result<i32> {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_replay(
+    dir: Option<&Path>,
+    filter: Option<&str>,
+    exec: bool,
+    profile: Option<&str>,
+    nextest_profile: Option<&str>,
+    args: &[String],
+) -> Result<i32> {
     let root: PathBuf = dir
         .map(Path::to_path_buf)
         .unwrap_or_else(ktstr::test_support::runs_root);
@@ -205,7 +218,7 @@ pub(crate) fn run_replay(dir: Option<&Path>, filter: Option<&str>, exec: bool) -
     // post-exec re-scan that builds a fresh pool Vec.
     let queued: BTreeSet<String> = failed_names.iter().map(|s| s.to_string()).collect();
 
-    let exit = invoke_nextest(&filter_expr).with_context(|| {
+    let exit = invoke_nextest(&filter_expr, profile, nextest_profile, args).with_context(|| {
         format!("ktstr replay: cargo nextest run -E {filter_expr:?} failed to spawn")
     })?;
 
@@ -704,12 +717,36 @@ fn regex_escape(s: &str) -> String {
 /// live progress. Returns the nextest exit code; an `Err` here
 /// is only for spawn failure (nextest binary missing,
 /// `Command::status()` failed at the syscall level).
-fn invoke_nextest(filter_expr: &str) -> Result<i32> {
+///
+/// `nextest_profile` becomes nextest's own `--profile <NAME>` (the test
+/// profile), placed before the user's trailing `args` so a passthrough
+/// token can't shadow it. `profile` sets `KTSTR_SCHEDULER_PROFILE` for
+/// the scheduler-under-test BUILD; absent, `build_and_find_binary`
+/// defaults the scheduler to `release`.
+fn invoke_nextest(
+    filter_expr: &str,
+    profile: Option<&str>,
+    nextest_profile: Option<&str>,
+    args: &[String],
+) -> Result<i32> {
     use std::process::Command;
-    let status = Command::new("cargo")
-        .args(["nextest", "run", "-E", filter_expr])
-        .status()
-        .context("spawn `cargo nextest run`")?;
+    let mut cmd = Command::new("cargo");
+    cmd.args(["nextest", "run", "-E", filter_expr]);
+    // `--nextest-profile <NAME>` selects the NEXTEST test profile;
+    // nextest's own flag is `--profile`.
+    if let Some(np) = nextest_profile {
+        cmd.args(["--profile", np]);
+    }
+    // Forward the operator's cargo/nextest flags (features,
+    // `--cargo-profile`, …) verbatim so the replay re-run builds
+    // identically to the original suite. No `--` separator is required.
+    cmd.args(args);
+    // `--profile <NAME>` sets the scheduler-under-test's cargo BUILD
+    // profile via `KTSTR_SCHEDULER_PROFILE`.
+    if let Some(p) = profile {
+        cmd.env(ktstr::KTSTR_SCHEDULER_PROFILE_ENV, p);
+    }
+    let status = cmd.status().context("spawn `cargo nextest run`")?;
     Ok(status.code().unwrap_or(1))
 }
 

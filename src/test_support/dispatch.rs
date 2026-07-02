@@ -1812,6 +1812,64 @@ fn format_unknown_kernel_label_error(
 /// Operators who invoke a test binary directly with `--exact
 /// verifier/...` will see the cell handler's "kernel label not in
 /// KTSTR_KERNEL_LIST" error.
+/// The set of workspace PACKAGE names, parsed once from the workspace
+/// `Cargo.toml` baked in at compile time. [`list_verifier_cells_all`]
+/// uses it to skip `declare_scheduler!` decls whose `Discover(pkg)` is
+/// not a real workspace package — the macro-expansion FIXTURES in
+/// tests/declare_scheduler.rs register into `KTSTR_SCHEDULERS` but have
+/// no buildable package, so their cells must not be emitted.
+///
+/// `CARGO_MANIFEST_DIR` is the ktstr crate dir, which IS the workspace
+/// root in this repo, so its `Cargo.toml` carries `[workspace] members`.
+fn workspace_packages() -> &'static std::collections::HashSet<String> {
+    use std::sync::OnceLock;
+    static PKGS: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    PKGS.get_or_init(|| {
+        const ROOT_TOML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+        parse_workspace_member_packages(ROOT_TOML, env!("CARGO_PKG_NAME"))
+    })
+}
+
+/// Pure parse of `[workspace] members = [ ... ]` from a `Cargo.toml`
+/// string into the set of package names. The `.` member (the workspace
+/// root) maps to `root_pkg`; every other member's last path component is
+/// taken as its package name (this workspace's convention: member dir
+/// `scx-ktstr` = package `scx-ktstr`). Pure so it is unit-testable.
+fn parse_workspace_member_packages(
+    cargo_toml: &str,
+    root_pkg: &str,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    // Anchor on the [workspace] section so a stray `members` key
+    // elsewhere can't be mistaken for the workspace member list.
+    let Some(ws) = cargo_toml.find("[workspace]") else {
+        return out;
+    };
+    let after_ws = &cargo_toml[ws..];
+    let Some(m) = after_ws.find("members") else {
+        return out;
+    };
+    let after = &after_ws[m..];
+    let Some(open) = after.find('[') else {
+        return out;
+    };
+    let Some(close_rel) = after[open..].find(']') else {
+        return out;
+    };
+    for tok in after[open + 1..open + close_rel].split(',') {
+        let name = tok.trim().trim_matches('"').trim();
+        if name.is_empty() {
+            continue;
+        }
+        if name == "." {
+            out.insert(root_pkg.to_string());
+        } else {
+            out.insert(name.rsplit('/').next().unwrap_or(name).to_string());
+        }
+    }
+    out
+}
+
 fn list_verifier_cells_all() {
     use super::SchedulerSpec;
     let kernel_list = read_kernel_list();
@@ -1835,6 +1893,25 @@ fn list_verifier_cells_all() {
                 sched.name,
             );
             continue;
+        }
+        // Skip declarations whose binary is not a real, buildable
+        // scheduler. The macro-expansion FIXTURES in
+        // tests/declare_scheduler.rs (`binary = "scx-full"`, `"scx-ee"`,
+        // …) register into KTSTR_SCHEDULERS but expand to `Discover` of a
+        // package that is NOT a workspace member; emitting their cells
+        // would make `cargo ktstr verifier --run-ignored` fail on
+        // `cargo build -p <fixture>` for a nonexistent package. A
+        // `Discover` of a real workspace member (scx-ktstr) and a `Path`
+        // that exists still emit. This is the emission-time counterpart to
+        // the resolve arms in `run_verifier_cell`.
+        match sched.binary {
+            SchedulerSpec::Discover(pkg) if !workspace_packages().contains(pkg) => {
+                continue;
+            }
+            SchedulerSpec::Path(p) if !std::path::Path::new(p).exists() => {
+                continue;
+            }
+            _ => {}
         }
         for kernel_entry in &kernel_list {
             if !sched_kernel_filter_accepts(sched.kernels, kernel_entry) {
@@ -2021,7 +2098,29 @@ fn run_verifier_cell(full_name: &str) -> i32 {
         }
     };
 
-    let kernel_path = kernel_entry.kernel_dir.clone();
+    // Resolve the kernel-build DIR to the actual bootable image file.
+    // `collect_verifier_output` -> `KtstrVm::builder().kernel()` loads the
+    // path verbatim (build() does NOT extract a source tree), so passing
+    // the raw dir makes the VMM loader read a directory as a bzImage and
+    // fail with "Unable to read bzImage header". `find_image_in_dir`
+    // handles both the build-tree (`arch/*/boot/bzImage`) and cache
+    // (`<dir>/bzImage`) layouts — the same resolution the eval path uses.
+    let kernel_path = if kernel_entry.kernel_dir.is_file() {
+        kernel_entry.kernel_dir.clone()
+    } else {
+        match crate::kernel_path::find_image_in_dir(&kernel_entry.kernel_dir) {
+            Some(img) => img,
+            None => {
+                eprintln!(
+                    "ktstr verifier: cell {full_name}: no kernel image \
+                     (arch/*/boot/bzImage or a cached bzImage) under {} — \
+                     build the kernel first",
+                    kernel_entry.kernel_dir.display(),
+                );
+                return 1;
+            }
+        }
+    };
     let topology = super::TopologyJson::from(preset.topology);
     let sched_args: Vec<String> = sched.sched_args.iter().map(|s| s.to_string()).collect();
 
