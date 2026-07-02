@@ -1317,8 +1317,8 @@ pub fn render_instruction_count_tables(records: &[VerifierCellRecord]) -> Option
     // the topologies that ran it. Topology is folded into the (min, max)
     // range: a flat scheduler has min == max (one number), a
     // topology-sensitive one has min < max (`lo..hi`).
-    let mut by_sched: BTreeMap<String, BTreeMap<String, BTreeMap<String, (u32, u32)>>> =
-        BTreeMap::new();
+    type VerifiedInsnSpans = BTreeMap<String, BTreeMap<String, BTreeMap<String, (u32, u32)>>>;
+    let mut by_sched: VerifiedInsnSpans = BTreeMap::new();
     // scheduler -> the union of program names it reported (the columns).
     let mut sched_progs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for r in records {

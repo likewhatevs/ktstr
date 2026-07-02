@@ -3268,24 +3268,25 @@ pub(crate) fn monitor_loop(
         // one live capture suffices, and skipping once captured avoids a
         // redundant `prog_idr` walk every tick. Gated on `data_valid`
         // like the runtime walk (pre-validity reads return phantom zeros).
-        if data_valid && verified_insns_capture.is_empty() {
-            if let Some(ctx) = prog_stats_ctx {
-                let live_walk = WalkContext {
-                    cr3_pa: select_cr3(
-                        ctx.cr3.load(std::sync::atomic::Ordering::Acquire),
-                        ctx.walk.cr3_pa,
-                    ),
-                    ..ctx.walk
-                };
-                verified_insns_capture = super::bpf_prog::find_struct_ops_progs(
-                    mem,
-                    live_walk,
-                    ctx.prog_idr_kva,
-                    &ctx.offsets,
-                    ctx.start_kernel_map,
-                    ctx.phys_base,
-                );
-            }
+        if data_valid
+            && verified_insns_capture.is_empty()
+            && let Some(ctx) = prog_stats_ctx
+        {
+            let live_walk = WalkContext {
+                cr3_pa: select_cr3(
+                    ctx.cr3.load(std::sync::atomic::Ordering::Acquire),
+                    ctx.walk.cr3_pa,
+                ),
+                ..ctx.walk
+            };
+            verified_insns_capture = super::bpf_prog::find_struct_ops_progs(
+                mem,
+                live_walk,
+                ctx.prog_idr_kva,
+                &ctx.offsets,
+                ctx.start_kernel_map,
+                ctx.phys_base,
+            );
         }
 
         // System-wide PSI-irq host-walk. `psi.psi_system_pa` is the
