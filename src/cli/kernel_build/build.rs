@@ -729,7 +729,7 @@ fn reconfigure_and_build(
         extra_kconfig.is_some() || !all_fragment_lines_present(&merged_fragment, &config_now);
     if needs_configure {
         let bar = progress.step_bar("Configuring kernel...");
-        let configure_result = configure_kernel(source_dir, &merged_fragment);
+        let configure_result = configure_kernel(source_dir, &merged_fragment, Some(progress));
         bar.finish();
         // Wrap configure errors with `--extra-kconfig` context when
         // extras are present so the user can pinpoint which input is

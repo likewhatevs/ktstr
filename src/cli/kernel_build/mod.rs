@@ -4,7 +4,7 @@
 //! - [`make`] — `make` subprocess wrappers ([`run_make`],
 //!   [`run_make_with_output`], [`make_kernel_with_output`]) plus
 //!   the byte-oriented line drain and timeout-poll loop they share.
-//! - [`kconfig`] — fragment merging ([`configure_kernel`]),
+//! - [`kconfig`] — fragment merging ([`kconfig::configure_kernel`]),
 //!   `--extra-kconfig` parsing ([`read_extra_kconfig`],
 //!   [`append_extra_kconfig_suffix`]), pre/post warning passes
 //!   over user fragments, and the post-build critical-options
@@ -20,7 +20,5 @@ mod kconfig;
 mod make;
 
 pub use build::{KernelBuildResult, kernel_build_pipeline};
-pub use kconfig::{
-    append_extra_kconfig_suffix, configure_kernel, read_extra_kconfig, validate_kernel_config,
-};
+pub use kconfig::{append_extra_kconfig_suffix, read_extra_kconfig, validate_kernel_config};
 pub use make::{make_kernel_with_output, run_make, run_make_with_output};

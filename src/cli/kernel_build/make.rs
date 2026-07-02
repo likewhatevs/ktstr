@@ -1,14 +1,27 @@
 //! `make` subprocess invocation.
 //!
-//! Wall-clock-bounded [`run_make`] (used for non-build invocations
-//! like `defconfig` / `olddefconfig` / `mrproper`) and pipe-drained
-//! [`run_make_with_output`] (used for the full build path so the
-//! merged stdout+stderr can stream through the progress group). The shared
-//! [`poll_child_with_timeout`] polling loop is extracted so timeout
-//! mechanics can be exercised against synthetic
-//! [`std::process::Child`] fixtures without spawning real `make`,
-//! and [`drain_lines_lossy`] handles the byte-oriented line-drain
-//! that survives non-UTF-8 compiler output.
+//! Three `make` invocation paths:
+//! - [`run_make`] inherits the parent's stdout/stderr under a
+//!   wall-clock timeout — used for `mrproper` and other calls made
+//!   outside an active progress group, where raw pass-through is fine.
+//! - [`run_make_captured`] captures merged stdout+stderr under a
+//!   wall-clock timeout and replays it only on failure/timeout — used
+//!   for the `defconfig` / `olddefconfig` configure step, which runs
+//!   under a live "Configuring kernel..." spinner that raw
+//!   pass-through would clobber (and whose output — e.g. `override:
+//!   reassigning to symbol …` warnings from the fragment — is routine
+//!   noise on the success path).
+//! - [`run_make_with_output`] streams merged stdout+stderr through the
+//!   progress group live with no timeout — used for the full build,
+//!   whose minutes-long (legitimately unbounded) output the operator
+//!   watches.
+//!
+//! The two timed paths share [`poll_deadline`] (wrapped by
+//! [`poll_child_with_timeout`] for the inherit path); the two
+//! capturing paths share [`drain_lines_lossy`]. Extracting both lets
+//! the timeout and line-drain mechanics be exercised against synthetic
+//! [`std::process::Child`] fixtures and in-memory readers without
+//! spawning real `make` or emitting non-UTF-8 compiler output.
 
 use std::io::BufRead;
 use std::path::Path;
@@ -16,40 +29,42 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-/// Run make in a kernel directory under a wall-clock timeout.
-///
-/// Used for non-build make invocations (`defconfig`, `olddefconfig`,
-/// `mrproper`, etc.) where the parent inherits stdout/stderr — the
-/// pipe-drained sibling [`run_make_with_output`] handles the full-
-/// build path with a separate EOF-driven termination.
+/// Wall-clock ceiling for the timed `make` paths ([`run_make`],
+/// [`run_make_captured`]).
 ///
 /// The timeout protects against a wedged make holding the calling
 /// pipeline forever. Without it, a stuck `olddefconfig` (e.g. an
-/// interactive `conf` prompt that the configure_kernel pre-step
+/// interactive `conf` prompt that the `configure_kernel` pre-step
 /// failed to bypass, or a kernel-tree inconsistency that wedges
-/// `make`) would block the parent process indefinitely. The
-/// ceiling is intentionally generous — a single `make defconfig`
-/// completes in seconds on any hardware, but large WIP kernel
-/// trees with many out-of-tree patches can stretch
-/// `mrproper` / `olddefconfig` past the typical seconds-scale; 30
-/// minutes covers every legitimate caller while still bounding a
-/// genuine wedge.
-///
-/// Polls `try_wait` at 100ms granularity — small enough that a
-/// completed make is reaped within one tick, large enough that
-/// the polling itself is not measurable load. On timeout, the
-/// child is killed (SIGKILL via `kill_on_drop`-style semantics)
-/// and reaped before bailing so no zombie outlives the function.
-pub fn run_make(kernel_dir: &Path, args: &[&str]) -> Result<()> {
-    const RUN_MAKE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-    // Production poll cadence: small enough that a completed
-    // make is reaped within one tick, large enough that the
-    // polling itself is not measurable load. Tests pass a
-    // sub-millisecond override directly to
-    // [`poll_child_with_timeout`] so timeout-fires-and-reaps
-    // assertions complete quickly.
-    const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// `make`) would block the parent process indefinitely. The ceiling
+/// is intentionally generous — a single `make defconfig` completes in
+/// seconds on any hardware, but large WIP kernel trees with many
+/// out-of-tree patches can stretch `mrproper` / `olddefconfig` past
+/// the typical seconds-scale; 30 minutes covers every legitimate
+/// caller while still bounding a genuine wedge.
+pub(super) const MAKE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+/// Production `try_wait` poll cadence for the timed `make` paths —
+/// small enough that a completed make is reaped within one tick, large
+/// enough that the polling itself is not measurable load. Tests pass a
+/// sub-millisecond override directly to [`poll_child_with_timeout`] /
+/// [`run_make_captured`] so timeout-fires-and-reaps assertions
+/// complete quickly.
+pub(super) const MAKE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Run make in a kernel directory under a wall-clock timeout, with the
+/// parent's stdout/stderr inherited.
+///
+/// Used for `mrproper` and other `make` calls made outside an active
+/// progress group, where raw pass-through is fine. The two capturing
+/// siblings — `run_make_captured` (configure step, replay-on-failure)
+/// and [`run_make_with_output`] (full build, live stream) — pipe-drain
+/// the output instead so it does not clobber a live spinner or bar.
+///
+/// On timeout the child is killed (SIGKILL) and reaped before bailing
+/// so no zombie outlives the function; see `poll_child_with_timeout`
+/// for the shared poll+reap mechanics.
+pub fn run_make(kernel_dir: &Path, args: &[&str]) -> Result<()> {
     let child = std::process::Command::new("make")
         .args(args)
         .current_dir(kernel_dir)
@@ -58,67 +73,103 @@ pub fn run_make(kernel_dir: &Path, args: &[&str]) -> Result<()> {
 
     poll_child_with_timeout(
         child,
-        RUN_MAKE_TIMEOUT,
-        POLL_INTERVAL,
+        MAKE_TIMEOUT,
+        MAKE_POLL_INTERVAL,
         &format!("make {}", args.join(" ")),
     )
 }
 
-/// Polling-loop body extracted from [`run_make`] so the timeout
-/// mechanics can be exercised against synthetic [`std::process::Child`]
-/// fixtures with sub-second deadlines (real `make` invocations
-/// would burn the full 30-minute production timeout). Production
-/// callers funnel through [`run_make`] which spawns `make`,
-/// constructs the production deadline, and delegates here.
-///
-/// `label` is the human-facing name embedded in error messages
-/// (e.g. `"make defconfig"`) — pinning a synthetic label in the
-/// test surface lets the assertion match the bail wording without
-/// depending on `make` being installed on the runner.
+/// Outcome of [`poll_deadline`] — reported without collapsing to a
+/// single error so callers can attach their own bail wording and, on
+/// the capturing path, replay captured output and sweep the process
+/// group before failing.
+enum PollOutcome {
+    /// Child exited on its own; `try_wait` already reaped it. The
+    /// carried status may be success or failure.
+    Exited(std::process::ExitStatus),
+    /// Deadline elapsed before the child exited; it was killed and
+    /// reaped inside [`poll_deadline`].
+    TimedOut,
+    /// `try_wait` itself errored; the child was killed and reaped
+    /// inside [`poll_deadline`] before returning.
+    WaitErr(std::io::Error),
+}
+
+/// Poll `child` until it exits or `timeout` elapses, then return the
+/// outcome without bailing.
 ///
 /// `timeout` is the wall-clock budget AFTER `child` has already
-/// spawned (the deadline is computed inside the helper relative
-/// to the call instant). `poll_interval` controls the
-/// `try_wait` polling cadence — small enough that a completed
-/// child is reaped within one tick, large enough that polling
-/// itself is not measurable load. Production uses 100ms; tests
-/// use 1ms so a sub-second timeout assertion completes quickly.
+/// spawned (the deadline is computed relative to the call instant).
+/// `poll_interval` controls the `try_wait` cadence — small enough that
+/// a completed child is reaped within one tick, large enough that
+/// polling itself is not measurable load. Production passes
+/// [`MAKE_POLL_INTERVAL`] (100ms); tests pass 1ms so a sub-second
+/// timeout assertion completes quickly.
 ///
-/// On timeout: kill + reap before bailing so no zombie outlives
-/// the function. On a `try_wait` error: same kill+reap cleanup
-/// before propagating, so a transient probe failure doesn't leak
-/// the child.
+/// On a clean exit the returned status is already reaped (`try_wait`
+/// consumed it). On timeout or a `try_wait` error the child is killed
+/// AND reaped before returning, so no zombie outlives the call in any
+/// path. Extracted from [`run_make`] so the timeout mechanics can be
+/// exercised against synthetic [`std::process::Child`] fixtures with
+/// sub-second deadlines (real `make` invocations would burn the full
+/// production timeout) — see [`poll_child_with_timeout`]'s tests.
+fn poll_deadline(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> PollOutcome {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return PollOutcome::Exited(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // Wedged — kill + reap so no zombie persists.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return PollOutcome::TimedOut;
+                }
+                std::thread::sleep(poll_interval);
+            }
+            Err(e) => {
+                // Reap before returning so a transient try_wait
+                // failure doesn't leak the child.
+                let _ = child.kill();
+                let _ = child.wait();
+                return PollOutcome::WaitErr(e);
+            }
+        }
+    }
+}
+
+/// Poll an already-spawned `child` under a wall-clock timeout, mapping
+/// the [`poll_deadline`] outcome to a labeled `Result` for the
+/// stdout/stderr-inherited [`run_make`] path.
+///
+/// `label` is the human-facing name embedded in error messages (e.g.
+/// `"make defconfig"`) — pinning a synthetic label in the test surface
+/// lets the assertion match the bail wording without depending on
+/// `make` being installed on the runner.
+///
+/// On timeout the bail carries `timed out after`; on a non-zero exit
+/// it carries `failed`; on a `try_wait` error it wraps the io error
+/// with `wait on {label}`. The child is always reaped before this
+/// returns (see [`poll_deadline`]).
 pub(super) fn poll_child_with_timeout(
     mut child: std::process::Child,
     timeout: Duration,
     poll_interval: Duration,
     label: &str,
 ) -> Result<()> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                anyhow::ensure!(status.success(), "{label} failed");
-                return Ok(());
-            }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    // Wedged — kill + reap before bailing so no
-                    // zombie persists after we return Err.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    bail!("{label} timed out after {timeout:?}; child killed");
-                }
-                std::thread::sleep(poll_interval);
-            }
-            Err(e) => {
-                // Reap before propagating so a transient try_wait
-                // failure doesn't leak the child.
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(e).with_context(|| format!("wait on {label}"));
-            }
+    match poll_deadline(&mut child, timeout, poll_interval) {
+        PollOutcome::Exited(status) => {
+            anyhow::ensure!(status.success(), "{label} failed");
+            Ok(())
         }
+        PollOutcome::TimedOut => {
+            bail!("{label} timed out after {timeout:?}; child killed")
+        }
+        PollOutcome::WaitErr(e) => Err(e).with_context(|| format!("wait on {label}")),
     }
 }
 
@@ -272,6 +323,155 @@ pub fn run_make_with_output(
         bail!("make {} failed", args.join(" "));
     }
     Ok(())
+}
+
+/// Run make capturing merged stdout+stderr, under a wall-clock
+/// timeout, replaying the captured output ONLY on failure or timeout.
+///
+/// Used for the `defconfig` / `olddefconfig` configure step, which
+/// runs under a live "Configuring kernel..." spinner. Unlike
+/// [`run_make_with_output`] (which streams every line live for the
+/// minutes-long build), this path stays SILENT on success: the
+/// configure step is fast and its output is routine noise (defconfig
+/// echoes, `override: reassigning to symbol …` warnings from ktstr's
+/// baked-in fragment intentionally overriding defconfig values), so
+/// streaming it would clutter the spinner without informing the
+/// operator. On failure or timeout the full captured output is
+/// replayed via [`replay_captured`] — above the progress bars through
+/// [`crate::cli::FetchProgress::println`] when a group is supplied,
+/// else on stderr — so a genuine configure error stays fully
+/// diagnosable.
+///
+/// Drains the merged pipe on a scoped worker thread while the calling
+/// thread runs [`poll_deadline`]: a single blocking read loop cannot
+/// also poll the child, so the read runs on its own thread. Continuous
+/// draining means the child never blocks on a full pipe regardless of
+/// output volume — the same single-pipe/single-reader no-deadlock
+/// property [`run_make_with_output`] documents. stdin is inherited,
+/// matching [`run_make`]: `olddefconfig` resolves new symbols
+/// non-interactively after the fragment append, and the timeout
+/// backstops any prompt that slips through.
+pub(super) fn run_make_captured(
+    kernel_dir: &Path,
+    args: &[&str],
+    progress: Option<&crate::cli::FetchProgress>,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+
+    let (read_fd, write_fd) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+        .context("create pipe for merged make stdout+stderr")?;
+    let write_fd_err = write_fd
+        .try_clone()
+        .context("clone pipe write end for stderr")?;
+
+    // `process_group(0)` makes the child a process-group leader (pgid
+    // == its pid). The configure step's `make` spawns a short-lived
+    // `scripts/kconfig/conf`; if that wedges (e.g. an interactive
+    // prompt blocked on stdin) it inherits — and holds open — the
+    // pipe's write end. Killing `make` alone would leave `conf` alive,
+    // the write end open, and the drain thread blocked on read
+    // forever. The group kill (below) sweeps `make` AND its
+    // descendants so every write end closes and the reader hits EOF.
+    //
+    // Trade-off of the fresh group: `make` is no longer in the
+    // terminal's foreground group, so a Ctrl-C (SIGINT) during the
+    // seconds-scale configure step reaches only the parent CLI, not
+    // `make` directly — the parent exiting then breaks the pipe and
+    // `make` dies of EPIPE. The streaming build path
+    // (`run_make_with_output`) keeps the parent's group and stays
+    // directly Ctrl-C-interruptible.
+    let mut child = std::process::Command::new("make")
+        .args(args)
+        .current_dir(kernel_dir)
+        .stdout(std::process::Stdio::from(write_fd))
+        .stderr(std::process::Stdio::from(write_fd_err))
+        .process_group(0)
+        .spawn()
+        .with_context(|| format!("spawn make {}", args.join(" ")))?;
+    // The child leads its own group, so its pid IS the pgid. Guard the
+    // cast the way `scenario::payload_run::kill_payload_process_group`
+    // does: `killpg` with a non-positive pgid broadcasts to the
+    // caller's group / every permitted process, so a pid that is
+    // non-positive or outside `pid_t` must never reach `killpg`. Linux
+    // pid_max <= 2^22 makes this unreachable in practice; the guard
+    // keeps the destructive syscall safe regardless.
+    let child_pgid: Option<nix::unistd::Pid> = libc::pid_t::try_from(child.id())
+        .ok()
+        .filter(|&p| p > 0)
+        .map(nix::unistd::Pid::from_raw);
+    debug_assert!(
+        child_pgid.is_some(),
+        "make child pid {} is not a valid pgid",
+        child.id()
+    );
+
+    // Parent holds no write ends after spawn (Stdio::from consumed
+    // both OwnedFds and the builder dropped its dup2'd copies), so the
+    // reader sees EOF once every write-end holder closes — on the
+    // child's natural exit, or on the timeout group-kill below. Drain
+    // on a scoped thread so the calling thread can enforce the
+    // deadline concurrently.
+    let reader = std::io::BufReader::new(std::fs::File::from(read_fd));
+    let (outcome, drained) = std::thread::scope(|scope| {
+        let drain = scope.spawn(move || drain_lines_lossy(reader, |_line| {}));
+        let outcome = poll_deadline(&mut child, timeout, poll_interval);
+        // Sweep the process group on EVERY path before joining the
+        // drain thread. poll_deadline already reaped `make` itself (via
+        // try_wait on a clean exit, or kill+wait on timeout), but any
+        // descendant that inherited the pipe's write end — a wedged
+        // `conf` on the timeout path, or a backgrounded recipe process
+        // on a clean exit — would keep the reader from ever seeing EOF
+        // and hang drain.join() with no remaining backstop. killpg
+        // closes those write ends. An already-empty (all-reaped) group
+        // ESRCHs harmlessly. Unconditional-sweep-after-wait matches
+        // `scenario::payload_run::PayloadHandle::wait`.
+        if let Some(pgid) = child_pgid {
+            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+        }
+        let drained = drain.join().expect("make output drain thread panicked");
+        (outcome, drained)
+    });
+
+    // A drain-thread read error wins over the make outcome here (the
+    // `?` propagates it before the outcome match), matching
+    // `run_make_with_output`: the pipe-read failure is itself the
+    // actionable diagnostic.
+    let captured = drained.context("read merged make stdout+stderr")?;
+    let label = format!("make {}", args.join(" "));
+    // Every failure arm replays the captured output before surfacing so
+    // the contract in this function's doc ("replayed on failure or
+    // timeout") holds symmetrically — including the rare WaitErr path.
+    match outcome {
+        PollOutcome::Exited(status) if status.success() => Ok(()),
+        PollOutcome::Exited(_) => {
+            replay_captured(&captured, progress);
+            bail!("{label} failed");
+        }
+        PollOutcome::TimedOut => {
+            replay_captured(&captured, progress);
+            bail!("{label} timed out after {timeout:?}; child killed");
+        }
+        PollOutcome::WaitErr(e) => {
+            replay_captured(&captured, progress);
+            Err(e).with_context(|| format!("wait on {label}"))
+        }
+    }
+}
+
+/// Replay captured make output on the failure path — above the
+/// progress bars via [`crate::cli::FetchProgress::println`] when a
+/// group is live (so it does not interleave with the bars), else on
+/// stderr. Lines are already LF-normalized and terminator-less
+/// ([`drain_lines_lossy`]).
+fn replay_captured(captured: &[String], progress: Option<&crate::cli::FetchProgress>) {
+    for line in captured {
+        match progress {
+            Some(p) => p.println(line),
+            None => eprintln!("{line}"),
+        }
+    }
 }
 
 /// Build the kernel with output piped through the progress group.
@@ -725,5 +925,206 @@ mod tests {
     fn cli_build_make_args_multi_core() {
         let args = build_make_args(16);
         assert_eq!(args, vec!["-j16", "KCFLAGS=-Wno-error"]);
+    }
+
+    // -- run_make_captured --
+
+    /// Spawn failure (nonexistent `current_dir`) surfaces the
+    /// `spawn make <args>` context with the underlying
+    /// `ErrorKind::NotFound`, the same contract as
+    /// [`run_make_with_output`] — proving the capturing+timed path
+    /// wraps spawn errors before reaching the drain/poll machinery.
+    /// No `make` needed: the failure happens before exec.
+    #[test]
+    fn run_make_captured_surfaces_error_when_kernel_dir_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("nonexistent_child");
+        let err = run_make_captured(
+            &missing,
+            &["foo"],
+            None,
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )
+        .expect_err("nonexistent kernel_dir must surface a spawn failure");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("spawn make foo"),
+            "expected `spawn make foo` context layer, got: {rendered}"
+        );
+        let has_not_found = err.chain().any(|e| {
+            e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        });
+        assert!(
+            has_not_found,
+            "expected underlying io::Error with ErrorKind::NotFound, got: {rendered}"
+        );
+    }
+
+    /// Clean exit (fake `@true` target) returns Ok — mirrors the
+    /// configure step's success path where the spinner must not be
+    /// clobbered (output captured, nothing emitted).
+    #[test]
+    fn run_make_captured_succeeds_on_clean_exit() {
+        if !make_in_path() {
+            skip!("make not in PATH");
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("Makefile"), "default:\n\t@true\n").unwrap();
+        run_make_captured(
+            dir.path(),
+            &["default"],
+            None,
+            Duration::from_secs(30),
+            Duration::from_millis(1),
+        )
+        .expect("clean exit must surface as Ok");
+    }
+
+    /// Non-zero exit surfaces `make <args> failed` (captured output is
+    /// replayed first, then the bail fires). Distinct wording from the
+    /// timeout path so CI scrapers can tell build-failed from wedged.
+    #[test]
+    fn run_make_captured_bails_on_failing_make() {
+        if !make_in_path() {
+            skip!("make not in PATH");
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("Makefile"),
+            "default:\n\t@printf 'boom\\n'\n\t@false\n",
+        )
+        .unwrap();
+        let err = run_make_captured(
+            dir.path(),
+            &["default"],
+            None,
+            Duration::from_secs(30),
+            Duration::from_millis(1),
+        )
+        .expect_err("non-zero exit must surface as Err");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("make default failed"),
+            "expected `make default failed`, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("timed out"),
+            "non-zero exit must not use the timeout wording; got: {rendered}"
+        );
+    }
+
+    /// The timeout path must not hang when a recipe grandchild (here
+    /// `sleep`) inherits and holds the merged pipe's write end open.
+    /// `process_group(0)` at spawn plus the `killpg` sweep on timeout
+    /// kills `make` AND the `sleep`, so the drain thread hits EOF and
+    /// joins. A regression that killed only `make` (no group sweep)
+    /// would block the drain-thread join until `sleep` exits (~30s),
+    /// blowing the sub-5s wall-clock assertion. Pins the `timed out
+    /// after` wording too.
+    #[test]
+    fn run_make_captured_times_out_and_sweeps_group_without_hang() {
+        if !make_in_path() {
+            skip!("make not in PATH");
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("Makefile"), "default:\n\t@sleep 30\n").unwrap();
+        let start = std::time::Instant::now();
+        let err = run_make_captured(
+            dir.path(),
+            &["default"],
+            None,
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+        )
+        .expect_err("wedged make must surface as Err");
+        let elapsed = start.elapsed();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("make default"),
+            "timeout bail must include the label; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("timed out after"),
+            "timeout bail must include `timed out after`; got: {rendered}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "run must return promptly after the 100ms timeout — took {elapsed:?}, \
+             which means the group sweep did not unblock the output-drain thread \
+             (the recipe's `sleep` still held the pipe open)"
+        );
+    }
+
+    /// High-volume merged output (~200 KiB, past the 64 KiB pipe
+    /// buffer) drains without deadlock through the timed capturing
+    /// path: the drain thread empties the pipe continuously so the
+    /// child never blocks on a full pipe, and the generous timeout
+    /// never fires. A regression that read the pipe only after the
+    /// child exited would deadlock (child blocks on write, parent
+    /// waits for exit).
+    #[test]
+    fn run_make_captured_drains_high_volume_without_deadlock() {
+        if !make_in_path() {
+            skip!("make not in PATH");
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let stdout_chunk: String = "S".repeat(1024);
+        let stderr_chunk: String = "E".repeat(1024);
+        let mut recipe = String::new();
+        for _ in 0..100 {
+            recipe.push_str(&format!("\t@printf '%s\\n' '{stdout_chunk}'\n"));
+            recipe.push_str(&format!("\t@printf '%s\\n' '{stderr_chunk}' >&2\n"));
+        }
+        let makefile = format!("default:\n{recipe}\t@false\n");
+        std::fs::write(dir.path().join("Makefile"), makefile).unwrap();
+        let err = run_make_captured(
+            dir.path(),
+            &["default"],
+            None,
+            Duration::from_secs(30),
+            Duration::from_millis(1),
+        )
+        .expect_err("non-zero exit must surface as Err");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("make default failed"),
+            "expected `make default failed`, got: {rendered}"
+        );
+    }
+
+    /// Exercises the `Some(progress)` replay branch (replay_captured
+    /// routes each captured line through `FetchProgress::println`,
+    /// above the bars). Every other run_make_captured test passes None
+    /// (the eprintln fallback), so without this the Some arm is
+    /// uncovered — a regression that broke the above-bars routing would
+    /// pass CI. Under nextest the group is hidden, so println routes to
+    /// stderr (nextest-captured) rather than the bars; the test asserts
+    /// the failure still surfaces cleanly with no panic.
+    #[test]
+    fn run_make_captured_replays_through_progress_group_on_failure() {
+        if !make_in_path() {
+            skip!("make not in PATH");
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("Makefile"),
+            "default:\n\t@printf 'boom-via-progress\\n'\n\t@false\n",
+        )
+        .unwrap();
+        let progress = crate::cli::FetchProgress::new();
+        let err = run_make_captured(
+            dir.path(),
+            &["default"],
+            Some(&progress),
+            Duration::from_secs(30),
+            Duration::from_millis(1),
+        )
+        .expect_err("non-zero exit must surface as Err");
+        assert!(
+            format!("{err:#}").contains("make default failed"),
+            "expected `make default failed`, got: {err:#}"
+        );
     }
 }

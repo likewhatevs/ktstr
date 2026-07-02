@@ -26,7 +26,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 use super::super::kernel_cmd::EMBEDDED_KCONFIG;
-use super::make::run_make;
+use super::make::{MAKE_POLL_INTERVAL, MAKE_TIMEOUT, run_make_captured};
 
 /// Ensure the kconfig fragment is applied to the kernel's .config.
 ///
@@ -363,10 +363,28 @@ pub(super) fn warn_dropped_extra_kconfig_lines(kernel_dir: &Path, extra: &str, c
 /// to resolve new options with defaults — without this, the
 /// subsequent `make` launches interactive `conf` prompts that hang
 /// when stdout/stderr are piped.
-pub fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<()> {
+///
+/// The `defconfig` / `olddefconfig` invocations run through
+/// `run_make_captured` rather than [`super::make::run_make`]: this
+/// step runs under a live "Configuring kernel..." spinner, so their
+/// output is captured (and replayed only on failure) instead of
+/// raw-inherited, which would clobber the spinner. `progress` is
+/// `Some` under the spinner (failure replay lands above the bars) and
+/// `None` in tests.
+pub(crate) fn configure_kernel(
+    kernel_dir: &Path,
+    fragment: &str,
+    progress: Option<&crate::cli::FetchProgress>,
+) -> Result<()> {
     let config_path = kernel_dir.join(".config");
     if !config_path.exists() {
-        run_make(kernel_dir, &["defconfig"])?;
+        run_make_captured(
+            kernel_dir,
+            &["defconfig"],
+            progress,
+            MAKE_TIMEOUT,
+            MAKE_POLL_INTERVAL,
+        )?;
     }
 
     let config_content = std::fs::read_to_string(&config_path)?;
@@ -379,7 +397,13 @@ pub fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<()> {
         .open(&config_path)?;
     std::io::Write::write_all(&mut config, fragment.as_bytes())?;
 
-    run_make(kernel_dir, &["olddefconfig"])?;
+    run_make_captured(
+        kernel_dir,
+        &["olddefconfig"],
+        progress,
+        MAKE_TIMEOUT,
+        MAKE_POLL_INTERVAL,
+    )?;
 
     Ok(())
 }
@@ -1007,7 +1031,7 @@ mod tests {
         std::fs::write(dir.path().join(".config"), "CONFIG_BPF=y\n").unwrap();
         std::fs::write(dir.path().join("Makefile"), "olddefconfig:\n\t@true\n").unwrap();
         let fragment = "CONFIG_EXTRA=y\n";
-        configure_kernel(dir.path(), fragment).unwrap();
+        configure_kernel(dir.path(), fragment, None).unwrap();
         let config = std::fs::read_to_string(dir.path().join(".config")).unwrap();
         assert!(config.contains("CONFIG_EXTRA=y"));
         assert!(config.contains("CONFIG_BPF=y"));
@@ -1019,7 +1043,7 @@ mod tests {
         let initial = "CONFIG_BPF=y\nCONFIG_EXTRA=y\n";
         std::fs::write(dir.path().join(".config"), initial).unwrap();
         let fragment = "CONFIG_EXTRA=y\n";
-        configure_kernel(dir.path(), fragment).unwrap();
+        configure_kernel(dir.path(), fragment, None).unwrap();
         let config = std::fs::read_to_string(dir.path().join(".config")).unwrap();
         assert_eq!(config, initial);
     }
@@ -1036,7 +1060,7 @@ mod tests {
         std::fs::write(dir.path().join(".config"), initial).unwrap();
         std::fs::write(dir.path().join("Makefile"), "olddefconfig:\n\t@true\n").unwrap();
         let fragment = "CONFIG_NR_CPUS=1\n";
-        configure_kernel(dir.path(), fragment).unwrap();
+        configure_kernel(dir.path(), fragment, None).unwrap();
         let config = std::fs::read_to_string(dir.path().join(".config")).unwrap();
         assert!(
             config.lines().any(|l| l.trim() == "CONFIG_NR_CPUS=1"),
@@ -1045,6 +1069,34 @@ mod tests {
         assert!(
             config.lines().any(|l| l.trim() == "CONFIG_NR_CPUS=128"),
             "original CONFIG_NR_CPUS=128 must be preserved: {config:?}"
+        );
+    }
+
+    /// The `!config_path.exists()` branch: with no pre-existing
+    /// `.config`, configure_kernel runs `make defconfig` first (via
+    /// run_make_captured), then appends the fragment and runs
+    /// olddefconfig. The other configure_kernel tests all pre-write a
+    /// `.config`, so the defconfig branch was otherwise uncovered. Fake
+    /// Makefile targets stand in for the kernel's: `defconfig` writes a
+    /// base `.config`, `olddefconfig` is a no-op.
+    #[test]
+    fn configure_kernel_runs_defconfig_when_config_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("Makefile"),
+            "defconfig:\n\t@printf 'CONFIG_BASE=y\\n' > .config\nolddefconfig:\n\t@true\n",
+        )
+        .unwrap();
+        let fragment = "CONFIG_EXTRA=y\n";
+        configure_kernel(dir.path(), fragment, None).unwrap();
+        let config = std::fs::read_to_string(dir.path().join(".config")).unwrap();
+        assert!(
+            config.contains("CONFIG_BASE=y"),
+            "defconfig target must have created the base .config: {config:?}"
+        );
+        assert!(
+            config.contains("CONFIG_EXTRA=y"),
+            "fragment must be appended after defconfig: {config:?}"
         );
     }
 
