@@ -80,38 +80,19 @@ pub(crate) fn run_verifier(
     args: Vec<String>,
 ) -> Result<(), String> {
     let mut cmd = Command::new("cargo");
-    // Two load-bearing pieces:
-    //   * `--run-ignored all`: verifier cells are emitted IGNORE-GATED
-    //     (like gauntlet variants) — `list_verifier_cells_all` emits every
-    //     `verifier/<sched>/<kernel>/<preset>` line unconditionally,
-    //     including on nextest's `--list --ignored` pass, so nextest marks
-    //     each cell ignored. Without opting in, `cargo nextest run` skips
-    //     every cell.
-    //   * `test(/^verifier/) & !test(/^verifier::/)`: match the CELLS
-    //     (named `verifier/...`, with a slash) but NOT the verifier
-    //     module's own unit tests (`verifier::tests::...`, colons), which
-    //     also start with "verifier" and would otherwise run under a bare
-    //     `^verifier` prefix. `cargo ktstr verifier` collects BPF verifier
-    //     stats from VM-boot cells; the module unit tests belong to
-    //     `cargo ktstr test`, so they are excluded here.
-    cmd.args([
-        "nextest",
-        "run",
-        "--run-ignored",
-        "all",
-        "-E",
-        "test(/^verifier/) & !test(/^verifier::/)",
-    ]);
-    // `--nextest-profile <NAME>` selects the NEXTEST test profile;
-    // nextest's own flag for it is `--profile`. Emitted before the user's
-    // trailing args so a passthrough token can't shadow it.
-    if let Some(np) = &nextest_profile {
-        cmd.args(["--profile", np]);
-    }
-    // Forward the user's cargo/nextest flags (features, `--cargo-profile`,
-    // ...) verbatim; no `--` separator is needed — clap captures them as
-    // the trailing_var_arg group.
-    cmd.args(&args);
+    // The nextest argument vector — base flags (`--run-ignored all`, the
+    // load-bearing `--no-tests pass`, and the `verifier/...`-cell filter),
+    // then the optional `--nextest-profile` as nextest's `--profile`, then
+    // the user's forwarded trailing args verbatim — is built by
+    // `ktstr::verifier::build_nextest_args`, which documents each flag
+    // and is unit-tested so the reachability-critical ones cannot be
+    // silently dropped. The profile is emitted before the forwarded args
+    // so a passthrough token cannot shadow it; no `--` separator is needed
+    // (clap captured `args` as the trailing_var_arg group).
+    cmd.args(ktstr::verifier::build_nextest_args(
+        nextest_profile.as_deref(),
+        &args,
+    ));
 
     if raw {
         cmd.env(ktstr::KTSTR_VERIFIER_RAW_ENV, "1");
@@ -212,35 +193,16 @@ pub(crate) fn run_verifier(
     }
     let _ = std::fs::remove_dir_all(&result_dir);
 
-    // A `--scheduler <NAME>` that matched no emitted cell writes zero
-    // records: either the name is not a declared BPF scheduler, or no
-    // topology preset fits this host under the scheduler's declared
-    // scope. Gate on `status.success()` so this targeted message fires
-    // ONLY when nextest ran cleanly but matched nothing — a nextest
-    // build/exec FAILURE (e.g. integration-gated cells that never
-    // compiled without the feature passthrough) also writes zero
-    // records, and must surface its own diagnostic via the
-    // status-failure arm below, not be misreported as "no such scheduler".
-    if status.success()
-        && let Some(name) = &scheduler
-        && records.is_empty()
-    {
-        return Err(format!(
-            "--scheduler {name:?}: matched no verifier cell — no declared BPF \
-             scheduler by that name, or no topology preset fits this host for \
-             it. Run `cargo ktstr verifier` with no --scheduler to see the \
-             swept set."
-        ));
-    }
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "cargo nextest run exited with {}",
-            status
-                .code()
-                .map_or("signal".to_string(), |c| c.to_string()),
-        ))
-    }
+    // Decide the outcome from nextest's exit + the records. With
+    // `--no-tests pass` a zero-cell selection exits 0, so an empty record
+    // set on success is diagnosed here (a `--scheduler` typo, no scheduler
+    // declared, or no topology preset fits this host) rather than
+    // surfacing nextest's generic no-tests error. A real build/exec
+    // failure still exits non-zero and is surfaced verbatim.
+    ktstr::verifier::classify_run_outcome(
+        status.success(),
+        records.is_empty(),
+        scheduler.as_deref(),
+        status.code(),
+    )
 }

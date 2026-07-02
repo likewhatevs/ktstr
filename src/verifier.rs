@@ -1127,6 +1127,84 @@ pub fn read_cell_records(dir: &std::path::Path) -> Vec<VerifierCellRecord> {
         .collect()
 }
 
+/// Decide the `cargo ktstr verifier` run outcome from nextest's exit
+/// success, whether any per-cell records were produced, and the optional
+/// `--scheduler` filter.
+///
+/// The dispatcher runs nextest with `--no-tests=pass`, so a run that
+/// selects zero verifier cells exits 0 (success) with empty records
+/// rather than nextest's generic "no tests to run" (exit 4). That lets
+/// the dispatcher diagnose the empty case itself instead of surfacing a
+/// cryptic nextest exit:
+/// - `--scheduler <NAME>` set + no records: the name is not a declared
+///   scheduler, or no topology preset fits this host for it.
+/// - no `--scheduler` + no records: no `declare_scheduler!` is linked into
+///   a test binary the sweep sees, or every declared scheduler's
+///   constraints rejected all topology presets on this host.
+///
+/// A genuine build/exec failure still fails nextest (exit non-zero, which
+/// `--no-tests=pass` does not mask), surfaced via the `exit_code` arm.
+pub fn classify_run_outcome(
+    success: bool,
+    records_empty: bool,
+    scheduler: Option<&str>,
+    exit_code: Option<i32>,
+) -> Result<(), String> {
+    if !success {
+        let code = exit_code.map_or_else(|| "signal".to_string(), |c| c.to_string());
+        return Err(format!("cargo nextest run exited with {code}"));
+    }
+    if records_empty {
+        return Err(match scheduler {
+            Some(name) => format!(
+                "--scheduler {name:?}: matched no verifier cell — no declared BPF \
+                 scheduler by that name, or no topology preset fits this host for \
+                 it. Run `cargo ktstr verifier` with no --scheduler to see the \
+                 swept set."
+            ),
+            None => "no verifier cells ran — no scheduler is declared via \
+                 declare_scheduler! in a linked test binary, or every declared \
+                 scheduler's constraints rejected all topology presets on this \
+                 host."
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Build the `cargo nextest run` argument vector for the verifier sweep.
+///
+/// Load-bearing tokens:
+/// - `--run-ignored all`: verifier cells are emitted ignore-gated, so
+///   nextest skips them unless opted in.
+/// - `--no-tests pass`: a zero-cell selection exits 0 (not nextest's
+///   default exit-4 "no tests to run"), so [`classify_run_outcome`] can
+///   emit a targeted diagnostic instead of a cryptic nextest exit.
+/// - `-E 'test(/^verifier/) & !test(/^verifier::/)'`: the `verifier/...`
+///   cells, excluding the verifier module's own `verifier::tests::*`.
+///
+/// `nextest_profile`, if set, becomes nextest's `--profile <NAME>`,
+/// emitted before `forward` so a forwarded token cannot shadow it.
+/// `forward` is the user's trailing cargo/nextest args, appended verbatim.
+pub fn build_nextest_args(nextest_profile: Option<&str>, forward: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "nextest".to_string(),
+        "run".to_string(),
+        "--run-ignored".to_string(),
+        "all".to_string(),
+        "--no-tests".to_string(),
+        "pass".to_string(),
+        "-E".to_string(),
+        "test(/^verifier/) & !test(/^verifier::/)".to_string(),
+    ];
+    if let Some(np) = nextest_profile {
+        args.push("--profile".to_string());
+        args.push(np.to_string());
+    }
+    args.extend(forward.iter().cloned());
+    args
+}
+
 /// Column labeling for [`render_result_table`]'s PASS/FAIL grid: with a
 /// single kernel, label a column by its scheduler alone; with multiple
 /// kernels, disambiguate as `scheduler @ kernel`. Only that renderer
@@ -1563,6 +1641,86 @@ mod tests {
             render_instruction_count_tables(&bare).is_none(),
             "no stats -> None"
         );
+    }
+
+    /// classify_run_outcome: a build/exec failure surfaces nextest's exit;
+    /// a successful-but-empty run is diagnosed by the dispatcher (friendly
+    /// no-such-scheduler message when --scheduler was set, no-cells-ran
+    /// message otherwise); a successful run with records is Ok.
+    #[test]
+    fn classify_run_outcome_cases() {
+        // Records present + success -> Ok regardless of --scheduler.
+        assert!(classify_run_outcome(true, false, None, Some(0)).is_ok());
+        assert!(classify_run_outcome(true, false, Some("ktstr_sched"), Some(0)).is_ok());
+
+        // Success + empty + --scheduler -> friendly "no such scheduler".
+        // Reachable ONLY because --no-tests=pass turns a 0-cell match into
+        // exit 0; under the old `auto` default a 0-match exited 4 -> the
+        // failure arm, leaving this message dead.
+        let e = classify_run_outcome(true, true, Some("nope"), Some(0)).unwrap_err();
+        assert!(
+            e.contains("--scheduler \"nope\"") && e.contains("matched no verifier cell"),
+            "scheduler-empty diagnostic: {e}"
+        );
+
+        // Success + empty + no --scheduler -> "no cells ran" diagnosis
+        // (must NOT silently succeed under --no-tests=pass).
+        let e = classify_run_outcome(true, true, None, Some(0)).unwrap_err();
+        assert!(
+            e.contains("no verifier cells ran") && e.contains("declare_scheduler!"),
+            "no-cells diagnostic: {e}"
+        );
+
+        // Failure surfaces nextest's exit code; a signal (no code) renders
+        // as "signal".
+        assert_eq!(
+            classify_run_outcome(false, true, None, Some(4)).unwrap_err(),
+            "cargo nextest run exited with 4"
+        );
+        assert_eq!(
+            classify_run_outcome(false, false, Some("x"), None).unwrap_err(),
+            "cargo nextest run exited with signal"
+        );
+    }
+
+    /// build_nextest_args carries the flags that make the friendly
+    /// diagnostic reachable: `--run-ignored all` (cells are ignore-gated)
+    /// and `--no-tests pass` (a 0-cell selection exits 0 so
+    /// classify_run_outcome runs instead of nextest's exit-4). Guards
+    /// against a future edit silently dropping either, plus the
+    /// profile-before-forwarded-args ordering.
+    #[test]
+    fn build_nextest_args_carries_load_bearing_flags() {
+        let args = build_nextest_args(None, &[]);
+        let ri = args
+            .iter()
+            .position(|a| a == "--run-ignored")
+            .expect("--run-ignored present");
+        assert_eq!(args[ri + 1], "all", "--run-ignored all");
+        let nt = args
+            .iter()
+            .position(|a| a == "--no-tests")
+            .expect("--no-tests present");
+        assert_eq!(args[nt + 1], "pass", "--no-tests pass");
+        assert!(
+            args.iter()
+                .any(|a| a == "test(/^verifier/) & !test(/^verifier::/)"),
+            "verifier-cell filter present: {args:?}"
+        );
+
+        // --profile <NAME> is emitted before forwarded args so a forwarded
+        // token cannot shadow it.
+        let args = build_nextest_args(Some("ci"), &["--features".to_string(), "wprof".to_string()]);
+        let p = args
+            .iter()
+            .position(|a| a == "--profile")
+            .expect("--profile present");
+        assert_eq!(args[p + 1], "ci");
+        let f = args
+            .iter()
+            .position(|a| a == "--features")
+            .expect("forwarded --features present");
+        assert!(p < f, "profile emitted before forwarded args: {args:?}");
     }
 
     // -----------------------------------------------------------------------
