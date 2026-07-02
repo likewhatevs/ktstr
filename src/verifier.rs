@@ -1783,7 +1783,10 @@ mod tests {
         // (defensively) true.
         let attach_fail = base(AttachOutcome::Died, true, false).cell_verdict();
         assert!(
-            attach_fail.as_ref().unwrap_err().contains("did not turn on"),
+            attach_fail
+                .as_ref()
+                .unwrap_err()
+                .contains("did not turn on"),
             "attach gate must win over dispatch: {attach_fail:?}",
         );
 

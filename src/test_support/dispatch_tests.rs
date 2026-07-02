@@ -812,7 +812,12 @@ fn format_unknown_kernel_label_error_joins_present_with_comma_space() {
     // Three-entry present slice must render comma-space separated
     // to match the `present.join(", ")` contract.
     let present = vec!["a", "b", "c"];
-    let s = format_unknown_kernel_label_error("verifier/foo/kernel_x/tiny", "kernel_x", "foo", &present);
+    let s = format_unknown_kernel_label_error(
+        "verifier/foo/kernel_x/tiny",
+        "kernel_x",
+        "foo",
+        &present,
+    );
     assert!(
         s.contains("Present labels: [a, b, c]"),
         "wrong join delimiter: {s}",

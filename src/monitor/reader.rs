@@ -3849,7 +3849,11 @@ mod tests {
         // bpf_prog: STRUCT_OPS (kernel BPF_PROG_TYPE_STRUCT_OPS = 27) +
         // aux pointer; prog_stats left 0.
         w32(&mut buf, prog_pa + offsets.prog_type as u64, 27);
-        w64(&mut buf, prog_pa + offsets.prog_aux as u64, pa_to_kva(aux_pa));
+        w64(
+            &mut buf,
+            prog_pa + offsets.prog_aux as u64,
+            pa_to_kva(aux_pa),
+        );
         // bpf_prog_aux: verified_insns + NUL-terminated name.
         w32(&mut buf, aux_pa + offsets.aux_verified_insns as u64, 4242);
         let name = b"sched_prog";

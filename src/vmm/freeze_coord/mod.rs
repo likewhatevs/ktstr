@@ -14627,7 +14627,7 @@ fn choose_verifier_stats_source(
 
 #[cfg(test)]
 mod verifier_stats_source_tests {
-    use super::{choose_verifier_stats_source, VerifierStatsSource};
+    use super::{VerifierStatsSource, choose_verifier_stats_source};
 
     /// The core decision: a non-empty mid-run capture is
     /// preferred over the post-teardown walk (which races `idr_remove`),
