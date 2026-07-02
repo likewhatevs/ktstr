@@ -1029,17 +1029,23 @@ test-author configuration is required either way.
 
 `cargo ktstr verifier` runs the BPF verifier against every
 `declare_scheduler!`-registered scheduler's struct_ops programs
-inside a real kernel and prints per-program verified-instruction
-counts. The dispatcher hands off to
-`cargo nextest run -E 'test(/^verifier/)'`; nextest fans out
-across (scheduler × declared kernel × accepted topology preset)
-cells, each cell booting its own VM. Per-cell output starts with
-a banner identifying the axis values:
+inside a real kernel, prints per-program verified-instruction
+counts, and asserts the scheduler turns on (attaches as the active
+sched_ext scheduler). The dispatcher hands off to
+`cargo nextest run -E 'test(/^verifier/) & !test(/^verifier::/)'`
+(the `verifier/...` cells, not the module's `verifier::tests::*` unit
+tests); nextest fans out across (scheduler × declared kernel) cells —
+one per pair, each on the smallest topology the scheduler accepts —
+each cell booting its own VM. After the run a scheduler × kernel
+PASS/FAIL summary table is printed. Per-cell output starts with a
+banner identifying the axis values:
 
 ```text
-=== ktstr_sched | kernel kernel_6_14_2 | topology tiny-1llc ===
+=== ktstr_sched | kernel kernel_6_14_2 ===
+verifier topology: tiny-1llc (4 CPUs, 1 LLC)
 
 verifier
+  scheduler: attached (sched_ext enabled)
   enqueue                                  verified_insns=42
 
 verifier --- verifier stats ---
@@ -1055,9 +1061,11 @@ When the scheduler did not capture a log, the output is just the
 per-program table:
 
 ```text
-=== ktstr_sched | kernel kernel_6_14_2 | topology tiny-1llc ===
+=== ktstr_sched | kernel kernel_6_14_2 ===
+verifier topology: tiny-1llc (4 CPUs, 1 LLC)
 
 verifier
+  scheduler: attached (sched_ext enabled)
   enqueue                                  verified_insns=500
   dispatch                                 verified_insns=1200
   init                                     verified_insns=300

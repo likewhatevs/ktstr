@@ -4,19 +4,32 @@
 //! Each test binary that links the `ktstr` crate's `test_support`
 //! module and has at least one `declare_scheduler!` declaration
 //! emits one nextest test per
-//! (declared scheduler × kernel-list entry × accepted gauntlet
-//! preset) cell. The lister + cell handler live in
+//! (declared scheduler × kernel-list entry) cell — one cell per
+//! (scheduler, kernel), on the smallest topology the scheduler's
+//! constraints accept (`verified_insns` is topology-independent). A
+//! cell PASSes only when its scheduler both verifies (BPF loads) AND
+//! turns on — the guest attach gate confirms sched_ext `enabled`. The
+//! lister + cell handler live in
 //! `src/test_support/dispatch.rs::list_verifier_cells_all` and
 //! `run_verifier_cell`. Nextest provides per-cell parallelism,
 //! retries, and failure isolation; this dispatcher resolves the
 //! `--kernel` argument into the `KTSTR_KERNEL_LIST` env-var matrix
 //! dimension the test binary's lister walks, plumbs `--raw` via
-//! `KTSTR_VERIFIER_RAW`, and spawns nextest with a verifier-prefix
-//! filter expression. The trailing `args` are forwarded verbatim to that
-//! `cargo nextest run` — feature selection (`cargo ktstr verifier
-//! --features integration,wprof`, no `--` separator) reaches the
+//! `KTSTR_VERIFIER_RAW`, and spawns nextest filtered to the CELL names
+//! only (`test(/^verifier/) & !test(/^verifier::/)` — the `verifier/...`
+//! cells, NOT the verifier module's own `verifier::tests::*` unit tests,
+//! which also start with "verifier"). The trailing `args` are forwarded
+//! verbatim to that `cargo nextest run` — feature selection (`cargo ktstr
+//! verifier --features integration,wprof`, no `--` separator) reaches the
 //! integration-gated `declare_scheduler!` cell build; the
-//! scheduler-under-test builds release by default.
+//! scheduler-under-test builds release by default, and each cell boots
+//! with performance mode disabled (its `verified_insns` count is
+//! perf-mode-independent, so cells take only a shared LLC reservation and
+//! no longer starve each other on the LLC lock — see
+//! `collect_verifier_output`). After nextest returns, the dispatcher
+//! reads each cell's PASS/FAIL record (written under
+//! `KTSTR_VERIFIER_RESULT_DIR`) and prints a scheduler × kernel
+//! summary table.
 //!
 //! `KTSTR_KERNEL_LIST` is ALWAYS populated by this dispatcher — even
 //! with no `--kernel` flag the dispatcher auto-discovers one kernel
@@ -39,9 +52,9 @@ use crate::kernel::{
 /// `cargo nextest run` — the path for feature selection
 /// (`cargo ktstr verifier --features integration,wprof`), which the
 /// integration-gated `declare_scheduler!` cells require to compile.
-/// Without the feature passthrough the verifier-prefix filter matches
-/// only the module's unit tests and the command collects no verifier
-/// statistics.
+/// Without the feature passthrough the integration-gated cells never
+/// compile, so the cell-only filter matches nothing and the command
+/// collects no verifier statistics.
 ///
 /// `profile` is the scheduler-under-test's cargo BUILD profile
 /// (`--profile <NAME>`): set as `KTSTR_SCHEDULER_PROFILE` so
@@ -58,22 +71,27 @@ pub(crate) fn run_verifier(
     args: Vec<String>,
 ) -> Result<(), String> {
     let mut cmd = Command::new("cargo");
-    // `--run-ignored all` is load-bearing: verifier cells are emitted
-    // IGNORE-GATED (like gauntlet variants). `list_verifier_cells_all`
-    // emits every `verifier/<sched>/<kernel>/<preset>` line
-    // unconditionally — including on nextest's `--list --ignored` pass —
-    // so nextest classifies each cell as ignored. Without opting in,
-    // `cargo nextest run` skips every cell and this command runs only the
-    // non-ignored `verifier::tests::*` unit tests (0 cells collected).
-    // `all` (not `only`) keeps those unit tests running alongside the
-    // cells.
+    // Two load-bearing pieces:
+    //   * `--run-ignored all`: verifier cells are emitted IGNORE-GATED
+    //     (like gauntlet variants) — `list_verifier_cells_all` emits every
+    //     `verifier/<sched>/<kernel>` line unconditionally,
+    //     including on nextest's `--list --ignored` pass, so nextest marks
+    //     each cell ignored. Without opting in, `cargo nextest run` skips
+    //     every cell.
+    //   * `test(/^verifier/) & !test(/^verifier::/)`: match the CELLS
+    //     (named `verifier/...`, with a slash) but NOT the verifier
+    //     module's own unit tests (`verifier::tests::...`, colons), which
+    //     also start with "verifier" and would otherwise run under a bare
+    //     `^verifier` prefix. `cargo ktstr verifier` collects BPF verifier
+    //     stats from VM-boot cells; the module unit tests belong to
+    //     `cargo ktstr test`, so they are excluded here.
     cmd.args([
         "nextest",
         "run",
         "--run-ignored",
         "all",
         "-E",
-        "test(/^verifier/)",
+        "test(/^verifier/) & !test(/^verifier::/)",
     ]);
     // `--nextest-profile <NAME>` selects the NEXTEST test profile;
     // nextest's own flag for it is `--profile`. Emitted before the user's
@@ -125,10 +143,27 @@ pub(crate) fn run_verifier(
     // VM-boot tests can skip when run under raw nextest. Mirrors
     // the `cargo ktstr test` dispatcher in run_cargo.rs.
     cmd.env(ktstr::KTSTR_ORCHESTRATED_ENV, "1");
+
+    // Per-cell result dir: each verifier cell writes its PASS/FAIL record
+    // here (via KTSTR_VERIFIER_RESULT_DIR), and after nextest returns we
+    // read them back to render the summary table. Unique per dispatcher pid
+    // so concurrent `cargo ktstr verifier` runs don't cross-read; wiped
+    // first so a stale dir from a crashed prior run can't leak old records.
+    let result_dir =
+        std::env::temp_dir().join(format!("ktstr-verifier-results-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&result_dir);
+    if let Err(e) = std::fs::create_dir_all(&result_dir) {
+        return Err(format!(
+            "create verifier result dir {}: {e}",
+            result_dir.display()
+        ));
+    }
+    cmd.env(ktstr::KTSTR_VERIFIER_RESULT_DIR_ENV, &result_dir);
+
     let kernel_count = resolved.len();
 
     eprintln!(
-        "cargo ktstr verifier: dispatching to nextest with filter test(/^verifier/) \
+        "cargo ktstr verifier: dispatching to nextest (verifier/ cells only) \
          on {kernel_count} resolved kernel(s){raw}{fwd}",
         raw = if raw { " (raw output)" } else { "" },
         fwd = if args.is_empty() {
@@ -141,6 +176,18 @@ pub(crate) fn run_verifier(
     let status = cmd
         .status()
         .map_err(|e| format!("spawn cargo nextest run: {e}"))?;
+
+    // Render the per-cell PASS/FAIL summary table from the records each
+    // cell wrote into `result_dir`. Printed on BOTH success and failure so
+    // the operator sees the full scheduler × kernel matrix
+    // even when some cells failed. Best-effort: no records (e.g. 0 cells
+    // ran) -> render_result_table returns None and nothing prints.
+    let records = ktstr::verifier::read_cell_records(&result_dir);
+    if let Some(table) = ktstr::verifier::render_result_table(&records) {
+        print!("{table}");
+    }
+    let _ = std::fs::remove_dir_all(&result_dir);
+
     if status.success() {
         Ok(())
     } else {

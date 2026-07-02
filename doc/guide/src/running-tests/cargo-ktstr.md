@@ -561,11 +561,21 @@ cargo ktstr kernel clean --corrupt-only --force   # remove only corrupt entries
 
 Collect BPF verifier statistics for every scheduler declared via
 `declare_scheduler!` in the workspace's test binaries. Spawns
-`cargo nextest run -E 'test(/^verifier/)'` and lets nextest fan
-out per (scheduler × kernel-list entry × accepted topology preset)
-cell — each cell boots its own VM, loads the scheduler's BPF
-programs, and reports per-program verified instruction counts
-from host-side memory introspection.
+`cargo nextest run -E 'test(/^verifier/) & !test(/^verifier::/)'` (the
+`verifier/...` cells only, not the verifier module's `verifier::tests::*`
+unit tests) and lets nextest fan out per (scheduler × kernel-list entry)
+cell — one cell per pair (not per topology; `verified_insns` is
+topology-independent), each on the smallest topology the scheduler's
+constraints accept. Each cell boots its own VM with performance mode
+disabled (its `verified_insns` count is perf-mode-independent, so cells
+take only a shared `LOCK_SH` LLC reservation and no longer starve each
+other on the LLC lock; a `performance_mode` peer's `LOCK_EX` can still
+defer a cell, resolved by nextest retry), loads the scheduler's BPF
+programs, reports per-program verified instruction counts from host-side
+memory introspection, and asserts the scheduler turns on (the guest
+attach gate confirms sched_ext `enabled`). A cell PASSes only when the
+scheduler both verifies AND attaches. After the run, a scheduler × kernel
+PASS/FAIL summary table is printed.
 
 ```sh
 cargo ktstr verifier                              # auto-discover kernel

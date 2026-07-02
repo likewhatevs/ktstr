@@ -738,11 +738,11 @@ fn filter_rejects_when_no_declared_spec_matches() {
 
 #[test]
 fn format_empty_kernel_list_error_names_cell_and_dispatcher() {
-    let s = format_empty_kernel_list_error("verifier/sched_foo/kernel_6_14_2/tiny-1llc");
+    let s = format_empty_kernel_list_error("verifier/sched_foo/kernel_6_14_2");
     // Cell name appears verbatim so the operator can grep their
     // own invocation for the failing cell.
     assert!(
-        s.contains("verifier/sched_foo/kernel_6_14_2/tiny-1llc"),
+        s.contains("verifier/sched_foo/kernel_6_14_2"),
         "missing cell name in: {s}",
     );
     // Root cause is named explicitly.
@@ -762,7 +762,7 @@ fn format_empty_kernel_list_error_names_cell_and_dispatcher() {
 fn format_unknown_kernel_label_error_lists_present_labels_and_both_fix_paths() {
     let present = vec!["kernel_6_14_2", "kernel_6_15_0"];
     let s = format_unknown_kernel_label_error(
-        "verifier/sched_foo/kernel_7_0_0/tiny-1llc",
+        "verifier/sched_foo/kernel_7_0_0",
         "kernel_7_0_0",
         "sched_foo",
         &present,
@@ -770,7 +770,7 @@ fn format_unknown_kernel_label_error_lists_present_labels_and_both_fix_paths() {
     // Cell name + missing label appear so operators see exactly
     // which lookup failed.
     assert!(
-        s.contains("verifier/sched_foo/kernel_7_0_0/tiny-1llc"),
+        s.contains("verifier/sched_foo/kernel_7_0_0"),
         "missing cell name: {s}",
     );
     // Debug-formatted missing label (`{kernel_label:?}` produces
@@ -800,7 +800,7 @@ fn format_unknown_kernel_label_error_empty_present_renders_empty_brackets() {
     // (string equality drifted) but the present slice the caller
     // assembles is empty — still surfaces the bracket pair so the
     // diagnostic format is uniform with the non-empty case.
-    let s = format_unknown_kernel_label_error("verifier/foo/kernel_x/tiny", "kernel_x", "foo", &[]);
+    let s = format_unknown_kernel_label_error("verifier/foo/kernel_x", "kernel_x", "foo", &[]);
     assert!(
         s.contains("Present labels: []"),
         "missing empty brackets: {s}"
@@ -812,12 +812,7 @@ fn format_unknown_kernel_label_error_joins_present_with_comma_space() {
     // Three-entry present slice must render comma-space separated
     // to match the `present.join(", ")` contract.
     let present = vec!["a", "b", "c"];
-    let s = format_unknown_kernel_label_error(
-        "verifier/foo/kernel_x/tiny",
-        "kernel_x",
-        "foo",
-        &present,
-    );
+    let s = format_unknown_kernel_label_error("verifier/foo/kernel_x", "kernel_x", "foo", &present);
     assert!(
         s.contains("Present labels: [a, b, c]"),
         "wrong join delimiter: {s}",
@@ -2532,13 +2527,13 @@ fn analyze_sidecars_single_fixture_renders_rows_only() {
 // run_verifier_cell — pure name-parse error branches
 // ---------------------------------------------------------------
 //
-// The two early guards (missing `verifier/` prefix, <3-part cell
+// The two early guards (missing `verifier/` prefix, <2-part cell
 // name) run BEFORE the cell banner, check_kvm(), and any scheduler
 // / kernel resolution (`run_verifier_cell`'s
 // `full_name.strip_prefix("verifier/")` None arm and its
-// `if parts.len() != 3` arm), so they are
+// `if parts.len() != 2` arm), so they are
 // host-reachable with no KVM, no scheduler binary, no kernel. A
-// syntactically-valid 3-part name would fall through to
+// syntactically-valid 2-part name would fall through to
 // check_kvm() and is intentionally NOT tested here.
 
 /// A name lacking the `verifier/` prefix exits 1 with the
@@ -2555,19 +2550,19 @@ fn run_verifier_cell_missing_prefix_exits_one() {
     );
 }
 
-/// A name with the prefix but fewer than 3 slash-separated
-/// segments after it (splitn(3) on `only_two` yields 1 part)
-/// exits 1 with the malformed-cell diagnostic naming the
-/// expected shape. Pins the parts.len() != 3 arm.
+/// A name with the prefix but no `/` after it (splitn(2) on
+/// `onlyone` yields 1 part) exits 1 with the malformed-cell
+/// diagnostic naming the expected shape. Pins the parts.len() != 2
+/// arm.
 #[test]
 fn run_verifier_cell_too_few_parts_exits_one() {
     use crate::test_support::test_helpers::capture_stderr;
-    let (code, captured) = capture_stderr(|| run_verifier_cell("verifier/only_two"));
+    let (code, captured) = capture_stderr(|| run_verifier_cell("verifier/onlyone"));
     assert_eq!(code, 1);
     let stderr = String::from_utf8(captured).expect("stderr is utf-8");
     assert!(
         stderr.contains("malformed cell name")
-            && stderr.contains("expected verifier/<sched>/<kernel>/<preset>"),
+            && stderr.contains("expected verifier/<sched>/<kernel>"),
         "malformed-cell diagnostic must name the expected shape; got: {stderr}",
     );
 }
@@ -2954,9 +2949,9 @@ fn run_verifier_cell_unknown_scheduler_exits_one() {
     }
     let (code, captured) = capture_stderr(|| {
         // Banner goes to stdout; swallow it so only the diagnostic
-        // is examined. The 3 parts are sched/kernel/preset.
+        // is examined. The 2 parts are sched/kernel.
         let (code, _stdout) =
-            capture_stdout(|| run_verifier_cell("verifier/__no_such_sched__/kernel_x/tiny-1llc"));
+            capture_stdout(|| run_verifier_cell("verifier/__no_such_sched__/kernel_x"));
         code
     });
     assert_eq!(code, 1, "unknown scheduler cell must exit 1");

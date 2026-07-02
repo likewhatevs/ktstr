@@ -414,24 +414,37 @@ pub(crate) enum KtstrCommand {
     },
     /// Collect BPF verifier statistics for declared schedulers.
     ///
-    /// Spawns `cargo nextest run -E 'test(/^verifier/)'` (waited on
-    /// via `Command::status()`, not `execvp`). Each test binary that
-    /// links ktstr-test-support and has at least one
+    /// Spawns `cargo nextest run -E 'test(/^verifier/) & !test(/^verifier::/)'`
+    /// (waited on via `Command::status()`, not `execvp`) — the filter
+    /// matches the `verifier/<sched>/<kernel>` cells but excludes the
+    /// verifier module's own `verifier::tests::*` unit tests. Each test
+    /// binary that links ktstr-test-support and has at least one
     /// `declare_scheduler!` declaration emits one nextest test per
-    /// (declared scheduler × declared kernel × accepted gauntlet
-    /// topology preset) cell. Each cell loads the scheduler's BPF
-    /// programs inside a VM with the declared topology and reports
-    /// per-program verified-instruction counts via host-side memory
-    /// introspection. Eevdf + KernelBuiltin scheduler variants are
-    /// skipped at cell-emission time (no userspace binary to verify).
+    /// (declared scheduler × declared kernel) cell — one cell, not one
+    /// per topology, because `verified_insns` is topology-independent.
+    /// Each cell boots a VM on the smallest topology the scheduler's
+    /// constraints accept, loads the scheduler's BPF programs (the real
+    /// kernel verifier runs), and reports per-program
+    /// verified-instruction counts via host-side memory introspection.
+    /// A cell PASSes only when the scheduler both verifies AND turns on:
+    /// the in-guest attach gate confirms `/sys/kernel/sched_ext/state`
+    /// reached `enabled`, so a scheduler that loads but never attaches
+    /// FAILs.
+    /// Each cell boots with performance mode disabled (`verified_insns`
+    /// is perf-mode-independent), so it takes only a shared (LOCK_SH) LLC
+    /// reservation and parallel cells no longer starve each other on the
+    /// LLC lock (a `performance_mode` peer's LOCK_EX can still defer a
+    /// cell, resolved by nextest retry). Eevdf + KernelBuiltin scheduler
+    /// variants are skipped at cell-emission time (no userspace binary to
+    /// verify). After nextest finishes, a scheduler × kernel PASS/FAIL
+    /// summary table is printed.
     ///
     /// The `declare_scheduler!` cells that carry a userspace scheduler
     /// live in integration test targets, so forward the build features to
     /// nextest — e.g. `cargo ktstr verifier --kernel ../linux --features
     /// integration,wprof` (no `--` needed). Without the feature
-    /// passthrough those cells never compile and the verifier-prefix
-    /// filter matches only the module's unit tests. The scheduler-under-
-    /// test builds release by default.
+    /// passthrough those cells never compile and the cell-only filter
+    /// matches nothing. The scheduler-under-test builds release by default.
     Verifier {
         /// Repeatable. See [`KERNEL_HELP_NO_RAW`] for accepted shapes
         /// (path / version / cache key / range / git source). Overrides
