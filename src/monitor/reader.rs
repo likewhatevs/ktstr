@@ -2054,6 +2054,20 @@ pub(crate) struct MonitorLoopResult {
     /// the in-`monitor_loop` returns leave it `false`. Forwarded to
     /// [`super::MonitorReport::scx_event_counters_supported`].
     pub(crate) scx_event_counters_supported: bool,
+    /// Load-time per-program `verified_insns`, captured MID-RUN (while
+    /// the scheduler is attached and its BPF progs are live in
+    /// `prog_idr`) rather than at post-teardown cleanup. The cleanup
+    /// walk races synchronous `idr_remove`: `bpf_prog_free_id` fires the
+    /// instant the scheduler process drops its last prog reference
+    /// (last fd close on guest teardown), BEFORE the RCU-deferred prog
+    /// free — so a post-exit walk finds an empty `prog_idr` and loses
+    /// `verified_insns`. `verified_insns` is fixed once at load
+    /// (`bpf_prog_aux->verified_insns`, written once in `bpf_check`), so
+    /// the first non-empty mid-run capture is authoritative for the run.
+    /// Empty when no struct_ops scheduler was observed (the loop never
+    /// saw a live prog) — [`crate::vmm::freeze_coord`] then falls back to
+    /// the post-teardown walk.
+    pub(crate) verified_insns: Vec<super::bpf_prog::ProgVerifierStats>,
 }
 
 /// System-wide PSI-irq host-walk inputs: the resolved `struct psi_group`
@@ -2676,6 +2690,11 @@ pub(crate) fn monitor_loop(
         .map(|r| r.num_cpus as usize)
         .unwrap_or(rq_pas.len());
     let mut samples: Vec<MonitorSample> = Vec::new();
+    // One-shot mid-run capture of load-time `verified_insns` while the
+    // scheduler's BPF progs are still live in `prog_idr`. See
+    // `MonitorLoopResult::verified_insns` for why this must not wait for
+    // post-teardown cleanup (synchronous `idr_remove` race).
+    let mut verified_insns_capture: Vec<super::bpf_prog::ProgVerifierStats> = Vec::new();
     // Reactive threshold trackers — reuse the post-hoc
     // `SustainedViolationTracker` so "sustained for N samples"
     // means the same thing to the reactive SysRq-D dump and to
@@ -2730,6 +2749,9 @@ pub(crate) fn monitor_loop(
                 preemption_threshold_ns,
                 boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
                 scx_event_counters_supported: false,
+                // Pre-loop setup failure: no sample was ever taken, so no
+                // live prog was observed. Cleanup falls back to its walk.
+                verified_insns: Vec::new(),
             };
         }
     };
@@ -2746,6 +2768,9 @@ pub(crate) fn monitor_loop(
             preemption_threshold_ns,
             boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
             scx_event_counters_supported: false,
+            // Pre-loop setup failure: no sample was ever taken, so no
+            // live prog was observed. Cleanup falls back to its walk.
+            verified_insns: Vec::new(),
         };
     }
     let epoll = match Epoll::new() {
@@ -2762,6 +2787,9 @@ pub(crate) fn monitor_loop(
                 preemption_threshold_ns,
                 boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
                 scx_event_counters_supported: false,
+                // Pre-loop setup failure: no sample was ever taken, so no
+                // live prog was observed. Cleanup falls back to its walk.
+                verified_insns: Vec::new(),
             };
         }
     };
@@ -2783,6 +2811,9 @@ pub(crate) fn monitor_loop(
             preemption_threshold_ns,
             boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
             scx_event_counters_supported: false,
+            // Pre-loop setup failure: no sample was ever taken, so no
+            // live prog was observed. Cleanup falls back to its walk.
+            verified_insns: Vec::new(),
         };
     }
     if let Err(e) = epoll.ctl(
@@ -2801,6 +2832,9 @@ pub(crate) fn monitor_loop(
             preemption_threshold_ns,
             boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
             scx_event_counters_supported: false,
+            // Pre-loop setup failure: no sample was ever taken, so no
+            // live prog was observed. Cleanup falls back to its walk.
+            verified_insns: Vec::new(),
         };
     }
     let mut epoll_buf = [EpollEvent::default(); 2];
@@ -3228,6 +3262,32 @@ pub(crate) fn monitor_loop(
             None
         };
 
+        // One-shot mid-run `verified_insns` capture (see
+        // `MonitorLoopResult::verified_insns`). Runs only until the first
+        // non-empty result: `verified_insns` is fixed once at load, so
+        // one live capture suffices, and skipping once captured avoids a
+        // redundant `prog_idr` walk every tick. Gated on `data_valid`
+        // like the runtime walk (pre-validity reads return phantom zeros).
+        if data_valid && verified_insns_capture.is_empty() {
+            if let Some(ctx) = prog_stats_ctx {
+                let live_walk = WalkContext {
+                    cr3_pa: select_cr3(
+                        ctx.cr3.load(std::sync::atomic::Ordering::Acquire),
+                        ctx.walk.cr3_pa,
+                    ),
+                    ..ctx.walk
+                };
+                verified_insns_capture = super::bpf_prog::find_struct_ops_progs(
+                    mem,
+                    live_walk,
+                    ctx.prog_idr_kva,
+                    &ctx.offsets,
+                    ctx.start_kernel_map,
+                    ctx.phys_base,
+                );
+            }
+        }
+
         // System-wide PSI-irq host-walk. `psi.psi_system_pa` is the
         // pre-translated (`text_kva_to_pa_with_base`, once at setup) PA of the
         // `psi_group psi_system` `.data` global — no per-iteration translation
@@ -3312,6 +3372,7 @@ pub(crate) fn monitor_loop(
         preemption_threshold_ns,
         boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
         scx_event_counters_supported: false,
+        verified_insns: verified_insns_capture,
     }
 }
 
@@ -3727,6 +3788,136 @@ mod tests {
         assert_eq!(samples[0].cpus[0].scx_nr_running, 1);
         assert_eq!(samples[0].cpus[0].local_dsq_depth, 3);
         assert_eq!(samples[0].cpus[0].rq_clock, 500);
+    }
+
+    /// Mid-run capture of load-time `verified_insns`: with a
+    /// `ProgStatsCtx` over a synthetic `prog_idr` holding one STRUCT_OPS
+    /// program, `monitor_loop` must populate
+    /// `MonitorLoopResult.verified_insns` WHILE running (not at
+    /// post-teardown cleanup, which races `idr_remove`). CI-runnable (no
+    /// VM/kernel) companion to the host-gated demo_verifier e2e — pins
+    /// the capture guard (`data_valid && is_empty`), the one-shot latch,
+    /// and the field threading that the e2e masks when it skips without a
+    /// kernel.
+    #[test]
+    fn monitor_loop_captures_verified_insns_mid_run() {
+        use super::super::symbols::START_KERNEL_MAP;
+        use crate::monitor::btf_offsets::BpfProgOffsets;
+
+        // Direct-map baseline: prog/aux KVAs are `PAGE_OFFSET + PA`
+        // (matches the passing find_struct_ops_progs fixture).
+        const PAGE_OFFSET: u64 = 0xFFFF_8880_0000_0000;
+        // find_struct_ops_progs reads prog_type, prog_aux ->
+        // aux_verified_insns + aux_name; it never touches prog_stats, so
+        // that field stays 0 and the sibling runtime walk skips this prog.
+        let offsets = BpfProgOffsets {
+            prog_type: 0,
+            prog_aux: 8,
+            aux_verified_insns: 0,
+            aux_name: 8,
+            aux_used_maps: 24,
+            aux_used_map_cnt: 32,
+            xa_node_slots: 16,
+            xa_node_shift: 0,
+            idr_xa_head: 0,
+            idr_next: 8,
+            prog_stats: 16,
+            stats_cnt: 0,
+            stats_nsecs: 8,
+            stats_misses: 16,
+        };
+        // idr @ 0x100 so the rq read at PA 0 sees clean zeros; prog @
+        // 0x1000; aux @ 0x2000.
+        let idr_pa: u64 = 0x100;
+        let prog_pa: u64 = 0x1000;
+        let aux_pa: u64 = 0x2000;
+        let mut buf = vec![0u8; 0x3000];
+        let pa_to_kva = |pa: u64| PAGE_OFFSET.wrapping_add(pa);
+        let w64 = |b: &mut Vec<u8>, pa: u64, v: u64| {
+            let o = pa as usize;
+            b[o..o + 8].copy_from_slice(&v.to_ne_bytes());
+        };
+        let w32 = |b: &mut Vec<u8>, pa: u64, v: u32| {
+            let o = pa as usize;
+            b[o..o + 4].copy_from_slice(&v.to_ne_bytes());
+        };
+        // Single-entry xarray: xa_head IS the prog KVA (leaf), idr_next=1.
+        let prog_kva = pa_to_kva(prog_pa);
+        assert_eq!(prog_kva & 3, 0, "prog_kva must be a leaf entry");
+        w64(&mut buf, idr_pa + offsets.idr_xa_head as u64, prog_kva);
+        w32(&mut buf, idr_pa + offsets.idr_next as u64, 1);
+        // bpf_prog: STRUCT_OPS (kernel BPF_PROG_TYPE_STRUCT_OPS = 27) +
+        // aux pointer; prog_stats left 0.
+        w32(&mut buf, prog_pa + offsets.prog_type as u64, 27);
+        w64(&mut buf, prog_pa + offsets.prog_aux as u64, pa_to_kva(aux_pa));
+        // bpf_prog_aux: verified_insns + NUL-terminated name.
+        w32(&mut buf, aux_pa + offsets.aux_verified_insns as u64, 4242);
+        let name = b"sched_prog";
+        let np = (aux_pa + offsets.aux_name as u64) as usize;
+        buf[np..np + name.len()].copy_from_slice(name);
+
+        // SAFETY: buf is a live local Vec<u8> outliving the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+        let ctx = ProgStatsCtx {
+            per_cpu_offsets: vec![0],
+            walk: WalkContext {
+                cr3_pa: 0,
+                page_offset: PAGE_OFFSET,
+                l5: false,
+                tcr_el1: 0,
+            },
+            prog_idr_kva: idr_pa + START_KERNEL_MAP,
+            offsets,
+            start_kernel_map: START_KERNEL_MAP,
+            phys_base: 0,
+            cr3: std::sync::Arc::new(AtomicU64::new(0)),
+        };
+        // rq_refresh: None => data_valid latches true from tick 1, so the
+        // capture block fires immediately.
+        let cfg = MonitorConfig {
+            event_pcpu_pas: None,
+            dump_trigger: None,
+            watchdog_override: None,
+            vcpu_timing: None,
+            perf_capture: None,
+            preemption_threshold_ns: 0,
+            prog_stats_ctx: Some(&ctx),
+            page_offset: PAGE_OFFSET,
+            start_kernel_map: START_KERNEL_MAP,
+            phys_base: 0,
+            rq_refresh: None,
+            psi: None,
+            watchdog_reset: None,
+            watch_bpf_maps: None,
+        };
+        let kernel_offsets = test_offsets();
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                kill.store(true, Ordering::Release);
+            })
+        };
+        let result = monitor_loop(
+            &mem,
+            &[0],
+            &kernel_offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+
+        assert!(
+            !result.verified_insns.is_empty(),
+            "mid-run capture must populate verified_insns while attached",
+        );
+        assert_eq!(result.verified_insns[0].name, "sched_prog");
+        assert_eq!(result.verified_insns[0].verified_insns, 4242);
     }
 
     #[test]

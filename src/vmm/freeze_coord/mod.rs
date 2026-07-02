@@ -11447,6 +11447,8 @@ impl KtstrVm {
                             preemption_threshold_ns,
                             boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
                             scx_event_counters_supported,
+                            // Monitor torn down before sampling: no live prog seen.
+                            verified_insns: Vec::new(),
                         };
                     }
                     let kill_fd = kill_evt_clone.as_raw_fd();
@@ -11504,6 +11506,8 @@ impl KtstrVm {
                             preemption_threshold_ns,
                             boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
                             scx_event_counters_supported,
+                            // Monitor torn down before sampling: no live prog seen.
+                            verified_insns: Vec::new(),
                         };
                     }
                 }
@@ -11647,6 +11651,8 @@ impl KtstrVm {
                         preemption_threshold_ns,
                         boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
                         scx_event_counters_supported,
+                        // Monitor torn down before sampling: no live prog seen.
+                        verified_insns: Vec::new(),
                     };
                 }
 
@@ -11748,6 +11754,8 @@ impl KtstrVm {
                         preemption_threshold_ns,
                         boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
                         scx_event_counters_supported,
+                        // Monitor torn down before sampling: no live prog seen.
+                        verified_insns: Vec::new(),
                     };
                 }
 
@@ -11895,6 +11903,8 @@ impl KtstrVm {
                         preemption_threshold_ns,
                         boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
                         scx_event_counters_supported,
+                        // Monitor torn down before sampling: no live prog seen.
+                        verified_insns: Vec::new(),
                     };
                 }
                 // aarch64 TCR_EL1 (granule + T1SZ) for the
@@ -11975,6 +11985,8 @@ impl KtstrVm {
                         preemption_threshold_ns,
                         boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
                         scx_event_counters_supported,
+                        // Monitor torn down before sampling: no live prog seen.
+                        verified_insns: Vec::new(),
                     };
                 }
 
@@ -13038,7 +13050,7 @@ impl KtstrVm {
             slot.hit.store(false, Ordering::Release);
         }
 
-        let (monitor_report, mid_flight_drain) =
+        let (monitor_report, mid_flight_drain, mid_run_verified_insns) =
             match run.monitor_handle.and_then(|h| h.join().ok()) {
                 Some(monitor::reader::MonitorLoopResult {
                     samples,
@@ -13048,6 +13060,7 @@ impl KtstrVm {
                     preemption_threshold_ns,
                     boot_wait_outcome,
                     scx_event_counters_supported,
+                    verified_insns,
                 }) => {
                     // `preemption_threshold_ns` was resolved once
                     // inside `start_monitor` (and threaded through
@@ -13072,9 +13085,9 @@ impl KtstrVm {
                         boot_wait_outcome,
                         scx_event_counters_supported,
                     };
-                    (Some(report), drain)
+                    (Some(report), drain, verified_insns)
                 }
-                None => (None, BulkDrainResult::default()),
+                None => (None, BulkDrainResult::default(), Vec::new()),
             };
         eprintln!("CLEANUP: monitor joined");
         let cleanup_t = std::time::Instant::now();
@@ -13247,26 +13260,45 @@ impl KtstrVm {
         let has_bpf_scheduler = self.has_bpf_scheduler_attached();
         let vs_t = std::time::Instant::now();
         let mut vs_path: &'static str = "skipped_no_scheduler";
-        let verifier_stats = if has_bpf_scheduler {
-            if let Some(ref prog) = run.prog_accessor {
-                use crate::monitor::bpf_prog::BpfProgAccessor;
-                vs_path = "prebuilt_accessor";
-                eprintln!("CLEANUP: verifier_stats using pre-built accessor");
-                let a = prog.as_accessor();
-                a.struct_ops_progs()
-            } else {
-                vs_path = "fallback_full_parse";
-                eprintln!("CLEANUP: verifier_stats fallback (full parse)");
-                self.collect_verifier_stats(
-                    &run.vm,
-                    run.tcr_el1.as_ref(),
-                    &run.cr3,
-                    run.vmlinux_data.as_ref().map(|d| d.as_slice()),
-                    run.kern_phys_base,
-                )
+        // Prefer the mid-run capture taken while the scheduler was
+        // attached (see `monitor::reader::MonitorLoopResult::
+        // verified_insns`). The post-teardown walk runs AFTER the guest
+        // killed the scheduler process, which drops the last prog
+        // reference and fires synchronous `bpf_prog_free_id`/`idr_remove`
+        // (kernel/bpf/syscall.c) — so the walk finds an empty `prog_idr`
+        // and loses `verified_insns`. The mid-run value is captured
+        // before that teardown and is fixed once at load, so it is
+        // authoritative. The source decision is factored into
+        // `choose_verifier_stats_source` (unit-tested); the walk stays
+        // inline here because it needs `self`/`run`.
+        let verifier_stats = match choose_verifier_stats_source(
+            mid_run_verified_insns.is_empty(),
+            has_bpf_scheduler,
+        ) {
+            VerifierStatsSource::MidRun => {
+                vs_path = "mid_run_capture";
+                mid_run_verified_insns
             }
-        } else {
-            Vec::new()
+            VerifierStatsSource::PostTeardownWalk => {
+                if let Some(ref prog) = run.prog_accessor {
+                    use crate::monitor::bpf_prog::BpfProgAccessor;
+                    vs_path = "prebuilt_accessor";
+                    eprintln!("CLEANUP: verifier_stats using pre-built accessor");
+                    let a = prog.as_accessor();
+                    a.struct_ops_progs()
+                } else {
+                    vs_path = "fallback_full_parse";
+                    eprintln!("CLEANUP: verifier_stats fallback (full parse)");
+                    self.collect_verifier_stats(
+                        &run.vm,
+                        run.tcr_el1.as_ref(),
+                        &run.cr3,
+                        run.vmlinux_data.as_ref().map(|d| d.as_slice()),
+                        run.kern_phys_base,
+                    )
+                }
+            }
+            VerifierStatsSource::None => Vec::new(),
         };
         tracing::info!(
             elapsed_ms = vs_t.elapsed().as_millis() as u64,
@@ -14551,5 +14583,77 @@ mod compute_watchpoint_only_trigger_tests {
                 );
             }
         }
+    }
+}
+
+/// Which source `collect_results` uses for `VmResult.verifier_stats`.
+/// See [`choose_verifier_stats_source`].
+#[derive(Debug, PartialEq, Eq)]
+enum VerifierStatsSource {
+    /// The mid-run capture, taken while the scheduler was attached and
+    /// its BPF progs were live in `prog_idr`.
+    MidRun,
+    /// The post-teardown host walk. Used only when no mid-run capture
+    /// exists (e.g. a boot so short the monitor never latched
+    /// `data_valid`) but a BPF scheduler was attached. Races synchronous
+    /// `idr_remove` at scheduler-process exit, hence the fallback role.
+    PostTeardownWalk,
+    /// No BPF scheduler was attached — empty `verifier_stats`.
+    None,
+}
+
+/// Decide where `collect_results` sources `verifier_stats`. Prefer the
+/// mid-run capture over the post-teardown walk: the walk runs after the
+/// guest killed the scheduler process, which drops the last `bpf_prog`
+/// reference and fires synchronous `bpf_prog_free_id` / `idr_remove`
+/// (kernel/bpf/syscall.c) BEFORE the RCU-deferred prog free — so it
+/// finds an empty `prog_idr` and loses `verified_insns`.
+/// A non-empty mid-run capture (read while attached; `verified_insns` is
+/// fixed once at load) is therefore authoritative. Fall back to the
+/// walk only when there is no mid-run capture, and to empty when no BPF
+/// scheduler attached at all.
+fn choose_verifier_stats_source(
+    mid_run_empty: bool,
+    has_bpf_scheduler: bool,
+) -> VerifierStatsSource {
+    if !mid_run_empty {
+        VerifierStatsSource::MidRun
+    } else if has_bpf_scheduler {
+        VerifierStatsSource::PostTeardownWalk
+    } else {
+        VerifierStatsSource::None
+    }
+}
+
+#[cfg(test)]
+mod verifier_stats_source_tests {
+    use super::{choose_verifier_stats_source, VerifierStatsSource};
+
+    /// The core decision: a non-empty mid-run capture is
+    /// preferred over the post-teardown walk (which races `idr_remove`),
+    /// even when a scheduler is attached; an empty capture falls back to
+    /// the walk when a scheduler attached, else to empty. CI-runnable
+    /// (no VM/kernel) — pairs the host-gated demo_verifier e2e.
+    #[test]
+    fn prefers_mid_run_capture_then_falls_back() {
+        // Non-empty mid-run capture wins regardless of has_bpf_scheduler.
+        assert_eq!(
+            choose_verifier_stats_source(false, true),
+            VerifierStatsSource::MidRun,
+        );
+        assert_eq!(
+            choose_verifier_stats_source(false, false),
+            VerifierStatsSource::MidRun,
+        );
+        // Empty capture + scheduler attached -> post-teardown walk.
+        assert_eq!(
+            choose_verifier_stats_source(true, true),
+            VerifierStatsSource::PostTeardownWalk,
+        );
+        // Empty capture + no scheduler -> empty stats.
+        assert_eq!(
+            choose_verifier_stats_source(true, false),
+            VerifierStatsSource::None,
+        );
     }
 }

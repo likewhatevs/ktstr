@@ -120,8 +120,8 @@ where
 pub struct ProgVerifierStats {
     /// Program name as registered with the kernel.
     pub name: String,
-    /// Instructions accepted by the verifier (from
-    /// `bpf_prog_aux->verified_insns`).
+    /// Instructions processed by the verifier (path-exploration count,
+    /// not static program size), from `bpf_prog_aux->verified_insns`.
     pub verified_insns: u32,
 }
 
