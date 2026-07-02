@@ -2054,6 +2054,7 @@ fn noise_findings_classifies_both_polarities() {
         &noise_side("regress", 15.0, 1000),
         LEGACY_PAIRING_DIMS,
         1.0,
+        false,
     );
     assert_eq!(rep.paired_scenarios, 1);
     assert_eq!(
@@ -2074,6 +2075,7 @@ fn noise_findings_classifies_both_polarities() {
         &noise_side("improve", 10.0, 2000),
         LEGACY_PAIRING_DIMS,
         1.0,
+        false,
     );
     assert_eq!(rep.regressions(), 0);
     assert_eq!(
@@ -2101,6 +2103,7 @@ fn noise_findings_too_noisy_takes_precedence_over_regression() {
         &noise_side("noisy", 30.0, 2000),
         LEGACY_PAIRING_DIMS,
         1.0,
+        false,
     );
     let ws = rep
         .findings
@@ -2137,6 +2140,7 @@ fn noise_findings_skips_all_zero_and_omits_unchanged() {
         &noise_side("zero", 0.0, 0),
         LEGACY_PAIRING_DIMS,
         1.0,
+        false,
     );
     assert!(
         rep.findings.is_empty(),
@@ -2150,12 +2154,126 @@ fn noise_findings_skips_all_zero_and_omits_unchanged() {
         &noise_side("same", 12.0, 1500),
         LEGACY_PAIRING_DIMS,
         1.0,
+        false,
     );
     assert!(
         rep.findings.is_empty(),
         "unchanged-clean scenario yields no findings"
     );
     assert_eq!((rep.regressions(), rep.noisy()), (0, 0));
+}
+
+#[test]
+fn noise_findings_include_stable_shows_unchanged_metrics() {
+    // include_stable=true (the render path): an unchanged-and-clean metric
+    // the gate path omits is instead reported as Stable, so the full
+    // comparison table shows every metric. Stable never gates.
+    let rep = noise_findings(
+        &noise_side("same", 12.0, 1500),
+        &noise_side("same", 12.0, 1500),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+        true,
+    );
+    assert!(
+        !rep.findings.is_empty(),
+        "include_stable surfaces the unchanged metrics"
+    );
+    assert!(
+        rep.findings.iter().all(|f| f.kind == NoiseKind::Stable),
+        "unchanged-clean metrics are Stable: {:?}",
+        rep.findings
+            .iter()
+            .map(|f| (f.metric.name, f.kind))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!((rep.regressions(), rep.noisy()), (0, 0));
+
+    // Both-zero metrics stay OMITTED even under include_stable=true (the
+    // both-zero skip precedes the include_stable branch), so no zero-valued
+    // metric leaks into the table as a spurious Stable row.
+    let rep_zero = noise_findings(
+        &noise_side("zero", 0.0, 0),
+        &noise_side("zero", 0.0, 0),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+        true,
+    );
+    assert!(
+        rep_zero.findings.is_empty(),
+        "both-zero metrics are omitted (never Stable) even with include_stable: {:?}",
+        rep_zero
+            .findings
+            .iter()
+            .map(|f| f.metric.name)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(rep_zero.paired_scenarios, 1);
+}
+
+#[test]
+fn format_noise_findings_table_renders_rows_and_verdicts() {
+    // worst_spread rises 10->15 (LowerBetter -> REGRESSION); total_iterations
+    // is unchanged (2000 both) -> Stable. The table carries the header, the
+    // regressed row + verdict, and the Stable row (full comparison visible).
+    let rep = noise_findings(
+        &noise_side("mix", 10.0, 2000),
+        &noise_side("mix", 15.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+        true,
+    );
+    let out = format_noise_findings_table(&rep.findings, "base", "head");
+    assert!(
+        out.contains("SCENARIO / METRIC") && out.contains("VERDICT"),
+        "header present: {out}"
+    );
+    assert!(
+        out.contains("mix / worst_spread") && out.contains("REGRESSION"),
+        "worsened metric row + verdict: {out}"
+    );
+    assert!(
+        out.contains("stable"),
+        "unchanged total_iterations renders as a stable row: {out}"
+    );
+}
+
+#[test]
+fn format_noise_findings_table_renders_noisy_and_improvement_verdicts() {
+    // Pin the remaining verdict-arm strings (a text/color swap in one arm
+    // would otherwise slip past the REGRESSION/stable-only table test).
+    // Noisy: wide A spread on worst_spread -> NOISY row.
+    let a = vec![
+        cmp_row("nz", "tiny-1llc", true, 10.0, 2000),
+        cmp_row("nz", "tiny-1llc", true, 20.0, 2000),
+        cmp_row("nz", "tiny-1llc", true, 15.0, 2000),
+    ];
+    let rep = noise_findings(
+        &a,
+        &noise_side("nz", 30.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+        true,
+    );
+    let out = format_noise_findings_table(&rep.findings, "base", "head");
+    assert!(
+        out.contains("NOISY (spread over gate)"),
+        "noisy verdict rendered: {out}"
+    );
+
+    // Improvement: worst_spread drops 15->10 (LowerBetter, clean) -> improvement.
+    let rep = noise_findings(
+        &noise_side("imp", 15.0, 2000),
+        &noise_side("imp", 10.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+        true,
+    );
+    let out = format_noise_findings_table(&rep.findings, "base", "head");
+    assert!(
+        out.contains("improvement"),
+        "improvement verdict rendered: {out}"
+    );
 }
 
 /// A `Polarity::Informational` metric (the monitor `total_ttwu_count`) that

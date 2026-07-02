@@ -1906,6 +1906,12 @@ pub(crate) enum NoiseKind {
     /// Significant change in a directionless (`Polarity::Informational`) metric —
     /// shown but NEVER fails the gate (no good/bad direction to regress).
     Informational,
+    /// Unchanged and clean: B's mean is within A's `[min, max]` band and
+    /// neither side is too noisy. Shown in the full metrics table so the
+    /// operator sees every metric's A/B stats, but never gates. Emitted
+    /// only when the caller passes `include_stable = true` (the render
+    /// path); the gate-only path omits it.
+    Stable,
 }
 
 /// One metric's noise-adjusted finding for a paired scenario.
@@ -1945,14 +1951,18 @@ impl NoiseReport {
 /// mirroring how [`compare_rows_by`] underlies [`compare_partitions`]. Groups
 /// each side's per-run rows by pairing key, then per metric summarizes the spread
 /// and classifies via [`noise_verdict`]. Returns one [`NoiseFinding`] per
-/// changed-or-noisy (scenario, metric); unchanged-and-clean metrics, metrics with
-/// no signal on either side (both means under [`ZERO_MEAN_EPS`]), and
-/// render-suppressed rate components are omitted.
+/// (scenario, metric) that is changed, noisy, or — when `include_stable` is
+/// true — unchanged-and-clean ([`NoiseKind::Stable`], shown in the full metrics
+/// table but never gating). With `include_stable = false` only changed/noisy
+/// metrics are returned (the gate-only path). Metrics with no signal on either
+/// side (both means under [`ZERO_MEAN_EPS`]) and render-suppressed rate
+/// components are omitted regardless of `include_stable`.
 pub(crate) fn noise_findings(
     rows_a: &[GauntletRow],
     rows_b: &[GauntletRow],
     pairing_dims: &[Dimension],
     spread_threshold_pct: f64,
+    include_stable: bool,
 ) -> NoiseReport {
     use std::collections::BTreeMap;
     let group = |rows: &[GauntletRow]| {
@@ -2013,8 +2023,12 @@ pub(crate) fn noise_findings(
                         }
                     }
                 }
+            } else if include_stable {
+                // Unchanged + clean: shown in the full metrics table (never
+                // gates) when the render path asks for every metric.
+                NoiseKind::Stable
             } else {
-                continue; // unchanged + clean: omit
+                continue; // unchanged + clean: omit (gate-only path)
             };
             findings.push(NoiseFinding {
                 scenario: scenario.clone(),
@@ -2040,8 +2054,12 @@ pub(crate) fn noise_findings(
 /// band in the worsening direction (per polarity) AND neither side is too noisy; a
 /// metric whose relative spread exceeds `spread_threshold_pct` is flagged `NOISY`
 /// and does NOT by itself fail the gate — the point of the mode is to not fail on
-/// noise. Only changed/noisy rows are printed; the footer carries the counts and,
-/// when every changed metric was too noisy, an explicit inconclusive note.
+/// noise. Prints a table of EVERY compared metric — changed, noisy,
+/// informational, and stable (unchanged + clean) — with each side's
+/// `mean [min-max] spread%` and the verdict, so the operator sees the whole
+/// comparison, not just what moved. The footer carries the regression/noisy
+/// counts and, when every changed (non-stable) metric was too noisy, an
+/// explicit inconclusive note.
 pub fn compare_partitions_noise(
     filter_a: &RowFilter,
     filter_b: &RowFilter,
@@ -2058,32 +2076,34 @@ pub fn compare_partitions_noise(
         &prepared.rows_b_for_compare,
         &prepared.pairing_dims,
         spread_threshold_pct,
+        // Include Stable (unchanged + clean) metrics so the rendered table
+        // shows the full comparison, not just changed/noisy rows.
+        true,
     );
 
     println!(
         "perf-delta --noise-adjust: {label_b} vs {label_a} (per-side spread gate {spread_threshold_pct:.2}%)"
     );
-    for f in &report.findings {
-        let label = match f.kind {
-            NoiseKind::Regression => "REGRESSION",
-            NoiseKind::Improvement => "improvement",
-            NoiseKind::Noisy => "NOISY (spread over gate)",
-            NoiseKind::Informational => "informational",
-        };
-        let v = &f.verdict;
-        println!(
-            "  {scenario} / {name}: {label_a} {amean:.1} [{amin:.1}-{amax:.1}] {asp:.2}%  vs  \
-             {label_b} {bmean:.1} [{bmin:.1}-{bmax:.1}] {bsp:.2}%  -> {label}",
-            scenario = f.scenario,
-            name = f.metric.name,
-            amean = v.a.mean,
-            amin = v.a.min,
-            amax = v.a.max,
-            asp = v.a.spread_pct,
-            bmean = v.b.mean,
-            bmin = v.b.min,
-            bmax = v.b.max,
-            bsp = v.b.spread_pct,
+    if report.findings.is_empty() {
+        // Distinguish "nothing paired" from "paired but every metric omitted"
+        // so the message never contradicts the paired-scenario footer below.
+        // A metric is omitted when both sides' means are ~zero, it read on
+        // only one side, or it is a render-suppressed rate component.
+        if report.paired_scenarios == 0 {
+            println!(
+                "perf-delta --noise-adjust: no paired scenario across the two runs — \
+                 nothing to compare"
+            );
+        } else {
+            println!(
+                "perf-delta --noise-adjust: no metric to display — every compared metric \
+                 was unchanged at zero, present on only one side, or render-suppressed"
+            );
+        }
+    } else {
+        print!(
+            "{}",
+            format_noise_findings_table(&report.findings, &label_a, &label_b)
         );
     }
     let regressions = report.regressions();
@@ -2093,17 +2113,67 @@ pub fn compare_partitions_noise(
          {noisy} too-noisy metric(s)",
         report.paired_scenarios,
     );
-    // Inconclusive: every CHANGED metric was too noisy to gate on — no confident
-    // signal either way. Surfaced prominently so a CI log shows it, but per the
-    // user spec ("flag if spread too great") noise FLAGS, not FAILS, so the exit
-    // stays 0 unless a confident regression fired.
-    if !report.findings.is_empty() && report.findings.iter().all(|f| f.kind == NoiseKind::Noisy) {
+    // Inconclusive: every CHANGED metric (excluding Stable rows, which never
+    // gate) was too noisy to gate on — no confident signal either way. Surfaced
+    // prominently for CI logs, but per the user spec noise FLAGS, not FAILS, so
+    // the exit stays 0 unless a confident regression fired.
+    let changed: Vec<&NoiseFinding> = report
+        .findings
+        .iter()
+        .filter(|f| f.kind != NoiseKind::Stable)
+        .collect();
+    if !changed.is_empty() && changed.iter().all(|f| f.kind == NoiseKind::Noisy) {
         println!(
             "perf-delta --noise-adjust: NOTE -- every changed metric was too noisy to gate on; \
              raise --noise-adjust N or --noise-spread-threshold for a trustworthy verdict"
         );
     }
     Ok(if regressions > 0 { 1 } else { 0 })
+}
+
+/// Render the per-metric noise-adjusted findings as a table for
+/// `perf-delta --noise-adjust`: one row per (scenario, metric) with each
+/// side's `mean [min-max] spread%` and the colored verdict. Includes
+/// [`NoiseKind::Stable`] rows so the operator sees every compared metric,
+/// not only the changed ones. Pure (returns the rendered string with a
+/// trailing newline) so the row/verdict mapping is unit-testable without
+/// capturing stdout.
+pub(crate) fn format_noise_findings_table(
+    findings: &[NoiseFinding],
+    label_a: &str,
+    label_b: &str,
+) -> String {
+    use comfy_table::{Cell, Color};
+    let mut table = crate::cli::new_table();
+    table.set_header(vec![
+        "SCENARIO / METRIC".to_string(),
+        format!("{label_a} (A: mean [min-max] spread%)"),
+        format!("{label_b} (B: mean [min-max] spread%)"),
+        "VERDICT".to_string(),
+    ]);
+    for f in findings {
+        let (verdict_text, color) = match f.kind {
+            NoiseKind::Regression => ("REGRESSION", Color::Red),
+            NoiseKind::Improvement => ("improvement", Color::Green),
+            NoiseKind::Noisy => ("NOISY (spread over gate)", Color::Yellow),
+            NoiseKind::Informational => ("informational", Color::Blue),
+            NoiseKind::Stable => ("stable", Color::Grey),
+        };
+        let v = &f.verdict;
+        table.add_row(vec![
+            Cell::new(format!("{} / {}", f.scenario, f.metric.name)),
+            Cell::new(format!(
+                "{:.1} [{:.1}-{:.1}] {:.2}%",
+                v.a.mean, v.a.min, v.a.max, v.a.spread_pct
+            )),
+            Cell::new(format!(
+                "{:.1} [{:.1}-{:.1}] {:.2}%",
+                v.b.mean, v.b.min, v.b.max, v.b.spread_pct
+            )),
+            Cell::new(verdict_text).fg(color),
+        ]);
+    }
+    format!("{table}\n")
 }
 
 /// Render the scalar findings table for `stats compare --runs`.
