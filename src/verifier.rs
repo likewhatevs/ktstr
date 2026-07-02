@@ -1205,83 +1205,88 @@ pub fn build_nextest_args(nextest_profile: Option<&str>, forward: &[String]) -> 
     args
 }
 
-/// Column labeling for [`render_result_table`]'s PASS/FAIL grid: with a
-/// single kernel, label a column by its scheduler alone; with multiple
-/// kernels, disambiguate as `scheduler @ kernel`. Only that renderer
-/// uses this; [`render_instruction_count_tables`] labels its columns by
-/// BPF-program name and its rows by kernel version, so it does not share
-/// this rule.
-fn verifier_col_label(
-    cols: &std::collections::BTreeSet<(String, String)>,
-) -> impl Fn(&str, &str) -> String {
-    use std::collections::BTreeSet;
-    let single_kernel = cols.iter().map(|(_, k)| k).collect::<BTreeSet<_>>().len() == 1;
-    move |sched: &str, kernel: &str| {
-        if single_kernel {
-            sched.to_string()
-        } else {
-            format!("{sched} @ {kernel}")
-        }
-    }
-}
-
-/// Render the per-cell records into a summary table: one row per topology
-/// preset, one column per distinct (scheduler, kernel) pair, each cell
-/// ✅ / ❌ (or `-` when that scheduler/kernel did not run that
-/// topology — e.g. its constraints rejected the preset). With a single
-/// kernel the columns are labeled by scheduler only; with multiple
-/// kernels each column is `scheduler @ kernel` so the kernel axis stays
-/// visible. Returns `None` for an empty record set (the caller prints
-/// nothing).
+/// Render the per-cell records into a summary grid: one row per topology
+/// preset, one column per scheduler, aggregating across kernels. Each
+/// cell is:
+/// - ✅ every kernel that ran this (topology, scheduler) passed,
+/// - ❌ every kernel that ran it failed,
+/// - 🇽 mixed — at least one kernel passed AND at least one failed,
+/// - `-` no kernel ran this (topology, scheduler) (e.g. the scheduler's
+///   constraints rejected the preset).
 ///
-/// Rows and columns are BTreeSet-sorted so the same run renders the same
-/// table (shell-pipeline stable). The header line carries a ✅/❌
-/// tally.
+/// After the grid, the specific failing `(scheduler, kernel, topology)`
+/// combinations are listed so a ❌ or 🇽 cell can be drilled to the exact
+/// kernel(s) that failed. Returns `None` for an empty record set (the
+/// caller prints nothing).
+///
+/// Rows, columns, and the failing list are BTreeSet-sorted so the same
+/// run renders the same output (shell-pipeline stable). The header line
+/// carries a ✅/❌/🇽 tally counting grid cells.
 pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
     if records.is_empty() {
         return None;
     }
     use std::collections::{BTreeMap, BTreeSet};
-    let mut cols: BTreeSet<(String, String)> = BTreeSet::new(); // (scheduler, kernel)
+    let mut schedulers: BTreeSet<String> = BTreeSet::new(); // columns
     let mut rows: BTreeSet<String> = BTreeSet::new(); // topology presets
-    let mut cell: BTreeMap<(String, String, String), bool> = BTreeMap::new(); // (topology, scheduler, kernel) -> passed
-    let (mut n_pass, mut n_fail) = (0usize, 0usize);
+    // (topology, scheduler) -> (passes, fails) aggregated across kernels.
+    let mut agg: BTreeMap<(String, String), (u32, u32)> = BTreeMap::new();
+    // Distinct failing (scheduler, kernel, topology) combinations.
+    let mut failing: BTreeSet<(String, String, String)> = BTreeSet::new();
     for r in records {
-        cols.insert((r.scheduler.clone(), r.kernel.clone()));
+        schedulers.insert(r.scheduler.clone());
         rows.insert(r.topology.clone());
-        cell.insert(
-            (r.topology.clone(), r.scheduler.clone(), r.kernel.clone()),
-            r.passed,
-        );
+        let counts = agg
+            .entry((r.topology.clone(), r.scheduler.clone()))
+            .or_insert((0, 0));
         if r.passed {
-            n_pass += 1;
+            counts.0 += 1;
         } else {
-            n_fail += 1;
+            counts.1 += 1;
+            failing.insert((r.scheduler.clone(), r.kernel.clone(), r.topology.clone()));
         }
     }
-    let col_label = verifier_col_label(&cols);
 
+    let (mut n_pass, mut n_fail, mut n_mixed) = (0usize, 0usize, 0usize);
     let mut table = crate::cli::new_table();
     let mut header: Vec<String> = vec!["topology".to_string()];
-    for (sched, kernel) in &cols {
-        header.push(col_label(sched, kernel));
+    for sched in &schedulers {
+        header.push(sched.clone());
     }
     table.set_header(header);
     for topo in &rows {
         let mut line: Vec<String> = vec![topo.clone()];
-        for (sched, kernel) in &cols {
-            let text = match cell.get(&(topo.clone(), sched.clone(), kernel.clone())) {
-                Some(true) => "✅",
-                Some(false) => "❌",
+        for sched in &schedulers {
+            // An entry only exists with >= 1 record, so (_, 0) means all
+            // passed, (0, _) means all failed, and both-nonzero is mixed.
+            let text = match agg.get(&(topo.clone(), sched.clone())) {
                 None => "-",
+                Some((_, 0)) => {
+                    n_pass += 1;
+                    "✅"
+                }
+                Some((0, _)) => {
+                    n_fail += 1;
+                    "❌"
+                }
+                Some(_) => {
+                    n_mixed += 1;
+                    "🇽"
+                }
             };
             line.push(text.to_string());
         }
         table.add_row(line);
     }
-    Some(format!(
-        "\nverifier summary: {n_pass} ✅  {n_fail} ❌\n{table}\n"
-    ))
+
+    let mut out = format!("\nverifier summary: {n_pass} ✅  {n_fail} ❌  {n_mixed} 🇽\n{table}\n");
+    if !failing.is_empty() {
+        out.push_str("\nfailing combinations (scheduler / kernel / topology):\n");
+        for (sched, kernel, topo) in &failing {
+            out.push_str(&format!("  {sched} / {kernel} / {topo}\n"));
+        }
+    }
+    Some(out)
 }
 
 /// Render one `verified_insns` table per declared scheduler. Within each
@@ -1421,9 +1426,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The summary table: topology rows × scheduler columns, ✅/❌ +
-    /// tally; a single kernel labels columns by scheduler only; an empty
-    /// record set renders nothing.
+    /// The summary grid aggregates across kernels per (topology,
+    /// scheduler): all-pass -> ✅, all-fail -> ❌, with a ✅/❌/🇽 tally.
+    /// Failing (scheduler, kernel, topology) combinations are listed after
+    /// the grid; an empty record set renders nothing.
     #[test]
     fn render_result_table_matrix_tally_and_empty() {
         let recs = vec![
@@ -1443,16 +1449,15 @@ mod tests {
             },
         ];
         let out = render_result_table(&recs).expect("non-empty records -> Some");
-        assert!(out.contains("verifier summary: 1 ✅  1 ❌"), "tally: {out}");
-        // topology rows + scheduler-only column label (single kernel).
         assert!(
-            out.contains("topology") && out.contains("tiny-1llc") && out.contains("large-4llc"),
-            "topology rows: {out}"
+            out.contains("verifier summary: 1 ✅  1 ❌  0 🇽"),
+            "tally: {out}"
         );
-        assert!(out.contains("scx_a"), "column labeled by scheduler: {out}");
+        // Columns are scheduler-only (kernels fold into the cell), so no
+        // `scheduler @ kernel` labeling appears.
         assert!(
-            !out.contains(" @ "),
-            "single-kernel table labels columns by scheduler only: {out}"
+            out.contains("scx_a") && !out.contains(" @ "),
+            "columns: {out}"
         );
         // The emoji must render in the GRID CELLS, not merely the tally
         // line: locate each topology's row and assert its cell glyph
@@ -1463,7 +1468,7 @@ mod tests {
             .expect("tiny-1llc row present");
         assert!(
             pass_row.contains('✅'),
-            "passing cell renders ✅ in the grid row: {pass_row}"
+            "all-pass cell renders ✅ in the grid row: {pass_row}"
         );
         let fail_row = out
             .lines()
@@ -1471,20 +1476,43 @@ mod tests {
             .expect("large-4llc row present");
         assert!(
             fail_row.contains('❌'),
-            "failing cell renders ❌ in the grid row: {fail_row}"
+            "all-fail cell renders ❌ in the grid row: {fail_row}"
+        );
+        // The single failure is listed after the grid.
+        assert!(
+            out.contains("failing combinations (scheduler / kernel / topology):")
+                && out.contains("scx_a / kernel_6_14 / large-4llc"),
+            "failing combinations listed: {out}"
         );
         assert!(render_result_table(&[]).is_none(), "empty -> None");
     }
 
-    /// Multiple kernels -> columns carry the kernel ('scheduler @ kernel');
-    /// a (scheduler, kernel) that did not run a given topology shows `-`.
+    /// A (topology, scheduler) where one kernel passes and another fails
+    /// renders 🇽 (mixed); an all-pass (topology, scheduler) across kernels
+    /// renders ✅. Only the failing kernel appears in the failing list.
     #[test]
-    fn render_result_table_multi_kernel_columns_and_missing_cell() {
+    fn render_result_table_mixed_kernels_blue_x() {
         let recs = vec![
+            // tiny-1llc / scx_a: 6_14 passes, 6_15 fails -> mixed -> 🇽.
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_14".into(),
                 topology: "tiny-1llc".into(),
+                passed: true,
+                stats: vec![],
+            },
+            VerifierCellRecord {
+                scheduler: "scx_a".into(),
+                kernel: "kernel_6_15".into(),
+                topology: "tiny-1llc".into(),
+                passed: false,
+                stats: vec![],
+            },
+            // smt-2llc / scx_a: both kernels pass -> ✅.
+            VerifierCellRecord {
+                scheduler: "scx_a".into(),
+                kernel: "kernel_6_14".into(),
+                topology: "smt-2llc".into(),
                 passed: true,
                 stats: vec![],
             },
@@ -1497,17 +1525,39 @@ mod tests {
             },
         ];
         let out = render_result_table(&recs).expect("Some");
-        // Multi-kernel columns include the kernel; each (sched,kernel) ran
-        // only one topology, so the other topology row shows '-'.
         assert!(
-            out.contains("scx_a @ kernel_6_14") && out.contains("scx_a @ kernel_6_15"),
-            "multi-kernel columns include the kernel: {out}",
+            out.contains("verifier summary: 1 ✅  0 ❌  1 🇽"),
+            "tally counts one all-pass + one mixed cell: {out}"
+        );
+        let mixed_row = out
+            .lines()
+            .find(|l| l.contains("tiny-1llc"))
+            .expect("tiny-1llc row present");
+        assert!(
+            mixed_row.contains('🇽'),
+            "mixed (some pass, some fail) cell renders 🇽: {mixed_row}"
+        );
+        let pass_row = out
+            .lines()
+            .find(|l| l.contains("smt-2llc"))
+            .expect("smt-2llc row present");
+        assert!(
+            pass_row.contains('✅'),
+            "all-kernels-pass cell renders ✅: {pass_row}"
+        );
+        // Only the failing kernel is listed after the grid.
+        assert!(
+            out.contains("scx_a / kernel_6_15 / tiny-1llc"),
+            "the failing kernel is listed: {out}"
         );
         assert!(
-            out.contains('-'),
-            "a (sched,kernel) absent for a topology renders '-': {out}"
+            !out.contains("kernel_6_14 / tiny-1llc"),
+            "the passing kernel on the mixed topology is not listed: {out}"
         );
-        assert!(out.contains("verifier summary: 2 ✅  0 ❌"), "tally: {out}");
+        assert!(
+            !out.contains("/ smt-2llc"),
+            "the all-pass topology contributes no failing combination: {out}"
+        );
     }
 
     /// Per-scheduler verified_insns tables: one section per declared
