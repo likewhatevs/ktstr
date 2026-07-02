@@ -855,9 +855,9 @@ fn cached_releases_routing_singleton_path() {
 ///   for a sub-2-segment input (the `else` arm).
 /// - `fetch_version_for_prefix` selects the highest in-cache
 ///   patch for a known prefix WITHOUT reaching the
-///   `probe_latest_patch` network fallback (the `6.14` series is
-///   present in the cache, so the `best.is_some()` early return
-///   fires).
+///   `latest_patch_from_sha256sums` network fallback (the `6.14`
+///   series is present in the cache, so the `best.is_some()` early
+///   return fires).
 #[test]
 fn series_resolution_routing_through_cache() {
     // SAME synthetic data the two peer cache tests use — all
@@ -964,9 +964,9 @@ fn series_resolution_routing_through_cache() {
 
     // The `6.14` series is in the cache, so the selection loop
     // finds `6.14.2` and returns via the `best.is_some()` arm —
-    // it must NOT fall through to the probe_latest_patch network
-    // fallback. A regression that skipped the cache hit would
-    // attempt a real cdn.kernel.org directory-listing GET.
+    // it must NOT fall through to the latest_patch_from_sha256sums
+    // network fallback. A regression that skipped the cache hit
+    // would attempt a real cdn.kernel.org sha256sums.asc GET.
     let resolved = super::fetch_version_for_prefix(client, "6.14", "test")
         .expect("present series must resolve from cache without network");
     assert_eq!(
@@ -2091,6 +2091,66 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  linux-6.14.3.t
     );
 }
 
+// -- latest_patch_in_manifest --
+
+/// `latest_patch_in_manifest` returns the numerically-highest patch
+/// of the prefix from a sha256sums.asc body — the EOL-series
+/// resolution path (releases.json omits EOL series, so 6.14 must be
+/// recovered from the manifest). Entries are interleaved and out of
+/// order to prove the max loop, not line order, decides.
+#[test]
+fn latest_patch_in_manifest_returns_highest_patch() {
+    let manifest = "\
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+aaaa  linux-6.14.1.tar.xz
+bbbb  linux-6.14.11.tar.xz
+cccc  linux-6.14.2.tar.xz
+dddd  linux-6.12.94.tar.xz
+-----BEGIN PGP SIGNATURE-----
+";
+    assert_eq!(
+        super::latest_patch_in_manifest(manifest, "6.14"),
+        Some(11),
+        "must select the numerically-highest 6.14 patch (11), not the \
+             lexically-highest (2) nor the last-listed",
+    );
+}
+
+/// The `linux-{prefix}.` needle's trailing dot keeps a `6.1` prefix
+/// from matching the `6.14` / `6.12` series, and only `.tar.xz`
+/// artifacts count (`.tar.gz` / `.tar.sign` / patch files lack the
+/// `.tar.xz` suffix after the patch number).
+#[test]
+fn latest_patch_in_manifest_boundary_and_suffix() {
+    let manifest = "\
+aaaa  linux-6.14.11.tar.xz
+bbbb  linux-6.12.94.tar.xz
+cccc  linux-6.1.140.tar.xz
+dddd  linux-6.1.99.tar.gz
+eeee  linux-6.1.50.tar.xz
+";
+    assert_eq!(
+        super::latest_patch_in_manifest(manifest, "6.1"),
+        Some(140),
+        "prefix 6.1 must exclude 6.14/6.12 (dot boundary) and the \
+             .tar.gz entry (only .tar.xz counts), leaving max(140, 50)",
+    );
+}
+
+/// A prefix with no `.tar.xz` entry returns None — the caller turns
+/// that into a hard "no tarball listed" error.
+#[test]
+fn latest_patch_in_manifest_absent_prefix_returns_none() {
+    let manifest = "aaaa  linux-6.12.94.tar.xz\n";
+    assert_eq!(
+        super::latest_patch_in_manifest(manifest, "6.14"),
+        None,
+        "a prefix with no matching .tar.xz entry must return None",
+    );
+}
+
 /// `parse_sha256_for_file` strips the PGP signature trailer —
 /// content after `-----BEGIN PGP SIGNATURE-----` is binary
 /// noise that must NOT be scanned for checksum lines (a chance
@@ -2277,6 +2337,103 @@ fn verify_sha256_rejects_mismatch_with_both_digests_in_message() {
         msg.contains("--skip-sha256"),
         "mismatch error must name --skip-sha256 as the recovery \
              flag for the in-place-tarball-update case: {msg}",
+    );
+}
+
+// -- download_stable_tarball_from_url + TarballNotFound routing --
+
+/// The `TarballNotFound` marker must be downcast-detectable, and a
+/// non-marker error must NOT be — pins the exact `downcast_ref`
+/// contract `download_tarball`'s EOL git-fallback dispatch depends on
+/// (a 404 carries the marker → shallow git-tag clone; any other error
+/// propagates unchanged). Runs in CI (no network) so the contract is
+/// guarded even though the seam tests below are `#[ignore]`.
+#[test]
+fn tarball_not_found_marker_is_downcast_detectable() {
+    let marked: anyhow::Error = anyhow::Error::new(super::TarballNotFound);
+    assert!(
+        marked.downcast_ref::<super::TarballNotFound>().is_some(),
+        "the marker must be downcast-detectable — download_tarball's \
+             `e.downcast_ref::<TarballNotFound>()` git-fallback arm relies on it",
+    );
+    let plain: anyhow::Error = anyhow::anyhow!("download x: HTTP 500");
+    assert!(
+        plain.downcast_ref::<super::TarballNotFound>().is_none(),
+        "a non-marker error must NOT be misrouted to the git fallback",
+    );
+}
+
+/// Create a mockito server serving one canned tarball response at a
+/// fixed path. Returns (server, url, mock). Mirrors [`mock_sha256sums`]
+/// for the tarball endpoint.
+fn mock_tarball(status: usize, body: &str) -> (mockito::ServerGuard, String, mockito::Mock) {
+    let mut server = mockito::Server::new();
+    let mock = server
+        .mock("GET", "/linux.tar.xz")
+        .with_status(status)
+        .with_body(body)
+        .create();
+    let url = format!("{}/linux.tar.xz", server.url());
+    (server, url, mock)
+}
+
+/// A 404 from the tarball GET must surface as a downcast-detectable
+/// [`super::TarballNotFound`] — the signal `download_tarball` turns
+/// into the shallow git-tag clone of a pruned/EOL kernel. Drives the
+/// real `download_stable_tarball_from_url` status gate against a
+/// localhost mock (`skip_sha256 = true`, so no sha256sums.asc fetch is
+/// attempted). Without this the 404→marker path is unproven — the pure
+/// `latest_patch_in_manifest` tests say nothing about the routing.
+#[test]
+#[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
+fn download_stable_tarball_404_returns_tarball_not_found_marker() {
+    let (_server, url, _mock) = mock_tarball(404, "Not Found");
+    let client = test_client();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let err = super::download_stable_tarball_from_url(
+        &client,
+        &url,
+        "6.14.11",
+        tmp.path(),
+        "test",
+        true,
+        None,
+    )
+    .expect_err("a 404 tarball GET must be an error");
+    assert!(
+        err.downcast_ref::<super::TarballNotFound>().is_some(),
+        "a 404 must carry the TarballNotFound marker so download_tarball \
+             routes to the git-tag fallback; got: {err:#}",
+    );
+}
+
+/// A non-404 failure (HTTP 500) must be a HARD error with NO marker —
+/// the git-tag fallback is only for pruned tarballs, not a server
+/// error, which must propagate unchanged (no clone attempt).
+#[test]
+#[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
+fn download_stable_tarball_500_is_hard_error_without_marker() {
+    let (_server, url, _mock) = mock_tarball(500, "Internal Server Error");
+    let client = test_client();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let err = super::download_stable_tarball_from_url(
+        &client,
+        &url,
+        "6.14.11",
+        tmp.path(),
+        "test",
+        true,
+        None,
+    )
+    .expect_err("a 500 tarball GET must be an error");
+    assert!(
+        err.downcast_ref::<super::TarballNotFound>().is_none(),
+        "a 500 must NOT carry the marker — no git fallback for a server \
+             error; got: {err:#}",
+    );
+    assert!(
+        format!("{err:#}").contains("500"),
+        "the hard error must name the HTTP status: {err:#}",
     );
 }
 

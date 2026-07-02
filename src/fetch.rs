@@ -31,7 +31,7 @@ static SHARED_CLIENT: OnceLock<Client> = OnceLock::new();
 /// duration once the connection is up.
 ///
 /// No total request `.timeout()` is set: the same client serves both
-/// short requests (directory listings, releases.json) and large
+/// short requests (releases.json, sha256sums.asc) and large
 /// tarball streams ([`download_stable_tarball`],
 /// [`download_rc_tarball`]), where a 130–180 MiB compressed payload
 /// over a slow uplink can take minutes of wall-clock to deliver.
@@ -873,7 +873,46 @@ fn resolve_expected_sha256_from_url(
     }
 }
 
+/// The linux-stable git tree — the authoritative source for tags
+/// whose `.tar.xz` is no longer on cdn.kernel.org.
+///
+/// cdn.kernel.org keeps only the LATEST tarball of each series
+/// currently in `releases.json`; every superseded point release AND
+/// every tag of an EOL series is pruned (a GET for the tarball 404s,
+/// verified empirically — and HEAD is not a dependable existence
+/// probe on the CDN). The stable tree still carries every `vX.Y.Z`
+/// tag, so a shallow tag clone ([`git_clone`], depth 1) recovers the
+/// source the pruned tarball would have provided. Used by
+/// [`download_tarball`]'s [`TarballNotFound`] fallback.
+const STABLE_TREE_URL: &str = "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git";
+
+/// Marker error attached to a stable-tarball download failure when
+/// cdn.kernel.org returns HTTP 404.
+///
+/// A 404 means the tarball is pruned — an EOL series (absent from
+/// `releases.json`) or a superseded point release (the CDN retains
+/// only each maintained series' latest). [`download_tarball`] detects
+/// this via `downcast_ref` (the context-aware anyhow accessor — a
+/// `chain().any(..is::<T>())` walk would MISS a context-wrapped
+/// marker) and falls back to a shallow git-tag clone from
+/// [`STABLE_TREE_URL`]. Any other HTTP status is a hard error with no
+/// fallback.
+#[derive(Debug)]
+struct TarballNotFound;
+
+impl std::fmt::Display for TarballNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stable tarball pruned from cdn.kernel.org (EOL or superseded point release)")
+    }
+}
+
+impl std::error::Error for TarballNotFound {}
+
 /// Download a stable kernel tarball (.tar.xz) from cdn.kernel.org.
+///
+/// Returns a [`TarballNotFound`] error (downcast-detectable) when the
+/// CDN 404s the tarball — see that type for the pruning semantics and
+/// [`download_tarball`] for the git-tag fallback it triggers.
 ///
 /// Streams the body through a [`DownloadStream`] watchdog so a
 /// stalled connection (no body bytes for
@@ -901,25 +940,50 @@ fn download_stable_tarball(
     mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<PathBuf> {
     let major = major_version(version)?;
+    let url = format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/linux-{version}.tar.xz");
+    download_stable_tarball_from_url(client, &url, version, dest_dir, cli_label, skip_sha256, mp)
+}
+
+/// URL-injectable core of [`download_stable_tarball`]: the GET, the
+/// 404→[`TarballNotFound`] / other-status→hard-error status gate, and
+/// the stream→verify→extract pipeline, against an arbitrary tarball
+/// `url`. Production reaches this only via [`download_stable_tarball`],
+/// which pins the cdn.kernel.org URL; the seam exists so the status
+/// routing (404 marker vs hard error) is unit-testable against a
+/// localhost mock without a real cdn round-trip — mirrors
+/// [`resolve_expected_sha256_from_url`] / [`fetch_releases`].
+fn download_stable_tarball_from_url(
+    client: &Client,
+    url: &str,
+    version: &str,
+    dest_dir: &Path,
+    cli_label: &str,
+    skip_sha256: bool,
+    mp: Option<&crate::cli::FetchProgress>,
+) -> Result<PathBuf> {
+    let major = major_version(version)?;
     let tarball_name = format!("linux-{version}.tar.xz");
-    let url = format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/{tarball_name}");
 
     let expected_sha256 = resolve_expected_sha256(client, major, &tarball_name, skip_sha256);
 
     tracing::info!(%url, "downloading stable kernel tarball (requires network)");
     let response = client
-        .get(&url)
+        .get(url)
         .timeout(DOWNLOAD_REQUEST_READ_TIMEOUT)
         .send()
         .with_context(|| format!("download {url}"))?;
     if !response.status().is_success() {
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            anyhow::bail!("{}", version_not_found_msg(client, version));
+            // Pruned tarball (EOL series or superseded point release).
+            // Return the downcast-detectable marker so `download_tarball`
+            // falls back to a shallow git-tag clone from `STABLE_TREE_URL`
+            // rather than failing outright.
+            return Err(anyhow::Error::new(TarballNotFound));
         }
         anyhow::bail!("download {url}: HTTP {}", response.status());
     }
-    reject_html_response(&response, &url)?;
-    print_download_size(&response, &url, cli_label, mp);
+    reject_html_response(&response, url)?;
+    print_download_size(&response, url, cli_label, mp);
     // Capture the total before `response` is moved into the stream so a
     // determinate (percent + ETA) bar can be built; `None` when the
     // server sent no Content-Length, in which case the bar degrades to
@@ -962,7 +1026,7 @@ fn download_stable_tarball(
         bar.finish();
     }
     if let Some(expected) = expected_sha256.as_deref() {
-        verify_sha256(&actual_hex, expected, &url)?;
+        verify_sha256(&actual_hex, expected, url)?;
         status(&format!(
             "{cli_label}: sha256 verified ({bytes_total} bytes, hash {actual_hex})"
         ));
@@ -1133,7 +1197,39 @@ pub fn download_tarball(
     let source_dir = if is_rc(version) {
         download_rc_tarball(client, version, dest_dir, cli_label, mp)?
     } else {
-        download_stable_tarball(client, version, dest_dir, cli_label, skip_sha256, mp)?
+        match download_stable_tarball(client, version, dest_dir, cli_label, skip_sha256, mp) {
+            Ok(dir) => dir,
+            // Pruned tarball (EOL series or superseded point release):
+            // cdn.kernel.org keeps only each maintained series' latest
+            // .tar.xz. Recover the source from the stable tree's
+            // `v{version}` tag via a shallow (depth-1) clone. The kernel
+            // built from this source is cached by the caller under the
+            // SAME `{version}-tarball-...` key returned below, so a
+            // re-run hits that cache and never re-clones.
+            Err(e) if e.downcast_ref::<TarballNotFound>().is_some() => {
+                let tag = format!("v{version}");
+                // A 404 says the tarball is gone, not why. If the stable
+                // tree carries `v{version}`, the tarball was pruned
+                // (EOL / superseded) and the tag clone recovers it. If
+                // the tag is absent, the version simply does not exist —
+                // surface the friendly "not found" suggestion (with the
+                // latest in-series patch) instead of a cryptic clone
+                // failure.
+                if ls_remote_commit_hash(STABLE_TREE_URL, &tag).is_none() {
+                    anyhow::bail!("{}", version_not_found_msg(client, version));
+                }
+                let msg = format!(
+                    "{cli_label}: {version} not on cdn.kernel.org (pruned/EOL); \
+                     cloning stable tag {tag}"
+                );
+                match mp {
+                    Some(fp) => fp.println(&msg),
+                    None => eprintln!("{msg}"),
+                }
+                git_clone(STABLE_TREE_URL, &tag, dest_dir, cli_label, mp)?.source_dir
+            }
+            Err(e) => return Err(e),
+        }
     };
 
     Ok(AcquiredSource {
@@ -1306,15 +1402,16 @@ pub fn is_major_minor_prefix(s: &str) -> bool {
 /// E.g., "6.12" → "6.12.81", "6" → "6.19.12" (highest 6.x.y).
 ///
 /// Scans all monikers in releases.json except linux-next. If no
-/// match is found (EOL series), fetches the cdn.kernel.org directory
-/// listing to find the highest patch version with a tarball.
+/// match is found (EOL series, absent from releases.json), parses
+/// cdn.kernel.org's `sha256sums.asc` manifest to find the highest
+/// patch — see `latest_patch_from_sha256sums`.
 ///
 /// When `client` is the process-wide [`shared_client`] singleton,
 /// routes through `RELEASES_CACHE`; other clients bypass the
 /// cache via pointer-equality and exercise `fetch_releases`
 /// directly — see `cached_releases_with` for details. Cache
-/// scope is releases.json only; the EOL-series directory-listing
-/// fallback in `probe_latest_patch` always hits the network.
+/// scope is releases.json only; the EOL-series `sha256sums.asc`
+/// fallback in `latest_patch_from_sha256sums` always hits the network.
 ///
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
@@ -1346,34 +1443,60 @@ pub fn fetch_version_for_prefix(client: &Client, prefix: &str, cli_label: &str) 
         return Ok(version.to_string());
     }
 
-    eprintln!("{cli_label}: {prefix}.x not in releases.json (EOL series), probing cdn.kernel.org");
-    probe_latest_patch(client, prefix, cli_label)
+    eprintln!(
+        "{cli_label}: {prefix}.x not in releases.json (EOL series); \
+         resolving via cdn.kernel.org sha256sums.asc"
+    );
+    latest_patch_from_sha256sums(client, prefix, cli_label)
 }
 
-/// Find the latest patch version for an EOL series by fetching the
-/// CDN directory listing.
+/// Find the latest patch version for an EOL series (absent from
+/// releases.json) by parsing cdn.kernel.org's `sha256sums.asc`.
 ///
-/// GETs the `v{major}.x/` directory index from cdn.kernel.org and
-/// extracts `linux-{prefix}.{patch}.tar.xz` filenames to find the
-/// highest patch. One GET replaces the former parallel-HEAD probe
-/// which failed in CI environments that block or mishandle HEAD
-/// requests to the CDN.
-fn probe_latest_patch(client: &Client, prefix: &str, cli_label: &str) -> Result<String> {
+/// The `v{major}.x/` directory index is NOT a viable source —
+/// cdn.kernel.org serves no directory listing (a GET 404s, and HEAD
+/// is not a dependable existence probe on the CDN). `sha256sums.asc`,
+/// by contrast, is a real served file: a historical manifest with one
+/// `<64-hex-digest>  <filename>` line per released artifact, covering
+/// every `linux-{major}.{minor}.{patch}.tar.xz` of the major series
+/// including EOL series. Parse it for the highest patch of `prefix`.
+///
+/// The resolved version's `.tar.xz` may itself be pruned from cdn
+/// (only each maintained series' latest tarball is retained), so the
+/// download path falls back to a git-tag clone when the tarball 404s
+/// — see [`download_tarball`] and [`TarballNotFound`].
+fn latest_patch_from_sha256sums(client: &Client, prefix: &str, cli_label: &str) -> Result<String> {
     let major = major_version(prefix)?;
-    let url = format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/");
-    eprintln!("{cli_label}: fetching directory listing from {url}");
-    let body = client
-        .get(&url)
-        .send()
-        .with_context(|| format!("GET {url}"))?
-        .error_for_status()
-        .with_context(|| format!("GET {url}"))?
-        .text()
-        .with_context(|| format!("reading body from {url}"))?;
+    let url = sha256sums_url(major);
+    eprintln!("{cli_label}: resolving {prefix}.x from {url}");
+    let manifest = fetch_sha256sums_from_url(client, &url)?;
 
+    match latest_patch_in_manifest(&manifest, prefix) {
+        Some(patch) => {
+            let version = format!("{prefix}.{patch}");
+            eprintln!("{cli_label}: latest {prefix}.x kernel (from sha256sums.asc): {version}");
+            Ok(version)
+        }
+        None => anyhow::bail!("no linux-{prefix}.* tarball listed in {url}"),
+    }
+}
+
+/// Highest patch level of `prefix` named in a `sha256sums.asc` body.
+///
+/// Scans each `<64-hex-digest>  <filename>` line for
+/// `linux-{prefix}.{patch}.tar.xz` and returns the greatest `{patch}`.
+/// Pure (no network) so it is unit-testable against a synthetic
+/// manifest — mirrors [`parse_sha256_for_file`].
+///
+/// The trailing `.` in the `linux-{prefix}.` needle prevents a `6.14`
+/// prefix from matching a `6.140` series (`linux-6.140.` contains no
+/// `linux-6.14.` substring). Only `.tar.xz` names count — `.tar.sign`
+/// / `.tar.gz` / patch lines lack the `.tar.xz` suffix after the patch
+/// number and are skipped.
+fn latest_patch_in_manifest(manifest: &str, prefix: &str) -> Option<u32> {
     let needle = format!("linux-{prefix}.");
     let mut best_patch: Option<u32> = None;
-    for line in body.lines() {
+    for line in manifest.lines() {
         let Some(pos) = line.find(&needle) else {
             continue;
         };
@@ -1388,20 +1511,7 @@ fn probe_latest_patch(client: &Client, prefix: &str, cli_label: &str) -> Result<
             best_patch = Some(patch);
         }
     }
-
-    match best_patch {
-        Some(patch) => {
-            let version = format!("{prefix}.{patch}");
-            eprintln!("{cli_label}: latest {prefix}.x kernel (from cdn listing): {version}");
-            Ok(version)
-        }
-        None => {
-            anyhow::bail!(
-                "no tarball matching {prefix}.x found in cdn.kernel.org \
-                 directory listing at {url}"
-            );
-        }
-    }
+    best_patch
 }
 
 /// Cache key for a git-cloned kernel: the raw user ref verbatim, the
