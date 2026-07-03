@@ -60,8 +60,8 @@ pub struct MetricDef {
     /// Temporal aggregation kind. Drives how
     /// [`aggregate_samples`] collapses N readings of the same
     /// metric across multiple capture samples (e.g. periodic
-    /// monitor ticks within one run, or two `cargo ktstr stats
-    /// compare` snapshot subdirectories) into one comparable
+    /// monitor ticks within one run, or runs pooled for a
+    /// `cargo ktstr perf-delta` comparison) into one comparable
     /// value. Distinct from [`Self::polarity`], which is the
     /// "good direction" of the FINAL value: kind tells us HOW to
     /// reduce a vec of samples; polarity tells us how to interpret

@@ -102,10 +102,10 @@ The `unknown` sentinel applies to the **dirname only**. The
 in-memory `SidecarResult.project_commit` field stays `None`
 (serialized as JSON `null`) for these runs — the dirname uses a
 filesystem-safe sentinel, while the JSON field preserves the
-original probe outcome. As a consequence, `cargo ktstr stats
-compare --project-commit unknown` will **not** match a sidecar
-whose `project_commit` is `None`; omit the `--project-commit`
-filter entirely to include `None`-commit rows in the comparison.
+original probe outcome. As a consequence, a `project_commit`
+filter for the literal `unknown` will **not** match a sidecar
+whose `project_commit` is `None` — the dirname sentinel and the
+JSON field diverge here.
 
 `KTSTR_SIDECAR_DIR` overrides the *sidecar* directory itself
 (used as-is, no key suffix), not the parent. The override only
@@ -113,10 +113,10 @@ affects where new sidecars are written and what bare
 `cargo ktstr stats` reads. When the override is set, **pre-clear
 is skipped** — the operator chose that directory and owns its
 contents, so any pre-existing sidecars there are preserved.
-`cargo ktstr stats list`, `cargo ktstr stats compare`,
-`cargo ktstr stats list-values`, and `cargo ktstr stats show-host`
-all walk `{CARGO_TARGET_DIR or "target"}/ktstr/` by default —
-pass `--dir DIR` on `compare` / `list-values` / `show-host` to
+`cargo ktstr stats list`, `cargo ktstr stats list-values`, and
+`cargo ktstr stats show-host` all walk
+`{CARGO_TARGET_DIR or "target"}/ktstr/` by default — pass
+`--dir DIR` on `list-values` / `show-host` to
 point them at an alternate run root (e.g. an archived sidecar
 tree copied off a CI host). They do NOT consult
 `KTSTR_SIDECAR_DIR`.
@@ -153,40 +153,25 @@ tree copied off a CI host). They do NOT consult
    sidecar in the run carries one. Rows are ordered by directory
    mtime, most recent first.
 
-4. **Compare** across dimensions:
+4. **Compare** HEAD against a baseline commit (regression gate):
 
    ```sh
-   cargo ktstr stats compare --a-kernel 6.14 --b-kernel 7.0
-   cargo ktstr stats compare --a-kernel 6.14 --b-kernel 7.0 -E cgroup_steady
-   cargo ktstr stats compare --a-scheduler scx_rusty --b-scheduler scx_lavd --kernel 6.14
-   cargo ktstr stats compare --a-project-commit abcdef1 --b-project-commit fedcba2
-   cargo ktstr stats compare --a-project-commit abc1234 --b-project-commit abc1234-dirty
-   cargo ktstr stats compare --a-kernel-commit abcdef1 --b-kernel-commit fedcba2
-   cargo ktstr stats compare --a-run-source ci --b-run-source local
+   cargo ktstr perf-delta --dual-run --kernel 6.14            # HEAD vs merge-base(HEAD, main)
+   cargo ktstr perf-delta --base abc1234                      # vs an explicit baseline commit
+   cargo ktstr perf-delta --dual-run --kernel 6.14 -E cgroup_steady  # narrow the perf set
    ```
 
-   The `abc1234` vs `abc1234-dirty` row is the canonical
-   WIP-vs-baseline pattern: run the suite once at a clean commit
-   to capture the baseline directory `{kernel}-abc1234`, edit the
-   tree without committing, run the suite again to capture
-   `{kernel}-abc1234-dirty`, then diff the two. Both sidecar pools
-   coexist under `target/ktstr/` because the `-dirty` suffix
-   makes them distinct directories.
-
-   Per-side filters (`--a-*` / `--b-*`) partition the sidecar pool
-   into two sides; shared filters (`--kernel`, `--scheduler`,
-   `--project-commit`, `--kernel-commit`, `--run-source`, etc.)
-   pin both sides. The nine slicing dimensions are `kernel`,
-   `scheduler`, `topology`, `work-type`, `project-commit`,
-   `kernel-commit`, `run-source`, `resolve-source`, and `cpu-budget`;
-   differing on
-   any subset of them defines the A/B contrast. Per-metric deltas are
-   computed using the unified `MetricDef` registry (polarity,
+   `perf-delta` pairs the baseline commit's `performance_mode`
+   sidecars against HEAD's per scenario and reports per-metric
+   regressions via the unified `MetricDef` registry (polarity,
    absolute and relative thresholds). Output is colored: red for
-   regressions, green for improvements. The command exits non-zero
-   when regressions are detected. Use `cargo ktstr stats
-   list-values` to discover available dimension values before
-   constructing a comparison.
+   regressions, green for improvements; it exits non-zero when a
+   metric regresses past its gate. The canonical WIP-vs-baseline
+   pattern is `perf-delta --base abc1234` from a `-dirty` working
+   tree against the clean commit it was edited from. See
+   [cargo-ktstr](cargo-ktstr.md#perf-delta) for the full flag set,
+   and `cargo ktstr stats list-values` to discover the values a
+   pool carries.
 
 5. **Print analysis** for the most recent run (no subcommand):
 
@@ -211,8 +196,8 @@ tree copied off a CI host). They do NOT consult
    host-context field via `HostContext::format_human`: CPU model,
    memory config, transparent-hugepage policy, NUMA node count, uname
    triple, kernel cmdline, and every `/proc/sys/kernel/sched_*`
-   tunable. Same fingerprint `stats compare` uses for its host-delta
-   section, but available on a single run. Fails with an actionable
+   tunable. Same fingerprint the `perf-delta` host-delta section
+   uses, but available on a single run. Fails with an actionable
    error when no sidecar carries a host field (pre-enrichment run).
 
 ## Metric registry discovery

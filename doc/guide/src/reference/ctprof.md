@@ -753,7 +753,7 @@ its raw inputs).
   want to inspect host configuration only, without the per-
   thread walk.
 - [Capture and Compare Host State](../recipes/host-state.md) —
-  recipe covering the `show-host` / `stats compare` flow for
+  recipe covering the `show-host` / `perf-delta` flow for
   comparing host *context* across sidecars (not the per-thread
   profiler).
 - [Environment Variables](environment-variables.md) — every

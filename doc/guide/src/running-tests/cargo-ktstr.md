@@ -333,7 +333,7 @@ failures against the new code" workflow.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--dir PATH` | `target/ktstr/` | Override the sidecar root. Same semantics as `cargo ktstr stats compare --dir`. |
+| `--dir PATH` | `target/ktstr/` | Override the sidecar root. Same semantics as `cargo ktstr stats list-values --dir`. |
 | `-E, --filter SUBSTR` | -- | Substring filter on `test_name` (case-sensitive). |
 | `--exec` | dry-run | Invoke `cargo nextest run` with the computed filter instead of printing it. |
 | `--profile NAME` | release | Cargo BUILD profile for the scheduler-under-test (see `cargo ktstr test --profile`). Only meaningful with `--exec` (the dry-run path runs nothing). |
@@ -729,20 +729,17 @@ cargo ktstr completions fish > ~/.config/fish/completions/cargo-ktstr.fish
 
 ## stats
 
-Sidecar analysis, per-record diagnostics, and run-to-run comparison.
+Sidecar analysis and per-record diagnostics. Cross-run regression
+comparison is [`perf-delta`](#perf-delta).
 See [Runs](runs.md) for the directory layout.
 
 ```sh
 cargo ktstr stats                                             # print analysis of newest run
 cargo ktstr stats list                                        # list runs
 cargo ktstr stats list-metrics                                # list registered regression metrics
-cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15     # slice on kernel
-cargo ktstr stats compare --a-scheduler scx_rusty --b-scheduler scx_alpha  # slice on scheduler
-cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15 --scheduler scx_rusty  # slice on kernel, pin scheduler on both sides
-cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15 -E cgroup_steady       # add substring filter
-cargo ktstr stats compare --a-project-commit abcdef1 --b-project-commit fedcba2 --no-average  # opt out of trial averaging
-cargo ktstr stats compare --a-kernel-commit abcdef1 --b-kernel-commit fedcba2    # slice on kernel source HEAD
-cargo ktstr stats compare --a-run-source ci --b-run-source local                 # slice on run environment
+cargo ktstr stats list-values                                 # distinct filter values present in the pool
+cargo ktstr stats show-host --run RUN_ID                       # archived host context for a run
+cargo ktstr perf-delta --dual-run --kernel 6.14               # regression-gate HEAD vs a baseline commit
 cargo ktstr stats explain-sidecar --run RUN_ID                                   # diagnose Option-field absences
 ```
 
@@ -827,11 +824,10 @@ numeric dimension — its JSON value is an array of integers (the
 effective host-CPU budget each run's vCPU threads ran on), and
 never-booted skip rows (budget 0) are omitted.
 
-Use this before crafting a `cargo ktstr stats compare`
-invocation to discover what `--a-X` / `--b-X` values the pool
-actually carries: `--a-kernel 6.20` against an empty pool fails
-downstream with "no rows match filter A", and `list-values` is
-the upstream answer to "what kernels do I have?".
+Use this to discover what filter values the pool actually carries
+before narrowing a [`perf-delta`](#perf-delta) run (e.g. which
+kernels or project commits are present); `list-values` is the
+upstream answer to "what have I got?".
 
 ```sh
 cargo ktstr stats list-values                       # text per-dim blocks
@@ -859,9 +855,7 @@ dimension name with arrays of values:
 
 The JSON keys `commit` and `source` are the wire contract;
 internally the corresponding fields are
-`SidecarResult::project_commit` and `SidecarResult::run_source`,
-and the per-side filter flags spell as `--project-commit` /
-`--run-source` (see [`compare`](#compare)).
+`SidecarResult::project_commit` and `SidecarResult::run_source`.
 
 `kernel`, `commit`, `kernel_commit`, and `source` are optional
 on the source sidecar (`SidecarResult::kernel_version` /
@@ -873,7 +867,7 @@ that dimension.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--json` | off | Emit JSON instead of per-dimension text blocks. |
-| `--dir DIR` | `target/ktstr/` | Alternate run root. Same semantics as `compare --dir`. |
+| `--dir DIR` | `target/ktstr/` | Alternate run root. Same semantics as `stats show-host --dir`. |
 
 ### show-host (archived) {#stats-show-host}
 
@@ -881,7 +875,7 @@ Print the archived `HostContext` for a specific run: CPU identity,
 memory/hugepage config, transparent-hugepage policy, NUMA node
 count, kernel uname triple, kernel cmdline, and every
 `/proc/sys/kernel/sched_*` tunable captured at archive time. Useful
-for inspecting the same fingerprint `compare`'s host-delta section
+for inspecting the same fingerprint `perf-delta`'s host-delta section
 uses, available on a single run.
 
 The command scans sidecars in the run directory in iteration order
@@ -894,13 +888,13 @@ returning empty output.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--run ID` | required | Run key (e.g. `6.14-abc1234` or `6.14-abc1234-dirty`; from `cargo ktstr stats list`). |
-| `--dir DIR` | `target/ktstr/` | Alternate run root. Same semantics as `compare --dir`: useful for archived sidecar trees copied off a CI host. |
+| `--dir DIR` | `target/ktstr/` | Alternate run root. Same semantics as `stats show-host --dir`: useful for archived sidecar trees copied off a CI host. |
 
 ### explain-sidecar
 
 Diagnose `Option`-field absences across a run's sidecars. Loads
 every `*.ktstr.json` under `--run ID` (or its subdirectories one
-level deep, mirroring `compare`'s gauntlet-job layout) and reports,
+level deep, mirroring the gauntlet-job sidecar layout) and reports,
 per sidecar, which `Option<T>` fields landed as `None` plus the
 documented causes for each absence and a classification:
 
@@ -919,7 +913,7 @@ rather than aggregate.
 
 Sidecars are loaded verbatim — this command does NOT rewrite
 `run_source` to `"archive"` even when `--dir` is set. Diverges
-intentionally from `compare` / `list-values`; matches `show-host`.
+intentionally from `list-values`; matches `show-host`.
 The override would erase the only signal that surfaces the
 pre-rename `source`-key drop case.
 
@@ -1047,186 +1041,8 @@ cargo ktstr stats explain-sidecar --run RUN_ID --dir /path/archive    # diagnose
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--run ID` | required | Run key (e.g. `6.14-abc1234` or `6.14-abc1234-dirty`; from `cargo ktstr stats list`). |
-| `--dir DIR` | `target/ktstr/` | Alternate run root. Same semantics as `compare --dir`. |
+| `--dir DIR` | `target/ktstr/` | Alternate run root. Same semantics as `stats show-host --dir`. |
 | `--json` | off | Emit aggregate JSON instead of per-sidecar text. |
-
-### compare
-
-Pool every sidecar under `target/ktstr/` (or `--dir`), partition
-the rows into A and B sides via per-side filter flags, average
-each side's matching sidecars per pairing key (or pass through
-distinct sidecars under `--no-average`), and report regressions
-on the A→B delta. Exits non-zero on regression.
-
-The dimensions on which the A and B filters DIFFER are the
-SLICING dimensions — the axes of the A/B contrast. Every other
-dimension is part of the dynamic PAIRING key the comparison
-joins on. Slicing dims are derived automatically from the
-filters:
-
-```sh
-# Slice on kernel: A is 6.14, B is 6.15. Pair on every other dim.
-cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15
-
-# Slice on kernel AND scheduler simultaneously.
-cargo ktstr stats compare \
-    --a-kernel 6.14 --a-scheduler scx_rusty \
-    --b-kernel 6.15 --b-scheduler scx_alpha
-
-# Slice on project commit, narrow both sides to one scheduler+kernel.
-cargo ktstr stats compare \
-    --a-project-commit abcdef1 --b-project-commit fedcba2 \
-    --kernel 6.14 --scheduler scx_rusty
-
-# Slice on run environment: CI runs vs local developer runs.
-cargo ktstr stats compare \
-    --a-run-source ci --b-run-source local
-```
-
-**Symmetric sugar.** Shared `--X` flags (`--kernel`, `--scheduler`,
-`--topology`, `--work-type`, `--project-commit`, `--kernel-commit`,
-`--run-source`, `--resolve-source`, `--cpu-budget`) pin BOTH sides to
-the same value(s). Per-side `--a-X` / `--b-X` flags REPLACE the
-corresponding shared `--X` value for that side only — "more-specific
-replaces" semantics. So `--kernel 6.14 --a-kernel 6.13` puts A on 6.13
-and B on 6.14. Together the nine slicing dimensions (`kernel`,
-`scheduler`, `topology`, `work-type`, `project-commit`,
-`kernel-commit`, `run-source`, `resolve-source`, `cpu-budget`) cover
-every typed axis the comparison can contrast on.
-
-`cpu-budget` (the effective host-CPU budget a run's vCPU threads ran
-on) is a PAIRING dimension by default: even without any `--cpu-budget`
-flag, two runs of different budgets never pair, so a budget-confined
-run is never silently compared against a roomy one (their timing
-metrics measure different host-contention conditions). Pass
-`--a-cpu-budget` / `--b-cpu-budget` to deliberately CONTRAST budgets;
-when you do, prefer the overcommit-invariant `worst_iterations_per_cpu_sec`
-metric over raw timing.
-
-**Validation.** The dispatch site rejects two cases up front:
-- **Empty slicing**: no `--a-X` / `--b-X` at all, OR the per-side
-  flags resolve to identical effective filters. Bails with
-  "specify at least one per-side filter (e.g. `--a-kernel 6.14
-  --b-kernel 6.15`) to define what dimension separates the two
-  sides."
-- **Multi-dim slicing**: slicing on more than one dimension
-  prints a warning to stderr ("warning: slicing on N
-  dimensions; results compress multiple axes into a single A/B
-  contrast") but continues — multi-dim contrasts are a
-  deliberate feature for cohort sweeps.
-
-**Averaging.** By default the comparison aggregates every
-matching sidecar within each side into a single arithmetic-mean
-row per pairing key, smoothing run-to-run jitter. Failing /
-skipped contributors are excluded from the metric mean; the
-aggregated row's `passed` is the AND across every contributor.
-A header line above the comparison table reads `averaged across
-N runs (A) and M runs (B)` and a per-group
-`passes_observed/total_observed` block prints below the summary.
-
-**`+mixed` commit marker.** When contributors to an averaged
-group disagree on the `-dirty` suffix for the same canonical
-hex (some clean, some `-dirty`), the rendered `commit` and
-`kernel_commit` columns show `{hex}+mixed` for that group.
-`+mixed` is a COHORT-level marker (distinct from `-dirty`,
-which is a per-record property of one sidecar): it indicates
-mixed working-tree state across the group's contributors.
-Mixed-dirty tracking spans EVERY contributor (passing,
-failing, skipped) so WIP-vs-committed disagreement surfaces
-in the averaged row even when one of the two states only
-appears on a failing run. The marker is rendered against the
-canonical un-suffixed hex, so a `abc1234` clean entry plus an
-`abc1234-dirty` entry render as `abc1234+mixed` regardless of
-which contributor was scanned first. Homogeneous cohorts
-(every contributor clean, every contributor dirty, or every
-contributor `None`) preserve the first-seen value verbatim
-and never get the `+mixed` marker.
-
-`--no-average` keeps each sidecar distinct. If multiple sidecars
-on the same side share the same pairing key under `--no-average`,
-the comparison bails with "duplicate pairing keys" — pairing
-across A/B sides is ambiguous when one A-row could match many
-B-rows. Either drop `--no-average` to average them, or add
-another per-side filter to disambiguate.
-
-**Kernel match shape.** A `--kernel 6.12` filter (two-segment
-major.minor) PREFIX-matches every patch release in that series:
-`6.12`, `6.12.0`, `6.12.5` all match. A three-or-more-segment
-filter (`--kernel 6.14.2`, `--kernel 6.15-rc3`) is strict
-equality — `6.14.2` does NOT match `6.14.20`. The same shape
-applies to `--a-kernel` / `--b-kernel`.
-
-**Discovering filter values.** Run
-[`cargo ktstr stats list-values`](#list-values) before
-crafting a `compare` invocation to see what `kernel`, `commit`,
-`kernel_commit`, `source`, `resolve_source`, `cpu_budget`,
-`scheduler`, `topology`, and `work_type` values the sidecar pool
-actually carries; passing a
-`--a-kernel 6.20` against an empty pool fails downstream with
-"no rows match filter A" and `list-values` is the upstream
-answer to "what have I got?". `list-values` reports all nine
-filterable dimensions; the JSON keys `commit` and `source` map
-to the per-side filter flags `--project-commit` and
-`--run-source`.
-
-When a side comes back as `unknown` for one of the optional
-dimensions (`kernel`, `commit`, `kernel_commit`, `source`),
-[`cargo ktstr stats explain-sidecar`](#explain-sidecar) on the
-underlying run reports per-sidecar which optional fields are
-missing and what each absence means.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-E FILTER` | -- | Substring filter applied to the joined `scenario topology scheduler work_type` string. **Scope is limited**: `-E` does NOT match against `kernel`, `project_commit`, `kernel_commit`, or `run_source` — those are typed dimensions reachable only via the dedicated `--kernel` / `--project-commit` / `--kernel-commit` / `--run-source` flags. To narrow on those, use the typed flags. Composes with the typed dimension filters: typed narrows happen first, substring runs over the surviving set. |
-| `--kernel VER` (repeatable) | -- | Pin BOTH sides to the listed kernel version(s). Sugar for `--a-kernel V1 --a-kernel V2 --b-kernel V1 --b-kernel V2`. Per-side `--a-kernel` / `--b-kernel` REPLACES this shared value for that side only. Major.minor (`6.12`) prefix-matches; three-segment (`6.14.2`) is strict. |
-| `--scheduler NAME` (repeatable) | -- | Pin BOTH sides to the listed scheduler(s). Sugar for `--a-scheduler N1 --a-scheduler N2 --b-scheduler N1 --b-scheduler N2`. Per-side `--a-scheduler` / `--b-scheduler` REPLACES this shared value for that side only. OR-combined: a row matches iff its `scheduler` field equals ANY listed entry. Strict equality per entry. |
-| `--topology LABEL` (repeatable) | -- | Pin BOTH sides to the listed rendered topology label(s) (e.g. `1n2l4c2t`). Sugar for `--a-topology L1 --a-topology L2 --b-topology L1 --b-topology L2`. Per-side `--a-topology` / `--b-topology` REPLACES this shared value for that side only. OR-combined: a row matches iff its rendered topology label equals ANY listed entry. Strict equality per entry. |
-| `--work-type TYPE` (repeatable) | -- | Pin BOTH sides to the listed work_type(s) (PascalCase variants of `WorkType`, e.g. `SpinWait`). Sugar for `--a-work-type T1 --a-work-type T2 --b-work-type T1 --b-work-type T2`. Per-side `--a-work-type` / `--b-work-type` REPLACES this shared value for that side only. OR-combined: a row matches iff its `work_type` field equals ANY listed entry. Strict equality per entry. See [WorkSpec types](../concepts/work-types.md). |
-| `--project-commit HASH` (repeatable) | -- | Pin BOTH sides to listed `project_commit` value(s) (7-char hex, optional `-dirty` suffix). Also accepts git revspecs (`HEAD`, `HEAD~N`, tags, branches, `A..B` ranges) resolved against the project repo into the same 7-char short hashes; see `--help` for details. Filters the ktstr framework commit; the scheduler binary's commit (`SidecarResult::scheduler_commit`) is not currently exposed as a filter. |
-| `--kernel-commit HASH` (repeatable) | -- | Pin BOTH sides to listed `kernel_commit` value(s) (7-char hex, optional `-dirty` suffix). Also accepts git revspecs (`HEAD`, `HEAD~N`, tags, branches, `A..B` ranges) resolved against the kernel repo (`gix::open` against `KTSTR_KERNEL`'s path); see `--help` for details. Filters the kernel SOURCE TREE commit (`SidecarResult::kernel_commit`), distinct from the kernel release version (`--kernel`): two runs of the same `kernel_version` with different `kernel_commit` values represent the same release rebuilt from different trees. Rows whose `kernel_commit` is `None` (KTSTR_KERNEL pointed at a non-git path, the underlying source was Tarball / Git rather than a `Local` tree, or the gix probe failed) NEVER match a populated filter. |
-| `--run-source NAME` (repeatable) | -- | Pin BOTH sides to listed run-environment source(s). Filters `SidecarResult::run_source` set by `detect_run_source` at sidecar-write time: `"local"` for developer runs, `"ci"` when `KTSTR_CI` was set, or rewritten to `"archive"` at load time when `--dir` points at a non-default pool root. Rows whose `run_source` is `None` (sidecar pre-dates the field) NEVER match a populated filter — same opt-in policy as `--kernel` / `--project-commit` / `--kernel-commit`. Combine per-side `--a-run-source ci --b-run-source local` to contrast CI runs against developer runs of the same scenarios. |
-| `--resolve-source NAME` (repeatable) | -- | Pin BOTH sides to listed scheduler-resolution source(s) — HOW the scheduler binary was discovered for the run (`SidecarResult::resolve_source`; e.g. `auto_built`, `target_debug`, `target_release`, `sibling_dir`, `path`, `env_var`, `path_lookup`, `not_found`). OR-combined, strict equality. Distinct from `--run-source` (the run ENVIRONMENT): this is the scheduler discovery PATH. Rows whose `resolve_source` is `None` (sidecar pre-dates the field, or a skip resolved no binary) NEVER match a populated filter — same opt-in policy as `--run-source`. Combine per-side `--a-resolve-source auto_built --b-resolve-source target_debug` to contrast auto-built vs stale-target runs. |
-| `--cpu-budget N` (repeatable) | -- | Pin BOTH sides to listed effective host-CPU budget(s) — the number of host CPUs the run's vCPU threads ran on (`SidecarResult::cpu_budget`, decimal). `cpu_budget` is a PAIRING dimension: even without this flag, two runs of different budgets never pair, so a budget-confined run is never silently compared against a roomy one. Rows with no recorded budget (skip rows that never booted) never match. Use the per-side `--a-cpu-budget` / `--b-cpu-budget` to deliberately contrast budgets, and prefer the overcommit-invariant `worst_iterations_per_cpu_sec` metric over raw timing when you do. |
-| `--a-kernel VER` (repeatable) | -- | A-side kernel filter. Replaces the shared `--kernel` for the A side only. |
-| `--a-scheduler NAME` (repeatable) | -- | A-side scheduler filter, OR-combined. Replaces the shared `--scheduler` value for the A side only. |
-| `--a-topology LABEL` (repeatable) | -- | A-side topology filter, OR-combined. Replaces the shared `--topology` value for the A side only. |
-| `--a-work-type TYPE` (repeatable) | -- | A-side work_type filter, OR-combined. Replaces the shared `--work-type` value for the A side only. |
-| `--a-project-commit HASH` (repeatable) | -- | A-side project-commit filter. Replaces the shared `--project-commit` for the A side only. |
-| `--a-kernel-commit HASH` (repeatable) | -- | A-side kernel-commit filter. Replaces the shared `--kernel-commit` for the A side only. |
-| `--a-run-source NAME` (repeatable) | -- | A-side run-source filter. Replaces the shared `--run-source` for the A side only. |
-| `--a-resolve-source NAME` (repeatable) | -- | A-side resolve-source filter. Replaces the shared `--resolve-source` for the A side only. |
-| `--a-cpu-budget N` (repeatable) | -- | A-side cpu-budget filter. Replaces the shared `--cpu-budget` for the A side only. Use with `--b-cpu-budget` to contrast two host-CPU budgets. |
-| `--b-kernel VER` (repeatable) | -- | B-side kernel filter. Replaces the shared `--kernel` for the B side only. |
-| `--b-scheduler NAME` (repeatable) | -- | B-side scheduler filter, OR-combined. Replaces the shared `--scheduler` value for the B side only. |
-| `--b-topology LABEL` (repeatable) | -- | B-side topology filter, OR-combined. Replaces the shared `--topology` value for the B side only. |
-| `--b-work-type TYPE` (repeatable) | -- | B-side work_type filter, OR-combined. Replaces the shared `--work-type` value for the B side only. |
-| `--b-project-commit HASH` (repeatable) | -- | B-side project-commit filter. Replaces the shared `--project-commit` for the B side only. |
-| `--b-kernel-commit HASH` (repeatable) | -- | B-side kernel-commit filter. Replaces the shared `--kernel-commit` for the B side only. |
-| `--b-run-source NAME` (repeatable) | -- | B-side run-source filter. Replaces the shared `--run-source` for the B side only. |
-| `--b-resolve-source NAME` (repeatable) | -- | B-side resolve-source filter. Replaces the shared `--resolve-source` for the B side only. |
-| `--b-cpu-budget N` (repeatable) | -- | B-side cpu-budget filter. Replaces the shared `--cpu-budget` for the B side only. Use with `--a-cpu-budget` to contrast two host-CPU budgets. |
-| `--no-average` | off | Disable averaging. Each sidecar stays distinct; bails with an actionable error when multiple sidecars on the same side share the same pairing key (since pairing across sides becomes ambiguous). |
-| `--threshold PCT` | per-metric `default_rel` | Uniform relative significance threshold in percent. Overrides the per-metric `default_rel` for every metric; the absolute gate is always per-metric and cannot be tuned from the CLI. Mutually exclusive with `--policy`. |
-| `--policy FILE` | -- | Path to a JSON `ComparisonPolicy` file with per-metric thresholds. Schema: `{ "default_percent": N, "per_metric_percent": { "worst_spread": 5.0, ... } }`. Priority is per-metric override → `default_percent` → each metric's registry `default_rel`. Per-metric keys are rejected at load time if they do not match a metric in the `METRICS` registry. Mutually exclusive with `--threshold`. |
-| `--dir DIR` | `target/ktstr/` | Alternate runs root for pool collection. Defaults to `test_support::runs_root()` (typically `target/ktstr/`). Useful when comparing archived sidecar trees copied off a CI host. |
-
-#### Phase rendering
-
-The compare output renders per-phase tables in addition to the
-scalar findings table. The flags below tune that rendering. They
-are mutually exclusive with each other only where noted —
-`--no-phases` is the global suppress switch and conflicts with
-every other phase flag, and `--steps-only` and `--phase` are also
-mutually exclusive; the remaining pairings among `--phases-only` /
-`--steps-only` / `--phase` / `--phase-threshold` compose.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--no-phases` | off | Suppress the per-phase tables entirely; render only the scalar findings table. Mutually exclusive with every other `--phase…` flag below. |
-| `--phases-only` | off | Render ONLY the per-phase tables; suppress the scalar findings table and the scalar summary footer. The host-context delta still renders. Composes with `--steps-only`, `--phase`, `--phase-threshold`. |
-| `--steps-only` | off | Within the per-phase tables, suppress the BASELINE bucket (`step_index` 0) and render only scenario Step buckets. Useful when the BASELINE settle window is dominated by scheduler startup transients. Mutually exclusive with `--phase`; composes with `--phases-only` and `--phase-threshold`. |
-| `--phase N` | every phase | Render only the named phase index (single value, not repeatable). `0` selects BASELINE; `1..=N` select scenario Step ordinals (matched against `step_index`). Mutually exclusive with `--steps-only`. |
-| `--phase-threshold PCT` | inherits `--threshold` | Per-phase significance threshold in percent. Lets per-phase tables use a different threshold from the scalar comparison (e.g. tighter scalar gate but a looser per-phase gate for noisy boundary effects). Inherits the scalar `--threshold` (or registry `default_rel`) when unset. |
 
 ### Prerequisites
 
@@ -1246,9 +1062,9 @@ when the worktree differs).
 
 Compare `performance_mode` test metrics between HEAD and a baseline
 commit, exiting non-zero when a metric regresses past its threshold.
-The verdict reuses the same polarity-aware, abs+rel dual-gate engine as
-[`stats compare`](#stats) (`compare_partitions`): the baseline commit's
-sidecars are the A side, HEAD's are the B side, paired per scenario.
+The verdict uses a polarity-aware, abs+rel dual-gate engine: the
+baseline commit's sidecars are one side, HEAD's are the other, paired
+per scenario.
 It runs in any repo that consumes ktstr (it discovers the repo from the
 cwd). The primary use is a scheduler author asserting that a change does
 not regress a degenerate case: mark the degenerate-case scenarios
@@ -1258,7 +1074,7 @@ that adds a fix-flag is gated against the commit before it. The
 baseline is the merge-base with `main` by default, or any `--base` /
 `--base-ref` commit. The same shape is a CI perf-gate on a pull
 request. See the [A/B Compare Branches](../recipes/ab-compare.md) recipe
-for the manual `stats compare` equivalent.
+for a worked walkthrough.
 
 ```sh
 cargo ktstr perf-delta --dual-run --kernel 6.14            # HEAD vs merge-base(HEAD, main)
@@ -1282,20 +1098,11 @@ The resolved baseline is shortened to the 7-hex form the sidecar
 `project_commit` records, so it lines up with pooled runs directly. The
 command bails if the baseline resolves to HEAD (nothing to compare).
 
-**Two comparison axes:**
-
-- **commit axis** (default) — HEAD vs a baseline commit, partitioned by
-  `project_commit` (baseline resolution above; source models below).
-- **config axis** (`--a-scheduler X --b-scheduler Y`) — two scheduler
-  configs at the SAME commit, partitioned by `scheduler`: the "is config
-  B not slower than A on this case" gate. It compares runs already
-  pooled from a `cargo ktstr test` that exercised both schedulers (the
-  test declares the scheduler enums), so it needs no worktree and
-  conflicts with the commit-axis flags (`--base` / `--base-ref` /
-  `--dual-run`). Both `--a-scheduler` and `--b-scheduler` are required
-  together.
-
-The baseline resolution and source models below are the **commit axis**.
+`perf-delta` compares on the **commit axis**: HEAD vs a baseline commit,
+partitioned by `project_commit` (baseline resolution above; source
+models below). A cross-config question — e.g. scheduler A vs scheduler B
+at the same commit — is answered in-test via the Verdict DSL's
+`better_across_phases`, not by this command.
 
 **Two source models for the baseline run's sidecars:**
 
@@ -1328,11 +1135,10 @@ exits `0` — an empty perf set is "nothing to compare", not a failure.
 | `--default-branch BRANCH` | `main` | Merge-base target when no `--base`/`--base-ref`/`$GITHUB_BASE_REF`. |
 | `-E, --filter EXPR` | all `performance_mode` | Nextest filter narrowing within the `performance_mode` set. |
 | `--threshold PCT` | registry defaults | Uniform relative regression gate (percent). Mutually exclusive with `--policy`. |
-| `--policy PATH` | registry defaults | Per-metric threshold JSON. Mutually exclusive with `--threshold`. Schema: see [`stats compare`](#stats). |
-| `--noise-adjust N` | off | Self-tuning noise mode (commit axis only; requires `--kernel`): run each side N times and gate a confident regression on the two sides being SEPARATED (a two-sided Welch t-test at alpha=0.05, or fully disjoint `[min, max]` bands) AND MATERIAL (the registry `default_abs`/`default_rel` dual-gate), instead of a fixed `--threshold`. Implies dual-run production looped N times. Conflicts with `--a-scheduler`/`--b-scheduler`, `--threshold`, `--policy`, and `--dual-run`. |
+| `--policy PATH` | registry defaults | Per-metric threshold JSON. Mutually exclusive with `--threshold`. Schema: `{ "default_percent": N, "per_metric_percent": { "worst_spread": 5.0, ... } }` (priority: per-metric override → `default_percent` → each metric's registry `default_rel`). |
+| `--noise-adjust N` | off | Self-tuning noise mode (requires `--kernel`): run each side N times and gate a confident regression on the two sides being SEPARATED (a two-sided Welch t-test at alpha=0.05, or fully disjoint `[min, max]` bands) AND MATERIAL (the registry `default_abs`/`default_rel` dual-gate), instead of a fixed `--threshold`. Implies dual-run production looped N times. Conflicts with `--threshold`, `--policy`, and `--dual-run`. |
 | `--noise-spread-threshold PCT` | `5.0` | Per-side relative-spread limit (percent) above which `--noise-adjust` adds an ADVISORY "noisy spread" annotation to a metric's row. Advisory only — never suppresses a confident regression. Requires `--noise-adjust`. |
-| `--a-scheduler X` / `--b-scheduler Y` | — | CONFIG axis: compare two scheduler configs at the same commit (partitioned by `scheduler`). Both required together; conflict with the commit-axis flags `--base`/`--base-ref`/`--dual-run`. |
-| `--no-phases` / `--phases-only` / `--steps-only` / `--phase N` / `--phase-threshold PCT` | full per-phase render | Per-phase output projection (render-only; does not change the verdict). Same flags as `stats compare`. |
+| `--no-phases` / `--phases-only` / `--steps-only` / `--phase N` / `--phase-threshold PCT` | full per-phase render | Per-phase output projection for the `--noise-adjust` spread block (render-only; does not change the verdict). Each **requires `--noise-adjust`** — per-phase output exists only on the noise-adjusted path. |
 
 Runnable as `just perf-delta <kernel> [base]`.
 
@@ -1345,8 +1151,7 @@ policy, NUMA node count, kernel uname triple
 `/proc/sys/kernel/sched_*` tunable. Useful for diagnosing
 cross-run regressions that trace back to host-context drift
 (sysctl change, THP policy flip, hugepage reservation) or for
-confirming what `cargo ktstr stats compare` would record on
-the next run produced here.
+confirming what a future run produced here would record.
 
 ```sh
 cargo ktstr show-host
@@ -1361,10 +1166,9 @@ two outputs are byte-for-byte comparable when the host is
 unchanged.
 
 For historical drift between archived runs (host-side diff
-across two run partitions), use
-[`cargo ktstr stats compare`](#compare) — its host-delta
-section reports which host-context fields changed between
-side A and side B using the same `HostContext::diff` logic.
+across two run partitions), use [`perf-delta`](#perf-delta) — its host-delta section reports
+which host-context fields changed between the baseline and HEAD
+sides using the same `HostContext::diff` logic.
 
 ## show-thresholds
 

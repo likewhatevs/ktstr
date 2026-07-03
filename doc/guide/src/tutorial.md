@@ -862,8 +862,8 @@ post-run CLI workflow, not part of the test definition:
 ```sh
 cargo ktstr stats                                 # summary: gauntlet coverage, verifier, KVM stats
 cargo ktstr stats list                            # list runs with date, test count, arch
-cargo ktstr stats compare --a-kernel 6.14 \       # diff sidecar partitions defined by
-    --b-kernel 6.15                               #   per-side --a-X / --b-X filter flags
+cargo ktstr perf-delta --dual-run --kernel 6.14   # regression-gate HEAD vs the
+                                                  #   merge-base baseline commit
 ```
 
 Statistics are collected even on test failure (`if: !cancelled()` in

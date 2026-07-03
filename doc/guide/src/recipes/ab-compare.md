@@ -1,201 +1,105 @@
 # A/B Compare Branches
 
-> **Disambiguation**: this recipe covers **scheduler-behavior diffs
-> between branches** (per-metric scheduler-driven measurements via
-> `cargo ktstr stats compare` on two runs). For **host-context
-> diffs** (kernel build, CPU model, sched_\* tunables, NUMA layout
-> between machines or over time), see
-> [Capture and Compare Host State](host-state.md). Both recipes
-> invoke `cargo ktstr stats compare`; this recipe drives it by
-> partitioning two branch worktrees' runs on the `commit` dimension,
-> and the host-state recipe drives it the same way, reading the
-> host-delta from each sidecar's archived `host` field (`show-host`
-> there is for live/archived host inspection, not for feeding
-> `stats compare`).
+> **Disambiguation**: this recipe covers **scheduler-behavior
+> regression checks between a branch and its baseline** (per-metric
+> scheduler-driven measurements via `cargo ktstr perf-delta`). For
+> **host-context diffs** (kernel build, CPU model, sched_\* tunables,
+> NUMA layout), see [Capture and Compare Host State](host-state.md) —
+> `perf-delta` surfaces a host-delta section too, read from each
+> sidecar's archived `host` field.
 
-Compare scheduler behavior between two branches by running the
-same `#[ktstr_test]` suite against each, then using
-`cargo ktstr stats compare` to diff per-metric results with
-dual-gate (absolute and relative) significance and exit non-zero
-on any regression.
+Compare scheduler behavior between HEAD and a baseline branch by
+running the same `#[ktstr_test(performance_mode)]` scenarios against
+each, then diffing per-metric results with dual-gate (absolute and
+relative) significance and exiting non-zero on any regression.
+[`cargo ktstr perf-delta`](../running-tests/cargo-ktstr.md#perf-delta)
+is the single command for this: the baseline commit's sidecars are
+side A, HEAD's are side B, paired per scenario.
 
-> **Automated alternative**:
-> [`cargo ktstr perf-delta`](../running-tests/cargo-ktstr.md#perf-delta)
-> automates this entire flow for `performance_mode` tests — it
-> resolves the baseline as `merge-base(HEAD, <ref>)` (or a
-> `$GITHUB_BASE_REF` PR target), runs both commits (`--dual-run`
-> checks the baseline out in a `git worktree`), and drives the same
-> `stats compare` engine, exiting non-zero on a regression. Reach for
-> it as a CI perf-gate; use the manual steps below when you need
-> control over the worktrees, the test selection, or comparing
-> non-`performance_mode` runs.
+## Automated: `perf-delta --dual-run`
 
-## Setup worktrees
+`perf-delta` resolves the baseline as `merge-base(HEAD, <ref>)` (or a
+`$GITHUB_BASE_REF` PR target), then `--dual-run` checks the baseline
+out in a detached `git worktree`, runs both commits' `performance_mode`
+tests, and compares — no manual worktree bookkeeping.
 
-The examples below use the `scx` scheduler crate under
-`~/opensource/scx`; substitute your own scheduler crate's path and
-remote everywhere `scx` appears.
+```sh
+cd ~/opensource/scx                # the scheduler crate under test
+
+cargo ktstr perf-delta --dual-run --kernel ../linux                    # HEAD vs merge-base(HEAD, main)
+cargo ktstr perf-delta --dual-run --kernel ../linux --base-ref release # vs merge-base(HEAD, release)
+cargo ktstr perf-delta --dual-run --kernel ../linux -E cgroup_steady   # narrow the perf set
+cargo ktstr perf-delta --dual-run --kernel ../linux --threshold 5      # 5% uniform gate
+```
+
+The command exits non-zero when a metric regresses past its gate, so
+it drops straight into a CI perf-gate on a pull request. For a
+statistically robust verdict on a noisy box, use `--noise-adjust N` in
+place of `--dual-run` (the two are mutually exclusive): it produces N
+runs per side itself and gates a confident regression on the two sides
+being SEPARATED (Welch t-test or disjoint bands) AND MATERIAL (the
+registry dual-gate), instead of a fixed threshold. See
+[perf-delta](../running-tests/cargo-ktstr.md#perf-delta) for the full
+flag set.
+
+## Manual: compare already-pooled runs
+
+When you want control over the worktrees or the test selection — or
+you already have both runs' sidecars pooled from CI artifacts — run
+the two branches yourself and point `perf-delta --base` at the
+baseline commit; it compares the cached pool without producing new
+runs (so it needs no `--kernel`).
 
 ```sh
 cd ~/opensource/scx
 
-# Create a worktree for the baseline branch.
+# Baseline: check out and run the baseline branch's suite.
 git worktree add ~/opensource/scx-main upstream/main
-```
-
-## Collect both runs into a shared run root
-
-Each `cargo ktstr test` run (which drives cargo nextest under the
-hood) writes its sidecars into
-`target/ktstr/{kernel}-{project_commit}/`. The `{project_commit}`
-half is the project tree's HEAD short hex captured at first
-sidecar write (suffixed `-dirty` when the worktree differs from
-HEAD), so two branches with distinct HEADs land in distinct
-directories.
-Two back-to-back runs of the SAME kernel at the SAME commit
-reuse the same directory — the second run pre-clears any prior
-sidecars at first write, so each directory is a last-writer-wins
-snapshot of (kernel, project commit).
-
-> **Warning:** The two worktrees MUST be at distinct commits for
-> A/B comparison to work. If both checkouts share the same HEAD
-> (e.g. baseline branch and feature branch happen to be even),
-> the second run **overwrites** the first via the last-writer-wins
-> pre-clear and the comparison degenerates to "identical pool of
-> sidecars." Confirm distinct commits with `git -C ~/opensource/scx
-> rev-parse HEAD` and `git -C ~/opensource/scx-main rev-parse
-> HEAD` before invoking the second `cargo ktstr test`.
-
-Every sidecar also carries its own `project_commit` field (read
-from the project tree's git HEAD at sidecar-write time), so
-the runs from two branches land disjoint values on the `commit`
-dimension regardless of how the directories are named. The
-project commit is discovered by walking up from the test
-process's **current working directory** to find a `.git` marker
-— so the `cd ~/opensource/scx-main` / `cd ~/opensource/scx`
-steps below are load-bearing, not stylistic. Without them the
-probe would walk up from wherever you happened to invoke
-`cargo`, potentially ending at an entirely different repo and
-recording the wrong commit on every sidecar. The simplest
-collection workflow is to merge both branches' run
-subdirectories under one root and rely on
-`--a-project-commit` / `--b-project-commit` to partition them:
-
-```sh
-mkdir -p ~/opensource/scx-runs/ktstr
-
-# Baseline.
 cd ~/opensource/scx-main
-cargo ktstr test --kernel ../linux
-mv target/ktstr/* ~/opensource/scx-runs/ktstr/
+cargo ktstr test --kernel ../linux -- -E 'test(/performance_mode/)'
 
-# Experimental.
+# Experimental: run HEAD's suite.
 cd ~/opensource/scx
-cargo ktstr test --kernel ../linux
-mv target/ktstr/* ~/opensource/scx-runs/ktstr/
+cargo ktstr test --kernel ../linux -- -E 'test(/performance_mode/)'
+
+# Compare the pooled sidecars: HEAD vs the baseline commit.
+cargo ktstr perf-delta --base <baseline-short-hex>
 ```
 
-The `{kernel}-{project_commit}` subdirectory names are unique per
-(kernel, project commit) pair, so two branches with distinct
-HEADs coexist under one root without collision. Within a single
-branch, two clean back-to-back runs at the same commit reuse
-one directory (last-writer-wins via per-process pre-clear);
-mark one of them as `-dirty` (uncommitted change) or commit /
-amend between runs to land separate directories.
+Each `cargo ktstr test` run writes its sidecars into
+`target/ktstr/{kernel}-{project_commit}/`; the `{project_commit}` half
+is the project tree's HEAD short hex captured at first sidecar write
+(suffixed `-dirty` when the worktree differs from HEAD), so two
+branches with distinct HEADs land in distinct directories and coexist
+under one runs root. `perf-delta --base <hex>` partitions that pool by
+`project_commit`: the baseline commit's sidecars are side A, HEAD's are
+side B.
 
-Do **not** set `KTSTR_SIDECAR_DIR`: `cargo ktstr stats compare`
-walks `{CARGO_TARGET_DIR or "target"}/ktstr/` by default and would
-not see runs written to a custom flat directory unless `--dir DIR`
-is passed; `cargo ktstr stats list` has no `--dir` flag and honors
-only `CARGO_TARGET_DIR`.
+> **Warning:** the two runs MUST be at distinct commits. If both
+> checkouts share the same HEAD they land in the same directory and the
+> second run's pre-clear overwrites the first — the comparison
+> degenerates to an identical pool. Confirm distinct commits with
+> `git -C ~/opensource/scx rev-parse HEAD` before the second run.
 
-## Discover available dimension values
+The project commit is discovered by walking up from the test process's
+**current working directory** to the enclosing `.git`, so the `cd`
+steps are load-bearing: without them the probe records the wrong
+commit. Use
+[`cargo ktstr stats list-values`](../running-tests/cargo-ktstr.md#list-values)
+to see the `project_commit` values a pool actually carries before
+choosing `--base`.
 
-The framework records the project tree's git commit (discovered
-by walking parents of the test process's cwd to find the
-enclosing `.git`) on every sidecar via
-`SidecarResult::project_commit`, so two runs from different
-commits land disjoint values on the `commit` dimension and
-`--a-project-commit` / `--b-project-commit` slice between them
-without any per-run directory bookkeeping.
-Use
-`cargo ktstr stats list-values --dir DIR` to enumerate the
-distinct values of every filterable dimension (`kernel`,
-`commit`, `kernel_commit`, `source`, `resolve_source`,
-`cpu_budget`, `scheduler`, `topology`, `work_type`) present in the
-pool, so per-side filters target
-real values. The `commit` and `source` keys map to the
-internal `SidecarResult::project_commit` / `run_source` fields;
-the per-side filter flags spell as `--a-project-commit` /
-`--b-project-commit` and `--a-run-source` / `--b-run-source`
-on the [`compare`](../running-tests/cargo-ktstr.md#compare)
-subcommand.
+## Comparing configurations (not commits)
 
-```sh
-cd ~/opensource/scx
-CARGO_TARGET_DIR=~/opensource/scx-runs cargo ktstr stats list
-CARGO_TARGET_DIR=~/opensource/scx-runs cargo ktstr stats list-values
-```
-
-## Compare per-side filter groups
-
-```sh
-cd ~/opensource/scx
-CARGO_TARGET_DIR=~/opensource/scx-runs cargo ktstr stats compare \
-    --a-project-commit <baseline-short-hex> \
-    --b-project-commit <current-short-hex>
-```
-
-`stats compare` is pool-driven: every sidecar under the runs
-root is loaded into a single pool, and per-side filter flags
-(`--a-X` / `--b-X`) partition the pool into the A and B
-contrasts. The dimensions on which the A and B filters DIFFER
-are the *slicing* dimensions of the contrast; every other
-dimension is part of the dynamic *pairing key* the comparison
-joins on. Slicing on `project-commit` alone joins each
-baseline scenario with its matching experimental counterpart
-on every other dimension (kernel, kernel-commit, run-source,
-resolve-source, cpu-budget, scheduler, topology, work_type).
-
-Other slicing axes work the same way:
-
-```sh
-# Slice on kernel.
-cargo ktstr stats compare --a-kernel 6.14 --b-kernel 7.0
-
-# Slice on scheduler, pin both sides to one kernel.
-cargo ktstr stats compare \
-    --a-scheduler scx_rusty --b-scheduler scx_lavd \
-    --kernel 6.14
-```
-
-Shared `--X` flags pin BOTH sides to the same value; per-side
-`--a-X` / `--b-X` REPLACE the corresponding shared `--X` for
-that side only ("more-specific replaces"). Slicing on more
-than one dimension at once prints a stderr warning but is
-supported for cohort sweeps.
-
-`compare` applies the dual-gate significance check from the
-unified `MetricDef` registry to every metric and prints colored
-output (red = regression, green = improvement). Rows where
-either side has `passed=false` are dropped from the math and
-counted in the summary line; the exit code is non-zero when
-any regression is detected, so the command can gate CI
-directly. Narrow further with `-E SUBSTRING` (matches the
-joined `scenario topology scheduler work_type` string),
-override the relative gate uniformly with `--threshold PCT`
-or per-metric via `--policy FILE`. The absolute gate from each
-`MetricDef` is unaffected by `--threshold` — a delta must
-clear both gates to count as significant.
-
-See [`stats compare`](../running-tests/cargo-ktstr.md#compare)
-for the full per-side flag table and validation rules, and
-[`stats list-values`](../running-tests/cargo-ktstr.md#list-values)
-for the discovery counterpart.
+`perf-delta` compares on the commit axis (HEAD vs a baseline). A
+cross-config question — scheduler A vs scheduler B, or two tunings, at
+the SAME commit — is answered in-test via the Verdict DSL's
+`better_across_phases`: the test declares both configurations and
+asserts the relationship directly, so the verdict travels with the
+test rather than a separate compare invocation.
 
 ## Cleanup
 
 ```sh
 git worktree remove ~/opensource/scx-main
-rm -rf ~/opensource/scx-runs
 ```

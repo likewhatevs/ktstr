@@ -62,4 +62,5 @@
 - [Troubleshooting](troubleshooting.md)
 - [Environment Variables](reference/environment-variables.md)
 - [ctprof](reference/ctprof.md)
+- [Assertable Metrics](reference/assertable-metrics.md)
 - [API Reference](reference/api.md)
