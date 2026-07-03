@@ -4042,3 +4042,41 @@ fn parse_completions_binary_override() {
     };
     assert_eq!(binary, "ktstr");
 }
+
+/// A perf-delta flag REMOVED from the native surface (the per-side A/B axis,
+/// moved in-test to the Verdict DSL `better_across_phases`) must surface as a
+/// clean top-level clap "unexpected argument" error, NOT be forwarded verbatim
+/// into the nextest passthrough (which produced a confusing nested error).
+/// `argsplit::rewrite` routes the rejected flag into the ktstr bucket (before
+/// the emitted `--`) so clap rejects it by name.
+#[test]
+fn parse_perf_delta_removed_ab_flag_is_clean_unknown_flag_error() {
+    for flag in ["--a-scheduler", "--b-scheduler", "--a-topology", "--b-topology"] {
+        // Both the space-separated (`--a-scheduler scx_foo`) and the =value
+        // (`--a-scheduler=scx_foo`) forms take distinct partition code paths
+        // (the latter splits the token at `=`); both must route the flag into
+        // the ktstr bucket for a clean clap error rather than the passthrough.
+        let eq_form = format!("{flag}=scx_foo");
+        let forms: [Vec<&str>; 2] = [
+            vec!["cargo", "ktstr", "perf-delta", flag, "scx_foo"],
+            vec!["cargo", "ktstr", "perf-delta", eq_form.as_str()],
+        ];
+        for argv in forms {
+            let raw: Vec<std::ffi::OsString> = argv.iter().map(std::ffi::OsString::from).collect();
+            let rewritten = crate::argsplit::rewrite(&Cargo::command(), &raw);
+            let err = Cargo::try_parse_from(&rewritten).err().unwrap_or_else(|| {
+                panic!("removed flag {flag} ({argv:?}) must be rejected, not forwarded to nextest")
+            });
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "removed flag {flag} ({argv:?}) must yield a clean UnknownArgument error; got {:?}",
+                err.kind(),
+            );
+            assert!(
+                err.to_string().contains(flag),
+                "the error must name the offending flag {flag} ({argv:?}); got: {err}",
+            );
+        }
+    }
+}

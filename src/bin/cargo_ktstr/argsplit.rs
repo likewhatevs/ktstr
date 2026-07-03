@@ -17,6 +17,12 @@
 //! so clap parses the ktstr flags in any order and the passthrough
 //! lands in the `last = true` field verbatim.
 //!
+//! The auto-derived oracle above covers a subcommand's LIVE flags. One
+//! deliberately hand-maintained exception ([`rejected_flags`]): flags REMOVED
+//! from a subcommand's native surface are routed into the ktstr bucket too, so
+//! clap emits a clean top-level unknown-flag error instead of forwarding a
+//! stale flag to the inner tool as a confusing nested error.
+//!
 //! A user-supplied `--` is honored as a hard passthrough boundary
 //! (everything after it is passthrough, even a token spelled like a
 //! ktstr flag). A token that SHARES a spelling with a ktstr flag —
@@ -67,7 +73,11 @@ pub(crate) fn rewrite(root: &clap::Command, argv: &[OsString]) -> Vec<OsString> 
     }
 
     let (longs, shorts) = owned_flags(sub);
-    let (ktstr_bucket, pass_bucket) = partition(&argv[3..], &longs, &shorts);
+    // Key the denylist on the RESOLVED command's canonical name (sub was
+    // matched by name-or-alias at line above), not the raw argv token, so an
+    // aliased spelling still gets the rejected-flag treatment.
+    let (ktstr_bucket, pass_bucket) =
+        partition(&argv[3..], &longs, &shorts, rejected_flags(sub.get_name()));
 
     let mut out = Vec::with_capacity(argv.len() + 1);
     out.push(argv[0].clone());
@@ -121,6 +131,22 @@ fn owned_flags(sub: &clap::Command) -> (HashMap<String, bool>, HashMap<char, boo
     (longs, shorts)
 }
 
+/// Flags removed from a subcommand's native surface that users still reach for.
+/// On a lookup miss [`partition`] routes these into the ktstr bucket (not the
+/// nextest passthrough) so clap emits a clean top-level "unexpected argument"
+/// error rather than forwarding them to the inner tool as a confusing nested
+/// error. Names carry NO leading `--` (matching the `longs` keys). Empty for
+/// every subcommand except `perf-delta`, whose per-side A/B axis
+/// (`--a-scheduler` / `--b-scheduler` / `--a-topology` / `--b-topology`) was
+/// removed; cross-config comparison now lives in-test in the Verdict DSL
+/// (`better_across_phases`), so those flags no longer exist on the command.
+fn rejected_flags(sub_name: &str) -> &'static [&'static str] {
+    match sub_name {
+        "perf-delta" => &["a-scheduler", "b-scheduler", "a-topology", "b-topology"],
+        _ => &[],
+    }
+}
+
 /// Split `tail` into (ktstr-owned tokens, passthrough tokens). See the
 /// module doc for the rules; a literal `--` ends the scan (its
 /// remainder is passthrough and the `--` itself is dropped, since
@@ -129,6 +155,7 @@ fn partition(
     tail: &[OsString],
     longs: &HashMap<String, bool>,
     shorts: &HashMap<char, bool>,
+    rejected: &[&str],
 ) -> (Vec<OsString>, Vec<OsString>) {
     let mut ktstr: Vec<OsString> = Vec::new();
     let mut pass: Vec<OsString> = Vec::new();
@@ -155,6 +182,14 @@ fn partition(
                             i += 1;
                         }
                     }
+                    // A flag REMOVED from this subcommand's native surface that
+                    // the user still typed: route it into the ktstr bucket (not
+                    // the nextest passthrough) so clap emits a clean top-level
+                    // "unexpected argument" error instead of forwarding a stray
+                    // --flag to the inner tool as a confusing nested error. A
+                    // space-separated value (if any) stays in `pass`; clap errors
+                    // on the flag first, so it never matters.
+                    None if rejected.contains(&flag) => ktstr.push(tok.clone()),
                     None => pass.push(tok.clone()),
                 }
             }
