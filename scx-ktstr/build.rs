@@ -290,6 +290,31 @@ fn fetch_via_tarball(url: &str, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Config-section filter for the fallback clone: keep gix's default trust gate
+/// but DROP global (`~/.gitconfig`) and system (`/etc/gitconfig`) config — the
+/// user- and admin-writable sources where a `url.<base>.insteadOf` rewrite
+/// (commonly `git@github.com:` insteadOf `https://github.com/`) turns the HTTPS
+/// clone URL below into an SSH one, which prompts for a key passphrase and fails
+/// non-interactively / behind a proxy. Every OTHER source is left intact:
+/// repository-local (empty for a fresh clone), override/env/API, and
+/// git-installation config — so a site-provided mirror rewrite in the shipped
+/// git config still applies, and absent any rewrite the HTTPS URL is used
+/// verbatim.
+fn clone_config_skips_global_system(meta: &gix::config::file::Metadata) -> bool {
+    use gix::config::source::Kind;
+    gix::config::section::is_trusted(meta)
+        && !matches!(meta.source.kind(), Kind::Global | Kind::System)
+}
+
+/// gix open options mirroring `gix::prepare_clone`'s git-binary config, minus
+/// the global/system config sources (see [`clone_config_skips_global_system`]).
+fn clone_open_options() -> gix::open::Options {
+    use gix::sec::trust::DefaultForLevel;
+    let mut opts = gix::open::Options::default_for_level(gix::sec::Trust::Full);
+    opts.permissions.config.git_binary = true;
+    opts.filter_config_section(clone_config_skips_global_system)
+}
+
 /// Shallow-clone the tag and copy `SCX_FETCH_FILES` into `dest` via a
 /// stage directory. Used as a fallback when the GitHub archive
 /// tarball cannot be reached.
@@ -305,9 +330,15 @@ fn fetch_via_clone(dest: &Path) -> Result<(), String> {
     let url = "https://github.com/sched-ext/scx.git";
     let interrupt = std::sync::atomic::AtomicBool::new(false);
 
-    let mut prep = gix::prepare_clone(url, &work)
-        .map_err(|e| format!("prepare_clone: {e}"))?
-        .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
+    let mut prep = gix::clone::PrepareFetch::new(
+        url,
+        &work,
+        gix::create::Kind::WithWorktree,
+        gix::create::Options::default(),
+        clone_open_options(),
+    )
+    .map_err(|e| format!("prepare_clone: {e}"))?
+    .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
             1.try_into().expect("non-zero depth"),
         ))
         .with_ref_name(Some(SCX_TAG))
