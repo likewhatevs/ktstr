@@ -2686,6 +2686,34 @@ fn noise_phase_findings_disambiguate_by_pairing_key_across_topologies() {
 }
 
 #[test]
+fn summarize_side_runs_categorizes_by_exclusion() {
+    // A skipped run (is_skip); a failed run (passed=false, not skipped/inc =>
+    // is_fail); a comparable run (passed=true). `comparable` must equal the
+    // count noise_findings keeps, so a zero explains an empty comparison.
+    let mut skip = cmp_row("s", "tiny-1llc", false, 0.0, 0);
+    skip.skipped = true;
+    let fail = cmp_row("s", "tiny-1llc", false, 0.0, 0);
+    let pass = cmp_row("s", "tiny-1llc", true, 0.0, 0);
+
+    // All skipped -> 0 comparable; the breakdown names the skips (the perf-delta
+    // "no comparable runs to pair" diagnostic reads this).
+    let (ok, desc) = summarize_side_runs(&[skip.clone(), skip.clone(), skip.clone()]);
+    assert_eq!(ok, 0, "all skipped -> 0 comparable: {desc}");
+    assert!(
+        desc.contains("3 run(s)") && desc.contains("0 comparable") && desc.contains("3 skipped"),
+        "breakdown names the skipped runs: {desc}"
+    );
+
+    // Mixed: 1 pass + 1 skip + 1 fail -> 1 comparable, both exclusions named.
+    let (ok2, desc2) = summarize_side_runs(&[pass, skip, fail]);
+    assert_eq!(ok2, 1, "one pass is comparable: {desc2}");
+    assert!(
+        desc2.contains("1 comparable") && desc2.contains("1 skipped") && desc2.contains("1 failed"),
+        "mixed breakdown names each excluded category: {desc2}"
+    );
+}
+
+#[test]
 fn noise_findings_classifies_both_polarities() {
     // Both polarities WORSEN: worst_spread (LowerBetter) rises 10->15;
     // total_iterations (HigherBetter) drops 2000->1000. Both sides clean (spread

@@ -2535,6 +2535,53 @@ fn noise_phase_findings(
     }
 }
 
+/// Summarize a side's loaded runs by why each is or isn't comparable, using the
+/// SAME exclusions [`noise_findings`] applies (skip / fail / inconclusive /
+/// expected-failure). Returns `(comparable_count, human_summary)` so an empty
+/// comparison can explain WHY — e.g. every run was skipped — instead of the bare
+/// "nothing to compare". The `comparable_count` equals the number of rows
+/// `noise_findings` would keep (a row is comparable iff none of the four
+/// exclusions hold), so a zero here is exactly why the side produced no findings.
+pub(crate) fn summarize_side_runs(rows: &[GauntletRow]) -> (usize, String) {
+    let (mut skipped, mut failed, mut inconclusive, mut xfail, mut comparable) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+    for r in rows {
+        if r.is_skip() {
+            skipped += 1;
+        } else if r.is_fail() {
+            failed += 1;
+        } else if r.is_inconclusive() {
+            inconclusive += 1;
+        } else if r.expected_failure {
+            xfail += 1;
+        } else {
+            comparable += 1;
+        }
+    }
+    let mut excluded = Vec::new();
+    if skipped > 0 {
+        excluded.push(format!("{skipped} skipped"));
+    }
+    if failed > 0 {
+        excluded.push(format!("{failed} failed"));
+    }
+    if inconclusive > 0 {
+        excluded.push(format!("{inconclusive} inconclusive"));
+    }
+    if xfail > 0 {
+        excluded.push(format!("{xfail} expected-failure"));
+    }
+    let breakdown = if excluded.is_empty() {
+        "none excluded".to_string()
+    } else {
+        excluded.join(", ")
+    };
+    (
+        comparable,
+        format!("{} run(s): {comparable} comparable ({breakdown})", rows.len()),
+    )
+}
+
 /// Noise-adjusted variant of [`compare_partitions`]: instead of averaging each
 /// side's runs into one mean and gating on a fixed threshold, it keeps every run
 /// ([`RowPrep::PerRunPooled`]), summarizes each side per metric as a `mean` over its
@@ -2563,6 +2610,12 @@ fn noise_phase_findings(
 /// confident-regression count), matching the scalar per-phase pass; the footer
 /// appends per-phase counts only when per-phase data exists and no phase filter
 /// is active.
+///
+/// When no scenario pairs, the aggregate note breaks down each side's loaded
+/// runs via [`summarize_side_runs`] — naming skipped / failed / inconclusive
+/// runs — so an all-skipped comparison (e.g. a non-`performance_mode` test under
+/// perf-delta's `KTSTR_PERF_ONLY`) is explained, not silently reported as
+/// "nothing to compare".
 pub fn compare_partitions_noise(
     filter_a: &RowFilter,
     filter_b: &RowFilter,
@@ -2600,10 +2653,33 @@ pub fn compare_partitions_noise(
             // A metric is omitted when both sides' means are ~zero, it read on
             // only one side, or it is a render-suppressed rate component.
             if report.paired_scenarios == 0 {
+                // Explain WHY nothing paired instead of a bare "nothing to
+                // compare": prepare_partitioned_comparison already bailed if a
+                // side loaded ZERO rows, so both sides have >=1 run here — the
+                // pairing failure is either all-excluded runs (skip/fail/etc.)
+                // or a genuine scenario mismatch. Break down each side so a
+                // skipped-on-both-sides run (the common perf-delta case: a
+                // non-performance_mode test under KTSTR_PERF_ONLY) is named.
+                let (a_ok, a_desc) = summarize_side_runs(&prepared.rows_a_for_compare);
+                let (b_ok, b_desc) = summarize_side_runs(&prepared.rows_b_for_compare);
                 println!(
-                    "perf-delta --noise-adjust: no paired scenario across the two runs — \
-                     nothing to compare"
+                    "perf-delta --noise-adjust: no comparable runs to pair across the two runs."
                 );
+                println!("  {label_a} — {a_desc}");
+                println!("  {label_b} — {b_desc}");
+                if a_ok == 0 || b_ok == 0 {
+                    println!(
+                        "  A skipped run carries no metrics: perf-delta runs with \
+                         KTSTR_PERF_ONLY, which skips any test not marked \
+                         #[ktstr_test(performance_mode = true)]; host-gated skips land here \
+                         too. A failed / inconclusive run is excluded from the spread math."
+                    );
+                } else {
+                    println!(
+                        "  Both sides produced comparable runs but share no scenario / topology \
+                         / work_type — the two selections have no common test to contrast."
+                    );
+                }
             } else {
                 println!(
                     "perf-delta --noise-adjust: no metric to display — every compared metric \
