@@ -114,8 +114,11 @@ pub(crate) enum KtstrCommand {
         /// `--kernel`, a path, a cache key, or a git source.
         #[arg(long, help = INCLUDE_EOL_HELP)]
         include_eol: bool,
-        /// Arguments passed through to cargo nextest run.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Arguments passed through to cargo nextest run. Native flags
+        /// may appear in any order relative to these (no `--` separator
+        /// needed); to forward a token that shares a name with a native
+        /// flag (e.g. nextest's own `--profile`), place it after a `--`.
+        #[arg(last = true)]
         args: Vec<String>,
     },
     /// Build the kernel (if needed) and run tests with coverage via
@@ -163,8 +166,12 @@ pub(crate) enum KtstrCommand {
         /// `--kernel`, a path, a cache key, or a git source.
         #[arg(long, help = INCLUDE_EOL_HELP)]
         include_eol: bool,
-        /// Arguments passed through to cargo llvm-cov nextest.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Arguments passed through to cargo llvm-cov nextest. Native
+        /// flags may appear in any order relative to these (no `--`
+        /// separator needed); to forward a token that shares a name with
+        /// a native flag (e.g. nextest's own `--profile`), place it after
+        /// a `--`.
+        #[arg(last = true)]
         args: Vec<String>,
     },
     /// Run `cargo llvm-cov` with arbitrary arguments.
@@ -201,8 +208,11 @@ pub(crate) enum KtstrCommand {
         /// `--kernel`, a path, a cache key, or a git source.
         #[arg(long, help = INCLUDE_EOL_HELP)]
         include_eol: bool,
-        /// Arguments passed through to cargo llvm-cov.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Arguments passed through to cargo llvm-cov. Native flags may
+        /// appear in any order relative to these (no `--` separator
+        /// needed); to forward a token that shares a name with a native
+        /// flag (e.g. nextest's own `--profile`), place it after a `--`.
+        #[arg(last = true)]
         args: Vec<String>,
     },
     /// Print sidecar analysis from the most recent test run.
@@ -269,12 +279,14 @@ pub(crate) enum KtstrCommand {
         nextest_profile: Option<String>,
         /// cargo/nextest flags forwarded verbatim to `cargo nextest run`
         /// when `--exec` re-runs the failed tests (`--features …`,
-        /// `--cargo-profile …`). No `--` separator required, but place
-        /// them AFTER the native flags (`--dir` / `--filter` / `--exec` /
-        /// `--profile` / `--nextest-profile`): the trailing capture starts
-        /// at the first unrecognized token. Ignored on the dry-run path,
-        /// which prints only the filter expression.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// `--cargo-profile …`). Native flags may appear in ANY order
+        /// relative to these — the argv split (see the `argsplit` module)
+        /// routes each token to ktstr or the passthrough by name, so a
+        /// `--` separator is not required. To forward a token that shares
+        /// a name with a native flag (e.g. this command's own `-E` /
+        /// `--profile`), place it after a `--`. Ignored on the dry-run
+        /// path, which prints only the filter expression.
+        #[arg(last = true)]
         args: Vec<String>,
     },
     /// Compare `performance_mode` test metrics between HEAD and a
@@ -416,10 +428,12 @@ pub(crate) enum KtstrCommand {
         nextest_profile: Option<String>,
         /// cargo/nextest flags forwarded verbatim to BOTH sides'
         /// `cargo ktstr test` on the dual-run / noise-adjust production
-        /// path (e.g. `--features integration,wprof`). No `--` separator
-        /// required, but place them AFTER the native flags: the trailing
-        /// capture starts at the first unrecognized token.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// path (e.g. `--features integration,wprof`). Native flags may
+        /// appear in ANY order relative to these (the argv split routes
+        /// by name), so no `--` separator is required; to forward a token
+        /// that shares a name with a native flag (e.g. `-E` / `--profile`),
+        /// place it after a `--`.
+        #[arg(last = true)]
         args: Vec<String>,
     },
     /// Manage cached kernel images.
@@ -500,12 +514,12 @@ pub(crate) enum KtstrCommand {
         include_eol: bool,
         /// cargo/nextest flags forwarded verbatim to the inner
         /// `cargo nextest run` — a nextest filterset, `--cargo-profile`,
-        /// etc. No `--` separator
-        /// is required, but place them AFTER the native flags (`--kernel`
-        /// / `--raw` / `--profile` / `--nextest-profile`): the trailing
-        /// capture starts at the first unrecognized token, so a
-        /// passthrough flag placed before a native one swallows it.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// etc. Native flags (`--kernel` / `--raw` / `--profile` /
+        /// `--nextest-profile`) may appear in ANY order relative to these
+        /// (the argv split routes by name), so no `--` separator is
+        /// required; to forward a token that shares a name with a native
+        /// flag (e.g. nextest's own `--profile`), place it after a `--`.
+        #[arg(last = true)]
         args: Vec<String>,
     },
     /// Throw a costume party for a JSON dump — replaces every

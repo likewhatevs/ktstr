@@ -92,6 +92,22 @@ fn parse_compare(extra: &[&str]) -> StatsCommand {
     sc
 }
 
+/// Parse a full `cargo ktstr <sub> …` argv through the SAME pre-parse
+/// split `main` applies (the `argsplit` module) and then clap, returning
+/// the [`KtstrCommand`]. Use this — NOT a bare `Cargo::try_parse_from` —
+/// for the passthrough subcommands (test / coverage / llvm-cov /
+/// verifier / replay / perf-delta) so a no-`--` invocation with ktstr
+/// flags interleaved among nextest passthrough args parses exactly as it
+/// does in production. Panics if clap rejects the rewritten argv.
+fn parse_via_split(argv: &[&str]) -> KtstrCommand {
+    let raw: Vec<std::ffi::OsString> = argv.iter().map(std::ffi::OsString::from).collect();
+    let rewritten = crate::argsplit::rewrite(&Cargo::command(), &raw);
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(&rewritten).unwrap_or_else(|e| panic!("{e}"));
+    k.command
+}
+
 #[test]
 fn parse_perf_delta_flags_and_defaults() {
     // Explicit flags round-trip (kebab-case subcommand `perf-delta`).
@@ -693,7 +709,7 @@ fn parse_test_include_eol_flag() {
     );
 }
 
-/// Pin `trailing_var_arg` args forwarded verbatim after `--`.
+/// Pin passthrough args (the `last = true` field) forwarded verbatim after `--`.
 #[test]
 fn parse_test_with_passthrough_args() {
     assert_passthrough_args("test", &["-p", "ktstr", "--no-capture"]);
@@ -719,7 +735,7 @@ fn parse_nextest_alias_dispatches_to_test() {
 }
 
 /// `nextest` alias carries trailing args through the same
-/// `trailing_var_arg` pipeline as `test`. Pins the alias's
+/// passthrough (`last = true`) pipeline as `test`. Pins the alias's
 /// passthrough behaviour byte-exactly so a clap regression
 /// that treated the alias as a distinct parse tree surfaces
 /// here rather than in runtime dispatch.
@@ -882,7 +898,7 @@ fn parse_coverage_with_profile_flags() {
     );
 }
 
-/// Pin `trailing_var_arg` args forwarded verbatim after `--`.
+/// Pin passthrough args (the `last = true` field) forwarded verbatim after `--`.
 #[test]
 fn parse_coverage_with_passthrough_args() {
     assert_passthrough_args(
@@ -992,7 +1008,7 @@ fn parse_llvm_cov_include_eol_flag() {
     );
 }
 
-/// Pin `trailing_var_arg` args forwarded verbatim after `--`.
+/// Pin passthrough args (the `last = true` field) forwarded verbatim after `--`.
 #[test]
 fn parse_llvm_cov_with_passthrough_args() {
     assert_passthrough_args(
@@ -2565,32 +2581,26 @@ fn parse_kernel_build_force_clean_and_extra_kconfig_compose() {
 
 /// Non-build subcommands that accept `--extra-kconfig` would
 /// silently produce wrong cache lookups. The flag is `kernel
-/// build`-only at the configuration layer; this test pins the
-/// parse-level reject for `shell` — the one CLEAN clap surface
-/// with no `trailing_var_arg` passthrough — while the sibling
-/// passthrough tests pin that the passthrough subcommands forward
-/// it downstream instead.
+/// build`-only at the configuration layer; this test pins that a
+/// passthrough subcommand (verifier) forwards it downstream, while
+/// the sibling `shell` test pins the parse-level reject for a
+/// non-passthrough subcommand.
 ///
 /// Subcommands and their behavior:
-/// - `shell`: REJECTS at parse time (no trailing_var_arg).
-///   Pin via `try_parse_from` returning `Err`.
-/// - `verifier` / `test` / `coverage` / `llvm-cov`: PASSTHROUGH
-///   via `args: Vec<String>` with `trailing_var_arg = true,
-///   allow_hyphen_values = true`. Clap forwards `--extra-kconfig
-///   ...` as trailing args to `cargo nextest run` (or
-///   `cargo llvm-cov`), which then rejects it as an unknown
-///   cargo flag — but at the cargo subprocess layer, NOT at
-///   parse time. This is a structural property of clap's
-///   trailing-var-arg shape and is consistent across every
-///   passthrough subcommand on `cargo ktstr`. We pin these as
-///   args-capture, NOT parse errors, because that is the actual
-///   shape — the rejection happens downstream in the cargo
-///   subprocess.
+/// - `shell`: REJECTS at parse time — not a passthrough subcommand,
+///   so `argsplit::rewrite` leaves its argv unchanged and clap has
+///   no `args` field to absorb the unknown flag. Pin via
+///   `try_parse_from` returning `Err`.
+/// - `verifier` / `test` / `coverage` / `llvm-cov`: PASSTHROUGH via
+///   the `args: Vec<String>` (`last = true`) field. `argsplit::rewrite`
+///   routes an unknown `--extra-kconfig ...` into the passthrough, so
+///   it reaches `cargo nextest run` (or `cargo llvm-cov`), which then
+///   rejects it as an unknown cargo flag — at the cargo subprocess
+///   layer, NOT at parse time. We pin these as args-capture, NOT
+///   parse errors, because that is the actual shape.
 #[test]
 fn parse_extra_kconfig_passes_through_verifier_subcommand_to_args_vec() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
+    let KtstrCommand::Verifier { args, .. } = parse_via_split(&[
         "cargo",
         "ktstr",
         "verifier",
@@ -2598,15 +2608,13 @@ fn parse_extra_kconfig_passes_through_verifier_subcommand_to_args_vec() {
         "../linux",
         "--extra-kconfig",
         "/tmp/x.kconfig",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Verifier { args, .. } = k.command else {
+    ]) else {
         panic!("expected KtstrCommand::Verifier");
     };
     assert_eq!(
         args,
         vec!["--extra-kconfig", "/tmp/x.kconfig"],
-        "verifier has no native --extra-kconfig, so trailing_var_arg forwards \
+        "verifier has no native --extra-kconfig, so the argv split routes \
          it into `args` (the inner cargo nextest run rejects it downstream) — \
          verifier is a passthrough subcommand like test/coverage, NOT a \
          clean-surface reject like shell",
@@ -2625,38 +2633,34 @@ fn parse_extra_kconfig_rejected_on_shell_subcommand() {
     assert!(
         m.is_err(),
         "--extra-kconfig must be rejected on `cargo ktstr shell` \
-         (shell has no trailing_var_arg, so unknown flags fail at parse time)",
+         (shell is not a passthrough subcommand — no `last = true` args \
+         field and argsplit leaves its argv unchanged — so unknown flags \
+         fail at parse time)",
     );
 }
 
-/// Documents the passthrough behavior on `test` /
-/// `coverage` / `llvm-cov`: clap's `trailing_var_arg = true`
-/// on `args: Vec<String>` SWALLOWS `--extra-kconfig` as a
-/// positional argument forwarded to `cargo nextest run` /
-/// `cargo llvm-cov`. The rejection happens later, at the
-/// cargo subprocess layer, not at parse time. Pin the
-/// shape so a future change to the trailing_var_arg shape
-/// (e.g. removing it) surfaces here as a behavior change.
+/// Documents the passthrough behavior on `test` / `coverage` /
+/// `llvm-cov`: `argsplit::rewrite` routes an unknown `--extra-kconfig`
+/// into the `args: Vec<String>` (`last = true`) field, forwarded to
+/// `cargo nextest run` / `cargo llvm-cov`. The rejection happens later,
+/// at the cargo subprocess layer, not at parse time. Pin the shape so a
+/// future change to the passthrough routing surfaces here.
 #[test]
 fn parse_extra_kconfig_passes_through_test_subcommand_to_args_vec() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
+    let KtstrCommand::Test { args, .. } = parse_via_split(&[
         "cargo",
         "ktstr",
         "test",
         "--extra-kconfig",
         "/tmp/x.kconfig",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Test { args, .. } = k.command else {
+    ]) else {
         panic!("expected KtstrCommand::Test");
     };
     assert_eq!(
         args,
         vec!["--extra-kconfig", "/tmp/x.kconfig"],
         "--extra-kconfig must passthrough into `args` Vec on test \
-         subcommand (trailing_var_arg = true). The cargo nextest \
+         subcommand (the argv split routes it there). The cargo nextest \
          subprocess will reject it as an unknown flag downstream."
     );
 }
@@ -2854,15 +2858,15 @@ fn parse_verifier_with_scheduler() {
 }
 
 /// The trailing `args` forward cargo/nextest flags to the inner
-/// `cargo nextest run` with NO `--` separator — the headline of the
-/// verifier feature-passthrough fix. clap's `trailing_var_arg` +
-/// `allow_hyphen_values` captures `--features integration` into `args`
-/// once the preceding native flag (`--kernel`) has consumed its value.
+/// `cargo nextest run` with NO `--` separator. The argv split (the bin's
+/// `argsplit` module) routes `--kernel` to the native flag and
+/// `--features integration` to the passthrough `args` (`last = true`) by
+/// name, regardless of their order.
 #[test]
 fn parse_verifier_forwards_flags_without_separator() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
+    let KtstrCommand::Verifier {
+        kernel, raw, args, ..
+    } = parse_via_split(&[
         "cargo",
         "ktstr",
         "verifier",
@@ -2870,12 +2874,7 @@ fn parse_verifier_forwards_flags_without_separator() {
         "../linux",
         "--features",
         "integration",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Verifier {
-        kernel, raw, args, ..
-    } = k.command
-    else {
+    ]) else {
         panic!("expected Verifier");
     };
     assert_eq!(kernel, vec!["../linux"], "--kernel parsed as a native flag");
@@ -2887,16 +2886,14 @@ fn parse_verifier_forwards_flags_without_separator() {
     );
 }
 
-/// Ordering caveat: `trailing_var_arg` capture begins at the FIRST
-/// unrecognized token, so a passthrough flag placed BEFORE the native
-/// flags swallows them. Pins clap's behavior so a future clap bump (or
-/// an arg-order change) can't silently regress the "native flags first"
-/// contract the `args` doc states — the failure mode a reviewer flagged.
+/// Position-independence (the exact ordering-bug repro): a native flag
+/// placed AFTER a passthrough flag still parses as native — the argv
+/// split (`argsplit`) routes each token by name — and only the genuine
+/// passthrough lands in `args`. Previously `--kernel` here was swallowed
+/// into `args` and rejected by nextest.
 #[test]
-fn parse_verifier_passthrough_before_native_flag_swallows_it() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
+fn parse_verifier_flag_after_passthrough_is_native() {
+    let KtstrCommand::Verifier { kernel, args, .. } = parse_via_split(&[
         "cargo",
         "ktstr",
         "verifier",
@@ -2904,24 +2901,18 @@ fn parse_verifier_passthrough_before_native_flag_swallows_it() {
         "integration",
         "--kernel",
         "../linux",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Verifier { kernel, args, .. } = k.command else {
+    ]) else {
         panic!("expected Verifier");
     };
-    assert!(
-        kernel.is_empty(),
-        "--kernel placed AFTER a passthrough flag is swallowed into args, not parsed as a native flag",
+    assert_eq!(
+        kernel,
+        vec!["../linux"],
+        "--kernel placed AFTER a passthrough flag parses as a native flag, not swallowed",
     );
     assert_eq!(
         args,
-        vec![
-            "--features".to_string(),
-            "integration".to_string(),
-            "--kernel".to_string(),
-            "../linux".to_string(),
-        ],
-        "trailing capture starts at the first unrecognized token and swallows everything after it",
+        vec!["--features".to_string(), "integration".to_string()],
+        "only the genuine passthrough lands in args",
     );
 }
 
@@ -2931,9 +2922,13 @@ fn parse_verifier_passthrough_before_native_flag_swallows_it() {
 /// following passthrough flag (`--features`) still lands in `args`.
 #[test]
 fn parse_verifier_with_profiles() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
+    let KtstrCommand::Verifier {
+        kernel,
+        profile,
+        nextest_profile,
+        args,
+        ..
+    } = parse_via_split(&[
         "cargo",
         "ktstr",
         "verifier",
@@ -2945,16 +2940,7 @@ fn parse_verifier_with_profiles() {
         "ci",
         "--features",
         "integration",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Verifier {
-        kernel,
-        profile,
-        nextest_profile,
-        args,
-        ..
-    } = k.command
-    else {
+    ]) else {
         panic!("expected Verifier");
     };
     assert_eq!(kernel, vec!["../linux"]);
@@ -2978,18 +2964,16 @@ fn parse_verifier_with_profiles() {
 /// a future native re-add (which would not land in `args`).
 #[test]
 fn parse_verifier_all_profiles_forwarded_not_native() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from(["cargo", "ktstr", "verifier", "--all-profiles"])
-        .unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Verifier { args, .. } = k.command else {
+    let KtstrCommand::Verifier { args, .. } =
+        parse_via_split(&["cargo", "ktstr", "verifier", "--all-profiles"])
+    else {
         panic!("expected Verifier");
     };
     assert_eq!(
         args,
         vec!["--all-profiles"],
-        "--all-profiles is not a native verifier flag; trailing_var_arg \
-         forwards it into `args`. A future native re-add would empty `args`.",
+        "--all-profiles is not a native verifier flag; the argv split \
+         routes it into `args`. A future native re-add would empty `args`.",
     );
 }
 
@@ -3000,25 +2984,357 @@ fn parse_verifier_all_profiles_forwarded_not_native() {
 /// re-add.
 #[test]
 fn parse_verifier_profiles_filter_forwarded_not_native() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
+    let KtstrCommand::Verifier { args, .. } = parse_via_split(&[
         "cargo",
         "ktstr",
         "verifier",
         "--profiles",
         "default,llc,llc+steal",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Verifier { args, .. } = k.command else {
+    ]) else {
         panic!("expected Verifier");
     };
     assert_eq!(
         args,
         vec!["--profiles", "default,llc,llc+steal"],
-        "--profiles is not a native verifier flag; trailing_var_arg forwards it \
+        "--profiles is not a native verifier flag; the argv split routes it \
          and its value into `args`. A future native re-add would consume the \
          value and empty `args`.",
+    );
+}
+
+// -- argv split: position-independent ktstr flags --
+
+/// `test`: a ktstr flag (`--include-eol`) placed AFTER a passthrough
+/// flag parses as native, and only the passthrough lands in `args`.
+#[test]
+fn parse_test_flag_after_passthrough_is_native() {
+    let KtstrCommand::Test {
+        include_eol,
+        kernel,
+        args,
+        ..
+    } = parse_via_split(&[
+        "cargo",
+        "ktstr",
+        "test",
+        "--kernel",
+        "6.11..6.14",
+        "--features",
+        "integration",
+        "--include-eol",
+    ]) else {
+        panic!("expected Test");
+    };
+    assert!(
+        include_eol,
+        "--include-eol after a passthrough flag is consumed by ktstr"
+    );
+    assert_eq!(kernel, vec!["6.11..6.14"]);
+    assert_eq!(
+        args,
+        vec!["--features".to_string(), "integration".to_string()]
+    );
+}
+
+/// `test`: the same flags in the other order parse identically —
+/// position does not matter (regression pin for the reported bug).
+#[test]
+fn parse_test_flag_before_passthrough_is_native() {
+    let KtstrCommand::Test {
+        include_eol,
+        kernel,
+        args,
+        ..
+    } = parse_via_split(&[
+        "cargo",
+        "ktstr",
+        "test",
+        "--kernel",
+        "6.11..6.14",
+        "--include-eol",
+        "--features",
+        "integration",
+    ]) else {
+        panic!("expected Test");
+    };
+    assert!(include_eol);
+    assert_eq!(kernel, vec!["6.11..6.14"]);
+    assert_eq!(
+        args,
+        vec!["--features".to_string(), "integration".to_string()]
+    );
+}
+
+/// A ktstr flag interleaved BETWEEN two passthrough tokens is still
+/// routed to ktstr; the passthrough tokens land in `args` in order.
+#[test]
+fn parse_test_interleaved_ktstr_flag() {
+    let KtstrCommand::Test { kernel, args, .. } = parse_via_split(&[
+        "cargo",
+        "ktstr",
+        "test",
+        "--features",
+        "integration",
+        "--kernel",
+        "6.14",
+        "--no-capture",
+    ]) else {
+        panic!("expected Test");
+    };
+    assert_eq!(kernel, vec!["6.14"]);
+    assert_eq!(
+        args,
+        vec![
+            "--features".to_string(),
+            "integration".to_string(),
+            "--no-capture".to_string()
+        ]
+    );
+}
+
+/// The `--flag=value` form of a value-taking ktstr flag is routed whole,
+/// even after a passthrough flag.
+#[test]
+fn parse_test_kernel_eq_value_after_passthrough() {
+    let KtstrCommand::Test { kernel, args, .. } = parse_via_split(&[
+        "cargo",
+        "ktstr",
+        "test",
+        "--features",
+        "integration",
+        "--kernel=6.14",
+    ]) else {
+        panic!("expected Test");
+    };
+    assert_eq!(kernel, vec!["6.14"]);
+    assert_eq!(
+        args,
+        vec!["--features".to_string(), "integration".to_string()]
+    );
+}
+
+/// Repeated `--kernel` (Append) after a passthrough flag collects both
+/// values.
+#[test]
+fn parse_test_repeated_kernel_after_passthrough() {
+    let KtstrCommand::Test { kernel, args, .. } = parse_via_split(&[
+        "cargo",
+        "ktstr",
+        "test",
+        "--features",
+        "x",
+        "--kernel",
+        "6.14",
+        "--kernel",
+        "6.15",
+    ]) else {
+        panic!("expected Test");
+    };
+    assert_eq!(kernel, vec!["6.14", "6.15"]);
+    assert_eq!(args, vec!["--features".to_string(), "x".to_string()]);
+}
+
+/// `coverage`: `--include-eol` after a passthrough flag is native.
+#[test]
+fn parse_coverage_flag_after_passthrough_is_native() {
+    let KtstrCommand::Coverage {
+        include_eol, args, ..
+    } = parse_via_split(&[
+        "cargo",
+        "ktstr",
+        "coverage",
+        "--features",
+        "integration",
+        "--include-eol",
+    ]) else {
+        panic!("expected Coverage");
+    };
+    assert!(include_eol);
+    assert_eq!(
+        args,
+        vec!["--features".to_string(), "integration".to_string()]
+    );
+}
+
+/// `llvm-cov`: `--include-eol` after a passthrough flag is native.
+#[test]
+fn parse_llvm_cov_flag_after_passthrough_is_native() {
+    let KtstrCommand::LlvmCov {
+        include_eol, args, ..
+    } = parse_via_split(&[
+        "cargo",
+        "ktstr",
+        "llvm-cov",
+        "--features",
+        "integration",
+        "--include-eol",
+    ]) else {
+        panic!("expected LlvmCov");
+    };
+    assert!(include_eol);
+    assert_eq!(
+        args,
+        vec!["--features".to_string(), "integration".to_string()]
+    );
+}
+
+/// An explicit `--` forces EVERYTHING after it to passthrough, even a
+/// token spelled like a ktstr flag — the escape hatch for a passthrough
+/// token that collides with a native flag name.
+#[test]
+fn parse_test_double_dash_forces_passthrough() {
+    let KtstrCommand::Test {
+        include_eol,
+        kernel,
+        args,
+        ..
+    } = parse_via_split(&["cargo", "ktstr", "test", "--kernel", "6.14", "--", "--include-eol"])
+    else {
+        panic!("expected Test");
+    };
+    assert!(
+        !include_eol,
+        "--include-eol after -- is passthrough, not the native flag"
+    );
+    assert_eq!(kernel, vec!["6.14"]);
+    assert_eq!(args, vec!["--include-eol".to_string()]);
+}
+
+/// Name-collision case: `--profile` is a ktstr flag (scheduler build
+/// profile). Before `--` it is native; after `--` it forwards to the
+/// inner tool — the documented way to pass nextest's own `--profile`.
+#[test]
+fn parse_test_profile_native_vs_passthrough_by_double_dash() {
+    let KtstrCommand::Test { profile, args, .. } =
+        parse_via_split(&["cargo", "ktstr", "test", "--profile", "dev", "--features", "x"])
+    else {
+        panic!("expected Test");
+    };
+    assert_eq!(
+        profile.as_deref(),
+        Some("dev"),
+        "--profile before -- is the native ktstr flag"
+    );
+    assert_eq!(args, vec!["--features".to_string(), "x".to_string()]);
+
+    let KtstrCommand::Test { profile, args, .. } = parse_via_split(&[
+        "cargo",
+        "ktstr",
+        "test",
+        "--kernel",
+        "6.14",
+        "--",
+        "--profile",
+        "nextest-ci",
+    ]) else {
+        panic!("expected Test");
+    };
+    assert_eq!(profile, None, "--profile after -- forwards to the inner tool");
+    assert_eq!(
+        args,
+        vec!["--profile".to_string(), "nextest-ci".to_string()]
+    );
+}
+
+/// `replay`: the short `-E` (its native filter) is routed to ktstr even
+/// after a passthrough flag, in both `-E value` and glued `-Evalue`
+/// forms; the passthrough lands in `args`.
+#[test]
+fn parse_replay_short_e_after_passthrough() {
+    let KtstrCommand::Replay { filter, args, .. } = parse_via_split(&[
+        "cargo",
+        "ktstr",
+        "replay",
+        "--exec",
+        "--features",
+        "x",
+        "-E",
+        "scheduler_",
+    ]) else {
+        panic!("expected Replay");
+    };
+    assert_eq!(
+        filter.as_deref(),
+        Some("scheduler_"),
+        "-E value after a passthrough flag is native"
+    );
+    assert_eq!(args, vec!["--features".to_string(), "x".to_string()]);
+
+    let KtstrCommand::Replay { filter, args, .. } = parse_via_split(&[
+        "cargo",
+        "ktstr",
+        "replay",
+        "--exec",
+        "--features",
+        "x",
+        "-Escheduler_",
+    ]) else {
+        panic!("expected Replay");
+    };
+    assert_eq!(
+        filter.as_deref(),
+        Some("scheduler_"),
+        "glued -Evalue after a passthrough flag is native"
+    );
+    assert_eq!(args, vec!["--features".to_string(), "x".to_string()]);
+}
+
+/// A passthrough-only invocation (no ktstr flag among the tail) forwards
+/// every token and steals nothing.
+#[test]
+fn parse_test_passthrough_only_steals_nothing() {
+    let KtstrCommand::Test { kernel, args, .. } = parse_via_split(&[
+        "cargo",
+        "ktstr",
+        "test",
+        "--kernel",
+        "6.14",
+        "--no-capture",
+        "-j4",
+    ]) else {
+        panic!("expected Test");
+    };
+    assert_eq!(kernel, vec!["6.14"]);
+    assert_eq!(
+        args,
+        vec!["--no-capture".to_string(), "-j4".to_string()]
+    );
+}
+
+/// `--help` stays a native (ktstr) flag — clap shows help rather than
+/// forwarding `--help` to the inner tool. `rewrite` routes it to the
+/// ktstr side, so `try_parse_from` surfaces clap's `DisplayHelp`.
+#[test]
+fn parse_test_help_stays_native() {
+    let raw: Vec<std::ffi::OsString> = ["cargo", "ktstr", "test", "--help"]
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+    let rewritten = crate::argsplit::rewrite(&Cargo::command(), &raw);
+    // `.err()` drops the Ok(Cargo) value (Cargo is not Debug, so
+    // `expect_err` would not compile) and keeps the clap error.
+    let err = Cargo::try_parse_from(&rewritten)
+        .err()
+        .expect("--help must not parse as a command");
+    assert_eq!(
+        err.kind(),
+        clap::error::ErrorKind::DisplayHelp,
+        "--help stays native (clap help), not forwarded to args",
+    );
+}
+
+/// A non-passthrough subcommand (e.g. `shell`) is returned unchanged by
+/// `rewrite` — no `--` is injected, so its own args parse normally.
+#[test]
+fn rewrite_leaves_non_passthrough_subcommand_unchanged() {
+    let raw: Vec<std::ffi::OsString> = ["cargo", "ktstr", "shell", "--topology", "1,1,2,1"]
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+    let rewritten = crate::argsplit::rewrite(&Cargo::command(), &raw);
+    assert_eq!(
+        rewritten, raw,
+        "shell is not a passthrough subcommand; argv is untouched"
     );
 }
 
@@ -3061,9 +3377,14 @@ fn parse_replay_defaults() {
 /// parse as `Some(_)`.
 #[test]
 fn parse_replay_all_flags_and_passthrough() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
+    let KtstrCommand::Replay {
+        dir,
+        filter,
+        exec,
+        profile,
+        nextest_profile,
+        args,
+    } = parse_via_split(&[
         "cargo",
         "ktstr",
         "replay",
@@ -3078,17 +3399,7 @@ fn parse_replay_all_flags_and_passthrough() {
         "ci",
         "--features",
         "integration",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Replay {
-        dir,
-        filter,
-        exec,
-        profile,
-        nextest_profile,
-        args,
-    } = k.command
-    else {
+    ]) else {
         panic!("expected Replay");
     };
     assert_eq!(

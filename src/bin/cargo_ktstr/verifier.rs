@@ -26,8 +26,10 @@
 //! !test(/^verifier::/)` — the `verifier/...` cells, NOT the verifier
 //! module's own `verifier::tests::*` unit tests, which also start with
 //! "verifier"). The trailing `args` are forwarded verbatim to that
-//! `cargo nextest run` (a nextest filterset, `--cargo-profile`, ..., no
-//! `--` separator). The `declare_scheduler!` verifier cells carry no
+//! `cargo nextest run` (a nextest filterset, `--cargo-profile`, ...);
+//! native flags may appear in any order relative to them and no `--`
+//! separator is needed (see the bin's `argsplit` module). The
+//! `declare_scheduler!` verifier cells carry no
 //! `required-features`, so they build without a feature flag — no
 //! `--features` passthrough is needed to collect verifier statistics.
 //! The scheduler-under-test builds release by default, and each cell boots
@@ -89,7 +91,8 @@ pub(crate) fn run_verifier(
     // and is unit-tested so the reachability-critical ones cannot be
     // silently dropped. The profile is emitted before the forwarded args
     // so a passthrough token cannot shadow it; no `--` separator is needed
-    // (clap captured `args` as the trailing_var_arg group).
+    // (the bin's argsplit rewrite routes native flags to ktstr and the
+    // passthrough to the `last = true` `args` field before clap parses).
     cmd.args(ktstr::verifier::build_nextest_args(
         nextest_profile.as_deref(),
         &args,

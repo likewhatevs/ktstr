@@ -188,7 +188,7 @@ fn worktree_remove_argv(wt_dir: &Path) -> Vec<String> {
 ///
 /// `filter` (`-E`) and `passthrough` (the user's cargo/nextest flags,
 /// e.g. `--features integration,wprof`) become the inner `test`'s
-/// `trailing_var_arg`, which `run_cargo_sub` forwards verbatim to
+/// passthrough args, which `run_cargo_sub` forwards verbatim to
 /// `cargo nextest run`. Forwarding to BOTH sides is load-bearing: a
 /// delta computed across mismatched feature selections is not a
 /// like-for-like comparison, and — before this — the baseline/HEAD
@@ -198,9 +198,11 @@ fn worktree_remove_argv(wt_dir: &Path) -> Vec<String> {
 ///
 /// `profile` (`--profile <NAME>`, the scheduler BUILD profile) and
 /// `nextest_profile` (`--nextest-profile <NAME>`, the nextest test
-/// profile) are emitted as NATIVE `cargo ktstr test` flags — right after
-/// `--kernel <k>` and BEFORE the `-E` / passthrough trailing capture,
-/// which starts at the first unrecognized token. Omitting `profile`
+/// profile) are emitted as NATIVE `cargo ktstr test` flags, right after
+/// `--kernel <k>` and before the `-E` / passthrough args. The child
+/// re-splits its argv by flag name (the bin's `argsplit` module), so this
+/// ordering is no longer load-bearing — it is kept only for a stable,
+/// readable child command line. Omitting `profile`
 /// leaves the scheduler at its release default (see
 /// [`ktstr::build_and_find_binary`]); both are forwarded to BOTH sides so
 /// baseline and HEAD build identically.
@@ -217,10 +219,11 @@ fn perf_test_argv(
         "--kernel".to_string(),
         kernel.to_string(),
     ];
-    // Native `cargo ktstr test` flags MUST precede the trailing capture
-    // (`-E` / passthrough): clap starts the `trailing_var_arg` group at
-    // the first unrecognized token, so a native flag placed after `-E`
-    // would be swallowed into the passthrough.
+    // Emit native `cargo ktstr test` flags before the `-E` / passthrough
+    // args. The child re-splits its argv by flag name (the bin's argsplit
+    // module), so a native flag placed after `-E` would still parse
+    // correctly — this ordering is kept only for a stable, readable child
+    // command line.
     if let Some(p) = profile {
         v.push("--profile".to_string());
         v.push(p.to_string());
@@ -969,13 +972,13 @@ mod tests {
     }
 
     /// `--profile` / `--nextest-profile` are emitted as NATIVE `cargo
-    /// ktstr test` flags AFTER `--kernel <k>` and BEFORE the `-E` /
-    /// passthrough trailing capture — otherwise clap's `trailing_var_arg`
-    /// group (which starts at the first unrecognized token, e.g. `-E`)
-    /// would swallow them into the passthrough and they'd reach nextest
-    /// as raw args instead of selecting the profiles.
+    /// ktstr test` flags after `--kernel <k>` and before the `-E` /
+    /// passthrough args. The child re-splits its argv by flag name (the
+    /// bin's `argsplit` module), so the ordering is no longer required for
+    /// correctness; this pins the stable, readable child command line
+    /// `perf_test_argv` emits.
     #[test]
-    fn perf_test_argv_emits_profiles_before_trailing_capture() {
+    fn perf_test_argv_emits_profiles_before_passthrough() {
         let expect = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
         let feat = ["--features".to_string(), "integration".to_string()];
 

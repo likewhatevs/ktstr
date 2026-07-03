@@ -68,11 +68,14 @@ mod btf_catalog;
 #[path = "cargo_ktstr/blobs.rs"]
 mod blobs;
 
+#[path = "cargo_ktstr/argsplit.rs"]
+mod argsplit;
+
 #[cfg(test)]
 #[path = "cargo_ktstr/parse_tests.rs"]
 mod parse_tests;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use ktstr::cli::KernelCommand;
 
 use crate::cli::{Cargo, CargoSub, KtstrCommand};
@@ -117,9 +120,18 @@ fn main() {
         .with_writer(std::io::stderr)
         .init();
 
+    // Position-independent ktstr flags: rewrite argv so a passthrough
+    // subcommand's ktstr-owned flags parse regardless of their position
+    // relative to nextest passthrough args (see the `argsplit` module).
+    // Non-passthrough subcommands pass through unchanged.
+    let raw: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let rewritten = argsplit::rewrite(&Cargo::command(), &raw);
     let Cargo {
         command: CargoSub::Ktstr(ktstr),
-    } = Cargo::parse();
+    } = match Cargo::try_parse_from(&rewritten) {
+        Ok(c) => c,
+        Err(e) => e.exit(),
+    };
 
     let result = dispatch_command(ktstr.command);
 
