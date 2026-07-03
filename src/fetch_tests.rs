@@ -3576,3 +3576,23 @@ fn latest_patch_from_git_tags_resolves_eol_series() {
         "EOL 6.14 must resolve to its final patch 6.14.11 via git tags",
     );
 }
+
+/// `anon_open_opts` must load ONLY repo-local git config. This is the
+/// fix that stops a user's `url.<base>.insteadOf` rewrite (e.g.
+/// `https://github.com/` -> `git@github.com:`) from rerouting anonymous
+/// public-mirror fetches through SSH — which prompted for the key
+/// passphrase once per operation, several at once under the concurrent
+/// intra-range kernel resolution. Pins every ambient config source OFF
+/// so a future edit that re-enables one (re-introducing the rewrite)
+/// fails here. Environment permissions are intentionally NOT asserted
+/// off: they stay at the Full-trust default so an `http(s)_proxy` env
+/// var still applies to real downloads.
+#[test]
+fn anon_open_opts_disables_ambient_config_sources() {
+    let cfg = super::anon_open_opts().permissions.config;
+    assert!(!cfg.user, "user (~/.gitconfig) config must not load");
+    assert!(!cfg.system, "system (/etc/gitconfig) config must not load");
+    assert!(!cfg.git, "XDG git config must not load");
+    assert!(!cfg.env, "GIT_CONFIG_* env config must not load");
+    assert!(!cfg.git_binary, "git-binary config must not load");
+}

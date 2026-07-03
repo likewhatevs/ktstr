@@ -1954,8 +1954,9 @@ fn is_full_sha(git_ref: &str) -> bool {
 /// [`cached_stable_tags`], and [`latest_patch_from_git_tags`] (highest
 /// `v{prefix}.{patch}` tag).
 ///
-/// The ad-hoc bare repo (`gix::init` on a tempdir) carries no working
-/// tree and fetches no pack. Remote-side ref-prefix filtering is
+/// The ad-hoc repo (`init_opts` on a tempdir, with repo-local git config
+/// only — see `anon_open_opts`) carries no working tree and fetches no
+/// pack. Remote-side ref-prefix filtering is
 /// DISABLED: gix's default (`prefix_from_spec_as_filter_on_remote =
 /// true`) derives protocol-v2 `ls-refs` `ref-prefix` filters from the
 /// remote's fetch refspecs; an anonymous `remote_at` has none, and
@@ -1965,7 +1966,14 @@ fn is_full_sha(git_ref: &str) -> bool {
 /// all resolve.
 fn ls_remote_refs(url: &str) -> Option<Vec<gix::protocol::handshake::Ref>> {
     let tmp = tempfile::TempDir::new().ok()?;
-    let repo = gix::init(tmp.path()).ok()?;
+    let repo = gix::ThreadSafeRepository::init_opts(
+        tmp.path(),
+        gix::create::Kind::WithWorktree,
+        gix::create::Options::default(),
+        anon_open_opts(),
+    )
+    .ok()?
+    .to_thread_local();
     let remote = repo.remote_at(url).ok()?;
     let conn = remote.connect(gix::remote::Direction::Fetch).ok()?;
     let (refmap, _handshake) = conn
@@ -1978,6 +1986,40 @@ fn ls_remote_refs(url: &str) -> Option<Vec<gix::protocol::handshake::Ref>> {
         )
         .ok()?;
     Some(refmap.remote_refs)
+}
+
+/// Open options for ktstr's git fetches: load ONLY repo-local git
+/// config, never the user (`~/.gitconfig`), XDG, system
+/// (`/etc/gitconfig`), or `GIT_CONFIG_*` env sources. This neutralizes a
+/// `url.<base>.insteadOf` rewrite (e.g. a developer rule mapping
+/// `https://github.com/` to `git@github.com:`) that would otherwise
+/// route an anonymous public fetch through SSH and prompt for the key
+/// passphrase once per operation — several at once under the concurrent
+/// intra-range kernel resolution. Environment permissions stay at the
+/// Full-trust default so an `http(s)_proxy` env var still applies.
+///
+/// SCOPE: these opts govern EVERY gix remote path — the internal version
+/// resolution (`ls_remote_refs` and its callers) AND every user-supplied
+/// `git+URL` clone via `git_clone_inner`, including a self-hosted
+/// `git+https://...` source. The tradeoff is deliberate: a PUBLIC source
+/// (the common case — kernel.org / gregkh / torvalds mirrors) fetches
+/// anonymously with no credential prompt, and a PRIVATE source must use a
+/// `git+ssh://user@host/repo` URL (SSH authenticates via `~/.ssh`,
+/// independent of gitconfig). gitconfig-driven auth (an `insteadOf`
+/// HTTPS->SSH rewrite plus credential/`git_binary` config) is
+/// intentionally NOT honored, so it can never silently reroute an
+/// anonymous fetch through SSH. The ad-hoc temp repos carry no local
+/// config, so the effective URL-rewrite set is empty: the passed URL is
+/// used verbatim.
+fn anon_open_opts() -> gix::open::Options {
+    use gix::sec::trust::DefaultForLevel;
+    let mut opts = gix::open::Options::default_for_level(gix::sec::Trust::Full);
+    opts.permissions.config.system = false;
+    opts.permissions.config.git = false;
+    opts.permissions.config.user = false;
+    opts.permissions.config.env = false;
+    opts.permissions.config.git_binary = false;
+    opts
 }
 
 /// Shallow-clone a git repository at a BRANCH ref.
@@ -2110,8 +2152,19 @@ fn git_clone_inner(
 
     let clone_dir = dest_dir.join("linux");
 
-    let mut prep = gix::prepare_clone(url, &clone_dir)
-        .with_context(|| "prepare clone")?
+    // Build the clone with anon_open_opts() (repo-local config only)
+    // rather than gix::prepare_clone, whose open opts load the user's
+    // gitconfig and would apply an `insteadOf` HTTPS->SSH rewrite,
+    // prompting for a key passphrase. Mirrors gix::prepare_clone's
+    // (WithWorktree, default create opts) otherwise.
+    let mut prep = gix::clone::PrepareFetch::new(
+        url,
+        &clone_dir,
+        gix::create::Kind::WithWorktree,
+        gix::create::Options::default(),
+        anon_open_opts(),
+    )
+    .with_context(|| "prepare clone")?
         .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
             NonZeroU32::new(1).expect("1 is nonzero"),
         ))
