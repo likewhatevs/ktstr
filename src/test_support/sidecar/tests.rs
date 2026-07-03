@@ -669,7 +669,7 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
     assert_eq!(loaded.stats.cgroups[0].num_workers, 3);
     // ext_metrics (the pooled iterations_per_cpu_sec Rate + its Counter
     // components) must round-trip — the sidecar is the durable surface every
-    // cross-run `stats compare` reads.
+    // cross-run `perf-delta` reads.
     assert_eq!(
         loaded
             .stats
@@ -2351,7 +2351,7 @@ fn write_sidecar_writes_file() {
     assert!(loaded.is_pass());
     assert!(!loaded.skipped, "pass result is not a skip");
     // write_sidecar must populate the host-context snapshot so
-    // downstream `stats compare --runs a b` can diff hosts.
+    // downstream `perf-delta` can diff hosts.
     // Without this assertion, a regression that dropped the
     // `host: Some(collect_host_context())` builder line would
     // land silently. `kernel_name` is always `Some("Linux")`
@@ -2925,7 +2925,7 @@ fn scheduler_fingerprint_eevdf_has_no_commit() {
 /// vec, NOT to an empty default. A regression that drops the
 /// phases field from the sidecar serializer or fails to
 /// reconstitute it on the reader silently loses every per-phase
-/// row downstream consumers depend on (cargo ktstr stats compare's
+/// row downstream consumers depend on (cargo ktstr perf-delta's
 /// per-phase delta render, GauntletRow.phases carry-through).
 #[test]
 fn sidecar_round_trip_preserves_phases() {
@@ -3182,7 +3182,7 @@ fn finalize_sidecar_verdict_records_inversion_and_no_ops_ordinary() {
     let tmp = tempfile::TempDir::new().unwrap();
     // A raw Fail sidecar finalized to Pass (an expect_err inversion):
     // the verdict bits flip to pass AND expected_failure is set (so
-    // `stats compare` still excludes the failure-mode telemetry).
+    // `perf-delta` still excludes the failure-mode telemetry).
     let fail_path = tmp.path().join("t-0000000000000000.ktstr.json");
     let mut fail = SidecarResult::test_fixture();
     fail.passed = false; // raw Fail = the all-false verdict

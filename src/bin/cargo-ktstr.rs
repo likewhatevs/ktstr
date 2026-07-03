@@ -25,9 +25,9 @@
 //!   surfaces the A/B commit pair.
 //! - `replay` — `replay` dispatcher that re-runs the failing
 //!   subset of a prior sidecar pool.
-//! - `stats`  — `stats compare` subcommand that diffs
-//!   `target/ktstr/` JSON across two kernel/scheduler
-//!   build commits.
+//! - `stats`  — single-run inspection subcommands (list /
+//!   list-values / list-metrics / show-host / explain-sidecar)
+//!   over the `target/ktstr/` sidecar pool.
 //! - `verifier` — `verifier` subcommand that runs a scheduler
 //!   binary under the BPF-stats verifier and renders
 //!   per-program verified-instruction counts.
@@ -239,8 +239,6 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
             dual_run,
             threshold,
             policy,
-            a_scheduler,
-            b_scheduler,
             noise_adjust,
             noise_spread_threshold,
             no_phases,
@@ -262,8 +260,6 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
                 dual_run,
                 threshold,
                 policy: policy.as_deref(),
-                a_scheduler: a_scheduler.as_deref(),
-                b_scheduler: b_scheduler.as_deref(),
                 noise_adjust,
                 noise_spread_threshold,
                 profile: profile.as_deref(),

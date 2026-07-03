@@ -39,9 +39,10 @@ pub enum Dimension {
 
 impl Dimension {
     /// Every dimension in CLI-flag order. Used by
-    /// [`derive_slicing_dims`] to walk the dimension space and by
-    /// `compare_partitions` to compute the pairing-dim
-    /// complement set (all dims minus slicing dims).
+    /// [`Self::pairing_dims`] (invoked from `compare_partitions`) to
+    /// compute the pairing-dim complement set (all dims minus slicing
+    /// dims). The sliceable subset [`derive_slicing_dims`] contrasts on
+    /// is [`Self::SLICEABLE`].
     pub const ALL: &'static [Dimension] = &[
         Dimension::Kernel,
         Dimension::Scheduler,
@@ -54,12 +55,29 @@ impl Dimension {
         Dimension::CpuBudget,
     ];
 
+    /// The dimensions that may form an A/B CONTRAST (slice). Only the
+    /// version axes are contrastable: comparing across a project commit,
+    /// a kernel version, or a kernel commit is a purposeful "did this
+    /// change regress" question. Every other dimension
+    /// (scheduler/topology/work_type/run_source/resolve_source/cpu_budget)
+    /// is FILTER + PAIRING only — it narrows the cohort and joins A to B,
+    /// but contrasting across it bulk-compares heterogeneous runs
+    /// (different configs/hosts/conditions), which the significance math
+    /// cannot soundly attribute. A cross-config question is answered
+    /// in-test via the Verdict DSL (`better_across_phases`), not here.
+    pub const SLICEABLE: &'static [Dimension] = &[
+        Dimension::Kernel,
+        Dimension::ProjectCommit,
+        Dimension::KernelCommit,
+    ];
+
     /// Compute pairing dims from a slicing-dim set: every
     /// dimension in [`Dimension::ALL`] that is NOT in `slicing`,
     /// in canonical order. This is the dynamic key derivation the
     /// comparison pipeline uses everywhere — slicing dims define
     /// the contrast (different on A vs B), pairing dims define
-    /// the join (same across A and B).
+    /// the join (same across A and B). A non-[`Self::SLICEABLE`] dimension is
+    /// never in `slicing`, so it is always a pairing dim.
     pub fn pairing_dims(slicing: &[Dimension]) -> Vec<Dimension> {
         Self::ALL
             .iter()
@@ -116,37 +134,32 @@ pub(crate) const LEGACY_PAIRING_DIMS: &[Dimension] = &[Dimension::Topology, Dime
 /// dims were promoted to `Vec<String>` so the operator-visible
 /// shape is uniform across every dimension.
 ///
-/// Returns dimensions in [`Dimension::ALL`] order so callers
-/// (header lines, error messages, side labels) get a stable
-/// presentation.
+/// Returns dimensions in canonical ([`Dimension::ALL`]) order so callers
+/// (header lines, error messages, side labels) get a stable presentation.
+/// Only a [`Dimension::SLICEABLE`] dimension can be a slicing dim; the
+/// non-sliceable dims are filter + pairing only and are only ever set via a
+/// single shared `--<x>` filter (applied to BOTH sides), so they can never
+/// differ A↔B — the walk skips them.
 pub fn derive_slicing_dims(filter_a: &RowFilter, filter_b: &RowFilter) -> Vec<Dimension> {
     let mut out = Vec::new();
-    for &dim in Dimension::ALL {
+    for &dim in Dimension::SLICEABLE {
         let differs = match dim {
             Dimension::Kernel => sorted_dedup(&filter_a.kernels) != sorted_dedup(&filter_b.kernels),
-            Dimension::Scheduler => {
-                sorted_dedup(&filter_a.schedulers) != sorted_dedup(&filter_b.schedulers)
-            }
-            Dimension::Topology => {
-                sorted_dedup(&filter_a.topologies) != sorted_dedup(&filter_b.topologies)
-            }
-            Dimension::WorkType => {
-                sorted_dedup(&filter_a.work_types) != sorted_dedup(&filter_b.work_types)
-            }
             Dimension::ProjectCommit => {
                 sorted_dedup(&filter_a.project_commits) != sorted_dedup(&filter_b.project_commits)
             }
             Dimension::KernelCommit => {
                 sorted_dedup(&filter_a.kernel_commits) != sorted_dedup(&filter_b.kernel_commits)
             }
-            Dimension::RunSource => {
-                sorted_dedup(&filter_a.run_sources) != sorted_dedup(&filter_b.run_sources)
-            }
-            Dimension::ResolveSource => {
-                sorted_dedup(&filter_a.resolve_sources) != sorted_dedup(&filter_b.resolve_sources)
-            }
-            Dimension::CpuBudget => {
-                sorted_dedup(&filter_a.cpu_budgets) != sorted_dedup(&filter_b.cpu_budgets)
+            // Non-sliceable dims are filter + pairing only (see
+            // [`Dimension::SLICEABLE`]); the walk never reaches them.
+            Dimension::Scheduler
+            | Dimension::Topology
+            | Dimension::WorkType
+            | Dimension::RunSource
+            | Dimension::ResolveSource
+            | Dimension::CpuBudget => {
+                unreachable!("non-sliceable dimension {dim:?} in SLICEABLE walk")
             }
         };
         if differs {
@@ -769,20 +782,14 @@ impl<'a> Accumulator<'a> {
             run_source: acc.first.run_source.clone(),
             resolve_source: acc.first.resolve_source.clone(),
             // First-seen budget metadata, like scheduler/kernel_version
-            // above. When CpuBudget is a PAIRING dim it is part of the
-            // group key, so every contributor shares one budget and the
-            // first row's value is the group's. When the operator slices
-            // on budget (e.g. an asymmetric `--a-cpu-budget`), CpuBudget
-            // is a SLICING dim and is dropped from the pairing key, so a
-            // group's contributors may carry heterogeneous budgets — the
-            // first-seen value is then representative metadata, not a join
-            // key, and `render_overcommit_warning` surfaces the cross-budget
-            // mix on the compared sides. vcpus is likewise first-seen
-            // metadata — and is NOT a Dimension, so a TOPOLOGY-sliced group
-            // (vcpus = topology.total_cpus()) can mix vcpus too. No
-            // post-aggregation consumer reads the aggregated vcpus (the
-            // overcommit checks run pre-aggregation on the raw rows), so the
-            // first-seen value is metadata only.
+            // above. CpuBudget is a PAIRING dim (not sliceable — see
+            // Dimension::SLICEABLE), so it is part of the group key and every
+            // contributor shares one budget; the first row's value is the
+            // group's. vcpus is likewise first-seen metadata — and is NOT a
+            // Dimension. No post-aggregation consumer reads the aggregated
+            // vcpus (`render_overcommit_warning` and the other overcommit
+            // checks run pre-aggregation on the raw rows), so the first-seen
+            // value is metadata only.
             cpu_budget: acc.first.cpu_budget,
             vcpus: acc.first.vcpus,
             // ALL must pass: any failed, inconclusive, or skipped

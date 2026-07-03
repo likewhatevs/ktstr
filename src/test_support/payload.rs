@@ -933,7 +933,7 @@ impl MetricCheck {
 ///
 /// Status: persisted on the sidecar for future review-tooling
 /// (CI dashboards, `cargo ktstr stats`-style filters); not yet
-/// consumed by `stats compare` or any automated pipeline. The
+/// consumed by `perf-delta` or any automated pipeline. The
 /// field is wired end-to-end from the payload-pipeline to the
 /// sidecar JSON today so that downstream review tools can start
 /// filtering on it without a schema change — but no production

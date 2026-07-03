@@ -159,7 +159,7 @@ impl SchedulerSpec {
     ///   binary commit to record.
     ///
     /// Returning `None` rather than `Some("unknown")` keeps the
-    /// sidecar schema's nullable semantics honest: `stats compare`
+    /// sidecar schema's nullable semantics honest: `perf-delta`
     /// distinguishes "unset" from "set to a sentinel" without a
     /// magic string, and a future enhancement that learns to
     /// introspect a scheduler binary can flip a single arm to

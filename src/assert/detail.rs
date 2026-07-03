@@ -666,7 +666,7 @@ impl std::fmt::Display for AssertDetail {
 /// [`InfoNote`] messages: an `InfoNote` carries a single human-
 /// readable string (formatted via its `Display` impl), the
 /// structured map carries typed `(key, NoteValue)` pairs for
-/// programmatic consumption (sidecar parsers, `stats compare`,
+/// programmatic consumption (sidecar parsers, `perf-delta`,
 /// regression dashboards). Producers can call BOTH `note(msg)`
 /// and `note_value(key, val)` on the same result — they occupy
 /// independent buffers (`info_notes` vs `measurements`).

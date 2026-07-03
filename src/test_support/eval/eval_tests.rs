@@ -766,7 +766,7 @@ fn target_dir_probe_order_prefers_profile_match() {
 /// `ResolveSource::as_str` is the load-bearing enum -> persisted-tag
 /// bridge: it produces the snake_case string stamped into
 /// `SidecarResult::resolve_source` (eval/mod.rs stamps it post-run) and
-/// surfaced by `stats compare --resolve-source` / `stats list-values`. The
+/// surfaced by `stats list-values` (resolve_source column). The
 /// roundtrip / propagation tests pin
 /// the String values INDEPENDENTLY (they hardcode the expected tags), so
 /// a typo here (e.g. `SiblingDir => "sibling-dir"`) would silently ship

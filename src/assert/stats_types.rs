@@ -98,7 +98,7 @@ pub struct AssertResult {
     /// outcomes carry typed verdict variants with `AssertDetail`
     /// payloads for operator triage, `measurements` carries typed
     /// `(key, NoteValue)` pairs for programmatic consumption (sidecar
-    /// parsers, `stats compare`, regression dashboards).
+    /// parsers, `perf-delta`, regression dashboards).
     pub measurements: std::collections::BTreeMap<String, NoteValue>,
     /// Informational annotations attached via [`Self::note`] /
     /// [`Verdict::note`]. Structurally separated from [`Self::outcomes`]
@@ -1035,7 +1035,7 @@ impl CgroupStats {
     /// scenario duration): cross-variant comparison is misleading
     /// because this metric is NOT rate-normalized — a longer-
     /// running scenario racks up more iterations per worker even if
-    /// the scheduler is identical. `stats compare`-style
+    /// the scheduler is identical. `perf-delta`-style
     /// comparisons hold scenario, topology, and work_type constant
     /// before reading this method.
     pub fn iterations_per_worker(&self) -> Option<f64> {

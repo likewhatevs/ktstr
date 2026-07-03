@@ -262,7 +262,7 @@ pub(crate) fn run_ktstr_test_inner(
     match crate::test_support::sidecar::take_last_sidecar_path() {
         // A sidecar was written (the guest produced a parseable result):
         // overwrite its raw verdict with the final one and set
-        // `expected_failure` so `stats compare` still excludes the
+        // `expected_failure` so `perf-delta` still excludes the
         // failure-mode-dominated telemetry of an inverted failure.
         Some(path) => crate::test_support::sidecar::finalize_sidecar_verdict(
             &path,
@@ -327,7 +327,7 @@ fn read_primary_exit_kind(entry_name: &str, variant_hash: u64) -> Option<u64> {
 /// survives those code paths too.
 ///
 /// The placeholder's `is_placeholder: true` field lets downstream
-/// tooling (stats compare, sidecar walkers) distinguish a stub
+/// tooling (perf-delta, sidecar walkers) distinguish a stub
 /// from a real BPF dump. The `reason` string carries both the
 /// lifecycle stage classification AND — when extractable — the
 /// `BUG SUMMARY` text (per `extract_bug_summary` over the captured
@@ -1200,7 +1200,7 @@ fn run_ktstr_test_inner_impl(
     // regardless of whether real BPF state could be
     // captured. The `is_placeholder: true` field on
     // [`crate::monitor::dump::FailureDumpReport`] lets downstream
-    // tooling (stats compare, sidecar walkers) distinguish a stub
+    // tooling (perf-delta, sidecar walkers) distinguish a stub
     // from a real BPF dump.
     if !result.success {
         write_placeholder_failure_dump_if_missing(&primary_dump_path, &result);
@@ -1943,7 +1943,7 @@ fn populate_run_stats_and_folded_timeline(
     // read_sample returns None — avg_imbalance_ratio, iteration_rate,
     // system_time_ns / user_time_ns (populate_run_ext_metrics_from_phases).
     // Without it those keys never reach the sidecar and
-    // `cargo ktstr stats compare` silently drops the rows.
+    // `cargo ktstr perf-delta` silently drops the rows.
     // Fold the guest-collected per-phase per_cgroup carriers
     // (parsed into check_result.stats.phases from the guest's
     // AssertResult above) into the host-rebuilt buckets keyed by

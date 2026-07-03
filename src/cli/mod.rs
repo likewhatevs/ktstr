@@ -76,8 +76,9 @@ pub use crate::vmm::host_topology::CpuCap;
 /// `cargo-ktstr`'s `BuildCompareFilters::build()` plumbing. The
 /// `stats` module is `pub(crate)` (its tabular reporting types
 /// have no stable surface yet), but the `cargo-ktstr` binary needs
-/// `Dimension` and `derive_slicing_dims` to construct compare
-/// requests and to unit-test the filter-builder shape. Same
+/// `Dimension` and `derive_slicing_dims` to unit-test the
+/// filter-builder shape (the `BuildCompareFilters` tests assert
+/// which slicing dim a per-side filter pair derives). Same
 /// pattern as `CpuCap` above: keep the canonical definitions in
 /// `stats` (where the comparison plumbing consumes them
 /// internally) and re-export the slim slicing surface through

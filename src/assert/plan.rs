@@ -705,7 +705,7 @@ impl AssertResult {
     /// Distinct from [`Self::note`]: `note` carries a free-form
     /// `String` for operator triage; `note_value` carries a typed
     /// `(key, NoteValue)` pair for programmatic consumption (sidecar
-    /// parsers, `stats compare` regression dashboards). Producers
+    /// parsers, `perf-delta` regression dashboards). Producers
     /// commonly call BOTH — they occupy independent buffers and
     /// neither overwrites the other.
     ///

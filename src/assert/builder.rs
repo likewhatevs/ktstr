@@ -92,7 +92,7 @@ pub struct Assert {
     ///     wake latencies are single-digit µs, so sub-µs resolution
     ///     matters for regression gates);
     ///   - the reporting fields use US for readability in
-    ///     `stats compare` / dashboard output.
+    ///     `perf-delta` / dashboard output.
     ///
     /// Both are computed from the same underlying
     /// [`WorkerReport::wake_latencies_ns`] samples — see

@@ -316,7 +316,7 @@ pub(crate) struct PhaseCoverageDiff {
 /// unchanged.
 ///
 /// The struct is `serde::Serialize` / `serde::Deserialize` so
-/// `cargo ktstr stats compare --policy <path>` can load a
+/// `cargo ktstr perf-delta --policy <path>` can load a
 /// JSON-persisted policy file. Default construction produces an
 /// empty policy that uses every registry default; [`Self::uniform`]
 /// reproduces the old `--threshold N` behaviour without any
@@ -337,7 +337,7 @@ pub struct ComparisonPolicy {
 }
 
 /// CLI-controlled rendering of the per-phase delta block in
-/// `cargo ktstr stats compare`. Bundled as a struct so the
+/// `cargo ktstr perf-delta`. Bundled as a struct so the
 /// 5-flag clap surface threads through `compare_partitions` as
 /// a single positional rather than five. Default value renders
 /// every phase / every metric / every paired row — equivalent
@@ -520,7 +520,7 @@ impl ComparisonPolicy {
 
     /// Uniform override: every metric uses `percent / 100.0`.
     /// Mirrors the old `--threshold N` CLI behaviour; the CLI
-    /// dispatch at `cargo-ktstr stats compare --threshold N`
+    /// dispatch at `cargo ktstr perf-delta --threshold N`
     /// constructs a policy via this constructor.
     pub fn uniform(percent: f64) -> Self {
         Self {
@@ -608,7 +608,7 @@ impl ComparisonPolicy {
     /// default (validated for sign); `--policy PATH` loads a
     /// per-metric JSON policy; neither falls through to the registry
     /// defaults. Shared by every subcommand that accepts the pair
-    /// (`stats compare`, `perf-delta`) so the resolution rules — and
+    /// (`perf-delta`) so the resolution rules — and
     /// the "exactly one of the two" contract — live in one place.
     ///
     /// Both flags set is rejected with an error. At the CLI call
@@ -1277,7 +1277,7 @@ pub(crate) fn render_overcommit_warning(
              host-overcommitted, so its guest-scheduler timing metrics \
              (wake-latency / off-CPU / run-delay) are host-contention-confounded. \
              Compare the overcommit-invariant worst_iterations_per_cpu_sec metric \
-             (`stats compare --metric worst_iterations_per_cpu_sec`) instead of raw \
+             instead of raw \
              timing."
         );
     } else {
@@ -1446,7 +1446,7 @@ pub(crate) fn zero_match_diagnostic(
     pool_len: usize,
 ) -> String {
     let mut msg = format!(
-        "stats compare: {side} side filter matched 0 sidecars in \
+        "perf-delta: {side} side filter matched 0 sidecars in \
          pool ({pool_len} pooled). Check the per-side filters or \
          confirm the runs exist with `cargo ktstr stats list`."
     );
@@ -1625,7 +1625,7 @@ pub(crate) fn zero_match_diagnostic(
     msg
 }
 
-/// Resolved inputs for the `stats compare --runs` render phase.
+/// Resolved inputs for the `perf-delta` render phase.
 ///
 /// Produced by [`prepare_partitioned_comparison`] — the validation,
 /// pooling, partitioning, and averaging steps of [`compare_partitions`]
@@ -1669,10 +1669,10 @@ struct PartitionedComparison {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowPrep {
     /// Fold same-pairing-key rows on each side into one arithmetic-mean
-    /// row — the default `stats compare` behavior.
+    /// row — the default (averaging) compare behavior.
     Averaged,
     /// Keep every row distinct and REJECT duplicate pairing keys. The
-    /// pairwise `stats compare --no-average` path: `compare_rows` pairs
+    /// pairwise no-average compare path: `compare_rows` pairs
     /// one A-row against exactly one B-row per key, so a duplicate key
     /// is ambiguous and must be an error.
     PerRunUnique,
@@ -1707,7 +1707,7 @@ fn prepare_partitioned_comparison(
     let slicing_dims = derive_slicing_dims(filter_a, filter_b);
     if slicing_dims.is_empty() {
         anyhow::bail!(
-            "stats compare: A and B select identical rows. \
+            "perf-delta: A and B select identical rows. \
              Specify at least one per-side filter (e.g. \
              --a-kernel 6.14 --b-kernel 6.15) to define what \
              dimension separates the two sides."
@@ -1724,7 +1724,7 @@ fn prepare_partitioned_comparison(
     if slicing_dims.len() > 1 {
         let dim_names: Vec<&str> = slicing_dims.iter().map(|d| d.name()).collect();
         eprintln!(
-            "warning: stats compare: slicing on {n} dimensions [{dims}]; \
+            "warning: perf-delta: slicing on {n} dimensions [{dims}]; \
              results compress multiple axes into a single A/B contrast.",
             n = slicing_dims.len(),
             dims = dim_names.join(", "),
@@ -1762,7 +1762,7 @@ fn prepare_partitioned_comparison(
     }
     if pool.is_empty() {
         anyhow::bail!(
-            "stats compare: no sidecar data found under {}. \
+            "perf-delta: no sidecar data found under {}. \
              Run `cargo ktstr test` to generate runs, or pass \
              --dir to point at an archived sidecar tree.",
             root.display(),
@@ -1771,11 +1771,10 @@ fn prepare_partitioned_comparison(
     let rows: Vec<GauntletRow> = pool.iter().map(sidecar_to_row).collect();
 
     // Partition: apply each side's filter to the same pool. A
-    // row may match both sides (e.g. when scheduler is the
-    // slicing dim and kernel is unconstrained on both, a row
-    // whose `scheduler` is in `filter_a.schedulers` matches A
-    // but NOT B unless `filter_b.schedulers` also contains it —
-    // typically not when scheduler is the slicing axis).
+    // row may match both sides (e.g. when project_commit is the
+    // slicing dim, a row whose `project_commit` is in
+    // `filter_a.project_commits` matches A but NOT B unless
+    // `filter_b.project_commits` also contains it).
     let mut rows_a = apply_row_filters(&rows, filter_a);
     let mut rows_b = apply_row_filters(&rows, filter_b);
     if rows_a.is_empty() {
@@ -1813,7 +1812,7 @@ fn prepare_partitioned_comparison(
             // Derive each run's Rate metrics so compare_rows_by reads them
             // (the schedstat rates whose components only appear in ext_metrics
             // at sidecar_to_row time). The Averaged path derives via
-            // group_and_average_by; this per-run (`stats compare --no-average`)
+            // group_and_average_by; this per-run (no-average)
             // path must derive per row or every schedstat Rate is silently
             // dropped from the pairwise delta.
             for r in rows_a.iter_mut() {
@@ -3315,7 +3314,7 @@ pub(crate) fn format_noise_phase_findings_lines(
     lines
 }
 
-/// Render the scalar findings table for `stats compare --runs`.
+/// Render the scalar findings table for `perf-delta`.
 ///
 /// Extracted from [`compare_partitions`] verbatim; the
 /// `--phases-only` gate stays at the call site so this prints
@@ -3353,7 +3352,7 @@ fn print_scalar_findings_table(report: &CompareReport, label_a: &str, label_b: &
     println!("{table}");
 }
 
-/// Render the per-phase delta block for `stats compare --runs`.
+/// Render the per-phase delta block for `perf-delta`.
 /// Activated when the parallel pass populated any of phase_deltas,
 /// phase_coverage_diffs, or unpaired_phases for the current row-pair
 /// set AND `--no-phases` was not passed. Single-phase scenarios (no
@@ -3594,7 +3593,7 @@ pub(crate) fn format_phase_block_lines(
     lines
 }
 
-/// Render the scalar summary block for `stats compare --runs` —
+/// Render the scalar summary block for `perf-delta` —
 /// regressions / improvements / unchanged + skipped-failed +
 /// per-group pass counts + new_in_b / removed_from_a. All lines
 /// describe the scalar findings table; the `--phases-only` gate
@@ -3677,7 +3676,7 @@ pub(crate) fn format_coverage_diff_lines(
     lines
 }
 
-/// Print the host-context delta for `stats compare --runs`. Same
+/// Print the host-context delta for `perf-delta`. Same
 /// first-Some(host) baseline `compare_partitions` uses — picking
 /// representative hosts off the partitioned sidecars rather than
 /// the full pool so the delta reflects what actually fed the
@@ -3731,7 +3730,7 @@ pub(crate) fn check_no_duplicate_pairing_keys(
     }
     if let Some((dup_key, count)) = seen.iter().find(|&(_, &c)| c > 1) {
         anyhow::bail!(
-            "stats compare --no-average: side {side_label} has {count} \
+            "perf-delta: side {side_label} has {count} \
              sidecars with the same pairing key {key:?}. Either drop \
              --no-average to average them, or add another --{side}-X \
              filter to disambiguate.",
@@ -3742,7 +3741,7 @@ pub(crate) fn check_no_duplicate_pairing_keys(
     Ok(())
 }
 
-/// Render the host-context delta section of `stats compare --runs`
+/// Render the host-context delta section of `perf-delta`
 /// as a block of text ready to `print!`. Extracted as a pure
 /// function of `(Option<&HostContext>, Option<&HostContext>, &str,
 /// &str)` so the five match arms can be unit-tested without

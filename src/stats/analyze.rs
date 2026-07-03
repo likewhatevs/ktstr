@@ -635,7 +635,7 @@ pub(crate) fn sorted_run_entries(root: &std::path::Path) -> std::io::Result<Vec<
 /// (from `SidecarResult::run_source`), `resolve_source` (from
 /// `SidecarResult::resolve_source`), and `cpu_budget` (from
 /// `SidecarResult::cpu_budget`). The dimension catalogue here matches
-/// what `cargo ktstr stats compare` accepts as `--X` and `--a-X` /
+/// what `cargo ktstr perf-delta` accepts as `--X` and `--a-X` /
 /// `--b-X` filter flags — the command exists so an operator can answer
 /// "what kernel versions are in the pool?" before crafting a compare
 /// invocation. The JSON keys `commit` and `source` are the wire

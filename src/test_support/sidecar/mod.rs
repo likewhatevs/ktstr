@@ -176,7 +176,7 @@ pub struct SidecarResult {
     /// `sidecar_variant_hash` for the same cross-host grouping
     /// reason `scheduler_commit` is excluded: two runs of the same
     /// semantic variant on different ktstr commits must still bucket
-    /// together so `stats compare` can diff them; the commit-drift
+    /// together so `perf-delta` can diff them; the commit-drift
     /// detection inspects this field directly via `--project-commit`
     /// / `--a-project-commit` / `--b-project-commit`.
     pub project_commit: Option<String>,
@@ -249,7 +249,7 @@ pub struct SidecarResult {
     /// analysis, and `replay` match nextest's exit code. This flag
     /// preserves the one fact that overwrite loses: that the run's
     /// telemetry is failure-mode-dominated (a deliberately short /
-    /// stalled run). `stats compare` ORs it into its exclusion guard so
+    /// stalled run). `perf-delta` ORs it into its exclusion guard so
     /// an inverted-to-pass row is still kept OUT of the regression math
     /// (its induced-crash telemetry is not real scheduler behavior).
     pub expected_failure: bool,
@@ -371,7 +371,7 @@ pub struct SidecarResult {
     /// cross-host grouping reason `scheduler_commit` and
     /// `project_commit` are excluded: two runs of the same semantic
     /// variant on different kernel-source HEADs must still bucket
-    /// together so `stats compare` can diff them; the commit-drift
+    /// together so `perf-delta` can diff them; the commit-drift
     /// detection inspects this field directly via the
     /// `--kernel-commit` filter.
     pub kernel_commit: Option<String>,
@@ -432,7 +432,7 @@ pub struct SidecarResult {
     pub cleanup_duration_ms: Option<u64>,
     /// Provenance tag for this sidecar — distinguishes a developer's
     /// local run from a CI run so cross-environment comparisons in
-    /// `stats compare` can narrow on (or contrast across) the run
+    /// `perf-delta` can narrow on (or contrast across) the run
     /// environment without inferring it from `host`.
     ///
     /// Recorded by `detect_run_source` at sidecar-write time:
@@ -458,9 +458,8 @@ pub struct SidecarResult {
     /// contract. Excluded from `sidecar_variant_hash` for the same
     /// cross-host grouping reason `host` is excluded — two runs of
     /// the same semantic variant from different environments must
-    /// still bucket together so `stats compare` can diff them;
-    /// `--run-source` and `--a-run-source` / `--b-run-source` are the
-    /// explicit knobs for source-aware narrowing.
+    /// still bucket together so `perf-delta` can pair them; `--run-source`
+    /// is the explicit knob for source-aware narrowing.
     ///
     /// Field name `run_source` (renamed from `source`) disambiguates
     /// from [`crate::cache::KernelSource`] / `KernelMetadata.source`
@@ -993,13 +992,13 @@ pub(crate) fn collect_sidecars_with_errors(
 /// stale-sidecar skip counts aggregate into one pool-wide summary). The
 /// result is a flat
 /// `Vec<SidecarResult>` covering every recorded run on disk —
-/// `cargo ktstr stats compare`'s pool-driven sourcing reads it
+/// `cargo ktstr perf-delta`'s pool-driven sourcing reads it
 /// once, applies the typed `--a-*` / `--b-*` filters in memory,
 /// and partitions the survivors into A/B sides.
 ///
 /// `root` is typically [`runs_root`]; pass an alternate path when
 /// comparing archived sidecar trees copied off a CI host (the
-/// `--dir` escape hatch on `stats compare`).
+/// `--dir` escape hatch on `perf-delta`).
 ///
 /// Returns an empty Vec when `root` does not exist or contains no
 /// run directories. Per-run failure (a corrupt sidecar, a partial
@@ -1310,7 +1309,7 @@ fn resolve_default_sidecar_dir() -> PathBuf {
 /// SENTINEL ASYMMETRY: the on-disk dirname uses `"unknown"` for
 /// missing values, but the in-memory [`SidecarResult::project_commit`]
 /// / [`SidecarResult::kernel_version`] fields stay `None` (`null`
-/// in JSON). `cargo ktstr stats compare --project-commit unknown`
+/// in JSON). a `project_commit` filter for a specific commit
 /// will NOT match a sidecar whose `project_commit` is `None` —
 /// omit the filter to include `None`-commit rows. The asymmetry
 /// is deliberate: the dirname needs a filesystem-safe sentinel,
@@ -2115,7 +2114,7 @@ fn commit_with_dirty_suffix(repo: &gix::Repository) -> Option<String> {
 /// separate `[[bin]]` crate that consumes `ktstr` as an
 /// external dependency and needs this helper to compute the
 /// `-dirty` suffix in
-/// `cargo ktstr stats compare --project-commit HEAD`. Hidden
+/// the baseline/HEAD commit in `cargo ktstr perf-delta`. Hidden
 /// from rustdoc via `#[doc(hidden)]` because it is a probe-
 /// style helper without a stable API contract — external
 /// consumers should not depend on it.
@@ -2335,7 +2334,7 @@ pub const SIDECAR_RUN_SOURCE_LOCAL: &str = "local";
 /// Tag value applied to [`SidecarResult::run_source`] /
 /// [`GauntletRow::run_source`](crate::stats::GauntletRow::run_source)
 /// at LOAD time when the consumer pulls sidecars from a non-default
-/// pool root via `cargo ktstr stats compare --dir` /
+/// pool root via `cargo ktstr stats show-host --dir` /
 /// `cargo ktstr stats list-values --dir`. NEVER written by
 /// [`write_sidecar`] — the writer cannot know the file will later
 /// be moved off-host. See [`apply_archive_source_override`].
@@ -2638,7 +2637,7 @@ fn kernel_commit_for_sidecar() -> Option<String> {
 /// [`SidecarResult::run_source`] /
 /// [`SidecarResult::resolve_source`] directly (via
 /// `--project-commit` / `--kernel-commit` / `--run-source` /
-/// `--resolve-source` on `stats compare`); the filename stays stable
+/// `--resolve-source` on `perf-delta`); the filename stays stable
 /// across commits and run environments by design.
 ///
 /// The corollary of the HostContext exclusion: if the host's
@@ -3020,7 +3019,7 @@ pub(crate) fn finalize_sidecar_verdict(
     };
     // The run's telemetry is failure-mode-dominated when its scenario
     // actually failed/was-inconclusive but the final verdict is a
-    // pass/skip (an inversion) — `stats compare` excludes such rows.
+    // pass/skip (an inversion) — `perf-delta` excludes such rows.
     let raw_failed = sc.is_fail() || sc.is_inconclusive();
     let expected_failure = raw_failed && (passed || skipped);
     if sc.passed == passed

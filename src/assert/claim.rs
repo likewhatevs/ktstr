@@ -247,7 +247,7 @@ impl Verdict {
     /// Use when a test wants to surface a programmatically
     /// consumable measurement (e.g. `verdict.note_value("max_wchar",
     /// 12345i64)`) alongside pass/fail claims, so sidecar parsers
-    /// and `stats compare` dashboards can read the typed value
+    /// and `perf-delta` dashboards can read the typed value
     /// without re-grepping `details`.
     pub fn note_value(&mut self, key: impl Into<String>, value: impl Into<NoteValue>) -> &mut Self {
         self.result.note_value(key, value);

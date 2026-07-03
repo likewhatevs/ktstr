@@ -1449,7 +1449,7 @@ type PhaseSpec<'a> = (u16, &'a str, f64, &'a [(&'a str, f64)]);
 /// unpaired-phase render path.
 fn phase_sidecar(
     test_name: &str,
-    scheduler: &str,
+    project_commit: &str,
     passed: bool,
     spread: f64,
     phases: &[PhaseSpec],
@@ -1464,7 +1464,7 @@ fn phase_sidecar(
         .collect();
     crate::test_support::SidecarResult {
         test_name: test_name.to_string(),
-        scheduler: scheduler.to_string(),
+        project_commit: Some(project_commit.to_string()),
         passed,
         stats: crate::assert::ScenarioStats {
             worst_spread: spread,
@@ -1482,7 +1482,7 @@ fn phase_sidecar(
 /// table, the discovery footer hint, and the scalar summary block
 /// (excluded_pairs + new_in_b + removed_from_a) all render inside
 /// `compare_partitions`, which pools sidecars off disk. The fixture
-/// writes a tempdir pool whose per-side filters slice on `scheduler`,
+/// writes a tempdir pool whose per-side filters slice on `project_commit`,
 /// so the comparison joins on the remaining pairing dims.
 ///
 /// Runs with `no_average = true`: per-phase buckets only survive the
@@ -1521,8 +1521,8 @@ fn phase_sidecar(
 fn compare_partitions_renders_phase_and_summary_blocks_via_pool() {
     let alt_root = tempfile::TempDir::new().expect("create alt-root tempdir");
     // One subdir per sidecar. (test_name, scheduler, passed, scalar
-    // spread, phases). scx_alpha is the A side, scx_beta the B side;
-    // scheduler is the slicing dim. The B side of paired_scn carries
+    // spread, phases). commit_a is the A side, commit_b the B side;
+    // project_commit is the slicing dim. The B side of paired_scn carries
     // an extra Step[0] bucket so the matched pair has phase-coverage
     // asymmetry (covers the unpaired-phase render path).
     // `const` (not a `let` binding) so the extra-metrics slices are
@@ -1546,41 +1546,41 @@ fn compare_partitions_renders_phase_and_summary_blocks_via_pool() {
         // still 1 from the scalar worst_spread regression).
         (
             "paired_scn",
-            "scx_alpha",
+            "commit_a",
             true,
             10.0,
             vec![(0u16, "BASELINE", 10.0, PAIRED_A_EXTRA)],
         ),
         (
             "paired_scn",
-            "scx_beta",
+            "commit_b",
             true,
             30.0,
             baseline_plus_step(30.0),
         ),
         // present on both sides but B failed -> excluded_pairs.
-        ("excl_scn", "scx_alpha", true, 10.0, baseline(10.0)),
-        ("excl_scn", "scx_beta", false, 30.0, baseline(30.0)),
+        ("excl_scn", "commit_a", true, 10.0, baseline(10.0)),
+        ("excl_scn", "commit_b", false, 30.0, baseline(30.0)),
         // B-only -> new_in_b.
-        ("new_only_b", "scx_beta", true, 10.0, baseline(10.0)),
+        ("new_only_b", "commit_b", true, 10.0, baseline(10.0)),
         // A-only -> removed_from_a.
-        ("removed_only_a", "scx_alpha", true, 10.0, baseline(10.0)),
+        ("removed_only_a", "commit_a", true, 10.0, baseline(10.0)),
     ];
-    for (i, (name, sched, passed, spread, phases)) in sidecars.iter().enumerate() {
+    for (i, (name, pc, passed, spread, phases)) in sidecars.iter().enumerate() {
         let run_dir = alt_root.path().join(format!("__phase_render_{i}__"));
         std::fs::create_dir_all(&run_dir).expect("create run dir");
-        let sc = phase_sidecar(name, sched, *passed, *spread, phases);
+        let sc = phase_sidecar(name, pc, *passed, *spread, phases);
         let json = serde_json::to_string(&sc).expect("serialize sidecar");
         std::fs::write(run_dir.join(format!("{name}_{i}.ktstr.json")), json)
             .expect("write sidecar");
     }
 
     let filter_a = RowFilter {
-        schedulers: vec!["scx_alpha".to_string()],
+        project_commits: vec!["commit_a".to_string()],
         ..RowFilter::default()
     };
     let filter_b = RowFilter {
-        schedulers: vec!["scx_beta".to_string()],
+        project_commits: vec!["commit_b".to_string()],
         ..RowFilter::default()
     };
 
@@ -1665,19 +1665,19 @@ fn compare_partitions_no_average_bails_on_duplicate_pairing_keys() {
     let alt_root = tempfile::TempDir::new().expect("create alt-root tempdir");
     // A side: two sidecars with the SAME scenario+topology+work_type
     // (and every other pairing dim equal) -> identical pairing key.
-    // B side: one sidecar so the slicing-dim (scheduler) derivation
+    // B side: one sidecar so the slicing-dim (project_commit) derivation
     // is non-empty.
     let triples = [
-        ("dup_scn", "scx_alpha"),
-        ("dup_scn", "scx_alpha"),
-        ("dup_scn", "scx_beta"),
+        ("dup_scn", "commit_a"),
+        ("dup_scn", "commit_a"),
+        ("dup_scn", "commit_b"),
     ];
-    for (i, (name, sched)) in triples.iter().enumerate() {
+    for (i, (name, pc)) in triples.iter().enumerate() {
         let run_dir = alt_root.path().join(format!("__dup_{i}__"));
         std::fs::create_dir_all(&run_dir).expect("create run dir");
         let sc = phase_sidecar(
             name,
-            sched,
+            pc,
             true,
             10.0,
             &[(0, "BASELINE", 10.0, &[] as &[(&str, f64)])],
@@ -1687,11 +1687,11 @@ fn compare_partitions_no_average_bails_on_duplicate_pairing_keys() {
             .expect("write sidecar");
     }
     let filter_a = RowFilter {
-        schedulers: vec!["scx_alpha".to_string()],
+        project_commits: vec!["commit_a".to_string()],
         ..RowFilter::default()
     };
     let filter_b = RowFilter {
-        schedulers: vec!["scx_beta".to_string()],
+        project_commits: vec!["commit_b".to_string()],
         ..RowFilter::default()
     };
     let err = compare_partitions(

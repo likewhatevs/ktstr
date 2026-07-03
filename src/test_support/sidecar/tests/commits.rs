@@ -13,7 +13,7 @@ use anyhow::Result;
 /// `skipped: true, passed: false, inconclusive: false` so the strict
 /// 4-state mutex `(passed, skipped, inconclusive, fail)` holds and
 /// downstream consumers (`SidecarResult::is_pass()`,
-/// `select_failed_names`, `stats compare`) read the row as a Skip
+/// `select_failed_names`, `perf-delta`) read the row as a Skip
 /// rather than a Pass. This regression guards that contract against
 /// a future change that flips back to `passed: true` (which would
 /// double-count skipped runs into both pass and skip buckets and
@@ -78,7 +78,7 @@ fn write_skip_sidecar_records_skip_mutex() {
     );
     // write_skip_sidecar shares the host-context capture with
     // write_sidecar (same `collect_host_context()` builder line)
-    // so skip paths still give `stats compare --runs` a host
+    // so skip paths still give `perf-delta` a host
     // baseline. A regression that dropped the skip-path capture
     // would leave `host: None` in only the skip bucket, producing
     // silent per-run partial data.
@@ -718,7 +718,7 @@ fn sidecar_variant_hash_excludes_host_context() {
 /// `scheduler_commit` is metadata, not a variant discriminator:
 /// two gauntlet runs differing only in the recorded scheduler
 /// commit (e.g. same variant re-run after a scheduler rebuild)
-/// must share one hash bucket so `stats compare` treats them as
+/// must share one hash bucket so `perf-delta` treats them as
 /// the same semantic variant. If a future change folds
 /// `scheduler_commit` into `sidecar_variant_hash`, this test
 /// catches it before the run-key split reaches on-disk sidecars
@@ -742,7 +742,7 @@ fn sidecar_variant_hash_excludes_scheduler_commit() {
         "scheduler_commit must not influence variant hash — \
          runs of the same semantic variant on different \
          scheduler-binary builds must remain comparable by \
-         `stats compare`",
+         `perf-delta`",
     );
 }
 
@@ -750,7 +750,7 @@ fn sidecar_variant_hash_excludes_scheduler_commit() {
 /// two gauntlet runs differing only in the recorded ktstr
 /// project commit (e.g. same variant re-run after a `git pull`
 /// of the harness, or run from two ktstr clones at different
-/// HEADs) must share one hash bucket so `stats compare`
+/// HEADs) must share one hash bucket so `perf-delta`
 /// treats them as the same semantic variant. If a future
 /// change folds `project_commit` into `sidecar_variant_hash`,
 /// this test catches it before the run-key split reaches
@@ -828,7 +828,7 @@ fn sidecar_variant_hash_excludes_project_commit() {
 /// source-tree commit (e.g. same variant re-run after a
 /// `git pull` of the kernel tree, or the same release rebuilt
 /// on top of a WIP patch) must share one hash bucket so
-/// `stats compare` treats them as the same semantic variant.
+/// `perf-delta` treats them as the same semantic variant.
 /// If a future change folds `kernel_commit` into
 /// `sidecar_variant_hash`, this test catches it before the
 /// run-key split reaches on-disk sidecars and splits
@@ -1002,7 +1002,7 @@ fn sidecar_variant_hash_excludes_resolve_source() {
 /// change is a different MEASUREMENT, separated downstream by the
 /// `Dimension::CpuBudget` pairing, not by shattering the identity bucket.
 /// Two runs of the same semantic variant at different budgets must still
-/// bucket together so `stats compare` can diff them — mirrors the
+/// bucket together so `perf-delta` can diff them — mirrors the
 /// commit / run_source exclusion tests.
 #[test]
 fn sidecar_variant_hash_excludes_cpu_budget() {

@@ -65,7 +65,7 @@ fn sidecar_to_row_basic() {
 /// MetricDef::read surfaces it via the `|_| None` accessor's ext fallback;
 /// an absent key (no cgroup reported a defined rate) reads None, distinct
 /// from a measured 0.0. The metric stays registered so
-/// `stats compare --metric worst_iterations_per_cpu_sec` resolves.
+/// it resolves in the metric registry (`stats list-metrics`).
 #[test]
 fn sidecar_to_row_carries_worst_iterations_per_cpu_sec_via_ext() {
     use crate::test_support;
@@ -78,7 +78,7 @@ fn sidecar_to_row_carries_worst_iterations_per_cpu_sec_via_ext() {
         ..test_support::SidecarResult::test_fixture()
     };
     let def = metric_def("worst_iterations_per_cpu_sec")
-        .expect("metric must be registered so `stats compare --metric` resolves it");
+        .expect("metric must be registered so it resolves in the metric registry");
     assert_eq!(def.read(&sidecar_to_row(&present)), Some(1234.5));
 
     // Absent key (re-pool wrote nothing) → read None, NOT a measured 0.0.

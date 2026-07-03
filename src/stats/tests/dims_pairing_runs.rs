@@ -69,18 +69,18 @@ fn derive_slicing_dims_identical_filters_yields_empty() {
     assert!(derive_slicing_dims(&f, &f).is_empty());
 }
 
-/// One-dim diff: only the differing dimension is reported.
+/// One-dim diff on a SLICEABLE (version) axis: only that dimension is reported.
 #[test]
 fn derive_slicing_dims_single_dim_diff() {
     let f_a = RowFilter {
-        schedulers: vec!["scx_alpha".to_string()],
+        kernels: vec!["6.14".to_string()],
         ..RowFilter::default()
     };
     let f_b = RowFilter {
-        schedulers: vec!["scx_beta".to_string()],
+        kernels: vec!["6.15".to_string()],
         ..RowFilter::default()
     };
-    assert_eq!(derive_slicing_dims(&f_a, &f_b), vec![Dimension::Scheduler]);
+    assert_eq!(derive_slicing_dims(&f_a, &f_b), vec![Dimension::Kernel]);
 }
 
 /// Vec dims (kernels/commits) compare as sorted-deduped sets —
@@ -102,37 +102,40 @@ fn derive_slicing_dims_vec_compares_as_set() {
     );
 }
 
-/// Multi-dim diff: every differing dimension is reported, in
-/// canonical [`Dimension::ALL`] order.
+/// Multi-dim diff across SLICEABLE axes: every differing sliceable
+/// dimension is reported, in canonical [`Dimension::ALL`] order. A
+/// differing NON-sliceable dim (here `schedulers`) is NOT reported — it
+/// is filter + pairing only (see [`Dimension::SLICEABLE`]).
 #[test]
 fn derive_slicing_dims_multi_dim_diff_in_canonical_order() {
     let f_a = RowFilter {
         kernels: vec!["6.14".to_string()],
+        project_commits: vec!["aaaaaaa".to_string()],
         schedulers: vec!["scx_alpha".to_string()],
         ..RowFilter::default()
     };
     let f_b = RowFilter {
         kernels: vec!["6.15".to_string()],
+        project_commits: vec!["bbbbbbb".to_string()],
         schedulers: vec!["scx_beta".to_string()],
         ..RowFilter::default()
     };
     assert_eq!(
         derive_slicing_dims(&f_a, &f_b),
-        vec![Dimension::Kernel, Dimension::Scheduler],
+        vec![Dimension::Kernel, Dimension::ProjectCommit],
+        "sliceable dims slice in canonical order; the differing scheduler \
+         (non-sliceable) is filter+pairing only and never slices",
     );
 }
 
-/// Source-only diff: filters that disagree on `run_sources`
-/// and agree on every other dimension produce a slicing-dim
-/// set containing exactly `Dimension::RunSource`. Pins the
-/// Source arm of the per-dimension comparison switch in
-/// [`derive_slicing_dims`] — a regression that omitted the
-/// arm or compared the wrong field would surface here as an
-/// empty slicing-dim set (and downstream as a `compare`
-/// command that mistakenly bails with "A and B select
-/// identical rows" on a legitimate source contrast).
+/// Run-source is FILTER + PAIRING only — NOT a sliceable axis (see
+/// [`Dimension::SLICEABLE`]). A `run_sources` difference must NOT form an A/B
+/// contrast: only the version axes (kernel / project-commit / kernel-commit)
+/// slice; contrasting across run-source would bulk-compare heterogeneous runs
+/// the significance math cannot soundly attribute. It still narrows the cohort
+/// and joins A to B as a pairing dim.
 #[test]
-fn derive_slicing_dims_source_only_diff() {
+fn derive_slicing_dims_run_source_is_filter_pairing_only() {
     let f_a = RowFilter {
         run_sources: vec!["local".to_string()],
         ..RowFilter::default()
@@ -141,37 +144,17 @@ fn derive_slicing_dims_source_only_diff() {
         run_sources: vec!["ci".to_string()],
         ..RowFilter::default()
     };
-    assert_eq!(
-        derive_slicing_dims(&f_a, &f_b),
-        vec![Dimension::RunSource],
-        "differing `run_sources` must surface Source as a slicing dim",
-    );
-
-    // Sorted-deduped Vec semantics also apply on the Source
-    // dim — same set in different order/multiplicity must NOT
-    // slice. Mirrors the `derive_slicing_dims_vec_compares_as_set`
-    // contract for the Source arm.
-    let f_c = RowFilter {
-        run_sources: vec!["local".to_string(), "ci".to_string()],
-        ..RowFilter::default()
-    };
-    let f_d = RowFilter {
-        run_sources: vec!["ci".to_string(), "local".to_string(), "local".to_string()],
-        ..RowFilter::default()
-    };
     assert!(
-        derive_slicing_dims(&f_c, &f_d).is_empty(),
-        "same run_source set in different order/multiplicity must NOT slice",
+        derive_slicing_dims(&f_a, &f_b).is_empty(),
+        "run_source is not sliceable — a difference must not slice",
     );
 }
 
-/// Resolve-source-only diff: filters that disagree on
-/// `resolve_sources` and agree on every other dimension produce a
-/// slicing-dim set containing exactly `Dimension::ResolveSource`. Pins
-/// the ResolveSource arm of [`derive_slicing_dims`] — mirror of
-/// `derive_slicing_dims_source_only_diff` for the resolve_source dim.
+/// Resolve-source is FILTER + PAIRING only — NOT sliceable (see
+/// [`Dimension::SLICEABLE`]). A `resolve_sources` difference must NOT slice;
+/// mirror of `derive_slicing_dims_run_source_is_filter_pairing_only`.
 #[test]
-fn derive_slicing_dims_resolve_source_only_diff() {
+fn derive_slicing_dims_resolve_source_is_filter_pairing_only() {
     let f_a = RowFilter {
         resolve_sources: vec!["auto_built".to_string()],
         ..RowFilter::default()
@@ -180,42 +163,19 @@ fn derive_slicing_dims_resolve_source_only_diff() {
         resolve_sources: vec!["target_debug".to_string()],
         ..RowFilter::default()
     };
-    assert_eq!(
-        derive_slicing_dims(&f_a, &f_b),
-        vec![Dimension::ResolveSource],
-        "differing `resolve_sources` must surface ResolveSource as a slicing dim",
-    );
-    // Sorted-deduped set semantics on the ResolveSource arm too.
-    let f_c = RowFilter {
-        resolve_sources: vec!["auto_built".to_string(), "path".to_string()],
-        ..RowFilter::default()
-    };
-    let f_d = RowFilter {
-        resolve_sources: vec![
-            "path".to_string(),
-            "auto_built".to_string(),
-            "path".to_string(),
-        ],
-        ..RowFilter::default()
-    };
     assert!(
-        derive_slicing_dims(&f_c, &f_d).is_empty(),
-        "same resolve_source set in different order/multiplicity must NOT slice",
+        derive_slicing_dims(&f_a, &f_b).is_empty(),
+        "resolve_source is not sliceable — a difference must not slice",
     );
 }
 
-/// Topology-only diff: filters that disagree on `topologies`
-/// and agree on every other dimension produce a slicing-dim
-/// set containing exactly `Dimension::Topology`. Pins the
-/// Topology arm of the per-dimension comparison switch in
-/// [`derive_slicing_dims`] for the post-Vec-promotion
-/// `topologies` field; before promotion `--topology` was a
-/// single-value `Option<String>` and the per-arm comparison
-/// shape was `Option<String> != Option<String>`. Mirror of
-/// `derive_slicing_dims_source_only_diff` for the Topology
-/// arm.
+/// Topology is FILTER + PAIRING only — NOT sliceable (see
+/// [`Dimension::SLICEABLE`]). A `topologies` difference must NOT slice:
+/// contrasting across topology compares physically different machines, which
+/// the significance math cannot attribute to a code change. It joins A to B as
+/// a pairing dim.
 #[test]
-fn derive_slicing_dims_topology_only_diff() {
+fn derive_slicing_dims_topology_is_filter_pairing_only() {
     let f_a = RowFilter {
         topologies: vec!["1n2l4c1t".to_string()],
         ..RowFilter::default()
@@ -224,39 +184,17 @@ fn derive_slicing_dims_topology_only_diff() {
         topologies: vec!["1n2l4c2t".to_string()],
         ..RowFilter::default()
     };
-    assert_eq!(
-        derive_slicing_dims(&f_a, &f_b),
-        vec![Dimension::Topology],
-        "differing `topologies` must surface Topology as a slicing dim",
-    );
-
-    // Sorted-deduped Vec semantics: same set in different
-    // order/multiplicity must NOT slice.
-    let f_c = RowFilter {
-        topologies: vec!["1n2l4c1t".to_string(), "1n2l4c2t".to_string()],
-        ..RowFilter::default()
-    };
-    let f_d = RowFilter {
-        topologies: vec![
-            "1n2l4c2t".to_string(),
-            "1n2l4c1t".to_string(),
-            "1n2l4c1t".to_string(),
-        ],
-        ..RowFilter::default()
-    };
     assert!(
-        derive_slicing_dims(&f_c, &f_d).is_empty(),
-        "same topology set in different order/multiplicity must NOT slice",
+        derive_slicing_dims(&f_a, &f_b).is_empty(),
+        "topology is not sliceable — a difference must not slice",
     );
 }
 
-/// WorkType-only diff: filters that disagree on `work_types`
-/// and agree on every other dimension produce a slicing-dim
-/// set containing exactly `Dimension::WorkType`. Mirror of
-/// `derive_slicing_dims_topology_only_diff` for the WorkType
-/// arm.
+/// WorkType is FILTER + PAIRING only — NOT sliceable (see
+/// [`Dimension::SLICEABLE`]). A `work_types` difference must NOT slice; mirror
+/// of `derive_slicing_dims_topology_is_filter_pairing_only`.
 #[test]
-fn derive_slicing_dims_work_type_only_diff() {
+fn derive_slicing_dims_work_type_is_filter_pairing_only() {
     let f_a = RowFilter {
         work_types: vec!["SpinWait".to_string()],
         ..RowFilter::default()
@@ -265,29 +203,9 @@ fn derive_slicing_dims_work_type_only_diff() {
         work_types: vec!["PageFaultChurn".to_string()],
         ..RowFilter::default()
     };
-    assert_eq!(
-        derive_slicing_dims(&f_a, &f_b),
-        vec![Dimension::WorkType],
-        "differing `work_types` must surface WorkType as a slicing dim",
-    );
-
-    // Sorted-deduped Vec semantics: same set in different
-    // order/multiplicity must NOT slice.
-    let f_c = RowFilter {
-        work_types: vec!["SpinWait".to_string(), "PageFaultChurn".to_string()],
-        ..RowFilter::default()
-    };
-    let f_d = RowFilter {
-        work_types: vec![
-            "PageFaultChurn".to_string(),
-            "SpinWait".to_string(),
-            "SpinWait".to_string(),
-        ],
-        ..RowFilter::default()
-    };
     assert!(
-        derive_slicing_dims(&f_c, &f_d).is_empty(),
-        "same work_type set in different order/multiplicity must NOT slice",
+        derive_slicing_dims(&f_a, &f_b).is_empty(),
+        "work_type is not sliceable — a difference must not slice",
     );
 }
 

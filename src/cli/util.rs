@@ -17,7 +17,7 @@ pub fn stderr_color() -> bool {
 }
 
 /// Whether stdout supports color (cached per process). Distinct from
-/// [`stderr_color`] because `cargo ktstr stats compare > report.txt`
+/// [`stderr_color`] because `cargo ktstr perf-delta > report.txt`
 /// pipes stdout to a file while leaving stderr on the TTY — gating
 /// stdout tables on the stderr TTY state would leave ANSI escapes
 /// in the file. Table-rendering code paths gate on this reading;

@@ -696,7 +696,7 @@ impl MetricKind {
 /// Reduce a slice of per-sample readings of the same metric into
 /// one representative value, dispatching on [`MetricKind`]. Used
 /// by sample-windowed comparison paths (e.g. multi-tick monitor
-/// captures, stats compare across multiple snapshot
+/// captures, perf-delta across multiple snapshot
 /// subdirectories) to collapse a sample vec into the value the
 /// existing scalar-comparison pipeline already understands.
 ///
@@ -1375,7 +1375,7 @@ impl MetricDef {
 ///
 /// Each metric is referenced by three names across the pipeline.
 /// The registry name is the stable surface — sidecars, CI gates,
-/// and `cargo ktstr stats compare` output all quote it verbatim —
+/// and `cargo ktstr perf-delta` output all quote it verbatim —
 /// and cannot be renamed without silently invalidating downstream
 /// consumers. The field name on [`GauntletRow`] and the polars
 /// DataFrame column name are internal; they are kept terse and
@@ -1592,7 +1592,7 @@ pub static METRICS: &[MetricDef] = &[
     MetricDef {
         // `"worst_spread"` is the wire/surface name — emitted in
         // sidecars, referenced by CI gates, and printed by
-        // `cargo ktstr stats compare`. Internally the field on
+        // `cargo ktstr perf-delta`. Internally the field on
         // `GauntletRow` is named `spread` and the polars DataFrame
         // column keeps that shorter name; see the doc on
         // `GauntletRow.spread` for the rationale (rename-of-
@@ -2174,7 +2174,7 @@ pub static METRICS: &[MetricDef] = &[
         // averaging per-phase ratios. Higher-is-better (more throughput). The
         // registry entry exists so MetricDef::read on a
         // GauntletRow.ext_metrics fallback surfaces it through cargo ktstr
-        // stats compare like any other metric, and so
+        // perf-delta like any other metric, and so
         // Timeline::from_phase_buckets reads it by the canonical name from
         // PhaseBucket.metrics. No typed GauntletRow field; accessor is the
         // ext_metrics fallback.
@@ -2317,7 +2317,7 @@ pub static METRICS: &[MetricDef] = &[
         // sample-count-weighted), like user_time_ns. LowerBetter — the DSQ-spinlock
         // regression surfaces as rising system time (CPUs spinning in
         // the kernel). No typed GauntletRow field; the ext_metrics
-        // fallback carries it through cargo ktstr stats compare.
+        // fallback carries it through cargo ktstr perf-delta.
         name: "system_time_ns",
         polarity: crate::test_support::Polarity::LowerBetter,
         kind: MetricKind::PerPhaseDeltaSum,

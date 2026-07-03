@@ -1362,7 +1362,7 @@ impl Default for FailureDumpReport {
 impl FailureDumpReport {
     /// Build a placeholder report for a capture that could not
     /// produce real data. Every `*_unavailable` field is set to
-    /// `Some(reason)` so downstream consumers (`stats compare`,
+    /// `Some(reason)` so downstream consumers (`perf-delta`,
     /// failure-rendering tooling) can distinguish "capture
     /// happened, no data" from "capture path failed for reason X".
     /// All vector / option fields stay at their `Default` empty

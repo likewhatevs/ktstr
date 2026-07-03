@@ -34,12 +34,10 @@ pub(crate) struct Ktstr {
     pub(crate) command: KtstrCommand,
 }
 
-// Same rationale as `StatsCommand`'s sibling `#[allow]` — clap's
-// derive expands every variant into a struct of `Option<T>` /
-// `Vec<T>` per CLI flag, which after the per-side slicing flags
-// were added pushes the Stats-via-Compare variant past clippy's
-// large-variant heuristic. The enum is constructed once per CLI
-// invocation and dispatched immediately; boxing every variant
+// clap's derive expands every variant into a struct of `Option<T>` /
+// `Vec<T>` per CLI flag; the `PerfDelta` variant's large flag set pushes
+// the enum past clippy's large-variant heuristic. The enum is constructed
+// once per CLI invocation and dispatched immediately; boxing every variant
 // would distort the match ergonomics without measurable benefit.
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
@@ -228,7 +226,9 @@ pub(crate) enum KtstrCommand {
     /// (kernel, project commit) pair (re-running at the same key
     /// pre-clears prior sidecars before writing the new run).
     ///
-    /// Use `list` to see runs; `compare <a> <b>` to diff two.
+    /// Single-run inspection (list / list-metrics / list-values /
+    /// show-host / explain-sidecar); `cargo ktstr perf-delta` diffs two
+    /// commits.
     Stats {
         #[command(subcommand)]
         command: Option<StatsCommand>,
@@ -249,7 +249,7 @@ pub(crate) enum KtstrCommand {
     Replay {
         /// Override the sidecar root. Defaults to
         /// `test_support::runs_root()` (typically `target/ktstr/`).
-        /// Same semantics as `cargo ktstr stats compare --dir` and
+        /// Same semantics as `cargo ktstr stats show-host --dir` and
         /// `cargo ktstr stats list-values --dir`: useful when
         /// inspecting an archived sidecar tree copied off a CI host.
         #[arg(long)]
@@ -295,7 +295,7 @@ pub(crate) enum KtstrCommand {
     /// target via `$GITHUB_BASE_REF`, or an explicit `--base`), then
     /// either compares already-pooled sidecars or (with `--dual-run`)
     /// produces both commits' runs first and compares them, reusing the
-    /// `stats compare` regression engine to pair on scenario and emit
+    /// shared `compare_partitions` regression engine to pair on scenario and emit
     /// the verdict.
     PerfDelta {
         /// Override the baseline commit directly (skips merge-base). The
@@ -335,22 +335,12 @@ pub(crate) enum KtstrCommand {
         /// with `--policy`.
         #[arg(long, conflicts_with = "policy")]
         threshold: Option<f64>,
-        /// Path to a JSON `ComparisonPolicy` with per-metric
-        /// thresholds. Mutually exclusive with `--threshold`; see
-        /// `cargo ktstr stats compare --help` for the schema.
+        /// Path to a JSON `ComparisonPolicy` with per-metric thresholds:
+        /// `{ "default_percent": <f64>, "per_metric_percent": { "<metric>":
+        /// <f64>, ... } }` (metric names from `cargo ktstr stats
+        /// list-metrics`). Mutually exclusive with `--threshold`.
         #[arg(long, conflicts_with = "threshold")]
         policy: Option<std::path::PathBuf>,
-        /// CONFIG axis: compare this scheduler config against
-        /// `--b-scheduler` at the SAME commit (partitioned by
-        /// `scheduler`), instead of the commit axis. Both flags are
-        /// required together. Compares runs already pooled from a
-        /// `cargo ktstr test` that exercised both schedulers, so it
-        /// conflicts with the commit-axis run-production flags.
-        #[arg(long, requires = "b_scheduler", conflicts_with_all = ["base", "base_ref", "dual_run"])]
-        a_scheduler: Option<String>,
-        /// CONFIG axis B side — see `--a-scheduler`.
-        #[arg(long, requires = "a_scheduler", conflicts_with_all = ["base", "base_ref", "dual_run"])]
-        b_scheduler: Option<String>,
         /// Self-tuning noise mode: run each side N times and decide significance
         /// from whether the two sides are SEPARATED — a Welch two-sample t-test,
         /// or fully disjoint `[min, max]` bands — AND the delta is MATERIAL (the
@@ -364,7 +354,7 @@ pub(crate) enum KtstrCommand {
             long,
             value_name = "N",
             value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(2..),
-            conflicts_with_all = ["a_scheduler", "b_scheduler", "threshold", "policy", "dual_run"],
+            conflicts_with_all = ["threshold", "policy", "dual_run"],
         )]
         noise_adjust: Option<usize>,
         /// Per-side relative-spread limit in percent above which `--noise-adjust`
@@ -646,7 +636,7 @@ pub(crate) enum KtstrCommand {
     /// (sysctl change, THP policy flip, hugepage reservation).
     ///
     /// For historical drift between archived runs, use
-    /// `cargo ktstr stats compare` — its host-delta section
+    /// `cargo ktstr perf-delta` — its host-delta section
     /// reports which host-context fields changed between run A
     /// and run B using the same [`ktstr::host_context::HostContext::diff`] logic.
     ShowHost,
@@ -836,17 +826,6 @@ pub(crate) enum KtstrCommand {
     },
 }
 
-// `clippy::large_enum_variant` triggers because clap's argument
-// derives produce variant-sized cells of `Option<String>` /
-// `Option<PathBuf>` per CLI flag. Boxing each variant would
-// distort every match arm's pattern shape (`Some(StatsCommand::
-// Compare { .. })` becomes `Some(StatsCommand::Compare(box))`)
-// and force every dispatch site through an extra deref. The enum
-// is constructed once per CLI invocation and immediately
-// pattern-matched into a single subcommand call — no allocation
-// hot path, no cache pressure. Suppress at the enum level rather
-// than wrapping each variant in `Box`.
-#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub(crate) enum StatsCommand {
     /// List test runs under `{CARGO_TARGET_DIR or "target"}/ktstr/`.
@@ -877,16 +856,13 @@ pub(crate) enum StatsCommand {
     /// pools the sidecars, and reports the set of distinct values
     /// found across all nine filterable dimensions: `kernel`,
     /// `commit`, `kernel_commit`, `source`, `resolve_source`,
-    /// `cpu_budget`, `scheduler`, `topology`, and `work_type`. The JSON keys `commit` and `source` map to the
-    /// internal `SidecarResult::project_commit` /
-    /// `SidecarResult::run_source` fields; the per-side filter
-    /// flags spell `--project-commit` / `--run-source` on the
-    /// `compare` subcommand. Use this before crafting a
-    /// `cargo ktstr stats compare` invocation to discover what
-    /// `--a-X` / `--b-X` values the pool actually carries — a
-    /// `--a-kernel 6.20` against an empty pool fails downstream
-    /// with "no rows match filter A", and `list-values` is the
-    /// upstream answer to "what kernels do I have?".
+    /// `cpu_budget`, `scheduler`, `topology`, and `work_type`. The JSON keys
+    /// `commit` and `source` map to the internal
+    /// `SidecarResult::project_commit` / `SidecarResult::run_source` fields.
+    /// Use this before a `cargo ktstr perf-delta` invocation to discover what
+    /// commit / kernel values the pool actually carries — a baseline or
+    /// `--kernel` that matches no pooled run fails downstream with "no rows
+    /// match", and `list-values` is the upstream answer to "what do I have?".
     ///
     /// Default output renders one block per dimension with values
     /// one per line; `--json` emits a single JSON object keyed by
@@ -900,8 +876,7 @@ pub(crate) enum StatsCommand {
         json: bool,
         /// Alternate run root to walk. Defaults to
         /// `test_support::runs_root()` (typically `target/ktstr/`).
-        /// Same semantics as `cargo ktstr stats compare --dir` and
-        /// `cargo ktstr stats show-host --dir`: useful when
+        /// Same semantics as `cargo ktstr stats show-host --dir`: useful when
         /// inspecting archived sidecar trees copied off a CI host.
         #[arg(long)]
         dir: Option<std::path::PathBuf>,
@@ -934,7 +909,7 @@ pub(crate) enum StatsCommand {
         /// Alternate run root to resolve `--run` against. Defaults
         /// to `test_support::runs_root()` (typically
         /// `target/ktstr/`). Same semantics as
-        /// `cargo ktstr stats compare --dir`.
+        /// `cargo ktstr stats show-host --dir`.
         #[arg(long)]
         dir: Option<std::path::PathBuf>,
     },
@@ -959,7 +934,7 @@ pub(crate) enum StatsCommand {
     /// per-sidecar rather than aggregate.
     ///
     /// Sidecars are loaded verbatim. Diverges intentionally from
-    /// `stats compare` / `stats list-values` (which rewrite the
+    /// `stats list-values` (which rewrite the
     /// `run_source` field to `"archive"` when `--dir` is set):
     /// the override would erase the only signal that surfaces a
     /// pre-rename archive whose `run_source` field was lost on
@@ -1013,7 +988,7 @@ pub(crate) enum StatsCommand {
         run: String,
         /// Alternate run root to resolve `--run` against.
         /// Defaults to `target/ktstr/`. Same semantics as
-        /// `cargo ktstr stats compare --dir`.
+        /// `cargo ktstr stats show-host --dir`.
         #[arg(long)]
         dir: Option<std::path::PathBuf>,
         /// Emit aggregate JSON instead of per-sidecar text. The
@@ -1024,460 +999,13 @@ pub(crate) enum StatsCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Compare two filter-defined partitions of the sidecar pool
-    /// and report regressions across slicing dimensions.
-    ///
-    /// Each `--a-X` / `--b-X` pair pins a different value on
-    /// dimension `X` for the A and B sides; the dimensions on
-    /// which A and B differ are the SLICING dimensions, the
-    /// dimensions on which they agree are the PAIRING dimensions
-    /// the comparison joins on. Shared `--X` flags pin BOTH sides
-    /// to the same value (sugar that narrows pre-slicing scope).
-    /// Per-side `--a-X` / `--b-X` flags REPLACE the corresponding
-    /// shared `--X` value for that side — "more-specific replaces."
-    Compare {
-        /// Substring filter. Matches against scenario, topology,
-        /// scheduler, work_type.
-        #[arg(short = 'E', long)]
-        filter: Option<String>,
-        /// Uniform relative significance threshold in percent
-        /// (e.g. 10 for 10%). When set, overrides the per-metric
-        /// default threshold for ALL metrics — intentionally, so
-        /// callers can loosen a tight default or tighten a loose
-        /// one from the CLI without per-metric knobs. Omit to use
-        /// each metric's built-in default.
-        ///
-        /// Sugar for `--policy` with `{default_percent: N}` and an
-        /// empty per-metric map. Mutually exclusive with `--policy`
-        /// — if you need per-metric overrides, spell them out in a
-        /// policy file and pass `--policy`.
-        #[arg(long, conflicts_with = "policy")]
-        threshold: Option<f64>,
-        /// Path to a JSON-persisted `ktstr::cli::ComparisonPolicy`
-        /// file with per-metric thresholds. Mutually exclusive
-        /// with `--threshold`. Use `--threshold` as sugar for a
-        /// uniform default; use `--policy` for the per-metric
-        /// override map.
-        ///
-        /// Priority: per-metric override → `default_percent` →
-        /// each metric's registry `default_rel`.
-        ///
-        /// Schema (every field optional; empty object produces
-        /// the "registry defaults everywhere" policy):
-        ///
-        ///   {
-        ///     "default_percent": 10.0,
-        ///     "per_metric_percent": {
-        ///       "worst_spread": 5.0,
-        ///       "worst_p99_wake_latency_us": 20.0,
-        ///       "worst_mean_run_delay_us": 15.0
-        ///     }
-        ///   }
-        ///
-        /// Values are PERCENT (e.g. `10.0` → 10%). Negative
-        /// values are rejected. Per-metric keys must match a
-        /// metric name in the `METRICS` registry — a typo
-        /// (e.g. `wrost_spread`) is rejected at load time so it
-        /// does not silently fall through to `default_percent`.
-        /// Use `cargo ktstr stats list-metrics` to discover
-        /// available metric names and their default thresholds.
-        #[arg(long, conflicts_with = "threshold")]
-        policy: Option<std::path::PathBuf>,
-        /// Alternate run root to resolve `a` / `b` against. Defaults
-        /// to `test_support::runs_root()` (typically `target/ktstr/`).
-        /// Useful when comparing archived sidecar trees copied off a
-        /// CI host.
-        #[arg(long)]
-        dir: Option<std::path::PathBuf>,
-        /// Match against the sidecar's `kernel_version` field
-        /// (e.g. `--kernel 6.14.2`). **Match shape depends on
-        /// segment count**: a two-segment value (`--kernel 6.12`)
-        /// is a major.minor PREFIX — it matches `6.12`, `6.12.0`,
-        /// `6.12.5`, etc., letting the operator narrow on a stable
-        /// series without naming every patch release. A
-        /// three-or-more-segment value (`--kernel 6.14.2`,
-        /// `--kernel 6.15-rc3`) is STRICT EQUALITY — `6.14.2` does
-        /// NOT match `6.14.20`. See `kernel_filter_matches` in
-        /// stats.rs for the cutoff implementation.
-        ///
-        /// Repeatable: `--kernel A --kernel B` keeps rows whose
-        /// `kernel_version` equals A OR B (each value applies its
-        /// own match shape per the segment-count rule). Rows whose
-        /// `kernel_version` is `None` (sidecar writer could not
-        /// extract a version) NEVER match a populated filter —
-        /// passing `--kernel` is an opt-in that demands a
-        /// known-version row. Same flag name as on `cargo ktstr
-        /// test`/`coverage`/`llvm-cov` for consistency: every
-        /// subcommand that accepts a kernel filter spells it
-        /// `--kernel`. The per-side overrides `--a-kernel` /
-        /// `--b-kernel` carry the same match-shape rule.
-        #[arg(long, action = ArgAction::Append)]
-        kernel: Vec<String>,
-        /// Repeatable OR-combined filter on the sidecar's
-        /// `project_commit` field (e.g. `--project-commit abcdef1`
-        /// or `--project-commit abcdef1-dirty`).
-        /// `--project-commit A --project-commit B` keeps rows
-        /// whose `project_commit` equals A OR B; each entry uses
-        /// strict equality (no prefix matching — `abcdef1` does
-        /// not match `abcdef10`). Rows whose `project_commit` is
-        /// `None` (sidecar writer's gix probe failed, or cwd was
-        /// outside any git repo at write time) NEVER match a
-        /// populated filter — same opt-in policy as `--kernel`.
-        ///
-        /// Also accepts git revspecs (`HEAD`, `HEAD~N`, branch
-        /// names, tags, `A..B` ranges) resolved against the
-        /// project repo (`gix::discover` from cwd) into the same
-        /// 7-char short hashes the sidecar writer records. A range
-        /// expands to every commit reachable from `B` but not from
-        /// `A`, each treated as an OR-combined exact-match
-        /// filter. Example: `--project-commit HEAD~3..HEAD` keeps
-        /// rows whose `project_commit` matches every commit
-        /// reachable from `HEAD` but not from `HEAD~3` (the walk
-        /// is breadth-first across the full commit DAG, so for
-        /// linear histories this is "the last 3 commits"; for
-        /// histories with merges it includes every commit on every
-        /// branch joined since `HEAD~3`).
-        /// Unrecognized inputs and `<hash>-dirty` forms (which
-        /// revspec parsing rejects) pass through as literal
-        /// exact-match filters, preserving compatibility with
-        /// hand-typed dirty entries. When run outside any git tree,
-        /// every input passes through as a literal — revspec
-        /// resolution requires the cwd to be inside a project repo.
-        ///
-        /// Filters on the ktstr framework commit
-        /// (`SidecarResult::project_commit`); the scheduler
-        /// binary's commit (`SidecarResult::scheduler_commit`,
-        /// currently always `None`) is a separate concept and is
-        /// not currently exposed as a filter.
-        ///
-        /// The recorded commit is whatever
-        /// `detect_project_commit` reads from `gix::discover`
-        /// walking up from the test process's cwd at sidecar-write
-        /// time; the `-dirty` suffix lands when HEAD-vs-index or
-        /// index-vs-worktree changes are detected, so a clean run
-        /// and a dirty run of the same HEAD bucket separately
-        /// under this filter.
-        ///
-        /// Symmetric with `--kernel-commit` (which filters on the
-        /// kernel SOURCE TREE commit). Together the pair lets the
-        /// operator narrow on either or both commit dimensions.
-        #[arg(long = "project-commit", action = ArgAction::Append)]
-        project_commit: Vec<String>,
-        /// Repeatable OR-combined filter on the sidecar's
-        /// `kernel_commit` field (e.g. `--kernel-commit abcdef1`
-        /// or `--kernel-commit abcdef1-dirty`).
-        /// `--kernel-commit A --kernel-commit B` keeps rows whose
-        /// `kernel_commit` equals A OR B; each entry uses strict
-        /// equality (no prefix matching — `abcdef1` does not
-        /// match `abcdef10`). Rows whose `kernel_commit` is
-        /// `None` (KTSTR_KERNEL pointed at a non-git path, the
-        /// underlying source was Tarball / Git rather than a
-        /// `Local` tree, or `detect_kernel_commit`'s gix probe
-        /// failed) NEVER match a populated filter — same opt-in
-        /// policy as `--project-commit` / `--kernel`.
-        ///
-        /// Also accepts git revspecs (`HEAD`, `HEAD~N`, branch
-        /// names, tags, `A..B` ranges) resolved against the
-        /// kernel repo (`gix::open` against `KTSTR_KERNEL`'s
-        /// path) into the same 7-char short hashes the sidecar
-        /// writer records. A range expands to every commit
-        /// reachable from `B` but not from `A`, each treated as
-        /// an OR-combined exact-match filter. Example:
-        /// `--kernel-commit v6.14..v6.15` keeps rows whose
-        /// `kernel_commit` falls in that release window.
-        /// Unrecognized inputs and `<hash>-dirty` forms (which
-        /// revspec parsing rejects) pass through as literal
-        /// exact-match filters, preserving compatibility with
-        /// hand-typed dirty entries. When `KTSTR_KERNEL` is unset
-        /// or points outside any git tree, every input passes
-        /// through as a literal — revspec resolution requires the
-        /// repo to be available.
-        ///
-        /// Filters on the kernel SOURCE TREE commit
-        /// (`SidecarResult::kernel_commit`), NOT on the kernel
-        /// release version (`SidecarResult::kernel_version` —
-        /// filter that with `--kernel`). Two runs of the same
-        /// `kernel_version` with different `kernel_commit` values
-        /// represent the same release rebuilt from different
-        /// trees (e.g. WIP patches on top of a tagged release);
-        /// `--kernel-commit` distinguishes them, `--kernel` does
-        /// not.
-        ///
-        /// The recorded value is whatever
-        /// `detect_kernel_commit` reads via
-        /// `gix::open(<kernel-dir>)` (NOT `discover` — the
-        /// kernel directory is explicit, not walked-up); the
-        /// `-dirty` suffix lands when HEAD-vs-index or
-        /// index-vs-worktree changes are detected, so a clean
-        /// kernel tree and a dirty one at the same HEAD bucket
-        /// separately under this filter.
-        #[arg(long, action = ArgAction::Append)]
-        kernel_commit: Vec<String>,
-        /// Repeatable OR-combined filter on the sidecar's
-        /// `scheduler` field (e.g. `--scheduler scx_rusty`).
-        /// `--scheduler A --scheduler B` keeps rows whose
-        /// `scheduler` equals A OR B; each entry uses strict
-        /// equality (no prefix matching).
-        /// Distinct from `-E`, which matches a substring across
-        /// the joined fields. Use this when the operator wants to
-        /// pin specific schedulers rather than narrow on a
-        /// fragment. Empty (no `--scheduler` flag) is the no-op
-        /// default and matches every row's scheduler.
-        #[arg(long, action = ArgAction::Append)]
-        scheduler: Vec<String>,
-        /// Repeatable OR-combined filter on the rendered topology
-        /// label (e.g. `--topology 1n2l4c2t`). The label is what
-        /// `Topology::Display` produces; `cargo ktstr stats list`
-        /// shows the form per-row. `--topology A --topology B`
-        /// keeps rows whose `topology` equals A OR B; each entry
-        /// uses strict equality (no prefix matching). Empty is
-        /// the no-op default.
-        #[arg(long, action = ArgAction::Append)]
-        topology: Vec<String>,
-        /// Repeatable OR-combined filter on the sidecar's
-        /// `work_type` field (e.g. `--work-type SpinWait`). Valid
-        /// names are the PascalCase variants of `WorkType`. See
-        /// `WorkType::ALL_NAMES` for the canonical variant list, or
-        /// `doc/guide/src/concepts/work-types.md`. `--work-type A
-        /// --work-type B` keeps rows whose `work_type` equals A OR
-        /// B; each entry uses strict equality (no prefix
-        /// matching). Empty is the no-op default.
-        #[arg(long = "work-type", action = ArgAction::Append)]
-        work_type: Vec<String>,
-        /// Repeatable OR-combined filter on the sidecar's
-        /// `run_source` field (e.g. `--run-source local`,
-        /// `--run-source ci`, `--run-source archive`).
-        /// `--run-source A --run-source B` keeps rows whose
-        /// `run_source` equals A OR B; each entry uses strict
-        /// equality (case-sensitive, no prefix matching). Rows
-        /// whose `run_source` is `None` (sidecar pre-dates the
-        /// field) NEVER match a populated filter — same opt-in
-        /// policy as `--kernel` / `--project-commit` /
-        /// `--kernel-commit`.
-        ///
-        /// Filters on the run-environment provenance recorded by
-        /// `detect_run_source` at sidecar-write time (`"local"`
-        /// for developer runs, `"ci"` when `KTSTR_CI` was set),
-        /// or rewritten to `"archive"` at load time when this
-        /// command's `--dir` flag points at a non-default pool
-        /// root. Combine with `--a-run-source` / `--b-run-source`
-        /// to contrast across run environments (e.g.
-        /// `--a-run-source ci --b-run-source local` to diff CI
-        /// runs against developer runs of the same scenarios).
-        ///
-        /// Named `--run-source` (rather than `--source`) to
-        /// disambiguate from `KernelSource` — every other
-        /// `source`-shaped surface in the workspace (a
-        /// `--kernel <path>` source tree, `KernelMetadata.source`)
-        /// refers to a kernel-source kind, not a run-environment
-        /// tag.
-        #[arg(long = "run-source", action = ArgAction::Append)]
-        run_source: Vec<String>,
-        /// Repeatable OR-combined filter on the sidecar's
-        /// `resolve_source` field — HOW the scheduler binary was
-        /// resolved for the run (e.g. `--resolve-source auto_built`,
-        /// `--resolve-source target_debug`). `--resolve-source A
-        /// --resolve-source B` keeps rows whose `resolve_source` equals
-        /// A OR B; strict equality, no prefix matching. Rows whose
-        /// `resolve_source` is `None` (sidecar pre-dates the field, or a
-        /// skip resolved no binary) NEVER match a populated filter —
-        /// same opt-in policy as `--run-source`.
-        ///
-        /// Distinct from `--run-source` (the run ENVIRONMENT
-        /// local/ci/archive): this is the scheduler discovery PATH. Tags
-        /// are the `ResolveSource::as_str` values ("auto_built" =
-        /// built-from-HEAD this run; "target_debug"/"target_release"/
-        /// "sibling_dir"/"path"/"env_var"/"path_lookup" = possibly-stale;
-        /// "not_found" = kernel-supplied). Combine with
-        /// `--a-resolve-source` / `--b-resolve-source` to contrast (e.g.
-        /// auto-built vs stale-target runs of the same scenarios).
-        #[arg(long = "resolve-source", action = ArgAction::Append)]
-        resolve_source: Vec<String>,
-        /// Filter to runs whose effective host-CPU budget (the count of
-        /// host CPUs the guest vCPU threads ran on) equals this value
-        /// (`--cpu-budget 32`, repeatable / OR-combined). cpu-budget is a
-        /// pairing dimension: even WITHOUT this flag, A/B comparison never
-        /// pairs rows of different budgets (a 4-CPU-budget run and a
-        /// 32-CPU-budget run measure different things). Use this flag to
-        /// SLICE by budget, or `--a-cpu-budget` / `--b-cpu-budget` to
-        /// contrast two budgets. Matches by exact decimal string (the
-        /// canonical form `stats list-values` prints), like every other
-        /// typed dimension filter: a non-canonical value such as `032`
-        /// or ` 4` will not match `4`.
-        #[arg(long = "cpu-budget", action = ArgAction::Append)]
-        cpu_budget: Vec<String>,
-        /// A-side overrides: replace the corresponding shared
-        /// `--X` value for the A side only. See the per-side
-        /// semantics on each `--X` flag's doc.
-        ///
-        /// `--a-kernel` carries the same match-shape rule as the
-        /// shared `--kernel`: a two-segment value (e.g.
-        /// `--a-kernel 6.12`) is a major.minor PREFIX matching
-        /// every patch release in that series; a three-or-more-
-        /// segment value (`6.14.2`, `6.15-rc3`) is strict
-        /// equality. NOT strict equality across the board — see
-        /// `kernel_filter_matches` for the cutoff implementation.
-        #[arg(long = "a-kernel", action = ArgAction::Append)]
-        a_kernel: Vec<String>,
-        #[arg(long = "a-project-commit", action = ArgAction::Append)]
-        a_project_commit: Vec<String>,
-        #[arg(long = "a-kernel-commit", action = ArgAction::Append)]
-        a_kernel_commit: Vec<String>,
-        #[arg(long = "a-run-source", action = ArgAction::Append)]
-        a_run_source: Vec<String>,
-        #[arg(long = "a-resolve-source", action = ArgAction::Append)]
-        a_resolve_source: Vec<String>,
-        #[arg(long = "a-cpu-budget", action = ArgAction::Append)]
-        a_cpu_budget: Vec<String>,
-        #[arg(long = "a-scheduler", action = ArgAction::Append)]
-        a_scheduler: Vec<String>,
-        #[arg(long = "a-topology", action = ArgAction::Append)]
-        a_topology: Vec<String>,
-        #[arg(long = "a-work-type", action = ArgAction::Append)]
-        a_work_type: Vec<String>,
-
-        /// B-side overrides: replace the corresponding shared
-        /// `--X` value for the B side only. See the per-side
-        /// semantics on each `--X` flag's doc.
-        ///
-        /// `--b-kernel` carries the same match-shape rule as the
-        /// shared `--kernel`: a two-segment value (e.g.
-        /// `--b-kernel 6.12`) is a major.minor PREFIX matching
-        /// every patch release in that series; a three-or-more-
-        /// segment value (`6.14.2`, `6.15-rc3`) is strict
-        /// equality. NOT strict equality across the board — see
-        /// `kernel_filter_matches` for the cutoff implementation.
-        #[arg(long = "b-kernel", action = ArgAction::Append)]
-        b_kernel: Vec<String>,
-        #[arg(long = "b-project-commit", action = ArgAction::Append)]
-        b_project_commit: Vec<String>,
-        #[arg(long = "b-kernel-commit", action = ArgAction::Append)]
-        b_kernel_commit: Vec<String>,
-        #[arg(long = "b-run-source", action = ArgAction::Append)]
-        b_run_source: Vec<String>,
-        #[arg(long = "b-resolve-source", action = ArgAction::Append)]
-        b_resolve_source: Vec<String>,
-        #[arg(long = "b-cpu-budget", action = ArgAction::Append)]
-        b_cpu_budget: Vec<String>,
-        #[arg(long = "b-scheduler", action = ArgAction::Append)]
-        b_scheduler: Vec<String>,
-        #[arg(long = "b-topology", action = ArgAction::Append)]
-        b_topology: Vec<String>,
-        #[arg(long = "b-work-type", action = ArgAction::Append)]
-        b_work_type: Vec<String>,
-
-        /// Disable averaging. By default the comparison folds
-        /// every matching sidecar within each side into a single
-        /// arithmetic-mean row per pairing key; `--no-average`
-        /// keeps each sidecar distinct and bails with an
-        /// actionable diagnostic if multiple sidecars on the
-        /// same side share the same pairing key (otherwise
-        /// pairing across A/B sides is ambiguous).
-        ///
-        /// Aggregation rules under the default (averaging-on)
-        /// path: failing, skipped, and inconclusive contributors
-        /// are excluded from the metric mean (they carry no
-        /// comparable per-run signal); the aggregated row's
-        /// verdict bits fold under the strict 4-state
-        /// `Fail > Inconclusive > Pass > Skip` lattice (any
-        /// failing contributor wins; else any inconclusive
-        /// contributor wins; else any skipped contributor wins;
-        /// only an all-pass cohort yields a real Pass aggregate).
-        /// Aggregate rows that are not real Pass route the pair
-        /// through `compare_rows`' `excluded_pairs` gate.
-        #[arg(long = "no-average")]
-        no_average: bool,
-
-        /// Suppress the per-phase delta tables entirely.
-        ///
-        /// The scalar findings table and footer render
-        /// unchanged, for operators who don't want the
-        /// per-phase surface. Mutually exclusive with every
-        /// other phase flag (`--phases-only`, `--steps-only`,
-        /// `--phase`, `--phase-threshold`).
-        #[arg(
-            long = "no-phases",
-            help_heading = "Phase rendering",
-            conflicts_with_all = ["phases_only", "steps_only", "phase", "phase_threshold"],
-        )]
-        no_phases: bool,
-
-        /// Show ONLY the per-phase tables; suppress the scalar
-        /// findings table and the scalar summary footer (host
-        /// context delta still renders).
-        ///
-        /// Useful for narrowing investigation to a phase
-        /// regression when the scalar rollup is noise. Composes
-        /// with `--steps-only`, `--phase`, and
-        /// `--phase-threshold`.
-        #[arg(
-            long = "phases-only",
-            help_heading = "Phase rendering",
-            conflicts_with = "no_phases"
-        )]
-        phases_only: bool,
-
-        /// Within the per-phase tables, suppress the BASELINE
-        /// bucket (`step_index == 0`) — show only scenario
-        /// Step buckets.
-        ///
-        /// Useful when the BASELINE settle window is dominated
-        /// by scheduler startup transients. Mutually exclusive
-        /// with `--phase` (the single-phase filter).
-        #[arg(
-            long = "steps-only",
-            help_heading = "Phase rendering",
-            conflicts_with_all = ["no_phases", "phase"],
-        )]
-        steps_only: bool,
-
-        /// Within the per-phase tables, show only the named
-        /// phase index. `0` selects BASELINE; `1..=N` selects
-        /// scenario Step ordinals (`1` → Step\[0\], `2` → Step\[1\],
-        /// ...).
-        ///
-        /// Integer rather than label so a future label rename
-        /// (`"Step[0]"` → `"Step:0"`) doesn't break operator CI
-        /// invocations. Mutually exclusive with `--steps-only`.
-        #[arg(
-            long = "phase",
-            help_heading = "Phase rendering",
-            conflicts_with_all = ["no_phases", "steps_only"],
-        )]
-        phase: Option<u16>,
-
-        /// Per-row relative-delta gate for the per-phase tables.
-        /// Suppresses paired rows whose `|delta| / |a| < PCT / 100.0`
-        /// (a value from a ~zero baseline is an unbounded relative
-        /// change and is always shown).
-        ///
-        /// `0` shows every paired row; positive values widen
-        /// the gate to suppress small deltas. ABSENCE shows
-        /// every paired row — the registry's per-metric
-        /// `default_rel` already governs the per-phase verdict
-        /// at the data layer (sub-threshold rows render as
-        /// `stable`, not the red REGRESSION verdict), so the
-        /// renderer defaults to "show everything; the verdict
-        /// column surfaces what matters." Pass an explicit
-        /// `--phase-threshold` to additionally hide noise rows.
-        /// Independent from `--threshold` — the per-phase and
-        /// scalar passes have separate filters so the operator
-        /// can widen one without widening the other. Mutually
-        /// exclusive with `--no-phases`.
-        #[arg(
-            long = "phase-threshold",
-            help_heading = "Phase rendering",
-            conflicts_with = "no_phases"
-        )]
-        phase_threshold: Option<f64>,
-    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // -- StatsCommand::Compare phase-rendering flag mutex constraints --
+    // -- perf-delta phase-rendering flag mutex constraints --
     //
     // Clap's `conflicts_with` / `conflicts_with_all` annotations on
     // the 5 phase flags (`--no-phases` / `--phases-only` /
@@ -1488,30 +1016,15 @@ mod tests {
     // and "render only phase 1"). A future refactor that drops
     // one of those annotations silently re-admits the contradiction
     // and the renderer reaches an undefined state. The tests below
-    // exercise each documented conflict pair and one negative-case
-    // composition that should parse without error.
+    // exercise each documented conflict pair and two negative-case
+    // compositions that should parse without error.
     //
-    // Tests construct argv via `Cargo::try_parse_from(...)` rather
-    // than `StatsCommand::try_parse_from(...)` because Compare is
-    // a Subcommand variant nested under `KtstrCommand::Stats` —
-    // the parser entry point is the top-level Cli.
+    // The phase flags live on the top-level `KtstrCommand::PerfDelta`
+    // variant, so the parser entry point is the top-level Cli
+    // (`Cargo::try_parse_from(...)`).
 
-    fn argv_compare<'a>(extra: &[&'a str]) -> Vec<&'a str> {
-        // Minimum-viable Compare argv: needs at least one per-side
-        // filter so the slicing-dims validation downstream is happy
-        // (the parse step doesn't validate dims, but the canonical
-        // argv shape includes one slicing pair so the tests pin
-        // intended use).
-        let mut v: Vec<&'a str> = vec![
-            "cargo-ktstr",
-            "ktstr",
-            "stats",
-            "compare",
-            "--a-kernel",
-            "6.14",
-            "--b-kernel",
-            "6.15",
-        ];
+    fn argv_perf_delta<'a>(extra: &[&'a str]) -> Vec<&'a str> {
+        let mut v: Vec<&'a str> = vec!["cargo-ktstr", "ktstr", "perf-delta"];
         v.extend_from_slice(extra);
         v
     }
@@ -1520,8 +1033,8 @@ mod tests {
     /// contradiction: suppress the entire phase block AND show
     /// only the phase block. Clap must reject at parse.
     #[test]
-    fn compare_phase_flags_no_phases_conflicts_with_phases_only() {
-        let argv = argv_compare(&["--no-phases", "--phases-only"]);
+    fn perf_delta_phase_flags_no_phases_conflicts_with_phases_only() {
+        let argv = argv_perf_delta(&["--no-phases", "--phases-only"]);
         let result = Cargo::try_parse_from(&argv);
         let err = match result {
             Ok(_) => panic!("--no-phases + --phases-only must be rejected"),
@@ -1538,8 +1051,8 @@ mod tests {
     /// phase block is suppressed entirely, so "show only steps
     /// within the phase block" is nonsensical. Clap must reject.
     #[test]
-    fn compare_phase_flags_no_phases_conflicts_with_steps_only() {
-        let argv = argv_compare(&["--no-phases", "--steps-only"]);
+    fn perf_delta_phase_flags_no_phases_conflicts_with_steps_only() {
+        let argv = argv_perf_delta(&["--no-phases", "--steps-only"]);
         assert!(
             Cargo::try_parse_from(&argv).is_err(),
             "--no-phases + --steps-only must be rejected",
@@ -1549,8 +1062,8 @@ mod tests {
     /// `--no-phases` paired with `--phase 1` contradicts: suppressed
     /// block can't show a specific phase. Clap must reject.
     #[test]
-    fn compare_phase_flags_no_phases_conflicts_with_phase_filter() {
-        let argv = argv_compare(&["--no-phases", "--phase", "1"]);
+    fn perf_delta_phase_flags_no_phases_conflicts_with_phase_filter() {
+        let argv = argv_perf_delta(&["--no-phases", "--phase", "1"]);
         assert!(
             Cargo::try_parse_from(&argv).is_err(),
             "--no-phases + --phase must be rejected",
@@ -1561,8 +1074,8 @@ mod tests {
     /// suppressed block can't apply a row-significance filter.
     /// Clap must reject.
     #[test]
-    fn compare_phase_flags_no_phases_conflicts_with_phase_threshold() {
-        let argv = argv_compare(&["--no-phases", "--phase-threshold", "5"]);
+    fn perf_delta_phase_flags_no_phases_conflicts_with_phase_threshold() {
+        let argv = argv_perf_delta(&["--no-phases", "--phase-threshold", "5"]);
         assert!(
             Cargo::try_parse_from(&argv).is_err(),
             "--no-phases + --phase-threshold must be rejected",
@@ -1575,8 +1088,8 @@ mod tests {
     /// `--steps-only` suppresses it; if N>=1, `--steps-only` is
     /// redundant). Clap must reject.
     #[test]
-    fn compare_phase_flags_steps_only_conflicts_with_phase_filter() {
-        let argv = argv_compare(&["--steps-only", "--phase", "1"]);
+    fn perf_delta_phase_flags_steps_only_conflicts_with_phase_filter() {
+        let argv = argv_perf_delta(&["--steps-only", "--phase", "1"]);
         assert!(
             Cargo::try_parse_from(&argv).is_err(),
             "--steps-only + --phase must be rejected",
@@ -1590,8 +1103,8 @@ mod tests {
     /// would break this test, surfacing the over-restriction
     /// before it ships.
     #[test]
-    fn compare_phase_flags_phases_only_composes_with_steps_only_and_threshold() {
-        let argv = argv_compare(&["--phases-only", "--steps-only", "--phase-threshold", "5"]);
+    fn perf_delta_phase_flags_phases_only_composes_with_steps_only_and_threshold() {
+        let argv = argv_perf_delta(&["--phases-only", "--steps-only", "--phase-threshold", "5"]);
         assert!(
             Cargo::try_parse_from(&argv).is_ok(),
             "--phases-only + --steps-only + --phase-threshold must parse cleanly",
@@ -1604,8 +1117,8 @@ mod tests {
     /// phase × per-row significance gate). Sibling negative-case
     /// sentinel to the steps-only composition above.
     #[test]
-    fn compare_phase_flags_phases_only_composes_with_phase_filter_and_threshold() {
-        let argv = argv_compare(&["--phases-only", "--phase", "1", "--phase-threshold", "5"]);
+    fn perf_delta_phase_flags_phases_only_composes_with_phase_filter_and_threshold() {
+        let argv = argv_perf_delta(&["--phases-only", "--phase", "1", "--phase-threshold", "5"]);
         assert!(
             Cargo::try_parse_from(&argv).is_ok(),
             "--phases-only + --phase + --phase-threshold must parse cleanly",

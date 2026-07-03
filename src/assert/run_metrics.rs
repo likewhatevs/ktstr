@@ -264,7 +264,7 @@ impl ScenarioStats {
     /// `execute_scenario`, holds). A `post_vm` callback instead receives
     /// a `VmResult`, which has NO `stats` field and no run-level
     /// Distribution surface — compare those cross-run via `cargo ktstr
-    /// stats compare`.
+    /// perf-delta`.
     ///
     /// The ext family is populated only by the `#[ktstr_test]` eval
     /// flow's post-merge producer
@@ -549,7 +549,7 @@ const TYPED_FIELD_NAMES: &[&str] = &[
 /// overwritten — `read_sample` path values win when both produced
 /// an entry.
 ///
-/// Without this fill, `cargo ktstr stats compare` silently misses
+/// Without this fill, `cargo ktstr perf-delta` silently misses
 /// these phase-only metrics (avg_imbalance_ratio, iteration_rate,
 /// system_time_ns, user_time_ns) in flat-row output because
 /// `MetricDef::read` falls back to ext_metrics and finds nothing.
@@ -1800,7 +1800,7 @@ fn distribution_cgroup_reduction(
 /// value (populated via the MetricDef accessor at sidecar-write
 /// time) wins on the read path, and this fn fills the gap for
 /// registered metrics that have a `read_sample` wire but no typed
-/// GauntletRow field. Without this fill, `cargo ktstr stats compare`
+/// GauntletRow field. Without this fill, `cargo ktstr perf-delta`
 /// silently skips the metric (read returns None on both sides, so the
 /// `(None, None)` arm drops the pair).
 ///

@@ -1959,7 +1959,7 @@ fn group_and_average_then_compare_rows_yields_regression_on_means() {
 /// in the aggregation → compare wiring lands here.
 ///
 /// Fixture: two runs each carrying three sidecars that
-/// differ on `scheduler` (the slicing dim). Side A's three
+/// differ on `project_commit` (the slicing dim). Side A's three
 /// trials cluster around `worst_spread = 10` (mean 12);
 /// side B's three cluster around `worst_spread = 30` (mean
 /// 30). The 18-unit delta clears the default dual gate, so
@@ -1981,16 +1981,16 @@ fn compare_partitions_with_average_default_produces_regression_on_aggregated_mea
     let trials_a = [(10.0, 100), (12.0, 120), (14.0, 140)];
     let trials_b = [(28.0, 280), (30.0, 300), (32.0, 320)];
 
-    // Scheduler is the slicing dim: side A's three trials
-    // run under "scx_alpha", side B's under "scx_beta". The
+    // project_commit is the slicing dim: side A's three trials
+    // carry commit_a, side B's carry commit_b. The
     // pairing dims are everything else (kernel/topology/
-    // work_type/commit) which match across both runs,
+    // work_type) which match across both runs,
     // so the three trials on each side aggregate into one
     // mean row keyed by `(scenario, topology, work_type)`
-    // plus the matching kernel/commit values.
-    for (run_key, trials, sched) in [
-        (run_a, &trials_a, "scx_alpha"),
-        (run_b, &trials_b, "scx_beta"),
+    // plus the matching kernel value.
+    for (run_key, trials, pc) in [
+        (run_a, &trials_a, "commit_a"),
+        (run_b, &trials_b, "commit_b"),
     ] {
         let run_dir = alt_root.path().join(run_key);
         std::fs::create_dir_all(&run_dir).expect("create run dir");
@@ -1999,7 +1999,7 @@ fn compare_partitions_with_average_default_produces_regression_on_aggregated_mea
             let mut sidecar = SidecarResult {
                 test_name: "avg_test".to_string(),
                 topology: "1n2l4c1t".to_string(),
-                scheduler: sched.to_string(),
+                project_commit: Some(pc.to_string()),
                 work_type: "SpinWait".to_string(),
                 ..SidecarResult::test_fixture()
             };
@@ -2014,11 +2014,11 @@ fn compare_partitions_with_average_default_produces_regression_on_aggregated_mea
     }
 
     let filter_a = RowFilter {
-        schedulers: vec!["scx_alpha".to_string()],
+        project_commits: vec!["commit_a".to_string()],
         ..RowFilter::default()
     };
     let filter_b = RowFilter {
-        schedulers: vec!["scx_beta".to_string()],
+        project_commits: vec!["commit_b".to_string()],
         ..RowFilter::default()
     };
 

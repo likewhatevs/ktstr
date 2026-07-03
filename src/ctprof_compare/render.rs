@@ -258,7 +258,7 @@ pub fn colored_header_with_sort(
 /// pre-color baseline for shell-pipeline consumers.
 ///
 /// Color choice: blue contrasts with both the unstyled primary
-/// table and the stats compare verdict palette
+/// table and the perf-delta verdict palette
 /// (`Color::Red` / `Color::Green` for REGRESSION /
 /// improvement) — derived rows do not carry a regression
 /// verdict of their own, so reusing the verdict colors here

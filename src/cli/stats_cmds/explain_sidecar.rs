@@ -487,8 +487,7 @@ fn render_explain_sidecar_text(
                 "  cpu_budget: {} / {} vcpus  [OVERCOMMIT: host time-slices the \
                  guest vCPUs -> wake-latency / off-CPU / run-delay timing metrics \
                  are host-contention-confounded; compare the overcommit-invariant \
-                 worst_iterations_per_cpu_sec (stats compare --metric \
-                 worst_iterations_per_cpu_sec), not raw timing]",
+                 worst_iterations_per_cpu_sec, not raw timing]",
                 sc.cpu_budget, sc.vcpus,
             );
         } else {

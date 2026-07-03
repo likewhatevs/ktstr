@@ -1030,7 +1030,7 @@ fn diff_single_field_surfaces_only_that_field() {
 /// a CPU present in one side only renders as `(absent)`, a
 /// value change renders as `old → new`. Mirrors the
 /// `sched_tunables.<key>` per-key pattern so operators
-/// running `stats compare` see governor churn per-CPU rather
+/// running `perf-delta` see governor churn per-CPU rather
 /// than a collapsed "N entries changed" summary.
 #[test]
 fn diff_cpufreq_governor_both_empty_produces_no_lines() {
@@ -1198,7 +1198,7 @@ fn diff_sched_tunables_none_vs_some() {
 /// later run — `/proc/cmdline` normally always readable, but
 /// a restricted procfs mount could hide it) must surface as
 /// `<old> → (unknown)` so an
-/// operator running `stats compare` sees the disappearance
+/// operator running `perf-delta` sees the disappearance
 /// explicitly.
 #[test]
 fn diff_some_to_none_shows_arrow_unknown() {

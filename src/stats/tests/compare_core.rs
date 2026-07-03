@@ -997,7 +997,7 @@ fn comparison_policy_load_json_accepts_partial_fields() {
 }
 
 /// `from_cli_flags` resolves the `--threshold` / `--policy` pair
-/// the shared way for `stats compare` and `perf-delta`:
+/// the shared way for `perf-delta`:
 /// threshold → uniform (validated), policy → load_json, neither →
 /// registry defaults, both → error (the clap-`conflicts_with`
 /// backstop). Pin every branch so a future edit can't silently
@@ -1294,7 +1294,7 @@ fn compare_rows_filter_applies_to_new_and_removed_counters() {
 }
 
 // -- format_host_delta: the 5 match arms of the host-delta
-//    section emitted under `stats compare --runs a b`. --
+//    section emitted under `perf-delta a b`. --
 
 /// Builder for a `HostContext` with enough populated fields to
 /// exercise `HostContext::diff`. Leaves everything else at its
@@ -1309,7 +1309,7 @@ fn host_ctx(release: &str, kernel_cmdline: Option<&str>) -> crate::host_context:
 }
 
 /// `(Some, Some)` identical: the helper emits a one-line
-/// confirmation so users running `stats compare` can distinguish
+/// confirmation so users running `perf-delta` can distinguish
 /// "same host" from "captured but unused" without inspecting
 /// individual sidecars.
 #[test]
@@ -1389,7 +1389,7 @@ fn format_host_delta_both_absent_emits_nothing() {
 /// `(Some, Some)` identical with both sides carrying the SAME
 /// arch: the helper appends `(arch: {value})` to the identical
 /// confirmation line. Pins the identical-arch surfacing contract
-/// so an operator running `stats compare` on two same-arch runs
+/// so an operator running `perf-delta` on two same-arch runs
 /// sees that the matching dimension covers arch — distinguishing
 /// "both x86_64, identical" from "both aarch64, identical"
 /// without inspecting individual sidecars.
@@ -1586,7 +1586,7 @@ fn gauntlet_row_none_cpu_budget_omits_keys() {
 ///
 /// Fixture: a tempdir alt-root with two run subdirectories,
 /// each holding one sidecar. The two sidecars differ on
-/// `scheduler` so the slicing-dim is `scheduler` and
+/// `project_commit` so the slicing-dim is `project_commit` and
 /// `compare_partitions` has a well-defined contrast. Calling
 /// `compare_partitions` with `dir = Some(alt_root)` finds the
 /// pooled fixtures and returns Ok; calling without `--dir`
@@ -1597,18 +1597,18 @@ fn compare_partitions_threads_dir_through_to_pool_collection() {
     use crate::test_support::SidecarResult;
 
     let alt_root = tempfile::TempDir::new().expect("create alt-root tempdir");
-    // Two run subdirs; each holds one sidecar. The sidecars
-    // differ on scheduler so the slicing-dim derivation has
-    // a non-empty result.
-    for (run_key, sched) in [
-        ("__dir_thread_a__", "scx_alpha"),
-        ("__dir_thread_b__", "scx_beta"),
+    // Two run subdirs; each holds one sidecar. The sidecars differ on
+    // project_commit (a SLICEABLE version axis) so the slicing-dim
+    // derivation has a non-empty result.
+    for (run_key, pc) in [
+        ("__dir_thread_a__", "aaaaaa1"),
+        ("__dir_thread_b__", "bbbbbb2"),
     ] {
         let run_dir = alt_root.path().join(run_key);
         std::fs::create_dir_all(&run_dir).expect("create run dir");
         let sidecar = SidecarResult {
             test_name: "dir_thread_fixture".to_string(),
-            scheduler: sched.to_string(),
+            project_commit: Some(pc.to_string()),
             ..SidecarResult::test_fixture()
         };
         let json = serde_json::to_string(&sidecar).expect("serialize fixture sidecar");
@@ -1617,11 +1617,11 @@ fn compare_partitions_threads_dir_through_to_pool_collection() {
     }
 
     let filter_a = RowFilter {
-        schedulers: vec!["scx_alpha".to_string()],
+        project_commits: vec!["aaaaaa1".to_string()],
         ..RowFilter::default()
     };
     let filter_b = RowFilter {
-        schedulers: vec!["scx_beta".to_string()],
+        project_commits: vec!["bbbbbb2".to_string()],
         ..RowFilter::default()
     };
 
@@ -1641,7 +1641,7 @@ fn compare_partitions_threads_dir_through_to_pool_collection() {
     .expect("compare_partitions must pool sidecars under --dir override");
     assert_eq!(
         exit, 0,
-        "byte-identical metrics across the two scheduler \
+        "byte-identical metrics across the two project-commit \
              partitions must yield zero regressions (exit 0). \
              A non-zero exit means either the partitions loaded \
              different data than written above or compare_rows \
@@ -1666,15 +1666,15 @@ fn compare_partitions_noise_pools_duplicate_pairing_keys() {
     let alt_root = tempfile::TempDir::new().expect("create alt-root tempdir");
     // Three runs per side (the `--noise-adjust 3` shape). Each side's
     // three sidecars share one pairing key (identical but for the
-    // slicing dim `scheduler`), so each side has 3 duplicate-key rows —
+    // slicing dim `project_commit`), so each side has 3 duplicate-key rows —
     // exactly the input the old dup-key gate rejected.
-    for (sched, tag) in [("scx_base", "base"), ("scx_head", "head")] {
+    for (pc, tag) in [("aaaaaa1", "base"), ("bbbbbb2", "head")] {
         for i in 0..3 {
             let run_dir = alt_root.path().join(format!("noise_{tag}_{i}"));
             std::fs::create_dir_all(&run_dir).expect("create run dir");
             let sidecar = SidecarResult {
                 test_name: "noise_dup_fixture".to_string(),
-                scheduler: sched.to_string(),
+                project_commit: Some(pc.to_string()),
                 ..SidecarResult::test_fixture()
             };
             let json = serde_json::to_string(&sidecar).expect("serialize fixture sidecar");
@@ -1684,11 +1684,11 @@ fn compare_partitions_noise_pools_duplicate_pairing_keys() {
     }
 
     let filter_a = RowFilter {
-        schedulers: vec!["scx_base".to_string()],
+        project_commits: vec!["aaaaaa1".to_string()],
         ..RowFilter::default()
     };
     let filter_b = RowFilter {
-        schedulers: vec!["scx_head".to_string()],
+        project_commits: vec!["bbbbbb2".to_string()],
         ..RowFilter::default()
     };
 
