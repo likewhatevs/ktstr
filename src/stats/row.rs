@@ -349,9 +349,9 @@ pub struct GauntletRow {
     /// reduced over one scenario phase (BASELINE at
     /// `step_index = 0`, Step ordinals at `step_index = 1..=N`
     /// per the 1-indexed phase convention) so the per-phase
-    /// comparison renderer at [`compare_partitions`] can pair
+    /// comparison renderer at [`compare_partitions_noise`] can pair
     /// matched phases across two sidecars by `step_index` and
-    /// emit per-phase delta rows without re-deriving phase
+    /// emit per-phase spread rows without re-deriving phase
     /// boundaries.
     ///
     /// Empty when the source sidecar had no phase data — single-

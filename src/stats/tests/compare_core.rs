@@ -1635,8 +1635,6 @@ fn compare_partitions_threads_dir_through_to_pool_collection() {
         None,
         &ComparisonPolicy::default(),
         Some(alt_root.path()),
-        false,
-        &PhaseDisplayOptions::default(),
     )
     .expect("compare_partitions must pool sidecars under --dir override");
     assert_eq!(
@@ -1652,9 +1650,8 @@ fn compare_partitions_threads_dir_through_to_pool_collection() {
 /// Regression: `perf-delta --noise-adjust` writes N runs per side, all
 /// sharing one pairing key, and `compare_partitions_noise` must POOL
 /// them (`RowPrep::PerRunPooled`) so `noise_findings` computes each
-/// side's spread. The shared prep's duplicate-pairing-key rejection —
-/// correct for the pairwise `--no-average` path (`PerRunUnique`) — must
-/// NOT fire here. Before the fix `prepare_partitioned_comparison` bailed
+/// side's spread — the N same-key runs per side are the intended input,
+/// pooled rather than rejected as duplicates. Before an earlier fix `prepare_partitioned_comparison` bailed
 /// on the N duplicates, so `--noise-adjust N` (N>1) always failed. The
 /// spread math itself is covered by the `noise_findings` tests above;
 /// this pins that the N duplicate-key rows REACH it through the pool +
@@ -1963,7 +1960,7 @@ fn render_overcommit_warning_mixed_budget_per_group() {
 
     // Sliced + b1/b2 share EVERY pairing dim (scenario + scheduler +
     // topology + ... all default-equal): one group, two budgets, so
-    // --average folds them -> mixed warning on side B.
+    // the averaging fold combines them -> mixed warning on side B.
     let sliced_same = super::render_overcommit_warning(&[a], &[b1, b2], &sliced)
         .expect("mixed budgets in one group on a sliced side must warn");
     assert!(
@@ -2005,8 +2002,8 @@ fn render_overcommit_warning_mixed_budget_per_group() {
 /// — the "mixing two measurement conditions" message, distinct from
 /// the host-overcommit message. Each budget meets its own vCPU count
 /// (16/16, 32/32) so neither is overcommitted, but the two rows share
-/// every pairing dim and CpuBudget is sliced, so `--average` would
-/// fold them into one mean. Pins the no-overcommit-but-mixed banner
+/// every pairing dim and CpuBudget is sliced, so the averaging fold
+/// would combine them into one mean. Pins the no-overcommit-but-mixed banner
 /// text the existing per-group test never reaches (its mixed case
 /// also overcommits, taking the `if` branch).
 #[test]
@@ -2034,64 +2031,6 @@ fn render_overcommit_warning_mixed_no_overcommit_uses_else_banner() {
     );
 }
 
-// -- check_no_duplicate_pairing_keys --
-
-/// `check_no_duplicate_pairing_keys` returns `Ok(())` when every row
-/// on the side carries a distinct pairing key — the normal
-/// `--no-average` path where each sidecar is a unique
-/// (scenario, topology, work_type) measurement.
-#[test]
-fn check_no_duplicate_pairing_keys_ok_when_all_keys_distinct() {
-    let rows = vec![
-        cmp_row("alpha", "tiny-1llc", true, 10.0, 0),
-        cmp_row("beta", "tiny-1llc", true, 10.0, 0),
-    ];
-    assert!(
-        super::check_no_duplicate_pairing_keys(&rows, LEGACY_PAIRING_DIMS, "A").is_ok(),
-        "distinct pairing keys must pass the --no-average duplicate gate",
-    );
-    // Empty input is trivially duplicate-free.
-    assert!(
-        super::check_no_duplicate_pairing_keys(&[], LEGACY_PAIRING_DIMS, "A").is_ok(),
-        "empty side must pass the duplicate gate",
-    );
-}
-
-/// `check_no_duplicate_pairing_keys` bails when two rows on one side
-/// share a pairing key — the `--no-average` guard against
-/// `compare_rows_by` silently latching onto the first match. The bail
-/// must name the offending side and the duplicate-key condition so the
-/// operator can drop `--no-average` or add a disambiguating filter.
-#[test]
-fn check_no_duplicate_pairing_keys_bails_on_collision_and_names_side() {
-    // Two rows with the SAME (scenario, topology, work_type) under
-    // LEGACY_PAIRING_DIMS -> identical pairing key.
-    let rows = vec![
-        cmp_row("dup", "tiny-1llc", true, 10.0, 0),
-        cmp_row("dup", "tiny-1llc", true, 20.0, 0),
-    ];
-    let err = super::check_no_duplicate_pairing_keys(&rows, LEGACY_PAIRING_DIMS, "B")
-        .expect_err("two rows sharing a pairing key must bail under --no-average");
-    let rendered = format!("{err:#}");
-    assert!(
-        rendered.contains("side B"),
-        "bail must name the offending side; got: {rendered}",
-    );
-    assert!(
-        rendered.contains("same pairing key"),
-        "bail must describe the duplicate-key condition; got: {rendered}",
-    );
-    assert!(
-        rendered.contains("--no-average"),
-        "bail must point at the --no-average flag the operator can drop; got: {rendered}",
-    );
-    // The side label is lowercased into the `--b-X` suggestion.
-    assert!(
-        rendered.contains("--b-"),
-        "bail must suggest a per-side filter to disambiguate; got: {rendered}",
-    );
-}
-
 // -- noise_findings (perf-delta --noise-adjust row-level core) tests --
 
 /// Three identical runs of one scenario carrying `worst_spread` (LowerBetter, via
@@ -2112,7 +2051,7 @@ fn noise_side(scenario: &str, spread: f64, iters: u64) -> Vec<GauntletRow> {
 /// side with runs (run_delay=100, wall=1s)->100/s and (run_delay=100,
 /// wall=10s)->10/s has pooled 200/11 = 18.18/s but mean-of-ratios 55/s. The
 /// per-run band ([10,100]) still measures run-to-run spread. This pins that
-/// the centroid is pooled (agreeing with the Averaged/--average path).
+/// the centroid is pooled (agreeing with the Averaged path).
 #[test]
 fn noise_findings_rate_centroid_is_pooled_not_mean_of_ratios() {
     let mk = |run_delay: f64, wall: f64| {
@@ -2434,7 +2373,7 @@ fn noise_phase_empty_one_sided_step_surfaces_as_shape_coverage() {
     // A has BASELINE + a Step[1] whose buckets carry NO readable metric (a
     // synthesized capture-free step); B has only BASELINE. The empty one-sided
     // Step[1] must still surface as a metric-less coverage row, not be silently
-    // dropped (no-silent-drops; mirrors the scalar empty UnpairedPhaseRow).
+    // dropped (no-silent-drops).
     let a = phased_rows(
         "scn",
         3,
@@ -2625,14 +2564,12 @@ fn format_noise_phase_findings_lines_honors_phase_threshold() {
 
 #[test]
 fn noise_phase_informational_metric_shows_but_never_gates() {
-    // DELIBERATE divergence from the scalar per-phase pass (which DROPS
-    // Informational metrics — its bool verdict can't represent them): the noise
-    // per-phase path SHOWS an Informational metric as NoiseKind::Informational,
-    // never gating. total_ttwu_count is a registered directionless Counter; a
-    // significant move (1000->5000, clean spread 0) must classify Informational,
-    // not Regression, and must NOT count in phase_regressions(). Pins the
-    // divergence so a future refactor mirroring the scalar skip can't silently
-    // reverse it.
+    // The noise per-phase path SHOWS an Informational metric as
+    // NoiseKind::Informational and never gates it (directionless metrics are
+    // surfaced, not dropped). total_ttwu_count is a registered directionless
+    // Counter; a significant move (1000->5000, clean spread 0) must classify
+    // Informational, not Regression, and must NOT count in phase_regressions().
+    // Pins that an Informational per-phase move is shown but never gates.
     let a = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("total_ttwu_count", 1000.0)])]);
     let b = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("total_ttwu_count", 5000.0)])]);
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);

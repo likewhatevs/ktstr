@@ -363,49 +363,59 @@ pub(crate) enum KtstrCommand {
         /// `--noise-adjust`.
         #[arg(long, requires = "noise_adjust")]
         noise_spread_threshold: Option<f64>,
-        /// Suppress the per-phase delta tables entirely. Mutually
-        /// exclusive with every other phase flag.
+        /// Suppress the `--noise-adjust` per-phase spread block
+        /// entirely. Requires `--noise-adjust`; mutually exclusive
+        /// with every other phase flag.
         #[arg(
             long = "no-phases",
             help_heading = "Phase rendering",
             conflicts_with_all = ["phases_only", "steps_only", "phase", "phase_threshold"],
+            requires = "noise_adjust",
         )]
         no_phases: bool,
-        /// Show ONLY the per-phase tables; suppress the scalar
-        /// findings table and footer. Composes with `--steps-only`,
-        /// `--phase`, and `--phase-threshold`.
+        /// Show ONLY the `--noise-adjust` per-phase spread block;
+        /// suppress the aggregate spread table and footer. Requires
+        /// `--noise-adjust`. Composes with `--steps-only`, `--phase`,
+        /// and `--phase-threshold`.
         #[arg(
             long = "phases-only",
             help_heading = "Phase rendering",
-            conflicts_with = "no_phases"
+            conflicts_with = "no_phases",
+            requires = "noise_adjust",
         )]
         phases_only: bool,
-        /// Within the per-phase tables, suppress the BASELINE bucket
-        /// (`step_index == 0`). Mutually exclusive with `--phase`.
+        /// Within the `--noise-adjust` per-phase block, suppress the
+        /// BASELINE bucket (`step_index == 0`). Requires
+        /// `--noise-adjust`; mutually exclusive with `--phase`.
         #[arg(
             long = "steps-only",
             help_heading = "Phase rendering",
             conflicts_with_all = ["no_phases", "phase"],
+            requires = "noise_adjust",
         )]
         steps_only: bool,
-        /// Show only the named per-phase index. `0` selects BASELINE;
-        /// `1..=N` select scenario Step ordinals. Mutually exclusive
-        /// with `--steps-only`.
+        /// Show only the named per-phase index in the `--noise-adjust`
+        /// per-phase block. `0` selects BASELINE; `1..=N` select
+        /// scenario Step ordinals. Requires `--noise-adjust`; mutually
+        /// exclusive with `--steps-only`.
         #[arg(
             long = "phase",
             help_heading = "Phase rendering",
             conflicts_with_all = ["no_phases", "steps_only"],
+            requires = "noise_adjust",
         )]
         phase: Option<u16>,
-        /// Per-row relative-delta gate for the per-phase tables:
-        /// suppress paired rows whose `|delta| / |a| < PCT / 100.0`
-        /// (a value from a ~zero baseline is an unbounded relative
-        /// change and is always shown). Independent from `--threshold`.
-        /// Mutually exclusive with `--no-phases`.
+        /// Per-row relative-spread gate for the `--noise-adjust`
+        /// per-phase block: suppress paired rows whose
+        /// `|delta-mean| / |a.mean| < PCT / 100.0` (a value from a
+        /// ~zero baseline is an unbounded relative change and is
+        /// always shown). Independent from `--threshold`. Requires
+        /// `--noise-adjust`; mutually exclusive with `--no-phases`.
         #[arg(
             long = "phase-threshold",
             help_heading = "Phase rendering",
-            conflicts_with = "no_phases"
+            conflicts_with = "no_phases",
+            requires = "noise_adjust",
         )]
         phase_threshold: Option<f64>,
         /// Cargo BUILD profile for the scheduler-under-test on BOTH
@@ -1024,7 +1034,12 @@ mod tests {
     // (`Cargo::try_parse_from(...)`).
 
     fn argv_perf_delta<'a>(extra: &[&'a str]) -> Vec<&'a str> {
-        let mut v: Vec<&'a str> = vec!["cargo-ktstr", "ktstr", "perf-delta"];
+        // Every phase flag `require`s `--noise-adjust` (per-phase output
+        // exists only under the noise-adjusted path), so the fixtures carry
+        // it; the flag under test then surfaces its conflict (or clean
+        // composition) as the sole parse outcome rather than a missing-
+        // requirement error.
+        let mut v: Vec<&'a str> = vec!["cargo-ktstr", "ktstr", "perf-delta", "--noise-adjust", "3"];
         v.extend_from_slice(extra);
         v
     }

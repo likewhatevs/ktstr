@@ -660,7 +660,7 @@ fn render_host_diff_section(section: &HostDiffSection) {
 /// logic can be unit-tested against synthetic SidecarResult
 /// fixtures without instantiating a real sidecar pool on
 /// disk. Mirrors the closure-extraction pattern used elsewhere
-/// for `matches_phase` / `passes_delta_threshold`.
+/// for `matches_phase`.
 pub(crate) fn select_failed_names<'a>(
     pool: &'a [ktstr::test_support::SidecarResult],
     filter: Option<&str>,

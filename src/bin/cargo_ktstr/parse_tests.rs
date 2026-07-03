@@ -95,9 +95,6 @@ fn parse_perf_delta_flags_and_defaults() {
         "--dual-run",
         "--threshold",
         "12.5",
-        "--phases-only",
-        "--phase-threshold",
-        "5",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
     match k.command {
@@ -130,9 +127,11 @@ fn parse_perf_delta_flags_and_defaults() {
             assert!(dual_run, "--dual-run flag sets dual_run");
             assert_eq!(threshold, Some(12.5));
             assert!(policy.is_none());
-            assert!(phases_only, "--phases-only sets phases_only");
-            assert_eq!(phase_threshold, Some(5.0));
-            assert!(!no_phases && !steps_only && phase.is_none());
+            assert!(
+                !no_phases && !phases_only && !steps_only
+                    && phase.is_none() && phase_threshold.is_none(),
+                "phase flags require --noise-adjust and are absent on the scalar path",
+            );
             assert!(
                 noise_adjust.is_none() && noise_spread_threshold.is_none(),
                 "no --noise-adjust on this invocation",
@@ -205,16 +204,30 @@ fn parse_perf_delta_flags_and_defaults() {
         "3",
         "--noise-spread-threshold",
         "1.5",
+        "--phases-only",
+        "--steps-only",
+        "--phase-threshold",
+        "5",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
     match k.command {
         KtstrCommand::PerfDelta {
             noise_adjust,
             noise_spread_threshold,
+            phases_only,
+            steps_only,
+            phase_threshold,
             ..
         } => {
             assert_eq!(noise_adjust, Some(3));
             assert_eq!(noise_spread_threshold, Some(1.5));
+            assert!(phases_only, "--phases-only round-trips under --noise-adjust");
+            assert!(steps_only, "--steps-only round-trips under --noise-adjust");
+            assert_eq!(
+                phase_threshold,
+                Some(5.0),
+                "--phase-threshold round-trips under --noise-adjust",
+            );
         }
         _ => panic!("expected PerfDelta"),
     }
@@ -278,12 +291,15 @@ fn parse_perf_delta_flags_and_defaults() {
         .is_err(),
         "--threshold and --policy must conflict at parse time",
     );
-    // --no-phases conflicts with every other phase flag.
+    // --no-phases conflicts with every other phase flag (all under
+    // --noise-adjust, which the phase flags require).
     assert!(
         Cargo::try_parse_from([
             "cargo",
             "ktstr",
             "perf-delta",
+            "--noise-adjust",
+            "3",
             "--no-phases",
             "--phases-only"
         ])
@@ -296,12 +312,37 @@ fn parse_perf_delta_flags_and_defaults() {
             "cargo",
             "ktstr",
             "perf-delta",
+            "--noise-adjust",
+            "3",
             "--steps-only",
             "--phase",
             "1"
         ])
         .is_err(),
         "--steps-only must conflict with --phase",
+    );
+    // Each phase flag REQUIRES --noise-adjust (per-phase output exists only
+    // under the noise-adjusted path). A phase flag alone must be rejected at
+    // parse time, not silently accepted as an inert no-op on the scalar path.
+    assert!(
+        Cargo::try_parse_from(["cargo", "ktstr", "perf-delta", "--no-phases"]).is_err(),
+        "--no-phases without --noise-adjust must be rejected (requires = noise_adjust)",
+    );
+    assert!(
+        Cargo::try_parse_from(["cargo", "ktstr", "perf-delta", "--phases-only"]).is_err(),
+        "--phases-only without --noise-adjust must be rejected (requires = noise_adjust)",
+    );
+    assert!(
+        Cargo::try_parse_from(["cargo", "ktstr", "perf-delta", "--steps-only"]).is_err(),
+        "--steps-only without --noise-adjust must be rejected (requires = noise_adjust)",
+    );
+    assert!(
+        Cargo::try_parse_from(["cargo", "ktstr", "perf-delta", "--phase", "1"]).is_err(),
+        "--phase without --noise-adjust must be rejected (requires = noise_adjust)",
+    );
+    assert!(
+        Cargo::try_parse_from(["cargo", "ktstr", "perf-delta", "--phase-threshold", "5"]).is_err(),
+        "--phase-threshold without --noise-adjust must be rejected (requires = noise_adjust)",
     );
 }
 

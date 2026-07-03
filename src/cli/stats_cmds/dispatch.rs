@@ -79,12 +79,8 @@ pub fn compare_partitions(
     filter: Option<&str>,
     policy: &ComparisonPolicy,
     dir: Option<&Path>,
-    no_average: bool,
-    phase_opts: &crate::stats::PhaseDisplayOptions,
 ) -> Result<i32> {
-    crate::stats::compare_partitions(
-        filter_a, filter_b, filter, policy, dir, no_average, phase_opts,
-    )
+    crate::stats::compare_partitions(filter_a, filter_b, filter, policy, dir)
 }
 
 /// Noise-adjusted variant of [`compare_partitions`]: keeps every per-run row and

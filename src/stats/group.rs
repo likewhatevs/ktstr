@@ -361,7 +361,7 @@ pub struct AveragedGroup {
     /// contributor was Inconclusive and none failed; `skipped`
     /// fires when at least one contributor was Skip and none
     /// failed or was Inconclusive. Fed directly into
-    /// `compare_rows` when `--average` is active.
+    /// `compare_rows` (averaging is the fixed compare_partitions fold).
     pub row: GauntletRow,
     /// Number of contributors that were a real pass
     /// (`is_pass() == true`). Renders as the numerator of the
@@ -841,11 +841,10 @@ impl<'a> Accumulator<'a> {
             // averaging across mismatched step_index sets would
             // invent rows neither side carried. Surface the empty
             // slice so downstream consumers fall back to the flat
-            // bucket. A future MergeKind::Phase aware merge will
-            // revisit this once compare_partitions' cross-cardinality
-            // (per-step_index intersection + unpaired surfacing)
-            // lands and gives us a tested intersection semantic to
-            // reuse here.
+            // bucket. Averaged groups carry no per-phase data; the
+            // per-step_index intersection + one-sided-step surfacing
+            // semantic lives in the per-run noise path
+            // (noise_phase_findings), not the averaging path.
             phases: Vec::new(),
         };
         AveragedGroup {

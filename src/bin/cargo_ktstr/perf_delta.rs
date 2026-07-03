@@ -775,15 +775,7 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
         ..Default::default()
     };
     let (filter_a, filter_b) = build.build();
-    cli::compare_partitions(
-        &filter_a,
-        &filter_b,
-        None,
-        &policy,
-        None,
-        false,
-        &args.phase_display,
-    )
+    cli::compare_partitions(&filter_a, &filter_b, None, &policy, None)
 }
 
 use ktstr::cli;

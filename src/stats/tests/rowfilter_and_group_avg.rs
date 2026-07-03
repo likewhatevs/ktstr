@@ -640,7 +640,7 @@ fn paint_metrics(row: &mut GauntletRow, spread: f64, gap_ms: u64, migrations: u6
 
 /// Empty input produces zero aggregated rows. Pins the empty-
 /// vec edge case so callers iterating over the result vector
-/// don't need to special-case the `--average` path on empty
+/// don't need to special-case the averaging path on empty
 /// run directories.
 #[test]
 fn group_and_average_empty_input_yields_empty_output() {
@@ -2033,8 +2033,6 @@ fn compare_partitions_with_average_default_produces_regression_on_aggregated_mea
         None,
         &ComparisonPolicy::default(),
         Some(alt_root.path()),
-        false, // no_average=false → averaging is ON
-        &PhaseDisplayOptions::default(),
     )
     .expect("compare_partitions must succeed against valid fixtures");
     assert_eq!(

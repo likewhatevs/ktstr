@@ -4029,8 +4029,8 @@ pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
     METRICS.iter().find(|m| m.name == name)
 }
 
-/// Rate-COMPONENT metric names suppressed from compare OUTPUT (scalar findings,
-/// per-phase deltas, and unpaired-phase rows). These are the internal
+/// Rate-COMPONENT metric names suppressed from compare OUTPUT (scalar findings and the
+/// noise per-phase spread + coverage rows). These are the internal
 /// numerator/denominator Counters of the derived rates — `iteration_rate`
 /// (`total_phase_iterations` / `total_phase_duration_sec`) and the pooled
 /// `iterations_per_cpu_sec` (`total_iterations_pooled` / `total_cpu_time_sec`) —
@@ -4080,19 +4080,6 @@ const RENDER_SUPPRESSED_COMPONENTS: &[&str] = &[
 /// [`RENDER_SUPPRESSED_COMPONENTS`]).
 pub(crate) fn is_render_suppressed_component(name: &str) -> bool {
     RENDER_SUPPRESSED_COMPONENTS.contains(&name)
-}
-
-/// Clone a per-phase metrics map with the suppressed Rate components removed —
-/// used for the unpaired-phase compare rows so a side-only phase does not render
-/// the component plumbing (see [`RENDER_SUPPRESSED_COMPONENTS`]).
-pub(crate) fn metrics_without_suppressed(
-    metrics: &std::collections::BTreeMap<String, f64>,
-) -> std::collections::BTreeMap<String, f64> {
-    metrics
-        .iter()
-        .filter(|(k, _)| !is_render_suppressed_component(k.as_str()))
-        .map(|(k, v)| (k.clone(), *v))
-        .collect()
 }
 
 /// Infer the regression polarity (`higher_is_worse`) of a metric

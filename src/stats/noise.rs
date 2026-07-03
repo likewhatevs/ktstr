@@ -171,7 +171,7 @@ impl SideSummary {
     /// `--noise-adjust`: the band still measures run-to-run variability from
     /// the per-run ratios, but the compared centroid is the duration-weighted
     /// pooled rate the metric registry documents as the cross-run Rate value,
-    /// so `--noise-adjust` and `--average` agree on a Rate's central value. The
+    /// so `--noise-adjust` and the scalar averaging compare agree on a Rate's central value. The
     /// relative spread is recomputed against the pooled mean; `n`, the band, the
     /// variance, AND `sample_mean` are unchanged. The Welch arm reads
     /// `sample_mean` + `var` (both from the raw per-run ratios), so overriding

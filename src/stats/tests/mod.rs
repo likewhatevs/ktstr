@@ -36,8 +36,7 @@ fn make_row(scenario: &str, topo: &str, passed: bool, spread: f64) -> GauntletRo
 }
 
 /// Build a [`crate::assert::PhaseBucket`] for a step with the given per-metric
-/// values. Shared by the scalar per-phase tests (compare_phase) and the
-/// per-phase noise tests (compare_core).
+/// values. Used by the per-phase noise tests (compare_core).
 fn make_phase_bucket(
     step_index: u16,
     label: &str,

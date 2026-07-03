@@ -32,7 +32,7 @@ pub(crate) struct Finding {
 }
 
 /// How a significant (past-dual-gate) delta is classified. A metric
-/// becomes a [`Finding`] / [`PhaseDeltaRow`] only after clearing the
+/// becomes a [`Finding`] only after clearing the
 /// dual gate; this says which kind. `Informational` is for a
 /// [`Polarity::Informational`](crate::test_support::Polarity::Informational)
 /// metric (`MetricDef::classify_direction` => `None`): the change is
@@ -42,33 +42,6 @@ pub(crate) struct Finding {
 pub(crate) enum FindingKind {
     Regression,
     Improvement,
-    Informational,
-}
-
-/// Classification of one per-phase metric delta ([`PhaseDeltaRow`]).
-///
-/// Unlike the run-level [`FindingKind`] — which is recorded only for
-/// metrics that CLEARED the dual gate (unchanged metrics are counted in
-/// [`CompareReport::unchanged`], never made into a `Finding`) — the
-/// per-phase table emits a row for EVERY paired metric so the operator
-/// sees the full per-phase comparison. It therefore needs a `Stable`
-/// state for a below-dual-gate delta in addition to the directional and
-/// directionless kinds. Mirrors the noise per-phase [`NoiseKind`]
-/// vocabulary minus `Noisy` (the `<2 runs` / insufficient-samples state
-/// that has no scalar analog), so the scalar and noise per-phase tables
-/// render the same verdict words.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub(crate) enum PhaseVerdict {
-    /// Directional metric past the dual gate in the worsening direction
-    /// (per the metric's polarity). The only kind counted as a regression.
-    Regression,
-    /// Directional metric past the dual gate in the improving direction.
-    Improvement,
-    /// Below the dual gate (or both sides ~zero): no significant change.
-    Stable,
-    /// Directionless ([`crate::test_support::Polarity::Informational`])
-    /// metric with a significant change — shown, never a regression or
-    /// improvement, never gating the exit.
     Informational,
 }
 
@@ -119,18 +92,6 @@ pub(crate) struct CoverageDiff {
 /// counts B-side rows whose key has no match on the A side; the
 /// converse is `removed_from_a`. The filter (when set) applies to
 /// every counter, so excluded rows do not contribute.
-///
-/// `phase_deltas`, `phase_coverage_diffs`, and `unpaired_phases`
-/// carry the per-phase comparison shape derived from
-/// [`crate::assert::ScenarioStats::phases`] on each row pair:
-/// `phase_deltas` for a metric on both sides of a matched phase,
-/// `phase_coverage_diffs` for a metric on exactly one side of a
-/// matched phase, and `unpaired_phases` for a whole phase present on
-/// only one side. The phase pass runs after the scalar-row pass via
-/// the same pairing key; rows whose `phases` slice is empty on either
-/// side contribute nothing here (single-phase scenarios skip the
-/// per-phase view, falling back to the scalar findings already in
-/// `findings`).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub(crate) struct CompareReport {
     pub regressions: u32,
@@ -144,8 +105,6 @@ pub(crate) struct CompareReport {
     pub new_in_b: u32,
     pub removed_from_a: u32,
     pub findings: Vec<Finding>,
-    pub phase_deltas: Vec<PhaseDeltaRow>,
-    pub unpaired_phases: Vec<UnpairedPhaseRow>,
     /// Metrics present on exactly one side of a paired row (a metric
     /// appeared or disappeared between runs A and B). Never gated — not
     /// counted in `regressions`/`improvements`/`informational` and no
@@ -153,21 +112,13 @@ pub(crate) struct CompareReport {
     /// visible rather than silently dropped or mis-flagged as a
     /// regression from a zero baseline. See [`CoverageDiff`].
     pub coverage_diffs: Vec<CoverageDiff>,
-    /// Metrics present on exactly one side of a MATCHED phase (the
-    /// per-phase analog of `coverage_diffs`; distinct from
-    /// `unpaired_phases`, which is a whole one-sided phase). Never gated;
-    /// surfaced so a metric appearing/disappearing within a matched phase
-    /// between runs is visible rather than silently dropped. See
-    /// [`PhaseCoverageDiff`].
-    pub phase_coverage_diffs: Vec<PhaseCoverageDiff>,
 }
 
 /// Which side of an A/B comparison a row belongs to. Typed surface
 /// for the per-phase rows so new code does not propagate the
 /// `"A"` / `"B"` string-literal pattern the scalar-finding path
 /// uses (kept as-is at the existing `"A"` / `"B"` call sites in this
-/// module — `render_side_label`, `zero_match_diagnostic`, and
-/// `check_no_duplicate_pairing_keys`).
+/// module — `render_side_label`, `zero_match_diagnostic`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub(crate) enum ComparePartition {
     A,
@@ -177,112 +128,14 @@ pub(crate) enum ComparePartition {
 impl ComparePartition {
     /// Render the side as the same one-letter label
     /// `render_side_label` produces for the scalar table headers,
-    /// so the new per-phase tables and the existing scalar table
-    /// share the same operator-facing identifier.
+    /// so the noise per-phase coverage rows and the scalar findings
+    /// table share the same operator-facing side identifier.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::A => "A",
             Self::B => "B",
         }
     }
-}
-
-/// One per-phase metric delta between matched A/B rows. Populated
-/// when both rows carry a [`crate::assert::PhaseBucket`] at the
-/// same `step_index` AND both buckets carry a value for the same
-/// metric name. Generated by the parallel-pass after the
-/// scalar-finding compare runs.
-#[derive(Clone, Debug, serde::Serialize)]
-pub(crate) struct PhaseDeltaRow {
-    /// Same pairing key the scalar [`Finding`] uses, so the per-
-    /// phase delta is unambiguously scoped to the matched row pair.
-    pub pairing_key: PairingKey,
-    /// 1-indexed phase encoding per the framework convention:
-    /// `0` is BASELINE, `1..=N` are scenario Step ordinals.
-    pub step_index: u16,
-    /// Human-readable label mirroring
-    /// [`crate::assert::PhaseBucket::label`] (`"BASELINE"` or
-    /// `"Step[k-1]"`). The renderer prints this in the PHASE
-    /// column.
-    pub label: String,
-    /// Registry entry the delta was computed against. Carries the
-    /// `MetricKind` (e.g. Counter / Peak / Gauge / DeltaSum) the
-    /// phase aggregator used to fold the per-sample readings into
-    /// the per-phase value, plus the `Polarity` the renderer uses
-    /// to classify the delta direction.
-    pub metric: &'static MetricDef,
-    /// A-side phase-aggregated value (from
-    /// `phase_bucket.metrics[metric.name]`).
-    pub a: f64,
-    /// B-side phase-aggregated value.
-    pub b: f64,
-    /// `val_b - val_a` (B minus A) — the same plain difference the
-    /// scalar [`Finding::delta`] carries. Polarity is NOT folded into
-    /// the sign here; it is applied separately when computing
-    /// `verdict` (below) via the metric's `classify_direction()`
-    /// (whose `None` routes a directionless metric to
-    /// `Informational` rather than splitting on polarity).
-    pub delta: f64,
-    /// The metric's per-phase classification. `Stable` for a
-    /// below-dual-gate delta (this table emits a row for every paired
-    /// metric, so unchanged rows are labeled, not omitted);
-    /// `Informational` for a significant change in a directionless
-    /// ([`crate::test_support::Polarity::Informational`]) metric — the
-    /// IRQ/softirq schedstat counters land here rather than being
-    /// dropped; `Regression`/`Improvement` for a past-gate directional
-    /// metric per its polarity. Only `Regression` is counted in the
-    /// footer's regression tally and it never gates the exit (the
-    /// per-phase table is render-only).
-    pub verdict: PhaseVerdict,
-}
-
-/// One per-phase bucket present on exactly one side of the A/B
-/// comparison. Generated when a matched row pair has phase
-/// coverage asymmetry — e.g. A ran a 3-Step scenario and B ran a
-/// 4-Step version, so B's Step\[3\] has no A counterpart. The
-/// renderer surfaces these in a dedicated "Phase Coverage
-/// Asymmetry" section so the operator sees explicitly which side
-/// is missing data; silently dropping them would mask the
-/// scenario-shape difference.
-#[derive(Clone, Debug, serde::Serialize)]
-pub(crate) struct UnpairedPhaseRow {
-    /// Which side carries the orphan bucket.
-    pub side: ComparePartition,
-    /// Same pairing key the matched [`PhaseDeltaRow`]s use.
-    pub pairing_key: PairingKey,
-    pub step_index: u16,
-    pub label: String,
-    /// Per-metric values carried verbatim from the orphan bucket's
-    /// [`crate::assert::PhaseBucket::metrics`] map; the renderer
-    /// prints them one-sided with `—` (em dash) in the absent
-    /// column.
-    pub metrics: std::collections::BTreeMap<String, f64>,
-}
-
-/// A metric present on exactly ONE side of a MATCHED (same `step_index`)
-/// phase — the per-phase analog of [`CoverageDiff`].
-///
-/// Distinct from [`UnpairedPhaseRow`], which is a WHOLE phase
-/// (`step_index`) present on only one side; this is a single metric name
-/// present in one matched bucket and absent in the other. A phase bucket
-/// OMITS a metric whose samples yield no per-sample reading
-/// (`read_sample`-driven), so two runs' buckets can carry different
-/// metric-name sets at the same `step_index`. Recording it here (never
-/// gated, no regression/improvement verdict) surfaces the
-/// appear/disappear-within-a-matched-phase case instead of silently
-/// dropping it — the per-phase counterpart of the scalar one-sided-absent
-/// fix.
-#[derive(Clone, Debug, serde::Serialize)]
-pub(crate) struct PhaseCoverageDiff {
-    /// Same pairing key the matched [`PhaseDeltaRow`]s use.
-    pub pairing_key: PairingKey,
-    pub step_index: u16,
-    pub label: String,
-    pub metric: &'static MetricDef,
-    /// The side whose matched bucket HAS the metric; the other is absent.
-    pub present_side: ComparePartition,
-    /// The present side's value (the absent side has none).
-    pub value: f64,
 }
 
 /// Per-metric threshold policy driving `compare_rows` /
@@ -336,12 +189,13 @@ pub struct ComparisonPolicy {
     pub per_metric_percent: BTreeMap<String, f64>,
 }
 
-/// CLI-controlled rendering of the per-phase delta block in
-/// `cargo ktstr perf-delta`. Bundled as a struct so the
-/// 5-flag clap surface threads through `compare_partitions` as
-/// a single positional rather than five. Default value renders
-/// every phase / every metric / every paired row — equivalent
-/// to passing no phase flags.
+/// CLI-controlled rendering of the per-phase spread block in
+/// `cargo ktstr perf-delta --noise-adjust`. Bundled as a struct
+/// so the 5-flag clap surface threads through
+/// `compare_partitions_noise` as a single positional rather than
+/// five. Default value renders every phase / every metric / every
+/// paired row — equivalent to passing no phase flags. All 5 flags
+/// require `--noise-adjust` (per-phase output exists only there).
 ///
 /// The flags compose via AND on independent axes (block-level
 /// suppression × phase-id × row-significance), with three
@@ -355,26 +209,24 @@ pub struct ComparisonPolicy {
 ///   to a single bucket; the other suppresses BASELINE — both
 ///   together are confused phrasing).
 ///
-/// The 5 flags trigger renderer behaviour ONLY — the data
-/// layer in `compare_rows_by` always emits the full set of
-/// matched `PhaseDeltaRow`s, `PhaseCoverageDiff`s, and
-/// `UnpairedPhaseRow`s so programmatic consumers of
-/// `CompareReport` see the unfiltered surface. Filtering is
-/// render-time projection.
+/// The 5 flags trigger renderer behaviour ONLY — the
+/// `--noise-adjust` per-phase pass always computes the full set
+/// of `NoisePhaseFinding`s and coverage entries so programmatic
+/// consumers see the unfiltered surface. Filtering is render-time
+/// projection.
 #[derive(Debug, Default, Clone)]
 pub struct PhaseDisplayOptions {
-    /// `--no-phases`: suppress the per-phase block (delta,
-    /// coverage, and unpaired tables) entirely. The scalar
-    /// findings table and footer
-    /// render unchanged; the only effect is hiding the phase
-    /// block (and the phase footer hint). Mutually exclusive
+    /// `--no-phases`: suppress the `--noise-adjust` per-phase
+    /// spread block entirely. The aggregate spread table and
+    /// footer render unchanged; the only effect is hiding the
+    /// per-phase block (and its footer hint). Mutually exclusive
     /// with every other phase flag at CLI parse time.
     pub no_phases: bool,
-    /// `--phases-only`: suppress the scalar findings table and
-    /// the host-context delta; render ONLY the per-phase block.
-    /// Useful for narrowing investigation to a phase regression
-    /// when the scalar rollup is noise. Composes with
-    /// `--steps-only`, `--phase`, and `--phase-threshold`.
+    /// `--phases-only`: suppress the aggregate spread table and
+    /// the host-context delta; render ONLY the per-phase spread
+    /// block. Useful for narrowing investigation to a phase
+    /// regression when the aggregate rollup is noise. Composes
+    /// with `--steps-only`, `--phase`, and `--phase-threshold`.
     pub phases_only: bool,
     /// `--steps-only`: within the per-phase block, suppress
     /// the BASELINE bucket (`step_index == 0`); render only
@@ -389,18 +241,17 @@ pub struct PhaseDisplayOptions {
     /// rename (`"Step[0]"` → `"Step:0"`) doesn't break operator
     /// CI invocations. Mutually exclusive with `--steps-only`.
     pub phase: Option<u16>,
-    /// `--phase-threshold <PCT>`: render-side relative-delta
-    /// gate for the per-phase pass. Suppresses paired rows
-    /// where `|delta| / |a| < PCT / 100.0`; a value from a
-    /// ~zero baseline (`|a| < ZERO_MEAN_EPS`) is an unbounded
-    /// relative change and clears any finite threshold. `0.0`
-    /// shows every paired row; absence falls through to the
-    /// registry's per-metric `default_rel`. Independent from
-    /// the scalar `--threshold` — the two passes have separate
-    /// filters so an operator can widen the phase view without
-    /// widening the scalar view (the diagnostic "show me every
-    /// per-phase delta but only load-bearing scalar findings"
-    /// use case).
+    /// `--phase-threshold <PCT>`: render-side relative-spread
+    /// gate for the `--noise-adjust` per-phase pass. Suppresses
+    /// paired rows where `|delta-mean| / |a.mean| < PCT / 100.0`;
+    /// a value from a ~zero baseline (`|a.mean| < ZERO_MEAN_EPS`)
+    /// is an unbounded relative change and clears any finite
+    /// threshold. `0.0` shows every paired row; absence falls
+    /// through to the registry's per-metric `default_rel`.
+    /// Independent from `--threshold` — the aggregate and
+    /// per-phase passes have separate filters so an operator can
+    /// widen the per-phase view without widening the aggregate
+    /// view.
     pub phase_threshold: Option<f64>,
 }
 
@@ -428,9 +279,8 @@ impl PhaseDisplayOptions {
     /// render under the current display flags. Combines the two
     /// step-axis predicates (`--phase <N>` filter and
     /// `--steps-only` BASELINE-suppressor) into a single
-    /// row-level decision the renderer can apply uniformly
-    /// across the `PhaseDeltaRow`, `PhaseCoverageDiff`, and
-    /// `UnpairedPhaseRow` vecs.
+    /// row-level decision the renderer applies uniformly across
+    /// the `--noise-adjust` per-phase findings and coverage rows.
     /// Returns `true` when no relevant flag is set (default
     /// path: every step renders).
     pub fn matches_phase(&self, step_index: u16) -> bool {
@@ -445,55 +295,13 @@ impl PhaseDisplayOptions {
         true
     }
 
-    /// True when a [`PhaseDeltaRow`] passes the
-    /// `--phase-threshold` relative-significance gate. Computes
-    /// `|delta| / |a| >= phase_threshold / 100.0` when the baseline
-    /// `a` is non-negligible. A value appearing from a ~zero
-    /// baseline (`|a| < ZERO_MEAN_EPS` with `|delta|` above the same
-    /// floor) is an unbounded relative change — its relative spread
-    /// is treated as `+INFINITY`, so it clears any finite threshold
-    /// rather than dividing by zero. A row whose `|a|` AND `|delta|`
-    /// are both below the floor carries no signal and is filtered by
-    /// any positive threshold. Returns `true` when no flag is set
-    /// (default path: every row passes; per the `--phase-threshold`
-    /// clap doc — absence keeps every paired row in the rendered
-    /// output).
-    ///
-    /// `ZERO_MEAN_EPS` is the domain zero epsilon the dual-gate
-    /// (`push_scalar_findings` / `push_phase_deltas`) and the noise
-    /// verdict skip also use, so "is this baseline zero" is one
-    /// consistent test across the comparator — not `f64::EPSILON`,
-    /// the machine ulp near 1.0.
-    ///
-    /// `pub(crate)` rather than `pub` because [`PhaseDeltaRow`]
-    /// is `pub(crate)` — the row type is an internal renderer
-    /// detail, not a public surface. External consumers reach
-    /// per-row decisions through the rendered output, not by
-    /// instantiating a `PhaseDeltaRow` themselves.
-    pub(crate) fn passes_delta_threshold(&self, delta: &PhaseDeltaRow) -> bool {
-        let Some(pct) = self.phase_threshold else {
-            return true;
-        };
-        let rel = if delta.a.abs() > ZERO_MEAN_EPS {
-            delta.delta.abs() / delta.a.abs()
-        } else if delta.delta.abs() > ZERO_MEAN_EPS {
-            // A value from a ~zero baseline is an unbounded relative
-            // change — above any finite --phase-threshold.
-            f64::INFINITY
-        } else {
-            // No signal on either side: filtered by any positive threshold.
-            0.0
-        };
-        rel >= pct / 100.0
-    }
-
-    /// The noise/spread analog of [`Self::passes_delta_threshold`] for a
+    /// The `--phase-threshold` relative-spread gate for a
     /// [`NoisePhaseFinding`]'s verdict: `|b.mean - a.mean| / |a.mean| >=
     /// phase_threshold / 100`. A move from a ~zero baseline (`|a.mean| <
     /// ZERO_MEAN_EPS`) is unbounded → shown; both ~zero carries no signal →
     /// filtered by any positive threshold. Returns `true` when no flag is set.
-    /// A distinct method from `passes_delta_threshold` because the noise row
-    /// carries per-side means (a [`NoiseVerdict`]), not a scalar row delta.
+    /// The noise row carries per-side means (a [`NoiseVerdict`]), so the gate
+    /// works on the mean delta rather than a single-run row delta.
     pub(crate) fn passes_noise_spread_threshold(&self, verdict: &NoiseVerdict) -> bool {
         let Some(pct) = self.phase_threshold else {
             return true;
@@ -699,8 +507,8 @@ pub(crate) fn compare_rows_by(
     // each row_b lookup is O(1) instead of O(rows_a). `or_insert_with`
     // preserves first-match semantics from the prior `rows_a.iter().find()`
     // call: on the rare path where two A-side rows share a key (the
-    // averaging path produces unique keys; the `--no-average` path
-    // bails earlier via `check_no_duplicate_pairing_keys`), the
+    // averaging path folds same-key rows into one mean, so a
+    // shared key is not normally reachable), the
     // earlier-iterated row wins.
     let mut a_by_key: HashMap<PairingKey, &GauntletRow> = HashMap::with_capacity(rows_a.len());
     for row_a in rows_a {
@@ -779,7 +587,6 @@ pub(crate) fn compare_rows_by(
             &rel_thresholds,
             &suppressed,
         );
-        push_phase_deltas(&mut report, row_a, row_b, &key_b, policy);
     }
 
     // Second pass: A-side rows whose key has no match on the B side.
@@ -940,210 +747,6 @@ fn push_scalar_findings(
     }
 }
 
-/// Append the per-phase delta rows for one matched `(row_a, row_b)`
-/// pair to `report`. Runs on every paired row pair alongside the
-/// scalar findings (see [`push_scalar_findings`]). Walks the union of
-/// step_index keys from `row_a.phases` and `row_b.phases` and emits
-/// one [`PhaseDeltaRow`] per matched (step_index, metric_name) pair
-/// where both sides carry a value, one [`PhaseCoverageDiff`] per
-/// metric present on exactly one side within a matched step_index, or
-/// one [`UnpairedPhaseRow`] per side-only step_index. Rows whose
-/// `phases` slice is empty on
-/// either side contribute nothing here — single-phase scenarios skip
-/// the per-phase view entirely without emitting orphan
-/// UnpairedPhaseRows (an empty A-side against a populated B-side
-/// would otherwise flood the unpaired section for every B phase). The
-/// early-skip matches the "Empty when scenario produced no periodic
-/// captures" semantic on `ScenarioStats.phases`.
-fn push_phase_deltas(
-    report: &mut CompareReport,
-    row_a: &GauntletRow,
-    row_b: &GauntletRow,
-    key_b: &PairingKey,
-    policy: &ComparisonPolicy,
-) {
-    if !row_a.phases.is_empty() && !row_b.phases.is_empty() {
-        let a_by_step: std::collections::BTreeMap<u16, &crate::assert::PhaseBucket> =
-            row_a.phases.iter().map(|p| (p.step_index, p)).collect();
-        let b_by_step: std::collections::BTreeMap<u16, &crate::assert::PhaseBucket> =
-            row_b.phases.iter().map(|p| (p.step_index, p)).collect();
-        let union: std::collections::BTreeSet<u16> =
-            a_by_step.keys().chain(b_by_step.keys()).copied().collect();
-        for step_index in union {
-            match (a_by_step.get(&step_index), b_by_step.get(&step_index)) {
-                (Some(pa), Some(pb)) => {
-                    // Matched phase on both sides — emit a
-                    // PhaseDeltaRow per metric_name present on
-                    // BOTH sides. A name present on only one side
-                    // is not a delta; it becomes a
-                    // PhaseCoverageDiff via the (Some, None) /
-                    // (None, Some) arms below, never a synthetic
-                    // delta against an absent value.
-                    //
-                    // The `PhaseVerdict` honors the same dual-gate
-                    // the scalar pass applies inside its
-                    // per-metric loop (search for `default_abs <`
-                    // in `compare_rows_by` above): a row whose
-                    // `|delta| < default_abs` OR whose
-                    // `rel_delta < policy.rel_threshold` is
-                    // classified `Stable` even when the direction
-                    // matches `polarity`. This mirrors the scalar
-                    // `unchanged` semantic so a sub-threshold
-                    // per-phase delta (e.g. `+0.1 ms` on a
-                    // 10-ms-default gate) does not produce a
-                    // false-positive REGRESSION verdict in the
-                    // rendered table. The row is still emitted into
-                    // `phase_deltas` so programmatic consumers of
-                    // `CompareReport.phase_deltas` see every paired
-                    // comparison; the classification, not the
-                    // presence of a row, carries the verdict.
-                    // Iterate the UNION of metric names across both matched
-                    // buckets (PhaseBucket.metrics is a BTreeMap, so the union
-                    // is deterministically ordered). A metric present in only
-                    // ONE bucket at this matched step_index is a per-phase
-                    // coverage difference (PhaseCoverageDiff), not a delta — the
-                    // per-phase analog of the scalar one-sided-absent handling.
-                    // Iterating only `pa.metrics` would silently drop a B-only
-                    // metric; the prior `pb.metrics.get(name) else continue`
-                    // silently dropped an A-only one.
-                    let metric_names: std::collections::BTreeSet<&str> = pa
-                        .metrics
-                        .keys()
-                        .chain(pb.metrics.keys())
-                        .map(String::as_str)
-                        .collect();
-                    for metric_name in metric_names {
-                        // Suppress Rate components from the per-phase view (delta
-                        // AND coverage), as in the scalar path; they stay in
-                        // PhaseBucket.metrics for the re-pool.
-                        if is_render_suppressed_component(metric_name) {
-                            continue;
-                        }
-                        let Some(metric_def) = metric_def(metric_name) else {
-                            continue;
-                        };
-                        match (pa.metrics.get(metric_name), pb.metrics.get(metric_name)) {
-                            (Some(&val_a), Some(&val_b)) => {
-                                let delta = val_b - val_a;
-                                let rel_thresh =
-                                    policy.rel_threshold(metric_def.name, metric_def.default_rel);
-                                // Same zero discipline as the scalar dual-gate: a
-                                // value from a ~zero baseline is an unbounded
-                                // relative change (INFINITY clears the rel gate,
-                                // leaving the absolute gate to decide); both sides
-                                // ~zero is no signal (rel 0, and |delta| ~0 also
-                                // fails the absolute gate). ZERO_MEAN_EPS is the
-                                // domain zero epsilon, matching the scalar path
-                                // and the noise verdict skip — not f64::EPSILON,
-                                // the machine ulp near 1.0.
-                                let rel_delta = if val_a.abs() > ZERO_MEAN_EPS {
-                                    (delta / val_a).abs()
-                                } else if delta.abs() > ZERO_MEAN_EPS {
-                                    f64::INFINITY
-                                } else {
-                                    0.0
-                                };
-                                let below_dual_gate =
-                                    delta.abs() < metric_def.default_abs || rel_delta < rel_thresh;
-                                // Below the gate -> Stable (this table shows every
-                                // paired metric, so a sub-threshold delta is a
-                                // labeled `stable` row, not a phantom improvement).
-                                // Past the gate, a directionless metric (the
-                                // IRQ/softirq schedstat counters:
-                                // `total_hardirqs`, `total_softirq_*`,
-                                // `total_*_time_ns`, `total_steal_time_ns` — all
-                                // Informational AND phase-bucketed) is shown as
-                                // `Informational`, never a regression/improvement;
-                                // a directional metric splits on its polarity.
-                                // Mirrors the run-level `push_scalar_findings`
-                                // classify and the noise per-phase `classify_noise`.
-                                let verdict = if below_dual_gate {
-                                    PhaseVerdict::Stable
-                                } else {
-                                    match metric_def.classify_direction() {
-                                        None => PhaseVerdict::Informational,
-                                        Some(higher_is_worse) => {
-                                            let is_regression = if higher_is_worse {
-                                                delta > 0.0
-                                            } else {
-                                                delta < 0.0
-                                            };
-                                            if is_regression {
-                                                PhaseVerdict::Regression
-                                            } else {
-                                                PhaseVerdict::Improvement
-                                            }
-                                        }
-                                    }
-                                };
-                                report.phase_deltas.push(PhaseDeltaRow {
-                                    pairing_key: key_b.clone(),
-                                    step_index,
-                                    label: pa.label.clone(),
-                                    metric: metric_def,
-                                    a: val_a,
-                                    b: val_b,
-                                    delta,
-                                    verdict,
-                                });
-                            }
-                            (Some(&value), None) => {
-                                // A-only within this matched phase: a coverage
-                                // diff, never a verdict (no comparable baseline).
-                                report.phase_coverage_diffs.push(PhaseCoverageDiff {
-                                    pairing_key: key_b.clone(),
-                                    step_index,
-                                    label: pa.label.clone(),
-                                    metric: metric_def,
-                                    present_side: ComparePartition::A,
-                                    value,
-                                });
-                            }
-                            (None, Some(&value)) => {
-                                // B-only within this matched phase: the mirror of
-                                // the above — previously never iterated, hence
-                                // silently dropped.
-                                report.phase_coverage_diffs.push(PhaseCoverageDiff {
-                                    pairing_key: key_b.clone(),
-                                    step_index,
-                                    label: pb.label.clone(),
-                                    metric: metric_def,
-                                    present_side: ComparePartition::B,
-                                    value,
-                                });
-                            }
-                            (None, None) => {
-                                unreachable!("metric_name came from the union of both key sets")
-                            }
-                        }
-                    }
-                }
-                (Some(orphan), None) => {
-                    report.unpaired_phases.push(UnpairedPhaseRow {
-                        side: ComparePartition::A,
-                        pairing_key: key_b.clone(),
-                        step_index,
-                        label: orphan.label.clone(),
-                        metrics: metrics_without_suppressed(&orphan.metrics),
-                    });
-                }
-                (None, Some(orphan)) => {
-                    report.unpaired_phases.push(UnpairedPhaseRow {
-                        side: ComparePartition::B,
-                        pairing_key: key_b.clone(),
-                        step_index,
-                        label: orphan.label.clone(),
-                        metrics: metrics_without_suppressed(&orphan.metrics),
-                    });
-                }
-                (None, None) => {
-                    unreachable!("step_index taken from union of a_by_step / b_by_step keys")
-                }
-            }
-        }
-    }
-}
-
 /// Emit a stderr warning naming any `-dirty` commit values present
 /// in the partitioned rows so the operator knows the comparison
 /// includes builds whose source tree may not match the recorded
@@ -1195,8 +798,8 @@ fn warn_on_overcommit(rows_a: &[GauntletRow], rows_b: &[GauntletRow], pairing_di
 ///   stamp exists to surface.
 /// - MIXED BUDGET: a single pairing group on a side holds more than
 ///   one distinct non-skip budget. [`group_and_average_by`] folds rows
-///   that share a full [`PairingKey`], so this is exactly the set
-///   `--average` would average together across budgets. It only arises
+///   that share a full [`PairingKey`], so this is exactly the set the
+///   averaging fold combines across budgets. It only arises
 ///   when [`Dimension::CpuBudget`] is NOT a pairing dim (the operator
 ///   sliced on cpu-budget, dropping it from the key); when it IS a
 ///   pairing dim, each budget keys its own group and is never folded.
@@ -1231,8 +834,8 @@ pub(crate) fn render_overcommit_warning(
     };
 
     // Per pairing group: the union of budgets across groups that hold
-    // >1 distinct budget — exactly the budgets `--average` folds into
-    // one mean. Empty when CpuBudget is a pairing dim (each budget keys
+    // >1 distinct budget — exactly the budgets the averaging fold
+    // combines into one mean. Empty when CpuBudget is a pairing dim (each budget keys
     // its own group, so no group ever holds two).
     let cpu_budget_is_pairing = pairing_dims.contains(&Dimension::CpuBudget);
     let mixed_folded = |rows: &[GauntletRow]| -> BTreeSet<u32> {
@@ -1312,8 +915,7 @@ pub(crate) fn render_overcommit_warning(
             let _ = writeln!(
                 out,
                 "  side {label}: CPU budgets [{list}] share a pairing group — \
-                 --average folds them into one mean (--no-average rejects them as \
-                 duplicate keys); slice with --cpu-budget so cross-budget runs are \
+                 the average fold collapses them into one mean; slice with --cpu-budget so cross-budget runs are \
                  not compared under one key"
             );
         }
@@ -1647,13 +1249,13 @@ struct PartitionedComparison {
     /// `pool` converted to rows, same length and iteration order.
     rows: Vec<GauntletRow>,
     /// A-side rows fed to [`compare_rows_by`]: averaged mean rows
-    /// under [`RowPrep::Averaged`], the raw filtered rows under either
-    /// per-run mode ([`RowPrep::PerRunUnique`] / [`RowPrep::PerRunPooled`]).
+    /// under [`RowPrep::Averaged`], the raw filtered rows under
+    /// [`RowPrep::PerRunPooled`].
     rows_a_for_compare: Vec<GauntletRow>,
     /// B-side counterpart of `rows_a_for_compare`.
     rows_b_for_compare: Vec<GauntletRow>,
     /// A-side averaged groups under [`RowPrep::Averaged`]; `None` under
-    /// both per-run modes. Drives the per-group pass-count block.
+    /// [`RowPrep::PerRunPooled`]. Drives the per-group pass-count block.
     avg_a: Option<Vec<AveragedGroup>>,
     /// B-side counterpart of `avg_a`.
     avg_b: Option<Vec<AveragedGroup>>,
@@ -1671,13 +1273,8 @@ enum RowPrep {
     /// Fold same-pairing-key rows on each side into one arithmetic-mean
     /// row — the default (averaging) compare behavior.
     Averaged,
-    /// Keep every row distinct and REJECT duplicate pairing keys. The
-    /// pairwise no-average compare path: `compare_rows` pairs
-    /// one A-row against exactly one B-row per key, so a duplicate key
-    /// is ambiguous and must be an error.
-    PerRunUnique,
-    /// Keep every row INCLUDING duplicate pairing keys, and do NOT run
-    /// the duplicate-key rejection. The `perf-delta --noise-adjust`
+    /// Keep every row INCLUDING duplicate pairing keys. The
+    /// `perf-delta --noise-adjust`
     /// path: [`noise_findings`] groups the N runs per key per side into
     /// a spread, so N-per-key is the intended input, not an error.
     PerRunPooled,
@@ -1688,8 +1285,7 @@ enum RowPrep {
 /// bundle the render half destructures, or bails with the same
 /// diagnostics in the same order as the original in-function prelude:
 /// identical-rows gate, empty-pool gate, then the two zero-match
-/// gates, then (under [`RowPrep::PerRunUnique`]) the
-/// duplicate-pairing-key gates. The multi-dim slicing warning and the dirty-build /
+/// gates. The multi-dim slicing warning and the dirty-build /
 /// overcommit warnings are emitted here so they precede the render
 /// half's header lines, preserving output order.
 fn prepare_partitioned_comparison(
@@ -1775,8 +1371,8 @@ fn prepare_partitioned_comparison(
     // slicing dim, a row whose `project_commit` is in
     // `filter_a.project_commits` matches A but NOT B unless
     // `filter_b.project_commits` also contains it).
-    let mut rows_a = apply_row_filters(&rows, filter_a);
-    let mut rows_b = apply_row_filters(&rows, filter_b);
+    let rows_a = apply_row_filters(&rows, filter_a);
+    let rows_b = apply_row_filters(&rows, filter_b);
     if rows_a.is_empty() {
         anyhow::bail!(
             "{}",
@@ -1798,8 +1394,8 @@ fn prepare_partitioned_comparison(
 
     // Fold each side's rows per the caller's [`RowPrep`]. `Averaged`
     // collapses same-pairing-key rows into one mean row (the default);
-    // both per-run modes keep every row distinct and differ only in
-    // whether a duplicate pairing key is an error.
+    // PerRunPooled keeps every row distinct, including duplicate
+    // pairing keys (N-per-key is the intended noise-adjust input).
     let (rows_a_for_compare, rows_b_for_compare, avg_a, avg_b) = match prep {
         RowPrep::Averaged => {
             let avg_a = group_and_average_by(&rows_a, &pairing_dims);
@@ -1808,32 +1404,11 @@ fn prepare_partitioned_comparison(
             let b_rows: Vec<GauntletRow> = avg_b.iter().map(|r| r.row.clone()).collect();
             (a_rows, b_rows, Some(avg_a), Some(avg_b))
         }
-        RowPrep::PerRunUnique => {
-            // Derive each run's Rate metrics so compare_rows_by reads them
-            // (the schedstat rates whose components only appear in ext_metrics
-            // at sidecar_to_row time). The Averaged path derives via
-            // group_and_average_by; this per-run (no-average)
-            // path must derive per row or every schedstat Rate is silently
-            // dropped from the pairwise delta.
-            for r in rows_a.iter_mut() {
-                crate::stats::metric::derive_rate_metrics(&mut r.ext_metrics);
-            }
-            for r in rows_b.iter_mut() {
-                crate::stats::metric::derive_rate_metrics(&mut r.ext_metrics);
-            }
-            // Pairwise compare needs a 1:1 A:B match per key. Detect
-            // duplicates manually so the error names the key rather than
-            // letting compare_rows silently latch onto the first match.
-            check_no_duplicate_pairing_keys(&rows_a, &pairing_dims, "A")?;
-            check_no_duplicate_pairing_keys(&rows_b, &pairing_dims, "B")?;
-            (rows_a, rows_b, None, None)
-        }
         RowPrep::PerRunPooled => {
             // The noise-spread compare groups the N runs per pairing key
             // per side (see `noise_findings`), so N-per-key is the
-            // intended input. Keep every row and do NOT run the
-            // duplicate-key rejection — that guard is only for the
-            // pairwise `PerRunUnique` path.
+            // intended input. Keep every row including duplicate
+            // pairing keys — N-per-key is expected here, not an error.
             (rows_a, rows_b, None, None)
         }
     };
@@ -1913,13 +1488,8 @@ pub(crate) fn scalar_declared_gate_warning(rows_b: &[GauntletRow]) -> Option<Str
 ///   comparing e.g. (kernel A + scheduler A) against (kernel B +
 ///   scheduler B).
 ///
-/// `no_average = false` (the default) groups every matching
-/// sidecar within each side by pairing key and averages the
-/// metrics across the group. `no_average = true` keeps each
-/// sidecar row distinct; if multiple rows on one side share the
-/// same pairing key the function bails with an actionable
-/// "duplicate pairing keys" error rather than picking one
-/// arbitrarily.
+/// Groups every matching sidecar within each side by pairing key
+/// and averages the metrics across the group.
 ///
 /// Returns 0 on no regressions, 1 if regressions detected.
 pub fn compare_partitions(
@@ -1928,19 +1498,8 @@ pub fn compare_partitions(
     filter: Option<&str>,
     policy: &ComparisonPolicy,
     dir: Option<&std::path::Path>,
-    no_average: bool,
-    phase_opts: &PhaseDisplayOptions,
 ) -> anyhow::Result<i32> {
-    let prepared = prepare_partitioned_comparison(
-        filter_a,
-        filter_b,
-        dir,
-        if no_average {
-            RowPrep::PerRunUnique
-        } else {
-            RowPrep::Averaged
-        },
-    )?;
+    let prepared = prepare_partitioned_comparison(filter_a, filter_b, dir, RowPrep::Averaged)?;
     let PartitionedComparison {
         slicing_dims,
         pairing_dims,
@@ -1985,43 +1544,24 @@ pub fn compare_partitions(
         println!("{warning}");
     }
 
-    if !no_average {
-        println!(
-            "{}",
-            format_average_header(*pre_agg_a, *pre_agg_b, &label_a, &label_b)
-        );
-    }
+    println!(
+        "{}",
+        format_average_header(*pre_agg_a, *pre_agg_b, &label_a, &label_b)
+    );
 
-    // Scalar findings table — suppressed when the operator
-    // passed `--phases-only` (they want the per-phase block
-    // only). The scalar pre-aggregation already ran; this just
-    // hides its render.
-    if !phase_opts.phases_only {
-        print_scalar_findings_table(&report, &label_a, &label_b);
-    }
-
-    print_phase_block(&report, phase_opts, &label_a, &label_b);
+    // Scalar findings table.
+    print_scalar_findings_table(&report, &label_a, &label_b);
 
     // Scalar summary block — regressions / improvements /
     // unchanged + skipped-failed + per-group pass counts +
-    // new_in_b / removed_from_a. All four lines describe the
-    // scalar findings table; suppress them under `--phases-only`
-    // so the operator's "phase-block only" projection stays
-    // pure (the phase block has its own footer hint above).
-    if !phase_opts.phases_only {
-        print_summary_block(&report, avg_a, avg_b, &label_a, &label_b);
-    }
+    // new_in_b / removed_from_a.
+    print_summary_block(&report, avg_a, avg_b, &label_a, &label_b);
 
     // Host-context delta. Same first-Some(host) baseline
     // `compare_partitions` uses — picking representative hosts
     // off the partitioned sidecars rather than the full pool so
     // the delta reflects what actually fed the comparison.
-    // Suppressed under `--phases-only`, which renders ONLY the
-    // per-phase block (see `PhaseDisplayOptions::phases_only`),
-    // matching the scalar table and summary gates above.
-    if !phase_opts.phases_only {
-        print_host_context_delta(pool, rows, filter_a, filter_b, &label_a, &label_b);
-    }
+    print_host_context_delta(pool, rows, filter_a, filter_b, &label_a, &label_b);
 
     Ok(if report.regressions > 0 { 1 } else { 0 })
 }
@@ -2075,9 +1615,8 @@ pub(crate) struct NoiseFinding {
 /// scenario — the per-phase (`--noise-adjust` + per-phase) analog of
 /// [`NoiseFinding`], carrying the `step_index`/`label` the render prints.
 /// Emitted only for a `(step_index, metric)` present on BOTH sides across
-/// the runs. Per-phase SPREAD findings are render-only (parity with the
-/// scalar per-phase [`PhaseDeltaRow`] pass) EXCEPT one carrying an
-/// author-declared phase-scoped gate (`gated_by_assertion`), which DOES
+/// the runs. Per-phase SPREAD findings are render-only EXCEPT one carrying
+/// an author-declared phase-scoped gate (`gated_by_assertion`), which DOES
 /// contribute to the exit via [`NoiseReport::declared_phase_regressions`].
 pub(crate) struct NoisePhaseFinding {
     /// The pairing-key label (see [`NoiseFinding::pairing_label`]).
@@ -2096,8 +1635,7 @@ pub(crate) struct NoisePhaseFinding {
 
 /// A per-phase metric present on only ONE side of the noise comparison —
 /// either a metric absent in the other side's matched-`step_index` buckets,
-/// or a whole one-sided `step_index`. The noise analog of
-/// [`PhaseCoverageDiff`]/[`UnpairedPhaseRow`], collapsed into one row because
+/// or a whole one-sided `step_index`. Both collapse into one row because
 /// a one-sided metric has no band on the absent side either way. Never gated;
 /// surfaced so a coverage asymmetry is not silently dropped.
 pub(crate) struct NoisePhaseCoverage {
@@ -2108,7 +1646,7 @@ pub(crate) struct NoisePhaseCoverage {
     /// The one-sided metric, or `None` for a whole one-sided phase that
     /// carried no readable (non-suppressed) metric — surfaced (rendered with
     /// `—`) so the "phase fired but produced no data on one side" shape is not
-    /// silently dropped, matching the scalar empty-`UnpairedPhaseRow`.
+    /// silently dropped.
     pub metric: Option<&'static MetricDef>,
     /// The side that carries the metric/phase; the other has none.
     pub present_side: ComparePartition,
@@ -2150,7 +1688,7 @@ pub(crate) struct NoiseReport {
 impl NoiseReport {
     /// Confident AGGREGATE regressions — the gate's exit basis. Per-phase
     /// findings are render-only and deliberately excluded (see
-    /// [`Self::phase_regressions`]), matching the scalar per-phase pass.
+    /// [`Self::phase_regressions`]).
     pub fn regressions(&self) -> usize {
         self.findings
             .iter()
@@ -2165,8 +1703,7 @@ impl NoiseReport {
             .count()
     }
     /// Confident per-phase regressions — for the footer + tests ONLY, never
-    /// the exit basis (per-phase SPREAD is render-only, like the scalar phase
-    /// pass). A per-phase regression the author explicitly DECLARED via a
+    /// the exit basis (per-phase SPREAD is render-only). A per-phase regression the author explicitly DECLARED via a
     /// phase-scoped [`crate::test_support::PerfDeltaAssertion`] DOES gate — see
     /// [`Self::declared_phase_regressions`].
     pub fn phase_regressions(&self) -> usize {
@@ -2271,8 +1808,7 @@ pub(crate) fn noise_findings(
         let mut consulted: BTreeSet<&'static str> = BTreeSet::new();
         let mut consulted_phase: BTreeSet<(u16, &'static str)> = BTreeSet::new();
         // Label by the FULL pairing key (scenario + pairing dims like
-        // topology/work_type), joined as the scalar per-phase path does
-        // (pairing_key.0.join). noise_findings groups by the full pairing key,
+        // topology/work_type), joined via pairing_key.0.join. noise_findings groups by the full pairing key,
         // so a scenario run on multiple topologies/work_types forms distinct
         // groups; labeling by scenario alone would render them indistinguishably.
         let pairing_label = key.0.join("/");
@@ -2288,8 +1824,8 @@ pub(crate) fn noise_findings(
             // Rate metrics: the per-run ratios (a_vals/b_vals) give the
             // run-to-run band, but the compared centroid is the pooled
             // Σnum/Σden (duration-weighted) — the cross-run Rate value the
-            // registry documents (metric.rs), so --noise-adjust and --average
-            // agree on a Rate's central value while the band still measures
+            // registry documents (metric.rs), so --noise-adjust and the scalar
+            // averaging compare agree on a Rate's central value while the band still measures
             // per-run variability. Non-Rate metrics summarize their samples.
             let verdict = match m.kind {
                 MetricKind::Rate {
@@ -2508,9 +2044,9 @@ fn classify_noise(
     })
 }
 
-/// Push one one-sided per-phase metric to `coverage` — the noise analog of a
-/// scalar [`PhaseCoverageDiff`]/[`UnpairedPhaseRow`] entry. `value` is the
-/// present side's per-side mean across its runs (the absent side has none).
+/// Push one one-sided per-phase metric to `coverage` — a metric present in a
+/// matched-`step_index` bucket on one side only. `value` is the present
+/// side's per-side mean across its runs (the absent side has none).
 fn push_noise_phase_coverage(
     coverage: &mut Vec<NoisePhaseCoverage>,
     pairing_label: &str,
@@ -2536,8 +2072,7 @@ fn push_noise_phase_coverage(
 
 /// Surface every non-suppressed metric of a whole one-sided `step_index` (a
 /// phase present on only one side's runs) as [`NoisePhaseCoverage`] rows, so a
-/// scenario-shape asymmetry is not silently dropped (mirrors the scalar
-/// [`UnpairedPhaseRow`]).
+/// scenario-shape asymmetry is not silently dropped.
 fn push_noise_unpaired_step(
     coverage: &mut Vec<NoisePhaseCoverage>,
     pairing_label: &str,
@@ -2569,7 +2104,7 @@ fn push_noise_unpaired_step(
         // A one-sided phase with no readable (non-suppressed) metric — a
         // synthesized capture-free step can carry an empty metrics map. Surface
         // the empty shape (metric/value None -> rendered with `—`) so it is not
-        // silently dropped, matching the scalar empty UnpairedPhaseRow.
+        // silently dropped.
         coverage.push(NoisePhaseCoverage {
             pairing_label: pairing_label.to_string(),
             step_index,
@@ -2581,9 +2116,9 @@ fn push_noise_unpaired_step(
     }
 }
 
-/// Per-phase noise sub-pass for one matched `(a_rows, b_rows)` pair, mirroring
-/// [`push_phase_deltas`] but over the N per-run [`crate::assert::PhaseBucket`]s
-/// per side. For each matched `step_index` it walks the union of metric names
+/// Per-phase noise sub-pass for one matched `(a_rows, b_rows)` pair, over the
+/// N per-run [`crate::assert::PhaseBucket`]s per side. For each matched
+/// `step_index` it walks the union of metric names
 /// and emits a [`NoisePhaseFinding`] per `(step, metric)` present on BOTH sides
 /// (spread verdict via the same machinery as the aggregate pass, incl. the
 /// pooled-`Σnum/Σden` Rate centroid — here summed WITHIN the phase from
@@ -2604,8 +2139,7 @@ fn noise_phase_findings(
 ) {
     use std::collections::BTreeSet;
     // Single-phase scenarios carry empty phases on every run; skip the per-phase
-    // view if either side has no run with phases (the N-run analog of
-    // push_phase_deltas' both-non-empty guard).
+    // view if either side has no run with phases.
     let has_phases = |rows: &[GauntletRow]| rows.iter().any(|r| !r.phases.is_empty());
     if !has_phases(a_rows) || !has_phases(b_rows) {
         return;
@@ -2659,7 +2193,7 @@ fn noise_phase_findings(
                     match (a_vals.is_empty(), b_vals.is_empty()) {
                         (true, true) => continue,
                         // Present on only one matched side: no band on the other
-                        // — coverage, not a delta (mirror push_phase_deltas).
+                        // — coverage, not a delta.
                         (false, true) => {
                             push_noise_phase_coverage(
                                 coverage,
@@ -2826,7 +2360,7 @@ pub(crate) fn summarize_side_runs(rows: &[GauntletRow]) -> (usize, String) {
 /// (`--no-phases` / `--phases-only` / `--steps-only` / `--phase` /
 /// `--phase-threshold`); under `--phases-only` the aggregate table is
 /// suppressed. Per-phase SPREAD findings are RENDER-ONLY — classified and
-/// colored but not gating, matching the scalar per-phase pass — EXCEPT a
+/// colored but not gating — EXCEPT a
 /// per-phase regression the author explicitly declared a phase-scoped gate for,
 /// which DOES contribute to the exit alongside the aggregate confident
 /// regressions (the exit basis is `regressions + declared_phase_regressions`).
@@ -2847,8 +2381,8 @@ pub fn compare_partitions_noise(
 ) -> anyhow::Result<i32> {
     // Keep every per-run row INCLUDING duplicate pairing keys so the
     // run-to-run spread is observable: noise_findings groups the N runs
-    // per key per side. PerRunPooled skips the duplicate-key rejection
-    // that the pairwise `--no-average` path (PerRunUnique) enforces.
+    // per key per side. PerRunPooled keeps every per-run row including
+    // duplicate pairing keys — the N-per-key spread is the intended input.
     let prepared = prepare_partitioned_comparison(filter_a, filter_b, dir, RowPrep::PerRunPooled)?;
     let label_a = render_side_label(filter_a, &prepared.slicing_dims, "A");
     let label_b = render_side_label(filter_b, &prepared.slicing_dims, "B");
@@ -2866,8 +2400,8 @@ pub fn compare_partitions_noise(
     println!(
         "perf-delta --noise-adjust: {label_b} vs {label_a} (advisory noisy-spread threshold {spread_threshold_pct:.2}%)"
     );
-    // Aggregate spread table — suppressed under --phases-only, mirroring the
-    // scalar compare_partitions phase path (compare.rs `if !phases_only`).
+    // Aggregate spread table — suppressed under --phases-only (renders ONLY
+    // the per-phase block).
     if !phase_opts.phases_only {
         if report.findings.is_empty() {
             // Distinguish "nothing paired" from "paired but every metric omitted"
@@ -2949,8 +2483,8 @@ pub fn compare_partitions_noise(
     // is identical whether or not the phase footer is shown.
     let declared_phase_regressions = report.declared_phase_regressions();
     // The aggregate summary footer describes the (hidden) aggregate spread, so
-    // suppress it under --phases-only — which renders ONLY the per-phase block,
-    // matching the scalar compare's summary suppression + the phases_only doc.
+    // suppress it under --phases-only — which renders ONLY the per-phase
+    // block.
     // The exit still gates on `regressions` + `declared_phase_regressions`
     // (computed above) when the footer is hidden.
     if !phase_opts.phases_only {
@@ -2959,8 +2493,8 @@ pub fn compare_partitions_noise(
         // AND no phase filter is active (no --no-phases / --phase / --steps-only
         // / --phase-threshold) — so the counts always match the fully-rendered
         // per-phase table, and a single-phase run (no per-phase view) shows no
-        // confusing 0/0 per-phase clause. Mirrors the scalar hint's
-        // render_phase_block + !any-flag-set discipline.
+        // confusing 0/0 per-phase clause. Uses the same !any-flag-set
+        // discipline as the aggregate paired-scenario hint.
         let has_phase_data =
             !report.phase_findings.is_empty() || !report.phase_coverage.is_empty();
         let show_phase_footer = has_phase_data
@@ -3194,7 +2728,7 @@ pub(crate) fn format_noise_assertion_coverage_lines(
 /// carries the full pairing-key label (scenario plus every pairing dim),
 /// matching the scalar compare path — a scenario shared across topologies
 /// renders as distinct rows. Mirrors
-/// [`format_phase_block_lines`] + [`format_noise_findings_table`], honoring
+/// [`format_noise_findings_table`], honoring
 /// [`PhaseDisplayOptions`] (no_phases / phase / steps_only / phase_threshold).
 /// Render-only: these rows never gate. Pure — returns the lines (empty when
 /// suppressed / no per-phase data) so the row/verdict mapping is unit-testable
@@ -3292,10 +2826,10 @@ pub(crate) fn format_noise_phase_findings_lines(
         table.set_header(vec!["SIDE", "TEST", "PHASE", "METRIC", "VALUE"]);
         for c in coverage {
             // A whole one-sided phase with no readable metric renders `—` in the
-            // METRIC + VALUE columns (mirrors the scalar empty UnpairedPhaseRow).
+            // METRIC + VALUE columns.
             let metric_cell = c.metric.map(|m| m.name).unwrap_or("—");
-            // Bare {:.2} with NO display_unit — matching the scalar per-phase
-            // coverage/unpaired tables and the noise aggregate findings table,
+            // Bare {:.2} with NO display_unit — matching the noise aggregate
+            // findings table,
             // so a unit-carrying metric renders consistently across all of them.
             let value_cell = match c.value {
                 Some(v) => format!("{v:.2}"),
@@ -3350,247 +2884,6 @@ fn print_scalar_findings_table(report: &CompareReport, label_a: &str, label_b: &
         ]);
     }
     println!("{table}");
-}
-
-/// Render the per-phase delta block for `perf-delta`.
-/// Activated when the parallel pass populated any of phase_deltas,
-/// phase_coverage_diffs, or unpaired_phases for the current row-pair
-/// set AND `--no-phases` was not passed. Single-phase scenarios (no
-/// periodic captures) leave all three vecs empty and the phase block
-/// is suppressed entirely.
-///
-/// CLI filters compose by AND on independent axes:
-/// - `--phase <N>` keeps only the named step_index
-/// - `--steps-only` suppresses BASELINE (step_index == 0)
-/// - `--phase-threshold <PCT>` filters paired rows whose
-///   `|delta| / |a|` is below `PCT / 100.0` (a value from a
-///   ~zero baseline is an unbounded relative change → shown)
-///
-/// Filtering is render-time projection — the underlying
-/// CompareReport.phase_deltas / phase_coverage_diffs /
-/// unpaired_phases vecs hold the unfiltered data so programmatic
-/// consumers see every paired row regardless of CLI flags.
-fn print_phase_block(
-    report: &CompareReport,
-    phase_opts: &PhaseDisplayOptions,
-    label_a: &str,
-    label_b: &str,
-) {
-    for line in format_phase_block_lines(report, phase_opts, label_a, label_b) {
-        println!("{line}");
-    }
-}
-
-/// Build the per-phase block's rendered lines for [`print_phase_block`].
-/// Pure (returns the lines; empty when the block is suppressed —
-/// `--no-phases`, no phase data, or every row filtered out) so the
-/// render gate, the per-phase delta/unpaired tables, and the
-/// one-sided-metric coverage table are unit-testable without capturing
-/// stdout. Each rendered table is one multi-line element; an empty
-/// element is a blank separator line the caller prints verbatim.
-pub(crate) fn format_phase_block_lines(
-    report: &CompareReport,
-    phase_opts: &PhaseDisplayOptions,
-    label_a: &str,
-    label_b: &str,
-) -> Vec<String> {
-    use comfy_table::{Cell, Color};
-    let mut lines = Vec::new();
-    let render_phase_block = !phase_opts.no_phases
-        && (!report.phase_deltas.is_empty()
-            || !report.unpaired_phases.is_empty()
-            || !report.phase_coverage_diffs.is_empty());
-    if render_phase_block {
-        let filtered_deltas: Vec<&PhaseDeltaRow> = report
-            .phase_deltas
-            .iter()
-            .filter(|d| phase_opts.matches_phase(d.step_index))
-            .filter(|d| phase_opts.passes_delta_threshold(d))
-            .collect();
-        let filtered_unpaired: Vec<&UnpairedPhaseRow> = report
-            .unpaired_phases
-            .iter()
-            .filter(|u| phase_opts.matches_phase(u.step_index))
-            .collect();
-        let filtered_phase_coverage: Vec<&PhaseCoverageDiff> = report
-            .phase_coverage_diffs
-            .iter()
-            .filter(|c| phase_opts.matches_phase(c.step_index))
-            .collect();
-        // Capture filtered counts BEFORE the per-table renders move
-        // `filtered_deltas` / `filtered_unpaired` / `filtered_phase_coverage`
-        // into their sorted Vecs below — the footer hint reads all three
-        // after the table rendering consumes them.
-        let filtered_delta_total = filtered_deltas.len();
-        let filtered_delta_regressions = filtered_deltas
-            .iter()
-            .filter(|d| d.verdict == PhaseVerdict::Regression)
-            .count();
-        let filtered_coverage_total = filtered_phase_coverage.len();
-        let filtered_unpaired_total = filtered_unpaired.len();
-        if !filtered_deltas.is_empty()
-            || !filtered_unpaired.is_empty()
-            || !filtered_phase_coverage.is_empty()
-        {
-            lines.push(String::new());
-            lines.push("phase coverage:".to_string());
-            if !filtered_deltas.is_empty() {
-                let mut phase_table = crate::cli::new_table();
-                phase_table.set_header(vec![
-                    "PHASE", "TEST", "METRIC", label_a, label_b, "DELTA", "VERDICT",
-                ]);
-                // Sort by step_index ascending, then pairing key,
-                // then metric name. step_index-first ordering matches
-                // the operator-facing time order from BASELINE
-                // through Step[N] so the reader scans top-down by
-                // phase boundary; ties within a phase sort by row
-                // pair then metric so the table is stable across
-                // runs with identical input.
-                let mut sorted_deltas = filtered_deltas;
-                sorted_deltas.sort_by(|a, b| {
-                    a.step_index
-                        .cmp(&b.step_index)
-                        .then_with(|| a.pairing_key.0.cmp(&b.pairing_key.0))
-                        .then_with(|| a.metric.name.cmp(b.metric.name))
-                });
-                for d in sorted_deltas {
-                    let (verdict_text, verdict_color) = match d.verdict {
-                        PhaseVerdict::Regression => ("REGRESSION", Color::Red),
-                        PhaseVerdict::Improvement => ("improvement", Color::Green),
-                        PhaseVerdict::Stable => ("stable", Color::Grey),
-                        PhaseVerdict::Informational => ("informational", Color::Blue),
-                    };
-                    let test_label = d.pairing_key.0.join("/");
-                    let phase_cell = format!("{}: {}", d.step_index, d.label);
-                    phase_table.add_row(vec![
-                        Cell::new(phase_cell),
-                        Cell::new(test_label),
-                        Cell::new(d.metric.name),
-                        Cell::new(format!("{:.2}", d.a)),
-                        Cell::new(format!("{:.2}", d.b)),
-                        Cell::new(format!("{:+.2}{}", d.delta, d.metric.display_unit)),
-                        Cell::new(verdict_text).fg(verdict_color),
-                    ]);
-                }
-                lines.push(phase_table.to_string());
-            }
-            if !filtered_unpaired.is_empty() {
-                lines.push(String::new());
-                lines.push("phase coverage asymmetry (one-sided phases):".to_string());
-                let mut unpaired_table = crate::cli::new_table();
-                unpaired_table.set_header(vec!["SIDE", "TEST", "PHASE", "METRIC", "VALUE"]);
-                // Sort by step_index then side then pairing key then
-                // metric name. Time-order (step_index first) reads
-                // most naturally — the reader sees missing data in
-                // the order it would have appeared during the
-                // scenario, not grouped by which side is missing
-                // (side grouping would force a mental flip-flop
-                // across the paired rows above).
-                let mut sorted_unpaired = filtered_unpaired;
-                sorted_unpaired.sort_by(|a, b| {
-                    a.step_index
-                        .cmp(&b.step_index)
-                        .then_with(|| a.side.as_str().cmp(b.side.as_str()))
-                        .then_with(|| a.pairing_key.0.cmp(&b.pairing_key.0))
-                });
-                for u in sorted_unpaired {
-                    let test_label = u.pairing_key.0.join("/");
-                    let phase_cell = format!("{}: {}", u.step_index, u.label);
-                    if u.metrics.is_empty() {
-                        // Bucket present but no metrics — surface
-                        // the empty shape rather than hiding it. The
-                        // operator sees that the phase fired but
-                        // produced no readable metric data on the
-                        // single side it ran on, which is itself a
-                        // signal. Two paths reach here: (1) capture
-                        // landed but MetricDef::read_sample returned
-                        // None for every registered metric on these
-                        // samples; (2) the phase's only metrics were
-                        // suppressed Rate components, which
-                        // metrics_without_suppressed drops from the
-                        // unpaired row.
-                        unpaired_table.add_row(vec![
-                            Cell::new(u.side.as_str()),
-                            Cell::new(test_label),
-                            Cell::new(phase_cell),
-                            Cell::new("—"),
-                            Cell::new("—"),
-                        ]);
-                    } else {
-                        for (metric_name, &value) in &u.metrics {
-                            unpaired_table.add_row(vec![
-                                Cell::new(u.side.as_str()),
-                                Cell::new(&test_label),
-                                Cell::new(&phase_cell),
-                                Cell::new(metric_name),
-                                Cell::new(format!("{value:.2}")),
-                            ]);
-                        }
-                    }
-                }
-                lines.push(unpaired_table.to_string());
-            }
-            if !filtered_phase_coverage.is_empty() {
-                lines.push(String::new());
-                lines.push(
-                    "phase coverage asymmetry (one-sided metrics within a matched phase):"
-                        .to_string(),
-                );
-                let mut coverage_table = crate::cli::new_table();
-                coverage_table.set_header(vec!["SIDE", "TEST", "PHASE", "METRIC", "VALUE"]);
-                // Same time-order sort as the unpaired table: step_index,
-                // then side, then pairing key, then metric name — so the
-                // reader scans missing data in scenario time order.
-                let mut sorted_coverage = filtered_phase_coverage;
-                sorted_coverage.sort_by(|a, b| {
-                    a.step_index
-                        .cmp(&b.step_index)
-                        .then_with(|| a.present_side.as_str().cmp(b.present_side.as_str()))
-                        .then_with(|| a.pairing_key.0.cmp(&b.pairing_key.0))
-                        .then_with(|| a.metric.name.cmp(b.metric.name))
-                });
-                for c in sorted_coverage {
-                    let test_label = c.pairing_key.0.join("/");
-                    let phase_cell = format!("{}: {}", c.step_index, c.label);
-                    coverage_table.add_row(vec![
-                        Cell::new(c.present_side.as_str()),
-                        Cell::new(test_label),
-                        Cell::new(phase_cell),
-                        Cell::new(c.metric.name),
-                        Cell::new(format!("{:.2}", c.value)),
-                    ]);
-                }
-                lines.push(coverage_table.to_string());
-            }
-            // Operator hint surfaces only when the default-on
-            // path is producing rows AND no filter flag was set —
-            // a user who already passed `--phase`, `--steps-only`,
-            // `--phase-threshold`, or `--phases-only` doesn't need
-            // the discovery hint. `--no-phases` already
-            // short-circuited the entire block above so it can't
-            // reach here.
-            let any_flag_set = phase_opts.phases_only
-                || phase_opts.steps_only
-                || phase_opts.phase.is_some()
-                || phase_opts.phase_threshold.is_some();
-            if !any_flag_set {
-                let plural = if filtered_delta_regressions == 1 {
-                    ""
-                } else {
-                    "s"
-                };
-                lines.push(format!(
-                    "  phases: {filtered_delta_total} delta row(s) \
-                     ({filtered_delta_regressions} regression{plural}), \
-                     {filtered_coverage_total} one-sided-metric coverage diff(s), \
-                     {filtered_unpaired_total} one-sided phase(s) shown. \
-                     Filter with --phase N / --phases-only / --steps-only / \
-                     --phase-threshold P / --no-phases.",
-                ));
-            }
-        }
-    }
-    lines
 }
 
 /// Render the scalar summary block for `perf-delta` —
@@ -3711,36 +3004,6 @@ fn print_host_context_delta(
     print!("{}", format_host_delta(host_a, host_b, label_a, label_b));
 }
 
-/// Bail when `rows` contains two or more entries with the same
-/// pairing key — only relevant under `--no-average`, where each
-/// sidecar row stays distinct and `compare_rows_by` would
-/// silently latch onto whichever entry happened to be first in
-/// iteration order. Names the offending key in the diagnostic
-/// so the operator can choose to either drop `--no-average` or
-/// add another per-side filter to disambiguate.
-pub(crate) fn check_no_duplicate_pairing_keys(
-    rows: &[GauntletRow],
-    pairing_dims: &[Dimension],
-    side_label: &str,
-) -> anyhow::Result<()> {
-    let mut seen: BTreeMap<PairingKey, usize> = BTreeMap::new();
-    for row in rows {
-        let key = PairingKey::from_row(row, pairing_dims);
-        *seen.entry(key).or_insert(0) += 1;
-    }
-    if let Some((dup_key, count)) = seen.iter().find(|&(_, &c)| c > 1) {
-        anyhow::bail!(
-            "perf-delta: side {side_label} has {count} \
-             sidecars with the same pairing key {key:?}. Either drop \
-             --no-average to average them, or add another --{side}-X \
-             filter to disambiguate.",
-            key = dup_key.0,
-            side = side_label.to_lowercase(),
-        );
-    }
-    Ok(())
-}
-
 /// Render the host-context delta section of `perf-delta`
 /// as a block of text ready to `print!`. Extracted as a pure
 /// function of `(Option<&HostContext>, Option<&HostContext>, &str,
@@ -3754,7 +3017,7 @@ pub(crate) fn check_no_duplicate_pairing_keys(
 /// silently suppressing the section — a mixed-tooling-version run
 /// comparison should surface the asymmetry.
 /// Format the one-line averaging-mode header that prints above
-/// the comparison table when `--average` is active.
+/// the comparison table.
 ///
 /// Pure function of (`pre_agg_a`, `pre_agg_b`, `a`, `b`) so the
 /// exact-string contract — the operator-visible "averaged across
@@ -3766,7 +3029,7 @@ pub(crate) fn check_no_duplicate_pairing_keys(
 /// [`group_and_average_by`]), NOT the post-aggregation unique-key
 /// counts. The two answer different operator questions; the
 /// header surfaces the contributor count because that's the
-/// "how many trials got folded?" intuition the `--average` flag
+/// "how many trials got folded?" intuition the averaging fold
 /// is actually delivering.
 pub(crate) fn format_average_header(
     pre_agg_a: usize,
@@ -3778,7 +3041,7 @@ pub(crate) fn format_average_header(
 }
 
 /// Format the per-group `passes_observed/total_observed` block
-/// that prints below the summary line when `--average` is active.
+/// that prints below the summary line.
 ///
 /// Pure function of (`avg_a`, `avg_b`, `a`, `b`) so the rendered
 /// surface — one line per (scenario, topology, work_type) group
