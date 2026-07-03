@@ -62,6 +62,15 @@ fn kaslr_write_symbol_roundtrip_panic_on_oops(ctx: &Ctx) -> Result<AssertResult>
 }
 
 fn assert_panic_on_oops_roundtrip(result: &VmResult) -> Result<()> {
+    // A scheduler that never attached (SchedulerNotAttached, e.g. scx
+    // enable stalled under host oversubscription) yields success ==
+    // false with an empty bridge; the runner already renders that with
+    // the real scheduler-log cause. Return early so the assertions below
+    // don't fire a misleading "kern_kaslr_offset == 0" / "no reply for
+    // tag" on top of it (mirrors default_post_vm_periodic_fired).
+    if !result.success {
+        return Ok(());
+    }
     anyhow::ensure!(
         result.kern_kaslr_offset != 0,
         "kern_kaslr_offset == 0 — test must run under KASLR-on to \
@@ -129,6 +138,11 @@ fn kaslr_read_symbol_jiffies_64(ctx: &Ctx) -> Result<AssertResult> {
 }
 
 fn assert_jiffies_read(result: &VmResult) -> Result<()> {
+    // See assert_panic_on_oops_roundtrip: skip the KASLR/reply checks
+    // when the scheduler never attached, so the real failure surfaces.
+    if !result.success {
+        return Ok(());
+    }
     anyhow::ensure!(result.kern_kaslr_offset != 0, "KASLR-on required");
     let replies = result.snapshot_bridge.drain_kernel_ops();
     let reply = replies
@@ -181,6 +195,11 @@ fn kaslr_write_per_cpu_field_or_roundtrip(ctx: &Ctx) -> Result<AssertResult> {
 }
 
 fn assert_rq_flags_or_roundtrip(result: &VmResult) -> Result<()> {
+    // See assert_panic_on_oops_roundtrip: skip the KASLR/reply checks
+    // when the scheduler never attached, so the real failure surfaces.
+    if !result.success {
+        return Ok(());
+    }
     anyhow::ensure!(
         result.kern_kaslr_offset != 0,
         "kern_kaslr_offset == 0 — test requires KASLR-on"
@@ -262,6 +281,11 @@ fn kaslr_compute_rq_pas_ground_truth(ctx: &Ctx) -> Result<AssertResult> {
 }
 
 fn assert_rq_cpu_field(result: &VmResult) -> Result<()> {
+    // See assert_panic_on_oops_roundtrip: skip the KASLR/reply checks
+    // when the scheduler never attached, so the real failure surfaces.
+    if !result.success {
+        return Ok(());
+    }
     anyhow::ensure!(
         result.kern_kaslr_offset != 0,
         "KASLR-on required to validate compute_rq_pas under slide"
