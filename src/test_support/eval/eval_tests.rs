@@ -989,3 +989,48 @@ fn overcommit_skip_uses_stricter_cap_for_expect_auto_repro() {
         "expect_auto_repro overcommit must yield a SKIP result",
     );
 }
+
+#[test]
+fn overcommit_skip_keys_on_booted_not_declared_topology() {
+    // Under a gauntlet/CLI TopoOverride the VM boots the OVERRIDE
+    // topology, not entry.topology, so the skip decision must model the
+    // BOOTED oversubscription. Every other overcommit_skip test passes
+    // topo=None (declared == booted) and so never exercises the
+    // divergence; a regression that keys on the declared count would flip
+    // the verdict in BOTH directions below.
+    let host: Vec<usize> = (0..8).collect(); // 8 host CPUs
+
+    // Small declared (DEFAULT = 2 vCPUs) dispatched onto a large preset
+    // (14×9×2 = 252 booted vCPUs): declared 2/8 = 1.0x would RUN, but the
+    // booted 252/8 = 31.5x >> 6.0x cap MUST auto-skip.
+    let mut small = eevdf_entry("overcommit_skip_booted_small_declared");
+    small.cpu_budget = None;
+    let big_preset = crate::test_support::topo::TopoOverride {
+        numa_nodes: 1,
+        llcs: 14,
+        cores: 9,
+        threads: 2,
+        memory_mib: 512,
+    };
+    let skip = super::overcommit_skip(&small, &host, Some(&big_preset))
+        .expect("small declared on a large preset must skip on the BOOTED 31.5x oversubscription");
+    assert!(skip.is_skip(), "booted-oversubscription overcommit must yield a SKIP");
+
+    // Inverse: large declared (256 vCPUs) dispatched onto a tiny preset
+    // (1×2×1 = 2 booted vCPUs): declared 256/8 = 32x would SKIP, but the
+    // booted 2/8 = 1.0x fits and MUST run.
+    let mut big = eevdf_entry("overcommit_skip_booted_big_declared");
+    big.topology = wide_smp_topology(); // 256 declared
+    big.cpu_budget = None;
+    let tiny_preset = crate::test_support::topo::TopoOverride {
+        numa_nodes: 1,
+        llcs: 1,
+        cores: 2,
+        threads: 1,
+        memory_mib: 512,
+    };
+    assert!(
+        super::overcommit_skip(&big, &host, Some(&tiny_preset)).is_none(),
+        "large declared on a tiny preset must RUN (the booted topology fits the host)",
+    );
+}

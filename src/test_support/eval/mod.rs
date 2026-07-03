@@ -444,7 +444,8 @@ fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vm
 /// [`run_ktstr_test_inner_impl`] so the predicate-to-skip WIRING is
 /// unit-testable without booting a VM (the sibling `performance_mode` /
 /// `perf_only` skips are env-driven; this one is topology-driven). When
-/// the host cannot run the entry's topology without racing the
+/// the host cannot run the BOOTED topology (`resolve_vm_topology`, which
+/// honors a gauntlet/CLI preset override) without racing the
 /// oversub-scaled boot watchdog
 /// ([`super::runtime::overcommit_skip_reason`]), emits the operator SKIP
 /// banner, records the skip sidecar, and returns the skip
@@ -462,8 +463,19 @@ fn overcommit_skip(
     host_cpus: &[usize],
     topo: Option<&TopoOverride>,
 ) -> Option<AssertResult> {
+    // Key the skip decision on the BOOTED vCPU count — the topology the
+    // VM actually launches — not the declared entry.topology. Under a
+    // TopoOverride (gauntlet preset / --ktstr-topo) they diverge, and the
+    // skip must model the oversubscription of the topology that boots
+    // (otherwise a small declared test on a large preset never skips and
+    // races the boot watchdog it exists to prevent). record_skip_sidecar
+    // below already resolves this same booted topology; mirrors the
+    // booted-count ratio in contention_not_attached_skip_reason.
+    let booted_vcpus = super::runtime::resolve_vm_topology(entry, topo)
+        .0
+        .total_cpus();
     let reason = super::runtime::overcommit_skip_reason(
-        entry.topology.total_cpus(),
+        booted_vcpus,
         host_cpus.len(),
         entry.cpu_budget,
         entry.expect_auto_repro,
@@ -2310,7 +2322,7 @@ fn render_no_result_message(
         // diagnostic in `freeze_coord/mod.rs` so the operator sees
         // the same direction whether they read VM stderr or this
         // test-output message.
-        let vm_timeout = vm_timeout_from_entry(entry);
+        let vm_timeout = vm_timeout_from_entry(entry, topo.total_cpus());
         let watchdog_section = format!(
             "\n\n--- watchdog ---\n\
              elapsed={:?} (VM run wall-clock)\n\

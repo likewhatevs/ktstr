@@ -826,7 +826,18 @@ pub(crate) fn overcommit_skip_reason(
 /// [`crate::vmm::freeze_coord::WPROF_SHIP_GRACE`] when it declares
 /// `wprof` (a crashing scheduler's late Phase-5 trace ship is held for
 /// that window before teardown).
-pub(crate) fn vm_timeout_from_entry(entry: &super::entry::KtstrTestEntry) -> Duration {
+///
+/// `booted_vcpus` is the vCPU count of the topology the VM actually
+/// boots (`resolve_vm_topology(entry, topo).0.total_cpus()`), NOT the
+/// declared `entry.topology`: under a `TopoOverride` (gauntlet preset /
+/// `--ktstr-topo`) they diverge, and both the vCPU-scaled boot headroom
+/// and the oversubscription multiplier must scale to the topology that
+/// boots — otherwise the watchdog fires mid-boot on a larger-than-declared
+/// preset.
+pub(crate) fn vm_timeout_from_entry(
+    entry: &super::entry::KtstrTestEntry,
+    booted_vcpus: u32,
+) -> Duration {
     let mut base = entry
         .watchdog_timeout
         .max(entry.duration)
@@ -842,7 +853,7 @@ pub(crate) fn vm_timeout_from_entry(entry: &super::entry::KtstrTestEntry) -> Dur
     if entry.wprof {
         base += crate::vmm::freeze_coord::WPROF_SHIP_GRACE;
     }
-    let vcpus = entry.topology.total_cpus();
+    let vcpus = booted_vcpus;
     let oversub = overcommit_ratio(
         vcpus,
         crate::vmm::host_topology::host_allowed_cpus().len(),
@@ -896,7 +907,7 @@ pub(crate) fn build_vm_builder_base(
         .memory_deferred_min(memory_mib)
         .cmdline(cmdline_extra)
         .run_args(guest_args)
-        .timeout(vm_timeout_from_entry(entry))
+        .timeout(vm_timeout_from_entry(entry, vm_topology.total_cpus()))
         .workload_duration(entry.duration)
         .no_perf_mode(no_perf_mode);
 
@@ -1089,8 +1100,8 @@ mod tests {
         // when the entry declares a host-side bpf_map_write; the delta
         // between an otherwise-identical pair is exactly that budget.
         assert_eq!(
-            vm_timeout_from_entry(&with_write),
-            vm_timeout_from_entry(&no_write) + COLD_BTF_PHASE1_BUDGET,
+            vm_timeout_from_entry(&with_write, with_write.topology.total_cpus()),
+            vm_timeout_from_entry(&no_write, no_write.topology.total_cpus()) + COLD_BTF_PHASE1_BUDGET,
             "bpf_map_write entries get the cold-BTF phase-1 budget added",
         );
     }
@@ -2362,7 +2373,7 @@ mod tests {
             duration: Duration::from_secs(30),
             ..KtstrTestEntry::DEFAULT
         };
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_millis(80_300));
+        assert_eq!(vm_timeout_from_entry(&entry, entry.topology.total_cpus()), Duration::from_millis(80_300));
     }
 
     #[test]
@@ -2376,7 +2387,7 @@ mod tests {
         };
         // base = max(5s, 120s, 1s) = 120s; vm_boot_headroom(2) = 20.3 s.
         assert_eq!(
-            vm_timeout_from_entry(&entry),
+            vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
             Duration::from_millis(140_300)
         );
     }
@@ -2391,7 +2402,7 @@ mod tests {
             duration: Duration::from_millis(50),
             ..KtstrTestEntry::DEFAULT
         };
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_millis(21_300));
+        assert_eq!(vm_timeout_from_entry(&entry, entry.topology.total_cpus()), Duration::from_millis(21_300));
     }
 
     #[test]
@@ -2403,7 +2414,7 @@ mod tests {
             name: "default",
             ..KtstrTestEntry::DEFAULT
         };
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_millis(32_300));
+        assert_eq!(vm_timeout_from_entry(&entry, entry.topology.total_cpus()), Duration::from_millis(32_300));
     }
 
     #[test]
@@ -2429,7 +2440,39 @@ mod tests {
             },
             ..KtstrTestEntry::DEFAULT
         };
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_millis(50_900));
+        assert_eq!(vm_timeout_from_entry(&entry, entry.topology.total_cpus()), Duration::from_millis(50_900));
+    }
+
+    #[test]
+    fn vm_timeout_from_entry_scales_on_booted_not_declared_vcpus() {
+        // Under a TopoOverride the VM boots a different vCPU count than
+        // entry.topology declares; the boot-headroom deadline must scale
+        // to the BOOTED count passed in, not entry.topology. A default
+        // 2-vCPU entry "booted" at 126 vCPUs must get the 126-vCPU
+        // headroom (50.9 s, matching the declared-126 case above), not
+        // the declared 2-vCPU headroom (32.3 s). Pin a wide cpuset so
+        // neither count is oversubscribed (multiplier = 1.0). The
+        // declared-vs-booted gap is otherwise untested — every other
+        // vm_timeout test passes entry.topology.total_cpus() (declared ==
+        // booted).
+        let _pin = AllowedCpusPin::new((0..256).collect());
+        let entry = KtstrTestEntry {
+            name: "booted_override",
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert_eq!(
+            vm_timeout_from_entry(&entry, 126),
+            Duration::from_millis(50_900),
+        );
+        assert_eq!(
+            vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
+            Duration::from_millis(32_300),
+        );
+        assert_ne!(
+            vm_timeout_from_entry(&entry, 126),
+            vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
+            "the deadline must key on the booted count, not the declared entry.topology",
+        );
     }
 
     // -- overcommit_ratio / oversub-scaled vm_timeout --
@@ -2561,7 +2604,7 @@ mod tests {
         };
         // 12_000 + 58_400 × 4 = 245_600 ms.
         assert_eq!(
-            vm_timeout_from_entry(&entry),
+            vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
             Duration::from_millis(245_600)
         );
     }
@@ -2587,7 +2630,7 @@ mod tests {
         };
         // 12_000 + 58_400 × 6 = 362_400 ms.
         assert_eq!(
-            vm_timeout_from_entry(&entry),
+            vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
             Duration::from_millis(362_400)
         );
     }
