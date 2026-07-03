@@ -68,8 +68,13 @@ fn assert_perphase_metrics_survive_detach(result: &VmResult) -> Result<()> {
 // VM hard deadline -- max(watchdog_timeout, duration) plus boot headroom
 // (vm_timeout_from_entry, test_support/runtime.rs) -- so the 35s base covers
 // boot + the full worst-case scenario with slack.
+// performance_mode is REQUIRED: `cargo ktstr perf-delta` runs both sides with
+// KTSTR_PERF_ONLY, which skips every non-performance_mode test. Without it this
+// demo — the exact path perf-delta renders per phase — is skipped on both sides
+// and the compare finds nothing to pair.
 #[ktstr_test(
     scheduler = PERF_SCX,
+    performance_mode = true,
     llcs = 1,
     cores = 2,
     threads = 1,
