@@ -3366,24 +3366,7 @@ fn resolve_ref_commit_sha_resolves_offline_lowercased() {
     assert!(resolve_ref_commit("https://github.com/x/y", "foo", GitRefKind::Unknown).is_none());
 }
 
-#[test]
-fn ls_remote_commit_hash_uses_full_sha_directly_without_network() {
-    // A full 40-hex ref short-circuits the handshake (the bogus URL is
-    // never contacted) and is returned in full, lowercased to match
-    // git_clone's head rendering (the cache key needs the full id).
-    let sha = "1234567890abcdef1234567890abcdef12345678";
-    assert_eq!(
-        ls_remote_commit_hash("https://invalid.invalid/nope.git", sha),
-        Some(sha.to_string()),
-    );
-    let upper = "ABCDEF1234567890ABCDEF1234567890ABCDEF12";
-    assert_eq!(
-        ls_remote_commit_hash("https://invalid.invalid/nope.git", upper),
-        Some(upper.to_ascii_lowercase()),
-    );
-}
-
-/// Regression: `ls_remote_commit_hash` must resolve a BRANCH ref. The
+/// Regression: a BRANCH ref must resolve over protocol-v2 ls-refs. The
 /// bug was gix's default `Options` (`prefix_from_spec_as_filter_on_remote
 /// = true`): over a protocol-v2 `ls-refs` it derives ref-prefix filters
 /// from the anonymous remote's refspecs, and with empty fetch specs +
@@ -3392,9 +3375,9 @@ fn ls_remote_commit_hash_uses_full_sha_directly_without_network() {
 /// `None`, defeating `resolve_git_kernel`'s clone-skip (every run
 /// re-cloned). The fix sets the flag `false`. A `Some(_)` here is only
 /// reachable once `refs/heads/for-next` reaches `remote_refs`, so
-/// reverting the flag turns this red — the sole test that pins the
-/// `ref_map` Options path (the `match_ref_commit_hash_*` unit tests feed
-/// synthetic ref vectors and never exercise it).
+/// reverting the flag turns this red — the `pick_ref_object_*` unit tests
+/// feed synthetic ref vectors and never exercise the `ref_map` Options
+/// path.
 ///
 /// `#[ignore]`: hits the live sched_ext remote over the network (project
 /// convention for network-fetch tests). The filtering is protocol-v2
@@ -3403,9 +3386,10 @@ fn ls_remote_commit_hash_uses_full_sha_directly_without_network() {
 /// networked host.
 #[test]
 #[ignore = "network: live ls-remote against git.kernel.org sched_ext (protocol v2)"]
-fn ls_remote_commit_hash_resolves_branch_over_v2() {
+fn resolve_ref_commit_resolves_branch_over_v2() {
+    use crate::kernel_path::GitRefKind;
     let url = "https://git.kernel.org/pub/scm/linux/kernel/git/tj/sched_ext.git";
-    let hash = ls_remote_commit_hash(url, "for-next")
+    let hash = resolve_ref_commit(url, "for-next", GitRefKind::Branch)
         .expect("for-next branch must resolve over v2 ls-refs — the prefix filter must be off");
     assert_eq!(hash.len(), 40, "a full commit hash is 40 hex chars: {hash}");
     assert!(
@@ -3421,54 +3405,12 @@ fn direct_ref(name: &str, hex: &str) -> gix::protocol::handshake::Ref {
     }
 }
 
-#[test]
-fn match_ref_commit_hash_resolves_branch_tag_head_and_precedence() {
-    let a = "1111111111111111111111111111111111111111";
-    let b = "2222222222222222222222222222222222222222";
-    let c = "3333333333333333333333333333333333333333";
-
-    // Branch under refs/heads — returns the FULL commit hash.
-    let refs = vec![direct_ref("refs/heads/for-next", a)];
-    assert_eq!(match_ref_commit_hash(&refs, "for-next"), Some(a.into()));
-
-    // Lightweight tag (Direct under refs/tags).
-    let refs = vec![direct_ref("refs/tags/v6.10", b)];
-    assert_eq!(match_ref_commit_hash(&refs, "v6.10"), Some(b.into()));
-
-    // heads wins over tags for the same bare name (the probe's documented
-    // precedence; the rare divergence from the shallow clone is handled by
-    // the post-clone re-check — see match_ref_commit_hash).
-    let refs = vec![direct_ref("refs/tags/x", b), direct_ref("refs/heads/x", a)];
-    assert_eq!(match_ref_commit_hash(&refs, "x"), Some(a.into()));
-
-    // An explicit refs/ path matches exactly.
-    let refs = vec![direct_ref("refs/heads/main", c)];
-    assert_eq!(
-        match_ref_commit_hash(&refs, "refs/heads/main"),
-        Some(c.into())
-    );
-
-    // HEAD via a Symbolic ref resolves to its ultimate object.
-    let refs = vec![gix::protocol::handshake::Ref::Symbolic {
-        full_ref_name: "HEAD".into(),
-        target: "refs/heads/main".into(),
-        tag: None,
-        object: gix::hash::ObjectId::from_hex(c.as_bytes()).unwrap(),
-    }];
-    assert_eq!(match_ref_commit_hash(&refs, "HEAD"), Some(c.into()));
-
-    // No matching ref -> None.
-    let refs = vec![direct_ref("refs/heads/main", a)];
-    assert_eq!(match_ref_commit_hash(&refs, "does-not-exist"), None);
-}
-
 /// The kind-directed grammar's load-bearing invariant: `pick_ref_object`
 /// matches the FULLY-QUALIFIED ref name exactly, so a tag and a
 /// same-named branch NEVER alias. `resolve_ref_commit` builds
 /// `refs/tags/{ref}` for `Tag` and `refs/heads/{ref}` for `Branch`, so
-/// each kind resolves to its own namespace's commit — unlike the DWIM
-/// `match_ref_commit_hash`, which prefers heads over tags for a bare
-/// name (see the precedence test above). Pure over `&[Ref]` — no
+/// each kind resolves to its own namespace's commit — a bare-name DWIM
+/// lookup would instead resolve either. Pure over `&[Ref]` — no
 /// network — so the anti-aliasing invariant is pinned without a live
 /// ls-remote.
 #[test]
@@ -3497,9 +3439,9 @@ fn pick_ref_object_matches_kind_namespace_without_aliasing() {
 }
 
 #[test]
-fn match_ref_commit_hash_annotated_tag_uses_peeled_commit_not_tag() {
+fn pick_ref_object_annotated_tag_uses_peeled_commit_not_tag() {
     // An annotated tag advertises Peeled { tag: <tag object>, object:
-    // <peeled commit> }. The key must use the peeled COMMIT (object):
+    // <peeled commit> }. The resolver must use the peeled COMMIT (object):
     // git_clone checks out the commit (HEAD = commit), so the tag
     // object's hash would never match a clone-produced cache key.
     let tag_obj = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -3509,16 +3451,19 @@ fn match_ref_commit_hash_annotated_tag_uses_peeled_commit_not_tag() {
         tag: gix::hash::ObjectId::from_hex(tag_obj.as_bytes()).unwrap(),
         object: gix::hash::ObjectId::from_hex(commit.as_bytes()).unwrap(),
     }];
-    assert_eq!(match_ref_commit_hash(&refs, "v1.0"), Some(commit.into()));
+    assert_eq!(
+        pick_ref_object(&refs, "refs/tags/v1.0").map(|o| o.to_string()),
+        Some(commit.to_string()),
+    );
 }
 
 #[test]
-fn match_ref_commit_hash_skips_unborn() {
+fn pick_ref_object_skips_unborn() {
     let refs = vec![gix::protocol::handshake::Ref::Unborn {
         full_ref_name: "refs/heads/new".into(),
         target: "refs/heads/new".into(),
     }];
-    assert_eq!(match_ref_commit_hash(&refs, "new"), None);
+    assert!(pick_ref_object(&refs, "refs/heads/new").is_none());
 }
 
 #[test]
@@ -3560,8 +3505,9 @@ fn git_clone_rejects_raw_sha_git_ref_without_panic() {
     );
 }
 
-/// `git_clone_tag` shallow-clones a linux-stable annotated TAG — the
-/// EOL-kernel recovery path. A plain `with_ref_name` shallow clone
+/// `git_clone_tag` shallow-clones an annotated TAG — the `#tag=`
+/// git-source clone path (via `git_clone_kinded`) for a non-GitHub
+/// remote. A plain `with_ref_name` shallow clone
 /// forces `refs/heads/{ref}` and fails on a tag with "None of the
 /// refspec(s) matched"; the appended `+refs/tags/{tag}:refs/heads/{tag}`
 /// refspec fixes it. This can ONLY be validated by a real clone — the
@@ -3609,21 +3555,20 @@ fn git_clone_tag_shallow_clones_stable_tag() {
 }
 
 /// `latest_patch_from_git_tags` resolves an EOL series to its highest
-/// patch via a real git.kernel.org ls-remote of the linux-stable tree
-/// — the cdn-independent resolution the CI runners need (cdn serves
+/// patch via a real ls-remote of the gregkh GitHub mirror — the
+/// cdn-independent resolution the CI runners need (cdn serves
 /// `sha256sums.asc` as 404 on some edges even where its tarballs 200).
 /// Network (ls-remote only, no pack fetch), so #[ignore]; this is the
 /// empirical guard for the resolution the pure `max_tag_patch` tests
-/// cannot provide (they don't touch the network).
+/// cannot provide (they don't touch the network). `Some` because 6.14
+/// has stable point releases; the `None` (mainline-base) branch is a
+/// pure-code path the caller `fetch_version_for_prefix` handles.
 #[test]
-#[ignore = "network: ls-remote git.kernel.org linux-stable for v6.14.* tags; run with --run-ignored on a connected host"]
+#[ignore = "network: ls-remote the gregkh GitHub mirror for v6.14.* tags; run with --run-ignored on a connected host"]
 fn latest_patch_from_git_tags_resolves_eol_series() {
-    let v = super::latest_patch_from_git_tags(
-        "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git",
-        "6.14",
-        "test",
-    )
-    .expect("must resolve the latest 6.14.x from stable-tree tags");
+    let v = super::latest_patch_from_git_tags("https://github.com/gregkh/linux", "6.14", "test")
+        .expect("ls-remote of the gregkh mirror must succeed")
+        .expect("6.14 must resolve to a stable patch release");
     // 6.14 is EOL and frozen at 6.14.11 (no further releases), so the
     // resolver must return exactly that — not a lower patch, not an -rc.
     assert_eq!(
