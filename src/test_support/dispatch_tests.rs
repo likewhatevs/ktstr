@@ -581,10 +581,10 @@ fn parse_kernel_list_trims_whitespace() {
 /// version parsing).
 #[test]
 fn parse_kernel_list_preserves_label() {
-    let entries = parse_kernel_list("6.14.2=/a;git_tj_sched_ext_main=/b;6.15-rc3=/c");
+    let entries = parse_kernel_list("6.14.2=/a;git_tj_sched_ext_branch_main=/b;6.15-rc3=/c");
     assert_eq!(entries.len(), 3);
     assert_eq!(entries[0].label, "6.14.2");
-    assert_eq!(entries[1].label, "git_tj_sched_ext_main");
+    assert_eq!(entries[1].label, "git_tj_sched_ext_branch_main");
     assert_eq!(entries[2].label, "6.15-rc3");
 }
 
@@ -677,8 +677,8 @@ fn filter_handles_unparseable_entry_label_in_range() {
     // Entry whose label isn't version-shaped (e.g. a Git
     // label) can't be in a version range — reject.
     let git_entry = mk_entry(
-        "git_tj_sched_ext_main",
-        "kernel_git_tj_sched_ext_main",
+        "git_tj_sched_ext_branch_main",
+        "kernel_git_tj_sched_ext_branch_main",
         "/a",
     );
     assert!(!entry_matches_spec(&git_entry, "6.14..6.16"));
@@ -717,7 +717,7 @@ fn filter_accepts_when_any_declared_spec_matches() {
     // Multiple declared specs; entry matches one of them.
     let e = mk_entry("6.15.3", "kernel_6_15_3", "/a");
     assert!(sched_kernel_filter_accepts(
-        &["6.14.2", "6.14..6.16", "git+https://example.com/r#main"],
+        &["6.14.2", "6.14..6.16", "git+https://example.com/r#branch=main"],
         &e,
     ));
 }
@@ -848,14 +848,14 @@ fn sanitize_kernel_label_handles_full_cache_key_shape() {
     );
 }
 
-/// Git-source semantic label `git_tj_sched_ext_for-next` from
+/// Git-source semantic label `git_tj_sched_ext_branch_for-next` from
 /// the producer-side encoder maps to the dash-stripped form
 /// the sanitizer produces.
 #[test]
 fn sanitize_kernel_label_git_semantic_label() {
     assert_eq!(
-        sanitize_kernel_label("git_tj_sched_ext_for-next"),
-        "kernel_git_tj_sched_ext_for_next",
+        sanitize_kernel_label("git_tj_sched_ext_branch_for-next"),
+        "kernel_git_tj_sched_ext_branch_for_next",
     );
 }
 
@@ -919,7 +919,7 @@ fn sanitized_kernel_label_new_runs_sanitizer() {
         "6.14.2",
         "6.15-rc3",
         "ABC-DEF",
-        "git_tj_sched_ext_for-next",
+        "git_tj_sched_ext_branch_for-next",
         "",
     ] {
         let label = SanitizedKernelLabel::new(raw);

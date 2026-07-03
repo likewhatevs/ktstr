@@ -1545,7 +1545,8 @@ pub const KTSTR_WPROF_PATH_ENV: &str = "KTSTR_WPROF_PATH";
 // literals, and `KERNEL_ID_GRAMMAR` is a `const &str` not a literal.)
 pub const KTSTR_KERNEL_HINT: &str = "set KTSTR_KERNEL to one of: \
     exact version (`6.14`), inclusive range (`6.14..7.0` or \
-    `6.14..=7.0`), git source (`git+URL#REF`), absolute or \
+    `6.14..=7.0`), git source (`git+URL#tag=NAME`, \
+    `git+URL#branch=NAME`, or `git+URL#sha=<40-hex>`), absolute or \
     `~`-prefixed path, or cache key. List cached keys with \
     `cargo ktstr kernel list`; build new ones with \
     `cargo ktstr kernel build`";
@@ -1661,7 +1662,8 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
                 // Explicit cache key not found — skip general cache scan.
                 skip_cache_scan = true;
             }
-            // Multi-kernel specs (`A..B` ranges, `git+URL#REF` sources)
+            // Multi-kernel specs (`A..B` ranges; git sources like
+            // `git+URL#branch=main` are single-kernel but share this arm)
             // are only meaningful at the test/coverage/verifier
             // subcommand entry points where the runner can fan out
             // across kernels. The KTSTR_KERNEL env reader resolves a

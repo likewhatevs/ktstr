@@ -262,11 +262,13 @@ pub(crate) fn resolve_one(
         KernelId::Git {
             ref url,
             ref git_ref,
+            ref_kind,
         } => {
-            let cache_dir = ktstr::cli::resolve_git_kernel(url, git_ref, "cargo ktstr", mp)
-                .map_err(|e| format!("resolve git+{url}#{git_ref}: {e:#}"))?;
+            let cache_dir =
+                ktstr::cli::resolve_git_kernel(url, git_ref, ref_kind, "cargo ktstr", mp)
+                    .map_err(|e| format!("resolve git+{url}#{git_ref}: {e:#}"))?;
             let dir = canonicalize_cache_dir(cache_dir);
-            let label = git_kernel_label(url, git_ref);
+            let label = git_kernel_label(url, git_ref, ref_kind);
             Ok((label, dir))
         }
         KernelId::Range { start, end, .. } => {
@@ -315,8 +317,8 @@ pub(crate) fn resolve_one(
 ///   (e.g. `6.14.2`, `6.15-rc3`).
 /// - CacheKey → the version prefix (everything before the first
 ///   `-tarball-` / `-git-` / `-local-` component).
-/// - Git → `git_{owner}_{repo}_{ref}` extracted from the URL +
-///   git ref.
+/// - Git → `git_{owner}_{repo}_{kind}_{ref}` extracted from the URL,
+///   the ref kind (tag/branch/sha), and the git ref.
 ///
 /// The downstream [`ktstr::test_support::sanitize_kernel_label`]
 /// applies the `kernel_` prefix and `[a-z0-9_]+` normalisation; this
@@ -360,12 +362,14 @@ pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBu
 ///   - Range → fetch releases.json once, then per-version
 ///     cache lookup → maybe download + build for each
 ///     expanded version.
-///   - Git → shallow clone → cache lookup → maybe build.
+///   - Git → resolve the commit (kind-directed ls-remote) → cache
+///     lookup → GitHub codeload snapshot or non-GitHub shallow
+///     clone → maybe build.
 ///
 /// Two phases of work happen behind the per-spec resolvers:
-/// (1) network I/O — kernel.org tarball download or
-///     `git_clone` shallow fetch — which is independent
-///     across specs and overlaps freely.
+/// (1) network I/O — kernel.org tarball download, a GitHub codeload
+///     snapshot, or a `git_clone` shallow fetch — which is
+///     independent across specs and overlaps freely.
 /// (2) build — `make -j$(nproc)` invoked under an LLC flock
 ///     plus a cgroup v2 sandbox (`acquire_build_reservation`
 ///     in `kernel_build_pipeline`). The LLC flock is taken
@@ -775,6 +779,11 @@ fn kernel_build_one(
         fetch::local_source(src_path).map_err(|e| format!("{e:#}"))?
     } else if let Some(ref url) = git {
         let ref_name = git_ref.as_deref().expect("clap requires --ref with --git");
+        // The `--git`/`--ref` flag surface fetches a BRANCH only (gix
+        // single-branch shallow clone). Tag/sha resolution uses the
+        // explicit `--kernel git+URL#tag=/#sha=` grammar
+        // (`ktstr::cli::resolve_git_kernel`); unifying the two git
+        // surfaces onto `--kernel` is separate follow-up work.
         fetch::git_clone(
             url,
             ref_name,

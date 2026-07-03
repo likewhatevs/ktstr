@@ -299,7 +299,8 @@ impl SanitizedKernelLabel {
 ///   (`6.14.2`, `6.15-rc3`).
 /// - CacheKey: the version prefix (everything before the
 ///   `-tarball-` / `-git-` source tag).
-/// - Git: `git_{owner}_{repo}_{ref}` extracted from the URL.
+/// - Git: `git_{owner}_{repo}_{kind}_{ref}` extracted from the URL
+///   (kind = tag/branch/sha).
 /// - Path: `path_{basename}_{hash6}` — basename + 6-char crc32 of
 ///   the canonical path, disambiguating two `linux` directories
 ///   under different parents.
@@ -1695,7 +1696,7 @@ fn list_tests_all(ignored_only: bool) {
 /// - [`crate::kernel_path::KernelId::Path`] / [`crate::kernel_path::KernelId::CacheKey`] / [`crate::kernel_path::KernelId::Git`]:
 ///   sanitized-label equality — the producer-side encoder
 ///   (`src/bin/cargo_ktstr/kernel/wire_format.rs`) emits a deterministic
-///   label per variant (`path_…`, `git_owner_repo_ref`, version
+///   label per variant (`path_…`, `git_owner_repo_kind_ref`, version
 ///   prefix from cache key), so identical specs on both sides
 ///   produce identical sanitized labels.
 ///

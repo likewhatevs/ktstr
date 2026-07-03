@@ -71,7 +71,10 @@ pub enum KernelCommand {
         /// at the ref supplied via --ref.
         #[arg(long, requires = "git_ref", conflicts_with_all = ["version", "source"])]
         git: Option<String>,
-        /// Git ref to checkout (branch, tag, commit). Required with --git.
+        /// Git branch to check out. Required with --git. For a tag or
+        /// commit, use `--kernel` with the explicit git grammar
+        /// (`git+URL#tag=NAME` / `git+URL#sha=<40-hex>`) — the
+        /// `--git`/`--ref` path fetches a branch only.
         #[arg(long = "ref", requires = "git")]
         git_ref: Option<String>,
         /// Rebuild even if a cached image exists.
@@ -230,7 +233,8 @@ pub enum KernelCommand {
 pub const KERNEL_HELP_NO_RAW: &str = "Kernel identifier: a source directory \
      path (e.g. `../linux`), a version (`6.14.2`, or major.minor prefix \
      `6.14` for latest patch), a cache key (see `kernel list`), a \
-     version range (`6.12..6.14`), or a git source (`git+URL#REF`). Raw \
+     version range (`6.12..6.14`), or a git source \
+     (`git+URL#tag=NAME`, `git+URL#branch=NAME`, or `git+URL#sha=<40-hex>`). Raw \
      image files are rejected. Source directories auto-build (can be slow \
      on a fresh tree); versions auto-download from kernel.org on cache \
      miss. The flag is REPEATABLE on `test`, `coverage`, and `llvm-cov` \
@@ -239,8 +243,9 @@ pub const KERNEL_HELP_NO_RAW: &str = "Kernel identifier: a source directory \
      tuple becomes a distinct nextest test case so nextest's parallelism, \
      retries, and `-E` filtering work natively. Ranges expand to every \
      `stable` and `longterm` release inside `[START, END]` inclusive \
-     (mainline / linux-next dropped). Git sources clone shallow at the \
-     ref and build once. In contrast, `ktstr shell` accepts a single \
+     (mainline / linux-next dropped). Git sources are fetched at the \
+     given ref (GitHub via a codeload snapshot, other hosts via a \
+     shallow clone) and built once. In contrast, `ktstr shell` accepts a single \
      kernel only — pass exactly one `--kernel`.";
 
 /// Help text for `--kernel` in contexts that accept raw image files:
@@ -255,7 +260,7 @@ pub const KERNEL_HELP_RAW_OK: &str = "Kernel identifier: a source directory \
      (can be slow on a fresh tree); versions auto-download from kernel.org \
      on cache miss. When absent, resolves via cache then filesystem, \
      falling back to downloading the latest stable kernel. Ranges \
-     (`START..END`) and git sources (`git+URL#REF`) are not supported \
+     (`START..END`) and git sources (`git+URL#tag=NAME`) are not supported \
      in this context; pass a single kernel.";
 
 /// Help text for the `--cpu-cap N` flag. Shared across `ktstr kernel build`,

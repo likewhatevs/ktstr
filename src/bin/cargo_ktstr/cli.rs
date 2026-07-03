@@ -49,7 +49,7 @@ pub(crate) enum KtstrCommand {
     Test {
         /// Repeatable. See [`KERNEL_HELP_NO_RAW`] for accepted shapes
         /// (path, version, cache key, range `START..END`, git source
-        /// `git+URL#REF`). Multiple `--kernel` flags fan out the
+        /// `git+URL#tag=NAME`). Multiple `--kernel` flags fan out the
         /// gauntlet across kernels: each `(test × scenario × topology
         /// × kernel)` tuple becomes a distinct nextest test case so
         /// nextest's parallelism, retries, and `-E` filtering all

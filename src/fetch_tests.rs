@@ -189,6 +189,86 @@ fn promote_staged_bails_on_empty_staging() {
     );
 }
 
+// -- promote_single_kernel_tree --
+
+/// A well-formed codeload archive (one top-level directory, whatever
+/// its ref-derived name) is renamed out of staging to `dest/{canonical}`.
+#[test]
+fn promote_single_promotes_sole_directory() {
+    let dest = tempfile::TempDir::new().unwrap();
+    let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+    std::fs::create_dir(staging.path().join("linux-6.11.11")).unwrap();
+    std::fs::write(staging.path().join("linux-6.11.11").join("Makefile"), b"# fake").unwrap();
+    let out =
+        promote_single_kernel_tree(&staging, dest.path(), "linux-git-abc1234").unwrap();
+    assert_eq!(out, dest.path().join("linux-git-abc1234"));
+    assert!(out.is_dir());
+    assert!(out.join("Makefile").is_file(), "promoted tree keeps its contents");
+    assert!(!staging.path().join("linux-6.11.11").exists(), "renamed out of staging");
+}
+
+#[test]
+fn promote_single_rejects_zero_entries() {
+    let dest = tempfile::TempDir::new().unwrap();
+    let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+    let err = promote_single_kernel_tree(&staging, dest.path(), "linux-git-abc1234").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("exactly one top-level entry"),
+        "empty staging must be rejected: {err:#}"
+    );
+    assert!(!dest.path().join("linux-git-abc1234").exists());
+}
+
+#[test]
+fn promote_single_rejects_multiple_entries() {
+    let dest = tempfile::TempDir::new().unwrap();
+    let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+    std::fs::create_dir(staging.path().join("a")).unwrap();
+    std::fs::create_dir(staging.path().join("b")).unwrap();
+    let err = promote_single_kernel_tree(&staging, dest.path(), "linux-git-abc1234").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("exactly one top-level entry"),
+        "several top-level entries must be rejected: {err:#}"
+    );
+    assert!(!dest.path().join("linux-git-abc1234").exists());
+}
+
+#[test]
+fn promote_single_rejects_top_level_file() {
+    let dest = tempfile::TempDir::new().unwrap();
+    let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+    std::fs::write(staging.path().join("linux-6.11.11"), b"not a dir").unwrap();
+    let err = promote_single_kernel_tree(&staging, dest.path(), "linux-git-abc1234").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("not a plain directory"),
+        "a top-level file must be rejected: {err:#}"
+    );
+    assert!(!dest.path().join("linux-git-abc1234").exists());
+}
+
+/// A sole top-level symlink-to-directory must be rejected, not
+/// followed: `Path::is_dir()` would accept the attacker-chosen target
+/// and `fs::rename` would promote the symlink itself. The directory-
+/// entry file-type check rejects it.
+#[test]
+#[cfg(unix)]
+fn promote_single_rejects_top_level_symlink() {
+    let dest = tempfile::TempDir::new().unwrap();
+    let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+    // A real directory OUTSIDE staging that the symlink points at.
+    let target = tempfile::TempDir::new().unwrap();
+    std::os::unix::fs::symlink(target.path(), staging.path().join("linux-evil")).unwrap();
+    let err = promote_single_kernel_tree(&staging, dest.path(), "linux-git-abc1234").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("not a plain directory"),
+        "a top-level symlink must be rejected: {err:#}"
+    );
+    assert!(
+        !dest.path().join("linux-git-abc1234").exists(),
+        "the symlink must not be promoted into dest",
+    );
+}
+
 // -- patch_level --
 
 #[test]
@@ -2440,6 +2520,140 @@ fn download_stable_tarball_500_is_hard_error_without_marker() {
     );
 }
 
+// -- download_github_archive error paths --
+
+/// Serve one canned codeload response at `/archive` on a localhost
+/// mock. Mirrors [`mock_tarball`] for the GitHub codeload endpoint;
+/// `content_type` is set when a case needs the html-reject path.
+fn mock_codeload(
+    status: usize,
+    body: &[u8],
+    content_type: Option<&str>,
+) -> (mockito::ServerGuard, String) {
+    let mut server = mockito::Server::new();
+    let mut m = server
+        .mock("GET", "/archive")
+        .with_status(status)
+        .with_body(body);
+    if let Some(ct) = content_type {
+        m = m.with_header("content-type", ct);
+    }
+    m.create();
+    let url = format!("{}/archive", server.url());
+    (server, url)
+}
+
+const CODELOAD_TEST_SHA: &str = "abc1234abc1234abc1234abc1234abc1234abc12";
+
+/// A 404 from the codeload GET is a clean "snapshot not found" error;
+/// nothing lands in dest_dir.
+#[test]
+#[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
+fn download_github_archive_404_is_clean_error() {
+    let (_server, url) = mock_codeload(404, b"Not Found", None);
+    let dest = tempfile::TempDir::new().expect("tempdir");
+    let err = super::download_github_archive(
+        &test_client(),
+        &url,
+        "v6.14",
+        CODELOAD_TEST_SHA,
+        dest.path(),
+        "test",
+        None,
+    )
+    .err()
+    .expect("a 404 codeload GET must error");
+    assert!(
+        format!("{err:#}").contains("not found"),
+        "404 -> snapshot-not-found error: {err:#}",
+    );
+    assert!(
+        std::fs::read_dir(dest.path()).unwrap().next().is_none(),
+        "nothing must land in dest on a 404",
+    );
+}
+
+/// A non-404 failure (HTTP 500) is a hard error naming the status;
+/// nothing cached.
+#[test]
+#[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
+fn download_github_archive_500_is_hard_error() {
+    let (_server, url) = mock_codeload(500, b"boom", None);
+    let dest = tempfile::TempDir::new().expect("tempdir");
+    let err = super::download_github_archive(
+        &test_client(),
+        &url,
+        "v6.14",
+        CODELOAD_TEST_SHA,
+        dest.path(),
+        "test",
+        None,
+    )
+    .err()
+    .expect("a 500 codeload GET must error");
+    assert!(
+        format!("{err:#}").contains("500"),
+        "hard error names the HTTP status: {err:#}",
+    );
+    assert!(std::fs::read_dir(dest.path()).unwrap().next().is_none());
+}
+
+/// A 200 text/html body (proxy / login interstitial) is rejected by
+/// reject_html_response before any extraction.
+#[test]
+#[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
+fn download_github_archive_rejects_html_body() {
+    let (_server, url) =
+        mock_codeload(200, b"<!DOCTYPE html><html>nope</html>", Some("text/html"));
+    let dest = tempfile::TempDir::new().expect("tempdir");
+    let err = super::download_github_archive(
+        &test_client(),
+        &url,
+        "v6.14",
+        CODELOAD_TEST_SHA,
+        dest.path(),
+        "test",
+        None,
+    )
+    .err()
+    .expect("an HTML body must be rejected");
+    assert!(
+        format!("{err:#}").contains("HTML"),
+        "html-reject error: {err:#}",
+    );
+    assert!(std::fs::read_dir(dest.path()).unwrap().next().is_none());
+}
+
+/// A 200 with a non-gzip body fails extraction cleanly; the staging
+/// TempDir Drop sweeps it, so dest_dir stays empty (no partial tree
+/// promoted).
+#[test]
+#[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
+fn download_github_archive_garbage_gzip_fails_clean() {
+    let (_server, url) =
+        mock_codeload(200, b"this is not gzip data", Some("application/gzip"));
+    let dest = tempfile::TempDir::new().expect("tempdir");
+    let err = super::download_github_archive(
+        &test_client(),
+        &url,
+        "v6.14",
+        CODELOAD_TEST_SHA,
+        dest.path(),
+        "test",
+        None,
+    )
+    .err()
+    .expect("a garbage gzip body must fail extraction");
+    assert!(
+        format!("{err:#}").contains("extract"),
+        "extract error: {err:#}",
+    );
+    assert!(
+        std::fs::read_dir(dest.path()).unwrap().next().is_none(),
+        "staging swept on decode failure — dest must stay empty",
+    );
+}
+
 // -- proptest --
 
 use proptest::prop_assert;
@@ -3025,6 +3239,133 @@ fn git_cache_key_full_hash_distinguishes_7hex_prefix_collision() {
     );
 }
 
+/// A slashed branch ref (e.g. `for-next/core`) must be sanitized so
+/// the cache key contains no `/` or `..` — validate_cache_key
+/// (housekeeping) hard-rejects those, which would make a slashed ref
+/// uncacheable verbatim (breaking both the pre-clone probe and the
+/// store). The full commit hash keeps the key unique, so mapping
+/// `/` -> `_` cannot serve a wrong build.
+#[test]
+fn git_cache_key_sanitizes_slashed_ref() {
+    let h = "abc1234abc1234abc1234abc1234abc1234abc12";
+    let key = git_cache_key("for-next/core", h);
+    assert!(!key.contains('/'), "cache key must not contain `/`: {key}");
+    assert!(!key.contains(".."), "cache key must not contain `..`: {key}");
+    assert!(
+        key.starts_with(&format!("for-next_core-git-{h}-")),
+        "slashed ref must sanitize `/` -> `_`: {key}"
+    );
+}
+
+/// git_cache_key must sanitize every class validate_cache_key rejects,
+/// not just `/` — a leading `.` (hidden entry) and a NUL byte would
+/// otherwise force a cache miss (and a store hard-fail). The full
+/// commit hash keeps the key unique across the collapse.
+#[test]
+fn git_cache_key_sanitizes_dot_prefixed_and_nul_refs() {
+    let h = "abc1234abc1234abc1234abc1234abc1234abc12";
+    let dot = git_cache_key(".hidden", h);
+    assert!(!dot.starts_with('.'), "leading `.` must be sanitized: {dot}");
+    assert!(
+        dot.starts_with(&format!("_.hidden-git-{h}-")),
+        "leading `.` is prefixed with `_`: {dot}"
+    );
+    let nul = git_cache_key("a\0b", h);
+    assert!(!nul.contains('\0'), "NUL must be sanitized: {nul:?}");
+    assert!(
+        nul.starts_with(&format!("a_b-git-{h}-")),
+        "NUL maps to `_`: {nul}"
+    );
+}
+
+/// [`github_archive_url`] builds the codeload archive URL for the
+/// resolved commit — `.../archive/{commit}.tar.gz` — from any GitHub
+/// remote shape (https/http/scp, optional trailing `/` and `.git`,
+/// case-insensitive host), lowercasing the commit; and returns `None`
+/// for non-GitHub hosts, deeper-than-OWNER/REPO paths, and an
+/// OWNER-without-REPO path. Pure — no network.
+#[test]
+fn github_archive_url_builds_codeload_commit_url() {
+    let sha = "abc1234abc1234abc1234abc1234abc1234abc12";
+    let gregkh = format!("https://github.com/gregkh/linux/archive/{sha}.tar.gz");
+    // https, with and without `.git`; trailing slash; trailing `.git/`.
+    assert_eq!(
+        github_archive_url("https://github.com/gregkh/linux.git", sha),
+        Some(gregkh.clone()),
+    );
+    assert_eq!(
+        github_archive_url("https://github.com/gregkh/linux", sha),
+        Some(gregkh.clone()),
+    );
+    assert_eq!(
+        github_archive_url("https://github.com/gregkh/linux/", sha),
+        Some(gregkh.clone()),
+    );
+    assert_eq!(
+        github_archive_url("https://github.com/gregkh/linux.git/", sha),
+        Some(gregkh.clone()),
+    );
+    let torvalds = format!("https://github.com/torvalds/linux/archive/{sha}.tar.gz");
+    // scp-style remote + mixed-case host (DNS is case-insensitive).
+    assert_eq!(
+        github_archive_url("git@github.com:torvalds/linux", sha),
+        Some(torvalds.clone()),
+    );
+    assert_eq!(
+        github_archive_url("https://GitHub.com/torvalds/linux", sha),
+        Some(torvalds.clone()),
+    );
+    // An uppercase commit is lowercased (aligns with git_cache_key's hash).
+    let upper = "ABC1234ABC1234ABC1234ABC1234ABC1234ABC12";
+    assert_eq!(
+        github_archive_url("https://github.com/gregkh/linux", upper),
+        Some(format!(
+            "https://github.com/gregkh/linux/archive/{}.tar.gz",
+            upper.to_ascii_lowercase()
+        )),
+    );
+    // ssh:// (with or without a `git@` userinfo) and git:// schemes for
+    // github.com also route to codeload.
+    assert_eq!(
+        github_archive_url("ssh://git@github.com/torvalds/linux", sha),
+        Some(torvalds.clone()),
+    );
+    assert_eq!(
+        github_archive_url("ssh://github.com/torvalds/linux", sha),
+        Some(torvalds.clone()),
+    );
+    assert_eq!(
+        github_archive_url("git://github.com/torvalds/linux", sha),
+        Some(torvalds.clone()),
+    );
+    // Non-GitHub host, deeper-than-OWNER/REPO path, and OWNER without a
+    // REPO all → None (the gix clone path handles non-GitHub).
+    assert!(
+        github_archive_url(
+            "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git",
+            sha,
+        )
+        .is_none()
+    );
+    assert!(github_archive_url("https://github.com/a/b/c", sha).is_none());
+    assert!(github_archive_url("https://github.com/torvalds/", sha).is_none());
+}
+
+/// [`resolve_ref_commit`] resolves a `Sha` ref offline (no handshake),
+/// lowercasing to match `git_clone`'s rendering, and returns `None` for
+/// `Unknown` without a network round-trip. `Tag`/`Branch` need a live
+/// ls-remote and are exercised by integration paths, not here.
+#[test]
+fn resolve_ref_commit_sha_resolves_offline_lowercased() {
+    use crate::kernel_path::GitRefKind;
+    let sha = "ABC1234abc1234abc1234abc1234abc1234ABC12";
+    assert_eq!(
+        resolve_ref_commit("https://github.com/x/y", sha, GitRefKind::Sha).as_deref(),
+        Some("abc1234abc1234abc1234abc1234abc1234abc12"),
+    );
+    assert!(resolve_ref_commit("https://github.com/x/y", "foo", GitRefKind::Unknown).is_none());
+}
+
 #[test]
 fn ls_remote_commit_hash_uses_full_sha_directly_without_network() {
     // A full 40-hex ref short-circuits the handshake (the bogus URL is
@@ -3119,6 +3460,40 @@ fn match_ref_commit_hash_resolves_branch_tag_head_and_precedence() {
     // No matching ref -> None.
     let refs = vec![direct_ref("refs/heads/main", a)];
     assert_eq!(match_ref_commit_hash(&refs, "does-not-exist"), None);
+}
+
+/// The kind-directed grammar's load-bearing invariant: `pick_ref_object`
+/// matches the FULLY-QUALIFIED ref name exactly, so a tag and a
+/// same-named branch NEVER alias. `resolve_ref_commit` builds
+/// `refs/tags/{ref}` for `Tag` and `refs/heads/{ref}` for `Branch`, so
+/// each kind resolves to its own namespace's commit — unlike the DWIM
+/// `match_ref_commit_hash`, which prefers heads over tags for a bare
+/// name (see the precedence test above). Pure over `&[Ref]` — no
+/// network — so the anti-aliasing invariant is pinned without a live
+/// ls-remote.
+#[test]
+fn pick_ref_object_matches_kind_namespace_without_aliasing() {
+    let branch = "1111111111111111111111111111111111111111";
+    let tag = "2222222222222222222222222222222222222222";
+    // A remote advertising BOTH refs/heads/main and refs/tags/main at
+    // DIFFERENT commits — the exact collision the kind-directed grammar
+    // disambiguates (and the DWIM path silently resolved to the branch).
+    let refs = vec![
+        direct_ref("refs/heads/main", branch),
+        direct_ref("refs/tags/main", tag),
+    ];
+    assert_eq!(
+        pick_ref_object(&refs, "refs/tags/main").map(|o| o.to_string()),
+        Some(tag.to_string()),
+        "#tag=main must resolve to its refs/tags/ commit, not the branch",
+    );
+    assert_eq!(
+        pick_ref_object(&refs, "refs/heads/main").map(|o| o.to_string()),
+        Some(branch.to_string()),
+        "#branch=main must resolve to its refs/heads/ commit, not the tag",
+    );
+    // A ref not advertised in the requested namespace -> None.
+    assert!(pick_ref_object(&refs, "refs/tags/absent").is_none());
 }
 
 #[test]

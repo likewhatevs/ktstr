@@ -112,7 +112,7 @@ Match semantics per variant:
   both endpoints) — matches entries whose raw version falls
   inside `[start, end]` via
   `decompose_version_for_compare`.
-- `Path` / `CacheKey` / `Git` (`"git+URL#REF"`, `"path/to/dir"`,
+- `Path` / `CacheKey` / `Git` (`"git+URL#tag=NAME"`, `"path/to/dir"`,
   `"6.14.2-tarball-x86_64-kc..."`) — matches by sanitized-label
   equality.
 
@@ -230,7 +230,7 @@ keys (use the dedicated key instead).
   exclusive with `binary` and `binary_path`.
 - `sched_args = ["--a", "--b"]` — CLI args prepended to every
   test that uses this scheduler.
-- `kernels = ["6.14", "6.15..=7.0", "git+URL#REF", "/path", "cache-key"]`
+- `kernels = ["6.14", "6.15..=7.0", "git+URL#tag=NAME", "/path", "cache-key"]`
   — verifier sweep set; see the field doc above.
 - `cgroup_parent = "/path"` — must begin with `/`, must not be
   `"/"` alone, must not contain `..` segments (rejected at compile

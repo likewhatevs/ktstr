@@ -324,7 +324,8 @@ cargo ktstr test --kernel ../linux
 `--kernel` accepts a kernel source tree path (e.g. `../linux`,
 auto-built on first use), a version (`6.14.2`, or `6.14` for
 latest patch), a cache key (see `kernel list`), a version
-range (`6.12..6.14`), or a git source (`git+URL#REF`).
+range (`6.12..6.14`), or a git source (`git+URL#tag=NAME`,
+`git+URL#branch=NAME`, or `git+URL#sha=<40-hex>`).
 
 `cargo ktstr test` wraps `cargo nextest run` with kernel
 resolution (source tree, version, or cache key), kconfig

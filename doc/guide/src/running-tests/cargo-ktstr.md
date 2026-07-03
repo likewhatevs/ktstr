@@ -18,15 +18,15 @@ cargo ktstr test --kernel ../linux                             # local source tr
 cargo ktstr test --kernel 6.14.2                               # version (auto-downloads on miss)
 cargo ktstr test --kernel 6.14.2-tarball-x86_64-kc...          # cache key (from kernel list)
 cargo ktstr test --kernel 6.12..6.14                           # range: every stable+longterm release in [6.12, 6.14]
-cargo ktstr test --kernel git+https://example.com/r.git#v6.14  # git URL + ref (tag/branch)
-cargo ktstr test --kernel git+https://example.com/r.git#deadbeef1234  # specific commit
+cargo ktstr test --kernel git+https://example.com/r.git#tag=v6.14  # git URL + tag (or #branch=NAME)
+cargo ktstr test --kernel git+https://example.com/r.git#sha=<full-40-hex-commit>  # a specific commit
 cargo ktstr test --kernel 6.14.2 --kernel 6.15.0               # multi-kernel: repeatable
 cargo ktstr test --release                                     # release profile (stricter assertions)
 ```
 
 `--kernel` is **repeatable** and accepts a path, version string,
 cache key, version range (`START..END`), or git source
-(`git+URL#REF`). When absent, the test framework discovers a kernel
+(`git+URL#tag=NAME`, `#branch=NAME`, or `#sha=<40-hex>`). When absent, the test framework discovers a kernel
 from `KTSTR_TEST_KERNEL`, then `KTSTR_KERNEL`, then falls back to
 cache and filesystem lookup. When `--kernel` is a path,
 cargo-ktstr configures and builds the kernel before running tests.
@@ -42,8 +42,9 @@ The endpoints themselves do NOT need to appear in `releases.json` —
 `6.10..6.16` brackets the surviving releases even if `6.10` and
 `6.16` have aged out.
 
-Git sources (`git+URL#REF`) clone the repo shallow at the given
-ref, build, and cache the result. A repeat invocation against an
+Git sources (`git+URL#tag=NAME`, `#branch=NAME`, or `#sha=<40-hex>`)
+are fetched at the given ref (GitHub via a codeload snapshot, other
+hosts via a shallow clone), built, and cached. A repeat invocation against an
 unchanged branch tip lands a cache hit; a moved tip rebuilds.
 
 ### Multi-kernel: kernel as a gauntlet dimension
@@ -74,9 +75,9 @@ sanitized to `kernel_[a-z0-9_]+`:
 - Version / range expansion → `kernel_6_14_2`, `kernel_6_15_rc3`
 - Cache key → version prefix only (`kernel_6_14_2` from
   `6.14.2-tarball-x86_64-kc<hash>`)
-- Git source → `kernel_git_{owner}_{repo}_{ref}` (e.g.
-  `kernel_git_tj_sched_ext_for_next` from
-  `git+https://github.com/tj/sched_ext#for-next`)
+- Git source → `kernel_git_{owner}_{repo}_{kind}_{ref}` (e.g.
+  `kernel_git_tj_sched_ext_branch_for_next` from
+  `git+https://github.com/tj/sched_ext#branch=for-next`)
 - Path → `kernel_path_{basename}_{hash6}` (e.g.
   `kernel_path_linux_a3f2b1`); the 6-char crc32 of the canonical
   path disambiguates two `linux` directories under different
@@ -125,7 +126,7 @@ identical work for no signal.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--kernel ID` (repeatable) | auto | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#REF`). Repeatable; a multi-kernel set fans the gauntlet across kernels. |
+| `--kernel ID` (repeatable) | auto | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#tag=NAME`). Repeatable; a multi-kernel set fans the gauntlet across kernels. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 | `--no-skip-mode` | off | Convert resource-contention and host-topology-insufficient skips into hard test failures (exit `1` instead of `0`). Default behavior skips so a contended runner does not fail tests that simply could not start; setting this flag opts into "if the test cannot run, the test fails". Exports `KTSTR_NO_SKIP_MODE=1` for the test binary. |
 | `--release` | off | Build and run tests with the release profile (`--cargo-profile release` to nextest). Release mode applies **stricter assertion thresholds** (`gap_threshold_ms` 2000 vs debug's 3000, `spread_threshold_pct` 15% vs debug's 35%) — tests that barely pass in debug may fail under `--release`. `catch_unwind`-based tests and tests gated on `#[cfg(debug_assertions)]` are skipped. |
@@ -448,7 +449,7 @@ cargo ktstr llvm-cov --kernel ../linux report                  # pin kernel + pa
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--kernel ID` (repeatable) | auto | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#REF`). Same multi-kernel semantics as `cargo ktstr test --kernel`. |
+| `--kernel ID` (repeatable) | auto | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#tag=NAME`). Same multi-kernel semantics as `cargo ktstr test --kernel`. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 | `--no-skip-mode` | off | Convert resource-contention and host-topology-insufficient skips into hard test failures. Same semantics as on `test`; exports `KTSTR_NO_SKIP_MODE=1` for the test binary. |
 
@@ -617,7 +618,7 @@ for the rendering details.
 
 | Flag | Description |
 |------|-------------|
-| `--kernel ID` (repeatable) | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#REF`). Raw image files (`bzImage`/`Image`) are NOT accepted — the verifier needs the cached `vmlinux` and kconfig fragment alongside the image. Source directories auto-build; version strings auto-download on cache miss. When absent, resolves via cache then filesystem, falling back to auto-download. Raw images are accepted only on `cargo ktstr shell`. |
+| `--kernel ID` (repeatable) | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#tag=NAME`). Raw image files (`bzImage`/`Image`) are NOT accepted — the verifier needs the cached `vmlinux` and kconfig fragment alongside the image. Source directories auto-build; version strings auto-download on cache miss. When absent, resolves via cache then filesystem, falling back to auto-download. Raw images are accepted only on `cargo ktstr shell`. |
 | `--raw` | Print raw verifier output without cycle collapse. |
 | `--scheduler NAME` | Restrict the sweep to a single declared scheduler (its `declare_scheduler!` `name`) across topologies. Omitted, every declared scheduler is swept. A name matching no declared BPF scheduler fails loud with an empty result set. Sets `KTSTR_VERIFIER_SCHEDULER` for the inner `cargo nextest run`. |
 | `--profile NAME` | Cargo BUILD profile for the scheduler-under-test (see `cargo ktstr test --profile`). Omitted, the scheduler builds `release`. Sets `KTSTR_SCHEDULER_PROFILE` for the inner `cargo nextest run`. |

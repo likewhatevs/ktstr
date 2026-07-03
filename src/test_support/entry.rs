@@ -1082,7 +1082,7 @@ pub struct Scheduler {
     /// `cargo ktstr verifier --kernel <SPEC>` CLI flag. Accepts exact
     /// versions (`"6.14"`), closed ranges spelled either `..` or `..=`
     /// (`"6.14..7.0"` or `"6.14..=7.0"` — both inclusive on both
-    /// endpoints), git refs (`"git+URL#REF"`), paths, and cache keys.
+    /// endpoints), git refs (`"git+URL#tag=NAME"`), paths, and cache keys.
     ///
     /// The verifier sweep matrix is driven by the operator's
     /// `cargo ktstr verifier --kernel <SPEC>` set (which the

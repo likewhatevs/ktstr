@@ -150,7 +150,7 @@ KVM enabled and the user must have read+write access to `/dev/kvm`.
 ```text
 no kernel found — the test harness was likely invoked outside `cargo ktstr test` (which builds and injects a kernel automatically).
   hint: run `cargo ktstr test --kernel <path-or-version>` to drive this test, or set KTSTR_TEST_KERNEL=/path/to/{bzImage|Image} to point at a pre-built bootable image directly.
-  hint: set KTSTR_KERNEL to one of: exact version (`6.14`), inclusive range (`6.14..7.0` or `6.14..=7.0`), git source (`git+URL#REF`), absolute or `~`-prefixed path, or cache key. List cached keys with `cargo ktstr kernel list`; build new ones with `cargo ktstr kernel build`
+  hint: set KTSTR_KERNEL to one of: exact version (`6.14`), inclusive range (`6.14..7.0` or `6.14..=7.0`), git source (`git+URL#tag=NAME`, `git+URL#branch=NAME`, or `git+URL#sha=<40-hex>`), absolute or `~`-prefixed path, or cache key. List cached keys with `cargo ktstr kernel list`; build new ones with `cargo ktstr kernel build`
 ```
 
 On aarch64 the first hint's image filename is `Image` instead of

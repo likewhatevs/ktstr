@@ -176,7 +176,7 @@ declare_scheduler!(DECLARE_SCHEDULER_KERNEL_VARIANTS, {
         "6.14..=6.20",
         "/tmp/linux-custom",
         "foo/../bar/linux",
-        "git+https://example.com/linux.git#main",
+        "git+https://example.com/linux.git#branch=main",
         "my-cache-key-x86-64",
     ],
 });
@@ -196,7 +196,7 @@ fn kernel_variant_strings_accepted_by_macro() {
     );
     assert_eq!(
         DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels[4],
-        "git+https://example.com/linux.git#main"
+        "git+https://example.com/linux.git#branch=main"
     );
     assert_eq!(
         DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels[5],

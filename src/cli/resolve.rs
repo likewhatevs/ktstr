@@ -323,8 +323,10 @@ pub fn resolve_cached_kernel(
         // This function returns one path; range/git fan-out belongs
         // upstream in the dispatch loop that iterates kernels. Bail
         // with an actionable redirect that cites the value the user
-        // wrote — `KernelId::Display` renders Range as `start..end`
-        // and Git as `git+URL#REF`, matching the sibling cache-key
+        // wrote — `KernelId::Display` renders Range as `start..=end`
+        // (or `start..end`) and Git as `git+URL#tag=NAME` /
+        // `#branch=NAME` / `#sha=HASH` (a bare `git+URL#REF` only for
+        // the rejected Unknown kind), matching the sibling cache-key
         // bail above that cites `{key}`.
         //
         // Run `validate()` first so an inverted range surfaces the
@@ -664,58 +666,77 @@ fn filter_and_sort_range(
     selected.into_iter().map(|(v, _)| v).collect()
 }
 
-/// Resolve a `git+URL#REF` kernel spec to a cache-entry directory.
+/// Resolve a `git+URL#tag=/#branch=/#sha=` kernel spec to a cache-entry
+/// directory.
 ///
 /// Mirrors [`download_and_cache_version`] for the git source path. To
-/// avoid an unconditional clone, it FIRST ls-remote-resolves `REF` to
-/// its tip commit (no clone, no working tree — see
-/// [`crate::fetch::ls_remote_commit_hash`]) and probes the cache for the
-/// key that resolution produces ([`crate::fetch::git_cache_key`]); on a
-/// hit it returns the cached entry WITHOUT cloning. On a cache miss — or
-/// any ls-remote failure (network, auth, an unadvertised ref), which is
-/// non-fatal — it shallow-clones into a temp directory via
-/// [`crate::fetch::git_clone`], re-checks the cache (the clone resolves
-/// the tip authoritatively), and on miss delegates to
-/// [`kernel_build_pipeline`] for configure/build/validate/cache. Returns
-/// the cache entry directory path — the same shape
-/// `download_and_cache_version` returns and callers feed into the
-/// [`crate::KTSTR_KERNEL_ENV`] export.
+/// avoid an unconditional fetch, it FIRST resolves `git_ref` to its
+/// commit via a KIND-directed ls-remote (a `Sha` resolves offline; a
+/// `Tag`/`Branch` matches its fully-qualified ref so a tag never aliases
+/// a same-named branch — see `crate::fetch::resolve_ref_commit`) and
+/// probes the cache for the key that resolution produces
+/// (`crate::fetch::git_cache_key`); on a hit it returns the cached
+/// entry WITHOUT any download.
 ///
-/// The cache key embeds `REF` verbatim alongside the resolved tip
-/// commit's full 40-hex hash, so two invocations with identical-sha-different-`REF`
-/// spellings remain distinct cache entries (collapsing those to one is
-/// separate future work — see [`crate::kernel_path::KernelId::Git`]).
+/// On a cache miss the fetch is routed by source:
+/// - **GitHub** (`github.com/OWNER/REPO`, via
+///   `crate::fetch::github_archive_url`): a codeload `tar.gz` snapshot
+///   of the RESOLVED COMMIT (`crate::fetch::download_github_archive`) —
+///   no clone, and the exact-commit snapshot matches the cache key even
+///   if a branch tip advances between the ls-remote probe and the GET.
+/// - **Non-GitHub, or a ref whose ls-remote resolution failed**: a
+///   kind-directed shallow clone into a temp directory
+///   (`crate::fetch::git_clone_kinded` → `git_clone_tag` for a tag,
+///   `git_clone` for a branch; a `sha` is unsupported off GitHub). The
+///   clone resolves the tip authoritatively, catching a hit the
+///   ls-remote probe missed.
+///
+/// On a final miss it delegates to [`kernel_build_pipeline`] for
+/// configure/build/validate/cache. Returns the cache entry directory
+/// path — the same shape `download_and_cache_version` returns and
+/// callers feed into the [`crate::KTSTR_KERNEL_ENV`] export.
+///
+/// The cache key embeds `git_ref` verbatim (`/` and `..` sanitized —
+/// see `crate::fetch::git_cache_key`) alongside the resolved commit's
+/// full 40-hex hash, so two invocations with
+/// identical-sha-different-`git_ref` spellings remain distinct cache
+/// entries (collapsing those to one is separate future work — see
+/// [`crate::kernel_path::KernelId::Git`]).
 ///
 /// `cli_label` matches the contract the sibling helpers
 /// (`download_and_cache_version`, `resolve_kernel_dir`) use:
 /// it prefixes diagnostic status output and is threaded into
 /// [`kernel_build_pipeline`].
 ///
-/// `mp` is the progress group the clone bar is added to (the parallel
-/// resolve's shared group). Forwarded to [`crate::fetch::git_clone`];
-/// `None` disables the bar.
+/// `mp` is the progress group the download/clone bar is added to (the
+/// parallel resolve's shared group). Forwarded to the codeload download
+/// and the clone; `None` disables the bar.
 pub fn resolve_git_kernel(
     url: &str,
     git_ref: &str,
+    ref_kind: crate::kernel_path::GitRefKind,
     cli_label: &str,
     mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<std::path::PathBuf> {
-    // Open the cache once: reused by the pre-clone ls-remote probe, the
-    // post-clone lookup, and the build pipeline below.
+    // Open the cache once: reused by the pre-fetch ls-remote probe, the
+    // post-fetch lookup, and the build pipeline below.
     let cache = crate::cache::CacheDir::new()?;
 
-    // Probe the cache BEFORE the expensive full clone: ls-remote
-    // resolves `git_ref` to its tip commit hash, which with the raw
-    // `git_ref` keys the same entry `git_clone` would write — a hit
-    // returns without cloning. ls-remote failure is non-fatal: fall
-    // through to the clone, which resolves the tip authoritatively (and
-    // surfaces a clearer error if the remote is genuinely unreachable).
-    if let Some(commit_hash) = crate::fetch::ls_remote_commit_hash(url, git_ref) {
-        let cache_key = crate::fetch::git_cache_key(git_ref, &commit_hash);
+    // Resolve `git_ref` to its commit BEFORE the expensive fetch, using
+    // a KIND-directed ls-remote (a tag never aliases a same-named
+    // branch). With `git_ref` this keys the same entry the fetch would
+    // write, so a cache hit returns without any download. `Sha` resolves
+    // offline; a `Tag`/`Branch` ls-remote failure is non-fatal for the
+    // clone path (the clone resolves the tip authoritatively) but is
+    // fatal for the codeload path (below), which has no `.git` to read
+    // the commit back from.
+    let commit = crate::fetch::resolve_ref_commit(url, git_ref, ref_kind);
+    if let Some(commit_hash) = &commit {
+        let cache_key = crate::fetch::git_cache_key(git_ref, commit_hash);
         if let Some(entry) = cache_lookup(&cache, &cache_key, cli_label) {
             // Full hash keys the entry; show the familiar 7-hex prefix.
             let short = &commit_hash[..7.min(commit_hash.len())];
-            let msg = format!("{cli_label}: git+{url}#{git_ref} -> {short} cached; skipping clone");
+            let msg = format!("{cli_label}: git+{url} -> {short} cached; skipping fetch");
             match mp {
                 Some(fp) => fp.println(&msg),
                 None => eprintln!("{msg}"),
@@ -725,12 +746,39 @@ pub fn resolve_git_kernel(
     }
 
     let tmp_dir = tempfile::TempDir::new()?;
-    let acquired = crate::fetch::git_clone(url, git_ref, tmp_dir.path(), cli_label, mp)?;
+    // GitHub sources download the RESOLVED COMMIT's codeload `tar.gz`
+    // snapshot — no clone, and the exact-commit snapshot matches the
+    // cache key even if a branch tip advances mid-resolve.
+    // `github_archive_url` returns None for a non-GitHub URL. A ref that
+    // did not resolve to a commit (a `Tag`/`Branch` ls-remote failure —
+    // a `Sha` resolves offline, so it is never `None` here) has no
+    // codeload URL and falls through to the kind-directed clone, which
+    // resolves the tip authoritatively.
+    let github_archive = commit
+        .as_deref()
+        .and_then(|c| crate::fetch::github_archive_url(url, c));
+    let acquired = if let Some(archive_url) = github_archive {
+        let commit_hash = commit
+            .as_deref()
+            .expect("commit present — the archive URL was built from it");
+        crate::fetch::download_github_archive(
+            crate::fetch::shared_client(),
+            &archive_url,
+            git_ref,
+            commit_hash,
+            tmp_dir.path(),
+            cli_label,
+            mp,
+        )?
+    } else {
+        crate::fetch::git_clone_kinded(url, git_ref, ref_kind, tmp_dir.path(), cli_label, mp)?
+    };
 
-    // Re-check the cache post-clone: the clone resolves the tip
+    // Re-check the cache post-fetch: the clone resolves the tip
     // authoritatively, catching a hit the ls-remote probe missed (a
     // ref-name resolution difference, or a probe that failed) so an
-    // unchanged tip still skips the rebuild.
+    // unchanged tip still skips the rebuild. (The codeload path's key is
+    // already the probe key, so this is a no-op there.)
     if let Some(entry) = cache_lookup(&cache, &acquired.cache_key, cli_label) {
         return Ok(entry.path);
     }

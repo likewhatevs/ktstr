@@ -293,7 +293,7 @@ pub fn find_test_vmlinux() -> Option<std::path::PathBuf> {
                 .ok()
                 .and_then(|p| p.into_os_string().into_string().ok())
         }
-        // Multi-kernel specs (`A..B` ranges, `git+URL#REF`) cannot
+        // Range and git specs (`A..B` ranges, `git+URL#branch=main`) cannot
         // resolve to a single BTF source — there is no dispatch
         // loop here, just a one-shot lookup feeding `resolve_btf`.
         // Treat as "no env hint" and let the local-tree / sysfs
