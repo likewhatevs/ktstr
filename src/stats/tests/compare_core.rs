@@ -1695,7 +1695,13 @@ fn compare_partitions_noise_pools_duplicate_pairing_keys() {
     // Must POOL the 3-per-side duplicates and return Ok — NOT bail with
     // "N sidecars with the same pairing key". Byte-identical metrics
     // across the two sides mean no confident regression, so exit 0.
-    let exit = compare_partitions_noise(&filter_a, &filter_b, Some(alt_root.path()), 1.0)
+    let exit = compare_partitions_noise(
+        &filter_a,
+        &filter_b,
+        Some(alt_root.path()),
+        1.0,
+        &PhaseDisplayOptions::default(),
+    )
         .expect("noise compare must pool N duplicate-key runs per side, not reject them");
     assert_eq!(
         exit, 0,
@@ -2230,6 +2236,455 @@ fn noise_findings_degenerate_single_sample_side_is_noisy_not_confident() {
     );
 }
 
+// ---- per-phase noise (perf-delta --noise-adjust, per-phase) ----
+
+/// Build `n` pass rows for one side, each carrying the given phase buckets.
+fn phased_rows(
+    scenario: &str,
+    n: usize,
+    buckets: &[crate::assert::PhaseBucket],
+) -> Vec<GauntletRow> {
+    (0..n)
+        .map(|_| {
+            let mut r = cmp_row(scenario, "tiny-1llc", true, 10.0, 0);
+            r.phases = buckets.to_vec();
+            r
+        })
+        .collect()
+}
+
+#[test]
+fn noise_phase_findings_emits_per_phase_spread() {
+    // Step[1] max_dsq_depth (LowerBetter Peak) rises 8->15 across sides, clean
+    // (spread 0 both) -> a confident per-phase REGRESSION; BASELINE unchanged.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)]),
+        ],
+    );
+    let b = phased_rows(
+        "scn",
+        3,
+        &[
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 15.0)]),
+        ],
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    let s1 = rep
+        .phase_findings
+        .iter()
+        .find(|f| f.step_index == 1 && f.metric.name == "max_dsq_depth")
+        .expect("Step[1] max_dsq_depth per-phase finding");
+    assert_eq!((s1.verdict.a.mean, s1.verdict.b.mean), (8.0, 15.0));
+    assert_eq!(
+        s1.kind,
+        NoiseKind::Regression,
+        "LowerBetter 8->15 rose => per-phase regression",
+    );
+}
+
+#[test]
+fn noise_phase_scoped_regression_is_render_only_not_gated() {
+    // A per-phase regression with NO scalar/aggregate move: the row-level
+    // metric fields are identical across sides (cmp_row defaults), only the
+    // phase bucket shifts. Per-phase is render-only, so the exit basis
+    // (aggregate regressions) stays 0 while phase_regressions() counts it.
+    let a = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])]);
+    let b = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 15.0)])]);
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    assert_eq!(rep.phase_regressions(), 1, "the per-phase shift is a phase regression");
+    assert_eq!(
+        rep.regressions(),
+        0,
+        "no aggregate move -> exit basis unaffected (per-phase is render-only)",
+    );
+}
+
+#[test]
+fn noise_phase_rate_pooled_centroid_within_phase() {
+    // iteration_rate = total_phase_iterations / total_phase_duration_sec (Rate,
+    // HigherBetter). A side: run1 (100 iters, 1s)=100/s + run2 (100 iters,
+    // 10s)=10/s -> pooled 200/11 = 18.18, NOT mean-of-ratios 55; band [10,100].
+    let bucket = |iters: f64, sec: f64| {
+        make_phase_bucket(
+            1,
+            "Step[0]",
+            &[
+                ("total_phase_iterations", iters),
+                ("total_phase_duration_sec", sec),
+                ("iteration_rate", iters / sec),
+            ],
+        )
+    };
+    let side = |scn: &str| {
+        vec![
+            {
+                let mut r = cmp_row(scn, "tiny-1llc", true, 10.0, 0);
+                r.phases = vec![bucket(100.0, 1.0)];
+                r
+            },
+            {
+                let mut r = cmp_row(scn, "tiny-1llc", true, 10.0, 0);
+                r.phases = vec![bucket(100.0, 10.0)];
+                r
+            },
+        ]
+    };
+    let rep = noise_findings(&side("scn"), &side("scn"), LEGACY_PAIRING_DIMS, 1.0, true);
+    let f = rep
+        .phase_findings
+        .iter()
+        .find(|f| f.step_index == 1 && f.metric.name == "iteration_rate")
+        .expect("Step[1] iteration_rate per-phase finding");
+    assert!(
+        (f.verdict.a.mean - 200.0 / 11.0).abs() < 1e-6,
+        "per-phase Rate centroid must be pooled (18.18), got {} (mean-of-ratios would be 55)",
+        f.verdict.a.mean,
+    );
+}
+
+#[test]
+fn noise_phase_excludes_non_pass_run() {
+    // B = 2 clean Step[1]=8 + 1 FAILED Step[1]=40 (outlier). The failed run's
+    // phase must be excluded before the per-phase pass, so Step[1] sees only
+    // the 2 passing B values (8,8) and there is no false per-phase regression.
+    let a = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])]);
+    let mut b = phased_rows("scn", 2, &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])]);
+    let mut failed = cmp_row("scn", "tiny-1llc", false, 10.0, 0); // is_fail
+    failed.phases = vec![make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 40.0)])];
+    b.push(failed);
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    assert_eq!(
+        rep.phase_regressions(),
+        0,
+        "the failed run's outlier phase must be excluded, no false per-phase regression",
+    );
+}
+
+#[test]
+fn noise_phase_n_lt_2_is_noisy() {
+    // Step[1] max_dsq_depth present in only 1 of A's 3 passing runs -> n<2 ->
+    // Noisy, never a confident regression, despite a large cross-side shift.
+    let mut a = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[])]);
+    a[0].phases = vec![make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])];
+    let b = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 40.0)])]);
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    let f = rep
+        .phase_findings
+        .iter()
+        .find(|f| f.step_index == 1 && f.metric.name == "max_dsq_depth");
+    assert!(
+        matches!(f.map(|f| f.kind), Some(NoiseKind::Noisy)),
+        "a <2-sample per-phase side must be Noisy, got {:?}",
+        f.map(|f| f.kind),
+    );
+}
+
+#[test]
+fn noise_phase_one_sided_metric_is_coverage() {
+    // A's matched Step[1] has max_dsq_depth; B's Step[1] does not -> coverage
+    // (present_side A), not a finding.
+    let a = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])]);
+    let b = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[])]);
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    assert!(
+        rep.phase_coverage
+            .iter()
+            .any(|c| c.metric.map(|m| m.name) == Some("max_dsq_depth")
+                && c.present_side == ComparePartition::A),
+        "A-only max_dsq_depth at a matched step must be a coverage row",
+    );
+    assert!(
+        !rep.phase_findings.iter().any(|f| f.metric.name == "max_dsq_depth"),
+        "a one-sided metric is coverage, never a finding",
+    );
+}
+
+#[test]
+fn noise_phase_one_sided_step_is_coverage() {
+    // A has BASELINE + Step[1]; B has only BASELINE. The whole one-sided
+    // Step[1] must surface as coverage, not be dropped.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)]),
+        ],
+    );
+    let b = phased_rows("scn", 3, &[make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)])]);
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    assert!(
+        rep.phase_coverage
+            .iter()
+            .any(|c| c.step_index == 1 && c.present_side == ComparePartition::A),
+        "the whole one-sided Step[1] must surface as coverage",
+    );
+    assert_eq!(rep.phase_regressions(), 0, "matched BASELINE unchanged -> no regression");
+}
+
+#[test]
+fn noise_phase_empty_one_sided_step_surfaces_as_shape_coverage() {
+    // A has BASELINE + a Step[1] whose buckets carry NO readable metric (a
+    // synthesized capture-free step); B has only BASELINE. The empty one-sided
+    // Step[1] must still surface as a metric-less coverage row, not be silently
+    // dropped (no-silent-drops; mirrors the scalar empty UnpairedPhaseRow).
+    let a = phased_rows(
+        "scn",
+        3,
+        &[
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)]),
+            make_phase_bucket(1, "Step[0]", &[]),
+        ],
+    );
+    let b = phased_rows("scn", 3, &[make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)])]);
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    assert!(
+        rep.phase_coverage.iter().any(|c| c.step_index == 1
+            && c.metric.is_none()
+            && c.present_side == ComparePartition::A),
+        "an empty one-sided Step[1] must surface as a metric-less coverage row: {:?}",
+        rep.phase_coverage
+            .iter()
+            .map(|c| (c.step_index, c.metric.map(|m| m.name)))
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn noise_phase_empty_phases_skip() {
+    // A carries phases, B has none -> per-phase sub-pass skipped entirely,
+    // while the aggregate findings still populate.
+    let a = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])]);
+    let b: Vec<GauntletRow> = (0..3).map(|_| cmp_row("scn", "tiny-1llc", true, 10.0, 0)).collect();
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    assert!(
+        rep.phase_findings.is_empty() && rep.phase_coverage.is_empty(),
+        "no per-phase data when a side has no phases",
+    );
+}
+
+#[test]
+fn format_noise_phase_findings_lines_honors_flags() {
+    // BASELINE max_dsq_depth 5->9 and Step[1] 8->15 both shift (regressions).
+    let a = phased_rows(
+        "scn",
+        3,
+        &[
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)]),
+        ],
+    );
+    let b = phased_rows(
+        "scn",
+        3,
+        &[
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 9.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 15.0)]),
+        ],
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, true);
+    let render = |opts: &PhaseDisplayOptions| {
+        format_noise_phase_findings_lines(&rep.phase_findings, &rep.phase_coverage, opts, "base", "head")
+            .join("\n")
+    };
+    // no_phases -> empty
+    assert!(
+        format_noise_phase_findings_lines(
+            &rep.phase_findings,
+            &rep.phase_coverage,
+            &PhaseDisplayOptions {
+                no_phases: true,
+                ..Default::default()
+            },
+            "base",
+            "head",
+        )
+        .is_empty(),
+        "no_phases suppresses the per-phase block",
+    );
+    // steps_only -> Step[0] present, BASELINE (step 0) absent.
+    let s = render(&PhaseDisplayOptions {
+        steps_only: true,
+        ..Default::default()
+    });
+    assert!(
+        s.contains("1: Step[0]") && !s.contains("0: BASELINE"),
+        "steps_only suppresses BASELINE:\n{s}",
+    );
+    // --phase 0 -> only BASELINE.
+    let p = render(&PhaseDisplayOptions {
+        phase: Some(0),
+        ..Default::default()
+    });
+    assert!(
+        p.contains("0: BASELINE") && !p.contains("1: Step[0]"),
+        "phase=0 shows only BASELINE:\n{p}",
+    );
+    // REGRESSION verdict text present in the default render.
+    assert!(
+        render(&PhaseDisplayOptions::default()).contains("REGRESSION"),
+        "a per-phase regression renders the REGRESSION verdict",
+    );
+}
+
+#[test]
+fn passes_noise_spread_threshold_edges() {
+    // Build a NoiseVerdict with known means (2 identical samples/side -> mean).
+    let v = |a: f64, b: f64| noise_verdict(&[a, a], &[b, b], 1.0);
+    // No --phase-threshold -> every row passes.
+    assert!(PhaseDisplayOptions::default().passes_noise_spread_threshold(&v(100.0, 200.0)));
+    let o = PhaseDisplayOptions {
+        phase_threshold: Some(10.0),
+        ..Default::default()
+    };
+    // |b-a|/|a| under vs over the 10% gate.
+    assert!(!o.passes_noise_spread_threshold(&v(100.0, 105.0)), "5% < 10% -> filtered");
+    assert!(o.passes_noise_spread_threshold(&v(100.0, 120.0)), "20% >= 10% -> shown");
+    // ~zero baseline with a real move -> unbounded relative change -> shown.
+    assert!(o.passes_noise_spread_threshold(&v(0.0, 50.0)), "zero baseline + move -> shown");
+    // Both ~zero -> no signal -> filtered by any positive threshold.
+    assert!(!o.passes_noise_spread_threshold(&v(0.0, 0.0)), "both ~zero -> filtered");
+}
+
+#[test]
+fn format_noise_phase_findings_lines_renders_coverage() {
+    // A one-sided metric (A-only max_dsq_depth at matched Step[1]) + a whole
+    // empty one-sided step (Step[2]) -> the coverage table must render both,
+    // with `—` for the metric-less shape row.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)]),
+            make_phase_bucket(2, "Step[1]", &[]),
+        ],
+    );
+    let b = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[])]);
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    let out = format_noise_phase_findings_lines(
+        &rep.phase_findings,
+        &rep.phase_coverage,
+        &PhaseDisplayOptions::default(),
+        "base",
+        "head",
+    )
+    .join("\n");
+    assert!(
+        out.contains("per-phase coverage asymmetry"),
+        "coverage header rendered:\n{out}",
+    );
+    assert!(out.contains("max_dsq_depth"), "one-sided metric name rendered:\n{out}");
+    assert!(out.contains("—"), "the metric-less empty one-sided step renders `—`:\n{out}");
+}
+
+#[test]
+fn format_noise_phase_findings_lines_honors_phase_threshold() {
+    // Step[0] (step 1) shifts +3%, Step[1] (step 2) shifts +50%. --phase-threshold
+    // 10 suppresses the small move, keeps the large one.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 100.0)]),
+            make_phase_bucket(2, "Step[1]", &[("max_dsq_depth", 100.0)]),
+        ],
+    );
+    let b = phased_rows(
+        "scn",
+        3,
+        &[
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 103.0)]),
+            make_phase_bucket(2, "Step[1]", &[("max_dsq_depth", 150.0)]),
+        ],
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, true);
+    let out = format_noise_phase_findings_lines(
+        &rep.phase_findings,
+        &rep.phase_coverage,
+        &PhaseDisplayOptions {
+            phase_threshold: Some(10.0),
+            ..Default::default()
+        },
+        "base",
+        "head",
+    )
+    .join("\n");
+    assert!(
+        out.contains("2: Step[1]") && !out.contains("1: Step[0]"),
+        "--phase-threshold 10 keeps the +50% step and suppresses the +3% step:\n{out}",
+    );
+}
+
+#[test]
+fn noise_phase_informational_metric_shows_but_never_gates() {
+    // DELIBERATE divergence from the scalar per-phase pass (which DROPS
+    // Informational metrics — its bool verdict can't represent them): the noise
+    // per-phase path SHOWS an Informational metric as NoiseKind::Informational,
+    // never gating. total_ttwu_count is a registered directionless Counter; a
+    // significant move (1000->5000, clean spread 0) must classify Informational,
+    // not Regression, and must NOT count in phase_regressions(). Pins the
+    // divergence so a future refactor mirroring the scalar skip can't silently
+    // reverse it.
+    let a = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("total_ttwu_count", 1000.0)])]);
+    let b = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("total_ttwu_count", 5000.0)])]);
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    let f = rep
+        .phase_findings
+        .iter()
+        .find(|f| f.step_index == 1 && f.metric.name == "total_ttwu_count")
+        .expect("Step[1] total_ttwu_count per-phase finding (noise SHOWS Informational)");
+    assert_eq!(
+        f.kind,
+        NoiseKind::Informational,
+        "an Informational per-phase metric shows as Informational, not a regression",
+    );
+    assert_eq!(rep.phase_regressions(), 0, "Informational never gates");
+}
+
+#[test]
+fn noise_phase_findings_disambiguate_by_pairing_key_across_topologies() {
+    // One scenario name run on TWO topologies forms two distinct pairing-key
+    // groups (topology is a pairing dim), each with its own per-phase finding.
+    // Their rows must carry DISTINCT pairing_labels (scenario/topology/...),
+    // not collapse to identical "scenario"-only labels the operator can't tell
+    // apart.
+    let phased = |topo: &'static str, depth: f64| {
+        (0..3)
+            .map(|_| {
+                let mut r = cmp_row("scn", topo, true, 10.0, 0);
+                r.phases = vec![make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", depth)])];
+                r
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut a = phased("tiny-1llc", 8.0);
+    a.extend(phased("large-4llc", 8.0));
+    let mut b = phased("tiny-1llc", 15.0);
+    b.extend(phased("large-4llc", 15.0));
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    let labels: Vec<&str> = rep
+        .phase_findings
+        .iter()
+        .filter(|f| f.metric.name == "max_dsq_depth")
+        .map(|f| f.pairing_label.as_str())
+        .collect();
+    assert_eq!(
+        labels.len(),
+        2,
+        "one per-phase finding per topology group, distinct labels: {labels:?}",
+    );
+    assert!(
+        labels.iter().any(|l| l.contains("tiny-1llc")) && labels.iter().any(|l| l.contains("large-4llc")),
+        "pairing labels must include the topology to disambiguate: {labels:?}",
+    );
+    assert_ne!(labels[0], labels[1], "the two topology groups must render distinct labels");
+}
+
 #[test]
 fn noise_findings_classifies_both_polarities() {
     // Both polarities WORSEN: worst_spread (LowerBetter) rises 10->15;
@@ -2411,11 +2866,13 @@ fn format_noise_findings_table_renders_rows_and_verdicts() {
     );
     let out = format_noise_findings_table(&rep.findings, "base", "head");
     assert!(
-        out.contains("SCENARIO / METRIC") && out.contains("VERDICT"),
+        out.contains("TEST / METRIC") && out.contains("VERDICT"),
         "header present: {out}"
     );
+    // The TEST column carries the full pairing-key label (scenario + pairing
+    // dims: topology/work_type), not scenario alone — matching the scalar path.
     assert!(
-        out.contains("mix / worst_spread") && out.contains("REGRESSION"),
+        out.contains("mix/tiny-1llc/SpinWait / worst_spread") && out.contains("REGRESSION"),
         "worsened metric row + verdict: {out}"
     );
     assert!(

@@ -14,23 +14,6 @@ use super::*;
 // buckets explicitly, then asserts the resulting CompareReport
 // shape against the expected per-phase + unpaired data flow.
 
-fn make_phase_bucket(
-    step_index: u16,
-    label: &str,
-    metrics: &[(&str, f64)],
-) -> crate::assert::PhaseBucket {
-    let metrics_map = metrics.iter().map(|(k, v)| (k.to_string(), *v)).collect();
-    crate::assert::PhaseBucket {
-        per_cgroup: Default::default(),
-        step_index,
-        label: label.to_string(),
-        start_ms: 0,
-        end_ms: 100,
-        sample_count: 1,
-        metrics: metrics_map,
-    }
-}
-
 /// Matched phases on both sides populate one
 /// PhaseDeltaRow per phase per metric present in both
 /// buckets; unpaired_phases stays empty. Pins the matched
@@ -639,14 +622,16 @@ fn compare_rows_by_phase_deltas_respect_metric_polarity() {
 }
 
 /// An `Polarity::Informational` metric placed in a `PhaseBucket` is DROPPED
-/// from the per-phase delta table: the per-phase path classifies via
+/// from the scalar per-phase delta table: the per-phase path classifies via
 /// `is_regression: bool` and has no informational state, so it skips
-/// directionless metrics rather than misclassifying them. No phase-bucketed
-/// metric is Informational today (every per-phase metric is directional; the
-/// informational schedstat counters are run-level), so this guards the
-/// invariant the `PhaseDeltaRow`-keeps-`bool` decision rests on — a future
-/// per-phase Informational metric is skipped, never silently flagged a
-/// regression.
+/// directionless metrics rather than misclassifying them. Informational
+/// phase-bucketed metrics DO exist in production — the IRQ/softirq schedstat
+/// counters (`total_hardirqs`, `total_softirq_*`, `total_*_time_ns`,
+/// `total_steal_time_ns`) are Informational AND phase-bucketed — and are
+/// dropped here by the bool-verdict skip (surfacing them is task-tracked; the
+/// noise per-phase path already shows them). This test uses `total_ttwu_count`
+/// as one directionless example to pin that the skip fires, never silently
+/// flagging a directionless metric a regression.
 #[test]
 fn compare_rows_by_phase_deltas_skip_informational_metrics() {
     let mut row_a = make_row("test_inf", "tiny-1llc", true, 0.0);

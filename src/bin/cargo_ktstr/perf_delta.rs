@@ -727,7 +727,13 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
             ..Default::default()
         };
         let (filter_a, filter_b) = build.build();
-        return cli::compare_partitions_noise(&filter_a, &filter_b, None, threshold);
+        return cli::compare_partitions_noise(
+            &filter_a,
+            &filter_b,
+            None,
+            threshold,
+            &args.phase_display,
+        );
     }
 
     if args.dual_run {

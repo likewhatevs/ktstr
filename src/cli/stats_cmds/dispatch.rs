@@ -89,15 +89,18 @@ pub fn compare_partitions(
 
 /// Noise-adjusted variant of [`compare_partitions`]: keeps every per-run row,
 /// summarizes each side's spread, and gates on B's mean leaving A's observed
-/// band rather than a fixed threshold. See `crate::stats::compare_partitions_noise`
-/// for the full contract.
+/// band rather than a fixed threshold. When the scenarios carry phases it also
+/// renders a per-phase spread + coverage block (render-only, honoring
+/// `phase_opts`; per-phase never affects the exit). See
+/// `crate::stats::compare_partitions_noise` for the full contract.
 pub fn compare_partitions_noise(
     filter_a: &RowFilter,
     filter_b: &RowFilter,
     dir: Option<&Path>,
     spread_threshold_pct: f64,
+    phase_opts: &crate::stats::PhaseDisplayOptions,
 ) -> Result<i32> {
-    crate::stats::compare_partitions_noise(filter_a, filter_b, dir, spread_threshold_pct)
+    crate::stats::compare_partitions_noise(filter_a, filter_b, dir, spread_threshold_pct, phase_opts)
 }
 
 /// Collect the current host context via
