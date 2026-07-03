@@ -3518,8 +3518,23 @@ pub static METRICS: &[MetricDef] = &[
     },
     MetricDef {
         // Whole-run completed work cycles (Σ over phases+cgroups). HigherBetter
-        // (throughput). NOT a rate component, so NOT suppressed. Distinct from the
-        // per-phase `schbench_loop_count` (PerPhase timeline).
+        // (throughput). NOT a rate component, so NOT suppressed. Uses the tighter
+        // rel 0.10 throughput-Counter band shared by its structural peers
+        // total_iterations / total_phase_iterations (HigherBetter completed-work
+        // Counters): the whole-run Σ pools every cycle, so a 10-29% drop is a real
+        // regression, not noise. The per-phase twin `schbench_loop_count`
+        // (PerPhase) DELIBERATELY keeps the looser rel 0.30 for a
+        // SMALL-SAMPLE-WINDOW reason, not an accounting one: a single phase pools
+        // far fewer completed cycles than the whole-run Σ, so its run-to-run
+        // relative variance (CV) is higher and needs a wider band. It is NOT
+        // phase-edge jitter -- the per-phase counts partition EXACTLY to the
+        // whole-run total and cycles are whole, never fractional (schbench/run.rs
+        // increments once per completed cycle, drains a whole count at the phase
+        // boundary). The nearest per-phase RAW-COUNT peer, total_phase_iterations,
+        // itself gates at 0.10; loop_count's 0.30 is the small-window-CV
+        // exception, not a like-for-like registry precedent. default_abs is the
+        // near-idle activity floor; default_rel carries materiality (see
+        // MetricDef::default_abs).
         name: TOTAL_SCHBENCH_LOOPS,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::Counter,
