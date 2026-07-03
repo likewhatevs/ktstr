@@ -356,10 +356,13 @@ pub(crate) enum KtstrCommand {
         /// band — instead of a fixed `--threshold`. Flags a metric whose relative
         /// spread exceeds `--noise-spread-threshold` as too noisy to trust.
         /// Implies the dual-run production, looped N times; commit axis only
-        /// (needs `--kernel`).
+        /// (needs `--kernel`). N must be >= 2: a single run per side has no
+        /// spread to observe, so the mode would emit a confident verdict driven
+        /// by pure run-to-run noise (>= 5 is recommended for a trustworthy band).
         #[arg(
             long,
             value_name = "N",
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(2..),
             conflicts_with_all = ["a_scheduler", "b_scheduler", "threshold", "policy", "dual_run"],
         )]
         noise_adjust: Option<usize>,

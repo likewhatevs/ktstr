@@ -1649,6 +1649,62 @@ fn compare_partitions_threads_dir_through_to_pool_collection() {
     );
 }
 
+/// Regression: `perf-delta --noise-adjust` writes N runs per side, all
+/// sharing one pairing key, and `compare_partitions_noise` must POOL
+/// them (`RowPrep::PerRunPooled`) so `noise_findings` computes each
+/// side's spread. The shared prep's duplicate-pairing-key rejection —
+/// correct for the pairwise `--no-average` path (`PerRunUnique`) — must
+/// NOT fire here. Before the fix `prepare_partitioned_comparison` bailed
+/// on the N duplicates, so `--noise-adjust N` (N>1) always failed. The
+/// spread math itself is covered by the `noise_findings` tests above;
+/// this pins that the N duplicate-key rows REACH it through the pool +
+/// prep instead of being rejected.
+#[test]
+fn compare_partitions_noise_pools_duplicate_pairing_keys() {
+    use crate::test_support::SidecarResult;
+
+    let alt_root = tempfile::TempDir::new().expect("create alt-root tempdir");
+    // Three runs per side (the `--noise-adjust 3` shape). Each side's
+    // three sidecars share one pairing key (identical but for the
+    // slicing dim `scheduler`), so each side has 3 duplicate-key rows —
+    // exactly the input the old dup-key gate rejected.
+    for (sched, tag) in [("scx_base", "base"), ("scx_head", "head")] {
+        for i in 0..3 {
+            let run_dir = alt_root.path().join(format!("noise_{tag}_{i}"));
+            std::fs::create_dir_all(&run_dir).expect("create run dir");
+            let sidecar = SidecarResult {
+                test_name: "noise_dup_fixture".to_string(),
+                scheduler: sched.to_string(),
+                ..SidecarResult::test_fixture()
+            };
+            let json = serde_json::to_string(&sidecar).expect("serialize fixture sidecar");
+            std::fs::write(run_dir.join(format!("noise_{tag}_{i}.ktstr.json")), json)
+                .expect("write fixture sidecar");
+        }
+    }
+
+    let filter_a = RowFilter {
+        schedulers: vec!["scx_base".to_string()],
+        ..RowFilter::default()
+    };
+    let filter_b = RowFilter {
+        schedulers: vec!["scx_head".to_string()],
+        ..RowFilter::default()
+    };
+
+    // Must POOL the 3-per-side duplicates and return Ok — NOT bail with
+    // "N sidecars with the same pairing key". Byte-identical metrics
+    // across the two sides mean no confident regression, so exit 0.
+    let exit = compare_partitions_noise(&filter_a, &filter_b, Some(alt_root.path()), 1.0)
+        .expect("noise compare must pool N duplicate-key runs per side, not reject them");
+    assert_eq!(
+        exit, 0,
+        "identical metrics across the two sides must yield no confident \
+         regression (exit 0); an Err means the old dup-key gate still \
+         rejects the pooled per-run rows before noise_findings sees them",
+    );
+}
+
 // -- render_dirty_warning --
 
 /// No `-dirty` commit values on either side returns `None` so
@@ -2044,6 +2100,136 @@ fn noise_side(scenario: &str, spread: f64, iters: u64) -> Vec<GauntletRow> {
     ]
 }
 
+/// Under --noise-adjust a Rate's compared centroid must be the pooled
+/// Σnum/Σden (duration-weighted) the registry documents (metric.rs), NOT the
+/// mean of per-run ratios — the two differ when run denominators differ. A
+/// side with runs (run_delay=100, wall=1s)->100/s and (run_delay=100,
+/// wall=10s)->10/s has pooled 200/11 = 18.18/s but mean-of-ratios 55/s. The
+/// per-run band ([10,100]) still measures run-to-run spread. This pins that
+/// the centroid is pooled (agreeing with the Averaged/--average path).
+#[test]
+fn noise_findings_rate_centroid_is_pooled_not_mean_of_ratios() {
+    let mk = |run_delay: f64, wall: f64| {
+        let mut r = cmp_row("rate", "tiny-1llc", true, 10.0, 0);
+        r.ext_metrics.insert("total_run_delay".to_string(), run_delay);
+        r.ext_metrics
+            .insert("total_schedstat_wall_sec".to_string(), wall);
+        r
+    };
+    // B identical to A so the only thing under test is A's reported centroid.
+    let a = vec![mk(100.0, 1.0), mk(100.0, 10.0)];
+    let b = vec![mk(100.0, 1.0), mk(100.0, 10.0)];
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, true);
+    let f = rep
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "run_delay_per_sec")
+        .unwrap_or_else(|| {
+            panic!(
+                "run_delay_per_sec must appear: {:?}",
+                rep.findings.iter().map(|f| f.metric.name).collect::<Vec<_>>(),
+            )
+        });
+    // Pooled Σnum/Σden = 200/11 = 18.18..., NOT mean-of-ratios (100+10)/2 = 55.
+    assert!(
+        (f.verdict.a.mean - 200.0 / 11.0).abs() < 1e-6,
+        "Rate centroid must be pooled Σnum/Σden (18.18), got {} (mean-of-ratios would be 55)",
+        f.verdict.a.mean,
+    );
+}
+
+/// Schedstat Rate metrics (e.g. total_run_delay_ns_per_sched) have a
+/// `|_| None` accessor and materialize only via derive_rate_metrics from
+/// their ext_metrics components — which sidecar_to_row injects but never
+/// derives. The Averaged path derives them (group_and_average_by); the
+/// per-run noise path must too, or a real regression in a GATED schedstat
+/// rate is silently absent from the verdict. Here run-delay-per-schedule
+/// doubles 1000 -> 2000 ns (LowerBetter) with zero per-side spread, so the
+/// DERIVED rate must appear and gate as a confident REGRESSION.
+#[test]
+fn noise_findings_derives_schedstat_rate_from_per_run_components() {
+    let mk = |run_delay: f64| {
+        let mut r = cmp_row("sched", "tiny-1llc", true, 10.0, 0);
+        r.ext_metrics.insert("total_run_delay".to_string(), run_delay);
+        r.ext_metrics.insert("total_pcount".to_string(), 1000.0);
+        r
+    };
+    // total_run_delay_ns_per_sched = total_run_delay / total_pcount.
+    let a = vec![mk(1_000_000.0), mk(1_000_000.0)]; // 1000 ns/sched
+    let b = vec![mk(2_000_000.0), mk(2_000_000.0)]; // 2000 ns/sched
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    assert_eq!(rep.paired_scenarios, 1);
+    let rate = rep
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "total_run_delay_ns_per_sched")
+        .unwrap_or_else(|| {
+            panic!(
+                "derived schedstat rate must appear in noise findings: {:?}",
+                rep.findings.iter().map(|f| f.metric.name).collect::<Vec<_>>(),
+            )
+        });
+    assert_eq!(
+        rate.kind,
+        NoiseKind::Regression,
+        "run-delay-per-schedule doubling (LowerBetter) must gate as a confident regression",
+    );
+}
+
+/// A per-side run can fail (noise_dual_run logs + continues), writing a
+/// `passed=false` sidecar whose failure-mode metric is an outlier. It must
+/// be EXCLUDED from the spread pool — mirroring the scalar `compare_rows_by`
+/// — or a byte-identical HEAD gates as a false regression. Here B = 2 clean
+/// runs at 2000 iters + 1 FAILED run at 990; A = 3 clean runs at 2000.
+/// Without exclusion B's mean (1663) < A's band => a false total_iterations
+/// regression; with exclusion the failed row is dropped and there is none.
+#[test]
+fn noise_findings_excludes_failed_run_from_the_spread_pool() {
+    let a = noise_side("fx", 10.0, 2000);
+    let b = vec![
+        cmp_row("fx", "tiny-1llc", true, 10.0, 2000),
+        cmp_row("fx", "tiny-1llc", true, 10.0, 2000),
+        cmp_row("fx", "tiny-1llc", false, 10.0, 990), // failed run, outlier iters
+    ];
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    assert_eq!(rep.paired_scenarios, 1);
+    assert_eq!(
+        rep.regressions(),
+        0,
+        "a failed per-run row must be excluded from the pool, not gate a false regression: {:?}",
+        rep.findings
+            .iter()
+            .map(|f| (f.metric.name, f.kind))
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// A per-side run failure can leave one side with a single realized
+/// sample. Even a large cross-side shift that would otherwise be a
+/// confident regression must be reported NOISY (never gated), because a
+/// single-point band has no measurable spread. Pins that the `<2`-sample
+/// guard in `noise_verdict` flows through `noise_findings` end-to-end.
+#[test]
+fn noise_findings_degenerate_single_sample_side_is_noisy_not_confident() {
+    let a_one = vec![cmp_row("degen", "tiny-1llc", true, 10.0, 2000)];
+    let b_three = noise_side("degen", 10.0, 1000); // 3 clean runs, iters dropped 2000->1000
+    let rep = noise_findings(&a_one, &b_three, LEGACY_PAIRING_DIMS, 1.0, false);
+    assert_eq!(rep.paired_scenarios, 1);
+    assert_eq!(
+        rep.regressions(),
+        0,
+        "a single-sample baseline side must NOT yield a confident regression: {:?}",
+        rep.findings
+            .iter()
+            .map(|f| (f.metric.name, f.kind))
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        rep.noisy() >= 1,
+        "the shifted metric(s) must be flagged NOISY because side A realized <2 samples",
+    );
+}
+
 #[test]
 fn noise_findings_classifies_both_polarities() {
     // Both polarities WORSEN: worst_spread (LowerBetter) rises 10->15;
@@ -2257,7 +2443,7 @@ fn format_noise_findings_table_renders_noisy_and_improvement_verdicts() {
     );
     let out = format_noise_findings_table(&rep.findings, "base", "head");
     assert!(
-        out.contains("NOISY (spread over gate)"),
+        out.contains("NOISY (spread over gate or <2 runs)"),
         "noisy verdict rendered: {out}"
     );
 

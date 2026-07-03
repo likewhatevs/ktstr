@@ -284,6 +284,12 @@ fn parse_perf_delta_flags_and_defaults() {
         }
         _ => panic!("expected PerfDelta"),
     }
+    // --noise-adjust must be >= 2: a single run per side has no spread to
+    // observe, so N=1 would emit a confident verdict on pure noise.
+    assert!(
+        Cargo::try_parse_from(["cargo", "ktstr", "perf-delta", "--noise-adjust", "1"]).is_err(),
+        "--noise-adjust 1 must be rejected at parse time (needs >= 2 runs)",
+    );
     // --noise-spread-threshold requires --noise-adjust.
     assert!(
         Cargo::try_parse_from([

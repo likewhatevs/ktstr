@@ -12,7 +12,9 @@
 //! - a change is SIGNIFICANT only when B's mean falls OUTSIDE A's observed
 //!   `[min, max]` band — a move larger than A's own run-to-run noise;
 //! - a metric is TOO NOISY (verdict untrustworthy) when either side's relative
-//!   spread `(max - min) / |mean|` exceeds a threshold (default 1%). Range is the
+//!   spread `(max - min) / |mean|` exceeds a threshold (default 1%), OR either
+//!   side realized fewer than 2 samples (a single-point band has no measurable
+//!   spread — e.g. a per-side run failed). Range is the
 //!   most outlier-sensitive dispersion measure: one anomalous run inflates it and
 //!   trips the gate — deliberate for a conservative noise gate (a single wild run
 //!   flags the metric), but it reacts more strongly than a stddev / CV would.
@@ -95,6 +97,26 @@ impl SideSummary {
             spread_pct,
         }
     }
+
+    /// Override the centroid with a pooled mean (`Σnumerator/Σdenominator`)
+    /// while KEEPING the per-run `[min, max]` band. For Rate metrics under
+    /// `--noise-adjust`: the band still measures run-to-run variability from
+    /// the per-run ratios, but the compared centroid is the duration-weighted
+    /// pooled rate the metric registry documents as the cross-run Rate value,
+    /// so `--noise-adjust` and `--average` agree on a Rate's central value. The
+    /// relative spread is recomputed against the pooled mean; `n` and the band
+    /// are unchanged (so the `< 2` too-noisy guard still applies).
+    pub fn with_pooled_mean(mut self, pooled_mean: f64) -> SideSummary {
+        self.mean = pooled_mean;
+        self.spread_pct = if self.max == self.min {
+            0.0
+        } else if pooled_mean.abs() < ZERO_MEAN_EPS {
+            f64::INFINITY
+        } else {
+            (self.max - self.min) / pooled_mean.abs() * 100.0
+        };
+        self
+    }
 }
 
 /// Where B's mean falls relative to A's observed `[min, max]` band.
@@ -121,23 +143,40 @@ pub struct NoiseVerdict {
     /// than A's run-to-run noise. Direction-agnostic; the caller applies the
     /// metric's polarity to decide regression vs improvement.
     pub significant: bool,
-    /// Either side's `spread_pct` exceeds the threshold — the measurement is too
-    /// noisy for the verdict to be trustworthy.
+    /// The verdict is not trustworthy: either side's `spread_pct` exceeds the
+    /// threshold, OR either side realized fewer than 2 samples (a single-point
+    /// band has no measurable spread). Such a metric is flagged, never gated.
     pub too_noisy: bool,
 }
 
 /// Decide the noise-adjusted verdict for one metric from A's and B's per-run
 /// samples. `spread_threshold_pct` is the relative-spread limit in PERCENT
 /// (e.g. `1.0` for 1%): a side whose spread STRICTLY exceeds it marks the
-/// verdict `too_noisy`. Significance is range-based — B's mean outside A's
+/// verdict `too_noisy`. A side with fewer than 2 samples is ALSO
+/// `too_noisy` (a single-point band has no measurable spread; never gate
+/// on it). Significance is range-based — B's mean outside A's
 /// `[min, max]` — and direction-agnostic (either way is significant).
 pub fn noise_verdict(
     a_samples: &[f64],
     b_samples: &[f64],
     spread_threshold_pct: f64,
 ) -> NoiseVerdict {
-    let a = SideSummary::of(a_samples);
-    let b = SideSummary::of(b_samples);
+    noise_verdict_from(
+        SideSummary::of(a_samples),
+        SideSummary::of(b_samples),
+        spread_threshold_pct,
+    )
+}
+
+/// Decide the verdict from two already-summarized sides. Split from
+/// [`noise_verdict`] so the Rate consumer in `noise_findings` can inject a
+/// pooled `Σnum/Σden` centroid ([`SideSummary::with_pooled_mean`]) while the
+/// `[min, max]` band stays per-run.
+pub fn noise_verdict_from(
+    a: SideSummary,
+    b: SideSummary,
+    spread_threshold_pct: f64,
+) -> NoiseVerdict {
     let direction = if b.mean > a.max {
         Direction::Higher
     } else if b.mean < a.min {
@@ -146,7 +185,17 @@ pub fn noise_verdict(
         Direction::Within
     };
     let significant = direction != Direction::Within;
-    let too_noisy = a.spread_pct > spread_threshold_pct || b.spread_pct > spread_threshold_pct;
+    // A side with fewer than 2 realized samples has NO measurable spread:
+    // SideSummary::of([x]) reports spread_pct=0, a degenerate single-point
+    // band that reads any B change as significant-and-clean — the exact
+    // pure-noise confident verdict this mode exists to prevent. Runs are
+    // REQUESTED >= 2 (the --noise-adjust clap gate), but a per-side run can
+    // fail (noise_dual_run logs and continues), so a side can REALIZE < 2.
+    // Treat that as too noisy to gate on rather than a trustworthy verdict.
+    let too_noisy = a.spread_pct > spread_threshold_pct
+        || b.spread_pct > spread_threshold_pct
+        || a.n < 2
+        || b.n < 2;
     NoiseVerdict {
         a,
         b,
@@ -185,6 +234,35 @@ mod tests {
         let s = SideSummary::of(&[42.0]);
         assert_eq!((s.n, s.mean, s.min, s.max), (1, 42.0, 42.0, 42.0));
         assert_eq!(s.spread_pct, 0.0);
+    }
+
+    #[test]
+    fn noise_verdict_flags_side_with_fewer_than_two_samples_too_noisy() {
+        // A per-side run can fail (noise_dual_run logs + continues), so a
+        // side can realize <2 samples even though --noise-adjust requires
+        // N>=2. A single-sample side has a degenerate zero-spread band that
+        // would otherwise read any B change as a CONFIDENT verdict — the
+        // exact pure-noise false gate the mode exists to prevent. It must be
+        // too_noisy (flagged, never gated), even when B is "significant".
+        // A realized 1 sample; B 3 clean samples with a real shift.
+        let v = noise_verdict(&[100.0], &[130.0, 130.0, 130.0], 1.0);
+        assert_eq!(v.a.n, 1);
+        assert!(v.significant, "B mean is outside A's single-point band");
+        assert!(
+            v.too_noisy,
+            "a side with <2 realized samples must be too_noisy, not confident",
+        );
+        // Symmetric: B realized 1 sample.
+        let v = noise_verdict(&[100.0, 100.0, 100.0], &[130.0], 1.0);
+        assert_eq!(v.b.n, 1);
+        assert!(v.too_noisy, "a degenerate B side must also be too_noisy");
+        // Control: both sides have >=2 clean samples (zero spread) with a
+        // real shift — a trustworthy significant verdict, NOT over-flagged.
+        let v = noise_verdict(&[100.0, 100.0], &[130.0, 130.0], 1.0);
+        assert!(
+            v.significant && !v.too_noisy,
+            "n>=2 clean sides stay gateable; the <2 guard must not over-trigger",
+        );
     }
 
     #[test]

@@ -1593,12 +1593,13 @@ struct PartitionedComparison {
     /// `pool` converted to rows, same length and iteration order.
     rows: Vec<GauntletRow>,
     /// A-side rows fed to [`compare_rows_by`]: averaged mean rows
-    /// when `no_average` is false, the raw filtered rows otherwise.
+    /// under [`RowPrep::Averaged`], the raw filtered rows under either
+    /// per-run mode ([`RowPrep::PerRunUnique`] / [`RowPrep::PerRunPooled`]).
     rows_a_for_compare: Vec<GauntletRow>,
     /// B-side counterpart of `rows_a_for_compare`.
     rows_b_for_compare: Vec<GauntletRow>,
-    /// A-side averaged groups when `no_average` is false; `None`
-    /// under `--no-average`. Drives the per-group pass-count block.
+    /// A-side averaged groups under [`RowPrep::Averaged`]; `None` under
+    /// both per-run modes. Drives the per-group pass-count block.
     avg_a: Option<Vec<AveragedGroup>>,
     /// B-side counterpart of `avg_a`.
     avg_b: Option<Vec<AveragedGroup>>,
@@ -1609,20 +1610,39 @@ struct PartitionedComparison {
     pre_agg_b: usize,
 }
 
+/// How [`prepare_partitioned_comparison`] folds each side's rows before
+/// the compare half consumes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowPrep {
+    /// Fold same-pairing-key rows on each side into one arithmetic-mean
+    /// row — the default `stats compare` behavior.
+    Averaged,
+    /// Keep every row distinct and REJECT duplicate pairing keys. The
+    /// pairwise `stats compare --no-average` path: `compare_rows` pairs
+    /// one A-row against exactly one B-row per key, so a duplicate key
+    /// is ambiguous and must be an error.
+    PerRunUnique,
+    /// Keep every row INCLUDING duplicate pairing keys, and do NOT run
+    /// the duplicate-key rejection. The `perf-delta --noise-adjust`
+    /// path: [`noise_findings`] groups the N runs per key per side into
+    /// a spread, so N-per-key is the intended input, not an error.
+    PerRunPooled,
+}
+
 /// Validate, pool, partition, and average the inputs for
 /// [`compare_partitions`]. Returns the owned [`PartitionedComparison`]
 /// bundle the render half destructures, or bails with the same
 /// diagnostics in the same order as the original in-function prelude:
 /// identical-rows gate, empty-pool gate, then the two zero-match
-/// gates, then (under `--no-average`) the duplicate-pairing-key
-/// gates. The multi-dim slicing warning and the dirty-build /
+/// gates, then (under [`RowPrep::PerRunUnique`]) the
+/// duplicate-pairing-key gates. The multi-dim slicing warning and the dirty-build /
 /// overcommit warnings are emitted here so they precede the render
 /// half's header lines, preserving output order.
 fn prepare_partitioned_comparison(
     filter_a: &RowFilter,
     filter_b: &RowFilter,
     dir: Option<&std::path::Path>,
-    no_average: bool,
+    prep: RowPrep,
 ) -> anyhow::Result<PartitionedComparison> {
     // Validation gate 1: there must be at least one dimension
     // on which filter_a differs from filter_b — otherwise the
@@ -1702,8 +1722,8 @@ fn prepare_partitioned_comparison(
     // whose `scheduler` is in `filter_a.schedulers` matches A
     // but NOT B unless `filter_b.schedulers` also contains it —
     // typically not when scheduler is the slicing axis).
-    let rows_a = apply_row_filters(&rows, filter_a);
-    let rows_b = apply_row_filters(&rows, filter_b);
+    let mut rows_a = apply_row_filters(&rows, filter_a);
+    let mut rows_b = apply_row_filters(&rows, filter_b);
     if rows_a.is_empty() {
         anyhow::bail!(
             "{}",
@@ -1723,24 +1743,46 @@ fn prepare_partitioned_comparison(
     let pre_agg_a = rows_a.len();
     let pre_agg_b = rows_b.len();
 
-    // Average by default: fold same-pairing-key rows on each
-    // side into one mean row. `--no-average` keeps every
-    // sidecar distinct but still rejects duplicate pairing keys
-    // because compare_rows can't pair an A-row against multiple
-    // B-rows with the same key.
-    let (rows_a_for_compare, rows_b_for_compare, avg_a, avg_b) = if !no_average {
-        let avg_a = group_and_average_by(&rows_a, &pairing_dims);
-        let avg_b = group_and_average_by(&rows_b, &pairing_dims);
-        let a_rows: Vec<GauntletRow> = avg_a.iter().map(|r| r.row.clone()).collect();
-        let b_rows: Vec<GauntletRow> = avg_b.iter().map(|r| r.row.clone()).collect();
-        (a_rows, b_rows, Some(avg_a), Some(avg_b))
-    } else {
-        // Detect duplicates manually so the error names the key
-        // rather than letting compare_rows silently latch onto
-        // the first match.
-        check_no_duplicate_pairing_keys(&rows_a, &pairing_dims, "A")?;
-        check_no_duplicate_pairing_keys(&rows_b, &pairing_dims, "B")?;
-        (rows_a, rows_b, None, None)
+    // Fold each side's rows per the caller's [`RowPrep`]. `Averaged`
+    // collapses same-pairing-key rows into one mean row (the default);
+    // both per-run modes keep every row distinct and differ only in
+    // whether a duplicate pairing key is an error.
+    let (rows_a_for_compare, rows_b_for_compare, avg_a, avg_b) = match prep {
+        RowPrep::Averaged => {
+            let avg_a = group_and_average_by(&rows_a, &pairing_dims);
+            let avg_b = group_and_average_by(&rows_b, &pairing_dims);
+            let a_rows: Vec<GauntletRow> = avg_a.iter().map(|r| r.row.clone()).collect();
+            let b_rows: Vec<GauntletRow> = avg_b.iter().map(|r| r.row.clone()).collect();
+            (a_rows, b_rows, Some(avg_a), Some(avg_b))
+        }
+        RowPrep::PerRunUnique => {
+            // Derive each run's Rate metrics so compare_rows_by reads them
+            // (the schedstat rates whose components only appear in ext_metrics
+            // at sidecar_to_row time). The Averaged path derives via
+            // group_and_average_by; this per-run (`stats compare --no-average`)
+            // path must derive per row or every schedstat Rate is silently
+            // dropped from the pairwise delta.
+            for r in rows_a.iter_mut() {
+                crate::stats::metric::derive_rate_metrics(&mut r.ext_metrics);
+            }
+            for r in rows_b.iter_mut() {
+                crate::stats::metric::derive_rate_metrics(&mut r.ext_metrics);
+            }
+            // Pairwise compare needs a 1:1 A:B match per key. Detect
+            // duplicates manually so the error names the key rather than
+            // letting compare_rows silently latch onto the first match.
+            check_no_duplicate_pairing_keys(&rows_a, &pairing_dims, "A")?;
+            check_no_duplicate_pairing_keys(&rows_b, &pairing_dims, "B")?;
+            (rows_a, rows_b, None, None)
+        }
+        RowPrep::PerRunPooled => {
+            // The noise-spread compare groups the N runs per pairing key
+            // per side (see `noise_findings`), so N-per-key is the
+            // intended input. Keep every row and do NOT run the
+            // duplicate-key rejection — that guard is only for the
+            // pairwise `PerRunUnique` path.
+            (rows_a, rows_b, None, None)
+        }
     };
 
     Ok(PartitionedComparison {
@@ -1811,7 +1853,16 @@ pub fn compare_partitions(
     no_average: bool,
     phase_opts: &PhaseDisplayOptions,
 ) -> anyhow::Result<i32> {
-    let prepared = prepare_partitioned_comparison(filter_a, filter_b, dir, no_average)?;
+    let prepared = prepare_partitioned_comparison(
+        filter_a,
+        filter_b,
+        dir,
+        if no_average {
+            RowPrep::PerRunUnique
+        } else {
+            RowPrep::Averaged
+        },
+    )?;
     let PartitionedComparison {
         slicing_dims,
         pairing_dims,
@@ -1900,8 +1951,8 @@ pub(crate) enum NoiseKind {
     Regression,
     /// Significant in the improving direction and not too noisy.
     Improvement,
-    /// Either side's spread exceeds the gate — verdict untrustworthy; flagged but
-    /// does NOT fail the gate.
+    /// Either side's spread exceeds the gate, OR either side realized fewer than
+    /// 2 samples — verdict untrustworthy; flagged but does NOT fail the gate.
     Noisy,
     /// Significant change in a directionless (`Polarity::Informational`) metric —
     /// shown but NEVER fails the gate (no good/bad direction to regress).
@@ -1949,8 +2000,11 @@ impl NoiseReport {
 /// Row-level noise-adjusted compare — the testable core of
 /// [`compare_partitions_noise`] (which wraps it with sidecar pooling + render),
 /// mirroring how [`compare_rows_by`] underlies [`compare_partitions`]. Groups
-/// each side's per-run rows by pairing key, then per metric summarizes the spread
-/// and classifies via [`noise_verdict`]. Returns one [`NoiseFinding`] per
+/// each side's per-run rows by pairing key — EXCLUDING non-pass runs
+/// (fail / skip / inconclusive / expected_failure), whose failure-mode
+/// telemetry would corrupt the spread, exactly as [`compare_rows_by`] excludes
+/// them — then per metric summarizes the spread and classifies via
+/// [`noise_verdict`]. Returns one [`NoiseFinding`] per
 /// (scenario, metric) that is changed, noisy, or — when `include_stable` is
 /// true — unchanged-and-clean ([`NoiseKind::Stable`], shown in the full metrics
 /// table but never gating). With `include_stable = false` only changed/noisy
@@ -1968,10 +2022,31 @@ pub(crate) fn noise_findings(
     let group = |rows: &[GauntletRow]| {
         let mut by_key: BTreeMap<PairingKey, Vec<GauntletRow>> = BTreeMap::new();
         for r in rows {
+            // Exclude non-pass runs from the spread pool, mirroring the
+            // scalar `compare_rows_by` and the averaged `group_and_average_by`:
+            // a failed / inconclusive / skipped / expected_failure run's
+            // telemetry is failure-mode-dominated (zeroed or an outlier), so
+            // pooling it would corrupt the per-side [min, max] band and mean
+            // and could produce a confident FALSE gate — the exact
+            // silent-wrong-verdict class the noise mode exists to prevent.
+            // A side reduced below 2 real samples by this filter is then
+            // caught by `noise_verdict`'s n<2 too_noisy guard.
+            if r.is_fail() || r.is_inconclusive() || r.is_skip() || r.expected_failure {
+                continue;
+            }
+            // Derive this run's Rate metrics (e.g. the schedstat rates whose
+            // components only materialize in ext_metrics at sidecar_to_row
+            // time) so the spread reads them — the Averaged path derives via
+            // group_and_average_by -> derive_rate_metrics; the per-run paths
+            // must derive per row or every schedstat Rate is silently absent
+            // from the verdict. Per-run derivation (each run's own num/den) is
+            // the correct band semantics for run-to-run spread.
+            let mut row = r.clone();
+            crate::stats::metric::derive_rate_metrics(&mut row.ext_metrics);
             by_key
-                .entry(PairingKey::from_row(r, pairing_dims))
+                .entry(PairingKey::from_row(&row, pairing_dims))
                 .or_default()
-                .push(r.clone());
+                .push(row);
         }
         by_key
     };
@@ -1995,7 +2070,45 @@ pub(crate) fn noise_findings(
             if a_vals.is_empty() || b_vals.is_empty() {
                 continue;
             }
-            let verdict = noise_verdict(&a_vals, &b_vals, spread_threshold_pct);
+            // Rate metrics: the per-run ratios (a_vals/b_vals) give the
+            // run-to-run band, but the compared centroid is the pooled
+            // Σnum/Σden (duration-weighted) — the cross-run Rate value the
+            // registry documents (metric.rs), so --noise-adjust and --average
+            // agree on a Rate's central value while the band still measures
+            // per-run variability. Non-Rate metrics summarize their samples.
+            let verdict = match m.kind {
+                MetricKind::Rate {
+                    numerator,
+                    denominator,
+                } => {
+                    let pooled = |rows: &[GauntletRow]| -> Option<f64> {
+                        // Sum num/den only over runs that carry BOTH components,
+                        // so a run missing one cannot skew the pooled ratio (the
+                        // per-run rate is undefined for it anyway).
+                        let (num, den) = rows.iter().fold((0.0, 0.0), |(sn, sd), r| {
+                            match (
+                                r.ext_metrics.get(numerator),
+                                r.ext_metrics.get(denominator),
+                            ) {
+                                (Some(n), Some(d)) => (sn + n, sd + d),
+                                _ => (sn, sd),
+                            }
+                        });
+                        (den != 0.0).then(|| num / den)
+                    };
+                    // A zero pooled denominator means no rate to compare on that
+                    // side — skip (matches the per-run derivation guard).
+                    let (Some(a_pooled), Some(b_pooled)) = (pooled(a_rows), pooled(b_rows)) else {
+                        continue;
+                    };
+                    noise_verdict_from(
+                        SideSummary::of(&a_vals).with_pooled_mean(a_pooled),
+                        SideSummary::of(&b_vals).with_pooled_mean(b_pooled),
+                        spread_threshold_pct,
+                    )
+                }
+                _ => noise_verdict(&a_vals, &b_vals, spread_threshold_pct),
+            };
             // No signal on either side (both ~zero): skip. Uses the same zero
             // epsilon as the spread ratio for one consistent "is this zero".
             if verdict.a.mean.abs() < ZERO_MEAN_EPS && verdict.b.mean.abs() < ZERO_MEAN_EPS {
@@ -2046,7 +2159,7 @@ pub(crate) fn noise_findings(
 
 /// Noise-adjusted variant of [`compare_partitions`]: instead of averaging each
 /// side's runs into one mean and gating on a fixed threshold, it keeps every run
-/// (`no_average`), summarizes each side per metric as a `mean` over its
+/// ([`RowPrep::PerRunPooled`]), summarizes each side per metric as a `mean` over its
 /// `[min, max]` band, and decides from A's observed spread (see [`noise_findings`]
 /// for the row-level core + [`noise_verdict`] for the per-metric decision). Used
 /// by `perf-delta --noise-adjust N`, which produces N runs per side. A metric is a
@@ -2066,8 +2179,11 @@ pub fn compare_partitions_noise(
     dir: Option<&std::path::Path>,
     spread_threshold_pct: f64,
 ) -> anyhow::Result<i32> {
-    // Keep every per-run row (no_average) so the run-to-run spread is observable.
-    let prepared = prepare_partitioned_comparison(filter_a, filter_b, dir, true)?;
+    // Keep every per-run row INCLUDING duplicate pairing keys so the
+    // run-to-run spread is observable: noise_findings groups the N runs
+    // per key per side. PerRunPooled skips the duplicate-key rejection
+    // that the pairwise `--no-average` path (PerRunUnique) enforces.
+    let prepared = prepare_partitioned_comparison(filter_a, filter_b, dir, RowPrep::PerRunPooled)?;
     let label_a = render_side_label(filter_a, &prepared.slicing_dims, "A");
     let label_b = render_side_label(filter_b, &prepared.slicing_dims, "B");
 
@@ -2155,7 +2271,7 @@ pub(crate) fn format_noise_findings_table(
         let (verdict_text, color) = match f.kind {
             NoiseKind::Regression => ("REGRESSION", Color::Red),
             NoiseKind::Improvement => ("improvement", Color::Green),
-            NoiseKind::Noisy => ("NOISY (spread over gate)", Color::Yellow),
+            NoiseKind::Noisy => ("NOISY (spread over gate or <2 runs)", Color::Yellow),
             NoiseKind::Informational => ("informational", Color::Blue),
             NoiseKind::Stable => ("stable", Color::Grey),
         };
