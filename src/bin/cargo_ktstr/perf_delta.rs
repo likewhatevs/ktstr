@@ -110,6 +110,7 @@ pub(crate) fn resolve_baseline(
 // Dual-run (increment 3b): produce the baseline run in a git worktree
 // ---------------------------------------------------------------------------
 
+use ktstr::flock::{FlockMode, try_flock};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -134,6 +135,35 @@ fn baseline_sidecar_leaf(runs_root_abs: &Path, baseline_short: &str) -> PathBuf 
 /// source tree. `baseline_short` keeps concurrent baselines distinct.
 fn worktree_checkout_dir(temp_root: &Path, baseline_short: &str) -> PathBuf {
     temp_root.join(format!("ktstr-perf-delta-wt-{baseline_short}"))
+}
+
+/// Advisory-lock path for a baseline worktree: `<wt_dir>.lock`, a SIBLING of
+/// `wt_dir` (not inside it, which cleanup removes) so the flock outlives the
+/// worktree it guards. The path is shared per baseline commit, matching
+/// `worktree_checkout_dir`, so two runs of the same baseline contend on it.
+fn worktree_lock_path(wt_dir: &Path) -> PathBuf {
+    let mut s = wt_dir.as_os_str().to_owned();
+    s.push(".lock");
+    PathBuf::from(s)
+}
+
+/// Take the exclusive per-baseline worktree lock, or bail if another perf-delta
+/// run holds it. Returns the lock fd to hold for the worktree's whole lifetime
+/// (drop releases; the OS also releases on process death). See the call sites
+/// for why the shared per-baseline path makes this serialization load-bearing.
+fn acquire_baseline_worktree_lock(
+    wt_dir: &Path,
+    baseline_short: &str,
+) -> Result<std::os::fd::OwnedFd> {
+    let lock_path = worktree_lock_path(wt_dir);
+    try_flock(&lock_path, FlockMode::Exclusive)
+        .with_context(|| format!("lock baseline worktree {}", lock_path.display()))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "another `cargo ktstr perf-delta` run is using the baseline worktree \
+                 for {baseline_short}; retry once it finishes"
+            )
+        })
 }
 
 /// Env pairs for the baseline child `cargo ktstr test`: restrict to
@@ -272,15 +302,64 @@ impl Drop for WorktreeGuard {
     fn drop(&mut self) {
         // Best-effort: this is the cleanup path, so a failure cannot
         // propagate. `git worktree remove` prints its own diagnostic to
-        // stderr on failure, and a leftover dir surfaces as an explicit
-        // "already exists" error on the next run's `worktree add` rather
-        // than a silent stale-data reuse — so a swallowed Err here is
-        // visible downstream, not hidden.
+        // stderr on failure. A swallowed Err (or a skipped drop on Ctrl-C /
+        // SIGKILL / crash) leaves a leftover, but the next run's
+        // `create_baseline_worktree` calls `prune_leftover_worktree` before
+        // `git worktree add`, which recovers it — so a failure here degrades
+        // to a re-created worktree next run, not a stuck "already exists".
         let _ = Command::new("git")
             .current_dir(&self.repo_root)
             .args(worktree_remove_argv(&self.wt_dir))
             .status();
     }
+}
+
+/// Best-effort self-heal of a leftover baseline worktree before a fresh
+/// `git worktree add`. Ctrl-C (SIGINT), SIGKILL, or a crash kills the process
+/// before [`WorktreeGuard`]`::drop` runs, orphaning the temp checkout AND its
+/// registration — so the next run's `git worktree add` hard-fails
+/// `'<dir>' already exists`. Idempotent recovery here covers EVERY interruption
+/// mode (a SIGINT handler could not cover SIGKILL / crash). Three steps, each
+/// swallowing failure because a clean tree makes them no-ops: remove a
+/// still-registered worktree (clears registration + dir), delete a bare leftover
+/// dir that carried no / a broken registration, then prune a dangling
+/// registration whose dir is now gone.
+fn prune_leftover_worktree(repo_root: &Path, wt_dir: &Path) {
+    let _ = Command::new("git")
+        .current_dir(repo_root)
+        .args(worktree_remove_argv(wt_dir))
+        .status();
+    if wt_dir.exists() {
+        let _ = std::fs::remove_dir_all(wt_dir);
+    }
+    let _ = Command::new("git")
+        .current_dir(repo_root)
+        .args(["worktree", "prune"])
+        .status();
+}
+
+/// Create the detached baseline worktree at `wt_dir`, first self-healing any
+/// leftover from an interrupted prior run via [`prune_leftover_worktree`] so a
+/// re-run always recovers rather than dying on "already exists".
+fn create_baseline_worktree(
+    repo_root: &Path,
+    wt_dir: &Path,
+    baseline_full_hex: &str,
+    baseline_short: &str,
+) -> Result<()> {
+    prune_leftover_worktree(repo_root, wt_dir);
+    let add = Command::new("git")
+        .current_dir(repo_root)
+        .args(worktree_add_argv(wt_dir, baseline_full_hex))
+        .status()
+        .with_context(|| format!("spawn `git worktree add` for baseline {baseline_short}"))?;
+    if !add.success() {
+        anyhow::bail!(
+            "`git worktree add {} {baseline_full_hex}` failed ({add})",
+            wt_dir.display(),
+        );
+    }
+    Ok(())
 }
 
 /// Absolutize a relative kernel-source path against the MAIN tree so the
@@ -339,19 +418,18 @@ fn dual_run(
     // worktree) resolves the same tree HEAD does (cwd = main).
     let kernel_arg = resolve_kernel_for_children(repo_root, kernel);
 
-    // Create the detached baseline worktree.
-    let add = Command::new("git")
-        .current_dir(repo_root)
-        .args(worktree_add_argv(&wt_dir, baseline_full_hex))
-        .status()
-        .with_context(|| format!("spawn `git worktree add` for baseline {baseline_short}"))?;
-    if !add.success() {
-        anyhow::bail!(
-            "`git worktree add {} {baseline_full_hex}` failed ({add}) — \
-             a leftover worktree from a prior run may need `git worktree prune`",
-            wt_dir.display(),
-        );
-    }
+    // Serialize concurrent perf-delta runs against the SAME baseline: they share
+    // one per-baseline worktree path, and create_baseline_worktree force-removes
+    // any leftover — which would destroy a live concurrent run's checkout. The
+    // exclusive advisory flock (OS-released on process death) makes a live
+    // concurrent run bail cleanly here, while an interrupted run's lock frees for
+    // the next run (which then self-heals the leftover). Held for the whole
+    // baseline lifetime; declared before `_guard` so it drops AFTER the worktree
+    // is removed.
+    let _wt_lock = acquire_baseline_worktree_lock(&wt_dir, baseline_short)?;
+    // Create the detached baseline worktree, self-healing any leftover from an
+    // interrupted prior run (Ctrl-C / SIGKILL / crash skip WorktreeGuard::drop).
+    create_baseline_worktree(repo_root, &wt_dir, baseline_full_hex, baseline_short)?;
     let _guard = WorktreeGuard {
         repo_root: repo_root.to_path_buf(),
         wt_dir: wt_dir.clone(),
@@ -433,18 +511,13 @@ fn noise_dual_run(
     let wt_dir = worktree_checkout_dir(&std::env::temp_dir(), baseline_short);
     let kernel_arg = resolve_kernel_for_children(repo_root, kernel);
 
-    let add = Command::new("git")
-        .current_dir(repo_root)
-        .args(worktree_add_argv(&wt_dir, baseline_full_hex))
-        .status()
-        .with_context(|| format!("spawn `git worktree add` for baseline {baseline_short}"))?;
-    if !add.success() {
-        anyhow::bail!(
-            "`git worktree add {} {baseline_full_hex}` failed ({add}) — \
-             a leftover worktree from a prior run may need `git worktree prune`",
-            wt_dir.display(),
-        );
-    }
+    // Serialize same-baseline runs before the self-heal force-removes the shared
+    // worktree (see dual_run for the full rationale). Held for the whole run;
+    // declared before `_guard` so it drops after the worktree is removed.
+    let _wt_lock = acquire_baseline_worktree_lock(&wt_dir, baseline_short)?;
+    // Self-heal a leftover worktree, then create the detached baseline (see
+    // create_baseline_worktree — Ctrl-C / SIGKILL skip WorktreeGuard::drop).
+    create_baseline_worktree(repo_root, &wt_dir, baseline_full_hex, baseline_short)?;
     let _guard = WorktreeGuard {
         repo_root: repo_root.to_path_buf(),
         wt_dir: wt_dir.clone(),
@@ -907,6 +980,58 @@ mod tests {
                 "/tmp/wt".to_string(),
             ],
         );
+    }
+
+    #[test]
+    fn prune_leftover_worktree_removes_a_bare_leftover_dir() {
+        // Simulate an interrupted prior run's orphaned worktree: a populated dir
+        // the next `git worktree add` would trip over. With a non-repo repo_root
+        // the `git worktree remove/prune` calls fail harmlessly (not a repo), so
+        // this pins the fs fallback that clears the bare leftover — the exact
+        // "'<dir>' already exists" recovery a Ctrl-C'd run needs.
+        let base = std::env::temp_dir().join(format!("ktstr-pd-selfheal-{}", std::process::id()));
+        let repo_root = base.join("not-a-repo");
+        let wt = base.join("wt-leftover");
+        std::fs::create_dir_all(&repo_root).expect("mk repo_root");
+        std::fs::create_dir_all(wt.join("scx-ktstr")).expect("mk leftover subtree");
+        std::fs::write(wt.join("scx-ktstr/build.rs"), "x").expect("write leftover file");
+        assert!(wt.exists(), "leftover present before self-heal");
+        prune_leftover_worktree(&repo_root, &wt);
+        assert!(
+            !wt.exists(),
+            "self-heal must remove a bare leftover worktree dir so `git worktree add` can proceed",
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn baseline_worktree_lock_blocks_a_concurrent_same_baseline_run() {
+        // Two perf-delta runs against the same baseline share worktree_lock_path;
+        // the exclusive flock must let only ONE proceed so the self-heal never
+        // force-removes a live concurrent run's checkout (the medium-severity
+        // regression this lock closes). Also pins the sibling `.lock` path shape
+        // and that the lock frees for the next run once released (the
+        // interrupted-run recovery path — the OS releases it on process death).
+        let wt = std::env::temp_dir().join(format!("ktstr-pd-locktest-wt-{}", std::process::id()));
+        assert_eq!(
+            worktree_lock_path(&wt),
+            PathBuf::from(format!("{}.lock", wt.display())),
+            "lock is a sibling <wt_dir>.lock, outside the worktree cleanup removes",
+        );
+        let lock_path = worktree_lock_path(&wt);
+        let _ = std::fs::remove_file(&lock_path);
+
+        let held =
+            acquire_baseline_worktree_lock(&wt, "abc1234").expect("first run acquires the lock");
+        assert!(
+            acquire_baseline_worktree_lock(&wt, "abc1234").is_err(),
+            "a concurrent same-baseline run must fail to acquire, not clobber the live worktree",
+        );
+        drop(held);
+        let after = acquire_baseline_worktree_lock(&wt, "abc1234")
+            .expect("lock frees for the next run once released");
+        drop(after);
+        let _ = std::fs::remove_file(&lock_path);
     }
 
     #[test]
