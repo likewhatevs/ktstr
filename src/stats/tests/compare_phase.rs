@@ -97,8 +97,9 @@ fn schbench_per_phase_metrics_drive_cross_run_verdict_with_registry_polarity() {
         .find(|d| d.metric.name == "wakeup_p99_latency_us")
         .expect("wakeup_p99_latency_us must resolve to a registered metric_def and emit a delta");
     assert_eq!(lat.delta, 1000.0);
-    assert!(
-        lat.is_regression,
+    assert_eq!(
+        lat.verdict,
+        PhaseVerdict::Regression,
         "a rising p99 on a LowerBetter metric is a regression",
     );
 
@@ -122,8 +123,9 @@ fn schbench_per_phase_metrics_drive_cross_run_verdict_with_registry_polarity() {
         .iter()
         .find(|d| d.metric.name == "wakeup_p99_latency_us")
         .expect("delta present");
-    assert!(
-        !lat2.is_regression,
+    assert_eq!(
+        lat2.verdict,
+        PhaseVerdict::Improvement,
         "a falling p99 on a LowerBetter metric is an improvement",
     );
 
@@ -149,8 +151,9 @@ fn schbench_per_phase_metrics_drive_cross_run_verdict_with_registry_polarity() {
         .find(|d| d.metric.name == "schbench_loop_count")
         .expect("schbench_loop_count must resolve to a registered metric_def and emit a delta");
     assert_eq!(lc.delta, -4000.0);
-    assert!(
-        lc.is_regression,
+    assert_eq!(
+        lc.verdict,
+        PhaseVerdict::Regression,
         "falling loop_count on a HigherBetter metric is a regression (less throughput)",
     );
 }
@@ -318,6 +321,80 @@ fn phase_block_lines_render_a_coverage_only_report() {
         joined.contains("0 delta row(s)") && joined.contains("2 one-sided-metric coverage diff(s)"),
         "footer hint must report the coverage-diff count, not only deltas: {joined}"
     );
+}
+
+/// `format_phase_block_lines` paints a below-dual-gate (unchanged) per-phase
+/// delta as `stable`, NOT the green `improvement` the pre-`PhaseVerdict` bool
+/// verdict produced (`is_regression=false` was rendered "improvement",
+/// conflating unchanged with a real improvement). A max_dsq_depth phase that
+/// does not move (10 -> 10, delta 0, below the abs gate) must read `stable`.
+#[test]
+fn phase_block_lines_render_unchanged_metric_as_stable_not_improvement() {
+    let mut row_a = make_row("test_stable", "tiny-1llc", true, 0.0);
+    let mut row_b = make_row("test_stable", "tiny-1llc", true, 0.0);
+    row_a.phases = vec![make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 10.0)])];
+    row_b.phases = vec![make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 10.0)])];
+    let report = compare_rows_by(&[row_a], &[row_b], &[], None, &ComparisonPolicy::default());
+    assert_eq!(report.phase_deltas.len(), 1);
+    assert_eq!(report.phase_deltas[0].verdict, PhaseVerdict::Stable);
+    let joined =
+        format_phase_block_lines(&report, &PhaseDisplayOptions::default(), "A", "B").join("\n");
+    assert!(joined.contains("stable"), "an unchanged phase reads `stable`: {joined}");
+    assert!(
+        !joined.contains("improvement"),
+        "an unchanged phase must NOT read `improvement`: {joined}"
+    );
+    assert!(
+        !joined.contains("REGRESSION"),
+        "an unchanged phase must NOT read `REGRESSION`: {joined}"
+    );
+}
+
+/// `format_phase_block_lines` renders the full per-phase verdict vocabulary:
+/// `REGRESSION` (LowerBetter past-gate), `improvement` (HigherBetter
+/// past-gate), `stable` (below-gate), and `informational` (a directionless
+/// metric past its gate). The `informational` word pins that an Informational
+/// phase-bucketed metric (the IRQ/softirq schedstat counters, here
+/// `total_ttwu_count`) now surfaces in the scalar per-phase table instead of
+/// being dropped, and the footer counts exactly one regression (the
+/// Informational row never gates).
+#[test]
+fn phase_block_lines_render_all_four_verdict_words() {
+    let mut row_a = make_row("test_v4", "tiny-1llc", true, 0.0);
+    let mut row_b = make_row("test_v4", "tiny-1llc", true, 0.0);
+    let metrics_a = &[
+        ("max_dsq_depth", 10.0),          // LowerBetter, 10->25 -> Regression
+        ("total_iterations", 200.0),      // HigherBetter, 200->400 -> Improvement
+        ("wakeup_p99_latency_us", 500.0), // 500->500 (delta 0) -> Stable
+        ("total_ttwu_count", 1000.0),     // Informational, 1000->5000 -> Informational
+    ];
+    let metrics_b = &[
+        ("max_dsq_depth", 25.0),
+        ("total_iterations", 400.0),
+        ("wakeup_p99_latency_us", 500.0),
+        ("total_ttwu_count", 5000.0),
+    ];
+    row_a.phases = vec![make_phase_bucket(0, "BASELINE", metrics_a)];
+    row_b.phases = vec![make_phase_bucket(0, "BASELINE", metrics_b)];
+    let report = compare_rows_by(&[row_a], &[row_b], &[], None, &ComparisonPolicy::default());
+    assert_eq!(report.phase_deltas.len(), 4, "all four metrics emit a per-phase row");
+    let joined =
+        format_phase_block_lines(&report, &PhaseDisplayOptions::default(), "A", "B").join("\n");
+    for word in ["REGRESSION", "improvement", "stable", "informational"] {
+        assert!(joined.contains(word), "verdict `{word}` renders: {joined}");
+    }
+    // Only the directional regression counts in the footer; the Informational
+    // (and stable, and improvement) rows are shown but never gated.
+    assert!(
+        joined.contains("4 delta row(s) (1 regression)"),
+        "footer counts 4 rows but only the one regression: {joined}"
+    );
+    let regressions = report
+        .phase_deltas
+        .iter()
+        .filter(|d| d.verdict == PhaseVerdict::Regression)
+        .count();
+    assert_eq!(regressions, 1, "exactly one regression among the four verdicts");
 }
 
 /// `format_phase_block_lines` returns no lines when there is no phase data at
@@ -505,12 +582,14 @@ fn compare_rows_by_phase_one_sided_suppressed_component_is_dropped_not_coverage_
     );
 }
 
-/// A one-sided Informational metric within a MATCHED phase DOES surface as a
-/// PhaseCoverageDiff: the (Some, None) / (None, Some) arms carry no
-/// classify_direction / polarity gate (a coverage diff is never a verdict),
-/// unlike the (Some, Some) delta arm which skips Informational metrics. Pins
-/// the documented intent that a one-sided Informational metric is reported,
-/// not dropped.
+/// A one-sided Informational metric within a MATCHED phase surfaces as a
+/// PhaseCoverageDiff, NOT a delta: the (Some, None) / (None, Some) arms carry
+/// no classify_direction / polarity gate (a coverage diff is never a verdict)
+/// because a one-sided metric has no comparable baseline. A BOTH-sided
+/// Informational metric, by contrast, DOES become a delta — the (Some, Some)
+/// arm classifies it PhaseVerdict::Informational (pinned by
+/// compare_rows_by_phase_deltas_show_informational_metrics). Pins that a
+/// one-sided Informational metric is reported (as coverage), not dropped.
 #[test]
 fn compare_rows_by_phase_one_sided_informational_metric_is_coverage_diff() {
     // total_ttwu_count is Polarity::Informational; present only on A's matched
@@ -537,7 +616,7 @@ fn compare_rows_by_phase_one_sided_informational_metric_is_coverage_diff() {
             .phase_deltas
             .iter()
             .all(|d| d.metric.name != "total_ttwu_count"),
-        "an Informational metric is never a phase delta",
+        "a ONE-sided Informational metric routes to phase_coverage_diffs, not phase_deltas",
     );
 }
 
@@ -567,10 +646,10 @@ fn compare_rows_by_skips_phase_pass_when_either_side_phases_empty() {
     );
 }
 
-/// Polarity-aware is_regression: a `worst_*`-style
-/// LowerBetter metric where B > A flags regression=true;
-/// a `*_iterations`/HigherBetter metric where B > A flags
-/// regression=false (improvement). Pins the polarity wiring
+/// Polarity-aware verdict: a `worst_*`-style
+/// LowerBetter metric where B > A is a `Regression`;
+/// a `*_iterations`/HigherBetter metric where B > A is an
+/// `Improvement`. Pins the polarity wiring
 /// that the existing scalar-finding path uses, applied to
 /// the per-phase pass.
 ///
@@ -606,8 +685,9 @@ fn compare_rows_by_phase_deltas_respect_metric_polarity() {
         .iter()
         .find(|r| r.metric.name == "max_dsq_depth")
         .expect("max_dsq_depth delta present");
-    assert!(
-        dsq.is_regression,
+    assert_eq!(
+        dsq.verdict,
+        PhaseVerdict::Regression,
         "max_dsq_depth bigger on B -> regression (LowerBetter polarity)"
     );
     let iters = report
@@ -615,28 +695,29 @@ fn compare_rows_by_phase_deltas_respect_metric_polarity() {
         .iter()
         .find(|r| r.metric.name == "total_iterations")
         .expect("total_iterations delta present");
-    assert!(
-        !iters.is_regression,
+    assert_eq!(
+        iters.verdict,
+        PhaseVerdict::Improvement,
         "total_iterations bigger on B -> improvement (HigherBetter polarity)"
     );
 }
 
-/// An `Polarity::Informational` metric placed in a `PhaseBucket` is DROPPED
-/// from the scalar per-phase delta table: the per-phase path classifies via
-/// `is_regression: bool` and has no informational state, so it skips
-/// directionless metrics rather than misclassifying them. Informational
-/// phase-bucketed metrics DO exist in production — the IRQ/softirq schedstat
+/// A `Polarity::Informational` metric placed in a `PhaseBucket` and moving
+/// past its dual gate surfaces as a `PhaseVerdict::Informational` per-phase
+/// row — shown, never a regression/improvement, never gating. Informational
+/// phase-bucketed metrics exist in production — the IRQ/softirq schedstat
 /// counters (`total_hardirqs`, `total_softirq_*`, `total_*_time_ns`,
-/// `total_steal_time_ns`) are Informational AND phase-bucketed — and are
-/// dropped here by the bool-verdict skip (surfacing them is task-tracked; the
-/// noise per-phase path already shows them). This test uses `total_ttwu_count`
-/// as one directionless example to pin that the skip fires, never silently
-/// flagging a directionless metric a regression.
+/// `total_steal_time_ns`) are Informational AND phase-bucketed — so dropping
+/// them (the pre-`PhaseVerdict` bool behavior) hid real per-phase data. This
+/// test uses `total_ttwu_count` as one directionless example to pin that it
+/// is shown as Informational alongside a directional regression, never
+/// counted among the regressions.
 #[test]
-fn compare_rows_by_phase_deltas_skip_informational_metrics() {
+fn compare_rows_by_phase_deltas_show_informational_metrics() {
     let mut row_a = make_row("test_inf", "tiny-1llc", true, 0.0);
     let mut row_b = make_row("test_inf", "tiny-1llc", true, 0.0);
-    // total_ttwu_count is Polarity::Informational; max_dsq_depth is directional.
+    // total_ttwu_count is Polarity::Informational (default_abs 100 / rel 0.10);
+    // 1000 -> 5000 clears the gate. max_dsq_depth is directional.
     row_a.phases = vec![make_phase_bucket(
         0,
         "BASELINE",
@@ -650,17 +731,25 @@ fn compare_rows_by_phase_deltas_skip_informational_metrics() {
     let report = compare_rows_by(&[row_a], &[row_b], &[], None, &ComparisonPolicy::default());
     assert_eq!(
         report.phase_deltas.len(),
-        1,
-        "only the directional metric produces a per-phase delta"
+        2,
+        "both the directional and the Informational metric produce a per-phase row"
     );
-    assert_eq!(report.phase_deltas[0].metric.name, "max_dsq_depth");
-    assert!(
-        !report
-            .phase_deltas
-            .iter()
-            .any(|r| r.metric.name == "total_ttwu_count"),
-        "the Informational metric must be skipped from the per-phase table"
+    let ttwu = report
+        .phase_deltas
+        .iter()
+        .find(|r| r.metric.name == "total_ttwu_count")
+        .expect("the Informational metric is now shown, not dropped");
+    assert_eq!(
+        ttwu.verdict,
+        PhaseVerdict::Informational,
+        "a directionless metric past its gate is Informational, never a regression",
     );
+    let dsq = report
+        .phase_deltas
+        .iter()
+        .find(|r| r.metric.name == "max_dsq_depth")
+        .expect("max_dsq_depth delta present");
+    assert_eq!(dsq.verdict, PhaseVerdict::Regression);
 }
 
 /// per-phase pass honors the dual-gate semantic the
@@ -668,16 +757,18 @@ fn compare_rows_by_phase_deltas_skip_informational_metrics() {
 /// `push_scalar_findings` (`|delta| < default_abs ||
 /// rel_delta < default_rel`). Sub-threshold deltas are still
 /// emitted into `phase_deltas` (programmatic consumers see
-/// every paired comparison) but their `is_regression` flag
-/// is `false` — the renderer paints them as "improvement"
-/// or unstyled rather than the red REGRESSION verdict.
+/// every paired comparison) but classify as
+/// `PhaseVerdict::Stable` — the renderer paints them "stable"
+/// (grey), NOT the red REGRESSION verdict and NOT a green
+/// "improvement" (the bool verdict conflated below-gate with
+/// improvement).
 ///
 /// Two cases pinned in one test:
 /// - sub-abs-gate: `max_dsq_depth` `default_abs=10.0` —
 ///   delta=5 (5→10) is direction-matching for LowerBetter
-///   polarity but `5 < 10` → is_regression=false.
+///   polarity but `5 < 10` → Stable.
 /// - above-both-gates: `max_dsq_depth` delta=15 (10→25)
-///   passes both abs and rel gates → is_regression=true.
+///   passes both abs and rel gates → Regression.
 #[test]
 fn compare_rows_by_phase_deltas_dual_gate_suppresses_subthreshold_regressions() {
     let mut row_a = make_row("test_dg", "tiny-1llc", true, 0.0);
@@ -703,10 +794,11 @@ fn compare_rows_by_phase_deltas_dual_gate_suppresses_subthreshold_regressions() 
         .find(|r| r.step_index == 0)
         .expect("BASELINE delta present");
     assert_eq!(baseline.delta, 5.0);
-    assert!(
-        !baseline.is_regression,
-        "delta=5 < default_abs=10 → sub-abs-gate; \
-             is_regression must clear despite LowerBetter polarity direction"
+    assert_eq!(
+        baseline.verdict,
+        PhaseVerdict::Stable,
+        "delta=5 < default_abs=10 → sub-abs-gate; classifies Stable \
+             (not improvement) despite LowerBetter polarity direction"
     );
     let step0 = report
         .phase_deltas
@@ -714,21 +806,22 @@ fn compare_rows_by_phase_deltas_dual_gate_suppresses_subthreshold_regressions() 
         .find(|r| r.step_index == 1)
         .expect("Step[0] delta present");
     assert_eq!(step0.delta, 15.0);
-    assert!(
-        step0.is_regression,
+    assert_eq!(
+        step0.verdict,
+        PhaseVerdict::Regression,
         "delta=15 ≥ default_abs=10 AND rel_delta=1.5 ≥ default_rel=0.5 → \
-             above both gates; LowerBetter polarity sets is_regression=true"
+             above both gates; LowerBetter polarity sets Regression"
     );
 }
 
 /// Per-phase mirror of the scalar zero-baseline fix: a phase metric
 /// rising from a ~zero baseline to a value over its absolute gate must
-/// set `is_regression`. Before the fix the per-phase `rel_delta` was
+/// be a `Regression`. Before the fix the per-phase `rel_delta` was
 /// forced to `0.0` on a ~zero baseline, which (AND-gated with the
-/// relative threshold) cleared `is_regression` for every `0 -> large`
+/// relative threshold) cleared the regression for every `0 -> large`
 /// phase jump. The fix treats the appearance as an unbounded relative
 /// change (`+inf`), so the absolute gate alone decides; a both-~zero
-/// phase carries no signal and stays non-regression.
+/// phase carries no signal and stays `Stable`.
 #[test]
 fn compare_rows_by_phase_deltas_zero_baseline_jump_is_a_regression() {
     let mut row_a = make_row("test_zphase", "tiny-1llc", true, 0.0);
@@ -749,9 +842,10 @@ fn compare_rows_by_phase_deltas_zero_baseline_jump_is_a_regression() {
         .find(|r| r.step_index == 0)
         .expect("BASELINE delta present");
     assert_eq!(baseline.delta, 15.0);
-    assert!(
-        baseline.is_regression,
-        "0 -> 15 (>= abs gate 10) from a zero baseline must set is_regression, \
+    assert_eq!(
+        baseline.verdict,
+        PhaseVerdict::Regression,
+        "0 -> 15 (>= abs gate 10) from a zero baseline must be a Regression, \
              not be vetoed by the zero-baseline relative gate"
     );
     let step1 = report
@@ -760,9 +854,10 @@ fn compare_rows_by_phase_deltas_zero_baseline_jump_is_a_regression() {
         .find(|r| r.step_index == 1)
         .expect("Step[0] delta present");
     assert_eq!(step1.delta, 0.0);
-    assert!(
-        !step1.is_regression,
-        "0 -> 0 carries no signal (rel_delta=0, |delta|=0 < abs gate) → not a regression"
+    assert_eq!(
+        step1.verdict,
+        PhaseVerdict::Stable,
+        "0 -> 0 carries no signal (rel_delta=0, |delta|=0 < abs gate) → Stable, not a regression"
     );
 }
 
@@ -930,7 +1025,7 @@ fn passes_delta_threshold_unset_admits_all_deltas() {
         a: 100.0,
         b: 100.0,
         delta: 0.0,
-        is_regression: false,
+        verdict: PhaseVerdict::Stable,
     };
     let big_delta = PhaseDeltaRow {
         pairing_key: PairingKey(vec!["t".into()]),
@@ -940,7 +1035,7 @@ fn passes_delta_threshold_unset_admits_all_deltas() {
         a: 100.0,
         b: 1099.0,
         delta: 999.0,
-        is_regression: true,
+        verdict: PhaseVerdict::Regression,
     };
     assert!(opts.passes_delta_threshold(&zero_delta));
     assert!(opts.passes_delta_threshold(&big_delta));
@@ -969,7 +1064,7 @@ fn passes_delta_threshold_inclusive_at_boundary() {
         a: 100.0,
         b: 110.0,
         delta: 10.0,
-        is_regression: true,
+        verdict: PhaseVerdict::Regression,
     };
     assert!(
         opts.passes_delta_threshold(&at_gate),
@@ -1010,7 +1105,7 @@ fn passes_delta_threshold_zero_a_nonzero_delta_is_unbounded() {
         a: 0.0,
         b: 10.0,
         delta: 10.0,
-        is_regression: true,
+        verdict: PhaseVerdict::Regression,
     };
     assert!(
         opts.passes_delta_threshold(&zero_a),
@@ -1043,7 +1138,7 @@ fn passes_delta_threshold_zero_a_tiny_delta_renders_unbounded() {
         a: 0.0,
         b: 0.001,
         delta: 0.001,
-        is_regression: true,
+        verdict: PhaseVerdict::Regression,
     };
     assert!(
         opts.passes_delta_threshold(&zero_a_tiny),
@@ -1074,7 +1169,7 @@ fn passes_delta_threshold_both_zero_filtered_by_positive_threshold() {
         a: 0.0,
         b: 0.0,
         delta: 0.0,
-        is_regression: false,
+        verdict: PhaseVerdict::Stable,
     };
     assert!(
         !opts.passes_delta_threshold(&both_zero),
@@ -1104,7 +1199,7 @@ fn passes_delta_threshold_both_zero_at_pct_zero_renders() {
         a: 0.0,
         b: 0.0,
         delta: 0.0,
-        is_regression: false,
+        verdict: PhaseVerdict::Stable,
     };
     assert!(
         opts.passes_delta_threshold(&both_zero),
@@ -1137,7 +1232,7 @@ fn passes_delta_threshold_zero_pct_admits_all_rows() {
         a: 100.0,
         b: 100.0,
         delta: 0.0,
-        is_regression: false,
+        verdict: PhaseVerdict::Stable,
     };
     assert!(
         opts.passes_delta_threshold(&zero_delta),

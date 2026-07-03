@@ -45,6 +45,33 @@ pub(crate) enum FindingKind {
     Informational,
 }
 
+/// Classification of one per-phase metric delta ([`PhaseDeltaRow`]).
+///
+/// Unlike the run-level [`FindingKind`] — which is recorded only for
+/// metrics that CLEARED the dual gate (unchanged metrics are counted in
+/// [`CompareReport::unchanged`], never made into a `Finding`) — the
+/// per-phase table emits a row for EVERY paired metric so the operator
+/// sees the full per-phase comparison. It therefore needs a `Stable`
+/// state for a below-dual-gate delta in addition to the directional and
+/// directionless kinds. Mirrors the noise per-phase [`NoiseKind`]
+/// vocabulary minus `Noisy` (the spread-gate state that has no scalar
+/// analog), so the scalar and noise per-phase tables render the same
+/// verdict words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) enum PhaseVerdict {
+    /// Directional metric past the dual gate in the worsening direction
+    /// (per the metric's polarity). The only kind counted as a regression.
+    Regression,
+    /// Directional metric past the dual gate in the improving direction.
+    Improvement,
+    /// Below the dual gate (or both sides ~zero): no significant change.
+    Stable,
+    /// Directionless ([`crate::test_support::Polarity::Informational`])
+    /// metric with a significant change — shown, never a regression or
+    /// improvement, never gating the exit.
+    Informational,
+}
+
 /// A metric present on exactly ONE side of a paired (scenario,
 /// topology, work_type) row — a coverage difference, not a perf delta.
 ///
@@ -192,17 +219,21 @@ pub(crate) struct PhaseDeltaRow {
     /// `val_b - val_a` (B minus A) — the same plain difference the
     /// scalar [`Finding::delta`] carries. Polarity is NOT folded into
     /// the sign here; it is applied separately when computing
-    /// `is_regression` (below) via the metric's `higher_is_worse()`.
+    /// `verdict` (below) via the metric's `classify_direction()`
+    /// (whose `None` routes a directionless metric to
+    /// `Informational` rather than splitting on polarity).
     pub delta: f64,
-    /// `true` when the delta exceeds the dual-gate threshold in
-    /// the regression direction (per metric polarity). A `bool` —
-    /// not the scalar path's three-way [`FindingKind`] — because
-    /// this table carries only DIRECTIONAL per-phase metrics.
-    /// Informational per-phase metrics (the IRQ/softirq schedstat
-    /// counters) DO exist, but the bool cannot represent them, so
-    /// `push_phase_deltas` omits them from this table — the noise
-    /// per-phase path shows them as Informational rows instead.
-    pub is_regression: bool,
+    /// The metric's per-phase classification. `Stable` for a
+    /// below-dual-gate delta (this table emits a row for every paired
+    /// metric, so unchanged rows are labeled, not omitted);
+    /// `Informational` for a significant change in a directionless
+    /// ([`crate::test_support::Polarity::Informational`]) metric — the
+    /// IRQ/softirq schedstat counters land here rather than being
+    /// dropped; `Regression`/`Improvement` for a past-gate directional
+    /// metric per its polarity. Only `Regression` is counted in the
+    /// footer's regression tally and it never gates the exit (the
+    /// per-phase table is render-only).
+    pub verdict: PhaseVerdict,
 }
 
 /// One per-phase bucket present on exactly one side of the A/B
@@ -949,24 +980,23 @@ fn push_phase_deltas(
                     // (None, Some) arms below, never a synthetic
                     // delta against an absent value.
                     //
-                    // `is_regression` honors the same dual-gate
+                    // The `PhaseVerdict` honors the same dual-gate
                     // the scalar pass applies inside its
                     // per-metric loop (search for `default_abs <`
                     // in `compare_rows_by` above): a row whose
                     // `|delta| < default_abs` OR whose
                     // `rel_delta < policy.rel_threshold` is
-                    // classified `is_regression = false` even
-                    // when the direction matches `polarity`.
-                    // This mirrors the scalar `unchanged`
-                    // semantic so a sub-threshold per-phase
-                    // delta (e.g. `+0.1 ms` on a 10-ms-default
-                    // gate) does not produce a false-positive
-                    // REGRESSION verdict in the rendered table.
-                    // The row is still emitted into
-                    // `phase_deltas` so programmatic consumers
-                    // of `CompareReport.phase_deltas` see every
-                    // paired comparison; the filter is on the
-                    // classification only.
+                    // classified `Stable` even when the direction
+                    // matches `polarity`. This mirrors the scalar
+                    // `unchanged` semantic so a sub-threshold
+                    // per-phase delta (e.g. `+0.1 ms` on a
+                    // 10-ms-default gate) does not produce a
+                    // false-positive REGRESSION verdict in the
+                    // rendered table. The row is still emitted into
+                    // `phase_deltas` so programmatic consumers of
+                    // `CompareReport.phase_deltas` see every paired
+                    // comparison; the classification, not the
+                    // presence of a row, carries the verdict.
                     // Iterate the UNION of metric names across both matched
                     // buckets (PhaseBucket.metrics is a BTreeMap, so the union
                     // is deterministically ordered). A metric present in only
@@ -994,29 +1024,6 @@ fn push_phase_deltas(
                         };
                         match (pa.metrics.get(metric_name), pb.metrics.get(metric_name)) {
                             (Some(&val_a), Some(&val_b)) => {
-                                // Informational metrics carry no regression
-                                // direction, so they have no place in the
-                                // per-phase delta table — which classifies via
-                                // `is_regression: bool` (the run-level scalar
-                                // [`Finding`] carries the 3-way [`FindingKind`]).
-                                // The IRQ/softirq schedstat counters
-                                // (`total_hardirqs`, `total_softirq_*`,
-                                // `total_*_time_ns`, `total_steal_time_ns`) ARE
-                                // Informational AND phase-bucketed (they have
-                                // `read_sample` arms and land in
-                                // `PhaseBucket.metrics`), so this skip DOES fire
-                                // for them in production, dropping them from the
-                                // per-phase delta table — a bool verdict cannot
-                                // represent a directionless metric. The noise
-                                // per-phase path shows them as Informational rows;
-                                // surfacing them in this scalar view too is a
-                                // follow-up. (A ONE-sided Informational metric
-                                // still surfaces as a PhaseCoverageDiff below — a
-                                // coverage diff is never a verdict, so polarity is
-                                // irrelevant there.)
-                                if metric_def.classify_direction().is_none() {
-                                    continue;
-                                }
                                 let delta = val_b - val_a;
                                 let rel_thresh =
                                     policy.rel_threshold(metric_def.name, metric_def.default_rel);
@@ -1038,12 +1045,36 @@ fn push_phase_deltas(
                                 };
                                 let below_dual_gate =
                                     delta.abs() < metric_def.default_abs || rel_delta < rel_thresh;
-                                let is_regression = if below_dual_gate {
-                                    false
-                                } else if metric_def.higher_is_worse() {
-                                    delta > 0.0
+                                // Below the gate -> Stable (this table shows every
+                                // paired metric, so a sub-threshold delta is a
+                                // labeled `stable` row, not a phantom improvement).
+                                // Past the gate, a directionless metric (the
+                                // IRQ/softirq schedstat counters:
+                                // `total_hardirqs`, `total_softirq_*`,
+                                // `total_*_time_ns`, `total_steal_time_ns` — all
+                                // Informational AND phase-bucketed) is shown as
+                                // `Informational`, never a regression/improvement;
+                                // a directional metric splits on its polarity.
+                                // Mirrors the run-level `push_scalar_findings`
+                                // classify and the noise per-phase `classify_noise`.
+                                let verdict = if below_dual_gate {
+                                    PhaseVerdict::Stable
                                 } else {
-                                    delta < 0.0
+                                    match metric_def.classify_direction() {
+                                        None => PhaseVerdict::Informational,
+                                        Some(higher_is_worse) => {
+                                            let is_regression = if higher_is_worse {
+                                                delta > 0.0
+                                            } else {
+                                                delta < 0.0
+                                            };
+                                            if is_regression {
+                                                PhaseVerdict::Regression
+                                            } else {
+                                                PhaseVerdict::Improvement
+                                            }
+                                        }
+                                    }
                                 };
                                 report.phase_deltas.push(PhaseDeltaRow {
                                     pairing_key: key_b.clone(),
@@ -1053,7 +1084,7 @@ fn push_phase_deltas(
                                     a: val_a,
                                     b: val_b,
                                     delta,
-                                    is_regression,
+                                    verdict,
                                 });
                             }
                             (Some(&value), None) => {
@@ -2942,7 +2973,10 @@ pub(crate) fn format_phase_block_lines(
         // into their sorted Vecs below — the footer hint reads all three
         // after the table rendering consumes them.
         let filtered_delta_total = filtered_deltas.len();
-        let filtered_delta_regressions = filtered_deltas.iter().filter(|d| d.is_regression).count();
+        let filtered_delta_regressions = filtered_deltas
+            .iter()
+            .filter(|d| d.verdict == PhaseVerdict::Regression)
+            .count();
         let filtered_coverage_total = filtered_phase_coverage.len();
         let filtered_unpaired_total = filtered_unpaired.len();
         if !filtered_deltas.is_empty()
@@ -2971,10 +3005,11 @@ pub(crate) fn format_phase_block_lines(
                         .then_with(|| a.metric.name.cmp(b.metric.name))
                 });
                 for d in sorted_deltas {
-                    let (verdict_text, verdict_color) = if d.is_regression {
-                        ("REGRESSION", Color::Red)
-                    } else {
-                        ("improvement", Color::Green)
+                    let (verdict_text, verdict_color) = match d.verdict {
+                        PhaseVerdict::Regression => ("REGRESSION", Color::Red),
+                        PhaseVerdict::Improvement => ("improvement", Color::Green),
+                        PhaseVerdict::Stable => ("stable", Color::Grey),
+                        PhaseVerdict::Informational => ("informational", Color::Blue),
                     };
                     let test_label = d.pairing_key.0.join("/");
                     let phase_cell = format!("{}: {}", d.step_index, d.label);

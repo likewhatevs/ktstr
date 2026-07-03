@@ -1452,11 +1452,11 @@ pub(crate) enum StatsCommand {
         /// `0` shows every paired row; positive values widen
         /// the gate to suppress small deltas. ABSENCE shows
         /// every paired row — the registry's per-metric
-        /// `default_rel` already governs the `is_regression`
-        /// flag at the data layer (sub-threshold rows render
-        /// without the red REGRESSION verdict), so the renderer
-        /// defaults to "show everything; the verdict column
-        /// surfaces what matters." Pass an explicit
+        /// `default_rel` already governs the per-phase verdict
+        /// at the data layer (sub-threshold rows render as
+        /// `stable`, not the red REGRESSION verdict), so the
+        /// renderer defaults to "show everything; the verdict
+        /// column surfaces what matters." Pass an explicit
         /// `--phase-threshold` to additionally hide noise rows.
         /// Independent from `--threshold` — the per-phase and
         /// scalar passes have separate filters so the operator
