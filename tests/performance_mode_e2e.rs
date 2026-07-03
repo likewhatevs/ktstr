@@ -1,5 +1,15 @@
-//! End-to-end demonstration of the per-phase schbench metric path across a
-//! real scheduler detach. Boots with scx-ktstr as the boot scheduler, runs a
+//! End-to-end schbench-under-scx-ktstr tests in performance_mode. Two tests:
+//!
+//! 1. `performance_mode_perphase_metrics_across_detach` — the per-phase metric
+//!    path across a real scheduler detach (below).
+//! 2. `performance_mode_schbench_steady` — a low-variance STEADY benchmark
+//!    (warmup + one settled hold, no detach) built for a meaningful
+//!    `cargo ktstr perf-delta --noise-adjust` A/B across commits: it surfaces
+//!    every metric so a regression in any of them shows up, and avoids the
+//!    detach demo's variance amplifiers (mid-run scheduler swap, p99/p999 tails).
+//!
+//! Test 1: the per-phase schbench metric path across a real scheduler detach.
+//! Boots with scx-ktstr as the boot scheduler, runs a
 //! backdrop schbench workload, holds (scx phase), then Op::DetachScheduler
 //! (kernel falls back to EEVDF) and holds again (EEVDF phase). The per-phase
 //! schbench percentiles are attributed to each phase's PhaseBucket and read
@@ -110,6 +120,73 @@ fn performance_mode_perphase_metrics_across_detach(ctx: &Ctx) -> Result<AssertRe
             vec![Op::detach_scheduler()],
             HoldSpec::fixed(Duration::from_secs(4)),
         ),
+    ];
+
+    execute_scenario(ctx, backdrop, steps)
+}
+
+/// post_vm for the steady bench: the framework-invariant gate only — the steady
+/// phase produced schbench metrics, so a broken run (no workload) fails while
+/// `perf-delta` reads EVERY metric for the A/B. Deliberately does NOT gate on a
+/// throughput/latency target (scx-ktstr is a fixture, not a perf scheduler); the
+/// point is a low-variance workload perf-delta can compare across commits.
+fn assert_schbench_steady_ran(result: &VmResult) -> Result<()> {
+    let steady = Phase::step(1); // step_index 2 = the measured steady phase (post-warmup)
+    anyhow::ensure!(
+        result.phase_metric(steady, "schbench_loop_count").is_some(),
+        "steady phase (Step[1]) produced no schbench_loop_count — the workload did not run"
+    );
+    Ok(())
+}
+
+// duration_s budgets the whole in-scenario window from scenario_start, and
+// run_step clamps each Fixed hold to `(scenario_start + duration_s) - now`.
+// scenario_start is taken BEFORE backdrop setup (cgroup create + schbench worker
+// spawn) and inter-step teardown, which ALSO draw on the budget — so budget
+// generously: warmup(3s) + steady(15s) = 18s of holds plus ~7s of headroom, so
+// the 15s steady window (the low-variance measurement this test exists for) is
+// never silently clamped by setup/teardown on a cold or contended host (a
+// shrunken window would pass the gate but defeat the purpose). watchdog_timeout_s
+// lifts the VM hard deadline above boot + the full scenario. performance_mode is
+// REQUIRED so `perf-delta` (KTSTR_PERF_ONLY) runs this rather than skipping it
+// (see the sibling test).
+#[ktstr_test(
+    scheduler = PERF_SCX,
+    performance_mode = true,
+    llcs = 1,
+    cores = 2,
+    threads = 1,
+    memory_mib = 512,
+    duration_s = 25,
+    watchdog_timeout_s = 35,
+    cleanup_budget_ms = 5000,
+    num_snapshots = 3,
+    post_vm = assert_schbench_steady_ran,
+)]
+fn performance_mode_schbench_steady(ctx: &Ctx) -> Result<AssertResult> {
+    use ktstr::scenario::backdrop::Backdrop;
+    use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_scenario};
+    use ktstr::workload::{SchbenchConfig, WorkType};
+    use std::time::Duration;
+
+    // A steady, low-variance schbench run for a meaningful perf-delta A/B: a
+    // short warmup phase discards the cold-start regime (cache fill, cpufreq/turbo
+    // ramp, page-cache warmup), then one longer measured phase — no mid-run
+    // scheduler detach, so the
+    // metrics reflect a single settled regime instead of a transition. The
+    // backdrop cgroup spans both phases; the steady phase (Step[1]) is the one
+    // perf-delta reads for the comparison.
+    let backdrop = Backdrop::new().push_cgroup(
+        CgroupDef::named("sched_bench")
+            .work_type(WorkType::schbench(SchbenchConfig::default()))
+            .workers(1),
+    );
+
+    let steps = vec![
+        // Step[0]: warmup — discarded cold-start regime.
+        Step::new(vec![], HoldSpec::fixed(Duration::from_secs(3))),
+        // Step[1]: steady measured window.
+        Step::new(vec![], HoldSpec::fixed(Duration::from_secs(15))),
     ];
 
     execute_scenario(ctx, backdrop, steps)
