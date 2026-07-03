@@ -419,6 +419,38 @@ fn send_sys_rdy_retry_reports_port_exists_when_path_resolves() {
     assert!(logs_contain("vcpus=4"), "WARN must include the vcpus value",);
 }
 
+/// Regression pin for the fast-fail retry THROTTLE in
+/// `send_sys_rdy_with_retry`: when the port node exists but every send
+/// fails (host context), the loop must retry at a BOUNDED rate, not
+/// hot-spin the guest init (PID 1) thread. The 100 ms guard-rail sleep
+/// is the sole hot-spin guard on that path — without it the loop
+/// re-enters Stage 1 (fast-path Done, since the node exists) and
+/// re-fails with zero delay. Elapsed wall-clock cannot distinguish
+/// throttle-present from -absent (the deadline gate bounds both to
+/// ~budget), so this pins the ITERATION COUNT: with the ~100 ms throttle
+/// a 400 ms budget yields only a handful of iterations, whereas a
+/// busy-spin would yield thousands.
+#[test]
+fn send_sys_rdy_retry_throttles_fast_fail_does_not_hot_spin() {
+    use std::sync::atomic::Ordering;
+    let tmpfile =
+        tempfile::NamedTempFile::new().expect("create tempfile to stand in for /dev/vport0p1");
+    let budget = std::time::Duration::from_millis(400);
+    let addrs = crate::vmm::wire::KernAddrs::new(0, 0, None);
+    SEND_SYS_RDY_RETRY_ITERS.store(0, Ordering::Relaxed);
+    send_sys_rdy_with_retry(budget, 4, &addrs, tmpfile.path());
+    let iters = SEND_SYS_RDY_RETRY_ITERS.load(Ordering::Relaxed);
+    // ~budget/100ms ≈ 4-5 throttled iterations; allow generous slack for
+    // scheduling jitter. A dropped throttle would spin into the
+    // thousands, so the upper bound is the regression guard.
+    assert!(
+        (2..=12).contains(&iters),
+        "port-exists + always-failing-send must retry at the ~100 ms \
+         throttled rate (≈ budget/100ms iterations), not hot-spin: got \
+         {iters} iterations for a 400 ms budget",
+    );
+}
+
 #[test]
 fn parse_topo_from_cmdline_not_present_on_host() {
     // Host /proc/cmdline won't contain KTSTR_TOPO.

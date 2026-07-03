@@ -199,33 +199,67 @@ pub(crate) fn spawn_wprof_if_configured() -> Option<std::thread::JoinHandle<Opti
     )
 }
 
-/// Poll for the virtio-console bulk port and deliver the
-/// KERN_ADDRS + SYS_RDY frames to the host.
+/// Loop-iteration counter for [`send_sys_rdy_with_retry`], bumped once
+/// per retry iteration. Exists so a test can pin that the fast-fail
+/// retry path THROTTLES (bounded iterations) rather than hot-spinning:
+/// with the guard-rail sleep, a port-exists + always-failing-send run
+/// makes roughly `budget / 100ms` iterations, whereas a regression that
+/// dropped the throttle would make thousands. Mirrors the
+/// observability-counter pattern of
+/// [`crate::vmm::guest_comms::BULK_PORT_WRITE_ATTEMPTS`], including its
+/// `#[cfg(test)]` gating: the counter and its increment compile only
+/// under test, never into the production guest-init binary.
+#[cfg(test)]
+pub(crate) static SEND_SYS_RDY_RETRY_ITERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Wait (event-driven) for the virtio-console bulk port, then deliver
+/// the KERN_ADDRS + SYS_RDY frames to the host.
 ///
 /// The kernel virtio_console driver's multiport handshake
 /// (DEVICE_READY → PORT_ADD → PORT_READY → PORT_OPEN, see
-/// `drivers/char/virtio_console.c`) completes asynchronously.
-/// `/dev/vport0p1` is created by `add_port` when PORT_ADD arrives
-/// (via `device_create` + devtmpfs `wait_for_completion`);
-/// `host_connected` flips true only when PORT_OPEN arrives later in
-/// the same `control_work_handler` batch. So a writev between port
-/// creation and host_connected blocks inside `wait_port_writable`
-/// (see `wait_event_freezable` at `include/linux/wait.h` — no
-/// timeout argument). The loop polls the device-node existence at
-/// 100 ms cadence with a wall-clock deadline so blocking writev
-/// time counts against the budget. The deadline is captured INSIDE
-/// the function so guest-init setup (mounts, kallsyms reads) does
-/// not eat the handshake's budget.
+/// `drivers/char/virtio_console.c`) completes asynchronously in two
+/// stages this function waits on WITHOUT polling:
+///
+/// 1. **Node appearance.** `/dev/vport0p1` is created by `add_port`'s
+///    `device_create` when PORT_ADD arrives. We block on
+///    `kernfs_evented_wait` over an inotify watch of the port's
+///    parent directory (`IN_CREATE` / `IN_MOVED_TO`) so we wake on the
+///    exact devtmpfs create edge, with a 1 s guard-rail cadence
+///    bounding wake latency if the best-effort inotify source misses.
+///    This replaces a former 100 ms existence poll whose stacked sleep
+///    latency on a cold / oversubscribed boot delayed KERN_ADDRS (and
+///    thus the host's BPF-accessor build) well past the workload.
+///
+/// 2. **Host-connected.** `host_connected` flips true only when
+///    PORT_OPEN arrives later. The send path's blocking writev is
+///    itself kernel-evented: it parks in `wait_port_writable` →
+///    `wait_event_freezable(port->waitqueue, !will_write_block)` (no
+///    timeout) until PORT_OPEN's `wake_up_interruptible` fires. So no
+///    poll/sleep is needed for stage 2 — `send_kern_addrs` /
+///    `send_sys_rdy` simply block until writable. (`poll(POLLOUT)` is
+///    NOT usable: `port_fops_poll` reports `EPOLLHUP` while
+///    `!host_connected`, so a POLLOUT wait would busy-return.)
+///
+/// The deadline is captured INSIDE the function so guest-init setup
+/// (mounts, kallsyms reads) does not eat the handshake's budget.
 ///
 /// Both KERN_ADDRS and SYS_RDY are required for the host. KERN_ADDRS
-/// is latched: once a `send_kern_addrs` call returns true the loop
-/// skips it on subsequent iterations. The early-return condition is
-/// `kern_addrs_sent && send_sys_rdy()` — we never exit until BOTH
-/// have been delivered (a successful sys_rdy on the re-opened FD
-/// after a kern_addrs failure must not leave kern_addrs unsent,
-/// because the host's KERN_ADDRS arm is the only virt-KASLR
-/// publisher on aarch64; see `src/vmm/freeze_coord/dispatch.rs`'s
-/// KERN_ADDRS handler).
+/// is latched: once a `send_kern_addrs` call returns true the retry
+/// skips it. The early-return condition is `kern_addrs_sent &&
+/// send_sys_rdy()` — we never exit until BOTH have been delivered (a
+/// successful sys_rdy on a re-opened FD after a kern_addrs failure must
+/// not leave kern_addrs unsent, because the host's KERN_ADDRS arm is
+/// the only virt-KASLR publisher on aarch64; see
+/// `src/vmm/freeze_coord/dispatch.rs`'s KERN_ADDRS handler). A send
+/// that fails re-enters stage 1 — whose fast-path returns immediately
+/// while the node exists — and retries, bounded by the deadline. Most
+/// send failures block first (the writev parks in `wait_port_writable`
+/// until PORT_OPEN), but the open-error and post-connect fast-error
+/// paths (a `try_open` failure, or an ENOMEM / add-outbuf error after
+/// host_connected) return WITHOUT parking, so a bounded throttle guards
+/// the retry against hot-spinning the guest init thread (matching the
+/// sibling `send_sched_swap_notify` / `send_scenario_start` loops).
 ///
 /// Host idempotency for KERN_ADDRS retries (matters when the latch
 /// is reset by a failed write that cleared the cached FD):
@@ -235,12 +269,13 @@ pub(crate) fn spawn_wprof_if_configured() -> Option<std::thread::JoinHandle<Opti
 /// `KernAddrs::new`), so repeated stores and a CAS-success-then-
 /// no-op-on-equal-existing both produce the same final state.
 ///
-/// On budget exhaustion the function emits a structured WARN with
-/// fields `budget_ms`, `vcpus`, `elapsed_ms` (loop wall time),
-/// `port_exists` (sampled once before WARN), and `kern_addrs_sent`.
-/// The guest then continues — the host monitor's `data_valid` gate
-/// keeps reads safe without SYS_RDY, and the freeze coordinator's
-/// `Option::take` makes a late SYS_RDY harmless (fire-once). See
+/// On budget exhaustion (or a kernel with no evented source available
+/// for stage 1) the function emits a structured WARN with fields
+/// `budget_ms`, `vcpus`, `elapsed_ms` (loop wall time), `port_exists`
+/// (sampled once before WARN), and `kern_addrs_sent`. The guest then
+/// continues — the host monitor's `data_valid` gate keeps reads safe
+/// without SYS_RDY, and the freeze coordinator's `Option::take` makes a
+/// late SYS_RDY harmless (fire-once). See
 /// `doc/guide/src/troubleshooting.md#send_sys_rdy-timeout` for the
 /// operator-facing diagnosis flow.
 pub(crate) fn send_sys_rdy_with_retry(
@@ -249,36 +284,87 @@ pub(crate) fn send_sys_rdy_with_retry(
     kern_addrs: &crate::vmm::wire::KernAddrs,
     port_path: &std::path::Path,
 ) {
+    use crate::vmm::freeze_coord::evented_wait::{KernfsWaitOutcome, kernfs_evented_wait};
+    use nix::sys::inotify::AddWatchFlags;
+
     let loop_t0 = std::time::Instant::now();
     let deadline = loop_t0 + budget;
+    // Guard-rail cadence bounding wake latency ONLY if the best-effort
+    // inotify source misses the device-create edge; the real wake is
+    // the inotify event. Not a poll — see `kernfs_evented_wait`.
+    let cadence = std::time::Duration::from_secs(1);
+    // The port node lives directly under /dev; watch that directory for
+    // its creation. `/dev` is the parent of `/dev/vport0p1`.
+    let watch_dir = port_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("/dev"));
+
+    // Structured WARN shared by the timeout and no-evented-source exits.
+    // Snapshots `port_exists` so the field reports the last-attempt
+    // state, not a fresh stat that could observe the port appearing in
+    // the gap between the final wait and the WARN call.
+    let warn_timeout = |kern_addrs_sent: bool| {
+        let port_exists_snapshot = port_path.exists();
+        tracing::warn!(
+            budget_ms = budget.as_millis() as u64,
+            vcpus,
+            elapsed_ms = loop_t0.elapsed().as_millis() as u64,
+            port_exists = port_exists_snapshot,
+            kern_addrs_sent,
+            "ktstr-init: send_sys_rdy failed within boot budget; \
+             see https://ktstr.dev/guide/troubleshooting.html#send_sys_rdy-timeout",
+        );
+    };
+
     let mut kern_addrs_sent = false;
     loop {
-        if port_path.exists() {
-            if !kern_addrs_sent {
-                kern_addrs_sent = crate::vmm::guest_comms::send_kern_addrs(kern_addrs);
+        #[cfg(test)]
+        SEND_SYS_RDY_RETRY_ITERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Stage 1: block (evented) until `/dev/vport0p1` appears. On a
+        // send-failure retry the node already exists, so the fast-path
+        // predicate returns immediately.
+        match kernfs_evented_wait(
+            watch_dir,
+            AddWatchFlags::IN_CREATE | AddWatchFlags::IN_MOVED_TO,
+            None::<&std::path::Path>,
+            cadence,
+            deadline,
+            || port_path.exists().then_some(()),
+        ) {
+            KernfsWaitOutcome::Done(()) => {
+                // Stage 2: the sends' blocking writev parks on the port
+                // waitqueue until PORT_OPEN (host_connected) — kernel-
+                // evented, no poll/sleep needed here.
+                if !kern_addrs_sent {
+                    kern_addrs_sent = crate::vmm::guest_comms::send_kern_addrs(kern_addrs);
+                }
+                if kern_addrs_sent && crate::vmm::guest_comms::send_sys_rdy() {
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    warn_timeout(kern_addrs_sent);
+                    return;
+                }
+                // The send failed and reset the cached FD. Most send
+                // failures block first (the writev parks in
+                // wait_port_writable until PORT_OPEN), but the
+                // open-error and post-connect fast-error paths (a
+                // try_open failure, or an ENOMEM / add-outbuf error
+                // after host_connected) return WITHOUT parking. Throttle
+                // before retrying so a persistent fast-fail cannot
+                // hot-spin the guest init thread — a bounded guard-rail
+                // capped by the remaining budget, matching the sibling
+                // bulk-port retry loops (send_sched_swap_notify /
+                // send_scenario_start). Stage 1's node-appearance wait
+                // stays fully evented.
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                std::thread::sleep(std::time::Duration::from_millis(100).min(remaining));
             }
-            if kern_addrs_sent && crate::vmm::guest_comms::send_sys_rdy() {
+            KernfsWaitOutcome::Timeout | KernfsWaitOutcome::NoEventedSource => {
+                warn_timeout(kern_addrs_sent);
                 return;
             }
         }
-        if std::time::Instant::now() >= deadline {
-            // Snapshot before WARN so the field reports the
-            // last-attempt state, not a fresh stat that could
-            // observe a port appearing in the gap between the
-            // final loop iteration and the WARN call.
-            let port_exists_snapshot = port_path.exists();
-            tracing::warn!(
-                budget_ms = budget.as_millis() as u64,
-                vcpus,
-                elapsed_ms = loop_t0.elapsed().as_millis() as u64,
-                port_exists = port_exists_snapshot,
-                kern_addrs_sent,
-                "ktstr-init: send_sys_rdy failed within boot budget; \
-                 see https://ktstr.dev/guide/troubleshooting.html#send_sys_rdy-timeout",
-            );
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 

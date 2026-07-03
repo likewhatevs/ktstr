@@ -727,8 +727,10 @@ pub fn send_sys_rdy() -> bool {
 /// Send the typed [`crate::vmm::wire::KernAddrs`] payload to the
 /// host so the monitor can translate kernel virtual addresses
 /// without walking guest page tables. Called from
-/// `vmm::rust_init::send_sys_rdy_with_retry` on the first
-/// port-exists tick, before each [`send_sys_rdy`] attempt.
+/// `vmm::rust_init::send_sys_rdy_with_retry` once the console bulk
+/// port is ready (its evented node-appearance wait fires), and
+/// LATCHED: once this succeeds the retry loop skips it while it keeps
+/// attempting [`send_sys_rdy`].
 ///
 /// The wire layout, the per-field encoding (including the +1
 /// bias on present-bit slots), and the host-side decode contract
