@@ -90,33 +90,151 @@ fn main() {
     // main.bpf.c here would be a duplicate.
 }
 
-/// Populate `dest` (typically `$OUT_DIR/scx-lib`) with the subset of
-/// scx upstream sources `SCX_FETCH_FILES` enumerates. Returns when
-/// every file in the list exists at its destination path.
-///
-/// Strategy mirrors the busybox fetch in `../build.rs`:
-///   1. cache hit -> no work
-///   2. download GitHub archive tarball, extract just the listed
-///      files into a stage directory, then promote with one rename
-///   3. fall back to a shallow `gix` clone of the tag if the
-///      tarball download or extraction fails
-///   4. panic with an actionable message if both paths fail
-///
-/// Partial state from a prior failed run is removed before each
-/// fallback so a half-extracted tree cannot satisfy the cache check
-/// on the next attempt.
+/// Populate `dest` (`$OUT_DIR/scx-lib`) with the `SCX_FETCH_FILES` subset of scx
+/// upstream sources. Fetches ONCE per cache home into a persistent, tag-keyed
+/// shared cache ([`scx_lib_cache_dir`]) and copies the small source set into
+/// this build's `dest`. Without the shared cache the first-build fetch reran for
+/// EVERY target / git-worktree `OUT_DIR` — slow, and behind a constrained
+/// network a repeated failure (perf-delta's ephemeral baseline worktree hit
+/// this every run). Falls back to fetching straight into `dest` when no cache
+/// home is resolvable.
 fn fetch_scx_lib(dest: &Path) {
     if scx_lib_complete(dest) {
         return;
     }
+    match scx_lib_cache_dir() {
+        Some(shared) => {
+            populate_shared_scx_lib(&shared);
+            copy_scx_lib(&shared, dest);
+        }
+        None => {
+            // No cache home (neither XDG_CACHE_HOME absolute nor HOME set): fetch
+            // straight into this build's OUT_DIR. Unlike the shared-cache path
+            // this recurs per target / worktree, so the message says so.
+            println!(
+                "cargo:warning=fetching scx {SCX_TAG} sources for sdt_alloc \
+                 (no cache home; fetched per build)..."
+            );
+            fetch_scx_lib_into(dest, dest);
+        }
+    }
+}
 
+/// Persistent, tag-keyed shared-cache dir for the fetched scx sources, or `None`
+/// when no cache home is resolvable (then the caller fetches straight into
+/// `OUT_DIR`). Keyed by `SCX_TAG` so a tag bump uses a fresh dir (the old one
+/// lingers harmlessly) — which also means the dir is only ever absent or
+/// complete, never a stale partial to race on.
+fn scx_lib_cache_dir() -> Option<PathBuf> {
+    // Both the XDG branch and the HOME fallback must be absolute: a relative
+    // cache root would land the shared cache under build.rs's cwd (the crate
+    // dir) — per-worktree, defeating the cross-worktree sharing — so a relative
+    // value falls through to `None` (per-build OUT_DIR fetch). The first filter
+    // lets a relative XDG_CACHE_HOME still fall back to HOME; the second rejects
+    // a relative HOME.
+    let root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .filter(|p| p.is_absolute())?;
+    Some(root.join("ktstr").join("scx-lib").join(SCX_TAG))
+}
+
+/// RAII cleanup for the pid-isolated fetch work dir: removes it on drop,
+/// including the panic-unwind path a terminal fetch failure takes — so a failed
+/// build does not leak partial download/clone state under the shared cache.
+struct WorkDirGuard(PathBuf);
+
+impl Drop for WorkDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Ensure the shared cache holds the scx sources, fetching once if absent.
+/// Lock-free + concurrency-safe: fetch into a pid-isolated work dir, then
+/// atomically publish via one rename to `shared` (rename-wins — a build that
+/// loses the race discards its copy and uses the winner's tree). The tag-keyed
+/// `shared` is only ever absent or complete, so the rename target does not exist
+/// unless another build already published a complete tree.
+fn populate_shared_scx_lib(shared: &Path) {
+    if scx_lib_complete(shared) {
+        return;
+    }
+    let cache_parent = shared.parent().expect("scx-lib cache dir has a parent");
+    std::fs::create_dir_all(cache_parent).expect("create scx-lib cache dir");
+    // Pid-isolated work dir so concurrent builds' internal stage dirs (created
+    // by the fetch fns relative to their dest's parent) never collide, and so a
+    // same-filesystem rename can atomically publish the finished tree.
+    let work = cache_parent.join(format!(".work-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).expect("create scx-lib work dir");
+    // Cleaned on drop — including the panic-unwind path fetch_scx_lib_into takes
+    // on a terminal fetch failure, so a failed build leaks no work dir.
+    let _work_guard = WorkDirGuard(work.clone());
+    let staged = work.join("scx-lib");
     println!(
         "cargo:warning=fetching scx {SCX_TAG} sources for sdt_alloc \
-         (first build only)..."
+         (first build for this cache home)..."
     );
+    // Point the manual-placement hint at the persistent shared dir, not the
+    // ephemeral work dir.
+    fetch_scx_lib_into(&staged, shared);
+    match std::fs::rename(&staged, shared) {
+        Ok(()) => {}
+        // Lost the publish race: another build already put a complete tree here.
+        Err(_) if scx_lib_complete(shared) => {}
+        Err(e) => panic!("publish scx-lib cache to {}: {e}", shared.display()),
+    }
+    // `_work_guard` removes `work` on drop (here and on any earlier panic).
+}
 
+/// Copy `SCX_FETCH_FILES` from the shared cache into this build's `dest`
+/// (`$OUT_DIR/scx-lib`) and stamp the tag sentinel, so `scx_lib_complete(dest)`
+/// holds and the BPF compile finds the sources at their expected `OUT_DIR`
+/// paths.
+fn copy_scx_lib(shared: &Path, dest: &Path) {
     if dest.exists() {
         std::fs::remove_dir_all(dest).expect("remove stale OUT_DIR/scx-lib");
+    }
+    for rel in SCX_FETCH_FILES {
+        let src = shared.join(rel);
+        let dst = dest.join(rel);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|e| panic!("mkdir {}: {e}", parent.display()));
+        }
+        std::fs::copy(&src, &dst)
+            .unwrap_or_else(|e| panic!("copy {} -> {}: {e}", src.display(), dst.display()));
+    }
+    stamp_scx_tag(dest).expect("stamp scx-lib tag sentinel in OUT_DIR");
+}
+
+/// Fetch the `SCX_FETCH_FILES` subset directly into `dest`, tarball-then-clone.
+/// `hint_dir` is the path named in the terminal-failure manual-placement hint
+/// (the persistent shared cache when fetching for it, else `dest`).
+///
+/// Strategy:
+///   1. cache hit -> no work
+///   2. download GitHub archive tarball, extract just the listed files into a
+///      stage directory, then promote with one rename
+///   3. fall back to a shallow `gix` clone of the tag if the tarball download or
+///      extraction fails
+///   4. panic with an actionable message if both paths fail
+///
+/// Partial state from a prior failed run is removed before each fallback so a
+/// half-extracted tree cannot satisfy the cache check on the next attempt.
+fn fetch_scx_lib_into(dest: &Path, hint_dir: &Path) {
+    if scx_lib_complete(dest) {
+        return;
+    }
+
+    // The "fetching..." cargo:warning is emitted by the CALLERS, whose context
+    // knows whether this is the once-per-cache-home shared-cache fetch or the
+    // per-build OUT_DIR fallback — so the frequency claim is accurate.
+
+    if dest.exists() {
+        std::fs::remove_dir_all(dest).expect("remove stale scx-lib");
     }
 
     let tarball_url =
@@ -136,7 +254,7 @@ fn fetch_scx_lib(dest: &Path) {
         println!("cargo:warning=tarball fetch failed, trying git clone...");
 
         if dest.exists() {
-            std::fs::remove_dir_all(dest).expect("remove partial OUT_DIR/scx-lib before clone");
+            std::fs::remove_dir_all(dest).expect("remove partial scx-lib before clone");
         }
 
         let clone_err = fetch_via_clone(dest).err();
@@ -149,7 +267,7 @@ fn fetch_scx_lib(dest: &Path) {
             // to the operator's terminal, and is needed for diagnosis.
             // Workarounds line below covers the two non-network paths
             // that a constrained operator can take to unblock the build.
-            let scx_lib_dir = dest.display();
+            let scx_lib_dir = hint_dir.display();
             panic!(
                 "failed to obtain scx {SCX_TAG} sources for sdt_alloc.\n\
                  tarball ({tarball_url}): {tarball_err}\n\
@@ -158,7 +276,8 @@ fn fetch_scx_lib(dest: &Path) {
                  Workarounds:\n\
                    • If behind a proxy, ensure HTTP_PROXY/HTTPS_PROXY environment\n\
                      variables are set (e.g., export HTTPS_PROXY=http://proxy:8080).\n\
-                   • Or manually place files at {scx_lib_dir}/lib/{{sdt_alloc.bpf.c, sdt_task.bpf.c, scxtest/scx_test.h}}."
+                   • Or manually place files at {scx_lib_dir}/lib/{{sdt_alloc.bpf.c, sdt_task.bpf.c, scxtest/scx_test.h}},\n\
+                     then mark the tree complete: printf %s {SCX_TAG} > {scx_lib_dir}/{SCX_TAG_SENTINEL}"
             );
         }
     }
@@ -185,11 +304,12 @@ fn scx_lib_complete(dest: &Path) -> bool {
 }
 
 /// Stamp the `SCX_TAG_SENTINEL` file inside `dest` with the current
-/// `SCX_TAG`. Called by both fetch paths after a successful staged
-/// rename, before the function returns `Ok`. Stamping after the
-/// rename means a partially-written sentinel cannot satisfy
-/// `scx_lib_complete` on the next run — if `write` fails the cache
-/// stays incomplete and the next build re-fetches.
+/// `SCX_TAG`. Called last by each populate path — both fetch paths after
+/// their staged rename, and `copy_scx_lib` after copying the source set into
+/// `OUT_DIR` — so it always runs after `dest` is fully populated. Stamping
+/// last means a partially-written tree cannot satisfy `scx_lib_complete` on
+/// the next run: a copy/rename/write failure leaves the cache incomplete and
+/// the next build re-populates.
 fn stamp_scx_tag(dest: &Path) -> Result<(), String> {
     std::fs::write(dest.join(SCX_TAG_SENTINEL), SCX_TAG)
         .map_err(|e| format!("write {SCX_TAG_SENTINEL}: {e}"))
