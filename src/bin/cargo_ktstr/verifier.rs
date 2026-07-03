@@ -77,6 +77,7 @@ pub(crate) fn run_verifier(
     profile: Option<String>,
     nextest_profile: Option<String>,
     scheduler: Option<String>,
+    include_eol: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
     let mut cmd = Command::new("cargo");
@@ -121,7 +122,7 @@ pub(crate) fn run_verifier(
     // entry with a path-basename label. The test-binary cell
     // handler keys on this list as its single source of truth.
     let resolved: Vec<(String, PathBuf)> = if !kernel.is_empty() {
-        let r = resolve_kernel_set(&kernel)?;
+        let r = resolve_kernel_set(&kernel, include_eol)?;
         if r.is_empty() {
             return Err(
                 "--kernel: every supplied value parsed to empty / whitespace; \

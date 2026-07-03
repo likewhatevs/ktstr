@@ -42,6 +42,25 @@ The endpoints themselves do NOT need to appear in `releases.json` —
 `6.10..6.16` brackets the surviving releases even if `6.10` and
 `6.16` have aged out.
 
+Both endpoints are series-inclusive: a 2-component `MAJOR.MINOR`
+endpoint names the whole series, so `6.11..6.14` covers every `6.14.N`
+point release (not just `6.14.0`). Spell an endpoint with an explicit
+patch (`6.14.2`) to make it an exact bound — `6.11..6.14.2` stops at
+`6.14.2`.
+
+By default the expansion sees only series still listed in
+`releases.json`, so a series that has reached end-of-life is
+silently absent — `6.11..6.14` collapses to just the 6.11 series if
+6.12 and 6.13 are EOL. Pass `--include-eol` to additionally enumerate
+EOL series from the gregkh linux-stable mirror's tags: the range then
+contributes the highest point release of every `stable` series inside
+`[START, END]`, maintained or not. If the mirror tag list cannot be
+fetched, expansion falls back to the active-release set with a
+warning. `--include-eol` is accepted on every command that expands a
+range (`test`, `coverage`, `llvm-cov`, `verifier`,
+`kernel list --range`, and `kernel build`); it has no effect on a
+single version, path, cache key, or git source.
+
 Git sources (`git+URL#tag=NAME`, `#branch=NAME`, or `#sha=<40-hex>`)
 are fetched at the given ref (GitHub via a codeload snapshot, other
 hosts via a shallow clone), built, and cached. A repeat invocation against an
@@ -127,6 +146,7 @@ identical work for no signal.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--kernel ID` (repeatable) | auto | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#tag=NAME`). Repeatable; a multi-kernel set fans the gauntlet across kernels. |
+| `--include-eol` | off | When a `--kernel START..END` range is present, also enumerate EOL `stable` series from the gregkh linux-stable mirror's tags, not just the active series in `releases.json`. Each in-range EOL series contributes its highest point release. No effect on a single kernel, path, cache key, or git source. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 | `--no-skip-mode` | off | Convert resource-contention and host-topology-insufficient skips into hard test failures (exit `1` instead of `0`). Default behavior skips so a contended runner does not fail tests that simply could not start; setting this flag opts into "if the test cannot run, the test fails". Exports `KTSTR_NO_SKIP_MODE=1` for the test binary. |
 | `--release` | off | Build and run tests with the release profile (`--cargo-profile release` to nextest). Release mode applies **stricter assertion thresholds** (`gap_threshold_ms` 2000 vs debug's 3000, `spread_threshold_pct` 15% vs debug's 35%) — tests that barely pass in debug may fail under `--release`. `catch_unwind`-based tests and tests gated on `#[cfg(debug_assertions)]` are skipped. |
@@ -345,6 +365,7 @@ cargo ktstr coverage -- --workspace --lcov --output-path lcov.info # lcov output
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--kernel ID` (repeatable) | auto | Same shapes and multi-kernel semantics as `cargo ktstr test --kernel`: each (test × kernel) variant runs as its own nextest subprocess so cargo-llvm-cov merges every variant's profraw automatically. |
+| `--include-eol` | off | Same as `cargo ktstr test --include-eol`: when a `--kernel START..END` range is present, also expand EOL `stable` series from the gregkh linux-stable mirror. No effect on a single kernel. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 | `--no-skip-mode` | off | Convert resource-contention and host-topology-insufficient skips into hard test failures. Same semantics as on `test`; exports `KTSTR_NO_SKIP_MODE=1` for the test binary. |
 | `--release` | off | Collect coverage with the release profile (`--cargo-profile release` to llvm-cov nextest). Same stricter-threshold caveats as `test --release` — release mode applies `gap_threshold_ms=2000` / `spread_threshold_pct=15%`, and skips `catch_unwind`-based tests along with `#[cfg(debug_assertions)]`-gated tests. |
@@ -450,6 +471,7 @@ cargo ktstr llvm-cov --kernel ../linux report                  # pin kernel + pa
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--kernel ID` (repeatable) | auto | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#tag=NAME`). Same multi-kernel semantics as `cargo ktstr test --kernel`. |
+| `--include-eol` | off | Same as `cargo ktstr test --include-eol`: when a `--kernel START..END` range is present, also expand EOL `stable` series from the gregkh linux-stable mirror. No effect on a single kernel. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 | `--no-skip-mode` | off | Convert resource-contention and host-topology-insufficient skips into hard test failures. Same semantics as on `test`; exports `KTSTR_NO_SKIP_MODE=1` for the test binary. |
 
@@ -501,6 +523,7 @@ parsed start / end, and the expanded `versions` array.
 |------|-------------|
 | `--json` | Output in JSON format. Each entry includes a boolean `eol` field (computed at list time by fetching kernel.org's `releases.json`) alongside the cached metadata. With `--range`, emits a single object `{range, start, end, versions}` instead. |
 | `--range START..END` | Switch to range-preview mode. Format: `MAJOR.MINOR[.PATCH][-rcN]..MAJOR.MINOR[.PATCH][-rcN]`. Performs the single `releases.json` fetch a real range resolve does, expands inclusively, and prints the version list — no downloads, no builds, no cache lookups. |
+| `--include-eol` | With `--range`, also enumerate EOL `stable` series from the gregkh linux-stable mirror's tags so the preview lists series that have aged out of `releases.json`. Ignored in the default cache-listing mode. |
 
 ### kernel build
 
@@ -540,6 +563,7 @@ find the latest available tarball. Skips building when a cached entry already ex
 | `--cpu-cap N` | Reserve exactly N host CPUs for the build (integer ≥ 1; must be ≤ the calling process's `sched_getaffinity` cpuset size). When absent, 30% of the allowed CPUs are reserved (minimum 1). The planner walks whole LLCs in consolidation- and NUMA-aware order, partial-taking the last LLC so `plan.cpus.len() == N` exactly. Under `--cpu-cap`, `make -jN` parallelism matches the reserved CPU count and the build runs inside a cgroup v2 sandbox that pins gcc/ld to the reserved CPUs + NUMA nodes. Mutually exclusive with `KTSTR_BYPASS_LLC_LOCKS=1`. Also settable via `KTSTR_CPU_CAP` env var (CLI flag wins when both are present). |
 | `--extra-kconfig PATH` | Additional kconfig fragment merged on top of the baked-in `ktstr.kconfig` (user values win on conflict). Lands in a distinct cache slot keyed by the extra fragment's hash, so it never collides with a baked-only build. |
 | `--skip-sha256` | Skip SHA-256 verification of a downloaded stable tarball (emits a bypass warning). No effect on `--source`/`--git` builds, which download no tarball. |
+| `--include-eol` | When `VERSION` is a `START..END` range, also enumerate EOL `stable` series from the gregkh linux-stable mirror so the range builds series that have aged out of `releases.json`. No effect on a single version, `--source`, or `--git`. |
 
 ### kernel clean
 
@@ -620,6 +644,7 @@ for the rendering details.
 |------|-------------|
 | `--kernel ID` (repeatable) | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#tag=NAME`). Raw image files (`bzImage`/`Image`) are NOT accepted — the verifier needs the cached `vmlinux` and kconfig fragment alongside the image. Source directories auto-build; version strings auto-download on cache miss. When absent, resolves via cache then filesystem, falling back to auto-download. Raw images are accepted only on `cargo ktstr shell`. |
 | `--raw` | Print raw verifier output without cycle collapse. |
+| `--include-eol` | When a `--kernel START..END` range is present, also expand EOL `stable` series from the gregkh linux-stable mirror. No effect on a single kernel. |
 | `--scheduler NAME` | Restrict the sweep to a single declared scheduler (its `declare_scheduler!` `name`) across topologies. Omitted, every declared scheduler is swept. A name matching no declared BPF scheduler fails loud with an empty result set. Sets `KTSTR_VERIFIER_SCHEDULER` for the inner `cargo nextest run`. |
 | `--profile NAME` | Cargo BUILD profile for the scheduler-under-test (see `cargo ktstr test --profile`). Omitted, the scheduler builds `release`. Sets `KTSTR_SCHEDULER_PROFILE` for the inner `cargo nextest run`. |
 | `--nextest-profile NAME` | Nextest TEST profile forwarded to the inner `cargo nextest run` as `--profile <NAME>` (see `cargo ktstr test --nextest-profile`). |

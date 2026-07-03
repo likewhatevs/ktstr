@@ -115,6 +115,15 @@ pub fn shared_client() -> &'static Client {
 /// and skips the network entirely.
 static RELEASES_CACHE: OnceLock<Vec<Release>> = OnceLock::new();
 
+/// Cache for the gregkh stable-mirror release tags — the `X.Y.Z`
+/// version strings parsed from its `refs/tags/vX.Y.Z` advertisement.
+/// Companion to [`RELEASES_CACHE`]: `--include-eol` may expand several
+/// `A..B` ranges under one `resolve_kernel_set`, and each would
+/// otherwise re-ls-remote the mirror. Populated on the first successful
+/// enumeration; a failed ls-remote leaves it empty so the next caller
+/// retries (`Vec`, not `Result`, mirroring `RELEASES_CACHE`).
+static STABLE_TAGS_CACHE: OnceLock<Vec<String>> = OnceLock::new();
+
 /// Fetch `releases.json` via the process-wide [`shared_client`],
 /// routing through [`RELEASES_CACHE`].
 ///
@@ -889,6 +898,15 @@ fn resolve_expected_sha256_from_url(
 /// source the pruned tarball would have provided. Used by
 /// [`download_tarball`]'s [`TarballNotFound`] fallback.
 const STABLE_TREE_URL: &str = "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git";
+
+/// GitHub mirror of the linux-stable tree — comprehensive (stable +
+/// base-release `vX.Y.Z` tags back to v2.6). Its `ls-refs` advertises
+/// every release tag, which `--include-eol` enumerates to surface EOL
+/// series absent from `releases.json` (see [`cached_stable_tags`]), and
+/// codeload serves any tag as a `tar.gz`, so it also backs the pruned/
+/// EOL version-tarball recovery. github.com advertises allow-sha + a
+/// ref-prefix filter and a codeload CDN; git.kernel.org offers neither.
+const STABLE_MIRROR_URL: &str = "https://github.com/gregkh/linux";
 
 /// Marker error attached to a stable-tarball download failure when
 /// cdn.kernel.org returns HTTP 404.
@@ -1678,6 +1696,41 @@ fn max_tag_patch<'a>(ref_names: impl Iterator<Item = &'a [u8]>, prefix: &str) ->
         }
     }
     best
+}
+
+/// ls-remote the gregkh stable mirror ([`STABLE_MIRROR_URL`]) once and
+/// cache the release version strings (`X.Y.Z`) parsed from its
+/// `refs/tags/vX.Y.Z` advertisement, for `--include-eol` range
+/// expansion. Returns EVERY release-tag version verbatim (including
+/// `-rc*` and old series); the caller
+/// (`crate::cli::select_series_latest_in_range`) does the
+/// range / rc / per-series filtering. `None` on ls-remote failure —
+/// not cached, so the next caller retries. gregkh/linux mirrors
+/// linux-stable comprehensively (tags back to v2.6), so this surfaces
+/// EOL series that `releases.json` has dropped.
+pub(crate) fn cached_stable_tags() -> Option<&'static [String]> {
+    if let Some(tags) = STABLE_TAGS_CACHE.get() {
+        return Some(tags.as_slice());
+    }
+    let refs = ls_remote_refs(STABLE_MIRROR_URL)?;
+    let tags: Vec<String> = refs
+        .iter()
+        .filter_map(|r| {
+            // Base tag name only: gix folds an annotated tag's peeled
+            // entry into one `Ref::Peeled` carrying the base name, and a
+            // lightweight tag is a `Ref::Direct` with the base name, so
+            // `^{}` never appears on real gix output — the strip is a
+            // defensive no-op. Non-`refs/tags/v*` refs are skipped.
+            let name = ref_full_name(r);
+            let v = name.strip_prefix(b"refs/tags/v")?;
+            let v = v.strip_suffix(b"^{}").unwrap_or(v);
+            std::str::from_utf8(v).ok().map(|s| s.to_string())
+        })
+        .collect();
+    // Loser of a concurrent race discards its clone (both fetched the
+    // same advertisement, so the cached content is equivalent).
+    let _ = STABLE_TAGS_CACHE.set(tags);
+    STABLE_TAGS_CACHE.get().map(|v| v.as_slice())
 }
 
 /// Cache key for a git-cloned kernel: the raw user ref verbatim, the

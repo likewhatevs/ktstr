@@ -289,7 +289,13 @@ impl KernelId {
                          `6.10-rc1..=6.10`.",
                     )
                 })?;
-                let end_key = decompose_version_for_compare(end).ok_or_else(|| {
+                // END is series-inclusive: a 2-component `MAJOR.MINOR`
+                // END names the whole series (see `range_end_key`), so
+                // the inversion check must use the SAME widened bound the
+                // expansion does — otherwise a valid same-series range
+                // like `6.14.5..6.14` (= 6.14.5 .. end of the 6.14
+                // series) is falsely rejected as inverted.
+                let end_key = range_end_key(end).ok_or_else(|| {
                     format!(
                         "kernel range end `{end}` is not a parseable version. \
                          Expected `MAJOR.MINOR[.PATCH][-rc<num>]` (e.g. \"6.10\", \
@@ -461,6 +467,29 @@ pub(crate) fn decompose_version_for_compare(s: &str) -> Option<(u64, u64, u64, u
         return None;
     }
     Some((major, minor, patch, rc))
+}
+
+/// The upper-bound comparison key for a range's END endpoint,
+/// series-inclusive: a 2-component `MAJOR.MINOR` (or bare-major) END
+/// with no `-rc` names the WHOLE series, so its patch and rc slots are
+/// widened to `u64::MAX`. [`decompose_version_for_compare`] alone maps a
+/// missing patch to 0, which as an inclusive upper bound would exclude
+/// every `6.14.N` (N >= 1) from an END of `6.14`. An explicit-patch END
+/// (`6.14.2`) or an `-rc` END keeps its exact key. Shared by
+/// [`KernelId::validate`]'s inversion check and the `cli` module's
+/// range expansion (`range_bounds`) so the two agree on where a range
+/// ends. START needs no such widening — its `.0` is the series floor.
+pub(crate) fn range_end_key(end: &str) -> Option<(u64, u64, u64, u64)> {
+    let key = decompose_version_for_compare(end)?;
+    // Same predicate as `crate::fetch::is_major_minor_prefix`, inlined
+    // because this file forbids non-std imports (file-header rule #1):
+    // a 2-component (or bare-major) endpoint with no `-rc` is a whole
+    // series and widens to its ceiling.
+    if end.matches('.').count() < 2 && !end.contains("-rc") {
+        Some((key.0, key.1, u64::MAX, u64::MAX))
+    } else {
+        Some(key)
+    }
 }
 
 /// Expand a leading `~` or `~/...` in `s` against `$HOME` and

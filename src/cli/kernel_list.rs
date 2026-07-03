@@ -291,7 +291,10 @@ pub fn format_entry_row(
 ///   See [`crate::cache::ListedEntry::error_kind`] for the
 ///   classifier contract.
 pub fn kernel_list(json: bool) -> Result<()> {
-    kernel_list_inner(json, None)
+    // `include_eol` is meaningless in cache-listing mode (no range to
+    // expand); pass `false` — `kernel_list_inner` only consults it on
+    // the `range = Some(_)` branch.
+    kernel_list_inner(json, None, false)
 }
 
 /// Range-preview variant of [`kernel_list`].
@@ -309,13 +312,13 @@ pub fn kernel_list(json: bool) -> Result<()> {
 /// `cli::kernel_list_inner(json, Some(R))`. The shared inner
 /// function keeps a single `--json` formatter and a single test
 /// surface.
-pub fn kernel_list_range_preview(json: bool, range: &str) -> Result<()> {
-    kernel_list_inner(json, Some(range))
+pub fn kernel_list_range_preview(json: bool, range: &str, include_eol: bool) -> Result<()> {
+    kernel_list_inner(json, Some(range), include_eol)
 }
 
-fn kernel_list_inner(json: bool, range: Option<&str>) -> Result<()> {
+fn kernel_list_inner(json: bool, range: Option<&str>, include_eol: bool) -> Result<()> {
     if let Some(spec) = range {
-        return run_kernel_list_range(json, spec);
+        return run_kernel_list_range(json, spec, include_eol);
     }
     let cache = CacheDir::new()?;
     let entries = cache.list()?;
@@ -514,7 +517,7 @@ fn kernel_list_inner(json: bool, range: Option<&str>) -> Result<()> {
 ///   (`| awk`, `| grep`) see clean stdout.
 /// - JSON: a single object with the literal range, the parsed
 ///   start / end strings, and the expanded version array.
-fn run_kernel_list_range(json: bool, spec: &str) -> Result<()> {
+fn run_kernel_list_range(json: bool, spec: &str, include_eol: bool) -> Result<()> {
     use crate::kernel_path::KernelId;
 
     let id = KernelId::parse(spec);
@@ -531,7 +534,7 @@ fn run_kernel_list_range(json: bool, spec: &str) -> Result<()> {
     id.validate()
         .map_err(|e| anyhow::anyhow!("kernel list --range {spec}: {e}"))?;
 
-    let versions = expand_kernel_range(&start, &end, "kernel list")?;
+    let versions = expand_kernel_range(&start, &end, "kernel list", include_eol)?;
 
     if json {
         let payload = serde_json::json!({
@@ -888,7 +891,7 @@ mod tests {
     /// kernel_list_range_preview rejects non-Range spec.
     #[test]
     fn kernel_list_range_preview_rejects_non_range_spec() {
-        let err = run_kernel_list_range(false, "6.14.2")
+        let err = run_kernel_list_range(false, "6.14.2", false)
             .expect_err("bare version must not parse as a Range");
         let msg = format!("{err:#}");
         assert!(msg.contains("does not parse as a `START..END` range"));
@@ -898,7 +901,7 @@ mod tests {
     /// kernel_list_range_preview rejects inverted range.
     #[test]
     fn kernel_list_range_preview_rejects_inverted_range() {
-        let err = run_kernel_list_range(false, "6.16..6.12")
+        let err = run_kernel_list_range(false, "6.16..6.12", false)
             .expect_err("inverted range must not be accepted");
         let msg = format!("{err:#}");
         assert!(msg.contains("kernel list --range 6.16..6.12"));

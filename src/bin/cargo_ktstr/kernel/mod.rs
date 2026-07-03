@@ -323,7 +323,10 @@ pub(crate) fn resolve_one(
 /// The downstream [`ktstr::test_support::sanitize_kernel_label`]
 /// applies the `kernel_` prefix and `[a-z0-9_]+` normalisation; this
 /// label is the human-meaningful payload it operates on.
-pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String> {
+pub(crate) fn resolve_kernel_set(
+    specs: &[String],
+    include_eol: bool,
+) -> Result<Vec<(String, PathBuf)>, String> {
     preflight_collision_check(specs)?;
     // One progress group shared across every parallel worker: each
     // download/clone adds its own bar to the group's MultiProgress
@@ -332,7 +335,7 @@ pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBu
     // bars linger into the build/test phase. `?` is applied AFTER the
     // clear so an error path still tidies the terminal.
     let mp = ktstr::cli::FetchProgress::new();
-    let resolved = resolve_specs_parallel(specs, &mp);
+    let resolved = resolve_specs_parallel(specs, &mp, include_eol);
     mp.clear();
     let resolved = dedupe_resolved(resolved?);
     detect_label_collisions(&resolved)?;
@@ -415,6 +418,7 @@ pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBu
 fn resolve_one_spec(
     trimmed: String,
     mp: &ktstr::cli::FetchProgress,
+    include_eol: bool,
 ) -> Vec<Result<(String, PathBuf), String>> {
     use ktstr::kernel_path::KernelId;
 
@@ -427,7 +431,7 @@ fn resolve_one_spec(
     }
     match id {
         KernelId::Range { start, end, .. } => {
-            match ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr") {
+            match ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr", include_eol) {
                 Ok(versions) => resolve_versions_parallel(versions, |ver| {
                     resolve_one_with_progress(KernelId::Version(ver.to_string()), mp)
                         .map_err(|e| format!("resolve kernel {ver}: {e}"))
@@ -519,6 +523,7 @@ fn resolve_one_with_progress(
 fn resolve_specs_parallel(
     specs: &[String],
     mp: &ktstr::cli::FetchProgress,
+    include_eol: bool,
 ) -> Result<Vec<(String, PathBuf)>, String> {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -582,7 +587,7 @@ fn resolve_specs_parallel(
                     Some(trimmed.to_string())
                 }
             })
-            .flat_map_iter(|trimmed| resolve_one_spec(trimmed, mp).into_iter())
+            .flat_map_iter(|trimmed| resolve_one_spec(trimmed, mp, include_eol).into_iter())
             .collect::<Result<Vec<_>, _>>()
     };
     match bounded_pool {
@@ -620,6 +625,7 @@ pub(crate) fn kernel_build(
     cpu_cap: Option<usize>,
     extra_kconfig: Option<PathBuf>,
     skip_sha256: bool,
+    include_eol: bool,
 ) -> Result<(), String> {
     ktstr::cli::check_tools(&["make"]).map_err(|e| format!("{e:#}"))?;
     // Read the extra-kconfig fragment ONCE up front so a range
@@ -652,7 +658,7 @@ pub(crate) fn kernel_build(
         // "swap the endpoints" diagnostic ahead of any download.
         id.validate().map_err(|e| format!("--kernel {id}: {e}"))?;
         if let KernelId::Range { start, end, .. } = id {
-            let versions = ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr")
+            let versions = ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr", include_eol)
                 .map_err(|e| format!("{e:#}"))?;
             let total = versions.len();
             let mut failures: Vec<(String, String)> = Vec::new();
@@ -1205,7 +1211,7 @@ mod tests {
     #[test]
     fn resolve_kernel_set_colliding_specs_fail_at_preflight_before_io() {
         let specs = vec!["6.14.2".to_string(), "6-14-2".to_string()];
-        let err = resolve_kernel_set(&specs)
+        let err = resolve_kernel_set(&specs, false)
             .expect_err("colliding sanitized labels must abort at preflight");
         assert!(
             err.contains("pre-flight check found collision"),
@@ -1228,7 +1234,7 @@ mod tests {
     #[test]
     fn resolve_kernel_set_inverted_range_fails_validation_before_io() {
         let specs = vec!["6.15..6.14".to_string()];
-        let err = resolve_kernel_set(&specs)
+        let err = resolve_kernel_set(&specs, false)
             .expect_err("inverted range must fail validation pre-resolve");
         assert!(
             err.contains("--kernel"),

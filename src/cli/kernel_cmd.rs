@@ -55,6 +55,11 @@ pub enum KernelCommand {
         /// pipelines.
         #[arg(long)]
         range: Option<String>,
+        /// See [`INCLUDE_EOL_HELP`]. Only affects `--range` preview
+        /// expansion; ignored in the default cache-listing mode
+        /// (which reads no releases.json and enumerates no series).
+        #[arg(long, help = INCLUDE_EOL_HELP)]
+        include_eol: bool,
     },
     /// Download, build, and cache a kernel image.
     Build {
@@ -186,6 +191,12 @@ pub enum KernelCommand {
         /// would otherwise appear.
         #[arg(long)]
         skip_sha256: bool,
+        /// See [`INCLUDE_EOL_HELP`]. Only affects a range VERSION
+        /// (e.g. `kernel build 6.11..6.14`); ignored for a single
+        /// version, `--source`, or `--git`, none of which expand a
+        /// range.
+        #[arg(long, help = INCLUDE_EOL_HELP)]
+        include_eol: bool,
     },
     /// Remove cached kernel images.
     Clean {
@@ -262,6 +273,32 @@ pub const KERNEL_HELP_RAW_OK: &str = "Kernel identifier: a source directory \
      falling back to downloading the latest stable kernel. Ranges \
      (`START..END`) and git sources (`git+URL#tag=NAME`) are not supported \
      in this context; pass a single kernel.";
+
+/// Help text for the `--include-eol` flag, shared by every command
+/// that expands a `START..END` kernel range (`cargo ktstr test`,
+/// `coverage`, `llvm-cov`, `verifier`, `kernel list --range`, and
+/// `kernel build VERSION` when VERSION is a range). One const so the
+/// wording stays identical across every surface the flag appears on.
+///
+/// Describes what the code DOES: [`crate::cli::expand_kernel_range`]
+/// draws only from kernel.org's `releases.json` by default (active
+/// `stable`/`longterm` series); under this flag it unions in the
+/// `vX.Y.Z` tags of the gregkh linux-stable mirror
+/// (`crate::fetch::cached_stable_tags`) and takes the latest patch
+/// per `(major, minor)` series across both sources, so a series that
+/// has aged out of `releases.json` still contributes its highest
+/// point release. If the mirror tag list cannot be fetched, expansion
+/// proceeds with a warning against the active-release set alone.
+pub const INCLUDE_EOL_HELP: &str = "Include end-of-life stable series when \
+     expanding a `START..END` kernel range. Default range resolution draws \
+     only from kernel.org's active releases (releases.json), which omits \
+     series no longer maintained; with this flag the range additionally \
+     covers every `vX.Y.Z` tag in the gregkh linux-stable mirror, so an EOL \
+     series inside [START, END] still contributes its highest point release. \
+     Has no effect on a single version, path, cache key, or git source — \
+     only range expansion consults the EOL set. When the mirror tag list \
+     cannot be fetched, expansion proceeds with a warning against the \
+     active-release set alone.";
 
 /// Help text for the `--cpu-cap N` flag. Shared across `ktstr kernel build`,
 /// `cargo ktstr kernel build`, and `ktstr shell` so the operator-facing

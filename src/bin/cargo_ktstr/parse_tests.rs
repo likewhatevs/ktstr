@@ -448,6 +448,7 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             release,
             profile,
             nextest_profile,
+            include_eol,
             args,
         } => {
             assert!(
@@ -473,6 +474,10 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             assert!(
                 nextest_profile.is_none(),
                 "bare `--` passthrough must not spuriously set --nextest-profile",
+            );
+            assert!(
+                !include_eol,
+                "bare `--` passthrough must not spuriously set --include-eol",
             );
             assert_eq!(args, expected);
         }
@@ -483,6 +488,7 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             release,
             profile,
             nextest_profile,
+            include_eol,
             args,
         } => {
             assert!(
@@ -509,12 +515,17 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
                 nextest_profile.is_none(),
                 "bare `--` passthrough must not spuriously set --nextest-profile",
             );
+            assert!(
+                !include_eol,
+                "bare `--` passthrough must not spuriously set --include-eol",
+            );
             assert_eq!(args, expected);
         }
         KtstrCommand::LlvmCov {
             kernel,
             no_perf_mode,
             no_skip_mode,
+            include_eol,
             args,
         } => {
             assert!(
@@ -528,6 +539,10 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             assert!(
                 !no_skip_mode,
                 "bare `--` passthrough must not spuriously set --no-skip-mode",
+            );
+            assert!(
+                !include_eol,
+                "bare `--` passthrough must not spuriously set --include-eol",
             );
             assert_eq!(args, expected);
         }
@@ -655,6 +670,29 @@ fn parse_test_with_nextest_profile_flag() {
     assert!(!release, "`--nextest-profile` alone must NOT set --release");
 }
 
+/// `--include-eol` on `test` round-trips to `KtstrCommand::Test {
+/// include_eol: true, .. }` so `run_cargo_sub` forwards it into
+/// `resolve_kernel_set` → `expand_kernel_range`. Pins the clap
+/// binding for the new flag alongside a range `--kernel`.
+#[test]
+fn parse_test_include_eol_flag() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "test", "--kernel", "6.11..6.14", "--include-eol"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Test {
+        kernel, include_eol, ..
+    } = k.command
+    else {
+        panic!("expected Test");
+    };
+    assert_eq!(kernel, vec!["6.11..6.14".to_string()]);
+    assert!(
+        include_eol,
+        "`--include-eol` must round-trip as true so the range expands EOL series"
+    );
+}
+
 /// Pin `trailing_var_arg` args forwarded verbatim after `--`.
 #[test]
 fn parse_test_with_passthrough_args() {
@@ -716,6 +754,7 @@ fn parse_nextest_alias_with_kernel_and_no_perf_mode() {
         release,
         profile,
         nextest_profile,
+        include_eol,
         args,
     } = k.command
     else {
@@ -733,6 +772,10 @@ fn parse_nextest_alias_with_kernel_and_no_perf_mode() {
         nextest_profile.is_none(),
         "bare invocation must default --nextest-profile to None"
     );
+    assert!(
+        !include_eol,
+        "bare invocation must default --include-eol to false"
+    );
     assert!(args.is_empty());
 }
 
@@ -748,6 +791,34 @@ fn parse_coverage_minimal() {
 fn parse_coverage_with_kernel() {
     let m = Cargo::try_parse_from(["cargo", "ktstr", "coverage", "--kernel", "6.14.2"]);
     assert!(m.is_ok(), "{}", m.err().unwrap());
+}
+
+/// `coverage --kernel R --include-eol` round-trips `include_eol=true`
+/// so `run_coverage` forwards it into the range expansion.
+#[test]
+fn parse_coverage_include_eol_flag() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "coverage",
+        "--kernel",
+        "6.11..6.14",
+        "--include-eol",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Coverage {
+        kernel, include_eol, ..
+    } = k.command
+    else {
+        panic!("expected Coverage");
+    };
+    assert_eq!(kernel, vec!["6.11..6.14".to_string()]);
+    assert!(
+        include_eol,
+        "`--include-eol` must round-trip as true on coverage"
+    );
 }
 
 /// `--release` on `coverage` parses to `KtstrCommand::Coverage
@@ -848,6 +919,7 @@ fn parse_coverage_with_kernel_and_no_perf_mode() {
         release,
         profile,
         nextest_profile,
+        include_eol,
         args,
     } = k.command
     else {
@@ -864,6 +936,10 @@ fn parse_coverage_with_kernel_and_no_perf_mode() {
     assert!(
         nextest_profile.is_none(),
         "bare invocation must default --nextest-profile to None"
+    );
+    assert!(
+        !include_eol,
+        "bare invocation must default --include-eol to false"
     );
     assert_eq!(args, vec!["--workspace"]);
 }
@@ -886,6 +962,34 @@ fn parse_llvm_cov_with_kernel() {
         panic!("expected LlvmCov");
     };
     assert_eq!(kernel, vec!["6.14.2".to_string()]);
+}
+
+/// `llvm-cov --kernel R --include-eol` round-trips `include_eol=true`
+/// so `run_llvm_cov` forwards it into the range expansion.
+#[test]
+fn parse_llvm_cov_include_eol_flag() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "llvm-cov",
+        "--kernel",
+        "6.11..6.14",
+        "--include-eol",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::LlvmCov {
+        kernel, include_eol, ..
+    } = k.command
+    else {
+        panic!("expected LlvmCov");
+    };
+    assert_eq!(kernel, vec!["6.11..6.14".to_string()]);
+    assert!(
+        include_eol,
+        "`--include-eol` must round-trip as true on llvm-cov"
+    );
 }
 
 /// Pin `trailing_var_arg` args forwarded verbatim after `--`.
@@ -921,6 +1025,7 @@ fn parse_llvm_cov_with_kernel_and_no_perf_mode() {
         kernel,
         no_perf_mode,
         no_skip_mode,
+        include_eol,
         args,
     } = k.command
     else {
@@ -929,6 +1034,10 @@ fn parse_llvm_cov_with_kernel_and_no_perf_mode() {
     assert_eq!(kernel, vec!["6.14.2".to_string()]);
     assert!(no_perf_mode);
     assert!(!no_skip_mode);
+    assert!(
+        !include_eol,
+        "bare invocation must default --include-eol to false"
+    );
     assert_eq!(args, vec!["report", "--lcov"]);
 }
 
@@ -1844,7 +1953,12 @@ fn parse_kernel_list_range() {
     let KtstrCommand::Kernel { command } = k.command else {
         panic!("expected Kernel");
     };
-    let KernelCommand::List { json, range } = command else {
+    let KernelCommand::List {
+        json,
+        range,
+        include_eol,
+    } = command
+    else {
         panic!("expected KernelCommand::List, got {command:?}");
     };
     assert!(!json, "bare --range must not enable --json");
@@ -1853,6 +1967,10 @@ fn parse_kernel_list_range() {
         Some("6.12..6.14"),
         "--range must round-trip the literal spec for \
          dispatch to pass to `expand_kernel_range`",
+    );
+    assert!(
+        !include_eol,
+        "bare --range must default --include-eol to false"
     );
 }
 
@@ -1877,11 +1995,52 @@ fn parse_kernel_list_range_with_json() {
     let KtstrCommand::Kernel { command } = k.command else {
         panic!("expected Kernel");
     };
-    let KernelCommand::List { json, range } = command else {
+    let KernelCommand::List {
+        json,
+        range,
+        include_eol,
+    } = command
+    else {
         panic!("expected KernelCommand::List, got {command:?}");
     };
     assert!(json, "--json must round-trip alongside --range");
     assert_eq!(range.as_deref(), Some("6.12..6.14"));
+    assert!(
+        !include_eol,
+        "--range --json without --include-eol must default it to false"
+    );
+}
+
+/// `kernel list --range R --include-eol` round-trips
+/// `include_eol=true` so the preview enumerates EOL series.
+#[test]
+fn parse_kernel_list_range_include_eol() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "kernel",
+        "list",
+        "--range",
+        "6.11..6.14",
+        "--include-eol",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Kernel { command } = k.command else {
+        panic!("expected Kernel");
+    };
+    let KernelCommand::List {
+        range, include_eol, ..
+    } = command
+    else {
+        panic!("expected KernelCommand::List, got {command:?}");
+    };
+    assert_eq!(range.as_deref(), Some("6.11..6.14"));
+    assert!(
+        include_eol,
+        "`--include-eol` must round-trip as true on kernel list --range"
+    );
 }
 
 /// `--run-source V` round-trips to `Compare { run_source: vec![V],
@@ -1953,6 +2112,39 @@ fn parse_stats_compare_with_run_source_per_side() {
 fn parse_kernel_build_version() {
     let m = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "build", "6.14.2"]);
     assert!(m.is_ok(), "{}", m.err().unwrap());
+}
+
+/// `kernel build RANGE --include-eol` round-trips `include_eol=true`
+/// so the range-build path expands EOL series.
+#[test]
+fn parse_kernel_build_range_include_eol() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "kernel",
+        "build",
+        "6.11..6.14",
+        "--include-eol",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Kernel { command } = k.command else {
+        panic!("expected Kernel");
+    };
+    let KernelCommand::Build {
+        version,
+        include_eol,
+        ..
+    } = command
+    else {
+        panic!("expected KernelCommand::Build, got {command:?}");
+    };
+    assert_eq!(version.as_deref(), Some("6.11..6.14"));
+    assert!(
+        include_eol,
+        "`--include-eol` must round-trip as true on kernel build RANGE"
+    );
 }
 
 #[test]
@@ -2601,7 +2793,13 @@ fn parse_verifier_bare() {
     let Cargo {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "verifier"]).unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Verifier { kernel, raw, .. } = k.command else {
+    let KtstrCommand::Verifier {
+        kernel,
+        raw,
+        include_eol,
+        ..
+    } = k.command
+    else {
         panic!("expected Verifier");
     };
     assert!(
@@ -2609,6 +2807,38 @@ fn parse_verifier_bare() {
         "bare verifier must default --kernel to empty Vec"
     );
     assert!(!raw, "bare verifier must default --raw to false");
+    assert!(
+        !include_eol,
+        "bare verifier must default --include-eol to false"
+    );
+}
+
+/// `verifier --kernel R --include-eol` round-trips `include_eol=true`
+/// so the range expands EOL series in the verifier sweep too.
+#[test]
+fn parse_verifier_include_eol_flag() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "verifier",
+        "--kernel",
+        "6.11..6.14",
+        "--include-eol",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Verifier {
+        kernel, include_eol, ..
+    } = k.command
+    else {
+        panic!("expected Verifier");
+    };
+    assert_eq!(kernel, vec!["6.11..6.14".to_string()]);
+    assert!(
+        include_eol,
+        "`--include-eol` must round-trip as true on verifier"
+    );
 }
 
 #[test]

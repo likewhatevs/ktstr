@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
 use ktstr::cli::KernelCommand;
-use ktstr::cli::{KERNEL_HELP_NO_RAW, KERNEL_HELP_RAW_OK};
+use ktstr::cli::{INCLUDE_EOL_HELP, KERNEL_HELP_NO_RAW, KERNEL_HELP_RAW_OK};
 
 #[derive(Parser)]
 #[command(name = "cargo-ktstr", bin_name = "cargo")]
@@ -109,6 +109,11 @@ pub(crate) enum KtstrCommand {
         /// harness's cargo build profile).
         #[arg(long)]
         nextest_profile: Option<String>,
+        /// Include EOL stable series in a `--kernel START..END` range
+        /// expansion (shared `INCLUDE_EOL_HELP`). No effect on a single
+        /// `--kernel`, a path, a cache key, or a git source.
+        #[arg(long, help = INCLUDE_EOL_HELP)]
+        include_eol: bool,
         /// Arguments passed through to cargo nextest run.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -153,6 +158,11 @@ pub(crate) enum KtstrCommand {
         /// `--profile <NAME>` (see `cargo ktstr test --nextest-profile`).
         #[arg(long)]
         nextest_profile: Option<String>,
+        /// Include EOL stable series in a `--kernel START..END` range
+        /// expansion (shared `INCLUDE_EOL_HELP`). No effect on a single
+        /// `--kernel`, a path, a cache key, or a git source.
+        #[arg(long, help = INCLUDE_EOL_HELP)]
+        include_eol: bool,
         /// Arguments passed through to cargo llvm-cov nextest.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -186,6 +196,11 @@ pub(crate) enum KtstrCommand {
         /// contract. Exports `KTSTR_NO_SKIP_MODE=1`.
         #[arg(long)]
         no_skip_mode: bool,
+        /// Include EOL stable series in a `--kernel START..END` range
+        /// expansion (shared `INCLUDE_EOL_HELP`). No effect on a single
+        /// `--kernel`, a path, a cache key, or a git source.
+        #[arg(long, help = INCLUDE_EOL_HELP)]
+        include_eol: bool,
         /// Arguments passed through to cargo llvm-cov.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -478,6 +493,11 @@ pub(crate) enum KtstrCommand {
         /// never emitted, so naming one matches no cell.
         #[arg(long)]
         scheduler: Option<String>,
+        /// Include EOL stable series in a `--kernel START..END` range
+        /// expansion (shared `INCLUDE_EOL_HELP`). No effect on a single
+        /// `--kernel`, a path, a cache key, or a git source.
+        #[arg(long, help = INCLUDE_EOL_HELP)]
+        include_eol: bool,
         /// cargo/nextest flags forwarded verbatim to the inner
         /// `cargo nextest run` — a nextest filterset, `--cargo-profile`,
         /// etc. No `--` separator

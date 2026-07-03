@@ -528,6 +528,7 @@ fn kernel_build(
     cpu_cap: Option<usize>,
     extra_kconfig: Option<PathBuf>,
     skip_sha256: bool,
+    include_eol: bool,
 ) -> Result<()> {
     // Read the extra-kconfig fragment ONCE up front so a range
     // expansion doesn't re-read the same file per version (and so
@@ -554,7 +555,7 @@ fn kernel_build(
         id.validate()
             .map_err(|e| anyhow::anyhow!("--kernel {id}: {e}"))?;
         if let KernelId::Range { start, end, .. } = id {
-            let versions = ktstr::cli::expand_kernel_range(&start, &end, "ktstr")?;
+            let versions = ktstr::cli::expand_kernel_range(&start, &end, "ktstr", include_eol)?;
             let total = versions.len();
             let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
             for (i, ver) in versions.iter().enumerate() {
@@ -1213,8 +1214,12 @@ fn main() -> Result<()> {
         }
 
         Command::Kernel { command } => match command {
-            KernelCommand::List { json, range } => match range {
-                Some(r) => cli::kernel_list_range_preview(json, &r)?,
+            KernelCommand::List {
+                json,
+                range,
+                include_eol,
+            } => match range {
+                Some(r) => cli::kernel_list_range_preview(json, &r, include_eol)?,
                 None => cli::kernel_list(json)?,
             },
             KernelCommand::Build {
@@ -1227,6 +1232,7 @@ fn main() -> Result<()> {
                 cpu_cap,
                 extra_kconfig,
                 skip_sha256,
+                include_eol,
             } => kernel_build(
                 version,
                 source,
@@ -1237,6 +1243,7 @@ fn main() -> Result<()> {
                 cpu_cap,
                 extra_kconfig,
                 skip_sha256,
+                include_eol,
             )?,
             KernelCommand::Clean {
                 keep,

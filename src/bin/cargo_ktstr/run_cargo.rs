@@ -226,11 +226,14 @@ fn build_cargo_command(
 /// without the exec/fs tail — all-whitespace specs reach `resolve_kernel_set`
 /// but `filter_map` drops them before any `KernelId::parse`, so this path
 /// does no network/build I/O.
-fn kernel_set_or_bail(kernel: &[String]) -> Result<Vec<(String, PathBuf)>, String> {
+fn kernel_set_or_bail(
+    kernel: &[String],
+    include_eol: bool,
+) -> Result<Vec<(String, PathBuf)>, String> {
     if kernel.is_empty() {
         return Ok(Vec::new());
     }
-    let resolved = resolve_kernel_set(kernel)?;
+    let resolved = resolve_kernel_set(kernel, include_eol)?;
     if resolved.is_empty() {
         // `resolve_kernel_set` skips arguments that trim to
         // empty, so `--kernel ""` or `--kernel "  "` reach
@@ -263,6 +266,7 @@ fn run_cargo_sub(
     release: bool,
     profile: Option<String>,
     nextest_profile: Option<String>,
+    include_eol: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
     let mut cmd = build_cargo_command(
@@ -294,7 +298,7 @@ fn run_cargo_sub(
     // Empty `kernel` (flag omitted) -> empty set, auto-discovery path.
     // Non-empty but all-whitespace -> actionable bail (see
     // `kernel_set_or_bail`). Otherwise the resolved (label, dir) set.
-    let resolved = kernel_set_or_bail(&kernel)?;
+    let resolved = kernel_set_or_bail(&kernel, include_eol)?;
     if !resolved.is_empty() {
         // `KTSTR_KERNEL` always points at the first resolved entry
         // so downstream code that inspects the env directly (e.g.
@@ -807,6 +811,7 @@ fn check_ktstr_version_compat() -> Result<(), String> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_test(
     kernel: Vec<String>,
     no_perf_mode: bool,
@@ -814,6 +819,7 @@ pub(crate) fn run_test(
     release: bool,
     profile: Option<String>,
     nextest_profile: Option<String>,
+    include_eol: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
@@ -828,10 +834,12 @@ pub(crate) fn run_test(
         release,
         profile,
         nextest_profile,
+        include_eol,
         args,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_coverage(
     kernel: Vec<String>,
     no_perf_mode: bool,
@@ -839,6 +847,7 @@ pub(crate) fn run_coverage(
     release: bool,
     profile: Option<String>,
     nextest_profile: Option<String>,
+    include_eol: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
@@ -856,6 +865,7 @@ pub(crate) fn run_coverage(
         release,
         profile,
         nextest_profile,
+        include_eol,
         args,
     )
 }
@@ -864,6 +874,7 @@ pub(crate) fn run_llvm_cov(
     kernel: Vec<String>,
     no_perf_mode: bool,
     no_skip_mode: bool,
+    include_eol: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
     // `llvm-cov` is raw passthrough — the user supplies every
@@ -887,6 +898,7 @@ pub(crate) fn run_llvm_cov(
         false,
         None,
         None,
+        include_eol,
         args,
     )
 }
@@ -1503,7 +1515,7 @@ mod tests {
     /// to auto-discovery (which would mask the operator's intent).
     #[test]
     fn kernel_set_or_bail_all_whitespace_bails() {
-        let err = kernel_set_or_bail(&["".to_string(), "  \t ".to_string()])
+        let err = kernel_set_or_bail(&["".to_string(), "  \t ".to_string()], false)
             .expect_err("all-whitespace --kernel must bail, not auto-discover");
         assert!(
             err.starts_with("--kernel: every supplied value parsed to empty"),
@@ -1516,7 +1528,7 @@ mod tests {
     /// through to the `find_kernel` chain without exporting KTSTR_KERNEL.
     #[test]
     fn kernel_set_or_bail_empty_input_is_ok_empty() {
-        assert_eq!(kernel_set_or_bail(&[]), Ok(Vec::new()));
+        assert_eq!(kernel_set_or_bail(&[], false), Ok(Vec::new()));
     }
 
     // -- generate_btf_anchor (no-bpf early return) --

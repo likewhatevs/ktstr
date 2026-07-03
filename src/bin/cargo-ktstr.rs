@@ -160,6 +160,7 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
             release,
             profile,
             nextest_profile,
+            include_eol,
             args,
         } => run_cargo::run_test(
             kernel,
@@ -168,6 +169,7 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
             release,
             profile,
             nextest_profile,
+            include_eol,
             args,
         ),
         KtstrCommand::Coverage {
@@ -177,6 +179,7 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
             release,
             profile,
             nextest_profile,
+            include_eol,
             args,
         } => run_cargo::run_coverage(
             kernel,
@@ -185,14 +188,16 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
             release,
             profile,
             nextest_profile,
+            include_eol,
             args,
         ),
         KtstrCommand::LlvmCov {
             kernel,
             no_perf_mode,
             no_skip_mode,
+            include_eol,
             args,
-        } => run_cargo::run_llvm_cov(kernel, no_perf_mode, no_skip_mode, args),
+        } => run_cargo::run_llvm_cov(kernel, no_perf_mode, no_skip_mode, include_eol, args),
         KtstrCommand::Stats { ref command } => stats::run_stats(command),
         KtstrCommand::Replay {
             dir,
@@ -288,10 +293,13 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
 fn dispatch_admin_command(command: KtstrCommand) -> Result<(), String> {
     match command {
         KtstrCommand::Kernel { command } => match command {
-            KernelCommand::List { json, range } => match range {
-                Some(r) => {
-                    ktstr::cli::kernel_list_range_preview(json, &r).map_err(|e| format!("{e:#}"))
-                }
+            KernelCommand::List {
+                json,
+                range,
+                include_eol,
+            } => match range {
+                Some(r) => ktstr::cli::kernel_list_range_preview(json, &r, include_eol)
+                    .map_err(|e| format!("{e:#}")),
                 None => ktstr::cli::kernel_list(json).map_err(|e| format!("{e:#}")),
             },
             KernelCommand::Build {
@@ -304,6 +312,7 @@ fn dispatch_admin_command(command: KtstrCommand) -> Result<(), String> {
                 cpu_cap,
                 extra_kconfig,
                 skip_sha256,
+                include_eol,
             } => kernel::kernel_build(
                 version,
                 source,
@@ -314,6 +323,7 @@ fn dispatch_admin_command(command: KtstrCommand) -> Result<(), String> {
                 cpu_cap,
                 extra_kconfig,
                 skip_sha256,
+                include_eol,
             ),
             KernelCommand::Clean {
                 keep,
@@ -327,8 +337,17 @@ fn dispatch_admin_command(command: KtstrCommand) -> Result<(), String> {
             profile,
             nextest_profile,
             scheduler,
+            include_eol,
             args,
-        } => verifier::run_verifier(kernel, raw, profile, nextest_profile, scheduler, args),
+        } => verifier::run_verifier(
+            kernel,
+            raw,
+            profile,
+            nextest_profile,
+            scheduler,
+            include_eol,
+            args,
+        ),
         KtstrCommand::Funify {
             input,
             seed,

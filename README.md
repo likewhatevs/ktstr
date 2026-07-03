@@ -325,7 +325,10 @@ cargo ktstr test --kernel ../linux
 auto-built on first use), a version (`6.14.2`, or `6.14` for
 latest patch), a cache key (see `kernel list`), a version
 range (`6.12..6.14`), or a git source (`git+URL#tag=NAME`,
-`git+URL#branch=NAME`, or `git+URL#sha=<40-hex>`).
+`git+URL#branch=NAME`, or `git+URL#sha=<40-hex>`). A range
+expands only across series still listed in kernel.org's active
+releases; add `--include-eol` to also cover end-of-life stable
+series (enumerated from the gregkh linux-stable mirror).
 
 `cargo ktstr test` wraps `cargo nextest run` with kernel
 resolution (source tree, version, or cache key), kconfig
