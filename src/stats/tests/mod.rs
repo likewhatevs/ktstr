@@ -3,6 +3,7 @@ use super::*;
 fn make_row(scenario: &str, topo: &str, passed: bool, spread: f64) -> GauntletRow {
     GauntletRow {
         scenario: scenario.into(),
+        perf_delta_assertions: Vec::new(),
         topology: topo.into(),
         work_type: "SpinWait".into(),
         scheduler: String::new(),
@@ -68,6 +69,7 @@ fn make_filter_row(
 ) -> GauntletRow {
     GauntletRow {
         scenario: scenario.into(),
+        perf_delta_assertions: Vec::new(),
         topology: topology.into(),
         work_type: work_type.into(),
         scheduler: scheduler.into(),

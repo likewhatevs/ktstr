@@ -364,6 +364,7 @@ pub(crate) const VALUE_ATTR_NAMES: &[&str] = &[
     "staged_schedulers",
     "bpf_map_write",
     "watch_bpf_maps",
+    "perf_delta_assertions",
     "post_vm",
     "post_vm_unconditional",
     "disk",
@@ -454,6 +455,7 @@ pub(crate) struct AttrValues {
     pub(crate) staged_schedulers: Option<Vec<syn::Path>>,
     pub(crate) bpf_map_write: Option<Vec<syn::Path>>,
     pub(crate) watch_bpf_maps: Option<Vec<syn::Path>>,
+    pub(crate) perf_delta_assertions: Option<Vec<syn::Path>>,
     pub(crate) post_vm: Option<syn::Path>,
     pub(crate) post_vm_unconditional: Option<syn::Path>,
     pub(crate) disk: Option<syn::Path>,
@@ -559,6 +561,7 @@ impl Default for AttrValues {
             staged_schedulers: None,
             bpf_map_write: None,
             watch_bpf_maps: None,
+            perf_delta_assertions: None,
             post_vm: None,
             post_vm_unconditional: None,
             disk: None,
@@ -972,6 +975,31 @@ fn validate_cross_attr(attrs: &AttrValues) -> syn::Result<()> {
              no_perf_mode (or drop cpu_budget).",
         ));
     }
+    // `perf_delta_assertions` tighten the perf-delta noise threshold on a
+    // metric, which is only meaningful on a pinned run. Under no-perf mode
+    // (or the default LLC mode) the metric carries host-CPU-oversubscription
+    // noise the gate would misread — false regressions, or a real one masked
+    // by the narrowed band. Require `performance_mode` so a declared gate
+    // always sees pinned data. Same compile-time cross-attr shape as the
+    // `cpu_budget ⇒ no_perf_mode` require above; the programmatic-
+    // construction path is guarded at runtime in
+    // `src/test_support/entry_validate.rs::validate_perf_delta_assertions`.
+    if attrs
+        .perf_delta_assertions
+        .as_ref()
+        .is_some_and(|paths| !paths.is_empty())
+        && !(attrs.performance_mode_set && attrs.performance_mode)
+    {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "perf_delta_assertions requires performance_mode — a declared \
+             regression gate tightens the noise threshold on a metric, which \
+             is only meaningful on a pinned (performance_mode) run. Under \
+             no-perf mode the metric carries host-CPU-oversubscription noise \
+             the gate would misread. Add performance_mode = true (or drop \
+             the assertions).",
+        ));
+    }
     // `host_only = true` short-circuits the VM-boot pipeline before
     // any of the VM-only features fire. Catch attribute combinations
     // where the user pairs `host_only = true` with attributes that
@@ -1272,6 +1300,13 @@ pub(crate) fn ktstr_test_impl(
                             value,
                             "expected a WatchBpfMap path or [A, B] array for \
                              watch_bpf_maps (e.g. WATCH or [WATCH_A, WATCH_B])",
+                        )?);
+                    }
+                    "perf_delta_assertions" => {
+                        attrs.perf_delta_assertions = Some(expect_path_or_array_of_paths(
+                            value,
+                            "expected a PerfDeltaAssertion path or [A, B] array for \
+                             perf_delta_assertions (e.g. RPS_GATE or [GATE_A, GATE_B])",
                         )?);
                     }
                     "post_vm" => {

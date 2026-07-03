@@ -884,7 +884,8 @@ pub mod prelude {
         BpfMapAgg, BpfMapWrite, CgroupPath, EXIT_FAIL, EXIT_INCONCLUSIVE, EXIT_PASS,
         KTSTR_SCHEDULERS, KTSTR_TESTS, KtstrTestEntry, MemSideCache, Metric, MetricCheck,
         MetricHint, MetricStream, NumaDistance, NumaNode, OutputFormat, Payload, PayloadKind,
-        PayloadMetrics, Polarity, Scheduler, SchedulerSpec, SidecarResult, Sysctl, Topology,
+        PayloadMetrics, PerfDeltaAssertion, Polarity, Scheduler, SchedulerSpec, SidecarResult,
+        Sysctl, Topology,
         TopologyConstraints, WatchBpfMap, extract_metrics, find_scheduler, find_test, sidecar_dir,
     };
     // The following items are intentionally NOT in the prelude. They

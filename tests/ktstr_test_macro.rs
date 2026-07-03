@@ -36,6 +36,16 @@ const MACRO_TEST_WATCH_B: ktstr::test_support::WatchBpfMap = ktstr::test_support
     "b",
 );
 
+/// Two const `PerfDeltaAssertion`s so the `perf_delta_assertions = [A, B]`
+/// array-form macro arm below can reference them as paths. Pins the const-fn
+/// builders the `perf_delta_assertions` codegen borrows into a slice literal.
+const MACRO_TEST_GATE_A: ktstr::test_support::PerfDeltaAssertion =
+    ktstr::test_support::PerfDeltaAssertion::new("worst_spread").with_max_regression_pct(5.0);
+const MACRO_TEST_GATE_B: ktstr::test_support::PerfDeltaAssertion =
+    ktstr::test_support::PerfDeltaAssertion::new("total_iterations")
+        .with_min_abs(100.0)
+        .with_phase(1);
+
 /// Minimal ktstr_test that checks the macro compiles and the generated
 /// linkme registration + test wrapper resolve correctly from an
 /// integration test.
@@ -132,6 +142,22 @@ fn watch_bpf_maps_array_compiles(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
+/// `perf_delta_assertions = [A, B]` (array form) must compile and expand to a
+/// two-element `&[&PerfDeltaAssertion]` entry field. Requires
+/// `performance_mode` (the macro rejects a declared gate without it). `ignore` —
+/// the value is the COMPILE + codegen (the entry field), not a VM boot.
+#[ktstr_test(
+    llcs = 1,
+    cores = 1,
+    threads = 1,
+    performance_mode = true,
+    perf_delta_assertions = [MACRO_TEST_GATE_A, MACRO_TEST_GATE_B],
+    ignore
+)]
+fn perf_delta_assertions_array_compiles(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
 /// Pin the `#[ktstr_test(disk = PATH)]` macro arm — verifies the
 /// `disk = MACRO_TEST_DISK` syntax expands to a valid entry that
 /// links into the test registry. The test body just confirms the
@@ -214,6 +240,24 @@ fn watch_bpf_maps_array_expands_to_two_elements() {
     );
     assert_eq!(entry.watch_bpf_maps[0].field(), "count_a");
     assert_eq!(entry.watch_bpf_maps[1].field(), "count_b");
+}
+
+/// `perf_delta_assertions = [A, B]` expands to a two-element
+/// `&[&PerfDeltaAssertion]` entry field, preserving each gate's metric and
+/// phase scope in order. VM-free: reads the registered entry and asserts the
+/// codegen borrowed both consts into the slice.
+#[test]
+fn perf_delta_assertions_array_expands_to_two_elements() {
+    let entry = ktstr::test_support::find_test("perf_delta_assertions_array_compiles").unwrap();
+    assert_eq!(
+        entry.perf_delta_assertions.len(),
+        2,
+        "perf_delta_assertions = [A, B] must expand to a 2-element &[&PerfDeltaAssertion]"
+    );
+    assert_eq!(entry.perf_delta_assertions[0].metric(), "worst_spread");
+    assert_eq!(entry.perf_delta_assertions[0].phase(), None);
+    assert_eq!(entry.perf_delta_assertions[1].metric(), "total_iterations");
+    assert_eq!(entry.perf_delta_assertions[1].phase(), Some(1));
 }
 
 /// Check default attribute values.

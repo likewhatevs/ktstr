@@ -766,6 +766,7 @@ mod tests {
     fn synth_sidecar(test_name: &str, passed: bool, skipped: bool) -> SidecarResult {
         SidecarResult {
             test_name: test_name.to_string(),
+            perf_delta_assertions: Vec::new(),
             topology: "synth".into(),
             scheduler: "synth".into(),
             vcpus: 1,

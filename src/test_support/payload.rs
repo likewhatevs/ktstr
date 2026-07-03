@@ -737,6 +737,19 @@ impl Polarity {
         }
     }
 
+    /// The regression direction of this polarity: `Some(true)` = an INCREASE is
+    /// a regression (`LowerBetter` / `TargetValue` / the conservative `Unknown`),
+    /// `Some(false)` = a DECREASE is a regression (`HigherBetter`), `None` =
+    /// directionless (`Informational`, never gates). The single source of truth
+    /// that `MetricDef::classify_direction` delegates to.
+    pub const fn classify_direction(&self) -> Option<bool> {
+        match self {
+            Polarity::Informational => None,
+            Polarity::HigherBetter => Some(false),
+            Polarity::LowerBetter | Polarity::TargetValue(_) | Polarity::Unknown => Some(true),
+        }
+    }
+
     /// Construct a [`Polarity::TargetValue`] from a finite `target`.
     ///
     /// # Panics

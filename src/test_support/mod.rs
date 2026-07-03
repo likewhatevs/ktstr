@@ -126,8 +126,9 @@ pub(crate) use sidecar::{
     is_run_directory, is_sidecar_filename, warn_skipped_sidecars,
 };
 pub use sidecar::{
-    SidecarResult, collect_pool, detect_kernel_commit, format_run_artifact_footer, newest_run_dir,
-    repo_is_dirty, runs_root, sidecar_dir, source_dir_for,
+    PerfDeltaAssertionRecord, SidecarResult, collect_pool, detect_kernel_commit,
+    format_run_artifact_footer, newest_run_dir, repo_is_dirty, runs_root, sidecar_dir,
+    source_dir_for,
 };
 
 pub use dispatch::{
@@ -138,7 +139,8 @@ pub use dispatch::{
 };
 pub use entry::{
     BinaryKindJson, BpfMapAgg, BpfMapWrite, CgroupPath, KTSTR_SCHEDULERS, KTSTR_TESTS,
-    KtstrTestEntry, MemSideCache, NumaDistance, NumaNode, Scheduler, SchedulerJson, SchedulerSpec,
+    KtstrTestEntry, MemSideCache, NumaDistance, NumaNode, PerfDeltaAssertion, Scheduler,
+    SchedulerJson, SchedulerSpec,
     Sysctl, Topology, TopologyConstraints, TopologyConstraintsJson, TopologyJson, WatchBpfMap,
     default_post_vm_periodic_fired, find_scheduler, find_test,
 };

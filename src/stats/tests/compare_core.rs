@@ -3019,6 +3019,368 @@ fn format_noise_findings_table_renders_noisy_improvement_and_advisory_spread() {
     );
 }
 
+// ---- PerfDeltaAssertion declared-gate overrides (perf-delta only) ----
+
+/// Build a declared-gate record (the sidecar mirror the compare path reads).
+fn perf_gate(
+    metric: &str,
+    max_regression_pct: Option<f64>,
+    min_abs: Option<f64>,
+    direction: Option<crate::test_support::Polarity>,
+    phase: Option<u16>,
+) -> crate::test_support::PerfDeltaAssertionRecord {
+    crate::test_support::PerfDeltaAssertionRecord {
+        metric: metric.to_string(),
+        direction,
+        max_regression_pct,
+        min_abs,
+        phase,
+    }
+}
+
+/// Attach a declared gate to every row of a side (each run of a test carries
+/// the same declared assertions; the compare path reads `b_rows.first()`).
+fn with_gate(
+    mut rows: Vec<GauntletRow>,
+    gate: crate::test_support::PerfDeltaAssertionRecord,
+) -> Vec<GauntletRow> {
+    for r in &mut rows {
+        r.perf_delta_assertions.push(gate.clone());
+    }
+    rows
+}
+
+#[test]
+fn noise_findings_declared_gate_tightens_immaterial_move_to_regression() {
+    // worst_spread 10->11: under the registry default (abs 5.0 / rel 0.25) the
+    // abs delta 1.0 < 5.0 is IMMATERIAL -> Stable. A declared gate
+    // (max_regression_pct=5 -> rel 0.05, min_abs=0.5) makes abs 1.0>=0.5 AND rel
+    // 0.10>=0.05 -> material; the disjoint [10,10] vs [11,11] bands separate;
+    // LowerBetter 11>10 worsened -> REGRESSION. Proves the override tightens and
+    // that the classification is attributed to the declared gate.
+    let a = noise_side("gate", 10.0, 0);
+
+    // Baseline: the SAME move without the gate stays Stable and never gates.
+    let ungated = noise_findings(
+        &a,
+        &noise_side("gate", 11.0, 0),
+        LEGACY_PAIRING_DIMS,
+        5.0,
+        true,
+    );
+    let uw = ungated
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "worst_spread")
+        .expect("worst_spread row");
+    assert_eq!(
+        uw.kind,
+        NoiseKind::Stable,
+        "10->11 is immaterial under the registry default",
+    );
+    assert!(!uw.gated_by_assertion, "no declared gate on the ungated rows");
+    assert_eq!(ungated.regressions(), 0);
+
+    // With the declared gate the same move becomes a confident regression.
+    let b = with_gate(
+        noise_side("gate", 11.0, 0),
+        perf_gate("worst_spread", Some(5.0), Some(0.5), None, None),
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    let w = rep
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "worst_spread")
+        .expect("worst_spread row");
+    assert_eq!(
+        w.kind,
+        NoiseKind::Regression,
+        "the tighter declared gate flags the move",
+    );
+    assert!(
+        w.gated_by_assertion,
+        "the row was classified by the declared gate",
+    );
+    assert_eq!(
+        rep.regressions(),
+        1,
+        "the declared-gate regression gates the exit",
+    );
+    assert!(
+        rep.assertion_coverage.is_empty(),
+        "the gate matched a metric that had data",
+    );
+}
+
+#[test]
+fn noise_findings_declared_direction_override_flips_polarity() {
+    // worst_spread is LowerBetter, so a material 10->11 rise is a REGRESSION. A
+    // declared direction=HigherBetter reclassifies the SAME move as an
+    // improvement — proving the direction override in classify_noise.
+    let a = noise_side("dir", 10.0, 0);
+    let b = with_gate(
+        noise_side("dir", 11.0, 0),
+        perf_gate(
+            "worst_spread",
+            Some(5.0),
+            Some(0.5),
+            Some(crate::test_support::Polarity::HigherBetter),
+            None,
+        ),
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    let w = rep
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "worst_spread")
+        .expect("worst_spread row");
+    assert_eq!(
+        w.kind,
+        NoiseKind::Improvement,
+        "HigherBetter reclassifies the 10->11 rise as an improvement",
+    );
+    assert!(w.gated_by_assertion);
+    assert_eq!(rep.regressions(), 0);
+}
+
+#[test]
+fn noise_findings_unmatched_whole_run_gate_is_reported() {
+    // A declared gate on a metric absent from the compared data
+    // (run_delay_per_sec — a Rate with no components on these rows) never reaches
+    // classify_noise, so it surfaces as an un-evaluated declared gate rather than
+    // a silent pass. The runtime analog of validate()'s registry typo check.
+    let a = noise_side("cov", 10.0, 0);
+    let b = with_gate(
+        noise_side("cov", 10.0, 0),
+        perf_gate("run_delay_per_sec", Some(5.0), None, None, None),
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    assert_eq!(
+        rep.assertion_coverage.len(),
+        1,
+        "the absent-metric gate is reported as un-evaluated",
+    );
+    let c = &rep.assertion_coverage[0];
+    assert_eq!(c.assertion.metric, "run_delay_per_sec");
+    assert_eq!(c.assertion.phase, None);
+    assert_eq!(
+        rep.regressions(),
+        0,
+        "an un-evaluated gate never gates the exit",
+    );
+}
+
+#[test]
+fn noise_findings_unmatched_phase_gate_is_reported() {
+    // A phase-scoped gate (step 5) on a scenario that has NO phases: the
+    // per-phase pass never evaluates it, so it surfaces as un-evaluated. The
+    // aggregate worst_spread row is present (identical sides -> Stable) but NOT
+    // annotated, since the gate is phase-scoped, not whole-run.
+    let a = noise_side("pcov", 10.0, 0);
+    let b = with_gate(
+        noise_side("pcov", 10.0, 0),
+        perf_gate("worst_spread", Some(5.0), None, None, Some(5)),
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    assert_eq!(rep.assertion_coverage.len(), 1);
+    assert_eq!(rep.assertion_coverage[0].assertion.phase, Some(5));
+    let w = rep
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "worst_spread")
+        .expect("aggregate worst_spread row");
+    assert!(
+        !w.gated_by_assertion,
+        "a phase-scoped gate does not annotate the aggregate row",
+    );
+}
+
+#[test]
+fn format_noise_findings_table_marks_declared_gate() {
+    // A declared-gate regression renders with the "(declared gate)" verdict
+    // annotation so the operator distinguishes an author-tightened gate from a
+    // registry-default one.
+    let a = noise_side("mark", 10.0, 0);
+    let b = with_gate(
+        noise_side("mark", 11.0, 0),
+        perf_gate("worst_spread", Some(5.0), Some(0.5), None, None),
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    let out = format_noise_findings_table(&rep.findings, "base", "head");
+    assert!(
+        out.contains("REGRESSION (declared gate)"),
+        "declared-gate regression is annotated: {out}",
+    );
+}
+
+#[test]
+fn format_noise_assertion_coverage_lines_lists_unevaluated_gates() {
+    // The un-evaluated declared gate warning names the metric and describes the
+    // thresholds it would have applied; empty coverage renders nothing.
+    let a = noise_side("fcov", 10.0, 0);
+    let b = with_gate(
+        noise_side("fcov", 10.0, 0),
+        perf_gate("run_delay_per_sec", Some(5.0), Some(0.5), None, None),
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    let out = format_noise_assertion_coverage_lines(&rep.assertion_coverage).join("\n");
+    assert!(out.contains("NOT evaluated"), "warning header present: {out}");
+    assert!(
+        out.contains("run_delay_per_sec"),
+        "the un-evaluated metric is named: {out}",
+    );
+    assert!(
+        out.contains("max_regression_pct=5") && out.contains("min_abs=0.5"),
+        "the declared thresholds are described: {out}",
+    );
+    assert!(
+        format_noise_assertion_coverage_lines(&[]).is_empty(),
+        "no coverage rows -> no lines",
+    );
+}
+
+#[test]
+fn noise_findings_declared_phase_gate_gates_the_exit() {
+    // Step[0] (step_index 1) max_dsq_depth 8->9: immaterial under the registry
+    // default (abs 1 < default_abs 10) -> a render-only Stable per-phase finding.
+    // A phase-scoped declared gate (phase=1, max_regression_pct=5, min_abs=0.5)
+    // tightens it to a per-phase REGRESSION that — unlike a spread-only per-phase
+    // finding — DOES gate the exit (declared_phase_regressions), while the
+    // AGGREGATE basis stays 0 (row-level max_dsq_depth is 0 on both sides).
+    let buckets = |v: f64| {
+        vec![
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", v)]),
+        ]
+    };
+    let a = phased_rows("pg", 3, &buckets(8.0));
+    let mut b = phased_rows("pg", 3, &buckets(9.0));
+    for r in &mut b {
+        r.perf_delta_assertions
+            .push(perf_gate("max_dsq_depth", Some(5.0), Some(0.5), None, Some(1)));
+    }
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    let s1 = rep
+        .phase_findings
+        .iter()
+        .find(|f| f.step_index == 1 && f.metric.name == "max_dsq_depth")
+        .expect("Step[0] max_dsq_depth per-phase finding");
+    assert_eq!(
+        s1.kind,
+        NoiseKind::Regression,
+        "the declared phase gate flags the otherwise-immaterial move",
+    );
+    assert!(s1.gated_by_assertion);
+    assert_eq!(
+        rep.declared_phase_regressions(),
+        1,
+        "a declared phase gate contributes to the exit basis",
+    );
+    assert_eq!(
+        rep.regressions(),
+        0,
+        "no AGGREGATE regression — the move is phase-scoped only",
+    );
+    assert!(
+        rep.assertion_coverage.is_empty(),
+        "the phase gate matched Step[0]",
+    );
+}
+
+#[test]
+fn scalar_declared_gate_warning_flags_present_gates() {
+    // The scalar compare does not evaluate declared gates; it must WARN (not
+    // silently ignore) when compared tests carry them.
+    let plain = vec![cmp_row("s", "tiny-1llc", true, 10.0, 0)];
+    assert!(
+        scalar_declared_gate_warning(&plain).is_none(),
+        "no declared gates -> no warning",
+    );
+    let gated = with_gate(
+        vec![cmp_row("s", "tiny-1llc", true, 10.0, 0)],
+        perf_gate("worst_spread", Some(5.0), None, None, None),
+    );
+    let w = scalar_declared_gate_warning(&gated).expect("declared gate -> warning");
+    assert!(
+        w.contains("--noise-adjust") && w.contains("NOT evaluate"),
+        "warning must name --noise-adjust and that gates are not evaluated: {w}",
+    );
+}
+
+#[test]
+fn classify_noise_ignores_target_value_direction_on_the_sidecar_path() {
+    // `with_direction` rejects TargetValue, but PerfDeltaAssertionRecord is a
+    // pub serde type, so a hand-edited / stale sidecar could carry
+    // direction=TargetValue (built here directly via perf_gate, bypassing the
+    // builder gate — the sidecar path). classify_noise must IGNORE it and
+    // inherit the registry polarity, not misread it as increase-is-worse:
+    // total_iterations is HigherBetter, so a 1000->1100 rise is an IMPROVEMENT.
+    // Without the guard, TargetValue -> Some(true) would flip this to Regression.
+    let a = noise_side("tv", 10.0, 1000);
+    let b = with_gate(
+        noise_side("tv", 10.0, 1100),
+        perf_gate(
+            "total_iterations",
+            Some(5.0),
+            Some(50.0),
+            Some(crate::test_support::Polarity::TargetValue(5.0)),
+            None,
+        ),
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    let f = rep
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "total_iterations")
+        .expect("total_iterations row");
+    assert_eq!(
+        f.kind,
+        NoiseKind::Improvement,
+        "a TargetValue direction on the Record must be ignored -> inherit \
+         HigherBetter -> a rise is an improvement, not a regression",
+    );
+    assert!(f.gated_by_assertion);
+}
+
+#[test]
+fn classify_noise_ignores_out_of_range_thresholds_on_the_sidecar_path() {
+    // validate rejects negative/NaN thresholds on the entry path, but a stale /
+    // hand-edited sidecar Record could carry them (built here directly via
+    // perf_gate). delta.abs()/rel_delta are non-negative, so a NEGATIVE gate
+    // would make `material` unconditionally true -> a phantom confident
+    // regression that flips the exit. The guard must reject out-of-range
+    // thresholds and fall back to the registry default. worst_spread 10->10.5 is
+    // separated (disjoint bands) but immaterial under the registry default (0.5 <
+    // default_abs 5.0), so with the guard it stays Stable despite the negative
+    // declared thresholds.
+    let a = noise_side("oor", 10.0, 2000);
+    let b = with_gate(
+        noise_side("oor", 10.5, 2000),
+        perf_gate("worst_spread", Some(-5.0), Some(-10.0), None, None),
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    assert_eq!(
+        rep.regressions(),
+        0,
+        "negative sidecar thresholds must NOT manufacture a phantom regression: {:?}",
+        rep.findings
+            .iter()
+            .map(|f| (f.metric.name, f.kind))
+            .collect::<Vec<_>>(),
+    );
+    let w = rep
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "worst_spread")
+        .expect("worst_spread row");
+    assert_eq!(
+        w.kind,
+        NoiseKind::Stable,
+        "out-of-range declared thresholds fall back to the registry default -> \
+         0.5 < default_abs 5.0 -> immaterial -> Stable",
+    );
+}
+
 /// A `Polarity::Informational` metric (the monitor `total_ttwu_count`) that
 /// moves significantly is classified `FindingKind::Informational` — it appears
 /// in the findings but is NEVER counted as a regression or improvement, so it

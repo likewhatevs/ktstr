@@ -28,6 +28,7 @@ impl crate::test_support::KtstrTestEntry {
         self.validate_mode_flags()?;
         self.validate_snapshots()?;
         self.validate_config_and_topology()?;
+        self.validate_perf_delta_assertions()?;
         Ok(())
     }
 
@@ -415,6 +416,124 @@ impl crate::test_support::KtstrTestEntry {
                 self.scheduler.name
             )
         })?;
+        Ok(())
+    }
+
+    /// Validate declared `perf_delta_assertions`. Each assertion is a
+    /// per-test regression gate consulted only under
+    /// `perf-delta --noise-adjust` (the scalar `perf-delta` path warns that
+    /// declared gates were skipped) — inert during a normal `ktstr test` run,
+    /// where the in-VM evaluation never reads it. Two rules:
+    ///
+    /// - Every asserted `metric` must resolve in the metric registry
+    ///   (`crate::stats::metric_def`). A typo'd metric name would never
+    ///   match a captured field, so the gate would silently never fire:
+    ///   the author believes a regression is guarded when nothing is.
+    ///   Reject at validate time so the typo surfaces during nextest
+    ///   discovery rather than as a phantom-passing perf-delta run.
+    /// - Declaring any assertion requires `performance_mode`. The gate
+    ///   tightens the noise threshold on a metric; under no-perf mode the
+    ///   vCPU threads share an oversubscribed host-CPU mask, so the
+    ///   metric carries scheduling noise the tightened gate would misread
+    ///   (false regressions, or a real regression masked by the narrowed
+    ///   band). A perf gate is only meaningful on a pinned run. Mirrors
+    ///   the `cpu_budget ⇒ no_perf_mode` flag-dependency above.
+    fn validate_perf_delta_assertions(&self) -> anyhow::Result<()> {
+        if self.perf_delta_assertions.is_empty() {
+            return Ok(());
+        }
+        if !self.performance_mode {
+            anyhow::bail!(
+                "KtstrTestEntry '{}' declares perf_delta_assertions but \
+                 performance_mode=false — a declared regression gate \
+                 tightens the noise threshold on a metric, which is only \
+                 meaningful on a pinned (performance_mode) run. Under \
+                 no-perf mode the metric carries host-CPU-oversubscription \
+                 noise the gate would misread. Set performance_mode=true \
+                 or drop the assertions.",
+                self.name,
+            );
+        }
+        let mut seen: std::collections::BTreeSet<(&'static str, Option<u16>)> =
+            std::collections::BTreeSet::new();
+        for a in self.perf_delta_assertions {
+            let metric = a.metric();
+            if crate::stats::metric_def(metric).is_none() {
+                anyhow::bail!(
+                    "KtstrTestEntry '{}'.perf_delta_assertions references \
+                     unknown metric '{}' — it does not resolve in the \
+                     metric registry, so the gate would never match a \
+                     captured field and silently never fire. Check the \
+                     name against the registry (src/stats/metric.rs \
+                     METRICS).",
+                    self.name,
+                    metric,
+                );
+            }
+            // A render-suppressed rate COMPONENT (the internal numerator/
+            // denominator of a derived rate — e.g. total_phase_iterations)
+            // keeps its registry slot for the cross-run re-pool but is never
+            // emitted as a compare finding, so a gate on it can NEVER fire: a
+            // guaranteed-dead gate that would pass this check on name alone.
+            // Reject so the author declares the user-facing rate (e.g.
+            // iteration_rate) rather than its suppressed component.
+            if crate::stats::is_render_suppressed_component(metric) {
+                anyhow::bail!(
+                    "KtstrTestEntry '{}'.perf_delta_assertions references \
+                     render-suppressed rate component '{}' — it is an internal \
+                     numerator/denominator that never surfaces as a compare \
+                     finding, so the gate could never fire. Declare the \
+                     user-facing rate metric instead.",
+                    self.name,
+                    metric,
+                );
+            }
+            // A non-finite or negative threshold silently inverts or disables
+            // the gate in classify_noise (abs_gate/rel_gate are compared with
+            // `>=`; NaN makes every comparison false, a negative floor makes
+            // every move material). Reject both overrides.
+            if let Some(pct) = a.max_regression_pct()
+                && (!pct.is_finite() || pct < 0.0)
+            {
+                anyhow::bail!(
+                    "KtstrTestEntry '{}'.perf_delta_assertions gate on '{}' has \
+                     max_regression_pct={} — must be finite and >= 0 (a negative \
+                     or NaN threshold silently disables or inverts the gate).",
+                    self.name,
+                    metric,
+                    pct,
+                );
+            }
+            if let Some(min) = a.min_abs()
+                && (!min.is_finite() || min < 0.0)
+            {
+                anyhow::bail!(
+                    "KtstrTestEntry '{}'.perf_delta_assertions gate on '{}' has \
+                     min_abs={} — must be finite and >= 0 (a negative or NaN floor \
+                     silently disables or inverts the gate).",
+                    self.name,
+                    metric,
+                    min,
+                );
+            }
+            // Duplicate (metric, phase): the compare consults declared gates via
+            // a first-match `.find()`, so a second gate on the same (metric,
+            // phase) is silently dropped. Reject rather than pick-one-silently.
+            if !seen.insert((metric, a.phase())) {
+                let scope = match a.phase() {
+                    Some(k) => format!("phase {k}"),
+                    None => "the aggregate value".to_string(),
+                };
+                anyhow::bail!(
+                    "KtstrTestEntry '{}'.perf_delta_assertions declares more than \
+                     one gate on metric '{}' for {} — the compare applies only the \
+                     first and silently drops the rest. Merge them into one gate.",
+                    self.name,
+                    metric,
+                    scope,
+                );
+            }
+        }
         Ok(())
     }
 }

@@ -1853,6 +1853,31 @@ fn prepare_partitioned_comparison(
     })
 }
 
+/// Warning for the SCALAR compare path when compared tests declare
+/// `perf_delta_assertions` gates it does not evaluate. Declared gates are a
+/// CI-gating perf assertion; gating on single-run scalar data would flip CI on
+/// noise, so they are honored ONLY under `perf-delta --noise-adjust` (multi-run,
+/// Welch + separation). Returning the message instead of a bare no-op keeps the
+/// gate from silently disappearing on the default `perf-delta` invocation.
+/// `None` when no compared test declares a gate. Pure (no I/O) so the
+/// count/message is unit-testable. Counts DISTINCT scenarios carrying a gate.
+pub(crate) fn scalar_declared_gate_warning(rows_b: &[GauntletRow]) -> Option<String> {
+    let n = rows_b
+        .iter()
+        .filter(|r| !r.perf_delta_assertions.is_empty())
+        .map(|r| r.scenario.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    (n > 0).then(|| {
+        format!(
+            "NOTE — {n} compared test(s) declare perf_delta_assertions gate(s) that this \
+             scalar comparison does NOT evaluate. Declared gates are enforced only under \
+             `perf-delta --noise-adjust N` (single-run scalar gating would flip CI on \
+             noise); re-run with --noise-adjust to gate on them."
+        )
+    })
+}
+
 /// Compare two filter-defined partitions of the sidecar pool and
 /// report regressions across slicing dimensions.
 ///
@@ -1955,6 +1980,11 @@ pub fn compare_partitions(
         if pair_names.is_empty() { "" } else { ", " },
         pair_names.join(", "),
     );
+    // Declared gates are not evaluated on the scalar path — warn rather than
+    // silently ignore (they are honored only under `perf-delta --noise-adjust`).
+    if let Some(warning) = scalar_declared_gate_warning(rows_b_for_compare) {
+        println!("{warning}");
+    }
 
     if !no_average {
         println!(
@@ -2031,14 +2061,25 @@ pub(crate) struct NoiseFinding {
     pub metric: &'static MetricDef,
     pub verdict: NoiseVerdict,
     pub kind: NoiseKind,
+    /// A whole-run [`crate::test_support::PerfDeltaAssertionRecord`] is declared
+    /// on this (test, metric) — its `min_abs` / `max_regression_pct` /
+    /// `direction` override the registry defaults in [`classify_noise`] (a
+    /// declared value that is out of range on a corrupt/stale sidecar is
+    /// rejected there and falls back to the registry default, but the row still
+    /// CARRIES the declared gate). Rendered as a `(declared gate)` verdict
+    /// annotation so the operator sees the author declared a gate here. `false`
+    /// = no declared assertion; the registry defaults classified this row.
+    pub gated_by_assertion: bool,
 }
 
 /// One metric's noise-adjusted finding for a matched PHASE of a paired
 /// scenario — the per-phase (`--noise-adjust` + per-phase) analog of
 /// [`NoiseFinding`], carrying the `step_index`/`label` the render prints.
 /// Emitted only for a `(step_index, metric)` present on BOTH sides across
-/// the runs. Render-only: per-phase findings never contribute to the gate
-/// exit (parity with the scalar per-phase [`PhaseDeltaRow`] pass).
+/// the runs. Per-phase SPREAD findings are render-only (parity with the
+/// scalar per-phase [`PhaseDeltaRow`] pass) EXCEPT one carrying an
+/// author-declared phase-scoped gate (`gated_by_assertion`), which DOES
+/// contribute to the exit via [`NoiseReport::declared_phase_regressions`].
 pub(crate) struct NoisePhaseFinding {
     /// The pairing-key label (see [`NoiseFinding::pairing_label`]).
     pub pairing_label: String,
@@ -2049,6 +2090,9 @@ pub(crate) struct NoisePhaseFinding {
     pub metric: &'static MetricDef,
     pub verdict: NoiseVerdict,
     pub kind: NoiseKind,
+    /// A phase-scoped declared assertion (`phase == Some(step_index)`) drove the
+    /// gate for this per-phase row — see [`NoiseFinding::gated_by_assertion`].
+    pub gated_by_assertion: bool,
 }
 
 /// A per-phase metric present on only ONE side of the noise comparison —
@@ -2074,13 +2118,33 @@ pub(crate) struct NoisePhaseCoverage {
     pub value: Option<f64>,
 }
 
+/// A declared [`crate::test_support::PerfDeltaAssertionRecord`] that was NEVER
+/// evaluated — its metric resolves in the registry (guaranteed by
+/// `KtstrTestEntry::validate`) but produced no comparable value in THIS
+/// comparison, so [`classify_noise`] never saw it. The runtime analog of the
+/// validate-time typo check: the author declared a perf gate that silently did
+/// not fire (metric absent from the captured data, a Rate with a zero pooled
+/// denominator, or — for a phase-scoped assertion — a step that no matched run
+/// carried). Surfaced (never gated) so a silently-inert declared gate is not
+/// mistaken for a passing one.
+pub(crate) struct NoiseAssertionCoverage {
+    /// The pairing-key label the unmatched gate was declared under (see
+    /// [`NoiseFinding::pairing_label`]).
+    pub pairing_label: String,
+    /// The declared gate that never evaluated — carries its metric, phase
+    /// scope, and overridden thresholds for the warning message.
+    pub assertion: crate::test_support::PerfDeltaAssertionRecord,
+}
+
 /// Result of [`noise_findings`]: the per-(scenario, metric) aggregate findings,
-/// the per-(scenario, phase, metric) findings + one-sided coverage rows, and the
-/// number of scenarios paired across both sides (for the footer).
+/// the per-(scenario, phase, metric) findings + one-sided coverage rows, the
+/// declared gates that never evaluated, and the number of scenarios paired
+/// across both sides (for the footer).
 pub(crate) struct NoiseReport {
     pub findings: Vec<NoiseFinding>,
     pub phase_findings: Vec<NoisePhaseFinding>,
     pub phase_coverage: Vec<NoisePhaseCoverage>,
+    pub assertion_coverage: Vec<NoiseAssertionCoverage>,
     pub paired_scenarios: usize,
 }
 
@@ -2102,11 +2166,27 @@ impl NoiseReport {
             .count()
     }
     /// Confident per-phase regressions — for the footer + tests ONLY, never
-    /// the exit basis (per-phase is render-only, like the scalar phase pass).
+    /// the exit basis (per-phase SPREAD is render-only, like the scalar phase
+    /// pass). A per-phase regression the author explicitly DECLARED via a
+    /// phase-scoped [`crate::test_support::PerfDeltaAssertion`] DOES gate — see
+    /// [`Self::declared_phase_regressions`].
     pub fn phase_regressions(&self) -> usize {
         self.phase_findings
             .iter()
             .filter(|f| f.kind == NoiseKind::Regression)
+            .count()
+    }
+    /// Per-phase regressions on a metric the test author explicitly DECLARED a
+    /// phase-scoped gate for. Unlike the render-only per-phase spread pass, a
+    /// declared phase gate is an opt-in: the author accepted the narrower
+    /// phase-window noise, so it contributes to the perf-delta EXIT alongside
+    /// the aggregate [`Self::regressions`]. A per-phase regression WITHOUT a
+    /// declared gate stays render-only (a narrow-window flake must not flip CI
+    /// red on its own).
+    pub fn declared_phase_regressions(&self) -> usize {
+        self.phase_findings
+            .iter()
+            .filter(|f| f.kind == NoiseKind::Regression && f.gated_by_assertion)
             .count()
     }
     /// Per-phase metrics flagged untrustworthy — a side had < 2 usable runs.
@@ -2139,7 +2219,7 @@ pub(crate) fn noise_findings(
     spread_threshold_pct: f64,
     include_stable: bool,
 ) -> NoiseReport {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     let group = |rows: &[GauntletRow]| {
         let mut by_key: BTreeMap<PairingKey, Vec<GauntletRow>> = BTreeMap::new();
         for r in rows {
@@ -2177,12 +2257,20 @@ pub(crate) fn noise_findings(
     let mut findings = Vec::new();
     let mut phase_findings = Vec::new();
     let mut phase_coverage = Vec::new();
+    let mut assertion_coverage = Vec::new();
     let mut paired_scenarios = 0usize;
     for (key, a_rows) in &a_by_key {
         let Some(b_rows) = b_by_key.get(key) else {
             continue;
         };
         paired_scenarios += 1;
+        // Metrics whose gate WAS evaluated this group, split by scope: whole-run
+        // (aggregate pass) and phase-scoped `(step_index, metric)` (per-phase
+        // pass). Diffed against the declared assertions after both passes to
+        // surface any declared gate that never fired (metric absent from the
+        // captured data).
+        let mut consulted: BTreeSet<&'static str> = BTreeSet::new();
+        let mut consulted_phase: BTreeSet<(u16, &'static str)> = BTreeSet::new();
         // Label by the FULL pairing key (scenario + pairing dims like
         // topology/work_type), joined as the scalar per-phase path does
         // (pairing_key.0.join). noise_findings groups by the full pairing key,
@@ -2237,7 +2325,21 @@ pub(crate) fn noise_findings(
                 }
                 _ => noise_verdict(&a_vals, &b_vals, spread_threshold_pct),
             };
-            let Some(kind) = classify_noise(&verdict, m, include_stable) else {
+            // This metric produced a comparable verdict, so a declared gate on
+            // it WAS evaluated — record it so the post-loop diff does not flag it
+            // as never-evaluated. Recorded here (not at the empty-values / zero-
+            // denominator `continue`s above) so those absent-data cases DO
+            // surface as unmatched declared gates.
+            consulted.insert(m.name);
+            // Aggregate (whole-run) declared assertion for this test+metric
+            // (phase: None). HEAD (B) side is authoritative on the declaration.
+            let assertion = b_rows.first().and_then(|r| {
+                r.perf_delta_assertions
+                    .iter()
+                    .find(|x| x.metric == m.name && x.phase.is_none())
+            });
+            let gated_by_assertion = assertion.is_some();
+            let Some(kind) = classify_noise(&verdict, m, assertion, include_stable) else {
                 continue;
             };
             findings.push(NoiseFinding {
@@ -2245,6 +2347,7 @@ pub(crate) fn noise_findings(
                 metric: m,
                 verdict,
                 kind,
+                gated_by_assertion,
             });
         }
         // Per-phase sub-pass: mirror the aggregate spread for each matched
@@ -2258,12 +2361,34 @@ pub(crate) fn noise_findings(
             include_stable,
             &mut phase_findings,
             &mut phase_coverage,
+            &mut consulted_phase,
         );
+        // Diff the declared gates (HEAD/B authoritative) against what actually
+        // evaluated this group. A whole-run gate (`phase: None`) matches when its
+        // metric produced an aggregate verdict; a phase-scoped gate matches when
+        // its `(phase, metric)` produced a per-phase verdict. Anything left is a
+        // gate the author declared that silently never fired — surfaced, never
+        // gated.
+        if let Some(first) = b_rows.first() {
+            for a in &first.perf_delta_assertions {
+                let matched = match a.phase {
+                    None => consulted.contains(a.metric.as_str()),
+                    Some(step) => consulted_phase.contains(&(step, a.metric.as_str())),
+                };
+                if !matched {
+                    assertion_coverage.push(NoiseAssertionCoverage {
+                        pairing_label: pairing_label.clone(),
+                        assertion: a.clone(),
+                    });
+                }
+            }
+        }
     }
     NoiseReport {
         findings,
         phase_findings,
         phase_coverage,
+        assertion_coverage,
         paired_scenarios,
     }
 }
@@ -2278,7 +2403,12 @@ pub(crate) fn noise_findings(
 /// `high_spread` flag does NOT gate (that suppression was the signal-inverting
 /// bug). A row is a confident regression only when SEPARATED (Welch or disjoint
 /// bands) AND MATERIAL (the registry dual-gate) in the worsening polarity.
-fn classify_noise(verdict: &NoiseVerdict, m: &MetricDef, include_stable: bool) -> Option<NoiseKind> {
+fn classify_noise(
+    verdict: &NoiseVerdict,
+    m: &MetricDef,
+    assertion: Option<&crate::test_support::PerfDeltaAssertionRecord>,
+    include_stable: bool,
+) -> Option<NoiseKind> {
     // No signal on either side (both ~zero): skip. Same zero epsilon as the
     // spread ratio for one consistent "is this zero".
     if verdict.a.mean.abs() < ZERO_MEAN_EPS && verdict.b.mean.abs() < ZERO_MEAN_EPS {
@@ -2315,10 +2445,48 @@ fn classify_noise(verdict: &NoiseVerdict, m: &MetricDef, include_stable: bool) -
     } else {
         0.0
     };
-    let material = delta.abs() >= m.default_abs && rel_delta >= m.default_rel;
+    // A declared PerfDeltaAssertion OVERRIDES the registry gate for THIS
+    // (test, metric): an absolute floor (`min_abs`), a relative threshold
+    // (`max_regression_pct`), and/or a pinned direction. Absent (None) =>
+    // registry defaults, so the no-assertion path is byte-identical to the
+    // default gate. A tighter declared threshold turns a default-Stable move
+    // into a Regression; a pinned direction can assert a registry-Informational
+    // metric.
+    //
+    // `min_abs` / `max_regression_pct` come from a pub serde
+    // `PerfDeltaAssertionRecord`. `KtstrTestEntry::validate` rejects a negative
+    // or NaN threshold on the entry-construction path, but a hand-edited or
+    // stale sidecar could deserialize one — and `delta.abs()` / `rel_delta` are
+    // non-negative, so a NEGATIVE gate makes `material` unconditionally true (a
+    // phantom confident regression that flips the exit) while a NaN gate makes
+    // every `>=` false (silently disabled). Reject out-of-range values here and
+    // fall back to the registry default — symmetric with the `TargetValue`
+    // direction guard below, defending the same untrusted deserialization path.
+    let abs_gate = assertion
+        .and_then(|x| x.min_abs)
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(m.default_abs);
+    let rel_gate = assertion
+        .and_then(|x| x.max_regression_pct)
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|pct| pct / 100.0)
+        .unwrap_or(m.default_rel);
+    let material = delta.abs() >= abs_gate && rel_delta >= rel_gate;
+    // A declared direction override, else the registry polarity. `TargetValue`
+    // is rejected at the `PerfDeltaAssertion::with_direction` builder, so a
+    // validated entry never carries it — but `PerfDeltaAssertionRecord` is a
+    // pub serde type, so a hand-edited or stale sidecar could deserialize a
+    // `direction: TargetValue`. Symmetric target-distance gating is
+    // unimplemented (the polarity path would misread it as increase-is-worse),
+    // so ignore it here and inherit the registry polarity — matching the
+    // entry-path guarantee on the sidecar-deserialization path.
+    let classify = match assertion.and_then(|x| x.direction) {
+        Some(crate::test_support::Polarity::TargetValue(_)) | None => m.classify_direction(),
+        Some(p) => p.classify_direction(),
+    };
 
     Some(if verdict.separated && material {
-        match m.classify_direction() {
+        match classify {
             // Directionless metric: a separated + material move with no good/bad
             // direction — shown, never fails the gate.
             None => NoiseKind::Informational,
@@ -2433,6 +2601,7 @@ fn noise_phase_findings(
     include_stable: bool,
     findings: &mut Vec<NoisePhaseFinding>,
     coverage: &mut Vec<NoisePhaseCoverage>,
+    consulted_phase: &mut std::collections::BTreeSet<(u16, &'static str)>,
 ) {
     use std::collections::BTreeSet;
     // Single-phase scenarios carry empty phases on every run; skip the per-phase
@@ -2548,7 +2717,18 @@ fn noise_phase_findings(
                         }
                         _ => noise_verdict(&a_vals, &b_vals, spread_threshold_pct),
                     };
-                    let Some(kind) = classify_noise(&verdict, m, include_stable) else {
+                    // This (step, metric) produced a comparable verdict, so a
+                    // phase-scoped gate on it WAS evaluated (see the aggregate
+                    // pass's `consulted`).
+                    consulted_phase.insert((step_index, m.name));
+                    // Phase-scoped declared assertion for this test+metric+step.
+                    let assertion = b_rows.first().and_then(|r| {
+                        r.perf_delta_assertions
+                            .iter()
+                            .find(|x| x.metric == m.name && x.phase == Some(step_index))
+                    });
+                    let gated_by_assertion = assertion.is_some();
+                    let Some(kind) = classify_noise(&verdict, m, assertion, include_stable) else {
                         continue;
                     };
                     findings.push(NoisePhaseFinding {
@@ -2558,6 +2738,7 @@ fn noise_phase_findings(
                         metric: m,
                         verdict,
                         kind,
+                        gated_by_assertion,
                     });
                 }
             }
@@ -2645,11 +2826,13 @@ pub(crate) fn summarize_side_runs(rows: &[GauntletRow]) -> (usize, String) {
 /// one-sided phases/metrics. `phase_opts` controls the per-phase render only
 /// (`--no-phases` / `--phases-only` / `--steps-only` / `--phase` /
 /// `--phase-threshold`); under `--phases-only` the aggregate table is
-/// suppressed. Per-phase findings are RENDER-ONLY — they are classified and
-/// colored but never contribute to the exit basis (which stays the aggregate
-/// confident-regression count), matching the scalar per-phase pass; the footer
-/// appends per-phase counts only when per-phase data exists and no phase filter
-/// is active.
+/// suppressed. Per-phase SPREAD findings are RENDER-ONLY — classified and
+/// colored but not gating, matching the scalar per-phase pass — EXCEPT a
+/// per-phase regression the author explicitly declared a phase-scoped gate for,
+/// which DOES contribute to the exit alongside the aggregate confident
+/// regressions (the exit basis is `regressions + declared_phase_regressions`).
+/// The footer appends per-phase counts only when per-phase data exists and no
+/// phase filter is active.
 ///
 /// When no scenario pairs, the aggregate note breaks down each side's loaded
 /// runs via [`summarize_side_runs`] — naming skipped / failed / inconclusive
@@ -2753,11 +2936,24 @@ pub fn compare_partitions_noise(
     for line in phase_lines {
         println!("{line}");
     }
+    // Declared gates that never evaluated (metric absent from the compared
+    // data). Rendered regardless of --phases-only — a silently-inert declared
+    // gate is important whether or not the aggregate table is shown. Never
+    // gates the exit.
+    for line in format_noise_assertion_coverage_lines(&report.assertion_coverage) {
+        println!("{line}");
+    }
     let regressions = report.regressions();
+    // Per-phase regressions the author explicitly DECLARED a phase-scoped gate
+    // for — these gate the exit alongside the aggregate regressions (spread-only
+    // per-phase findings stay render-only). Computed unconditionally so the exit
+    // is identical whether or not the phase footer is shown.
+    let declared_phase_regressions = report.declared_phase_regressions();
     // The aggregate summary footer describes the (hidden) aggregate spread, so
     // suppress it under --phases-only — which renders ONLY the per-phase block,
     // matching the scalar compare's summary suppression + the phases_only doc.
-    // The exit still gates on `regressions` (computed above) when it is hidden.
+    // The exit still gates on `regressions` + `declared_phase_regressions`
+    // (computed above) when the footer is hidden.
     if !phase_opts.phases_only {
         let noisy = report.noisy();
         // Per-phase footer counts are shown ONLY when there IS per-phase data
@@ -2774,17 +2970,33 @@ pub fn compare_partitions_noise(
             && !phase_opts.steps_only
             && phase_opts.phase_threshold.is_none();
         let phase_footer = if show_phase_footer {
+            // Per-phase regressions are render-only EXCEPT the declared-gated
+            // ones, which gate the exit — call that out so the count is not read
+            // as fully render-only when a declared phase gate fired.
+            let declared_note = if declared_phase_regressions > 0 {
+                format!(" ({declared_phase_regressions} declared-gated, exit-affecting)")
+            } else {
+                " (render-only)".to_string()
+            };
             format!(
-                "; {} per-phase regression(s), {} per-phase under-sampled (<2 runs) (render-only)",
+                "; {} per-phase regression(s){declared_note}, {} per-phase under-sampled (<2 runs)",
                 report.phase_regressions(),
                 report.phase_noisy(),
             )
         } else {
             String::new()
         };
+        // Declared gates that never evaluated — a single-line summary of the
+        // warning block above (shown whenever any gate went unevaluated).
+        let unevaluated_gates = report.assertion_coverage.len();
+        let gate_footer = if unevaluated_gates > 0 {
+            format!("; {unevaluated_gates} declared gate(s) not evaluated")
+        } else {
+            String::new()
+        };
         println!(
             "perf-delta --noise-adjust: {} paired scenario(s); {regressions} confident regression(s), \
-             {noisy} under-sampled metric(s) (<2 runs){phase_footer}",
+             {noisy} under-sampled metric(s) (<2 runs){phase_footer}{gate_footer}",
             report.paired_scenarios,
         );
     }
@@ -2807,10 +3019,44 @@ pub fn compare_partitions_noise(
             );
         }
     }
-    // Exit gates on AGGREGATE regressions only; per-phase findings are
-    // render-only (parity with the scalar per-phase pass — a narrow-window
-    // phase flake must not flip CI red).
-    Ok(if regressions > 0 { 1 } else { 0 })
+    // Exit gates on AGGREGATE regressions plus DECLARED phase regressions.
+    // Spread-only per-phase findings stay render-only (parity with the scalar
+    // per-phase pass — a narrow-window phase flake must not flip CI red), but a
+    // phase-scoped gate the author explicitly declared is an opt-in and DOES
+    // gate (matches the `PerfDeltaAssertion::phase` doc).
+    Ok(if regressions + declared_phase_regressions > 0 {
+        1
+    } else {
+        0
+    })
+}
+
+/// Compose a noise verdict cell's text: the base label plus any parenthesized,
+/// comma-joined annotations. Shared by the aggregate and per-phase tables so
+/// both annotate identically. `noisy spread` (advisory `high_spread`, suppressed
+/// on a Noisy <2-runs row where it is redundant) and `declared gate` (the row
+/// carries a declared [`crate::test_support::PerfDeltaAssertion`] — its
+/// overrides drive the gate, or fall back to the registry defaults if rejected
+/// as out-of-range on a corrupt sidecar) can co-occur → `REGRESSION (noisy
+/// spread, declared gate)`.
+fn compose_noise_verdict_text(
+    base: &str,
+    high_spread: bool,
+    kind: NoiseKind,
+    gated_by_assertion: bool,
+) -> String {
+    let mut annotations: Vec<&str> = Vec::new();
+    if high_spread && kind != NoiseKind::Noisy {
+        annotations.push("noisy spread");
+    }
+    if gated_by_assertion {
+        annotations.push("declared gate");
+    }
+    if annotations.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base} ({})", annotations.join(", "))
+    }
 }
 
 /// Render the per-metric noise-adjusted findings as a table for
@@ -2841,14 +3087,14 @@ pub(crate) fn format_noise_findings_table(
             NoiseKind::Informational => ("informational", Color::Blue),
             NoiseKind::Stable => ("stable", Color::Grey),
         };
-        // high_spread is ADVISORY — annotate a reported verdict so the operator
-        // sees a noisy side, but it never changed the classification (redundant
-        // on a Noisy <2-runs row, so omit it there).
-        let verdict_text = if f.verdict.high_spread && f.kind != NoiseKind::Noisy {
-            format!("{base} (noisy spread)")
-        } else {
-            base.to_string()
-        };
+        // Verdict annotations (parenthesized, comma-joined). `noisy spread` is
+        // ADVISORY (high_spread) — flags a noisy side without changing the
+        // classification, redundant on a Noisy <2-runs row so omitted there.
+        // `declared gate` marks a row that CARRIES a declared PerfDeltaAssertion
+        // (its overrides drive the gate, or fall back to registry defaults if
+        // rejected as out-of-range on a corrupt sidecar), so the operator can
+        // tell an author-declared gate from a pure registry-default one.
+        let verdict_text = compose_noise_verdict_text(base, f.verdict.high_spread, f.kind, f.gated_by_assertion);
         let v = &f.verdict;
         table.add_row(vec![
             Cell::new(format!("{} / {}", f.pairing_label, f.metric.name)),
@@ -2864,6 +3110,82 @@ pub(crate) fn format_noise_findings_table(
         ]);
     }
     format!("{table}\n")
+}
+
+/// One-line description of a declared gate's overrides for the
+/// not-evaluated warning: the thresholds it WOULD have applied. All-`None`
+/// (a bare `PerfDeltaAssertion::new(metric)`) renders `registry defaults` —
+/// a presence-checked gate that inherits the registry `default_abs`/
+/// `default_rel`/polarity.
+fn describe_declared_gate(a: &crate::test_support::PerfDeltaAssertionRecord) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(pct) = a.max_regression_pct {
+        parts.push(format!("max_regression_pct={pct}"));
+    }
+    if let Some(abs) = a.min_abs {
+        parts.push(format!("min_abs={abs}"));
+    }
+    if let Some(dir) = a.direction {
+        parts.push(format!("direction={dir:?}"));
+    }
+    if parts.is_empty() {
+        "registry defaults".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Render the declared perf gates that never evaluated (a metric absent from
+/// the compared data) as warning lines for `perf-delta --noise-adjust`: a
+/// TEST | METRIC | PHASE | DECLARED GATE table, so an author whose declared
+/// [`crate::test_support::PerfDeltaAssertion`] silently did not fire sees it
+/// rather than mistaking a not-evaluated gate for a passing one. Never gates
+/// the exit (a gate that could not evaluate is not a regression). Pure —
+/// returns the lines (empty when there are none) so the mapping is
+/// unit-testable without capturing stdout.
+pub(crate) fn format_noise_assertion_coverage_lines(
+    coverage: &[NoiseAssertionCoverage],
+) -> Vec<String> {
+    use comfy_table::{Cell, Color};
+    let mut lines = Vec::new();
+    if coverage.is_empty() {
+        return lines;
+    }
+    let mut rows: Vec<&NoiseAssertionCoverage> = coverage.iter().collect();
+    rows.sort_by(|a, b| {
+        a.pairing_label
+            .cmp(&b.pairing_label)
+            .then_with(|| a.assertion.metric.cmp(&b.assertion.metric))
+            .then_with(|| a.assertion.phase.cmp(&b.assertion.phase))
+    });
+    lines.push(String::new());
+    lines.push(
+        "declared perf gate(s) NOT evaluated — the metric was absent from the compared \
+         data (workload no longer emits it, a one-sided/failed run, or a Rate with no \
+         samples), so the declared gate silently did not fire:"
+            .to_string(),
+    );
+    let mut table = crate::cli::new_table();
+    table.set_header(vec![
+        "TEST".to_string(),
+        "METRIC".to_string(),
+        "PHASE".to_string(),
+        "DECLARED GATE".to_string(),
+    ]);
+    for c in rows {
+        let phase = match c.assertion.phase {
+            None => "aggregate".to_string(),
+            Some(k) => k.to_string(),
+        };
+        table.add_row(vec![
+            Cell::new(&c.pairing_label),
+            Cell::new(&c.assertion.metric).fg(Color::Yellow),
+            Cell::new(phase),
+            Cell::new(describe_declared_gate(&c.assertion)),
+        ]);
+    }
+    lines.push(format!("{table}"));
+    lines
 }
 
 /// Render the per-phase noise-adjusted findings as lines for
@@ -2933,13 +3255,9 @@ pub(crate) fn format_noise_phase_findings_lines(
                 NoiseKind::Informational => ("informational", Color::Blue),
                 NoiseKind::Stable => ("stable", Color::Grey),
             };
-            // high_spread is ADVISORY — annotate but never reclassify (redundant
-            // on a Noisy <2-runs row).
-            let verdict_text = if f.verdict.high_spread && f.kind != NoiseKind::Noisy {
-                format!("{base} (noisy spread)")
-            } else {
-                base.to_string()
-            };
+            // Same annotation composition as the aggregate table (advisory
+            // `noisy spread` + `declared gate`).
+            let verdict_text = compose_noise_verdict_text(base, f.verdict.high_spread, f.kind, f.gated_by_assertion);
             let v = &f.verdict;
             table.add_row(vec![
                 Cell::new(format!("{}: {}", f.step_index, f.label)),

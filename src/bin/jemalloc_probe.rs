@@ -2199,6 +2199,7 @@ mod tests {
     fn minimal_sidecar_json() -> String {
         let sc = ktstr::test_support::SidecarResult {
             test_name: "t".to_string(),
+            perf_delta_assertions: Vec::new(),
             topology: "1n1l1c1t".to_string(),
             scheduler: "eevdf".to_string(),
             scheduler_commit: None,

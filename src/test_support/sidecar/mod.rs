@@ -489,6 +489,52 @@ pub struct SidecarResult {
     /// lost its tag" — both lower-bound at `None` for filter
     /// purposes.
     pub run_source: Option<String>,
+    /// Per-test [`crate::test_support::PerfDeltaAssertion`]s declared on the
+    /// entry, serialized so `cargo ktstr perf-delta --noise-adjust`'s host-side
+    /// compare can enforce them across commits (the entry registry in the parent
+    /// process describes only HEAD's tests, not a baseline/cached sidecar's
+    /// commit, so the declaration must travel WITH the run). Empty when the test
+    /// declared none. Inert here — a normal `cargo ktstr test` writes them but
+    /// never gates on them; only the `--noise-adjust` compare consults them (the
+    /// scalar compare warns that declared gates were skipped).
+    ///
+    /// Writer always emits (`"perf_delta_assertions": []` on absence); reader-
+    /// side this `Vec` field is hard-required (non-`Option` fails deserialize on
+    /// absence) — see the module-level doc for the full contract.
+    pub perf_delta_assertions: Vec<PerfDeltaAssertionRecord>,
+}
+
+/// Owned, serialized mirror of [`crate::test_support::PerfDeltaAssertion`]. The
+/// public declaration type uses `&'static str` (so it stays const/E0493-safe on
+/// the entry) and therefore cannot `Deserialize` into an owned value; this
+/// `String`-backed record is the sidecar carrier the perf-delta compare reads.
+/// `pub` because it is a field of the `pub` [`SidecarResult`] (constructed
+/// across the workspace, including by the `cargo-ktstr` binary crate); the
+/// author-facing declaration type is [`crate::test_support::PerfDeltaAssertion`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PerfDeltaAssertionRecord {
+    /// Registry metric name this assertion gates (see `stats list-metrics`).
+    pub metric: String,
+    /// Pinned regression direction, or `None` to inherit the registry polarity.
+    pub direction: Option<crate::test_support::Polarity>,
+    /// Relative-regression override (percent), or `None` for `default_rel`.
+    pub max_regression_pct: Option<f64>,
+    /// Absolute-materiality override, or `None` for `default_abs`.
+    pub min_abs: Option<f64>,
+    /// Phase scope (`step_index`), or `None` to gate the aggregate value.
+    pub phase: Option<u16>,
+}
+
+impl From<&crate::test_support::PerfDeltaAssertion> for PerfDeltaAssertionRecord {
+    fn from(a: &crate::test_support::PerfDeltaAssertion) -> Self {
+        Self {
+            metric: a.metric().to_string(),
+            direction: a.direction(),
+            max_regression_pct: a.max_regression_pct(),
+            min_abs: a.min_abs(),
+            phase: a.phase(),
+        }
+    }
 }
 
 impl SidecarResult {
@@ -583,6 +629,7 @@ impl SidecarResult {
     pub(crate) fn test_fixture() -> SidecarResult {
         SidecarResult {
             test_name: "t".to_string(),
+            perf_delta_assertions: Vec::new(),
             topology: "1n1l1c1t".to_string(),
             scheduler: "eevdf".to_string(),
             scheduler_commit: None,
@@ -3545,6 +3592,11 @@ pub(crate) fn write_skip_sidecar(
     } = scheduler_fingerprint(entry);
     let sidecar = SidecarResult {
         test_name: entry.name.to_string(),
+        perf_delta_assertions: entry
+            .perf_delta_assertions
+            .iter()
+            .map(|&a| a.into())
+            .collect(),
         // The RESOLVED topology a run of this preset would boot
         // (resolve_vm_topology(entry, topo)), NOT the declared
         // entry.topology — for a topology gauntlet each preset boots a
@@ -3645,6 +3697,11 @@ pub(crate) fn write_sidecar(
     } = scheduler_fingerprint(entry);
     let sidecar = SidecarResult {
         test_name: entry.name.to_string(),
+        perf_delta_assertions: entry
+            .perf_delta_assertions
+            .iter()
+            .map(|&a| a.into())
+            .collect(),
         // The RESOLVED topology this run booted (resolve_vm_topology
         // result), NOT the declared entry.topology — a topology gauntlet
         // boots a distinct topology per preset, so the declared value

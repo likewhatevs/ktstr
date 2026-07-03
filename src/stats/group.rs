@@ -757,6 +757,9 @@ impl<'a> Accumulator<'a> {
         let ext_metrics = fold_ext_metrics(acc.ext_pairs, &acc.ext_counter_keys);
         let aggregated = GauntletRow {
             scenario: acc.first.scenario.clone(),
+            // Per-test gate declarations are identical across a test's grouped
+            // runs (same entry), so the first row's carry the group's.
+            perf_delta_assertions: acc.first.perf_delta_assertions.clone(),
             topology: acc.first.topology.clone(),
             work_type: acc.first.work_type.clone(),
             scheduler: acc.first.scheduler.clone(),
@@ -1172,6 +1175,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
 
     GauntletRow {
         scenario: sc.test_name.clone(),
+        perf_delta_assertions: sc.perf_delta_assertions.clone(),
         topology: sc.topology.clone(),
         work_type: sc.work_type.clone(),
         scheduler: sc.scheduler.clone(),

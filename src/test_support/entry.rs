@@ -735,6 +735,175 @@ impl WatchBpfMap {
     }
 }
 
+/// A per-test performance-regression assertion that
+/// `cargo ktstr perf-delta --noise-adjust` enforces when this test is compared
+/// across two commits — and that a normal `cargo ktstr test` run IGNORES.
+///
+/// Enforced ONLY under `--noise-adjust`. A declared gate is a CI-gating perf
+/// assertion; gating on a single-run scalar comparison would flip CI on noise,
+/// so the multi-run `--noise-adjust` path (Welch + disjoint-band separation) is
+/// the only statistically sound basis. Plain `perf-delta` (scalar) does NOT
+/// evaluate declared gates — it warns that they were skipped. Declaring a gate
+/// also REQUIRES `performance_mode` (validated at compile time by the macro and
+/// at discovery time by [`KtstrTestEntry::validate`]) so the compared data is
+/// pinned.
+///
+/// Inert-as-a-test / active-under-perf-delta is by CONSTRUCTION, not a runtime
+/// flag: the in-VM verdict path consults only [`crate::assert::Assert`], never a
+/// `PerfDeltaAssertion`, so declaring one changes no normal-run verdict or exit
+/// code. It becomes active only because `perf-delta` serializes the declaration
+/// into the sidecar and consults it in the host-side `--noise-adjust` compare.
+///
+/// A declaration names a registry metric and OVERRIDES, for this test, the gate
+/// that decides a confident regression on it: a tighter relative threshold, an
+/// absolute floor, a pinned direction, and/or a phase scope. It LAYERS ON TOP of
+/// the `--noise-adjust` default all-metrics regression net (which still runs, to
+/// catch unknown-unknown regressions) — it is an explicit contract check, not a
+/// whitelist that narrows the net.
+///
+/// Declare by binding each gate to a `const` and listing it on the macro:
+/// `const RPS_GATE: PerfDeltaAssertion =
+/// PerfDeltaAssertion::new("rps_p50").with_max_regression_pct(5.0);` then
+/// `#[ktstr_test(performance_mode = true, perf_delta_assertions = [RPS_GATE])]`.
+/// Or directly on a programmatically-built [`KtstrTestEntry`]:
+/// `perf_delta_assertions: &[&RPS_GATE]` — bind the const first; a chained inline
+/// `&PerfDeltaAssertion::new(..).with_*(..)` does NOT rvalue-promote to `'static`
+/// in a non-const `KtstrTestEntry { .. }` literal (E0716). Construct via
+/// [`PerfDeltaAssertion::new`] + the `const fn` `with_*` builders; fields are
+/// crate-private so every value passes the compile-time format gate. The type is
+/// `Copy` over a `&'static str` metric (no `Drop`, E0493-safe); the owned form
+/// the sidecar serializes is a separate internal mirror,
+/// [`crate::test_support::PerfDeltaAssertionRecord`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PerfDeltaAssertion {
+    metric: &'static str,
+    direction: Option<crate::test_support::Polarity>,
+    max_regression_pct: Option<f64>,
+    min_abs: Option<f64>,
+    phase: Option<u16>,
+}
+
+impl PerfDeltaAssertion {
+    /// Const constructor for use in `static`/`const` context. `metric` is a
+    /// registry metric name (see `cargo ktstr stats list-metrics`); the
+    /// remaining knobs default to the registry values and are set via the
+    /// builders below.
+    ///
+    /// # Panics
+    ///
+    /// Panics at compile time when `metric` is empty, contains whitespace or a
+    /// path separator (`/`, `\`), or a non-printable / high-bit byte. That the
+    /// name RESOLVES in the metric registry is checked at run time by
+    /// [`KtstrTestEntry::validate`] (the registry is not const-accessible).
+    pub const fn new(metric: &'static str) -> Self {
+        let m = metric.as_bytes();
+        assert!(!m.is_empty(), "PerfDeltaAssertion metric must not be empty");
+        let mut i = 0;
+        while i < m.len() {
+            let b = m[i];
+            assert!(
+                b != b' ' && b != b'\t' && b != b'\n' && b != b'\r',
+                "PerfDeltaAssertion metric must not contain whitespace",
+            );
+            assert!(
+                b != b'/' && b != b'\\',
+                "PerfDeltaAssertion metric must not contain path separators",
+            );
+            assert!(
+                b >= 0x20 && b < 0x7f,
+                "PerfDeltaAssertion metric must be printable ASCII only",
+            );
+            i += 1;
+        }
+        Self {
+            metric,
+            direction: None,
+            max_regression_pct: None,
+            min_abs: None,
+            phase: None,
+        }
+    }
+
+    /// Override the relative-regression gate (percent) for this metric: a
+    /// worsening move larger than `pct`% of the baseline gates. `None` (unset)
+    /// inherits the registry `default_rel`. `pct` must be finite and `>= 0`
+    /// (enforced at discovery time by [`KtstrTestEntry::validate`]).
+    pub const fn with_max_regression_pct(mut self, pct: f64) -> Self {
+        self.max_regression_pct = Some(pct);
+        self
+    }
+
+    /// Override the absolute-materiality floor for this metric: a move smaller
+    /// than `min` in absolute units never gates, regardless of the relative
+    /// threshold. `None` (unset) inherits the registry `default_abs`. `min` must
+    /// be finite and `>= 0` (enforced at discovery time by
+    /// [`KtstrTestEntry::validate`]).
+    pub const fn with_min_abs(mut self, min: f64) -> Self {
+        self.min_abs = Some(min);
+        self
+    }
+
+    /// Pin the regression DIRECTION for this metric instead of inheriting the
+    /// registry polarity (e.g. assert a metric the registry treats as
+    /// `Informational` as `LowerBetter` for this test).
+    ///
+    /// # Panics
+    ///
+    /// Panics at compile time on [`crate::test_support::Polarity::TargetValue`]:
+    /// symmetric target-distance gating is not implemented, and the compare
+    /// polarity path would silently treat it as increase-is-worse. Use
+    /// `HigherBetter`, `LowerBetter`, or `Informational`.
+    pub const fn with_direction(mut self, polarity: crate::test_support::Polarity) -> Self {
+        assert!(
+            !matches!(polarity, crate::test_support::Polarity::TargetValue(_)),
+            "PerfDeltaAssertion::with_direction does not support Polarity::TargetValue \
+             (symmetric target-distance gating is unimplemented); use HigherBetter, \
+             LowerBetter, or Informational",
+        );
+        self.direction = Some(polarity);
+        self
+    }
+
+    /// Scope the assertion to a single phase (`step_index`: `0` = BASELINE,
+    /// `1..=N` = scenario `Step` ordinals). `None` (unset) gates the aggregate
+    /// (whole-run) value. Unlike the render-only per-phase spread tables, a
+    /// phase-scoped assertion DOES contribute to the `perf-delta --noise-adjust`
+    /// exit code (the scalar `perf-delta` path warns and skips all declared
+    /// gates, phase-scoped included).
+    pub const fn with_phase(mut self, step_index: u16) -> Self {
+        self.phase = Some(step_index);
+        self
+    }
+
+    /// The registry metric name this assertion gates.
+    pub const fn metric(&self) -> &'static str {
+        self.metric
+    }
+
+    /// The pinned regression direction, or `None` to inherit the registry
+    /// polarity.
+    pub const fn direction(&self) -> Option<crate::test_support::Polarity> {
+        self.direction
+    }
+
+    /// The relative-regression override (percent), or `None` for the registry
+    /// `default_rel`.
+    pub const fn max_regression_pct(&self) -> Option<f64> {
+        self.max_regression_pct
+    }
+
+    /// The absolute-materiality override, or `None` for the registry
+    /// `default_abs`.
+    pub const fn min_abs(&self) -> Option<f64> {
+        self.min_abs
+    }
+
+    /// The phase scope (`step_index`), or `None` to gate the aggregate value.
+    pub const fn phase(&self) -> Option<u16> {
+        self.phase
+    }
+}
+
 /// Gauntlet topology filtering constraints.
 ///
 /// Controls which gauntlet presets are eligible for a test entry.
@@ -1588,6 +1757,19 @@ pub struct KtstrTestEntry {
     /// available. The four host-side optimizations (vCPU pinning,
     /// hugepages, NUMA mbind, RT scheduling) apply.
     pub performance_mode: bool,
+    /// Per-test performance-regression assertions enforced ONLY by
+    /// `cargo ktstr perf-delta --noise-adjust` (inert under a normal
+    /// `cargo ktstr test` run — the in-VM verdict never consults them — and
+    /// skipped-with-a-warning under a scalar `perf-delta` without
+    /// `--noise-adjust`, since single-run gating would flip CI on noise). Each
+    /// [`PerfDeltaAssertion`] names a registry metric and overrides the
+    /// confident-regression gate for it (relative / absolute threshold,
+    /// direction, phase scope), LAYERED ON TOP of the `--noise-adjust` default
+    /// all-metrics net. Serialized into the sidecar so the host-side compare can
+    /// read the declaration. `&[]` = no per-test assertions. Requires
+    /// `performance_mode` (checked by [`Self::validate`] and the macro) — a
+    /// declaration on a non-perf test would compare unpinned, noisy data.
+    pub perf_delta_assertions: &'static [&'static PerfDeltaAssertion],
     /// Enable the virtio-PCI transport: a host bridge at `00:00.0`
     /// plus the PCI0 ECAM/CAM config-access windows. When `false`, no
     /// PCI host bridge is exposed and the guest cmdline carries
@@ -2052,6 +2234,7 @@ impl KtstrTestEntry {
         bpf_map_write: &[],
         watch_bpf_maps: &[],
         performance_mode: false,
+        perf_delta_assertions: &[],
         pci: false,
         no_perf_mode: false,
         duration: Duration::from_secs(12),
@@ -3544,6 +3727,182 @@ mod tests {
         entry
             .validate()
             .expect("cpu_budget + no_perf_mode must validate");
+    }
+
+    /// `validate()` rejects `perf_delta_assertions` without
+    /// `performance_mode` — a declared regression gate is only meaningful on
+    /// a pinned run (mirrors the macro's compile-time reject). Guards the
+    /// programmatic-construction path.
+    #[test]
+    fn validate_rejects_perf_delta_assertions_without_performance_mode() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        const GATE: PerfDeltaAssertion = PerfDeltaAssertion::new("worst_spread");
+        let entry = KtstrTestEntry {
+            name: "gate_no_perf_mode",
+            func: good_test_func,
+            perf_delta_assertions: &[&GATE],
+            performance_mode: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("perf_delta_assertions without performance_mode must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("perf_delta_assertions") && msg.contains("performance_mode"),
+            "expected perf_delta_assertions/performance_mode diagnostic, got: {msg}",
+        );
+    }
+
+    /// `validate()` rejects a `perf_delta_assertions` metric that does not
+    /// resolve in the registry — `PerfDeltaAssertion::new` validates only the
+    /// NAME FORMAT at compile time (the registry is not const-accessible), so a
+    /// typo'd-but-well-formed metric name is caught here at run time. Without it
+    /// the gate would silently never match a captured field.
+    #[test]
+    fn validate_rejects_perf_delta_assertions_unknown_metric() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        const GATE: PerfDeltaAssertion = PerfDeltaAssertion::new("totally_made_up_metric");
+        let entry = KtstrTestEntry {
+            name: "gate_unknown_metric",
+            func: good_test_func,
+            perf_delta_assertions: &[&GATE],
+            performance_mode: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("an unregistered metric must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("totally_made_up_metric") && msg.contains("unknown metric"),
+            "expected unknown-metric diagnostic, got: {msg}",
+        );
+    }
+
+    /// A well-formed, registry-resolving gate under `performance_mode` is the
+    /// legitimate shape — pins the happy path against the two rejection paths so
+    /// a future edit can't flip polarity and reject every valid declared gate.
+    #[test]
+    fn validate_accepts_perf_delta_assertions_with_performance_mode_and_known_metric() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        const GATE: PerfDeltaAssertion = PerfDeltaAssertion::new("worst_spread")
+            .with_max_regression_pct(5.0)
+            .with_min_abs(0.5);
+        let entry = KtstrTestEntry {
+            name: "gate_ok",
+            func: good_test_func,
+            perf_delta_assertions: &[&GATE],
+            performance_mode: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry
+            .validate()
+            .expect("a known metric under performance_mode must validate");
+    }
+
+    /// `validate()` rejects a gate on a render-suppressed rate COMPONENT: it
+    /// resolves in the registry (so the unknown-metric check passes) but never
+    /// surfaces a compare finding, so the gate could never fire.
+    #[test]
+    fn validate_rejects_perf_delta_assertions_render_suppressed_component() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        const GATE: PerfDeltaAssertion = PerfDeltaAssertion::new("total_phase_iterations");
+        let entry = KtstrTestEntry {
+            name: "gate_suppressed_component",
+            func: good_test_func,
+            perf_delta_assertions: &[&GATE],
+            performance_mode: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("a render-suppressed component gate must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("total_phase_iterations") && msg.contains("render-suppressed"),
+            "expected render-suppressed-component diagnostic, got: {msg}",
+        );
+    }
+
+    /// `validate()` rejects a negative or NaN threshold override — either would
+    /// silently disable or invert the gate in classify_noise.
+    #[test]
+    fn validate_rejects_perf_delta_assertions_negative_or_nan_threshold() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        const NEG: PerfDeltaAssertion =
+            PerfDeltaAssertion::new("worst_spread").with_max_regression_pct(-1.0);
+        let e1 = KtstrTestEntry {
+            name: "gate_neg_pct",
+            func: good_test_func,
+            perf_delta_assertions: &[&NEG],
+            performance_mode: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert!(
+            format!("{}", e1.validate().unwrap_err()).contains("max_regression_pct"),
+            "a negative relative threshold must be rejected",
+        );
+        const NAN_ABS: PerfDeltaAssertion =
+            PerfDeltaAssertion::new("worst_spread").with_min_abs(f64::NAN);
+        let e2 = KtstrTestEntry {
+            name: "gate_nan_abs",
+            func: good_test_func,
+            perf_delta_assertions: &[&NAN_ABS],
+            performance_mode: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert!(
+            format!("{}", e2.validate().unwrap_err()).contains("min_abs"),
+            "a NaN absolute floor must be rejected",
+        );
+    }
+
+    /// `validate()` rejects two gates on the same (metric, phase): the compare
+    /// applies only the first via `.find()` and silently drops the rest.
+    #[test]
+    fn validate_rejects_perf_delta_assertions_duplicate_metric_phase() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        const A: PerfDeltaAssertion =
+            PerfDeltaAssertion::new("worst_spread").with_max_regression_pct(5.0);
+        const B: PerfDeltaAssertion = PerfDeltaAssertion::new("worst_spread").with_min_abs(1.0);
+        let entry = KtstrTestEntry {
+            name: "gate_dup",
+            func: good_test_func,
+            perf_delta_assertions: &[&A, &B],
+            performance_mode: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("duplicate (metric, phase) gates must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("more than one gate") && msg.contains("worst_spread"),
+            "expected duplicate-gate diagnostic, got: {msg}",
+        );
+    }
+
+    /// `PerfDeltaAssertion::with_direction` panics on `Polarity::TargetValue`:
+    /// symmetric target-distance gating is unimplemented and the compare would
+    /// misclassify it as increase-is-worse.
+    #[test]
+    #[should_panic(expected = "TargetValue")]
+    fn with_direction_rejects_target_value() {
+        let _ = PerfDeltaAssertion::new("worst_spread")
+            .with_direction(crate::test_support::Polarity::TargetValue(5.0));
     }
 
     /// `validate()` rejects `num_snapshots` greater than the bridge

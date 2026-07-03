@@ -367,6 +367,13 @@ pub struct GauntletRow {
     /// carrying an empty array.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub phases: Vec<crate::assert::PhaseBucket>,
+    /// Per-test [`crate::test_support::PerfDeltaAssertion`] declarations (owned
+    /// records) carried from the sidecar so the perf-delta noise compare can
+    /// enforce the declared gate. Empty for rows with none; `serde(default)`
+    /// tolerates legacy sidecars (pre-1.0 disposability). NOT a pairing/slicing
+    /// dimension — per-test gate metadata only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub perf_delta_assertions: Vec<crate::test_support::PerfDeltaAssertionRecord>,
 }
 
 impl GauntletRow {

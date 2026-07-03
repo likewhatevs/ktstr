@@ -410,6 +410,7 @@ fn sidecar_payload_and_metrics_always_emit_when_empty() {
         cleanup_duration_ms,
         run_source,
         resolve_source,
+        perf_delta_assertions: _,
     } = loaded;
     assert!(payload.is_none());
     assert!(metrics.is_empty());

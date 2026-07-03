@@ -1352,12 +1352,7 @@ impl MetricDef {
     /// the deliberate split between "fold needs a direction" and "verdict
     /// must stay neutral".
     pub const fn classify_direction(&self) -> Option<bool> {
-        use crate::test_support::Polarity;
-        match self.polarity {
-            Polarity::Informational => None,
-            Polarity::HigherBetter => Some(false),
-            Polarity::LowerBetter | Polarity::TargetValue(_) | Polarity::Unknown => Some(true),
-        }
+        self.polarity.classify_direction()
     }
 }
 

@@ -267,6 +267,14 @@ fn test_fixture_variant_hash_is_stable() {
 fn sidecar_result_roundtrip() {
     let sc = SidecarResult {
         test_name: "my_test".to_string(),
+        // Distinct populated values so a dropped/mis-serialized field surfaces.
+        perf_delta_assertions: vec![super::PerfDeltaAssertionRecord {
+            metric: "rps_p50".to_string(),
+            direction: Some(crate::test_support::Polarity::HigherBetter),
+            max_regression_pct: Some(5.0),
+            min_abs: Some(1.0),
+            phase: Some(2),
+        }],
         topology: "1n2l4c2t".to_string(),
         scheduler: "scx_mitosis".to_string(),
         vcpus: 16,
@@ -392,6 +400,7 @@ fn sidecar_result_roundtrip() {
         cleanup_duration_ms,
         run_source,
         resolve_source,
+        perf_delta_assertions,
     } = loaded;
     // Hash-participating string fields round-trip verbatim.
     assert_eq!(test_name, "my_test");
@@ -473,6 +482,16 @@ fn sidecar_result_roundtrip() {
         "resolve_source must round-trip the literal discovery-path tag \
          populated on the write side",
     );
+    // The per-test perf-delta assertion round-trips field-for-field.
+    assert_eq!(perf_delta_assertions.len(), 1);
+    assert_eq!(perf_delta_assertions[0].metric, "rps_p50");
+    assert_eq!(
+        perf_delta_assertions[0].direction,
+        Some(crate::test_support::Polarity::HigherBetter),
+    );
+    assert_eq!(perf_delta_assertions[0].max_regression_pct, Some(5.0));
+    assert_eq!(perf_delta_assertions[0].min_abs, Some(1.0));
+    assert_eq!(perf_delta_assertions[0].phase, Some(2));
 }
 
 /// Exhaustive schema-audit gate for `SidecarResult`'s serde
@@ -527,6 +546,7 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
 
     let sc = SidecarResult {
         test_name: "audit".to_string(),
+        perf_delta_assertions: Vec::new(),
         topology: "8n8l16c2t".to_string(),
         scheduler: "scx_audit".to_string(),
         vcpus: 256,
@@ -813,6 +833,7 @@ fn sidecar_result_missing_required_field_rejected_by_deserialize() {
         "periodic_target",
         "vcpus",
         "cpu_budget",
+        "perf_delta_assertions",
     ];
 
     let fixture = SidecarResult::test_fixture();
