@@ -413,9 +413,9 @@ cargo ktstr test --kernel ~/linux -- -E 'test(my_test)'    # local source tree +
 cargo ktstr replay                                         # print a nextest filter for last session's failures (add --exec to re-run)
 cargo ktstr coverage                                       # tests under cargo-llvm-cov nextest
 cargo ktstr llvm-cov report --lcov --output-path lcov.info # raw llvm-cov passthrough (report/clean/show-env)
-cargo ktstr kernel build 6.14.2                            # cache a specific version
-cargo ktstr kernel build --source ~/linux                  # build from local source tree
-cargo ktstr kernel build --git URL --ref v6.14             # shallow-clone a git tree
+cargo ktstr kernel build --kernel 6.14.2                   # cache a specific version
+cargo ktstr kernel build --kernel ~/linux                  # build from a local source tree
+cargo ktstr kernel build --kernel git+URL#tag=v6.14        # build from a git tag
 cargo ktstr kernel list                                    # list cached kernels (shows (EOL) tags)
 cargo ktstr kernel clean --keep 3                          # keep 3 most recent
 cargo ktstr verifier                                       # BPF verifier sweep (auto-discover kernel)
@@ -451,9 +451,9 @@ Every `ktstr kernel ...` subcommand is identical to the corresponding
 ktstr topo                                                 # show host CPU topology
 ktstr shell --kernel 6.14.2                                # interactive VM shell (kernel optional)
 ktstr kernel list                                          # manage cached kernels
-ktstr kernel build 6.14.2
-ktstr kernel build --source ../linux
-ktstr kernel build --git URL --ref v6.14
+ktstr kernel build --kernel 6.14.2
+ktstr kernel build --kernel ../linux
+ktstr kernel build --kernel git+URL#tag=v6.14
 ktstr kernel clean --keep 3
 ktstr ctprof capture --output baseline.ctprof.zst         # snapshot every live thread's counters
 # ctprof capture pulls per-thread jemalloc counters via ptrace; needs root,

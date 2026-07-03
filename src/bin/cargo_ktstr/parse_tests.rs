@@ -1937,46 +1937,46 @@ fn parse_kernel_list_json() {
     assert!(m.is_ok(), "{}", m.err().unwrap());
 }
 
-/// `kernel list --range R` round-trips to
-/// `KernelCommand::List { range: Some(R), .. }` so the
+/// `kernel list --kernel R` round-trips to
+/// `KernelCommand::List { kernel: Some(R), .. }` so the
 /// dispatch site routes through `kernel_list_range_preview`
 /// rather than the cache-walk path. Pins the clap binding
-/// for the new `--range` flag — a regression that dropped
-/// the `range` field from the Subcommand enum would surface
+/// for the `--kernel` flag — a regression that dropped the
+/// `kernel` field from the Subcommand enum would surface
 /// here as a parse rejection.
 #[test]
 fn parse_kernel_list_range() {
     let Cargo {
         command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "list", "--range", "6.12..6.14"])
+    } = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "list", "--kernel", "6.12..6.14"])
         .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Kernel { command } = k.command else {
         panic!("expected Kernel");
     };
     let KernelCommand::List {
         json,
-        range,
+        kernel,
         include_eol,
     } = command
     else {
         panic!("expected KernelCommand::List, got {command:?}");
     };
-    assert!(!json, "bare --range must not enable --json");
+    assert!(!json, "bare --kernel must not enable --json");
     assert_eq!(
-        range.as_deref(),
+        kernel.as_deref(),
         Some("6.12..6.14"),
-        "--range must round-trip the literal spec for \
+        "--kernel must round-trip the literal spec for \
          dispatch to pass to `expand_kernel_range`",
     );
     assert!(
         !include_eol,
-        "bare --range must default --include-eol to false"
+        "bare --kernel range must default --include-eol to false"
     );
 }
 
-/// `kernel list --range R --json` round-trips both flags.
+/// `kernel list --kernel R --json` round-trips both flags.
 /// Pins the JSON-output mode is reachable on the range-preview
-/// path (a regression that wired `--range` only on the text
+/// path (a regression that wired `--kernel` only on the text
 /// path would surface here).
 #[test]
 fn parse_kernel_list_range_with_json() {
@@ -1987,7 +1987,7 @@ fn parse_kernel_list_range_with_json() {
         "ktstr",
         "kernel",
         "list",
-        "--range",
+        "--kernel",
         "6.12..6.14",
         "--json",
     ])
@@ -1997,21 +1997,21 @@ fn parse_kernel_list_range_with_json() {
     };
     let KernelCommand::List {
         json,
-        range,
+        kernel,
         include_eol,
     } = command
     else {
         panic!("expected KernelCommand::List, got {command:?}");
     };
-    assert!(json, "--json must round-trip alongside --range");
-    assert_eq!(range.as_deref(), Some("6.12..6.14"));
+    assert!(json, "--json must round-trip alongside --kernel");
+    assert_eq!(kernel.as_deref(), Some("6.12..6.14"));
     assert!(
         !include_eol,
-        "--range --json without --include-eol must default it to false"
+        "--kernel --json without --include-eol must default it to false"
     );
 }
 
-/// `kernel list --range R --include-eol` round-trips
+/// `kernel list --kernel R --include-eol` round-trips
 /// `include_eol=true` so the preview enumerates EOL series.
 #[test]
 fn parse_kernel_list_range_include_eol() {
@@ -2022,7 +2022,7 @@ fn parse_kernel_list_range_include_eol() {
         "ktstr",
         "kernel",
         "list",
-        "--range",
+        "--kernel",
         "6.11..6.14",
         "--include-eol",
     ])
@@ -2031,15 +2031,15 @@ fn parse_kernel_list_range_include_eol() {
         panic!("expected Kernel");
     };
     let KernelCommand::List {
-        range, include_eol, ..
+        kernel, include_eol, ..
     } = command
     else {
         panic!("expected KernelCommand::List, got {command:?}");
     };
-    assert_eq!(range.as_deref(), Some("6.11..6.14"));
+    assert_eq!(kernel.as_deref(), Some("6.11..6.14"));
     assert!(
         include_eol,
-        "`--include-eol` must round-trip as true on kernel list --range"
+        "`--include-eol` must round-trip as true on kernel list --kernel"
     );
 }
 
@@ -2110,7 +2110,7 @@ fn parse_stats_compare_with_run_source_per_side() {
 
 #[test]
 fn parse_kernel_build_version() {
-    let m = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "build", "6.14.2"]);
+    let m = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "build", "--kernel", "6.14.2"]);
     assert!(m.is_ok(), "{}", m.err().unwrap());
 }
 
@@ -2125,6 +2125,7 @@ fn parse_kernel_build_range_include_eol() {
         "ktstr",
         "kernel",
         "build",
+        "--kernel",
         "6.11..6.14",
         "--include-eol",
     ])
@@ -2133,124 +2134,60 @@ fn parse_kernel_build_range_include_eol() {
         panic!("expected Kernel");
     };
     let KernelCommand::Build {
-        version,
+        kernel,
         include_eol,
         ..
     } = command
     else {
         panic!("expected KernelCommand::Build, got {command:?}");
     };
-    assert_eq!(version.as_deref(), Some("6.11..6.14"));
+    assert_eq!(kernel.as_deref(), Some("6.11..6.14"));
     assert!(
         include_eol,
-        "`--include-eol` must round-trip as true on kernel build RANGE"
+        "`--include-eol` must round-trip as true on kernel build --kernel RANGE"
     );
 }
 
 #[test]
-fn parse_kernel_build_source() {
-    let m = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "build", "--source", "../linux"]);
+fn parse_kernel_build_path() {
+    let m = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "build", "--kernel", "../linux"]);
     assert!(m.is_ok(), "{}", m.err().unwrap());
 }
 
-/// Conflict pin: `--source PATH` and the positional VERSION are
-/// mutually exclusive at clap parse time. Catches a regression
-/// that drops the `conflicts_with` (or its equivalent
-/// `requires_ifs` shape) on the source flag and lets a contradictory
-/// `--source ../linux 6.14.2` invocation flow into the dispatcher,
-/// where `kernel build` would have to disambiguate a "use this
-/// tree" hint from a "fetch this version" hint at runtime.
+/// `kernel build --kernel git+URL#tag=NAME` round-trips a git source
+/// to `KernelCommand::Build { kernel: Some(git+…), .. }` so the
+/// dispatch routes through `resolve_git_kernel`. The old `--git` /
+/// `--ref` flags are retired; the explicit git grammar on `--kernel`
+/// is the one git surface (and additionally supports `#branch=` /
+/// `#sha=`).
 #[test]
-fn parse_kernel_build_source_conflicts_with_version() {
-    let result = Cargo::try_parse_from([
-        "cargo", "ktstr", "kernel", "build", "--source", "../linux", "6.14.2",
-    ]);
-    match result {
-        Ok(_) => panic!("--source + positional VERSION must be rejected at parse time"),
-        Err(err) => assert_eq!(
-            err.kind(),
-            clap::error::ErrorKind::ArgumentConflict,
-            "expected ArgumentConflict — a different ErrorKind would \
-             signal that the conflicts_with attribute regressed in a way \
-             the bare is_err() pin would silently mask. Full err: {err}",
-        ),
-    }
-}
-
-#[test]
-fn parse_kernel_build_git_requires_ref() {
-    let result = Cargo::try_parse_from([
+fn parse_kernel_build_git() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
         "cargo",
         "ktstr",
         "kernel",
         "build",
-        "--git",
-        "https://example.com/linux.git",
-    ]);
-    match result {
-        Ok(_) => panic!("--git without --ref must be rejected at parse time"),
-        Err(err) => assert_eq!(
-            err.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument,
-            "expected MissingRequiredArgument — `--git` carries \
-             `requires = \"git_ref\"` (clap uses the field name, not \
-             the long flag name), so a regression that dropped the \
-             attribute would surface as a different ErrorKind that \
-             the bare is_err() pin would silently mask. Full err: {err}",
-        ),
-    }
+        "--kernel",
+        "git+https://example.com/linux.git#tag=v6.14",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Kernel {
+        command: KernelCommand::Build { kernel, .. },
+    } = k.command
+    else {
+        panic!("expected KernelCommand::Build");
+    };
+    assert_eq!(
+        kernel.as_deref(),
+        Some("git+https://example.com/linux.git#tag=v6.14"),
+        "a git source must round-trip verbatim through --kernel",
+    );
 }
 
-#[test]
-fn parse_kernel_build_git_with_ref() {
-    let m = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "kernel",
-        "build",
-        "--git",
-        "https://example.com/linux.git",
-        "--ref",
-        "v6.14",
-    ]);
-    assert!(m.is_ok(), "{}", m.err().unwrap());
-}
-
-/// Conflict pin: `--git URL --ref REF` and `--source PATH` are
-/// mutually exclusive — git-spec triggers a clone, source-spec
-/// reuses an existing tree. Both at once would either silently
-/// favour one over the other or surface as an inscrutable
-/// dispatcher panic; clap's `conflicts_with` pushes the
-/// rejection up to parse time so the operator sees a clear
-/// argument-conflict error.
-#[test]
-fn parse_kernel_build_git_conflicts_with_source() {
-    let result = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "kernel",
-        "build",
-        "--git",
-        "https://example.com/linux.git",
-        "--ref",
-        "v6.14",
-        "--source",
-        "../linux",
-    ]);
-    match result {
-        Ok(_) => panic!("--git + --source must be rejected at parse time"),
-        Err(err) => assert_eq!(
-            err.kind(),
-            clap::error::ErrorKind::ArgumentConflict,
-            "expected ArgumentConflict — a different ErrorKind would \
-             signal that the conflicts_with attribute regressed in a way \
-             the bare is_err() pin would silently mask. Full err: {err}",
-        ),
-    }
-}
-
-/// `kernel build VERSION --extra-kconfig PATH` round-trips to
-/// `KernelCommand::Build { version: Some(..), extra_kconfig:
+/// `kernel build --kernel VERSION --extra-kconfig PATH` round-trips to
+/// `KernelCommand::Build { kernel: Some(..), extra_kconfig:
 /// Some(..), .. }` so the dispatch site forwards the path
 /// through `kernel_build` → `kernel_build_one` →
 /// `cli::kernel_build_pipeline` with `Some(content)`. Pins the
@@ -2266,6 +2203,7 @@ fn parse_kernel_build_with_extra_kconfig() {
         "ktstr",
         "kernel",
         "build",
+        "--kernel",
         "6.14.2",
         "--extra-kconfig",
         "/tmp/extra.kconfig",
@@ -2274,7 +2212,7 @@ fn parse_kernel_build_with_extra_kconfig() {
     let KtstrCommand::Kernel {
         command:
             KernelCommand::Build {
-                version,
+                kernel,
                 extra_kconfig,
                 ..
             },
@@ -2282,7 +2220,7 @@ fn parse_kernel_build_with_extra_kconfig() {
     else {
         panic!("expected KernelCommand::Build");
     };
-    assert_eq!(version.as_deref(), Some("6.14.2"));
+    assert_eq!(kernel.as_deref(), Some("6.14.2"));
     assert_eq!(
         extra_kconfig,
         Some(std::path::PathBuf::from("/tmp/extra.kconfig")),
@@ -2297,7 +2235,7 @@ fn parse_kernel_build_with_extra_kconfig() {
 fn parse_kernel_build_without_extra_kconfig_is_none() {
     let Cargo {
         command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "build", "6.14.2"])
+    } = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "build", "--kernel", "6.14.2"])
         .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Kernel {
         command: KernelCommand::Build { extra_kconfig, .. },
@@ -2327,6 +2265,7 @@ fn parse_kernel_build_with_skip_sha256() {
         "ktstr",
         "kernel",
         "build",
+        "--kernel",
         "6.14.2",
         "--skip-sha256",
     ])
@@ -2334,7 +2273,7 @@ fn parse_kernel_build_with_skip_sha256() {
     let KtstrCommand::Kernel {
         command:
             KernelCommand::Build {
-                version,
+                kernel,
                 skip_sha256,
                 ..
             },
@@ -2342,7 +2281,7 @@ fn parse_kernel_build_with_skip_sha256() {
     else {
         panic!("expected KernelCommand::Build");
     };
-    assert_eq!(version.as_deref(), Some("6.14.2"));
+    assert_eq!(kernel.as_deref(), Some("6.14.2"));
     assert!(
         skip_sha256,
         "--skip-sha256 must round-trip as true; without this the \
@@ -2358,7 +2297,7 @@ fn parse_kernel_build_with_skip_sha256() {
 fn parse_kernel_build_without_skip_sha256_is_false() {
     let Cargo {
         command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "build", "6.14.2"])
+    } = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "build", "--kernel", "6.14.2"])
         .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Kernel {
         command: KernelCommand::Build { skip_sha256, .. },
@@ -2374,14 +2313,13 @@ fn parse_kernel_build_without_skip_sha256_is_false() {
     );
 }
 
-/// `--skip-sha256` works alongside `--source` (local source tree
-/// path). Pins that the flag is not mutually exclusive with the
-/// other source-acquire flags — skip-sha256 is documented as a
-/// no-op on --source / --git, but clap must still ACCEPT the
-/// combination so the help-text-promised orthogonality holds at
-/// parse time.
+/// `--skip-sha256` works alongside a `--kernel <path>` source tree.
+/// Pins that the flag is not mutually exclusive with a path source —
+/// skip-sha256 is documented as a no-op there (a path or git source
+/// downloads no tarball), but clap must still ACCEPT the combination
+/// so the help-text-promised orthogonality holds at parse time.
 #[test]
-fn parse_kernel_build_skip_sha256_with_source() {
+fn parse_kernel_build_skip_sha256_with_path() {
     let Cargo {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from([
@@ -2389,7 +2327,7 @@ fn parse_kernel_build_skip_sha256_with_source() {
         "ktstr",
         "kernel",
         "build",
-        "--source",
+        "--kernel",
         "/tmp/src",
         "--skip-sha256",
     ])
@@ -2397,7 +2335,7 @@ fn parse_kernel_build_skip_sha256_with_source() {
     let KtstrCommand::Kernel {
         command:
             KernelCommand::Build {
-                source,
+                kernel,
                 skip_sha256,
                 ..
             },
@@ -2405,12 +2343,12 @@ fn parse_kernel_build_skip_sha256_with_source() {
     else {
         panic!("expected KernelCommand::Build");
     };
-    assert_eq!(source, Some(std::path::PathBuf::from("/tmp/src")));
+    assert_eq!(kernel.as_deref(), Some("/tmp/src"));
     assert!(
         skip_sha256,
-        "--skip-sha256 must round-trip when combined with --source \
-         (the help text promises the flag is a no-op there, but \
-         clap must still accept the combination)"
+        "--skip-sha256 must round-trip when combined with a --kernel \
+         <path> source (the help text promises the flag is a no-op \
+         there, but clap must still accept the combination)"
     );
 }
 
@@ -2426,6 +2364,7 @@ fn parse_kernel_build_skip_sha256_underscore_rejected() {
         "ktstr",
         "kernel",
         "build",
+        "--kernel",
         "6.14.2",
         "--skip_sha256",
     ]);
@@ -2452,6 +2391,7 @@ fn parse_kernel_build_skip_sha256_range_compose() {
         "ktstr",
         "kernel",
         "build",
+        "--kernel",
         "6.14.2..6.14.4",
         "--skip-sha256",
     ])
@@ -2459,7 +2399,7 @@ fn parse_kernel_build_skip_sha256_range_compose() {
     let KtstrCommand::Kernel {
         command:
             KernelCommand::Build {
-                version,
+                kernel,
                 skip_sha256,
                 ..
             },
@@ -2467,7 +2407,7 @@ fn parse_kernel_build_skip_sha256_range_compose() {
     else {
         panic!("expected KernelCommand::Build");
     };
-    assert_eq!(version.as_deref(), Some("6.14.2..6.14.4"));
+    assert_eq!(kernel.as_deref(), Some("6.14.2..6.14.4"));
     assert!(
         skip_sha256,
         "--skip-sha256 must round-trip on a range version so every \
@@ -2491,6 +2431,7 @@ fn parse_kernel_build_skip_sha256_with_extra_kconfig_and_force_clean() {
         "ktstr",
         "kernel",
         "build",
+        "--kernel",
         "6.14.2",
         "--skip-sha256",
         "--extra-kconfig",
@@ -2549,6 +2490,7 @@ fn parse_kernel_build_range_with_extra_kconfig() {
         "ktstr",
         "kernel",
         "build",
+        "--kernel",
         "6.14.2..6.14.4",
         "--extra-kconfig",
         "/tmp/range-extra.kconfig",
@@ -2557,7 +2499,7 @@ fn parse_kernel_build_range_with_extra_kconfig() {
     let KtstrCommand::Kernel {
         command:
             KernelCommand::Build {
-                version,
+                kernel,
                 extra_kconfig,
                 ..
             },
@@ -2565,7 +2507,7 @@ fn parse_kernel_build_range_with_extra_kconfig() {
     else {
         panic!("expected KernelCommand::Build");
     };
-    assert_eq!(version.as_deref(), Some("6.14.2..6.14.4"));
+    assert_eq!(kernel.as_deref(), Some("6.14.2..6.14.4"));
     assert_eq!(
         extra_kconfig,
         Some(std::path::PathBuf::from("/tmp/range-extra.kconfig")),
@@ -2586,7 +2528,7 @@ fn parse_kernel_build_force_clean_and_extra_kconfig_compose() {
         "ktstr",
         "kernel",
         "build",
-        "--source",
+        "--kernel",
         "../linux",
         "--force",
         "--clean",
@@ -2719,12 +2661,11 @@ fn parse_extra_kconfig_passes_through_test_subcommand_to_args_vec() {
     );
 }
 
-/// `--extra-kconfig` works alongside `--source` (local source
-/// tree path). Pins that the flag is not mutually exclusive
-/// with the other source-acquire flags — extra-kconfig is
-/// orthogonal to where the kernel SOURCE comes from.
+/// `--extra-kconfig` works alongside a `--kernel <path>` source
+/// tree. Pins that the flag is orthogonal to where the kernel
+/// SOURCE comes from.
 #[test]
-fn parse_kernel_build_extra_kconfig_with_source() {
+fn parse_kernel_build_extra_kconfig_with_path() {
     let Cargo {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from([
@@ -2732,7 +2673,7 @@ fn parse_kernel_build_extra_kconfig_with_source() {
         "ktstr",
         "kernel",
         "build",
-        "--source",
+        "--kernel",
         "../linux",
         "--extra-kconfig",
         "/tmp/extra.kconfig",
@@ -2741,7 +2682,7 @@ fn parse_kernel_build_extra_kconfig_with_source() {
     let KtstrCommand::Kernel {
         command:
             KernelCommand::Build {
-                source,
+                kernel,
                 extra_kconfig,
                 ..
             },
@@ -2749,7 +2690,7 @@ fn parse_kernel_build_extra_kconfig_with_source() {
     else {
         panic!("expected KernelCommand::Build");
     };
-    assert_eq!(source, Some(std::path::PathBuf::from("../linux")));
+    assert_eq!(kernel.as_deref(), Some("../linux"));
     assert_eq!(
         extra_kconfig,
         Some(std::path::PathBuf::from("/tmp/extra.kconfig")),
@@ -3667,7 +3608,7 @@ fn parse_shell_no_perf_mode_without_cpu_cap_succeeds() {
 // KERNEL_LIST_LONG_ABOUT — range-mode JSON schema discoverability
 // ---------------------------------------------------------------
 //
-// `cargo ktstr kernel list --range R --json` emits a
+// `cargo ktstr kernel list --kernel R --json` emits a
 // structurally-different JSON shape from the cache-walk mode:
 // four top-level fields (`range`, `start`, `end`, `versions`)
 // with no cache metadata. The help copy is the
@@ -3743,8 +3684,8 @@ fn kernel_list_long_about_exposes_range_mode_json_keys() {
          the `entries` key: got: {about:?}",
     );
     assert!(
-        about.contains("--range"),
-        "KERNEL_LIST_LONG_ABOUT must reference the `--range` flag \
+        about.contains("--kernel"),
+        "KERNEL_LIST_LONG_ABOUT must reference the `--kernel` flag \
          so a `kernel list --help` reader sees the range-mode \
          entry point: got: {about:?}",
     );
@@ -4343,30 +4284,6 @@ fn parse_verifier_kernel_repeatable() {
         vec!["6.14.2".to_string(), "6.15-rc3".to_string()],
         "verifier --kernel must accumulate via ArgAction::Append",
     );
-}
-
-// -- try_get_matches_from: kernel build --ref/--git symmetry --
-
-/// Symmetric pin to [`parse_kernel_build_git_requires_ref`]:
-/// `--ref REF` without `--git URL` must also fail at parse time.
-/// `git_ref` carries `requires = "git"`, so a regression that
-/// dropped that attribute would let `--ref` be set without a
-/// matching git URL — ambiguous at the dispatch layer.
-#[test]
-fn parse_kernel_build_ref_requires_git() {
-    let result = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "build", "--ref", "v6.14"]);
-    match result {
-        Ok(_) => panic!("--ref without --git must be rejected at parse time"),
-        Err(err) => assert_eq!(
-            err.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument,
-            "expected MissingRequiredArgument — `--ref` carries \
-             `requires = \"git\"` (clap uses the field name, not \
-             the long flag name), so a regression that dropped the \
-             attribute would surface as a different ErrorKind that \
-             the bare is_err() pin would silently mask. Full err: {err}",
-        ),
-    }
 }
 
 // -- try_get_matches_from: completions --binary default --

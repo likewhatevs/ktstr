@@ -264,9 +264,13 @@ pub(crate) fn resolve_one(
             ref git_ref,
             ref_kind,
         } => {
-            let cache_dir =
-                ktstr::cli::resolve_git_kernel(url, git_ref, ref_kind, "cargo ktstr", mp)
-                    .map_err(|e| format!("resolve git+{url}#{git_ref}: {e:#}"))?;
+            // Auto-discovery test path: no build-flag overrides (force /
+            // clean / cpu_cap / extra_kconfig are `cargo ktstr kernel
+            // build --kernel git+…`-only).
+            let cache_dir = ktstr::cli::resolve_git_kernel(
+                url, git_ref, ref_kind, "cargo ktstr", mp, false, false, None, None,
+            )
+            .map_err(|e| format!("resolve git+{url}#{git_ref}: {e:#}"))?;
             let dir = canonicalize_cache_dir(cache_dir);
             let label = git_kernel_label(url, git_ref, ref_kind);
             Ok((label, dir))
@@ -596,30 +600,38 @@ fn resolve_specs_parallel(
     }
 }
 
-/// Acquire source, configure, build, and cache a kernel image.
+/// Resolve the `--cpu-cap` flag into a build reservation plan, rejecting
+/// the `KTSTR_BYPASS_LLC_LOCKS` conflict up front so operators see the
+/// parse-time error, not an opaque pipeline bail later. Shared by the
+/// tarball / source path ([`kernel_build_one`]) and the git path
+/// ([`ktstr::cli::resolve_git_kernel`]).
+fn resolve_cpu_cap(cpu_cap: Option<usize>) -> Result<Option<cli::CpuCap>, String> {
+    if cpu_cap.is_some() && ktstr::bypass_llc_locks_active() {
+        return Err(
+            "--cpu-cap conflicts with KTSTR_BYPASS_LLC_LOCKS=1; unset one of them. \
+             --cpu-cap is a resource contract; bypass disables the contract entirely."
+                .to_string(),
+        );
+    }
+    cli::CpuCap::resolve(cpu_cap).map_err(|e| format!("{e:#}"))
+}
+
+/// Acquire source, configure, build, and cache a kernel image from a
+/// single unified `--kernel` spec.
 ///
-/// `version` accepts `MAJOR.MINOR[.PATCH][-rcN]` for a single tarball,
-/// `MAJOR.MINOR` (a major.minor prefix that resolves to the latest
-/// patch in that series), or `START..END` for a range that expands
-/// against kernel.org's `releases.json` to every `stable` /
-/// `longterm` release inside the inclusive interval. A range is
-/// detected via [`ktstr::kernel_path::KernelId::parse`] and
-/// dispatched here to [`kernel_build_one`] per resolved version,
-/// sharing the download / cache-lookup / build pipeline that
-/// single-version invocations use. Range mode collects per-version
-/// errors as a best-effort summary: a build failure on one version
-/// is reported and the iteration continues to the next, so a stale
-/// endpoint doesn't block the rest of the range from caching.
-///
-/// `--git` and `--source` paths bypass range expansion (range
-/// applies to tarball downloads only) and forward unchanged to
-/// [`kernel_build_one`].
-#[allow(clippy::too_many_arguments)]
+/// The spec parses to a [`ktstr::kernel_path::KernelId`] whose variant
+/// selects the source: a `Version` (`6.14.2`, or a `MAJOR.MINOR` prefix
+/// resolving to the latest patch) or omitted `--kernel` downloads a
+/// tarball; a `Range` (`START..END`) expands against kernel.org's
+/// `releases.json` and builds every `stable` / `longterm` release in
+/// the inclusive interval; a `Path` builds a local source tree; a `Git`
+/// source is fetched and built via [`ktstr::cli::resolve_git_kernel`]; a
+/// `CacheKey` is rejected (it names an already-built entry). Range mode
+/// collects per-version errors as a best-effort summary — a build
+/// failure on one version is reported and the iteration continues, so a
+/// stale endpoint doesn't block the rest of the range from caching.
 pub(crate) fn kernel_build(
-    version: Option<String>,
-    source: Option<PathBuf>,
-    git: Option<String>,
-    git_ref: Option<String>,
+    kernel: Option<String>,
     force: bool,
     clean: bool,
     cpu_cap: Option<usize>,
@@ -640,34 +652,28 @@ pub(crate) fn kernel_build(
         None => None,
     };
 
-    // Range dispatch only applies to tarball mode. `--source` and
-    // `--git` carry their own source-of-truth that ranges don't
-    // overlap with: a path identifies one tree, a git ref names one
-    // commit. A range argument alongside either is undefined input;
-    // clap's existing `conflicts_with` already rejects
-    // `version + source` and `version + git` combinations, so the
-    // range branch only fires when neither --source nor --git is
-    // present.
-    if source.is_none()
-        && git.is_none()
-        && let Some(ref v) = version
-    {
-        use ktstr::kernel_path::KernelId;
-        let id = KernelId::parse(v);
-        // Validate before any I/O: an inverted range surfaces the
-        // "swap the endpoints" diagnostic ahead of any download.
+    use ktstr::kernel_path::KernelId;
+    // The unified `--kernel` spec parses to a KernelId whose variant
+    // selects the source; omitted (`None`) builds the latest stable
+    // release via the tarball path. Validate before any I/O so an
+    // inverted range surfaces the "swap the endpoints" diagnostic ahead
+    // of any download.
+    let id = kernel.as_deref().map(KernelId::parse);
+    if let Some(id) = &id {
         id.validate().map_err(|e| format!("--kernel {id}: {e}"))?;
-        if let KernelId::Range { start, end, .. } = id {
-            let versions = ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr", include_eol)
-                .map_err(|e| format!("{e:#}"))?;
+    }
+
+    match id {
+        Some(KernelId::Range { start, end, .. }) => {
+            let versions =
+                ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr", include_eol)
+                    .map_err(|e| format!("{e:#}"))?;
             let total = versions.len();
             let mut failures: Vec<(String, String)> = Vec::new();
             for (i, ver) in versions.iter().enumerate() {
                 eprintln!("cargo ktstr: [{}/{total}] kernel build {ver}", i + 1);
                 if let Err(e) = kernel_build_one(
                     Some(ver.clone()),
-                    None,
-                    None,
                     None,
                     force,
                     clean,
@@ -682,18 +688,13 @@ pub(crate) fn kernel_build(
             if failures.is_empty() {
                 Ok(())
             } else {
-                // Surface the failure summary on the way out so an
-                // automated invocation can scrape one log line per
-                // failing version. Continue-on-error is the right
-                // default for ranges (a stale endpoint shouldn't
-                // gate the rest of the build cohort), but a
-                // non-zero exit still flags the cohort as
-                // partial.
+                // Continue-on-error is the right default for ranges (a
+                // stale endpoint shouldn't gate the rest of the cohort);
+                // a non-zero exit still flags the cohort as partial and
+                // the summary lists each failing version for scraping.
                 Err(format!(
                     "kernel build range {start}..{end}: {failed}/{total} \
                      version(s) failed: {names}",
-                    start = start,
-                    end = end,
                     failed = failures.len(),
                     names = failures
                         .iter()
@@ -702,40 +703,77 @@ pub(crate) fn kernel_build(
                         .join(", "),
                 ))
             }
-        } else {
-            kernel_build_one(
-                version,
-                source,
-                git,
-                git_ref,
-                force,
-                clean,
-                cpu_cap,
-                extra_content.as_deref(),
-                skip_sha256,
-            )
         }
-    } else {
-        kernel_build_one(
-            version,
-            source,
-            git,
-            git_ref,
+        Some(KernelId::Path(path)) => kernel_build_one(
+            None,
+            Some(path),
             force,
             clean,
             cpu_cap,
             extra_content.as_deref(),
             skip_sha256,
-        )
+        ),
+        Some(KernelId::Version(v)) => kernel_build_one(
+            Some(v),
+            None,
+            force,
+            clean,
+            cpu_cap,
+            extra_content.as_deref(),
+            skip_sha256,
+        ),
+        None => kernel_build_one(
+            None,
+            None,
+            force,
+            clean,
+            cpu_cap,
+            extra_content.as_deref(),
+            skip_sha256,
+        ),
+        Some(KernelId::Git {
+            url,
+            git_ref,
+            ref_kind,
+        }) => {
+            // Git builds route through the SAME resolver the test path
+            // uses (codeload snapshot for GitHub, kind-directed clone
+            // otherwise), now threading `kernel build`'s force/clean/
+            // cpu_cap/extra_kconfig flags so a git build honors them.
+            let resolved_cap = resolve_cpu_cap(cpu_cap)?;
+            let fetch_progress = cli::FetchProgress::new();
+            let dir = ktstr::cli::resolve_git_kernel(
+                &url,
+                &git_ref,
+                ref_kind,
+                "cargo ktstr",
+                Some(&fetch_progress),
+                force,
+                clean,
+                resolved_cap,
+                extra_content.as_deref(),
+            )
+            .map_err(|e| format!("build git+{url}#{git_ref}: {e:#}"))?;
+            eprintln!("cargo ktstr: kernel cached at {}", dir.display());
+            Ok(())
+        }
+        Some(KernelId::CacheKey(key)) => Err(format!(
+            "--kernel {key}: a cache key names an already-built kernel, so \
+             there is nothing to build. Pass a version (`6.14.2`), a range \
+             (`6.11..6.14`), a source path (`./linux`), or a git source \
+             (`git+URL#tag=NAME`). A relative source directory must be \
+             spelled `./{key}` to be read as a path, not a cache key. Run \
+             `kernel list` to see cached entries.",
+        )),
     }
 }
 
-/// Single-version variant of [`kernel_build`]: handles one tarball,
-/// `--source`, or `--git` invocation. Carries the `kernel_build`
-/// implementation as it stood before range dispatch was wired in;
-/// extracted into a helper so the range loop in `kernel_build` can
-/// reuse the same download + cache + build pipeline per resolved
-/// version without duplicating it.
+/// Build one tarball (explicit version / `MAJOR.MINOR` prefix / latest
+/// stable) or a `--kernel <path>` local source tree. Split from
+/// [`kernel_build`] so the range loop can reuse the download + cache +
+/// build pipeline per resolved version without duplicating it. The
+/// git-source path is handled separately by
+/// [`ktstr::cli::resolve_git_kernel`].
 ///
 /// `extra_kconfig` is the pre-loaded user fragment from
 /// `--extra-kconfig PATH` (the file is read once in [`kernel_build`]
@@ -744,30 +782,16 @@ pub(crate) fn kernel_build(
 /// [`ktstr::cache_key_suffix_with_extra`] and into the configure
 /// pass via the Cow merge construction in
 /// [`ktstr::cli::kernel_build_pipeline`].
-#[allow(clippy::too_many_arguments)]
 fn kernel_build_one(
     version: Option<String>,
     source: Option<PathBuf>,
-    git: Option<String>,
-    git_ref: Option<String>,
     force: bool,
     clean: bool,
     cpu_cap: Option<usize>,
     extra_kconfig: Option<&str>,
     skip_sha256: bool,
 ) -> Result<(), String> {
-    // Resolve the CLI --cpu-cap flag against KTSTR_CPU_CAP env
-    // and the implicit "no cap" default. Conflict with
-    // KTSTR_BYPASS_LLC_LOCKS=1 surfaces here so operators see
-    // the parse-time error, not an opaque pipeline bail later.
-    if cpu_cap.is_some() && ktstr::bypass_llc_locks_active() {
-        return Err(
-            "--cpu-cap conflicts with KTSTR_BYPASS_LLC_LOCKS=1; unset one of them. \
-             --cpu-cap is a resource contract; bypass disables the contract entirely."
-                .to_string(),
-        );
-    }
-    let resolved_cap = cli::CpuCap::resolve(cpu_cap).map_err(|e| format!("{e:#}"))?;
+    let resolved_cap = resolve_cpu_cap(cpu_cap)?;
 
     let cache = CacheDir::new().map_err(|e| format!("open cache: {e:#}"))?;
 
@@ -776,28 +800,13 @@ fn kernel_build_one(
 
     // Acquire source.
     let client = fetch::shared_client();
-    // Progress group for this build: hosts the download/clone bar AND
+    // Progress group for this build: hosts the download bar AND
     // (via `kernel_build_pipeline`) the build phase, so one renderer
-    // covers the whole operation. The `--source` path adds no fetch bar
-    // but the same group still hosts the build bar.
+    // covers the whole operation. A `--kernel <path>` source adds no
+    // fetch bar but the same group still hosts the build bar.
     let fetch_progress = cli::FetchProgress::new();
     let mut acquired = if let Some(ref src_path) = source {
         fetch::local_source(src_path).map_err(|e| format!("{e:#}"))?
-    } else if let Some(ref url) = git {
-        let ref_name = git_ref.as_deref().expect("clap requires --ref with --git");
-        // The `--git`/`--ref` flag surface fetches a BRANCH only (gix
-        // single-branch shallow clone). Tag/sha resolution uses the
-        // explicit `--kernel git+URL#tag=/#sha=` grammar
-        // (`ktstr::cli::resolve_git_kernel`); unifying the two git
-        // surfaces onto `--kernel` is separate follow-up work.
-        fetch::git_clone(
-            url,
-            ref_name,
-            tmp_dir.path(),
-            "cargo ktstr",
-            Some(&fetch_progress),
-        )
-        .map_err(|e| format!("{e:#}"))?
     } else {
         // Tarball download: explicit version, prefix, or latest stable.
         let ver = match version {
@@ -844,21 +853,21 @@ fn kernel_build_one(
         acquired
     };
 
-    // For `--source` and `--git` paths, `local_source` and `git_clone`
-    // build `acquired.cache_key` against the bare `cache_key_suffix()`
-    // — already shaped `...-kc{baked_hash}`. With `--extra-kconfig`
-    // set, lift the `-xkc{extra_hash}` append to
-    // [`cli::append_extra_kconfig_suffix`] so both binaries share
-    // one merge path; the cache lookup + post-build store both target
-    // the extras-aware slot.
-    if source.is_some() || git.is_some() {
+    // For a `--kernel <path>` source, `local_source` builds
+    // `acquired.cache_key` against the bare `cache_key_suffix()` —
+    // already shaped `...-kc{baked_hash}`. With `--extra-kconfig` set,
+    // lift the `-xkc{extra_hash}` append to
+    // [`cli::append_extra_kconfig_suffix`] so the cache lookup +
+    // post-build store both target the extras-aware slot. (The tarball
+    // path already looked up under the merged key above.)
+    if source.is_some() {
         cli::append_extra_kconfig_suffix(&mut acquired.cache_key, extra_kconfig);
     }
 
-    // Check cache for --source and --git (tarball already checked
-    // pre-download above).
+    // Check cache for a `--kernel <path>` source (tarball already
+    // checked pre-download above).
     if !force
-        && (source.is_some() || git.is_some())
+        && source.is_some()
         && !acquired.is_dirty
         && let Some(entry) = cache_lookup(&cache, &acquired.cache_key)
     {

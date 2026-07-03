@@ -353,7 +353,7 @@ fn cache_hit_diagnostic(cache_key: &str) -> String {
 ///
 /// `is_local_source` should be true when the source is a local
 /// kernel source tree, regardless of how the caller arrived there
-/// (`kernel build --source`, `cargo ktstr test --kernel <path>`,
+/// (`kernel build --kernel <path>`, `cargo ktstr test --kernel <path>`,
 /// or any other Path-spec entry that funnels through
 /// [`super::super::resolve_kernel_dir`] /
 /// [`super::super::resolve_kernel_dir_to_entry`]). It controls the
@@ -523,7 +523,7 @@ pub fn kernel_build_pipeline(
     if clean {
         if !is_local_source {
             eprintln!(
-                "{cli_label}: --clean is only meaningful with --source (downloaded sources start clean)"
+                "{cli_label}: --clean is only meaningful with a --kernel <path> source (downloaded/cloned sources start clean)"
             );
         } else {
             eprintln!("{cli_label}: make mrproper");
@@ -1611,14 +1611,14 @@ mod tests {
             #[command(subcommand)]
             cmd: KernelCommand,
         }
-        let parsed = TestCli::try_parse_from(["prog", "build", "6.14.2", "--cpu-cap", "4"])
+        let parsed = TestCli::try_parse_from(["prog", "build", "--kernel", "6.14.2", "--cpu-cap", "4"])
             .expect("kernel build --cpu-cap N must parse");
         match parsed.cmd {
             KernelCommand::Build {
-                cpu_cap, version, ..
+                cpu_cap, kernel, ..
             } => {
                 assert_eq!(cpu_cap, Some(4));
-                assert_eq!(version.as_deref(), Some("6.14.2"));
+                assert_eq!(kernel.as_deref(), Some("6.14.2"));
             }
             other => panic!("expected KernelCommand::Build, got {other:?}"),
         }
@@ -1637,7 +1637,7 @@ mod tests {
             #[command(subcommand)]
             cmd: KernelCommand,
         }
-        let parsed = TestCli::try_parse_from(["prog", "build", "6.14.2"])
+        let parsed = TestCli::try_parse_from(["prog", "build", "--kernel", "6.14.2"])
             .expect("kernel build without --cpu-cap must parse");
         match parsed.cmd {
             KernelCommand::Build { cpu_cap, .. } => {
@@ -1660,7 +1660,7 @@ mod tests {
             #[command(subcommand)]
             cmd: KernelCommand,
         }
-        let parsed = TestCli::try_parse_from(["prog", "build", "6.14.2", "--cpu-cap", "0"])
+        let parsed = TestCli::try_parse_from(["prog", "build", "--kernel", "6.14.2", "--cpu-cap", "0"])
             .expect("clap-level parse must accept 0; runtime validation rejects");
         match parsed.cmd {
             KernelCommand::Build { cpu_cap, .. } => {

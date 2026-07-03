@@ -86,7 +86,7 @@ steps:
   - name: Install ktstr
     run: cargo install --path . --locked --features remote-cache
   - name: Build test kernel
-    run: cargo ktstr kernel build ${{ matrix.kernel-version }}
+    run: cargo ktstr kernel build --kernel ${{ matrix.kernel-version }}
   - run: cargo ktstr test --kernel ${{ matrix.kernel-version }} -- --profile ci --features integration
 ```
 

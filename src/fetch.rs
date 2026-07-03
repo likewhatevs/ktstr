@@ -811,8 +811,9 @@ fn verify_sha256(actual_hex: &str, expected_hex: &str, url: &str) -> Result<()> 
 /// authentication for build availability. A network-path attacker
 /// who can deny `sha256sums.asc` while serving a poisoned
 /// `linux-{version}.tar.xz` could exploit this; operators who
-/// require strict verification should pin the source via `--source`
-/// or `--git` rather than the download path. The bypass warnings
+/// require strict verification should pin the source via a
+/// `--kernel <path>` or `--kernel git+…` source rather than the
+/// download path. The bypass warnings
 /// surface on the operator's diagnostic stream so the lost
 /// guarantee is visible to ops triage.
 ///
@@ -1356,8 +1357,8 @@ pub(crate) fn download_github_archive(
 /// bypasses. RC tarballs (`download_rc_tarball`) have no published
 /// manifest so verification is impossible regardless of the flag;
 /// the RC path always runs unverified and emits its own warning,
-/// so `skip_sha256` is a no-op on the RC arm. `--source` and
-/// `--git` callers do not reach this function at all.
+/// so `skip_sha256` is a no-op on the RC arm. `--kernel <path>` and
+/// `--kernel git+…` sources do not reach this function at all.
 ///
 /// `mp` is the progress group the determinate download bar is added
 /// to; `None` disables the bar (the single-shot `kernel build` paths
@@ -2443,7 +2444,7 @@ pub fn inspect_local_source_state(canonical: &Path) -> Result<LocalSourceState> 
             // remediation paths — once the is_dirty=true branch
             // decides to skip the cache. Emitting a second
             // "not a git repository" warning here duplicated that
-            // content for every non-git `--source` run. The
+            // content for every non-git `--kernel <path>` run. The
             // `(None, true, false)` tuple silently communicates
             // the non-git state to the cache-skip decision site;
             // no separate stderr line is needed on this path.

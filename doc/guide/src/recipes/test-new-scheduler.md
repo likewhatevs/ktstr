@@ -252,7 +252,7 @@ Build a kernel once (see section 3), then run the gated tests.
 The feature flag rides the nextest passthrough after `--`:
 
 ```sh
-cargo ktstr kernel build --source /path/to/linux
+cargo ktstr kernel build --kernel /path/to/linux
 cargo ktstr test --kernel /path/to/linux -- --features ktstr-tests
 ```
 

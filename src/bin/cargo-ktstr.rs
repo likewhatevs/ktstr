@@ -295,18 +295,15 @@ fn dispatch_admin_command(command: KtstrCommand) -> Result<(), String> {
         KtstrCommand::Kernel { command } => match command {
             KernelCommand::List {
                 json,
-                range,
+                kernel,
                 include_eol,
-            } => match range {
-                Some(r) => ktstr::cli::kernel_list_range_preview(json, &r, include_eol)
+            } => match kernel {
+                Some(k) => ktstr::cli::kernel_list_range_preview(json, &k, include_eol)
                     .map_err(|e| format!("{e:#}")),
                 None => ktstr::cli::kernel_list(json).map_err(|e| format!("{e:#}")),
             },
             KernelCommand::Build {
-                version,
-                source,
-                git,
-                git_ref,
+                kernel,
                 force,
                 clean,
                 cpu_cap,
@@ -314,10 +311,7 @@ fn dispatch_admin_command(command: KtstrCommand) -> Result<(), String> {
                 skip_sha256,
                 include_eol,
             } => kernel::kernel_build(
-                version,
-                source,
-                git,
-                git_ref,
+                kernel,
                 force,
                 clean,
                 cpu_cap,

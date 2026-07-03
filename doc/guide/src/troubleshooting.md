@@ -170,7 +170,7 @@ search order.
 **Fixes:**
 
 - Download and cache a kernel: `cargo ktstr kernel build`
-- Build from a local tree: `cargo ktstr kernel build --source ../linux`
+- Build from a local tree: `cargo ktstr kernel build --kernel ../linux`
 - Set `KTSTR_TEST_KERNEL` to an explicit image path.
 - The host's installed kernel works for basic testing.
 
@@ -571,7 +571,7 @@ free-form `error` string.
   `cargo ktstr kernel clean --corrupt-only --force`
 - Remove the corrupt entry along with everything else:
   `cargo ktstr kernel clean --force`
-- Rebuild a specific version after cleanup: `cargo ktstr kernel build --force 6.14.2`
+- Rebuild a specific version after cleanup: `cargo ktstr kernel build --force --kernel 6.14.2`
 - Override the cache directory via `KTSTR_CACHE_DIR` if the default
   location is on a problematic filesystem.
 - See [`cargo ktstr kernel clean`](running-tests/cargo-ktstr.md#kernel-clean)
@@ -638,8 +638,7 @@ is set to a real absolute path.
 ## Stale kconfig
 
 ```text
-warning: entries marked (stale kconfig) were built against a different ktstr.kconfig.
-Rebuild with: kernel build --force <entry version>
+warning: entries marked (stale kconfig) were built against a different ktstr.kconfig. Rebuild with: kernel build --force --kernel <entry version> (add --extra-kconfig PATH if the entry also carries the (extra kconfig) tag).
 ```
 
 `cargo ktstr kernel list` marks entries whose stored `ktstr_kconfig_hash`
@@ -718,7 +717,7 @@ For version-specific download errors (HTTP 404, HTML responses), see
   (reqwest respects these environment variables).
 - Override the cache directory via `KTSTR_CACHE_DIR` if the default
   location has insufficient space or permissions.
-- Pre-download a kernel explicitly: `cargo ktstr kernel build 6.14.10`
+- Pre-download a kernel explicitly: `cargo ktstr kernel build --kernel 6.14.10`
   to isolate whether the failure is in version resolution or download.
 
 ## Kernel download failures
@@ -749,7 +748,7 @@ RC tarball not found: https://git.kernel.org/torvalds/t/linux-6.15-rc3.tar.gz
 ```
 
 RC tarballs are removed from git.kernel.org after the stable version
-ships. Use `--git` with a git.kernel.org URL to clone the tag instead.
+ships. Use `--kernel git+URL#tag=NAME` with a git.kernel.org URL to clone the tag instead.
 
 ```text
 download ...: server returned HTML instead of tarball (URL may be invalid)
@@ -763,8 +762,8 @@ The download rejects these responses.
 - Check the suggested version in the error message.
 - Verify the version exists: check
   `https://www.kernel.org/releases.json` for available versions.
-- For RC releases, use `--git` with a git.kernel.org URL instead of
-  a tarball download.
+- For RC releases, use `--kernel git+URL#tag=NAME` with a
+  git.kernel.org URL instead of a tarball download.
 - Run `cargo ktstr kernel build` without a version to automatically
   fetch the latest stable.
 

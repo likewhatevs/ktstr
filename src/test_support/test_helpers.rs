@@ -128,7 +128,7 @@ pub(crate) fn isolated_sidecar_dir() -> IsolatedSidecarDir {
 /// in the second case.
 ///
 /// Production code is fine with the upward-walk semantics —
-/// an operator who points `--source` at a tempdir genuinely
+/// an operator who points `--kernel` at a tempdir genuinely
 /// inside their checkout DOES want the checkout's HEAD as the
 /// source identity. The semantic only breaks for tests that
 /// MUST exercise the no-repo-found branch; those tests call

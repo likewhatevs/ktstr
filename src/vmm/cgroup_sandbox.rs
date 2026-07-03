@@ -432,13 +432,13 @@ impl BuildSandbox {
                       \n\
                         systemd-run --user --scope \\\n\
                             -p 'Delegate=cpuset cpu' \\\n\
-                            cargo ktstr kernel build --source <path> --cpu-cap N\n\
+                            cargo ktstr kernel build --kernel <path> --cpu-cap N\n\
                       \n\
                    2. Re-run with sudo preserving env so KTSTR_CPU_CAP / \
                       KTSTR_CACHE_DIR / RUST_LOG propagate to the root \
                       invocation:\n\
                       \n\
-                        sudo -E cargo ktstr kernel build --source <path> --cpu-cap N\n\
+                        sudo -E cargo ktstr kernel build --kernel <path> --cpu-cap N\n\
                       \n\
                    3. Enable cpuset delegation on the caller's cgroup \
                       by adding `cpuset` to the parent's cgroup.subtree_control \

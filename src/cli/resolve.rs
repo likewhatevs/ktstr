@@ -889,12 +889,25 @@ fn select_series_latest_in_range(
 /// `mp` is the progress group the download/clone bar is added to (the
 /// parallel resolve's shared group). Forwarded to the codeload download
 /// and the clone; `None` disables the bar.
+///
+/// Build flags shared with `cargo ktstr kernel build --kernel git+…`:
+/// `force` skips both cache probes so the ref is refetched and rebuilt;
+/// `clean`, `cpu_cap`, and `extra_kconfig` thread into
+/// [`kernel_build_pipeline`] (an `extra_kconfig` fragment also appends
+/// its `-xkc{hash}` suffix to the cache key so an extras build lands a
+/// distinct slot). The auto-discovery test path passes `false` / `None`
+/// for all four; only `kernel build` populates them.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_git_kernel(
     url: &str,
     git_ref: &str,
     ref_kind: crate::kernel_path::GitRefKind,
     cli_label: &str,
     mp: Option<&crate::cli::FetchProgress>,
+    force: bool,
+    clean: bool,
+    cpu_cap: Option<crate::cli::CpuCap>,
+    extra_kconfig: Option<&str>,
 ) -> Result<std::path::PathBuf> {
     // Open the cache once: reused by the pre-fetch ls-remote probe, the
     // post-fetch lookup, and the build pipeline below.
@@ -909,8 +922,15 @@ pub fn resolve_git_kernel(
     // fatal for the codeload path (below), which has no `.git` to read
     // the commit back from.
     let commit = crate::fetch::resolve_ref_commit(url, git_ref, ref_kind);
-    if let Some(commit_hash) = &commit {
-        let cache_key = crate::fetch::git_cache_key(git_ref, commit_hash);
+    // `--force` skips the pre-fetch probe so the ref is always refetched
+    // and rebuilt. The `-xkc{hash}` suffix folds `--extra-kconfig` into
+    // the key so an extras build probes its own slot, not the baked-only
+    // one.
+    if !force
+        && let Some(commit_hash) = &commit
+    {
+        let mut cache_key = crate::fetch::git_cache_key(git_ref, commit_hash);
+        crate::cli::append_extra_kconfig_suffix(&mut cache_key, extra_kconfig);
         if let Some(entry) = cache_lookup(&cache, &cache_key, cli_label) {
             // Full hash keys the entry; show the familiar 7-hex prefix.
             let short = &commit_hash[..7.min(commit_hash.len())];
@@ -935,7 +955,7 @@ pub fn resolve_git_kernel(
     let github_archive = commit
         .as_deref()
         .and_then(|c| crate::fetch::github_archive_url(url, c));
-    let acquired = if let Some(archive_url) = github_archive {
+    let mut acquired = if let Some(archive_url) = github_archive {
         let commit_hash = commit
             .as_deref()
             .expect("commit present — the archive URL was built from it");
@@ -951,24 +971,38 @@ pub fn resolve_git_kernel(
     } else {
         crate::fetch::git_clone_kinded(url, git_ref, ref_kind, tmp_dir.path(), cli_label, mp)?
     };
+    // Fold --extra-kconfig into the fetched key so the post-fetch probe
+    // and the pipeline's cache store target the extras-aware slot
+    // (mirrors kernel_build_one). A no-op when extra_kconfig is None.
+    crate::cli::append_extra_kconfig_suffix(&mut acquired.cache_key, extra_kconfig);
 
-    // Re-check the cache post-fetch: the clone resolves the tip
-    // authoritatively, catching a hit the ls-remote probe missed (a
-    // ref-name resolution difference, or a probe that failed) so an
-    // unchanged tip still skips the rebuild. (The codeload path's key is
-    // already the probe key, so this is a no-op there.)
-    if let Some(entry) = cache_lookup(&cache, &acquired.cache_key, cli_label) {
+    // Re-check the cache post-fetch (skipped under --force): the clone
+    // resolves the tip authoritatively, catching a hit the ls-remote
+    // probe missed (a ref-name resolution difference, or a probe that
+    // failed) so an unchanged tip still skips the rebuild. (The codeload
+    // path's key is already the probe key, so this is a no-op there.)
+    if !force
+        && let Some(entry) = cache_lookup(&cache, &acquired.cache_key, cli_label)
+    {
         return Ok(entry.path);
     }
 
-    // is_local_source = false: a freshly cloned tree is treated the
-    // same as a tarball download — no `make mrproper` skip-warning,
-    // no compile_commands.json generation (acquired.is_temp gates
-    // that inside the pipeline).
-    // extra_kconfig = None: this entry path serves auto-discovery
-    // (cargo ktstr test/coverage/llvm-cov), which doesn't expose
-    // `--extra-kconfig`. The flag is `cargo ktstr kernel build`-only.
-    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, false, None, None, mp)?;
+    // `--force` fail-fast: if tests are holding the cache-entry lock,
+    // bail with the PID list rather than silently waiting to stomp the
+    // in-use entry (mirrors kernel_build_one). The guard drops before
+    // the pipeline runs.
+    if force {
+        let _force_check = cache.try_acquire_exclusive_lock(&acquired.cache_key)?;
+    }
+
+    // is_local_source = false: a freshly cloned tree is treated the same
+    // as a tarball download — no `make mrproper` skip-warning, no
+    // compile_commands.json generation (acquired.is_temp gates that
+    // inside the pipeline). `clean`, `cpu_cap`, and `extra_kconfig` come
+    // from `cargo ktstr kernel build`; the auto-discovery test path
+    // passes false / None.
+    let result =
+        kernel_build_pipeline(&acquired, &cache, cli_label, clean, false, cpu_cap, extra_kconfig, mp)?;
 
     match result.entry {
         Some(entry) => Ok(entry.path),

@@ -94,9 +94,8 @@ fn help_kernel_build() {
         .args(["kernel", "build", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--source"))
-        .stdout(predicate::str::contains("--git"))
-        .stdout(predicate::str::contains("--ref"))
+        .stdout(predicate::str::contains("--kernel"))
+        .stdout(predicate::str::contains("git+URL"))
         .stdout(predicate::str::contains("--force"))
         .stdout(predicate::str::contains("--clean"))
         // `--skip-sha256` is a security-sensitive bypass flag — it
@@ -557,7 +556,7 @@ fn ktstr_kernel_build_cpu_cap_with_bypass_errors() {
         .args([
             "kernel",
             "build",
-            "--source",
+            "--kernel",
             "/nonexistent/ktstr-ktstr-cpu-cap-bypass-test",
             "--cpu-cap",
             "2",
@@ -565,6 +564,27 @@ fn ktstr_kernel_build_cpu_cap_with_bypass_errors() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("resource contract"));
+}
+
+/// `ktstr kernel build --kernel <cache-key>` is rejected: a cache key
+/// names an already-built entry, so there is nothing to build. Mirrors
+/// `cargo_ktstr_kernel_build_cache_key_rejected` for the `ktstr`
+/// binary's `anyhow::bail!` CacheKey arm.
+#[test]
+fn ktstr_kernel_build_cache_key_rejected() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .args([
+            "kernel",
+            "build",
+            "--kernel",
+            "6.14.2-tarball-x86_64-kcabc123",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cache key"))
+        .stderr(predicate::str::contains("nothing to build"));
 }
 
 /// Library-layer fallback via `ktstr shell --no-perf-mode` under

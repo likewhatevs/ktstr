@@ -122,10 +122,10 @@ configures it with the embedded `ktstr.kconfig` fragment, builds it,
 and caches the result:
 
 ```sh
-cargo ktstr kernel build               # latest stable series with >= 8 maintenance releases
-cargo ktstr kernel build 6.14.2        # specific version
-cargo ktstr kernel build 6.12          # highest 6.12.x patch release
-cargo ktstr kernel build 6             # highest 6.x.y release
+cargo ktstr kernel build                       # latest stable series with >= 8 maintenance releases
+cargo ktstr kernel build --kernel 6.14.2       # specific version
+cargo ktstr kernel build --kernel 6.12         # highest 6.12.x patch release
+cargo ktstr kernel build --kernel 6            # highest 6.x.y release
 ```
 
 The bare `cargo ktstr kernel build` skips series that have fewer
@@ -141,7 +141,7 @@ above).
 To build from a local source tree:
 
 ```sh
-cargo ktstr kernel build --source ../linux
+cargo ktstr kernel build --kernel ../linux
 ```
 
 To list and manage cached kernels:

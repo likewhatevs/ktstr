@@ -385,9 +385,10 @@ impl std::fmt::Display for KernelId {
 
 /// Check if a string matches a kernel version pattern.
 ///
-/// Matches: `6.14`, `6.14.2`, `6.15-rc3`, `6.14.2-rc1`.
-/// Does not match: `v6.14` (git tag prefix), `6` (no minor),
-/// `6.14.2-tarball-x86_64-kc...` (cache key with extra segments).
+/// Matches: `6` (bare major prefix), `6.14`, `6.14.2`, `6.15-rc3`,
+/// `6.14.2-rc1`. Does not match: `v6.14` (git tag prefix), `6.`
+/// (trailing dot), `6.14.2-tarball-x86_64-kc...` (cache key with
+/// extra segments).
 fn _is_version_string(s: &str) -> bool {
     let (version_part, rc_part) = match s.split_once("-rc") {
         Some((v, rc)) => (v, Some(rc)),
@@ -408,8 +409,13 @@ fn _is_version_string(s: &str) -> bool {
         Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {}
         _ => return false,
     }
-    // Minor: required, non-empty digits.
+    // Minor: OPTIONAL — a bare MAJOR (`6`) is a valid version prefix
+    // that resolves to the highest patch across all minors (see
+    // `crate::fetch::fetch_version_for_prefix`). If present it must be
+    // non-empty digits; `6.` (trailing dot) is rejected as an empty
+    // component.
     match parts.next() {
+        None => {}
         Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {}
         _ => return false,
     }
@@ -456,7 +462,14 @@ pub(crate) fn decompose_version_for_compare(s: &str) -> Option<(u64, u64, u64, u
     };
     let mut parts = version_part.split('.');
     let major: u64 = parts.next()?.parse().ok()?;
-    let minor: u64 = parts.next()?.parse().ok()?;
+    // Minor optional: a bare MAJOR (`6`) decomposes to `(major, 0, 0,
+    // ..)` so it behaves as a series-floor prefix, consistent with
+    // `_is_version_string` accepting a bare major.
+    let minor: u64 = match parts.next() {
+        None => 0,
+        Some("") => return None,
+        Some(m) => m.parse().ok()?,
+    };
     let patch: u64 = match parts.next() {
         Some("") => return None,
         Some(p) => p.parse().ok()?,
@@ -1391,9 +1404,10 @@ mod tests {
     }
 
     #[test]
-    fn kernel_id_parse_bare_major_not_version() {
-        // "6" alone has no minor component -- cache key.
-        assert_eq!(KernelId::parse("6"), KernelId::CacheKey("6".to_string()));
+    fn kernel_id_parse_bare_major_is_version() {
+        // "6" is a bare-major version prefix (resolves to the highest
+        // 6.x.y patch via fetch_version_for_prefix), NOT a cache key.
+        assert_eq!(KernelId::parse("6"), KernelId::Version("6".to_string()));
     }
 
     #[test]
@@ -2134,6 +2148,7 @@ mod tests {
 
     #[test]
     fn kernel_id_is_version_string_valid() {
+        assert!(_is_version_string("6"), "bare major is a version prefix");
         assert!(_is_version_string("6.14"));
         assert!(_is_version_string("6.14.2"));
         assert!(_is_version_string("6.15-rc3"));
@@ -2145,7 +2160,9 @@ mod tests {
 
     #[test]
     fn kernel_id_is_version_string_invalid() {
-        assert!(!_is_version_string("6"));
+        // Bare major `6` is now VALID (optional minor), but a non-digit
+        // minor must still reject — pins the optional-minor boundary.
+        assert!(!_is_version_string("6.x"));
         assert!(!_is_version_string("v6.14"));
         assert!(!_is_version_string(""));
         assert!(!_is_version_string("6.14.2-tarball-x86_64"));

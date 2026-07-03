@@ -1248,8 +1248,8 @@ pub(crate) enum StatsCommand {
         ///
         /// Named `--run-source` (rather than `--source`) to
         /// disambiguate from `KernelSource` — every other
-        /// `source`-shaped CLI surface in the workspace
-        /// (`kernel build --source`, `KernelMetadata.source`)
+        /// `source`-shaped surface in the workspace (a
+        /// `--kernel <path>` source tree, `KernelMetadata.source`)
         /// refers to a kernel-source kind, not a run-environment
         /// tag.
         #[arg(long = "run-source", action = ArgAction::Append)]

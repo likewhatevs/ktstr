@@ -58,7 +58,7 @@ contributes the highest point release of every `stable` series inside
 fetched, expansion falls back to the active-release set with a
 warning. `--include-eol` is accepted on every command that expands a
 range (`test`, `coverage`, `llvm-cov`, `verifier`,
-`kernel list --range`, and `kernel build`); it has no effect on a
+`kernel list`, and `kernel build`); it has no effect on a
 single version, path, cache key, or git source.
 
 Git sources (`git+URL#tag=NAME`, `#branch=NAME`, or `#sha=<40-hex>`)
@@ -265,7 +265,7 @@ distinct cache entry under the clean shape.
 > cache for a future `cache_key`-keyed lookup. The `KTSTR_KERNEL`
 > env var with a path value follows this same direct-image flow
 > — the cache write path is reached only via the `cargo ktstr`
-> `--kernel` argument (or via `cargo ktstr kernel build --source
+> `--kernel` argument (or via `cargo ktstr kernel build --kernel
 > ../linux` as an explicit cache-populate step). Pass
 > `--kernel ../linux` to opt into the cache pipeline so a clean
 > tree's build is stored once and reused on subsequent runs.
@@ -491,15 +491,15 @@ Manage cached kernel images. Three subcommands: `list`, `build`,
 
 ### kernel list
 
-List cached kernel images, sorted newest first. With `--range`,
-switches to PREVIEW MODE: prints the versions a `START..END` range
+List cached kernel images, sorted newest first. With a `--kernel`
+range, switches to PREVIEW MODE: prints the versions a `START..END` range
 expands to without performing any download or build.
 
 ```sh
 cargo ktstr kernel list
 cargo ktstr kernel list --json                    # JSON output for CI scripting
-cargo ktstr kernel list --range 6.12..6.14        # preview range expansion
-cargo ktstr kernel list --range 6.12..6.14 --json # preview as JSON
+cargo ktstr kernel list --kernel 6.12..6.14        # preview range expansion
+cargo ktstr kernel list --kernel 6.12..6.14 --json # preview as JSON
 ```
 
 Default mode walks the local cache. Human-readable output shows
@@ -510,7 +510,7 @@ active releases list are marked `(EOL)`; prefix lookups for EOL
 series fall back to probing cdn.kernel.org for the latest patch
 release.
 
-`--range` mode performs no cache reads: it fetches kernel.org's
+`--kernel` range mode performs no cache reads: it fetches kernel.org's
 `releases.json` once, expands the inclusive range against the
 `stable` and `longterm` releases (mainline / linux-next dropped),
 and prints one version per line on stdout. Use this to answer
@@ -521,49 +521,51 @@ parsed start / end, and the expanded `versions` array.
 
 | Flag | Description |
 |------|-------------|
-| `--json` | Output in JSON format. Each entry includes a boolean `eol` field (computed at list time by fetching kernel.org's `releases.json`) alongside the cached metadata. With `--range`, emits a single object `{range, start, end, versions}` instead. |
-| `--range START..END` | Switch to range-preview mode. Format: `MAJOR.MINOR[.PATCH][-rcN]..MAJOR.MINOR[.PATCH][-rcN]`. Performs the single `releases.json` fetch a real range resolve does, expands inclusively, and prints the version list — no downloads, no builds, no cache lookups. |
-| `--include-eol` | With `--range`, also enumerate EOL `stable` series from the gregkh linux-stable mirror's tags so the preview lists series that have aged out of `releases.json`. Ignored in the default cache-listing mode. |
+| `--json` | Output in JSON format. Each entry includes a boolean `eol` field (computed at list time by fetching kernel.org's `releases.json`) alongside the cached metadata. With a `--kernel` range, emits a single object `{range, start, end, versions}` instead. |
+| `--kernel START..END` | Switch to range-preview mode. Format: `MAJOR.MINOR[.PATCH][-rcN]..MAJOR.MINOR[.PATCH][-rcN]`. Performs the single `releases.json` fetch a real range resolve does, expands inclusively, and prints the version list — no downloads, no builds, no cache lookups. A non-range `--kernel` is rejected (preview expands ranges only). |
+| `--include-eol` | With a `--kernel` range, also enumerate EOL `stable` series from the gregkh linux-stable mirror's tags so the preview lists series that have aged out of `releases.json`. Ignored in the default cache-listing mode. |
 
 ### kernel build
 
-Download, build, and cache a kernel image. Three source modes:
-version (tarball download), `--source` (local tree), `--git` (clone).
+Download, build, and cache a kernel image. Takes a single `--kernel`
+(the unified grammar): a version / prefix (tarball download), a
+`START..END` range (builds each release), a source-tree path (local
+build), or a `git+URL#…` source (fetch + build).
 
 ```sh
-cargo ktstr kernel build                               # latest stable from kernel.org
-cargo ktstr kernel build 6.14.2                        # specific version
-cargo ktstr kernel build 6.15-rc3                      # RC release
-cargo ktstr kernel build 6.12                          # latest 6.12.x patch release
-cargo ktstr kernel build --source ../linux             # local source tree
-cargo ktstr kernel build --git URL --ref v6.14         # git clone (shallow, depth 1)
-cargo ktstr kernel build --force 6.14.2                # rebuild even if cached
+cargo ktstr kernel build                                   # latest stable from kernel.org
+cargo ktstr kernel build --kernel 6.14.2                   # specific version
+cargo ktstr kernel build --kernel 6.15-rc3                 # RC release
+cargo ktstr kernel build --kernel 6.12                     # latest 6.12.x patch release
+cargo ktstr kernel build --kernel 6.11..6.14               # every release in the range
+cargo ktstr kernel build --kernel ../linux                 # local source tree
+cargo ktstr kernel build --kernel git+URL#tag=v6.14        # git source (tag / branch / sha)
+cargo ktstr kernel build --force --kernel 6.14.2           # rebuild even if cached
 ```
 
-When no version or source is given, fetches the latest stable
-series that has had at least 8 maintenance releases — keeping CI
-off brand-new majors whose early builds are more likely to break —
-from kernel.org's `releases.json`. A major.minor prefix (e.g.
-`6.12`) resolves to the highest patch release in that series. For
-EOL series no longer in `releases.json`, probes cdn.kernel.org to
-find the latest available tarball. Skips building when a cached entry already exists
-(use `--force` to override). Stale entries (built with a different
-`ktstr.kconfig`) are rebuilt automatically. For `--source`, generates
-`compile_commands.json` for LSP support. Dirty local trees
-(uncommitted changes to tracked files) are built but not cached.
+When `--kernel` is omitted, fetches the latest stable series that
+has had at least 8 maintenance releases — keeping CI off brand-new
+majors whose early builds are more likely to break — from
+kernel.org's `releases.json`. A major.minor prefix (e.g. `6.12`)
+resolves to the highest patch release in that series. For EOL series
+no longer in `releases.json`, probes cdn.kernel.org to find the
+latest available tarball. A cache key (an already-built entry) is
+rejected — there is nothing to build. Skips building when a cached
+entry already exists (use `--force` to override). Stale entries
+(built with a different `ktstr.kconfig`) are rebuilt automatically.
+For a `--kernel <path>` source tree, generates `compile_commands.json`
+for LSP support. Dirty local trees (uncommitted changes to tracked
+files) are built but not cached.
 
 | Flag | Description |
 |------|-------------|
-| `VERSION` | Kernel version or prefix to download (e.g. `6.14.2`, `6.12`, `6.15-rc3`). A major.minor prefix resolves to the highest patch release, probing cdn.kernel.org for EOL series. Conflicts with `--source` and `--git`. |
-| `--source PATH` | Path to existing kernel source directory. Conflicts with `VERSION` and `--git`. |
-| `--git URL` | Git URL to clone. Requires `--ref`. Conflicts with `VERSION` and `--source`. |
-| `--ref REF` | Git ref to checkout (branch, tag, commit). Required with `--git`. |
+| `--kernel ID` | Kernel to build: a version (`6.14.2`), a `MAJOR.MINOR` prefix (`6.14`, latest patch), a `START..END` range (builds every release), a source-tree path (`./linux`, `~/linux`, or an absolute path; a bare relative name is read as a cache key, so prefix a relative source dir with `./`), or a git source (`git+URL#tag=NAME` / `#branch=NAME` / `#sha=<40-hex>`). Omitted, builds the latest stable. A cache key (already-built entry) is rejected. Not repeatable — one kernel or range per invocation. |
 | `--force` | Rebuild even if a cached image exists. |
-| `--clean` | Run `make mrproper` before configuring. Only meaningful with `--source`. |
+| `--clean` | Run `make mrproper` before configuring. Only meaningful for a `--kernel <path>` source tree. |
 | `--cpu-cap N` | Reserve exactly N host CPUs for the build (integer ≥ 1; must be ≤ the calling process's `sched_getaffinity` cpuset size). When absent, 30% of the allowed CPUs are reserved (minimum 1). The planner walks whole LLCs in consolidation- and NUMA-aware order, partial-taking the last LLC so `plan.cpus.len() == N` exactly. Under `--cpu-cap`, `make -jN` parallelism matches the reserved CPU count and the build runs inside a cgroup v2 sandbox that pins gcc/ld to the reserved CPUs + NUMA nodes. Mutually exclusive with `KTSTR_BYPASS_LLC_LOCKS=1`. Also settable via `KTSTR_CPU_CAP` env var (CLI flag wins when both are present). |
 | `--extra-kconfig PATH` | Additional kconfig fragment merged on top of the baked-in `ktstr.kconfig` (user values win on conflict). Lands in a distinct cache slot keyed by the extra fragment's hash, so it never collides with a baked-only build. |
-| `--skip-sha256` | Skip SHA-256 verification of a downloaded stable tarball (emits a bypass warning). No effect on `--source`/`--git` builds, which download no tarball. |
-| `--include-eol` | When `VERSION` is a `START..END` range, also enumerate EOL `stable` series from the gregkh linux-stable mirror so the range builds series that have aged out of `releases.json`. No effect on a single version, `--source`, or `--git`. |
+| `--skip-sha256` | Skip SHA-256 verification of a downloaded stable tarball (emits a bypass warning). No effect on a `--kernel <path>` or git source, which download no tarball. |
+| `--include-eol` | When `--kernel` is a `START..END` range, also enumerate EOL `stable` series from the gregkh linux-stable mirror so the range builds series that have aged out of `releases.json`. No effect on a single version, path, or git source. |
 
 ### kernel clean
 
@@ -1447,7 +1449,7 @@ Scans four lock-file roots:
   same flow.
 - `{cache_root}/.locks/*.lock` — cache-entry locks held
   during `kernel build` writes, and `source-{path_hash}.lock`
-  files held for the duration of `kernel build --source` and
+  files held for the duration of `kernel build --kernel <path>` and
   `cargo ktstr test --kernel <path>` against the same source tree.
 - `{runs_root}/.locks/{kernel}-{project_commit}.lock` —
   per-run-key sidecar-write locks held for the duration of

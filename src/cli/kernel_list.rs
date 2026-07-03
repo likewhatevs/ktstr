@@ -302,12 +302,12 @@ pub fn kernel_list(json: bool) -> Result<()> {
 /// Routes through `kernel_list_inner` with `range = Some(spec)`,
 /// switching the subcommand from "walk the cache and list local
 /// entries" to "fetch releases.json once and print the versions
-/// `spec` expands to." See the `range` arg's doc on
+/// `spec` expands to." See the `kernel` arg's doc on
 /// [`super::KernelCommand::List`] for operator-facing semantics.
 ///
 /// Surfaced as a thin wrapper because the binary dispatch sites
-/// (`ktstr::kernel kernel list --range R` /
-/// `cargo ktstr kernel list --range R`) read more naturally as
+/// (`ktstr kernel list --kernel R` /
+/// `cargo ktstr kernel list --kernel R`) read more naturally as
 /// `cli::kernel_list_range_preview(json, R)` than as
 /// `cli::kernel_list_inner(json, Some(R))`. The shared inner
 /// function keeps a single `--json` formatter and a single test
@@ -493,7 +493,7 @@ fn kernel_list_inner(json: bool, range: Option<&str>, include_eol: bool) -> Resu
     Ok(())
 }
 
-/// Render a `kernel list --range START..END` preview by parsing
+/// Render a `kernel list --kernel START..END` preview by parsing
 /// `spec` as a [`crate::kernel_path::KernelId::Range`], expanding
 /// it via [`expand_kernel_range`], and printing the resulting
 /// version list.
@@ -525,14 +525,14 @@ fn run_kernel_list_range(json: bool, spec: &str, include_eol: bool) -> Result<()
         KernelId::Range { start, end, .. } => (start.clone(), end.clone()),
         _ => {
             bail!(
-                "kernel list --range: `{spec}` does not parse as a \
+                "kernel list --kernel: `{spec}` does not parse as a \
                  `START..END` range. Expected `MAJOR.MINOR[.PATCH][-rcN]..\
                  MAJOR.MINOR[.PATCH][-rcN]` (e.g. `6.12..6.14`)."
             );
         }
     };
     id.validate()
-        .map_err(|e| anyhow::anyhow!("kernel list --range {spec}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("kernel list --kernel {spec}: {e}"))?;
 
     let versions = expand_kernel_range(&start, &end, "kernel list", include_eol)?;
 
@@ -548,7 +548,7 @@ fn run_kernel_list_range(json: bool, spec: &str, include_eol: bool) -> Result<()
     }
 
     // Text output: versions on stdout (one per line) so
-    // `kernel list --range R | xargs -I{} kernel build {}`
+    // `kernel list --kernel R | xargs -I{} kernel build --kernel {}`
     // works without tearing on legend lines. The header on
     // stderr matches `expand_kernel_range`'s own status output
     // shape so the operator gets the same "expanded to N
@@ -904,7 +904,7 @@ mod tests {
         let err = run_kernel_list_range(false, "6.16..6.12", false)
             .expect_err("inverted range must not be accepted");
         let msg = format!("{err:#}");
-        assert!(msg.contains("kernel list --range 6.16..6.12"));
+        assert!(msg.contains("kernel list --kernel 6.16..6.12"));
     }
 
     fn mk_valid(key: &str) -> crate::cache::ListedEntry {
