@@ -606,15 +606,16 @@ pub(crate) struct PerfDeltaArgs<'a> {
     /// `--b-scheduler <Y>` — CONFIG axis B side. See [`Self::a_scheduler`].
     pub b_scheduler: Option<&'a str>,
     /// `--noise-adjust <N>` — run each side N times and decide significance from
-    /// the observed per-side spread (B's mean leaving A's `[min, max]` band)
-    /// instead of a fixed threshold; flag a metric whose relative spread exceeds
-    /// [`Self::noise_spread_threshold`]. Commit axis only — it implies the
-    /// dual-run production, looped N times. `None` = the default single-run
-    /// threshold compare.
+    /// whether the two sides are SEPARATED (a Welch two-sample t-test, or fully
+    /// disjoint `[min, max]` bands) AND the delta is MATERIAL (the registry
+    /// dual-gate), instead of a fixed single-run threshold. Commit axis only — it
+    /// implies the dual-run production, looped N times. `None` = the default
+    /// single-run threshold compare.
     pub noise_adjust: Option<usize>,
     /// `--noise-spread-threshold <PCT>` — the per-side relative-spread limit (in
-    /// percent) above which `--noise-adjust` flags a metric as too noisy to
-    /// trust. Defaults to `1.0` when `--noise-adjust` is set.
+    /// percent) above which `--noise-adjust` ANNOTATES a metric with an advisory
+    /// "noisy spread" flag. Advisory only: it never suppresses a separated +
+    /// material regression. Defaults to `5.0` when `--noise-adjust` is set.
     pub noise_spread_threshold: Option<f64>,
     /// `--profile <NAME>` — the scheduler-under-test's cargo BUILD profile,
     /// forwarded to BOTH sides' `cargo ktstr test` so baseline and HEAD
@@ -793,7 +794,7 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
             args.passthrough,
             n,
         )?;
-        let threshold = args.noise_spread_threshold.unwrap_or(1.0);
+        let threshold = args.noise_spread_threshold.unwrap_or(5.0);
         let build = crate::stats::BuildCompareFilters {
             a_project_commit: vec![baseline.clone()],
             b_project_commit: vec![head.clone()],

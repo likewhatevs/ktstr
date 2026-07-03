@@ -352,13 +352,14 @@ pub(crate) enum KtstrCommand {
         #[arg(long, requires = "a_scheduler", conflicts_with_all = ["base", "base_ref", "dual_run"])]
         b_scheduler: Option<String>,
         /// Self-tuning noise mode: run each side N times and decide significance
-        /// from the observed per-side spread — B's mean leaving A's `[min, max]`
-        /// band — instead of a fixed `--threshold`. Flags a metric whose relative
-        /// spread exceeds `--noise-spread-threshold` as too noisy to trust.
-        /// Implies the dual-run production, looped N times; commit axis only
-        /// (needs `--kernel`). N must be >= 2: a single run per side has no
-        /// spread to observe, so the mode would emit a confident verdict driven
-        /// by pure run-to-run noise (>= 5 is recommended for a trustworthy band).
+        /// from whether the two sides are SEPARATED — a Welch two-sample t-test,
+        /// or fully disjoint `[min, max]` bands — AND the delta is MATERIAL (the
+        /// registry dual-gate), instead of a fixed `--threshold`. A high per-side
+        /// spread (over `--noise-spread-threshold`) is an ADVISORY annotation
+        /// only and never suppresses a confident regression. Implies the dual-run
+        /// production, looped N times; commit axis only (needs `--kernel`). N must
+        /// be >= 2: variance and the Welch test need at least two runs per side
+        /// (>= 5 recommended for a well-powered test).
         #[arg(
             long,
             value_name = "N",
@@ -367,7 +368,8 @@ pub(crate) enum KtstrCommand {
         )]
         noise_adjust: Option<usize>,
         /// Per-side relative-spread limit in percent above which `--noise-adjust`
-        /// flags a metric too noisy to trust (default 1.0). Requires
+        /// adds an ADVISORY "noisy spread" annotation to a metric's row (default
+        /// 5.0). Advisory only — never suppresses a verdict. Requires
         /// `--noise-adjust`.
         #[arg(long, requires = "noise_adjust")]
         noise_spread_threshold: Option<f64>,

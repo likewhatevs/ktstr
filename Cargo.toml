@@ -255,6 +255,16 @@ grex = { version = "1.4", default-features = false, optional = true }
 sha2 = "0.11"
 # Lowercase hex encoding for SHA-256 digest comparisons.
 hex = "0.4"
+# Two-sample significance testing for perf-delta's `--noise-adjust` mode
+# (src/stats/noise.rs): the `StudentsT` distribution (cdf/sf) turns a Welch
+# t-statistic into a p-value, and `Statistics::variance` gives per-side Bessel
+# (N-1) sample variance. Replaces the old within-side range-spread gate, which
+# inverted signal and noise — it suppressed a real regression whose degraded
+# side was high-variance while reporting trivial low-variance moves.
+# `default-features = false` drops the `nalgebra` feature (multivariate
+# distributions we do not use); univariate `StudentsT` is ungated, so the add is
+# +2 crates (statrs + approx), not the full nalgebra linear-algebra stack.
+statrs = { version = "0.18", default-features = false }
 # Error-enum derives (`#[derive(thiserror::Error)]`) for the crate's
 # structured error types (disk_config, topology, workload types).
 # v2's `#[source]` attribute matches the structured-error pattern

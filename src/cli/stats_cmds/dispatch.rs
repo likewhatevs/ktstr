@@ -87,11 +87,13 @@ pub fn compare_partitions(
     )
 }
 
-/// Noise-adjusted variant of [`compare_partitions`]: keeps every per-run row,
-/// summarizes each side's spread, and gates on B's mean leaving A's observed
-/// band rather than a fixed threshold. When the scenarios carry phases it also
-/// renders a per-phase spread + coverage block (render-only, honoring
-/// `phase_opts`; per-phase never affects the exit). See
+/// Noise-adjusted variant of [`compare_partitions`]: keeps every per-run row and
+/// gates a confident regression on the two sides being SEPARATED (a two-sided
+/// Welch t-test, or fully disjoint `[min, max]` bands) AND the mean delta being
+/// MATERIAL (the registry `default_abs` + `default_rel` dual-gate), instead of a
+/// fixed single-run threshold. When the scenarios carry phases it also renders a
+/// per-phase spread + coverage block (render-only, honoring `phase_opts`;
+/// per-phase never affects the exit). See
 /// `crate::stats::compare_partitions_noise` for the full contract.
 pub fn compare_partitions_noise(
     filter_a: &RowFilter,

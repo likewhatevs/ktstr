@@ -2255,8 +2255,10 @@ fn phased_rows(
 
 #[test]
 fn noise_phase_findings_emits_per_phase_spread() {
-    // Step[1] max_dsq_depth (LowerBetter Peak) rises 8->15 across sides, clean
-    // (spread 0 both) -> a confident per-phase REGRESSION; BASELINE unchanged.
+    // Step[1] max_dsq_depth (LowerBetter Peak) rises 8->20 across sides, clean
+    // (spread 0 both) -> separated (disjoint bands) and material (delta 12 >= abs
+    // 10, 150% >= 50% rel) -> a confident per-phase REGRESSION; BASELINE
+    // unchanged.
     let a = phased_rows(
         "scn",
         3,
@@ -2270,20 +2272,20 @@ fn noise_phase_findings_emits_per_phase_spread() {
         3,
         &[
             make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)]),
-            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 15.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 20.0)]),
         ],
     );
-    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, false);
     let s1 = rep
         .phase_findings
         .iter()
         .find(|f| f.step_index == 1 && f.metric.name == "max_dsq_depth")
         .expect("Step[1] max_dsq_depth per-phase finding");
-    assert_eq!((s1.verdict.a.mean, s1.verdict.b.mean), (8.0, 15.0));
+    assert_eq!((s1.verdict.a.mean, s1.verdict.b.mean), (8.0, 20.0));
     assert_eq!(
         s1.kind,
         NoiseKind::Regression,
-        "LowerBetter 8->15 rose => per-phase regression",
+        "LowerBetter 8->20 rose => per-phase regression",
     );
 }
 
@@ -2294,8 +2296,8 @@ fn noise_phase_scoped_regression_is_render_only_not_gated() {
     // phase bucket shifts. Per-phase is render-only, so the exit basis
     // (aggregate regressions) stays 0 while phase_regressions() counts it.
     let a = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])]);
-    let b = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 15.0)])]);
-    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    let b = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 20.0)])]);
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, false);
     assert_eq!(rep.phase_regressions(), 1, "the per-phase shift is a phase regression");
     assert_eq!(
         rep.regressions(),
@@ -2470,7 +2472,8 @@ fn noise_phase_empty_phases_skip() {
 
 #[test]
 fn format_noise_phase_findings_lines_honors_flags() {
-    // BASELINE max_dsq_depth 5->9 and Step[1] 8->15 both shift (regressions).
+    // BASELINE max_dsq_depth 5->20 and Step[1] 8->20 both shift, each material
+    // (delta >= abs 10, rel >= 50%) and separated -> per-phase regressions.
     let a = phased_rows(
         "scn",
         3,
@@ -2483,11 +2486,11 @@ fn format_noise_phase_findings_lines_honors_flags() {
         "scn",
         3,
         &[
-            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 9.0)]),
-            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 15.0)]),
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 20.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 20.0)]),
         ],
     );
-    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, true);
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
     let render = |opts: &PhaseDisplayOptions| {
         format_noise_phase_findings_lines(&rep.phase_findings, &rep.phase_coverage, opts, "base", "head")
             .join("\n")
@@ -2664,9 +2667,9 @@ fn noise_phase_findings_disambiguate_by_pairing_key_across_topologies() {
     };
     let mut a = phased("tiny-1llc", 8.0);
     a.extend(phased("large-4llc", 8.0));
-    let mut b = phased("tiny-1llc", 15.0);
-    b.extend(phased("large-4llc", 15.0));
-    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    let mut b = phased("tiny-1llc", 20.0);
+    b.extend(phased("large-4llc", 20.0));
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, false);
     let labels: Vec<&str> = rep
         .phase_findings
         .iter()
@@ -2758,10 +2761,15 @@ fn noise_findings_classifies_both_polarities() {
 }
 
 #[test]
-fn noise_findings_too_noisy_takes_precedence_over_regression() {
-    // A's worst_spread swings 10..20 (~67% relative spread, over the 1% gate), so
-    // even though B (30) is far higher (a worsening direction for LowerBetter), the
-    // metric is flagged NOISY, NOT counted as a confident regression.
+fn noise_findings_high_spread_annotates_but_does_not_suppress_regression() {
+    // A's worst_spread swings 10..20 (~67% relative spread, over the 5% advisory
+    // gate), and B (30) is far higher — a worsening move for LowerBetter. The
+    // high per-side spread is ADVISORY: it flags the row (high_spread) but must
+    // NOT suppress the confident regression. The old behavior dropped exactly
+    // this as NOISY, INVERTING signal and noise (a real regression's degraded
+    // side is intrinsically high-variance). The bands are disjoint ([10,20] vs
+    // [30,30]) so the move is separated, and the delta is material (15 >= abs 5,
+    // 100% >= 25% rel).
     let a = vec![
         cmp_row("noisy", "tiny-1llc", true, 10.0, 2000),
         cmp_row("noisy", "tiny-1llc", true, 20.0, 2000),
@@ -2771,7 +2779,7 @@ fn noise_findings_too_noisy_takes_precedence_over_regression() {
         &a,
         &noise_side("noisy", 30.0, 2000),
         LEGACY_PAIRING_DIMS,
-        1.0,
+        5.0,
         false,
     );
     let ws = rep
@@ -2781,13 +2789,17 @@ fn noise_findings_too_noisy_takes_precedence_over_regression() {
         .expect("worst_spread finding present");
     assert_eq!(
         ws.kind,
-        NoiseKind::Noisy,
-        "wide A spread -> NOISY, not REGRESSION"
+        NoiseKind::Regression,
+        "wide A spread must NOT suppress a separated + material worsening move",
+    );
+    assert!(
+        ws.verdict.high_spread,
+        "A's ~67% spread exceeds the 5% advisory gate -> high_spread annotation",
     );
     assert_eq!(
         rep.regressions(),
-        0,
-        "a too-noisy metric must not fail the gate"
+        1,
+        "the separated, material worsening metric gates as a confident regression",
     );
     // total_iterations is unchanged (2000 both sides) and clean -> omitted.
     assert!(
@@ -2797,6 +2809,47 @@ fn noise_findings_too_noisy_takes_precedence_over_regression() {
             .iter()
             .map(|f| f.metric.name)
             .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn noise_findings_separated_but_immaterial_stays_stable() {
+    // The materiality gate in isolation: worst_spread A [10,10,10] vs B
+    // [10.5,10.5,10.5] has fully DISJOINT zero-variance bands -> separated=true,
+    // but delta 0.5 < default_abs 5.0 -> material=false. classify_noise must keep
+    // it Stable (include_stable) / omit it (gate path), NEVER a regression. Guards
+    // the `&& material` clause in classify_noise: dropping it would turn this into
+    // a false Regression while every band/separation test still passed.
+    let a = noise_side("imm", 10.0, 2000);
+    let b = noise_side("imm", 10.5, 2000);
+    // Gate path: the separated-but-immaterial move must not gate.
+    let gate = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, false);
+    assert_eq!(
+        gate.regressions(),
+        0,
+        "a separated but immaterial (0.5 < abs 5.0) move must not gate: {:?}",
+        gate.findings
+            .iter()
+            .map(|f| (f.metric.name, f.kind))
+            .collect::<Vec<_>>(),
+    );
+    // Render path: it surfaces as Stable, not Regression, and the bands really
+    // are separated (so it is the materiality gate — not lack of separation —
+    // holding it back).
+    let show = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    let ws = show
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "worst_spread")
+        .expect("worst_spread row present under include_stable");
+    assert_eq!(
+        ws.kind,
+        NoiseKind::Stable,
+        "separated-but-immaterial worst_spread is Stable, not a regression",
+    );
+    assert!(
+        ws.verdict.separated,
+        "premise: the [10,10] vs [10.5,10.5] bands are disjoint => separated",
     );
 }
 
@@ -2910,26 +2963,23 @@ fn format_noise_findings_table_renders_rows_and_verdicts() {
 }
 
 #[test]
-fn format_noise_findings_table_renders_noisy_and_improvement_verdicts() {
-    // Pin the remaining verdict-arm strings (a text/color swap in one arm
-    // would otherwise slip past the REGRESSION/stable-only table test).
-    // Noisy: wide A spread on worst_spread -> NOISY row.
-    let a = vec![
-        cmp_row("nz", "tiny-1llc", true, 10.0, 2000),
-        cmp_row("nz", "tiny-1llc", true, 20.0, 2000),
-        cmp_row("nz", "tiny-1llc", true, 15.0, 2000),
-    ];
+fn format_noise_findings_table_renders_noisy_improvement_and_advisory_spread() {
+    // Pin the remaining verdict-arm strings (a text/color swap in one arm would
+    // otherwise slip past the REGRESSION/stable-only table test).
+
+    // Noisy: a side with <2 usable runs (insufficient_samples) -> NOISY row.
+    let a = vec![cmp_row("nz", "tiny-1llc", true, 10.0, 2000)];
     let rep = noise_findings(
         &a,
         &noise_side("nz", 30.0, 2000),
         LEGACY_PAIRING_DIMS,
-        1.0,
+        5.0,
         true,
     );
     let out = format_noise_findings_table(&rep.findings, "base", "head");
     assert!(
-        out.contains("NOISY (spread over gate or <2 runs)"),
-        "noisy verdict rendered: {out}"
+        out.contains("NOISY (<2 runs)"),
+        "insufficient-samples verdict rendered: {out}"
     );
 
     // Improvement: worst_spread drops 15->10 (LowerBetter, clean) -> improvement.
@@ -2937,13 +2987,35 @@ fn format_noise_findings_table_renders_noisy_and_improvement_verdicts() {
         &noise_side("imp", 15.0, 2000),
         &noise_side("imp", 10.0, 2000),
         LEGACY_PAIRING_DIMS,
-        1.0,
+        5.0,
         true,
     );
     let out = format_noise_findings_table(&rep.findings, "base", "head");
     assert!(
         out.contains("improvement"),
         "improvement verdict rendered: {out}"
+    );
+
+    // Advisory spread: a separated + material worsening move whose baseline side
+    // is high-variance (worst_spread A [10,20,15] ~67% > 5% gate, B 30) renders
+    // as "REGRESSION (noisy spread)" — the advisory flag annotates but does NOT
+    // suppress (the signal-inversion fix).
+    let a = vec![
+        cmp_row("adv", "tiny-1llc", true, 10.0, 2000),
+        cmp_row("adv", "tiny-1llc", true, 20.0, 2000),
+        cmp_row("adv", "tiny-1llc", true, 15.0, 2000),
+    ];
+    let rep = noise_findings(
+        &a,
+        &noise_side("adv", 30.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        5.0,
+        true,
+    );
+    let out = format_noise_findings_table(&rep.findings, "base", "head");
+    assert!(
+        out.contains("REGRESSION (noisy spread)"),
+        "high_spread annotates the reported regression, never suppresses it: {out}"
     );
 }
 

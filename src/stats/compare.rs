@@ -54,9 +54,9 @@ pub(crate) enum FindingKind {
 /// sees the full per-phase comparison. It therefore needs a `Stable`
 /// state for a below-dual-gate delta in addition to the directional and
 /// directionless kinds. Mirrors the noise per-phase [`NoiseKind`]
-/// vocabulary minus `Noisy` (the spread-gate state that has no scalar
-/// analog), so the scalar and noise per-phase tables render the same
-/// verdict words.
+/// vocabulary minus `Noisy` (the `<2 runs` / insufficient-samples state
+/// that has no scalar analog), so the scalar and noise per-phase tables
+/// render the same verdict words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum PhaseVerdict {
     /// Directional metric past the dual gate in the worsening direction
@@ -2000,22 +2000,25 @@ pub fn compare_partitions(
 /// How a metric's noise-adjusted verdict classifies for the gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NoiseKind {
-    /// Significant in the worsening direction (per polarity) and not too noisy —
-    /// the only kind that fails the gate.
+    /// SEPARATED (Welch or disjoint bands) AND MATERIAL in the worsening
+    /// direction (per polarity) — the only kind that fails the gate.
     Regression,
-    /// Significant in the improving direction and not too noisy.
+    /// Separated AND material in the improving direction.
     Improvement,
-    /// Either side's spread exceeds the gate, OR either side realized fewer than
-    /// 2 samples — verdict untrustworthy; flagged but does NOT fail the gate.
+    /// A side realized fewer than 2 samples, so variance / Welch are undefined —
+    /// verdict untrustworthy; flagged but does NOT fail the gate. A merely
+    /// high-spread side no longer lands here: `high_spread` is ADVISORY and
+    /// annotates a reported verdict (e.g. `REGRESSION (noisy spread)`) rather
+    /// than suppressing it — the fix for the old spread-gate signal inversion.
     Noisy,
-    /// Significant change in a directionless (`Polarity::Informational`) metric —
-    /// shown but NEVER fails the gate (no good/bad direction to regress).
+    /// Separated + material change in a directionless (`Polarity::Informational`)
+    /// metric — shown but NEVER fails the gate (no good/bad direction to regress).
     Informational,
-    /// Unchanged and clean: B's mean is within A's `[min, max]` band and
-    /// neither side is too noisy. Shown in the full metrics table so the
-    /// operator sees every metric's A/B stats, but never gates. Emitted
-    /// only when the caller passes `include_stable = true` (the render
-    /// path); the gate-only path omits it.
+    /// Not separated, or separated but immaterial (below the registry dual-gate),
+    /// with both sides having >= 2 samples. Shown in the full metrics table so the
+    /// operator sees every metric's A/B stats, but never gates. Emitted only when
+    /// the caller passes `include_stable = true` (the render path); the gate-only
+    /// path omits it.
     Stable,
 }
 
@@ -2091,7 +2094,7 @@ impl NoiseReport {
             .filter(|f| f.kind == NoiseKind::Regression)
             .count()
     }
-    /// Aggregate metrics flagged too noisy to trust.
+    /// Aggregate metrics flagged untrustworthy — a side had < 2 usable runs.
     pub fn noisy(&self) -> usize {
         self.findings
             .iter()
@@ -2106,7 +2109,7 @@ impl NoiseReport {
             .filter(|f| f.kind == NoiseKind::Regression)
             .count()
     }
-    /// Per-phase metrics flagged too noisy to trust.
+    /// Per-phase metrics flagged untrustworthy — a side had < 2 usable runs.
     pub fn phase_noisy(&self) -> usize {
         self.phase_findings
             .iter()
@@ -2148,7 +2151,7 @@ pub(crate) fn noise_findings(
             // and could produce a confident FALSE gate — the exact
             // silent-wrong-verdict class the noise mode exists to prevent.
             // A side reduced below 2 real samples by this filter is then
-            // caught by `noise_verdict`'s n<2 too_noisy guard.
+            // caught by `noise_verdict`'s n<2 insufficient_samples guard.
             if r.is_fail() || r.is_inconclusive() || r.is_skip() || r.expected_failure {
                 continue;
             }
@@ -2267,29 +2270,63 @@ pub(crate) fn noise_findings(
 
 /// Classify one metric's [`NoiseVerdict`] into a [`NoiseKind`], shared by the
 /// aggregate and per-phase noise passes. Returns `None` to omit the row: both
-/// sides ~zero (no signal), or unchanged-and-clean when `include_stable` is
-/// false (the gate-only path). `too_noisy` takes precedence over significance —
-/// an untrustworthy spread (or a `<2`-sample side) never calls a confident
-/// regression.
+/// sides ~zero (no signal), or unchanged/immaterial-and-clean when
+/// `include_stable` is false (the gate-only path).
+///
+/// A `< 2`-sample side (`insufficient_samples`) is a HARD gate that precedes
+/// significance (Noisy, never a confident regression); the ADVISORY
+/// `high_spread` flag does NOT gate (that suppression was the signal-inverting
+/// bug). A row is a confident regression only when SEPARATED (Welch or disjoint
+/// bands) AND MATERIAL (the registry dual-gate) in the worsening polarity.
 fn classify_noise(verdict: &NoiseVerdict, m: &MetricDef, include_stable: bool) -> Option<NoiseKind> {
     // No signal on either side (both ~zero): skip. Same zero epsilon as the
     // spread ratio for one consistent "is this zero".
     if verdict.a.mean.abs() < ZERO_MEAN_EPS && verdict.b.mean.abs() < ZERO_MEAN_EPS {
         return None;
     }
-    Some(if verdict.too_noisy {
-        NoiseKind::Noisy
-    } else if verdict.significant {
+    // HARD gate: a side realized < 2 samples, so variance / Welch are undefined.
+    // Precedes significance — never a confident regression. (The ADVISORY
+    // high_spread flag, by contrast, does NOT gate.)
+    if verdict.insufficient_samples {
+        return Some(NoiseKind::Noisy);
+    }
+    // MATERIALITY: mirror the scalar dual-gate (push_scalar_findings ~L899) so
+    // noise and default modes agree on "is this delta large enough". A
+    // statistically-separated but trivially-small move stays Stable. --noise-adjust
+    // conflicts with --threshold/--policy (cli.rs), so the registry defaults ARE
+    // the resolved thresholds (an empty ComparisonPolicy::rel_threshold returns
+    // default_rel); reading them from `m` directly is equivalent, no policy needed.
+    // For a Rate metric, `mean` is the pooled Σnum/Σden centroid (the
+    // registry-authoritative cross-run value), while the Welch separation arm
+    // reads `sample_mean` (mean-of-ratios, coherent with `var`). Materiality AND
+    // the direction label below authoritatively follow `mean`; the two statistics
+    // can order the sides oppositely only under orders-of-magnitude denominator
+    // skew between runs of one config (physically implausible), where the pooled
+    // direction is the correct label anyway.
+    let a = verdict.a.mean;
+    let b = verdict.b.mean;
+    let delta = b - a;
+    let rel_delta = if a.abs() > ZERO_MEAN_EPS {
+        (delta / a).abs()
+    } else if delta.abs() > ZERO_MEAN_EPS {
+        // Non-negligible move from a ~zero baseline: unbounded relative change,
+        // so the absolute gate alone decides (mirrors the scalar path).
+        f64::INFINITY
+    } else {
+        0.0
+    };
+    let material = delta.abs() >= m.default_abs && rel_delta >= m.default_rel;
+
+    Some(if verdict.separated && material {
         match m.classify_direction() {
-            // Directionless metric: a significant move with no good/bad
+            // Directionless metric: a separated + material move with no good/bad
             // direction — shown, never fails the gate.
             None => NoiseKind::Informational,
             Some(higher_is_worse) => {
-                let worsened = if higher_is_worse {
-                    verdict.direction == Direction::Higher
-                } else {
-                    verdict.direction == Direction::Lower
-                };
+                // Polarity split by the SIGN of the mean delta (b vs a), NOT a
+                // band position: separation can come from the Welch arm even when
+                // b.mean sits inside a's [min, max] band.
+                let worsened = if higher_is_worse { b > a } else { b < a };
                 if worsened {
                     NoiseKind::Regression
                 } else {
@@ -2300,7 +2337,7 @@ fn classify_noise(verdict: &NoiseVerdict, m: &MetricDef, include_stable: bool) -
     } else if include_stable {
         NoiseKind::Stable
     } else {
-        return None; // unchanged + clean: omit (gate-only path)
+        return None; // unchanged/immaterial + clean: omit (gate-only path)
     })
 }
 
@@ -2584,20 +2621,23 @@ pub(crate) fn summarize_side_runs(rows: &[GauntletRow]) -> (usize, String) {
 
 /// Noise-adjusted variant of [`compare_partitions`]: instead of averaging each
 /// side's runs into one mean and gating on a fixed threshold, it keeps every run
-/// ([`RowPrep::PerRunPooled`]), summarizes each side per metric as a `mean` over its
-/// `[min, max]` band, and decides from A's observed spread (see [`noise_findings`]
-/// for the row-level core + [`noise_verdict`] for the per-metric decision). Used
-/// by `perf-delta --noise-adjust N`, which produces N runs per side. A metric is a
-/// CONFIDENT REGRESSION (the non-zero exit basis) when B's mean is outside A's
-/// band in the worsening direction (per polarity) AND neither side is too noisy; a
-/// metric whose relative spread exceeds `spread_threshold_pct` is flagged `NOISY`
-/// and does NOT by itself fail the gate — the point of the mode is to not fail on
-/// noise. Prints a table of EVERY compared metric — changed, noisy,
-/// informational, and stable (unchanged + clean) — with each side's
-/// `mean [min-max] spread%` and the verdict, so the operator sees the whole
-/// comparison, not just what moved. The footer carries the regression/noisy
-/// counts and, when every changed (non-stable) metric was too noisy, an
-/// explicit inconclusive note.
+/// ([`RowPrep::PerRunPooled`]), summarizes each side per metric, and decides
+/// whether the two sides are distinguishable given their run-to-run variability
+/// (see [`noise_findings`] for the row-level core + [`noise_verdict`] for the
+/// per-metric decision). Used by `perf-delta --noise-adjust N`, which produces N
+/// runs per side. A metric is a CONFIDENT REGRESSION (the non-zero exit basis)
+/// when it is SEPARATED (a two-sided Welch t-test rejects equal means at
+/// `NOISE_ALPHA`, OR the `[min, max]` bands are fully disjoint) AND MATERIAL (the
+/// mean delta clears both the registry `default_abs` and `default_rel`, the same
+/// dual-gate as the scalar path) in the worsening direction (per polarity). A
+/// side that realized fewer than 2 runs is flagged `NOISY` and never gates; a
+/// per-side relative spread over `spread_threshold_pct` is an ADVISORY
+/// `(noisy spread)` annotation that NEVER suppresses a verdict. Prints a table of
+/// EVERY compared metric — changed, noisy, informational, and stable (unchanged +
+/// clean) — with each side's `mean [min-max] spread%` and the verdict, so the
+/// operator sees the whole comparison, not just what moved. The footer carries
+/// the regression/under-sampled counts and, when every changed (non-stable)
+/// metric had a side with <2 usable runs, an explicit inconclusive note.
 ///
 /// When the scenarios carry phases, a per-phase spread block follows the
 /// aggregate table (via [`format_noise_phase_findings_lines`]): the same
@@ -2642,7 +2682,7 @@ pub fn compare_partitions_noise(
     );
 
     println!(
-        "perf-delta --noise-adjust: {label_b} vs {label_a} (per-side spread gate {spread_threshold_pct:.2}%)"
+        "perf-delta --noise-adjust: {label_b} vs {label_a} (advisory noisy-spread threshold {spread_threshold_pct:.2}%)"
     );
     // Aggregate spread table — suppressed under --phases-only, mirroring the
     // scalar compare_partitions phase path (compare.rs `if !phases_only`).
@@ -2735,7 +2775,7 @@ pub fn compare_partitions_noise(
             && phase_opts.phase_threshold.is_none();
         let phase_footer = if show_phase_footer {
             format!(
-                "; {} per-phase regression(s), {} per-phase too-noisy (render-only)",
+                "; {} per-phase regression(s), {} per-phase under-sampled (<2 runs) (render-only)",
                 report.phase_regressions(),
                 report.phase_noisy(),
             )
@@ -2744,15 +2784,15 @@ pub fn compare_partitions_noise(
         };
         println!(
             "perf-delta --noise-adjust: {} paired scenario(s); {regressions} confident regression(s), \
-             {noisy} too-noisy metric(s){phase_footer}",
+             {noisy} under-sampled metric(s) (<2 runs){phase_footer}",
             report.paired_scenarios,
         );
     }
     // Inconclusive: every CHANGED aggregate metric (excluding Stable rows, which
-    // never gate) was too noisy to gate on — no confident signal either way.
-    // Surfaced prominently for CI logs, but per the user spec noise FLAGS, not
-    // FAILS, so the exit stays 0 unless a confident AGGREGATE regression fired.
-    // Suppressed under --phases-only (the aggregate table is hidden there).
+    // never gate) had a side with < 2 usable runs — no trustworthy signal either
+    // way. Surfaced prominently for CI logs, but noise FLAGS, not FAILS, so the
+    // exit stays 0 unless a confident AGGREGATE regression fired. Suppressed
+    // under --phases-only (the aggregate table is hidden there).
     if !phase_opts.phases_only {
         let changed: Vec<&NoiseFinding> = report
             .findings
@@ -2761,8 +2801,9 @@ pub fn compare_partitions_noise(
             .collect();
         if !changed.is_empty() && changed.iter().all(|f| f.kind == NoiseKind::Noisy) {
             println!(
-                "perf-delta --noise-adjust: NOTE -- every changed metric was too noisy to gate on; \
-                 raise --noise-adjust N or --noise-spread-threshold for a trustworthy verdict"
+                "perf-delta --noise-adjust: NOTE -- every changed metric had a side with <2 usable \
+                 runs; raise --noise-adjust N (or investigate why per-side runs failed) for a \
+                 trustworthy verdict"
             );
         }
     }
@@ -2793,12 +2834,20 @@ pub(crate) fn format_noise_findings_table(
         "VERDICT".to_string(),
     ]);
     for f in findings {
-        let (verdict_text, color) = match f.kind {
+        let (base, color) = match f.kind {
             NoiseKind::Regression => ("REGRESSION", Color::Red),
             NoiseKind::Improvement => ("improvement", Color::Green),
-            NoiseKind::Noisy => ("NOISY (spread over gate or <2 runs)", Color::Yellow),
+            NoiseKind::Noisy => ("NOISY (<2 runs)", Color::Yellow),
             NoiseKind::Informational => ("informational", Color::Blue),
             NoiseKind::Stable => ("stable", Color::Grey),
+        };
+        // high_spread is ADVISORY — annotate a reported verdict so the operator
+        // sees a noisy side, but it never changed the classification (redundant
+        // on a Noisy <2-runs row, so omit it there).
+        let verdict_text = if f.verdict.high_spread && f.kind != NoiseKind::Noisy {
+            format!("{base} (noisy spread)")
+        } else {
+            base.to_string()
         };
         let v = &f.verdict;
         table.add_row(vec![
@@ -2877,12 +2926,19 @@ pub(crate) fn format_noise_phase_findings_lines(
             "VERDICT".to_string(),
         ]);
         for f in findings {
-            let (verdict_text, color) = match f.kind {
+            let (base, color) = match f.kind {
                 NoiseKind::Regression => ("REGRESSION", Color::Red),
                 NoiseKind::Improvement => ("improvement", Color::Green),
-                NoiseKind::Noisy => ("NOISY (spread over gate or <2 runs)", Color::Yellow),
+                NoiseKind::Noisy => ("NOISY (<2 runs)", Color::Yellow),
                 NoiseKind::Informational => ("informational", Color::Blue),
                 NoiseKind::Stable => ("stable", Color::Grey),
+            };
+            // high_spread is ADVISORY — annotate but never reclassify (redundant
+            // on a Noisy <2-runs row).
+            let verdict_text = if f.verdict.high_spread && f.kind != NoiseKind::Noisy {
+                format!("{base} (noisy spread)")
+            } else {
+                base.to_string()
             };
             let v = &f.verdict;
             table.add_row(vec![
