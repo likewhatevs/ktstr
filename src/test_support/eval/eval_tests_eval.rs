@@ -3672,3 +3672,101 @@ fn eval_sched_fail_with_no_monitor_omits_monitor_section() {
         "the failure detail must still render (the guest-fail path ran), got: {msg}",
     );
 }
+
+// -- contention_not_attached_skip_reason: skip vs fail --
+
+/// Build a bulk drain with a single `SchedulerNotAttached` lifecycle
+/// frame carrying `reason` as its UTF-8 suffix (the shape the guest's
+/// `send_lifecycle` emits). `lifecycle_drain` drops the suffix, so the
+/// reason-bearing frame is built here.
+fn not_attached_drain(reason: &str) -> crate::vmm::host_comms::BulkDrainResult {
+    use crate::vmm::wire::{LifecyclePhase, MSG_TYPE_LIFECYCLE, ShmEntry};
+    let mut payload = vec![LifecyclePhase::SchedulerNotAttached.wire_value()];
+    payload.extend_from_slice(reason.as_bytes());
+    crate::vmm::host_comms::BulkDrainResult {
+        entries: vec![ShmEntry {
+            msg_type: MSG_TYPE_LIFECYCLE,
+            payload,
+            crc_ok: true,
+        }],
+    }
+}
+
+/// A still-in-flight enable (state=enabling) under host oversubscription
+/// (64 vCPUs on 8 allowed CPUs = 8x) is a contention SKIP.
+#[test]
+fn contention_skip_enabling_oversubscribed_skips() {
+    let drain = not_attached_drain("timeout: state=enabling");
+    let reason = contention_not_attached_skip_reason(Some(&drain), 64, 8, None);
+    assert!(
+        reason
+            .as_deref()
+            .is_some_and(|r| r.contains("oversubscription") && r.contains("enabling")),
+        "state=enabling + 8x oversubscription must classify as a contention skip, got {reason:?}",
+    );
+}
+
+/// The SAME still-in-flight enable on a FITTING host (8 vCPUs on 8 CPUs
+/// = 1.0x) is NOT a skip — a startup stall with no contention to blame
+/// is a real defect that must FAIL.
+#[test]
+fn contention_skip_enabling_fitting_host_fails() {
+    let drain = not_attached_drain("timeout: state=enabling");
+    assert_eq!(
+        contention_not_attached_skip_reason(Some(&drain), 8, 8, None),
+        None,
+        "state=enabling on a fitting host (1.0x) is a real defect, not a skip",
+    );
+}
+
+/// A REJECTED enable (state=disabling) is a real defect and must FAIL
+/// even under heavy oversubscription.
+#[test]
+fn contention_skip_disabling_never_skips() {
+    let drain = not_attached_drain("timeout: state=disabling");
+    assert_eq!(
+        contention_not_attached_skip_reason(Some(&drain), 64, 8, None),
+        None,
+        "a rejected enable (state=disabling) must FAIL, never skip, even oversubscribed",
+    );
+}
+
+/// state=disabled (a rejected enable, further along the disable path)
+/// also never skips.
+#[test]
+fn contention_skip_disabled_never_skips() {
+    let drain = not_attached_drain("timeout: state=disabled");
+    assert_eq!(
+        contention_not_attached_skip_reason(Some(&drain), 64, 8, None),
+        None,
+    );
+}
+
+/// A missing sched_ext sysfs (a config fault, not contention) never
+/// skips.
+#[test]
+fn contention_skip_sysfs_absent_never_skips() {
+    let drain = not_attached_drain("sched_ext sysfs absent");
+    assert_eq!(
+        contention_not_attached_skip_reason(Some(&drain), 64, 8, None),
+        None,
+    );
+}
+
+/// A `SchedulerDied` frame (the process exited during load — a verifier
+/// reject / crash) never skips, even oversubscribed.
+#[test]
+fn contention_skip_scheduler_died_never_skips() {
+    let drain = lifecycle_drain(&[crate::vmm::wire::LifecyclePhase::SchedulerDied]);
+    assert_eq!(
+        contention_not_attached_skip_reason(Some(&drain), 64, 8, None),
+        None,
+        "SchedulerDied is a real defect and must FAIL, never skip",
+    );
+}
+
+/// No lifecycle frame at all (a generic no-result run) never skips.
+#[test]
+fn contention_skip_no_frame_never_skips() {
+    assert_eq!(contention_not_attached_skip_reason(None, 64, 8, None), None);
+}

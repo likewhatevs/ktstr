@@ -473,6 +473,60 @@ fn overcommit_skip(
     Some(AssertResult::skip(reason))
 }
 
+/// Classify a no-guest-result run for the contention-`NotAttached` SKIP.
+///
+/// Returns `Some(reason)` when the run should SKIP (a clean host-resource
+/// condition): the guest reported `SchedulerNotAttached` with the enable
+/// STILL IN FLIGHT (reason carries `state=enabling`) AND the host was
+/// oversubscribed (overcommit ratio > 1.0) — the scheduler was still
+/// enabling when the startup budget expired under host time-slicing, not
+/// a load/verify reject. Returns `None` (the run FAILs) for a REJECTED
+/// enable (`state=disabling`/`disabled`), a missing sched_ext sysfs, a
+/// `SchedulerDied`, a stall on a FITTING host (ratio == 1.0), or any run
+/// with no `SchedulerNotAttached` frame.
+///
+/// The `state=enabling` token is produced by the guest's
+/// `poll_scx_attached` (`src/vmm/rust_init/scheduler.rs`): the sched_ext
+/// enable path leaves `Enabling` for `Disabling`/`Disabled` ONLY on
+/// failure, so `Enabling` at the deadline means a still-progressing (not
+/// rejected) enable. `SchedulerDied` and the non-`enabling` reasons are
+/// checked FIRST so a genuine defect can never be classified as a skip.
+/// Pure over its inputs so the skip boundary is unit-testable without a
+/// live scheduler.
+fn contention_not_attached_skip_reason(
+    guest_messages: Option<&crate::vmm::host_comms::BulkDrainResult>,
+    vcpus: u32,
+    allowed_cpus: usize,
+    cpu_budget: Option<u32>,
+) -> Option<String> {
+    let crate::verifier::AttachOutcome::NotAttached(reason) =
+        crate::verifier::attach_outcome_from_messages(guest_messages)
+    else {
+        // SchedulerDied / Attached / Unconfirmed (no NotAttached frame):
+        // never a contention skip.
+        return None;
+    };
+    // Only a still-in-flight enable is skippable; a rejected enable
+    // (disabling/disabled), sysfs-absent, or unknown state is a real
+    // defect that must FAIL.
+    if !reason.contains("state=enabling") {
+        return None;
+    }
+    // On a fitting host a startup-budget stall is a real defect, not
+    // contention — only an oversubscribed host has the time-slicing that
+    // stretches scx_enable's cross-vCPU sync past the budget.
+    let ratio = super::runtime::overcommit_ratio(vcpus, allowed_cpus, cpu_budget);
+    if ratio <= 1.0 {
+        return None;
+    }
+    Some(format!(
+        "scheduler enable did not complete within the startup budget under \
+         {ratio:.1}x host oversubscription (sched_ext state was still \
+         `enabling` at the deadline, not a load/verify reject) — widen the \
+         process cpuset or shrink the guest topology"
+    ))
+}
+
 fn run_ktstr_test_inner_impl(
     entry: &KtstrTestEntry,
     topo: Option<&TopoOverride>,
@@ -1458,7 +1512,7 @@ fn run_ktstr_test_inner_impl(
     };
 
     eprintln!("post-VM overhead before eval: {:?}", post_vm_t.elapsed());
-    let eval_result = evaluate_vm_result(
+    let mut eval_result = evaluate_vm_result(
         entry,
         &result,
         &merged_assert,
@@ -1468,6 +1522,43 @@ fn run_ktstr_test_inner_impl(
         &repro_fn,
         post_vm_err.as_ref(),
     );
+    // Reclassify a no-guest-result run that is a contention-caused
+    // SchedulerNotAttached — the scheduler enable was still in flight
+    // (state=enabling) when the startup budget expired under host
+    // oversubscription — as a clean SKIP: surfaced (nextest shows SKIP),
+    // never retry-masked green, never false-failed. Under
+    // KTSTR_NO_SKIP_MODE it stays a FAIL with the actionable reason. A
+    // rejected enable (disabling/disabled), missing sched_ext sysfs, a
+    // SchedulerDied, or a stall on a FITTING host is a real defect and
+    // stays a FAIL (contention_not_attached_skip_reason returns None).
+    if eval_result.is_err()
+        && let Some(skip_reason) = contention_not_attached_skip_reason(
+            result.guest_messages.as_ref(),
+            // The oversubscription ratio must key on the BOOTED vCPU
+            // count (vm_topology), not the declared entry.topology: under
+            // a TopoOverride (gauntlet / host-test preset) the VM boots
+            // resolve_vm_topology(entry, topo), which can differ. Keying
+            // on the declared count would mis-scale the ratio and could
+            // mask a genuine fitting-host stall as a skip (or false-fail
+            // real contention). vm_topology is the same topology passed
+            // to evaluate_vm_result above.
+            vm_topology.total_cpus(),
+            crate::vmm::host_topology::host_allowed_cpus().len(),
+            entry.cpu_budget,
+        )
+    {
+        if std::env::var_os(crate::KTSTR_NO_SKIP_MODE_ENV).is_some() {
+            eval_result = eval_result.map_err(|e| {
+                e.context(format!(
+                    "{skip_reason} [KTSTR_NO_SKIP_MODE: contention skip promoted to fail]"
+                ))
+            });
+        } else {
+            crate::report::test_skip(format_args!("{}: {skip_reason}", entry.name));
+            record_skip_sidecar(entry, topo);
+            eval_result = Ok(AssertResult::skip(skip_reason));
+        }
+    }
     // Set result.expect_auto_repro_satisfied based on the artifact-on-disk
     // probe. Called AFTER evaluate_vm_result so the auto-repro VM has had
     // a chance to land its .repro.wprof.pb artifact via the host's

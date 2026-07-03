@@ -639,7 +639,7 @@ impl AttachOutcome {
 /// Corrupt frames (`crc_ok == false`) and empty payloads are skipped. A
 /// `None` `guest_messages` (no frames at all) is
 /// [`AttachOutcome::Unconfirmed`].
-fn attach_outcome_from_messages(
+pub(crate) fn attach_outcome_from_messages(
     guest_messages: Option<&crate::vmm::host_comms::BulkDrainResult>,
 ) -> AttachOutcome {
     let Some(drain) = guest_messages else {
