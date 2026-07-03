@@ -139,8 +139,8 @@ fn compare_rows_zero_baseline_jump_below_abs_gate_is_unchanged() {
 /// improvement path would be caught.
 #[test]
 fn compare_rows_zero_baseline_jump_above_abs_gate_is_an_improvement() {
-    // total_iterations: HigherBetter, Counter, default_abs = 100.0 (the only
-    // metric reading r.total_iterations). 0 -> 1000: delta +1000 >= 100
+    // total_iterations: HigherBetter, Counter, default_abs = 2.0 (the only
+    // metric reading r.total_iterations). 0 -> 1000: delta +1000 >= 2
     // clears the absolute gate; HigherBetter + delta > 0 => improvement.
     let rows_a = vec![cmp_row("zbase_imp", "tiny-1llc", true, 0.0, 0)];
     let rows_b = vec![cmp_row("zbase_imp", "tiny-1llc", true, 0.0, 1000)];
@@ -153,7 +153,7 @@ fn compare_rows_zero_baseline_jump_above_abs_gate_is_an_improvement() {
     );
     assert_eq!(
         res.improvements, 1,
-        "0 -> 1000 total_iterations (>= abs gate 100, HigherBetter) must be \
+        "0 -> 1000 total_iterations (>= abs gate 2, HigherBetter) must be \
          an improvement, not hidden as unchanged",
     );
     assert_eq!(res.regressions, 0);
@@ -238,7 +238,7 @@ fn compare_rows_genuine_stuck_count_regression_is_flagged() {
 fn compare_rows_synthetic_regression_and_improvement() {
     // spread 10 -> 30: abs delta 20.0 >= 5.0, rel 2.0 >= 0.10 →
     // regression (higher_is_worse).
-    // total_iterations 1000 -> 500: abs delta 500 >= 100, rel 0.5
+    // total_iterations 1000 -> 500: abs delta 500 >= 2, rel 0.5
     // >= 0.10, higher_is_worse=false so decrease is a regression.
     // Net: 2 regressions, 0 improvements; one Finding per
     // significant metric.
@@ -3519,5 +3519,67 @@ fn coverage_diff_lines_map_present_absent_labels_by_side() {
     assert!(
         joined2.contains("absent in 'runA'"),
         "absent maps to runA: {joined2}"
+    );
+}
+
+/// #28: a scale-varying count metric (`total_iterations`, recalibrated from a
+/// high-throughput floor of 100 to a near-idle activity floor of 2) must flag a
+/// large RELATIVE regression on a low-throughput run. Before the fix
+/// default_abs=100 masked a 200->120 drop: rel 0.40 clears default_rel (0.10)
+/// but |delta| 80 < 100 failed the abs gate, so a 40% iteration collapse was
+/// classified "unchanged". After the near-idle recalibration the relative gate
+/// carries materiality and the drop surfaces as a regression.
+#[test]
+fn compare_rows_scale_varying_low_throughput_regression_is_material() {
+    // total_iterations: HigherBetter, default_abs 2.0 (was 100), default_rel 0.10
+    // (2.0 not 1.0: rounded-mean u64 field -- a floor of 1.0 would let a <=1.0
+    // rounding delta fabricate a regression; see group.rs rounded-mean invariant).
+    let rows_a = vec![cmp_row("lowtput", "tiny-1llc", true, 10.0, 200)];
+    let rows_b = vec![cmp_row("lowtput", "tiny-1llc", true, 10.0, 120)];
+    let res = compare_rows_by(
+        &rows_a,
+        &rows_b,
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert!(
+        res.findings
+            .iter()
+            .any(|f| f.metric.name == "total_iterations" && f.kind == FindingKind::Regression),
+        "200 -> 120 total_iterations (40% drop, |delta| 80 < old floor 100) must \
+         be a regression after the near-idle floor recalibration; got {:?}",
+        res.findings
+            .iter()
+            .map(|f| (f.metric.name, f.delta))
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// Contrast to the low-throughput pin: the near-idle floor recalibration lowered
+/// ONLY the absolute floor, not the relative gate, so a small RELATIVE move on a
+/// high-throughput baseline is still filtered as noise. This pins that the fix
+/// did not make the gate hair-trigger at high throughput.
+#[test]
+fn compare_rows_scale_varying_high_throughput_noise_is_unchanged() {
+    // 100000 -> 101000 total_iterations: |delta| 1000 >= near-idle floor 2.0, but
+    // rel 0.01 < default_rel 0.10 -> the relative gate vetoes -> unchanged.
+    let rows_a = vec![cmp_row("hitput", "tiny-1llc", true, 10.0, 100_000)];
+    let rows_b = vec![cmp_row("hitput", "tiny-1llc", true, 10.0, 101_000)];
+    let res = compare_rows_by(
+        &rows_a,
+        &rows_b,
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert!(
+        res.findings.iter().all(|f| f.metric.name != "total_iterations"),
+        "100000 -> 101000 total_iterations (1% move) must stay unchanged: the \
+         relative gate still filters high-throughput noise; got {:?}",
+        res.findings
+            .iter()
+            .map(|f| (f.metric.name, f.delta))
+            .collect::<Vec<_>>(),
     );
 }

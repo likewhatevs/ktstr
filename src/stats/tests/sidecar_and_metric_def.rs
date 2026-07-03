@@ -1581,3 +1581,246 @@ fn metric_def_read_prefers_accessor_over_ext_metrics() {
     assert!(metric_def("custom_metric").is_none());
     assert_eq!(row.ext_metrics.get("custom_metric").copied(), Some(77.0));
 }
+
+/// #28 recurrence guard: every throughput metric -- a `MetricKind::Rate` OR a
+/// phase-aware throughput carrier (`PerPhase` / `PerRunDistribution` /
+/// `WorstLowest`) with a per-time unit -- must carry a NEAR-IDLE absolute floor,
+/// not a high-throughput one. For a scale-varying metric `default_abs` is only an
+/// activity guard; the relative gate (`default_rel`) carries materiality.
+/// A high fixed floor silently masks a large RELATIVE regression on a
+/// low-throughput workload -- the #28 bug (e.g. `sched_count_per_sec`
+/// 50->30/s: rel 0.40 clears `default_rel` but |20| < 100 failed the abs
+/// gate, so the 40% drop was dropped as "unchanged"). Fractions carry unit
+/// `""` and are intrinsically bounded to [0,1], so they keep a fixed
+/// unit-scale floor and are excluded here. This test fails if a rate metric
+/// is (re)introduced with a masking floor.
+#[test]
+fn throughput_rate_floors_are_near_idle() {
+    // Per-time throughput units: the baseline spans orders of magnitude across
+    // workloads, so a fixed absolute floor cannot be scale-correct.
+    const THROUGHPUT_UNITS: &[&str] = &[
+        "/s", "ns/s", "ops/s", "req/s", "irq/s", "softirq/s", "iter/s", "iter/cpu-s",
+    ];
+    for m in METRICS {
+        // Throughput carriers: Rate, plus the phase-aware kinds that hold a
+        // per-time throughput -- SCHBENCH_RPS_* are PerPhase / PerRunDistribution
+        // (req/s), the taobench qps are PerPhase (ops/s), and
+        // worst_iterations_per_cpu_sec is WorstLowest (iter/cpu-s). All span
+        // orders of magnitude across workloads, so a fixed floor masks a
+        // low-throughput regression exactly as a Rate does.
+        let is_throughput = matches!(
+            m.kind,
+            MetricKind::Rate { .. }
+                | MetricKind::PerPhase
+                | MetricKind::PerRunDistribution
+                | MetricKind::WorstLowest { .. }
+        ) && THROUGHPUT_UNITS.contains(&m.display_unit);
+        if !is_throughput {
+            continue;
+        }
+        // ns-denominated rates accrue in nanoseconds, so their idle floor is
+        // ~1us (1000 ns); count/throughput rates idle near a single event/s.
+        let ceiling = if m.display_unit.contains("ns") { 1000.0 } else { 10.0 };
+        assert!(
+            m.default_abs <= ceiling,
+            "scale-varying rate `{}` has default_abs {} > near-idle ceiling {} \
+             (unit {:?}): a high absolute floor masks a large RELATIVE regression \
+             on a low-throughput workload (the #28 bug). Use a near-idle activity \
+             floor and let default_rel carry materiality.",
+            m.name, m.default_abs, ceiling, m.display_unit,
+        );
+    }
+}
+
+/// #28 recurrence guard (accumulation class): every raw per-event / per-window
+/// ACCUMULATION -- a `MetricKind::Counter` or `MetricKind::PerPhaseDeltaSum`
+/// denominated in a raw count `""`, nanoseconds `"ns"`, or (Counter only)
+/// microseconds `"µs"`, plus the per-schedule mean run-delay `Rate`s (unit
+/// `"ns"`) -- must carry a NEAR-IDLE absolute floor, for the same reason as the
+/// throughput class: the baseline spans orders of magnitude across workloads, so
+/// a fixed high floor masks a large relative regression on a low-throughput run.
+///
+/// The unit gate is deliberate, NOT a "natural unit scale" claim: cumulative
+/// TIME accumulators exist in ns AND µs, and both are scale-varying -- only the
+/// PSI-stall Counter carries `"µs"` (naturally-bounded µs LATENCY metrics are
+/// PerPhase / Distribution / Peak, never Counter, so a Counter-"µs" arm captures
+/// only the accumulator). Second-denominated (`"s"`) metrics are excluded: the
+/// LIVE ones (`total_schedstat_wall_sec`, `total_phase_wall_sec`) are bounded
+/// wall-clock window spans, not orders-of-magnitude counts; `total_cpu_time_sec`
+/// IS a scale-varying pooled CPU-time accumulation, but it is a render-suppressed
+/// Rate component (inert floor) whose magnitude is already guarded via its ns twin
+/// `total_cpu_time_ns` (Counter, "ns").
+///
+/// NOT auto-guarded -- scale-varying raw counts / accumulators whose (kind, unit)
+/// is a MIXED class that also holds bounded metrics, so a (kind, unit) match
+/// cannot cover them without false positives. They ARE recalibrated to near-idle
+/// floors and kept there by convention:
+/// - `Peak` + `""` / `"µs"` -- `max_cpu_hardirqs`, `max_cpu_softirq_net_rx`,
+///   `max_cgroup_irq_pressure` (Peak also holds bounded depth / utilization /
+///   criticality peaks).
+/// - `WorstLowest` / `PerPhase` + `""` -- `worst_iterations_per_worker`,
+///   `iterations_per_worker`, `SCHBENCH_LOOP_COUNT` (these kinds + `""` also hold
+///   bounded fractions like `worst_page_locality` / `migration_ratio` /
+///   `wake_latency_cv`).
+///
+/// A future raw-count metric of these kinds needs a near-idle floor too.
+/// Fails if a covered accumulation is (re)introduced with a masking floor.
+#[test]
+fn scale_varying_count_floors_are_near_idle() {
+    for m in METRICS {
+        // Near-idle ceiling by (kind, unit) for the scale-varying ACCUMULATION
+        // classes; `_ => continue` skips everything else. ns-denominated
+        // accumulations idle near ~1us (1000 ns); raw counts idle near a single
+        // event; the µs PSI-stall Counter idles near ~1us.
+        let ceiling = match (m.kind, m.display_unit) {
+            // Raw per-event counts (Counter) and per-phase delta sums
+            // (PerPhaseDeltaSum: system_time_ns / user_time_ns) -- both sum like
+            // a counter and span orders of magnitude.
+            (MetricKind::Counter | MetricKind::PerPhaseDeltaSum, "") => 10.0,
+            (MetricKind::Counter | MetricKind::PerPhaseDeltaSum, "ns") => 1000.0,
+            // Per-schedule mean run-delay rates (Σrun_delay / Σpcount, ns):
+            // total_run_delay_ns_per_sched + the schbench msg/worker variants --
+            // the only Rate-"ns" metrics, all scale-varying LowerBetter latency
+            // rates (fraction Rates carry unit "", so no bounded false positives).
+            (MetricKind::Rate { .. }, "ns") => 1000.0,
+            // The cumulative PSI IRQ-stall accumulator (total_irq_pressure_us).
+            // Naturally-bounded µs LATENCY metrics are PerPhase / Distribution /
+            // Peak (never Counter), so a Counter-"µs" arm captures only the
+            // accumulator. "\u{00b5}s" is U+00B5 (micro sign), matching the unit.
+            (MetricKind::Counter, "\u{00b5}s") => 1.0,
+            _ => continue,
+        };
+        assert!(
+            m.default_abs <= ceiling,
+            "scale-varying accumulation `{}` has default_abs {} > near-idle ceiling {} \
+             (unit {:?}): a high absolute floor masks a large RELATIVE regression \
+             on a low-throughput workload (the #28 bug). Use a near-idle activity \
+             floor and let default_rel carry materiality.",
+            m.name, m.default_abs, ceiling, m.display_unit,
+        );
+    }
+}
+
+/// #28 recurrence guard (mixed-class pin): the scale-varying raw-count / µs-
+/// accumulator metrics whose (kind, unit) is a MIXED class -- it also holds
+/// bounded metrics, so a derived (kind, unit) match would false-positive (e.g.
+/// `Peak` + `""` also holds `max_avg_irq_util` / `max_task_lat_cri`) -- are
+/// pinned to their near-idle ceilings by an EXPLICIT allowlist. This makes the
+/// "kept near-idle by convention" note on
+/// [`scale_varying_count_floors_are_near_idle`] enforceable: a re-hardening of
+/// any of these six fails the build, closing the #28 recurrence gap for the
+/// metrics the two derived guards cannot classify -- without a per-literal
+/// MetricScale field. A new mixed-class scale-varying metric must be added here.
+#[test]
+fn mixed_class_scale_varying_floors_pinned() {
+    // (name, near-idle ceiling). Peak/WorstLowest/PerPhase raw counts idle near a
+    // single event (<= 10); the µs PSI-stall Peak idles near ~1us (<= 1.0).
+    const PINNED: &[(&str, f64)] = &[
+        ("max_cpu_hardirqs", 10.0),
+        ("max_cpu_softirq_net_rx", 10.0),
+        ("max_cgroup_irq_pressure", 1.0),
+        ("worst_iterations_per_worker", 10.0),
+        ("iterations_per_worker", 10.0),
+        ("schbench_loop_count", 1.0),
+    ];
+    for (name, ceiling) in PINNED {
+        let m =
+            metric_def(name).unwrap_or_else(|| panic!("pinned metric `{name}` not in METRICS"));
+        assert!(
+            m.default_abs <= *ceiling,
+            "mixed-class scale-varying metric `{}` has default_abs {} > near-idle \
+             ceiling {}: a high absolute floor masks a large RELATIVE regression on \
+             a low-throughput workload (the #28 bug). These are not covered by the \
+             (kind, unit) guards (mixed class), so this allowlist pins them.",
+            name, m.default_abs, ceiling,
+        );
+    }
+}
+
+/// #28 rounding-safety guard (LOWER bound): the typed u64/i64 `GauntletRow` fields
+/// folded cross-run via `round_u64` / `round_i64` (group.rs) carry a per-A/B-pair
+/// rounding error up to 1.0, so their absolute floor must stay STRICTLY above 1.0
+/// or a rounding-only delta fabricates a unit regression (the group.rs rounded-mean
+/// invariant; `stuck_count` sidesteps this by being exact-mean f64 with a 1.0
+/// floor). The other #28 guards pin only the UPPER (near-idle) bound; this pins the
+/// lower bound so a future recalibration to `<= 1.0` fails the build. Enumerated
+/// (an allowlist) -- "is folded via round_u64/round_i64" is not a (kind, unit).
+#[test]
+fn rounded_mean_count_floors_above_rounding_noise() {
+    // round_u64 / round_i64-folded typed integer fields. stuck_count is NOT here:
+    // it is exact-mean f64 and deliberately floored at 1.0.
+    const ROUNDED: &[&str] = &[
+        "total_iterations",
+        "total_migrations",
+        "total_fallback",
+        "total_keep_last",
+    ];
+    for name in ROUNDED {
+        let m = metric_def(name)
+            .unwrap_or_else(|| panic!("rounded-mean metric `{name}` not in METRICS"));
+        assert!(
+            m.default_abs > 1.0,
+            "rounded-mean field `{}` has default_abs {} <= 1.0: a cross-run round_u64 / \
+             round_i64 fold can differ by up to 1.0 per A/B pair, so a floor <= 1.0 lets \
+             a rounding-only delta fabricate a unit regression (group.rs rounded-mean \
+             invariant). Keep default_abs >= 2.0.",
+            name, m.default_abs,
+        );
+    }
+}
+
+/// #28 recurrence guard (closed unit taxonomy): every `METRICS` display_unit must
+/// be a KNOWN unit string. The floor guards above classify by (kind, unit), so a
+/// metric introduced with a BRAND-NEW unit string (e.g. a future `pkt/s` /
+/// `bytes/s` throughput) silently slips all of them and could ship the #28 masking
+/// floor with a green build. This guard fails the build on an unrecognized unit,
+/// FORCING the author to add it here AND route it into the correct floor treatment
+/// -- the recurrence-prevention the (kind, unit) guards cannot give a new unit.
+///
+/// Units are SHARED across classes (`""`, `"ns"`, `"µs"` are scale-varying for
+/// counts/accumulators and bounded for fractions/latencies), so a unit set cannot
+/// auto-classify -- it only forces the confrontation; the failure message routes
+/// the author to the right floor guard, which then enforces the near-idle floor.
+///
+/// KNOWN RESIDUAL (deliberate won't-fix): a future scale-varying metric of an
+/// EXISTING unit but an unguarded kind -- specifically a scale-varying `Gauge`
+/// with unit `""` -- would slip both this guard (unit is known) and the floor
+/// guards (no Gauge arm). None exist today (every `Gauge` is an instantaneous
+/// bounded value -- nr_running, utilization, ratios -- not an accumulation). Fully
+/// closing this needs a per-literal MetricScale field on all ~184 MetricDef
+/// literals; that cost is disproportionate to a hypothetical unusual Gauge, so it
+/// is not taken. A new scale-varying Gauge must be added to a floor guard by hand.
+#[test]
+fn all_metric_units_are_known() {
+    // The complete set of units the registry uses today. A new unit must be added
+    // here AND classified into a floor guard (scale-varying) or left bounded.
+    const KNOWN_UNITS: &[&str] = &[
+        "",           // raw counts (varying) / fractions & ratios (bounded)
+        "%",          // percent (bounded)
+        "x",          // ratio (bounded)
+        "ms",         // millisecond latency (bounded)
+        "\u{00b5}s",  // microsecond latency (bounded) / PSI-stall accumulator (varying, Counter)
+        "ns",         // nanosecond accumulation / per-schedule rate (varying)
+        "s",          // second wall-clock window (bounded) / CPU-time accumulator (suppressed)
+        "/s",         // per-second event rate (varying)
+        "ns/s",       // nanoseconds-per-second rate (varying)
+        "ops/s",      // ops throughput (varying)
+        "req/s",      // request throughput (varying)
+        "irq/s",      // IRQ rate (varying)
+        "softirq/s",  // softirq rate (varying)
+        "iter/s",     // iteration rate (varying)
+        "iter/cpu-s", // overcommit-invariant iteration rate (varying)
+    ];
+    for m in METRICS {
+        assert!(
+            KNOWN_UNITS.contains(&m.display_unit),
+            "metric `{}` has unrecognized display_unit {:?}: add it to KNOWN_UNITS AND \
+             decide its #28 floor treatment -- if scale-varying (a count, accumulation, \
+             or per-time rate whose baseline spans orders of magnitude), route it into \
+             throughput_rate_floors_are_near_idle / scale_varying_count_floors_are_near_idle \
+             / mixed_class_scale_varying_floors_pinned with a near-idle floor; if bounded \
+             (a fraction, ratio, percent, or fixed-unit latency), a fixed floor is correct.",
+            m.name, m.display_unit,
+        );
+    }
+}

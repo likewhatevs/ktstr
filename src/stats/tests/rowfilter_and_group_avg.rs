@@ -685,7 +685,10 @@ fn group_and_average_single_pass_passes_through_metrics() {
 /// up-to-1.0 per-A/B-pair error defeat stuck_count's
 /// `default_abs` of 1.0 and fabricate single-stall regressions
 /// from sub-integer differences. Every other typed integer field
-/// rounds (abs >= 5.0 absorbs the error); stuck_count alone is f64.
+/// rounds; the smallest floor (total_iterations / total_migrations at
+/// 2.0) still exceeds the <= 1.0 per-A/B-pair error, so it is absorbed
+/// (pinned by rounded_mean_count_floors_above_rounding_noise);
+/// stuck_count alone is f64 with a 1.0 floor.
 #[test]
 fn group_and_average_stuck_count_is_exact_fractional_mean() {
     let mut a = make_row("t", "tiny-1llc", true, 0.0);

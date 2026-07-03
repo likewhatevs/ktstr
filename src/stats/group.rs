@@ -968,9 +968,13 @@ fn fold_ext_metrics(
 ///   aggregate's `passed = false` routes the pair to
 ///   [`compare_rows_by`]' `excluded_pairs` gate.
 /// - `u64` / `i64` fields take the rounded mean
-///   (`(sum / count).round() as u64`). The up-to-0.5-unit rounding
-///   error is well below each such field's `default_abs` gate (the
-///   smallest is `total_fallback` / `total_keep_last` at 5.0).
+///   (`(sum / count).round() as u64`). The up-to-0.5-unit per-side
+///   rounding error (up to 1.0 across an A/B pair) stays below each
+///   such field's `default_abs` gate: the smallest is
+///   `total_iterations` / `total_migrations` at 2.0, held `>= 2.0` by
+///   the scale-varying #28 recalibration precisely so a rounding-only
+///   delta (`<= 1.0`) never clears the gate and fabricates a unit
+///   regression.
 /// - `stuck_count` is the exception: it is `f64` and carries the
 ///   EXACT mean (`sum / count`, no rounding). Its `default_abs` is
 ///   1.0 — tight enough that a rounded mean's up-to-1.0 per-A/B-pair

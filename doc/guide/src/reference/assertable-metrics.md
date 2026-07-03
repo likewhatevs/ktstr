@@ -45,10 +45,20 @@ Each `MetricDef` row means:
 - **default_abs** / **default_rel** — the **dual gate**. A move counts
   as a confident regression only when it clears BOTH the absolute
   floor (`default_abs`, in the metric's units) AND the relative
-  threshold (`default_rel`, a fraction). A tiny absolute move on a
-  huge relative base — or a large relative move below the absolute
-  floor — is not material. `perf-delta --threshold PCT` / `--policy
-  FILE` override the relative gate; the absolute gate is per-metric.
+  threshold (`default_rel`, a fraction). The absolute floor's role
+  depends on the metric's dynamic range:
+  - **Scale-bounded** metrics (fractions, ratios, `%` spread, `ms`/`µs`
+    latencies) use `default_abs` as a fixed unit-scale noise floor — a
+    sub-unit move is immaterial regardless of its relative size.
+  - **Scale-varying** metrics (`*_per_sec` rates, `ops/s`, `req/s`, raw
+    counts) can span orders of magnitude across workloads, so a fixed
+    floor would MASK a large relative regression on a low-throughput
+    workload. For these `default_abs` is only a near-idle activity guard
+    and `default_rel` carries materiality — a 40 % drop is flagged whether
+    the baseline is 50/s or 50000/s.
+
+  `perf-delta --threshold PCT` / `--policy FILE` override the relative
+  gate; the absolute gate is per-metric.
 - **display_unit** — the unit rendered in tables (`ms`, `/s`, `ns`, …).
 
 ## Workload → emitted metrics
