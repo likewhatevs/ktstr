@@ -107,10 +107,9 @@ use super::*;
 /// Returns the count of removed debris entries (info-level
 /// tracing also logs each removal).
 ///
-/// `dead_code` allow: kept as the operator-facing entry point
-/// for a future `cargo ktstr clean` subcommand and the
-/// opportunistic in-process sweep before `store_atomic`.
-#[allow(dead_code)]
+/// Called once per process from `ensure_template` (via
+/// `sweep_cache_debris_once`) to GC dead-pid debris on the production
+/// path, plus the operator-facing `clean_all`.
 pub fn clean_orphaned_tmp_dirs(cache_root: &Path) -> Result<usize> {
     if !cache_root.is_dir() {
         // Cache root not yet materialised — nothing to sweep.
@@ -512,4 +511,51 @@ pub fn clean_all() -> Result<usize> {
         drop(lock_fd);
     }
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_orphaned_tmp_dirs_removes_dead_pid_debris_keeps_live_and_published() {
+        // pid 2147483647 (i32::MAX) is above pid_max, so kill() -> ESRCH
+        // (dead); our own pid is live. Verify all three debris shapes are
+        // reclaimed only for the dead owner, and published entries / .locks
+        // / live-pid in-flight files are never touched.
+        let base = std::env::temp_dir().join(format!("ktstr-dtsweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("mk cache root");
+        let live = std::process::id();
+
+        let dead_staging = base.join("template.img.in-flight.somekey.2147483647");
+        let dead_pertest = base.join(".per-test-2147483647-aa-bb.img");
+        let dead_stagedir = base.join("somekey.tmp.2147483647");
+        std::fs::write(&dead_staging, b"x").unwrap();
+        std::fs::write(&dead_pertest, b"x").unwrap();
+        std::fs::create_dir(&dead_stagedir).unwrap();
+
+        let live_staging = base.join(format!("template.img.in-flight.somekey.{live}"));
+        let live_pertest = base.join(format!(".per-test-{live}-cc-dd.img"));
+        std::fs::write(&live_staging, b"x").unwrap();
+        std::fs::write(&live_pertest, b"x").unwrap();
+
+        let published = base.join("somekey");
+        let locks = base.join(".locks");
+        std::fs::create_dir(&published).unwrap();
+        std::fs::create_dir(&locks).unwrap();
+
+        let removed = clean_orphaned_tmp_dirs(&base).expect("sweep");
+
+        assert!(!dead_staging.exists(), "dead-pid staging image reclaimed");
+        assert!(!dead_pertest.exists(), "dead-pid per-test backing reclaimed");
+        assert!(!dead_stagedir.exists(), "dead-pid staging dir reclaimed");
+        assert!(live_staging.exists(), "live-pid staging image kept");
+        assert!(live_pertest.exists(), "live-pid per-test backing kept");
+        assert!(published.exists(), "published cache entry untouched");
+        assert!(locks.exists(), ".locks dir untouched");
+        assert_eq!(removed, 3, "exactly the three dead-pid entries removed");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

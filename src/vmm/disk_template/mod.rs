@@ -1142,6 +1142,11 @@ fn locate_host_binary(name: &str, package_hint: &str) -> Result<PathBuf> {
 /// then pass the returned path to [`clone_to_per_test`] for the
 /// per-test reflink clone.
 pub(crate) fn ensure_template(fs: Filesystem, capacity_bytes: u64) -> Result<PathBuf> {
+    // Reclaim dead-pid staging / per-test debris from crashed prior runs,
+    // once per process, BEFORE the cache-hit early-return below so a run
+    // that only hits the template cache (but still creates per-test backing
+    // files) also GCs. See sweep_cache_debris_once.
+    sweep_cache_debris_once();
     // Resolve the host mkfs binary up front and query its version
     // fingerprint so the cache key reflects which mkfs would build
     // the template if we miss. The PATH lookup here is cheap (one
@@ -1204,6 +1209,23 @@ pub(crate) fn ensure_template(fs: Filesystem, capacity_bytes: u64) -> Result<Pat
         }
     };
     Ok(final_path)
+}
+
+/// Reclaim disk-template cache debris orphaned by dead-pid prior runs
+/// (staging images + per-test FICLONE backing files), ONCE per process.
+/// Runs at the top of [`ensure_template`] — before its cache-hit
+/// early-return — so even a run that only hits the template cache (but
+/// creates per-test backing files) still GCs. Best-effort: a cache-root
+/// resolution failure or sweep error is ignored (a later run reclaims the
+/// debris, and `clean_orphaned_tmp_dirs` is dead-pid gated so it never
+/// removes a live run's in-flight file).
+fn sweep_cache_debris_once() {
+    static SWEEP_ONCE: std::sync::Once = std::sync::Once::new();
+    SWEEP_ONCE.call_once(|| {
+        if let Ok(root) = cache_root() {
+            let _ = cleanup::clean_orphaned_tmp_dirs(&root);
+        }
+    });
 }
 
 /// Compose the staging-image path for a `(cache_key, pid)` pair.
