@@ -3417,6 +3417,77 @@ fn noise_findings_declared_phase_gate_gates_the_exit() {
 }
 
 #[test]
+fn noise_findings_declared_whole_run_gate_gates_the_exit() {
+    // worst_spread 10->15 (LowerBetter) is a single AGGREGATE regression. Under
+    // the default count gate (>=5 regressions) it alone would NOT fail. A
+    // whole-run (phase: None) declared gate on it is an author opt-in that
+    // ALWAYS gates — the aggregate-axis parity of the declared PHASE gate above
+    // — so the exit is 1 with only this one regression.
+    let a = noise_side("wr", 10.0, 2000);
+    let b = with_gate(
+        noise_side("wr", 15.0, 2000),
+        perf_gate("worst_spread", Some(5.0), Some(0.5), None, None),
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    let agg = rep
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "worst_spread")
+        .expect("worst_spread aggregate finding");
+    assert_eq!(agg.kind, NoiseKind::Regression);
+    assert!(
+        agg.gated_by_assertion,
+        "a whole-run declared gate marks the AGGREGATE finding"
+    );
+    assert_eq!(rep.declared_regressions(), 1);
+    assert_eq!(
+        rep.declared_phase_regressions(),
+        0,
+        "the gate is whole-run, not phase-scoped"
+    );
+    assert_eq!(
+        rep.regressions(),
+        1,
+        "exactly one aggregate regression (below the default count gate)"
+    );
+    // A single declared whole-run regression fails the run under the DEFAULT
+    // count gate (>=5) — the count gate must not swallow an author opt-in.
+    assert_eq!(
+        noise_exit_code(&rep, &crate::stats::GateOptions::default()),
+        1,
+        "a declared whole-run regression fails even below --fail-threshold",
+    );
+    // ...and with the count gate fully disabled (fail_threshold 0) it still gates.
+    assert_eq!(
+        noise_exit_code(
+            &rep,
+            &crate::stats::GateOptions {
+                fail_threshold: Some(0),
+                ..Default::default()
+            },
+        ),
+        1,
+        "a declared whole-run regression gates even with the count gate disabled",
+    );
+    // Sanity: WITHOUT the declaration the SAME lone regression does NOT fail the
+    // default gate — proving the declaration is what gates, not the count.
+    let rep_undeclared = noise_findings(
+        &a,
+        &noise_side("wr", 15.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        5.0,
+        true,
+    );
+    assert_eq!(rep_undeclared.regressions(), 1);
+    assert_eq!(rep_undeclared.declared_regressions(), 0);
+    assert_eq!(
+        noise_exit_code(&rep_undeclared, &crate::stats::GateOptions::default()),
+        0,
+        "a lone UNdeclared regression is below the default count gate (>=5)",
+    );
+}
+
+#[test]
 fn scalar_declared_gate_warning_flags_present_gates() {
     // The scalar compare does not evaluate declared gates; it must WARN (not
     // silently ignore) when compared tests carry them.

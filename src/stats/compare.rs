@@ -1820,6 +1820,19 @@ impl NoiseReport {
             .filter(|f| f.kind == NoiseKind::Regression)
             .count()
     }
+    /// Aggregate (whole-run) regressions on a metric the test author explicitly
+    /// DECLARED a whole-run [`crate::test_support::PerfDeltaAssertion`] for
+    /// (`phase: None`, `gated_by_assertion`). Like a declared PHASE gate
+    /// ([`Self::declared_phase_regressions`]), a declared whole-run gate is an
+    /// author opt-in that ALWAYS contributes to the exit, orthogonal to the
+    /// operator's count / must-fail gate — an UNdeclared aggregate regression
+    /// stays subject to that count gate (`gate_fails`).
+    pub fn declared_regressions(&self) -> usize {
+        self.findings
+            .iter()
+            .filter(|f| f.kind == NoiseKind::Regression && f.gated_by_assertion)
+            .count()
+    }
     /// Aggregate metrics flagged untrustworthy — a side had < 2 usable runs.
     pub fn noisy(&self) -> usize {
         self.findings
@@ -2692,16 +2705,22 @@ pub fn compare_partitions_noise(
     // per-phase pass — a narrow-window phase flake must not flip CI red), but a
     // phase-scoped gate the author explicitly declared is an opt-in and DOES
     // gate (matches the `PerfDeltaAssertion::phase` doc).
-    // Operator gate: the count / must-fail gate applies to the aggregate
-    // confident regressions; an author-DECLARED phase gate always fails (its
-    // own opt-in, orthogonal to the operator's count gate).
+    // Operator gate: the count / must-fail gate applies to the UNdeclared
+    // aggregate confident regressions; an author-DECLARED gate — whole-run OR
+    // phase-scoped — always fails (its own opt-in, orthogonal to the operator's
+    // count gate).
     Ok(noise_exit_code(&report, gate))
 }
 
-/// Exit code for the noise-adjusted compare: the operator gate ([`gate_fails`])
-/// over the aggregate confident regressions, OR any author-DECLARED
-/// phase-scoped regression (which always gates, independent of the operator's
-/// count gate). Extracted so the exit decision is unit-testable.
+/// Exit code for the noise-adjusted compare. Fails (`1`) when EITHER the
+/// operator gate ([`gate_fails`]) trips on the aggregate confident regressions,
+/// OR any author-DECLARED regression is present — whole-run
+/// ([`NoiseReport::declared_regressions`]) or phase-scoped
+/// ([`NoiseReport::declared_phase_regressions`]). A declared assertion is a
+/// per-test opt-in that ALWAYS gates on its metric, independent of the
+/// operator's count / must-fail gate, so a single declared regression fails
+/// even below `--fail-threshold`. Extracted so the exit decision is
+/// unit-testable.
 pub(crate) fn noise_exit_code(report: &NoiseReport, gate: &GateOptions) -> i32 {
     let regressing: Vec<&str> = report
         .findings
@@ -2709,7 +2728,10 @@ pub(crate) fn noise_exit_code(report: &NoiseReport, gate: &GateOptions) -> i32 {
         .filter(|f| f.kind == NoiseKind::Regression)
         .map(|f| f.metric.name)
         .collect();
-    if gate_fails(&regressing, gate) || report.declared_phase_regressions() > 0 {
+    if gate_fails(&regressing, gate)
+        || report.declared_regressions() > 0
+        || report.declared_phase_regressions() > 0
+    {
         1
     } else {
         0
