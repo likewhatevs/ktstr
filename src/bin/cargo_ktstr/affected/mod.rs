@@ -7,14 +7,15 @@
 //!
 //! A scheduler is affected if a changed path is reachable by EITHER layer:
 //!
-//! 1. **`.d` input set** ([`dep_info`]): the scheduler is built once and its
-//!    cargo `<artifact>.d` dep-info is parsed into the exact set of source
-//!    files that compiled into it -- the Rust sources, the generated BPF
-//!    skeletons, and (via clang's `-M`) every `.bpf.c` / header it includes,
-//!    including cross-scheduler text-includes (e.g. `scx_chaos` including
-//!    `scx_p2dq`'s BPF) and shared headers under the `bpf_h -> scheds/include`
-//!    symlink. File-precise, and always the fresh ground truth (uncached --
-//!    see [`scheduler_input_set`]).
+//! 1. **`.d` input set** ([`dep_info`]): the schedulers are built once (all in
+//!    a single cargo invocation -- [`build_schedulers`]) and each cargo
+//!    `<artifact>.d` dep-info is parsed into the exact set of source files that
+//!    compiled into it -- the Rust sources, the generated BPF skeletons, and
+//!    (via clang's `-M`) every `.bpf.c` / header it includes, including
+//!    cross-scheduler text-includes (e.g. `scx_chaos` including `scx_p2dq`'s
+//!    BPF) and shared headers under the `bpf_h -> scheds/include` symlink.
+//!    File-precise, and always the fresh ground truth (uncached -- see
+//!    [`scheduler_input_set_from_artifact`]).
 //!
 //! 2. **cargo dep-closure** (cargo_metadata): a changed path is attributed to
 //!    its owning workspace crate; the scheduler is affected if that crate is
@@ -190,10 +191,23 @@ fn compute_outcome(
     include_worktree: bool,
     schedulers: &[SchedulerInfo],
 ) -> Result<(AffectedOutcome, Vec<String>)> {
+    // Resolve cargo ONCE ($CARGO else "cargo") and use it for BOTH `cargo
+    // metadata` and `build_schedulers`, so `PackageId.repr` (an opaque,
+    // cargo-version-dependent string) is spelled identically across the two
+    // invocations. A mismatch (e.g. $CARGO differs from PATH `cargo`) would make
+    // every artifact->package lookup miss -> empty input sets -> all schedulers
+    // conservatively affected: still fail-safe (over-run), but it would silently
+    // defeat the precise `.d` attribution this layer exists for.
+    let cargo = std::env::var_os("CARGO")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("cargo"));
+
     // Build the workspace graph FIRST so the RunAll set and the Subset set draw
     // from the SAME ws-filtered testable universe. A `cargo metadata` failure
     // is the one case that falls back to the unfiltered enumeration set.
-    let meta = match cargo_metadata::MetadataCommand::new().exec() {
+    let mut meta_cmd = cargo_metadata::MetadataCommand::new();
+    meta_cmd.cargo_path(&cargo);
+    let meta = match meta_cmd.exec() {
         Ok(m) => m,
         Err(_) => return Ok((AffectedOutcome::RunAll, package_schedulers(schedulers))),
     };
@@ -288,9 +302,20 @@ fn compute_outcome(
         .any(|p| is_native_source(p) || ws.owning_crate(p).is_none());
     let mut input_sets: BTreeMap<String, Option<BTreeSet<String>>> = BTreeMap::new();
     if need_dot_d {
+        // ONE cargo build for every testable scheduler (cargo resolves the graph
+        // and compiles shared deps once). A package ABSENT from the result map
+        // (its bin did not build) -> None -> conservatively affected, matching
+        // the per-scheduler fail-safe.
+        let id_to_name: BTreeMap<String, String> = meta
+            .packages
+            .iter()
+            .map(|p| (p.id.repr.clone(), p.name.to_string()))
+            .collect();
+        let artifacts = build_schedulers(&cargo, &testable_pkgs, &id_to_name);
         for pkg in &testable_pkgs {
-            // Err (build/read failure) -> None -> conservatively affected.
-            let set = scheduler_input_set(pkg, &repo_root, &ws).ok();
+            let set = artifacts
+                .get(pkg)
+                .and_then(|a| scheduler_input_set_from_artifact(pkg, a, &repo_root, &ws).ok());
             input_sets.insert(pkg.clone(), set);
         }
     }
@@ -446,23 +471,23 @@ fn attribute(
     }
 }
 
-/// A scheduler's `.d` input set (canonicalized, repo-relative). Builds the
-/// scheduler (a fast up-to-date check if the target dir is warm), reads its
-/// dep-info, and folds in the scheduler's own manifest + build.rs paths (build
-/// inputs the `.d` never lists, so a dep bump in its Cargo.toml still marks it
-/// affected).
+/// A scheduler's `.d` input set (canonicalized, repo-relative) from its
+/// PRE-BUILT `[[bin]]` artifact: reads the dep-info alongside `artifact` and
+/// folds in the scheduler's own manifest + build.rs paths (build inputs the
+/// `.d` never lists, so a dep bump in its Cargo.toml still marks it affected).
+/// The scheduler is built once, in a batch, by [`build_schedulers`].
 ///
 /// Deliberately UNCACHED: the `.d` is the only ground truth for the input set,
 /// and any cache keyed on a cheaper proxy (source-path set, Cargo.lock) risks a
 /// stale set that silently under-runs when a shared header gains a new include
 /// -- the worst outcome. Rebuilding every run is the accepted cost.
-fn scheduler_input_set(
+fn scheduler_input_set_from_artifact(
     pkg: &str,
+    artifact: &Path,
     repo_root: &Path,
     ws: &WorkspaceGraph,
 ) -> Result<BTreeSet<String>> {
     let (manifest_rel, build_rs_rel) = ws.scheduler_manifest_inputs(pkg, repo_root)?;
-    let artifact = build_scheduler(pkg)?;
     let dot_d = artifact.with_extension("d");
     let contents = std::fs::read_to_string(&dot_d)
         .with_context(|| format!("read dep-info {}", dot_d.display()))?;
@@ -478,8 +503,19 @@ fn scheduler_input_set(
     Ok(set)
 }
 
-/// Build a TARGET-repo scheduler package in the CURRENT directory and return
-/// its `[[bin]]` artifact path (its `.d` dep-info sits alongside).
+/// Build EVERY testable scheduler in ONE `cargo build -p A -p B ...` and map
+/// each package NAME to its `[[bin]]` artifact path (its `.d` sits alongside).
+/// One cargo invocation instead of one-per-scheduler: cargo resolves the graph
+/// and compiles shared dependencies once.
+///
+/// A package that produced no bin artifact (its build failed, or cargo stopped
+/// before reaching it) is ABSENT from the map, so
+/// [`scheduler_input_set_from_artifact`] is never called for it and its input
+/// set stays `None` -> conservatively affected (the per-scheduler fail-safe,
+/// preserved). The exit status is therefore NOT checked: cargo still emits
+/// artifacts for the packages that DID build even when a sibling fails, so
+/// parse-what-was-emitted keeps the successful schedulers precise while the
+/// failed ones fall through to the conservative `None`.
 ///
 /// Deliberately NOT [`ktstr::build_and_find_binary`], which pins cargo's cwd to
 /// ktstr's own manifest dir (baked via `env!("CARGO_MANIFEST_DIR")` at compile
@@ -487,59 +523,76 @@ fn scheduler_input_set(
 /// schedulers are what we build. Uses the SAME profile
 /// (`ktstr::scheduler_profile_name`: `KTSTR_SCHEDULER_PROFILE` or the release
 /// default) the scheduler-under-test is built with, so the `.d` lands in the
-/// matching `target/<profile>/` and a warm build is reused rather than a
-/// redundant release build.
-fn build_scheduler(pkg: &str) -> Result<PathBuf> {
-    let profile = ktstr::scheduler_profile_name();
-    let output = Command::new("cargo")
-        .args([
-            "build",
-            "-p",
-            pkg,
-            "--message-format=json",
-            "--profile",
-            profile.as_str(),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .output()
-        .with_context(|| format!("spawn cargo build -p {pkg}"))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "cargo build -p {pkg} failed (exit {})",
-            output.status.code().unwrap_or(-1)
-        );
+/// matching `target/<profile>/` and a warm build is reused.
+///
+/// `cargo` is the caller-resolved cargo binary (the SAME one `cargo metadata`
+/// used), so the `PackageId.repr` in the emitted artifacts matches the metadata
+/// reprs `id_to_name` is keyed on.
+fn build_schedulers(
+    cargo: &Path,
+    pkgs: &[String],
+    id_to_name: &BTreeMap<String, String>,
+) -> BTreeMap<String, PathBuf> {
+    if pkgs.is_empty() {
+        return BTreeMap::new();
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+    let profile = ktstr::scheduler_profile_name();
+    let mut cmd = Command::new(cargo);
+    cmd.args([
+        "build",
+        "--message-format=json",
+        "--profile",
+        profile.as_str(),
+    ]);
+    for pkg in pkgs {
+        cmd.args(["-p", pkg]);
+    }
+    let output = match cmd.stdout(Stdio::piped()).stderr(Stdio::inherit()).output() {
+        Ok(o) => o,
+        // Spawn failure -> empty map -> every scheduler conservatively affected.
+        Err(_) => return BTreeMap::new(),
+    };
+    map_artifacts_to_bins(std::io::Cursor::new(output.stdout), id_to_name)
+}
+
+/// Parse a `cargo build --message-format=json` stream into a package-NAME ->
+/// `[[bin]]` artifact-path map. Extracted from [`build_schedulers`] so the
+/// artifact filtering (a non-test `[[bin]]` target of a known package that has
+/// an executable) is unit-testable without spawning cargo. `id_to_name` maps
+/// `PackageId.repr` to the package name, so an artifact is attributed to its
+/// package regardless of whether the `[[bin]]` name matches the package name;
+/// an artifact whose `package_id` is not in the map (a dependency) is skipped.
+///
+/// Assumes ONE `[[bin]]` per scheduler package (true for every scx scheduler,
+/// and the same assumption [`ktstr::build_and_find_binary`] makes). If a package
+/// emits multiple bins the last wins and a diagnostic is logged to stderr; a
+/// future multi-bin scheduler would want the per-bin `.d` sets unioned instead.
+fn map_artifacts_to_bins<R: std::io::BufRead>(
+    stream: R,
+    id_to_name: &BTreeMap<String, String>,
+) -> BTreeMap<String, PathBuf> {
+    let mut map: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for msg in cargo_metadata::Message::parse_stream(stream).flatten() {
+        let cargo_metadata::Message::CompilerArtifact(art) = msg else {
             continue;
         };
-        if msg.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
-            continue;
-        }
-        let is_bin = msg
-            .get("target")
-            .and_then(|t| t.get("kind"))
-            .and_then(|k| k.as_array())
-            .is_some_and(|kinds| kinds.iter().any(|k| k.as_str() == Some("bin")));
-        let is_test = msg
-            .get("profile")
-            .and_then(|p| p.get("test"))
-            .and_then(|t| t.as_bool())
-            == Some(true);
-        if is_bin
-            && !is_test
-            && let Some(path) = msg
-                .get("filenames")
-                .and_then(|f| f.as_array())
-                .and_then(|a| a.first())
-                .and_then(|f| f.as_str())
+        if art.target.is_bin()
+            && !art.profile.test
+            && let Some(name) = id_to_name.get(&art.package_id.repr)
+            && let Some(exe) = art.executable
         {
-            return Ok(PathBuf::from(path));
+            let path = PathBuf::from(exe.as_str());
+            if let Some(prev) = map.insert(name.clone(), path) {
+                eprintln!(
+                    "ktstr affected: scheduler package `{name}` emitted multiple \
+                     [[bin]] artifacts; using the last, ignoring {} (its `.d` \
+                     inputs are not considered)",
+                    prev.display()
+                );
+            }
         }
     }
-    anyhow::bail!("cargo build -p {pkg} produced no [[bin]] artifact")
+    map
 }
 
 /// Workspace crate graph: member manifest dirs (repo-relative) + dependency
@@ -1075,5 +1128,57 @@ mod tests {
         let tests = vec![sched_test("t_b", "scx_b_sched")];
         let outcome = AffectedOutcome::Subset(vec!["scx_a".to_string()]);
         assert_eq!(select_relevant_tests(&outcome, &pkg_of, &tests), None);
+    }
+
+    /// map_artifacts_to_bins keeps ONLY a non-test `[[bin]]` artifact of a KNOWN
+    /// package that has an executable, attributed by `package_id` -> its
+    /// `executable`. Each of the four filter conjuncts is exercised in
+    /// isolation: a lib (not a bin), a TEST-profile bin (dropped by `!test`, and
+    /// ordered AFTER the real bin so a broken `!test` filter would overwrite and
+    /// flip the asserted path), a bin with a null executable (dropped by
+    /// `executable.is_some()`), and a bin of an unknown package (a dependency).
+    /// Fixture is real `cargo build --message-format=json` output shape.
+    #[test]
+    fn map_artifacts_to_bins_filters_and_attributes() {
+        let mut id_to_name: BTreeMap<String, String> = BTreeMap::new();
+        id_to_name.insert(
+            "scx_a 1.0.0 (path+file:///w/scx_a)".to_string(),
+            "scx_a".to_string(),
+        );
+        id_to_name.insert(
+            "scx_b 1.0.0 (path+file:///w/scx_b)".to_string(),
+            "scx_b".to_string(),
+        );
+        let stream = concat!(
+            // scx_a real bin (non-test, has executable) -> the sole mapped entry.
+            r#"{"reason":"compiler-artifact","package_id":"scx_a 1.0.0 (path+file:///w/scx_a)","target":{"name":"scx_a","kind":["bin"],"src_path":"/w/scx_a/src/main.rs"},"profile":{"opt_level":"3","debug_assertions":false,"overflow_checks":false,"test":false},"features":[],"filenames":["/w/target/release/scx_a"],"executable":"/w/target/release/scx_a","fresh":false}"#,
+            "\n",
+            // scx_a lib -> dropped (not a bin).
+            r#"{"reason":"compiler-artifact","package_id":"scx_a 1.0.0 (path+file:///w/scx_a)","target":{"name":"scx_a","kind":["lib"],"src_path":"/w/scx_a/src/lib.rs"},"profile":{"opt_level":"3","debug_assertions":false,"overflow_checks":false,"test":false},"features":[],"filenames":["/w/target/release/libscx_a.rlib"],"executable":null,"fresh":false}"#,
+            "\n",
+            // scx_a TEST-profile bin (after the real bin, different executable)
+            // -> dropped by `!test`; a broken filter would overwrite scx_a.
+            r#"{"reason":"compiler-artifact","package_id":"scx_a 1.0.0 (path+file:///w/scx_a)","target":{"name":"scx_a","kind":["bin"],"src_path":"/w/scx_a/src/main.rs"},"profile":{"opt_level":"3","debug_assertions":false,"overflow_checks":false,"test":true},"features":[],"filenames":["/w/target/release/deps/scx_a-abc123"],"executable":"/w/target/release/deps/scx_a-abc123","fresh":false}"#,
+            "\n",
+            // scx_b bin with a null executable -> dropped by `executable.is_some()`.
+            r#"{"reason":"compiler-artifact","package_id":"scx_b 1.0.0 (path+file:///w/scx_b)","target":{"name":"scx_b","kind":["bin"],"src_path":"/w/scx_b/src/main.rs"},"profile":{"opt_level":"3","debug_assertions":false,"overflow_checks":false,"test":false},"features":[],"filenames":[],"executable":null,"fresh":false}"#,
+            "\n",
+            // Unknown package (a dependency) bin -> dropped (not in id_to_name).
+            r#"{"reason":"compiler-artifact","package_id":"ghost 1.0.0 (path+file:///w/ghost)","target":{"name":"ghost","kind":["bin"],"src_path":"/w/ghost/src/main.rs"},"profile":{"opt_level":"3","debug_assertions":false,"overflow_checks":false,"test":false},"features":[],"filenames":["/w/target/release/ghost"],"executable":"/w/target/release/ghost","fresh":false}"#,
+            "\n",
+            r#"{"reason":"build-finished","success":true}"#,
+            "\n",
+        );
+        let map = map_artifacts_to_bins(std::io::Cursor::new(stream), &id_to_name);
+        assert_eq!(map.len(), 1, "only the known non-test bin maps: {map:?}");
+        assert_eq!(
+            map.get("scx_a").map(|p| p.to_string_lossy().into_owned()),
+            Some("/w/target/release/scx_a".to_string()),
+            "the real (non-test) bin is mapped, not the test-profile bin",
+        );
+        assert!(
+            !map.contains_key("scx_b"),
+            "a bin with a null executable is not mapped: {map:?}",
+        );
     }
 }
