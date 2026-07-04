@@ -51,8 +51,9 @@ two binaries.
 
 `cargo install --locked ktstr`
 installs the two user-facing binaries (`ktstr` host-side CLI and
-`cargo-ktstr` dev workflow plugin). The two test-fixture binaries
-(`ktstr-jemalloc-probe`, `ktstr-jemalloc-alloc-worker`) the crate's
+`cargo-ktstr` dev workflow plugin). The four test-fixture binaries
+(`ktstr-jemalloc-probe`, `ktstr-jemalloc-alloc-worker`,
+`ktstr-schbench-validate`, `ktstr-taobench-validate`) the crate's
 integration tests spawn require the non-default `integration`
 feature, so a default install excludes them.
 
@@ -62,7 +63,7 @@ Add ktstr as a dev-dependency:
 
 ```toml
 [dev-dependencies]
-ktstr = { version = "0.20.0" }
+ktstr = { version = "0.23.0" }
 ```
 
 To host a ktstr test in an external scheduler crate (gated behind a
@@ -121,10 +122,10 @@ configures it with the embedded `ktstr.kconfig` fragment, builds it,
 and caches the result:
 
 ```sh
-cargo ktstr kernel build               # latest stable series with >= 8 maintenance releases
-cargo ktstr kernel build 6.14.2        # specific version
-cargo ktstr kernel build 6.12          # highest 6.12.x patch release
-cargo ktstr kernel build 6             # highest 6.x.y release
+cargo ktstr kernel build                       # latest stable series with >= 8 maintenance releases
+cargo ktstr kernel build --kernel 6.14.2       # specific version
+cargo ktstr kernel build --kernel 6.12         # highest 6.12.x patch release
+cargo ktstr kernel build --kernel 6            # highest 6.x.y release
 ```
 
 The bare `cargo ktstr kernel build` skips series that have fewer
@@ -140,7 +141,7 @@ above).
 To build from a local source tree:
 
 ```sh
-cargo ktstr kernel build --source ../linux
+cargo ktstr kernel build --kernel ../linux
 ```
 
 To list and manage cached kernels:
@@ -170,7 +171,7 @@ tuned for scheduler testing (sched_ext, BPF, kprobes, minimal boot).
 
 Create a file in your crate's `tests/` directory (e.g.
 `tests/sched_test.rs`) and write a `#[ktstr_test]` function. The
-[`prelude`](https://likewhatevs.github.io/ktstr/api/ktstr/prelude/index.html)
+[`prelude`](https://ktstr.dev/rustdoc/ktstr/prelude/index.html)
 module re-exports the types you need.
 
 The simplest test uses a canned scenario. `AssertResult` carries the
@@ -258,9 +259,10 @@ return assertion results. `Ctx` provides the guest topology
 
 ### What gets checked
 
-**Nothing, by default.** `Assert::default_checks()` is the all-`None`
+**Nothing, by default.** `Assert::default_checks()` is the no-overrides
 identity (`Self::NO_OVERRIDES`) — every worker check, fairness check,
-monitor threshold, and starvation gate is **opt-in**. A bare
+monitor threshold, and starvation gate is unset/off, so all are
+**opt-in**. A bare
 `#[ktstr_test]` boots the VM, runs the scenario, and reports `pass`
 even if the scheduler stalled, starved workers, or never dispatched
 a task.

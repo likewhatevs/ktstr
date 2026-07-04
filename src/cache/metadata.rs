@@ -468,7 +468,11 @@ pub(crate) fn format_image_missing_reason(image_name: &str) -> String {
 /// Shared prefix → `error_kind` classifier.
 ///
 /// Each `ListedEntry::Corrupt` carries a free-form `reason` string
-/// produced by [`super::housekeeping::read_metadata`]. This helper
+/// produced either by [`super::housekeeping::read_metadata`] (the
+/// six `metadata.json …` reasons) or by
+/// [`format_image_missing_reason`] at list-time (the `image_missing`
+/// reason, emitted from `cache_dir.rs`'s `list` corrupt arm when the
+/// image file is absent). This helper
 /// flattens those strings into a small, stable enum-of-strings the
 /// CLI surfaces in `cargo ktstr kernel list --json` as the
 /// `error_kind` field.
@@ -495,8 +499,10 @@ pub(crate) fn format_image_missing_reason(image_name: &str) -> String {
 /// missing checksum field" reason), so the dispatcher pins both ends
 /// of the canonical form.
 ///
-/// The producer in [`super::housekeeping::read_metadata`] is the
-/// authoritative source of these prefixes. If a new failure mode is
+/// [`super::housekeeping::read_metadata`] is the authoritative
+/// source of the six `metadata.json …` prefixes;
+/// [`format_image_missing_reason`] is the authoritative source of
+/// the `image_missing` prefix. If a new failure mode is
 /// added there, both this dispatcher and the
 /// `classify_corrupt_reason_covers_every_documented_prefix` test
 /// must be updated in lockstep so the JSON contract stays stable.
@@ -1125,7 +1131,9 @@ mod tests {
     // -- KernelSource::as_local_git_hash --
     //
     // The accessor exists for kernel_build_pipeline's post-build
-    // dirty re-check (see cli/kernel_build/build.rs:557): it
+    // dirty re-check (see cli/kernel_build/build.rs
+    // compute_mid_wait_state / post_build_dirty_skip, where
+    // as_local_git_hash is called): it
     // compares the post-build HEAD hash against the acquire-time
     // hash to detect mid-build commits. The accessor MUST return
     // the inner `git_hash` for `Local` variant only and `None` for

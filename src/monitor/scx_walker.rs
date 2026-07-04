@@ -14,8 +14,8 @@
 //!
 //! 2. [`walk_local_dsqs`] — per-CPU local DSQs at
 //!    `rq->scx.local_dsq`. Runs unconditionally — local DSQs are
-//!    initialized at boot (`init_dsq` at `kernel/sched/ext.c:7772`
-//!    for every possible CPU) and exist whether or not a scheduler
+//!    initialized at boot (`init_dsq`, called for every possible CPU
+//!    from `init_sched_ext_class`) and exist whether or not a scheduler
 //!    is attached, so this surfaces local-DSQ state even when
 //!    `*scx_root == 0`.
 //!
@@ -36,7 +36,7 @@
 //!    `scx_tasks` LIST_HEAD via each task's `scx.tasks_node`.
 //!    Surfaces every task owned by an scx_sched, surviving the
 //!    per-rq runnable_list drain that scheduler teardown
-//!    (`scx_bypass`, `kernel/sched/ext.c:5304-5404`) triggers.
+//!    (`scx_bypass`) triggers.
 //!
 //! All walkers are best-effort: any address that fails to translate
 //! (slab page race, PA out of bounds) yields a partial result rather
@@ -121,15 +121,21 @@ pub struct RqScxState {
     pub cpu_released: bool,
     /// `rq->scx.ops_qseq`.
     pub ops_qseq: u64,
-    /// `rq->scx.kick_sync` — present on post-v7.0-rc5 kernels. None
-    /// when the BTF lookup of the field returns absent (v6.14 and
-    /// v7.0 release-line layouts predate the `kick_sync` member).
-    /// Skipped on serde when None so older dumps stay tight.
+    /// `rq->scx.kick_sync` — the per-rq pick-next sequence counter.
+    /// Version-renamed in the kernel: named `pnt_seq` on v6.12–v6.18
+    /// and `kick_sync` on v6.19+. `ScxRqOffsets::from_btf` resolves
+    /// the offset via a `kick_sync`-then-`pnt_seq` fallback, so this
+    /// is Some (captured) across the supported range. None only when
+    /// neither name resolves (stripped BTF / sched_ext not built in).
+    /// Skipped on serde when None so those dumps stay tight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kick_sync: Option<u64>,
     /// `rq->scx.nr_immed` — count of ENQ_IMMED tasks on local_dsq.
-    /// Same kernel-version provenance as [`Self::kick_sync`]: the
-    /// field is post-v7.0-rc5 and absent on the v6.14/v7.0 CI matrix.
+    /// A feature-branch (`for-7.1`) field, absent on every release
+    /// tag in the supported range (v6.12 → v7.0-rc5); the offset
+    /// resolves None there and the JSON elides the field. Distinct
+    /// provenance from [`Self::kick_sync`], which is present across
+    /// the range via its `pnt_seq` fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nr_immed: Option<u32>,
     /// `rq->scx.clock` — per-CPU scx_rq clock (the value
@@ -284,11 +290,15 @@ pub fn walk_rq_scx(
     let flags = mem.read_u32(rq_pa, scx_off + scx_rq_offs.flags);
     let cpu_released = mem.read_u8(rq_pa, scx_off + scx_rq_offs.cpu_released) != 0;
     let ops_qseq = mem.read_u64(rq_pa, scx_off + scx_rq_offs.ops_qseq);
-    // kick_sync / nr_immed are post-v7.0-rc5 fields; offsets resolve
-    // as None on v6.14 and v7.0 release-line BTFs. Gate the read on
-    // Some so we don't fabricate a u64/u32 from rq_pa+0 (which would
-    // alias the local_dsq head pointer — a non-zero garbage read
-    // that the dump would render as legitimate kernel state).
+    // nr_immed is a for-7.1 feature-branch field, absent on every
+    // release tag in the supported range (v6.12 → v7.0-rc5), so its
+    // offset resolves None there. kick_sync, by contrast, resolves
+    // Some across the range via the `pnt_seq` fallback in
+    // ScxRqOffsets::from_btf. Gate each read on Some so a truly-
+    // absent field (stripped BTF / sched_ext not built in) is not
+    // fabricated from rq_pa+0 (which would alias the local_dsq head
+    // pointer — a non-zero garbage read the dump would render as
+    // legitimate kernel state).
     let kick_sync = scx_rq_offs
         .kick_sync
         .map(|off| mem.read_u64(rq_pa, scx_off + off));
@@ -485,23 +495,22 @@ pub const SCX_SCHED_STATE_SOURCE_BSS: &str = "bss_snapshot";
 
 /// `SCX_TASK_CURSOR` flag value (`1 << 31`) on `sched_ext_entity.flags`.
 /// Cursor entries are stack-allocated `sched_ext_entity` placeholders
-/// that `scx_task_iter_start` (`kernel/sched/ext.c:843-846`) inserts
+/// that `scx_task_iter_start` inserts
 /// into `scx_tasks` to mark the iterator's progress; they are NOT
 /// embedded in any `task_struct` so the global walker must skip them
 /// to avoid container_of producing a bogus task KVA. Pinned per
-/// `include/linux/sched/ext.h:142::SCX_TASK_CURSOR`.
+/// `SCX_TASK_CURSOR` in `include/linux/sched/ext.h`.
 const SCX_TASK_CURSOR: u32 = 1 << 31;
 /// Walk the kernel's global `scx_tasks` LIST_HEAD and recover every
 /// task linked into it via `task_struct.scx.tasks_node`.
 ///
-/// `scx_tasks` is `static LIST_HEAD(scx_tasks)` at
-/// `kernel/sched/ext.c:47`. Tasks are added on
-/// `scx_init_task` (`kernel/sched/ext.c:3742` —
-/// `list_add_tail(&p->scx.tasks_node, &scx_tasks)`) and removed on
-/// `sched_ext_dead` (`kernel/sched/ext.c:3803` —
-/// `list_del_init(&p->scx.tasks_node)`). The list outlives the
+/// `scx_tasks` is `static LIST_HEAD(scx_tasks)` in
+/// `kernel/sched/ext.c`. Tasks are added in
+/// `scx_post_fork` (`list_add_tail(&p->scx.tasks_node, &scx_tasks)`)
+/// and removed in `sched_ext_dead`
+/// (`list_del_init(&p->scx.tasks_node)`). The list outlives the
 /// per-rq `runnable_list` because `scx_bypass`
-/// (`kernel/sched/ext.c:5304-5404`) drains runnable_list during
+/// drains runnable_list during
 /// scheduler teardown without touching `scx_tasks` — making this
 /// the durable task source for failure-dump enrichment.
 ///
@@ -665,8 +674,8 @@ pub fn walk_scx_tasks_global(
 ///
 /// This is a strict subset of [`walk_dsqs`]'s pass 1, extracted so
 /// the dump path can call it INDEPENDENTLY of `*scx_root`. Per-CPU
-/// local DSQs are kernel-initialized at boot (`init_dsq` from
-/// `kernel/sched/ext.c:7772`, called for every possible CPU in the
+/// local DSQs are kernel-initialized at boot (`init_dsq`, called for
+/// every possible CPU from `init_sched_ext_class` in the
 /// `__init` path), so they exist even when no scheduler is attached
 /// (`*scx_root == NULL`) and survive scheduler teardown's bypass
 /// drain.
@@ -823,7 +832,7 @@ pub fn walk_local_dsqs(
 /// the local pass. This split lets the dump path surface local DSQ
 /// state even when no scheduler is attached
 /// (`*scx_root == NULL`) — the local_dsq struct is initialized at
-/// boot per `init_dsq` (`kernel/sched/ext.c:7772`) for every
+/// boot per `init_dsq` (called from `init_sched_ext_class`) for every
 /// possible CPU, so it has well-defined contents long before any
 /// scheduler attaches.
 ///

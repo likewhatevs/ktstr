@@ -2,8 +2,8 @@
 //! dispatch path: `Op::Spawn` (with both `SpawnPlacement::Cgroup`
 //! and `SpawnPlacement::RunnerCgroup`) and `Op::MoveAllTasks`.
 //!
-//! The MockCgroupOps unit tests in `src/scenario/ops/mod.rs`'s
-//! `mod tests` (`op_spawn_cgroup_moves_tasks_into_named_cgroup`,
+//! The MockCgroupOps unit tests in `src/scenario/ops/tests.rs`
+//! (the `mod tests` submodule) (`op_spawn_cgroup_moves_tasks_into_named_cgroup`,
 //! `op_spawn_runner_cgroup_emits_zero_cgroup_calls`,
 //! `op_move_all_tasks_clears_subtree_control_then_moves_to_dst`,
 //! `op_spawn_cgroup_after_addcgroupdef_sets_cpuset_before_move_tasks`)
@@ -162,7 +162,7 @@ fn cgroup_ops_compose_in_real_vm(ctx: &Ctx) -> Result<AssertResult> {
     // spawn_workers + move_all_tasks placement, not a pre-populated
     // destination). cg_src is registered via `push_cgroup` so its 2
     // SpinWait workers are placed at backdrop setup time, before
-    // any Step::ops fire. `run_step` (src/scenario/ops/mod.rs:1292)
+    // any Step::ops fire. `run_step` (src/scenario/ops/mod.rs:1583)
     // executes ops BEFORE Step::setup for non-Loop hold modes; a
     // CgroupDef in Step::setup would mean MoveAllTasks fires with
     // cg_src unmigrated and missing on the cgroupfs, defeating the

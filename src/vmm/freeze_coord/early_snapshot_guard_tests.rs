@@ -119,8 +119,9 @@ fn early_snapshot_guard_drops_on_panic_unwind() {
     // proves every populated FailureDumpReport field (those NOT
     // suppressed by `skip_serializing_if`) round-trips identically
     // through the drained file. Synthetic populates schema + maps;
-    // the 20 other fields stay at empty-Vec / None defaults and are
-    // suppressed from the wire JSON, so this leg proves both
+    // the 24 other fields stay at empty-Vec / None / 0 / false /
+    // Default values and are suppressed from the wire JSON, so this
+    // leg proves both
     // populated-field survival AND suppressed-field-stays-suppressed.
     // Broader infallibility across max-populated shapes is proven
     // by `failure_dump_report_serialization_is_infallible_for_max_synthetic_input`

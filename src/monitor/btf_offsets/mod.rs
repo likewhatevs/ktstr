@@ -981,8 +981,9 @@ pub(super) fn member_byte_offset_with_member(
     bail!("btf: field '{field}' not found in struct");
 }
 
-/// Follow a Member's type_id through Ptr/Const/Volatile/Typedef/TypeTag
-/// chains to reach the underlying Struct.
+/// Follow a Member's type_id through
+/// Ptr/Const/Volatile/Typedef/TypeTag/Restrict/DeclTag chains to reach
+/// the underlying Struct.
 pub(super) fn resolve_member_struct(btf: &Btf, member: &btf_rs::Member) -> Result<btf_rs::Struct> {
     use btf_rs::BtfType;
     let tid = member.get_type_id().context("btf: member type_id")?;
@@ -995,8 +996,8 @@ pub(super) fn resolve_member_struct(btf: &Btf, member: &btf_rs::Member) -> Resul
 /// Each non-leaf segment must resolve to a struct or union — the
 /// helper descends into the segment's underlying composite via
 /// [`member_byte_offset_with_member`] + [`resolve_member_struct`]
-/// (which follows Const/Volatile/Typedef/TypeTag chains but rejects
-/// pointer indirection). The leaf segment can be any member type;
+/// (which follows Ptr/Const/Volatile/Typedef/TypeTag/Restrict/DeclTag
+/// chains). The leaf segment can be any member type;
 /// the final offset is returned as bytes from the root struct.
 ///
 /// Used by the cold-path Op dispatcher for `KernelOpTarget::TaskField`
@@ -1886,10 +1887,10 @@ pub struct SchedExtEntityOffsets {
     pub holding_cpu: usize,
     /// Offset of `tasks_node` (struct list_head). Links every
     /// scx-managed task into the kernel's global `scx_tasks`
-    /// list (kernel/sched/ext.c:47). The host walker uses this
+    /// list (kernel/sched/ext.c:48). The host walker uses this
     /// to enumerate every task owned by an scx_sched, surviving
     /// the per-rq runnable_list drain that scx_bypass triggers
-    /// during scheduler teardown (kernel/sched/ext.c:5341).
+    /// during scheduler teardown (kernel/sched/ext.c:5448).
     pub tasks_node: usize,
 }
 
@@ -2204,11 +2205,11 @@ impl UpidStructOffsets {
 /// global `runnable_at` scanner.
 ///
 /// The scanner walks the kernel's global `scx_tasks` LIST_HEAD
-/// (`kernel/sched/ext.c:47`) — every scx-managed task is linked into
+/// (`kernel/sched/ext.c:48`) — every scx-managed task is linked into
 /// it via `task_struct.scx.tasks_node`. Walking the global list (not
 /// the per-rq `runnable_list`) keeps the scanner functional through
 /// scheduler teardown: `scx_bypass`
-/// (`kernel/sched/ext.c:5304-5404`) drains every per-rq
+/// (`kernel/sched/ext.c:5448-5548`) drains every per-rq
 /// `runnable_list` while leaving `scx_tasks` intact, so a per-rq
 /// walk would see an empty list at exactly the moment the dual
 /// snapshot's early trigger needs to fire. For each task on the
@@ -2239,16 +2240,16 @@ pub struct RunnableScanOffsets {
     /// `task_struct_scx + sched_ext_entity_tasks_node` — subtract
     /// this from a `tasks_node` KVA to recover the `task_struct`
     /// KVA via container_of. The kernel's global `scx_tasks`
-    /// LIST_HEAD (`kernel/sched/ext.c:47`) links every scx-managed
+    /// LIST_HEAD (`kernel/sched/ext.c:48`) links every scx-managed
     /// task via this field; walking it survives the per-rq
     /// `runnable_list` drain that `scx_bypass`
-    /// (`kernel/sched/ext.c:5304-5404`) performs during scheduler
+    /// (`kernel/sched/ext.c:5448-5548`) performs during scheduler
     /// teardown.
     pub sched_ext_entity_tasks_node: usize,
     /// Offset of `flags` (u32) within `struct sched_ext_entity`.
     /// Read off each `scx_tasks` list entry to skip cursor
     /// placeholders that `scx_task_iter_start`
-    /// (`kernel/sched/ext.c:843-846`) inserts with `SCX_TASK_CURSOR`
+    /// (`kernel/sched/ext.c:804-823`) inserts with `SCX_TASK_CURSOR`
     /// (`1 << 31`) set. Cursor entries are stack-allocated, not
     /// embedded in a `task_struct`, so container_of would synthesize
     /// a bogus task KVA without this skip.

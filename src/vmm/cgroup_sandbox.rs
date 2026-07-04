@@ -51,8 +51,9 @@ use std::time::Duration;
 /// or `i64`.
 const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
 
-/// Ceiling on the EBUSY retry loop in Drop. Five attempts at 10ms
-/// gives kernel housekeeping 50ms to release references the
+/// Ceiling on the EBUSY retry loop in Drop. Five attempts with a
+/// 10ms backoff between them gives kernel housekeeping up to 40ms
+/// (4 x 10ms) to release references the
 /// build process may have left on the cgroup (e.g. a grandchild
 /// caught mid-fork). Past that, the directory is orphaned and
 /// logged; the operator sweeps it with a manual
@@ -268,15 +269,16 @@ impl BuildSandbox {
                 return Self::degraded_or_err(SandboxDegraded::NoCgroupV2, hard_error_on_degrade);
             }
         };
-        // Set the walk root to the operator's own cgroup parent so
-        // `CgroupManager::setup` never walks above it. Without the
-        // override, a Mode B/C operator running under
-        // `user.slice`-style delegation would EACCES at the
-        // delegation boundary the moment the build sandbox tried to
-        // write `cgroup.subtree_control` higher in the tree. With
-        // the override, the strip-prefix walk inside
-        // `setup_under_root` short-circuits at `parent_abs` itself
-        // because `parent.strip_prefix(parent) = Ok("")`.
+        // Pin the walk root to the operator's own cgroup parent.
+        // `try_create` never calls `CgroupManager::setup`, so the
+        // override's effect here is on `drain_tasks`: without it,
+        // `drain_tasks` migrates pids to `walk_root/cgroup.procs`
+        // where `walk_root` defaults to the kernel-owned
+        // `/sys/fs/cgroup` root (cgroup.rs DEFAULT_WALK_ROOT) — a
+        // Mode B/C operator running under `user.slice`-style
+        // delegation cannot write that root's `cgroup.procs`. With
+        // the override, `walk_root == parent_abs`, so drain migrates
+        // pids to the operator's own parent cgroup instead.
         let cg = CgroupManager::new(parent_str)
             .with_walk_root(&parent_abs)
             .context("build sandbox: pin walk_root to operator's own cgroup parent")?;
@@ -430,13 +432,13 @@ impl BuildSandbox {
                       \n\
                         systemd-run --user --scope \\\n\
                             -p 'Delegate=cpuset cpu' \\\n\
-                            cargo ktstr kernel build --source <path> --cpu-cap N\n\
+                            cargo ktstr kernel build --kernel <path> --cpu-cap N\n\
                       \n\
                    2. Re-run with sudo preserving env so KTSTR_CPU_CAP / \
                       KTSTR_CACHE_DIR / RUST_LOG propagate to the root \
                       invocation:\n\
                       \n\
-                        sudo -E cargo ktstr kernel build --source <path> --cpu-cap N\n\
+                        sudo -E cargo ktstr kernel build --kernel <path> --cpu-cap N\n\
                       \n\
                    3. Enable cpuset delegation on the caller's cgroup \
                       by adding `cpuset` to the parent's cgroup.subtree_control \
@@ -459,12 +461,13 @@ impl Drop for BuildSandbox {
         };
         let inner: &SandboxInner = boxed;
 
-        // Migrate our pid back to root BEFORE rmdir — kernel
-        // returns EBUSY on cgroup_rmdir when cgroup.procs is
+        // Migrate our pid back to the parent cgroup BEFORE rmdir —
+        // kernel returns EBUSY on cgroup_rmdir when cgroup.procs is
         // non-empty. drain_tasks already walks cgroup.procs and
-        // re-drives each pid to /sys/fs/cgroup/cgroup.procs, which
-        // handles the case of extra children the build left behind
-        // as well.
+        // re-drives each pid to the parent cgroup's cgroup.procs
+        // (drain_tasks uses walk_root, which the sandbox pins to
+        // parent_abs), which handles the case of extra children the
+        // build left behind as well.
         if let Err(e) = inner.cg.drain_tasks(&inner.name) {
             tracing::warn!(
                 cgroup = %inner.name,
@@ -475,7 +478,8 @@ impl Drop for BuildSandbox {
         }
 
         // Remove with bounded EBUSY retries. CgroupManager::remove_cgroup
-        // already sleeps 50ms after draining; our retry loop covers the
+        // waits (event-driven, 1s ceiling) for the cgroup to report
+        // unpopulated after draining; our retry loop covers the
         // case where a just-exited child still holds a reference.
         for attempt in 0..RMDIR_EBUSY_RETRIES {
             match inner.cg.remove_cgroup(&inner.name) {
@@ -672,8 +676,8 @@ fn parent_controllers_include(parent_abs: &Path, controller: &str) -> bool {
 /// Read a `cpuset.{cpus,mems}.effective` file and parse into a
 /// `BTreeSet<usize>`. Returns `None` when the file doesn't exist
 /// (kernel versions without the `.effective` view — cgroup v2
-/// exposes it since 5.12 but some distros backport, so absence is
-/// treated as "cannot verify" rather than hard failure).
+/// exposes it, but absence is treated as "cannot verify" rather
+/// than hard failure).
 fn read_cpuset_effective(path: &Path) -> Option<BTreeSet<usize>> {
     let text = std::fs::read_to_string(path).ok()?;
     Some(
@@ -708,10 +712,11 @@ fn cpuset_sets_equal(requested: &BTreeSet<usize>, effective: &BTreeSet<usize>) -
 ///
 /// Concurrent sweepers (two ktstr processes entering `try_create`
 /// at the same time) are safe: if both target the same orphan, the
-/// second's `CgroupManager::remove_cgroup` hits ENOENT on
-/// `fs::remove_dir` (src/cgroup.rs `remove_cgroup`), which bubbles
-/// up as an `anyhow::Error` and is tolerated by the
-/// `tracing::warn!` branch below. Neither sweeper poisons the
+/// second's `CgroupManager::remove_cgroup` usually returns `Ok(())`
+/// via its `!p.exists()` short-circuit (src/cgroup.rs
+/// `remove_cgroup`); only a narrow race can produce ENOENT from
+/// `fs::remove_dir`, which the `tracing::warn!` branch below
+/// tolerates. Either way, neither sweeper poisons the
 /// other's forward progress — both still mkdir their own
 /// `{epoch_nanos}-{pid}`-suffixed child.
 /// Reason to skip sweeping a particular `ktstr-build-*` entry.

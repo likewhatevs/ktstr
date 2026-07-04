@@ -254,7 +254,7 @@ fn oob_src_reg_does_not_panic() {
 /// itself is rejected: `parent == target` is almost always a
 /// structural error from ambiguous pointer aliasing in the
 /// analyzer, not a real kptr write. Production line
-/// `if parent_struct_id == target_struct_id { return; }`
+/// `if canonical_parent == target { return; }`
 /// drops the finding; output map is empty.
 #[test]
 fn self_store_rejected() {
@@ -674,21 +674,19 @@ fn finalize_empty_access_set_does_not_emit() {
 }
 
 /// The candidate-search intersection drops the source struct
-/// itself even when its layout matches every observed
-/// `(offset, size)` access. When the original candidate set is
+/// from the candidate set. When the original candidate set is
 /// `{source, X}` (source plus exactly one foreign struct that also
-/// matches), `finalize` rejects the entire entry rather than
-/// emitting `X`: an `{source, X}` set means the true target could
-/// have been the source AND its access pattern happens to match
-/// X by coincidence. Picking X would be a false positive.
+/// matches), `finalize` removes the source, leaving `{X}`, and
+/// emits `X` as the sole remaining candidate. Dropping the entry
+/// happens only when 0 or 2+ non-source candidates remain.
 #[test]
 fn finalize_source_in_candidates_with_others_emits_other() {
     // BTF: u64(1), T(2, u64@0 + u64@8 -- same shape T matches its
     // own access pattern), Q(3, u64@0 + u64@8). Loading T.f at
     // offset 0 then dereferencing through it at offsets 0 and 8
     // gives candidates {T, Q} -- both have u64s at those offsets.
-    // Production must drop because the source T is in the set
-    // alongside Q.
+    // Source T is removed from the candidate set; Q is the sole
+    // remaining candidate and is emitted.
     let mut strings: Vec<u8> = vec![0];
     let n_u64 = push_name(&mut strings, "u64");
     let n_t = push_name(&mut strings, "T");
@@ -776,7 +774,7 @@ fn finalize_source_in_candidates_with_others_emits_other() {
 
 /// When the only candidate matching the access pattern is the
 /// source struct itself, `finalize` removes it via
-/// `had_source = candidates.remove(source)` and the resulting set
+/// `candidates.remove(source)` and the resulting set
 /// is empty -- nothing emits. This guards against self-typed
 /// casts (`source.f` -> `source*`) where a self-referential layout
 /// would silently win the intersection without disambiguating

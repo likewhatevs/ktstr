@@ -7,7 +7,7 @@
 use super::{SnapshotError, SnapshotResult};
 
 /// One value's view at the leaf of a dotted-path walk over a
-/// [`serde_json::Value`]. Returned by [`stats_path`] / `StatsValue::path`.
+/// [`serde_json::Value`]. Returned by [`stats_path`] / `StatsValue::get`.
 ///
 /// Mirrors the [`super::SnapshotField`] shape so test authors who already
 /// know the BPF-snapshot accessor surface get the same `as_u64` /
@@ -66,9 +66,11 @@ impl<'a> JsonField<'a> {
     }
 
     /// Read as `u64`. Accepts JSON integers (positive only), JSON
-    /// booleans (true → 1, false → 0), and JSON strings whose
+    /// booleans (true → 1, false → 0), JSON strings whose
     /// content parses as a u64 (scx_stats sometimes stringifies
-    /// large counters to avoid 53-bit float collapse). Returns
+    /// large counters to avoid 53-bit float collapse), and JSON
+    /// floats that are integral and non-negative (`5.0` → 5;
+    /// fractional, negative, or non-finite floats error). Returns
     /// [`SnapshotError::TypeMismatch`] otherwise.
     pub fn as_u64(&self) -> SnapshotResult<u64> {
         match self {
@@ -78,8 +80,9 @@ impl<'a> JsonField<'a> {
     }
 
     /// Read as `i64`. Accepts JSON integers (any sign), JSON
-    /// booleans (true → 1, false → 0), and JSON strings whose
-    /// content parses as an i64.
+    /// booleans (true → 1, false → 0), JSON strings whose
+    /// content parses as an i64, and integral finite JSON floats
+    /// (`9.0` → 9; fractional or non-finite floats error).
     pub fn as_i64(&self) -> SnapshotResult<i64> {
         match self {
             JsonField::Value(v) => json_to_i64(v),

@@ -54,9 +54,9 @@ use ktstr::workload::WorkType;
 const KTSTR_SCHED: Scheduler =
     Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
-/// virtio-net with a deterministic locally-administered MAC (last byte distinct
-/// from the sibling IRQ e2es so traces are unmistakable; each VM is isolated, so
-/// a collision would be harmless regardless).
+/// virtio-net with a deterministic locally-administered MAC. The last byte (0x03)
+/// matches `irq_steer_e2e`'s `NET_TEST_STEER`; each VM is isolated, so the
+/// collision is harmless.
 const NET_TEST: NetConfig = NetConfig::DEFAULT.mac([0x52, 0x54, 0x00, 0x4e, 0x54, 0x03]);
 
 /// Continuous NetTraffic: zero inter-frame interval, min Ethernet frame — the

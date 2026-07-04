@@ -45,10 +45,11 @@ struct Args {
     /// when --slow-path-p99-us enables the heavy tail).
     #[arg(short = 'u', long, default_value_t = 100)]
     slow_path_sleep_us: u64,
-    /// Heavy-tailed slow-path service-time p99 in microseconds (0 or <=
-    /// slow_path_sleep_us = fixed latency). When larger, each fetch is a Pareto
-    /// draw with median slow_path_sleep_us and this p99 — under -R the serve-latency
-    /// line below then exhibits the tail.
+    /// Heavy-tailed slow-path service-time p99 in microseconds (0, <=
+    /// slow_path_sleep_us, or slow_path_sleep_us == 0 = fixed latency; a zero
+    /// median has no Pareto scale). When larger than a non-zero slow_path_sleep_us,
+    /// each fetch is a Pareto draw with median slow_path_sleep_us and this p99 —
+    /// under -R the serve-latency line below then exhibits the tail.
     #[arg(short = 'p', long, default_value_t = 0)]
     slow_path_p99_us: u64,
     /// Benchmark runtime in seconds.

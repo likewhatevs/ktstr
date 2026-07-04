@@ -10,7 +10,7 @@ use anyhow::Result;
 ///
 /// One cgroup runs CachePressure workers (L1-strided RMW, cache-hot) and
 /// the other runs SpinWait workers (cache-cold). Checks throughput
-/// fairness across workers (CV < 1.0) to catch gross placement imbalance.
+/// fairness across workers (CV <= 1.0) to catch gross placement imbalance.
 pub fn custom_cache_pressure_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     let checks = Assert::default_checks().max_throughput_cv(1.0);
 

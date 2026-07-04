@@ -155,8 +155,11 @@ fn resolve_work_type_fan_out_group_size() {
 }
 /// Guards two invariants of [`WorkType::FanOutCompute`]:
 ///
-/// 1. Every spawned worker produces non-zero `work_units`, and at
-///    least one records a wake latency into `wake_latencies_ns`.
+/// 1. Every spawned worker produces non-zero `work_units`, and
+///    every non-messenger receiver records at least one wake
+///    latency into `wake_latencies_ns` (the messenger advances
+///    the generation and never waits, so its vec is legitimately
+///    empty).
 /// 2. The Release/Acquire ordering between the messenger's
 ///    `wake_ns` store and its generation advance prevents workers
 ///    from pairing a fresh generation with a stale or zero-init

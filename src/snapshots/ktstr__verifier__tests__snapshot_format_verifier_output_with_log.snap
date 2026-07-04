@@ -4,6 +4,7 @@ expression: "format_verifier_output(\"llc+steal\", &result, false)"
 ---
 
 llc+steal
+  scheduler: NOT ATTACHED — scheduler process exited during BPF load/startup
   enqueue                                  verified_insns=42
 
 llc+steal --- verifier stats ---

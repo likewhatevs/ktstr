@@ -1,8 +1,8 @@
 //! Spawn pipeline: `WorkloadHandle`, `SpawnGuard`, `GroupParams`,
 //! `ThreadWorker`, the report shapes (`WorkerReport`, `WorkerExitInfo`,
 //! `Migration`), and the helpers that thread workers through fork or
-//! `std::thread::spawn`. Split out of `workload/mod.rs` to keep the
-//! production code path under 3500 lines per file. Tests are
+//! `std::thread::spawn`. Split out of `workload/mod.rs` to separate
+//! the production code path from its co-located tests. Tests are
 //! co-located with the production code in topic-grouped sibling
 //! files (`tests_lifecycle`, `tests_grandchild`, `tests_composed`,
 //! ...) that import shared fixtures from `testing.rs` via
@@ -599,6 +599,19 @@ pub struct WorkerReport {
     /// Option<…> tag (one byte) is the only overhead on the
     /// success path.
     pub affinity_error: Option<String>,
+    /// `set_sched_policy` failure text (`{e:#}`), or `None` when the
+    /// per-worker scheduling-policy set succeeded (or the policy was the
+    /// `Normal` no-op). Load-bearing for the verifier dispatch probe: a
+    /// probe worker configured `SchedPolicy::Ext` whose
+    /// `sched_setattr(SCHED_EXT)` was rejected (e.g. the scheduler set
+    /// `scx.disallow` on it) stays SCHED_OTHER, so its `iterations`
+    /// progress does NOT prove the BPF scheduler dispatched it —
+    /// `run_and_confirm_dispatch` excludes any worker with a
+    /// `sched_policy_error` from the dispatch proof. Sentinel reports
+    /// synthesised by [`WorkloadHandle::stop_and_collect`] leave this
+    /// `None` (no policy set was attempted). Same positional-serde
+    /// reasoning as [`Self::affinity_error`]: no `skip_serializing_if`.
+    pub sched_policy_error: Option<String>,
     /// Per-phase telemetry slices for a backdrop (persistent) worker
     /// that spanned multiple scenario steps. EMPTY for step-local
     /// workers and for any backdrop worker that observed no phase
@@ -1216,6 +1229,8 @@ pub struct WorkloadHandle {
 ///   hundreds-to-thousands; the clamp only triggers on a
 ///   degenerate input that itself fails admission control
 ///   elsewhere (the queue is far larger than RAM).
+/// - [`WorkType::SignalStorm`] needs 8 bytes — two `u32` tid
+///   slots (worker 0's tid @ offset 0, worker 1's @ offset 4).
 /// - Everything else: `u32` (4 bytes).
 ///
 /// Returning the same byte count for every WorkType variant lets
@@ -1653,9 +1668,10 @@ impl GroupParams {
     /// scenario context (the caller supplies the `from` pool for
     /// `RandomSubset`, so per-worker sampling stays self-contained).
     /// Topology-aware variants (`SingleCpu`, `LlcAligned`,
-    /// `CrossCgroup`) require a [`crate::topology::TestTopology`] /
-    /// cpuset state that [`WorkloadHandle::spawn`] does not have, so
-    /// they bail with an actionable diagnostic.
+    /// `CrossCgroup`, `SmtSiblingPair`) require a
+    /// [`crate::topology::TestTopology`] / cpuset state that
+    /// [`WorkloadHandle::spawn`] does not have, so they bail with an
+    /// actionable diagnostic.
     ///
     /// `site` names the location of the affinity field for the bail
     /// message — `"WorkloadConfig::affinity"` for the primary group,
@@ -1732,8 +1748,9 @@ impl GroupParams {
     /// [`ResolvedAffinity`] runs through
     /// [`Self::resolve_spawn_affinity`] under the same gate as
     /// [`Self::from_composed`]. Topology-aware variants
-    /// (`SingleCpu`, `LlcAligned`, `CrossCgroup`) require scenario
-    /// context; the scenario engine pre-resolves them via
+    /// (`SingleCpu`, `LlcAligned`, `CrossCgroup`, `SmtSiblingPair`)
+    /// require scenario context; the scenario engine pre-resolves
+    /// them via
     /// `crate::scenario::intent_for_spawn` (which round-trips
     /// `RandomSubset` verbatim and flattens topology-aware variants
     /// to `Exact`) before building [`WorkloadConfig`], so the gate
@@ -3094,7 +3111,7 @@ impl WorkloadHandle {
     /// children — no fork, no resource allocation. Same for the
     /// empty-thread case across ALL groups (every `num_workers ==
     /// 0`): the leader is skipped because there is no work to host.
-    /// This matches the `pcomm_with_zero_workers_skips_container`
+    /// This matches the `pcomm_zero_workers_no_container_spawn`
     /// contract.
     ///
     /// Group-level admission rejects WorkType variants that conflict

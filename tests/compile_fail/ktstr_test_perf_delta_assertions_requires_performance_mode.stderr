@@ -1,0 +1,7 @@
+error: perf_delta_assertions requires performance_mode — a declared regression gate tightens the noise threshold on a metric, which is only meaningful on a pinned (performance_mode) run. Under no-perf mode the metric carries host-CPU-oversubscription noise the gate would misread. Add performance_mode = true (or drop the assertions).
+  --> tests/compile_fail/ktstr_test_perf_delta_assertions_requires_performance_mode.rs:10:1
+   |
+10 | #[ktstr_test(perf_delta_assertions = [GATE])]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

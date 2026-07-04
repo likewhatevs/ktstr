@@ -6,7 +6,7 @@ ktstr::declare_scheduler!(BARE_HOST_ONLY_CONFLICT_SCHED, {
 });
 
 // Pin that the BARE-form `host_only` (no `= true`) routes through
-// BoolAttrParser identically to the explicit form, and therefore
+// AttrValues::assign_bool identically to the explicit form, and therefore
 // trips the host_only-vs-scheduler mutex check at expansion time.
 // A regression that special-cased the bare-form path through a
 // different code arm (skipping the _set flag write or the value

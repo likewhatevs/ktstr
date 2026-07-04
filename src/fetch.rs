@@ -1,9 +1,13 @@
-//! Kernel source acquisition: tarball download, git clone, local tree.
+//! Kernel source acquisition: tarball download, GitHub codeload
+//! snapshot, git clone, local tree.
 //!
-//! Three entry points — [`download_tarball`], [`git_clone`], and
-//! [`local_source`] — each return an [`AcquiredSource`] carrying the
-//! source directory, cache key, and metadata the caller needs to
-//! proceed to configuration and build.
+//! The acquisition entry points each return an [`AcquiredSource`]
+//! carrying the source directory, cache key, and metadata the caller
+//! needs to proceed to configuration and build: [`download_tarball`]
+//! (kernel.org stable/RC), `download_github_archive` (a GitHub codeload
+//! commit snapshot), `git_clone_kinded` (a kind-directed shallow clone
+//! that dispatches to `git_clone_tag` / [`git_clone`]), and
+//! [`local_source`] (an on-disk tree).
 
 use std::io::Read;
 use std::num::NonZeroU32;
@@ -31,7 +35,7 @@ static SHARED_CLIENT: OnceLock<Client> = OnceLock::new();
 /// duration once the connection is up.
 ///
 /// No total request `.timeout()` is set: the same client serves both
-/// short requests (directory listings, releases.json) and large
+/// short requests (releases.json, sha256sums.asc) and large
 /// tarball streams ([`download_stable_tarball`],
 /// [`download_rc_tarball`]), where a 130–180 MiB compressed payload
 /// over a slow uplink can take minutes of wall-clock to deliver.
@@ -70,9 +74,10 @@ const SHARED_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// # Panics
 ///
 /// Panics on the first call if `Client::builder().build()` fails to
-/// construct a client. The documented failure modes are TLS backend
+/// construct a client. Documented failure modes include TLS backend
 /// initialization (e.g. rustls/native-tls subsystem unreachable) and
-/// are treated as setup bugs rather than runtime errors. The
+/// system-resolver config load failure; both are treated as setup
+/// bugs rather than runtime errors. The
 /// `expect` here, rather than propagating the error, mirrors the
 /// inherited behavior of `reqwest::blocking::Client::new()` (which
 /// is itself an infallible wrapper around `builder().build().expect`).
@@ -109,6 +114,15 @@ pub fn shared_client() -> &'static Client {
 /// populates the slot; the second observes the populated slot
 /// and skips the network entirely.
 static RELEASES_CACHE: OnceLock<Vec<Release>> = OnceLock::new();
+
+/// Cache for the gregkh stable-mirror release tags — the `X.Y.Z`
+/// version strings parsed from its `refs/tags/vX.Y.Z` advertisement.
+/// Companion to [`RELEASES_CACHE`]: `--include-eol` may expand several
+/// `A..B` ranges under one `resolve_kernel_set`, and each would
+/// otherwise re-ls-remote the mirror. Populated on the first successful
+/// enumeration; a failed ls-remote leaves it empty so the next caller
+/// retries (`Vec`, not `Result`, mirroring `RELEASES_CACHE`).
+static STABLE_TAGS_CACHE: OnceLock<Vec<String>> = OnceLock::new();
 
 /// Fetch `releases.json` via the process-wide [`shared_client`],
 /// routing through [`RELEASES_CACHE`].
@@ -507,9 +521,10 @@ const DOWNLOAD_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
 ///    when more than [`DOWNLOAD_NO_PROGRESS_TIMEOUT`] elapses
 ///    between byte-producing reads. Without this, a CDN edge that
 ///    keepalives the socket but stops delivering body bytes would
-///    leave the download blocked indefinitely (reqwest's per-read
-///    timeout reset on every empty wakeup, and the connect-phase
-///    timeout already passed during handshake). The check fires
+///    only surface after reqwest's per-request read timeout
+///    ([`DOWNLOAD_REQUEST_READ_TIMEOUT`], 300s), which bounds a
+///    single stalled `read()`; the watchdog applies the tighter
+///    60s no-progress bound across successive reads. The check fires
 ///    BEFORE the inner `read()` so a stalled inner reader cannot
 ///    out-block the watchdog.
 ///
@@ -796,8 +811,9 @@ fn verify_sha256(actual_hex: &str, expected_hex: &str, url: &str) -> Result<()> 
 /// authentication for build availability. A network-path attacker
 /// who can deny `sha256sums.asc` while serving a poisoned
 /// `linux-{version}.tar.xz` could exploit this; operators who
-/// require strict verification should pin the source via `--source`
-/// or `--git` rather than the download path. The bypass warnings
+/// require strict verification should pin the source via a
+/// `--kernel <path>` or `--kernel git+…` source rather than the
+/// download path. The bypass warnings
 /// surface on the operator's diagnostic stream so the lost
 /// guarantee is visible to ops triage.
 ///
@@ -871,7 +887,53 @@ fn resolve_expected_sha256_from_url(
     }
 }
 
+/// GitHub mirror of the linux-stable tree — comprehensive (stable +
+/// base-release `vX.Y.Z` tags back to v2.6) and the authoritative
+/// source for tags whose `.tar.xz` is no longer on cdn.kernel.org.
+///
+/// cdn.kernel.org keeps only the LATEST tarball of each series
+/// currently in `releases.json`; every superseded point release AND
+/// every tag of an EOL series is pruned (a GET for the tarball 404s,
+/// verified empirically — and HEAD is not a dependable existence probe
+/// on the CDN). The gregkh mirror still carries every `vX.Y.Z` tag, and
+/// codeload serves each tag's snapshot as a `tar.gz`, so a codeload
+/// download recovers the source a pruned tarball would have provided —
+/// no clone. Its `ls-refs` advertises every release tag, which
+/// `--include-eol` enumerates to surface EOL series absent from
+/// `releases.json` (see [`cached_stable_tags`]) and which
+/// [`fetch_version_for_prefix`] resolves for an EOL/unreleased series.
+/// github.com advertises allow-sha + a ref-prefix filter and a codeload
+/// CDN; git.kernel.org offers neither. Used by [`download_tarball`]'s
+/// [`TarballNotFound`] fallback and the prefix resolver.
+const STABLE_MIRROR_URL: &str = "https://github.com/gregkh/linux";
+
+/// Marker error attached to a stable-tarball download failure when
+/// cdn.kernel.org returns HTTP 404.
+///
+/// A 404 means the tarball is pruned — an EOL series (absent from
+/// `releases.json`) or a superseded point release (the CDN retains
+/// only each maintained series' latest). [`download_tarball`] detects
+/// this via `downcast_ref` (the context-aware anyhow accessor — a
+/// `chain().any(..is::<T>())` walk would MISS a context-wrapped
+/// marker) and falls back to a codeload snapshot of the tag from the
+/// gregkh mirror ([`STABLE_MIRROR_URL`]). Any other HTTP status is a
+/// hard error with no fallback.
+#[derive(Debug)]
+struct TarballNotFound;
+
+impl std::fmt::Display for TarballNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stable tarball pruned from cdn.kernel.org (EOL or superseded point release)")
+    }
+}
+
+impl std::error::Error for TarballNotFound {}
+
 /// Download a stable kernel tarball (.tar.xz) from cdn.kernel.org.
+///
+/// Returns a [`TarballNotFound`] error (downcast-detectable) when the
+/// CDN 404s the tarball — see that type for the pruning semantics and
+/// [`download_tarball`] for the git-tag fallback it triggers.
 ///
 /// Streams the body through a [`DownloadStream`] watchdog so a
 /// stalled connection (no body bytes for
@@ -899,25 +961,51 @@ fn download_stable_tarball(
     mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<PathBuf> {
     let major = major_version(version)?;
+    let url = format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/linux-{version}.tar.xz");
+    download_stable_tarball_from_url(client, &url, version, dest_dir, cli_label, skip_sha256, mp)
+}
+
+/// URL-injectable core of [`download_stable_tarball`]: the GET, the
+/// 404→[`TarballNotFound`] / other-status→hard-error status gate, and
+/// the stream→verify→extract pipeline, against an arbitrary tarball
+/// `url`. Production reaches this only via [`download_stable_tarball`],
+/// which pins the cdn.kernel.org URL; the seam exists so the status
+/// routing (404 marker vs hard error) is unit-testable against a
+/// localhost mock without a real cdn round-trip — mirrors
+/// [`resolve_expected_sha256_from_url`] / [`fetch_releases`].
+fn download_stable_tarball_from_url(
+    client: &Client,
+    url: &str,
+    version: &str,
+    dest_dir: &Path,
+    cli_label: &str,
+    skip_sha256: bool,
+    mp: Option<&crate::cli::FetchProgress>,
+) -> Result<PathBuf> {
+    let major = major_version(version)?;
     let tarball_name = format!("linux-{version}.tar.xz");
-    let url = format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/{tarball_name}");
 
     let expected_sha256 = resolve_expected_sha256(client, major, &tarball_name, skip_sha256);
 
     tracing::info!(%url, "downloading stable kernel tarball (requires network)");
     let response = client
-        .get(&url)
+        .get(url)
         .timeout(DOWNLOAD_REQUEST_READ_TIMEOUT)
         .send()
         .with_context(|| format!("download {url}"))?;
     if !response.status().is_success() {
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            anyhow::bail!("{}", version_not_found_msg(client, version));
+            // Pruned tarball (EOL series or superseded point release).
+            // Return the downcast-detectable marker so `download_tarball`
+            // falls back to a codeload snapshot of the tag from the
+            // gregkh mirror (`STABLE_MIRROR_URL`) rather than failing
+            // outright.
+            return Err(anyhow::Error::new(TarballNotFound));
         }
         anyhow::bail!("download {url}: HTTP {}", response.status());
     }
-    reject_html_response(&response, &url)?;
-    print_download_size(&response, &url, cli_label, mp);
+    reject_html_response(&response, url)?;
+    print_download_size(&response, url, cli_label, mp);
     // Capture the total before `response` is moved into the stream so a
     // determinate (percent + ETA) bar can be built; `None` when the
     // server sent no Content-Length, in which case the bar degrades to
@@ -960,7 +1048,7 @@ fn download_stable_tarball(
         bar.finish();
     }
     if let Some(expected) = expected_sha256.as_deref() {
-        verify_sha256(&actual_hex, expected, &url)?;
+        verify_sha256(&actual_hex, expected, url)?;
         status(&format!(
             "{cli_label}: sha256 verified ({bytes_total} bytes, hash {actual_hex})"
         ));
@@ -1013,6 +1101,58 @@ fn promote_staged_kernel_tree(
     }
     let inner = staging.path().join(&expected_name);
     let source_dir = dest_dir.join(&expected_name);
+    std::fs::rename(&inner, &source_dir)
+        .with_context(|| format!("rename {} -> {}", inner.display(), source_dir.display()))?;
+    Ok(source_dir)
+}
+
+/// Promote the single top-level directory a codeload archive extracts
+/// out of `staging` into `dest_dir/{canonical}`, so it survives
+/// `staging`'s `Drop`.
+///
+/// Unlike [`promote_staged_kernel_tree`], the top-dir name is not
+/// `linux-{version}` — GitHub derives it from the ref (`linux-6.11.11`
+/// for a tag, `linux-{sha}` for a commit, `linux-{branch}` for a
+/// branch), so this promotes the SOLE entry by structure rather than by
+/// a fixed name, renaming it to a caller-supplied `canonical` name that
+/// keys off the resolved commit (collision-free across refs). A hostile
+/// or malformed snapshot that deposits zero or several top-level
+/// entries — or a top-level entry that is not a plain directory (a
+/// regular file, or a symlink, which the directory-entry file-type
+/// check rejects rather than following) — is rejected before anything
+/// lands in `dest_dir`; the `TempDir`'s `Drop` sweeps every entry the
+/// archive left.
+fn promote_single_kernel_tree(
+    staging: &tempfile::TempDir,
+    dest_dir: &Path,
+    canonical: &str,
+) -> Result<PathBuf> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(staging.path()).with_context(|| "read staging dir entries")? {
+        entries.push(entry.with_context(|| "iterate staging dir entry")?);
+    }
+    if entries.len() != 1 {
+        anyhow::bail!(
+            "codeload archive must contain exactly one top-level entry; found {}",
+            entries.len()
+        );
+    }
+    let inner = entries[0].path();
+    // Use the DIRECTORY-ENTRY file type (does NOT follow symlinks) so a
+    // top-level symlink-to-directory is rejected rather than promoted:
+    // `Path::is_dir()` would follow the link and accept an
+    // attacker-chosen target, and `fs::rename` moves the symlink itself
+    // (it never dereferences), leaving the build reading through it.
+    let entry_type = entries[0]
+        .file_type()
+        .with_context(|| "stat codeload top-level entry")?;
+    if !entry_type.is_dir() {
+        anyhow::bail!(
+            "codeload archive top-level entry is not a plain directory: {}",
+            inner.display()
+        );
+    }
+    let source_dir = dest_dir.join(canonical);
     std::fs::rename(&inner, &source_dir)
         .with_context(|| format!("rename {} -> {}", inner.display(), source_dir.display()))?;
     Ok(source_dir)
@@ -1103,6 +1243,109 @@ fn download_rc_tarball(
     Ok(source_dir)
 }
 
+/// Download a GitHub source snapshot for `git_ref` as a codeload
+/// `tar.gz` and extract it, returning an [`AcquiredSource`] keyed
+/// identically to the clone path ([`git_cache_key`] over the resolved
+/// `commit_hash`) so a codeload-acquired kernel and a clone-acquired
+/// one of the same commit share the cache entry.
+///
+/// GitHub serves a gzip snapshot for any tag/branch/commit via
+/// codeload; the caller supplies the `archive_url`
+/// ([`github_archive_url`]) and the pre-resolved `commit_hash`
+/// ([`resolve_ref_commit`]) — the snapshot has no `.git`, so the
+/// commit cannot be read back from the tree. Modeled on
+/// [`download_rc_tarball`] (gzip decode; codeload carries no sha256
+/// manifest, so extraction is structurally verified —
+/// [`promote_single_kernel_tree`] rejects any top level that is not a
+/// single plain directory (multi-entry, a file, or a symlink) — and
+/// the streamed digest is logged, not compared).
+pub(crate) fn download_github_archive(
+    client: &Client,
+    archive_url: &str,
+    git_ref: &str,
+    commit_hash: &str,
+    dest_dir: &Path,
+    cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
+) -> Result<AcquiredSource> {
+    tracing::info!(%archive_url, "downloading GitHub codeload snapshot (requires network)");
+    let response = client
+        .get(archive_url)
+        .timeout(DOWNLOAD_REQUEST_READ_TIMEOUT)
+        .send()
+        .with_context(|| format!("download {archive_url}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!(
+            "codeload snapshot not found: {archive_url}\n  \
+             the ref may not exist on the remote, or the repo is private"
+        );
+    }
+    if !response.status().is_success() {
+        anyhow::bail!("download {archive_url}: HTTP {}", response.status());
+    }
+    reject_html_response(&response, archive_url)?;
+    print_download_size(&response, archive_url, cli_label, mp);
+    // codeload responses are dynamically generated and often arrive
+    // without a Content-Length, so `total` is frequently `None` and the
+    // bar degrades to a live byte counter.
+    let total = response.content_length();
+
+    let status = |line: &str| match mp {
+        Some(fp) => fp.println(line),
+        None => eprintln!("{line}"),
+    };
+    status(&format!("{cli_label}: extracting snapshot (gzip)"));
+    // Stage extraction inside `dest_dir` (same filesystem) so the final
+    // atomic rename keeps `dest_dir` clean when a bad response serves a
+    // malformed archive or sneaks stray top-level entries. codeload
+    // snapshots have no upstream sha256 manifest, so structural
+    // verification (single top-level dir) is the only defence against a
+    // hostile response.
+    let staging =
+        tempfile::TempDir::new_in(dest_dir).with_context(|| "create extraction staging dir")?;
+    let short_hash: String = commit_hash.chars().take(7).collect();
+    let download_bar = mp.map(|fp| fp.download_bar(git_ref, total));
+    let stream = DownloadStream::with_progress(response, download_bar.as_ref().map(|b| b.bar()));
+    let decoder = flate2::read::GzDecoder::new(stream);
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .unpack(staging.path())
+        .with_context(|| "extract snapshot")?;
+
+    // Drain the watchdog to read the streamed digest. codeload has no
+    // published manifest, so the digest cannot be verified — log it so
+    // an operator can capture it for offline pinning. `into_inner` peels
+    // the tar then the gz layer, recovering the `DownloadStream`.
+    let stream = archive.into_inner().into_inner();
+    let (actual_hex, bytes_total) = stream.finalize();
+    if let Some(bar) = &download_bar {
+        bar.finish();
+    }
+    tracing::info!(
+        url = %archive_url,
+        bytes = bytes_total,
+        sha256 = %actual_hex,
+        "codeload snapshot extracted (unverified: codeload archives have \
+         no published sha256 manifest)",
+    );
+
+    // Name the promoted tree by the resolved commit so distinct refs
+    // never collide in `dest_dir` (the tree is temporary — `is_temp`).
+    let canonical = format!("linux-git-{short_hash}");
+    let source_dir = promote_single_kernel_tree(&staging, dest_dir, &canonical)?;
+    let version = read_makefile_version(&source_dir);
+
+    Ok(AcquiredSource {
+        source_dir,
+        cache_key: git_cache_key(git_ref, commit_hash),
+        version,
+        kernel_source: crate::cache::KernelSource::git(short_hash, git_ref),
+        is_temp: true,
+        is_dirty: false,
+        is_git: true,
+    })
+}
+
 /// Download a kernel tarball (stable or RC) and extract it.
 ///
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
@@ -1113,8 +1356,8 @@ fn download_rc_tarball(
 /// bypasses. RC tarballs (`download_rc_tarball`) have no published
 /// manifest so verification is impossible regardless of the flag;
 /// the RC path always runs unverified and emits its own warning,
-/// so `skip_sha256` is a no-op on the RC arm. `--source` and
-/// `--git` callers do not reach this function at all.
+/// so `skip_sha256` is a no-op on the RC arm. `--kernel <path>` and
+/// `--kernel git+…` sources do not reach this function at all.
 ///
 /// `mp` is the progress group the determinate download bar is added
 /// to; `None` disables the bar (the single-shot `kernel build` paths
@@ -1131,7 +1374,57 @@ pub fn download_tarball(
     let source_dir = if is_rc(version) {
         download_rc_tarball(client, version, dest_dir, cli_label, mp)?
     } else {
-        download_stable_tarball(client, version, dest_dir, cli_label, skip_sha256, mp)?
+        match download_stable_tarball(client, version, dest_dir, cli_label, skip_sha256, mp) {
+            Ok(dir) => dir,
+            // Pruned tarball (EOL series or superseded point release):
+            // cdn.kernel.org keeps only each maintained series' latest
+            // .tar.xz. Recover the source from the stable tree's
+            // `v{version}` tag via a shallow (depth-1) clone. The kernel
+            // built from this source is cached by the caller under the
+            // SAME `{version}-tarball-...` key returned below, so a
+            // re-run hits that cache and never re-clones.
+            Err(e) if e.downcast_ref::<TarballNotFound>().is_some() => {
+                let tag = format!("v{version}");
+                // A 404 says the tarball is gone, not why. cdn.kernel.org
+                // keeps only the latest tarball per series, but the gregkh
+                // GitHub mirror carries every `vX.Y.Z` release tag and
+                // codeload serves the tag's snapshot as a tar.gz — no
+                // clone, and a commit-pinned snapshot. Resolve the tag to
+                // its commit first (kind-directed, so a tag never aliases
+                // a same-named branch); a tag absent there means the
+                // version simply does not exist — surface the friendly
+                // "not found" suggestion (with the latest in-series patch)
+                // instead of a cryptic fetch failure.
+                let Some(commit_hash) = resolve_ref_commit(
+                    STABLE_MIRROR_URL,
+                    &tag,
+                    crate::kernel_path::GitRefKind::Tag,
+                ) else {
+                    anyhow::bail!("{}", version_not_found_msg(client, version));
+                };
+                let archive_url = github_archive_url(STABLE_MIRROR_URL, &commit_hash)
+                    .expect("STABLE_MIRROR_URL is a github.com URL");
+                let msg = format!(
+                    "{cli_label}: {version} not on cdn.kernel.org (pruned/EOL); \
+                     fetching gregkh mirror tag {tag}"
+                );
+                match mp {
+                    Some(fp) => fp.println(&msg),
+                    None => eprintln!("{msg}"),
+                }
+                download_github_archive(
+                    client,
+                    &archive_url,
+                    &tag,
+                    &commit_hash,
+                    dest_dir,
+                    cli_label,
+                    mp,
+                )?
+                .source_dir
+            }
+            Err(e) => return Err(e),
+        }
     };
 
     Ok(AcquiredSource {
@@ -1303,16 +1596,19 @@ pub fn is_major_minor_prefix(s: &str) -> bool {
 ///
 /// E.g., "6.12" → "6.12.81", "6" → "6.19.12" (highest 6.x.y).
 ///
-/// Scans all monikers in releases.json except linux-next. If no
-/// match is found (EOL series), fetches the cdn.kernel.org directory
-/// listing to find the highest patch version with a tarball.
+/// Scans all monikers in releases.json except linux-next. On no active
+/// match (an EOL or unreleased series, absent from releases.json),
+/// resolves the highest `vX.Y.z` stable patch from the gregkh mirror's
+/// git tags; if the series has NO stable point release yet (only a base
+/// tag), falls back to the bare `{prefix}` mainline base — see
+/// `latest_patch_from_git_tags`.
 ///
 /// When `client` is the process-wide [`shared_client`] singleton,
 /// routes through `RELEASES_CACHE`; other clients bypass the
 /// cache via pointer-equality and exercise `fetch_releases`
 /// directly — see `cached_releases_with` for details. Cache
-/// scope is releases.json only; the EOL-series directory-listing
-/// fallback in `probe_latest_patch` always hits the network.
+/// scope is releases.json only; the EOL-series git-tag fallback in
+/// `latest_patch_from_git_tags` always hits the network.
 ///
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
@@ -1344,71 +1640,146 @@ pub fn fetch_version_for_prefix(client: &Client, prefix: &str, cli_label: &str) 
         return Ok(version.to_string());
     }
 
-    eprintln!("{cli_label}: {prefix}.x not in releases.json (EOL series), probing cdn.kernel.org");
-    probe_latest_patch(client, prefix, cli_label)
+    eprintln!(
+        "{cli_label}: {prefix}.x not in releases.json (EOL or unreleased series); \
+         resolving latest patch via the gregkh mirror tags"
+    );
+    match latest_patch_from_git_tags(STABLE_MIRROR_URL, prefix, cli_label)? {
+        Some(version) => Ok(version),
+        None => {
+            // No stable point release for this series — fall back to the
+            // mainline base (the `{prefix}` release itself, e.g. a series
+            // just cut with no `.1` yet, per the "only if there is no
+            // X.Y.z stable use X.Y mainline" rule). The base tarball is
+            // fetched by the normal download path (cdn.kernel.org,
+            // falling back to the gregkh mirror snapshot); torvalds is
+            // the mainline authority the gregkh mirror tracks.
+            eprintln!(
+                "{cli_label}: no {prefix}.x stable point release; using {prefix} mainline base"
+            );
+            Ok(prefix.to_string())
+        }
+    }
 }
 
-/// Find the latest patch version for an EOL series by fetching the
-/// CDN directory listing.
+/// Resolve a series' latest stable patch by ls-remote-ing the gregkh
+/// GitHub mirror's `refs/tags/v{prefix}.{patch}` tags and taking the
+/// highest patch. Returns `Ok(None)` when the series has NO stable
+/// point release (no `v{prefix}.N` tag) — the caller then falls back to
+/// the mainline base.
 ///
-/// GETs the `v{major}.x/` directory index from cdn.kernel.org and
-/// extracts `linux-{prefix}.{patch}.tar.xz` filenames to find the
-/// highest patch. One GET replaces the former parallel-HEAD probe
-/// which failed in CI environments that block or mishandle HEAD
-/// requests to the CDN.
-fn probe_latest_patch(client: &Client, prefix: &str, cli_label: &str) -> Result<String> {
-    let major = major_version(prefix)?;
-    let url = format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/");
-    eprintln!("{cli_label}: fetching directory listing from {url}");
-    let body = client
-        .get(&url)
-        .send()
-        .with_context(|| format!("GET {url}"))?
-        .error_for_status()
-        .with_context(|| format!("GET {url}"))?
-        .text()
-        .with_context(|| format!("reading body from {url}"))?;
-
-    let needle = format!("linux-{prefix}.");
-    let mut best_patch: Option<u32> = None;
-    for line in body.lines() {
-        let Some(pos) = line.find(&needle) else {
-            continue;
-        };
-        let after = &line[pos + needle.len()..];
-        let Some(dot) = after.find(".tar.xz") else {
-            continue;
-        };
-        let patch_str = &after[..dot];
-        if let Ok(patch) = patch_str.parse::<u32>()
-            && best_patch.is_none_or(|b| patch > b)
-        {
-            best_patch = Some(patch);
-        }
-    }
-
-    match best_patch {
+/// The gregkh mirror is the RELIABLE EOL-resolution source: it carries
+/// every `vX.Y.Z` release tag (back to v2.6) and its codeload CDN
+/// serves each tag's tarball, so resolution and the pruned-tarball
+/// download (see [`download_tarball`]'s fallback) share ONE
+/// comprehensive mirror. cdn.kernel.org cannot be used here: its
+/// `v{major}.x/` directory index 404s, and its `sha256sums.asc` is
+/// served inconsistently per CDN edge (200 from some nodes, 404 from
+/// others — the 404 nodes break CI runners while the tarball fetch on
+/// those same nodes still succeeds).
+fn latest_patch_from_git_tags(url: &str, prefix: &str, cli_label: &str) -> Result<Option<String>> {
+    eprintln!("{cli_label}: resolving {prefix}.x release tags via {url}");
+    let refs = ls_remote_refs(url)
+        .with_context(|| format!("ls-remote {url} for {prefix}.x release tags"))?;
+    match max_tag_patch(refs.iter().map(ref_full_name), prefix) {
         Some(patch) => {
             let version = format!("{prefix}.{patch}");
-            eprintln!("{cli_label}: latest {prefix}.x kernel (from cdn listing): {version}");
-            Ok(version)
+            eprintln!("{cli_label}: latest {prefix}.x kernel (from git tags): {version}");
+            Ok(Some(version))
         }
-        None => {
-            anyhow::bail!(
-                "no tarball matching {prefix}.x found in cdn.kernel.org \
-                 directory listing at {url}"
-            );
+        None => Ok(None),
+    }
+}
+
+/// The advertised full ref name (`refs/...`), as raw bytes, of a
+/// protocol handshake ref.
+fn ref_full_name(r: &gix::protocol::handshake::Ref) -> &[u8] {
+    use gix::protocol::handshake::Ref::{Direct, Peeled, Symbolic, Unborn};
+    match r {
+        Peeled { full_ref_name, .. }
+        | Direct { full_ref_name, .. }
+        | Symbolic { full_ref_name, .. }
+        | Unborn { full_ref_name, .. } => full_ref_name.as_ref(),
+    }
+}
+
+/// Highest `{patch}` among `refs/tags/v{prefix}.{patch}` ref names.
+///
+/// gix folds an annotated tag's peeled entry into a single
+/// `Ref::Peeled` whose `full_ref_name` is the BASE name — no `^{}`
+/// suffix — and a lightweight tag arrives as a `Ref::Direct` with the
+/// base name too, so every tag advertises its base
+/// `refs/tags/v{prefix}.{patch}` name for the needle to match. The
+/// `^{}` strip below is therefore a defensive no-op on real gix output
+/// (it only affects a raw wire ref name gix never emits; the base
+/// entry supplies the patch regardless). Pure (no network) so it is
+/// unit-testable with synthetic ref names.
+///
+/// The trailing `.` in the `refs/tags/v{prefix}.` needle keeps a
+/// `6.14` prefix from matching a `6.140` series, and the numeric-only
+/// patch tail rejects `-rc` and other non-release tags.
+fn max_tag_patch<'a>(ref_names: impl Iterator<Item = &'a [u8]>, prefix: &str) -> Option<u32> {
+    let needle = format!("refs/tags/v{prefix}.");
+    let mut best: Option<u32> = None;
+    for name in ref_names {
+        let Some(rest) = name.strip_prefix(needle.as_bytes()) else {
+            continue;
+        };
+        let rest = rest.strip_suffix(b"^{}").unwrap_or(rest);
+        if let Ok(s) = std::str::from_utf8(rest)
+            && let Ok(patch) = s.parse::<u32>()
+        {
+            best = Some(best.map_or(patch, |b| b.max(patch)));
         }
     }
+    best
+}
+
+/// ls-remote the gregkh stable mirror ([`STABLE_MIRROR_URL`]) once and
+/// cache the release version strings (`X.Y.Z`) parsed from its
+/// `refs/tags/vX.Y.Z` advertisement, for `--include-eol` range
+/// expansion. Returns EVERY release-tag version verbatim (including
+/// `-rc*` and old series); the caller
+/// (`crate::cli::select_series_latest_in_range`) does the
+/// range / rc / per-series filtering. `None` on ls-remote failure —
+/// not cached, so the next caller retries. gregkh/linux mirrors
+/// linux-stable comprehensively (tags back to v2.6), so this surfaces
+/// EOL series that `releases.json` has dropped.
+pub(crate) fn cached_stable_tags() -> Option<&'static [String]> {
+    if let Some(tags) = STABLE_TAGS_CACHE.get() {
+        return Some(tags.as_slice());
+    }
+    let refs = ls_remote_refs(STABLE_MIRROR_URL)?;
+    let tags: Vec<String> = refs
+        .iter()
+        .filter_map(|r| {
+            // Base tag name only: gix folds an annotated tag's peeled
+            // entry into one `Ref::Peeled` carrying the base name, and a
+            // lightweight tag is a `Ref::Direct` with the base name, so
+            // `^{}` never appears on real gix output — the strip is a
+            // defensive no-op. Non-`refs/tags/v*` refs are skipped.
+            let name = ref_full_name(r);
+            let v = name.strip_prefix(b"refs/tags/v")?;
+            let v = v.strip_suffix(b"^{}").unwrap_or(v);
+            std::str::from_utf8(v).ok().map(|s| s.to_string())
+        })
+        .collect();
+    // Loser of a concurrent race discards its clone (both fetched the
+    // same advertisement, so the cached content is equivalent).
+    let _ = STABLE_TAGS_CACHE.set(tags);
+    STABLE_TAGS_CACHE.get().map(|v| v.as_slice())
 }
 
 /// Cache key for a git-cloned kernel: the raw user ref verbatim, the
 /// resolved commit's FULL hash, the target arch, and the
-/// kconfig-fragment suffix. The SINGLE construction site, shared by
-/// [`git_clone`] (post-clone, from `head_id`) and the pre-clone
-/// ls-remote cache probe in `resolve_git_kernel` — a drift between the
-/// two would make the probe miss the entry the clone wrote and defeat
-/// the clone-skip.
+/// kconfig-fragment suffix. The SINGLE construction site, shared by all
+/// three sharers of a commit's cache entry: [`git_clone`] (post-clone,
+/// from `head_id`), `download_github_archive` (post-download, keyed on
+/// the resolved commit), and the pre-fetch ls-remote cache probe in
+/// `resolve_git_kernel` — a drift between any of them would make the
+/// probe miss the entry the fetch wrote and defeat the fetch-skip, and
+/// split the codeload and clone paths onto separate entries for one
+/// commit.
 ///
 /// The FULL 40-hex commit hash keys the entry (not a 7-hex prefix): a
 /// branch/tag tip moves over time, so the `{git_ref}` segment alone
@@ -1418,64 +1789,165 @@ fn probe_latest_patch(client: &Client, prefix: &str, cli_label: &str) -> Result<
 /// the wrong kernel build under the new ref. The full id removes that
 /// collision class; the probe and clone both render full lowercase hex
 /// before any truncation, so keying on it is drift-free.
-pub fn git_cache_key(git_ref: &str, commit_hash: &str) -> String {
+pub(crate) fn git_cache_key(git_ref: &str, commit_hash: &str) -> String {
     let (arch, _) = arch_info();
+    // Sanitize the ref segment so no ref can produce a key
+    // validate_cache_key (cache::housekeeping) rejects: it rejects `/`,
+    // `\`, `..`, a NUL byte, and a leading `.`. A slashed branch ref
+    // (e.g. `for-next/core`) or a dot-prefixed ref (`.foo`) would
+    // otherwise be uncacheable verbatim and break both the pre-fetch
+    // probe lookup and the store. The full commit_hash already makes
+    // the key unique, so collapsing several refs onto one sanitized
+    // prefix is safe — two refs at the same commit want the same build;
+    // two at different commits differ in the hash segment.
+    let safe_ref: String = git_ref
+        .chars()
+        .map(|c| {
+            if c == '/' || c == '\\' || c == '\0' {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let safe_ref = safe_ref.replace("..", "__");
+    // A leading `.` (hidden entry, `.` / `..`) is rejected by
+    // validate_cache_key; prefix `_` so a `.foo` ref stays cacheable.
+    let safe_ref = if safe_ref.starts_with('.') {
+        format!("_{safe_ref}")
+    } else {
+        safe_ref
+    };
     format!(
-        "{git_ref}-git-{commit_hash}-{arch}-kc{}",
+        "{safe_ref}-git-{commit_hash}-{arch}-kc{}",
         crate::cache_key_suffix()
     )
 }
 
-/// Resolve `git_ref` to its tip COMMIT's full hash among the `refs` a
-/// remote advertised, for the pre-clone cache probe. Precedence: an
-/// explicit `refs/` path, else `refs/heads/{ref}`, else
-/// `refs/tags/{ref}`, else `HEAD`. For an annotated tag (`Ref::Peeled`)
-/// the peeled commit (`object`) is used, never the tag object;
-/// `Ref::Unborn` carries no commit and is skipped. `None` when no ref
-/// matches. Pure over `refs` so the precedence + tag-peeling are
-/// unit-testable without a network handshake.
+/// If `url` is a GitHub remote, build the codeload archive URL for the
+/// resolved `commit_hash`: `github.com/OWNER/REPO/archive/<commit>.tar.gz`
+/// (302 → codeload.github.com, its CDN) serves a gzip source snapshot
+/// for any commit — verified empirically. This lets a GitHub source's
+/// commit be fetched over HTTP (no clone, no server-side allow-sha
+/// requirement) rather than cloned. `None` for a non-GitHub URL
+/// (self-hosted / GitLab / …) — those take the gix clone path.
 ///
-/// This is a best-effort guess at the commit a clone would land on; it
-/// does NOT perfectly mirror the shallow clone in every case. This probe
-/// applies heads-before-tags precedence, whereas the shallow clone
-/// ([`git_clone`], `DepthAtRemote(1)`) resolves the bare ref via gix's
-/// DWIM across heads AND tags and errors `RefNameAmbiguous` when a remote
-/// advertises both a branch and a tag of that name — where this probe
-/// instead returns the branch commit. A mismatch only costs a redundant
-/// clone (the post-clone re-check in `resolve_git_kernel` is
-/// authoritative); it never serves a wrong build, since [`git_cache_key`]
-/// embeds the full commit hash returned here.
-fn match_ref_commit_hash(refs: &[gix::protocol::handshake::Ref], git_ref: &str) -> Option<String> {
-    let pick = |target: &str| -> Option<gix::hash::ObjectId> {
-        refs.iter().find_map(|r| {
-            let (name, object) = match r {
-                gix::protocol::handshake::Ref::Peeled {
-                    full_ref_name,
-                    object,
-                    ..
-                }
-                | gix::protocol::handshake::Ref::Direct {
-                    full_ref_name,
-                    object,
-                }
-                | gix::protocol::handshake::Ref::Symbolic {
-                    full_ref_name,
-                    object,
-                    ..
-                } => (full_ref_name, object),
-                gix::protocol::handshake::Ref::Unborn { .. } => return None,
-            };
-            (*name == target).then_some(*object)
-        })
+/// The caller resolves the ref to `commit_hash` FIRST (a kind-directed
+/// ls-remote; a sha is already the commit), so the download fetches the
+/// EXACT commit the cache entry is keyed on — a branch tip that
+/// advances between the ls-remote probe and this GET cannot mislabel
+/// the entry the way a ref-name snapshot would. `commit_hash` is
+/// lowercased to align with `git_cache_key`'s hash segment.
+///
+/// Accepts the https/http/ssh/git and scp-style GitHub remotes, each
+/// with an optional trailing `/` and `.git`; the host is matched
+/// case-insensitively (DNS hostnames are case-insensitive).
+pub(crate) fn github_archive_url(url: &str, commit_hash: &str) -> Option<String> {
+    // Match the github.com scheme+host CASE-INSENSITIVELY (DNS
+    // hostnames are case-insensitive, so `GitHub.com` is a GitHub URL),
+    // keeping the OWNER/REPO path verbatim. Accept the https/http/ssh/git
+    // schemes (with an optional `git@` userinfo) and the scp-style
+    // git@github.com:OWNER/REPO, each with an optional trailing `.git`.
+    let mut path = None;
+    for prefix in [
+        "https://github.com/",
+        "http://github.com/",
+        "ssh://git@github.com/",
+        "ssh://github.com/",
+        "git://github.com/",
+        "git@github.com:",
+    ] {
+        if url
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        {
+            path = Some(&url[prefix.len()..]);
+            break;
+        }
+    }
+    let path = path?;
+    // Trim trailing slashes (a common copy-paste artifact) before the
+    // `.git` strip so `OWNER/REPO/` and `OWNER/REPO.git/` still resolve
+    // to codeload rather than misrouting to the clone path.
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    // Exactly OWNER/REPO — reject deeper paths (a stray extra segment
+    // is not a repo root, so fall through to the clone path).
+    let mut segs = path.split('/');
+    let owner = segs.next().filter(|s| !s.is_empty())?;
+    let repo = segs.next().filter(|s| !s.is_empty())?;
+    if segs.next().is_some() {
+        return None;
+    }
+    // Always the resolved COMMIT (lowercased) — never a ref-name
+    // snapshot — so the extracted tree matches git_cache_key's commit
+    // exactly regardless of a concurrent branch-tip move. codeload
+    // serves any commit case-insensitively.
+    Some(format!(
+        "https://github.com/{owner}/{repo}/archive/{}.tar.gz",
+        commit_hash.to_ascii_lowercase()
+    ))
+}
+
+/// The object id the advertised ref named exactly `target` points at,
+/// or `None` if no ref matches. For an annotated tag (`Ref::Peeled`)
+/// this is the PEELED commit (`object`), never the tag object;
+/// `Ref::Unborn` carries no commit and never matches. Used by the
+/// kind-directed [`resolve_ref_commit`] so tag-peeling and
+/// unborn-skipping stay consistent.
+fn pick_ref_object(
+    refs: &[gix::protocol::handshake::Ref],
+    target: &str,
+) -> Option<gix::hash::ObjectId> {
+    refs.iter().find_map(|r| {
+        let (name, object) = match r {
+            gix::protocol::handshake::Ref::Peeled {
+                full_ref_name,
+                object,
+                ..
+            }
+            | gix::protocol::handshake::Ref::Direct {
+                full_ref_name,
+                object,
+            }
+            | gix::protocol::handshake::Ref::Symbolic {
+                full_ref_name,
+                object,
+                ..
+            } => (full_ref_name, object),
+            gix::protocol::handshake::Ref::Unborn { .. } => return None,
+        };
+        (*name == target).then_some(*object)
+    })
+}
+
+/// Resolve `git_ref` to its full commit hash under `ref_kind`, via a
+/// kind-directed ls-remote. Unlike the clone path, the codeload
+/// download has no checked-out `.git` to read `head_id` from, so it
+/// resolves the commit here — [`git_cache_key`] needs it to key the
+/// entry a clone of the same ref would write (shared cache).
+///
+/// A `Sha` ref IS the commit (lowercased to match `git_clone`'s
+/// rendering) and resolves offline — no handshake. `Tag`/`Branch`
+/// match ONLY the fully-qualified `refs/tags/{ref}` / `refs/heads/{ref}`
+/// so a tag never aliases a same-named branch (a bare-name DWIM lookup
+/// would resolve either). `None` on
+/// ls-remote failure, no match, or `Unknown` (rejected by
+/// [`crate::kernel_path::KernelId::validate`] upstream, so it is never
+/// resolved).
+pub(crate) fn resolve_ref_commit(
+    url: &str,
+    git_ref: &str,
+    ref_kind: crate::kernel_path::GitRefKind,
+) -> Option<String> {
+    use crate::kernel_path::GitRefKind;
+    let target = match ref_kind {
+        GitRefKind::Sha => return Some(git_ref.to_ascii_lowercase()),
+        GitRefKind::Tag => format!("refs/tags/{git_ref}"),
+        GitRefKind::Branch => format!("refs/heads/{git_ref}"),
+        GitRefKind::Unknown => return None,
     };
-    let object = git_ref
-        .starts_with("refs/")
-        .then(|| pick(git_ref))
-        .flatten()
-        .or_else(|| pick(&format!("refs/heads/{git_ref}")))
-        .or_else(|| pick(&format!("refs/tags/{git_ref}")))
-        .or_else(|| (git_ref == "HEAD").then(|| pick("HEAD")).flatten())?;
-    Some(format!("{object}"))
+    pick_ref_object(&ls_remote_refs(url)?, &target).map(|object| format!("{object}"))
 }
 
 /// True when `git_ref` is a full 40-char hex commit id — recognizable
@@ -1487,59 +1959,81 @@ fn is_full_sha(git_ref: &str) -> bool {
     git_ref.len() == 40 && git_ref.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Resolve `git_ref` to its tip commit's FULL hash WITHOUT cloning, via
-/// an ls-remote handshake, so [`crate::cli::resolve_git_kernel`] can
-/// probe the cache before the expensive full clone. Returns `None`
-/// (best-effort) on ANY failure — network, auth, or an unadvertised ref
-/// — so the caller falls through to the clone, which resolves the ref
-/// authoritatively.
+/// ls-remote `url` and return EVERY advertised ref WITHOUT fetching a
+/// pack. Best-effort: `None` on any failure (network, auth). Shared by
+/// [`resolve_ref_commit`] (resolve one kind-directed ref → commit),
+/// [`cached_stable_tags`], and [`latest_patch_from_git_tags`] (highest
+/// `v{prefix}.{patch}` tag).
 ///
-/// A full 40-hex `git_ref` is taken directly (no handshake): it matches
-/// [`git_clone`]'s post-clone `head_id` byte-for-byte (gix `Id` /
-/// `ObjectId` `Display` both emit the full lowercase hex), so it builds
-/// the key a sha-clone would write — see [`git_cache_key`]. [`git_clone`]
-/// currently REJECTS a raw-sha `git_ref` (a bare commit cannot be
-/// fetched), so for a sha this probe always misses and the clone then
-/// surfaces the actionable error; the branch is kept because it avoids a
-/// handshake on that reject path and is ready for a future sha-capable
-/// clone. It trusts the hex verbatim (no remote validation) — harmless
-/// while sha-clone is rejected, since an unbuildable sha has no cache
-/// entry. The ad-hoc bare repo (`gix::init` on a tempdir) carries no
-/// working tree and fetches no pack; `ref_map` lists every advertised ref
-/// (remote-side ref-prefix filtering is disabled — see the body) without
-/// fetching a pack. See `match_ref_commit_hash` for the rare branch/tag
-/// same-name caveat where this guess and the clone diverge.
-pub fn ls_remote_commit_hash(url: &str, git_ref: &str) -> Option<String> {
-    if is_full_sha(git_ref) {
-        return Some(git_ref.to_ascii_lowercase());
-    }
+/// The ad-hoc repo (`init_opts` on a tempdir, with repo-local git config
+/// only — see `anon_open_opts`) carries no working tree and fetches no
+/// pack. Remote-side ref-prefix filtering is
+/// DISABLED: gix's default (`prefix_from_spec_as_filter_on_remote =
+/// true`) derives protocol-v2 `ls-refs` `ref-prefix` filters from the
+/// remote's fetch refspecs; an anonymous `remote_at` has none, and
+/// `fetch_tags = Included` injects only `refs/tags/*`, so the server
+/// would return TAGS ONLY and `refs/heads/*` would never arrive.
+/// Disabling the filter returns all refs, so a branch, tag, or HEAD
+/// all resolve.
+fn ls_remote_refs(url: &str) -> Option<Vec<gix::protocol::handshake::Ref>> {
     let tmp = tempfile::TempDir::new().ok()?;
-    let repo = gix::init(tmp.path()).ok()?;
+    let repo = gix::ThreadSafeRepository::init_opts(
+        tmp.path(),
+        gix::create::Kind::WithWorktree,
+        gix::create::Options::default(),
+        anon_open_opts(),
+    )
+    .ok()?
+    .to_thread_local();
     let remote = repo.remote_at(url).ok()?;
     let conn = remote.connect(gix::remote::Direction::Fetch).ok()?;
     let (refmap, _handshake) = conn
         .ref_map(
             gix::progress::Discard,
             gix::remote::ref_map::Options {
-                // ls-remote semantics: list EVERY advertised ref. gix's
-                // default (`prefix_from_spec_as_filter_on_remote = true`)
-                // derives protocol-v2 `ls-refs` `ref-prefix` filters from the
-                // remote's fetch refspecs; an anonymous `remote_at` has none,
-                // and `fetch_tags = Included` injects only `refs/tags/*`, so
-                // the server returns TAGS ONLY and `refs/heads/*` never
-                // arrive — a branch `git_ref` then resolves to `None` and the
-                // clone-skip never fires (every run re-clones). Disabling the
-                // remote-side filter returns all refs, so a branch, tag, or
-                // HEAD `git_ref` all resolve.
                 prefix_from_spec_as_filter_on_remote: false,
                 ..Default::default()
             },
         )
         .ok()?;
-    match_ref_commit_hash(&refmap.remote_refs, git_ref)
+    Some(refmap.remote_refs)
 }
 
-/// Clone a git repository with shallow depth.
+/// Open options for ktstr's git fetches: load ONLY repo-local git
+/// config, never the user (`~/.gitconfig`), XDG, system
+/// (`/etc/gitconfig`), or `GIT_CONFIG_*` env sources. This neutralizes a
+/// `url.<base>.insteadOf` rewrite (e.g. a developer rule mapping
+/// `https://github.com/` to `git@github.com:`) that would otherwise
+/// route an anonymous public fetch through SSH and prompt for the key
+/// passphrase once per operation — several at once under the concurrent
+/// intra-range kernel resolution. Environment permissions stay at the
+/// Full-trust default so an `http(s)_proxy` env var still applies.
+///
+/// SCOPE: these opts govern EVERY gix remote path — the internal version
+/// resolution (`ls_remote_refs` and its callers) AND every user-supplied
+/// `git+URL` clone via `git_clone_inner`, including a self-hosted
+/// `git+https://...` source. The tradeoff is deliberate: a PUBLIC source
+/// (the common case — kernel.org / gregkh / torvalds mirrors) fetches
+/// anonymously with no credential prompt, and a PRIVATE source must use a
+/// `git+ssh://user@host/repo` URL (SSH authenticates via `~/.ssh`,
+/// independent of gitconfig). gitconfig-driven auth (an `insteadOf`
+/// HTTPS->SSH rewrite plus credential/`git_binary` config) is
+/// intentionally NOT honored, so it can never silently reroute an
+/// anonymous fetch through SSH. The ad-hoc temp repos carry no local
+/// config, so the effective URL-rewrite set is empty: the passed URL is
+/// used verbatim.
+fn anon_open_opts() -> gix::open::Options {
+    use gix::sec::trust::DefaultForLevel;
+    let mut opts = gix::open::Options::default_for_level(gix::sec::Trust::Full);
+    opts.permissions.config.system = false;
+    opts.permissions.config.git = false;
+    opts.permissions.config.user = false;
+    opts.permissions.config.env = false;
+    opts.permissions.config.git_binary = false;
+    opts
+}
+
+/// Shallow-clone a git repository at a BRANCH ref.
 ///
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
@@ -1550,6 +2044,9 @@ pub fn ls_remote_commit_hash(url: &str, git_ref: &str) -> Option<String> {
 /// tests pass `None`). The bar shows real object/file counts + ETA
 /// during the receiving / resolving / checkout phases that gix reports
 /// a bounded total for; see the `crate::cli::progress` module.
+///
+/// For a TAG ref use `git_clone_tag`: gix's shallow clone only
+/// resolves branches via `with_ref_name` — see `git_clone_inner`.
 pub fn git_clone(
     url: &str,
     git_ref: &str,
@@ -1557,18 +2054,105 @@ pub fn git_clone(
     cli_label: &str,
     mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<AcquiredSource> {
-    // A raw 40-hex commit SHA cannot be cloned here: gix's
-    // `prepare_clone(...).with_ref_name(<object-id>)` panics at
-    // `fetch_then_checkout` (gix `clone/access.rs`), and fetching a bare
-    // commit needs server-side allow-sha-in-want support this path does
-    // not implement. Reject with an actionable error (use a branch or
-    // tag) rather than panic. Placed at the single clone entry so every
-    // caller (auto-discovery + `kernel build`) is covered.
+    git_clone_inner(url, git_ref, dest_dir, cli_label, mp, None)
+}
+
+/// Shallow-clone a git repository at a TAG ref (e.g. `v6.14.11`).
+///
+/// gix's shallow clone routes the ref through `Category::LocalBranch`
+/// (`refs/heads/`) in its single-branch-shallow path
+/// (`gix::clone::fetch`), so a tag never matches on the remote and the
+/// fetch fails with "None of the refspec(s) matched". This appends a
+/// `+refs/tags/{tag}:refs/heads/{tag}` refspec so the tag is fetched
+/// into the local branch ref the checkout resolves. The `#tag=` git
+/// source (via [`git_clone_kinded`]) uses this for a non-GitHub remote;
+/// a GitHub remote takes the codeload path instead. (The pruned/EOL
+/// tarball recovery no longer clones — [`download_tarball`]'s
+/// `TarballNotFound` fallback fetches a gregkh codeload snapshot.)
+pub(crate) fn git_clone_tag(
+    url: &str,
+    tag: &str,
+    dest_dir: &Path,
+    cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
+) -> Result<AcquiredSource> {
+    let extra_refspec = format!("+refs/tags/{tag}:refs/heads/{tag}");
+    git_clone_inner(url, tag, dest_dir, cli_label, mp, Some(extra_refspec))
+}
+
+/// Clone a git source at `git_ref`, dispatching on `ref_kind` to the
+/// correct clone path. A well-formed `github.com/OWNER/REPO` source
+/// normally takes the codeload path ([`download_github_archive`], via
+/// [`crate::cli::resolve_git_kernel`]) and reaches here only as a
+/// fallback when the pre-fetch ls-remote resolution failed (no commit →
+/// no codeload URL). A `github.com` URL whose path is not exactly
+/// `OWNER/REPO` (so `github_archive_url` returns `None`) can still reach
+/// the `Sha` arm below.
+///
+/// - `Tag` → [`git_clone_tag`] (adds the `refs/tags/*` refspec gix's
+///   shallow path omits).
+/// - `Branch` → [`git_clone`] (the plain shallow single-branch clone).
+/// - `Sha` → a hard error: gix cannot fetch a bare commit, and a
+///   self-hosted server generally lacks allow-sha-in-want. The
+///   actionable message points at GitHub (codeload serves any sha) or a
+///   tag/branch.
+/// - `Unknown` → a hard error; [`crate::kernel_path::KernelId::validate`]
+///   rejects it upstream, so this is a defensive backstop.
+pub(crate) fn git_clone_kinded(
+    url: &str,
+    git_ref: &str,
+    ref_kind: crate::kernel_path::GitRefKind,
+    dest_dir: &Path,
+    cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
+) -> Result<AcquiredSource> {
+    use crate::kernel_path::GitRefKind;
+    match ref_kind {
+        GitRefKind::Tag => git_clone_tag(url, git_ref, dest_dir, cli_label, mp),
+        GitRefKind::Branch => git_clone(url, git_ref, dest_dir, cli_label, mp),
+        GitRefKind::Sha => anyhow::bail!(
+            "git+{url}#sha={git_ref}: fetching this source by commit sha is \
+             not supported — gix cannot fetch a bare commit and the remote \
+             lacks allow-sha-in-want. Use a github.com/OWNER/REPO URL \
+             (codeload serves any commit) or pin a #tag= / #branch= instead."
+        ),
+        GitRefKind::Unknown => anyhow::bail!(
+            "git+{url}: ref kind could not be determined; use #tag=NAME, \
+             #branch=NAME, or #sha=<40-hex>"
+        ),
+    }
+}
+
+/// Shared shallow-clone implementation for [`git_clone`] (branch) and
+/// [`git_clone_tag`] (tag).
+///
+/// `extra_refspec`, when `Some`, is appended to the remote's fetch
+/// refspecs via `configure_remote` before the fetch (the tag path uses
+/// it to fetch `refs/tags/*`). `None` leaves the branch clone
+/// byte-identical to the historical behavior.
+fn git_clone_inner(
+    url: &str,
+    git_ref: &str,
+    dest_dir: &Path,
+    cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
+    extra_refspec: Option<String>,
+) -> Result<AcquiredSource> {
+    // Any 40-hex `git_ref` cannot be cloned here, whatever kind the
+    // operator meant it as: gix's `with_ref_name(<40-hex>)` treats it as
+    // an object-id (its own `# Panics` doc: "an object-id as hex-hash"
+    // panics at `fetch_then_checkout`, gix `clone/access.rs`), and
+    // fetching a bare commit needs server-side allow-sha-in-want this
+    // path does not implement. Reject with an actionable error rather
+    // than panic. Placed at the single clone entry so every caller is
+    // covered — including a `#branch=`/`#tag=` whose NAME is 40 hex.
     if is_full_sha(git_ref) {
         anyhow::bail!(
-            "git+{url}#{git_ref}: cannot fetch a kernel by raw commit SHA — \
-             use a branch or tag name instead (the resolved commit is recorded \
-             in the cache key after a branch/tag clone)"
+            "git+{url}#{git_ref}: cannot fetch a kernel by a raw commit SHA — \
+             gix's shallow clone treats any 40-hex ref as a commit id (even a \
+             branch/tag named 40 hex chars). Use a branch or tag name that is \
+             not 40 hex chars, or on github.com `#sha=<40-hex>` (codeload \
+             fetches the commit)."
         );
     }
     let cloning = format!("{cli_label}: cloning {url} (ref: {git_ref}, depth: 1)");
@@ -1579,13 +2163,38 @@ pub fn git_clone(
 
     let clone_dir = dest_dir.join("linux");
 
-    let mut prep = gix::prepare_clone(url, &clone_dir)
-        .with_context(|| "prepare clone")?
-        .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
-            NonZeroU32::new(1).expect("1 is nonzero"),
-        ))
-        .with_ref_name(Some(git_ref))
-        .with_context(|| "set ref name")?;
+    // Build the clone with anon_open_opts() (repo-local config only)
+    // rather than gix::prepare_clone, whose open opts load the user's
+    // gitconfig and would apply an `insteadOf` HTTPS->SSH rewrite,
+    // prompting for a key passphrase. Mirrors gix::prepare_clone's
+    // (WithWorktree, default create opts) otherwise.
+    let mut prep = gix::clone::PrepareFetch::new(
+        url,
+        &clone_dir,
+        gix::create::Kind::WithWorktree,
+        gix::create::Options::default(),
+        anon_open_opts(),
+    )
+    .with_context(|| "prepare clone")?
+    .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
+        NonZeroU32::new(1).expect("1 is nonzero"),
+    ))
+    .with_ref_name(Some(git_ref))
+    .with_context(|| "set ref name")?;
+
+    // Tag path only: gix's single-branch-shallow fetch derives its
+    // refspec from `with_ref_name` via Category::LocalBranch
+    // (`refs/heads/{ref}`), which never matches a `refs/tags/*` ref.
+    // Append the caller's `+refs/tags/{tag}:refs/heads/{tag}` so the
+    // tag is fetched into the branch ref the checkout resolves.
+    // `with_refspecs` APPENDS (keeping gix's own single-branch spec),
+    // so a branch clone that reaches here would still match its spec —
+    // but the branch path passes `None` and skips this entirely.
+    if let Some(spec) = extra_refspec {
+        prep = prep.configure_remote(move |remote| {
+            Ok(remote.with_refspecs(Some(spec.as_str()), gix::remote::Direction::Fetch)?)
+        });
+    }
 
     // Drive a determinate clone bar from gix's progress tree (see
     // [`crate::cli::progress::CloneProgress`]). `None` when no progress
@@ -1878,7 +2487,7 @@ pub fn inspect_local_source_state(canonical: &Path) -> Result<LocalSourceState> 
             // remediation paths — once the is_dirty=true branch
             // decides to skip the cache. Emitting a second
             // "not a git repository" warning here duplicated that
-            // content for every non-git `--source` run. The
+            // content for every non-git `--kernel <path>` run. The
             // `(None, true, false)` tuple silently communicates
             // the non-git state to the cache-skip decision site;
             // no separate stderr line is needed on this path.

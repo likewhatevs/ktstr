@@ -1195,7 +1195,7 @@ pub enum WorkType {
     /// transitions: `nanosleep` dequeues the worker into
     /// TASK_INTERRUPTIBLE; on the pinned CPU, when no other tasks
     /// are runnable, `__pick_next_task` selects the idle class
-    /// (`pick_task_idle` at `kernel/sched/idle.c:480`); on
+    /// (`pick_task_idle` at `kernel/sched/idle.c:501-505`); on
     /// `nanosleep` expiry the hrtimer callback `hrtimer_wakeup`
     /// calls `wake_up_process` → `try_to_wake_up`.
     ///
@@ -1292,7 +1292,7 @@ pub enum WorkType {
     /// scheduler and a test must pick the one the design
     /// requires:
     ///
-    /// - `do_nanosleep` at `kernel/time/hrtimer.c:2115-2148` calls
+    /// - `do_nanosleep` at `kernel/time/hrtimer.c:2284-2317` calls
     ///   `set_current_state(TASK_INTERRUPTIBLE | TASK_FREEZABLE)`
     ///   then `schedule()`. The current task IS dequeued and goes
     ///   off-CPU on every iteration regardless of what else is
@@ -1359,12 +1359,12 @@ pub enum WorkType {
     ///
     /// The kernel adds `current->timer_slack_ns` to the requested
     /// `sleep_duration` inside `hrtimer_nanosleep` at
-    /// `kernel/time/hrtimer.c:2162-2188`, specifically the
+    /// `kernel/time/hrtimer.c:2331-2356`, specifically the
     /// `hrtimer_set_expires_range_ns(&t.timer, rqtp,
-    /// current->timer_slack_ns)` call at L2170.
+    /// current->timer_slack_ns)` call at L2338.
     /// `timer_slack_ns` is inherited from the parent at fork; the
     /// kernel default propagated from `init_task` is 50000ns
-    /// (50µs, set at `init/init_task.c:172`). So:
+    /// (50µs, set at `init/init_task.c:173`). So:
     ///
     /// - `sleep_duration` is a **lower bound** on the observed
     ///   idle interval — actual sleep extends by up to
@@ -1639,12 +1639,12 @@ pub enum WorkType {
         /// When `true`, the IdleChurn dispatch arm calls
         /// `prctl(PR_SET_TIMERSLACK, 1)` once before the work
         /// loop. The kernel's PR_SET_TIMERSLACK arm at
-        /// `kernel/sys.c:2645` sets `current->timer_slack_ns =
+        /// `kernel/sys.c:2653` sets `current->timer_slack_ns =
         /// arg2` when `arg2 > 0`; passing `0` is a RESET to
         /// `default_timer_slack_ns` (the inherited 50µs), so
         /// `1` is the smallest value that actually shrinks the
         /// slack. After the call, `hrtimer_nanosleep`
-        /// (`kernel/time/hrtimer.c:2162-2188`) coalesces
+        /// (`kernel/time/hrtimer.c:2331-2356`) coalesces
         /// expiries within a 1ns window instead of the default
         /// 50µs, exposing the scheduler's true wake-resume
         /// latency for sub-100µs `sleep_duration` values.
@@ -1658,7 +1658,7 @@ pub enum WorkType {
         /// difference.
         ///
         /// **RT/DL workers ignore this setting.** The kernel
-        /// guard at `kernel/sys.c:2646`
+        /// guard at `kernel/sys.c:2647`
         /// (`if (rt_or_dl_task_policy(current)) break;`)
         /// makes `prctl(PR_SET_TIMERSLACK, ...)` a no-op for
         /// RT/DL tasks; their slack is independently forced to

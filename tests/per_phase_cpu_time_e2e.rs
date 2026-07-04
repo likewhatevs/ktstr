@@ -43,7 +43,8 @@ const KTSTR_SCHED: Scheduler =
     Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
 /// VM core count (matches the `cores` attr below) — the plausibility
-/// ceiling for per-phase CPU time is `wall × CORES`.
+/// ceiling for per-phase CPU time is `wall × CORES × 2` (the ×2 slack
+/// covers measurement edges, matching the applied formula below).
 const CORES: u128 = 2;
 
 fn assert_per_phase_cpu_time(result: &VmResult) -> Result<()> {

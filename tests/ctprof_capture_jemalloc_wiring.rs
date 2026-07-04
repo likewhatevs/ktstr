@@ -19,15 +19,17 @@
 //! the layout the ktstr VMM-backed integration tests use) any
 //! same-uid process attaches and the test runs unconditionally.
 //! Under `=1` (Debian/Ubuntu host default outside CI) the test
-//! parent is the worker's parent PID, which YAMA's `is_my_thread`
-//! branch already permits — same-uid + same-process-tree, no
-//! capability needed.
+//! parent is the worker's parent PID, which YAMA's
+//! `YAMA_SCOPE_RELATIONAL` `task_is_descendant` branch already
+//! permits — the tracer is an ancestor of the target, so no
+//! capability is needed.
 //!
 //! Under `=2` or `=3`, or when running as a non-uid-matching user,
-//! the `attach_jemalloc` step inside `capture_pid` returns an
-//! `AttachError` that the capture pipeline absorbs into the
-//! "absent counter = 0" contract, so the worker's tid would land
-//! with `allocated_bytes=0`. To distinguish "wiring failed" from
+//! `attach_jemalloc` still succeeds (it only parses ELF/maps and
+//! never calls ptrace), but each per-thread `probe_thread` read
+//! inside `capture_pid` fails with `ProbeError::PtraceSeize`, which
+//! the capture pipeline absorbs into the "absent counter = 0"
+//! contract, so the worker's tid would land with `allocated_bytes=0`. To distinguish "wiring failed" from
 //! "test ran on a host where ptrace is locked down", the test
 //! short-circuits with an informative skip message when it cannot
 //! self-attach (a one-shot probe against the test process's own
@@ -174,7 +176,7 @@ fn capture_populates_jemalloc_counters_for_alloc_worker() {
     // attach. The test's primary value is the positive
     // assertion path; running it on a locked-down host would
     // produce zero observable signal anyway because the probe
-    // would silently absorb every `AttachError::PtraceSeize`
+    // would silently absorb every `ProbeError::PtraceSeize`
     // through capture's "absent = 0" contract.
     if !ptrace_attach_allowed() {
         eprintln!(

@@ -1,7 +1,7 @@
 error[E0599]: no variant or associated item named `nonexistent_check` found for enum `MetricCheck` in the current scope
-  --> tests/compile_fail/derive_payload_unknown_check.rs:14:17
+  --> tests/compile_fail/derive_payload_unknown_check.rs:15:17
    |
-14 | #[default_check(nonexistent_check("metric", 1.0))]
+15 | #[default_check(nonexistent_check("metric", 1.0))]
    |                 ^^^^^^^^^^^^^^^^^ variant or associated item not found in `MetricCheck`
    |
 note: if you're trying to build a new `MetricCheck` consider using one of the following associated functions:

@@ -150,7 +150,7 @@ KVM enabled and the user must have read+write access to `/dev/kvm`.
 ```text
 no kernel found — the test harness was likely invoked outside `cargo ktstr test` (which builds and injects a kernel automatically).
   hint: run `cargo ktstr test --kernel <path-or-version>` to drive this test, or set KTSTR_TEST_KERNEL=/path/to/{bzImage|Image} to point at a pre-built bootable image directly.
-  hint: set KTSTR_KERNEL to one of: exact version (`6.14`), inclusive range (`6.14..7.0` or `6.14..=7.0`), git source (`git+URL#REF`), absolute or `~`-prefixed path, or cache key. List cached keys with `cargo ktstr kernel list`; build new ones with `cargo ktstr kernel build`
+  hint: set KTSTR_KERNEL to one of: exact version (`6.14`), inclusive range (`6.14..7.0` or `6.14..=7.0`), git source (`git+URL#tag=NAME`, `git+URL#branch=NAME`, or `git+URL#sha=<40-hex>`), absolute or `~`-prefixed path, or cache key. List cached keys with `cargo ktstr kernel list`; build new ones with `cargo ktstr kernel build`
 ```
 
 On aarch64 the first hint's image filename is `Image` instead of
@@ -170,7 +170,7 @@ search order.
 **Fixes:**
 
 - Download and cache a kernel: `cargo ktstr kernel build`
-- Build from a local tree: `cargo ktstr kernel build --source ../linux`
+- Build from a local tree: `cargo ktstr kernel build --kernel ../linux`
 - Set `KTSTR_TEST_KERNEL` to an explicit image path.
 - The host's installed kernel works for basic testing.
 
@@ -201,17 +201,29 @@ binary in:
    binary's parent).
 3. `target/debug/`.
 4. `target/release/`.
-5. On-demand build via `cargo build` against the scheduler's
-   package name — ktstr invokes the build itself when the
-   preceding four locations have no match, so a fresh checkout
-   with an unbuilt scheduler still produces a usable binary
-   without the caller pre-running `cargo build`.
+The ordering above (steps 1–4 first, on-demand build last) applies
+only to a direct `cargo test` run marked with `KTSTR_CARGO_TEST_MODE=1`.
+On the default `cargo ktstr test` (orchestrated) path the on-demand
+build runs FIRST — right after the `KTSTR_SCHEDULER` env checks:
+
+- `cargo build -p <scheduler>` runs before the sibling / target-dir
+  probes, so an edited scheduler is never validated against a stale
+  pre-built binary.
+- If that build FAILS, ktstr REFUSES: the test hard-fails rather than
+  falling back to a pre-built binary. Set
+  `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK=1` to opt into the
+  sibling → `target/{release,debug}/` fallback when the workspace
+  build is momentarily broken.
+
+So step 5 (the on-demand build after steps 2–4 miss) only runs on the
+`KTSTR_CARGO_TEST_MODE` path; the orchestrated path builds up front.
 
 **Fixes:**
 
-- Build the scheduler first: `cargo build -p scx_mitosis` (skipped
-  automatically if step 5 above can build it on demand, but
-  pre-building makes the first test run faster).
+- Build the scheduler first: `cargo build -p scx_mitosis` (on the
+  default `cargo ktstr test` path this build already runs
+  automatically before the pre-built probes, so pre-building only
+  primes the cache to make the first test run faster).
 - Set `KTSTR_SCHEDULER=/path/to/binary`.
 - Use `SchedulerSpec::Path` for an explicit path in `#[ktstr_test]`.
 
@@ -254,14 +266,16 @@ complete failure output format and auto-repro walkthrough.
 ## send_sys_rdy timeout
 
 ```text
-WARN ktstr::vmm::rust_init: ktstr-init: send_sys_rdy failed within boot budget; see https://likewhatevs.github.io/ktstr/guide/troubleshooting.html#send_sys_rdy-timeout budget_ms=11200 vcpus=8 elapsed_ms=11342 port_exists=false kern_addrs_sent=false
+WARN ktstr::vmm::rust_init: ktstr-init: send_sys_rdy failed within boot budget; see https://ktstr.dev/guide/troubleshooting.html#send_sys_rdy-timeout budget_ms=11200 vcpus=8 elapsed_ms=11342 port_exists=false kern_addrs_sent=false
 ```
 
 The guest-side `ktstr-init` sends a `MSG_TYPE_SYS_RDY` TLV frame
 through the virtio-console bulk port (`/dev/vport0p1`) after the
 VM boots, signaling the host monitor that the guest is ready. The
-retry loop polls for the port device at 100 ms cadence with a
-wall-clock deadline. When the deadline expires the WARN above
+retry loop waits for the port device via an inotify-evented watch
+on `/dev` (guard-railed at a 1 s cadence cap, not a poll), bounded
+by a wall-clock deadline; once the port appears, a failed send is
+retried with a 100 ms throttle capped by the remaining budget. When the deadline expires the WARN above
 fires, the guest continues running, and the host monitor falls
 through to its `data_valid` gate to start sampling without the
 SYS_RDY trigger; a late SYS_RDY arriving past the host's 5 s
@@ -571,7 +585,7 @@ free-form `error` string.
   `cargo ktstr kernel clean --corrupt-only --force`
 - Remove the corrupt entry along with everything else:
   `cargo ktstr kernel clean --force`
-- Rebuild a specific version after cleanup: `cargo ktstr kernel build --force 6.14.2`
+- Rebuild a specific version after cleanup: `cargo ktstr kernel build --force --kernel 6.14.2`
 - Override the cache directory via `KTSTR_CACHE_DIR` if the default
   location is on a problematic filesystem.
 - See [`cargo ktstr kernel clean`](running-tests/cargo-ktstr.md#kernel-clean)
@@ -638,8 +652,7 @@ is set to a real absolute path.
 ## Stale kconfig
 
 ```text
-warning: entries marked (stale kconfig) were built against a different ktstr.kconfig.
-Rebuild with: kernel build --force <entry version>
+warning: entries marked (stale kconfig) were built against a different ktstr.kconfig. Rebuild with: kernel build --force --kernel <entry version> (add --extra-kconfig PATH if the entry also carries the (extra kconfig) tag).
 ```
 
 `cargo ktstr kernel list` marks entries whose stored `ktstr_kconfig_hash`
@@ -718,7 +731,7 @@ For version-specific download errors (HTTP 404, HTML responses), see
   (reqwest respects these environment variables).
 - Override the cache directory via `KTSTR_CACHE_DIR` if the default
   location has insufficient space or permissions.
-- Pre-download a kernel explicitly: `cargo ktstr kernel build 6.14.10`
+- Pre-download a kernel explicitly: `cargo ktstr kernel build --kernel 6.14.10`
   to isolate whether the failure is in version resolution or download.
 
 ## Kernel download failures
@@ -749,7 +762,7 @@ RC tarball not found: https://git.kernel.org/torvalds/t/linux-6.15-rc3.tar.gz
 ```
 
 RC tarballs are removed from git.kernel.org after the stable version
-ships. Use `--git` with a git.kernel.org URL to clone the tag instead.
+ships. Use `--kernel git+URL#tag=NAME` with a git.kernel.org URL to clone the tag instead.
 
 ```text
 download ...: server returned HTML instead of tarball (URL may be invalid)
@@ -763,8 +776,8 @@ The download rejects these responses.
 - Check the suggested version in the error message.
 - Verify the version exists: check
   `https://www.kernel.org/releases.json` for available versions.
-- For RC releases, use `--git` with a git.kernel.org URL instead of
-  a tarball download.
+- For RC releases, use `--kernel git+URL#tag=NAME` with a
+  git.kernel.org URL instead of a tarball download.
 - Run `cargo ktstr kernel build` without a version to automatically
   fetch the latest stable.
 
@@ -810,47 +823,6 @@ contained no regular files. FIFOs, device nodes, and sockets are
 skipped during the walk.
 
 **Fix:** Verify the directory contains the files you expect.
-
-## Model load failed
-
-```text
-GGUF model load failed at /home/.../models/Qwen3-4B-Q4_K_M.gguf. The
-file may be corrupt or incompatible with the linked llama.cpp version
-— delete the file and re-run `cargo ktstr model fetch` to download
-a fresh copy. Check stderr for the upstream llama.cpp rejection reason.
-```
-
-The host-side LLM extraction backend (`OutputFormat::LlmExtract`)
-could not load the cached GGUF weights. The cached file is either
-corrupt (partial download, disk error) or incompatible with the
-linked llama.cpp version.
-
-**Diagnose:**
-
-- Re-run with `RUST_LOG=llama-cpp-2=info` (or `=debug` for more
-  detail) to surface llama.cpp's own rejection reason on stderr.
-  The first call to the inference engine routes
-  `llama_cpp_2::send_logs_to_tracing` events through the tracing
-  subscriber under target `"llama-cpp-2"` (literal hyphens — see
-  [Environment Variables](reference/environment-variables.md) for
-  the EnvFilter shape).
-- `cargo ktstr model status` reports the cache path and verdict
-  (`Matches`, `Mismatches`, `CheckFailed`, `NotCached`).
-
-**Fix:**
-
-- Delete the cached file and re-fetch:
-  `cargo ktstr model clean && cargo ktstr model fetch`. `clean`
-  removes both the GGUF artifact and its `.mtime-size` warm-cache
-  sidecar; `fetch` re-downloads from the pinned URL and SHA-checks
-  the result.
-- If `model status` reports `Mismatches`, the local file's hash
-  diverged from the pinned digest — re-run `cargo ktstr model fetch`,
-  which atomically re-downloads into a tempfile and renames it over
-  the corrupt cache entry (an explicit `clean` is only required under
-  `KTSTR_MODEL_OFFLINE`, which refuses the network re-fetch).
-- If you set `KTSTR_MODEL_OFFLINE=1`, unset it for the re-fetch.
-  See [`cargo ktstr model`](running-tests/cargo-ktstr.md#model).
 
 ## Flock timeout / NFS rejection
 

@@ -6,16 +6,22 @@
 //! pick named values out of `std::env::args()` without getting in the
 //! way of the harness's own flag handling.
 //!
-//! All helpers accept a `&[String]` slice and return either the first
-//! matching value or `None`. They are intentionally lenient: they only
-//! recognize the `--ktstr-*=VALUE` form (or, for `--ktstr-test-fn`,
+//! The `extract_*` helpers accept a `&[String]` slice and return the
+//! first matching value or `None`. They are intentionally lenient: they
+//! only recognize the `--ktstr-*=VALUE` form (or, for `--ktstr-test-fn`,
 //! also the space-separated form) and ignore unknown flags entirely.
 //! That keeps the dispatch path inert for binaries that aren't built
 //! against ktstr.
 //!
-//! [`resolve_cgroup_root`] is the one outlier: it sources the path from
-//! the initramfs-mounted `/sched_args` file first, then falls back to
-//! the process argv. Used only from guest-side dispatch to derive the
+//! The remaining helpers have their own signatures and flag namespace:
+//! [`current_work_type`] takes no argument (it reads `std::env::args()`
+//! itself) and returns a `String`; the `--cell-parent-cgroup` helpers
+//! ([`parse_cell_parent_cgroup`], [`cell_parent_path_is_valid`]) parse
+//! and validate that flag rather than the `--ktstr-*` form.
+//!
+//! [`resolve_cgroup_root`] is a further outlier: it sources the path
+//! from the initramfs-mounted `/sched_args` file first, then falls back
+//! to the process argv. Used only from guest-side dispatch to derive the
 //! cgroup manager root for the running test.
 
 /// Extract the test function name from `--ktstr-test-fn=NAME` or
@@ -175,6 +181,24 @@ pub(crate) fn extract_export_output_arg(args: &[String]) -> Option<&str> {
         }
     }
     None
+}
+
+/// The bare boolean flag that marks a guest run as a verifier-workload
+/// dispatch probe. Written onto the guest `run_args` by
+/// [`crate::verifier::collect_verifier_output`] and detected here by
+/// [`is_verifier_workload`]. Single source of truth so the writer (host
+/// dispatcher) and reader (guest init) never spell the flag by hand.
+pub(crate) const VERIFIER_WORKLOAD_FLAG: &str = "--ktstr-verifier-workload";
+
+/// Whether [`VERIFIER_WORKLOAD_FLAG`] is present in the argument list.
+/// Consumed at `ktstr_guest_init` Phase 5: instead of dispatching a
+/// `#[ktstr_test]` body (the verifier sweep VM has none) it runs the
+/// SpinWait dispatch probe and, on confirmed worker progress after the
+/// scheduler attaches, emits a
+/// [`crate::vmm::wire::LifecyclePhase::WorkloadDispatched`] frame. A bare
+/// boolean flag — presence is the whole signal, no value.
+pub(crate) fn is_verifier_workload(args: &[String]) -> bool {
+    args.iter().any(|a| a == VERIFIER_WORKLOAD_FLAG)
 }
 
 /// Canonical name for the cgroup-parent flag scx schedulers accept.
@@ -460,6 +484,26 @@ mod tests {
     fn extract_test_fn_arg_space_form_empty_args() {
         let args: Vec<String> = vec![];
         assert!(extract_test_fn_arg(&args).is_none());
+    }
+
+    // -- is_verifier_workload --
+
+    #[test]
+    fn is_verifier_workload_present() {
+        let args = vec!["/init".into(), VERIFIER_WORKLOAD_FLAG.to_string()];
+        assert!(is_verifier_workload(&args));
+    }
+
+    #[test]
+    fn is_verifier_workload_absent() {
+        let args = vec!["/init".into(), "--ktstr-test-fn=foo".into()];
+        assert!(!is_verifier_workload(&args));
+    }
+
+    #[test]
+    fn is_verifier_workload_empty_args() {
+        let args: Vec<String> = vec![];
+        assert!(!is_verifier_workload(&args));
     }
 
     // -- extract_probe_stack_arg --

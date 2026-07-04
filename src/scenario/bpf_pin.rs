@@ -56,7 +56,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 ///
 /// **Privilege**: requires `CAP_SYS_ADMIN`. The kernel gates
 /// `BPF_*_GET_NEXT_ID` and `BPF_MAP_GET_FD_BY_ID` on CAP_SYS_ADMIN
-/// unconditionally (`kernel/bpf/syscall.c:4741` and `:4849`),
+/// unconditionally (`kernel/bpf/syscall.c:4761` and `:4869`),
 /// independent of `CAP_BPF` (which only governs prog/map creation).
 /// ktstr always runs as root inside the guest VM so this is satisfied.
 pub fn open_bpf_map_fd_by_name(name: &str) -> Result<OwnedFd> {

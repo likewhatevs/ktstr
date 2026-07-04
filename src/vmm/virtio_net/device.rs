@@ -638,9 +638,9 @@ impl VirtioNet {
     /// `offset` (offset 0 = `mac[0]`). Reads past the populated layout
     /// return zero (virtio-v1.2 §4.2.2.2).
     pub(crate) fn config_bytes(&self, offset: usize, data: &mut [u8]) {
-        // SAFETY: `VirtioNetConfig` is `ByteValued` — every bit pattern
-        // of the underlying bytes is a valid value, so viewing it as a
-        // byte slice is sound.
+        // `VirtioNetConfig` is `ByteValued`, so `as_slice()` is a sound
+        // safe view over its bytes. (Not a `SAFETY:` note — the view is
+        // a safe call; SAFETY is reserved for unsafe blocks/impls.)
         let config_bytes = self.config.as_slice();
         for (i, byte) in data.iter_mut().enumerate() {
             *byte = config_bytes.get(offset + i).copied().unwrap_or(0);

@@ -578,9 +578,9 @@ fn iter_htab_entries_key_size_cap_returns_empty() {
 /// bytes. Uses direct-mapping (page_offset) for per-CPU addresses.
 ///
 /// Layout:
-///   0x0000..0x1000: page table pages (PGD/PUD/PMD/PTE)
-///   0x10000: bpf_array (containing pptrs at array_value offset)
-///   0x11000+: per-CPU value regions
+///   0x10000..0x13000: page table pages (PGD/PUD/PMD/PTE)
+///   0x14000: bpf_array (containing pptrs at array_value offset)
+///   0x20000+: per-CPU value regions
 ///   per_cpu_offsets[cpu] adjusts the percpu base to per-CPU data
 ///
 /// Returns (buffer, cr3_pa, page_offset, map_info, offsets, per_cpu_offsets).
@@ -1124,7 +1124,7 @@ fn read_percpu_array_kva_via_page_table() {
     //   0x12000: PMD
     //   0x13000: PTE -> percpu_base_pa
     //   0x14000: bpf_array (pptrs at array_value offset)
-    //   0x15000: PTE -> percpu_base_pa (planted percpu value)
+    //   0x15000: percpu_base_pa (planted percpu value)
     let pgd_pa: u64 = 0x10000;
     let pud_pa: u64 = 0x11000;
     let pmd_pa: u64 = 0x12000;
@@ -1205,7 +1205,7 @@ fn read_percpu_array_kva_via_page_table() {
     };
 
     // Direct-mapping math for the percpu KVA would yield
-    // percpu_base_kva - page_offset = 0x4900_0010_0000 — well
+    // percpu_base_kva - page_offset = 0x4080_0010_0000 — well
     // past the 0x16000 buffer end. The pre-fix path read this
     // out-of-bounds PA and emitted `None`.
     let page_offset: u64 = 0xFFFF_8880_0000_0000;

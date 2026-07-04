@@ -91,7 +91,6 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -102,8 +101,8 @@ use crate::vmm::disk_config::Filesystem;
 
 /// Cache subdirectory suffix passed to
 /// [`crate::cache::resolve_cache_root_with_suffix`]. Distinct from
-/// `"kernels"` (kernel image cache) and `"models"` (LLM cache) so
-/// the three flavors share a parent root via `KTSTR_CACHE_DIR` /
+/// `"kernels"` (kernel image cache) and `"cast_analysis"` (cast-analysis
+/// cache) so the three flavors share a parent root via `KTSTR_CACHE_DIR` /
 /// `XDG_CACHE_HOME` without colliding on filesystem paths.
 const CACHE_SUFFIX: &str = "disk_templates";
 
@@ -112,20 +111,6 @@ const TEMPLATE_FILENAME: &str = "template.img";
 
 /// Lockfile subdirectory name (per-key serialization).
 const LOCK_DIR_NAME: &str = ".locks";
-
-/// `FICLONE` ioctl command number per Linux uapi
-/// `include/uapi/linux/fs.h:312` — `_IOW(0x94, 9, int)`.
-///
-/// Generic ioctl encoding (shared by x86_64 and aarch64):
-/// `(_IOC_WRITE << 30) | (sizeof(int) << 16) | (0x94 << 8) | 9`
-/// = `0x40000000 | 0x40000 | 0x9400 | 9` = `0x40049409`.
-///
-/// This is the same value `reflink-0.1.3/src/sys/unix.rs:10`
-/// hardcodes (with a now-stale "is this equal on all archs?" TODO).
-/// Pinned here as a `const` so a future arch port can audit it
-/// against the host's `<asm/ioctl.h>` instead of grepping a
-/// transitive dep.
-const FICLONE_IOCTL: libc::c_ulong = 0x4004_9409;
 
 /// Maximum wall-clock duration to wait for a peer process holding
 /// the cache lockfile while it builds the template.
@@ -888,14 +873,15 @@ pub(crate) fn acquire_template_lock(key: &str) -> Result<std::os::fd::OwnedFd> {
 ///
 /// The realistic source of an `EEXIST` here is leftover staging
 /// debris from a previous run that crashed before unlinking its
-/// per-test fan-out file. The caller's tempfile name embeds a pid
-/// (mkstemp-style); a prior ktstr peer that crashed mid-test (SIGKILL,
+/// per-test fan-out file. The caller's dest name embeds a pid plus
+/// a timestamp-and-random suffix (`.per-test-<pid>-<ns>-<rnd>.img`);
+/// a prior ktstr peer that crashed mid-test (SIGKILL,
 /// host reboot, OOM kill, panic before the per-test cleanup ran)
 /// can leave its dest file in place. If the operating system later
 /// reuses the same pid for a new ktstr process and that process
 /// happens to generate a tempfile name colliding with the leaked
 /// file's name, the `O_EXCL` open trips on the leftover. PID reuse
-/// alone does not collide — the mkstemp randomization disambiguates
+/// alone does not collide — the timestamp+random suffix disambiguates
 /// most cases — but the check is `O_EXCL` precisely to surface the
 /// rare collision as a hard error rather than a silent overwrite.
 ///
@@ -963,13 +949,12 @@ pub(crate) fn clone_to_per_test(src_path: &Path, dest_path: &Path) -> Result<Fil
         .create_new(true)
         .open(dest_path)
         .with_context(|| format!("open dest path {dest_path:?} for FICLONE"))?;
-    // SAFETY: ioctl FICLONE takes (dest_fd, FICLONE, src_fd) per
-    // Linux uapi. Both fds are valid for the duration of the call;
-    // ioctl does not retain them. The kernel returns 0 on success
-    // and -1 with errno set on failure.
-    let rc = unsafe { libc::ioctl(dest.as_raw_fd(), FICLONE_IOCTL, src.as_raw_fd()) };
-    if rc != 0 {
-        let err = io::Error::last_os_error();
+    // Reflink the template into the per-test dest via the shared FICLONE
+    // inner. Unlike reflink_or_copy, the per-test backing MUST be a
+    // copy-on-write clone (a byte copy would defeat the fan-out and blow up
+    // per-test disk usage), so ANY error hard-bails rather than falling back
+    // — verify_cache_dir_supports_reflink already pre-checked the fs.
+    if let Err(err) = crate::reflink::ficlone(&dest, &src) {
         // Best-effort cleanup of the half-written dest file.
         let _ = std::fs::remove_file(dest_path);
         return Err(anyhow!(
@@ -1141,6 +1126,11 @@ fn locate_host_binary(name: &str, package_hint: &str) -> Result<PathBuf> {
 /// then pass the returned path to [`clone_to_per_test`] for the
 /// per-test reflink clone.
 pub(crate) fn ensure_template(fs: Filesystem, capacity_bytes: u64) -> Result<PathBuf> {
+    // Reclaim dead-pid staging / per-test debris from crashed prior runs,
+    // once per process, BEFORE the cache-hit early-return below so a run
+    // that only hits the template cache (but still creates per-test backing
+    // files) also GCs. See sweep_cache_debris_once.
+    sweep_cache_debris_once();
     // Resolve the host mkfs binary up front and query its version
     // fingerprint so the cache key reflects which mkfs would build
     // the template if we miss. The PATH lookup here is cheap (one
@@ -1203,6 +1193,23 @@ pub(crate) fn ensure_template(fs: Filesystem, capacity_bytes: u64) -> Result<Pat
         }
     };
     Ok(final_path)
+}
+
+/// Reclaim disk-template cache debris orphaned by dead-pid prior runs
+/// (staging images + per-test FICLONE backing files), ONCE per process.
+/// Runs at the top of [`ensure_template`] — before its cache-hit
+/// early-return — so even a run that only hits the template cache (but
+/// creates per-test backing files) still GCs. Best-effort: a cache-root
+/// resolution failure or sweep error is ignored (a later run reclaims the
+/// debris, and `clean_orphaned_tmp_dirs` is dead-pid gated so it never
+/// removes a live run's in-flight file).
+fn sweep_cache_debris_once() {
+    static SWEEP_ONCE: std::sync::Once = std::sync::Once::new();
+    SWEEP_ONCE.call_once(|| {
+        if let Ok(root) = cache_root() {
+            let _ = cleanup::clean_orphaned_tmp_dirs(&root);
+        }
+    });
 }
 
 /// Compose the staging-image path for a `(cache_key, pid)` pair.

@@ -655,7 +655,7 @@ fn task_field_read_u32_returns_exact_value() {
 /// can't close.
 #[test]
 fn task_field_read_nonkey_roundtrips_distinct_value() {
-    // Non-zero so the `start_boottime != 0` validation (L7) still
+    // Non-zero so the `start_boottime != 0` validation (L8) still
     // passes after the write, and distinct from TF_PID so a read that
     // echoed the walk key would fail this assertion.
     const BOOTTIME_SENTINEL: u64 = 0xDEAD_BEEF_0000_1234;

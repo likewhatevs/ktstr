@@ -446,8 +446,8 @@ impl<'a> BpfMapProjector<'a> {
             };
             let entry = map.at(self.entry_index);
             // Walk the entry's value — SnapshotEntry doesn't expose its
-            // struct members directly, but the rendered_value() accessor
-            // on the field-with-empty-path does.
+            // struct members directly, but get("") returns the struct value
+            // (walk_dotted_path returns Value(root) for an empty path).
             if let SnapshotField::Value(crate::monitor::btf_render::RenderedValue::Struct {
                 members,
                 ..
@@ -1043,8 +1043,9 @@ mod tests {
 
     /// Empty series — no rows to discover member names from, so
     /// `member_names()` returns an empty vec and both auto-projectors
-    /// yield empty results without panicking. Pins the "no first
-    /// row" branch in `BpfMapProjector::member_names`.
+    /// yield empty results without panicking. Pins the zero-row
+    /// iteration path in `BpfMapProjector::member_names` (the loop over
+    /// `self.series.rows` runs zero times and returns an empty vec).
     #[test]
     fn bpf_map_projector_field_helpers_empty_series_yields_empty_vec() {
         let series = SampleSeries::empty();

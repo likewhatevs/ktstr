@@ -4,18 +4,18 @@
 //! These tests DO NOT boot a VM — they exercise the pure-data
 //! flat-metric lookup helpers (`find_metric`, `has_metric`,
 //! `count_indexed_metrics`) plus the `ThreadLookup::ExceedsCap`
-//! saturated-scan case. The helpers live inline in
-//! `jemalloc_probe_tests.rs` because they close over file-private
-//! names (`PayloadMetrics`, `Metric`) and the probe-specific key
-//! conventions; duplicating the small helper bodies here lets the
+//! saturated-scan case. Production versions of these helpers live
+//! in `src/test_support/probe_metrics.rs` (re-exported via
+//! `test_support`); this file holds standalone local copies so the
 //! unit tests live in a clean-slate integration-test file without
 //! the ktstr early-dispatch ctor hiding `#[test]` fns behind the
 //! `--list` intercept (see the module doc on
-//! `jemalloc_probe_tests.rs` for the intercept rationale).
+//! `jemalloc_alloc_worker_exit_codes.rs` for the intercept
+//! rationale).
 
-use ktstr::test_support::{Metric, MetricSource, MetricStream, PayloadMetrics, Polarity};
+use ktstr::test_support::{Metric, MetricStream, PayloadMetrics, Polarity};
 
-// --- Helpers (mirrors of the inline helpers in `jemalloc_probe_tests.rs`) ---
+// --- Helpers (standalone copies of ktstr::test_support::probe_metrics helpers) ---
 
 fn find_metric<'a>(metrics: &'a PayloadMetrics, key: &str) -> Option<&'a Metric> {
     metrics.metrics.iter().find(|m| m.name == key)
@@ -40,7 +40,7 @@ where
     n
 }
 
-// --- Mirror of the ThreadLookup shape + lookup used in probe tests ---
+// --- Local simplified ThreadLookup + scan used by the tests below ---
 
 #[derive(Debug, PartialEq, Eq)]
 enum ThreadLookup {
@@ -77,7 +77,6 @@ fn metric(name: &str, value: f64) -> Metric {
         value,
         polarity: Polarity::Unknown,
         unit: String::new(),
-        source: MetricSource::Json,
         stream: MetricStream::Stdout,
     }
 }

@@ -120,8 +120,8 @@ where
 pub struct ProgVerifierStats {
     /// Program name as registered with the kernel.
     pub name: String,
-    /// Instructions accepted by the verifier (from
-    /// `bpf_prog_aux->verified_insns`).
+    /// Instructions processed by the verifier (path-exploration count,
+    /// not static program size), from `bpf_prog_aux->verified_insns`.
     pub verified_insns: u32,
 }
 
@@ -710,7 +710,7 @@ pub struct GuestMemProgAccessor<'a> {
     prog_idr_kva: u64,
     /// Borrowed from the caller. Mirrors the
     /// [`super::bpf_map::GuestMemMapAccessor`] pattern:
-    /// `BpfProgOffsets` is a ~160-byte POD built once from the
+    /// `BpfProgOffsets` is a ~112-byte POD built once from the
     /// vmlinux BTF, and every hot-path method reads it by reference,
     /// so owning it in the accessor would charge a clone that serves
     /// no purpose.
@@ -824,7 +824,7 @@ impl GuestMemProgAccessorOwned {
 
     /// Borrow as a [`GuestMemProgAccessor`] for program operations.
     ///
-    /// Infallible — `new` already resolved `prog_idr_kva` and the
+    /// Infallible — `finish` already resolved `prog_idr_kva` and the
     /// borrow returns the cached KVA directly. Mirrors
     /// [`super::bpf_map::GuestMemMapAccessorOwned::as_accessor`].
     pub fn as_accessor(&self) -> GuestMemProgAccessor<'_> {
@@ -924,7 +924,7 @@ mod tests {
     }
 
     /// All three counters use `saturating_add` in
-    /// [`read_prog_runtime_stats`] when summing per-CPU slots, so a
+    /// [`walk_struct_ops_runtime_stats`] when summing per-CPU slots, so a
     /// long-running guest with a hot BPF program (or scrambled
     /// per-CPU pages from an unmapped slot) can produce a `u64::MAX`
     /// sum instead of wrapping. Pinning the wire shape here proves

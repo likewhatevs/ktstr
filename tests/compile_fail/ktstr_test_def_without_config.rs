@@ -1,7 +1,7 @@
 // A scheduler with `config_file_def` set, paired with a `#[ktstr_test]`
 // that omits `config = ...`, must fail at compile time. The macro emits
-// a `const _: () = { ... };` block that const-evaluates
-// `(scheduler).config_file_def().is_some()` against the macro-known
+// a `const <name>: () = { ... };` block that const-evaluates
+// `(scheduler).config_file_def.is_some()` against the macro-known
 // `config_set` flag and panics when the def is present but no content
 // was supplied.
 use ktstr::ktstr_test;

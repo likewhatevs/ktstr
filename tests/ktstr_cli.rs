@@ -94,9 +94,8 @@ fn help_kernel_build() {
         .args(["kernel", "build", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--source"))
-        .stdout(predicate::str::contains("--git"))
-        .stdout(predicate::str::contains("--ref"))
+        .stdout(predicate::str::contains("--kernel"))
+        .stdout(predicate::str::contains("git+URL"))
         .stdout(predicate::str::contains("--force"))
         .stdout(predicate::str::contains("--clean"))
         // `--skip-sha256` is a security-sensitive bypass flag — it
@@ -315,7 +314,8 @@ fn kernel_list_json() {
 // Replaces two source-scanning tests (`eol_legend_emits_via_eprintln`
 // and `kernel_list_footer_ordering_pin`) that previously used
 // `include_str!("cli.rs")` + a hand-rolled brace-balanced matcher to
-// static-analyze the cli.rs source for legend emit sites. The new
+// static-analyze the src/cli/kernel_list.rs source for legend emit
+// sites. The new
 // tests exercise the real binary against a fixture cache and assert
 // against captured stdout/stderr — the actual behaviour operators
 // observe, not the source-form of the code that produces it.
@@ -341,8 +341,9 @@ fn kernel_list_json() {
 // and a version string that survives the active-prefixes filter. The
 // old source-pattern test pinned all four via static analysis; these
 // integration tests pin the three we can fixture deterministically
-// offline, and the in-source block comment + per-helper unit tests
-// in cli.rs continue to cover EOL's design.
+// offline, and the in-source block comment (src/cli/kernel_list.rs)
+// + per-helper `*_legend_if_any` unit tests (src/cli/kernel_cmd.rs)
+// continue to cover EOL's design.
 
 /// Helper: write a valid-shape metadata.json to `dir` with the given
 /// `ktstr_kconfig_hash` (None = untracked, Some(non-matching) = stale).
@@ -426,7 +427,8 @@ fn kernel_list_legends_emit_on_stderr() {
 
     // Each of the three offline-fixturable legends must appear in
     // stderr. The exact wording comes from the *_EXPLANATION consts
-    // / format_corrupt_footer body in cli.rs; pinning a stable
+    // / format_corrupt_footer body in src/cli/kernel_cmd.rs; pinning a
+    // stable
     // substring from each catches a reword at the CLI boundary
     // without over-specifying the full string.
     for needle in [
@@ -496,7 +498,8 @@ fn kernel_list_legend_ordering_pins_untracked_stale_corrupt() {
         "stale legend must precede corrupt footer — informational \
          trio (EOL/untracked/stale) comes before the operationally-\
          disruptive corrupt entry per the emission block comment in \
-         cli.rs. stale at byte {i_stale}, corrupt at {i_corrupt}:\n{stderr}",
+         src/cli/kernel_list.rs. stale at byte {i_stale}, corrupt at \
+         {i_corrupt}:\n{stderr}",
     );
 
     // EOL ordering: only enforceable when the fixture's version
@@ -528,7 +531,7 @@ fn kernel_list_legend_ordering_pins_untracked_stale_corrupt() {
 
 /// `ktstr shell --no-perf-mode --cpu-cap N` under
 /// KTSTR_BYPASS_LLC_LOCKS=1 must fail with "resource contract" in
-/// the error. Pins the rejection at bin/ktstr.rs:577.
+/// the error. Pins the rejection at src/bin/ktstr.rs:1268.
 #[test]
 fn ktstr_shell_cpu_cap_with_bypass_errors() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -543,7 +546,7 @@ fn ktstr_shell_cpu_cap_with_bypass_errors() {
 
 /// `ktstr kernel build --cpu-cap N` under
 /// KTSTR_BYPASS_LLC_LOCKS=1 must fail with "resource contract" in
-/// the error. Pins the rejection at bin/ktstr.rs:298.
+/// the error. Pins the rejection at src/bin/ktstr.rs:653.
 #[test]
 fn ktstr_kernel_build_cpu_cap_with_bypass_errors() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -553,7 +556,7 @@ fn ktstr_kernel_build_cpu_cap_with_bypass_errors() {
         .args([
             "kernel",
             "build",
-            "--source",
+            "--kernel",
             "/nonexistent/ktstr-ktstr-cpu-cap-bypass-test",
             "--cpu-cap",
             "2",
@@ -563,9 +566,30 @@ fn ktstr_kernel_build_cpu_cap_with_bypass_errors() {
         .stderr(predicate::str::contains("resource contract"));
 }
 
+/// `ktstr kernel build --kernel <cache-key>` is rejected: a cache key
+/// names an already-built entry, so there is nothing to build. Mirrors
+/// `cargo_ktstr_kernel_build_cache_key_rejected` for the `ktstr`
+/// binary's `anyhow::bail!` CacheKey arm.
+#[test]
+fn ktstr_kernel_build_cache_key_rejected() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .args([
+            "kernel",
+            "build",
+            "--kernel",
+            "6.14.2-tarball-x86_64-kcabc123",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cache key"))
+        .stderr(predicate::str::contains("nothing to build"));
+}
+
 /// Library-layer fallback via `ktstr shell --no-perf-mode` under
 /// `KTSTR_CPU_CAP` + `KTSTR_BYPASS_LLC_LOCKS`. This exercises the
-/// KtstrVmBuilder::build site at vmm/mod.rs:3866 — the CLI binary
+/// KtstrVmBuilder::build site at src/vmm/builder.rs:1203 — the CLI binary
 /// checks KTSTR_BYPASS against the --cpu-cap FLAG, but a consumer
 /// setting KTSTR_CPU_CAP env + KTSTR_BYPASS_LLC_LOCKS env (no
 /// --cpu-cap flag) flows through the library-layer check instead.

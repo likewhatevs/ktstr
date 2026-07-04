@@ -186,7 +186,7 @@ volatile const bool ktstr_enabled = false;
  *        translate the .bss map's `value_kva` plus the BTF-
  *        resolved field offset to a guest physical address (the
  *        same translation the freeze coordinator does at
- *        vmm/mod.rs:`load_probe_bss_offset` +
+ *        vmm/vcpu.rs:`load_probe_bss_offset` +
  *        `translate_any_kva`), then zero the byte at that PA in
  *        the host-mapped `GuestMem`. The libbpf API is NOT
  *        available from host code outside the guest — only the
@@ -224,7 +224,7 @@ volatile u32 ktstr_err_exit_detected = 0;
 u64 ktstr_last_trigger_ts = 0;
 
 /* Forward-compat shadow of `struct scx_event_stats` (13 s64 counters,
- * kernel/sched/ext_internal.h:867). Uses the `___fwd` CO-RE naming
+ * kernel/sched/ext_internal.h:868). Uses the `___fwd` CO-RE naming
  * convention so the definition compiles on kernels where vmlinux.h
  * only carries a forward declaration of the type (pre-6.16 kernels
  * that lack the `scx_bpf_events` kfunc). libbpf strips the `___fwd`
@@ -296,20 +296,20 @@ struct scx_event_stats___fwd ktstr_exit_event_stats = {};
  * resolves these vars by name via the probe's BTF Datasec walk and
  * uses them as a fallback for `read_scx_sched_state` when the live
  * `*scx_root` deref returns NULL — which happens during the narrow
- * teardown window where `scx_unregister` has already nulled the
+ * teardown window where `scx_root_disable` has already nulled the
  * root pointer but the failure dump is still in flight.
  *
  * The kernel writes `*scx_root` to NULL during scheduler teardown
- * (kernel/sched/ext.c::scx_unregister); a freeze that fires AFTER
+ * (kernel/sched/ext.c::scx_root_disable); a freeze that fires AFTER
  * the err exit but BEFORE the kernel reaches the next idle would
  * still see the populated `*scx_root` and read live state. A freeze
- * delayed past `scx_unregister` (slow guest, contended lock, etc.)
+ * delayed past `scx_root_disable` (slow guest, contended lock, etc.)
  * would observe `*scx_root == 0` and lose every scheduler scalar —
  * `aborting`, `bypass_depth`, `exit_kind`, `watchdog_timeout`. The
  * snapshot below is captured BEFORE the scheduler reaches the
  * teardown path because the BPF tp_btf handler fires from inside
- * `scx_claim_exit` (kernel/sched/ext.c:9210) — well before
- * `scx_unregister` runs. So the values written here represent the
+ * `scx_claim_exit` (kernel/sched/ext.c:6074) — well before
+ * `scx_root_disable` runs. So the values written here represent the
  * scheduler at the instant it errored out, even if `*scx_root` has
  * been nulled by the time the host reads guest memory.
  *
@@ -387,7 +387,7 @@ u64 ktstr_miss_log[MAX_MISS_LOG] = {};
 u32 ktstr_miss_log_idx = 0;
 
 /* `scx_bpf_events` kfunc declaration. Kernel definition lives at
- * `kernel/sched/ext.c:9417`; the kfunc takes a writable pointer
+ * `kernel/sched/ext.c:9706`; the kfunc takes a writable pointer
  * to a `struct scx_event_stats` plus its size (the kernel uses
  * `min(events__sz, sizeof(*events))` so passing a smaller-or-equal
  * size is always safe, but the `__sz` suffix is required by the BPF
@@ -642,7 +642,7 @@ int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
 	 *
 	 * Use `bpf_probe_read_kernel` to read the live `*scx_root`
 	 * pointer rather than a direct dereference — the kernel pointer
-	 * could be racing with `scx_unregister`'s NULL store. The probe
+	 * could be racing with `scx_root_disable`'s NULL store. The probe
 	 * read returns the pointer value at the read instant; the
 	 * subsequent BPF_CORE_READ chain on `sched` then reads the
 	 * scheduler scalars via the same atomicity guarantee.
@@ -814,12 +814,13 @@ int BPF_PROG(ktstr_tl_migrate, struct task_struct *p, int dest_cpu)
 		return 0;
 	}
 
-	/* `task_cpu(p)` is `p->thread_info.cpu` on x86 / `p->cpu` on
-	 * older arches, so use BPF_CORE_READ on the wrapper field
-	 * `wake_cpu` which the kernel keeps in lockstep with the
-	 * scheduler's last-CPU view (see kernel/sched/core.c
-	 * `set_task_cpu`). `wake_cpu` is on `task_struct` directly,
-	 * so the read is a single dereference regardless of arch. */
+	/* Read the `wake_cpu` field directly with BPF_CORE_READ.
+	 * `wake_cpu` is the wakeup placement hint on `task_struct`
+	 * (set in the ttwu / migrate-swap paths, e.g. kernel/sched/core.c
+	 * `__migrate_swap_task` and `sched_fork`); it differs from
+	 * `task_cpu(p)` (`task_thread_info(p)->cpu`, which `set_task_cpu`
+	 * updates). It is on `task_struct` directly, so the read is a
+	 * single dereference regardless of arch. */
 	e->type     = TL_EVT_MIGRATE;
 	e->cpu      = bpf_get_smp_processor_id();
 	e->ts       = bpf_ktime_get_ns();
@@ -887,11 +888,12 @@ int BPF_PROG(ktstr_tl_wakeup, struct task_struct *p)
  * registered before tests start, but rt_mutex_setprio can fire
  * during early kernel boot (e.g. systemd's PI-using mutexes).
  *
- * Sparse by design: `rt_mutex_setprio` is only invoked from the
- * rt_mutex chain-walk path (kernel/locking/rtmutex.c
- * `task_blocks_on_rt_mutex` -> `rt_mutex_adjust_prio_chain` ->
- * `rt_mutex_setprio`) plus a single call from `do_set_cpus_allowed`
- * for affinity changes, so steady-state fire count is zero on a
+ * Sparse by design: `rt_mutex_setprio` has a single direct caller,
+ * `rt_mutex_adjust_prio` (kernel/locking/rtmutex.c), which in turn
+ * runs from the rt_mutex chain-walk / waiter paths
+ * (`task_blocks_on_rt_mutex`, `rt_mutex_adjust_prio_chain`,
+ * `remove_waiter`, `mark_wakeup_next_waiter`), so steady-state fire
+ * count is zero on a
  * test that does not exercise rt_mutex contention. The 1024-entry
  * `pi_scratch` map is amply sized for realistic concurrency.
  */
@@ -966,9 +968,11 @@ int BPF_PROG(ktstr_pi_fexit, struct task_struct *p,
 /*
  * Lock contention begin tracepoint (#63).
  *
- * `tp_btf/contention_begin` fires from `kernel/locking/lockdep.c`
- * (`lock_contended` -> `__lock_contended` -> `trace_contention_begin`)
- * whenever a waiter blocks on a contended lock. The tracepoint is
+ * `tp_btf/contention_begin` fires from the lock primitives under
+ * `kernel/locking/` (mutex.c, rwsem.c, qspinlock.c, qrwlock.c,
+ * rtmutex.c, percpu-rwsem.c, semaphore.c, rwbase_rt.c) which call
+ * `trace_contention_begin` directly — NOT from lockdep.c — whenever
+ * a waiter blocks on a contended lock. The tracepoint is
  * unconditionally available in mainline — `CONFIG_LOCK_STAT` is NOT
  * a gate (only the trace_pipe / debugfs surface depends on it; the
  * tp_btf attach point is always present per

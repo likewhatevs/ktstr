@@ -13,7 +13,8 @@
 //!
 //! All three sit in `.data..percpu` symbols (`kernel_cpustat`, `kstat`,
 //! `tick_cpu_sched`); the dump path resolves the symbols via
-//! `super::symbols::KernelSymbols::cpu_time_symbols` and adds
+//! `super::super::symbols::KernelSymbols::from_elf` (which populates the
+//! `kernel_cpustat` / `kstat` / `tick_cpu_sched` fields) and adds
 //! `__per_cpu_offset[cpu]` per CPU.
 
 use anyhow::Result;
@@ -138,17 +139,18 @@ const _: () = {
 /// (`kernel_cpustat`, `kstat`, `tick_cpu_sched`). Per-CPU symbols
 /// carry section-relative offsets in vmlinux's symtab; the per-CPU
 /// KVA for CPU `n` is `<symbol> + __per_cpu_offset[n]` —
-/// `super::super::symbols::KernelSymbols::cpu_time_symbols` resolves the
-/// symbols and the dump path adds `__per_cpu_offset[cpu]` per CPU.
+/// `super::super::symbols::KernelSymbols::from_elf` resolves the
+/// symbols (into the `kernel_cpustat` / `kstat` / `tick_cpu_sched`
+/// fields) and the dump path adds `__per_cpu_offset[cpu]` per CPU.
 ///
 /// Field-presence semantics: a kernel without sched_ext omits no
 /// field captured here, but a kernel built without
 /// `CONFIG_NO_HZ_COMMON` drops `tick_sched`. The offset resolver
 /// reports `tick_sched_iowait_sleeptime` as `Some` only when the
-/// type is present. Callers that observe `None` skip the
-/// `iowait_sleeptime` capture and surface `nr_iowait` (an atomic
-/// counter on `struct rq` that the existing scx walker already
-/// reads) instead.
+/// type is present. When `tick_sched_iowait_sleeptime` is `None`,
+/// `collect_per_cpu_time` leaves
+/// `super::super::dump::PerCpuTimeStats::iowait_sleeptime_ns` as `None`
+/// (no fallback source).
 #[derive(Debug, Clone, Copy)]
 pub struct CpuTimeOffsets {
     /// Offset of `cpustat[]` (the `u64[NR_STATS]` array) within

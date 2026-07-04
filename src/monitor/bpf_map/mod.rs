@@ -1199,10 +1199,10 @@ fn resolve_to_struct_with_id(btf: &btf_rs::Btf, type_id: u32) -> Option<(btf_rs:
 /// a snapshot-style read API used by the failure-dump renderer and
 /// any future read-only consumer.
 ///
-/// One implementation lives in this crate today; a second backend is
-/// planned (live-host introspection via the `bpf()` syscall — see
-/// the live-host introspection task in the project queue) and will
-/// plug into the same trait surface.
+/// Two implementations exist today: `GuestMemMapAccessor` (this
+/// module — reads a frozen guest VM's physical memory) and
+/// `super::bpf_syscall::BpfSyscallAccessor` (live-host introspection
+/// via the `bpf()` syscall). Both plug into this trait surface.
 ///
 /// - `GuestMemMapAccessor` — reads from a frozen guest VM's physical
 ///   memory via PTE walks against the frozen `init_mm`. Used by the
@@ -1215,10 +1215,10 @@ fn resolve_to_struct_with_id(btf: &btf_rs::Btf, type_id: u32) -> Option<(btf_rs:
 ///   CPUs surface as `None` rather than aliasing CPU 0 (see
 ///   `read_percpu_array_value`).
 ///
-/// The planned live-host backend will produce identical
+/// The live-host backend produces identical
 /// [`BpfMapInfo`] / byte buffers, so the rendering pipeline
 /// (`super::btf_render::render_value`) stays data-source-agnostic
-/// and will consume either accessor through this trait. The
+/// and consumes either accessor through this trait. The
 /// live-host backend's failure modes are different (e.g. hash reads
 /// will rely on the kernel's RCU read-side critical section,
 /// `bpf_map_lookup_elem` rejection for non-readable types) and
@@ -1227,9 +1227,9 @@ fn resolve_to_struct_with_id(btf: &btf_rs::Btf, type_id: u32) -> Option<(btf_rs:
 /// `dump_state` currently takes a concrete
 /// `GuestMemMapAccessor` because its sdt_alloc post-pass walks
 /// the underlying `super::guest::GuestKernel` — that handle is
-/// not part of the trait surface. When the live-host backend lands
-/// (and sdt_alloc walking moves into a backend-specific path),
-/// `dump_state` will switch to `&dyn BpfMapAccessor`. Other call
+/// not part of the trait surface. Once sdt_alloc walking moves
+/// into a backend-specific path, `dump_state` can switch to
+/// `&dyn BpfMapAccessor`. Other call
 /// sites that need only the trait surface can already bind on
 /// `&dyn BpfMapAccessor` (or `<A: BpfMapAccessor>`) without paying
 /// virtual dispatch.
@@ -1238,10 +1238,10 @@ pub trait BpfMapAccessor {
     /// Enumerate every BPF map visible to this accessor.
     ///
     /// Order is implementation-defined: the guest-memory backend walks
-    /// `map_idr` (allocation order); the planned bpf-syscall backend
-    /// will walk the kernel's id space via `BPF_MAP_GET_NEXT_ID` (also
-    /// allocation order, modulo concurrent destruction races on the
-    /// live host). Callers that want a stable view should sort by name.
+    /// `map_idr` (allocation order); the bpf-syscall backend walks the
+    /// kernel's id space via `BPF_MAP_GET_NEXT_ID` (also allocation
+    /// order, modulo concurrent destruction races on the live host).
+    /// Callers that want a stable view should sort by name.
     fn maps(&self) -> Vec<BpfMapInfo>;
 
     /// Find the first BPF map whose name ends with `name_suffix`.
@@ -1261,8 +1261,8 @@ pub trait BpfMapAccessor {
     /// [`Self::read_arena_pages`]; HASH — use [`Self::iter_hash_map`])
     /// or when the backing read fails. The guest-memory backend's
     /// failure modes are unmapped guest pages and out-of-range value
-    /// regions; the planned bpf-syscall backend will additionally
-    /// surface `bpf_map_lookup_elem` rejection (e.g. `-EINVAL` on
+    /// regions; the bpf-syscall backend additionally surfaces
+    /// `bpf_map_lookup_elem` rejection (e.g. `-EINVAL` on
     /// arena maps, kernel-side ACL denials).
     fn read_value(&self, map: &BpfMapInfo, offset: usize, len: usize) -> Option<Vec<u8>>;
 
@@ -1354,7 +1354,7 @@ pub trait BpfMapAccessor {
     /// when the per-CPU slot is readable; `None` when it isn't (e.g.
     /// an out-of-range CPU index — `__per_cpu_offset[cpu]` reads as
     /// the BSS-zero sentinel — or an unmapped page on the
-    /// guest-memory path; the planned bpf-syscall backend surfaces
+    /// guest-memory path; the bpf-syscall backend surfaces
     /// out-of-range CPU on `bpf_map_lookup_elem` failure). Returns an
     /// empty vec for non-PERCPU_ARRAY maps or `key >= max_entries`.
     fn read_percpu_array(&self, map: &BpfMapInfo, key: u32, num_cpus: u32) -> Vec<Option<Vec<u8>>>;
@@ -1363,10 +1363,10 @@ pub trait BpfMapAccessor {
     ///
     /// `arena_offsets` resolves kernel struct field offsets the
     /// guest-memory backend uses to walk `bpf_arena -> kern_vm ->
-    /// vm_struct.addr`; the planned bpf-syscall backend will mmap the
-    /// arena fd directly (the only data path the kernel exposes —
-    /// arena's `lookup_elem` returns `-EINVAL`, see
-    /// `kernel/bpf/arena.c`) and ignore `arena_offsets`. The default
+    /// vm_struct.addr`; the bpf-syscall backend mmaps the arena fd
+    /// directly (the only data path the kernel exposes — arena's
+    /// `lookup_elem` returns `-EINVAL`, see `kernel/bpf/arena.c`)
+    /// and ignores `arena_offsets`. The default
     /// implementation returns an empty snapshot; backends override to
     /// produce real content.
     fn read_arena_pages(

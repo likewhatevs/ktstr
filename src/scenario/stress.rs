@@ -172,7 +172,7 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
 /// Uses spawn_diverse helper for 5 different workload types across cgroups.
 /// Dynamic cgroup count and workload rotation logic is not Op/Step compatible.
 pub fn custom_cgroup_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
-    // All workload types across 5 cgroups, no flags. Exercises base dispatch with every work pattern.
+    // 5 diverse workload types (SpinWait, Bursty, IoSyncWrite, Mixed, YieldHeavy) across 5 cgroups, no flags. Exercises base dispatch across the diverse work-type set.
     if ctx.topo.all_cpus().len() < 6 {
         return Ok(AssertResult::skip("need >=6 CPUs for 5 cgroups"));
     }
@@ -190,7 +190,7 @@ pub fn custom_cgroup_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
 
 /// Uses spawn_diverse for workload variety + manual cpuset partitioning.
 pub fn custom_cgroup_cpuset_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
-    // All workload types with cpusets.
+    // 3 diverse workload types (SpinWait, Bursty, IoSyncWrite) across 3 cpuset-partitioned cgroups.
     let all = ctx.topo.all_cpus();
     if all.len() < 6 {
         return Ok(AssertResult::skip("need >=6 CPUs"));
@@ -286,7 +286,9 @@ pub fn custom_cgroup_cpuset_cross_llc_race(ctx: &Ctx) -> Result<AssertResult> {
         return Ok(AssertResult::skip("LLC1 has no CPUs"));
     }
 
-    // Reserve one CPU from LLC0 for cg_0 to avoid cg_0-starvation.
+    // Hold one LLC0 CPU out of both cgroups' cpusets: it is filtered
+    // from llc0 below and never appears in llc0/llc1/cross0/cross1, so
+    // the cross-LLC flip never packs every LLC0 CPU, leaving host headroom.
     let reserved = *llc0_full.iter().next().unwrap();
     let llc0: BTreeSet<usize> = llc0_full
         .iter()

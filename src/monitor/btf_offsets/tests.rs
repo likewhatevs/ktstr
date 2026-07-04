@@ -855,9 +855,9 @@ fn load_btf_symlink_into_cache_writes_sidecar_in_cache_only() {
     let lexical_sidecar = btf_sidecar_path(&symlink_path);
 
     // Load via the symlink path. Post-fix, canonicalize at the
-    // top of load_btf_from_path resolves the symlink so the
-    // sidecar writes to <cache>/kentry/vmlinux.btf next to the
-    // real file. Pre-fix this flow missed the cache entirely:
+    // top of load_btf_from_bytes_inner (reached via
+    // load_btf_from_path) resolves the symlink so the sidecar
+    // writes to <cache>/kentry/vmlinux.btf next to the real file. Pre-fix this flow missed the cache entirely:
     // lexical parent (<source-tree>) canonicalizes outside the
     // cache, the membership gate returns false, and the sidecar
     // is suppressed for what is, after symlink resolution, a
@@ -1550,9 +1550,10 @@ fn parse_ringbuf_offsets_from_vmlinux() {
         rb.rbm_rb > 0,
         "bpf_ringbuf_map.rb must follow embedded bpf_map"
     );
-    // The four position fields live on bpf_ringbuf, which starts
-    // with mask. Beyond that, every field must be at a distinct
-    // offset since they're back-to-back u64/unsigned long fields.
+    // The four position fields live on bpf_ringbuf. mask sits
+    // after waitq/work (nonzero offset); consumer_pos and
+    // producer_pos are each PAGE_SIZE-aligned, and pending_pos
+    // follows producer_pos. All four offsets are distinct.
     let position_fields = [
         rb.rb_mask,
         rb.rb_consumer_pos,
@@ -1569,11 +1570,11 @@ fn parse_ringbuf_offsets_from_vmlinux() {
             );
         }
     }
-    // Spacing sanity: consumer/producer/pending are placed on
-    // separate cachelines per the kernel layout (each at >= 4096
-    // bytes apart in modern kernels for false-sharing avoidance).
-    // Don't pin the exact spacing — just ensure the layout is
-    // monotonically nonzero past mask.
+    // Spacing sanity: consumer_pos and producer_pos are each
+    // PAGE_SIZE-aligned so each position can be mapped with
+    // distinct permissions; pending_pos deliberately shares
+    // producer_pos's page/cacheline. Don't pin the exact
+    // spacing — just ensure the layout is nonzero past mask.
     assert!(
         rb.rb_consumer_pos > rb.rb_mask,
         "consumer_pos must follow mask in bpf_ringbuf"

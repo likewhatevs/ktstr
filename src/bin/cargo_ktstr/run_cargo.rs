@@ -2,14 +2,22 @@
 //! subcommands.
 //!
 //! All three subcommands share the `cargo nextest`/`cargo
-//! llvm-cov` execve plumbing, the `--no-perf-mode` env-var pass-
-//! through, and the multi-kernel
+//! llvm-cov` execve plumbing, the `--no-perf-mode` /
+//! `--no-skip-mode` env-var pass-throughs, and the multi-kernel
 //! [`ktstr::KTSTR_KERNEL_LIST_ENV`] export. The differences live
 //! in the leading `cargo` subcommand argv (`{nextest run}` vs
 //! `{llvm-cov nextest}` vs `{llvm-cov}`) and the optional
 //! `--cargo-profile release` injection on the test/coverage
 //! paths. [`run_cargo_sub`] folds the shared shape; thin
 //! per-subcommand wrappers fix the argv constants.
+//!
+//! test/coverage additionally accept `--profile <NAME>` (the
+//! scheduler-under-test's cargo BUILD profile, forwarded via the
+//! [`ktstr::KTSTR_SCHEDULER_PROFILE_ENV`] env) and `--nextest-profile
+//! <NAME>` (the nextest test profile, emitted as nextest's own
+//! `--profile`); the raw `llvm-cov` passthrough sets neither. `--profile`
+//! is INDEPENDENT of `--release` (`--cargo-profile release`, the harness
+//! build profile).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -109,7 +117,7 @@ fn prebuilt_blob_bin_envs(
 /// All three subcommands share the same plumbing: resolve `--kernel`
 /// to a flat `(label, kernel_dir)` set, propagate `--no-perf-mode`
 /// via an env var, optionally prepend `--cargo-profile release`,
-/// append the user's trailing args, and `cmd.exec()` once. The
+/// append the user's trailing args, and `cmd.status()` once. The
 /// cargo subcommand name (`["nextest","run"]` vs `["llvm-cov",
 /// "nextest"]` vs `["llvm-cov"]`) and the log / error-message
 /// prefix are the only static differences.
@@ -140,41 +148,25 @@ fn prebuilt_blob_bin_envs(
 /// still gets a valid path. The test binary's `--list` / `--exact`
 /// handlers prefer `KTSTR_KERNEL_LIST` when set.
 ///
-/// `release` is always `false` for the raw `llvm-cov` passthrough —
-/// that subcommand hands every argument to the user, so the profile
-/// is set via the user's trailing args (or not at all). `test` and
-/// `coverage` wire their `--release` flag through to this argument.
-/// The `KTSTR_SCHEDULER_PROFILE` value the scheduler-under-test build
-/// should use given the two CLI flags: `Some("release")` when EITHER
-/// `--release` (everything release) or `--release-scheduler` (only the
-/// scheduler) is set, else `None` (default dev profile). Pure so the
-/// flag->env coupling is unit-testable — `run_cargo_sub` itself execs
-/// cargo and can't be inspected directly.
-fn scheduler_profile_env(release: bool, release_scheduler: bool) -> Option<&'static str> {
-    (release || release_scheduler).then_some("release")
-}
-
 /// Assemble the cargo `Command` argv + the flag-gated env vars that are
-/// driven purely by the CLI flags — `--cargo-profile release` injection,
-/// the `--no-perf-mode` / `--no-skip-mode` env passthroughs, and the
-/// scheduler-profile env. Split out of [`run_cargo_sub`] as a pure
-/// `Command` factory (no `std::env` reads, no fs, no exec) so the argv
-/// ordering and the flag->env coupling are unit-testable via the stable
-/// [`Command::get_args`] / [`Command::get_envs`] APIs; `run_cargo_sub`
-/// itself execs cargo and can't be inspected directly.
-///
-/// `scheduler_profile` is the already-resolved
-/// [`scheduler_profile_env`] result, threaded in so this builder wires
-/// it without re-deriving the truth table — the wiring (Some -> set the
-/// env, None -> leave it absent) is what these tests pin.
+/// driven purely by the CLI flags — `--cargo-profile release` injection
+/// (`--release`, the HARNESS profile), the nextest test profile
+/// (`--nextest-profile` -> nextest `--profile`), the scheduler build
+/// profile (`--profile` -> `KTSTR_SCHEDULER_PROFILE`), and the
+/// `--no-perf-mode` / `--no-skip-mode` env passthroughs. Split out of
+/// [`run_cargo_sub`] as a pure `Command` factory (no `std::env` reads, no
+/// fs, no exec) so the argv ordering and the flag->argv/env coupling are
+/// unit-testable via the stable [`Command::get_args`] /
+/// [`Command::get_envs`] APIs; `run_cargo_sub` itself execs cargo and
+/// can't be inspected directly.
 ///
 /// `--cargo-profile release` is prepended BEFORE the user's trailing
 /// `args` so the profile selection applies to the whole invocation.
 /// nextest reads `--cargo-profile` directly; `cargo llvm-cov nextest`
 /// forwards it to its inner nextest invocation. For `cargo llvm-cov
 /// <sub>` (the raw-passthrough binding) the caller passes `release ==
-/// false`, so the release arg is never injected — the raw path relies on
-/// user-supplied `--release` / `--profile`.
+/// false` and `profile` / `nextest_profile` `None`, so nothing is
+/// injected — the raw path relies on user-supplied flags.
 ///
 /// The `std::env`-reading envs (prebuilt-blob paths, `LLVM_PROFILE_FILE`
 /// profraw injection) and the kernel-resolution envs are layered on by
@@ -183,15 +175,22 @@ fn scheduler_profile_env(release: bool, release_scheduler: bool) -> Option<&'sta
 fn build_cargo_command(
     sub_argv: &[&str],
     release: bool,
+    profile: Option<&str>,
+    nextest_profile: Option<&str>,
     no_perf_mode: bool,
     no_skip_mode: bool,
-    scheduler_profile: Option<&str>,
     args: &[String],
 ) -> Command {
     let mut cmd = Command::new("cargo");
     cmd.args(sub_argv);
     if release {
         cmd.args(["--cargo-profile", "release"]);
+    }
+    // `--nextest-profile <NAME>` selects the NEXTEST test profile
+    // (`.config/nextest.toml`); nextest's own flag for it is `--profile`,
+    // and `cargo llvm-cov nextest` forwards it to its inner nextest.
+    if let Some(np) = nextest_profile {
+        cmd.args(["--profile", np]);
     }
     cmd.args(args);
     if no_perf_mode {
@@ -200,13 +199,13 @@ fn build_cargo_command(
     if no_skip_mode {
         cmd.env(ktstr::KTSTR_NO_SKIP_MODE_ENV, "1");
     }
-    // Build the scheduler-under-test release when either `--release`
-    // (everything release) or `--release-scheduler` (only the scheduler,
-    // harness stays dev) is set. The test binary's `build_and_find_binary`
-    // reads this and adds `--release` to its `cargo build -p <scheduler>`,
-    // decoupling the scheduler profile from the harness profile.
-    if let Some(profile) = scheduler_profile {
-        cmd.env(ktstr::KTSTR_SCHEDULER_PROFILE_ENV, profile);
+    // `--profile <NAME>` selects the scheduler-under-test's cargo BUILD
+    // profile: `build_and_find_binary` reads `KTSTR_SCHEDULER_PROFILE` and
+    // passes `cargo build -p <scheduler> --profile <name>`. Absent -> that
+    // build defaults the scheduler to `release`. This is independent of
+    // the harness `--release` (`--cargo-profile release`) above.
+    if let Some(p) = profile {
+        cmd.env(ktstr::KTSTR_SCHEDULER_PROFILE_ENV, p);
     }
     cmd
 }
@@ -227,11 +226,14 @@ fn build_cargo_command(
 /// without the exec/fs tail — all-whitespace specs reach `resolve_kernel_set`
 /// but `filter_map` drops them before any `KernelId::parse`, so this path
 /// does no network/build I/O.
-fn kernel_set_or_bail(kernel: &[String]) -> Result<Vec<(String, PathBuf)>, String> {
+fn kernel_set_or_bail(
+    kernel: &[String],
+    include_eol: bool,
+) -> Result<Vec<(String, PathBuf)>, String> {
     if kernel.is_empty() {
         return Ok(Vec::new());
     }
-    let resolved = resolve_kernel_set(kernel)?;
+    let resolved = resolve_kernel_set(kernel, include_eol)?;
     if resolved.is_empty() {
         // `resolve_kernel_set` skips arguments that trim to
         // empty, so `--kernel ""` or `--kernel "  "` reach
@@ -262,15 +264,18 @@ fn run_cargo_sub(
     no_perf_mode: bool,
     no_skip_mode: bool,
     release: bool,
-    release_scheduler: bool,
+    profile: Option<String>,
+    nextest_profile: Option<String>,
+    include_eol: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
     let mut cmd = build_cargo_command(
         sub_argv,
         release,
+        profile.as_deref(),
+        nextest_profile.as_deref(),
         no_perf_mode,
         no_skip_mode,
-        scheduler_profile_env(release, release_scheduler),
         &args,
     );
 
@@ -293,7 +298,7 @@ fn run_cargo_sub(
     // Empty `kernel` (flag omitted) -> empty set, auto-discovery path.
     // Non-empty but all-whitespace -> actionable bail (see
     // `kernel_set_or_bail`). Otherwise the resolved (label, dir) set.
-    let resolved = kernel_set_or_bail(&kernel)?;
+    let resolved = kernel_set_or_bail(&kernel, include_eol)?;
     if !resolved.is_empty() {
         // `KTSTR_KERNEL` always points at the first resolved entry
         // so downstream code that inspects the env directly (e.g.
@@ -390,6 +395,13 @@ fn run_cargo_sub(
     if let Ok(d) = run_start.duration_since(std::time::UNIX_EPOCH) {
         cmd.env(ktstr::KTSTR_RUN_EPOCH_ENV, d.as_nanos().to_string());
     }
+    // Survive Ctrl-C / SIGTERM for the duration of the child run so the
+    // parent reaches its cleanup below instead of dying at the default
+    // disposition. nextest, in the same foreground process group,
+    // receives its own SIGINT and tears down every per-test child
+    // independently; this guard only stops the PARENT from dying so the
+    // shm sweep + artifact footer still run. See `crate::interrupt`.
+    let interrupt_guard = crate::interrupt::InterruptGuard::install();
     let status = cmd
         .status()
         .map_err(|e| format!("spawn cargo {}: {e}", sub_argv.join(" ")))?;
@@ -410,6 +422,15 @@ fn run_cargo_sub(
     let footer = ktstr::test_support::format_run_artifact_footer(&runs_root, run_start);
     if !footer.is_empty() {
         eprint!("{footer}");
+    }
+    // Cleanup + footer are done. If a Ctrl-C / SIGTERM arrived during the
+    // run, propagate it as the conventional 128+signal exit (130 / 143)
+    // now that teardown has completed. Drop the guard first so the signal
+    // is back at its prior disposition before we re-raise.
+    let caught = interrupt_guard.interrupted();
+    drop(interrupt_guard);
+    if let Some(sig) = caught {
+        crate::interrupt::reraise(sig);
     }
     if !status.success() {
         // nextest is the authoritative pass/fail signal. The footer
@@ -806,17 +827,122 @@ fn check_ktstr_version_compat() -> Result<(), String> {
     Ok(())
 }
 
+/// Split nextest FILTERSET tokens (`-E` / `--filterset` / the legacy
+/// `--filter-expr`; space-, `=`-, and glued-short forms) out of a passthrough
+/// argv, returning (filterset expressions, remaining args). A bare trailing
+/// `-E` with no following value is dropped (nextest would reject it anyway).
+///
+/// Only FILTERSETS are extracted — positional test-name filters are left in
+/// `rest` deliberately: nextest ANDs the name-filter dimension with the
+/// filterset dimension (verified in nextest-runner 0.118 `test_filter.rs`
+/// `filter_match_base`: a test must match BOTH), so a positional filter already
+/// intersects the injected relevant filterset correctly and needs no folding.
+/// Multiple filtersets, by contrast, UNION among themselves (`exprs.iter().any`
+/// in `matches_expression`), so they MUST be folded into one `&`-composed
+/// expression to narrow rather than widen.
+fn extract_nextest_filtersets(args: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut filters = Vec::new();
+    let mut rest = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(tok) = it.next() {
+        if tok == "-E" || tok == "--filterset" || tok == "--filter-expr" {
+            if let Some(val) = it.next() {
+                filters.push(val);
+            }
+        } else if let Some(val) = tok
+            .strip_prefix("--filterset=")
+            .or_else(|| tok.strip_prefix("--filter-expr="))
+        {
+            filters.push(val.to_string());
+        } else if let Some(rest_short) = tok.strip_prefix("-E") {
+            // Glued short form: `-E=EXPR` or `-EEXPR`. Any `-E`-prefixed token is
+            // treated as the nextest filterset flag: `-E` is nextest's only
+            // `-E*` short flag, and no legitimate cargo/nextest passthrough value
+            // begins with `-E` (feature lists, profiles, paths, and test-name
+            // filters do not), so this cannot swallow a non-filterset token.
+            filters.push(
+                rest_short
+                    .strip_prefix('=')
+                    .unwrap_or(rest_short)
+                    .to_string(),
+            );
+        } else {
+            rest.push(tok);
+        }
+    }
+    (filters, rest)
+}
+
+/// Fold the change-relevant nextest filterset into `args`, intersecting it with
+/// any user filtersets already present so the net effect NARROWS the run
+/// (`(relevant) & (userA | userB | ...)`), never widens it (nextest UNIONs
+/// multiple `-E`). User filterset tokens are removed and replaced by one
+/// composed `-E`; every other token (positional name filters, `--features`,
+/// …) is preserved and passes through untouched.
+fn compose_relevant_filter(args: Vec<String>, relevant: &str) -> Vec<String> {
+    let (user_filtersets, mut rest) = extract_nextest_filtersets(args);
+    let combined = if user_filtersets.is_empty() {
+        relevant.to_string()
+    } else {
+        let union = user_filtersets
+            .iter()
+            .map(|f| format!("({f})"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        format!("({relevant}) & ({union})")
+    };
+    rest.push("-E".to_string());
+    rest.push(combined);
+    rest
+}
+
+/// Resolve and apply `--relevant` narrowing to a test/coverage passthrough
+/// argv. A no-op when `relevant` is false. Otherwise builds + introspects the
+/// declared schedulers to map the `base..worktree` change onto a nextest
+/// filterset ([`crate::affected::relevant_test_filter`]) and folds it into
+/// `args`. `Ok(None)` from the resolver (a broad / unattributable change, or a
+/// mapping that could not be built) means "do not narrow" — run the user's
+/// unmodified selection (the fail-safe).
+fn apply_relevant_narrowing(
+    args: Vec<String>,
+    relevant: bool,
+    base: Option<String>,
+    base_ref: Option<String>,
+    default_branch: String,
+) -> Result<Vec<String>, String> {
+    if !relevant {
+        return Ok(args);
+    }
+    match crate::affected::relevant_test_filter(
+        base.as_deref(),
+        base_ref.as_deref(),
+        &default_branch,
+    ) {
+        Ok(Some(expr)) => Ok(compose_relevant_filter(args, &expr)),
+        Ok(None) => Ok(args),
+        Err(e) => Err(format!("compute --relevant test set: {e:#}")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_test(
     kernel: Vec<String>,
     no_perf_mode: bool,
     no_skip_mode: bool,
     release: bool,
-    release_scheduler: bool,
+    profile: Option<String>,
+    nextest_profile: Option<String>,
+    include_eol: bool,
+    relevant: bool,
+    base: Option<String>,
+    base_ref: Option<String>,
+    default_branch: String,
     args: Vec<String>,
 ) -> Result<(), String> {
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     ktstr::cli::check_tools(&["cargo-nextest"]).map_err(|e| format!("{e:#}"))?;
     check_ktstr_version_compat()?;
+    let args = apply_relevant_narrowing(args, relevant, base, base_ref, default_branch)?;
     run_cargo_sub(
         TEST_SUB_ARGV,
         "tests",
@@ -824,17 +950,26 @@ pub(crate) fn run_test(
         no_perf_mode,
         no_skip_mode,
         release,
-        release_scheduler,
+        profile,
+        nextest_profile,
+        include_eol,
         args,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_coverage(
     kernel: Vec<String>,
     no_perf_mode: bool,
     no_skip_mode: bool,
     release: bool,
-    release_scheduler: bool,
+    profile: Option<String>,
+    nextest_profile: Option<String>,
+    include_eol: bool,
+    relevant: bool,
+    base: Option<String>,
+    base_ref: Option<String>,
+    default_branch: String,
     args: Vec<String>,
 ) -> Result<(), String> {
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
@@ -843,6 +978,7 @@ pub(crate) fn run_coverage(
     // hits the same CLI-too-old incompatibility `test` does — guard it
     // identically.
     check_ktstr_version_compat()?;
+    let args = apply_relevant_narrowing(args, relevant, base, base_ref, default_branch)?;
     run_cargo_sub(
         COVERAGE_SUB_ARGV,
         "coverage",
@@ -850,7 +986,9 @@ pub(crate) fn run_coverage(
         no_perf_mode,
         no_skip_mode,
         release,
-        release_scheduler,
+        profile,
+        nextest_profile,
+        include_eol,
         args,
     )
 }
@@ -859,12 +997,14 @@ pub(crate) fn run_llvm_cov(
     kernel: Vec<String>,
     no_perf_mode: bool,
     no_skip_mode: bool,
+    include_eol: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
     // `llvm-cov` is raw passthrough — the user supplies every
     // argument after the subcommand name, including any profile
-    // selection. `release: false` / `release_scheduler: false` here
-    // mean "don't inject a profile ourselves"; the user decides.
+    // selection. `release: false` / `profile: None` / `nextest_profile:
+    // None` here mean "don't inject any profile ourselves"; the user
+    // decides via the raw args.
     //
     // No ktstr version guard here (unlike `test` / `coverage`): a
     // passthrough subcommand like `llvm-cov report` does NOT rebuild or
@@ -879,7 +1019,9 @@ pub(crate) fn run_llvm_cov(
         no_perf_mode,
         no_skip_mode,
         false,
-        false,
+        None,
+        None,
+        include_eol,
         args,
     )
 }
@@ -949,6 +1091,96 @@ mod tests {
             version_guard(&v("0.19.0+abc"), &v("0.19.0")),
             VersionGuard::Ok,
         );
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `extract_nextest_filtersets` pulls every filterset spelling (`-E` /
+    /// `--filterset` / legacy `--filter-expr`, space / `=` / glued-short) out of
+    /// the argv while leaving positional filters and other flags in `rest`.
+    #[test]
+    fn extract_filtersets_all_spellings() {
+        let (filters, rest) = extract_nextest_filtersets(strs(&[
+            "-E",
+            "test(a)",
+            "--filterset",
+            "test(b)",
+            "--filter-expr=test(c)",
+            "-E=test(d)",
+            "-Etest(e)",
+            "--filterset=test(f)",
+            "positional_name",
+            "--features",
+            "integration",
+        ]));
+        assert_eq!(
+            filters,
+            strs(&[
+                "test(a)", "test(b)", "test(c)", "test(d)", "test(e)", "test(f)",
+            ]),
+        );
+        // Positional filter + unrelated flag survive untouched (nextest ANDs
+        // positional filters with the filterset dimension, so they need no fold).
+        assert_eq!(
+            rest,
+            strs(&["positional_name", "--features", "integration"])
+        );
+    }
+
+    /// With no user filterset, the relevant expression is injected verbatim as a
+    /// single `-E`, and non-filter passthrough is preserved.
+    #[test]
+    fn compose_relevant_no_user_filterset() {
+        let out = compose_relevant_filter(strs(&["--features", "x"]), "test(r1) | test(r2)");
+        assert_eq!(out, strs(&["--features", "x", "-E", "test(r1) | test(r2)"]),);
+    }
+
+    /// With user filtersets present, the composition INTERSECTS
+    /// (`(relevant) & (u1 | u2)`) so the net effect narrows, never widens
+    /// (nextest UNIONs multiple `-E`). The user's `-E` tokens are removed.
+    #[test]
+    fn compose_relevant_intersects_user_filtersets() {
+        let out = compose_relevant_filter(
+            strs(&[
+                "-E",
+                "test(u1)",
+                "--features",
+                "x",
+                "--filterset",
+                "test(u2)",
+            ]),
+            "test(r)",
+        );
+        assert_eq!(
+            out,
+            strs(&[
+                "--features",
+                "x",
+                "-E",
+                "(test(r)) & ((test(u1)) | (test(u2)))",
+            ]),
+        );
+    }
+
+    /// A `none()` relevant expression (the docs-only Empty outcome) composes to
+    /// a zero-match filter, so a `--relevant` run of a docs-only change runs no
+    /// tests.
+    #[test]
+    fn compose_relevant_none_expression() {
+        let out = compose_relevant_filter(Vec::new(), "none()");
+        assert_eq!(out, strs(&["-E", "none()"]));
+    }
+
+    /// `apply_relevant_narrowing` is a no-op when `--relevant` is off — the argv
+    /// (including any user `-E`) passes through byte-for-byte.
+    #[test]
+    fn apply_relevant_narrowing_off_is_noop() {
+        let args = strs(&["-E", "test(x)", "--features", "y"]);
+        let out = apply_relevant_narrowing(args.clone(), false, None, None, "main".to_string())
+            .expect("no-op path never errors");
+        assert_eq!(out, args);
     }
 
     /// A `cargo metadata` Package JSON object with every required field
@@ -1219,19 +1451,6 @@ mod tests {
         );
     }
 
-    /// Truth table for the flag->scheduler-profile coupling:
-    /// EITHER --release (everything release) or --release-scheduler
-    /// (scheduler only) yields `Some("release")`; neither yields `None`
-    /// (dev). A regression narrowing the guard to drop the `release ||`
-    /// (so --release stops building the scheduler release) flips a cell.
-    #[test]
-    fn scheduler_profile_env_truth_table() {
-        assert_eq!(scheduler_profile_env(false, false), None);
-        assert_eq!(scheduler_profile_env(true, false), Some("release"));
-        assert_eq!(scheduler_profile_env(false, true), Some("release"));
-        assert_eq!(scheduler_profile_env(true, true), Some("release"));
-    }
-
     /// Byte-exact pin on the three `*_SUB_ARGV` constants that drive
     /// `run_test`, `run_coverage`, and `run_llvm_cov` into
     /// `run_cargo_sub`. A regression that re-ordered the Coverage
@@ -1375,9 +1594,10 @@ mod tests {
         let cmd = build_cargo_command(
             TEST_SUB_ARGV,
             true,
-            false,
-            false,
             None,
+            None,
+            false,
+            false,
             &["-E".to_string(), "test(foo)".to_string()],
         );
         let argv: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
@@ -1405,9 +1625,10 @@ mod tests {
         let cmd = build_cargo_command(
             LLVM_COV_SUB_ARGV,
             false,
-            false,
-            false,
             None,
+            None,
+            false,
+            false,
             &["report".to_string()],
         );
         let argv: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
@@ -1424,7 +1645,7 @@ mod tests {
     #[test]
     fn build_cargo_command_perf_and_skip_env_gates() {
         // perf=true, skip=false → only KTSTR_NO_PERF_MODE="1".
-        let cmd = build_cargo_command(TEST_SUB_ARGV, false, true, false, None, &[]);
+        let cmd = build_cargo_command(TEST_SUB_ARGV, false, None, None, true, false, &[]);
         let map = cmd_env_map(&cmd);
         assert_eq!(
             map.get(std::ffi::OsStr::new(ktstr::KTSTR_NO_PERF_MODE_ENV)),
@@ -1433,7 +1654,7 @@ mod tests {
         assert!(!map.contains_key(std::ffi::OsStr::new(ktstr::KTSTR_NO_SKIP_MODE_ENV)));
 
         // perf=false, skip=true → only KTSTR_NO_SKIP_MODE="1".
-        let cmd = build_cargo_command(TEST_SUB_ARGV, false, false, true, None, &[]);
+        let cmd = build_cargo_command(TEST_SUB_ARGV, false, None, None, false, true, &[]);
         let map = cmd_env_map(&cmd);
         assert_eq!(
             map.get(std::ffi::OsStr::new(ktstr::KTSTR_NO_SKIP_MODE_ENV)),
@@ -1442,28 +1663,58 @@ mod tests {
         assert!(!map.contains_key(std::ffi::OsStr::new(ktstr::KTSTR_NO_PERF_MODE_ENV)));
     }
 
-    /// The `scheduler_profile` Option result is wired into the
-    /// `KTSTR_SCHEDULER_PROFILE` env: `Some("release")` sets the var to
-    /// "release"; `None` leaves it absent. `scheduler_profile_env` has
-    /// its own truth-table test; this pins the WIRING (correct var name +
+    /// The `profile` Option (the `--profile <NAME>` scheduler BUILD
+    /// profile) is wired into the `KTSTR_SCHEDULER_PROFILE` env:
+    /// `Some("dev")` sets the var to "dev"; `None` leaves it absent (the
+    /// scheduler build then defaults to release inside
+    /// `build_and_find_binary`). Pins the WIRING (correct var name +
     /// value, and the absent corner) that a dropped `.env()` call would
-    /// pass past the pure-fn test.
+    /// otherwise slip through.
     #[test]
-    fn build_cargo_command_scheduler_profile_env_wired_from_flags() {
-        // release=false, release_scheduler=true → Some("release").
-        let profile = scheduler_profile_env(false, true);
-        let cmd = build_cargo_command(TEST_SUB_ARGV, false, false, false, profile, &[]);
+    fn build_cargo_command_scheduler_profile_wired_from_flag() {
+        // Some("dev") → var set to "dev".
+        let cmd = build_cargo_command(TEST_SUB_ARGV, false, Some("dev"), None, false, false, &[]);
         let map = cmd_env_map(&cmd);
         assert_eq!(
             map.get(std::ffi::OsStr::new(ktstr::KTSTR_SCHEDULER_PROFILE_ENV)),
-            Some(&Some(std::ffi::OsString::from("release"))),
+            Some(&Some(std::ffi::OsString::from("dev"))),
         );
 
-        // release=false, release_scheduler=false → None, var absent.
-        let profile = scheduler_profile_env(false, false);
-        let cmd = build_cargo_command(TEST_SUB_ARGV, false, false, false, profile, &[]);
+        // None → var absent (scheduler build defaults to release).
+        let cmd = build_cargo_command(TEST_SUB_ARGV, false, None, None, false, false, &[]);
         let map = cmd_env_map(&cmd);
         assert!(!map.contains_key(std::ffi::OsStr::new(ktstr::KTSTR_SCHEDULER_PROFILE_ENV)));
+    }
+
+    /// The `nextest_profile` Option (the `--nextest-profile <NAME>`
+    /// NEXTEST test profile) is emitted as a `--profile <NAME>` argv token
+    /// AFTER `sub_argv` and BEFORE the user's trailing args — nextest and
+    /// `cargo llvm-cov nextest` read `--profile` to select the test
+    /// profile. `None` injects nothing. Byte-exact argv pins the token
+    /// name + placement; a regression emitting the wrong flag, or
+    /// appending after the user args, flips the vector.
+    #[test]
+    fn build_cargo_command_nextest_profile_injects_profile_flag() {
+        // Some("ci") → `--profile ci` after sub_argv, before user args.
+        let cmd = build_cargo_command(
+            TEST_SUB_ARGV,
+            false,
+            None,
+            Some("ci"),
+            false,
+            false,
+            &["-E".to_string(), "test(foo)".to_string()],
+        );
+        let argv: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            argv,
+            ["nextest", "run", "--profile", "ci", "-E", "test(foo)"].map(std::ffi::OsStr::new),
+        );
+
+        // None → no `--profile` token.
+        let cmd = build_cargo_command(TEST_SUB_ARGV, false, None, None, false, false, &[]);
+        let argv: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(argv, ["nextest", "run"].map(std::ffi::OsStr::new));
     }
 
     // -- kernel_set_or_bail --
@@ -1477,7 +1728,7 @@ mod tests {
     /// to auto-discovery (which would mask the operator's intent).
     #[test]
     fn kernel_set_or_bail_all_whitespace_bails() {
-        let err = kernel_set_or_bail(&["".to_string(), "  \t ".to_string()])
+        let err = kernel_set_or_bail(&["".to_string(), "  \t ".to_string()], false)
             .expect_err("all-whitespace --kernel must bail, not auto-discover");
         assert!(
             err.starts_with("--kernel: every supplied value parsed to empty"),
@@ -1490,7 +1741,7 @@ mod tests {
     /// through to the `find_kernel` chain without exporting KTSTR_KERNEL.
     #[test]
     fn kernel_set_or_bail_empty_input_is_ok_empty() {
-        assert_eq!(kernel_set_or_bail(&[]), Ok(Vec::new()));
+        assert_eq!(kernel_set_or_bail(&[], false), Ok(Vec::new()));
     }
 
     // -- generate_btf_anchor (no-bpf early return) --

@@ -1,4 +1,4 @@
-// `validate_constraints_expr` Call arm must recurse into
+// `validate_const_eligible` Call arm must recurse into
 // `Some(...)` constructor args. Without arg recursion, the outer
 // PascalCase shape acceptance would let `Some(non_const_call())`
 // slip past the const-eval guard.

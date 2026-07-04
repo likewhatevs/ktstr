@@ -1,6 +1,7 @@
 // Pins the `min_numa_nodes` cross-field check arm. `topology`
 // declares 1 NUMA node but `constraints.min_numa_nodes = 4`
-// excludes any host that doesn't have at least 4 NUMA nodes.
+// excludes every gauntlet preset with fewer than 4 NUMA nodes —
+// every gauntlet preset rejects the test at runtime.
 use ktstr::declare_scheduler;
 #[allow(unused_imports)]
 use ktstr::test_support::TopologyConstraints;

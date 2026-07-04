@@ -12,7 +12,6 @@ const FIO: Payload = Payload::new(
     &[],
     false,
     None,
-    None,
 );
 
 // `workloads` must be an array literal `[FIO]`, not a bare path.

@@ -116,11 +116,15 @@ fn assert_phase_map_ext_pipeline(result: &VmResult) -> Result<()> {
         }
     }
 
-    // PhaseMap::ratio_across_phases lands the verdict. If only one
-    // Step phase was populated by counter_delta_per_phase, the
-    // "needs both phases" arm fires — that's still a recorded
-    // verdict mutation. Pin EITHER the pass-arm info note OR the
-    // missing-phase fail detail (both prove the comparator ran).
+    // PhaseMapExt::ratio_across_phases lands the verdict. This test
+    // self-zips both Step(0) and Step(1) (asserted above), so both
+    // phases are populated and the comparator takes the ratio path: a
+    // pass info note when the ratio is within the ceiling, or a
+    // failure detail when it exceeds the ceiling / is non-finite. (A
+    // genuinely missing phase would record an Inconclusive — neither
+    // an info note nor a failure detail — but the populated self-zip
+    // rules that out.) Pin that EITHER a pass note OR a failure detail
+    // mentioning the label landed, proving the comparator ran.
     let mut verdict = Verdict::new();
     synthetic_frac
         .ratio_across_phases(

@@ -4,11 +4,11 @@
 //! path), holds one phase, and reads the per-phase qps metric back in post_vm.
 //!
 //! The taobench engine is entirely in-process: a client population drives a
-//! sharded cache; fast workers serve hits (touching the stored value bytes); slow
-//! dispatcher threads serve misses (sleep + fill + wake). The client and
+//! sharded cache, serving in-cache hits inline (touching the stored value bytes);
+//! slow dispatcher threads serve misses (sleep + fill + wake). The client and
 //! dispatcher threads make the fast-hit / slow-miss handoffs genuinely concurrent
 //! across the guest's cores. `WorkType::Taobench` mandates a single ktstr worker --
-//! the client/fast/slow parallelism is the engine's internal thread topology, not
+//! the client/dispatcher parallelism is the engine's internal thread topology, not
 //! ktstr worker processes. Clients run closed-loop by default (issue the next
 //! request when the prior completes); a non-zero `arrival_rate` switches them to
 //! open-loop fixed-rate arrival with coordinated-omission serve-latency

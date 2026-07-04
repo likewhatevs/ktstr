@@ -58,7 +58,7 @@ pub fn assert_isolation(reports: &[WorkerReport], expected: &BTreeSet<usize>) ->
 /// the value at the computed index — a meaningless number. A
 /// `debug_assert!` enforces this in debug builds; release builds
 /// skip the check (the production callers sort immediately upstream
-/// — `assert_not_starved` and `assert_benchmarks` both
+/// — `cgroup_stats` and `assert_benchmarks` both
 /// `sorted.sort_unstable()` before this call — so the runtime
 /// guard is unnecessary in production paths).
 ///
@@ -1387,11 +1387,12 @@ pub fn assert_thresholds(
 ) -> AssertResult {
     // Empty `reports` means nothing was measured. Returning a fresh
     // `pass()` here would silently green-light a broken run that
-    // produced no signal; delegating to `assert_benchmarks` and
-    // merging its skip would lose the skip flag (`AssertResult::merge`
-    // ANDs `skipped`, so `pass.merge(skip) == passed-not-skipped`).
-    // Surface the skip directly so the operator sees the thresholds
-    // weren't actually exercised.
+    // produced no signal. `assert_benchmarks` also skips on empty
+    // reports, and merging that skip into a `pass()` would preserve it
+    // (`AssertResult::merge` extends `outcomes`, and an all-Skip
+    // non-empty `outcomes` folds to Skip) — but its message is generic.
+    // Surface the skip directly so the operator sees the
+    // thresholds-specific reason: no worker reports to evaluate.
     if reports.is_empty() {
         return AssertResult::skip("no worker reports to evaluate");
     }

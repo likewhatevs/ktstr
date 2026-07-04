@@ -184,8 +184,9 @@ pub struct VmResult {
     /// side.
     ///
     /// The counter struct exposes nine `AtomicU64` fields, each
-    /// bumped from `drain_bracket_impl` (in `src/vmm/virtio_blk/device.rs`)
-    /// via the `VirtioBlkCounters::record_*` helpers. Per-request
+    /// bumped from `drain_bracket_impl` (in `src/vmm/virtio_blk/drain.rs`)
+    /// via the `VirtioBlkCounters::record_*` helpers (defined in
+    /// `src/vmm/virtio_blk/counters.rs`). Per-request
     /// cumulative counters, per-event cumulative counters, and
     /// per-request live gauges are kept distinct per the
     /// counter-taxonomy doc on `VirtioBlkCounters`:
@@ -272,10 +273,12 @@ pub struct VmResult {
     /// comes from the per-CPU / per-IRQ metrics axis, not these
     /// device-internal loopback counters.
     ///
-    /// The counter struct exposes thirteen `AtomicU64` fields, each
+    /// The counter struct exposes sixteen `AtomicU64` fields, each
     /// bumped across the TX-drain path rooted at `process_tx_loopback`
     /// (several are bumped inside the `pop_and_capture_tx` /
-    /// `try_loopback_to_rx` helpers it calls):
+    /// `try_loopback_to_rx` helpers it calls; the three `ctrl_*`
+    /// counters are bumped on the control-vq path, not the TX-drain
+    /// path):
     ///
     ///   - `tx_packets` — count of TX chains whose L2 frame was
     ///     captured (`frame_len = Some`) AND whose TX `add_used`
@@ -338,6 +341,21 @@ pub struct VmResult {
     ///     `queue_poisoned` flag short-circuits subsequent kicks
     ///     so one guest fault produces exactly one bump regardless
     ///     of how many notifications follow before reset.
+    ///   - `ctrl_mq_set` — cumulative count of successful control-vq
+    ///     `VIRTIO_NET_CTRL_MQ` / `VQ_PAIRS_SET` commands (the device
+    ///     updated `curr_queue_pairs` and wrote `VIRTIO_NET_OK`).
+    ///     Per-event counter.
+    ///   - `ctrl_chain_invalid` — cumulative count of control-vq
+    ///     chains the device could not satisfy: malformed shape (no
+    ///     device-writable status descriptor, too few readable command
+    ///     bytes), an unknown `(class, cmd)`, or a `virtqueue_pairs`
+    ///     outside `[1, queue_pairs]`. Per-event hostile/buggy-guest
+    ///     counter; the control-vq analog of `tx_chain_invalid`.
+    ///   - `ctrl_add_used_failures` — cumulative count of control-vq
+    ///     status-write or `add_used` failures (the status byte's GPA
+    ///     or the used-ring address is unmapped). Queue-state breakage
+    ///     distinct from `ctrl_chain_invalid`; the control-vq analog
+    ///     of `tx_add_used_failures`.
     ///
     /// Counters are cumulative for the device's lifetime — a guest
     /// driver re-bind (writing `STATUS=0`) does NOT zero them.
@@ -1264,6 +1282,33 @@ impl VmResult {
             .join("\n")
     }
 
+    /// The scheduler's captured log — its stderr, including any libbpf /
+    /// BPF-verifier output — extracted from the bulk-port
+    /// `MSG_TYPE_SCHED_LOG` frames in [`Self::guest_messages`]. Empty when
+    /// no scheduler log was captured (no scheduler was spawned, or the
+    /// framed markers never arrived).
+    ///
+    /// Mirrors the extraction [`crate::verifier::collect_verifier_output`]
+    /// performs: concatenate the `SchedLog` chunks, slice the span from the
+    /// first `SCHED_OUTPUT_START` to the last `SCHED_OUTPUT_END` (spanning
+    /// any intervening markers when the guest staged more than one log),
+    /// and fall back to `output` when the bulk-port drain carried no
+    /// `SchedLog` frames (a kernel without the bulk port). Lets a post_vm
+    /// callback assert on what the scheduler logged — e.g. a libbpf
+    /// verifier-reject — without reaching into the crate-internal wire
+    /// types.
+    pub fn scheduler_log(&self) -> String {
+        let merged = crate::verifier::concat_sched_log_chunks(self.guest_messages.as_ref());
+        let source = if merged.is_empty() {
+            &self.output
+        } else {
+            &merged
+        };
+        crate::verifier::parse_sched_output(source)
+            .unwrap_or("")
+            .to_string()
+    }
+
     /// The host watchdog-override readback (`expected_jiffies` =
     /// host-written, `observed_jiffies` = read back from guest memory).
     /// `None` when the scheduler never attached (no readback recorded).
@@ -1557,7 +1602,7 @@ pub(crate) struct VmRunState {
     /// them into `VmResult::guest_messages` alongside the post-exit
     /// `drain_bulk` and the post-mortem SHM CRASH-ring drain.
     /// Without this stash every EXIT / TEST / PAYLOAD_METRICS /
-    /// RAW_PAYLOAD_OUTPUT / PROFRAW frame consumed by the coord
+    /// PROFRAW frame consumed by the coord
     /// would vanish — only the leftover bytes that arrived on
     /// `port1_tx_buf` after the coord exited would reach the
     /// verdict, and a typical run would surface no metrics.
@@ -1586,6 +1631,58 @@ pub(crate) struct VmRunState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// scheduler_log() concatenates the bulk-port SchedLog frames and
+    /// slices the `SCHED_OUTPUT_START`/`END`-bracketed content (mirroring
+    /// collect_verifier_output). A CRC-bad frame is dropped; with no valid
+    /// SchedLog frames and an empty `output`, the log is empty. CI-runnable
+    /// (no VM) — pins the accessor the demo_verifier post_vm assertions
+    /// depend on, so a boot-path capture regression is caught even when the
+    /// host-gated e2e cells skip under resource contention.
+    #[test]
+    fn scheduler_log_extracts_bracketed_content_and_drops_crc_bad() {
+        use crate::vmm::host_comms::BulkDrainResult;
+        use crate::vmm::wire::{MSG_TYPE_SCHED_LOG, ShmEntry};
+
+        let framed = "===SCHED_OUTPUT_START===\n\
+            libbpf: prog 'ktstr_dispatch': BPF program load failed: -EACCES\n\
+            -- BEGIN PROG LOAD LOG --\n0: (b7) r0 = 0\n-- END PROG LOAD LOG --\n\
+            ===SCHED_OUTPUT_END===\n";
+        let mut result = VmResult::test_fixture();
+        result.guest_messages = Some(BulkDrainResult {
+            entries: vec![ShmEntry {
+                msg_type: MSG_TYPE_SCHED_LOG,
+                payload: framed.as_bytes().to_vec(),
+                crc_ok: true,
+            }],
+        });
+        let log = result.scheduler_log();
+        assert!(
+            log.contains("-- BEGIN PROG LOAD LOG --"),
+            "libbpf verifier-reject marker survives extraction: {log}"
+        );
+        assert!(
+            log.contains("BPF program load failed"),
+            "scheduler stderr content present: {log}"
+        );
+        assert!(
+            !log.contains("SCHED_OUTPUT_START"),
+            "wire brackets stripped by parse_sched_output: {log}"
+        );
+
+        // A CRC-bad SchedLog frame is dropped; with no valid frames the
+        // merged stream is empty and `output` (empty here) is the fallback,
+        // so scheduler_log() is empty.
+        let mut bad = VmResult::test_fixture();
+        bad.guest_messages = Some(BulkDrainResult {
+            entries: vec![ShmEntry {
+                msg_type: MSG_TYPE_SCHED_LOG,
+                payload: framed.as_bytes().to_vec(),
+                crc_ok: false,
+            }],
+        });
+        assert_eq!(bad.scheduler_log(), "", "crc-bad frame dropped -> empty");
+    }
 
     /// A StepStart/StepEnd/terminal `StimulusEvent` for the
     /// `step_throughput_in` pairing tests.

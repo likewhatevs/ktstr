@@ -9,9 +9,9 @@
 //! captured console, monitor samples, and drained guest messages.
 //!
 //! See the [VMM architecture
-//! page](https://likewhatevs.github.io/ktstr/guide/architecture/vmm.html)
+//! page](https://ktstr.dev/guide/architecture/vmm.html)
 //! for the boot flow and the [Performance Mode
-//! page](https://likewhatevs.github.io/ktstr/guide/concepts/performance-mode.html)
+//! page](https://ktstr.dev/guide/concepts/performance-mode.html)
 //! for the isolation options the builder exposes.
 //!
 //! # Module layout
@@ -100,7 +100,7 @@ pub(crate) mod virtio_net;
 // streaming assembler (`bulk`), the guest-side typed senders
 // (`guest_comms`), and the host-side typed consumers (`host_comms`)
 // each carry a single responsibility. Production data (STIMULUS /
-// EXIT / SCHED_EXIT / PAYLOAD_METRICS / RAW_PAYLOAD_OUTPUT /
+// EXIT / SCHED_EXIT / PAYLOAD_METRICS /
 // SCENARIO_*) flows through the virtio-console port-1 TLV stream,
 // and crash diagnostics travel via COM2.
 pub(crate) mod bulk;
@@ -588,10 +588,10 @@ pub struct KtstrVm {
     ///
     /// `.get_full()` returns the richer
     /// `super::cast_analysis_load::CastAnalysisOutput` which
-    /// carries three pieces:
-    /// 1. `cast_map`: the
-    ///    `(parent_struct, member_offset) -> CastHit` map the
-    ///    instruction-level analyzer recovered.
+    /// carries four pieces:
+    /// 1. `cast_maps`: a `Vec<Arc<CastMap>>`, one per embedded
+    ///    object, each a `(parent_btf_id, member_offset) -> CastHit`
+    ///    map the instruction-level analyzer recovered.
     /// 2. `btfs`: every parsed embedded BPF object's program BTF
     ///    (one entry per object inside `.bpf.objs`).
     /// 3. `fwd_index`: a `name -> (btfs index, type_id)` index
@@ -600,21 +600,21 @@ pub struct KtstrVm {
     ///    [`crate::monitor::btf_render::MemReader::cross_btf_resolve_fwd`]
     ///    override to chase a `BTF_KIND_FWD` whose body lives in
     ///    a sibling embedded object's BTF.
-    ///
-    /// `.get()` is a thinner accessor that returns just the
-    /// `Arc<CastMap>`; production callers go through `.get_full()`
-    /// because the freeze-time threading needs all three pieces
-    /// (cast map for promotion, BTFs + fwd_index for cross-BTF
-    /// resolution).
+    /// 4. `alloc_size_types`: unique `(alloc_size, struct_name)`
+    ///    pairs captured from `scx_static_alloc_internal` call
+    ///    sites, threaded to the renderer as a last-resort fallback
+    ///    for deferred-resolve arena chases whose `CastHit` has
+    ///    `alloc_size: None`.
     ///
     /// When `.get_full()` fires, results are cached process-wide
-    /// by SHA-256 of the binary bytes so two VMs in the same
+    /// by a u64 ahash content hash of the binary bytes so two VMs
+    /// in the same
     /// process resolving to the same scheduler binary content
     /// share one analyzer run (auto-repro path, future in-process
     /// multi-test drivers). The cast map is threaded into
     /// [`crate::monitor::dump::DumpContext::cast_map`] and the
     /// `(btfs, fwd_index)` pair into
-    /// `crate::monitor::dump::DumpContext::cross_btf` at freeze
+    /// `crate::monitor::dump::DumpContext::cross_btf_fwd_index` at freeze
     /// time so the failure-dump renderer can promote `u64` fields
     /// the analyzer flagged into typed-pointer renders via
     /// [`crate::monitor::btf_render::MemReader::cast_lookup`] and
@@ -1038,7 +1038,8 @@ impl KtstrVm {
     /// Sets the host terminal to raw mode, spawns threads for stdin->hvc0
     /// and hvc0->stdout forwarding, and runs until the guest shuts down.
     /// Terminal state is restored on all exit paths including panic and
-    /// process-killing signals (SIGINT, SIGTERM, SIGQUIT).
+    /// process-killing signals (SIGINT, SIGTERM, SIGQUIT, SIGABRT,
+    /// SIGFPE).
     ///
     /// Builder settings ignored in interactive mode: `monitor_thresholds`,
     /// `watchdog_timeout`, `bpf_map_write`, `performance_mode` pinning,
@@ -1250,7 +1251,7 @@ impl KtstrVm {
         // and installs signal handlers for SIGINT, SIGTERM, SIGQUIT,
         // SIGABRT, and SIGFPE so every terminating signal routes through
         // the terminal-restore path before the process exits (see
-        // `src/terminal.rs`). Skip for exec mode — no interactive
+        // `src/vmm/terminal.rs`). Skip for exec mode — no interactive
         // terminal needed.
         let _raw_guard = if exec_mode {
             None
@@ -1893,8 +1894,9 @@ impl KtstrVm {
         // Exec mode fallback: if virtio-console produced no output
         // (kernel lacks CONFIG_VIRTIO_CONSOLE, guest fell back to
         // COM2), print COM2 output to stdout so the caller sees it.
-        // Filter out the KTSTR_EXEC_EXIT sentinel which the guest
-        // writes to stderr (also COM2 in the fallback case).
+        // No sentinel appears on COM2: the exec exit is a typed
+        // `MSG_TYPE_EXEC_EXIT` bulk-port frame (see the inner
+        // comment below), so the COM2 bytes are written verbatim.
         if exec_mode && !stdout_wrote {
             let app_output = com2.lock().output();
             if !app_output.is_empty() {

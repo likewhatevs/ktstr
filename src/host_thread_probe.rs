@@ -1222,8 +1222,9 @@ fn struct_member_offsets_in_unit<R: Reader>(
     // 2. Field scan: walk ALL DW_TAG_member entries looking for the
     //    unique field names directly. Handles typedef'd anonymous
     //    structs, C++ namespaced structs, or renamed struct types.
-    //    The field names are unique enough (84-char mangled prefix)
-    //    that false positives are impossible.
+    //    The field names are unique enough (the 54-char
+    //    `cant_access_tsd_items_directly_use_a_getter_or_setter_`
+    //    prefix) that false positives are impossible.
     let mut allocated: Option<u64> = None;
     let mut deallocated: Option<u64> = None;
 
@@ -1536,10 +1537,13 @@ fn find_jemalloc_via_maps_at(
                     return Ok((symbol, r));
                 }
 
-                // 4. Inline DWARF slow walk (last resort, bounded).
-                // Only reaches here if no pubtypes, no DWP, no
-                // external debuginfo resolved. Bounded to 200
-                // units to prevent multi-minute hangs.
+                // 4. Inline DWARF slow walk (last resort). Only
+                // reaches here if no pubtypes, no DWP, no external
+                // debuginfo resolved. resolve_field_offsets_from_bytes
+                // walks every unit, stopping only once both field
+                // offsets are found; the .debug_pubtypes fast path
+                // avoids this full walk on binaries that carry
+                // pubtypes.
                 if section_is_populated(&elf, data, ".debug_info")
                     && let Ok(offsets) = resolve_field_offsets_from_bytes(data, &exe_path)
                 {

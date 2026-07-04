@@ -395,7 +395,7 @@ impl VirtioBlk {
             return (VIRTIO_BLK_S_IOERR as u8, 1);
         }
         // used_len: 20 data bytes written + 1 status byte. Symmetric
-        // with handle_read_impl's `total_read + 1` accounting.
+        // with handle_read_impl's `bytes_to_guest + 1` accounting.
         (VIRTIO_BLK_S_OK as u8, VIRTIO_BLK_ID_BYTES + 1)
     }
 

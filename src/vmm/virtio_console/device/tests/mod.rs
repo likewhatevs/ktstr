@@ -58,7 +58,7 @@ fn make_chain_test_mem() -> GuestMemoryMmap {
 /// point at `mock`'s desc/avail/used rings with size 16, mark
 /// the queue ready, then transition to DRIVER_OK. Mirrors
 /// `virtio_blk::testing::wire_device_to_mock` adapted to the
-/// 6-queue console layout.
+/// 3-port / 8-queue console layout.
 ///
 /// `init_device` walks the FSM all the way to DRIVER_OK with no
 /// queue config — the post-DRIVER_OK gate then rejects any
@@ -127,7 +127,7 @@ fn wire_console_queue_to_mock(
 }
 
 // ----------------------------------------------------------------
-// Chain-level MockSplitQueue tests for `drain_port1_pending_rx`.
+// Chain-level MockSplitQueue tests for `drain_pending_rx` (port 1).
 //
 // These pin the host->guest port-1 RX path: snapshot reply payloads
 // the freeze coordinator queues via `queue_input_port1` get
@@ -173,9 +173,9 @@ fn wire_port1_rxq_to_mock(dev: &mut VirtioConsole, mock: &MockSplitQueue<GuestMe
 }
 
 /// Mark port 1 as opened by sending PORT_OPEN(value=1) on c_ovq.
-/// This sets `port_opened[1] = true` so the gate in
-/// `drain_port1_pending_rx` lets bytes through. The same call
-/// invokes `drain_port1_pending_rx` internally on the open
+/// This sets `ports[1].opened = true` so the gate in
+/// `drain_pending_rx` lets bytes through. The same call
+/// invokes `drain_pending_rx` internally on the open
 /// transition, but with no pending bytes that is a no-op — the
 /// caller pushes pending bytes AFTER opening the port (or relies
 /// on the open handler's own deferred-drain trigger).
@@ -188,7 +188,7 @@ fn open_port1(dev: &mut VirtioConsole) {
     assert!(
         dev.ports[1].opened,
         "open_port1 helper precondition: PORT_OPEN(value=1) must \
-         set port_opened[1]"
+         set ports[1].opened"
     );
 }
 
@@ -198,8 +198,9 @@ fn open_port1(dev: &mut VirtioConsole) {
 // Port 2 mirrors port 1's TX/RX paths line-for-line in production
 // — only the queue index, the buffer field, and the wake eventfd
 // differ. Without explicit port-2 coverage the queue_idx → buffer
-// routing match in `process_tx_into`, the `port_opened[2]` gate in
-// `drain_port2_pending_rx`, and the `stats_tx_evt` vs `tx_evt`
+// routing match in `process_tx` (via `port_queues`), the
+// `ports[2].opened` gate in `drain_pending_rx`, and the
+// `stats_tx_evt` vs `tx_evt`
 // dispatch could regress to incorrect targets and only surface in
 // an end-to-end VM run. These tests pin every divergence between
 // port 2 and the other two ports.
@@ -207,7 +208,7 @@ fn open_port1(dev: &mut VirtioConsole) {
 
 /// Mark port 2 as opened by sending PORT_OPEN(value=1) on c_ovq.
 /// Mirrors `open_port1` for the port-2 RX gate in
-/// `drain_port2_pending_rx`.
+/// `drain_pending_rx`.
 fn open_port2(dev: &mut VirtioConsole) {
     dev.handle_control_event(VirtioConsoleControl {
         id: 2,
@@ -217,7 +218,7 @@ fn open_port2(dev: &mut VirtioConsole) {
     assert!(
         dev.ports[2].opened,
         "open_port2 helper precondition: PORT_OPEN(value=1) must \
-         set port_opened[2]"
+         set ports[2].opened"
     );
 }
 

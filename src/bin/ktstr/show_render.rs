@@ -10,7 +10,7 @@ use super::*;
 
 /// Emit the `## Primary metrics` table. One row per (group,
 /// metric) pair whose `metric.section` is enabled. Two sections
-/// share the table — [`ctprof_compare::Section::Primary`] (52
+/// share the table — [`ctprof_compare::Section::Primary`] (53
 /// non-taskstats rows) and [`ctprof_compare::Section::TaskstatsDelay`]
 /// (34 taskstats genetlink rows). The outer gate keeps the table
 /// open while EITHER section is enabled. Mirrors the
@@ -549,8 +549,9 @@ pub(super) fn write_show_host_pressure<W: std::fmt::Write>(
 /// their byte counts field-summed; under `--no-thread-normalize`
 /// the literal `pcomm[tgid]` shape is preserved so each PID stays
 /// attributable. Process iteration order: descending by Rss,
-/// tiebreak descending Pss, final tiebreak alphabetical (mirrors
-/// the compare-side sort). Skip zero-valued entries per-row to keep
+/// tiebreak descending Pss, final tiebreak alphabetical. Compare
+/// sorts by absolute Rss delta (unavailable for a single snapshot),
+/// so show sorts by absolute Rss instead. Skip zero-valued entries per-row to keep
 /// output bounded — Pss for an unmapped process is meaningfully
 /// zero, but ShmemPmdMapped=0 etc. are noise rows. Suppressed when
 /// no captured thread has a populated map (older kernels, stripped

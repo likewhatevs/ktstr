@@ -16,8 +16,9 @@ use super::*;
 /// `!self.enforce`) would let violations silently pass even under
 /// enforce=true, defeating the test author's opt-in.
 ///
-/// Parallel to `stuck_sustained_window_catches_real_stuck` above
-/// (same fixture) but explicitly asserts the end-to-end arithmetic
+/// Parallel to `stuck_sustained_window_catches_real_stuck` in
+/// `stall_detection_tests.rs` (same fixture) but explicitly asserts
+/// the end-to-end arithmetic
 /// rather than the canary-style "stall must fail" framing.
 #[test]
 fn enforce_true_with_violation_yields_passed_false() {

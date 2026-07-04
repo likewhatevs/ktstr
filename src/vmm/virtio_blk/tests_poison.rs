@@ -104,10 +104,13 @@ fn hostile_avail_idx_poisons_queue_until_reset() {
     // avail_addr + 2 (after the 2-byte flags field), per
     // virtio-v1.2 §2.7.6. The device's negotiated queue.size is
     // 256 (QUEUE_MAX_SIZE); planting 1000 makes the bounds
-    // check `(1000 - next_avail).0 > 256` fire — even the
-    // smallest possible difference (next_avail = 1 from the
-    // build_desc_chain bump) gives 999 > 256, well clear of
-    // the threshold.
+    // check `(1000 - next_avail).0 > 256` fire. The device's
+    // next_avail is still 0 (build_desc_chain only bumps the
+    // guest-memory avail.idx; the device cursor advances only
+    // on a successful pop, which never happens on the poison
+    // path because the check fires inside AvailIter::new before
+    // next() runs), so the difference is 1000 - 0 = 1000 > 256,
+    // well clear of the threshold.
     let avail_idx_addr = mock.avail_addr().checked_add(2).unwrap();
     mem.write_obj(1000u16, avail_idx_addr).unwrap();
 

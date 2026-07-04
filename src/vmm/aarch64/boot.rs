@@ -115,11 +115,13 @@ const PSTATE_DAIF_MASK: u64 = 0x3C0;
 
 /// Set up vCPU registers for the BSP.
 ///
-/// Per the arm64 boot protocol (Documentation/arm64/booting.rst):
+/// Per the arm64 boot protocol (Documentation/arch/arm64/booting.rst):
 /// - x0 = physical address of the FDT
 /// - PC = kernel entry point
 /// - pstate = EL1h with DAIF masked
-/// - All other registers are undefined (kernel does not depend on them)
+/// - x1 = x2 = x3 = 0 (reserved for future use); satisfied because
+///   KVM_ARM_VCPU_INIT zero-initializes the GP registers and we set
+///   only PC/x0/pstate below. All remaining GP registers are undefined.
 pub fn setup_regs(vcpu: &VcpuFd, entry: u64, fdt_addr: u64) -> Result<()> {
     // Set PC to kernel entry point.
     vcpu.set_one_reg(REG_PC, &entry.to_le_bytes())

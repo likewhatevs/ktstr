@@ -31,11 +31,11 @@
 //!
 //! | Controller | `setup` writes | Methods that touch the controller's files |
 //! |------------|----------------|-------------------------------------------|
-//! | `cpuset`   | always         | `Self::set_cpuset`, `Self::set_cpuset_mems`, `Self::clear_cpuset`, `Self::clear_cpuset_mems` |
-//! | `cpu`      | when `enable_cpu_controller=true` | `Self::set_cpu_max`, `Self::set_cpu_weight` |
-//! | `memory`   | always         | `Self::set_memory_max`, `Self::set_memory_high`, `Self::set_memory_low`, `Self::set_memory_swap_max` |
-//! | `pids`     | always         | `Self::set_pids_max` |
-//! | `io`       | always         | `Self::set_io_weight` |
+//! | `cpuset`   | when `Controller::Cpuset` in the set passed to `setup` (runtime adds it when a `CgroupDef` declares `cpuset`/`cpuset_mems`) | `Self::set_cpuset`, `Self::set_cpuset_mems`, `Self::clear_cpuset`, `Self::clear_cpuset_mems` |
+//! | `cpu`      | when `Controller::Cpu` in the set passed to `setup` (runtime adds it when a `CgroupDef` declares `cpu`) | `Self::set_cpu_max`, `Self::set_cpu_weight` |
+//! | `memory`   | when `Controller::Memory` in the set passed to `setup` (runtime adds it when a `CgroupDef` declares `memory`) | `Self::set_memory_max`, `Self::set_memory_high`, `Self::set_memory_low`, `Self::set_memory_swap_max` |
+//! | `pids`     | when `Controller::Pids` in the set passed to `setup` (runtime adds it when a `CgroupDef` declares `pids`) | `Self::set_pids_max` |
+//! | `io`       | when `Controller::Io` in the set passed to `setup` (runtime adds it when a `CgroupDef` declares `io`) | `Self::set_io_weight` |
 //! | (cgroup-core) | not gated   | `Self::set_freeze`, `Self::move_task`, `Self::move_tasks` |
 //!
 //! `cgroup.freeze` and `cgroup.procs` are cgroup-core files exposed on
@@ -814,25 +814,21 @@ impl CgroupManager {
     ///
     /// # Post-drain settle window
     ///
-    /// The 50ms sleep between [`Self::drain_tasks`] and `rmdir` is a
-    /// concession to the cgroup v2 task-migration RCU grace period.
-    /// Writes to `cgroup.procs` queue the task move but the source
-    /// cgroup's `nr_populated` counter only drops once the per-task
-    /// css_set switch completes — `rmdir` returns EBUSY if the
-    /// counter is non-zero. The kernel's `cgroup_rmdir` path
-    /// (`kernel/cgroup/cgroup.c`) gates on `cgroup_is_populated()`
-    /// which reads `nr_populated`, and the migration RCU callback
-    /// runs from the next softirq tick. 50ms exceeds the longest
-    /// observed callback latency on a moderately-loaded host (worst
-    /// case ~30ms under heavy IRQ pressure on a 4.18-era kernel,
-    /// sub-millisecond on a quiet 6.x kernel).
+    /// Between [`Self::drain_tasks`] and `rmdir`,
+    /// `remove_cgroup_inner` calls `wait_for_cgroup_unpopulated` with
+    /// a 1s budget. Writes to `cgroup.procs` queue the task move but
+    /// the source cgroup's populated state only clears once the
+    /// per-task css_set switch completes — `rmdir` returns EBUSY
+    /// while the cgroup is still populated. Rather than a blind
+    /// sleep, the wait is event-driven: it blocks on an
+    /// inotify(IN_MODIFY) watch of the cgroup's `cgroup.events` file
+    /// and returns as soon as that file reports `populated 0`, so it
+    /// wakes on the actual kernel state-transition write.
     ///
-    /// Without the sleep, the `rmdir` would race the migration RCU
-    /// callback under load and intermittently return EBUSY. A
-    /// per-attempt retry loop would also work, but adds branching
-    /// to a non-hot teardown path; the fixed-window sleep is
-    /// simpler and the 50ms tax on a teardown that is already
-    /// scheduled to absorb a VM shutdown is immaterial.
+    /// The wait falls through to `rmdir` on deadline (or when
+    /// `cgroup.events` is absent / inotify setup fails), so a
+    /// genuinely stuck-populated cgroup still surfaces the same
+    /// EBUSY error from the subsequent `rmdir`.
     ///
     /// # Outstanding-remove cap
     ///
@@ -1842,16 +1838,6 @@ impl CgroupOps for CgroupManager {
     }
 }
 
-/// Drain all tasks from `procs_path` to the cgroup filesystem root.
-///
-/// The root cgroup is exempt from the no-internal-process constraint,
-/// so writes to `/sys/fs/cgroup/cgroup.procs` succeed even when
-/// intermediate cgroups have `subtree_control` set.
-/// ESRCH (task exited) is silently tolerated; other errors are logged.
-/// A `read_to_string` failure or a malformed pid line is surfaced via
-/// `tracing::warn!` — silently dropping either would hide a cgroup
-/// that still contains tasks and send it into cleanup, which then
-/// fails with EBUSY and compounds the confusion.
 /// Block until the cgroup at `cgroup_dir` reports `populated 0` via
 /// its `cgroup.events` file, or until `budget` elapses. Event-driven
 /// via inotify(IN_MODIFY) on the events file so the wait wakes on

@@ -1,7 +1,10 @@
 //! Worker process management and telemetry.
 //!
-//! Workers are `fork()`ed processes (not threads) so each can be placed
-//! in its own cgroup. Key types:
+//! Workers are `fork()`ed processes by default ([`CloneMode::Fork`],
+//! the `#[default]`) so each can be placed in its own cgroup;
+//! [`CloneMode::Thread`] instead uses [`std::thread::spawn`], so those
+//! workers share the parent's `tgid`, address space, and signal-handler
+//! table. Key types:
 //! - [`WorkType`] -- what each worker does
 //! - [`WorkloadConfig`] -- spawn configuration (count, affinity, work type, policy)
 //! - [`WorkloadHandle`] -- RAII handle to spawned workers
@@ -13,8 +16,8 @@
 //! - [`SchedPolicy`] -- Linux scheduling policy for a worker process
 //! - [`MemPolicy`] -- NUMA memory placement policy for worker processes
 //!
-//! See the [WorkSpec Types](https://likewhatevs.github.io/ktstr/guide/concepts/work-types.html)
-//! and [Worker Processes](https://likewhatevs.github.io/ktstr/guide/architecture/workers.html)
+//! See the [WorkSpec Types](https://ktstr.dev/guide/concepts/work-types.html)
+//! and [Worker Processes](https://ktstr.dev/guide/architecture/workers.html)
 //! chapters of the guide.
 //!
 //! # Module layout
@@ -65,15 +68,17 @@
 //!
 //! ## "Churn" vs "Sweep" suffixes on [`WorkType`] variants
 //!
-//! Variants whose names end in `Churn` cycle their target setting
-//! **without ordering** — each iteration picks a fresh value
-//! independently of the previous one. [`WorkType::AffinityChurn`]
-//! samples a random CPU from the effective cpuset on every
-//! iteration; [`WorkType::PolicyChurn`] cycles through the
-//! supported scheduling policies; [`WorkType::PageFaultChurn`]
-//! touches a fresh random subset of pages each cycle. The intent
-//! is high-frequency randomness — exercise the kernel's per-task
-//! state machines under unpredictable transitions.
+//! Variants whose names end in `Churn` cycle their target setting at
+//! high frequency to exercise the kernel's per-task state machines
+//! under rapid transitions. [`WorkType::AffinityChurn`] samples a
+//! random CPU from the effective cpuset on every iteration
+//! (`rand::rng().random_range`); [`WorkType::PageFaultChurn`] touches
+//! a fresh random subset of pages each cycle (xorshift64). Most Churn
+//! variants pick each value randomly and independently of the
+//! previous one; [`WorkType::PolicyChurn`] is the exception — despite
+//! the `Churn` name it cycles through the supported scheduling
+//! policies in a fixed, ordered sequence keyed on the iteration
+//! counter (`iterations % policies.len()`).
 //!
 //! Variants whose names end in `Sweep` rotate their target setting
 //! through an **ordered list or range** — the next value is a
@@ -120,9 +125,11 @@ pub(crate) use worker::{MAX_WAKE_SAMPLES, reservoir_push};
 // `build_nodemask` is the low-level `set_mempolicy(2)` / `mbind(2)`
 // nodemask builder. It's deliberately NOT in the public surface —
 // test authors express NUMA placement through the [`MemPolicy`]
-// enum — but `crate::vmm::host_topology` invokes the syscall
-// directly when warming the per-VM topology cache and needs an
-// in-crate path to the helper.
+// enum — but `crate::vmm::host_topology` invokes `mbind(2)` directly to
+// bind guest memory regions to host NUMA nodes
+// (`crate::vmm::numa_mem`'s `mbind_regions` via
+// `host_topology::mbind_to_nodes`) and needs an in-crate path to
+// the helper.
 pub(crate) use spawn::build_nodemask;
 pub use types::*;
 // schbench_rs is otherwise a private submodule. Its user-facing config type is

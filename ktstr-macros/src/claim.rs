@@ -28,8 +28,9 @@
 //! `use ::ktstr::prelude::*` (which re-exports the trait) to bring the
 //! methods into scope.
 //!
-//! Label source: every method body is `verdict.claim(stringify!(field),
-//! ...)` — the label is the field's source-text identifier. Renaming
+//! Label source: every method body passes `stringify!(field)` as the
+//! label to its dispatch helper (`verdict.claim` / `claim_set` /
+//! `claim_seq`) — the label is the field's source-text identifier. Renaming
 //! the field updates both the method name AND the rendered failure
 //! label in lock-step; a stale call site that referenced the old
 //! method name fails to compile. This is the compile-mechanical
@@ -47,9 +48,12 @@ use syn::{Data, DeriveInput, Fields};
 /// `name` (e.g. `BTreeSet<T>` → `is_path_named(ty, "BTreeSet") == true`).
 /// Used to dispatch container fields onto `claim_set` / `claim_seq`
 /// without forcing the caller to import `BTreeSet` / `Vec` from a
-/// specific module path. Misses `std::collections::BTreeSet<T>` if the
-/// caller uses an alias — acceptable in v1 because the project's
-/// stats structs all use the canonical `BTreeSet` / `Vec` names.
+/// specific module path. Misses a field typed through a user alias
+/// (e.g. `type MySet = BTreeSet<T>; field: MySet`), since only the last
+/// path segment is compared; a fully-qualified `std::collections::BTreeSet<T>`
+/// still matches (its last segment is `BTreeSet`) — acceptable in v1
+/// because the project's stats structs use the canonical `BTreeSet` /
+/// `Vec` names directly.
 fn is_path_named(ty: &syn::Type, name: &str) -> bool {
     if let syn::Type::Path(tp) = ty
         && let Some(ident) = crate::common::path_last_segment_ident(&tp.path)

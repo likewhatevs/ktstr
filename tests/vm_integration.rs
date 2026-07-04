@@ -370,7 +370,7 @@ fn check_event_counter_timeline(result: &VmResult) -> Result<()> {
 /// `(runtime=500us, deadline=1ms, period=10ms)` — a 5% bandwidth
 /// reservation that easily fits on any single CPU, so the
 /// admission-control path (`__checkparam_dl`,
-/// `kernel/sched/deadline.c::dl_overflow`) accepts it.
+/// `kernel/sched/deadline.c::sched_dl_overflow`) accepts it.
 ///
 /// Pins:
 ///   1. `WorkerReport::completed = true` — the worker ran the SCHED_DL

@@ -9,7 +9,7 @@ repository = "https://github.com/likewhatevs/ktstr"
 
 [package]
 name = "ktstr"
-version = "0.20.0"
+version = "0.23.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -18,7 +18,7 @@ description = "Test harness for Linux process schedulers"
 readme = "README.md"
 keywords = ["sched_ext", "scheduler", "testing", "bpf", "linux"]
 categories = ["development-tools::testing"]
-documentation = "https://likewhatevs.github.io/ktstr/api/ktstr/"
+documentation = "https://ktstr.dev/rustdoc/ktstr/"
 exclude = [".build-cache/", "doc/guide/book/", ".github/", ".githooks/", ".config/"]
 
 [dependencies]
@@ -40,7 +40,7 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = { version = "4", optional = true }
 crc32fast = "1.5"
 # Binary serialization for bulk-port TLV payloads (AssertResult,
-# PayloadMetrics, RawPayloadOutput, WorkerReport) and sidecar disk
+# PayloadMetrics, WorkerReport) and sidecar disk
 # persistence (cast_analysis_load). Pre-1.0 — old sidecar /
 # baseline data is disposable; re-running tests regenerates the
 # cache.
@@ -53,7 +53,7 @@ crc32fast = "1.5"
 # requirements, no format-pinning headaches.
 postcard = { version = "1", features = ["use-std"] }
 itoa = "1"
-gix = { version = "0.83", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation", "status", "revision", "progress-tree"] }
+gix = { version = "0.83", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation", "status", "revision", "progress-tree", "tree-editor"] }
 reqwest = { version = "0.13", features = ["blocking"] }
 tar = "0.4"
 tempfile = "3"
@@ -113,14 +113,17 @@ virtio-queue = "0.17"
 vm-superio = "0.8.1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 linkme = "0.3"
-ktstr-macros = { version = "0.20.0", path = "ktstr-macros" }
+ktstr-macros = { version = "0.23.0", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
-# Memory-map /proc/self/exe in `try_flush_profraw` instead of reading
-# the whole binary into a Vec<u8>. Coverage-instrumented test binaries
-# are large (hundreds of MiB to ~1 GiB), and the read+copy cost on the
-# guest's coverage-flush path was a measurable share of teardown
-# latency. Already in the dep tree transitively (blazesym, gix); pinned
-# here so `src/test_support/profraw.rs` doesn't depend on either crate's
+# Memory-map /proc/self/exe in the coverage-instrumentation detection
+# probe (`is_coverage_instrumented_binary` / `find_symbol_vaddrs` in
+# `src/test_support/profraw.rs`) to walk `.symtab` instead of reading the
+# whole binary into a Vec<u8>. Coverage-instrumented test binaries are
+# large (hundreds of MiB to ~1 GiB), so the read+copy cost matters.
+# (`try_flush_profraw` itself no longer parses the ELF — under
+# `cfg(coverage)` it calls the compiler-rt buffer API directly.) Already
+# in the dep tree transitively (blazesym, gix); pinned here so
+# `src/test_support/profraw.rs` doesn't depend on either crate's
 # re-export surface.
 memmap2 = "0.9"
 # DWARF parser for resolving struct-member offsets in jemalloc's tsd_t
@@ -131,7 +134,7 @@ gimli = "0.33"
 rayon = "1"
 # ELF reader/writer. `features = ["build"]` pulls in the full
 # `object::build::elf::Builder` surface used by `elf_strip.rs` and
-# `cache.rs` for SHT_NOBITS rewriting. `cargo tree --duplicates` may
+# `src/cache/vmlinux_strip.rs` for SHT_NOBITS rewriting. `cargo tree --duplicates` may
 # still report a second `object` instance reached transitively via
 # `ar_archive_writer` (build-dep of `psm` / `stacker`) with only the
 # `memchr` feature; that second instance is a build-script compilation
@@ -213,8 +216,11 @@ base64 = { version = "0.22", optional = true }
 # mallctl reads return populated values instead of failing with
 # EPERM; `host_heap::collect` depends on this.
 #
-# Only referenced from the `#[global_allocator]` declarations in the
-# four `src/bin/*.rs` entry points. Gated behind the `cli-bins`
+# Referenced from the `#[global_allocator]` declaration in `src/lib.rs`
+# (gated on `cli-bins`), which every bin that links the crate inherits;
+# only `ktstr-jemalloc-alloc-worker` (`src/bin/jemalloc_alloc_worker.rs`)
+# declares its own because it links via `#[path]` rather than the crate.
+# Gated behind the `cli-bins`
 # feature; with the feature off, `tikv-jemalloc-ctl`'s mallctl reads
 # return Err and `host_heap::collect` lands `None` as documented on
 # the ctl dep below — same observable shape, no allocator swap.
@@ -244,47 +250,29 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 # colored, indoc) so only the library trait is pulled in.
 grex = { version = "1.4", default-features = false, optional = true }
 # SHA-256 for one-shot digest verification of downloaded artifacts
-# (fetch.rs), cache-key fingerprinting (disk_template.rs), seeded
-# key derivation (fun.rs), and model-cache integrity checks
-# (test_support/model). Not on the test hot path.
+# (fetch.rs), cache-key fingerprinting (disk_template.rs), and seeded
+# key derivation (fun.rs). Not on the test hot path.
 sha2 = "0.11"
-# Lowercase hex encoding for SHA-256 digest comparisons in the
-# model-cache verify path.
+# Lowercase hex encoding for SHA-256 digest comparisons.
 hex = "0.4"
-# Local inference backend for `OutputFormat::LlmExtract`. CPU-only —
-# `openmp` enables OpenMP-parallel matmul (no GPU offload). The GGUF
-# carries its own tokenizer surface, so no separate tokenizer crate is
-# needed. The `sampler` feature enables the `LlamaSampler` builder API
-# (`greedy()`, `accept()`, `sample()`) used by `invoke_with_model`.
-# Build dep on cmake — the linked llama.cpp C++ sources are built from
-# source via `llama-cpp-sys-2`'s build script.
-#
-# Gated behind the `llm` feature (in `default` to preserve behavior,
-# but `--no-default-features` consumers can drop it). When the
-# feature is off, the entire `test_support::model` module is
-# compiled out, and downstream callers in `eval.rs`, `payload_run.rs`,
-# and `cargo-ktstr` are gated alongside it.
-llama-cpp-2 = { version = "0.1.145", default-features = false, features = ["openmp", "sampler"], optional = true }
-# Stateful UTF-8 decoder required by `LlamaModel::token_to_piece` —
-# a single token may carry a partial multi-byte UTF-8 sequence and
-# only a stateful decoder can stitch consecutive tokens into valid
-# UTF-8 without dropping bytes. Already a transitive dep of
-# `llama-cpp-2`; pinned as a direct dep so the call site's intent is
-# explicit and survives a future llama-cpp-2 reorganization that
-# changes its re-export surface. Tied to the same `llm` feature.
-encoding_rs = { version = "0.8", optional = true }
-# Error-enum derives for the `InferenceError` type that
-# `load_inference` and `invoke_with_model` return. Already a
-# transitive dep via `llama-cpp-2`'s own thiserror-derived error
-# types; promoted to a direct dep so the migration's
-# `#[derive(thiserror::Error)]` site is explicit. Pinned at the v2
-# series to match what `llama-cpp-2` already pulls in (v2.0.18);
-# v2's `#[source]` attribute matches the structured-error
-# pattern this crate's error-handling design favors.
+# Two-sample significance testing for perf-delta's `--noise-adjust` mode
+# (src/stats/noise.rs): the `StudentsT` distribution (cdf/sf) turns a Welch
+# t-statistic into a p-value, and `Statistics::variance` gives per-side Bessel
+# (N-1) sample variance. Replaces the old within-side range-spread gate, which
+# inverted signal and noise — it suppressed a real regression whose degraded
+# side was high-variance while reporting trivial low-variance moves.
+# `default-features = false` drops the `nalgebra` feature (multivariate
+# distributions we do not use); univariate `StudentsT` is ungated, so the add is
+# +2 crates (statrs + approx), not the full nalgebra linear-algebra stack.
+statrs = { version = "0.18", default-features = false }
+# Error-enum derives (`#[derive(thiserror::Error)]`) for the crate's
+# structured error types (disk_config, topology, workload types).
+# v2's `#[source]` attribute matches the structured-error pattern
+# this crate's error-handling design favors.
 thiserror = "2"
 
 # Compiled regex patterns for the token-based pattern_key
-# normalizer in `ctprof_compare.rs`. Used to express the
+# normalizer in `src/ctprof_compare/pattern.rs`. Used to express the
 # spec rules in `classify_token` (`^\d+$`, `^[0-9a-f]+$`,
 # `^[A-Za-z]+\d+$`, `^\d+[A-Za-z]+$`) literally rather than as
 # hand-rolled char loops, so the rules read identically to the
@@ -346,7 +334,7 @@ panic = "abort"
 debug = "line-tables-only"
 
 [features]
-default = ["llm", "cli-bins"]
+default = ["cli-bins"]
 # `integration` pulls `cli-bins` because the jemalloc introspection
 # fixtures (`ktstr-jemalloc-{probe,alloc-worker}`, gated on cli-bins +
 # integration) are `env!(CARGO_BIN_EXE_…)`'d by their e2es, and cargo
@@ -358,8 +346,9 @@ default = ["llm", "cli-bins"]
 integration = ["cli-bins"]
 # Dependencies for the `src/bin/*.rs` entry points. The two
 # user-facing bins (`ktstr`, `cargo-ktstr`) carry
-# `required-features = ["cli-bins"]`; the two jemalloc test fixtures
-# (`ktstr-jemalloc-probe`, `ktstr-jemalloc-alloc-worker`) additionally
+# `required-features = ["cli-bins"]`; the four integration-gated fixture
+# bins (`ktstr-jemalloc-probe`, `ktstr-jemalloc-alloc-worker`,
+# `ktstr-schbench-validate`, `ktstr-taobench-validate`) additionally
 # require `integration`, so a default `cargo install ktstr` builds only
 # the two user-facing bins.
 #   - `tikv-jemallocator` — process-wide `#[global_allocator]` swap.
@@ -373,7 +362,7 @@ integration = ["cli-bins"]
 # `default-features = false`:
 #
 #   [dev-dependencies]
-#   ktstr = { version = "0.20.0", default-features = false, features = ["llm"] }
+#   ktstr = { version = "0.23.0", default-features = false }
 cli-bins = [
     "dep:tikv-jemallocator",
     "dep:clap_complete",
@@ -393,14 +382,6 @@ export = ["dep:base64"]
 # compiles libbpf + blazesym (requires git, make, gcc, clang,
 # elfutils-devel, zlib-devel on the host; takes several minutes).
 wprof = ["ktstr-macros/wprof"]
-# Local-CPU LLM extraction (`OutputFormat::LlmExtract`) via the
-# bundled Qwen3-4B GGUF. Pulls in `llama-cpp-2` (compiles llama.cpp
-# C++ via cmake — minutes of build time on a cold cache) plus
-# `encoding_rs`. Default-ON to preserve current behavior; consumers
-# wanting a leaner library (no LLM inference path) can
-# `--no-default-features` and re-enable just the features they want
-# (e.g. `cargo build --no-default-features --features remote-cache,pretty-labels`).
-llm = ["dep:llama-cpp-2", "dep:encoding_rs"]
 # Pretty thread-name labels in `ctprof_compare` output. Enables
 # `grex` regex synthesis to render multi-member buckets as a
 # minimal regex (e.g. `tokio-runtime-worker-[0-3]`). With this
@@ -480,7 +461,7 @@ flate2 = "1"
 libbpf-cargo = "0.26"
 reqwest = { version = "0.13", features = ["blocking"] }
 # SHA-256 for build-script tarball integrity verification (busybox
-# pin in build.rs). Same crate the runtime uses for model artifact
+# pin in build.rs). Same crate the runtime uses for artifact
 # verification — single algorithm across every hashing site.
 sha2 = "0.11"
 # Stable hash for BTF content drift detection in build.rs.

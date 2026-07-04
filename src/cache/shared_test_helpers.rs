@@ -1,7 +1,7 @@
 //! Test fixtures shared across the cache submodule test files.
 //!
 //! [`test_metadata`] and [`create_fake_image`] are referenced from
-//! tests in `cache_dir.rs`, `housekeeping.rs`, and `metadata.rs`.
+//! tests in `cache_dir_tests.rs` and `metadata.rs`.
 //! Keeping them here in a single module prevents drift if the
 //! [`KernelMetadata`] field set or the in-test image content changes.
 

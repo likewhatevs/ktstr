@@ -29,7 +29,7 @@
 //!   the pooled latency samples, not as a mean of per-worker CVs —
 //!   see [`CgroupStats::wake_latency_cv`] for the masking caveat.
 //!
-//! See the [Checking](https://likewhatevs.github.io/ktstr/guide/concepts/checking.html)
+//! See the [Checking](https://ktstr.dev/guide/concepts/checking.html)
 //! chapter of the guide.
 
 use crate::workload::WorkerReport;

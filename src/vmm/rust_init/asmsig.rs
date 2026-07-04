@@ -5,8 +5,8 @@
 //! is needed.
 
 /// Async-signal-safe rendering of `value` as lowercase hex (no `0x`
-/// prefix, no leading-zero trim) into the tail of `buf`. Returns the
-/// byte slice covering the rendered digits.
+/// prefix, no leading-zero trim) filling all 16 bytes of `buf`.
+/// Returns `&buf[..]`, the full 16-byte slice.
 ///
 /// Used by [`fatal_signal_handler`], where every libc allocator
 /// boundary is forbidden — `format!`, `write!`, and even

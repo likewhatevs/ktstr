@@ -132,6 +132,7 @@ mod process;
 mod relay;
 mod scheduler;
 mod topology;
+mod verifier_workload;
 
 pub(crate) use asmsig::*;
 pub(crate) use dump::*;

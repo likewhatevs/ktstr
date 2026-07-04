@@ -10,12 +10,13 @@
 //! this helper.
 //!
 //! Kept in its own file (rather than nested in
-//! `ktstr_sched_tests.rs`) because the ktstr early-dispatch path
-//! intercepts nextest `--list` and `--exact` for any test binary
-//! that registers `KtstrTestEntry` entries — plain `#[test]`
-//! functions in such a binary are filtered out of the listing.
-//! This file registers no gauntlet entries, so the standard
-//! harness discovers its `#[test]` functions normally.
+//! `ktstr_sched_tests.rs`) simply because it carries no ktstr
+//! entries or schedulers. The ktstr early-dispatch path only
+//! intercepts nextest `--list`/`--exact` when a binary has real
+//! `KtstrTestEntry` entries or declared schedulers
+//! (`has_real_tests || has_schedulers`); this file has neither, so
+//! interception never fires and the standard harness discovers its
+//! `#[test]` functions normally.
 
 use grok::Grok;
 
@@ -24,7 +25,7 @@ use grok::Grok;
 /// — both files compile separately under cargo (each integration
 /// test is its own binary), so a shared function would require a
 /// helper crate or a `#[path = ...]` include. Duplicating the
-/// 7-line helper keeps the dep graph flat; the unit tests here
+/// small (~10-line) helper keeps the dep graph flat; the unit tests here
 /// pin the contract via direct input, and the production call
 /// site in `ktstr_sched_tests.rs` uses the same grok pattern.
 fn parse_stall_duration_seconds(kmsg: &str) -> Option<f64> {

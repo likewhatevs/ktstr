@@ -134,10 +134,10 @@ fn worktype_clone_mode_gauntlet_covers_epoll_and_cgroup(_ctx: &Ctx) -> Result<As
     // above would otherwise mask. The cgroups persist post-run (workers
     // exit; no remove), and this test body runs in the same guest as the
     // forked workers, so it observes the dirs they created.
-    // This literal mirrors `churn_cgroup_name(i)` and the default
-    // `resolve_cgroup_root` in worker/mod.rs (a `tests/` crate cannot
-    // import those `pub(crate)`/private helpers). A name-format change
-    // there makes this path miss, so the assertion fails loudly.
+    // This literal mirrors `churn_cgroup_name(i)` (worker/mod.rs) and the
+    // default from `resolve_cgroup_root` (test_support/args.rs) (a `tests/`
+    // crate cannot import those `pub(crate)`/private helpers). A name-format
+    // change there makes this path miss, so the assertion fails loudly.
     for i in 0..groups {
         let dir = format!("/sys/fs/cgroup/ktstr/wt-cgroup-churn-{i}");
         if !std::path::Path::new(&dir).is_dir() {

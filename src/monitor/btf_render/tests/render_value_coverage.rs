@@ -5,7 +5,7 @@ use super::*;
 
 // ---------------------------------------------------------------------------
 // RenderedValue scalar coercion accessors: as_i64 / as_f64 / as_bool and the
-// typed-array variants. The as_u64 surface is already pinned above; these
+// typed-array variants. The as_u64 surface is already pinned in rendered_value_accessors.rs; these
 // cover the sibling accessors' per-variant arms (mod.rs as_i64 ~347, as_f64
 // ~361, as_bool ~385, as_i64_array / as_f64_array, and array_elements'
 // Ptr-deref peel).
@@ -552,7 +552,7 @@ fn display_anonymous_struct_template_omits_name_and_suppresses_zero_common_field
 // ---------------------------------------------------------------------------
 
 /// A 1-byte char-encoded BTF int renders as `RenderedValue::Char`. The
-/// `is_char()` arm (mod.rs ~2618) is reached only for `needed == 1`; encoding
+/// `is_char()` arm (mod.rs ~2632) is reached only for `needed == 1`; encoding
 /// bit 2 (`BTF_INT_CHAR`) sets it.
 #[test]
 fn render_char_int_renders_as_char_variant() {
@@ -575,7 +575,7 @@ fn render_char_int_renders_as_char_variant() {
 
 /// A BTF int wider than 8 bytes (e.g. `__int128`, size 16) cannot fit a u64,
 /// so the renderer falls back to a `Bytes` hex dump rather than discarding the
-/// upper bits (mod.rs ~2626).
+/// upper bits (mod.rs ~2639).
 #[test]
 fn render_int_wider_than_8_bytes_falls_back_to_bytes() {
     let mut strings: Vec<u8> = vec![0];
@@ -605,7 +605,7 @@ fn render_int_wider_than_8_bytes_falls_back_to_bytes() {
 
 /// An Enum value with fewer bytes than the enum's declared size yields a
 /// `Truncated` whose partial is the raw hex of what was available (mod.rs
-/// ~2157). A full-width Enum resolves its variant name (~2186).
+/// ~2171). A full-width Enum resolves its variant name (~2200).
 #[test]
 fn render_enum_truncated_and_variant_resolution() {
     let mut strings: Vec<u8> = vec![0];
@@ -653,7 +653,7 @@ fn render_enum_truncated_and_variant_resolution() {
 }
 
 /// Enum64 mirrors the Enum32 decode: truncation surfaces hex, full-width
-/// resolves the variant. Exercises the Enum64 arm (mod.rs ~2198).
+/// resolves the variant. Exercises the Enum64 arm (mod.rs ~2212).
 #[test]
 fn render_enum64_truncated_and_variant_resolution() {
     let mut strings: Vec<u8> = vec![0];
@@ -691,7 +691,7 @@ fn render_enum64_truncated_and_variant_resolution() {
 }
 
 /// Rendering a standalone `BTF_KIND_VAR` type id forwards to its underlying
-/// type against the supplied bytes (mod.rs ~2563). libbpf wraps Var in a
+/// type against the supplied bytes (mod.rs ~2577). libbpf wraps Var in a
 /// Datasec normally; this hits the standalone path directly.
 #[test]
 fn render_standalone_var_forwards_to_underlying_type() {
@@ -743,7 +743,7 @@ fn render_standalone_var_forwards_to_underlying_type() {
 }
 
 /// A `BTF_KIND_FWD` rendered directly (its body is in another BTF) yields
-/// `Unsupported` with a forward-declaration reason (mod.rs ~2546).
+/// `Unsupported` with a forward-declaration reason (mod.rs ~2560).
 #[test]
 fn render_fwd_type_is_unsupported_forward_declaration() {
     let mut strings: Vec<u8> = vec![0];
@@ -769,7 +769,7 @@ fn render_fwd_type_is_unsupported_forward_declaration() {
 
 /// A bitfield whose base type is neither Int nor Enum (here a Ptr) is treated
 /// as unsigned by `render_bitfield` — the `_ => false` signedness arm (mod.rs
-/// ~4570). The result is a `Uint` of the raw bits, never sign-extended.
+/// ~4584). The result is a `Uint` of the raw bits, never sign-extended.
 #[test]
 fn render_bitfield_non_int_non_enum_base_is_unsigned() {
     let mut strings: Vec<u8> = vec![0];
@@ -825,7 +825,7 @@ fn render_bitfield_non_int_non_enum_base_is_unsigned() {
 /// `type_size` resolves an array member's size as `len * elem_size` and peels
 /// a Const-wrapped member to its underlying size. Reached via a struct with a
 /// `u32 arr[3]` member and a `const u32` member: rendering the struct sizes
-/// each member through `type_size` (mod.rs Array arm ~4734, Const arm ~4740).
+/// each member through `type_size` (mod.rs Array arm ~4748, Const arm ~4754).
 #[test]
 fn render_struct_sizes_array_and_const_members_via_type_size() {
     let mut strings: Vec<u8> = vec![0];
@@ -928,7 +928,7 @@ fn uint32(value: u64) -> RenderedValue {
 // unsizable_chase_reason variants reached through a cast chase: a Func / Void
 // pointee target produces a distinct, type-named skip reason instead of the
 // generic "unresolvable size" message. Pins the per-kind diagnostic arms
-// (mod.rs ~3224 Func, ~3241 Void).
+// (mod.rs ~3238 Func, ~3255 Void).
 // ---------------------------------------------------------------------------
 
 /// A kernel cast whose recovered target type is a `BTF_KIND_FUNC` cannot be

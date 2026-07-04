@@ -589,10 +589,11 @@ fn walk_scx_tasks_global_zero_kva_returns_empty() {
 /// invariant). Walker returns no task KVAs.
 #[test]
 fn walk_scx_tasks_global_empty_list_returns_empty() {
-    // page_offset = 0 makes the GuestKernel's text_kva_to_pa
-    // return KVA itself for KVAs >= __START_KERNEL_map. The KVA
-    // we choose is in the text mapping range so the translation
-    // lands at a sensible offset within our test buffer.
+    // phys_base = 0 (new_for_test hardcodes it) so
+    // text_kva_to_pa(kva) = kva - START_KERNEL_MAP: a head KVA at
+    // START_KERNEL_MAP + 0x100 maps to PA 0x100 inside the test
+    // buffer. (page_offset governs only the direct-map kva_to_pa
+    // used by translate_any_kva, not the text-symbol head read.)
     let head_kva = crate::monitor::symbols::START_KERNEL_MAP + 0x100;
     let head_pa = head_kva.wrapping_sub(crate::monitor::symbols::START_KERNEL_MAP) as usize;
     let mut buf = vec![0u8; 0x1000];

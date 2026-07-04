@@ -6,10 +6,11 @@
 //! binary's executable, kept out of `ktstr.rlib` to avoid bloating
 //! every library consumer (each test binary, scheduler-author
 //! crates depending on `ktstr` as a dev-dep). At cargo-ktstr
-//! startup, [`crate::vmm::guest_comms`] inherits an env var pointing
-//! at a tempfile holding the blob bytes; helpers in this module
-//! read the env var and load the file on demand at the point the
-//! library actually needs to pack the blob into an initramfs.
+//! startup, `cargo-ktstr` extracts each blob to a tempfile and
+//! exports its path via an env var; child processes it spawns
+//! inherit the var, and helpers in this module read it and load the
+//! file on demand at the point the library actually needs to pack
+//! the blob into an initramfs.
 //!
 //! Required entry point: `cargo ktstr <SUB>`. Direct `cargo nextest
 //! run` invocations bypass the cargo-ktstr setup and leave the env

@@ -435,8 +435,10 @@ impl VirtioBlkPci {
 
     /// Apply a common-cfg register write at BAR-region offset `off`. Each
     /// register maps to a transport-neutral core op (the queue-config /
-    /// feature-lock gates live inside the op); read-only registers and the
-    /// INTx-inert MSI-X registers are dropped.
+    /// feature-lock gates live inside the op); the MSI-X vector-select
+    /// registers (`CC_MSIX_CONFIG`, `CC_QUEUE_MSIX_VECTOR`) latch the
+    /// (clamped) guest-assigned vector into the shared `MsixState`, and
+    /// only read-only registers are dropped.
     ///
     /// Width: the register is decoded from `off` alone and `get_u32` takes the
     /// low <=4 bytes. This relies on the Linux-width access model — `vp_modern`

@@ -42,10 +42,12 @@ pub(crate) use wire_format::{
 ///   - Clean source tree, cache miss → build, store at
 ///     `local-{hash7}-{arch}-kc{suffix}`, return cache entry dir
 ///     with `is_dirty=false`.
-///   - Clean source tree, cache hit → skip build, emit a stderr
-///     line referencing the user's raw input path, the resolved
-///     cache key, and the build age, then return cache entry dir
-///     with `is_dirty=false`.
+///   - Clean source tree, cache hit → skip build, log a
+///     `tracing::info!` cache-hit line referencing the user's raw
+///     input path, the resolved cache key, and the build age
+///     (rendered on stderr only when `RUST_LOG` enables the `info`
+///     level; suppressed under the default `warn` filter), then
+///     return cache entry dir with `is_dirty=false`.
 ///   - Dirty source tree → build in source, skip cache store,
 ///     return canonical source dir with `is_dirty=true`. The
 ///     caller appends `_dirty` to the kernel label so the test
@@ -58,8 +60,8 @@ pub(crate) use wire_format::{
 /// layout (`<dir>/arch/<arch>/boot/<image_name>`) are both probed.
 ///
 /// `raw_input` is the verbatim user-supplied `--kernel` argument
-/// before canonicalization — used in the cache-hit stderr line so
-/// the operator sees the path they actually typed (e.g.
+/// before canonicalization — used in the cache-hit `tracing::info!`
+/// line so the operator sees the path they actually typed (e.g.
 /// `../linux`) rather than the resolved canonical form, and in
 /// the resolve-failure error so a typo names whatever the user
 /// supplied.
@@ -176,10 +178,10 @@ pub(crate) fn canonicalize_cache_dir(cache_dir: PathBuf) -> PathBuf {
 /// `Version` ids before calling here) to a `(label, dir)` tuple.
 ///
 /// Extracted from `resolve_kernel_set`'s rayon body so the per-
-/// spec match arm is one function call rather than five inline
-/// arms duplicated across the parallel and sequential paths.
-/// Each non-Range arm here mirrors what the original sequential
-/// loop did.
+/// spec match arm is one shared function rather than five inline
+/// arms: [`resolve_one_spec`] fans a Range out to per-version
+/// `Version` ids and calls here once per version (all on the same
+/// bounded rayon pool), and every other spec calls here once.
 ///
 /// Range fan-out lives on the caller because the
 /// `expand_kernel_range` step yields a `Vec<String>` that has to
@@ -260,11 +262,25 @@ pub(crate) fn resolve_one(
         KernelId::Git {
             ref url,
             ref git_ref,
+            ref_kind,
         } => {
-            let cache_dir = ktstr::cli::resolve_git_kernel(url, git_ref, "cargo ktstr", mp)
-                .map_err(|e| format!("resolve git+{url}#{git_ref}: {e:#}"))?;
+            // Auto-discovery test path: no build-flag overrides (force /
+            // clean / cpu_cap / extra_kconfig are `cargo ktstr kernel
+            // build --kernel git+…`-only).
+            let cache_dir = ktstr::cli::resolve_git_kernel(
+                url,
+                git_ref,
+                ref_kind,
+                "cargo ktstr",
+                mp,
+                false,
+                false,
+                None,
+                None,
+            )
+            .map_err(|e| format!("resolve git+{url}#{git_ref}: {e:#}"))?;
             let dir = canonicalize_cache_dir(cache_dir);
-            let label = git_kernel_label(url, git_ref);
+            let label = git_kernel_label(url, git_ref, ref_kind);
             Ok((label, dir))
         }
         KernelId::Range { start, end, .. } => {
@@ -313,13 +329,16 @@ pub(crate) fn resolve_one(
 ///   (e.g. `6.14.2`, `6.15-rc3`).
 /// - CacheKey → the version prefix (everything before the first
 ///   `-tarball-` / `-git-` / `-local-` component).
-/// - Git → `git_{owner}_{repo}_{ref}` extracted from the URL +
-///   git ref.
+/// - Git → `git_{owner}_{repo}_{kind}_{ref}` extracted from the URL,
+///   the ref kind (tag/branch/sha), and the git ref.
 ///
 /// The downstream [`ktstr::test_support::sanitize_kernel_label`]
 /// applies the `kernel_` prefix and `[a-z0-9_]+` normalisation; this
 /// label is the human-meaningful payload it operates on.
-pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String> {
+pub(crate) fn resolve_kernel_set(
+    specs: &[String],
+    include_eol: bool,
+) -> Result<Vec<(String, PathBuf)>, String> {
     preflight_collision_check(specs)?;
     // One progress group shared across every parallel worker: each
     // download/clone adds its own bar to the group's MultiProgress
@@ -328,7 +347,7 @@ pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBu
     // bars linger into the build/test phase. `?` is applied AFTER the
     // clear so an error path still tidies the terminal.
     let mp = ktstr::cli::FetchProgress::new();
-    let resolved = resolve_specs_parallel(specs, &mp);
+    let resolved = resolve_specs_parallel(specs, &mp, include_eol);
     mp.clear();
     let resolved = dedupe_resolved(resolved?);
     detect_label_collisions(&resolved)?;
@@ -358,12 +377,14 @@ pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBu
 ///   - Range → fetch releases.json once, then per-version
 ///     cache lookup → maybe download + build for each
 ///     expanded version.
-///   - Git → shallow clone → cache lookup → maybe build.
+///   - Git → resolve the commit (kind-directed ls-remote) → cache
+///     lookup → GitHub codeload snapshot or non-GitHub shallow
+///     clone → maybe build.
 ///
 /// Two phases of work happen behind the per-spec resolvers:
-/// (1) network I/O — kernel.org tarball download or
-///     `git_clone` shallow fetch — which is independent
-///     across specs and overlaps freely.
+/// (1) network I/O — kernel.org tarball download, a GitHub codeload
+///     snapshot, or a `git_clone` shallow fetch — which is
+///     independent across specs and overlaps freely.
 /// (2) build — `make -j$(nproc)` invoked under an LLC flock
 ///     plus a cgroup v2 sandbox (`acquire_build_reservation`
 ///     in `kernel_build_pipeline`). The LLC flock is taken
@@ -390,46 +411,78 @@ pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBu
 /// own lock and finds the just-written entry, skipping the
 /// redundant build.
 ///
-/// `flat_map_iter` flattens Range expansion under one rayon
-/// worker: this fn resolves every version of a single
-/// Range spec sequentially via `.map(...).collect::<Vec<_>>()`
-/// before returning the Vec, so a 5-version range
-/// serializes its five resolves against itself within one
-/// worker. Peer specs (other top-level `--kernel` arguments)
-/// still parallelize across workers — only versions WITHIN
-/// one Range are serial. The serialization is acceptable
-/// because the per-version build phase is already serialized
-/// at the LLC-flock layer (see comment above), so the lost
-/// intra-range download overlap is a small fraction of total
-/// wall time on multi-version Range invocations.
+/// A Range spec expands to N versions; this fn resolves them
+/// concurrently via [`resolve_versions_parallel`] rather than
+/// serializing versions against itself. That is the same
+/// parallelism peer specs (other top-level `--kernel` arguments)
+/// already get: builds do NOT serialize against each other (the
+/// LLC flock is shared — see above), and each expanded version is
+/// a distinct tarball cache key hitting its own per-key store
+/// lock, so a range's versions are as independent as separate
+/// `--kernel` flags.
+///
+/// Fail-fast is unchanged from the pre-parallel form: the helper's
+/// `collect` gathers every version's `Result`, then the outer
+/// `collect::<Result<_, _>>` in `resolve_specs_parallel` aborts on
+/// the first Err it observes — which version surfaces is not
+/// deterministic under concurrency, but a single failure still
+/// aborts the whole resolve just as the sequential loop did.
 fn resolve_one_spec(
     trimmed: String,
     mp: &ktstr::cli::FetchProgress,
+    include_eol: bool,
 ) -> Vec<Result<(String, PathBuf), String>> {
     use ktstr::kernel_path::KernelId;
 
     // Validation runs first so an inverted Range bails
     // before any I/O — same diagnostic timing the
-    // sequential loop preserved.
+    // pre-parallel loop preserved.
     let id = KernelId::parse(&trimmed);
     if let Err(e) = id.validate() {
         return vec![Err(format!("--kernel {id}: {e}"))];
     }
     match id {
         KernelId::Range { start, end, .. } => {
-            match ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr") {
-                Ok(versions) => versions
-                    .into_iter()
-                    .map(|ver| {
-                        resolve_one_with_progress(KernelId::Version(ver.clone()), mp)
-                            .map_err(|e| format!("resolve kernel {ver}: {e}"))
-                    })
-                    .collect::<Vec<_>>(),
+            match ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr", include_eol) {
+                Ok(versions) => resolve_versions_parallel(versions, |ver| {
+                    resolve_one_with_progress(KernelId::Version(ver.to_string()), mp)
+                        .map_err(|e| format!("resolve kernel {ver}: {e}"))
+                }),
                 Err(e) => vec![Err(format!("{e:#}"))],
             }
         }
         other => vec![resolve_one_with_progress(other, mp)],
     }
+}
+
+/// Resolve every version of an expanded Range concurrently,
+/// preserving input (version) order in the returned Vec.
+///
+/// `Vec::into_par_iter` is an `IndexedParallelIterator`, so
+/// `collect` writes each result into its input slot — the output
+/// is in the same order as `versions` regardless of which worker
+/// finishes first (so a downstream `resolved[0] -> KTSTR_KERNEL`
+/// choice stays deterministic). The nested `into_par_iter` runs on
+/// whatever rayon pool the caller is installed under
+/// ([`resolve_specs_parallel`]'s bounded pool), sharing it via
+/// work-stealing rather than spawning a second pool, so
+/// `KTSTR_KERNEL_PARALLELISM` still bounds total width. `collect`
+/// gathers EVERY version's `Result` (Ok and Err alike); the
+/// caller's outer `collect::<Result<_, _>>` is what aborts the
+/// cohort on the first Err.
+///
+/// The per-version `resolve` closure is injected so this
+/// concurrency + order contract can be unit-tested without
+/// network / build I/O.
+fn resolve_versions_parallel<R>(
+    versions: Vec<String>,
+    resolve: R,
+) -> Vec<Result<(String, PathBuf), String>>
+where
+    R: Fn(&str) -> Result<(String, PathBuf), String> + Sync,
+{
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    versions.into_par_iter().map(|ver| resolve(&ver)).collect()
 }
 
 /// `resolve_one` plus per-resolve progress feedback.
@@ -471,17 +524,18 @@ fn resolve_one_with_progress(
 /// detection.
 ///
 /// Result-collecting fail-fast: rayon's `collect` on
-/// `Result<_, _>` short-circuits on the first error, so a
-/// single failed spec aborts the rest. This matches the
-/// pre-parallel loop's `?` propagation; the operator sees
-/// the first failure even though peers may still be in
-/// flight (their cleanup is owned by their tempdirs going
-/// out of scope, see `download_and_cache_version` /
-/// `resolve_git_kernel` for the `tempfile::TempDir`-driven
-/// teardown).
+/// `Result<_, _>` aborts on the first Err it observes — which
+/// failing spec surfaces is not deterministic under concurrency —
+/// discarding the other in-flight results. A single failure still
+/// aborts the whole resolve, matching the pre-parallel loop's `?`
+/// propagation (that loop surfaced errors in spec order). Peers
+/// still in flight clean up via their tempdirs going out of scope
+/// (see `download_and_cache_version` / `resolve_git_kernel` for
+/// the `tempfile::TempDir`-driven teardown).
 fn resolve_specs_parallel(
     specs: &[String],
     mp: &ktstr::cli::FetchProgress,
+    include_eol: bool,
 ) -> Result<Vec<(String, PathBuf)>, String> {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -545,7 +599,7 @@ fn resolve_specs_parallel(
                     Some(trimmed.to_string())
                 }
             })
-            .flat_map_iter(|trimmed| resolve_one_spec(trimmed, mp).into_iter())
+            .flat_map_iter(|trimmed| resolve_one_spec(trimmed, mp, include_eol).into_iter())
             .collect::<Result<Vec<_>, _>>()
     };
     match bounded_pool {
@@ -554,35 +608,44 @@ fn resolve_specs_parallel(
     }
 }
 
-/// Acquire source, configure, build, and cache a kernel image.
+/// Resolve the `--cpu-cap` flag into a build reservation plan, rejecting
+/// the `KTSTR_BYPASS_LLC_LOCKS` conflict up front so operators see the
+/// parse-time error, not an opaque pipeline bail later. Shared by the
+/// tarball / source path ([`kernel_build_one`]) and the git path
+/// ([`ktstr::cli::resolve_git_kernel`]).
+fn resolve_cpu_cap(cpu_cap: Option<usize>) -> Result<Option<cli::CpuCap>, String> {
+    if cpu_cap.is_some() && ktstr::bypass_llc_locks_active() {
+        return Err(
+            "--cpu-cap conflicts with KTSTR_BYPASS_LLC_LOCKS=1; unset one of them. \
+             --cpu-cap is a resource contract; bypass disables the contract entirely."
+                .to_string(),
+        );
+    }
+    cli::CpuCap::resolve(cpu_cap).map_err(|e| format!("{e:#}"))
+}
+
+/// Acquire source, configure, build, and cache a kernel image from a
+/// single unified `--kernel` spec.
 ///
-/// `version` accepts `MAJOR.MINOR[.PATCH][-rcN]` for a single tarball,
-/// `MAJOR.MINOR` (a major.minor prefix that resolves to the latest
-/// patch in that series), or `START..END` for a range that expands
-/// against kernel.org's `releases.json` to every `stable` /
-/// `longterm` release inside the inclusive interval. A range is
-/// detected via [`ktstr::kernel_path::KernelId::parse`] and
-/// dispatched here to [`kernel_build_one`] per resolved version,
-/// sharing the download / cache-lookup / build pipeline that
-/// single-version invocations use. Range mode collects per-version
-/// errors as a best-effort summary: a build failure on one version
-/// is reported and the iteration continues to the next, so a stale
-/// endpoint doesn't block the rest of the range from caching.
-///
-/// `--git` and `--source` paths bypass range expansion (range
-/// applies to tarball downloads only) and forward unchanged to
-/// [`kernel_build_one`].
-#[allow(clippy::too_many_arguments)]
+/// The spec parses to a [`ktstr::kernel_path::KernelId`] whose variant
+/// selects the source: a `Version` (`6.14.2`, or a `MAJOR.MINOR` prefix
+/// resolving to the latest patch) or omitted `--kernel` downloads a
+/// tarball; a `Range` (`START..END`) expands against kernel.org's
+/// `releases.json` and builds every `stable` / `longterm` release in
+/// the inclusive interval; a `Path` builds a local source tree; a `Git`
+/// source is fetched and built via [`ktstr::cli::resolve_git_kernel`]; a
+/// `CacheKey` is rejected (it names an already-built entry). Range mode
+/// collects per-version errors as a best-effort summary — a build
+/// failure on one version is reported and the iteration continues, so a
+/// stale endpoint doesn't block the rest of the range from caching.
 pub(crate) fn kernel_build(
-    version: Option<String>,
-    source: Option<PathBuf>,
-    git: Option<String>,
-    git_ref: Option<String>,
+    kernel: Option<String>,
     force: bool,
     clean: bool,
     cpu_cap: Option<usize>,
     extra_kconfig: Option<PathBuf>,
     skip_sha256: bool,
+    include_eol: bool,
 ) -> Result<(), String> {
     ktstr::cli::check_tools(&["make"]).map_err(|e| format!("{e:#}"))?;
     // Read the extra-kconfig fragment ONCE up front so a range
@@ -597,34 +660,28 @@ pub(crate) fn kernel_build(
         None => None,
     };
 
-    // Range dispatch only applies to tarball mode. `--source` and
-    // `--git` carry their own source-of-truth that ranges don't
-    // overlap with: a path identifies one tree, a git ref names one
-    // commit. A range argument alongside either is undefined input;
-    // clap's existing `conflicts_with` already rejects
-    // `version + source` and `version + git` combinations, so the
-    // range branch only fires when neither --source nor --git is
-    // present.
-    if source.is_none()
-        && git.is_none()
-        && let Some(ref v) = version
-    {
-        use ktstr::kernel_path::KernelId;
-        let id = KernelId::parse(v);
-        // Validate before any I/O: an inverted range surfaces the
-        // "swap the endpoints" diagnostic ahead of any download.
+    use ktstr::kernel_path::KernelId;
+    // The unified `--kernel` spec parses to a KernelId whose variant
+    // selects the source; omitted (`None`) builds the latest stable
+    // release via the tarball path. Validate before any I/O so an
+    // inverted range surfaces the "swap the endpoints" diagnostic ahead
+    // of any download.
+    let id = kernel.as_deref().map(KernelId::parse);
+    if let Some(id) = &id {
         id.validate().map_err(|e| format!("--kernel {id}: {e}"))?;
-        if let KernelId::Range { start, end, .. } = id {
-            let versions = ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr")
-                .map_err(|e| format!("{e:#}"))?;
+    }
+
+    match id {
+        Some(KernelId::Range { start, end, .. }) => {
+            let versions =
+                ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr", include_eol)
+                    .map_err(|e| format!("{e:#}"))?;
             let total = versions.len();
             let mut failures: Vec<(String, String)> = Vec::new();
             for (i, ver) in versions.iter().enumerate() {
                 eprintln!("cargo ktstr: [{}/{total}] kernel build {ver}", i + 1);
                 if let Err(e) = kernel_build_one(
                     Some(ver.clone()),
-                    None,
-                    None,
                     None,
                     force,
                     clean,
@@ -639,18 +696,13 @@ pub(crate) fn kernel_build(
             if failures.is_empty() {
                 Ok(())
             } else {
-                // Surface the failure summary on the way out so an
-                // automated invocation can scrape one log line per
-                // failing version. Continue-on-error is the right
-                // default for ranges (a stale endpoint shouldn't
-                // gate the rest of the build cohort), but a
-                // non-zero exit still flags the cohort as
-                // partial.
+                // Continue-on-error is the right default for ranges (a
+                // stale endpoint shouldn't gate the rest of the cohort);
+                // a non-zero exit still flags the cohort as partial and
+                // the summary lists each failing version for scraping.
                 Err(format!(
                     "kernel build range {start}..{end}: {failed}/{total} \
                      version(s) failed: {names}",
-                    start = start,
-                    end = end,
                     failed = failures.len(),
                     names = failures
                         .iter()
@@ -659,40 +711,77 @@ pub(crate) fn kernel_build(
                         .join(", "),
                 ))
             }
-        } else {
-            kernel_build_one(
-                version,
-                source,
-                git,
-                git_ref,
-                force,
-                clean,
-                cpu_cap,
-                extra_content.as_deref(),
-                skip_sha256,
-            )
         }
-    } else {
-        kernel_build_one(
-            version,
-            source,
-            git,
-            git_ref,
+        Some(KernelId::Path(path)) => kernel_build_one(
+            None,
+            Some(path),
             force,
             clean,
             cpu_cap,
             extra_content.as_deref(),
             skip_sha256,
-        )
+        ),
+        Some(KernelId::Version(v)) => kernel_build_one(
+            Some(v),
+            None,
+            force,
+            clean,
+            cpu_cap,
+            extra_content.as_deref(),
+            skip_sha256,
+        ),
+        None => kernel_build_one(
+            None,
+            None,
+            force,
+            clean,
+            cpu_cap,
+            extra_content.as_deref(),
+            skip_sha256,
+        ),
+        Some(KernelId::Git {
+            url,
+            git_ref,
+            ref_kind,
+        }) => {
+            // Git builds route through the SAME resolver the test path
+            // uses (codeload snapshot for GitHub, kind-directed clone
+            // otherwise), now threading `kernel build`'s force/clean/
+            // cpu_cap/extra_kconfig flags so a git build honors them.
+            let resolved_cap = resolve_cpu_cap(cpu_cap)?;
+            let fetch_progress = cli::FetchProgress::new();
+            let dir = ktstr::cli::resolve_git_kernel(
+                &url,
+                &git_ref,
+                ref_kind,
+                "cargo ktstr",
+                Some(&fetch_progress),
+                force,
+                clean,
+                resolved_cap,
+                extra_content.as_deref(),
+            )
+            .map_err(|e| format!("build git+{url}#{git_ref}: {e:#}"))?;
+            eprintln!("cargo ktstr: kernel cached at {}", dir.display());
+            Ok(())
+        }
+        Some(KernelId::CacheKey(key)) => Err(format!(
+            "--kernel {key}: a cache key names an already-built kernel, so \
+             there is nothing to build. Pass a version (`6.14.2`), a range \
+             (`6.11..6.14`), a source path (`./linux`), or a git source \
+             (`git+URL#tag=NAME`). A relative source directory must be \
+             spelled `./{key}` to be read as a path, not a cache key. Run \
+             `kernel list` to see cached entries.",
+        )),
     }
 }
 
-/// Single-version variant of [`kernel_build`]: handles one tarball,
-/// `--source`, or `--git` invocation. Carries the `kernel_build`
-/// implementation as it stood before range dispatch was wired in;
-/// extracted into a helper so the range loop in `kernel_build` can
-/// reuse the same download + cache + build pipeline per resolved
-/// version without duplicating it.
+/// Build one tarball (explicit version / `MAJOR.MINOR` prefix / latest
+/// stable) or a `--kernel <path>` local source tree. Split from
+/// [`kernel_build`] so the range loop can reuse the download + cache +
+/// build pipeline per resolved version without duplicating it. The
+/// git-source path is handled separately by
+/// [`ktstr::cli::resolve_git_kernel`].
 ///
 /// `extra_kconfig` is the pre-loaded user fragment from
 /// `--extra-kconfig PATH` (the file is read once in [`kernel_build`]
@@ -701,30 +790,16 @@ pub(crate) fn kernel_build(
 /// [`ktstr::cache_key_suffix_with_extra`] and into the configure
 /// pass via the Cow merge construction in
 /// [`ktstr::cli::kernel_build_pipeline`].
-#[allow(clippy::too_many_arguments)]
 fn kernel_build_one(
     version: Option<String>,
     source: Option<PathBuf>,
-    git: Option<String>,
-    git_ref: Option<String>,
     force: bool,
     clean: bool,
     cpu_cap: Option<usize>,
     extra_kconfig: Option<&str>,
     skip_sha256: bool,
 ) -> Result<(), String> {
-    // Resolve the CLI --cpu-cap flag against KTSTR_CPU_CAP env
-    // and the implicit "no cap" default. Conflict with
-    // KTSTR_BYPASS_LLC_LOCKS=1 surfaces here so operators see
-    // the parse-time error, not an opaque pipeline bail later.
-    if cpu_cap.is_some() && ktstr::bypass_llc_locks_active() {
-        return Err(
-            "--cpu-cap conflicts with KTSTR_BYPASS_LLC_LOCKS=1; unset one of them. \
-             --cpu-cap is a resource contract; bypass disables the contract entirely."
-                .to_string(),
-        );
-    }
-    let resolved_cap = cli::CpuCap::resolve(cpu_cap).map_err(|e| format!("{e:#}"))?;
+    let resolved_cap = resolve_cpu_cap(cpu_cap)?;
 
     let cache = CacheDir::new().map_err(|e| format!("open cache: {e:#}"))?;
 
@@ -733,23 +808,13 @@ fn kernel_build_one(
 
     // Acquire source.
     let client = fetch::shared_client();
-    // Progress group for this build: hosts the download/clone bar AND
+    // Progress group for this build: hosts the download bar AND
     // (via `kernel_build_pipeline`) the build phase, so one renderer
-    // covers the whole operation. The `--source` path adds no fetch bar
-    // but the same group still hosts the build bar.
+    // covers the whole operation. A `--kernel <path>` source adds no
+    // fetch bar but the same group still hosts the build bar.
     let fetch_progress = cli::FetchProgress::new();
     let mut acquired = if let Some(ref src_path) = source {
         fetch::local_source(src_path).map_err(|e| format!("{e:#}"))?
-    } else if let Some(ref url) = git {
-        let ref_name = git_ref.as_deref().expect("clap requires --ref with --git");
-        fetch::git_clone(
-            url,
-            ref_name,
-            tmp_dir.path(),
-            "cargo ktstr",
-            Some(&fetch_progress),
-        )
-        .map_err(|e| format!("{e:#}"))?
     } else {
         // Tarball download: explicit version, prefix, or latest stable.
         let ver = match version {
@@ -796,21 +861,21 @@ fn kernel_build_one(
         acquired
     };
 
-    // For `--source` and `--git` paths, `local_source` and `git_clone`
-    // build `acquired.cache_key` against the bare `cache_key_suffix()`
-    // — already shaped `...-kc{baked_hash}`. With `--extra-kconfig`
-    // set, lift the `-xkc{extra_hash}` append to
-    // [`cli::append_extra_kconfig_suffix`] so both binaries share
-    // one merge path; the cache lookup + post-build store both target
-    // the extras-aware slot.
-    if source.is_some() || git.is_some() {
+    // For a `--kernel <path>` source, `local_source` builds
+    // `acquired.cache_key` against the bare `cache_key_suffix()` —
+    // already shaped `...-kc{baked_hash}`. With `--extra-kconfig` set,
+    // lift the `-xkc{extra_hash}` append to
+    // [`cli::append_extra_kconfig_suffix`] so the cache lookup +
+    // post-build store both target the extras-aware slot. (The tarball
+    // path already looked up under the merged key above.)
+    if source.is_some() {
         cli::append_extra_kconfig_suffix(&mut acquired.cache_key, extra_kconfig);
     }
 
-    // Check cache for --source and --git (tarball already checked
-    // pre-download above).
+    // Check cache for a `--kernel <path>` source (tarball already
+    // checked pre-download above).
     if !force
-        && (source.is_some() || git.is_some())
+        && source.is_some()
         && !acquired.is_dirty
         && let Some(entry) = cache_lookup(&cache, &acquired.cache_key)
     {
@@ -1027,6 +1092,67 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
+    // resolve_versions_parallel — intra-range concurrency contract
+    // ---------------------------------------------------------------
+    //
+    // The Range arm of `resolve_one_spec` resolves expanded versions
+    // through this helper. Its two guarantees — output order == input
+    // order, and every version attempted (no inner short-circuit) —
+    // are what the doc asserts and what a downstream `resolved[0] ->
+    // KTSTR_KERNEL` choice relies on. Real Range resolves need network
+    // + build, so the per-version resolver is injected here to exercise
+    // the concurrency contract in isolation.
+
+    /// `Vec::into_par_iter` is indexed, so `collect` restores input
+    /// order regardless of completion order. A regression that swapped
+    /// the helper to an unindexed adaptor (e.g. `par_bridge`) would
+    /// shuffle the output and fail this.
+    #[test]
+    fn resolve_versions_parallel_preserves_input_order() {
+        let versions: Vec<String> = (0..64).map(|i| format!("6.{i}")).collect();
+        let out = resolve_versions_parallel(versions.clone(), |ver| {
+            Ok((
+                ver.to_string(),
+                std::path::PathBuf::from(format!("/fake/{ver}")),
+            ))
+        });
+        let labels: Vec<String> = out.into_iter().map(|r| r.unwrap().0).collect();
+        assert_eq!(
+            labels, versions,
+            "parallel resolve must return results in input (version) order"
+        );
+    }
+
+    /// The helper's `collect` gathers EVERY version's `Result` — it
+    /// does NOT short-circuit on the first Err (that is the caller's
+    /// outer `collect::<Result<_, _>>`'s job). So a failing version
+    /// leaves all N resolves attempted and its Err at its input index.
+    #[test]
+    fn resolve_versions_parallel_attempts_every_version_and_keeps_error_position() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let versions: Vec<String> = (0..32).map(|i| format!("6.{i}")).collect();
+        let attempts = AtomicUsize::new(0);
+        let out = resolve_versions_parallel(versions.clone(), |ver| {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            if ver == "6.7" {
+                Err(format!("boom {ver}"))
+            } else {
+                Ok((ver.to_string(), std::path::PathBuf::from(ver)))
+            }
+        });
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            versions.len(),
+            "every version must be attempted; the inner collect does not short-circuit"
+        );
+        assert_eq!(out.len(), versions.len());
+        assert!(
+            out.iter().enumerate().all(|(i, r)| (i == 7) == r.is_err()),
+            "only the 6.7 slot (input index 7) is Err; order preserved"
+        );
+    }
+
+    // ---------------------------------------------------------------
     // canonicalize_cache_dir — both arms of the single `unwrap_or`
     // ---------------------------------------------------------------
     //
@@ -1102,7 +1228,7 @@ mod tests {
     #[test]
     fn resolve_kernel_set_colliding_specs_fail_at_preflight_before_io() {
         let specs = vec!["6.14.2".to_string(), "6-14-2".to_string()];
-        let err = resolve_kernel_set(&specs)
+        let err = resolve_kernel_set(&specs, false)
             .expect_err("colliding sanitized labels must abort at preflight");
         assert!(
             err.contains("pre-flight check found collision"),
@@ -1125,7 +1251,7 @@ mod tests {
     #[test]
     fn resolve_kernel_set_inverted_range_fails_validation_before_io() {
         let specs = vec!["6.15..6.14".to_string()];
-        let err = resolve_kernel_set(&specs)
+        let err = resolve_kernel_set(&specs, false)
             .expect_err("inverted range must fail validation pre-resolve");
         assert!(
             err.contains("--kernel"),

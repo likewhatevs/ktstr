@@ -90,7 +90,7 @@ fn multi_llc_guest_presents_fat_l3(ctx: &Ctx) -> Result<AssertResult> {
 ///
 /// The >255-unique coverage is the boot and the grouping, NOT the cache
 /// synthesis: `num_threads_sharing` is encoded purely from cores-per-LLC
-/// (topology.rs `patch_cache_topology_eax`), independent of vCPU count, so
+/// (x86_64/topology/mod.rs `patch_cache_topology_eax`), independent of vCPU count, so
 /// a per-CPU-collapse or mis-size regression is already caught by the
 /// 16-vCPU sibling. This variant adds (a) all 256 APs coming online — the
 /// per-CPU /sys scan reads every CPU's L3 only if the split-irqchip boot

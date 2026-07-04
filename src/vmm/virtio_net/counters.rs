@@ -340,7 +340,8 @@ impl VirtioNetCounters {
 
     /// Record one observed `Error::InvalidAvailRingIndex` event
     /// from `Queue::iter`. Called by `process_tx_loopback` /
-    /// `pop_rx_chain` (the RX-pull phase of `try_loopback_to_rx`)
+    /// `pop_rx_chain` (the RX-pull phase of `try_loopback_to_rx`) /
+    /// `process_ctrl_queue` (the control vq)
     /// when the avail ring's `idx` is more than `queue.size` ahead
     /// of `next_avail` — a virtio-spec
     /// violation by the guest. The caller also sets

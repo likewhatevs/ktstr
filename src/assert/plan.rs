@@ -303,8 +303,9 @@ impl AssertResult {
     /// # `tracing` vs `println!`
     ///
     /// Notes are emitted via `tracing::info!` with target
-    /// `"ktstr::assert"` — matches the comparator pass-arm logging
-    /// convention at [`crate::assert::claim`]. Operators set
+    /// `"ktstr::assert"` — the parent namespace of the comparator
+    /// pass-arm's more specific `"ktstr::assert::claim"` target at
+    /// [`crate::assert::claim`]. Operators set
     /// `RUST_LOG=ktstr::assert=info` (or broader) to surface them;
     /// `println!` would bypass the tracing subscriber and bake in
     /// stdout-only visibility.
@@ -363,7 +364,8 @@ impl AssertResult {
         self
     }
     /// Drop the best-effort RAW per-phase per-cgroup sample vectors
-    /// (`wake_latencies_ns`, `run_delays_ns`, `off_cpu_pcts`) from every phase
+    /// (`wake_latencies_ns`, `timer_latencies_ns`, `run_delays_ns`,
+    /// `off_cpu_pcts`) and the schbench per-phase histograms from every phase
     /// bucket, keeping the reduced counters (`num_workers`, `total_*`,
     /// `wake_sample_total`, the NUMA counts, the coupled gap) and the rest of the
     /// verdict. Returns the number of samples dropped.
@@ -395,7 +397,7 @@ impl AssertResult {
                 // drop, so the render distinguishes "stripped for size" from a
                 // carrier that genuinely measured nothing (already-empty vecs
                 // stay not-stripped).
-                // schbench per-phase histograms (wakeup + request, ~19 KiB each)
+                // schbench per-phase histograms (wakeup + request + rps, ~19 KiB each)
                 // also multiply by carrier count, so a many-carrier overflow
                 // with schbench carriers present must drop them too (a
                 // worker_count>1 schbench cgroup can emit several). Dropping
@@ -601,7 +603,7 @@ impl AssertResult {
         // polarity from name substrings (e.g. `*_iops`,
         // `*_latency_us`). Without the inference, a payload-author
         // throughput metric — e.g. `jobs.0.read.iops` from
-        // `OutputFormat::LlmExtract` — would fold with `max`,
+        // `OutputFormat::Json` — would fold with `max`,
         // keeping the BETTER (higher) value across cgroups and
         // masking a cgroup that fell behind. The inference returns a
         // higher-is-worse default when no token matches, so genuinely
@@ -703,7 +705,7 @@ impl AssertResult {
     /// Distinct from [`Self::note`]: `note` carries a free-form
     /// `String` for operator triage; `note_value` carries a typed
     /// `(key, NoteValue)` pair for programmatic consumption (sidecar
-    /// parsers, `stats compare` regression dashboards). Producers
+    /// parsers, `perf-delta` regression dashboards). Producers
     /// commonly call BOTH — they occupy independent buffers and
     /// neither overwrites the other.
     ///

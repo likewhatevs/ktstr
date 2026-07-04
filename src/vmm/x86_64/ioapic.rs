@@ -1,6 +1,8 @@
-//! Userspace IOAPIC (Intel 82093AA model) for the split-irqchip / >255-vCPU path.
+//! Userspace IOAPIC (Intel 82093AA model) for the split-irqchip path
+//! (any guest APIC ID > 254).
 //!
-//! When a guest has more than 254 vCPUs, KVM runs in split-irqchip mode
+//! When a guest's maximum APIC ID exceeds 254 (the 8-bit xAPIC limit),
+//! KVM runs in split-irqchip mode
 //! (see [`super::kvm`]): the LAPIC stays in-kernel but the IOAPIC does not
 //! exist in the kernel, because the in-kernel IOAPIC's redirection-entry
 //! destination field is `u8` and cannot address an APIC ID > 255
@@ -59,8 +61,8 @@ const REG_ID: u32 = 0x00;
 const REG_VER: u32 = 0x01;
 pub(crate) const REG_REDTBL_BASE: u32 = 0x10; // entry i: low dword 0x10+2i, high dword 0x11+2i
 
-/// IOAPIC version. 0x20 advertises the EOI register; the high byte of the
-/// VER register reports the max redirection entry (NUM_PINS - 1).
+/// IOAPIC version. 0x20 advertises the EOI register; bits `[23:16]` of the
+/// VER register report the max redirection entry (NUM_PINS - 1).
 const IOAPIC_VERSION: u32 = 0x20;
 
 // Redirection-table entry (64-bit) bit fields, per the guest's

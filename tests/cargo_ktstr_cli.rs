@@ -170,9 +170,8 @@ fn help_kernel_build() {
         .args(["kernel", "build", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--source"))
-        .stdout(predicate::str::contains("--git"))
-        .stdout(predicate::str::contains("--ref"))
+        .stdout(predicate::str::contains("--kernel"))
+        .stdout(predicate::str::contains("git+URL"))
         .stdout(predicate::str::contains("--force"))
         .stdout(predicate::str::contains("--clean"))
         .stdout(predicate::str::contains("--extra-kconfig"))
@@ -197,7 +196,7 @@ fn help_kernel_build() {
 /// `kernel_build`'s up-front file read.
 ///
 /// `KTSTR_CACHE_DIR` is pointed at a tempdir so this test does not
-/// touch the developer's real cache root, and `--source` is set to
+/// touch the developer's real cache root, and `--kernel` is set to
 /// a clearly-nonexistent path so even if the extra-kconfig check
 /// were skipped (and the source-tree validation fired instead), the
 /// command would still bail before any network or build work.
@@ -209,7 +208,7 @@ fn kernel_build_extra_kconfig_nonexistent_path_errors() {
         .args([
             "kernel",
             "build",
-            "--source",
+            "--kernel",
             "/nonexistent/ktstr-extra-kconfig-source-test",
             "--extra-kconfig",
             "/definitely/not/a/real/file/ktstr-extra-kconfig-test.kconfig",
@@ -238,7 +237,7 @@ fn kernel_build_extra_kconfig_directory_errors() {
         .args([
             "kernel",
             "build",
-            "--source",
+            "--kernel",
             "/nonexistent/ktstr-source-test-dir-arg",
             "--extra-kconfig",
         ])
@@ -267,7 +266,7 @@ fn kernel_build_extra_kconfig_invalid_utf8_errors() {
         .args([
             "kernel",
             "build",
-            "--source",
+            "--kernel",
             "/nonexistent/ktstr-source-test-utf8-arg",
             "--extra-kconfig",
         ])
@@ -281,7 +280,7 @@ fn kernel_build_extra_kconfig_invalid_utf8_errors() {
 /// An empty file passed to `--extra-kconfig` is NOT an error —
 /// `read_extra_kconfig` warns but proceeds. The
 /// build then bails when the source-tree check fails (we point
-/// `--source` at a nonexistent path), proving the empty-file
+/// `--kernel` at a nonexistent path), proving the empty-file
 /// branch passed through without aborting on the fragment read.
 /// stderr carries both the empty-file warning AND the source-tree
 /// failure, confirming sequence: empty fragment → warn → continue
@@ -299,7 +298,7 @@ fn kernel_build_extra_kconfig_empty_file_warns_but_proceeds() {
         .args([
             "kernel",
             "build",
-            "--source",
+            "--kernel",
             "/nonexistent/ktstr-source-test-empty-arg",
             "--extra-kconfig",
         ])
@@ -319,7 +318,7 @@ fn kernel_build_extra_kconfig_empty_file_warns_but_proceeds() {
 /// contents without manual canonicalization.
 ///
 /// Test passes when the build proceeds past the fragment-read
-/// stage (we point `--source` at a nonexistent path so the
+/// stage (we point `--kernel` at a nonexistent path so the
 /// command bails on source-tree validation, AFTER the fragment
 /// is successfully read). If symlink resolution were broken,
 /// `read_extra_kconfig` would error before reaching the source
@@ -340,7 +339,7 @@ fn kernel_build_extra_kconfig_symlink_chain_resolves() {
         .args([
             "kernel",
             "build",
-            "--source",
+            "--kernel",
             "/nonexistent/ktstr-source-symlink-test",
             "--extra-kconfig",
         ])
@@ -351,7 +350,7 @@ fn kernel_build_extra_kconfig_symlink_chain_resolves() {
     // Must NOT carry the `--extra-kconfig` error string — the
     // fragment was read successfully through the chain. The
     // failure that surfaces is the source-tree validation
-    // (since --source points at nothing), proving the read
+    // (since --kernel points at nothing), proving the read
     // completed before that next stage.
     assert!(
         !stderr.contains("--extra-kconfig"),
@@ -364,7 +363,7 @@ fn kernel_build_extra_kconfig_symlink_chain_resolves() {
 /// The `--extra-kconfig` validation fires BEFORE source
 /// acquisition. A nonexistent extra-kconfig path
 /// MUST produce the `--extra-kconfig`-named error even when
-/// `--source` is also nonexistent — proving the error precedence.
+/// `--kernel` is also nonexistent — proving the error precedence.
 /// If the order were reversed the test would see the
 /// source-tree error instead.
 #[test]
@@ -375,7 +374,7 @@ fn kernel_build_extra_kconfig_validation_fires_before_source_acquire() {
         .args([
             "kernel",
             "build",
-            "--source",
+            "--kernel",
             "/nonexistent/ktstr-source-precedence-test",
             "--extra-kconfig",
             "/nonexistent/ktstr-extra-precedence-test.kconfig",
@@ -523,7 +522,7 @@ fn stats_no_data() {
     // Pin the read path to an empty directory via KTSTR_SIDECAR_DIR
     // so the test is independent of whatever sits under the
     // developer's target/ktstr/. Bare `cargo ktstr stats` honors
-    // KTSTR_SIDECAR_DIR (cli.rs print_stats_report). With nothing
+    // KTSTR_SIDECAR_DIR (cli::print_stats_report honors it). With nothing
     // there to read the empty-state notice goes to stderr and
     // stdout stays clean.
     let tmp = tempfile::tempdir().unwrap();
@@ -574,7 +573,7 @@ fn kernel_list_json() {
 
 /// `cargo ktstr shell --no-perf-mode --cpu-cap N` under
 /// KTSTR_BYPASS_LLC_LOCKS=1 must fail with the "resource contract"
-/// substring. Pins the rejection at bin/cargo-ktstr.rs:851.
+/// substring. Pins the rejection at src/bin/cargo_ktstr/misc/shell.rs:184.
 #[test]
 fn cargo_ktstr_shell_cpu_cap_with_bypass_errors() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -589,20 +588,20 @@ fn cargo_ktstr_shell_cpu_cap_with_bypass_errors() {
 
 /// `cargo ktstr kernel build --cpu-cap N` under
 /// KTSTR_BYPASS_LLC_LOCKS=1 must fail with the "resource contract"
-/// substring. Pins the rejection at bin/cargo-ktstr.rs:729.
+/// substring. Pins the rejection at src/bin/cargo_ktstr/kernel/mod.rs:720.
 #[test]
 fn cargo_ktstr_kernel_build_cpu_cap_with_bypass_errors() {
     let tmp = tempfile::TempDir::new().unwrap();
-    // Pass a clearly-nonexistent --source so if the conflict check
-    // were somehow skipped, we'd get a source-acquire failure (not
-    // a network fetch hanging forever in CI).
+    // Pass a clearly-nonexistent `--kernel <path>` so if the cpu-cap
+    // check were somehow skipped, we'd get a source-acquire failure
+    // (not a network fetch hanging forever in CI).
     cargo_ktstr()
         .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
         .env(ktstr::KTSTR_BYPASS_LLC_LOCKS_ENV, "1")
         .args([
             "kernel",
             "build",
-            "--source",
+            "--kernel",
             "/nonexistent/ktstr-cargo-ktstr-cpu-cap-bypass-test",
             "--cpu-cap",
             "2",
@@ -610,6 +609,49 @@ fn cargo_ktstr_kernel_build_cpu_cap_with_bypass_errors() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("resource contract"));
+}
+
+/// `cargo ktstr kernel build --kernel <cache-key>` is rejected: a
+/// cache key names an already-built entry, so there is nothing to
+/// build. Pins the `KernelId::CacheKey` arm of `kernel_build`'s
+/// dispatch — a bare token that is not a version / path / range / git
+/// source parses to `CacheKey`, and building one is ill-defined.
+#[test]
+fn cargo_ktstr_kernel_build_cache_key_rejected() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    cargo_ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .args([
+            "kernel",
+            "build",
+            "--kernel",
+            "6.14.2-tarball-x86_64-kcabc123",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cache key"))
+        .stderr(predicate::str::contains("nothing to build"));
+}
+
+/// `cargo ktstr kernel build --kernel git+…` reaches the Git dispatch
+/// arm (not the tarball path). A bogus `file://` git URL fails fast
+/// (no network) with the git-arm-specific `build git+` error prefix
+/// (kernel/mod.rs), proving the Git arm ran rather than a
+/// tarball/download error.
+#[test]
+fn cargo_ktstr_kernel_build_git_dispatch() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    cargo_ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .args([
+            "kernel",
+            "build",
+            "--kernel",
+            "git+file:///nonexistent-ktstr-git-dispatch-test#tag=x",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("build git+"));
 }
 
 // -- --extra-kconfig CLI integration --
@@ -776,9 +818,8 @@ fn extra_kconfig_cache_miss_on_different_content() {
 ///
 /// We don't drive a real network kernel.org fetch from a unit
 /// test, so we verify the parser accepts the combination by
-/// pointing `--source` at a nonexistent path (range mode requires
-/// neither `--source` nor `--git`, but the test below reaches the
-/// non-range branch which still proves the flag plumbing) AND by
+/// pointing `--kernel` at a nonexistent path (the path branch still
+/// proves the flag plumbing the range loop reuses) AND by
 /// verifying `--help` documents the flag combination.
 #[test]
 fn extra_kconfig_range_expansion() {
@@ -798,19 +839,19 @@ fn extra_kconfig_range_expansion() {
     let frag = tmp.path().join("extras.kconfig");
     std::fs::write(&frag, "CONFIG_FOO=y\n").unwrap();
 
-    // Use `--source` (not a range) to short-circuit before the
-    // network fetch — the test's invariant is that `--extra-kconfig`
-    // parses cleanly alongside the rest of `kernel build`'s flag
-    // surface, which the range loop reuses verbatim. A clap-level
-    // rejection of the combination would surface BEFORE the source-
-    // acquire path runs.
+    // Use a `--kernel <path>` (not a range) to short-circuit before
+    // the network fetch — the test's invariant is that
+    // `--extra-kconfig` parses cleanly alongside the rest of `kernel
+    // build`'s flag surface, which the range loop reuses verbatim. A
+    // clap-level rejection of the combination would surface BEFORE the
+    // source-acquire path runs.
     let assert_result = cargo_ktstr()
         .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
         .env(ktstr::KTSTR_BYPASS_LLC_LOCKS_ENV, "1")
         .args([
             "kernel",
             "build",
-            "--source",
+            "--kernel",
             "/nonexistent/ktstr-extras-range-test",
             "--extra-kconfig",
             frag.to_str().unwrap(),

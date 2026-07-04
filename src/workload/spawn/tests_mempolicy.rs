@@ -86,7 +86,7 @@ fn apply_mempolicy_empty_interleave_skipped() {
 /// triggered"); the worker still touches the region every
 /// iteration. Sufficient for the pathology smoke check —
 /// real multi-node migration tests live under
-/// `tests/numa_tests.rs` (see #143/#146).
+/// `tests/numa_tests.rs`.
 #[test]
 fn pathology_numa_working_set_sweep_iterates() {
     let cfg = WorkloadConfig {

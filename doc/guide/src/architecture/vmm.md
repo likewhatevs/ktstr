@@ -89,17 +89,21 @@ data channel. Carries scenario markers (`MSG_TYPE_SCENARIO_START`,
 `MSG_TYPE_SCENARIO_END`), test results (`MSG_TYPE_TEST_RESULT`),
 exit codes (`MSG_TYPE_EXIT`), stimulus events (`MSG_TYPE_STIMULUS`),
 scheduler exit notifications (`MSG_TYPE_SCHED_EXIT`), profraw
-coverage data (`MSG_TYPE_PROFRAW`), per-payload-invocation metrics
-(`MSG_TYPE_PAYLOAD_METRICS`), and raw LlmExtract output
-(`MSG_TYPE_RAW_PAYLOAD_OUTPUT`). Each TLV frame has a CRC32 for
+coverage data (`MSG_TYPE_PROFRAW`), and per-payload-invocation
+metrics (`MSG_TYPE_PAYLOAD_METRICS`). Each TLV frame has a CRC32 for
 integrity checking.
 
 ## Virtio devices
 
-The VMM implements three virtio-MMIO devices in addition to the
-serial console above. All three speak the virtio 1.x MMIO transport
-(virtio-v1.2 §4.2.2) with `VIRTIO_F_VERSION_1` and use irqfd
-(eventfd → KVM GSI) for interrupt delivery.
+The VMM implements three virtio devices in addition to the serial
+console above, all speaking virtio 1.x with `VIRTIO_F_VERSION_1`. The
+transport is arch-split: virtio-console uses the virtio-MMIO transport
+(virtio-v1.2 §4.2.2) on every arch, while virtio-blk and virtio-net
+are virtio-PCI functions on x86_64 (behind a host bridge with ECAM/CAM
+config windows) and virtio-MMIO on aarch64. MMIO devices deliver
+interrupts via irqfd (eventfd → KVM GSI); the x86_64 virtio-PCI
+functions use MSI-X when the guest negotiates it, falling back to INTx
+(via the device's `irq_evt`).
 
 - **virtio-blk** (`vmm::virtio_blk`) -- file-backed block device
   with a single request virtqueue and a token-bucket throttle.
@@ -120,7 +124,7 @@ serial console above. All three speak the virtio 1.x MMIO transport
   Port 0 carries the interactive `/dev/hvc0` console alongside the
   COM1/COM2 16550 serial ports; port 1 carries the guest-to-host TLV
   stream that delivers exit code, test result, per-payload metrics,
-  raw payload outputs, profraw, and scheduler exit notifications;
+  profraw, and scheduler exit notifications;
   port 2 is a transparent byte-pipe relay carrying scx_stats request
   bytes from the host to the in-guest relay thread and the
   scheduler's responses back. Advertises

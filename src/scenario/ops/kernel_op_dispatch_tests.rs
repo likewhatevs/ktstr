@@ -79,7 +79,7 @@ fn kernel_value_into_wire_maps_every_variant() {
     let bytes_val: crate::vmm::wire::KernelOpValue = (&KernelValue::bytes(bytes.clone())).into();
     assert_eq!(bytes_val, crate::vmm::wire::KernelOpValue::Bytes(bytes));
     // OrU32: width is u32 not u64 (struct scx_rq.flags is u32
-    // per kernel/sched/sched.h:802); a regression that mapped
+    // per kernel/sched/sched.h:803); a regression that mapped
     // OrU32 to wire-side U32 or OrU64 (had one existed) would
     // silently lose the RMW intent at the dispatcher and
     // either drop the OR or corrupt the adjacent field.
@@ -171,22 +171,7 @@ fn write_entries_from_writes_preserves_order_and_count() {
     }
 }
 
-/// `dispatch_kernel_op_request` hard-bails when no bridge is
-/// installed AND we're not in a guest VM — per the project
-/// "no silent drops" rule. The bail message must name both
-/// recovery paths (install bridge callback / run in guest VM)
-/// so the misconfigured-test signal is actionable. A regression
-/// that reverted to silent warn-skip would re-introduce the
-/// vacuous-test footgun.
-/// Defense-in-depth pin: `wait_for_accessor_publish_or_bail`'s
-/// `None`-bridge arm must `anyhow::bail!` loudly, not silently
-/// return Ok. A regression that reverted to the earlier
-/// `Some(Ok(_)) | None => Ok(())` shape would let
-/// AttachScheduler / ReplaceScheduler appear to succeed in
-/// contexts where no SnapshotBridge is installed — the
-/// scheduler-liveness verification would never run and
-/// downstream assertions would vacuously pass.
-/// Defense-in-depth pin: `wait_for_worker_state_not_trying_or_bail`'s
+/// `wait_for_worker_state_not_trying_or_bail`'s
 /// `None`-bridge arm must `anyhow::bail!` loudly. A regression
 /// that reverted to the earlier silent-Ok shape would let
 /// AttachScheduler / ReplaceScheduler proceed without quiescing
@@ -218,6 +203,14 @@ fn wait_for_worker_state_not_trying_or_bail_no_bridge_bails_loudly() {
     );
 }
 
+/// `wait_for_accessor_publish_or_bail`'s
+/// `None`-bridge arm must `anyhow::bail!` loudly, not silently
+/// return Ok. A regression that reverted to the earlier
+/// `Some(Ok(_)) | None => Ok(())` shape would let
+/// AttachScheduler / ReplaceScheduler appear to succeed in
+/// contexts where no SnapshotBridge is installed — the
+/// scheduler-liveness verification would never run and
+/// downstream assertions would vacuously pass.
 #[test]
 fn wait_for_accessor_publish_or_bail_no_bridge_bails_loudly() {
     let err = wait_for_accessor_publish_or_bail(
@@ -245,6 +238,13 @@ fn wait_for_accessor_publish_or_bail_no_bridge_bails_loudly() {
     );
 }
 
+/// `dispatch_kernel_op_request` hard-bails when no bridge is
+/// installed AND we're not in a guest VM — per the project
+/// "no silent drops" rule. The bail message must name both
+/// recovery paths (install bridge callback / run in guest VM)
+/// so the misconfigured-test signal is actionable. A regression
+/// that reverted to silent warn-skip would re-introduce the
+/// vacuous-test footgun.
 #[test]
 fn dispatch_kernel_op_request_no_bridge_no_guest_hard_bails() {
     let payload = build_kernel_op_request(

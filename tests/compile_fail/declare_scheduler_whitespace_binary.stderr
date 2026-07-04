@@ -1,5 +1,5 @@
 error: declare_scheduler!: `binary` must contain at least one visible character (empty, whitespace-only, and invisible-only literals are rejected)
-  --> tests/compile_fail/declare_scheduler_whitespace_binary.rs:10:14
+  --> tests/compile_fail/declare_scheduler_whitespace_binary.rs:12:14
    |
-10 |     binary = "   ",
+12 |     binary = "   ",
    |              ^^^^^

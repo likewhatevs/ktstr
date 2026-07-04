@@ -49,8 +49,10 @@ fn single_thread_group_yields_one_row_per_metric() {
 
 /// Reference test data: every input thread name produces the
 /// exact expected normalized form via `pattern_key`. Covers
-/// every classifier rule across the 14 multi-member bucket
-/// patterns and the 13 singletons. The bucket member-count
+/// the pure-digit, alpha-prefix, digit-suffix, and literal
+/// classifier rules across the 14 multi-member bucket
+/// patterns and the 13 singletons; the hex rule (`{H}`) is
+/// exercised in `tests_pattern.rs`. The bucket member-count
 /// half of the spec lives in
 /// [`spec_thread_grouping_bucket_membership`].
 #[test]
@@ -432,9 +434,8 @@ fn sort_diff_rows_by_keys_respects_ascending_direction() {
 /// Final tie-break: when every sort-key value matches across
 /// groups, `sort_diff_rows_by_keys` falls through to ascending
 /// `group_key` ordering for deterministic output. Pins the
-/// last branch in the comparator (`a.cmp(b)`) — without it,
-/// equal-delta groups would emerge in BTreeMap-iteration order
-/// dependent on hash, which would produce flaky test output.
+/// last branch in the comparator (`a.cmp(b)`) — it makes the
+/// final ordering deterministic when every sort-key value ties.
 #[test]
 fn sort_diff_rows_by_keys_falls_back_to_ascending_group_key_on_full_tie() {
     let mk_row = |group: &str, metric: &'static str, delta: f64| DiffRow {
@@ -452,12 +453,13 @@ fn sort_diff_rows_by_keys_falls_back_to_ascending_group_key_on_full_tie() {
         sort_by_cell: None,
         sort_by_delta: None,
     };
-    // Three groups with IDENTICAL deltas — only the
-    // group_key tie-break can deterministically order them.
-    // Insert in reverse-alphabetical order so the test fails
-    // if the tie-break is dropped (BTreeMap iteration would
-    // already produce ascending — distinguishable only via
-    // explicit reverse-input ordering).
+    // Three groups with IDENTICAL deltas. Group ordering is
+    // derived from the `unique_groups` BTreeSet (ascending)
+    // via a stable `sort_by`, so ascending output holds with
+    // or without the `ga.cmp(gb)` tie-break; this test only
+    // pins that fully-tied groups emerge in ascending order.
+    // Input rows are reverse-alphabetical, but that order
+    // never feeds group ranking.
     let mut rows = vec![
         mk_row("charlie", "run_time_ns", 100.0),
         mk_row("bravo", "run_time_ns", 100.0),
@@ -552,8 +554,8 @@ fn sort_diff_rows_by_keys_within_group_uses_registry_order() {
         sort_by_delta: None,
     };
     // Use four metrics from the scheduling block in their
-    // registry order: run_time_ns (idx 6), wait_time_ns (7),
-    // timeslices (8), nr_wakeups (11). Insert in
+    // registry order: run_time_ns (idx 10), wait_time_ns (11),
+    // timeslices (12), nr_wakeups (15). Insert in
     // REVERSE-registry order so a regression that orders by
     // input/sort-spec/lexicographic would surface as a
     // visibly wrong metric_order assertion.

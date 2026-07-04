@@ -51,7 +51,7 @@ doc-strict:
 
 # Build a test kernel
 kernel-build version="":
-    cargo run --bin cargo-ktstr -- ktstr kernel build --skip-sha256 {{version}}
+    cargo run --bin cargo-ktstr -- ktstr kernel build --skip-sha256 {{ if version != "" { "--kernel " + version } else { "" } }}
 
 # Run tests against a kernel version. `extra-features` is passed BOTH to
 # the cargo-ktstr build AND appended to the inner test feature list. The
@@ -138,9 +138,9 @@ sccache-stats:
 stats:
     cargo run --bin cargo-ktstr -- ktstr stats
 
-# Compare performance_mode metrics: HEAD vs a baseline commit (dual-run)
-perf-delta kernel base="":
-    cargo run --bin cargo-ktstr -- ktstr perf-delta --dual-run --kernel {{kernel}}{{ if base != "" { " --base " + base } else { "" } }}
+# Compare performance_mode metrics: HEAD vs a baseline commit (noise-adjusted; runs per side defaults to 5)
+perf-delta kernel base="" runs="5":
+    cargo run --bin cargo-ktstr -- ktstr perf-delta --noise-adjust {{runs}} --kernel {{kernel}}{{ if base != "" { " --base " + base } else { "" } }}
 
 # Build and link-check the guide book
 docs:
@@ -173,9 +173,9 @@ book-serve:
 site: docs api-docs
     #!/usr/bin/env bash
     set -euo pipefail
-    mkdir -p _site/guide _site/api
+    mkdir -p _site/guide _site/rustdoc
     cp -r doc/guide/book/html/* _site/guide/
-    cp -r target/doc/* _site/api/
+    cp -r target/doc/* _site/rustdoc/
     cat > _site/index.html <<'HTML'
     <!DOCTYPE html>
     <meta http-equiv="refresh" content="0; url=guide/">

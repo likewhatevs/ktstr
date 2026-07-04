@@ -70,7 +70,6 @@ static JEMALLOC_PROBE: Payload = Payload::new(
     &[],
     false,
     None,
-    None,
 );
 
 /// Probe invocation without exit-code gating. Used by the error-
@@ -85,7 +84,6 @@ static JEMALLOC_PROBE_NO_EXIT_CHECK: Payload = Payload::new(
     &[],
     &[],
     false,
-    None,
     None,
 );
 
@@ -109,7 +107,6 @@ static JEMALLOC_ALLOC_WORKER: Payload = Payload::new(
     &[],
     false,
     None,
-    None,
 );
 
 /// Churn-mode allocator worker. Same binary as
@@ -130,7 +127,6 @@ static JEMALLOC_ALLOC_WORKER_CHURN: Payload = Payload::new(
     &[],
     false,
     None,
-    None,
 );
 
 // ---------------------------------------------------------------------------
@@ -140,9 +136,10 @@ static JEMALLOC_ALLOC_WORKER_CHURN: Payload = Payload::new(
 // Flat-metric scanning primitives (`ThreadLookup`, `lookup_thread`,
 // `snapshot_worker_allocated`, `thread_count`, `snapshot_count`)
 // live in `ktstr::test_support::probe_metrics` so they're
-// reachable from lib-crate unit tests. Only the tiny
-// file-local `find_metric_u64` wrapper stays here — it's used once in
-// this file and doesn't warrant promotion.
+// reachable from lib-crate unit tests, alongside `find_metric_u64`,
+// `flat_metrics_dump`, and `has_metric` (all imported below). Only
+// the file-local `snapshot_timestamp` wrapper stays here — it
+// composes `find_metric_u64` with a per-snapshot timestamp key.
 
 use ktstr::test_support::{
     MAX_SCAN_INDEX, ThreadLookup, find_metric_u64, flat_metrics_dump, has_metric, lookup_thread,
@@ -241,7 +238,7 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
     //   probe emitted some tids but none of them was the worker.
     //
     // `n_threads` is attached to the passing `AssertResult` at the
-    // end of this test as a `DetailKind::Other` diagnostic so
+    // end of this test as an info note (via `with_note`) so
     // future jemalloc versions that lazily spawn a background thread
     // (decay / bg_thd) surface visibly in CI output: `n_threads > 1`
     // would be a heads-up that the worker is no longer strictly
@@ -333,14 +330,16 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
 /// the probe returns non-zero.
 ///
 /// Coverage scope: this test only exercises the pid-not-found
-/// branch (`find_jemalloc_via_maps` fails on a missing
-/// `/proc/<pid>`). It does NOT cover the two complementary
+/// branch (`run()`'s `/proc/<pid>` existence check fails on the
+/// fake pid, returning `FatalKind::PidMissing`). It does NOT cover
+/// the two complementary
 /// "target exists but the probe cannot read its jemalloc state"
 /// branches:
 /// - `jemalloc-not-found`: no `tsd_tls` symbol in any r-x mapping
 ///   (target is linked against a different allocator, or a
-///   jemalloc build whose symbol-name prefix is not in
-///   [`TSD_TLS_SYMBOL_NAMES`]).
+///   jemalloc build whose symbol name does not satisfy the
+///   `is_jemalloc_tsd_tls_symbol` predicate (bare `tsd_tls` or any
+///   `<prefix>_tsd_tls` with a non-empty prefix)).
 /// - `jemalloc-in-dso`: `tsd_tls` present, but in a shared object
 ///   rather than the main executable's static-TLS image. v1 cannot
 ///   address dynamic-TLS symbols.
@@ -352,7 +351,7 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
 /// `RunOutcome::Fatal` with exit code 1, so the guarantee tested
 /// here is "probe reports fatal and exits non-zero on an invalid
 /// pid". The two skipped branches are exercised by unit tests in
-/// the probe crate (`find_jemalloc_via_maps` error paths).
+/// the probe crate (`find_jemalloc_via_maps_at` error paths).
 #[ktstr_test(llcs = 1, cores = 1, threads = 1)]
 fn jemalloc_probe_fatal_on_nonexistent_pid(ctx: &Ctx) -> Result<AssertResult> {
     let fake_pid: i32 = 999_999_999;
@@ -496,7 +495,7 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
             )));
         }
         // Non-zero (non-signal) exit would mean a fatal probe-side
-        // error OUTSIDE the per-thread loop (e.g. find_jemalloc_via_maps
+        // error OUTSIDE the per-thread loop (e.g. find_jemalloc_via_maps_at
         // failure). That's not what this test exercises — it should
         // reach the per-thread path and at least attempt some tids.
         if metrics.exit_code != 0 {

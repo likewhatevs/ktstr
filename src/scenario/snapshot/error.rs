@@ -13,7 +13,7 @@ use super::HEX_KEY_PREFIX;
 /// Why a sample's `stats` slot is unavailable — carried on
 /// [`SnapshotError::MissingStats`] so operator diagnostics name
 /// the specific failure mode rather than the generic "stats
-/// absent". Built by [`From<&crate::vmm::sched_stats::SchedStatsError>`]
+/// absent". Built by `From<&crate::vmm::sched_stats::SchedStatsError>`
 /// for the relay-failure path, plus dedicated variants for the
 /// pre-client gates that the `crate::vmm::SchedStatsError` enum doesn't
 /// cover (no scheduler binary configured).
@@ -274,8 +274,8 @@ pub enum SnapshotError {
     /// A path string contained an empty component (e.g. `"a..b"`).
     /// `requested` is the user-supplied lookup string.
     EmptyPathComponent { requested: String },
-    /// `EntryAccessor::get` was called on a per-CPU entry without
-    /// narrowing to a CPU first via [`super::SnapshotMap::cpu`].
+    /// [`super::SnapshotEntry::get`] was called on a per-CPU entry
+    /// without narrowing to a CPU first via [`super::SnapshotMap::cpu`].
     PerCpuNotNarrowed { map: String },
     /// Hash entry has no rendered key/value side (BTF type id was
     /// missing at capture time, leaving the hex bytes only).

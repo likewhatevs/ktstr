@@ -1,7 +1,7 @@
 //! BPF map state dump for scheduler-failure post-mortem.
 //!
 //! [`dump_state`] is invoked by the freeze coordinator after the vCPU
-//! rendezvous succeeds (see `src/vmm/mod.rs`). It enumerates every
+//! rendezvous succeeds (see `src/vmm/freeze_coord/mod.rs`). It enumerates every
 //! BPF map in the guest via [`BpfMapAccessor::maps`], filters out
 //! ktstr-internal probes (the framework's own probe and fentry skel
 //! maps), and dispatches per map type:
@@ -1362,7 +1362,7 @@ impl Default for FailureDumpReport {
 impl FailureDumpReport {
     /// Build a placeholder report for a capture that could not
     /// produce real data. Every `*_unavailable` field is set to
-    /// `Some(reason)` so downstream consumers (`stats compare`,
+    /// `Some(reason)` so downstream consumers (`perf-delta`,
     /// failure-rendering tooling) can distinguish "capture
     /// happened, no data" from "capture path failed for reason X".
     /// All vector / option fields stay at their `Default` empty
@@ -2481,7 +2481,7 @@ fn decode_probe_counters_snapshot(
         "ktstr_pcpu_counters",
     )? as usize;
 
-    // Read the entire array as one slab — 256 * 17 * 128 = 544 KB.
+    // Read the entire array as one slab — 256 * 15 * 128 = 480 KiB.
     // A single slab read is cheaper than 256 * 17 individual reads
     // through the page-walking accessor; the read primitive
     // tolerates over-large requests (truncates at the map's
@@ -2896,12 +2896,12 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
 
                 // 3. Per-CPU local DSQ walk runs unconditionally —
                 //    `rq->scx.local_dsq` is initialized at boot
-                //    (init_dsq from kernel/sched/ext.c:7772 for every
+                //    (init_dsq from kernel/sched/ext.c:4581 for every
                 //    possible CPU) and survives scheduler teardown,
                 //    so it produces data even when *scx_root is NULL.
                 //    This is the data source that survives
                 //    scx_bypass's runnable_list drain
-                //    (kernel/sched/ext.c:5304-5404) during teardown.
+                //    (kernel/sched/ext.c:5448-5548) during teardown.
                 let walk_local_dsqs_t0 = std::time::Instant::now();
                 let mut dsqs: Vec<super::scx_walker::DsqState> = Vec::new();
                 if !deadline_exceeded(&mut truncated_at_us)
@@ -3437,12 +3437,11 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
             };
             let payload_size =
                 elem_size.saturating_sub(sdt_offsets.data_header_size as u64) as usize;
-            // Pass the vmlinux base BTF so the heuristic excludes
-            // base-BTF type ids (kernel `*_ctx` structs of the same
-            // size as the scheduler's payload) from the candidate
-            // set. Without this filter the size-match arm could win
-            // on a vmlinux struct whose layout has nothing to do
-            // with the scheduler's allocator slot.
+            // `prog_btf` is split BTF: the scheduler's program types
+            // layered on the vmlinux base. `discover_payload_btf_id`
+            // probes only the program section's id range (via
+            // `Btf::split`), so vmlinux base `*_ctx` structs of the
+            // same size cannot shadow the scheduler's payload struct.
             let choice = discover_payload_btf_id(prog_btf, payload_size, &var_name);
 
             let snap = walk_sdt_allocator(

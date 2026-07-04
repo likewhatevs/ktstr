@@ -139,8 +139,8 @@ fn compare_rows_zero_baseline_jump_below_abs_gate_is_unchanged() {
 /// improvement path would be caught.
 #[test]
 fn compare_rows_zero_baseline_jump_above_abs_gate_is_an_improvement() {
-    // total_iterations: HigherBetter, Counter, default_abs = 100.0 (the only
-    // metric reading r.total_iterations). 0 -> 1000: delta +1000 >= 100
+    // total_iterations: HigherBetter, Counter, default_abs = 2.0 (the only
+    // metric reading r.total_iterations). 0 -> 1000: delta +1000 >= 2
     // clears the absolute gate; HigherBetter + delta > 0 => improvement.
     let rows_a = vec![cmp_row("zbase_imp", "tiny-1llc", true, 0.0, 0)];
     let rows_b = vec![cmp_row("zbase_imp", "tiny-1llc", true, 0.0, 1000)];
@@ -153,7 +153,7 @@ fn compare_rows_zero_baseline_jump_above_abs_gate_is_an_improvement() {
     );
     assert_eq!(
         res.improvements, 1,
-        "0 -> 1000 total_iterations (>= abs gate 100, HigherBetter) must be \
+        "0 -> 1000 total_iterations (>= abs gate 2, HigherBetter) must be \
          an improvement, not hidden as unchanged",
     );
     assert_eq!(res.regressions, 0);
@@ -238,7 +238,7 @@ fn compare_rows_genuine_stuck_count_regression_is_flagged() {
 fn compare_rows_synthetic_regression_and_improvement() {
     // spread 10 -> 30: abs delta 20.0 >= 5.0, rel 2.0 >= 0.10 →
     // regression (higher_is_worse).
-    // total_iterations 1000 -> 500: abs delta 500 >= 100, rel 0.5
+    // total_iterations 1000 -> 500: abs delta 500 >= 2, rel 0.5
     // >= 0.10, higher_is_worse=false so decrease is a regression.
     // Net: 2 regressions, 0 improvements; one Finding per
     // significant metric.
@@ -997,7 +997,7 @@ fn comparison_policy_load_json_accepts_partial_fields() {
 }
 
 /// `from_cli_flags` resolves the `--threshold` / `--policy` pair
-/// the shared way for `stats compare` and `perf-delta`:
+/// the shared way for `perf-delta`:
 /// threshold → uniform (validated), policy → load_json, neither →
 /// registry defaults, both → error (the clap-`conflicts_with`
 /// backstop). Pin every branch so a future edit can't silently
@@ -1124,12 +1124,13 @@ fn compare_rows_per_metric_policy_resolves_each_metric_independently() {
     );
 }
 
-/// `compare_rows` uses `Iterator::find` to locate the A-side
-/// match for each B-side row, so when `rows_a` contains two
+/// `compare_rows_by` builds a `HashMap<PairingKey, &GauntletRow>`
+/// from `rows_a` via `entry(key).or_insert(row_a)`, then looks up
+/// each B-side row with `get`, so when `rows_a` contains two
 /// entries with the same `(scenario, topology, work_type)` key
-/// the first one wins. Lock that contract in: the second
-/// duplicate must be ignored even though it would change the
-/// verdict.
+/// the first (earlier-iterated) one wins. Lock that contract in:
+/// the second duplicate must be ignored even though it would
+/// change the verdict.
 #[test]
 fn compare_rows_duplicate_key_first_match_wins() {
     // First A-side entry has spread=10 (would yield a regression
@@ -1293,7 +1294,7 @@ fn compare_rows_filter_applies_to_new_and_removed_counters() {
 }
 
 // -- format_host_delta: the 5 match arms of the host-delta
-//    section emitted under `stats compare --runs a b`. --
+//    section emitted under `perf-delta a b`. --
 
 /// Builder for a `HostContext` with enough populated fields to
 /// exercise `HostContext::diff`. Leaves everything else at its
@@ -1308,7 +1309,7 @@ fn host_ctx(release: &str, kernel_cmdline: Option<&str>) -> crate::host_context:
 }
 
 /// `(Some, Some)` identical: the helper emits a one-line
-/// confirmation so users running `stats compare` can distinguish
+/// confirmation so users running `perf-delta` can distinguish
 /// "same host" from "captured but unused" without inspecting
 /// individual sidecars.
 #[test]
@@ -1388,7 +1389,7 @@ fn format_host_delta_both_absent_emits_nothing() {
 /// `(Some, Some)` identical with both sides carrying the SAME
 /// arch: the helper appends `(arch: {value})` to the identical
 /// confirmation line. Pins the identical-arch surfacing contract
-/// so an operator running `stats compare` on two same-arch runs
+/// so an operator running `perf-delta` on two same-arch runs
 /// sees that the matching dimension covers arch — distinguishing
 /// "both x86_64, identical" from "both aarch64, identical"
 /// without inspecting individual sidecars.
@@ -1585,7 +1586,7 @@ fn gauntlet_row_none_cpu_budget_omits_keys() {
 ///
 /// Fixture: a tempdir alt-root with two run subdirectories,
 /// each holding one sidecar. The two sidecars differ on
-/// `scheduler` so the slicing-dim is `scheduler` and
+/// `project_commit` so the slicing-dim is `project_commit` and
 /// `compare_partitions` has a well-defined contrast. Calling
 /// `compare_partitions` with `dir = Some(alt_root)` finds the
 /// pooled fixtures and returns Ok; calling without `--dir`
@@ -1596,18 +1597,18 @@ fn compare_partitions_threads_dir_through_to_pool_collection() {
     use crate::test_support::SidecarResult;
 
     let alt_root = tempfile::TempDir::new().expect("create alt-root tempdir");
-    // Two run subdirs; each holds one sidecar. The sidecars
-    // differ on scheduler so the slicing-dim derivation has
-    // a non-empty result.
-    for (run_key, sched) in [
-        ("__dir_thread_a__", "scx_alpha"),
-        ("__dir_thread_b__", "scx_beta"),
+    // Two run subdirs; each holds one sidecar. The sidecars differ on
+    // project_commit (a SLICEABLE version axis) so the slicing-dim
+    // derivation has a non-empty result.
+    for (run_key, pc) in [
+        ("__dir_thread_a__", "aaaaaa1"),
+        ("__dir_thread_b__", "bbbbbb2"),
     ] {
         let run_dir = alt_root.path().join(run_key);
         std::fs::create_dir_all(&run_dir).expect("create run dir");
         let sidecar = SidecarResult {
             test_name: "dir_thread_fixture".to_string(),
-            scheduler: sched.to_string(),
+            project_commit: Some(pc.to_string()),
             ..SidecarResult::test_fixture()
         };
         let json = serde_json::to_string(&sidecar).expect("serialize fixture sidecar");
@@ -1616,11 +1617,11 @@ fn compare_partitions_threads_dir_through_to_pool_collection() {
     }
 
     let filter_a = RowFilter {
-        schedulers: vec!["scx_alpha".to_string()],
+        project_commits: vec!["aaaaaa1".to_string()],
         ..RowFilter::default()
     };
     let filter_b = RowFilter {
-        schedulers: vec!["scx_beta".to_string()],
+        project_commits: vec!["bbbbbb2".to_string()],
         ..RowFilter::default()
     };
 
@@ -1634,17 +1635,78 @@ fn compare_partitions_threads_dir_through_to_pool_collection() {
         None,
         &ComparisonPolicy::default(),
         Some(alt_root.path()),
-        false,
-        &PhaseDisplayOptions::default(),
+        &crate::stats::GateOptions::default(),
     )
     .expect("compare_partitions must pool sidecars under --dir override");
     assert_eq!(
         exit, 0,
-        "byte-identical metrics across the two scheduler \
+        "byte-identical metrics across the two project-commit \
              partitions must yield zero regressions (exit 0). \
              A non-zero exit means either the partitions loaded \
              different data than written above or compare_rows \
              regressed on identical inputs.",
+    );
+}
+
+/// Regression: `perf-delta --noise-adjust` writes N runs per side, all
+/// sharing one pairing key, and `compare_partitions_noise` must POOL
+/// them (`RowPrep::PerRunPooled`) so `noise_findings` computes each
+/// side's spread — the N same-key runs per side are the intended input,
+/// pooled rather than rejected as duplicates. Before an earlier fix `prepare_partitioned_comparison` bailed
+/// on the N duplicates, so `--noise-adjust N` (N>1) always failed. The
+/// spread math itself is covered by the `noise_findings` tests above;
+/// this pins that the N duplicate-key rows REACH it through the pool +
+/// prep instead of being rejected.
+#[test]
+fn compare_partitions_noise_pools_duplicate_pairing_keys() {
+    use crate::test_support::SidecarResult;
+
+    let alt_root = tempfile::TempDir::new().expect("create alt-root tempdir");
+    // Three runs per side (the `--noise-adjust 3` shape). Each side's
+    // three sidecars share one pairing key (identical but for the
+    // slicing dim `project_commit`), so each side has 3 duplicate-key rows —
+    // exactly the input the old dup-key gate rejected.
+    for (pc, tag) in [("aaaaaa1", "base"), ("bbbbbb2", "head")] {
+        for i in 0..3 {
+            let run_dir = alt_root.path().join(format!("noise_{tag}_{i}"));
+            std::fs::create_dir_all(&run_dir).expect("create run dir");
+            let sidecar = SidecarResult {
+                test_name: "noise_dup_fixture".to_string(),
+                project_commit: Some(pc.to_string()),
+                ..SidecarResult::test_fixture()
+            };
+            let json = serde_json::to_string(&sidecar).expect("serialize fixture sidecar");
+            std::fs::write(run_dir.join(format!("noise_{tag}_{i}.ktstr.json")), json)
+                .expect("write fixture sidecar");
+        }
+    }
+
+    let filter_a = RowFilter {
+        project_commits: vec!["aaaaaa1".to_string()],
+        ..RowFilter::default()
+    };
+    let filter_b = RowFilter {
+        project_commits: vec!["bbbbbb2".to_string()],
+        ..RowFilter::default()
+    };
+
+    // Must POOL the 3-per-side duplicates and return Ok — NOT bail with
+    // "N sidecars with the same pairing key". Byte-identical metrics
+    // across the two sides mean no confident regression, so exit 0.
+    let exit = compare_partitions_noise(
+        &filter_a,
+        &filter_b,
+        Some(alt_root.path()),
+        1.0,
+        &PhaseDisplayOptions::default(),
+        &crate::stats::GateOptions::default(),
+    )
+    .expect("noise compare must pool N duplicate-key runs per side, not reject them");
+    assert_eq!(
+        exit, 0,
+        "identical metrics across the two sides must yield no confident \
+         regression (exit 0); an Err means the old dup-key gate still \
+         rejects the pooled per-run rows before noise_findings sees them",
     );
 }
 
@@ -1900,7 +1962,7 @@ fn render_overcommit_warning_mixed_budget_per_group() {
 
     // Sliced + b1/b2 share EVERY pairing dim (scenario + scheduler +
     // topology + ... all default-equal): one group, two budgets, so
-    // --average folds them -> mixed warning on side B.
+    // the averaging fold combines them -> mixed warning on side B.
     let sliced_same = super::render_overcommit_warning(&[a], &[b1, b2], &sliced)
         .expect("mixed budgets in one group on a sliced side must warn");
     assert!(
@@ -1942,8 +2004,8 @@ fn render_overcommit_warning_mixed_budget_per_group() {
 /// — the "mixing two measurement conditions" message, distinct from
 /// the host-overcommit message. Each budget meets its own vCPU count
 /// (16/16, 32/32) so neither is overcommitted, but the two rows share
-/// every pairing dim and CpuBudget is sliced, so `--average` would
-/// fold them into one mean. Pins the no-overcommit-but-mixed banner
+/// every pairing dim and CpuBudget is sliced, so the averaging fold
+/// would combine them into one mean. Pins the no-overcommit-but-mixed banner
 /// text the existing per-group test never reaches (its mixed case
 /// also overcommits, taking the `if` branch).
 #[test]
@@ -1971,64 +2033,6 @@ fn render_overcommit_warning_mixed_no_overcommit_uses_else_banner() {
     );
 }
 
-// -- check_no_duplicate_pairing_keys --
-
-/// `check_no_duplicate_pairing_keys` returns `Ok(())` when every row
-/// on the side carries a distinct pairing key — the normal
-/// `--no-average` path where each sidecar is a unique
-/// (scenario, topology, work_type) measurement.
-#[test]
-fn check_no_duplicate_pairing_keys_ok_when_all_keys_distinct() {
-    let rows = vec![
-        cmp_row("alpha", "tiny-1llc", true, 10.0, 0),
-        cmp_row("beta", "tiny-1llc", true, 10.0, 0),
-    ];
-    assert!(
-        super::check_no_duplicate_pairing_keys(&rows, LEGACY_PAIRING_DIMS, "A").is_ok(),
-        "distinct pairing keys must pass the --no-average duplicate gate",
-    );
-    // Empty input is trivially duplicate-free.
-    assert!(
-        super::check_no_duplicate_pairing_keys(&[], LEGACY_PAIRING_DIMS, "A").is_ok(),
-        "empty side must pass the duplicate gate",
-    );
-}
-
-/// `check_no_duplicate_pairing_keys` bails when two rows on one side
-/// share a pairing key — the `--no-average` guard against
-/// `compare_rows_by` silently latching onto the first match. The bail
-/// must name the offending side and the duplicate-key condition so the
-/// operator can drop `--no-average` or add a disambiguating filter.
-#[test]
-fn check_no_duplicate_pairing_keys_bails_on_collision_and_names_side() {
-    // Two rows with the SAME (scenario, topology, work_type) under
-    // LEGACY_PAIRING_DIMS -> identical pairing key.
-    let rows = vec![
-        cmp_row("dup", "tiny-1llc", true, 10.0, 0),
-        cmp_row("dup", "tiny-1llc", true, 20.0, 0),
-    ];
-    let err = super::check_no_duplicate_pairing_keys(&rows, LEGACY_PAIRING_DIMS, "B")
-        .expect_err("two rows sharing a pairing key must bail under --no-average");
-    let rendered = format!("{err:#}");
-    assert!(
-        rendered.contains("side B"),
-        "bail must name the offending side; got: {rendered}",
-    );
-    assert!(
-        rendered.contains("same pairing key"),
-        "bail must describe the duplicate-key condition; got: {rendered}",
-    );
-    assert!(
-        rendered.contains("--no-average"),
-        "bail must point at the --no-average flag the operator can drop; got: {rendered}",
-    );
-    // The side label is lowercased into the `--b-X` suggestion.
-    assert!(
-        rendered.contains("--b-"),
-        "bail must suggest a per-side filter to disambiguate; got: {rendered}",
-    );
-}
-
 // -- noise_findings (perf-delta --noise-adjust row-level core) tests --
 
 /// Three identical runs of one scenario carrying `worst_spread` (LowerBetter, via
@@ -2043,6 +2047,1010 @@ fn noise_side(scenario: &str, spread: f64, iters: u64) -> Vec<GauntletRow> {
     ]
 }
 
+/// Under --noise-adjust a Rate's compared centroid must be the pooled
+/// Σnum/Σden (duration-weighted) the registry documents (metric.rs), NOT the
+/// mean of per-run ratios — the two differ when run denominators differ. A
+/// side with runs (run_delay=100, wall=1s)->100/s and (run_delay=100,
+/// wall=10s)->10/s has pooled 200/11 = 18.18/s but mean-of-ratios 55/s. The
+/// per-run band ([10,100]) still measures run-to-run spread. This pins that
+/// the centroid is pooled (agreeing with the Averaged path).
+#[test]
+fn noise_findings_rate_centroid_is_pooled_not_mean_of_ratios() {
+    let mk = |run_delay: f64, wall: f64| {
+        let mut r = cmp_row("rate", "tiny-1llc", true, 10.0, 0);
+        r.ext_metrics
+            .insert("total_run_delay".to_string(), run_delay);
+        r.ext_metrics
+            .insert("total_schedstat_wall_sec".to_string(), wall);
+        r
+    };
+    // B identical to A so the only thing under test is A's reported centroid.
+    let a = vec![mk(100.0, 1.0), mk(100.0, 10.0)];
+    let b = vec![mk(100.0, 1.0), mk(100.0, 10.0)];
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, true);
+    let f = rep
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "run_delay_per_sec")
+        .unwrap_or_else(|| {
+            panic!(
+                "run_delay_per_sec must appear: {:?}",
+                rep.findings
+                    .iter()
+                    .map(|f| f.metric.name)
+                    .collect::<Vec<_>>(),
+            )
+        });
+    // Pooled Σnum/Σden = 200/11 = 18.18..., NOT mean-of-ratios (100+10)/2 = 55.
+    assert!(
+        (f.verdict.a.mean - 200.0 / 11.0).abs() < 1e-6,
+        "Rate centroid must be pooled Σnum/Σden (18.18), got {} (mean-of-ratios would be 55)",
+        f.verdict.a.mean,
+    );
+}
+
+/// Schedstat Rate metrics (e.g. total_run_delay_ns_per_sched) have a
+/// `|_| None` accessor and materialize only via derive_rate_metrics from
+/// their ext_metrics components — which sidecar_to_row injects but never
+/// derives. The Averaged path derives them (group_and_average_by); the
+/// per-run noise path must too, or a real regression in a GATED schedstat
+/// rate is silently absent from the verdict. Here run-delay-per-schedule
+/// doubles 1000 -> 2000 ns (LowerBetter) with zero per-side spread, so the
+/// DERIVED rate must appear and gate as a confident REGRESSION.
+#[test]
+fn noise_findings_derives_schedstat_rate_from_per_run_components() {
+    let mk = |run_delay: f64| {
+        let mut r = cmp_row("sched", "tiny-1llc", true, 10.0, 0);
+        r.ext_metrics
+            .insert("total_run_delay".to_string(), run_delay);
+        r.ext_metrics.insert("total_pcount".to_string(), 1000.0);
+        r
+    };
+    // total_run_delay_ns_per_sched = total_run_delay / total_pcount.
+    let a = vec![mk(1_000_000.0), mk(1_000_000.0)]; // 1000 ns/sched
+    let b = vec![mk(2_000_000.0), mk(2_000_000.0)]; // 2000 ns/sched
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    assert_eq!(rep.paired_scenarios, 1);
+    let rate = rep
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "total_run_delay_ns_per_sched")
+        .unwrap_or_else(|| {
+            panic!(
+                "derived schedstat rate must appear in noise findings: {:?}",
+                rep.findings
+                    .iter()
+                    .map(|f| f.metric.name)
+                    .collect::<Vec<_>>(),
+            )
+        });
+    assert_eq!(
+        rate.kind,
+        NoiseKind::Regression,
+        "run-delay-per-schedule doubling (LowerBetter) must gate as a confident regression",
+    );
+}
+
+/// A per-side run can fail (noise_dual_run logs + continues), writing a
+/// `passed=false` sidecar whose failure-mode metric is an outlier. It must
+/// be EXCLUDED from the spread pool — mirroring the scalar `compare_rows_by`
+/// — or a byte-identical HEAD gates as a false regression. Here B = 2 clean
+/// runs at 2000 iters + 1 FAILED run at 990; A = 3 clean runs at 2000.
+/// Without exclusion B's mean (1663) < A's band => a false total_iterations
+/// regression; with exclusion the failed row is dropped and there is none.
+#[test]
+fn noise_findings_excludes_failed_run_from_the_spread_pool() {
+    let a = noise_side("fx", 10.0, 2000);
+    let b = vec![
+        cmp_row("fx", "tiny-1llc", true, 10.0, 2000),
+        cmp_row("fx", "tiny-1llc", true, 10.0, 2000),
+        cmp_row("fx", "tiny-1llc", false, 10.0, 990), // failed run, outlier iters
+    ];
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    assert_eq!(rep.paired_scenarios, 1);
+    assert_eq!(
+        rep.regressions(),
+        0,
+        "a failed per-run row must be excluded from the pool, not gate a false regression: {:?}",
+        rep.findings
+            .iter()
+            .map(|f| (f.metric.name, f.kind))
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// A per-side run failure can leave one side with a single realized
+/// sample. Even a large cross-side shift that would otherwise be a
+/// confident regression must be reported NOISY (never gated), because a
+/// single-point band has no measurable spread. Pins that the `<2`-sample
+/// guard in `noise_verdict` flows through `noise_findings` end-to-end.
+#[test]
+fn noise_findings_degenerate_single_sample_side_is_noisy_not_confident() {
+    let a_one = vec![cmp_row("degen", "tiny-1llc", true, 10.0, 2000)];
+    let b_three = noise_side("degen", 10.0, 1000); // 3 clean runs, iters dropped 2000->1000
+    let rep = noise_findings(&a_one, &b_three, LEGACY_PAIRING_DIMS, 1.0, false);
+    assert_eq!(rep.paired_scenarios, 1);
+    assert_eq!(
+        rep.regressions(),
+        0,
+        "a single-sample baseline side must NOT yield a confident regression: {:?}",
+        rep.findings
+            .iter()
+            .map(|f| (f.metric.name, f.kind))
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        rep.noisy() >= 1,
+        "the shifted metric(s) must be flagged NOISY because side A realized <2 samples",
+    );
+}
+
+// ---- per-phase noise (perf-delta --noise-adjust, per-phase) ----
+
+/// Build `n` pass rows for one side, each carrying the given phase buckets.
+fn phased_rows(
+    scenario: &str,
+    n: usize,
+    buckets: &[crate::assert::PhaseBucket],
+) -> Vec<GauntletRow> {
+    (0..n)
+        .map(|_| {
+            let mut r = cmp_row(scenario, "tiny-1llc", true, 10.0, 0);
+            r.phases = buckets.to_vec();
+            r
+        })
+        .collect()
+}
+
+#[test]
+fn noise_phase_findings_emits_per_phase_spread() {
+    // Step[1] max_dsq_depth (LowerBetter Peak) rises 8->20 across sides, clean
+    // (spread 0 both) -> separated (disjoint bands) and material (delta 12 >= abs
+    // 10, 150% >= 50% rel) -> a confident per-phase REGRESSION; BASELINE
+    // unchanged.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)]),
+        ],
+    );
+    let b = phased_rows(
+        "scn",
+        3,
+        &[
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 20.0)]),
+        ],
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, false);
+    let s1 = rep
+        .phase_findings
+        .iter()
+        .find(|f| f.step_index == 1 && f.metric.name == "max_dsq_depth")
+        .expect("Step[1] max_dsq_depth per-phase finding");
+    assert_eq!((s1.verdict.a.mean, s1.verdict.b.mean), (8.0, 20.0));
+    assert_eq!(
+        s1.kind,
+        NoiseKind::Regression,
+        "LowerBetter 8->20 rose => per-phase regression",
+    );
+}
+
+#[test]
+fn noise_phase_scoped_regression_is_render_only_not_gated() {
+    // A per-phase regression with NO scalar/aggregate move: the row-level
+    // metric fields are identical across sides (cmp_row defaults), only the
+    // phase bucket shifts. Per-phase is render-only, so the exit basis
+    // (aggregate regressions) stays 0 while phase_regressions() counts it.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])],
+    );
+    let b = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 20.0)])],
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, false);
+    assert_eq!(
+        rep.phase_regressions(),
+        1,
+        "the per-phase shift is a phase regression"
+    );
+    assert_eq!(
+        rep.regressions(),
+        0,
+        "no aggregate move -> exit basis unaffected (per-phase is render-only)",
+    );
+}
+
+#[test]
+fn noise_phase_rate_pooled_centroid_within_phase() {
+    // iteration_rate = total_phase_iterations / total_phase_duration_sec (Rate,
+    // HigherBetter). A side: run1 (100 iters, 1s)=100/s + run2 (100 iters,
+    // 10s)=10/s -> pooled 200/11 = 18.18, NOT mean-of-ratios 55; band [10,100].
+    let bucket = |iters: f64, sec: f64| {
+        make_phase_bucket(
+            1,
+            "Step[0]",
+            &[
+                ("total_phase_iterations", iters),
+                ("total_phase_duration_sec", sec),
+                ("iteration_rate", iters / sec),
+            ],
+        )
+    };
+    let side = |scn: &str| {
+        vec![
+            {
+                let mut r = cmp_row(scn, "tiny-1llc", true, 10.0, 0);
+                r.phases = vec![bucket(100.0, 1.0)];
+                r
+            },
+            {
+                let mut r = cmp_row(scn, "tiny-1llc", true, 10.0, 0);
+                r.phases = vec![bucket(100.0, 10.0)];
+                r
+            },
+        ]
+    };
+    let rep = noise_findings(&side("scn"), &side("scn"), LEGACY_PAIRING_DIMS, 1.0, true);
+    let f = rep
+        .phase_findings
+        .iter()
+        .find(|f| f.step_index == 1 && f.metric.name == "iteration_rate")
+        .expect("Step[1] iteration_rate per-phase finding");
+    assert!(
+        (f.verdict.a.mean - 200.0 / 11.0).abs() < 1e-6,
+        "per-phase Rate centroid must be pooled (18.18), got {} (mean-of-ratios would be 55)",
+        f.verdict.a.mean,
+    );
+}
+
+#[test]
+fn noise_phase_excludes_non_pass_run() {
+    // B = 2 clean Step[1]=8 + 1 FAILED Step[1]=40 (outlier). The failed run's
+    // phase must be excluded before the per-phase pass, so Step[1] sees only
+    // the 2 passing B values (8,8) and there is no false per-phase regression.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])],
+    );
+    let mut b = phased_rows(
+        "scn",
+        2,
+        &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])],
+    );
+    let mut failed = cmp_row("scn", "tiny-1llc", false, 10.0, 0); // is_fail
+    failed.phases = vec![make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 40.0)])];
+    b.push(failed);
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    assert_eq!(
+        rep.phase_regressions(),
+        0,
+        "the failed run's outlier phase must be excluded, no false per-phase regression",
+    );
+}
+
+#[test]
+fn noise_phase_n_lt_2_is_noisy() {
+    // Step[1] max_dsq_depth present in only 1 of A's 3 passing runs -> n<2 ->
+    // Noisy, never a confident regression, despite a large cross-side shift.
+    let mut a = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[])]);
+    a[0].phases = vec![make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])];
+    let b = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 40.0)])],
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    let f = rep
+        .phase_findings
+        .iter()
+        .find(|f| f.step_index == 1 && f.metric.name == "max_dsq_depth");
+    assert!(
+        matches!(f.map(|f| f.kind), Some(NoiseKind::Noisy)),
+        "a <2-sample per-phase side must be Noisy, got {:?}",
+        f.map(|f| f.kind),
+    );
+}
+
+#[test]
+fn noise_phase_one_sided_metric_is_coverage() {
+    // A's matched Step[1] has max_dsq_depth; B's Step[1] does not -> coverage
+    // (present_side A), not a finding.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])],
+    );
+    let b = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[])]);
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    assert!(
+        rep.phase_coverage
+            .iter()
+            .any(|c| c.metric.map(|m| m.name) == Some("max_dsq_depth")
+                && c.present_side == ComparePartition::A),
+        "A-only max_dsq_depth at a matched step must be a coverage row",
+    );
+    assert!(
+        !rep.phase_findings
+            .iter()
+            .any(|f| f.metric.name == "max_dsq_depth"),
+        "a one-sided metric is coverage, never a finding",
+    );
+}
+
+#[test]
+fn noise_phase_one_sided_step_is_coverage() {
+    // A has BASELINE + Step[1]; B has only BASELINE. The whole one-sided
+    // Step[1] must surface as coverage, not be dropped.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)]),
+        ],
+    );
+    let b = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)])],
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    assert!(
+        rep.phase_coverage
+            .iter()
+            .any(|c| c.step_index == 1 && c.present_side == ComparePartition::A),
+        "the whole one-sided Step[1] must surface as coverage",
+    );
+    assert_eq!(
+        rep.phase_regressions(),
+        0,
+        "matched BASELINE unchanged -> no regression"
+    );
+}
+
+#[test]
+fn noise_phase_empty_one_sided_step_surfaces_as_shape_coverage() {
+    // A has BASELINE + a Step[1] whose buckets carry NO readable metric (a
+    // synthesized capture-free step); B has only BASELINE. The empty one-sided
+    // Step[1] must still surface as a metric-less coverage row, not be silently
+    // dropped (no-silent-drops).
+    let a = phased_rows(
+        "scn",
+        3,
+        &[
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)]),
+            make_phase_bucket(1, "Step[0]", &[]),
+        ],
+    );
+    let b = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)])],
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    assert!(
+        rep.phase_coverage.iter().any(|c| c.step_index == 1
+            && c.metric.is_none()
+            && c.present_side == ComparePartition::A),
+        "an empty one-sided Step[1] must surface as a metric-less coverage row: {:?}",
+        rep.phase_coverage
+            .iter()
+            .map(|c| (c.step_index, c.metric.map(|m| m.name)))
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn noise_phase_empty_phases_skip() {
+    // A carries phases, B has none -> per-phase sub-pass skipped entirely,
+    // while the aggregate findings still populate.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])],
+    );
+    let b: Vec<GauntletRow> = (0..3)
+        .map(|_| cmp_row("scn", "tiny-1llc", true, 10.0, 0))
+        .collect();
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    assert!(
+        rep.phase_findings.is_empty() && rep.phase_coverage.is_empty(),
+        "no per-phase data when a side has no phases",
+    );
+}
+
+#[test]
+fn format_noise_phase_findings_lines_honors_flags() {
+    // BASELINE max_dsq_depth 5->20 and Step[1] 8->20 both shift, each material
+    // (delta >= abs 10, rel >= 50%) and separated -> per-phase regressions.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)]),
+        ],
+    );
+    let b = phased_rows(
+        "scn",
+        3,
+        &[
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 20.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 20.0)]),
+        ],
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    let render = |opts: &PhaseDisplayOptions| {
+        format_noise_phase_findings_lines(
+            &rep.phase_findings,
+            &rep.phase_coverage,
+            opts,
+            "base",
+            "head",
+            true,
+        )
+        .join("\n")
+    };
+    // no_phases -> empty
+    assert!(
+        format_noise_phase_findings_lines(
+            &rep.phase_findings,
+            &rep.phase_coverage,
+            &PhaseDisplayOptions {
+                no_phases: true,
+                ..Default::default()
+            },
+            "base",
+            "head",
+            true,
+        )
+        .is_empty(),
+        "no_phases suppresses the per-phase block",
+    );
+    // steps_only -> Step[0] present, BASELINE (step 0) absent.
+    let s = render(&PhaseDisplayOptions {
+        steps_only: true,
+        ..Default::default()
+    });
+    assert!(
+        s.contains("1: Step[0]") && !s.contains("0: BASELINE"),
+        "steps_only suppresses BASELINE:\n{s}",
+    );
+    // --phase 0 -> only BASELINE.
+    let p = render(&PhaseDisplayOptions {
+        phase: Some(0),
+        ..Default::default()
+    });
+    assert!(
+        p.contains("0: BASELINE") && !p.contains("1: Step[0]"),
+        "phase=0 shows only BASELINE:\n{p}",
+    );
+    // REGRESSION verdict text present in the default render.
+    assert!(
+        render(&PhaseDisplayOptions::default()).contains("REGRESSION"),
+        "a per-phase regression renders the REGRESSION verdict",
+    );
+}
+
+#[test]
+fn passes_noise_spread_threshold_edges() {
+    // Build a NoiseVerdict with known means (2 identical samples/side -> mean).
+    let v = |a: f64, b: f64| noise_verdict(&[a, a], &[b, b], 1.0);
+    // No --phase-threshold -> every row passes.
+    assert!(PhaseDisplayOptions::default().passes_noise_spread_threshold(&v(100.0, 200.0)));
+    let o = PhaseDisplayOptions {
+        phase_threshold: Some(10.0),
+        ..Default::default()
+    };
+    // |b-a|/|a| under vs over the 10% gate.
+    assert!(
+        !o.passes_noise_spread_threshold(&v(100.0, 105.0)),
+        "5% < 10% -> filtered"
+    );
+    assert!(
+        o.passes_noise_spread_threshold(&v(100.0, 120.0)),
+        "20% >= 10% -> shown"
+    );
+    // ~zero baseline with a real move -> unbounded relative change -> shown.
+    assert!(
+        o.passes_noise_spread_threshold(&v(0.0, 50.0)),
+        "zero baseline + move -> shown"
+    );
+    // Both ~zero -> no signal -> filtered by any positive threshold.
+    assert!(
+        !o.passes_noise_spread_threshold(&v(0.0, 0.0)),
+        "both ~zero -> filtered"
+    );
+}
+
+#[test]
+fn format_noise_phase_findings_lines_renders_coverage() {
+    // A one-sided metric (A-only max_dsq_depth at matched Step[1]) + a whole
+    // empty one-sided step (Step[2]) -> the coverage table must render both,
+    // with `—` for the metric-less shape row.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)]),
+            make_phase_bucket(2, "Step[1]", &[]),
+        ],
+    );
+    let b = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[])]);
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    let out = format_noise_phase_findings_lines(
+        &rep.phase_findings,
+        &rep.phase_coverage,
+        &PhaseDisplayOptions::default(),
+        "base",
+        "head",
+        false,
+    )
+    .join("\n");
+    assert!(
+        out.contains("per-phase coverage asymmetry"),
+        "coverage header rendered:\n{out}",
+    );
+    assert!(
+        out.contains("max_dsq_depth"),
+        "one-sided metric name rendered:\n{out}"
+    );
+    assert!(
+        out.contains("—"),
+        "the metric-less empty one-sided step renders `—`:\n{out}"
+    );
+}
+
+#[test]
+fn format_noise_phase_findings_lines_honors_phase_threshold() {
+    // Step[0] (step 1) shifts +3%, Step[1] (step 2) shifts +50%. --phase-threshold
+    // 10 suppresses the small move, keeps the large one.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 100.0)]),
+            make_phase_bucket(2, "Step[1]", &[("max_dsq_depth", 100.0)]),
+        ],
+    );
+    let b = phased_rows(
+        "scn",
+        3,
+        &[
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 103.0)]),
+            make_phase_bucket(2, "Step[1]", &[("max_dsq_depth", 150.0)]),
+        ],
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, true);
+    let out = format_noise_phase_findings_lines(
+        &rep.phase_findings,
+        &rep.phase_coverage,
+        &PhaseDisplayOptions {
+            phase_threshold: Some(10.0),
+            ..Default::default()
+        },
+        "base",
+        "head",
+        true,
+    )
+    .join("\n");
+    assert!(
+        out.contains("2: Step[1]") && !out.contains("1: Step[0]"),
+        "--phase-threshold 10 keeps the +50% step and suppresses the +3% step:\n{out}",
+    );
+}
+
+#[test]
+fn format_noise_phase_findings_lines_default_hides_stable_rows() {
+    // Default per-phase view (show_all=false) shows only MEANINGFUL rows
+    // (regression / improvement / informational) and hides the wall of stable /
+    // noisy rows — parity with the aggregate table. A phase carrying one
+    // regression + one unchanged (stable) metric shows only the regression by
+    // default; `--all-metrics` (show_all=true) restores the stable row.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(
+            1,
+            "Step[0]",
+            &[("max_dsq_depth", 5.0), ("schbench_loop_count", 100.0)],
+        )],
+    );
+    let b = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(
+            1,
+            "Step[0]",
+            &[("max_dsq_depth", 20.0), ("schbench_loop_count", 100.0)],
+        )],
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    // Fixture sanity: max_dsq_depth 5->20 is a per-phase regression, and the
+    // unchanged schbench_loop_count is a stable row to hide. Guards against a
+    // vacuous pass if the classifier ever changes.
+    assert!(
+        rep.phase_findings
+            .iter()
+            .any(|f| f.metric.name == "max_dsq_depth" && f.kind == NoiseKind::Regression),
+        "fixture must carry a per-phase regression: {:?}",
+        rep.phase_findings
+            .iter()
+            .map(|f| (f.metric.name, f.kind))
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        rep.phase_findings
+            .iter()
+            .any(|f| f.metric.name == "schbench_loop_count" && f.kind == NoiseKind::Stable),
+        "fixture must carry a per-phase stable row to hide",
+    );
+    let default = format_noise_phase_findings_lines(
+        &rep.phase_findings,
+        &rep.phase_coverage,
+        &PhaseDisplayOptions::default(),
+        "base",
+        "head",
+        false,
+    )
+    .join("\n");
+    assert!(
+        default.contains("max_dsq_depth") && default.contains("REGRESSION"),
+        "the meaningful regression row shows by default:\n{default}",
+    );
+    assert!(
+        !default.contains("schbench_loop_count"),
+        "a stable per-phase row is hidden without --all-metrics:\n{default}",
+    );
+    let full = format_noise_phase_findings_lines(
+        &rep.phase_findings,
+        &rep.phase_coverage,
+        &PhaseDisplayOptions::default(),
+        "base",
+        "head",
+        true,
+    )
+    .join("\n");
+    assert!(
+        full.contains("schbench_loop_count"),
+        "--all-metrics restores the suppressed stable per-phase row:\n{full}",
+    );
+}
+
+#[test]
+fn format_noise_phase_findings_lines_collapses_when_all_stable() {
+    // Every per-phase row stable -> the default view collapses to a one-line
+    // summary (never a silent gap or an empty table), and it names --all-metrics
+    // so the suppressed rows stay discoverable.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(
+            1,
+            "Step[0]",
+            &[("schbench_loop_count", 100.0)],
+        )],
+    );
+    let b = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(
+            1,
+            "Step[0]",
+            &[("schbench_loop_count", 100.0)],
+        )],
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    assert!(
+        !rep.phase_findings.is_empty()
+            && rep
+                .phase_findings
+                .iter()
+                .all(|f| f.kind == NoiseKind::Stable),
+        "fixture must be all-stable per-phase findings: {:?}",
+        rep.phase_findings
+            .iter()
+            .map(|f| (f.metric.name, f.kind))
+            .collect::<Vec<_>>(),
+    );
+    let out = format_noise_phase_findings_lines(
+        &rep.phase_findings,
+        &rep.phase_coverage,
+        &PhaseDisplayOptions::default(),
+        "base",
+        "head",
+        false,
+    )
+    .join("\n");
+    assert!(
+        out.contains("none meaningfully changed") && out.contains("--all-metrics"),
+        "all-stable per-phase collapses to the one-line summary:\n{out}",
+    );
+    // --all-metrics restores the full stable table (no collapse).
+    let full = format_noise_phase_findings_lines(
+        &rep.phase_findings,
+        &rep.phase_coverage,
+        &PhaseDisplayOptions::default(),
+        "base",
+        "head",
+        true,
+    )
+    .join("\n");
+    assert!(
+        full.contains("schbench_loop_count") && !full.contains("none meaningfully changed"),
+        "--all-metrics shows the stable rows instead of collapsing:\n{full}",
+    );
+}
+
+#[test]
+fn format_noise_phase_findings_lines_suppressed_spread_with_coverage_shows_hint() {
+    // A matched-but-STABLE metric (suppressed by default) ALONGSIDE a one-sided
+    // COVERAGE metric: the default view must still surface the --all-metrics hint
+    // (the suppressed spread rows are not silently gone) AND render the coverage
+    // table. Regression guard for the coverage-present suppression gap.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(
+            1,
+            "Step[0]",
+            &[("schbench_loop_count", 100.0), ("max_dsq_depth", 8.0)],
+        )],
+    );
+    let b = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(
+            1,
+            "Step[0]",
+            &[("schbench_loop_count", 100.0)],
+        )],
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    // Fixture sanity: schbench_loop_count is a matched STABLE finding (to
+    // suppress), max_dsq_depth is A-only (a coverage row).
+    assert!(
+        rep.phase_findings
+            .iter()
+            .any(|f| f.metric.name == "schbench_loop_count" && f.kind == NoiseKind::Stable),
+        "fixture must carry a matched stable spread row to suppress: {:?}",
+        rep.phase_findings
+            .iter()
+            .map(|f| (f.metric.name, f.kind))
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        !rep.phase_coverage.is_empty(),
+        "fixture must carry a one-sided coverage row"
+    );
+    let out = format_noise_phase_findings_lines(
+        &rep.phase_findings,
+        &rep.phase_coverage,
+        &PhaseDisplayOptions::default(),
+        "base",
+        "head",
+        false,
+    )
+    .join("\n");
+    assert!(
+        out.contains("none meaningfully changed") && out.contains("--all-metrics"),
+        "the suppressed-spread hint appears even when a coverage table follows:\n{out}",
+    );
+    assert!(
+        out.contains("per-phase coverage asymmetry"),
+        "the coverage table still renders alongside the hint:\n{out}",
+    );
+    assert!(
+        !out.contains("schbench_loop_count"),
+        "the stable spread row itself stays hidden without --all-metrics:\n{out}",
+    );
+}
+
+#[test]
+fn noise_report_composite_counts_regressed_improved_stable() {
+    // The composite footer cites regressed / improved (the signal) and stable
+    // (the residual); pin the accessors that feed it. worst_spread (LowerBetter):
+    // 10->15 regresses, 10->5 improves; unchanged total_iterations (2000) stays
+    // stable in both directions.
+    let base = noise_side("scn", 10.0, 2000);
+
+    let regressed = noise_findings(
+        &base,
+        &noise_side("scn", 15.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+        true,
+    );
+    assert_eq!(regressed.regressions(), 1, "worst_spread 10->15 regresses");
+    assert_eq!(
+        regressed.improvements(),
+        0,
+        "nothing improved on the regressing side"
+    );
+    assert!(
+        regressed.stable() >= 1,
+        "unchanged total_iterations is counted stable"
+    );
+    assert_eq!(
+        regressed.informational(),
+        0,
+        "no informational metric in the fixture"
+    );
+
+    let improved = noise_findings(
+        &base,
+        &noise_side("scn", 5.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+        true,
+    );
+    assert_eq!(improved.improvements(), 1, "worst_spread 10->5 improves");
+    assert_eq!(
+        improved.regressions(),
+        0,
+        "nothing regressed on the improving side"
+    );
+    assert!(
+        improved.stable() >= 1,
+        "unchanged total_iterations is counted stable"
+    );
+}
+
+#[test]
+fn verdict_label_stays_stable_below_cutoff_cites_direction_above() {
+    // Default cutoff 5. Sub-cutoff moves in either direction are likely noise ->
+    // STABLE (they are still flagged / counted in the footer). Clearing the
+    // cutoff cites that direction; both directions can hold at once.
+    assert_eq!(
+        verdict_label(false, 0, None),
+        "STABLE",
+        "no moves -> stable"
+    );
+    assert_eq!(
+        verdict_label(false, 4, None),
+        "STABLE",
+        "4 improvements < 5 cutoff -> still stable (likely noise)"
+    );
+    assert_eq!(
+        verdict_label(false, 5, None),
+        "IMPROVED",
+        "improvements clear the cutoff -> IMPROVED"
+    );
+    assert_eq!(
+        verdict_label(true, 0, None),
+        "REGRESSED",
+        "a failing run reads REGRESSED even with no improvements"
+    );
+    assert_eq!(
+        verdict_label(true, 5, None),
+        "REGRESSED + IMPROVED",
+        "both directions clear the cutoff -> combined verdict"
+    );
+    // The cutoff tracks --fail-threshold: 1 makes a single improvement
+    // significant; 0 disables count significance for improvements.
+    assert_eq!(verdict_label(false, 1, Some(1)), "IMPROVED");
+    assert_eq!(verdict_label(false, 100, Some(0)), "STABLE");
+}
+
+#[test]
+fn noise_phase_informational_metric_shows_but_never_gates() {
+    // The noise per-phase path SHOWS an Informational metric as
+    // NoiseKind::Informational and never gates it (directionless metrics are
+    // surfaced, not dropped). total_ttwu_count is a registered directionless
+    // Counter; a significant move (1000->5000, clean spread 0) must classify
+    // Informational, not Regression, and must NOT count in phase_regressions().
+    // Pins that an Informational per-phase move is shown but never gates.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(
+            1,
+            "Step[0]",
+            &[("total_ttwu_count", 1000.0)],
+        )],
+    );
+    let b = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(
+            1,
+            "Step[0]",
+            &[("total_ttwu_count", 5000.0)],
+        )],
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
+    let f = rep
+        .phase_findings
+        .iter()
+        .find(|f| f.step_index == 1 && f.metric.name == "total_ttwu_count")
+        .expect("Step[1] total_ttwu_count per-phase finding (noise SHOWS Informational)");
+    assert_eq!(
+        f.kind,
+        NoiseKind::Informational,
+        "an Informational per-phase metric shows as Informational, not a regression",
+    );
+    assert_eq!(rep.phase_regressions(), 0, "Informational never gates");
+}
+
+#[test]
+fn noise_phase_findings_disambiguate_by_pairing_key_across_topologies() {
+    // One scenario name run on TWO topologies forms two distinct pairing-key
+    // groups (topology is a pairing dim), each with its own per-phase finding.
+    // Their rows must carry DISTINCT pairing_labels (scenario/topology/...),
+    // not collapse to identical "scenario"-only labels the operator can't tell
+    // apart.
+    let phased = |topo: &'static str, depth: f64| {
+        (0..3)
+            .map(|_| {
+                let mut r = cmp_row("scn", topo, true, 10.0, 0);
+                r.phases = vec![make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", depth)])];
+                r
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut a = phased("tiny-1llc", 8.0);
+    a.extend(phased("large-4llc", 8.0));
+    let mut b = phased("tiny-1llc", 20.0);
+    b.extend(phased("large-4llc", 20.0));
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, false);
+    let labels: Vec<&str> = rep
+        .phase_findings
+        .iter()
+        .filter(|f| f.metric.name == "max_dsq_depth")
+        .map(|f| f.pairing_label.as_str())
+        .collect();
+    assert_eq!(
+        labels.len(),
+        2,
+        "one per-phase finding per topology group, distinct labels: {labels:?}",
+    );
+    assert!(
+        labels.iter().any(|l| l.contains("tiny-1llc"))
+            && labels.iter().any(|l| l.contains("large-4llc")),
+        "pairing labels must include the topology to disambiguate: {labels:?}",
+    );
+    assert_ne!(
+        labels[0], labels[1],
+        "the two topology groups must render distinct labels"
+    );
+}
+
+#[test]
+fn summarize_side_runs_categorizes_by_exclusion() {
+    // A skipped run (is_skip); a failed run (passed=false, not skipped/inc =>
+    // is_fail); a comparable run (passed=true). `comparable` must equal the
+    // count noise_findings keeps, so a zero explains an empty comparison.
+    let mut skip = cmp_row("s", "tiny-1llc", false, 0.0, 0);
+    skip.skipped = true;
+    let fail = cmp_row("s", "tiny-1llc", false, 0.0, 0);
+    let pass = cmp_row("s", "tiny-1llc", true, 0.0, 0);
+
+    // All skipped -> 0 comparable; the breakdown names the skips (the perf-delta
+    // "no comparable runs to pair" diagnostic reads this).
+    let (ok, desc) = summarize_side_runs(&[skip.clone(), skip.clone(), skip.clone()]);
+    assert_eq!(ok, 0, "all skipped -> 0 comparable: {desc}");
+    assert!(
+        desc.contains("3 run(s)") && desc.contains("0 comparable") && desc.contains("3 skipped"),
+        "breakdown names the skipped runs: {desc}"
+    );
+
+    // Mixed: 1 pass + 1 skip + 1 fail -> 1 comparable, both exclusions named.
+    let (ok2, desc2) = summarize_side_runs(&[pass, skip, fail]);
+    assert_eq!(ok2, 1, "one pass is comparable: {desc2}");
+    assert!(
+        desc2.contains("1 comparable") && desc2.contains("1 skipped") && desc2.contains("1 failed"),
+        "mixed breakdown names each excluded category: {desc2}"
+    );
+}
+
 #[test]
 fn noise_findings_classifies_both_polarities() {
     // Both polarities WORSEN: worst_spread (LowerBetter) rises 10->15;
@@ -2053,6 +3061,7 @@ fn noise_findings_classifies_both_polarities() {
         &noise_side("regress", 15.0, 1000),
         LEGACY_PAIRING_DIMS,
         1.0,
+        false,
     );
     assert_eq!(rep.paired_scenarios, 1);
     assert_eq!(
@@ -2073,6 +3082,7 @@ fn noise_findings_classifies_both_polarities() {
         &noise_side("improve", 10.0, 2000),
         LEGACY_PAIRING_DIMS,
         1.0,
+        false,
     );
     assert_eq!(rep.regressions(), 0);
     assert_eq!(
@@ -2086,10 +3096,15 @@ fn noise_findings_classifies_both_polarities() {
 }
 
 #[test]
-fn noise_findings_too_noisy_takes_precedence_over_regression() {
-    // A's worst_spread swings 10..20 (~67% relative spread, over the 1% gate), so
-    // even though B (30) is far higher (a worsening direction for LowerBetter), the
-    // metric is flagged NOISY, NOT counted as a confident regression.
+fn noise_findings_high_spread_annotates_but_does_not_suppress_regression() {
+    // A's worst_spread swings 10..20 (~67% relative spread, over the 5% advisory
+    // gate), and B (30) is far higher — a worsening move for LowerBetter. The
+    // high per-side spread is ADVISORY: it flags the row (high_spread) but must
+    // NOT suppress the confident regression. The old behavior dropped exactly
+    // this as NOISY, INVERTING signal and noise (a real regression's degraded
+    // side is intrinsically high-variance). The bands are disjoint ([10,20] vs
+    // [30,30]) so the move is separated, and the delta is material (15 >= abs 5,
+    // 100% >= 25% rel).
     let a = vec![
         cmp_row("noisy", "tiny-1llc", true, 10.0, 2000),
         cmp_row("noisy", "tiny-1llc", true, 20.0, 2000),
@@ -2099,7 +3114,8 @@ fn noise_findings_too_noisy_takes_precedence_over_regression() {
         &a,
         &noise_side("noisy", 30.0, 2000),
         LEGACY_PAIRING_DIMS,
-        1.0,
+        5.0,
+        false,
     );
     let ws = rep
         .findings
@@ -2108,13 +3124,17 @@ fn noise_findings_too_noisy_takes_precedence_over_regression() {
         .expect("worst_spread finding present");
     assert_eq!(
         ws.kind,
-        NoiseKind::Noisy,
-        "wide A spread -> NOISY, not REGRESSION"
+        NoiseKind::Regression,
+        "wide A spread must NOT suppress a separated + material worsening move",
+    );
+    assert!(
+        ws.verdict.high_spread,
+        "A's ~67% spread exceeds the 5% advisory gate -> high_spread annotation",
     );
     assert_eq!(
         rep.regressions(),
-        0,
-        "a too-noisy metric must not fail the gate"
+        1,
+        "the separated, material worsening metric gates as a confident regression",
     );
     // total_iterations is unchanged (2000 both sides) and clean -> omitted.
     assert!(
@@ -2128,6 +3148,47 @@ fn noise_findings_too_noisy_takes_precedence_over_regression() {
 }
 
 #[test]
+fn noise_findings_separated_but_immaterial_stays_stable() {
+    // The materiality gate in isolation: worst_spread A [10,10,10] vs B
+    // [10.5,10.5,10.5] has fully DISJOINT zero-variance bands -> separated=true,
+    // but delta 0.5 < default_abs 5.0 -> material=false. classify_noise must keep
+    // it Stable (include_stable) / omit it (gate path), NEVER a regression. Guards
+    // the `&& material` clause in classify_noise: dropping it would turn this into
+    // a false Regression while every band/separation test still passed.
+    let a = noise_side("imm", 10.0, 2000);
+    let b = noise_side("imm", 10.5, 2000);
+    // Gate path: the separated-but-immaterial move must not gate.
+    let gate = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, false);
+    assert_eq!(
+        gate.regressions(),
+        0,
+        "a separated but immaterial (0.5 < abs 5.0) move must not gate: {:?}",
+        gate.findings
+            .iter()
+            .map(|f| (f.metric.name, f.kind))
+            .collect::<Vec<_>>(),
+    );
+    // Render path: it surfaces as Stable, not Regression, and the bands really
+    // are separated (so it is the materiality gate — not lack of separation —
+    // holding it back).
+    let show = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    let ws = show
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "worst_spread")
+        .expect("worst_spread row present under include_stable");
+    assert_eq!(
+        ws.kind,
+        NoiseKind::Stable,
+        "separated-but-immaterial worst_spread is Stable, not a regression",
+    );
+    assert!(
+        ws.verdict.separated,
+        "premise: the [10,10] vs [10.5,10.5] bands are disjoint => separated",
+    );
+}
+
+#[test]
 fn noise_findings_skips_all_zero_and_omits_unchanged() {
     // Both sides exactly 0 on every metric -> no signal -> no findings, but the
     // scenario still counts as paired.
@@ -2136,6 +3197,7 @@ fn noise_findings_skips_all_zero_and_omits_unchanged() {
         &noise_side("zero", 0.0, 0),
         LEGACY_PAIRING_DIMS,
         1.0,
+        false,
     );
     assert!(
         rep.findings.is_empty(),
@@ -2149,12 +3211,676 @@ fn noise_findings_skips_all_zero_and_omits_unchanged() {
         &noise_side("same", 12.0, 1500),
         LEGACY_PAIRING_DIMS,
         1.0,
+        false,
     );
     assert!(
         rep.findings.is_empty(),
         "unchanged-clean scenario yields no findings"
     );
     assert_eq!((rep.regressions(), rep.noisy()), (0, 0));
+}
+
+#[test]
+fn noise_findings_include_stable_shows_unchanged_metrics() {
+    // include_stable=true (the render path): an unchanged-and-clean metric
+    // the gate path omits is instead reported as Stable, so the full
+    // comparison table shows every metric. Stable never gates.
+    let rep = noise_findings(
+        &noise_side("same", 12.0, 1500),
+        &noise_side("same", 12.0, 1500),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+        true,
+    );
+    assert!(
+        !rep.findings.is_empty(),
+        "include_stable surfaces the unchanged metrics"
+    );
+    assert!(
+        rep.findings.iter().all(|f| f.kind == NoiseKind::Stable),
+        "unchanged-clean metrics are Stable: {:?}",
+        rep.findings
+            .iter()
+            .map(|f| (f.metric.name, f.kind))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!((rep.regressions(), rep.noisy()), (0, 0));
+
+    // Both-zero metrics stay OMITTED even under include_stable=true (the
+    // both-zero skip precedes the include_stable branch), so no zero-valued
+    // metric leaks into the table as a spurious Stable row.
+    let rep_zero = noise_findings(
+        &noise_side("zero", 0.0, 0),
+        &noise_side("zero", 0.0, 0),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+        true,
+    );
+    assert!(
+        rep_zero.findings.is_empty(),
+        "both-zero metrics are omitted (never Stable) even with include_stable: {:?}",
+        rep_zero
+            .findings
+            .iter()
+            .map(|f| f.metric.name)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(rep_zero.paired_scenarios, 1);
+}
+
+#[test]
+fn format_noise_findings_table_renders_rows_and_verdicts() {
+    // worst_spread rises 10->15 (LowerBetter -> REGRESSION); total_iterations
+    // is unchanged (2000 both) -> Stable. The table carries the header, the
+    // regressed row + verdict, and the Stable row (full comparison visible).
+    let rep = noise_findings(
+        &noise_side("mix", 10.0, 2000),
+        &noise_side("mix", 15.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+        true,
+    );
+    let out = format_noise_findings_table(&rep.findings, "base", "head", true);
+    assert!(
+        out.contains("TEST / METRIC") && out.contains("VERDICT"),
+        "header present: {out}"
+    );
+    // The TEST column carries the full pairing-key label (scenario + pairing
+    // dims: topology/work_type), not scenario alone — matching the scalar path.
+    assert!(
+        out.contains("mix/tiny-1llc/SpinWait / worst_spread") && out.contains("REGRESSION"),
+        "worsened metric row + verdict: {out}"
+    );
+    assert!(
+        out.contains("stable"),
+        "unchanged total_iterations renders as a stable row: {out}"
+    );
+}
+
+#[test]
+fn format_noise_findings_table_renders_noisy_improvement_and_advisory_spread() {
+    // Pin the remaining verdict-arm strings (a text/color swap in one arm would
+    // otherwise slip past the REGRESSION/stable-only table test).
+
+    // Noisy: a side with <2 usable runs (insufficient_samples) -> NOISY row.
+    let a = vec![cmp_row("nz", "tiny-1llc", true, 10.0, 2000)];
+    let rep = noise_findings(
+        &a,
+        &noise_side("nz", 30.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        5.0,
+        true,
+    );
+    let out = format_noise_findings_table(&rep.findings, "base", "head", true);
+    assert!(
+        out.contains("NOISY (<2 runs)"),
+        "insufficient-samples verdict rendered: {out}"
+    );
+
+    // Improvement: worst_spread drops 15->10 (LowerBetter, clean) -> improvement.
+    let rep = noise_findings(
+        &noise_side("imp", 15.0, 2000),
+        &noise_side("imp", 10.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        5.0,
+        true,
+    );
+    let out = format_noise_findings_table(&rep.findings, "base", "head", true);
+    assert!(
+        out.contains("improvement"),
+        "improvement verdict rendered: {out}"
+    );
+
+    // Advisory spread: a separated + material worsening move whose baseline side
+    // is high-variance (worst_spread A [10,20,15] ~67% > 5% gate, B 30) renders
+    // as "REGRESSION (noisy spread)" — the advisory flag annotates but does NOT
+    // suppress (the signal-inversion fix).
+    let a = vec![
+        cmp_row("adv", "tiny-1llc", true, 10.0, 2000),
+        cmp_row("adv", "tiny-1llc", true, 20.0, 2000),
+        cmp_row("adv", "tiny-1llc", true, 15.0, 2000),
+    ];
+    let rep = noise_findings(
+        &a,
+        &noise_side("adv", 30.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        5.0,
+        true,
+    );
+    let out = format_noise_findings_table(&rep.findings, "base", "head", true);
+    assert!(
+        out.contains("REGRESSION (noisy spread)"),
+        "high_spread annotates the reported regression, never suppresses it: {out}"
+    );
+}
+
+#[test]
+fn format_noise_findings_table_default_hides_stable_and_noisy_rows() {
+    // Default operator view (show_all=false): only MEANINGFUL rows (regression /
+    // improvement / informational) print; Stable and Noisy rows are hidden. This
+    // pins the core default-suppress display invariant — every OTHER
+    // format_noise_findings_table test passes show_all=true, so without this a
+    // regression that leaked Stable/Noisy rows into the default view, or emitted
+    // an empty table instead of the one-line summary, would ship silently.
+
+    // worst_spread 10->15 (LowerBetter) -> REGRESSION; total_iterations unchanged
+    // (2000 both) -> Stable. Under show_all=false the regression shows, the
+    // stable row is hidden.
+    let rep = noise_findings(
+        &noise_side("mix", 10.0, 2000),
+        &noise_side("mix", 15.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+        true,
+    );
+    // Guard against a vacuous pass: the fixture MUST carry a Stable finding to hide.
+    assert!(
+        rep.findings.iter().any(|f| f.kind == NoiseKind::Stable),
+        "fixture must contain a Stable finding to hide: {:?}",
+        rep.findings.iter().map(|f| f.kind).collect::<Vec<_>>()
+    );
+    let out = format_noise_findings_table(&rep.findings, "base", "head", false);
+    assert!(
+        out.contains("worst_spread") && out.contains("REGRESSION"),
+        "the meaningful regression row still shows under default suppression: {out}"
+    );
+    assert!(
+        !out.contains("stable"),
+        "Stable rows are hidden without --all-metrics: {out}"
+    );
+
+    // A report whose findings are ALL Stable/Noisy collapses to the one-line
+    // summary (never an empty table) under show_all=false. Side A has one run
+    // (insufficient) -> every metric classifies Noisy.
+    let a = vec![cmp_row("nz", "tiny-1llc", true, 10.0, 2000)];
+    let rep = noise_findings(
+        &a,
+        &noise_side("nz", 30.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        5.0,
+        true,
+    );
+    assert!(
+        rep.findings
+            .iter()
+            .all(|f| matches!(f.kind, NoiseKind::Stable | NoiseKind::Noisy)),
+        "fixture must contain only suppressed (Stable/Noisy) findings: {:?}",
+        rep.findings.iter().map(|f| f.kind).collect::<Vec<_>>()
+    );
+    let out = format_noise_findings_table(&rep.findings, "base", "head", false);
+    assert!(
+        out.contains("none meaningfully changed") && out.contains("--all-metrics"),
+        "all-suppressed collapses to the one-line summary: {out}"
+    );
+    // --all-metrics (show_all=true) restores the full table (the NOISY row returns).
+    let full = format_noise_findings_table(&rep.findings, "base", "head", true);
+    assert!(
+        full.contains("NOISY (<2 runs)"),
+        "--all-metrics restores the suppressed rows: {full}"
+    );
+}
+
+// ---- PerfDeltaAssertion declared-gate overrides (perf-delta only) ----
+
+/// Build a declared-gate record (the sidecar mirror the compare path reads).
+fn perf_gate(
+    metric: &str,
+    max_regression_pct: Option<f64>,
+    min_abs: Option<f64>,
+    direction: Option<crate::test_support::Polarity>,
+    phase: Option<u16>,
+) -> crate::test_support::PerfDeltaAssertionRecord {
+    crate::test_support::PerfDeltaAssertionRecord {
+        metric: metric.to_string(),
+        direction,
+        max_regression_pct,
+        min_abs,
+        phase,
+    }
+}
+
+/// Attach a declared gate to every row of a side (each run of a test carries
+/// the same declared assertions; the compare path reads `b_rows.first()`).
+fn with_gate(
+    mut rows: Vec<GauntletRow>,
+    gate: crate::test_support::PerfDeltaAssertionRecord,
+) -> Vec<GauntletRow> {
+    for r in &mut rows {
+        r.perf_delta_assertions.push(gate.clone());
+    }
+    rows
+}
+
+#[test]
+fn noise_findings_declared_gate_tightens_immaterial_move_to_regression() {
+    // worst_spread 10->11: under the registry default (abs 5.0 / rel 0.25) the
+    // abs delta 1.0 < 5.0 is IMMATERIAL -> Stable. A declared gate
+    // (max_regression_pct=5 -> rel 0.05, min_abs=0.5) makes abs 1.0>=0.5 AND rel
+    // 0.10>=0.05 -> material; the disjoint [10,10] vs [11,11] bands separate;
+    // LowerBetter 11>10 worsened -> REGRESSION. Proves the override tightens and
+    // that the classification is attributed to the declared gate.
+    let a = noise_side("gate", 10.0, 0);
+
+    // Baseline: the SAME move without the gate stays Stable and never gates.
+    let ungated = noise_findings(
+        &a,
+        &noise_side("gate", 11.0, 0),
+        LEGACY_PAIRING_DIMS,
+        5.0,
+        true,
+    );
+    let uw = ungated
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "worst_spread")
+        .expect("worst_spread row");
+    assert_eq!(
+        uw.kind,
+        NoiseKind::Stable,
+        "10->11 is immaterial under the registry default",
+    );
+    assert!(
+        !uw.gated_by_assertion,
+        "no declared gate on the ungated rows"
+    );
+    assert_eq!(ungated.regressions(), 0);
+
+    // With the declared gate the same move becomes a confident regression.
+    let b = with_gate(
+        noise_side("gate", 11.0, 0),
+        perf_gate("worst_spread", Some(5.0), Some(0.5), None, None),
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    let w = rep
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "worst_spread")
+        .expect("worst_spread row");
+    assert_eq!(
+        w.kind,
+        NoiseKind::Regression,
+        "the tighter declared gate flags the move",
+    );
+    assert!(
+        w.gated_by_assertion,
+        "the row was classified by the declared gate",
+    );
+    assert_eq!(
+        rep.regressions(),
+        1,
+        "the declared-gate regression gates the exit",
+    );
+    assert!(
+        rep.assertion_coverage.is_empty(),
+        "the gate matched a metric that had data",
+    );
+}
+
+#[test]
+fn noise_findings_declared_direction_override_flips_polarity() {
+    // worst_spread is LowerBetter, so a material 10->11 rise is a REGRESSION. A
+    // declared direction=HigherBetter reclassifies the SAME move as an
+    // improvement — proving the direction override in classify_noise.
+    let a = noise_side("dir", 10.0, 0);
+    let b = with_gate(
+        noise_side("dir", 11.0, 0),
+        perf_gate(
+            "worst_spread",
+            Some(5.0),
+            Some(0.5),
+            Some(crate::test_support::Polarity::HigherBetter),
+            None,
+        ),
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    let w = rep
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "worst_spread")
+        .expect("worst_spread row");
+    assert_eq!(
+        w.kind,
+        NoiseKind::Improvement,
+        "HigherBetter reclassifies the 10->11 rise as an improvement",
+    );
+    assert!(w.gated_by_assertion);
+    assert_eq!(rep.regressions(), 0);
+}
+
+#[test]
+fn noise_findings_unmatched_whole_run_gate_is_reported() {
+    // A declared gate on a metric absent from the compared data
+    // (run_delay_per_sec — a Rate with no components on these rows) never reaches
+    // classify_noise, so it surfaces as an un-evaluated declared gate rather than
+    // a silent pass. The runtime analog of validate()'s registry typo check.
+    let a = noise_side("cov", 10.0, 0);
+    let b = with_gate(
+        noise_side("cov", 10.0, 0),
+        perf_gate("run_delay_per_sec", Some(5.0), None, None, None),
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    assert_eq!(
+        rep.assertion_coverage.len(),
+        1,
+        "the absent-metric gate is reported as un-evaluated",
+    );
+    let c = &rep.assertion_coverage[0];
+    assert_eq!(c.assertion.metric, "run_delay_per_sec");
+    assert_eq!(c.assertion.phase, None);
+    assert_eq!(
+        rep.regressions(),
+        0,
+        "an un-evaluated gate never gates the exit",
+    );
+}
+
+#[test]
+fn noise_findings_unmatched_phase_gate_is_reported() {
+    // A phase-scoped gate (step 5) on a scenario that has NO phases: the
+    // per-phase pass never evaluates it, so it surfaces as un-evaluated. The
+    // aggregate worst_spread row is present (identical sides -> Stable) but NOT
+    // annotated, since the gate is phase-scoped, not whole-run.
+    let a = noise_side("pcov", 10.0, 0);
+    let b = with_gate(
+        noise_side("pcov", 10.0, 0),
+        perf_gate("worst_spread", Some(5.0), None, None, Some(5)),
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    assert_eq!(rep.assertion_coverage.len(), 1);
+    assert_eq!(rep.assertion_coverage[0].assertion.phase, Some(5));
+    let w = rep
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "worst_spread")
+        .expect("aggregate worst_spread row");
+    assert!(
+        !w.gated_by_assertion,
+        "a phase-scoped gate does not annotate the aggregate row",
+    );
+}
+
+#[test]
+fn format_noise_findings_table_marks_declared_gate() {
+    // A declared-gate regression renders with the "(declared gate)" verdict
+    // annotation so the operator distinguishes an author-tightened gate from a
+    // registry-default one.
+    let a = noise_side("mark", 10.0, 0);
+    let b = with_gate(
+        noise_side("mark", 11.0, 0),
+        perf_gate("worst_spread", Some(5.0), Some(0.5), None, None),
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    let out = format_noise_findings_table(&rep.findings, "base", "head", true);
+    assert!(
+        out.contains("REGRESSION (declared gate)"),
+        "declared-gate regression is annotated: {out}",
+    );
+}
+
+#[test]
+fn format_noise_assertion_coverage_lines_lists_unevaluated_gates() {
+    // The un-evaluated declared gate warning names the metric and describes the
+    // thresholds it would have applied; empty coverage renders nothing.
+    let a = noise_side("fcov", 10.0, 0);
+    let b = with_gate(
+        noise_side("fcov", 10.0, 0),
+        perf_gate("run_delay_per_sec", Some(5.0), Some(0.5), None, None),
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    let out = format_noise_assertion_coverage_lines(&rep.assertion_coverage).join("\n");
+    assert!(
+        out.contains("NOT evaluated"),
+        "warning header present: {out}"
+    );
+    assert!(
+        out.contains("run_delay_per_sec"),
+        "the un-evaluated metric is named: {out}",
+    );
+    assert!(
+        out.contains("max_regression_pct=5") && out.contains("min_abs=0.5"),
+        "the declared thresholds are described: {out}",
+    );
+    assert!(
+        format_noise_assertion_coverage_lines(&[]).is_empty(),
+        "no coverage rows -> no lines",
+    );
+}
+
+#[test]
+fn noise_findings_declared_phase_gate_gates_the_exit() {
+    // Step[0] (step_index 1) max_dsq_depth 8->9: immaterial under the registry
+    // default (abs 1 < default_abs 10) -> a render-only Stable per-phase finding.
+    // A phase-scoped declared gate (phase=1, max_regression_pct=5, min_abs=0.5)
+    // tightens it to a per-phase REGRESSION that — unlike a spread-only per-phase
+    // finding — DOES gate the exit (declared_phase_regressions), while the
+    // AGGREGATE basis stays 0 (row-level max_dsq_depth is 0 on both sides).
+    let buckets = |v: f64| {
+        vec![
+            make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)]),
+            make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", v)]),
+        ]
+    };
+    let a = phased_rows("pg", 3, &buckets(8.0));
+    let mut b = phased_rows("pg", 3, &buckets(9.0));
+    for r in &mut b {
+        r.perf_delta_assertions.push(perf_gate(
+            "max_dsq_depth",
+            Some(5.0),
+            Some(0.5),
+            None,
+            Some(1),
+        ));
+    }
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    let s1 = rep
+        .phase_findings
+        .iter()
+        .find(|f| f.step_index == 1 && f.metric.name == "max_dsq_depth")
+        .expect("Step[0] max_dsq_depth per-phase finding");
+    assert_eq!(
+        s1.kind,
+        NoiseKind::Regression,
+        "the declared phase gate flags the otherwise-immaterial move",
+    );
+    assert!(s1.gated_by_assertion);
+    assert_eq!(
+        rep.declared_phase_regressions(),
+        1,
+        "a declared phase gate contributes to the exit basis",
+    );
+    assert_eq!(
+        rep.regressions(),
+        0,
+        "no AGGREGATE regression — the move is phase-scoped only",
+    );
+    assert!(
+        rep.assertion_coverage.is_empty(),
+        "the phase gate matched Step[0]",
+    );
+    // The declared phase gate fires the EXIT (1) even though the aggregate
+    // count is 0 and even with the operator count gate disabled — it is an
+    // author opt-in orthogonal to --fail-threshold.
+    assert_eq!(
+        noise_exit_code(&rep, &crate::stats::GateOptions::default()),
+        1,
+        "a declared phase regression fails the run under the default gate",
+    );
+    assert_eq!(
+        noise_exit_code(
+            &rep,
+            &crate::stats::GateOptions {
+                fail_threshold: Some(0),
+                ..Default::default()
+            },
+        ),
+        1,
+        "a declared phase regression fails even with the count gate disabled",
+    );
+}
+
+#[test]
+fn noise_findings_declared_whole_run_gate_gates_the_exit() {
+    // worst_spread 10->15 (LowerBetter) is a single AGGREGATE regression. Under
+    // the default count gate (>=5 regressions) it alone would NOT fail. A
+    // whole-run (phase: None) declared gate on it is an author opt-in that
+    // ALWAYS gates — the aggregate-axis parity of the declared PHASE gate above
+    // — so the exit is 1 with only this one regression.
+    let a = noise_side("wr", 10.0, 2000);
+    let b = with_gate(
+        noise_side("wr", 15.0, 2000),
+        perf_gate("worst_spread", Some(5.0), Some(0.5), None, None),
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    let agg = rep
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "worst_spread")
+        .expect("worst_spread aggregate finding");
+    assert_eq!(agg.kind, NoiseKind::Regression);
+    assert!(
+        agg.gated_by_assertion,
+        "a whole-run declared gate marks the AGGREGATE finding"
+    );
+    assert_eq!(rep.declared_regressions(), 1);
+    assert_eq!(
+        rep.declared_phase_regressions(),
+        0,
+        "the gate is whole-run, not phase-scoped"
+    );
+    assert_eq!(
+        rep.regressions(),
+        1,
+        "exactly one aggregate regression (below the default count gate)"
+    );
+    // A single declared whole-run regression fails the run under the DEFAULT
+    // count gate (>=5) — the count gate must not swallow an author opt-in.
+    assert_eq!(
+        noise_exit_code(&rep, &crate::stats::GateOptions::default()),
+        1,
+        "a declared whole-run regression fails even below --fail-threshold",
+    );
+    // ...and with the count gate fully disabled (fail_threshold 0) it still gates.
+    assert_eq!(
+        noise_exit_code(
+            &rep,
+            &crate::stats::GateOptions {
+                fail_threshold: Some(0),
+                ..Default::default()
+            },
+        ),
+        1,
+        "a declared whole-run regression gates even with the count gate disabled",
+    );
+    // Sanity: WITHOUT the declaration the SAME lone regression does NOT fail the
+    // default gate — proving the declaration is what gates, not the count.
+    let rep_undeclared = noise_findings(
+        &a,
+        &noise_side("wr", 15.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        5.0,
+        true,
+    );
+    assert_eq!(rep_undeclared.regressions(), 1);
+    assert_eq!(rep_undeclared.declared_regressions(), 0);
+    assert_eq!(
+        noise_exit_code(&rep_undeclared, &crate::stats::GateOptions::default()),
+        0,
+        "a lone UNdeclared regression is below the default count gate (>=5)",
+    );
+}
+
+#[test]
+fn scalar_declared_gate_warning_flags_present_gates() {
+    // The scalar compare does not evaluate declared gates; it must WARN (not
+    // silently ignore) when compared tests carry them.
+    let plain = vec![cmp_row("s", "tiny-1llc", true, 10.0, 0)];
+    assert!(
+        scalar_declared_gate_warning(&plain).is_none(),
+        "no declared gates -> no warning",
+    );
+    let gated = with_gate(
+        vec![cmp_row("s", "tiny-1llc", true, 10.0, 0)],
+        perf_gate("worst_spread", Some(5.0), None, None, None),
+    );
+    let w = scalar_declared_gate_warning(&gated).expect("declared gate -> warning");
+    assert!(
+        w.contains("--noise-adjust") && w.contains("NOT evaluate"),
+        "warning must name --noise-adjust and that gates are not evaluated: {w}",
+    );
+}
+
+#[test]
+fn classify_noise_ignores_target_value_direction_on_the_sidecar_path() {
+    // `with_direction` rejects TargetValue, but PerfDeltaAssertionRecord is a
+    // pub serde type, so a hand-edited / stale sidecar could carry
+    // direction=TargetValue (built here directly via perf_gate, bypassing the
+    // builder gate — the sidecar path). classify_noise must IGNORE it and
+    // inherit the registry polarity, not misread it as increase-is-worse:
+    // total_iterations is HigherBetter, so a 1000->1100 rise is an IMPROVEMENT.
+    // Without the guard, TargetValue -> Some(true) would flip this to Regression.
+    let a = noise_side("tv", 10.0, 1000);
+    let b = with_gate(
+        noise_side("tv", 10.0, 1100),
+        perf_gate(
+            "total_iterations",
+            Some(5.0),
+            Some(50.0),
+            Some(crate::test_support::Polarity::TargetValue(5.0)),
+            None,
+        ),
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    let f = rep
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "total_iterations")
+        .expect("total_iterations row");
+    assert_eq!(
+        f.kind,
+        NoiseKind::Improvement,
+        "a TargetValue direction on the Record must be ignored -> inherit \
+         HigherBetter -> a rise is an improvement, not a regression",
+    );
+    assert!(f.gated_by_assertion);
+}
+
+#[test]
+fn classify_noise_ignores_out_of_range_thresholds_on_the_sidecar_path() {
+    // validate rejects negative/NaN thresholds on the entry path, but a stale /
+    // hand-edited sidecar Record could carry them (built here directly via
+    // perf_gate). delta.abs()/rel_delta are non-negative, so a NEGATIVE gate
+    // would make `material` unconditionally true -> a phantom confident
+    // regression that flips the exit. The guard must reject out-of-range
+    // thresholds and fall back to the registry default. worst_spread 10->10.5 is
+    // separated (disjoint bands) but immaterial under the registry default (0.5 <
+    // default_abs 5.0), so with the guard it stays Stable despite the negative
+    // declared thresholds.
+    let a = noise_side("oor", 10.0, 2000);
+    let b = with_gate(
+        noise_side("oor", 10.5, 2000),
+        perf_gate("worst_spread", Some(-5.0), Some(-10.0), None, None),
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    assert_eq!(
+        rep.regressions(),
+        0,
+        "negative sidecar thresholds must NOT manufacture a phantom regression: {:?}",
+        rep.findings
+            .iter()
+            .map(|f| (f.metric.name, f.kind))
+            .collect::<Vec<_>>(),
+    );
+    let w = rep
+        .findings
+        .iter()
+        .find(|f| f.metric.name == "worst_spread")
+        .expect("worst_spread row");
+    assert_eq!(
+        w.kind,
+        NoiseKind::Stable,
+        "out-of-range declared thresholds fall back to the registry default -> \
+         0.5 < default_abs 5.0 -> immaterial -> Stable",
+    );
 }
 
 /// A `Polarity::Informational` metric (the monitor `total_ttwu_count`) that
@@ -2358,5 +4084,69 @@ fn coverage_diff_lines_map_present_absent_labels_by_side() {
     assert!(
         joined2.contains("absent in 'runA'"),
         "absent maps to runA: {joined2}"
+    );
+}
+
+/// #28: a scale-varying count metric (`total_iterations`, recalibrated from a
+/// high-throughput floor of 100 to a near-idle activity floor of 2) must flag a
+/// large RELATIVE regression on a low-throughput run. Before the fix
+/// default_abs=100 masked a 200->120 drop: rel 0.40 clears default_rel (0.10)
+/// but |delta| 80 < 100 failed the abs gate, so a 40% iteration collapse was
+/// classified "unchanged". After the near-idle recalibration the relative gate
+/// carries materiality and the drop surfaces as a regression.
+#[test]
+fn compare_rows_scale_varying_low_throughput_regression_is_material() {
+    // total_iterations: HigherBetter, default_abs 2.0 (was 100), default_rel 0.10
+    // (2.0 not 1.0: rounded-mean u64 field -- a floor of 1.0 would let a <=1.0
+    // rounding delta fabricate a regression; see group.rs rounded-mean invariant).
+    let rows_a = vec![cmp_row("lowtput", "tiny-1llc", true, 10.0, 200)];
+    let rows_b = vec![cmp_row("lowtput", "tiny-1llc", true, 10.0, 120)];
+    let res = compare_rows_by(
+        &rows_a,
+        &rows_b,
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert!(
+        res.findings
+            .iter()
+            .any(|f| f.metric.name == "total_iterations" && f.kind == FindingKind::Regression),
+        "200 -> 120 total_iterations (40% drop, |delta| 80 < old floor 100) must \
+         be a regression after the near-idle floor recalibration; got {:?}",
+        res.findings
+            .iter()
+            .map(|f| (f.metric.name, f.delta))
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// Contrast to the low-throughput pin: the near-idle floor recalibration lowered
+/// ONLY the absolute floor, not the relative gate, so a small RELATIVE move on a
+/// high-throughput baseline is still filtered as noise. This pins that the fix
+/// did not make the gate hair-trigger at high throughput.
+#[test]
+fn compare_rows_scale_varying_high_throughput_noise_is_unchanged() {
+    // 100000 -> 101000 total_iterations: |delta| 1000 >= near-idle floor 2.0, but
+    // rel 0.01 < default_rel 0.10 -> the relative gate vetoes -> unchanged.
+    let rows_a = vec![cmp_row("hitput", "tiny-1llc", true, 10.0, 100_000)];
+    let rows_b = vec![cmp_row("hitput", "tiny-1llc", true, 10.0, 101_000)];
+    let res = compare_rows_by(
+        &rows_a,
+        &rows_b,
+        LEGACY_PAIRING_DIMS,
+        None,
+        &ComparisonPolicy::default(),
+    );
+    assert!(
+        res.findings
+            .iter()
+            .all(|f| f.metric.name != "total_iterations"),
+        "100000 -> 101000 total_iterations (1% move) must stay unchanged: the \
+         relative gate still filters high-throughput noise; got {:?}",
+        res.findings
+            .iter()
+            .map(|f| (f.metric.name, f.delta))
+            .collect::<Vec<_>>(),
     );
 }

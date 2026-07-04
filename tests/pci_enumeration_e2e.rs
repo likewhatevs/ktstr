@@ -35,7 +35,9 @@
 //! dispatch. The final check reads offset 0x100 from a non-boot CPU
 //! to exercise that ECAM MMIO path end-to-end (it returns 0 — the
 //! host bridge has no extended capabilities). The ECAM/CAM decode is
-//! also unit-tested in `src/vmm/pci/mod.rs` (`ecam_*`,
+//! also unit-tested in `src/vmm/pci/mod.rs`
+//! (`decode_ecam_extracts_bus_devfn_reg`,
+//! `overread_past_config_space_is_all_ones_not_panic`,
 //! `cam_decodes_extended_register_not_aliased_to_base`,
 //! `ecam_decodes_extended_register_not_aliased_to_base`).
 //!

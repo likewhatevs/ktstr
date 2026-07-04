@@ -16,9 +16,10 @@ use super::*;
 /// type in the BTF — `peel_modifiers` returns `None`. The renderer
 /// surfaces `Ptr{ deref: None, deref_skipped_reason: Some("kernel
 /// cast target type id N unresolvable") }` from
-/// [`render_cast_pointer`]'s kernel-arm peel gate (the
-/// `peel_modifiers_resolving_fwd` call that precedes the
-/// `try_sdt_alloc_bridge` and size resolution).
+/// [`resolve_chase_target`]'s step-1 peel (called by
+/// [`render_cast_pointer`]'s kernel arm), whose
+/// `peel_modifiers_resolving_fwd` call precedes the
+/// `try_sdt_alloc_bridge` and size resolution.
 /// Without this guard, a corrupt or stale CastMap entry pointing at
 /// a freed type id would propagate `None` further down and surface
 /// as the same "kernel read_kva failed" reason that genuine read
@@ -81,8 +82,9 @@ fn cast_chase_kernel_target_type_id_unresolvable() {
 /// = 0` — represents an incomplete forward declaration the BPF
 /// compiler emitted without a definition). The renderer surfaces
 /// `Ptr{ deref: None, deref_skipped_reason: Some("...BTF size is 0
-/// (incomplete type)") }` from [`render_cast_pointer`]'s
-/// kernel-arm `if btf_size == 0` gate. This guard
+/// (incomplete type)") }` from [`resolve_chase_target`]'s
+/// step-5 `if btf_size == 0` gate (reached from
+/// [`render_cast_pointer`]'s kernel arm). This guard
 /// prevents a zero-byte `read_kva` from succeeding spuriously and
 /// rendering an empty struct as if the chase had landed.
 #[test]
@@ -93,9 +95,10 @@ fn cast_chase_kernel_target_btf_size_zero() {
     //   id=2: struct T { u64 f @ 0 }, size 8
     //   id=3: struct Q {}, size 0  (the zero-sized cast target)
     //
-    // T_id=2, Q_id=3. The kernel arm's `if btf_size == 0` check at
-    // [`render_cast_pointer`]'s kernel-arm `if btf_size == 0`
-    // gate is what we are exercising; `type_size`
+    // T_id=2, Q_id=3. The gate we exercise is
+    // [`resolve_chase_target`]'s step-5 `if btf_size == 0`,
+    // reached from [`render_cast_pointer`]'s kernel arm via its
+    // `resolve_chase_target("kernel cast")` call; `type_size`
     // returns `Some(0)` for a zero-sized Struct so the prior guard
     // (None case) does not fire.
     let (strings, n_int, n_t, n_q, n_f, _n_x) = cast_strings_for_t_q();

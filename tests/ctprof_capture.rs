@@ -32,13 +32,18 @@ use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
 /// Why schedstat-OR-minflt: `CONFIG_SCHEDSTATS` is compiled in
 /// (see ktstr.kconfig) but runtime-disabled until `sysctl
 /// kernel.sched_schedstats=1` fires. A guest that doesn't
-/// enable it sees every `run_time_ns` / `voluntary_csw` / etc.
-/// field as zero. `minflt` (page faults) does not depend on
-/// any compile-time flag — any thread that dirtied a COW page
-/// to print its own argv has a non-zero count. Using
-/// `run_time_ns > 0 || voluntary_csw > 0 || nr_wakeups > 0 ||
-/// minflt > 0` accepts the common case AND the schedstat-off
-/// case without softening the "did ANY counter land" invariant.
+/// enable it sees the `/proc/<tid>/schedstat` fields
+/// (`run_time_ns` / `timeslices`) as zero. `voluntary_csw` /
+/// `nonvoluntary_csw` come from `/proc/<tid>/status`
+/// (`p->nvcsw` / `p->nivcsw`, bumped in `__schedule` on every
+/// context switch) and `minflt` (page faults) from
+/// `/proc/<tid>/stat` — none depend on the schedstat runtime
+/// flag, so any thread that context-switched or dirtied a COW
+/// page to print its own argv has a non-zero count. Using
+/// `run_time_ns > 0 || voluntary_csw > 0 || nonvoluntary_csw > 0
+/// || nr_wakeups > 0 || timeslices > 0 || minflt > 0` accepts
+/// the common case AND the schedstat-off case without softening
+/// the "did ANY counter land" invariant.
 ///
 /// Topology: 1 LLC / 2 cores / 1 thread — minimal. The test
 /// cares about the capture surface, not about scheduler-level
@@ -116,7 +121,7 @@ fn ctprof_capture_returns_threads_with_nonzero_counters(ctx: &Ctx) -> Result<Ass
                  any_tgid_nonzero={any_tgid_nonzero}. Suggests the \
                  capture layer reached procfs but every counter \
                  read collapsed to Default — likely a
-                 /proc/<tid>/{{sched,stat}} parse regression.",
+                 /proc/<tid>/{{sched,schedstat,stat,status}} parse regression.",
                 snap.threads.len(),
             ),
         )));

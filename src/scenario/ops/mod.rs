@@ -5,7 +5,7 @@
 //! single declaration. [`execute_steps()`] runs a step sequence with
 //! scheduler liveness checks and stimulus event recording.
 //!
-//! See the [Ops and Steps](https://likewhatevs.github.io/ktstr/guide/concepts/ops.html)
+//! See the [Ops and Steps](https://ktstr.dev/guide/concepts/ops.html)
 //! chapter for a guide.
 //!
 //! # Cgroup tooling at a glance
@@ -1040,7 +1040,7 @@ fn finish_scenario(
     mut result: AssertResult,
 ) -> AssertResult {
     // ScenarioEnd marker. Routes through `send_scenario_end`
-    // (virtio-console port-1 with COM2 fallback for early-boot).
+    // (virtio-console port-1 bulk channel).
     // Carries the last cleanly-completed step's COINCIDENT (elapsed_ms,
     // iterations) pair so the host can give the last step an
     // `iteration_rate` over a well-formed window. The elapsed
@@ -1150,9 +1150,10 @@ fn run_scenario(
         // Live `crate::vmm::rust_init::sched_pid()` read instead of
         // `ctx.sched_pid` snapshot so a mid-scenario
         // `Op::ReplaceScheduler` swap is reflected — the swap
-        // dispatcher updates `SCHED_PID` to the new child via
-        // `set_sched_pid`, and this check then observes the new
-        // pid's liveness (not the dead boot pid). `None` means
+        // dispatcher publishes the new child's pid to `SCHED_PID`
+        // via the `SCHED_PID.store` in `try_spawn_scheduler`, and
+        // this check then observes the new pid's liveness (not the
+        // dead boot pid). `None` means
         // either no scheduler was configured at boot or
         // `Op::DetachScheduler` cleared the pid; the liveness probe
         // cannot meaningfully report on a pid that doesn't exist.

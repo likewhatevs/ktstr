@@ -381,8 +381,8 @@ fn build_groups_comm_distinct_prefixes_do_not_merge() {
 }
 
 /// AlphaPrefix grouping (no separator before trailing digits)
-/// clusters CamelCase names that share a prefix. 176
-/// `CamelCaseWord{0..175}` threads (one per CPU) collapse
+/// clusters CamelCase names that share a prefix. 6
+/// `CamelCaseWord{0..5}` threads collapse
 /// into one bucket — pin the bucket count and exact member
 /// count to defend against a regression that reintroduces
 /// the separator gate.
@@ -544,7 +544,7 @@ fn build_groups_comm_exact_preserves_literal_semantics() {
 
 /// kworker-style parent processes collapse into one bucket
 /// when grouped by pcomm under default normalization.
-/// `kworker/0:0`, `kworker/1:0`, `kworker/2:1` all produce
+/// `kworker/0:0`, `kworker/1:0`, `kworker/3:2` all produce
 /// the skeleton `kworker/{N}:{N}` so a 3-process fleet
 /// clusters into one bucket. Mirrors
 /// [`build_groups_comm_kworker_bare_collapses_across_cpus`]

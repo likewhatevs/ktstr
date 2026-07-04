@@ -264,7 +264,7 @@ impl ScenarioStats {
     /// `execute_scenario`, holds). A `post_vm` callback instead receives
     /// a `VmResult`, which has NO `stats` field and no run-level
     /// Distribution surface — compare those cross-run via `cargo ktstr
-    /// stats compare`.
+    /// perf-delta`.
     ///
     /// The ext family is populated only by the `#[ktstr_test]` eval
     /// flow's post-merge producer
@@ -549,7 +549,7 @@ const TYPED_FIELD_NAMES: &[&str] = &[
 /// overwritten — `read_sample` path values win when both produced
 /// an entry.
 ///
-/// Without this fill, `cargo ktstr stats compare` silently misses
+/// Without this fill, `cargo ktstr perf-delta` silently misses
 /// these phase-only metrics (avg_imbalance_ratio, iteration_rate,
 /// system_time_ns, user_time_ns) in flat-row output because
 /// `MetricDef::read` falls back to ext_metrics and finds nothing.
@@ -577,7 +577,8 @@ pub fn populate_run_ext_metrics_from_phases(
             continue;
         };
         // Derived metrics (every `is_derived()`: Rate / Distribution / WorstLowest /
-        // WakeLatencyTailRatio / WorstCrossNodeRatio / PerPhase) are produced
+        // WakeLatencyTailRatio / WorstCrossNodeRatio / PerPhase / PerRunDistribution)
+        // are produced
         // from their pooled components, not folded as per-phase values: skip
         // here. A Rate re-derives after the loop (Σnum/Σdenom over the folded
         // components); the distributional kinds (Distribution / WorstLowest /
@@ -989,9 +990,11 @@ pub fn populate_run_pooled_taobench_distribution(stats: &mut ScenarioStats) {
 /// when that role was scheduled (`pcount > 0`), so `derive_rate_metrics` yields
 /// the role's gate-Rate iff it ran (never a 0/0); the two roles are independent
 /// (a worker-only run emits only the worker Rate). `total_schbench_loops` is
-/// always written when any schbench carrier ran (0 is a measured zero). Distinct
-/// from the per-phase `sched_delay_msg/worker_us` (mean-of-means parity,
-/// PerPhase display-only) — these Rates gate; no double-count. Cross-RUN the
+/// always written when any schbench carrier ran (0 is a measured zero). The
+/// per-phase `sched_delay_msg/worker_us` is the SAME Σrun_delay_ns/Σpcount
+/// per-schedule mean at phase scope (NOT schbench's native mean-of-per-thread-
+/// means, a separate whole-run SchbenchResult stat) and stays PerPhase
+/// display-only — only these Rates gate; no double-count. Cross-RUN the
 /// components SUM-fold (Counter), so each Rate re-pools Σrun_delay/Σpcount.
 pub fn populate_run_pooled_schbench(stats: &mut ScenarioStats) {
     use crate::stats::{
@@ -1799,7 +1802,7 @@ fn distribution_cgroup_reduction(
 /// value (populated via the MetricDef accessor at sidecar-write
 /// time) wins on the read path, and this fn fills the gap for
 /// registered metrics that have a `read_sample` wire but no typed
-/// GauntletRow field. Without this fill, `cargo ktstr stats compare`
+/// GauntletRow field. Without this fill, `cargo ktstr perf-delta`
 /// silently skips the metric (read returns None on both sides, so the
 /// `(None, None)` arm drops the pair).
 ///

@@ -182,8 +182,10 @@ fn identical_snapshots_produce_zero_deltas() {
     t.voluntary_csw = MonotonicCount(50);
     let snap = snap_with(vec![t]);
     let diff = compare(&snap, &snap, &CompareOptions::default());
-    // `Aggregated::Mode { .. } => None` (line ~465) gates the
-    // delta — every metric registered with any `AggRule::Mode*`
+    // `Aggregated::numeric()` returns `None` for its
+    // `Aggregated::Mode { .. }` arm, and `build_row` gates the
+    // delta on `(a.numeric(), b.numeric())` — every metric
+    // registered with any `AggRule::Mode*`
     // variant (`Mode` for policy, `ModeChar` for state,
     // `ModeBool` for ext_enabled — see CTPROF_METRICS)
     // surfaces as None-delta even when both sides are
@@ -1049,15 +1051,17 @@ fn fudge_n_to_one_merge_unions_affinity() {
 }
 
 /// P1: N:1 merge unions Aggregated::Mode tally maps so the
-/// cross-bucket frequency for each value is preserved.
-/// Build a baseline cgroup with all-SCHED_OTHER threads and
-/// two candidate cgroups: one all-SCHED_OTHER, one mostly
-/// SCHED_FIFO with a SCHED_OTHER minority. The merged
-/// candidate Mode must report SCHED_OTHER as the mode
-/// (10 + 1 = 11 occurrences) — beating SCHED_FIFO's 9
-/// occurrences. Under the old single-mode shape, the
-/// per-bucket max-count was 9 (SCHED_FIFO in cgroup B), so
-/// the merged Mode would have wrongly elected SCHED_FIFO.
+/// cross-bucket frequency for each value is preserved. Under
+/// GroupBy::All (fudge_compare) build_groups buckets each
+/// thread by the full `cg\x00pcomm\x00comm` compound key, so
+/// each row is a single thread type and the merge is per
+/// thread-type. The candidate side carries two cgroups
+/// contributing the alpha pcomm: /svc-a (SCHED_OTHER) and
+/// /svc-b (SCHED_FIFO, since alpha is FUDGE_WORDS index 0 and
+/// idx 0 < 9 => SCHED_FIFO). This pins that the alpha row's
+/// merged candidate tally keeps BOTH values (SCHED_OTHER:1,
+/// SCHED_FIFO:1, total 2) across the N:1 merge, not that a
+/// specific value wins the mode.
 #[test]
 fn fudge_n_to_one_merge_unions_mode_tallies() {
     let threads_a = fudge_threads_with("/svc", 10, |t| {
@@ -1086,10 +1090,7 @@ fn fudge_n_to_one_merge_unions_mode_tallies() {
         .iter()
         .find(|r| r.metric_name == "policy" && r.group_key.contains("alpha"))
         .expect("policy alpha row must surface");
-    // SCHED_OTHER appears 1 time in the merged candidate
-    // (one thread of cgroup B carrying alpha pcomm) — and
-    // no SCHED_FIFO in cgroup B carrying alpha pcomm.
-    // Actually the per-thread bucketing groups by full
+    // The per-thread bucketing groups by full
     // (cgroup\x00pcomm\x00comm) compound key, so the
     // alpha-pcomm thread in /svc-a has SCHED_OTHER and
     // the alpha-pcomm thread in /svc-b has SCHED_FIFO

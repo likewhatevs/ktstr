@@ -415,9 +415,10 @@ fn kva_write_user_half_rejects_before_walk() {
 // OrU32 read-direction misuse (catch-all arm).
 // ---------------------------------------------------------------
 
-/// OrU32 as a read width-hint is wire-format misuse on ANY target —
-/// the read catch-all rejects it. Pins that the catch-all fires for
-/// a Symbol target (it has no per-target OrU32 read arm).
+/// OrU32 as a read width-hint is wire-format misuse. For
+/// Symbol/Direct/Kva targets the read catch-all rejects it;
+/// PerCpuField/TaskField reject it in their own read arm. Pins the
+/// catch-all path via a Symbol target (no per-target OrU32 read arm).
 #[test]
 fn read_direction_oru32_rejects_via_catch_all() {
     const MASK: u32 = 0x0000_00FF;

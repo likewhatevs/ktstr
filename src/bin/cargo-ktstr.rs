@@ -1,13 +1,14 @@
 //! Cargo-integrated `cargo ktstr <SUB>` binary entry point.
 //!
-//! This file is the bin target itself: the global jemalloc allocator,
-//! tracing init, SIGPIPE restore, top-level [`clap::Parser`] dispatch,
+//! This file is the bin target itself: the inherited global jemalloc
+//! allocator, tracing init, SIGPIPE restore, top-level [`clap::Parser`]
+//! dispatch,
 //! and the `KtstrCommand` match arm that fans out to each subcommand
 //! handler. The handlers themselves live in submodules under
 //! `src/bin/cargo_ktstr/`:
 //!
 //! - `cli`    — clap-derived `Cargo` / `CargoSub` / `Ktstr` /
-//!   `KtstrCommand` / `ModelCommand` / `StatsCommand`
+//!   `KtstrCommand` / `StatsCommand`
 //!   types that drive argument parsing and shell
 //!   completion generation.
 //! - `kernel` — `--kernel <SPEC>` resolution shared by the `shell`,
@@ -19,15 +20,19 @@
 //! - `run_cargo` — `test`, `coverage`, `llvm-cov` dispatchers that
 //!   wrap `cargo nextest` with the kernel/topology
 //!   gauntlet wire format.
-//! - `stats`  — `stats compare` subcommand that diffs
-//!   `target/stats/` JSON across two kernel/scheduler
-//!   build commits.
+//! - `perf_delta` — `perf-delta` dispatcher that resolves the
+//!   baseline commit a perf run is compared against and
+//!   surfaces the A/B commit pair.
+//! - `replay` — `replay` dispatcher that re-runs the failing
+//!   subset of a prior sidecar pool.
+//! - `stats`  — single-run inspection subcommands (list /
+//!   list-values / list-metrics / show-host / explain-sidecar)
+//!   over the `target/ktstr/` sidecar pool.
 //! - `verifier` — `verifier` subcommand that runs a scheduler
 //!   binary under the BPF-stats verifier and renders
 //!   per-program verified-instruction counts.
 //! - `misc`   — smaller subcommand dispatchers, one submodule per
-//!   CLI verb: `shell`, `completions`, `funify`,
-//!   `model {fetch,status,clean}`, `export`.
+//!   CLI verb: `shell`, `completions`, `export`.
 //! - `parse_tests` (test-only) — clap parse-shape coverage: every
 //!   `KtstrCommand` variant gets at least one test that
 //!   pins flag wiring + conflict/requires constraints.
@@ -40,8 +45,12 @@
 
 // Global allocator (jemalloc) is provided centrally by the ktstr
 // library crate (src/lib.rs) and inherited by this bin.
+#[path = "cargo_ktstr/affected/mod.rs"]
+mod affected;
 #[path = "cargo_ktstr/cli.rs"]
 mod cli;
+#[path = "cargo_ktstr/interrupt.rs"]
+mod interrupt;
 #[path = "cargo_ktstr/kernel/mod.rs"]
 mod kernel;
 #[path = "cargo_ktstr/misc/mod.rs"]
@@ -63,15 +72,16 @@ mod btf_catalog;
 #[path = "cargo_ktstr/blobs.rs"]
 mod blobs;
 
+#[path = "cargo_ktstr/argsplit.rs"]
+mod argsplit;
+
 #[cfg(test)]
 #[path = "cargo_ktstr/parse_tests.rs"]
 mod parse_tests;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use ktstr::cli::KernelCommand;
 
-#[cfg(feature = "llm")]
-use crate::cli::ModelCommand;
 use crate::cli::{Cargo, CargoSub, KtstrCommand};
 
 fn main() {
@@ -104,7 +114,7 @@ fn main() {
     // Mirror `ktstr`'s tracing init (src/bin/ktstr.rs main()) so
     // `tracing::warn!` calls inside `cli::` / `test_support::` surface
     // on stderr instead of being silently dropped. Default to `warn`
-    // so normal CLI invocations (kernel build, model fetch, etc.) stay
+    // so normal CLI invocations (kernel build, shell, etc.) stay
     // quiet; users who want finer detail set `RUST_LOG=info,debug,...`.
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -114,9 +124,18 @@ fn main() {
         .with_writer(std::io::stderr)
         .init();
 
+    // Position-independent ktstr flags: rewrite argv so a passthrough
+    // subcommand's ktstr-owned flags parse regardless of their position
+    // relative to nextest passthrough args (see the `argsplit` module).
+    // Non-passthrough subcommands pass through unchanged.
+    let raw: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let rewritten = argsplit::rewrite(&Cargo::command(), &raw);
     let Cargo {
         command: CargoSub::Ktstr(ktstr),
-    } = Cargo::parse();
+    } = match Cargo::try_parse_from(&rewritten) {
+        Ok(c) => c,
+        Err(e) => e.exit(),
+    };
 
     let result = dispatch_command(ktstr.command);
 
@@ -129,8 +148,8 @@ fn main() {
 /// Fan out a parsed [`KtstrCommand`] to its subcommand handler.
 ///
 /// Split into [`dispatch_run_command`] (test/coverage/llvm-cov/stats/
-/// replay/perf-delta) and [`dispatch_admin_command`] (kernel/model/
-/// verifier/funify/completions/host/thresholds/export/locks/shell)
+/// replay/perf-delta) and [`dispatch_admin_command`] (kernel/
+/// verifier/completions/host/thresholds/export/locks/shell)
 /// purely to keep each function under the source-function size guard;
 /// the run-group helper matches its variants and forwards every other
 /// variant to the admin-group helper, so the two together cover the
@@ -155,14 +174,26 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
             no_perf_mode,
             no_skip_mode,
             release,
-            release_scheduler,
+            profile,
+            nextest_profile,
+            include_eol,
+            relevant,
+            base,
+            base_ref,
+            default_branch,
             args,
         } => run_cargo::run_test(
             kernel,
             no_perf_mode,
             no_skip_mode,
             release,
-            release_scheduler,
+            profile,
+            nextest_profile,
+            include_eol,
+            relevant,
+            base,
+            base_ref,
+            default_branch,
             args,
         ),
         KtstrCommand::Coverage {
@@ -170,41 +201,64 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
             no_perf_mode,
             no_skip_mode,
             release,
-            release_scheduler,
+            profile,
+            nextest_profile,
+            include_eol,
+            relevant,
+            base,
+            base_ref,
+            default_branch,
             args,
         } => run_cargo::run_coverage(
             kernel,
             no_perf_mode,
             no_skip_mode,
             release,
-            release_scheduler,
+            profile,
+            nextest_profile,
+            include_eol,
+            relevant,
+            base,
+            base_ref,
+            default_branch,
             args,
         ),
         KtstrCommand::LlvmCov {
             kernel,
             no_perf_mode,
             no_skip_mode,
+            include_eol,
             args,
-        } => run_cargo::run_llvm_cov(kernel, no_perf_mode, no_skip_mode, args),
+        } => run_cargo::run_llvm_cov(kernel, no_perf_mode, no_skip_mode, include_eol, args),
         KtstrCommand::Stats { ref command } => stats::run_stats(command),
-        KtstrCommand::Replay { dir, filter, exec } => {
-            match replay::run_replay(dir.as_deref(), filter.as_deref(), exec) {
-                Ok(0) => Ok(()),
-                Ok(code) => std::process::exit(code),
-                Err(e) => Err(format!("{e:#}")),
-            }
-        }
+        KtstrCommand::Replay {
+            dir,
+            filter,
+            exec,
+            profile,
+            nextest_profile,
+            args,
+        } => match replay::run_replay(
+            dir.as_deref(),
+            filter.as_deref(),
+            exec,
+            profile.as_deref(),
+            nextest_profile.as_deref(),
+            &args,
+        ) {
+            Ok(0) => Ok(()),
+            Ok(code) => std::process::exit(code),
+            Err(e) => Err(format!("{e:#}")),
+        },
         KtstrCommand::PerfDelta {
             base,
             base_ref,
             filter,
+            relevant,
             default_branch,
             kernel,
-            dual_run,
             threshold,
             policy,
-            a_scheduler,
-            b_scheduler,
             noise_adjust,
             noise_spread_threshold,
             no_phases,
@@ -212,20 +266,30 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
             steps_only,
             phase,
             phase_threshold,
+            profile,
+            nextest_profile,
+            all_metrics,
+            fail_threshold,
+            must_fail,
+            args: passthrough,
         } => {
             let args = perf_delta::PerfDeltaArgs {
+                passthrough: &passthrough,
                 base: base.as_deref(),
                 base_ref: base_ref.as_deref(),
                 filter: filter.as_deref(),
+                relevant,
                 default_branch: &default_branch,
                 kernel: kernel.as_deref(),
-                dual_run,
                 threshold,
                 policy: policy.as_deref(),
-                a_scheduler: a_scheduler.as_deref(),
-                b_scheduler: b_scheduler.as_deref(),
                 noise_adjust,
                 noise_spread_threshold,
+                profile: profile.as_deref(),
+                nextest_profile: nextest_profile.as_deref(),
+                all_metrics,
+                fail_threshold,
+                must_fail: must_fail.as_deref(),
                 phase_display: ktstr::cli::PhaseDisplayOptions {
                     no_phases,
                     phases_only,
@@ -247,15 +311,13 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
         // the single-match compile-time exhaustiveness guarantee.
         cmd @ (KtstrCommand::Kernel { .. }
         | KtstrCommand::Verifier { .. }
-        | KtstrCommand::Funify { .. }
         | KtstrCommand::Completions { .. }
         | KtstrCommand::ShowHost
         | KtstrCommand::ShowThresholds { .. }
+        | KtstrCommand::Affected { .. }
         | KtstrCommand::Export { .. }
         | KtstrCommand::Locks { .. }
         | KtstrCommand::Shell { .. }) => dispatch_admin_command(cmd),
-        #[cfg(feature = "llm")]
-        cmd @ KtstrCommand::Model { .. } => dispatch_admin_command(cmd),
     }
 }
 
@@ -265,32 +327,31 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
 fn dispatch_admin_command(command: KtstrCommand) -> Result<(), String> {
     match command {
         KtstrCommand::Kernel { command } => match command {
-            KernelCommand::List { json, range } => match range {
-                Some(r) => {
-                    ktstr::cli::kernel_list_range_preview(json, &r).map_err(|e| format!("{e:#}"))
-                }
+            KernelCommand::List {
+                json,
+                kernel,
+                include_eol,
+            } => match kernel {
+                Some(k) => ktstr::cli::kernel_list_range_preview(json, &k, include_eol)
+                    .map_err(|e| format!("{e:#}")),
                 None => ktstr::cli::kernel_list(json).map_err(|e| format!("{e:#}")),
             },
             KernelCommand::Build {
-                version,
-                source,
-                git,
-                git_ref,
+                kernel,
                 force,
                 clean,
                 cpu_cap,
                 extra_kconfig,
                 skip_sha256,
+                include_eol,
             } => kernel::kernel_build(
-                version,
-                source,
-                git,
-                git_ref,
+                kernel,
                 force,
                 clean,
                 cpu_cap,
                 extra_kconfig,
                 skip_sha256,
+                include_eol,
             ),
             KernelCommand::Clean {
                 keep,
@@ -298,22 +359,33 @@ fn dispatch_admin_command(command: KtstrCommand) -> Result<(), String> {
                 corrupt_only,
             } => ktstr::cli::kernel_clean(keep, force, corrupt_only).map_err(|e| format!("{e:#}")),
         },
-        #[cfg(feature = "llm")]
-        KtstrCommand::Model { command } => match command {
-            ModelCommand::Fetch => misc::run_model_fetch(),
-            ModelCommand::Status => misc::run_model_status(),
-            ModelCommand::Clean => misc::run_model_clean(),
-        },
-        KtstrCommand::Verifier { kernel, raw } => verifier::run_verifier(kernel, raw),
-        KtstrCommand::Funify {
-            input,
-            seed,
-            pretty,
-        } => misc::run_funify(input, seed, pretty),
+        KtstrCommand::Verifier {
+            kernel,
+            raw,
+            profile,
+            nextest_profile,
+            scheduler,
+            include_eol,
+            args,
+        } => verifier::run_verifier(
+            kernel,
+            raw,
+            profile,
+            nextest_profile,
+            scheduler,
+            include_eol,
+            args,
+        ),
         KtstrCommand::Completions { shell, binary } => {
             misc::run_completions(shell, &binary);
             Ok(())
         }
+        KtstrCommand::Affected {
+            base,
+            base_ref,
+            default_branch,
+        } => affected::run(base.as_deref(), base_ref.as_deref(), &default_branch)
+            .map_err(|e| format!("{e:#}")),
         KtstrCommand::ShowHost => {
             print!("{}", ktstr::cli::show_host());
             Ok(())

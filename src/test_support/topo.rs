@@ -147,7 +147,8 @@ fn looks_like_legacy_topo(s: &str) -> bool {
 }
 
 /// Parse a topology string in "NnNlNcNt" form (e.g. `"1n2l4c2t"`).
-/// `n` = NUMA nodes, `l` = LLCs per node, `c` = cores per LLC,
+/// `n` = NUMA nodes, `l` = total LLCs across the VM (must be a multiple
+/// of `n`), `c` = cores per LLC,
 /// `t` = threads per core. Returns `(numa_nodes, llcs, cores, threads)`
 /// or `None` on parse failure — nonzero fields, canonical axis order,
 /// and no trailing characters after the `t` terminator.

@@ -3333,7 +3333,7 @@ fn setup_page_table_vmalloc_64k() -> (Vec<u8>, u64, u64, u64) {
     let kva: u64 = 0xFFFF_8000_8400_0000;
     let pgd_idx = (kva >> 42) & 0x3F; // 32
     let pmd_idx = (kva >> 29) & 0x1FFF; // 4
-    let pte_idx = (kva >> 16) & 0x1FFF; // 0
+    let pte_idx = (kva >> 16) & 0x1FFF; // 1024
 
     let pgd_pa: u64 = 0x10000;
     let pmd_pa: u64 = 0x20000;
@@ -3399,8 +3399,8 @@ fn translate_kva_vmalloc_64k_unmapped_neighbor() {
 
 /// Build a 4-level 4 KB page table mapping a single 4 KB page.
 /// Indices for KVA 0xFFFF_8880_0000_5000:
-///   PGD: bits [47:39] = 0x110 (272)
-///   PUD: bits [38:30] = 0x100 (256)
+///   PGD: bits [47:39] = 0x111 (273)
+///   PUD: bits [38:30] = 0x0 (0)
 ///   PMD: bits [29:21] = 0x0
 ///   PTE: bits [20:12] = 0x5
 #[cfg(target_arch = "aarch64")]

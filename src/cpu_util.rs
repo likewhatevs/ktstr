@@ -122,9 +122,10 @@ pub fn parse_cpu_list(s: &str) -> Option<Vec<u32>> {
 ///
 /// The kernel's `SYSCALL_DEFINE3(sched_getaffinity)`
 /// (`kernel/sched/syscalls.c`) rejects a caller buffer shorter
-/// than `nr_cpu_ids / BITS_PER_BYTE` with `EINVAL`. The kernel
-/// supports `CONFIG_NR_CPUS` values up to 8192 on x86_64 default
-/// and higher on custom builds (large NUMA / partitioning
+/// than `nr_cpu_ids / BITS_PER_BYTE` with `EINVAL`. The x86_64
+/// `CONFIG_NR_CPUS` maximum is 8192 (`NR_CPUS_RANGE_END` with
+/// `CPUMASK_OFFSTACK`; without it the max is 512); other
+/// architectures may allow higher (large NUMA / partitioning
 /// hardware). libc's fixed [`libc::cpu_set_t`] is only 1024 bits
 /// wide, so calling `sched_getaffinity` with
 /// `size_of::<cpu_set_t>()` against a `CONFIG_NR_CPUS > 1024`
@@ -213,8 +214,10 @@ pub fn read_affinity(tid: i32) -> Option<Vec<u32>> {
 }
 
 /// Initial number of CPU bits the affinity buffer starts at.
-/// 8192 matches the x86_64 default `CONFIG_NR_CPUS`, so the
-/// overwhelming majority of hosts resolve on the first syscall.
+/// 8192 is the x86_64 `CONFIG_NR_CPUS` ceiling (`NR_CPUS_RANGE_END`
+/// with `CPUMASK_OFFSTACK`; also the `MAXSMP` default), so no
+/// x86_64 host exceeds it and the overwhelming majority resolve
+/// on the first syscall.
 pub const AFFINITY_INITIAL_BITS: usize = 8192;
 
 /// Maximum number of CPU bits [`read_affinity`] is willing to

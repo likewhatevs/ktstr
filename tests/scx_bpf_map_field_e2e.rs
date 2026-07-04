@@ -10,7 +10,7 @@
 //! `bpf_bpf_alloc_count` is PRESENT and a finite, positive count. The key is
 //! the active scheduler's obj prefix plus the declared label (`alloc_count`):
 //! scx-ktstr's kernel-visible global-section map is `bpf_bpf.bss`, so the obj
-//! prefix the watcher resolves (via the same `find_active_struct_ops_obj` +
+//! prefix the watcher resolves (via the same `find_active_struct_ops_obj_no_target` +
 //! `extract_global_section_obj_prefix` path) is `bpf_bpf`. The sibling live
 //! e2es `pin_bpf_map_e2e` / `live_var_disambiguation_e2e` match live maps by
 //! that exact `bpf_bpf.bss` name; the booted-VM run here is the arbiter.

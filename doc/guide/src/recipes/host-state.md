@@ -8,17 +8,17 @@
 > [ctprof reference](../reference/ctprof.md) and the
 > [Diagnose a Slow Scheduler with ctprof](diagnose-slow-scheduler.md)
 > recipe. For **scheduler-behavior diffs between branches**
-> (per-metric scheduler measurements via `cargo ktstr stats
-> compare` on two `#[ktstr_test]` runs against different worktrees),
-> see [A/B Compare Branches](ab-compare.md).
+> (per-metric scheduler measurements via `cargo ktstr perf-delta`
+> between HEAD and a baseline commit), see
+> [A/B Compare Branches](ab-compare.md).
 
 When a gauntlet run passes on one machine and fails on another —
 or passes on Monday and fails on Wednesday — the first thing to
 check is whether the host itself changed. `cargo ktstr show-host`
 captures a snapshot of the kernel, CPU, memory, scheduler
-tunables, and kernel cmdline; `cargo ktstr stats compare`
-surfaces the changes between two sidecars in a host-delta
-section of its output so you can see what moved.
+tunables, and kernel cmdline; `cargo ktstr perf-delta`
+surfaces the changes between the baseline and HEAD runs in a
+host-delta section of its output so you can see what moved.
 
 ## Two `show-host` commands: live vs archived
 
@@ -29,7 +29,7 @@ interchangeable — pick the one whose target matches your question:
   by reading `/proc`, `/sys`, and `uname()` at invocation time.
   Use this when you want to inspect the current machine, e.g.
   before running a benchmark, after a sysctl change, or to
-  confirm what `cargo ktstr stats compare` would record on the
+  confirm what a `cargo ktstr perf-delta` run would record on the
   next run produced here. No prior runs needed.
 - **`cargo ktstr stats show-host --run RUN_ID`** prints the
   **archived** host context captured at sidecar-write time for
@@ -76,6 +76,14 @@ Prints a `key: value` report covering:
   populates it. It collapses to `None` only for downstream library
   consumers that link jemalloc but do not install it as the global
   allocator (allocated and active bytes both zero).
+- `task_delayacct` — delay-accounting state from
+  `/proc/sys/kernel/task_delayacct`: `on`, `runtime-off` (built in but
+  the sysctl reads `0`), or `config-off` (the sysctl file is absent —
+  built without `CONFIG_TASK_DELAY_ACCT`). Gates which `taskstats` delay
+  fields populate.
+- `config_task_xacct` — `CONFIG_TASK_XACCT` build state probed from
+  `/proc/config.gz`. Gates the taskstats memory-watermark fields; there
+  is no runtime toggle.
 
 Absent fields render as `(unknown)` — an empty `sched_*` map
 renders as `(empty)` and a missing map renders as `(unknown)`.
@@ -85,7 +93,7 @@ dimension was inspected but absent, vs failed to populate.
 Sidecars written before the older field names (`uname_sysname` /
 `uname_release` / `uname_machine`) were renamed to `kernel_name` /
 `kernel_release` / `arch` render those fields as `(unknown)` — in
-`show-host` and in `stats compare`'s host-delta section alike. Per
+`show-host` and in `perf-delta`'s host-delta section alike. Per
 the pre-1.0 sidecar-disposable rule, just re-run the test to
 regenerate the sidecar under the current schema.
 
@@ -94,18 +102,17 @@ the `host` field of any sidecar JSON (same schema, identical
 values — `show-host` prints the live snapshot the sidecar
 writer would attach to a fresh test run).
 
-## Compare: `stats compare`
+## Compare: `perf-delta` host-delta
 
 ```sh
-cargo ktstr stats compare --a-project-commit <baseline> --b-project-commit <current>
+cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14
 ```
 
-Per-side filter flags (`--a-X` / `--b-X`) partition the
-sidecar pool into the two sides of the contrast — slice on
-`project-commit`, `kernel`, `scheduler`, `run-source`, etc.
-depending on what you are diffing. `compare` picks the first
+`perf-delta` compares HEAD against a baseline commit (see
+[perf-delta](../running-tests/cargo-ktstr.md#perf-delta)); the
+baseline is side A and HEAD is side B. It picks the first
 sidecar with `Some(host)` from each side, then prints one of
-five host-section shapes depending on what survived capture:
+four host-section shapes depending on what survived capture:
 
 - Neither side carried host context — the host section is
   omitted entirely (no banner, no rows).
@@ -139,21 +146,13 @@ from "the whole map was unknown at capture time".
 ### CI integration
 
 Gauntlet runs emit the host block automatically in every
-sidecar. To diff the host state across two CI runs, slice the
-pool on whatever dimension separates them (typically
-`--a-project-commit` / `--b-project-commit` or `--a-kernel` /
-`--b-kernel`) — the host-delta section appears automatically
-in the compare output when any host field differs between the
-two sides. A CI job can:
-
-1. Run the gauntlet on the candidate commit and the baseline.
-2. Invoke `stats compare` slicing on the dimension that
-   separates the two runs (e.g.
-   `--a-project-commit <baseline> --b-project-commit <current>`)
-   and inspect the host-delta section of its output.
-3. Fail (or annotate the PR) if any host dimension changed —
-   an unchanged host set is the precondition for a clean A/B
-   of scheduler behavior.
+sidecar. A CI perf-gate that runs `cargo ktstr perf-delta` on a
+pull request (HEAD vs the merge-base baseline) surfaces the
+host-delta section automatically when any host field differs
+between the baseline and HEAD sides. An unchanged host set is
+the precondition for a clean A/B of scheduler behavior, so a
+host-delta on the gate is a signal the comparison may not hold —
+fail or annotate the PR when it appears.
 
 ## Typical hits
 

@@ -79,7 +79,7 @@ pub(super) fn parse_schedstat_line(data: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// Print a single "schedstat unavailable" warning for the lifetime
-/// of the process. The workload spawns `N_WORKERS` threads, each of
+/// of the process. The workload spawns N worker threads, each of
 /// which calls `read_schedstat` twice; without a gate this would
 /// emit up to `2N` duplicate lines on a kernel without
 /// `CONFIG_SCHED_INFO`.
@@ -262,6 +262,12 @@ pub(super) fn duration_to_kernel_ns(d: Duration, field: &str) -> Result<u64> {
     Ok(ns_u128 as u64)
 }
 
+/// `SCHED_EXT` policy number from `include/uapi/linux/sched.h`
+/// (`#define SCHED_EXT 7`). libc does not expose it, so it is defined
+/// here for the `sched_setattr` path. Valid only on a kernel built with
+/// `CONFIG_SCHED_CLASS_EXT` and with a sched_ext scheduler attached.
+const SCHED_EXT: i32 = 7;
+
 /// Lower a [`SchedPolicy`] to a `sched_setscheduler` / `sched_setattr`
 /// syscall and apply it to `pid`. `Normal` is a no-op (the kernel
 /// default); `Batch`/`Idle` use `SCHED_BATCH`/`SCHED_IDLE` with prio
@@ -272,7 +278,11 @@ pub(super) fn duration_to_kernel_ns(d: Duration, field: &str) -> Result<u64> {
 /// non-zero, DL_SCALE 1024 ns floor, bit-63-clear overflow guard
 /// via `duration_to_kernel_ns`) before issuing
 /// `syscall(SYS_sched_setattr, ...)` directly because glibc does
-/// not wrap that syscall.
+/// not wrap that syscall. `Ext` sets `SCHED_EXT` via the same
+/// unwrapped `sched_setattr` path (policy only); it succeeds whenever
+/// the kernel has `CONFIG_SCHED_CLASS_EXT` (routing to ext when a
+/// scheduler is attached, else to fair) and is rejected only by
+/// `EACCES` when the task carries `scx.disallow`.
 ///
 /// Returns `Err` on any pre-flight rejection or kernel-side
 /// EINVAL/EPERM with a named-field error message; the caller
@@ -393,8 +403,9 @@ pub(super) fn set_sched_policy(pid: libc::pid_t, policy: SchedPolicy) -> Result<
             //   value; the kernel rejects unknown flag bits with
             //   EINVAL.
             // - The kernel copies `attr` into kernel space inside
-            //   the syscall (`copy_struct_from_user` in
-            //   kernel/sched/syscalls.c) and does not retain a
+            //   the syscall (`sched_copy_attr` in
+            //   kernel/sched/syscalls.c, via `copy_struct_from_user`)
+            //   and does not retain a
             //   reference to our stack memory after the syscall
             //   returns, so the borrow only needs to outlive the
             //   single syscall.
@@ -408,6 +419,44 @@ pub(super) fn set_sched_policy(pid: libc::pid_t, policy: SchedPolicy) -> Result<
             };
             if ret != 0 {
                 anyhow::bail!("sched_setattr: {}", std::io::Error::last_os_error());
+            }
+            return Ok(());
+        }
+        SchedPolicy::Ext => {
+            // SCHED_EXT has no `sched_param` representation and glibc
+            // does not wrap it — issue `sched_setattr(2)` directly with
+            // `sched_policy = SCHED_EXT`, mirroring the Deadline arm's
+            // raw-syscall path. Only `sched_policy` is set; runtime /
+            // deadline / period do not apply. SCHED_EXT is a valid policy
+            // whenever the kernel has CONFIG_SCHED_CLASS_EXT, so the
+            // syscall succeeds whether or not a scheduler is attached
+            // (attached -> ext_sched_class; none -> fair, task_should_scx
+            // false). `scx_check_setscheduler` (kernel/sched/ext.c)
+            // rejects with EACCES when the task carries `scx.disallow`.
+            //
+            // SAFETY: identical `sched_attr` / `sched_setattr`
+            // invariants as the Deadline arm above — `attr` is a zeroed
+            // `#[repr(C)]` UAPI struct with `size` set so the kernel's
+            // forward-compat protocol reads exactly our fields; `pid` is
+            // validated > 0 at the top of this fn; the kernel copies
+            // `attr` in (`sched_copy_attr`) and retains no reference past
+            // the syscall; `flags = 0` is the only defined value.
+            let mut attr: libc::sched_attr = unsafe { std::mem::zeroed() };
+            attr.size = std::mem::size_of::<libc::sched_attr>() as u32;
+            attr.sched_policy = SCHED_EXT as u32;
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_sched_setattr,
+                    pid,
+                    &attr as *const libc::sched_attr,
+                    0u32,
+                )
+            };
+            if ret != 0 {
+                anyhow::bail!(
+                    "sched_setattr(SCHED_EXT): {}",
+                    std::io::Error::last_os_error()
+                );
             }
             return Ok(());
         }

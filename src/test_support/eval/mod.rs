@@ -33,17 +33,11 @@ use super::sidecar::{write_sidecar, write_skip_sidecar};
 use super::topo::TopoOverride;
 use super::{KtstrTestEntry, SchedulerSpec, Topology};
 mod kernel;
-#[cfg(feature = "llm")]
-mod llm_extract;
 mod post_vm;
-#[cfg(feature = "llm")]
-pub(crate) use llm_extract::host_side_llm_extract;
 pub use post_vm::post_vm_skip;
 pub(crate) use post_vm::{
-    ExpectAutoReproSatisfied, HostSkipRequest, LLM_MODEL_LOAD_FAILED_PREFIX,
-    PostVmAssertionFailure, SchedulerBuildRefused, ScxBpfErrorMatcherMismatch,
-    SurvivesStormViolated, record_skip_sidecar, run_post_vm_callbacks,
-    should_skip_on_llm_model_load_failure,
+    ExpectAutoReproSatisfied, HostSkipRequest, PostVmAssertionFailure, SchedulerBuildRefused,
+    ScxBpfErrorMatcherMismatch, SurvivesStormViolated, record_skip_sidecar, run_post_vm_callbacks,
 };
 mod reporting;
 mod scheduler;
@@ -89,22 +83,6 @@ pub(crate) const ERR_NO_TEST_FUNCTION_OUTPUT: &str =
 /// `eval_crash_in_output_says_guest_crashed`, `eval_crash_eevdf_says_guest_crashed`,
 /// and `eval_crash_message_from_field`.
 pub(crate) const ERR_GUEST_CRASHED_PREFIX: &str = "guest crashed:";
-
-// ---------------------------------------------------------------------------
-// Host-side OutputFormat::LlmExtract resolution
-// ---------------------------------------------------------------------------
-//
-// The guest's `payload_run::evaluate_llm_extract_deferred` ships
-// raw stdout/stderr across the SHM ring under
-// `MSG_TYPE_RAW_PAYLOAD_OUTPUT` and emits an empty-metrics
-// `PayloadMetrics` placeholder under `MSG_TYPE_PAYLOAD_METRICS` for
-// every `OutputFormat::LlmExtract` invocation. The guest does NOT
-// load the local model into VM RAM (the model is ~2.55 GiB; the test
-// VM's RAM budget cannot accommodate it). The host runs
-// `extract_via_llm` here, after VM exit, on the captured text — same
-// stdout-primary / stderr-fallback contract that previously lived in
-// the prior in-VM extraction path — and replaces the empty `metrics` vec on
-// the paired `PayloadMetrics` with the extracted result.
 
 // ---------------------------------------------------------------------------
 // Host-state save/restore guards for the VM-run path
@@ -284,7 +262,7 @@ pub(crate) fn run_ktstr_test_inner(
     match crate::test_support::sidecar::take_last_sidecar_path() {
         // A sidecar was written (the guest produced a parseable result):
         // overwrite its raw verdict with the final one and set
-        // `expected_failure` so `stats compare` still excludes the
+        // `expected_failure` so `perf-delta` still excludes the
         // failure-mode-dominated telemetry of an inverted failure.
         Some(path) => crate::test_support::sidecar::finalize_sidecar_verdict(
             &path,
@@ -349,7 +327,7 @@ fn read_primary_exit_kind(entry_name: &str, variant_hash: u64) -> Option<u64> {
 /// survives those code paths too.
 ///
 /// The placeholder's `is_placeholder: true` field lets downstream
-/// tooling (stats compare, sidecar walkers) distinguish a stub
+/// tooling (perf-delta, sidecar walkers) distinguish a stub
 /// from a real BPF dump. The `reason` string carries both the
 /// lifecycle stage classification AND — when extractable — the
 /// `BUG SUMMARY` text (per `extract_bug_summary` over the captured
@@ -466,7 +444,8 @@ fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vm
 /// [`run_ktstr_test_inner_impl`] so the predicate-to-skip WIRING is
 /// unit-testable without booting a VM (the sibling `performance_mode` /
 /// `perf_only` skips are env-driven; this one is topology-driven). When
-/// the host cannot run the entry's topology without racing the
+/// the host cannot run the BOOTED topology (`resolve_vm_topology`, which
+/// honors a gauntlet/CLI preset override) without racing the
 /// oversub-scaled boot watchdog
 /// ([`super::runtime::overcommit_skip_reason`]), emits the operator SKIP
 /// banner, records the skip sidecar, and returns the skip
@@ -484,8 +463,19 @@ fn overcommit_skip(
     host_cpus: &[usize],
     topo: Option<&TopoOverride>,
 ) -> Option<AssertResult> {
+    // Key the skip decision on the BOOTED vCPU count — the topology the
+    // VM actually launches — not the declared entry.topology. Under a
+    // TopoOverride (gauntlet preset / --ktstr-topo) they diverge, and the
+    // skip must model the oversubscription of the topology that boots
+    // (otherwise a small declared test on a large preset never skips and
+    // races the boot watchdog it exists to prevent). record_skip_sidecar
+    // below already resolves this same booted topology; mirrors the
+    // booted-count ratio in contention_not_attached_skip_reason.
+    let booted_vcpus = super::runtime::resolve_vm_topology(entry, topo)
+        .0
+        .total_cpus();
     let reason = super::runtime::overcommit_skip_reason(
-        entry.topology.total_cpus(),
+        booted_vcpus,
         host_cpus.len(),
         entry.cpu_budget,
         entry.expect_auto_repro,
@@ -493,6 +483,60 @@ fn overcommit_skip(
     crate::report::test_skip(format_args!("{}: {reason}", entry.name));
     record_skip_sidecar(entry, topo);
     Some(AssertResult::skip(reason))
+}
+
+/// Classify a no-guest-result run for the contention-`NotAttached` SKIP.
+///
+/// Returns `Some(reason)` when the run should SKIP (a clean host-resource
+/// condition): the guest reported `SchedulerNotAttached` with the enable
+/// STILL IN FLIGHT (reason carries `state=enabling`) AND the host was
+/// oversubscribed (overcommit ratio > 1.0) — the scheduler was still
+/// enabling when the startup budget expired under host time-slicing, not
+/// a load/verify reject. Returns `None` (the run FAILs) for a REJECTED
+/// enable (`state=disabling`/`disabled`), a missing sched_ext sysfs, a
+/// `SchedulerDied`, a stall on a FITTING host (ratio == 1.0), or any run
+/// with no `SchedulerNotAttached` frame.
+///
+/// The `state=enabling` token is produced by the guest's
+/// `poll_scx_attached` (`src/vmm/rust_init/scheduler.rs`): the sched_ext
+/// enable path leaves `Enabling` for `Disabling`/`Disabled` ONLY on
+/// failure, so `Enabling` at the deadline means a still-progressing (not
+/// rejected) enable. `SchedulerDied` and the non-`enabling` reasons are
+/// checked FIRST so a genuine defect can never be classified as a skip.
+/// Pure over its inputs so the skip boundary is unit-testable without a
+/// live scheduler.
+fn contention_not_attached_skip_reason(
+    guest_messages: Option<&crate::vmm::host_comms::BulkDrainResult>,
+    vcpus: u32,
+    allowed_cpus: usize,
+    cpu_budget: Option<u32>,
+) -> Option<String> {
+    let crate::verifier::AttachOutcome::NotAttached(reason) =
+        crate::verifier::attach_outcome_from_messages(guest_messages)
+    else {
+        // SchedulerDied / Attached / Unconfirmed (no NotAttached frame):
+        // never a contention skip.
+        return None;
+    };
+    // Only a still-in-flight enable is skippable; a rejected enable
+    // (disabling/disabled), sysfs-absent, or unknown state is a real
+    // defect that must FAIL.
+    if !reason.contains("state=enabling") {
+        return None;
+    }
+    // On a fitting host a startup-budget stall is a real defect, not
+    // contention — only an oversubscribed host has the time-slicing that
+    // stretches scx_enable's cross-vCPU sync past the budget.
+    let ratio = super::runtime::overcommit_ratio(vcpus, allowed_cpus, cpu_budget);
+    if ratio <= 1.0 {
+        return None;
+    }
+    Some(format!(
+        "scheduler enable did not complete within the startup budget under \
+         {ratio:.1}x host oversubscription (sched_ext state was still \
+         `enabling` at the deadline, not a load/verify reject) — widen the \
+         process cpuset or shrink the guest topology"
+    ))
 }
 
 fn run_ktstr_test_inner_impl(
@@ -596,9 +640,10 @@ fn run_ktstr_test_inner_impl(
     // kernel lives in one). Prevents a concurrent
     // `cargo ktstr kernel build` from swapping the entry under
     // the VM mid-run. Dropped explicitly after VM exit (before
-    // LLM inference) so concurrent kernel rebuilds aren't
-    // blocked during the multi-second extraction phase. `None`
-    // on non-cache kernels — those don't need coordination.
+    // the post-VM-exit eval work: sidecar write, auto-repro, and
+    // post_vm callbacks) so concurrent kernel rebuilds aren't
+    // blocked while that runs. `None` on non-cache kernels —
+    // those don't need coordination.
     let kernel_lock = acquire_test_kernel_lock_if_cached(&kernel)?;
     // Capture the scheduler's ResolveSource (the discovery path) so the
     // sidecar records where this run's binary came from — write_sidecar
@@ -1155,7 +1200,7 @@ fn run_ktstr_test_inner_impl(
     // regardless of whether real BPF state could be
     // captured. The `is_placeholder: true` field on
     // [`crate::monitor::dump::FailureDumpReport`] lets downstream
-    // tooling (stats compare, sidecar walkers) distinguish a stub
+    // tooling (perf-delta, sidecar walkers) distinguish a stub
     // from a real BPF dump.
     if !result.success {
         write_placeholder_failure_dump_if_missing(&primary_dump_path, &result);
@@ -1176,7 +1221,8 @@ fn run_ktstr_test_inner_impl(
     // `post_vm_unconditional` bypasses this gate entirely): skip
     // post_vm when the guest already reported a hard `Fail`
     // `AssertResult` (e.g. `sched_died_during_hold` recorded
-    // mid-step at `src/scenario/ops/mod.rs::966`). The host's
+    // mid-step via `build_sched_died_during_hold` in
+    // `src/scenario/ops/mod.rs`). The host's
     // typical post_vm body asserts on workload-derived state
     // (`snapshot_bridge`, `periodic_fired`, …) — that state is
     // structurally missing when the scheduler died before the
@@ -1251,47 +1297,15 @@ fn run_ktstr_test_inner_impl(
     }
 
     // Release VM resources (CPU/LLC flocks, guest memory) before
-    // the multi-second LLM inference so concurrent peers can
-    // acquire the same LLC slots during extraction.
+    // the post-VM-exit eval work (sidecar write, auto-repro,
+    // post_vm callbacks) so concurrent peers can acquire the same
+    // LLC slots while that runs.
     let post_vm_t = std::time::Instant::now();
     drop(vm);
     // Release the kernel-cache reader flock — the VM no longer
     // maps the kernel image, so concurrent `cargo ktstr kernel
     // build` can proceed.
     drop(kernel_lock);
-
-    // Broaden the calling thread's CPU mask before
-    // `host_side_llm_extract` runs. After `vm.run()` the
-    // BSP / vCPU 0 thread carries either:
-    //   - a single-CPU pin (perf-mode path: the vmm `vm.run`
-    //     entry calls `pin_current_thread` to nail the BSP to one
-    //     CPU for ipi-latency stability) — LLM inference on 1 CPU
-    //     is dramatically slow (10x+ in throughput) and gives the
-    //     other free host CPUs no work, OR
-    //   - a multi-CPU LLC-aware mask (no-perf-mode path: the vmm
-    //     applies `set_thread_cpumask` against the
-    //     `no_perf_plan.cpus` set so the BSP can roam within an
-    //     LLC) — already pool-style, but narrower than the
-    //     host-allowed cpuset.
-    // Inference is a host-side post-VM-exit phase that doesn't
-    // share the VM's measurement contract; it should use whatever
-    // CPUs the host process is permitted on (cgroup cpuset / sudo
-    // -u limits / CI runner allocation), which is exactly what
-    // `host_allowed_cpus()` returns via `sched_getaffinity(0)`.
-    // Use no-perf-mode cpuset for inference: `set_thread_cpumask`
-    // against the broader host-allowed pool is the no-perf-mode
-    // primitive applied to a wider set than any single LLC-plan
-    // would carve out.
-    //
-    // Empty `host_allowed_cpus()` (sched_getaffinity unavailable,
-    // procfs fallback failed) skips the call rather than masking
-    // to zero CPUs (which would block forever); inference inherits
-    // whatever the test left behind. Logged as a warning by
-    // `set_thread_cpumask` itself if the syscall fails.
-    let host_cpus = crate::vmm::host_topology::host_allowed_cpus();
-    if !host_cpus.is_empty() {
-        crate::vmm::set_thread_cpumask(&host_cpus, "test");
-    }
 
     // Log verifier stats count for visibility.
     if !result.verifier_stats.is_empty() {
@@ -1312,32 +1326,20 @@ fn run_ktstr_test_inner_impl(
     }
 
     // Extract profraw from SHM ring buffer and collect stimulus
-    // events + per-payload metrics + raw outputs from
-    // `OutputFormat::LlmExtract` payloads.
+    // events + per-payload metrics.
     //
-    // Pairing contract: every guest-side payload-pipeline emit
-    // (one per `.run()` / `.wait()` / `.kill()` / `.try_wait()`
-    // terminal call) allocates one `payload_index` from
-    // `payload_run`'s per-process counter and stamps it onto the
-    // emitted `PayloadMetrics`. LlmExtract invocations additionally
-    // emit a `RawPayloadOutput` carrying the SAME index. Non-
-    // LlmExtract payloads emit only the `PayloadMetrics`. The host
-    // pairs an LlmExtract `RawPayloadOutput` to its empty-metrics
-    // companion by EQUAL `payload_index`, not by emission order —
-    // see `host_side_llm_extract` for the pairing implementation.
     // Complete per-phase stimulus timeline (step-start frames + the
     // scenario-end terminal boundary) via the single shared accessor —
     // the SAME timeline a post_vm callback gets, so the production eval
     // and any out-of-tree re-derivation can never disagree on the last
     // step's iteration_rate boundary. The bulk loop below per-entry
-    // handles PayloadMetrics + RawPayloadOutput (and streams Stderr);
+    // handles PayloadMetrics (and streams Stderr);
     // Profraw and WprofTrace/WprofTraceChunk are no-ops there (Profraw is
     // persisted centrally in `crate::vmm::KtstrVm::run`; the wprof `.pb` is
     // written by the #[cfg(feature="wprof")] pre-pass above). Stimulus +
     // ScenarioEnd are consumed by stimulus_timeline().
     let stimulus_events = result.stimulus_timeline();
     let mut payload_metrics: Vec<crate::test_support::PayloadMetrics> = Vec::new();
-    let mut raw_outputs: Vec<crate::test_support::RawPayloadOutput> = Vec::new();
     if let Some(ref bulk) = result.guest_messages {
         // Per-frame typed dispatch on the bucketed bulk drain.
         // Mirrors the freeze coord's TOKEN_TX exhaustive match —
@@ -1358,18 +1360,6 @@ fn run_ktstr_test_inner_impl(
                             Err(e) => {
                                 eprintln!("ktstr_test: decode payload metrics from bulk port: {e}")
                             }
-                        }
-                    }
-                }
-                Some(crate::vmm::wire::MsgType::RawPayloadOutput) => {
-                    if bulk_entry.crc_ok {
-                        match postcard::from_bytes::<crate::test_support::RawPayloadOutput>(
-                            &bulk_entry.payload,
-                        ) {
-                            Ok(raw) => raw_outputs.push(raw),
-                            Err(e) => eprintln!(
-                                "ktstr_test: decode raw payload output from bulk port: {e}"
-                            ),
                         }
                     }
                 }
@@ -1452,25 +1442,6 @@ fn run_ktstr_test_inner_impl(
         }
     }
 
-    // Host-side `OutputFormat::LlmExtract` resolution. For every
-    // RawPayloadOutput drained from the bulk port, look up its
-    // `payload_index` in the PayloadMetrics slice, run the
-    // LLM-backed extraction on the host, and replace the empty
-    // `metrics` vec on the matched slot with the extracted result.
-    // The model lives at the host's cache and the guest VM never
-    // had it, so this is the only correct place for the call.
-    //
-    // Pairing is by explicit `payload_index` equality, not emission
-    // order — emission order would conflate a `Json` payload that
-    // produced zero numeric leaves with an LlmExtract placeholder.
-    // Returns a flat `Vec<AssertDetail>` of host-side failures
-    // (model unavailable, universal invariant violation, orphan
-    // raw outputs) for the test verdict to fold in.
-    #[cfg(feature = "llm")]
-    let host_extract_failures = host_side_llm_extract(&mut payload_metrics, &raw_outputs);
-    #[cfg(not(feature = "llm"))]
-    let host_extract_failures: Vec<crate::assert::AssertDetail> = Vec::new();
-
     // Gate-skip on a post_vm `HostSkipRequest`: a host-side callback
     // determined the run is inconclusive (the VM could not produce the
     // artifact the assertion needs — e.g. a load-starved VM whose BPF
@@ -1486,30 +1457,6 @@ fn run_ktstr_test_inner_impl(
         crate::report::test_skip(format_args!("{}: {}", entry.name, reason));
         record_skip_sidecar(entry, topo);
         return Ok(AssertResult::skip(reason));
-    }
-
-    // Gate-skip on an unloadable host LLM model. The model lives
-    // host-side (it is too large to ship into the guest) and is a hard
-    // prerequisite for any LlmExtract payload: when it cannot load
-    // (cold-cache offline, or a cached GGUF incompatible with the linked
-    // llama.cpp), the extraction never runs and the test's metrics are
-    // unfulfillable. The prior code folded this into the verdict as a
-    // failure, failing the whole test on a missing prereq; convert that
-    // same whole-test path to a SKIP so the suite passes where a
-    // compatible model is present and skips where it is not. Re-fetching
-    // cannot help — the incompatibility is with the linked llama.cpp, not
-    // a stale download.
-    // The skip-vs-fail decision — including the rule that a host-side
-    // post_vm failure DOMINATES (no skip), so a real regression is never
-    // masked by a missing model — is should_skip_on_llm_model_load_failure
-    // (truth-tabled). A post_vm Err is folded into the verdict below and
-    // carries the PostVmAssertionFailure marker downstream.
-    if let Some(skip_reason) =
-        should_skip_on_llm_model_load_failure(&host_extract_failures, post_vm_err.is_some())
-    {
-        crate::report::test_skip(format_args!("{}: {}", entry.name, skip_reason));
-        record_skip_sidecar(entry, topo);
-        return Ok(AssertResult::skip(skip_reason));
     }
 
     // auto_repro is enabled when:
@@ -1577,17 +1524,53 @@ fn run_ktstr_test_inner_impl(
     };
 
     eprintln!("post-VM overhead before eval: {:?}", post_vm_t.elapsed());
-    let eval_result = evaluate_vm_result(
+    let mut eval_result = evaluate_vm_result(
         entry,
         &result,
         &merged_assert,
         &stimulus_events,
         &payload_metrics,
-        &host_extract_failures,
         &vm_topology,
         &repro_fn,
         post_vm_err.as_ref(),
     );
+    // Reclassify a no-guest-result run that is a contention-caused
+    // SchedulerNotAttached — the scheduler enable was still in flight
+    // (state=enabling) when the startup budget expired under host
+    // oversubscription — as a clean SKIP: surfaced (nextest shows SKIP),
+    // never retry-masked green, never false-failed. Under
+    // KTSTR_NO_SKIP_MODE it stays a FAIL with the actionable reason. A
+    // rejected enable (disabling/disabled), missing sched_ext sysfs, a
+    // SchedulerDied, or a stall on a FITTING host is a real defect and
+    // stays a FAIL (contention_not_attached_skip_reason returns None).
+    if eval_result.is_err()
+        && let Some(skip_reason) = contention_not_attached_skip_reason(
+            result.guest_messages.as_ref(),
+            // The oversubscription ratio must key on the BOOTED vCPU
+            // count (vm_topology), not the declared entry.topology: under
+            // a TopoOverride (gauntlet / host-test preset) the VM boots
+            // resolve_vm_topology(entry, topo), which can differ. Keying
+            // on the declared count would mis-scale the ratio and could
+            // mask a genuine fitting-host stall as a skip (or false-fail
+            // real contention). vm_topology is the same topology passed
+            // to evaluate_vm_result above.
+            vm_topology.total_cpus(),
+            crate::vmm::host_topology::host_allowed_cpus().len(),
+            entry.cpu_budget,
+        )
+    {
+        if std::env::var_os(crate::KTSTR_NO_SKIP_MODE_ENV).is_some() {
+            eval_result = eval_result.map_err(|e| {
+                e.context(format!(
+                    "{skip_reason} [KTSTR_NO_SKIP_MODE: contention skip promoted to fail]"
+                ))
+            });
+        } else {
+            crate::report::test_skip(format_args!("{}: {skip_reason}", entry.name));
+            record_skip_sidecar(entry, topo);
+            eval_result = Ok(AssertResult::skip(skip_reason));
+        }
+    }
     // Set result.expect_auto_repro_satisfied based on the artifact-on-disk
     // probe. Called AFTER evaluate_vm_result so the auto-repro VM has had
     // a chance to land its .repro.wprof.pb artifact via the host's
@@ -1831,38 +1814,23 @@ fn precompute_failure_sections(
     )
 }
 
-/// Fold the verdict inputs (host-extract failures, the `post_vm` callback's
-/// Err, the cleanup-budget overrun, and the reproducer-mode `scx_bpf_error`
+/// Fold the verdict inputs (the `post_vm` callback's Err, the
+/// cleanup-budget overrun, and the reproducer-mode `scx_bpf_error`
 /// matcher) into `check_result`. Returns whether the matcher contributed a
 /// mismatch detail (`matcher_mismatch`) so the caller wraps the failure Err
 /// with [`ScxBpfErrorMatcherMismatch`].
-#[allow(clippy::too_many_arguments)]
 fn evaluate_verdict_folds(
     check_result: &mut AssertResult,
     entry: &KtstrTestEntry,
     result: &vmm::VmResult,
     merged_assert: &crate::assert::Assert,
-    host_extract_failures: &[crate::assert::AssertDetail],
     post_vm_err: Option<&anyhow::Error>,
     sched_log_input: &str,
     dump_section: &str,
 ) -> bool {
-    // Fold host-side LlmExtract failures into the guest's
-    // AssertResult before the sidecar write so per-run stats
-    // tooling sees the host-extracted verdict, not the guest's
-    // placeholder pass(). Each host-side failure is appended as
-    // an `AssertDetail` exactly as if it had been raised inside
-    // the guest's `evaluate_checks` — same kind, same prose
-    // shape — so failure-rendering downstream is uniform across
-    // sources.
-    for detail in host_extract_failures {
-        check_result.merge(AssertResult::fail(detail.clone()));
-    }
-
     // Fold the host-side `post_vm` callback's Err into the
-    // verdict so it flows through the same failure path as
-    // host-extract failures and the guest-stamped check
-    // result. The downstream failure formatter renders the
+    // verdict so it flows through the same failure path as the
+    // guest-stamped check result. The downstream failure formatter renders the
     // `--- scheduler log ---` / `--- sched_ext dump ---` /
     // `--- monitor ---` sections + dispatches `repro_fn`
     // (auto-repro) from this single point — no parallel
@@ -1887,7 +1855,7 @@ fn evaluate_verdict_folds(
     // timeout is NOT a `None` case — `run_bsp_loop` exits cleanly
     // with `timed_out = true` and `collect_results` still
     // populates `cleanup_duration` to `Some(_)`, per the field
-    // contract documented at `src/vmm/mod.rs` for
+    // contract documented at `src/vmm/result.rs` for
     // `VmResult::cleanup_duration`. The surrounding error path
     // (BSP panic propagation, pre-BSP setup `Err`) already
     // produces a failure verdict in the absent-measurement case,
@@ -1975,7 +1943,7 @@ fn populate_run_stats_and_folded_timeline(
     // read_sample returns None — avg_imbalance_ratio, iteration_rate,
     // system_time_ns / user_time_ns (populate_run_ext_metrics_from_phases).
     // Without it those keys never reach the sidecar and
-    // `cargo ktstr stats compare` silently drops the rows.
+    // `cargo ktstr perf-delta` silently drops the rows.
     // Fold the guest-collected per-phase per_cgroup carriers
     // (parsed into check_result.stats.phases from the guest's
     // AssertResult above) into the host-rebuilt buckets keyed by
@@ -2127,7 +2095,7 @@ fn render_failure_verdict_message(
     // emit site in this crate tags its `AssertDetail` with one
     // of those variants (see the ops.rs / scenario/mod.rs call
     // sites plus the `format_sched_died_*` helpers in
-    // `assert.rs`), so filtering by kind is sufficient — the
+    // `src/assert/detail.rs`), so filtering by kind is sufficient — the
     // prior `is_scheduler_death()` prefix-match fallback was
     // removed once every production emitter was audited as
     // kind-tagging its details. `verbose()` forces the
@@ -2344,7 +2312,7 @@ fn render_no_result_message(
         // why the deadline fired. Append the four knobs the host
         // watchdog actually consulted: the host VM timeout (the
         // value the watchdog deadline was anchored to,
-        // `max(watchdog_timeout, duration)` per
+        // `max(watchdog_timeout, duration, 1s)` per
         // `vm_timeout_from_entry`), the scheduler watchdog timeout
         // (`entry.watchdog_timeout`, the scx_sched.watchdog_timeout
         // override applied to the guest kernel), the workload
@@ -2354,7 +2322,7 @@ fn render_no_result_message(
         // diagnostic in `freeze_coord/mod.rs` so the operator sees
         // the same direction whether they read VM stderr or this
         // test-output message.
-        let vm_timeout = vm_timeout_from_entry(entry);
+        let vm_timeout = vm_timeout_from_entry(entry, topo.total_cpus());
         let watchdog_section = format!(
             "\n\n--- watchdog ---\n\
              elapsed={:?} (VM run wall-clock)\n\
@@ -2531,13 +2499,6 @@ fn eval_monitor_thresholds(
 /// is the per-invocation accumulator drained from the guest SHM ring;
 /// the sidecar writer receives it verbatim so stats tooling sees one
 /// entry per `ctx.payload(X).run()` / `.spawn().wait()`.
-///
-/// `host_extract_failures` carries the universal-invariant +
-/// model-load failures produced by [`host_side_llm_extract`] when
-/// the run's `OutputFormat::LlmExtract` payloads were resolved on
-/// the host. The folded details are appended to the test's
-/// AssertResult so a host-side LlmExtract failure surfaces in the
-/// same failure-rendering pipeline as a guest-emitted check failure.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_vm_result(
     entry: &KtstrTestEntry,
@@ -2545,7 +2506,6 @@ fn evaluate_vm_result(
     merged_assert: &crate::assert::Assert,
     stimulus_events: &[StimulusEvent],
     payload_metrics: &[crate::test_support::PayloadMetrics],
-    host_extract_failures: &[crate::assert::AssertDetail],
     topo: &Topology,
     repro_fn: &dyn Fn(&str) -> Option<String>,
     // Optional Err captured from `KtstrTestEntry::post_vm` so the
@@ -2643,7 +2603,6 @@ fn evaluate_vm_result(
             entry,
             result,
             merged_assert,
-            host_extract_failures,
             post_vm_err,
             sched_log_input,
             &dump_section,
@@ -2760,7 +2719,5 @@ mod eval_tests;
 mod eval_tests_eval;
 #[cfg(test)]
 mod eval_tests_inner;
-#[cfg(test)]
-mod eval_tests_llm;
 #[cfg(test)]
 mod eval_tests_reporting;

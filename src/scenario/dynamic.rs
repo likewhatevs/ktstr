@@ -105,9 +105,10 @@ pub fn custom_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
     // (the comment claiming the guard reaped it was wrong — the
     // guard only reaps names it has been told about). Duplicate
     // pushes of the same name across cycles are harmless: Drop
-    // iterates `names` and calls remove_cgroup for each, which
-    // returns ENOENT after the first successful removal — and
-    // `is_io_not_found` filters that case from the warn output.
+    // iterates `names` and calls remove_cgroup for each, and once
+    // the directory is already gone remove_cgroup short-circuits
+    // to Ok(()) via its `!p.exists()` early return, so the second
+    // (and later) removals produce no error and fire no warn.
     const MAX_EPHEMERAL_NAMES: usize = 100;
     while Instant::now() < deadline {
         let n = format!("ephemeral_{}", i % MAX_EPHEMERAL_NAMES);

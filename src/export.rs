@@ -598,14 +598,13 @@ fn compose_sched_args_joined(
     // Compose scheduler args via the same host-side builder the
     // in-VM test path uses to assemble the scheduler argv
     // (`append_base_sched_args`, invoked from both `eval/mod.rs` and
-    // `probe.rs`): cgroup-parent auto-inject from
-    // `entry.scheduler.cgroup_parent`, then the scheduler def's own
+    // `probe.rs`): fail-fast validation of any user-supplied
+    // `--cell-parent-cgroup` value, then the scheduler def's own
     // `sched_args`, then per-test `extra_sched_args`. Reusing the
     // helper keeps the bare-metal repro aligned with a normal test
-    // run for these three sources — without it, the export would
-    // silently drop `--cell-parent-cgroup` and any sched-def
-    // baseline args, and the reproduced scheduler would land in the
-    // wrong cgroup tree.
+    // run for these sources — without it, the export would
+    // silently drop any sched-def baseline args, and a malformed
+    // `--cell-parent-cgroup` would slip past the runtime gate.
     //
     // Config-driven schedulers (declared `config_file` and/or
     // `config_content`) are handled via the `config_additions`
@@ -958,8 +957,9 @@ chmod 700 "$DIR"
 # The ktstr in-process dispatch creates its cgroup tree under
 # /sys/fs/cgroup/ktstr — the export-relevant path goes through the
 # ctor early-dispatch into `test_support::probe::build_dispatch_ctx_parts`
-# which calls `test_support::args::resolve_cgroup_root` (args.rs:111
-# fallback), and the in-VM init follows the same convention.
+# which calls `test_support::args::resolve_cgroup_root` (fn at
+# args.rs:336, `/sys/fs/cgroup/ktstr` fallback at args.rs:377), and
+# the in-VM init follows the same convention.
 # Capture the path here so the trap teardown can clean any subgroups
 # the dispatch created. The rmdir must walk depth-first because
 # cgroup v2 forbids rmdir on a subtree that still contains child
@@ -1004,7 +1004,7 @@ fi
 {scheduler_launch}
 # --- run the test ---
 # `--ktstr-test-fn $KTSTR_TEST_NAME` is intercepted by the ktstr
-# binary's `#[ctor::ctor] ktstr_test_early_dispatch` (in
+# binary's `#[ctor(unsafe)] ktstr_test_early_dispatch` (in
 # `src/test_support/dispatch.rs`), which fires from `.init_array`
 # BEFORE `main()` runs. The ctor reads the argv directly via
 # `extract_test_fn_arg` and dispatches via
@@ -1063,7 +1063,8 @@ fn git_provenance() -> String {
             // `head_id()` returns an Id<'_> borrowing `repo`, so format
             // and truncate to an owned String inside the same scope as
             // `repo` to satisfy the borrow checker. Mirrors the
-            // pattern at fetch.rs:1016-1017.
+            // head_id/format/truncate pattern in
+            // `crate::fetch::inspect_local_source_state`.
             repo.head_id()
                 .ok()
                 .map(|id| format!("{id}").chars().take(7).collect::<String>())

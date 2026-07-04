@@ -189,8 +189,9 @@ pub(crate) fn sched_pid() -> Option<libc::pid_t> {
 /// scheduler-lifecycle Op dispatch on the guest to swap the live PID
 /// across Detach (`pid = 0`) / Attach (`pid = new child`) /
 /// Replace (`pid = swap`) transitions. The boot path
-/// ([`spawn_scheduler_from_paths`]) calls this directly with the
-/// freshly-spawned `child.id()`.
+/// ([`spawn_scheduler_from_paths`], via `try_spawn_scheduler`)
+/// bypasses this helper and stores the freshly-spawned
+/// `child.id()` into [`SCHED_PID`] directly.
 ///
 /// `Release` ordering pairs with the `Acquire` load in
 /// [`sched_pid`]; the writer's side effects (Op log emit, prior
@@ -202,7 +203,7 @@ pub(crate) fn set_sched_pid(pid: libc::pid_t) {
 /// Read the live scheduler identity published by the dispatch
 /// arms of `Op::AttachScheduler` / `Op::ReplaceScheduler` (the
 /// matching `set_current_scheduler` call site lives in
-/// `src/scenario/ops/mod.rs`). Returns `None` when no scheduler
+/// `src/scenario/ops/dispatch.rs`). Returns `None` when no scheduler
 /// is currently attached — the pre-attach state at process start
 /// and the post-`Op::DetachScheduler` state.
 ///
@@ -236,7 +237,7 @@ pub fn current_scheduler() -> Option<&'static crate::test_support::SchedulerSpec
 /// clear the slot when `None`. Called by the
 /// `Op::AttachScheduler` / `Op::ReplaceScheduler` /
 /// `Op::DetachScheduler` dispatch arms in
-/// `src/scenario/ops/mod.rs` immediately after the corresponding
+/// `src/scenario/ops/dispatch.rs` immediately after the corresponding
 /// pid change so the two side channels (pid + identity) stay
 /// co-published.
 ///
@@ -395,13 +396,16 @@ pub(crate) fn proc_pid_alive(pid: u32) -> bool {
 /// notable case (the scheduler binary either ignored SIGTERM or its
 /// userspace signal handler ran too slow against the grace window).
 //
-// `#[allow(dead_code)]` because the helper has no production caller
-// in this commit — the Op::DetachScheduler / Op::RestartScheduler /
-// Op::ReplaceScheduler dispatchers that will consume it land in
-// follow-up work. Tests in this module exercise every variant + the
-// InvalidPid error path, so the helper is verified-correct as it
-// lands; the allow becomes a no-op the moment the first production
-// caller wires up.
+// `#[allow(dead_code)]` because the helper has no production caller.
+// The Op::DetachScheduler / Op::RestartScheduler /
+// Op::ReplaceScheduler dispatchers deliberately bypass it: they
+// route kills through `kill_current_scheduler`, which uses direct
+// `libc::kill(SIGTERM)` + `wait_for_scx_disabled` because this
+// helper's strict /proc-absence verification can fire
+// `StillAliveAfterSigkill` when the scheduler's exit blocks on BPF
+// detach (see src/scenario/ops/dispatch.rs). Tests in this module
+// exercise every variant + the InvalidPid error path, so the
+// helper is verified-correct.
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum KillSchedulerOutcome {
@@ -493,12 +497,12 @@ pub(crate) enum KillSchedulerError {
 /// the kill helper generic (no implicit singleton-pid assumption)
 /// lets unit tests exercise it against any spawned child pid.
 ///
-/// # Poll cadence
+/// # Wait mechanism
 ///
-/// 50ms polling interval — matches the existing
-/// [`poll_startup`] cadence so the latency-vs-CPU tradeoff is
-/// consistent across the scheduler-lifecycle helpers. The
-/// post-SIGKILL grace is the module-level [`POST_SIGKILL_GRACE`]
+/// Absence is detected via the kernel-evented pidfd path in
+/// [`poll_proc_pid_absent`] (`pidfd_wait_exit`), not a sleep-poll
+/// loop; the `interval` argument passed there is currently unused.
+/// The post-SIGKILL grace is the module-level [`POST_SIGKILL_GRACE`]
 /// const (see that const's doc for the 200ms-vs-magic-number
 /// rationale).
 #[allow(dead_code)] // production callers (Op::*Scheduler dispatch) wire up in follow-up work
@@ -550,7 +554,7 @@ pub(crate) fn kill_scheduler_process(
 /// both the routine reap path (sub-100ms for a simple userspace
 /// process) AND the scheduler-lifecycle Op kill path where an scx
 /// scheduler's exit blocks on `scx_disable_workfn`
-/// (`kernel/sched/ext.c:5923`) tearing down BPF programs from a
+/// (`kernel/sched/ext.c:6101`) tearing down BPF programs from a
 /// workqueue. BPF tear-down dominates the SIGKILL→/proc removal
 /// latency for scx_* binaries and routinely exceeds 1s on
 /// loaded kernels; 2s leaves comfortable headroom while keeping
@@ -567,10 +571,11 @@ pub(crate) fn kill_scheduler_process(
 /// call site.
 const POST_SIGKILL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Poll `/proc/{pid}` for absence up to `timeout`, sleeping at the
-/// caller's `interval` cadence between checks. Returns `true` if the
-/// pid's procfs entry disappears within the budget, `false`
-/// otherwise.
+/// Wait (kernel-evented via `pidfd_wait_exit`) for `/proc/{pid}`
+/// absence up to `timeout`. Returns `true` if the pid's procfs
+/// entry disappears within the budget, `false` otherwise. The
+/// `interval` parameter is currently unused (the evented path
+/// carries no sleep cadence).
 ///
 /// Single source of truth for "wait until the kernel runs
 /// release_task for this pid": [`kill_scheduler_process`] uses it to

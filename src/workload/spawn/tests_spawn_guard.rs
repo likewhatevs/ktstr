@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 /// EMFILE on the inter-worker pipe loop: with num_workers=4 and
 /// PipeIo (which needs 2 pipe pairs = 4 pipe() calls = 8 fds),
 /// cap RLIMIT_NOFILE at baseline+5 so the first pair allocates
-/// cleanly (ab+ba = 4 fds) and the second pair's first `pipe(ab)`
+/// cleanly (ab+ba = 4 fds) and the second pair's first `pipe2(ab)`
 /// call fails with EMFILE (needs 2 fds, only 1 slot remains).
 /// At bail time `guard.pipe_pairs` holds the first pair;
 /// SpawnGuard::Drop must close all 4 fds so the child's fd
@@ -54,7 +54,7 @@ fn spawn_guard_cleans_up_on_interworker_pipe_emfile() {
         // succeeds but the second pair's first `pipe(ab)` does
         // not. baseline + 5 permits 5 new fds: 4 for the first
         // pipe pair (ab+ba) and 1 leftover. The second pair's
-        // `pipe(ab)` needs 2 fds against that 1 slot and fails
+        // `pipe2(ab)` needs 2 fds against that 1 slot and fails
         // with EMFILE.
         let target_cur = (baseline + 5) as u64;
         let lowered = libc::rlimit {

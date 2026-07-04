@@ -128,7 +128,7 @@ pub(crate) fn isolated_sidecar_dir() -> IsolatedSidecarDir {
 /// in the second case.
 ///
 /// Production code is fine with the upward-walk semantics —
-/// an operator who points `--source` at a tempdir genuinely
+/// an operator who points `--kernel` at a tempdir genuinely
 /// inside their checkout DOES want the checkout's HEAD as the
 /// source identity. The semantic only breaks for tests that
 /// MUST exercise the no-repo-found branch; those tests call
@@ -311,7 +311,7 @@ pub(crate) fn make_vm_result(
 }
 
 /// Build an [`AssertResult`] with a default (all-zero)
-/// [`ScenarioStats`] payload. Centralizes the 16-field zero-stats
+/// [`ScenarioStats`] payload. Centralizes the zero-stats
 /// skeleton that previously had to be hand-typed at every
 /// `evaluate_vm_result` call site.
 ///
@@ -656,11 +656,9 @@ fn env_var_guard_restores_non_utf8_original_exactly() {
 /// process-global mutation — two concurrent callers in DIFFERENT
 /// modules would see each other's output land in their sink (or
 /// worse, the save/restore pair could interleave and permanently
-/// break fd 2). Before this lock existed, `src/cli.rs` and
-/// `src/report.rs` each had their own module-local mutex, which
-/// serialized within-module calls but did NOT coordinate across
-/// modules. The ONE mutex here guards every capture site in the
-/// crate.
+/// break fd 2). The ONE mutex here guards every capture site in
+/// the crate — today's callers are `src/report.rs` and
+/// `src/test_macros.rs`.
 pub(crate) static STDERR_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// RAII guard that restores the saved stderr fd on Drop, even if

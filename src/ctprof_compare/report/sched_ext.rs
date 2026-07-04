@@ -44,7 +44,7 @@ pub(super) fn write_sched_ext_section<W: fmt::Write>(
     // AND for the empty-string-but-Some case (file
     // unreadable but directory present). The "-" placeholder
     // makes "no observation" visually distinct from a real
-    // sched_ext_state_str[] value.
+    // scx_enable_state_str[] value.
     fn state_cell_for(s: Option<&crate::ctprof::SchedExtSysfs>) -> String {
         match s {
             None => "-".to_string(),

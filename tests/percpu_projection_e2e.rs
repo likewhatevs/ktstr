@@ -4,8 +4,10 @@
 //! (per-CPU select), exercised against a REAL `BPF_MAP_TYPE_PERCPU_ARRAY`
 //! (scx-ktstr's `ktstr_pcpu_fix`) captured from a booted scheduler.
 //!
-//! No prior test captured a real per-CPU map (scx-ktstr had none — see
-//! its `ktstr_dump_cpu` "no per-cpu state" line), so this validates the
+//! No prior test captured a real per-CPU map (`ktstr_pcpu_fix`, the
+//! only `BPF_MAP_TYPE_PERCPU_ARRAY` in scx-ktstr, was added for this
+//! test — see its decl comment in `scx-ktstr/src/bpf/main.bpf.c`), so
+//! this validates the
 //! whole per-CPU capture → render → projector chain end-to-end, not
 //! just the host-side projector logic the bpf.rs chain tests cover with
 //! synthetic data.

@@ -11,16 +11,19 @@
 //!   [`DerivedRow`] plus the resolved [`Column`] set and emit
 //!   the column-by-column `Vec<String>` that the table adapter
 //!   consumes.
-//! - **Cell formatters** — [`format_arrow_cell`],
-//!   [`cgroup_cell`], [`format_psi_avg_cell`] and friends render
-//!   `baseline → candidate (delta)` triples for the various
-//!   units (raw `Aggregated`, raw `u64` cgroup counters,
-//!   centi-percent PSI averages).
+//! - **Cell formatters** — [`format_arrow_cell`] renders a
+//!   `baseline → candidate` arrow pair (the delta renders in a
+//!   separate column), while [`cgroup_cell`] and
+//!   [`format_psi_avg_cell`] fuse a `(delta)` parenthetical into
+//!   `baseline → candidate (delta)` for the various units (raw
+//!   `Aggregated`, raw `u64` cgroup counters, centi-percent PSI
+//!   averages).
 //! - **Color / chrome** — [`color_diff_cell`],
 //!   [`color_derived_cells`], [`colored_header`] /
 //!   [`colored_header_with_sort`] wrap rendered strings in
 //!   [`comfy_table::Cell`]s with the foreground color encoding
-//!   regression vs improvement (yellow / magenta), uptime
+//!   delta direction (yellow for a positive delta, magenta for
+//!   a negative delta), uptime
 //!   gradient (green / yellow / red), or the cyan header / blue
 //!   derived-row palette.
 //!
@@ -39,12 +42,12 @@ use super::scale::{
 use super::{CTPROF_METRICS, metric_display_name, metric_tags};
 use crate::ctprof::{Psi, PsiHalf, PsiResource};
 
-/// Format the arrow cell `<baseline> -> <candidate> (<delta>)`
-/// for primary diff rows. Mirrors [`cgroup_cell`]'s shape so
-/// the visual style stays consistent across primary and cgroup
-/// tables. When `delta` is `None` (categorical Mode rule), the
-/// parenthetical drops to "same"/"differs"; for non-Mode rows
-/// without a numeric projection the parenthetical is "-".
+/// Format the arrow cell `<baseline> -> <candidate>` for
+/// primary diff rows. The `delta` argument is currently unused
+/// (discarded via `let _ = delta;`) — the delta renders in the
+/// separate Delta column paired with Arrow under
+/// `DisplayFormat::Arrow`. Unlike [`cgroup_cell`], no `(delta)`
+/// parenthetical is fused into the cell.
 pub(super) fn format_arrow_cell(
     baseline: &Aggregated,
     candidate: &Aggregated,
@@ -208,7 +211,7 @@ pub fn color_diff_cell(
 
 /// Extract the parent directory and leaf segment of a cgroup path.
 /// `/system.slice/foo.service` → (`/system.slice`, `foo.service`).
-/// `/` → (`/`, `/`). Empty → (``, ``).
+/// `/` → (`/`, ``) (empty leaf). Empty → (``, ``).
 pub(super) fn cgroup_parent_leaf(path: &str) -> (&str, &str) {
     match path.rfind('/') {
         Some(0) => ("/", &path[1..]),
@@ -255,7 +258,7 @@ pub fn colored_header_with_sort(
 /// pre-color baseline for shell-pipeline consumers.
 ///
 /// Color choice: blue contrasts with both the unstyled primary
-/// table and the stats compare verdict palette
+/// table and the perf-delta verdict palette
 /// (`Color::Red` / `Color::Green` for REGRESSION /
 /// improvement) — derived rows do not carry a regression
 /// verdict of their own, so reusing the verdict colors here

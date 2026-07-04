@@ -31,7 +31,16 @@ enum ScxAttachStatus {
     /// `enabling`, or the enable FAILED and the state moved on to
     /// `disabling`/`disabled`. Typically a BPF verifier reject, an
     /// ops-mismatch, a slow init, or an ops.init/enable failure.
-    Timeout,
+    ///
+    /// Carries the LAST-observed `/sys/kernel/sched_ext/state` reading
+    /// (`None` if every state read failed). This is the discriminator
+    /// the host uses to tell a still-in-flight enable (`Enabling` — a
+    /// slow/contended enable) from a rejected enable (`Disabling` /
+    /// `Disabled` — a real defect): the enable path leaves `Enabling`
+    /// for `Disabling`/`Disabled` ONLY on failure (see [`ScxState`]),
+    /// so `Enabling` at timeout means the enable was still progressing
+    /// when the deadline hit.
+    Timeout(Option<ScxState>),
     /// Every read of `root/ops` returned `Err`. Either the kernel
     /// lacks sched_ext support entirely or the sysfs tree has not
     /// been created for the current kernel — distinct from
@@ -121,6 +130,13 @@ fn poll_scx_attached(
     // steady-state fast path.
     let mut buf = String::with_capacity(64);
     let mut ever_read_ok = false;
+    // Last-observed sched_ext state, carried into
+    // ScxAttachStatus::Timeout so the host can tell a still-in-flight
+    // enable (Enabling) from a rejected one (Disabling/Disabled). Only
+    // updated on a successful read, and only read below in the Timeout
+    // branch (which requires ever_read_ok), so it always reflects a real
+    // reading there.
+    let mut last_state: Option<ScxState> = None;
     // Track whether read ever succeeded so the Timeout vs SysfsAbsent
     // distinction stays correct after the helper returns.
     let check_done = || -> Option<()> {
@@ -138,7 +154,9 @@ fn poll_scx_attached(
             // scheduler. scx_state() re-reads /sys/kernel/sched_ext/state each
             // call (cheap; the cadence below drives the ENABLING->ENABLED
             // re-check on kernels that do not sysfs_notify the transition).
-            if scx_attach_ready(&buf, scx_state()) {
+            let state = scx_state();
+            last_state = state;
+            if scx_attach_ready(&buf, state) {
                 return Some(());
             }
         }
@@ -176,7 +194,7 @@ fn poll_scx_attached(
         KernfsWaitOutcome::Done(()) => ScxAttachStatus::Attached,
         KernfsWaitOutcome::NoEventedSource => {
             // Both attr fd open and inotify_add_watch failed. We
-            // target kernel 6.12+ where kernfs + inotify are
+            // target kernel 6.16+ where kernfs + inotify are
             // universally present, so /sys/kernel/sched_ext/ is
             // fundamentally missing or broken. Surface as
             // SysfsAbsent; the log makes the operator-actionable
@@ -191,7 +209,7 @@ fn poll_scx_attached(
         }
         KernfsWaitOutcome::Timeout => {
             let status = if ever_read_ok {
-                ScxAttachStatus::Timeout
+                ScxAttachStatus::Timeout(last_state)
             } else {
                 ScxAttachStatus::SysfsAbsent
             };
@@ -458,9 +476,12 @@ pub(crate) enum SpawnSchedulerError {
     /// (the dead pid was published optimistically at spawn so the
     /// sched_exit_monitor caller path could install against a known
     /// id; the StartupDied branch never gets that far so the spawn
-    /// helper owns the rollback). The process is already reaped via
-    /// `poll_startup`'s internal `try_wait`. No manual cleanup
-    /// required by the caller.
+    /// helper owns the rollback). The dead child is auto-reaped by
+    /// the kernel because PID 1 runs SIGCHLD=`SIG_IGN` (see
+    /// [`poll_startup`]'s doc and [`ktstr_guest_init`]);
+    /// `poll_startup` only observes the exit via pidfd POLLIN, it
+    /// does not reap. No manual `wait`/`try_wait` required by the
+    /// caller.
     StartupDied { log_path: String },
 
     /// Process is alive past the liveness window but
@@ -615,8 +636,10 @@ pub(crate) fn try_spawn_scheduler(
         std::time::Duration::from_secs(1),
     ) {
         StartupStatus::Died => {
-            // Process already exited — SIGCHLD reaped via poll_startup's
-            // try_wait. SCHED_PID still points at the dead pid; clear so a
+            // Process already exited — the dead child is auto-reaped by
+            // the kernel under SIGCHLD=SIG_IGN (poll_startup only observes
+            // the exit via pidfd POLLIN, it does not reap). SCHED_PID still
+            // points at the dead pid; clear so a
             // subsequent Op dispatch's sched_pid() returns None instead of
             // the stale dead/recycled id. The pid was published optimistically
             // at spawn so the sched_exit_monitor caller path can install
@@ -649,8 +672,21 @@ pub(crate) fn try_spawn_scheduler(
                 std::time::Duration::from_secs(10),
             );
             if !status.is_attached() {
+                // The terminal scx_state distinguishes a still-in-flight
+                // enable (Enabling — a slow/contended enable the host may
+                // classify as skippable) from a REJECTED enable (Disabling/
+                // Disabled — a verifier reject / ops.init failure, a real
+                // defect that must FAIL). The host keys its skip-vs-fail
+                // decision on this token; see the SchedulerNotAttached
+                // handling in src/test_support/eval.
                 let reason = match status {
-                    ScxAttachStatus::Timeout => "timeout",
+                    ScxAttachStatus::Timeout(Some(ScxState::Enabling)) => "timeout: state=enabling",
+                    ScxAttachStatus::Timeout(Some(ScxState::Disabling)) => {
+                        "timeout: state=disabling"
+                    }
+                    ScxAttachStatus::Timeout(Some(ScxState::Disabled)) => "timeout: state=disabled",
+                    ScxAttachStatus::Timeout(Some(ScxState::Enabled)) => "timeout: state=enabled",
+                    ScxAttachStatus::Timeout(None) => "timeout: state=unknown",
                     ScxAttachStatus::SysfsAbsent => "sched_ext sysfs absent",
                     ScxAttachStatus::Attached => unreachable!(),
                 };

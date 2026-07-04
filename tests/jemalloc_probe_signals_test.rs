@@ -66,25 +66,6 @@ fn wait_for_worker_ready(pid: i32, timeout: Duration) -> Result<(), String> {
     ))
 }
 
-/// Multi-snapshot run interrupted mid-sleep by SIGINT must exit
-/// cleanly with a partial ProbeOutput carrying `interrupted: true`.
-///
-/// Protocol:
-/// 1. Spawn the alloc-worker with 16 MiB, waits for ready marker.
-/// 2. Spawn the probe with `--snapshots 20 --interval-ms 300 --json`
-///    so the run takes ~6s of wall-clock.
-/// 3. Sleep `2 * interval_ms + 400ms` — guaranteed to cover at
-///    least one full snapshot plus buffer for probe spawn/attach,
-///    even on a CPU-saturated CI runner.
-/// 4. Send SIGINT to the probe. The probe's signal handler sets
-///    `CLEANUP_REQUESTED` and `sleep_with_cancel` returns within
-///    one poll tick (10ms).
-/// 5. Wait for probe exit + parse JSON. Assert:
-///    - exit code 0 (success, not signaled)
-///    - `interrupted: true`
-///    - `snapshots.len() < 20` (interrupt landed before completion)
-///    - at least one snapshot emitted (interrupt landed AFTER first)
-///
 /// Pre-check YAMA `ptrace_scope`. Returns `true` when the test
 /// should skip — i.e. the file is readable and its value is > 0
 /// AND the caller is not privileged (`geteuid() != 0` stands in
@@ -120,6 +101,24 @@ fn skip_with_reason(reason: &str) {
     eprintln!("================================================================");
 }
 
+/// Multi-snapshot run interrupted mid-sleep by SIGINT must exit
+/// cleanly with a partial ProbeOutput carrying `interrupted: true`.
+///
+/// Protocol:
+/// 1. Spawn the alloc-worker with 16 MiB, waits for ready marker.
+/// 2. Spawn the probe with `--snapshots 20 --interval-ms 300 --json`
+///    so the run takes ~6s of wall-clock.
+/// 3. Sleep `2 * interval_ms + 400ms` — guaranteed to cover at
+///    least one full snapshot plus buffer for probe spawn/attach,
+///    even on a CPU-saturated CI runner.
+/// 4. Send SIGINT to the probe. The probe's signal handler sets
+///    `CLEANUP_REQUESTED` and `sleep_with_cancel` returns within
+///    one poll tick (10ms).
+/// 5. Wait for probe exit + parse JSON. Assert:
+///    - exit code 0 (success, not signaled)
+///    - `interrupted: true`
+///    - `snapshots.len() < 20` (interrupt landed before completion)
+///    - at least one snapshot emitted (interrupt landed AFTER first)
 #[test]
 #[ignore] // requires CAP_SYS_PTRACE or ptrace_scope=0 for sibling attach
 fn probe_sigint_mid_multi_snapshot_produces_partial_output() {

@@ -32,8 +32,10 @@
 //! The kernel reply nests one `TASKSTATS_TYPE_AGGR_PID`
 //! attribute that carries a `TASKSTATS_TYPE_PID` (u32 pid) plus a
 //! `TASKSTATS_TYPE_STATS` blob holding the full
-//! `struct taskstats` payload (~600 bytes — the union of v1..v17
-//! fields). Older kernels truncate the trailing fields; the
+//! `struct taskstats` payload (688 bytes for the full v17 struct;
+//! this parser reads only the 560-byte prefix through
+//! `irq_delay_min` and ignores the 128-byte v17 timestamp tail).
+//! Older kernels truncate the trailing fields; the
 //! parser handles short-payload cases by treating absent bytes as
 //! zero.
 //!
@@ -174,8 +176,9 @@ impl TaskstatsSummary {
     /// and the `other_err` clause is the operator's hint to
     /// look at the underlying log line.
     pub fn record_result(&mut self, result: &io::Result<DelayStats>) {
-        // POSIX errno values, hardcoded so this module stays
-        // off the libc dep. The two recognized errnos cover the
+        // POSIX errno values, hardcoded so this module needn't
+        // import libc just for two errno constants (libc is
+        // already a crate dependency). The two recognized errnos cover the
         // operationally interesting causes; other errnos fall to
         // `other_err_count`.
         const EPERM: i32 = 1;
@@ -343,7 +346,8 @@ const TASKSTATS_TYPE_STATS: u16 = 3;
 /// nests `TASKSTATS_TYPE_PID` + `TASKSTATS_TYPE_STATS`.
 const TASKSTATS_TYPE_AGGR_PID: u16 = 4;
 
-/// Family name registered by `kernel/taskstats.c::taskstats_genl_family`.
+/// Family name registered by `kernel/taskstats.c`'s `family`
+/// genl_family struct (`.name = TASKSTATS_GENL_NAME = "TASKSTATS"`).
 const TASKSTATS_FAMILY_NAME: &str = "TASKSTATS";
 
 impl TaskstatsClient {
@@ -973,7 +977,7 @@ mod tests {
     /// reply carries `NLMSG_ERROR` (e.g. ESRCH for an exited tid,
     /// EPERM when CAP_NET_ADMIN is missing). Errno=-1 (the kernel's
     /// negative-on-the-wire convention; see
-    /// netlink-packet-core/src/error.rs:146 "Negative errno or 0
+    /// netlink-packet-core/src/error.rs:278 "Negative errno or 0
     /// for acknowledgements") surfaces as `errno=1` in the
     /// rendered string per `parse_reply`'s `let errno = -err`
     /// negation step.

@@ -464,7 +464,7 @@ fn extract_not_attached_reason(
 /// [`crate::test_support::wprof::reassemble_wprof_trace`] over the full
 /// bulk drain so a chunked trace is concatenated, not truncated to its
 /// terminal frame. Only the wprof trace unique to this path is
-/// persisted here — Stimulus, PayloadMetrics, and RawPayloadOutput
+/// persisted here — Stimulus and PayloadMetrics
 /// frames from the auto-repro run are intentionally NOT extracted
 /// because they're a duplicate of the primary's and the verdict
 /// context only applies to the primary's drain.
@@ -615,7 +615,9 @@ fn build_repro_vm_builder(
     // add a bounded drain grace so the watchdog cannot fire mid-flush and truncate
     // the captured-arg payload (which the host would then fail to parse and drop
     // as "auto-repro: no probe data"). See PROBE_DRAIN_GRACE.
-    builder = builder.timeout(super::runtime::vm_timeout_from_entry(entry) + PROBE_DRAIN_GRACE);
+    builder = builder.timeout(
+        super::runtime::vm_timeout_from_entry(entry, vm_topology.total_cpus()) + PROBE_DRAIN_GRACE,
+    );
 
     // Set the auto-repro failure-dump sink to a `.repro` sibling
     // of the primary's `{name}-{variant_hash}.failure-dump.json` so the auto-repro
@@ -2531,12 +2533,12 @@ fn take_deferred_probe() -> Option<DeferredProbe> {
 /// `false` on timeout or when the file is unreadable (kernels
 /// without sched_ext or non-root probes can't read it).
 ///
-/// `disabled` means the kernel's `scx_disable_irq_workfn` ran to
-/// completion — which is exactly the path that calls
-/// `scx_claim_exit` and fires `trace_sched_ext_exit`. Polling for
-/// this transition is the most reliable signal that the trigger
-/// tracepoint has fired (or never will, in which case the timeout
-/// is the correct signal).
+/// `disabled` is set by `scx_set_enable_state(SCX_DISABLED)` at the
+/// tail of `scx_root_disable`, which runs strictly after
+/// `scx_claim_exit` (called from `scx_vexit`/`scx_disable`) fired
+/// `trace_sched_ext_exit`. Polling for this transition is the most
+/// reliable signal that the trigger tracepoint has fired (or never
+/// will, in which case the timeout is the correct signal).
 ///
 /// Polls every 50 ms — short enough to bound the post-test
 /// finalisation latency, long enough that the per-iteration
@@ -2619,11 +2621,12 @@ pub(crate) fn finalize_probe_after_unwind() {
         // loop's BSS check.
         //
         // No grace sleep after `wait_for_sched_disabled` returns
-        // true: the kernel's `scx_disable_irq_workfn` calls
-        // `scx_claim_exit` (which fires `trace_sched_ext_exit`)
-        // BEFORE `scx_set_enable_state(SCX_DISABLED)`, so a
-        // `state == disabled` observation establishes a
-        // happens-after relationship with the BPF handler's CAS
+        // true: the kernel's `scx_claim_exit` (called from
+        // `scx_vexit`/`scx_disable`) fires `trace_sched_ext_exit`
+        // BEFORE `scx_set_enable_state(SCX_DISABLED)` runs at the
+        // tail of `scx_root_disable`, so a `state == disabled`
+        // observation establishes a happens-after relationship
+        // with the BPF handler's CAS
         // on `ktstr_err_exit_detected` and the ringbuf-event
         // commit. The probe poll loop already breaks on
         // `bss_triggered` without needing `stop` set; setting

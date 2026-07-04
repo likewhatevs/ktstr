@@ -25,8 +25,11 @@
 //! The cfg split decides which thread runs `drain_bracket_impl`:
 //!
 //! - **Production (`cfg(not(test))`):** A dedicated worker thread
-//!   (`ktstr-vblk`, spawned in `with_options`) owns the
-//!   `BlkWorkerState` for the device's lifetime. The vCPU's
+//!   (`ktstr-vblk`, spawned by `respawn_worker` on the guest's
+//!   first `STATUS = DRIVER_OK`; the seed `BlkWorkerState` is
+//!   stashed in `SpawnedEngine::respawn_pending` at
+//!   `with_options` time) owns the `BlkWorkerState` for the
+//!   device's lifetime. The vCPU's
 //!   `mmio_write(QUEUE_NOTIFY)` performs a non-blocking
 //!   `kick_fd.write(1)` and returns immediately; the worker's
 //!   `epoll_wait` resumes and runs one drain iteration per kick.

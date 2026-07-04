@@ -29,7 +29,7 @@ projection + assertion surface only.
 `SampleSeries` is the ordered sequence of `(tag, report, stats,
 elapsed_ms)` tuples drained from the bridge after the VM exits. Build
 it from
-[`SnapshotBridge::drain_ordered_with_stats`](snapshots.md#wiring-the-bridge):
+[`SnapshotBridge::drain_ordered_with_stats`](periodic-capture.md):
 
 ```rust,ignore
 use ktstr::prelude::*;
@@ -154,8 +154,11 @@ non-numeric / type-mismatched fields silently. Useful for blanket
 "every counter must be nondecreasing" sweeps.
 
 **Top-level scalar fields only** for the typed `field_*` helpers.
-Nested struct members (e.g. `"ctx.weight"`) and per-CPU maps need
-the manual closure path through `SampleSeries::bpf`.
+Nested struct members (e.g. `"ctx.weight"`) need the manual closure
+path through `SampleSeries::bpf`. Per-CPU maps use the projector's
+typed helpers: the cross-CPU reductions `field_cpu_sum_*` /
+`field_cpu_max_*` / `field_cpu_min_*`, or `.cpu(n).field_*` to
+select one CPU's slot.
 
 ## The seven temporal patterns
 

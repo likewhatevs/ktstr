@@ -23,7 +23,7 @@
 //!    `hlist_nulls_head`).
 //! 3. The chain links via `bpf_local_storage_elem.map_node`. That
 //!    field is at offset 0 of the elem (asserted at BTF resolve
-//!    time in `super::super::btf_offsets::resolve_task_storage_offsets`),
+//!    time in `super::super::btf_offsets::local_storage::resolve_task_storage_offsets`),
 //!    so each chain `node_kva` IS the elem KVA.
 //! 4. For each elem: copy `value_size` bytes from
 //!    `elem + elem_sdata + sdata_data` (the cacheline-aligned
@@ -77,7 +77,9 @@ const TASK_STORAGE_BUCKETS_MAX: u32 = 1 << 16;
 /// - the map's `buckets` pointer is null (map allocation failed
 ///   between create and freeze);
 /// - the bucket count exceeds [`TASK_STORAGE_BUCKETS_MAX`] (corrupted
-///   `bucket_log`).
+///   `bucket_log`);
+/// - the map's `value_size` exceeds [`super::MAX_VALUE_SIZE`]
+///   (corrupted/torn `value_size` read).
 ///
 /// Untranslatable buckets and elems are skipped — the corresponding
 /// chain breaks but the walk continues into the next bucket.

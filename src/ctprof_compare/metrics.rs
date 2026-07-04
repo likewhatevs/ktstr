@@ -343,7 +343,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
     },
     // `nr_wakeups`, `_local`, `_remote`, `_sync`, `_migrate`
     // are class-agnostic — `__schedstat_inc` from
-    // `kernel/sched/core.c::ttwu_stat` (e.g. line 3614 for the
+    // `kernel/sched/core.c::ttwu_stat` (e.g. line 3677 for the
     // base counter) fires for every task class. The macro
     // expands to `do { } while (0)` under !CONFIG_SCHEDSTATS
     // per `kernel/sched/stats.h:75-82`.
@@ -395,8 +395,8 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
     // `nr_wakeups_affine`, `_attempts` are CFS-only —
     // `kernel/sched/fair.c::wake_affine` calls
     // `schedstat_inc(p->stats.nr_wakeups_affine_attempts)` at
-    // line 7604 and the matching `_affine` increment at line
-    // 7609. Both expand only under CFS task lifetime, so a
+    // line 7681 and the matching `_affine` increment at line
+    // 7686. Both expand only under CFS task lifetime, so a
     // task on SCHED_EXT / SCHED_FIFO / SCHED_RR / SCHED_DL
     // never accumulates them.
     CtprofMetricDef {
@@ -418,7 +418,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         section: Section::Primary,
     },
     // `nr_migrations` is incremented unconditionally at
-    // `kernel/sched/core.c:3283` (`p->se.nr_migrations++`) — no
+    // `kernel/sched/core.c:3346` (`p->se.nr_migrations++`) — no
     // schedstat macro, no class gating. Always populated.
     CtprofMetricDef {
         name: "nr_migrations",
@@ -430,7 +430,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         section: Section::Primary,
     },
     // `nr_forced_migrations` is set by
-    // `kernel/sched/fair.c:9775` (`schedstat_inc`) inside
+    // `kernel/sched/fair.c:9857` (`schedstat_inc`) inside
     // CFS-only load-balancing.
     CtprofMetricDef {
         name: "nr_forced_migrations",
@@ -443,7 +443,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
     },
     // `nr_failed_migrations_*` family — all CFS-only,
     // incremented in `kernel/sched/fair.c::can_migrate_task`
-    // (lines 9701, 9735, 9761, 9942).
+    // (lines 9783, 9817, 9843).
     CtprofMetricDef {
         name: "nr_failed_migrations_affine",
         rule: AggRule::SumCount(|t| t.nr_failed_migrations_affine),
@@ -474,7 +474,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
     // `wait_sum` / `wait_count` / `wait_max` — written by
     // `__update_stats_wait_end` (`kernel/sched/stats.c:21`),
     // which is called from `update_stats_wait_end_fair`
-    // (kernel/sched/fair.c:1426), `update_stats_wait_end_dl`
+    // (kernel/sched/fair.c:1478), `update_stats_wait_end_dl`
     // (kernel/sched/deadline.c:2114), and
     // `update_stats_wait_end_rt` (kernel/sched/rt.c:1282) —
     // i.e. CFS, RT, AND DL classes accumulate. Sched_ext bypasses
@@ -513,7 +513,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
     // `block_max` / `iowait_sum` / `iowait_count` — written by
     // `__update_stats_enqueue_sleeper` (kernel/sched/stats.c:48),
     // which is called from `update_stats_enqueue_sleeper_fair`
-    // (kernel/sched/fair.c:1452),
+    // (kernel/sched/fair.c:1504),
     // `update_stats_enqueue_sleeper_dl`
     // (kernel/sched/deadline.c:2122), and
     // `update_stats_enqueue_sleeper_rt`
@@ -596,9 +596,9 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
     // root (CAP_NET_ADMIN is implicit), so the procfs fallback
     // bought no extra coverage.
     // `exec_max` is set inside `update_se`
-    // (`kernel/sched/fair.c:1335`), guarded by
+    // (`kernel/sched/fair.c:1353`), guarded by
     // `if (schedstat_enabled())`. Reachable from sched_ext via
-    // `update_curr_common` (`kernel/sched/ext.c:1355`), so
+    // `update_curr_common` (`kernel/sched/ext.c:1343`), so
     // class-agnostic at runtime, gated only by CONFIG_SCHEDSTATS.
     CtprofMetricDef {
         name: "exec_max",
@@ -785,7 +785,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
     // `task_io_account_cancelled_write` (kernel
     // include/linux/task_io_accounting_ops.h:39-42) increments
     // `current->ioac.cancelled_write_bytes` from
-    // `folio_account_cleaned` (mm/page-writeback.c:2628) when a
+    // `folio_account_cleaned` (mm/page-writeback.c:2652) when a
     // dirty folio is reclaimed without writeback (truncate /
     // inode invalidation), so the per-thread value records on
     // the truncating task — not necessarily the original writer.

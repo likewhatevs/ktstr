@@ -235,7 +235,10 @@ fn track_event_rates_missing_counters_records_non_violation() {
 /// `track_event_rates` must not divide by zero when two consecutive
 /// samples share the same `elapsed_ms`. The `interval_s <= 0.0`
 /// guard records a non-violation and continues; a regression that
-/// dropped the guard would `NaN`-propagate into `rate`.
+/// dropped the guard would divide by the zero interval -- `+inf` on
+/// the fallback path (delta 0->1000) tripping a false violation that
+/// the `fb.worst_run == 0` assertion catches, and `NaN` on the
+/// keep_last path (0/0).
 #[test]
 fn track_event_rates_zero_interval_does_not_panic() {
     let t = MonitorThresholds::default();

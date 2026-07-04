@@ -4,7 +4,8 @@
 //! serde) without crossing the kernel boundary itself: [`WorkloadConfig`]
 //! and its [`WorkSpec`] composed entries, the per-knob enums
 //! ([`SchedPolicy`], [`SchedClass`], [`MemPolicy`], [`MpolFlags`],
-//! [`CloneMode`], [`FutexLockMode`], [`WakeMechanism`], [`AluWidth`]),
+//! [`CloneMode`], [`FutexLockMode`], [`WakeMechanism`], [`ReapMode`],
+//! [`AluWidth`]),
 //! the [`defaults`] constants `WorkType::from_name` consults, the
 //! [`humantime_serde_helper`] module the duration fields cite, and the
 //! [`resolve_work_type`] selector. The corresponding kernel-call
@@ -800,7 +801,7 @@ mod tests {
     /// every variant roundtrips through serde unchanged. Default
     /// drift would silently re-class every WorkSpec that omits
     /// `sched_policy`; serde drift would break captured config
-    /// replay across the 6 variants (one per scheduling class).
+    /// replay across all 7 variants.
     #[test]
     fn sched_policy_default_is_normal_and_serde_roundtrip_per_variant() {
         let d: SchedPolicy = Default::default();
@@ -817,11 +818,21 @@ mod tests {
                 deadline: Duration::from_millis(20),
                 period: Duration::from_millis(30),
             },
+            SchedPolicy::Ext,
         ];
         for original in &variants {
             let bytes = serde_json::to_vec(original).expect("serialize");
             let restored: SchedPolicy = serde_json::from_slice(&bytes).expect("deserialize");
             assert_eq!(restored, *original, "roundtrip drift for {original:?}");
         }
+    }
+
+    /// `SchedClass::Ext` resolves to `SchedPolicy::Ext` (the SCHED_EXT
+    /// syscall path), closing the prior gap where it mapped to `Normal`.
+    /// Pins the coarse-class -> policy mapping the verifier's SCHED_EXT
+    /// dispatch probe relies on.
+    #[test]
+    fn sched_class_ext_maps_to_sched_policy_ext() {
+        assert_eq!(SchedClass::Ext.to_policy(), SchedPolicy::Ext);
     }
 }

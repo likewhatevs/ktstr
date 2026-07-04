@@ -558,9 +558,11 @@ impl VirtioNetPci {
 
     /// Apply a common-cfg register write at BAR-region offset `off`. Each
     /// register maps to a transport-neutral core op (the gates live inside
-    /// the op); read-only registers (device_feature/num_queues/
-    /// config_generation/queue_notify_off) and the INTx-inert MSI-X
-    /// registers are dropped.
+    /// the op); the read-only registers (device_feature/num_queues/
+    /// config_generation/queue_notify_off) are dropped, while the MSI-X
+    /// vector-select registers (CC_MSIX_CONFIG/CC_QUEUE_MSIX_VECTOR) are
+    /// clamped and latched into the shared MSI-X state (INTx-inert, but
+    /// echoed back for the kernel's -EBUSY read-back).
     ///
     /// Offset-exact, natural-width (the write mirror of `common_read`): the
     /// guest writes each register at its own offset/width, and the 64-bit

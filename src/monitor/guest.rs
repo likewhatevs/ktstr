@@ -39,7 +39,7 @@ use super::symbols::{
 ///   vmalloc'd memory, module text.
 ///
 /// `Clone` is cheap: `mem` and `symbols` are `Arc` (shared, not deep-
-/// copied) and every other field is a `Copy` scalar. The freeze-coord
+/// copied) and every other field is `Copy`. The freeze-coord
 /// accessor-init worker clones the map accessor's kernel to build the
 /// prog accessor without re-parsing the vmlinux symtab or re-walking
 /// the page tables.
@@ -201,11 +201,14 @@ impl GuestKernel {
         Self::from_elf_with_hint(mem, elf, tcr_el1, cr3_pa, 0)
     }
 
-    /// Like [`Self::from_elf`] but accepts a `phys_base_hint`. When
-    /// non-zero, skips the page-table walk for `phys_base` and uses
-    /// the hint directly. The guest-reported `phys_base` (from
-    /// `/proc/iomem`) includes `kaslr_offset`, which is what
-    /// `text_kva_to_pa_with_base` needs for link-time KVAs.
+    /// Like [`Self::from_elf_with_hint`] but accepts a pre-built
+    /// `symbols: Arc<HashMap<String, u64>>` map, storing it directly
+    /// instead of parsing the ELF symtab (which
+    /// [`Self::from_elf`]/[`Self::from_elf_with_hint`] do). Also takes
+    /// the `phys_base_hint`: when non-zero, skips the page-table walk
+    /// for `phys_base` and uses the hint directly. The guest-reported
+    /// `phys_base` (from `/proc/iomem`) includes `kaslr_offset`, which
+    /// is what `text_kva_to_pa_with_base` needs for link-time KVAs.
     pub fn from_elf_with_symbols(
         mem: Arc<GuestMem>,
         symbols: Arc<HashMap<String, u64>>,
@@ -274,6 +277,11 @@ impl GuestKernel {
         })
     }
 
+    /// Like [`Self::from_elf`] but accepts a `phys_base_hint`. When
+    /// non-zero, skips the page-table walk for `phys_base` and uses
+    /// the hint directly. The guest-reported `phys_base` (from
+    /// `/proc/iomem`) includes `kaslr_offset`, which is what
+    /// `text_kva_to_pa_with_base` needs for link-time KVAs.
     pub fn from_elf_with_hint(
         mem: Arc<GuestMem>,
         elf: &goblin::elf::Elf<'_>,

@@ -5,7 +5,7 @@
 //! captures argument state, and formats annotated output with source
 //! locations.
 //!
-//! See the [Investigate a Crash](https://likewhatevs.github.io/ktstr/guide/recipes/investigate-crash.html)
+//! See the [Investigate a Crash](https://ktstr.dev/guide/recipes/investigate-crash.html)
 //! recipe.
 
 pub mod btf;

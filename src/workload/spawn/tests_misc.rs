@@ -65,9 +65,11 @@ fn start_idempotent() {
 /// arrives (proving `stop_and_collect` sees a graceful exit
 /// on this path, not a signal kill).
 ///
-/// Pairs with [`page_fault_churn_from_name_defaults`] which
-/// pins the happy path — together they pin both ends of the
-/// region_size validity domain.
+/// Pairs with [`pathology_page_fault_churn_iterates`], the
+/// runtime happy path that drives a worker through the region
+/// path with `region_kib = 256` and asserts `iterations > 0` —
+/// together they pin both ends of the region_size validity
+/// domain.
 #[test]
 fn page_fault_churn_region_kib_overflow_worker_exits_cleanly() {
     let config = WorkloadConfig {
@@ -140,7 +142,7 @@ fn mutex_contention_records_wake_latency() {
 }
 // -- pathology WorkType smoke tests --
 //
-// Each pathology variant added in #25 was implemented and
+// Each pathology variant was implemented and
 // wired into name registries but had no runtime call site.
 // These smoke tests exercise the worker body of every variant
 // for ~200ms with the minimum legal worker count and assert
@@ -550,8 +552,8 @@ fn pathology_alu_hot_populates_iteration_costs() {
 /// `num_workers == 2 * k` (k pairs); with k=1 the workers
 /// run independently because the test doesn't pin to SMT
 /// siblings — but they still iterate. Pinning to actual SMT
-/// siblings is the test author's responsibility (see
-/// follow-up #311 for the framework helper).
+/// siblings is the test author's responsibility; a
+/// framework helper is a possible follow-up.
 #[test]
 fn pathology_smt_sibling_spin_iterates() {
     let cfg = WorkloadConfig {
@@ -601,9 +603,10 @@ fn smt_sibling_spin_odd_workers_rejects() {
         "expected NonDivisibleWorkerCount for SmtSiblingSpin; got: {typed:?}",
     );
 }
-/// `WorkType::IpcVariance` smoke test at the defaults from
-/// [`defaults`]. Workers alternate hot/cold phases internally
-/// — a 200ms run completes a few outer iterations.
+/// `WorkType::IpcVariance` smoke test with explicit small knobs
+/// (`hot_iters = 1024`, `cold_iters = 64`, `period_iters = 4`).
+/// Workers alternate hot/cold phases internally — a 200ms run
+/// completes a few outer iterations.
 #[test]
 fn pathology_ipc_variance_iterates() {
     let cfg = WorkloadConfig {

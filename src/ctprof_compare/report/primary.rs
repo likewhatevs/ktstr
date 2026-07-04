@@ -1,6 +1,6 @@
 //! Primary-metrics table emitter for [`super::write_diff`].
 //!
-//! Renders the per-thread primary table (52 non-taskstats rows
+//! Renders the per-thread primary table (53 non-taskstats rows
 //! plus 34 taskstats genetlink rows). Two [`Section`] flags
 //! share the table: [`Section::Primary`] gates the non-taskstats
 //! rows; [`Section::TaskstatsDelay`] gates the genetlink rows.
@@ -53,7 +53,7 @@ pub(super) fn depth_color(depth: usize) -> comfy_table::Color {
 /// enabled — `--sections taskstats-delay` alone still emits
 /// the table containing only the 34 taskstats rows;
 /// `--sections primary` alone emits the table containing only
-/// the 52 non-taskstats rows; either combined or the empty
+/// the 53 non-taskstats rows; either combined or the empty
 /// default ("all on") emits all rows.
 pub(super) fn write_primary_section<W: fmt::Write>(
     w: &mut W,
@@ -194,10 +194,12 @@ where
     hier
 }
 
-/// Emit a cgroup-segment heading row. The leaf segment of the
-/// path renders at depth-colored bold; ancestor segments seen
-/// in `last_segments` are skipped. Returns the new
-/// `last_segments` vector for the caller to track.
+/// Emit one heading row per newly-diverging path segment: the
+/// loop skips the segments common with `last_segments` and adds
+/// a row for each remaining segment through the leaf, each at
+/// depth-colored bold. Returns `Some(segments)` (the full split
+/// path) when any heading was emitted, or `None` when the cgroup
+/// is unchanged from `last_segments` and no rows were added.
 pub(super) fn emit_cgroup_segments<'a>(
     table: &mut comfy_table::Table,
     cgroup: &'a str,
@@ -769,9 +771,11 @@ mod tests {
         );
     }
 
-    /// Build a minimal `CtprofDiff` carrying the given rows and a
-    /// `run_time_ns` sort metric so the section renderers have a
-    /// real registry-backed sort name to print in the header.
+    /// Build a minimal `CtprofDiff` wrapping the given rows with
+    /// every other field defaulted (`sort_metric_name` = `None`).
+    /// The rows carry a real `run_time_ns` `metric_name` so the
+    /// `CTPROF_METRICS` lookups in `write_primary_section` /
+    /// `render_diff_row_cells` resolve.
     fn diff_with(rows: Vec<DiffRow>) -> CtprofDiff {
         CtprofDiff {
             rows,

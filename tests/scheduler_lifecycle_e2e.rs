@@ -296,8 +296,9 @@ fn dispatch_hold_truncates_when_scheduler_dies_midstep(ctx: &Ctx) -> Result<Asse
              actual elapsed = {elapsed:?} (≥ {ceiling:?} ceiling). \
              hold_or_sched_died's mid-hold scheduler-death observation is \
              broken — the per-step hold ran to completion despite the \
-             scheduler dying. Check pidfd_wait_exit + the dispatch loop's \
-             death-observation branch in src/scenario/ops/mod.rs."
+             scheduler dying. Check hold_or_sched_died's SYS_pidfd_open + \
+             epoll wait and its sched_exit_kind error-exit latch in \
+             src/scenario/ops/mod.rs."
         )));
     }
     // Propagate the inner result so the framework's expect_err =
@@ -394,7 +395,7 @@ fn replace_with_broken_binary_surfaces_startup_died(ctx: &Ctx) -> Result<AssertR
 ///    from the boot pid). The Op handler reads SCHED_PID before
 ///    kill, SIGTERMs, waits for sched_ext state to reach
 ///    `disabled`, spawns, and the spawn helper re-publishes
-///    SCHED_PID via [`set_sched_pid`](ktstr::vmm::rust_init::set_sched_pid).
+///    SCHED_PID via `set_sched_pid`.
 /// 2. The post-restart scheduler successfully binds to sched_ext —
 ///    verified inside `spawn_scheduler_from_paths` via
 ///    `poll_scx_attached` against `/sys/kernel/sched_ext/root/ops`.

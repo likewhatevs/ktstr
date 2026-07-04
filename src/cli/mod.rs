@@ -18,17 +18,16 @@ mod testing;
 
 pub use kernel_cmd::{
     CPU_CAP_HELP, DIRTY_TREE_CACHE_SKIP_HINT, EMBEDDED_KCONFIG, EOL_EXPLANATION,
-    EXTRA_KCONFIG_HELP, KERNEL_HELP_NO_RAW, KERNEL_HELP_RAW_OK, KERNEL_LIST_LONG_ABOUT,
-    KernelCommand, NON_GIT_TREE_CACHE_SKIP_HINT, STALE_KCONFIG_EXPLANATION,
-    UNTRACKED_KCONFIG_EXPLANATION, embedded_kconfig_hash,
+    EXTRA_KCONFIG_HELP, INCLUDE_EOL_HELP, KERNEL_HELP_BUILD, KERNEL_HELP_NO_RAW,
+    KERNEL_HELP_RAW_OK, KERNEL_LIST_LONG_ABOUT, KernelCommand, NON_GIT_TREE_CACHE_SKIP_HINT,
+    STALE_KCONFIG_EXPLANATION, UNTRACKED_KCONFIG_EXPLANATION, embedded_kconfig_hash,
 };
 
 pub use kernel_list::{format_entry_row, kernel_clean, kernel_list, kernel_list_range_preview};
 
 pub use kernel_build::{
-    KernelBuildResult, append_extra_kconfig_suffix, configure_kernel, kernel_build_pipeline,
-    make_kernel_with_output, read_extra_kconfig, run_make, run_make_with_output,
-    validate_kernel_config,
+    KernelBuildResult, append_extra_kconfig_suffix, kernel_build_pipeline, make_kernel_with_output,
+    read_extra_kconfig, run_make, run_make_with_output, validate_kernel_config,
 };
 
 pub use parse::{DISK_HELP, parse_disk_arg, parse_disk_size_mib, parse_topology_string};
@@ -57,7 +56,7 @@ pub use util::{
 /// It must be `pub` (not `pub(crate)`) because those call sites live
 /// in the binary crates and thread `&FetchProgress` into the library
 /// resolvers — the same lib/bin-boundary reason [`Spinner`] is `pub`.
-/// The child-bar types (`DownloadBar`, `CloneProgress`) stay
+/// The child-bar types (`GroupBar`, `CloneProgress`) stay
 /// `pub(crate)`: only the in-crate fetch path constructs them.
 pub use progress::FetchProgress;
 
@@ -76,8 +75,9 @@ pub use crate::vmm::host_topology::CpuCap;
 /// `cargo-ktstr`'s `BuildCompareFilters::build()` plumbing. The
 /// `stats` module is `pub(crate)` (its tabular reporting types
 /// have no stable surface yet), but the `cargo-ktstr` binary needs
-/// `Dimension` and `derive_slicing_dims` to construct compare
-/// requests and to unit-test the filter-builder shape. Same
+/// `Dimension` and `derive_slicing_dims` to unit-test the
+/// filter-builder shape (the `BuildCompareFilters` tests assert
+/// which slicing dim a per-side filter pair derives). Same
 /// pattern as `CpuCap` above: keep the canonical definitions in
 /// `stats` (where the comparison plumbing consumes them
 /// internally) and re-export the slim slicing surface through
@@ -92,4 +92,7 @@ pub use crate::stats::{Dimension, derive_slicing_dims};
 /// policy is the only item in `stats` that a CLI or external
 /// consumer constructs directly; every other item is internal
 /// plumbing reached via `cli::compare_partitions`.
-pub use crate::stats::{AveragedGroup, ComparisonPolicy, PhaseDisplayOptions, RowFilter};
+pub use crate::stats::{
+    AveragedGroup, ComparisonPolicy, GateOptions, PhaseDisplayOptions, RowFilter,
+    is_render_suppressed_component, metric_def,
+};

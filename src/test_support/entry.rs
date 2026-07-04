@@ -159,7 +159,7 @@ impl SchedulerSpec {
     ///   binary commit to record.
     ///
     /// Returning `None` rather than `Some("unknown")` keeps the
-    /// sidecar schema's nullable semantics honest: `stats compare`
+    /// sidecar schema's nullable semantics honest: `perf-delta`
     /// distinguishes "unset" from "set to a sentinel" without a
     /// magic string, and a future enhancement that learns to
     /// introspect a scheduler binary can flip a single arm to
@@ -735,6 +735,175 @@ impl WatchBpfMap {
     }
 }
 
+/// A per-test performance-regression assertion that
+/// `cargo ktstr perf-delta --noise-adjust` enforces when this test is compared
+/// across two commits — and that a normal `cargo ktstr test` run IGNORES.
+///
+/// Enforced ONLY under `--noise-adjust`. A declared gate is a CI-gating perf
+/// assertion; gating on a single-run scalar comparison would flip CI on noise,
+/// so the multi-run `--noise-adjust` path (Welch + disjoint-band separation) is
+/// the only statistically sound basis. Plain `perf-delta` (scalar) does NOT
+/// evaluate declared gates — it warns that they were skipped. Declaring a gate
+/// also REQUIRES `performance_mode` (validated at compile time by the macro and
+/// at discovery time by [`KtstrTestEntry::validate`]) so the compared data is
+/// pinned.
+///
+/// Inert-as-a-test / active-under-perf-delta is by CONSTRUCTION, not a runtime
+/// flag: the in-VM verdict path consults only [`crate::assert::Assert`], never a
+/// `PerfDeltaAssertion`, so declaring one changes no normal-run verdict or exit
+/// code. It becomes active only because `perf-delta` serializes the declaration
+/// into the sidecar and consults it in the host-side `--noise-adjust` compare.
+///
+/// A declaration names a registry metric and OVERRIDES, for this test, the gate
+/// that decides a confident regression on it: a tighter relative threshold, an
+/// absolute floor, a pinned direction, and/or a phase scope. It LAYERS ON TOP of
+/// the `--noise-adjust` default all-metrics regression net (which still runs, to
+/// catch unknown-unknown regressions) — it is an explicit contract check, not a
+/// whitelist that narrows the net.
+///
+/// Declare by binding each gate to a `const` and listing it on the macro:
+/// `const RPS_GATE: PerfDeltaAssertion =
+/// PerfDeltaAssertion::new("rps_p50").with_max_regression_pct(5.0);` then
+/// `#[ktstr_test(performance_mode = true, perf_delta_assertions = [RPS_GATE])]`.
+/// Or directly on a programmatically-built [`KtstrTestEntry`]:
+/// `perf_delta_assertions: &[&RPS_GATE]` — bind the const first; a chained inline
+/// `&PerfDeltaAssertion::new(..).with_*(..)` does NOT rvalue-promote to `'static`
+/// in a non-const `KtstrTestEntry { .. }` literal (E0716). Construct via
+/// [`PerfDeltaAssertion::new`] + the `const fn` `with_*` builders; fields are
+/// crate-private so every value passes the compile-time format gate. The type is
+/// `Copy` over a `&'static str` metric (no `Drop`, E0493-safe); the owned form
+/// the sidecar serializes is a separate internal mirror,
+/// [`crate::test_support::PerfDeltaAssertionRecord`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PerfDeltaAssertion {
+    metric: &'static str,
+    direction: Option<crate::test_support::Polarity>,
+    max_regression_pct: Option<f64>,
+    min_abs: Option<f64>,
+    phase: Option<u16>,
+}
+
+impl PerfDeltaAssertion {
+    /// Const constructor for use in `static`/`const` context. `metric` is a
+    /// registry metric name (see `cargo ktstr stats list-metrics`); the
+    /// remaining knobs default to the registry values and are set via the
+    /// builders below.
+    ///
+    /// # Panics
+    ///
+    /// Panics at compile time when `metric` is empty, contains whitespace or a
+    /// path separator (`/`, `\`), or a non-printable / high-bit byte. That the
+    /// name RESOLVES in the metric registry is checked at run time by
+    /// [`KtstrTestEntry::validate`] (the registry is not const-accessible).
+    pub const fn new(metric: &'static str) -> Self {
+        let m = metric.as_bytes();
+        assert!(!m.is_empty(), "PerfDeltaAssertion metric must not be empty");
+        let mut i = 0;
+        while i < m.len() {
+            let b = m[i];
+            assert!(
+                b != b' ' && b != b'\t' && b != b'\n' && b != b'\r',
+                "PerfDeltaAssertion metric must not contain whitespace",
+            );
+            assert!(
+                b != b'/' && b != b'\\',
+                "PerfDeltaAssertion metric must not contain path separators",
+            );
+            assert!(
+                b >= 0x20 && b < 0x7f,
+                "PerfDeltaAssertion metric must be printable ASCII only",
+            );
+            i += 1;
+        }
+        Self {
+            metric,
+            direction: None,
+            max_regression_pct: None,
+            min_abs: None,
+            phase: None,
+        }
+    }
+
+    /// Override the relative-regression gate (percent) for this metric: a
+    /// worsening move larger than `pct`% of the baseline gates. `None` (unset)
+    /// inherits the registry `default_rel`. `pct` must be finite and `>= 0`
+    /// (enforced at discovery time by [`KtstrTestEntry::validate`]).
+    pub const fn with_max_regression_pct(mut self, pct: f64) -> Self {
+        self.max_regression_pct = Some(pct);
+        self
+    }
+
+    /// Override the absolute-materiality floor for this metric: a move smaller
+    /// than `min` in absolute units never gates, regardless of the relative
+    /// threshold. `None` (unset) inherits the registry `default_abs`. `min` must
+    /// be finite and `>= 0` (enforced at discovery time by
+    /// [`KtstrTestEntry::validate`]).
+    pub const fn with_min_abs(mut self, min: f64) -> Self {
+        self.min_abs = Some(min);
+        self
+    }
+
+    /// Pin the regression DIRECTION for this metric instead of inheriting the
+    /// registry polarity (e.g. assert a metric the registry treats as
+    /// `Informational` as `LowerBetter` for this test).
+    ///
+    /// # Panics
+    ///
+    /// Panics at compile time on [`crate::test_support::Polarity::TargetValue`]:
+    /// symmetric target-distance gating is not implemented, and the compare
+    /// polarity path would silently treat it as increase-is-worse. Use
+    /// `HigherBetter`, `LowerBetter`, or `Informational`.
+    pub const fn with_direction(mut self, polarity: crate::test_support::Polarity) -> Self {
+        assert!(
+            !matches!(polarity, crate::test_support::Polarity::TargetValue(_)),
+            "PerfDeltaAssertion::with_direction does not support Polarity::TargetValue \
+             (symmetric target-distance gating is unimplemented); use HigherBetter, \
+             LowerBetter, or Informational",
+        );
+        self.direction = Some(polarity);
+        self
+    }
+
+    /// Scope the assertion to a single phase (`step_index`: `0` = BASELINE,
+    /// `1..=N` = scenario `Step` ordinals). `None` (unset) gates the aggregate
+    /// (whole-run) value. Unlike the render-only per-phase spread tables, a
+    /// phase-scoped assertion DOES contribute to the `perf-delta --noise-adjust`
+    /// exit code (the scalar `perf-delta` path warns and skips all declared
+    /// gates, phase-scoped included).
+    pub const fn with_phase(mut self, step_index: u16) -> Self {
+        self.phase = Some(step_index);
+        self
+    }
+
+    /// The registry metric name this assertion gates.
+    pub const fn metric(&self) -> &'static str {
+        self.metric
+    }
+
+    /// The pinned regression direction, or `None` to inherit the registry
+    /// polarity.
+    pub const fn direction(&self) -> Option<crate::test_support::Polarity> {
+        self.direction
+    }
+
+    /// The relative-regression override (percent), or `None` for the registry
+    /// `default_rel`.
+    pub const fn max_regression_pct(&self) -> Option<f64> {
+        self.max_regression_pct
+    }
+
+    /// The absolute-materiality override, or `None` for the registry
+    /// `default_abs`.
+    pub const fn min_abs(&self) -> Option<f64> {
+        self.min_abs
+    }
+
+    /// The phase scope (`step_index`), or `None` to gate the aggregate value.
+    pub const fn phase(&self) -> Option<u16> {
+        self.phase
+    }
+}
+
 /// Gauntlet topology filtering constraints.
 ///
 /// Controls which gauntlet presets are eligible for a test entry.
@@ -1044,7 +1213,7 @@ pub struct Scheduler {
     /// zero-overrides baseline) chained through the `Assert` builder
     /// methods. The `Assert` builder surface (every overridable
     /// threshold + scheduler-tunable knob) is documented at the
-    /// [Checking](https://likewhatevs.github.io/ktstr/guide/concepts/checking.html)
+    /// [Checking](https://ktstr.dev/guide/concepts/checking.html)
     /// guide chapter; see [`crate::assert::Assert`] for the full
     /// per-method threshold list.
     pub assert: crate::assert::Assert,
@@ -1082,7 +1251,7 @@ pub struct Scheduler {
     /// `cargo ktstr verifier --kernel <SPEC>` CLI flag. Accepts exact
     /// versions (`"6.14"`), closed ranges spelled either `..` or `..=`
     /// (`"6.14..7.0"` or `"6.14..=7.0"` — both inclusive on both
-    /// endpoints), git refs (`"git+URL#REF"`), paths, and cache keys.
+    /// endpoints), git refs (`"git+URL#tag=NAME"`), paths, and cache keys.
     ///
     /// The verifier sweep matrix is driven by the operator's
     /// `cargo ktstr verifier --kernel <SPEC>` set (which the
@@ -1588,6 +1757,19 @@ pub struct KtstrTestEntry {
     /// available. The four host-side optimizations (vCPU pinning,
     /// hugepages, NUMA mbind, RT scheduling) apply.
     pub performance_mode: bool,
+    /// Per-test performance-regression assertions enforced ONLY by
+    /// `cargo ktstr perf-delta --noise-adjust` (inert under a normal
+    /// `cargo ktstr test` run — the in-VM verdict never consults them — and
+    /// skipped-with-a-warning under a scalar `perf-delta` without
+    /// `--noise-adjust`, since single-run gating would flip CI on noise). Each
+    /// [`PerfDeltaAssertion`] names a registry metric and overrides the
+    /// confident-regression gate for it (relative / absolute threshold,
+    /// direction, phase scope), LAYERED ON TOP of the `--noise-adjust` default
+    /// all-metrics net. Serialized into the sidecar so the host-side compare can
+    /// read the declaration. `&[]` = no per-test assertions. Requires
+    /// `performance_mode` (checked by [`Self::validate`] and the macro) — a
+    /// declaration on a non-perf test would compare unpinned, noisy data.
+    pub perf_delta_assertions: &'static [&'static PerfDeltaAssertion],
     /// Enable the virtio-PCI transport: a host bridge at `00:00.0`
     /// plus the PCI0 ECAM/CAM config-access windows. When `false`, no
     /// PCI host bridge is exposed and the guest cmdline carries
@@ -2052,6 +2234,7 @@ impl KtstrTestEntry {
         bpf_map_write: &[],
         watch_bpf_maps: &[],
         performance_mode: false,
+        perf_delta_assertions: &[],
         pci: false,
         no_perf_mode: false,
         duration: Duration::from_secs(12),
@@ -2600,6 +2783,30 @@ pub struct SchedulerJson {
     pub constraints: TopologyConstraintsJson,
 }
 
+/// A [`SchedulerJson`] plus the number of `#[ktstr_test]`s declared against
+/// it. Emitted (as a JSON array) by the `--ktstr-list-schedulers` probe so
+/// `cargo ktstr affected` can enumerate declared schedulers AND skip those
+/// with zero tests when producing its CI matrix, in one probe.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SchedulerListEntry {
+    /// The projected scheduler.
+    pub scheduler: SchedulerJson,
+    /// Count of registered [`KtstrTestEntry`]s whose scheduler is this one.
+    pub test_count: usize,
+}
+
+/// A single `#[ktstr_test]` paired with its declared scheduler's name. Emitted
+/// (as a JSON array) by the `--ktstr-list-scheduler-tests` probe so `--relevant`
+/// can map each test to its scheduler and select the tests whose scheduler a
+/// diff affects.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SchedulerTestJson {
+    /// The `#[ktstr_test]` function name, as registered.
+    pub test: String,
+    /// The declared scheduler's name (the `SchedulerJson::name` field).
+    pub scheduler: String,
+}
+
 /// JSON-friendly form of [`SchedulerSpec`] tagged so the verifier
 /// dispatch can exhaustively `match` on the variant. `Discover` and
 /// `Path` both carry a string identifier; `Eevdf` and
@@ -2761,12 +2968,15 @@ impl SchedulerJson {
 
 ::ctor::declarative::ctor! {
 /// Ctor that intercepts `--ktstr-list-schedulers` before `main()` runs.
-/// Walks [`KTSTR_SCHEDULERS`], serializes each entry to JSON via
-/// [`SchedulerJson::from_scheduler`], prints the resulting array on
-/// stdout, and exits with status 0.
+/// Walks [`KTSTR_SCHEDULERS`], emits a [`SchedulerListEntry`] per scheduler
+/// (its [`SchedulerJson`] projection plus the count of [`KTSTR_TESTS`]
+/// declared against it) as a single JSON array on stdout, and exits with
+/// status 0.
 ///
 /// One ctor per binary, regardless of how many schedulers the binary
-/// registers — walks the slice once and emits a single JSON array.
+/// registers — walks the slices once and emits a single JSON array. The
+/// `test_count` is what lets `cargo ktstr affected` drop zero-test schedulers
+/// from its CI matrix without a second probe.
 ///
 /// Uses ctor's declarative `ctor::declarative::ctor! { ... }` form;
 /// the proc-macro `#[ctor::ctor(...)]` form is re-exported at
@@ -2776,11 +2986,45 @@ fn __ktstr_list_schedulers() {
     if !std::env::args().any(|a| a == "--ktstr-list-schedulers") {
         return;
     }
-    let entries: Vec<SchedulerJson> = KTSTR_SCHEDULERS
+    // Count declared tests per scheduler name (a scheduler with no test still
+    // appears, with test_count 0).
+    let mut test_counts: std::collections::HashMap<&'static str, usize> =
+        std::collections::HashMap::new();
+    for t in KTSTR_TESTS.iter() {
+        *test_counts.entry(t.scheduler.name).or_insert(0) += 1;
+    }
+    let entries: Vec<SchedulerListEntry> = KTSTR_SCHEDULERS
         .iter()
-        .map(|s| SchedulerJson::from_scheduler(s))
+        .map(|s| SchedulerListEntry {
+            scheduler: SchedulerJson::from_scheduler(s),
+            test_count: test_counts.get(s.name).copied().unwrap_or(0),
+        })
         .collect();
     let json = ::serde_json::to_string(&entries).expect("serialize schedulers");
+    println!("{json}");
+    std::process::exit(0);
+}
+}
+
+::ctor::declarative::ctor! {
+/// Ctor that intercepts `--ktstr-list-scheduler-tests` before `main()` runs.
+/// Walks [`KTSTR_TESTS`], emits a [`SchedulerTestJson`] per test (its name and
+/// its declared scheduler's name) as a single JSON array on stdout, and exits
+/// 0. Distinct from `--ktstr-list-schedulers`: this is test-NAME level, spawned
+/// only for a `--relevant` run to map each test to its scheduler.
+#[ctor(unsafe)]
+fn __ktstr_list_scheduler_tests() {
+    if !std::env::args().any(|a| a == "--ktstr-list-scheduler-tests") {
+        return;
+    }
+    let entries: Vec<SchedulerTestJson> = KTSTR_TESTS
+        .iter()
+        .map(|t| SchedulerTestJson {
+            test: t.name.to_string(),
+            scheduler: t.scheduler.name.to_string(),
+        })
+        .collect();
+    let json = ::serde_json::to_string(&entries).expect("serialize scheduler tests");
     println!("{json}");
     std::process::exit(0);
 }
@@ -3003,7 +3247,6 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
-            metric_bounds: None,
         };
         let entry = KtstrTestEntry::DEFAULT
             .with_name("clear_test")
@@ -3031,7 +3274,6 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
-            metric_bounds: None,
         };
         let entry = KtstrTestEntry {
             name: "payload_entry",
@@ -3056,17 +3298,11 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
-            metric_bounds: None,
         };
         // stress-ng emits progress / metrics / summaries to stderr; stdout
         // is blank. `OutputFormat::Json` yields zero metrics — stdout has
         // nothing JSON-shaped to parse, and the stderr fallback sees prose
         // rather than JSON so the extraction pipeline returns empty.
-        // `OutputFormat::LlmExtract` MAY extract numbers from the stderr
-        // fallback, but results depend on the local model's tolerance for
-        // stress-ng's prose format — unstable without a stderr→stdout
-        // redirect wired into `default_args`. Keep `ExitCode` unless you
-        // are prepared for that tradeoff.
         const STRESS_NG: Payload = Payload {
             name: "stress-ng",
             kind: PayloadKind::Binary("stress-ng"),
@@ -3077,7 +3313,6 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
-            metric_bounds: None,
         };
         let entry = KtstrTestEntry {
             name: "multi_workload",
@@ -3107,7 +3342,6 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
-            metric_bounds: None,
         };
         fn good_test_func(_: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -3148,17 +3382,11 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
-            metric_bounds: None,
         };
         // stress-ng emits progress / metrics / summaries to stderr; stdout
         // is blank. `OutputFormat::Json` yields zero metrics — stdout has
         // nothing JSON-shaped to parse, and the stderr fallback sees prose
         // rather than JSON so the extraction pipeline returns empty.
-        // `OutputFormat::LlmExtract` MAY extract numbers from the stderr
-        // fallback, but results depend on the local model's tolerance for
-        // stress-ng's prose format — unstable without a stderr→stdout
-        // redirect wired into `default_args`. Keep `ExitCode` unless you
-        // are prepared for that tradeoff.
         const STRESS_NG: Payload = Payload {
             name: "stress-ng",
             kind: PayloadKind::Binary("stress-ng"),
@@ -3169,7 +3397,6 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
-            metric_bounds: None,
         };
         fn good_test_func(_: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -3185,7 +3412,8 @@ mod tests {
 
     // -- staged_schedulers validation tests --
     //
-    // KtstrTestEntry::validate at L1556 walks staged_schedulers and
+    // KtstrTestEntry::validate (in entry_validate.rs, via
+    // validate_basics_and_staging) walks staged_schedulers and
     // enforces (a) per-name shape rules via the delegated
     // validate_staged_scheduler_name + (b) within-set uniqueness
     // via the BTreeSet insert. Both are silent-data-loss classes
@@ -3560,6 +3788,182 @@ mod tests {
         entry
             .validate()
             .expect("cpu_budget + no_perf_mode must validate");
+    }
+
+    /// `validate()` rejects `perf_delta_assertions` without
+    /// `performance_mode` — a declared regression gate is only meaningful on
+    /// a pinned run (mirrors the macro's compile-time reject). Guards the
+    /// programmatic-construction path.
+    #[test]
+    fn validate_rejects_perf_delta_assertions_without_performance_mode() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        const GATE: PerfDeltaAssertion = PerfDeltaAssertion::new("worst_spread");
+        let entry = KtstrTestEntry {
+            name: "gate_no_perf_mode",
+            func: good_test_func,
+            perf_delta_assertions: &[&GATE],
+            performance_mode: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("perf_delta_assertions without performance_mode must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("perf_delta_assertions") && msg.contains("performance_mode"),
+            "expected perf_delta_assertions/performance_mode diagnostic, got: {msg}",
+        );
+    }
+
+    /// `validate()` rejects a `perf_delta_assertions` metric that does not
+    /// resolve in the registry — `PerfDeltaAssertion::new` validates only the
+    /// NAME FORMAT at compile time (the registry is not const-accessible), so a
+    /// typo'd-but-well-formed metric name is caught here at run time. Without it
+    /// the gate would silently never match a captured field.
+    #[test]
+    fn validate_rejects_perf_delta_assertions_unknown_metric() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        const GATE: PerfDeltaAssertion = PerfDeltaAssertion::new("totally_made_up_metric");
+        let entry = KtstrTestEntry {
+            name: "gate_unknown_metric",
+            func: good_test_func,
+            perf_delta_assertions: &[&GATE],
+            performance_mode: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("an unregistered metric must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("totally_made_up_metric") && msg.contains("unknown metric"),
+            "expected unknown-metric diagnostic, got: {msg}",
+        );
+    }
+
+    /// A well-formed, registry-resolving gate under `performance_mode` is the
+    /// legitimate shape — pins the happy path against the two rejection paths so
+    /// a future edit can't flip polarity and reject every valid declared gate.
+    #[test]
+    fn validate_accepts_perf_delta_assertions_with_performance_mode_and_known_metric() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        const GATE: PerfDeltaAssertion = PerfDeltaAssertion::new("worst_spread")
+            .with_max_regression_pct(5.0)
+            .with_min_abs(0.5);
+        let entry = KtstrTestEntry {
+            name: "gate_ok",
+            func: good_test_func,
+            perf_delta_assertions: &[&GATE],
+            performance_mode: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry
+            .validate()
+            .expect("a known metric under performance_mode must validate");
+    }
+
+    /// `validate()` rejects a gate on a render-suppressed rate COMPONENT: it
+    /// resolves in the registry (so the unknown-metric check passes) but never
+    /// surfaces a compare finding, so the gate could never fire.
+    #[test]
+    fn validate_rejects_perf_delta_assertions_render_suppressed_component() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        const GATE: PerfDeltaAssertion = PerfDeltaAssertion::new("total_phase_iterations");
+        let entry = KtstrTestEntry {
+            name: "gate_suppressed_component",
+            func: good_test_func,
+            perf_delta_assertions: &[&GATE],
+            performance_mode: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("a render-suppressed component gate must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("total_phase_iterations") && msg.contains("render-suppressed"),
+            "expected render-suppressed-component diagnostic, got: {msg}",
+        );
+    }
+
+    /// `validate()` rejects a negative or NaN threshold override — either would
+    /// silently disable or invert the gate in classify_noise.
+    #[test]
+    fn validate_rejects_perf_delta_assertions_negative_or_nan_threshold() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        const NEG: PerfDeltaAssertion =
+            PerfDeltaAssertion::new("worst_spread").with_max_regression_pct(-1.0);
+        let e1 = KtstrTestEntry {
+            name: "gate_neg_pct",
+            func: good_test_func,
+            perf_delta_assertions: &[&NEG],
+            performance_mode: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert!(
+            format!("{}", e1.validate().unwrap_err()).contains("max_regression_pct"),
+            "a negative relative threshold must be rejected",
+        );
+        const NAN_ABS: PerfDeltaAssertion =
+            PerfDeltaAssertion::new("worst_spread").with_min_abs(f64::NAN);
+        let e2 = KtstrTestEntry {
+            name: "gate_nan_abs",
+            func: good_test_func,
+            perf_delta_assertions: &[&NAN_ABS],
+            performance_mode: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert!(
+            format!("{}", e2.validate().unwrap_err()).contains("min_abs"),
+            "a NaN absolute floor must be rejected",
+        );
+    }
+
+    /// `validate()` rejects two gates on the same (metric, phase): the compare
+    /// applies only the first via `.find()` and silently drops the rest.
+    #[test]
+    fn validate_rejects_perf_delta_assertions_duplicate_metric_phase() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        const A: PerfDeltaAssertion =
+            PerfDeltaAssertion::new("worst_spread").with_max_regression_pct(5.0);
+        const B: PerfDeltaAssertion = PerfDeltaAssertion::new("worst_spread").with_min_abs(1.0);
+        let entry = KtstrTestEntry {
+            name: "gate_dup",
+            func: good_test_func,
+            perf_delta_assertions: &[&A, &B],
+            performance_mode: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("duplicate (metric, phase) gates must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("more than one gate") && msg.contains("worst_spread"),
+            "expected duplicate-gate diagnostic, got: {msg}",
+        );
+    }
+
+    /// `PerfDeltaAssertion::with_direction` panics on `Polarity::TargetValue`:
+    /// symmetric target-distance gating is unimplemented and the compare would
+    /// misclassify it as increase-is-worse.
+    #[test]
+    #[should_panic(expected = "TargetValue")]
+    fn with_direction_rejects_target_value() {
+        let _ = PerfDeltaAssertion::new("worst_spread")
+            .with_direction(crate::test_support::Polarity::TargetValue(5.0));
     }
 
     /// `validate()` rejects `num_snapshots` greater than the bridge
@@ -4831,7 +5235,6 @@ mod tests {
             include_files: &["fio"],
             uses_parent_pgrp: false,
             known_flags: None,
-            metric_bounds: None,
         };
         static WL_A: crate::test_support::Payload = crate::test_support::Payload {
             name: "wl_a",
@@ -4843,7 +5246,6 @@ mod tests {
             include_files: &["stress-ng"],
             uses_parent_pgrp: false,
             known_flags: None,
-            metric_bounds: None,
         };
         static WL_B: crate::test_support::Payload = crate::test_support::Payload {
             name: "wl_b",
@@ -4855,7 +5257,6 @@ mod tests {
             include_files: &["schbench"],
             uses_parent_pgrp: false,
             known_flags: None,
-            metric_bounds: None,
         };
         static WORKLOADS: &[&crate::test_support::Payload] = &[&WL_A, &WL_B];
         let entry = KtstrTestEntry {
@@ -6194,12 +6595,13 @@ mod tests {
         assert!(json.constraints.requires_smt);
     }
 
-    /// The projected `SchedulerJson` survives a serde JSON
-    /// round-trip with field-for-field equality — the wire shape the
-    /// `--ktstr-list-schedulers` ctor serializes is the exact shape a
-    /// consumer deserializes. Exercises the `#[serde(tag = "kind",
-    /// content = "value")]` adjacent tagging on `BinaryKindJson`
-    /// (Discover serializes as `{"kind":"discover","value":"..."}`).
+    /// The projected `SchedulerJson` survives a serde JSON round-trip with
+    /// field-for-field equality — it is the `scheduler` field of each
+    /// [`SchedulerListEntry`] the `--ktstr-list-schedulers` ctor serializes,
+    /// so this is the exact shape a consumer deserializes. Exercises the
+    /// `#[serde(tag = "kind", content = "value")]` adjacent tagging on
+    /// `BinaryKindJson` (Discover serializes as
+    /// `{"kind":"discover","value":"..."}`).
     #[test]
     fn from_scheduler_json_roundtrips_through_serde() {
         let s = Scheduler::named("rt")
@@ -6219,5 +6621,48 @@ mod tests {
             back, json,
             "SchedulerJson must round-trip through serde unchanged"
         );
+    }
+
+    /// [`SchedulerListEntry`] — the `--ktstr-list-schedulers` wire element (a
+    /// [`SchedulerJson`] plus `test_count`) — survives a serde round-trip
+    /// field-for-field, the exact shape `cargo ktstr affected` deserializes.
+    #[test]
+    fn scheduler_list_entry_roundtrips_through_serde() {
+        let s = Scheduler::named("rt")
+            .binary_discover("scx_rt")
+            .topology(1, 2, 4, 2)
+            .kernels(&["6.14"]);
+        let entry = SchedulerListEntry {
+            scheduler: SchedulerJson::from_scheduler(&s),
+            test_count: 3,
+        };
+        let text = serde_json::to_string(&entry).expect("serialize SchedulerListEntry");
+        assert!(
+            text.contains("\"test_count\":3"),
+            "test_count must serialize, got: {text}"
+        );
+        let back: SchedulerListEntry =
+            serde_json::from_str(&text).expect("deserialize SchedulerListEntry");
+        assert_eq!(back, entry, "SchedulerListEntry must round-trip unchanged");
+    }
+
+    /// [`SchedulerTestJson`] — the `--ktstr-list-scheduler-tests` wire element
+    /// (test name + its scheduler's name) — survives a serde round-trip
+    /// field-for-field, the exact shape `cargo ktstr --relevant` deserializes to
+    /// map each test to its scheduler.
+    #[test]
+    fn scheduler_test_json_roundtrips_through_serde() {
+        let entry = SchedulerTestJson {
+            test: "boot_smoke".to_string(),
+            scheduler: "scx_rt".to_string(),
+        };
+        let text = serde_json::to_string(&entry).expect("serialize SchedulerTestJson");
+        assert!(
+            text.contains("\"test\":\"boot_smoke\"") && text.contains("\"scheduler\":\"scx_rt\""),
+            "both fields must serialize, got: {text}"
+        );
+        let back: SchedulerTestJson =
+            serde_json::from_str(&text).expect("deserialize SchedulerTestJson");
+        assert_eq!(back, entry, "SchedulerTestJson must round-trip unchanged");
     }
 }

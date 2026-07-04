@@ -476,7 +476,7 @@ fn kaslr_off_watch_snapshot_jiffies_64_errs(ctx: &Ctx) -> Result<AssertResult> {
     )];
     // execute_steps wraps step-level errors into Ok(failed_AssertResult)
     // via run_scenario's err→stamped-fail conversion at
-    // src/scenario/ops/mod.rs:939-955. Match the canonical pattern
+    // src/scenario/ops/mod.rs:1269-1288. Match the canonical pattern
     // pinned in tests/snapshot_e2e.rs (watch_snapshot_op_unresolvable_
     // symbol_bails_immediately): unwrap Ok, assert is_fail(), grep the
     // recorded detail for the typed diagnostic substring.

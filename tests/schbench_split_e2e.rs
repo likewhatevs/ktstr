@@ -70,7 +70,7 @@ fn schbench_split_runs_in_vm(ctx: &Ctx) -> Result<AssertResult> {
     // split_percent(Some(50)): half the cache footprint is the per-thread private
     // matrix, half is the ONE shared matrix every worker contends on. Two worker
     // threads make the shared-matrix writes genuinely concurrent. WorkType::Schbench
-    // mandates a single ktstr worker (the message/worker topology is internal).
+    // should use a single ktstr worker (the message/worker topology is internal).
     let cfg = SchbenchConfig::default()
         .worker_threads(2)
         .split_percent(Some(50));

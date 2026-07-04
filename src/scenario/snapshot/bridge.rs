@@ -281,8 +281,9 @@ pub(super) struct SnapshotStore {
     /// stored under the same tag in `reports`. Periodic captures
     /// populate this when a stats client is wired and the request
     /// succeeds; on-demand / watchpoint paths leave the entry
-    /// absent. Sample::stats reads `stats.get(tag)` — `None` is the
-    /// expected shape for non-periodic tags or when the scheduler
+    /// absent. `drain_ordered_with_stats` `remove`s the per-tag slot
+    /// and surfaces it as `Sample::stats`; an absent/`None` slot is
+    /// the expected shape for non-periodic tags or when the scheduler
     /// stats request failed.
     pub(super) stats: HashMap<String, Result<serde_json::Value, super::error::MissingStatsReason>>,
     /// Elapsed milliseconds since `run_start` at the moment the
@@ -797,9 +798,11 @@ impl SnapshotBridge {
             // kernel-scheduling-tick latency. Distinct from the
             // accessor_ready_evt the coord drains (no second-
             // consumer race). Reaching poll_dispatcher_wake without
-            // an installed wake fd panics — the early-return at L679
-            // gates this branch on accessor_worker_state.is_some()
-            // and with_accessor_state stores both together.
+            // an installed wake fd panics — the `(Some, Some)` match
+            // / `return Ok(0)` at the top of this function gates this
+            // branch on both accessor_publish_seqno and
+            // accessor_worker_state being present, and
+            // with_accessor_state stores both together.
             let remaining = deadline.saturating_duration_since(now);
             self.poll_dispatcher_wake(remaining);
         }
@@ -1357,15 +1360,16 @@ impl SnapshotBridge {
     }
 
     /// Take ownership of the captured snapshots, leaving the bridge
-    /// empty. Drops any periodic-capture stats / elapsed metadata
-    /// stored alongside reports — callers that need the stats JSON
-    /// or per-sample timestamp must use
+    /// empty. Drops any periodic-capture stats / elapsed / boundary-
+    /// offset metadata stored alongside reports — callers that need
+    /// the stats JSON or per-sample timestamp must use
     /// [`Self::drain_ordered_with_stats`] instead.
     pub fn drain(&self) -> HashMap<String, FailureDumpReport> {
         let mut store = self.snapshots.lock_unpoisoned();
         store.order.clear();
         store.stats.clear();
         store.elapsed_ms.clear();
+        store.boundary_offset_ms.clear();
         store.step_index.clear();
         std::mem::take(&mut store.reports)
     }
@@ -1394,11 +1398,12 @@ impl SnapshotBridge {
         let mut store = self.snapshots.lock_unpoisoned();
         let order = std::mem::take(&mut store.order);
         let mut reports = std::mem::take(&mut store.reports);
-        // Stats / elapsed / step_index are dropped with the bridge —
-        // callers that need the parallel data must use
-        // `drain_ordered_with_stats` instead.
+        // Stats / elapsed / boundary_offset / step_index are dropped
+        // with the bridge — callers that need the parallel data must
+        // use `drain_ordered_with_stats` instead.
         store.stats.clear();
         store.elapsed_ms.clear();
+        store.boundary_offset_ms.clear();
         store.step_index.clear();
         let mut out: Vec<(String, FailureDumpReport)> = Vec::with_capacity(order.len());
         for tag in order {

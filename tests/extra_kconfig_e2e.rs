@@ -43,7 +43,7 @@
 //! mkdir -p /tmp/extras
 //! printf '# CONFIG_BPF_SYSCALL is not set\n' > /tmp/extras/bad.kconfig
 //! cargo ktstr kernel build \
-//!     --source ../linux \
+//!     --kernel ../linux \
 //!     --extra-kconfig /tmp/extras/bad.kconfig \
 //!     --force
 //! # → exit 1, stderr contains "CONFIG_BPF_SYSCALL not set"
@@ -55,8 +55,10 @@ use std::process::Command;
 /// Path to the linux source tree used by the E2E test.
 ///
 /// Resolved at runtime (the binary doesn't move between compile and
-/// run) so a missing tree produces a clean skip rather than a
-/// `compile_error!`. The convention is `../linux` relative to the
+/// run) so a missing tree fails the test at runtime with an
+/// actionable prerequisite message (the `assert!` in
+/// `extra_kconfig_e2e_validate_rejects_disabled_bpf_syscall`) rather
+/// than a `compile_error!`. The convention is `../linux` relative to the
 /// ktstr crate root (matching the kernel build patterns used
 /// throughout the project).
 fn linux_source_dir() -> PathBuf {
@@ -119,7 +121,7 @@ fn extra_kconfig_e2e_validate_rejects_disabled_bpf_syscall() {
     std::fs::write(&fragment_path, "# CONFIG_BPF_SYSCALL is not set\n")
         .expect("write malicious kconfig fragment");
 
-    // Spawn `cargo-ktstr kernel build --source ../linux
+    // Spawn `cargo-ktstr kernel build --kernel ../linux
     // --extra-kconfig <tempfile> --force`. The `--force` defeats the
     // cache lookup so every run reaches the configure + build +
     // validate pipeline.
@@ -127,7 +129,7 @@ fn extra_kconfig_e2e_validate_rejects_disabled_bpf_syscall() {
         .arg("ktstr") // cargo-ktstr is invoked via cargo's "cargo-X" -> "X" arg shim
         .arg("kernel")
         .arg("build")
-        .arg("--source")
+        .arg("--kernel")
         .arg(&source)
         .arg("--extra-kconfig")
         .arg(&fragment_path)

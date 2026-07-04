@@ -66,7 +66,10 @@ impl<'a> SnapshotEntry<'a> {
 
     /// Look up the entry's KEY side along a dotted path. Mirror
     /// of [`Self::get`] but operates on the key's rendered
-    /// structure (HASH / PERCPU_HASH only).
+    /// structure. Supports the three key-bearing variants: `Hash`
+    /// and `PercpuHash` walk their rendered key; `Percpu` returns
+    /// its u32 key as [`SnapshotField::PercpuKey`] for an empty
+    /// path (and `TypeMismatch` for a non-empty path).
     pub fn key(&self, path: &str) -> SnapshotField<'a> {
         match self {
             SnapshotEntry::Hash(e) => match e.key.as_ref() {
@@ -105,7 +108,9 @@ impl<'a> SnapshotEntry<'a> {
 
     // -----------------------------------------------------------------
     // Per-CPU aggregators. Apply only to `Percpu` / `PercpuHash`
-    // entries; other variants return `Err(TypeMismatch)`. Inside the
+    // entries; other variants return an `Err`: `Hash` / `Value`
+    // yield `TypeMismatch`, `Missing` propagates its captured error.
+    // Inside the
     // per_cpu vec, slots whose value is `None` (CPU unmapped / out of
     // range — see `read_percpu_array_value` semantics) skip the
     // aggregation; slots whose rendered value can't decode to the

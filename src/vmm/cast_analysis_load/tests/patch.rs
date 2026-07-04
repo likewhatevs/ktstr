@@ -1224,7 +1224,7 @@ fn build_fwd_index_indexes_single_btf_structs() {
     let n_bar = push_btf_name(&mut strings, "bar");
     let n_x = push_btf_name(&mut strings, "x");
     let types = vec![
-        // id 1: u64 (skipped by the indexer — only Struct/Union)
+        // id 1: u64 (skipped by the indexer — Int is not a Struct/Union/Typedef)
         SynKind::Int {
             name_off: n_int,
             size: 8,

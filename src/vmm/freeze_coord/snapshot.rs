@@ -30,16 +30,6 @@ use super::super::vcpu::{ImmediateExitHandle, WatchpointArm, vcpu_signal};
 use super::state::SnapshotRequest;
 use crate::vmm::KERNEL_HALF_CANONICAL as KERNEL_HALF_CANONICAL_4LEVEL;
 
-/// Frame a `MSG_TYPE_SNAPSHOT_REPLY` TLV — header (16 bytes) plus
-/// [`crate::vmm::wire::SnapshotReplyPayload`] (520 bytes) — into a
-/// single buffer the coordinator pushes through
-/// [`crate::vmm::virtio_console::VirtioConsole::queue_input_port1`].
-/// The reply is delivered atomically as one TLV: the buffer is
-/// concatenated before the call so a partial push that splits header
-/// and payload across multiple `queue_input_port1` invocations cannot
-/// arise. CRC32 is computed over the payload bytes only — matches
-/// the wire-format contract `parse_tlv_stream` enforces on the
-/// guest's `read_bulk_port_frame`.
 /// Frame a `MSG_TYPE_KERNEL_OP_REPLY` TLV — header (16 bytes) plus
 /// the postcard-encoded [`crate::vmm::wire::KernelOpReplyPayload`]
 /// — into a single buffer the coordinator pushes through
@@ -74,6 +64,16 @@ pub(super) fn frame_kernel_op_reply(
     Ok(buf)
 }
 
+/// Frame a `MSG_TYPE_SNAPSHOT_REPLY` TLV — header (16 bytes) plus
+/// [`crate::vmm::wire::SnapshotReplyPayload`] (520 bytes) — into a
+/// single buffer the coordinator pushes through
+/// [`crate::vmm::virtio_console::VirtioConsole::queue_input_port1`].
+/// The reply is delivered atomically as one TLV: the buffer is
+/// concatenated before the call so a partial push that splits header
+/// and payload across multiple `queue_input_port1` invocations cannot
+/// arise. CRC32 is computed over the payload bytes only — matches
+/// the wire-format contract `parse_tlv_stream` enforces on the
+/// guest's `read_bulk_port_frame`.
 pub(super) fn frame_snapshot_reply(request_id: u32, status: u32, reason: &str) -> Vec<u8> {
     use crate::vmm::wire::{
         FRAME_HEADER_SIZE, MSG_TYPE_SNAPSHOT_REPLY, SNAPSHOT_REASON_MAX, ShmMessage,
@@ -662,15 +662,17 @@ mod snapshot_tagged_path_tests {
     /// Path with only an extension and no recognisable stem
     /// (`/tmp/run/.json` — a hidden-file convention with no name)
     /// falls back to the `"dump"` literal in the `unwrap_or`
-    /// clause. `Path::file_stem` on `.json` returns `None` so the
-    /// fallback is exercised; the suffix strip is a no-op on
-    /// `"dump"` so the resulting filename is
-    /// `dump.snapshot.{tag}.json`.
+    /// clause. `Path::file_stem` on `.json` returns `Some(".json")`,
+    /// which the `.filter(!starts_with('.'))` clause rejects, so the
+    /// `unwrap_or("dump")` fallback fires. The suffix strip is a
+    /// no-op on `"dump"`, and `extension()` is `None` on `.json`, so
+    /// the resulting filename is `dump.snapshot.{tag}`.
     #[test]
     fn no_stem_path_falls_back_to_dump() {
         let base = Path::new("/tmp/run/.json");
         let out = snapshot_tagged_path(base, "tag1");
-        // `.json` is a dotfile (no stem, no extension per Rust Path).
+        // `.json` has file_stem Some(".json") (rejected by the
+        // starts_with('.') filter → "dump") and no extension per Rust Path.
         // The function falls back to stem="dump" and ext=None.
         assert_eq!(out, PathBuf::from("/tmp/run/dump.snapshot.tag1"));
     }

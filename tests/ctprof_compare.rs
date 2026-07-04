@@ -47,8 +47,9 @@ fn compare_options(group_by: GroupBy, flatten: Vec<String>) -> CompareOptions {
 /// them via the public loader, run compare, render the result,
 /// and verify that every stage composes correctly.
 ///
-/// Baseline and candidate differ in `run_time_ns` and
-/// `voluntary_csw` so the renderer's delta path is exercised;
+/// Baseline and candidate differ in `run_time_ns`,
+/// `voluntary_csw`, and `nr_wakeups` so the renderer's delta
+/// path is exercised;
 /// they share both pcomm and comm so they group together
 /// under any GroupBy axis.
 #[test]
@@ -450,13 +451,13 @@ fn run_compare_with_invalid_sort_by_returns_err() {
 }
 
 /// Exhaustive accessor pin for the entire CTPROF_METRICS
-/// registry: every entry, regardless of its [`AggRule`] variant
-/// (Sum, Max, OrdinalRange, Mode, Affinity), must read back
+/// registry: every entry, regardless of the resulting [`Aggregated`]
+/// family (Sum, Max, OrdinalRange, Mode, Affinity), must read back
 /// the exact field its accessor closure names.
 ///
 /// The unit-level test
 /// `sum_metric_accessors_read_expected_field` (in
-/// src/ctprof_compare.rs) only covers Sum metrics. This
+/// src/ctprof_compare/tests_metrics.rs) only covers Sum metrics. This
 /// integration-level pin extends the same idea to every variant
 /// AND verifies (via set-equality against the registry below)
 /// that no metric is missing from the local case table — the
@@ -1594,7 +1595,7 @@ fn taskstats_metrics_render_with_auto_scaled_ns_and_bytes_ladders() {
 
 /// `--sections taskstats-delay` keeps the primary table open
 /// AND restricts the rendered rows to the 34 taskstats-tagged
-/// metrics. The 52 non-taskstats metrics (run_time_ns,
+/// metrics. The 53 non-taskstats metrics (run_time_ns,
 /// voluntary_csw, etc.) tagged `Section::Primary` are filtered
 /// out per-row when `Section::Primary` is absent from the
 /// requested filter. Mirrors the
@@ -1603,7 +1604,7 @@ fn taskstats_metrics_render_with_auto_scaled_ns_and_bytes_ladders() {
 /// table.
 ///
 /// Symmetric inverse: `--sections primary` excludes every
-/// taskstats row but keeps the 52 non-taskstats rows. Both
+/// taskstats row but keeps the 53 non-taskstats rows. Both
 /// directions are pinned so a regression that conflates the
 /// two sections (e.g. forgets the per-row gate) surfaces as
 /// either a missed exclusion or a missed inclusion.
@@ -1656,7 +1657,7 @@ fn sections_filter_isolates_taskstats_delay_rows_in_primary_table() {
     );
 
     // Filter B: --sections primary → primary table renders the
-    // 52 non-taskstats rows; every taskstats row drops.
+    // 53 non-taskstats rows; every taskstats row drops.
     let mut display = DisplayOptions::default();
     display.sections = vec![Section::Primary];
     let mut out_primary = String::new();

@@ -1309,7 +1309,7 @@ pub(crate) fn shm_segment_name(content_hash: u64) -> String {
 /// reaches its normal unlink sites, and `libc::atexit` handlers do
 /// not run on `abort()` either — so the segment leaks *from this
 /// run's perspective*. Cleanup is deferred: the next ktstr run
-/// sweeps orphans via `crate::vmm::cleanup_stale_shm`, which
+/// sweeps orphans via `crate::vmm::initramfs_cache::cleanup_stale_shm`, which
 /// non-blockingly `LOCK_EX`'s each stale entry and unlinks it when
 /// no other process holds a lock.
 ///

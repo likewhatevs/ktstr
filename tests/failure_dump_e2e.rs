@@ -110,8 +110,9 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
     // stem; the generated bpf_skel.rs emits `.name("bpf_bpf")` +
     // `.map("bpf_bpf.bss", ...)`), so the global-section map is
     // `bpf_bpf.bss`. This lookup is name-agnostic — it just takes the
-    // first entry whose name ends with `.bss` and is NOT one of the
-    // framework probes filtered by `KTSTR_INTERNAL_MAPS`.
+    // first entry whose name ends with `.bss` and is NOT a framework
+    // probe map (filtered here by the `probe_bp.` / `fentry_p.`
+    // prefixes below).
     let bss_map = maps
         .iter()
         .find(|m| {
@@ -443,8 +444,8 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
     // only needs the matching update here, no manual byte-reversal.
     //
     // Per-page scan (vs. cross-page concatenation): scx-ktstr's
-    // sdt_alloc slot layout is 24 bytes (8-byte sdt_data header +
-    // 16-byte ktstr_arena_ctx) and slots align within pages — no slot
+    // sdt_alloc slot layout is 40 bytes (8-byte sdt_data header +
+    // 32-byte ktstr_arena_ctx) and slots align within pages — no slot
     // crosses a page boundary, so the magic u64 is always contiguous
     // within a single captured page.
     const KTSTR_ARENA_MAGIC: u64 = 0xDEADBEEFCAFEBABE;
@@ -869,7 +870,7 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
     // -- task_enrichments capture --
     //
     // The runnable_list walker pushes one entry per task on each
-    // CPU's rq->scx.runnable_list. With workers_per_cgroup=2 driving
+    // CPU's rq->scx.runnable_list. With workers_per_cgroup>0 driving
     // active workloads, at least one task should be runnable at the
     // freeze instant. An empty enrichment vec when scx-ktstr is
     // loaded means the walker missed every task — a real defect.

@@ -11,23 +11,26 @@ use super::*;
 // panicking.
 
 /// MOV with `dst == r10` is rejected by the production guard in
-/// the ALU64-MOV-X arm (`if dst == BPF_REG_R10 { return; }`).
-/// Verifying r10's state directly is impossible because the
-/// stack-spill / reload path keys on the register index, not on
-/// `regs[10]`'s `RegState`. The probe instead routes through a
-/// second MOV: `MOV r3, r10` copies `regs[10]` into `regs[3]`,
-/// then a deref chain through r3 records a cast iff `regs[10]`
-/// was typed. With the rejection working, `regs[10]` stays
-/// Unknown, so r3 stays Unknown, and the deref chain produces no
-/// record.
+/// the ALU64-MOV-X arm (`if dst == BPF_REG_R10 { return; }`,
+/// mod.rs). Because r10 is never written, `regs[10]` keeps its
+/// initial Unknown state and no downstream deref can attribute a
+/// cast through it. The follow-on `MOV r3, r10; LDX r4, [r3+0]`
+/// chain cannot observe `regs[10]`'s content: the MOV's source is
+/// r10, so production takes the `src == BPF_REG_R10` branch and
+/// sets `r3 = FrameAddr{0}` regardless of `regs[10]` (mod.rs); a
+/// FrameAddr register never matches the typed-base cases in
+/// handle_ldx (only `Pointer`/`DatasecPointer`, mod.rs), so the
+/// LDX records nothing. The test therefore asserts the guard
+/// produces no panic and no phantom record, not that r3 reflects
+/// r10's state.
 #[test]
 fn mov_to_r10_rejected_keeps_r10_unknown() {
     let (blob, t_id, _q_id) = btf_with_source_and_target(8, 0);
     let btf = Btf::from_bytes(&blob).unwrap();
     // r2 = *(u64 *)(r1 + 8)   -- r2 = LoadedU64Field{T, 8}
     // r10 = r2                -- REJECTED, r10 stays Unknown
-    // r3 = r10                -- r3 = regs[10] = Unknown
-    // r4 = *(u64 *)(r3 + 0)   -- r3 Unknown, no record
+    // r3 = r10                -- src is r10 -> r3 = FrameAddr{0}
+    // r4 = *(u64 *)(r3 + 0)   -- r3 FrameAddr, no record
     let insns = vec![
         ldx(BPF_SIZE_DW, 2, 1, 8),
         mov_x(10, 2),
@@ -53,20 +56,23 @@ fn mov_to_r10_rejected_keeps_r10_unknown() {
 }
 
 /// LDX with `dst == r10` is rejected by the production guard
-/// (`if dst == BPF_REG_R10 { return; }` in `handle_ldx`). The
-/// same routing trick as `mov_to_r10_rejected_keeps_r10_unknown`
-/// observes the rejection: a successful LDX into r10 would have
-/// seeded `regs[10] = LoadedU64Field`, and a follow-up
-/// `MOV r3, r10; LDX r4, [r3+0]` chain would record a cast.
-/// With the guard active, r10 stays Unknown and the chain
-/// produces nothing.
+/// (`if dst == BPF_REG_R10 { return; }` in `handle_ldx`). With
+/// the guard active r10 is never written, so `regs[10]` keeps its
+/// initial Unknown state. The follow-up `MOV r3, r10; LDX r4,
+/// [r3+0]` chain cannot distinguish the guarded case: `MOV r3,
+/// r10` takes the `src == BPF_REG_R10` branch and sets `r3 =
+/// FrameAddr{0}` regardless of `regs[10]` (mod.rs), and a
+/// FrameAddr register never reaches the typed-base cases in
+/// handle_ldx (mod.rs), so no cast is recorded whether or not
+/// the LDX-into-r10 guard fired. The test asserts the guard
+/// yields no panic and no phantom record.
 #[test]
 fn ldx_into_r10_rejected_keeps_r10_unknown() {
     let (blob, t_id, _q_id) = btf_with_source_and_target(8, 0);
     let btf = Btf::from_bytes(&blob).unwrap();
     // r10 = *(u64 *)(r1 + 8)  -- REJECTED, r10 stays Unknown
-    // r3 = r10                -- r3 = regs[10] = Unknown
-    // r4 = *(u64 *)(r3 + 0)   -- r3 Unknown, no record
+    // r3 = r10                -- src is r10 -> r3 = FrameAddr{0}
+    // r4 = *(u64 *)(r3 + 0)   -- r3 FrameAddr, no record
     let insns = vec![
         ldx(BPF_SIZE_DW, 10, 1, 8),
         mov_x(3, 10),
@@ -468,7 +474,7 @@ fn mov_k_destroys_typed_pointer() {
 
 /// `BPF_ADDR_SPACE_CAST` with a reserved imm value (`imm == 2`,
 /// neither `1` nor `0x10000`) drops the destination register to
-/// Unknown. The verifier in `kernel/bpf/verifier.c check_alu_op`
+/// Unknown. The verifier in `kernel/bpf/verifier.c check_alu_fields`
 /// rejects programs that use any other imm for
 /// `BPF_ADDR_SPACE_CAST`, so seeing it in pre-verification
 /// bytecode is malformed; treating dst as Unknown is the
@@ -700,7 +706,8 @@ fn single_exit_does_not_panic() {
 fn jumps_only_program_does_not_panic() {
     let (blob, _t_id, _q_id) = btf_with_source_and_target(8, 0);
     let btf = Btf::from_bytes(&blob).unwrap();
-    // BPF_JEQ_K = 0x10. Construct a sequence of conditional and
+    // BPF_JEQ = 0x10 (op nibble); BPF_JEQ_K = BPF_JMP|BPF_JEQ|BPF_K
+    // = 0x05|0x10|0x00 = 0x15. Construct a sequence of conditional and
     // unconditional jumps that branch within bounds.
     // pc 0: if r1 == 0 goto +1 (target = pc 2)
     // pc 1: ja +1               (target = pc 3)

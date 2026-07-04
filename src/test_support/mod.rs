@@ -20,12 +20,15 @@
 //!
 //! # Module layout
 //!
-//! Implementation is split across 18 production submodules
+//! Implementation is split across 19 production submodules
 //! re-exported at `test_support::*` for a flat public API: `args`
 //! (CLI argument extraction), `dispatch` (ktstr / cargo-ktstr CLI
-//! entry points), `entry` (scheduler + test-entry types), `eval`
-//! (host-side VM result evaluation), `metrics` (payload stdout →
-//! `Metric` list), `model` (LLM backend + model cache), `output`
+//! entry points), `entry` (scheduler + test-entry types),
+//! `entry_validate` (`KtstrTestEntry::validate` + phase helpers split
+//! out of `entry.rs`), `eval`
+//! (host-side VM result evaluation), `host_class` (shared
+//! host-insufficiency error classification), `metrics` (payload stdout →
+//! `Metric` list), `output`
 //! (guest-output and console parsing), `payload` (`Payload` /
 //! `MetricCheck` / `Metric` / `Polarity`), `probe` (auto-repro and
 //! BPF probe pipeline), `probe_metrics` (host-side BPF map
@@ -61,8 +64,6 @@ mod entry_validate;
 mod eval;
 mod host_class;
 mod metrics;
-#[cfg(feature = "llm")]
-mod model;
 mod output;
 // Reachable crate-wide (vmm::VmResult::guest_assert_result parses the guest
 // AssertResult from its own drained guest_messages via this helper, mirroring
@@ -104,29 +105,30 @@ mod topo;
 pub type PostVmCallback = fn(&crate::vmm::VmResult) -> anyhow::Result<()>;
 
 // extract_probe_stack_arg and extract_work_type_arg are reached in
-// production via `super::args::` (probe.rs, eval/mod.rs); the re-export here
+// production via `super::args::` (probe.rs); the re-export here
 // preserves the flat-namespace invariant so `test_support::X` resolves
 // uniformly across all CLI arg extractors.
 #[cfg(feature = "export")]
 pub(crate) use args::extract_export_output_arg;
 #[allow(unused_imports)]
 pub(crate) use args::{
-    CellParentCgroupArg, cell_parent_path_is_valid, extract_export_test_arg,
-    extract_probe_stack_arg, extract_shell_test_arg, extract_test_fn_arg, extract_topo_arg,
-    extract_work_type_arg, parse_cell_parent_cgroup,
+    CellParentCgroupArg, VERIFIER_WORKLOAD_FLAG, cell_parent_path_is_valid,
+    extract_export_test_arg, extract_probe_stack_arg, extract_shell_test_arg, extract_test_fn_arg,
+    extract_topo_arg, extract_work_type_arg, is_verifier_workload, parse_cell_parent_cgroup,
 };
 #[allow(unused_imports)]
 pub(crate) use runtime::{append_base_sched_args, content_hash, scratch_dir, sys_rdy_budget_ms};
 #[cfg(test)]
 pub(crate) use sidecar::enriched_parse_error_message_for_test;
+pub use sidecar::{
+    PerfDeltaAssertionRecord, SidecarResult, collect_pool, detect_kernel_commit,
+    format_run_artifact_footer, newest_run_dir, repo_is_dirty, runs_root, sidecar_dir,
+    source_dir_for,
+};
 pub(crate) use sidecar::{
     SidecarIoError, SidecarParseError, apply_archive_source_override, collect_sidecars,
     collect_sidecars_with_errors, format_callback_profile, format_kvm_stats, format_verifier_stats,
-    is_run_directory, is_sidecar_filename,
-};
-pub use sidecar::{
-    SidecarResult, collect_pool, detect_kernel_commit, format_run_artifact_footer, newest_run_dir,
-    repo_is_dirty, runs_root, sidecar_dir, source_dir_for,
+    is_run_directory, is_sidecar_filename, warn_skipped_sidecars,
 };
 
 pub use dispatch::{
@@ -137,8 +139,9 @@ pub use dispatch::{
 };
 pub use entry::{
     BinaryKindJson, BpfMapAgg, BpfMapWrite, CgroupPath, KTSTR_SCHEDULERS, KTSTR_TESTS,
-    KtstrTestEntry, MemSideCache, NumaDistance, NumaNode, Scheduler, SchedulerJson, SchedulerSpec,
-    Sysctl, Topology, TopologyConstraints, TopologyConstraintsJson, TopologyJson, WatchBpfMap,
+    KtstrTestEntry, MemSideCache, NumaDistance, NumaNode, PerfDeltaAssertion, Scheduler,
+    SchedulerJson, SchedulerListEntry, SchedulerSpec, SchedulerTestJson, Sysctl, Topology,
+    TopologyConstraints, TopologyConstraintsJson, TopologyJson, WatchBpfMap,
     default_post_vm_periodic_fired, find_scheduler, find_test,
 };
 pub use eval::{KernelUnavailable, ResolveSource, resolve_scheduler, resolve_test_kernel};
@@ -148,17 +151,11 @@ pub use metrics::{
     MAX_WALK_DEPTH, WALK_TRUNCATION_SENTINEL_NAME, extract_metrics, is_truncation_sentinel_name,
     walk_json_leaves,
 };
-#[cfg(feature = "llm")]
-pub use model::{
-    CleanReport, DEFAULT_MODEL, LLM_DEBUG_RESPONSES_ENV, ModelSpec, ModelStatus, OFFLINE_ENV,
-    ShaVerdict, clean, ensure, status,
-};
 pub(crate) use output::extract_panic_message;
 pub use payload::{
-    Metric, MetricBounds, MetricCheck, MetricHint, MetricSource, MetricStream, OutputFormat,
-    Payload, PayloadKind, PayloadMetrics, Polarity,
+    Metric, MetricCheck, MetricHint, MetricStream, OutputFormat, Payload, PayloadKind,
+    PayloadMetrics, Polarity,
 };
-pub(crate) use payload::{RawPayloadOutput, WireMetricHint};
 pub(crate) use probe::maybe_dispatch_vm_test;
 pub(crate) use probe::{
     PROBE_DRAIN_GRACE, finalize_probe_after_unwind, maybe_dispatch_vm_test_with_args,

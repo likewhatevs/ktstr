@@ -95,12 +95,13 @@ const FORBIDDEN_PATTERNS: &[&str] = &[
     "failure_dump_path(\"",
     // Vector 2: path-assembly with the suffix bearing the literal.
     // `sidecar_dir().join("<...>.wprof.pb")` — catches the
-    // auto-repro body-callsite path-assembly pattern. Excludes the
-    // intentional patterns above (which contain `.wprof.pb"` as a
-    // substring of the helper name, but always preceded by an open
-    // paren — the literal-suffix check below requires the `.pb"`
-    // pattern at the very end of a string literal, which the
-    // helper-name patterns above never produce).
+    // auto-repro body-callsite path-assembly pattern. Every pattern
+    // is matched by the flat `line.contains(pat)` sweep below (no
+    // anchoring, no exclusion). The Vector-1 substrings
+    // (`wprof_pb_path("`, `failure_dump_path("`) and these Vector-2
+    // suffix substrings do not co-match a line because they are
+    // disjoint: a helper call like `wprof_pb_path("foo")` contains
+    // the Vector-1 substring but not `.wprof.pb"`.
     ".wprof.pb\"",
     ".repro.wprof.pb\"",
     ".failure-dump.json\"",

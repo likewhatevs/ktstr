@@ -73,4 +73,4 @@ eliminates observer effects on scheduling decisions.
 **Per-combination scheduler declarations.** Each scheduler/flag
 combination is its own `declare_scheduler!` const rather than a
 runtime-synthesized flag profile; the variant lands in the sidecar
-`scheduler` field and appears as a distinct row in `stats compare`.
+`scheduler` field and appears as a distinct row when comparing runs.

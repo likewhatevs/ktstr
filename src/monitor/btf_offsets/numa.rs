@@ -23,17 +23,19 @@ use super::{find_struct, member_byte_offset};
 /// from `enum numa_stat_item` (`include/linux/mmzone.h`). The kernel
 /// pins this order; external readers (`/sys/devices/system/node/nodeN/numastat`,
 /// `/proc/zoneinfo`) depend on it. Hard-coded here for the same
-/// reason the [`super::CPUTIME_USER`] family is hard-coded — BTF only
-/// encodes the array length, not the enum-to-position mapping, so a
-/// BTF-driven read would require resolving the enum separately
-/// (which is a UAPI break, not a layout drift this code can adapt
-/// to).
+/// reason the [`super::CPUTIME_USER`] family is hard-coded: BTF does
+/// encode the named enum, but mapping array positions to names would
+/// require a separate enum-resolution step; the order is UAPI-stable,
+/// so it is pinned here instead (a mismatching kernel would be a UAPI
+/// break, not a layout drift this code can adapt to).
 pub const NUMA_HIT: usize = 0;
-/// Pages allocated on the requested non-local node when the local
-/// node was full. See [`NUMA_HIT`].
+/// Pages allocated on a node other than the intended (preferred)
+/// node; counted on the node that actually served the allocation.
+/// See [`NUMA_HIT`].
 pub const NUMA_MISS: usize = 1;
-/// Pages allocated on this node by a process whose policy targeted
-/// a different node. See [`NUMA_HIT`].
+/// Allocations intended for this node that were served on a
+/// different node; counted on the intended (preferred) node.
+/// See [`NUMA_HIT`].
 pub const NUMA_FOREIGN: usize = 2;
 /// Allocations from an interleave policy that hit this node.
 /// See [`NUMA_HIT`].
@@ -72,8 +74,8 @@ pub const NUMA_EVENT_NAMES: [&str; NR_VM_NUMA_EVENT_ITEMS] = [
 /// The walk path is:
 ///   1. Resolve kernel symbol `node_data` — an array of
 ///      `pglist_data *` indexed by node id (declared in
-///      `arch/x86/mm/numa.c::node_data[]` on x86 / `arch/arm64/mm/numa.c`
-///      on arm64).
+///      `mm/numa.c::node_data[]`, generic and shared by x86 and
+///      arm64).
 ///   2. For each node, dereference `node_data[node]` to reach the
 ///      `pglist_data` for that node.
 ///   3. Walk `pglist_data.node_zones[MAX_NR_ZONES]` (an inline array
@@ -85,19 +87,16 @@ pub const NUMA_EVENT_NAMES: [&str; NR_VM_NUMA_EVENT_ITEMS] = [
 /// `pglist_data_node_zones` and `zone_vm_numa_event` are the two
 /// offsets the walker needs after the `node_data` symbol is
 /// resolved; `zone_size` lets the walker stride to
-/// `node_zones[zone_idx]`. `MAX_NR_ZONES` is hard-coded to 5
-/// (matching mainline x86_64 and arm64: ZONE_DMA, ZONE_DMA32,
-/// ZONE_NORMAL, ZONE_MOVABLE, ZONE_DEVICE) — a kernel without
-/// CONFIG_ZONE_DEVICE drops the trailing slot but still reports
-/// the others, so iterating up to 5 is safe (indices past the
-/// kernel's actual count read all-zero).
+/// `node_zones[zone_idx]`. The pending walker will iterate
+/// `node_zones[MAX_NR_ZONES]`; on x86_64/arm64 defconfig
+/// `MAX_NR_ZONES` is 5 (ZONE_DMA, ZONE_DMA32, ZONE_NORMAL,
+/// ZONE_MOVABLE, ZONE_DEVICE).
 ///
 /// Resolution returns `Err` when `pglist_data` or `zone` are
 /// missing from BTF — universal types whose absence indicates a
-/// stripped vmlinux. `vm_numa_event` is gated on
-/// `CONFIG_NUMA + CONFIG_VM_EVENT_COUNTERS` (the latter defaults
-/// to y on every modern kernel); when missing the resolver returns
-/// Err so the caller skips the capture.
+/// stripped vmlinux. `vm_numa_event` is gated on `CONFIG_NUMA`;
+/// when missing the resolver returns Err so the caller skips the
+/// capture.
 #[derive(Debug, Clone, Copy)]
 pub struct NumaStatsOffsets {
     /// Offset of `node_zones[]` within `struct pglist_data`.
@@ -114,8 +113,7 @@ pub struct NumaStatsOffsets {
 impl NumaStatsOffsets {
     /// Resolve NUMA-event offsets from a pre-loaded BTF object.
     /// Returns Err when any required type/field is missing
-    /// (stripped vmlinux, kernel without `CONFIG_NUMA` or without
-    /// `CONFIG_VM_EVENT_COUNTERS`).
+    /// (stripped vmlinux, or a kernel without `CONFIG_NUMA`).
     pub fn from_btf(btf: &Btf) -> Result<Self> {
         let (pglist_data, _) = find_struct(btf, "pglist_data")?;
         let pglist_data_node_zones = member_byte_offset(btf, &pglist_data, "node_zones")?;

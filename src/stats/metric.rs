@@ -60,8 +60,8 @@ pub struct MetricDef {
     /// Temporal aggregation kind. Drives how
     /// [`aggregate_samples`] collapses N readings of the same
     /// metric across multiple capture samples (e.g. periodic
-    /// monitor ticks within one run, or two `cargo ktstr stats
-    /// compare` snapshot subdirectories) into one comparable
+    /// monitor ticks within one run, or runs pooled for a
+    /// `cargo ktstr perf-delta` comparison) into one comparable
     /// value. Distinct from [`Self::polarity`], which is the
     /// "good direction" of the FINAL value: kind tells us HOW to
     /// reduce a vec of samples; polarity tells us how to interpret
@@ -73,6 +73,28 @@ pub struct MetricDef {
     /// are counters; the field exists so the remaining peaks and
     /// gauges can opt out of sum-aggregation explicitly.
     pub kind: MetricKind,
+    /// Absolute-materiality gate: a move smaller than this (in the metric's
+    /// [`Self::display_unit`]) is never a confident change, ANDed with
+    /// [`Self::default_rel`]. Its role depends on the metric's dynamic range
+    /// across workloads:
+    ///
+    /// - **Scale-bounded** metrics (a ratio of co-scaling counters, or a
+    ///   naturally-bounded unit — `%` spread, `ms`/`µs` latency, `x` ratios,
+    ///   `[0,1]` fractions): `default_abs` is a fixed unit-scale measurement-
+    ///   noise floor. A sub-unit move is immaterial regardless of its relative
+    ///   size, so a fixed floor is correct.
+    /// - **Scale-varying** metrics (a raw per-event count, or a rate normalized
+    ///   only by time — `*_per_sec`, `ops/s`, `req/s`, `ns/s`): the baseline
+    ///   spans orders of magnitude across workloads, so a fixed floor calibrated
+    ///   for high throughput would MASK a large relative regression on a low-
+    ///   throughput workload. Here `default_abs` is only a NEAR-IDLE activity
+    ///   guard (it keeps a big relative swing on a near-idle baseline from
+    ///   firing) and [`Self::default_rel`] carries materiality. Three tests
+    ///   enforce that every scale-varying metric keeps a near-idle floor:
+    ///   `throughput_rate_floors_are_near_idle` (per-time rates + throughput
+    ///   carriers), `scale_varying_count_floors_are_near_idle` (raw counts and
+    ///   ns/µs accumulations), and `mixed_class_scale_varying_floors_pinned`
+    ///   (the mixed-class Peak/WorstLowest/PerPhase metrics, by allowlist).
     pub default_abs: f64,
     pub default_rel: f64,
     pub display_unit: &'static str,
@@ -196,14 +218,16 @@ pub enum MetricKind {
     /// whose quotient is the intended rate unit (the component
     /// registration owns the unit choice; this variant does not scale).
     ///
-    /// `derive_rate_metrics` runs as a post-pass at the seven aggregation
+    /// `derive_rate_metrics` runs as a post-pass at the nine aggregation
     /// sites where the components co-locate in one map: the two per-phase
     /// builds (`buckets_from_grouped`, `build_phase_buckets_with_stimulus`),
     /// the cross-phase bucket merge (`merge_matched_phase_buckets`), the
     /// three cross-RUN ext-metrics reducers (`populate_run_ext_metrics`,
     /// `populate_run_ext_metrics_from_phases`, and `group_and_average_by`),
-    /// and the cross-CGROUP pooled re-pool
-    /// (`crate::assert::populate_run_pooled_iterations_per_cpu_sec`).
+    /// and the cross-CGROUP pooled re-pools
+    /// (`crate::assert::populate_run_pooled_iterations_per_cpu_sec`,
+    /// `crate::assert::populate_run_pooled_taobench`,
+    /// `crate::assert::populate_run_pooled_schbench`).
     /// The cross-CGROUP `AssertResult::merge` ext-metrics fold itself uses
     /// worst-case polarity (min/max) and is NOT a re-pool site; the pooled
     /// re-pool runs separately after it, at the eval layer, reading
@@ -694,7 +718,7 @@ impl MetricKind {
 /// Reduce a slice of per-sample readings of the same metric into
 /// one representative value, dispatching on [`MetricKind`]. Used
 /// by sample-windowed comparison paths (e.g. multi-tick monitor
-/// captures, stats compare across multiple snapshot
+/// captures, perf-delta across multiple snapshot
 /// subdirectories) to collapse a sample vec into the value the
 /// existing scalar-comparison pipeline already understands.
 ///
@@ -1009,14 +1033,16 @@ pub fn phase_counter_delta(samples: &[f64]) -> Option<f64> {
 /// `metrics[rate] = metrics[numerator] / metrics[denominator]`.
 ///
 /// This is the SOLE producer of a Rate metric's value. It runs as a
-/// post-pass at seven aggregation sites where the components co-locate in
+/// post-pass at nine aggregation sites where the components co-locate in
 /// one map: the two per-phase builds, the cross-phase bucket merge, the
 /// three cross-RUN ext-metrics reducers (`populate_run_ext_metrics`,
 /// `populate_run_ext_metrics_from_phases`, `group_and_average_by`), and the
-/// cross-CGROUP pooled re-pool
+/// cross-CGROUP pooled re-pools
 /// (`crate::assert::populate_run_pooled_iterations_per_cpu_sec`, run
 /// post-`merge` at the eval layer to re-pool `iterations_per_cpu_sec` across a
-/// run's cgroups). At each, the components are
+/// run's cgroups, plus `crate::assert::populate_run_pooled_taobench` and
+/// `crate::assert::populate_run_pooled_schbench` for the taobench/schbench
+/// whole-run Rates). At each, the components are
 /// pooled FIRST by their own kinds (a `Counter` numerator summed), then
 /// the rate is re-derived — so for `Counter / Counter` the result is
 /// `Σnumerator / Σdenominator`, the correct re-pool rather than a mean of
@@ -1102,9 +1128,14 @@ impl MetricDef {
     /// reading.
     ///
     /// Wired per-sample arms (return `Some`): `max_dsq_depth` /
-    /// `avg_dsq_depth` from `sample.snapshot`'s DSQ-walker and
+    /// `avg_dsq_depth` from `sample.snapshot`'s DSQ-walker,
     /// `total_fallback` / `total_keep_last` from its SCX events
-    /// region. Every other registered metric falls to `_ => None`
+    /// region, and the IRQ/steal cross-CPU sums `total_hardirqs`,
+    /// `total_softirq_net_rx` / `total_softirq_net_tx` /
+    /// `total_softirq_timer` / `total_softirq_sched`,
+    /// `total_irq_time_ns`, `total_softirq_time_ns`, and
+    /// `total_steal_time_ns` from its `per_cpu_time`. Every other
+    /// registered metric falls to `_ => None`
     /// here, for one of three reasons: (1) it is a MONITOR-axis
     /// signal with no guest-`Snapshot` shape (`stuck_count`,
     /// `max_imbalance_ratio`, `avg_imbalance_ratio`) — folded
@@ -1127,7 +1158,7 @@ impl MetricDef {
     pub fn read_sample(&self, sample: &crate::scenario::sample::Sample<'_>) -> Option<f64> {
         // Per-metric dispatch by registry name. Only the metrics
         // whose value is genuinely a per-sample reading are wired;
-        // the remaining 16 entries in the METRICS registry are
+        // every other entry in the METRICS registry is
         // cross-cgroup folds or run-level distributional re-pools
         // computed host-side at `evaluate_vm_result` time
         // (worst-spread / worst-gap-ms fold; the
@@ -1178,7 +1209,7 @@ impl MetricDef {
             // Cumulative `select_cpu_fallback` counter at the
             // freeze instant. The host's event-counter walker
             // builds a per-tick timeline of CPU-summed counters
-            // (`EventCounterSample` at src/monitor/dump/mod.rs:442);
+            // (`EventCounterSample` at src/monitor/dump/mod.rs:477);
             // `.last()` gives the cumulative reading at the most
             // recent tick within this freeze's capture window.
             // Counter-kind reduction folds `last - first` across
@@ -1343,11 +1374,33 @@ impl MetricDef {
     /// the deliberate split between "fold needs a direction" and "verdict
     /// must stay neutral".
     pub const fn classify_direction(&self) -> Option<bool> {
-        use crate::test_support::Polarity;
-        match self.polarity {
-            Polarity::Informational => None,
-            Polarity::HigherBetter => Some(false),
-            Polarity::LowerBetter | Polarity::TargetValue(_) | Polarity::Unknown => Some(true),
+        self.polarity.classify_direction()
+    }
+
+    /// Whether this metric's value can reach the AGGREGATE findings the
+    /// perf-delta failure gate reads — the cross-run scalar compare
+    /// ([`compare_partitions`], `noise_adjust == false`) or the per-run noise
+    /// compare ([`compare_partitions_noise`], `noise_adjust == true`). `false`
+    /// for names whose value never lands on a compared row in that mode, so a
+    /// `--must-fail` gate on one could never fire (a silent no-op):
+    /// - [`MetricKind::PerPhase`]: `accessor` is `None`, it has no run-level
+    ///   producer, and it is gated out of the cross-run ext fold — its value
+    ///   lives only in per-phase carriers, never on a `GauntletRow`, so it
+    ///   reaches NEITHER compare. Always `false`.
+    /// - [`MetricKind::PerRunDistribution`]: `accessor` is `None` and it is
+    ///   gated out of the cross-run ext fold, so it is absent on the scalar
+    ///   compare's cross-run-folded rows — but each run carries its own
+    ///   `*_whole` scalar that [`compare_partitions_noise`] reads, so it CAN
+    ///   gate under `--noise-adjust`. `noise_adjust`-only.
+    ///
+    /// Every other kind reaches both compares; whether it then produces a
+    /// *regression* (vs an informational finding) is a separate
+    /// direction question — see [`classify_direction`](Self::classify_direction).
+    pub const fn gates_aggregate(&self, noise_adjust: bool) -> bool {
+        match self.kind {
+            MetricKind::PerPhase => false,
+            MetricKind::PerRunDistribution => noise_adjust,
+            _ => true,
         }
     }
 }
@@ -1371,7 +1424,7 @@ impl MetricDef {
 ///
 /// Each metric is referenced by three names across the pipeline.
 /// The registry name is the stable surface — sidecars, CI gates,
-/// and `cargo ktstr stats compare` output all quote it verbatim —
+/// and `cargo ktstr perf-delta` output all quote it verbatim —
 /// and cannot be renamed without silently invalidating downstream
 /// consumers. The field name on [`GauntletRow`] and the polars
 /// DataFrame column name are internal; they are kept terse and
@@ -1466,10 +1519,12 @@ pub(crate) const SCHBENCH_LOOP_COUNT: &str = "schbench_loop_count";
 // (RENDER_SUPPRESSED) for the two sample-weighted Σrun_delay/Σpcount gate Rates
 // (workload-scoped siblings of the system-wide `total_run_delay_ns_per_sched`);
 // the message and worker thread ROLES pool separately (different per-schedule
-// wait populations). Distinct from the per-phase `sched_delay_msg/worker_us`
-// (mean-of-means, schbench.c parity) which stay PerPhase display-only — the
-// Rates gate, no double-count. `total_schbench_loops` is the whole-run loop
-// Counter (distinct from the per-phase `schbench_loop_count`).
+// wait populations). The per-phase `sched_delay_msg/worker_us` is the SAME
+// Σrun_delay_ns/Σpcount per-schedule mean at phase scope (NOT schbench's native
+// mean-of-per-thread-means, a separate whole-run SchbenchResult stat) and stays
+// PerPhase display-only — only these Rates gate, no double-count.
+// `total_schbench_loops` is the whole-run loop Counter (distinct from the
+// per-phase `schbench_loop_count`).
 pub(crate) const TOTAL_SCHBENCH_MSG_RUN_DELAY_NS: &str = "total_schbench_msg_run_delay_ns";
 pub(crate) const TOTAL_SCHBENCH_MSG_PCOUNT: &str = "total_schbench_msg_pcount";
 pub(crate) const TOTAL_SCHBENCH_WORKER_RUN_DELAY_NS: &str = "total_schbench_worker_run_delay_ns";
@@ -1588,7 +1643,7 @@ pub static METRICS: &[MetricDef] = &[
     MetricDef {
         // `"worst_spread"` is the wire/surface name — emitted in
         // sidecars, referenced by CI gates, and printed by
-        // `cargo ktstr stats compare`. Internally the field on
+        // `cargo ktstr perf-delta`. Internally the field on
         // `GauntletRow` is named `spread` and the polars DataFrame
         // column keeps that shorter name; see the doc on
         // `GauntletRow.spread` for the rationale (rename-of-
@@ -1615,7 +1670,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_migrations",
         polarity: crate::test_support::Polarity::LowerBetter,
         kind: MetricKind::Counter,
-        default_abs: 10.0,
+        default_abs: 2.0,
         default_rel: 0.30,
         display_unit: "",
         accessor: |r| Some(r.migrations as f64),
@@ -1764,7 +1819,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_run_delay",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 1_000_000.0,
+        default_abs: 1000.0,
         default_rel: 0.10,
         display_unit: "ns",
         accessor: |_| None,
@@ -1776,7 +1831,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_pcount",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 100.0,
+        default_abs: 1.0,
         default_rel: 0.10,
         display_unit: "",
         accessor: |_| None,
@@ -1789,7 +1844,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_sched_count",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 100.0,
+        default_abs: 1.0,
         default_rel: 0.10,
         display_unit: "",
         accessor: |_| None,
@@ -1800,7 +1855,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_yld_count",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 100.0,
+        default_abs: 1.0,
         default_rel: 0.10,
         display_unit: "",
         accessor: |_| None,
@@ -1811,7 +1866,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_sched_goidle",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 100.0,
+        default_abs: 1.0,
         default_rel: 0.10,
         display_unit: "",
         accessor: |_| None,
@@ -1822,7 +1877,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_ttwu_count",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 100.0,
+        default_abs: 1.0,
         default_rel: 0.10,
         display_unit: "",
         accessor: |_| None,
@@ -1834,7 +1889,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_ttwu_local",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 100.0,
+        default_abs: 1.0,
         default_rel: 0.10,
         display_unit: "",
         accessor: |_| None,
@@ -1855,7 +1910,7 @@ pub static METRICS: &[MetricDef] = &[
             numerator: "total_run_delay",
             denominator: "total_pcount",
         },
-        default_abs: 1000.0,
+        default_abs: 100.0,
         default_rel: 0.15,
         display_unit: "ns",
         accessor: |_| None,
@@ -1940,7 +1995,7 @@ pub static METRICS: &[MetricDef] = &[
             numerator: "total_run_delay",
             denominator: "total_schedstat_wall_sec",
         },
-        default_abs: 1_000_000.0,
+        default_abs: 1000.0,
         default_rel: 0.30,
         display_unit: "ns/s",
         accessor: |_| None,
@@ -1955,7 +2010,7 @@ pub static METRICS: &[MetricDef] = &[
             numerator: "total_pcount",
             denominator: "total_schedstat_wall_sec",
         },
-        default_abs: 100.0,
+        default_abs: 1.0,
         default_rel: 0.30,
         display_unit: "/s",
         accessor: |_| None,
@@ -1973,7 +2028,7 @@ pub static METRICS: &[MetricDef] = &[
             numerator: "total_sched_count",
             denominator: "total_schedstat_wall_sec",
         },
-        default_abs: 100.0,
+        default_abs: 1.0,
         default_rel: 0.30,
         display_unit: "/s",
         accessor: |_| None,
@@ -1987,7 +2042,7 @@ pub static METRICS: &[MetricDef] = &[
             numerator: "total_yld_count",
             denominator: "total_schedstat_wall_sec",
         },
-        default_abs: 10.0,
+        default_abs: 1.0,
         default_rel: 0.30,
         display_unit: "/s",
         accessor: |_| None,
@@ -2002,7 +2057,7 @@ pub static METRICS: &[MetricDef] = &[
             numerator: "total_ttwu_count",
             denominator: "total_schedstat_wall_sec",
         },
-        default_abs: 100.0,
+        default_abs: 1.0,
         default_rel: 0.30,
         display_unit: "/s",
         accessor: |_| None,
@@ -2017,7 +2072,7 @@ pub static METRICS: &[MetricDef] = &[
             numerator: "total_sched_goidle",
             denominator: "total_schedstat_wall_sec",
         },
-        default_abs: 100.0,
+        default_abs: 1.0,
         default_rel: 0.30,
         display_unit: "/s",
         accessor: |_| None,
@@ -2170,7 +2225,7 @@ pub static METRICS: &[MetricDef] = &[
         // averaging per-phase ratios. Higher-is-better (more throughput). The
         // registry entry exists so MetricDef::read on a
         // GauntletRow.ext_metrics fallback surfaces it through cargo ktstr
-        // stats compare like any other metric, and so
+        // perf-delta like any other metric, and so
         // Timeline::from_phase_buckets reads it by the canonical name from
         // PhaseBucket.metrics. No typed GauntletRow field; accessor is the
         // ext_metrics fallback.
@@ -2189,7 +2244,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_iterations",
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::Counter,
-        default_abs: 100.0,
+        default_abs: 2.0,
         default_rel: 0.10,
         display_unit: "",
         accessor: |r| Some(r.total_iterations as f64),
@@ -2204,7 +2259,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_phase_iterations",
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::Counter,
-        default_abs: 100.0,
+        default_abs: 1.0,
         default_rel: 0.10,
         display_unit: "",
         accessor: |_| None,
@@ -2263,7 +2318,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_iterations_pooled",
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::Counter,
-        default_abs: 100.0,
+        default_abs: 1.0,
         default_rel: 0.10,
         display_unit: "",
         accessor: |_| None,
@@ -2313,11 +2368,11 @@ pub static METRICS: &[MetricDef] = &[
         // sample-count-weighted), like user_time_ns. LowerBetter — the DSQ-spinlock
         // regression surfaces as rising system time (CPUs spinning in
         // the kernel). No typed GauntletRow field; the ext_metrics
-        // fallback carries it through cargo ktstr stats compare.
+        // fallback carries it through cargo ktstr perf-delta.
         name: "system_time_ns",
         polarity: crate::test_support::Polarity::LowerBetter,
         kind: MetricKind::PerPhaseDeltaSum,
-        default_abs: 1_000_000.0,
+        default_abs: 1000.0,
         default_rel: 0.30,
         display_unit: "ns",
         accessor: |_| None,
@@ -2336,7 +2391,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "user_time_ns",
         polarity: crate::test_support::Polarity::LowerBetter,
         kind: MetricKind::PerPhaseDeltaSum,
-        default_abs: 1_000_000.0,
+        default_abs: 1000.0,
         default_rel: 0.30,
         display_unit: "ns",
         accessor: |_| None,
@@ -2359,7 +2414,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_hardirqs",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 1000.0,
+        default_abs: 10.0,
         default_rel: 0.50,
         display_unit: "",
         accessor: |_| None,
@@ -2371,7 +2426,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_softirq_net_rx",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 500.0,
+        default_abs: 10.0,
         default_rel: 0.50,
         display_unit: "",
         accessor: |_| None,
@@ -2381,7 +2436,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_softirq_net_tx",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 500.0,
+        default_abs: 10.0,
         default_rel: 0.50,
         display_unit: "",
         accessor: |_| None,
@@ -2391,7 +2446,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_softirq_timer",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 1000.0,
+        default_abs: 10.0,
         default_rel: 0.50,
         display_unit: "",
         accessor: |_| None,
@@ -2401,7 +2456,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_softirq_sched",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 1000.0,
+        default_abs: 10.0,
         default_rel: 0.50,
         display_unit: "",
         accessor: |_| None,
@@ -2414,7 +2469,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_irq_time_ns",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 1_000_000.0,
+        default_abs: 1000.0,
         default_rel: 0.50,
         display_unit: "ns",
         accessor: |_| None,
@@ -2425,7 +2480,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_softirq_time_ns",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 1_000_000.0,
+        default_abs: 1000.0,
         default_rel: 0.50,
         display_unit: "ns",
         accessor: |_| None,
@@ -2440,7 +2495,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_steal_time_ns",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 1_000_000.0,
+        default_abs: 1000.0,
         default_rel: 0.50,
         display_unit: "ns",
         accessor: |_| None,
@@ -2485,7 +2540,7 @@ pub static METRICS: &[MetricDef] = &[
             numerator: "total_hardirqs",
             denominator: "total_phase_wall_sec",
         },
-        default_abs: 10.0,
+        default_abs: 1.0,
         default_rel: 0.30,
         display_unit: "irq/s",
         accessor: |_| None,
@@ -2500,7 +2555,7 @@ pub static METRICS: &[MetricDef] = &[
             numerator: "total_softirq_net_rx",
             denominator: "total_phase_wall_sec",
         },
-        default_abs: 10.0,
+        default_abs: 1.0,
         default_rel: 0.30,
         display_unit: "softirq/s",
         accessor: |_| None,
@@ -2544,7 +2599,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_phase_wall_ns",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 1_000_000.0,
+        default_abs: 1000.0,
         default_rel: 0.30,
         display_unit: "ns",
         accessor: |_| None,
@@ -2562,7 +2617,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "max_cpu_hardirqs",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Peak,
-        default_abs: 500.0,
+        default_abs: 10.0,
         default_rel: 0.50,
         display_unit: "",
         accessor: |_| None,
@@ -2603,7 +2658,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "max_cpu_softirq_net_rx",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Peak,
-        default_abs: 500.0,
+        default_abs: 10.0,
         default_rel: 0.50,
         display_unit: "",
         accessor: |_| None,
@@ -2719,7 +2774,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "max_cgroup_irq_pressure",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Peak,
-        default_abs: 1000.0,
+        default_abs: 1.0,
         default_rel: 0.50,
         display_unit: "µs",
         accessor: |_| None,
@@ -2788,7 +2843,7 @@ pub static METRICS: &[MetricDef] = &[
         name: "total_irq_pressure_us",
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 1000.0,
+        default_abs: 1.0,
         default_rel: 0.50,
         display_unit: "µs",
         accessor: |_| None,
@@ -2896,9 +2951,9 @@ pub static METRICS: &[MetricDef] = &[
         // Derivation of `abs = 10`: this metric is PER-WORKER. In-tree
         // fixtures span `workers_per_cgroup` from 1 through 8 (see
         // the KtstrTestEntry declarations under src/scenario/*.rs and
-        // tests/*.rs); `KtstrTestEntry::DEFAULT.workers_per_cgroup`
-        // is 2, with scenario-level overrides commonly picking 4 or
-        // 8. A per-worker floor of 10 therefore corresponds to
+        // tests/*.rs); `CtxBuilder`'s `workers_per_cgroup`
+        // defaults to 1, with scenario-level overrides raising it. A
+        // per-worker floor of 10 therefore corresponds to
         // aggregate regressions of 10-80 total iterations across the
         // supported worker counts — high enough that a lightly-
         // loaded scheduler's jitter does not flag a regression, low
@@ -3109,7 +3164,7 @@ pub static METRICS: &[MetricDef] = &[
         name: SCHBENCH_LOOP_COUNT,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::PerPhase,
-        default_abs: 10.0,
+        default_abs: 1.0,
         default_rel: 0.30,
         display_unit: "",
         accessor: |_| None,
@@ -3122,7 +3177,7 @@ pub static METRICS: &[MetricDef] = &[
         name: TAOBENCH_TOTAL_QPS,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::PerPhase,
-        default_abs: 1000.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "ops/s",
         accessor: |_| None,
@@ -3131,7 +3186,7 @@ pub static METRICS: &[MetricDef] = &[
         name: TAOBENCH_FAST_QPS,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::PerPhase,
-        default_abs: 1000.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "ops/s",
         accessor: |_| None,
@@ -3140,7 +3195,7 @@ pub static METRICS: &[MetricDef] = &[
         name: TAOBENCH_SLOW_QPS,
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::PerPhase,
-        default_abs: 1000.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "ops/s",
         accessor: |_| None,
@@ -3241,7 +3296,7 @@ pub static METRICS: &[MetricDef] = &[
         name: TOTAL_TAOBENCH_OPS,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::Counter,
-        default_abs: 1000.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "",
         accessor: |_| None,
@@ -3250,7 +3305,7 @@ pub static METRICS: &[MetricDef] = &[
         name: TOTAL_TAOBENCH_FAST_OPS,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::Counter,
-        default_abs: 1000.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "",
         accessor: |_| None,
@@ -3259,7 +3314,7 @@ pub static METRICS: &[MetricDef] = &[
         name: TOTAL_TAOBENCH_SLOW_OPS,
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 1000.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "",
         accessor: |_| None,
@@ -3288,7 +3343,7 @@ pub static METRICS: &[MetricDef] = &[
             numerator: TOTAL_TAOBENCH_OPS,
             denominator: TOTAL_TAOBENCH_WALL_SEC,
         },
-        default_abs: 1000.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "ops/s",
         accessor: |_| None,
@@ -3302,7 +3357,7 @@ pub static METRICS: &[MetricDef] = &[
             numerator: TOTAL_TAOBENCH_FAST_OPS,
             denominator: TOTAL_TAOBENCH_WALL_SEC,
         },
-        default_abs: 1000.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "ops/s",
         accessor: |_| None,
@@ -3318,7 +3373,7 @@ pub static METRICS: &[MetricDef] = &[
             numerator: TOTAL_TAOBENCH_SLOW_OPS,
             denominator: TOTAL_TAOBENCH_WALL_SEC,
         },
-        default_abs: 1000.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "ops/s",
         accessor: |_| None,
@@ -3417,7 +3472,7 @@ pub static METRICS: &[MetricDef] = &[
         name: TOTAL_TAOBENCH_GET_CMDS,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::Counter,
-        default_abs: 1000.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "",
         accessor: |_| None,
@@ -3426,7 +3481,7 @@ pub static METRICS: &[MetricDef] = &[
         name: TOTAL_TAOBENCH_GET_HITS,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::Counter,
-        default_abs: 1000.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "",
         accessor: |_| None,
@@ -3451,9 +3506,11 @@ pub static METRICS: &[MetricDef] = &[
     // RENDER_SUPPRESSED; `total_` prefix → Counter gate). The two Rates are the
     // sample-weighted Σrun_delay/Σpcount per-schedule means (the workload-scoped
     // siblings of the system-wide `total_run_delay_ns_per_sched`); message and
-    // worker roles pool separately. Distinct from the per-phase
-    // `sched_delay_msg/worker_us` (mean-of-means parity, PerPhase display-only) —
-    // the Rates gate, no double-count.
+    // worker roles pool separately. The per-phase `sched_delay_msg/worker_us`
+    // (PerPhase, display-only) is the SAME Σrun_delay_ns/Σpcount per-schedule
+    // mean at phase scope -- NOT schbench's native mean-of-per-thread-means
+    // (that is a separate whole-run stat on `SchbenchResult`, see
+    // workload/schbench). Only these Rates gate, so no double-count.
     MetricDef {
         name: TOTAL_SCHBENCH_MSG_RUN_DELAY_NS,
         polarity: crate::test_support::Polarity::LowerBetter,
@@ -3467,7 +3524,7 @@ pub static METRICS: &[MetricDef] = &[
         name: TOTAL_SCHBENCH_MSG_PCOUNT,
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 100.0,
+        default_abs: 1.0,
         default_rel: 0.10,
         display_unit: "",
         accessor: |_| None,
@@ -3485,19 +3542,34 @@ pub static METRICS: &[MetricDef] = &[
         name: TOTAL_SCHBENCH_WORKER_PCOUNT,
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Counter,
-        default_abs: 100.0,
+        default_abs: 1.0,
         default_rel: 0.10,
         display_unit: "",
         accessor: |_| None,
     },
     MetricDef {
         // Whole-run completed work cycles (Σ over phases+cgroups). HigherBetter
-        // (throughput). NOT a rate component, so NOT suppressed. Distinct from the
-        // per-phase `schbench_loop_count` (PerPhase timeline).
+        // (throughput). NOT a rate component, so NOT suppressed. Uses the tighter
+        // rel 0.10 throughput-Counter band shared by its structural peers
+        // total_iterations / total_phase_iterations (HigherBetter completed-work
+        // Counters): the whole-run Σ pools every cycle, so a 10-29% drop is a real
+        // regression, not noise. The per-phase twin `schbench_loop_count`
+        // (PerPhase) DELIBERATELY keeps the looser rel 0.30 for a
+        // SMALL-SAMPLE-WINDOW reason, not an accounting one: a single phase pools
+        // far fewer completed cycles than the whole-run Σ, so its run-to-run
+        // relative variance (CV) is higher and needs a wider band. It is NOT
+        // phase-edge jitter -- the per-phase counts partition EXACTLY to the
+        // whole-run total and cycles are whole, never fractional (schbench/run.rs
+        // increments once per completed cycle, drains a whole count at the phase
+        // boundary). The nearest per-phase RAW-COUNT peer, total_phase_iterations,
+        // itself gates at 0.10; loop_count's 0.30 is the small-window-CV
+        // exception, not a like-for-like registry precedent. default_abs is the
+        // near-idle activity floor; default_rel carries materiality (see
+        // MetricDef::default_abs).
         name: TOTAL_SCHBENCH_LOOPS,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::Counter,
-        default_abs: 100.0,
+        default_abs: 1.0,
         default_rel: 0.10,
         display_unit: "",
         accessor: |_| None,
@@ -3513,7 +3585,7 @@ pub static METRICS: &[MetricDef] = &[
             numerator: TOTAL_SCHBENCH_MSG_RUN_DELAY_NS,
             denominator: TOTAL_SCHBENCH_MSG_PCOUNT,
         },
-        default_abs: 1000.0,
+        default_abs: 100.0,
         default_rel: 0.10,
         display_unit: "ns",
         accessor: |_| None,
@@ -3528,7 +3600,7 @@ pub static METRICS: &[MetricDef] = &[
             numerator: TOTAL_SCHBENCH_WORKER_RUN_DELAY_NS,
             denominator: TOTAL_SCHBENCH_WORKER_PCOUNT,
         },
-        default_abs: 1000.0,
+        default_abs: 100.0,
         default_rel: 0.10,
         display_unit: "ns",
         accessor: |_| None,
@@ -3578,8 +3650,8 @@ pub static METRICS: &[MetricDef] = &[
     // what schbench emits, not an extension). HigherBetter (more requests/sec = more
     // throughput) — note min/max INVERT the latency polarity (a higher worst-second
     // rate is better). A per-second RATE spanning tens..tens-of-thousands, so
-    // rel-dominant (rel 0.10) with a small abs floor (100) — NOT loop_count's
-    // count-style abs 10/rel 0.30.
+    // rel-dominant (rel 0.10) with a near-idle abs floor (10) — NOT loop_count's
+    // count-style abs 1/rel 0.30.
     //
     // rps min/max keep the percentile-tier rel (0.10), NOT the loosened latency-max
     // tier (0.50): each rps sample is a 1-second-AVERAGED rate (cycles completed that
@@ -3594,19 +3666,19 @@ pub static METRICS: &[MetricDef] = &[
     // sentinel (plat.rs `if min==0 || us<min`) treats 0 as "unset" — a 0 sets min=0 but
     // the next sample replaces it (e.g. [100,0,200] -> min=200), so min reads 0 only
     // when a 0 is the last min-lowering sample. (2) Across cgroups, PlatStats::combine's
-    // `other.min != 0` guard (plat.rs:227 — correct for latency, where 0 means empty)
+    // `other.min != 0` guard (plat.rs:230 — correct for latency, where 0 means empty)
     // skips a starved cgroup's min=0 when pooling, so a 0-rps cgroup pooled with a
     // nonzero one leaves rps_min nonzero. rps_min is thus a trustworthy worst-second
     // floor only absent 0-seconds. Sustained starvation (0-seconds >= 20% of the
     // window) still shows in rps_p20, which reads the pooled histogram's bucket 0
-    // (folded unconditionally, plat.rs:221) in both cases; a single 0-second in a longer
+    // (folded unconditionally, plat.rs:223-224) in both cases; a single 0-second in a longer
     // window is below p20 and lost from rps_min — invisible to both. Faithful to
     // schbench's add_lat min sentinel.
     MetricDef {
         name: SCHBENCH_RPS_P20,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::PerPhase,
-        default_abs: 100.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "req/s",
         accessor: |_| None,
@@ -3615,7 +3687,7 @@ pub static METRICS: &[MetricDef] = &[
         name: SCHBENCH_RPS_P50,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::PerPhase,
-        default_abs: 100.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "req/s",
         accessor: |_| None,
@@ -3624,7 +3696,7 @@ pub static METRICS: &[MetricDef] = &[
         name: SCHBENCH_RPS_P90,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::PerPhase,
-        default_abs: 100.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "req/s",
         accessor: |_| None,
@@ -3633,7 +3705,7 @@ pub static METRICS: &[MetricDef] = &[
         name: SCHBENCH_RPS_MIN,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::PerPhase,
-        default_abs: 100.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "req/s",
         accessor: |_| None,
@@ -3642,7 +3714,7 @@ pub static METRICS: &[MetricDef] = &[
         name: SCHBENCH_RPS_MAX,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::PerPhase,
-        default_abs: 100.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "req/s",
         accessor: |_| None,
@@ -3766,7 +3838,7 @@ pub static METRICS: &[MetricDef] = &[
         name: SCHBENCH_RPS_P20_WHOLE,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::PerRunDistribution,
-        default_abs: 100.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "req/s",
         accessor: |_| None,
@@ -3775,7 +3847,7 @@ pub static METRICS: &[MetricDef] = &[
         name: SCHBENCH_RPS_P50_WHOLE,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::PerRunDistribution,
-        default_abs: 100.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "req/s",
         accessor: |_| None,
@@ -3784,7 +3856,7 @@ pub static METRICS: &[MetricDef] = &[
         name: SCHBENCH_RPS_P90_WHOLE,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::PerRunDistribution,
-        default_abs: 100.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "req/s",
         accessor: |_| None,
@@ -3793,7 +3865,7 @@ pub static METRICS: &[MetricDef] = &[
         name: SCHBENCH_RPS_MIN_WHOLE,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::PerRunDistribution,
-        default_abs: 100.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "req/s",
         accessor: |_| None,
@@ -3802,7 +3874,7 @@ pub static METRICS: &[MetricDef] = &[
         name: SCHBENCH_RPS_MAX_WHOLE,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::PerRunDistribution,
-        default_abs: 100.0,
+        default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "req/s",
         accessor: |_| None,
@@ -3812,7 +3884,7 @@ pub static METRICS: &[MetricDef] = &[
     // `write_carrier_scalars`), never from a `GauntletRow`. BARE per-cgroup
     // names (NOT the run-level `worst_*`): a single cgroup's value is not a
     // "worst across cgroups", and reusing `worst_*` would collide
-    // `is_known_metric` with the run-level selector. Thresholds mirror the
+    // `metric_def` with the run-level selector. Thresholds mirror the
     // analogous `worst_*` entries. (`iterations_per_cpu_sec` is intentionally
     // absent — it is already a Rate entry above; the per-cgroup value resolves
     // through that name without a second registration.)
@@ -4025,8 +4097,8 @@ pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
     METRICS.iter().find(|m| m.name == name)
 }
 
-/// Rate-COMPONENT metric names suppressed from compare OUTPUT (scalar findings,
-/// per-phase deltas, and unpaired-phase rows). These are the internal
+/// Rate-COMPONENT metric names suppressed from compare OUTPUT (scalar findings and the
+/// noise per-phase spread + coverage rows). These are the internal
 /// numerator/denominator Counters of the derived rates — `iteration_rate`
 /// (`total_phase_iterations` / `total_phase_duration_sec`) and the pooled
 /// `iterations_per_cpu_sec` (`total_iterations_pooled` / `total_cpu_time_sec`) —
@@ -4073,22 +4145,9 @@ const RENDER_SUPPRESSED_COMPONENTS: &[&str] = &[
 ];
 
 /// True when `name` is a Rate component suppressed from compare output (see
-/// [`RENDER_SUPPRESSED_COMPONENTS`]).
-pub(crate) fn is_render_suppressed_component(name: &str) -> bool {
+/// the private `RENDER_SUPPRESSED_COMPONENTS` list).
+pub fn is_render_suppressed_component(name: &str) -> bool {
     RENDER_SUPPRESSED_COMPONENTS.contains(&name)
-}
-
-/// Clone a per-phase metrics map with the suppressed Rate components removed —
-/// used for the unpaired-phase compare rows so a side-only phase does not render
-/// the component plumbing (see [`RENDER_SUPPRESSED_COMPONENTS`]).
-pub(crate) fn metrics_without_suppressed(
-    metrics: &std::collections::BTreeMap<String, f64>,
-) -> std::collections::BTreeMap<String, f64> {
-    metrics
-        .iter()
-        .filter(|(k, _)| !is_render_suppressed_component(k.as_str()))
-        .map(|(k, v)| (k.clone(), *v))
-        .collect()
 }
 
 /// Infer the regression polarity (`higher_is_worse`) of a metric
@@ -4114,12 +4173,12 @@ pub(crate) fn metrics_without_suppressed(
 ///   `locality`, `_score`, `goodput`. The scheduler-test fixture's
 ///   `total_iterations` and `worst_iterations_per_worker` already
 ///   carry this polarity in the registry; a payload-author metric
-///   like `jobs.0.read.iops` from the schbench LlmExtract path
+///   like `jobs.0.read.iops` from the schbench JSON path
 ///   should fold the same way.
 /// - Tokens that signal LowerBetter (returned `true`):
-///   `latency`, `delay`, `gap`, `stall`, `stuck`, `cv`, `error`,
+///   `latency`, `delay`, `_gap`, `stall`, `stuck`, `_cv`, `error`,
 ///   `fail`, `drop`, `spread`, `_us`, `_ms`, `_ns`, `migration_ratio`,
-///   `imbalance`. These are the polarity signals from the existing
+///   `imbalance`, `_depth`, `dsq`. These are the polarity signals from the existing
 ///   registered LowerBetter entries (`worst_p99_wake_latency_us`,
 ///   `worst_run_delay_us`, `worst_gap_ms`, `stuck_count`,
 ///   `worst_wake_latency_cv`, `worst_spread`, `worst_migration_ratio`,

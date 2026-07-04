@@ -107,8 +107,10 @@ pub fn is_perf_mode_unavailable(e: &anyhow::Error) -> bool {
 
 /// Check if an `anyhow::Error` carries a [`CpuBudgetUnsatisfiable`].
 ///
-/// Chain-aware. A `CpuBudgetUnsatisfiable` is a HARD ERROR (an explicit
-/// `--cpu-cap` / `cpu_budget` number the host cannot satisfy), NOT a skip.
+/// Chain-aware. A `CpuBudgetUnsatisfiable` is a HARD ERROR (an operator
+/// `--cpu-cap` number the host cannot satisfy), NOT a skip. (An author's
+/// per-test `cpu_budget` over the allowance skips via `TopologyInsufficient`
+/// instead — see `resolve_cpu_budget` — so it never carries this type.)
 ///
 /// [`CpuBudgetUnsatisfiable`]: crate::vmm::host_topology::CpuBudgetUnsatisfiable
 #[doc(hidden)]
@@ -196,8 +198,8 @@ pub fn is_kernel_unavailable(e: &anyhow::Error) -> bool {
 ///
 /// `pub(crate)` because every consumer (this module, the
 /// production parser at [`parse_kernel_list`], and the encoder
-/// helpers in `cargo-ktstr` that thread labels through
-/// `parse_kernel_list`) lives inside the workspace; no external
+/// helpers in `cargo-ktstr` that emit the wire format
+/// `parse_kernel_list` decodes) lives inside the workspace; no external
 /// surface is needed today. If a future external consumer needs
 /// to construct a `SanitizedKernelLabel` directly, expose
 /// `Self::new` as `pub` then — but the private inner stays a
@@ -299,7 +301,8 @@ impl SanitizedKernelLabel {
 ///   (`6.14.2`, `6.15-rc3`).
 /// - CacheKey: the version prefix (everything before the
 ///   `-tarball-` / `-git-` source tag).
-/// - Git: `git_{owner}_{repo}_{ref}` extracted from the URL.
+/// - Git: `git_{owner}_{repo}_{kind}_{ref}` extracted from the URL
+///   (kind = tag/branch/sha).
 /// - Path: `path_{basename}_{hash6}` — basename + 6-char crc32 of
 ///   the canonical path, disambiguating two `linux` directories
 ///   under different parents.
@@ -516,9 +519,9 @@ pub fn ktstr_test_early_dispatch() {
                 && let Some(name) = args.get(pos + 1)
                 && name.starts_with("verifier/")
             {
-                // verifier/<sched>/<kernel>/<preset> cells bypass
-                // libtest entirely — the cell handler resolves the
-                // scheduler binary, kernel, and preset topology, runs
+                // verifier/<sched>/<kernel>/<preset> cells bypass libtest
+                // entirely — the cell handler resolves the scheduler
+                // binary, kernel, and the cell's topology preset, runs
                 // collect_verifier_output, prints the result, and
                 // exits. No #[test] wrapper exists for declared
                 // schedulers (declare_scheduler! only emits a static),
@@ -1058,7 +1061,7 @@ fn ok_to_exit_code(r: AssertResult, expect_err: bool, allow_inconclusive: bool) 
     // detects the HostSkipRequest marker, reports via report::test_skip,
     // and returns Ok(AssertResult::skip) → this guard maps it to
     // EXIT_PASS. is_skip() is true only when `outcomes` is non-empty and
-    // every outcome is Outcome::Skip (assert/mod.rs); the empty-outcomes
+    // every outcome is Outcome::Skip (assert/plan.rs); the empty-outcomes
     // Pass identity has is_skip()==false and falls through to the
     // trailing `EXIT_PASS`.
     if r.is_skip() {
@@ -1694,8 +1697,8 @@ fn list_tests_all(ignored_only: bool) {
 ///   `[6.14, 6.16]` inclusive.
 /// - [`crate::kernel_path::KernelId::Path`] / [`crate::kernel_path::KernelId::CacheKey`] / [`crate::kernel_path::KernelId::Git`]:
 ///   sanitized-label equality — the producer-side encoder
-///   (`cargo_ktstr/kernel/wire_format.rs`) emits a deterministic
-///   label per variant (`path_…`, `git_owner_repo_ref`, version
+///   (`src/bin/cargo_ktstr/kernel/wire_format.rs`) emits a deterministic
+///   label per variant (`path_…`, `git_owner_repo_kind_ref`, version
 ///   prefix from cache key), so identical specs on both sides
 ///   produce identical sanitized labels.
 ///
@@ -1768,50 +1771,106 @@ fn format_unknown_kernel_label_error(
     )
 }
 
+/// The set of workspace PACKAGE names, parsed once from the workspace
+/// `Cargo.toml` baked in at compile time. [`list_verifier_cells_all`]
+/// uses it to skip `declare_scheduler!` decls whose `Discover(pkg)` is
+/// not a real workspace package — the macro-expansion FIXTURES in
+/// tests/declare_scheduler.rs register into `KTSTR_SCHEDULERS` but have
+/// no buildable package, so their cells must not be emitted.
+///
+/// `CARGO_MANIFEST_DIR` is the ktstr crate dir, which IS the workspace
+/// root in this repo, so its `Cargo.toml` carries `[workspace] members`.
+fn workspace_packages() -> &'static std::collections::HashSet<String> {
+    use std::sync::OnceLock;
+    static PKGS: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    PKGS.get_or_init(|| {
+        const ROOT_TOML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+        parse_workspace_member_packages(ROOT_TOML, env!("CARGO_PKG_NAME"))
+    })
+}
+
+/// Pure parse of `[workspace] members = [ ... ]` from a `Cargo.toml`
+/// string into the set of package names. The `.` member (the workspace
+/// root) maps to `root_pkg`; every other member's last path component is
+/// taken as its package name (this workspace's convention: member dir
+/// `scx-ktstr` = package `scx-ktstr`). Pure so it is unit-testable.
+fn parse_workspace_member_packages(
+    cargo_toml: &str,
+    root_pkg: &str,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    // Anchor on the [workspace] section so a stray `members` key
+    // elsewhere can't be mistaken for the workspace member list.
+    let Some(ws) = cargo_toml.find("[workspace]") else {
+        return out;
+    };
+    let after_ws = &cargo_toml[ws..];
+    let Some(m) = after_ws.find("members") else {
+        return out;
+    };
+    let after = &after_ws[m..];
+    let Some(open) = after.find('[') else {
+        return out;
+    };
+    let Some(close_rel) = after[open..].find(']') else {
+        return out;
+    };
+    for tok in after[open + 1..open + close_rel].split(',') {
+        let name = tok.trim().trim_matches('"').trim();
+        if name.is_empty() {
+            continue;
+        }
+        if name == "." {
+            out.insert(root_pkg.to_string());
+        } else {
+            out.insert(name.rsplit('/').next().unwrap_or(name).to_string());
+        }
+    }
+    out
+}
+
 /// Emit `verifier/<sched>/<kernel>/<preset>: test` lines — one per
-/// (declared scheduler × kernel-list entry × accepted gauntlet
-/// preset) cell. Mirrors the gauntlet emission pattern in
-/// [`list_tests_all`] but walks [`super::KTSTR_SCHEDULERS`] instead
-/// of [`KTSTR_TESTS`]. Cells are paired with the
+/// (declared scheduler × kernel-list entry × accepted topology preset)
+/// cell. Mirrors the gauntlet emission pattern in [`list_tests_all`] but
+/// walks [`super::KTSTR_SCHEDULERS`] instead of [`KTSTR_TESTS`]. The
+/// verifier sweeps each declared scheduler ACROSS topologies, because
+/// attach/liveness is topology-dependent (a scheduler can attach on one
+/// topology and wedge on another). Cells are paired with the
 /// [`run_verifier_cell`] handler registered in
 /// [`ktstr_test_early_dispatch`]'s `--exact verifier/...` branch.
 ///
-/// The matrix dimension is `KTSTR_KERNEL_LIST` (always populated by
-/// the `cargo ktstr verifier` dispatcher — even with a single
-/// auto-discovered kernel, the dispatcher synthesizes a one-entry
-/// list with a derived label). Each scheduler's
-/// `declare_scheduler!` `kernels = [...]` declaration acts as a
-/// per-scheduler filter on the matrix — `Version` / `Range`
-/// declarations match entries by raw-label equality / range
-/// membership; `Path` / `CacheKey` / `Git` declarations match by
-/// sanitized-label equality. An empty `kernels = []` declaration
-/// accepts every entry in the list (no filter).
+/// The matrix dimension is `KTSTR_KERNEL_LIST` (always populated by the
+/// `cargo ktstr verifier` dispatcher — even with a single
+/// auto-discovered kernel, the dispatcher synthesizes a one-entry list
+/// with a derived label). Each scheduler's `declare_scheduler!`
+/// `kernels = [...]` declaration acts as a per-scheduler filter on the
+/// matrix — `Version` / `Range` declarations match entries by
+/// raw-label equality / range membership; `Path` / `CacheKey` / `Git`
+/// declarations match by sanitized-label equality. An empty
+/// `kernels = []` declaration accepts every entry in the list.
 ///
-/// Acceptance filter mirrors the gauntlet branching in
-/// [`for_each_gauntlet_variant`]: perf-mode pinning constrains
-/// preset eligibility against the host's LLC width AND per-LLC CPU
-/// width, while no-perf-mode (KVM-emulated topology) only needs the
-/// total-CPU budget to fit. The mode is global for the verifier path
-/// — there is no per-cell `performance_mode` attribute analogous to
-/// `KtstrTestEntry::no_perf_mode` because every cell shares the same
-/// `cargo ktstr verifier` invocation.
+/// The topology dimension is [`crate::gauntlet::gauntlet_presets`], gated
+/// per scheduler: the verifier VM always runs no_perf_mode, so a preset
+/// is emitted only when the scheduler's constraints accept it under
+/// [`super::TopologyConstraints::accepts_no_perf_mode`] (declared scope +
+/// host CPU budget). A scheduler that accepts no preset emits no cell.
 ///
 /// Schedulers declared with [`super::SchedulerSpec::Eevdf`] or
-/// [`super::SchedulerSpec::KernelBuiltin`] are skipped at emission
-/// time because neither has a userspace binary to load BPF programs
-/// from — emitting cells that would always SKIP at execution wastes
-/// nextest's per-cell process budget and clutters the run output.
+/// [`super::SchedulerSpec::KernelBuiltin`] are skipped at emission time
+/// because neither has a userspace binary to load BPF programs from.
 ///
-/// Cell names with `/` in `sched.name` or `preset.name` would
-/// corrupt the splitn-based parse in [`run_verifier_cell`]. The
-/// emission elides such cells with a stderr warning so the operator
-/// sees the gap rather than silently dropping cells.
+/// When [`crate::KTSTR_VERIFIER_SCHEDULER_ENV`] is set (the
+/// `cargo ktstr verifier --scheduler <NAME>` filter), every declared
+/// scheduler whose `name` does not equal the value is skipped, so the
+/// sweep covers one scheduler across topologies instead of the full
+/// declared-scheduler matrix. A value matching no declared scheduler
+/// (or a non-BPF one) emits no cell; the dispatcher reports the empty
+/// result set rather than silently sweeping nothing.
 ///
-/// When `KTSTR_KERNEL_LIST` is absent (direct binary invocation
-/// outside the `cargo ktstr verifier` dispatcher), no cells emit.
-/// Operators who invoke a test binary directly with `--exact
-/// verifier/...` will see the cell handler's "kernel label not in
-/// KTSTR_KERNEL_LIST" error.
+/// Cell names with `/` in `sched.name` or `preset.name` would corrupt
+/// the splitn-based parse in [`run_verifier_cell`]; the emission elides
+/// such cells with a stderr warning. When `KTSTR_KERNEL_LIST` is absent
+/// (direct binary invocation outside the dispatcher), no cells emit.
 fn list_verifier_cells_all() {
     use super::SchedulerSpec;
     let kernel_list = read_kernel_list();
@@ -1819,10 +1878,20 @@ fn list_verifier_cells_all() {
         return;
     }
     let presets = crate::gauntlet::gauntlet_presets();
-    let (host_cpus, host_llcs, host_max_cpus_per_llc) = super::host_capacity();
-    let no_perf_mode = super::runtime::no_perf_mode_active();
+    let (host_cpus, _host_llcs, _host_max_cpus_per_llc) = super::host_capacity();
+
+    // `cargo ktstr verifier --scheduler <NAME>` filter (via
+    // KTSTR_VERIFIER_SCHEDULER): when set, sweep only the named declared
+    // scheduler across topologies instead of the full declared-scheduler
+    // matrix. Read once; unset (or non-unicode) leaves the sweep full.
+    let scheduler_filter = std::env::var(crate::KTSTR_VERIFIER_SCHEDULER_ENV).ok();
 
     for sched in super::KTSTR_SCHEDULERS.iter() {
+        if let Some(want) = &scheduler_filter
+            && sched.name != want.as_str()
+        {
+            continue;
+        }
         if matches!(
             sched.binary,
             SchedulerSpec::Eevdf | SchedulerSpec::KernelBuiltin { .. }
@@ -1836,10 +1905,42 @@ fn list_verifier_cells_all() {
             );
             continue;
         }
+        // Skip declarations whose binary is not a real, buildable
+        // scheduler. The macro-expansion FIXTURES in
+        // tests/declare_scheduler.rs (`binary = "scx-full"`, `"scx-ee"`,
+        // …) register into KTSTR_SCHEDULERS but expand to `Discover` of a
+        // package that is NOT a workspace member; emitting their cells
+        // would make `cargo ktstr verifier --run-ignored` fail on
+        // `cargo build -p <fixture>` for a nonexistent package. A
+        // `Discover` of a real workspace member (scx-ktstr) and a `Path`
+        // that exists still emit. This is the emission-time counterpart to
+        // the resolve arms in `run_verifier_cell`.
+        match sched.binary {
+            SchedulerSpec::Discover(pkg) if !workspace_packages().contains(pkg) => {
+                continue;
+            }
+            SchedulerSpec::Path(p) if !std::path::Path::new(p).exists() => {
+                continue;
+            }
+            _ => {}
+        }
         for kernel_entry in &kernel_list {
             if !sched_kernel_filter_accepts(sched.kernels, kernel_entry) {
                 continue;
             }
+            // One cell per (scheduler, kernel, topology preset). The
+            // verifier sweep runs each scheduler's "does it verify,
+            // attach, AND dispatch" check ACROSS topologies, because
+            // both vary with topology: attach/liveness (a scheduler can
+            // attach on one topology and wedge on another — odd LLC
+            // counts, large CPU counts, SMT) and verified_insns (a
+            // scheduler that bakes topology-derived config into .rodata
+            // hands the verifier different known constants, so it
+            // processes a different instruction count per topology). The
+            // verifier VM always
+            // runs no_perf_mode, so preset eligibility uses
+            // accepts_no_perf_mode: the KVM-emulated topology is gated by
+            // the scheduler's declared scope + the host CPU budget.
             for preset in presets.iter() {
                 if preset.name.contains('/') {
                     eprintln!(
@@ -1848,19 +1949,10 @@ fn list_verifier_cells_all() {
                     );
                     continue;
                 }
-                let accepted = if no_perf_mode {
-                    sched
-                        .constraints
-                        .accepts_no_perf_mode(&preset.topology, host_cpus)
-                } else {
-                    sched.constraints.accepts(
-                        &preset.topology,
-                        host_cpus,
-                        host_llcs,
-                        host_max_cpus_per_llc,
-                    )
-                };
-                if !accepted {
+                if !sched
+                    .constraints
+                    .accepts_no_perf_mode(&preset.topology, host_cpus)
+                {
                     continue;
                 }
                 println!(
@@ -1872,15 +1964,19 @@ fn list_verifier_cells_all() {
     }
 }
 
-/// Parse `verifier/<sched_name>/<kernel_label>/<preset_name>`, look
-/// up the declared scheduler in [`super::KTSTR_SCHEDULERS`] + the
-/// gauntlet preset in [`crate::gauntlet::gauntlet_presets`] + the kernel
-/// in [`KTSTR_KERNEL_LIST_ENV`](crate::KTSTR_KERNEL_LIST_ENV),
-/// resolve the scheduler binary path per
-/// [`super::SchedulerSpec`], boot the verifier VM via
-/// [`crate::verifier::collect_verifier_output`], and print the
-/// rendered output. Returns 0 on success, 1 on failure /
-/// malformed cell name.
+/// Parse `verifier/<sched_name>/<kernel_label>/<preset_name>`, look up
+/// the declared scheduler in [`super::KTSTR_SCHEDULERS`] + the gauntlet
+/// preset in [`crate::gauntlet::gauntlet_presets`] + the kernel in
+/// [`KTSTR_KERNEL_LIST_ENV`](crate::KTSTR_KERNEL_LIST_ENV), resolve the
+/// scheduler binary path per [`super::SchedulerSpec`], boot the verifier
+/// VM on that topology via [`crate::verifier::collect_verifier_output`],
+/// and print the rendered output. Returns 0 only when the scheduler
+/// verified (BPF loaded), turned on (the guest attach gate reached
+/// sched_ext `enabled`, surfaced via [`crate::verifier::AttachOutcome`]),
+/// AND dispatched the injected workload (a `WorkloadDispatched` frame) on
+/// this topology — the three gates `VerifierVmResult::cell_verdict`
+/// enforces; returns 1 on a verify / attach / dispatch failure, a
+/// post-attach teardown hang (`timed_out`), or a malformed cell name.
 ///
 /// The per-cell kernel directory is resolved by sanitized-label
 /// lookup in `KTSTR_KERNEL_LIST` — the
@@ -1898,7 +1994,10 @@ fn list_verifier_cells_all() {
 /// `--exact verifier/<eevdf>/...` invocation outside nextest
 /// (the only path that bypasses the emission-time filter); in
 /// that case they emit a `SKIP` banner + exit 0.
-fn run_verifier_cell(full_name: &str) -> i32 {
+fn run_verifier_cell_inner(
+    full_name: &str,
+    out_stats: &mut Vec<crate::verifier::ProgStats>,
+) -> i32 {
     use super::SchedulerSpec;
 
     let rest = match full_name.strip_prefix("verifier/") {
@@ -1918,10 +2017,10 @@ fn run_verifier_cell(full_name: &str) -> i32 {
     let (sched_name, kernel_label, preset_name) = (parts[0], parts[1], parts[2]);
 
     // Emit the cell banner BEFORE every SKIP / FAIL branch so the
-    // operator always sees which (scheduler, kernel, preset) tuple
+    // operator always sees which (scheduler, kernel, topology) tuple
     // produced the result. Without it an early-exit SKIP / FAIL would
-    // surface as a bare error line nextest tags with the full cell
-    // name but no per-axis context.
+    // surface as a bare error line nextest tags with the full cell name
+    // but no per-axis context.
     println!("\n=== {sched_name} | kernel {kernel_label} | topology {preset_name} ===");
 
     // Fail-fast on missing KVM with the canonical actionable error
@@ -1940,6 +2039,7 @@ fn run_verifier_cell(full_name: &str) -> i32 {
         return 1;
     };
 
+    // Resolve the cell's topology preset by its <preset> name segment.
     let preset_list = crate::gauntlet::gauntlet_presets();
     let Some(preset) = preset_list.iter().find(|p| p.name == preset_name) else {
         eprintln!("ktstr verifier: no gauntlet preset {preset_name:?} (cell {full_name:?})",);
@@ -2021,7 +2121,29 @@ fn run_verifier_cell(full_name: &str) -> i32 {
         }
     };
 
-    let kernel_path = kernel_entry.kernel_dir.clone();
+    // Resolve the kernel-build DIR to the actual bootable image file.
+    // `collect_verifier_output` -> `KtstrVm::builder().kernel()` loads the
+    // path verbatim (build() does NOT extract a source tree), so passing
+    // the raw dir makes the VMM loader read a directory as a bzImage and
+    // fail with "Unable to read bzImage header". `find_image_in_dir`
+    // handles both the build-tree (`arch/*/boot/bzImage`) and cache
+    // (`<dir>/bzImage`) layouts — the same resolution the eval path uses.
+    let kernel_path = if kernel_entry.kernel_dir.is_file() {
+        kernel_entry.kernel_dir.clone()
+    } else {
+        match crate::kernel_path::find_image_in_dir(&kernel_entry.kernel_dir) {
+            Some(img) => img,
+            None => {
+                eprintln!(
+                    "ktstr verifier: cell {full_name}: no kernel image \
+                     (arch/*/boot/bzImage or a cached bzImage) under {} — \
+                     build the kernel first",
+                    kernel_entry.kernel_dir.display(),
+                );
+                return 1;
+            }
+        }
+    };
     let topology = super::TopologyJson::from(preset.topology);
     let sched_args: Vec<String> = sched.sched_args.iter().map(|s| s.to_string()).collect();
 
@@ -2042,13 +2164,54 @@ fn run_verifier_cell(full_name: &str) -> i32 {
         Ok(result) => {
             let output = crate::verifier::format_verifier_output("verifier", &result, raw);
             print!("{output}");
-            0
+            // PASS requires verify + attach (sched_ext `enabled`) +
+            // dispatch (the injected workload made progress).
+            // `cell_verdict` names the first failing gate (timed_out →
+            // attach → dispatch, root cause first) and never keys on the
+            // guest exit code, which is 1 even on the verifier success
+            // path (no #[ktstr_test] body to dispatch).
+            let code = match result.cell_verdict() {
+                Ok(()) => 0,
+                Err(reason) => {
+                    eprintln!("ktstr verifier: cell {full_name} FAILED: {reason}");
+                    1
+                }
+            };
+            // Hand the per-program verified_insns out to the record writer
+            // so the dispatcher can render the instruction-count tables.
+            // Only this arm has stats; every earlier return (skip, kernel
+            // resolution error, build failure) leaves out_stats empty.
+            *out_stats = result.stats;
+            code
         }
         Err(e) => {
             eprintln!("ktstr verifier: cell {full_name} FAILED: {e:#}");
             1
         }
     }
+}
+
+/// Run a verifier cell and, when the `cargo ktstr verifier` dispatcher
+/// set [`crate::KTSTR_VERIFIER_RESULT_DIR_ENV`], record its PASS/FAIL
+/// outcome there so the dispatcher can render the run-summary table after
+/// nextest returns. Best-effort + env-gated: a direct
+/// `--exact verifier/...` invocation (env unset) behaves exactly as
+/// [`run_verifier_cell_inner`], and a record-write failure never changes
+/// the cell's exit code. A nextest RETRY re-runs this wrapper and
+/// overwrites the cell's own record (deterministic filename), so the
+/// final attempt's outcome is the one that lands in the table.
+fn run_verifier_cell(full_name: &str) -> i32 {
+    let mut stats = Vec::new();
+    let code = run_verifier_cell_inner(full_name, &mut stats);
+    if let Some(dir) = std::env::var_os(crate::KTSTR_VERIFIER_RESULT_DIR_ENV) {
+        crate::verifier::write_cell_record(
+            std::path::Path::new(&dir),
+            full_name,
+            code == 0,
+            &stats,
+        );
+    }
+    code
 }
 
 /// List tests with budget-based coverage maximization.
@@ -2429,9 +2592,10 @@ fn run_host_only_test_inner(entry: &KtstrTestEntry) -> Result<AssertResult> {
 /// env-override path and `build_host_cgroup_manager` for the
 /// cgroup-v2 Mode B/C delegation wire-up.
 ///
-/// `pub` so integration tests can pin against it instead of mirroring
-/// the literal in their own assertion strings (tests/host_mode_e2e.rs
-/// uses this to assert the resolve cascade's fallback). Treat as the
+/// `pub` so tests can pin against it instead of mirroring
+/// the literal in their own assertion strings (the
+/// `resolve_host_cgroup_parent_*` unit tests in `dispatch_tests.rs`
+/// assert unset/empty env falls back to this const). Treat as the
 /// canonical default — operators set `KTSTR_HOST_CGROUP_PARENT` to
 /// override.
 pub const DEFAULT_HOST_CGROUP_PARENT: &str = "/sys/fs/cgroup/ktstr";

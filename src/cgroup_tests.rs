@@ -104,8 +104,8 @@ fn cleanup_all_skips_non_dir_entries() {
 /// `root/mid/leaf/` plus `root/sibling/`, invokes
 /// [`cleanup_recursive`] directly on `root`, and verifies every
 /// directory is gone. Exercises the recursive call inside
-/// [`for_each_child_dir`] that item 7's `cleanup_recursive`
-/// function-pointer arg drives.
+/// [`for_each_child_dir`], which `cleanup_recursive` drives via a
+/// closure that threads `walk_root` through the recursion.
 #[test]
 fn cleanup_recursive_removes_nested_dirs_depth_first() {
     let _tempdir_keep_alive = make_inline_tempdir("nested");
@@ -802,9 +802,10 @@ fn set_memory_high_writes_bytes_or_max_keyword() {
     assert_eq!(fs::read_to_string(&target).unwrap(), "max");
 }
 
-/// `memory.low`'s "no protection" wire value is `"0"`, NOT
-/// `"max"` — the kernel treats `max` as a syntax error on
-/// `memory.low`. Pin both the bytes-set and the cleared paths.
+/// `memory.low`'s "no protection" wire value is `"0"`. ktstr writes
+/// `"0"` for `None` (not `"max"`, which the kernel accepts but means
+/// "protect everything" — the opposite intent). Pin both the
+/// bytes-set and the cleared paths.
 #[test]
 fn set_memory_low_writes_bytes_or_zero() {
     let (_tempdir_keep_alive, target, cg) =
@@ -1117,7 +1118,7 @@ fn set_freeze_returns_err_with_enoent_when_freeze_file_missing() {
     );
 }
 
-// -- setter Err-chain context wraps (#128 MEDIUM coverage) ------
+// -- setter Err-chain context wraps ---------------------------
 //
 // Each setter's `with_context` closure encodes the cgroup name,
 // the failed value, and a controller hint pointing at the

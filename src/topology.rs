@@ -4,7 +4,7 @@
 //! Provides cpuset generation methods used by
 //! [`CpusetSpec`](crate::scenario::ops::CpusetSpec).
 //!
-//! See the [Scenarios](https://likewhatevs.github.io/ktstr/guide/concepts/scenarios.html)
+//! See the [Scenarios](https://ktstr.dev/guide/concepts/scenarios.html)
 //! chapter for how topology drives cpuset partitioning.
 
 use anyhow::{Context, Result, bail};
@@ -1879,7 +1879,7 @@ mod tests {
         assert_eq!(llc.num_cores(), 0);
     }
 
-    // -- TestTopology + LlcInfo PartialEq + Eq (B1) --
+    // -- TestTopology + LlcInfo PartialEq + Eq --
 
     #[test]
     fn test_topology_partial_eq_equal_for_same_spec() {

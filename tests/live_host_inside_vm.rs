@@ -5,10 +5,8 @@
 //! the scx-ktstr scheduler attached, then runs the live-host
 //! pipeline INSIDE the guest:
 //!
-//! 1. [`BpfSyscallAccessor::from_running_kernel_filtered`] enumerates
-//!    every BPF map the guest kernel currently knows about, pinning
-//!    fds for the ones that match the scx-ktstr scheduler's name
-//!    suffix.
+//! 1. [`BpfSyscallAccessor::from_running_kernel`] enumerates and
+//!    pins every BPF map the guest kernel currently knows about.
 //! 2. [`LiveHostKernelEnv::discover`] resolves
 //!    `/sys/kernel/btf/vmlinux` (always present with sched_ext) plus
 //!    `/proc/kallsyms` for symbol lookups.
@@ -186,9 +184,9 @@ fn live_host_pipeline_inside_guest_produces_expected_shape(ctx: &Ctx) -> Result<
     }
 
     // 3. kallsyms — root-readable in the ktstr test environment.
-    //    Empty tables are valid (per KallsymsTable::is_empty's
-    //    contract: parsed-but-empty when CAP_SYSLOG is missing and
-    //    every address is zero-redacted), but we expect a
+    //    Empty tables are valid (per KallsymsTable::parse's
+    //    contract: addr==0 lines are skipped as the
+    //    non-CAP_SYSLOG-redacted view), but we expect a
     //    non-empty table inside ktstr's root-privileged guest.
     let kallsyms = match KallsymsTable::load_from(&env) {
         Ok(t) => t,

@@ -185,7 +185,7 @@ verdict to PASS via `expect_auto_repro`. Its shape:
     bpf_map_write = BPF_CRASH,
 )]
 fn bpf_crash_auto_repro_e2e(ctx: &Ctx) -> Result<AssertResult> {
-    ktstr::scenario::basic::custom_sched_mixed(ctx)
+    ktstr::scenario::basic::custom_crash_light(ctx)
 }
 ```
 

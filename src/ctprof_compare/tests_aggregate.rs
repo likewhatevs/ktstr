@@ -155,9 +155,11 @@ fn mode_display_hides_ratio_when_unanimous() {
     assert_eq!(m.to_string(), "SCHED_OTHER (3/5)");
 }
 
-/// `aggregate(OrdinalRange, &[])` returns `OrdinalRange {
-/// min: 0, max: 0 }` via the `unwrap_or(0)` in the first-value
-/// init. Sibling to the empty-affinity test.
+/// `aggregate(RangeI32, &[])` returns `OrdinalRange { min: 0,
+/// max: 0 }`: `Rangeable::range_across` returns `None` on an
+/// empty iterator (`it.next()?`), and the `RangeI32` arm's
+/// `None =>` branch in `groups::aggregate` collapses that to
+/// `(0, 0)`. Sibling to the empty-affinity test.
 #[test]
 fn aggregate_ordinal_range_on_empty_threads_is_zero() {
     let empty: Vec<&ThreadState> = vec![];

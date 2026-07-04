@@ -11,7 +11,7 @@
 //! in the [`idr`] module) through page table translation. No guest
 //! cooperation is needed.
 //!
-//! See the [Monitor](https://likewhatevs.github.io/ktstr/guide/architecture/monitor.html)
+//! See the [Monitor](https://ktstr.dev/guide/architecture/monitor.html)
 //! chapter of the guide.
 
 pub mod arena;
@@ -293,7 +293,7 @@ pub fn find_test_vmlinux() -> Option<std::path::PathBuf> {
                 .ok()
                 .and_then(|p| p.into_os_string().into_string().ok())
         }
-        // Multi-kernel specs (`A..B` ranges, `git+URL#REF`) cannot
+        // Range and git specs (`A..B` ranges, `git+URL#branch=main`) cannot
         // resolve to a single BTF source — there is no dispatch
         // loop here, just a one-shot lookup feeding `resolve_btf`.
         // Treat as "no env hint" and let the local-tree / sysfs
@@ -674,7 +674,8 @@ pub struct RqSchedstat {
 /// Domains are ordered from lowest (e.g. SMT, level 0) to highest
 /// (e.g. NUMA, level N) following the kernel's `sd->parent` chain.
 /// `newidle_call`, `newidle_success`, and `newidle_ratio` are `None`
-/// on 6.16+ where the kernel removed these fields.
+/// when the kernel lacks these fields (added in 7.0; backported to
+/// 6.18.5+, 6.12.65+; not present on 6.16-6.18.4).
 /// CONFIG_SCHEDSTATS load balancing stats are in the optional `stats`
 /// field.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]

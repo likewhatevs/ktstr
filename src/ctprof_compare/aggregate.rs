@@ -56,9 +56,10 @@ pub enum Aggregated {
     /// the [`crate::metric_types::Summable::sum_across`]
     /// reduction; storage stays u64 to preserve full precision
     /// across the entire schedstats / byte / tick range with
-    /// no lossy cast at aggregation time. Phase 4 will read
-    /// the registry's `unit` tag (not the wrapper type) at
-    /// render time to pick the auto-scale ladder.
+    /// no lossy cast at aggregation time. The render-time
+    /// auto-scale ladder is derived from the typed accessor
+    /// newtype via [`super::AggRule::ladder`] — there is no
+    /// separate `unit` tag on the metric def.
     Sum(u64),
     /// Group-wide maximum produced by the
     /// [`super::AggRule::MaxPeak`] / [`super::AggRule::MaxGaugeNs`] /
@@ -372,7 +373,7 @@ pub(super) fn merge_aggregated_into(existing: &mut Aggregated, val: &Aggregated)
 /// ranges (`a-b`), matching the kernel's cpuset display
 /// convention (`cat cpuset.cpus` emits `0-3,8`). Assumes the
 /// input is sorted ascending — capture layer
-/// (`crate::ctprof::ThreadState::cpus_allowed`) stores
+/// (`crate::ctprof::ThreadState::cpu_affinity`) stores
 /// sorted cpusets. Empty input returns an empty string. Used
 /// only by `Aggregated`'s `Display::fmt` Affinity arm; kept here so the
 /// renderer and its helper travel together.

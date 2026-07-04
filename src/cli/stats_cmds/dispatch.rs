@@ -79,25 +79,35 @@ pub fn compare_partitions(
     filter: Option<&str>,
     policy: &ComparisonPolicy,
     dir: Option<&Path>,
-    no_average: bool,
-    phase_opts: &crate::stats::PhaseDisplayOptions,
+    gate: &crate::stats::GateOptions,
 ) -> Result<i32> {
-    crate::stats::compare_partitions(
-        filter_a, filter_b, filter, policy, dir, no_average, phase_opts,
-    )
+    crate::stats::compare_partitions(filter_a, filter_b, filter, policy, dir, gate)
 }
 
-/// Noise-adjusted variant of [`compare_partitions`]: keeps every per-run row,
-/// summarizes each side's spread, and gates on B's mean leaving A's observed
-/// band rather than a fixed threshold. See `crate::stats::compare_partitions_noise`
-/// for the full contract.
+/// Noise-adjusted variant of [`compare_partitions`]: keeps every per-run row and
+/// gates a confident regression on the two sides being SEPARATED (a two-sided
+/// Welch t-test, or fully disjoint `[min, max]` bands) AND the mean delta being
+/// MATERIAL (the registry `default_abs` + `default_rel` dual-gate), instead of a
+/// fixed single-run threshold. When the scenarios carry phases it also renders a
+/// per-phase spread + coverage block (render-only, honoring `phase_opts`;
+/// per-phase never affects the exit). See
+/// `crate::stats::compare_partitions_noise` for the full contract.
 pub fn compare_partitions_noise(
     filter_a: &RowFilter,
     filter_b: &RowFilter,
     dir: Option<&Path>,
     spread_threshold_pct: f64,
+    phase_opts: &crate::stats::PhaseDisplayOptions,
+    gate: &crate::stats::GateOptions,
 ) -> Result<i32> {
-    crate::stats::compare_partitions_noise(filter_a, filter_b, dir, spread_threshold_pct)
+    crate::stats::compare_partitions_noise(
+        filter_a,
+        filter_b,
+        dir,
+        spread_threshold_pct,
+        phase_opts,
+        gate,
+    )
 }
 
 /// Collect the current host context via
@@ -115,9 +125,8 @@ pub fn show_host() -> String {
 /// `root` cannot be enumerated).
 ///
 /// Threshold is `max(3, query.len() / 3)` — same shape as
-/// [`suggest_closest_test_name`] / `suggest_closest_scenario_name`
-/// so the "did you mean?" UX stays uniform across the test-name,
-/// scenario-name, and run-key surfaces. The absolute-3 floor lets
+/// [`suggest_closest_test_name`] so the "did you mean?" UX stays
+/// uniform across the test-name and run-key surfaces. The absolute-3 floor lets
 /// short keys (e.g. `6.14`) tolerate small typos while the
 /// proportional `len/3` lets longer keys (e.g.
 /// `6.14-abcdef1-dirty`) tolerate roughly one bit-flip per 3

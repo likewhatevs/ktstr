@@ -11,18 +11,27 @@
 //!
 //!   1. packs `enable` cmds into `/sched_enable` and `disable` cmds
 //!      into `/sched_disable` in the initramfs
-//!      (`src/vmm/initramfs.rs::pack_sched_scripts`),
+//!      (`src/vmm/initramfs.rs::build_suffix`, which writes the
+//!      `sched_enable`/`sched_disable` cpio entries),
 //!   2. runs `/sched_enable` in shell-mode at
 //!      `ktstr_guest_init`'s `exec_shell_script("/sched_enable")`
 //!      call BEFORE the `busybox sh -c` payload,
 //!   3. runs `/sched_disable` AFTER the payload, BEFORE
 //!      `force_reboot()`.
 //!
-//! These tests pin the ENABLE half of that lifecycle. DISABLE-side
-//! observability is gated on a follow-up symmetric drain fix in
-//! `ktstr_guest_init` (force_reboot is bare `RB_AUTOBOOT` with no
-//! userspace drain — disable's writes after the pre-disable drain
-//! race the reboot tearing down the virtio TX ring).
+//! These tests pin both halves of that lifecycle. DISABLE-side
+//! observability is safe because `ktstr_guest_init` runs
+//! `exec_shell_script("/sched_disable")` then `tcdrain(1)`/`tcdrain(2)`
+//! BEFORE `force_reboot()` — on the exec path
+//! (src/vmm/rust_init/init.rs:407-429) and again on the interactive
+//! path (src/vmm/rust_init/init.rs:467-480). The post-disable drain
+//! lands the disable script's `echo > /proc/1/fd/1` bytes in host
+//! capture before `force_reboot`'s bare `RB_AUTOBOOT`
+//! (src/vmm/rust_init/process.rs:9) tears down the virtio TX ring.
+//! `shell_mode_only_disable_set_no_enable_marker` and
+//! `shell_mode_enable_and_disable_both_fire_with_payload` assert the
+//! disable marker's exact count and ordering; see the corroborating
+//! comments at lines 380-386 and 410-424.
 //!
 //! Line numbers in citation comments below are accurate as of the
 //! commit landing this file; symbol-level cites (`exec_shell_script`,
@@ -252,7 +261,8 @@ fn shell_mode_enable_fires_before_payload() {
         enable_count, 1,
         "SHELL_LIFECYCLE_ENABLE_MARKER count = {enable_count}; \
          expected exactly 1. Zero = /sched_enable never ran \
-         (initramfs pack broken in `pack_sched_scripts` OR \
+         (initramfs pack broken in `build_suffix`'s `sched_enable` \
+         cpio entry OR \
          shell-mode dispatch skipped `exec_shell_script` in \
          `ktstr_guest_init`'s shell branch). >1 = duplicate \
          invocation. Combined output:\n{combined}",

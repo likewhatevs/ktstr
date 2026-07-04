@@ -3,7 +3,8 @@
 //! Split into two submodules:
 //! - [`dispatch`] — thin wrappers over [`crate::stats`] +
 //!   host-context render entry points (list_runs, list_metrics,
-//!   list_values, compare_partitions, show_host, show_run_host,
+//!   list_values, compare_partitions, compare_partitions_noise,
+//!   show_host, show_run_host,
 //!   show_thresholds, print_stats_report) and the per-test /
 //!   per-run-key fuzzy-match helpers.
 //! - `explain_sidecar` — the per-sidecar `Option`-field absence

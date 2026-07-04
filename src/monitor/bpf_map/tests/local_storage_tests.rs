@@ -134,8 +134,8 @@ fn build_storage_scene(
 
     // Layout: smap @ 0x0000, buckets @ 0x1000, elems start @ 0x2000,
     // ls containers start @ 0x10_0000. Each elem occupies
-    // max(elem_sdata + value_size, 64) bytes; ls containers take 64
-    // bytes each. Sizes are padded so adjacent elems do not overlap.
+    // max(elem_sdata + sdata_data + value_size, 64) bytes; ls containers
+    // take 64 bytes each. Sizes are padded so adjacent elems do not overlap.
     let smap_pa: u64 = 0x0000;
     let buckets_pa: u64 = 0x1000;
     let elems_start: u64 = 0x2000;

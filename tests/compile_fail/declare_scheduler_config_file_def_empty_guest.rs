@@ -1,6 +1,6 @@
 // Pins config_file_def empty-string check on guest_path
-// position (element 1). Empty guest_path breaks the `mkdir -p`
-// invariant.
+// position (element 1). An empty guest_path leaves the config
+// with no destination path inside the guest.
 use ktstr::declare_scheduler;
 
 declare_scheduler!(MY_SCHED, {

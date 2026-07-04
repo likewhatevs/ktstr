@@ -8,7 +8,7 @@
 //!
 //! `map->btf_value_type_id` (set by libbpf to the user program's
 //! interpretation of the registered struct — `tools/lib/bpf/libbpf.c`
-//! around `map->btf_value_type_id = type_id` in `bpf_object__init_struct_ops`)
+//! around `map->btf_value_type_id = type_id` in `init_struct_ops_maps`)
 //! describes the `data` payload only; it does NOT cover the common
 //! header. To render through the existing BTF path with that type_id,
 //! the dump renderer reads from `kvalue + value_data` (the data start)

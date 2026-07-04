@@ -155,26 +155,23 @@
 //! # Library usage
 //!
 //! Default install (full feature set — includes the installed
-//! `ktstr` / `cargo-ktstr` bins' deps and the local LLM extractor):
+//! `ktstr` / `cargo-ktstr` bins' deps):
 //!
 //! ```toml
 //! [dev-dependencies]
-//! ktstr = "0.20.0"
+//! ktstr = "0.23.0"
 //! ```
 //!
 //! Lean dev-dep (drops the host-tooling crates: tikv-jemallocator,
-//! clap_complete, tree-sitter, tree-sitter-c, base64; keeps the
-//! `OutputFormat::LlmExtract` path):
+//! clap_complete, tree-sitter, tree-sitter-c, base64):
 //!
 //! ```toml
 //! [dev-dependencies]
-//! ktstr = { version = "0.20.0", default-features = false, features = ["llm"] }
+//! ktstr = { version = "0.23.0", default-features = false }
 //! ```
 //!
 //! # Feature flags
 //!
-//! - **`llm`** (default) — `OutputFormat::LlmExtract` via bundled
-//!   Qwen3-4B GGUF. Pulls in `llama-cpp-2` (cmake C++ build).
 //! - **`cli-bins`** (default) — umbrella for deps used only by the
 //!   four `src/bin/*.rs` entry points and the matching test-binary
 //!   dispatch hooks. Pulls in `tikv-jemallocator`, `clap_complete`,
@@ -561,6 +558,7 @@ pub mod remote_cache {
     pub fn remote_store(_entry: &CacheEntry, _cli_label: &str) {}
 }
 pub mod gauntlet;
+pub(crate) mod reflink;
 pub(crate) mod sync;
 #[cfg(any(feature = "export", feature = "remote-cache"))]
 pub(crate) mod tar_util;
@@ -715,9 +713,12 @@ pub use ktstr_macros::ktstr_test;
 /// Grouped into a single hidden module so that `use ktstr::*;` pulls
 /// in one module name instead of two leading-underscore items.
 /// Consumers of `#[ktstr_test]` should not reference anything under
-/// this path — the macro expansion names these crates via
-/// `::ktstr::__private::ctor` / `serde_json` and the set may change
-/// without notice. (`linkme` lives at the public crate root —
+/// this path — the `#[ktstr_test]` macro registers via
+/// `::ktstr::distributed_slice` / `::ktstr::linkme`; the `ctor` /
+/// `serde_json` re-exports here serve downstream test-author code
+/// (pre-`main()` setup and sidecar parsing) and ktstr's own
+/// declarative-ctor sites, and the set may change without notice.
+/// (`linkme` lives at the public crate root —
 /// [`ktstr::linkme`](crate::linkme) — since the macro now emits the
 /// public path.)
 #[doc(hidden)]
@@ -882,9 +883,9 @@ pub mod prelude {
     // namespace, distinct from the derive macro re-exported above.
     pub use crate::test_support::{
         BpfMapAgg, BpfMapWrite, CgroupPath, EXIT_FAIL, EXIT_INCONCLUSIVE, EXIT_PASS,
-        KTSTR_SCHEDULERS, KTSTR_TESTS, KtstrTestEntry, MemSideCache, Metric, MetricBounds,
-        MetricCheck, MetricHint, MetricSource, MetricStream, NumaDistance, NumaNode, OutputFormat,
-        Payload, PayloadKind, PayloadMetrics, Polarity, Scheduler, SchedulerSpec, SidecarResult,
+        KTSTR_SCHEDULERS, KTSTR_TESTS, KtstrTestEntry, MemSideCache, Metric, MetricCheck,
+        MetricHint, MetricStream, NumaDistance, NumaNode, OutputFormat, Payload, PayloadKind,
+        PayloadMetrics, PerfDeltaAssertion, Polarity, Scheduler, SchedulerSpec, SidecarResult,
         Sysctl, Topology, TopologyConstraints, WatchBpfMap, extract_metrics, find_scheduler,
         find_test, sidecar_dir,
     };
@@ -1033,6 +1034,26 @@ pub const KTSTR_KERNEL_LIST_ENV: &str = "KTSTR_KERNEL_LIST";
 /// Range/Git specs, or a Version/CacheKey cache miss) are absent from
 /// the map, and the fallback yields the same `None` for them.
 pub const KTSTR_KERNEL_COMMIT_ENV: &str = "KTSTR_KERNEL_COMMIT";
+
+/// Name of the environment variable cargo-ktstr's perf-delta sets to the
+/// PROJECT tree's short commit hash (with a `-dirty` suffix when the tree
+/// is dirty) that the child's sidecars must record as their
+/// `project_commit`. Unlike [`KTSTR_KERNEL_COMMIT_ENV`] this is a single
+/// value, not a `dir=commit` map — a child has exactly one project tree.
+///
+/// perf-delta computes the A/B commit labels ONCE in the orchestrator
+/// (`short_hash`) and both the pool FILTER and the two run children read
+/// the same value: the filter partitions on it, and each child records it
+/// verbatim (the sidecar writer's `detect_project_commit` returns this
+/// value when the env is set), so the recorded `project_commit` and the
+/// filter can never diverge on the `-dirty` suffix. It also lets the
+/// baseline run, whose tree is a plain gix checkout with no `.git`, skip a
+/// `gix::discover` that would otherwise resolve to the wrong repo (or none).
+///
+/// Override only: an absent or empty env falls back to the in-process
+/// `gix::discover` + dirty-walk, which is correct for a normal (non
+/// perf-delta) test run.
+pub const KTSTR_PROJECT_COMMIT_ENV: &str = "KTSTR_PROJECT_COMMIT";
 
 /// Name of the environment variable cargo-ktstr sets to signal
 /// "this test process was launched by a cargo-ktstr orchestration
@@ -1229,6 +1250,29 @@ pub const KTSTR_KERNEL_PARALLELISM_ENV: &str = "KTSTR_KERNEL_PARALLELISM";
 /// each reader; if the name ever changes, the change lands in one
 /// place instead of fanning out to every call site.
 pub const KTSTR_VERIFIER_RAW_ENV: &str = "KTSTR_VERIFIER_RAW";
+
+/// Name of the environment variable carrying the directory that each
+/// `cargo ktstr verifier` cell writes its per-cell PASS/FAIL record to.
+/// The `cargo ktstr verifier` dispatcher creates the dir, exports this
+/// var (inherited by the spawned `cargo nextest run` and thus by every
+/// cell process), and after nextest returns reads the records back to
+/// render the per-(topology × scheduler) summary grid. Unset
+/// when a verifier cell runs outside the dispatcher (a hand-driven
+/// `--exact verifier/...`): the cell then simply skips the record write.
+/// Single source of truth so the name is not spelled by hand at the
+/// writer (cell) and reader (dispatcher) ends.
+pub const KTSTR_VERIFIER_RESULT_DIR_ENV: &str = "KTSTR_VERIFIER_RESULT_DIR";
+
+/// Name of the environment variable carrying the operator's
+/// `cargo ktstr verifier --scheduler <NAME>` filter. Set by the
+/// dispatcher in `src/bin/cargo_ktstr/verifier.rs`; read by
+/// `crate::test_support::dispatch`'s verifier cell emission, which
+/// skips every declared scheduler whose `name` does not equal the value
+/// so the sweep runs one scheduler across topologies instead of the
+/// full declared-scheduler matrix. Unset, every declared scheduler is
+/// swept. Single source of truth so the writer (dispatcher) and reader
+/// (emission) do not spell the name by hand.
+pub const KTSTR_VERIFIER_SCHEDULER_ENV: &str = "KTSTR_VERIFIER_SCHEDULER";
 
 /// Name of the environment variable that forces ktstr to skip the
 /// `perf_event_open` access check + the
@@ -1476,7 +1520,7 @@ pub const KTSTR_JEMALLOC_ALLOC_WORKER_BINARY_ENV: &str = "KTSTR_JEMALLOC_ALLOC_W
 /// Name of the environment variable that opts into per-assertion
 /// PASS logging in the verdict pipeline. Read once per call at
 /// [`crate::assert::claim::Verdict::new`] via the
-/// `log_passes_default` helper at src/assert/claim.rs L45-50:
+/// `log_passes_default` helper in src/assert/claim.rs:
 /// the reader is `!(v.is_empty() || v == "0")`, so empty and
 /// the literal `"0"` disable; any other value (`"1"`, `"true"`,
 /// `"yes"`, even `"false"` because it isn't `"0"`) enables.
@@ -1523,7 +1567,8 @@ pub const KTSTR_WPROF_PATH_ENV: &str = "KTSTR_WPROF_PATH";
 // literals, and `KERNEL_ID_GRAMMAR` is a `const &str` not a literal.)
 pub const KTSTR_KERNEL_HINT: &str = "set KTSTR_KERNEL to one of: \
     exact version (`6.14`), inclusive range (`6.14..7.0` or \
-    `6.14..=7.0`), git source (`git+URL#REF`), absolute or \
+    `6.14..=7.0`), git source (`git+URL#tag=NAME`, \
+    `git+URL#branch=NAME`, or `git+URL#sha=<40-hex>`), absolute or \
     `~`-prefixed path, or cache key. List cached keys with \
     `cargo ktstr kernel list`; build new ones with \
     `cargo ktstr kernel build`";
@@ -1639,7 +1684,8 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
                 // Explicit cache key not found — skip general cache scan.
                 skip_cache_scan = true;
             }
-            // Multi-kernel specs (`A..B` ranges, `git+URL#REF` sources)
+            // Multi-kernel specs (`A..B` ranges; git sources like
+            // `git+URL#branch=main` are single-kernel but share this arm)
             // are only meaningful at the test/coverage/verifier
             // subcommand entry points where the runner can fan out
             // across kernels. The KTSTR_KERNEL env reader resolves a
@@ -1717,15 +1763,20 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
     Ok(kernel_path::find_image(None, release_ref))
 }
 
-/// Name of the environment variable selecting the build profile for a
-/// `SchedulerSpec::Discover` scheduler built on demand by
-/// [`build_and_find_binary`]. `"release"` builds the scheduler-under-
-/// test with the release profile; any other value (or unset) uses the
-/// default dev profile. This DECOUPLES the scheduler-under-test's
-/// profile from the harness/test binary's compile profile:
-/// `cargo ktstr test --release-scheduler` sets this so the scheduler
-/// runs optimized while the harness keeps its dev-profile assertion
-/// thresholds and `catch_unwind` behavior; `--release` sets both.
+/// Name of the environment variable selecting the cargo build profile
+/// for a `SchedulerSpec::Discover` scheduler built on demand by
+/// [`build_and_find_binary`]. Holds a cargo profile NAME; unset / empty
+/// means the RELEASE default (see `build_and_find_binary` — a debug
+/// sched_ext scheduler is never the intended thing to test). Set by
+/// `cargo ktstr <cmd> --profile <NAME>` (on `test` / `coverage` /
+/// `verifier` / `perf-delta` / `replay`), or exported directly to pick a
+/// non-default profile. This is INDEPENDENT of the harness `--release`
+/// (`--cargo-profile release` to nextest), which selects the harness/test
+/// binary's compile profile and does NOT touch this var — DECOUPLING the
+/// scheduler-under-test's profile from the harness profile: the scheduler
+/// runs optimized by default while the harness keeps its dev-profile
+/// assertion thresholds and `catch_unwind` behavior unless its own build
+/// profile is set separately.
 pub const KTSTR_SCHEDULER_PROFILE_ENV: &str = "KTSTR_SCHEDULER_PROFILE";
 
 /// Name of the presence-only opt-out env var that re-enables the
@@ -1742,6 +1793,68 @@ pub const KTSTR_SCHEDULER_PROFILE_ENV: &str = "KTSTR_SCHEDULER_PROFILE";
 /// re-enable the hazard.
 pub const KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV: &str = "KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK";
 
+/// The cargo build profile NAME for the scheduler-under-test:
+/// [`KTSTR_SCHEDULER_PROFILE_ENV`] when set non-empty, else the
+/// `"release"` default. Single source of the default so
+/// [`build_and_find_binary`] (which builds it) and the `Discover`
+/// fallback probe (which locates a pre-built one) never disagree on
+/// which `target/<dir>/` the scheduler lands in.
+pub fn scheduler_profile_name() -> String {
+    resolve_scheduler_profile(std::env::var(KTSTR_SCHEDULER_PROFILE_ENV).ok())
+}
+
+/// Pure resolution of the scheduler build-profile NAME from the raw
+/// [`KTSTR_SCHEDULER_PROFILE_ENV`] value: a non-empty value verbatim,
+/// else the `"release"` default. An empty string is treated as UNSET —
+/// so a stray `--profile ""` / `KTSTR_SCHEDULER_PROFILE=` can never make
+/// [`build_and_find_binary`] run `cargo build --profile ""` (which would
+/// resolve the artifact under an empty-named profile dir). Split from
+/// [`scheduler_profile_name`] so the empty / unset / named cases are
+/// unit-testable without mutating process env.
+fn resolve_scheduler_profile(env_val: Option<String>) -> String {
+    env_val
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "release".to_string())
+}
+
+#[cfg(test)]
+mod scheduler_profile_tests {
+    use super::resolve_scheduler_profile;
+
+    /// The scheduler build-profile default: unset AND empty both fall
+    /// back to `release` (empty is treated as unset so a stray
+    /// `--profile ""` / `KTSTR_SCHEDULER_PROFILE=` cannot build under an
+    /// empty-named profile dir); a non-empty name passes through verbatim
+    /// (`dev`, `release`, or any custom `[profile.<name>]`). Pins the
+    /// exact regressions [`resolve_scheduler_profile`] guards — dropping
+    /// the `.filter(!is_empty)` (empty → empty name) or flipping the
+    /// default flips a case.
+    #[test]
+    fn resolve_scheduler_profile_defaults_and_passthrough() {
+        assert_eq!(
+            resolve_scheduler_profile(None),
+            "release",
+            "unset -> release default"
+        );
+        assert_eq!(
+            resolve_scheduler_profile(Some(String::new())),
+            "release",
+            "empty string is treated as unset -> release, never an empty profile name",
+        );
+        assert_eq!(
+            resolve_scheduler_profile(Some("dev".into())),
+            "dev",
+            "named profile passes through verbatim"
+        );
+        assert_eq!(resolve_scheduler_profile(Some("release".into())), "release");
+        assert_eq!(
+            resolve_scheduler_profile(Some("custom".into())),
+            "custom",
+            "custom [profile.<name>] passes through unchanged",
+        );
+    }
+}
+
 /// Build a cargo binary package and return its output path.
 ///
 /// Runs from the ktstr crate's manifest directory (which is also the
@@ -1749,16 +1862,25 @@ pub const KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV: &str = "KTSTR_SCHEDULER_ALLO
 /// unification (e.g. vendored libbpf-sys) is always in effect,
 /// regardless of the calling process's working directory.
 ///
-/// Honors [`KTSTR_SCHEDULER_PROFILE_ENV`]: when set to `"release"` the
-/// build adds `--release`, so the returned artifact path resolves under
-/// `target/release/` — letting the scheduler-under-test be built
-/// release-profile independently of how the calling test binary was
-/// compiled.
+/// The scheduler-under-test is built with the RELEASE profile by
+/// DEFAULT: a debug sched_ext scheduler is far slower and its BPF
+/// verifier instruction counts differ, so it is never the intended thing
+/// to test. [`KTSTR_SCHEDULER_PROFILE_ENV`] overrides the profile name
+/// (set by `cargo ktstr <cmd> --profile <NAME>`); an unset / empty value
+/// keeps the release default. The build passes `cargo build --profile
+/// <name>` verbatim (`dev` = the default profile, `release` == `--release`,
+/// any custom `[profile.<name>]`), so the returned artifact path resolves
+/// under the matching `target/<dir>/`.
 pub fn build_and_find_binary(package: &str) -> anyhow::Result<std::path::PathBuf> {
-    let mut build_args: Vec<&str> = vec!["build", "-p", package, "--message-format=json"];
-    if std::env::var(KTSTR_SCHEDULER_PROFILE_ENV).as_deref() == Ok("release") {
-        build_args.push("--release");
-    }
+    let profile = scheduler_profile_name();
+    let build_args: Vec<String> = vec![
+        "build".into(),
+        "-p".into(),
+        package.into(),
+        "--message-format=json".into(),
+        "--profile".into(),
+        profile,
+    ];
     let output = std::process::Command::new("cargo")
         .args(&build_args)
         .current_dir(env!("CARGO_MANIFEST_DIR"))

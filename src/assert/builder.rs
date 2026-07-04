@@ -92,7 +92,7 @@ pub struct Assert {
     ///     wake latencies are single-digit µs, so sub-µs resolution
     ///     matters for regression gates);
     ///   - the reporting fields use US for readability in
-    ///     `stats compare` / dashboard output.
+    ///     `perf-delta` / dashboard output.
     ///
     /// Both are computed from the same underlying
     /// [`WorkerReport::wake_latencies_ns`] samples — see
@@ -255,10 +255,10 @@ impl Assert {
     /// the Debug impl or source. Output is a sequence of indented
     /// `row` lines ending with a newline; the caller owns any
     /// outer section header (the `show-thresholds` CLI already
-    /// prints `Test: ...` / `Scheduler: ...` lines above the
-    /// threshold block, which together establish context — an
-    /// additional `Resolved assertion thresholds:` banner here
-    /// would be a redundant third header).
+    /// prints `Test: ...` / `Scheduler: ...` / `Resolved assertion
+    /// thresholds:` lines above the threshold block, and
+    /// `format_human` emits no outer header of its own so it does
+    /// not duplicate that banner).
     pub fn format_human(&self) -> String {
         use std::fmt::Write;
         let mut out = String::new();
@@ -308,8 +308,9 @@ impl Assert {
         out
     }
 
-    /// Identity element for [`Assert::merge`]: every field is `None`,
-    /// so neither side of a merge with `NO_OVERRIDES` is altered.
+    /// Identity element for [`Assert::merge`]: every Option field is
+    /// `None` and `enforce_monitor_thresholds` is `false`, so neither
+    /// side of a merge with `NO_OVERRIDES` is altered.
     /// Identical to the value returned by [`Self::default_checks`] —
     /// the const is for spread-into-struct-literal composition, the
     /// const fn is the method-style entry point.
@@ -511,7 +512,7 @@ impl Assert {
         // `Option::or` is not yet const-stable, so each field expands
         // a match rather than calling `other.x.or(self.x)`. Keep it
         // this way until `const fn` can call `Option::or`; at that
-        // point the 19 match blocks collapse to 19 `.or()` calls.
+        // point the 21 match blocks collapse to 21 `.or()` calls.
         Assert {
             not_starved: match other.not_starved {
                 Some(v) => Some(v),
@@ -708,7 +709,7 @@ impl Assert {
     /// canonical default from `MonitorThresholds::new()`
     /// — so a test that only cares about `max_keep_last_rate` can chain
     /// `.max_keep_last_rate(N).with_monitor_defaults()` and get the
-    /// other four enforced at their canonical defaults.
+    /// other five enforced at their canonical defaults.
     pub const fn with_monitor_defaults(mut self) -> Self {
         use crate::monitor::MonitorThresholds;
         let d = MonitorThresholds::new();

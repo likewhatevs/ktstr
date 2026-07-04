@@ -69,10 +69,10 @@ fn parse_summary_records_schedstat_failure() {
     )
     .unwrap();
 
-    // capture_with(_, _, false) skips the production gate so
-    // parse_summary is None; use true and stage a /proc tree
-    // that the host_context probe absorbs without panicking.
-    // For the synthetic-tree pattern, stage a tally directly.
+    // Drive capture_thread_at_with_tally directly against a
+    // manually-staged ParseTally: this exercises the per-file
+    // tally path without the capture_with pipeline (which gates
+    // parse_summary on use_syscall_affinity).
     let mut tally = ParseTally::default();
     let mut tally_opt: Option<&mut ParseTally> = Some(&mut tally);
     tally_opt.as_mut().unwrap().tids_walked += 1;

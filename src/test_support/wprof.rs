@@ -3,9 +3,10 @@
 //! tests.
 //!
 //! The wprof trace is generated inside the guest VM and shipped to
-//! the host via the `MsgType::WprofTrace` virtq message; the
-//! host-side dispatch arm in
-//! `test_support::eval::run_ktstr_test_inner`'s wprof handler writes
+//! the host via the `MsgType::WprofTrace` virtq message; a
+//! post-drain pre-pass in
+//! `test_support::eval::run_ktstr_test_inner_impl` reassembles the
+//! trace via `reassemble_wprof_trace` and writes
 //! a `.wprof.pb` file per test run under
 //! `{sidecar_dir()}/{test_name}-{variant_hash:016x}.wprof.pb` — the
 //! variant hash keys the artifact to the resolved variant so sibling

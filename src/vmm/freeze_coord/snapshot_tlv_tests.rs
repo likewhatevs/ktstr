@@ -112,8 +112,9 @@ fn decode_full_buffer_tag_uses_full_length() {
 }
 
 /// Reply frame is exactly header + `size_of::<SnapshotReplyPayload>()`;
-/// CRC32 over payload bytes matches the wire-format contract
-/// `parse_tlv_stream` enforces on the guest side.
+/// CRC32 over payload bytes matches the wire-format contract the
+/// guest's `request_snapshot` reply reader enforces (guest_comms.rs)
+/// when validating the host->guest reply frame.
 #[test]
 fn frame_reply_size_and_crc() {
     let bytes = frame_snapshot_reply(123, SNAPSHOT_STATUS_OK, "");

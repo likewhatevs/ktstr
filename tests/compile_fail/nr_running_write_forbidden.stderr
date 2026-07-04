@@ -1,5 +1,0 @@
-error[E0433]: failed to resolve: could not find `WriteableField` in `ops`
-  --> tests/compile_fail/nr_running_write_forbidden.rs:23:35
-   |
-23 |     let _ = ktstr::scenario::ops::WriteableField::NrRunning;
-   |                                   ^^^^^^^^^^^^^^ could not find `WriteableField` in `ops`

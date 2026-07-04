@@ -1,4 +1,4 @@
-// `validate_constraints_expr` must recurse into struct-literal
+// `validate_const_eligible` must recurse into struct-literal
 // field values. Without the recursion, an outer
 // `TopologyConstraints { .. }` shape would accept any non-const
 // expression inside a field — defeating the const-eval guard.

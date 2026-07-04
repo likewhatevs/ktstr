@@ -59,7 +59,7 @@ const KTSTR_SCHED: Scheduler =
     auto_repro = false,
 )]
 fn workload_root_cgroup_creates_dir_and_hosts_workload_cgroups(ctx: &Ctx) -> Result<AssertResult> {
-    // Run a tiny no-workload scenario so the host-side
+    // Run a tiny no-workload scenario so the guest-side
     // `vmm::rust_init::create_workload_root_cgroup_from_file` has
     // fired by the time the assertions below run. The actual
     // CgroupManager-managed workload cgroup creation is exercised

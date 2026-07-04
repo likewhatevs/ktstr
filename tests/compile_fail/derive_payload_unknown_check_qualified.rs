@@ -2,8 +2,9 @@
 // compile. When the user writes `MetricCheck::nonexistent_check(...)`, the
 // macro sees the prefix via `expr_has_check_prefix`, skips its
 // implicit `::ktstr::test_support::MetricCheck::` prepend, and emits the
-// user's path verbatim — the same E0599 "no function named ... in
-// `MetricCheck`" still fires. Pairs with `derive_payload_unknown_check.rs`
+// user's path verbatim — the same E0599 "no variant or associated
+// item named ... found for enum `MetricCheck`" still fires. Pairs with
+// `derive_payload_unknown_check.rs`
 // (bare form); both must bail, neither may silently resolve to
 // something else.
 use ktstr::Payload;

@@ -69,8 +69,9 @@ basename.
 
 Each test invocation writes a `*.ktstr.json` sidecar per variant
 into `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{project_commit}/`.
-`cargo ktstr stats list` enumerates runs; `cargo ktstr stats
-compare`, `list-values`, and `show-host` operate on those sidecars.
+`cargo ktstr stats list` enumerates runs; `list-values` and
+`show-host` inspect those sidecars, and `cargo ktstr perf-delta`
+compares them across commits.
 `list-metrics` is independent of the sidecar pool — it enumerates the
 static `ktstr::stats::METRICS` regression-metric registry (metric
 names, polarities, default abs/rel thresholds, units) and takes no

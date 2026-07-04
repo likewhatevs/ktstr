@@ -1926,7 +1926,7 @@ mod tests {
     #[test]
     fn build_device_msi_routing_empty_is_valid() {
         // All-masked IOAPIC -> empty route set -> nr=0 table (the re-mask-all
-        // case the kernel reviewer verified: FamStructWrapper::new(0) yields a
+        // case: FamStructWrapper::new(0) yields a
         // valid header-only kvm_irq_routing{nr:0}).
         let mut routing = build_device_msi_routing(&[]).expect("empty routing");
         assert_eq!(routing.as_mut_slice().len(), 0, "no entries for empty set");

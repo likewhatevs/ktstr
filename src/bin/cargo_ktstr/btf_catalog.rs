@@ -17,7 +17,8 @@
 //!    anchor each struct in BTF.
 //!
 //! The anchor is cached in `target/ktstr_btf_anchor.h` with an ahash
-//! of all inputs (ktstr version, source paths, cflags, .bpf.o sizes).
+//! of all inputs (ktstr version, source paths, cflags, .bpf.o names
+//! and sizes).
 //! Regenerated only when inputs change.
 
 use std::collections::{BTreeSet, HashSet};
@@ -47,8 +48,8 @@ pub(crate) fn generate_btf_anchor(
     // Fast path: hash all inputs that affect the anchor output.
     // - ktstr version: pipeline logic changes invalidate
     // - source paths: file set changes
-    // - .bpf.o sizes: proxy for source content changes (recompilation
-    //   changes object size via BTF/code changes)
+    // - .bpf.o names + sizes: proxy for source file-set and content
+    //   changes (recompilation changes object size via BTF/code changes)
     // - cflags: different includes change the dep chain
     bpf_sources.sort();
     let input_hash = {

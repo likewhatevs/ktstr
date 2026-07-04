@@ -1,9 +1,3 @@
-// The expected `.so` baseline below assumes the `llm` feature is
-// enabled (so libgomp + libstdc++ are dragged in via llama-cpp-2's
-// `openmp` build). Without the feature the count is smaller and a
-// different baseline would apply; gate the whole test so the
-// expected counts match the configuration they were derived from.
-#![cfg(feature = "llm")]
 //! Pin test for the `ktstr` binary's dynamic library dependency
 //! count.
 //!
@@ -41,14 +35,8 @@
 //!
 //! # glibc version assumption
 //!
-//! The 5-entry baseline (libgomp.so.1, libstdc++.so.6,
-//! libgcc_s.so.1, libm.so.6, libc.so.6) assumes **glibc >= 2.34**
-//! AND a host C++ runtime that ships libstdc++ + libgomp. The
-//! libgomp + libstdc++ entries are pulled by `llama-cpp-2`'s
-//! `openmp` feature: the upstream `llama-cpp-sys-2` build links
-//! the linked llama.cpp C++ sources, dragging libstdc++ in for
-//! the runtime, and the OpenMP-parallel matmul path drags libgomp
-//! in for the parallel runtime. Starting with glibc 2.34 (released
+//! The 3-entry baseline (libgcc_s.so.1, libm.so.6, libc.so.6)
+//! assumes **glibc >= 2.34**. Starting with glibc 2.34 (released
 //! 2021-08-01), glibc consolidated `libpthread.so.0`,
 //! `libdl.so.2`, `libutil.so.1`, and `libanl.so.1` into
 //! `libc.so.6`; a binary that pulls in any of those legacy libs
@@ -102,18 +90,11 @@ fn ktstr_binary_dynamic_deps_pinned() {
         .collect();
 
     // Expected dynamic dep set on a glibc-linked Linux host:
-    //   libgomp.so.1   — OpenMP runtime. `llama-cpp-2` builds with
-    //     the `openmp` feature enabled (see Cargo.toml comment on
-    //     llama-cpp-2) for OpenMP-parallel matmul during inference;
-    //     the upstream C++ link pulls in libgomp from the system.
-    //   libstdc++.so.6 — C++ standard library, pulled by the
-    //     `llama-cpp-sys-2` build that links the linked llama.cpp
-    //     C++ sources.
     //   libgcc_s.so.1  — Rust unwinding personality on Linux. Even
     //     under panic=abort, the linker pulls it in for stack-unwind
     //     metadata referenced by the standard library.
     //   libm.so.6      — transcendental math (exp/log/sqrt) used
-    //     transitively by several deps (rand, polars, llama-cpp-2).
+    //     transitively by several deps (rand, polars).
     //   libc.so.6      — glibc itself.
     // Third-party jemalloc ships vendored and statically-linked
     // (see Cargo.toml comment on tikv-jemallocator). libbpf is
@@ -124,7 +105,7 @@ fn ktstr_binary_dynamic_deps_pinned() {
     // transitive crate dep introduced a dynamic link requirement.
     // Confirm the new link is intentional, then bump this pin and
     // note the reason in the commit message.
-    const EXPECTED_DEPS: usize = 5;
+    const EXPECTED_DEPS: usize = 3;
 
     assert_eq!(
         deps.len(),
@@ -149,7 +130,7 @@ fn ktstr_binary_dynamic_deps_pinned() {
     // Harden the libgcc_s check: the presence gate above proves
     // the NAME appears somewhere in the ldd output, but NOT that
     // the dynamic loader actually resolved it to a real file. An
-    // ldd line shaped `libgcc_s.so.1 => not found (0x0)` would
+    // ldd line shaped `libgcc_s.so.1 => not found` would
     // satisfy `contains("libgcc_s.so")` yet crash at runtime on
     // the first unwind. Pin the `=>` resolution form AND verify
     // the resolved path exists as a regular file on disk — belt

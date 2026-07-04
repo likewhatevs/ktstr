@@ -236,9 +236,11 @@ fn scenario_stats_phase_lookup_by_step_index_not_position() {
 }
 
 /// `ScenarioStats::phase_metric` is the typed shortcut for
-/// `phase(idx).and_then(|p| p.get(metric))`. Returns the value
-/// when both the step and metric are present; `None` when either
-/// is missing.
+/// `phase(idx).and_then(|p| p.get(metric))`, falling back to the
+/// per-cgroup Counter total when the metric misses the pooled
+/// `metrics` store (see `phase_metric`'s rustdoc for the two stores
+/// checked). Returns the value when both the step and metric are
+/// present; `None` when either is missing.
 #[test]
 fn scenario_stats_phase_metric_resolves_typed_lookup() {
     let mut metrics = BTreeMap::new();
@@ -340,7 +342,7 @@ fn scenario_stats_phase_step_resolves_to_step_bucket() {
 #[test]
 fn scenario_stats_run_metric_resolves_ext_family_sentinel_free() {
     let mut ext = BTreeMap::new();
-    // A reclassified Distribution metric (was a typed field pre-Item-7).
+    // A reclassified Distribution metric (was a typed field before it moved to ext_metrics).
     ext.insert("worst_run_delay_us".to_string(), 48.0);
     // A reclassified WorstLowest metric.
     ext.insert("worst_iterations_per_cpu_sec".to_string(), 12345.0);

@@ -4,7 +4,7 @@ thread_local! {
     /// Thread-local active phase label. Set by the [`PhaseGuard`]
     /// scope helper at scenario-driver `run_step` entry and read by
     /// [`AssertDetail::new`] / [`PassDetail::binary`] /
-    /// [`PassDetail::unary`] / [`NoteValue`] producers so every
+    /// [`PassDetail::unary`] / [`InfoNote::new`] producers so every
     /// detail constructed under a guarded scope auto-stamps its
     /// `phase` field with the active label without the producer
     /// having to thread context through every `with_phase` chain.
@@ -17,7 +17,7 @@ thread_local! {
 /// Snapshot the active phase label installed by the most recent
 /// [`PhaseGuard::install`] on this thread. `None` outside any
 /// guarded scope. Construction sites for [`AssertDetail`] /
-/// [`PassDetail`] / [`NoteValue`] call this to auto-stamp the
+/// [`PassDetail`] / [`InfoNote`] call this to auto-stamp the
 /// `phase` field; the test author can still override via the
 /// builder `with_phase(...)` chain when an explicit value is
 /// preferred.

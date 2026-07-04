@@ -3,8 +3,8 @@
 `cargo ktstr` is a cargo plugin for kernel build, cache, and test
 workflow. Subcommands in `--help` order: `test` (alias: `nextest`),
 `coverage`, `llvm-cov`, `stats`, `replay`, `perf-delta`, `kernel`,
-`model`, `verifier`, `funify` (alias: `costume`), `completions`,
-`show-host`, `show-thresholds`, `export`, `locks`, `shell`.
+`verifier`, `completions`,
+`show-host`, `show-thresholds`, `affected`, `export`, `locks`, `shell`.
 
 ## test
 
@@ -18,15 +18,24 @@ cargo ktstr test --kernel ../linux                             # local source tr
 cargo ktstr test --kernel 6.14.2                               # version (auto-downloads on miss)
 cargo ktstr test --kernel 6.14.2-tarball-x86_64-kc...          # cache key (from kernel list)
 cargo ktstr test --kernel 6.12..6.14                           # range: every stable+longterm release in [6.12, 6.14]
-cargo ktstr test --kernel git+https://example.com/r.git#v6.14  # git URL + ref (tag/branch)
-cargo ktstr test --kernel git+https://example.com/r.git#deadbeef1234  # specific commit
+cargo ktstr test --kernel git+https://example.com/r.git#tag=v6.14  # git URL + tag (or #branch=NAME)
+cargo ktstr test --kernel git+https://example.com/r.git#sha=<full-40-hex-commit>  # a specific commit
 cargo ktstr test --kernel 6.14.2 --kernel 6.15.0               # multi-kernel: repeatable
 cargo ktstr test --release                                     # release profile (stricter assertions)
+cargo ktstr test --relevant                                    # only tests the current diff affects
 ```
+
+`--relevant` narrows the run to only the tests whose scheduler your
+working-tree change touches (committed `base..HEAD` ∪ uncommitted +
+untracked edits), intersected with any `-E` you pass. It is the local
+counterpart to the `affected` CI matrix — see
+[affected / --relevant](#relevant) for the attribution model, the
+`--base` / `--base-ref` / `--default-branch` baseline knobs, and the
+fail-safe behavior.
 
 `--kernel` is **repeatable** and accepts a path, version string,
 cache key, version range (`START..END`), or git source
-(`git+URL#REF`). When absent, the test framework discovers a kernel
+(`git+URL#tag=NAME`, `#branch=NAME`, or `#sha=<40-hex>`). When absent, the test framework discovers a kernel
 from `KTSTR_TEST_KERNEL`, then `KTSTR_KERNEL`, then falls back to
 cache and filesystem lookup. When `--kernel` is a path,
 cargo-ktstr configures and builds the kernel before running tests.
@@ -42,8 +51,28 @@ The endpoints themselves do NOT need to appear in `releases.json` —
 `6.10..6.16` brackets the surviving releases even if `6.10` and
 `6.16` have aged out.
 
-Git sources (`git+URL#REF`) clone the repo shallow at the given
-ref, build, and cache the result. A repeat invocation against an
+Both endpoints are series-inclusive: a 2-component `MAJOR.MINOR`
+endpoint names the whole series, so `6.11..6.14` covers every `6.14.N`
+point release (not just `6.14.0`). Spell an endpoint with an explicit
+patch (`6.14.2`) to make it an exact bound — `6.11..6.14.2` stops at
+`6.14.2`.
+
+By default the expansion sees only series still listed in
+`releases.json`, so a series that has reached end-of-life is
+silently absent — `6.11..6.14` collapses to just the 6.11 series if
+6.12 and 6.13 are EOL. Pass `--include-eol` to additionally enumerate
+EOL series from the gregkh linux-stable mirror's tags: the range then
+contributes the highest point release of every `stable` series inside
+`[START, END]`, maintained or not. If the mirror tag list cannot be
+fetched, expansion falls back to the active-release set with a
+warning. `--include-eol` is accepted on every command that expands a
+range (`test`, `coverage`, `llvm-cov`, `verifier`,
+`kernel list`, and `kernel build`); it has no effect on a
+single version, path, cache key, or git source.
+
+Git sources (`git+URL#tag=NAME`, `#branch=NAME`, or `#sha=<40-hex>`)
+are fetched at the given ref (GitHub via a codeload snapshot, other
+hosts via a shallow clone), built, and cached. A repeat invocation against an
 unchanged branch tip lands a cache hit; a moved tip rebuilds.
 
 ### Multi-kernel: kernel as a gauntlet dimension
@@ -74,9 +103,9 @@ sanitized to `kernel_[a-z0-9_]+`:
 - Version / range expansion → `kernel_6_14_2`, `kernel_6_15_rc3`
 - Cache key → version prefix only (`kernel_6_14_2` from
   `6.14.2-tarball-x86_64-kc<hash>`)
-- Git source → `kernel_git_{owner}_{repo}_{ref}` (e.g.
-  `kernel_git_tj_sched_ext_for_next` from
-  `git+https://github.com/tj/sched_ext#for-next`)
+- Git source → `kernel_git_{owner}_{repo}_{kind}_{ref}` (e.g.
+  `kernel_git_tj_sched_ext_branch_for_next` from
+  `git+https://github.com/tj/sched_ext#branch=for-next`)
 - Path → `kernel_path_{basename}_{hash6}` (e.g.
   `kernel_path_linux_a3f2b1`); the 6-char crc32 of the canonical
   path disambiguates two `linux` directories under different
@@ -125,10 +154,17 @@ identical work for no signal.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--kernel ID` (repeatable) | auto | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#REF`). Repeatable; a multi-kernel set fans the gauntlet across kernels. |
+| `--kernel ID` (repeatable) | auto | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#tag=NAME`). Repeatable; a multi-kernel set fans the gauntlet across kernels. |
+| `--include-eol` | off | When a `--kernel START..END` range is present, also enumerate EOL `stable` series from the gregkh linux-stable mirror's tags, not just the active series in `releases.json`. Each in-range EOL series contributes its highest point release. No effect on a single kernel, path, cache key, or git source. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 | `--no-skip-mode` | off | Convert resource-contention and host-topology-insufficient skips into hard test failures (exit `1` instead of `0`). Default behavior skips so a contended runner does not fail tests that simply could not start; setting this flag opts into "if the test cannot run, the test fails". Exports `KTSTR_NO_SKIP_MODE=1` for the test binary. |
 | `--release` | off | Build and run tests with the release profile (`--cargo-profile release` to nextest). Release mode applies **stricter assertion thresholds** (`gap_threshold_ms` 2000 vs debug's 3000, `spread_threshold_pct` 15% vs debug's 35%) — tests that barely pass in debug may fail under `--release`. `catch_unwind`-based tests and tests gated on `#[cfg(debug_assertions)]` are skipped. |
+| `--profile NAME` | release | Cargo BUILD profile for the scheduler-under-test (a `SchedulerSpec::Discover` package): drives `cargo build -p <scheduler> --profile <NAME>` via the `KTSTR_SCHEDULER_PROFILE` env. Omitted, the scheduler builds `release` — an optimized scheduler is the only sensible default. INDEPENDENT of `--release` (the harness build profile): pass `--profile dev` for a fast unoptimized scheduler build, or any custom `[profile.<name>]`. Distinct from `--nextest-profile` (the nextest test profile). |
+| `--nextest-profile NAME` | nextest default | Nextest TEST profile (`.config/nextest.toml`), forwarded to nextest as `--profile <NAME>` (retry / timeout / output settings). Distinct from `--profile` (the scheduler's cargo BUILD profile) and `--release` (the harness's cargo build profile). |
+| `--relevant` | off | Narrow the run to only the tests whose scheduler the working-tree change touches (committed `base..HEAD` ∪ uncommitted + untracked), intersected with any `-E`. Broad / unattributable change → everything (fail-safe); docs-only → nothing. See [affected / --relevant](#relevant). |
+| `--base COMMIT` | — | With `--relevant`: explicit attribution baseline (skips merge-base). Ignored without `--relevant`. |
+| `--base-ref REF` | — | With `--relevant`: ref to merge-base against (defaults to `$GITHUB_BASE_REF` on a PR, else `--default-branch`). Ignored without `--relevant`. |
+| `--default-branch BRANCH` | `main` | With `--relevant`: merge-base target when no `--base` / `--base-ref` / `$GITHUB_BASE_REF`. Ignored without `--relevant`. |
 
 ### What it does (path mode only)
 
@@ -242,7 +278,7 @@ distinct cache entry under the clean shape.
 > cache for a future `cache_key`-keyed lookup. The `KTSTR_KERNEL`
 > env var with a path value follows this same direct-image flow
 > — the cache write path is reached only via the `cargo ktstr`
-> `--kernel` argument (or via `cargo ktstr kernel build --source
+> `--kernel` argument (or via `cargo ktstr kernel build --kernel
 > ../linux` as an explicit cache-populate step). Pass
 > `--kernel ../linux` to opt into the cache pipeline so a clean
 > tree's build is stored once and reused on subsequent runs.
@@ -265,8 +301,8 @@ values. CI gates and dashboards triage runs by exit code:
 
 | Code | Verdict      | Meaning                                                                                                                                                |
 |------|--------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `0`  | Pass / Skip  | All assertions passed, or the test never ran (host topology insufficient, resource contention). Skip degenerates to Pass at the process boundary.      |
-| `1`  | Fail         | At least one assertion failed; OR a requested host guarantee is impossible — `performance_mode` on a host too small for the topology (`PerfModeUnavailable`), or an explicit per-test `cpu_budget` / `--cpu-cap` the host cannot satisfy (`CpuBudgetUnsatisfiable`) — both hard errors, NOT the skips in the `0` row; OR `expect_err = true` and the test produced a Pass / Inconclusive (an `expect_err` test whose gate could not evaluate is unsatisfied just as it would be on a Pass). |
+| `0`  | Pass / Skip  | All assertions passed, or the test never ran (host topology insufficient, resource contention, `performance_mode` unavailable on a host too small for the topology, or a per-test `cpu_budget` exceeding the allowed CPUs). These host-insufficiency skips degenerate to Pass at the process boundary — unless `--no-skip-mode` / `KTSTR_NO_SKIP_MODE` promotes them to exit `1`. |
+| `1`  | Fail         | At least one assertion failed; OR an operator `--cpu-cap` / `KTSTR_CPU_CAP` the host cannot satisfy (`CpuBudgetUnsatisfiable`, an unconditional hard error — an author's per-test `cpu_budget` over the allowance skips in the `0` row instead); OR a host-insufficiency skip (`PerfModeUnavailable`, resource contention, topology insufficient) run under `--no-skip-mode` / `KTSTR_NO_SKIP_MODE`; OR `expect_err = true` and the test produced a Pass / Inconclusive (an `expect_err` test whose gate could not evaluate is unsatisfied just as it would be on a Pass). |
 | `2`  | Inconclusive | A zero-denominator ratio gate could not evaluate — the workload produced no signal to ratio against, so neither pass nor fail is truthful.             |
 
 Exit code `2` is the silent-pass guard: a Pass at a `≤ threshold`
@@ -310,9 +346,11 @@ failures against the new code" workflow.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--dir PATH` | `target/ktstr/` | Override the sidecar root. Same semantics as `cargo ktstr stats compare --dir`. |
+| `--dir PATH` | `target/ktstr/` | Override the sidecar root. Same semantics as `cargo ktstr stats list-values --dir`. |
 | `-E, --filter SUBSTR` | -- | Substring filter on `test_name` (case-sensitive). |
 | `--exec` | dry-run | Invoke `cargo nextest run` with the computed filter instead of printing it. |
+| `--profile NAME` | release | Cargo BUILD profile for the scheduler-under-test (see `cargo ktstr test --profile`). Only meaningful with `--exec` (the dry-run path runs nothing). |
+| `--nextest-profile NAME` | nextest default | Nextest TEST profile forwarded to the re-run `cargo nextest run` as `--profile <NAME>`. Only meaningful with `--exec`. |
 
 ## coverage
 
@@ -340,9 +378,16 @@ cargo ktstr coverage -- --workspace --lcov --output-path lcov.info # lcov output
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--kernel ID` (repeatable) | auto | Same shapes and multi-kernel semantics as `cargo ktstr test --kernel`: each (test × kernel) variant runs as its own nextest subprocess so cargo-llvm-cov merges every variant's profraw automatically. |
+| `--include-eol` | off | Same as `cargo ktstr test --include-eol`: when a `--kernel START..END` range is present, also expand EOL `stable` series from the gregkh linux-stable mirror. No effect on a single kernel. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 | `--no-skip-mode` | off | Convert resource-contention and host-topology-insufficient skips into hard test failures. Same semantics as on `test`; exports `KTSTR_NO_SKIP_MODE=1` for the test binary. |
 | `--release` | off | Collect coverage with the release profile (`--cargo-profile release` to llvm-cov nextest). Same stricter-threshold caveats as `test --release` — release mode applies `gap_threshold_ms=2000` / `spread_threshold_pct=15%`, and skips `catch_unwind`-based tests along with `#[cfg(debug_assertions)]`-gated tests. |
+| `--profile NAME` | release | Cargo BUILD profile for the scheduler-under-test (see `cargo ktstr test --profile`). Omitted, the scheduler builds `release`; INDEPENDENT of `--release`. |
+| `--nextest-profile NAME` | nextest default | Nextest TEST profile forwarded to `cargo llvm-cov nextest` as `--profile <NAME>` (see `cargo ktstr test --nextest-profile`). |
+| `--relevant` | off | Narrow the run to only the tests whose scheduler the working-tree change touches, intersected with any `-E` (see `cargo ktstr test --relevant`). Broad change → everything (fail-safe); docs-only → nothing. See [affected / --relevant](#relevant). |
+| `--base COMMIT` | — | With `--relevant`: explicit attribution baseline (skips merge-base). Ignored without `--relevant`. |
+| `--base-ref REF` | — | With `--relevant`: ref to merge-base against (defaults to `$GITHUB_BASE_REF` on a PR, else `--default-branch`). Ignored without `--relevant`. |
+| `--default-branch BRANCH` | `main` | With `--relevant`: merge-base target when no `--base` / `--base-ref` / `$GITHUB_BASE_REF`. Ignored without `--relevant`. |
 
 Requires `cargo-llvm-cov` and the `llvm-tools-preview` rustup
 component:
@@ -442,7 +487,8 @@ cargo ktstr llvm-cov --kernel ../linux report                  # pin kernel + pa
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--kernel ID` (repeatable) | auto | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#REF`). Same multi-kernel semantics as `cargo ktstr test --kernel`. |
+| `--kernel ID` (repeatable) | auto | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#tag=NAME`). Same multi-kernel semantics as `cargo ktstr test --kernel`. |
+| `--include-eol` | off | Same as `cargo ktstr test --include-eol`: when a `--kernel START..END` range is present, also expand EOL `stable` series from the gregkh linux-stable mirror. No effect on a single kernel. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 | `--no-skip-mode` | off | Convert resource-contention and host-topology-insufficient skips into hard test failures. Same semantics as on `test`; exports `KTSTR_NO_SKIP_MODE=1` for the test binary. |
 
@@ -462,15 +508,15 @@ Manage cached kernel images. Three subcommands: `list`, `build`,
 
 ### kernel list
 
-List cached kernel images, sorted newest first. With `--range`,
-switches to PREVIEW MODE: prints the versions a `START..END` range
+List cached kernel images, sorted newest first. With a `--kernel`
+range, switches to PREVIEW MODE: prints the versions a `START..END` range
 expands to without performing any download or build.
 
 ```sh
 cargo ktstr kernel list
 cargo ktstr kernel list --json                    # JSON output for CI scripting
-cargo ktstr kernel list --range 6.12..6.14        # preview range expansion
-cargo ktstr kernel list --range 6.12..6.14 --json # preview as JSON
+cargo ktstr kernel list --kernel 6.12..6.14        # preview range expansion
+cargo ktstr kernel list --kernel 6.12..6.14 --json # preview as JSON
 ```
 
 Default mode walks the local cache. Human-readable output shows
@@ -481,7 +527,7 @@ active releases list are marked `(EOL)`; prefix lookups for EOL
 series fall back to probing cdn.kernel.org for the latest patch
 release.
 
-`--range` mode performs no cache reads: it fetches kernel.org's
+`--kernel` range mode performs no cache reads: it fetches kernel.org's
 `releases.json` once, expands the inclusive range against the
 `stable` and `longterm` releases (mainline / linux-next dropped),
 and prints one version per line on stdout. Use this to answer
@@ -492,47 +538,51 @@ parsed start / end, and the expanded `versions` array.
 
 | Flag | Description |
 |------|-------------|
-| `--json` | Output in JSON format. Each entry includes a boolean `eol` field (computed at list time by fetching kernel.org's `releases.json`) alongside the cached metadata. With `--range`, emits a single object `{range, start, end, versions}` instead. |
-| `--range START..END` | Switch to range-preview mode. Format: `MAJOR.MINOR[.PATCH][-rcN]..MAJOR.MINOR[.PATCH][-rcN]`. Performs the single `releases.json` fetch a real range resolve does, expands inclusively, and prints the version list — no downloads, no builds, no cache lookups. |
+| `--json` | Output in JSON format. Each entry includes a boolean `eol` field (computed at list time by fetching kernel.org's `releases.json`) alongside the cached metadata. With a `--kernel` range, emits a single object `{range, start, end, versions}` instead. |
+| `--kernel START..END` | Switch to range-preview mode. Format: `MAJOR.MINOR[.PATCH][-rcN]..MAJOR.MINOR[.PATCH][-rcN]`. Performs the single `releases.json` fetch a real range resolve does, expands inclusively, and prints the version list — no downloads, no builds, no cache lookups. A non-range `--kernel` is rejected (preview expands ranges only). |
+| `--include-eol` | With a `--kernel` range, also enumerate EOL `stable` series from the gregkh linux-stable mirror's tags so the preview lists series that have aged out of `releases.json`. Ignored in the default cache-listing mode. |
 
 ### kernel build
 
-Download, build, and cache a kernel image. Three source modes:
-version (tarball download), `--source` (local tree), `--git` (clone).
+Download, build, and cache a kernel image. Takes a single `--kernel`
+(the unified grammar): a version / prefix (tarball download), a
+`START..END` range (builds each release), a source-tree path (local
+build), or a `git+URL#…` source (fetch + build).
 
 ```sh
-cargo ktstr kernel build                               # latest stable from kernel.org
-cargo ktstr kernel build 6.14.2                        # specific version
-cargo ktstr kernel build 6.15-rc3                      # RC release
-cargo ktstr kernel build 6.12                          # latest 6.12.x patch release
-cargo ktstr kernel build --source ../linux             # local source tree
-cargo ktstr kernel build --git URL --ref v6.14         # git clone (shallow, depth 1)
-cargo ktstr kernel build --force 6.14.2                # rebuild even if cached
+cargo ktstr kernel build                                   # latest stable from kernel.org
+cargo ktstr kernel build --kernel 6.14.2                   # specific version
+cargo ktstr kernel build --kernel 6.15-rc3                 # RC release
+cargo ktstr kernel build --kernel 6.12                     # latest 6.12.x patch release
+cargo ktstr kernel build --kernel 6.11..6.14               # every release in the range
+cargo ktstr kernel build --kernel ../linux                 # local source tree
+cargo ktstr kernel build --kernel git+URL#tag=v6.14        # git source (tag / branch / sha)
+cargo ktstr kernel build --force --kernel 6.14.2           # rebuild even if cached
 ```
 
-When no version or source is given, fetches the latest stable
-series that has had at least 8 maintenance releases — keeping CI
-off brand-new majors whose early builds are more likely to break —
-from kernel.org's `releases.json`. A major.minor prefix (e.g.
-`6.12`) resolves to the highest patch release in that series. For
-EOL series no longer in `releases.json`, probes cdn.kernel.org to
-find the latest available tarball. Skips building when a cached entry already exists
-(use `--force` to override). Stale entries (built with a different
-`ktstr.kconfig`) are rebuilt automatically. For `--source`, generates
-`compile_commands.json` for LSP support. Dirty local trees
-(uncommitted changes to tracked files) are built but not cached.
+When `--kernel` is omitted, fetches the latest stable series that
+has had at least 8 maintenance releases — keeping CI off brand-new
+majors whose early builds are more likely to break — from
+kernel.org's `releases.json`. A major.minor prefix (e.g. `6.12`)
+resolves to the highest patch release in that series. For EOL series
+no longer in `releases.json`, probes cdn.kernel.org to find the
+latest available tarball. A cache key (an already-built entry) is
+rejected — there is nothing to build. Skips building when a cached
+entry already exists (use `--force` to override). Stale entries
+(built with a different `ktstr.kconfig`) are rebuilt automatically.
+For a `--kernel <path>` source tree, generates `compile_commands.json`
+for LSP support. Dirty local trees (uncommitted changes to tracked
+files) are built but not cached.
 
 | Flag | Description |
 |------|-------------|
-| `VERSION` | Kernel version or prefix to download (e.g. `6.14.2`, `6.12`, `6.15-rc3`). A major.minor prefix resolves to the highest patch release, probing cdn.kernel.org for EOL series. Conflicts with `--source` and `--git`. |
-| `--source PATH` | Path to existing kernel source directory. Conflicts with `VERSION` and `--git`. |
-| `--git URL` | Git URL to clone. Requires `--ref`. Conflicts with `VERSION` and `--source`. |
-| `--ref REF` | Git ref to checkout (branch, tag, commit). Required with `--git`. |
+| `--kernel ID` | Kernel to build: a version (`6.14.2`), a `MAJOR.MINOR` prefix (`6.14`, latest patch), a `START..END` range (builds every release), a source-tree path (`./linux`, `~/linux`, or an absolute path; a bare relative name is read as a cache key, so prefix a relative source dir with `./`), or a git source (`git+URL#tag=NAME` / `#branch=NAME` / `#sha=<40-hex>`). Omitted, builds the latest stable. A cache key (already-built entry) is rejected. Not repeatable — one kernel or range per invocation. |
 | `--force` | Rebuild even if a cached image exists. |
-| `--clean` | Run `make mrproper` before configuring. Only meaningful with `--source`. |
+| `--clean` | Run `make mrproper` before configuring. Only meaningful for a `--kernel <path>` source tree. |
 | `--cpu-cap N` | Reserve exactly N host CPUs for the build (integer ≥ 1; must be ≤ the calling process's `sched_getaffinity` cpuset size). When absent, 30% of the allowed CPUs are reserved (minimum 1). The planner walks whole LLCs in consolidation- and NUMA-aware order, partial-taking the last LLC so `plan.cpus.len() == N` exactly. Under `--cpu-cap`, `make -jN` parallelism matches the reserved CPU count and the build runs inside a cgroup v2 sandbox that pins gcc/ld to the reserved CPUs + NUMA nodes. Mutually exclusive with `KTSTR_BYPASS_LLC_LOCKS=1`. Also settable via `KTSTR_CPU_CAP` env var (CLI flag wins when both are present). |
 | `--extra-kconfig PATH` | Additional kconfig fragment merged on top of the baked-in `ktstr.kconfig` (user values win on conflict). Lands in a distinct cache slot keyed by the extra fragment's hash, so it never collides with a baked-only build. |
-| `--skip-sha256` | Skip SHA-256 verification of a downloaded stable tarball (emits a bypass warning). No effect on `--source`/`--git` builds, which download no tarball. |
+| `--skip-sha256` | Skip SHA-256 verification of a downloaded stable tarball (emits a bypass warning). No effect on a `--kernel <path>` or git source, which download no tarball. |
+| `--include-eol` | When `--kernel` is a `START..END` range, also enumerate EOL `stable` series from the gregkh linux-stable mirror so the range builds series that have aged out of `releases.json`. No effect on a single version, path, or git source. |
 
 ### kernel clean
 
@@ -551,83 +601,48 @@ cargo ktstr kernel clean --corrupt-only --force   # remove only corrupt entries
 | `--force` | Skip confirmation prompt. Required in non-interactive contexts. |
 | `--corrupt-only` | Remove only corrupt cache entries (metadata missing or unparseable, image file absent). Valid entries are left untouched regardless of `--force`. Useful for clearing broken entries after an interrupted build without risking the curated set of good kernels. Mutually exclusive with `--keep`. |
 
-## model
-
-Manage the LLM model cache used by `OutputFormat::LlmExtract`
-payloads. `fetch` downloads the default pinned model into the
-ktstr model cache; `status` reports whether a SHA-checked copy
-is already cached; `clean` deletes the cached artifact plus
-its warm-cache sidecar.
-
-```sh
-cargo ktstr model fetch                          # download + SHA-check (no-op if cached)
-cargo ktstr model status                         # report cache path + verdict
-cargo ktstr model clean                          # delete cached artifact + sidecar
-```
-
-`fetch` is a no-op when the cache already holds a SHA-checked
-copy. Respects `KTSTR_MODEL_OFFLINE=1` — set to refuse network
-fetches. Cache root resolution: `KTSTR_CACHE_DIR` (if set),
-then `$XDG_CACHE_HOME/ktstr/models/`, then
-`$HOME/.cache/ktstr/models/`.
-
-`status` prints four fields and adds a one-line annotation
-when the verdict is anything other than `Matches` (a clean
-hit gets no annotation):
-
-| Field | Description |
-|---|---|
-| `model:` | Model file name (the pinned default; e.g. `Qwen3-4B-Q4_K_M.gguf`). |
-| `path:` | Absolute cache path (`{cache_root}/models/{file}`) the producer reads at LlmExtract time. |
-| `cached:` | `true` if an entry exists at `path:`, `false` otherwise. |
-| `checked:` | `true` if the cached entry's SHA-256 matches the pinned digest. |
-
-The annotation distinguishes four verdicts: `NotCached` (no
-entry — emit a `cargo ktstr model fetch` hint plus the
-expected download size), `CheckFailed` (cached entry could
-not be SHA-checked due to an I/O error — re-fetch),
-`Mismatches` (cached entry hash does not match the pinned
-digest — re-fetch), `Matches` (silent — the all-clear path).
-Re-fetch is the shared remediation tail for every cached-but-
-not-Matches branch.
-
-`clean` removes both the GGUF artifact at
-`{cache_root}/models/{file_name}` and its `.mtime-size`
-warm-cache sidecar (a small companion file the SHA fast-path
-uses to skip re-hashing on subsequent `status` calls). Per-
-file output names what was deleted with an IEC-prefixed size
-in parentheses (`removed /path/to/Qwen3-4B-Q4_K_M.gguf (2.34
-GiB)`); a final `freed N total` line sums the artifact and
-sidecar bytes. A no-op clean (nothing cached) prints a single
-`no cached model found at {path}` line so an idempotent re-run
-produces a clear "nothing to do" outcome instead of two
-"(absent)" lines. Subsequent `cargo ktstr model fetch`
-re-downloads the pin from scratch.
-
 ## verifier
 
 Collect BPF verifier statistics for every scheduler declared via
 `declare_scheduler!` in the workspace's test binaries. Spawns
-`cargo nextest run -E 'test(/^verifier/)'` and lets nextest fan
-out per (scheduler × kernel-list entry × accepted topology preset)
-cell — each cell boots its own VM, loads the scheduler's BPF
-programs, and reports per-program verified instruction counts
-from host-side memory introspection.
+`cargo nextest run -E 'test(/^verifier/) & !test(/^verifier::/)'` (the
+`verifier/...` cells only, not the verifier module's `verifier::tests::*`
+unit tests) and lets nextest fan out per (scheduler × kernel-list entry ×
+accepted topology preset) cell — the sweep runs each scheduler ACROSS
+topologies, because whether it attaches and dispatches is
+topology-dependent (a scheduler can attach on one topology and wedge on
+another). Each cell boots its own VM on the topology named in the cell,
+with performance mode disabled (its `verified_insns` count is
+perf-mode-independent, so cells take only a shared `LOCK_SH` LLC
+reservation and no longer starve each other on the LLC lock; a
+`performance_mode` peer's `LOCK_EX` can still defer a cell, resolved by
+nextest retry), loads the scheduler's BPF programs, and reports
+per-program verified instruction counts from host-side memory
+introspection. A cell PASSes only when the scheduler verifies (BPF
+loads), attaches (the guest gate confirms sched_ext `enabled`), AND
+dispatches an injected SpinWait workload (the guest confirms a worker
+made forward progress after attach). After the run, one `verified_insns`
+table per scheduler (rows = kernel, cols = BPF program, cell = the count
+across topologies) and a topology × scheduler PASS/FAIL grid are
+printed.
 
 ```sh
 cargo ktstr verifier                              # auto-discover kernel
 cargo ktstr verifier --kernel ../linux            # pin to one kernel
 cargo ktstr verifier --kernel 6.14 --kernel 7.0   # multi-kernel sweep
+cargo ktstr verifier --scheduler scx-ktstr        # one scheduler across topologies
 cargo ktstr verifier --raw                        # raw verifier log
 ```
 
-There are no `--scheduler` / `--scheduler-bin` flags: the sweep
-discovers schedulers from the `KTSTR_SCHEDULERS` distributed
-slice populated by `declare_scheduler!`. To exclude a scheduler
-from the sweep, omit it from the test binary (or declare it with
-`SchedulerSpec::Eevdf` / `SchedulerSpec::KernelBuiltin` — both
-are skipped at cell-emission time because neither has a
-userspace binary to verify).
+The sweep discovers schedulers from the `KTSTR_SCHEDULERS`
+distributed slice populated by `declare_scheduler!`. `--scheduler
+<NAME>` restricts the sweep to a single declared scheduler (matched
+by its `declare_scheduler!` `name`) across topologies; omitted, every
+declared scheduler is swept. To exclude a scheduler entirely, omit it
+from the test binary (or declare it with `SchedulerSpec::Eevdf` /
+`SchedulerSpec::KernelBuiltin` — both are skipped at cell-emission
+time because neither has a userspace binary to verify, so naming one
+with `--scheduler` matches no cell).
 
 `--kernel` is repeatable; cargo-ktstr always exports
 `KTSTR_KERNEL_LIST` to the nextest invocation (synthesizing a
@@ -635,7 +650,7 @@ single entry from auto-discovery when no `--kernel` is passed).
 Each scheduler's `kernels = [...]` declaration acts as a
 per-scheduler filter on the operator-supplied set; an empty (or
 omitted) `kernels` field accepts every entry. See [BPF Verifier:
-Matrix dimension + per-scheduler filter](verifier.md#matrix-dimension--per-scheduler-filter)
+Matrix dimensions + filters](verifier.md#matrix-dimensions--filters)
 for the full filter contract.
 
 `--raw` exports `KTSTR_VERIFIER_RAW=1`; the cell handler reads
@@ -646,8 +661,12 @@ for the rendering details.
 
 | Flag | Description |
 |------|-------------|
-| `--kernel ID` (repeatable) | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#REF`). Raw image files (`bzImage`/`Image`) are NOT accepted — the verifier needs the cached `vmlinux` and kconfig fragment alongside the image. Source directories auto-build; version strings auto-download on cache miss. When absent, resolves via cache then filesystem, falling back to auto-download. Raw images are accepted only on `cargo ktstr shell`. |
+| `--kernel ID` (repeatable) | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#tag=NAME`). Raw image files (`bzImage`/`Image`) are NOT accepted — the verifier needs the cached `vmlinux` and kconfig fragment alongside the image. Source directories auto-build; version strings auto-download on cache miss. When absent, resolves via cache then filesystem, falling back to auto-download. Raw images are accepted only on `cargo ktstr shell`. |
 | `--raw` | Print raw verifier output without cycle collapse. |
+| `--include-eol` | When a `--kernel START..END` range is present, also expand EOL `stable` series from the gregkh linux-stable mirror. No effect on a single kernel. |
+| `--scheduler NAME` | Restrict the sweep to a single declared scheduler (its `declare_scheduler!` `name`) across topologies. Omitted, every declared scheduler is swept. A name matching no declared BPF scheduler fails loud with an empty result set. Sets `KTSTR_VERIFIER_SCHEDULER` for the inner `cargo nextest run`. |
+| `--profile NAME` | Cargo BUILD profile for the scheduler-under-test (see `cargo ktstr test --profile`). Omitted, the scheduler builds `release`. Sets `KTSTR_SCHEDULER_PROFILE` for the inner `cargo nextest run`. |
+| `--nextest-profile NAME` | Nextest TEST profile forwarded to the inner `cargo nextest run` as `--profile <NAME>` (see `cargo ktstr test --nextest-profile`). |
 
 See [BPF Verifier](verifier.md) for the cell-based dispatch
 design and output format, and
@@ -669,46 +688,6 @@ cargo ktstr shell --topology 1,2,4,1
 cargo ktstr shell -i ./my-binary -i strace
 ```
 
-## funify
-
-Rewrite a JSON dump by replacing every non-metric value with a
-deterministic `adjective-animal` petname, so a downstream LLM can
-reason about the structural shape of the dump without seeing real
-identifiers. Visible alias: `costume`.
-
-```sh
-cargo ktstr funify failure_dump.json                  # stdin or file path
-cargo ktstr funify dump.json --seed demo              # deterministic across invocations
-cargo ktstr funify dump.json --seed demo --pretty     # pretty-printed JSON output
-cat dump.json | cargo ktstr costume --seed demo       # alias + stdin
-```
-
-The walker funifies by default — every value whose containing key
-is NOT on the metric allowlist gets replaced. Values that share
-the same key AND the same payload get the same fun name so
-cross-references inside the dump survive (e.g. `"swift-otter
-migrated from CPU 3 to CPU 7"` stays consistent). Floats always
-pass through; sentinel `u64` values `0` and `u64::MAX` keep their
-kthread / "no value" semantics. Non-JSON input fails fast with
-the underlying serde_json parse error.
-
-The metric allowlist is the source of truth (see
-`ktstr::fun::Funifier::is_metric_passthrough`). It covers
-structural enums (`schema`, `type`, `kind`, `state`, `policy`,
-…), position / lifecycle counts (`size`, `len`, `epoch`, …),
-count suffixes (`*_count`, `*_total`, `*_completed`, …), rates /
-ratios (`*_per_sec`, `*_ratio`, …), units (`*_ns`, `*_bytes`,
-…), statistics (`*_mean`, `*_p99`, …), I/O counters, scheduling
-fields (`priority`, `nice`, `weight`, …), per-rq SCX state,
-DSQ counters, NUMA events, SCX exit-info events, BPF prog runtime,
-and hardware perf counters.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `INPUT` | stdin | Path to the JSON file. `-` or omitted reads from stdin. |
-| `--seed STR` | random per process | Fixed seed for reproducible fun-name assignment across invocations. Omit for a fresh process-local key. |
-| `--pretty` | compact | Pretty-print the output. Default emits compact JSON suitable for piping. |
-
 ## completions
 
 Generate shell completions for cargo-ktstr. See
@@ -727,20 +706,17 @@ cargo ktstr completions fish > ~/.config/fish/completions/cargo-ktstr.fish
 
 ## stats
 
-Sidecar analysis, per-record diagnostics, and run-to-run comparison.
+Sidecar analysis and per-record diagnostics. Cross-run regression
+comparison is [`perf-delta`](#perf-delta).
 See [Runs](runs.md) for the directory layout.
 
 ```sh
 cargo ktstr stats                                             # print analysis of newest run
 cargo ktstr stats list                                        # list runs
 cargo ktstr stats list-metrics                                # list registered regression metrics
-cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15     # slice on kernel
-cargo ktstr stats compare --a-scheduler scx_rusty --b-scheduler scx_alpha  # slice on scheduler
-cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15 --scheduler scx_rusty  # slice on kernel, pin scheduler on both sides
-cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15 -E cgroup_steady       # add substring filter
-cargo ktstr stats compare --a-project-commit abcdef1 --b-project-commit fedcba2 --no-average  # opt out of trial averaging
-cargo ktstr stats compare --a-kernel-commit abcdef1 --b-kernel-commit fedcba2    # slice on kernel source HEAD
-cargo ktstr stats compare --a-run-source ci --b-run-source local                 # slice on run environment
+cargo ktstr stats list-values                                 # distinct filter values present in the pool
+cargo ktstr stats show-host --run RUN_ID                       # archived host context for a run
+cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14         # regression-gate HEAD vs a baseline commit
 cargo ktstr stats explain-sidecar --run RUN_ID                                   # diagnose Option-field absences
 ```
 
@@ -815,8 +791,9 @@ cargo ktstr stats list-metrics --json       # JSON array
 List the distinct values present per filterable dimension in the
 sidecar pool. Walks every run directory under `target/ktstr/`
 (or `--dir`), pools the sidecars, and reports per-dimension sets
-for all eight dimensions: `kernel`, `commit`, `kernel_commit`,
-`source`, `cpu_budget`, `scheduler`, `topology`, and `work_type`.
+for all nine dimensions: `kernel`, `commit`, `kernel_commit`,
+`source`, `resolve_source`, `cpu_budget`, `scheduler`, `topology`, and
+`work_type`.
 The `commit` and `source` keys map to the internal
 `SidecarResult::project_commit` / `run_source` fields; the JSON
 wire keys keep the shorter spellings. `cpu_budget` is the only
@@ -824,11 +801,10 @@ numeric dimension — its JSON value is an array of integers (the
 effective host-CPU budget each run's vCPU threads ran on), and
 never-booted skip rows (budget 0) are omitted.
 
-Use this before crafting a `cargo ktstr stats compare`
-invocation to discover what `--a-X` / `--b-X` values the pool
-actually carries: `--a-kernel 6.20` against an empty pool fails
-downstream with "no rows match filter A", and `list-values` is
-the upstream answer to "what kernels do I have?".
+Use this to discover what filter values the pool actually carries
+before narrowing a [`perf-delta`](#perf-delta) run (e.g. which
+kernels or project commits are present); `list-values` is the
+upstream answer to "what have I got?".
 
 ```sh
 cargo ktstr stats list-values                       # text per-dim blocks
@@ -846,6 +822,7 @@ dimension name with arrays of values:
   "commit": [null, "abcdef1", "abcdef1-dirty"],
   "kernel_commit": [null, "kabcde7", "kabcde7-dirty"],
   "source": [null, "ci", "local"],
+  "resolve_source": [null, "auto_built", "target_debug"],
   "cpu_budget": [4, 16],
   "scheduler": ["eevdf", "scx_rusty"],
   "topology": ["1n2l4c1t", "1n4l2c1t"],
@@ -855,9 +832,7 @@ dimension name with arrays of values:
 
 The JSON keys `commit` and `source` are the wire contract;
 internally the corresponding fields are
-`SidecarResult::project_commit` and `SidecarResult::run_source`,
-and the per-side filter flags spell as `--project-commit` /
-`--run-source` (see [`compare`](#compare)).
+`SidecarResult::project_commit` and `SidecarResult::run_source`.
 
 `kernel`, `commit`, `kernel_commit`, and `source` are optional
 on the source sidecar (`SidecarResult::kernel_version` /
@@ -869,7 +844,7 @@ that dimension.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--json` | off | Emit JSON instead of per-dimension text blocks. |
-| `--dir DIR` | `target/ktstr/` | Alternate run root. Same semantics as `compare --dir`. |
+| `--dir DIR` | `target/ktstr/` | Alternate run root. Same semantics as `stats show-host --dir`. |
 
 ### show-host (archived) {#stats-show-host}
 
@@ -877,7 +852,7 @@ Print the archived `HostContext` for a specific run: CPU identity,
 memory/hugepage config, transparent-hugepage policy, NUMA node
 count, kernel uname triple, kernel cmdline, and every
 `/proc/sys/kernel/sched_*` tunable captured at archive time. Useful
-for inspecting the same fingerprint `compare`'s host-delta section
+for inspecting the same fingerprint `perf-delta`'s host-delta section
 uses, available on a single run.
 
 The command scans sidecars in the run directory in iteration order
@@ -890,13 +865,13 @@ returning empty output.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--run ID` | required | Run key (e.g. `6.14-abc1234` or `6.14-abc1234-dirty`; from `cargo ktstr stats list`). |
-| `--dir DIR` | `target/ktstr/` | Alternate run root. Same semantics as `compare --dir`: useful for archived sidecar trees copied off a CI host. |
+| `--dir DIR` | `target/ktstr/` | Alternate run root. Same semantics as `stats show-host --dir`: useful for archived sidecar trees copied off a CI host. |
 
 ### explain-sidecar
 
 Diagnose `Option`-field absences across a run's sidecars. Loads
 every `*.ktstr.json` under `--run ID` (or its subdirectories one
-level deep, mirroring `compare`'s gauntlet-job layout) and reports,
+level deep, mirroring the gauntlet-job sidecar layout) and reports,
 per sidecar, which `Option<T>` fields landed as `None` plus the
 documented causes for each absence and a classification:
 
@@ -915,7 +890,7 @@ rather than aggregate.
 
 Sidecars are loaded verbatim — this command does NOT rewrite
 `run_source` to `"archive"` even when `--dir` is set. Diverges
-intentionally from `compare` / `list-values`; matches `show-host`.
+intentionally from `list-values`; matches `show-host`.
 The override would erase the only signal that surfaces the
 pre-rename `source`-key drop case.
 
@@ -1043,182 +1018,8 @@ cargo ktstr stats explain-sidecar --run RUN_ID --dir /path/archive    # diagnose
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--run ID` | required | Run key (e.g. `6.14-abc1234` or `6.14-abc1234-dirty`; from `cargo ktstr stats list`). |
-| `--dir DIR` | `target/ktstr/` | Alternate run root. Same semantics as `compare --dir`. |
+| `--dir DIR` | `target/ktstr/` | Alternate run root. Same semantics as `stats show-host --dir`. |
 | `--json` | off | Emit aggregate JSON instead of per-sidecar text. |
-
-### compare
-
-Pool every sidecar under `target/ktstr/` (or `--dir`), partition
-the rows into A and B sides via per-side filter flags, average
-each side's matching sidecars per pairing key (or pass through
-distinct sidecars under `--no-average`), and report regressions
-on the A→B delta. Exits non-zero on regression.
-
-The dimensions on which the A and B filters DIFFER are the
-SLICING dimensions — the axes of the A/B contrast. Every other
-dimension is part of the dynamic PAIRING key the comparison
-joins on. Slicing dims are derived automatically from the
-filters:
-
-```sh
-# Slice on kernel: A is 6.14, B is 6.15. Pair on every other dim.
-cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15
-
-# Slice on kernel AND scheduler simultaneously.
-cargo ktstr stats compare \
-    --a-kernel 6.14 --a-scheduler scx_rusty \
-    --b-kernel 6.15 --b-scheduler scx_alpha
-
-# Slice on project commit, narrow both sides to one scheduler+kernel.
-cargo ktstr stats compare \
-    --a-project-commit abcdef1 --b-project-commit fedcba2 \
-    --kernel 6.14 --scheduler scx_rusty
-
-# Slice on run environment: CI runs vs local developer runs.
-cargo ktstr stats compare \
-    --a-run-source ci --b-run-source local
-```
-
-**Symmetric sugar.** Shared `--X` flags (`--kernel`, `--scheduler`,
-`--topology`, `--work-type`, `--project-commit`, `--kernel-commit`,
-`--run-source`, `--cpu-budget`) pin BOTH sides to the same value(s).
-Per-side `--a-X` / `--b-X` flags REPLACE the corresponding shared
-`--X` value for that side only — "more-specific replaces" semantics.
-So `--kernel 6.14 --a-kernel 6.13` puts A on 6.13 and B on 6.14.
-Together the eight slicing dimensions (`kernel`, `scheduler`,
-`topology`, `work-type`, `project-commit`, `kernel-commit`,
-`run-source`, `cpu-budget`) cover every typed axis the comparison
-can contrast on.
-
-`cpu-budget` (the effective host-CPU budget a run's vCPU threads ran
-on) is a PAIRING dimension by default: even without any `--cpu-budget`
-flag, two runs of different budgets never pair, so a budget-confined
-run is never silently compared against a roomy one (their timing
-metrics measure different host-contention conditions). Pass
-`--a-cpu-budget` / `--b-cpu-budget` to deliberately CONTRAST budgets;
-when you do, prefer the overcommit-invariant `worst_iterations_per_cpu_sec`
-metric over raw timing.
-
-**Validation.** The dispatch site rejects two cases up front:
-- **Empty slicing**: no `--a-X` / `--b-X` at all, OR the per-side
-  flags resolve to identical effective filters. Bails with
-  "specify at least one per-side filter (e.g. `--a-kernel 6.14
-  --b-kernel 6.15`) to define what dimension separates the two
-  sides."
-- **Multi-dim slicing**: slicing on more than one dimension
-  prints a warning to stderr ("warning: slicing on N
-  dimensions; results compress multiple axes into a single A/B
-  contrast") but continues — multi-dim contrasts are a
-  deliberate feature for cohort sweeps.
-
-**Averaging.** By default the comparison aggregates every
-matching sidecar within each side into a single arithmetic-mean
-row per pairing key, smoothing run-to-run jitter. Failing /
-skipped contributors are excluded from the metric mean; the
-aggregated row's `passed` is the AND across every contributor.
-A header line above the comparison table reads `averaged across
-N runs (A) and M runs (B)` and a per-group
-`passes_observed/total_observed` block prints below the summary.
-
-**`+mixed` commit marker.** When contributors to an averaged
-group disagree on the `-dirty` suffix for the same canonical
-hex (some clean, some `-dirty`), the rendered `commit` and
-`kernel_commit` columns show `{hex}+mixed` for that group.
-`+mixed` is a COHORT-level marker (distinct from `-dirty`,
-which is a per-record property of one sidecar): it indicates
-mixed working-tree state across the group's contributors.
-Mixed-dirty tracking spans EVERY contributor (passing,
-failing, skipped) so WIP-vs-committed disagreement surfaces
-in the averaged row even when one of the two states only
-appears on a failing run. The marker is rendered against the
-canonical un-suffixed hex, so a `abc1234` clean entry plus an
-`abc1234-dirty` entry render as `abc1234+mixed` regardless of
-which contributor was scanned first. Homogeneous cohorts
-(every contributor clean, every contributor dirty, or every
-contributor `None`) preserve the first-seen value verbatim
-and never get the `+mixed` marker.
-
-`--no-average` keeps each sidecar distinct. If multiple sidecars
-on the same side share the same pairing key under `--no-average`,
-the comparison bails with "duplicate pairing keys" — pairing
-across A/B sides is ambiguous when one A-row could match many
-B-rows. Either drop `--no-average` to average them, or add
-another per-side filter to disambiguate.
-
-**Kernel match shape.** A `--kernel 6.12` filter (two-segment
-major.minor) PREFIX-matches every patch release in that series:
-`6.12`, `6.12.0`, `6.12.5` all match. A three-or-more-segment
-filter (`--kernel 6.14.2`, `--kernel 6.15-rc3`) is strict
-equality — `6.14.2` does NOT match `6.14.20`. The same shape
-applies to `--a-kernel` / `--b-kernel`.
-
-**Discovering filter values.** Run
-[`cargo ktstr stats list-values`](#list-values) before
-crafting a `compare` invocation to see what `kernel`, `commit`,
-`kernel_commit`, `source`, `cpu_budget`, `scheduler`, `topology`,
-and `work_type` values the sidecar pool actually carries; passing a
-`--a-kernel 6.20` against an empty pool fails downstream with
-"no rows match filter A" and `list-values` is the upstream
-answer to "what have I got?". `list-values` reports all eight
-filterable dimensions; the JSON keys `commit` and `source` map
-to the per-side filter flags `--project-commit` and
-`--run-source`.
-
-When a side comes back as `unknown` for one of the optional
-dimensions (`kernel`, `commit`, `kernel_commit`, `source`),
-[`cargo ktstr stats explain-sidecar`](#explain-sidecar) on the
-underlying run reports per-sidecar which optional fields are
-missing and what each absence means.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-E FILTER` | -- | Substring filter applied to the joined `scenario topology scheduler work_type` string. **Scope is limited**: `-E` does NOT match against `kernel`, `project_commit`, `kernel_commit`, or `run_source` — those are typed dimensions reachable only via the dedicated `--kernel` / `--project-commit` / `--kernel-commit` / `--run-source` flags. To narrow on those, use the typed flags. Composes with the typed dimension filters: typed narrows happen first, substring runs over the surviving set. |
-| `--kernel VER` (repeatable) | -- | Pin BOTH sides to the listed kernel version(s). Sugar for `--a-kernel V1 --a-kernel V2 --b-kernel V1 --b-kernel V2`. Per-side `--a-kernel` / `--b-kernel` REPLACES this shared value for that side only. Major.minor (`6.12`) prefix-matches; three-segment (`6.14.2`) is strict. |
-| `--scheduler NAME` (repeatable) | -- | Pin BOTH sides to the listed scheduler(s). Sugar for `--a-scheduler N1 --a-scheduler N2 --b-scheduler N1 --b-scheduler N2`. Per-side `--a-scheduler` / `--b-scheduler` REPLACES this shared value for that side only. OR-combined: a row matches iff its `scheduler` field equals ANY listed entry. Strict equality per entry. |
-| `--topology LABEL` (repeatable) | -- | Pin BOTH sides to the listed rendered topology label(s) (e.g. `1n2l4c2t`). Sugar for `--a-topology L1 --a-topology L2 --b-topology L1 --b-topology L2`. Per-side `--a-topology` / `--b-topology` REPLACES this shared value for that side only. OR-combined: a row matches iff its rendered topology label equals ANY listed entry. Strict equality per entry. |
-| `--work-type TYPE` (repeatable) | -- | Pin BOTH sides to the listed work_type(s) (PascalCase variants of `WorkType`, e.g. `SpinWait`). Sugar for `--a-work-type T1 --a-work-type T2 --b-work-type T1 --b-work-type T2`. Per-side `--a-work-type` / `--b-work-type` REPLACES this shared value for that side only. OR-combined: a row matches iff its `work_type` field equals ANY listed entry. Strict equality per entry. See [WorkSpec types](../concepts/work-types.md). |
-| `--project-commit HASH` (repeatable) | -- | Pin BOTH sides to listed `project_commit` value(s) (7-char hex, optional `-dirty` suffix). Also accepts git revspecs (`HEAD`, `HEAD~N`, tags, branches, `A..B` ranges) resolved against the project repo into the same 7-char short hashes; see `--help` for details. Filters the ktstr framework commit; the scheduler binary's commit (`SidecarResult::scheduler_commit`) is not currently exposed as a filter. |
-| `--kernel-commit HASH` (repeatable) | -- | Pin BOTH sides to listed `kernel_commit` value(s) (7-char hex, optional `-dirty` suffix). Also accepts git revspecs (`HEAD`, `HEAD~N`, tags, branches, `A..B` ranges) resolved against the kernel repo (`gix::open` against `KTSTR_KERNEL`'s path); see `--help` for details. Filters the kernel SOURCE TREE commit (`SidecarResult::kernel_commit`), distinct from the kernel release version (`--kernel`): two runs of the same `kernel_version` with different `kernel_commit` values represent the same release rebuilt from different trees. Rows whose `kernel_commit` is `None` (KTSTR_KERNEL pointed at a non-git path, the underlying source was Tarball / Git rather than a `Local` tree, or the gix probe failed) NEVER match a populated filter. |
-| `--run-source NAME` (repeatable) | -- | Pin BOTH sides to listed run-environment source(s). Filters `SidecarResult::run_source` set by `detect_run_source` at sidecar-write time: `"local"` for developer runs, `"ci"` when `KTSTR_CI` was set, or rewritten to `"archive"` at load time when `--dir` points at a non-default pool root. Rows whose `run_source` is `None` (sidecar pre-dates the field) NEVER match a populated filter — same opt-in policy as `--kernel` / `--project-commit` / `--kernel-commit`. Combine per-side `--a-run-source ci --b-run-source local` to contrast CI runs against developer runs of the same scenarios. |
-| `--cpu-budget N` (repeatable) | -- | Pin BOTH sides to listed effective host-CPU budget(s) — the number of host CPUs the run's vCPU threads ran on (`SidecarResult::cpu_budget`, decimal). `cpu_budget` is a PAIRING dimension: even without this flag, two runs of different budgets never pair, so a budget-confined run is never silently compared against a roomy one. Rows with no recorded budget (skip rows that never booted) never match. Use the per-side `--a-cpu-budget` / `--b-cpu-budget` to deliberately contrast budgets, and prefer the overcommit-invariant `worst_iterations_per_cpu_sec` metric over raw timing when you do. |
-| `--a-kernel VER` (repeatable) | -- | A-side kernel filter. Replaces the shared `--kernel` for the A side only. |
-| `--a-scheduler NAME` (repeatable) | -- | A-side scheduler filter, OR-combined. Replaces the shared `--scheduler` value for the A side only. |
-| `--a-topology LABEL` (repeatable) | -- | A-side topology filter, OR-combined. Replaces the shared `--topology` value for the A side only. |
-| `--a-work-type TYPE` (repeatable) | -- | A-side work_type filter, OR-combined. Replaces the shared `--work-type` value for the A side only. |
-| `--a-project-commit HASH` (repeatable) | -- | A-side project-commit filter. Replaces the shared `--project-commit` for the A side only. |
-| `--a-kernel-commit HASH` (repeatable) | -- | A-side kernel-commit filter. Replaces the shared `--kernel-commit` for the A side only. |
-| `--a-run-source NAME` (repeatable) | -- | A-side run-source filter. Replaces the shared `--run-source` for the A side only. |
-| `--a-cpu-budget N` (repeatable) | -- | A-side cpu-budget filter. Replaces the shared `--cpu-budget` for the A side only. Use with `--b-cpu-budget` to contrast two host-CPU budgets. |
-| `--b-kernel VER` (repeatable) | -- | B-side kernel filter. Replaces the shared `--kernel` for the B side only. |
-| `--b-scheduler NAME` (repeatable) | -- | B-side scheduler filter, OR-combined. Replaces the shared `--scheduler` value for the B side only. |
-| `--b-topology LABEL` (repeatable) | -- | B-side topology filter, OR-combined. Replaces the shared `--topology` value for the B side only. |
-| `--b-work-type TYPE` (repeatable) | -- | B-side work_type filter, OR-combined. Replaces the shared `--work-type` value for the B side only. |
-| `--b-project-commit HASH` (repeatable) | -- | B-side project-commit filter. Replaces the shared `--project-commit` for the B side only. |
-| `--b-kernel-commit HASH` (repeatable) | -- | B-side kernel-commit filter. Replaces the shared `--kernel-commit` for the B side only. |
-| `--b-run-source NAME` (repeatable) | -- | B-side run-source filter. Replaces the shared `--run-source` for the B side only. |
-| `--b-cpu-budget N` (repeatable) | -- | B-side cpu-budget filter. Replaces the shared `--cpu-budget` for the B side only. Use with `--a-cpu-budget` to contrast two host-CPU budgets. |
-| `--no-average` | off | Disable averaging. Each sidecar stays distinct; bails with an actionable error when multiple sidecars on the same side share the same pairing key (since pairing across sides becomes ambiguous). |
-| `--threshold PCT` | per-metric `default_rel` | Uniform relative significance threshold in percent. Overrides the per-metric `default_rel` for every metric; the absolute gate is always per-metric and cannot be tuned from the CLI. Mutually exclusive with `--policy`. |
-| `--policy FILE` | -- | Path to a JSON `ComparisonPolicy` file with per-metric thresholds. Schema: `{ "default_percent": N, "per_metric_percent": { "worst_spread": 5.0, ... } }`. Priority is per-metric override → `default_percent` → each metric's registry `default_rel`. Per-metric keys are rejected at load time if they do not match a metric in the `METRICS` registry. Mutually exclusive with `--threshold`. |
-| `--dir DIR` | `target/ktstr/` | Alternate runs root for pool collection. Defaults to `test_support::runs_root()` (typically `target/ktstr/`). Useful when comparing archived sidecar trees copied off a CI host. |
-
-#### Phase rendering
-
-The compare output renders per-phase tables in addition to the
-scalar findings table. The flags below tune that rendering. They
-are mutually exclusive with each other only where noted —
-`--no-phases` is the global suppress switch and conflicts with
-every other phase flag, and `--steps-only` and `--phase` are also
-mutually exclusive; the remaining pairings among `--phases-only` /
-`--steps-only` / `--phase` / `--phase-threshold` compose.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--no-phases` | off | Suppress the per-phase tables entirely; render only the scalar findings table. Mutually exclusive with every other `--phase…` flag below. |
-| `--phases-only` | off | Render ONLY the per-phase tables; suppress the scalar findings table and the scalar summary footer. The host-context delta still renders. Composes with `--steps-only`, `--phase`, `--phase-threshold`. |
-| `--steps-only` | off | Within the per-phase tables, suppress the BASELINE bucket (`step_index` 0) and render only scenario Step buckets. Useful when the BASELINE settle window is dominated by scheduler startup transients. Mutually exclusive with `--phase`; composes with `--phases-only` and `--phase-threshold`. |
-| `--phase N` | every phase | Render only the named phase index (single value, not repeatable). `0` selects BASELINE; `1..=N` select scenario Step ordinals (matched against `step_index`). Mutually exclusive with `--steps-only`. |
-| `--phase-threshold PCT` | inherits `--threshold` | Per-phase significance threshold in percent. Lets per-phase tables use a different threshold from the scalar comparison (e.g. tighter scalar gate but a looser per-phase gate for noisy boundary effects). Inherits the scalar `--threshold` (or registry `default_rel`) when unset. |
 
 ### Prerequisites
 
@@ -1237,10 +1038,12 @@ when the worktree differs).
 ## perf-delta
 
 Compare `performance_mode` test metrics between HEAD and a baseline
-commit, exiting non-zero when a metric regresses past its threshold.
-The verdict reuses the same polarity-aware, abs+rel dual-gate engine as
-[`stats compare`](#stats) (`compare_partitions`): the baseline commit's
-sidecars are the A side, HEAD's are the B side, paired per scenario.
+commit, exiting non-zero when enough metrics regress to trip the
+failure gate — by default 5 or more (so a lone noisy regression does
+not flip CI red); tune with `--fail-threshold` / `--must-fail`.
+The verdict uses a polarity-aware, abs+rel dual-gate engine: the
+baseline commit's sidecars are one side, HEAD's are the other, paired
+per scenario.
 It runs in any repo that consumes ktstr (it discovers the repo from the
 cwd). The primary use is a scheduler author asserting that a change does
 not regress a degenerate case: mark the degenerate-case scenarios
@@ -1250,14 +1053,15 @@ that adds a fix-flag is gated against the commit before it. The
 baseline is the merge-base with `main` by default, or any `--base` /
 `--base-ref` commit. The same shape is a CI perf-gate on a pull
 request. See the [A/B Compare Branches](../recipes/ab-compare.md) recipe
-for the manual `stats compare` equivalent.
+for a worked walkthrough.
 
 ```sh
-cargo ktstr perf-delta --dual-run --kernel 6.14            # HEAD vs merge-base(HEAD, main)
-cargo ktstr perf-delta --dual-run --kernel 6.14 --base-ref release  # vs merge-base(HEAD, release)
-cargo ktstr perf-delta --base abc1234                      # vs an explicit commit, cached sidecars
-cargo ktstr perf-delta --dual-run --kernel 6.14 -E perf_throughput  # narrow within performance_mode
-cargo ktstr perf-delta --dual-run --kernel 6.14 --threshold 5       # 5% uniform regression gate
+cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14           # HEAD vs merge-base(HEAD, main)
+cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14 --base-ref release  # vs merge-base(HEAD, release)
+cargo ktstr perf-delta --base abc1234                           # vs an explicit commit, cached sidecars
+cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14 -E perf_throughput  # narrow within performance_mode
+cargo ktstr perf-delta --base abc1234 --threshold 5             # cached compare, 5% uniform gate
+cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14 --must-fail worst_spread  # also fail if worst_spread regresses, any count
 ```
 
 **Baseline resolution** (highest precedence first):
@@ -1274,20 +1078,11 @@ The resolved baseline is shortened to the 7-hex form the sidecar
 `project_commit` records, so it lines up with pooled runs directly. The
 command bails if the baseline resolves to HEAD (nothing to compare).
 
-**Two comparison axes:**
-
-- **commit axis** (default) — HEAD vs a baseline commit, partitioned by
-  `project_commit` (baseline resolution above; source models below).
-- **config axis** (`--a-scheduler X --b-scheduler Y`) — two scheduler
-  configs at the SAME commit, partitioned by `scheduler`: the "is config
-  B not slower than A on this case" gate. It compares runs already
-  pooled from a `cargo ktstr test` that exercised both schedulers (the
-  test declares the scheduler enums), so it needs no worktree and
-  conflicts with the commit-axis flags (`--base` / `--base-ref` /
-  `--dual-run`). Both `--a-scheduler` and `--b-scheduler` are required
-  together.
-
-The baseline resolution and source models below are the **commit axis**.
+`perf-delta` compares on the **commit axis**: HEAD vs a baseline commit,
+partitioned by `project_commit` (baseline resolution above; source
+models below). A cross-config question — e.g. scheduler A vs scheduler B
+at the same commit — is answered in-test via the Verdict DSL's
+`better_across_phases`, not by this command.
 
 **Two source models for the baseline run's sidecars:**
 
@@ -1295,15 +1090,15 @@ The baseline resolution and source models below are the **commit axis**.
   under the runs-root from a prior run or a downloaded CI artifact. The
   caller supplies both runs; perf-delta only resolves the pair and
   compares.
-- **`--dual-run`** — PRODUCES both runs first: it checks the baseline
-  commit out in a detached `git worktree` and runs its
-  `performance_mode` tests there (sidecars redirected into the main
-  pool), runs HEAD's in the working tree, then compares. Both ends run
+- **`--noise-adjust N`** — PRODUCES both runs first: it checks BOTH the
+  baseline commit and the HEAD snapshot out into their own plain `gix`
+  checkouts (no `.git`, no linked worktree), runs each side's
+  `performance_mode` tests N times (sidecars redirected into the main
+  pool), then compares from the observed spread. Both ends run
   `KTSTR_PERF_ONLY=1` so only `performance_mode` tests execute, narrowed
-  by `-E`. The worktree is removed on return. `gix` has no
-  worktree-creation API, so this shells `git worktree add/remove` —
-  `git` must be on `PATH`. A non-zero child test exit is logged but does
-  not abort; the sidecars that were written are still compared.
+  by `-E`. The checkouts are removed on return. A non-zero child test
+  exit is logged but does not abort; the sidecars that were written are
+  still compared.
 
 If no `performance_mode` sidecars are produced at the baseline (none
 are defined yet, or `-E` matched none), the command prints a notice and
@@ -1311,18 +1106,111 @@ exits `0` — an empty perf set is "nothing to compare", not a failure.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--dual-run` | off | Produce both runs via a baseline worktree before comparing (else compare already-pooled sidecars). |
-| `--kernel SPEC` | — | Kernel both runs boot. Required with `--dual-run`. Same `--kernel` form as `cargo ktstr test`. |
+| `--kernel SPEC` | — | Kernel both runs boot. Required with `--noise-adjust`. Same `--kernel` form as `cargo ktstr test`. |
+| `--profile NAME` | release | Cargo BUILD profile for the scheduler-under-test on BOTH sides' `cargo ktstr test` (see `cargo ktstr test --profile`). Only meaningful on the run-producing path (`--noise-adjust`). |
+| `--nextest-profile NAME` | nextest default | Nextest TEST profile forwarded to BOTH sides' `cargo ktstr test`. Only meaningful on the run-producing path (`--noise-adjust`). |
 | `--base COMMIT` | — | Explicit baseline commit-ish (skips merge-base). |
 | `--base-ref REF` | — | Ref to merge-base against. |
 | `--default-branch BRANCH` | `main` | Merge-base target when no `--base`/`--base-ref`/`$GITHUB_BASE_REF`. |
 | `-E, --filter EXPR` | all `performance_mode` | Nextest filter narrowing within the `performance_mode` set. |
+| `--relevant` | off | Additionally narrow to the `performance_mode` tests the `base..HEAD` diff (∪ working tree) touches, from the same baseline; intersected with `--filter`. Broad change → compares everything; docs-only → nothing. See [affected / --relevant](#relevant). |
 | `--threshold PCT` | registry defaults | Uniform relative regression gate (percent). Mutually exclusive with `--policy`. |
-| `--policy PATH` | registry defaults | Per-metric threshold JSON. Mutually exclusive with `--threshold`. Schema: see [`stats compare`](#stats). |
-| `--a-scheduler X` / `--b-scheduler Y` | — | CONFIG axis: compare two scheduler configs at the same commit (partitioned by `scheduler`). Both required together; conflict with the commit-axis flags `--base`/`--base-ref`/`--dual-run`. |
-| `--no-phases` / `--phases-only` / `--steps-only` / `--phase N` / `--phase-threshold PCT` | full per-phase render | Per-phase output projection (render-only; does not change the verdict). Same flags as `stats compare`. |
+| `--policy PATH` | registry defaults | Per-metric threshold JSON. Mutually exclusive with `--threshold`. Schema: `{ "default_percent": N, "per_metric_percent": { "worst_spread": 5.0, ... } }` (priority: per-metric override → `default_percent` → each metric's registry `default_rel`). |
+| `--fail-threshold N` | `5` | Fail the run only when at least N metrics regress, so a handful of one-off noisy regressions doesn't flip CI red. `--fail-threshold 1` restores fail-on-any; `0` disables the count gate (only `--must-fail` can then fail). Counts confident regressions; suppressed rows still count. |
+| `--must-fail M1,M2,...` | none | Registry metric names (from `cargo ktstr stats list-metrics`) that fail the run if ANY of them regresses, regardless of `--fail-threshold` (ORed on top of the count gate). Names that could never fire the gate are rejected up front: unknown names, internal rate components, per-phase-only metrics, and — without `--noise-adjust` — whole-run distribution metrics (read only per-run) and informational metrics (no regression direction on the default comparison). |
+| `--noise-adjust N` | off | Self-tuning noise mode (requires `--kernel`, N >= 2): PRODUCES N runs per side and gates a confident regression on the two sides being SEPARATED (a two-sided Welch t-test at alpha=0.05, or fully disjoint `[min, max]` bands) AND MATERIAL (the registry `default_abs`/`default_rel` dual-gate), instead of a fixed `--threshold`. Conflicts with `--threshold` and `--policy`. |
+| `--noise-spread-threshold PCT` | `5.0` | Per-side relative-spread limit (percent) above which `--noise-adjust` adds an ADVISORY "noisy spread" annotation to a metric's row. Advisory only — never suppresses a confident regression. Requires `--noise-adjust`. |
+| `--no-phases` / `--phases-only` / `--steps-only` / `--phase N` / `--phase-threshold PCT` | per-phase render (meaningful rows) | Per-phase output projection for the `--noise-adjust` spread block (render-only; does not change the verdict). Each **requires `--noise-adjust`** — per-phase output exists only on the noise-adjusted path. Like the aggregate table, the per-phase spread block shows only meaningful rows by default; pass `--all-metrics` to include stable / noisy rows. |
+| `--all-metrics` | off | Show every compared metric row on BOTH the `--noise-adjust` aggregate table AND the per-phase spread table, including stable (unchanged) and noisy (<2 usable runs) rows. Default: each table prints only meaningful rows (regression / improvement / informational), collapsing to a one-line summary when every row is suppressed. The per-phase table is additionally spread-gated by `--phase-threshold`; its coverage (one-sided metrics) table is always shown. Display-only — never affects the failure gate. |
 
-Runnable as `just perf-delta <kernel> [base]`.
+Runnable as `just perf-delta <kernel> [base] [runs]` (runs per side defaults to 5).
+
+## affected {#affected}
+
+Emit the scheduler packages a `base..HEAD` diff affects, as a flat JSON
+array for a GitHub Actions **dynamic matrix**. Run it inside a scheduler
+repo that consumes ktstr (it discovers the repo + workspace from the
+cwd); pipe its output into `strategy.matrix.scheduler: ${{ fromJSON(...)
+}}` so CI spawns one job per affected scheduler instead of building and
+testing the whole fleet on every push.
+
+```sh
+cargo ktstr affected                          # vs merge-base(HEAD, main)
+cargo ktstr affected --base-ref release       # vs merge-base(HEAD, release)
+cargo ktstr affected --base abc1234           # vs an explicit commit
+# -> e.g. ["scx_lavd","scx_rusty"]
+```
+
+**Attribution** is the UNION of two layers — a scheduler is affected if a
+changed path is reachable by either:
+
+1. **cargo dependency closure** (from `cargo metadata`): a changed path
+   is attributed to its owning workspace crate; the scheduler is affected
+   if that crate is in the scheduler's transitive dependency closure.
+   Catches shared *Rust* library changes.
+2. **`.d` input set**: only when a native (`.c`/`.h`) source or an
+   unattributable path changed, each scheduler is built once and its
+   cargo `<artifact>.d` dep-info is parsed into the exact set of files
+   that compiled into it — the Rust sources, the generated BPF skeletons,
+   and (via clang's `-M`) every `.bpf.c` / header it text-includes,
+   including cross-scheduler includes and shared headers. A pure-Rust
+   change skips this build (the crate closure alone is sound).
+
+**Fail-safe** — a false negative (silently skipping an affected
+scheduler) is the worst outcome, so every uncertainty widens to the full
+testable set, never to a skip: an unresolvable base, a diff failure, a
+workspace-root / build-graph / `Cargo.lock` change, or any changed
+non-docs path attributed to neither a scheduler `.d` nor a workspace
+crate. A per-scheduler build/read failure marks that scheduler affected.
+Only a strictly docs-only change (or `base == HEAD`) emits `[]`.
+
+Only **Discover** (cargo-package) schedulers appear in the array —
+package-less schedulers (EEVDF, kernel-builtin) have no package to key a
+matrix cell on and must run in a separate unconditional CI leg.
+
+**Baseline resolution** is identical to [`perf-delta`](#perf-delta):
+`--base <commit>` (explicit, skips merge-base) → `--base-ref <ref>`
+(merge-base against it) → `$GITHUB_BASE_REF` (on a PR, as
+`origin/<ref>`) → `merge-base(HEAD, <--default-branch>)` (default
+`main`).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--base COMMIT` | — | Explicit baseline commit-ish (skips merge-base). |
+| `--base-ref REF` | — | Ref to merge-base against. Defaults to `$GITHUB_BASE_REF` on a PR, else `--default-branch`. |
+| `--default-branch BRANCH` | `main` | Merge-base target when no `--base`/`--base-ref`/`$GITHUB_BASE_REF`. |
+
+### --relevant (local test narrowing) {#relevant}
+
+`affected` produces a CI matrix; `--relevant` is its local inner-loop
+counterpart. `cargo ktstr test --relevant` (also `coverage --relevant`
+and `perf-delta --relevant`) runs the SAME attribution engine against the
+working tree — the committed `base..HEAD` diff **UNIONed with uncommitted
+and untracked edits** — and narrows the run to only the tests whose
+scheduler the change touched.
+
+```sh
+cargo ktstr test --relevant                       # only tests my edits affect
+cargo ktstr test --relevant --base-ref release    # vs merge-base(HEAD, release)
+cargo ktstr test --relevant -E 'test(smoke)'      # relevant AND matching -E
+```
+
+The relevant set is folded into a single nextest filterset that
+**intersects** (`&`) any `-E` you pass, so it always narrows — never
+widens — the selection. Outcomes mirror `affected`:
+
+- a broad / build-graph / unattributable change does **not** narrow — the
+  full selection runs (the fail-safe);
+- a strictly docs-only change (or a clean tree at `base`) narrows to
+  nothing — the run executes zero tests;
+- otherwise only the affected schedulers' tests run. Package-less
+  schedulers (EEVDF, kernel-builtin) are conservatively included on any
+  non-docs change.
+
+`--base` / `--base-ref` / `--default-branch` select the attribution
+baseline exactly as in `affected` (ignored without `--relevant`). On
+`perf-delta`, `--relevant` reuses the SAME baseline for both the
+attribution and the A/B comparison, and intersects with `--filter`.
 
 ## show-host (live) {#show-host-live}
 
@@ -1333,8 +1221,7 @@ policy, NUMA node count, kernel uname triple
 `/proc/sys/kernel/sched_*` tunable. Useful for diagnosing
 cross-run regressions that trace back to host-context drift
 (sysctl change, THP policy flip, hugepage reservation) or for
-confirming what `cargo ktstr stats compare` would record on
-the next run produced here.
+confirming what a future run produced here would record.
 
 ```sh
 cargo ktstr show-host
@@ -1349,10 +1236,9 @@ two outputs are byte-for-byte comparable when the host is
 unchanged.
 
 For historical drift between archived runs (host-side diff
-across two run partitions), use
-[`cargo ktstr stats compare`](#compare) — its host-delta
-section reports which host-context fields changed between
-side A and side B using the same `HostContext::diff` logic.
+across two run partitions), use [`perf-delta`](#perf-delta) — its host-delta section reports
+which host-context fields changed between the baseline and HEAD
+sides using the same `HostContext::diff` logic.
 
 ## show-thresholds
 
@@ -1437,7 +1323,7 @@ Scans four lock-file roots:
   same flow.
 - `{cache_root}/.locks/*.lock` — cache-entry locks held
   during `kernel build` writes, and `source-{path_hash}.lock`
-  files held for the duration of `kernel build --source` and
+  files held for the duration of `kernel build --kernel <path>` and
   `cargo ktstr test --kernel <path>` against the same source tree.
 - `{runs_root}/.locks/{kernel}-{project_commit}.lock` —
   per-run-key sidecar-write locks held for the duration of
@@ -1469,8 +1355,9 @@ semantics.
 cargo install --locked ktstr   # the two user-facing binaries
 ```
 
-The two test-fixture binaries (`ktstr-jemalloc-probe`,
-`ktstr-jemalloc-alloc-worker`) require the non-default `integration`
+The four test-fixture binaries (`ktstr-jemalloc-probe`,
+`ktstr-jemalloc-alloc-worker`, `ktstr-schbench-validate`,
+`ktstr-taobench-validate`) require the non-default `integration`
 feature, so a default `cargo install` builds only `ktstr` and
 `cargo-ktstr` and never places the fixtures on `$PATH`.
 

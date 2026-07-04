@@ -55,7 +55,8 @@ pub fn custom_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     };
 
     // Pinning all workers to 2 CPUs concentrates load and increases
-    // spread under EEVDF; relax the default 35% threshold.
+    // spread under EEVDF; relax the default spread threshold
+    // (`spread_threshold_pct`: 35% debug / 15% release).
     let checks = Assert::default_checks().max_spread_pct(75.0);
 
     // Settle step uses a fixed minimum so `ctx.settle = Duration::ZERO`
@@ -66,7 +67,7 @@ pub fn custom_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     // without the 500ms floor a ZERO-duration settle would let the
     // affinity-pin step race the worker dispatch path.
     // `HoldSpec::fixed(ZERO)` itself is VALID per HoldSpec::validate
-    // (types.rs:1854) — the floor is for scheduler-warmup
+    // (scenario/ops/types/step.rs) — the floor is for scheduler-warmup
     // correctness, not validation.
     let settle = ctx.settle.max(Duration::from_millis(500));
     let backdrop = Backdrop::new()

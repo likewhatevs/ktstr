@@ -659,20 +659,20 @@ fn sys_rdy_releases_monitor_before_5s_timeout() {
 /// pre-sample boot wait MUST observe the kill eventfd and
 /// fall through — not block until the 5 s sys_rdy ceiling.
 ///
-/// Wallclock budget: 8 s. The path to a kill_evt-driven
+/// Wallclock budget: 12 s. The path to a kill_evt-driven
 /// monitor wakeup is "kernel panic → reboot exit → BSP loop
 /// sets kill → freeze coordinator writes kill_evt → monitor
 /// boot wait wakes". A regression that left the monitor
 /// blocked on sys_rdy alone (no kill_evt registration) would
 /// hold the VM open for the full 5 s ceiling — still under
-/// the 8 s budget, but a kill_evt regression that blocks
+/// the 12 s budget, but a kill_evt regression that blocks
 /// indefinitely on a different fd would still surface here.
 ///
-/// `init=/nonexistent` rides on the kernel cmdline ahead of
-/// the builder's own `rdinit=/init` token; the kernel's
+/// `init=/nonexistent` is supplied via the builder cmdline
+/// (this test sets no `init_binary`, so no `rdinit=/init`
+/// token is emitted); the kernel's
 /// `init/main.c::run_init_process` tries every `init=` path
-/// in order and panics when none succeeds, regardless of
-/// `rdinit` (which only fires for ramdisk-style discovery).
+/// in order and panics when none succeeds.
 /// `panic=-1` is the existing default in
 /// `KtstrVm::setup_memory`'s cmdline composition; setting it
 /// again via `cmdline_extra` is a no-op for the kernel parser
@@ -721,23 +721,24 @@ fn monitor_exits_cleanly_when_guest_panics_before_sys_rdy() {
     );
 }
 
-/// Asserts the FIRST monitor sample (no reverse scan) has
-/// `rq_clock > 1ms` on at least one CPU. This pins the SYS_RDY
+/// Asserts at least one of the first 5 monitor samples (no
+/// reverse scan) has `rq_clock > 1ms` on at least one CPU.
+/// This pins the SYS_RDY
 /// → DATA_VALID pipeline's load-bearing semantics: when
 /// `send_sys_rdy` fires, the guest BSP has already completed
 /// `setup_per_cpu_areas` AND KASLR randomization AND
-/// `mount_filesystems()`, so the first per-iteration refresh in
-/// `monitor_loop` produces in-DRAM PAs and `read_rq_stats`
+/// `mount_filesystems()`, so the early per-iteration refreshes in
+/// `monitor_loop` produce in-DRAM PAs and `read_rq_stats`
 /// returns live counters — no zero-pad sentinel period and no
 /// reverse scan needed to find a populated sample.
 ///
 /// Distinct from `boot_kernel_with_monitor`'s reverse-scan
 /// assertion: that test passes if ANY sample (even the last
 /// one, after seconds of pre-boot zeros) is populated. This
-/// test fails if the FIRST sample is empty — which would
-/// indicate the monitor started sampling before the guest had
-/// the rq fields written, defeating the whole point of the
-/// SYS_RDY gate.
+/// test fails if none of the first 5 samples is populated —
+/// which would indicate the monitor started sampling before
+/// the guest had the rq fields written, defeating the whole
+/// point of the SYS_RDY gate.
 ///
 #[test]
 fn first_sample_has_valid_rq_clock_thanks_to_sys_rdy() {
@@ -899,7 +900,7 @@ fn watchdog_timeout_override_lands_in_guest_memory() {
 
 /// Prove the kernel uses the host-written watchdog timeout.
 ///
-/// Sets a 300-second watchdog and runs the scheduler for 15s.
+/// Sets a 300-second watchdog and runs the scheduler for 30s.
 /// If the host write is effective, the kernel's watchdog timer
 /// uses 300s and no stall exit occurs. If the write were
 /// ineffective (kernel ignoring the value), the default timeout
@@ -963,7 +964,7 @@ fn watchdog_override_prevents_stall_exit() {
     };
     assert!(
         !lifecycle_phase_seen(crate::vmm::wire::LifecyclePhase::SchedulerDied),
-        "scheduler no longer running after 15s — either the watchdog fired or the \
+        "scheduler no longer running after 30s — either the watchdog fired or the \
          scheduler exited for another reason. output: {output:?}, stderr: {stderr:?}",
     );
     assert!(

@@ -84,7 +84,7 @@ pub(crate) fn decorate_path_label_for_dirty(base_label: &str, is_dirty: bool) ->
 ///   PREFIX is the source tag, with `{discriminator}` being the
 ///   git short_hash of the source tree (or the literal `unknown`
 ///   when the tree is not a git repo, see
-///   `crate::fetch::local_source`). Label is `local_{hash6}`,
+///   `ktstr::fetch::local_source`). Label is `local_{hash6}`,
 ///   where `{hash6}` is the 6-char prefix of the discriminator —
 ///   collapsing every local entry to bare `"local"` would erase
 ///   distinct local trees from the operator-visible label and
@@ -151,21 +151,29 @@ pub(crate) fn cache_key_to_version_label(key: &str) -> std::borrow::Cow<'_, str>
     Cow::Borrowed(key)
 }
 
-/// Build the `git_{owner}_{repo}_{ref}` label for a `Git`-resolved
-/// kernel. Extracts the `owner` and `repo` segments from the URL's
-/// path component, drops the scheme/host, strips a trailing `.git`,
-/// and pairs them with the operator-supplied git ref.
+/// Build the `git_{owner}_{repo}_{kind}_{ref}` label for a
+/// `Git`-resolved kernel. Extracts the `owner` and `repo` segments from
+/// the URL's path component, drops the scheme/host, strips a trailing
+/// `.git`, and pairs them with the ref KIND (`tag` / `branch` / `sha`)
+/// and the operator-supplied ref. Encoding the kind keeps a tag and a
+/// same-named branch — which can resolve to different commits — on
+/// distinct, non-colliding labels.
 ///
 /// Examples:
-/// - `git+https://github.com/tj/sched_ext#for-next` →
-///   `git_tj_sched_ext_for-next`
-/// - `git+https://gitlab.com/foo/bar.git#v6.14` →
-///   `git_foo_bar_v6.14`
+/// - `git+https://github.com/tj/sched_ext#branch=for-next` →
+///   `git_tj_sched_ext_branch_for-next`
+/// - `git+https://gitlab.com/foo/bar.git#tag=v6.14` →
+///   `git_foo_bar_tag_v6.14`
 /// - URL without a recognisable owner/repo (path with only one
-///   segment, e.g. a local mirror `/srv/linux.git`) → `git_<first
-///   non-empty segment>_<ref>` (defensively avoids producing an
-///   ambiguous `git_` prefix on its own).
-pub(crate) fn git_kernel_label(url: &str, git_ref: &str) -> String {
+///   segment, e.g. a local mirror `/srv/linux.git`) →
+///   `git_<first non-empty segment>_<kind>_<ref>` (defensively avoids
+///   producing an ambiguous `git_` prefix on its own).
+pub(crate) fn git_kernel_label(
+    url: &str,
+    git_ref: &str,
+    ref_kind: ktstr::kernel_path::GitRefKind,
+) -> String {
+    use ktstr::kernel_path::GitRefKind;
     // Strip scheme: everything up to and including `://`.
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     // Strip user@host: split off the leading host segment by
@@ -178,16 +186,24 @@ pub(crate) fn git_kernel_label(url: &str, git_ref: &str) -> String {
     // Trim leading `/`, drop trailing `.git`, then pull the last
     // two non-empty segments as `(owner, repo)`. A single-segment
     // path (e.g. local mirror) gives `(segment, "")` which we
-    // collapse to `git_{segment}_{ref}`.
+    // collapse to `git_{segment}_{kind}_{ref}`.
     let trimmed = path.trim_start_matches('/').trim_end_matches('/');
     let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
     let mut segments: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
     let repo = segments.pop().unwrap_or("repo");
     let owner = segments.pop().unwrap_or("");
+    // Encode the ref kind so a tag and a same-named branch get distinct
+    // labels rather than colliding at detect_label_collisions.
+    let kind = match ref_kind {
+        GitRefKind::Tag => "tag",
+        GitRefKind::Branch => "branch",
+        GitRefKind::Sha => "sha",
+        GitRefKind::Unknown => "ref",
+    };
     if owner.is_empty() {
-        format!("git_{repo}_{git_ref}")
+        format!("git_{repo}_{kind}_{git_ref}")
     } else {
-        format!("git_{owner}_{repo}_{git_ref}")
+        format!("git_{owner}_{repo}_{kind}_{git_ref}")
     }
 }
 
@@ -202,7 +218,7 @@ pub(crate) fn git_kernel_label(url: &str, git_ref: &str) -> String {
 /// `[a-z0-9_]+` identifiers happens on the test-binary side via
 /// `dispatch::sanitize_kernel_label`. The producer-side label is
 /// already a semantic, operator-readable identifier (a version
-/// string like `6.14.2`, `git_owner_repo_ref`, `path_basename_hash6`,
+/// string like `6.14.2`, `git_owner_repo_kind_ref`, `path_basename_hash6`,
 /// or `local`), so the env var inspected directly via `printenv
 /// KTSTR_KERNEL_LIST` reads as a meaningful kernel→path map rather
 /// than as raw cache-key plumbing.
@@ -221,11 +237,11 @@ pub(crate) fn encode_kernel_list(resolved: &[(String, PathBuf)]) -> Result<Strin
     // into garbage.
     //
     // Producers feeding this helper today (the encoder family
-    // around `path_kernel_label` / `git_kernel_label` /
-    // `version_kernel_label`) never emit either character in
+    // around `path_kernel_label` / `git_kernel_label` / the inline
+    // `v.clone()` version label) never emit either character in
     // practice — basenames are `[a-zA-Z0-9._-]+`, version
     // strings have `[0-9.-]`, and git labels are
-    // `git_{owner}_{repo}_{ref}` with hash-stripped refs. The
+    // `git_{owner}_{repo}_{kind}_{ref}` with hash-stripped refs. The
     // checks here guard against a future producer change OR a
     // direct caller of `encode_kernel_list` (e.g. a unit test
     // injecting synthetic input) that violates the wire-format
@@ -340,7 +356,11 @@ pub(crate) fn preflight_collision_check(specs: &[String]) -> Result<(), String> 
         let label: Option<String> = match &id {
             KernelId::Version(v) => Some(v.clone()),
             KernelId::CacheKey(k) => Some(cache_key_to_version_label(k).to_string()),
-            KernelId::Git { url, git_ref } => Some(git_kernel_label(url, git_ref)),
+            KernelId::Git {
+                url,
+                git_ref,
+                ref_kind,
+            } => Some(git_kernel_label(url, git_ref, *ref_kind)),
             // Path / Range deferred to post-resolve check.
             KernelId::Path(_) | KernelId::Range { .. } => None,
         };
@@ -403,10 +423,11 @@ pub(crate) fn dedupe_resolved(resolved: Vec<(String, PathBuf)>) -> Vec<(String, 
 
 /// Detect two distinct producer-side labels that normalize to the
 /// same nextest identifier via [`ktstr::test_support::sanitize_kernel_label`].
-/// A collision would shatter two cache directories under one test-
-/// name suffix, so the dispatch-side label-to-dir map in
-/// `parse_kernel_list` would silently retain only the last entry
-/// and every prior collision would route to the wrong kernel.
+/// A collision would make two distinct kernels share one sanitized
+/// suffix, so the downstream first-match lookup on the dispatch side
+/// (`kernel_list.iter().find(|k| k.sanitized.as_str() == kernel_label)`)
+/// would silently route every colliding label to the FIRST matching
+/// entry, misrouting the others.
 ///
 /// On collision: returns `Err(message)` naming both labels and the
 /// shared sanitized form so the operator can disambiguate the
@@ -551,39 +572,55 @@ mod tests {
     #[test]
     fn git_kernel_label_github_https() {
         assert_eq!(
-            git_kernel_label("https://github.com/tj/sched_ext", "for-next"),
-            "git_tj_sched_ext_for-next",
+            git_kernel_label(
+                "https://github.com/tj/sched_ext",
+                "for-next",
+                ktstr::kernel_path::GitRefKind::Branch,
+            ),
+            "git_tj_sched_ext_branch_for-next",
         );
     }
 
     #[test]
     fn git_kernel_label_github_https_with_dot_git() {
         assert_eq!(
-            git_kernel_label("https://github.com/tj/sched_ext.git", "for-next"),
-            "git_tj_sched_ext_for-next",
+            git_kernel_label(
+                "https://github.com/tj/sched_ext.git",
+                "for-next",
+                ktstr::kernel_path::GitRefKind::Branch,
+            ),
+            "git_tj_sched_ext_branch_for-next",
         );
     }
 
     #[test]
     fn git_kernel_label_gitlab_with_ref_tag() {
         assert_eq!(
-            git_kernel_label("https://gitlab.com/foo/bar.git", "v6.14"),
-            "git_foo_bar_v6.14",
+            git_kernel_label(
+                "https://gitlab.com/foo/bar.git",
+                "v6.14",
+                ktstr::kernel_path::GitRefKind::Tag,
+            ),
+            "git_foo_bar_tag_v6.14",
         );
     }
 
     #[test]
     fn git_kernel_label_local_mirror_two_segment_path() {
         // Two-segment path (`/srv/linux.git`) renders as
-        // `git_{owner}_{repo}_{ref}` even when the "owner" is just
+        // `git_{owner}_{repo}_{kind}_{ref}` even when the "owner" is just
         // a parent directory — the helper does not heuristically
         // distinguish "meaningful" ownership from filesystem
         // hierarchy. Deterministic and unique-per-URL is good
         // enough; over-cleverness would risk silently colliding
         // labels across distinct mirrors.
         assert_eq!(
-            git_kernel_label("file:///srv/linux.git", "v6.14"),
-            "git_srv_linux_v6.14",
+            git_kernel_label(
+                "file:///srv/linux.git",
+                "v6.14",
+                ktstr::kernel_path::GitRefKind::Tag,
+            ),
+            "git_srv_linux_tag_v6.14",
         );
     }
 
@@ -596,11 +633,15 @@ mod tests {
         // after the first `/` post-scheme; with no `/` to split
         // on, the entire post-scheme string IS the path. After
         // `.git` strip we have one segment, owner pops empty, and
-        // the helper falls back to `git_{repo}_{ref}` to avoid
+        // the helper falls back to `git_{repo}_{kind}_{ref}` to avoid
         // emitting `git__{ref}`.
         assert_eq!(
-            git_kernel_label("file://linux.git", "v6.14"),
-            "git_linux_v6.14",
+            git_kernel_label(
+                "file://linux.git",
+                "v6.14",
+                ktstr::kernel_path::GitRefKind::Tag,
+            ),
+            "git_linux_tag_v6.14",
         );
     }
 
@@ -611,8 +652,12 @@ mod tests {
         // the host, yielding the same `tj/sched_ext` path
         // component as the https variant.
         assert_eq!(
-            git_kernel_label("ssh://git@github.com/tj/sched_ext", "main"),
-            "git_tj_sched_ext_main",
+            git_kernel_label(
+                "ssh://git@github.com/tj/sched_ext",
+                "main",
+                ktstr::kernel_path::GitRefKind::Branch,
+            ),
+            "git_tj_sched_ext_branch_main",
         );
     }
 
@@ -1148,23 +1193,23 @@ mod tests {
 
     #[test]
     fn preflight_collision_check_git_url_collision() {
-        // Two distinct `git+URL#REF` specs that produce
-        // `git_owner_repo_ref`-shape labels can collide if they
-        // share owner/repo/ref segments. Construct two URLs whose
+        // Two distinct `git+URL#tag=` specs that produce
+        // `git_owner_repo_kind_ref`-shape labels can collide if they
+        // share owner/repo/kind/ref segments. Construct two URLs whose
         // git_kernel_label outputs differ only in `.` vs `-`
         // characters that sanitize to `_`.
-        // - `git+ssh://h/foo/bar#v6.14` → `git_foo_bar_v6.14`
-        //   sanitizes to `kernel_git_foo_bar_v6_14`.
-        // - `git+ssh://h/foo/bar#v6-14` → `git_foo_bar_v6-14`
-        //   sanitizes to the same `kernel_git_foo_bar_v6_14`.
+        // - `git+ssh://h/foo/bar#tag=v6.14` → `git_foo_bar_tag_v6.14`
+        //   sanitizes to `kernel_git_foo_bar_tag_v6_14`.
+        // - `git+ssh://h/foo/bar#tag=v6-14` → `git_foo_bar_tag_v6-14`
+        //   sanitizes to the same `kernel_git_foo_bar_tag_v6_14`.
         let specs = vec![
-            "git+ssh://host/foo/bar#v6.14".to_string(),
-            "git+ssh://host/foo/bar#v6-14".to_string(),
+            "git+ssh://host/foo/bar#tag=v6.14".to_string(),
+            "git+ssh://host/foo/bar#tag=v6-14".to_string(),
         ];
         let err = preflight_collision_check(&specs)
             .expect_err("colliding git refs must surface a pre-flight error");
-        assert!(err.contains("git_foo_bar_v6.14") || err.contains("git_foo_bar_v6-14"));
-        assert!(err.contains("kernel_git_foo_bar_v6_14"));
+        assert!(err.contains("git_foo_bar_tag_v6.14") || err.contains("git_foo_bar_tag_v6-14"));
+        assert!(err.contains("kernel_git_foo_bar_tag_v6_14"));
     }
 
     // ---------------------------------------------------------------

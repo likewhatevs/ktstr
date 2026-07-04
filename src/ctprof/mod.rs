@@ -2963,9 +2963,11 @@ fn capture_with(
     } else {
         None
     };
-    // Linux pid_max is bounded above by 2^22 (kernel/pid.c —
-    // PID_MAX_LIMIT) on every supported architecture, well
-    // inside i32::MAX, so the u32 → i32 cast cannot wrap.
+    // Linux pid_max is bounded above by 2^22 (PID_MAX_LIMIT,
+    // defined in include/linux/threads.h; kernel/pid.c clamps
+    // pid_max to it via pid_max_max) on every supported
+    // architecture, well inside i32::MAX, so the u32 → i32 cast
+    // cannot wrap.
     let self_pid = std::process::id() as i32;
     let mut threads: Vec<ThreadState> = Vec::new();
     let mut failed_tgids_logged: std::collections::BTreeSet<i32> =
@@ -3521,9 +3523,11 @@ fn capture_pid_with(
     } else {
         None
     };
-    // Linux pid_max is bounded above by 2^22 (kernel/pid.c —
-    // PID_MAX_LIMIT) on every supported architecture, well
-    // inside i32::MAX, so the u32 → i32 cast cannot wrap.
+    // Linux pid_max is bounded above by 2^22 (PID_MAX_LIMIT,
+    // defined in include/linux/threads.h; kernel/pid.c clamps
+    // pid_max to it via pid_max_max) on every supported
+    // architecture, well inside i32::MAX, so the u32 → i32 cast
+    // cannot wrap.
     let self_pid = std::process::id() as i32;
     let pcomm = read_process_comm_at(proc_root, pid).unwrap_or_default();
     let mut summary = ProbeSummary::default();

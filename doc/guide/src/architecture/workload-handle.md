@@ -60,7 +60,8 @@ For grouped work types (the full set: `PipeIo`, `CachePipe`,
 `FutexPingPong`, `FutexFanOut`, `FanOutCompute`, `MutexContention`,
 `ThunderingHerd`, `PriorityInversion`, `ProducerConsumerImbalance`,
 `RtStarvation`, `AsymmetricWaker`, `WakeChain`, `SignalStorm`,
-`PreemptStorm`, `EpollStorm`, `SmtSiblingSpin`), `spawn()` validates
+`PreemptStorm`, `EpollStorm`, `SmtSiblingSpin`, `IrqWake`), `spawn()`
+validates
 that `num_workers` is divisible by the work type's group size (each
 variant exposes a `worker_group_size()` accessor) and sets up the
 inter-worker communication the variant requires: pipes for
@@ -68,7 +69,8 @@ inter-worker communication the variant requires: pipes for
 contention families (`FutexPingPong`, `FutexFanOut`, `FanOutCompute`,
 `MutexContention`, `ThunderingHerd`, `PriorityInversion`,
 `ProducerConsumerImbalance`, `AsymmetricWaker`, `WakeChain`,
-`RtStarvation`, `SignalStorm`, `PreemptStorm`, `EpollStorm`).
+`RtStarvation`, `SignalStorm`, `PreemptStorm`, `EpollStorm`,
+`IrqWake`).
 
 ## Methods
 
@@ -109,8 +111,8 @@ Auto-starts workers if `start()` was not called. SIGKILL fires
 unconditionally after the read (or on deadline expiry without a
 report) to reap zombies. Consumes the handle. Each `WorkerReport`
 carries `work_units`, `tid`, optional `affinity_error`, and an
-optional `exit_info` discriminator (`Panicked` / `Signaled(sig)` /
-`TimedOut` / `WaitFailed(errno)` / `Exited(code)`) — see
+optional `exit_info` discriminator (`Panicked(msg)` / `Signaled(sig)` /
+`TimedOut` / `WaitFailed(msg)` / `Exited(code)`) — see
 [`WorkerReport`](workers.md) for the full shape and the
 sentinel-vs-real-report distinction.
 

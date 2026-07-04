@@ -274,8 +274,9 @@ fn err_triggered_or_gate_combinations() {
 /// Idempotency: repeated calls against the same mem + PA with no
 /// underlying writes return the same state. Pins the helper as a
 /// pure read with no side effects, mirroring the production poll
-/// cadence (every 100 ms during boot, every scan tick afterward)
-/// where any per-call mutation would drift the err_triggered
+/// cadence (the freeze coordinator's epoll loop re-reads the latch
+/// on each scanner tick, SCAN_INTERVAL = 250 ms, plus event-driven
+/// wakes) where any per-call mutation would drift the err_triggered
 /// decision under steady state.
 #[test]
 fn helper_is_pure_under_repeated_calls() {

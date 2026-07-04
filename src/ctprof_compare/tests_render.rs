@@ -32,7 +32,7 @@ use regex::Regex;
 /// Pin all four branches of `cgroup_cell` directly with the
 /// dimensionless ("") unit so values render verbatim (no
 /// scaling). Auto-scaling per-unit is exercised separately by
-/// `cgroup_cell_renders_scaled_*`. Existing higher-level
+/// `cgroup_cell_scales_*`. Existing higher-level
 /// tests only exercise the (Some, Some) path transitively via
 /// `write_diff_cgroup_enrichment_section_for_cgroup_mode`; the
 /// other three branches (baseline-only, candidate-only,
@@ -52,11 +52,11 @@ fn cgroup_cell_renders_all_four_branches() {
         cgroup_cell(Some(50), Some(5), ScaleLadder::Unitless),
         "50 → 5 (-45)"
     );
-    // (Some, None) → baseline value then en-dash placeholder.
+    // (Some, None) → baseline value then hyphen placeholder.
     assert_eq!(cgroup_cell(Some(7), None, ScaleLadder::Unitless), "7 → -");
-    // (None, Some) → leading en-dash placeholder.
+    // (None, Some) → leading hyphen placeholder.
     assert_eq!(cgroup_cell(None, Some(99), ScaleLadder::Unitless), "- → 99");
-    // (None, None) → single en-dash (both sides absent).
+    // (None, None) → single hyphen (both sides absent).
     assert_eq!(cgroup_cell(None, None, ScaleLadder::Unitless), "-");
 }
 
@@ -77,11 +77,11 @@ fn format_psi_avg_cell_renders_all_four_branches() {
         format_psi_avg_cell(Some(2431), Some(1859)),
         "24.31% → 18.59% (-5.72%)",
     );
-    // (Some, None) → baseline value then en-dash placeholder.
+    // (Some, None) → baseline value then hyphen placeholder.
     assert_eq!(format_psi_avg_cell(Some(750), None), "7.50% → -");
-    // (None, Some) → leading en-dash placeholder.
+    // (None, Some) → leading hyphen placeholder.
     assert_eq!(format_psi_avg_cell(None, Some(50)), "- → 0.50%");
-    // (None, None) → single en-dash (both sides absent).
+    // (None, None) → single hyphen (both sides absent).
     assert_eq!(format_psi_avg_cell(None, None), "-");
 }
 

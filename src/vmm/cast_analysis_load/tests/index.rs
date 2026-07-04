@@ -121,8 +121,8 @@ fn build_fwd_index_skips_anonymous_structs() {
 /// shares the name. The renderer's chase consults the index to
 /// resolve a Fwd terminal to a complete sibling; a Fwd-keyed
 /// entry would point the chase at another Fwd (no body), defeating
-/// the index. The function's `if let Type::Struct(s) | Type::Union(s)`
-/// filter excludes Fwd before the name lookup.
+/// the index. The function's `match` on the type kind routes Fwd
+/// to the `_ => {}` arm, so Fwd never reaches `resolve_name`.
 ///
 /// Fixture: BTF #0 declares `struct shared;` (Fwd) at id 2; BTF #1
 /// defines `struct shared { u64 v @ 0 }` at id 2. Expected:
@@ -215,15 +215,15 @@ fn build_fwd_index_skips_fwd_when_complete_body_in_later_btf() {
 
 /// A `BTF_KIND_FWD` with `name_off = 0` (no name in
 /// the strtab) must be silently skipped without panicking the
-/// id-space walk. The btf-rs parser only registers names when
-/// `name_off > 0` (see obj.rs `if bt.name_off > 0`), so the type
-/// entry exists in `types[id]` but has no string-table linkage.
-/// `build_fwd_index`'s `if let Type::Struct(s) | Type::Union(s)`
-/// filter excludes the Fwd before the name lookup runs, so
-/// `resolve_name` is never called on the empty-named Fwd.
-/// This test pins the no-panic guarantee — a future refactor that
-/// drops the kind filter (e.g. broadening to also index Typedefs)
-/// must not panic on a name_off=0 Fwd.
+/// id-space walk. btf-rs registers a name only when `name_offset`
+/// returns `Some` (cbtf.rs `btf_type::name_offset` gates on
+/// `if offset > 0`, and Fwd is not in `has_anon_name`), so a
+/// name_off=0 Fwd has no string-table linkage.
+/// `build_fwd_index`'s `match` on `&ty` routes Fwd to the `_ => {}`
+/// arm, so `resolve_name` is never called on the empty-named Fwd.
+/// This test pins the no-panic guarantee — the `match` already has
+/// a `Type::Typedef` arm alongside Struct/Union, and Fwd falls to
+/// the `_ => {}` wildcard so `resolve_name` never runs on it.
 #[test]
 fn build_fwd_index_handles_empty_name_fwd_without_panic() {
     let mut strings = vec![0u8];
@@ -240,8 +240,9 @@ fn build_fwd_index_handles_empty_name_fwd_without_panic() {
             bits: 64,
         },
         // id 2: BTF_KIND_FWD with name_off=0 (no strtab linkage).
-        // The btf-rs name-cache registration block at obj.rs is
-        // skipped because of the `if bt.name_off > 0` gate.
+        // btf-rs's `btf_type::name_offset` (cbtf.rs) returns `None`
+        // here because of the `if offset > 0` gate (Fwd is not in
+        // `has_anon_name`).
         SynKind::Fwd {
             name_off: 0,
             kind_flag: 0,

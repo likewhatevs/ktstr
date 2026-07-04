@@ -600,7 +600,7 @@ fn spawn_thread_drop_cleanup() {
 /// window means its pipe ops never observed a real wake.
 ///
 /// Asserting `work_units > 0` would NOT prove pipe routing —
-/// `pipe_exchange` ignores `libc::write`/`libc::poll` return
+/// `pipe_exchange` ignores `libc::write`/`libc::read` return
 /// values, and the surrounding worker loop bumps work_units
 /// per iteration regardless of pipe success. A pipe with
 /// closed fds returns -1/EBADF and `pipe_exchange` short-
@@ -659,9 +659,10 @@ fn spawn_thread_with_pipe_io() {
 /// repeat-bootstrap regression queues bytes on the same
 /// pipe), but the spawn path differs: thread workers route
 /// through `spawn_thread_worker` rather than `fork`, and the
-/// pipe-fd ownership transfer goes through
-/// `WorkloadHandle::chain_pipes` rather than the post-fork
-/// close. This test pins the throughput contract under the
+/// pipe-fds are moved into `WorkloadHandle`'s `chain_pipes`
+/// field by `SpawnGuard::into_handle` and closed at
+/// `WorkloadHandle::drop`, rather than by a post-fork close.
+/// This test pins the throughput contract under the
 /// Thread spawn path so a regression that breaks Thread-mode
 /// pipe-fd lifetime (e.g. closes fds before workers reach
 /// the chain handoff) trips the bootstrap-once invariant
@@ -726,8 +727,9 @@ fn wake_chain_pipe_thread_mode_bootstrap_throughput() {
          expected ≥ 4) — the bootstrap byte never completed a full \
          lap. Under Thread mode this typically means the pipe fds \
          were closed before the workers reached the chain handoff \
-         site (a regression in `WorkloadHandle::chain_pipes` \
-         ownership transfer). Per-worker reports: {:?}",
+         site (a regression in `SpawnGuard::into_handle`'s \
+         chain_pipes ownership transfer; fds closed at \
+         `WorkloadHandle::drop`). Per-worker reports: {:?}",
         reports,
     );
 }

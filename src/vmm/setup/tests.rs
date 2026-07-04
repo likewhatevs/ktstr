@@ -720,7 +720,7 @@ fn aarch64_initrd_addr_exact_value_for_aligned_fit() {
 /// the cross-arch common flags. The free fn was extracted so a flag
 /// added once applies to BOTH arches — the doc cites a past per-arch
 /// drift that left `sysctl.vm.overcommit_memory=1` on x86 only and
-/// OOM-ed the aarch64 guest /init. Neither caller (`setup_memory`,
+/// OOM-ed the aarch64 guest /init. Neither caller (`build_guest_cmdline`,
 /// `finish_aarch64_setup`) is host-testable, so this directly pins the
 /// assembled string: the cross-arch invariant flags, the spliced arch
 /// tail, and the `console=ttyS0` / `KTSTR_GUEST=1` anchors.

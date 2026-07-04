@@ -140,12 +140,13 @@ const MAX_ARENA_STRIDE_PROBES: u64 = 256;
 ///
 /// The walker computes its span from `info.max_entries * page_size`
 /// (the BPF map's declared page capacity, see [`snapshot_arena`]).
-/// `bpf_arena_init` allows at most 4 GiB worth of pages by design —
+/// `arena_map_alloc` allows at most 4 GiB worth of pages by design —
 /// the BPF JIT addresses arena pointers via the low 32 bits of the
 /// user address, so anything wider than `0x1_0000_0000` cannot be a
-/// real arena layout (see `bpf_arena_alloc_pages` in
-/// `kernel/bpf/arena.c`). A torn / corrupt `bpf_map.max_entries` or
-/// a freeze-time race against `arena_init` could yield a wild value;
+/// real arena layout (see the `vm_range > SZ_4G` check in
+/// `arena_map_alloc`, `kernel/bpf/arena.c`). A torn / corrupt
+/// `bpf_map.max_entries` or a freeze-time race against `arena_map_alloc`
+/// could yield a wild value;
 /// cap it here so the walker never multiplies a near-`u64::MAX` page
 /// count by the page size (overflow) or attempts to walk billions of
 /// pgoffs (live-lock on the freeze path).

@@ -422,10 +422,14 @@ fn fault_then_inspect(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-The write is event-driven: the host polls for BPF map
-discoverability (scheduler loaded), polls the SHM ring for
-scenario start, then writes the configured u32 at the configured
-offset. Only `BPF_MAP_TYPE_ARRAY` maps are supported; the framework
+The write is event-driven: the host waits for the BPF map
+accessor to become buildable (kernel booted, page tables up),
+resolves the field name to a byte offset from the map's program
+BTF once the scheduler's map appears, then writes the configured
+u32 at that offset — racing probe attachment, with no
+scenario-start synchronization. Completion is signalled to the
+guest via `SIGNAL_BPF_WRITE_DONE` over virtio-console (the legacy
+SHM signal-slot rendezvous was removed). Only `BPF_MAP_TYPE_ARRAY` maps are supported; the framework
 finds the map by `map_name_suffix` (e.g. `".bss"`) via
 `BpfMapAccessor::find_map`. See [Monitor → BPF map writes](../architecture/monitor.md)
 for the prerequisites (vmlinux) and the full host-side

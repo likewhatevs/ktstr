@@ -13,7 +13,7 @@
 //! an env var (e.g. `KTSTR_BUSYBOX_PATH`). Child processes spawned
 //! by cargo-ktstr (e.g. nextest, which fans out to per-test-binary
 //! processes) inherit these env vars; the `ktstr` library's blob-
-//! loading helpers (e.g. `ktstr::vmm::load_busybox_bytes`) read
+//! loading helpers (e.g. `ktstr::vmm::blobs::load_busybox_bytes`) read
 //! the env vars and load the bytes from disk on demand. Subsequent
 //! cargo-ktstr invocations with the same blob bytes hit the same
 //! path and skip the write — only a fresh cargo-ktstr binary (new
@@ -85,9 +85,10 @@ fn extract_to_content_addressed_file(
     }
 
     // Write to a sibling staging tempfile so the rename below is
-    // same-filesystem (atomic). Drop-on-rename is fine here: keep()
-    // unlinks the random suffix, then rename overwrites the
-    // content-addressed target.
+    // same-filesystem (atomic). keep() disables the tempfile's
+    // drop-cleanup and returns the persisted staging path; the
+    // subsequent rename(staging_path, target) removes the
+    // random-suffix name and installs the content-addressed target.
     let dir = target.parent().unwrap_or_else(|| std::path::Path::new("."));
     let mut staging = tempfile::Builder::new()
         .prefix(&format!("ktstr-blob-{name_hint}-staging-"))
@@ -206,10 +207,13 @@ mod tests {
         let _ = std::fs::remove_file(&beta);
     }
 
-    /// The extracted file must be executable (mode 0o755) so the
-    /// guest `/init` shell — and host child processes that invoke
-    /// the wprof binary directly — can exec it without an explicit
-    /// chmod step.
+    /// The extracted file must be executable (mode 0o755) — this pins
+    /// the executable-mode contract of
+    /// `extract_to_content_addressed_file` itself, set at the
+    /// `set_permissions(.., from_mode(0o755))` call. The extracted
+    /// host tempfile is never exec'd: the library reads its bytes to
+    /// pack them into the guest initramfs, where the guest exec bit is
+    /// set independently by the cpio `write_entry` mode (`0o100755`).
     #[test]
     fn extract_to_content_addressed_file_sets_executable_mode() {
         use std::os::unix::fs::PermissionsExt;

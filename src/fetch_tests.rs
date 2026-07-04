@@ -189,6 +189,95 @@ fn promote_staged_bails_on_empty_staging() {
     );
 }
 
+// -- promote_single_kernel_tree --
+
+/// A well-formed codeload archive (one top-level directory, whatever
+/// its ref-derived name) is renamed out of staging to `dest/{canonical}`.
+#[test]
+fn promote_single_promotes_sole_directory() {
+    let dest = tempfile::TempDir::new().unwrap();
+    let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+    std::fs::create_dir(staging.path().join("linux-6.11.11")).unwrap();
+    std::fs::write(
+        staging.path().join("linux-6.11.11").join("Makefile"),
+        b"# fake",
+    )
+    .unwrap();
+    let out = promote_single_kernel_tree(&staging, dest.path(), "linux-git-abc1234").unwrap();
+    assert_eq!(out, dest.path().join("linux-git-abc1234"));
+    assert!(out.is_dir());
+    assert!(
+        out.join("Makefile").is_file(),
+        "promoted tree keeps its contents"
+    );
+    assert!(
+        !staging.path().join("linux-6.11.11").exists(),
+        "renamed out of staging"
+    );
+}
+
+#[test]
+fn promote_single_rejects_zero_entries() {
+    let dest = tempfile::TempDir::new().unwrap();
+    let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+    let err = promote_single_kernel_tree(&staging, dest.path(), "linux-git-abc1234").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("exactly one top-level entry"),
+        "empty staging must be rejected: {err:#}"
+    );
+    assert!(!dest.path().join("linux-git-abc1234").exists());
+}
+
+#[test]
+fn promote_single_rejects_multiple_entries() {
+    let dest = tempfile::TempDir::new().unwrap();
+    let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+    std::fs::create_dir(staging.path().join("a")).unwrap();
+    std::fs::create_dir(staging.path().join("b")).unwrap();
+    let err = promote_single_kernel_tree(&staging, dest.path(), "linux-git-abc1234").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("exactly one top-level entry"),
+        "several top-level entries must be rejected: {err:#}"
+    );
+    assert!(!dest.path().join("linux-git-abc1234").exists());
+}
+
+#[test]
+fn promote_single_rejects_top_level_file() {
+    let dest = tempfile::TempDir::new().unwrap();
+    let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+    std::fs::write(staging.path().join("linux-6.11.11"), b"not a dir").unwrap();
+    let err = promote_single_kernel_tree(&staging, dest.path(), "linux-git-abc1234").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("not a plain directory"),
+        "a top-level file must be rejected: {err:#}"
+    );
+    assert!(!dest.path().join("linux-git-abc1234").exists());
+}
+
+/// A sole top-level symlink-to-directory must be rejected, not
+/// followed: `Path::is_dir()` would accept the attacker-chosen target
+/// and `fs::rename` would promote the symlink itself. The directory-
+/// entry file-type check rejects it.
+#[test]
+#[cfg(unix)]
+fn promote_single_rejects_top_level_symlink() {
+    let dest = tempfile::TempDir::new().unwrap();
+    let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+    // A real directory OUTSIDE staging that the symlink points at.
+    let target = tempfile::TempDir::new().unwrap();
+    std::os::unix::fs::symlink(target.path(), staging.path().join("linux-evil")).unwrap();
+    let err = promote_single_kernel_tree(&staging, dest.path(), "linux-git-abc1234").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("not a plain directory"),
+        "a top-level symlink must be rejected: {err:#}"
+    );
+    assert!(
+        !dest.path().join("linux-git-abc1234").exists(),
+        "the symlink must not be promoted into dest",
+    );
+}
+
 // -- patch_level --
 
 #[test]
@@ -679,14 +768,14 @@ fn inspect_local_source_state_detects_mid_build_modification() {
 /// the URL-injection seam and proves the non-singleton
 /// `Client` skips [`RELEASES_CACHE`] and reaches
 /// [`fetch_releases`] with the supplied URL.
-/// [`fetch_releases`]'s GET-and-parse mechanics — the same
-/// function the bypass branch invokes with whatever URL is
-/// threaded in, and that production callers reach on cache
+/// [`fetch_releases`]'s parse mechanics — the same
+/// [`parse_releases_body`] call the bypass branch runs on the
+/// response body, which production callers reach on cache
 /// miss (with [`RELEASES_URL`] pinned by the
 /// [`cached_releases_with`] wrapper) — are covered
 /// deterministically by
 /// [`fetch_releases_against_localhost_mock_returns_parsed`]
-/// against a TcpListener mock with an injected URL, plus the
+/// via a direct [`parse_releases_body`] call, plus the
 /// `fetch_releases_*` family of error-path tests
 /// (HTTP 500, malformed JSON, missing array, partial rows,
 /// empty array, extra fields, connection refused). Together
@@ -719,6 +808,9 @@ fn inspect_local_source_state_detects_mid_build_modification() {
 /// tests in `cli.rs` bypass the network by calling
 /// `filter_and_sort_range` directly with synthetic
 /// releases. The
+/// `expand_kernel_range`-shaped tests in `src/cli/resolve.rs`
+/// bypass the network by calling `filter_and_sort_range`
+/// directly with synthetic releases. The
 /// `is_shared_client_recognizes_process_singleton` and
 /// `is_shared_client_rejects_test_constructed_clients`
 /// tests touch [`SHARED_CLIENT`] but not
@@ -852,9 +944,9 @@ fn cached_releases_routing_singleton_path() {
 ///   for a sub-2-segment input (the `else` arm).
 /// - `fetch_version_for_prefix` selects the highest in-cache
 ///   patch for a known prefix WITHOUT reaching the
-///   `probe_latest_patch` network fallback (the `6.14` series is
-///   present in the cache, so the `best.is_some()` early return
-///   fires).
+///   `latest_patch_from_git_tags` network fallback (the `6.14`
+///   series is present in the cache, so the `best.is_some()` early
+///   return fires).
 #[test]
 fn series_resolution_routing_through_cache() {
     // SAME synthetic data the two peer cache tests use — all
@@ -961,9 +1053,9 @@ fn series_resolution_routing_through_cache() {
 
     // The `6.14` series is in the cache, so the selection loop
     // finds `6.14.2` and returns via the `best.is_some()` arm —
-    // it must NOT fall through to the probe_latest_patch network
-    // fallback. A regression that skipped the cache hit would
-    // attempt a real cdn.kernel.org directory-listing GET.
+    // it must NOT fall through to the latest_patch_from_git_tags
+    // network fallback. A regression that skipped the cache hit
+    // would attempt a real git.kernel.org ls-remote.
     let resolved = super::fetch_version_for_prefix(client, "6.14", "test")
         .expect("present series must resolve from cache without network");
     assert_eq!(
@@ -1066,7 +1158,7 @@ fn cached_releases_with_non_singleton_bypasses_cache() {
         }"#;
     let (_server, mock_url, _mock) = mock_releases(200, mock_body);
 
-    // Build a non-singleton client via the shared 5s-timeout
+    // Build a non-singleton client via the shared 60s-timeout
     // builder helper. The address differs from
     // `shared_client()`'s OnceLock-stored address, so
     // `is_shared_client(&non_singleton)` returns false and
@@ -1197,23 +1289,18 @@ fn mock_releases(status: usize, body: &str) -> (mockito::ServerGuard, String, mo
     (server, url, mock)
 }
 
-/// [`fetch_releases`] issues a real HTTP GET against the
-/// `url` it's handed, parses the response body as
-/// `releases.json`, and returns the structured
-/// `Vec<Release>`. Replaces the prior 1ms-connect-timeout
-/// bypass-arm assertion that required a real kernel.org
-/// reach with a deterministic localhost TcpListener mock —
-/// no real network, no flake on slow connect, exit shape
-/// pinned to "Ok with synthetic data".
+/// [`parse_releases_body`] parses a canned `releases.json`
+/// string into a structured `Vec<Release>`. Drives the parse
+/// path directly on a literal body — no network, no
+/// [`fetch_releases`] invocation, exit shape pinned to "Ok
+/// with synthetic data".
 ///
-/// Covers [`fetch_releases`]'s GET-and-parse mechanics — the
-/// same function [`cached_releases_with_url`]'s bypass branch
-/// invokes with whatever URL is threaded in, and the same
-/// function production callers reach on cache miss (with
-/// [`RELEASES_URL`] pinned by the [`cached_releases_with`]
-/// wrapper). The bypass-branch routing decision (non-singleton
+/// Covers the parse half of [`fetch_releases`]'s GET-and-parse
+/// path — the same [`parse_releases_body`] call that
+/// [`fetch_releases`] runs on the response body. The GET half,
+/// and the bypass-branch routing decision (non-singleton
 /// reaches `fetch_releases` with the supplied URL, NOT
-/// [`RELEASES_CACHE`]) is verified separately by
+/// [`RELEASES_CACHE`]), are verified separately by
 /// [`is_shared_client_rejects_test_constructed_clients`]
 /// (predicate-level) and by
 /// [`cached_releases_with_non_singleton_bypasses_cache`]
@@ -1264,6 +1351,7 @@ fn test_client() -> reqwest::blocking::Client {
 /// order: same length, same `moniker`, and same `version` for
 /// every index. Shared between the cache-routing tests
 /// (`cached_releases_routing_singleton_path`,
+/// `series_resolution_routing_through_cache`,
 /// `cached_releases_with_non_singleton_bypasses_cache`) so the
 /// "cache contains the byte-equal synthetic" sanity check has
 /// one definition. Catches the regression where a peer test
@@ -1835,7 +1923,7 @@ fn is_shared_client_returns_false_when_uninit() {
 /// against the one-shot baseline.
 #[test]
 fn download_stream_finalizes_sha256_over_streamed_bytes() {
-    // Synthetic payload large enough that a default 4 KiB read
+    // Synthetic payload large enough that the default read
     // buffer cycles through `read` many times — exercises the
     // hasher.update + last_progress reset on the typical
     // streaming path.
@@ -2092,6 +2180,69 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  linux-6.14.3.t
     );
 }
 
+// -- max_tag_patch --
+
+/// `max_tag_patch` returns the numerically-highest patch among
+/// `refs/tags/v{prefix}.{patch}` ref names — the EOL-series resolution
+/// path (releases.json omits EOL series, so 6.14 is recovered from the
+/// stable tree's git tags via ls-remote, cdn-independent). Refs are
+/// interleaved + out of order to prove the max loop (not order)
+/// decides. gix folds an annotated tag into a single base-named
+/// `Ref::Peeled`, so `refs/tags/v6.14.11` is the real advertised
+/// shape; the extra `v6.14.11^{}` entry is a DEFENSIVE raw-wire shape
+/// gix never emits (it exercises the `^{}` strip) and must still
+/// resolve to patch 11 via the base entry.
+#[test]
+fn max_tag_patch_returns_highest_patch() {
+    let refs: &[&[u8]] = &[
+        b"refs/tags/v6.14.1",
+        b"refs/tags/v6.14.11",
+        b"refs/tags/v6.14.11^{}",
+        b"refs/tags/v6.14.2",
+        b"refs/tags/v6.12.94",
+        b"refs/heads/master",
+    ];
+    assert_eq!(
+        super::max_tag_patch(refs.iter().copied(), "6.14"),
+        Some(11),
+        "must select the numerically-highest 6.14 patch (11), not the \
+             lexically-highest (2) nor the last-listed",
+    );
+}
+
+/// The `refs/tags/v{prefix}.` needle's trailing dot keeps a `6.1`
+/// prefix from matching the `6.14` / `6.12` series, and a non-numeric
+/// patch tail (an `-rc` pre-release tag) is rejected.
+#[test]
+fn max_tag_patch_boundary_and_rc() {
+    let refs: &[&[u8]] = &[
+        b"refs/tags/v6.14.11",
+        b"refs/tags/v6.12.94",
+        b"refs/tags/v6.1.140",
+        b"refs/tags/v6.1.99-rc1",
+        b"refs/tags/v6.1.50",
+    ];
+    assert_eq!(
+        super::max_tag_patch(refs.iter().copied(), "6.1"),
+        Some(140),
+        "prefix 6.1 must exclude 6.14/6.12 (dot boundary) and the -rc \
+             tag (non-numeric patch), leaving max(140, 50)",
+    );
+}
+
+/// A prefix with no matching release tag returns None — the caller
+/// turns that into a hard "no release tags" error. A same-series
+/// BRANCH (`refs/heads/linux-6.14.y`) must NOT be mistaken for a tag.
+#[test]
+fn max_tag_patch_absent_prefix_returns_none() {
+    let refs: &[&[u8]] = &[b"refs/tags/v6.12.94", b"refs/heads/linux-6.14.y"];
+    assert_eq!(
+        super::max_tag_patch(refs.iter().copied(), "6.14"),
+        None,
+        "no v6.14.* release TAG -> None; the 6.14.y branch is not a tag",
+    );
+}
+
 /// `parse_sha256_for_file` strips the PGP signature trailer —
 /// content after `-----BEGIN PGP SIGNATURE-----` is binary
 /// noise that must NOT be scanned for checksum lines (a chance
@@ -2278,6 +2429,235 @@ fn verify_sha256_rejects_mismatch_with_both_digests_in_message() {
         msg.contains("--skip-sha256"),
         "mismatch error must name --skip-sha256 as the recovery \
              flag for the in-place-tarball-update case: {msg}",
+    );
+}
+
+// -- download_stable_tarball_from_url + TarballNotFound routing --
+
+/// The `TarballNotFound` marker must be downcast-detectable, and a
+/// non-marker error must NOT be — pins the exact `downcast_ref`
+/// contract `download_tarball`'s EOL git-fallback dispatch depends on
+/// (a 404 carries the marker → shallow git-tag clone; any other error
+/// propagates unchanged). Runs in CI (no network) so the contract is
+/// guarded even though the seam tests below are `#[ignore]`.
+#[test]
+fn tarball_not_found_marker_is_downcast_detectable() {
+    let marked: anyhow::Error = anyhow::Error::new(super::TarballNotFound);
+    assert!(
+        marked.downcast_ref::<super::TarballNotFound>().is_some(),
+        "the marker must be downcast-detectable — download_tarball's \
+             `e.downcast_ref::<TarballNotFound>()` git-fallback arm relies on it",
+    );
+    let plain: anyhow::Error = anyhow::anyhow!("download x: HTTP 500");
+    assert!(
+        plain.downcast_ref::<super::TarballNotFound>().is_none(),
+        "a non-marker error must NOT be misrouted to the git fallback",
+    );
+}
+
+/// Create a mockito server serving one canned tarball response at a
+/// fixed path. Returns (server, url, mock). Mirrors [`mock_sha256sums`]
+/// for the tarball endpoint.
+fn mock_tarball(status: usize, body: &str) -> (mockito::ServerGuard, String, mockito::Mock) {
+    let mut server = mockito::Server::new();
+    let mock = server
+        .mock("GET", "/linux.tar.xz")
+        .with_status(status)
+        .with_body(body)
+        .create();
+    let url = format!("{}/linux.tar.xz", server.url());
+    (server, url, mock)
+}
+
+/// A 404 from the tarball GET must surface as a downcast-detectable
+/// [`super::TarballNotFound`] — the signal `download_tarball` turns
+/// into the shallow git-tag clone of a pruned/EOL kernel. Drives the
+/// real `download_stable_tarball_from_url` status gate against a
+/// localhost mock (`skip_sha256 = true`, so no sha256sums.asc fetch is
+/// attempted). Without this the 404→marker path is unproven — the pure
+/// `max_tag_patch` tests say nothing about the tarball-download routing.
+#[test]
+#[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
+fn download_stable_tarball_404_returns_tarball_not_found_marker() {
+    let (_server, url, _mock) = mock_tarball(404, "Not Found");
+    let client = test_client();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let err = super::download_stable_tarball_from_url(
+        &client,
+        &url,
+        "6.14.11",
+        tmp.path(),
+        "test",
+        true,
+        None,
+    )
+    .expect_err("a 404 tarball GET must be an error");
+    assert!(
+        err.downcast_ref::<super::TarballNotFound>().is_some(),
+        "a 404 must carry the TarballNotFound marker so download_tarball \
+             routes to the git-tag fallback; got: {err:#}",
+    );
+}
+
+/// A non-404 failure (HTTP 500) must be a HARD error with NO marker —
+/// the git-tag fallback is only for pruned tarballs, not a server
+/// error, which must propagate unchanged (no clone attempt).
+#[test]
+#[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
+fn download_stable_tarball_500_is_hard_error_without_marker() {
+    let (_server, url, _mock) = mock_tarball(500, "Internal Server Error");
+    let client = test_client();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let err = super::download_stable_tarball_from_url(
+        &client,
+        &url,
+        "6.14.11",
+        tmp.path(),
+        "test",
+        true,
+        None,
+    )
+    .expect_err("a 500 tarball GET must be an error");
+    assert!(
+        err.downcast_ref::<super::TarballNotFound>().is_none(),
+        "a 500 must NOT carry the marker — no git fallback for a server \
+             error; got: {err:#}",
+    );
+    assert!(
+        format!("{err:#}").contains("500"),
+        "the hard error must name the HTTP status: {err:#}",
+    );
+}
+
+// -- download_github_archive error paths --
+
+/// Serve one canned codeload response at `/archive` on a localhost
+/// mock. Mirrors [`mock_tarball`] for the GitHub codeload endpoint;
+/// `content_type` is set when a case needs the html-reject path.
+fn mock_codeload(
+    status: usize,
+    body: &[u8],
+    content_type: Option<&str>,
+) -> (mockito::ServerGuard, String) {
+    let mut server = mockito::Server::new();
+    let mut m = server
+        .mock("GET", "/archive")
+        .with_status(status)
+        .with_body(body);
+    if let Some(ct) = content_type {
+        m = m.with_header("content-type", ct);
+    }
+    m.create();
+    let url = format!("{}/archive", server.url());
+    (server, url)
+}
+
+const CODELOAD_TEST_SHA: &str = "abc1234abc1234abc1234abc1234abc1234abc12";
+
+/// A 404 from the codeload GET is a clean "snapshot not found" error;
+/// nothing lands in dest_dir.
+#[test]
+#[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
+fn download_github_archive_404_is_clean_error() {
+    let (_server, url) = mock_codeload(404, b"Not Found", None);
+    let dest = tempfile::TempDir::new().expect("tempdir");
+    let err = super::download_github_archive(
+        &test_client(),
+        &url,
+        "v6.14",
+        CODELOAD_TEST_SHA,
+        dest.path(),
+        "test",
+        None,
+    )
+    .err()
+    .expect("a 404 codeload GET must error");
+    assert!(
+        format!("{err:#}").contains("not found"),
+        "404 -> snapshot-not-found error: {err:#}",
+    );
+    assert!(
+        std::fs::read_dir(dest.path()).unwrap().next().is_none(),
+        "nothing must land in dest on a 404",
+    );
+}
+
+/// A non-404 failure (HTTP 500) is a hard error naming the status;
+/// nothing cached.
+#[test]
+#[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
+fn download_github_archive_500_is_hard_error() {
+    let (_server, url) = mock_codeload(500, b"boom", None);
+    let dest = tempfile::TempDir::new().expect("tempdir");
+    let err = super::download_github_archive(
+        &test_client(),
+        &url,
+        "v6.14",
+        CODELOAD_TEST_SHA,
+        dest.path(),
+        "test",
+        None,
+    )
+    .err()
+    .expect("a 500 codeload GET must error");
+    assert!(
+        format!("{err:#}").contains("500"),
+        "hard error names the HTTP status: {err:#}",
+    );
+    assert!(std::fs::read_dir(dest.path()).unwrap().next().is_none());
+}
+
+/// A 200 text/html body (proxy / login interstitial) is rejected by
+/// reject_html_response before any extraction.
+#[test]
+#[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
+fn download_github_archive_rejects_html_body() {
+    let (_server, url) = mock_codeload(200, b"<!DOCTYPE html><html>nope</html>", Some("text/html"));
+    let dest = tempfile::TempDir::new().expect("tempdir");
+    let err = super::download_github_archive(
+        &test_client(),
+        &url,
+        "v6.14",
+        CODELOAD_TEST_SHA,
+        dest.path(),
+        "test",
+        None,
+    )
+    .err()
+    .expect("an HTML body must be rejected");
+    assert!(
+        format!("{err:#}").contains("HTML"),
+        "html-reject error: {err:#}",
+    );
+    assert!(std::fs::read_dir(dest.path()).unwrap().next().is_none());
+}
+
+/// A 200 with a non-gzip body fails extraction cleanly; the staging
+/// TempDir Drop sweeps it, so dest_dir stays empty (no partial tree
+/// promoted).
+#[test]
+#[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
+fn download_github_archive_garbage_gzip_fails_clean() {
+    let (_server, url) = mock_codeload(200, b"this is not gzip data", Some("application/gzip"));
+    let dest = tempfile::TempDir::new().expect("tempdir");
+    let err = super::download_github_archive(
+        &test_client(),
+        &url,
+        "v6.14",
+        CODELOAD_TEST_SHA,
+        dest.path(),
+        "test",
+        None,
+    )
+    .err()
+    .expect("a garbage gzip body must fail extraction");
+    assert!(
+        format!("{err:#}").contains("extract"),
+        "extract error: {err:#}",
+    );
+    assert!(
+        std::fs::read_dir(dest.path()).unwrap().next().is_none(),
+        "staging swept on decode failure — dest must stay empty",
     );
 }
 
@@ -2866,24 +3246,140 @@ fn git_cache_key_full_hash_distinguishes_7hex_prefix_collision() {
     );
 }
 
+/// A slashed branch ref (e.g. `for-next/core`) must be sanitized so
+/// the cache key contains no `/` or `..` — validate_cache_key
+/// (housekeeping) hard-rejects those, which would make a slashed ref
+/// uncacheable verbatim (breaking both the pre-clone probe and the
+/// store). The full commit hash keeps the key unique, so mapping
+/// `/` -> `_` cannot serve a wrong build.
 #[test]
-fn ls_remote_commit_hash_uses_full_sha_directly_without_network() {
-    // A full 40-hex ref short-circuits the handshake (the bogus URL is
-    // never contacted) and is returned in full, lowercased to match
-    // git_clone's head rendering (the cache key needs the full id).
-    let sha = "1234567890abcdef1234567890abcdef12345678";
-    assert_eq!(
-        ls_remote_commit_hash("https://invalid.invalid/nope.git", sha),
-        Some(sha.to_string()),
+fn git_cache_key_sanitizes_slashed_ref() {
+    let h = "abc1234abc1234abc1234abc1234abc1234abc12";
+    let key = git_cache_key("for-next/core", h);
+    assert!(!key.contains('/'), "cache key must not contain `/`: {key}");
+    assert!(
+        !key.contains(".."),
+        "cache key must not contain `..`: {key}"
     );
-    let upper = "ABCDEF1234567890ABCDEF1234567890ABCDEF12";
-    assert_eq!(
-        ls_remote_commit_hash("https://invalid.invalid/nope.git", upper),
-        Some(upper.to_ascii_lowercase()),
+    assert!(
+        key.starts_with(&format!("for-next_core-git-{h}-")),
+        "slashed ref must sanitize `/` -> `_`: {key}"
     );
 }
 
-/// Regression: `ls_remote_commit_hash` must resolve a BRANCH ref. The
+/// git_cache_key must sanitize every class validate_cache_key rejects,
+/// not just `/` — a leading `.` (hidden entry) and a NUL byte would
+/// otherwise force a cache miss (and a store hard-fail). The full
+/// commit hash keeps the key unique across the collapse.
+#[test]
+fn git_cache_key_sanitizes_dot_prefixed_and_nul_refs() {
+    let h = "abc1234abc1234abc1234abc1234abc1234abc12";
+    let dot = git_cache_key(".hidden", h);
+    assert!(
+        !dot.starts_with('.'),
+        "leading `.` must be sanitized: {dot}"
+    );
+    assert!(
+        dot.starts_with(&format!("_.hidden-git-{h}-")),
+        "leading `.` is prefixed with `_`: {dot}"
+    );
+    let nul = git_cache_key("a\0b", h);
+    assert!(!nul.contains('\0'), "NUL must be sanitized: {nul:?}");
+    assert!(
+        nul.starts_with(&format!("a_b-git-{h}-")),
+        "NUL maps to `_`: {nul}"
+    );
+}
+
+/// [`github_archive_url`] builds the codeload archive URL for the
+/// resolved commit — `.../archive/{commit}.tar.gz` — from any GitHub
+/// remote shape (https/http/scp, optional trailing `/` and `.git`,
+/// case-insensitive host), lowercasing the commit; and returns `None`
+/// for non-GitHub hosts, deeper-than-OWNER/REPO paths, and an
+/// OWNER-without-REPO path. Pure — no network.
+#[test]
+fn github_archive_url_builds_codeload_commit_url() {
+    let sha = "abc1234abc1234abc1234abc1234abc1234abc12";
+    let gregkh = format!("https://github.com/gregkh/linux/archive/{sha}.tar.gz");
+    // https, with and without `.git`; trailing slash; trailing `.git/`.
+    assert_eq!(
+        github_archive_url("https://github.com/gregkh/linux.git", sha),
+        Some(gregkh.clone()),
+    );
+    assert_eq!(
+        github_archive_url("https://github.com/gregkh/linux", sha),
+        Some(gregkh.clone()),
+    );
+    assert_eq!(
+        github_archive_url("https://github.com/gregkh/linux/", sha),
+        Some(gregkh.clone()),
+    );
+    assert_eq!(
+        github_archive_url("https://github.com/gregkh/linux.git/", sha),
+        Some(gregkh.clone()),
+    );
+    let torvalds = format!("https://github.com/torvalds/linux/archive/{sha}.tar.gz");
+    // scp-style remote + mixed-case host (DNS is case-insensitive).
+    assert_eq!(
+        github_archive_url("git@github.com:torvalds/linux", sha),
+        Some(torvalds.clone()),
+    );
+    assert_eq!(
+        github_archive_url("https://GitHub.com/torvalds/linux", sha),
+        Some(torvalds.clone()),
+    );
+    // An uppercase commit is lowercased (aligns with git_cache_key's hash).
+    let upper = "ABC1234ABC1234ABC1234ABC1234ABC1234ABC12";
+    assert_eq!(
+        github_archive_url("https://github.com/gregkh/linux", upper),
+        Some(format!(
+            "https://github.com/gregkh/linux/archive/{}.tar.gz",
+            upper.to_ascii_lowercase()
+        )),
+    );
+    // ssh:// (with or without a `git@` userinfo) and git:// schemes for
+    // github.com also route to codeload.
+    assert_eq!(
+        github_archive_url("ssh://git@github.com/torvalds/linux", sha),
+        Some(torvalds.clone()),
+    );
+    assert_eq!(
+        github_archive_url("ssh://github.com/torvalds/linux", sha),
+        Some(torvalds.clone()),
+    );
+    assert_eq!(
+        github_archive_url("git://github.com/torvalds/linux", sha),
+        Some(torvalds.clone()),
+    );
+    // Non-GitHub host, deeper-than-OWNER/REPO path, and OWNER without a
+    // REPO all → None (the gix clone path handles non-GitHub).
+    assert!(
+        github_archive_url(
+            "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git",
+            sha,
+        )
+        .is_none()
+    );
+    assert!(github_archive_url("https://github.com/a/b/c", sha).is_none());
+    assert!(github_archive_url("https://github.com/torvalds/", sha).is_none());
+}
+
+/// [`resolve_ref_commit`] resolves a `Sha` ref offline (no handshake),
+/// lowercasing to match `git_clone`'s rendering, and returns `None` for
+/// `Unknown` without a network round-trip. `Tag`/`Branch` need a live
+/// ls-remote and are exercised by integration paths, not here.
+#[test]
+fn resolve_ref_commit_sha_resolves_offline_lowercased() {
+    use crate::kernel_path::GitRefKind;
+    let sha = "ABC1234abc1234abc1234abc1234abc1234ABC12";
+    assert_eq!(
+        resolve_ref_commit("https://github.com/x/y", sha, GitRefKind::Sha).as_deref(),
+        Some("abc1234abc1234abc1234abc1234abc1234abc12"),
+    );
+    assert!(resolve_ref_commit("https://github.com/x/y", "foo", GitRefKind::Unknown).is_none());
+}
+
+/// Regression: a BRANCH ref must resolve over protocol-v2 ls-refs. The
 /// bug was gix's default `Options` (`prefix_from_spec_as_filter_on_remote
 /// = true`): over a protocol-v2 `ls-refs` it derives ref-prefix filters
 /// from the anonymous remote's refspecs, and with empty fetch specs +
@@ -2892,9 +3388,9 @@ fn ls_remote_commit_hash_uses_full_sha_directly_without_network() {
 /// `None`, defeating `resolve_git_kernel`'s clone-skip (every run
 /// re-cloned). The fix sets the flag `false`. A `Some(_)` here is only
 /// reachable once `refs/heads/for-next` reaches `remote_refs`, so
-/// reverting the flag turns this red — the sole test that pins the
-/// `ref_map` Options path (the `match_ref_commit_hash_*` unit tests feed
-/// synthetic ref vectors and never exercise it).
+/// reverting the flag turns this red — the `pick_ref_object_*` unit tests
+/// feed synthetic ref vectors and never exercise the `ref_map` Options
+/// path.
 ///
 /// `#[ignore]`: hits the live sched_ext remote over the network (project
 /// convention for network-fetch tests). The filtering is protocol-v2
@@ -2903,9 +3399,10 @@ fn ls_remote_commit_hash_uses_full_sha_directly_without_network() {
 /// networked host.
 #[test]
 #[ignore = "network: live ls-remote against git.kernel.org sched_ext (protocol v2)"]
-fn ls_remote_commit_hash_resolves_branch_over_v2() {
+fn resolve_ref_commit_resolves_branch_over_v2() {
+    use crate::kernel_path::GitRefKind;
     let url = "https://git.kernel.org/pub/scm/linux/kernel/git/tj/sched_ext.git";
-    let hash = ls_remote_commit_hash(url, "for-next")
+    let hash = resolve_ref_commit(url, "for-next", GitRefKind::Branch)
         .expect("for-next branch must resolve over v2 ls-refs — the prefix filter must be off");
     assert_eq!(hash.len(), 40, "a full commit hash is 40 hex chars: {hash}");
     assert!(
@@ -2921,51 +3418,43 @@ fn direct_ref(name: &str, hex: &str) -> gix::protocol::handshake::Ref {
     }
 }
 
+/// The kind-directed grammar's load-bearing invariant: `pick_ref_object`
+/// matches the FULLY-QUALIFIED ref name exactly, so a tag and a
+/// same-named branch NEVER alias. `resolve_ref_commit` builds
+/// `refs/tags/{ref}` for `Tag` and `refs/heads/{ref}` for `Branch`, so
+/// each kind resolves to its own namespace's commit — a bare-name DWIM
+/// lookup would instead resolve either. Pure over `&[Ref]` — no
+/// network — so the anti-aliasing invariant is pinned without a live
+/// ls-remote.
 #[test]
-fn match_ref_commit_hash_resolves_branch_tag_head_and_precedence() {
-    let a = "1111111111111111111111111111111111111111";
-    let b = "2222222222222222222222222222222222222222";
-    let c = "3333333333333333333333333333333333333333";
-
-    // Branch under refs/heads — returns the FULL commit hash.
-    let refs = vec![direct_ref("refs/heads/for-next", a)];
-    assert_eq!(match_ref_commit_hash(&refs, "for-next"), Some(a.into()));
-
-    // Lightweight tag (Direct under refs/tags).
-    let refs = vec![direct_ref("refs/tags/v6.10", b)];
-    assert_eq!(match_ref_commit_hash(&refs, "v6.10"), Some(b.into()));
-
-    // heads wins over tags for the same bare name (the probe's documented
-    // precedence; the rare divergence from the shallow clone is handled by
-    // the post-clone re-check — see match_ref_commit_hash).
-    let refs = vec![direct_ref("refs/tags/x", b), direct_ref("refs/heads/x", a)];
-    assert_eq!(match_ref_commit_hash(&refs, "x"), Some(a.into()));
-
-    // An explicit refs/ path matches exactly.
-    let refs = vec![direct_ref("refs/heads/main", c)];
+fn pick_ref_object_matches_kind_namespace_without_aliasing() {
+    let branch = "1111111111111111111111111111111111111111";
+    let tag = "2222222222222222222222222222222222222222";
+    // A remote advertising BOTH refs/heads/main and refs/tags/main at
+    // DIFFERENT commits — the exact collision the kind-directed grammar
+    // disambiguates (and the DWIM path silently resolved to the branch).
+    let refs = vec![
+        direct_ref("refs/heads/main", branch),
+        direct_ref("refs/tags/main", tag),
+    ];
     assert_eq!(
-        match_ref_commit_hash(&refs, "refs/heads/main"),
-        Some(c.into())
+        pick_ref_object(&refs, "refs/tags/main").map(|o| o.to_string()),
+        Some(tag.to_string()),
+        "#tag=main must resolve to its refs/tags/ commit, not the branch",
     );
-
-    // HEAD via a Symbolic ref resolves to its ultimate object.
-    let refs = vec![gix::protocol::handshake::Ref::Symbolic {
-        full_ref_name: "HEAD".into(),
-        target: "refs/heads/main".into(),
-        tag: None,
-        object: gix::hash::ObjectId::from_hex(c.as_bytes()).unwrap(),
-    }];
-    assert_eq!(match_ref_commit_hash(&refs, "HEAD"), Some(c.into()));
-
-    // No matching ref -> None.
-    let refs = vec![direct_ref("refs/heads/main", a)];
-    assert_eq!(match_ref_commit_hash(&refs, "does-not-exist"), None);
+    assert_eq!(
+        pick_ref_object(&refs, "refs/heads/main").map(|o| o.to_string()),
+        Some(branch.to_string()),
+        "#branch=main must resolve to its refs/heads/ commit, not the tag",
+    );
+    // A ref not advertised in the requested namespace -> None.
+    assert!(pick_ref_object(&refs, "refs/tags/absent").is_none());
 }
 
 #[test]
-fn match_ref_commit_hash_annotated_tag_uses_peeled_commit_not_tag() {
+fn pick_ref_object_annotated_tag_uses_peeled_commit_not_tag() {
     // An annotated tag advertises Peeled { tag: <tag object>, object:
-    // <peeled commit> }. The key must use the peeled COMMIT (object):
+    // <peeled commit> }. The resolver must use the peeled COMMIT (object):
     // git_clone checks out the commit (HEAD = commit), so the tag
     // object's hash would never match a clone-produced cache key.
     let tag_obj = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -2975,16 +3464,19 @@ fn match_ref_commit_hash_annotated_tag_uses_peeled_commit_not_tag() {
         tag: gix::hash::ObjectId::from_hex(tag_obj.as_bytes()).unwrap(),
         object: gix::hash::ObjectId::from_hex(commit.as_bytes()).unwrap(),
     }];
-    assert_eq!(match_ref_commit_hash(&refs, "v1.0"), Some(commit.into()));
+    assert_eq!(
+        pick_ref_object(&refs, "refs/tags/v1.0").map(|o| o.to_string()),
+        Some(commit.to_string()),
+    );
 }
 
 #[test]
-fn match_ref_commit_hash_skips_unborn() {
+fn pick_ref_object_skips_unborn() {
     let refs = vec![gix::protocol::handshake::Ref::Unborn {
         full_ref_name: "refs/heads/new".into(),
         target: "refs/heads/new".into(),
     }];
-    assert_eq!(match_ref_commit_hash(&refs, "new"), None);
+    assert!(pick_ref_object(&refs, "refs/heads/new").is_none());
 }
 
 #[test]
@@ -3024,4 +3516,96 @@ fn git_clone_rejects_raw_sha_git_ref_without_panic() {
         msg.contains("raw commit SHA") && msg.contains("branch or tag"),
         "the error must be actionable (use a branch or tag): {msg}"
     );
+}
+
+/// `git_clone_tag` shallow-clones an annotated TAG — the `#tag=`
+/// git-source clone path (via `git_clone_kinded`) for a non-GitHub
+/// remote. A plain `with_ref_name` shallow clone
+/// forces `refs/heads/{ref}` and fails on a tag with "None of the
+/// refspec(s) matched"; the appended `+refs/tags/{tag}:refs/heads/{tag}`
+/// refspec fixes it. This can ONLY be validated by a real clone — the
+/// failure is a runtime refspec mismatch, invisible at compile time and
+/// to source-level review — so it is the empirical guard for the fix.
+/// Network + a ~200MB shallow fetch of the linux-stable tree, hence
+/// #[ignore] (run with --run-ignored on a connected, uncontended host).
+#[test]
+#[ignore = "network: shallow git-tag clone of linux-stable v6.14.11 (~200MB); run with --run-ignored on a connected host"]
+fn git_clone_tag_shallow_clones_stable_tag() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let acquired = super::git_clone_tag(
+        "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git",
+        "v6.14.11",
+        tmp.path(),
+        "test",
+        None,
+    )
+    .expect(
+        "git_clone_tag must shallow-clone the v6.14.11 tag, not fail with \
+         'None of the refspec(s) matched'",
+    );
+    // A real linux source tree must be checked out at the tag.
+    let makefile = acquired.source_dir.join("Makefile");
+    assert!(
+        makefile.exists(),
+        "cloned tree must contain a top-level Makefile: {}",
+        acquired.source_dir.display(),
+    );
+    // The Makefile version fields must read exactly 6.14.11, proving the
+    // checkout landed on the tag (not HEAD or the series branch tip).
+    let mk = std::fs::read_to_string(&makefile).expect("read cloned Makefile");
+    assert!(
+        mk.contains("PATCHLEVEL = 14") && mk.contains("SUBLEVEL = 11"),
+        "cloned Makefile must be 6.14.11 (PATCHLEVEL=14, SUBLEVEL=11)",
+    );
+    // The recorded source must be git-shaped (kernel_source::git).
+    assert!(
+        matches!(
+            acquired.kernel_source,
+            crate::cache::KernelSource::Git { .. }
+        ),
+        "git_clone_tag must record a Git KernelSource",
+    );
+}
+
+/// `latest_patch_from_git_tags` resolves an EOL series to its highest
+/// patch via a real ls-remote of the gregkh GitHub mirror — the
+/// cdn-independent resolution the CI runners need (cdn serves
+/// `sha256sums.asc` as 404 on some edges even where its tarballs 200).
+/// Network (ls-remote only, no pack fetch), so #[ignore]; this is the
+/// empirical guard for the resolution the pure `max_tag_patch` tests
+/// cannot provide (they don't touch the network). `Some` because 6.14
+/// has stable point releases; the `None` (mainline-base) branch is a
+/// pure-code path the caller `fetch_version_for_prefix` handles.
+#[test]
+#[ignore = "network: ls-remote the gregkh GitHub mirror for v6.14.* tags; run with --run-ignored on a connected host"]
+fn latest_patch_from_git_tags_resolves_eol_series() {
+    let v = super::latest_patch_from_git_tags("https://github.com/gregkh/linux", "6.14", "test")
+        .expect("ls-remote of the gregkh mirror must succeed")
+        .expect("6.14 must resolve to a stable patch release");
+    // 6.14 is EOL and frozen at 6.14.11 (no further releases), so the
+    // resolver must return exactly that — not a lower patch, not an -rc.
+    assert_eq!(
+        v, "6.14.11",
+        "EOL 6.14 must resolve to its final patch 6.14.11 via git tags",
+    );
+}
+
+/// `anon_open_opts` must load ONLY repo-local git config. This is the
+/// fix that stops a user's `url.<base>.insteadOf` rewrite (e.g.
+/// `https://github.com/` -> `git@github.com:`) from rerouting anonymous
+/// public-mirror fetches through SSH — which prompted for the key
+/// passphrase once per operation, several at once under the concurrent
+/// intra-range kernel resolution. Pins every ambient config source OFF
+/// so a future edit that re-enables one (re-introducing the rewrite)
+/// fails here. Environment permissions are intentionally NOT asserted
+/// off: they stay at the Full-trust default so an `http(s)_proxy` env
+/// var still applies to real downloads.
+#[test]
+fn anon_open_opts_disables_ambient_config_sources() {
+    let cfg = super::anon_open_opts().permissions.config;
+    assert!(!cfg.user, "user (~/.gitconfig) config must not load");
+    assert!(!cfg.system, "system (/etc/gitconfig) config must not load");
+    assert!(!cfg.git, "XDG git config must not load");
+    assert!(!cfg.env, "GIT_CONFIG_* env config must not load");
+    assert!(!cfg.git_binary, "git-binary config must not load");
 }

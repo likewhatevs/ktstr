@@ -114,8 +114,10 @@ fn read_cgroup_stats_at_cpu_stat_missing_key_defaults_field_zero() {
 // H4 — parse_sched every-field coverage + parse fallbacks
 // ------------------------------------------------------------
 
-/// Populated `/proc/<tid>/sched` with every field
-/// parse_sched recognises. Ordering mixed (sync before
+/// Populated `/proc/<tid>/sched` with the fields this test
+/// asserts. The CONFIG_SCHED_CORE-gated `core_forceidle_sum`
+/// arm and the fair-policy-only `slice` (`fair_slice_ns`) arm
+/// are excluded. Ordering mixed (sync before
 /// local) so the test doesn't pin a single-pass scan order
 /// that the helper doesn't actually promise. Integer-only
 /// PN_SCHEDSTAT values (no fractional part) parse via the

@@ -524,7 +524,7 @@ computable" from "computed as zero".
 | `avg_compact_delay_ns` | `compact_delay_total_ns / compact_delay_count` | `compact_delay_total_ns`, `compact_delay_count` | ns | Average memory-compaction wait per event. |
 | `avg_wpcopy_delay_ns` | `wpcopy_delay_total_ns / wpcopy_delay_count` | `wpcopy_delay_total_ns`, `wpcopy_delay_count` | ns | Average write-protect-copy (CoW) fault wait per event. |
 | `avg_irq_delay_ns` | `irq_delay_total_ns / irq_delay_count` | `irq_delay_total_ns`, `irq_delay_count` | ns | Average IRQ-handler window per event. |
-| `total_offcpu_delay_ns` | `cpu + blkio + freepages + compact + wpcopy + irq + max(swapin, thrashing)` | every `*_delay_total_ns` | ns | Sum of every meaningful off-CPU delay-accounting bucket. The swapin/thrashing pair is OR'd with `.max()` rather than summed because the two share syscall-layer events (every thrashing event is also a swapin from the syscall perspective); summing both would double-count thrashing-induced swapins. When `CONFIG_TASK_DELAY_ACCT` is off, the runtime toggle is off, or the kernel predates a bucket's introduction (e.g. `wpcopy_*` lands in v13, `irq_*` in v14), the missing buckets read zero from the truncated taskstats payload — the rollup degrades to the sum of the populated buckets rather than returning `-`. The structured taskstats outcome lives on `CtprofSnapshot::taskstats_summary` for the operator to disambiguate "no data" from "zero data." |
+| `total_offcpu_delay_ns` | `cpu + blkio + freepages + compact + wpcopy + irq + max(swapin, thrashing)` | every `*_delay_total_ns` | ns | Sum of every meaningful off-CPU delay-accounting bucket. The swapin/thrashing pair is OR'd with `.max()` rather than summed because the two share syscall-layer events (every thrashing event is also a swapin from the syscall perspective); summing both would double-count thrashing-induced swapins. When `CONFIG_TASK_DELAY_ACCT` is off or the runtime delayacct toggle is off, the whole taskstats family folds to `Absent`, so this rollup short-circuits and renders `-` (not a zero). When the kernel merely predates a bucket's introduction (e.g. `wpcopy_*` lands in v13, `irq_*` in v14), the missing buckets read zero from the truncated taskstats payload and the rollup degrades to the sum of the populated buckets. The structured taskstats outcome lives on `CtprofSnapshot::taskstats_summary` for the operator to disambiguate "no data" from "zero data." |
 
 The `is_ratio` column on the registry is load-bearing for the
 renderer: ratio rows skip the `%` column entirely (the absolute
@@ -753,7 +753,7 @@ its raw inputs).
   want to inspect host configuration only, without the per-
   thread walk.
 - [Capture and Compare Host State](../recipes/host-state.md) —
-  recipe covering the `show-host` / `stats compare` flow for
+  recipe covering the `show-host` / `perf-delta` flow for
   comparing host *context* across sidecars (not the per-thread
   profiler).
 - [Environment Variables](environment-variables.md) — every

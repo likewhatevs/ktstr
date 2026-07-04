@@ -339,8 +339,11 @@ impl BaseKey {
     }
 }
 
-/// Process-global cache for base initramfs bytes. Keyed by content hash
-/// of payload, scheduler, include files, and busybox flag.
+/// Process-global cache for base initramfs bytes. Keyed by [`BaseKey`]
+/// (a `u64`): the payload's shared-lib set + interpreter (NOT the
+/// payload's content), plus the content hashes of the scheduler /
+/// probe / worker and staged binaries. Shell keys additionally mix in
+/// a sentinel, include files, and the busybox bytes.
 /// The lock is only held during map lookup/insert, never during the
 /// actual build.
 pub(crate) fn base_cache() -> &'static Mutex<HashMap<BaseKey, Arc<Vec<u8>>>> {

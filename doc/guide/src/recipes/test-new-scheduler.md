@@ -79,9 +79,8 @@ for version selection and local source builds.
 or an explicit `--kernel <spec>` (a version like `6.14`, a cache key
 from `cargo ktstr kernel list`, or a path to a kernel source tree).
 `cargo ktstr test` does not accept a prebuilt `bzImage`/`Image` (only
-`cargo ktstr shell` does). Step 3 populated the cache with the
-declared kernels, so the bare form is sufficient when a single kernel
-is available:
+`cargo ktstr shell` does). Step 3 built the latest stable release into
+the cache, so the bare form resolves that single cached kernel:
 
 ```sh
 cargo ktstr test            # auto-discover from cache / KTSTR_KERNEL
@@ -218,7 +217,7 @@ In the scheduler crate's `Cargo.toml`:
 # be an optional [dependencies] entry, not a dev-dependency, because
 # `dep:ktstr` in [features] only resolves an optional normal dep
 # (Cargo has no optional dev-dependencies).
-ktstr = { version = "=0.20.0", optional = true }
+ktstr = { version = "=0.23.0", optional = true }
 
 [features]
 # Enabling the feature pulls ktstr in; without it the crate builds
@@ -252,7 +251,7 @@ Build a kernel once (see section 3), then run the gated tests.
 The feature flag rides the nextest passthrough after `--`:
 
 ```sh
-cargo ktstr kernel build --source /path/to/linux
+cargo ktstr kernel build --kernel /path/to/linux
 cargo ktstr test --kernel /path/to/linux -- --features ktstr-tests
 ```
 

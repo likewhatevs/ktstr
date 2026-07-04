@@ -52,7 +52,7 @@ pub(crate) fn derive_payload_inner(input: DeriveInput) -> syn::Result<proc_macro
     let mut name_override: Option<String> = None;
     // `None` means "not specified" → default ExitCode at emit time.
     // `Some(tokens)` holds the fully-qualified OutputFormat variant
-    // the user selected (possibly with an LlmExtract hint expression).
+    // the user selected.
     let mut output_tokens: Option<proc_macro2::TokenStream> = None;
 
     for attr in &input.attrs {
@@ -224,7 +224,6 @@ pub(crate) fn derive_payload_inner(input: DeriveInput) -> syn::Result<proc_macro
                 &[#(#include_files),*],
                 false,
                 None,
-                None,
             );
     };
 
@@ -237,79 +236,34 @@ pub(crate) fn derive_payload_inner(input: DeriveInput) -> syn::Result<proc_macro
 /// so the attribute reads identically to `Polarity` below:
 ///
 /// - `Json` / `ExitCode` — bare idents.
-/// - `LlmExtract` — bare ident (no hint).
-/// - `LlmExtract("hint")` — call with a single string literal.
-/// - `LlmExtract()` — call with no args (no hint).
 fn output_from_expr(expr: &syn::Expr) -> syn::Result<proc_macro2::TokenStream> {
     match expr {
         syn::Expr::Path(ep) => {
-            let ident = ep.path.get_ident().ok_or_else(|| {
-                syn::Error::new_spanned(expr, "expected `Json`, `ExitCode`, or `LlmExtract`")
-            })?;
+            let ident = ep
+                .path
+                .get_ident()
+                .ok_or_else(|| syn::Error::new_spanned(expr, "expected `Json` or `ExitCode`"))?;
             match ident.to_string().as_str() {
                 "Json" => Ok(quote! { ::ktstr::test_support::OutputFormat::Json }),
                 "ExitCode" => Ok(quote! { ::ktstr::test_support::OutputFormat::ExitCode }),
-                "LlmExtract" => {
-                    Ok(quote! { ::ktstr::test_support::OutputFormat::LlmExtract(None) })
-                }
                 other => Err(syn::Error::new_spanned(
                     expr,
-                    format!(
-                        "unknown output format `{other}` (expected `Json`, `ExitCode`, or `LlmExtract`)"
-                    ),
+                    format!("unknown output format `{other}` (expected `Json` or `ExitCode`)"),
                 )),
             }
         }
         syn::Expr::Call(call) => {
-            // Only `LlmExtract(...)` is callable.
-            let ident = match &*call.func {
-                syn::Expr::Path(ep) => ep.path.get_ident().ok_or_else(|| {
-                    syn::Error::new_spanned(expr, "expected `LlmExtract(...)` call form")
-                })?,
-                _ => {
-                    return Err(syn::Error::new_spanned(
-                        expr,
-                        "expected `LlmExtract(...)` call form",
-                    ));
-                }
-            };
-            if ident != "LlmExtract" {
-                return Err(syn::Error::new_spanned(
-                    expr,
-                    format!(
-                        "unknown output format `{ident}(...)` (only `LlmExtract(...)` takes arguments)"
-                    ),
-                ));
-            }
-            match call.args.len() {
-                0 => Ok(quote! { ::ktstr::test_support::OutputFormat::LlmExtract(None) }),
-                1 => {
-                    let arg = &call.args[0];
-                    match arg {
-                        syn::Expr::Lit(syn::ExprLit {
-                            lit: syn::Lit::Str(ls),
-                            ..
-                        }) => {
-                            let hint = ls.value();
-                            Ok(quote! {
-                                ::ktstr::test_support::OutputFormat::LlmExtract(Some(#hint))
-                            })
-                        }
-                        _ => Err(syn::Error::new_spanned(
-                            arg,
-                            "LlmExtract argument must be a string literal hint",
-                        )),
-                    }
-                }
-                _ => Err(syn::Error::new_spanned(
-                    expr,
-                    "LlmExtract takes at most one string literal argument",
-                )),
-            }
+            // No output format is callable — `Json` and `ExitCode` are
+            // both bare idents. Reject the call form.
+            let _ = call;
+            Err(syn::Error::new_spanned(
+                expr,
+                "output formats take no arguments; use a bare `Json` or `ExitCode`",
+            ))
         }
         _ => Err(syn::Error::new_spanned(
             expr,
-            "output must be `Json`, `ExitCode`, `LlmExtract`, or `LlmExtract(\"hint\")`",
+            "output must be `Json` or `ExitCode`",
         )),
     }
 }
@@ -322,7 +276,8 @@ fn output_from_expr(expr: &syn::Expr) -> syn::Result<proc_macro2::TokenStream> {
 /// `polarity` accepts bare idents `HigherBetter`, `LowerBetter`,
 /// `Unknown`, and the call form `TargetValue(<float literal>)`. The
 /// float literal is stamped into a `Polarity::TargetValue(lit)` so
-/// the generated const is const-evaluable.
+/// the generated const is const-evaluable. The `Informational`
+/// variant is not accepted via the derive.
 fn parse_metric_attr(attr: &syn::Attribute) -> syn::Result<(String, proc_macro2::TokenStream)> {
     let mut name: Option<String> = None;
     let mut polarity: Option<proc_macro2::TokenStream> = None;
@@ -400,9 +355,11 @@ fn expr_has_check_prefix(expr: &syn::Expr) -> bool {
 }
 
 /// Translate the user-facing `polarity = ...` expression to a
-/// fully-qualified `Polarity` variant. Accepts the four enum
-/// variants in bare-ident form (`HigherBetter`, `LowerBetter`,
-/// `Unknown`) or as `TargetValue(<float>)`.
+/// fully-qualified `Polarity` variant. Accepts four of the five
+/// `Polarity` variants: the bare idents `HigherBetter`, `LowerBetter`,
+/// `Unknown`, and the call form `TargetValue(<float>)`. The fifth
+/// variant `Informational` is not accepted via the derive; any other
+/// ident is rejected as an unknown polarity.
 fn polarity_from_expr(expr: &syn::Expr) -> syn::Result<proc_macro2::TokenStream> {
     match expr {
         syn::Expr::Path(ep) => {

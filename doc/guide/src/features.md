@@ -180,7 +180,7 @@ readiness gates between host and guest.
 </details>
 
 <details>
-<summary><b>39 work types</b> — configurable workload profiles for different scheduling pressures</summary>
+<summary><b>45 work types</b> — configurable workload profiles for different scheduling pressures</summary>
 
 Workers are `fork()`ed processes placed in cgroups:
 
@@ -195,6 +195,7 @@ Workers are `fork()`ed processes placed in cgroups:
 - `IoConvoy` — interleaved sequential pwrite + random pread with periodic fdatasync (O_DIRECT)
 - `Bursty` — CPU burst then sleep (parameterized via `Duration`)
 - `IdleChurn` — CPU burst then `nanosleep` (hrtimer + idle-class path)
+- `TimerLatency` — cyclictest-style periodic wake via `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)`; per-cycle jitter feeds the `timer_latencies_ns` reservoir
 - `PipeIo` — CPU burst then pipe exchange (cross-CPU wake placement)
 - `FutexPingPong` — paired futex wait/wake (non-WF_SYNC)
 - `FutexFanOut` — 1:N fan-out wake
@@ -209,6 +210,7 @@ Workers are `fork()`ed processes placed in cgroups:
 - `PolicyChurn` — cycle SCHED_OTHER → BATCH → IDLE (→ FIFO/RR with CAP_SYS_NICE)
 - `NumaMigrationChurn` — rotate sched_setaffinity across NUMA nodes
 - `CgroupChurn` — cycle cgroup membership between sibling cgroups
+- `CgroupAttachStorm` — rapid fork + migrate each child into a destination cgroup's `cgroup.procs` (attach storm)
 - `FanOutCompute` — messenger/worker fan-out with matrix-multiply compute
 - `AsymmetricWaker` — paired workers in mismatched scheduling classes share one futex word
 - `WakeChain` — ring of waker-wakee hops (Pipe with WF_SYNC, or Futex)
@@ -219,9 +221,13 @@ Workers are `fork()`ed processes placed in cgroups:
 - `MutexContention` — N-way futex mutex contention
 - `PriorityInversion` — three-tier lock contention (Pi or Plain futex)
 - `ProducerConsumerImbalance` — unbalanced producer/consumer pipeline (queue grows)
-- `SignalStorm` — paired workers fire tkill(partner, SIGUSR1) between CPU bursts
+- `SignalStorm` — paired workers fire tkill(partner, SIGUSR2) between CPU bursts
 - `PreemptStorm` — one SCHED_FIFO worker preempts CFS spinners at ~kHz
 - `RtStarvation` — SCHED_FIFO workers monopolise CPU; SCHED_NORMAL workers starve
+- `Schbench` — schbench default-mode benchmark re-expressed natively (message/worker threads; request-latency measurement)
+- `Taobench` — bounded, evicting key-value object-cache benchmark (closed-loop clients over a sharded in-process cache; fast hit path + slow backing-miss path)
+- `NetTraffic` — AF_PACKET traffic generator driving the virtio-net NIC's RX hardirq + NAPI softirq
+- `IrqWake` — paired sender/receiver; the receiver blocks in `recvfrom` and is woken from NET_RX softirq context
 - `Custom` — user-supplied work function
 
 See [WorkType](concepts/work-types.md).
@@ -533,10 +539,36 @@ guest and host coverage for unified `cargo llvm-cov` reports.
 
 Wraps `cargo nextest run` with automatic kernel resolution.
 Subcommands (in `--help` order): `test`, `coverage`, `llvm-cov`,
-`stats`, `replay`, `perf-delta`, `kernel`, `model`, `verifier`,
-`funify`, `completions`, `show-host`, `show-thresholds`, `export`,
-`locks`, `shell`.
+`stats`, `replay`, `perf-delta`, `kernel`, `verifier`,
+`completions`, `show-host`, `show-thresholds`, `affected`,
+`export`, `locks`, `shell`.
 See [`cargo-ktstr`](running-tests/cargo-ktstr.md).
+
+</details>
+
+<details>
+<summary><b>Change-scoped selection</b> — <code>affected</code> emits a CI matrix of only the schedulers a diff touches; <code>--relevant</code> narrows a local run to only the affected tests</summary>
+
+`cargo ktstr affected` (run inside a scheduler repo) attributes the
+`base..HEAD` diff to declared schedulers and prints the affected
+scheduler package names as a flat JSON array — a GitHub Actions dynamic
+matrix (`strategy.matrix.scheduler: ${{ fromJSON(...) }}`) then spawns
+one job per affected scheduler instead of the whole fleet. Attribution
+unions two layers: the cargo dependency closure (a changed Rust file →
+its owning crate → every scheduler that depends on it) and, only when a
+native (C/BPF) or unattributable path changed, each scheduler's cargo
+`.d` dep-info (built once to read the exact BPF/header/skeleton input
+set, including cross-scheduler text-includes and shared headers). Every
+uncertainty widens to "run all" (a false negative — silently skipping an
+affected scheduler — is the worst outcome); a strictly docs-only change
+emits `[]`.
+
+`cargo ktstr test --relevant` (and `coverage --relevant`, `perf-delta
+--relevant`) applies the same attribution to the LOCAL working tree
+(committed `base..HEAD` UNIONed with uncommitted + untracked edits) and
+narrows the run to only the tests whose scheduler the change touched —
+the fast inner-loop counterpart to the CI matrix. See
+[`cargo-ktstr`](running-tests/cargo-ktstr.md#affected).
 
 </details>
 

@@ -1,8 +1,9 @@
 // Pins the `max_cpus` cross-field check arm. `topology` declares
 // total_cpus = 2*4*1 = 8 but `constraints.max_cpus = Some(4)`
-// excludes any host that has more than 4 CPUs — a common gotcha
-// when a test author sets a small max_cpus on a topology larger
-// than expected.
+// caps the accepted topology at 4 CPUs, so the declared 8-CPU
+// topology can never satisfy it — every gauntlet preset would
+// reject the test at runtime, which the macro rejects at compile
+// time.
 use ktstr::declare_scheduler;
 #[allow(unused_imports)]
 use ktstr::test_support::TopologyConstraints;

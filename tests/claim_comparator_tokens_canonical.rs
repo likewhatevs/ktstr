@@ -9,7 +9,7 @@
 //! that filters `result.passes` by comparator. This file makes that
 //! drift loud.
 //!
-//! Coverage: each of the 23 tokens in [`ktstr::COMPARATOR_VOCABULARY`]
+//! Coverage: each of the 23 tokens in [`ktstr::prelude::COMPARATOR_VOCABULARY`]
 //! is exercised by exactly one passing claim; the test asserts that the
 //! resulting `passes[0].comparator` equals the expected token literal.
 //! If a token is added to the vocabulary, a matching test must be added

@@ -11,7 +11,7 @@
 //!
 //! These types are declarative — the corresponding kernel-call
 //! helpers live in the [`crate::workload::worker`] submodule
-//! (`set_sched_policy` in `worker/sched.rs`, `apply_sched_class`).
+//! (`set_sched_policy` in `worker/sched.rs`, `SchedClass::to_policy`).
 
 use std::time::Duration;
 
@@ -97,6 +97,28 @@ pub enum SchedPolicy {
         #[serde(with = "humantime_serde_helper")]
         period: Duration,
     },
+    /// `SCHED_EXT` — routes the worker through the loaded sched_ext BPF
+    /// scheduler. Applied via `sched_setattr(2)` with `sched_policy =
+    /// SCHED_EXT` (7); glibc does not wrap `SCHED_EXT`, so
+    /// `set_sched_policy` issues the raw syscall. `SCHED_EXT` is a valid
+    /// policy whenever the kernel is built with `CONFIG_SCHED_CLASS_EXT`,
+    /// so the syscall SUCCEEDS whether or not a scheduler is attached:
+    /// attached, the task routes to `ext_sched_class`; with none attached
+    /// `task_should_scx` is false so it silently falls back to
+    /// `fair_sched_class` (still `policy == SCHED_EXT`). It `EINVAL`s only
+    /// on a kernel built WITHOUT `CONFIG_SCHED_CLASS_EXT`.
+    /// `scx_check_setscheduler` (kernel/sched/ext.c) returns `EACCES` when
+    /// the task carries `scx.disallow`. No priority or deadline
+    /// parameters apply.
+    ///
+    /// Unlike `Normal` under a switch-all scheduler — which the kernel
+    /// reroutes to the ext class via `task_should_scx` WITHOUT changing
+    /// the task's policy — `Ext` sets `policy == SCHED_EXT` explicitly,
+    /// so the task is BPF-scheduled even under a `SCX_OPS_SWITCH_PARTIAL`
+    /// scheduler that leaves SCHED_OTHER tasks in fair. That is what
+    /// makes a SCHED_EXT worker a switch-mode-agnostic "the BPF scheduler
+    /// dispatched me" probe.
+    Ext,
 }
 
 impl SchedPolicy {
@@ -241,11 +263,11 @@ pub enum WakeMechanism {
 /// # Current behaviour
 ///
 /// All widths run the same four-stream scalar multiply path;
-/// the width selector is preserved on the wire and on
-/// [`WorkerReport`](crate::workload::WorkerReport) so a
-/// downstream classifier can distinguish runs that requested
-/// SIMD from runs that requested scalar even though the
-/// dispatch is uniform.
+/// the width selector is preserved on the wire (the
+/// `WorkType::AluHot` / `WorkPhase::AluHot` config carries
+/// `width`) so a downstream classifier can distinguish runs
+/// that requested SIMD from runs that requested scalar even
+/// though the dispatch is uniform.
 ///
 /// # Default semantics
 ///
@@ -317,11 +339,10 @@ pub enum AluWidth {
     /// AMX tile multiply chain (x86_64 server SKUs with AMX-INT8
     /// or AMX-BF16). The widest data-path on x86_64; uses XFD
     /// gating in the kernel
-    /// (`arch/x86/kernel/traps.c::handle_xfd_event` raises the
-    /// #NM trap, then
-    /// `arch/x86/kernel/fpu/xstate.c::__xfd_enable_feature`
-    /// allocates the dynamic XSAVE area) so the first AMX
-    /// instruction triggers a #NM fault and the kernel allocates
+    /// (the first AMX instruction raises a #NM trap that
+    /// `arch/x86/kernel/traps.c::handle_xfd_event` handles,
+    /// calling `arch/x86/kernel/fpu/xstate.c::__xfd_enable_feature`
+    /// to allocate the dynamic XSAVE area) so the kernel allocates
     /// the dynamic XSAVE area lazily — adds a one-time per-task
     /// latency spike on first use.
     ///
@@ -356,7 +377,7 @@ pub enum AluWidth {
 /// `WorkType::AsymmetricWaker` consumes when it wants to
 /// describe a waker / wakee pair without specifying priority
 /// values. When a per-worker class is applied,
-/// `apply_sched_class` maps the variant to the equivalent
+/// `SchedClass::to_policy` maps the variant to the equivalent
 /// [`SchedPolicy`] (using a default priority where applicable)
 /// and routes through `set_sched_policy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -392,8 +413,9 @@ pub enum SchedClass {
     /// task already reroutes to ext via `task_should_scx` (see
     /// kernel/sched/ext.c). `Cfs` is preserved as the explicit
     /// "I want fair semantics" knob the user expresses; `Ext`
-    /// is preserved for tests that explicitly want
-    /// `policy == SCHED_EXT` set on the task_struct.
+    /// maps to [`SchedPolicy::Ext`], which sets `policy == SCHED_EXT`
+    /// on the task_struct so it is BPF-scheduled even under a
+    /// `SCX_OPS_SWITCH_PARTIAL` scheduler.
     Ext,
 }
 
@@ -407,16 +429,17 @@ const RT_DEFAULT_PRIO: u32 = 50;
 impl SchedClass {
     /// Resolve to an equivalent [`SchedPolicy`]. `Rt` uses
     /// `RT_DEFAULT_PRIO`; `Deadline` uses the minimum-bandwidth
-    /// reservation (1us runtime over 1ms period — passes
+    /// reservation (2us runtime, 1ms deadline, 10ms period — passes
     /// `__checkparam_dl` and the default sysctl bounds).
-    /// `Ext` maps to `SchedPolicy::Normal` because there is no
-    /// userspace `SCHED_EXT` constant in libc; tests that want
-    /// the kernel to read `policy == SCHED_EXT` (which
-    /// requires sched_ext-aware userspace) cannot be expressed
-    /// via this helper and must call the raw syscall path.
+    /// `Ext` maps to [`SchedPolicy::Ext`], which issues `sched_setattr`
+    /// with `sched_policy = SCHED_EXT` (7) so the kernel reads
+    /// `policy == SCHED_EXT`. The task is BPF-scheduled only when a
+    /// sched_ext scheduler is attached; with none attached the syscall
+    /// still succeeds and the task runs in `fair_sched_class`.
     pub const fn to_policy(self) -> SchedPolicy {
         match self {
-            SchedClass::Cfs | SchedClass::Ext => SchedPolicy::Normal,
+            SchedClass::Cfs => SchedPolicy::Normal,
+            SchedClass::Ext => SchedPolicy::Ext,
             SchedClass::Batch => SchedPolicy::Batch,
             SchedClass::Idle => SchedPolicy::Idle,
             SchedClass::Rt => SchedPolicy::Fifo(RT_DEFAULT_PRIO),
@@ -425,13 +448,13 @@ impl SchedClass {
     }
 
     /// Minimum-bandwidth `SCHED_DEADLINE` reservation that passes
-    /// `__checkparam_dl`'s `runtime >= DL_SCALE` floor and the
-    /// kernel's default `sched_deadline_period_min_us` (100us).
-    /// 1us runtime, 1ms deadline, 10ms period — bandwidth fraction
-    /// 0.0001, well below admission-control limits.
+    /// `__checkparam_dl`'s `runtime >= (1 << DL_SCALE)` (1024ns)
+    /// floor and the kernel's default `sched_deadline_period_min_us`
+    /// (100us). 2us runtime, 1ms deadline, 10ms period — bandwidth
+    /// fraction 0.0002, well below admission-control limits.
     pub const fn default_deadline_reservation() -> SchedPolicy {
         SchedPolicy::Deadline {
-            runtime: Duration::from_micros(1),
+            runtime: Duration::from_micros(2),
             deadline: Duration::from_millis(1),
             period: Duration::from_millis(10),
         }

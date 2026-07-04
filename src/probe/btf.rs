@@ -645,7 +645,7 @@ pub fn parse_btf_functions(func_names: &[&str], vmlinux_path: Option<&str>) -> V
 
 /// Discover loaded sched_ext BPF programs via libbpf-rs `ProgInfoIter`.
 ///
-/// Discovers programs in two passes:
+/// Classifies each discovered program into one of two categories:
 /// 1. All `StructOps` programs (scheduler callbacks).
 /// 2. Any other loaded BPF program whose name matches a display name
 ///    in `stack_names` (e.g. `SEC("syscall")` programs like
@@ -1206,7 +1206,7 @@ pub(super) fn resolve_ops_callback_proto<'a>(
 /// Uses BPF program BTF (not vmlinux) for offset resolution. Handles
 /// both single-level field access (`->field`) and chained pointer
 /// dereferences (`->ptr->field`). Skips params that have `struct_name`
-/// set (those are handled by [`resolve_field_specs`] with vmlinux BTF).
+/// set (those are handled by [`resolve_field_specs_with_btf`] with vmlinux BTF).
 pub fn resolve_bpf_field_specs(btf_func: &BtfFunc, prog_id: u32) -> Vec<FieldSpec> {
     use libbpf_rs::btf;
 

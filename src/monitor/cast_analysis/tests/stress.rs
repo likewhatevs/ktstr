@@ -5,8 +5,7 @@ use super::*;
 // These tests target performance regressions (quadratic blowups
 // over the BTF id walk, the patterns set, the layout index) and
 // boundary panics (OOB indexing on max-stack, depth-limit chains
-// through `peel_modifiers`, all-LD_IMM64 streams driving
-// `skip_next` to the program end). Assertions verify exact
+// through `peel_modifiers`). Assertions verify exact
 // `CastMap` contents — counting only would mask both spurious
 // entries and missed entries.
 
@@ -17,9 +16,14 @@ use super::*;
 /// state across thousands of unrelated instructions. Single-slot
 /// `r0 = 0` only clobbers `r0`, so the seeded `r1 = T*` and the
 /// loaded `r2 = LoadedU64Field{T, 8}` survive across the no-op
-/// padding and the cast resolves uniquely to `Q`. Real `BPF_JA +0`
-/// would add every PC to the jump-target set and reset register
-/// state at every step.
+/// padding and the cast resolves uniquely to `Q`. `mov_k(0, 0)` is
+/// used (not a `BPF_JA +0` no-op) because it clobbers only `r0` and
+/// is ALU64-class, so it adds no jump targets. A `BPF_JA +0` would
+/// add every PC to the jump-target set, but the branch-merge only
+/// saves/restores register state at conditional-branch targets — no
+/// state is reset at unconditional-JA targets — so an all-`BPF_JA +0`
+/// stream would carry `r1`/`r2` through unchanged rather than
+/// clobbering them.
 #[test]
 fn large_program_buried_cast_recorded() {
     let (blob, t_id, q_id) = btf_with_source_and_target(8, 0);
@@ -186,8 +190,8 @@ fn many_func_entries_each_seeds() {
 /// Layout: `Qtarget` has `(u64@40, u32@80)`. The other 499 each
 /// carry only a single `u64@0` — they match neither `(40, 8)` nor
 /// `(80, 4)`, so the intersection collapses to `Qtarget`. Source
-/// `T` has a single u64@8; T's u64@0 is absent, avoiding the
-/// "had_source && others remain" ambiguity drop.
+/// `T` has a single u64@8, which matches neither observed access
+/// `(40, 8)` nor `(80, 4)`, so `T` never enters the candidate set.
 #[test]
 fn many_struct_types_unique_match_resolves() {
     const N_FILLER: usize = 499;

@@ -214,7 +214,7 @@ pub fn format_entry_row(
 ///   consumers must check this field before trusting `eol`.
 /// - `entries`: heterogeneous array; each element is either a valid
 ///   entry (object with the full field set) or a corrupt entry
-///   (object with only `key`, `path`, and `error`). Corrupt entries
+///   (object with `key`, `path`, `error`, and `error_kind`). Corrupt entries
 ///   have a structurally different shape — consumers should detect the
 ///   `"error"` key and branch.
 ///
@@ -291,7 +291,10 @@ pub fn format_entry_row(
 ///   See [`crate::cache::ListedEntry::error_kind`] for the
 ///   classifier contract.
 pub fn kernel_list(json: bool) -> Result<()> {
-    kernel_list_inner(json, None)
+    // `include_eol` is meaningless in cache-listing mode (no range to
+    // expand); pass `false` — `kernel_list_inner` only consults it on
+    // the `range = Some(_)` branch.
+    kernel_list_inner(json, None, false)
 }
 
 /// Range-preview variant of [`kernel_list`].
@@ -299,23 +302,23 @@ pub fn kernel_list(json: bool) -> Result<()> {
 /// Routes through `kernel_list_inner` with `range = Some(spec)`,
 /// switching the subcommand from "walk the cache and list local
 /// entries" to "fetch releases.json once and print the versions
-/// `spec` expands to." See the `range` arg's doc on
+/// `spec` expands to." See the `kernel` arg's doc on
 /// [`super::KernelCommand::List`] for operator-facing semantics.
 ///
 /// Surfaced as a thin wrapper because the binary dispatch sites
-/// (`ktstr::kernel kernel list --range R` /
-/// `cargo ktstr kernel list --range R`) read more naturally as
+/// (`ktstr kernel list --kernel R` /
+/// `cargo ktstr kernel list --kernel R`) read more naturally as
 /// `cli::kernel_list_range_preview(json, R)` than as
 /// `cli::kernel_list_inner(json, Some(R))`. The shared inner
 /// function keeps a single `--json` formatter and a single test
 /// surface.
-pub fn kernel_list_range_preview(json: bool, range: &str) -> Result<()> {
-    kernel_list_inner(json, Some(range))
+pub fn kernel_list_range_preview(json: bool, range: &str, include_eol: bool) -> Result<()> {
+    kernel_list_inner(json, Some(range), include_eol)
 }
 
-fn kernel_list_inner(json: bool, range: Option<&str>) -> Result<()> {
+fn kernel_list_inner(json: bool, range: Option<&str>, include_eol: bool) -> Result<()> {
     if let Some(spec) = range {
-        return run_kernel_list_range(json, spec);
+        return run_kernel_list_range(json, spec, include_eol);
     }
     let cache = CacheDir::new()?;
     let entries = cache.list()?;
@@ -490,7 +493,7 @@ fn kernel_list_inner(json: bool, range: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Render a `kernel list --range START..END` preview by parsing
+/// Render a `kernel list --kernel START..END` preview by parsing
 /// `spec` as a [`crate::kernel_path::KernelId::Range`], expanding
 /// it via [`expand_kernel_range`], and printing the resulting
 /// version list.
@@ -514,7 +517,7 @@ fn kernel_list_inner(json: bool, range: Option<&str>) -> Result<()> {
 ///   (`| awk`, `| grep`) see clean stdout.
 /// - JSON: a single object with the literal range, the parsed
 ///   start / end strings, and the expanded version array.
-fn run_kernel_list_range(json: bool, spec: &str) -> Result<()> {
+fn run_kernel_list_range(json: bool, spec: &str, include_eol: bool) -> Result<()> {
     use crate::kernel_path::KernelId;
 
     let id = KernelId::parse(spec);
@@ -522,16 +525,16 @@ fn run_kernel_list_range(json: bool, spec: &str) -> Result<()> {
         KernelId::Range { start, end, .. } => (start.clone(), end.clone()),
         _ => {
             bail!(
-                "kernel list --range: `{spec}` does not parse as a \
+                "kernel list --kernel: `{spec}` does not parse as a \
                  `START..END` range. Expected `MAJOR.MINOR[.PATCH][-rcN]..\
                  MAJOR.MINOR[.PATCH][-rcN]` (e.g. `6.12..6.14`)."
             );
         }
     };
     id.validate()
-        .map_err(|e| anyhow::anyhow!("kernel list --range {spec}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("kernel list --kernel {spec}: {e}"))?;
 
-    let versions = expand_kernel_range(&start, &end, "kernel list")?;
+    let versions = expand_kernel_range(&start, &end, "kernel list", include_eol)?;
 
     if json {
         let payload = serde_json::json!({
@@ -545,7 +548,7 @@ fn run_kernel_list_range(json: bool, spec: &str) -> Result<()> {
     }
 
     // Text output: versions on stdout (one per line) so
-    // `kernel list --range R | xargs -I{} kernel build {}`
+    // `kernel list --kernel R | xargs -I{} kernel build --kernel {}`
     // works without tearing on legend lines. The header on
     // stderr matches `expand_kernel_range`'s own status output
     // shape so the operator gets the same "expanded to N
@@ -888,7 +891,7 @@ mod tests {
     /// kernel_list_range_preview rejects non-Range spec.
     #[test]
     fn kernel_list_range_preview_rejects_non_range_spec() {
-        let err = run_kernel_list_range(false, "6.14.2")
+        let err = run_kernel_list_range(false, "6.14.2", false)
             .expect_err("bare version must not parse as a Range");
         let msg = format!("{err:#}");
         assert!(msg.contains("does not parse as a `START..END` range"));
@@ -898,10 +901,10 @@ mod tests {
     /// kernel_list_range_preview rejects inverted range.
     #[test]
     fn kernel_list_range_preview_rejects_inverted_range() {
-        let err = run_kernel_list_range(false, "6.16..6.12")
+        let err = run_kernel_list_range(false, "6.16..6.12", false)
             .expect_err("inverted range must not be accepted");
         let msg = format!("{err:#}");
-        assert!(msg.contains("kernel list --range 6.16..6.12"));
+        assert!(msg.contains("kernel list --kernel 6.16..6.12"));
     }
 
     fn mk_valid(key: &str) -> crate::cache::ListedEntry {
@@ -987,8 +990,9 @@ mod tests {
         assert_eq!(keys, vec!["c_mid"]);
     }
 
-    /// Bucket-by-version retention: keep=1 with 4 entries split
-    /// across two versions retains the newest from EACH version.
+    /// Constructs a single `ListedEntry::Valid` with the given key,
+    /// version, and extra-kconfig-hash (no ktstr-kconfig-hash), by
+    /// delegating to `mk_valid_bucketed_full`.
     fn mk_valid_bucketed(
         key: &str,
         version: Option<&str>,

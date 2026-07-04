@@ -89,8 +89,8 @@ const MAX_RENDER_DEPTH: u32 = 32;
 ///
 /// The `kind` tag identifies the variant; field order matches the
 /// rendering pipeline (Int / Uint / Bool / Char before Float / Enum /
-/// Struct / Array / Ptr, with Bytes / Truncated / Unsupported as the
-/// recovery path).
+/// Struct / Array / CpuList / Ptr, with Bytes / Truncated / Unsupported
+/// as the recovery path).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[allow(dead_code)]
@@ -3298,26 +3298,6 @@ struct ArenaChaseOutcome {
     sdt_alloc_resolved: bool,
 }
 
-/// Outcome of [`try_sdt_alloc_bridge`]. Distinguishes the no-fire
-/// case from a fire that adopts a recovered payload type id, with
-/// the resolved type, its id, the `header_skip` the caller applies
-/// to its arena read, and the payload's `btf_size` so callers
-/// don't re-resolve any of them.
-///
-/// `target_ty` and `effective_type_id` are the post-peel type and
-/// type id the caller adopts for its render. The bridge resolves
-/// the recovered id through [`peel_modifiers_resolving_fwd`] before
-/// producing this struct so the caller can switch its render
-/// target without re-running the peel.
-///
-/// `header_skip` is the byte count the chase must skip past the
-/// chased address before the payload struct begins. The
-/// [`MemReader::resolve_arena_type`] contract returns this value:
-/// 0 when the chased pointer already lands on payload-start (the
-/// historical behaviour), or the slot's header size when the
-/// chased pointer lands on slot-start (the new path that handles
-/// the raw return of `sdt_alloc()` cached in `data` fields).
-///
 /// Try the sdt_alloc bridge for a `BTF_KIND_FWD` chase target.
 ///
 /// Returns the raw [`ArenaResolveHit`] when the chased address

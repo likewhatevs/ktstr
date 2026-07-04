@@ -40,8 +40,9 @@
 //! zero-denominator gate produced no signal, so re-running the
 //! same scenario would just reproduce the non-measurement (see
 //! the function-level doc on `select_failed_names` for the full
-//! rationale). The four mutually-exclusive bits `(passed,
-//! skipped, inconclusive, fail)` are pinned by the SidecarResult
+//! rationale). The four mutually-exclusive states `(passed,
+//! skipped, inconclusive, fail)` — three stored bits plus the
+//! derived all-false Fail state — are pinned by the SidecarResult
 //! contract; `write_skip_sidecar` emits a Skip row as
 //! `passed=false, skipped=true, inconclusive=false`, so a Skip
 //! is correctly excluded by both the `!skipped` and `!passed`
@@ -130,11 +131,24 @@ const EMPTY_POOL_FILTER: &str = "test(/^__ktstr_no_failures_to_replay__$/)";
 /// computed filter; otherwise the filter is printed and the
 /// caller can pipe it into nextest themselves.
 ///
+/// `profile` (`--profile <NAME>`, the scheduler BUILD profile) and
+/// `nextest_profile` (`--nextest-profile <NAME>`, the nextest test
+/// profile) shape the `--exec` re-run only — the dry-run path runs no
+/// tests. `profile` omitted leaves the scheduler at its release default.
+///
 /// Returns `Ok(0)` on a clean dry-run or successful exec.
 /// Returns `Ok(N)` with nextest's exit code when `exec` is set
 /// and nextest exits non-zero. Returns `Err` only for genuine
 /// errors (unreadable sidecar root, nextest spawn failure).
-pub(crate) fn run_replay(dir: Option<&Path>, filter: Option<&str>, exec: bool) -> Result<i32> {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_replay(
+    dir: Option<&Path>,
+    filter: Option<&str>,
+    exec: bool,
+    profile: Option<&str>,
+    nextest_profile: Option<&str>,
+    args: &[String],
+) -> Result<i32> {
     let root: PathBuf = dir
         .map(Path::to_path_buf)
         .unwrap_or_else(ktstr::test_support::runs_root);
@@ -204,7 +218,7 @@ pub(crate) fn run_replay(dir: Option<&Path>, filter: Option<&str>, exec: bool) -
     // post-exec re-scan that builds a fresh pool Vec.
     let queued: BTreeSet<String> = failed_names.iter().map(|s| s.to_string()).collect();
 
-    let exit = invoke_nextest(&filter_expr).with_context(|| {
+    let exit = invoke_nextest(&filter_expr, profile, nextest_profile, args).with_context(|| {
         format!("ktstr replay: cargo nextest run -E {filter_expr:?} failed to spawn")
     })?;
 
@@ -372,8 +386,9 @@ pub(crate) fn classify_replay<'a>(
 /// Render the outcome-diff summary to stderr (the narrative
 /// stream — stdout stays clean for the dry-run filter path,
 /// which is the primary pipeable surface). Header line carries
-/// the counts; per-test lines name each PERSISTENT/DROPPED
-/// entry so the operator can drill in without parsing nextest
+/// the counts; per-test lines name each
+/// PERSISTENT/INCONCLUSIVE/DROPPED/MIXED entry so the operator
+/// can drill in without parsing nextest
 /// output. FIXED entries are aggregated to a count only to
 /// keep the diff short on healthy days; the operator who wants
 /// per-test FIXED detail can grep the live nextest output above.
@@ -483,7 +498,7 @@ fn render_outcome_diff(outcomes: &BTreeMap<&str, ReplayOutcome>) {
 ///   inline and can correlate it with persistent/mixed outcomes
 ///   above.
 ///
-/// Non-exhaustive matching is intentional inside the renderer —
+/// Exhaustive matching is intentional inside the renderer —
 /// every variant has a distinct user-visible string and a future
 /// fourth variant would need explicit handling.
 #[derive(Debug, PartialEq, Eq)]
@@ -543,7 +558,7 @@ pub(crate) fn extract_captured_host(
 /// test process.
 ///
 /// Implementation: defers all field-level comparison to
-/// [`HostContext::diff`] at host_context.rs:480. That function
+/// [`HostContext::diff`] at host_context.rs:642. That function
 /// already handles every dimension of the struct (CPU identity,
 /// memory, NUMA, kernel uname triple, cmdline, sched tunables,
 /// THP, cpufreq governors) plus the `Option` / `BTreeMap` edge
@@ -645,7 +660,7 @@ fn render_host_diff_section(section: &HostDiffSection) {
 /// logic can be unit-tested against synthetic SidecarResult
 /// fixtures without instantiating a real sidecar pool on
 /// disk. Mirrors the closure-extraction pattern used elsewhere
-/// for `matches_phase` / `passes_delta_threshold`.
+/// for `matches_phase`.
 pub(crate) fn select_failed_names<'a>(
     pool: &'a [ktstr::test_support::SidecarResult],
     filter: Option<&str>,
@@ -668,7 +683,7 @@ pub(crate) fn select_failed_names<'a>(
 /// before reaching this fn — callers emit
 /// `EMPTY_POOL_FILTER` instead so the downstream nextest
 /// invocation has a parseable input.
-fn build_nextest_filter(names: &BTreeSet<&str>) -> String {
+pub(crate) fn build_nextest_filter(names: &BTreeSet<&str>) -> String {
     let parts: Vec<String> = names
         .iter()
         .map(|n| format!("test(/^(.*::)?{}$/)", regex_escape(n)))
@@ -702,12 +717,36 @@ fn regex_escape(s: &str) -> String {
 /// live progress. Returns the nextest exit code; an `Err` here
 /// is only for spawn failure (nextest binary missing,
 /// `Command::status()` failed at the syscall level).
-fn invoke_nextest(filter_expr: &str) -> Result<i32> {
+///
+/// `nextest_profile` becomes nextest's own `--profile <NAME>` (the test
+/// profile), placed before the user's trailing `args` so a passthrough
+/// token can't shadow it. `profile` sets `KTSTR_SCHEDULER_PROFILE` for
+/// the scheduler-under-test BUILD; absent, `build_and_find_binary`
+/// defaults the scheduler to `release`.
+fn invoke_nextest(
+    filter_expr: &str,
+    profile: Option<&str>,
+    nextest_profile: Option<&str>,
+    args: &[String],
+) -> Result<i32> {
     use std::process::Command;
-    let status = Command::new("cargo")
-        .args(["nextest", "run", "-E", filter_expr])
-        .status()
-        .context("spawn `cargo nextest run`")?;
+    let mut cmd = Command::new("cargo");
+    cmd.args(["nextest", "run", "-E", filter_expr]);
+    // `--nextest-profile <NAME>` selects the NEXTEST test profile;
+    // nextest's own flag is `--profile`.
+    if let Some(np) = nextest_profile {
+        cmd.args(["--profile", np]);
+    }
+    // Forward the operator's cargo/nextest flags (features,
+    // `--cargo-profile`, …) verbatim so the replay re-run builds
+    // identically to the original suite. No `--` separator is required.
+    cmd.args(args);
+    // `--profile <NAME>` sets the scheduler-under-test's cargo BUILD
+    // profile via `KTSTR_SCHEDULER_PROFILE`.
+    if let Some(p) = profile {
+        cmd.env(ktstr::KTSTR_SCHEDULER_PROFILE_ENV, p);
+    }
+    let status = cmd.status().context("spawn `cargo nextest run`")?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -727,6 +766,7 @@ mod tests {
     fn synth_sidecar(test_name: &str, passed: bool, skipped: bool) -> SidecarResult {
         SidecarResult {
             test_name: test_name.to_string(),
+            perf_delta_assertions: Vec::new(),
             topology: "synth".into(),
             scheduler: "synth".into(),
             vcpus: 1,

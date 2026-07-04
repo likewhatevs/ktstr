@@ -169,8 +169,8 @@ fn classify_exit_x86_mmio_read_unmapped_returns_0xff() {
     let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
     let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
     // Pick an address well below any virtio_*_MMIO_BASE so no
-    // device window matches it. 0x1000 is in the BIOS-EBDA area,
-    // which ktstr does not back with any MMIO device.
+    // device window matches it. 0x1000 is in low conventional
+    // memory, which ktstr does not back with any MMIO device.
     let mut buf = [0u8; 4];
     let mut exit = VcpuExit::MmioRead(0x1000, &mut buf);
     let action = classify_exit(&com1, &com2, None, None, None, None, None, &mut exit);

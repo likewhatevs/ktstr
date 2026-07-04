@@ -9,8 +9,9 @@
 //!   render through BTF when available.
 //! - ARENA — reuse the dump pre-pass snapshot or take a fresh
 //!   page-granular snapshot.
-//! - STRUCT_OPS — read the userspace `kvalue` shape and patch
-//!   `state` from `kvalue.common.state`.
+//! - STRUCT_OPS — read the userspace `kvalue.data` payload (offset
+//!   via [`super::super::btf_offsets::StructOpsOffsets`]'s `value_data`)
+//!   and render it against the per-ops struct type into `value`.
 //! - TASK_STORAGE / INODE_STORAGE / SK_STORAGE / CGRP_STORAGE — walk
 //!   the shared `bpf_local_storage_map` selem chain via the
 //!   accessor's `iter_task_storage`. All four kernel map types share
@@ -189,7 +190,7 @@ pub(super) type ArenaPageIndex = std::collections::HashMap<u64, usize>;
 /// Visibility matches sibling render-pass types (`ArenaPageIndex`,
 /// `SdtAllocMeta`, `ArenaSlotIndex`, `RenderMapCtx`): all are
 /// `pub(super)` so the `dump` module owns the surface. The
-/// 20-byte POD derive set (`PartialEq, Eq`) lets tests use
+/// 24-byte POD derive set (`PartialEq, Eq`) lets tests use
 /// `assert_eq!` directly. `Hash` is intentionally NOT derived —
 /// the type is the VALUE side of [`ArenaSlotIndex`] (a `BTreeMap`
 /// keyed by `slot_start: u32`) and never composes into a hashed
@@ -384,7 +385,7 @@ pub(super) fn append_arena_slot_index_for_allocator(
             }
             std::collections::btree_map::Entry::Occupied(o) => {
                 // Low-32-bit collision mitigation: probability is
-                // ~1.6% with 8K entries. A real duplicate signals
+                // ~0.8% with 8K entries. A real duplicate signals
                 // either a torn snapshot OR (more likely) a low-32
                 // collision between slot starts in different
                 // allocators. Surface as `warn` so an operator
@@ -1839,11 +1840,13 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
             //
             // Hard-cap at MAX_HASH_ENTRIES to keep a million-entry
             // hash from OOMing the host renderer. `iter_hash_map`
-            // already enforces its own much-larger HTAB_ITER_MAX
-            // (1_000_000) inside the bucket walk, but a million
-            // [`RenderedValue`] trees would still pin gigabytes
-            // here — surface the truncation in `out.error` so the
-            // consumer sees that the rendered slice is partial.
+            // already materializes at most `MAP_MATERIALIZE_MAX`
+            // (4096, one-past) entries (htab.rs) — this cap aliases
+            // that so the `len > MAX_HASH_ENTRIES` truncation signal
+            // stays lockstep; the walker's 1_000_000 `MAP_WALK_ITER_MAX`
+            // bound is a nodes-visited pointer-cycle guard, not an
+            // entry-count cap. Surface the truncation in `out.error`
+            // so the consumer sees that the rendered slice is partial.
             let raw_entries = accessor.iter_hash_map(info);
             let truncated = raw_entries.len() > MAX_HASH_ENTRIES;
             // Resolve the sdt_data arena-pointer field offset once,
@@ -2096,8 +2099,9 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
             // Same `MAX_HASH_ENTRIES` truncation policy as plain HASH:
             // a million-entry storage map would otherwise pin gigabytes
             // of [`RenderedValue`] trees here. The walker's own cap
-            // (`TASK_STORAGE_ITER_MAX = 1_000_000`) is the safety
-            // bound against pointer-cycle corruption; this cap is the
+            // (`MAP_WALK_ITER_MAX = 1_000_000`, via ctx.iter_max in
+            // local_storage.rs) is the safety bound against
+            // pointer-cycle corruption; this cap is the
             // operator-visible report-size bound.
             //
             // Empty-result handling matches HASH: no entries means no

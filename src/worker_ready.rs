@@ -15,9 +15,11 @@
 //! `/tmp/ktstr-worker-ready-<pid>` where `<pid>` is the worker's
 //! decimal pid (see [`worker_ready_marker_path`] / [`WORKER_READY_MARKER_PREFIX`]).
 //! The worker issues `std::fs::write(path, b"ready\n")` on
-//! ready; the test polls `Path::exists` in a bounded loop (see
-//! `wait_for_worker_ready` in the sibling `worker_ready_wait`
-//! module). A test-only env override —
+//! ready; the test waits for that file via `wait_for_worker_ready`
+//! in the sibling `worker_ready_wait` module — inotify-event-driven
+//! (`IN_CREATE | IN_MOVED_TO` on the marker's parent directory),
+//! re-checking `Path::exists` on every wake, with a 10 ms sleep
+//! fallback when inotify is unavailable. A test-only env override —
 //! [`WORKER_READY_MARKER_OVERRIDE_ENV`] — replaces the default
 //! pid-scoped path when set and non-empty; production callers
 //! never set it.
@@ -64,16 +66,17 @@
 //! - **No `crate::…` paths**, no `use crate::…` statements.
 //!   `crate` resolves to two different crates (ktstr vs.
 //!   the bin) on the two compilation paths; anything that names the
-//!   other crate's types breaks one of the two builds. A future
-//!   nested `#[cfg(test)] mod tests { … }` block is safe to add at
-//!   the bottom of this file using `super::` to reach items defined
-//!   here — `super::` from a child `mod tests` resolves to this
-//!   file's own items, which exist identically under both
-//!   compilation paths, so the tests would not divide lib vs. bin.
-//!   None currently exists; the pin-tests for the path format live
-//!   in `tests/jemalloc_alloc_worker_exit_codes.rs` and
-//!   `tests/jemalloc_probe_signals_test.rs`, which reach the items
-//!   through the `ktstr::worker_ready::…` public surface.
+//!   other crate's types breaks one of the two builds. The nested
+//!   `#[cfg(test)] mod tests { … }` block at the bottom of this file
+//!   uses `super::` to reach items defined here — `super::` from a
+//!   child `mod tests` resolves to this file's own items, which exist
+//!   identically under both compilation paths, so the tests do not
+//!   divide lib vs. bin. Those tests pin the path format (the prefix
+//!   literal, decimal-pid formatting, and the override-env / stderr /
+//!   stdout prefixes). `tests/jemalloc_alloc_worker_exit_codes.rs`
+//!   and `tests/jemalloc_probe_signals_test.rs` merely consume the
+//!   same items through the `ktstr::worker_ready::…` public surface;
+//!   they do not re-pin the path-format literal.
 //! - **No ktstr-library types or modules.** Only `std` items,
 //!   language primitives, and `core` types are safe. Anything that
 //!   depends on `PayloadHandle`, scenario `Ctx`, `anyhow`, or any
@@ -190,8 +193,10 @@ pub fn worker_ready_marker_path(pid: u32) -> String {
 pub const WORKER_STDERR_PREFIX: &str = "jemalloc-alloc-worker:";
 
 /// Stdout "ready" breadcrumb the `ktstr-jemalloc-alloc-worker`
-/// binary prints once, immediately before parking on `pause()`,
-/// after its allocation + `black_box` triple has materialised.
+/// binary prints once, immediately before entering its terminal
+/// loop — the default-mode `sleep(3600s)` park loop or the
+/// `--churn` spawn+join loop — after its allocation + `black_box`
+/// triple has materialised.
 /// The full emitted line is
 /// `{WORKER_STDOUT_READY_PREFIX} pid={pid} bytes={bytes}`; this
 /// const carries only the prefix so host-side consumers that want

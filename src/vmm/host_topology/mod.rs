@@ -37,7 +37,12 @@ impl std::error::Error for ResourceContention {}
 /// returned by the `performance_mode` planner (`compute_pinning`) when the
 /// host has too few physical CPUs / LLC groups — but that perf-mode caller
 /// RE-MAPS it to [`PerfModeUnavailable`] (a host-insufficiency: skip by
-/// default, fail under `KTSTR_NO_SKIP_MODE`). Distinct
+/// default, fail under `KTSTR_NO_SKIP_MODE`). Also raised by
+/// `resolve_cpu_budget` when an author's per-test `cpu_budget` exceeds the
+/// allowed-CPU count — the author-attribute half of a provenance split (a
+/// capability requirement a bigger host satisfies → skip), mirroring the
+/// operator-knob half [`CpuBudgetUnsatisfiable`] (a concrete `--cpu-cap`
+/// number the host cannot satisfy → hard fail). Distinct
 /// from [`ResourceContention`] (a transient slot/resource shortage a retry
 /// resolves → skip); a too-small host is permanent, so the operator must
 /// provision different hardware or narrow the topology rather than retry.
@@ -89,39 +94,20 @@ impl std::fmt::Display for PerfModeUnavailable {
 
 impl std::error::Error for PerfModeUnavailable {}
 
-/// An explicit CPU budget (`--cpu-cap N` / per-test `cpu_budget = N`) the
-/// host cannot satisfy: N exceeds the CPUs this process is allowed on. A
-/// HARD ERROR, not a skip — the author typed a concrete number that does
-/// not exist on this host (a user-input error, distinct from a bare
-/// capability request). Contrast [`ResourceContention`] (a transient
-/// shortage of an otherwise-satisfiable budget → skip/retry).
+/// An operator `--cpu-cap N` (or `KTSTR_CPU_CAP`) the host cannot satisfy: N
+/// exceeds the CPUs this process is allowed on. A HARD ERROR, not a skip —
+/// the operator typed a concrete number that does not exist on this host (a
+/// user-input error). This is the OPERATOR-knob half of a provenance split:
+/// an author's per-test `cpu_budget` over the allowance is instead a
+/// [`TopologyInsufficient`] SKIP (a capability request a bigger host would
+/// satisfy), raised in `resolve_cpu_budget`. Contrast [`ResourceContention`]
+/// (a transient shortage of an otherwise-satisfiable budget → skip/retry).
 ///
 /// Downcast via `anyhow::Error::downcast_ref::<CpuBudgetUnsatisfiable>()`
 /// (chain-aware).
 #[derive(Debug)]
 pub struct CpuBudgetUnsatisfiable {
     pub reason: String,
-}
-
-impl CpuBudgetUnsatisfiable {
-    /// Construct the "explicit CPU budget exceeds the allowed cpuset"
-    /// hard error shared by the `--cpu-cap` (`CpuCap::effective_count`)
-    /// and per-test `cpu_budget` (`KtstrVmBuilder::build`) paths: both
-    /// share the same prefix, the `sched_getaffinity` framing, and the
-    /// "pick a smaller value or release the constraint" remediation.
-    /// `source` names the knob in the message (e.g. `"--cpu-cap N"`,
-    /// `"cpu_budget"`); `omit_hint` is the source-specific "or omit X to
-    /// use the default" tail.
-    pub(crate) fn exceeds_allowed(source: &str, n: usize, allowed: usize, omit_hint: &str) -> Self {
-        Self {
-            reason: format!(
-                "{source} = {n} exceeds the {allowed} CPUs this process is \
-                 allowed on (from sched_getaffinity / Cpus_allowed_list). \
-                 Pick a value ≤ {allowed}, release the cgroup/taskset \
-                 constraint restricting this process, or {omit_hint}."
-            ),
-        }
-    }
 }
 
 impl std::fmt::Display for CpuBudgetUnsatisfiable {
@@ -371,11 +357,11 @@ impl HostTopology {
     // on top of these queries:
     //
     // - Perf-mode distributes virtual NUMA nodes across host NUMA
-    //   nodes with modulo rotation; uses primitive 1 + 2 (group-by-node
-    //   + eligibility-by-capacity). No distance lookup.
+    //   nodes with modulo rotation; uses primitive 2
+    //   (eligibility-by-capacity). No distance lookup.
     // - Consolidation seeds from a scored LLC list then greedily
     //   expands within the seed's node, spilling to nearest-by-distance
-    //   when needed; uses primitive 1 + 2 + 3.
+    //   when needed; uses primitive 3 (plus llc_numa_node).
     //
     // Kept as small orthogonal queries rather than a single mega-selector
     // — the two algorithms genuinely do different things, but they both
@@ -633,13 +619,15 @@ impl HostTopology {
     /// claim) — stricter than the prior floor-based check, so the
     /// "+1" guest nodes always land on a node with capacity.
     ///
-    /// Implementation composes [`Self::host_llcs_by_numa_node`] +
-    /// [`Self::numa_nodes_with_capacity`] — the same group-by-node + eligibility
-    /// queries the `--cpu-cap` consolidation PLAN phase uses. The two
-    /// callers' SELECTION algorithms differ (perf-mode does modulo
-    /// rotation of guest onto host nodes; consolidation does
-    /// score-driven greedy expansion), but the underlying topology
-    /// lookups are the same.
+    /// Implementation composes [`Self::numa_nodes_with_capacity`],
+    /// which iterates the memoized `host_node_llcs` map. The
+    /// `--cpu-cap` consolidation PLAN phase instead composes
+    /// [`Self::numa_nodes_sorted_by_distance`] plus
+    /// [`Self::llc_numa_node`], so the two callers share the memoized
+    /// `host_node_llcs` map rather than the same accessor calls. The
+    /// two callers' SELECTION algorithms also differ: perf-mode does
+    /// modulo rotation of guest onto host nodes; consolidation does
+    /// score-driven greedy expansion.
     pub(crate) fn numa_aware_llc_order(
         &self,
         numa_nodes: u32,
@@ -1124,14 +1112,17 @@ impl CpuCap {
             // (the author typed a concrete number that does not exist here),
             // not transient contention: CpuBudgetUnsatisfiable, not
             // ResourceContention, so it fails rather than skips.
-            return Err(anyhow::Error::new(CpuBudgetUnsatisfiable::exceeds_allowed(
-                "--cpu-cap N",
-                n,
-                allowed_cpus,
-                "omit --cpu-cap to use the auto-sized default (30% of the \
-                 allowed set for kernel builds; the vCPU count, floored at \
-                 30%, for VMs)",
-            )));
+            return Err(anyhow::Error::new(CpuBudgetUnsatisfiable {
+                reason: format!(
+                    "--cpu-cap N = {n} exceeds the {allowed_cpus} CPUs this \
+                     process is allowed on (from sched_getaffinity / \
+                     Cpus_allowed_list). Pick a value ≤ {allowed_cpus}, \
+                     release the cgroup/taskset constraint restricting this \
+                     process, or omit --cpu-cap to use the auto-sized default \
+                     (30% of the allowed set for kernel builds; the vCPU \
+                     count, floored at 30%, for VMs)."
+                ),
+            }));
         }
         Ok(n)
     }
@@ -1139,9 +1130,10 @@ impl CpuCap {
 
 /// Per-LLC discover snapshot: identity + current holder set.
 /// Constructed by [`discover_llc_snapshots`] before the PLAN phase.
-/// `pub(crate)` because the `ktstr locks` observational command
-/// renders holder lists via the same snapshot structure; external
-/// callers have no reason to construct one.
+/// `pub(crate)` so the in-crate PLAN pipeline and this module's tests
+/// can construct and inspect it; the `ktstr locks` observational
+/// command shares only [`crate::flock::HolderInfo`], not this
+/// structure. External callers have no reason to construct one.
 #[derive(Debug, Clone)]
 pub(crate) struct LlcSnapshot {
     /// Host LLC index — matches [`HostTopology::llc_groups`] ordering.
@@ -1248,9 +1240,10 @@ const TOCTOU_RETRY_DELAYS: [std::time::Duration; ACQUIRE_MAX_TOCTOU_RETRIES as u
 /// `mountinfo` is the `/proc/self/mountinfo` text read once per
 /// `acquire_llc_plan` invocation at [`acquire_llc_plan_with_acquire_fn`]
 /// and threaded through here so a host with N LLCs pays for exactly
-/// one mountinfo read per DISCOVER pass (DISCOVER is called twice
-/// on the TOCTOU-exhausted diagnostic path, hence caching at the
-/// plan level rather than per snapshot walk).
+/// one mountinfo read per DISCOVER pass (DISCOVER runs once per retry
+/// attempt — up to ACQUIRE_MAX_TOCTOU_RETRIES+1 — plus once on the
+/// retry-exhausted diagnostic path, up to 5 passes, hence caching at
+/// the plan level rather than per snapshot walk).
 ///
 /// Returns `Ok(snapshots)` on success. Propagates opening + stat
 /// errors so a missing `/tmp` or permission failure surfaces
@@ -1616,8 +1609,9 @@ where
     // Every DISCOVER pass re-uses this text to derive per-LLC
     // /proc/locks needles (major:minor:inode). Without this cache, a
     // host with N LLCs would re-read mountinfo N× per DISCOVER pass,
-    // and DISCOVER itself runs up to twice (once per attempt + once
-    // on the retry-exhausted diagnostic path). Mount points are
+    // and DISCOVER itself runs up to ACQUIRE_MAX_TOCTOU_RETRIES+1
+    // times in the retry loop, plus once on the retry-exhausted
+    // diagnostic path (up to 5 total). Mount points are
     // effectively static during a plan acquisition — a bind mount
     // changing under us mid-acquire is a host-reconfiguration event
     // that invalidates every parallel acquirer anyway, not something

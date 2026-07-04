@@ -36,8 +36,9 @@
 //!
 //! # Lifetime model
 //!
-//! `SampleSeries` owns the drained `Vec<(tag, report, stats,
-//! elapsed_ms)>` so projection closures can borrow into the
+//! `SampleSeries` owns the drained `Vec<SampleRow>` (each row:
+//! tag, report, stats, elapsed_ms, boundary_offset_ms, step_index)
+//! so projection closures can borrow into the
 //! reports / stats without copying. Constructing a `Sample` only
 //! borrows; [`SampleSeries::iter_samples`] yields `Sample<'_>`
 //! bound by the series' own lifetime.
@@ -231,7 +232,7 @@ impl SampleSeries {
     /// `result.monitor.clone()` from a `VmResult`). Pass `None`
     /// when the monitor did not run (host-only tests, early VM
     /// failure). Surfaced via [`Self::monitor`] for typed projection
-    /// of the summary + scx_events + (future) per-sample timelines.
+    /// of the summary + scx_events + per-sample timelines.
     pub fn from_drained(
         drained: Vec<(
             String,
@@ -359,8 +360,9 @@ impl SampleSeries {
 
     /// Iterate over [`Sample`] views borrowing into this series.
     /// Each yielded `Sample<'_>` carries the tag, elapsed-ms,
-    /// borrowed [`Snapshot`], borrowed `Option<&Value>` stats,
-    /// and the per-sample phase step index.
+    /// borrowed [`Snapshot`], borrowed
+    /// `Result<&Value, &MissingStatsReason>` stats, the per-sample
+    /// phase step index, and the workload-relative boundary offset.
     pub fn iter_samples(&self) -> impl Iterator<Item = Sample<'_>> {
         self.rows.iter().map(|r| Sample {
             tag: r.tag.as_str(),

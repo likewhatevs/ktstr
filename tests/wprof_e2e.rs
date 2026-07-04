@@ -10,7 +10,7 @@
 //!   (KTSTR_WPROF_PATH → ktstr library reads file via
 //!   `crate::vmm::blobs::load_wprof_path` → packs into initramfs)
 //! - the wprof binary lands at `/bin/wprof` in the guest filesystem
-//!   with executable mode + non-trivial size
+//!   with executable mode
 //!
 //! Runs on the self-hosted CI runners (`[ktstr-x64]` /
 //! `[ktstr-arm64]`). ktstr supplies the guest kernel itself via
@@ -22,8 +22,7 @@ const CARGO_KTSTR_BINARY: &str = env!("CARGO_BIN_EXE_cargo-ktstr");
 
 /// `cargo ktstr shell --exec "ls -la /bin/wprof"` boots a VM,
 /// the guest's `ls` (from busybox at `/bin/busybox`) inspects
-/// `/bin/wprof`, and stdout shows the file with `x` mode and
-/// non-trivial size.
+/// `/bin/wprof`, and stdout shows the file with `x` mode.
 #[test]
 fn wprof_e2e_shell_mode_exposes_bin_wprof() {
     let output = std::process::Command::new(CARGO_KTSTR_BINARY)
@@ -46,9 +45,9 @@ fn wprof_e2e_shell_mode_exposes_bin_wprof() {
         stdout.contains("/bin/wprof"),
         "guest `ls -la /bin/wprof` did not surface the binary; stdout:\n{stdout}",
     );
-    // The wprof binary should be at least a few hundred KB. A
-    // truncated / zero-byte file would indicate the embed →
-    // extract → pack pipeline lost the bytes somewhere.
+    // The wprof binary must be executable. A missing or
+    // non-executable file would indicate the embed → extract →
+    // pack pipeline dropped or mangled the binary somewhere.
     assert!(
         stdout.contains("-rwxr-xr-x"),
         "guest /bin/wprof not executable; stdout:\n{stdout}",

@@ -86,11 +86,6 @@ slow-timeout = { period = "75s", terminate-after = 3 }
 retries = 6
 
 [[profile.ci.overrides]]
-filter = "test(model_loaded_)"
-slow-timeout = { period = "600s", terminate-after = 3 }
-retries = 6
-
-[[profile.ci.overrides]]
 filter = "test(shell_exec_)"
 test-group = "vm-cli"
 threads-required = 1
@@ -121,7 +116,7 @@ threads-required = 1
 # try 2 passed in 0.014s once the binary was in the page cache. The
 # test logic itself is trivial — make_client + pre_populate +
 # request_raw — and both ends of the cvar handshake are race-safe:
-# pre_populate (sched_stats.rs:935-954) follows the standard cvar
+# pre_populate (sched_stats.rs:1036-1055) follows the standard cvar
 # producer pattern (acquire mutex, append bytes, notify_all WHILE
 # holding the mutex, release on guard drop), and request_raw's loop
 # at the response_buf check site re-inspects the buffer BEFORE
@@ -241,9 +236,9 @@ slow-timeout = { period = "180s", terminate-after = 2 }
 # cached_releases bypass test: drives a localhost mock through the
 # fetch.rs URL-injection seam. Observed exhausting the ci profile's
 # 270s slow-timeout budget (90s × 3) on ARM64 runners. The test
-# itself is bounded by a 5s reqwest timeout per attempt, so the only
+# itself is bounded by a 60s reqwest timeout per attempt, so the only
 # way to hit 270s is repeated retries — each retry replays the same
-# RELEASES_CACHE OnceLock state and the same TcpListener::bind path,
+# RELEASES_CACHE OnceLock state and the same mockito server path,
 # so a failure is never transient. retries=0 keeps a single attempt
 # and surfaces any genuine regression as a fast failure rather than
 # letting the retry storm consume the timeout budget. The 240s × 2
@@ -256,40 +251,15 @@ slow-timeout = { period = "240s", terminate-after = 2 }
 retries = 0
 
 # EEVDF tests: no sched_ext scheduler attached, so VM lifecycle is
-# bounded by vm_timeout_from_entry (max(watchdog, duration, 1s) + 45s)
-# plus VM setup overhead. 75s gives a margin above that ceiling so
+# bounded by vm_timeout_from_entry (base = max(watchdog, duration, 1s),
+# plus vm_boot_headroom = 10s + sys_rdy_budget_ms(vcpus), that headroom
+# scaled by the host overcommit ratio) plus VM setup overhead. 75s
+# gives a margin above that ceiling so
 # nextest does not race the watchdog. retries=0 because a watchdog
 # timeout is never transient — re-running just burns the same time.
 [[profile.default.overrides]]
 filter = "test(eevdf_)"
 slow-timeout = { period = "75s", terminate-after = 2 }
-retries = 0
-
-# Model-loaded tests: real CPU inference on the 2.55 GiB Qwen3 GGUF
-# runs the SAMPLE_LEN-token loop, which routinely takes 2-5 minutes
-# per call on host CPU. The default 60s × 2 budget terminates these
-# long before they finish; the override budgets 600s × 2 (20 min
-# total) so a slow CI runner with greedy sampling on a 64-core box
-# still completes inside the cap.
-#
-# Two populations match this filter:
-#   * Unit tests in `src/test_support/model.rs` are `#[ignore]`'d by
-#     default and only run via `--run-ignored=only` — the override
-#     applies to ignored runs the same way nextest applies any other
-#     override.
-#   * The integration test
-#     `tests/llm_extract_e2e_test.rs::model_loaded_llm_extract_schbench`
-#     runs by default; the host-side `host_side_llm_extract` path
-#     (`src/test_support/eval.rs`) loads the GGUF post-VM-exit and
-#     runs inference on host CPU. The 2-5 minute inference window
-#     alone exceeds the 60s default budget on EVERY run regardless
-#     of cache state — the 600s override is required for warm-cache
-#     runs too. A cold cache additionally pays the GGUF download cost
-#     on top of that. retries=0: inference time is deterministic, so
-#     a timeout-killed run is never transient.
-[[profile.default.overrides]]
-filter = "test(model_loaded_)"
-slow-timeout = { period = "600s", terminate-after = 2 }
 retries = 0
 
 # Wide-SMP boot tests: mirror of the profile.ci override (nextest does
@@ -347,7 +317,7 @@ threads-required = 1
 max-threads = 1
 
 # `pathology_alu_hot_iterates` runs `AluWidth::Widest`, which
-# `resolve_alu_width` (src/workload.rs) downgrades to Vec512 on
+# `resolve_alu_width` (src/workload/worker/mod.rs) downgrades to Vec512 on
 # avx512f hosts (Vec256/Vec128/Scalar otherwise). AMX is not
 # probed on stable Rust — `AluWidth::Amx` always downgrades to
 # the widest stable-detectable variant. The `alu_hot_vec512`

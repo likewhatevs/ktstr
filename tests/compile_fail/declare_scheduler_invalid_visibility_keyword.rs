@@ -1,6 +1,8 @@
-// An invalid Rust visibility token (`extern` is not a valid
-// visibility keyword) must be rejected at macro-expand time via
-// syn::Visibility::parse's natural failure.
+// `extern` is a Rust keyword, so it is neither a valid visibility
+// prefix nor a valid const name. syn::Visibility::parse treats it as
+// Inherited (no prefix, no error); the const-name syn::Ident parse
+// then rejects it at macro-expand time with `expected identifier,
+// found keyword `extern`` (see the .stderr sibling).
 use ktstr::declare_scheduler;
 
 declare_scheduler!(extern MY_SCHED, {

@@ -19,11 +19,12 @@
 //! discovery proves that by listing the entry below as a runnable
 //! test.
 //!
-//! No standalone `#[test]` assertions live here: once a binary holds
-//! any real `#[ktstr_test]` entry, `test_support::ktstr_main`
-//! intercepts nextest's `--list` and hides plain `#[test]`
-//! functions. The registration proof is in the entry's presence in
-//! the nextest list, not in a separate assertion.
+//! No standalone `#[test]` assertions are needed: the manually-
+//! registered entry surfaces in nextest's `--list` as a runnable
+//! test (`ktstr/external_context_marker`), and its presence there is
+//! the registration proof. Plain `#[test]` functions in such a
+//! binary stay visible too — `test_support::ktstr_main` intercepts
+//! `--list` but re-lists them via `list_plain_tests`.
 
 use anyhow::Result;
 use ktstr::assert::AssertResult;

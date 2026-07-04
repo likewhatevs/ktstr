@@ -38,7 +38,8 @@ use super::mountinfo::{needle_from_path, needle_from_path_with_mountinfo};
 /// `(major, minor)` via `/proc/self/mountinfo` and `inode` via
 /// `stat().st_ino`. Used by path-only callers ([`read_holders`],
 /// the `ktstr locks` observational scan, and the EWOULDBLOCK-branch
-/// peer-holder lookup in `cache.rs`). `acquire_llc_plan`'s DISCOVER
+/// peer-holder lookup in `src/cache/cache_dir.rs`).
+/// `acquire_llc_plan`'s DISCOVER
 /// phase uses [`super::mountinfo::needle_from_path_with_mountinfo`]
 /// instead so the mountinfo read amortizes across every LLC in one
 /// invocation.
@@ -204,9 +205,12 @@ mod tests {
 
     /// [`parse_flock_pids_for_needle`] deduplicates PIDs when a single
     /// process holds multiple FLOCK entries on the same lockfile
-    /// (e.g. the kernel emits one `lock:` line per OFD, and a
-    /// process that dup'd its fd has multiple OFDs on the same
-    /// inode). One PID per holder, regardless of how many entries.
+    /// (each `/proc/locks` line is prefixed with a numeric lock id +
+    /// colon like `N: FLOCK ...`, not a `lock:` token; a process gets
+    /// multiple FLOCK entries on one inode by open(2)ing the lockfile
+    /// more than once — each open is a distinct struct file, and
+    /// flock keys on the struct file, so dup/fork share one entry).
+    /// One PID per holder, regardless of how many entries.
     #[test]
     fn parse_flock_pids_for_needle_deduplicates_pids() {
         let needle = "08:02:1234";

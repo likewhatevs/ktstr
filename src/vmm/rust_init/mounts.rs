@@ -80,10 +80,11 @@ pub(crate) fn mount_filesystems() {
 ///
 /// Skips entirely when `KTSTR_DISK0_FS` is absent. The cmdline
 /// emission on the host side is gated on
-/// `disk.filesystem != Filesystem::Raw`, so this branch
-/// matches the host-side opt-in: every config that requests an
-/// on-disk filesystem gets the auto-mount, and every config that
-/// doesn't is unaffected.
+/// `disk.filesystem != Filesystem::Raw && !disk.no_auto_mount`, so
+/// this branch matches the host-side opt-in: a `Raw` disk or a disk
+/// built with `no_auto_mount` emits no `KTSTR_DISK0_FS` token and is
+/// not auto-mounted here, while every other config that requests an
+/// on-disk filesystem gets the auto-mount.
 pub(crate) fn auto_mount_data_disks() {
     let Some(fstype) = cmdline_val("KTSTR_DISK0_FS") else {
         return;
@@ -179,20 +180,6 @@ pub(crate) fn write_com2(msg: &str) {
     }
 }
 
-/// Create the cgroup parent directory specified by `--cell-parent-cgroup`
-/// (two-token or `=`-combined form) in `/sched_args`. The directory must
-/// exist before the scheduler starts because the scheduler expects it at
-/// startup.
-///
-/// In cgroup v2, a controller is only visible inside a cgroup when its
-/// parent's `cgroup.subtree_control` enables it. The kernel enforces
-/// this in `cgroup_subtree_control_write` via `cgroup_control(cgrp)`,
-/// which returns `parent->subtree_control` for non-root cgroups. To
-/// make `cpuset` and `cpu` available in the leaf, every ancestor from
-/// the cgroup root down to (and including) the leaf's immediate parent
-/// must enable both controllers. Writes are applied root-to-leaf so
-/// each level's prerequisite is already in place when its child is
-/// written.
 /// Materialise the per-test workload-cgroup root declared via
 /// `#[ktstr_test(workload_root_cgroup = "/path")]`. Reads
 /// `/workload_root_cgroup` (written by
@@ -264,6 +251,20 @@ fn create_cgroup_from_file(file: &str) {
     enable_subtree_controllers_to(&cgroup_dir);
 }
 
+/// Create the cgroup parent directory specified by `--cell-parent-cgroup`
+/// (two-token or `=`-combined form) in `/sched_args`. The directory must
+/// exist before the scheduler starts because the scheduler expects it at
+/// startup.
+///
+/// In cgroup v2, a controller is only visible inside a cgroup when its
+/// parent's `cgroup.subtree_control` enables it. The kernel enforces
+/// this in `cgroup_subtree_control_write` via `cgroup_control(cgrp)`,
+/// which returns `parent->subtree_control` for non-root cgroups. To
+/// make `cpuset` and `cpu` available in the leaf, every ancestor from
+/// the cgroup root down to (and including) the leaf's immediate parent
+/// must enable both controllers. Writes are applied root-to-leaf so
+/// each level's prerequisite is already in place when its child is
+/// written.
 #[tracing::instrument]
 pub(crate) fn create_cgroup_parent_from_sched_args() {
     let sched_args = match fs::read_to_string("/sched_args") {

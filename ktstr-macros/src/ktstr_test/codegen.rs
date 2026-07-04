@@ -51,6 +51,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         staged_schedulers,
         bpf_map_write,
         watch_bpf_maps,
+        perf_delta_assertions,
         post_vm,
         post_vm_unconditional,
         disk,
@@ -234,6 +235,14 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         _ => quote! { &[] },
     };
 
+    // `perf_delta_assertions = A` (one const) or `= [A, B]` (several): each
+    // PerfDeltaAssertion path is borrowed into a `&[&PerfDeltaAssertion]` slice,
+    // the same single-or-array grammar as `bpf_map_write`.
+    let perf_delta_assertions_tokens = match &perf_delta_assertions {
+        Some(paths) if !paths.is_empty() => quote! { &[ #(&#paths),* ] },
+        _ => quote! { &[] },
+    };
+
     // Emit `Option<&'static Payload>` for the primary payload. The
     // user supplies a path (`&FIO` equivalent in source), so we
     // wrap it in `Some(&#p)` at emission time to preserve the
@@ -398,6 +407,11 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         quote! { watch_bpf_maps },
         quote! { #watch_bpf_maps_tokens },
     );
+    let perf_delta_assertions_field = entry_field(
+        perf_delta_assertions.is_some(),
+        quote! { perf_delta_assertions },
+        quote! { #perf_delta_assertions_tokens },
+    );
     let performance_mode_field = entry_field(
         performance_mode_set,
         quote! { performance_mode },
@@ -469,7 +483,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     // `post_vm_unconditional` has no default — when the attribute
     // omits it, the field stays `None` (matching `KtstrTestEntry::DEFAULT`)
     // and the unconditional dispatch arm at
-    // `src/test_support/eval.rs` is a no-op for that entry.
+    // `src/test_support/eval/post_vm.rs` is a no-op for that entry.
     let post_vm_unconditional_field =
         some_wrapped_entry_field(&post_vm_unconditional, quote! { post_vm_unconditional });
     // `config = EXPR` lands in `KtstrTestEntry::config_content`, which
@@ -702,6 +716,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
             #watchdog_timeout_field
             #bpf_map_write_field
             #watch_bpf_maps_field
+            #perf_delta_assertions_field
             #performance_mode_field
             #pci_field
             #no_perf_mode_field

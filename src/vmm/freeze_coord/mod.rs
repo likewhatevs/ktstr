@@ -831,7 +831,7 @@ pub(super) enum FreezeMode<'a> {
 /// - `retain_tag`: set by the late-trigger Degraded / Suppressed
 ///   arms when their tagged-sibling write fails, so the drain
 ///   lands the recovered file at the operator-correct path rather
-///   than the default NEVER_FIRED tag (per N8-2 / #72).
+///   than the default NEVER_FIRED tag.
 ///
 /// Excluded from the guard (verified to NOT need panic-safe
 /// preservation):
@@ -980,6 +980,202 @@ fn has_bpf_scheduler_attached_inner<P: AsRef<std::path::Path>>(
     scheduler_binary.is_some()
 }
 
+/// Kick every still-running vCPU thread out of `KVM_RUN` and join them all,
+/// draining the guest-memory readers before the backing mmap unmaps. The
+/// caller MUST set `kill`, signal `kill_evt`, and clear `freeze` first so a
+/// parked AP observes the shutdown and exits promptly. Kicks + unparks each
+/// non-exited AP, epoll-waits on their `exit_evt`s with a 2 s deadline
+/// (re-kicking each cycle), then joins every handle. Shared by
+/// [`KtstrVm::collect_results`] and [`RunVmThreadGuard`]'s `Drop` so both
+/// drain the vCPU threads through the identical, deadlock-safe sequence.
+fn kick_and_join_ap_threads(ap_threads: Vec<VcpuThread>) {
+    for vt in &ap_threads {
+        if !vt.exited.load(Ordering::Acquire) {
+            vt.kick();
+        }
+        vt.handle.thread().unpark();
+    }
+    let mut remaining = ap_threads.len();
+    if remaining > 0
+        && let Ok(epoll) = Epoll::new()
+    {
+        for (i, vt) in ap_threads.iter().enumerate() {
+            if vt.exited.load(Ordering::Acquire) {
+                remaining -= 1;
+                continue;
+            }
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                vt.exit_evt.as_raw_fd(),
+                EpollEvent::new(EventSet::IN, i as u64),
+            );
+        }
+        if remaining > 0 {
+            let mut events = vec![EpollEvent::default(); remaining];
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while remaining > 0 {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                let ms = left.as_millis().min(i32::MAX as u128) as i32;
+                match epoll.wait(ms, &mut events) {
+                    Ok(0) => break,
+                    Ok(n) => remaining = remaining.saturating_sub(n),
+                    Err(_) => break,
+                }
+                for vt in &ap_threads {
+                    if !vt.exited.load(Ordering::Acquire) {
+                        vt.kick();
+                    }
+                }
+            }
+        }
+    }
+    for vt in ap_threads {
+        let _ = vt.handle.join();
+    }
+}
+
+/// Handles reclaimed from [`RunVmThreadGuard::disarm`] on the Ok path so the
+/// normal teardown owns them again (join the watchdog + coordinator before
+/// `bsp` drops; move the vCPU / monitor / bpf-write handles onto `VmRunState`).
+struct RunVmHandles {
+    ap_threads: Vec<VcpuThread>,
+    monitor: Option<JoinHandle<monitor::reader::MonitorLoopResult>>,
+    bpf_write: Option<JoinHandle<()>>,
+    freeze_coord: Option<JoinHandle<()>>,
+    watchdog: Option<JoinHandle<()>>,
+}
+
+/// RAII guard that joins the vCPU / monitor / bpf-write / freeze-coordinator /
+/// watchdog threads [`KtstrVm::run_vm`] spawns BEFORE the `vm` local (and its
+/// `guest_mem` mmap) drops, on EVERY exit path. The normal Ok teardown
+/// [`disarm`](Self::disarm)s it and joins the handles itself; any `?`
+/// early-return or panic-unwind between the first spawn and that teardown
+/// triggers `Drop` instead. Without it, an early exit DETACHES those threads —
+/// they hold BARE raw pointers into `vm.guest_mem` (no `Arc`) and run `KVM_RUN`,
+/// so touching that memory after `KtstrKvm::Drop` munmaps it is a host-side
+/// use-after-free (kernel fd teardown is refcounted, so the danger is purely the
+/// dangling host pointer). Accumulates handles as `run_vm` spawns them; mirrors
+/// the fixed two-handle `CrossThreadKickGuard` on the interactive path (a
+/// function-local struct in `run_interactive`, so it has no linkable path).
+///
+/// A partial spawn INSIDE `spawn_ap_threads` is covered by its own
+/// [`PartialApSpawnGuard`] (before this guard is armed), closing the
+/// guest_mem-reader detach window for the vCPUs spawned there. (The sched-stats
+/// drainer is NOT a guest_mem reader: its only device call, `drain_port2_bulk`,
+/// swaps a host-side `tx_buf` VecDeque the vCPU thread already copied into via
+/// `process_tx` — it never dereferences the `virtio_con` guest-memory handle —
+/// so it needs no join here and its `ClientShared::drop` stays signal-only.)
+///
+/// Declared AFTER `bsp` so it drops — and joins the watchdog + coordinator that
+/// hold `bsp`'s `ImmediateExitHandle` — BEFORE `bsp` drops; and, as a function
+/// local while `vm` is a parameter, BEFORE `vm` drops (parameters drop last).
+struct RunVmThreadGuard {
+    ap_threads: Vec<VcpuThread>,
+    monitor: Option<JoinHandle<monitor::reader::MonitorLoopResult>>,
+    bpf_write: Option<JoinHandle<()>>,
+    freeze_coord: Option<JoinHandle<()>>,
+    watchdog: Option<JoinHandle<()>>,
+    kill: Arc<AtomicBool>,
+    kill_evt: Arc<EventFd>,
+    freeze: Arc<AtomicBool>,
+    bsp_done: Arc<AtomicBool>,
+    bsp_done_evt: Arc<EventFd>,
+}
+
+impl RunVmThreadGuard {
+    /// Reclaim every handle on the Ok path, leaving the guard empty so its
+    /// `Drop` joins nothing. The caller then runs the normal teardown.
+    fn disarm(&mut self) -> RunVmHandles {
+        RunVmHandles {
+            ap_threads: std::mem::take(&mut self.ap_threads),
+            monitor: self.monitor.take(),
+            bpf_write: self.bpf_write.take(),
+            freeze_coord: self.freeze_coord.take(),
+            watchdog: self.watchdog.take(),
+        }
+    }
+}
+
+impl Drop for RunVmThreadGuard {
+    fn drop(&mut self) {
+        if self.ap_threads.is_empty()
+            && self.monitor.is_none()
+            && self.bpf_write.is_none()
+            && self.freeze_coord.is_none()
+            && self.watchdog.is_none()
+        {
+            return; // disarmed on the Ok path — nothing to join
+        }
+        // Early-return / panic-unwind cleanup. Replicate the Ok teardown's EXACT
+        // stop sequence: set `bsp_done` (+ its evt) so the freeze-coordinator
+        // takes its clean bsp-done exit rather than the sched-exit crash-final
+        // pass (its outer loop DOES terminate on `kill` alone via that pass, but
+        // bsp_done is the correct teardown signal the Ok path also uses), then
+        // set `kill` (+ its evt) and clear `freeze`. Join the WATCHDOG and
+        // COORDINATOR first: they hold the vCPUs' `ImmediateExitHandle`s, so
+        // joining a vCPU (which drops its `kvm_run` mmap) while a coordinator
+        // still kicks it would be a use-after-free — the kickers must be
+        // quiesced before their targets.
+        self.bsp_done.store(true, Ordering::Release);
+        let _ = self.bsp_done_evt.write(1);
+        self.kill.store(true, Ordering::Release);
+        let _ = self.kill_evt.write(1);
+        self.freeze.store(false, Ordering::Release);
+        if let Some(h) = self.watchdog.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.freeze_coord.take() {
+            let _ = h.join();
+        }
+        kick_and_join_ap_threads(std::mem::take(&mut self.ap_threads));
+        if let Some(h) = self.monitor.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.bpf_write.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// RAII guard over `spawn_ap_threads`' partially-built vCPU thread set. Each AP
+/// thread begins `KVM_RUN` against `vm.guest_mem` the instant it spawns, so if a
+/// LATER per-AP `?` fails mid-loop (the exit-eventfd alloc or the thread spawn),
+/// the already-spawned APs are live. Without this guard the local
+/// `Vec<VcpuThread>` would drop and DETACH them (`VcpuThread` has no `Drop`), and
+/// the caller's `vm` would then munmap guest_mem under them — the same host-side
+/// use-after-free [`RunVmThreadGuard`] covers, but for the window INSIDE
+/// `spawn_ap_threads`, before the outer guard is armed. `Drop` signals kill +
+/// clears freeze and joins the partial set via [`kick_and_join_ap_threads`]; the
+/// success path [`disarm`](Self::disarm)s it so `Drop` joins nothing.
+struct PartialApSpawnGuard {
+    ap_threads: Vec<VcpuThread>,
+    kill: Arc<AtomicBool>,
+    kill_evt: Arc<EventFd>,
+    freeze: Arc<AtomicBool>,
+}
+
+impl PartialApSpawnGuard {
+    /// Reclaim the fully-spawned set on success, leaving the guard empty.
+    fn disarm(&mut self) -> Vec<VcpuThread> {
+        std::mem::take(&mut self.ap_threads)
+    }
+}
+
+impl Drop for PartialApSpawnGuard {
+    fn drop(&mut self) {
+        if self.ap_threads.is_empty() {
+            return; // disarmed on success (or a zero-AP / first-AP failure)
+        }
+        self.kill.store(true, Ordering::Release);
+        let _ = self.kill_evt.write(1);
+        self.freeze.store(false, Ordering::Release);
+        kick_and_join_ap_threads(std::mem::take(&mut self.ap_threads));
+    }
+}
+
 impl KtstrVm {
     /// Spawn threads and run the BSP. Returns all state needed for
     /// `collect_results`.
@@ -1113,7 +1309,8 @@ impl KtstrVm {
         // host owns the entire capture pipeline.
         // Allocate the accessor-init worker's publish-seqno + worker-
         // state atomics here so the snapshot bridge below adopts the
-        // same Arc the worker (spawned much later at L2237+) bumps on
+        // same Arc the worker (the `vmm-accessor-init` worker,
+        // spawned much later) bumps on
         // every successful publish / state transition. The dispatch
         // for `Op::ReplaceScheduler` / `Op::AttachScheduler` reads the
         // seqno via the thread-local bridge and waits for it to
@@ -1472,6 +1669,16 @@ impl KtstrVm {
             })
             .collect();
 
+        // BSP-done signal pair, hoisted above the first thread spawn so the
+        // `RunVmThreadGuard` below can carry it (its Drop signals `bsp_done` so
+        // the freeze coordinator takes its clean teardown exit — see the guard's
+        // `Drop`) and so its fallible `EventFd` alloc is no longer a post-spawn `?`
+        // early-return window. `bsp_done` flips true when the BSP exits its run
+        // loop; `bsp_done_evt` (EFD_NONBLOCK, so a doubled write from the panic
+        // hook + post-loop store cannot stall) wakes the coordinator's epoll.
+        let bsp_done = Arc::new(AtomicBool::new(false));
+        let bsp_done_evt = Arc::new(EventFd::new(EFD_NONBLOCK).context("create bsp_done EventFd")?);
+
         let (ap_threads, ap_freeze_handles) = self.spawn_ap_threads(
             vcpus,
             has_immediate_exit,
@@ -1493,6 +1700,27 @@ impl KtstrVm {
             Some(&thaw_evt),
         )?;
 
+        // UAF guard: from the first spawn onward, any `?` early-return or panic
+        // between here and the Ok teardown must join every spawned thread before
+        // `vm`/`guest_mem` drops (the threads hold bare raw pointers into
+        // guest_mem). The guard owns `ap_threads` (borrowed below via
+        // `guard.ap_threads`) and accumulates the monitor / bpf-write /
+        // coordinator / watchdog handles as they spawn; the Ok path `disarm`s it.
+        // Declared after `bsp` (above) so it joins the watchdog + coordinator
+        // (which hold bsp's ImmediateExitHandle) before `bsp` drops.
+        let mut guard = RunVmThreadGuard {
+            ap_threads,
+            monitor: None,
+            bpf_write: None,
+            freeze_coord: None,
+            watchdog: None,
+            kill: kill.clone(),
+            kill_evt: kill_evt.clone(),
+            freeze: freeze.clone(),
+            bsp_done: bsp_done.clone(),
+            bsp_done_evt: bsp_done_evt.clone(),
+        };
+
         // Pin / mask BSP (runs on current thread, pid=0 means calling thread).
         if let Some(Some(host_cpu)) = pin_targets.first() {
             pin_current_thread(*host_cpu, "BSP (vCPU 0)");
@@ -1506,9 +1734,9 @@ impl KtstrVm {
         // Collect vCPU pthread_t handles for monitor stall detection.
         // BSP runs on the current thread; APs have spawned threads.
         let vcpu_pthreads = {
-            let mut pts = Vec::with_capacity(1 + ap_threads.len());
+            let mut pts = Vec::with_capacity(1 + guard.ap_threads.len());
             pts.push(unsafe { libc::pthread_self() } as libc::pthread_t);
-            for vt in &ap_threads {
+            for vt in &guard.ap_threads {
                 pts.push(vt.handle.as_pthread_t() as libc::pthread_t);
             }
             pts
@@ -1662,6 +1890,10 @@ impl KtstrVm {
             kern_phys_base_evt.clone(),
             kern_virt_kaslr.clone(),
         )?;
+        // Hand the monitor handle to the guard so an early-return past here
+        // joins it before guest_mem drops (the monitor holds a bare raw pointer
+        // into guest_mem). Reclaimed by `guard.disarm()` on the Ok path.
+        guard.monitor = monitor_handle;
         let watchdog_reset_for_coord = watchdog_reset_ns.clone();
         let watchdog_pause_ns: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1737,6 +1969,9 @@ impl KtstrVm {
             virtio_con.clone(),
             kern_phys_base.clone(),
         )?;
+        // Same as the monitor: the bpf-map-write thread holds a raw pointer into
+        // guest_mem, so the guard must join it on an early-return past here.
+        guard.bpf_write = bpf_write_handle;
 
         // Run BSP on this thread.
         register_vcpu_signal_handler();
@@ -1749,7 +1984,7 @@ impl KtstrVm {
             None
         };
         let bsp_tid = unsafe { libc::pthread_self() };
-        let bsp_done = Arc::new(AtomicBool::new(false));
+        // `bsp_done` is created above (hoisted before the first spawn).
         let bsp_done_for_wd = bsp_done.clone();
         // BSP-IE-handle liveness gate. The freeze coordinator's
         // captured `ImmediateExitHandle` for the BSP addresses the
@@ -1764,13 +1999,7 @@ impl KtstrVm {
         // BSP-side immediate_exit write on `bsp_alive.load(Acquire)`.
         let bsp_alive = Arc::new(AtomicBool::new(true));
         let bsp_alive_for_coord = bsp_alive.clone();
-        // Wake fd paired with `bsp_done`. Setters (run_vm post-loop,
-        // BSP panic hook) flip the AtomicBool AND write `1` to this
-        // EventFd so the freeze coordinator's epoll wait returns
-        // immediately. Mirrors the `kill` / `kill_evt` pair above.
-        // EFD_NONBLOCK so a doubled write (panic hook AND post-loop
-        // store) cannot stall — either edge is sufficient.
-        let bsp_done_evt = Arc::new(EventFd::new(EFD_NONBLOCK).context("create bsp_done EventFd")?);
+        // `bsp_done_evt` is created above (hoisted before the first spawn).
         let kill_for_watchdog = kill.clone();
         let timed_out_for_watchdog = timed_out_flag.clone();
         // Wake fds the watchdog blocks on via epoll, paired with the
@@ -2108,7 +2337,8 @@ impl KtstrVm {
             parked: freeze_coord_ap_parked,
             regs: freeze_coord_ap_regs,
         } = ap_freeze_handles;
-        let freeze_coord_ap_pthreads: Vec<libc::pthread_t> = ap_threads
+        let freeze_coord_ap_pthreads: Vec<libc::pthread_t> = guard
+            .ap_threads
             .iter()
             .map(|vt| vt.handle.as_pthread_t() as libc::pthread_t)
             .collect();
@@ -2118,8 +2348,11 @@ impl KtstrVm {
         // inside VcpuThread) and the coordinator's copy — single-byte
         // volatile writes through `set` from either side address the
         // same MAP_SHARED page.
-        let freeze_coord_ap_ies: Vec<Option<ImmediateExitHandle>> =
-            ap_threads.iter().map(|vt| vt.immediate_exit).collect();
+        let freeze_coord_ap_ies: Vec<Option<ImmediateExitHandle>> = guard
+            .ap_threads
+            .iter()
+            .map(|vt| vt.immediate_exit)
+            .collect();
         // Per-AP `alive` flags paired with the IE handles above. The
         // coordinator's pass-1 kick (in `freeze_and_dispatch`) and
         // `arm_user_watchpoint` gate each `ie.set` on a fresh
@@ -2135,12 +2368,12 @@ impl KtstrVm {
         // (or `zip`) so a future change that drops or reorders any
         // one Vec is loud about the regression.
         let freeze_coord_ap_alive: Vec<Arc<AtomicBool>> =
-            ap_threads.iter().map(|vt| vt.alive.clone()).collect();
+            guard.ap_threads.iter().map(|vt| vt.alive.clone()).collect();
         // Total vCPU count (BSP + APs). Forwarded into dump_state so
         // PERCPU_ARRAY map rendering knows how many per-CPU slots to
         // read — `bpf_array.pptrs[k]` is a `void __percpu *` whose
         // per-CPU expansion needs `__per_cpu_offset[0..nr_cpu_ids]`.
-        let freeze_coord_num_cpus = (ap_threads.len() + 1) as u32;
+        let freeze_coord_num_cpus = (guard.ap_threads.len() + 1) as u32;
         // NUMA node count from the configured topology. Forwarded
         // into the scx walker (per-node global DSQ pass) and the
         // per-node NUMA event walker. Defaults to 1 on UMA topologies.
@@ -2240,7 +2473,7 @@ impl KtstrVm {
         // and drains the per-frame `BulkMessage` values. Without
         // this buffer those messages would be discarded after the
         // SCHED_EXIT scan, leaving `collect_results` blind to every
-        // EXIT / TEST / PAYLOAD_METRICS / RAW_PAYLOAD_OUTPUT /
+        // EXIT / TEST / PAYLOAD_METRICS /
         // PROFRAW frame the guest already published mid-run. The
         // post-exit `drain_bulk()` only catches what arrived AFTER
         // the coordinator stopped draining — not the bulk of a
@@ -2323,7 +2556,7 @@ impl KtstrVm {
         // existing slot value).
         let kern_virt_kaslr_for_bsp = kern_virt_kaslr.clone();
         // Clone the publish-EventFd for the BSP MSR_LSTAR-derive path
-        // (mirrors the KERN_ADDRS-side write at dispatch.rs:427) so
+        // (mirrors the KERN_ADDRS-side write at dispatch.rs:547) so
         // both publishers signal the same eventfd on successful CAS.
         // No production consumer epolls this fd today, but the
         // asymmetry would foot-gun a future change that does.
@@ -2340,11 +2573,11 @@ impl KtstrVm {
         let rendezvous_timeout = self.rendezvous_timeout.unwrap_or(FREEZE_RENDEZVOUS_TIMEOUT);
         // Cache vm.vm_fd's raw fd (Copy = i32) before the
         // freeze-coord spawn. The spawned closure is `move ||` —
-        // capturing vm directly would consume it and break L8888
+        // capturing vm directly would consume it and break L10885
         // construction of VmRunState. The raw fd is owned by
         // `vm.vm_fd` (in the outer scope) and stays valid for the
         // entire `run_vm` lifetime; coord-thread joins via
-        // `freeze_coord_handle.join()` at L8825 before vm drops.
+        // `freeze_coord_handle.join()` at L10832 before vm drops.
         // Used by the kvm_clock save/restore path inside
         // freeze_and_dispatch + thaw_and_barrier closures via
         // [`kvm_get_clock_via_raw_fd`] +
@@ -2363,7 +2596,7 @@ impl KtstrVm {
                 // we have a cr3_pa / page_offset / l5 view).
                 struct RunnableScanCtx {
                     /// KVA of the kernel's global `scx_tasks` LIST_HEAD
-                    /// (`kernel/sched/ext.c:47`). The walker reads
+                    /// (`kernel/sched/ext.c:48`). The walker reads
                     /// `scx_tasks.next` via the runtime kernel image
                     /// base ([`Self::start_kernel_map`]) and
                     /// container_of's each list entry back to its
@@ -2381,8 +2614,8 @@ impl KtstrVm {
                     offsets: crate::monitor::btf_offsets::RunnableScanOffsets,
                     jiffies_64_pa: u64,
                     /// PA of `scx_watchdog_timestamp`
-                    /// (`kernel/sched/ext.c:94`). The kernel's
-                    /// `scx_tick` (`kernel/sched/ext.c:3409`) compares
+                    /// (`kernel/sched/ext.c:93`). The kernel's
+                    /// `scx_tick` (`kernel/sched/ext.c:3492`) compares
                     /// `jiffies - scx_watchdog_timestamp` against the
                     /// scheduler's `watchdog_timeout` and fires
                     /// `SCX_EXIT_ERROR_STALL` when the workqueue
@@ -2767,7 +3000,7 @@ impl KtstrVm {
                                             // capture into the final scenario step (collapsing
                                             // the per-phase pipeline to one bucket). The KASLR
                                             // text offset still arrives via KERN_ADDRS for the
-                                            // kaslr publish gate (~L7751); only the map-accessor
+                                            // kaslr publish gate (~L8204); only the map-accessor
                                             // build is unblocked here. The host runs the guest
                                             // same-arch under KVM, so cfg!(target_arch) is the
                                             // guest arch. x86_64 keeps waiting for the real
@@ -4275,7 +4508,7 @@ impl KtstrVm {
                             // (cpu_time, prog_runtime_stats, scx)
                             // resolves to wrong KVAs and reads zero
                             // values from random pages. Sibling
-                            // `compute_rq_pas` at L4101-4127 uses
+                            // `compute_rq_pas` at L4827 uses
                             // `kernel.text_kva_to_pa` which threads
                             // the live `phys_base` from the accessor
                             // — same source-of-truth.
@@ -5703,13 +5936,15 @@ impl KtstrVm {
                                     + if worker_was_running { 1 } else { 0 };
                             let deadline = Instant::now() + rendezvous_timeout;
                             // Sub-deadline for the virtio-blk worker
-                            // ack. `device.rs::stop_worker_and_reclaim_state`
-                            // (and any sibling shutdown path) writes
-                            // `paused.store(false, Release)` BEFORE
+                            // ack. The `Drop` shutdown path
+                            // (`lifecycle.rs`) and its reset sibling
+                            // (`control.rs::stop_worker_and_reclaim_state`)
+                            // write `paused.store(false, Release)` BEFORE
                             // signalling stop_fd and joining the
-                            // worker — see lines around device.rs
-                            // 3561 (`self.paused.store(false,
-                            // Ordering::Release)` + `signal_worker_stop`).
+                            // worker — see `lifecycle.rs:427`
+                            // (`self.paused.store(false,
+                            // Ordering::Release)`) + `lifecycle.rs:436`
+                            // (`signal_worker_stop`).
                             // Between that store and the worker
                             // exiting (with no further `paused=true`
                             // store on the shutdown path), the
@@ -5727,7 +5962,7 @@ impl KtstrVm {
                             // cache (the same envelope
                             // `DROP_JOIN_TIMEOUT` (1 s) commits to
                             // for the worker join in
-                            // `device.rs`). If the worker hasn't
+                            // `lifecycle.rs`). If the worker hasn't
                             // parked within 1 s, it's likely
                             // mid-shutdown (signal_worker_stop
                             // pre-clears paused=false). Dropping
@@ -6068,7 +6303,7 @@ impl KtstrVm {
                                 // rather than Degraded — Capture-mode's
                                 // Degraded carries vcpu_regs +
                                 // DegradedFailureDumpReport which the
-                                // L6614 ColdOp caller cannot consume
+                                // L8119 ColdOp caller cannot consume
                                 // (it expects KernelOp). Build a typed
                                 // error reply naming the rendezvous
                                 // failure so the wire reply correlates
@@ -6234,7 +6469,7 @@ impl KtstrVm {
                             // the Capture-mode exit-kind gate + dump
                             // pipeline below. Returns
                             // FreezeOutcome::KernelOp(reply) directly so
-                            // the L6614 stub-replacement call site can
+                            // the L8119 stub-replacement call site can
                             // frame the wire reply without traversing the
                             // dump path. Capture mode falls through.
                             if let FreezeMode::ColdOp(req) = &mode {
@@ -6246,7 +6481,7 @@ impl KtstrVm {
                                         req,
                                     )
                                 } else {
-                                    // Caller at L6614 should gate on
+                                    // Caller at L8119 should gate on
                                     // owned_accessor.is_some() before
                                     // invoking; defensive error frame if
                                     // it slipped through unset. No panic
@@ -6841,11 +7076,11 @@ impl KtstrVm {
                                 // the cpu_time walker's prereqs are
                                 // strictly tied to BOTH of the partial-
                                 // path triggers (cf. cpu_time_capture
-                                // construction at L5923):
+                                // construction at L6615):
                                 //   - if we're here because
                                 //     `owned_accessor.is_none()`,
                                 //     `prog_per_cpu_offsets` is also None
-                                //     (its lazy-init at L3569 gates on
+                                //     (its lazy-init at L4229 gates on
                                 //     owned_accessor.is_some() so
                                 //     `phys_base` is the real KASLR
                                 //     displacement, not the bootstrap 0
@@ -6854,9 +7089,9 @@ impl KtstrVm {
                                 //     under KASLR-on guests).
                                 //   - if we're here because `dump_btf.is_none()`,
                                 //     `dump_cpu_time_offsets` (BTF-derived
-                                //     at L2580) is also None.
+                                //     at L2989) is also None.
                                 // Either way the cpu_time_capture 4-prereq
-                                // match at L5923 falls to `None` and the
+                                // match at L6615 falls to `None` and the
                                 // walker can't run. Hardcoded empty here
                                 // matches that result without re-walking
                                 // the prereqs at this site.
@@ -8038,7 +8273,7 @@ impl KtstrVm {
                             //     incomplete" from "publish complete
                             //     with offset 0".
                             // Same pattern as the WATCH-deferral at
-                            // L6864-6900; defer + drain when both
+                            // L7767; defer + drain when both
                             // prerequisites land.
                             tracing::info!(
                                 request_id = req.request_id,
@@ -8230,8 +8465,8 @@ impl KtstrVm {
                             // workload-start.
                             //
                             // Fallback: a scheduler that breaks the
-                            // bulk port (the sibling-reported
-                            // scx_mitosis cell-mode case where the
+                            // bulk port (the scx_mitosis cell-mode
+                            // case where the
                             // guest never gets to / completes
                             // send_scenario_start) leaves
                             // scenario_start_ns at 0 forever and the
@@ -8367,8 +8602,8 @@ impl KtstrVm {
                                 // loss class bug — the field is
                                 // populated but every counter is
                                 // 0). Same rationale as the ColdOp
-                                // gate at L7198 and the WATCH gate
-                                // at L7166: defer until the
+                                // gate at L8013 and the WATCH gate
+                                // at L7767: defer until the
                                 // publisher (BSP MSR_LSTAR on
                                 // x86_64 OR guest-channel KERN_ADDRS
                                 // on both arches) lands. Under
@@ -8382,10 +8617,10 @@ impl KtstrVm {
                                 //
                                 // `owned_accessor` is the second
                                 // half of the prereq set: the FULL
-                                // dump path at L5770 only enters
+                                // dump path at L6479 only enters
                                 // when the accessor is adopted;
                                 // otherwise the dump falls through
-                                // to the PARTIAL path at L6075
+                                // to the PARTIAL path at L6838
                                 // which hard-codes `per_cpu_time:
                                 // Vec::new()` and skips every other
                                 // walker output (maps, prog
@@ -8929,7 +9164,7 @@ impl KtstrVm {
                         // silent-mis-attribution this stamping was
                         // meant to prevent. Acquire pairs with the
                         // scenario writer's Release at
-                        // `src/scenario/ops/mod.rs:903`.
+                        // `src/scenario/ops/mod.rs:1194`.
                         let trip_phase_step_index =
                             freeze_coord_current_step.load(Ordering::Acquire);
                         // User watchpoint has no while-frozen work,
@@ -10386,6 +10621,10 @@ impl KtstrVm {
                 eprintln!("CLEANUP: coord closure done {:?}", coord_exit_t.elapsed());
             })
             .context("spawn freeze coordinator thread")?;
+        // The coordinator holds bsp + AP ImmediateExitHandles and a raw pointer
+        // into guest_mem; the guard joins it (before bsp/vm drop) on an
+        // early-return past here — e.g. the watchdog spawn `?` just below.
+        guard.freeze_coord = Some(freeze_coord_handle);
 
         let watchdog = std::thread::Builder::new()
             .name("vmm-watchdog".into())
@@ -10672,6 +10911,16 @@ impl KtstrVm {
                 }
             })
             .context("spawn watchdog thread")?;
+        // Last spawn: the watchdog holds bsp's ImmediateExitHandle. With it in
+        // the guard, the guard now owns every spawned thread. Under panic=unwind
+        // (test profile) a panic in the BSP loop below unwinds through the
+        // guard's Drop, which joins them all before bsp/vm drop; under
+        // panic=abort (release) the process aborts instead — no detached thread
+        // survives to touch freed memory, so that path is UAF-safe too. The
+        // normal return disarms the guard just before the watchdog/coordinator
+        // joins (deferred past the infallible post-loop teardown, so a panic
+        // there is still covered).
+        guard.watchdog = Some(watchdog);
 
         // BSP run loop. Wrapped in the same `with_vcpu_panic_ctx`
         // scope the APs use (symmetric panic-hook signaling) —
@@ -10734,6 +10983,12 @@ impl KtstrVm {
                 )
             },
         );
+        // BSP loop returned normally (Ok path). Keep the guard ARMED through the
+        // infallible teardown below (bsp_done / kill stores, eprintln, x86 route
+        // tracing) and disarm it only just before the watchdog / coordinator
+        // join — so a panic anywhere in this window (defense-in-depth against a
+        // future fallible op added here) still joins every spawned thread before
+        // bsp / vm drop rather than detaching them.
         bsp_done.store(true, Ordering::Release);
         // Wake the freeze coordinator's epoll loop. Failure
         // (counter overflow / EAGAIN under EFD_NONBLOCK) is benign
@@ -10804,10 +11059,31 @@ impl KtstrVm {
             }
         }
 
+        // Disarm the guard and reclaim every handle for the joins below; from
+        // here its Drop is a no-op. Deferred to this point (not right after the
+        // BSP loop) so the guard covers the infallible post-loop teardown above.
+        // The watchdog/coord joins below consume these handles, so the disarm
+        // cannot move past them; the post-join `read_tcr_el1` / `read_cr3`
+        // catch-up reads (which must follow the coordinator join to avoid a
+        // cache race) then run after this disarm — but they are infallible
+        // `.ok()` reads with no panic site, a pre-existing sliver unchanged by
+        // this fix. The `watchdog` / `freeze_coord_handle` bindings are `Option`
+        // (always `Some` here — reached only after both spawned successfully).
+        let RunVmHandles {
+            ap_threads,
+            monitor: monitor_handle,
+            bpf_write: bpf_write_handle,
+            freeze_coord: freeze_coord_handle,
+            watchdog,
+        } = guard.disarm();
+
         // Join the watchdog before dropping `bsp`. The watchdog holds an
         // ImmediateExitHandle pointing into bsp's kvm_run mmap. If bsp is
         // dropped first, the watchdog may write to unmapped memory.
-        let _ = watchdog.join();
+        // (`Some` here — disarmed from the guard after a successful spawn.)
+        if let Some(h) = watchdog {
+            let _ = h.join();
+        }
         eprintln!("CLEANUP: watchdog joined");
 
         // Join the freeze coordinator BEFORE `bsp` falls out of scope at
@@ -10829,7 +11105,10 @@ impl KtstrVm {
         // that point the coordinator thread is gone and the gate is
         // belt-and-braces for any future restructuring that could
         // share the BSP IE handle outside this lifecycle.
-        let _ = freeze_coord_handle.join();
+        // (`Some` here — disarmed from the guard after a successful spawn.)
+        if let Some(h) = freeze_coord_handle {
+            let _ = h.join();
+        }
         eprintln!("CLEANUP: freeze_coord joined");
         bsp_alive.store(false, Ordering::Release);
 
@@ -11003,7 +11282,16 @@ impl KtstrVm {
         vcpu_panic::install_once();
         let n = vcpus.len();
         debug_assert_eq!(ap_tid_slots.len(), n);
-        let mut ap_threads: Vec<VcpuThread> = Vec::with_capacity(n);
+        // Guard the partially-built AP set: a mid-loop `?` below (exit-eventfd
+        // alloc / thread spawn) must kick+join the already-spawned APs before
+        // the caller's `vm` munmaps guest_mem — the outer RunVmThreadGuard is
+        // not armed until spawn_ap_threads returns. Disarmed on success.
+        let mut spawn_guard = PartialApSpawnGuard {
+            ap_threads: Vec::with_capacity(n),
+            kill: kill.clone(),
+            kill_evt: kill_evt.clone(),
+            freeze: freeze.clone(),
+        };
         let mut freeze_parked: Vec<Arc<AtomicBool>> = Vec::with_capacity(n);
         let mut freeze_regs: Vec<Arc<std::sync::Mutex<Option<exit_dispatch::VcpuRegSnapshot>>>> =
             Vec::with_capacity(n);
@@ -11164,7 +11452,7 @@ impl KtstrVm {
                 })
                 .with_context(|| format!("spawn vCPU {} thread", i + 1))?;
 
-            ap_threads.push(VcpuThread {
+            spawn_guard.ap_threads.push(VcpuThread {
                 handle,
                 exited,
                 immediate_exit: ie_handle,
@@ -11174,6 +11462,8 @@ impl KtstrVm {
             freeze_parked.push(parked);
             freeze_regs.push(regs);
         }
+        // All APs spawned — reclaim the set so the guard's Drop is a no-op.
+        let ap_threads = spawn_guard.disarm();
         Ok((
             ap_threads,
             ApFreezeHandles {
@@ -11444,6 +11734,8 @@ impl KtstrVm {
                             preemption_threshold_ns,
                             boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
                             scx_event_counters_supported,
+                            // Monitor torn down before sampling: no live prog seen.
+                            verified_insns: Vec::new(),
                         };
                     }
                     let kill_fd = kill_evt_clone.as_raw_fd();
@@ -11501,6 +11793,8 @@ impl KtstrVm {
                             preemption_threshold_ns,
                             boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
                             scx_event_counters_supported,
+                            // Monitor torn down before sampling: no live prog seen.
+                            verified_insns: Vec::new(),
                         };
                     }
                 }
@@ -11644,6 +11938,8 @@ impl KtstrVm {
                         preemption_threshold_ns,
                         boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
                         scx_event_counters_supported,
+                        // Monitor torn down before sampling: no live prog seen.
+                        verified_insns: Vec::new(),
                     };
                 }
 
@@ -11745,6 +12041,8 @@ impl KtstrVm {
                         preemption_threshold_ns,
                         boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
                         scx_event_counters_supported,
+                        // Monitor torn down before sampling: no live prog seen.
+                        verified_insns: Vec::new(),
                     };
                 }
 
@@ -11892,6 +12190,8 @@ impl KtstrVm {
                         preemption_threshold_ns,
                         boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
                         scx_event_counters_supported,
+                        // Monitor torn down before sampling: no live prog seen.
+                        verified_insns: Vec::new(),
                     };
                 }
                 // aarch64 TCR_EL1 (granule + T1SZ) for the
@@ -11972,6 +12272,8 @@ impl KtstrVm {
                         preemption_threshold_ns,
                         boot_wait_outcome: monitor::BootWaitOutcome::NotConfigured,
                         scx_event_counters_supported,
+                        // Monitor torn down before sampling: no live prog seen.
+                        verified_insns: Vec::new(),
                     };
                 }
 
@@ -12511,7 +12813,9 @@ impl KtstrVm {
         // via `msr_kaslr::read_and_derive` on x86_64 between vCPU
         // run iterations; on success it CAS-publishes the
         // `(offset + 1)` here so the monitor + dump pipelines
-        // (`freeze_coord/mod.rs:9130` and `freeze_coord/mod.rs:5202`)
+        // (the dump-path `CpuTimeCapture` construction and the
+        // monitor's `RqRefresh` / `text_kva_to_pa_with_base` sites
+        // in `start_monitor`)
         // can resolve per-CPU `rq` / `kernel_cpustat` / `kstat`
         // KVAs under `CONFIG_RANDOMIZE_BASE=y`. The guest-channel
         // KERN_ADDRS path also CAS-publishes here (from the coord
@@ -12654,7 +12958,7 @@ impl KtstrVm {
             // MSR_LSTAR from the TD-emulated allow-list.
             // Fail-loud, not silent-garbage. The
             // `is_retryable()` / `LstarUnsupported` gate at
-            // msr_kaslr.rs:209-225 surfaces this as
+            // msr_kaslr.rs:243 surfaces this as
             // `LstarDeriveError`; the wait-loop falls through to
             // the guest-channel KERN_ADDRS `_text` publisher
             // (`dispatch.rs`) or the `nokaslr` cmdline arg
@@ -12677,7 +12981,7 @@ impl KtstrVm {
                     .is_ok()
             {
                 // Mirror the KERN_ADDRS-path evt fire at
-                // dispatch.rs:427 so any future epoll-on-publish
+                // dispatch.rs:547 so any future epoll-on-publish
                 // consumer (none today, but the eventfd is in
                 // the run-loop fdset and the asymmetry would
                 // foot-gun a future change). No-op on signal-fd
@@ -12891,7 +13195,7 @@ impl KtstrVm {
     /// favors skipping the walk entirely.
     ///
     /// Sibling to the inline check at `stats_client`
-    /// construction (~L1126) which uses `self.scheduler_binary.
+    /// construction (~L1386) which uses `self.scheduler_binary.
     /// is_some()` directly — both gates ask the same
     /// "is there a userspace BPF binary attached" question
     /// and share the same answer.
@@ -12930,17 +13234,6 @@ impl KtstrVm {
         // freeze clears.
         run.freeze.store(false, Ordering::Release);
 
-        // Kick APs out of KVM_RUN. Skip APs that already exited —
-        // their VcpuFd (and kvm_run mmap) may be dropped, so writing
-        // to ImmediateExitHandle would hit unmapped memory. Unpark
-        // each so a parked AP observes the cleared freeze flag
-        // promptly without waiting for the 10ms park_timeout.
-        for vt in &run.ap_threads {
-            if !vt.exited.load(Ordering::Acquire) {
-                vt.kick();
-            }
-            vt.handle.thread().unpark();
-        }
         // The freeze coordinator was joined inside `run_vm` BEFORE
         // bsp dropped (preventing UAF on the BSP ImmediateExitHandle),
         // so `run.freeze_coordinator` is always `None` here. The
@@ -12951,48 +13244,11 @@ impl KtstrVm {
         if let Some(h) = run.freeze_coordinator {
             let _ = h.join();
         }
-        {
-            let mut remaining = run.ap_threads.len();
-            if remaining > 0
-                && let Ok(epoll) = Epoll::new()
-            {
-                for (i, vt) in run.ap_threads.iter().enumerate() {
-                    if vt.exited.load(Ordering::Acquire) {
-                        remaining -= 1;
-                        continue;
-                    }
-                    let _ = epoll.ctl(
-                        ControlOperation::Add,
-                        vt.exit_evt.as_raw_fd(),
-                        EpollEvent::new(EventSet::IN, i as u64),
-                    );
-                }
-                if remaining > 0 {
-                    let mut events = vec![EpollEvent::default(); remaining];
-                    let deadline = Instant::now() + Duration::from_secs(2);
-                    while remaining > 0 {
-                        let left = deadline.saturating_duration_since(Instant::now());
-                        if left.is_zero() {
-                            break;
-                        }
-                        let ms = left.as_millis().min(i32::MAX as u128) as i32;
-                        match epoll.wait(ms, &mut events) {
-                            Ok(0) => break,
-                            Ok(n) => remaining = remaining.saturating_sub(n),
-                            Err(_) => break,
-                        }
-                        for vt in &run.ap_threads {
-                            if !vt.exited.load(Ordering::Acquire) {
-                                vt.kick();
-                            }
-                        }
-                    }
-                }
-            }
-            for vt in run.ap_threads {
-                let _ = vt.handle.join();
-            }
-        }
+        // Kick + join every vCPU thread via the shared helper — the same
+        // deadlock-safe drain (kick + unpark + epoll-wait with deadline, then
+        // join) that `RunVmThreadGuard`'s `Drop` runs on the early-return path.
+        // `kill` / `kill_evt` / `freeze` were set above, as the helper requires.
+        kick_and_join_ap_threads(run.ap_threads);
         eprintln!("CLEANUP: all AP threads joined");
 
         // Invalidate the watchpoint slots BEFORE `run.vm` drops at
@@ -13033,7 +13289,7 @@ impl KtstrVm {
             slot.hit.store(false, Ordering::Release);
         }
 
-        let (monitor_report, mid_flight_drain) =
+        let (monitor_report, mid_flight_drain, mid_run_verified_insns) =
             match run.monitor_handle.and_then(|h| h.join().ok()) {
                 Some(monitor::reader::MonitorLoopResult {
                     samples,
@@ -13043,6 +13299,7 @@ impl KtstrVm {
                     preemption_threshold_ns,
                     boot_wait_outcome,
                     scx_event_counters_supported,
+                    verified_insns,
                 }) => {
                     // `preemption_threshold_ns` was resolved once
                     // inside `start_monitor` (and threaded through
@@ -13067,9 +13324,9 @@ impl KtstrVm {
                         boot_wait_outcome,
                         scx_event_counters_supported,
                     };
-                    (Some(report), drain)
+                    (Some(report), drain, verified_insns)
                 }
-                None => (None, BulkDrainResult::default()),
+                None => (None, BulkDrainResult::default(), Vec::new()),
             };
         eprintln!("CLEANUP: monitor joined");
         let cleanup_t = std::time::Instant::now();
@@ -13081,7 +13338,7 @@ impl KtstrVm {
 
         // Drain the virtio-console port-1 TX accumulator: the guest
         // wrote bulk TLV-framed messages (STIMULUS, EXIT, SCHED_EXIT,
-        // PAYLOAD_METRICS, RAW_PAYLOAD_OUTPUT, etc.) to
+        // PAYLOAD_METRICS, etc.) to
         // `/dev/vport0p1`; the host side accumulated them into
         // `port1_tx_buf` and we parse them here through
         // `parse_tlv_stream`. Port-1 uses backpressure rather than
@@ -13128,7 +13385,7 @@ impl KtstrVm {
         // those parsed frames stash here on every drain so
         // `collect_results` can recover them after the coord has
         // joined. Without this merge every guest-side EXIT / TEST
-        // / PAYLOAD_METRICS / RAW_PAYLOAD_OUTPUT / PROFRAW frame
+        // / PAYLOAD_METRICS / PROFRAW frame
         // consumed mid-run would be silently lost — `drain_bulk()`
         // above only catches what arrived AFTER the coord stopped
         // polling, which on a typical run is empty. Mid-run
@@ -13242,26 +13499,45 @@ impl KtstrVm {
         let has_bpf_scheduler = self.has_bpf_scheduler_attached();
         let vs_t = std::time::Instant::now();
         let mut vs_path: &'static str = "skipped_no_scheduler";
-        let verifier_stats = if has_bpf_scheduler {
-            if let Some(ref prog) = run.prog_accessor {
-                use crate::monitor::bpf_prog::BpfProgAccessor;
-                vs_path = "prebuilt_accessor";
-                eprintln!("CLEANUP: verifier_stats using pre-built accessor");
-                let a = prog.as_accessor();
-                a.struct_ops_progs()
-            } else {
-                vs_path = "fallback_full_parse";
-                eprintln!("CLEANUP: verifier_stats fallback (full parse)");
-                self.collect_verifier_stats(
-                    &run.vm,
-                    run.tcr_el1.as_ref(),
-                    &run.cr3,
-                    run.vmlinux_data.as_ref().map(|d| d.as_slice()),
-                    run.kern_phys_base,
-                )
+        // Prefer the mid-run capture taken while the scheduler was
+        // attached (see `monitor::reader::MonitorLoopResult::
+        // verified_insns`). The post-teardown walk runs AFTER the guest
+        // killed the scheduler process, which drops the last prog
+        // reference and fires synchronous `bpf_prog_free_id`/`idr_remove`
+        // (kernel/bpf/syscall.c) — so the walk finds an empty `prog_idr`
+        // and loses `verified_insns`. The mid-run value is captured
+        // before that teardown and is fixed once at load, so it is
+        // authoritative. The source decision is factored into
+        // `choose_verifier_stats_source` (unit-tested); the walk stays
+        // inline here because it needs `self`/`run`.
+        let verifier_stats = match choose_verifier_stats_source(
+            mid_run_verified_insns.is_empty(),
+            has_bpf_scheduler,
+        ) {
+            VerifierStatsSource::MidRun => {
+                vs_path = "mid_run_capture";
+                mid_run_verified_insns
             }
-        } else {
-            Vec::new()
+            VerifierStatsSource::PostTeardownWalk => {
+                if let Some(ref prog) = run.prog_accessor {
+                    use crate::monitor::bpf_prog::BpfProgAccessor;
+                    vs_path = "prebuilt_accessor";
+                    eprintln!("CLEANUP: verifier_stats using pre-built accessor");
+                    let a = prog.as_accessor();
+                    a.struct_ops_progs()
+                } else {
+                    vs_path = "fallback_full_parse";
+                    eprintln!("CLEANUP: verifier_stats fallback (full parse)");
+                    self.collect_verifier_stats(
+                        &run.vm,
+                        run.tcr_el1.as_ref(),
+                        &run.cr3,
+                        run.vmlinux_data.as_ref().map(|d| d.as_slice()),
+                        run.kern_phys_base,
+                    )
+                }
+            }
+            VerifierStatsSource::None => Vec::new(),
         };
         tracing::info!(
             elapsed_ms = vs_t.elapsed().as_millis() as u64,
@@ -14546,5 +14822,191 @@ mod compute_watchpoint_only_trigger_tests {
                 );
             }
         }
+    }
+}
+
+/// Which source `collect_results` uses for `VmResult.verifier_stats`.
+/// See [`choose_verifier_stats_source`].
+#[derive(Debug, PartialEq, Eq)]
+enum VerifierStatsSource {
+    /// The mid-run capture, taken while the scheduler was attached and
+    /// its BPF progs were live in `prog_idr`.
+    MidRun,
+    /// The post-teardown host walk. Used only when no mid-run capture
+    /// exists (e.g. a boot so short the monitor never latched
+    /// `data_valid`) but a BPF scheduler was attached. Races synchronous
+    /// `idr_remove` at scheduler-process exit, hence the fallback role.
+    PostTeardownWalk,
+    /// No BPF scheduler was attached — empty `verifier_stats`.
+    None,
+}
+
+/// Decide where `collect_results` sources `verifier_stats`. Prefer the
+/// mid-run capture over the post-teardown walk: the walk runs after the
+/// guest killed the scheduler process, which drops the last `bpf_prog`
+/// reference and fires synchronous `bpf_prog_free_id` / `idr_remove`
+/// (kernel/bpf/syscall.c) BEFORE the RCU-deferred prog free — so it
+/// finds an empty `prog_idr` and loses `verified_insns`.
+/// A non-empty mid-run capture (read while attached; `verified_insns` is
+/// fixed once at load) is therefore authoritative. Fall back to the
+/// walk only when there is no mid-run capture, and to empty when no BPF
+/// scheduler attached at all.
+fn choose_verifier_stats_source(
+    mid_run_empty: bool,
+    has_bpf_scheduler: bool,
+) -> VerifierStatsSource {
+    if !mid_run_empty {
+        VerifierStatsSource::MidRun
+    } else if has_bpf_scheduler {
+        VerifierStatsSource::PostTeardownWalk
+    } else {
+        VerifierStatsSource::None
+    }
+}
+
+#[cfg(test)]
+mod verifier_stats_source_tests {
+    use super::{VerifierStatsSource, choose_verifier_stats_source};
+
+    /// The core decision: a non-empty mid-run capture is
+    /// preferred over the post-teardown walk (which races `idr_remove`),
+    /// even when a scheduler is attached; an empty capture falls back to
+    /// the walk when a scheduler attached, else to empty. CI-runnable
+    /// (no VM/kernel) — pairs the host-gated demo_verifier e2e.
+    #[test]
+    fn prefers_mid_run_capture_then_falls_back() {
+        // Non-empty mid-run capture wins regardless of has_bpf_scheduler.
+        assert_eq!(
+            choose_verifier_stats_source(false, true),
+            VerifierStatsSource::MidRun,
+        );
+        assert_eq!(
+            choose_verifier_stats_source(false, false),
+            VerifierStatsSource::MidRun,
+        );
+        // Empty capture + scheduler attached -> post-teardown walk.
+        assert_eq!(
+            choose_verifier_stats_source(true, true),
+            VerifierStatsSource::PostTeardownWalk,
+        );
+        // Empty capture + no scheduler -> empty stats.
+        assert_eq!(
+            choose_verifier_stats_source(true, false),
+            VerifierStatsSource::None,
+        );
+    }
+}
+
+#[cfg(test)]
+mod run_vm_thread_guard_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A worker thread that spins until the guard signals `kill`, then records
+    /// that it ran. A `Drop` that forgot to set `kill` would hang the join
+    /// forever (test timeout); one that detached instead of joining would leave
+    /// the `joined` count short.
+    fn kill_watching_worker(kill: Arc<AtomicBool>, joined: Arc<AtomicUsize>) -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            while !kill.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            joined.fetch_add(1, Ordering::Release);
+        })
+    }
+
+    fn evt() -> Arc<EventFd> {
+        Arc::new(EventFd::new(EFD_NONBLOCK).expect("eventfd"))
+    }
+
+    /// The core invariant: on the early-return/panic path, `Drop` signals
+    /// shutdown (kill + kill_evt + bsp_done + freeze cleared) AND joins every
+    /// spawned handle before returning — so no detached thread outlives the
+    /// guard (and, in `run_vm`, `guest_mem`). Uses the non-vCPU handles
+    /// (monitor/bpf/coord/watchdog); a real `VcpuThread` needs a live VcpuFd,
+    /// so the AP path is covered by the shared `kick_and_join_ap_threads` +
+    /// `collect_results`.
+    ///
+    /// This deterministically verifies the CURRENT (joining) `Drop`: `join()`
+    /// establishes a happens-before edge from each worker's final
+    /// `fetch_add` to the post-drop read, so `joined == 3` is guaranteed. As a
+    /// guard against a hypothetical future detach regression it is strong but
+    /// not 100% deterministic — a detached worker still observes the
+    /// Drop-set `kill` and would eventually increment, so on a sufficiently
+    /// fast machine it could reach the counter before the assert. A fully
+    /// race-free detach-catch would require a timed wait, which the codebase
+    /// forbids (event-driven only); the happens-before proof above is the
+    /// strongest sleepless invariant available for a self-terminating worker.
+    #[test]
+    fn drop_signals_kill_and_joins_every_handle() {
+        let kill = Arc::new(AtomicBool::new(false));
+        let joined = Arc::new(AtomicUsize::new(0));
+        let guard = RunVmThreadGuard {
+            ap_threads: Vec::new(),
+            monitor: None,
+            bpf_write: Some(kill_watching_worker(kill.clone(), joined.clone())),
+            freeze_coord: Some(kill_watching_worker(kill.clone(), joined.clone())),
+            watchdog: Some(kill_watching_worker(kill.clone(), joined.clone())),
+            kill: kill.clone(),
+            kill_evt: evt(),
+            freeze: Arc::new(AtomicBool::new(true)),
+            bsp_done: Arc::new(AtomicBool::new(false)),
+            bsp_done_evt: evt(),
+        };
+        drop(guard);
+        assert!(
+            kill.load(Ordering::Acquire),
+            "Drop sets the kill flag so the workers can exit"
+        );
+        assert_eq!(
+            joined.load(Ordering::Acquire),
+            3,
+            "Drop JOINS every handle (each worker bumps the counter before exit) \
+             — a detach would leave the count below 3"
+        );
+    }
+
+    /// After `disarm`, the guard is empty: `Drop` must be a no-op (NOT signal
+    /// kill, NOT join), and the handles are handed back to the caller. Proves
+    /// the Ok path reclaims the threads for the normal teardown instead of the
+    /// guard joining them.
+    #[test]
+    fn disarm_hands_back_handles_and_drop_is_inert() {
+        let kill = Arc::new(AtomicBool::new(false));
+        let joined = Arc::new(AtomicUsize::new(0));
+        // Worker exits on its OWN flag, not the guard's kill, so we can prove the
+        // disarmed guard neither signals kill nor joins it.
+        let go = Arc::new(AtomicBool::new(false));
+        let go_worker = go.clone();
+        let joined_worker = joined.clone();
+        let h = std::thread::spawn(move || {
+            while !go_worker.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            joined_worker.fetch_add(1, Ordering::Release);
+        });
+        let mut guard = RunVmThreadGuard {
+            ap_threads: Vec::new(),
+            monitor: None,
+            bpf_write: Some(h),
+            freeze_coord: None,
+            watchdog: None,
+            kill: kill.clone(),
+            kill_evt: evt(),
+            freeze: Arc::new(AtomicBool::new(false)),
+            bsp_done: Arc::new(AtomicBool::new(false)),
+            bsp_done_evt: evt(),
+        };
+        let handles = guard.disarm();
+        drop(guard); // disarmed -> inert
+        assert!(
+            !kill.load(Ordering::Acquire),
+            "a disarmed guard's Drop does not signal kill"
+        );
+        assert!(handles.bpf_write.is_some(), "disarm returns the handle");
+        // Release + join the reclaimed handle ourselves (the Ok-path role).
+        go.store(true, Ordering::Release);
+        let _ = handles.bpf_write.unwrap().join();
+        assert_eq!(joined.load(Ordering::Acquire), 1);
     }
 }

@@ -62,7 +62,9 @@ fn vcpu_threshold_reasonable_range() {
 
 #[test]
 fn vcpu_threshold_default_hz_fallback() {
-    // Nonexistent kernel path -> falls back to host config or default.
+    // Nonexistent kernel path with Some(...): IKCONFIG and .config
+    // lookups both fail, so guest_kernel_hz returns DEFAULT_HZ without
+    // consulting host /boot/config.
     let t = vcpu_preemption_threshold_ns(Some(std::path::Path::new("/nonexistent/bzImage")));
     assert!(
         (10_000_000..=100_000_000).contains(&t),

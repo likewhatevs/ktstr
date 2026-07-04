@@ -6,12 +6,12 @@
 //! that expect specific section names can still resolve them by name
 //! rather than by index.
 //!
-//! # 3-way section partition
+//! # Section partition
 //!
-//! Every section in the input ELF lands in exactly one of three buckets,
-//! decided by the unions [`STRUCTURAL_KEEP_SECTIONS`] (must keep
-//! verbatim) and [`SPECULATIVE_ZERO_DATA_SECTIONS`] (keep header,
-//! zero data) plus the keep-list logic in [`strip_keep_list`]:
+//! Every section in the input ELF is classified by the unions
+//! [`STRUCTURAL_KEEP_SECTIONS`] (must keep verbatim) and
+//! [`SPECULATIVE_ZERO_DATA_SECTIONS`] (keep header, zero data) plus
+//! the keep-list logic in [`strip_keep_list`]:
 //!
 //! 1. **Keep verbatim.** Sections the runtime depends on at full
 //!    fidelity: BTF (`.BTF`, `.BTF.ext`), kallsyms tables, IKCONFIG
@@ -19,9 +19,10 @@
 //!    bytes intact so `monitor`, `probe::btf`, and ktstr's CONFIG_HZ
 //!    recovery still find what they need.
 //! 2. **Header-only (zeroed data).** Sections whose names matter to
-//!    consumers but whose bytes do not (e.g. `.init.data`). The
-//!    section header is rewritten to `SHT_NOBITS` so the symbol
-//!    address space is preserved without inflating the file.
+//!    consumers but whose bytes do not (e.g. `.init.data`), plus any
+//!    section flagged `SHF_EXECINSTR` (e.g. `.text`). The section
+//!    header is rewritten to `SHT_NOBITS` so the symbol address
+//!    space is preserved without inflating the file.
 //! 3. **Drop entirely.** Everything else — debug info (`.debug_*`),
 //!    relocations against stripped sections, unreferenced strings.
 //!
@@ -45,7 +46,9 @@
 //!      logic can't classify), the orchestrator logs a
 //!      `tracing::warn!` and falls through to
 //!      [`strip_debug_prefix`], which is a strictly weaker strip
-//!      that only drops `SHF_ALLOC=0` `.debug_*` sections. The
+//!      that drops `.debug_*`, `.comment`, and reloc-prefixed
+//!      (`.rela.` / `.rel.` / `.relr.` / `.crel.`) sections by name.
+//!      The
 //!      fallback succeeds for any well-formed ELF, so a partial
 //!      strip is preferred over a total failure that would brick
 //!      the cache write.
@@ -110,7 +113,7 @@ impl StrippedVmlinux {
 /// Strip a vmlinux ELF for caching by partitioning every section
 /// into one of three buckets and rewriting the file accordingly.
 ///
-/// # 3-way partition
+/// # Section partition
 ///
 /// The strip pipeline classifies every input section against the
 /// keep-list logic in [`strip_keep_list`] and the unions defined
@@ -123,8 +126,9 @@ impl StrippedVmlinux {
 ///    `monitor::btf_offsets`, `probe::btf`, kallsyms lookup, and
 ///    CONFIG_HZ recovery from the IKCONFIG blob all keep working.
 /// 2. **Header-only (zeroed data)** — sections in
-///    [`SPECULATIVE_ZERO_DATA_SECTIONS`] (today: `.init.data`).
-///    Section header is rewritten to `SHT_NOBITS` so address-space
+///    [`SPECULATIVE_ZERO_DATA_SECTIONS`] (today: `.init.data`) plus
+///    any section flagged `SHF_EXECINSTR` (e.g. `.text`). The
+///    section header is rewritten to `SHT_NOBITS` so address-space
 ///    layout and section-name-to-index mapping survive, but the
 ///    bytes are dropped. No current consumer needs the bytes,
 ///    only the addressing.
@@ -140,7 +144,8 @@ impl StrippedVmlinux {
 /// toolchain that emits headers the keep-list logic can't classify),
 /// the helper logs a `tracing::warn!` and falls back to
 /// [`strip_debug_prefix`], which is a strictly weaker strip that
-/// only drops `.debug_*` sections. The fallback always succeeds
+/// drops `.debug_*`, `.comment`, and reloc-prefixed sections by
+/// name. The fallback always succeeds
 /// for any well-formed ELF, so a partial strip is preferred over
 /// a total failure that would brick the cache write entirely.
 /// `cache_dir::CacheDir::store` records the "stripped" outcome in
@@ -166,10 +171,10 @@ impl StrippedVmlinux {
 ///
 /// - `path()` — absolute path to the stripped ELF on disk under a
 ///   fresh `tempfile::TempDir`. The caller (typically
-///   [`super::cache_dir::CacheDir::store`]) `fs::copy`s this path
+///   [`super::cache_dir::CacheDir::store`]) reflink-or-copies this path
 ///   into the cache directory.
 /// - The owned `TempDir`, which is unlinked when the
-///   `StrippedVmlinux` is dropped. The cache `fs::copy` happens
+///   `StrippedVmlinux` is dropped. The cache reflink/copy happens
 ///   before drop, so the cached entry is independent of the temp
 ///   path.
 ///
@@ -271,7 +276,9 @@ pub(crate) fn neutralize_relocs(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Keep-list strip: three-way partition of ELF sections by name.
+/// Keep-list strip: partitions sections into keep (by name),
+/// zero-data→SHT_NOBITS (by name), executable→SHT_NOBITS (by
+/// SHF_EXECINSTR), and delete (everything else).
 pub(crate) fn strip_keep_list(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut builder = object::build::elf::Builder::read(data)
         .map_err(|e| anyhow::anyhow!("parse vmlinux ELF: {e}"))?;

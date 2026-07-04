@@ -1237,7 +1237,7 @@ impl VirtioConsole {
 
     /// Handle MMIO read at `offset` within the device's MMIO region.
     pub fn mmio_read(&self, offset: u64, data: &mut [u8]) {
-        // Config space lives at 0x100..0x110 in the MMIO layout per
+        // Config space lives at 0x100..0x10c in the MMIO layout per
         // virtio-v1.2 §4.2.2; `struct virtio_console_config` is 12
         // bytes (cols u16, rows u16, max_nr_ports u32, emerg_wr u32).
         const CFG_BASE: u64 = 0x100;

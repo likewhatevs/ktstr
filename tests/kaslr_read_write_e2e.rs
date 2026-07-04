@@ -2,15 +2,15 @@
 //! Exercises the kaslr_offset thread-through in kernel_op_dispatch.rs
 //! on both the read AND the write paths via:
 //!
-//! 1. Symbol read — `jiffies_64` (.bss u64); validates the kernel-
+//! 1. Symbol read — `jiffies_64` (.data u64); validates the kernel-
 //!    text slide path for an in-image global.
 //! 2. Symbol write round-trip — `panic_on_oops` (kernel/panic.c, u32);
 //!    read pre, write sentinel, read post. Pin: post == SENTINEL.
 //!    Mutation is harmless past test teardown (controls oops behavior
 //!    only).
 //! 3. Per-CPU OrU32 round-trip — `runqueues.scx.flags` cpu 0; HIGH_BIT
-//!    is reserved test space (scx-ktstr writes low bits per
-//!    `enum scx_rq_flags`). Pin: post & HIGH_BIT == HIGH_BIT AND
+//!    is reserved test space (sched_ext core touches only the low bits
+//!    defined by `enum scx_rq_flags`). Pin: post & HIGH_BIT == HIGH_BIT AND
 //!    (post ^ pre) == HIGH_BIT (no scheduler-side bits drifted).
 //!
 //! All assertions are EXPLICIT-VALUE (no panic-on-bad-read). The
@@ -62,6 +62,15 @@ fn kaslr_write_symbol_roundtrip_panic_on_oops(ctx: &Ctx) -> Result<AssertResult>
 }
 
 fn assert_panic_on_oops_roundtrip(result: &VmResult) -> Result<()> {
+    // A scheduler that never attached (SchedulerNotAttached, e.g. scx
+    // enable stalled under host oversubscription) yields success ==
+    // false with an empty bridge; the runner already renders that with
+    // the real scheduler-log cause. Return early so the assertions below
+    // don't fire a misleading "kern_kaslr_offset == 0" / "no reply for
+    // tag" on top of it (mirrors default_post_vm_periodic_fired).
+    if !result.success {
+        return Ok(());
+    }
     anyhow::ensure!(
         result.kern_kaslr_offset != 0,
         "kern_kaslr_offset == 0 — test must run under KASLR-on to \
@@ -129,6 +138,11 @@ fn kaslr_read_symbol_jiffies_64(ctx: &Ctx) -> Result<AssertResult> {
 }
 
 fn assert_jiffies_read(result: &VmResult) -> Result<()> {
+    // See assert_panic_on_oops_roundtrip: skip the KASLR/reply checks
+    // when the scheduler never attached, so the real failure surfaces.
+    if !result.success {
+        return Ok(());
+    }
     anyhow::ensure!(result.kern_kaslr_offset != 0, "KASLR-on required");
     let replies = result.snapshot_bridge.drain_kernel_ops();
     let reply = replies
@@ -153,8 +167,8 @@ fn assert_jiffies_read(result: &VmResult) -> Result<()> {
 // =========================================================================
 // Op::WriteKernelCold(per_cpu_field, OrU32) round-trip — exercises the
 // per-CPU write path under KASLR-on. Target: runqueues.scx.flags cpu 0;
-// HIGH_BIT (bit 31) is reserved test space (scx-ktstr touches low bits
-// only per `enum scx_rq_flags`).
+// HIGH_BIT (bit 31) is reserved test space (sched_ext core touches the
+// low bits only per `enum scx_rq_flags`).
 // =========================================================================
 
 const TAG_PCPU_PRE: &str = "rq_flags_pre";
@@ -181,6 +195,11 @@ fn kaslr_write_per_cpu_field_or_roundtrip(ctx: &Ctx) -> Result<AssertResult> {
 }
 
 fn assert_rq_flags_or_roundtrip(result: &VmResult) -> Result<()> {
+    // See assert_panic_on_oops_roundtrip: skip the KASLR/reply checks
+    // when the scheduler never attached, so the real failure surfaces.
+    if !result.success {
+        return Ok(());
+    }
     anyhow::ensure!(
         result.kern_kaslr_offset != 0,
         "kern_kaslr_offset == 0 — test requires KASLR-on"
@@ -218,7 +237,8 @@ fn assert_rq_flags_or_roundtrip(result: &VmResult) -> Result<()> {
     anyhow::ensure!(
         (post_v ^ pre_v) == HIGH_BIT,
         "post ^ pre = {:#x}, expected {HIGH_BIT:#x} — other bits \
-         changed mid-rendezvous; FULL hold did not block vCPUs.",
+         changed between the write and post-read rendezvous while \
+         vCPUs ran (each cold op is a separate rendezvous).",
         post_v ^ pre_v
     );
     Ok(())
@@ -227,7 +247,7 @@ fn assert_rq_flags_or_roundtrip(result: &VmResult) -> Result<()> {
 // =========================================================================
 // rq.cpu ground-truth — exercises the per-CPU read path under KASLR-on
 // for TWO distinct CPUs (cpu 0 + cpu 1). The field rq.cpu is set ONCE
-// by init_idle at boot to the CPU index. Pin: cpu0_read == 0 AND
+// by sched_init at boot to the CPU index. Pin: cpu0_read == 0 AND
 // cpu1_read == 1. Without cpu1 the cpu0==0 assertion is vacuous (any
 // wrong-PA zero would also match).
 // =========================================================================
@@ -261,6 +281,11 @@ fn kaslr_compute_rq_pas_ground_truth(ctx: &Ctx) -> Result<AssertResult> {
 }
 
 fn assert_rq_cpu_field(result: &VmResult) -> Result<()> {
+    // See assert_panic_on_oops_roundtrip: skip the KASLR/reply checks
+    // when the scheduler never attached, so the real failure surfaces.
+    if !result.success {
+        return Ok(());
+    }
     anyhow::ensure!(
         result.kern_kaslr_offset != 0,
         "KASLR-on required to validate compute_rq_pas under slide"

@@ -4,12 +4,14 @@ use super::super::super::*;
 // mmio_read non-4-byte and config_read out-of-range defenses.
 //
 // virtio-v1.2 §4.2.2 specifies 4-byte register access for the MMIO
-// control registers. A misbehaving guest issuing 1/2/8-byte reads
-// would otherwise let the device return stale stack contents (the
-// `data` buffer is the caller's, not zero-initialised by the
-// device path). The defensive 0xff-fill makes the protocol
-// violation visible — distinct from a register that legitimately
-// reads as zero.
+// control registers. Absent the defense, a non-4-byte mmio read
+// would panic on `data.copy_from_slice(&val.to_le_bytes())`
+// (length mismatch: the `to_le_bytes` array is 4 bytes, the caller's
+// `data` is not), and an out-of-range config read would panic on
+// `cfg[start..end]` (index-out-of-bounds when end > 12). The
+// defensive 0xff-fill absorbs the malformed access without panicking
+// and makes the protocol violation visible — distinct from a
+// register that legitimately reads as zero.
 // ----------------------------------------------------------------
 
 /// 8-byte mmio_read (above the 4-byte register width) must fill

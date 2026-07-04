@@ -10,9 +10,11 @@
 //!
 //! Helpers `build_per_node_map` and `acquire_slot_with_locks` live next
 //! to `build()` because they execute as part of the build pipeline:
-//! both are called only from `build()` and `validate_performance_mode`,
-//! and they cooperate with the [`super::host_topology`] flock primitives
-//! to reserve the LLC slots the resulting VM will pin against.
+//! `build_per_node_map` is called from `resolve_run_plans` and
+//! `acquire_slot_with_locks` from `validate_performance_mode` (neither
+//! directly from `build()`), and they cooperate with the
+//! [`super::host_topology`] flock primitives to reserve the LLC slots
+//! the resulting VM will pin against.
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -288,8 +290,14 @@ struct RunPlans {
 }
 
 impl KtstrVmBuilder {
-    /// Path to the guest kernel: either a source directory (the VMM
-    /// extracts `arch/*/boot/{bzImage,Image}`) or a prebuilt image.
+    /// Path to the guest kernel IMAGE file (a prebuilt `bzImage` /
+    /// `Image`); [`build`](Self::build) loads it verbatim and does NOT
+    /// extract a source tree, so a directory here fails at load with
+    /// "Unable to read bzImage header". For a source-tree ROOT use
+    /// [`kernel_dir`](Self::kernel_dir) (resolves `arch/<arch>/boot/…`),
+    /// or resolve the image yourself first (e.g.
+    /// `crate::kernel_path::find_image_in_dir`, which also handles the
+    /// cache `<dir>/bzImage` layout).
     pub fn kernel(mut self, path: impl Into<PathBuf>) -> Self {
         self.kernel = Some(path.into());
         self
@@ -331,7 +339,6 @@ impl KtstrVmBuilder {
     /// same guest path. The packing pipeline (follow-up work)
     /// rejects such duplicates at build time as the
     /// final-line-of-defense beyond the validate gate.
-    #[allow(dead_code)] // production callers (runtime plumb) wire up in follow-up work
     pub fn staged_scheduler(
         mut self,
         name: impl Into<String>,
@@ -757,7 +764,7 @@ impl KtstrVmBuilder {
     /// [`super::disk_template::cache_root`]) so operators can
     /// inspect what's been built, GC stale entries by hand, and warm
     /// the cache out-of-band by running a Btrfs test once. The cache
-    /// is keyed by `(filesystem_tag, capacity_mib)` and the
+    /// is keyed by `(filesystem_tag, capacity_mib, mkfs_version_fingerprint)` and the
     /// directory layout is `<cache>/disk_templates/<key>/template.img`
     /// — see [`super::disk_template`] module docs for the full encoding.
     ///
@@ -942,9 +949,12 @@ impl KtstrVmBuilder {
     /// `performance_mode` requirements (a too-small host surfaces as
     /// `PerfModeUnavailable` — a host-insufficiency: skip-class by default,
     /// promoted to a hard fail under `KTSTR_NO_SKIP_MODE`; busy LLC slots
-    /// surface as `ResourceContention`, also skip-class). An explicit
-    /// over-budget `--cpu-cap` / `cpu_budget` surfaces as
-    /// `CpuBudgetUnsatisfiable` (a hard error).
+    /// surface as `ResourceContention`, also skip-class). An operator
+    /// over-budget `--cpu-cap` surfaces as `CpuBudgetUnsatisfiable` (a hard
+    /// error — a concrete number the host cannot satisfy); an author's per-test
+    /// `cpu_budget` over the allowance instead surfaces as
+    /// `TopologyInsufficient` (skip-class, like any topology requirement a
+    /// bigger host would satisfy).
     pub fn build(mut self) -> Result<KtstrVm> {
         // Periodic capture's boundary computation requires
         // `workload_duration` to slice. Without it the
@@ -1034,8 +1044,7 @@ impl KtstrVmBuilder {
         // no CAP_BPF) defers until the failure-dump path first
         // calls
         // [`super::cast_analysis_load::LazyCastMap::get_full`]
-        // (production accessor — `.get()` is `#[allow(dead_code)]`
-        // and used only by the lazy-handle unit tests).
+        // (the sole accessor).
         // Schedulers whose tests pass never trigger analyzer
         // work — the dominant case for nextest's process-per-test
         // execution model where steady-state tests boot a VM,
@@ -1189,8 +1198,8 @@ impl KtstrVmBuilder {
             //
             // The CLI binaries reject `--cpu-cap` + bypass at parse
             // time (see `ktstr::cli::CPU_CAP_HELP` and the Shell/
-            // kernel-build dispatch checks in bin/ktstr.rs and
-            // bin/cargo-ktstr.rs), but library consumers building
+            // kernel-build dispatch checks in src/bin/ktstr.rs and
+            // src/bin/cargo-ktstr.rs), but library consumers building
             // a `KtstrVmBuilder` directly with both env vars set
             // would silently lose the cap under a bare `if bypass
             // { return None-plan }`. Mirror the CLI check here so
@@ -1477,11 +1486,17 @@ fn resolve_effective_cpu_budget(
 /// `cpu_budget`, and the host allowance.
 ///
 /// - An explicit `--cpu-cap`/`KTSTR_CPU_CAP` (`cpu_cap = Some`) wins verbatim.
-/// - Otherwise a per-test `cpu_budget` (`#[ktstr_test]`) is honored: a budget
-///   exceeding `allowed` host CPUs is a [`host_topology::CpuBudgetUnsatisfiable`]
-///   hard error (the author named a concrete number the host cannot satisfy,
-///   symmetric with `--cpu-cap`); at or below the allowance it stands (floored
-///   at 1) so a test can force overcommit (`cpu_budget < vcpus`).
+/// - Otherwise a per-test `cpu_budget` (`#[ktstr_test]`) is honored as a
+///   topology REQUIREMENT: a budget exceeding `allowed` host CPUs yields
+///   [`host_topology::TopologyInsufficient`] (a host-dependent SKIP — the
+///   scenario needs a bigger host; a `#[ktstr_test]` attribute is an author
+///   capability request, not the operator's concrete `--cpu-cap` number, so a
+///   too-small host skips it rather than reddening CI, and `--no-skip-mode`
+///   promotes it to a fail). At or below the allowance it stands (floored at 1)
+///   so a test can force overcommit (`cpu_budget < vcpus`). This is the
+///   provenance split: the operator knob (`--cpu-cap`, validated in
+///   [`host_topology::CpuCap::effective_count`]) FAILS when unsatisfiable; the
+///   author attribute SKIPS.
 /// - Absent both, the budget auto-sizes to the VM's vCPU count via
 ///   [`host_topology::no_perf_cpu_budget`] so a wide VM's boot-time parallel AP
 ///   bringup is not throttled by the 30% default mask.
@@ -1501,14 +1516,26 @@ fn resolve_cpu_budget(
                 Some(n) => {
                     let n = n as usize;
                     if n > allowed {
-                        return Err(anyhow::Error::new(
-                            host_topology::CpuBudgetUnsatisfiable::exceeds_allowed(
-                                "cpu_budget",
-                                n,
-                                allowed,
-                                "omit cpu_budget to auto-size it",
+                        // A per-test `cpu_budget` is an AUTHOR-declared topology
+                        // REQUIREMENT (the scenario needs `n` CPUs to be
+                        // meaningful), not an operator's concrete `--cpu-cap`
+                        // assertion. A host with fewer allowed CPUs cannot run
+                        // it, but a bigger one can — so this is a host-dependent
+                        // SKIP (`TopologyInsufficient`), like any other topology
+                        // requirement, NOT the hard `CpuBudgetUnsatisfiable` a
+                        // too-large `--cpu-cap` raises. Provenance splits the
+                        // verdict: an author attribute skips; an operator knob
+                        // fails.
+                        return Err(anyhow::Error::new(host_topology::TopologyInsufficient {
+                            reason: format!(
+                                "cpu_budget = {n} exceeds the {allowed} CPUs this \
+                                 process is allowed on (from sched_getaffinity / \
+                                 Cpus_allowed_list): this test needs a host with at \
+                                 least {n} allowed CPUs. Provision a larger host, \
+                                 lower the test's cpu_budget, or release the \
+                                 cgroup/taskset constraint restricting this process."
                             ),
-                        ));
+                        }));
                     }
                     n.max(1)
                 }
@@ -1614,18 +1641,28 @@ mod tests {
         assert_eq!(resolved.effective_count(10).unwrap(), 4);
     }
 
-    /// resolve_cpu_budget over-allowance gate: a per-test cpu_budget exceeding the host
-    /// allowance is a TYPED CpuBudgetUnsatisfiable hard error (symmetric with
-    /// --cpu-cap), not a silent clamp — the author named a concrete number the
-    /// host cannot satisfy.
+    /// resolve_cpu_budget over-allowance gate: a per-test cpu_budget exceeding
+    /// the host allowance is a TYPED TopologyInsufficient SKIP (an author
+    /// attribute is a topology requirement a bigger host would satisfy), NOT a
+    /// silent clamp and NOT the hard CpuBudgetUnsatisfiable an operator
+    /// `--cpu-cap` raises (that provenance split is the point). The complement —
+    /// an operator `--cpu-cap` over the allowance still hard-failing — is pinned
+    /// by the CpuCap::effective_count tests, since that path is validated there,
+    /// before resolve_cpu_budget sees the cap.
     #[test]
-    fn resolve_cpu_budget_per_test_budget_over_allowance_errors() {
+    fn resolve_cpu_budget_per_test_budget_over_allowance_skips() {
         let err = resolve_cpu_budget(None, Some(100), 10, 8)
-            .expect_err("budget 100 > allowed 10 must error");
+            .expect_err("budget 100 > allowed 10 must yield a skip error");
+        assert!(
+            err.downcast_ref::<host_topology::TopologyInsufficient>()
+                .is_some(),
+            "must be a typed TopologyInsufficient (skip), got: {err:#}",
+        );
         assert!(
             err.downcast_ref::<host_topology::CpuBudgetUnsatisfiable>()
-                .is_some(),
-            "must be a typed CpuBudgetUnsatisfiable, got: {err:#}",
+                .is_none(),
+            "an author cpu_budget must NOT raise the operator-only \
+             CpuBudgetUnsatisfiable hard error: {err:#}",
         );
     }
 

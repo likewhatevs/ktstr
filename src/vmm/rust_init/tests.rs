@@ -419,6 +419,38 @@ fn send_sys_rdy_retry_reports_port_exists_when_path_resolves() {
     assert!(logs_contain("vcpus=4"), "WARN must include the vcpus value",);
 }
 
+/// Regression pin for the fast-fail retry THROTTLE in
+/// `send_sys_rdy_with_retry`: when the port node exists but every send
+/// fails (host context), the loop must retry at a BOUNDED rate, not
+/// hot-spin the guest init (PID 1) thread. The 100 ms guard-rail sleep
+/// is the sole hot-spin guard on that path — without it the loop
+/// re-enters Stage 1 (fast-path Done, since the node exists) and
+/// re-fails with zero delay. Elapsed wall-clock cannot distinguish
+/// throttle-present from -absent (the deadline gate bounds both to
+/// ~budget), so this pins the ITERATION COUNT: with the ~100 ms throttle
+/// a 400 ms budget yields only a handful of iterations, whereas a
+/// busy-spin would yield thousands.
+#[test]
+fn send_sys_rdy_retry_throttles_fast_fail_does_not_hot_spin() {
+    use std::sync::atomic::Ordering;
+    let tmpfile =
+        tempfile::NamedTempFile::new().expect("create tempfile to stand in for /dev/vport0p1");
+    let budget = std::time::Duration::from_millis(400);
+    let addrs = crate::vmm::wire::KernAddrs::new(0, 0, None);
+    SEND_SYS_RDY_RETRY_ITERS.store(0, Ordering::Relaxed);
+    send_sys_rdy_with_retry(budget, 4, &addrs, tmpfile.path());
+    let iters = SEND_SYS_RDY_RETRY_ITERS.load(Ordering::Relaxed);
+    // ~budget/100ms ≈ 4-5 throttled iterations; allow generous slack for
+    // scheduling jitter. A dropped throttle would spin into the
+    // thousands, so the upper bound is the regression guard.
+    assert!(
+        (2..=12).contains(&iters),
+        "port-exists + always-failing-send must retry at the ~100 ms \
+         throttled rate (≈ budget/100ms iterations), not hot-spin: got \
+         {iters} iterations for a 400 ms budget",
+    );
+}
+
 #[test]
 fn parse_topo_from_cmdline_not_present_on_host() {
     // Host /proc/cmdline won't contain KTSTR_TOPO.
@@ -646,7 +678,8 @@ fn kill_scheduler_process_ignoring_sigterm_child_escalates_to_sigkill() {
 }
 
 /// kill_scheduler_process MUST NOT mutate SCHED_PID — the design
-/// at L320-327 of rust_init.rs explicitly keeps the helper
+/// contract on `kill_scheduler_process` (see its `# Pid lifecycle
+/// semantic` doc in process.rs) explicitly keeps the helper
 /// generic-pid (no implicit singleton-pid assumption) and defers
 /// SCHED_PID ownership to the dispatcher (the future
 /// Op::DetachScheduler arm). This test pins that contract against
@@ -695,8 +728,9 @@ fn kill_scheduler_process_does_not_mutate_sched_pid() {
 }
 
 /// SIGCHLD signal disposition is process-wide, so the
-/// `with_sigchld_default_*` and `poll_startup_under_sigign_*`
-/// regression tests must serialize. Without this lock, two
+/// `with_sigchld_default_*`, `poll_startup_*_under_sigchld_ignore`,
+/// `kill_scheduler_process_*`, and `sched_pid_*` regression tests
+/// must serialize. Without this lock, two
 /// concurrent `libc::signal(SIGCHLD, ...)` calls from different
 /// test threads could leave SIGCHLD in an unexpected state when
 /// either test inspects or restores it. Acquired via

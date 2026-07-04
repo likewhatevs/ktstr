@@ -182,8 +182,8 @@ static __KTSTR_ENTRY_BPF_API: ktstr::test_support::KtstrTestEntry =
 //   2. GUEST scheduler's BPF dispatcher reads the new `stall` value
 //      from its `.bss` section on the next dispatch entry
 //      (`if (stall) return;` in main.bpf.c).
-//   3. GUEST ACTS: the scheduler stops inserting tasks into DSQs,
-//      every CPU sits idle, the scx watchdog observes no progress
+//   3. GUEST ACTS: the scheduler stops moving tasks from the
+//      shared DSQ to per-CPU local DSQs, every CPU sits idle, the scx watchdog observes no progress
 //      within its budget and tears the scheduler down (emitted
 //      via the `SchedulerDied` assert detail the runtime records).
 //   4. HOST CONFIRMS: the scenario returns a failing AssertResult
@@ -584,7 +584,7 @@ static __KTSTR_ENTRY_SCX: ktstr::test_support::KtstrTestEntry =
 /// Minimal scheduler test that exercises host-side BPF program enumeration.
 /// The framework warns when verifier_stats is empty for scheduler tests.
 ///
-/// `watchdog_timeout_s = 15` overrides the 4 s
+/// `watchdog_timeout_s = 15` overrides the 5 s
 /// `KtstrTestEntry::DEFAULT.watchdog_timeout`. The minimal scx-ktstr
 /// pull-from-shared-DSQ scheduler under 2-vCPU SpinWait contention can
 /// leave background tasks (init, RCU kthreads) sitting on

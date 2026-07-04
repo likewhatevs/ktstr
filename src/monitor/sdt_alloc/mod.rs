@@ -125,8 +125,8 @@ pub(super) const SIZEOF_SDT_ID: usize = 8;
 /// will trust.
 ///
 /// `lib/sdt_alloc.bpf.c::pool_set_size` checks `data_size % 8 == 0`
-/// and bails on zero; `scx_alloc_init` rounds up to 8 then ensures
-/// the chunk fits in `PAGE_SIZE`. So a real `elem_size` is always
+/// and bails on `nr_pages == 0`; `scx_alloc_init` rounds up to 8 then
+/// ensures the chunk fits in `PAGE_SIZE`. So a real `elem_size` is always
 /// `[16, 4096]` for non-degenerate allocators (16-byte minimum =
 /// `sizeof(sdt_data) + 8`-byte minimum payload after `round_up(...,
 /// 8)`). A torn snapshot or an uninitialized struct could surface a
@@ -1156,6 +1156,90 @@ mod tests {
             choice.reason, "",
             "single-match path must return empty reason; got {:?}",
             choice.reason
+        );
+    }
+
+    /// Split BTF (a scheduler program layered on the vmlinux base)
+    /// must not let a base-BTF struct shadow payload discovery. A
+    /// vmlinux base struct of the payload size sits at a LOW type id
+    /// (probed first by a naive 1..N loop); `discover_payload_btf_id`
+    /// probes only the program section's id range (via `Btf::split`),
+    /// so a base struct of the same size is never a candidate. Here the
+    /// base has a 16-byte `base_ctx` while the program has NO 16-byte
+    /// struct, so a size-16 query must resolve to 0 (no candidate).
+    /// Pre-fix the naive loop probed base ids too and wrongly returned
+    /// `base_ctx`'s id.
+    #[test]
+    fn discover_payload_btf_id_split_btf_excludes_base_types() {
+        // Base BTF: u64 (id 1) + a 16-byte struct base_ctx (id 2).
+        let mut base_strings: Vec<u8> = vec![0];
+        let bn_u64 = sdta_push_name(&mut base_strings, "u64");
+        let bn_base_ctx = sdta_push_name(&mut base_strings, "base_ctx");
+        let bn_a = sdta_push_name(&mut base_strings, "a");
+        let bn_b = sdta_push_name(&mut base_strings, "b");
+        let base_types = vec![
+            SdtaSynType::Int {
+                name_off: bn_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            SdtaSynType::Struct {
+                name_off: bn_base_ctx,
+                size: 16,
+                members: vec![
+                    SdtaSynMember {
+                        name_off: bn_a,
+                        type_id: 1,
+                        byte_offset: 0,
+                    },
+                    SdtaSynMember {
+                        name_off: bn_b,
+                        type_id: 1,
+                        byte_offset: 8,
+                    },
+                ],
+            },
+        ];
+        let base_blob = sdta_build_btf(&base_types, &base_strings);
+        let base = Btf::from_bytes(&base_blob).expect("base BTF parses");
+
+        // Split (program) BTF: a single 8-byte struct scx_payload
+        // (id 3 — base has 3 types counting Void). Deliberately NO
+        // 16-byte struct here; its member references base u64 (id 1).
+        let mut split_strings: Vec<u8> = vec![0];
+        let sn_payload = sdta_push_name(&mut split_strings, "scx_payload");
+        let sn_x = sdta_push_name(&mut split_strings, "x");
+        let split_types = vec![SdtaSynType::Struct {
+            name_off: sn_payload,
+            size: 8,
+            members: vec![SdtaSynMember {
+                name_off: sn_x,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        }];
+        let split_blob = sdta_build_btf(&split_types, &split_strings);
+        let btf = Btf::from_split_bytes(&split_blob, &base).expect("split BTF parses");
+
+        // The only 16-byte struct is base_ctx, which lives in the base
+        // and must be excluded — the program has none.
+        let choice = discover_payload_btf_id(&btf, 16, "");
+        assert_eq!(
+            choice.target_type_id, 0,
+            "base-BTF struct base_ctx (size 16) must NOT shadow discovery; \
+             program has no size-16 struct, so the result must be 0, got {}",
+            choice.target_type_id,
+        );
+
+        // Sanity: the program's own 8-byte struct IS discoverable,
+        // proving the program section is actually probed (not skipped).
+        let prog = discover_payload_btf_id(&btf, 8, "");
+        assert_ne!(
+            prog.target_type_id, 0,
+            "program struct scx_payload (size 8) must be discoverable, \
+             proving the program id range is probed",
         );
     }
 

@@ -27,9 +27,11 @@ use super::{CgroupDef, PayloadEntry, PayloadSource, ScenarioState, validate_memp
 /// file on failure to see exactly which PIDs landed in which cgroup
 /// at spawn time AND how `Op::MoveAllTasks` migrated them. The file
 /// lives in tmpfs and survives the scenario teardown (only the
-/// cgroup directories are rmdir'd; this file stays put). Cleared by
-/// the runtime at the start of each test run so an assertion in
-/// test N never reads stale placement from test N-1.
+/// cgroup directories are rmdir'd; this file stays put). The log is
+/// append-only and is never cleared between runs (the only writer,
+/// `append_placement_log`, opens with `.append(true)` and never
+/// truncates), so lines from prior runs accumulate — a reader that
+/// needs only the current run's placement must filter accordingly.
 pub const PLACEMENT_LOG_PATH: &str = "/tmp/ktstr-placement.log";
 
 /// Append `msg` (with a trailing newline) to the placement-history

@@ -199,15 +199,15 @@ pub(crate) struct KernelSymbols {
     /// without sched_ext.
     pub scx_root: Option<u64>,
     /// Kernel virtual address of `scx_tasks` — the global LIST_HEAD
-    /// (`kernel/sched/ext.c:47`) every scx-managed task is linked
+    /// (`kernel/sched/ext.c:48`) every scx-managed task is linked
     /// into via `task_struct.scx.tasks_node`. The host walker uses
     /// this anchor to enumerate every task owned by an scx_sched
     /// across ALL CPUs in one walk, surviving the per-rq
     /// runnable_list drain that `scx_bypass`
-    /// (`kernel/sched/ext.c:5304-5404`) triggers during scheduler
+    /// (`kernel/sched/ext.c:5448`) triggers during scheduler
     /// teardown — `scx_tasks` outlives runnable_list because tasks
     /// only leave it via `sched_ext_dead`
-    /// (`kernel/sched/ext.c:3792`). `None` when the symbol is
+    /// (`kernel/sched/ext.c:3858`). `None` when the symbol is
     /// absent (kernel without sched_ext, or stripped vmlinux).
     pub scx_tasks: Option<u64>,
     /// Kernel virtual address of the top-level page table.
@@ -227,10 +227,10 @@ pub(crate) struct KernelSymbols {
     /// None on 7.1+ or when the symbol is absent.
     pub scx_watchdog_timeout: Option<u64>,
     /// Kernel virtual address of `scx_watchdog_timestamp` (file-scope
-    /// static `unsigned long` declared at `kernel/sched/ext.c:94`).
+    /// static `unsigned long` declared at `kernel/sched/ext.c:93`).
     /// Updated to `jiffies` by `scx_watchdog_workfn`
-    /// (`kernel/sched/ext.c:3383`) each time the workqueue runs;
-    /// `scx_tick` (`kernel/sched/ext.c:3409`) reads it via `READ_ONCE`
+    /// (`kernel/sched/ext.c:3473`) each time the workqueue runs;
+    /// `scx_tick` (`kernel/sched/ext.c:3492`) reads it via `READ_ONCE`
     /// and fires `SCX_EXIT_ERROR_STALL` when
     /// `jiffies > timestamp + root->watchdog_timeout`. Reading it at
     /// scan time gives the dual-snapshot path the same global stall
@@ -241,7 +241,7 @@ pub(crate) struct KernelSymbols {
     /// [`text_kva_to_pa_with_base`].
     pub scx_watchdog_timestamp: Option<u64>,
     /// Kernel virtual address of `scx_watchdog_interval` (file-scope
-    /// static `unsigned long` at `kernel/sched/ext.c:86`). The workfn
+    /// static `unsigned long` at `kernel/sched/ext.c:85`). The workfn
     /// poll cadence. Must be updated alongside `watchdog_timeout` to
     /// make the override effective within one interval period.
     pub scx_watchdog_interval: Option<u64>,
@@ -279,8 +279,8 @@ pub(crate) struct KernelSymbols {
     /// Used with MSR_LSTAR to derive the runtime virtual KASLR offset:
     /// `virt_kaslr_offset = LSTAR_runtime - entry_SYSCALL_64_link`.
     ///
-    /// On non-FRED x86_64 kernels, `idt_syscall_init` at
-    /// `arch/x86/kernel/cpu/common.c:2257` writes `wrmsrq(MSR_LSTAR,
+    /// On non-FRED x86_64 kernels, `idt_syscall_init`
+    /// (`arch/x86/kernel/cpu/common.c:2268`) writes `wrmsrq(MSR_LSTAR,
     /// (unsigned long)entry_SYSCALL_64)` — the cast resolves to the
     /// post-relocation runtime KVA (relocation is applied by
     /// `handle_relocations` in `arch/x86/boot/compressed/misc.c`).
@@ -294,7 +294,8 @@ pub(crate) struct KernelSymbols {
     /// at `freeze_coord::mod` continues to handle physical KASLR.
     ///
     /// **FRED caveat**: on CONFIG_X86_FRED=y kernels, `syscall_init`
-    /// at common.c:2303-2304 SKIPS `idt_syscall_init` entirely — the
+    /// (common.c:2304) SKIPS the `idt_syscall_init()` call (common.c:2317)
+    /// entirely — the
     /// FRED entry-points live in MSR_IA32_FRED_CONFIG, not MSR_LSTAR.
     /// On such kernels MSR_LSTAR reads back as 0 (the value KVM
     /// seeded at vCPU init); the LSTAR-derivation path must gate on
@@ -353,12 +354,9 @@ pub(crate) struct KernelSymbols {
     /// `None` when the symbol is absent (UMA build, stripped vmlinux,
     /// or kernel built without `CONFIG_NUMA`).
     ///
-    /// Stub-stage `dead_code` suppression: the consumer
-    /// ([`crate::vmm::capture_numa::build`]) is wired but returns
-    /// `None` until the implementer fills in the walker. Removing
-    /// this attribute is the natural marker for "the producer has
-    /// landed" — drop it the moment a real reader appears.
-    #[allow(dead_code)]
+    /// Read by [`crate::vmm::capture_numa::build`], which walks each
+    /// node's `pglist_data.node_zones[]` and sums `zone.vm_numa_event[]`
+    /// into one per-node NUMA-event row.
     pub node_data: Option<u64>,
 }
 

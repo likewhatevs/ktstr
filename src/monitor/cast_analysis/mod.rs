@@ -87,15 +87,19 @@
 //! to `Pointer{struct_type_id}` after the standard R0..R5 clobber.
 //!
 //! Plain-helper return values: at every `BPF_CALL` whose `src_reg ==
-//! 0` (the helper-call form per linux uapi `bpf.h`) AND
-//! `imm == BPF_FUNC_map_lookup_elem`, R1's pre-clobber state is
+//! 0` (the helper-call form per linux uapi `bpf.h`) AND `imm ==
+//! BPF_FUNC_map_lookup_elem` OR `imm ==
+//! BPF_FUNC_map_lookup_percpu_elem`, R1's pre-clobber state is
 //! consulted. If R1 was [`RegState::DatasecPointer`] into a
 //! `BTF_KIND_DATASEC` named `.maps` and the targeted map's BTF
 //! declaration carries a `value` member whose type peels to
 //! `Ptr -> Struct/Union`, R0 is typed `Pointer{value_struct_id}`
 //! after the clobber. Other helper ids leave R0 Unknown — the
-//! analyzer keeps a strict per-helper allowlist (currently length 1)
-//! to bound false-positive risk. Maps whose value type is a primitive
+//! analyzer keeps a strict per-helper allowlist (the two map-lookup
+//! ids, `BPF_FUNC_map_lookup_elem` and
+//! `BPF_FUNC_map_lookup_percpu_elem`) to bound false-positive risk;
+//! `BPF_FUNC_map_update_elem` drives a separate spill-bridge path
+//! rather than typing R0. Maps whose value type is a primitive
 //! (e.g. stat counters declared `__type(value, u64)`) drop because
 //! `Ptr -> u64` does not peel to a Struct/Union.
 //!
@@ -641,8 +645,8 @@ struct Access {
 /// `BPF_PSEUDO_MAP_VALUE` reference into a `.bss` / `.data` /
 /// `.rodata` global section — see [`DatasecPointer`]. `subprog_returns`
 /// annotates `BPF_PSEUDO_CALL` sites whose resolved subprog name
-/// matches the arena-allocator allowlist (e.g. `scx_static_alloc_internal`,
-/// `scx_alloc_internal`, `bpf_arena_alloc_pages`); after the standard
+/// matches the arena-allocator allowlist (`scx_static_alloc_internal`,
+/// `scx_alloc_internal`); after the standard
 /// R0..=R5 clobber the analyzer seeds R0 to
 /// [`RegState::ArenaU64FromAlloc`] so the value flows into STX-side
 /// arena cast detection. See [`SubprogReturn`].
@@ -736,7 +740,7 @@ struct Access {
 /// The loop is capped at [`MAX_PASSES`] iterations to bound work on
 /// programs that resist convergence. The cap matches the BPF
 /// verifier's call-depth limit (`MAX_CALL_FRAMES = 8` in linux
-/// `kernel/bpf/verifier.h`), since each additional layer of typed-arg
+/// `include/linux/bpf_verifier.h`), since each additional layer of typed-arg
 /// propagation corresponds to one more layer of subprog nesting. A
 /// program that has not converged after 8 passes will not converge
 /// further along the call-depth axis — its caller_arg_types snapshot
@@ -837,7 +841,7 @@ pub fn analyze_casts(
 /// Maximum fixpoint iterations [`analyze_casts`] runs before bailing
 /// on convergence. Set to 8 to mirror the BPF verifier's
 /// `MAX_CALL_FRAMES` call-depth limit (linux
-/// `kernel/bpf/verifier.h`): each additional pass propagates
+/// `include/linux/bpf_verifier.h`): each additional pass propagates
 /// caller-arg typings one nesting level deeper, so 8 passes cover the
 /// deepest call graph the verifier accepts. A program that would need
 /// pass 9 to converge cannot exist in valid BPF bytecode the analyzer
@@ -1882,11 +1886,11 @@ impl<'a> Analyzer<'a> {
                         // `BPF_PSEUDO_KFUNC_CALL = 2` is kfunc; the
                         // verifier treats `src_reg == 0` as a kernel
                         // helper-id call). `imm` is the helper id
-                        // (`BPF_FUNC_*`); the analyzer types R0 only
-                        // for `bpf_map_lookup_elem` (helper id 1) —
-                        // no other helper has a pointer-to-struct
-                        // return shape we can resolve from the BPF
-                        // program BTF alone. The map descriptor lives
+                        // (`BPF_FUNC_*`); the analyzer types R0 for
+                        // `bpf_map_lookup_elem` (helper id 1) and
+                        // `bpf_map_lookup_percpu_elem` (the arm guard
+                        // above), whose returns we can resolve from
+                        // the BPF program BTF alone. The map descriptor lives
                         // in R1 at the call site (per
                         // `bpf_map_lookup_elem_proto::arg1_type =
                         // ARG_CONST_MAP_PTR` in linux

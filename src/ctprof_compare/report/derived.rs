@@ -100,8 +100,8 @@ fn write_derived_all<W: fmt::Write>(
     //
     // Pin fudged rows (display_key starting with `[fudged`)
     // outside the truncation budget so the operator-requested
-    // N:1 merges always render. Mirrors the primary-section
-    // partition at primary.rs:276-289 — without the partition,
+    // N:1 merges always render. Mirrors the fudged-row
+    // partition in primary::write_primary_all — without it,
     // the line limit could silently bury fudged rows whenever
     // the top-N normal movers consumed the budget first.
     let (fudged_rows, normal_rows): (Vec<&DerivedRow>, Vec<&DerivedRow>) = derived_rows

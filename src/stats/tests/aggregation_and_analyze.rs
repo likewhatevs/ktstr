@@ -1756,8 +1756,10 @@ fn aggregate_samples_for_phase_returns_none_on_empty_or_all_nan() {
 /// Each entry carries an explicit `registry_key` (distinct from its display
 /// label — `spread`→`worst_spread`, `migrations`→`total_migrations`, …), so the
 /// guard resolves and polarity-checks all 13 entries, including the 9 typed ones
-/// whose short labels a display-name lookup could not resolve (so they went
-/// unchecked before). Those typed entries read GauntletRow fields directly
+/// — 8 of whose short labels a display-name lookup could not resolve (the ninth,
+/// `migration_ratio`, whose short label IS a registry name but resolves to the
+/// PerPhase entry, not its cross-run `worst_migration_ratio` key). All went
+/// unchecked before. Those typed entries read GauntletRow fields directly
 /// (sidecar-zeroed, not the ext 0.0-sentinel), but `find_outliers` flags their
 /// HIGH tail identically, so they too must be LowerBetter.
 #[test]

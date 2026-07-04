@@ -5,17 +5,17 @@
 //! transition) through the host-side capture path (bridge stamps
 //! every periodic capture with the live step_index, sample
 //! conversion preserves it, `SampleSeries::by_stimulus_phase` partitions
-//! by it) into [`crate::assert::build_phase_buckets`] which folds
-//! per-phase samples into the rendered [`crate::assert::PhaseBucket`]
+//! by it) into [`ktstr::assert::build_phase_buckets`] which folds
+//! per-phase samples into the rendered [`ktstr::assert::PhaseBucket`]
 //! vec the operator sees on `result.stats.phases`. The unit tests
-//! at `src/assert/tests_phase_bucket.rs` pin each stage in
+//! at `src/assert/tests_phase_bucket/` pin each stage in
 //! isolation against synthetic fixtures; this e2e test boots a
 //! real guest under scx-ktstr, drives a 2-Step scenario with
 //! periodic captures, and asserts the actual pipeline flows
 //! step_index through the bridge into the rendered phases vec
 //! end-to-end.
 //!
-//! ## Why this test exists when 38 unit tests already cover the surface
+//! ## Why this test exists when the phase-bucket unit tests already cover the surface
 //!
 //! Each stage of the pipeline has a unit test (wiring,
 //! compare-pass, dual-gate, matches_phase / passes_delta_
@@ -39,7 +39,7 @@
 //!    scx-ktstr's enqueue/dispatch paths advancing across
 //!    both phases.
 //! 3. In `post_vm`, drain the bridge BEFORE
-//!    [`crate::test_support::eval::evaluate_vm_result`]
+//!    `evaluate_vm_result`
 //!    consumes it, build a [`SampleSeries`], fold through
 //!    `build_phase_buckets`, and assert the load-bearing
 //!    pipeline contracts (assertions A1-A4 below).
@@ -806,7 +806,7 @@ fn assert_watch_snapshot_trip_phase_stamped(result: &VmResult) -> Result<()> {
         // host_current_step (HOST-side mirror) at trip time. This atomic
         // is updated when the guest publishes a STIMULUS frame via the
         // bulk virtio-console port, which the scenario driver sends
-        // AFTER apply_ops returns (scenario/ops/mod.rs:1248). For the
+        // AFTER apply_ops returns (scenario/ops/mod.rs:1695). For the
         // 1-Step scenario here, the watchpoint arms inside apply_ops
         // and fires on the next jiffies tick — that fire can race the
         // STIMULUS frame for Step[0]. When the trip wins the race, the

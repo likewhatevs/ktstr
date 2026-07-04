@@ -30,7 +30,7 @@
 //!   XACCT family does not gate on the `delayacct=on` runtime
 //!   toggle (set on the guest cmdline via the bare `delayacct`
 //!   boot param + `sysctl.kernel.task_delayacct=1` in
-//!   `vmm/mod.rs`); `xacct_add_tsk` is unconditional once
+//!   `vmm/setup/mod.rs`); `xacct_add_tsk` is unconditional once
 //!   `CONFIG_TASK_XACCT` is built. The
 //!   `CONFIG_TASK_DELAY_ACCT` delay-family fields
 //!   (cpu_delay / blkio_delay / etc) travel through the same
@@ -66,7 +66,7 @@ use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
 use ktstr::workload::WorkType;
 
 // ---------------------------------------------------------------------------
-// CONFIG_TASK_IO_ACCOUNTING — assert rchar/wchar > 0 after file I/O
+// CONFIG_TASK_IO_ACCOUNTING — assert wchar > 0 after file I/O
 // ---------------------------------------------------------------------------
 
 /// Run the [`WorkType::IoSyncWrite`] workload inside the guest —
@@ -175,7 +175,7 @@ fn ctprof_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResult> 
 // test below covers the same DELAY_ACCT runtime toggle via the
 // netlink delivery channel.
 // ---------------------------------------------------------------------------
-// CONFIG_PSI — assert host PSI cpu.some.total_usec > 0 after CPU pressure
+// CONFIG_PSI — assert host PSI /proc/pressure/cpu is reachable (parser wired) after CPU pressure
 // ---------------------------------------------------------------------------
 
 /// Drive CPU oversubscription inside the guest — more workers
@@ -259,7 +259,7 @@ fn ctprof_capture_reaches_host_psi_cpu_under_oversubscription(ctx: &Ctx) -> Resu
 
 // ---------------------------------------------------------------------------
 // CONFIG_TASKSTATS + CONFIG_TASK_DELAY_ACCT + CONFIG_TASK_XACCT —
-// assert taskstats genetlink path populates cpu_delay and hiwater_rss
+// assert taskstats genetlink path populates hiwater_rss (hard); cpu_delay reachability-only
 // ---------------------------------------------------------------------------
 
 /// Drive CPU oversubscription inside the guest — more workers

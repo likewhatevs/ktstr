@@ -25,11 +25,9 @@ fn troubleshooting_send_sys_rdy_doc_matches_emit_fmt() {
          test in the same change",
     );
     assert!(
-        TOPOLOGY_RS.contains(
-            "https://likewhatevs.github.io/ktstr/guide/troubleshooting.html#send_sys_rdy-timeout"
-        ),
+        TOPOLOGY_RS.contains("https://ktstr.dev/guide/troubleshooting.html#send_sys_rdy-timeout"),
         "src/vmm/rust_init/topology.rs must emit the published docs URL \
-         `https://likewhatevs.github.io/ktstr/guide/troubleshooting.html#send_sys_rdy-timeout`; \
+         `https://ktstr.dev/guide/troubleshooting.html#send_sys_rdy-timeout`; \
          a repo-source path is not clickable from a VM dmesg",
     );
 
@@ -61,9 +59,8 @@ fn troubleshooting_send_sys_rdy_doc_matches_emit_fmt() {
          `send_sys_rdy failed within boot budget`",
     );
     assert!(
-        TROUBLESHOOTING_MD.contains(
-            "https://likewhatevs.github.io/ktstr/guide/troubleshooting.html#send_sys_rdy-timeout"
-        ),
+        TROUBLESHOOTING_MD
+            .contains("https://ktstr.dev/guide/troubleshooting.html#send_sys_rdy-timeout"),
         "troubleshooting.md must show the published docs URL the \
          WARN emits, so an operator landing on this section can \
          confirm they're at the right page",

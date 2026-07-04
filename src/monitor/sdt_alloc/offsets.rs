@@ -62,15 +62,14 @@ impl SdtAllocOffsets {
     ///
     /// BPF program BTFs emit `BTF_KIND_FWD` (forward declaration, no
     /// body) for any struct the program references only by pointer.
-    /// The four "structural" types — `scx_allocator`, `sdt_pool`,
-    /// `sdt_desc`, `sdt_chunk` — must surface as full struct
-    /// definitions: the walker derives member offsets from each, and
-    /// a forward declaration carries no member information. A Fwd for
-    /// any of those four is surfaced as `Err` so the dump pipeline
-    /// records a clear diagnostic instead of crashing on missing
-    /// members.
+    /// Three "structural" types — `scx_allocator`, `sdt_pool`,
+    /// `sdt_desc` — must surface as full struct definitions: the
+    /// walker derives member offsets from each, and a forward
+    /// declaration carries no member information. A Fwd for any of
+    /// those three is surfaced as `Err` so the dump pipeline records a
+    /// clear diagnostic instead of crashing on missing members.
     ///
-    /// `sdt_data` is the exception: lavd and other schedulers that
+    /// `sdt_chunk` and `sdt_data` are the exceptions: lavd and other schedulers that
     /// only consume opaque allocator-returned pointers emit `sdt_data`
     /// as a `BTF_KIND_FWD`. The walker only needs the size of the
     /// header (the leading `union sdt_id`, 8 bytes; the `payload[]`

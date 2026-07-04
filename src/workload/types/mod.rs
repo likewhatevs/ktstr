@@ -85,10 +85,10 @@ pub use work_type::{CustomCfg, CustomFn, WorkType, WorkerCtx};
 /// `anyhow::bail!` strings did so call sites that match on the
 /// rendered message keep working.
 ///
-/// Each variant carries `group_idx` (the position of the offending
-/// `WorkSpec` inside `WorkloadConfig::composed`; the primary
-/// group is index 0) so multi-group scenarios can locate the
-/// offending entry without re-parsing the message string. Variants
+/// Each variant carries `group_idx`, a unified group index where 0
+/// is the primary group and the i-th `WorkloadConfig::composed`
+/// entry is `group_idx == i + 1`, so multi-group scenarios can
+/// locate the offending entry without re-parsing the message string. Variants
 /// with multiple constraint inputs (depth, divisor, observed count)
 /// expose those values as named fields to the same end.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, thiserror::Error)]
@@ -104,8 +104,8 @@ pub enum WorkTypeValidationError {
          no runtime (see [`WorkType::IdleChurn`] variant doc)"
     )]
     ZeroBurstDuration {
-        /// Index of the offending group in
-        /// `WorkloadConfig::composed` (primary group = 0).
+        /// Unified group index of the offending group: 0 for the
+        /// primary group, `i + 1` for `WorkloadConfig::composed[i]`.
         group_idx: usize,
     },
     /// [`WorkType::IdleChurn`] with `sleep_duration == Duration::ZERO`.
@@ -123,8 +123,8 @@ pub enum WorkTypeValidationError {
          doc rationale in [`WorkType::IdleChurn`])."
     )]
     ZeroSleepDuration {
-        /// Index of the offending group in
-        /// `WorkloadConfig::composed` (primary group = 0).
+        /// Unified group index of the offending group: 0 for the
+        /// primary group, `i + 1` for `WorkloadConfig::composed[i]`.
         group_idx: usize,
     },
     /// [`WorkType::TimerLatency`] with `interval_us == 0`. A zero interval never
@@ -136,8 +136,8 @@ pub enum WorkTypeValidationError {
          busy-spin (see [`WorkType::TimerLatency`] variant doc)"
     )]
     ZeroTimerInterval {
-        /// Index of the offending group in
-        /// `WorkloadConfig::composed` (primary group = 0).
+        /// Unified group index of the offending group: 0 for the
+        /// primary group, `i + 1` for `WorkloadConfig::composed[i]`.
         group_idx: usize,
     },
     /// [`WorkType::NetTraffic`] with `frame_bytes` outside `[60, 1514]`. Below
@@ -152,8 +152,8 @@ pub enum WorkTypeValidationError {
     NetTrafficFrameBytes {
         /// The offending `frame_bytes` value the caller supplied.
         frame_bytes: u16,
-        /// Index of the offending group in
-        /// `WorkloadConfig::composed` (primary group = 0).
+        /// Unified group index of the offending group: 0 for the
+        /// primary group, `i + 1` for `WorkloadConfig::composed[i]`.
         group_idx: usize,
     },
     /// [`WorkType::IrqWake`] with `frame_bytes` outside `[60, 1514]` — same bound
@@ -168,8 +168,8 @@ pub enum WorkTypeValidationError {
     IrqWakeFrameBytes {
         /// The offending `frame_bytes` value the caller supplied.
         frame_bytes: u16,
-        /// Index of the offending group in
-        /// `WorkloadConfig::composed` (primary group = 0).
+        /// Unified group index of the offending group: 0 for the
+        /// primary group, `i + 1` for `WorkloadConfig::composed[i]`.
         group_idx: usize,
     },
     /// [`WorkType::WakeChain`] with `depth < 2`. A 1-stage chain has
@@ -184,8 +184,8 @@ pub enum WorkTypeValidationError {
     InsufficientWakeChainDepth {
         /// The offending `depth` value the caller supplied.
         depth: usize,
-        /// Index of the offending group in
-        /// `WorkloadConfig::composed` (primary group = 0).
+        /// Unified group index of the offending group: 0 for the
+        /// primary group, `i + 1` for `WorkloadConfig::composed[i]`.
         group_idx: usize,
     },
     /// `num_workers` is not a positive multiple of the variant's
@@ -198,8 +198,8 @@ pub enum WorkTypeValidationError {
     NonDivisibleWorkerCount {
         /// PascalCase variant name from [`WorkType::name`].
         name: String,
-        /// Index of the offending group in
-        /// `WorkloadConfig::composed` (primary group = 0).
+        /// Unified group index of the offending group: 0 for the
+        /// primary group, `i + 1` for `WorkloadConfig::composed[i]`.
         group_idx: usize,
         /// Required group size (the variant's
         /// [`worker_group_size`](WorkType::worker_group_size)).
@@ -225,8 +225,8 @@ pub enum WorkTypeValidationError {
         /// Static name of the offending field —
         /// `"hot_iters"`, `"cold_iters"`, or `"period_iters"`.
         field: &'static str,
-        /// Index of the offending group in
-        /// `WorkloadConfig::composed` (primary group = 0).
+        /// Unified group index of the offending group: 0 for the
+        /// primary group, `i + 1` for `WorkloadConfig::composed[i]`.
         group_idx: usize,
     },
 }

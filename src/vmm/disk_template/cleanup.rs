@@ -33,8 +33,9 @@ use super::*;
 ///
 /// All three shapes embed the originating peer's pid in the filename.
 /// The sweep parses that pid and probes liveness via
-/// `kill(pid, None)` (rust-side: [`nix::sys::signal::kill`] with
-/// `Signal::None`). The kernel returns:
+/// `kill(pid, None)` (rust-side: [`nix::sys::signal::kill`] passing
+/// `Option::None` for the signal — no signal, probe only). The
+/// kernel returns:
 /// - `Ok(())` — pid is live AND in-policy for our uid (the signal
 ///   COULD have been delivered). Debris is owned by a peer that
 ///   may still publish; leave alone.
@@ -45,8 +46,8 @@ use super::*;
 ///   (debris left on disk) are recoverable, false positives
 ///   (deleting live state) are not.
 ///
-/// Mirrors `crate::cache::clean_orphaned_tmp_dirs` in
-/// `src/cache.rs` — the disk-template cache and the kernel-image
+/// Mirrors `crate::cache::housekeeping::clean_orphaned_tmp_dirs` in
+/// `src/cache/housekeeping.rs` — the disk-template cache and the kernel-image
 /// cache use the same pid-in-suffix + ESRCH-probe contract for
 /// cross-process cleanup. The two are independent because their
 /// debris namespaces don't overlap (kernel cache uses `.tmp-`
@@ -71,9 +72,7 @@ use super::*;
 /// # When to call this
 ///
 /// **Library code (the steady state):** [`clean_all`] invokes this
-/// before walking published entries, and the framework can also
-/// call it opportunistically before a `store_atomic` to keep the
-/// cache root tidy. Library callers do NOT need to invoke this
+/// before walking published entries. Library callers do NOT need to invoke this
 /// directly to make a workload run — `ensure_template` does not
 /// trip on stale debris because each new build picks a unique
 /// `(cache_key, pid)` filename via [`staging_image_path`].
@@ -108,15 +107,14 @@ use super::*;
 /// Returns the count of removed debris entries (info-level
 /// tracing also logs each removal).
 ///
-/// `dead_code` allow: kept as the operator-facing entry point
-/// for a future `cargo ktstr clean` subcommand and the
-/// opportunistic in-process sweep before `store_atomic`.
-#[allow(dead_code)]
+/// Called once per process from `ensure_template` (via
+/// `sweep_cache_debris_once`) to GC dead-pid debris on the production
+/// path, plus the operator-facing `clean_all`.
 pub fn clean_orphaned_tmp_dirs(cache_root: &Path) -> Result<usize> {
     if !cache_root.is_dir() {
         // Cache root not yet materialised — nothing to sweep.
         // Mirrors the early-return at the head of
-        // [`crate::cache::clean_orphaned_tmp_dirs`].
+        // [`crate::cache::housekeeping::clean_orphaned_tmp_dirs`].
         return Ok(0);
     }
     let read_dir = match std::fs::read_dir(cache_root) {
@@ -196,7 +194,7 @@ pub fn clean_orphaned_tmp_dirs(cache_root: &Path) -> Result<usize> {
         // Reject non-positive pids defensively — `kill(0, ...)`
         // probes the caller's own process group, `kill(-N, ...)`
         // probes process group N. Same hardening as
-        // [`crate::cache::clean_orphaned_tmp_dirs`].
+        // [`crate::cache::housekeeping::clean_orphaned_tmp_dirs`].
         if pid <= 0 {
             continue;
         }
@@ -208,10 +206,10 @@ pub fn clean_orphaned_tmp_dirs(cache_root: &Path) -> Result<usize> {
             continue;
         }
         let path = dir_entry.path();
-        // The two debris shapes need different removers. Probe
-        // via `metadata` rather than re-checking the prefix —
-        // the prefix already classified the path; metadata picks
-        // the right `remove_*` arm.
+        // The debris shapes need two different removers (file vs
+        // directory). Probe via `file_type()` rather than
+        // re-checking the prefix — the prefix already classified
+        // the path; `file_type()` picks the right `remove_*` arm.
         let result = match dir_entry.file_type() {
             Ok(ft) if ft.is_dir() => std::fs::remove_dir_all(&path),
             Ok(_) => std::fs::remove_file(&path),
@@ -310,11 +308,14 @@ pub fn clean_orphaned_tmp_dirs(cache_root: &Path) -> Result<usize> {
 ///
 /// Each entry's per-key lockfile is acquired non-blocking in
 /// `LOCK_EX` mode via [`crate::flock::try_flock`]. An entry whose
-/// lock is held by a live peer (an active test run mid-FICLONE,
-/// or a concurrent template build that finished its rename but is
-/// still inside the lock holder's critical section) is skipped
-/// rather than removed — the holder is using the entry; deleting
-/// it would yank the template out from under a live `clone_to_per_test`.
+/// lock is held by a live peer (a concurrent template build that
+/// finished its rename but is still inside the lock holder's
+/// critical section) is skipped rather than removed — the skip
+/// prevents racing a builder's publish. Per-test clones
+/// ([`clone_to_per_test`]) take no lock, so a held lock never
+/// indicates a live clone; those clones are protected instead by
+/// Unix open-fd inode semantics (an already-open fd survives the
+/// remove-tree).
 ///
 /// The flock is held across the `remove_dir_all` so a peer that
 /// blocks on the lock while we're removing observes a clean
@@ -345,10 +346,6 @@ pub fn clean_orphaned_tmp_dirs(cache_root: &Path) -> Result<usize> {
 /// - The `.locks/` subdirectory (lockfile namespace).
 /// - Any cache entry whose lockfile is currently held by a live
 ///   peer (logged at `info` so the operator sees what was kept).
-/// - Any cache entry whose `template.img` is missing (corrupt /
-///   half-installed) — those are removed regardless of lock state
-///   because they can't serve a `clone_to_per_test` and waste
-///   inode space.
 /// - Non-UTF-8 entry names (foreign — not produced by ktstr).
 /// - Files at the cache root (only directories are cache entries;
 ///   `clean_orphaned_tmp_dirs` already swept the staging-image
@@ -465,7 +462,8 @@ pub fn clean_all() -> Result<usize> {
             Ok(Some(fd)) => fd,
             Ok(None) => {
                 // A live peer holds the lock. Skip — its work
-                // would race a `remove_dir_all` mid-clone.
+                // would race a `remove_dir_all` against a
+                // concurrent builder's publish.
                 tracing::info!(
                     cache_key = %name,
                     lockfile = %lock_path.display(),
@@ -513,4 +511,54 @@ pub fn clean_all() -> Result<usize> {
         drop(lock_fd);
     }
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_orphaned_tmp_dirs_removes_dead_pid_debris_keeps_live_and_published() {
+        // pid 2147483647 (i32::MAX) is above pid_max, so kill() -> ESRCH
+        // (dead); our own pid is live. Verify all three debris shapes are
+        // reclaimed only for the dead owner, and published entries / .locks
+        // / live-pid in-flight files are never touched.
+        let base = std::env::temp_dir().join(format!("ktstr-dtsweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("mk cache root");
+        let live = std::process::id();
+
+        let dead_staging = base.join("template.img.in-flight.somekey.2147483647");
+        let dead_pertest = base.join(".per-test-2147483647-aa-bb.img");
+        let dead_stagedir = base.join("somekey.tmp.2147483647");
+        std::fs::write(&dead_staging, b"x").unwrap();
+        std::fs::write(&dead_pertest, b"x").unwrap();
+        std::fs::create_dir(&dead_stagedir).unwrap();
+
+        let live_staging = base.join(format!("template.img.in-flight.somekey.{live}"));
+        let live_pertest = base.join(format!(".per-test-{live}-cc-dd.img"));
+        std::fs::write(&live_staging, b"x").unwrap();
+        std::fs::write(&live_pertest, b"x").unwrap();
+
+        let published = base.join("somekey");
+        let locks = base.join(".locks");
+        std::fs::create_dir(&published).unwrap();
+        std::fs::create_dir(&locks).unwrap();
+
+        let removed = clean_orphaned_tmp_dirs(&base).expect("sweep");
+
+        assert!(!dead_staging.exists(), "dead-pid staging image reclaimed");
+        assert!(
+            !dead_pertest.exists(),
+            "dead-pid per-test backing reclaimed"
+        );
+        assert!(!dead_stagedir.exists(), "dead-pid staging dir reclaimed");
+        assert!(live_staging.exists(), "live-pid staging image kept");
+        assert!(live_pertest.exists(), "live-pid per-test backing kept");
+        assert!(published.exists(), "published cache entry untouched");
+        assert!(locks.exists(), ".locks dir untouched");
+        assert_eq!(removed, 3, "exactly the three dead-pid entries removed");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

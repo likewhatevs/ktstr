@@ -695,6 +695,7 @@ fn claim_against_worker_report_via_derived_accessors() {
         is_messenger: false,
         group_idx: 0,
         affinity_error: None,
+        sched_policy_error: None,
         phase_slices: vec![],
         taobench_whole: None,
     };
@@ -866,7 +867,7 @@ fn verdict_inconclusive_does_not_mask_prior_failure() {
     // `Fail > Inconclusive > Pass > Skip` lattice — a verdict that
     // recorded a real failure before a later Inconclusive must
     // surface as Fail, not Inconclusive. Pins the symmetric
-    // counterpart of `verdict_skip_does_not_mask_prior_failure`.
+    // counterpart of `verdict_skip_preserves_prior_failure`.
     let mut v = Verdict::new();
     let counter = 5u64;
     claim!(v, counter).at_most(3); // records Fail
@@ -1021,7 +1022,7 @@ fn assert_detail_display_with_kind_prefixes_variant_token() {
 }
 
 /// `display_with_kind` rendering uses the Debug form of the
-/// variant (e.g. `SchedulerDied`), not the snake_case rename
+/// variant (e.g. `SchedulerCrashed`), not the snake_case rename
 /// from any future `serde::Serialize` impl. Pinning the spelling
 /// for a multi-word variant catches a swap from `{:?}` to
 /// `{:#?}` (which would line-break) or to a serde-driven
@@ -1037,11 +1038,13 @@ fn assert_detail_display_with_kind_uses_debug_token_for_multiword_variant() {
 
 // -- Verdict::log_passes ---------------------------------------------
 
-/// New verdicts default to log_passes=false so the zero-cost
-/// pass path stays unallocated under normal runs. `KTSTR_LOG_PASSES`
-/// env-var seeding is tested separately in
-/// `log_passes_env_var_enables_default` via SAFETY-bracketed
-/// env mutation.
+/// New verdicts default to log_passes=false, which suppresses the
+/// positive-confirmation `tracing::info!` output on the pass path
+/// (the format/log cost); it does not make the pass path
+/// allocation-free — a `PassDetail` is pushed to `result.passes`
+/// on every passing claim regardless of the flag. The default is
+/// seeded from the `KTSTR_LOG_PASSES` env var, read once at
+/// `Verdict::new` time.
 #[test]
 fn verdict_log_passes_default_off() {
     // Guard against test pollution: env-var-seeded tests below
@@ -1114,8 +1117,10 @@ fn verdict_log_passes_emits_event_on_scalar_pass() {
 }
 
 /// A passing scalar claim emits no `tracing::info!` event when
-/// log_passes is off (the default), preserving the
-/// allocation-free pass path documented on the flag.
+/// log_passes is off (the default) — the flag suppresses the
+/// positive-confirmation tracing event (the format/log cost). It
+/// does not avoid the `PassDetail` allocation, which happens on
+/// every pass regardless of the flag.
 #[tracing_test::traced_test]
 #[test]
 fn verdict_log_passes_silent_when_off() {

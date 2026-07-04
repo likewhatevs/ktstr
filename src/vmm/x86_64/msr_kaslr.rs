@@ -20,9 +20,11 @@
 //!
 //! # Why not phys_base subtraction?
 //!
-//! `freeze_coord` already derives a PHYSICAL KASLR offset from
-//! `phys_base - real_phys_base` (where `real_phys_base` is the
-//! iomem-derived value). Virtual and physical KASLR are
+//! A prior inline `freeze_coord` derivation subtracted
+//! `phys_base - real_phys_base`, but both reads targeted the same
+//! kernel global and the difference reduced to a structural zero,
+//! so that path was deleted (`freeze_coord/mod.rs` notes the
+//! removal). Virtual and physical KASLR are
 //! INDEPENDENTLY randomized by `choose_random_location` in
 //! `arch/x86/boot/compressed/kaslr.c` — `find_random_phys_addr` and
 //! `find_random_virt_addr` are separate slot-pickers. The virtual
@@ -37,7 +39,8 @@
 //! `MSR_IA32_FRED_CONFIG`, not `MSR_LSTAR` — so `MSR_LSTAR` reads
 //! back as 0 (the value KVM seeded at vCPU init). [`derive_virt_kaslr`]
 //! returns `Err(LstarZero)` in that case so the caller can fall back
-//! to the phys-base-derived path or skip virt-KASLR-dependent reads.
+//! to the guest-channel `KERN_ADDRS` `_text` derivation
+//! (`freeze_coord/dispatch.rs`) or skip virt-KASLR-dependent reads.
 //!
 //! `ktstr.kconfig` defensively asserts `# CONFIG_X86_FRED is not set`
 //! to keep this gate dormant for the kernels ktstr produces.
@@ -62,7 +65,8 @@
 //! host-side monitor REQUIRES non-pause-gated host-computed
 //! KASLR-aware PA derivation — the LSTAR readback path here is
 //! one of two such mechanisms (the other being the KERN_ADDRS
-//! guest channel at `src/vmm/freeze_coord/dispatch.rs::295-417`).
+//! guest channel — the `MSG_TYPE_KERN_ADDRS` arm at
+//! `src/vmm/freeze_coord/dispatch.rs`).
 //! Divergence is INTENTIONAL: documented here so future reviewers
 //! don't propose collapsing to a ref-VMM pattern that breaks
 //! continuous monitoring.
@@ -78,9 +82,9 @@
 //! distinction (e.g. the freeze-coord wire-in deciding whether to
 //! trust the virt-KASLR path) should cross-check with an EXTERNAL
 //! signal:
-//! kernel cmdline `nokaslr`, `CONFIG_RANDOMIZE_BASE`, or comparison
-//! against the `phys_base`-derived path at
-//! `freeze_coord/mod.rs:9083-9099`.
+//! kernel cmdline `nokaslr` or `CONFIG_RANDOMIZE_BASE`. (The
+//! former `phys_base`-derived cross-check no longer exists — that
+//! derivation reduced to a structural zero and was deleted.)
 //!
 //! # BSP-only read
 //!
@@ -94,11 +98,13 @@
 //! rendezvous (an AP that hasn't completed `cpu_init` yet still
 //! holds the KVM-seeded 0). Reading from BSP avoids the race.
 
-// Consumers of these helpers (KASLR wire-in into freeze_coord and
-// dump paths) are not yet wired up, so the virt-KASLR primitive
-// items look unused in non-test builds; suppress dead-code
-// warnings at module scope — the unit tests below DO exercise
-// every fn.
+// `read_and_derive` is wired into `freeze_coord`'s BSP wait-loop
+// (`crate::vmm::x86_64::msr_kaslr::read_and_derive` at
+// `freeze_coord/mod.rs`), but `is_retryable` has no production
+// caller today (only the unit tests below exercise it), so it
+// would warn as dead-code; suppress at module scope. The module
+// itself is `#[cfg(target_arch = "x86_64")]`-gated, so it is not
+// compiled on other architectures.
 #![allow(dead_code)]
 
 use anyhow::Result;
@@ -139,8 +145,8 @@ pub(crate) const KERNEL_HALF_CANONICAL_4LEVEL: u64 = 0xFFFF_8000_0000_0000;
 
 /// Reasons the LSTAR-based virt-KASLR derivation can decline a
 /// reading. Each is recoverable — the caller falls back to an
-/// alternate KASLR source (e.g. `phys_base` subtraction) or skips
-/// virt-KASLR-dependent reads for this dump.
+/// alternate KASLR source (the guest-channel `KERN_ADDRS` `_text`
+/// derivation) or skips virt-KASLR-dependent reads for this dump.
 ///
 /// `#[non_exhaustive]` so future paging-mode-specific gates (5-level
 /// canonical-half tightening, FRED-vs-early-boot disambiguation)
@@ -296,9 +302,9 @@ pub fn derive_virt_kaslr(lstar: u64, entry_syscall_64_link: u64) -> Result<u64, 
 ///   [`super::msr_io::read_one_msr`] with [`MSR_LSTAR`] and
 ///   [`derive_virt_kaslr`] directly to get the typed error.
 ///
-/// Callers typically fall back to the `phys_base`-derived KASLR
-/// path on any error here — that path is independent and works
-/// whether or not LSTAR is meaningful.
+/// Callers typically fall back to the guest-channel `KERN_ADDRS`
+/// `_text` derivation on any error here — that path is independent
+/// of LSTAR and works whether or not LSTAR is meaningful.
 ///
 /// # Confidential-compute caveat (SEV-ES / SEV-SNP / TDX)
 ///
@@ -306,11 +312,14 @@ pub fn derive_virt_kaslr(lstar: u64, entry_syscall_64_link: u64) -> Result<u64, 
 /// guests — fail-loud rather than silent-garbage. ktstr does NOT
 /// target SEV-ES / SEV-SNP / TDX guests today; the gates below
 /// catch it correctly via the existing `is_retryable()` /
-/// `LstarUnsupported` / `LstarZero` path at L209-225, fall
+/// `LstarUnsupported` / `LstarZero` path (`is_retryable` at
+/// L243-248, the `LstarUnsupported` gate in `read_and_derive` at
+/// L340-349; the wait-loop itself lives in `freeze_coord/mod.rs`,
+/// not this file), fall
 /// through to the wait-loop, and let the guest-channel
 /// `KERN_ADDRS` `_text` publisher
 /// (`src/vmm/freeze_coord/dispatch.rs`) or the `nokaslr` cmdline
-/// (`src/vmm/setup.rs`) become the authoritative source.
+/// (`src/vmm/setup/mod.rs`) become the authoritative source.
 ///
 /// Kernel-source paths the gates rely on:
 ///

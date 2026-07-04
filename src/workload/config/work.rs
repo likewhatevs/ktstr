@@ -266,7 +266,7 @@ impl Default for WorkSpec {
     /// `CgroupDef::merged_works`). The `workers_pct` mutex with
     /// `num_workers` only fires when BOTH are `Some(_)` — at
     /// default neither is set, so the
-    /// `CgroupDef::resolve_workers_pct` arm that emits the
+    /// `WorkSpec::resolve_workers_pct` arm that emits the
     /// `WorkSpec sets BOTH workers(...) and workers_pct(...)` bail
     /// does not trigger.
     fn default() -> Self {

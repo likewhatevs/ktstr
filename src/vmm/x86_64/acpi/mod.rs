@@ -1,6 +1,6 @@
 /// ACPI 2.0 table generation for SMP topology via zerocopy packed structs.
 ///
-/// Generates RSDP rev 2 -> XSDT/RSDT -> {FADT, MADT, SRAT, SLIT[, HMAT]},
+/// Generates RSDP rev 2 -> XSDT/RSDT -> {FADT, MADT, SRAT, SLIT[, HMAT][, MCFG]},
 /// with FADT referencing DSDT. RSDT with 32-bit pointers coexists with
 /// XSDT as an ACPI 1.0 fallback. FADT rev 6 with legacy hardware
 /// (PIC, PIT, ISA serial). Per-CPU APIC type: Local APIC (type 0) for
@@ -261,7 +261,8 @@ fn set_sdt_checksum(buf: &mut [u8]) {
 /// Write ACPI tables to guest memory.
 ///
 /// RSDP is at fixed address 0xE0000; remaining tables pack contiguously
-/// after it in order: DSDT, MADT, FADT, SRAT, SLIT, HMAT, RSDT, XSDT.
+/// after it in order: DSDT, MADT, FADT, SRAT, SLIT, HMAT[, MCFG], RSDT, XSDT
+/// (MCFG present only when PCI is enabled).
 ///
 /// SRAT memory affinity uses `NumaMemoryLayout` regions directly,
 /// ensuring GPA ranges match KVM memory slots exactly. HMAT is emitted

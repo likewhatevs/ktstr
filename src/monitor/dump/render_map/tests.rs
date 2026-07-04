@@ -321,7 +321,7 @@ fn append_arena_slot_index_oversized_header_skips() {
 // Mirrors the wire-format builder in `dump::tests` (the
 // `find_sdt_data_field_offset_returns_offset_for_fwd_pointee`
 // template) so the BTF-driven tests below don't depend on a host
-// vmlinux. Kept local so every edit stays inside render_map.rs.
+// vmlinux. Kept local so every edit stays inside this render_map tests file.
 
 /// Push a NUL-terminated string into the BTF string section,
 /// returning its offset.

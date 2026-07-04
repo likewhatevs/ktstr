@@ -1,7 +1,10 @@
 //! Per-row data carriers for the comparison output.
 //!
-//! Three layers, each consumed by the renderer in the parent
-//! module's `write_diff` / `write_show` paths:
+//! Three layers. [`DiffRow`] / [`DerivedRow`] / [`CtprofDiff`]
+//! are consumed by the parent module's [`super::write_diff`]
+//! renderer; [`ThreadGroup`] additionally feeds the binary
+//! crate's show path (`write_show` in `src/bin/ktstr.rs`), which
+//! renders from [`super::Aggregated`] rather than the diff rows:
 //!
 //! 1. [`ThreadGroup`] — the per-axis aggregation result. One
 //!    instance per group key (pcomm / cgroup / comm / comm-exact
@@ -27,13 +30,17 @@
 //!    the [`FudgedPair`] entries documenting matched cgroup
 //!    renames, the host PSI snapshots, the per-cgroup smaps_rollup
 //!    maps, and the global sched_ext sysfs snapshot. Consumed by
-//!    `write_diff` directly; the pointer-hash identity used to
-//!    deduplicate rows downstream still works because every
-//!    consumer passes `&CtprofDiff` by reference, never by value.
+//!    `write_diff` directly; downstream the hierarchical sort keys
+//!    a pointer-identity `BTreeMap<*const R, usize>` on each row's
+//!    address to recover its original rank (report/primary.rs),
+//!    which is valid because every consumer passes `&CtprofDiff` by
+//!    reference, never by value.
 //!
 //! The types in this module are pure data carriers — no rendering
 //! logic, no aggregation logic. Aggregation lives next door in
-//! [`mod@super::aggregate`]; rendering lives in mod.rs.
+//! [`mod@super::aggregate`]; rendering lives in the `render` and
+//! `report` submodules (and the show path in `src/bin/ktstr.rs`).
+//! mod.rs only wires the module tree.
 
 use std::collections::BTreeMap;
 
@@ -62,7 +69,9 @@ pub struct ThreadGroup {
     /// [`super::GroupBy::Pcomm`] — both groupings feed the grex
     /// display-label path the same way (each pattern-aware bucket
     /// renders a regex over the union of its members across
-    /// baseline + candidate). Empty Vec for groupings that
+    /// baseline + candidate, only when built with the
+    /// `pretty-labels` feature; default builds render the join key
+    /// unchanged). Empty Vec for groupings that
     /// render the join key directly: [`super::GroupBy::Cgroup`],
     /// [`super::GroupBy::CommExact`], or pattern-aware groupings under
     /// [`super::CompareOptions::no_thread_normalize`] where the join key
@@ -119,7 +128,10 @@ pub struct DiffRow {
     /// or [`super::GroupBy::Pcomm`] pattern buckets containing ≥ 2
     /// distinct member literals, this carries a grex-generated
     /// regex over the union of baseline+candidate members so the
-    /// operator sees exactly which names landed in the bucket.
+    /// operator sees exactly which names landed in the bucket —
+    /// but only when built with the `pretty-labels` feature and
+    /// the regex is no longer than the key; otherwise (including
+    /// all default builds) it equals `group_key`.
     pub display_key: String,
 }
 
@@ -170,8 +182,9 @@ pub struct FudgedPair {
     /// match.
     pub overlap: usize,
     /// Jaccard similarity coefficient: `|A ∩ B| / |A ∪ B|` over
-    /// the thread-type sets. Range `[0.0, 1.0]`. Matching gate
-    /// is `jaccard >= 0.90`.
+    /// the thread-type sets. Range `[0.0, 1.0]`. Matching gate is
+    /// `jaccard >= 0.90` AND overlap (intersection) >= 10 (with
+    /// candidate set size >= 10).
     pub jaccard: f64,
     /// Thread types present in baseline but missing from the
     /// UNION of every candidate matched against this baseline
@@ -225,8 +238,9 @@ pub struct CtprofDiff {
     /// pair plus its overlap / Jaccard / residuals / cascade
     /// metadata. Pairs are emitted by the fudge stage of
     /// [`super::compare()`] and consumed by the renderer's "Fudged cgroup
-    /// matches" section. Empty under non-cgroup `super::GroupBy` modes
-    /// (fudge applies only when keys are cgroup paths).
+    /// matches" section. Empty except under [`super::GroupBy::All`]
+    /// (fudge runs only when `group_by == GroupBy::All`, matching
+    /// on the cgroup prefix of each compound key).
     pub fudged_pairs: Vec<FudgedPair>,
     /// Baseline-only cgroup-level enrichment rows, keyed by the
     /// cgroup path (after flatten). Populated only for

@@ -267,6 +267,14 @@ fn test_fixture_variant_hash_is_stable() {
 fn sidecar_result_roundtrip() {
     let sc = SidecarResult {
         test_name: "my_test".to_string(),
+        // Distinct populated values so a dropped/mis-serialized field surfaces.
+        perf_delta_assertions: vec![super::PerfDeltaAssertionRecord {
+            metric: "rps_p50".to_string(),
+            direction: Some(crate::test_support::Polarity::HigherBetter),
+            max_regression_pct: Some(5.0),
+            min_abs: Some(1.0),
+            phase: Some(2),
+        }],
         topology: "1n2l4c2t".to_string(),
         scheduler: "scx_mitosis".to_string(),
         vcpus: 16,
@@ -351,9 +359,9 @@ fn sidecar_result_roundtrip() {
     };
     let json = serde_json::to_string_pretty(&sc).unwrap();
     let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
-    // Exhaustive destructure — `SidecarResult` is `non_exhaustive`
-    // only across crates, but in-crate destructure still requires
-    // every field to appear by name. Adding a field to
+    // Exhaustive destructure — an in-crate struct-literal
+    // destructure without `..` requires every field to appear by
+    // name. Adding a field to
     // `SidecarResult` without extending this pattern fails to
     // compile here, forcing the author to make an explicit
     // roundtrip-coverage decision at the same time they introduce
@@ -392,6 +400,7 @@ fn sidecar_result_roundtrip() {
         cleanup_duration_ms,
         run_source,
         resolve_source,
+        perf_delta_assertions,
     } = loaded;
     // Hash-participating string fields round-trip verbatim.
     assert_eq!(test_name, "my_test");
@@ -473,6 +482,16 @@ fn sidecar_result_roundtrip() {
         "resolve_source must round-trip the literal discovery-path tag \
          populated on the write side",
     );
+    // The per-test perf-delta assertion round-trips field-for-field.
+    assert_eq!(perf_delta_assertions.len(), 1);
+    assert_eq!(perf_delta_assertions[0].metric, "rps_p50");
+    assert_eq!(
+        perf_delta_assertions[0].direction,
+        Some(crate::test_support::Polarity::HigherBetter),
+    );
+    assert_eq!(perf_delta_assertions[0].max_regression_pct, Some(5.0));
+    assert_eq!(perf_delta_assertions[0].min_abs, Some(1.0));
+    assert_eq!(perf_delta_assertions[0].phase, Some(2));
 }
 
 /// Exhaustive schema-audit gate for `SidecarResult`'s serde
@@ -522,11 +541,12 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
     use crate::host_context::HostContext;
     use crate::monitor::MonitorSummary;
     use crate::monitor::bpf_prog::ProgVerifierStats;
-    use crate::test_support::{Metric, MetricSource, MetricStream, PayloadMetrics, Polarity};
+    use crate::test_support::{Metric, MetricStream, PayloadMetrics, Polarity};
     use crate::timeline::StimulusEvent;
 
     let sc = SidecarResult {
         test_name: "audit".to_string(),
+        perf_delta_assertions: Vec::new(),
         topology: "8n8l16c2t".to_string(),
         scheduler: "scx_audit".to_string(),
         vcpus: 256,
@@ -542,7 +562,6 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
                 value: 42.0,
                 polarity: Polarity::HigherBetter,
                 unit: "audits".to_string(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             }],
             exit_code: 7,
@@ -650,7 +669,7 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
     assert_eq!(loaded.stats.cgroups[0].num_workers, 3);
     // ext_metrics (the pooled iterations_per_cpu_sec Rate + its Counter
     // components) must round-trip — the sidecar is the durable surface every
-    // cross-run `stats compare` reads.
+    // cross-run `perf-delta` reads.
     assert_eq!(
         loaded
             .stats
@@ -768,9 +787,9 @@ fn sidecar_result_roundtrip_no_monitor() {
 /// that tolerance is part of the asymmetric contract documented
 /// at the module level — writer always emits, reader tolerates
 /// absence on `Option`s. The sibling
-/// `serialize_always_emits_option_keys` tests pin the writer
-/// side; this loop pins the reader side for non-`Option` fields
-/// only.
+/// `sidecar_payload_and_metrics_always_emit_when_empty` test pins
+/// the writer side; this loop pins the reader side for
+/// non-`Option` fields only.
 #[test]
 fn sidecar_result_missing_required_field_rejected_by_deserialize() {
     // Table-driven expansion covering every non-`Option` field of
@@ -782,11 +801,11 @@ fn sidecar_result_missing_required_field_rejected_by_deserialize() {
     // `#[serde(default)]` needed — it's a builtin rule), so
     // removing e.g. `payload: Option<String>` from the JSON
     // yields `None` on the parsed struct rather than a rejection.
-    // The module doc at src/test_support/sidecar.rs promises
+    // The module doc at src/test_support/sidecar/mod.rs promises
     // "required on deserialize" for Option fields, but that's
     // enforced at the writer (always-emitted) side, not the
-    // parser side. The `serialize_always_emits_option_keys`
-    // sibling tests pin the writer half; this test pins the
+    // parser side. The `sidecar_payload_and_metrics_always_emit_when_empty`
+    // sibling test pins the writer half; this test pins the
     // parser-side strictness for every non-Option field.
     //
     // Old single-field-sentinel form (checking only `test_name`)
@@ -814,6 +833,7 @@ fn sidecar_result_missing_required_field_rejected_by_deserialize() {
         "periodic_target",
         "vcpus",
         "cpu_budget",
+        "perf_delta_assertions",
     ];
 
     let fixture = SidecarResult::test_fixture();
@@ -1081,6 +1101,39 @@ fn collect_sidecars_skips_non_ktstr_json() {
     std::fs::write(tmp.join("other.json"), r#"{"test":"val"}"#).unwrap();
     let results = collect_sidecars(tmp);
     assert!(results.is_empty());
+}
+
+#[test]
+fn collect_sidecars_with_errors_counts_stale_for_summary() {
+    // A valid sidecar loads; stale/unparseable ones are dropped from the
+    // returned Vec and counted in parse_errors. That count drives the
+    // single aggregated `warn_skipped_sidecars` summary that replaced the
+    // per-file skip spam -- lock it in so a regression that stops counting
+    // (or starts admitting stale data into the pool) is caught.
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let tmp = tmp_dir.path();
+    let sc = SidecarResult {
+        test_name: "ok".to_string(),
+        ..SidecarResult::test_fixture()
+    };
+    std::fs::write(
+        tmp.join("ok.ktstr.json"),
+        serde_json::to_string(&sc).unwrap(),
+    )
+    .unwrap();
+    // Two stale sidecars: invalid JSON, and valid JSON missing the
+    // SidecarResult schema (the schema-drift case behind the user report).
+    std::fs::write(tmp.join("bad1.ktstr.json"), "not json").unwrap();
+    std::fs::write(tmp.join("bad2.ktstr.json"), r#"{"unrelated":true}"#).unwrap();
+    let (sidecars, parse_errors, io_errors) = collect_sidecars_with_errors(tmp);
+    assert_eq!(sidecars.len(), 1, "only the valid sidecar loads");
+    assert_eq!(sidecars[0].test_name, "ok");
+    assert_eq!(
+        parse_errors.len(),
+        2,
+        "both stale sidecars are counted (drives the aggregated skip summary)"
+    );
+    assert!(io_errors.is_empty());
 }
 
 #[test]
@@ -1448,7 +1501,8 @@ fn pre_clear_run_dir_once_silent_on_missing_dir() {
 /// `pre_clear_run_dir_once` reaps orphaned atomic-write staging
 /// files in the same shallow sweep as live sidecars. Pins the
 /// staging-cleanup invariant documented at
-/// `pre_clear_run_dir_once`'s in-line comment block (line ~2317):
+/// `pre_clear_run_dir_once`'s in-line comment block (mod.rs,
+/// wipe loop, ~line 3261):
 /// a writer that died between `write` and `rename` in
 /// `serialize_and_write_sidecar` leaves a
 /// `<test>-<hash>.ktstr.json.tmp.<pid>.<run_id>` artifact;
@@ -2297,7 +2351,7 @@ fn write_sidecar_writes_file() {
     assert!(loaded.is_pass());
     assert!(!loaded.skipped, "pass result is not a skip");
     // write_sidecar must populate the host-context snapshot so
-    // downstream `stats compare --runs a b` can diff hosts.
+    // downstream `perf-delta` can diff hosts.
     // Without this assertion, a regression that dropped the
     // `host: Some(collect_host_context())` builder line would
     // land silently. `kernel_name` is always `Some("Linux")`
@@ -2871,7 +2925,7 @@ fn scheduler_fingerprint_eevdf_has_no_commit() {
 /// vec, NOT to an empty default. A regression that drops the
 /// phases field from the sidecar serializer or fails to
 /// reconstitute it on the reader silently loses every per-phase
-/// row downstream consumers depend on (cargo ktstr stats compare's
+/// row downstream consumers depend on (cargo ktstr perf-delta's
 /// per-phase delta render, GauntletRow.phases carry-through).
 #[test]
 fn sidecar_round_trip_preserves_phases() {
@@ -3128,7 +3182,7 @@ fn finalize_sidecar_verdict_records_inversion_and_no_ops_ordinary() {
     let tmp = tempfile::TempDir::new().unwrap();
     // A raw Fail sidecar finalized to Pass (an expect_err inversion):
     // the verdict bits flip to pass AND expected_failure is set (so
-    // `stats compare` still excludes the failure-mode telemetry).
+    // `perf-delta` still excludes the failure-mode telemetry).
     let fail_path = tmp.path().join("t-0000000000000000.ktstr.json");
     let mut fail = SidecarResult::test_fixture();
     fail.passed = false; // raw Fail = the all-false verdict

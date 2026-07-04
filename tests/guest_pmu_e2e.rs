@@ -4,7 +4,7 @@
 //! Rust that exercises the synthesized PMU surface:
 //!   - On x86_64: reads CPUID leaf 0xA via the `cpuid` instruction
 //!     and verifies the synthesized PMU-v2 fields surface to the
-//!     guest. The handler in `src/vmm/x86_64/topology.rs` writes
+//!     guest. The handler in `src/vmm/x86_64/topology/mod.rs` writes
 //!     version=2, num_gp=4, gp_width=48, mask_length=7, num_fixed=3,
 //!     fixed_width=48 when the host advertises a non-zero PMU
 //!     version. A regression in the synthesizer (or in KVM's
@@ -26,8 +26,9 @@
 //!     zero — no kernel error, just silent miscapture.
 //!   - The synthesized PMU-v2 surface is unconditional on
 //!     x86 when the host advertises a non-zero version
-//!     (gated in `topology.rs`); the unit tests in that file
-//!     verify the synthesizer in isolation, but cannot pin
+//!     (gated in `topology/mod.rs`); the unit tests in
+//!     `topology/tests_math.rs` verify the synthesizer in
+//!     isolation, but cannot pin
 //!     the guest-side observability across the full
 //!     CPUID → kernel-init → perf-event-open chain.
 //!
@@ -106,7 +107,7 @@ fn read_cpuid_leaf_a() -> CpuidLeafA {
 /// synthesizer correctly preserves the zero) from "synthesizer
 /// regressed silently" (it should have written v2 but didn't).
 /// Without an independent signal, a regression in
-/// `src/vmm/x86_64/topology.rs::leaf 0xa` would produce a silent
+/// `src/vmm/x86_64/topology/mod.rs::leaf 0xa` would produce a silent
 /// pass — the test would report version=0, classify it as "no PMU",
 /// and never fail.
 ///
@@ -177,7 +178,7 @@ fn host_likely_has_pmu_decode(
     leaf1_edx: u32,
 ) -> bool {
     // "GenuineIntel" = EBX:0x756e6547 EDX:0x49656e69 ECX:0x6c65746e —
-    // matches `detect_vendor` in src/vmm/x86_64/topology.rs.
+    // matches `detect_vendor` in src/vmm/x86_64/topology/mod.rs.
     let intel = (leaf0_ebx, leaf0_edx, leaf0_ecx) == (0x756e_6547, 0x4965_6e69, 0x6c65_746e);
     if !intel {
         return false;
@@ -223,7 +224,7 @@ enum PerfOpenResult {
 ///     `perf_event_open` surfaces as `EINVAL` on the syscall —
 ///     see `kernel/events/core.c::perf_event_open`'s `return
 ///     -EINVAL` arms). A regression in
-///     `src/vmm/x86_64/topology.rs::leaf 0xa` that drops the
+///     `src/vmm/x86_64/topology/mod.rs::leaf 0xa` that drops the
 ///     synthesized v2 surface would surface as exactly that.
 ///     Fail.
 fn classify_perf_open_errno(raw: i32) -> PerfOpenResult {
@@ -234,7 +235,7 @@ fn classify_perf_open_errno(raw: i32) -> PerfOpenResult {
         libc::ENOSYS => PerfOpenResult::Skip("ENOSYS = kernel without CONFIG_PERF_EVENTS"),
         _ => PerfOpenResult::Fail(
             "EINVAL/ENODEV/EOPNOTSUPP indicate the synthesized PMU surface \
-             did not bind to a backend — check src/vmm/x86_64/topology.rs::leaf 0xa \
+             did not bind to a backend — check src/vmm/x86_64/topology/mod.rs::leaf 0xa \
              for x86 or src/vmm/aarch64/kvm.rs::init_pmuv3 for aarch64",
         ),
     }
@@ -243,7 +244,7 @@ fn classify_perf_open_errno(raw: i32) -> PerfOpenResult {
 /// Asserts the synthesized PMU-v2 surface is visible to the guest
 /// via CPUID leaf 0xA. When the host has no PMU
 /// (kvm.enable_pmu=0 or PMU-less hardware), the synthesizer in
-/// `src/vmm/x86_64/topology.rs` leaves the leaf zeroed; under that
+/// `src/vmm/x86_64/topology/mod.rs` leaves the leaf zeroed; under that
 /// condition the test consults [`host_likely_has_pmu`] (an
 /// independent CPUID probe via vendor + DS feature bit) to
 /// distinguish "host has no PMU — expected" from "synthesizer
@@ -268,7 +269,7 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
     let leaf = read_cpuid_leaf_a();
     let mut result = AssertResult::pass();
     if leaf.version == 0 {
-        // The synthesizer in src/vmm/x86_64/topology.rs gates leaf
+        // The synthesizer in src/vmm/x86_64/topology/mod.rs gates leaf
         // 0xA synthesis on `entry.eax & 0xff != 0` — version=0 in
         // the guest means KVM passed through 0 (host has no PMU,
         // kvm.enable_pmu=0, or vendor=AMD which doesn't define
@@ -290,7 +291,7 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
                  appears PMU-capable (vendor=GenuineIntel and \
                  leaf 1 EDX bit 21 (DS) is set, which on a \
                  KVM guest requires enable_pmu=1 + host PEBS). \
-                 src/vmm/x86_64/topology.rs::leaf 0xa regressed: \
+                 src/vmm/x86_64/topology/mod.rs::leaf 0xa regressed: \
                  the synthesizer should have written PMU v2 but \
                  the guest sees version=0, which breaks \
                  scx_layered/scx_cosmos perf-counter reads."
@@ -319,7 +320,7 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
             format!(
                 "CPUID leaf 0xA reports version={}, expected 2 \
                  (synthesized PMU-v2). The handler in \
-                 src/vmm/x86_64/topology.rs may have regressed.",
+                 src/vmm/x86_64/topology/mod.rs may have regressed.",
                 leaf.version,
             ),
         ));
@@ -401,7 +402,7 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
 /// burn ~10M iterations of CPU work, read the counter, and assert
 /// the value is non-zero. Pins the end-to-end pipeline:
 ///   1. Guest kernel's `intel_pmu_init` (x86) /
-///      `armv8_pmuv3_init` (aarch64) accepted the surface.
+///      `armv8_pmu_init` (aarch64) accepted the surface.
 ///   2. `perf_event_open(2)` succeeds for PERF_TYPE_HARDWARE.
 ///   3. The kernel's perf core wires to a real counter.
 ///   4. The counter advances under guest CPU work.
@@ -427,7 +428,7 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
 ///     (intel_pmu_init returning -ENODEV upstream of perf_event_open
 ///     surfaces here as EINVAL on the syscall — see
 ///     kernel/events/core.c::perf_event_open's `return -EINVAL` arms);
-///     a regression in `src/vmm/x86_64/topology.rs::leaf_0xa` that
+///     a regression in `src/vmm/x86_64/topology/mod.rs::leaf_0xa` that
 ///     drops the synthesized v2 surface would surface as exactly that.
 #[ktstr_test(llcs = 1, cores = 1, threads = 1, memory_mib = 512)]
 fn guest_pmu_perf_event_open_counts_instructions(_ctx: &Ctx) -> Result<AssertResult> {

@@ -58,8 +58,10 @@
 //! `queue_vectors[queue]` entry, so RX, TX, and distinct queue-pairs deliver
 //! independently. When a queue count exceeds the per-device vector budget, EACH
 //! (and SHARED_SLOW) request more vectors than the table holds and fail; the
-//! driver falls through to SHARED (`nvectors = 2`: config → vector 0, ALL
-//! virtqueues → vector 1, virtio_pci_common.h). The per-queue signal path serves
+//! driver falls through to SHARED (`nvectors = 2` in `vp_find_vqs_msix`'s
+//! `!per_vq_vectors` branch, virtio_pci_common.c): config → vector 0, ALL
+//! virtqueues → vector 1 (VP_MSIX_CONFIG_VECTOR / VP_MSIX_VQ_VECTOR,
+//! virtio_pci_common.h). The per-queue signal path serves
 //! SHARED transparently — every `queue_vectors[]` entry the guest programs
 //! resolves to the same vector, so a coalesced VRING signal fires it and the
 //! guest's shared-vector handler polls every vq mapped to it. Multiqueue is

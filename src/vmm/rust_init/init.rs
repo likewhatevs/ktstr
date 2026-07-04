@@ -268,8 +268,8 @@ pub(crate) fn ktstr_guest_init() -> ! {
         // Mark this process tree as running under guest init (PID 1).
         // Workers forked inside the guest legitimately have
         // `getppid() == 1` because init IS their parent, so the
-        // host-side orphan-detection fast-path in `workload.rs` must
-        // skip the `_exit(0)` branch when this variable is present.
+        // orphan-detection fast-path in `src/workload/spawn/mod.rs`
+        // must skip the `_exit(0)` branch when this variable is present.
         // The variable is inherited across fork/exec, so every
         // descendant of guest init (including workloads that re-exec
         // /init to run scenarios) observes it.
@@ -325,7 +325,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
         // ShellTestDescriptor.scheduler_enable_cmds — Phase B of the
         // KernelBuiltin lifecycle, packed into /sched_enable by the
         // VM builder). Idempotent / safe when the file doesn't exist
-        // (returns Ok(())). Mirrors the test-mode wire-up at L1329 so
+        // (returns early). Mirrors the test-mode wire-up at L526 so
         // the shell-mode operator drops into the SAME scheduler-loaded
         // environment a test would see — without this, the shell falls
         // through to whatever scheduler the kernel boots with and the
@@ -491,8 +491,9 @@ pub(crate) fn ktstr_guest_init() -> ! {
     };
     tracing::debug!(args = ?args, "parsed /args");
 
-    // Propagate RUST_BACKTRACE and RUST_LOG from the kernel cmdline to
-    // the process environment BEFORE Phase A spawns its probe thread.
+    // Propagate RUST_BACKTRACE, RUST_LOG, and KTSTR_SIDECAR_DIR from
+    // the kernel cmdline to the process environment BEFORE Phase A
+    // spawns its probe thread.
     // `std::env::set_var` mutates glibc's `__environ` without locking;
     // calling it while the probe thread is live is UB on Linux.
     crate::test_support::propagate_rust_env_from_cmdline();
@@ -599,7 +600,16 @@ pub(crate) fn ktstr_guest_init() -> ! {
     let wprof_handle = spawn_wprof_if_configured();
 
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
-    let code = if let Some(pa) = probe_phase_a {
+    let code = if crate::test_support::is_verifier_workload(&args) {
+        // Verifier sweep VM: no `#[ktstr_test]` body to dispatch. Instead
+        // run the dispatch probe — spawn a SpinWait workload and, on
+        // confirmed worker progress after the scheduler attached, emit a
+        // `WorkloadDispatched` frame. Exit 1 like the no-test-fn path: the
+        // host verifier verdict keys on lifecycle frames, never on the
+        // guest exit code (which is 1 even on the verifier success path).
+        super::verifier_workload::run_and_confirm_dispatch();
+        1
+    } else if let Some(pa) = probe_phase_a {
         crate::test_support::maybe_dispatch_vm_test_with_phase_a(&args, pa).unwrap_or(1)
     } else {
         crate::test_support::maybe_dispatch_vm_test_with_args(&args).unwrap_or(1)

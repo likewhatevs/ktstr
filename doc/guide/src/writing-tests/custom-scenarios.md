@@ -76,6 +76,7 @@ pub struct Ctx<'a> {
     pub wait_for_map_write: bool,
     pub current_step: Arc<AtomicU16>,
     pub entry_name: Option<&'static str>,
+    pub variant_hash: u64,
 }
 ```
 
@@ -112,16 +113,19 @@ duration after `start()` and before `stop_and_collect()`. Honoring
 this value keeps custom scenarios composable with the gauntlet
 budget controller and with `#[ktstr_test(duration_s = N)]` overrides.
 
-**`workers_per_cgroup`** -- default per-cgroup worker count derived
-from the test's `workers` attribute (or the topology when unset).
-`dfl_wl(ctx)` pre-fills this. Custom scenarios that hand-build a
+**`workers_per_cgroup`** -- default per-cgroup worker count. Defaults
+to 1 (from `CtxBuilder`); there is no `workers` `#[ktstr_test]`
+attribute. `dfl_wl(ctx)` sources `num_workers` from this field. Set a
+different per-cgroup count in the scenario body via
+`CgroupDef::named("X").workers(N)`. Custom scenarios that hand-build a
 `WorkloadConfig` should source `num_workers` from this field unless
 the test explicitly wants a different value.
 
 **`work_type_override`** -- gauntlet-supplied or programmatic
 `WorkType` to swap in for any `CgroupDef` whose `swappable = true`
-and for the `dfl_wl` default. `None` keeps the per-cgroup work type
-the scenario specified.
+(applied per-WorkSpec via `resolve_work_type`). It does NOT affect the
+`dfl_wl` default, which always uses `WorkType::SpinWait`. `None` keeps
+the per-cgroup work type the scenario specified.
 
 **`assert`** -- the merged `Assert` (`default_checks() →
 scheduler → per-test`) the test framework expects the scenario to

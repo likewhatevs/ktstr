@@ -55,6 +55,30 @@ fn assert_stats_round_trip(result: &VmResult) -> Result<()> {
         result.periodic_target,
     );
 
+    // `periodic_fired` counts PLACEHOLDERS: a Degraded capture from a
+    // freeze-rendezvous timeout (the vCPUs could not be paused, so BPF
+    // state was never read) still bumps it. `periodic_real_count()` is
+    // the "a real, non-placeholder capture landed" floor. Require it up
+    // front so the dominant flake — an all-placeholder run where the
+    // rendezvous timed out — fails HERE with its true cause instead of
+    // downstream as a confusing empty host.cpus(). This gates the
+    // stats-axis (`nr_dispatched`) assertions below: a non-placeholder
+    // capture carries the scx_stats envelope. It does NOT by itself
+    // guarantee per_cpu_time — a non-placeholder capture can still
+    // carry empty per-CPU rows when the per-CPU dump path was
+    // unavailable at the boundary — so the host per-CPU axis keeps its
+    // own guard further down. Read before draining (drain consumes the
+    // bridge).
+    anyhow::ensure!(
+        result.snapshot_bridge.periodic_real_count() >= 1,
+        "no real (non-placeholder) periodic capture landed — every \
+         capture was a Degraded placeholder (the freeze rendezvous \
+         timed out, so guest memory was never read). periodic_fired = \
+         {} counts placeholders and does not imply a data-bearing \
+         sample.",
+        result.periodic_fired,
+    );
+
     let drained = result.snapshot_bridge.drain_ordered_with_stats();
     anyhow::ensure!(
         !drained.is_empty(),
@@ -155,28 +179,35 @@ fn assert_stats_round_trip(result: &VmResult) -> Result<()> {
          failed"
     );
 
-    // series.host() consume-path assertion: the per-sample
-    // per-CPU host snapshot data (FailureDumpReport.per_cpu_time)
-    // must wire through SampleSeries and surface via the
-    // HostView projector. With num_snapshots = 1 the bridge
-    // captures at least one periodic boundary that includes the
-    // per-CPU time stats; HostView.cpus() must therefore report
-    // at least one captured CPU. Catches the regression where
-    // the per_cpu_time slice is unpopulated or the host accessor
-    // dropped the rows.
+    // series.host() consume-path assertion: the per-sample per-CPU
+    // host snapshot data (FailureDumpReport.per_cpu_time) must wire
+    // through SampleSeries and surface via the HostView projector.
+    // This is the HOST per-CPU axis, distinct from the stats-axis
+    // guard above: the periodic_real_count() floor guaranteed a real
+    // (non-placeholder) capture landed, but a non-placeholder capture
+    // can still carry empty per_cpu_time if the per-CPU dump path was
+    // unavailable at the boundary. On the reachable path the per-CPU
+    // dump is up by the ~2.5 s midpoint (per-CPU areas are populated
+    // at early boot, well before the accessor/KASLR publish the fire
+    // gate requires), so HostView.cpus() reports at least one captured
+    // CPU. Catches the regression where the per_cpu_time slice is
+    // unpopulated or the host accessor dropped the rows.
     let host_view = series.host().ok_or_else(|| {
         anyhow::anyhow!(
-            "series.host() returned None despite a periodic capture \
-             having fired — the per-sample per_cpu_time rows did \
-             not wire through SampleSeries"
+            "series.host() returned None despite a real capture having \
+             landed (the periodic_real_count guard above passed) — the \
+             per-sample per_cpu_time rows did not wire through \
+             SampleSeries"
         )
     })?;
     let captured_cpus = host_view.cpus();
     anyhow::ensure!(
         !captured_cpus.is_empty(),
-        "host view reported zero captured CPUs across the 5 s run \
-         — the per_cpu_time pipeline never populated rows, or the \
-         HostView::cpus discovery dropped them"
+        "host view reported zero captured CPUs across the 5 s run: a \
+         real (non-placeholder) capture landed (the guard above \
+         passed) but carried no per_cpu_time rows — the per-CPU dump \
+         path was unavailable at the capture boundary, or \
+         HostView::cpus dropped the rows"
     );
 
     // Closure projector consume-path: exercise
@@ -217,8 +248,16 @@ fn assert_stats_round_trip(result: &VmResult) -> Result<()> {
     post_vm = assert_stats_round_trip,
 )]
 fn stats_bridge_round_trip(ctx: &Ctx) -> Result<AssertResult> {
+    // Oversubscribe the 2-vCPU box (4 workers > 2 CPUs) so scx-ktstr's
+    // dispatch path is exercised deterministically: with a single worker
+    // on an idle CPU, ktstr_select_cpu's idle fast-path direct-dispatches
+    // to SCX_DSQ_LOCAL, bypassing SHARED_DSQ and ktstr_dispatch — so
+    // nr_dispatched can legitimately still read 0 at the midpoint
+    // capture. More runnable workers than CPUs forces slice-exhaustion
+    // re-enqueue through SHARED_DSQ, which ktstr_dispatch must consume,
+    // making nr_dispatched > 0 structural rather than timing-dependent.
     let steps = vec![Step {
-        setup: vec![ctx.cgroup_def("cg_0")].into(),
+        setup: vec![ctx.cgroup_def("cg_0").workers(4)].into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];

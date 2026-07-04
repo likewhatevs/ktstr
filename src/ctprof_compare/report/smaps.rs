@@ -3,11 +3,14 @@
 //!
 //! Iterates the union of process keys across both snapshots;
 //! one row per `(process, key)` pair carrying baseline →
-//! candidate kB values rendered through the existing "B"
-//! auto-scale ladder after kB → bytes conversion. Suppressed
+//! candidate byte values (converted from kB up-front by
+//! [`crate::ctprof::ThreadState::smaps_rollup_bytes`] at
+//! collection) rendered through the existing "B" auto-scale
+//! ladder. Suppressed
 //! when neither side has any smaps_rollup data; per-row gate
-//! skips rows where baseline equals candidate (treats absent
-//! and 0 as equal). Mirrors the memory.stat compare layout.
+//! skips rows where baseline equals candidate (absent and 0
+//! are distinct: `Some(0) != None`, so an absent-vs-0 pair
+//! renders as a delta). Mirrors the memory.stat compare layout.
 //!
 //! Process iteration order: descending by absolute Rss delta,
 //! tiebreak by descending max-Rss across baseline and
@@ -79,7 +82,8 @@ pub(super) fn write_smaps_section<W: fmt::Write>(
     // Header: under GroupBy::All the key shape is compound
     // (cgroup\x00pcomm) and the row column carries the
     // hierarchical comm cell, matching the primary table's
-    // "comm" header at primary.rs:298 and 426. Under any
+    // "comm" header set by write_primary_hier (primary.rs:309).
+    // Under any
     // non-All group_by the keys are bare pcomm strings and
     // the column carries that.
     let is_compound = group_by == GroupBy::All;
@@ -150,7 +154,8 @@ fn sorted_smaps_process_keys(diff: &CtprofDiff) -> Vec<&String> {
 
 /// Pre-pass over `keys`: true when any `(process, key)` pair
 /// carries a non-equal baseline/candidate value (absent and 0
-/// treated as equal under `Option` inequality). Callers scan the
+/// are distinct under `Option` inequality: `Some(0) != None`).
+/// Callers scan the
 /// FULL key set before truncating so movers below the line limit
 /// still surface the section.
 fn smaps_has_any_delta(diff: &CtprofDiff, keys: &[&String]) -> bool {

@@ -256,7 +256,6 @@ fn validate_known_flags_accepts_listed_long_flags() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: Some(&["runtime", "threads", "verbose"]),
-        metric_bounds: None,
     };
     let args: Vec<String> = vec![
         "--runtime=30".into(),
@@ -294,7 +293,6 @@ fn validate_known_flags_fails_fast_on_first_unknown() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: Some(&["runtime", "threads", "verbose"]),
-        metric_bounds: None,
     };
     let args = vec!["--runtime=30".into(), "--threds".into(), "--verbose".into()];
     let err = validate_known_flags(&WITH_ALLOWLIST, &args)
@@ -324,7 +322,6 @@ fn validate_known_flags_rejects_unknown_long_flag() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: Some(&["runtime", "threads"]),
-        metric_bounds: None,
     };
     // "threds" is a typo for "threads" — the exact failure
     // the allowlist exists to catch.
@@ -358,7 +355,6 @@ fn validate_known_flags_none_is_permissive() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     let args: Vec<String> = vec![
         "--anything".into(),
@@ -383,7 +379,6 @@ fn op_discriminant_unique() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     let ops: Vec<Op> = vec![
         Op::AddCgroup { name: "a".into() },
@@ -491,7 +486,7 @@ fn assert_discriminant(op: Op, want: u32, name: &str) {
 /// `op_discriminant_payload_ops`,
 /// `op_discriminant_freeze_snapshot_kernel_ops`,
 /// `op_discriminant_scheduler_ops`); their union covers every Op
-/// variant (discriminants 0..=26) exactly once, in source order.
+/// variant (discriminants 0..=27) exactly once, in source order.
 #[test]
 fn op_discriminant_cgroup_ops() {
     assert_discriminant(Op::AddCgroup { name: "a".into() }, 0, "AddCgroup");
@@ -567,7 +562,6 @@ fn op_discriminant_payload_ops() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     assert_discriminant(
         Op::RunPayload {
@@ -656,7 +650,7 @@ fn op_discriminant_freeze_snapshot_kernel_ops() {
 }
 
 /// Discriminant pin for the scheduler-control Op variants plus
-/// `PinBpfMap`/`CaptureCgroupProcs` (discriminants 21..=26). See
+/// `PinBpfMap`/`CaptureCgroupProcs`/`SteerIrq` (discriminants 21..=27). See
 /// [`op_discriminant_cgroup_ops`] for the full pin rationale.
 #[test]
 fn op_discriminant_scheduler_ops() {
@@ -1423,7 +1417,6 @@ fn holdspec_loop_arm_drain_on_err_kills_live_payload_via_kill_not_drop() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     let mock = MockCgroupOps::new();
@@ -3752,7 +3745,6 @@ fn cgroup_def_workload_stores_payload() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     let def = CgroupDef::named("cg_0").workload(&FIO);
     let p = def.payload.expect("workload was attached");
@@ -3791,7 +3783,6 @@ fn drain_payload_handles_for_cgroup_removes_matching_only() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     let cgroups = CgroupManager::new("/nonexistent");
@@ -3844,7 +3835,6 @@ fn step_with_payload_emits_runpayload_op() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     let step = Step::with_payload(&FIO, HoldSpec::fixed(Duration::from_millis(50)));
     assert_eq!(step.ops.len(), 1);
@@ -3880,7 +3870,6 @@ fn op_payload_constructors_produce_expected_variants() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     let op = Op::run_payload(&FIO, ["--warmup"]);
@@ -3990,7 +3979,6 @@ fn op_runpayload_writes_pid_to_named_cgroup_via_placement_trait() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     let ops = vec![Op::RunPayload {
@@ -4047,7 +4035,6 @@ fn op_runpayload_without_cgroup_does_not_place() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     let ops = vec![Op::RunPayload {
@@ -4087,7 +4074,6 @@ fn cgroupdef_workload_with_payload_places_in_def_name() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     let defs = vec![CgroupDef::named("cg_def").workload(&TRUE_BIN)];
@@ -4192,7 +4178,6 @@ fn runpayload_placement_uses_def_name_not_resolved_path() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     // MockCgroupOps's parent_path() is "/mock/cgroup" (see
@@ -4254,7 +4239,6 @@ fn op_runpayload_unknown_cgroup_currently_silently_places_via_trait() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     let ops = vec![Op::RunPayload {
@@ -4501,7 +4485,6 @@ fn apply_ops_run_then_kill_consumes_handle() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     mock_setup_state!(mock, topo, ctx, state);
@@ -4535,7 +4518,6 @@ fn apply_ops_run_duplicate_payload_name_bails() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     mock_setup_state!(mock, topo, ctx, state);
@@ -4595,7 +4577,6 @@ fn apply_ops_run_rejects_payload_already_owned_by_cgroup_def() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     mock_setup_state!(mock, topo, ctx, state);
@@ -4701,7 +4682,6 @@ fn apply_ops_error_does_not_lose_live_payload_handles() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     apply_ops_test(&ctx, &mut state, &[Op::run_payload(&SLEEP, ["3600"])]).expect("spawn");
@@ -5324,7 +5304,6 @@ fn apply_ops_run_duplicate_name_different_cgroups_allowed() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     push_fake_payload_entry(
@@ -5381,7 +5360,6 @@ fn take_payload_by_composite_key_matches_exact_cgroup() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     push_fake_payload_entry(
@@ -5430,7 +5408,6 @@ fn take_payload_by_bare_name_reports_ambiguous_cgroups() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     push_fake_payload_entry(
@@ -5478,7 +5455,6 @@ fn take_payload_by_bare_name_succeeds_on_single_copy() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup_state!(mock, topo, ctx, state);
     push_fake_payload_entry(
@@ -5518,7 +5494,6 @@ fn apply_ops_bare_wait_and_kill_ambiguity_hint_names_full_constructor() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
     mock_setup!(mock, topo, ctx);
 
@@ -8990,8 +8965,9 @@ fn move_all_tasks_preserves_state_when_move_tasks_fails() {
 }
 
 /// Companion to `move_all_tasks_preserves_state_when_move_tasks_fails`:
-/// the step→backdrop ownership-transfer site at the handler
-/// L2727 rename_handles call must ALSO not run when move_tasks
+/// the step→backdrop ownership-transfer site — the
+/// `rename_handles` call in `apply_move_all_tasks` — must ALSO
+/// not run when move_tasks
 /// fails mid-loop. Pins the cross-state-slot atomicity contract
 /// — a regression that ran the transfer before the move loop
 /// would push the handle into backdrop_state.handles even
@@ -9069,9 +9045,9 @@ fn move_all_tasks_step_to_backdrop_failure_preserves_step_ownership() {
 /// Companion to `move_all_tasks_preserves_state_when_move_tasks_fails`:
 /// when MULTIPLE handles are keyed under `from`, a mid-loop
 /// move_tasks failure must leave ALL handles keyed under
-/// `from` (per the handler comment at L2697-2705: "the kernel
-/// side may still be partially migrated, but the in-process
-/// tracking does not also drift"). The first N-1 batches
+/// `from` (per the handler comment in `apply_move_all_tasks`:
+/// "the kernel side may still be partially migrated ... but the
+/// in-process tracking does not also drift"). The first N-1 batches
 /// migrated kernel-side; the Nth failed; rename_handles never
 /// ran for any of them. Subsequent ops looking up `from` find
 /// the same set as pre-op. Pins the all-or-nothing in-process

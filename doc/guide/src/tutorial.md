@@ -371,9 +371,15 @@ Host-side monitor checks (imbalance ratio, DSQ depth, stall
 detection, fallback / keep-last event rates) walk every sample
 and record violations in the verdict details, but the default
 `enforce_monitor_thresholds = false` keeps them report-only.
-Set `enforce_monitor_thresholds = true` (or override individual
-thresholds from `MonitorThresholds::new()`) to make them gate
-the test result.
+Setting the individual monitor-threshold attributes on `#[ktstr_test]`
+(`max_imbalance_ratio`, `max_local_dsq_depth`, `fail_on_stall`,
+`max_fallback_rate`, `max_keep_last_rate`) tightens those thresholds,
+but they stay report-only — none of the per-test attributes enables
+enforcement. To make monitor violations gate the test, turn enforcement
+on at the scheduler level in the `declare_scheduler!` block:
+`assert = Assert::NO_OVERRIDES.with_monitor_defaults()`, which fills each
+unset monitor threshold with its canonical default and sets
+`enforce_monitor_thresholds = true`.
 
 Cpuset isolation is also opt-in -- enable it with `isolation = true`.
 Override the spread threshold and add throughput-parity gates:
@@ -862,8 +868,7 @@ post-run CLI workflow, not part of the test definition:
 ```sh
 cargo ktstr stats                                 # summary: gauntlet coverage, verifier, KVM stats
 cargo ktstr stats list                            # list runs with date, test count, arch
-cargo ktstr stats compare --a-kernel 6.14 \       # diff sidecar partitions defined by
-    --b-kernel 6.15                               #   per-side --a-X / --b-X filter flags
+cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14   # regression-gate HEAD vs the merge-base baseline
 ```
 
 Statistics are collected even on test failure (`if: !cancelled()` in
@@ -1029,17 +1034,25 @@ test-author configuration is required either way.
 
 `cargo ktstr verifier` runs the BPF verifier against every
 `declare_scheduler!`-registered scheduler's struct_ops programs
-inside a real kernel and prints per-program verified-instruction
-counts. The dispatcher hands off to
-`cargo nextest run -E 'test(/^verifier/)'`; nextest fans out
-across (scheduler × declared kernel × accepted topology preset)
-cells, each cell booting its own VM. Per-cell output starts with
-a banner identifying the axis values:
+inside a real kernel, prints per-program verified-instruction
+counts, asserts the scheduler turns on (attaches as the active
+sched_ext scheduler), and asserts it dispatches an injected workload.
+The dispatcher hands off to
+`cargo nextest run -E 'test(/^verifier/) & !test(/^verifier::/)'`
+(the `verifier/...` cells, not the module's `verifier::tests::*` unit
+tests); nextest fans out across (scheduler × declared kernel ×
+accepted topology preset) cells — the sweep runs each scheduler across
+topologies, each cell booting its own VM. After the run, one
+`verified_insns` table per scheduler (rows = kernel, cols = BPF
+program) and a topology × scheduler PASS/FAIL grid are printed. Per-cell
+output starts with a banner identifying the axis values:
 
 ```text
 === ktstr_sched | kernel kernel_6_14_2 | topology tiny-1llc ===
 
 verifier
+  scheduler: attached (sched_ext enabled)
+  dispatch: confirmed (injected workload ran)
   enqueue                                  verified_insns=42
 
 verifier --- verifier stats ---
@@ -1058,6 +1071,8 @@ per-program table:
 === ktstr_sched | kernel kernel_6_14_2 | topology tiny-1llc ===
 
 verifier
+  scheduler: attached (sched_ext enabled)
+  dispatch: confirmed (injected workload ran)
   enqueue                                  verified_insns=500
   dispatch                                 verified_insns=1200
   init                                     verified_insns=300

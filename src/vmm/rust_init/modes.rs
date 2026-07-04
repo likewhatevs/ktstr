@@ -152,9 +152,10 @@ pub(crate) fn cmdline_contains_token(cmdline: &str, token: &str) -> bool {
 
 /// Disk-template build dispatch: exec `/bin/mkfs.btrfs /dev/vda`
 /// (the host packed `mkfs.btrfs` into the initramfs at this path),
-/// wait for it, return its exit code so the caller emits the exit
-/// sentinel on COM2 before rebooting. Returns `0` on success and
-/// the binary's exit code (or `1` on spawn failure) otherwise.
+/// wait for it, return its exit code so the caller sends the exit
+/// code over the bulk port (`MsgType::Exit`) before rebooting.
+/// Returns `0` on success and the binary's exit code (or `1` on
+/// spawn failure) otherwise.
 ///
 /// The disk image at `/dev/vda` is the host-side staging file
 /// (sparse, sized to the requested capacity); after this function
@@ -169,11 +170,10 @@ pub(crate) fn cmdline_contains_token(cmdline: &str, token: &str) -> bool {
 /// would slip past testing.
 pub(crate) fn run_disk_template_mode() -> i32 {
     redirect_stdio_to_bulk_port();
-    // The mkfs.btrfs binary is packed at `bin/mkfs.btrfs` by
-    // [`crate::vmm::disk_template::build_template_via_vm`] via
-    // `include_files`; that function — not `ensure_template` — is
-    // the host-side site that assembles the template-VM
-    // initramfs.
+    // The mkfs.btrfs binary is packed at `bin/mkfs.btrfs` by the
+    // disk_template build path (`build_template_via_vm` ->
+    // `build_template_vm`, which is the site that calls
+    // `include_files`) — not `ensure_template`.
     const MKFS: &str = "/bin/mkfs.btrfs";
     // `-f` forces overwrite of any existing signature so a leftover
     // ext4 magic from a host that recycled the staging file does

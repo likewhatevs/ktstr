@@ -21,7 +21,9 @@ use super::CgroupDef;
 /// fields default to "inherit from parent" — the framework only writes
 /// each knob when its corresponding field is `Some`.
 ///
-/// Set via [`CgroupDef::cpu`]. The kernel allows `quota` and `weight`
+/// Set via [`CgroupDef::cpu_quota_pct`] / [`CgroupDef::cpu_quota`] /
+/// [`CgroupDef::cpu_weight`] (clear a cap with
+/// [`CgroupDef::cpu_unlimited`]). The kernel allows `quota` and `weight`
 /// to coexist (per `Documentation/admin-guide/cgroup-v2.rst`,
 /// "CPU Interface Files"): `weight` biases relative CPU share inside
 /// `period`, `quota` enforces an absolute ceiling. Surfacing both as
@@ -148,14 +150,20 @@ pub struct MemoryLimits {
 /// budget produces silent fork failures that surface as
 /// `WorkloadConfig`-level workers refusing to start.
 ///
-/// **The framework spawns exactly one task per worker** — no
-/// per-worker helper threads in any variant's
-/// [`worker_main`](crate::workload) dispatch arm. Per-worker
-/// budget therefore depends only on
+/// **Most variants spawn exactly one task per worker** — their
+/// [`worker_main`](crate::workload) dispatch arm neither spawns
+/// helper threads nor forks children. Two exceptions run internal
+/// helper threads inside the worker process: `Schbench`
+/// (`message_threads` message threads, each spawning
+/// `worker_threads` worker threads, plus a control thread) and
+/// `Taobench` (`client_threads` client threads + `slow_threads`
+/// dispatcher threads); their per-worker task counts are
+/// config/CPU-sized, not 1. Per-worker budget therefore depends on
 /// [`CloneMode`](crate::workload::CloneMode) (whether each worker
-/// is a process or a thread sharing the parent's tgid) and
-/// whether the variant transiently forks short-lived children
-/// inside its own loop. The two columns below capture both:
+/// is a process or a thread sharing the parent's tgid), the
+/// variant's internal helper-thread topology, and whether the
+/// variant transiently forks short-lived children inside its own
+/// loop. The columns below capture all three:
 ///
 /// | Variant | Steady-state tasks | Transient peak |
 /// |---------|--------------------|----------------|
@@ -173,7 +181,10 @@ pub struct MemoryLimits {
 /// | `ThunderingHerd`, `MutexContention`, `WakeChain` | 1/worker | — |
 /// | `PriorityInversion`, `ProducerConsumerImbalance` | 1/worker | — |
 /// | `RtStarvation`, `PreemptStorm`, `EpollStorm` | 1/worker | — |
+/// | `CrossAffinityChurn`, `TimerLatency`, `NetTraffic`, `IrqWake` | 1/worker | — |
 /// | `ForkExit` | 1/worker | +1/worker (waitpid'd before next iter) |
+/// | `CgroupAttachStorm` | 1/worker | +1/worker (forked child per iter, `_exit`s + auto-reaped) |
+/// | `Schbench`, `Taobench` | >1/worker (internal helper threads, config/CPU-sized) | — |
 /// | `Custom` | 1/worker | depends on user closure (see below) |
 ///
 /// **`CloneMode::Fork`** (the default): each worker is a separate

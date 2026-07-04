@@ -1559,7 +1559,7 @@ fn outcome_implements_expected_traits() {
 /// separately by
 /// [`outcome_merge_precedence_inconclusive_above_pass_below_fail`].
 /// A "Fail > Skip > Pass" alternative would flip the existing
-/// `merge_skip_plus_pass_demotes_skip` test invariant; the
+/// `merge_skip_plus_explicit_pass_demotes_skip` test invariant; the
 /// `Fail > Pass > Skip` ordering is the one this implementation
 /// actually realizes on the three-variant subset.
 #[test]

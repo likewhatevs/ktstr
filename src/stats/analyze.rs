@@ -594,30 +594,34 @@ pub(crate) fn sorted_run_entries(root: &std::path::Path) -> std::io::Result<Vec<
             .then_with(|| a.file_name().cmp(&b.file_name()))
     });
 
-    let rows = entries
-        .into_iter()
-        .map(|(entry, _)| {
-            let path = entry.path();
-            let sidecars = crate::test_support::collect_sidecars(&path);
-            let count = sidecars.len();
-            let date = sidecars
-                .iter()
-                .map(|s| s.timestamp.as_str())
-                .filter(|t| !t.is_empty())
-                .min()
-                .map(|s| s.to_string());
-            // Arch from the first sidecar that carries
-            // `host.arch`. A run is on one machine so every
-            // sidecar in the dir agrees on arch; taking the first
-            // non-None reading keeps the lookup O(1) under the
-            // common case (host-populated sidecar at the head
-            // of `collect_sidecars`'s walk).
-            let arch = sidecars
-                .iter()
-                .find_map(|s| s.host.as_ref().and_then(|h| h.arch.clone()));
-            (path, count, date, arch)
-        })
-        .collect();
+    // Walk every run directory with the error-returning collector and
+    // accumulate the stale-sidecar skip count, so `stats list` emits ONE
+    // aggregated summary after the table instead of one per directory
+    // (which `collect_sidecars` would do — see its rustdoc).
+    let mut rows = Vec::new();
+    let mut skipped = 0usize;
+    for (entry, _) in entries {
+        let path = entry.path();
+        let (sidecars, parse_errors, _io_errors) =
+            crate::test_support::collect_sidecars_with_errors(&path);
+        skipped += parse_errors.len();
+        let count = sidecars.len();
+        let date = sidecars
+            .iter()
+            .map(|s| s.timestamp.as_str())
+            .filter(|t| !t.is_empty())
+            .min()
+            .map(|s| s.to_string());
+        // Arch from the first sidecar that carries `host.arch`. A run is
+        // on one machine so every sidecar in the dir agrees on arch;
+        // taking the first non-None reading keeps the lookup O(1) under
+        // the common case (host-populated sidecar at the head of the walk).
+        let arch = sidecars
+            .iter()
+            .find_map(|s| s.host.as_ref().and_then(|h| h.arch.clone()));
+        rows.push((path, count, date, arch));
+    }
+    crate::test_support::warn_skipped_sidecars(root, skipped);
     Ok(rows)
 }
 
@@ -631,7 +635,7 @@ pub(crate) fn sorted_run_entries(root: &std::path::Path) -> std::io::Result<Vec<
 /// (from `SidecarResult::run_source`), `resolve_source` (from
 /// `SidecarResult::resolve_source`), and `cpu_budget` (from
 /// `SidecarResult::cpu_budget`). The dimension catalogue here matches
-/// what `cargo ktstr stats compare` accepts as `--X` and `--a-X` /
+/// what `cargo ktstr perf-delta` accepts as `--X` and `--a-X` /
 /// `--b-X` filter flags — the command exists so an operator can answer
 /// "what kernel versions are in the pool?" before crafting a compare
 /// invocation. The JSON keys `commit` and `source` are the wire

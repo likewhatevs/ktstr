@@ -40,9 +40,8 @@ provides:
 - Runtime fields: `balance_interval`, `nr_balance_failed`,
   `max_newidle_lb_cost`.
 - Optional fields: `newidle_call`, `newidle_success`,
-  `newidle_ratio` — added together in 6.19 (proportional newidle
-  balance, kernel commit 33cf66d88306); resolved as optional and
-  absent on pre-6.19 kernels.
+  `newidle_ratio` — added together in 7.0 (backported to 6.18.5+
+  and 6.12.65+); resolved as optional and absent on 6.16–6.18.4.
 
 When `CONFIG_SCHEDSTATS` is also enabled, each domain additionally
 provides load-balancing stats: `lb_count`, `lb_failed`, `lb_balanced`,
@@ -200,9 +199,11 @@ Map discovery walks the kernel's `map_idr` xarray:
 `find_map` searches by name suffix (e.g. `".bss"` matches
 `"mitosis.bss"`) and returns the first name-matching map of any
 type. The sibling `find_array_map` applies the same suffix match
-but returns only `BPF_MAP_TYPE_ARRAY` maps (the value-region
-read/write path needs `value_kva`, which is populated only for
-ARRAY maps). Use `maps()` to enumerate all maps without filtering.
+but returns only `BPF_MAP_TYPE_ARRAY` maps — the ARRAY filter is the
+intended value-region read/write target. (`value_kva` is populated for
+both `BPF_MAP_TYPE_ARRAY` and `BPF_MAP_TYPE_STRUCT_OPS` maps, but the
+inline-value read/write path narrows to ARRAY.) Use `maps()` to
+enumerate all maps without filtering.
 
 Value access for `BPF_MAP_TYPE_ARRAY` maps reads/writes the inline
 `bpf_array.value` flex array at the BTF-resolved offset. The value

@@ -18,11 +18,13 @@
 //! scheduler). A deadlock, panic, or stats-plumbing break would produce no metric
 //! and fail the gate.
 //!
-//! CI-runnable companions cover the arm + carrier WITHOUT a VM, so the logic stays
-//! covered even when this host-gated e2e is skipped: the
-//! `worktype_coverage_fork_gauntlet_e2e` liveness arm drives the TimerLatency
-//! dispatch arm, and `build_phase_slice_full_delta_math` pins the timer reservoir
-//! flowing through the per-phase carrier.
+//! The VM-free CI-runnable companion is `build_phase_slice_full_delta_math`
+//! (a plain `#[test]`), which pins the timer reservoir flowing through the
+//! per-phase carrier -- so the carrier math stays covered even when this
+//! host-gated e2e is skipped. `worktype_coverage_fork_gauntlet_e2e` also drives
+//! the TimerLatency dispatch arm, but it is itself a VM-booting host-gated e2e
+//! (skipped under the same host gate as this test), so it does NOT preserve
+//! dispatch-arm coverage when skipped.
 
 use anyhow::Result;
 use ktstr::assert::{AssertResult, Phase};

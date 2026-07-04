@@ -144,23 +144,6 @@ pub struct Payload {
     /// Flag names in the slice are bare (no leading `--`) and
     /// match the syntax of `Op::RunPayload`'s per-flag slot.
     pub known_flags: Option<&'static [&'static str]>,
-
-    /// Per-payload validation bounds applied host-side to
-    /// extracted metrics (`OutputFormat::LlmExtract` only). When
-    /// `None` (the default), only the framework's universal
-    /// invariants apply. When `Some(&MetricBounds { … })`, each
-    /// declared bound is enforced after extraction in
-    /// `crate::test_support::eval::host_side_llm_extract` and
-    /// any violation surfaces as an [`crate::assert::AssertDetail`].
-    /// See [`MetricBounds`] for the per-bound contract and the
-    /// rationale for declaring this per-payload rather than
-    /// globally.
-    ///
-    /// `Json` and `ExitCode` payloads ignore this field — their
-    /// extraction runs guest-side and goes through `default_checks`
-    /// for assertion. The bound-checking pass is host-only because
-    /// LlmExtract metrics are extracted host-side post-VM-exit.
-    pub metric_bounds: Option<&'static MetricBounds>,
 }
 
 impl std::fmt::Debug for Payload {
@@ -375,7 +358,6 @@ impl Payload {
         &[],
         false,
         None,
-        None,
     );
 
     /// Short, human-readable name for logging and sidecar output.
@@ -422,7 +404,6 @@ impl Payload {
         include_files: &'static [&'static str],
         uses_parent_pgrp: bool,
         known_flags: Option<&'static [&'static str]>,
-        metric_bounds: Option<&'static MetricBounds>,
     ) -> Payload {
         Payload {
             name,
@@ -434,7 +415,6 @@ impl Payload {
             include_files,
             uses_parent_pgrp,
             known_flags,
-            metric_bounds,
         }
     }
 
@@ -460,7 +440,6 @@ impl Payload {
             &[],
             &[],
             false,
-            None,
             None,
         )
     }
@@ -671,22 +650,20 @@ impl Payload {
 ///
 /// `ExitCode` records only the exit code; no text parsing. `Json`
 /// finds a JSON document region and walks numeric leaves into
-/// [`Metric`] values. `LlmExtract` routes the same text through a
-/// local small-model prompt that produces JSON, then runs the same
-/// JSON walker — one extraction pipeline, two acquisition paths.
+/// [`Metric`] values.
 ///
-/// For `Json` and `LlmExtract`, extraction is stdout-primary with a
-/// stderr fallback: the extractor runs first against stdout, and
-/// only when that yields an empty metric set AND stderr is
-/// non-empty does it retry against stderr. Well-behaved binaries
-/// keep stdout canonical; payloads that emit structured output only
-/// on stderr (schbench's `show_latencies` → `fprintf(stderr, ...)`)
-/// still parse. The streams are never merged. `ExitCode` produces
-/// no metrics from either stream — `extract_metrics` is invoked
-/// (the control flow is variant-agnostic for simplicity) but the
-/// `ExitCode` arm returns `Ok(vec![])` immediately, so the stderr
-/// fallback runs and also returns empty. Observable behavior:
-/// exit code only, no metrics.
+/// For `Json`, extraction is stdout-primary with a stderr fallback:
+/// the extractor runs first against stdout, and only when that
+/// yields an empty metric set AND stderr is non-empty does it retry
+/// against stderr. Well-behaved binaries keep stdout canonical;
+/// payloads that emit structured output only on stderr (schbench's
+/// `show_latencies` → `fprintf(stderr, ...)`) still parse. The
+/// streams are never merged. `ExitCode` produces no metrics from
+/// either stream — `extract_metrics` is invoked (the control flow
+/// is variant-agnostic for simplicity) but the `ExitCode` arm
+/// returns `Ok(vec![])` immediately, so the stderr fallback runs
+/// and also returns empty. Observable behavior: exit code only, no
+/// metrics.
 #[derive(Debug, Clone, Copy)]
 pub enum OutputFormat {
     /// Pass/fail from exit code alone. Stdout is archived for
@@ -701,41 +678,10 @@ pub enum OutputFormat {
     /// numeric leaves as metrics keyed by dotted path (e.g.
     /// `jobs.0.read.iops`).
     Json,
-    /// Feed the primary stream (stdout, or stderr on fallback) to a
-    /// local small model; model emits JSON; walk that JSON as in
-    /// [`OutputFormat::Json`] but tag each metric with
-    /// [`MetricSource::LlmExtract`]. The optional `&'static str` is
-    /// a user-provided focus hint appended to the default prompt.
-    ///
-    /// **Host-only, deferred extraction.** Unlike `Json`, the LLM
-    /// extraction does NOT run inside the guest VM — the model
-    /// (~2.4 GiB) does not fit in guest RAM and the cache lives on
-    /// the host. Inside the guest, `ctx.payload(P).run()` returns
-    /// empty metrics; the captured raw stdout/stderr ship across
-    /// the SHM ring as a `MSG_TYPE_RAW_PAYLOAD_OUTPUT` entry, and
-    /// the host's post-VM-exit pipeline runs `extract_via_llm` on
-    /// the captured text. Test bodies for LlmExtract payloads must
-    /// return `Ok(assert_result)` without inspecting `metrics.metrics`
-    /// directly. Runtime `.check()` on LlmExtract payloads accepts
-    /// only `MetricCheck::ExitCodeEq`; metric-level variants
-    /// (`Min`/`Max`/`Range`/`Exists`) panic at runtime. Declare
-    /// metric checks via `default_checks` on the `Payload` so the
-    /// host can apply them.
-    ///
-    /// Same stdout-primary / stderr-fallback contract as `Json`,
-    /// applied host-side rather than guest-side.
-    ///
-    /// When present, the hint is emitted on its own line as
-    /// `Focus: <hint>\n\n` between the default prompt template and
-    /// the `STDOUT:` section (see `compose_prompt` in
-    /// `test_support::model`). An empty or whitespace-only hint is
-    /// dropped — the line is not emitted — so a caller passing
-    /// `Some("")` or `Some("   ")` sees the same prompt as `None`.
-    LlmExtract(Option<&'static str>),
 }
 
 // ---------------------------------------------------------------------------
-// Polarity, MetricCheck, Metric, MetricSource
+// Polarity, MetricCheck, Metric
 // ---------------------------------------------------------------------------
 
 /// Regression direction for a metric.
@@ -791,6 +737,19 @@ impl Polarity {
         }
     }
 
+    /// The regression direction of this polarity: `Some(true)` = an INCREASE is
+    /// a regression (`LowerBetter` / `TargetValue` / the conservative `Unknown`),
+    /// `Some(false)` = a DECREASE is a regression (`HigherBetter`), `None` =
+    /// directionless (`Informational`, never gates). The single source of truth
+    /// that `MetricDef::classify_direction` delegates to.
+    pub const fn classify_direction(&self) -> Option<bool> {
+        match self {
+            Polarity::Informational => None,
+            Polarity::HigherBetter => Some(false),
+            Polarity::LowerBetter | Polarity::TargetValue(_) | Polarity::Unknown => Some(true),
+        }
+    }
+
     /// Construct a [`Polarity::TargetValue`] from a finite `target`.
     ///
     /// # Panics
@@ -825,124 +784,6 @@ pub struct MetricHint {
     /// string means "no unit"; matches the sentinel used by
     /// `MetricDef`.
     pub unit: &'static str,
-}
-
-/// Per-payload validation bounds applied host-side to extracted
-/// metrics from `OutputFormat::LlmExtract` payloads.
-///
-/// The framework's universal invariants in
-/// `crate::test_support::eval::validate_llm_extraction` (unique
-/// names, finite values, `MetricSource::LlmExtract`) are workload-
-/// agnostic and apply to every LlmExtract payload. Workload-
-/// specific bounds — minimum metric count, sign, magnitude — vary
-/// per payload (schbench's > 5 latency rows vs a single-throughput
-/// benchmark; non-negative microseconds vs delta-emitting payloads
-/// that legitimately report negatives) and cannot be globalized.
-///
-/// `MetricBounds` lets the payload author declare these bounds
-/// declaratively on the `Payload` struct via the `metric_bounds`
-/// field. The host applies them after extraction in
-/// `crate::test_support::eval::host_side_llm_extract`; each
-/// violation surfaces as its own [`crate::assert::AssertDetail`]
-/// with `DetailKind::Other`.
-///
-/// Every bound is `Option`-wrapped so a payload can declare any
-/// subset: a payload that only cares about metric count leaves
-/// `value_min` / `value_max` as `None`; a payload that only cares
-/// about value magnitude leaves `min_count` as `None`.
-///
-/// `#[non_exhaustive]` so future bound classes (per-metric ranges,
-/// required-name lists) can land without breaking existing
-/// `MetricBounds { ... }` literals — call sites must use
-/// struct-update or named-field initialization patterns.
-///
-/// Wire-format note: `MetricBounds` rides through the SHM ring on
-/// `RawPayloadOutput::metric_bounds` (owned form). The struct's
-/// fields (`Option<usize>` / `Option<f64>`) are serde-trivial; no
-/// separate `WireMetricBounds` type is needed because `&'static
-/// MetricBounds` carries no string slices that would defeat
-/// serialization.
-///
-/// # Example
-///
-/// Schbench-style bounds: at least five percentile rows, every
-/// reported value non-negative (latencies cannot be negative
-/// microseconds), no upper magnitude cap because the value range
-/// scales with workload duration. The struct is `#[non_exhaustive]`
-/// to reserve room for future bound classes; out-of-crate callers
-/// construct values through the [`MetricBounds::new`] const
-/// constructor (or [`MetricBounds::default()`] for the all-disabled
-/// baseline).
-///
-/// ```
-/// use ktstr::test_support::MetricBounds;
-///
-/// const SCHBENCH_BOUNDS: MetricBounds =
-///     MetricBounds::new(Some(5), Some(0.0), None);
-/// ```
-///
-/// Attach to a payload via `metric_bounds: Some(&SCHBENCH_BOUNDS)`
-/// in the `Payload` struct literal (or via `#[derive(Payload)]`
-/// once the macro grows the `metric_bounds` attribute hook). The
-/// host's `host_side_llm_extract` reads the value off the
-/// `RawPayloadOutput` after extraction and surfaces one
-/// `AssertDetail` per bound violation.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-#[non_exhaustive]
-pub struct MetricBounds {
-    /// Minimum total metric count. When `Some(n)`, an extracted
-    /// metric set with fewer than `n` entries surfaces an
-    /// `AssertDetail` naming the shortfall. `None` disables the
-    /// count check (the universal "did we extract anything"
-    /// invariant in `validate_llm_extraction` does NOT enforce
-    /// a lower bound — payloads that genuinely produce zero
-    /// metrics on a clean run are allowed under the universal
-    /// rules).
-    pub min_count: Option<usize>,
-
-    /// Universal lower bound applied to every metric value. When
-    /// `Some(v)`, any metric with `value < v` surfaces an
-    /// `AssertDetail` naming the metric and the bound. `None`
-    /// disables the lower-bound check — payloads that emit
-    /// signed delta metrics (improvement = negative latency
-    /// delta) leave this `None`.
-    pub value_min: Option<f64>,
-
-    /// Universal upper bound applied to every metric value. When
-    /// `Some(v)`, any metric with `value > v` surfaces an
-    /// `AssertDetail` naming the metric and the bound. `None`
-    /// disables the upper-bound check — payloads that emit
-    /// large-but-legitimate metrics (memory bytes in a multi-TB
-    /// container, RSS in petabyte ranges) leave this `None`.
-    pub value_max: Option<f64>,
-}
-
-impl MetricBounds {
-    /// Const constructor that takes all three bounds at once. The
-    /// only out-of-crate construction path (the struct itself is
-    /// `#[non_exhaustive]` so external callers cannot use struct-
-    /// literal syntax). Pass `None` to disable any individual
-    /// bound; pass `Some(value)` to enable it.
-    pub const fn new(
-        min_count: Option<usize>,
-        value_min: Option<f64>,
-        value_max: Option<f64>,
-    ) -> MetricBounds {
-        MetricBounds {
-            min_count,
-            value_min,
-            value_max,
-        }
-    }
-}
-
-impl Default for MetricBounds {
-    /// All bounds disabled — applying these to a metric set produces
-    /// zero violations regardless of input shape. Equivalent to
-    /// `MetricBounds::new(None, None, None)`.
-    fn default() -> Self {
-        Self::new(None, None, None)
-    }
 }
 
 /// Assertion check evaluated against an extracted
@@ -1020,7 +861,7 @@ impl MetricCheck {
     /// registry-name string. `const` (via `BuiltinMetric::wire_name`) so it
     /// composes in `const` payload-check tables exactly like [`Self::min`]. Use
     /// this for a registered built-in metric; keep [`Self::min`] for the dynamic
-    /// keyspace (dotted LLM-extraction paths, scheduler-runtime keys).
+    /// keyspace (dotted JSON-leaf paths from [`OutputFormat::Json`], scheduler-runtime keys).
     ///
     /// ```
     /// use ktstr::prelude::*;
@@ -1071,37 +912,17 @@ impl MetricCheck {
     }
 }
 
-/// Provenance of a [`Metric`] — tells downstream tooling whether the
-/// value came from a structured-output parse or from LLM-derived
-/// extraction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum MetricSource {
-    /// Extracted directly from JSON output via
-    /// [`OutputFormat::Json`].
-    Json,
-    /// Extracted by feeding stdout through the local model
-    /// (`OutputFormat::LlmExtract` path). Values depend on the model's
-    /// prompt-driven parse rather than the payload's own structured
-    /// output; downstream tooling that compares runs should surface
-    /// the source so users can filter out LLM-derived metrics when
-    /// reproducibility matters.
-    LlmExtract,
-}
-
 /// Which of the payload's output streams a [`Metric`] was extracted
 /// from.
 ///
-/// Orthogonal to [`MetricSource`]: `source` captures HOW the metric
-/// was produced (structured JSON parse vs LLM-driven extraction);
-/// `stream` captures WHERE the bytes came from (payload stdout vs
-/// stderr). Both axes matter for diagnosing "surprise metrics" in
-/// post-run analysis: a metric tagged [`Self::Stderr`] signals a
-/// payload whose structured output landed on the diagnostic stream
-/// — well-behaved payloads keep stdout canonical per the
+/// Captures WHERE the bytes came from (payload stdout vs stderr).
+/// This matters for diagnosing "surprise metrics" in post-run
+/// analysis: a metric tagged [`Self::Stderr`] signals a payload
+/// whose structured output landed on the diagnostic stream —
+/// well-behaved payloads keep stdout canonical per the
 /// [`OutputFormat`] doc contract, so a stderr tag is a review hint
 /// ("is this payload misconfigured, or did the fallback
-/// intentionally pick it up?") even when `source` says the parse
-/// itself succeeded.
+/// intentionally pick it up?").
 ///
 /// Populated by the extraction pipeline in
 /// [`crate::scenario::payload_run`]: the stdout-primary branch
@@ -1112,7 +933,7 @@ pub enum MetricSource {
 ///
 /// Status: persisted on the sidecar for future review-tooling
 /// (CI dashboards, `cargo ktstr stats`-style filters); not yet
-/// consumed by `stats compare` or any automated pipeline. The
+/// consumed by `perf-delta` or any automated pipeline. The
 /// field is wired end-to-end from the payload-pipeline to the
 /// sidecar JSON today so that downstream review tools can start
 /// filtering on it without a schema change — but no production
@@ -1143,7 +964,7 @@ pub enum MetricStream {
 /// verdict so test-stats can classify regressions across runs.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Metric {
-    /// Dotted-path name matching the JSON leaf or the LLM-emitted key.
+    /// Dotted-path name matching the JSON leaf.
     pub name: String,
     /// Numeric value.
     pub value: f64,
@@ -1153,13 +974,10 @@ pub struct Metric {
     pub polarity: Polarity,
     /// Display unit string; empty when no unit was declared.
     pub unit: String,
-    /// Where this metric came from — JSON parse or LLM extraction.
-    pub source: MetricSource,
     /// Which of the payload's output streams the metric was read
     /// from — stdout on the happy path, stderr under the
     /// stderr-fallback contract. See [`MetricStream`] for the
-    /// orthogonality with `source` and the "well-behaved
-    /// payloads keep stdout canonical" review hint.
+    /// "well-behaved payloads keep stdout canonical" review hint.
     pub stream: MetricStream,
 }
 
@@ -1177,20 +995,11 @@ pub struct Metric {
 /// The `payload_index` field stamps every per-invocation emission
 /// (one `PayloadMetrics` value per `.run()` / `.wait()` / `.kill()` /
 /// `.try_wait()` call) with a monotonically increasing per-process
-/// counter — assigned at emit time inside the guest VM. Hosts use
-/// the index to pair an [`OutputFormat::LlmExtract`] payload's
-/// empty-metrics `PayloadMetrics` slot with its companion
-/// `crate::test_support::RawPayloadOutput` without relying on
-/// emission order, which would conflate a `Json` payload that
-/// legitimately produced zero metrics (no numeric leaves) with an
-/// `LlmExtract` placeholder.
+/// counter — assigned at emit time inside the guest VM.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PayloadMetrics {
     /// Per-invocation index assigned at emit time. Monotonically
     /// increasing within a single guest VM process, starting at 0.
-    /// Pairs with `crate::test_support::RawPayloadOutput::payload_index`
-    /// for `OutputFormat::LlmExtract` payloads — the host matches
-    /// raw output to its empty-metrics slot by equal index.
     pub payload_index: usize,
     /// Extracted metrics. Empty when [`OutputFormat::ExitCode`] is
     /// used or when JSON parsing found no numeric leaves.
@@ -1210,102 +1019,6 @@ impl PayloadMetrics {
             .find(|m| m.name == name)
             .map(|m| m.value)
     }
-}
-
-/// Owned-strings counterpart to [`MetricHint`] used to ship the
-/// payload's polarity / unit declarations across the guest-to-host
-/// SHM ring.
-///
-/// `MetricHint` carries `&'static str` references that cannot
-/// round-trip through serde; the guest builds a `Vec<WireMetricHint>`
-/// from `payload.metrics` at LlmExtract emit time and the host
-/// consumes it in [`crate::scenario::payload_run::resolve_polarities_owned`]
-/// to stamp the host-extracted [`Metric`] set.
-///
-/// Wire-only — never constructed in test bodies. Public-by-crate so
-/// `crate::test_support::eval` can decode and consume it.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct WireMetricHint {
-    /// Dotted-path metric name, mirrors [`MetricHint::name`].
-    pub name: String,
-    /// Regression direction, mirrors [`MetricHint::polarity`].
-    pub polarity: Polarity,
-    /// Display unit, mirrors [`MetricHint::unit`].
-    pub unit: String,
-}
-
-impl From<&MetricHint> for WireMetricHint {
-    fn from(h: &MetricHint) -> Self {
-        Self {
-            name: h.name.to_string(),
-            polarity: h.polarity,
-            unit: h.unit.to_string(),
-        }
-    }
-}
-
-/// Raw stdout/stderr captured from a payload that declared
-/// [`OutputFormat::LlmExtract`].
-///
-/// Emitted by the guest alongside an empty
-/// [`PayloadMetrics`] so the host can run the
-/// LLM-backed extraction post-VM-exit. LLM extraction never runs in
-/// the guest: the model (~2.4 GiB) does not fit in guest VM RAM, and
-/// the cache lives on the host. Each `RawPayloadOutput` carries a
-/// `payload_index` matching the empty-metrics `PayloadMetrics`
-/// slot's `payload_index`. The host pairs them by equal index, not
-/// emission order — see [`payload_index`](Self::payload_index).
-///
-/// `hint` is the focus directive declared on the payload's
-/// `OutputFormat::LlmExtract(Some(hint))`. Stored as `Option<String>`
-/// (rather than `Option<&'static str>`) because the SHM transport is
-/// owned-bytes only.
-///
-/// `metric_hints` carries an owned-strings copy of the payload's
-/// `metrics: &[MetricHint]` slice — required to apply
-/// [`Polarity`] and unit classification on the host after extraction.
-/// The guest's static `&'static [MetricHint]` cannot round-trip
-/// across SHM, so [`WireMetricHint`] mirrors the fields with owned
-/// `String`s. Empty slice when the payload declared no hints.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct RawPayloadOutput {
-    /// Per-invocation index — equals the
-    /// [`PayloadMetrics::payload_index`] of the empty-metrics slot
-    /// emitted by the same `OutputFormat::LlmExtract` invocation.
-    /// The host pairs raw output to its empty-metrics slot by equal
-    /// index rather than emission order, which would conflate a
-    /// `Json` payload that legitimately produced zero metrics with
-    /// an `LlmExtract` placeholder.
-    pub payload_index: usize,
-    /// Stdout captured from the payload's child process. Non-UTF-8
-    /// bytes are replaced with U+FFFD per the framework's
-    /// stream-capture contract.
-    pub stdout: String,
-    /// Stderr captured from the payload's child process. The host's
-    /// `extract_metrics` runs stdout-primary with stderr-fallback,
-    /// matching the legacy guest-side dispatch contract. Non-UTF-8
-    /// bytes are replaced with U+FFFD per the framework's
-    /// stream-capture contract.
-    pub stderr: String,
-    /// Optional focus directive declared on
-    /// `OutputFormat::LlmExtract(Some(hint))`. `None` when the
-    /// payload declared `LlmExtract(None)` or `LlmExtract`. The
-    /// host's `extract_via_llm` threads this into the prompt.
-    pub hint: Option<String>,
-    /// Owned-strings copy of the payload's `metrics` slice. Consumed
-    /// by [`crate::scenario::payload_run::resolve_polarities_owned`]
-    /// on the host to apply [`Polarity`] + unit to the host-extracted
-    /// metric set. Empty when the payload declared no hints.
-    pub metric_hints: Vec<WireMetricHint>,
-    /// Owned copy of the payload's [`MetricBounds`] declaration —
-    /// `Some(bounds)` when the payload set
-    /// [`Payload::metric_bounds`], `None` when it didn't. Consumed
-    /// by the host's `host_side_llm_extract` after extraction to
-    /// apply per-payload validation (minimum metric count, value
-    /// magnitude bounds). `MetricBounds` is `Copy` + serde, so no
-    /// owned-strings conversion is needed — the value rides through
-    /// SHM by value.
-    pub metric_bounds: Option<MetricBounds>,
 }
 
 #[cfg(test)]
@@ -1470,7 +1183,6 @@ mod tests {
                 value: 1000.0,
                 polarity: Polarity::HigherBetter,
                 unit: "iops".to_string(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             }],
             exit_code: 0,
@@ -1488,57 +1200,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn output_format_llm_extract_hint_round_trips() {
-        // The `LlmExtract` payload variant carries an optional focus
-        // hint that the host appends to the extraction prompt
-        // (`compose_prompt`). Pin that the hint is preserved through
-        // construction and pattern-matching — a regression that dropped
-        // or swapped the inner `Option<&str>` would silently send the
-        // model the wrong (or no) focus directive.
-        assert!(
-            matches!(
-                OutputFormat::LlmExtract(Some("focus on iops")),
-                OutputFormat::LlmExtract(Some(h)) if h == "focus on iops",
-            ),
-            "Some(hint) must carry the exact hint string",
-        );
-        assert!(
-            matches!(
-                OutputFormat::LlmExtract(None),
-                OutputFormat::LlmExtract(None),
-            ),
-            "None hint must match the no-hint arm",
-        );
-        // A Some-hint must NOT match the None arm (the discriminant on
-        // the inner Option is load-bearing for the prompt path).
-        assert!(
-            !matches!(
-                OutputFormat::LlmExtract(Some("x")),
-                OutputFormat::LlmExtract(None),
-            ),
-            "Some(hint) must not match the None arm",
-        );
-    }
-
-    #[test]
-    fn metric_source_serde_round_trip() {
-        let js = serde_json::to_string(&MetricSource::Json).unwrap();
-        let de: MetricSource = serde_json::from_str(&js).unwrap();
-        assert_eq!(de, MetricSource::Json);
-        let js = serde_json::to_string(&MetricSource::LlmExtract).unwrap();
-        let de: MetricSource = serde_json::from_str(&js).unwrap();
-        assert_eq!(de, MetricSource::LlmExtract);
-    }
-
     /// Wire-format round-trip for every [`MetricStream`] variant.
     /// Pins the serde representation so a sidecar written by one
     /// version of ktstr deserializes under another — a silent wire
     /// change (rename, internal tag, numeric encoding) would
     /// surface here, not as a missing-field error on every
-    /// existing sidecar. Mirrors
-    /// [`metric_source_serde_round_trip`] so the two metric-tag
-    /// enums share one pinning convention.
+    /// existing sidecar.
     #[test]
     fn metric_stream_serde_round_trip() {
         for s in [MetricStream::Stdout, MetricStream::Stderr] {
@@ -1580,7 +1247,6 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
-            metric_bounds: None,
         };
         match FIO.kind {
             PayloadKind::Binary(name) => assert_eq!(name, "fio"),
@@ -1617,7 +1283,6 @@ mod tests {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     #[test]
@@ -1901,167 +1566,6 @@ mod tests {
         assert_eq!(a.as_scheduler().map(|s| s.name), Some("eevdf"));
     }
 
-    /// Round-trip a [`RawPayloadOutput`] carrying NON-empty stdout
-    /// AND non-empty stderr through serde_json::to_vec /
-    /// from_slice — the wire format the guest's
-    /// `emit_raw_payload_output_to_shm` actually uses on the SHM ring
-    /// (see src/scenario/payload_run.rs `emit_raw_payload_output_to_shm`).
-    /// Pins the wire-format invariant for the deferred LlmExtract
-    /// path: both raw streams MUST survive the guest→host transport,
-    /// because the host's `host_side_llm_extract` runs the model
-    /// stdout-primary with stderr-fallback, and a regression that
-    /// dropped either stream on the wire would silently degrade the
-    /// extraction (e.g. a schbench-style payload that emits its
-    /// summary on stderr would land empty on the host).
-    ///
-    /// Round-trip rather than direct value comparison so a future
-    /// change to field naming, serde rename, or representation
-    /// surfaces here as a failed deserialize rather than a silent
-    /// per-field shape drift.
-    #[test]
-    fn raw_payload_output_serde_round_trip_carries_both_streams() {
-        let original = RawPayloadOutput {
-            payload_index: 17,
-            stdout: "stdout document with metrics: {\"iops\": 100}\n".to_string(),
-            stderr: "stderr fallback document: {\"latency\": 42}\n".to_string(),
-            hint: Some("focus on iops".to_string()),
-            metric_hints: vec![
-                WireMetricHint {
-                    name: "iops".to_string(),
-                    polarity: Polarity::HigherBetter,
-                    unit: "iops".to_string(),
-                },
-                WireMetricHint {
-                    name: "latency".to_string(),
-                    polarity: Polarity::LowerBetter,
-                    unit: "ns".to_string(),
-                },
-            ],
-            metric_bounds: None,
-        };
-        let bytes = postcard::to_stdvec(&original)
-            .expect("RawPayloadOutput must always postcard-serialize");
-        let restored: RawPayloadOutput =
-            postcard::from_bytes(&bytes).expect("wire format must round-trip");
-
-        assert_eq!(restored.payload_index, original.payload_index);
-        assert_eq!(
-            restored.stdout, original.stdout,
-            "stdout must round-trip byte-for-byte; lost stdout would degrade \
-             the host's stdout-primary extraction silently",
-        );
-        assert_eq!(
-            restored.stderr, original.stderr,
-            "stderr must round-trip byte-for-byte; lost stderr would silently \
-             defeat the stderr-fallback contract for payloads (e.g. schbench) \
-             that emit structured output on stderr only",
-        );
-        assert_eq!(restored.hint, original.hint);
-        assert_eq!(restored.metric_hints.len(), original.metric_hints.len());
-        for (got, want) in restored
-            .metric_hints
-            .iter()
-            .zip(original.metric_hints.iter())
-        {
-            assert_eq!(got.name, want.name);
-            assert_eq!(got.polarity, want.polarity);
-            assert_eq!(got.unit, want.unit);
-        }
-    }
-
-    /// Boundary case for the wire-format pin: empty stdout AND empty
-    /// stderr round-trip cleanly without panicking the deserializer
-    /// or collapsing into a None / null. Pins that the SHM transport
-    /// preserves the empty-string distinction the host needs to
-    /// distinguish "stream had no bytes" from "stream was missing"
-    /// (the host's stderr fallback is gated on `!stderr.is_empty()` —
-    /// an absent vs empty stderr would behave differently on the
-    /// host if the wire format dropped the field).
-    #[test]
-    fn raw_payload_output_serde_round_trip_empty_streams_preserved() {
-        let original = RawPayloadOutput {
-            payload_index: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-            hint: None,
-            metric_hints: Vec::new(),
-            metric_bounds: None,
-        };
-        let bytes = serde_json::to_vec(&original).expect("serialize");
-        let restored: RawPayloadOutput = serde_json::from_slice(&bytes).expect("deserialize");
-        assert_eq!(restored.payload_index, 0);
-        assert!(
-            restored.stdout.is_empty(),
-            "empty stdout must survive round-trip as empty string, not vanish to None or null"
-        );
-        assert!(
-            restored.stderr.is_empty(),
-            "empty stderr must survive round-trip as empty string"
-        );
-        assert!(restored.hint.is_none(), "absent hint must survive as None");
-        assert!(
-            restored.metric_hints.is_empty(),
-            "empty metric_hints must survive as empty Vec"
-        );
-    }
-
-    /// Asymmetric stream content: stdout populated, stderr empty.
-    /// Common shape for well-behaved payloads (fio, stress-ng JSON
-    /// mode) where stdout is canonical. Pins that the wire format
-    /// does not "collapse" the empty stderr into the populated
-    /// stdout (e.g. via a smart serializer that omits empty
-    /// fields and then a deserializer that maps absence to a
-    /// duplicate of the other field).
-    #[test]
-    fn raw_payload_output_serde_round_trip_stdout_only() {
-        let original = RawPayloadOutput {
-            payload_index: 3,
-            stdout: r#"{"throughput": 9000}"#.to_string(),
-            stderr: String::new(),
-            hint: None,
-            metric_hints: Vec::new(),
-            metric_bounds: None,
-        };
-        let bytes = serde_json::to_vec(&original).expect("serialize");
-        let restored: RawPayloadOutput = serde_json::from_slice(&bytes).expect("deserialize");
-        assert_eq!(restored.stdout, original.stdout);
-        assert!(restored.stderr.is_empty(), "stderr must remain empty");
-    }
-
-    /// Inverse of `raw_payload_output_serde_round_trip_stdout_only`:
-    /// stderr populated, stdout empty — the schbench-style shape that
-    /// drives the stderr-fallback contract on the host. A regression
-    /// that dropped this stream-asymmetric variant on the wire would
-    /// silently break every stderr-only payload's metrics.
-    #[test]
-    fn raw_payload_output_serde_round_trip_stderr_only() {
-        let original = RawPayloadOutput {
-            payload_index: 9,
-            stdout: String::new(),
-            stderr: r#"{"latency_p99": 1234}"#.to_string(),
-            hint: None,
-            metric_hints: Vec::new(),
-            metric_bounds: None,
-        };
-        let bytes = serde_json::to_vec(&original).expect("serialize");
-        let restored: RawPayloadOutput = serde_json::from_slice(&bytes).expect("deserialize");
-        assert!(restored.stdout.is_empty(), "stdout must remain empty");
-        assert_eq!(restored.stderr, original.stderr);
-    }
-
-    /// `MetricBounds::default()` must produce the all-`None` baseline
-    /// (no extra checks). A regression where Default seeds a non-None
-    /// bound (e.g. a defensive `value_max = Some(f64::MAX)`) would
-    /// silently start failing previously-passing metric streams whose
-    /// `..MetricBounds::default()` spread callers stayed quiet.
-    #[test]
-    fn metric_bounds_default_is_all_none() {
-        let bounds: MetricBounds = Default::default();
-        assert!(bounds.min_count.is_none());
-        assert!(bounds.value_min.is_none());
-        assert!(bounds.value_max.is_none());
-    }
-
     /// `PayloadMetrics` postcard wire-format roundtrip. The type ships
     /// guest→host inside `MSG_TYPE_PAYLOAD_METRICS` and the
     /// postcard codec rejects any nested type carrying
@@ -2081,7 +1585,6 @@ mod tests {
                     value: 12345.6,
                     polarity: Polarity::HigherBetter,
                     unit: "ops/s".to_string(),
-                    source: MetricSource::Json,
                     stream: MetricStream::Stdout,
                 },
                 Metric {
@@ -2089,7 +1592,6 @@ mod tests {
                     value: 0.025,
                     polarity: Polarity::LowerBetter,
                     unit: "s".to_string(),
-                    source: MetricSource::LlmExtract,
                     stream: MetricStream::Stderr,
                 },
             ],
@@ -2104,49 +1606,5 @@ mod tests {
             assert_eq!(a.name, b.name);
             assert_eq!(a.value, b.value);
         }
-    }
-
-    /// `RawPayloadOutput` postcard wire-format roundtrip. Same
-    /// silent-truncation class as the `PayloadMetrics` pin above —
-    /// ships guest→host via the LlmExtract path. Nested
-    /// `WireMetricHint` + `Polarity` must stay externally-tagged on
-    /// the postcard channel. Pin populates every field including the
-    /// `Option<String>` arm (Some + None) so a regression that
-    /// flipped `hint`'s encoding tags trips here.
-    #[test]
-    fn raw_payload_output_postcard_roundtrip() {
-        let original = RawPayloadOutput {
-            payload_index: 3,
-            stdout: "tput=987\n".to_string(),
-            stderr: "warn: clock drift\n".to_string(),
-            hint: Some("extract tput".to_string()),
-            metric_hints: vec![WireMetricHint {
-                name: "tput".to_string(),
-                polarity: Polarity::HigherBetter,
-                unit: "ops/s".to_string(),
-            }],
-            metric_bounds: None,
-        };
-        let bytes = postcard::to_allocvec(&original).expect("encode");
-        let back: RawPayloadOutput = postcard::from_bytes(&bytes).expect("decode");
-        assert_eq!(back.payload_index, original.payload_index);
-        assert_eq!(back.stdout, original.stdout);
-        assert_eq!(back.stderr, original.stderr);
-        assert_eq!(back.hint, original.hint);
-        assert_eq!(back.metric_hints.len(), original.metric_hints.len());
-        // None branch on `hint` — covers the other arm of the Option
-        // encoding so a future externally-tagged-vs-untagged Option
-        // breakage on either arm trips here.
-        let none_hint = RawPayloadOutput {
-            payload_index: 4,
-            stdout: String::new(),
-            stderr: String::new(),
-            hint: None,
-            metric_hints: Vec::new(),
-            metric_bounds: None,
-        };
-        let bytes = postcard::to_allocvec(&none_hint).expect("encode None-hint");
-        let back: RawPayloadOutput = postcard::from_bytes(&bytes).expect("decode None-hint");
-        assert_eq!(back.hint, None);
     }
 }

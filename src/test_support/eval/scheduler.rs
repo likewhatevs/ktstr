@@ -217,7 +217,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 ///
 /// Returns `(name, resolved_host_path, sched_args)` tuples in the
 /// SAME order as `entry.staged_schedulers` iteration. Ordering is
-/// load-bearing: the future initramfs packer iterates the result
+/// load-bearing: the initramfs packer iterates the result
 /// to emit per-scheduler `/staging/schedulers/<name>/` archive
 /// entries, and parent-directory dependencies are encounter-order
 /// sensitive. Tests pin the order-preservation against a future
@@ -428,13 +428,12 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, Resol
 
             // 3-4. target/{debug,release}/ pre-built fallbacks (reached
             // only when the build-first step could not run). Probe the
-            // profile-matching dir FIRST: with
-            // KTSTR_SCHEDULER_PROFILE=release (set by --release /
-            // --release-scheduler) the release build is the intended
-            // one, so prefer target/release/ over a possibly-stale
-            // target/debug/ binary.
-            let prefer_release =
-                std::env::var(crate::KTSTR_SCHEDULER_PROFILE_ENV).as_deref() == Ok("release");
+            // profile-matching dir FIRST: the scheduler defaults to the
+            // release profile (see `build_and_find_binary`), so prefer
+            // target/release/ over a possibly-stale target/debug/ binary
+            // unless KTSTR_SCHEDULER_PROFILE=dev explicitly selects the
+            // debug tree.
+            let prefer_release = crate::scheduler_profile_name() != "dev";
             for (dir, source) in target_dir_probe_order(prefer_release) {
                 let candidate = PathBuf::from(dir).join(name);
                 if candidate.exists() {
@@ -469,10 +468,10 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, Resol
 
 /// Order to probe the pre-built `target/{debug,release}/` scheduler
 /// binaries in the `Discover` cascade fallback: the profile-matching
-/// directory first. With `prefer_release` (set when
-/// `KTSTR_SCHEDULER_PROFILE=release`) the release build is the intended
-/// one, so `target/release/` is probed before a possibly-stale
-/// opposite-profile `target/debug/` binary. Pure +
+/// directory first. With `prefer_release` (the release-profile default —
+/// see [`crate::scheduler_profile_name`] — unless `KTSTR_SCHEDULER_PROFILE=dev`)
+/// the release build is the intended one, so `target/release/` is probed
+/// before a possibly-stale opposite-profile `target/debug/` binary. Pure +
 /// `pub(crate)` so the reorder is unit-testable without staging a CWD.
 pub(crate) fn target_dir_probe_order(prefer_release: bool) -> [(&'static str, ResolveSource); 2] {
     if prefer_release {

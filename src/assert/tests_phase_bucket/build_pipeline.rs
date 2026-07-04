@@ -12,7 +12,7 @@ use super::*;
 // * sample_count matches the input count
 //
 // Metric population is exercised separately at the
-// per-metric-arm tests in `src/stats.rs`; these tests verify the
+// per-metric-arm tests in `src/stats/metric.rs`; these tests verify the
 // bucketing skeleton independent of metric data.
 
 /// Empty `SampleSeries` -> empty `phases` vec. No BASELINE
@@ -155,8 +155,8 @@ fn build_phase_buckets_skipped_steps_yield_sparse_output() {
 /// Counter last-first delta for total_fallback / total_keep_last).
 ///
 /// Pins the wiring between MetricDef::read_sample's per-metric
-/// dispatch (stats.rs:read_sample at L315+) and the per-phase
-/// reduction (aggregate_samples_for_phase at L225). A future
+/// dispatch (read_sample in `src/stats/metric.rs`) and the per-phase
+/// reduction (aggregate_samples_for_phase in `src/stats/metric.rs`). A future
 /// refactor that drops a metric from the dispatch silently
 /// produces a missing-key in PhaseBucket.metrics — which the
 /// renderer paints as "absent" but is actually a regression;

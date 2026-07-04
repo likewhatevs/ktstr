@@ -36,10 +36,12 @@ fn default_threadstate_state_is_sentinel_tilde() {
 /// Mode tie-break regression: a default-constructed
 /// `ThreadState` must NOT lex-beat a real kernel state
 /// letter when both contribute to the same Mode aggregation
-/// at equal frequency. The kernel's
-/// [`crate::ctprof_compare::aggregate`] closure
-/// `a.1.cmp(&b.1).then(b.0.cmp(&a.0))` selects
-/// LEX-SMALLEST on count-ties, so the sentinel must be
+/// at equal frequency. ktstr's host-side
+/// [`crate::ctprof_compare::aggregate`] routes `ModeChar`
+/// through `mode_aggregate`, which tallies into a
+/// `BTreeMap<String, usize>`; [`Aggregated::mode_value`]
+/// then breaks count-ties toward the lex-smallest BTreeMap
+/// key via a strict-greater fold, so the sentinel must be
 /// LARGER than every real letter to keep the real letter
 /// winning. `'~'` (U+007E = 126) is larger than every
 /// kernel state letter (`R`=82, `S`=83, `D`=68, `T`=84,
@@ -273,7 +275,8 @@ fn nr_threads_field_pinned_to_gauge_count() {
 /// Type-pin: cancelled_write_bytes MUST be `Bytes`. A future
 /// refactor that flipped it to a non-byte type (e.g. plain
 /// `MonotonicCount`, dropping the IEC-binary auto-scale
-/// ladder and the registry's `unit: "B"` rendering) would
+/// ladder and the `ScaleLadder::Bytes` base unit `"B"` that
+/// the `AggRule::SumBytes` variant selects) would
 /// break this single `let _: Bytes = ...;` assignment. The
 /// test compiles only when the type is exactly `Bytes`.
 #[test]

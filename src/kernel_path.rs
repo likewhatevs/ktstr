@@ -45,13 +45,15 @@
 //    `#[cfg(test)]` portion lives in `src/kernel_path.rs` only.
 
 /// Human-readable enumeration of every form `KernelId::parse` accepts.
-/// Single source of truth — the macro-time rejection in
-/// `declare_scheduler!(kernels = […])` and the runtime cache-lookup
-/// bails in `ktstr` / `cargo-ktstr` all cite this string verbatim so
-/// the operator sees one grammar regardless of where their typo trips.
+/// The macro-time rejection in `declare_scheduler!(kernels = […])`
+/// cites this const verbatim. The runtime cache-lookup bails in
+/// `ktstr` / `cargo-ktstr` cite the `KTSTR_KERNEL_HINT` const, a manual
+/// mirror of this same wording — const composition cannot `concat!` a
+/// `const &str`, only literals — so keep the two in sync when either
+/// changes.
 pub const KERNEL_ID_GRAMMAR: &str = "exact version (`6.14`), inclusive range (`6.14..7.0` or \
-     `6.14..=7.0`), git source (`git+URL#REF`), absolute or \
-     `~`-prefixed path, or cache key";
+     `6.14..=7.0`), git source (`git+URL#tag=NAME`, `git+URL#branch=NAME`, or \
+     `git+URL#sha=<40-hex>`), absolute or `~`-prefixed path, or cache key";
 
 /// Kernel identifier: filesystem path, version string, cache key,
 /// stable-release range, or git source.
@@ -59,7 +61,8 @@ pub const KERNEL_ID_GRAMMAR: &str = "exact version (`6.14`), inclusive range (`6
 /// Parsing heuristic (see [`KernelId::parse`]):
 /// - Contains `/` (without a `git+` prefix) or starts with `.` or `~`:
 ///   [`KernelId::Path`]
-/// - Starts with `git+`: [`KernelId::Git`] (form `git+URL#REF`)
+/// - Starts with `git+`: [`KernelId::Git`] (form `git+URL#tag=NAME` /
+///   `git+URL#branch=NAME` / `git+URL#sha=<40-hex>`)
 /// - Contains `..` between two version-shaped tokens:
 ///   [`KernelId::Range`] (inclusive on both endpoints)
 /// - Matches `MAJOR.MINOR[.PATCH][-rcN]`: [`KernelId::Version`]
@@ -95,38 +98,75 @@ pub enum KernelId {
         /// message round-trip the operator's typed form.
         syntax_inclusive: bool,
     },
-    /// Git source: clone `url`, check out `git_ref` (a branch or tag),
-    /// stored verbatim by `KernelId::parse` with no remote contact. At
-    /// cache-resolution time `resolve_git_kernel` ls-remote-resolves
-    /// `git_ref` to its tip's short hash and probes the cache before
-    /// cloning, so a re-run against an unchanged tip skips the clone. The
-    /// cache key embeds `git_ref` verbatim alongside that short hash;
-    /// collapsing identical-sha-different-spelling refs to one
-    /// content-addressed `(URL, resolved_sha)` entry remains future work.
+    /// Git source: acquire the source at `git_ref` per `ref_kind`
+    /// (tag / branch / sha), chosen explicitly by the operator's
+    /// `#tag=` / `#branch=` / `#sha=` fragment — no DWIM. Stored
+    /// verbatim by `KernelId::parse` with no remote contact. At
+    /// cache-resolution time `resolve_git_kernel` resolves `git_ref`
+    /// to its full commit hash (a kind-directed ls-remote) and probes
+    /// the cache before fetching, so a re-run against an unchanged tip
+    /// skips the download.
     ///
-    /// A raw 40-hex commit SHA is NOT supported and is rejected with an
-    /// actionable error at clone time: fetching a bare commit needs
-    /// server-side allow-sha-in-want support the clone path does not
-    /// implement (a separate future feature). Use a branch or tag.
+    /// Acquisition is routed by host (see `resolve_git_kernel` /
+    /// `crate::fetch`):
+    /// - GitHub (`github.com/OWNER/REPO`): a codeload `tar.gz` snapshot
+    ///   of the RESOLVED COMMIT (the ls-remote-resolved commit for a
+    ///   tag/branch, the sha itself for a sha) — no clone; the
+    ///   exact-commit snapshot matches the cache key even if a branch
+    ///   tip moves mid-resolve. A tag/branch whose ls-remote resolution
+    ///   fails falls back to the clone path below (like a non-GitHub
+    ///   source).
+    /// - Non-GitHub: a kind-directed shallow clone — `Tag` fetches
+    ///   `refs/tags/{git_ref}` (annotated tags peel to the commit),
+    ///   `Branch` fetches `refs/heads/{git_ref}`. `Sha` is unsupported off
+    ///   GitHub (gix cannot fetch a bare commit and the remote lacks
+    ///   allow-sha-in-want) and errors.
     Git {
-        /// Remote URL (https or git@).
+        /// Remote URL (https or git@). GitHub sources are fetched from
+        /// codeload; non-GitHub sources are shallow-cloned from here.
         url: String,
-        /// Branch or tag name. Stored verbatim by `parse`;
-        /// ls-remote-resolved to its tip short hash at cache-resolution
-        /// time (see `resolve_git_kernel`) so a cached build is reused
-        /// without re-cloning. A raw 40-hex commit SHA is rejected at
-        /// clone time (not supported — see the variant doc).
+        /// The ref value after `kind=` (verbatim, no `refs/` prefix) for
+        /// `Tag` / `Branch` / `Sha`; the whole unrecognized fragment for
+        /// `Unknown`. For `ref_kind == Sha` this is the 40-hex commit id.
         git_ref: String,
+        /// Which git namespace `git_ref` names, from the explicit
+        /// `#tag=` / `#branch=` / `#sha=` selector. `Unknown` marks a
+        /// bare `#REF` or unrecognized selector that `validate` rejects.
+        ref_kind: GitRefKind,
     },
+}
+
+/// Which git ref namespace a [`KernelId::Git`]'s `git_ref` names,
+/// chosen explicitly by the operator via the `#tag=` / `#branch=` /
+/// `#sha=` fragment — never DWIM-inferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitRefKind {
+    /// `#tag=v6.14` → an annotated or lightweight tag (`refs/tags/`).
+    Tag,
+    /// `#branch=for-next` → a branch head (`refs/heads/`).
+    Branch,
+    /// `#sha=<40-hex>` → a raw commit id.
+    Sha,
+    /// A bare `#REF` fragment (no `kind=`) or an unrecognized selector;
+    /// carried so [`KernelId::validate`] can emit an actionable error.
+    /// Never resolved.
+    Unknown,
 }
 
 impl KernelId {
     /// Parse a string into a kernel identifier.
     ///
     /// Recognizes (in order):
-    /// - `git+URL#REF` → [`KernelId::Git`] (the `git+` prefix takes
-    ///   precedence over the `/`-contains test below, since URLs
-    ///   contain `/`).
+    /// - `git+`-prefixed → [`KernelId::Git`]. ANY `git+…` string is a
+    ///   Git source (the `git+` prefix takes precedence over the range
+    ///   and `/`-contains tests below), so a typo such as a missing
+    ///   `#fragment` never silently becomes a `Path`. The fragment
+    ///   selects the ref kind: `#tag=NAME` / `#branch=NAME` /
+    ///   `#sha=<40-hex>`; a missing/empty fragment or unrecognized
+    ///   selector yields `GitRefKind::Unknown`, and an empty URL an
+    ///   empty `url` — both of which [`KernelId::validate`] rejects
+    ///   with an actionable error rather than the resolver later
+    ///   reporting a confusing "path not found".
     /// - `START..=END` or `START..END` where both endpoints are
     ///   version-shaped → [`KernelId::Range`]. The endpoints are
     ///   ALWAYS inclusive — both `..` and `..=` spellings produce a
@@ -137,14 +177,32 @@ impl KernelId {
     /// - Version-shaped → [`KernelId::Version`].
     /// - Anything else → [`KernelId::CacheKey`].
     pub fn parse(s: &str) -> Self {
-        if let Some(rest) = s.strip_prefix("git+")
-            && let Some((url, git_ref)) = rest.rsplit_once('#')
-            && !url.is_empty()
-            && !git_ref.is_empty()
-        {
+        if let Some(rest) = s.strip_prefix("git+") {
+            // ANY `git+…` string is a Git source — split off the
+            // `#fragment` (a missing one leaves an empty fragment) and
+            // NEVER fall through to Path/CacheKey, so a typo such as
+            // `git+URL` (no fragment) surfaces the actionable
+            // git-grammar error from `validate` rather than a confusing
+            // "path not found". `parse` returns `Self`, not `Result`, so
+            // all structural rejection (Unknown kind, empty url/ref, bad
+            // sha) is deferred to `validate`.
+            let (url, frag) = match rest.rsplit_once('#') {
+                Some((url, frag)) => (url, frag),
+                None => (rest, ""),
+            };
+            // Explicit ref-kind grammar: `#tag=NAME` / `#branch=NAME` /
+            // `#sha=<40-hex>`. A bare `#REF` (no `kind=`), an empty
+            // fragment, or an unrecognized selector parses as `Unknown`.
+            let (ref_kind, git_ref) = match frag.split_once('=') {
+                Some(("tag", v)) => (GitRefKind::Tag, v.to_string()),
+                Some(("branch", v)) => (GitRefKind::Branch, v.to_string()),
+                Some(("sha", v)) => (GitRefKind::Sha, v.to_string()),
+                _ => (GitRefKind::Unknown, frag.to_string()),
+            };
             return KernelId::Git {
                 url: url.to_string(),
-                git_ref: git_ref.to_string(),
+                git_ref,
+                ref_kind,
             };
         }
         if let Some((start, end)) = s.split_once("..=")
@@ -180,7 +238,7 @@ impl KernelId {
     /// identifiers. Empty entries are silently skipped (so trailing
     /// commas or repeated separators are forgiving). Each non-empty
     /// segment is fed through [`KernelId::parse`] verbatim — so
-    /// `parse_list("6.10,git+URL#main,/srv/linux")` returns three
+    /// `parse_list("6.10,git+URL#branch=main,/srv/linux")` returns three
     /// distinct variants. Deduplication is the resolver's
     /// responsibility (after canonicalization to a cache key); this
     /// function preserves order and duplicates as written.
@@ -231,7 +289,13 @@ impl KernelId {
                          `6.10-rc1..=6.10`.",
                     )
                 })?;
-                let end_key = decompose_version_for_compare(end).ok_or_else(|| {
+                // END is series-inclusive: a 2-component `MAJOR.MINOR`
+                // END names the whole series (see `range_end_key`), so
+                // the inversion check must use the SAME widened bound the
+                // expansion does — otherwise a valid same-series range
+                // like `6.14.5..6.14` (= 6.14.5 .. end of the 6.14
+                // series) is falsely rejected as inverted.
+                let end_key = range_end_key(end).ok_or_else(|| {
                     format!(
                         "kernel range end `{end}` is not a parseable version. \
                          Expected `MAJOR.MINOR[.PATCH][-rc<num>]` (e.g. \"6.10\", \
@@ -249,10 +313,42 @@ impl KernelId {
                 }
                 Ok(())
             }
-            KernelId::Path(_)
-            | KernelId::Version(_)
-            | KernelId::CacheKey(_)
-            | KernelId::Git { .. } => Ok(()),
+            KernelId::Git {
+                url,
+                git_ref,
+                ref_kind,
+            } => {
+                if url.is_empty() {
+                    return Err(format!(
+                        "git source `git+#{git_ref}`: empty URL — write \
+                         `git+<url>#tag=<name>` (or `#branch=` / `#sha=`)."
+                    ));
+                }
+                if *ref_kind == GitRefKind::Unknown {
+                    return Err(format!(
+                        "git source `git+{url}#{git_ref}`: the ref kind must be \
+                         explicit — write `#tag=<name>`, `#branch=<name>`, or \
+                         `#sha=<40-hex>` (a bare `#REF` is no longer accepted).",
+                    ));
+                }
+                if git_ref.is_empty() {
+                    return Err(format!(
+                        "git source `git+{url}#...`: empty ref value — write \
+                         `#tag=<name>`, `#branch=<name>`, or `#sha=<40-hex>`.",
+                    ));
+                }
+                if *ref_kind == GitRefKind::Sha
+                    && (git_ref.len() != 40 || !git_ref.bytes().all(|b| b.is_ascii_hexdigit()))
+                {
+                    return Err(format!(
+                        "git source `git+{url}#sha={git_ref}`: a sha must be the full \
+                         40-hex commit id (abbreviated shas can't be fetched); use \
+                         `#tag=` or `#branch=` for a name.",
+                    ));
+                }
+                Ok(())
+            }
+            KernelId::Path(_) | KernelId::Version(_) | KernelId::CacheKey(_) => Ok(()),
         }
     }
 }
@@ -271,16 +367,28 @@ impl std::fmt::Display for KernelId {
                 let sep = if *syntax_inclusive { "..=" } else { ".." };
                 write!(f, "{start}{sep}{end}")
             }
-            KernelId::Git { url, git_ref } => write!(f, "git+{url}#{git_ref}"),
+            KernelId::Git {
+                url,
+                git_ref,
+                ref_kind,
+            } => match ref_kind {
+                GitRefKind::Tag => write!(f, "git+{url}#tag={git_ref}"),
+                GitRefKind::Branch => write!(f, "git+{url}#branch={git_ref}"),
+                GitRefKind::Sha => write!(f, "git+{url}#sha={git_ref}"),
+                // Round-trip a rejected bare fragment verbatim so
+                // `parse(Display(x)) == x` still holds for the Unknown case.
+                GitRefKind::Unknown => write!(f, "git+{url}#{git_ref}"),
+            },
         }
     }
 }
 
 /// Check if a string matches a kernel version pattern.
 ///
-/// Matches: `6.14`, `6.14.2`, `6.15-rc3`, `6.14.2-rc1`.
-/// Does not match: `v6.14` (git tag prefix), `6` (no minor),
-/// `6.14.2-tarball-x86_64-kc...` (cache key with extra segments).
+/// Matches: `6` (bare major prefix), `6.14`, `6.14.2`, `6.15-rc3`,
+/// `6.14.2-rc1`. Does not match: `v6.14` (git tag prefix), `6.`
+/// (trailing dot), `6.14.2-tarball-x86_64-kc...` (cache key with
+/// extra segments).
 fn _is_version_string(s: &str) -> bool {
     let (version_part, rc_part) = match s.split_once("-rc") {
         Some((v, rc)) => (v, Some(rc)),
@@ -301,8 +409,13 @@ fn _is_version_string(s: &str) -> bool {
         Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {}
         _ => return false,
     }
-    // Minor: required, non-empty digits.
+    // Minor: OPTIONAL — a bare MAJOR (`6`) is a valid version prefix
+    // that resolves to the highest patch across all minors (see
+    // `crate::fetch::fetch_version_for_prefix`). If present it must be
+    // non-empty digits; `6.` (trailing dot) is rejected as an empty
+    // component.
     match parts.next() {
+        None => {}
         Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {}
         _ => return false,
     }
@@ -349,7 +462,14 @@ pub(crate) fn decompose_version_for_compare(s: &str) -> Option<(u64, u64, u64, u
     };
     let mut parts = version_part.split('.');
     let major: u64 = parts.next()?.parse().ok()?;
-    let minor: u64 = parts.next()?.parse().ok()?;
+    // Minor optional: a bare MAJOR (`6`) decomposes to `(major, 0, 0,
+    // ..)` so it behaves as a series-floor prefix, consistent with
+    // `_is_version_string` accepting a bare major.
+    let minor: u64 = match parts.next() {
+        None => 0,
+        Some("") => return None,
+        Some(m) => m.parse().ok()?,
+    };
     let patch: u64 = match parts.next() {
         Some("") => return None,
         Some(p) => p.parse().ok()?,
@@ -362,6 +482,29 @@ pub(crate) fn decompose_version_for_compare(s: &str) -> Option<(u64, u64, u64, u
     Some((major, minor, patch, rc))
 }
 
+/// The upper-bound comparison key for a range's END endpoint,
+/// series-inclusive: a 2-component `MAJOR.MINOR` (or bare-major) END
+/// with no `-rc` names the WHOLE series, so its patch and rc slots are
+/// widened to `u64::MAX`. [`decompose_version_for_compare`] alone maps a
+/// missing patch to 0, which as an inclusive upper bound would exclude
+/// every `6.14.N` (N >= 1) from an END of `6.14`. An explicit-patch END
+/// (`6.14.2`) or an `-rc` END keeps its exact key. Shared by
+/// [`KernelId::validate`]'s inversion check and the `cli` module's
+/// range expansion (`range_bounds`) so the two agree on where a range
+/// ends. START needs no such widening — its `.0` is the series floor.
+pub(crate) fn range_end_key(end: &str) -> Option<(u64, u64, u64, u64)> {
+    let key = decompose_version_for_compare(end)?;
+    // Same predicate as `crate::fetch::is_major_minor_prefix`, inlined
+    // because this file forbids non-std imports (file-header rule #1):
+    // a 2-component (or bare-major) endpoint with no `-rc` is a whole
+    // series and widens to its ceiling.
+    if end.matches('.').count() < 2 && !end.contains("-rc") {
+        Some((key.0, key.1, u64::MAX, u64::MAX))
+    } else {
+        Some(key)
+    }
+}
+
 /// Expand a leading `~` or `~/...` in `s` against `$HOME` and
 /// return the resulting [`std::path::PathBuf`]. Any other shape (no leading
 /// `~`, `~user/...` for a different user, `$HOME` unset or empty)
@@ -371,7 +514,8 @@ pub(crate) fn decompose_version_for_compare(s: &str) -> Option<(u64, u64, u64, u
 ///
 /// Cases handled:
 /// - `"~"` → `$HOME`
-/// - `"~/"` → `$HOME/`
+/// - `"~/"` → `$HOME` (same as bare `"~"`; the empty suffix
+///   after `~/` yields no trailing separator)
 /// - `"~/linux"` → `$HOME/linux`
 /// - `"~user/..."` → unchanged (std has no `getpwnam`; a
 ///   different-user expansion would require shelling out, which
@@ -437,9 +581,11 @@ fn expand_tilde(s: &str) -> std::path::PathBuf {
 /// Returns `None` if the procfs entry is unreadable, empty, or missing.
 /// Callers that need the release string for `/lib/modules/{release}/…`
 /// fallbacks use this rather than shelling out to `uname -r`: the
-/// procfs entry exposes the same value the kernel returns from the
-/// uname(2) syscall (see linux/kernel/sys.c: `override_release`) and
-/// only costs a small read.
+/// procfs entry exposes the raw utsname release (served by
+/// `proc_do_uts_string` in linux/kernel/utsname_sysctl.c), the same
+/// field uname(2) reads — modulo the UNAME26 personality shim
+/// `override_release` applies on the uname(2) path only — and only
+/// costs a small read.
 fn kernel_release_from_procfs() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .ok()
@@ -1258,9 +1404,10 @@ mod tests {
     }
 
     #[test]
-    fn kernel_id_parse_bare_major_not_version() {
-        // "6" alone has no minor component -- cache key.
-        assert_eq!(KernelId::parse("6"), KernelId::CacheKey("6".to_string()));
+    fn kernel_id_parse_bare_major_is_version() {
+        // "6" is a bare-major version prefix (resolves to the highest
+        // 6.x.y patch via fetch_version_for_prefix), NOT a cache key.
+        assert_eq!(KernelId::parse("6"), KernelId::Version("6".to_string()));
     }
 
     #[test]
@@ -1298,7 +1445,37 @@ mod tests {
         assert_eq!(
             KernelId::Git {
                 url: "https://example.com/r.git".to_string(),
+                git_ref: "for-next".to_string(),
+                ref_kind: GitRefKind::Branch,
+            }
+            .to_string(),
+            "git+https://example.com/r.git#branch=for-next",
+        );
+        assert_eq!(
+            KernelId::Git {
+                url: "https://example.com/r.git".to_string(),
+                git_ref: "v6.14".to_string(),
+                ref_kind: GitRefKind::Tag,
+            }
+            .to_string(),
+            "git+https://example.com/r.git#tag=v6.14",
+        );
+        assert_eq!(
+            KernelId::Git {
+                url: "https://example.com/r.git".to_string(),
+                git_ref: "abc123".to_string(),
+                ref_kind: GitRefKind::Sha,
+            }
+            .to_string(),
+            "git+https://example.com/r.git#sha=abc123",
+        );
+        // Unknown (a bare `#REF`) round-trips verbatim so
+        // parse(Display(x)) == x still holds for the reject case.
+        assert_eq!(
+            KernelId::Git {
+                url: "https://example.com/r.git".to_string(),
                 git_ref: "main".to_string(),
+                ref_kind: GitRefKind::Unknown,
             }
             .to_string(),
             "git+https://example.com/r.git#main",
@@ -1398,73 +1575,131 @@ mod tests {
         );
     }
 
-    // -- KernelId::parse — Git arm --
+    // -- KernelId::parse — Git arm (explicit #tag= / #branch= / #sha=) --
 
     #[test]
     fn kernel_id_parse_git_branch() {
         assert_eq!(
-            KernelId::parse("git+https://example.com/r.git#main"),
+            KernelId::parse("git+https://example.com/r.git#branch=main"),
             KernelId::Git {
                 url: "https://example.com/r.git".to_string(),
                 git_ref: "main".to_string(),
+                ref_kind: GitRefKind::Branch,
+            },
+        );
+    }
+
+    #[test]
+    fn kernel_id_parse_git_tag() {
+        assert_eq!(
+            KernelId::parse("git+https://example.com/r.git#tag=v6.14"),
+            KernelId::Git {
+                url: "https://example.com/r.git".to_string(),
+                git_ref: "v6.14".to_string(),
+                ref_kind: GitRefKind::Tag,
             },
         );
     }
 
     #[test]
     fn kernel_id_parse_git_sha() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
         assert_eq!(
-            KernelId::parse("git+https://example.com/r.git#abc1234"),
+            KernelId::parse(&format!("git+https://example.com/r.git#sha={sha}")),
             KernelId::Git {
                 url: "https://example.com/r.git".to_string(),
-                git_ref: "abc1234".to_string(),
+                git_ref: sha.to_string(),
+                ref_kind: GitRefKind::Sha,
             },
         );
     }
 
-    /// The Git arm splits on the LAST `#` so URL fragments survive
-    /// inside the URL slot — `git+https://x#frag#main` parses as
-    /// url=`https://x#frag`, git_ref=`main`. A future regression
-    /// that swapped to `split_once('#')` would land here as a
-    /// flipped URL/ref.
+    /// A bare `#REF` (no `kind=`) parses to `GitRefKind::Unknown` so
+    /// `validate` — not `parse` — surfaces the actionable error; `parse`
+    /// returns `Self`, never `Result`. An unrecognized `#foo=` selector
+    /// lands the same way (the whole fragment is kept as the ref).
+    #[test]
+    fn kernel_id_parse_git_bare_ref_is_unknown() {
+        assert_eq!(
+            KernelId::parse("git+https://example.com/r.git#main"),
+            KernelId::Git {
+                url: "https://example.com/r.git".to_string(),
+                git_ref: "main".to_string(),
+                ref_kind: GitRefKind::Unknown,
+            },
+        );
+        assert_eq!(
+            KernelId::parse("git+https://example.com/r.git#foo=bar"),
+            KernelId::Git {
+                url: "https://example.com/r.git".to_string(),
+                git_ref: "foo=bar".to_string(),
+                ref_kind: GitRefKind::Unknown,
+            },
+        );
+    }
+
+    /// The Git arm splits the URL/fragment on the LAST `#` (so a `#`
+    /// inside the URL survives), then the fragment on the FIRST `=`
+    /// into kind/value — `git+https://x#frag#branch=main` parses as
+    /// url=`https://x#frag`, branch=`main`. A regression to
+    /// `split_once('#')` would flip the URL/ref.
     #[test]
     fn kernel_id_parse_git_multi_hash_url() {
         assert_eq!(
-            KernelId::parse("git+https://x#frag#main"),
+            KernelId::parse("git+https://x#frag#branch=main"),
             KernelId::Git {
                 url: "https://x#frag".to_string(),
                 git_ref: "main".to_string(),
+                ref_kind: GitRefKind::Branch,
             },
         );
     }
 
-    /// Empty git_ref after the `#`: the Git arm requires a non-empty
-    /// ref so it skips. The string still contains `/` (the URL's
-    /// scheme separator and path), so the `/`-contains Path arm
-    /// fires next and the value lands as a Path holding the literal
-    /// `git+` spelling. That's a degenerate Path — the auto-build
-    /// step will reject `git+...` as a non-existent directory at
-    /// resolve time, surfacing the typo with a clear filesystem
-    /// error instead of letting the Git arm swallow an empty ref.
+    /// Empty fragment after the `#` (`git+URL#`): the Git arm now
+    /// claims ANY `git+…` string, so this parses to a Git with an empty
+    /// `git_ref` and `GitRefKind::Unknown` rather than falling through
+    /// to Path. That routes the typo into `validate`, which surfaces the
+    /// actionable "ref kind must be explicit" error instead of a
+    /// confusing filesystem "path not found".
     #[test]
-    fn kernel_id_parse_git_empty_ref_falls_through() {
+    fn kernel_id_parse_git_empty_ref_is_git_unknown() {
+        let id = KernelId::parse("git+https://example.com/r.git#");
         assert_eq!(
-            KernelId::parse("git+https://example.com/r.git#"),
-            KernelId::Path(PathBuf::from("git+https://example.com/r.git#")),
+            id,
+            KernelId::Git {
+                url: "https://example.com/r.git".to_string(),
+                git_ref: String::new(),
+                ref_kind: GitRefKind::Unknown,
+            },
+        );
+        assert!(
+            id.validate().is_err(),
+            "an empty/kind-less git fragment must be rejected by validate",
         );
     }
 
-    /// Empty URL before the `#`: the Git arm fails on the empty url
-    /// check. Unlike the empty-ref case above, this string contains
-    /// no `/`, so the Path arm doesn't fire either. `_is_version_string`
-    /// fails on the leading `git+`, so it lands as CacheKey holding
-    /// the literal spelling — which a downstream cache lookup will
-    /// reject as a missing entry.
+    /// Empty URL before the `#`: the Git arm claims it (git+ takes
+    /// precedence), producing a Git with an empty `url`. A valid `#tag=`
+    /// selector isolates the empty-URL `validate` check (a kind-less
+    /// fragment would also trip the Unknown check), pinning that the
+    /// empty URL — not a silent CacheKey miss — is what gets rejected.
     #[test]
-    fn kernel_id_parse_git_empty_url_falls_through() {
+    fn kernel_id_parse_git_empty_url_is_rejected() {
+        let id = KernelId::parse("git+#tag=x");
         assert_eq!(
-            KernelId::parse("git+#main"),
-            KernelId::CacheKey("git+#main".to_string()),
+            id,
+            KernelId::Git {
+                url: String::new(),
+                git_ref: "x".to_string(),
+                ref_kind: GitRefKind::Tag,
+            },
+        );
+        let err = id
+            .validate()
+            .expect_err("an empty git URL must be rejected by validate");
+        assert!(
+            err.contains("empty URL"),
+            "empty-URL git spec must surface the empty-URL diagnostic, got: {err}",
         );
     }
 
@@ -1476,10 +1711,11 @@ mod tests {
     #[test]
     fn kernel_id_parse_git_beats_path() {
         assert_eq!(
-            KernelId::parse("git+/local/repo#v1"),
+            KernelId::parse("git+/local/repo#tag=v1"),
             KernelId::Git {
                 url: "/local/repo".to_string(),
                 git_ref: "v1".to_string(),
+                ref_kind: GitRefKind::Tag,
             },
         );
     }
@@ -1500,12 +1736,13 @@ mod tests {
 
     #[test]
     fn kernel_id_parse_list_mixed() {
-        let list = KernelId::parse_list("6.10,git+url#main,/srv/linux");
+        let list = KernelId::parse_list("6.10,git+url#branch=main,/srv/linux");
         assert_eq!(list.len(), 3, "expected 3 entries, got {list:?}");
         assert!(matches!(list[0], KernelId::Version(ref v) if v == "6.10"));
         assert!(matches!(
             list[1],
-            KernelId::Git { ref url, ref git_ref } if url == "url" && git_ref == "main"
+            KernelId::Git { ref url, ref git_ref, ref_kind: GitRefKind::Branch }
+                if url == "url" && git_ref == "main"
         ));
         assert!(matches!(list[2], KernelId::Path(ref p) if p == &PathBuf::from("/srv/linux")));
     }
@@ -1759,6 +1996,34 @@ mod tests {
         );
     }
 
+    /// `6.14.5..6.14` — an explicit-patch START into a 2-component END
+    /// that names the WHOLE 6.14 series. `range_end_key` widens the END
+    /// to the series ceiling (6,14,MAX,MAX), so this is the valid range
+    /// "6.14.5 through the end of the 6.14 series", NOT an inversion.
+    /// Regression pin: before END-series-inclusivity, validate used the
+    /// un-widened end (6,14,0,MAX) and falsely rejected this while the
+    /// expansion accepted it — the two disagreed; now they must agree.
+    #[test]
+    fn kernel_id_validate_range_explicit_start_patch_into_series_end_ok() {
+        let id = KernelId::parse("6.14.5..6.14");
+        assert!(
+            id.validate().is_ok(),
+            "explicit-patch start into a series END must validate: {id:?}",
+        );
+    }
+
+    /// `6.15..6.14` — a higher START minor than the END series must
+    /// still reject even with the END widened to (6,14,MAX,MAX): the
+    /// widening must not mask a real inversion.
+    #[test]
+    fn kernel_id_validate_range_series_end_still_rejects_higher_start() {
+        let id = KernelId::parse("6.15..6.14");
+        assert!(
+            id.validate().is_err(),
+            "higher start minor must still reject as inverted: {id:?}",
+        );
+    }
+
     /// `6.10-rc3..6.10-rc1` — same major.minor.patch but rc decreases.
     /// Reject. Pre-release ordering must follow numeric rcN order.
     #[test]
@@ -1792,9 +2057,46 @@ mod tests {
             KernelId::Git {
                 url: "https://example.com/r.git".to_string(),
                 git_ref: "main".to_string(),
+                ref_kind: GitRefKind::Branch,
             }
             .validate()
             .is_ok(),
+        );
+    }
+
+    /// The explicit git ref grammar rejects, at `validate`, a bare
+    /// `#REF` (Unknown kind), an empty ref value, and a `#sha=` that
+    /// is not a full 40-hex commit id. `parse` returns the variant;
+    /// `validate` is the error channel (there is no `KernelId::Invalid`).
+    #[test]
+    fn kernel_id_validate_git_rejects_malformed_ref() {
+        // Bare `#main` → Unknown → rejected with the "use #tag=/…" hint.
+        let bare = KernelId::parse("git+https://example.com/r.git#main");
+        let err = bare.validate().expect_err("bare #REF must be rejected");
+        assert!(
+            err.contains("#tag=") && err.contains("#branch=") && err.contains("#sha="),
+            "error must name the accepted grammar: {err}"
+        );
+        // Empty value after a valid kind.
+        assert!(
+            KernelId::parse("git+https://example.com/r.git#tag=")
+                .validate()
+                .is_err(),
+            "empty #tag= must be rejected"
+        );
+        // `#sha=` that is not 40 hex.
+        assert!(
+            KernelId::parse("git+https://example.com/r.git#sha=abc123")
+                .validate()
+                .is_err(),
+            "short (non-40-hex) #sha= must be rejected"
+        );
+        let full = "0123456789abcdef0123456789abcdef01234567";
+        assert!(
+            KernelId::parse(&format!("git+https://example.com/r.git#sha={full}"))
+                .validate()
+                .is_ok(),
+            "a full 40-hex #sha= must validate"
         );
     }
 
@@ -1846,6 +2148,7 @@ mod tests {
 
     #[test]
     fn kernel_id_is_version_string_valid() {
+        assert!(_is_version_string("6"), "bare major is a version prefix");
         assert!(_is_version_string("6.14"));
         assert!(_is_version_string("6.14.2"));
         assert!(_is_version_string("6.15-rc3"));
@@ -1857,7 +2160,9 @@ mod tests {
 
     #[test]
     fn kernel_id_is_version_string_invalid() {
-        assert!(!_is_version_string("6"));
+        // Bare major `6` is now VALID (optional minor), but a non-digit
+        // minor must still reject — pins the optional-minor boundary.
+        assert!(!_is_version_string("6.x"));
         assert!(!_is_version_string("v6.14"));
         assert!(!_is_version_string(""));
         assert!(!_is_version_string("6.14.2-tarball-x86_64"));
@@ -1926,13 +2231,23 @@ mod tests {
                         "Range payload drift for {s:?}",
                     );
                 }
-                KernelId::Git { url, git_ref } => {
-                    // Git is constructed only on the `git+URL#REF`
-                    // prefix branch with non-empty url and git_ref;
-                    // round-trip the full prefix/separator shape.
+                KernelId::Git { .. } => {
+                    // Any `git+…` string parses to a Git value. A STRING
+                    // round-trip cannot hold for every input: `git+URL`
+                    // and `git+URL#` both parse to the same value
+                    // (`Unknown` kind, empty ref), and `Display` always
+                    // renders a `#`, so `git+URL` != Display(parse("git+URL")).
+                    // Assert the SEMANTIC round-trip instead — Display
+                    // then re-parse yields an equal id — which holds for
+                    // every kind including the `#`-free / empty-fragment
+                    // spellings.
+                    let id = KernelId::parse(&s);
+                    let reparsed = KernelId::parse(&id.to_string());
                     prop_assert!(
-                        format!("git+{url}#{git_ref}") == s,
-                        "Git payload drift for {s:?}",
+                        reparsed == id,
+                        "Git semantic round-trip drift for {s:?}: \
+                         {id:?} -> {:?} -> {reparsed:?}",
+                        id.to_string(),
                     );
                 }
             }

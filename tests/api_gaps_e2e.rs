@@ -2,21 +2,27 @@
 //! mid-2026-05-18 batch: [`VmResult::periodic_series`] sugar, the
 //! [`SeriesField::ratio_across_phases`] cross-phase comparator,
 //! [`SeriesField::value_at_phase`] / [`SeriesField::last_per_phase`]
-//! per-phase reductions, and [`Snapshot::live_var_via`] live-pick
-//! disambiguator.
+//! per-phase reductions, plus the [`VmResult`] per-phase-bucket
+//! accessors (`phase_buckets` / `phase_cgroup` / `phase_metric` /
+//! `phase_cgroup_metric`) and `guest_assert_result`.
 //!
 //! Boots a single 2-Step scenario with periodic captures across
 //! both Steps so the resulting [`SampleSeries`] carries samples
 //! stamped with both `Phase::step(0)` and `Phase::step(1)`. One
-//! `post_vm` callback covers every helper in one drain:
+//! `post_vm` callback covers these helpers in one drain:
 //!
 //! * `result.periodic_series()` returns a non-empty series — pins
 //!   the sugar drains the same bridge `SampleSeries::from_drained_typed`
 //!   would have, with `periodic_only()` applied.
-//! * `series.bpf(...).value_at_phase(Phase::step(0))` returns
-//!   `Some(_)` and `last_per_phase()` carries the same key —
+//! * `series.bpf(...).value_at_phase` returns `Some(_)` for at
+//!   least one Step phase and `last_per_phase()` is non-empty —
 //!   pins the two phase-reduction helpers are wired to the
 //!   periodic-axis phase stamps the framework emits.
+//! * `result.phase_buckets()` / `phase_cgroup(...)` /
+//!   `phase_metric(...)` / `phase_cgroup_metric(...)` resolve the
+//!   per-phase buckets and their folded per-cgroup carriers from
+//!   `post_vm`, and `guest_assert_result()` decodes the run's
+//!   guest verdict frame.
 //! * `series.bpf(...).ratio_across_phases(verdict, Step[0], Step[1])
 //!   .at_most(...)` lands either pass (records info note) or fail
 //!   (records temporal detail) — pins the comparator chain

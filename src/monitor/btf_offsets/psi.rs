@@ -9,7 +9,7 @@
 //!   `total[PSI_AVGS][PSI_IRQ_FULL]` is the monotonic IRQ-full stall accumulator
 //!   (`collect_percpu_times` folds per-CPU `times[PSI_IRQ_FULL]` into it,
 //!   psi.c:362-415). `psi_show` renders it as µs via `div_u64(.., NSEC_PER_USEC)`
-//!   (psi.c:1285), so [`decode_total_us`] divides the raw ns by 1000.
+//!   (psi.c:1280-1281), so [`decode_total_us`] divides the raw ns by 1000.
 //! - `avg[NR_PSI_STATES-1][3]` (`unsigned long`, the EWMA): `avg[PSI_IRQ_FULL][0]`
 //!   is the 10s window. `calc_avgs` (psi.c:356-360) scales the percent by
 //!   `FIXED_1` (`pct *= FIXED_1`) and `calc_load` is scale-preserving, so the
@@ -62,7 +62,7 @@ pub const PSI_ELEM_SIZE: usize = 8;
 /// (`calc_avgs` psi.c:356-360), so `raw/FIXED_1` recovers percent `[0,100]`.
 pub const PSI_FIXED_1: f64 = 2048.0;
 
-/// `NSEC_PER_USEC` — `psi_show` (psi.c:1285) emits `total` as
+/// `NSEC_PER_USEC` — `psi_show` (psi.c:1280-1281) emits `total` as
 /// `div_u64(total_ns, NSEC_PER_USEC)`, so the stored `total[]` ns ÷ this = µs.
 pub const PSI_NSEC_PER_USEC: f64 = 1000.0;
 

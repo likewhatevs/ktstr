@@ -3380,7 +3380,8 @@ mod tests {
     #[test]
     fn terminal_event_single_step_rate() {
         // Boundary case: a one-step scenario (first == last). With the
-        // 0 baseline and the terminal boundary        // the single step still gets a rate, and the terminal adds no
+        // 0 baseline and the terminal boundary supplying the right edge,
+        // the single step still gets a rate, and the terminal adds no
         // phase.
         let mut events: Vec<StimulusEvent> = [wire_event(0, 1, 0)]
             .iter()
@@ -3769,9 +3770,10 @@ mod tests {
     /// buckets whose avg_imbalance / avg_dsq_depth cross the thresholds
     /// in the worsening direction must record Degraded changes on the
     /// ENTERED phase (phases[1]), and the BASELINE phase records none.
-    /// Without this, the 821-869 detection loop ships unverified (a
-    /// wrong threshold, inverted direction, wrong-phase recording, or
-    /// wrong metric field would all slip past the other
+    /// Without this, the from_phase_buckets boundary-change loop (the
+    /// `for i in 1..phases.len()` call to detect_boundary_changes) ships
+    /// unverified (a wrong threshold, inverted direction, wrong-phase
+    /// recording, or wrong metric field would all slip past the other
     /// from_phase_buckets tests, which never trigger the loop).
     #[test]
     fn from_phase_buckets_detects_boundary_degradation() {

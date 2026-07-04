@@ -418,7 +418,7 @@ fn host_capacity_returns_plausible_triple() {
 fn for_each_gauntlet_variant_skips_presets_exceeding_host_capacity() {
     // Pass host_cpus=1/host_llcs=1 against the preset list: every
     // current preset has total_cpus >= 4 (see `gauntlet_presets()`
-    // in src/vm.rs), so every preset fails
+    // in src/gauntlet.rs), so every preset fails
     // `TopologyConstraints::accepts` and `visit` must never be
     // called. Any entry works since the constraint check runs
     // before the visit — use the test dummy.
@@ -581,10 +581,10 @@ fn parse_kernel_list_trims_whitespace() {
 /// version parsing).
 #[test]
 fn parse_kernel_list_preserves_label() {
-    let entries = parse_kernel_list("6.14.2=/a;git_tj_sched_ext_main=/b;6.15-rc3=/c");
+    let entries = parse_kernel_list("6.14.2=/a;git_tj_sched_ext_branch_main=/b;6.15-rc3=/c");
     assert_eq!(entries.len(), 3);
     assert_eq!(entries[0].label, "6.14.2");
-    assert_eq!(entries[1].label, "git_tj_sched_ext_main");
+    assert_eq!(entries[1].label, "git_tj_sched_ext_branch_main");
     assert_eq!(entries[2].label, "6.15-rc3");
 }
 
@@ -677,8 +677,8 @@ fn filter_handles_unparseable_entry_label_in_range() {
     // Entry whose label isn't version-shaped (e.g. a Git
     // label) can't be in a version range — reject.
     let git_entry = mk_entry(
-        "git_tj_sched_ext_main",
-        "kernel_git_tj_sched_ext_main",
+        "git_tj_sched_ext_branch_main",
+        "kernel_git_tj_sched_ext_branch_main",
         "/a",
     );
     assert!(!entry_matches_spec(&git_entry, "6.14..6.16"));
@@ -717,7 +717,11 @@ fn filter_accepts_when_any_declared_spec_matches() {
     // Multiple declared specs; entry matches one of them.
     let e = mk_entry("6.15.3", "kernel_6_15_3", "/a");
     assert!(sched_kernel_filter_accepts(
-        &["6.14.2", "6.14..6.16", "git+https://example.com/r#main"],
+        &[
+            "6.14.2",
+            "6.14..6.16",
+            "git+https://example.com/r#branch=main"
+        ],
         &e,
     ));
 }
@@ -848,14 +852,14 @@ fn sanitize_kernel_label_handles_full_cache_key_shape() {
     );
 }
 
-/// Git-source semantic label `git_tj_sched_ext_for-next` from
+/// Git-source semantic label `git_tj_sched_ext_branch_for-next` from
 /// the producer-side encoder maps to the dash-stripped form
 /// the sanitizer produces.
 #[test]
 fn sanitize_kernel_label_git_semantic_label() {
     assert_eq!(
-        sanitize_kernel_label("git_tj_sched_ext_for-next"),
-        "kernel_git_tj_sched_ext_for_next",
+        sanitize_kernel_label("git_tj_sched_ext_branch_for-next"),
+        "kernel_git_tj_sched_ext_branch_for_next",
     );
 }
 
@@ -919,7 +923,7 @@ fn sanitized_kernel_label_new_runs_sanitizer() {
         "6.14.2",
         "6.15-rc3",
         "ABC-DEF",
-        "git_tj_sched_ext_for-next",
+        "git_tj_sched_ext_branch_for-next",
         "",
     ] {
         let label = SanitizedKernelLabel::new(raw);
@@ -2555,14 +2559,14 @@ fn run_verifier_cell_missing_prefix_exits_one() {
     );
 }
 
-/// A name with the prefix but fewer than 3 slash-separated
-/// segments after it (splitn(3) on `only_two` yields 1 part)
-/// exits 1 with the malformed-cell diagnostic naming the
-/// expected shape. Pins the parts.len() != 3 arm.
+/// A name with the prefix but fewer than 3 slash-separated segments
+/// (splitn(3) on `only/two` yields 2 parts) exits 1 with the
+/// malformed-cell diagnostic naming the expected shape. Pins the
+/// parts.len() != 3 arm.
 #[test]
 fn run_verifier_cell_too_few_parts_exits_one() {
     use crate::test_support::test_helpers::capture_stderr;
-    let (code, captured) = capture_stderr(|| run_verifier_cell("verifier/only_two"));
+    let (code, captured) = capture_stderr(|| run_verifier_cell("verifier/only/two"));
     assert_eq!(code, 1);
     let stderr = String::from_utf8(captured).expect("stderr is utf-8");
     assert!(
@@ -2868,8 +2872,8 @@ fn list_verifier_cells_all_empty_kernel_list_emits_nothing() {
 /// this binary's `KTSTR_SCHEDULERS` slice (the lib test binary
 /// registers none), `list_verifier_cells_all` runs the post-early-
 /// return setup (its `gauntlet_presets()` / `host_capacity()` /
-/// `no_perf_mode_active()` bindings) and then iterates zero schedulers — so no
-/// `verifier/` line is ever printed. Pins that a kernel list alone
+/// `scheduler_filter` bindings) and then iterates zero schedulers — so
+/// no `verifier/` line is ever printed. Pins that a kernel list alone
 /// does not synthesize cells without a scheduler to pair them with.
 #[test]
 fn list_verifier_cells_all_no_schedulers_emits_no_cells() {
@@ -2883,6 +2887,47 @@ fn list_verifier_cells_all_no_schedulers_emits_no_cells() {
         !stdout.lines().any(|l| l.starts_with("verifier/")),
         "zero declared schedulers must yield zero `verifier/` cells even \
          with a populated kernel list; got:\n{stdout}",
+    );
+}
+
+/// Pure parse of `[workspace] members`: `.` maps to the root package
+/// name, other members' last path component is the package name, and a
+/// non-member (a fixture scheduler) is absent.
+#[test]
+fn parse_workspace_member_packages_maps_dot_and_dirs() {
+    let toml = "\
+[workspace]
+members = [\".\", \"ktstr-macros\", \"scx-ktstr\", \"nested/pkg\"]
+resolver = \"2\"
+";
+    let pkgs = parse_workspace_member_packages(toml, "ktstr");
+    assert!(pkgs.contains("ktstr"), "`.` maps to the root package name");
+    assert!(pkgs.contains("ktstr-macros"));
+    assert!(pkgs.contains("scx-ktstr"));
+    assert!(pkgs.contains("pkg"), "nested member -> last path component");
+    assert!(
+        !pkgs.contains("scx-full"),
+        "a non-member fixture scheduler is absent",
+    );
+    assert_eq!(pkgs.len(), 4);
+}
+
+/// Regression pin for the verifier fixture-gate: parsed from the REAL
+/// baked workspace `Cargo.toml`, the set includes the real scheduler
+/// package (its cells emit) and EXCLUDES the macro-expansion fixture
+/// scheduler names from tests/declare_scheduler.rs (their cells are
+/// gated out of the sweep so `--run-ignored` doesn't fail on
+/// `cargo build -p <fixture>`).
+#[test]
+fn workspace_packages_includes_real_scheduler_excludes_fixtures() {
+    let pkgs = workspace_packages();
+    assert!(
+        pkgs.contains("scx-ktstr"),
+        "the real scheduler package must be a workspace member (emits verifier cells)",
+    );
+    assert!(
+        !pkgs.contains("scx-full") && !pkgs.contains("scx-ee") && !pkgs.contains("scx-both"),
+        "declare_scheduler.rs fixture schedulers must NOT be workspace members (cells gated out)",
     );
 }
 

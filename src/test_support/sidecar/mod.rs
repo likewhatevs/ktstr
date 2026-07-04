@@ -176,7 +176,7 @@ pub struct SidecarResult {
     /// `sidecar_variant_hash` for the same cross-host grouping
     /// reason `scheduler_commit` is excluded: two runs of the same
     /// semantic variant on different ktstr commits must still bucket
-    /// together so `stats compare` can diff them; the commit-drift
+    /// together so `perf-delta` can diff them; the commit-drift
     /// detection inspects this field directly via `--project-commit`
     /// / `--a-project-commit` / `--b-project-commit`.
     pub project_commit: Option<String>,
@@ -249,7 +249,7 @@ pub struct SidecarResult {
     /// analysis, and `replay` match nextest's exit code. This flag
     /// preserves the one fact that overwrite loses: that the run's
     /// telemetry is failure-mode-dominated (a deliberately short /
-    /// stalled run). `stats compare` ORs it into its exclusion guard so
+    /// stalled run). `perf-delta` ORs it into its exclusion guard so
     /// an inverted-to-pass row is still kept OUT of the regression math
     /// (its induced-crash telemetry is not real scheduler behavior).
     pub expected_failure: bool,
@@ -371,7 +371,7 @@ pub struct SidecarResult {
     /// cross-host grouping reason `scheduler_commit` and
     /// `project_commit` are excluded: two runs of the same semantic
     /// variant on different kernel-source HEADs must still bucket
-    /// together so `stats compare` can diff them; the commit-drift
+    /// together so `perf-delta` can diff them; the commit-drift
     /// detection inspects this field directly via the
     /// `--kernel-commit` filter.
     pub kernel_commit: Option<String>,
@@ -432,7 +432,7 @@ pub struct SidecarResult {
     pub cleanup_duration_ms: Option<u64>,
     /// Provenance tag for this sidecar — distinguishes a developer's
     /// local run from a CI run so cross-environment comparisons in
-    /// `stats compare` can narrow on (or contrast across) the run
+    /// `perf-delta` can narrow on (or contrast across) the run
     /// environment without inferring it from `host`.
     ///
     /// Recorded by `detect_run_source` at sidecar-write time:
@@ -458,9 +458,8 @@ pub struct SidecarResult {
     /// contract. Excluded from `sidecar_variant_hash` for the same
     /// cross-host grouping reason `host` is excluded — two runs of
     /// the same semantic variant from different environments must
-    /// still bucket together so `stats compare` can diff them;
-    /// `--run-source` and `--a-run-source` / `--b-run-source` are the
-    /// explicit knobs for source-aware narrowing.
+    /// still bucket together so `perf-delta` can pair them; `--run-source`
+    /// is the explicit knob for source-aware narrowing.
     ///
     /// Field name `run_source` (renamed from `source`) disambiguates
     /// from [`crate::cache::KernelSource`] / `KernelMetadata.source`
@@ -489,6 +488,52 @@ pub struct SidecarResult {
     /// lost its tag" — both lower-bound at `None` for filter
     /// purposes.
     pub run_source: Option<String>,
+    /// Per-test [`crate::test_support::PerfDeltaAssertion`]s declared on the
+    /// entry, serialized so `cargo ktstr perf-delta --noise-adjust`'s host-side
+    /// compare can enforce them across commits (the entry registry in the parent
+    /// process describes only HEAD's tests, not a baseline/cached sidecar's
+    /// commit, so the declaration must travel WITH the run). Empty when the test
+    /// declared none. Inert here — a normal `cargo ktstr test` writes them but
+    /// never gates on them; only the `--noise-adjust` compare consults them (the
+    /// scalar compare warns that declared gates were skipped).
+    ///
+    /// Writer always emits (`"perf_delta_assertions": []` on absence); reader-
+    /// side this `Vec` field is hard-required (non-`Option` fails deserialize on
+    /// absence) — see the module-level doc for the full contract.
+    pub perf_delta_assertions: Vec<PerfDeltaAssertionRecord>,
+}
+
+/// Owned, serialized mirror of [`crate::test_support::PerfDeltaAssertion`]. The
+/// public declaration type uses `&'static str` (so it stays const/E0493-safe on
+/// the entry) and therefore cannot `Deserialize` into an owned value; this
+/// `String`-backed record is the sidecar carrier the perf-delta compare reads.
+/// `pub` because it is a field of the `pub` [`SidecarResult`] (constructed
+/// across the workspace, including by the `cargo-ktstr` binary crate); the
+/// author-facing declaration type is [`crate::test_support::PerfDeltaAssertion`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PerfDeltaAssertionRecord {
+    /// Registry metric name this assertion gates (see `stats list-metrics`).
+    pub metric: String,
+    /// Pinned regression direction, or `None` to inherit the registry polarity.
+    pub direction: Option<crate::test_support::Polarity>,
+    /// Relative-regression override (percent), or `None` for `default_rel`.
+    pub max_regression_pct: Option<f64>,
+    /// Absolute-materiality override, or `None` for `default_abs`.
+    pub min_abs: Option<f64>,
+    /// Phase scope (`step_index`), or `None` to gate the aggregate value.
+    pub phase: Option<u16>,
+}
+
+impl From<&crate::test_support::PerfDeltaAssertion> for PerfDeltaAssertionRecord {
+    fn from(a: &crate::test_support::PerfDeltaAssertion) -> Self {
+        Self {
+            metric: a.metric().to_string(),
+            direction: a.direction(),
+            max_regression_pct: a.max_regression_pct(),
+            min_abs: a.min_abs(),
+            phase: a.phase(),
+        }
+    }
 }
 
 impl SidecarResult {
@@ -583,6 +628,7 @@ impl SidecarResult {
     pub(crate) fn test_fixture() -> SidecarResult {
         SidecarResult {
             test_name: "t".to_string(),
+            perf_delta_assertions: Vec::new(),
             topology: "1n1l1c1t".to_string(),
             scheduler: "eevdf".to_string(),
             scheduler_commit: None,
@@ -636,7 +682,8 @@ impl SidecarResult {
 ///
 /// Single source of truth for "is this file a sidecar?" — used
 /// by [`collect_sidecars_with_errors`]'s parsing walker and by
-/// `crate::cli::count_sidecar_files`'s file-count walker. Both
+/// the explain-sidecar file-count walker
+/// (`crate::cli::stats_cmds::explain_sidecar::count_sidecar_files`). Both
 /// walkers MUST agree on the predicate so `walked` (count) and
 /// `valid + errors` (parse outcomes) reconcile against each
 /// other; a divergence would let a file count toward `walked`
@@ -654,11 +701,41 @@ pub(crate) fn is_sidecar_filename(path: &std::path::Path) -> bool {
 /// into subdirectories to handle per-job gauntlet layouts.
 ///
 /// Convenience wrapper over [`collect_sidecars_with_errors`] for
-/// callers that only need the parsed sidecars and not the
-/// per-file parse-failure list. The eprintln-driven diagnostic
-/// path is preserved unchanged inside the underlying walker.
+/// single-directory callers that only need the parsed sidecars and not
+/// the per-file parse-failure list. Emits ONE aggregated
+/// [`warn_skipped_sidecars`] summary for that directory when stale
+/// sidecars were dropped. Multi-directory walkers must NOT use this in a
+/// loop (it would print one summary per directory) — they call
+/// [`collect_sidecars_with_errors`] per directory and aggregate the counts
+/// into a single summary (see `collect_pool`).
 pub(crate) fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
-    collect_sidecars_with_errors(dir).0
+    let (sidecars, parse_errors, _io_errors) = collect_sidecars_with_errors(dir);
+    warn_skipped_sidecars(dir, parse_errors.len());
+    sidecars
+}
+
+/// Emit a single aggregated summary for the stale/unparseable sidecars a
+/// walk skipped, or nothing when `skipped == 0`. Sidecars written before a
+/// schema field was added fail to deserialize and are dropped (sidecar data
+/// is disposable — re-running regenerates it); this collapses what would
+/// otherwise be one `eprintln!` per file into one line. Per-file detail
+/// stays available through [`collect_sidecars_with_errors`]'s parse-error
+/// Vec, which `cargo ktstr stats explain-sidecar` renders.
+///
+/// `pub(crate)` so multi-directory walkers outside this module (e.g.
+/// `stats::analyze::sorted_run_entries`) can accumulate `parse_errors.len()`
+/// across run directories and emit ONE pool-wide summary rather than one
+/// per directory.
+pub(crate) fn warn_skipped_sidecars(dir: &std::path::Path, skipped: usize) {
+    if skipped > 0 {
+        eprintln!(
+            "ktstr_test: skipped {skipped} stale sidecar(s) under {} (older \
+             schema — re-run the affected tests to regenerate; \
+             `cargo ktstr stats explain-sidecar --run <run>` shows per-file \
+             detail)",
+            dir.display(),
+        );
+    }
 }
 
 /// Per-file parse-failure record returned by
@@ -733,9 +810,10 @@ pub(crate) fn enriched_parse_error_message_for_test(
 /// returns `None` for any other shape so consumers can branch on
 /// "enrichment exists" without re-implementing the match.
 ///
-/// Pulled out of [`collect_sidecars_with_errors`]'s hot path so
-/// the eprintln-side prose and the structured-channel
-/// `enriched` carry identical text.
+/// Pulled out of [`collect_sidecars_with_errors`]'s parse path so the
+/// enrichment prose is computed in one place and stored in the returned
+/// [`SidecarParseError`]'s `enriched_message` field — parse failures are
+/// surfaced only through that Vec, not a separate stderr channel.
 ///
 /// Matching on the Display text is deliberate: serde's typed-error
 /// surface for `missing field "X"` is not stable across
@@ -767,18 +845,16 @@ fn enriched_parse_error_message(path: &std::path::Path, raw_error: &str) -> Opti
 /// one level into subdirectories to handle per-job gauntlet
 /// layouts.
 ///
-/// Surfaces parse failures in two channels:
-/// - `eprintln!` to stderr (preserved for the operator-facing
-///   pre-1.0 disposable-sidecar diagnostic — emits the enriched
-///   prose for the host-missing schema-drift case, the raw serde
-///   message otherwise).
-/// - The returned parse-errors vec, capturing a
-///   [`SidecarParseError`] record (named fields `path`,
-///   `raw_error`, `enriched_message`) for structured callers
-///   (`explain-sidecar`'s walker output). Both raw and enriched
-///   are exposed so dashboard consumers can pick: raw for
-///   parse-error grepping, enriched for human-facing remediation
-///   prose.
+/// Parse failures are captured ONLY in the returned parse-errors vec —
+/// this walker no longer logs per file. Each failure is a
+/// [`SidecarParseError`] record (named fields `path`, `raw_error`,
+/// `enriched_message`) for structured callers (`explain-sidecar`'s walker
+/// output). Both raw and enriched are exposed so dashboard consumers can
+/// pick: raw for parse-error grepping, enriched for human-facing
+/// remediation prose. Callers that only need the sidecars aggregate
+/// `parse_errors.len()` and emit one [`warn_skipped_sidecars`] summary
+/// (see [`collect_sidecars`] / `collect_pool`) rather than one line per
+/// file.
 ///
 /// IO failures (third return) get a single eprintln line plus a
 /// structured [`SidecarIoError`] record. Distinguished from
@@ -838,14 +914,11 @@ pub(crate) fn collect_sidecars_with_errors(
             Err(e) => {
                 let raw = e.to_string();
                 let enriched = enriched_parse_error_message(path, &raw);
-                // eprintln channel: emit the enriched prose when
-                // it applies, the raw serde message otherwise.
-                // Identical text flows through both channels —
-                // both go through `enriched_parse_error_message`.
-                match &enriched {
-                    Some(prose) => eprintln!("{prose}"),
-                    None => eprintln!("ktstr_test: skipping {}: {raw}", path.display()),
-                }
+                // Capture (do not log) the per-file skip: callers emit one
+                // aggregated `warn_skipped_sidecars` summary so a directory
+                // of stale sidecars produces a single line, not a flood.
+                // `cargo ktstr stats explain-sidecar --run <run>` renders the
+                // per-file detail (raw + enriched remediation) from this Vec.
                 parse_errs.push(SidecarParseError {
                     path: path.to_path_buf(),
                     raw_error: raw,
@@ -914,22 +987,25 @@ pub(crate) fn collect_sidecars_with_errors(
 /// `{kernel}-{project_commit}` by [`sidecar_dir`] where
 /// `{project_commit}` is the project tree's HEAD short hex with
 /// `-dirty` suffix when the worktree differs from HEAD) and
-/// concatenates the sidecars each
-/// one yields via `collect_sidecars`. The result is a flat
+/// concatenates the sidecars each one yields via
+/// `collect_sidecars_with_errors` (per directory, so the per-directory
+/// stale-sidecar skip counts aggregate into one pool-wide summary). The
+/// result is a flat
 /// `Vec<SidecarResult>` covering every recorded run on disk —
-/// `cargo ktstr stats compare`'s pool-driven sourcing reads it
+/// `cargo ktstr perf-delta`'s pool-driven sourcing reads it
 /// once, applies the typed `--a-*` / `--b-*` filters in memory,
 /// and partitions the survivors into A/B sides.
 ///
 /// `root` is typically [`runs_root`]; pass an alternate path when
 /// comparing archived sidecar trees copied off a CI host (the
-/// `--dir` escape hatch on `stats compare`).
+/// `--dir` escape hatch on `perf-delta`).
 ///
 /// Returns an empty Vec when `root` does not exist or contains no
 /// run directories. Per-run failure (a corrupt sidecar, a partial
-/// directory) prints a per-file `eprintln!` from
-/// `collect_sidecars` and continues — pool-collection never
-/// aborts on a single bad file.
+/// directory) is counted and skipped — pool-collection never aborts
+/// on a single bad file, and emits ONE aggregated
+/// `warn_skipped_sidecars` summary for the whole walk rather than a
+/// per-file line.
 ///
 /// Performance: this is a full filesystem walk over `root`. On a
 /// host with many archived runs (dozens to hundreds), each
@@ -952,6 +1028,7 @@ pub fn collect_pool(root: &std::path::Path) -> Vec<SidecarResult> {
         }
     };
     let mut pool = Vec::new();
+    let mut skipped = 0usize;
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
@@ -966,14 +1043,19 @@ pub fn collect_pool(root: &std::path::Path) -> Vec<SidecarResult> {
         };
         let path = entry.path();
         if path.is_dir() {
-            // `collect_sidecars` already handles "one level of
-            // subdirectories for per-job gauntlet layouts" inside
-            // each run directory, so the two-level
-            // `{root}/{run_dir}/{job_subdir}` shape works without
-            // a third walker level.
-            pool.extend(collect_sidecars(&path));
+            // `collect_sidecars_with_errors` already handles "one level of
+            // subdirectories for per-job gauntlet layouts" inside each run
+            // directory, so the two-level `{root}/{run_dir}/{job_subdir}`
+            // shape works without a third walker level. Use the
+            // error-returning variant (not `collect_sidecars`, which emits
+            // its own per-directory summary) so the skip counts aggregate
+            // into ONE pool-wide summary below.
+            let (sidecars, parse_errors, _io_errors) = collect_sidecars_with_errors(&path);
+            pool.extend(sidecars);
+            skipped += parse_errors.len();
         }
     }
+    warn_skipped_sidecars(root, skipped);
     pool
 }
 
@@ -1227,7 +1309,7 @@ fn resolve_default_sidecar_dir() -> PathBuf {
 /// SENTINEL ASYMMETRY: the on-disk dirname uses `"unknown"` for
 /// missing values, but the in-memory [`SidecarResult::project_commit`]
 /// / [`SidecarResult::kernel_version`] fields stay `None` (`null`
-/// in JSON). `cargo ktstr stats compare --project-commit unknown`
+/// in JSON). a `project_commit` filter for a specific commit
 /// will NOT match a sidecar whose `project_commit` is `None` —
 /// omit the filter to include `None`-commit rows. The asymmetry
 /// is deliberate: the dirname needs a filesystem-safe sentinel,
@@ -1887,6 +1969,20 @@ pub(crate) fn detect_kernel_version() -> Option<String> {
 /// depends on the cwd at test launch (which crate is exercising
 /// ktstr), not the build host.
 pub(crate) fn detect_project_commit() -> Option<String> {
+    // Explicit override: an orchestrator (perf-delta) that checked the
+    // project tree out WITHOUT a `.git` — a plain gix checkout of a baseline
+    // commit into a temp dir — passes the commit label via
+    // KTSTR_PROJECT_COMMIT_ENV so the sidecar records it verbatim instead of
+    // a `gix::discover` that would resolve to the wrong repo (or none). It is
+    // also set on the HEAD run so the recorded `project_commit` equals the
+    // exact label perf-delta filters the pool on, closing the -dirty-suffix
+    // mismatch between the filter (`short_hash`) and this recorder. Empty is
+    // treated as unset. Mirrors the KTSTR_KERNEL_COMMIT_ENV override.
+    if let Ok(explicit) = std::env::var(crate::KTSTR_PROJECT_COMMIT_ENV)
+        && !explicit.is_empty()
+    {
+        return Some(explicit);
+    }
     // Per-process memoization of the SUCCESS case only.
     //
     // The cwd is stable for the lifetime of a test process (no
@@ -2032,7 +2128,7 @@ fn commit_with_dirty_suffix(repo: &gix::Repository) -> Option<String> {
 /// separate `[[bin]]` crate that consumes `ktstr` as an
 /// external dependency and needs this helper to compute the
 /// `-dirty` suffix in
-/// `cargo ktstr stats compare --project-commit HEAD`. Hidden
+/// the baseline/HEAD commit in `cargo ktstr perf-delta`. Hidden
 /// from rustdoc via `#[doc(hidden)]` because it is a probe-
 /// style helper without a stable API contract — external
 /// consumers should not depend on it.
@@ -2252,7 +2348,7 @@ pub const SIDECAR_RUN_SOURCE_LOCAL: &str = "local";
 /// Tag value applied to [`SidecarResult::run_source`] /
 /// [`GauntletRow::run_source`](crate::stats::GauntletRow::run_source)
 /// at LOAD time when the consumer pulls sidecars from a non-default
-/// pool root via `cargo ktstr stats compare --dir` /
+/// pool root via `cargo ktstr stats show-host --dir` /
 /// `cargo ktstr stats list-values --dir`. NEVER written by
 /// [`write_sidecar`] — the writer cannot know the file will later
 /// be moved off-host. See [`apply_archive_source_override`].
@@ -2507,7 +2603,9 @@ fn kernel_commit_for_sidecar() -> Option<String> {
 /// other's output.
 ///
 /// Uses [`siphasher::sip::SipHasher13`] with zero keys for the same
-/// stability reason as the initramfs cache keys — the discriminator
+/// cross-toolchain stability reason as the other zero-keyed
+/// SipHasher13 sites (`build.rs`, `runtime.rs` `content_hash`) —
+/// the discriminator
 /// must be the same across Rust toolchain versions or downstream
 /// tooling that groups variants by filename breaks.
 ///
@@ -2553,7 +2651,7 @@ fn kernel_commit_for_sidecar() -> Option<String> {
 /// [`SidecarResult::run_source`] /
 /// [`SidecarResult::resolve_source`] directly (via
 /// `--project-commit` / `--kernel-commit` / `--run-source` /
-/// `--resolve-source` on `stats compare`); the filename stays stable
+/// `--resolve-source` on `perf-delta`); the filename stays stable
 /// across commits and run environments by design.
 ///
 /// The corollary of the HostContext exclusion: if the host's
@@ -2935,7 +3033,7 @@ pub(crate) fn finalize_sidecar_verdict(
     };
     // The run's telemetry is failure-mode-dominated when its scenario
     // actually failed/was-inconclusive but the final verdict is a
-    // pass/skip (an inversion) — `stats compare` excludes such rows.
+    // pass/skip (an inversion) — `perf-delta` excludes such rows.
     let raw_failed = sc.is_fail() || sc.is_inconclusive();
     let expected_failure = raw_failed && (passed || skipped);
     if sc.passed == passed
@@ -3345,9 +3443,9 @@ fn is_sidecar_staging_filename(path: &std::path::Path) -> bool {
 /// inside the locked section that somehow survived the RAII
 /// drop, etc.) and surfacing that as an actionable error beats
 /// hanging the test run indefinitely. The timeout is asymmetric
-/// with the cache-store 60 s timeout because cache-store waits
-/// for tens of test runs to drain whereas this lock waits for
-/// at most one peer write.
+/// with the cache-store 300 s (5 minute) timeout because
+/// cache-store waits for tens of test runs to drain whereas this
+/// lock waits for at most one peer write.
 const RUN_DIR_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Compute the per-run-key flock sentinel path for `dir`.
@@ -3507,6 +3605,11 @@ pub(crate) fn write_skip_sidecar(
     } = scheduler_fingerprint(entry);
     let sidecar = SidecarResult {
         test_name: entry.name.to_string(),
+        perf_delta_assertions: entry
+            .perf_delta_assertions
+            .iter()
+            .map(|&a| a.into())
+            .collect(),
         // The RESOLVED topology a run of this preset would boot
         // (resolve_vm_topology(entry, topo)), NOT the declared
         // entry.topology — for a topology gauntlet each preset boots a
@@ -3607,6 +3710,11 @@ pub(crate) fn write_sidecar(
     } = scheduler_fingerprint(entry);
     let sidecar = SidecarResult {
         test_name: entry.name.to_string(),
+        perf_delta_assertions: entry
+            .perf_delta_assertions
+            .iter()
+            .map(|&a| a.into())
+            .collect(),
         // The RESOLVED topology this run booted (resolve_vm_topology
         // result), NOT the declared entry.topology — a topology gauntlet
         // boots a distinct topology per preset, so the declared value

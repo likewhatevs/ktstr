@@ -219,10 +219,13 @@ fn find_kernel_skips_stale_cache_entry() {
 /// the prefix breaks these equalities, catching the serialized-
 /// form change that would otherwise go silent.
 ///
-/// Lives in lib.rs (not in `worker_ready.rs`) because that file
-/// is dual-compiled via `#[path]` into the worker bin; a
-/// `#[cfg(test)] mod tests` inside it would duplicate the test
-/// into both the lib test binary and the bin test binary.
+/// These literal pins are duplicated from `worker_ready.rs`'s own
+/// `#[cfg(test)] mod tests`, which pins the identical marker-path
+/// format (`worker_ready_marker_path_decimal_pid_suffix` and
+/// `worker_ready_marker_prefix_literal`). That in-file `mod tests`
+/// reaches its items via `super::`, which resolves to this file's
+/// own items identically under both the lib and bin compilation
+/// paths, so it does not divide lib vs. bin.
 #[test]
 fn worker_ready_marker_path_format_is_stable() {
     use crate::worker_ready::{WORKER_READY_MARKER_PREFIX, worker_ready_marker_path};
@@ -410,6 +413,7 @@ fn ktstr_env_constants_are_their_literals() {
         KTSTR_NO_PERF_MODE_ENV, KTSTR_NO_SKIP_MODE_ENV, KTSTR_ORCHESTRATED_ENV,
         KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV, KTSTR_SCHEDULER_ENV, KTSTR_SIDECAR_DIR_ENV,
         KTSTR_TEST_KERNEL_ENV, KTSTR_VERBOSE_ENV, KTSTR_VERIFIER_RAW_ENV,
+        KTSTR_VERIFIER_SCHEDULER_ENV,
     };
     assert_eq!(KTSTR_KERNEL_ENV, "KTSTR_KERNEL");
     assert_eq!(KTSTR_KERNEL_LIST_ENV, "KTSTR_KERNEL_LIST");
@@ -418,6 +422,7 @@ fn ktstr_env_constants_are_their_literals() {
     assert_eq!(KTSTR_CGROUP_WALK_ROOT_ENV, "KTSTR_CGROUP_WALK_ROOT");
     assert_eq!(KTSTR_KERNEL_PARALLELISM_ENV, "KTSTR_KERNEL_PARALLELISM");
     assert_eq!(KTSTR_VERIFIER_RAW_ENV, "KTSTR_VERIFIER_RAW");
+    assert_eq!(KTSTR_VERIFIER_SCHEDULER_ENV, "KTSTR_VERIFIER_SCHEDULER");
     assert_eq!(KTSTR_NO_PERF_MODE_ENV, "KTSTR_NO_PERF_MODE");
     assert_eq!(KTSTR_GHA_CACHE_ENV, "KTSTR_GHA_CACHE");
     assert_eq!(KTSTR_CARGO_TEST_MODE_ENV, "KTSTR_CARGO_TEST_MODE");
@@ -536,7 +541,8 @@ fn cache_key_suffix_with_extra_some_differs_from_bare_suffix() {
 /// Production format-string shape assertion: the suffix
 /// `cache_key_suffix_with_extra(Some(...))` produces must be
 /// exactly the literal `format!("{baked}-xkc{extra_hash}")`
-/// cargo-ktstr.rs uses to build its tarball cache key. Pins
+/// that `cache_key_suffix_with_extra` (in `src/lib.rs`) emits and
+/// the bin cache-key call sites wrap. Pins
 /// the structural mirror so a refactor that changed the
 /// helper's format would surface here as a divergence from
 /// the production call site.
@@ -550,8 +556,10 @@ fn cache_key_suffix_with_extra_matches_production_format_string() {
     assert_eq!(
         helper, expected,
         "helper output must match production format `{{baked}}-xkc{{extra}}` \
-             (cargo-ktstr.rs builds the tarball cache key with the same shape \
-             via `{{ver}}-tarball-{{arch}}-kc{{cache_key_suffix_with_extra(...)}}`)"
+             (src/bin/cargo_ktstr/kernel/mod.rs builds the tarball cache key \
+             with the same shape via \
+             `{{ver}}-tarball-{{arch}}-kc{{cache_key_suffix_with_extra(...)}}`, \
+             mirrored in src/bin/ktstr.rs)"
     );
 }
 

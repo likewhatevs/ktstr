@@ -35,9 +35,11 @@
 //!
 //! dmesg lines arrive 100-500ms after the actual `scx_exit` call
 //! (the kernel buffers prints through klogd). The library is purely
-//! a parser — it doesn't do timing or polling. The capture-mode
-//! binary (separate task) tails `/dev/kmsg` and feeds new lines
-//! into [`parse_kmsg_window`] when an scx anchor appears.
+//! a parser — it doesn't do timing or polling. The production
+//! consumer is the eval harness ([`crate::test_support`]'s eval
+//! module), which calls [`parse_kmsg_window`] on the captured VM
+//! console (`result.stderr`) to attribute a scheduler exit when a
+//! test times out or a scheduled test produces no result.
 
 use serde::{Deserialize, Serialize};
 
@@ -49,8 +51,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(tag = "kind")]
-#[allow(dead_code)] // wired by the live-host capture-mode binary;
-// library lands the data shape.
+#[allow(dead_code)] // the eval harness consumes scheduler_name/message;
+// kind/stack/stuck_task_comm and these variants are exercised only by tests.
 pub enum ScxExitKind {
     /// Default — used by `ScxExitEvent::default()` in test fixtures
     /// and as the post-anchor placeholder before classification
@@ -89,11 +91,11 @@ pub struct ScxExitEvent {
     /// pre-classification placeholder.
     #[serde(default)]
     pub kind: ScxExitKind,
-    /// Operator-supplied exit message (`ei->msg`) when present —
-    /// the parenthesized text in the anchor line plus any
-    /// follow-on `pr_err` lines that look like `<scheduler>:`-
-    /// prefixed diagnostic. Empty when the kernel emitted no
-    /// message body.
+    /// Exit message aggregated from the kernel prints. The
+    /// parenthesized text in the anchor line is `ei->reason`
+    /// (kernel/sched/ext.c:6005/6014); the follow-on
+    /// `sched_ext: <name>: <msg>` pr_err line (ext.c:6008) carries
+    /// `ei->msg`. Empty when the kernel emitted no message body.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub message: String,
     /// Stuck task COMM (16-byte limit per `TASK_COMM_LEN`)
@@ -114,8 +116,9 @@ pub struct ScxExitEvent {
 /// One frame of a `%pS`-formatted stack trace.
 ///
 /// `funcname+0xoff/0xsz` is the canonical kernel format
-/// (`include/linux/printk.h::printk_format` / `lib/vsprintf.c`'s
-/// `pointer_string`). The parser captures the full original token
+/// (`%pS`, rendered by `lib/vsprintf.c`'s `symbol_string` →
+/// `kernel/kallsyms.c`'s `sprint_symbol`, which emits `+%#lx/%#lx`).
+/// The parser captures the full original token
 /// alongside the structured fields so the producer can render either.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -136,9 +139,11 @@ pub struct StackSymbol {
 /// Anchor pattern that marks the start of an scx exit event in
 /// kernel-message output.
 ///
-/// Source: `kernel/sched/ext.c` — `pr_info("sched_ext: BPF scheduler
-/// \"%s\" disabled (...)", ei->name, ...)`. The format string has
-/// shifted slightly across kernel versions but the leading `sched_ext:`
+/// Source: `kernel/sched/ext.c` `scx_root_disable` —
+/// `pr_err("sched_ext: BPF scheduler \"%s\" disabled (%s)",
+/// sch->ops.name, ei->reason)` on the error path (ext.c:6004, the
+/// arm that also prints the stack) and the `pr_info` sibling
+/// (ext.c:6013) for non-error exits. The leading `sched_ext:`
 /// prefix and the `BPF scheduler "..."` shape have been stable since
 /// 6.12.
 const ANCHOR_PREFIX: &str = "sched_ext: BPF scheduler \"";
@@ -362,7 +367,10 @@ fn classify_exit_kind(message: &str, stack: &[StackSymbol]) -> ScxExitKind {
 ///
 /// Scans for the patterns ktstr-aware schedulers (and the
 /// upstream watchdog) tend to emit:
-/// - `task <COMM>:<pid>` (mainline watchdog: `...stalled task <COMM>:<pid>`)
+/// - `task <COMM>:<pid>` (custom-scheduler messages; the mainline
+///   watchdog instead prints `<comm>[<pid>] failed to run for ...`
+///   at kernel/sched/ext.c:3462 and is classified via the
+///   `check_rq_for_timeouts` / `scx_watchdog_workfn` stack frames)
 /// - `comm=<COMM>` (some custom schedulers)
 ///
 /// The `task <COMM>` pattern requires the `COMM` to be followed by

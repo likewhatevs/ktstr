@@ -13,7 +13,7 @@
 //! - Watchdog disambiguation: `pi_boosted_out_of_scx` flag set when
 //!   the runnable task's `sched_class` is not `ext_sched_class` (the
 //!   PI-boost path moved it out and the failure isn't the BPF
-//!   scheduler's fault — see scx core.c rt_mutex_setprio interactions)
+//!   scheduler's fault — see kernel/sched/core.c rt_mutex_setprio interactions)
 //! - Context-switch counters: per-task nvcsw/nivcsw + per-thread-group
 //!   signal->nvcsw/nivcsw
 //! - Lock-contention hints: stack-trace pattern match against the
@@ -22,8 +22,9 @@
 //!   `rwsem_down_write_slowpath`. A PC inside any slowpath function
 //!   on a runnable ('R') task indicates lock contention rather than
 //!   scheduler fault. Stack-trace walking is only attempted when the
-//!   caller supplies a non-empty stack-PC slice (typically harvested
-//!   from the freeze coordinator's `VcpuRegSnapshot.instruction_pointer`
+//!   caller supplies a single instruction-pointer PC (`Option<u64>`,
+//!   typically harvested from the freeze coordinator's
+//!   `VcpuRegSnapshot.instruction_pointer`
 //!   for currently-running tasks; runnable-but-not-current tasks have
 //!   no stack PCs without a kernel-side unwinder, which ktstr does
 //!   not implement).
@@ -68,9 +69,10 @@ pub struct SchedClassRegistry {
     pub ext: Option<u64>,
 }
 
-#[allow(dead_code)] // wired through DumpContext::TaskEnrichmentCapture;
-// freeze coordinator passes None until the rq->scx
-// walker lands a walker producer.
+#[allow(dead_code)] // wired through DumpContext.task_enrichment_capture:
+// capture_tasks::build resolves this registry, freeze_coord builds a
+// TaskEnrichmentCapture from it, and dump_state passes it to
+// walk_task_enrichment for each captured task.
 impl SchedClassRegistry {
     /// Resolve all six class symbols via the GuestKernel's vmlinux
     /// symbol table. Each lookup is independent — a missing symbol
@@ -139,7 +141,9 @@ pub struct LockSlowpathRegistry {
 /// lock-slowpath entry symbols. See `LockSlowpathRegistry` doc.
 const LOCK_SLOWPATH_FN_MAX_SIZE: u64 = 4096;
 
-#[allow(dead_code)] // same wiring rationale as SchedClassRegistry above.
+#[allow(dead_code)] // same wiring as SchedClassRegistry above: resolved by
+// capture_tasks::build, threaded through TaskEnrichmentCapture into
+// walk_task_enrichment.
 impl LockSlowpathRegistry {
     /// Resolve the four lock-slowpath symbols from the GuestKernel's
     /// vmlinux. Each lookup is independent; absent symbols leave the
@@ -251,13 +255,15 @@ pub struct TaskEnrichment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub core_cookie: Option<u64>,
     /// True iff the task was on the rq->scx.runnable_list at freeze
-    /// time AND `sched_class != ext_sched_class`. Indicates the PI
+    /// time AND the `ext_sched_class` symbol was resolved
+    /// (`classes.ext.is_some()`) AND `sched_class != ext_sched_class`;
+    /// an unresolved ext symbol leaves the flag false. Indicates the PI
     /// boost path moved it out of SCX (rt_mutex_setprio) — failure
     /// is not the BPF scheduler's fault. Set only by the runnable
     /// walker; the queued-DSQ walker leaves this `false`.
     pub pi_boosted_out_of_scx: bool,
     /// `task_struct.nvcsw` (unsigned long). Voluntary context
-    /// switches; the live thread count.
+    /// switches for this live thread.
     pub nvcsw: u64,
     /// `task_struct.nivcsw` (unsigned long). Involuntary context
     /// switches.
@@ -301,8 +307,8 @@ pub struct TaskEnrichment {
     /// `None` when the supplied PC matched nothing OR the caller
     /// supplied no PCs.
     ///
-    /// Set only when `walk_task_enrichment_with_pcs` is used; the
-    /// no-PC entry point `walk_task_enrichment` always leaves this
+    /// Set only when `walk_task_enrichment` is called with a `Some(pc)`
+    /// that matches a slowpath window; a `None` pc always leaves this
     /// `None`. A stack walker that produces multiple PCs (a future
     /// kernel-side unwinder) would surface them as a `Vec<String>`
     /// in a non_exhaustive struct extension.

@@ -196,7 +196,8 @@ fn leaf1f_matches_leaf0b() {
     );
 
     // For subleaves 0 and 1, leaf 0x1F should produce the same topology
-    // data as leaf 0xB (EAX, EBX, EDX match; ECX may differ only in type encoding)
+    // data as leaf 0xB (EAX, EBX, ECX, EDX all match — both leaves are
+    // built from the same topo_subleaf calls with identical level_type/index)
     for sub in 0..2 {
         let leaf_b = cpuid.iter().find(|e| e.function == 0xb && e.index == sub);
         let leaf_1f = cpuid.iter().find(|e| e.function == 0x1f && e.index == sub);

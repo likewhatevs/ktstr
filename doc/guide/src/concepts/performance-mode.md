@@ -223,7 +223,8 @@ are only meaningful under performance mode's controlled environment.
 Cross-commit regression gating builds on the same tests:
 [`cargo ktstr perf-delta`](../running-tests/cargo-ktstr.md#perf-delta)
 runs the `performance_mode` suite at HEAD and at a baseline commit and
-A/B-compares the metrics, exiting non-zero on a regression. The in-guest
+A/B-compares the metrics, exiting non-zero once enough metrics regress
+to trip the failure gate (by default 5 or more). The in-guest
 `Assert` thresholds above catch a regression against a fixed bar;
 perf-delta catches one against the previous commit.
 
@@ -278,8 +279,10 @@ Enabled by `--no-perf-mode` / `KTSTR_NO_PERF_MODE=1`. Every
 no-perf-mode VM goes through `acquire_llc_plan`: the reservation
 is `LOCK_SH` across a NUMA-aware, consolidation-aware set of
 LLCs, sized to meet the CPU budget — either `--cpu-cap N` (or
-`KTSTR_CPU_CAP=N`) if set, or 30% of the calling process's
-sched_getaffinity cpuset (minimum 1) if not. The flock granularity
+`KTSTR_CPU_CAP=N`) if set, or the no-perf default `max(30% of the
+calling process's sched_getaffinity cpuset, min(vcpus, allowed))`
+(floored at 1) if not — so a wide VM's vCPU threads are not
+host-oversubscribed by a flat 30% mask. The flock granularity
 stays per-LLC; `plan.cpus` holds EXACTLY the budget (partial-take
 on the last LLC when the budget falls mid-LLC). Multiple
 no-perf-mode VMs coexist on the same LLCs because shared locks
@@ -393,19 +396,24 @@ skips, or runs degraded:
 | Tier | Host too small for the topology | Exit |
 |------|----------------------------------|------|
 | Tier 1 (`performance_mode`) | `PerfModeUnavailable` — the isolation guarantee cannot be honored | 0 / SKIP (1 / FAIL under `KTSTR_NO_SKIP_MODE`) |
-| Tier 2 — explicit `--cpu-cap` / per-test `cpu_budget` exceeds the allowed cpuset | `CpuBudgetUnsatisfiable` — the requested cap is impossible | 1 / FAIL |
+| Tier 2 — operator `--cpu-cap` exceeds the allowed cpuset | `CpuBudgetUnsatisfiable` — the operator-typed cap is impossible | 1 / FAIL |
+| Tier 2 — per-test `cpu_budget` exceeds the allowed cpuset | `TopologyInsufficient` — the author's requirement needs a bigger host | 0 / SKIP (1 / FAIL under `KTSTR_NO_SKIP_MODE`) |
 | Tier 2 — default budget (no explicit cap) | sizes down to `max(30%, min(vcpus, allowed))` and runs | 0 |
 | Tier 3 (default) | masks onto the allowed CPUs; warns + marks the sidecar only when that set is smaller than `vcpus` | 0 |
 
 The asymmetry is deliberate: an EXPLICIT request for a guarantee the host
 cannot provide must never silently downscale into a measurement that does
-not match what was asked for. A too-small `performance_mode` host honors
-that by SKIPPING — the VM never runs unisolated, so no wrong measurement
-ships; `KTSTR_NO_SKIP_MODE` turns the skip into a hard FAIL for runs that
-demand perf-mode execution. An explicit `--cpu-cap` / `cpu_budget` the host
-cannot satisfy stays a hard error (`CpuBudgetUnsatisfiable`): a user-typed
-number that does not exist on this host is a misconfiguration, not a
-host-capability gap. The DEFAULT path instead makes the test run
+not match what was asked for. What differs is the VERDICT, split by
+PROVENANCE. A too-small `performance_mode` host SKIPS — the VM never runs
+unisolated, so no wrong measurement ships. An author's per-test `cpu_budget`
+over the allowance likewise SKIPS (`TopologyInsufficient`): a `#[ktstr_test]`
+attribute is a capability REQUIREMENT — the scenario needs that many CPUs to
+be meaningful, and a bigger host would run it, exactly like a topology
+requirement. Both promote to a hard FAIL under `KTSTR_NO_SKIP_MODE` for runs
+that demand execution. An operator `--cpu-cap` the host cannot satisfy
+instead stays a hard error (`CpuBudgetUnsatisfiable`): a number typed for
+THIS run on THIS host that does not exist here is a misconfiguration, not a
+host-capability gap. The DEFAULT path (no explicit cap) makes the test run
 regardless, surfacing any oversubscription confound through the overcommit
 warning and the sidecar `cpu_budget` stamp rather than failing.
 
@@ -423,7 +431,8 @@ serializes the excess via the flock retry.
 `--no-perf-mode` (or `KTSTR_NO_PERF_MODE=1`) forces
 `performance_mode=false`. The result is **tier 2 above** — a
 CPU-capped `LOCK_SH` reservation (either explicit `--cpu-cap N`
-or the 30%-of-allowed default). The feature differences
+or the no-perf default `max(30% of allowed, min(vcpus, allowed))`).
+The feature differences
 relative to tier 1 are:
 
 - **LLC flock mode** — tier 1 holds `LOCK_EX` on each reserved LLC;
@@ -462,10 +471,11 @@ Available via:
 - `cargo ktstr shell --no-perf-mode`
 - `KTSTR_NO_PERF_MODE=1` (any value; presence is sufficient)
 
-`--cpu-cap N` is the **CLI flag** for `ktstr shell`, `cargo ktstr
-shell`, and `cargo ktstr kernel build` only — `cargo ktstr test`,
-`cargo ktstr coverage`, and `cargo ktstr llvm-cov` do NOT carry the
-flag. For the test/coverage/llvm-cov paths the cap is set via the
-`KTSTR_CPU_CAP` environment variable (the env var is read by every
-VM-builder call site). When absent, the 30%-of-allowed default
-applies automatically.
+`--cpu-cap N` is the **CLI flag** for `ktstr shell`, `ktstr kernel
+build`, `cargo ktstr shell`, and `cargo ktstr kernel build` only —
+`cargo ktstr test`, `cargo ktstr coverage`, and `cargo ktstr llvm-cov`
+do NOT carry the flag. For the test/coverage/llvm-cov paths the cap is
+set via the `KTSTR_CPU_CAP` environment variable (the env var is read
+by every VM-builder call site). When absent, the no-perf VM default
+`max(30% of allowed, min(vcpus, allowed))` applies automatically (the
+kernel-build path uses a flat 30%-of-allowed default).

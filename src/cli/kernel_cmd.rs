@@ -21,8 +21,8 @@ pub enum KernelCommand {
     /// List cached kernel images, or preview a range expansion
     /// without downloading or building.
     ///
-    /// Default mode (no `--range`): walks the local cache and
-    /// reports every cached kernel image. `--range START..END`
+    /// Default mode (no `--kernel`): walks the local cache and
+    /// reports every cached kernel image. `--kernel START..END`
     /// switches to PREVIEW mode: fetches kernel.org's
     /// `releases.json`, expands the inclusive range against the
     /// `stable` / `longterm` releases, and prints the resulting
@@ -36,13 +36,16 @@ pub enum KernelCommand {
         /// Output in JSON format for CI scripting.
         #[arg(long)]
         json: bool,
-        /// Range preview. When supplied, switches the subcommand
+        /// Range to PREVIEW. When supplied, switches the subcommand
         /// from "list cached kernels" to "fetch releases.json and
         /// print the versions a `START..END` range expands to."
         /// Format: `MAJOR.MINOR[.PATCH][-rcN]..MAJOR.MINOR[.PATCH][-rcN]`,
         /// matching [`crate::kernel_path::KernelId::Range`].
-        /// Example: `--range 6.12..6.14` → every stable/longterm
-        /// release in `[6.12, 6.14]` inclusive.
+        /// Example: `--kernel 6.12..6.14` → every stable/longterm
+        /// release in `[6.12, 6.14]` inclusive. A non-range
+        /// `--kernel` (a single version, path, or git source) is
+        /// rejected — preview mode expands ranges only; to inspect a
+        /// cached single kernel run `kernel list` without `--kernel`.
         ///
         /// In preview mode the subcommand performs no cache
         /// reads or kernel.org tarball downloads — only the
@@ -54,33 +57,27 @@ pub enum KernelCommand {
         /// versions are written one per line to stdout for shell
         /// pipelines.
         #[arg(long)]
-        range: Option<String>,
+        kernel: Option<String>,
+        /// See [`INCLUDE_EOL_HELP`]. Only affects a `--kernel`
+        /// range preview; ignored in the default cache-listing mode
+        /// (which reads no releases.json and enumerates no series).
+        #[arg(long, help = INCLUDE_EOL_HELP)]
+        include_eol: bool,
     },
     /// Download, build, and cache a kernel image.
     Build {
-        /// Kernel version to download (e.g. 6.14.2, 6.15-rc3). A
-        /// major.minor prefix (e.g. 6.12) resolves to the highest
-        /// patch release in that series, falling back to probing
-        /// cdn.kernel.org for EOL series no longer in releases.json.
-        #[arg(conflicts_with_all = ["source", "git"])]
-        version: Option<String>,
-        /// Path to existing kernel source directory.
-        #[arg(long, conflicts_with_all = ["version", "git"])]
-        source: Option<PathBuf>,
-        /// Git URL to clone kernel source from. Cloned shallow (depth 1)
-        /// at the ref supplied via --ref.
-        #[arg(long, requires = "git_ref", conflicts_with_all = ["version", "source"])]
-        git: Option<String>,
-        /// Git ref to checkout (branch, tag, commit). Required with --git.
-        #[arg(long = "ref", requires = "git")]
-        git_ref: Option<String>,
+        /// Kernel to build (the unified `--kernel` grammar). Omitted,
+        /// builds the latest stable release. See [`KERNEL_HELP_BUILD`]
+        /// for the accepted shapes.
+        #[arg(long, help = KERNEL_HELP_BUILD)]
+        kernel: Option<String>,
         /// Rebuild even if a cached image exists.
         #[arg(long)]
         force: bool,
-        /// Run `make mrproper` before configuring. Only meaningful
-        /// with `--source`: downloaded tarball and freshly cloned
-        /// git sources start clean, so this flag prints a notice
-        /// and is ignored in those modes.
+        /// Run `make mrproper` before configuring. Only meaningful for
+        /// a `--kernel <path>` source tree: version / range / git
+        /// sources build from a fresh tarball or clone, so this flag
+        /// prints a notice and is ignored for them.
         #[arg(long)]
         clean: bool,
         #[arg(long, help = CPU_CAP_HELP)]
@@ -136,7 +133,7 @@ pub enum KernelCommand {
         /// # Critical-symbol protection
         ///
         /// After build, [`super::validate_kernel_config`] rejects entries
-        /// that disabled symbols required by ktstr (CONFIG_BPF,
+        /// that disabled symbols required by ktstr (CONFIG_BPF_SYSCALL,
         /// CONFIG_DEBUG_INFO_BTF, CONFIG_FTRACE,
         /// CONFIG_SCHED_CLASS_EXT, etc.). The error names
         /// `--extra-kconfig` as the likely cause when extras were
@@ -159,7 +156,7 @@ pub enum KernelCommand {
         /// so existing cached kernels are not orphaned. An
         /// `--extra-kconfig`-built kernel is only addressable by a
         /// matching `--extra-kconfig` invocation or by an explicit
-        /// `--source` / `KTSTR_KERNEL` path — `cargo ktstr test
+        /// `--kernel <path>` / `KTSTR_KERNEL` path — `cargo ktstr test
         /// --kernel 6.14.2` (which doesn't take `--extra-kconfig`)
         /// will not surface the extra-built artifact.
         ///
@@ -171,18 +168,25 @@ pub enum KernelCommand {
         /// Skip SHA-256 verification of downloaded stable tarballs.
         /// Useful when cdn.kernel.org updates a tarball in-place (new
         /// point release reusing the same URL) and the
-        /// sha256sums.asc manifest is stale or mismatched. Has no
-        /// effect on `--source` (no download), `--git` (no manifest),
-        /// or RC tarballs (git.kernel.org dynamically generates RC
-        /// archives and publishes no upstream manifest, so RC
-        /// downloads always run unverified regardless of this flag).
-        /// Bypassing verification is security-sensitive: a single
-        /// `--skip-sha256: bypassing checksum verification` warning
-        /// fires per affected download so the lost guarantee is
-        /// visible alongside the verification-success line that
-        /// would otherwise appear.
+        /// sha256sums.asc manifest is stale or mismatched. Only affects
+        /// a version / range `--kernel` (the tarball download): no
+        /// effect on a `--kernel <path>` source tree (no download), a
+        /// `--kernel git+…` source (no manifest), or RC tarballs
+        /// (git.kernel.org dynamically generates RC archives and
+        /// publishes no upstream manifest, so RC downloads always run
+        /// unverified regardless of this flag). Bypassing verification
+        /// is security-sensitive: a single `--skip-sha256: bypassing
+        /// checksum verification` warning fires per affected download
+        /// so the lost guarantee is visible alongside the
+        /// verification-success line that would otherwise appear.
         #[arg(long)]
         skip_sha256: bool,
+        /// See [`INCLUDE_EOL_HELP`]. Only affects a `--kernel START..END`
+        /// range (e.g. `kernel build --kernel 6.11..6.14`); ignored for
+        /// a single version, path, or git source, none of which expand
+        /// a range.
+        #[arg(long, help = INCLUDE_EOL_HELP)]
+        include_eol: bool,
     },
     /// Remove cached kernel images.
     Clean {
@@ -224,13 +228,14 @@ pub enum KernelCommand {
 /// image (test/coverage need BTF, `ktstr shell` reuses the cache
 /// entry for kconfig discovery). A bare `bzImage`/`Image` passed
 /// directly carries neither, so silently accepting it would produce
-/// hard-to-diagnose mid-run failures. The verifier and
-/// `cargo ktstr shell` accept raw images because their flows do not
+/// hard-to-diagnose mid-run failures.
+/// `cargo ktstr shell` accepts raw images because its flow does not
 /// need that companion metadata; see [`KERNEL_HELP_RAW_OK`].
 pub const KERNEL_HELP_NO_RAW: &str = "Kernel identifier: a source directory \
      path (e.g. `../linux`), a version (`6.14.2`, or major.minor prefix \
      `6.14` for latest patch), a cache key (see `kernel list`), a \
-     version range (`6.12..6.14`), or a git source (`git+URL#REF`). Raw \
+     version range (`6.12..6.14`), or a git source \
+     (`git+URL#tag=NAME`, `git+URL#branch=NAME`, or `git+URL#sha=<40-hex>`). Raw \
      image files are rejected. Source directories auto-build (can be slow \
      on a fresh tree); versions auto-download from kernel.org on cache \
      miss. The flag is REPEATABLE on `test`, `coverage`, and `llvm-cov` \
@@ -239,12 +244,13 @@ pub const KERNEL_HELP_NO_RAW: &str = "Kernel identifier: a source directory \
      tuple becomes a distinct nextest test case so nextest's parallelism, \
      retries, and `-E` filtering work natively. Ranges expand to every \
      `stable` and `longterm` release inside `[START, END]` inclusive \
-     (mainline / linux-next dropped). Git sources clone shallow at the \
-     ref and build once. In contrast, `ktstr shell` accepts a single \
+     (mainline / linux-next dropped). Git sources are fetched at the \
+     given ref (GitHub via a codeload snapshot, other hosts via a \
+     shallow clone) and built once. In contrast, `ktstr shell` accepts a single \
      kernel only — pass exactly one `--kernel`.";
 
 /// Help text for `--kernel` in contexts that accept raw image files:
-/// `cargo ktstr verifier` and `cargo ktstr shell`. Matches
+/// `cargo ktstr shell`. Matches
 /// `KernelResolvePolicy { accept_raw_image: true, .. }`. See
 /// [`KERNEL_HELP_NO_RAW`] for the converse and the rationale for
 /// the asymmetry.
@@ -255,8 +261,54 @@ pub const KERNEL_HELP_RAW_OK: &str = "Kernel identifier: a source directory \
      (can be slow on a fresh tree); versions auto-download from kernel.org \
      on cache miss. When absent, resolves via cache then filesystem, \
      falling back to downloading the latest stable kernel. Ranges \
-     (`START..END`) and git sources (`git+URL#REF`) are not supported \
+     (`START..END`) and git sources (`git+URL#tag=NAME`) are not supported \
      in this context; pass a single kernel.";
+
+/// Help text for `--kernel` on `kernel build` (`ktstr` and
+/// `cargo ktstr`). Unlike [`KERNEL_HELP_NO_RAW`], this surface builds a
+/// kernel rather than resolving one for a test run: it is NOT repeatable
+/// (one kernel or one range per invocation), and a cache key is rejected
+/// (a cache key names an already-built entry, so there is nothing to
+/// build). A source-directory path auto-builds; a version / range
+/// auto-downloads; a git source is fetched and built. Omitting `--kernel`
+/// builds the latest stable release.
+pub const KERNEL_HELP_BUILD: &str = "Kernel to build: a version (`6.14.2`, \
+     a `MAJOR.MINOR` prefix `6.14` for the latest patch in that series, or a \
+     bare `MAJOR` prefix `6` for the latest patch across all `6.x`), a version range \
+     (`6.11..6.14` — builds every stable/longterm release in the range), a \
+     source directory path (`./linux`, `~/linux`, or an absolute path; a \
+     bare relative name like `linux` is read as a cache key, so prefix a \
+     relative source dir with `./`), or a git source (`git+URL#tag=NAME`, \
+     `git+URL#branch=NAME`, or `git+URL#sha=<40-hex>`). Omitted, the latest \
+     stable release is built. A cache key (an already-built entry from \
+     `kernel list`) is rejected — it names a built kernel, so there is \
+     nothing to build. Build one kernel (or one range) per invocation.";
+
+/// Help text for the `--include-eol` flag, shared by every command
+/// that expands a `START..END` kernel range (`cargo ktstr test`,
+/// `coverage`, `llvm-cov`, `verifier`, `kernel list`, and
+/// `kernel build` when the `--kernel` value is a range). One const so
+/// the wording stays identical across every surface the flag appears on.
+///
+/// Describes what the code DOES: [`crate::cli::expand_kernel_range`]
+/// draws only from kernel.org's `releases.json` by default (active
+/// `stable`/`longterm` series); under this flag it unions in the
+/// `vX.Y.Z` tags of the gregkh linux-stable mirror
+/// (`crate::fetch::cached_stable_tags`) and takes the latest patch
+/// per `(major, minor)` series across both sources, so a series that
+/// has aged out of `releases.json` still contributes its highest
+/// point release. If the mirror tag list cannot be fetched, expansion
+/// proceeds with a warning against the active-release set alone.
+pub const INCLUDE_EOL_HELP: &str = "Include end-of-life stable series when \
+     expanding a `START..END` kernel range. Default range resolution draws \
+     only from kernel.org's active releases (releases.json), which omits \
+     series no longer maintained; with this flag the range additionally \
+     covers every `vX.Y.Z` tag in the gregkh linux-stable mirror, so an EOL \
+     series inside [START, END] still contributes its highest point release. \
+     Has no effect on a single version, path, cache key, or git source — \
+     only range expansion consults the EOL set. When the mirror tag list \
+     cannot be fetched, expansion proceeds with a warning against the \
+     active-release set alone.";
 
 /// Help text for the `--cpu-cap N` flag. Shared across `ktstr kernel build`,
 /// `cargo ktstr kernel build`, and `ktstr shell` so the operator-facing
@@ -375,8 +427,12 @@ pub const KERNEL_LIST_LONG_ABOUT: &str = concat!(
     "                               check this field before trusting `eol`.\n",
     "  entries                      array of per-entry objects. Each\n",
     "                               element is either a VALID entry (full\n",
-    "                               field set) or a CORRUPT entry (only\n",
-    "                               `key`, `path`, `error`). Detect\n",
+    "                               field set) or a CORRUPT entry\n",
+    "                               (`key`, `path`, `error`,\n",
+    "                               `error_kind`). `error` is the\n",
+    "                               human-readable reason; `error_kind`\n",
+    "                               the machine-readable classifier.\n",
+    "                               Detect\n",
     "                               corruption by the presence of `error`.\n",
     "\n",
     "Valid entry fields: key, path, version (nullable), source, arch,\n",
@@ -428,13 +484,13 @@ pub const KERNEL_LIST_LONG_ABOUT: &str = concat!(
     "                   `kernel list` is self-describing for entries\n",
     "                   that carry user modifications.\n",
     "\n",
-    "When --range is set, the subcommand SWITCHES to range-preview\n",
+    "When --kernel is a range, the subcommand SWITCHES to range-preview\n",
     "mode and emits a structurally different JSON shape — the cache\n",
     "is not walked at all, only kernel.org's releases.json is fetched\n",
     "to expand the inclusive range. The --json output is one object\n",
     "with four top-level fields:\n",
     "\n",
-    "  range     literal range string supplied to --range\n",
+    "  range     literal range string supplied to --kernel\n",
     "            (e.g. \"6.12..6.14\").\n",
     "  start     parsed start endpoint\n",
     "            (MAJOR.MINOR[.PATCH][-rcN]).\n",
@@ -448,7 +504,7 @@ pub const KERNEL_LIST_LONG_ABOUT: &str = concat!(
     "Range-mode output never carries cache metadata\n",
     "(no current_ktstr_kconfig_hash, no entries) — to inspect cached\n",
     "kernels for one of the resolved versions, run `kernel list`\n",
-    "without --range. Consumers should dispatch on the presence of\n",
+    "without --kernel. Consumers should dispatch on the presence of\n",
     "the `range` key (range mode) versus `entries` key (list mode)\n",
     "to branch the parse."
 );
@@ -474,12 +530,12 @@ pub const DIRTY_TREE_CACHE_SKIP_HINT: &str = "skipping cache — working tree ha
 /// Pinned by `non_git_tree_cache_skip_hint_shape` below so a
 /// wording drift is caught in unit tests.
 pub const NON_GIT_TREE_CACHE_SKIP_HINT: &str = "skipping cache — source tree is not a git repository so dirty \
-     state cannot be detected; put the source under git, or replace \
-     `--source` with one of the content-keyed fetch modes that does \
-     not need dirty-state detection — `kernel build VERSION` \
-     (downloads the tarball from kernel.org) or \
-     `kernel build --git URL --ref REF` (shallow-clones the given \
-     ref) — to enable caching";
+     state cannot be detected; put the source under git, or replace the \
+     `--kernel <path>` source with one of the content-keyed fetch modes \
+     that does not need dirty-state detection — `kernel build --kernel \
+     <version>` (downloads the tarball from kernel.org) or `kernel build \
+     --kernel git+URL#branch=NAME` (shallow-clones the given ref) — to \
+     enable caching";
 
 /// Decide whether to emit the `(EOL)` legend under the `kernel list`
 /// table. Returns `Some(EOL_EXPLANATION)` iff at least one rendered
@@ -500,7 +556,7 @@ pub(crate) fn eol_legend_if_any(any_eol: bool) -> Option<&'static str> {
 /// its remediation is operational, not informational. See
 /// `format_corrupt_footer` for the full rationale.
 pub const UNTRACKED_KCONFIG_EXPLANATION: &str = "(untracked kconfig) marks entries with no recorded ktstr.kconfig hash \
-     (pre-dates kconfig hash tracking). Rebuild with: kernel build --force VERSION \
+     (pre-dates kconfig hash tracking). Rebuild with: kernel build --force --kernel VERSION \
      (add --extra-kconfig PATH if the original entry was built with a user fragment).";
 
 /// Decide whether to emit the `(untracked kconfig)` legend under the
@@ -522,7 +578,7 @@ pub(crate) fn untracked_legend_if_any(any_untracked: bool) -> Option<&'static st
 /// preserved from the prior inline `eprintln!` in `kernel_list`
 /// so existing operators see no behavioural change.
 pub const STALE_KCONFIG_EXPLANATION: &str = "warning: entries marked (stale kconfig) were built against a different ktstr.kconfig. \
-     Rebuild with: kernel build --force <entry version> \
+     Rebuild with: kernel build --force --kernel <entry version> \
      (add --extra-kconfig PATH if the entry also carries the (extra kconfig) tag).";
 
 /// Decide whether to emit the `(stale kconfig)` legend under the
@@ -685,7 +741,9 @@ mod tests {
         assert!(STALE_KCONFIG_EXPLANATION.starts_with("warning"));
         assert!(STALE_KCONFIG_EXPLANATION.contains("(stale kconfig)"));
         assert!(STALE_KCONFIG_EXPLANATION.contains("different ktstr.kconfig"));
-        assert!(STALE_KCONFIG_EXPLANATION.contains("kernel build --force <entry version>"));
+        assert!(
+            STALE_KCONFIG_EXPLANATION.contains("kernel build --force --kernel <entry version>")
+        );
     }
 
     /// `corrupt_footer_if_any` branches.
@@ -756,8 +814,8 @@ mod tests {
         assert!(NON_GIT_TREE_CACHE_SKIP_HINT.starts_with("skipping cache"));
         assert!(NON_GIT_TREE_CACHE_SKIP_HINT.contains("not a git repository"));
         assert!(NON_GIT_TREE_CACHE_SKIP_HINT.contains("put the source under git"));
-        assert!(NON_GIT_TREE_CACHE_SKIP_HINT.contains("kernel build VERSION"));
-        assert!(NON_GIT_TREE_CACHE_SKIP_HINT.contains("kernel build --git URL --ref REF"));
+        assert!(NON_GIT_TREE_CACHE_SKIP_HINT.contains("kernel build --kernel <version>"));
+        assert!(NON_GIT_TREE_CACHE_SKIP_HINT.contains("kernel build --kernel git+URL#branch=NAME"));
         assert!(!NON_GIT_TREE_CACHE_SKIP_HINT.contains("stash"));
         assert!(!NON_GIT_TREE_CACHE_SKIP_HINT.contains("commit"));
     }
@@ -820,14 +878,15 @@ mod tests {
             #[command(subcommand)]
             cmd: KernelCommand,
         }
-        let parsed = TestCli::try_parse_from(["prog", "build", "6.14.2", "--cpu-cap", "4"])
-            .expect("kernel build --cpu-cap N must parse");
+        let parsed =
+            TestCli::try_parse_from(["prog", "build", "--kernel", "6.14.2", "--cpu-cap", "4"])
+                .expect("kernel build --cpu-cap N must parse");
         match parsed.cmd {
             KernelCommand::Build {
-                cpu_cap, version, ..
+                cpu_cap, kernel, ..
             } => {
                 assert_eq!(cpu_cap, Some(4));
-                assert_eq!(version.as_deref(), Some("6.14.2"));
+                assert_eq!(kernel.as_deref(), Some("6.14.2"));
             }
             other => panic!("expected KernelCommand::Build, got {other:?}"),
         }
@@ -842,11 +901,36 @@ mod tests {
             #[command(subcommand)]
             cmd: KernelCommand,
         }
-        let parsed = TestCli::try_parse_from(["prog", "build", "6.14.2"])
+        let parsed = TestCli::try_parse_from(["prog", "build", "--kernel", "6.14.2"])
             .expect("kernel build without --cpu-cap must parse");
         match parsed.cmd {
             KernelCommand::Build { cpu_cap, .. } => {
                 assert_eq!(cpu_cap, None, "no --cpu-cap must produce None, not Some(0)");
+            }
+            other => panic!("expected KernelCommand::Build, got {other:?}"),
+        }
+    }
+
+    /// Bare `kernel build` (no `--kernel`) parses to `Build { kernel:
+    /// None }` — the latest-stable default. Pins the None default at the
+    /// parse layer so the dispatch's `None => latest stable` arm stays
+    /// reachable.
+    #[test]
+    fn kernel_build_without_kernel_defaults_to_none() {
+        use clap::Parser as _;
+        #[derive(clap::Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: KernelCommand,
+        }
+        let parsed =
+            TestCli::try_parse_from(["prog", "build"]).expect("bare kernel build must parse");
+        match parsed.cmd {
+            KernelCommand::Build { kernel, .. } => {
+                assert_eq!(
+                    kernel, None,
+                    "no --kernel must produce None (the latest-stable default)"
+                );
             }
             other => panic!("expected KernelCommand::Build, got {other:?}"),
         }
@@ -861,8 +945,9 @@ mod tests {
             #[command(subcommand)]
             cmd: KernelCommand,
         }
-        let parsed = TestCli::try_parse_from(["prog", "build", "6.14.2", "--cpu-cap", "0"])
-            .expect("clap-level parse must accept 0; runtime validation rejects");
+        let parsed =
+            TestCli::try_parse_from(["prog", "build", "--kernel", "6.14.2", "--cpu-cap", "0"])
+                .expect("clap-level parse must accept 0; runtime validation rejects");
         match parsed.cmd {
             KernelCommand::Build { cpu_cap, .. } => {
                 assert_eq!(cpu_cap, Some(0));
@@ -883,8 +968,9 @@ mod tests {
             #[command(subcommand)]
             cmd: KernelCommand,
         }
-        let parsed = TestCli::try_parse_from(["prog", "build", "6.14.2", "--skip-sha256"])
-            .expect("kernel build --skip-sha256 must parse");
+        let parsed =
+            TestCli::try_parse_from(["prog", "build", "--kernel", "6.14.2", "--skip-sha256"])
+                .expect("kernel build --skip-sha256 must parse");
         match parsed.cmd {
             KernelCommand::Build { skip_sha256, .. } => {
                 assert!(
@@ -910,7 +996,7 @@ mod tests {
             #[command(subcommand)]
             cmd: KernelCommand,
         }
-        let parsed = TestCli::try_parse_from(["prog", "build", "6.14.2"])
+        let parsed = TestCli::try_parse_from(["prog", "build", "--kernel", "6.14.2"])
             .expect("kernel build without --skip-sha256 must parse");
         match parsed.cmd {
             KernelCommand::Build { skip_sha256, .. } => {
@@ -1036,7 +1122,7 @@ mod tests {
 
     /// `kernel build --help` must surface the `--skip-sha256` flag
     /// with documentation covering the no-op semantics on
-    /// `--source` / `--git` / RC tarballs and the
+    /// `--kernel <path>` / git+ / RC tarballs and the
     /// security-sensitive bypass-warning contract. Without these
     /// hints an operator setting the flag would have no way to
     /// know whether their fetch actually bypassed verification.
@@ -1065,13 +1151,13 @@ mod tests {
         // Pins the user-facing semantics so a future doc rewrite
         // cannot drop the no-op clauses or the warning contract.
         assert!(
-            help.contains("--source"),
-            "--skip-sha256 help must call out the --source no-op so \
+            help.contains("--kernel <path>"),
+            "--skip-sha256 help must call out the --kernel <path> no-op so \
              operators don't expect bypass on local-source builds: {help}"
         );
         assert!(
-            help.contains("--git"),
-            "--skip-sha256 help must call out the --git no-op so \
+            help.contains("git+"),
+            "--skip-sha256 help must call out the git-source no-op so \
              operators don't expect bypass on git-source builds: {help}"
         );
         assert!(

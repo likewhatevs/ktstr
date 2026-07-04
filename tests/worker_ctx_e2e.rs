@@ -79,8 +79,9 @@ fn ctx_flipper(ctx: &WorkerCtx) -> WorkerReport {
 /// are declared BEFORE the two flippers so the declaration-order
 /// contract makes them visible (see `WorkType::CrossAffinityChurn`).
 /// Verdict mirrors `cross_affinity_churn_e2e`: the scenario runs
-/// cleanly under the scheduler. Fairness rate ceilings are raised
-/// because the flipper and futex profiles diverge by design.
+/// cleanly under the scheduler. Monitor event-rate ceilings
+/// (select_cpu_fallback / dispatch_keep_last) are raised because
+/// the flipper and futex profiles diverge by design.
 #[ktstr_test(
     scheduler = KTSTR_SCHED,
     llcs = 1,

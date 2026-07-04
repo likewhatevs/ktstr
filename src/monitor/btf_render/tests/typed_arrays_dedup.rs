@@ -489,8 +489,12 @@ fn write_struct_anonymous_overlay_with_unique_field_is_flattened() {
 // flat-scalar members pack 3-per-row under the `TypeName:`
 // breadcrumb. Two sub-paths: padded (`name = value`, needs >=3
 // rows AND >=4-char name-length variance in a column) and compact
-// (`name=value`). The existing multi-line test exercises only the
-// COMPOUND-member line path; these pin the scalar column grid.
+// (`name=value`). The existing multi-line test exercises the
+// scalar column grid (its inner struct's 20 u64 members) and the
+// compound-member line path (the outer struct's `child`), but
+// does not PIN the grid layout — it asserts only the breadcrumb
+// form and that inner values surface; these pin the padded and
+// compact scalar grid exactly.
 // Exact strings captured from the renderer.
 
 #[test]

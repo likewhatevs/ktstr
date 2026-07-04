@@ -640,7 +640,7 @@ fn paint_metrics(row: &mut GauntletRow, spread: f64, gap_ms: u64, migrations: u6
 
 /// Empty input produces zero aggregated rows. Pins the empty-
 /// vec edge case so callers iterating over the result vector
-/// don't need to special-case the `--average` path on empty
+/// don't need to special-case the averaging path on empty
 /// run directories.
 #[test]
 fn group_and_average_empty_input_yields_empty_output() {
@@ -685,7 +685,10 @@ fn group_and_average_single_pass_passes_through_metrics() {
 /// up-to-1.0 per-A/B-pair error defeat stuck_count's
 /// `default_abs` of 1.0 and fabricate single-stall regressions
 /// from sub-integer differences. Every other typed integer field
-/// rounds (abs >= 5.0 absorbs the error); stuck_count alone is f64.
+/// rounds; the smallest floor (total_iterations / total_migrations at
+/// 2.0) still exceeds the <= 1.0 per-A/B-pair error, so it is absorbed
+/// (pinned by rounded_mean_count_floors_above_rounding_noise);
+/// stuck_count alone is f64 with a 1.0 floor.
 #[test]
 fn group_and_average_stuck_count_is_exact_fractional_mean() {
     let mut a = make_row("t", "tiny-1llc", true, 0.0);
@@ -754,7 +757,8 @@ fn group_and_average_multi_pass_kind_aware_fold() {
             .copied(),
         Some(200.0),
     );
-    // worst_run_delay_us is the SOLE Worst Distribution: cross-RUN it
+    // worst_run_delay_us is a Worst-reduction Distribution (alongside
+    // worst_timer_latency_us): cross-RUN it
     // folds by MAX (the peak survives), NOT mean — gap_ms*2 = 200/400/600
     // → MAX 600 (a MEAN would give 400). Pins the Worst arm AND its
     // ordering before the general Distribution MEAN arm in aggregate_finite.
@@ -821,7 +825,8 @@ fn group_and_average_multi_pass_kind_aware_fold() {
     );
 }
 
-/// The two monitor schedstat Rates re-derive Σnumerator / Σdenominator
+/// The two per-SCHEDULE monitor schedstat Rates this test pins
+/// (total_run_delay_ns_per_sched + ttwu_local_fraction) re-derive Σnumerator / Σdenominator
 /// across runs (the `MetricKind::Rate` pooled fold), NOT a mean of per-run
 /// ratios. Two runs with deliberately different per-run ratios make the two
 /// estimators disagree, so this pins the pooled form:
@@ -1957,7 +1962,7 @@ fn group_and_average_then_compare_rows_yields_regression_on_means() {
 /// in the aggregation → compare wiring lands here.
 ///
 /// Fixture: two runs each carrying three sidecars that
-/// differ on `scheduler` (the slicing dim). Side A's three
+/// differ on `project_commit` (the slicing dim). Side A's three
 /// trials cluster around `worst_spread = 10` (mean 12);
 /// side B's three cluster around `worst_spread = 30` (mean
 /// 30). The 18-unit delta clears the default dual gate, so
@@ -1979,16 +1984,16 @@ fn compare_partitions_with_average_default_produces_regression_on_aggregated_mea
     let trials_a = [(10.0, 100), (12.0, 120), (14.0, 140)];
     let trials_b = [(28.0, 280), (30.0, 300), (32.0, 320)];
 
-    // Scheduler is the slicing dim: side A's three trials
-    // run under "scx_alpha", side B's under "scx_beta". The
+    // project_commit is the slicing dim: side A's three trials
+    // carry commit_a, side B's carry commit_b. The
     // pairing dims are everything else (kernel/topology/
-    // work_type/commit) which match across both runs,
+    // work_type) which match across both runs,
     // so the three trials on each side aggregate into one
     // mean row keyed by `(scenario, topology, work_type)`
-    // plus the matching kernel/commit values.
-    for (run_key, trials, sched) in [
-        (run_a, &trials_a, "scx_alpha"),
-        (run_b, &trials_b, "scx_beta"),
+    // plus the matching kernel value.
+    for (run_key, trials, pc) in [
+        (run_a, &trials_a, "commit_a"),
+        (run_b, &trials_b, "commit_b"),
     ] {
         let run_dir = alt_root.path().join(run_key);
         std::fs::create_dir_all(&run_dir).expect("create run dir");
@@ -1997,7 +2002,7 @@ fn compare_partitions_with_average_default_produces_regression_on_aggregated_mea
             let mut sidecar = SidecarResult {
                 test_name: "avg_test".to_string(),
                 topology: "1n2l4c1t".to_string(),
-                scheduler: sched.to_string(),
+                project_commit: Some(pc.to_string()),
                 work_type: "SpinWait".to_string(),
                 ..SidecarResult::test_fixture()
             };
@@ -2012,11 +2017,11 @@ fn compare_partitions_with_average_default_produces_regression_on_aggregated_mea
     }
 
     let filter_a = RowFilter {
-        schedulers: vec!["scx_alpha".to_string()],
+        project_commits: vec!["commit_a".to_string()],
         ..RowFilter::default()
     };
     let filter_b = RowFilter {
-        schedulers: vec!["scx_beta".to_string()],
+        project_commits: vec!["commit_b".to_string()],
         ..RowFilter::default()
     };
 
@@ -2031,8 +2036,13 @@ fn compare_partitions_with_average_default_produces_regression_on_aggregated_mea
         None,
         &ComparisonPolicy::default(),
         Some(alt_root.path()),
-        false, // no_average=false → averaging is ON
-        &PhaseDisplayOptions::default(),
+        // Gate at 1 so the single detected regression surfaces as exit 1:
+        // this test verifies regression DETECTION on averaged means, not the
+        // default multi-regression gate (which tolerates a lone regression).
+        &crate::stats::GateOptions {
+            fail_threshold: Some(1),
+            ..Default::default()
+        },
     )
     .expect("compare_partitions must succeed against valid fixtures");
     assert_eq!(

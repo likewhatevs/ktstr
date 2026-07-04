@@ -37,7 +37,7 @@ use ktstr::__private;
 fn private_serde_json_to_string_roundtrip() {
     let v: Vec<(&str, u32)> = vec![("llc", 0), ("borrow", 1)];
     let json = __private::serde_json::to_string(&v).expect("serialize via __private path");
-    // serde_json formats tuple structs as JSON arrays; the expected
+    // serde_json formats tuples as JSON arrays; the expected
     // output is stable and equality-testable.
     assert_eq!(json, r#"[["llc",0],["borrow",1]]"#);
 }

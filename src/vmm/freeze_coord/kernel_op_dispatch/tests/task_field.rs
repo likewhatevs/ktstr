@@ -185,7 +185,7 @@ fn validate_task_rejects_non_ext_sched_class() {
         .expect_err("non-ext sched_class must reject");
     assert!(err.contains(&format!("sched_class={fair_kva:#x}")));
     assert!(err.contains("SCX-managed tasks only"));
-    assert!(err.contains("SchedPolicy::Ext"));
+    assert!(err.contains("SchedPolicy::Normal"));
 }
 
 /// L8 (start_boottime == 0): probable slab-recycle survivor that
@@ -244,7 +244,7 @@ fn validate_task_layer_order_start_time_before_dead() {
 /// Migrated from `tests/oru64_rmw_e2e.rs` (gated skeleton); the
 /// dispatcher narrowed OrU64 to OrU32 because the canonical
 /// scheduler-flags use case (`struct scx_rq.flags`) is u32 per
-/// `kernel/sched/sched.h:802`. Test runs as a host-side unit
+/// `kernel/sched/sched.h:803`. Test runs as a host-side unit
 /// test against `build_test_kernel`'s synthetic guest memory —
 /// no VM boot — because the RMW correctness is pure dispatcher
 /// arithmetic.

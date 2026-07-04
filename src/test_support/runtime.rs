@@ -129,7 +129,8 @@ pub(crate) fn verbose() -> bool {
 /// True when `KTSTR_NO_PERF_MODE` is set to a NON-EMPTY value.
 ///
 /// Centralises the perf-mode-disabled check used by the dispatch
-/// gauntlet routes (`run_named_test`, `run_gauntlet_test` in
+/// gauntlet routes (`run_named_test`, `run_gauntlet_test`, and the
+/// verifier-cell listing route `list_verifier_cells_all`, all in
 /// `super::dispatch`) and the eval entry path
 /// (`super::eval::run_ktstr_test_inner_impl`). All four sites
 /// previously called `std::env::var("KTSTR_NO_PERF_MODE").is_ok()`
@@ -151,11 +152,11 @@ pub(crate) fn no_perf_mode_active() -> bool {
 /// True when `KTSTR_BYPASS_LLC_LOCKS` is set to a NON-EMPTY value.
 ///
 /// Centralises the bypass check used at 7 reader sites:
-/// `vmm/builder.rs:909`, `cli/kernel_build/build.rs:102` +
-/// `:473` (the inverse `!bypass_llc_locks_active()` form),
-/// `bin/cargo_ktstr/kernel/mod.rs:694`,
-/// `bin/cargo_ktstr/misc/shell.rs:199`, and `bin/ktstr.rs:592` +
-/// `:1744`. All sites previously spelled the same
+/// `vmm/builder.rs:1199`, `cli/kernel_build/build.rs:102` +
+/// `:488` (the latter the inverse `!bypass_llc_locks_active()`
+/// form), `bin/cargo_ktstr/kernel/mod.rs:720`,
+/// `bin/cargo_ktstr/misc/shell.rs:181`, and `bin/ktstr.rs:652` +
+/// `:1267`. All sites previously spelled the same
 /// `.ok().is_some_and(|v| !v.is_empty())` inline; centralising
 /// eliminates the drift hazard and matches the
 /// `no_perf_mode_active` shape so the empty-string contract is
@@ -309,8 +310,8 @@ pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
         parts.push(karg.to_string());
     }
     // Per-test KASLR opt-out (see `KtstrTestEntry.kaslr` doc). The base
-    // cmdline at `src/vmm/setup.rs` does NOT inject `nokaslr` by default —
-    // KASLR is on. A test that needs determinism sets `kaslr = false` in
+    // cmdline `base_guest_cmdline` at `src/vmm/setup/mod.rs` does NOT
+    // inject `nokaslr` by default — KASLR is on. A test that needs determinism sets `kaslr = false` in
     // its `#[ktstr_test]` attribute; that lands the token here, where it
     // composes with any operator-supplied `Scheduler::kargs(&["nokaslr"])`
     // above (kernel parses the flag as a bool; duplicates are harmless).
@@ -492,8 +493,9 @@ fn cgroup_parent_example(entry: &KtstrTestEntry) -> String {
 pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<String>) {
     // Fail-fast on a malformed user-supplied `--cell-parent-cgroup`
     // value before the auto-inject branch. The host-side consumer
-    // `resolve_cgroup_root` (used by the probe/setup path at
-    // `probe.rs::run_scenario_probe`) interpolates the value into a
+    // `resolve_cgroup_root` (defined in `test_support::args`, used by
+    // the probe/setup path at `probe.rs::build_dispatch_ctx_parts`)
+    // interpolates the value into a
     // `/sys/fs/cgroup{path}` literal and hands the result to
     // `CgroupManager::new`, which has NO host-root guard — any path
     // that doesn't start with `/` lands inside the host cgroup root
@@ -824,7 +826,18 @@ pub(crate) fn overcommit_skip_reason(
 /// [`crate::vmm::freeze_coord::WPROF_SHIP_GRACE`] when it declares
 /// `wprof` (a crashing scheduler's late Phase-5 trace ship is held for
 /// that window before teardown).
-pub(crate) fn vm_timeout_from_entry(entry: &super::entry::KtstrTestEntry) -> Duration {
+///
+/// `booted_vcpus` is the vCPU count of the topology the VM actually
+/// boots (`resolve_vm_topology(entry, topo).0.total_cpus()`), NOT the
+/// declared `entry.topology`: under a `TopoOverride` (gauntlet preset /
+/// `--ktstr-topo`) they diverge, and both the vCPU-scaled boot headroom
+/// and the oversubscription multiplier must scale to the topology that
+/// boots — otherwise the watchdog fires mid-boot on a larger-than-declared
+/// preset.
+pub(crate) fn vm_timeout_from_entry(
+    entry: &super::entry::KtstrTestEntry,
+    booted_vcpus: u32,
+) -> Duration {
     let mut base = entry
         .watchdog_timeout
         .max(entry.duration)
@@ -840,7 +853,7 @@ pub(crate) fn vm_timeout_from_entry(entry: &super::entry::KtstrTestEntry) -> Dur
     if entry.wprof {
         base += crate::vmm::freeze_coord::WPROF_SHIP_GRACE;
     }
-    let vcpus = entry.topology.total_cpus();
+    let vcpus = booted_vcpus;
     let oversub = overcommit_ratio(
         vcpus,
         crate::vmm::host_topology::host_allowed_cpus().len(),
@@ -894,7 +907,7 @@ pub(crate) fn build_vm_builder_base(
         .memory_deferred_min(memory_mib)
         .cmdline(cmdline_extra)
         .run_args(guest_args)
-        .timeout(vm_timeout_from_entry(entry))
+        .timeout(vm_timeout_from_entry(entry, vm_topology.total_cpus()))
         .workload_duration(entry.duration)
         .no_perf_mode(no_perf_mode);
 
@@ -1087,8 +1100,9 @@ mod tests {
         // when the entry declares a host-side bpf_map_write; the delta
         // between an otherwise-identical pair is exactly that budget.
         assert_eq!(
-            vm_timeout_from_entry(&with_write),
-            vm_timeout_from_entry(&no_write) + COLD_BTF_PHASE1_BUDGET,
+            vm_timeout_from_entry(&with_write, with_write.topology.total_cpus()),
+            vm_timeout_from_entry(&no_write, no_write.topology.total_cpus())
+                + COLD_BTF_PHASE1_BUDGET,
             "bpf_map_write entries get the cold-BTF phase-1 budget added",
         );
     }
@@ -2360,7 +2374,10 @@ mod tests {
             duration: Duration::from_secs(30),
             ..KtstrTestEntry::DEFAULT
         };
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_millis(80_300));
+        assert_eq!(
+            vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
+            Duration::from_millis(80_300)
+        );
     }
 
     #[test]
@@ -2374,7 +2391,7 @@ mod tests {
         };
         // base = max(5s, 120s, 1s) = 120s; vm_boot_headroom(2) = 20.3 s.
         assert_eq!(
-            vm_timeout_from_entry(&entry),
+            vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
             Duration::from_millis(140_300)
         );
     }
@@ -2389,7 +2406,10 @@ mod tests {
             duration: Duration::from_millis(50),
             ..KtstrTestEntry::DEFAULT
         };
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_millis(21_300));
+        assert_eq!(
+            vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
+            Duration::from_millis(21_300)
+        );
     }
 
     #[test]
@@ -2401,12 +2421,15 @@ mod tests {
             name: "default",
             ..KtstrTestEntry::DEFAULT
         };
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_millis(32_300));
+        assert_eq!(
+            vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
+            Duration::from_millis(32_300)
+        );
     }
 
     #[test]
     fn vm_timeout_from_entry_scales_headroom_with_topology() {
-        // The B2 reporter's case: numa=1, llcs=7, cores=9, threads=2 → 126 vCPUs.
+        // A reported case: numa=1, llcs=7, cores=9, threads=2 → 126 vCPUs.
         // sys_rdy_budget_ms(126) = 28_900 ms (10_000 base + 126×150) →
         // vm_boot_headroom = 38.9 s. base = max(5 s watchdog, 12 s
         // duration, 1 s) = 12 s → total = 50.9 s.
@@ -2427,7 +2450,42 @@ mod tests {
             },
             ..KtstrTestEntry::DEFAULT
         };
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_millis(50_900));
+        assert_eq!(
+            vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
+            Duration::from_millis(50_900)
+        );
+    }
+
+    #[test]
+    fn vm_timeout_from_entry_scales_on_booted_not_declared_vcpus() {
+        // Under a TopoOverride the VM boots a different vCPU count than
+        // entry.topology declares; the boot-headroom deadline must scale
+        // to the BOOTED count passed in, not entry.topology. A default
+        // 2-vCPU entry "booted" at 126 vCPUs must get the 126-vCPU
+        // headroom (50.9 s, matching the declared-126 case above), not
+        // the declared 2-vCPU headroom (32.3 s). Pin a wide cpuset so
+        // neither count is oversubscribed (multiplier = 1.0). The
+        // declared-vs-booted gap is otherwise untested — every other
+        // vm_timeout test passes entry.topology.total_cpus() (declared ==
+        // booted).
+        let _pin = AllowedCpusPin::new((0..256).collect());
+        let entry = KtstrTestEntry {
+            name: "booted_override",
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert_eq!(
+            vm_timeout_from_entry(&entry, 126),
+            Duration::from_millis(50_900),
+        );
+        assert_eq!(
+            vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
+            Duration::from_millis(32_300),
+        );
+        assert_ne!(
+            vm_timeout_from_entry(&entry, 126),
+            vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
+            "the deadline must key on the booted count, not the declared entry.topology",
+        );
     }
 
     // -- overcommit_ratio / oversub-scaled vm_timeout --
@@ -2559,7 +2617,7 @@ mod tests {
         };
         // 12_000 + 58_400 × 4 = 245_600 ms.
         assert_eq!(
-            vm_timeout_from_entry(&entry),
+            vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
             Duration::from_millis(245_600)
         );
     }
@@ -2585,7 +2643,7 @@ mod tests {
         };
         // 12_000 + 58_400 × 6 = 362_400 ms.
         assert_eq!(
-            vm_timeout_from_entry(&entry),
+            vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
             Duration::from_millis(362_400)
         );
     }
@@ -2607,7 +2665,7 @@ mod tests {
     fn sys_rdy_budget_ms_scales_linearly_in_band() {
         // 10_000 ms base + vcpus × 150, in the band below the 90 s cap.
         assert_eq!(sys_rdy_budget_ms(67), 20_050);
-        // The reporter's 126-vCPU case lands at 28.9 s.
+        // The 126-vCPU case lands at 28.9 s.
         assert_eq!(sys_rdy_budget_ms(126), 28_900);
         // 256-vCPU wide-SMP gets its FULL additive budget (48.4 s) — the
         // case the old 30 s cap truncated to 30 s, starving the boot.

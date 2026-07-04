@@ -244,7 +244,7 @@ pub fn cache_lookup(
     // warning on any local hit whose entry was stored via the
     // strip-fallback path. The remote-lookup path here funnels
     // downloads through `CacheDir::store`, which runs its own strip
-    // pipeline and reports via eprintln at store time — so the
+    // pipeline and reports via `tracing::warn!` at store time — so the
     // warning coverage is uniform across local and remote cache
     // hits without an additional check here.
     if let Some(entry) = cache.lookup(cache_key) {
@@ -323,8 +323,10 @@ pub fn resolve_cached_kernel(
         // This function returns one path; range/git fan-out belongs
         // upstream in the dispatch loop that iterates kernels. Bail
         // with an actionable redirect that cites the value the user
-        // wrote — `KernelId::Display` renders Range as `start..end`
-        // and Git as `git+URL#REF`, matching the sibling cache-key
+        // wrote — `KernelId::Display` renders Range as `start..=end`
+        // (or `start..end`) and Git as `git+URL#tag=NAME` /
+        // `#branch=NAME` / `#sha=HASH` (a bare `git+URL#REF` only for
+        // the rejected Unknown kind), matching the sibling cache-key
         // bail above that cites `{key}`.
         //
         // Run `validate()` first so an inverted range surfaces the
@@ -564,17 +566,35 @@ pub fn download_and_cache_version(
 ///
 /// Range endpoints are NOT required to appear in releases.json — the
 /// interval is half-the-numeric, half-presence: `6.10..6.16` selects
-/// every stable release strictly inside that span, regardless of
-/// whether `6.10` and `6.16` themselves are still listed (e.g. one
-/// has been pruned from active maintenance). This matches the
-/// inclusive-numeric-comparison semantics in
-/// [`crate::kernel_path::KernelId::validate`] and lets a range from
-/// an EOL series survive even after the endpoint version itself
-/// becomes unavailable.
+/// every stable release inside that span, regardless of whether `6.10`
+/// and `6.16` themselves are still listed (e.g. one has been pruned
+/// from active maintenance). This matches the inclusive-numeric-comparison
+/// semantics in [`crate::kernel_path::KernelId::validate`] and lets a
+/// range from an EOL series survive even after the endpoint version
+/// itself becomes unavailable.
+///
+/// Endpoint granularity is series-inclusive on BOTH ends: a 2-component
+/// `MAJOR.MINOR` endpoint names the whole series, so `6.11..6.14`
+/// includes every `6.14.N` (not just `6.14.0`). START is series-inclusive
+/// because its `.0` is the series floor; END is widened to the series
+/// ceiling by `range_bounds`. An explicit-patch endpoint (`6.14.2`) is
+/// an exact bound — `6.11..6.14.2` stops at `6.14.2`.
 ///
 /// `cli_label` prefixes the kernel.org-fetch status line so the
 /// diagnostic matches the binary that triggered the lookup
 /// (`"ktstr"` vs `"cargo ktstr"`).
+///
+/// When `include_eol` is set, the maintained set from `releases.json`
+/// is unioned with EOL `stable` series enumerated from the gregkh
+/// linux-stable mirror's tags (`crate::fetch::cached_stable_tags`),
+/// then the highest patch of each `(major, minor)` series is taken
+/// across both sources (`select_series_latest_in_range`). Without it
+/// a series dropped from `releases.json` is silently absent —
+/// `6.11..6.14` collapses to just the 6.11 series if 6.12/6.13 are
+/// EOL. If the mirror tag list cannot be fetched, expansion proceeds
+/// against the active-release set alone with a warning; the
+/// empty-result error hints `--include-eol` only when it was not
+/// already set.
 ///
 /// Pre-release filter: `mainline` and `linux-next` rows are
 /// excluded by the moniker filter; rc tags carrying a stable
@@ -583,23 +603,22 @@ pub fn download_and_cache_version(
 /// Operators who want to test against an rc spell it out as a
 /// single `--kernel 6.16-rc3` rather than expecting the range
 /// expansion to surface it.
-pub fn expand_kernel_range(start: &str, end: &str, cli_label: &str) -> Result<Vec<String>> {
-    use crate::kernel_path::decompose_version_for_compare;
+pub fn expand_kernel_range(
+    start: &str,
+    end: &str,
+    cli_label: &str,
+    include_eol: bool,
+) -> Result<Vec<String>> {
+    let (start_key, end_key) = range_bounds(start, end)?;
 
-    let start_key = decompose_version_for_compare(start).ok_or_else(|| {
-        anyhow!(
-            "kernel range start `{start}` is not a parseable version. \
-             Endpoints must match `MAJOR.MINOR[.PATCH][-rcN]`."
-        )
-    })?;
-    let end_key = decompose_version_for_compare(end).ok_or_else(|| {
-        anyhow!(
-            "kernel range end `{end}` is not a parseable version. \
-             Endpoints must match `MAJOR.MINOR[.PATCH][-rcN]`."
-        )
-    })?;
-
-    eprintln!("{cli_label}: expanding kernel range {start}..{end}");
+    eprintln!(
+        "{cli_label}: expanding kernel range {start}..{end}{eol}",
+        eol = if include_eol {
+            " (including EOL series)"
+        } else {
+            ""
+        },
+    );
     // Cached fetch: peer Range specs running in parallel under
     // `cargo ktstr`'s `resolve_kernel_set` rayon pipeline share
     // one network round-trip. The first Range to reach this
@@ -610,15 +629,34 @@ pub fn expand_kernel_range(start: &str, end: &str, cli_label: &str) -> Result<Ve
     // so the next caller re-attempts the network — failures
     // never poison the cache.
     let releases = crate::fetch::cached_releases()?;
+    let maintained = filter_and_sort_range(&releases, start_key, end_key);
 
-    let versions = filter_and_sort_range(&releases, start_key, end_key);
+    // Under `--include-eol`, also enumerate the gregkh stable mirror's
+    // tags. `None` = the ls-remote failed; warn and fall back to the
+    // maintained set alone. The fetch is cached
+    // (`crate::fetch::cached_stable_tags`) so peer ranges share one
+    // ls-remote.
+    let mirror_tags = if include_eol {
+        let tags = crate::fetch::cached_stable_tags();
+        if tags.is_none() {
+            eprintln!(
+                "{cli_label}: --include-eol: could not enumerate release tags \
+                 from the stable mirror (ls-remote failed); EOL series may be \
+                 missing from this range"
+            );
+        }
+        tags
+    } else {
+        None
+    };
+    let versions = combine_range_versions(maintained, mirror_tags, start_key, end_key, include_eol);
+
     if versions.is_empty() {
         bail!(
-            "kernel range {start}..{end} expanded to 0 stable releases. \
-             releases.json has no `stable` or `longterm` rows in this \
-             interval — verify the endpoints, or use a single \
-             `--kernel <version>` if you want a pre-release or \
-             archived version."
+            "kernel range {start}..{end} expanded to 0 stable releases.{hint} \
+             Verify the endpoints, or use a single `--kernel <version>` if you \
+             want a pre-release or archived version.",
+            hint = empty_range_hint(include_eol),
         );
     }
 
@@ -628,6 +666,93 @@ pub fn expand_kernel_range(start: &str, end: &str, cli_label: &str) -> Result<Ve
         list = versions.join(", "),
     );
     Ok(versions)
+}
+
+/// Version-comparison key: `(major, minor, patch, rc)`, ordered so a
+/// release (rc slot `u64::MAX`) sorts above its own release candidates.
+type VersionKey = (u64, u64, u64, u64);
+
+/// Decompose a range's `start` / `end` endpoints into comparison keys,
+/// widening a 2-component `MAJOR.MINOR` END to cover its whole series.
+///
+/// [`decompose_version_for_compare`](crate::kernel_path::decompose_version_for_compare)
+/// maps a missing patch to 0, so a 2-component END like `6.14` becomes
+/// `(6, 14, 0, u64::MAX)` — which as an inclusive upper bound would
+/// exclude every `6.14.N` (N >= 1), since `(6,14,N,MAX) > (6,14,0,MAX)`.
+/// But a `MAJOR.MINOR` END names the whole END series, not just its `.0`
+/// release, so its patch and rc slots are widened to `u64::MAX` to make
+/// the END series-inclusive. This matches START, whose 2-component form
+/// is already series-inclusive because `.0` is the series floor. An
+/// explicit-patch END (`6.14.2`) or an `-rc` END keeps its exact bound.
+///
+/// The END widening is delegated to
+/// [`crate::kernel_path::range_end_key`], which
+/// [`crate::kernel_path::KernelId::validate`] ALSO uses for its
+/// inversion check — so the pre-expansion validation and the expansion
+/// agree on where a range ends (a valid same-series spelling like
+/// `6.14.5..6.14` is not falsely rejected as inverted).
+///
+/// Pure — no I/O — so the endpoint-widening is unit-testable. Errors
+/// name the offending endpoint with the accepted grammar.
+fn range_bounds(start: &str, end: &str) -> Result<(VersionKey, VersionKey)> {
+    use crate::kernel_path::{decompose_version_for_compare, range_end_key};
+
+    let start_key = decompose_version_for_compare(start).ok_or_else(|| {
+        anyhow!(
+            "kernel range start `{start}` is not a parseable version. \
+             Endpoints must match `MAJOR.MINOR[.PATCH][-rcN]`."
+        )
+    })?;
+    let end_key = range_end_key(end).ok_or_else(|| {
+        anyhow!(
+            "kernel range end `{end}` is not a parseable version. \
+             Endpoints must match `MAJOR.MINOR[.PATCH][-rcN]`."
+        )
+    })?;
+    Ok((start_key, end_key))
+}
+
+/// The `--include-eol` hint appended to the empty-range error, present
+/// only when the flag was NOT set — setting it already consulted the
+/// EOL mirror, so suggesting it again would be misleading. Split out so
+/// the conditional is unit-testable without a network round-trip.
+fn empty_range_hint(include_eol: bool) -> &'static str {
+    if include_eol {
+        ""
+    } else {
+        " Pass --include-eol to also expand EOL series absent from releases.json."
+    }
+}
+
+/// Combine the maintained (releases.json) versions with the optional
+/// EOL mirror tags into the final expanded set.
+///
+/// Pure — the I/O-free core of [`expand_kernel_range`]'s selection,
+/// split out so the union / best-data-wins / EOL-fallback behavior is
+/// unit-testable without the network. When `include_eol` is false the
+/// maintained set is returned verbatim. When true, the maintained set is
+/// unioned with `mirror_tags` (`None` = the mirror ls-remote failed, so
+/// fall back to the maintained set alone) and
+/// [`select_series_latest_in_range`] re-selects the highest patch per
+/// `(major, minor)` across BOTH sources — so a mirror patch newer than
+/// releases.json wins, and a stale mirror never regresses a maintained
+/// version.
+fn combine_range_versions(
+    maintained: Vec<String>,
+    mirror_tags: Option<&[String]>,
+    start_key: VersionKey,
+    end_key: VersionKey,
+    include_eol: bool,
+) -> Vec<String> {
+    if !include_eol {
+        return maintained;
+    }
+    let Some(tags) = mirror_tags else {
+        return maintained;
+    };
+    let mut all = maintained;
+    all.extend(select_series_latest_in_range(tags, start_key, end_key));
+    select_series_latest_in_range(&all, start_key, end_key)
 }
 
 /// Filter [`Release`](crate::fetch::Release) rows to stable+longterm
@@ -642,12 +767,12 @@ pub fn expand_kernel_range(start: &str, end: &str, cli_label: &str) -> Result<Ve
 /// `active_prefixes_from_releases` split applied above.
 fn filter_and_sort_range(
     releases: &[crate::fetch::Release],
-    start_key: (u64, u64, u64, u64),
-    end_key: (u64, u64, u64, u64),
+    start_key: VersionKey,
+    end_key: VersionKey,
 ) -> Vec<String> {
     use crate::kernel_path::decompose_version_for_compare;
 
-    let mut selected: Vec<(String, (u64, u64, u64, u64))> = Vec::new();
+    let mut selected: Vec<(String, VersionKey)> = Vec::new();
     for r in releases {
         if r.moniker != "stable" && r.moniker != "longterm" {
             continue;
@@ -664,58 +789,149 @@ fn filter_and_sort_range(
     selected.into_iter().map(|(v, _)| v).collect()
 }
 
-/// Resolve a `git+URL#REF` kernel spec to a cache-entry directory.
+/// From release version strings (`X.Y.Z`), take the latest patch of each
+/// `(major, minor)` series inside `[start_key, end_key]`, dropping
+/// `-rc*` pre-releases, sorted ascending by version tuple.
+///
+/// Pure — the `--include-eol` counterpart to [`filter_and_sort_range`],
+/// run over the gregkh stable-mirror tags
+/// ([`crate::fetch::cached_stable_tags`]) unioned with the releases.json
+/// versions so an EOL series (dropped from releases.json) still
+/// contributes its highest point release. Uses the SAME
+/// `[start_key, end_key]` tuple bounds as `filter_and_sort_range`, so
+/// maintained and EOL series expand identically.
+fn select_series_latest_in_range(
+    versions: &[String],
+    start_key: VersionKey,
+    end_key: VersionKey,
+) -> Vec<String> {
+    use crate::kernel_path::decompose_version_for_compare;
+    use std::collections::HashMap;
+
+    // (major, minor) -> (patch, version string) of the highest release.
+    let mut best: HashMap<(u64, u64), (u64, String)> = HashMap::new();
+    for v in versions {
+        let Some(key) = decompose_version_for_compare(v) else {
+            continue;
+        };
+        // Drop pre-releases: a release maps its rc slot to u64::MAX (see
+        // decompose_version_for_compare), so `key.3 != MAX` marks an
+        // `-rcN` tag.
+        if key.3 != u64::MAX {
+            continue;
+        }
+        if key < start_key || key > end_key {
+            continue;
+        }
+        let series = (key.0, key.1);
+        let patch = key.2;
+        match best.get(&series) {
+            Some((p, _)) if *p >= patch => {}
+            _ => {
+                best.insert(series, (patch, v.clone()));
+            }
+        }
+    }
+    let mut out: Vec<(VersionKey, String)> = best
+        .into_values()
+        .map(|(_, v)| {
+            let key = decompose_version_for_compare(&v).expect("re-parses: it parsed once above");
+            (key, v)
+        })
+        .collect();
+    out.sort_by_key(|(k, _)| *k);
+    out.into_iter().map(|(_, v)| v).collect()
+}
+
+/// Resolve a `git+URL#tag=/#branch=/#sha=` kernel spec to a cache-entry
+/// directory.
 ///
 /// Mirrors [`download_and_cache_version`] for the git source path. To
-/// avoid an unconditional clone, it FIRST ls-remote-resolves `REF` to
-/// its tip commit (no clone, no working tree — see
-/// [`crate::fetch::ls_remote_commit_hash`]) and probes the cache for the
-/// key that resolution produces ([`crate::fetch::git_cache_key`]); on a
-/// hit it returns the cached entry WITHOUT cloning. On a cache miss — or
-/// any ls-remote failure (network, auth, an unadvertised ref), which is
-/// non-fatal — it shallow-clones into a temp directory via
-/// [`crate::fetch::git_clone`], re-checks the cache (the clone resolves
-/// the tip authoritatively), and on miss delegates to
-/// [`kernel_build_pipeline`] for configure/build/validate/cache. Returns
-/// the cache entry directory path — the same shape
-/// `download_and_cache_version` returns and callers feed into the
-/// [`crate::KTSTR_KERNEL_ENV`] export.
+/// avoid an unconditional fetch, it FIRST resolves `git_ref` to its
+/// commit via a KIND-directed ls-remote (a `Sha` resolves offline; a
+/// `Tag`/`Branch` matches its fully-qualified ref so a tag never aliases
+/// a same-named branch — see `crate::fetch::resolve_ref_commit`) and
+/// probes the cache for the key that resolution produces
+/// (`crate::fetch::git_cache_key`); on a hit it returns the cached
+/// entry WITHOUT any download.
 ///
-/// The cache key embeds `REF` verbatim alongside the resolved tip
-/// `short_hash`, so two invocations with identical-sha-different-`REF`
-/// spellings remain distinct cache entries (collapsing those to one is
-/// separate future work — see [`crate::kernel_path::KernelId::Git`]).
+/// On a cache miss the fetch is routed by source:
+/// - **GitHub** (`github.com/OWNER/REPO`, via
+///   `crate::fetch::github_archive_url`): a codeload `tar.gz` snapshot
+///   of the RESOLVED COMMIT (`crate::fetch::download_github_archive`) —
+///   no clone, and the exact-commit snapshot matches the cache key even
+///   if a branch tip advances between the ls-remote probe and the GET.
+/// - **Non-GitHub, or a ref whose ls-remote resolution failed**: a
+///   kind-directed shallow clone into a temp directory
+///   (`crate::fetch::git_clone_kinded` → `git_clone_tag` for a tag,
+///   `git_clone` for a branch; a `sha` is unsupported off GitHub). The
+///   clone resolves the tip authoritatively, catching a hit the
+///   ls-remote probe missed.
+///
+/// On a final miss it delegates to [`kernel_build_pipeline`] for
+/// configure/build/validate/cache. Returns the cache entry directory
+/// path — the same shape `download_and_cache_version` returns and
+/// callers feed into the [`crate::KTSTR_KERNEL_ENV`] export.
+///
+/// The cache key embeds `git_ref` verbatim (`/` and `..` sanitized —
+/// see `crate::fetch::git_cache_key`) alongside the resolved commit's
+/// full 40-hex hash, so two invocations with
+/// identical-sha-different-`git_ref` spellings remain distinct cache
+/// entries (collapsing those to one is separate future work — see
+/// [`crate::kernel_path::KernelId::Git`]).
 ///
 /// `cli_label` matches the contract the sibling helpers
 /// (`download_and_cache_version`, `resolve_kernel_dir`) use:
 /// it prefixes diagnostic status output and is threaded into
 /// [`kernel_build_pipeline`].
 ///
-/// `mp` is the progress group the clone bar is added to (the parallel
-/// resolve's shared group). Forwarded to [`crate::fetch::git_clone`];
-/// `None` disables the bar.
+/// `mp` is the progress group the download/clone bar is added to (the
+/// parallel resolve's shared group). Forwarded to the codeload download
+/// and the clone; `None` disables the bar.
+///
+/// Build flags shared with `cargo ktstr kernel build --kernel git+…`:
+/// `force` skips both cache probes so the ref is refetched and rebuilt;
+/// `clean`, `cpu_cap`, and `extra_kconfig` thread into
+/// [`kernel_build_pipeline`] (an `extra_kconfig` fragment also appends
+/// its `-xkc{hash}` suffix to the cache key so an extras build lands a
+/// distinct slot). The auto-discovery test path passes `false` / `None`
+/// for all four; only `kernel build` populates them.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_git_kernel(
     url: &str,
     git_ref: &str,
+    ref_kind: crate::kernel_path::GitRefKind,
     cli_label: &str,
     mp: Option<&crate::cli::FetchProgress>,
+    force: bool,
+    clean: bool,
+    cpu_cap: Option<crate::cli::CpuCap>,
+    extra_kconfig: Option<&str>,
 ) -> Result<std::path::PathBuf> {
-    // Open the cache once: reused by the pre-clone ls-remote probe, the
-    // post-clone lookup, and the build pipeline below.
+    // Open the cache once: reused by the pre-fetch ls-remote probe, the
+    // post-fetch lookup, and the build pipeline below.
     let cache = crate::cache::CacheDir::new()?;
 
-    // Probe the cache BEFORE the expensive full clone: ls-remote
-    // resolves `git_ref` to its tip commit hash, which with the raw
-    // `git_ref` keys the same entry `git_clone` would write — a hit
-    // returns without cloning. ls-remote failure is non-fatal: fall
-    // through to the clone, which resolves the tip authoritatively (and
-    // surfaces a clearer error if the remote is genuinely unreachable).
-    if let Some(commit_hash) = crate::fetch::ls_remote_commit_hash(url, git_ref) {
-        let cache_key = crate::fetch::git_cache_key(git_ref, &commit_hash);
+    // Resolve `git_ref` to its commit BEFORE the expensive fetch, using
+    // a KIND-directed ls-remote (a tag never aliases a same-named
+    // branch). With `git_ref` this keys the same entry the fetch would
+    // write, so a cache hit returns without any download. `Sha` resolves
+    // offline; a `Tag`/`Branch` ls-remote failure is non-fatal for the
+    // clone path (the clone resolves the tip authoritatively) but is
+    // fatal for the codeload path (below), which has no `.git` to read
+    // the commit back from.
+    let commit = crate::fetch::resolve_ref_commit(url, git_ref, ref_kind);
+    // `--force` skips the pre-fetch probe so the ref is always refetched
+    // and rebuilt. The `-xkc{hash}` suffix folds `--extra-kconfig` into
+    // the key so an extras build probes its own slot, not the baked-only
+    // one.
+    if !force && let Some(commit_hash) = &commit {
+        let mut cache_key = crate::fetch::git_cache_key(git_ref, commit_hash);
+        crate::cli::append_extra_kconfig_suffix(&mut cache_key, extra_kconfig);
         if let Some(entry) = cache_lookup(&cache, &cache_key, cli_label) {
             // Full hash keys the entry; show the familiar 7-hex prefix.
             let short = &commit_hash[..7.min(commit_hash.len())];
-            let msg = format!("{cli_label}: git+{url}#{git_ref} -> {short} cached; skipping clone");
+            let msg = format!("{cli_label}: git+{url} -> {short} cached; skipping fetch");
             match mp {
                 Some(fp) => fp.println(&msg),
                 None => eprintln!("{msg}"),
@@ -725,24 +941,71 @@ pub fn resolve_git_kernel(
     }
 
     let tmp_dir = tempfile::TempDir::new()?;
-    let acquired = crate::fetch::git_clone(url, git_ref, tmp_dir.path(), cli_label, mp)?;
+    // GitHub sources download the RESOLVED COMMIT's codeload `tar.gz`
+    // snapshot — no clone, and the exact-commit snapshot matches the
+    // cache key even if a branch tip advances mid-resolve.
+    // `github_archive_url` returns None for a non-GitHub URL. A ref that
+    // did not resolve to a commit (a `Tag`/`Branch` ls-remote failure —
+    // a `Sha` resolves offline, so it is never `None` here) has no
+    // codeload URL and falls through to the kind-directed clone, which
+    // resolves the tip authoritatively.
+    let github_archive = commit
+        .as_deref()
+        .and_then(|c| crate::fetch::github_archive_url(url, c));
+    let mut acquired = if let Some(archive_url) = github_archive {
+        let commit_hash = commit
+            .as_deref()
+            .expect("commit present — the archive URL was built from it");
+        crate::fetch::download_github_archive(
+            crate::fetch::shared_client(),
+            &archive_url,
+            git_ref,
+            commit_hash,
+            tmp_dir.path(),
+            cli_label,
+            mp,
+        )?
+    } else {
+        crate::fetch::git_clone_kinded(url, git_ref, ref_kind, tmp_dir.path(), cli_label, mp)?
+    };
+    // Fold --extra-kconfig into the fetched key so the post-fetch probe
+    // and the pipeline's cache store target the extras-aware slot
+    // (mirrors kernel_build_one). A no-op when extra_kconfig is None.
+    crate::cli::append_extra_kconfig_suffix(&mut acquired.cache_key, extra_kconfig);
 
-    // Re-check the cache post-clone: the clone resolves the tip
-    // authoritatively, catching a hit the ls-remote probe missed (a
-    // ref-name resolution difference, or a probe that failed) so an
-    // unchanged tip still skips the rebuild.
-    if let Some(entry) = cache_lookup(&cache, &acquired.cache_key, cli_label) {
+    // Re-check the cache post-fetch (skipped under --force): the clone
+    // resolves the tip authoritatively, catching a hit the ls-remote
+    // probe missed (a ref-name resolution difference, or a probe that
+    // failed) so an unchanged tip still skips the rebuild. (The codeload
+    // path's key is already the probe key, so this is a no-op there.)
+    if !force && let Some(entry) = cache_lookup(&cache, &acquired.cache_key, cli_label) {
         return Ok(entry.path);
     }
 
-    // is_local_source = false: a freshly cloned tree is treated the
-    // same as a tarball download — no `make mrproper` skip-warning,
-    // no compile_commands.json generation (acquired.is_temp gates
-    // that inside the pipeline).
-    // extra_kconfig = None: this entry path serves auto-discovery
-    // (cargo ktstr test/coverage/llvm-cov), which doesn't expose
-    // `--extra-kconfig`. The flag is `cargo ktstr kernel build`-only.
-    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, false, None, None, mp)?;
+    // `--force` fail-fast: if tests are holding the cache-entry lock,
+    // bail with the PID list rather than silently waiting to stomp the
+    // in-use entry (mirrors kernel_build_one). The guard drops before
+    // the pipeline runs.
+    if force {
+        let _force_check = cache.try_acquire_exclusive_lock(&acquired.cache_key)?;
+    }
+
+    // is_local_source = false: a freshly cloned tree is treated the same
+    // as a tarball download — no `make mrproper` skip-warning, no
+    // compile_commands.json generation (acquired.is_temp gates that
+    // inside the pipeline). `clean`, `cpu_cap`, and `extra_kconfig` come
+    // from `cargo ktstr kernel build`; the auto-discovery test path
+    // passes false / None.
+    let result = kernel_build_pipeline(
+        &acquired,
+        &cache,
+        cli_label,
+        clean,
+        false,
+        cpu_cap,
+        extra_kconfig,
+        mp,
+    )?;
 
     match result.entry {
         Some(entry) => Ok(entry.path),
@@ -801,7 +1064,10 @@ pub struct KernelDirOutcome {
     ///   [`crate::fetch::compose_local_cache_key`]); boot image at
     ///   `<dir>/<image_name>`.
     /// - Dirty tree: canonical source-tree directory, boot image at
-    ///   `<dir>/arch/<arch>/boot/<image_name>`.
+    ///   `<dir>/arch/x86/boot/bzImage` (x86_64) or
+    ///   `<dir>/arch/arm64/boot/Image` (aarch64) — the kernel
+    ///   build-tree arch subdir (`x86`/`arm64`), not the
+    ///   arch_info() name (`x86_64`/`aarch64`).
     ///
     /// Both shapes are valid inputs to
     /// [`crate::kernel_path::find_image_in_dir`].
@@ -854,7 +1120,10 @@ pub struct KernelDirOutcome {
 ///     (`is_dirty` short-circuit at the cache-store boundary) and
 ///     returns the source-tree image. `outcome.dir` is the
 ///     canonical source-tree directory (boot image at
-///     `<source>/arch/<arch>/boot/<image_name>`),
+///     `<source>/arch/x86/boot/bzImage` (x86_64) or
+///     `<source>/arch/arm64/boot/Image` (aarch64) — the kernel
+///     build-tree arch subdir (`x86`/`arm64`), not the
+///     arch_info() name),
 ///     `outcome.cache_hit` is `None`, `outcome.is_dirty` is
 ///     `true`. Callers use the dirty flag to mark the run as
 ///     non-reproducible in test reports — e.g. `cargo-ktstr`'s
@@ -1325,10 +1594,231 @@ mod tests {
         assert_eq!(out, vec!["6.14.0".to_string(), "6.14.5".to_string()]);
     }
 
+    /// `select_series_latest_in_range` keeps only the highest patch of
+    /// each `(major, minor)` series — the `--include-eol` path collapses
+    /// a mirror's full per-series tag history to one release per series.
+    #[test]
+    fn select_series_latest_in_range_picks_highest_patch_per_series() {
+        use crate::kernel_path::decompose_version_for_compare;
+        let versions = vec![
+            "6.11.0".to_string(),
+            "6.11.5".to_string(),
+            "6.11.2".to_string(),
+            "6.12.0".to_string(),
+            "6.12.10".to_string(),
+            "6.13.1".to_string(),
+        ];
+        let start_key = decompose_version_for_compare("6.10").unwrap();
+        let end_key = decompose_version_for_compare("6.16").unwrap();
+        let out = select_series_latest_in_range(&versions, start_key, end_key);
+        assert_eq!(
+            out,
+            vec![
+                "6.11.5".to_string(),
+                "6.12.10".to_string(),
+                "6.13.1".to_string()
+            ],
+            "one release per series, highest patch, ascending",
+        );
+    }
+
+    /// `-rc` pre-releases are dropped: a release maps its rc slot to
+    /// `u64::MAX`, so `key.3 != MAX` marks an rc, which the selector
+    /// skips (mirrors the moniker filter on the non-EOL path).
+    #[test]
+    fn select_series_latest_in_range_drops_rc() {
+        use crate::kernel_path::decompose_version_for_compare;
+        let versions = vec![
+            "6.12.5".to_string(),
+            "6.16-rc1".to_string(),
+            "6.13.2".to_string(),
+        ];
+        let start_key = decompose_version_for_compare("6.10").unwrap();
+        let end_key = decompose_version_for_compare("6.20").unwrap();
+        let out = select_series_latest_in_range(&versions, start_key, end_key);
+        assert_eq!(
+            out,
+            vec!["6.12.5".to_string(), "6.13.2".to_string()],
+            "rc tag must be excluded",
+        );
+    }
+
+    /// Bounds are honored: series below `start_key` or above `end_key`
+    /// are dropped, matching `filter_and_sort_range`'s interval so the
+    /// EOL and maintained sets expand over the same span.
+    #[test]
+    fn select_series_latest_in_range_respects_bounds() {
+        use crate::kernel_path::decompose_version_for_compare;
+        let versions = vec![
+            "6.9.9".to_string(),
+            "6.12.5".to_string(),
+            "6.20.0".to_string(),
+        ];
+        let start_key = decompose_version_for_compare("6.10").unwrap();
+        let end_key = decompose_version_for_compare("6.16").unwrap();
+        let out = select_series_latest_in_range(&versions, start_key, end_key);
+        assert_eq!(out, vec!["6.12.5".to_string()]);
+    }
+
+    /// Unparseable tag strings are dropped rather than aborting the
+    /// whole expansion (a mirror may carry non-version tags).
+    #[test]
+    fn select_series_latest_in_range_drops_unparseable() {
+        use crate::kernel_path::decompose_version_for_compare;
+        let versions = vec![
+            "6.12.5".to_string(),
+            "embargoed-cve-tag".to_string(),
+            "6.13.0".to_string(),
+        ];
+        let start_key = decompose_version_for_compare("6.10").unwrap();
+        let end_key = decompose_version_for_compare("6.16").unwrap();
+        let out = select_series_latest_in_range(&versions, start_key, end_key);
+        assert_eq!(out, vec!["6.12.5".to_string(), "6.13.0".to_string()]);
+    }
+
+    /// `range_bounds` widens a 2-component `MAJOR.MINOR` END to the
+    /// whole series (patch/rc → u64::MAX) while START keeps its natural
+    /// `.0` floor — the task-that-makes-`6.11..6.14`-cover-`6.14.x` pin.
+    #[test]
+    fn range_bounds_widens_two_component_end() {
+        let (start_key, end_key) = range_bounds("6.11", "6.14").expect("valid endpoints");
+        assert_eq!(start_key, (6, 11, 0, u64::MAX), "START floor is .0");
+        assert_eq!(
+            end_key,
+            (6, 14, u64::MAX, u64::MAX),
+            "2-component END widened to series ceiling",
+        );
+    }
+
+    /// An explicit-patch END is an exact bound, NOT widened.
+    #[test]
+    fn range_bounds_three_component_end_is_exact() {
+        let (_, end_key) = range_bounds("6.11", "6.14.2").expect("valid endpoints");
+        assert_eq!(end_key, (6, 14, 2, u64::MAX), "explicit patch is exact");
+    }
+
+    /// An `-rc` END keeps its exact rc bound (not widened).
+    #[test]
+    fn range_bounds_rc_end_is_exact() {
+        let (_, end_key) = range_bounds("6.11", "6.16-rc3").expect("valid endpoints");
+        assert_eq!(end_key, (6, 16, 0, 3), "rc END keeps its rc slot");
+    }
+
+    /// `range_bounds` rejects unparseable endpoints (both sides).
+    #[test]
+    fn range_bounds_rejects_unparseable() {
+        assert!(range_bounds("garbage", "6.14").is_err());
+        assert!(range_bounds("6.10", "garbage").is_err());
+    }
+
+    /// End-to-end of the widening: with `range_bounds("6.11","6.14")`,
+    /// `select_series_latest_in_range` keeps the HIGHEST 6.14 patch, not
+    /// just `6.14.0`. This is the regression pin for the END series being
+    /// series-inclusive (the `6.11..6.14 → whole 6.14 series` fix).
+    #[test]
+    fn range_bounds_end_series_covers_high_patch() {
+        let (start_key, end_key) = range_bounds("6.11", "6.14").expect("valid endpoints");
+        let versions = vec![
+            "6.11.0".to_string(),
+            "6.14.0".to_string(),
+            "6.14.9".to_string(),
+        ];
+        let out = select_series_latest_in_range(&versions, start_key, end_key);
+        assert_eq!(
+            out,
+            vec!["6.11.0".to_string(), "6.14.9".to_string()],
+            "END series contributes its HIGHEST patch, not just .0",
+        );
+    }
+
+    /// `combine_range_versions` with `include_eol=false` returns the
+    /// maintained set verbatim, ignoring any mirror tags.
+    #[test]
+    fn combine_range_versions_ignores_mirror_when_eol_off() {
+        let (start_key, end_key) = range_bounds("6.10", "6.20").unwrap();
+        let maintained = vec!["6.11.5".to_string()];
+        let tags = vec!["6.12.10".to_string()];
+        let out = combine_range_versions(
+            maintained.clone(),
+            Some(tags.as_slice()),
+            start_key,
+            end_key,
+            false,
+        );
+        assert_eq!(out, maintained, "eol off must ignore mirror tags");
+    }
+
+    /// `--include-eol` union fills a releases.json gap with EOL series
+    /// from the mirror.
+    #[test]
+    fn combine_range_versions_union_fills_gap() {
+        let (start_key, end_key) = range_bounds("6.10", "6.14").unwrap();
+        let maintained = vec!["6.11.5".to_string()];
+        let tags = vec!["6.12.10".to_string(), "6.13.2".to_string()];
+        let out =
+            combine_range_versions(maintained, Some(tags.as_slice()), start_key, end_key, true);
+        assert_eq!(
+            out,
+            vec![
+                "6.11.5".to_string(),
+                "6.12.10".to_string(),
+                "6.13.2".to_string()
+            ],
+        );
+    }
+
+    /// Best-data-wins: the higher patch is kept regardless of which
+    /// source carries it (mirror newer than releases.json, and vice
+    /// versa — a stale mirror never regresses a maintained version).
+    #[test]
+    fn combine_range_versions_best_data_wins() {
+        let (start_key, end_key) = range_bounds("6.10", "6.20").unwrap();
+        // Mirror newer than releases.json.
+        let out = combine_range_versions(
+            vec!["6.14.5".to_string()],
+            Some(["6.14.9".to_string()].as_slice()),
+            start_key,
+            end_key,
+            true,
+        );
+        assert_eq!(out, vec!["6.14.9".to_string()], "mirror-newer wins");
+        // Stale mirror must not regress the maintained version.
+        let out = combine_range_versions(
+            vec!["6.14.9".to_string()],
+            Some(["6.14.5".to_string()].as_slice()),
+            start_key,
+            end_key,
+            true,
+        );
+        assert_eq!(
+            out,
+            vec!["6.14.9".to_string()],
+            "stale mirror never regresses"
+        );
+    }
+
+    /// Mirror-fetch failure (`None`) with `include_eol=true` falls back
+    /// to the maintained set alone.
+    #[test]
+    fn combine_range_versions_mirror_failure_falls_back() {
+        let (start_key, end_key) = range_bounds("6.10", "6.20").unwrap();
+        let maintained = vec!["6.11.5".to_string()];
+        let out = combine_range_versions(maintained.clone(), None, start_key, end_key, true);
+        assert_eq!(out, maintained, "mirror failure falls back to maintained");
+    }
+
+    /// The empty-range `--include-eol` hint fires only when the flag was
+    /// NOT set (setting it already consulted the mirror).
+    #[test]
+    fn empty_range_hint_only_when_flag_unset() {
+        assert!(empty_range_hint(false).contains("--include-eol"));
+        assert_eq!(empty_range_hint(true), "");
+    }
+
     /// expand_kernel_range rejects unparseable start endpoint.
     #[test]
     fn expand_kernel_range_rejects_unparseable_start() {
-        let err = expand_kernel_range("garbage", "6.14", "ktstr-test")
+        let err = expand_kernel_range("garbage", "6.14", "ktstr-test", false)
             .expect_err("unparseable start must error");
         let msg = format!("{err:#}");
         assert!(msg.contains("kernel range start `garbage`"));
@@ -1336,7 +1826,7 @@ mod tests {
 
     #[test]
     fn expand_kernel_range_rejects_unparseable_end() {
-        let err = expand_kernel_range("6.10", "garbage", "ktstr-test")
+        let err = expand_kernel_range("6.10", "garbage", "ktstr-test", false)
             .expect_err("unparseable end must error");
         let msg = format!("{err:#}");
         assert!(msg.contains("kernel range end `garbage`"));

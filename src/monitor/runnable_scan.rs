@@ -5,15 +5,18 @@
 //!
 //! 1. **Global `scx_tasks` walk** (`max_runnable_age_global`): every
 //!    scx-managed task is linked into the kernel's global `scx_tasks`
-//!    LIST_HEAD (`kernel/sched/ext.c:47`) via
-//!    `task_struct.scx.tasks_node` at `scx_init_task`
-//!    (`kernel/sched/ext.c:3742`); they leave at `sched_ext_dead`
-//!    (`kernel/sched/ext.c:3803`). The walker recovers each
+//!    LIST_HEAD (`kernel/sched/ext.c:48`) via
+//!    `task_struct.scx.tasks_node` at `scx_post_fork`
+//!    (`kernel/sched/ext.c:3808`); they leave at `sched_ext_dead`
+//!    (`kernel/sched/ext.c:3858`). The walker recovers each
 //!    `task_struct` KVA via container_of on `task.scx +
 //!    see.tasks_node`, reads `task_struct.scx.runnable_at`, and
 //!    skips entries that are not `SCX_TASK_QUEUED` (the kernel
-//!    re-stamps `runnable_at` on every enqueue, so an unqueued task
-//!    on this list carries a stale stamp from its last enqueue) AND
+//!    refreshes `runnable_at` only at the next `set_task_runnable`
+//!    when `SCX_TASK_RESET_RUNNABLE_AT` is set; a dequeue via
+//!    `ops_dequeue` -> `clr_task_runnable(_, false)` leaves
+//!    `runnable_at` untouched, so an unqueued task on this list
+//!    carries a stale stamp from its last runnable window) AND
 //!    skips entries that have `SCX_TASK_RESET_RUNNABLE_AT` set (the
 //!    kernel marks the stamp stale via `clr_task_runnable` and does
 //!    not refresh it until the next `set_task_runnable`). The
@@ -21,7 +24,7 @@
 //!    `scx_root_disable` (`kernel/sched/ext.c`), which iterates
 //!    `scx_task_iter_next_locked` and switches each task's class
 //!    via `scx_disable_and_exit_task`. `scx_bypass`
-//!    (`kernel/sched/ext.c:5304-5404`) only cycles tasks
+//!    (`kernel/sched/ext.c:5448-5548`) only cycles tasks
 //!    (DEQUEUE_SAVE | DEQUEUE_MOVE) on each per-rq `runnable_list`
 //!    so they remain on the list after — it does NOT drain.
 //!    Because `scx_bypass` is invoked at the start of
@@ -46,10 +49,10 @@
 //! 3. **`scx_watchdog_timestamp` heartbeat** (caller-resolved PA
 //!    passed to [`max_runnable_age`] as
 //!    `watchdog_timestamp_pa`): the file-scope static
-//!    `scx_watchdog_timestamp` (`kernel/sched/ext.c:94`) is
+//!    `scx_watchdog_timestamp` (`kernel/sched/ext.c:93`) is
 //!    refreshed to `jiffies` by the workqueue callback
-//!    `scx_watchdog_workfn` (`kernel/sched/ext.c:3383`). The
-//!    kernel's `scx_tick` (`kernel/sched/ext.c:3409`) compares
+//!    `scx_watchdog_workfn` (`kernel/sched/ext.c:3473`). The
+//!    kernel's `scx_tick` (`kernel/sched/ext.c:3492`) compares
 //!    `jiffies - scx_watchdog_timestamp` against
 //!    `root->watchdog_timeout` and fires `SCX_EXIT_ERROR_STALL`
 //!    when the workqueue stops running. Reading the same global
@@ -89,7 +92,7 @@ use crate::monitor::btf_offsets::RunnableScanOffsets;
 
 /// `SCX_TASK_CURSOR` flag value (`1 << 31`) on `sched_ext_entity.flags`.
 /// Cursor entries are stack-allocated `sched_ext_entity` placeholders
-/// that `scx_task_iter_start` (`kernel/sched/ext.c:843-846`) inserts
+/// that `scx_task_iter_start` (`kernel/sched/ext.c:804-823`) inserts
 /// into `scx_tasks` to mark the iterator's progress; they are NOT
 /// embedded in any `task_struct` so the global walker must skip them
 /// to avoid container_of producing a bogus task KVA. Pinned per
@@ -146,10 +149,10 @@ const MAX_NODES: u32 = 65_536;
 ///    in `rq_pas`
 /// 3. the global `scx_watchdog_timestamp` heartbeat at
 ///    `watchdog_timestamp_pa` — `jiffies - timestamp` is the same
-///    quantity the kernel's `scx_tick` (`kernel/sched/ext.c:3409`)
+///    quantity the kernel's `scx_tick` (`kernel/sched/ext.c:3492`)
 ///    compares against `root->watchdog_timeout` to decide whether
 ///    to fire `SCX_EXIT_ERROR_STALL`. The workqueue callback
-///    `scx_watchdog_workfn` (`kernel/sched/ext.c:3383`) refreshes
+///    `scx_watchdog_workfn` (`kernel/sched/ext.c:3473`) refreshes
 ///    the timestamp; when the scheduler stops dispatching the
 ///    workqueue, the value goes stale and this walk returns the
 ///    growing age — catching the broader "scheduler stopped"
@@ -161,7 +164,7 @@ const MAX_NODES: u32 = 65_536;
 /// `watchdog_timestamp_pa` is `None` (caller lacks the symbol)
 /// or when the read returns 0 (unmapped guest memory) — the
 /// kernel initialises `scx_watchdog_timestamp = INITIAL_JIFFIES`
-/// (`kernel/sched/ext.c:94`), so a real-running guest never
+/// (`kernel/sched/ext.c:93`), so a real-running guest never
 /// shows 0; treating 0 as "no signal" avoids synthesising a
 /// spurious giant age out of an unmapped read.
 ///
@@ -209,7 +212,7 @@ pub fn max_runnable_age(
             // A zero read is an unmapped PA (GuestMem bounds-check
             // returned 0). The kernel initialises
             // `scx_watchdog_timestamp = INITIAL_JIFFIES`
-            // (`kernel/sched/ext.c:94`), which is non-zero, so a
+            // (`kernel/sched/ext.c:93`), which is non-zero, so a
             // real running guest never shows 0; treat it as
             // "no signal" rather than synthesise `jiffies` of age.
             //
@@ -282,8 +285,10 @@ pub fn max_runnable_age(
 /// `saturating_sub` clamps a future-runnable_at down to 0).
 ///
 /// Tasks whose `runnable_at == 0` are skipped without contributing
-/// to max — kernel-side `runnable_at` is zero between slab
-/// allocation and the first `set_task_runnable` call, and treating
+/// to max — kernel-side `runnable_at` is zero only when neither
+/// `init_scx_entity` (entity init) nor `set_task_runnable` has
+/// stamped it — a torn/zeroed read or a task not yet initialized —
+/// and treating
 /// that as age-from-zero would synthesize spurious multi-day
 /// stalls. Cursor entries (`SCX_TASK_CURSOR` flag set on the
 /// enclosing `sched_ext_entity.flags`) are skipped without

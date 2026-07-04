@@ -82,11 +82,11 @@ const DEFAULT_MAX_LINES: usize = 3000;
 /// virtio_blk-device, plus eval / fetch / scx_walker / host_context /
 /// initramfs / ops-mod reductions) and re-pinned to current counts for
 /// files that grew or are newly over the limit. Refresh per the drain
-/// protocol; entries shrink toward zero as files are split. Entries
-/// carrying a `// queued:` note grew from in-file test-module additions
-/// and are pinned with their split target rather than loosened silently;
-/// landing each split (moving the inline `#[cfg(test)]` mod into a
-/// sibling `tests.rs`) drains the entry.
+/// protocol; entries shrink toward zero as files are split. An entry
+/// carrying a `// queued:` note is pinned with its split target
+/// rather than loosened silently; the note names the remediation, and
+/// splitting the file until it falls below `DEFAULT_MAX_LINES` drains
+/// the entry.
 const EXCEPTIONS: &[(&str, usize)] = &[
     ("vmm/freeze_coord/mod.rs", 13531),
     ("scenario/ops/tests.rs", 9486),
@@ -199,9 +199,11 @@ fn no_src_file_exceeds_3000_lines_unless_grandfathered() {
                 }
                 // Drain signal (lines <= DEFAULT_MAX_LINES on a
                 // grandfathered file) is handled in the post-walk
-                // pass below — it covers BOTH the "shrank past the
-                // limit" case and the "file was deleted" case under
-                // a single stale-entry banner.
+                // pass below. The "shrank below the limit" case
+                // surfaces only under the stale-entry banner (3);
+                // the "file was deleted" case surfaces under both
+                // banner (3) (stale entry) and banner (4)
+                // (unreached key).
             }
             None => {
                 if lines > DEFAULT_MAX_LINES {

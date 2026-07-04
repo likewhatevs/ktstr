@@ -345,7 +345,8 @@ impl WorkloadConfig {
     /// 1. `num_workers > 0` on the primary group and on every
     ///    composed [`WorkSpec`] entry — zero workers emit no
     ///    `WorkerReport`s and downstream assertions would vacuously
-    ///    pass. Composed entries also route through `spawn_composed`
+    ///    pass. Composed entries also route through
+    ///    `WorkloadHandle::spawn` (via `GroupParams::from_composed`)
     ///    directly, bypassing the scenario-engine's
     ///    `resolve_num_workers` resolver, so the gate must live
     ///    here to catch `composed[i].num_workers=0` before the spawn
@@ -400,8 +401,9 @@ impl WorkloadConfig {
             );
         }
         for (idx, spec) in self.composed.iter().enumerate() {
-            // composed entries route through `spawn_composed` directly,
-            // bypassing the scenario engine's `resolve_num_workers` —
+            // composed entries route through `WorkloadHandle::spawn`
+            // (via `GroupParams::from_composed`) directly, bypassing
+            // the scenario engine's `resolve_num_workers` —
             // the gate must live here for the spawn entry to catch
             // composed[i].num_workers=0 before forking.
             if spec.num_workers == Some(0) {

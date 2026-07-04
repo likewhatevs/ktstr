@@ -20,7 +20,8 @@ fn host_cgroup_contention_steps(ctx: &Ctx) -> Vec<Step> {
 }
 
 /// Two managed cgroups with host-level contention from workers in the
-/// parent cgroup. Spawns `total_cpus` workers outside any managed cgroup
+/// test runner's own cgroup (`SpawnPlacement::RunnerCgroup`, typically
+/// the root cgroup). Spawns `total_cpus` workers outside any managed cgroup
 /// alongside two default cgroups.
 pub fn custom_host_cgroup_contention(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, host_cgroup_contention_steps(ctx))
@@ -68,8 +69,13 @@ pub fn custom_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
 /// (`scx_ops_disable`) bypass-drain has trivially few runnable tasks to
 /// migrate. Both death paths funnel through the same drain: an `scx_bpf_error`
 /// crash (host-injected via `bpf_map_write`, fires on any `ktstr_dispatch`
-/// call) AND a watchdog stall (`--stall-after`, which fires
-/// `SCX_EXIT_ERROR_STALL` on the scheduler's internal timer). A heavy runnable
+/// call) AND a watchdog stall (`--stall-after`, which the kernel's
+/// per-rq sched_ext watchdog fires: `scx_watchdog_workfn`'s delayed
+/// workqueue runs `check_rq_for_timeouts` (kernel/sched/ext.c), which
+/// calls `scx_exit(..., SCX_EXIT_ERROR_STALL, ...)` once a runnable
+/// task exceeds `watchdog_timeout`). The scheduler only stops
+/// dispatching under `--stall-after` (`if (stall) return;`); it runs
+/// no timer of its own. A heavy runnable
 /// workload (e.g. [`custom_sched_mixed`]'s 12 SpinWait tasks) triggers the
 /// Linux 6.14 per-node global-DSQ bypass-drain livelock, which strands the
 /// whole guest until the host watchdog fires; that livelock is fixed upstream

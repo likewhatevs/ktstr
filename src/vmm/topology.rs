@@ -44,13 +44,13 @@ pub struct NumaNode {
     /// HMAT access latency in nanoseconds. `None` uses the default
     /// (100ns for CPU-bearing, 300ns for memory-only). Emitted as
     /// an SLLBI access_latency entry in the HMAT table by
-    /// `write_hmat` in `x86_64/acpi.rs`. x86_64 only — aarch64 does
+    /// `write_hmat` in `x86_64/acpi/mod.rs`. x86_64 only — aarch64 does
     /// not expose an HMAT-equivalent to the guest.
     pub latency_ns: Option<u32>,
     /// HMAT read bandwidth in MB/s. `None` uses the default
     /// (51200 MB/s for CPU-bearing, 20480 MB/s for memory-only).
     /// Emitted as an SLLBI access_bandwidth entry in the HMAT table
-    /// by `write_hmat` in `x86_64/acpi.rs`. x86_64 only.
+    /// by `write_hmat` in `x86_64/acpi/mod.rs`. x86_64 only.
     pub bandwidth_mbs: Option<u32>,
     /// HMAT Type 2 memory-side cache. `None` means no cache entry
     /// is emitted for this node. x86_64 only.
@@ -382,7 +382,7 @@ impl Topology {
     /// Fallback topology used by
     /// [`Payload::topology`](crate::test_support::Payload::topology)
     /// for binary-kind payloads that have no scheduler-side topology
-    /// opinion. Matches the inline default previously baked into
+    /// opinion. Matches the inline default in
     /// [`KtstrTestEntry::DEFAULT`](crate::test_support::KtstrTestEntry::DEFAULT):
     /// 1 NUMA node / 1 LLC / 2 cores / 1 thread (2 CPUs total), the
     /// smallest VM shape that runs the harness meaningfully.

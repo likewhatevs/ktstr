@@ -452,7 +452,8 @@ pub(crate) fn cached_cast_analysis_for_scheduler(path: &Path) -> Option<Arc<Cast
 ///
 /// The dump renderer threads a single cast map (`cast_maps.first()`
 /// in the freeze coordinator) and the disk cache merges all objects
-/// into one (`get_full`); both are correct only when at most one
+/// into one (the `merged_for_cache` collapse in
+/// `cached_cast_analysis_for_scheduler`); both are correct only when at most one
 /// object carries casts. Per-object program BTFs each restart their
 /// user-type ids at `vmlinux_last + 1`, so the same
 /// `(parent_id, offset)` from two objects collides -- the merge
@@ -1057,7 +1058,7 @@ fn analyze_one_object_with_btf(obj_bytes: &[u8]) -> (CastMap, Option<Arc<Btf>>, 
     // every global subprog call as `BPF_PSEUDO_CALL` with
     // `imm = -1`, paired with a `STT_FUNC` relocation. The cast
     // analyzer's `caller_arg_types` mechanism (see
-    // [`crate::monitor::cast_analysis::Analyzer::analyze`])
+    // [`crate::monitor::cast_analysis::Analyzer::caller_arg_types`])
     // computes `callee_pc = pc + 1 + insn.imm`, so an unpatched
     // `imm == -1` resolves to `pc` (the call site itself) and
     // poisons the lookup table with bogus entries. Patching

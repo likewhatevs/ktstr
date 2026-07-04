@@ -3,6 +3,7 @@ use super::*;
 fn make_row(scenario: &str, topo: &str, passed: bool, spread: f64) -> GauntletRow {
     GauntletRow {
         scenario: scenario.into(),
+        perf_delta_assertions: Vec::new(),
         topology: topo.into(),
         work_type: "SpinWait".into(),
         scheduler: String::new(),
@@ -34,6 +35,25 @@ fn make_row(scenario: &str, topo: &str, passed: bool, spread: f64) -> GauntletRo
     }
 }
 
+/// Build a [`crate::assert::PhaseBucket`] for a step with the given per-metric
+/// values. Used by the per-phase noise tests (compare_core).
+fn make_phase_bucket(
+    step_index: u16,
+    label: &str,
+    metrics: &[(&str, f64)],
+) -> crate::assert::PhaseBucket {
+    let metrics_map = metrics.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    crate::assert::PhaseBucket {
+        per_cgroup: Default::default(),
+        step_index,
+        label: label.to_string(),
+        start_ms: 0,
+        end_ms: 100,
+        sample_count: 1,
+        metrics: metrics_map,
+    }
+}
+
 /// Helper that builds a `GauntletRow` with controllable
 /// scheduler / topology / work_type / kernel_version for the
 /// filter tests. The metric fields default to harmless
@@ -48,6 +68,7 @@ fn make_filter_row(
 ) -> GauntletRow {
     GauntletRow {
         scenario: scenario.into(),
+        perf_delta_assertions: Vec::new(),
         topology: topology.into(),
         work_type: work_type.into(),
         scheduler: scheduler.into(),

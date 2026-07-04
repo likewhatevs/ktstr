@@ -27,7 +27,7 @@ when relevant; the most common are:
 |---|---|
 | Error line | Test name, scheduler, failure reason. |
 | `--- stats ---` | Per-cgroup worker count, CPU count, spread, gap, migrations, iterations. |
-| `--- diagnostics ---` | Init stage classification, VM exit code, last 20 lines of kernel console. |
+| `--- diagnostics ---` | Init stage classification, VM exit code, and kernel console (last 20 lines, or the full console when a kernel `PANIC:` is detected). |
 | `--- timeline ---` | Kernel version, topology, scheduler, scenario duration, phase breakdown with monitor samples. |
 | `--- scheduler log ---` | Scheduler process stdout+stderr (cycle-collapsed). |
 | `--- monitor ---` | Host-side monitor: sample count, max imbalance ratio, max local-DSQ depth, stuck-CPU flag, average imbalance/nr_running/dsq-per-cpu, SCX event counters (`fallback`, `keep_last`, `offline`, plus conditional extras such as `reenq_immed`, `bypass_*`, `insert_not_owned`, `sub_bypass_dispatch`), optional schedstat deltas, per-BPF-program call count and ns/call, and the merged threshold verdict. |
@@ -59,7 +59,9 @@ The probe output shows each function in the crash chain with:
 
 After the probe data, the auto-repro section includes the repro VM
 duration and the last 40 lines of the repro VM's scheduler log
-(cycle-collapsed), sched_ext dump, and kernel console (dmesg). These
+(cycle-collapsed), sched_ext dump, the freeze-coordinator failure dump
+(BPF map state and vCPU registers, rendered inline when an error-class
+SCX exit fired during the repro run), and kernel console (dmesg). These
 supplement probe data when the crash produces sparse or no probe events.
 When probe data is absent, a crash reproduction status line replaces it.
 

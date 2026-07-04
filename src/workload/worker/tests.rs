@@ -513,6 +513,36 @@ fn set_sched_policy_batch_returns_valid_result() {
     }
 }
 #[test]
+fn set_sched_policy_ext_returns_valid_result() {
+    let pid: libc::pid_t = unsafe { libc::getpid() };
+    let result = set_sched_policy(pid, SchedPolicy::Ext);
+    // SCHED_EXT is a valid policy whenever the kernel has
+    // CONFIG_SCHED_CLASS_EXT, so `sched_setattr` succeeds whether or not
+    // a scheduler is attached (attached -> ext_sched_class; none -> fair
+    // via `task_should_scx` false). It is rejected only by EACCES (task
+    // carries scx.disallow) or by EINVAL on a kernel built WITHOUT
+    // CONFIG_SCHED_CLASS_EXT. The test tolerates both outcomes; it pins
+    // that the Ext arm issues the raw syscall and names it on failure
+    // (catching a wrong attr.size or a dropped sched_policy assignment).
+    match result {
+        Ok(()) => {
+            let pol = unsafe { libc::sched_getscheduler(pid) };
+            assert!(
+                pol >= 0,
+                "sched_getscheduler must return a valid policy, got {pol}",
+            );
+            restore_normal(pid);
+        }
+        Err(ref e) => {
+            let msg = format!("{e:#}");
+            assert!(
+                msg.contains("sched_setattr(SCHED_EXT)"),
+                "error must name the SCHED_EXT syscall: {msg}"
+            );
+        }
+    }
+}
+#[test]
 fn set_sched_policy_idle_returns_valid_result() {
     let pid: libc::pid_t = unsafe { libc::getpid() };
     let result = set_sched_policy(pid, SchedPolicy::Idle);
@@ -796,8 +826,9 @@ fn reservoir_push_uniform_sampling() {
 #[test]
 fn reservoir_push_cap_zero() {
     // Zero-capacity reservoir: buf.len() < 0 is never true (usize),
-    // falls through to else branch where random_range(0..1) returns 0,
-    // and 0 < 0 is false — sample is discarded.
+    // falls through to else branch where the xorshift64 draw is taken
+    // mod count (r % 1 == 0), and 0 < 0 (idx < cap) is false — sample
+    // is discarded.
     let mut buf = Vec::new();
     let mut count = 0u64;
     for i in 0..10 {

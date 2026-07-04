@@ -32,8 +32,9 @@ const MAX_NR_ZONES: usize = 5;
 ///
 /// Returns `None` when the `node_data` symbol is absent (UMA build,
 /// stripped vmlinux, or a kernel without `CONFIG_NUMA`), the BTF
-/// offsets failed to resolve (no `pglist_data` / `zone` types), or
-/// no node's `pglist_data` pointer was readable. A `None` return
+/// offsets failed to resolve (no `pglist_data` / `zone` types), the
+/// topology reports zero NUMA nodes, or no node's `pglist_data`
+/// pointer was readable. A `None` return
 /// leaves [`crate::monitor::dump::FailureDumpReport::per_node_numa`]
 /// empty and [`crate::monitor::dump::FailureDumpReport::per_node_numa_unavailable`]
 /// set to [`crate::monitor::dump::REASON_NO_NUMA_WALKER`].
@@ -181,7 +182,7 @@ mod tests {
             //   pglist_data_node_zones = 0x40
             //   zone_size              = 0x80
             //   zone_vm_numa_event     = 0x10
-            // Total pgdat size: 0x40 + MAX_NR_ZONES * 0x80 = 0x340.
+            // Total pgdat size: 0x40 + MAX_NR_ZONES * 0x80 = 0x2C0.
             let pglist_data_node_zones = 0x40usize;
             let zone_size = 0x80usize;
             let zone_vm_numa_event = 0x10usize;

@@ -96,7 +96,8 @@ impl NetTrafficSender {
     /// Bring the interface administratively up (`IFF_UP | IFF_RUNNING` via
     /// `SIOCSIFFLAGS`). Mandatory before TX: `packet_snd` rejects a down
     /// device with `-ENETDOWN` (`!(dev->flags & IFF_UP)`), and
-    /// `dev_queue_xmit`'s `netif_running` check is the deeper gate.
+    /// `__dev_queue_xmit` re-checks `!(dev->flags & IFF_UP)`
+    /// (`SKB_DROP_REASON_DEV_READY`) on the no-queue path.
     fn bring_up(&self, iface: &str) -> io::Result<()> {
         set_iface_up(self.fd, iface)
     }

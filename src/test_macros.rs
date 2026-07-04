@@ -277,7 +277,7 @@ mod tests {
 
     /// A typed HARD-FAIL host error is NOT in skip_on_contention!'s skip
     /// set: classify_host_error returns HostClass::Fail for a
-    /// CpuBudgetUnsatisfiable (an explicit cpu budget the host cannot
+    /// CpuBudgetUnsatisfiable (an operator --cpu-cap the host cannot
     /// satisfy), which the macro's `_ =>` arm panics — a typed hard-fail
     /// must never be swallowed as a skip. Pins the Fail->panic boundary the
     /// classify_host_error routing depends on; the skip tests cover the
@@ -288,7 +288,7 @@ mod tests {
     fn skip_on_contention_panics_on_typed_hard_fail() {
         fn skip_fn() {
             let err: anyhow::Error = anyhow::Error::new(CpuBudgetUnsatisfiable {
-                reason: "cpu_budget = 999 exceeds the allowed cpuset".into(),
+                reason: "--cpu-cap = 999 exceeds the allowed cpuset".into(),
             });
             let _: () = skip_on_contention!(Err::<(), _>(err));
         }

@@ -200,8 +200,8 @@ pub(crate) fn host_resource_snapshot() -> HostResourceSnapshot {
     // `near_limit` thresholds at 90% utilization — a soft tripwire
     // that surfaces "we're exhausted" without revealing the cap.
     // Both rlimits read here are SOFT caps (the first
-    // whitespace-separated value on the line); the kernel raises
-    // the hard cap on EMFILE before EAGAIN. The 90% threshold is
+    // whitespace-separated value on the line); the kernel returns
+    // EMFILE when the soft NOFILE cap is exceeded. The 90% threshold is
     // chosen so a routine test that fans out a few hundred fds
     // doesn't trip it, but a stuck-fd-leak hitting RLIMIT_NOFILE
     // does. Failure to read either limit (operator cgroup hiding
@@ -548,7 +548,7 @@ pub(crate) fn create_vm_with_retry(kvm: &kvm_ioctls::Kvm) -> Result<kvm_ioctls::
 mod tests {
     use super::*;
 
-    /// `host_resource_snapshot`'s [`Display`] impl must produce a
+    /// `host_resource_snapshot`'s [`std::fmt::Display`] impl must produce a
     /// single-line string naming the four key fields the operator
     /// needs when triaging a `ktstr: SKIP: resource contention:
     /// ...` banner: open-fd count, RSS, thread count, and a

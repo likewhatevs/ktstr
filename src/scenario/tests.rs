@@ -64,13 +64,14 @@ fn resolve_affinity_random_subset() {
     let cpusets: Vec<BTreeSet<usize>> = vec![[0, 1, 2, 3].into_iter().collect()];
     // Caller pre-builds the pool from topology; the resolver
     // intersects with the cgroup's cpuset so the effective sample
-    // pool stays within the cgroup's CPU budget. Sample size
-    // is half the cpuset (`(pool.len() / 2).max(1)`).
+    // pool stays within the cgroup's CPU budget. The resolver
+    // forwards the caller-supplied `count` verbatim (`count: *count`);
+    // this test passes count=2 explicitly.
     let intent = AffinityIntent::random_subset(t.all_cpus().iter().copied(), 2);
     match resolve_affinity_for_cgroup(&intent, cpusets.first(), &t).unwrap() {
         ResolvedAffinity::Random { from, count } => {
             assert_eq!(from, cpusets[0]);
-            assert_eq!(count, 2); // half of 4
+            assert_eq!(count, 2); // caller-supplied count, forwarded verbatim
         }
         other => panic!("expected Random, got {:?}", other),
     }
@@ -94,7 +95,7 @@ fn resolve_affinity_random_no_cpusets() {
     match resolve_affinity_for_cgroup(&intent, None, &t).unwrap() {
         ResolvedAffinity::Random { from, count } => {
             assert_eq!(from.len(), 8); // all CPUs
-            assert_eq!(count, 4); // half
+            assert_eq!(count, 4); // caller-supplied count, forwarded verbatim
         }
         other => panic!("expected Random, got {:?}", other),
     }
@@ -276,16 +277,17 @@ fn resolve_affinity_exact_empty_bails_regardless_of_cpuset() {
 
 #[test]
 fn resolve_affinity_oob_cgroup_idx_falls_back_to_unrestricted() {
-    // The wrapper that bounds-checked cgroup_idx against cpusets
-    // was inlined into run_scenario (see the tracing::warn in
-    // run_scenario's affinity-resolve block). The underlying
-    // `cpusets.get(idx)` returns None on OOB, and
-    // resolve_affinity_for_cgroup's None arm delivers the
-    // unrestricted fallback. This test pins the fallback contract.
+    // Affinity resolves in `apply_set_affinity` (ops/dispatch.rs),
+    // which looks the cpuset up by cgroup NAME via
+    // `ScenarioState::lookup_cpuset` — a name-keyed map that returns
+    // None for an unregistered name. `resolve_affinity_for_cgroup`'s
+    // None arm then delivers the unrestricted fallback. This test
+    // pins that fallback contract. The `cpusets.get(oob_idx)` below
+    // is a stand-in for the name-lookup miss: both yield None.
     let t = crate::topology::TestTopology::synthetic(4, 1);
     let cpusets: Vec<BTreeSet<usize>> = vec![[0, 1].into_iter().collect()];
     let oob_idx = 5;
-    // Mirror the inlined expression in run_scenario:
+    // Stand in for the name-lookup miss (both yield None):
     let cpuset = cpusets.get(oob_idx);
     assert!(cpuset.is_none(), "OOB index must yield None cpuset");
     let intent = AffinityIntent::random_subset(t.all_cpus().iter().copied(), 2);
@@ -780,9 +782,10 @@ impl crate::cgroup::CgroupOps for DropErrCgroupOps {
             Some(errno) => std::io::Error::from_raw_os_error(errno),
             None => std::io::Error::from(self.remove_kind),
         };
-        // Wrap in anyhow::Context the same way the real CgroupManager
-        // does, so `err.root_cause().downcast_ref::<io::Error>()`
-        // traverses the chain identically to production.
+        // Wrap the io::Error in a single anyhow::Context layer (as the
+        // real CgroupManager does) so `err.root_cause().downcast_ref::<io::Error>()`
+        // reaches the io::Error identically; the exact context message
+        // differs (production uses `rmdir {path}`) and is not load-bearing.
         Err(anyhow::Error::new(io).context("remove_dir cgroup"))
     }
     fn set_cpuset(&self, _: &str, _: &BTreeSet<usize>) -> Result<()> {
@@ -946,7 +949,8 @@ fn remove_cgroup_errno_hint_covers_ebusy_and_eacces() {
 // Every arm of `flatten_for_spawn` must round-trip a known
 // [`ResolvedAffinity`] into the matching [`AffinityIntent`]
 // shape. The flatten step gates the scenario engine's output
-// against the spawn-time gate in `workload::resolve_spawn_affinity`.
+// against the spawn-time gate in
+// `workload::spawn::GroupParams::resolve_spawn_affinity`.
 //
 // Contract: `resolve_affinity_for_cgroup` bails on every
 // path that would produce an empty pool — empty `Fixed`,

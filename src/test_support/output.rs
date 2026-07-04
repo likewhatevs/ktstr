@@ -111,7 +111,7 @@ pub(crate) fn extract_sched_ext_dump(output: &str) -> Option<String> {
 /// sched_ext dump for top-of-stderr placement on test failure.
 ///
 /// Primary anchor: the kernel's scheduler-exit emission at
-/// `kernel/sched/ext.c:6161-6163` produces
+/// `kernel/sched/ext.c:6357-6359` produces
 ///
 /// ```text
 /// <task>[<pid>] triggered exit kind <N>:
@@ -834,7 +834,7 @@ mod tests {
     ///     for every NON-idle CPU (idle CPUs are skipped so the
     ///     kernel's `if (idle && used == seq_buf_used(&ns))` gate
     ///     suppresses the per-CPU section, see
-    ///     kernel/sched/ext.c:6127-6283);
+    ///     kernel/sched/ext.c:6435, within scx_dump_state);
     ///   - `ktstr_dump_task`: emits `ktstr task: magic=0x... counter=N`
     ///     for every runnable task whose `scx_task_data(p)` is
     ///     non-null.
@@ -1057,7 +1057,7 @@ mod tests {
     #[test]
     fn extract_bug_summary_real_shaped_scheduler_crash_trace() {
         // Fixture mirrors the kernel's actual dump_line() emission
-        // contract at kernel/sched/ext.c:6161-6163:
+        // contract at kernel/sched/ext.c:6357-6359:
         //   "%s[%d] triggered exit kind %d:"  with current->comm,
         //                                          current->pid,
         //                                          ei->kind
@@ -1066,7 +1066,8 @@ mod tests {
         // Exit-kind 1025 = SCX_EXIT_ERROR_BPF (the scx_bpf_error
         // class, per kernel/sched/ext_internal.h:39-52). Reason
         // string "scx_bpf_error" matches ei->reason for this kind
-        // (kernel/sched/ext.c:5434-5455). The body uses paren-wrap
+        // (kernel/sched/ext.c:5578-5600, `return "scx_bpf_error"`
+        // at 5594). The body uses paren-wrap
         // formatting `<reason> (<msg>)` per the kernel format
         // string, not colon-separated.
         let dump = "\
@@ -1609,9 +1610,11 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
         // SchedulerDied / SchedulerNotAttached without a preceding
         // PayloadStarting frame mean init ran but the workload was
         // never entered — the scheduler-setup phase failed before
-        // PayloadStarting could fire (rust_init/process.rs force_reboot
-        // paths at the SchedulerDied / SchedulerNotAttached arms
-        // never reach the workload-launch site). The stage is
+        // PayloadStarting could fire (the SchedulerDied /
+        // SchedulerNotAttached arms in rust_init/scheduler.rs
+        // send the lifecycle frame then force-reboot, so they
+        // never reach the workload-launch site; force_reboot
+        // itself is defined in rust_init/process.rs). The stage is
         // STAGE_INIT_STARTED_NO_PAYLOAD, not the deeper
         // PAYLOAD_STARTED_NO_RESULT bucket — lumping these into
         // the payload bucket misleads operators into thinking the

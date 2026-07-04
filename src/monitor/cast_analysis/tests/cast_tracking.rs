@@ -224,7 +224,7 @@ fn arena_evidence_rejects_shape_inference_without_evidence() {
     let t_id = 3;
     // Sequence: r2 = T.f, r3 = *(u64*)(r2 + 0), r4 = *(u32*)(r2 + 8).
     // Pattern entries: {(0, 8), (8, 4)}; intersection in
-    // `build_layout_index` resolves to {Q} uniquely. NO
+    // `finalize` resolves to {Q} uniquely. NO
     // addr_space_cast, NO pseudo_call+SubprogReturn — neither
     // `arena_confirmed` nor `arena_stx_findings` populated for
     // (T, 8). The arena-evidence gate at the head of the arena-emit loop
@@ -257,8 +257,13 @@ fn arena_evidence_rejects_shape_inference_without_evidence() {
 #[test]
 fn ambiguous_targets_drop_silently() {
     // Build BTF with two structs having a u64 at offset 0
-    // (both Q1 and Q2 match the access pattern). Cast must NOT
-    // be recorded because false positives are unacceptable.
+    // (both Q1 and Q2 match the access pattern). This test emits
+    // NO addr_space_cast, so neither `arena_confirmed` nor
+    // `arena_stx_findings` is populated for (T, 8): finalize's
+    // arena-evidence gate drops the slot before the candidate
+    // intersection runs. Were direct arena evidence present, the
+    // ambiguity (Q1 and Q2 both match (0, 8)) would additionally
+    // drop it — false positives are unacceptable.
     let mut strings: Vec<u8> = vec![0];
     let n_int = push_name(&mut strings, "u64");
     let n_t = push_name(&mut strings, "T");
@@ -702,8 +707,8 @@ fn null_check_fall_through_preserves_state() {
     // `jump_targets()` is concerned. JMP32 class mirrors the
     // op codes; covered with BPF_CLASS_JMP32 | BPF_JEQ to verify
     // class-bit independence. None of these touch register
-    // state in `step()` (only BPF_OP_CALL clears registers per
-    // line ~726), so every variant must preserve the
+    // state in `step()` (only the `BPF_OP_CALL` arm clears
+    // registers), so every variant must preserve the
     // pre-jump LoadedU64Field on the fall-through path.
     let (blob, t_id, q_id) = btf_with_source_and_target(8, 0);
     let btf = Btf::from_bytes(&blob).unwrap();
@@ -773,15 +778,19 @@ fn null_check_fall_through_preserves_state() {
 #[test]
 fn deref_at_jump_target_is_dropped() {
     // if r2 != 0 goto USE; ... USE: deref r2.
-    // The deref is at the branch target, where state is reset
-    // by the conservative join handler. False negative is
-    // acceptable.
+    // The deref is at the branch target. The branch-source merge
+    // there keeps r2 = LoadedU64Field (fall-through and
+    // branch-source states agree), so the deref still records an
+    // access. The slot drops at finalize's arena-evidence gate:
+    // this test emits no addr_space_cast, so neither
+    // `arena_confirmed` nor `arena_stx_findings` is populated.
+    // False negative is acceptable.
     let (blob, t_id, _q_id) = btf_with_source_and_target(8, 0);
     let btf = Btf::from_bytes(&blob).unwrap();
     // pc 0: r2 = T.f
     // pc 1: if r2 != 0 goto +1 (= pc 3, the deref)
     // pc 2: exit (skipped on the taken branch)
-    // pc 3: r3 = *r2  -- STATE WAS RESET at pc 3 (target).
+    // pc 3: r3 = *r2  -- r2 still LoadedU64Field (merge keeps it).
     // pc 4: exit.
     let jne = mk_insn(BPF_CLASS_JMP | 0x50, 2, 0, 1, 0); // BPF_JNE_K = 0x50
     let insns = vec![

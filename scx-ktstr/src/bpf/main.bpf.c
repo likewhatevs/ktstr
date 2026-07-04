@@ -24,7 +24,7 @@ UEI_DEFINE(uei);
  * `lib/sdt_task.bpf.c::scx_task_data`).
  *
  * Struct layout exercises the host-side BPF cast analysis pipeline
- * (`src/monitor/cast_analysis.rs`) end-to-end. The analyzer parses
+ * (`src/monitor/cast_analysis/mod.rs`) end-to-end. The analyzer parses
  * scx-ktstr's `.bpf.objs` ELF blob at VM-builder time and produces a
  * `CastMap` keyed on `(struct_btf_id, field_byte_offset) → (target_btf_id,
  * AddrSpace)`. The dump renderer then promotes flagged `u64` fields into
@@ -109,7 +109,7 @@ __u64 ktstr_alloc_count;
  * dereferences the resulting u64 as a `struct ktstr_arena_ctx __arena *`,
  * reading enough fields (`magic` u64@0, `counter` u32@8, `task_kptr`
  * u64@16) that the host-side cast analyzer
- * (`src/monitor/cast_analysis.rs::analyze_casts`) can intersect the
+ * (`src/monitor/cast_analysis/mod.rs::analyze_casts`) can intersect the
  * observed access pattern against the program BTF and uniquely resolve
  * the target struct. The result is a `CastMap` entry
  * `(ktstr_bss_arena_holder, 0) -> (ktstr_arena_ctx, AddrSpace::Arena)`.
@@ -196,7 +196,7 @@ struct ktstr_cross_btf_value {
  * `bpf_map_lookup_elem(&ktstr_cross_btf_map, &key)` returns as
  * `Pointer{ktstr_cross_btf_value}` so the body's typed access
  * pattern survives verification. The host-side cast analyzer
- * (`src/monitor/cast_analysis.rs`) does not currently parse the
+ * (`src/monitor/cast_analysis/mod.rs`) does not currently parse the
  * map's value BTF off `bpf_map_lookup_elem` returns; the chase
  * detection on this fixture relies on a follow-up enhancement that
  * mirrors `FuncEntry`'s parameter-typing path for the helper
@@ -574,7 +574,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ktstr_init)
  * Helper that stamps the task_struct kernel address into a u64 field
  * of the per-task arena context. Defined as a static BPF-to-BPF helper
  * (not inlined) so the host-side cast analyzer
- * (`src/monitor/cast_analysis.rs::analyze_casts`) can seed both
+ * (`src/monitor/cast_analysis/mod.rs::analyze_casts`) can seed both
  * parameters as typed kernel pointers at function entry via the
  * `.BTF.ext` `func_info` table:
  *   - R1 ← `Pointer{ktstr_arena_ctx}` (the FuncProto's first param peels
@@ -608,7 +608,7 @@ int ktstr_stash_task_kptr(struct ktstr_arena_ctx __arena *taskc,
  * BSS→arena cast trainer. Loads `holder->arena_target` (a u64 in .bss)
  * and dereferences the resulting value as a `struct ktstr_arena_ctx
  * __arena *`. Static BPF-to-BPF helper so the host-side cast analyzer
- * (`src/monitor/cast_analysis.rs::analyze_casts`) seeds R1 with
+ * (`src/monitor/cast_analysis/mod.rs::analyze_casts`) seeds R1 with
  * `Pointer{ktstr_bss_arena_holder}` at function entry via the
  * `.BTF.ext` `func_info` table.
  *
@@ -664,11 +664,12 @@ int ktstr_train_bss_to_arena(struct ktstr_bss_arena_holder *holder)
 	raw = holder->arena_target;
 	if (!raw)
 		return -ENOENT;
-	/* The cast-through-(unsigned long) is the idiom the lavd
-	 * scheduler uses (see scx/scheds/rust/scx_lavd's `taskc =
-	 * (task_ctx __arena *)(unsigned long)cpuc->cached_taskc_raw`
-	 * pattern). LLVM lowers the conversion to a
-	 * `BPF_ADDR_SPACE_CAST` instruction, which the analyzer's
+	/* The cast-through-(unsigned long) is the idiom arena-using
+	 * schedulers rely on to turn a u64 arena handle back into an
+	 * arena pointer (e.g. scx_lavd's `__get_task_ctx_curcpu`, which
+	 * returns `cpuc->cached_taskc_raw` as a u64 that callers cast to
+	 * the `task_ctx __arena *` typedef). LLVM lowers the conversion
+	 * to a `BPF_ADDR_SPACE_CAST` instruction, which the analyzer's
 	 * arena-confirmed path records. */
 	p = (struct ktstr_arena_ctx __arena *)(unsigned long)raw;
 	if (!p)
@@ -782,7 +783,7 @@ int ktstr_cross_btf_publish(void)
 	 * `(ktstr_cross_btf_value, 0) -> AddrSpace::Arena` here:
 	 *   - R0 carries `RegState::ArenaU64FromAlloc` from the
 	 *     `scx_static_alloc_internal` subprog-return seed (already
-	 *     wired in `cast_analysis.rs::SubprogReturn`).
+	 *     wired in `cast_analysis/mod.rs::SubprogReturn`).
 	 *   - The store target is `Pointer{ktstr_cross_btf_value} + 0`,
 	 *     typed by the prospective helper-return tracking pass over
 	 *     `bpf_map_lookup_elem` (mirrors `FuncEntry`'s parameter-
@@ -997,7 +998,7 @@ void BPF_STRUCT_OPS(ktstr_dump, struct scx_dump_ctx *dctx)
  *
  * Skipping idle CPUs piggybacks on `scx_dump_state`'s
  * "if (idle && used == seq_buf_used(&ns)) goto next;" gate
- * (kernel/sched/ext.c:6127-6283): when ops.dump_cpu writes zero
+ * (kernel/sched/ext.c:6435, in scx_dump_state at 6323-6481): when ops.dump_cpu writes zero
  * bytes for an idle CPU, the kernel suppresses the entire per-CPU
  * section for that CPU. Emitting a marker on every idle CPU instead
  * defeats that gate and floods the failure dump with N copies of the
@@ -1043,7 +1044,7 @@ void BPF_STRUCT_OPS(ktstr_dump_task, struct scx_dump_ctx *dctx,
 /* Fixture observability hook: count every ops.yield invocation so the
  * yield-semantics test can confirm the op fired, and zero the yielder's
  * slice -- matching the kernel's default sched_yield handling
- * (yield_task_scx, kernel/sched/ext.c:2148, which zeros the slice when
+ * (yield_task_scx, kernel/sched/ext.c:2210, which zeros the slice when
  * ops.yield is unimplemented) -- so adding the hook changes nothing but
  * the counter. A fixture observes yields; it does not arbitrate them, so
  * the directed yield_to target (@to) gets no special handling.

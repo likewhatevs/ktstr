@@ -1,6 +1,7 @@
 # All commands live in the justfile so they are runnable locally via
 # `just <recipe>`.  The YAML handles only checkout, toolchain, cache, and
-# tool installation; every `run:` step calls a justfile recipe.
+# tool installation; every `run:` step that does actual CI work calls a
+# justfile recipe (toolchain and tool-install steps run inline).
 name: CI
 
 on:

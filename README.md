@@ -3,8 +3,8 @@
 [![CI](https://github.com/likewhatevs/ktstr/actions/workflows/ci.yml/badge.svg)](https://github.com/likewhatevs/ktstr/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/likewhatevs/ktstr/graph/badge.svg?token=E7GRAO2KZM)](https://codecov.io/gh/likewhatevs/ktstr)
 [![crates.io](https://img.shields.io/crates/v/ktstr.svg)](https://crates.io/crates/ktstr)
-[![tutorial](https://img.shields.io/badge/docs-tutorial-blue)](https://likewhatevs.github.io/ktstr/guide/tutorial.html)
-[![api](https://img.shields.io/badge/docs-api-blue)](https://likewhatevs.github.io/ktstr/api/ktstr/)
+[![tutorial](https://img.shields.io/badge/docs-tutorial-blue)](https://ktstr.dev/guide/tutorial.html)
+[![api](https://img.shields.io/badge/docs-api-blue)](https://ktstr.dev/rustdoc/ktstr/)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](https://github.com/likewhatevs/ktstr/issues)
 
 > **Early stage.** APIs, CLI, and internals are actively evolving.
@@ -44,7 +44,7 @@ automates this:
   handles the rest.
 - **Automated assertions** -- checks for starvation, cgroup
   isolation violations, and CPU time fairness. No manual inspection.
-- **[Gauntlet](https://likewhatevs.github.io/ktstr/guide/running-tests/gauntlet.html)** --
+- **[Gauntlet](https://ktstr.dev/guide/running-tests/gauntlet.html)** --
   one `#[ktstr_test]` expands across topology presets (4-252 vCPUs,
   1-15 LLCs, optional SMT and multi-NUMA), filtered by per-test
   constraints. Multi-kernel runs (`--kernel A --kernel B`) add the
@@ -59,7 +59,7 @@ automates this:
 - **Auto-repro** -- on failure, reruns the scenario with BPF probes
   on the crash call chain, capturing arguments and struct state at
   each call site.
-- **[Features](https://likewhatevs.github.io/ktstr/guide/features.html)** --
+- **[Features](https://ktstr.dev/guide/features.html)** --
   testing, observability, debugging, and infrastructure.
 
 ## Installation
@@ -68,7 +68,7 @@ Add ktstr as a dev-dependency:
 
 ```toml
 [dev-dependencies]
-ktstr = "0.20.0"
+ktstr = "0.23.0"
 ```
 
 The library is the test-author surface. The `anyhow::Result`
@@ -101,7 +101,7 @@ This installs:
 `cargo install --locked --bin cargo-ktstr ktstr@X.Y.Z`. ktstr is
 pre-1.0 — minor-version bumps may break the test-facing API, and
 patch bumps may break unstable internal surfaces (the CI matrix
-runs against the locked patch). Examples below assume 0.20.0; an
+runs against the locked patch). Examples below assume 0.23.0; an
 example from a different release may not compile against the crate
 this README documents.
 
@@ -141,7 +141,7 @@ it does not build or run on other platforms.
   step runs `validate_kernel_config` which requires `CONFIG_SCHED_CLASS_EXT`
   (present from 6.12); kernels older than that fail the check at
   build time rather than running with a missing scheduler class.
-  See [Supported kernels](https://likewhatevs.github.io/ktstr/guide/features.html#supported-kernels).
+  See [Supported kernels](https://ktstr.dev/guide/features.html#supported-kernels).
   Prebuilt kernels resolved via `KTSTR_KERNEL` must contain a
   vmlinux with embedded BTF.
 
@@ -160,7 +160,7 @@ for the dynamic-link path if you're modifying the workspace.
 
 **Test files** go in `tests/` as standard Rust integration tests. Use `#[ktstr_test]` from `ktstr::prelude::*`.
 
-See the [getting started guide](https://likewhatevs.github.io/ktstr/guide/getting-started.html) for kernel discovery and building a test kernel.
+See the [getting started guide](https://ktstr.dev/guide/getting-started.html) for kernel discovery and building a test kernel.
 
 ## Quick start
 
@@ -187,7 +187,7 @@ fn two_cgroups(ctx: &Ctx) -> Result<AssertResult> {
 Each test boots a KVM VM, creates the declared cgroups and workers,
 runs the workload, and checks for starvation and fairness. For
 canned scenarios, see `scenarios::steady` in the
-[getting started guide](https://likewhatevs.github.io/ktstr/guide/getting-started.html).
+[getting started guide](https://ktstr.dev/guide/getting-started.html).
 
 ### Define a scheduler
 
@@ -208,12 +208,23 @@ declare_scheduler!(MY_SCHED, {
 ```
 
 `binary = "scx_my_sched"` tells ktstr to auto-discover the scheduler
-binary. The resolution cascade is: explicit `KTSTR_SCHEDULER` env
-var → `$PATH` (when invoked under `cargo test`) →
-sibling-of-test-binary → `target/debug/` → `target/release/` →
-on-demand build from the workspace. If the scheduler is a `[[bin]]`
-target in the same workspace, `cargo build` places it where the
-sibling/target steps find it, so discovery is automatic. The
+binary. Resolution depends on how the test is invoked. Under the
+orchestrated `cargo ktstr test` path the cascade is: per-scheduler
+`KTSTR_SCHEDULER_BIN_<NAME>` → global `KTSTR_SCHEDULER` → an on-demand
+`cargo build -p scx_<name>` from the workspace. That build runs
+*first* — a build failure hard-fails the test rather than validating
+against a possibly-stale pre-built binary; only with
+`KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK=1` does it fall through to
+`sibling-of-test-binary` → `target/release/` → `target/debug/`. Under
+bare `cargo test` (`KTSTR_CARGO_TEST_MODE`) the on-demand build runs
+*last* instead: `KTSTR_SCHEDULER_BIN_<NAME>` → `KTSTR_SCHEDULER` →
+`$PATH` → `sibling-of-test-binary` → `target/release/` →
+`target/debug/` → on-demand build. `target/release/` is probed before
+`target/debug/` by default (the scheduler builds under the release
+profile; the order flips only under `KTSTR_SCHEDULER_PROFILE=dev`). If
+the scheduler is a `[[bin]]` target in the same workspace, `cargo
+build` places it where the sibling/target steps find it, so discovery
+is automatic. The
 resolved binary is packed into the VM's initramfs. Tests without a
 `scheduler` attribute run under EEVDF (the kernel's default
 scheduler).
@@ -226,7 +237,7 @@ Topologies display as `NnNlNcNt` (e.g. `1n2l4c1t`). In
 4, threads = 1, numa_nodes = 1`. Unset dimensions inherit from the
 scheduler's topology. For non-uniform NUMA, see
 `Topology::with_nodes()` in the
-[topology guide](https://likewhatevs.github.io/ktstr/guide/concepts/topology.html).
+[topology guide](https://ktstr.dev/guide/concepts/topology.html).
 
 `sched_args = [...]` are CLI args prepended to every test using
 this scheduler. Per-test `#[ktstr_test(extra_sched_args = [...])]`
@@ -294,8 +305,8 @@ struct (uppercased, `Payload` suffix stripped).
 use ktstr::prelude::*;
 
 #[derive(Payload)]
-#[payload(binary = "schbench", output = LlmExtract)]
-#[default_args("--runtime", "5", "--message-threads", "2")]
+#[payload(binary = "schbench", output = Json)]
+#[default_args("--runtime", "5", "--message-threads", "2", "--json", "-")]
 #[default_check(exit_code_eq(0))]
 pub struct SchbenchPayload;
 
@@ -307,11 +318,11 @@ fn schbench_under_my_sched(ctx: &Ctx) -> Result<AssertResult> {
 ```
 
 See
-[Payload Definitions](https://likewhatevs.github.io/ktstr/guide/writing-tests/scheduler-definitions.html#derive-payload)
+[Payload Definitions](https://ktstr.dev/guide/writing-tests/scheduler-definitions.html#derive-payload)
 for the `#[derive(Payload)]` macro and the full field surface
 (`default_args`, `default_checks`, `metrics`, `include_files`).
 This repo's `tests/common/fixtures.rs` carries reusable
-in-tree examples (`SCHBENCH`, `SCHBENCH_HINTED`, `SCHBENCH_JSON`)
+in-tree examples (`FIO`, `FIO_JSON`, `STRESS_NG`, `SCHBENCH_JSON`)
 that other ktstr tests inside this repo import via `mod common`;
 they are not part of the published `ktstr` crate.
 
@@ -324,7 +335,11 @@ cargo ktstr test --kernel ../linux
 `--kernel` accepts a kernel source tree path (e.g. `../linux`,
 auto-built on first use), a version (`6.14.2`, or `6.14` for
 latest patch), a cache key (see `kernel list`), a version
-range (`6.12..6.14`), or a git source (`git+URL#REF`).
+range (`6.12..6.14`), or a git source (`git+URL#tag=NAME`,
+`git+URL#branch=NAME`, or `git+URL#sha=<40-hex>`). A range
+expands only across series still listed in kernel.org's active
+releases; add `--include-eol` to also cover end-of-life stable
+series (enumerated from the gregkh linux-stable mirror).
 
 `cargo ktstr test` wraps `cargo nextest run` with kernel
 resolution (source tree, version, or cache key), kconfig
@@ -335,7 +350,7 @@ asks for.
 
 Requires `/dev/kvm` accessible to the invoking user. On most
 distros that means adding the user to the `kvm` group; the
-[Troubleshooting](https://likewhatevs.github.io/ktstr/guide/troubleshooting.html#devkvm-not-accessible)
+[Troubleshooting](https://ktstr.dev/guide/troubleshooting.html#devkvm-not-accessible)
 page covers permission errors and nested-virt setup for CI
 runners.
 
@@ -382,7 +397,7 @@ zero iterations, zero pages, zero wake events) separately from
 `ktstr::prelude::{EXIT_PASS, EXIT_FAIL, EXIT_INCONCLUSIVE}`
 for tooling that drives the harness programmatically.
 
-See the [verdict outcomes guide](https://likewhatevs.github.io/ktstr/guide/concepts/checking.html#verdict-outcomes)
+See the [verdict outcomes guide](https://ktstr.dev/guide/concepts/checking.html#verdict-outcomes)
 for the full four-state lattice (`Fail > Inconclusive > Pass > Skip`)
 and CI-gate patterns.
 
@@ -409,19 +424,15 @@ cargo ktstr test --kernel ~/linux -- -E 'test(my_test)'    # local source tree +
 cargo ktstr replay                                         # print a nextest filter for last session's failures (add --exec to re-run)
 cargo ktstr coverage                                       # tests under cargo-llvm-cov nextest
 cargo ktstr llvm-cov report --lcov --output-path lcov.info # raw llvm-cov passthrough (report/clean/show-env)
-cargo ktstr kernel build 6.14.2                            # cache a specific version
-cargo ktstr kernel build --source ~/linux                  # build from local source tree
-cargo ktstr kernel build --git URL --ref v6.14             # shallow-clone a git tree
+cargo ktstr kernel build --kernel 6.14.2                   # cache a specific version
+cargo ktstr kernel build --kernel ~/linux                  # build from a local source tree
+cargo ktstr kernel build --kernel git+URL#tag=v6.14        # build from a git tag
 cargo ktstr kernel list                                    # list cached kernels (shows (EOL) tags)
 cargo ktstr kernel clean --keep 3                          # keep 3 most recent
-cargo ktstr model fetch                                    # prefetch the LlmExtract model
-cargo ktstr model status                                   # report whether a SHA-checked model is cached
-cargo ktstr model clean                                    # drop cached model + warm-cache sidecar
 cargo ktstr verifier                                       # BPF verifier sweep (auto-discover kernel)
 cargo ktstr verifier --kernel 6.14.2 --kernel 6.15.0       # sweep across multiple kernels
 cargo ktstr stats                                          # aggregate gauntlet sidecars
-cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15  # diff sidecar partitions across kernels
-cargo ktstr perf-delta --dual-run --kernel 6.14            # gate HEAD vs merge-base on performance_mode metrics
+cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14      # gate HEAD vs merge-base on performance_mode metrics
 cargo ktstr stats show-host --run <key>                    # print archived HostContext for a run
 cargo ktstr stats list-metrics                             # discover the metric vocabulary in archived sidecars
 cargo ktstr stats list-values                              # list distinct values per filterable dimension in the sidecar pool
@@ -450,9 +461,9 @@ Every `ktstr kernel ...` subcommand is identical to the corresponding
 ktstr topo                                                 # show host CPU topology
 ktstr shell --kernel 6.14.2                                # interactive VM shell (kernel optional)
 ktstr kernel list                                          # manage cached kernels
-ktstr kernel build 6.14.2
-ktstr kernel build --source ../linux
-ktstr kernel build --git URL --ref v6.14
+ktstr kernel build --kernel 6.14.2
+ktstr kernel build --kernel ../linux
+ktstr kernel build --kernel git+URL#tag=v6.14
 ktstr kernel clean --keep 3
 ktstr ctprof capture --output baseline.ctprof.zst         # snapshot every live thread's counters
 # ctprof capture pulls per-thread jemalloc counters via ptrace; needs root,
@@ -469,17 +480,17 @@ without the test harness, use `cargo ktstr export`.
 
 ## Documentation
 
-**[Zero to ktstr](https://likewhatevs.github.io/ktstr/guide/tutorial.html)** --
+**[Zero to ktstr](https://ktstr.dev/guide/tutorial.html)** --
 hands-on tutorial: define a scheduler, write a test, run it.
 
-**[Guide](https://likewhatevs.github.io/ktstr/guide/)** -- getting started, concepts,
+**[Guide](https://ktstr.dev/guide/)** -- getting started, concepts,
 writing tests, recipes, architecture.
 
-**[ctprof reference](https://likewhatevs.github.io/ktstr/guide/reference/ctprof.html)** --
+**[ctprof reference](https://ktstr.dev/guide/reference/ctprof.html)** --
 metric registry, aggregation rules, taskstats kconfig gating,
 adding-a-metric guide.
 
-**[API docs](https://likewhatevs.github.io/ktstr/api/ktstr/)** -- rustdoc for all workspace crates.
+**[API docs](https://ktstr.dev/rustdoc/ktstr/)** -- rustdoc for all workspace crates.
 
 ## Contributing
 

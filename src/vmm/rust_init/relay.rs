@@ -11,8 +11,10 @@ use super::*;
 const SCHED_STATS_SOCKET: &str = "/var/run/scx/root/stats";
 
 /// Path of the guest-side stats relay's port-2 device node. The
-/// kernel virtio-console driver creates this when the multiport
-/// PORT_NAME control message lands ahead of PORT_OPEN; see
+/// kernel virtio-console driver creates this node in its PORT_ADD
+/// handler (`add_port` -> cdev_add + device_create); the PORT_NAME
+/// control message only populates the sysfs `name` attribute
+/// (`/sys/class/virtio-ports/vport0p2/name`); see
 /// [`crate::vmm::wire::PORT2_NAME`].
 const SCHED_STATS_PORT_DEV: &str = "/dev/vport0p2";
 
@@ -121,19 +123,14 @@ pub(crate) fn start_sched_stats_relay() -> RelayStopSignal {
     RelayStopSignal { flag, evt }
 }
 
-/// Inner loop for the stats relay thread. Opens the port-2 device
-/// node once (single open — the multiport handshake completed
-/// before this function was called) and drives the outer
-/// inotify-wait → connect → poll-relay-session cycle until `stop`
-/// flips.
 /// Maximum consecutive `PortEof` returns from the inner functions
 /// (`wait_for_stats_socket` and `run_relay_session`) we tolerate
 /// before declaring the virtio-console port dead and exiting the
-/// relay thread. Any non-`PortEof` exit (`RelaySessionExit::Other`,
-/// `WaitSocketResult::Connected`, `WaitSocketResult::Stopped`)
-/// resets the counter.
+/// relay thread. A `RelaySessionExit::Other` exit or a
+/// `WaitSocketResult::Connected` connect resets the counter;
+/// `WaitSocketResult::Stopped` exits the thread.
 ///
-/// B14: the stats-port reader can return Ok(0) when the host
+/// The stats-port reader can return Ok(0) when the host
 /// hasn't connected its end of `/dev/vport0p2` yet, when the host
 /// closes its console connection, or when the kernel virtio-console
 /// driver hits a transient disconnect. A single Ok(0) is recoverable
@@ -165,6 +162,11 @@ enum RelaySessionExit {
     Other,
 }
 
+/// Inner loop for the stats relay thread. Opens the port-2 device
+/// node once (single open — the multiport handshake completed
+/// before this function was called) and drives the outer
+/// inotify-wait → connect → poll-relay-session cycle until `stop`
+/// flips.
 fn sched_stats_relay_loop(stop: Arc<AtomicBool>, stop_evt: Arc<vmm_sys_util::eventfd::EventFd>) {
     let mut port = match fs::OpenOptions::new()
         .read(true)
@@ -182,7 +184,7 @@ fn sched_stats_relay_loop(stop: Arc<AtomicBool>, stop_evt: Arc<vmm_sys_util::eve
         }
     };
 
-    // B14: count consecutive `port.read` Ok(0) outcomes from the
+    // Count consecutive `port.read` Ok(0) outcomes from the
     // inner functions. A single Ok(0) is recoverable; after
     // `SCHED_STATS_RELAY_MAX_CONSECUTIVE_PORT_EOF` in a row we
     // assume the virtio-console port is permanently dead and exit.
@@ -242,9 +244,9 @@ fn sched_stats_relay_loop(stop: Arc<AtomicBool>, stop_evt: Arc<vmm_sys_util::eve
                 // non-EOF event resets it.
             }
             WaitSocketResult::Stopped => {
-                // wait_for_stats_socket returned None only when
-                // stop flipped or inotify itself errored. Either
-                // way, exit.
+                // wait_for_stats_socket returned
+                // `WaitSocketResult::Stopped` only when stop flipped
+                // or inotify itself errored. Either way, exit.
                 return;
             }
         }
@@ -253,7 +255,7 @@ fn sched_stats_relay_loop(stop: Arc<AtomicBool>, stop_evt: Arc<vmm_sys_util::eve
 
 /// Result of [`wait_for_stats_socket`]: distinguishes a successful
 /// connect from the two clean-exit paths so the outer loop can
-/// classify them correctly. B14: `PortEof` (port read returned
+/// classify them correctly. `PortEof` (port read returned
 /// Ok(0)) feeds the consecutive-EOF counter; `Stopped` (stop_evt
 /// fired or inotify errored) terminates the loop unconditionally.
 enum WaitSocketResult {
@@ -303,7 +305,7 @@ fn wait_for_stats_socket(
             return WaitSocketResult::Stopped;
         }
     };
-    // B2 fix: include IN_ATTRIB so a chmod-on-listen (some
+    // Include IN_ATTRIB so a chmod-on-listen (some
     // schedulers tighten perms after listen()) wakes us; include
     // IN_OPEN so any client that successfully connects (including
     // ourselves on a retry) re-fires the watch even if the
@@ -338,11 +340,11 @@ fn wait_for_stats_socket(
 
     // Park on poll(inotify_fd, port_fd, stop_evt). Each wake:
     //   - inotify edge: re-read events; on any event in the
-    //     watched dir, retry connect (the B2 expanded mask plus
+    //     watched dir, retry connect (the expanded mask plus
     //     this any-event retry policy guards against the
     //     IN_CREATE-then-listen() race that left the prior code
     //     waiting on a CREATE-only edge that never came again).
-    //   - port edge: B3 fix — host pushed a request before the
+    //   - port edge: host pushed a request before the
     //     scheduler came up. Drain it and reply with the inline
     //     error envelope so the host's request_raw wakes
     //     immediately with NoScheduler instead of waiting for the
@@ -390,7 +392,7 @@ fn wait_for_stats_socket(
             return WaitSocketResult::Stopped;
         }
 
-        // B3: host pushed a request while we're still waiting for
+        // Host pushed a request while we're still waiting for
         // the scheduler. Drain whatever bytes are available and
         // reply with the inline error envelope so the request
         // surfaces NoScheduler immediately. A burst that exceeds
@@ -402,7 +404,7 @@ fn wait_for_stats_socket(
         if port_ready {
             match port.read(&mut buf) {
                 Ok(0) => {
-                    // B14: this Ok(0) feeds the outer loop's
+                    // This Ok(0) feeds the outer loop's
                     // consecutive-EOF counter via the PortEof
                     // return. A single Ok(0) is recoverable
                     // (the outer re-arms inotify); after the
@@ -438,8 +440,8 @@ fn wait_for_stats_socket(
             }
         }
 
-        // inotify fd ready: drain events and try connect. B2:
-        // try connect on ANY event in the watched directory, not
+        // inotify fd ready: drain events and try connect on
+        // ANY event in the watched directory, not
         // just IN_CREATE for our target — the bind-without-listen
         // window means a CREATE-only check would miss the
         // listen-edge that follows.
@@ -484,7 +486,7 @@ fn wait_for_stats_socket(
 
 /// On socket loss, drain whatever request bytes the host has
 /// already pushed onto port 2 and answer each readable batch with
-/// the inline error envelope. Without this, B12: a request that
+/// the inline error envelope. Without this, a request that
 /// the host wrote AFTER we forwarded the prior request to the
 /// (now-dead) socket would otherwise be carried over into the
 /// next relay session, where it would be forwarded to a fresh
@@ -608,7 +610,7 @@ fn poll_relay_fds(
     let stop_rev = fds[2].revents();
     let port_ready = port_rev.is_some_and(|r| r.contains(PollFlags::POLLIN));
     let socket_in = socket_rev.is_some_and(|r| r.contains(PollFlags::POLLIN));
-    // B6: any POLLHUP or POLLERR on the socket — with or
+    // Any POLLHUP or POLLERR on the socket — with or
     // without POLLIN — is a permanent transition to
     // unhealthy. POLLHUP+POLLIN means buffered data is
     // still drainable; the same-iteration drain of the
@@ -654,7 +656,7 @@ fn run_relay_session(
     use std::io::ErrorKind;
 
     let mut buf = vec![0u8; RELAY_BUFFER_BYTES];
-    // B6: track socket health across poll iterations. Set false the
+    // Track socket health across poll iterations. Set false the
     // moment POLLHUP/POLLERR is observed on the socket fd; gate
     // every `socket.write_all` on this flag so we never write into
     // a HUP'd socket (which fails with EPIPE/SIGPIPE and surfaces
@@ -709,7 +711,7 @@ fn run_relay_session(
         // Host→guest port readable: read bytes and forward to
         // socket. The socket forward is a blocking write — bounded
         // by the kernel's Unix-socket buffer, not by any user
-        // timeout. B6: skip the write_all entirely when the socket
+        // timeout. Skip the write_all entirely when the socket
         // is already known unhealthy (POLLHUP seen on a prior
         // iteration). Reading the port still drains the host's
         // queued request bytes so they don't pile up in the kernel
@@ -719,7 +721,7 @@ fn run_relay_session(
         if port_ready {
             let n = match port.read(&mut buf) {
                 Ok(0) => {
-                    // B14: this Ok(0) is the busy-loop trigger —
+                    // This Ok(0) is the busy-loop trigger —
                     // surface it through the typed return so the
                     // outer `sched_stats_relay_loop` can count
                     // consecutive port-EOF exits and bail when the
@@ -750,7 +752,7 @@ fn run_relay_session(
                     error = %e,
                     "stats relay: socket write failed; emitting error envelopes and reconnecting"
                 );
-                // B12: the host may have additional queued
+                // The host may have additional queued
                 // requests on the port that we haven't read yet —
                 // the failed write_all means we're abandoning the
                 // socket without forwarding them. Answer the
@@ -766,7 +768,7 @@ fn run_relay_session(
         }
 
         // Scheduler→host socket readable: read response bytes and
-        // forward to port. B6: read POLLIN data even when POLLHUP
+        // forward to port. Read POLLIN data even when POLLHUP
         // arrived in the same poll — buffered scheduler responses
         // remain readable across the half-close until the kernel
         // socket buffer drains. `socket_healthy` was already

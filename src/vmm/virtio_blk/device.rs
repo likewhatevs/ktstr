@@ -574,7 +574,7 @@ pub(crate) struct BlkWorkerState {
 /// Wraps the request-processing engine. In Inline mode (cfg(test))
 /// the state lives in-line and `process_requests` runs the drain
 /// synchronously on the caller thread — preserving the existing
-/// 113-test surface that calls `process_requests` then immediately
+/// synchronous test surface that calls `process_requests` then immediately
 /// reads back queue + counter state without crossing a thread
 /// boundary. In Spawned mode (production) a dedicated worker thread
 /// owns the state and is woken by `kick_fd`; the MMIO QUEUE_NOTIFY
@@ -1157,7 +1157,7 @@ impl VirtioBlk {
     /// runs (i.e. before any QUEUE_NOTIFY can fire).
     ///
     /// `OnceLock::set` returns `Err` if the slot is already
-    /// populated. The current production wiring (mod.rs `init_virtio_blk`)
+    /// populated. The current production wiring (setup/mod.rs `init_virtio_blk`)
     /// calls `set_mem` exactly once per device, so the `Err` branch
     /// is unreachable in normal operation; `reset()` does NOT clear
     /// `mem`, matching the prior `Mutex<Option<…>>` semantics where

@@ -436,7 +436,7 @@ fn try_cow_overlay_rejects_cross_region_span() {
     let region_a_size: usize = 64 * 1024;
     let region_b_size: usize = 64 * 1024;
     let region_a_start: u64 = 0;
-    let region_b_start: u64 = 1 << 20; // 1 MiB gap
+    let region_b_start: u64 = 1 << 20; // region B at the 1 MiB mark (non-contiguous with region A)
     let mem = vm_memory::GuestMemoryMmap::<()>::from_ranges(&[
         (GuestAddress(region_a_start), region_a_size),
         (GuestAddress(region_b_start), region_b_size),

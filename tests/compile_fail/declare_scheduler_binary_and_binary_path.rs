@@ -1,4 +1,4 @@
-// Mutual exclusion across {binary, binary_path, binary_kernel}: each
+// Mutual exclusion across {binary, binary_path, kernel_builtin_{enable,disable}}: each
 // field selects a different `SchedulerSpec` variant and they cannot
 // stack. The macro rejects with the pick-exactly-one diagnostic.
 use ktstr::declare_scheduler;

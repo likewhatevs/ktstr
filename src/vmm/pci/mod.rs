@@ -1,9 +1,11 @@
 //! Emulated PCI Express transport, additive to the virtio-MMIO transport.
 //!
-//! ktstr keeps virtio-MMIO for console/block (discovered by the guest via
-//! `virtio_mmio.device=` kernel-cmdline tokens) and adds this virtio-PCI
-//! transport so virtio-net NICs can attach as PCI functions — one function
-//! per NIC, enabling multi-NIC topologies with per-NIC IRQ steering. The two
+//! ktstr keeps virtio-MMIO for the console on x86_64 (aarch64 also keeps
+//! block+net on MMIO), discovered by the guest via `virtio_mmio.device=`
+//! kernel-cmdline tokens, and adds this virtio-PCI transport so virtio-net
+//! NICs and virtio-blk attach as PCI functions on x86_64 — one function per
+//! NIC (enabling multi-NIC topologies with per-NIC IRQ steering) plus the
+//! single block function, none of which emit an MMIO cmdline token. The two
 //! transports coexist in a single guest: the MMIO devices are advertised on
 //! the kernel cmdline, the PCI devices via ACPI (MCFG + a `_SB.PCI0` host
 //! bridge in the DSDT). No reference VMM runs both transports in one guest, so
@@ -33,8 +35,9 @@
 //! `pci` node (aarch64) are arch-specific and live under `x86_64`/`aarch64`;
 //! this module takes the ECAM base as a constructor parameter so it stays
 //! arch-neutral. The host bridge occupies slot 0; one virtio-net function
-//! (each with a memory BAR, INTx) attaches per configured NIC at slots
-//! 1..N. Per-queue MSI-X is a subsequent increment.
+//! attaches per configured NIC at slots 1..=MAX_VIRTIO_NICS and the single
+//! virtio-blk function at slot MAX_VIRTIO_NICS+1 (each with a memory BAR,
+//! INTx, and per-queue MSI-X).
 //!
 //! Hostile-guest defense: every config access is bounds-checked. An access to
 //! an absent bus/device/function, or one that would read past the 4 KiB

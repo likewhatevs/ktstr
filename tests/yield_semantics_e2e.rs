@@ -13,7 +13,9 @@
 //! kernel's default slice-zero fallback does not touch any scheduler
 //! counter — so the `any_progress` floor catches a missing or
 //! unregistered handler, and `nondecreasing` catches a counter wrap or
-//! a stale/duplicated capture in the snapshot pipeline.
+//! a stale (out-of-order, older-valued) capture in the snapshot
+//! pipeline. A pure duplicate (the same value emitted twice) passes
+//! the `values[i] <= values[i+1]` check by design.
 
 use anyhow::Result;
 use ktstr::assert::{AssertResult, Verdict};

@@ -129,7 +129,7 @@ pub enum WorkType {
         consume_iters: u64,
         queue_depth_target: u64,
     },
-    SignalStorm {                                       // Paired workers fire tkill(partner, SIGUSR1) between CPU bursts.
+    SignalStorm {                                       // Paired workers fire tkill(partner, SIGUSR2) between CPU bursts.
         signals_per_iter: u64,
         work_iters: u64,
     },
@@ -156,16 +156,18 @@ pub enum WorkType {
 
 > **Imports:** `WorkType`, `WorkPhase`, `SchedPolicy`, `AluWidth`,
 > `WorkSpec`, `WorkloadConfig`, `SchbenchConfig` (the `Schbench`
-> config), and `ReapMode` (the `CgroupAttachStorm` reap mode) are in
+> config), `TaobenchConfig` (the `Taobench` config), and `ReapMode`
+> (the `CgroupAttachStorm` reap mode) are in
 > `ktstr::prelude::*`.
 > (Note: the prelude also exports an unrelated `Phase` from
 > `crate::assert` — the temporal-assertion phase bucket. The
 > `WorkType::Sequence` variant uses `WorkPhase`, not `Phase`.) The
 > auxiliary enums `FutexLockMode` (used by `PriorityInversion::pi_mode`),
 > `WakeMechanism` (used by `WakeChain::wake`), and `SchedClass`
-> (used by `AsymmetricWaker`) live under `ktstr::workload`. Bring
-> them into scope with `use ktstr::workload::*;` (or import each
-> by name) before writing variant literals that reference them.
+> (used by `AsymmetricWaker`) are also in `ktstr::prelude::*` — a single
+> `use ktstr::prelude::*;` brings them into scope. (They are re-exported
+> from `ktstr::workload`, so a named `use ktstr::workload::{FutexLockMode,
+> WakeMechanism, SchedClass};` also works if you prefer.)
 
 Parameterized variants have snake-case convenience constructors —
 e.g. `WorkType::bursty(burst_duration, sleep_duration)`,
@@ -490,7 +492,7 @@ group, so worker A reads its partner's write end whether the pair
 lives in two forked processes (`Fork` mode) or in two threads of
 one pcomm container.
 
-`SignalStorm` uses `tkill(partner_tid, SIGUSR1)` (per-task
+`SignalStorm` uses `tkill(partner_tid, SIGUSR2)` (per-task
 signal delivery, `PIDTYPE_PID`), NOT `kill` (per-tgid,
 `PIDTYPE_TGID`) and NOT `tgkill(self_tgid, partner_tid, …)`
 (would return `ESRCH` under Fork mode because each forked worker
@@ -596,6 +598,7 @@ pub enum SchedPolicy {
         deadline: Duration,  // relative deadline from period start
         period: Duration,    // period; Duration::ZERO uses `deadline`
     },
+    Ext,             // SCHED_EXT — route the worker through the loaded sched_ext BPF scheduler
 }
 ```
 
@@ -607,7 +610,12 @@ time (in `set_sched_policy` before `sched_setattr`) so a malformed
 `Deadline` fails fast rather than tunneling `EINVAL` through the
 syscall. The const constructor `SchedPolicy::deadline(runtime,
 deadline, period)` itself is a struct-literal wrapper and does not
-validate at construction time.
+validate at construction time. `Ext` is `SCHED_EXT`: applied via a raw
+`sched_setattr` (glibc does not wrap the policy), it routes the worker
+through the loaded sched_ext BPF scheduler — even under a
+`SCX_OPS_SWITCH_PARTIAL` scheduler that leaves other tasks in fair — and
+requires a kernel built with `CONFIG_SCHED_CLASS_EXT`; it takes no
+priority or deadline parameters.
 
 ## Overriding work types
 

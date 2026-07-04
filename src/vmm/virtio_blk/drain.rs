@@ -19,10 +19,12 @@
 //! All chain-shape validation (header presence, status descriptor,
 //! SEG_MAX / SIZE_MAX bounds, direction, sub-sector data length)
 //! happens BEFORE the throttle bucket is consumed — a malformed
-//! request never drains the bucket. The handler dispatch
-//! (`VirtioBlk::handle_*_impl`) lives in `handlers.rs`; the
-//! pre-throttle terminal classifier (`classify_pre_throttle`) lives
-//! on `VirtioBlk` itself in `device.rs`.
+//! request never drains the bucket. The dispatched flush/get_id
+//! handlers (`handle_flush_impl` / `handle_get_id_impl`) live in
+//! `handlers.rs`; the vectored read/write handlers
+//! (`handle_read_vectored_impl` / `handle_write_vectored_impl`) live
+//! on `VirtioBlk` in `device.rs`, as does the pre-throttle terminal
+//! classifier (`classify_pre_throttle`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -513,8 +515,8 @@ pub(crate) fn drain_bracket_impl(
             // Bound the push at `VIRTIO_BLK_SEG_MAX + 2`. A hostile
             // guest can submit a chain with up to `queue.size` (max
             // 32768 per virtio-v1.2 §2.7.5.2) descriptors, which at
-            // `sizeof(ChainDescriptor)` = 24 bytes would force the
-            // scratch Vec to grow to ~786KB per request — defeating
+            // `sizeof(ChainDescriptor)` = 16 bytes would force the
+            // scratch Vec to grow to ~512KB per request — defeating
             // the with_capacity preallocation and producing
             // unbounded heap pressure under sustained hostile load.
             // The kernel's `virtblk_add_req` (drivers/block/

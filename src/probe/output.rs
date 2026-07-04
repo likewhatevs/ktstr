@@ -998,7 +998,7 @@ mod tests {
         use crate::probe::process::ProbeEvent;
 
         // Field key "p0:task_struct.pid" -> split on '.' -> display "pid".
-        // Value 123 -> decode_named_value("pid", "123") -> "123" (passthrough).
+        // Value 123 -> decode_named_value("task_struct", "pid", "123") -> "123" (passthrough).
         let events = vec![ProbeEvent {
             func_idx: 0,
             task_ptr: 1,
@@ -1011,7 +1011,7 @@ mod tests {
         }];
         let func_names = vec![(0u32, "test_fn".to_string())];
         let out = format_probe_events(&events, &func_names, None, None);
-        // Line format: "      {field:<14}{decoded}\n"
+        // Line format: "      {field:<fw$}  {decoded}\n" where fw = max_field_w (8 here).
         assert!(out.contains("pid"), "field 'pid' should appear: {out}");
         assert!(
             out.contains("123"),

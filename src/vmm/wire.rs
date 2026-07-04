@@ -27,9 +27,8 @@
 //!     boundary pins) → `src/vmm/wire.rs` (this file)
 //!   - `KernelOpRequestPayload` / `KernelOpReplyPayload`
 //!     → 4 tests → `src/vmm/wire.rs` (this file)
-//!   - `PayloadMetrics` / `RawPayloadOutput`
-//!     → `payload_metrics_postcard_roundtrip` /
-//!     `raw_payload_output_postcard_roundtrip`
+//!   - `PayloadMetrics`
+//!     → `payload_metrics_postcard_roundtrip`
 //!     → `src/test_support/payload.rs`
 //!   - `WorkloadConfig` → `payload_roundtrip`
 //!     → `src/test_support/payload.rs`
@@ -140,9 +139,6 @@ pub enum MsgType {
     /// Per-payload-invocation metrics (payload: postcard-encoded
     /// `PayloadMetrics`).
     PayloadMetrics,
-    /// Raw stdout/stderr captured from an LlmExtract payload (payload:
-    /// postcard-encoded `RawPayloadOutput`).
-    RawPayloadOutput,
     /// Coverage profraw blob.
     Profraw,
     /// Guest→host stdout chunk. Payload: opaque UTF-8 bytes. Each
@@ -281,7 +277,6 @@ impl MsgType {
             MsgType::SchedExit => MSG_TYPE_SCHED_EXIT,
             MsgType::Crash => MSG_TYPE_CRASH,
             MsgType::PayloadMetrics => MSG_TYPE_PAYLOAD_METRICS,
-            MsgType::RawPayloadOutput => MSG_TYPE_RAW_PAYLOAD_OUTPUT,
             MsgType::Profraw => MSG_TYPE_PROFRAW,
             MsgType::WprofTrace => MSG_TYPE_WPROF_TRACE,
             MsgType::WprofTraceChunk => MSG_TYPE_WPROF_TRACE_CHUNK,
@@ -317,7 +312,6 @@ impl MsgType {
             MSG_TYPE_SCHED_EXIT => Some(MsgType::SchedExit),
             MSG_TYPE_CRASH => Some(MsgType::Crash),
             MSG_TYPE_PAYLOAD_METRICS => Some(MsgType::PayloadMetrics),
-            MSG_TYPE_RAW_PAYLOAD_OUTPUT => Some(MsgType::RawPayloadOutput),
             MSG_TYPE_PROFRAW => Some(MsgType::Profraw),
             MSG_TYPE_WPROF_TRACE => Some(MsgType::WprofTrace),
             MSG_TYPE_WPROF_TRACE_CHUNK => Some(MsgType::WprofTraceChunk),
@@ -408,6 +402,17 @@ pub enum LifecyclePhase {
     /// reason suffix lives in the bytes after the 1-byte phase
     /// header.
     SchedulerNotAttached,
+    /// The injected verifier workload dispatched: after attach, at least
+    /// one worker of the `--ktstr-verifier-workload` run made forward
+    /// progress on-CPU (a positive, scheduler-agnostic dispatch proof).
+    /// Emitted by `ktstr_guest_init` Phase 5 only when a verifier-workload
+    /// run recorded a worker with non-zero `iterations` under a confirmed
+    /// SCHED_EXT policy (so a fair-class fallback cannot false-confirm).
+    /// Given a `PayloadStarting` frame, the ABSENCE of this frame means the
+    /// scheduler attached (sched_ext `enabled`) but never dispatched the
+    /// workload — a distinct, worse failure than never attaching. Carries
+    /// an empty suffix. Has no legacy COM2 sentinel equivalent.
+    WorkloadDispatched,
 }
 
 impl LifecyclePhase {
@@ -420,6 +425,7 @@ impl LifecyclePhase {
             LifecyclePhase::PayloadStarting => 2,
             LifecyclePhase::SchedulerDied => 3,
             LifecyclePhase::SchedulerNotAttached => 4,
+            LifecyclePhase::WorkloadDispatched => 5,
         }
     }
 
@@ -433,6 +439,7 @@ impl LifecyclePhase {
             2 => Some(LifecyclePhase::PayloadStarting),
             3 => Some(LifecyclePhase::SchedulerDied),
             4 => Some(LifecyclePhase::SchedulerNotAttached),
+            5 => Some(LifecyclePhase::WorkloadDispatched),
             _ => None,
         }
     }
@@ -481,10 +488,6 @@ pub const MSG_TYPE_CRASH: u32 = 0x4352_5348; // "CRSH"
 /// Per-payload-invocation metrics
 /// (payload: postcard-encoded `crate::test_support::PayloadMetrics`).
 pub const MSG_TYPE_PAYLOAD_METRICS: u32 = 0x504d_4554; // "PMET"
-
-/// Raw stdout/stderr captured from an LlmExtract payload
-/// (payload: postcard-encoded `crate::test_support::RawPayloadOutput`).
-pub const MSG_TYPE_RAW_PAYLOAD_OUTPUT: u32 = 0x5241_574f; // "RAWO"
 
 /// Coverage profraw blob (payload: raw `.profraw` bytes serialized by
 /// `__llvm_profile_write_buffer`).
@@ -564,7 +567,7 @@ pub const MSG_TYPE_SCHED_LOG: u32 = 0x5343_4c47; // "SCLG"
 /// `SCHEDULER_NOT_ATTACHED` sentinel strings.
 pub const MSG_TYPE_LIFECYCLE: u32 = 0x4c49_4645; // "LIFE"
 
-/// Guest→host kernel address parameters (payload: 16 bytes LE).
+/// Guest→host kernel address parameters (payload: 24 bytes LE).
 ///
 /// Sent BEFORE `MSG_TYPE_SYS_RDY` so the monitor has `phys_base`
 /// and `page_offset_base` before its first sample iteration.
@@ -620,8 +623,9 @@ pub struct KernAddrs {
     /// Symbol KVA of the guest's `page_offset_base` global (NOT the
     /// runtime value the symbol points at — host dereferences via
     /// `monitor::symbols::text_kva_to_pa_with_base` + `read_u64` once
-    /// it has `phys_base` resolved). Populated by
-    /// `vmm::rust_init::build_kern_addrs` reading `/proc/kallsyms`.
+    /// it has `phys_base` resolved). Read by
+    /// `crate::vmm::guest_comms::read_kernel_page_offset_base_from_kallsyms`
+    /// (called from `vmm::rust_init::init`) from `/proc/kallsyms`.
     /// Storage class: `.data..ro_after_init` per
     /// `arch/x86/kernel/head64.c:63` — written during
     /// `kernel_randomize_memory()` in `start_kernel`, frozen after
@@ -1142,7 +1146,7 @@ pub enum KernelOpTarget {
     /// sleeping tasks (which is our validation gate). TaskField
     /// rejects non-SCX tasks before reaching this field anyway.
     ///
-    /// Seven-layer task validation before any write/read lands:
+    /// Eight-layer task validation before any write/read lands:
     /// 1. `task->pid == requested_pid` (anti-mismatch),
     /// 2. `task->start_time` within
     ///    `[expected_start_time_ns, expected_start_time_ns + 10ms)`
@@ -1159,14 +1163,14 @@ pub enum KernelOpTarget {
     ///    `include/linux/sched/ext.h:227`),
     /// 6. `task->sched_class == &ext_sched_class` (the canonical
     ///    SCX-managed gate),
-    /// 7. `task->start_boottime != 0` (anti-slab-recycle: a
+    /// 7. (REMOVED) a former `task->policy == SCHED_EXT` gate: SCX
+    ///    claims fair-policy tasks via `sched_class` without changing
+    ///    `task->policy`, so a policy check would wrongly reject
+    ///    SCX-managed tasks that forked under `SCHED_NORMAL`. The
+    ///    number is kept so the surviving gates retain their labels.
+    /// 8. `task->start_boottime != 0` (anti-slab-recycle: a
     ///    freshly-zeroed slab page reads zero; live tasks have this
     ///    set to non-zero `ktime_get_boottime_ns()` at fork).
-    ///
-    /// (A former `task->policy == SCHED_EXT` gate was removed: SCX
-    /// claims fair-policy tasks via `sched_class` without changing
-    /// `task->policy`, so a policy check would wrongly reject
-    /// SCX-managed tasks that forked under `SCHED_NORMAL`.)
     TaskField {
         /// Guest-side PID of the target task. Both leaders and
         /// non-leader threads are addressable via the dispatcher's
@@ -1534,7 +1538,6 @@ mod tests {
             MSG_TYPE_SCHED_EXIT,
             MSG_TYPE_CRASH,
             MSG_TYPE_PAYLOAD_METRICS,
-            MSG_TYPE_RAW_PAYLOAD_OUTPUT,
             MSG_TYPE_PROFRAW,
             MSG_TYPE_WPROF_TRACE,
             MSG_TYPE_WPROF_TRACE_CHUNK,
@@ -1609,7 +1612,6 @@ mod tests {
             MsgType::SchedExit,
             MsgType::Crash,
             MsgType::PayloadMetrics,
-            MsgType::RawPayloadOutput,
             MsgType::Profraw,
             MsgType::WprofTrace,
             MsgType::WprofTraceChunk,
@@ -1663,10 +1665,6 @@ mod tests {
         assert_eq!(
             MsgType::PayloadMetrics.wire_value(),
             MSG_TYPE_PAYLOAD_METRICS
-        );
-        assert_eq!(
-            MsgType::RawPayloadOutput.wire_value(),
-            MSG_TYPE_RAW_PAYLOAD_OUTPUT
         );
         assert_eq!(MsgType::Profraw.wire_value(), MSG_TYPE_PROFRAW);
         assert_eq!(MsgType::WprofTrace.wire_value(), MSG_TYPE_WPROF_TRACE);
@@ -1737,7 +1735,6 @@ mod tests {
             MsgType::SchedExit,
             MsgType::Crash,
             MsgType::PayloadMetrics,
-            MsgType::RawPayloadOutput,
             MsgType::Profraw,
             MsgType::WprofTrace,
             MsgType::WprofTraceChunk,
@@ -1789,6 +1786,7 @@ mod tests {
             LifecyclePhase::PayloadStarting,
             LifecyclePhase::SchedulerDied,
             LifecyclePhase::SchedulerNotAttached,
+            LifecyclePhase::WorkloadDispatched,
         ];
         for p in all {
             let v = p.wire_value();
@@ -1816,6 +1814,7 @@ mod tests {
         assert_eq!(LifecyclePhase::PayloadStarting.wire_value(), 2);
         assert_eq!(LifecyclePhase::SchedulerDied.wire_value(), 3);
         assert_eq!(LifecyclePhase::SchedulerNotAttached.wire_value(), 4);
+        assert_eq!(LifecyclePhase::WorkloadDispatched.wire_value(), 5);
     }
 
     /// `SnapshotRequestPayload` round-trips through bytes — guards

@@ -18,7 +18,7 @@
 //!   [`FailureDumpReport`] so the test exercises the executor +
 //!   bridge + Op-variant pipeline without booting a guest. The
 //!   kernel-grounded accessor traversal is covered by the in-crate
-//!   unit tests in `src/scenario/snapshot.rs` which can build
+//!   unit tests in `src/scenario/snapshot/tests.rs` which can build
 //!   synthetic `RenderedValue::Struct` trees against the
 //!   `#[non_exhaustive]` types directly.
 //!
@@ -533,9 +533,10 @@ fn scenario_watch_snapshot_op_captures_exit_state(
     })?;
 
     // 3. The captured snapshot contains the expected exit state.
-    //    `stall` is set by scx-ktstr's `--stall-after=N` watchdog
-    //    mechanism (main.bpf.c writes `stall = 1` before returning
-    //    early from dispatch); the freeze coordinator captures the
+    //    `stall` is set by scx-ktstr's `--stall-after=N` mechanism
+    //    (userspace main.rs writes `bss.stall = 1`; the BPF
+    //    `ktstr_dispatch` then returns early via `if (stall) return;`,
+    //    causing the scx watchdog to fire); the freeze coordinator captures the
     //    live `.bss` after the kernel sched_ext path emits
     //    SCX_EXIT_ERROR_STALL. Walking `Snapshot::var("stall")`
     //    proves we captured live error-state, not pre-init zeros.

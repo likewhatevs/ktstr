@@ -5,8 +5,8 @@
 //! synthetic-fixture builders that both
 //! `tests/ctprof_compare.rs` and
 //! `tests/ctprof_show.rs` use to drive the public surface
-//! (CtprofSnapshot / write/load roundtrip / run_compare /
-//! run_show via the binary). Living here under `common/`
+//! (CtprofSnapshot / write/load roundtrip / run_compare as a
+//! direct library call / run_show via the binary). Living here under `common/`
 //! keeps the integration-test harness from picking the file up
 //! as its own test binary AND avoids the duplicated copies of
 //! these helpers across the two integration files.

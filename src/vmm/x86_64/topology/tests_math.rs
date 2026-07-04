@@ -20,7 +20,7 @@ fn make_cache_entry(level: u32) -> kvm_cpuid_entry2 {
         function: 0x4, // doesn't matter for the helper
         index: 0,
         flags: 0,
-        // Set cache level in bits [7:5], type=2 (unified) in [4:0],
+        // Set cache level in bits [7:5], type=2 (instruction) in [4:0],
         // and fill sharing/core fields with 0xfff / 0x3f (max host values)
         // to verify the helper overwrites them.
         eax: (level << 5) | 2 | (0xfff << 14) | (0x3f << 26),

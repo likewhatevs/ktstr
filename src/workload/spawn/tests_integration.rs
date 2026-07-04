@@ -81,6 +81,7 @@ fn worker_report_serde_roundtrip() {
         // silent default-zero on serde would lose that tag.
         group_idx: 7,
         affinity_error: None,
+        sched_policy_error: None,
         phase_slices: vec![PhaseSlice {
             phase_epoch: 1,
             cpus_used: [2usize].into_iter().collect(),
@@ -725,6 +726,7 @@ fn worker_report_serde_edge_cases() {
         is_messenger: false,
         group_idx: 0,
         affinity_error: None,
+        sched_policy_error: None,
         phase_slices: vec![],
         taobench_whole: None,
     };
@@ -764,6 +766,7 @@ fn worker_report_serde_edge_cases() {
         is_messenger: false,
         group_idx: usize::MAX,
         affinity_error: None,
+        sched_policy_error: None,
         phase_slices: vec![],
         taobench_whole: None,
     };
@@ -864,6 +867,7 @@ fn worker_report_debug_shows_field_values() {
         is_messenger: false,
         group_idx: 0,
         affinity_error: None,
+        sched_policy_error: None,
         phase_slices: vec![],
         taobench_whole: None,
     };
@@ -1054,7 +1058,8 @@ fn spawn_custom_produces_work() {
 /// pair (existing test
 /// `stop_and_collect_reaps_grandchild_from_panicking_custom_closure`
 /// pins the fork mode's panic shape). This regression guard
-/// proves the new D5 incompatibility check does NOT also reject
+/// proves the CloneMode/WorkType compatibility gate (the
+/// Thread+ForkExit rejection in spawn::mod) does NOT also reject
 /// the legitimate Fork+ForkExit combination.
 #[test]
 fn spawn_fork_with_forkexit_succeeds() {
@@ -1389,6 +1394,7 @@ fn fully_populated_report() -> WorkerReport {
         is_messenger: true,
         group_idx: 4,
         affinity_error: None,
+        sched_policy_error: None,
         phase_slices: vec![PhaseSlice {
             phase_epoch: 2,
             cpus_used: [1usize, 4, 6].into_iter().collect(),
@@ -1492,6 +1498,10 @@ fn assert_worker_report_eq(a: &WorkerReport, b: &WorkerReport) {
     assert_eq!(a.is_messenger, b.is_messenger, "is_messenger");
     assert_eq!(a.group_idx, b.group_idx, "group_idx");
     assert_eq!(a.affinity_error, b.affinity_error, "affinity_error");
+    assert_eq!(
+        a.sched_policy_error, b.sched_policy_error,
+        "sched_policy_error"
+    );
     // PhaseSlice derives PartialEq, so a single assert_eq! compares every
     // field and self-maintains when a field is added — no hand-rolled
     // per-field list to fall out of sync. The backdrop per-phase telemetry
@@ -1528,6 +1538,7 @@ fn worker_report_postcard_sentinel_roundtrip() {
     let mut report = fully_populated_report();
     report.exit_info = Some(WorkerExitInfo::Exited(1));
     report.affinity_error = Some("EINVAL".to_string());
+    report.sched_policy_error = Some("EACCES".to_string());
     let bytes = postcard::to_stdvec(&report).expect("encode");
     let decoded: WorkerReport = postcard::from_bytes(&bytes).expect("decode");
     assert!(
@@ -1536,6 +1547,7 @@ fn worker_report_postcard_sentinel_roundtrip() {
         decoded.exit_info
     );
     assert_eq!(decoded.affinity_error.as_deref(), Some("EINVAL"));
+    assert_eq!(decoded.sched_policy_error.as_deref(), Some("EACCES"));
     assert_worker_report_eq(&report, &decoded);
 }
 
@@ -1589,8 +1601,9 @@ fn worker_report_postcard_all_exit_info_variants_roundtrip() {
 /// Roundtrip a `WorkerReport::default()` shape through postcard.
 /// Production sentinels are constructed via
 /// `WorkerReport { ..WorkerReport::default() }` with select fields
-/// overridden (mod.rs uses this shape at the catch_unwind arm,
-/// pcomm-decode-failure arm, and pcomm-empty-payload arm). A
+/// overridden (mod.rs uses this shape at the worker decode-failure
+/// arm, the pcomm cardinality-mismatch arm, and the pcomm
+/// no-decodable-report arm). A
 /// silent codec regression on the default shape would corrupt
 /// every sentinel without surfacing in tests that only encode
 /// fully-populated reports.

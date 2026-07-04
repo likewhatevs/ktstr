@@ -112,7 +112,12 @@ pub(super) fn classify_fs_magic(magic: i64) -> Result<()> {
             "Ceph MDS does not participate in flock serialization between \
              ktstr peers on distinct nodes",
         ),
-        fs_magic::AFS => ("AFS", "AFS does not support flock(2)"),
+        fs_magic::AFS => (
+            "AFS",
+            "AFS flock(2) is simulated via server-side POSIX locks; its \
+             serialization depends on the flock_mode mount option \
+             (local/openafs/write) and on the AFS server",
+        ),
         fs_magic::FUSE => (
             "FUSE",
             "flock reliability depends on the userspace server's op \

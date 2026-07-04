@@ -171,7 +171,7 @@ mod scheduler;
 ///     Maps onto `KtstrTestEntry::config_content`. Required when
 ///     the scheduler declares `config_file_def`; rejected when the
 ///     scheduler does not. The pairing is enforced at compile time
-///     via a `const` assertion against `Payload::config_file_def`,
+///     via a `const` assertion against `Scheduler::config_file_def`,
 ///     and again at runtime by `KtstrTestEntry::validate` so direct
 ///     programmatic-entry construction sees the same gate.
 ///   - `expect_scx_bpf_error_contains = EXPR` — literal-substring
@@ -336,7 +336,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// | `sched_args = [..]` | no | Scheduler CLI args prepended before per-test `extra_sched_args`. |
 /// | `sysctls = [Sysctl::new("k", "v"), ..]` | no | Guest sysctls. |
 /// | `kargs = [..]` | no | Extra guest kernel cmdline args. |
-/// | `kernels = ["6.14", "7.0..=7.2", ..]` | no | Kernel specs the verifier sweeps. Same parser as the `--kernel` CLI flag — accepts exact versions, ranges (`..` or `..=`, both inclusive), git refs (`git+URL#REF`), paths, and cache keys. Each entry is validated at macro-expand time via the same `KernelId::parse` + `validate` the verifier uses at runtime; empty entries, inverted ranges, and `..`-containing strings whose endpoints aren't version-shaped (e.g. `"abc..def"`) are rejected. |
+/// | `kernels = ["6.14", "7.0..=7.2", ..]` | no | Kernel specs the verifier sweeps. Same parser as the `--kernel` CLI flag — accepts exact versions, ranges (`..` or `..=`, both inclusive), git refs (`git+URL#tag=NAME`), paths, and cache keys. Each entry is validated at macro-expand time via the same `KernelId::parse` + `validate` the verifier uses at runtime; empty entries, inverted ranges, and `..`-containing strings whose endpoints aren't version-shaped (e.g. `"abc..def"`) are rejected. |
 /// | `constraints = TopologyConstraints { .. }` | no | Gauntlet preset constraints — maps directly onto `Scheduler::constraints`. Filters which gauntlet topology presets exercise this scheduler. When given as a struct literal, the macro additionally cross-checks each literal field against the effective topology (explicit `topology` field if present, otherwise the `(1, 1, 2, 1)` default from `Scheduler::named`) and rejects infeasible pairings; non-struct-literal forms (e.g. `OTHER::CONST_CONSTRAINTS`) skip that check. |
 /// | `assert = Assert::NO_OVERRIDES.method().chain()` | no | Scheduler-wide assertion overrides — maps directly onto `Scheduler::assert`. Merged with `Assert::default_checks()` and the per-test `assert` at runtime (`default ← scheduler ← per-test`). Accepts any const-evaluable expression: a const path like `Assert::NO_OVERRIDES`, a const-fn call like `Assert::default_checks()`, or a chain of const-fn setters like `Assert::NO_OVERRIDES.check_not_starved().max_gap_ms(50)`. The macro accepts MethodCall chains and Path-rooted (type/module-prefixed) Calls — only bare single-segment lowercase Calls like `helper()` are rejected as non-const free-fn patterns; non-const methods on a Path receiver slip through and surface as a deep const-eval failure at the spread site. |
 /// | `config_file = "..."` | no | Host-side config file path. |
@@ -374,13 +374,10 @@ pub fn declare_scheduler(input: TokenStream) -> TokenStream {
 ///
 /// - `name = "..."` — short name used in logs and sidecar records.
 ///   Defaults to the binary name.
-/// - `output = Json | ExitCode | LlmExtract("hint")` — how the
-///   framework extracts metrics from the payload's stdout. The
-///   variant names match the `OutputFormat` enum and the `Polarity`
-///   kwarg grammar. Defaults to `ExitCode`. The `LlmExtract` form
-///   accepts an optional string literal focus hint appended to the
-///   default LLM prompt; bare `LlmExtract` with no parenthesized
-///   argument is a shorthand for `LlmExtract()` (no hint).
+/// - `output = Json | ExitCode` — how the framework extracts
+///   metrics from the payload's stdout. The variant names match the
+///   `OutputFormat` enum and the `Polarity` kwarg grammar. Defaults
+///   to `ExitCode`.
 ///
 /// # Optional outer attributes
 ///
@@ -556,9 +553,9 @@ mod tests {
             overlap.is_empty(),
             "BOOL_ATTR_NAMES and VALUE_ATTR_NAMES overlap: {overlap:?}",
         );
-        // Cardinality pin: 16 bool + 49 value = 65 accepted attributes.
+        // Cardinality pin: 16 bool + 50 value = 66 accepted attributes.
         assert_eq!(bool_names.len(), 16, "bool attribute count changed");
-        assert_eq!(value_names.len(), 49, "value attribute count changed");
+        assert_eq!(value_names.len(), 50, "value attribute count changed");
     }
 
     /// Contract pin: `ktstr_test::AttrValues::default()` is the single source of
@@ -567,9 +564,9 @@ mod tests {
     /// assertion a maintainer editing the [`Default`] impl can shift
     /// any user-visible default (auto_repro, kaslr, memory_mib, the
     /// gauntlet caps, etc.) with zero test feedback. Same precedent
-    /// as `host_mode_default_cgroup_parent_resolves` in
-    /// tests/host_mode_e2e.rs pinning a runtime const against
-    /// production source.
+    /// as `resolve_host_cgroup_parent_env_unset_returns_default` in
+    /// src/test_support/dispatch_tests.rs pinning a runtime const
+    /// against production source.
     #[test]
     fn attr_values_default_matches_documented_macro_defaults() {
         let d = ktstr_test::AttrValues::default();

@@ -32,7 +32,8 @@ fn repro_vm_builder_adds_probe_drain_grace_to_deadline() {
         &[],
     )
     .expect("repro builder builds for a no-wprof EEVDF entry");
-    let base = crate::test_support::runtime::vm_timeout_from_entry(&entry);
+    let base =
+        crate::test_support::runtime::vm_timeout_from_entry(&entry, entry.topology.total_cpus());
     assert_eq!(
         builder.timeout,
         base + PROBE_DRAIN_GRACE,
@@ -1663,9 +1664,10 @@ fn format_probe_diagnostics_no_cause_when_clean_run() {
 
 #[test]
 fn format_probe_diagnostics_no_cause_when_stitch_succeeded() {
-    // Successful stitch: events_before == events_after > 0.
-    // The cause line MUST NOT fire — the events line is its own
-    // sufficient summary.
+    // Successful stitch: events_before_stitch > 0 and
+    // events_after_stitch > 0 (146 -> 100). The cause line only fires
+    // on events_after_stitch == 0, so a non-zero after-count
+    // suppresses it — the events line is its own sufficient summary.
     let pipeline = PipelineDiagnostics::default();
     let skeleton = diag_with_events(146, 100, 1, 1025);
     let rendered = format_probe_diagnostics(&pipeline, &skeleton);

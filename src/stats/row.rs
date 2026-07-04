@@ -60,7 +60,7 @@ pub struct GauntletRow {
     /// Scheduler binary name carried from the source sidecar
     /// (`SidecarResult::scheduler`). Surfaced through the substring
     /// filter in [`compare_rows_by`] and the typed
-    /// `RowFilter::scheduler` so users can narrow A/B comparisons
+    /// `RowFilter::schedulers` so users can narrow A/B comparisons
     /// by scheduler name.
     pub scheduler: String,
     /// Kernel version carried from the source sidecar
@@ -158,8 +158,7 @@ pub struct GauntletRow {
     /// `"target_debug"`, `"path"`, ...). `None` for sidecars produced
     /// before the field existed (pre-1.0 disposable schema) and for skip
     /// rows (no binary resolved). Surfaced via the typed
-    /// [`RowFilter::resolve_sources`] (`--resolve-source` /
-    /// `--a-resolve-source` / `--b-resolve-source`) for narrowing +
+    /// [`RowFilter::resolve_sources`] (`--resolve-source`) for narrowing +
     /// pairing — same opt-in policy as `run_source` — and listed by
     /// `stats list-values`. Provenance, not identity: distinct
     /// from `scheduler` / `kernel_commit` — it records HOW the scheduler
@@ -231,7 +230,7 @@ pub struct GauntletRow {
     ///   struct access path inside the comparison pipeline.
     /// - `MetricDef.name == "worst_spread"` — the [`METRICS`]
     ///   registry key, which is the domain-level name that appears
-    ///   in sidecars, CI gates, and `cargo ktstr stats compare`
+    ///   in sidecars, CI gates, and `cargo ktstr perf-delta`
     ///   output.
     /// - DataFrame column `"spread"` — the polars column name used
     ///   when the rows are projected into a DataFrame for group /
@@ -350,9 +349,9 @@ pub struct GauntletRow {
     /// reduced over one scenario phase (BASELINE at
     /// `step_index = 0`, Step ordinals at `step_index = 1..=N`
     /// per the 1-indexed phase convention) so the per-phase
-    /// comparison renderer at [`compare_partitions`] can pair
+    /// comparison renderer at [`compare_partitions_noise`] can pair
     /// matched phases across two sidecars by `step_index` and
-    /// emit per-phase delta rows without re-deriving phase
+    /// emit per-phase spread rows without re-deriving phase
     /// boundaries.
     ///
     /// Empty when the source sidecar had no phase data — single-
@@ -367,6 +366,13 @@ pub struct GauntletRow {
     /// carrying an empty array.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub phases: Vec<crate::assert::PhaseBucket>,
+    /// Per-test [`crate::test_support::PerfDeltaAssertion`] declarations (owned
+    /// records) carried from the sidecar so the perf-delta noise compare can
+    /// enforce the declared gate. Empty for rows with none; `serde(default)`
+    /// tolerates legacy sidecars (pre-1.0 disposability). NOT a pairing/slicing
+    /// dimension — per-test gate metadata only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub perf_delta_assertions: Vec<crate::test_support::PerfDeltaAssertionRecord>,
 }
 
 impl GauntletRow {
@@ -419,16 +425,16 @@ impl GauntletRow {
 }
 
 /// Typed-field filter set for narrowing `GauntletRow` sets in the
-/// `cargo ktstr stats compare` pipeline. Every field is `None` /
+/// `cargo ktstr perf-delta` pipeline. Every field is `None` /
 /// empty by default; populated fields are AND-combined ACROSS
 /// fields, with field-internal OR/AND semantics described per-field
 /// below. Applied via `apply_row_filters` in `compare_partitions`
-/// before the rows reach `compare_rows`.
+/// before the rows reach `compare_rows_by`.
 ///
 /// Match semantics:
 /// - `scheduler` / `topology` / `work_type` — STRICT EQUALITY against
 ///   the row's corresponding field. The sibling substring filter on
-///   `compare_rows` (`-E`) stays as the only fuzzy-match knob;
+///   `compare_rows_by` (`-E`) stays as the only fuzzy-match knob;
 ///   typed fields are exact so a `--scheduler scx_rusty` filter does
 ///   NOT spuriously match `scx_rusty_alt`.
 /// - `kernels` — repeatable, OR-combined: a row matches iff its
@@ -525,16 +531,15 @@ pub struct RowFilter {
     /// [`crate::test_support::ResolveSource::as_str`] tags
     /// (`"auto_built"`, `"target_debug"`, `"path"`, ...). Distinct from
     /// `run_sources` (the run ENVIRONMENT): this is HOW the scheduler
-    /// binary was found. Backs the [`Dimension::ResolveSource`] slice
-    /// (`--resolve-source` / `--a-resolve-source` / `--b-resolve-source`).
+    /// binary was found. Backs the [`Dimension::ResolveSource`] filter +
+    /// pairing dim (`--resolve-source`).
     pub resolve_sources: Vec<String>,
     /// Repeatable cpu-budget filter, OR-combined: a row matches iff its
     /// `GauntletRow::cpu_budget` (the effective host-CPU budget, as a
     /// decimal string) equals ANY entry. Empty vec disables the filter.
     /// Rows with `cpu_budget == None` (skips) are dropped when this filter
     /// is non-empty, mirroring `kernels` / `run_sources`. Backs the
-    /// [`Dimension::CpuBudget`] slice (`--cpu-budget` / `--a-cpu-budget` /
-    /// `--b-cpu-budget`).
+    /// [`Dimension::CpuBudget`] filter + pairing dim (`--cpu-budget`).
     pub cpu_budgets: Vec<String>,
     /// Repeatable scheduler-name filter, OR-combined: a row matches
     /// iff its `GauntletRow::scheduler` equals ANY entry. Empty vec

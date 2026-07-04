@@ -52,7 +52,7 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
 Additional `custom_*` functions are available in
 `ktstr::scenario::{affinity, basic, cpuset, dynamic, interaction,
 nested, performance, stress}`. See the
-[API docs](https://likewhatevs.github.io/ktstr/api/ktstr/scenario/index.html)
+[API docs](https://ktstr.dev/rustdoc/ktstr/scenario/index.html)
 for the full list.
 
 Most tests use these canned functions or build custom scenarios with

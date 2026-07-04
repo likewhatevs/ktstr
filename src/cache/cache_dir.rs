@@ -78,7 +78,7 @@ const SHARED_LOCK_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// 5 minutes covers a `store` peer's full critical section in the
 /// worst case: under heavy parallelism N concurrent runners may
 /// contend on the SAME `cache_key`, where the head writer holds
-/// `LOCK_EX` while it copies the boot image, runs the 3-stage
+/// `LOCK_EX` while it copies the boot image, runs the two-stage
 /// vmlinux strip pipeline ([`super::vmlinux_strip::strip_vmlinux_debug`]),
 /// writes `metadata.json`, and finishes the
 /// [`super::housekeeping::atomic_swap_dirs`] swap. A real vmlinux
@@ -455,10 +455,11 @@ impl CacheDir {
     ///    sibling temp directories from crashed PIDs are GC'd before
     ///    we add another one.
     /// 5. **Copy the boot image.** `metadata.image_name` lands at
-    ///    `tmp/<image_name>` via `fs::copy`.
+    ///    `tmp/<image_name>` via `reflink::reflink_or_copy` (copy-on-write
+    ///    when the cache filesystem supports it, else a plain byte copy).
     /// 6. **Strip and copy vmlinux (if supplied).** When
     ///    `artifacts.vmlinux` is `Some`, `strip_vmlinux_debug`
-    ///    runs the 3-stage strip pipeline and the result is written
+    ///    runs the two-stage strip pipeline and the result is written
     ///    to `tmp/vmlinux`. **Strip-fallback rationale:** if the
     ///    strip pipeline returns an error (e.g. an unrecognised ELF
     ///    layout from a future toolchain or an exotic config), the
@@ -545,15 +546,15 @@ impl CacheDir {
         let _guard = TmpDirGuard(&tmp_dir);
 
         let image_dest = tmp_dir.join(&metadata.image_name);
-        fs::copy(artifacts.image, &image_dest)
-            .map_err(|e| anyhow::anyhow!("copy kernel image to cache: {e}"))?;
+        crate::reflink::reflink_or_copy(artifacts.image, &image_dest)
+            .context("copy kernel image to cache")?;
 
         let (has_vmlinux, vmlinux_stripped) = if let Some(vmlinux) = artifacts.vmlinux {
             let vmlinux_dest = tmp_dir.join("vmlinux");
             match strip_vmlinux_debug(vmlinux) {
                 Ok(stripped) => {
-                    fs::copy(stripped.path(), &vmlinux_dest)
-                        .map_err(|e| anyhow::anyhow!("copy stripped vmlinux to cache: {e}"))?;
+                    crate::reflink::reflink_or_copy(stripped.path(), &vmlinux_dest)
+                        .context("copy stripped vmlinux to cache")?;
                     (true, true)
                 }
                 Err(e) => {
@@ -565,8 +566,8 @@ impl CacheDir {
                          `cargo ktstr kernel list --json` \
                          vmlinux_stripped field.",
                     );
-                    fs::copy(vmlinux, &vmlinux_dest)
-                        .map_err(|e| anyhow::anyhow!("copy vmlinux to cache: {e}"))?;
+                    crate::reflink::reflink_or_copy(vmlinux, &vmlinux_dest)
+                        .context("copy vmlinux to cache")?;
                     (true, false)
                 }
             }

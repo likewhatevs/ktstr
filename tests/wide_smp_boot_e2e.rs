@@ -68,8 +68,10 @@ fn wide_smp_guest_boots_all_cpus_online(ctx: &Ctx) -> Result<AssertResult> {
 /// The same 256-vCPU, >254-APIC-ID guest as
 /// [`wide_smp_guest_boots_all_cpus_online`], booted with `cpu_budget = 64`:
 /// the no-perf path masks all 256 vCPU threads onto 64 host CPUs (4x
-/// oversubscription on a host with >= 64 allowed CPUs; clamped to the host
-/// allowance on smaller hosts). This pins that the `cpu_budget` knob does
+/// oversubscription on a host with >= 64 allowed CPUs; on a host with < 64
+/// allowed CPUs this `cpu_budget` is a `CpuBudgetUnsatisfiable` hard error
+/// (`resolve_cpu_budget`), so the test only runs where >= 64 CPUs are
+/// allowed). This pins that the `cpu_budget` knob does
 /// not BREAK wide-SMP boot under a constrained host mask — every vCPU still
 /// comes online despite the oversubscription (an oversubscription-wedged AP
 /// bring-up would leave vCPUs offline or hang). It does not itself observe

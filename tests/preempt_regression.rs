@@ -188,6 +188,7 @@ fn fault_under_lock(ctx: &WorkerCtx) -> WorkerReport {
         is_messenger: false,
         group_idx: 0,
         affinity_error: None,
+        sched_policy_error: None,
         phase_slices: vec![],
         taobench_whole: None,
     }
@@ -223,6 +224,7 @@ fn zeroed_report(tid: libc::pid_t, start: Instant) -> WorkerReport {
         is_messenger: false,
         group_idx: 0,
         affinity_error: None,
+        sched_policy_error: None,
         phase_slices: vec![],
         taobench_whole: None,
     }
@@ -233,9 +235,12 @@ fn zeroed_report(tid: libc::pid_t, start: Instant) -> WorkerReport {
 /// workload alongside pure CPU workers competing for the same CPUs.
 ///
 /// To compare across kernel versions: run this test on both kernels,
-/// compare `total_iterations` and `schedstat_run_delay_ns` from the
-/// worker reports. A regression shows as lower throughput and higher
-/// run delay on the affected kernel.
+/// compare `total_iterations` from the worker reports. A regression
+/// shows as lower throughput on the affected kernel. (This test's
+/// `fault_under_lock` Custom worker leaves `schedstat_run_delay_ns` at
+/// 0 — the framework returns a Custom worker's report verbatim and only
+/// populates schedstat deltas on the built-in worker path, so run delay
+/// carries no signal here.)
 #[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mib = 2048)]
 fn preempt_regression_fault_under_load(ctx: &Ctx) -> Result<AssertResult> {
     let futex_addr = init_shared_futex();

@@ -390,10 +390,13 @@ fn fill_phase_iteration_rates(
 /// never fired, the latter means it fired but no metric reading
 /// came back.
 ///
-/// Live production caller: `evaluate_vm_result` in
-/// `src/test_support/eval/mod.rs` drains the snapshot bridge, builds
-/// a `SampleSeries`, and routes it through this fn to populate
-/// `AssertResult.stats.phases`. Exposed `pub` (not `pub(crate)`)
+/// No live production caller: `evaluate_vm_result` in
+/// `src/test_support/eval/mod.rs` builds its phase buckets through the
+/// stimulus-aware sibling `build_phase_buckets_with_stimulus` (via
+/// `precompute_early_series`), and `AssertResult.stats.phases` is
+/// populated from those stimulus buckets. This plain variant is
+/// reachable only by full path, for the rare no-stimulus-timeline
+/// case. Exposed `pub` (not `pub(crate)`)
 /// so out-of-tree consumers — payload authors writing custom
 /// eval paths against the publicly-drainable
 /// `result.snapshot_bridge` — can produce the same per-phase
@@ -696,7 +699,7 @@ pub(crate) fn cpu_util_comp_scale(
 /// (accessor/attach lag) it starts later, so this key reflects a later
 /// workload sub-window. Across a cold/warm boot mix its cross-run magnitude
 /// shifts; use `--noise-adjust` (spread analysis absorbs the boot-timing
-/// jitter) for cross-run compares — a plain `--dual-run` single-pair compare
+/// jitter) for cross-run compares — a plain single-pair (cached) compare
 /// of this key is advisory.
 fn fold_util_comp_scale(
     metrics: &mut std::collections::BTreeMap<String, f64>,
@@ -759,7 +762,7 @@ fn fold_util_comp_scale(
 /// freezes, whose window starts later on a cold boot (the prereq-ready
 /// anchor), so `avg_task_lat_cri`'s cross-run magnitude shifts across a
 /// cold/warm boot mix; use `--noise-adjust` for cross-run compares —
-/// `--dual-run` single-pair is advisory.
+/// a single-pair (cached) compare is advisory.
 fn fold_lat_cri(
     metrics: &mut std::collections::BTreeMap<String, f64>,
     samples_in_phase: &[crate::scenario::sample::Sample<'_>],

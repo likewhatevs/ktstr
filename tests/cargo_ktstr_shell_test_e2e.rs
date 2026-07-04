@@ -130,8 +130,14 @@ fn shell_test_resolves_topology_from_named_test() {
 #[test]
 fn shell_test_unknown_test_bails_with_actionable_diagnostic() {
     // Uses raw `Command::new` rather than `run_cargo_ktstr_shell`
-    // because the unknown-test bail fires before any kernel-resolve
-    // path — no `--kernel` flag needed and no VM boot to gate on.
+    // so the `--exec` payload is `true` (a no-op) and the `--test`
+    // name is a fixed nonexistent one. Kernel resolution
+    // (run_shell → resolve_kernel_image, shell.rs:201) runs BEFORE
+    // the unknown-test probe (resolve_shell_from_test_entry,
+    // shell.rs:233); with no `--kernel` passed it resolves via the
+    // runner's kernel cache (find_kernel, resolve.rs:435), so the
+    // run reaches the probe and the unknown name bails — which is
+    // what this test pins. No VM boots because the bail precedes it.
     let output = std::process::Command::new(CARGO_KTSTR_BINARY)
         .arg("ktstr")
         .arg("shell")

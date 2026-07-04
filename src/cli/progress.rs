@@ -381,8 +381,12 @@ impl GroupBar {
 
 impl Drop for GroupBar {
     /// Clear the bar if it was not explicitly finished — covers the
-    /// download fns' error exits (HTTP failure, HTML reject, sha
-    /// mismatch, extraction error) that bail before [`Self::finish`].
+    /// download fns' extraction-error exit (bar already created, the
+    /// xz/gzip unpack fails via `?` before [`Self::finish`]) that
+    /// bails with a live, unfinished bar. HTTP failure and HTML reject
+    /// bail before the bar is constructed; a sha256 mismatch bails
+    /// after `finish()` has already run, so Drop is only a redundant
+    /// no-op there.
     /// Idempotent with `finish`: a second `finish_and_clear` is a
     /// no-op on an already-cleared bar.
     fn drop(&mut self) {

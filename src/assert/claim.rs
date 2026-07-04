@@ -19,8 +19,10 @@
 //!      The label comes from `stringify!(<token tree>)` over the
 //!      expression tokens.
 //!
-//! There is NO third "manual string" path. `Verdict` exposes no method
-//! that takes a caller-supplied subject string, by design.
+//! There is NO third recommended "manual string" path. The
+//! string-taking entry points on `Verdict` (`claim` / `claim_set` /
+//! `claim_seq` / `claim_present`) are `#[doc(hidden)]` and expected to
+//! be fed only by `stringify!` via the derive or the `claim!` macro.
 //!
 //! Comparator surface for [`ClaimBuilder<T>`]:
 //!   * `T: PartialOrd + Display` -> `at_least` / `at_most` / `lt` / `gt`
@@ -245,7 +247,7 @@ impl Verdict {
     /// Use when a test wants to surface a programmatically
     /// consumable measurement (e.g. `verdict.note_value("max_wchar",
     /// 12345i64)`) alongside pass/fail claims, so sidecar parsers
-    /// and `stats compare` dashboards can read the typed value
+    /// and `perf-delta` dashboards can read the typed value
     /// without re-grepping `details`.
     pub fn note_value(&mut self, key: impl Into<String>, value: impl Into<NoteValue>) -> &mut Self {
         self.result.note_value(key, value);
@@ -321,7 +323,8 @@ impl Verdict {
     /// [`AssertResult::merge`] semantics — `other.outcomes` are
     /// appended to this verdict's outcome stream, so the merge
     /// lattice (`Fail > Inconclusive > Pass > Skip`) folds across
-    /// both sides; `notes`/`measurements` are concatenated;
+    /// both sides; notes are concatenated, measurements are folded as
+    /// a keyed union (other's keys overwrite self's on collision);
     /// aggregate stats adopt the worst per dimension.
     pub fn merge(&mut self, other: AssertResult) -> &mut Self {
         self.result.merge(other);
@@ -556,13 +559,14 @@ impl Verdict {
                 ),
             }
         }
-        // Cap + truncation sentinel: once `MAX_RECORDED_PASSES` is
-        // exceeded, replace the cap-th slot with a sentinel record
-        // that names the dropped-count; further pushes become
-        // no-ops. The cap bounds the wire-formatted AssertResult so
-        // a pathological test firing millions of claims can't blow
+        // Cap + truncation sentinel: once `MAX_RECORDED_PASSES` real
+        // records have been stored, one sentinel record naming the
+        // dropped-count is appended (pushing the vec to
+        // `MAX_RECORDED_PASSES + 1`); further pushes become no-ops.
+        // The cap bounds the wire-formatted AssertResult so a
+        // pathological test firing millions of claims can't blow
         // past `MAX_BULK_FRAME_PAYLOAD`. Sentinel pattern mirrors
-        // `SnapshotBridge::EventLogTruncated`.
+        // `SnapshotBridgeEvent::EventLogTruncated`.
         let len = self.result.passes.len();
         if len < super::MAX_RECORDED_PASSES {
             let detail = match expected {

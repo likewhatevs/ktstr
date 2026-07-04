@@ -13,7 +13,7 @@ use anyhow::Result;
 /// `skipped: true, passed: false, inconclusive: false` so the strict
 /// 4-state mutex `(passed, skipped, inconclusive, fail)` holds and
 /// downstream consumers (`SidecarResult::is_pass()`,
-/// `select_failed_names`, `stats compare`) read the row as a Skip
+/// `select_failed_names`, `perf-delta`) read the row as a Skip
 /// rather than a Pass. This regression guards that contract against
 /// a future change that flips back to `passed: true` (which would
 /// double-count skipped runs into both pass and skip buckets and
@@ -78,7 +78,7 @@ fn write_skip_sidecar_records_skip_mutex() {
     );
     // write_skip_sidecar shares the host-context capture with
     // write_sidecar (same `collect_host_context()` builder line)
-    // so skip paths still give `stats compare --runs` a host
+    // so skip paths still give `perf-delta` a host
     // baseline. A regression that dropped the skip-path capture
     // would leave `host: None` in only the skip bucket, producing
     // silent per-run partial data.
@@ -410,6 +410,7 @@ fn sidecar_payload_and_metrics_always_emit_when_empty() {
         cleanup_duration_ms,
         run_source,
         resolve_source,
+        perf_delta_assertions: _,
     } = loaded;
     assert!(payload.is_none());
     assert!(metrics.is_empty());
@@ -450,7 +451,7 @@ fn sidecar_payload_and_metrics_always_emit_when_empty() {
 /// would lose the per-payload provenance the design requires).
 #[test]
 fn sidecar_payload_and_metrics_roundtrip_populated() {
-    use crate::test_support::{Metric, MetricSource, MetricStream, PayloadMetrics, Polarity};
+    use crate::test_support::{Metric, MetricStream, PayloadMetrics, Polarity};
     let pm = PayloadMetrics {
         payload_index: 0,
         metrics: vec![Metric {
@@ -458,7 +459,6 @@ fn sidecar_payload_and_metrics_roundtrip_populated() {
             value: 5000.0,
             polarity: Polarity::HigherBetter,
             unit: "iops".to_string(),
-            source: MetricSource::Json,
             stream: MetricStream::Stdout,
         }],
         exit_code: 0,
@@ -491,13 +491,12 @@ fn sidecar_payload_and_metrics_roundtrip_populated() {
     );
 }
 
-/// `write_sidecar` must populate `payload` from `entry.payload`
-/// so a test declaring a binary payload writes the payload name
-/// into the sidecar even when no payload-metrics have been
-/// threaded in yet. This pins the half-wired state the
-/// follow-up WOs will extend: stats tooling that already groups
-/// by payload name sees the grouping key on the sidecar
-/// immediately.
+/// `write_sidecar` records `entry.payload`'s name into
+/// `SidecarResult.payload` regardless of whether payload-metrics
+/// were captured, so a test declaring a binary payload writes the
+/// payload name into the sidecar even when no payload-metrics are
+/// passed. Stats tooling that groups by payload name sees the
+/// grouping key on the sidecar immediately.
 #[test]
 fn write_sidecar_records_entry_payload_name() {
     use crate::test_support::{OutputFormat, Payload, PayloadKind};
@@ -519,7 +518,6 @@ fn write_sidecar_records_entry_payload_name() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
@@ -551,17 +549,17 @@ fn write_sidecar_records_entry_payload_name() {
     assert_eq!(loaded.payload.as_deref(), Some("fio"));
     assert!(
         loaded.metrics.is_empty(),
-        "metrics stay empty until a Ctx-level accumulator lands",
+        "payload set, no payload-metrics passed -> metrics serialize as empty",
     );
 }
 
-/// `write_sidecar` must forward the `payload_metrics` slice
-/// into `SidecarResult.metrics` unmodified — once the
-/// follow-up Ctx-accumulator WO lands, stats tooling will see
-/// every `ctx.payload(X).run()` invocation's output in order.
+/// `write_sidecar` forwards the `payload_metrics` slice into
+/// `SidecarResult.metrics` unmodified, preserving per-invocation
+/// order, so stats tooling reads every `ctx.payload(X).run()`
+/// invocation's output in order.
 #[test]
 fn write_sidecar_forwards_payload_metrics_slice() {
-    use crate::test_support::{Metric, MetricSource, MetricStream, PayloadMetrics, Polarity};
+    use crate::test_support::{Metric, MetricStream, PayloadMetrics, Polarity};
 
     let _lock = lock_env();
     let tmp = tempfile::Builder::new()
@@ -589,7 +587,6 @@ fn write_sidecar_forwards_payload_metrics_slice() {
                 value: 1200.0,
                 polarity: Polarity::HigherBetter,
                 unit: "iops".to_string(),
-                source: MetricSource::Json,
                 stream: MetricStream::Stdout,
             }],
             exit_code: 0,
@@ -647,7 +644,6 @@ fn write_skip_sidecar_records_entry_payload_name() {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
-        metric_bounds: None,
     };
 
     fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
@@ -722,7 +718,7 @@ fn sidecar_variant_hash_excludes_host_context() {
 /// `scheduler_commit` is metadata, not a variant discriminator:
 /// two gauntlet runs differing only in the recorded scheduler
 /// commit (e.g. same variant re-run after a scheduler rebuild)
-/// must share one hash bucket so `stats compare` treats them as
+/// must share one hash bucket so `perf-delta` treats them as
 /// the same semantic variant. If a future change folds
 /// `scheduler_commit` into `sidecar_variant_hash`, this test
 /// catches it before the run-key split reaches on-disk sidecars
@@ -746,7 +742,7 @@ fn sidecar_variant_hash_excludes_scheduler_commit() {
         "scheduler_commit must not influence variant hash — \
          runs of the same semantic variant on different \
          scheduler-binary builds must remain comparable by \
-         `stats compare`",
+         `perf-delta`",
     );
 }
 
@@ -754,7 +750,7 @@ fn sidecar_variant_hash_excludes_scheduler_commit() {
 /// two gauntlet runs differing only in the recorded ktstr
 /// project commit (e.g. same variant re-run after a `git pull`
 /// of the harness, or run from two ktstr clones at different
-/// HEADs) must share one hash bucket so `stats compare`
+/// HEADs) must share one hash bucket so `perf-delta`
 /// treats them as the same semantic variant. If a future
 /// change folds `project_commit` into `sidecar_variant_hash`,
 /// this test catches it before the run-key split reaches
@@ -832,7 +828,7 @@ fn sidecar_variant_hash_excludes_project_commit() {
 /// source-tree commit (e.g. same variant re-run after a
 /// `git pull` of the kernel tree, or the same release rebuilt
 /// on top of a WIP patch) must share one hash bucket so
-/// `stats compare` treats them as the same semantic variant.
+/// `perf-delta` treats them as the same semantic variant.
 /// If a future change folds `kernel_commit` into
 /// `sidecar_variant_hash`, this test catches it before the
 /// run-key split reaches on-disk sidecars and splits
@@ -1006,7 +1002,7 @@ fn sidecar_variant_hash_excludes_resolve_source() {
 /// change is a different MEASUREMENT, separated downstream by the
 /// `Dimension::CpuBudget` pairing, not by shattering the identity bucket.
 /// Two runs of the same semantic variant at different budgets must still
-/// bucket together so `stats compare` can diff them — mirrors the
+/// bucket together so `perf-delta` can diff them — mirrors the
 /// commit / run_source exclusion tests.
 #[test]
 fn sidecar_variant_hash_excludes_cpu_budget() {
@@ -1029,7 +1025,7 @@ fn sidecar_variant_hash_excludes_cpu_budget() {
          of the same variant must bucket together (separated by the \
          CpuBudget Dimension, not the identity hash)",
     );
-    // vcpus exclusion (the field docs name this test as the pin for BOTH):
+    // vcpus exclusion (the sidecar_variant_hash fn doc names this test as
     // vary ONLY the numeric vcpus field, holding the hashed `topology`
     // STRING and cpu_budget equal, and assert the hash is unchanged. The
     // topology string is deliberately identical to `overcommit` so only
@@ -1858,6 +1854,51 @@ fn detect_project_commit_memoizes_across_consecutive_calls() {
         first, third,
         "third detect_project_commit call must still match the \
          first; got first={first:?}, third={third:?}",
+    );
+}
+
+/// `detect_project_commit` short-circuits to `KTSTR_PROJECT_COMMIT` when
+/// that env is set non-empty: perf-delta stamps it on both run children so
+/// the recorded `project_commit` equals the label the compare filters the
+/// pool on (the -dirty-suffix mismatch fix), and a no-`.git` gix baseline
+/// checkout needn't a `gix::discover`. An empty value is treated as unset
+/// and falls through to the cwd probe.
+#[test]
+fn detect_project_commit_honors_explicit_env_override() {
+    let saved = std::env::var(crate::KTSTR_PROJECT_COMMIT_ENV).ok();
+    fn restore(saved: &Option<String>) {
+        // SAFETY: std::env::set_var/remove_var became unsafe in Rust 2024
+        // (the libc environ pointer can race setenv's realloc across
+        // threads). Under nextest no concurrent reader of this var exists
+        // during the bracketed mutation; save+restore leaves the
+        // environment exactly as found.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var(crate::KTSTR_PROJECT_COMMIT_ENV, v),
+                None => std::env::remove_var(crate::KTSTR_PROJECT_COMMIT_ENV),
+            }
+        }
+    }
+
+    // SAFETY: see `restore`.
+    unsafe { std::env::set_var(crate::KTSTR_PROJECT_COMMIT_ENV, "deadbee-dirty") };
+    let explicit = super::super::detect_project_commit();
+    restore(&saved);
+    assert_eq!(
+        explicit.as_deref(),
+        Some("deadbee-dirty"),
+        "a non-empty KTSTR_PROJECT_COMMIT must be recorded verbatim",
+    );
+
+    // SAFETY: see `restore`.
+    unsafe { std::env::set_var(crate::KTSTR_PROJECT_COMMIT_ENV, "") };
+    let empty = super::super::detect_project_commit();
+    restore(&saved);
+    assert_ne!(
+        empty.as_deref(),
+        Some(""),
+        "an empty KTSTR_PROJECT_COMMIT is treated as unset (falls through to the \
+         cwd probe), never recorded as an empty commit label",
     );
 }
 

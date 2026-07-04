@@ -263,7 +263,7 @@ pub(super) struct BulkDispatchSinks<'a> {
 ///
 /// Non-SchedExit verdict frames (Stimulus, ScenarioStart,
 /// ScenarioEnd, Exit, TestResult, Crash, PayloadMetrics,
-/// RawPayloadOutput, Profraw, Stdout, Stderr, SchedLog, Lifecycle,
+/// Profraw, Stdout, Stderr, SchedLog, Lifecycle,
 /// ExecExit, Dmesg, ProbeOutput) accumulate even when `crc_ok` is
 /// false — the host-side consumers filter on per-type contract.
 /// SchedExit is the lone exception: its kill-flag promotion makes a
@@ -383,9 +383,15 @@ pub(super) fn dispatch_bulk_message(
         _ if msg.msg_type == crate::vmm::wire::MSG_TYPE_KERN_ADDRS => {
             // Payload carries (via [`crate::vmm::wire::KernAddrs`]):
             //   [0..8]   phys_base + 1                (biased)
-            //   [8..16]  page_offset_base             (unused by host
-            //                                          today — guest
-            //                                          sends 0)
+            //   [8..16]  page_offset_base             (not read by
+            //                                          this arm; guest
+            //                                          sends the symbol
+            //                                          KVA from
+            //                                          kallsyms, 0 only
+            //                                          on arm64 /
+            //                                          RANDOMIZE_MEMORY=n
+            //                                          / kallsyms
+            //                                          unreadable)
             //   [16..24] kernel_text_runtime_kva + 1  (biased; `_text`
             //                                          symbol from
             //                                          guest's
@@ -519,8 +525,11 @@ pub(super) fn dispatch_bulk_message(
                         // the SAME virt-KASLR (KASLR is a single
                         // boot-time slot pick stored in
                         // `kaslr_offset`). Release pairs with the
-                        // consumer `.load(Acquire)` at L9130 /
-                        // L5202.
+                        // consumer `.load(Acquire)` in the
+                        // periodic-capture gate
+                        // (`kern_virt_kaslr_published`) and the
+                        // cleanup-time accessor resolution in
+                        // freeze_coord/mod.rs.
                         //
                         // CAS-fail cross-check: an EQUAL value is
                         // the expected no-op (MSR_LSTAR publisher
@@ -819,7 +828,7 @@ pub(super) fn dispatch_bulk_message(
         Some(other) if !other.is_coordinator_internal() => {
             // Every other typed verdict-bearing variant
             // (StepEnd, Exit, TestResult, Crash, PayloadMetrics,
-            // RawPayloadOutput, Profraw, WprofTrace, WprofTraceChunk,
+            // Profraw, WprofTrace, WprofTraceChunk,
             // Stdout, Stderr, SchedLog, Lifecycle, ExecExit, Dmesg,
             // ProbeOutput) accumulates into the bucket verbatim. (ExecExit is listed for
             // completeness but is shell-mode-only -- sent only by

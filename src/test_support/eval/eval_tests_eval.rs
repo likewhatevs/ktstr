@@ -29,7 +29,6 @@ fn eval_eevdf_no_com2_output() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -65,7 +64,6 @@ fn eval_sched_exits_no_com2_output() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -96,7 +94,6 @@ fn eval_sched_exits_with_sched_log() {
         &entry,
         &result,
         &assertions,
-        &[],
         &[],
         &[],
         &EVAL_TOPO,
@@ -138,7 +135,6 @@ fn eval_sched_mid_test_exit_triggers_repro() {
         &entry,
         &result,
         &assertions,
-        &[],
         &[],
         &[],
         &EVAL_TOPO,
@@ -183,7 +179,6 @@ fn eval_sched_repro_no_data_shows_diagnostic() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &repro_fn,
         None,
@@ -215,7 +210,6 @@ fn eval_timeout_no_result() {
         &entry,
         &result,
         &assertions,
-        &[],
         &[],
         &[],
         &EVAL_TOPO,
@@ -255,7 +249,6 @@ fn eval_payload_exits_no_check_result() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -282,7 +275,6 @@ fn eval_sched_ext_dump_included() {
         &entry,
         &result,
         &assertions,
-        &[],
         &[],
         &[],
         &EVAL_TOPO,
@@ -316,7 +308,6 @@ fn eval_check_result_passed_returns_ok() {
             &assertions,
             &[],
             &[],
-            &[],
             &EVAL_TOPO,
             &no_repro,
             None,
@@ -344,7 +335,6 @@ fn eval_check_result_skip_returns_ok() {
         &entry,
         &result,
         &assertions,
-        &[],
         &[],
         &[],
         &EVAL_TOPO,
@@ -378,7 +368,6 @@ fn eval_check_result_failed_includes_details() {
             &entry,
             &result,
             &assertions,
-            &[],
             &[],
             &[],
             &EVAL_TOPO,
@@ -418,7 +407,6 @@ fn eval_cleanup_budget_overshoot_folds_failing_detail() {
             &entry,
             &result,
             &assertions,
-            &[],
             &[],
             &[],
             &EVAL_TOPO,
@@ -465,7 +453,6 @@ fn eval_cleanup_budget_under_passes() {
             &assertions,
             &[],
             &[],
-            &[],
             &EVAL_TOPO,
             &no_repro,
             None,
@@ -498,7 +485,6 @@ fn eval_cleanup_budget_equal_passes() {
             &entry,
             &result,
             &assertions,
-            &[],
             &[],
             &[],
             &EVAL_TOPO,
@@ -539,7 +525,6 @@ fn eval_assert_failure_includes_sched_log() {
             &assertions,
             &[],
             &[],
-            &[],
             &EVAL_TOPO,
             &no_repro,
             None,
@@ -572,7 +557,6 @@ fn eval_assert_failure_has_fingerprint() {
             &assertions,
             &[],
             &[],
-            &[],
             &EVAL_TOPO,
             &no_repro,
             None,
@@ -596,7 +580,6 @@ fn eval_timeout_has_fingerprint() {
         &entry,
         &result,
         &assertions,
-        &[],
         &[],
         &[],
         &EVAL_TOPO,
@@ -628,7 +611,6 @@ fn eval_no_result_has_fingerprint() {
         &entry,
         &result,
         &assertions,
-        &[],
         &[],
         &[],
         &EVAL_TOPO,
@@ -663,7 +645,6 @@ fn eval_no_sched_output_no_fingerprint() {
             &entry,
             &result,
             &assertions,
-            &[],
             &[],
             &[],
             &EVAL_TOPO,
@@ -776,7 +757,6 @@ fn eval_monitor_fail_has_fingerprint() {
             &assertions,
             &[],
             &[],
-            &[],
             &EVAL_TOPO,
             &no_repro,
             None,
@@ -804,7 +784,6 @@ fn eval_timeout_with_sched_includes_diagnostics() {
         &entry,
         &result,
         &assertions,
-        &[],
         &[],
         &[],
         &EVAL_TOPO,
@@ -846,7 +825,6 @@ fn eval_no_sentinels_shows_initramfs_failure() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -879,7 +857,6 @@ fn eval_init_started_but_no_payload() {
         &entry,
         &result,
         &assertions,
-        &[],
         &[],
         &[],
         &EVAL_TOPO,
@@ -918,7 +895,6 @@ fn eval_payload_started_no_result() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -945,7 +921,6 @@ fn eval_crash_in_output_says_guest_crashed() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -966,7 +941,6 @@ fn eval_crash_eevdf_says_guest_crashed() {
         &entry,
         &result,
         &assertions,
-        &[],
         &[],
         &[],
         &EVAL_TOPO,
@@ -1003,7 +977,6 @@ fn eval_crash_message_from_field() {
         &entry,
         &result,
         &assertions,
-        &[],
         &[],
         &[],
         &EVAL_TOPO,
@@ -1053,7 +1026,6 @@ fn eval_sched_exit_includes_console() {
             &entry,
             &result,
             &assertions,
-            &[],
             &[],
             &[],
             &EVAL_TOPO,
@@ -1138,7 +1110,6 @@ fn eval_sched_exit_includes_monitor() {
             &entry,
             &result,
             &assertions,
-            &[],
             &[],
             &[],
             &EVAL_TOPO,
@@ -1253,7 +1224,6 @@ fn eval_monitor_fail_includes_sched_log() {
             &assertions,
             &[],
             &[],
-            &[],
             &EVAL_TOPO,
             &no_repro,
             None,
@@ -1333,7 +1303,6 @@ fn phase_buckets_equals_stats_phases_and_post_vm_read_does_not_starve() {
         &result,
         &crate::assert::Assert::NO_OVERRIDES,
         &stimulus,
-        &[],
         &[],
         &EVAL_TOPO,
         &no_repro,
@@ -1426,7 +1395,6 @@ fn phase_buckets_equals_stats_phases_with_guest_per_cgroup_carriers() {
         &crate::assert::Assert::NO_OVERRIDES,
         &stimulus,
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -1507,7 +1475,6 @@ fn run_metric_equals_evaluate_run_level_ext() {
         &result,
         &crate::assert::Assert::NO_OVERRIDES,
         &stimulus,
-        &[],
         &[],
         &EVAL_TOPO,
         &no_repro,
@@ -2243,7 +2210,6 @@ fn evaluate_failure_message_renders_per_cgroup_via_folded_timeline() {
         &crate::assert::Assert::NO_OVERRIDES,
         &stimulus,
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -2329,7 +2295,6 @@ fn evaluate_synthesizes_phase_buckets_for_uncaptured_steps() {
         &result,
         &crate::assert::Assert::NO_OVERRIDES,
         &stimulus,
-        &[],
         &[],
         &EVAL_TOPO,
         &no_repro,
@@ -2434,7 +2399,6 @@ fn evaluate_folds_guest_per_cgroup_into_host_phase_buckets() {
         &result,
         &crate::assert::Assert::NO_OVERRIDES,
         &stimulus,
-        &[],
         &[],
         &EVAL_TOPO,
         &no_repro,
@@ -2552,7 +2516,7 @@ fn acquire_test_kernel_lock_if_cached_returns_none_outside_cache() {
 ///
 /// The test feeds the seam a representative shared-lock-timeout
 /// rendering (matching the literal format produced at
-/// `flock.rs::try_flock_with_deadline` — `"flock LOCK_SH on
+/// `flock/acquire.rs::acquire_flock_with_timeout` — `"flock LOCK_SH on
 /// {context} timed out after {timeout:?}"`) and the
 /// exclusive-lock equivalent. A negative-control string lacking
 /// the `"flock LOCK_"` marker must NOT match — that protects
@@ -2599,7 +2563,7 @@ fn flock_timeout_substring_classification_pins_seam() {
     );
 }
 
-// -- timed-out arm: scheduler-exited reason override (the `timeout_reason` block in evaluate_vm_result's `if result.timed_out` arm) --
+// -- timed-out arm: scheduler-exited reason override (the `timeout_reason` block in `render_no_result_message`'s `if result.timed_out` arm, reached via evaluate_vm_result) --
 
 /// Timed-out run whose stderr carries an scx-disable kmsg anchor with
 /// a NON-EMPTY parenthesized body: `parse_kmsg_window` parses the
@@ -2623,7 +2587,6 @@ fn eval_timeout_sched_exited_reason_override() {
         &entry,
         &result,
         &assertions,
-        &[],
         &[],
         &[],
         &EVAL_TOPO,
@@ -2668,7 +2631,6 @@ fn eval_timeout_sched_exited_empty_message() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -2709,7 +2671,6 @@ fn eval_timeout_with_crash_renders_both() {
         &entry,
         &result,
         &assertions,
-        &[],
         &[],
         &[],
         &EVAL_TOPO,
@@ -2760,7 +2721,6 @@ fn eval_noresult_sched_exited_from_kmsg() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -2792,7 +2752,6 @@ fn eval_noresult_sched_exited_empty_message() {
         &entry,
         &result,
         &assertions,
-        &[],
         &[],
         &[],
         &EVAL_TOPO,
@@ -2840,7 +2799,6 @@ ktstr-1 [001] 0.501: sched_ext_dump:   apply_cell_config returned -EINVAL
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -2882,7 +2840,6 @@ fn eval_failure_renders_info_notes_section() {
         &entry,
         &result,
         &assertions,
-        &[],
         &[],
         &[],
         &EVAL_TOPO,
@@ -2961,7 +2918,6 @@ fn eval_failure_renders_stats_section_with_spread_na() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -3023,7 +2979,6 @@ fn eval_failure_repro_section_on_guest_fail() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &repro_fn,
         None,
@@ -3061,7 +3016,6 @@ fn eval_failure_no_repro_section_without_active_scheduling() {
         &entry,
         &result,
         &assertions,
-        &[],
         &[],
         &[],
         &EVAL_TOPO,
@@ -3188,7 +3142,6 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -3242,7 +3195,6 @@ fn eval_inconclusive_verdict_word_in_header() {
         &entry,
         &result,
         &assertions,
-        &[],
         &[],
         &[],
         &EVAL_TOPO,
@@ -3299,7 +3251,6 @@ fn eval_scx_bpf_error_matcher_mismatch_wraps_context() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -3343,7 +3294,6 @@ fn eval_no_matcher_no_mismatch_context() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -3382,7 +3332,6 @@ fn eval_post_vm_err_folds_into_guest_pass() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         Some(&pv),
@@ -3396,49 +3345,6 @@ fn eval_post_vm_err_folds_into_guest_pass() {
     assert!(
         msg.contains("] failed:"),
         "the folded Other detail is a hard Fail -> verdict word `failed`, got: {msg}",
-    );
-}
-
-// -- host_extract_failures fold (the `for detail in host_extract_failures` loop in evaluate_vm_result's parse-success arm) --
-
-/// A non-empty `host_extract_failures` slice (the 6th param) folds each
-/// detail into an otherwise-PASSING guest `check_result` via
-/// the `for detail in host_extract_failures {
-/// check_result.merge(AssertResult::fail(detail.clone())) }` loop,
-/// flipping the verdict to failed and rendering the
-/// host-extract detail in the details block.
-#[test]
-fn eval_host_extract_failures_fold_into_guest_pass() {
-    let _lock = lock_env();
-    let _sd = isolated_sidecar_dir();
-    let assert = build_assert_result(true, vec![]);
-    let entry = eevdf_entry("__eval_host_extract_fold__");
-    let result = make_vm_result_with_assert("", "", 0, false, &assert);
-    let assertions = crate::assert::Assert::NO_OVERRIDES;
-    let host_fails = vec![AssertDetail::new(
-        DetailKind::Other,
-        "llm model unavailable",
-    )];
-    let err = evaluate_vm_result(
-        &entry,
-        &result,
-        &assertions,
-        &[],
-        &[],
-        &host_fails,
-        &EVAL_TOPO,
-        &no_repro,
-        None,
-    )
-    .unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("llm model unavailable"),
-        "the host-extract failure detail must render in the details block, got: {msg}",
-    );
-    assert!(
-        msg.contains("] failed:"),
-        "the folded host-extract failure must flip the verdict to failed, got: {msg}",
     );
 }
 
@@ -3471,7 +3377,6 @@ fn eval_sched_log_truncates_over_200_lines() {
         &entry,
         &result,
         &assertions,
-        &[],
         &[],
         &[],
         &EVAL_TOPO,
@@ -3537,7 +3442,6 @@ fn eval_failure_renders_bug_summary_line_via_closure() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -3598,7 +3502,6 @@ fn eval_failure_renders_periodic_samples_section() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -3655,7 +3558,6 @@ fn eval_failure_renders_temporal_assertions_section() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -3708,7 +3610,6 @@ fn eval_noresult_eevdf_with_sched_output_suppresses_console_section() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -3756,7 +3657,6 @@ fn eval_sched_fail_with_no_monitor_omits_monitor_section() {
         &assertions,
         &[],
         &[],
-        &[],
         &EVAL_TOPO,
         &no_repro,
         None,
@@ -3771,4 +3671,102 @@ fn eval_sched_fail_with_no_monitor_omits_monitor_section() {
         msg.contains("worker 0 stuck"),
         "the failure detail must still render (the guest-fail path ran), got: {msg}",
     );
+}
+
+// -- contention_not_attached_skip_reason: skip vs fail --
+
+/// Build a bulk drain with a single `SchedulerNotAttached` lifecycle
+/// frame carrying `reason` as its UTF-8 suffix (the shape the guest's
+/// `send_lifecycle` emits). `lifecycle_drain` drops the suffix, so the
+/// reason-bearing frame is built here.
+fn not_attached_drain(reason: &str) -> crate::vmm::host_comms::BulkDrainResult {
+    use crate::vmm::wire::{LifecyclePhase, MSG_TYPE_LIFECYCLE, ShmEntry};
+    let mut payload = vec![LifecyclePhase::SchedulerNotAttached.wire_value()];
+    payload.extend_from_slice(reason.as_bytes());
+    crate::vmm::host_comms::BulkDrainResult {
+        entries: vec![ShmEntry {
+            msg_type: MSG_TYPE_LIFECYCLE,
+            payload,
+            crc_ok: true,
+        }],
+    }
+}
+
+/// A still-in-flight enable (state=enabling) under host oversubscription
+/// (64 vCPUs on 8 allowed CPUs = 8x) is a contention SKIP.
+#[test]
+fn contention_skip_enabling_oversubscribed_skips() {
+    let drain = not_attached_drain("timeout: state=enabling");
+    let reason = contention_not_attached_skip_reason(Some(&drain), 64, 8, None);
+    assert!(
+        reason
+            .as_deref()
+            .is_some_and(|r| r.contains("oversubscription") && r.contains("enabling")),
+        "state=enabling + 8x oversubscription must classify as a contention skip, got {reason:?}",
+    );
+}
+
+/// The SAME still-in-flight enable on a FITTING host (8 vCPUs on 8 CPUs
+/// = 1.0x) is NOT a skip — a startup stall with no contention to blame
+/// is a real defect that must FAIL.
+#[test]
+fn contention_skip_enabling_fitting_host_fails() {
+    let drain = not_attached_drain("timeout: state=enabling");
+    assert_eq!(
+        contention_not_attached_skip_reason(Some(&drain), 8, 8, None),
+        None,
+        "state=enabling on a fitting host (1.0x) is a real defect, not a skip",
+    );
+}
+
+/// A REJECTED enable (state=disabling) is a real defect and must FAIL
+/// even under heavy oversubscription.
+#[test]
+fn contention_skip_disabling_never_skips() {
+    let drain = not_attached_drain("timeout: state=disabling");
+    assert_eq!(
+        contention_not_attached_skip_reason(Some(&drain), 64, 8, None),
+        None,
+        "a rejected enable (state=disabling) must FAIL, never skip, even oversubscribed",
+    );
+}
+
+/// state=disabled (a rejected enable, further along the disable path)
+/// also never skips.
+#[test]
+fn contention_skip_disabled_never_skips() {
+    let drain = not_attached_drain("timeout: state=disabled");
+    assert_eq!(
+        contention_not_attached_skip_reason(Some(&drain), 64, 8, None),
+        None,
+    );
+}
+
+/// A missing sched_ext sysfs (a config fault, not contention) never
+/// skips.
+#[test]
+fn contention_skip_sysfs_absent_never_skips() {
+    let drain = not_attached_drain("sched_ext sysfs absent");
+    assert_eq!(
+        contention_not_attached_skip_reason(Some(&drain), 64, 8, None),
+        None,
+    );
+}
+
+/// A `SchedulerDied` frame (the process exited during load — a verifier
+/// reject / crash) never skips, even oversubscribed.
+#[test]
+fn contention_skip_scheduler_died_never_skips() {
+    let drain = lifecycle_drain(&[crate::vmm::wire::LifecyclePhase::SchedulerDied]);
+    assert_eq!(
+        contention_not_attached_skip_reason(Some(&drain), 64, 8, None),
+        None,
+        "SchedulerDied is a real defect and must FAIL, never skip",
+    );
+}
+
+/// No lifecycle frame at all (a generic no-result run) never skips.
+#[test]
+fn contention_skip_no_frame_never_skips() {
+    assert_eq!(contention_not_attached_skip_reason(None, 64, 8, None), None);
 }

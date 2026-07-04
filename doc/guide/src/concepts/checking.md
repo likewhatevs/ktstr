@@ -90,8 +90,9 @@ When workers use a [`MemPolicy`](mem-policy.md), ktstr collects NUMA
 page placement data and checks it against thresholds:
 
 **Page locality** -- `assert_page_locality()` checks the fraction of
-pages residing on the expected NUMA node(s). Expected nodes are derived
-from the worker's `MemPolicy::node_set()` at evaluation time. Page
+pages residing on the expected NUMA node(s). Expected nodes are the
+cgroup's cpuset NUMA-node set, derived from the resolved cpuset via
+`TestTopology::numa_nodes_for_cpuset(cpuset)` at evaluation time. Page
 counts come from `WorkerReport::numa_pages` (parsed from
 `/proc/self/numa_maps`). Returns 0.0 when no pages are observed -- a
 zero-allocation workload is treated as zero-locality (not vacuously
@@ -654,9 +655,12 @@ combined.merge(cgroup_1_result);
 // combined.inconclusive_details() iterates inconclusive payloads
 ```
 
-Stats merging takes worst values across cgroups for spread, gap, wake
-latency, and migration ratio. Counters (`total_workers`, `total_cpus`,
-`total_migrations`, `total_iterations`) are summed.
+Stats merging takes worst values across cgroups for spread, gap, and
+migration ratio. Counters (`total_workers`, `total_cpus`,
+`total_migrations`, `total_iterations`) are summed. Wake-latency and
+run-delay distributions (and the NUMA / iteration-efficiency
+roll-ups) are not folded during merge — they re-pool post-merge from
+the per-cgroup raw samples via `populate_run_distribution_metrics`.
 
 For examples of overriding thresholds at the scheduler and per-test
 level, see [Customize Checking](../recipes/custom-checking.md).

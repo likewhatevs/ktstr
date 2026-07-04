@@ -5,9 +5,9 @@ use super::*;
 // Block-style array Display has a "template" optimization for
 // arrays of similar structs: when 3+ consecutive single-element
 // groups are structs of the same shape with < 8 differing
-// fields, they collapse into one `[start-end] struct {}` block
-// showing common fields once and varying fields in a per-index
-// table. Below the threshold (< 3 structs OR 0 or > 3 varying
+// fields, they collapse into one `[start-end] TypeName:`
+// breadcrumb block showing common fields once and varying fields
+// in a per-index table. Below the threshold (< 3 structs OR 0 or > 3 varying
 // fields), it falls back to the default block render.
 
 #[test]
@@ -142,7 +142,9 @@ fn array_of_identical_structs_groups_via_run() {
     // All-identical structs: the leading group walker collapses
     // them into one `[start-end]` group rather than the template
     // (template requires varying fields). Pins that the
-    // ConsecutiveSimilar detection routes correctly. The
+    // identical-element group-merge (mod.rs group walker, which
+    // extends the last group for equal consecutive elements)
+    // routes correctly rather than the varying-field template. The
     // grouped struct itself renders inline so the marker is
     // `[0-2] s{x=5}`.
     let s = RenderedValue::Struct {
@@ -189,10 +191,13 @@ fn array_inline_sparse_runs() {
 #[test]
 fn array_inline_all_zero_collapses() {
     // All-zero inline array renders the special "all N zero"
-    // collapse marker. Use bits:32 since bits:8 all-zero
-    // arrays trip the string-detection NUL-string branch
-    // (rendered as `""`) — see the "[all N zero]"
-    // short-circuit at the head of the Array Display arm.
+    // collapse marker. bits:32 and bits:8 behave identically
+    // here: the string gate requires a non-NUL first byte
+    // (`b != 0 && is_text_byte(b)`), so an all-zero array's NUL
+    // first byte keeps `is_string` false regardless of width —
+    // both collapse to `[all N zero]`. The `[all N zero]`
+    // short-circuit lives inside the inline-scalar branch of the
+    // Array Display arm (not at its head).
     let v = RenderedValue::Array {
         len: 3,
         elements: vec![
@@ -397,9 +402,9 @@ fn array_renders_multiline_string_with_pipe() {
 
 #[test]
 fn write_array_element_uint_wide_renders_hex() {
-    // write_array_element formats Uint with bits>=32 as hex,
-    // bits<32 stays decimal. Indirect coverage via array
-    // Display.
+    // The array Display arm's per-element render (render_elem
+    // closure) formats Uint with bits>=32 as hex, bits<32 stays
+    // decimal. Indirect coverage via array Display.
     let v = RenderedValue::Array {
         len: 2,
         elements: vec![
@@ -432,7 +437,8 @@ fn write_array_element_uint_wide_renders_hex() {
 /// Stub MemReader that returns canned bytes for specific arena
 /// addresses. Used to construct synthetic cycles in pointer
 /// chases. `bytes_by_addr` maps arena address → backing bytes;
-/// `arena_range` defines `is_arena_addr` accept set.
+/// `arena_start`/`arena_end` define the half-open range
+/// `is_arena_addr` accepts.
 struct CycleArenaReader {
     bytes_by_addr: std::collections::HashMap<u64, Vec<u8>>,
     arena_start: u64,

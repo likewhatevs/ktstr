@@ -31,8 +31,8 @@ use regex::Regex;
 
 /// Strip-trailing-digit happy path with a variety of separator
 /// chars in the prefix: `tokio-worker-12` → `tokio-worker-{N}`,
-/// `worker_5` → `worker_{N}`, etc. Pins that a separator before
-/// Token-based normalizer: every separator-delimited
+/// `worker_5` → `worker_{N}`, etc. Token-based normalizer:
+/// every separator-delimited
 /// digit-run is replaced with `{N}` (rule 1), every
 /// alpha-prefix-plus-digits token with `prefix{N}` (rule 3).
 /// Embedded digit tokens between separators normalize too —
@@ -64,18 +64,17 @@ fn pattern_key_bare_numeric_and_dangling_separator() {
     assert_eq!(pattern_key("worker-"), "worker-");
 }
 
-/// AlphaPrefix (no separator before the digit run) groups when
-/// the prefix length passes the min-prefix gate. This catches
-/// CamelCase names like `CamelCaseWord0`/`CamelCaseWord1`/...
-/// that compose 40% of the unobserved coverage gap on
-/// many-CPU hosts. `cpu0` (prefix `cpu` exactly 3 chars) groups
-/// — correct on hosts where every CPU spawns one such thread.
+/// AlphaPrefix (no separator before the digit run) groups via
+/// rule 3 (`^[A-Za-z]+[0-9]+$`); any alpha prefix of length ≥ 1
+/// qualifies. This catches CamelCase names like
+/// `CamelCaseWord0`/`CamelCaseWord1`/... and `cpu0` (`cpu` is a
+/// 3-char prefix example, not a boundary).
 #[test]
 fn pattern_key_alpha_prefix_groups_without_separator() {
     assert_eq!(pattern_key("CamelCaseWord0"), "CamelCaseWord{N}");
     assert_eq!(pattern_key("CamelCaseWord175"), "CamelCaseWord{N}");
     assert_eq!(pattern_key("worker7"), "worker{N}");
-    // 3-char prefix is the min boundary — `cpu` is exactly 3 chars.
+    // Any alpha prefix (length ≥ 1) groups; `cpu` is a 3-char example.
     assert_eq!(pattern_key("cpu0"), "cpu{N}");
     // No trailing digits at all → stays literal.
     assert_eq!(pattern_key("init"), "init");
