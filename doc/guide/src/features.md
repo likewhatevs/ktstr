@@ -539,7 +539,7 @@ guest and host coverage for unified `cargo llvm-cov` reports.
 
 Wraps `cargo nextest run` with automatic kernel resolution.
 Subcommands (in `--help` order): `test`, `coverage`, `llvm-cov`,
-`stats`, `replay`, `perf-delta`, `kernel`, `model`, `verifier`,
+`stats`, `replay`, `perf-delta`, `kernel`, `verifier`,
 `completions`, `show-host`, `show-thresholds`, `export`,
 `locks`, `shell`.
 See [`cargo-ktstr`](running-tests/cargo-ktstr.md).

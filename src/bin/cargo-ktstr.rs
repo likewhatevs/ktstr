@@ -146,7 +146,7 @@ fn main() {
 /// Fan out a parsed [`KtstrCommand`] to its subcommand handler.
 ///
 /// Split into [`dispatch_run_command`] (test/coverage/llvm-cov/stats/
-/// replay/perf-delta) and [`dispatch_admin_command`] (kernel/model/
+/// replay/perf-delta) and [`dispatch_admin_command`] (kernel/
 /// verifier/completions/host/thresholds/export/locks/shell)
 /// purely to keep each function under the source-function size guard;
 /// the run-group helper matches its variants and forwards every other
