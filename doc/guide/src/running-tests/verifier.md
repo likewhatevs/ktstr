@@ -257,13 +257,16 @@ scx_ktstr:
 ```
 
 Then a topology × scheduler PASS/FAIL grid (one row per topology, one
-column per scheduler — or per `scheduler @ kernel` when the sweep spans
-multiple kernels; `-` where a scheduler emitted no cell for that
-topology). ✅ means the scheduler verified, turned on, AND dispatched
-the injected workload; ❌ means it did not:
+column per scheduler; `-` where a scheduler emitted no cell for that
+topology). Kernels fold into the cell: ✅ means the scheduler verified,
+turned on, AND dispatched the injected workload on every kernel that ran
+it; ❌ means it failed on every kernel; 🇽 means it passed on at least one
+kernel and failed on another (only reachable in a multi-kernel sweep).
+The exact failing (scheduler / kernel / topology) tuples are listed
+under the grid:
 
 ```text
-verifier summary: 4 ✅  0 ❌
+verifier summary: 4 ✅  0 ❌  0 🇽
  topology    scx_ktstr   scx_other
  tiny-1llc   ✅          ✅
  tiny-2llc   ✅          ✅

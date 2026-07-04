@@ -24,7 +24,9 @@ callback receives (the host-side hook that runs after the VM exits):
   (`system_time_ns`, `user_time_ns`) and scheduling quality
   (`avg_imbalance_ratio`, `avg_dsq_depth`). (Wake-latency / run-delay
   distributions are run-level — `MetricKind::Distribution`, pooled across
-  cgroups — compared via `cargo ktstr perf-delta`, not per-phase.) All
+  cgroups into one whole-run value — so they cannot be split into the
+  scheduler phase vs the EEVDF phase; to compare them, run the scheduler
+  and EEVDF as two separate tests and read each run's run-level metric.) All
   flow through the one
   per-phase bucket pipeline, so a new metric becomes comparable here the
   moment it lands in that pipeline.
@@ -60,9 +62,10 @@ fn compare_vs_eevdf(result: &VmResult) -> Result<()> {
     // Scheduling quality: any PER-PHASE metric compares the same way via
     // phase_metric. Skip the gate when a phase has no reading (None) rather
     // than failing. (Wake-latency and run-delay distributions are RUN-LEVEL —
-    // MetricKind::Distribution, pooled across cgroups — so they are NOT
-    // readable via phase_metric; compare those via `cargo ktstr
-    // perf-delta` / the GauntletRow ext_metrics surface instead.)
+    // MetricKind::Distribution, pooled across cgroups into one whole-run
+    // value — so they are NOT readable via phase_metric and cannot be
+    // attributed to either phase; compare them by running the scheduler and
+    // EEVDF as two separate tests and reading each run's run-level metrics.)
     if let (Some(s), Some(e)) = (
         result.phase_metric(sched, "avg_imbalance_ratio"),
         result.phase_metric(eevdf, "avg_imbalance_ratio"),

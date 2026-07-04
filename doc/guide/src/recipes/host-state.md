@@ -76,6 +76,14 @@ Prints a `key: value` report covering:
   populates it. It collapses to `None` only for downstream library
   consumers that link jemalloc but do not install it as the global
   allocator (allocated and active bytes both zero).
+- `task_delayacct` — delay-accounting state from
+  `/proc/sys/kernel/task_delayacct`: `on`, `runtime-off` (built in but
+  the sysctl reads `0`), or `config-off` (the sysctl file is absent —
+  built without `CONFIG_TASK_DELAY_ACCT`). Gates which `taskstats` delay
+  fields populate.
+- `config_task_xacct` — `CONFIG_TASK_XACCT` build state probed from
+  `/proc/config.gz`. Gates the taskstats memory-watermark fields; there
+  is no runtime toggle.
 
 Absent fields render as `(unknown)` — an empty `sched_*` map
 renders as `(empty)` and a missing map renders as `(unknown)`.

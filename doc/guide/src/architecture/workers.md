@@ -73,6 +73,7 @@ pub struct WorkerReport {
     pub is_messenger: bool,
     pub group_idx: usize,
     pub affinity_error: Option<String>,
+    pub sched_policy_error: Option<String>,
     pub phase_slices: Vec<PhaseSlice>,
     pub taobench_whole: Option<TaobenchStats>,
 }
@@ -99,7 +100,11 @@ for the total observation count when the cap is exceeded.
 when the worker's `sched_setaffinity` (CPU-affinity) setup failed;
 the worker still runs and produces a report but the field documents
 the divergence from the requested affinity contract. `mbind` /
-mem-policy failures are not surfaced here.
+mem-policy failures are not surfaced here. `sched_policy_error` is
+`Some(reason)` when the worker's `set_sched_policy` call failed (`None`
+on success or for the `Normal` no-op); the worker still runs, and the
+verifier dispatch probe uses this to exclude a worker whose `SCHED_EXT`
+set was rejected (leaving it in the fair class).
 
 Three fields worth calling out explicitly:
 

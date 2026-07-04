@@ -371,9 +371,15 @@ Host-side monitor checks (imbalance ratio, DSQ depth, stall
 detection, fallback / keep-last event rates) walk every sample
 and record violations in the verdict details, but the default
 `enforce_monitor_thresholds = false` keeps them report-only.
-Set `enforce_monitor_thresholds = true` (or override individual
-thresholds from `MonitorThresholds::new()`) to make them gate
-the test result.
+Setting the individual monitor-threshold attributes on `#[ktstr_test]`
+(`max_imbalance_ratio`, `max_local_dsq_depth`, `fail_on_stall`,
+`max_fallback_rate`, `max_keep_last_rate`) tightens those thresholds,
+but they stay report-only — none of the per-test attributes enables
+enforcement. To make monitor violations gate the test, turn enforcement
+on at the scheduler level in the `declare_scheduler!` block:
+`assert = Assert::NO_OVERRIDES.with_monitor_defaults()`, which fills each
+unset monitor threshold with its canonical default and sets
+`enforce_monitor_thresholds = true`.
 
 Cpuset isolation is also opt-in -- enable it with `isolation = true`.
 Override the spread threshold and add throughput-parity gates:

@@ -4,7 +4,7 @@
 workflow. Subcommands in `--help` order: `test` (alias: `nextest`),
 `coverage`, `llvm-cov`, `stats`, `replay`, `perf-delta`, `kernel`,
 `verifier`, `completions`,
-`show-host`, `show-thresholds`, `export`, `locks`, `shell`.
+`show-host`, `show-thresholds`, `affected`, `export`, `locks`, `shell`.
 
 ## test
 

@@ -258,7 +258,9 @@ is advisory-only without an NLM peer and NFSv4 byte-range
 locking does not cover `flock(2)`; SMB does not emit
 `/proc/locks` entries so ktstr cannot enumerate peer holders;
 Ceph MDS does not participate in `flock` serialization across
-nodes; AFS does not support `flock(2)` at all; FUSE flock
+nodes; AFS only simulates `flock(2)` via server-side POSIX locks, so its
+serialization depends on the mount's `flock_mode` option and the AFS
+server; FUSE flock
 semantics depend on whether the userspace server implements the
 op. `try_flock` statfs-checks every lockfile path at open time
 via `reject_remote_fs` in `src/flock/fs_filter.rs` — hitting any

@@ -597,6 +597,7 @@ pub enum SchedPolicy {
         deadline: Duration,  // relative deadline from period start
         period: Duration,    // period; Duration::ZERO uses `deadline`
     },
+    Ext,             // SCHED_EXT — route the worker through the loaded sched_ext BPF scheduler
 }
 ```
 
@@ -608,7 +609,12 @@ time (in `set_sched_policy` before `sched_setattr`) so a malformed
 `Deadline` fails fast rather than tunneling `EINVAL` through the
 syscall. The const constructor `SchedPolicy::deadline(runtime,
 deadline, period)` itself is a struct-literal wrapper and does not
-validate at construction time.
+validate at construction time. `Ext` is `SCHED_EXT`: applied via a raw
+`sched_setattr` (glibc does not wrap the policy), it routes the worker
+through the loaded sched_ext BPF scheduler — even under a
+`SCX_OPS_SWITCH_PARTIAL` scheduler that leaves other tasks in fair — and
+requires a kernel built with `CONFIG_SCHED_CLASS_EXT`; it takes no
+priority or deadline parameters.
 
 ## Overriding work types
 
