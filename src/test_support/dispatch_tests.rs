@@ -717,7 +717,11 @@ fn filter_accepts_when_any_declared_spec_matches() {
     // Multiple declared specs; entry matches one of them.
     let e = mk_entry("6.15.3", "kernel_6_15_3", "/a");
     assert!(sched_kernel_filter_accepts(
-        &["6.14.2", "6.14..6.16", "git+https://example.com/r#branch=main"],
+        &[
+            "6.14.2",
+            "6.14..6.16",
+            "git+https://example.com/r#branch=main"
+        ],
         &e,
     ));
 }

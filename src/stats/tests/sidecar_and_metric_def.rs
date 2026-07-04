@@ -1599,7 +1599,14 @@ fn throughput_rate_floors_are_near_idle() {
     // Per-time throughput units: the baseline spans orders of magnitude across
     // workloads, so a fixed absolute floor cannot be scale-correct.
     const THROUGHPUT_UNITS: &[&str] = &[
-        "/s", "ns/s", "ops/s", "req/s", "irq/s", "softirq/s", "iter/s", "iter/cpu-s",
+        "/s",
+        "ns/s",
+        "ops/s",
+        "req/s",
+        "irq/s",
+        "softirq/s",
+        "iter/s",
+        "iter/cpu-s",
     ];
     for m in METRICS {
         // Throughput carriers: Rate, plus the phase-aware kinds that hold a
@@ -1620,14 +1627,21 @@ fn throughput_rate_floors_are_near_idle() {
         }
         // ns-denominated rates accrue in nanoseconds, so their idle floor is
         // ~1us (1000 ns); count/throughput rates idle near a single event/s.
-        let ceiling = if m.display_unit.contains("ns") { 1000.0 } else { 10.0 };
+        let ceiling = if m.display_unit.contains("ns") {
+            1000.0
+        } else {
+            10.0
+        };
         assert!(
             m.default_abs <= ceiling,
             "scale-varying rate `{}` has default_abs {} > near-idle ceiling {} \
              (unit {:?}): a high absolute floor masks a large RELATIVE regression \
              on a low-throughput workload (the #28 bug). Use a near-idle activity \
              floor and let default_rel carry materiality.",
-            m.name, m.default_abs, ceiling, m.display_unit,
+            m.name,
+            m.default_abs,
+            ceiling,
+            m.display_unit,
         );
     }
 }
@@ -1696,7 +1710,10 @@ fn scale_varying_count_floors_are_near_idle() {
              (unit {:?}): a high absolute floor masks a large RELATIVE regression \
              on a low-throughput workload (the #28 bug). Use a near-idle activity \
              floor and let default_rel carry materiality.",
-            m.name, m.default_abs, ceiling, m.display_unit,
+            m.name,
+            m.default_abs,
+            ceiling,
+            m.display_unit,
         );
     }
 }
@@ -1724,15 +1741,16 @@ fn mixed_class_scale_varying_floors_pinned() {
         ("schbench_loop_count", 1.0),
     ];
     for (name, ceiling) in PINNED {
-        let m =
-            metric_def(name).unwrap_or_else(|| panic!("pinned metric `{name}` not in METRICS"));
+        let m = metric_def(name).unwrap_or_else(|| panic!("pinned metric `{name}` not in METRICS"));
         assert!(
             m.default_abs <= *ceiling,
             "mixed-class scale-varying metric `{}` has default_abs {} > near-idle \
              ceiling {}: a high absolute floor masks a large RELATIVE regression on \
              a low-throughput workload (the #28 bug). These are not covered by the \
              (kind, unit) guards (mixed class), so this allowlist pins them.",
-            name, m.default_abs, ceiling,
+            name,
+            m.default_abs,
+            ceiling,
         );
     }
 }
@@ -1764,7 +1782,8 @@ fn rounded_mean_count_floors_above_rounding_noise() {
              round_i64 fold can differ by up to 1.0 per A/B pair, so a floor <= 1.0 lets \
              a rounding-only delta fabricate a unit regression (group.rs rounded-mean \
              invariant). Keep default_abs >= 2.0.",
-            name, m.default_abs,
+            name,
+            m.default_abs,
         );
     }
 }
@@ -1820,7 +1839,8 @@ fn all_metric_units_are_known() {
              throughput_rate_floors_are_near_idle / scale_varying_count_floors_are_near_idle \
              / mixed_class_scale_varying_floors_pinned with a near-idle floor; if bounded \
              (a fraction, ratio, percent, or fixed-unit latency), a fixed floor is correct.",
-            m.name, m.display_unit,
+            m.name,
+            m.display_unit,
         );
     }
 }

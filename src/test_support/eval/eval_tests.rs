@@ -1014,7 +1014,10 @@ fn overcommit_skip_keys_on_booted_not_declared_topology() {
     };
     let skip = super::overcommit_skip(&small, &host, Some(&big_preset))
         .expect("small declared on a large preset must skip on the BOOTED 31.5x oversubscription");
-    assert!(skip.is_skip(), "booted-oversubscription overcommit must yield a SKIP");
+    assert!(
+        skip.is_skip(),
+        "booted-oversubscription overcommit must yield a SKIP"
+    );
 
     // Inverse: large declared (256 vCPUs) dispatched onto a tiny preset
     // (1×2×1 = 2 booted vCPUs): declared 256/8 = 32x would SKIP, but the

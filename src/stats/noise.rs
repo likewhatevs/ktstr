@@ -300,8 +300,7 @@ pub fn noise_verdict_from(
     let separated = welch_separated || disjoint_bands;
     // ADVISORY only (see NoiseVerdict::high_spread): flags a noisy side, never
     // suppresses a separated verdict.
-    let high_spread =
-        a.spread_pct > spread_threshold_pct || b.spread_pct > spread_threshold_pct;
+    let high_spread = a.spread_pct > spread_threshold_pct || b.spread_pct > spread_threshold_pct;
     NoiseVerdict {
         a,
         b,
@@ -409,9 +408,18 @@ mod tests {
         let s = SideSummary::of(&[10.0, 20.0, 30.0]); // raw mean 20, var 100
         assert!(approx(s.mean, 20.0) && approx(s.sample_mean, 20.0));
         let p = s.with_pooled_mean(18.18);
-        assert!(approx(p.mean, 18.18), "reported mean is the pooled centroid");
-        assert!(approx(p.sample_mean, 20.0), "Welch mean stays the raw sample mean");
-        assert!(approx(p.var, 100.0), "variance stays the raw-sample variance");
+        assert!(
+            approx(p.mean, 18.18),
+            "reported mean is the pooled centroid"
+        );
+        assert!(
+            approx(p.sample_mean, 20.0),
+            "Welch mean stays the raw sample mean"
+        );
+        assert!(
+            approx(p.var, 100.0),
+            "variance stays the raw-sample variance"
+        );
         assert_eq!((p.min, p.max), (10.0, 30.0), "band stays raw");
     }
 
@@ -420,7 +428,10 @@ mod tests {
         // A [90,110] mean 100; B [95,105] mean 100. Bands overlap and the means
         // are equal -> Welch t=0 (p=1) and no disjoint bands -> not separated.
         let v = noise_verdict(&[90.0, 110.0, 100.0], &[95.0, 105.0, 100.0], 100.0);
-        assert!(!v.separated, "overlapping bands, equal means => not separated");
+        assert!(
+            !v.separated,
+            "overlapping bands, equal means => not separated"
+        );
     }
 
     #[test]
@@ -461,7 +472,10 @@ mod tests {
             v.a.max >= v.b.min,
             "bands must overlap so this exercises the Welch arm, not the floor",
         );
-        assert!(v.separated, "Welch t-test must separate overlapping-band sides");
+        assert!(
+            v.separated,
+            "Welch t-test must separate overlapping-band sides"
+        );
     }
 
     #[test]
@@ -473,7 +487,10 @@ mod tests {
         let v = noise_verdict(&[100.0, 100.0, 100.0], &[130.0, 130.0, 130.0], 5.0);
         assert_eq!(v.a.var, 0.0);
         assert_eq!(v.b.var, 0.0);
-        assert!(v.separated, "disjoint bands separate even when Welch is skipped");
+        assert!(
+            v.separated,
+            "disjoint bands separate even when Welch is skipped"
+        );
         assert!(!v.insufficient_samples);
     }
 
@@ -496,7 +513,10 @@ mod tests {
         // Both spreads exactly 1% at a 1% threshold: strict `>` => NOT flagged.
         let v = noise_verdict(&[99.5, 100.5], &[99.5, 100.5], 1.0);
         assert!(approx(v.a.spread_pct, 1.0));
-        assert!(!v.high_spread, "spread == threshold is not over it (strict >)");
+        assert!(
+            !v.high_spread,
+            "spread == threshold is not over it (strict >)"
+        );
     }
 
     /// Demonstration on the real schbench engine (host-side `run_standalone`, no
@@ -566,8 +586,7 @@ mod tests {
         // latency — separated (the disjoint-band floor and/or Welch) and clearing
         // A's whole observed band (reliable at 10x, not flaky).
         assert!(
-            diff.separated
-                && diff.b.mean > a.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            diff.separated && diff.b.mean > a.iter().copied().fold(f64::NEG_INFINITY, f64::max),
             "10x operations must read as a separated increase clearing A's band: A={:?} B={:?}",
             diff.a,
             diff.b,

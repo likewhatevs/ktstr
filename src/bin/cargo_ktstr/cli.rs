@@ -435,7 +435,7 @@ pub(crate) enum KtstrCommand {
             long = "phases-only",
             help_heading = "Phase rendering",
             conflicts_with = "no_phases",
-            requires = "noise_adjust",
+            requires = "noise_adjust"
         )]
         phases_only: bool,
         /// Within the `--noise-adjust` per-phase block, suppress the
@@ -469,7 +469,7 @@ pub(crate) enum KtstrCommand {
             long = "phase-threshold",
             help_heading = "Phase rendering",
             conflicts_with = "no_phases",
-            requires = "noise_adjust",
+            requires = "noise_adjust"
         )]
         phase_threshold: Option<f64>,
         /// Cargo BUILD profile for the scheduler-under-test on BOTH

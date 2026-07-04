@@ -741,7 +741,9 @@ mod tests {
         assert!(STALE_KCONFIG_EXPLANATION.starts_with("warning"));
         assert!(STALE_KCONFIG_EXPLANATION.contains("(stale kconfig)"));
         assert!(STALE_KCONFIG_EXPLANATION.contains("different ktstr.kconfig"));
-        assert!(STALE_KCONFIG_EXPLANATION.contains("kernel build --force --kernel <entry version>"));
+        assert!(
+            STALE_KCONFIG_EXPLANATION.contains("kernel build --force --kernel <entry version>")
+        );
     }
 
     /// `corrupt_footer_if_any` branches.
@@ -813,9 +815,7 @@ mod tests {
         assert!(NON_GIT_TREE_CACHE_SKIP_HINT.contains("not a git repository"));
         assert!(NON_GIT_TREE_CACHE_SKIP_HINT.contains("put the source under git"));
         assert!(NON_GIT_TREE_CACHE_SKIP_HINT.contains("kernel build --kernel <version>"));
-        assert!(
-            NON_GIT_TREE_CACHE_SKIP_HINT.contains("kernel build --kernel git+URL#branch=NAME")
-        );
+        assert!(NON_GIT_TREE_CACHE_SKIP_HINT.contains("kernel build --kernel git+URL#branch=NAME"));
         assert!(!NON_GIT_TREE_CACHE_SKIP_HINT.contains("stash"));
         assert!(!NON_GIT_TREE_CACHE_SKIP_HINT.contains("commit"));
     }
@@ -878,8 +878,9 @@ mod tests {
             #[command(subcommand)]
             cmd: KernelCommand,
         }
-        let parsed = TestCli::try_parse_from(["prog", "build", "--kernel", "6.14.2", "--cpu-cap", "4"])
-            .expect("kernel build --cpu-cap N must parse");
+        let parsed =
+            TestCli::try_parse_from(["prog", "build", "--kernel", "6.14.2", "--cpu-cap", "4"])
+                .expect("kernel build --cpu-cap N must parse");
         match parsed.cmd {
             KernelCommand::Build {
                 cpu_cap, kernel, ..
@@ -944,8 +945,9 @@ mod tests {
             #[command(subcommand)]
             cmd: KernelCommand,
         }
-        let parsed = TestCli::try_parse_from(["prog", "build", "--kernel", "6.14.2", "--cpu-cap", "0"])
-            .expect("clap-level parse must accept 0; runtime validation rejects");
+        let parsed =
+            TestCli::try_parse_from(["prog", "build", "--kernel", "6.14.2", "--cpu-cap", "0"])
+                .expect("clap-level parse must accept 0; runtime validation rejects");
         match parsed.cmd {
             KernelCommand::Build { cpu_cap, .. } => {
                 assert_eq!(cpu_cap, Some(0));
@@ -966,8 +968,9 @@ mod tests {
             #[command(subcommand)]
             cmd: KernelCommand,
         }
-        let parsed = TestCli::try_parse_from(["prog", "build", "--kernel", "6.14.2", "--skip-sha256"])
-            .expect("kernel build --skip-sha256 must parse");
+        let parsed =
+            TestCli::try_parse_from(["prog", "build", "--kernel", "6.14.2", "--skip-sha256"])
+                .expect("kernel build --skip-sha256 must parse");
         match parsed.cmd {
             KernelCommand::Build { skip_sha256, .. } => {
                 assert!(

@@ -1837,10 +1837,7 @@ pub(crate) fn noise_findings(
                         // so a run missing one cannot skew the pooled ratio (the
                         // per-run rate is undefined for it anyway).
                         let (num, den) = rows.iter().fold((0.0, 0.0), |(sn, sd), r| {
-                            match (
-                                r.ext_metrics.get(numerator),
-                                r.ext_metrics.get(denominator),
-                            ) {
+                            match (r.ext_metrics.get(numerator), r.ext_metrics.get(denominator)) {
                                 (Some(n), Some(d)) => (sn + n, sd + d),
                                 _ => (sn, sd),
                             }
@@ -2160,11 +2157,7 @@ fn noise_phase_findings(
     }
     let a_by_step = by_step(a_rows);
     let b_by_step = by_step(b_rows);
-    let steps: BTreeSet<u16> = a_by_step
-        .keys()
-        .chain(b_by_step.keys())
-        .copied()
-        .collect();
+    let steps: BTreeSet<u16> = a_by_step.keys().chain(b_by_step.keys()).copied().collect();
     for step_index in steps {
         match (a_by_step.get(&step_index), b_by_step.get(&step_index)) {
             (Some(a_buckets), Some(b_buckets)) => {
@@ -2276,10 +2269,22 @@ fn noise_phase_findings(
                 }
             }
             (Some(a_buckets), None) => {
-                push_noise_unpaired_step(coverage, pairing_label, step_index, ComparePartition::A, a_buckets);
+                push_noise_unpaired_step(
+                    coverage,
+                    pairing_label,
+                    step_index,
+                    ComparePartition::A,
+                    a_buckets,
+                );
             }
             (None, Some(b_buckets)) => {
-                push_noise_unpaired_step(coverage, pairing_label, step_index, ComparePartition::B, b_buckets);
+                push_noise_unpaired_step(
+                    coverage,
+                    pairing_label,
+                    step_index,
+                    ComparePartition::B,
+                    b_buckets,
+                );
             }
             (None, None) => {}
         }
@@ -2329,7 +2334,10 @@ pub(crate) fn summarize_side_runs(rows: &[GauntletRow]) -> (usize, String) {
     };
     (
         comparable,
-        format!("{} run(s): {comparable} comparable ({breakdown})", rows.len()),
+        format!(
+            "{} run(s): {comparable} comparable ({breakdown})",
+            rows.len()
+        ),
     )
 }
 
@@ -2495,8 +2503,7 @@ pub fn compare_partitions_noise(
         // per-phase table, and a single-phase run (no per-phase view) shows no
         // confusing 0/0 per-phase clause. Uses the same !any-flag-set
         // discipline as the aggregate paired-scenario hint.
-        let has_phase_data =
-            !report.phase_findings.is_empty() || !report.phase_coverage.is_empty();
+        let has_phase_data = !report.phase_findings.is_empty() || !report.phase_coverage.is_empty();
         let show_phase_footer = has_phase_data
             && !phase_opts.no_phases
             && phase_opts.phase.is_none()
@@ -2627,7 +2634,8 @@ pub(crate) fn format_noise_findings_table(
         // (its overrides drive the gate, or fall back to registry defaults if
         // rejected as out-of-range on a corrupt sidecar), so the operator can
         // tell an author-declared gate from a pure registry-default one.
-        let verdict_text = compose_noise_verdict_text(base, f.verdict.high_spread, f.kind, f.gated_by_assertion);
+        let verdict_text =
+            compose_noise_verdict_text(base, f.verdict.high_spread, f.kind, f.gated_by_assertion);
         let v = &f.verdict;
         table.add_row(vec![
             Cell::new(format!("{} / {}", f.pairing_label, f.metric.name)),
@@ -2790,7 +2798,12 @@ pub(crate) fn format_noise_phase_findings_lines(
             };
             // Same annotation composition as the aggregate table (advisory
             // `noisy spread` + `declared gate`).
-            let verdict_text = compose_noise_verdict_text(base, f.verdict.high_spread, f.kind, f.gated_by_assertion);
+            let verdict_text = compose_noise_verdict_text(
+                base,
+                f.verdict.high_spread,
+                f.kind,
+                f.gated_by_assertion,
+            );
             let v = &f.verdict;
             table.add_row(vec![
                 Cell::new(format!("{}: {}", f.step_index, f.label)),

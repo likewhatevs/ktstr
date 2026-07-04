@@ -96,8 +96,7 @@ pub(crate) fn normalize_to_repo_relative(
     prereq: &Path,
     repo_root_canonical: &Path,
 ) -> Option<String> {
-    let resolved =
-        std::fs::canonicalize(prereq).unwrap_or_else(|_| lexically_normalize(prereq));
+    let resolved = std::fs::canonicalize(prereq).unwrap_or_else(|_| lexically_normalize(prereq));
     let rel = resolved.strip_prefix(repo_root_canonical).ok()?;
     // Lossy is safe for scx (ASCII paths); the diff side uses the same
     // conversion so the two path spaces intersect consistently.

@@ -615,8 +615,9 @@ fn build_repro_vm_builder(
     // add a bounded drain grace so the watchdog cannot fire mid-flush and truncate
     // the captured-arg payload (which the host would then fail to parse and drop
     // as "auto-repro: no probe data"). See PROBE_DRAIN_GRACE.
-    builder =
-        builder.timeout(super::runtime::vm_timeout_from_entry(entry, vm_topology.total_cpus()) + PROBE_DRAIN_GRACE);
+    builder = builder.timeout(
+        super::runtime::vm_timeout_from_entry(entry, vm_topology.total_cpus()) + PROBE_DRAIN_GRACE,
+    );
 
     // Set the auto-repro failure-dump sink to a `.repro` sibling
     // of the primary's `{name}-{variant_hash}.failure-dump.json` so the auto-repro

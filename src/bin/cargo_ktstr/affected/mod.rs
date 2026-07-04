@@ -115,21 +115,20 @@ fn package_schedulers(schedulers: &[SchedulerInfo]) -> Vec<String> {
 /// `test_count` across binaries (a scheduler may be registered in more than
 /// one test binary).
 fn enumerate_schedulers() -> Result<Vec<SchedulerInfo>> {
-    let per_binary: Vec<Vec<ktstr::test_support::SchedulerListEntry>> =
-        crate::misc::probe_collect(
-            None,
-            false,
-            |bin| {
-                let mut c = Command::new(bin);
-                c.arg("--ktstr-list-schedulers");
-                c
-            },
-            |_bin, out| {
-                serde_json::from_slice::<Vec<ktstr::test_support::SchedulerListEntry>>(&out.stdout)
-                    .map_err(|e| format!("parse --ktstr-list-schedulers output: {e}"))
-            },
-        )
-        .map_err(|e| anyhow!("probe test binaries for declared schedulers: {e:?}"))?;
+    let per_binary: Vec<Vec<ktstr::test_support::SchedulerListEntry>> = crate::misc::probe_collect(
+        None,
+        false,
+        |bin| {
+            let mut c = Command::new(bin);
+            c.arg("--ktstr-list-schedulers");
+            c
+        },
+        |_bin, out| {
+            serde_json::from_slice::<Vec<ktstr::test_support::SchedulerListEntry>>(&out.stdout)
+                .map_err(|e| format!("parse --ktstr-list-schedulers output: {e}"))
+        },
+    )
+    .map_err(|e| anyhow!("probe test binaries for declared schedulers: {e:?}"))?;
 
     let mut by_name: BTreeMap<String, SchedulerInfo> = BTreeMap::new();
     for entry in per_binary.into_iter().flatten() {
@@ -653,12 +652,16 @@ impl WorkspaceGraph {
         let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         if let Some(resolve) = &meta.resolve {
             for node in &resolve.nodes {
-                let Some(from) = id_to_name.get(&node.id).filter(|n| member_names.contains(*n))
+                let Some(from) = id_to_name
+                    .get(&node.id)
+                    .filter(|n| member_names.contains(*n))
                 else {
                     continue;
                 };
                 for dep in &node.deps {
-                    let Some(to) = id_to_name.get(&dep.pkg).filter(|n| member_names.contains(*n))
+                    let Some(to) = id_to_name
+                        .get(&dep.pkg)
+                        .filter(|n| member_names.contains(*n))
                     else {
                         continue;
                     };
@@ -671,7 +674,10 @@ impl WorkspaceGraph {
                             )
                         });
                     if linked {
-                        edges.entry((*from).clone()).or_default().insert((*to).clone());
+                        edges
+                            .entry((*from).clone())
+                            .or_default()
+                            .insert((*to).clone());
                     }
                 }
             }
@@ -739,10 +745,7 @@ impl WorkspaceGraph {
 }
 
 /// Transitive closure of `start` over `edges` (includes `start`).
-fn transitive_closure(
-    start: &str,
-    edges: &BTreeMap<String, BTreeSet<String>>,
-) -> BTreeSet<String> {
+fn transitive_closure(start: &str, edges: &BTreeMap<String, BTreeSet<String>>) -> BTreeSet<String> {
     let mut seen = BTreeSet::new();
     let mut queue = VecDeque::new();
     queue.push_back(start.to_string());
@@ -765,8 +768,7 @@ fn transitive_closure(
 /// top-level `doc`/`docs` directory. STRICT (matched with `.all()` over the
 /// full changed set) -- `src/docs_render.rs` is NOT docs.
 fn is_docs_only(path: &str) -> bool {
-    path.ends_with(".md")
-        || matches!(path.split('/').next(), Some("doc" | "docs"))
+    path.ends_with(".md") || matches!(path.split('/').next(), Some("doc" | "docs"))
 }
 
 /// A change to workspace-root / build-graph infrastructure whose blast radius
@@ -826,9 +828,15 @@ mod tests {
         let mut closures = BTreeMap::new();
         closures.insert(
             "scx_a".to_string(),
-            ["scx_a", "scx_common"].iter().map(|s| s.to_string()).collect(),
+            ["scx_a", "scx_common"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         );
-        closures.insert("scx_b".to_string(), ["scx_b"].iter().map(|s| s.to_string()).collect());
+        closures.insert(
+            "scx_b".to_string(),
+            ["scx_b"].iter().map(|s| s.to_string()).collect(),
+        );
         closures.insert(
             "scx_common".to_string(),
             ["scx_common"].iter().map(|s| s.to_string()).collect(),
@@ -847,8 +855,14 @@ mod tests {
     #[test]
     fn owning_crate_longest_prefix() {
         let g = graph();
-        assert_eq!(g.owning_crate("scheds/rust/scx_a/src/main.rs"), Some("scx_a"));
-        assert_eq!(g.owning_crate("rust/scx_common/src/lib.rs"), Some("scx_common"));
+        assert_eq!(
+            g.owning_crate("scheds/rust/scx_a/src/main.rs"),
+            Some("scx_a")
+        );
+        assert_eq!(
+            g.owning_crate("rust/scx_common/src/lib.rs"),
+            Some("scx_common")
+        );
         // A shared header outside every crate dir has no owner (the .d layer
         // attributes it instead).
         assert_eq!(g.owning_crate("scheds/include/scx/common.bpf.h"), None);
@@ -871,7 +885,10 @@ mod tests {
         let c = transitive_closure("a", &edges);
         assert_eq!(
             c,
-            ["a", "b", "c"].iter().map(|s| s.to_string()).collect::<BTreeSet<_>>()
+            ["a", "b", "c"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<BTreeSet<_>>()
         );
     }
 
@@ -936,7 +953,12 @@ mod tests {
         let pkgs = vec!["scx_a".to_string()];
         let mut input_sets = BTreeMap::new();
         input_sets.insert("scx_a".to_string(), Some(BTreeSet::new()));
-        let out = attribute(&changed(&["tools/random_script.sh"]), &pkgs, &input_sets, &g);
+        let out = attribute(
+            &changed(&["tools/random_script.sh"]),
+            &pkgs,
+            &input_sets,
+            &g,
+        );
         assert_eq!(out, AffectedOutcome::RunAll);
     }
 
@@ -1005,10 +1027,16 @@ mod tests {
                 other => panic!("{spec} did not resolve to a commit: {other:?}"),
             }
         };
-        let changed =
-            diff::changed_paths_committed(&repo, oid("HEAD~1"), oid("HEAD")).expect("changed paths");
-        assert!(changed.contains("a.rs"), "rename source captured: {changed:?}");
-        assert!(changed.contains("b.rs"), "rename dest captured: {changed:?}");
+        let changed = diff::changed_paths_committed(&repo, oid("HEAD~1"), oid("HEAD"))
+            .expect("changed paths");
+        assert!(
+            changed.contains("a.rs"),
+            "rename source captured: {changed:?}"
+        );
+        assert!(
+            changed.contains("b.rs"),
+            "rename dest captured: {changed:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1106,8 +1134,14 @@ mod tests {
         // Match on the `NAME$` boundary `build_nextest_filter` emits, so a
         // dropped name is not falsely "found" as a prefix of a kept one
         // (e.g. `t_b` is a prefix of `t_builtin`).
-        assert!(expr.contains("t_a$"), "affected Discover pkg test kept: {expr}");
-        assert!(expr.contains("t_builtin$"), "package-less test kept: {expr}");
+        assert!(
+            expr.contains("t_a$"),
+            "affected Discover pkg test kept: {expr}"
+        );
+        assert!(
+            expr.contains("t_builtin$"),
+            "package-less test kept: {expr}"
+        );
         assert!(
             expr.contains("t_unknown$"),
             "unenumerable-scheduler test kept: {expr}"

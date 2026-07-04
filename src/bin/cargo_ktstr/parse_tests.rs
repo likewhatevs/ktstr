@@ -130,8 +130,11 @@ fn parse_perf_delta_flags_and_defaults() {
             assert_eq!(threshold, Some(12.5));
             assert!(policy.is_none());
             assert!(
-                !no_phases && !phases_only && !steps_only
-                    && phase.is_none() && phase_threshold.is_none(),
+                !no_phases
+                    && !phases_only
+                    && !steps_only
+                    && phase.is_none()
+                    && phase_threshold.is_none(),
                 "phase flags require --noise-adjust and are absent on the scalar path",
             );
             assert!(
@@ -225,7 +228,10 @@ fn parse_perf_delta_flags_and_defaults() {
         } => {
             assert_eq!(noise_adjust, Some(3));
             assert_eq!(noise_spread_threshold, Some(1.5));
-            assert!(phases_only, "--phases-only round-trips under --noise-adjust");
+            assert!(
+                phases_only,
+                "--phases-only round-trips under --noise-adjust"
+            );
             assert!(steps_only, "--steps-only round-trips under --noise-adjust");
             assert_eq!(
                 phase_threshold,
@@ -659,10 +665,19 @@ fn parse_test_with_nextest_profile_flag() {
 fn parse_test_include_eol_flag() {
     let Cargo {
         command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from(["cargo", "ktstr", "test", "--kernel", "6.11..6.14", "--include-eol"])
-        .unwrap_or_else(|e| panic!("{e}"));
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "test",
+        "--kernel",
+        "6.11..6.14",
+        "--include-eol",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Test {
-        kernel, include_eol, ..
+        kernel,
+        include_eol,
+        ..
     } = k.command
     else {
         panic!("expected Test");
@@ -835,7 +850,9 @@ fn parse_coverage_include_eol_flag() {
     ])
     .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Coverage {
-        kernel, include_eol, ..
+        kernel,
+        include_eol,
+        ..
     } = k.command
     else {
         panic!("expected Coverage");
@@ -1007,7 +1024,9 @@ fn parse_llvm_cov_include_eol_flag() {
     ])
     .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::LlvmCov {
-        kernel, include_eol, ..
+        kernel,
+        include_eol,
+        ..
     } = k.command
     else {
         panic!("expected LlvmCov");
@@ -1645,7 +1664,9 @@ fn parse_kernel_list_range_include_eol() {
         panic!("expected Kernel");
     };
     let KernelCommand::List {
-        kernel, include_eol, ..
+        kernel,
+        include_eol,
+        ..
     } = command
     else {
         panic!("expected KernelCommand::List, got {command:?}");
@@ -2309,7 +2330,9 @@ fn parse_verifier_include_eol_flag() {
     ])
     .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Verifier {
-        kernel, include_eol, ..
+        kernel,
+        include_eol,
+        ..
     } = k.command
     else {
         panic!("expected Verifier");
@@ -2409,7 +2432,8 @@ fn parse_verifier_forwards_flags_without_separator() {
         "../linux",
         "--features",
         "integration",
-    ]) else {
+    ])
+    else {
         panic!("expected Verifier");
     };
     assert_eq!(kernel, vec!["../linux"], "--kernel parsed as a native flag");
@@ -2475,7 +2499,8 @@ fn parse_verifier_with_profiles() {
         "ci",
         "--features",
         "integration",
-    ]) else {
+    ])
+    else {
         panic!("expected Verifier");
     };
     assert_eq!(kernel, vec!["../linux"]);
@@ -2557,7 +2582,8 @@ fn parse_test_flag_after_passthrough_is_native() {
         "--features",
         "integration",
         "--include-eol",
-    ]) else {
+    ])
+    else {
         panic!("expected Test");
     };
     assert!(
@@ -2589,7 +2615,8 @@ fn parse_test_flag_before_passthrough_is_native() {
         "--include-eol",
         "--features",
         "integration",
-    ]) else {
+    ])
+    else {
         panic!("expected Test");
     };
     assert!(include_eol);
@@ -2681,7 +2708,8 @@ fn parse_coverage_flag_after_passthrough_is_native() {
         "--features",
         "integration",
         "--include-eol",
-    ]) else {
+    ])
+    else {
         panic!("expected Coverage");
     };
     assert!(include_eol);
@@ -2703,7 +2731,8 @@ fn parse_llvm_cov_flag_after_passthrough_is_native() {
         "--features",
         "integration",
         "--include-eol",
-    ]) else {
+    ])
+    else {
         panic!("expected LlvmCov");
     };
     assert!(include_eol);
@@ -2723,7 +2752,15 @@ fn parse_test_double_dash_forces_passthrough() {
         kernel,
         args,
         ..
-    } = parse_via_split(&["cargo", "ktstr", "test", "--kernel", "6.14", "--", "--include-eol"])
+    } = parse_via_split(&[
+        "cargo",
+        "ktstr",
+        "test",
+        "--kernel",
+        "6.14",
+        "--",
+        "--include-eol",
+    ])
     else {
         panic!("expected Test");
     };
@@ -2740,9 +2777,15 @@ fn parse_test_double_dash_forces_passthrough() {
 /// inner tool — the documented way to pass nextest's own `--profile`.
 #[test]
 fn parse_test_profile_native_vs_passthrough_by_double_dash() {
-    let KtstrCommand::Test { profile, args, .. } =
-        parse_via_split(&["cargo", "ktstr", "test", "--profile", "dev", "--features", "x"])
-    else {
+    let KtstrCommand::Test { profile, args, .. } = parse_via_split(&[
+        "cargo",
+        "ktstr",
+        "test",
+        "--profile",
+        "dev",
+        "--features",
+        "x",
+    ]) else {
         panic!("expected Test");
     };
     assert_eq!(
@@ -2764,7 +2807,10 @@ fn parse_test_profile_native_vs_passthrough_by_double_dash() {
     ]) else {
         panic!("expected Test");
     };
-    assert_eq!(profile, None, "--profile after -- forwards to the inner tool");
+    assert_eq!(
+        profile, None,
+        "--profile after -- forwards to the inner tool"
+    );
     assert_eq!(
         args,
         vec!["--profile".to_string(), "nextest-ci".to_string()]
@@ -2830,10 +2876,7 @@ fn parse_test_passthrough_only_steals_nothing() {
         panic!("expected Test");
     };
     assert_eq!(kernel, vec!["6.14"]);
-    assert_eq!(
-        args,
-        vec!["--no-capture".to_string(), "-j4".to_string()]
-    );
+    assert_eq!(args, vec!["--no-capture".to_string(), "-j4".to_string()]);
 }
 
 /// `--help` stays a native (ktstr) flag — clap shows help rather than
@@ -2934,7 +2977,8 @@ fn parse_replay_all_flags_and_passthrough() {
         "ci",
         "--features",
         "integration",
-    ]) else {
+    ])
+    else {
         panic!("expected Replay");
     };
     assert_eq!(
@@ -4030,7 +4074,12 @@ fn parse_completions_binary_override() {
 /// the emitted `--`) so clap rejects it by name.
 #[test]
 fn parse_perf_delta_removed_ab_flag_is_clean_unknown_flag_error() {
-    for flag in ["--a-scheduler", "--b-scheduler", "--a-topology", "--b-topology"] {
+    for flag in [
+        "--a-scheduler",
+        "--b-scheduler",
+        "--a-topology",
+        "--b-topology",
+    ] {
         // Both the space-separated (`--a-scheduler scx_foo`) and the =value
         // (`--a-scheduler=scx_foo`) forms take distinct partition code paths
         // (the latter splits the token at `=`); both must route the flag into

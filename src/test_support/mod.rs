@@ -120,15 +120,15 @@ pub(crate) use args::{
 pub(crate) use runtime::{append_base_sched_args, content_hash, scratch_dir, sys_rdy_budget_ms};
 #[cfg(test)]
 pub(crate) use sidecar::enriched_parse_error_message_for_test;
-pub(crate) use sidecar::{
-    SidecarIoError, SidecarParseError, apply_archive_source_override, collect_sidecars,
-    collect_sidecars_with_errors, format_callback_profile, format_kvm_stats, format_verifier_stats,
-    is_run_directory, is_sidecar_filename, warn_skipped_sidecars,
-};
 pub use sidecar::{
     PerfDeltaAssertionRecord, SidecarResult, collect_pool, detect_kernel_commit,
     format_run_artifact_footer, newest_run_dir, repo_is_dirty, runs_root, sidecar_dir,
     source_dir_for,
+};
+pub(crate) use sidecar::{
+    SidecarIoError, SidecarParseError, apply_archive_source_override, collect_sidecars,
+    collect_sidecars_with_errors, format_callback_profile, format_kvm_stats, format_verifier_stats,
+    is_run_directory, is_sidecar_filename, warn_skipped_sidecars,
 };
 
 pub use dispatch::{
@@ -140,8 +140,8 @@ pub use dispatch::{
 pub use entry::{
     BinaryKindJson, BpfMapAgg, BpfMapWrite, CgroupPath, KTSTR_SCHEDULERS, KTSTR_TESTS,
     KtstrTestEntry, MemSideCache, NumaDistance, NumaNode, PerfDeltaAssertion, Scheduler,
-    SchedulerJson, SchedulerListEntry, SchedulerSpec, SchedulerTestJson,
-    Sysctl, Topology, TopologyConstraints, TopologyConstraintsJson, TopologyJson, WatchBpfMap,
+    SchedulerJson, SchedulerListEntry, SchedulerSpec, SchedulerTestJson, Sysctl, Topology,
+    TopologyConstraints, TopologyConstraintsJson, TopologyJson, WatchBpfMap,
     default_post_vm_periodic_fired, find_scheduler, find_test,
 };
 pub use eval::{KernelUnavailable, ResolveSource, resolve_scheduler, resolve_test_kernel};

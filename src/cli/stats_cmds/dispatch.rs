@@ -98,7 +98,13 @@ pub fn compare_partitions_noise(
     spread_threshold_pct: f64,
     phase_opts: &crate::stats::PhaseDisplayOptions,
 ) -> Result<i32> {
-    crate::stats::compare_partitions_noise(filter_a, filter_b, dir, spread_threshold_pct, phase_opts)
+    crate::stats::compare_partitions_noise(
+        filter_a,
+        filter_b,
+        dir,
+        spread_threshold_pct,
+        phase_opts,
+    )
 }
 
 /// Collect the current host context via

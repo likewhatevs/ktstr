@@ -680,18 +680,12 @@ pub(crate) fn try_spawn_scheduler(
                 // decision on this token; see the SchedulerNotAttached
                 // handling in src/test_support/eval.
                 let reason = match status {
-                    ScxAttachStatus::Timeout(Some(ScxState::Enabling)) => {
-                        "timeout: state=enabling"
-                    }
+                    ScxAttachStatus::Timeout(Some(ScxState::Enabling)) => "timeout: state=enabling",
                     ScxAttachStatus::Timeout(Some(ScxState::Disabling)) => {
                         "timeout: state=disabling"
                     }
-                    ScxAttachStatus::Timeout(Some(ScxState::Disabled)) => {
-                        "timeout: state=disabled"
-                    }
-                    ScxAttachStatus::Timeout(Some(ScxState::Enabled)) => {
-                        "timeout: state=enabled"
-                    }
+                    ScxAttachStatus::Timeout(Some(ScxState::Disabled)) => "timeout: state=disabled",
+                    ScxAttachStatus::Timeout(Some(ScxState::Enabled)) => "timeout: state=enabled",
                     ScxAttachStatus::Timeout(None) => "timeout: state=unknown",
                     ScxAttachStatus::SysfsAbsent => "sched_ext sysfs absent",
                     ScxAttachStatus::Attached => unreachable!(),

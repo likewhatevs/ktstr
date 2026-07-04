@@ -268,7 +268,15 @@ pub(crate) fn resolve_one(
             // clean / cpu_cap / extra_kconfig are `cargo ktstr kernel
             // build --kernel git+…`-only).
             let cache_dir = ktstr::cli::resolve_git_kernel(
-                url, git_ref, ref_kind, "cargo ktstr", mp, false, false, None, None,
+                url,
+                git_ref,
+                ref_kind,
+                "cargo ktstr",
+                mp,
+                false,
+                false,
+                None,
+                None,
             )
             .map_err(|e| format!("resolve git+{url}#{git_ref}: {e:#}"))?;
             let dir = canonicalize_cache_dir(cache_dir);

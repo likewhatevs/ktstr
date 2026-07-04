@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// `PhaseDisplayOptions::rel_threshold` returns the
 /// `phase_threshold` percent divided by 100 (the override
 /// branch) when the flag is set, regardless of what

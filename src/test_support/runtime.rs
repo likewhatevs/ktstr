@@ -1101,7 +1101,8 @@ mod tests {
         // between an otherwise-identical pair is exactly that budget.
         assert_eq!(
             vm_timeout_from_entry(&with_write, with_write.topology.total_cpus()),
-            vm_timeout_from_entry(&no_write, no_write.topology.total_cpus()) + COLD_BTF_PHASE1_BUDGET,
+            vm_timeout_from_entry(&no_write, no_write.topology.total_cpus())
+                + COLD_BTF_PHASE1_BUDGET,
             "bpf_map_write entries get the cold-BTF phase-1 budget added",
         );
     }
@@ -2373,7 +2374,10 @@ mod tests {
             duration: Duration::from_secs(30),
             ..KtstrTestEntry::DEFAULT
         };
-        assert_eq!(vm_timeout_from_entry(&entry, entry.topology.total_cpus()), Duration::from_millis(80_300));
+        assert_eq!(
+            vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
+            Duration::from_millis(80_300)
+        );
     }
 
     #[test]
@@ -2402,7 +2406,10 @@ mod tests {
             duration: Duration::from_millis(50),
             ..KtstrTestEntry::DEFAULT
         };
-        assert_eq!(vm_timeout_from_entry(&entry, entry.topology.total_cpus()), Duration::from_millis(21_300));
+        assert_eq!(
+            vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
+            Duration::from_millis(21_300)
+        );
     }
 
     #[test]
@@ -2414,7 +2421,10 @@ mod tests {
             name: "default",
             ..KtstrTestEntry::DEFAULT
         };
-        assert_eq!(vm_timeout_from_entry(&entry, entry.topology.total_cpus()), Duration::from_millis(32_300));
+        assert_eq!(
+            vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
+            Duration::from_millis(32_300)
+        );
     }
 
     #[test]
@@ -2440,7 +2450,10 @@ mod tests {
             },
             ..KtstrTestEntry::DEFAULT
         };
-        assert_eq!(vm_timeout_from_entry(&entry, entry.topology.total_cpus()), Duration::from_millis(50_900));
+        assert_eq!(
+            vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
+            Duration::from_millis(50_900)
+        );
     }
 
     #[test]

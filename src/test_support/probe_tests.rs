@@ -32,7 +32,8 @@ fn repro_vm_builder_adds_probe_drain_grace_to_deadline() {
         &[],
     )
     .expect("repro builder builds for a no-wprof EEVDF entry");
-    let base = crate::test_support::runtime::vm_timeout_from_entry(&entry, entry.topology.total_cpus());
+    let base =
+        crate::test_support::runtime::vm_timeout_from_entry(&entry, entry.topology.total_cpus());
     assert_eq!(
         builder.timeout,
         base + PROBE_DRAIN_GRACE,

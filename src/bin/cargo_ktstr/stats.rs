@@ -208,7 +208,6 @@ mod tests {
         );
     }
 
-
     /// Shared `--kernel V` pins BOTH sides to the same vec.
     /// Sugar for `--a-kernel V --b-kernel V`.
     #[test]
@@ -253,7 +252,6 @@ mod tests {
         assert_eq!(fb.kernels, vec!["6.15"]);
     }
 
-
     /// Sibling of `build_compare_filters_empty_yields_default_default`
     /// for the `run_sources` field. The existing empty-default test
     /// asserts on `run_sources` already — this companion adds the
@@ -282,7 +280,6 @@ mod tests {
         );
     }
 
-
     /// Shared `--run-source` pins BOTH sides to the same vec (run-source is
     /// filter + pairing only — no per-side override). Mirrors
     /// `build_compare_filters_shared_kernel_pins_both_sides` for
@@ -297,6 +294,4 @@ mod tests {
         assert_eq!(fa.run_sources, vec!["ci".to_string()]);
         assert_eq!(fb.run_sources, vec!["ci".to_string()]);
     }
-
-
 }

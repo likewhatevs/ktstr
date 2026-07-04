@@ -885,8 +885,8 @@ pub mod prelude {
         KTSTR_SCHEDULERS, KTSTR_TESTS, KtstrTestEntry, MemSideCache, Metric, MetricCheck,
         MetricHint, MetricStream, NumaDistance, NumaNode, OutputFormat, Payload, PayloadKind,
         PayloadMetrics, PerfDeltaAssertion, Polarity, Scheduler, SchedulerSpec, SidecarResult,
-        Sysctl, Topology,
-        TopologyConstraints, WatchBpfMap, extract_metrics, find_scheduler, find_test, sidecar_dir,
+        Sysctl, Topology, TopologyConstraints, WatchBpfMap, extract_metrics, find_scheduler,
+        find_test, sidecar_dir,
     };
     // The following items are intentionally NOT in the prelude. They
     // are binary-entry helpers (the `ktstr` / `cargo-ktstr` bins) or

@@ -198,13 +198,22 @@ fn promote_single_promotes_sole_directory() {
     let dest = tempfile::TempDir::new().unwrap();
     let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
     std::fs::create_dir(staging.path().join("linux-6.11.11")).unwrap();
-    std::fs::write(staging.path().join("linux-6.11.11").join("Makefile"), b"# fake").unwrap();
-    let out =
-        promote_single_kernel_tree(&staging, dest.path(), "linux-git-abc1234").unwrap();
+    std::fs::write(
+        staging.path().join("linux-6.11.11").join("Makefile"),
+        b"# fake",
+    )
+    .unwrap();
+    let out = promote_single_kernel_tree(&staging, dest.path(), "linux-git-abc1234").unwrap();
     assert_eq!(out, dest.path().join("linux-git-abc1234"));
     assert!(out.is_dir());
-    assert!(out.join("Makefile").is_file(), "promoted tree keeps its contents");
-    assert!(!staging.path().join("linux-6.11.11").exists(), "renamed out of staging");
+    assert!(
+        out.join("Makefile").is_file(),
+        "promoted tree keeps its contents"
+    );
+    assert!(
+        !staging.path().join("linux-6.11.11").exists(),
+        "renamed out of staging"
+    );
 }
 
 #[test]
@@ -2603,8 +2612,7 @@ fn download_github_archive_500_is_hard_error() {
 #[test]
 #[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
 fn download_github_archive_rejects_html_body() {
-    let (_server, url) =
-        mock_codeload(200, b"<!DOCTYPE html><html>nope</html>", Some("text/html"));
+    let (_server, url) = mock_codeload(200, b"<!DOCTYPE html><html>nope</html>", Some("text/html"));
     let dest = tempfile::TempDir::new().expect("tempdir");
     let err = super::download_github_archive(
         &test_client(),
@@ -2630,8 +2638,7 @@ fn download_github_archive_rejects_html_body() {
 #[test]
 #[ignore = "flaky in the full CI suite: the localhost mock TCP connect times out under concurrent VM-boot load; run with --run-ignored on an uncontended host"]
 fn download_github_archive_garbage_gzip_fails_clean() {
-    let (_server, url) =
-        mock_codeload(200, b"this is not gzip data", Some("application/gzip"));
+    let (_server, url) = mock_codeload(200, b"this is not gzip data", Some("application/gzip"));
     let dest = tempfile::TempDir::new().expect("tempdir");
     let err = super::download_github_archive(
         &test_client(),
@@ -3250,7 +3257,10 @@ fn git_cache_key_sanitizes_slashed_ref() {
     let h = "abc1234abc1234abc1234abc1234abc1234abc12";
     let key = git_cache_key("for-next/core", h);
     assert!(!key.contains('/'), "cache key must not contain `/`: {key}");
-    assert!(!key.contains(".."), "cache key must not contain `..`: {key}");
+    assert!(
+        !key.contains(".."),
+        "cache key must not contain `..`: {key}"
+    );
     assert!(
         key.starts_with(&format!("for-next_core-git-{h}-")),
         "slashed ref must sanitize `/` -> `_`: {key}"
@@ -3265,7 +3275,10 @@ fn git_cache_key_sanitizes_slashed_ref() {
 fn git_cache_key_sanitizes_dot_prefixed_and_nul_refs() {
     let h = "abc1234abc1234abc1234abc1234abc1234abc12";
     let dot = git_cache_key(".hidden", h);
-    assert!(!dot.starts_with('.'), "leading `.` must be sanitized: {dot}");
+    assert!(
+        !dot.starts_with('.'),
+        "leading `.` must be sanitized: {dot}"
+    );
     assert!(
         dot.starts_with(&format!("_.hidden-git-{h}-")),
         "leading `.` is prefixed with `_`: {dot}"

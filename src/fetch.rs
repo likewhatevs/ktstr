@@ -1395,9 +1395,11 @@ pub fn download_tarball(
                 // version simply does not exist — surface the friendly
                 // "not found" suggestion (with the latest in-series patch)
                 // instead of a cryptic fetch failure.
-                let Some(commit_hash) =
-                    resolve_ref_commit(STABLE_MIRROR_URL, &tag, crate::kernel_path::GitRefKind::Tag)
-                else {
+                let Some(commit_hash) = resolve_ref_commit(
+                    STABLE_MIRROR_URL,
+                    &tag,
+                    crate::kernel_path::GitRefKind::Tag,
+                ) else {
                     anyhow::bail!("{}", version_not_found_msg(client, version));
                 };
                 let archive_url = github_archive_url(STABLE_MIRROR_URL, &commit_hash)
@@ -1800,7 +1802,13 @@ pub(crate) fn git_cache_key(git_ref: &str, commit_hash: &str) -> String {
     // two at different commits differ in the hash segment.
     let safe_ref: String = git_ref
         .chars()
-        .map(|c| if c == '/' || c == '\\' || c == '\0' { '_' } else { c })
+        .map(|c| {
+            if c == '/' || c == '\\' || c == '\0' {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     let safe_ref = safe_ref.replace("..", "__");
     // A leading `.` (hidden entry, `.` / `..`) is rejected by
@@ -1887,7 +1895,10 @@ pub(crate) fn github_archive_url(url: &str, commit_hash: &str) -> Option<String>
 /// `Ref::Unborn` carries no commit and never matches. Used by the
 /// kind-directed [`resolve_ref_commit`] so tag-peeling and
 /// unborn-skipping stay consistent.
-fn pick_ref_object(refs: &[gix::protocol::handshake::Ref], target: &str) -> Option<gix::hash::ObjectId> {
+fn pick_ref_object(
+    refs: &[gix::protocol::handshake::Ref],
+    target: &str,
+) -> Option<gix::hash::ObjectId> {
     refs.iter().find_map(|r| {
         let (name, object) = match r {
             gix::protocol::handshake::Ref::Peeled {
@@ -2165,11 +2176,11 @@ fn git_clone_inner(
         anon_open_opts(),
     )
     .with_context(|| "prepare clone")?
-        .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
-            NonZeroU32::new(1).expect("1 is nonzero"),
-        ))
-        .with_ref_name(Some(git_ref))
-        .with_context(|| "set ref name")?;
+    .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
+        NonZeroU32::new(1).expect("1 is nonzero"),
+    ))
+    .with_ref_name(Some(git_ref))
+    .with_context(|| "set ref name")?;
 
     // Tag path only: gix's single-branch-shallow fetch derives its
     // refspec from `with_ref_name` via Category::LocalBranch

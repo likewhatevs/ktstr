@@ -1611,8 +1611,9 @@ mod tests {
             #[command(subcommand)]
             cmd: KernelCommand,
         }
-        let parsed = TestCli::try_parse_from(["prog", "build", "--kernel", "6.14.2", "--cpu-cap", "4"])
-            .expect("kernel build --cpu-cap N must parse");
+        let parsed =
+            TestCli::try_parse_from(["prog", "build", "--kernel", "6.14.2", "--cpu-cap", "4"])
+                .expect("kernel build --cpu-cap N must parse");
         match parsed.cmd {
             KernelCommand::Build {
                 cpu_cap, kernel, ..
@@ -1660,8 +1661,9 @@ mod tests {
             #[command(subcommand)]
             cmd: KernelCommand,
         }
-        let parsed = TestCli::try_parse_from(["prog", "build", "--kernel", "6.14.2", "--cpu-cap", "0"])
-            .expect("clap-level parse must accept 0; runtime validation rejects");
+        let parsed =
+            TestCli::try_parse_from(["prog", "build", "--kernel", "6.14.2", "--cpu-cap", "0"])
+                .expect("clap-level parse must accept 0; runtime validation rejects");
         match parsed.cmd {
             KernelCommand::Build { cpu_cap, .. } => {
                 assert_eq!(

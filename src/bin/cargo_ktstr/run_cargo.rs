@@ -1102,17 +1102,15 @@ mod tests {
         assert_eq!(
             filters,
             strs(&[
-                "test(a)",
-                "test(b)",
-                "test(c)",
-                "test(d)",
-                "test(e)",
-                "test(f)",
+                "test(a)", "test(b)", "test(c)", "test(d)", "test(e)", "test(f)",
             ]),
         );
         // Positional filter + unrelated flag survive untouched (nextest ANDs
         // positional filters with the filterset dimension, so they need no fold).
-        assert_eq!(rest, strs(&["positional_name", "--features", "integration"]));
+        assert_eq!(
+            rest,
+            strs(&["positional_name", "--features", "integration"])
+        );
     }
 
     /// With no user filterset, the relevant expression is injected verbatim as a
@@ -1120,10 +1118,7 @@ mod tests {
     #[test]
     fn compose_relevant_no_user_filterset() {
         let out = compose_relevant_filter(strs(&["--features", "x"]), "test(r1) | test(r2)");
-        assert_eq!(
-            out,
-            strs(&["--features", "x", "-E", "test(r1) | test(r2)"]),
-        );
+        assert_eq!(out, strs(&["--features", "x", "-E", "test(r1) | test(r2)"]),);
     }
 
     /// With user filtersets present, the composition INTERSECTS
@@ -1132,7 +1127,14 @@ mod tests {
     #[test]
     fn compose_relevant_intersects_user_filtersets() {
         let out = compose_relevant_filter(
-            strs(&["-E", "test(u1)", "--features", "x", "--filterset", "test(u2)"]),
+            strs(&[
+                "-E",
+                "test(u1)",
+                "--features",
+                "x",
+                "--filterset",
+                "test(u2)",
+            ]),
             "test(r)",
         );
         assert_eq!(

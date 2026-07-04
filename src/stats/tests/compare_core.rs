@@ -1699,7 +1699,7 @@ fn compare_partitions_noise_pools_duplicate_pairing_keys() {
         1.0,
         &PhaseDisplayOptions::default(),
     )
-        .expect("noise compare must pool N duplicate-key runs per side, not reject them");
+    .expect("noise compare must pool N duplicate-key runs per side, not reject them");
     assert_eq!(
         exit, 0,
         "identical metrics across the two sides must yield no confident \
@@ -2056,7 +2056,8 @@ fn noise_side(scenario: &str, spread: f64, iters: u64) -> Vec<GauntletRow> {
 fn noise_findings_rate_centroid_is_pooled_not_mean_of_ratios() {
     let mk = |run_delay: f64, wall: f64| {
         let mut r = cmp_row("rate", "tiny-1llc", true, 10.0, 0);
-        r.ext_metrics.insert("total_run_delay".to_string(), run_delay);
+        r.ext_metrics
+            .insert("total_run_delay".to_string(), run_delay);
         r.ext_metrics
             .insert("total_schedstat_wall_sec".to_string(), wall);
         r
@@ -2072,7 +2073,10 @@ fn noise_findings_rate_centroid_is_pooled_not_mean_of_ratios() {
         .unwrap_or_else(|| {
             panic!(
                 "run_delay_per_sec must appear: {:?}",
-                rep.findings.iter().map(|f| f.metric.name).collect::<Vec<_>>(),
+                rep.findings
+                    .iter()
+                    .map(|f| f.metric.name)
+                    .collect::<Vec<_>>(),
             )
         });
     // Pooled Σnum/Σden = 200/11 = 18.18..., NOT mean-of-ratios (100+10)/2 = 55.
@@ -2095,7 +2099,8 @@ fn noise_findings_rate_centroid_is_pooled_not_mean_of_ratios() {
 fn noise_findings_derives_schedstat_rate_from_per_run_components() {
     let mk = |run_delay: f64| {
         let mut r = cmp_row("sched", "tiny-1llc", true, 10.0, 0);
-        r.ext_metrics.insert("total_run_delay".to_string(), run_delay);
+        r.ext_metrics
+            .insert("total_run_delay".to_string(), run_delay);
         r.ext_metrics.insert("total_pcount".to_string(), 1000.0);
         r
     };
@@ -2111,7 +2116,10 @@ fn noise_findings_derives_schedstat_rate_from_per_run_components() {
         .unwrap_or_else(|| {
             panic!(
                 "derived schedstat rate must appear in noise findings: {:?}",
-                rep.findings.iter().map(|f| f.metric.name).collect::<Vec<_>>(),
+                rep.findings
+                    .iter()
+                    .map(|f| f.metric.name)
+                    .collect::<Vec<_>>(),
             )
         });
     assert_eq!(
@@ -2234,10 +2242,22 @@ fn noise_phase_scoped_regression_is_render_only_not_gated() {
     // metric fields are identical across sides (cmp_row defaults), only the
     // phase bucket shifts. Per-phase is render-only, so the exit basis
     // (aggregate regressions) stays 0 while phase_regressions() counts it.
-    let a = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])]);
-    let b = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 20.0)])]);
+    let a = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])],
+    );
+    let b = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 20.0)])],
+    );
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, false);
-    assert_eq!(rep.phase_regressions(), 1, "the per-phase shift is a phase regression");
+    assert_eq!(
+        rep.phase_regressions(),
+        1,
+        "the per-phase shift is a phase regression"
+    );
     assert_eq!(
         rep.regressions(),
         0,
@@ -2293,8 +2313,16 @@ fn noise_phase_excludes_non_pass_run() {
     // B = 2 clean Step[1]=8 + 1 FAILED Step[1]=40 (outlier). The failed run's
     // phase must be excluded before the per-phase pass, so Step[1] sees only
     // the 2 passing B values (8,8) and there is no false per-phase regression.
-    let a = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])]);
-    let mut b = phased_rows("scn", 2, &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])]);
+    let a = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])],
+    );
+    let mut b = phased_rows(
+        "scn",
+        2,
+        &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])],
+    );
     let mut failed = cmp_row("scn", "tiny-1llc", false, 10.0, 0); // is_fail
     failed.phases = vec![make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 40.0)])];
     b.push(failed);
@@ -2312,7 +2340,11 @@ fn noise_phase_n_lt_2_is_noisy() {
     // Noisy, never a confident regression, despite a large cross-side shift.
     let mut a = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[])]);
     a[0].phases = vec![make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])];
-    let b = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 40.0)])]);
+    let b = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 40.0)])],
+    );
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
     let f = rep
         .phase_findings
@@ -2329,7 +2361,11 @@ fn noise_phase_n_lt_2_is_noisy() {
 fn noise_phase_one_sided_metric_is_coverage() {
     // A's matched Step[1] has max_dsq_depth; B's Step[1] does not -> coverage
     // (present_side A), not a finding.
-    let a = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])]);
+    let a = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])],
+    );
     let b = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[])]);
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
     assert!(
@@ -2340,7 +2376,9 @@ fn noise_phase_one_sided_metric_is_coverage() {
         "A-only max_dsq_depth at a matched step must be a coverage row",
     );
     assert!(
-        !rep.phase_findings.iter().any(|f| f.metric.name == "max_dsq_depth"),
+        !rep.phase_findings
+            .iter()
+            .any(|f| f.metric.name == "max_dsq_depth"),
         "a one-sided metric is coverage, never a finding",
     );
 }
@@ -2357,7 +2395,11 @@ fn noise_phase_one_sided_step_is_coverage() {
             make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)]),
         ],
     );
-    let b = phased_rows("scn", 3, &[make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)])]);
+    let b = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)])],
+    );
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
     assert!(
         rep.phase_coverage
@@ -2365,7 +2407,11 @@ fn noise_phase_one_sided_step_is_coverage() {
             .any(|c| c.step_index == 1 && c.present_side == ComparePartition::A),
         "the whole one-sided Step[1] must surface as coverage",
     );
-    assert_eq!(rep.phase_regressions(), 0, "matched BASELINE unchanged -> no regression");
+    assert_eq!(
+        rep.phase_regressions(),
+        0,
+        "matched BASELINE unchanged -> no regression"
+    );
 }
 
 #[test]
@@ -2382,7 +2428,11 @@ fn noise_phase_empty_one_sided_step_surfaces_as_shape_coverage() {
             make_phase_bucket(1, "Step[0]", &[]),
         ],
     );
-    let b = phased_rows("scn", 3, &[make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)])]);
+    let b = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(0, "BASELINE", &[("max_dsq_depth", 5.0)])],
+    );
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
     assert!(
         rep.phase_coverage.iter().any(|c| c.step_index == 1
@@ -2400,8 +2450,14 @@ fn noise_phase_empty_one_sided_step_surfaces_as_shape_coverage() {
 fn noise_phase_empty_phases_skip() {
     // A carries phases, B has none -> per-phase sub-pass skipped entirely,
     // while the aggregate findings still populate.
-    let a = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])]);
-    let b: Vec<GauntletRow> = (0..3).map(|_| cmp_row("scn", "tiny-1llc", true, 10.0, 0)).collect();
+    let a = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])],
+    );
+    let b: Vec<GauntletRow> = (0..3)
+        .map(|_| cmp_row("scn", "tiny-1llc", true, 10.0, 0))
+        .collect();
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
     assert!(
         rep.phase_findings.is_empty() && rep.phase_coverage.is_empty(),
@@ -2431,8 +2487,14 @@ fn format_noise_phase_findings_lines_honors_flags() {
     );
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
     let render = |opts: &PhaseDisplayOptions| {
-        format_noise_phase_findings_lines(&rep.phase_findings, &rep.phase_coverage, opts, "base", "head")
-            .join("\n")
+        format_noise_phase_findings_lines(
+            &rep.phase_findings,
+            &rep.phase_coverage,
+            opts,
+            "base",
+            "head",
+        )
+        .join("\n")
     };
     // no_phases -> empty
     assert!(
@@ -2485,12 +2547,24 @@ fn passes_noise_spread_threshold_edges() {
         ..Default::default()
     };
     // |b-a|/|a| under vs over the 10% gate.
-    assert!(!o.passes_noise_spread_threshold(&v(100.0, 105.0)), "5% < 10% -> filtered");
-    assert!(o.passes_noise_spread_threshold(&v(100.0, 120.0)), "20% >= 10% -> shown");
+    assert!(
+        !o.passes_noise_spread_threshold(&v(100.0, 105.0)),
+        "5% < 10% -> filtered"
+    );
+    assert!(
+        o.passes_noise_spread_threshold(&v(100.0, 120.0)),
+        "20% >= 10% -> shown"
+    );
     // ~zero baseline with a real move -> unbounded relative change -> shown.
-    assert!(o.passes_noise_spread_threshold(&v(0.0, 50.0)), "zero baseline + move -> shown");
+    assert!(
+        o.passes_noise_spread_threshold(&v(0.0, 50.0)),
+        "zero baseline + move -> shown"
+    );
     // Both ~zero -> no signal -> filtered by any positive threshold.
-    assert!(!o.passes_noise_spread_threshold(&v(0.0, 0.0)), "both ~zero -> filtered");
+    assert!(
+        !o.passes_noise_spread_threshold(&v(0.0, 0.0)),
+        "both ~zero -> filtered"
+    );
 }
 
 #[test]
@@ -2520,8 +2594,14 @@ fn format_noise_phase_findings_lines_renders_coverage() {
         out.contains("per-phase coverage asymmetry"),
         "coverage header rendered:\n{out}",
     );
-    assert!(out.contains("max_dsq_depth"), "one-sided metric name rendered:\n{out}");
-    assert!(out.contains("—"), "the metric-less empty one-sided step renders `—`:\n{out}");
+    assert!(
+        out.contains("max_dsq_depth"),
+        "one-sided metric name rendered:\n{out}"
+    );
+    assert!(
+        out.contains("—"),
+        "the metric-less empty one-sided step renders `—`:\n{out}"
+    );
 }
 
 #[test]
@@ -2570,8 +2650,24 @@ fn noise_phase_informational_metric_shows_but_never_gates() {
     // Counter; a significant move (1000->5000, clean spread 0) must classify
     // Informational, not Regression, and must NOT count in phase_regressions().
     // Pins that an Informational per-phase move is shown but never gates.
-    let a = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("total_ttwu_count", 1000.0)])]);
-    let b = phased_rows("scn", 3, &[make_phase_bucket(1, "Step[0]", &[("total_ttwu_count", 5000.0)])]);
+    let a = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(
+            1,
+            "Step[0]",
+            &[("total_ttwu_count", 1000.0)],
+        )],
+    );
+    let b = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(
+            1,
+            "Step[0]",
+            &[("total_ttwu_count", 5000.0)],
+        )],
+    );
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
     let f = rep
         .phase_findings
@@ -2619,10 +2715,14 @@ fn noise_phase_findings_disambiguate_by_pairing_key_across_topologies() {
         "one per-phase finding per topology group, distinct labels: {labels:?}",
     );
     assert!(
-        labels.iter().any(|l| l.contains("tiny-1llc")) && labels.iter().any(|l| l.contains("large-4llc")),
+        labels.iter().any(|l| l.contains("tiny-1llc"))
+            && labels.iter().any(|l| l.contains("large-4llc")),
         "pairing labels must include the topology to disambiguate: {labels:?}",
     );
-    assert_ne!(labels[0], labels[1], "the two topology groups must render distinct labels");
+    assert_ne!(
+        labels[0], labels[1],
+        "the two topology groups must render distinct labels"
+    );
 }
 
 #[test]
@@ -3015,7 +3115,10 @@ fn noise_findings_declared_gate_tightens_immaterial_move_to_regression() {
         NoiseKind::Stable,
         "10->11 is immaterial under the registry default",
     );
-    assert!(!uw.gated_by_assertion, "no declared gate on the ungated rows");
+    assert!(
+        !uw.gated_by_assertion,
+        "no declared gate on the ungated rows"
+    );
     assert_eq!(ungated.regressions(), 0);
 
     // With the declared gate the same move becomes a confident regression.
@@ -3161,7 +3264,10 @@ fn format_noise_assertion_coverage_lines_lists_unevaluated_gates() {
     );
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
     let out = format_noise_assertion_coverage_lines(&rep.assertion_coverage).join("\n");
-    assert!(out.contains("NOT evaluated"), "warning header present: {out}");
+    assert!(
+        out.contains("NOT evaluated"),
+        "warning header present: {out}"
+    );
     assert!(
         out.contains("run_delay_per_sec"),
         "the un-evaluated metric is named: {out}",
@@ -3193,8 +3299,13 @@ fn noise_findings_declared_phase_gate_gates_the_exit() {
     let a = phased_rows("pg", 3, &buckets(8.0));
     let mut b = phased_rows("pg", 3, &buckets(9.0));
     for r in &mut b {
-        r.perf_delta_assertions
-            .push(perf_gate("max_dsq_depth", Some(5.0), Some(0.5), None, Some(1)));
+        r.perf_delta_assertions.push(perf_gate(
+            "max_dsq_depth",
+            Some(5.0),
+            Some(0.5),
+            None,
+            Some(1),
+        ));
     }
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
     let s1 = rep
@@ -3574,7 +3685,9 @@ fn compare_rows_scale_varying_high_throughput_noise_is_unchanged() {
         &ComparisonPolicy::default(),
     );
     assert!(
-        res.findings.iter().all(|f| f.metric.name != "total_iterations"),
+        res.findings
+            .iter()
+            .all(|f| f.metric.name != "total_iterations"),
         "100000 -> 101000 total_iterations (1% move) must stay unchanged: the \
          relative gate still filters high-throughput noise; got {:?}",
         res.findings

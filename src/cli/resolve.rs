@@ -835,8 +835,7 @@ fn select_series_latest_in_range(
     let mut out: Vec<(VersionKey, String)> = best
         .into_values()
         .map(|(_, v)| {
-            let key = decompose_version_for_compare(&v)
-                .expect("re-parses: it parsed once above");
+            let key = decompose_version_for_compare(&v).expect("re-parses: it parsed once above");
             (key, v)
         })
         .collect();
@@ -926,9 +925,7 @@ pub fn resolve_git_kernel(
     // and rebuilt. The `-xkc{hash}` suffix folds `--extra-kconfig` into
     // the key so an extras build probes its own slot, not the baked-only
     // one.
-    if !force
-        && let Some(commit_hash) = &commit
-    {
+    if !force && let Some(commit_hash) = &commit {
         let mut cache_key = crate::fetch::git_cache_key(git_ref, commit_hash);
         crate::cli::append_extra_kconfig_suffix(&mut cache_key, extra_kconfig);
         if let Some(entry) = cache_lookup(&cache, &cache_key, cli_label) {
@@ -981,9 +978,7 @@ pub fn resolve_git_kernel(
     // probe missed (a ref-name resolution difference, or a probe that
     // failed) so an unchanged tip still skips the rebuild. (The codeload
     // path's key is already the probe key, so this is a no-op there.)
-    if !force
-        && let Some(entry) = cache_lookup(&cache, &acquired.cache_key, cli_label)
-    {
+    if !force && let Some(entry) = cache_lookup(&cache, &acquired.cache_key, cli_label) {
         return Ok(entry.path);
     }
 
@@ -1001,8 +996,16 @@ pub fn resolve_git_kernel(
     // inside the pipeline). `clean`, `cpu_cap`, and `extra_kconfig` come
     // from `cargo ktstr kernel build`; the auto-discovery test path
     // passes false / None.
-    let result =
-        kernel_build_pipeline(&acquired, &cache, cli_label, clean, false, cpu_cap, extra_kconfig, mp)?;
+    let result = kernel_build_pipeline(
+        &acquired,
+        &cache,
+        cli_label,
+        clean,
+        false,
+        cpu_cap,
+        extra_kconfig,
+        mp,
+    )?;
 
     match result.entry {
         Some(entry) => Ok(entry.path),
@@ -1610,7 +1613,11 @@ mod tests {
         let out = select_series_latest_in_range(&versions, start_key, end_key);
         assert_eq!(
             out,
-            vec!["6.11.5".to_string(), "6.12.10".to_string(), "6.13.1".to_string()],
+            vec![
+                "6.11.5".to_string(),
+                "6.12.10".to_string(),
+                "6.13.1".to_string()
+            ],
             "one release per series, highest patch, ascending",
         );
     }
@@ -1748,16 +1755,15 @@ mod tests {
         let (start_key, end_key) = range_bounds("6.10", "6.14").unwrap();
         let maintained = vec!["6.11.5".to_string()];
         let tags = vec!["6.12.10".to_string(), "6.13.2".to_string()];
-        let out = combine_range_versions(
-            maintained,
-            Some(tags.as_slice()),
-            start_key,
-            end_key,
-            true,
-        );
+        let out =
+            combine_range_versions(maintained, Some(tags.as_slice()), start_key, end_key, true);
         assert_eq!(
             out,
-            vec!["6.11.5".to_string(), "6.12.10".to_string(), "6.13.2".to_string()],
+            vec![
+                "6.11.5".to_string(),
+                "6.12.10".to_string(),
+                "6.13.2".to_string()
+            ],
         );
     }
 
@@ -1784,7 +1790,11 @@ mod tests {
             end_key,
             true,
         );
-        assert_eq!(out, vec!["6.14.9".to_string()], "stale mirror never regresses");
+        assert_eq!(
+            out,
+            vec!["6.14.9".to_string()],
+            "stale mirror never regresses"
+        );
     }
 
     /// Mirror-fetch failure (`None`) with `include_eol=true` falls back

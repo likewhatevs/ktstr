@@ -459,10 +459,10 @@ fn fetch_via_clone(dest: &Path) -> Result<(), String> {
     )
     .map_err(|e| format!("prepare_clone: {e}"))?
     .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
-            1.try_into().expect("non-zero depth"),
-        ))
-        .with_ref_name(Some(SCX_TAG))
-        .map_err(|e| format!("with_ref_name: {e}"))?;
+        1.try_into().expect("non-zero depth"),
+    ))
+    .with_ref_name(Some(SCX_TAG))
+    .map_err(|e| format!("with_ref_name: {e}"))?;
     let (mut checkout, _) = prep
         .fetch_then_checkout(gix::progress::Discard, &interrupt)
         .map_err(|e| format!("fetch_then_checkout: {e}"))?;

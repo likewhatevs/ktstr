@@ -62,7 +62,10 @@ pub(crate) fn rewrite(root: &clap::Command, argv: &[OsString]) -> Vec<OsString> 
         Some(c) => c,
         None => return argv.to_vec(),
     };
-    let sub = match ktstr_cmd.get_subcommands().find(|c| sub_matches(c, sub_name)) {
+    let sub = match ktstr_cmd
+        .get_subcommands()
+        .find(|c| sub_matches(c, sub_name))
+    {
         Some(c) => c,
         None => return argv.to_vec(),
     };
