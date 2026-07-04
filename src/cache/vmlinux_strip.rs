@@ -171,10 +171,10 @@ impl StrippedVmlinux {
 ///
 /// - `path()` — absolute path to the stripped ELF on disk under a
 ///   fresh `tempfile::TempDir`. The caller (typically
-///   [`super::cache_dir::CacheDir::store`]) `fs::copy`s this path
+///   [`super::cache_dir::CacheDir::store`]) reflink-or-copies this path
 ///   into the cache directory.
 /// - The owned `TempDir`, which is unlinked when the
-///   `StrippedVmlinux` is dropped. The cache `fs::copy` happens
+///   `StrippedVmlinux` is dropped. The cache reflink/copy happens
 ///   before drop, so the cached entry is independent of the temp
 ///   path.
 ///

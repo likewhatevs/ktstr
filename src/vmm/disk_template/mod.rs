@@ -91,7 +91,6 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -112,20 +111,6 @@ const TEMPLATE_FILENAME: &str = "template.img";
 
 /// Lockfile subdirectory name (per-key serialization).
 const LOCK_DIR_NAME: &str = ".locks";
-
-/// `FICLONE` ioctl command number per Linux uapi
-/// `include/uapi/linux/fs.h:312` — `_IOW(0x94, 9, int)`.
-///
-/// Generic ioctl encoding (shared by x86_64 and aarch64):
-/// `(_IOC_WRITE << 30) | (sizeof(int) << 16) | (0x94 << 8) | 9`
-/// = `0x40000000 | 0x40000 | 0x9400 | 9` = `0x40049409`.
-///
-/// This is the same value `reflink-0.1.3/src/sys/unix.rs:10`
-/// hardcodes (with a now-stale "is this equal on all archs?" TODO).
-/// Pinned here as a `const` so a future arch port can audit it
-/// against the host's `<asm/ioctl.h>` instead of grepping a
-/// transitive dep.
-const FICLONE_IOCTL: libc::c_ulong = 0x4004_9409;
 
 /// Maximum wall-clock duration to wait for a peer process holding
 /// the cache lockfile while it builds the template.
@@ -964,13 +949,12 @@ pub(crate) fn clone_to_per_test(src_path: &Path, dest_path: &Path) -> Result<Fil
         .create_new(true)
         .open(dest_path)
         .with_context(|| format!("open dest path {dest_path:?} for FICLONE"))?;
-    // SAFETY: ioctl FICLONE takes (dest_fd, FICLONE, src_fd) per
-    // Linux uapi. Both fds are valid for the duration of the call;
-    // ioctl does not retain them. The kernel returns 0 on success
-    // and -1 with errno set on failure.
-    let rc = unsafe { libc::ioctl(dest.as_raw_fd(), FICLONE_IOCTL, src.as_raw_fd()) };
-    if rc != 0 {
-        let err = io::Error::last_os_error();
+    // Reflink the template into the per-test dest via the shared FICLONE
+    // inner. Unlike reflink_or_copy, the per-test backing MUST be a
+    // copy-on-write clone (a byte copy would defeat the fan-out and blow up
+    // per-test disk usage), so ANY error hard-bails rather than falling back
+    // — verify_cache_dir_supports_reflink already pre-checked the fs.
+    if let Err(err) = crate::reflink::ficlone(&dest, &src) {
         // Best-effort cleanup of the half-written dest file.
         let _ = std::fs::remove_file(dest_path);
         return Err(anyhow!(

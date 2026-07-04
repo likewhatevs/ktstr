@@ -455,7 +455,8 @@ impl CacheDir {
     ///    sibling temp directories from crashed PIDs are GC'd before
     ///    we add another one.
     /// 5. **Copy the boot image.** `metadata.image_name` lands at
-    ///    `tmp/<image_name>` via `fs::copy`.
+    ///    `tmp/<image_name>` via `reflink::reflink_or_copy` (copy-on-write
+    ///    when the cache filesystem supports it, else a plain byte copy).
     /// 6. **Strip and copy vmlinux (if supplied).** When
     ///    `artifacts.vmlinux` is `Some`, `strip_vmlinux_debug`
     ///    runs the two-stage strip pipeline and the result is written
@@ -545,15 +546,15 @@ impl CacheDir {
         let _guard = TmpDirGuard(&tmp_dir);
 
         let image_dest = tmp_dir.join(&metadata.image_name);
-        fs::copy(artifacts.image, &image_dest)
-            .map_err(|e| anyhow::anyhow!("copy kernel image to cache: {e}"))?;
+        crate::reflink::reflink_or_copy(artifacts.image, &image_dest)
+            .context("copy kernel image to cache")?;
 
         let (has_vmlinux, vmlinux_stripped) = if let Some(vmlinux) = artifacts.vmlinux {
             let vmlinux_dest = tmp_dir.join("vmlinux");
             match strip_vmlinux_debug(vmlinux) {
                 Ok(stripped) => {
-                    fs::copy(stripped.path(), &vmlinux_dest)
-                        .map_err(|e| anyhow::anyhow!("copy stripped vmlinux to cache: {e}"))?;
+                    crate::reflink::reflink_or_copy(stripped.path(), &vmlinux_dest)
+                        .context("copy stripped vmlinux to cache")?;
                     (true, true)
                 }
                 Err(e) => {
@@ -565,8 +566,8 @@ impl CacheDir {
                          `cargo ktstr kernel list --json` \
                          vmlinux_stripped field.",
                     );
-                    fs::copy(vmlinux, &vmlinux_dest)
-                        .map_err(|e| anyhow::anyhow!("copy vmlinux to cache: {e}"))?;
+                    crate::reflink::reflink_or_copy(vmlinux, &vmlinux_dest)
+                        .context("copy vmlinux to cache")?;
                     (true, false)
                 }
             }
