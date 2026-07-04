@@ -132,38 +132,38 @@ fn baseline_sidecar_leaf(runs_root_abs: &Path, baseline_short: &str) -> PathBuf 
     runs_root_abs.join(format!("perf-delta-baseline-{baseline_short}"))
 }
 
-/// Checkout path for the baseline worktree, under `temp_root` (the
-/// system temp dir in production) so the full source checkout never
-/// lands inside the runs-root run-dir walk and never pollutes the
-/// source tree. `baseline_short` keeps concurrent baselines distinct.
-fn worktree_checkout_dir(temp_root: &Path, baseline_short: &str) -> PathBuf {
-    temp_root.join(format!("ktstr-perf-delta-wt-{baseline_short}"))
+/// Checkout path for the baseline, under `temp_root` (the system temp dir in
+/// production) so the full source checkout never lands inside the runs-root
+/// run-dir walk and never pollutes the source tree. `baseline_short` keeps
+/// concurrent baselines distinct.
+fn checkout_dir(temp_root: &Path, baseline_short: &str) -> PathBuf {
+    temp_root.join(format!("ktstr-perf-delta-co-{baseline_short}"))
 }
 
-/// Advisory-lock path for a baseline worktree: `<wt_dir>.lock`, a SIBLING of
+/// Advisory-lock path for a baseline checkout: `<wt_dir>.lock`, a SIBLING of
 /// `wt_dir` (not inside it, which cleanup removes) so the flock outlives the
-/// worktree it guards. The path is shared per baseline commit, matching
-/// `worktree_checkout_dir`, so two runs of the same baseline contend on it.
-fn worktree_lock_path(wt_dir: &Path) -> PathBuf {
+/// checkout it guards. The path is shared per baseline commit, matching
+/// `checkout_dir`, so two runs of the same baseline contend on it.
+fn checkout_lock_path(wt_dir: &Path) -> PathBuf {
     let mut s = wt_dir.as_os_str().to_owned();
     s.push(".lock");
     PathBuf::from(s)
 }
 
-/// Take the exclusive per-baseline worktree lock, or bail if another perf-delta
-/// run holds it. Returns the lock fd to hold for the worktree's whole lifetime
+/// Take the exclusive per-baseline checkout lock, or bail if another perf-delta
+/// run holds it. Returns the lock fd to hold for the checkout's whole lifetime
 /// (drop releases; the OS also releases on process death). See the call sites
 /// for why the shared per-baseline path makes this serialization load-bearing.
-fn acquire_baseline_worktree_lock(
+fn acquire_baseline_checkout_lock(
     wt_dir: &Path,
     baseline_short: &str,
 ) -> Result<std::os::fd::OwnedFd> {
-    let lock_path = worktree_lock_path(wt_dir);
+    let lock_path = checkout_lock_path(wt_dir);
     try_flock(&lock_path, FlockMode::Exclusive)
-        .with_context(|| format!("lock baseline worktree {}", lock_path.display()))?
+        .with_context(|| format!("lock baseline checkout {}", lock_path.display()))?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "another `cargo ktstr perf-delta` run is using the baseline worktree \
+                "another `cargo ktstr perf-delta` run is using the baseline checkout \
                  for {baseline_short}; retry once it finishes"
             )
         })
@@ -201,16 +201,16 @@ fn baseline_child_env(
 /// [`create_checkout_from_tree`] only self-heals the CURRENT run's
 /// checkout dir; a checkout left by an interrupted run against a
 /// DIFFERENT baseline (Ctrl-C / SIGKILL / crash skip
-/// [`WorktreeGuard`]`::drop`) accumulates in `temp_root` forever. This
+/// [`CheckoutGuard`]`::drop`) accumulates in `temp_root` forever. This
 /// runs at perf-delta startup on the run-producing paths and removes
-/// every `ktstr-perf-delta-wt-*` directory whose sibling `.lock` is NOT
+/// every `ktstr-perf-delta-co-*` directory whose sibling `.lock` is NOT
 /// held by a live run — mirroring `cleanup_stale_shm`'s lock-gated
 /// reclamation, so it never removes a concurrent run's checkout.
 /// Best-effort: each step swallows failure (a busy or racing entry is
 /// skipped and reclaimed by a later sweep). The checkout is a plain dir
 /// (no linked-worktree registration), so `remove_dir_all` fully reclaims
 /// it — no `git worktree prune` is needed.
-fn sweep_stale_worktrees(temp_root: &Path) {
+fn sweep_stale_checkouts(temp_root: &Path) {
     let Ok(entries) = std::fs::read_dir(temp_root) else {
         return;
     };
@@ -218,7 +218,7 @@ fn sweep_stale_worktrees(temp_root: &Path) {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         // The checkout DIRS only — not the sibling `<...>.lock` files.
-        if !name.starts_with("ktstr-perf-delta-wt-") || name.ends_with(".lock") {
+        if !name.starts_with("ktstr-perf-delta-co-") || name.ends_with(".lock") {
             continue;
         }
         let wt_dir = entry.path();
@@ -226,10 +226,10 @@ fn sweep_stale_worktrees(temp_root: &Path) {
             continue;
         }
         // A live run holds `<wt_dir>.lock` exclusively (see
-        // acquire_baseline_worktree_lock); only an orphan's lock is free.
+        // acquire_baseline_checkout_lock); only an orphan's lock is free.
         // try_flock -> Some(fd): WE took it (no live owner) -> reclaim.
         // None: held by a live run -> skip. Err: skip.
-        let held = match try_flock(worktree_lock_path(&wt_dir), FlockMode::Exclusive) {
+        let held = match try_flock(checkout_lock_path(&wt_dir), FlockMode::Exclusive) {
             Ok(Some(fd)) => fd,
             _ => continue,
         };
@@ -242,14 +242,14 @@ fn sweep_stale_worktrees(temp_root: &Path) {
         // bails) or, after the unlink, O_CREATs a fresh one — never both. (A
         // release-BEFORE-unlink would let a racer acquire the stale inode
         // while a third run O_CREATs a new one, yielding two "owners".)
-        let _ = std::fs::remove_file(worktree_lock_path(&wt_dir));
+        let _ = std::fs::remove_file(checkout_lock_path(&wt_dir));
         drop(held); // release the (now-unlinked) orphan lock
     }
 }
 
 /// Drop the interrupt guard; if a signal was caught during run
 /// production, re-raise it as the process exit (128+signal) now that the
-/// worktree teardown is done. Otherwise propagate the run's Result.
+/// checkout teardown is done. Otherwise propagate the run's Result.
 fn finish_or_reraise(guard: crate::interrupt::InterruptGuard, run_res: Result<()>) -> Result<()> {
     let caught = guard.interrupted();
     drop(guard);
@@ -341,11 +341,11 @@ fn count_sidecars(dir: &Path) -> usize {
 /// early return, `?`, or panic in [`dual_run`] — or a record-and-survive
 /// Ctrl-C — never leaks it. The checkout is a plain dir (no `.git`), so a
 /// `remove_dir_all` fully reclaims it.
-struct WorktreeGuard {
+struct CheckoutGuard {
     wt_dir: PathBuf,
 }
 
-impl Drop for WorktreeGuard {
+impl Drop for CheckoutGuard {
     fn drop(&mut self) {
         // Best-effort teardown: a failure here can't propagate and nothing
         // runs downstream. `remove_dir_all` is recursive and unconditional, so
@@ -353,7 +353,7 @@ impl Drop for WorktreeGuard {
         // behind — no "Directory not empty" the old `git worktree remove` hit.
         // A skipped drop on SIGKILL / crash is reclaimed by the next run's
         // `create_checkout_from_tree` pre-checkout self-heal (and the
-        // cross-baseline `sweep_stale_worktrees`).
+        // cross-baseline `sweep_stale_checkouts`).
         let _ = std::fs::remove_dir_all(&self.wt_dir);
     }
 }
@@ -379,7 +379,7 @@ fn create_checkout_from_tree(
     label: &str,
 ) -> Result<()> {
     // Clear any leftover checkout from an interrupted prior run (Ctrl-C /
-    // SIGKILL / crash skip WorktreeGuard::drop) so the checkout below writes
+    // SIGKILL / crash skip CheckoutGuard::drop) so the checkout below writes
     // into an empty dir.
     let _ = std::fs::remove_dir_all(wt_dir);
     // gix's checkout writes entries UNDER `wt_dir` but does not create the
@@ -407,7 +407,7 @@ fn create_checkout_from_tree(
     // Poll perf-delta's interrupt flag so a Ctrl-C aborts the checkout
     // promptly; the caller re-checks `interrupt::caught()` right after and
     // bails before spawning the build, and a partial checkout dir is reclaimed
-    // by WorktreeGuard::drop. checkout returns Ok even on abort, so the
+    // by CheckoutGuard::drop. checkout returns Ok even on abort, so the
     // post-return caught() check is what actually stops the run.
     gix::worktree::state::checkout(
         &mut index,
@@ -570,8 +570,8 @@ fn resolve_run_trees(
 
 /// Absolutize a relative kernel-source path against the MAIN tree so the
 /// baseline child resolves the SAME kernel HEAD does. The baseline child
-/// runs with its cwd in the worktree (a temp dir), where a relative
-/// `--kernel ../linux` would resolve against the worktree instead of the
+/// runs with its cwd in the checkout (a temp dir), where a relative
+/// `--kernel ../linux` would resolve against the checkout instead of the
 /// project root — pointing at the wrong (or a nonexistent) tree. A
 /// kernel VERSION (e.g. `6.14`), an already-absolute path, and a
 /// relative string that is not an existing path (a version, or a typo
@@ -591,7 +591,7 @@ fn resolve_kernel_for_children(repo_root: &Path, kernel: &str) -> String {
 /// fresh data: check the baseline commit's tree AND the HEAD snapshot
 /// (`head_tree`) out into two plain temp dirs (via `gix`) and run each side's
 /// perf tests in its own checkout (sidecars redirected into the main pool).
-/// Both checkouts are removed on return via [`WorktreeGuard`]. Both children
+/// Both checkouts are removed on return via [`CheckoutGuard`]. Both children
 /// stamp their `project_commit` from the parent's resolved labels
 /// (`baseline_short` / `head_short`) so the recorded field matches the
 /// compare's pool filter.
@@ -622,13 +622,13 @@ fn dual_run(
     // runs_root() is absolute under the cargo-ktstr orchestrator
     // (install_runs_root_env stamps KTSTR_RUNS_ROOT), so this join
     // yields that shared dir — Path::join discards `repo_root` against
-    // an absolute rhs, and both the baseline worktree child and HEAD
+    // an absolute rhs, and both the baseline checkout child and HEAD
     // inherit KTSTR_RUNS_ROOT and write there. join() also anchors the
     // relative raw-nextest fallback to repo_root; correct for both.
     let runs_root_abs = repo_root.join(ktstr::test_support::runs_root());
     let leaf = baseline_sidecar_leaf(&runs_root_abs, baseline_short);
-    let wt_dir = worktree_checkout_dir(&std::env::temp_dir(), baseline_short);
-    let head_wt_dir = worktree_checkout_dir(&std::env::temp_dir(), head_short);
+    let wt_dir = checkout_dir(&std::env::temp_dir(), baseline_short);
+    let head_wt_dir = checkout_dir(&std::env::temp_dir(), head_short);
     // Absolutize a relative kernel path so BOTH children (cwd = a temp
     // checkout) resolve the same tree the main tree does.
     let kernel_arg = resolve_kernel_for_children(repo_root, kernel);
@@ -639,16 +639,16 @@ fn dual_run(
     // (OS-released on process death) makes a live concurrent run bail cleanly.
     // Both locks are declared before both guards so each lock drops AFTER its
     // checkout is removed (LIFO: guards drop first).
-    let _baseline_lock = acquire_baseline_worktree_lock(&wt_dir, baseline_short)?;
-    let _head_lock = acquire_baseline_worktree_lock(&head_wt_dir, head_short)?;
+    let _baseline_lock = acquire_baseline_checkout_lock(&wt_dir, baseline_short)?;
+    let _head_lock = acquire_baseline_checkout_lock(&head_wt_dir, head_short)?;
     // Create both checkouts, self-healing any leftover from an interrupted
-    // prior run (Ctrl-C / SIGKILL / crash skip WorktreeGuard::drop).
+    // prior run (Ctrl-C / SIGKILL / crash skip CheckoutGuard::drop).
     create_checkout_from_tree(repo, &wt_dir, baseline_tree, baseline_short)?;
-    let _baseline_guard = WorktreeGuard {
+    let _baseline_guard = CheckoutGuard {
         wt_dir: wt_dir.clone(),
     };
     create_checkout_from_tree(repo, &head_wt_dir, head_tree, head_short)?;
-    let _head_guard = WorktreeGuard {
+    let _head_guard = CheckoutGuard {
         wt_dir: head_wt_dir.clone(),
     };
     // Ctrl-C during either checkout: bail before spawning any build. The guards
@@ -678,7 +678,7 @@ fn dual_run(
         );
     }
     // Ctrl-C during the baseline run: stop before spawning HEAD. Returning
-    // drops WorktreeGuard (removes the checkout); run() then re-raises 130.
+    // drops CheckoutGuard (removes the checkout); run() then re-raises 130.
     if crate::interrupt::caught().is_some() {
         return Ok(());
     }
@@ -719,7 +719,7 @@ fn dual_run(
 /// runs-root, so the noise
 /// compare's pool scan finds them and partitions by `project_commit`
 /// (baseline=A, HEAD=B), not by leaf. Both checkouts (baseline + HEAD
-/// snapshot) are created once and removed on return via [`WorktreeGuard`],
+/// snapshot) are created once and removed on return via [`CheckoutGuard`],
 /// so the HEAD side is hermetic like the baseline. A non-zero child exit is
 /// logged, not fatal (some `performance_mode` failures are expected; the
 /// sidecars that landed are still comparable).
@@ -739,23 +739,23 @@ fn noise_dual_run(
     runs: usize,
 ) -> Result<()> {
     let runs_root_abs = repo_root.join(ktstr::test_support::runs_root());
-    let wt_dir = worktree_checkout_dir(&std::env::temp_dir(), baseline_short);
-    let head_wt_dir = worktree_checkout_dir(&std::env::temp_dir(), head_short);
+    let wt_dir = checkout_dir(&std::env::temp_dir(), baseline_short);
+    let head_wt_dir = checkout_dir(&std::env::temp_dir(), head_short);
     let kernel_arg = resolve_kernel_for_children(repo_root, kernel);
 
     // Serialize concurrent runs that share a checkout path (see dual_run for the
     // full rationale). Both locks declared before both guards so each lock drops
     // after its checkout is removed (LIFO: guards drop first).
-    let _baseline_lock = acquire_baseline_worktree_lock(&wt_dir, baseline_short)?;
-    let _head_lock = acquire_baseline_worktree_lock(&head_wt_dir, head_short)?;
+    let _baseline_lock = acquire_baseline_checkout_lock(&wt_dir, baseline_short)?;
+    let _head_lock = acquire_baseline_checkout_lock(&head_wt_dir, head_short)?;
     // Create both checkouts, self-healing any leftover from an interrupted prior
-    // run (Ctrl-C / SIGKILL skip WorktreeGuard::drop).
+    // run (Ctrl-C / SIGKILL skip CheckoutGuard::drop).
     create_checkout_from_tree(repo, &wt_dir, baseline_tree, baseline_short)?;
-    let _baseline_guard = WorktreeGuard {
+    let _baseline_guard = CheckoutGuard {
         wt_dir: wt_dir.clone(),
     };
     create_checkout_from_tree(repo, &head_wt_dir, head_tree, head_short)?;
-    let _head_guard = WorktreeGuard {
+    let _head_guard = CheckoutGuard {
         wt_dir: head_wt_dir.clone(),
     };
     // Ctrl-C during either checkout: bail before the run loop. The guards remove
@@ -1002,8 +1002,8 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
         let (baseline_tree, head_snapshot_tree) = resolve_run_trees(&repo, baseline_oid)?;
         // Reclaim checkouts orphaned by prior interrupted runs against
         // OTHER baselines (the per-baseline self-heal misses them).
-        sweep_stale_worktrees(&std::env::temp_dir());
-        // Survive Ctrl-C during run production so WorktreeGuard::drop
+        sweep_stale_checkouts(&std::env::temp_dir());
+        // Survive Ctrl-C during run production so CheckoutGuard::drop
         // (checkout removal) runs; propagate the interrupt as 128+signal.
         let interrupt_guard = crate::interrupt::InterruptGuard::install();
         finish_or_reraise(
@@ -1047,8 +1047,8 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
         // Snapshot both trees ONCE at command start (hermetic HEAD/B side).
         let (baseline_tree, head_snapshot_tree) = resolve_run_trees(&repo, baseline_oid)?;
         // Reclaim cross-baseline orphaned checkouts, then survive Ctrl-C
-        // so WorktreeGuard::drop runs and the interrupt propagates as 130.
-        sweep_stale_worktrees(&std::env::temp_dir());
+        // so CheckoutGuard::drop runs and the interrupt propagates as 130.
+        sweep_stale_checkouts(&std::env::temp_dir());
         let interrupt_guard = crate::interrupt::InterruptGuard::install();
         finish_or_reraise(
             interrupt_guard,
@@ -1295,10 +1295,10 @@ mod tests {
     }
 
     #[test]
-    fn worktree_checkout_dir_under_temp_root() {
+    fn checkout_dir_under_temp_root() {
         assert_eq!(
-            worktree_checkout_dir(Path::new("/tmp"), "abc1234"),
-            Path::new("/tmp/ktstr-perf-delta-wt-abc1234"),
+            checkout_dir(Path::new("/tmp"), "abc1234"),
+            Path::new("/tmp/ktstr-perf-delta-co-abc1234"),
         );
     }
 
@@ -1327,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    fn sweep_reclaims_unlocked_but_keeps_locked_worktrees() {
+    fn sweep_reclaims_unlocked_but_keeps_locked_checkouts() {
         // Two orphan-shaped baseline checkout dirs under a throwaway temp
         // root: one whose sibling `.lock` is held (a live run), one free.
         // The cross-baseline sweep must reclaim the free one (pure
@@ -1336,26 +1336,26 @@ mod tests {
         let base = std::env::temp_dir().join(format!("ktstr-pd-sweep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("mk temp root");
-        let unlocked = base.join("ktstr-perf-delta-wt-aaaaaaa");
-        let locked = base.join("ktstr-perf-delta-wt-bbbbbbb");
-        std::fs::create_dir(&unlocked).expect("mk unlocked wt");
-        std::fs::create_dir(&locked).expect("mk locked wt");
-        // Hold the locked worktree's advisory lock for the sweep's duration.
-        let held = try_flock(worktree_lock_path(&locked), FlockMode::Exclusive)
+        let unlocked = base.join("ktstr-perf-delta-co-aaaaaaa");
+        let locked = base.join("ktstr-perf-delta-co-bbbbbbb");
+        std::fs::create_dir(&unlocked).expect("mk unlocked checkout");
+        std::fs::create_dir(&locked).expect("mk locked checkout");
+        // Hold the locked checkout's advisory lock for the sweep's duration.
+        let held = try_flock(checkout_lock_path(&locked), FlockMode::Exclusive)
             .expect("flock call")
             .expect("lock free initially");
 
-        sweep_stale_worktrees(&base);
+        sweep_stale_checkouts(&base);
 
-        assert!(!unlocked.exists(), "an unlocked orphan worktree is reclaimed");
+        assert!(!unlocked.exists(), "an unlocked orphan checkout is reclaimed");
         assert!(
-            !worktree_lock_path(&unlocked).exists(),
+            !checkout_lock_path(&unlocked).exists(),
             "the reclaimed orphan's sibling .lock is removed too (no lock debris)"
         );
-        assert!(locked.exists(), "a locked (live) worktree is never removed");
+        assert!(locked.exists(), "a locked (live) checkout is never removed");
         assert!(
-            worktree_lock_path(&locked).exists(),
-            "a live worktree's held .lock is left intact"
+            checkout_lock_path(&locked).exists(),
+            "a live checkout's held .lock is left intact"
         );
 
         drop(held);
@@ -1380,7 +1380,7 @@ mod tests {
     }
 
     #[test]
-    fn worktree_guard_drop_removes_the_checkout_dir() {
+    fn checkout_guard_drop_removes_the_checkout_dir() {
         // RAII cleanup: dropping the guard removes the checkout dir
         // recursively (incl. any build artifacts an interrupted run left) —
         // the plain-fs replacement for the old `git worktree remove`, and the
@@ -1391,13 +1391,13 @@ mod tests {
         std::fs::write(wt.join("scx-ktstr/build.rs"), "x").expect("write checkout file");
         assert!(wt.exists(), "checkout present before drop");
         {
-            let _guard = WorktreeGuard { wt_dir: wt.clone() };
+            let _guard = CheckoutGuard { wt_dir: wt.clone() };
         }
-        assert!(!wt.exists(), "WorktreeGuard::drop removes the checkout dir");
+        assert!(!wt.exists(), "CheckoutGuard::drop removes the checkout dir");
         // Drop on an already-absent dir is a harmless no-op (the SIGKILL /
         // already-swept case).
         {
-            let _guard = WorktreeGuard { wt_dir: wt.clone() };
+            let _guard = CheckoutGuard { wt_dir: wt.clone() };
         }
         assert!(!wt.exists(), "drop on an absent checkout stays a no-op");
         std::fs::remove_dir_all(&base).ok();
@@ -1658,8 +1658,8 @@ mod tests {
     }
 
     #[test]
-    fn baseline_worktree_lock_blocks_a_concurrent_same_baseline_run() {
-        // Two perf-delta runs against the same baseline share worktree_lock_path;
+    fn baseline_checkout_lock_blocks_a_concurrent_same_baseline_run() {
+        // Two perf-delta runs against the same baseline share checkout_lock_path;
         // the exclusive flock must let only ONE proceed so the self-heal never
         // remove_dir_all's a live concurrent run's checkout (the medium-severity
         // regression this lock closes). Also pins the sibling `.lock` path shape
@@ -1667,21 +1667,21 @@ mod tests {
         // interrupted-run recovery path — the OS releases it on process death).
         let wt = std::env::temp_dir().join(format!("ktstr-pd-locktest-wt-{}", std::process::id()));
         assert_eq!(
-            worktree_lock_path(&wt),
+            checkout_lock_path(&wt),
             PathBuf::from(format!("{}.lock", wt.display())),
-            "lock is a sibling <wt_dir>.lock, outside the worktree cleanup removes",
+            "lock is a sibling <wt_dir>.lock, outside the checkout cleanup removes",
         );
-        let lock_path = worktree_lock_path(&wt);
+        let lock_path = checkout_lock_path(&wt);
         let _ = std::fs::remove_file(&lock_path);
 
         let held =
-            acquire_baseline_worktree_lock(&wt, "abc1234").expect("first run acquires the lock");
+            acquire_baseline_checkout_lock(&wt, "abc1234").expect("first run acquires the lock");
         assert!(
-            acquire_baseline_worktree_lock(&wt, "abc1234").is_err(),
-            "a concurrent same-baseline run must fail to acquire, not clobber the live worktree",
+            acquire_baseline_checkout_lock(&wt, "abc1234").is_err(),
+            "a concurrent same-baseline run must fail to acquire, not clobber the live checkout",
         );
         drop(held);
-        let after = acquire_baseline_worktree_lock(&wt, "abc1234")
+        let after = acquire_baseline_checkout_lock(&wt, "abc1234")
             .expect("lock frees for the next run once released");
         drop(after);
         let _ = std::fs::remove_file(&lock_path);
@@ -1806,8 +1806,8 @@ mod tests {
     #[test]
     fn resolve_kernel_absolutizes_relative_existing_path() {
         // A relative kernel path that exists from the main tree must be
-        // absolutized so the worktree-cwd baseline child resolves the
-        // same tree (the bug: `../linux` resolved against the worktree).
+        // absolutized so the checkout-cwd baseline child resolves the
+        // same tree (the bug: `../linux` resolved against the checkout).
         let base = std::env::temp_dir().join(format!("ktstr-pd-kresolve-{}", std::process::id()));
         std::fs::create_dir_all(base.join("linux")).expect("mk linux dir");
         assert_eq!(
@@ -1841,7 +1841,7 @@ mod tests {
     /// format. These are the load-bearing baseline-resolution functions
     /// that the pure-helper unit tests can't reach (they need commits).
     /// Shells `git` to build the fixture — the same `git` dependency
-    /// perf-delta's worktree path already requires.
+    /// perf-delta's checkout path already requires.
     #[test]
     fn gix_resolution_against_a_temp_repo() {
         use std::process::Command;
