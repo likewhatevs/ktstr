@@ -37,7 +37,12 @@ impl std::error::Error for ResourceContention {}
 /// returned by the `performance_mode` planner (`compute_pinning`) when the
 /// host has too few physical CPUs / LLC groups — but that perf-mode caller
 /// RE-MAPS it to [`PerfModeUnavailable`] (a host-insufficiency: skip by
-/// default, fail under `KTSTR_NO_SKIP_MODE`). Distinct
+/// default, fail under `KTSTR_NO_SKIP_MODE`). Also raised by
+/// `resolve_cpu_budget` when an author's per-test `cpu_budget` exceeds the
+/// allowed-CPU count — the author-attribute half of a provenance split (a
+/// capability requirement a bigger host satisfies → skip), mirroring the
+/// operator-knob half [`CpuBudgetUnsatisfiable`] (a concrete `--cpu-cap`
+/// number the host cannot satisfy → hard fail). Distinct
 /// from [`ResourceContention`] (a transient slot/resource shortage a retry
 /// resolves → skip); a too-small host is permanent, so the operator must
 /// provision different hardware or narrow the topology rather than retry.
@@ -89,39 +94,20 @@ impl std::fmt::Display for PerfModeUnavailable {
 
 impl std::error::Error for PerfModeUnavailable {}
 
-/// An explicit CPU budget (`--cpu-cap N` / per-test `cpu_budget = N`) the
-/// host cannot satisfy: N exceeds the CPUs this process is allowed on. A
-/// HARD ERROR, not a skip — the author typed a concrete number that does
-/// not exist on this host (a user-input error, distinct from a bare
-/// capability request). Contrast [`ResourceContention`] (a transient
-/// shortage of an otherwise-satisfiable budget → skip/retry).
+/// An operator `--cpu-cap N` (or `KTSTR_CPU_CAP`) the host cannot satisfy: N
+/// exceeds the CPUs this process is allowed on. A HARD ERROR, not a skip —
+/// the operator typed a concrete number that does not exist on this host (a
+/// user-input error). This is the OPERATOR-knob half of a provenance split:
+/// an author's per-test `cpu_budget` over the allowance is instead a
+/// [`TopologyInsufficient`] SKIP (a capability request a bigger host would
+/// satisfy), raised in `resolve_cpu_budget`. Contrast [`ResourceContention`]
+/// (a transient shortage of an otherwise-satisfiable budget → skip/retry).
 ///
 /// Downcast via `anyhow::Error::downcast_ref::<CpuBudgetUnsatisfiable>()`
 /// (chain-aware).
 #[derive(Debug)]
 pub struct CpuBudgetUnsatisfiable {
     pub reason: String,
-}
-
-impl CpuBudgetUnsatisfiable {
-    /// Construct the "explicit CPU budget exceeds the allowed cpuset"
-    /// hard error shared by the `--cpu-cap` (`CpuCap::effective_count`)
-    /// and per-test `cpu_budget` (`KtstrVmBuilder::build`) paths: both
-    /// share the same prefix, the `sched_getaffinity` framing, and the
-    /// "pick a smaller value or release the constraint" remediation.
-    /// `source` names the knob in the message (e.g. `"--cpu-cap N"`,
-    /// `"cpu_budget"`); `omit_hint` is the source-specific "or omit X to
-    /// use the default" tail.
-    pub(crate) fn exceeds_allowed(source: &str, n: usize, allowed: usize, omit_hint: &str) -> Self {
-        Self {
-            reason: format!(
-                "{source} = {n} exceeds the {allowed} CPUs this process is \
-                 allowed on (from sched_getaffinity / Cpus_allowed_list). \
-                 Pick a value ≤ {allowed}, release the cgroup/taskset \
-                 constraint restricting this process, or {omit_hint}."
-            ),
-        }
-    }
 }
 
 impl std::fmt::Display for CpuBudgetUnsatisfiable {
@@ -1126,14 +1112,17 @@ impl CpuCap {
             // (the author typed a concrete number that does not exist here),
             // not transient contention: CpuBudgetUnsatisfiable, not
             // ResourceContention, so it fails rather than skips.
-            return Err(anyhow::Error::new(CpuBudgetUnsatisfiable::exceeds_allowed(
-                "--cpu-cap N",
-                n,
-                allowed_cpus,
-                "omit --cpu-cap to use the auto-sized default (30% of the \
-                 allowed set for kernel builds; the vCPU count, floored at \
-                 30%, for VMs)",
-            )));
+            return Err(anyhow::Error::new(CpuBudgetUnsatisfiable {
+                reason: format!(
+                    "--cpu-cap N = {n} exceeds the {allowed_cpus} CPUs this \
+                     process is allowed on (from sched_getaffinity / \
+                     Cpus_allowed_list). Pick a value ≤ {allowed_cpus}, \
+                     release the cgroup/taskset constraint restricting this \
+                     process, or omit --cpu-cap to use the auto-sized default \
+                     (30% of the allowed set for kernel builds; the vCPU \
+                     count, floored at 30%, for VMs)."
+                ),
+            }));
         }
         Ok(n)
     }

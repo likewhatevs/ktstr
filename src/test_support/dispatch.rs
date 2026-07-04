@@ -107,8 +107,10 @@ pub fn is_perf_mode_unavailable(e: &anyhow::Error) -> bool {
 
 /// Check if an `anyhow::Error` carries a [`CpuBudgetUnsatisfiable`].
 ///
-/// Chain-aware. A `CpuBudgetUnsatisfiable` is a HARD ERROR (an explicit
-/// `--cpu-cap` / `cpu_budget` number the host cannot satisfy), NOT a skip.
+/// Chain-aware. A `CpuBudgetUnsatisfiable` is a HARD ERROR (an operator
+/// `--cpu-cap` number the host cannot satisfy), NOT a skip. (An author's
+/// per-test `cpu_budget` over the allowance skips via `TopologyInsufficient`
+/// instead — see `resolve_cpu_budget` — so it never carries this type.)
 ///
 /// [`CpuBudgetUnsatisfiable`]: crate::vmm::host_topology::CpuBudgetUnsatisfiable
 #[doc(hidden)]

@@ -20,9 +20,12 @@ No-perf-mode VMs instead size to `max(30%, min(vcpus, allowed))`
 (`no_perf_cpu_budget`) so a wide VM's vCPU threads are not
 host-oversubscribed by a 30% mask. A per-test `cpu_budget` knob
 (`#[ktstr_test]`) overrides the auto-size, floored at 1; a value above
-`allowed` is a hard error (`CpuBudgetUnsatisfiable`), not silently
-clamped down. An explicit `--cpu-cap` / `KTSTR_CPU_CAP` still wins
-outright. The
+`allowed` SKIPS the test (`TopologyInsufficient` — an author capability
+requirement a bigger host would satisfy), not silently clamped down. An
+explicit operator `--cpu-cap` / `KTSTR_CPU_CAP` still wins outright, and
+over the allowance it hard-errors (`CpuBudgetUnsatisfiable`) rather than
+skipping — a concrete operator number that does not exist here is a
+misconfiguration, not a host-capability gap. The
 30% floor keeps `sched_setaffinity` safe under cgroup-restricted CI
 runners (CI hosts, systemd slices, sudo-under-a-limited-cpuset) where
 the process cannot run on every online CPU even if sysfs lists them.
