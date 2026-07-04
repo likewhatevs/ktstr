@@ -3,7 +3,7 @@
 `cargo ktstr` is a cargo plugin for kernel build, cache, and test
 workflow. Subcommands in `--help` order: `test` (alias: `nextest`),
 `coverage`, `llvm-cov`, `stats`, `replay`, `perf-delta`, `kernel`,
-`verifier`, `funify` (alias: `costume`), `completions`,
+`verifier`, `completions`,
 `show-host`, `show-thresholds`, `export`, `locks`, `shell`.
 
 ## test
@@ -670,46 +670,6 @@ cargo ktstr shell --kernel 6.14.2
 cargo ktstr shell --topology 1,2,4,1
 cargo ktstr shell -i ./my-binary -i strace
 ```
-
-## funify
-
-Rewrite a JSON dump by replacing every non-metric value with a
-deterministic `adjective-animal` petname, so a downstream LLM can
-reason about the structural shape of the dump without seeing real
-identifiers. Visible alias: `costume`.
-
-```sh
-cargo ktstr funify failure_dump.json                  # stdin or file path
-cargo ktstr funify dump.json --seed demo              # deterministic across invocations
-cargo ktstr funify dump.json --seed demo --pretty     # pretty-printed JSON output
-cat dump.json | cargo ktstr costume --seed demo       # alias + stdin
-```
-
-The walker funifies by default — every value whose containing key
-is NOT on the metric allowlist gets replaced. Values that share
-the same key AND the same payload get the same fun name so
-cross-references inside the dump survive (e.g. `"swift-otter
-migrated from CPU 3 to CPU 7"` stays consistent). Floats always
-pass through; sentinel `u64` values `0` and `u64::MAX` keep their
-kthread / "no value" semantics. Non-JSON input fails fast with
-the underlying serde_json parse error.
-
-The metric allowlist is the source of truth (see
-`ktstr::fun::Funifier::is_metric_passthrough`). It covers
-structural enums (`schema`, `type`, `kind`, `state`, `policy`,
-…), position / lifecycle counts (`size`, `len`, `epoch`, …),
-count suffixes (`*_count`, `*_total`, `*_completed`, …), rates /
-ratios (`*_per_sec`, `*_ratio`, …), units (`*_ns`, `*_bytes`,
-…), statistics (`*_mean`, `*_p99`, …), I/O counters, scheduling
-fields (`priority`, `nice`, `weight`, …), per-rq SCX state,
-DSQ counters, NUMA events, SCX exit-info events, BPF prog runtime,
-and hardware perf counters.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `INPUT` | stdin | Path to the JSON file. `-` or omitted reads from stdin. |
-| `--seed STR` | random per process | Fixed seed for reproducible fun-name assignment across invocations. Omit for a fresh process-local key. |
-| `--pretty` | compact | Pretty-print the output. Default emits compact JSON suitable for piping. |
 
 ## completions
 

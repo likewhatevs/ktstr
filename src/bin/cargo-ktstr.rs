@@ -32,7 +32,7 @@
 //!   binary under the BPF-stats verifier and renders
 //!   per-program verified-instruction counts.
 //! - `misc`   — smaller subcommand dispatchers, one submodule per
-//!   CLI verb: `shell`, `completions`, `funify`, `export`.
+//!   CLI verb: `shell`, `completions`, `export`.
 //! - `parse_tests` (test-only) — clap parse-shape coverage: every
 //!   `KtstrCommand` variant gets at least one test that
 //!   pins flag wiring + conflict/requires constraints.
@@ -147,7 +147,7 @@ fn main() {
 ///
 /// Split into [`dispatch_run_command`] (test/coverage/llvm-cov/stats/
 /// replay/perf-delta) and [`dispatch_admin_command`] (kernel/model/
-/// verifier/funify/completions/host/thresholds/export/locks/shell)
+/// verifier/completions/host/thresholds/export/locks/shell)
 /// purely to keep each function under the source-function size guard;
 /// the run-group helper matches its variants and forwards every other
 /// variant to the admin-group helper, so the two together cover the
@@ -287,7 +287,6 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
         // the single-match compile-time exhaustiveness guarantee.
         cmd @ (KtstrCommand::Kernel { .. }
         | KtstrCommand::Verifier { .. }
-        | KtstrCommand::Funify { .. }
         | KtstrCommand::Completions { .. }
         | KtstrCommand::ShowHost
         | KtstrCommand::ShowThresholds { .. }
@@ -353,11 +352,6 @@ fn dispatch_admin_command(command: KtstrCommand) -> Result<(), String> {
             include_eol,
             args,
         ),
-        KtstrCommand::Funify {
-            input,
-            seed,
-            pretty,
-        } => misc::run_funify(input, seed, pretty),
         KtstrCommand::Completions { shell, binary } => {
             misc::run_completions(shell, &binary);
             Ok(())

@@ -1,20 +1,12 @@
-//! Fun mode — context-hygiene for failure dumps. Funifies every
-//! non-metric value by default so LLM context stays clean: strings
-//! and integers under non-metric keys are replaced with
-//! deterministic `adjective-animal` names or hashed numeric IDs,
-//! while values under metric-allowlisted keys (counts, rates,
-//! ratios, byte/duration units, structural enums) pass through
-//! unchanged. The result lets an LLM reason about the structural
-//! and relational shape of a dump without dragging real internal
-//! identifiers into its context.
-//!
-//! This is a CONTEXT-HYGIENE feature, not a security feature. Real
-//! pids, cpu ids, cgroup names, and process comms are not sensitive
-//! per se — they are just noisy when fed to an LLM that does not
-//! need them. Replacing them with `agile-otter`-style names lets
-//! the reader reason about "agile-otter migrated from CPU 3 to CPU 7"
-//! without learning anything internal about whatever pid that
-//! actually was.
+//! Fun mode — deterministically rename a JSON dump's non-metric values to
+//! playful `adjective-animal` names (and hashed numeric IDs). Every non-metric
+//! value is funified by default: strings and integers under non-metric keys
+//! become a deterministic fun name, while values under metric-allowlisted keys
+//! (counts, rates, ratios, byte/duration units, structural enums) pass through
+//! unchanged. Structure and relationships are preserved — which keys nest
+//! where, which values co-refer — so `agile-otter migrated from CPU 3 to
+//! CPU 7` reads the same, just with fun names. Deterministic per seed; a
+//! funify is a one-way rename.
 //!
 //! # Polarity: metric allowlist
 //!
@@ -75,10 +67,9 @@ const FUN_PEPPER: &[u8] = b"ktstr-fun-mode/v1";
 /// identifier in the dump.
 #[derive(Clone, Debug)]
 pub struct Funifier {
-    /// 16-byte SipHash key. SipHash-2-4 is a keyed PRF; 128-bit key
-    /// is enough for the LLM-context-hygiene goal (we are not
-    /// defending against an attacker, only against accidental
-    /// context pollution). Derived either from SHA-256 over the
+    /// 16-byte SipHash key. SipHash-2-4 is a keyed PRF; 128 bits give a
+    /// deterministic, low-collision mapping from an identifier to its fun
+    /// name. Derived either from SHA-256 over the
     /// process pid and a ns timestamp ([`Self::ephemeral`]) or
     /// from SHA-256 over [`FUN_PEPPER`] and a user-supplied seed
     /// ([`Self::with_seed`]).
@@ -106,7 +97,7 @@ impl Funifier {
         // per kernel concurrent-life, ns timestamp gives 64-bit
         // intra-process distinctness. SHA-256 then mixes those
         // into a 16-byte key with adequate avalanche for the
-        // context-hygiene goal.
+        // value-substitution goal.
         let pid = std::process::id() as u64;
         let ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -131,8 +122,8 @@ impl Funifier {
     /// inputs. Different seeds give independent mappings.
     ///
     /// Uses SHA-256 over the fixed `FUN_PEPPER` || seed bytes,
-    /// truncated to 128 bits for SipHash. Not cryptographic but
-    /// sufficient for the deterministic-mapping contract.
+    /// truncated to 128 bits for SipHash — enough for a stable,
+    /// low-collision fun mapping.
     pub fn with_seed(seed: &str) -> Self {
         let mut h = Sha256::new();
         h.update(FUN_PEPPER);
@@ -191,12 +182,9 @@ impl Funifier {
     /// hash mixes (category, n.to_le_bytes()), and we take the low
     /// 64 bits as the new identifier.
     ///
-    /// This is NOT format-preserving encryption — we are not
-    /// defending against an attacker who has the corpus and is
-    /// trying to reverse the mapping. The user explicitly framed
-    /// fun mode as "nothing is sensitive to begin with, but like,
-    /// why risk it" / context hygiene for LLMs, NOT a security
-    /// feature.
+    /// The permutation just needs to be deterministic and to rarely
+    /// collide; fun mode keeps the numbers stable and distinct, not
+    /// meaningful.
     ///
     /// Two distinct `(category, n)` inputs collide on the same
     /// output u64 with probability ~2^-64. Within a single
@@ -765,7 +753,7 @@ fn funify_json_with_context(
 // (no spaces or hyphens) so the rendered name is always a clean
 // `adjective-animal` token suitable for downstream tooling.
 //
-// Word lists curated for ktstr's costume-party direction:
+// Word lists curated for readable fun names:
 // playful, recognizable, no edge-cases (no profanity, no political,
 // no unusual spellings). The order is fixed for the lifetime of
 // this v1 — adding new words to the END is safe; reordering would

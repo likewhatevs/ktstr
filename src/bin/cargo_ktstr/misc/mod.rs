@@ -9,7 +9,6 @@
 //!
 //! - [`shell`]       — `cargo ktstr shell` (KVM VM + busybox).
 //! - [`completions`] — `cargo ktstr completions` (clap_complete dump).
-//! - [`funify`]      — `cargo ktstr funify` (JSON value funification).
 //! - [`export`]      — `cargo ktstr export` (`.run` self-extracting
 //!   reproducer for a registered test).
 //! - [`probe`]       — shared probe-loop scaffolding
@@ -21,12 +20,10 @@
 
 mod completions;
 mod export;
-mod funify;
 mod probe;
 mod shell;
 
 pub(crate) use completions::run_completions;
 pub(crate) use export::run_export;
-pub(crate) use funify::run_funify;
 pub(crate) use probe::probe_collect;
 pub(crate) use shell::run_shell;
