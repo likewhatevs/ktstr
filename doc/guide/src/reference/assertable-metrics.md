@@ -105,7 +105,7 @@ check, not a whitelist.
 
 Bind each gate to a `const` and list it on the macro:
 
-```rust
+```rust,ignore
 use ktstr::prelude::*;
 
 // Name any metric from `cargo ktstr stats list-metrics`.

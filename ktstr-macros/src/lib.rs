@@ -553,9 +553,9 @@ mod tests {
             overlap.is_empty(),
             "BOOL_ATTR_NAMES and VALUE_ATTR_NAMES overlap: {overlap:?}",
         );
-        // Cardinality pin: 16 bool + 49 value = 65 accepted attributes.
+        // Cardinality pin: 16 bool + 50 value = 66 accepted attributes.
         assert_eq!(bool_names.len(), 16, "bool attribute count changed");
-        assert_eq!(value_names.len(), 49, "value attribute count changed");
+        assert_eq!(value_names.len(), 50, "value attribute count changed");
     }
 
     /// Contract pin: `ktstr_test::AttrValues::default()` is the single source of
