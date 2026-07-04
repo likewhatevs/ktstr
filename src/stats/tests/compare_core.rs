@@ -2495,6 +2495,7 @@ fn format_noise_phase_findings_lines_honors_flags() {
             opts,
             "base",
             "head",
+            true,
         )
         .join("\n")
     };
@@ -2509,6 +2510,7 @@ fn format_noise_phase_findings_lines_honors_flags() {
             },
             "base",
             "head",
+            true,
         )
         .is_empty(),
         "no_phases suppresses the per-phase block",
@@ -2590,6 +2592,7 @@ fn format_noise_phase_findings_lines_renders_coverage() {
         &PhaseDisplayOptions::default(),
         "base",
         "head",
+        false,
     )
     .join("\n");
     assert!(
@@ -2636,12 +2639,277 @@ fn format_noise_phase_findings_lines_honors_phase_threshold() {
         },
         "base",
         "head",
+        true,
     )
     .join("\n");
     assert!(
         out.contains("2: Step[1]") && !out.contains("1: Step[0]"),
         "--phase-threshold 10 keeps the +50% step and suppresses the +3% step:\n{out}",
     );
+}
+
+#[test]
+fn format_noise_phase_findings_lines_default_hides_stable_rows() {
+    // Default per-phase view (show_all=false) shows only MEANINGFUL rows
+    // (regression / improvement / informational) and hides the wall of stable /
+    // noisy rows — parity with the aggregate table. A phase carrying one
+    // regression + one unchanged (stable) metric shows only the regression by
+    // default; `--all-metrics` (show_all=true) restores the stable row.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(
+            1,
+            "Step[0]",
+            &[("max_dsq_depth", 5.0), ("schbench_loop_count", 100.0)],
+        )],
+    );
+    let b = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(
+            1,
+            "Step[0]",
+            &[("max_dsq_depth", 20.0), ("schbench_loop_count", 100.0)],
+        )],
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    // Fixture sanity: max_dsq_depth 5->20 is a per-phase regression, and the
+    // unchanged schbench_loop_count is a stable row to hide. Guards against a
+    // vacuous pass if the classifier ever changes.
+    assert!(
+        rep.phase_findings
+            .iter()
+            .any(|f| f.metric.name == "max_dsq_depth" && f.kind == NoiseKind::Regression),
+        "fixture must carry a per-phase regression: {:?}",
+        rep.phase_findings
+            .iter()
+            .map(|f| (f.metric.name, f.kind))
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        rep.phase_findings
+            .iter()
+            .any(|f| f.metric.name == "schbench_loop_count" && f.kind == NoiseKind::Stable),
+        "fixture must carry a per-phase stable row to hide",
+    );
+    let default = format_noise_phase_findings_lines(
+        &rep.phase_findings,
+        &rep.phase_coverage,
+        &PhaseDisplayOptions::default(),
+        "base",
+        "head",
+        false,
+    )
+    .join("\n");
+    assert!(
+        default.contains("max_dsq_depth") && default.contains("REGRESSION"),
+        "the meaningful regression row shows by default:\n{default}",
+    );
+    assert!(
+        !default.contains("schbench_loop_count"),
+        "a stable per-phase row is hidden without --all-metrics:\n{default}",
+    );
+    let full = format_noise_phase_findings_lines(
+        &rep.phase_findings,
+        &rep.phase_coverage,
+        &PhaseDisplayOptions::default(),
+        "base",
+        "head",
+        true,
+    )
+    .join("\n");
+    assert!(
+        full.contains("schbench_loop_count"),
+        "--all-metrics restores the suppressed stable per-phase row:\n{full}",
+    );
+}
+
+#[test]
+fn format_noise_phase_findings_lines_collapses_when_all_stable() {
+    // Every per-phase row stable -> the default view collapses to a one-line
+    // summary (never a silent gap or an empty table), and it names --all-metrics
+    // so the suppressed rows stay discoverable.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(1, "Step[0]", &[("schbench_loop_count", 100.0)])],
+    );
+    let b = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(1, "Step[0]", &[("schbench_loop_count", 100.0)])],
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    assert!(
+        !rep.phase_findings.is_empty()
+            && rep
+                .phase_findings
+                .iter()
+                .all(|f| f.kind == NoiseKind::Stable),
+        "fixture must be all-stable per-phase findings: {:?}",
+        rep.phase_findings
+            .iter()
+            .map(|f| (f.metric.name, f.kind))
+            .collect::<Vec<_>>(),
+    );
+    let out = format_noise_phase_findings_lines(
+        &rep.phase_findings,
+        &rep.phase_coverage,
+        &PhaseDisplayOptions::default(),
+        "base",
+        "head",
+        false,
+    )
+    .join("\n");
+    assert!(
+        out.contains("none meaningfully changed") && out.contains("--all-metrics"),
+        "all-stable per-phase collapses to the one-line summary:\n{out}",
+    );
+    // --all-metrics restores the full stable table (no collapse).
+    let full = format_noise_phase_findings_lines(
+        &rep.phase_findings,
+        &rep.phase_coverage,
+        &PhaseDisplayOptions::default(),
+        "base",
+        "head",
+        true,
+    )
+    .join("\n");
+    assert!(
+        full.contains("schbench_loop_count") && !full.contains("none meaningfully changed"),
+        "--all-metrics shows the stable rows instead of collapsing:\n{full}",
+    );
+}
+
+#[test]
+fn format_noise_phase_findings_lines_suppressed_spread_with_coverage_shows_hint() {
+    // A matched-but-STABLE metric (suppressed by default) ALONGSIDE a one-sided
+    // COVERAGE metric: the default view must still surface the --all-metrics hint
+    // (the suppressed spread rows are not silently gone) AND render the coverage
+    // table. Regression guard for the coverage-present suppression gap.
+    let a = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(
+            1,
+            "Step[0]",
+            &[("schbench_loop_count", 100.0), ("max_dsq_depth", 8.0)],
+        )],
+    );
+    let b = phased_rows(
+        "scn",
+        3,
+        &[make_phase_bucket(1, "Step[0]", &[("schbench_loop_count", 100.0)])],
+    );
+    let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
+    // Fixture sanity: schbench_loop_count is a matched STABLE finding (to
+    // suppress), max_dsq_depth is A-only (a coverage row).
+    assert!(
+        rep.phase_findings
+            .iter()
+            .any(|f| f.metric.name == "schbench_loop_count" && f.kind == NoiseKind::Stable),
+        "fixture must carry a matched stable spread row to suppress: {:?}",
+        rep.phase_findings
+            .iter()
+            .map(|f| (f.metric.name, f.kind))
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        !rep.phase_coverage.is_empty(),
+        "fixture must carry a one-sided coverage row"
+    );
+    let out = format_noise_phase_findings_lines(
+        &rep.phase_findings,
+        &rep.phase_coverage,
+        &PhaseDisplayOptions::default(),
+        "base",
+        "head",
+        false,
+    )
+    .join("\n");
+    assert!(
+        out.contains("none meaningfully changed") && out.contains("--all-metrics"),
+        "the suppressed-spread hint appears even when a coverage table follows:\n{out}",
+    );
+    assert!(
+        out.contains("per-phase coverage asymmetry"),
+        "the coverage table still renders alongside the hint:\n{out}",
+    );
+    assert!(
+        !out.contains("schbench_loop_count"),
+        "the stable spread row itself stays hidden without --all-metrics:\n{out}",
+    );
+}
+
+#[test]
+fn noise_report_composite_counts_regressed_improved_stable() {
+    // The composite footer cites regressed / improved (the signal) and stable
+    // (the residual); pin the accessors that feed it. worst_spread (LowerBetter):
+    // 10->15 regresses, 10->5 improves; unchanged total_iterations (2000) stays
+    // stable in both directions.
+    let base = noise_side("scn", 10.0, 2000);
+
+    let regressed = noise_findings(
+        &base,
+        &noise_side("scn", 15.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+        true,
+    );
+    assert_eq!(regressed.regressions(), 1, "worst_spread 10->15 regresses");
+    assert_eq!(regressed.improvements(), 0, "nothing improved on the regressing side");
+    assert!(
+        regressed.stable() >= 1,
+        "unchanged total_iterations is counted stable"
+    );
+    assert_eq!(regressed.informational(), 0, "no informational metric in the fixture");
+
+    let improved = noise_findings(
+        &base,
+        &noise_side("scn", 5.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+        true,
+    );
+    assert_eq!(improved.improvements(), 1, "worst_spread 10->5 improves");
+    assert_eq!(improved.regressions(), 0, "nothing regressed on the improving side");
+    assert!(
+        improved.stable() >= 1,
+        "unchanged total_iterations is counted stable"
+    );
+}
+
+#[test]
+fn verdict_label_stays_stable_below_cutoff_cites_direction_above() {
+    // Default cutoff 5. Sub-cutoff moves in either direction are likely noise ->
+    // STABLE (they are still flagged / counted in the footer). Clearing the
+    // cutoff cites that direction; both directions can hold at once.
+    assert_eq!(verdict_label(false, 0, None), "STABLE", "no moves -> stable");
+    assert_eq!(
+        verdict_label(false, 4, None),
+        "STABLE",
+        "4 improvements < 5 cutoff -> still stable (likely noise)"
+    );
+    assert_eq!(
+        verdict_label(false, 5, None),
+        "IMPROVED",
+        "improvements clear the cutoff -> IMPROVED"
+    );
+    assert_eq!(
+        verdict_label(true, 0, None),
+        "REGRESSED",
+        "a failing run reads REGRESSED even with no improvements"
+    );
+    assert_eq!(
+        verdict_label(true, 5, None),
+        "REGRESSED + IMPROVED",
+        "both directions clear the cutoff -> combined verdict"
+    );
+    // The cutoff tracks --fail-threshold: 1 makes a single improvement
+    // significant; 0 disables count significance for improvements.
+    assert_eq!(verdict_label(false, 1, Some(1)), "IMPROVED");
+    assert_eq!(verdict_label(false, 100, Some(0)), "STABLE");
 }
 
 #[test]

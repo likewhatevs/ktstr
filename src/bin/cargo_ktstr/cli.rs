@@ -476,12 +476,14 @@ pub(crate) enum KtstrCommand {
         /// immaterial) and noisy (fewer than 2 usable runs) ones. Default:
         /// only meaningful rows (confident regression / improvement /
         /// informational) print; when every row is suppressed a one-line
-        /// summary prints instead of an empty table. Applies to the
-        /// `--noise-adjust` aggregate metrics table; the per-phase table is
-        /// separately spread-gated by `--phase-threshold` (it shows every
-        /// verdict kind). The fixed-threshold table already lists every
-        /// changed row plus an unchanged count. Display-only — never affects
-        /// the failure gate.
+        /// summary prints instead of an empty table. Applies to BOTH the
+        /// `--noise-adjust` aggregate metrics table AND the per-phase spread
+        /// table (each hides stable / noisy rows by default and collapses to a
+        /// one-line summary when all its rows are suppressed); the per-phase
+        /// table is additionally spread-gated by `--phase-threshold`, and the
+        /// per-phase coverage (one-sided metrics) table is always shown. The
+        /// fixed-threshold table already lists every changed row plus an
+        /// unchanged count. Display-only — never affects the failure gate.
         #[arg(long, help_heading = "Metric rendering")]
         all_metrics: bool,
         /// Fail the run only when AT LEAST N metrics regress (default 5, so

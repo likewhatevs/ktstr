@@ -1840,6 +1840,35 @@ impl NoiseReport {
             .filter(|f| f.kind == NoiseKind::Noisy)
             .count()
     }
+    /// Confident AGGREGATE improvements — a metric that moved MATERIALLY in the
+    /// better direction and cleared the significance test. Render-only (an
+    /// improvement never gates); cited in the summary footer alongside
+    /// [`Self::regressions`] so the reader sees the composite verdict (what
+    /// regressed AND what improved), with [`Self::stable`] as the residual.
+    pub fn improvements(&self) -> usize {
+        self.findings
+            .iter()
+            .filter(|f| f.kind == NoiseKind::Improvement)
+            .count()
+    }
+    /// Aggregate metrics that did NOT move confidently+materially — the expected
+    /// common outcome, since the noise gate (Welch / disjoint-bands + material
+    /// dual-gate) is conservative. Cited as a residual COUNT in the footer (the
+    /// low-value majority), never enumerated.
+    pub fn stable(&self) -> usize {
+        self.findings
+            .iter()
+            .filter(|f| f.kind == NoiseKind::Stable)
+            .count()
+    }
+    /// Aggregate metrics that changed but carry no better/worse polarity
+    /// (registry `Informational`) — cited in the footer only when present.
+    pub fn informational(&self) -> usize {
+        self.findings
+            .iter()
+            .filter(|f| f.kind == NoiseKind::Informational)
+            .count()
+    }
     /// Confident per-phase regressions — for the footer + tests ONLY, never
     /// the exit basis (per-phase SPREAD is render-only). A per-phase regression the author explicitly DECLARED via a
     /// phase-scoped [`crate::test_support::PerfDeltaAssertion`] DOES gate — see
@@ -2496,15 +2525,25 @@ pub(crate) fn summarize_side_runs(rows: &[GauntletRow]) -> (usize, String) {
 /// only the MEANINGFUL rows (confident regression / improvement / informational),
 /// each with its side's `mean [min-max] spread%` and verdict; stable (unchanged +
 /// clean) and noisy (<2-run) rows are hidden unless `--all-metrics`, and a
-/// one-line summary prints when every row is suppressed. The footer carries the
-/// regression/under-sampled counts and, when every changed (non-stable) metric had
-/// a side with <2 usable runs, an explicit inconclusive note.
+/// one-line summary prints when every row is suppressed. The footer leads with an
+/// overall verdict word ([`overall_verdict`]: `STABLE` unless the regressed or
+/// improved count clears the significance cutoff — sub-cutoff moves are flagged
+/// but likely noise) followed by the composite counts (regressed / improved /
+/// stable / under-sampled, plus informational when present); and, when every
+/// changed (non-stable) metric had a side with <2 usable runs, an explicit
+/// inconclusive note.
 ///
 /// When the scenarios carry phases, a per-phase spread block follows the
 /// aggregate table (via [`format_noise_phase_findings_lines`]): the same
 /// spread verdict per matched `(step_index, metric)`, plus a coverage table for
-/// one-sided phases/metrics. `phase_opts` controls the per-phase render only
-/// (`--no-phases` / `--phases-only` / `--steps-only` / `--phase` /
+/// one-sided phases/metrics. Like the aggregate table, the per-phase block shows
+/// only MEANINGFUL rows by default (regression / improvement / informational) and
+/// hides stable / noisy rows unless `--all-metrics` (`gate.show_all`); whenever the
+/// spread rows are all suppressed it surfaces a one-line hint naming
+/// `--all-metrics` (even alongside a coverage table), so the suppressed rows are
+/// never silently gone. The coverage (one-sided) table is itself never
+/// suppressed. `phase_opts` controls the per-phase
+/// render only (`--no-phases` / `--phases-only` / `--steps-only` / `--phase` /
 /// `--phase-threshold`); under `--phases-only` the aggregate table is
 /// suppressed. Per-phase SPREAD findings are RENDER-ONLY — classified and
 /// colored but not gating — EXCEPT a
@@ -2607,6 +2646,7 @@ pub fn compare_partitions_noise(
         phase_opts,
         &label_a,
         &label_b,
+        gate.show_all,
     );
     if phase_lines.is_empty() && phase_opts.phases_only {
         println!(
@@ -2638,6 +2678,28 @@ pub fn compare_partitions_noise(
     // `declared_phase_regressions` (computed above) when the footer is hidden.
     if !phase_opts.phases_only {
         let noisy = report.noisy();
+        // Composite verdict counts: regressed / improved LEAD (the table shows
+        // each with its magnitude), stable is the expected residual cited as a
+        // count only, and informational (changed but no polarity) is cited only
+        // when present. All render-only — the exit reads gate_fails + declared
+        // gates, never these.
+        let improvements = report.improvements();
+        let stable = report.stable();
+        let informational = report.informational();
+        let info_clause = if informational > 0 {
+            format!(", {informational} informational")
+        } else {
+            String::new()
+        };
+        // Overall verdict word: STABLE unless a direction clears the cutoff (see
+        // overall_verdict). Sub-cutoff moves are flagged in the counts above but
+        // do not shift the verdict off STABLE.
+        let verdict = overall_verdict(&report, gate);
+        let stable_note = if verdict == "STABLE" && regressions + improvements > 0 {
+            " (moves are below the significance cutoff, more likely noise than signal)"
+        } else {
+            ""
+        };
         // Per-phase footer counts are shown ONLY when there IS per-phase data
         // AND no phase filter is active (no --no-phases / --phase / --steps-only
         // / --phase-threshold) — so the counts always match the fully-rendered
@@ -2650,6 +2712,19 @@ pub fn compare_partitions_noise(
             && phase_opts.phase.is_none()
             && !phase_opts.steps_only
             && phase_opts.phase_threshold.is_none();
+        // A REGRESSED verdict with ZERO aggregate regressions can only come from a
+        // declared PER-PHASE gate (a declared whole-run regression and --must-fail
+        // both require an aggregate Regression, so regressions >= 1 there). When
+        // the phase footer below is hidden (a phase filter is active) name the
+        // source so `overall REGRESSED: 0 regressed` is not self-contradictory;
+        // when the phase footer shows, its "(declared-gated, exit-affecting)"
+        // clause already explains it, so skip the redundant note.
+        let verdict_source =
+            if verdict.starts_with("REGRESSED") && regressions == 0 && !show_phase_footer {
+                " (regression is a declared per-phase gate)"
+            } else {
+                ""
+            };
         let phase_footer = if show_phase_footer {
             // Per-phase regressions are render-only EXCEPT the declared-gated
             // ones, which gate the exit — call that out so the count is not read
@@ -2676,8 +2751,9 @@ pub fn compare_partitions_noise(
             String::new()
         };
         println!(
-            "perf-delta --noise-adjust: {} paired scenario(s); {regressions} confident regression(s), \
-             {noisy} under-sampled metric(s) (<2 runs){phase_footer}{gate_footer}",
+            "perf-delta --noise-adjust: {} paired scenario(s); overall {verdict}: \
+             {regressions} regressed, {improvements} improved, {stable} stable{info_clause}, \
+             {noisy} under-sampled (<2 runs){stable_note}{verdict_source}{phase_footer}{gate_footer}",
             report.paired_scenarios,
         );
     }
@@ -2735,6 +2811,46 @@ pub(crate) fn noise_exit_code(report: &NoiseReport, gate: &GateOptions) -> i32 {
         1
     } else {
         0
+    }
+}
+
+/// Overall run verdict word for the `--noise-adjust` summary, derived from the
+/// confident move counts against the significance cutoff (`--fail-threshold`,
+/// default 5). Sub-cutoff moves in EITHER direction are FLAGGED (shown in the
+/// table, counted in the footer) but do NOT shift the verdict off `STABLE` —
+/// below the cutoff a move is more likely noise than signal, which is the whole
+/// point of the conservative noise gate. A direction only reads into the verdict
+/// once it clears the cutoff, and both can hold at once (`REGRESSED + IMPROVED`).
+///
+/// The regressed side reuses the exit decision ([`noise_exit_code`]) so a
+/// `--must-fail` or declared gate that fails the run also reads `REGRESSED` even
+/// below the count cutoff; the improved side has no gate, so it uses the count
+/// cutoff alone. Display-only — never the exit basis.
+pub(crate) fn overall_verdict(report: &NoiseReport, gate: &GateOptions) -> &'static str {
+    verdict_label(
+        noise_exit_code(report, gate) == 1,
+        report.improvements(),
+        gate.fail_threshold,
+    )
+}
+
+/// Pure verdict classifier: `regressed` is the run's regression-fail decision;
+/// `improvements` is the confident-improvement count; `fail_threshold` is the
+/// significance cutoff (`None` = 5, `Some(0)` disables count significance).
+/// Split out from [`overall_verdict`] so the STABLE-below-cutoff policy is
+/// unit-testable without building a full report.
+pub(crate) fn verdict_label(
+    regressed: bool,
+    improvements: usize,
+    fail_threshold: Option<usize>,
+) -> &'static str {
+    let n = fail_threshold.unwrap_or(5);
+    let improved = n >= 1 && improvements >= n;
+    match (regressed, improved) {
+        (true, true) => "REGRESSED + IMPROVED",
+        (true, false) => "REGRESSED",
+        (false, true) => "IMPROVED",
+        (false, false) => "STABLE",
     }
 }
 
@@ -2938,23 +3054,63 @@ pub(crate) fn format_noise_phase_findings_lines(
     phase_opts: &PhaseDisplayOptions,
     label_a: &str,
     label_b: &str,
+    show_all: bool,
 ) -> Vec<String> {
     use comfy_table::{Cell, Color};
     let mut lines = Vec::new();
     if phase_opts.no_phases {
         return lines;
     }
-    let mut findings: Vec<&NoisePhaseFinding> = phase_findings
+    // Rows passing the phase-axis filters (`--phase` / `--steps-only`) and the
+    // `--phase-threshold` spread gate, BEFORE the meaningful-only display filter.
+    // Retained so the collapse summary below can report how many rows the default
+    // view suppressed.
+    let phase_filtered: Vec<&NoisePhaseFinding> = phase_findings
         .iter()
         .filter(|f| phase_opts.matches_phase(f.step_index))
         .filter(|f| phase_opts.passes_noise_spread_threshold(&f.verdict))
+        .collect();
+    // Default view shows only MEANINGFUL rows (regression / improvement /
+    // informational); Stable + Noisy rows are hidden unless `show_all`
+    // (`--all-metrics`), mirroring the aggregate table
+    // ([`format_noise_findings_table`]). Display-only: the footer still reports
+    // the per-phase regression / under-sampled COUNTS from the unfiltered report,
+    // and the exit gate reads the unfiltered findings — so suppressing rows here
+    // changes neither the counts nor the pass/fail.
+    let mut findings: Vec<&NoisePhaseFinding> = phase_filtered
+        .iter()
+        .copied()
+        .filter(|f| show_all || !matches!(f.kind, NoiseKind::Stable | NoiseKind::Noisy))
         .collect();
     let mut coverage: Vec<&NoisePhaseCoverage> = phase_coverage
         .iter()
         .filter(|c| phase_opts.matches_phase(c.step_index))
         .collect();
     let had_findings = !findings.is_empty();
+    // Spread rows existed but were all suppressed as stable/noisy in the default
+    // view: a one-line hint (naming `--all-metrics`, wording matched to the
+    // aggregate collapse) keeps the suppression discoverable — surfaced whether
+    // the block is otherwise empty OR a coverage table follows, so the suppressed
+    // rows are never silently gone. Only in the default view: under `show_all`
+    // nothing is suppressed, so an empty result there means there was genuinely no
+    // per-phase spread data.
+    let suppressed_hint: Option<String> =
+        if findings.is_empty() && !phase_filtered.is_empty() && !show_all {
+            let noisy = phase_filtered
+                .iter()
+                .filter(|f| f.kind == NoiseKind::Noisy)
+                .count();
+            Some(format!(
+                "perf-delta --noise-adjust: {} per-phase metric(s) compared, none meaningfully \
+                 changed ({noisy} under-sampled); re-run with --all-metrics to see them",
+                phase_filtered.len(),
+            ))
+        } else {
+            None
+        };
     if findings.is_empty() && coverage.is_empty() {
+        // Nothing else to render — the hint (if any) is the whole block.
+        lines.extend(suppressed_hint);
         return lines;
     }
     lines.push(String::new());
@@ -3011,6 +3167,10 @@ pub(crate) fn format_noise_phase_findings_lines(
             ]);
         }
         lines.push(table.to_string());
+    } else {
+        // Spread rows were all suppressed but a coverage table follows: surface
+        // the suppression hint before it so `--all-metrics` stays discoverable.
+        lines.extend(suppressed_hint);
     }
     if !coverage.is_empty() {
         // Separate from the spread table above only when one was rendered; the
