@@ -1491,13 +1491,16 @@ pub(crate) fn scalar_declared_gate_warning(rows_b: &[GauntletRow]) -> Option<Str
 /// Groups every matching sidecar within each side by pairing key
 /// and averages the metrics across the group.
 ///
-/// Returns 0 on no regressions, 1 if regressions detected.
+/// Returns 1 when the confident regressions fail the operator gate — their
+/// count reaches `gate.fail_threshold` (default 5) or a `gate.must_fail`
+/// metric regressed; 0 otherwise. See [`gate_fails`] / [`GateOptions`].
 pub fn compare_partitions(
     filter_a: &RowFilter,
     filter_b: &RowFilter,
     filter: Option<&str>,
     policy: &ComparisonPolicy,
     dir: Option<&std::path::Path>,
+    gate: &GateOptions,
 ) -> anyhow::Result<i32> {
     let prepared = prepare_partitioned_comparison(filter_a, filter_b, dir, RowPrep::Averaged)?;
     let PartitionedComparison {
@@ -1563,7 +1566,129 @@ pub fn compare_partitions(
     // the delta reflects what actually fed the comparison.
     print_host_context_delta(pool, rows, filter_a, filter_b, &label_a, &label_b);
 
-    Ok(if report.regressions > 0 { 1 } else { 0 })
+    // Operator gate: the significance policy above decided WHICH deltas are
+    // confident regressions; the gate decides HOW MANY / WHICH-NAMED of them
+    // fail the run. (--all-metrics is a no-op on this path — the scalar table
+    // already lists every changed metric and the unchanged COUNT prints in
+    // the summary; it reveals stable/noisy rows on the --noise-adjust table.)
+    let regressing: Vec<&str> = report
+        .findings
+        .iter()
+        .filter(|f| f.kind == FindingKind::Regression)
+        .map(|f| f.metric.name)
+        .collect();
+    Ok(if gate_fails(&regressing, gate) { 1 } else { 0 })
+}
+
+/// Operator-level perf-delta failure gate + render options, layered on top
+/// of the per-metric significance policy (which decides WHICH deltas are
+/// confident regressions). These decide HOW MANY / WHICH-NAMED confident
+/// regressions fail the run, and whether stable/noisy rows render.
+#[derive(Debug, Clone, Default)]
+pub struct GateOptions {
+    /// Fail iff at least this many confident regressions occur. `None`
+    /// means 5 — a handful of regressions is tolerated as run-to-run noise
+    /// and the run fails only once several metrics regress; pass
+    /// `--fail-threshold 1` for fail-on-any. `Some(0)` disables the count
+    /// gate entirely — only [`Self::must_fail`] can then fail the run.
+    pub fail_threshold: Option<usize>,
+    /// Metric registry names that fail the run if ANY of them regresses,
+    /// regardless of the count gate (ORed on top). Caller-validated against
+    /// the metric registry.
+    pub must_fail: Vec<String>,
+    /// Render every compared metric row (stable + noisy included) on the
+    /// `--noise-adjust` table instead of only the meaningful ones.
+    /// Display-only — never affects the gate.
+    pub show_all: bool,
+}
+
+/// Decide whether a perf-delta run FAILS, given the registry names of the
+/// confident regressions it found. Fails iff the count meets
+/// [`GateOptions::fail_threshold`] (default 5; `Some(0)` disables the count
+/// gate), OR any regressing metric is in [`GateOptions::must_fail`] (ORed
+/// on top). The caller passes the CLASSIFIED regressions, so display-hidden
+/// (suppressed) rows still feed the gate.
+pub(crate) fn gate_fails(regressing_metrics: &[&str], gate: &GateOptions) -> bool {
+    let n = gate.fail_threshold.unwrap_or(5);
+    let fail_on_count = n >= 1 && regressing_metrics.len() >= n;
+    let fail_on_must = !gate.must_fail.is_empty()
+        && regressing_metrics
+            .iter()
+            .any(|m| gate.must_fail.iter().any(|w| w.as_str() == *m));
+    fail_on_count || fail_on_must
+}
+
+#[cfg(test)]
+mod gate_option_tests {
+    use super::*;
+
+    #[test]
+    fn default_gate_fails_only_at_five_regressions() {
+        // Default (None) threshold is 5: a handful of regressions is
+        // tolerated as run-to-run noise; the run fails once >= 5 regress.
+        let g = GateOptions::default();
+        assert!(!gate_fails(&[], &g), "0 regressions passes");
+        assert!(
+            !gate_fails(&["a", "b", "c", "d"], &g),
+            "4 < 5 passes under the default gate"
+        );
+        assert!(
+            gate_fails(&["a", "b", "c", "d", "e"], &g),
+            "5 >= 5 fails under the default gate"
+        );
+    }
+
+    #[test]
+    fn count_threshold_requires_n() {
+        let g = GateOptions {
+            fail_threshold: Some(3),
+            ..Default::default()
+        };
+        assert!(!gate_fails(&["a", "b"], &g), "2 < 3 passes");
+        assert!(gate_fails(&["a", "b", "c"], &g), "3 >= 3 fails");
+    }
+
+    #[test]
+    fn zero_threshold_disables_count_gate() {
+        let g = GateOptions {
+            fail_threshold: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            !gate_fails(&["a", "b", "c"], &g),
+            "N=0 never fails on the count"
+        );
+    }
+
+    #[test]
+    fn must_fail_fails_regardless_of_count() {
+        let g = GateOptions {
+            fail_threshold: Some(0),
+            must_fail: vec!["worst_p99_wake_latency_us".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            gate_fails(&["worst_p99_wake_latency_us"], &g),
+            "a must-fail metric regressing fails even with the count gate off"
+        );
+        assert!(
+            !gate_fails(&["some_other_metric"], &g),
+            "a non-must-fail regression does not fail with the count gate off"
+        );
+    }
+
+    #[test]
+    fn must_fail_is_ored_above_the_count() {
+        let g = GateOptions {
+            fail_threshold: Some(10),
+            must_fail: vec!["avg_dsq_depth".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            gate_fails(&["avg_dsq_depth"], &g),
+            "must-fail fires even below the count threshold"
+        );
+    }
 }
 
 /// How a metric's noise-adjusted verdict classifies for the gate.
@@ -2347,19 +2472,20 @@ pub(crate) fn summarize_side_runs(rows: &[GauntletRow]) -> (usize, String) {
 /// whether the two sides are distinguishable given their run-to-run variability
 /// (see [`noise_findings`] for the row-level core + [`noise_verdict`] for the
 /// per-metric decision). Used by `perf-delta --noise-adjust N`, which produces N
-/// runs per side. A metric is a CONFIDENT REGRESSION (the non-zero exit basis)
-/// when it is SEPARATED (a two-sided Welch t-test rejects equal means at
+/// runs per side. A metric is a CONFIDENT REGRESSION (fed to the operator
+/// failure gate below) when it is SEPARATED (a two-sided Welch t-test rejects equal means at
 /// `NOISE_ALPHA`, OR the `[min, max]` bands are fully disjoint) AND MATERIAL (the
 /// mean delta clears both the registry `default_abs` and `default_rel`, the same
 /// dual-gate as the scalar path) in the worsening direction (per polarity). A
 /// side that realized fewer than 2 runs is flagged `NOISY` and never gates; a
 /// per-side relative spread over `spread_threshold_pct` is an ADVISORY
-/// `(noisy spread)` annotation that NEVER suppresses a verdict. Prints a table of
-/// EVERY compared metric — changed, noisy, informational, and stable (unchanged +
-/// clean) — with each side's `mean [min-max] spread%` and the verdict, so the
-/// operator sees the whole comparison, not just what moved. The footer carries
-/// the regression/under-sampled counts and, when every changed (non-stable)
-/// metric had a side with <2 usable runs, an explicit inconclusive note.
+/// `(noisy spread)` annotation that NEVER suppresses a verdict. By default prints
+/// only the MEANINGFUL rows (confident regression / improvement / informational),
+/// each with its side's `mean [min-max] spread%` and verdict; stable (unchanged +
+/// clean) and noisy (<2-run) rows are hidden unless `--all-metrics`, and a
+/// one-line summary prints when every row is suppressed. The footer carries the
+/// regression/under-sampled counts and, when every changed (non-stable) metric had
+/// a side with <2 usable runs, an explicit inconclusive note.
 ///
 /// When the scenarios carry phases, a per-phase spread block follows the
 /// aggregate table (via [`format_noise_phase_findings_lines`]): the same
@@ -2370,8 +2496,9 @@ pub(crate) fn summarize_side_runs(rows: &[GauntletRow]) -> (usize, String) {
 /// suppressed. Per-phase SPREAD findings are RENDER-ONLY — classified and
 /// colored but not gating — EXCEPT a
 /// per-phase regression the author explicitly declared a phase-scoped gate for,
-/// which DOES contribute to the exit alongside the aggregate confident
-/// regressions (the exit basis is `regressions + declared_phase_regressions`).
+/// which DOES contribute to the exit alongside the operator gate on the aggregate
+/// confident regressions ([`gate_fails`]: their count reaches `fail_threshold`
+/// [default 5], or a `must_fail` metric regressed).
 /// The footer appends per-phase counts only when per-phase data exists and no
 /// phase filter is active.
 ///
@@ -2386,6 +2513,7 @@ pub fn compare_partitions_noise(
     dir: Option<&std::path::Path>,
     spread_threshold_pct: f64,
     phase_opts: &PhaseDisplayOptions,
+    gate: &GateOptions,
 ) -> anyhow::Result<i32> {
     // Keep every per-run row INCLUDING duplicate pairing keys so the
     // run-to-run spread is observable: noise_findings groups the N runs
@@ -2453,7 +2581,7 @@ pub fn compare_partitions_noise(
         } else {
             print!(
                 "{}",
-                format_noise_findings_table(&report.findings, &label_a, &label_b)
+                format_noise_findings_table(&report.findings, &label_a, &label_b, gate.show_all)
             );
         }
     }
@@ -2493,8 +2621,8 @@ pub fn compare_partitions_noise(
     // The aggregate summary footer describes the (hidden) aggregate spread, so
     // suppress it under --phases-only — which renders ONLY the per-phase
     // block.
-    // The exit still gates on `regressions` + `declared_phase_regressions`
-    // (computed above) when the footer is hidden.
+    // The exit still gates on gate_fails(aggregate regressions) +
+    // `declared_phase_regressions` (computed above) when the footer is hidden.
     if !phase_opts.phases_only {
         let noisy = report.noisy();
         // Per-phase footer counts are shown ONLY when there IS per-phase data
@@ -2564,11 +2692,28 @@ pub fn compare_partitions_noise(
     // per-phase pass — a narrow-window phase flake must not flip CI red), but a
     // phase-scoped gate the author explicitly declared is an opt-in and DOES
     // gate (matches the `PerfDeltaAssertion::phase` doc).
-    Ok(if regressions + declared_phase_regressions > 0 {
+    // Operator gate: the count / must-fail gate applies to the aggregate
+    // confident regressions; an author-DECLARED phase gate always fails (its
+    // own opt-in, orthogonal to the operator's count gate).
+    Ok(noise_exit_code(&report, gate))
+}
+
+/// Exit code for the noise-adjusted compare: the operator gate ([`gate_fails`])
+/// over the aggregate confident regressions, OR any author-DECLARED
+/// phase-scoped regression (which always gates, independent of the operator's
+/// count gate). Extracted so the exit decision is unit-testable.
+pub(crate) fn noise_exit_code(report: &NoiseReport, gate: &GateOptions) -> i32 {
+    let regressing: Vec<&str> = report
+        .findings
+        .iter()
+        .filter(|f| f.kind == NoiseKind::Regression)
+        .map(|f| f.metric.name)
+        .collect();
+    if gate_fails(&regressing, gate) || report.declared_phase_regressions() > 0 {
         1
     } else {
         0
-    })
+    }
 }
 
 /// Compose a noise verdict cell's text: the base label plus any parenthesized,
@@ -2610,8 +2755,32 @@ pub(crate) fn format_noise_findings_table(
     findings: &[NoiseFinding],
     label_a: &str,
     label_b: &str,
+    show_all: bool,
 ) -> String {
     use comfy_table::{Cell, Color};
+    // Default view shows only MEANINGFUL rows (confident regression /
+    // improvement / informational). Stable (unchanged / immaterial) and
+    // Noisy (<2 usable runs) rows are hidden unless `show_all`; their COUNTS
+    // still print in the caller's footer, and the gate reads the full
+    // classified set, so this suppression is display-only.
+    let visible: Vec<&NoiseFinding> = findings
+        .iter()
+        .filter(|f| show_all || !matches!(f.kind, NoiseKind::Stable | NoiseKind::Noisy))
+        .collect();
+    if visible.is_empty() {
+        if findings.is_empty() {
+            return String::new();
+        }
+        let noisy = findings
+            .iter()
+            .filter(|f| f.kind == NoiseKind::Noisy)
+            .count();
+        return format!(
+            "perf-delta --noise-adjust: {} metric(s) compared, none meaningfully changed \
+             ({noisy} under-sampled); re-run with --all-metrics to see them\n",
+            findings.len(),
+        );
+    }
     let mut table = crate::cli::new_table();
     table.set_header(vec![
         "TEST / METRIC".to_string(),
@@ -2619,7 +2788,7 @@ pub(crate) fn format_noise_findings_table(
         format!("{label_b} (B: mean [min-max] spread%)"),
         "VERDICT".to_string(),
     ]);
-    for f in findings {
+    for f in visible {
         let (base, color) = match f.kind {
             NoiseKind::Regression => ("REGRESSION", Color::Red),
             NoiseKind::Improvement => ("improvement", Color::Green),

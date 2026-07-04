@@ -2036,6 +2036,13 @@ fn compare_partitions_with_average_default_produces_regression_on_aggregated_mea
         None,
         &ComparisonPolicy::default(),
         Some(alt_root.path()),
+        // Gate at 1 so the single detected regression surfaces as exit 1:
+        // this test verifies regression DETECTION on averaged means, not the
+        // default multi-regression gate (which tolerates a lone regression).
+        &crate::stats::GateOptions {
+            fail_threshold: Some(1),
+            ..Default::default()
+        },
     )
     .expect("compare_partitions must succeed against valid fixtures");
     assert_eq!(

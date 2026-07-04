@@ -690,6 +690,19 @@ pub(crate) struct PerfDeltaArgs<'a> {
     /// the compare's `PhaseDisplayOptions`. Render-only — does not
     /// change the regression verdict / exit code.
     pub phase_display: cli::PhaseDisplayOptions,
+    /// `--all-metrics` — show every compared metric row (stable + noisy
+    /// included). Default (false) shows only meaningful rows. Display-only:
+    /// never changes the failure gate.
+    pub all_metrics: bool,
+    /// `--fail-threshold <N>` — fail only when >= N metrics regress
+    /// (`None` = 5, tolerating a handful of noisy regressions; `1` restores
+    /// fail-on-any; `0` = never fail on the count, leaving `--must-fail` as
+    /// the only failing condition).
+    pub fail_threshold: Option<usize>,
+    /// `--must-fail <M1,M2,...>` — metric registry names that fail the run
+    /// if ANY regresses, regardless of the count gate (ORed on top). The
+    /// raw comma-separated string; validated + split in [`run`].
+    pub must_fail: Option<&'a str>,
     /// `--noise-adjust <N>` — run each side N times and decide significance from
     /// whether the two sides are SEPARATED (a Welch two-sample t-test, or fully
     /// disjoint `[min, max]` bands) AND the delta is MATERIAL (the registry
@@ -737,6 +750,14 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
     // ComparisonPolicy resolver.
     let policy = cli::ComparisonPolicy::from_cli_flags(args.threshold, args.policy)
         .context("resolve --threshold / --policy")?;
+
+    // Operator failure-gate + render options. --must-fail is validated UP
+    // FRONT (before running any tests) — see parse_must_fail.
+    let gate = cli::GateOptions {
+        fail_threshold: args.fail_threshold,
+        must_fail: parse_must_fail(args.must_fail, args.noise_adjust.is_some())?,
+        show_all: args.all_metrics,
+    };
 
     // Fail loud rather than SILENTLY DROP the build-shaping flags: the
     // cargo/nextest passthrough AND `--profile` / `--nextest-profile` only
@@ -850,6 +871,7 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
             None,
             threshold,
             &args.phase_display,
+            &gate,
         );
     }
 
@@ -903,7 +925,73 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
         ..Default::default()
     };
     let (filter_a, filter_b) = build.build();
-    cli::compare_partitions(&filter_a, &filter_b, None, &policy, None)
+    cli::compare_partitions(&filter_a, &filter_b, None, &policy, None, &gate)
+}
+
+/// Parse + validate the `--must-fail` CSV: split on commas, trim, skip
+/// empties, and reject every name that cannot fire the gate under the ACTIVE
+/// comparison mode, so a name that would silently never fail errors before any
+/// tests run. Rejected:
+/// - unknown metric names;
+/// - render-suppressed rate COMPONENTS (never surface as any finding);
+/// - names whose value never reaches the aggregate compare in this mode
+///   (`MetricDef::gates_aggregate` is false) — per-phase-only metrics (rejected
+///   in BOTH modes) and whole-run distribution metrics (rejected on the scalar
+///   path only; they ARE read per-run under `--noise-adjust`);
+/// - on the default (scalar) comparison only, informational metrics (registry
+///   polarity has no regression direction, so `compare_partitions` classifies
+///   them `Informational`, never `Regression`) — ACCEPTED under `--noise-adjust`
+///   (`noise_adjust == true`) because a per-test direction override can then
+///   classify one as a regression (see the noise classifier
+///   `compare_partitions_noise`).
+///
+/// `metric_def` is `Some` past the unknown-name gate, and a
+/// `classify_direction()` of `None` is exactly `Polarity::Informational`.
+fn parse_must_fail(csv: Option<&str>, noise_adjust: bool) -> Result<Vec<String>> {
+    let Some(csv) = csv else {
+        return Ok(Vec::new());
+    };
+    let mut names = Vec::new();
+    for raw in csv.split(',') {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let Some(def) = cli::metric_def(name) else {
+            anyhow::bail!(
+                "--must-fail: unknown metric {name:?} \
+                 (see `cargo ktstr stats list-metrics`)"
+            );
+        };
+        if cli::is_render_suppressed_component(name) {
+            anyhow::bail!(
+                "--must-fail: {name:?} is an internal rate COMPONENT that never \
+                 surfaces as a regression — gate on its user-facing rate metric instead"
+            );
+        }
+        if !def.gates_aggregate(noise_adjust) {
+            // The value never lands on a compared row in this mode, so the gate
+            // could never fire. Tailor the hint: PerRunDistribution IS gateable
+            // under --noise-adjust; PerPhase never is (per-phase-only).
+            let hint = if def.gates_aggregate(true) {
+                " — it only reports per-run; add --noise-adjust to gate on it"
+            } else {
+                " — it is a per-phase-only metric that never produces an aggregate \
+                 regression; assert it per-phase in the test's Verdict DSL instead"
+            };
+            anyhow::bail!("--must-fail: {name:?} never reaches the aggregate comparison{hint}");
+        }
+        if !noise_adjust && def.classify_direction().is_none() {
+            anyhow::bail!(
+                "--must-fail: {name:?} is an informational metric with no regression \
+                 direction — it can never fail the default comparison. Add \
+                 --noise-adjust (a per-test direction override can then make it gate), \
+                 or gate on a directional metric"
+            );
+        }
+        names.push(name.to_string());
+    }
+    Ok(names)
 }
 
 use ktstr::cli;
@@ -911,6 +999,72 @@ use ktstr::cli;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_must_fail_trims_skips_empties_and_rejects_bad_names() {
+        // Split + trim + skip empties (leading / trailing / double comma).
+        // worst_spread + avg_dsq_depth are both directional (LowerBetter), so
+        // they parse under either mode; use the scalar mode here.
+        let ok = parse_must_fail(Some(" worst_spread , ,avg_dsq_depth,"), false)
+            .expect("known directional metrics parse");
+        assert_eq!(
+            ok,
+            vec!["worst_spread".to_string(), "avg_dsq_depth".to_string()]
+        );
+        // None -> empty set (both modes).
+        assert!(parse_must_fail(None, false).unwrap().is_empty());
+        assert!(parse_must_fail(None, true).unwrap().is_empty());
+        // Unknown name -> Err.
+        assert!(parse_must_fail(Some("definitely_not_a_metric"), false).is_err());
+        // A render-suppressed rate COMPONENT -> Err in BOTH modes (it can never
+        // surface as any finding, so gating on it is always a silent no-op).
+        assert!(
+            parse_must_fail(Some("total_taobench_ops"), false).is_err(),
+            "a render-suppressed rate component must be rejected on the scalar path"
+        );
+        assert!(
+            parse_must_fail(Some("total_taobench_ops"), true).is_err(),
+            "a render-suppressed rate component must be rejected under --noise-adjust too"
+        );
+        // An informational metric (no regression direction) can never gate the
+        // default comparison -> Err on the scalar path, so a typo-safe operator
+        // learns up front instead of shipping a silently-inert gate.
+        assert!(
+            parse_must_fail(Some("total_ttwu_count"), false).is_err(),
+            "an informational metric must be rejected on the scalar path"
+        );
+        // ...but under --noise-adjust a per-test direction override can classify
+        // it as a regression, so it is accepted then.
+        assert_eq!(
+            parse_must_fail(Some("total_ttwu_count"), true)
+                .expect("informational metric accepted under --noise-adjust"),
+            vec!["total_ttwu_count".to_string()],
+        );
+        // A PerPhase metric (per-phase-only, accessor None, no run-level
+        // producer) never lands on an aggregate row, so it can never fire the
+        // gate in EITHER mode -> Err both. (Directional (LowerBetter), so this
+        // is the gates_aggregate rejection, not the informational one.)
+        assert!(
+            parse_must_fail(Some("wakeup_p99_latency_us"), false).is_err(),
+            "a per-phase-only metric must be rejected on the scalar path"
+        );
+        assert!(
+            parse_must_fail(Some("wakeup_p99_latency_us"), true).is_err(),
+            "a per-phase-only metric must be rejected under --noise-adjust too"
+        );
+        // A PerRunDistribution metric is gated out of the cross-run fold, so it
+        // is inert on the scalar compare (Err) but IS read per-run by the noise
+        // compare (Ok).
+        assert!(
+            parse_must_fail(Some("wakeup_p99_latency_us_whole"), false).is_err(),
+            "a whole-run distribution metric cannot gate the scalar compare"
+        );
+        assert_eq!(
+            parse_must_fail(Some("wakeup_p99_latency_us_whole"), true)
+                .expect("whole-run distribution metric gates under --noise-adjust"),
+            vec!["wakeup_p99_latency_us_whole".to_string()],
+        );
+    }
 
     #[test]
     fn explicit_base_wins_and_skips_merge_base() {

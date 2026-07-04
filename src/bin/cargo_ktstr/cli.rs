@@ -472,6 +472,44 @@ pub(crate) enum KtstrCommand {
             requires = "noise_adjust"
         )]
         phase_threshold: Option<f64>,
+        /// Show EVERY compared metric row, including stable (unchanged /
+        /// immaterial) and noisy (fewer than 2 usable runs) ones. Default:
+        /// only meaningful rows (confident regression / improvement /
+        /// informational) print; when every row is suppressed a one-line
+        /// summary prints instead of an empty table. Applies to the
+        /// `--noise-adjust` aggregate metrics table; the per-phase table is
+        /// separately spread-gated by `--phase-threshold` (it shows every
+        /// verdict kind). The fixed-threshold table already lists every
+        /// changed row plus an unchanged count. Display-only — never affects
+        /// the failure gate.
+        #[arg(long, help_heading = "Metric rendering")]
+        all_metrics: bool,
+        /// Fail the run only when AT LEAST N metrics regress (default 5, so
+        /// a handful of one-off noisy regressions does not flip CI red; pass
+        /// `--fail-threshold 1` for fail-on-any). N = 0 never fails on the
+        /// count — only `--must-fail` can then fail. Counts confident
+        /// regressions; suppressed rows still count.
+        #[arg(long, value_name = "N", help_heading = "Failure gating")]
+        fail_threshold: Option<usize>,
+        /// Comma-separated metric registry names (from `cargo ktstr stats
+        /// list-metrics`) that fail the run if ANY of them regresses,
+        /// regardless of `--fail-threshold` (ORed on top of the count
+        /// gate). Names that could never fire the gate are rejected up front
+        /// so one cannot silently disarm it: unknown names; internal rate
+        /// components; per-phase-only metrics (their value never reaches the
+        /// aggregate comparison, in either mode — assert them per-phase in
+        /// the test instead); and — WITHOUT `--noise-adjust` — whole-run
+        /// distribution metrics (read only per-run, so add `--noise-adjust`
+        /// to gate on one) and informational metrics (registry polarity has
+        /// no regression direction, so they never classify as a regression
+        /// on the default comparison). An informational metric IS accepted
+        /// under `--noise-adjust`, where a per-test direction override can
+        /// classify it as a regression. Under `--noise-adjust`, a listed
+        /// metric that classifies NOISY (a side had fewer than 2 usable runs)
+        /// is reported but does NOT fail — raise `--noise-adjust N` for a
+        /// trustworthy verdict.
+        #[arg(long, value_name = "M1,M2,...", help_heading = "Failure gating")]
+        must_fail: Option<String>,
         /// Cargo BUILD profile for the scheduler-under-test on BOTH
         /// sides' `cargo ktstr test` (see `cargo ktstr test --profile`).
         /// Omitted, the scheduler builds `release`. Only meaningful on the

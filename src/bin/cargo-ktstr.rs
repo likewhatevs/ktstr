@@ -269,6 +269,9 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
             phase_threshold,
             profile,
             nextest_profile,
+            all_metrics,
+            fail_threshold,
+            must_fail,
             args: passthrough,
         } => {
             let args = perf_delta::PerfDeltaArgs {
@@ -286,6 +289,9 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
                 noise_spread_threshold,
                 profile: profile.as_deref(),
                 nextest_profile: nextest_profile.as_deref(),
+                all_metrics,
+                fail_threshold,
+                must_fail: must_fail.as_deref(),
                 phase_display: ktstr::cli::PhaseDisplayOptions {
                     no_phases,
                     phases_only,

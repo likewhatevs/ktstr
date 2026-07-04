@@ -92,4 +92,7 @@ pub use crate::stats::{Dimension, derive_slicing_dims};
 /// policy is the only item in `stats` that a CLI or external
 /// consumer constructs directly; every other item is internal
 /// plumbing reached via `cli::compare_partitions`.
-pub use crate::stats::{AveragedGroup, ComparisonPolicy, PhaseDisplayOptions, RowFilter};
+pub use crate::stats::{
+    AveragedGroup, ComparisonPolicy, GateOptions, PhaseDisplayOptions, RowFilter,
+    is_render_suppressed_component, metric_def,
+};

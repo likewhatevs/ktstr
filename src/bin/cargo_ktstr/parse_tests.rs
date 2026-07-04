@@ -117,9 +117,16 @@ fn parse_perf_delta_flags_and_defaults() {
             phase_threshold,
             profile,
             nextest_profile,
+            all_metrics,
+            fail_threshold,
+            must_fail,
             args,
         } => {
             assert!(args.is_empty(), "no cargo passthrough on this invocation");
+            assert!(
+                !all_metrics && fail_threshold.is_none() && must_fail.is_none(),
+                "gating / render flags default off when unset",
+            );
             assert_eq!(base.as_deref(), Some("abc123"));
             assert_eq!(base_ref.as_deref(), Some("release"));
             assert_eq!(filter.as_deref(), Some("perf::"));
@@ -172,11 +179,18 @@ fn parse_perf_delta_flags_and_defaults() {
             phase_threshold,
             profile,
             nextest_profile,
+            all_metrics,
+            fail_threshold,
+            must_fail,
             args,
         } => {
             assert!(
                 args.is_empty(),
                 "bare perf-delta parses no cargo passthrough"
+            );
+            assert!(
+                !all_metrics && fail_threshold.is_none() && must_fail.is_none(),
+                "bare perf-delta defaults gating / render flags off",
             );
             assert!(base.is_none() && base_ref.is_none() && filter.is_none());
             assert!(!relevant, "bare perf-delta defaults --relevant off");
@@ -215,6 +229,11 @@ fn parse_perf_delta_flags_and_defaults() {
         "--steps-only",
         "--phase-threshold",
         "5",
+        "--all-metrics",
+        "--fail-threshold",
+        "3",
+        "--must-fail",
+        "worst_spread",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
     match k.command {
@@ -224,6 +243,9 @@ fn parse_perf_delta_flags_and_defaults() {
             phases_only,
             steps_only,
             phase_threshold,
+            all_metrics,
+            fail_threshold,
+            must_fail,
             ..
         } => {
             assert_eq!(noise_adjust, Some(3));
@@ -237,6 +259,13 @@ fn parse_perf_delta_flags_and_defaults() {
                 phase_threshold,
                 Some(5.0),
                 "--phase-threshold round-trips under --noise-adjust",
+            );
+            assert!(all_metrics, "--all-metrics round-trips");
+            assert_eq!(fail_threshold, Some(3), "--fail-threshold N round-trips");
+            assert_eq!(
+                must_fail.as_deref(),
+                Some("worst_spread"),
+                "--must-fail round-trips the raw csv (validated in run())",
             );
         }
         _ => panic!("expected PerfDelta"),

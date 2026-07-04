@@ -1635,6 +1635,7 @@ fn compare_partitions_threads_dir_through_to_pool_collection() {
         None,
         &ComparisonPolicy::default(),
         Some(alt_root.path()),
+        &crate::stats::GateOptions::default(),
     )
     .expect("compare_partitions must pool sidecars under --dir override");
     assert_eq!(
@@ -1698,6 +1699,7 @@ fn compare_partitions_noise_pools_duplicate_pairing_keys() {
         Some(alt_root.path()),
         1.0,
         &PhaseDisplayOptions::default(),
+        &crate::stats::GateOptions::default(),
     )
     .expect("noise compare must pool N duplicate-key runs per side, not reject them");
     assert_eq!(
@@ -2982,7 +2984,7 @@ fn format_noise_findings_table_renders_rows_and_verdicts() {
         1.0,
         true,
     );
-    let out = format_noise_findings_table(&rep.findings, "base", "head");
+    let out = format_noise_findings_table(&rep.findings, "base", "head", true);
     assert!(
         out.contains("TEST / METRIC") && out.contains("VERDICT"),
         "header present: {out}"
@@ -3013,7 +3015,7 @@ fn format_noise_findings_table_renders_noisy_improvement_and_advisory_spread() {
         5.0,
         true,
     );
-    let out = format_noise_findings_table(&rep.findings, "base", "head");
+    let out = format_noise_findings_table(&rep.findings, "base", "head", true);
     assert!(
         out.contains("NOISY (<2 runs)"),
         "insufficient-samples verdict rendered: {out}"
@@ -3027,7 +3029,7 @@ fn format_noise_findings_table_renders_noisy_improvement_and_advisory_spread() {
         5.0,
         true,
     );
-    let out = format_noise_findings_table(&rep.findings, "base", "head");
+    let out = format_noise_findings_table(&rep.findings, "base", "head", true);
     assert!(
         out.contains("improvement"),
         "improvement verdict rendered: {out}"
@@ -3049,10 +3051,70 @@ fn format_noise_findings_table_renders_noisy_improvement_and_advisory_spread() {
         5.0,
         true,
     );
-    let out = format_noise_findings_table(&rep.findings, "base", "head");
+    let out = format_noise_findings_table(&rep.findings, "base", "head", true);
     assert!(
         out.contains("REGRESSION (noisy spread)"),
         "high_spread annotates the reported regression, never suppresses it: {out}"
+    );
+}
+
+#[test]
+fn format_noise_findings_table_default_hides_stable_and_noisy_rows() {
+    // Default operator view (show_all=false): only MEANINGFUL rows (regression /
+    // improvement / informational) print; Stable and Noisy rows are hidden. This
+    // pins the core default-suppress display invariant — every OTHER
+    // format_noise_findings_table test passes show_all=true, so without this a
+    // regression that leaked Stable/Noisy rows into the default view, or emitted
+    // an empty table instead of the one-line summary, would ship silently.
+
+    // worst_spread 10->15 (LowerBetter) -> REGRESSION; total_iterations unchanged
+    // (2000 both) -> Stable. Under show_all=false the regression shows, the
+    // stable row is hidden.
+    let rep = noise_findings(
+        &noise_side("mix", 10.0, 2000),
+        &noise_side("mix", 15.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        1.0,
+        true,
+    );
+    // Guard against a vacuous pass: the fixture MUST carry a Stable finding to hide.
+    assert!(
+        rep.findings.iter().any(|f| f.kind == NoiseKind::Stable),
+        "fixture must contain a Stable finding to hide: {:?}",
+        rep.findings.iter().map(|f| f.kind).collect::<Vec<_>>()
+    );
+    let out = format_noise_findings_table(&rep.findings, "base", "head", false);
+    assert!(
+        out.contains("worst_spread") && out.contains("REGRESSION"),
+        "the meaningful regression row still shows under default suppression: {out}"
+    );
+    assert!(
+        !out.contains("stable"),
+        "Stable rows are hidden without --all-metrics: {out}"
+    );
+
+    // A report whose findings are ALL Stable/Noisy collapses to the one-line
+    // summary (never an empty table) under show_all=false. Side A has one run
+    // (insufficient) -> every metric classifies Noisy.
+    let a = vec![cmp_row("nz", "tiny-1llc", true, 10.0, 2000)];
+    let rep = noise_findings(&a, &noise_side("nz", 30.0, 2000), LEGACY_PAIRING_DIMS, 5.0, true);
+    assert!(
+        rep.findings
+            .iter()
+            .all(|f| matches!(f.kind, NoiseKind::Stable | NoiseKind::Noisy)),
+        "fixture must contain only suppressed (Stable/Noisy) findings: {:?}",
+        rep.findings.iter().map(|f| f.kind).collect::<Vec<_>>()
+    );
+    let out = format_noise_findings_table(&rep.findings, "base", "head", false);
+    assert!(
+        out.contains("none meaningfully changed") && out.contains("--all-metrics"),
+        "all-suppressed collapses to the one-line summary: {out}"
+    );
+    // --all-metrics (show_all=true) restores the full table (the NOISY row returns).
+    let full = format_noise_findings_table(&rep.findings, "base", "head", true);
+    assert!(
+        full.contains("NOISY (<2 runs)"),
+        "--all-metrics restores the suppressed rows: {full}"
     );
 }
 
@@ -3246,7 +3308,7 @@ fn format_noise_findings_table_marks_declared_gate() {
         perf_gate("worst_spread", Some(5.0), Some(0.5), None, None),
     );
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
-    let out = format_noise_findings_table(&rep.findings, "base", "head");
+    let out = format_noise_findings_table(&rep.findings, "base", "head", true);
     assert!(
         out.contains("REGRESSION (declared gate)"),
         "declared-gate regression is annotated: {out}",
@@ -3332,6 +3394,25 @@ fn noise_findings_declared_phase_gate_gates_the_exit() {
     assert!(
         rep.assertion_coverage.is_empty(),
         "the phase gate matched Step[0]",
+    );
+    // The declared phase gate fires the EXIT (1) even though the aggregate
+    // count is 0 and even with the operator count gate disabled — it is an
+    // author opt-in orthogonal to --fail-threshold.
+    assert_eq!(
+        noise_exit_code(&rep, &crate::stats::GateOptions::default()),
+        1,
+        "a declared phase regression fails the run under the default gate",
+    );
+    assert_eq!(
+        noise_exit_code(
+            &rep,
+            &crate::stats::GateOptions {
+                fail_threshold: Some(0),
+                ..Default::default()
+            },
+        ),
+        1,
+        "a declared phase regression fails even with the count gate disabled",
     );
 }
 

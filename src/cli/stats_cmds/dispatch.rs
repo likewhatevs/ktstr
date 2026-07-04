@@ -79,8 +79,9 @@ pub fn compare_partitions(
     filter: Option<&str>,
     policy: &ComparisonPolicy,
     dir: Option<&Path>,
+    gate: &crate::stats::GateOptions,
 ) -> Result<i32> {
-    crate::stats::compare_partitions(filter_a, filter_b, filter, policy, dir)
+    crate::stats::compare_partitions(filter_a, filter_b, filter, policy, dir, gate)
 }
 
 /// Noise-adjusted variant of [`compare_partitions`]: keeps every per-run row and
@@ -97,6 +98,7 @@ pub fn compare_partitions_noise(
     dir: Option<&Path>,
     spread_threshold_pct: f64,
     phase_opts: &crate::stats::PhaseDisplayOptions,
+    gate: &crate::stats::GateOptions,
 ) -> Result<i32> {
     crate::stats::compare_partitions_noise(
         filter_a,
@@ -104,6 +106,7 @@ pub fn compare_partitions_noise(
         dir,
         spread_threshold_pct,
         phase_opts,
+        gate,
     )
 }
 

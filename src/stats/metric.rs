@@ -1376,6 +1376,33 @@ impl MetricDef {
     pub const fn classify_direction(&self) -> Option<bool> {
         self.polarity.classify_direction()
     }
+
+    /// Whether this metric's value can reach the AGGREGATE findings the
+    /// perf-delta failure gate reads — the cross-run scalar compare
+    /// ([`compare_partitions`], `noise_adjust == false`) or the per-run noise
+    /// compare ([`compare_partitions_noise`], `noise_adjust == true`). `false`
+    /// for names whose value never lands on a compared row in that mode, so a
+    /// `--must-fail` gate on one could never fire (a silent no-op):
+    /// - [`MetricKind::PerPhase`]: `accessor` is `None`, it has no run-level
+    ///   producer, and it is gated out of the cross-run ext fold — its value
+    ///   lives only in per-phase carriers, never on a `GauntletRow`, so it
+    ///   reaches NEITHER compare. Always `false`.
+    /// - [`MetricKind::PerRunDistribution`]: `accessor` is `None` and it is
+    ///   gated out of the cross-run ext fold, so it is absent on the scalar
+    ///   compare's cross-run-folded rows — but each run carries its own
+    ///   `*_whole` scalar that [`compare_partitions_noise`] reads, so it CAN
+    ///   gate under `--noise-adjust`. `noise_adjust`-only.
+    ///
+    /// Every other kind reaches both compares; whether it then produces a
+    /// *regression* (vs an informational finding) is a separate
+    /// direction question — see [`classify_direction`](Self::classify_direction).
+    pub const fn gates_aggregate(&self, noise_adjust: bool) -> bool {
+        match self.kind {
+            MetricKind::PerPhase => false,
+            MetricKind::PerRunDistribution => noise_adjust,
+            _ => true,
+        }
+    }
 }
 
 /// Unified metric registry covering all built-in and extensible metrics.
@@ -4118,8 +4145,8 @@ const RENDER_SUPPRESSED_COMPONENTS: &[&str] = &[
 ];
 
 /// True when `name` is a Rate component suppressed from compare output (see
-/// [`RENDER_SUPPRESSED_COMPONENTS`]).
-pub(crate) fn is_render_suppressed_component(name: &str) -> bool {
+/// the private `RENDER_SUPPRESSED_COMPONENTS` list).
+pub fn is_render_suppressed_component(name: &str) -> bool {
     RENDER_SUPPRESSED_COMPONENTS.contains(&name)
 }
 
