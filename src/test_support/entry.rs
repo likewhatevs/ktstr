@@ -2795,6 +2795,18 @@ pub struct SchedulerListEntry {
     pub test_count: usize,
 }
 
+/// A single `#[ktstr_test]` paired with its declared scheduler's name. Emitted
+/// (as a JSON array) by the `--ktstr-list-scheduler-tests` probe so `--relevant`
+/// can map each test to its scheduler and select the tests whose scheduler a
+/// diff affects.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SchedulerTestJson {
+    /// The `#[ktstr_test]` function name, as registered.
+    pub test: String,
+    /// The declared scheduler's name (the `SchedulerJson::name` field).
+    pub scheduler: String,
+}
+
 /// JSON-friendly form of [`SchedulerSpec`] tagged so the verifier
 /// dispatch can exhaustively `match` on the variant. `Discover` and
 /// `Path` both carry a string identifier; `Eevdf` and
@@ -2989,6 +3001,30 @@ fn __ktstr_list_schedulers() {
         })
         .collect();
     let json = ::serde_json::to_string(&entries).expect("serialize schedulers");
+    println!("{json}");
+    std::process::exit(0);
+}
+}
+
+::ctor::declarative::ctor! {
+/// Ctor that intercepts `--ktstr-list-scheduler-tests` before `main()` runs.
+/// Walks [`KTSTR_TESTS`], emits a [`SchedulerTestJson`] per test (its name and
+/// its declared scheduler's name) as a single JSON array on stdout, and exits
+/// 0. Distinct from `--ktstr-list-schedulers`: this is test-NAME level, spawned
+/// only for a `--relevant` run to map each test to its scheduler.
+#[ctor(unsafe)]
+fn __ktstr_list_scheduler_tests() {
+    if !std::env::args().any(|a| a == "--ktstr-list-scheduler-tests") {
+        return;
+    }
+    let entries: Vec<SchedulerTestJson> = KTSTR_TESTS
+        .iter()
+        .map(|t| SchedulerTestJson {
+            test: t.name.to_string(),
+            scheduler: t.scheduler.name.to_string(),
+        })
+        .collect();
+    let json = ::serde_json::to_string(&entries).expect("serialize scheduler tests");
     println!("{json}");
     std::process::exit(0);
 }
@@ -6608,5 +6644,25 @@ mod tests {
         let back: SchedulerListEntry =
             serde_json::from_str(&text).expect("deserialize SchedulerListEntry");
         assert_eq!(back, entry, "SchedulerListEntry must round-trip unchanged");
+    }
+
+    /// [`SchedulerTestJson`] — the `--ktstr-list-scheduler-tests` wire element
+    /// (test name + its scheduler's name) — survives a serde round-trip
+    /// field-for-field, the exact shape `cargo ktstr --relevant` deserializes to
+    /// map each test to its scheduler.
+    #[test]
+    fn scheduler_test_json_roundtrips_through_serde() {
+        let entry = SchedulerTestJson {
+            test: "boot_smoke".to_string(),
+            scheduler: "scx_rt".to_string(),
+        };
+        let text = serde_json::to_string(&entry).expect("serialize SchedulerTestJson");
+        assert!(
+            text.contains("\"test\":\"boot_smoke\"") && text.contains("\"scheduler\":\"scx_rt\""),
+            "both fields must serialize, got: {text}"
+        );
+        let back: SchedulerTestJson =
+            serde_json::from_str(&text).expect("deserialize SchedulerTestJson");
+        assert_eq!(back, entry, "SchedulerTestJson must round-trip unchanged");
     }
 }

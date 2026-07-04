@@ -683,7 +683,7 @@ pub(crate) fn select_failed_names<'a>(
 /// before reaching this fn — callers emit
 /// `EMPTY_POOL_FILTER` instead so the downstream nextest
 /// invocation has a parseable input.
-fn build_nextest_filter(names: &BTreeSet<&str>) -> String {
+pub(crate) fn build_nextest_filter(names: &BTreeSet<&str>) -> String {
     let parts: Vec<String> = names
         .iter()
         .map(|n| format!("test(/^(.*::)?{}$/)", regex_escape(n)))

@@ -33,6 +33,13 @@
 //! path attributed to neither a scheduler `.d` nor a workspace crate. A
 //! per-scheduler build/read failure marks that scheduler affected. Only a
 //! strictly docs-only change yields the empty set.
+//!
+//! ## `--relevant`
+//!
+//! The same engine powers [`relevant_test_filter`], which additionally folds
+//! the working tree into the changed set and maps the outcome onto a nextest
+//! filter over test NAMES (rather than a package matrix) so `cargo ktstr test
+//! --relevant` runs only the tests a local change touches.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -44,9 +51,10 @@ mod dep_info;
 mod diff;
 
 /// A declared scheduler discovered from the target repo's test binaries.
-/// Keyed by scheduler name during enumeration; only the package + test count
-/// are needed downstream, so the name itself is not retained.
 struct SchedulerInfo {
+    /// The scheduler's declared name -- the key `--relevant` maps a test's
+    /// `scheduler` field onto, to find its package.
+    name: String,
     /// The cargo package to build; `Some` only for `Discover` schedulers
     /// (`Path`/`Eevdf`/`KernelBuiltin` have no target-repo package).
     package: Option<String>,
@@ -74,7 +82,12 @@ enum AffectedOutcome {
 /// change-scoped -- CI must run their tests in a SEPARATE UNCONDITIONAL leg.
 pub(crate) fn run(base: Option<&str>, base_ref: Option<&str>, default_branch: &str) -> Result<()> {
     let schedulers = enumerate_schedulers().context("enumerate declared schedulers")?;
-    let names = compute(base, base_ref, default_branch, &schedulers)?;
+    let (outcome, testable) = compute_outcome(base, base_ref, default_branch, false, &schedulers)?;
+    let names = match outcome {
+        AffectedOutcome::RunAll => testable,
+        AffectedOutcome::Empty => Vec::new(),
+        AffectedOutcome::Subset(pkgs) => pkgs,
+    };
     println!(
         "{}",
         serde_json::to_string(&names).context("serialize affected JSON")?
@@ -84,7 +97,7 @@ pub(crate) fn run(base: Option<&str>, base_ref: Option<&str>, default_branch: &s
 
 /// Every Discover-package scheduler carrying >=1 test, sorted+deduped. The
 /// pre-workspace-graph fallback set (used only if `cargo metadata` fails);
-/// once the graph is built, [`compute`] narrows this to workspace members.
+/// once the graph is built, [`compute_outcome`] narrows this to workspace members.
 fn package_schedulers(schedulers: &[SchedulerInfo]) -> Vec<String> {
     let mut v: Vec<String> = schedulers
         .iter()
@@ -125,9 +138,10 @@ fn enumerate_schedulers() -> Result<Vec<SchedulerInfo>> {
             _ => None,
         };
         by_name
-            .entry(name)
+            .entry(name.clone())
             .and_modify(|si| si.test_count += entry.test_count)
             .or_insert(SchedulerInfo {
+                name,
                 package,
                 test_count: entry.test_count,
             });
@@ -135,21 +149,53 @@ fn enumerate_schedulers() -> Result<Vec<SchedulerInfo>> {
     Ok(by_name.into_values().collect())
 }
 
-/// The core fallback + attribution engine. Returns the flat list of affected
-/// scheduler packages: empty for a strictly docs-only change (or base == HEAD),
-/// the full testable set for RunAll, otherwise the attributed subset.
-fn compute(
+/// Enumerate declared tests with their scheduler by probing the target's built
+/// test binaries with `--ktstr-list-scheduler-tests`. Used by
+/// [`relevant_test_filter`] to map each test onto its scheduler's package.
+/// Deduplicates by test name (a test is registered in exactly one binary; the
+/// probe visits each binary, so re-seen entries are idempotent).
+fn enumerate_scheduler_tests() -> Result<Vec<ktstr::test_support::SchedulerTestJson>> {
+    let per_binary: Vec<Vec<ktstr::test_support::SchedulerTestJson>> = crate::misc::probe_collect(
+        None,
+        false,
+        |bin| {
+            let mut c = Command::new(bin);
+            c.arg("--ktstr-list-scheduler-tests");
+            c
+        },
+        |_bin, out| {
+            serde_json::from_slice::<Vec<ktstr::test_support::SchedulerTestJson>>(&out.stdout)
+                .map_err(|e| format!("parse --ktstr-list-scheduler-tests output: {e}"))
+        },
+    )
+    .map_err(|e| anyhow!("probe test binaries for declared tests: {e:?}"))?;
+
+    let mut by_name: BTreeMap<String, ktstr::test_support::SchedulerTestJson> = BTreeMap::new();
+    for entry in per_binary.into_iter().flatten() {
+        by_name.entry(entry.test.clone()).or_insert(entry);
+    }
+    Ok(by_name.into_values().collect())
+}
+
+/// The core fallback + attribution engine. Resolves the changed-path set
+/// (`base..HEAD`, plus the working tree when `include_worktree`), classifies
+/// it, and returns the [`AffectedOutcome`] alongside the ws-filtered testable
+/// scheduler-package universe (the set `RunAll` expands to). Separating the
+/// outcome from the flattening lets [`run`] emit package names while
+/// [`relevant_test_filter`] maps the SAME outcome onto test names.
+fn compute_outcome(
     base: Option<&str>,
     base_ref: Option<&str>,
     default_branch: &str,
+    include_worktree: bool,
     schedulers: &[SchedulerInfo],
-) -> Result<Vec<String>> {
+) -> Result<(AffectedOutcome, Vec<String>)> {
     // Build the workspace graph FIRST so the RunAll set and the Subset set draw
     // from the SAME ws-filtered testable universe. A `cargo metadata` failure
     // is the one case that falls back to the unfiltered enumeration set.
     let meta = match cargo_metadata::MetadataCommand::new().exec() {
         Ok(m) => m,
-        Err(_) => return Ok(package_schedulers(schedulers)),
+        Err(_) => return Ok((AffectedOutcome::RunAll, package_schedulers(schedulers))),
     };
     let ws_root = PathBuf::from(meta.workspace_root.as_str());
     let repo_root = std::fs::canonicalize(&ws_root).unwrap_or(ws_root);
@@ -178,7 +224,6 @@ fn compute(
     }
     testable_pkgs.sort();
     testable_pkgs.dedup();
-    let run_all = || testable_pkgs.clone();
 
     // --- Base resolution + diff; any failure -> RunAll (over-run beats a CI
     // error or a silently-empty gate). The gix workdir MUST equal the cargo
@@ -187,14 +232,14 @@ fn compute(
     let cwd = std::env::current_dir().context("resolve current dir")?;
     let repo = match gix::discover(&cwd) {
         Ok(r) => r,
-        Err(_) => return Ok(run_all()),
+        Err(_) => return Ok((AffectedOutcome::RunAll, testable_pkgs)),
     };
     let workdir_matches_root = repo
         .workdir()
         .and_then(|w| std::fs::canonicalize(w).ok())
         .is_some_and(|w| w == repo_root);
     if !workdir_matches_root {
-        return Ok(run_all());
+        return Ok((AffectedOutcome::RunAll, testable_pkgs));
     }
     let sel = crate::perf_delta::select_base(
         base,
@@ -204,26 +249,36 @@ fn compute(
     );
     let base_oid = match crate::perf_delta::resolve_baseline(&repo, &sel) {
         Ok(o) => o,
-        Err(_) => return Ok(run_all()),
+        Err(_) => return Ok((AffectedOutcome::RunAll, testable_pkgs)),
     };
     let head_oid = match repo.head_id() {
         Ok(h) => h.detach(),
-        Err(_) => return Ok(run_all()),
+        Err(_) => return Ok((AffectedOutcome::RunAll, testable_pkgs)),
     };
-    let changed = match diff::changed_paths_committed(&repo, base_oid, head_oid) {
+    let mut changed = match diff::changed_paths_committed(&repo, base_oid, head_oid) {
         Ok(c) => c,
-        Err(_) => return Ok(run_all()),
+        Err(_) => return Ok((AffectedOutcome::RunAll, testable_pkgs)),
     };
+    // --relevant additionally folds in uncommitted + untracked working-tree
+    // edits, so the local dev loop scopes tests to changes not yet committed.
+    // A clean tree contributes nothing (the union degrades to base..HEAD).
+    if include_worktree {
+        match diff::changed_paths_worktree(&repo) {
+            Ok(w) => changed.extend(w),
+            Err(_) => return Ok((AffectedOutcome::RunAll, testable_pkgs)),
+        }
+    }
 
     // --- Cheap whole-set verdicts. ---
     if changed.is_empty() {
-        return Ok(Vec::new()); // base == HEAD
+        // base == HEAD with a clean (or worktree-excluded) tree: nothing changed.
+        return Ok((AffectedOutcome::Empty, testable_pkgs));
     }
     if changed.iter().all(|p| is_docs_only(p)) {
-        return Ok(Vec::new());
+        return Ok((AffectedOutcome::Empty, testable_pkgs));
     }
     if changed.iter().any(|p| is_infra_path(p)) {
-        return Ok(run_all());
+        return Ok((AffectedOutcome::RunAll, testable_pkgs));
     }
 
     // --- Layer 1 (.d): built only when a native source or a crate-orphan path
@@ -240,17 +295,97 @@ fn compute(
         }
     }
 
-    Ok(match attribute(&changed, &testable_pkgs, &input_sets, &ws) {
-        AffectedOutcome::RunAll => run_all(),
-        AffectedOutcome::Empty => Vec::new(),
-        AffectedOutcome::Subset(pkgs) => pkgs,
-    })
+    let outcome = attribute(&changed, &testable_pkgs, &input_sets, &ws);
+    Ok((outcome, testable_pkgs))
+}
+
+/// A nextest filter-expression narrowing a run to the tests affected by the
+/// changes between `base` and the working tree (committed `base..HEAD` UNIONed
+/// with uncommitted + untracked edits), or `None` to apply no narrowing.
+///
+/// - `RunAll` (broad/infra change or any attribution failure) -> `None`: run
+///   whatever the user already selected, unnarrowed (the fail-safe).
+/// - `Empty` (strictly docs-only, or nothing changed vs base) -> `Some("none()")`:
+///   a valid nullary expression matching zero tests.
+/// - `Subset(pkgs)` -> a `test(...)` union over every test whose scheduler maps
+///   to an affected package, plus every package-less scheduler's tests
+///   (`Eevdf`/`Path`/`KernelBuiltin` sit outside the package matrix, so on any
+///   non-docs change they are conservatively kept). An empty union (no
+///   enumerated test maps to an affected package) -> `None`, the fail-safe:
+///   never silently narrow to nothing off a mapping we could not build.
+///
+/// The caller ANDs this with any user `-E` (nextest UNIONs multiple `-E`, so
+/// narrowing requires a single composed `(relevant)&(user)` expression).
+pub(crate) fn relevant_test_filter(
+    base: Option<&str>,
+    base_ref: Option<&str>,
+    default_branch: &str,
+) -> Result<Option<String>> {
+    let schedulers = enumerate_schedulers().context("enumerate declared schedulers")?;
+    let (outcome, _testable) = compute_outcome(base, base_ref, default_branch, true, &schedulers)?;
+
+    // RunAll / Empty resolve without the per-test scheduler map, so skip the
+    // (build+run) test-list probe on those paths; only Subset needs it.
+    if !matches!(outcome, AffectedOutcome::Subset(_)) {
+        return Ok(select_relevant_tests(&outcome, &BTreeMap::new(), &[]));
+    }
+    // scheduler name -> its package (None = package-less: outside the matrix).
+    let pkg_of: BTreeMap<&str, Option<&str>> = schedulers
+        .iter()
+        .map(|s| (s.name.as_str(), s.package.as_deref()))
+        .collect();
+    let tests = enumerate_scheduler_tests().context("enumerate declared tests")?;
+    Ok(select_relevant_tests(&outcome, &pkg_of, &tests))
+}
+
+/// Pure mapping of an [`AffectedOutcome`] onto a nextest filter over test NAMES,
+/// given the scheduler-name -> package map and the declared tests. Extracted
+/// from [`relevant_test_filter`] so the outcome -> test-name selection (the
+/// actual `--relevant` payload) is unit-testable without git, a build, or a
+/// probe.
+///
+/// - `RunAll` -> `None`: run everything, unnarrowed (the fail-safe).
+/// - `Empty` -> `Some("none()")`: a nullary expression matching zero tests.
+/// - `Subset` -> a `build_nextest_filter` union over every test whose scheduler
+///   maps to an affected package, PLUS every package-less or unenumerable
+///   scheduler's test (`Eevdf`/`Path`/`KernelBuiltin` sit outside the package
+///   matrix, so on any non-docs change they are conservatively kept). An empty
+///   selection -> `None` (fail-safe: never silently narrow to nothing off a
+///   mapping we could not build) -- distinct from `Empty`'s deliberate
+///   `none()`.
+fn select_relevant_tests(
+    outcome: &AffectedOutcome,
+    pkg_of: &BTreeMap<&str, Option<&str>>,
+    tests: &[ktstr::test_support::SchedulerTestJson],
+) -> Option<String> {
+    let affected: BTreeSet<&str> = match outcome {
+        AffectedOutcome::RunAll => return None,
+        AffectedOutcome::Empty => return Some("none()".to_string()),
+        AffectedOutcome::Subset(pkgs) => pkgs.iter().map(String::as_str).collect(),
+    };
+    let selected: BTreeSet<&str> = tests
+        .iter()
+        .filter(|t| match pkg_of.get(t.scheduler.as_str()).copied() {
+            // A Discover scheduler: keep the test iff its package is affected.
+            Some(Some(pkg)) => affected.contains(pkg),
+            // Package-less scheduler, or a scheduler we could not enumerate:
+            // keep on any non-docs change (Subset) -- the fail-safe.
+            _ => true,
+        })
+        .map(|t| t.test.as_str())
+        .collect();
+
+    if selected.is_empty() {
+        None
+    } else {
+        Some(crate::replay::build_nextest_filter(&selected))
+    }
 }
 
 /// Pure attribution: given the changed paths, the testable scheduler packages,
 /// each scheduler's `.d` input set (`None` = could not compute -> conservatively
 /// affected), and the workspace graph, decide the outcome. Extracted from
-/// [`compute`] so the layer-1 ∪ layer-2 union and the fail-safe
+/// [`compute_outcome`] so the layer-1 ∪ layer-2 union and the fail-safe
 /// (unattributed -> RunAll) are unit-testable without git or a build.
 fn attribute(
     changed: &BTreeSet<String>,
@@ -869,5 +1004,76 @@ mod tests {
         assert!(ws.closure_contains("user", "dep"));
         assert!(!ws.closure_contains("dep", "user"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn sched_test(test: &str, scheduler: &str) -> ktstr::test_support::SchedulerTestJson {
+        ktstr::test_support::SchedulerTestJson {
+            test: test.to_string(),
+            scheduler: scheduler.to_string(),
+        }
+    }
+
+    /// RunAll -> None (run everything, the fail-safe); no test map is consulted.
+    #[test]
+    fn select_relevant_runall_is_none() {
+        assert_eq!(
+            select_relevant_tests(&AffectedOutcome::RunAll, &BTreeMap::new(), &[]),
+            None
+        );
+    }
+
+    /// Empty (strictly docs-only) -> Some("none()"): a deliberate zero-match
+    /// filterset, DISTINCT from the empty-selection fail-safe (which is None).
+    #[test]
+    fn select_relevant_empty_is_none_filterset() {
+        assert_eq!(
+            select_relevant_tests(&AffectedOutcome::Empty, &BTreeMap::new(), &[]),
+            Some("none()".to_string())
+        );
+    }
+
+    /// Subset maps each test onto its scheduler's package: an affected Discover
+    /// package's test is kept, an unaffected one dropped; a package-less
+    /// scheduler's test and an unenumerable (unknown-name) test are kept (the
+    /// conservative inclusion).
+    #[test]
+    fn select_relevant_subset_maps_tests_to_affected_packages() {
+        let mut pkg_of: BTreeMap<&str, Option<&str>> = BTreeMap::new();
+        pkg_of.insert("scx_a_sched", Some("scx_a"));
+        pkg_of.insert("scx_b_sched", Some("scx_b"));
+        pkg_of.insert("builtin", None); // package-less scheduler
+        let tests = vec![
+            sched_test("t_a", "scx_a_sched"),   // affected pkg -> kept
+            sched_test("t_b", "scx_b_sched"),   // unaffected pkg -> dropped
+            sched_test("t_builtin", "builtin"), // package-less -> kept
+            sched_test("t_unknown", "ghost"),   // not in pkg_of -> kept
+        ];
+        let outcome = AffectedOutcome::Subset(vec!["scx_a".to_string()]);
+        let expr = select_relevant_tests(&outcome, &pkg_of, &tests).expect("Subset selects tests");
+        // Match on the `NAME$` boundary `build_nextest_filter` emits, so a
+        // dropped name is not falsely "found" as a prefix of a kept one
+        // (e.g. `t_b` is a prefix of `t_builtin`).
+        assert!(expr.contains("t_a$"), "affected Discover pkg test kept: {expr}");
+        assert!(expr.contains("t_builtin$"), "package-less test kept: {expr}");
+        assert!(
+            expr.contains("t_unknown$"),
+            "unenumerable-scheduler test kept: {expr}"
+        );
+        assert!(
+            !expr.contains("t_b$"),
+            "unaffected Discover pkg test dropped: {expr}"
+        );
+    }
+
+    /// Subset whose every test maps to an unaffected Discover package -> the
+    /// selection is empty -> None (run everything, the fail-safe), NOT
+    /// Some("none()") (which would silently run zero tests).
+    #[test]
+    fn select_relevant_subset_empty_selection_is_none_failsafe() {
+        let mut pkg_of: BTreeMap<&str, Option<&str>> = BTreeMap::new();
+        pkg_of.insert("scx_b_sched", Some("scx_b"));
+        let tests = vec![sched_test("t_b", "scx_b_sched")];
+        let outcome = AffectedOutcome::Subset(vec!["scx_a".to_string()]);
+        assert_eq!(select_relevant_tests(&outcome, &pkg_of, &tests), None);
     }
 }

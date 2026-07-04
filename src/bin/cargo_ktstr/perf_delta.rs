@@ -576,6 +576,12 @@ pub(crate) struct PerfDeltaArgs<'a> {
     pub base_ref: Option<&'a str>,
     /// Nextest `-E` filter narrowing within the perf-mode set.
     pub filter: Option<&'a str>,
+    /// `--relevant` — additionally narrow the compared perf set to the tests
+    /// the `base..HEAD` diff (UNIONed with the working tree) touches, computed
+    /// from the SAME `base` / `base_ref` / `default_branch` as the baseline.
+    /// Intersected with `filter`. A broad / unattributable change does not
+    /// narrow (compares everything); a docs-only change narrows to nothing.
+    pub relevant: bool,
     /// Branch to merge-base against when no override / env is present.
     pub default_branch: &'a str,
     /// `--kernel <SPEC>` — required with `--dual-run` (the kernel the
@@ -692,9 +698,28 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
         BaseSelection::ExplicitCommit(c) => println!("  baseline: explicit --base {c}"),
         BaseSelection::MergeBaseWith(r) => println!("  baseline: merge-base(HEAD, {r})"),
     }
+
+    // `--relevant`: fold the change-scoped filterset into the effective `-E`
+    // used for BOTH sides. `relevant_test_filter` returns `None` for a broad /
+    // unattributable change (do not narrow -> fall back to the user's `--filter`)
+    // and `Some("none()")` for a docs-only change (narrow to nothing -> the
+    // dual-run produces no sidecars and exits cleanly below). The composed
+    // expression intersects (`&`) so it narrows, never widens.
+    let relevant_expr = if args.relevant {
+        crate::affected::relevant_test_filter(args.base, args.base_ref, args.default_branch)
+            .context("compute --relevant perf-delta test set")?
+    } else {
+        None
+    };
+    let effective_filter: Option<String> = match (relevant_expr.as_deref(), args.filter) {
+        (Some(rel), Some(user)) => Some(format!("({rel}) & ({user})")),
+        (Some(rel), None) => Some(rel.to_string()),
+        (None, user) => user.map(str::to_string),
+    };
+    let effective_filter = effective_filter.as_deref();
     println!(
         "  perf tests: {}",
-        args.filter.unwrap_or("all performance_mode tests")
+        effective_filter.unwrap_or("all performance_mode tests")
     );
 
     // Noise-adjusted axis: produce N runs per side (looped dual-run into
@@ -710,7 +735,7 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
             &baseline,
             &head,
             kernel,
-            args.filter,
+            effective_filter,
             args.profile,
             args.nextest_profile,
             args.passthrough,
@@ -741,7 +766,7 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
             &baseline_oid.to_hex().to_string(),
             &baseline,
             kernel,
-            args.filter,
+            effective_filter,
             args.profile,
             args.nextest_profile,
             args.passthrough,

@@ -112,6 +112,31 @@ pub(crate) enum KtstrCommand {
         /// `--kernel`, a path, a cache key, or a git source.
         #[arg(long, help = INCLUDE_EOL_HELP)]
         include_eol: bool,
+        /// Narrow the run to only the tests a change touches: build +
+        /// introspect each declared scheduler, attribute the `base..HEAD`
+        /// diff UNIONed with the working tree (uncommitted + untracked) to
+        /// schedulers, and run only those schedulers' tests (ANDed with any
+        /// `-E` in the passthrough args). A broad / build-graph /
+        /// unattributable change runs everything (fail-safe); a strictly
+        /// docs-only change (or a clean tree at `base`) runs nothing. See
+        /// `cargo ktstr affected` for the same attribution rendered as a CI
+        /// matrix.
+        #[arg(long)]
+        relevant: bool,
+        /// With `--relevant`: override the baseline commit directly (skips
+        /// merge-base). Ignored without `--relevant`.
+        #[arg(long)]
+        base: Option<String>,
+        /// With `--relevant`: ref to merge-base against. Defaults to
+        /// `$GITHUB_BASE_REF` (as `origin/<ref>`) on a PR, else
+        /// `--default-branch`. Ignored without `--relevant`.
+        #[arg(long)]
+        base_ref: Option<String>,
+        /// With `--relevant`: branch to merge-base against when neither
+        /// `--base` / `--base-ref` nor `$GITHUB_BASE_REF` is set. Ignored
+        /// without `--relevant`.
+        #[arg(long, default_value = "main")]
+        default_branch: String,
         /// Arguments passed through to cargo nextest run. Native flags
         /// may appear in any order relative to these (no `--` separator
         /// needed); to forward a token that shares a name with a native
@@ -164,6 +189,27 @@ pub(crate) enum KtstrCommand {
         /// `--kernel`, a path, a cache key, or a git source.
         #[arg(long, help = INCLUDE_EOL_HELP)]
         include_eol: bool,
+        /// Narrow the run to only the tests a change touches (see `cargo
+        /// ktstr test --relevant` for the full contract). The relevant
+        /// filter is ANDed with any `-E` in the passthrough args; a broad /
+        /// unattributable change runs everything, a docs-only change runs
+        /// nothing.
+        #[arg(long)]
+        relevant: bool,
+        /// With `--relevant`: override the baseline commit directly (skips
+        /// merge-base). Ignored without `--relevant`.
+        #[arg(long)]
+        base: Option<String>,
+        /// With `--relevant`: ref to merge-base against. Defaults to
+        /// `$GITHUB_BASE_REF` (as `origin/<ref>`) on a PR, else
+        /// `--default-branch`. Ignored without `--relevant`.
+        #[arg(long)]
+        base_ref: Option<String>,
+        /// With `--relevant`: branch to merge-base against when neither
+        /// `--base` / `--base-ref` nor `$GITHUB_BASE_REF` is set. Ignored
+        /// without `--relevant`.
+        #[arg(long, default_value = "main")]
+        default_branch: String,
         /// Arguments passed through to cargo llvm-cov nextest. Native
         /// flags may appear in any order relative to these (no `--`
         /// separator needed); to forward a token that shares a name with
@@ -312,6 +358,14 @@ pub(crate) enum KtstrCommand {
         /// test set the run selects by default.
         #[arg(long, short = 'E')]
         filter: Option<String>,
+        /// Narrow the compared `performance_mode` set to only the tests the
+        /// `base..HEAD` diff (UNIONed with the working tree) touches, ANDed
+        /// with `--filter`. Reuses `--base` / `--base-ref` /
+        /// `--default-branch` as BOTH the comparison baseline and the
+        /// attribution base. A broad / unattributable change compares
+        /// everything (fail-safe); a docs-only change compares nothing.
+        #[arg(long)]
+        relevant: bool,
         /// Branch to merge-base against when neither `--base` /
         /// `--base-ref` nor `$GITHUB_BASE_REF` is set.
         #[arg(long, default_value = "main")]

@@ -102,6 +102,7 @@ fn parse_perf_delta_flags_and_defaults() {
             base,
             base_ref,
             filter,
+            relevant,
             default_branch,
             kernel,
             dual_run,
@@ -122,6 +123,7 @@ fn parse_perf_delta_flags_and_defaults() {
             assert_eq!(base.as_deref(), Some("abc123"));
             assert_eq!(base_ref.as_deref(), Some("release"));
             assert_eq!(filter.as_deref(), Some("perf::"));
+            assert!(!relevant, "--relevant defaults off");
             assert_eq!(default_branch, "main", "default branch defaults to main");
             assert_eq!(kernel.as_deref(), Some("6.14"));
             assert!(dual_run, "--dual-run flag sets dual_run");
@@ -152,6 +154,7 @@ fn parse_perf_delta_flags_and_defaults() {
             base,
             base_ref,
             filter,
+            relevant,
             default_branch,
             kernel,
             dual_run,
@@ -173,6 +176,7 @@ fn parse_perf_delta_flags_and_defaults() {
                 "bare perf-delta parses no cargo passthrough"
             );
             assert!(base.is_none() && base_ref.is_none() && filter.is_none());
+            assert!(!relevant, "bare perf-delta defaults --relevant off");
             assert_eq!(default_branch, "main");
             assert!(kernel.is_none());
             assert!(!dual_run, "--dual-run defaults off (cached-baseline path)");
@@ -410,6 +414,10 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             profile,
             nextest_profile,
             include_eol,
+            relevant,
+            base,
+            base_ref,
+            default_branch,
             args,
         } => {
             assert!(
@@ -439,6 +447,10 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             assert!(
                 !include_eol,
                 "bare `--` passthrough must not spuriously set --include-eol",
+            );
+            assert!(
+                !relevant && base.is_none() && base_ref.is_none() && default_branch == "main",
+                "bare `--` passthrough must not spuriously set --relevant / base flags",
             );
             assert_eq!(args, expected);
         }
@@ -450,6 +462,10 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             profile,
             nextest_profile,
             include_eol,
+            relevant,
+            base,
+            base_ref,
+            default_branch,
             args,
         } => {
             assert!(
@@ -479,6 +495,10 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             assert!(
                 !include_eol,
                 "bare `--` passthrough must not spuriously set --include-eol",
+            );
+            assert!(
+                !relevant && base.is_none() && base_ref.is_none() && default_branch == "main",
+                "bare `--` passthrough must not spuriously set --relevant / base flags",
             );
             assert_eq!(args, expected);
         }
@@ -654,6 +674,50 @@ fn parse_test_include_eol_flag() {
     );
 }
 
+/// `--relevant` + its base flags round-trip on `test`, and a user `-E`
+/// stays in the passthrough `args` (it is NOT a ktstr-owned flag on
+/// `test`, so `argsplit` leaves it for `compose_relevant_filter` to fold
+/// downstream). Goes through `parse_via_split` because a bare `-E` is
+/// position-dependent to raw clap; `argsplit::rewrite` routes it into the
+/// passthrough exactly as the real `main` does.
+#[test]
+fn parse_test_relevant_flags() {
+    let command = parse_via_split(&[
+        "cargo",
+        "ktstr",
+        "test",
+        "--relevant",
+        "--base",
+        "abc123",
+        "--base-ref",
+        "release",
+        "--default-branch",
+        "dev",
+        "-E",
+        "test(foo)",
+    ]);
+    let KtstrCommand::Test {
+        relevant,
+        base,
+        base_ref,
+        default_branch,
+        args,
+        ..
+    } = command
+    else {
+        panic!("expected Test");
+    };
+    assert!(relevant, "--relevant round-trips");
+    assert_eq!(base.as_deref(), Some("abc123"));
+    assert_eq!(base_ref.as_deref(), Some("release"));
+    assert_eq!(default_branch, "dev");
+    assert_eq!(
+        args,
+        vec!["-E".to_string(), "test(foo)".to_string()],
+        "a user -E is not ktstr-owned on `test`; it stays in the passthrough",
+    );
+}
+
 /// Pin passthrough args (the `last = true` field) forwarded verbatim after `--`.
 #[test]
 fn parse_test_with_passthrough_args() {
@@ -717,6 +781,7 @@ fn parse_nextest_alias_with_kernel_and_no_perf_mode() {
         nextest_profile,
         include_eol,
         args,
+        ..
     } = k.command
     else {
         panic!("expected Test (via `nextest` alias)");
@@ -882,6 +947,7 @@ fn parse_coverage_with_kernel_and_no_perf_mode() {
         nextest_profile,
         include_eol,
         args,
+        ..
     } = k.command
     else {
         panic!("expected Coverage");

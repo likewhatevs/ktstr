@@ -22,7 +22,16 @@ cargo ktstr test --kernel git+https://example.com/r.git#tag=v6.14  # git URL + t
 cargo ktstr test --kernel git+https://example.com/r.git#sha=<full-40-hex-commit>  # a specific commit
 cargo ktstr test --kernel 6.14.2 --kernel 6.15.0               # multi-kernel: repeatable
 cargo ktstr test --release                                     # release profile (stricter assertions)
+cargo ktstr test --relevant                                    # only tests the current diff affects
 ```
+
+`--relevant` narrows the run to only the tests whose scheduler your
+working-tree change touches (committed `base..HEAD` ∪ uncommitted +
+untracked edits), intersected with any `-E` you pass. It is the local
+counterpart to the `affected` CI matrix — see
+[affected / --relevant](#relevant) for the attribution model, the
+`--base` / `--base-ref` / `--default-branch` baseline knobs, and the
+fail-safe behavior.
 
 `--kernel` is **repeatable** and accepts a path, version string,
 cache key, version range (`START..END`), or git source
@@ -152,6 +161,10 @@ identical work for no signal.
 | `--release` | off | Build and run tests with the release profile (`--cargo-profile release` to nextest). Release mode applies **stricter assertion thresholds** (`gap_threshold_ms` 2000 vs debug's 3000, `spread_threshold_pct` 15% vs debug's 35%) — tests that barely pass in debug may fail under `--release`. `catch_unwind`-based tests and tests gated on `#[cfg(debug_assertions)]` are skipped. |
 | `--profile NAME` | release | Cargo BUILD profile for the scheduler-under-test (a `SchedulerSpec::Discover` package): drives `cargo build -p <scheduler> --profile <NAME>` via the `KTSTR_SCHEDULER_PROFILE` env. Omitted, the scheduler builds `release` — an optimized scheduler is the only sensible default. INDEPENDENT of `--release` (the harness build profile): pass `--profile dev` for a fast unoptimized scheduler build, or any custom `[profile.<name>]`. Distinct from `--nextest-profile` (the nextest test profile). |
 | `--nextest-profile NAME` | nextest default | Nextest TEST profile (`.config/nextest.toml`), forwarded to nextest as `--profile <NAME>` (retry / timeout / output settings). Distinct from `--profile` (the scheduler's cargo BUILD profile) and `--release` (the harness's cargo build profile). |
+| `--relevant` | off | Narrow the run to only the tests whose scheduler the working-tree change touches (committed `base..HEAD` ∪ uncommitted + untracked), intersected with any `-E`. Broad / unattributable change → everything (fail-safe); docs-only → nothing. See [affected / --relevant](#relevant). |
+| `--base COMMIT` | — | With `--relevant`: explicit attribution baseline (skips merge-base). Ignored without `--relevant`. |
+| `--base-ref REF` | — | With `--relevant`: ref to merge-base against (defaults to `$GITHUB_BASE_REF` on a PR, else `--default-branch`). Ignored without `--relevant`. |
+| `--default-branch BRANCH` | `main` | With `--relevant`: merge-base target when no `--base` / `--base-ref` / `$GITHUB_BASE_REF`. Ignored without `--relevant`. |
 
 ### What it does (path mode only)
 
@@ -371,6 +384,10 @@ cargo ktstr coverage -- --workspace --lcov --output-path lcov.info # lcov output
 | `--release` | off | Collect coverage with the release profile (`--cargo-profile release` to llvm-cov nextest). Same stricter-threshold caveats as `test --release` — release mode applies `gap_threshold_ms=2000` / `spread_threshold_pct=15%`, and skips `catch_unwind`-based tests along with `#[cfg(debug_assertions)]`-gated tests. |
 | `--profile NAME` | release | Cargo BUILD profile for the scheduler-under-test (see `cargo ktstr test --profile`). Omitted, the scheduler builds `release`; INDEPENDENT of `--release`. |
 | `--nextest-profile NAME` | nextest default | Nextest TEST profile forwarded to `cargo llvm-cov nextest` as `--profile <NAME>` (see `cargo ktstr test --nextest-profile`). |
+| `--relevant` | off | Narrow the run to only the tests whose scheduler the working-tree change touches, intersected with any `-E` (see `cargo ktstr test --relevant`). Broad change → everything (fail-safe); docs-only → nothing. See [affected / --relevant](#relevant). |
+| `--base COMMIT` | — | With `--relevant`: explicit attribution baseline (skips merge-base). Ignored without `--relevant`. |
+| `--base-ref REF` | — | With `--relevant`: ref to merge-base against (defaults to `$GITHUB_BASE_REF` on a PR, else `--default-branch`). Ignored without `--relevant`. |
+| `--default-branch BRANCH` | `main` | With `--relevant`: merge-base target when no `--base` / `--base-ref` / `$GITHUB_BASE_REF`. Ignored without `--relevant`. |
 
 Requires `cargo-llvm-cov` and the `llvm-tools-preview` rustup
 component:
@@ -1094,6 +1111,7 @@ exits `0` — an empty perf set is "nothing to compare", not a failure.
 | `--base-ref REF` | — | Ref to merge-base against. |
 | `--default-branch BRANCH` | `main` | Merge-base target when no `--base`/`--base-ref`/`$GITHUB_BASE_REF`. |
 | `-E, --filter EXPR` | all `performance_mode` | Nextest filter narrowing within the `performance_mode` set. |
+| `--relevant` | off | Additionally narrow to the `performance_mode` tests the `base..HEAD` diff (∪ working tree) touches, from the same baseline; intersected with `--filter`. Broad change → compares everything; docs-only → nothing. See [affected / --relevant](#relevant). |
 | `--threshold PCT` | registry defaults | Uniform relative regression gate (percent). Mutually exclusive with `--policy`. |
 | `--policy PATH` | registry defaults | Per-metric threshold JSON. Mutually exclusive with `--threshold`. Schema: `{ "default_percent": N, "per_metric_percent": { "worst_spread": 5.0, ... } }` (priority: per-metric override → `default_percent` → each metric's registry `default_rel`). |
 | `--noise-adjust N` | off | Self-tuning noise mode (requires `--kernel`): run each side N times and gate a confident regression on the two sides being SEPARATED (a two-sided Welch t-test at alpha=0.05, or fully disjoint `[min, max]` bands) AND MATERIAL (the registry `default_abs`/`default_rel` dual-gate), instead of a fixed `--threshold`. Implies dual-run production looped N times. Conflicts with `--threshold`, `--policy`, and `--dual-run`. |
@@ -1101,6 +1119,93 @@ exits `0` — an empty perf set is "nothing to compare", not a failure.
 | `--no-phases` / `--phases-only` / `--steps-only` / `--phase N` / `--phase-threshold PCT` | full per-phase render | Per-phase output projection for the `--noise-adjust` spread block (render-only; does not change the verdict). Each **requires `--noise-adjust`** — per-phase output exists only on the noise-adjusted path. |
 
 Runnable as `just perf-delta <kernel> [base]`.
+
+## affected {#affected}
+
+Emit the scheduler packages a `base..HEAD` diff affects, as a flat JSON
+array for a GitHub Actions **dynamic matrix**. Run it inside a scheduler
+repo that consumes ktstr (it discovers the repo + workspace from the
+cwd); pipe its output into `strategy.matrix.scheduler: ${{ fromJSON(...)
+}}` so CI spawns one job per affected scheduler instead of building and
+testing the whole fleet on every push.
+
+```sh
+cargo ktstr affected                          # vs merge-base(HEAD, main)
+cargo ktstr affected --base-ref release       # vs merge-base(HEAD, release)
+cargo ktstr affected --base abc1234           # vs an explicit commit
+# -> e.g. ["scx_lavd","scx_rusty"]
+```
+
+**Attribution** is the UNION of two layers — a scheduler is affected if a
+changed path is reachable by either:
+
+1. **cargo dependency closure** (from `cargo metadata`): a changed path
+   is attributed to its owning workspace crate; the scheduler is affected
+   if that crate is in the scheduler's transitive dependency closure.
+   Catches shared *Rust* library changes.
+2. **`.d` input set**: only when a native (`.c`/`.h`) source or an
+   unattributable path changed, each scheduler is built once and its
+   cargo `<artifact>.d` dep-info is parsed into the exact set of files
+   that compiled into it — the Rust sources, the generated BPF skeletons,
+   and (via clang's `-M`) every `.bpf.c` / header it text-includes,
+   including cross-scheduler includes and shared headers. A pure-Rust
+   change skips this build (the crate closure alone is sound).
+
+**Fail-safe** — a false negative (silently skipping an affected
+scheduler) is the worst outcome, so every uncertainty widens to the full
+testable set, never to a skip: an unresolvable base, a diff failure, a
+workspace-root / build-graph / `Cargo.lock` change, or any changed
+non-docs path attributed to neither a scheduler `.d` nor a workspace
+crate. A per-scheduler build/read failure marks that scheduler affected.
+Only a strictly docs-only change (or `base == HEAD`) emits `[]`.
+
+Only **Discover** (cargo-package) schedulers appear in the array —
+package-less schedulers (EEVDF, kernel-builtin) have no package to key a
+matrix cell on and must run in a separate unconditional CI leg.
+
+**Baseline resolution** is identical to [`perf-delta`](#perf-delta):
+`--base <commit>` (explicit, skips merge-base) → `--base-ref <ref>`
+(merge-base against it) → `$GITHUB_BASE_REF` (on a PR, as
+`origin/<ref>`) → `merge-base(HEAD, <--default-branch>)` (default
+`main`).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--base COMMIT` | — | Explicit baseline commit-ish (skips merge-base). |
+| `--base-ref REF` | — | Ref to merge-base against. Defaults to `$GITHUB_BASE_REF` on a PR, else `--default-branch`. |
+| `--default-branch BRANCH` | `main` | Merge-base target when no `--base`/`--base-ref`/`$GITHUB_BASE_REF`. |
+
+### --relevant (local test narrowing) {#relevant}
+
+`affected` produces a CI matrix; `--relevant` is its local inner-loop
+counterpart. `cargo ktstr test --relevant` (also `coverage --relevant`
+and `perf-delta --relevant`) runs the SAME attribution engine against the
+working tree — the committed `base..HEAD` diff **UNIONed with uncommitted
+and untracked edits** — and narrows the run to only the tests whose
+scheduler the change touched.
+
+```sh
+cargo ktstr test --relevant                       # only tests my edits affect
+cargo ktstr test --relevant --base-ref release    # vs merge-base(HEAD, release)
+cargo ktstr test --relevant -E 'test(smoke)'      # relevant AND matching -E
+```
+
+The relevant set is folded into a single nextest filterset that
+**intersects** (`&`) any `-E` you pass, so it always narrows — never
+widens — the selection. Outcomes mirror `affected`:
+
+- a broad / build-graph / unattributable change does **not** narrow — the
+  full selection runs (the fail-safe);
+- a strictly docs-only change (or a clean tree at `base`) narrows to
+  nothing — the run executes zero tests;
+- otherwise only the affected schedulers' tests run. Package-less
+  schedulers (EEVDF, kernel-builtin) are conservatively included on any
+  non-docs change.
+
+`--base` / `--base-ref` / `--default-branch` select the attribution
+baseline exactly as in `affected` (ignored without `--relevant`). On
+`perf-delta`, `--relevant` reuses the SAME baseline for both the
+attribution and the A/B comparison, and intersects with `--filter`.
 
 ## show-host (live) {#show-host-live}
 

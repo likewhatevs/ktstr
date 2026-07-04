@@ -1,4 +1,8 @@
-//! gix `base..HEAD` tree diff -> the set of changed repo-root-relative paths.
+//! gix change detection -> sets of changed repo-root-relative paths.
+//!
+//! [`changed_paths_committed`] diffs the `base..HEAD` trees; [`changed_paths_worktree`]
+//! diffs `HEAD` against the working tree (uncommitted + untracked). A `--relevant`
+//! run unions both to get everything changed relative to `base`.
 //!
 //! Wraps [`gix::Repository::diff_tree_to_tree`] (verified against gix 0.83 /
 //! gix-diff 0.63: `diff_tree_to_tree(old, new, None)` returns
@@ -16,7 +20,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
-use gix::bstr::ByteSlice;
+use gix::bstr::{BString, ByteSlice};
 
 /// Repo-root-relative paths changed between the `base` and `head` commit trees
 /// (the changes that turn `base` into `head`).
@@ -53,6 +57,45 @@ pub(crate) fn changed_paths_committed(
                 .source_location()
                 .to_str()
                 .context("changed source path is not valid UTF-8")?
+                .to_owned(),
+        );
+    }
+    Ok(paths)
+}
+
+/// Repo-root-relative paths that differ between `HEAD` and the current working
+/// tree -- every staged and unstaged change plus untracked files. Unioned with
+/// [`changed_paths_committed`] over `base..HEAD`, this yields the full set of
+/// paths a local `--relevant` run has touched relative to `base`. A clean tree
+/// yields an empty set, so on a committed-only checkout the union degrades to
+/// exactly the `base..HEAD` result.
+///
+/// Rename tracking is forced off on the tree->index leg
+/// (`TrackRenames::Disabled`) -- the `status()` default is `AsConfigured`,
+/// which tracks staged renames as a single rewrite exposing only the
+/// destination via `Item::location`. Disabling it makes a rename surface as a
+/// deletion (old path) plus an addition (new path), so both reach the set,
+/// matching the source+dest union [`changed_paths_committed`] performs. The
+/// index->worktree leg already defaults to no rewrite tracking. Untracked files
+/// are emitted individually (`UntrackedFiles::Files`) so a new native source or
+/// scheduler input is not collapsed into its parent directory and missed (a
+/// false-negative).
+pub(crate) fn changed_paths_worktree(repo: &gix::Repository) -> Result<BTreeSet<String>> {
+    let iter = repo
+        .status(gix::progress::Discard)
+        .context("open worktree status")?
+        .untracked_files(gix::status::UntrackedFiles::Files)
+        .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled)
+        .into_iter(Vec::<BString>::new())
+        .context("create worktree status iterator")?;
+
+    let mut paths = BTreeSet::new();
+    for item in iter {
+        let item = item.context("read worktree status item")?;
+        paths.insert(
+            item.location()
+                .to_str()
+                .context("worktree-changed path is not valid UTF-8")?
                 .to_owned(),
         );
     }

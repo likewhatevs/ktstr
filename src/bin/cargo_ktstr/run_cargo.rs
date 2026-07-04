@@ -811,6 +811,103 @@ fn check_ktstr_version_compat() -> Result<(), String> {
     Ok(())
 }
 
+/// Split nextest FILTERSET tokens (`-E` / `--filterset` / the legacy
+/// `--filter-expr`; space-, `=`-, and glued-short forms) out of a passthrough
+/// argv, returning (filterset expressions, remaining args). A bare trailing
+/// `-E` with no following value is dropped (nextest would reject it anyway).
+///
+/// Only FILTERSETS are extracted — positional test-name filters are left in
+/// `rest` deliberately: nextest ANDs the name-filter dimension with the
+/// filterset dimension (verified in nextest-runner 0.118 `test_filter.rs`
+/// `filter_match_base`: a test must match BOTH), so a positional filter already
+/// intersects the injected relevant filterset correctly and needs no folding.
+/// Multiple filtersets, by contrast, UNION among themselves (`exprs.iter().any`
+/// in `matches_expression`), so they MUST be folded into one `&`-composed
+/// expression to narrow rather than widen.
+fn extract_nextest_filtersets(args: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut filters = Vec::new();
+    let mut rest = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(tok) = it.next() {
+        if tok == "-E" || tok == "--filterset" || tok == "--filter-expr" {
+            if let Some(val) = it.next() {
+                filters.push(val);
+            }
+        } else if let Some(val) = tok
+            .strip_prefix("--filterset=")
+            .or_else(|| tok.strip_prefix("--filter-expr="))
+        {
+            filters.push(val.to_string());
+        } else if let Some(rest_short) = tok.strip_prefix("-E") {
+            // Glued short form: `-E=EXPR` or `-EEXPR`. Any `-E`-prefixed token is
+            // treated as the nextest filterset flag: `-E` is nextest's only
+            // `-E*` short flag, and no legitimate cargo/nextest passthrough value
+            // begins with `-E` (feature lists, profiles, paths, and test-name
+            // filters do not), so this cannot swallow a non-filterset token.
+            filters.push(
+                rest_short
+                    .strip_prefix('=')
+                    .unwrap_or(rest_short)
+                    .to_string(),
+            );
+        } else {
+            rest.push(tok);
+        }
+    }
+    (filters, rest)
+}
+
+/// Fold the change-relevant nextest filterset into `args`, intersecting it with
+/// any user filtersets already present so the net effect NARROWS the run
+/// (`(relevant) & (userA | userB | ...)`), never widens it (nextest UNIONs
+/// multiple `-E`). User filterset tokens are removed and replaced by one
+/// composed `-E`; every other token (positional name filters, `--features`,
+/// …) is preserved and passes through untouched.
+fn compose_relevant_filter(args: Vec<String>, relevant: &str) -> Vec<String> {
+    let (user_filtersets, mut rest) = extract_nextest_filtersets(args);
+    let combined = if user_filtersets.is_empty() {
+        relevant.to_string()
+    } else {
+        let union = user_filtersets
+            .iter()
+            .map(|f| format!("({f})"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        format!("({relevant}) & ({union})")
+    };
+    rest.push("-E".to_string());
+    rest.push(combined);
+    rest
+}
+
+/// Resolve and apply `--relevant` narrowing to a test/coverage passthrough
+/// argv. A no-op when `relevant` is false. Otherwise builds + introspects the
+/// declared schedulers to map the `base..worktree` change onto a nextest
+/// filterset ([`crate::affected::relevant_test_filter`]) and folds it into
+/// `args`. `Ok(None)` from the resolver (a broad / unattributable change, or a
+/// mapping that could not be built) means "do not narrow" — run the user's
+/// unmodified selection (the fail-safe).
+fn apply_relevant_narrowing(
+    args: Vec<String>,
+    relevant: bool,
+    base: Option<String>,
+    base_ref: Option<String>,
+    default_branch: String,
+) -> Result<Vec<String>, String> {
+    if !relevant {
+        return Ok(args);
+    }
+    match crate::affected::relevant_test_filter(
+        base.as_deref(),
+        base_ref.as_deref(),
+        &default_branch,
+    ) {
+        Ok(Some(expr)) => Ok(compose_relevant_filter(args, &expr)),
+        Ok(None) => Ok(args),
+        Err(e) => Err(format!("compute --relevant test set: {e:#}")),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_test(
     kernel: Vec<String>,
@@ -820,11 +917,16 @@ pub(crate) fn run_test(
     profile: Option<String>,
     nextest_profile: Option<String>,
     include_eol: bool,
+    relevant: bool,
+    base: Option<String>,
+    base_ref: Option<String>,
+    default_branch: String,
     args: Vec<String>,
 ) -> Result<(), String> {
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     ktstr::cli::check_tools(&["cargo-nextest"]).map_err(|e| format!("{e:#}"))?;
     check_ktstr_version_compat()?;
+    let args = apply_relevant_narrowing(args, relevant, base, base_ref, default_branch)?;
     run_cargo_sub(
         TEST_SUB_ARGV,
         "tests",
@@ -848,6 +950,10 @@ pub(crate) fn run_coverage(
     profile: Option<String>,
     nextest_profile: Option<String>,
     include_eol: bool,
+    relevant: bool,
+    base: Option<String>,
+    base_ref: Option<String>,
+    default_branch: String,
     args: Vec<String>,
 ) -> Result<(), String> {
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
@@ -856,6 +962,7 @@ pub(crate) fn run_coverage(
     // hits the same CLI-too-old incompatibility `test` does — guard it
     // identically.
     check_ktstr_version_compat()?;
+    let args = apply_relevant_narrowing(args, relevant, base, base_ref, default_branch)?;
     run_cargo_sub(
         COVERAGE_SUB_ARGV,
         "coverage",
@@ -968,6 +1075,94 @@ mod tests {
             version_guard(&v("0.19.0+abc"), &v("0.19.0")),
             VersionGuard::Ok,
         );
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `extract_nextest_filtersets` pulls every filterset spelling (`-E` /
+    /// `--filterset` / legacy `--filter-expr`, space / `=` / glued-short) out of
+    /// the argv while leaving positional filters and other flags in `rest`.
+    #[test]
+    fn extract_filtersets_all_spellings() {
+        let (filters, rest) = extract_nextest_filtersets(strs(&[
+            "-E",
+            "test(a)",
+            "--filterset",
+            "test(b)",
+            "--filter-expr=test(c)",
+            "-E=test(d)",
+            "-Etest(e)",
+            "--filterset=test(f)",
+            "positional_name",
+            "--features",
+            "integration",
+        ]));
+        assert_eq!(
+            filters,
+            strs(&[
+                "test(a)",
+                "test(b)",
+                "test(c)",
+                "test(d)",
+                "test(e)",
+                "test(f)",
+            ]),
+        );
+        // Positional filter + unrelated flag survive untouched (nextest ANDs
+        // positional filters with the filterset dimension, so they need no fold).
+        assert_eq!(rest, strs(&["positional_name", "--features", "integration"]));
+    }
+
+    /// With no user filterset, the relevant expression is injected verbatim as a
+    /// single `-E`, and non-filter passthrough is preserved.
+    #[test]
+    fn compose_relevant_no_user_filterset() {
+        let out = compose_relevant_filter(strs(&["--features", "x"]), "test(r1) | test(r2)");
+        assert_eq!(
+            out,
+            strs(&["--features", "x", "-E", "test(r1) | test(r2)"]),
+        );
+    }
+
+    /// With user filtersets present, the composition INTERSECTS
+    /// (`(relevant) & (u1 | u2)`) so the net effect narrows, never widens
+    /// (nextest UNIONs multiple `-E`). The user's `-E` tokens are removed.
+    #[test]
+    fn compose_relevant_intersects_user_filtersets() {
+        let out = compose_relevant_filter(
+            strs(&["-E", "test(u1)", "--features", "x", "--filterset", "test(u2)"]),
+            "test(r)",
+        );
+        assert_eq!(
+            out,
+            strs(&[
+                "--features",
+                "x",
+                "-E",
+                "(test(r)) & ((test(u1)) | (test(u2)))",
+            ]),
+        );
+    }
+
+    /// A `none()` relevant expression (the docs-only Empty outcome) composes to
+    /// a zero-match filter, so a `--relevant` run of a docs-only change runs no
+    /// tests.
+    #[test]
+    fn compose_relevant_none_expression() {
+        let out = compose_relevant_filter(Vec::new(), "none()");
+        assert_eq!(out, strs(&["-E", "none()"]));
+    }
+
+    /// `apply_relevant_narrowing` is a no-op when `--relevant` is off — the argv
+    /// (including any user `-E`) passes through byte-for-byte.
+    #[test]
+    fn apply_relevant_narrowing_off_is_noop() {
+        let args = strs(&["-E", "test(x)", "--features", "y"]);
+        let out = apply_relevant_narrowing(args.clone(), false, None, None, "main".to_string())
+            .expect("no-op path never errors");
+        assert_eq!(out, args);
     }
 
     /// A `cargo metadata` Package JSON object with every required field

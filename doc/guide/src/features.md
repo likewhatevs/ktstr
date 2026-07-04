@@ -540,9 +540,35 @@ guest and host coverage for unified `cargo llvm-cov` reports.
 Wraps `cargo nextest run` with automatic kernel resolution.
 Subcommands (in `--help` order): `test`, `coverage`, `llvm-cov`,
 `stats`, `replay`, `perf-delta`, `kernel`, `verifier`,
-`completions`, `show-host`, `show-thresholds`, `export`,
-`locks`, `shell`.
+`completions`, `show-host`, `show-thresholds`, `affected`,
+`export`, `locks`, `shell`.
 See [`cargo-ktstr`](running-tests/cargo-ktstr.md).
+
+</details>
+
+<details>
+<summary><b>Change-scoped selection</b> — <code>affected</code> emits a CI matrix of only the schedulers a diff touches; <code>--relevant</code> narrows a local run to only the affected tests</summary>
+
+`cargo ktstr affected` (run inside a scheduler repo) attributes the
+`base..HEAD` diff to declared schedulers and prints the affected
+scheduler package names as a flat JSON array — a GitHub Actions dynamic
+matrix (`strategy.matrix.scheduler: ${{ fromJSON(...) }}`) then spawns
+one job per affected scheduler instead of the whole fleet. Attribution
+unions two layers: the cargo dependency closure (a changed Rust file →
+its owning crate → every scheduler that depends on it) and, only when a
+native (C/BPF) or unattributable path changed, each scheduler's cargo
+`.d` dep-info (built once to read the exact BPF/header/skeleton input
+set, including cross-scheduler text-includes and shared headers). Every
+uncertainty widens to "run all" (a false negative — silently skipping an
+affected scheduler — is the worst outcome); a strictly docs-only change
+emits `[]`.
+
+`cargo ktstr test --relevant` (and `coverage --relevant`, `perf-delta
+--relevant`) applies the same attribution to the LOCAL working tree
+(committed `base..HEAD` UNIONed with uncommitted + untracked edits) and
+narrows the run to only the tests whose scheduler the change touched —
+the fast inner-loop counterpart to the CI matrix. See
+[`cargo-ktstr`](running-tests/cargo-ktstr.md#affected).
 
 </details>
 
