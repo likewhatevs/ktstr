@@ -301,7 +301,10 @@ mod tests {
 
         assert!(!dead.exists(), "a dead-owner .bin.tmp file is reclaimed");
         assert!(live.exists(), "our own (live) .bin.tmp file is kept");
-        assert!(final_cache.exists(), "the final .bin cache file is untouched");
+        assert!(
+            final_cache.exists(),
+            "the final .bin cache file is untouched"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

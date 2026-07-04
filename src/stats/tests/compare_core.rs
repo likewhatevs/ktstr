@@ -2733,12 +2733,20 @@ fn format_noise_phase_findings_lines_collapses_when_all_stable() {
     let a = phased_rows(
         "scn",
         3,
-        &[make_phase_bucket(1, "Step[0]", &[("schbench_loop_count", 100.0)])],
+        &[make_phase_bucket(
+            1,
+            "Step[0]",
+            &[("schbench_loop_count", 100.0)],
+        )],
     );
     let b = phased_rows(
         "scn",
         3,
-        &[make_phase_bucket(1, "Step[0]", &[("schbench_loop_count", 100.0)])],
+        &[make_phase_bucket(
+            1,
+            "Step[0]",
+            &[("schbench_loop_count", 100.0)],
+        )],
     );
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
     assert!(
@@ -2800,7 +2808,11 @@ fn format_noise_phase_findings_lines_suppressed_spread_with_coverage_shows_hint(
     let b = phased_rows(
         "scn",
         3,
-        &[make_phase_bucket(1, "Step[0]", &[("schbench_loop_count", 100.0)])],
+        &[make_phase_bucket(
+            1,
+            "Step[0]",
+            &[("schbench_loop_count", 100.0)],
+        )],
     );
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
     // Fixture sanity: schbench_loop_count is a matched STABLE finding (to
@@ -2858,12 +2870,20 @@ fn noise_report_composite_counts_regressed_improved_stable() {
         true,
     );
     assert_eq!(regressed.regressions(), 1, "worst_spread 10->15 regresses");
-    assert_eq!(regressed.improvements(), 0, "nothing improved on the regressing side");
+    assert_eq!(
+        regressed.improvements(),
+        0,
+        "nothing improved on the regressing side"
+    );
     assert!(
         regressed.stable() >= 1,
         "unchanged total_iterations is counted stable"
     );
-    assert_eq!(regressed.informational(), 0, "no informational metric in the fixture");
+    assert_eq!(
+        regressed.informational(),
+        0,
+        "no informational metric in the fixture"
+    );
 
     let improved = noise_findings(
         &base,
@@ -2873,7 +2893,11 @@ fn noise_report_composite_counts_regressed_improved_stable() {
         true,
     );
     assert_eq!(improved.improvements(), 1, "worst_spread 10->5 improves");
-    assert_eq!(improved.regressions(), 0, "nothing regressed on the improving side");
+    assert_eq!(
+        improved.regressions(),
+        0,
+        "nothing regressed on the improving side"
+    );
     assert!(
         improved.stable() >= 1,
         "unchanged total_iterations is counted stable"
@@ -2885,7 +2909,11 @@ fn verdict_label_stays_stable_below_cutoff_cites_direction_above() {
     // Default cutoff 5. Sub-cutoff moves in either direction are likely noise ->
     // STABLE (they are still flagged / counted in the footer). Clearing the
     // cutoff cites that direction; both directions can hold at once.
-    assert_eq!(verdict_label(false, 0, None), "STABLE", "no moves -> stable");
+    assert_eq!(
+        verdict_label(false, 0, None),
+        "STABLE",
+        "no moves -> stable"
+    );
     assert_eq!(
         verdict_label(false, 4, None),
         "STABLE",
@@ -3365,7 +3393,13 @@ fn format_noise_findings_table_default_hides_stable_and_noisy_rows() {
     // summary (never an empty table) under show_all=false. Side A has one run
     // (insufficient) -> every metric classifies Noisy.
     let a = vec![cmp_row("nz", "tiny-1llc", true, 10.0, 2000)];
-    let rep = noise_findings(&a, &noise_side("nz", 30.0, 2000), LEGACY_PAIRING_DIMS, 5.0, true);
+    let rep = noise_findings(
+        &a,
+        &noise_side("nz", 30.0, 2000),
+        LEGACY_PAIRING_DIMS,
+        5.0,
+        true,
+    );
     assert!(
         rep.findings
             .iter()

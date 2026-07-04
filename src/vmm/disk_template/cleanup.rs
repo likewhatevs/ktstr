@@ -548,7 +548,10 @@ mod tests {
         let removed = clean_orphaned_tmp_dirs(&base).expect("sweep");
 
         assert!(!dead_staging.exists(), "dead-pid staging image reclaimed");
-        assert!(!dead_pertest.exists(), "dead-pid per-test backing reclaimed");
+        assert!(
+            !dead_pertest.exists(),
+            "dead-pid per-test backing reclaimed"
+        );
         assert!(!dead_stagedir.exists(), "dead-pid staging dir reclaimed");
         assert!(live_staging.exists(), "live-pid staging image kept");
         assert!(live_pertest.exists(), "live-pid per-test backing kept");

@@ -2348,8 +2348,11 @@ impl KtstrVm {
         // inside VcpuThread) and the coordinator's copy — single-byte
         // volatile writes through `set` from either side address the
         // same MAP_SHARED page.
-        let freeze_coord_ap_ies: Vec<Option<ImmediateExitHandle>> =
-            guard.ap_threads.iter().map(|vt| vt.immediate_exit).collect();
+        let freeze_coord_ap_ies: Vec<Option<ImmediateExitHandle>> = guard
+            .ap_threads
+            .iter()
+            .map(|vt| vt.immediate_exit)
+            .collect();
         // Per-AP `alive` flags paired with the IE handles above. The
         // coordinator's pass-1 kick (in `freeze_and_dispatch`) and
         // `arm_user_watchpoint` gate each `ie.set` on a fresh
@@ -14903,10 +14906,7 @@ mod run_vm_thread_guard_tests {
     /// that it ran. A `Drop` that forgot to set `kill` would hang the join
     /// forever (test timeout); one that detached instead of joining would leave
     /// the `joined` count short.
-    fn kill_watching_worker(
-        kill: Arc<AtomicBool>,
-        joined: Arc<AtomicUsize>,
-    ) -> JoinHandle<()> {
+    fn kill_watching_worker(kill: Arc<AtomicBool>, joined: Arc<AtomicUsize>) -> JoinHandle<()> {
         std::thread::spawn(move || {
             while !kill.load(Ordering::Acquire) {
                 std::thread::yield_now();
