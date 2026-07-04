@@ -699,7 +699,7 @@ pub(crate) fn cpu_util_comp_scale(
 /// (accessor/attach lag) it starts later, so this key reflects a later
 /// workload sub-window. Across a cold/warm boot mix its cross-run magnitude
 /// shifts; use `--noise-adjust` (spread analysis absorbs the boot-timing
-/// jitter) for cross-run compares — a plain `--dual-run` single-pair compare
+/// jitter) for cross-run compares — a plain single-pair (cached) compare
 /// of this key is advisory.
 fn fold_util_comp_scale(
     metrics: &mut std::collections::BTreeMap<String, f64>,
@@ -762,7 +762,7 @@ fn fold_util_comp_scale(
 /// freezes, whose window starts later on a cold boot (the prereq-ready
 /// anchor), so `avg_task_lat_cri`'s cross-run magnitude shifts across a
 /// cold/warm boot mix; use `--noise-adjust` for cross-run compares —
-/// `--dual-run` single-pair is advisory.
+/// a single-pair (cached) compare is advisory.
 fn fold_lat_cri(
     metrics: &mut std::collections::BTreeMap<String, f64>,
     samples_in_phase: &[crate::scenario::sample::Sample<'_>],

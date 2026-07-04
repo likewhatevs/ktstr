@@ -101,7 +101,7 @@ impl InterruptGuard {
 
 /// The signal recorded by a live [`InterruptGuard`], if any — a
 /// free-standing read for code running under a guard a caller installed
-/// (e.g. perf-delta's `dual_run` short-circuiting between child runs).
+/// (e.g. perf-delta's `noise_dual_run` short-circuiting between child runs).
 pub(crate) fn caught() -> Option<libc::c_int> {
     match CAUGHT_SIGNAL.load(Ordering::SeqCst) {
         0 => None,
@@ -187,8 +187,16 @@ mod tests {
             "install clears the interrupted flag"
         );
         let want = handler as *const () as usize;
-        assert_eq!(current(libc::SIGINT), want, "install points SIGINT at handler");
-        assert_eq!(current(libc::SIGTERM), want, "install points SIGTERM at handler");
+        assert_eq!(
+            current(libc::SIGINT),
+            want,
+            "install points SIGINT at handler"
+        );
+        assert_eq!(
+            current(libc::SIGTERM),
+            want,
+            "install points SIGTERM at handler"
+        );
 
         // Synthetic delivery — never `raise`, which would kill the test.
         handler(libc::SIGINT);
@@ -203,7 +211,11 @@ mod tests {
 
         drop(guard);
         assert_eq!(current(libc::SIGINT), libc::SIG_IGN, "drop restores SIGINT");
-        assert_eq!(current(libc::SIGTERM), libc::SIG_IGN, "drop restores SIGTERM");
+        assert_eq!(
+            current(libc::SIGTERM),
+            libc::SIG_IGN,
+            "drop restores SIGTERM"
+        );
 
         // Hand the process back to whatever ran before the test.
         unsafe {

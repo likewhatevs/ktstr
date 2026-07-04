@@ -7,11 +7,12 @@
 //! axis in `run`: HEAD vs a baseline commit, partitioned by `project_commit`
 //! (the sole perf-delta axis — a cross-config question like scheduler A vs B is
 //! answered in-test via the Verdict DSL's `better_across_phases`, not here). The
-//! `--dual-run` and `--noise-adjust` paths PRODUCE both commits'
+//! `--noise-adjust` path PRODUCES both commits'
 //! `performance_mode` sidecars — checking the baseline out into a plain temp
 //! dir via `gix` (`index_from_tree` + `gix::worktree::state::checkout`, no
-//! linked worktree and no `.git`) before invoking `compare_partitions` /
-//! `compare_partitions_noise`.
+//! linked worktree and no `.git`) before invoking `compare_partitions_noise`;
+//! without it, `run` compares sidecars already pooled from a prior run or a
+//! downloaded artifact via `compare_partitions`.
 
 /// How the baseline commit (the "compare-current-to" point) is resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,29 +109,13 @@ pub(crate) fn resolve_baseline(
 }
 
 // ---------------------------------------------------------------------------
-// Dual-run (increment 3b): produce the baseline run in a plain gix checkout
+// Run production (--noise-adjust): check both commits out into plain gix
+// checkouts and run their performance_mode tests
 // ---------------------------------------------------------------------------
 
 use ktstr::flock::{FlockMode, try_flock};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-/// Run-pool leaf the baseline run's sidecars are written to — a
-/// DISTINCT subdir from HEAD's `{kernel}-{HEAD}` default leaf so both
-/// commits' sidecars coexist under the shared [`runs_root`] without
-/// collision. The compare partitions by the sidecar `project_commit`
-/// FIELD (the baseline child records it verbatim from
-/// [`KTSTR_PROJECT_COMMIT_ENV`]), not by this dir name, so the name only
-/// needs to be unique; `baseline_short` (7-hex) makes it so. Absolute
-/// (rooted at the MAIN tree's runs-root) so the checkout-cwd child writes
-/// into the main pool, not the checkout dir's own `target/ktstr`.
-///
-/// [`KTSTR_PROJECT_COMMIT_ENV`]: ktstr::KTSTR_PROJECT_COMMIT_ENV
-///
-/// [`runs_root`]: ktstr::test_support::runs_root
-fn baseline_sidecar_leaf(runs_root_abs: &Path, baseline_short: &str) -> PathBuf {
-    runs_root_abs.join(format!("perf-delta-baseline-{baseline_short}"))
-}
 
 /// Checkout path for the baseline, under `temp_root` (the system temp dir in
 /// production) so the full source checkout never lands inside the runs-root
@@ -319,26 +304,8 @@ fn perf_test_argv(
     v
 }
 
-/// Count `*.ktstr.json` sidecars directly in `dir` (non-recursive). A
-/// missing or unreadable dir counts as `0`. The dual-run path uses this
-/// on the baseline leaf to detect "no `performance_mode` tests produced
-/// any sidecar" and exit cleanly, instead of running the compare into a
-/// confusing empty-pool bail.
-fn count_sidecars(dir: &Path) -> usize {
-    std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.ends_with(".ktstr.json"))
-        })
-        .count()
-}
-
 /// RAII cleanup for the baseline checkout: drop removes the temp dir so an
-/// early return, `?`, or panic in [`dual_run`] — or a record-and-survive
+/// early return, `?`, or panic in [`noise_dual_run`] — or a record-and-survive
 /// Ctrl-C — never leaks it. The checkout is a plain dir (no `.git`), so a
 /// `remove_dir_all` fully reclaims it.
 struct CheckoutGuard {
@@ -587,127 +554,7 @@ fn resolve_kernel_for_children(repo_root: &Path, kernel: &str) -> String {
     }
 }
 
-/// Produce BOTH commits' `performance_mode` sidecars so the compare has
-/// fresh data: check the baseline commit's tree AND the HEAD snapshot
-/// (`head_tree`) out into two plain temp dirs (via `gix`) and run each side's
-/// perf tests in its own checkout (sidecars redirected into the main pool).
-/// Both checkouts are removed on return via [`CheckoutGuard`]. Both children
-/// stamp their `project_commit` from the parent's resolved labels
-/// (`baseline_short` / `head_short`) so the recorded field matches the
-/// compare's pool filter.
-///
-/// Running HEAD in its OWN checkout (not the live working tree) makes the B
-/// side hermetic: editing code during the run cannot perturb the B build, and
-/// a dirty HEAD's snapshot (built once at command start) matches the recorded
-/// `-dirty` label.
-///
-/// A non-zero exit from a child test run is logged but does NOT abort —
-/// some `performance_mode` failures (e.g. LLC-contention) are expected,
-/// and the sidecars that DID get written are still comparable. A
-/// spawn failure (cargo not runnable) IS a hard error.
-#[allow(clippy::too_many_arguments)]
-fn dual_run(
-    repo: &gix::Repository,
-    repo_root: &Path,
-    baseline_tree: gix::ObjectId,
-    head_tree: gix::ObjectId,
-    baseline_short: &str,
-    head_short: &str,
-    kernel: &str,
-    filter: Option<&str>,
-    profile: Option<&str>,
-    nextest_profile: Option<&str>,
-    passthrough: &[String],
-) -> Result<()> {
-    // runs_root() is absolute under the cargo-ktstr orchestrator
-    // (install_runs_root_env stamps KTSTR_RUNS_ROOT), so this join
-    // yields that shared dir — Path::join discards `repo_root` against
-    // an absolute rhs, and both the baseline checkout child and HEAD
-    // inherit KTSTR_RUNS_ROOT and write there. join() also anchors the
-    // relative raw-nextest fallback to repo_root; correct for both.
-    let runs_root_abs = repo_root.join(ktstr::test_support::runs_root());
-    let leaf = baseline_sidecar_leaf(&runs_root_abs, baseline_short);
-    let wt_dir = checkout_dir(&std::env::temp_dir(), baseline_short);
-    let head_wt_dir = checkout_dir(&std::env::temp_dir(), head_short);
-    // Absolutize a relative kernel path so BOTH children (cwd = a temp
-    // checkout) resolve the same tree the main tree does.
-    let kernel_arg = resolve_kernel_for_children(repo_root, kernel);
-
-    // Serialize concurrent perf-delta runs that share a checkout path:
-    // create_checkout_from_tree remove_dir_all's any leftover, which would
-    // destroy a live concurrent run's checkout. The exclusive advisory flock
-    // (OS-released on process death) makes a live concurrent run bail cleanly.
-    // Both locks are declared before both guards so each lock drops AFTER its
-    // checkout is removed (LIFO: guards drop first).
-    let _baseline_lock = acquire_baseline_checkout_lock(&wt_dir, baseline_short)?;
-    let _head_lock = acquire_baseline_checkout_lock(&head_wt_dir, head_short)?;
-    // Create both checkouts, self-healing any leftover from an interrupted
-    // prior run (Ctrl-C / SIGKILL / crash skip CheckoutGuard::drop).
-    create_checkout_from_tree(repo, &wt_dir, baseline_tree, baseline_short)?;
-    let _baseline_guard = CheckoutGuard {
-        wt_dir: wt_dir.clone(),
-    };
-    create_checkout_from_tree(repo, &head_wt_dir, head_tree, head_short)?;
-    let _head_guard = CheckoutGuard {
-        wt_dir: head_wt_dir.clone(),
-    };
-    // Ctrl-C during either checkout: bail before spawning any build. The guards
-    // remove the (possibly partial) checkouts; run() then re-raises 130.
-    if crate::interrupt::caught().is_some() {
-        return Ok(());
-    }
-
-    // Baseline run: in the baseline checkout, perf-only, sidecars into the pool leaf.
-    println!("perf-delta: running baseline {baseline_short} perf tests in checkout");
-    let baseline_status = Command::new("cargo")
-        .current_dir(&wt_dir)
-        .args(perf_test_argv(
-            &kernel_arg,
-            filter,
-            profile,
-            nextest_profile,
-            passthrough,
-        ))
-        .envs(baseline_child_env(&leaf, baseline_short))
-        .status()
-        .with_context(|| format!("spawn baseline `cargo ktstr test` in {}", wt_dir.display()))?;
-    if !baseline_status.success() {
-        eprintln!(
-            "perf-delta: warning: baseline perf run exited {baseline_status} — \
-             comparing the sidecars that were written"
-        );
-    }
-    // Ctrl-C during the baseline run: stop before spawning HEAD. Returning
-    // drops CheckoutGuard (removes the checkout); run() then re-raises 130.
-    if crate::interrupt::caught().is_some() {
-        return Ok(());
-    }
-
-    // HEAD run: in the HEAD snapshot checkout, perf-only, default {kernel}-{HEAD} leaf.
-    println!("perf-delta: running HEAD {head_short} perf tests in checkout");
-    let head_status = Command::new("cargo")
-        .current_dir(&head_wt_dir)
-        .args(perf_test_argv(
-            &kernel_arg,
-            filter,
-            profile,
-            nextest_profile,
-            passthrough,
-        ))
-        .env(ktstr::KTSTR_PERF_ONLY_ENV, "1")
-        .env(ktstr::KTSTR_PROJECT_COMMIT_ENV, head_short)
-        .status()
-        .context("spawn HEAD `cargo ktstr test`")?;
-    if !head_status.success() {
-        eprintln!(
-            "perf-delta: warning: HEAD perf run exited {head_status} — \
-             comparing the sidecars that were written"
-        );
-    }
-    Ok(())
-}
-
-/// `--noise-adjust N` run-production: like [`dual_run`] but loops, writing each
+/// `--noise-adjust N` run-production: loops the two-checkout production, writing each
 /// of the N baseline + N HEAD runs into its OWN sidecar leaf so the N runs per
 /// side accumulate. Two runs of the same test+config write the SAME sidecar
 /// filename — the variant hash covers run-INDEPENDENT identity only (topology /
@@ -743,9 +590,10 @@ fn noise_dual_run(
     let head_wt_dir = checkout_dir(&std::env::temp_dir(), head_short);
     let kernel_arg = resolve_kernel_for_children(repo_root, kernel);
 
-    // Serialize concurrent runs that share a checkout path (see dual_run for the
-    // full rationale). Both locks declared before both guards so each lock drops
-    // after its checkout is removed (LIFO: guards drop first).
+    // Serialize concurrent runs that share a checkout path: create_checkout_from_tree
+    // remove_dir_all's any leftover, so an exclusive advisory flock makes a live
+    // concurrent run bail cleanly. Both locks declared before both guards so each
+    // lock drops after its checkout is removed (LIFO: guards drop first).
     let _baseline_lock = acquire_baseline_checkout_lock(&wt_dir, baseline_short)?;
     let _head_lock = acquire_baseline_checkout_lock(&head_wt_dir, head_short)?;
     // Create both checkouts, self-healing any leftover from an interrupted prior
@@ -769,8 +617,8 @@ fn noise_dual_run(
         // filename, so a single leaf would overwrite all but the last; distinct
         // dirs keep all N. The compare still partitions by project_commit
         // (baseline vs HEAD), not by leaf name.
-        let base_leaf = runs_root_abs.join(format!("perf-delta-noise-base-{baseline_short}-{i}"));
-        let head_leaf = runs_root_abs.join(format!("perf-delta-noise-head-{head_short}-{i}"));
+        let base_leaf = noise_run_leaf(&runs_root_abs, "base", baseline_short, i);
+        let head_leaf = noise_run_leaf(&runs_root_abs, "head", head_short, i);
         println!("perf-delta --noise-adjust: run {}/{runs}", i + 1);
 
         let bs = Command::new("cargo")
@@ -816,6 +664,32 @@ fn noise_dual_run(
     Ok(())
 }
 
+/// Per-run sidecar leaf for the `--noise-adjust` production: `side` is `"base"`
+/// or `"head"`, `short` the commit label, `i` the run index. [`noise_dual_run`]
+/// writes into these and the empty-perf-set guard in [`run`] counts them, so both
+/// must agree on the naming — hence this single source.
+fn noise_run_leaf(runs_root_abs: &Path, side: &str, short: &str, i: usize) -> PathBuf {
+    runs_root_abs.join(format!("perf-delta-noise-{side}-{short}-{i}"))
+}
+
+/// Count `*.ktstr.json` sidecars directly in `dir` (non-recursive). A missing or
+/// unreadable dir counts as `0`. The `--noise-adjust` empty-perf-set guard sums
+/// this over the baseline run leaves to detect "no `performance_mode` test
+/// produced any sidecar" and exit cleanly, instead of running the compare into a
+/// confusing empty-pool bail.
+fn count_sidecars(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.ends_with(".ktstr.json"))
+        })
+        .count()
+}
+
 /// CLI args for `cargo ktstr perf-delta`.
 pub(crate) struct PerfDeltaArgs<'a> {
     /// `--base <commit>` override (skips merge-base).
@@ -832,14 +706,10 @@ pub(crate) struct PerfDeltaArgs<'a> {
     pub relevant: bool,
     /// Branch to merge-base against when no override / env is present.
     pub default_branch: &'a str,
-    /// `--kernel <SPEC>` — required with `--dual-run` (the kernel the
+    /// `--kernel <SPEC>` — required with `--noise-adjust` (the kernel the
     /// baseline and HEAD perf tests boot). `None` is valid only for the
-    /// cached-baseline path (no `--dual-run`), which runs no tests.
+    /// cached-baseline path (no `--noise-adjust`), which runs no tests.
     pub kernel: Option<&'a str>,
-    /// `--dual-run` — produce both commits' runs via a baseline gix
-    /// checkout before comparing, instead of comparing sidecars already
-    /// pooled from prior / downloaded runs.
-    pub dual_run: bool,
     /// `--threshold <PCT>` — uniform relative regression threshold
     /// (percent). Mutually exclusive with `policy`.
     pub threshold: Option<f64>,
@@ -867,9 +737,9 @@ pub(crate) struct PerfDeltaArgs<'a> {
     /// `--noise-adjust <N>` — run each side N times and decide significance from
     /// whether the two sides are SEPARATED (a Welch two-sample t-test, or fully
     /// disjoint `[min, max]` bands) AND the delta is MATERIAL (the registry
-    /// dual-gate), instead of a fixed single-run threshold. Commit axis only — it
-    /// implies the dual-run production, looped N times. `None` = the default
-    /// single-run threshold compare.
+    /// dual-gate). Commit axis only — it PRODUCES N runs per side (each checked
+    /// out into a plain gix checkout). `None` runs no tests and compares sidecars
+    /// already pooled from a prior run or a downloaded artifact.
     pub noise_adjust: Option<usize>,
     /// `--noise-spread-threshold <PCT>` — the per-side relative-spread limit (in
     /// percent) above which `--noise-adjust` ANNOTATES a metric with an advisory
@@ -879,8 +749,8 @@ pub(crate) struct PerfDeltaArgs<'a> {
     /// `--profile <NAME>` — the scheduler-under-test's cargo BUILD profile,
     /// forwarded to BOTH sides' `cargo ktstr test` so baseline and HEAD
     /// build the scheduler identically. `None` leaves it at the release
-    /// default. Only meaningful on the run-producing paths (`--dual-run` /
-    /// `--noise-adjust`); [`run`] rejects it on the paths that run no tests.
+    /// default. Only meaningful on the run-producing path (`--noise-adjust`);
+    /// [`run`] rejects it on the cached-baseline path that runs no tests.
     pub profile: Option<&'a str>,
     /// `--nextest-profile <NAME>` — the nextest test profile, forwarded to
     /// BOTH sides' `cargo ktstr test`. Only meaningful on the run-producing
@@ -889,10 +759,10 @@ pub(crate) struct PerfDeltaArgs<'a> {
     /// cargo/nextest flags forwarded verbatim to BOTH sides' `cargo ktstr
     /// test` → `cargo nextest run` (e.g. `--features integration,wprof`);
     /// no `--` separator required (but native flags must precede it — see
-    /// the CLI `args` doc). Only meaningful on the run-producing paths
-    /// (`--dual-run` / `--noise-adjust`); [`run`] rejects a non-empty
-    /// passthrough on the cached-baseline path (which runs no tests) rather
-    /// than silently dropping it.
+    /// the CLI `args` doc). Only meaningful on the run-producing path
+    /// (`--noise-adjust`); [`run`] rejects a non-empty passthrough on the
+    /// cached-baseline path (which runs no tests) rather than silently
+    /// dropping it.
     pub passthrough: &'a [String],
 }
 
@@ -901,9 +771,9 @@ pub(crate) struct PerfDeltaArgs<'a> {
 /// compare pairs per-scenario and applies each metric's polarity +
 /// abs/rel thresholds on the COMMIT axis: HEAD vs a baseline commit,
 /// partitioned by `project_commit`. Sidecars come either from the pool
-/// already (cached-baseline) or from `--dual-run`, which [`dual_run`]
-/// PRODUCES in a plain gix checkout (baseline) + the working tree
-/// (HEAD), both `performance_mode`-only and `-E`-narrowed. (Cross-config
+/// already (cached-baseline) or from `--noise-adjust`, which [`noise_dual_run`]
+/// PRODUCES by checking BOTH commits out into plain gix checkouts (no `.git`)
+/// and running their `performance_mode`-only, `-E`-narrowed tests. (Cross-config
 /// questions — e.g. scheduler A vs B — are answered in-test via the
 /// Verdict DSL's `better_across_phases`, not by this command.)
 pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
@@ -922,11 +792,10 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
 
     // Fail loud rather than SILENTLY DROP the build-shaping flags: the
     // cargo/nextest passthrough AND `--profile` / `--nextest-profile` only
-    // reach a `cargo ktstr test` run on the run-PRODUCING paths
-    // (--dual-run / --noise-adjust N). The cached-baseline compare runs no
-    // tests, so any of these there would vanish with no effect — surface the
-    // misuse instead.
-    let runs_tests = args.dual_run || args.noise_adjust.is_some();
+    // reach a `cargo ktstr test` run on the run-PRODUCING path
+    // (--noise-adjust N). The cached-baseline compare runs no tests, so any of
+    // these there would vanish with no effect — surface the misuse instead.
+    let runs_tests = args.noise_adjust.is_some();
     if !runs_tests
         && (!args.passthrough.is_empty()
             || args.profile.is_some()
@@ -934,10 +803,10 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
     {
         anyhow::bail!(
             "build-shaping flags (cargo/nextest passthrough {:?}, --profile {:?}, \
-             --nextest-profile {:?}) are only applied by the run-producing paths \
-             (--dual-run / --noise-adjust N); this invocation compares already-pooled \
-             sidecars and runs no tests, so they would be ignored. Add --dual-run \
-             (or --noise-adjust N), or drop the flags.",
+             --nextest-profile {:?}) are only applied by the run-producing path \
+             (--noise-adjust N); this invocation compares already-pooled sidecars \
+             and runs no tests, so they would be ignored. Add --noise-adjust N, \
+             or drop the flags.",
             args.passthrough,
             args.profile,
             args.nextest_profile,
@@ -971,9 +840,9 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
     // `--relevant`: fold the change-scoped filterset into the effective `-E`
     // used for BOTH sides. `relevant_test_filter` returns `None` for a broad /
     // unattributable change (do not narrow -> fall back to the user's `--filter`)
-    // and `Some("none()")` for a docs-only change (narrow to nothing -> the
-    // dual-run produces no sidecars and exits cleanly below). The composed
-    // expression intersects (`&`) so it narrows, never widens.
+    // and `Some("none()")` for a docs-only change (narrow to nothing -> the run
+    // produces no sidecars and the empty-perf-set guard below exits cleanly (0)). The
+    // composed expression intersects (`&`) so it narrows, never widens.
     let relevant_expr = if args.relevant {
         crate::affected::relevant_test_filter(args.base, args.base_ref, args.default_branch)
             .context("compute --relevant perf-delta test set")?
@@ -991,7 +860,7 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
         effective_filter.unwrap_or("all performance_mode tests")
     );
 
-    // Noise-adjusted axis: produce N runs per side (looped dual-run into
+    // Noise-adjusted axis: produce N runs per side (looped run production into
     // per-run leaves), then compare from the observed spread instead of a fixed
     // threshold. Commit axis only.
     if let Some(n) = args.noise_adjust {
@@ -1023,6 +892,25 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
                 n,
             ),
         )?;
+        // If the perf run produced no sidecars at all — no
+        // `#[ktstr_test(performance_mode)]` tests are defined, or `-E` / `--relevant`
+        // narrowed the selection to none — there is nothing to compare. Exit cleanly
+        // (Ok(0)) rather than letting compare_partitions_noise bail on an empty pool.
+        // All N runs share the baseline selection, so the total across the baseline
+        // leaves is zero iff no perf test ran. (The deleted `--dual-run` path carried
+        // the same guard on its single leaf.)
+        let runs_root_abs = cwd.join(ktstr::test_support::runs_root());
+        let baseline_sidecars: usize = (0..n)
+            .map(|i| count_sidecars(&noise_run_leaf(&runs_root_abs, "base", &baseline, i)))
+            .sum();
+        if baseline_sidecars == 0 {
+            println!(
+                "perf-delta: no performance_mode sidecars produced at baseline {baseline} \
+                 — nothing to compare (define #[ktstr_test(performance_mode)] tests, or widen \
+                 the -E filter, to enable the delta)"
+            );
+            return Ok(0);
+        }
         let threshold = args.noise_spread_threshold.unwrap_or(5.0);
         let build = crate::stats::BuildCompareFilters {
             a_project_commit: vec![baseline.clone()],
@@ -1038,51 +926,6 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
             &args.phase_display,
             &gate,
         );
-    }
-
-    if args.dual_run {
-        let kernel = args
-            .kernel
-            .context("--dual-run requires --kernel (the kernel both perf runs boot)")?;
-        // Snapshot both trees ONCE at command start (hermetic HEAD/B side).
-        let (baseline_tree, head_snapshot_tree) = resolve_run_trees(&repo, baseline_oid)?;
-        // Reclaim cross-baseline orphaned checkouts, then survive Ctrl-C
-        // so CheckoutGuard::drop runs and the interrupt propagates as 130.
-        sweep_stale_checkouts(&std::env::temp_dir());
-        let interrupt_guard = crate::interrupt::InterruptGuard::install();
-        finish_or_reraise(
-            interrupt_guard,
-            dual_run(
-                &repo,
-                &cwd,
-                baseline_tree,
-                head_snapshot_tree,
-                &baseline,
-                &head,
-                kernel,
-                effective_filter,
-                args.profile,
-                args.nextest_profile,
-                args.passthrough,
-            ),
-        )?;
-        // If the baseline run produced no sidecars, no `performance_mode`
-        // tests were selected (none are defined yet, or the `-E` filter
-        // matched none). There is nothing to compare — exit cleanly
-        // rather than letting the compare bail on an empty pool. HEAD
-        // runs the same selection, so a zero-baseline implies no delta
-        // is computable regardless of HEAD's output.
-        // Absolute runs_root() (orchestrator-stamped) makes this join
-        // return the shared dir; relative falls back anchored to cwd.
-        let leaf = baseline_sidecar_leaf(&cwd.join(ktstr::test_support::runs_root()), &baseline);
-        if count_sidecars(&leaf) == 0 {
-            println!(
-                "perf-delta: no performance_mode sidecars produced at baseline {baseline} \
-                 — nothing to compare (define #[ktstr_test(performance_mode)] tests, or widen \
-                 the -E filter, to enable the delta)"
-            );
-            return Ok(0);
-        }
     }
 
     // Reuse the stats-compare engine: partition the pooled sidecars by
@@ -1279,20 +1122,7 @@ mod tests {
         );
     }
 
-    // ---- dual-run pure helpers (increment 3b) ----
-
-    #[test]
-    fn baseline_sidecar_leaf_is_distinct_subdir_of_runs_root() {
-        let root = Path::new("/work/target/ktstr");
-        let leaf = baseline_sidecar_leaf(root, "abc1234");
-        assert_eq!(
-            leaf,
-            Path::new("/work/target/ktstr/perf-delta-baseline-abc1234")
-        );
-        // A distinct baseline yields a distinct leaf (no collision); and
-        // neither collides with HEAD's `{kernel}-{HEAD}` default leaf.
-        assert_ne!(leaf, baseline_sidecar_leaf(root, "def5678"));
-    }
+    // ---- checkout / child-run pure helpers ----
 
     #[test]
     fn checkout_dir_under_temp_root() {
@@ -1300,6 +1130,37 @@ mod tests {
             checkout_dir(Path::new("/tmp"), "abc1234"),
             Path::new("/tmp/ktstr-perf-delta-co-abc1234"),
         );
+    }
+
+    #[test]
+    fn noise_run_leaf_names_per_side_per_run() {
+        let root = Path::new("/work/target/ktstr");
+        assert_eq!(
+            noise_run_leaf(root, "base", "abc1234", 0),
+            Path::new("/work/target/ktstr/perf-delta-noise-base-abc1234-0"),
+        );
+        assert_eq!(
+            noise_run_leaf(root, "head", "def5678", 2),
+            Path::new("/work/target/ktstr/perf-delta-noise-head-def5678-2"),
+        );
+    }
+
+    #[test]
+    fn count_sidecars_counts_ktstr_json_and_zero_for_missing() {
+        let base = std::env::temp_dir().join(format!("ktstr-pd-count-{}", std::process::id()));
+        // A missing directory counts as zero (the no-perf-tests-ran case the
+        // empty-perf-set guard exits cleanly on).
+        assert_eq!(count_sidecars(&base.join("absent")), 0);
+        std::fs::create_dir_all(&base).expect("mk tempdir");
+        std::fs::write(base.join("a.ktstr.json"), "{}").expect("write a");
+        std::fs::write(base.join("b.ktstr.json"), "{}").expect("write b");
+        std::fs::write(base.join("notes.txt"), "x").expect("write txt");
+        assert_eq!(
+            count_sidecars(&base),
+            2,
+            "only *.ktstr.json sidecars count, not sibling files",
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -1347,7 +1208,10 @@ mod tests {
 
         sweep_stale_checkouts(&base);
 
-        assert!(!unlocked.exists(), "an unlocked orphan checkout is reclaimed");
+        assert!(
+            !unlocked.exists(),
+            "an unlocked orphan checkout is reclaimed"
+        );
         assert!(
             !checkout_lock_path(&unlocked).exists(),
             "the reclaimed orphan's sibling .lock is removed too (no lock debris)"
@@ -1472,8 +1336,11 @@ mod tests {
             let mut cfg = gix::config::File::new(gix::config::file::Metadata::api());
             cfg.set_raw_value(gitoxide::Author::NAME_FALLBACK, "ktstr-test")
                 .expect("author name fallback");
-            cfg.set_raw_value(gitoxide::Author::EMAIL_FALLBACK, "ktstr-test@example.invalid")
-                .expect("author email fallback");
+            cfg.set_raw_value(
+                gitoxide::Author::EMAIL_FALLBACK,
+                "ktstr-test@example.invalid",
+            )
+            .expect("author email fallback");
             repo.config_snapshot_mut().append(cfg);
         }
         let mut entries: Vec<gix::objs::tree::Entry> = files
@@ -1517,7 +1384,10 @@ mod tests {
         std::fs::write(repo_dir.join("file.txt"), b"v2\n").expect("dirty the worktree");
 
         let snap = build_head_snapshot_tree(&repo, head_tree, true).expect("build snapshot");
-        assert_ne!(snap, head_tree, "a dirty snapshot must differ from HEAD's tree");
+        assert_ne!(
+            snap, head_tree,
+            "a dirty snapshot must differ from HEAD's tree"
+        );
         let wt = base.join("checkout");
         create_checkout_from_tree(&repo, &wt, snap, "head").expect("checkout snapshot");
         assert_eq!(
@@ -1548,8 +1418,11 @@ mod tests {
                 oid: blob_v2,
             }],
         };
-        let tree_v2_id: gix::ObjectId = repo.write_object(&tree_v2).expect("write v2 tree").detach();
-        let mut idx = repo.index_from_tree(&tree_v2_id).expect("index_from_tree v2");
+        let tree_v2_id: gix::ObjectId =
+            repo.write_object(&tree_v2).expect("write v2 tree").detach();
+        let mut idx = repo
+            .index_from_tree(&tree_v2_id)
+            .expect("index_from_tree v2");
         idx.write(gix::index::write::Options::default())
             .expect("persist v2 index");
         // Revert the worktree to v1 (== HEAD): now index=v2 but worktree=v1.
@@ -1587,8 +1460,10 @@ mod tests {
         let base = std::env::temp_dir().join(format!("ktstr-pd-snap-untr-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let repo_dir = base.join("repo");
-        let (repo, head_tree) =
-            init_committed_repo(&repo_dir, &[("file.txt", b"v1\n"), (".gitignore", b"ignore.me\n")]);
+        let (repo, head_tree) = init_committed_repo(
+            &repo_dir,
+            &[("file.txt", b"v1\n"), (".gitignore", b"ignore.me\n")],
+        );
         std::fs::write(repo_dir.join("new.rs"), b"fn wip() {}\n").expect("untracked WIP");
         std::fs::write(repo_dir.join("ignore.me"), b"scratch\n").expect("ignored scratch");
 
@@ -1612,8 +1487,10 @@ mod tests {
         let base = std::env::temp_dir().join(format!("ktstr-pd-snap-del-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let repo_dir = base.join("repo");
-        let (repo, head_tree) =
-            init_committed_repo(&repo_dir, &[("keep.txt", b"keep\n"), ("gone.txt", b"gone\n")]);
+        let (repo, head_tree) = init_committed_repo(
+            &repo_dir,
+            &[("keep.txt", b"keep\n"), ("gone.txt", b"gone\n")],
+        );
         std::fs::remove_file(repo_dir.join("gone.txt")).expect("delete gone.txt");
 
         let snap = build_head_snapshot_tree(&repo, head_tree, true).expect("build snapshot");
@@ -1639,8 +1516,11 @@ mod tests {
         let (repo, head_tree) = init_committed_repo(&repo_dir, &[("run.sh", b"#!/bin/sh\n")]);
         // Worktree copy: modified AND made executable.
         std::fs::write(repo_dir.join("run.sh"), b"#!/bin/sh\necho hi\n").expect("edit");
-        std::fs::set_permissions(repo_dir.join("run.sh"), std::fs::Permissions::from_mode(0o755))
-            .expect("chmod +x");
+        std::fs::set_permissions(
+            repo_dir.join("run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod +x");
 
         let snap = build_head_snapshot_tree(&repo, head_tree, true).expect("build snapshot");
         let wt = base.join("checkout");
@@ -1685,23 +1565,6 @@ mod tests {
             .expect("lock frees for the next run once released");
         drop(after);
         let _ = std::fs::remove_file(&lock_path);
-    }
-
-    #[test]
-    fn count_sidecars_counts_ktstr_json_and_zero_for_missing() {
-        let base = std::env::temp_dir().join(format!("ktstr-pd-count-{}", std::process::id()));
-        // A missing directory counts as zero (the no-tests-ran case).
-        assert_eq!(count_sidecars(&base.join("absent")), 0);
-        std::fs::create_dir_all(&base).expect("mk tempdir");
-        std::fs::write(base.join("a.ktstr.json"), "{}").expect("write a");
-        std::fs::write(base.join("b.ktstr.json"), "{}").expect("write b");
-        std::fs::write(base.join("notes.txt"), "x").expect("write txt");
-        assert_eq!(
-            count_sidecars(&base),
-            2,
-            "only *.ktstr.json sidecars count, not sibling files",
-        );
-        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

@@ -156,9 +156,9 @@ tree copied off a CI host). They do NOT consult
 4. **Compare** HEAD against a baseline commit (regression gate):
 
    ```sh
-   cargo ktstr perf-delta --dual-run --kernel 6.14            # HEAD vs merge-base(HEAD, main)
-   cargo ktstr perf-delta --base abc1234                      # vs an explicit baseline commit
-   cargo ktstr perf-delta --dual-run --kernel 6.14 -E cgroup_steady  # narrow the perf set
+   cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14        # HEAD vs merge-base(HEAD, main)
+   cargo ktstr perf-delta --base abc1234                        # vs an explicit baseline commit
+   cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14 -E cgroup_steady  # narrow the perf set
    ```
 
    `perf-delta` pairs the baseline commit's `performance_mode`

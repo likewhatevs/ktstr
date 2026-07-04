@@ -92,7 +92,6 @@ fn parse_perf_delta_flags_and_defaults() {
         "perf::",
         "--kernel",
         "6.14",
-        "--dual-run",
         "--threshold",
         "12.5",
     ])
@@ -105,7 +104,6 @@ fn parse_perf_delta_flags_and_defaults() {
             relevant,
             default_branch,
             kernel,
-            dual_run,
             threshold,
             policy,
             noise_adjust,
@@ -133,7 +131,6 @@ fn parse_perf_delta_flags_and_defaults() {
             assert!(!relevant, "--relevant defaults off");
             assert_eq!(default_branch, "main", "default branch defaults to main");
             assert_eq!(kernel.as_deref(), Some("6.14"));
-            assert!(dual_run, "--dual-run flag sets dual_run");
             assert_eq!(threshold, Some(12.5));
             assert!(policy.is_none());
             assert!(
@@ -155,7 +152,7 @@ fn parse_perf_delta_flags_and_defaults() {
         }
         _ => panic!("expected PerfDelta"),
     }
-    // Bare invocation: overrides None, default branch = main, no dual-run.
+    // Bare invocation: overrides None, default branch = main, no run production.
     let Cargo {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "perf-delta"]).unwrap_or_else(|e| panic!("{e}"));
@@ -167,7 +164,6 @@ fn parse_perf_delta_flags_and_defaults() {
             relevant,
             default_branch,
             kernel,
-            dual_run,
             threshold,
             policy,
             noise_adjust,
@@ -196,7 +192,6 @@ fn parse_perf_delta_flags_and_defaults() {
             assert!(!relevant, "bare perf-delta defaults --relevant off");
             assert_eq!(default_branch, "main");
             assert!(kernel.is_none());
-            assert!(!dual_run, "--dual-run defaults off (cached-baseline path)");
             assert!(threshold.is_none() && policy.is_none());
             assert!(
                 !no_phases
@@ -204,7 +199,7 @@ fn parse_perf_delta_flags_and_defaults() {
                     && !steps_only
                     && phase.is_none()
                     && phase_threshold.is_none(),
-                "phase flags default off (full per-phase render)",
+                "phase flags default off (meaningful rows shown by default)",
             );
             assert!(noise_adjust.is_none() && noise_spread_threshold.is_none());
             assert!(
@@ -288,9 +283,9 @@ fn parse_perf_delta_flags_and_defaults() {
         .is_err(),
         "--noise-spread-threshold alone must fail (requires --noise-adjust)",
     );
-    // Noise axis conflicts with --threshold / --policy / --dual-run — the noise
-    // branch returns before any of them is used, so a clap conflict prevents them
-    // being silently ignored.
+    // Noise axis conflicts with --threshold / --policy — the noise branch returns
+    // before either is used, so a clap conflict prevents them being silently
+    // ignored.
     assert!(
         Cargo::try_parse_from([
             "cargo",
@@ -303,18 +298,6 @@ fn parse_perf_delta_flags_and_defaults() {
         ])
         .is_err(),
         "--noise-adjust must conflict with --threshold",
-    );
-    assert!(
-        Cargo::try_parse_from([
-            "cargo",
-            "ktstr",
-            "perf-delta",
-            "--noise-adjust",
-            "3",
-            "--dual-run"
-        ])
-        .is_err(),
-        "--noise-adjust must conflict with --dual-run",
     );
     // --threshold and --policy are mutually exclusive.
     assert!(
@@ -398,7 +381,8 @@ fn parse_perf_delta_with_profiles() {
         "cargo",
         "ktstr",
         "perf-delta",
-        "--dual-run",
+        "--noise-adjust",
+        "3",
         "--kernel",
         "6.14",
         "--profile",
@@ -4136,4 +4120,37 @@ fn parse_perf_delta_removed_ab_flag_is_clean_unknown_flag_error() {
             );
         }
     }
+}
+
+/// `--dual-run` was removed (single-run production could not distinguish a real
+/// regression from run-to-run noise; use `--noise-adjust N` for fresh runs). It
+/// must now be a clean UnknownArgument error, not silently forwarded to the
+/// nextest passthrough.
+#[test]
+fn parse_perf_delta_dual_run_removed_is_unknown_flag_error() {
+    let raw: Vec<std::ffi::OsString> = [
+        "cargo",
+        "ktstr",
+        "perf-delta",
+        "--dual-run",
+        "--kernel",
+        "6.14",
+    ]
+    .iter()
+    .map(std::ffi::OsString::from)
+    .collect();
+    let rewritten = crate::argsplit::rewrite(&Cargo::command(), &raw);
+    let err = Cargo::try_parse_from(&rewritten)
+        .err()
+        .unwrap_or_else(|| panic!("--dual-run must be rejected, not forwarded to nextest"));
+    assert_eq!(
+        err.kind(),
+        clap::error::ErrorKind::UnknownArgument,
+        "--dual-run must yield a clean UnknownArgument error; got {:?}",
+        err.kind(),
+    );
+    assert!(
+        err.to_string().contains("--dual-run"),
+        "the error must name --dual-run; got: {err}",
+    );
 }

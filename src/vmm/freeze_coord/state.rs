@@ -198,7 +198,7 @@ pub(super) fn periodic_tag(idx: u32) -> String {
 /// (`avg_cpu_util_comp_scale`, `avg_task_lat_cri`) toward their idle
 /// floor. `avg_cpu_util_comp_scale` is the verdict-affecting one (a
 /// LowerBetter first-to-last cpustat-delta RATIO), so under the old form
-/// its cold-vs-warm dilution was a systematic `--dual-run` perf-delta
+/// its cold-vs-warm dilution was a systematic single-run perf-delta
 /// skew (baseline cold, HEAD warm); `avg_task_lat_cri` is Informational
 /// (verdict-inert — its compare-path delta never counts toward the
 /// regression verdict), so clamping it is a sampling-fidelity gain, not a

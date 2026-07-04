@@ -139,13 +139,21 @@ fn owned_flags(sub: &clap::Command) -> (HashMap<String, bool>, HashMap<char, boo
 /// nextest passthrough) so clap emits a clean top-level "unexpected argument"
 /// error rather than forwarding them to the inner tool as a confusing nested
 /// error. Names carry NO leading `--` (matching the `longs` keys). Empty for
-/// every subcommand except `perf-delta`, whose per-side A/B axis
-/// (`--a-scheduler` / `--b-scheduler` / `--a-topology` / `--b-topology`) was
-/// removed; cross-config comparison now lives in-test in the Verdict DSL
-/// (`better_across_phases`), so those flags no longer exist on the command.
+/// every subcommand except `perf-delta`, which removed its per-side A/B axis
+/// (`--a-scheduler` / `--b-scheduler` / `--a-topology` / `--b-topology` —
+/// cross-config comparison now lives in-test in the Verdict DSL's
+/// `better_across_phases`) and `--dual-run` (a single run per side could not
+/// separate a real regression from run-to-run noise; use `--noise-adjust N`
+/// for fresh runs).
 fn rejected_flags(sub_name: &str) -> &'static [&'static str] {
     match sub_name {
-        "perf-delta" => &["a-scheduler", "b-scheduler", "a-topology", "b-topology"],
+        "perf-delta" => &[
+            "a-scheduler",
+            "b-scheduler",
+            "a-topology",
+            "b-topology",
+            "dual-run",
+        ],
         _ => &[],
     }
 }

@@ -339,10 +339,9 @@ pub(crate) enum KtstrCommand {
     /// baseline commit, exiting non-zero when a metric regresses past
     /// its threshold. Resolves the baseline (branch merge-base, a PR
     /// target via `$GITHUB_BASE_REF`, or an explicit `--base`), then
-    /// either compares already-pooled sidecars or (with `--dual-run`)
-    /// produces both commits' runs first and compares them, reusing the
-    /// shared `compare_partitions` regression engine to pair on scenario and emit
-    /// the verdict.
+    /// either compares already-pooled sidecars or (with `--noise-adjust`)
+    /// produces N runs per side first and compares them from the observed
+    /// spread, pairing on scenario to emit the verdict.
     PerfDelta {
         /// Override the baseline commit directly (skips merge-base). The
         /// testability / cached-baseline knob: diff HEAD against any
@@ -371,17 +370,10 @@ pub(crate) enum KtstrCommand {
         #[arg(long, default_value = "main")]
         default_branch: String,
         /// Kernel the baseline + HEAD `performance_mode` runs boot.
-        /// Required with `--dual-run`; same `--kernel <SPEC>` form as
+        /// Required with `--noise-adjust`; same `--kernel <SPEC>` form as
         /// `cargo ktstr test`. Unused on the cached-baseline path.
         #[arg(long)]
         kernel: Option<String>,
-        /// Produce both commits' runs before comparing: check the
-        /// baseline out in a detached git worktree and run its
-        /// `performance_mode` tests there, run HEAD's in the working
-        /// tree, then compare. Without it, compares sidecars already
-        /// pooled from a prior run or a downloaded CI artifact.
-        #[arg(long)]
-        dual_run: bool,
         /// Uniform relative significance threshold in percent (e.g. 10
         /// for 10%), overriding every metric's registry default — the
         /// knob a CI perf-gate tightens or loosens. Sugar for a
@@ -400,15 +392,15 @@ pub(crate) enum KtstrCommand {
         /// or fully disjoint `[min, max]` bands — AND the delta is MATERIAL (the
         /// registry dual-gate), instead of a fixed `--threshold`. A high per-side
         /// spread (over `--noise-spread-threshold`) is an ADVISORY annotation
-        /// only and never suppresses a confident regression. Implies the dual-run
-        /// production, looped N times; commit axis only (needs `--kernel`). N must
+        /// only and never suppresses a confident regression. Produces N runs per
+        /// side; commit axis only (needs `--kernel`). N must
         /// be >= 2: variance and the Welch test need at least two runs per side
         /// (>= 5 recommended for a well-powered test).
         #[arg(
             long,
             value_name = "N",
             value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(2..),
-            conflicts_with_all = ["threshold", "policy", "dual_run"],
+            conflicts_with_all = ["threshold", "policy"],
         )]
         noise_adjust: Option<usize>,
         /// Per-side relative-spread limit in percent above which `--noise-adjust`
@@ -515,18 +507,18 @@ pub(crate) enum KtstrCommand {
         /// Cargo BUILD profile for the scheduler-under-test on BOTH
         /// sides' `cargo ktstr test` (see `cargo ktstr test --profile`).
         /// Omitted, the scheduler builds `release`. Only meaningful on the
-        /// dual-run / noise-adjust production path (the cached-baseline
-        /// path runs nothing).
+        /// `--noise-adjust` production path (the cached-baseline path runs
+        /// nothing).
         #[arg(long)]
         profile: Option<String>,
         /// NEXTEST test profile forwarded to BOTH sides' `cargo ktstr
         /// test` as `--nextest-profile <NAME>` (see `cargo ktstr test
-        /// --nextest-profile`). Only meaningful on the dual-run /
-        /// noise-adjust production path.
+        /// --nextest-profile`). Only meaningful on the `--noise-adjust`
+        /// production path.
         #[arg(long)]
         nextest_profile: Option<String>,
         /// cargo/nextest flags forwarded verbatim to BOTH sides'
-        /// `cargo ktstr test` on the dual-run / noise-adjust production
+        /// `cargo ktstr test` on the `--noise-adjust` production
         /// path (e.g. `--features integration,wprof`). Native flags may
         /// appear in ANY order relative to these (the argv split routes
         /// by name), so no `--` separator is required; to forward a token

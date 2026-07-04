@@ -716,7 +716,7 @@ cargo ktstr stats list                                        # list runs
 cargo ktstr stats list-metrics                                # list registered regression metrics
 cargo ktstr stats list-values                                 # distinct filter values present in the pool
 cargo ktstr stats show-host --run RUN_ID                       # archived host context for a run
-cargo ktstr perf-delta --dual-run --kernel 6.14               # regression-gate HEAD vs a baseline commit
+cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14         # regression-gate HEAD vs a baseline commit
 cargo ktstr stats explain-sidecar --run RUN_ID                                   # diagnose Option-field absences
 ```
 
@@ -1056,12 +1056,12 @@ request. See the [A/B Compare Branches](../recipes/ab-compare.md) recipe
 for a worked walkthrough.
 
 ```sh
-cargo ktstr perf-delta --dual-run --kernel 6.14            # HEAD vs merge-base(HEAD, main)
-cargo ktstr perf-delta --dual-run --kernel 6.14 --base-ref release  # vs merge-base(HEAD, release)
-cargo ktstr perf-delta --base abc1234                      # vs an explicit commit, cached sidecars
-cargo ktstr perf-delta --dual-run --kernel 6.14 -E perf_throughput  # narrow within performance_mode
-cargo ktstr perf-delta --dual-run --kernel 6.14 --threshold 5       # 5% uniform regression gate
-cargo ktstr perf-delta --dual-run --kernel 6.14 --must-fail worst_spread  # also fail if worst_spread regresses, any count
+cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14           # HEAD vs merge-base(HEAD, main)
+cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14 --base-ref release  # vs merge-base(HEAD, release)
+cargo ktstr perf-delta --base abc1234                           # vs an explicit commit, cached sidecars
+cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14 -E perf_throughput  # narrow within performance_mode
+cargo ktstr perf-delta --base abc1234 --threshold 5             # cached compare, 5% uniform gate
+cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14 --must-fail worst_spread  # also fail if worst_spread regresses, any count
 ```
 
 **Baseline resolution** (highest precedence first):
@@ -1090,15 +1090,15 @@ at the same commit — is answered in-test via the Verdict DSL's
   under the runs-root from a prior run or a downloaded CI artifact. The
   caller supplies both runs; perf-delta only resolves the pair and
   compares.
-- **`--dual-run`** — PRODUCES both runs first: it checks the baseline
-  commit out in a detached `git worktree` and runs its
-  `performance_mode` tests there (sidecars redirected into the main
-  pool), runs HEAD's in the working tree, then compares. Both ends run
+- **`--noise-adjust N`** — PRODUCES both runs first: it checks BOTH the
+  baseline commit and the HEAD snapshot out into their own plain `gix`
+  checkouts (no `.git`, no linked worktree), runs each side's
+  `performance_mode` tests N times (sidecars redirected into the main
+  pool), then compares from the observed spread. Both ends run
   `KTSTR_PERF_ONLY=1` so only `performance_mode` tests execute, narrowed
-  by `-E`. The worktree is removed on return. `gix` has no
-  worktree-creation API, so this shells `git worktree add/remove` —
-  `git` must be on `PATH`. A non-zero child test exit is logged but does
-  not abort; the sidecars that were written are still compared.
+  by `-E`. The checkouts are removed on return. A non-zero child test
+  exit is logged but does not abort; the sidecars that were written are
+  still compared.
 
 If no `performance_mode` sidecars are produced at the baseline (none
 are defined yet, or `-E` matched none), the command prints a notice and
@@ -1106,10 +1106,9 @@ exits `0` — an empty perf set is "nothing to compare", not a failure.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--dual-run` | off | Produce both runs via a baseline worktree before comparing (else compare already-pooled sidecars). |
-| `--kernel SPEC` | — | Kernel both runs boot. Required with `--dual-run`. Same `--kernel` form as `cargo ktstr test`. |
-| `--profile NAME` | release | Cargo BUILD profile for the scheduler-under-test on BOTH sides' `cargo ktstr test` (see `cargo ktstr test --profile`). Only meaningful on the run-producing path (`--dual-run` / `--noise-adjust`). |
-| `--nextest-profile NAME` | nextest default | Nextest TEST profile forwarded to BOTH sides' `cargo ktstr test`. Only meaningful on the run-producing path (`--dual-run` / `--noise-adjust`). |
+| `--kernel SPEC` | — | Kernel both runs boot. Required with `--noise-adjust`. Same `--kernel` form as `cargo ktstr test`. |
+| `--profile NAME` | release | Cargo BUILD profile for the scheduler-under-test on BOTH sides' `cargo ktstr test` (see `cargo ktstr test --profile`). Only meaningful on the run-producing path (`--noise-adjust`). |
+| `--nextest-profile NAME` | nextest default | Nextest TEST profile forwarded to BOTH sides' `cargo ktstr test`. Only meaningful on the run-producing path (`--noise-adjust`). |
 | `--base COMMIT` | — | Explicit baseline commit-ish (skips merge-base). |
 | `--base-ref REF` | — | Ref to merge-base against. |
 | `--default-branch BRANCH` | `main` | Merge-base target when no `--base`/`--base-ref`/`$GITHUB_BASE_REF`. |
@@ -1119,7 +1118,7 @@ exits `0` — an empty perf set is "nothing to compare", not a failure.
 | `--policy PATH` | registry defaults | Per-metric threshold JSON. Mutually exclusive with `--threshold`. Schema: `{ "default_percent": N, "per_metric_percent": { "worst_spread": 5.0, ... } }` (priority: per-metric override → `default_percent` → each metric's registry `default_rel`). |
 | `--fail-threshold N` | `5` | Fail the run only when at least N metrics regress, so a handful of one-off noisy regressions doesn't flip CI red. `--fail-threshold 1` restores fail-on-any; `0` disables the count gate (only `--must-fail` can then fail). Counts confident regressions; suppressed rows still count. |
 | `--must-fail M1,M2,...` | none | Registry metric names (from `cargo ktstr stats list-metrics`) that fail the run if ANY of them regresses, regardless of `--fail-threshold` (ORed on top of the count gate). Names that could never fire the gate are rejected up front: unknown names, internal rate components, per-phase-only metrics, and — without `--noise-adjust` — whole-run distribution metrics (read only per-run) and informational metrics (no regression direction on the default comparison). |
-| `--noise-adjust N` | off | Self-tuning noise mode (requires `--kernel`): run each side N times and gate a confident regression on the two sides being SEPARATED (a two-sided Welch t-test at alpha=0.05, or fully disjoint `[min, max]` bands) AND MATERIAL (the registry `default_abs`/`default_rel` dual-gate), instead of a fixed `--threshold`. Implies dual-run production looped N times. Conflicts with `--threshold`, `--policy`, and `--dual-run`. |
+| `--noise-adjust N` | off | Self-tuning noise mode (requires `--kernel`, N >= 2): PRODUCES N runs per side and gates a confident regression on the two sides being SEPARATED (a two-sided Welch t-test at alpha=0.05, or fully disjoint `[min, max]` bands) AND MATERIAL (the registry `default_abs`/`default_rel` dual-gate), instead of a fixed `--threshold`. Conflicts with `--threshold` and `--policy`. |
 | `--noise-spread-threshold PCT` | `5.0` | Per-side relative-spread limit (percent) above which `--noise-adjust` adds an ADVISORY "noisy spread" annotation to a metric's row. Advisory only — never suppresses a confident regression. Requires `--noise-adjust`. |
 | `--no-phases` / `--phases-only` / `--steps-only` / `--phase N` / `--phase-threshold PCT` | per-phase render (meaningful rows) | Per-phase output projection for the `--noise-adjust` spread block (render-only; does not change the verdict). Each **requires `--noise-adjust`** — per-phase output exists only on the noise-adjusted path. Like the aggregate table, the per-phase spread block shows only meaningful rows by default; pass `--all-metrics` to include stable / noisy rows. |
 | `--all-metrics` | off | Show every compared metric row on BOTH the `--noise-adjust` aggregate table AND the per-phase spread table, including stable (unchanged) and noisy (<2 usable runs) rows. Default: each table prints only meaningful rows (regression / improvement / informational), collapsing to a one-line summary when every row is suppressed. The per-phase table is additionally spread-gated by `--phase-threshold`; its coverage (one-sided metrics) table is always shown. Display-only — never affects the failure gate. |

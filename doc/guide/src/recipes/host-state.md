@@ -105,7 +105,7 @@ writer would attach to a fresh test run).
 ## Compare: `perf-delta` host-delta
 
 ```sh
-cargo ktstr perf-delta --dual-run --kernel 6.14
+cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14
 ```
 
 `perf-delta` compares HEAD against a baseline commit (see

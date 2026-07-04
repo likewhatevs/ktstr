@@ -17,32 +17,32 @@ to trip the failure gate (by default 5 or more).
 is the single command for this: the baseline commit's sidecars are
 side A, HEAD's are side B, paired per scenario.
 
-## Automated: `perf-delta --dual-run`
+## Automated: `perf-delta --noise-adjust`
 
 `perf-delta` resolves the baseline as `merge-base(HEAD, <ref>)` (or a
-`$GITHUB_BASE_REF` PR target), then `--dual-run` checks the baseline
-out in a detached `git worktree`, runs both commits' `performance_mode`
-tests, and compares — no manual worktree bookkeeping.
+`$GITHUB_BASE_REF` PR target), then `--noise-adjust N` checks BOTH
+commits out into their own plain `gix` checkouts, runs each side's
+`performance_mode` tests N times, and compares from the observed spread
+— no manual worktree bookkeeping.
 
 ```sh
 cd ~/opensource/scx                # the scheduler crate under test
 
-cargo ktstr perf-delta --dual-run --kernel ../linux                    # HEAD vs merge-base(HEAD, main)
-cargo ktstr perf-delta --dual-run --kernel ../linux --base-ref release # vs merge-base(HEAD, release)
-cargo ktstr perf-delta --dual-run --kernel ../linux -E cgroup_steady   # narrow the perf set
-cargo ktstr perf-delta --dual-run --kernel ../linux --threshold 5      # 5% uniform gate
+cargo ktstr perf-delta --noise-adjust 5 --kernel ../linux                    # HEAD vs merge-base(HEAD, main)
+cargo ktstr perf-delta --noise-adjust 5 --kernel ../linux --base-ref release # vs merge-base(HEAD, release)
+cargo ktstr perf-delta --noise-adjust 5 --kernel ../linux -E cgroup_steady   # narrow the perf set
 ```
 
-The command exits non-zero once enough metrics regress past their gate
-to trip the failure gate — by default 5 or more, so a lone noisy
-regression doesn't fail the run (`--fail-threshold` tunes the count;
-`--must-fail M1,M2` fails on specific metrics regardless of count). It
-drops straight into a CI perf-gate on a pull request. For a
-statistically robust verdict on a noisy box, use `--noise-adjust N` in
-place of `--dual-run` (the two are mutually exclusive): it produces N
-runs per side itself and gates a confident regression on the two sides
-being SEPARATED (Welch t-test or disjoint bands) AND MATERIAL (the
-registry dual-gate), instead of a fixed threshold. See
+`--noise-adjust N` runs each side N times (N >= 2; >= 5 recommended) and
+gates a confident regression on the two sides being SEPARATED (a Welch
+t-test or disjoint `[min, max]` bands) AND MATERIAL (the registry
+dual-gate) — the statistically robust verdict, since a single run per
+side cannot tell a real regression from run-to-run noise. The command
+exits non-zero once enough metrics regress to trip the failure gate — by
+default 5 or more, so a lone noisy regression doesn't fail the run
+(`--fail-threshold` tunes the count; `--must-fail M1,M2` fails on
+specific metrics regardless of count). It drops straight into a CI
+perf-gate on a pull request. See
 [perf-delta](../running-tests/cargo-ktstr.md#perf-delta) for the full
 flag set.
 
