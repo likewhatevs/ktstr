@@ -1778,7 +1778,7 @@ pub const KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV: &str = "KTSTR_SCHEDULER_ALLO
 /// [`build_and_find_binary`] (which builds it) and the `Discover`
 /// fallback probe (which locates a pre-built one) never disagree on
 /// which `target/<dir>/` the scheduler lands in.
-pub(crate) fn scheduler_profile_name() -> String {
+pub fn scheduler_profile_name() -> String {
     resolve_scheduler_profile(std::env::var(KTSTR_SCHEDULER_PROFILE_ENV).ok())
 }
 

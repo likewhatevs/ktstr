@@ -45,6 +45,8 @@
 
 // Global allocator (jemalloc) is provided centrally by the ktstr
 // library crate (src/lib.rs) and inherited by this bin.
+#[path = "cargo_ktstr/affected/mod.rs"]
+mod affected;
 #[path = "cargo_ktstr/cli.rs"]
 mod cli;
 #[path = "cargo_ktstr/kernel/mod.rs"]
@@ -289,6 +291,7 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
         | KtstrCommand::Completions { .. }
         | KtstrCommand::ShowHost
         | KtstrCommand::ShowThresholds { .. }
+        | KtstrCommand::Affected { .. }
         | KtstrCommand::Export { .. }
         | KtstrCommand::Locks { .. }
         | KtstrCommand::Shell { .. }) => dispatch_admin_command(cmd),
@@ -359,6 +362,12 @@ fn dispatch_admin_command(command: KtstrCommand) -> Result<(), String> {
             misc::run_completions(shell, &binary);
             Ok(())
         }
+        KtstrCommand::Affected {
+            base,
+            base_ref,
+            default_branch,
+        } => affected::run(base.as_deref(), base_ref.as_deref(), &default_branch)
+            .map_err(|e| format!("{e:#}")),
         KtstrCommand::ShowHost => {
             print!("{}", ktstr::cli::show_host());
             Ok(())

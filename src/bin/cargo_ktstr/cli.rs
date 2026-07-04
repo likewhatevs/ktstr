@@ -677,6 +677,29 @@ pub(crate) enum KtstrCommand {
         /// invoking this command.
         test: String,
     },
+    /// Emit the scheduler packages a `base..HEAD` diff affects, as a flat JSON
+    /// array for a GitHub Actions dynamic matrix
+    /// (`strategy.matrix.scheduler: ${{ fromJSON(...) }}` — one job per
+    /// scheduler). Attributes changed paths via the cargo dependency closure
+    /// and — only when a native (C/BPF) or unattributable path changed — via
+    /// each scheduler's cargo dep-info (building it once to read that). A broad
+    /// / build-graph / unattributable change emits every testable scheduler
+    /// (fail-safe); a strictly docs-only change emits `[]`. Only Discover
+    /// (cargo-package) schedulers appear; package-less schedulers (EEVDF etc.)
+    /// have no matrix cell and must run in a separate unconditional CI leg.
+    Affected {
+        /// Override the baseline commit directly (skips merge-base).
+        #[arg(long)]
+        base: Option<String>,
+        /// Ref to merge-base against. Defaults to `$GITHUB_BASE_REF` (as
+        /// `origin/<ref>`) on a PR, else `--default-branch`.
+        #[arg(long)]
+        base_ref: Option<String>,
+        /// Branch to merge-base against when neither `--base` / `--base-ref`
+        /// nor `$GITHUB_BASE_REF` is set.
+        #[arg(long, default_value = "main")]
+        default_branch: String,
+    },
     /// Export a registered test as a self-extracting `.run` file
     /// that reproduces the scenario on bare metal without a VM.
     ///

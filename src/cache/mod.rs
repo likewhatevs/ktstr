@@ -76,6 +76,18 @@ pub use crate::kernel_path::KernelId;
 pub(crate) use resolve::{
     path_inside_cache_root, resolve_cache_root_with_suffix, resolve_lock_dir,
 };
+
+/// Cache root for the `cargo ktstr affected` per-scheduler input-set cache.
+///
+/// Exposed as `pub` (unlike the crate-internal
+/// `resolve_cache_root_with_suffix`) because the affected engine lives in
+/// the cargo-ktstr BIN crate, a separate crate that reaches it as
+/// `ktstr::cache::affected_cache_root()`. Runs the same `KTSTR_CACHE_DIR` ->
+/// `$XDG_CACHE_HOME` -> `$HOME/.cache` cascade as every other ktstr cache,
+/// under the `affected` suffix.
+pub fn affected_cache_root() -> anyhow::Result<std::path::PathBuf> {
+    resolve_cache_root_with_suffix("affected")
+}
 // Durable-publish primitives shared by both cache layers
 // (cache_dir::CacheDir::store and vmm/disk_template::store_atomic) so
 // the two stay consistent — see fsync_staging_dir's contract.

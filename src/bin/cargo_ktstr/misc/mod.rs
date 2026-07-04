@@ -28,4 +28,5 @@ mod shell;
 pub(crate) use completions::run_completions;
 pub(crate) use export::run_export;
 pub(crate) use funify::run_funify;
+pub(crate) use probe::probe_collect;
 pub(crate) use shell::run_shell;

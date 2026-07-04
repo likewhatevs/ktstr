@@ -2783,6 +2783,18 @@ pub struct SchedulerJson {
     pub constraints: TopologyConstraintsJson,
 }
 
+/// A [`SchedulerJson`] plus the number of `#[ktstr_test]`s declared against
+/// it. Emitted (as a JSON array) by the `--ktstr-list-schedulers` probe so
+/// `cargo ktstr affected` can enumerate declared schedulers AND skip those
+/// with zero tests when producing its CI matrix, in one probe.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SchedulerListEntry {
+    /// The projected scheduler.
+    pub scheduler: SchedulerJson,
+    /// Count of registered [`KtstrTestEntry`]s whose scheduler is this one.
+    pub test_count: usize,
+}
+
 /// JSON-friendly form of [`SchedulerSpec`] tagged so the verifier
 /// dispatch can exhaustively `match` on the variant. `Discover` and
 /// `Path` both carry a string identifier; `Eevdf` and
@@ -2944,12 +2956,15 @@ impl SchedulerJson {
 
 ::ctor::declarative::ctor! {
 /// Ctor that intercepts `--ktstr-list-schedulers` before `main()` runs.
-/// Walks [`KTSTR_SCHEDULERS`], serializes each entry to JSON via
-/// [`SchedulerJson::from_scheduler`], prints the resulting array on
-/// stdout, and exits with status 0.
+/// Walks [`KTSTR_SCHEDULERS`], emits a [`SchedulerListEntry`] per scheduler
+/// (its [`SchedulerJson`] projection plus the count of [`KTSTR_TESTS`]
+/// declared against it) as a single JSON array on stdout, and exits with
+/// status 0.
 ///
 /// One ctor per binary, regardless of how many schedulers the binary
-/// registers — walks the slice once and emits a single JSON array.
+/// registers — walks the slices once and emits a single JSON array. The
+/// `test_count` is what lets `cargo ktstr affected` drop zero-test schedulers
+/// from its CI matrix without a second probe.
 ///
 /// Uses ctor's declarative `ctor::declarative::ctor! { ... }` form;
 /// the proc-macro `#[ctor::ctor(...)]` form is re-exported at
@@ -2959,9 +2974,19 @@ fn __ktstr_list_schedulers() {
     if !std::env::args().any(|a| a == "--ktstr-list-schedulers") {
         return;
     }
-    let entries: Vec<SchedulerJson> = KTSTR_SCHEDULERS
+    // Count declared tests per scheduler name (a scheduler with no test still
+    // appears, with test_count 0).
+    let mut test_counts: std::collections::HashMap<&'static str, usize> =
+        std::collections::HashMap::new();
+    for t in KTSTR_TESTS.iter() {
+        *test_counts.entry(t.scheduler.name).or_insert(0) += 1;
+    }
+    let entries: Vec<SchedulerListEntry> = KTSTR_SCHEDULERS
         .iter()
-        .map(|s| SchedulerJson::from_scheduler(s))
+        .map(|s| SchedulerListEntry {
+            scheduler: SchedulerJson::from_scheduler(s),
+            test_count: test_counts.get(s.name).copied().unwrap_or(0),
+        })
         .collect();
     let json = ::serde_json::to_string(&entries).expect("serialize schedulers");
     println!("{json}");
@@ -6534,12 +6559,13 @@ mod tests {
         assert!(json.constraints.requires_smt);
     }
 
-    /// The projected `SchedulerJson` survives a serde JSON
-    /// round-trip with field-for-field equality — the wire shape the
-    /// `--ktstr-list-schedulers` ctor serializes is the exact shape a
-    /// consumer deserializes. Exercises the `#[serde(tag = "kind",
-    /// content = "value")]` adjacent tagging on `BinaryKindJson`
-    /// (Discover serializes as `{"kind":"discover","value":"..."}`).
+    /// The projected `SchedulerJson` survives a serde JSON round-trip with
+    /// field-for-field equality — it is the `scheduler` field of each
+    /// [`SchedulerListEntry`] the `--ktstr-list-schedulers` ctor serializes,
+    /// so this is the exact shape a consumer deserializes. Exercises the
+    /// `#[serde(tag = "kind", content = "value")]` adjacent tagging on
+    /// `BinaryKindJson` (Discover serializes as
+    /// `{"kind":"discover","value":"..."}`).
     #[test]
     fn from_scheduler_json_roundtrips_through_serde() {
         let s = Scheduler::named("rt")
@@ -6559,5 +6585,28 @@ mod tests {
             back, json,
             "SchedulerJson must round-trip through serde unchanged"
         );
+    }
+
+    /// [`SchedulerListEntry`] — the `--ktstr-list-schedulers` wire element (a
+    /// [`SchedulerJson`] plus `test_count`) — survives a serde round-trip
+    /// field-for-field, the exact shape `cargo ktstr affected` deserializes.
+    #[test]
+    fn scheduler_list_entry_roundtrips_through_serde() {
+        let s = Scheduler::named("rt")
+            .binary_discover("scx_rt")
+            .topology(1, 2, 4, 2)
+            .kernels(&["6.14"]);
+        let entry = SchedulerListEntry {
+            scheduler: SchedulerJson::from_scheduler(&s),
+            test_count: 3,
+        };
+        let text = serde_json::to_string(&entry).expect("serialize SchedulerListEntry");
+        assert!(
+            text.contains("\"test_count\":3"),
+            "test_count must serialize, got: {text}"
+        );
+        let back: SchedulerListEntry =
+            serde_json::from_str(&text).expect("deserialize SchedulerListEntry");
+        assert_eq!(back, entry, "SchedulerListEntry must round-trip unchanged");
     }
 }

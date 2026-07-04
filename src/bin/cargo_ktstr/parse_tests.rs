@@ -1430,6 +1430,61 @@ fn parse_kernel_list_json() {
     assert!(m.is_ok(), "{}", m.err().unwrap());
 }
 
+/// `affected` base flags round-trip; bare `affected` defaults base/base_ref to
+/// None and default_branch to "main" (mirrors the perf-delta base block).
+#[test]
+fn parse_affected_flags_and_defaults() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "affected"]).unwrap_or_else(|e| panic!("{e}"));
+    match k.command {
+        KtstrCommand::Affected {
+            base,
+            base_ref,
+            default_branch,
+        } => {
+            assert!(base.is_none() && base_ref.is_none());
+            assert_eq!(default_branch, "main");
+        }
+        _ => panic!("expected Affected"),
+    }
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "affected",
+        "--base",
+        "abc123",
+        "--base-ref",
+        "release",
+        "--default-branch",
+        "dev",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    match k.command {
+        KtstrCommand::Affected {
+            base,
+            base_ref,
+            default_branch,
+        } => {
+            assert_eq!(base.as_deref(), Some("abc123"));
+            assert_eq!(base_ref.as_deref(), Some("release"));
+            assert_eq!(default_branch, "dev");
+        }
+        _ => panic!("expected Affected"),
+    }
+}
+
+/// `affected` takes no positional/passthrough argument.
+#[test]
+fn parse_affected_rejects_positional() {
+    assert!(
+        Cargo::try_parse_from(["cargo", "ktstr", "affected", "stray-positional"]).is_err(),
+        "affected must reject a bare positional argument",
+    );
+}
+
 /// `kernel list --kernel R` round-trips to
 /// `KernelCommand::List { kernel: Some(R), .. }` so the
 /// dispatch site routes through `kernel_list_range_preview`
