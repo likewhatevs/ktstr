@@ -49,6 +49,8 @@
 mod affected;
 #[path = "cargo_ktstr/cli.rs"]
 mod cli;
+#[path = "cargo_ktstr/interrupt.rs"]
+mod interrupt;
 #[path = "cargo_ktstr/kernel/mod.rs"]
 mod kernel;
 #[path = "cargo_ktstr/misc/mod.rs"]

@@ -210,6 +210,82 @@ fn worktree_remove_argv(wt_dir: &Path) -> Vec<String> {
     ]
 }
 
+/// Reclaim baseline worktrees orphaned by prior interrupted runs.
+///
+/// [`prune_leftover_worktree`] only self-heals the CURRENT run's
+/// `baseline_short`; a worktree left by an interrupted run against a
+/// DIFFERENT baseline (Ctrl-C / SIGKILL / crash skip
+/// [`WorktreeGuard`]`::drop`) accumulates in `temp_root` forever. This
+/// runs at perf-delta startup on the run-producing paths and removes
+/// every `ktstr-perf-delta-wt-*` directory whose sibling `.lock` is NOT
+/// held by a live run — mirroring `cleanup_stale_shm`'s lock-gated
+/// reclamation, so it never removes a concurrent run's checkout.
+/// Best-effort: each step swallows failure (a busy or racing entry is
+/// skipped and reclaimed by a later sweep).
+fn sweep_stale_worktrees(repo_root: &Path, temp_root: &Path) {
+    let Ok(entries) = std::fs::read_dir(temp_root) else {
+        return;
+    };
+    let mut removed_any = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // The worktree DIRS only — not the sibling `<...>.lock` files.
+        if !name.starts_with("ktstr-perf-delta-wt-") || name.ends_with(".lock") {
+            continue;
+        }
+        let wt_dir = entry.path();
+        if !wt_dir.is_dir() {
+            continue;
+        }
+        // A live run holds `<wt_dir>.lock` exclusively (see
+        // acquire_baseline_worktree_lock); only an orphan's lock is free.
+        // try_flock -> Some(fd): WE took it (no live owner) -> reclaim.
+        // None: held by a live run -> skip. Err: skip.
+        let held = match try_flock(worktree_lock_path(&wt_dir), FlockMode::Exclusive) {
+            Ok(Some(fd)) => fd,
+            _ => continue,
+        };
+        let _ = Command::new("git")
+            .current_dir(repo_root)
+            .args(worktree_remove_argv(&wt_dir))
+            .status();
+        if wt_dir.exists() {
+            let _ = std::fs::remove_dir_all(&wt_dir);
+        }
+        // Unlink the sibling `.lock` WHILE still holding it, then release —
+        // mirroring cleanup_shm (run_cargo.rs). try_flock O_CREATs the lock
+        // file, so without this every swept orphan would leave 0-byte lock
+        // debris. Holding across the unlink preserves serialization: a
+        // concurrent same-baseline acquire either sees our held lock (and
+        // bails) or, after the unlink, O_CREATs a fresh one — never both. (A
+        // release-BEFORE-unlink would let a racer acquire the stale inode
+        // while a third run O_CREATs a new one, yielding two "owners".)
+        let _ = std::fs::remove_file(worktree_lock_path(&wt_dir));
+        removed_any = true;
+        drop(held); // release the (now-unlinked) orphan lock
+    }
+    // Clear any registrations left dangling by the dirs we removed.
+    if removed_any {
+        let _ = Command::new("git")
+            .current_dir(repo_root)
+            .args(["worktree", "prune"])
+            .status();
+    }
+}
+
+/// Drop the interrupt guard; if a signal was caught during run
+/// production, re-raise it as the process exit (128+signal) now that the
+/// worktree teardown is done. Otherwise propagate the run's Result.
+fn finish_or_reraise(guard: crate::interrupt::InterruptGuard, run_res: Result<()>) -> Result<()> {
+    let caught = guard.interrupted();
+    drop(guard);
+    if let Some(sig) = caught {
+        crate::interrupt::reraise(sig);
+    }
+    run_res
+}
+
 /// `cargo ktstr test --kernel <k> [-E <filter>] [<passthrough>...]` argv
 /// (after the `cargo` program name). The baseline child runs the SAME
 /// selection as HEAD; `KTSTR_PERF_ONLY` in the env (see
@@ -455,6 +531,11 @@ fn dual_run(
              comparing the sidecars that were written"
         );
     }
+    // Ctrl-C during the baseline run: stop before spawning HEAD. Returning
+    // drops WorktreeGuard (removes the checkout); run() then re-raises 130.
+    if crate::interrupt::caught().is_some() {
+        return Ok(());
+    }
 
     // HEAD run: in the main tree, perf-only, default {kernel}-{HEAD} leaf.
     println!("perf-delta: running HEAD perf tests in the working tree");
@@ -547,6 +628,9 @@ fn noise_dual_run(
         if !bs.success() {
             eprintln!("perf-delta --noise-adjust: warning: baseline run {i} exited {bs}");
         }
+        if crate::interrupt::caught().is_some() {
+            break;
+        }
 
         let hs = Command::new("cargo")
             .current_dir(repo_root)
@@ -563,6 +647,9 @@ fn noise_dual_run(
             .with_context(|| format!("spawn HEAD `cargo ktstr test` (noise run {i})"))?;
         if !hs.success() {
             eprintln!("perf-delta --noise-adjust: warning: HEAD run {i} exited {hs}");
+        }
+        if crate::interrupt::caught().is_some() {
+            break;
         }
     }
     Ok(())
@@ -729,17 +816,26 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
         let kernel = args
             .kernel
             .context("--noise-adjust requires --kernel (the kernel both perf runs boot)")?;
-        noise_dual_run(
-            &cwd,
-            &baseline_oid.to_hex().to_string(),
-            &baseline,
-            &head,
-            kernel,
-            effective_filter,
-            args.profile,
-            args.nextest_profile,
-            args.passthrough,
-            n,
+        // Reclaim worktrees orphaned by prior interrupted runs against
+        // OTHER baselines (the per-baseline self-heal misses them).
+        sweep_stale_worktrees(&cwd, &std::env::temp_dir());
+        // Survive Ctrl-C during run production so WorktreeGuard::drop
+        // (worktree removal) runs; propagate the interrupt as 128+signal.
+        let interrupt_guard = crate::interrupt::InterruptGuard::install();
+        finish_or_reraise(
+            interrupt_guard,
+            noise_dual_run(
+                &cwd,
+                &baseline_oid.to_hex().to_string(),
+                &baseline,
+                &head,
+                kernel,
+                effective_filter,
+                args.profile,
+                args.nextest_profile,
+                args.passthrough,
+                n,
+            ),
         )?;
         let threshold = args.noise_spread_threshold.unwrap_or(5.0);
         let build = crate::stats::BuildCompareFilters {
@@ -761,15 +857,22 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
         let kernel = args
             .kernel
             .context("--dual-run requires --kernel (the kernel both perf runs boot)")?;
-        dual_run(
-            &cwd,
-            &baseline_oid.to_hex().to_string(),
-            &baseline,
-            kernel,
-            effective_filter,
-            args.profile,
-            args.nextest_profile,
-            args.passthrough,
+        // Reclaim cross-baseline orphaned worktrees, then survive Ctrl-C
+        // so WorktreeGuard::drop runs and the interrupt propagates as 130.
+        sweep_stale_worktrees(&cwd, &std::env::temp_dir());
+        let interrupt_guard = crate::interrupt::InterruptGuard::install();
+        finish_or_reraise(
+            interrupt_guard,
+            dual_run(
+                &cwd,
+                &baseline_oid.to_hex().to_string(),
+                &baseline,
+                kernel,
+                effective_filter,
+                args.profile,
+                args.nextest_profile,
+                args.passthrough,
+            ),
         )?;
         // If the baseline run produced no sidecars, no `performance_mode`
         // tests were selected (none are defined yet, or the `-E` filter
@@ -919,6 +1022,61 @@ mod tests {
                 "--force".to_string(),
                 "/tmp/wt".to_string(),
             ],
+        );
+    }
+
+    #[test]
+    fn sweep_reclaims_unlocked_but_keeps_locked_worktrees() {
+        // Two orphan-shaped baseline worktree dirs under a throwaway temp
+        // root: one whose sibling `.lock` is held (a live run), one free.
+        // The cross-baseline sweep must reclaim the free one and NEVER
+        // touch the locked one. (`git worktree remove/prune` fail
+        // harmlessly on the non-repo repo_root — same pattern the
+        // prune_leftover_worktree test uses — so this pins the lock-gated
+        // fs reclamation.)
+        let base = std::env::temp_dir().join(format!("ktstr-pd-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("mk temp root");
+        let unlocked = base.join("ktstr-perf-delta-wt-aaaaaaa");
+        let locked = base.join("ktstr-perf-delta-wt-bbbbbbb");
+        std::fs::create_dir(&unlocked).expect("mk unlocked wt");
+        std::fs::create_dir(&locked).expect("mk locked wt");
+        // Hold the locked worktree's advisory lock for the sweep's duration.
+        let held = try_flock(worktree_lock_path(&locked), FlockMode::Exclusive)
+            .expect("flock call")
+            .expect("lock free initially");
+
+        sweep_stale_worktrees(&base, &base);
+
+        assert!(!unlocked.exists(), "an unlocked orphan worktree is reclaimed");
+        assert!(
+            !worktree_lock_path(&unlocked).exists(),
+            "the reclaimed orphan's sibling .lock is removed too (no lock debris)"
+        );
+        assert!(locked.exists(), "a locked (live) worktree is never removed");
+        assert!(
+            worktree_lock_path(&locked).exists(),
+            "a live worktree's held .lock is left intact"
+        );
+
+        drop(held);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn finish_or_reraise_passes_through_when_not_interrupted() {
+        // The common (no-signal) path must return the run Result unchanged.
+        // The reraise branch is unreachable here (it would terminate the
+        // process), so only the pass-through is pinned. Each nextest test is
+        // its own process, so installing the guard is isolated.
+        let g = crate::interrupt::InterruptGuard::install();
+        assert!(g.interrupted().is_none(), "no signal delivered in-test");
+        assert!(finish_or_reraise(g, Ok(())).is_ok(), "Ok passes through");
+
+        let g2 = crate::interrupt::InterruptGuard::install();
+        assert!(
+            finish_or_reraise(g2, Err(anyhow::anyhow!("boom"))).is_err(),
+            "Err propagates unchanged"
         );
     }
 

@@ -395,6 +395,13 @@ fn run_cargo_sub(
     if let Ok(d) = run_start.duration_since(std::time::UNIX_EPOCH) {
         cmd.env(ktstr::KTSTR_RUN_EPOCH_ENV, d.as_nanos().to_string());
     }
+    // Survive Ctrl-C / SIGTERM for the duration of the child run so the
+    // parent reaches its cleanup below instead of dying at the default
+    // disposition. nextest, in the same foreground process group,
+    // receives its own SIGINT and tears down every per-test child
+    // independently; this guard only stops the PARENT from dying so the
+    // shm sweep + artifact footer still run. See `crate::interrupt`.
+    let interrupt_guard = crate::interrupt::InterruptGuard::install();
     let status = cmd
         .status()
         .map_err(|e| format!("spawn cargo {}: {e}", sub_argv.join(" ")))?;
@@ -415,6 +422,15 @@ fn run_cargo_sub(
     let footer = ktstr::test_support::format_run_artifact_footer(&runs_root, run_start);
     if !footer.is_empty() {
         eprint!("{footer}");
+    }
+    // Cleanup + footer are done. If a Ctrl-C / SIGTERM arrived during the
+    // run, propagate it as the conventional 128+signal exit (130 / 143)
+    // now that teardown has completed. Drop the guard first so the signal
+    // is back at its prior disposition before we re-raise.
+    let caught = interrupt_guard.interrupted();
+    drop(interrupt_guard);
+    if let Some(sig) = caught {
+        crate::interrupt::reraise(sig);
     }
     if !status.success() {
         // nextest is the authoritative pass/fail signal. The footer
