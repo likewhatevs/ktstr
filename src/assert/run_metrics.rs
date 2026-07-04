@@ -990,9 +990,11 @@ pub fn populate_run_pooled_taobench_distribution(stats: &mut ScenarioStats) {
 /// when that role was scheduled (`pcount > 0`), so `derive_rate_metrics` yields
 /// the role's gate-Rate iff it ran (never a 0/0); the two roles are independent
 /// (a worker-only run emits only the worker Rate). `total_schbench_loops` is
-/// always written when any schbench carrier ran (0 is a measured zero). Distinct
-/// from the per-phase `sched_delay_msg/worker_us` (mean-of-means parity,
-/// PerPhase display-only) — these Rates gate; no double-count. Cross-RUN the
+/// always written when any schbench carrier ran (0 is a measured zero). The
+/// per-phase `sched_delay_msg/worker_us` is the SAME Σrun_delay_ns/Σpcount
+/// per-schedule mean at phase scope (NOT schbench's native mean-of-per-thread-
+/// means, a separate whole-run SchbenchResult stat) and stays PerPhase
+/// display-only — only these Rates gate; no double-count. Cross-RUN the
 /// components SUM-fold (Counter), so each Rate re-pools Σrun_delay/Σpcount.
 pub fn populate_run_pooled_schbench(stats: &mut ScenarioStats) {
     use crate::stats::{

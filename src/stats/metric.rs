@@ -1492,10 +1492,12 @@ pub(crate) const SCHBENCH_LOOP_COUNT: &str = "schbench_loop_count";
 // (RENDER_SUPPRESSED) for the two sample-weighted Σrun_delay/Σpcount gate Rates
 // (workload-scoped siblings of the system-wide `total_run_delay_ns_per_sched`);
 // the message and worker thread ROLES pool separately (different per-schedule
-// wait populations). Distinct from the per-phase `sched_delay_msg/worker_us`
-// (mean-of-means, schbench.c parity) which stay PerPhase display-only — the
-// Rates gate, no double-count. `total_schbench_loops` is the whole-run loop
-// Counter (distinct from the per-phase `schbench_loop_count`).
+// wait populations). The per-phase `sched_delay_msg/worker_us` is the SAME
+// Σrun_delay_ns/Σpcount per-schedule mean at phase scope (NOT schbench's native
+// mean-of-per-thread-means, a separate whole-run SchbenchResult stat) and stays
+// PerPhase display-only — only these Rates gate, no double-count.
+// `total_schbench_loops` is the whole-run loop Counter (distinct from the
+// per-phase `schbench_loop_count`).
 pub(crate) const TOTAL_SCHBENCH_MSG_RUN_DELAY_NS: &str = "total_schbench_msg_run_delay_ns";
 pub(crate) const TOTAL_SCHBENCH_MSG_PCOUNT: &str = "total_schbench_msg_pcount";
 pub(crate) const TOTAL_SCHBENCH_WORKER_RUN_DELAY_NS: &str = "total_schbench_worker_run_delay_ns";
@@ -3477,9 +3479,11 @@ pub static METRICS: &[MetricDef] = &[
     // RENDER_SUPPRESSED; `total_` prefix → Counter gate). The two Rates are the
     // sample-weighted Σrun_delay/Σpcount per-schedule means (the workload-scoped
     // siblings of the system-wide `total_run_delay_ns_per_sched`); message and
-    // worker roles pool separately. Distinct from the per-phase
-    // `sched_delay_msg/worker_us` (mean-of-means parity, PerPhase display-only) —
-    // the Rates gate, no double-count.
+    // worker roles pool separately. The per-phase `sched_delay_msg/worker_us`
+    // (PerPhase, display-only) is the SAME Σrun_delay_ns/Σpcount per-schedule
+    // mean at phase scope -- NOT schbench's native mean-of-per-thread-means
+    // (that is a separate whole-run stat on `SchbenchResult`, see
+    // workload/schbench). Only these Rates gate, so no double-count.
     MetricDef {
         name: TOTAL_SCHBENCH_MSG_RUN_DELAY_NS,
         polarity: crate::test_support::Polarity::LowerBetter,
