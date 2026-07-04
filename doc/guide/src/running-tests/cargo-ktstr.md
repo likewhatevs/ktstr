@@ -1038,7 +1038,9 @@ when the worktree differs).
 ## perf-delta
 
 Compare `performance_mode` test metrics between HEAD and a baseline
-commit, exiting non-zero when a metric regresses past its threshold.
+commit, exiting non-zero when enough metrics regress to trip the
+failure gate — by default 5 or more (so a lone noisy regression does
+not flip CI red); tune with `--fail-threshold` / `--must-fail`.
 The verdict uses a polarity-aware, abs+rel dual-gate engine: the
 baseline commit's sidecars are one side, HEAD's are the other, paired
 per scenario.
@@ -1059,6 +1061,7 @@ cargo ktstr perf-delta --dual-run --kernel 6.14 --base-ref release  # vs merge-b
 cargo ktstr perf-delta --base abc1234                      # vs an explicit commit, cached sidecars
 cargo ktstr perf-delta --dual-run --kernel 6.14 -E perf_throughput  # narrow within performance_mode
 cargo ktstr perf-delta --dual-run --kernel 6.14 --threshold 5       # 5% uniform regression gate
+cargo ktstr perf-delta --dual-run --kernel 6.14 --must-fail worst_spread  # also fail if worst_spread regresses, any count
 ```
 
 **Baseline resolution** (highest precedence first):
@@ -1114,9 +1117,12 @@ exits `0` — an empty perf set is "nothing to compare", not a failure.
 | `--relevant` | off | Additionally narrow to the `performance_mode` tests the `base..HEAD` diff (∪ working tree) touches, from the same baseline; intersected with `--filter`. Broad change → compares everything; docs-only → nothing. See [affected / --relevant](#relevant). |
 | `--threshold PCT` | registry defaults | Uniform relative regression gate (percent). Mutually exclusive with `--policy`. |
 | `--policy PATH` | registry defaults | Per-metric threshold JSON. Mutually exclusive with `--threshold`. Schema: `{ "default_percent": N, "per_metric_percent": { "worst_spread": 5.0, ... } }` (priority: per-metric override → `default_percent` → each metric's registry `default_rel`). |
+| `--fail-threshold N` | `5` | Fail the run only when at least N metrics regress, so a handful of one-off noisy regressions doesn't flip CI red. `--fail-threshold 1` restores fail-on-any; `0` disables the count gate (only `--must-fail` can then fail). Counts confident regressions; suppressed rows still count. |
+| `--must-fail M1,M2,...` | none | Registry metric names (from `cargo ktstr stats list-metrics`) that fail the run if ANY of them regresses, regardless of `--fail-threshold` (ORed on top of the count gate). Names that could never fire the gate are rejected up front: unknown names, internal rate components, per-phase-only metrics, and — without `--noise-adjust` — whole-run distribution metrics (read only per-run) and informational metrics (no regression direction on the default comparison). |
 | `--noise-adjust N` | off | Self-tuning noise mode (requires `--kernel`): run each side N times and gate a confident regression on the two sides being SEPARATED (a two-sided Welch t-test at alpha=0.05, or fully disjoint `[min, max]` bands) AND MATERIAL (the registry `default_abs`/`default_rel` dual-gate), instead of a fixed `--threshold`. Implies dual-run production looped N times. Conflicts with `--threshold`, `--policy`, and `--dual-run`. |
 | `--noise-spread-threshold PCT` | `5.0` | Per-side relative-spread limit (percent) above which `--noise-adjust` adds an ADVISORY "noisy spread" annotation to a metric's row. Advisory only — never suppresses a confident regression. Requires `--noise-adjust`. |
 | `--no-phases` / `--phases-only` / `--steps-only` / `--phase N` / `--phase-threshold PCT` | full per-phase render | Per-phase output projection for the `--noise-adjust` spread block (render-only; does not change the verdict). Each **requires `--noise-adjust`** — per-phase output exists only on the noise-adjusted path. |
+| `--all-metrics` | off | Show every compared metric row on the `--noise-adjust` aggregate table, including stable (unchanged) and noisy (<2 usable runs) rows. Default: only meaningful rows (regression / improvement / informational) print, collapsing to a one-line summary when every row is suppressed. Display-only — never affects the failure gate. The per-phase table is separately spread-gated by `--phase-threshold`. |
 
 Runnable as `just perf-delta <kernel> [base]`.
 

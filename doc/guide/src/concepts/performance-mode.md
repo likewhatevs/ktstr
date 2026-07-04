@@ -223,7 +223,8 @@ are only meaningful under performance mode's controlled environment.
 Cross-commit regression gating builds on the same tests:
 [`cargo ktstr perf-delta`](../running-tests/cargo-ktstr.md#perf-delta)
 runs the `performance_mode` suite at HEAD and at a baseline commit and
-A/B-compares the metrics, exiting non-zero on a regression. The in-guest
+A/B-compares the metrics, exiting non-zero once enough metrics regress
+to trip the failure gate (by default 5 or more). The in-guest
 `Assert` thresholds above catch a regression against a fixed bar;
 perf-delta catches one against the previous commit.
 

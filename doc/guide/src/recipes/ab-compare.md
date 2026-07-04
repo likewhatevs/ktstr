@@ -11,7 +11,8 @@
 Compare scheduler behavior between HEAD and a baseline branch by
 running the same `#[ktstr_test(performance_mode)]` scenarios against
 each, then diffing per-metric results with dual-gate (absolute and
-relative) significance and exiting non-zero on any regression.
+relative) significance and exiting non-zero when enough metrics regress
+to trip the failure gate (by default 5 or more).
 [`cargo ktstr perf-delta`](../running-tests/cargo-ktstr.md#perf-delta)
 is the single command for this: the baseline commit's sidecars are
 side A, HEAD's are side B, paired per scenario.
@@ -32,8 +33,11 @@ cargo ktstr perf-delta --dual-run --kernel ../linux -E cgroup_steady   # narrow 
 cargo ktstr perf-delta --dual-run --kernel ../linux --threshold 5      # 5% uniform gate
 ```
 
-The command exits non-zero when a metric regresses past its gate, so
-it drops straight into a CI perf-gate on a pull request. For a
+The command exits non-zero once enough metrics regress past their gate
+to trip the failure gate — by default 5 or more, so a lone noisy
+regression doesn't fail the run (`--fail-threshold` tunes the count;
+`--must-fail M1,M2` fails on specific metrics regardless of count). It
+drops straight into a CI perf-gate on a pull request. For a
 statistically robust verdict on a noisy box, use `--noise-adjust N` in
 place of `--dual-run` (the two are mutually exclusive): it produces N
 runs per side itself and gates a confident regression on the two sides

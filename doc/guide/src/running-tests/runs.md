@@ -165,8 +165,9 @@ tree copied off a CI host). They do NOT consult
    sidecars against HEAD's per scenario and reports per-metric
    regressions via the unified `MetricDef` registry (polarity,
    absolute and relative thresholds). Output is colored: red for
-   regressions, green for improvements; it exits non-zero when a
-   metric regresses past its gate. The canonical WIP-vs-baseline
+   regressions, green for improvements; it exits non-zero once enough
+   metrics regress past their gate to trip the failure gate (by default
+   5 or more; tune with `--fail-threshold` / `--must-fail`). The canonical WIP-vs-baseline
    pattern is `perf-delta --base abc1234` from a `-dirty` working
    tree against the clean commit it was edited from. See
    [cargo-ktstr](cargo-ktstr.md#perf-delta) for the full flag set,
