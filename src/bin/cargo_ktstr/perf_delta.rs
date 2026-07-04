@@ -198,8 +198,8 @@ fn baseline_child_env(
 
 /// Reclaim baseline checkouts orphaned by prior interrupted runs.
 ///
-/// [`create_baseline_worktree`] only self-heals the CURRENT run's
-/// `baseline_short`; a checkout left by an interrupted run against a
+/// [`create_checkout_from_tree`] only self-heals the CURRENT run's
+/// checkout dir; a checkout left by an interrupted run against a
 /// DIFFERENT baseline (Ctrl-C / SIGKILL / crash skip
 /// [`WorktreeGuard`]`::drop`) accumulates in `temp_root` forever. This
 /// runs at perf-delta startup on the run-producing paths and removes
@@ -352,28 +352,31 @@ impl Drop for WorktreeGuard {
         // it clears the checkout regardless of what the interrupted build left
         // behind — no "Directory not empty" the old `git worktree remove` hit.
         // A skipped drop on SIGKILL / crash is reclaimed by the next run's
-        // `create_baseline_worktree` pre-checkout self-heal (and the
+        // `create_checkout_from_tree` pre-checkout self-heal (and the
         // cross-baseline `sweep_stale_worktrees`).
         let _ = std::fs::remove_dir_all(&self.wt_dir);
     }
 }
 
-/// Materialize the baseline commit's tree into a PLAIN dir at `wt_dir` (no
-/// linked worktree, no `.git`) via `gix`, first self-healing any leftover
-/// checkout from an interrupted prior run so the checkout writes into an
-/// empty destination.
+/// Materialize a git `tree_oid` into a PLAIN dir at `wt_dir` (no linked
+/// worktree, no `.git`) via `gix`, first self-healing any leftover checkout
+/// from an interrupted prior run so the checkout writes into an empty
+/// destination. `label` names the checkout in diagnostics (a short commit
+/// hash). Both the baseline (its commit's tree) and the HEAD snapshot (HEAD's
+/// tree, or a worktree-snapshot tree for a dirty HEAD) feed this one path.
 ///
-/// `gix::worktree::state::checkout` reads objects from the repo's ODB and
-/// writes ONLY into `wt_dir` — it never mutates the repo: no worktree
-/// registration, and the index it consumes is built in memory from the tree
-/// (`index_from_tree`), never persisted. `destination_is_initially_empty` is
-/// set because the self-heal above guarantees an empty target, enabling
-/// exclusive-create writes and collision detection.
-fn create_baseline_worktree(
-    repo_root: &Path,
+/// READ-ONLY on the repo: `gix::worktree::state::checkout` reads objects from
+/// the ODB and writes ONLY into `wt_dir` — no worktree registration, and the
+/// index is built in memory from `tree_oid` (`index_from_tree`), never
+/// persisted. (For a dirty HEAD the ephemeral loose blob/tree objects are
+/// written earlier, in [`build_head_snapshot_tree`], not here.)
+/// `destination_is_initially_empty` is set because the self-heal above
+/// guarantees an empty target, enabling exclusive-create writes.
+fn create_checkout_from_tree(
+    repo: &gix::Repository,
     wt_dir: &Path,
-    baseline_full_hex: &str,
-    baseline_short: &str,
+    tree_oid: gix::ObjectId,
+    label: &str,
 ) -> Result<()> {
     // Clear any leftover checkout from an interrupted prior run (Ctrl-C /
     // SIGKILL / crash skip WorktreeGuard::drop) so the checkout below writes
@@ -382,25 +385,16 @@ fn create_baseline_worktree(
     // gix's checkout writes entries UNDER `wt_dir` but does not create the
     // root itself, so materialize a fresh empty dir for it.
     std::fs::create_dir_all(wt_dir)
-        .with_context(|| format!("create baseline checkout dir {}", wt_dir.display()))?;
-    let repo = gix::discover(repo_root)
-        .with_context(|| format!("discover repo for baseline {baseline_short} checkout"))?;
-    let oid = rev_parse_commit(&repo, baseline_full_hex)?;
-    let tree = repo
-        .find_commit(oid)
-        .with_context(|| format!("find baseline commit {baseline_short}"))?
-        .tree_id()
-        .context("resolve baseline tree")?
-        .detach();
+        .with_context(|| format!("create {label} checkout dir {}", wt_dir.display()))?;
     let mut index = repo
-        .index_from_tree(&tree)
-        .with_context(|| format!("build index from baseline {baseline_short} tree"))?;
+        .index_from_tree(&tree_oid)
+        .with_context(|| format!("build index from {label} tree"))?;
     let mut opts = repo
         .checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)
-        .context("build baseline checkout options")?;
+        .context("build checkout options")?;
     opts.destination_is_initially_empty = true;
     // Fail loud on any per-entry checkout error rather than silently
-    // collecting it — a broken baseline checkout must not be compared.
+    // collecting it — a broken checkout must not be compared.
     opts.keep_going = false;
     // `checkout` requires a `Send` object handle (it may use worker threads);
     // the repo's default handle is `Rc`-backed, so convert to the `Arc`-backed
@@ -409,12 +403,12 @@ fn create_baseline_worktree(
         .objects
         .clone()
         .into_arc()
-        .context("build thread-safe object handle for baseline checkout")?;
+        .context("build thread-safe object handle for checkout")?;
     // Poll perf-delta's interrupt flag so a Ctrl-C aborts the checkout
     // promptly; the caller re-checks `interrupt::caught()` right after and
-    // bails before spawning the baseline build, and a partial checkout dir is
-    // reclaimed by WorktreeGuard::drop. checkout returns Ok even on abort, so
-    // the post-return caught() check is what actually stops the run.
+    // bails before spawning the build, and a partial checkout dir is reclaimed
+    // by WorktreeGuard::drop. checkout returns Ok even on abort, so the
+    // post-return caught() check is what actually stops the run.
     gix::worktree::state::checkout(
         &mut index,
         wt_dir,
@@ -424,13 +418,154 @@ fn create_baseline_worktree(
         &crate::interrupt::INTERRUPTED,
         opts,
     )
-    .with_context(|| {
-        format!(
-            "check out baseline {baseline_short} into {}",
-            wt_dir.display()
-        )
-    })?;
+    .with_context(|| format!("check out {label} into {}", wt_dir.display()))?;
     Ok(())
+}
+
+/// Build the tree to check the HEAD/B side out from, hermetically snapshotting
+/// the working tree at command-start.
+///
+/// Clean HEAD (`dirty == false`): returns `head_tree_oid` unchanged — zero ODB
+/// writes; [`create_checkout_from_tree`] then materializes HEAD exactly (the
+/// read-only baseline path).
+///
+/// Dirty HEAD: snapshots the WORKING TREE (what a fresh checkout of the current
+/// state would build), so edits during the run don't perturb the B build and
+/// the sidecar's `-dirty` label matches the built content. Bases a tree editor
+/// on HEAD's tree and, for every path the status walk surfaces — staged AND
+/// unstaged AND untracked-non-ignored (both status legs) — RE-READS the
+/// worktree file as the single source of truth: present -> write its blob and
+/// upsert (`BlobExecutable` / `Link` / `Blob` per the worktree mode); absent
+/// -> remove. Rename detection is disabled, so a rename is a plain
+/// remove(old) + upsert(new). Ignored files (`target/`, editor swap files) are
+/// excluded, so a WIP file must be under `.gitignore` (or stashed) to be kept
+/// out of the comparison.
+///
+/// WRITES ephemeral loose blob+tree objects to the repo's ODB (unlike the
+/// read-only baseline path) — they are unreferenced and reclaimed by
+/// `git gc`. Only the dirty path writes; a clean HEAD touches nothing.
+fn build_head_snapshot_tree(
+    repo: &gix::Repository,
+    head_tree_oid: gix::ObjectId,
+    dirty: bool,
+) -> Result<gix::ObjectId> {
+    if !dirty {
+        return Ok(head_tree_oid);
+    }
+    use gix::bstr::{BString, ByteSlice};
+    use gix::objs::tree::EntryKind;
+    use std::os::unix::fs::PermissionsExt;
+
+    let workdir = repo
+        .workdir()
+        .context("cannot snapshot a dirty HEAD without a working tree")?
+        .to_path_buf();
+    let mut editor = repo
+        .edit_tree(head_tree_oid)
+        .context("open a tree editor on HEAD for the dirty snapshot")?;
+
+    // Both status legs (HEAD-vs-index staged + index-vs-worktree unstaged +
+    // untracked), renames off so each change is a plain path add/modify/delete.
+    let status = repo
+        .status(gix::progress::Discard)
+        .context("configure working-tree status for the snapshot")?
+        .untracked_files(gix::status::UntrackedFiles::Files)
+        .index_worktree_rewrites(None)
+        .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled);
+
+    let mut changed = 0usize;
+    for item in status
+        .into_iter(Vec::new())
+        .context("start the working-tree status walk for the snapshot")?
+    {
+        let item = item.context("read a working-tree status entry")?;
+        // worktree-file-is-truth: the status leg only tells us WHICH path
+        // changed; re-derive content/mode/existence from the filesystem so a
+        // staged-then-reverted file snapshots as its (reverted) worktree state.
+        let rela: BString = item.location().to_owned();
+        let abs = workdir.join(gix::path::from_bstr(rela.as_bstr()).as_ref());
+        match std::fs::symlink_metadata(&abs) {
+            Ok(md) if md.file_type().is_symlink() => {
+                let target = std::fs::read_link(&abs)
+                    .with_context(|| format!("read symlink {abs:?} for snapshot"))?;
+                let blob = repo
+                    .write_blob(gix::path::into_bstr(target).as_ref())
+                    .with_context(|| format!("write symlink blob for {rela}"))?
+                    .detach();
+                editor
+                    .upsert(rela.as_bstr(), EntryKind::Link, blob)
+                    .with_context(|| format!("snapshot symlink {rela}"))?;
+                changed += 1;
+            }
+            Ok(md) if md.is_file() => {
+                let bytes =
+                    std::fs::read(&abs).with_context(|| format!("read {abs:?} for snapshot"))?;
+                let blob = repo
+                    .write_blob(&bytes)
+                    .with_context(|| format!("write blob for {rela}"))?
+                    .detach();
+                let kind = if md.permissions().mode() & 0o111 != 0 {
+                    EntryKind::BlobExecutable
+                } else {
+                    EntryKind::Blob
+                };
+                editor
+                    .upsert(rela.as_bstr(), kind, blob)
+                    .with_context(|| format!("snapshot {rela}"))?;
+                changed += 1;
+            }
+            // An (empty) untracked directory the walk may emit, or a
+            // HEAD-tracked file now REPLACED by a directory: skip the dir-path
+            // item. Git tracks no empty dirs; for a file->dir replacement the
+            // dir's own files (upsert-ing `foo/bar`) auto-convert `foo` to a
+            // tree, and a remove("foo") here could delete that fresh tree.
+            Ok(md) if md.is_dir() => continue,
+            // Absent (deleted), or a non-file at that path: drop it from the
+            // snapshot tree.
+            _ => {
+                editor
+                    .remove(rela.as_bstr())
+                    .with_context(|| format!("drop {rela} from snapshot"))?;
+                changed += 1;
+            }
+        }
+    }
+    let tree = editor
+        .write()
+        .context("write the dirty-HEAD snapshot tree")?
+        .detach();
+    eprintln!(
+        "perf-delta: HEAD is dirty; snapshotting {changed} uncommitted change(s) \
+         (incl. untracked non-ignored files) so the comparison is hermetic"
+    );
+    Ok(tree)
+}
+
+/// Resolve the two trees the run-producing paths check out: the baseline
+/// commit's tree, and the HEAD snapshot tree (HEAD's tree for a clean HEAD, or
+/// a working-tree snapshot for a dirty HEAD — see [`build_head_snapshot_tree`]).
+/// Computed ONCE at command start so the HEAD/B side is a point-in-time capture
+/// that edits during the (long) run cannot perturb.
+fn resolve_run_trees(
+    repo: &gix::Repository,
+    baseline_oid: gix::ObjectId,
+) -> Result<(gix::ObjectId, gix::ObjectId)> {
+    let baseline_tree = repo
+        .find_commit(baseline_oid)
+        .context("find baseline commit")?
+        .tree_id()
+        .context("resolve baseline tree")?
+        .detach();
+    let head_oid = repo.head_id().context("resolve HEAD")?.detach();
+    let head_tree = repo
+        .find_commit(head_oid)
+        .context("find HEAD commit")?
+        .tree_id()
+        .context("resolve HEAD tree")?
+        .detach();
+    let dirty = ktstr::test_support::repo_is_dirty(repo) == Some(true);
+    let head_snapshot_tree = build_head_snapshot_tree(repo, head_tree, dirty)?;
+    Ok((baseline_tree, head_snapshot_tree))
 }
 
 /// Absolutize a relative kernel-source path against the MAIN tree so the
@@ -453,12 +588,18 @@ fn resolve_kernel_for_children(repo_root: &Path, kernel: &str) -> String {
 }
 
 /// Produce BOTH commits' `performance_mode` sidecars so the compare has
-/// fresh data: check the baseline commit out into a plain temp dir (via
-/// `gix`) and run its perf tests there (sidecars redirected into the main
-/// pool), then run HEAD's perf tests in the main tree. The checkout is
-/// removed on return via [`WorktreeGuard`]. Both children stamp their
-/// `project_commit` from the parent's resolved labels (`baseline_short` /
-/// `head_short`) so the recorded field matches the compare's pool filter.
+/// fresh data: check the baseline commit's tree AND the HEAD snapshot
+/// (`head_tree`) out into two plain temp dirs (via `gix`) and run each side's
+/// perf tests in its own checkout (sidecars redirected into the main pool).
+/// Both checkouts are removed on return via [`WorktreeGuard`]. Both children
+/// stamp their `project_commit` from the parent's resolved labels
+/// (`baseline_short` / `head_short`) so the recorded field matches the
+/// compare's pool filter.
+///
+/// Running HEAD in its OWN checkout (not the live working tree) makes the B
+/// side hermetic: editing code during the run cannot perturb the B build, and
+/// a dirty HEAD's snapshot (built once at command start) matches the recorded
+/// `-dirty` label.
 ///
 /// A non-zero exit from a child test run is logged but does NOT abort —
 /// some `performance_mode` failures (e.g. LLC-contention) are expected,
@@ -466,8 +607,10 @@ fn resolve_kernel_for_children(repo_root: &Path, kernel: &str) -> String {
 /// spawn failure (cargo not runnable) IS a hard error.
 #[allow(clippy::too_many_arguments)]
 fn dual_run(
+    repo: &gix::Repository,
     repo_root: &Path,
-    baseline_full_hex: &str,
+    baseline_tree: gix::ObjectId,
+    head_tree: gix::ObjectId,
     baseline_short: &str,
     head_short: &str,
     kernel: &str,
@@ -485,33 +628,36 @@ fn dual_run(
     let runs_root_abs = repo_root.join(ktstr::test_support::runs_root());
     let leaf = baseline_sidecar_leaf(&runs_root_abs, baseline_short);
     let wt_dir = worktree_checkout_dir(&std::env::temp_dir(), baseline_short);
-    // Absolutize a relative kernel path so the baseline child (cwd =
-    // worktree) resolves the same tree HEAD does (cwd = main).
+    let head_wt_dir = worktree_checkout_dir(&std::env::temp_dir(), head_short);
+    // Absolutize a relative kernel path so BOTH children (cwd = a temp
+    // checkout) resolve the same tree the main tree does.
     let kernel_arg = resolve_kernel_for_children(repo_root, kernel);
 
-    // Serialize concurrent perf-delta runs against the SAME baseline: they share
-    // one per-baseline checkout path, and create_baseline_worktree remove_dir_all's
-    // any leftover — which would destroy a live concurrent run's checkout. The
-    // exclusive advisory flock (OS-released on process death) makes a live
-    // concurrent run bail cleanly here, while an interrupted run's lock frees for
-    // the next run (which then self-heals the leftover). Held for the whole
-    // baseline lifetime; declared before `_guard` so it drops AFTER the checkout
-    // is removed.
-    let _wt_lock = acquire_baseline_worktree_lock(&wt_dir, baseline_short)?;
-    // Create the baseline checkout, self-healing any leftover from an
-    // interrupted prior run (Ctrl-C / SIGKILL / crash skip WorktreeGuard::drop).
-    create_baseline_worktree(repo_root, &wt_dir, baseline_full_hex, baseline_short)?;
-    let _guard = WorktreeGuard {
+    // Serialize concurrent perf-delta runs that share a checkout path:
+    // create_checkout_from_tree remove_dir_all's any leftover, which would
+    // destroy a live concurrent run's checkout. The exclusive advisory flock
+    // (OS-released on process death) makes a live concurrent run bail cleanly.
+    // Both locks are declared before both guards so each lock drops AFTER its
+    // checkout is removed (LIFO: guards drop first).
+    let _baseline_lock = acquire_baseline_worktree_lock(&wt_dir, baseline_short)?;
+    let _head_lock = acquire_baseline_worktree_lock(&head_wt_dir, head_short)?;
+    // Create both checkouts, self-healing any leftover from an interrupted
+    // prior run (Ctrl-C / SIGKILL / crash skip WorktreeGuard::drop).
+    create_checkout_from_tree(repo, &wt_dir, baseline_tree, baseline_short)?;
+    let _baseline_guard = WorktreeGuard {
         wt_dir: wt_dir.clone(),
     };
-    // Ctrl-C during the checkout above: bail before spawning the baseline
-    // build. WorktreeGuard::drop removes the (possibly partial) checkout;
-    // run() then re-raises 130.
+    create_checkout_from_tree(repo, &head_wt_dir, head_tree, head_short)?;
+    let _head_guard = WorktreeGuard {
+        wt_dir: head_wt_dir.clone(),
+    };
+    // Ctrl-C during either checkout: bail before spawning any build. The guards
+    // remove the (possibly partial) checkouts; run() then re-raises 130.
     if crate::interrupt::caught().is_some() {
         return Ok(());
     }
 
-    // Baseline run: in the checkout, perf-only, sidecars into the main pool leaf.
+    // Baseline run: in the baseline checkout, perf-only, sidecars into the pool leaf.
     println!("perf-delta: running baseline {baseline_short} perf tests in checkout");
     let baseline_status = Command::new("cargo")
         .current_dir(&wt_dir)
@@ -537,10 +683,10 @@ fn dual_run(
         return Ok(());
     }
 
-    // HEAD run: in the main tree, perf-only, default {kernel}-{HEAD} leaf.
-    println!("perf-delta: running HEAD perf tests in the working tree");
+    // HEAD run: in the HEAD snapshot checkout, perf-only, default {kernel}-{HEAD} leaf.
+    println!("perf-delta: running HEAD {head_short} perf tests in checkout");
     let head_status = Command::new("cargo")
-        .current_dir(repo_root)
+        .current_dir(&head_wt_dir)
         .args(perf_test_argv(
             &kernel_arg,
             filter,
@@ -572,14 +718,17 @@ fn dual_run(
 /// dirs -> distinct files -> all N survive. All leaves live under the shared
 /// runs-root, so the noise
 /// compare's pool scan finds them and partitions by `project_commit`
-/// (baseline=A, HEAD=B), not by leaf. The baseline checkout is created
-/// once and removed on return via [`WorktreeGuard`]. A non-zero child exit is
+/// (baseline=A, HEAD=B), not by leaf. Both checkouts (baseline + HEAD
+/// snapshot) are created once and removed on return via [`WorktreeGuard`],
+/// so the HEAD side is hermetic like the baseline. A non-zero child exit is
 /// logged, not fatal (some `performance_mode` failures are expected; the
 /// sidecars that landed are still comparable).
 #[allow(clippy::too_many_arguments)]
 fn noise_dual_run(
+    repo: &gix::Repository,
     repo_root: &Path,
-    baseline_full_hex: &str,
+    baseline_tree: gix::ObjectId,
+    head_tree: gix::ObjectId,
     baseline_short: &str,
     head_short: &str,
     kernel: &str,
@@ -591,20 +740,26 @@ fn noise_dual_run(
 ) -> Result<()> {
     let runs_root_abs = repo_root.join(ktstr::test_support::runs_root());
     let wt_dir = worktree_checkout_dir(&std::env::temp_dir(), baseline_short);
+    let head_wt_dir = worktree_checkout_dir(&std::env::temp_dir(), head_short);
     let kernel_arg = resolve_kernel_for_children(repo_root, kernel);
 
-    // Serialize same-baseline runs before the self-heal remove_dir_all's the shared
-    // checkout (see dual_run for the full rationale). Held for the whole run;
-    // declared before `_guard` so it drops after the worktree is removed.
-    let _wt_lock = acquire_baseline_worktree_lock(&wt_dir, baseline_short)?;
-    // Self-heal a leftover worktree, then create the detached baseline (see
-    // create_baseline_worktree — Ctrl-C / SIGKILL skip WorktreeGuard::drop).
-    create_baseline_worktree(repo_root, &wt_dir, baseline_full_hex, baseline_short)?;
-    let _guard = WorktreeGuard {
+    // Serialize concurrent runs that share a checkout path (see dual_run for the
+    // full rationale). Both locks declared before both guards so each lock drops
+    // after its checkout is removed (LIFO: guards drop first).
+    let _baseline_lock = acquire_baseline_worktree_lock(&wt_dir, baseline_short)?;
+    let _head_lock = acquire_baseline_worktree_lock(&head_wt_dir, head_short)?;
+    // Create both checkouts, self-healing any leftover from an interrupted prior
+    // run (Ctrl-C / SIGKILL skip WorktreeGuard::drop).
+    create_checkout_from_tree(repo, &wt_dir, baseline_tree, baseline_short)?;
+    let _baseline_guard = WorktreeGuard {
         wt_dir: wt_dir.clone(),
     };
-    // Ctrl-C during the checkout above: bail before the run loop.
-    // WorktreeGuard::drop removes the (possibly partial) checkout.
+    create_checkout_from_tree(repo, &head_wt_dir, head_tree, head_short)?;
+    let _head_guard = WorktreeGuard {
+        wt_dir: head_wt_dir.clone(),
+    };
+    // Ctrl-C during either checkout: bail before the run loop. The guards remove
+    // the (possibly partial) checkouts.
     if crate::interrupt::caught().is_some() {
         return Ok(());
     }
@@ -638,7 +793,7 @@ fn noise_dual_run(
         }
 
         let hs = Command::new("cargo")
-            .current_dir(repo_root)
+            .current_dir(&head_wt_dir)
             .args(perf_test_argv(
                 &kernel_arg,
                 filter,
@@ -843,17 +998,21 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
         let kernel = args
             .kernel
             .context("--noise-adjust requires --kernel (the kernel both perf runs boot)")?;
-        // Reclaim worktrees orphaned by prior interrupted runs against
+        // Snapshot both trees ONCE at command start (hermetic HEAD/B side).
+        let (baseline_tree, head_snapshot_tree) = resolve_run_trees(&repo, baseline_oid)?;
+        // Reclaim checkouts orphaned by prior interrupted runs against
         // OTHER baselines (the per-baseline self-heal misses them).
         sweep_stale_worktrees(&std::env::temp_dir());
         // Survive Ctrl-C during run production so WorktreeGuard::drop
-        // (worktree removal) runs; propagate the interrupt as 128+signal.
+        // (checkout removal) runs; propagate the interrupt as 128+signal.
         let interrupt_guard = crate::interrupt::InterruptGuard::install();
         finish_or_reraise(
             interrupt_guard,
             noise_dual_run(
+                &repo,
                 &cwd,
-                &baseline_oid.to_hex().to_string(),
+                baseline_tree,
+                head_snapshot_tree,
                 &baseline,
                 &head,
                 kernel,
@@ -885,15 +1044,19 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
         let kernel = args
             .kernel
             .context("--dual-run requires --kernel (the kernel both perf runs boot)")?;
-        // Reclaim cross-baseline orphaned worktrees, then survive Ctrl-C
+        // Snapshot both trees ONCE at command start (hermetic HEAD/B side).
+        let (baseline_tree, head_snapshot_tree) = resolve_run_trees(&repo, baseline_oid)?;
+        // Reclaim cross-baseline orphaned checkouts, then survive Ctrl-C
         // so WorktreeGuard::drop runs and the interrupt propagates as 130.
         sweep_stale_worktrees(&std::env::temp_dir());
         let interrupt_guard = crate::interrupt::InterruptGuard::install();
         finish_or_reraise(
             interrupt_guard,
             dual_run(
+                &repo,
                 &cwd,
-                &baseline_oid.to_hex().to_string(),
+                baseline_tree,
+                head_snapshot_tree,
                 &baseline,
                 &head,
                 kernel,
@@ -1241,32 +1404,18 @@ mod tests {
     }
 
     #[test]
-    fn create_baseline_worktree_materializes_the_committed_tree() {
-        // Build a throwaway repo with one committed file, then check that
-        // create_baseline_worktree materializes that file into a PLAIN dir
-        // with no `.git` — the gix-checkout replacement for `git worktree
-        // add --detach`. Pins our wiring (index_from_tree -> checkout_options
-        // -> gix::worktree::state::checkout), not gix itself.
+    fn create_checkout_from_tree_materializes_the_tree() {
+        // Build a throwaway repo with one blob+tree, then check that
+        // create_checkout_from_tree materializes it into a PLAIN dir with no
+        // `.git`. Pins our wiring (index_from_tree -> checkout_options ->
+        // gix::worktree::state::checkout), not gix itself. A committed HEAD is
+        // NOT needed — the fn checks out a tree oid directly.
         let base = std::env::temp_dir().join(format!("ktstr-pd-gixco-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let repo_dir = base.join("repo");
         std::fs::create_dir_all(&repo_dir).expect("mk repo dir");
 
-        let mut repo = gix::init(&repo_dir).expect("gix::init");
-        let _ = repo
-            .committer_or_set_generic_fallback()
-            .expect("committer fallback");
-        {
-            // Author identity fallback so `commit` succeeds with no ambient
-            // git identity (CI runners) — mirrors the sidecar commit fixtures.
-            use gix::config::tree::gitoxide;
-            let mut cfg = gix::config::File::new(gix::config::file::Metadata::api());
-            cfg.set_raw_value(gitoxide::Author::NAME_FALLBACK, "ktstr-test")
-                .expect("author name fallback");
-            cfg.set_raw_value(gitoxide::Author::EMAIL_FALLBACK, "ktstr-test@example.invalid")
-                .expect("author email fallback");
-            repo.config_snapshot_mut().append(cfg);
-        }
+        let repo = gix::init(&repo_dir).expect("gix::init");
         let blob = repo.write_blob(b"baseline\n").expect("write blob").detach();
         let tree = gix::objs::Tree {
             entries: vec![gix::objs::tree::Entry {
@@ -1276,20 +1425,13 @@ mod tests {
             }],
         };
         let tree_id: gix::ObjectId = repo.write_object(&tree).expect("write tree").detach();
-        let commit: gix::ObjectId = repo
-            .commit("HEAD", "init", tree_id, std::iter::empty::<gix::ObjectId>())
-            .expect("commit")
-            .detach();
-        let full_hex = commit.to_hex().to_string();
-        let short = &full_hex[..7];
 
         let wt = base.join("checkout");
-        create_baseline_worktree(&repo_dir, &wt, &full_hex, short).expect("gix baseline checkout");
-
+        create_checkout_from_tree(&repo, &wt, tree_id, "baseline").expect("gix checkout");
         assert_eq!(
             std::fs::read_to_string(wt.join("file.txt")).expect("checked-out file present"),
             "baseline\n",
-            "the committed tree's file must be materialized into the plain checkout",
+            "the tree's file must be materialized into the plain checkout",
         );
         assert!(
             !wt.join(".git").exists(),
@@ -1299,15 +1441,218 @@ mod tests {
         // Self-heal: a leftover populated checkout is cleared before re-checkout.
         std::fs::write(wt.join("file.txt"), b"stale\n").expect("dirty the leftover");
         std::fs::write(wt.join("untracked.tmp"), b"junk\n").expect("leftover untracked");
-        create_baseline_worktree(&repo_dir, &wt, &full_hex, short).expect("re-checkout self-heals");
+        create_checkout_from_tree(&repo, &wt, tree_id, "baseline").expect("re-checkout self-heals");
         assert_eq!(
             std::fs::read_to_string(wt.join("file.txt")).expect("file present after re-checkout"),
             "baseline\n",
-            "re-checkout must overwrite a stale leftover with the committed content",
+            "re-checkout must overwrite a stale leftover with the tree content",
         );
         assert!(
             !wt.join("untracked.tmp").exists(),
             "pre-checkout self-heal (remove_dir_all) clears a leftover's untracked debris",
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Throwaway git repo: commit `files` (HEAD + a persisted index + matching
+    /// worktree files, so `status` starts clean and any later worktree edit is
+    /// the only change). Returns the repo and HEAD's tree oid. Mirrors the
+    /// sidecar commit fixtures.
+    fn init_committed_repo(
+        dir: &std::path::Path,
+        files: &[(&str, &[u8])],
+    ) -> (gix::Repository, gix::ObjectId) {
+        std::fs::create_dir_all(dir).expect("mk repo dir");
+        let mut repo = gix::init(dir).expect("gix::init");
+        let _ = repo
+            .committer_or_set_generic_fallback()
+            .expect("committer fallback");
+        {
+            use gix::config::tree::gitoxide;
+            let mut cfg = gix::config::File::new(gix::config::file::Metadata::api());
+            cfg.set_raw_value(gitoxide::Author::NAME_FALLBACK, "ktstr-test")
+                .expect("author name fallback");
+            cfg.set_raw_value(gitoxide::Author::EMAIL_FALLBACK, "ktstr-test@example.invalid")
+                .expect("author email fallback");
+            repo.config_snapshot_mut().append(cfg);
+        }
+        let mut entries: Vec<gix::objs::tree::Entry> = files
+            .iter()
+            .map(|(name, content)| {
+                let oid = repo.write_blob(content).expect("write blob").detach();
+                gix::objs::tree::Entry {
+                    mode: gix::objs::tree::EntryKind::Blob.into(),
+                    filename: (*name).into(),
+                    oid,
+                }
+            })
+            .collect();
+        // git tree entries must be sorted by filename.
+        entries.sort_by(|a, b| a.filename.cmp(&b.filename));
+        let tree = gix::objs::Tree { entries };
+        let tree_id: gix::ObjectId = repo.write_object(&tree).expect("write tree").detach();
+        repo.commit("HEAD", "init", tree_id, std::iter::empty::<gix::ObjectId>())
+            .expect("commit");
+        // Persist an index from the tree + write the worktree files so status
+        // sees a clean baseline until the test edits the worktree.
+        let mut idx = repo.index_from_tree(&tree_id).expect("index_from_tree");
+        idx.write(gix::index::write::Options::default())
+            .expect("write index");
+        for (name, content) in files {
+            std::fs::write(dir.join(name), content).expect("write worktree file");
+        }
+        (repo, tree_id)
+    }
+
+    /// The load-bearing dirty-HEAD property: a dirty HEAD snapshots the WORKTREE
+    /// bytes, not HEAD's — so perf-delta builds the WIP, and the recorded
+    /// `-dirty` label matches the built content.
+    #[test]
+    fn dirty_head_snapshot_captures_worktree_bytes_not_head() {
+        let base = std::env::temp_dir().join(format!("ktstr-pd-snap-dirty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo_dir = base.join("repo");
+        let (repo, head_tree) = init_committed_repo(&repo_dir, &[("file.txt", b"v1\n")]);
+        // Modify the worktree (unstaged) so HEAD/index=v1 but worktree=v2.
+        std::fs::write(repo_dir.join("file.txt"), b"v2\n").expect("dirty the worktree");
+
+        let snap = build_head_snapshot_tree(&repo, head_tree, true).expect("build snapshot");
+        assert_ne!(snap, head_tree, "a dirty snapshot must differ from HEAD's tree");
+        let wt = base.join("checkout");
+        create_checkout_from_tree(&repo, &wt, snap, "head").expect("checkout snapshot");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("file.txt")).expect("snapshot file"),
+            "v2\n",
+            "the snapshot holds the WORKTREE bytes (v2), not HEAD's (v1)",
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Worktree-wins over the index: a file STAGED as v2 but then reverted in
+    /// the worktree to v1 (== HEAD) snapshots as v1 — the staged v2 is ignored
+    /// (perf-delta builds the WORKING TREE, not the index). This is the
+    /// documented "snapshot != git stash" corner. Exercises the TreeIndex
+    /// (staged) status leg specifically.
+    #[test]
+    fn dirty_head_snapshot_worktree_wins_over_staged() {
+        let base = std::env::temp_dir().join(format!("ktstr-pd-snap-stg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo_dir = base.join("repo");
+        let (repo, head_tree) = init_committed_repo(&repo_dir, &[("file.txt", b"v1\n")]);
+        // Stage v2: persist an index built from a v2 tree (index = v2, HEAD = v1).
+        let blob_v2 = repo.write_blob(b"v2\n").expect("write v2 blob").detach();
+        let tree_v2 = gix::objs::Tree {
+            entries: vec![gix::objs::tree::Entry {
+                mode: gix::objs::tree::EntryKind::Blob.into(),
+                filename: "file.txt".into(),
+                oid: blob_v2,
+            }],
+        };
+        let tree_v2_id: gix::ObjectId = repo.write_object(&tree_v2).expect("write v2 tree").detach();
+        let mut idx = repo.index_from_tree(&tree_v2_id).expect("index_from_tree v2");
+        idx.write(gix::index::write::Options::default())
+            .expect("persist v2 index");
+        // Revert the worktree to v1 (== HEAD): now index=v2 but worktree=v1.
+        std::fs::write(repo_dir.join("file.txt"), b"v1\n").expect("revert worktree to v1");
+
+        let snap = build_head_snapshot_tree(&repo, head_tree, true).expect("build snapshot");
+        assert_eq!(
+            snap, head_tree,
+            "worktree wins: a staged-then-reverted file snapshots as its worktree \
+             content (v1 == HEAD), ignoring the staged v2",
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A clean HEAD returns HEAD's tree verbatim (zero ODB writes) — the
+    /// read-only clean-HEAD path, no editor.
+    #[test]
+    fn clean_head_snapshot_is_head_tree_unchanged() {
+        let base = std::env::temp_dir().join(format!("ktstr-pd-snap-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo_dir = base.join("repo");
+        let (repo, head_tree) = init_committed_repo(&repo_dir, &[("file.txt", b"v1\n")]);
+        let snap = build_head_snapshot_tree(&repo, head_tree, false).expect("clean snapshot");
+        assert_eq!(
+            snap, head_tree,
+            "a clean HEAD snapshot is HEAD's tree unchanged (no editor, no writes)",
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// An untracked, non-ignored file (uncommitted WIP not yet `git add`ed) IS
+    /// in the snapshot; an ignored file is NOT.
+    #[test]
+    fn dirty_head_snapshot_includes_untracked_but_excludes_ignored() {
+        let base = std::env::temp_dir().join(format!("ktstr-pd-snap-untr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo_dir = base.join("repo");
+        let (repo, head_tree) =
+            init_committed_repo(&repo_dir, &[("file.txt", b"v1\n"), (".gitignore", b"ignore.me\n")]);
+        std::fs::write(repo_dir.join("new.rs"), b"fn wip() {}\n").expect("untracked WIP");
+        std::fs::write(repo_dir.join("ignore.me"), b"scratch\n").expect("ignored scratch");
+
+        let snap = build_head_snapshot_tree(&repo, head_tree, true).expect("build snapshot");
+        let wt = base.join("checkout");
+        create_checkout_from_tree(&repo, &wt, snap, "head").expect("checkout snapshot");
+        assert!(
+            wt.join("new.rs").exists(),
+            "an untracked non-ignored WIP file is included in the snapshot",
+        );
+        assert!(
+            !wt.join("ignore.me").exists(),
+            "an ignored file is excluded from the snapshot",
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A file deleted from the worktree is removed from the snapshot tree.
+    #[test]
+    fn dirty_head_snapshot_drops_a_deleted_file() {
+        let base = std::env::temp_dir().join(format!("ktstr-pd-snap-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo_dir = base.join("repo");
+        let (repo, head_tree) =
+            init_committed_repo(&repo_dir, &[("keep.txt", b"keep\n"), ("gone.txt", b"gone\n")]);
+        std::fs::remove_file(repo_dir.join("gone.txt")).expect("delete gone.txt");
+
+        let snap = build_head_snapshot_tree(&repo, head_tree, true).expect("build snapshot");
+        let wt = base.join("checkout");
+        create_checkout_from_tree(&repo, &wt, snap, "head").expect("checkout snapshot");
+        assert!(wt.join("keep.txt").exists(), "the kept file survives");
+        assert!(
+            !wt.join("gone.txt").exists(),
+            "a worktree-deleted file is dropped from the snapshot",
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The snapshot preserves the worktree's executable bit (a dropped +x on a
+    /// perf script would silently change behavior).
+    #[test]
+    fn dirty_head_snapshot_preserves_the_worktree_exec_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("ktstr-pd-snap-exec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo_dir = base.join("repo");
+        // Committed as a plain (non-exec) blob.
+        let (repo, head_tree) = init_committed_repo(&repo_dir, &[("run.sh", b"#!/bin/sh\n")]);
+        // Worktree copy: modified AND made executable.
+        std::fs::write(repo_dir.join("run.sh"), b"#!/bin/sh\necho hi\n").expect("edit");
+        std::fs::set_permissions(repo_dir.join("run.sh"), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod +x");
+
+        let snap = build_head_snapshot_tree(&repo, head_tree, true).expect("build snapshot");
+        let wt = base.join("checkout");
+        create_checkout_from_tree(&repo, &wt, snap, "head").expect("checkout snapshot");
+        assert!(
+            std::fs::metadata(wt.join("run.sh"))
+                .expect("run.sh present")
+                .permissions()
+                .mode()
+                & 0o111
+                != 0,
+            "the snapshot preserves the worktree's exec bit (BlobExecutable)",
         );
         std::fs::remove_dir_all(&base).ok();
     }
