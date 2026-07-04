@@ -5,7 +5,7 @@
 //! [`std::process::Command::status`] at the default SIGINT/SIGTERM
 //! disposition, so a terminal Ctrl-C (or a `kill`) killed the parent
 //! BEFORE it could run its post-run cleanup (the `/dev/shm` sweep, the
-//! artifact footer, the perf-delta worktree removal).
+//! artifact footer, the perf-delta gix-checkout removal).
 //!
 //! nextest itself, being in the same foreground process group, receives
 //! its own SIGINT and tears down every per-test child (its own handler,

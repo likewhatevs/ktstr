@@ -432,7 +432,7 @@ cargo ktstr kernel clean --keep 3                          # keep 3 most recent
 cargo ktstr verifier                                       # BPF verifier sweep (auto-discover kernel)
 cargo ktstr verifier --kernel 6.14.2 --kernel 6.15.0       # sweep across multiple kernels
 cargo ktstr stats                                          # aggregate gauntlet sidecars
-cargo ktstr perf-delta --dual-run --kernel 6.14            # gate HEAD vs merge-base on performance_mode metrics
+cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14      # gate HEAD vs merge-base on performance_mode metrics
 cargo ktstr stats show-host --run <key>                    # print archived HostContext for a run
 cargo ktstr stats list-metrics                             # discover the metric vocabulary in archived sidecars
 cargo ktstr stats list-values                              # list distinct values per filterable dimension in the sidecar pool

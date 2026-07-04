@@ -1123,7 +1123,7 @@ exits `0` — an empty perf set is "nothing to compare", not a failure.
 | `--no-phases` / `--phases-only` / `--steps-only` / `--phase N` / `--phase-threshold PCT` | per-phase render (meaningful rows) | Per-phase output projection for the `--noise-adjust` spread block (render-only; does not change the verdict). Each **requires `--noise-adjust`** — per-phase output exists only on the noise-adjusted path. Like the aggregate table, the per-phase spread block shows only meaningful rows by default; pass `--all-metrics` to include stable / noisy rows. |
 | `--all-metrics` | off | Show every compared metric row on BOTH the `--noise-adjust` aggregate table AND the per-phase spread table, including stable (unchanged) and noisy (<2 usable runs) rows. Default: each table prints only meaningful rows (regression / improvement / informational), collapsing to a one-line summary when every row is suppressed. The per-phase table is additionally spread-gated by `--phase-threshold`; its coverage (one-sided metrics) table is always shown. Display-only — never affects the failure gate. |
 
-Runnable as `just perf-delta <kernel> [base]`.
+Runnable as `just perf-delta <kernel> [base] [runs]` (runs per side defaults to 5).
 
 ## affected {#affected}
 
