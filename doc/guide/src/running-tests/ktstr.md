@@ -152,9 +152,9 @@ taskstats kconfig gating.
 |------|---------|-------------|
 | `BASELINE` | required | Path to the baseline `.ctprof.zst` snapshot. |
 | `CANDIDATE` | required | Path to the candidate `.ctprof.zst` snapshot. |
-| `--group-by AXIS` | `all` | Grouping axis: `all` (default; runs cgroup → pcomm → comm, folding renamed-but-identical cgroups together), `pcomm` (process name), `cgroup` (cgroup v2 path), `comm` (thread-name pattern, token-normalized), or `comm-exact` (synonym for `comm --no-thread-normalize`). |
+| `--group-by AXIS` | `all` | Grouping axis: `all` (default; runs cgroup → pcomm → comm, folding renamed-but-identical cgroups together), `pcomm` (process name), `cgroup` (cgroup v2 path), `comm` (thread-name pattern, token-normalized), or `comm-exact` (literal thread name, thread axis only: unlike `comm --no-thread-normalize`, `smaps_rollup` keying stays pcomm-pattern normalized). |
 | `--cgroup-flatten GLOB` | -- | Glob pattern that collapses dynamic cgroup path segments before grouping (e.g. `'/kubepods/*/workload'`). Repeatable; explicit globs apply before auto-normalize. |
-| `--no-thread-normalize` | off | Disable token-based pattern normalization for `--group-by comm`. Threads group by literal `comm`. |
+| `--no-thread-normalize` | off | Disable token-based pattern normalization across every name axis: `--group-by comm`, `--group-by pcomm`, and the `smaps_rollup` per-process keying (which reverts to literal `pcomm[tgid]`). Names group literally; smaps rows keep per-PID identity. No effect under `comm-exact` (already literal) or `cgroup` (use `--no-cg-normalize`). |
 | `--no-cg-normalize` | off | Disable token-based normalization for `--group-by cgroup`. Cgroup paths group by literal post-flatten path. |
 | `--sort-by SPEC` | by largest `\|delta_pct\|` | Multi-key sort spec: `metric1[:dir1],metric2[:dir2],...`. Each `metric` is a name from `ctprof metric-list`; each `dir` is `asc` or `desc` (default `desc`). |
 | `--display-format FORMAT` | `arrow` | Per-row column layout. `arrow` (default; collapses baseline/candidate into a single `baseline → candidate` cell), `full` (7 columns), `delta-only` (drop baseline+candidate), `no-pct`, or `pct-only`. |

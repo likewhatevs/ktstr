@@ -40,9 +40,8 @@ provides:
 - Runtime fields: `balance_interval`, `nr_balance_failed`,
   `max_newidle_lb_cost`.
 - Optional fields: `newidle_call`, `newidle_success`,
-  `newidle_ratio` — added together in 6.19 (proportional newidle
-  balance, kernel commit 33cf66d88306); resolved as optional and
-  absent on pre-6.19 kernels.
+  `newidle_ratio` — added together in 7.0 (backported to 6.18.5+
+  and 6.12.65+); resolved as optional and absent on 6.16–6.18.4.
 
 When `CONFIG_SCHEDSTATS` is also enabled, each domain additionally
 provides load-balancing stats: `lb_count`, `lb_failed`, `lb_balanced`,

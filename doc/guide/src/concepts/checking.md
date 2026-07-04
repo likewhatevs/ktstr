@@ -655,9 +655,12 @@ combined.merge(cgroup_1_result);
 // combined.inconclusive_details() iterates inconclusive payloads
 ```
 
-Stats merging takes worst values across cgroups for spread, gap, wake
-latency, and migration ratio. Counters (`total_workers`, `total_cpus`,
-`total_migrations`, `total_iterations`) are summed.
+Stats merging takes worst values across cgroups for spread, gap, and
+migration ratio. Counters (`total_workers`, `total_cpus`,
+`total_migrations`, `total_iterations`) are summed. Wake-latency and
+run-delay distributions (and the NUMA / iteration-efficiency
+roll-ups) are not folded during merge — they re-pool post-merge from
+the per-cgroup raw samples via `populate_run_distribution_metrics`.
 
 For examples of overriding thresholds at the scheduler and per-test
 level, see [Customize Checking](../recipes/custom-checking.md).

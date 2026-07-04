@@ -156,7 +156,8 @@ pub enum WorkType {
 
 > **Imports:** `WorkType`, `WorkPhase`, `SchedPolicy`, `AluWidth`,
 > `WorkSpec`, `WorkloadConfig`, `SchbenchConfig` (the `Schbench`
-> config), and `ReapMode` (the `CgroupAttachStorm` reap mode) are in
+> config), `TaobenchConfig` (the `Taobench` config), and `ReapMode`
+> (the `CgroupAttachStorm` reap mode) are in
 > `ktstr::prelude::*`.
 > (Note: the prelude also exports an unrelated `Phase` from
 > `crate::assert` — the temporal-assertion phase bucket. The

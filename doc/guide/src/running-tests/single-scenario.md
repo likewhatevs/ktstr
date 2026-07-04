@@ -7,8 +7,12 @@ cargo ktstr test --kernel ../linux -- -E 'test(sched_basic_proportional)'
 ```
 
 The `-E 'test(NAME)'` form is a nextest filterset expression. `test(NAME)`
-is a substring match against the test name; use `test(=NAME)` for an exact
-match. See nextest's filterset docs for the full grammar.
+is a substring match against the test name; `test(=NAME)` is an exact match
+against the full nextest test name. Because `#[ktstr_test]` tests are
+registered under an `ktstr/` prefix (gauntlet variants under `gauntlet/...`
+— see [Test name shapes](../running-tests.md)), the exact form must include
+it, e.g. `test(=ktstr/sched_basic_proportional)`, not the bare function
+name. See nextest's filterset docs for the full grammar.
 
 Integration-feature-gated tests (e.g. the jemalloc probe e2es) need
 `--features integration`, placed after the `--` separator so it is

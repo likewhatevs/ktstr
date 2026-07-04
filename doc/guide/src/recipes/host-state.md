@@ -112,7 +112,7 @@ cargo ktstr perf-delta --dual-run --kernel 6.14
 [perf-delta](../running-tests/cargo-ktstr.md#perf-delta)); the
 baseline is side A and HEAD is side B. It picks the first
 sidecar with `Some(host)` from each side, then prints one of
-five host-section shapes depending on what survived capture:
+four host-section shapes depending on what survived capture:
 
 - Neither side carried host context — the host section is
   omitted entirely (no banner, no rows).

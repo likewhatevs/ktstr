@@ -35,10 +35,17 @@ plan to validate guide changes before pushing.
 
 ## Compile-fail tests (trybuild)
 
-Fixtures under `tests/compile_fail/` pin the proc-macro diagnostics
-that `#[ktstr_test]` and `declare_scheduler!` emit. Without them an
-upstream `syn` / `proc-macro2` bump can silently degrade an error
-message that a test author would otherwise see at compile time.
+Fixtures under `tests/compile_fail/` pin two kinds of compile-time
+diagnostics: (1) the proc-macro diagnostics that `#[ktstr_test]`,
+`declare_scheduler!`, and `#[derive(Payload)]` emit (the
+`ktstr_test_*`, `declare_scheduler_*`, and `derive_payload_*`
+fixtures), and (2) the trait-bound errors from the sealed metric-type
+traits `Summable` / `Maxable` / `Modeable` / `Rangeable` in
+`src/metric_types.rs` — e.g. a generic site bound on `T: Maxable`
+refusing `Bytes` (the `metric_types_*` fixtures). Without them an
+upstream `syn` / `proc-macro2` bump, or a change to a trait's
+`#[diagnostic::on_unimplemented]` message, can silently degrade an
+error message that a test author would otherwise see at compile time.
 
 The fixtures live in their own `[[test]] name = "compile_fail"`
 target. The test driver function in `tests/compile_fail.rs` carries

@@ -201,17 +201,29 @@ binary in:
    binary's parent).
 3. `target/debug/`.
 4. `target/release/`.
-5. On-demand build via `cargo build` against the scheduler's
-   package name — ktstr invokes the build itself when the
-   preceding four locations have no match, so a fresh checkout
-   with an unbuilt scheduler still produces a usable binary
-   without the caller pre-running `cargo build`.
+The ordering above (steps 1–4 first, on-demand build last) applies
+only to a direct `cargo test` run marked with `KTSTR_CARGO_TEST_MODE=1`.
+On the default `cargo ktstr test` (orchestrated) path the on-demand
+build runs FIRST — right after the `KTSTR_SCHEDULER` env checks:
+
+- `cargo build -p <scheduler>` runs before the sibling / target-dir
+  probes, so an edited scheduler is never validated against a stale
+  pre-built binary.
+- If that build FAILS, ktstr REFUSES: the test hard-fails rather than
+  falling back to a pre-built binary. Set
+  `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK=1` to opt into the
+  sibling → `target/{release,debug}/` fallback when the workspace
+  build is momentarily broken.
+
+So step 5 (the on-demand build after steps 2–4 miss) only runs on the
+`KTSTR_CARGO_TEST_MODE` path; the orchestrated path builds up front.
 
 **Fixes:**
 
-- Build the scheduler first: `cargo build -p scx_mitosis` (skipped
-  automatically if step 5 above can build it on demand, but
-  pre-building makes the first test run faster).
+- Build the scheduler first: `cargo build -p scx_mitosis` (on the
+  default `cargo ktstr test` path this build already runs
+  automatically before the pre-built probes, so pre-building only
+  primes the cache to make the first test run faster).
 - Set `KTSTR_SCHEDULER=/path/to/binary`.
 - Use `SchedulerSpec::Path` for an explicit path in `#[ktstr_test]`.
 
@@ -260,8 +272,10 @@ WARN ktstr::vmm::rust_init: ktstr-init: send_sys_rdy failed within boot budget; 
 The guest-side `ktstr-init` sends a `MSG_TYPE_SYS_RDY` TLV frame
 through the virtio-console bulk port (`/dev/vport0p1`) after the
 VM boots, signaling the host monitor that the guest is ready. The
-retry loop polls for the port device at 100 ms cadence with a
-wall-clock deadline. When the deadline expires the WARN above
+retry loop waits for the port device via an inotify-evented watch
+on `/dev` (guard-railed at a 1 s cadence cap, not a poll), bounded
+by a wall-clock deadline; once the port appears, a failed send is
+retried with a 100 ms throttle capped by the remaining budget. When the deadline expires the WARN above
 fires, the guest continues running, and the host monitor falls
 through to its `data_valid` gate to start sampling without the
 SYS_RDY trigger; a late SYS_RDY arriving past the host's 5 s

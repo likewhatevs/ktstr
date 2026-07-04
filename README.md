@@ -208,12 +208,23 @@ declare_scheduler!(MY_SCHED, {
 ```
 
 `binary = "scx_my_sched"` tells ktstr to auto-discover the scheduler
-binary. The resolution cascade is: explicit `KTSTR_SCHEDULER` env
-var → `$PATH` (when invoked under `cargo test`) →
-sibling-of-test-binary → `target/debug/` → `target/release/` →
-on-demand build from the workspace. If the scheduler is a `[[bin]]`
-target in the same workspace, `cargo build` places it where the
-sibling/target steps find it, so discovery is automatic. The
+binary. Resolution depends on how the test is invoked. Under the
+orchestrated `cargo ktstr test` path the cascade is: per-scheduler
+`KTSTR_SCHEDULER_BIN_<NAME>` → global `KTSTR_SCHEDULER` → an on-demand
+`cargo build -p scx_<name>` from the workspace. That build runs
+*first* — a build failure hard-fails the test rather than validating
+against a possibly-stale pre-built binary; only with
+`KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK=1` does it fall through to
+`sibling-of-test-binary` → `target/release/` → `target/debug/`. Under
+bare `cargo test` (`KTSTR_CARGO_TEST_MODE`) the on-demand build runs
+*last* instead: `KTSTR_SCHEDULER_BIN_<NAME>` → `KTSTR_SCHEDULER` →
+`$PATH` → `sibling-of-test-binary` → `target/release/` →
+`target/debug/` → on-demand build. `target/release/` is probed before
+`target/debug/` by default (the scheduler builds under the release
+profile; the order flips only under `KTSTR_SCHEDULER_PROFILE=dev`). If
+the scheduler is a `[[bin]]` target in the same workspace, `cargo
+build` places it where the sibling/target steps find it, so discovery
+is automatic. The
 resolved binary is packed into the VM's initramfs. Tests without a
 `scheduler` attribute run under EEVDF (the kernel's default
 scheduler).

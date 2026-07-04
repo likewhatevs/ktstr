@@ -98,10 +98,21 @@ let def = CgroupDef::named("cg_0")
 
 ## Cpuset validation
 
-When a cgroup has a cpuset, ktstr validates that the `MemPolicy`'s
-node set is covered by the NUMA nodes reachable from that cpuset.
-A `MemPolicy::Bind([1])` on a cgroup whose cpuset covers only NUMA
-node 0 will fail with an error at setup time.
+When a cgroup has a cpuset and no cpuset-remapping flag is set, ktstr
+validates that the `MemPolicy`'s node set is covered by the NUMA nodes
+reachable from that cpuset. A `MemPolicy::Bind([1])` on a cgroup whose
+cpuset covers only NUMA node 0 (with no remapping flag) will fail with
+an error at setup time.
+
+The coverage check is flag-dependent. `MpolFlags::STATIC_NODES`
+replaces it with a host-node-existence check: the nodemask is absolute
+and intentionally allowed to fall outside the cpuset, so
+`Bind([1])` with `STATIC_NODES` succeeds as long as node 1 exists on
+the host. `MpolFlags::RELATIVE_NODES` bypasses the coverage check
+entirely (the nodemask is a cpuset-relative ordinal the kernel remaps
+internally). Setup also rejects unknown `MpolFlags` bits and the
+mutually-exclusive `STATIC_NODES | RELATIVE_NODES` combination before
+any coverage check runs.
 
 Policies without a node set (`Default`, `Local`) skip validation.
 

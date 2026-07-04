@@ -154,8 +154,11 @@ non-numeric / type-mismatched fields silently. Useful for blanket
 "every counter must be nondecreasing" sweeps.
 
 **Top-level scalar fields only** for the typed `field_*` helpers.
-Nested struct members (e.g. `"ctx.weight"`) and per-CPU maps need
-the manual closure path through `SampleSeries::bpf`.
+Nested struct members (e.g. `"ctx.weight"`) need the manual closure
+path through `SampleSeries::bpf`. Per-CPU maps use the projector's
+typed helpers: the cross-CPU reductions `field_cpu_sum_*` /
+`field_cpu_max_*` / `field_cpu_min_*`, or `.cpu(n).field_*` to
+select one CPU's slot.
 
 ## The seven temporal patterns
 

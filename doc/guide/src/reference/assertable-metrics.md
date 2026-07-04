@@ -20,8 +20,12 @@ cargo ktstr stats list-metrics --json   # machine-readable (includes kind + ever
 ```
 
 `list-metrics` reads only the static registry; it needs no sidecar
-pool. To see which of these metrics a *particular* run pool actually
-carries, use [`cargo ktstr stats list-values`](../running-tests/cargo-ktstr.md#list-values).
+pool. Which of these metrics a *particular* run actually carries is
+data-dependent on the emitting workload — see the
+[Workload → emitted metrics](#workload--emitted-metrics) table below.
+(`cargo ktstr stats list-values` enumerates the pool's filter
+dimensions — kernels, commits, schedulers, topologies, work types —
+not its metric keys, so it cannot answer which metrics are present.)
 
 ## Registry fields
 
@@ -80,9 +84,13 @@ The metric FAMILIES map to workload categories roughly as:
 - **cgroup / pressure** — emitted by cgroup-exercising scenarios and
   the periodic host-pressure capture.
 
-Because emission is data-dependent, treat `stats list-values` (what a
-pool carries) as ground truth for "will this metric be there?", and
-`list-metrics` as the registry of everything comparable.
+Because emission is data-dependent, use the [Workload → emitted
+metrics](#workload--emitted-metrics) table above to judge whether a
+given metric will be present; `list-metrics` is the registry of
+everything comparable. (`stats list-values` lists only the pool's
+filter dimensions — kernels, commits, schedulers, topologies, work
+types — not its metric keys, so it does not answer "will this metric
+be there?".)
 
 ## PerfDeltaAssertion how-to
 

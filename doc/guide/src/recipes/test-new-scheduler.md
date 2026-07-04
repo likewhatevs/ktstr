@@ -79,9 +79,8 @@ for version selection and local source builds.
 or an explicit `--kernel <spec>` (a version like `6.14`, a cache key
 from `cargo ktstr kernel list`, or a path to a kernel source tree).
 `cargo ktstr test` does not accept a prebuilt `bzImage`/`Image` (only
-`cargo ktstr shell` does). Step 3 populated the cache with the
-declared kernels, so the bare form is sufficient when a single kernel
-is available:
+`cargo ktstr shell` does). Step 3 built the latest stable release into
+the cache, so the bare form resolves that single cached kernel:
 
 ```sh
 cargo ktstr test            # auto-discover from cache / KTSTR_KERNEL
