@@ -269,6 +269,16 @@ pub fn run_make_with_output(
         .try_clone()
         .context("clone pipe write end for stderr")?;
 
+    // NOTE: do NOT arm PR_SET_PDEATHSIG via CommandExt::pre_exec to reap
+    // make on parent death — pre_exec forces the fork+exec path, and this
+    // orchestrator is multithreaded (jemalloc background threads, at least),
+    // so the forked child can deadlock BEFORE exec on a lock another thread
+    // held at fork time (empirically the high-volume drain tests below hang
+    // with no make ever exec'd). Parent death is already handled without it:
+    // the parent holds the only pipe READ end (below), so when it dies make
+    // and its gcc workers get SIGPIPE on their next write (std resets SIGPIPE
+    // to SIG_DFL in spawned children) and terminate; the normal / pipe-error
+    // paths reap via the explicit wait / kill below.
     let mut child = std::process::Command::new("make")
         .args(args)
         .current_dir(kernel_dir)
