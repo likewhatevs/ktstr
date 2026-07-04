@@ -15,11 +15,11 @@
 //! cleanup in normal context, and then re-raise so the process still
 //! exits with the conventional 128+signal status.
 //!
-//! The handler is async-signal-safe: it only stores the signal number in
-//! an atomic. All cleanup runs later in normal context, never in the
-//! handler.
+//! The handler is async-signal-safe: it only stores the signal number and
+//! sets an interrupted flag, both plain atomics. All cleanup runs later in
+//! normal context, never in the handler.
 
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 /// Signal number recorded by [`handler`] on the first SIGINT/SIGTERM
 /// delivery while a guard is installed; `0` means none seen. Read via
@@ -27,14 +27,25 @@ use std::sync::atomic::{AtomicI32, Ordering};
 /// (the child-run paths are sequential), so one global suffices.
 static CAUGHT_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
+/// Set true by [`handler`] on any SIGINT/SIGTERM while a guard is installed;
+/// cleared by [`InterruptGuard::install`]. A `&AtomicBool` is exactly what
+/// `gix`'s parallel checkout polls to abort mid-materialize, so perf-delta's
+/// baseline checkout passes `&INTERRUPTED` to let a Ctrl-C abort the checkout
+/// promptly instead of running it to completion.
+pub(crate) static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
 /// SIGINT/SIGTERM handler: record the signal and return so the blocked
 /// `Command::status()` resumes (its `waitpid` is EINTR-retried by std)
 /// once the child finishes its own teardown.
 ///
-/// Async-signal-safe: the only operation is an atomic compare-exchange.
+/// Async-signal-safe: the only operations are two lock-free atomic ops (a
+/// compare-exchange on the signal number and a store on the interrupted
+/// flag), both on the async-signal-safe list.
 extern "C" fn handler(sig: libc::c_int) {
     // Keep the FIRST signal seen so SIGINT-then-SIGTERM reports SIGINT.
     let _ = CAUGHT_SIGNAL.compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst);
+    // Abort any in-progress gix checkout polling this flag.
+    INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
 /// RAII guard that routes SIGINT + SIGTERM to [`handler`] for its
@@ -58,6 +69,7 @@ impl InterruptGuard {
     /// std) and would need re-checking.
     pub(crate) fn install() -> Self {
         CAUGHT_SIGNAL.store(0, Ordering::SeqCst);
+        INTERRUPTED.store(false, Ordering::SeqCst);
         // SAFETY: `handler` is an `extern "C" fn` matching the sa_handler
         // ABI and touches only an atomic (async-signal-safe). `sigaction`
         // with valid pointers cannot fail for SIGINT/SIGTERM. `prev_*` are
@@ -170,6 +182,10 @@ mod tests {
 
         let guard = InterruptGuard::install();
         assert_eq!(guard.interrupted(), None, "no signal before delivery");
+        assert!(
+            !INTERRUPTED.load(Ordering::SeqCst),
+            "install clears the interrupted flag"
+        );
         let want = handler as *const () as usize;
         assert_eq!(current(libc::SIGINT), want, "install points SIGINT at handler");
         assert_eq!(current(libc::SIGTERM), want, "install points SIGTERM at handler");
@@ -177,6 +193,10 @@ mod tests {
         // Synthetic delivery — never `raise`, which would kill the test.
         handler(libc::SIGINT);
         assert_eq!(guard.interrupted(), Some(libc::SIGINT));
+        assert!(
+            INTERRUPTED.load(Ordering::SeqCst),
+            "handler sets the interrupted flag so a gix checkout can abort"
+        );
         // First signal wins.
         handler(libc::SIGTERM);
         assert_eq!(guard.interrupted(), Some(libc::SIGINT));

@@ -8,9 +8,10 @@
 //! (the sole perf-delta axis — a cross-config question like scheduler A vs B is
 //! answered in-test via the Verdict DSL's `better_across_phases`, not here). The
 //! `--dual-run` and `--noise-adjust` paths PRODUCE both commits'
-//! `performance_mode` sidecars — checking the baseline out in a detached
-//! `git worktree` (shelled, because `gix` 0.83 has no worktree-creation
-//! API) before invoking `compare_partitions` / `compare_partitions_noise`.
+//! `performance_mode` sidecars — checking the baseline out into a plain temp
+//! dir via `gix` (`index_from_tree` + `gix::worktree::state::checkout`, no
+//! linked worktree and no `.git`) before invoking `compare_partitions` /
+//! `compare_partitions_noise`.
 
 /// How the baseline commit (the "compare-current-to" point) is resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,7 +108,7 @@ pub(crate) fn resolve_baseline(
 }
 
 // ---------------------------------------------------------------------------
-// Dual-run (increment 3b): produce the baseline run in a git worktree
+// Dual-run (increment 3b): produce the baseline run in a plain gix checkout
 // ---------------------------------------------------------------------------
 
 use ktstr::flock::{FlockMode, try_flock};
@@ -118,11 +119,13 @@ use std::process::Command;
 /// DISTINCT subdir from HEAD's `{kernel}-{HEAD}` default leaf so both
 /// commits' sidecars coexist under the shared [`runs_root`] without
 /// collision. The compare partitions by the sidecar `project_commit`
-/// FIELD (set from the worktree's git checkout), not by this dir name,
-/// so the name only needs to be unique; `baseline_short` (7-hex) makes
-/// it so. Absolute (rooted at the MAIN tree's runs-root) so the
-/// worktree-cwd child writes into the main pool, not the worktree's own
-/// `target/ktstr`.
+/// FIELD (the baseline child records it verbatim from
+/// [`KTSTR_PROJECT_COMMIT_ENV`]), not by this dir name, so the name only
+/// needs to be unique; `baseline_short` (7-hex) makes it so. Absolute
+/// (rooted at the MAIN tree's runs-root) so the checkout-cwd child writes
+/// into the main pool, not the checkout dir's own `target/ktstr`.
+///
+/// [`KTSTR_PROJECT_COMMIT_ENV`]: ktstr::KTSTR_PROJECT_COMMIT_ENV
 ///
 /// [`runs_root`]: ktstr::test_support::runs_root
 fn baseline_sidecar_leaf(runs_root_abs: &Path, baseline_short: &str) -> PathBuf {
@@ -167,53 +170,36 @@ fn acquire_baseline_worktree_lock(
 }
 
 /// Env pairs for the baseline child `cargo ktstr test`: restrict to
-/// `performance_mode` tests ([`KTSTR_PERF_ONLY_ENV`]) and redirect its
-/// sidecar output into the main pool leaf
-/// ([`KTSTR_SIDECAR_DIR_ENV`], absolute) so it pools with HEAD's run.
+/// `performance_mode` tests ([`KTSTR_PERF_ONLY_ENV`]), redirect its sidecar
+/// output into the main pool leaf ([`KTSTR_SIDECAR_DIR_ENV`], absolute) so
+/// it pools with HEAD's run, and stamp the recorded `project_commit`
+/// ([`KTSTR_PROJECT_COMMIT_ENV`] = `project_commit`, the parent's resolved
+/// baseline label). The child's checkout is a plain gix checkout with no
+/// `.git`, so it CANNOT derive `project_commit` from a `gix::discover`; the
+/// explicit label also guarantees the recorded field equals what the
+/// compare filters the pool on.
 ///
 /// [`KTSTR_PERF_ONLY_ENV`]: ktstr::KTSTR_PERF_ONLY_ENV
 /// [`KTSTR_SIDECAR_DIR_ENV`]: ktstr::KTSTR_SIDECAR_DIR_ENV
-fn baseline_child_env(sidecar_leaf_abs: &Path) -> Vec<(&'static str, String)> {
+/// [`KTSTR_PROJECT_COMMIT_ENV`]: ktstr::KTSTR_PROJECT_COMMIT_ENV
+fn baseline_child_env(
+    sidecar_leaf_abs: &Path,
+    project_commit: &str,
+) -> Vec<(&'static str, String)> {
     vec![
         (ktstr::KTSTR_PERF_ONLY_ENV, "1".to_string()),
         (
             ktstr::KTSTR_SIDECAR_DIR_ENV,
             sidecar_leaf_abs.to_string_lossy().into_owned(),
         ),
+        (ktstr::KTSTR_PROJECT_COMMIT_ENV, project_commit.to_string()),
     ]
 }
 
-/// `git worktree add --detach <dir> <commit>` argv (after the `git`
-/// program name). `--detach` checks out `commit` without creating a
-/// branch — the worktree is build-and-discard, never committed to.
-/// `commit` is the FULL hex oid (not the 7-hex short) so the checkout
-/// is unambiguous.
-fn worktree_add_argv(wt_dir: &Path, commit_full_hex: &str) -> Vec<String> {
-    vec![
-        "worktree".to_string(),
-        "add".to_string(),
-        "--detach".to_string(),
-        wt_dir.to_string_lossy().into_owned(),
-        commit_full_hex.to_string(),
-    ]
-}
-
-/// `git worktree remove --force <dir>` argv. `--force` removes despite
-/// the build artifacts the checkout accumulates (an unforced remove
-/// refuses a dirty worktree).
-fn worktree_remove_argv(wt_dir: &Path) -> Vec<String> {
-    vec![
-        "worktree".to_string(),
-        "remove".to_string(),
-        "--force".to_string(),
-        wt_dir.to_string_lossy().into_owned(),
-    ]
-}
-
-/// Reclaim baseline worktrees orphaned by prior interrupted runs.
+/// Reclaim baseline checkouts orphaned by prior interrupted runs.
 ///
-/// [`prune_leftover_worktree`] only self-heals the CURRENT run's
-/// `baseline_short`; a worktree left by an interrupted run against a
+/// [`create_baseline_worktree`] only self-heals the CURRENT run's
+/// `baseline_short`; a checkout left by an interrupted run against a
 /// DIFFERENT baseline (Ctrl-C / SIGKILL / crash skip
 /// [`WorktreeGuard`]`::drop`) accumulates in `temp_root` forever. This
 /// runs at perf-delta startup on the run-producing paths and removes
@@ -221,16 +207,17 @@ fn worktree_remove_argv(wt_dir: &Path) -> Vec<String> {
 /// held by a live run — mirroring `cleanup_stale_shm`'s lock-gated
 /// reclamation, so it never removes a concurrent run's checkout.
 /// Best-effort: each step swallows failure (a busy or racing entry is
-/// skipped and reclaimed by a later sweep).
-fn sweep_stale_worktrees(repo_root: &Path, temp_root: &Path) {
+/// skipped and reclaimed by a later sweep). The checkout is a plain dir
+/// (no linked-worktree registration), so `remove_dir_all` fully reclaims
+/// it — no `git worktree prune` is needed.
+fn sweep_stale_worktrees(temp_root: &Path) {
     let Ok(entries) = std::fs::read_dir(temp_root) else {
         return;
     };
-    let mut removed_any = false;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        // The worktree DIRS only — not the sibling `<...>.lock` files.
+        // The checkout DIRS only — not the sibling `<...>.lock` files.
         if !name.starts_with("ktstr-perf-delta-wt-") || name.ends_with(".lock") {
             continue;
         }
@@ -246,13 +233,7 @@ fn sweep_stale_worktrees(repo_root: &Path, temp_root: &Path) {
             Ok(Some(fd)) => fd,
             _ => continue,
         };
-        let _ = Command::new("git")
-            .current_dir(repo_root)
-            .args(worktree_remove_argv(&wt_dir))
-            .status();
-        if wt_dir.exists() {
-            let _ = std::fs::remove_dir_all(&wt_dir);
-        }
+        let _ = std::fs::remove_dir_all(&wt_dir);
         // Unlink the sibling `.lock` WHILE still holding it, then release —
         // mirroring cleanup_shm (run_cargo.rs). try_flock O_CREATs the lock
         // file, so without this every swept orphan would leave 0-byte lock
@@ -262,15 +243,7 @@ fn sweep_stale_worktrees(repo_root: &Path, temp_root: &Path) {
         // release-BEFORE-unlink would let a racer acquire the stale inode
         // while a third run O_CREATs a new one, yielding two "owners".)
         let _ = std::fs::remove_file(worktree_lock_path(&wt_dir));
-        removed_any = true;
         drop(held); // release the (now-unlinked) orphan lock
-    }
-    // Clear any registrations left dangling by the dirs we removed.
-    if removed_any {
-        let _ = Command::new("git")
-            .current_dir(repo_root)
-            .args(["worktree", "prune"])
-            .status();
     }
 }
 
@@ -364,77 +337,99 @@ fn count_sidecars(dir: &Path) -> usize {
         .count()
 }
 
-/// RAII cleanup for the baseline worktree: `git worktree remove
-/// --force` on drop so an early return, `?`, or panic in [`dual_run`]
-/// never leaks a checkout. Removal runs from the MAIN tree
-/// (`repo_root`), the only place `git worktree remove` resolves the
-/// linked worktree.
+/// RAII cleanup for the baseline checkout: drop removes the temp dir so an
+/// early return, `?`, or panic in [`dual_run`] — or a record-and-survive
+/// Ctrl-C — never leaks it. The checkout is a plain dir (no `.git`), so a
+/// `remove_dir_all` fully reclaims it.
 struct WorktreeGuard {
-    repo_root: PathBuf,
     wt_dir: PathBuf,
 }
 
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
-        // Best-effort: this is the cleanup path, so a failure cannot
-        // propagate. `git worktree remove` prints its own diagnostic to
-        // stderr on failure. A swallowed Err (or a skipped drop on Ctrl-C /
-        // SIGKILL / crash) leaves a leftover, but the next run's
-        // `create_baseline_worktree` calls `prune_leftover_worktree` before
-        // `git worktree add`, which recovers it — so a failure here degrades
-        // to a re-created worktree next run, not a stuck "already exists".
-        let _ = Command::new("git")
-            .current_dir(&self.repo_root)
-            .args(worktree_remove_argv(&self.wt_dir))
-            .status();
+        // Best-effort teardown: a failure here can't propagate and nothing
+        // runs downstream. `remove_dir_all` is recursive and unconditional, so
+        // it clears the checkout regardless of what the interrupted build left
+        // behind — no "Directory not empty" the old `git worktree remove` hit.
+        // A skipped drop on SIGKILL / crash is reclaimed by the next run's
+        // `create_baseline_worktree` pre-checkout self-heal (and the
+        // cross-baseline `sweep_stale_worktrees`).
+        let _ = std::fs::remove_dir_all(&self.wt_dir);
     }
 }
 
-/// Best-effort self-heal of a leftover baseline worktree before a fresh
-/// `git worktree add`. Ctrl-C (SIGINT), SIGKILL, or a crash kills the process
-/// before [`WorktreeGuard`]`::drop` runs, orphaning the temp checkout AND its
-/// registration — so the next run's `git worktree add` hard-fails
-/// `'<dir>' already exists`. Idempotent recovery here covers EVERY interruption
-/// mode (a SIGINT handler could not cover SIGKILL / crash). Three steps, each
-/// swallowing failure because a clean tree makes them no-ops: remove a
-/// still-registered worktree (clears registration + dir), delete a bare leftover
-/// dir that carried no / a broken registration, then prune a dangling
-/// registration whose dir is now gone.
-fn prune_leftover_worktree(repo_root: &Path, wt_dir: &Path) {
-    let _ = Command::new("git")
-        .current_dir(repo_root)
-        .args(worktree_remove_argv(wt_dir))
-        .status();
-    if wt_dir.exists() {
-        let _ = std::fs::remove_dir_all(wt_dir);
-    }
-    let _ = Command::new("git")
-        .current_dir(repo_root)
-        .args(["worktree", "prune"])
-        .status();
-}
-
-/// Create the detached baseline worktree at `wt_dir`, first self-healing any
-/// leftover from an interrupted prior run via [`prune_leftover_worktree`] so a
-/// re-run always recovers rather than dying on "already exists".
+/// Materialize the baseline commit's tree into a PLAIN dir at `wt_dir` (no
+/// linked worktree, no `.git`) via `gix`, first self-healing any leftover
+/// checkout from an interrupted prior run so the checkout writes into an
+/// empty destination.
+///
+/// `gix::worktree::state::checkout` reads objects from the repo's ODB and
+/// writes ONLY into `wt_dir` — it never mutates the repo: no worktree
+/// registration, and the index it consumes is built in memory from the tree
+/// (`index_from_tree`), never persisted. `destination_is_initially_empty` is
+/// set because the self-heal above guarantees an empty target, enabling
+/// exclusive-create writes and collision detection.
 fn create_baseline_worktree(
     repo_root: &Path,
     wt_dir: &Path,
     baseline_full_hex: &str,
     baseline_short: &str,
 ) -> Result<()> {
-    prune_leftover_worktree(repo_root, wt_dir);
-    let add = Command::new("git")
-        .current_dir(repo_root)
-        .args(worktree_add_argv(wt_dir, baseline_full_hex))
-        .status()
-        .with_context(|| format!("spawn `git worktree add` for baseline {baseline_short}"))?;
-    if !add.success() {
-        anyhow::bail!(
-            "`git worktree add {} {baseline_full_hex}` failed ({add})",
-            wt_dir.display(),
-        );
-    }
+    // Clear any leftover checkout from an interrupted prior run (Ctrl-C /
+    // SIGKILL / crash skip WorktreeGuard::drop) so the checkout below writes
+    // into an empty dir.
+    let _ = std::fs::remove_dir_all(wt_dir);
+    // gix's checkout writes entries UNDER `wt_dir` but does not create the
+    // root itself, so materialize a fresh empty dir for it.
+    std::fs::create_dir_all(wt_dir)
+        .with_context(|| format!("create baseline checkout dir {}", wt_dir.display()))?;
+    let repo = gix::discover(repo_root)
+        .with_context(|| format!("discover repo for baseline {baseline_short} checkout"))?;
+    let oid = rev_parse_commit(&repo, baseline_full_hex)?;
+    let tree = repo
+        .find_commit(oid)
+        .with_context(|| format!("find baseline commit {baseline_short}"))?
+        .tree_id()
+        .context("resolve baseline tree")?
+        .detach();
+    let mut index = repo
+        .index_from_tree(&tree)
+        .with_context(|| format!("build index from baseline {baseline_short} tree"))?;
+    let mut opts = repo
+        .checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)
+        .context("build baseline checkout options")?;
+    opts.destination_is_initially_empty = true;
+    // Fail loud on any per-entry checkout error rather than silently
+    // collecting it — a broken baseline checkout must not be compared.
+    opts.keep_going = false;
+    // `checkout` requires a `Send` object handle (it may use worker threads);
+    // the repo's default handle is `Rc`-backed, so convert to the `Arc`-backed
+    // one — the same `into_arc` gix's own clone-checkout uses.
+    let objects = repo
+        .objects
+        .clone()
+        .into_arc()
+        .context("build thread-safe object handle for baseline checkout")?;
+    // Poll perf-delta's interrupt flag so a Ctrl-C aborts the checkout
+    // promptly; the caller re-checks `interrupt::caught()` right after and
+    // bails before spawning the baseline build, and a partial checkout dir is
+    // reclaimed by WorktreeGuard::drop. checkout returns Ok even on abort, so
+    // the post-return caught() check is what actually stops the run.
+    gix::worktree::state::checkout(
+        &mut index,
+        wt_dir,
+        objects,
+        &gix::progress::Discard,
+        &gix::progress::Discard,
+        &crate::interrupt::INTERRUPTED,
+        opts,
+    )
+    .with_context(|| {
+        format!(
+            "check out baseline {baseline_short} into {}",
+            wt_dir.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -458,23 +453,23 @@ fn resolve_kernel_for_children(repo_root: &Path, kernel: &str) -> String {
 }
 
 /// Produce BOTH commits' `performance_mode` sidecars so the compare has
-/// fresh data: check the baseline commit out in a detached git worktree
-/// and run its perf tests there (sidecars redirected into the main
-/// pool), then run HEAD's perf tests in the main tree. The worktree is
-/// removed on return via [`WorktreeGuard`].
+/// fresh data: check the baseline commit out into a plain temp dir (via
+/// `gix`) and run its perf tests there (sidecars redirected into the main
+/// pool), then run HEAD's perf tests in the main tree. The checkout is
+/// removed on return via [`WorktreeGuard`]. Both children stamp their
+/// `project_commit` from the parent's resolved labels (`baseline_short` /
+/// `head_short`) so the recorded field matches the compare's pool filter.
 ///
 /// A non-zero exit from a child test run is logged but does NOT abort —
 /// some `performance_mode` failures (e.g. LLC-contention) are expected,
 /// and the sidecars that DID get written are still comparable. A
-/// spawn failure (git/cargo not runnable) IS a hard error.
-///
-/// `gix` 0.83 has no worktree-creation API (only list/inspect), so the
-/// worktree is managed by shelling `git worktree add/remove`.
+/// spawn failure (cargo not runnable) IS a hard error.
 #[allow(clippy::too_many_arguments)]
 fn dual_run(
     repo_root: &Path,
     baseline_full_hex: &str,
     baseline_short: &str,
+    head_short: &str,
     kernel: &str,
     filter: Option<&str>,
     profile: Option<&str>,
@@ -495,24 +490,29 @@ fn dual_run(
     let kernel_arg = resolve_kernel_for_children(repo_root, kernel);
 
     // Serialize concurrent perf-delta runs against the SAME baseline: they share
-    // one per-baseline worktree path, and create_baseline_worktree force-removes
+    // one per-baseline checkout path, and create_baseline_worktree remove_dir_all's
     // any leftover — which would destroy a live concurrent run's checkout. The
     // exclusive advisory flock (OS-released on process death) makes a live
     // concurrent run bail cleanly here, while an interrupted run's lock frees for
     // the next run (which then self-heals the leftover). Held for the whole
-    // baseline lifetime; declared before `_guard` so it drops AFTER the worktree
+    // baseline lifetime; declared before `_guard` so it drops AFTER the checkout
     // is removed.
     let _wt_lock = acquire_baseline_worktree_lock(&wt_dir, baseline_short)?;
-    // Create the detached baseline worktree, self-healing any leftover from an
+    // Create the baseline checkout, self-healing any leftover from an
     // interrupted prior run (Ctrl-C / SIGKILL / crash skip WorktreeGuard::drop).
     create_baseline_worktree(repo_root, &wt_dir, baseline_full_hex, baseline_short)?;
     let _guard = WorktreeGuard {
-        repo_root: repo_root.to_path_buf(),
         wt_dir: wt_dir.clone(),
     };
+    // Ctrl-C during the checkout above: bail before spawning the baseline
+    // build. WorktreeGuard::drop removes the (possibly partial) checkout;
+    // run() then re-raises 130.
+    if crate::interrupt::caught().is_some() {
+        return Ok(());
+    }
 
-    // Baseline run: in the worktree, perf-only, sidecars into the main pool leaf.
-    println!("perf-delta: running baseline {baseline_short} perf tests in worktree");
+    // Baseline run: in the checkout, perf-only, sidecars into the main pool leaf.
+    println!("perf-delta: running baseline {baseline_short} perf tests in checkout");
     let baseline_status = Command::new("cargo")
         .current_dir(&wt_dir)
         .args(perf_test_argv(
@@ -522,7 +522,7 @@ fn dual_run(
             nextest_profile,
             passthrough,
         ))
-        .envs(baseline_child_env(&leaf))
+        .envs(baseline_child_env(&leaf, baseline_short))
         .status()
         .with_context(|| format!("spawn baseline `cargo ktstr test` in {}", wt_dir.display()))?;
     if !baseline_status.success() {
@@ -549,6 +549,7 @@ fn dual_run(
             passthrough,
         ))
         .env(ktstr::KTSTR_PERF_ONLY_ENV, "1")
+        .env(ktstr::KTSTR_PROJECT_COMMIT_ENV, head_short)
         .status()
         .context("spawn HEAD `cargo ktstr test`")?;
     if !head_status.success() {
@@ -571,7 +572,7 @@ fn dual_run(
 /// dirs -> distinct files -> all N survive. All leaves live under the shared
 /// runs-root, so the noise
 /// compare's pool scan finds them and partitions by `project_commit`
-/// (baseline=A, HEAD=B), not by leaf. The detached baseline worktree is created
+/// (baseline=A, HEAD=B), not by leaf. The baseline checkout is created
 /// once and removed on return via [`WorktreeGuard`]. A non-zero child exit is
 /// logged, not fatal (some `performance_mode` failures are expected; the
 /// sidecars that landed are still comparable).
@@ -592,17 +593,21 @@ fn noise_dual_run(
     let wt_dir = worktree_checkout_dir(&std::env::temp_dir(), baseline_short);
     let kernel_arg = resolve_kernel_for_children(repo_root, kernel);
 
-    // Serialize same-baseline runs before the self-heal force-removes the shared
-    // worktree (see dual_run for the full rationale). Held for the whole run;
+    // Serialize same-baseline runs before the self-heal remove_dir_all's the shared
+    // checkout (see dual_run for the full rationale). Held for the whole run;
     // declared before `_guard` so it drops after the worktree is removed.
     let _wt_lock = acquire_baseline_worktree_lock(&wt_dir, baseline_short)?;
     // Self-heal a leftover worktree, then create the detached baseline (see
     // create_baseline_worktree — Ctrl-C / SIGKILL skip WorktreeGuard::drop).
     create_baseline_worktree(repo_root, &wt_dir, baseline_full_hex, baseline_short)?;
     let _guard = WorktreeGuard {
-        repo_root: repo_root.to_path_buf(),
         wt_dir: wt_dir.clone(),
     };
+    // Ctrl-C during the checkout above: bail before the run loop.
+    // WorktreeGuard::drop removes the (possibly partial) checkout.
+    if crate::interrupt::caught().is_some() {
+        return Ok(());
+    }
 
     for i in 0..runs {
         // Per-run leaves: two runs of the same test+config share a variant-hashed
@@ -622,7 +627,7 @@ fn noise_dual_run(
                 nextest_profile,
                 passthrough,
             ))
-            .envs(baseline_child_env(&base_leaf))
+            .envs(baseline_child_env(&base_leaf, baseline_short))
             .status()
             .with_context(|| format!("spawn baseline `cargo ktstr test` (noise run {i})"))?;
         if !bs.success() {
@@ -643,6 +648,7 @@ fn noise_dual_run(
             ))
             .env(ktstr::KTSTR_PERF_ONLY_ENV, "1")
             .env(ktstr::KTSTR_SIDECAR_DIR_ENV, &head_leaf)
+            .env(ktstr::KTSTR_PROJECT_COMMIT_ENV, head_short)
             .status()
             .with_context(|| format!("spawn HEAD `cargo ktstr test` (noise run {i})"))?;
         if !hs.success() {
@@ -675,8 +681,8 @@ pub(crate) struct PerfDeltaArgs<'a> {
     /// baseline and HEAD perf tests boot). `None` is valid only for the
     /// cached-baseline path (no `--dual-run`), which runs no tests.
     pub kernel: Option<&'a str>,
-    /// `--dual-run` — produce both commits' runs via a baseline git
-    /// worktree before comparing, instead of comparing sidecars already
+    /// `--dual-run` — produce both commits' runs via a baseline gix
+    /// checkout before comparing, instead of comparing sidecars already
     /// pooled from prior / downloaded runs.
     pub dual_run: bool,
     /// `--threshold <PCT>` — uniform relative regression threshold
@@ -741,7 +747,7 @@ pub(crate) struct PerfDeltaArgs<'a> {
 /// abs/rel thresholds on the COMMIT axis: HEAD vs a baseline commit,
 /// partitioned by `project_commit`. Sidecars come either from the pool
 /// already (cached-baseline) or from `--dual-run`, which [`dual_run`]
-/// PRODUCES in a detached git worktree (baseline) + the working tree
+/// PRODUCES in a plain gix checkout (baseline) + the working tree
 /// (HEAD), both `performance_mode`-only and `-E`-narrowed. (Cross-config
 /// questions — e.g. scheduler A vs B — are answered in-test via the
 /// Verdict DSL's `better_across_phases`, not by this command.)
@@ -839,7 +845,7 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
             .context("--noise-adjust requires --kernel (the kernel both perf runs boot)")?;
         // Reclaim worktrees orphaned by prior interrupted runs against
         // OTHER baselines (the per-baseline self-heal misses them).
-        sweep_stale_worktrees(&cwd, &std::env::temp_dir());
+        sweep_stale_worktrees(&std::env::temp_dir());
         // Survive Ctrl-C during run production so WorktreeGuard::drop
         // (worktree removal) runs; propagate the interrupt as 128+signal.
         let interrupt_guard = crate::interrupt::InterruptGuard::install();
@@ -881,7 +887,7 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
             .context("--dual-run requires --kernel (the kernel both perf runs boot)")?;
         // Reclaim cross-baseline orphaned worktrees, then survive Ctrl-C
         // so WorktreeGuard::drop runs and the interrupt propagates as 130.
-        sweep_stale_worktrees(&cwd, &std::env::temp_dir());
+        sweep_stale_worktrees(&std::env::temp_dir());
         let interrupt_guard = crate::interrupt::InterruptGuard::install();
         finish_or_reraise(
             interrupt_guard,
@@ -889,6 +895,7 @@ pub(crate) fn run(args: &PerfDeltaArgs<'_>) -> Result<i32> {
                 &cwd,
                 &baseline_oid.to_hex().to_string(),
                 &baseline,
+                &head,
                 kernel,
                 effective_filter,
                 args.profile,
@@ -1133,9 +1140,9 @@ mod tests {
     }
 
     #[test]
-    fn baseline_child_env_sets_perf_only_and_absolute_sidecar_dir() {
+    fn baseline_child_env_sets_perf_only_sidecar_dir_and_project_commit() {
         let leaf = Path::new("/work/target/ktstr/perf-delta-baseline-abc1234");
-        let env = baseline_child_env(leaf);
+        let env = baseline_child_env(leaf, "abc1234");
         assert_eq!(
             env,
             vec![
@@ -1144,50 +1151,25 @@ mod tests {
                     "KTSTR_SIDECAR_DIR",
                     "/work/target/ktstr/perf-delta-baseline-abc1234".to_string(),
                 ),
+                ("KTSTR_PROJECT_COMMIT", "abc1234".to_string()),
             ],
         );
         // Pin the env-var names against the library constants so a rename
-        // of either keeps the child pointed at the right vars.
+        // of any keeps the child pointed at the right vars. The explicit
+        // project_commit is what makes the sidecar record the SAME label the
+        // compare filters the pool on (the -dirty-mismatch fix).
         assert_eq!(env[0].0, ktstr::KTSTR_PERF_ONLY_ENV);
         assert_eq!(env[1].0, ktstr::KTSTR_SIDECAR_DIR_ENV);
-    }
-
-    #[test]
-    fn worktree_add_argv_is_detached_checkout_of_full_oid() {
-        assert_eq!(
-            worktree_add_argv(Path::new("/tmp/wt"), "0123456789abcdef"),
-            vec![
-                "worktree".to_string(),
-                "add".to_string(),
-                "--detach".to_string(),
-                "/tmp/wt".to_string(),
-                "0123456789abcdef".to_string(),
-            ],
-        );
-    }
-
-    #[test]
-    fn worktree_remove_argv_forces_removal() {
-        assert_eq!(
-            worktree_remove_argv(Path::new("/tmp/wt")),
-            vec![
-                "worktree".to_string(),
-                "remove".to_string(),
-                "--force".to_string(),
-                "/tmp/wt".to_string(),
-            ],
-        );
+        assert_eq!(env[2].0, ktstr::KTSTR_PROJECT_COMMIT_ENV);
     }
 
     #[test]
     fn sweep_reclaims_unlocked_but_keeps_locked_worktrees() {
-        // Two orphan-shaped baseline worktree dirs under a throwaway temp
+        // Two orphan-shaped baseline checkout dirs under a throwaway temp
         // root: one whose sibling `.lock` is held (a live run), one free.
-        // The cross-baseline sweep must reclaim the free one and NEVER
-        // touch the locked one. (`git worktree remove/prune` fail
-        // harmlessly on the non-repo repo_root — same pattern the
-        // prune_leftover_worktree test uses — so this pins the lock-gated
-        // fs reclamation.)
+        // The cross-baseline sweep must reclaim the free one (pure
+        // `remove_dir_all`, no git) and NEVER touch the locked one — pins
+        // the lock-gated fs reclamation.
         let base = std::env::temp_dir().join(format!("ktstr-pd-sweep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("mk temp root");
@@ -1200,7 +1182,7 @@ mod tests {
             .expect("flock call")
             .expect("lock free initially");
 
-        sweep_stale_worktrees(&base, &base);
+        sweep_stale_worktrees(&base);
 
         assert!(!unlocked.exists(), "an unlocked orphan worktree is reclaimed");
         assert!(
@@ -1235,23 +1217,97 @@ mod tests {
     }
 
     #[test]
-    fn prune_leftover_worktree_removes_a_bare_leftover_dir() {
-        // Simulate an interrupted prior run's orphaned worktree: a populated dir
-        // the next `git worktree add` would trip over. With a non-repo repo_root
-        // the `git worktree remove/prune` calls fail harmlessly (not a repo), so
-        // this pins the fs fallback that clears the bare leftover — the exact
-        // "'<dir>' already exists" recovery a Ctrl-C'd run needs.
-        let base = std::env::temp_dir().join(format!("ktstr-pd-selfheal-{}", std::process::id()));
-        let repo_root = base.join("not-a-repo");
-        let wt = base.join("wt-leftover");
-        std::fs::create_dir_all(&repo_root).expect("mk repo_root");
-        std::fs::create_dir_all(wt.join("scx-ktstr")).expect("mk leftover subtree");
-        std::fs::write(wt.join("scx-ktstr/build.rs"), "x").expect("write leftover file");
-        assert!(wt.exists(), "leftover present before self-heal");
-        prune_leftover_worktree(&repo_root, &wt);
+    fn worktree_guard_drop_removes_the_checkout_dir() {
+        // RAII cleanup: dropping the guard removes the checkout dir
+        // recursively (incl. any build artifacts an interrupted run left) —
+        // the plain-fs replacement for the old `git worktree remove`, and the
+        // reason a Ctrl-C never leaks a /tmp checkout.
+        let base = std::env::temp_dir().join(format!("ktstr-pd-guard-{}", std::process::id()));
+        let wt = base.join("wt");
+        std::fs::create_dir_all(wt.join("scx-ktstr")).expect("mk checkout subtree");
+        std::fs::write(wt.join("scx-ktstr/build.rs"), "x").expect("write checkout file");
+        assert!(wt.exists(), "checkout present before drop");
+        {
+            let _guard = WorktreeGuard { wt_dir: wt.clone() };
+        }
+        assert!(!wt.exists(), "WorktreeGuard::drop removes the checkout dir");
+        // Drop on an already-absent dir is a harmless no-op (the SIGKILL /
+        // already-swept case).
+        {
+            let _guard = WorktreeGuard { wt_dir: wt.clone() };
+        }
+        assert!(!wt.exists(), "drop on an absent checkout stays a no-op");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn create_baseline_worktree_materializes_the_committed_tree() {
+        // Build a throwaway repo with one committed file, then check that
+        // create_baseline_worktree materializes that file into a PLAIN dir
+        // with no `.git` — the gix-checkout replacement for `git worktree
+        // add --detach`. Pins our wiring (index_from_tree -> checkout_options
+        // -> gix::worktree::state::checkout), not gix itself.
+        let base = std::env::temp_dir().join(format!("ktstr-pd-gixco-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo_dir = base.join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mk repo dir");
+
+        let mut repo = gix::init(&repo_dir).expect("gix::init");
+        let _ = repo
+            .committer_or_set_generic_fallback()
+            .expect("committer fallback");
+        {
+            // Author identity fallback so `commit` succeeds with no ambient
+            // git identity (CI runners) — mirrors the sidecar commit fixtures.
+            use gix::config::tree::gitoxide;
+            let mut cfg = gix::config::File::new(gix::config::file::Metadata::api());
+            cfg.set_raw_value(gitoxide::Author::NAME_FALLBACK, "ktstr-test")
+                .expect("author name fallback");
+            cfg.set_raw_value(gitoxide::Author::EMAIL_FALLBACK, "ktstr-test@example.invalid")
+                .expect("author email fallback");
+            repo.config_snapshot_mut().append(cfg);
+        }
+        let blob = repo.write_blob(b"baseline\n").expect("write blob").detach();
+        let tree = gix::objs::Tree {
+            entries: vec![gix::objs::tree::Entry {
+                mode: gix::objs::tree::EntryKind::Blob.into(),
+                filename: "file.txt".into(),
+                oid: blob,
+            }],
+        };
+        let tree_id: gix::ObjectId = repo.write_object(&tree).expect("write tree").detach();
+        let commit: gix::ObjectId = repo
+            .commit("HEAD", "init", tree_id, std::iter::empty::<gix::ObjectId>())
+            .expect("commit")
+            .detach();
+        let full_hex = commit.to_hex().to_string();
+        let short = &full_hex[..7];
+
+        let wt = base.join("checkout");
+        create_baseline_worktree(&repo_dir, &wt, &full_hex, short).expect("gix baseline checkout");
+
+        assert_eq!(
+            std::fs::read_to_string(wt.join("file.txt")).expect("checked-out file present"),
+            "baseline\n",
+            "the committed tree's file must be materialized into the plain checkout",
+        );
         assert!(
-            !wt.exists(),
-            "self-heal must remove a bare leftover worktree dir so `git worktree add` can proceed",
+            !wt.join(".git").exists(),
+            "the checkout is a PLAIN dir — no .git linkage, so cleanup is a plain remove_dir_all",
+        );
+
+        // Self-heal: a leftover populated checkout is cleared before re-checkout.
+        std::fs::write(wt.join("file.txt"), b"stale\n").expect("dirty the leftover");
+        std::fs::write(wt.join("untracked.tmp"), b"junk\n").expect("leftover untracked");
+        create_baseline_worktree(&repo_dir, &wt, &full_hex, short).expect("re-checkout self-heals");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("file.txt")).expect("file present after re-checkout"),
+            "baseline\n",
+            "re-checkout must overwrite a stale leftover with the committed content",
+        );
+        assert!(
+            !wt.join("untracked.tmp").exists(),
+            "pre-checkout self-heal (remove_dir_all) clears a leftover's untracked debris",
         );
         std::fs::remove_dir_all(&base).ok();
     }
@@ -1260,7 +1316,7 @@ mod tests {
     fn baseline_worktree_lock_blocks_a_concurrent_same_baseline_run() {
         // Two perf-delta runs against the same baseline share worktree_lock_path;
         // the exclusive flock must let only ONE proceed so the self-heal never
-        // force-removes a live concurrent run's checkout (the medium-severity
+        // remove_dir_all's a live concurrent run's checkout (the medium-severity
         // regression this lock closes). Also pins the sibling `.lock` path shape
         // and that the lock frees for the next run once released (the
         // interrupted-run recovery path — the OS releases it on process death).

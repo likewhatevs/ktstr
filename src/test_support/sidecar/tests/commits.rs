@@ -1857,6 +1857,51 @@ fn detect_project_commit_memoizes_across_consecutive_calls() {
     );
 }
 
+/// `detect_project_commit` short-circuits to `KTSTR_PROJECT_COMMIT` when
+/// that env is set non-empty: perf-delta stamps it on both run children so
+/// the recorded `project_commit` equals the label the compare filters the
+/// pool on (the -dirty-suffix mismatch fix), and a no-`.git` gix baseline
+/// checkout needn't a `gix::discover`. An empty value is treated as unset
+/// and falls through to the cwd probe.
+#[test]
+fn detect_project_commit_honors_explicit_env_override() {
+    let saved = std::env::var(crate::KTSTR_PROJECT_COMMIT_ENV).ok();
+    fn restore(saved: &Option<String>) {
+        // SAFETY: std::env::set_var/remove_var became unsafe in Rust 2024
+        // (the libc environ pointer can race setenv's realloc across
+        // threads). Under nextest no concurrent reader of this var exists
+        // during the bracketed mutation; save+restore leaves the
+        // environment exactly as found.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var(crate::KTSTR_PROJECT_COMMIT_ENV, v),
+                None => std::env::remove_var(crate::KTSTR_PROJECT_COMMIT_ENV),
+            }
+        }
+    }
+
+    // SAFETY: see `restore`.
+    unsafe { std::env::set_var(crate::KTSTR_PROJECT_COMMIT_ENV, "deadbee-dirty") };
+    let explicit = super::super::detect_project_commit();
+    restore(&saved);
+    assert_eq!(
+        explicit.as_deref(),
+        Some("deadbee-dirty"),
+        "a non-empty KTSTR_PROJECT_COMMIT must be recorded verbatim",
+    );
+
+    // SAFETY: see `restore`.
+    unsafe { std::env::set_var(crate::KTSTR_PROJECT_COMMIT_ENV, "") };
+    let empty = super::super::detect_project_commit();
+    restore(&saved);
+    assert_ne!(
+        empty.as_deref(),
+        Some(""),
+        "an empty KTSTR_PROJECT_COMMIT is treated as unset (falls through to the \
+         cwd probe), never recorded as an empty commit label",
+    );
+}
+
 /// `detect_kernel_commit` memoizes its successful probes
 /// behind a process-wide
 /// [`std::sync::Mutex<HashMap<PathBuf, String>>`] keyed on

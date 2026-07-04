@@ -1034,6 +1034,26 @@ pub const KTSTR_KERNEL_LIST_ENV: &str = "KTSTR_KERNEL_LIST";
 /// the map, and the fallback yields the same `None` for them.
 pub const KTSTR_KERNEL_COMMIT_ENV: &str = "KTSTR_KERNEL_COMMIT";
 
+/// Name of the environment variable cargo-ktstr's perf-delta sets to the
+/// PROJECT tree's short commit hash (with a `-dirty` suffix when the tree
+/// is dirty) that the child's sidecars must record as their
+/// `project_commit`. Unlike [`KTSTR_KERNEL_COMMIT_ENV`] this is a single
+/// value, not a `dir=commit` map — a child has exactly one project tree.
+///
+/// perf-delta computes the A/B commit labels ONCE in the orchestrator
+/// (`short_hash`) and both the pool FILTER and the two run children read
+/// the same value: the filter partitions on it, and each child records it
+/// verbatim (the sidecar writer's `detect_project_commit` returns this
+/// value when the env is set), so the recorded `project_commit` and the
+/// filter can never diverge on the `-dirty` suffix. It also lets the
+/// baseline run, whose tree is a plain gix checkout with no `.git`, skip a
+/// `gix::discover` that would otherwise resolve to the wrong repo (or none).
+///
+/// Override only: an absent or empty env falls back to the in-process
+/// `gix::discover` + dirty-walk, which is correct for a normal (non
+/// perf-delta) test run.
+pub const KTSTR_PROJECT_COMMIT_ENV: &str = "KTSTR_PROJECT_COMMIT";
+
 /// Name of the environment variable cargo-ktstr sets to signal
 /// "this test process was launched by a cargo-ktstr orchestration
 /// path, not raw `cargo nextest`". cargo-ktstr's `test` and

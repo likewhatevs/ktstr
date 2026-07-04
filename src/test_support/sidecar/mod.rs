@@ -1969,6 +1969,20 @@ pub(crate) fn detect_kernel_version() -> Option<String> {
 /// depends on the cwd at test launch (which crate is exercising
 /// ktstr), not the build host.
 pub(crate) fn detect_project_commit() -> Option<String> {
+    // Explicit override: an orchestrator (perf-delta) that checked the
+    // project tree out WITHOUT a `.git` — a plain gix checkout of a baseline
+    // commit into a temp dir — passes the commit label via
+    // KTSTR_PROJECT_COMMIT_ENV so the sidecar records it verbatim instead of
+    // a `gix::discover` that would resolve to the wrong repo (or none). It is
+    // also set on the HEAD run so the recorded `project_commit` equals the
+    // exact label perf-delta filters the pool on, closing the -dirty-suffix
+    // mismatch between the filter (`short_hash`) and this recorder. Empty is
+    // treated as unset. Mirrors the KTSTR_KERNEL_COMMIT_ENV override.
+    if let Ok(explicit) = std::env::var(crate::KTSTR_PROJECT_COMMIT_ENV)
+        && !explicit.is_empty()
+    {
+        return Some(explicit);
+    }
     // Per-process memoization of the SUCCESS case only.
     //
     // The cwd is stable for the lifetime of a test process (no
