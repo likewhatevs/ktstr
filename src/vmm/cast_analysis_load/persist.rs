@@ -101,7 +101,48 @@ struct PersistedCastAnalysis {
 }
 
 fn cache_dir() -> Option<PathBuf> {
-    crate::cache::resolve_cache_root_with_suffix("cast_analysis").ok()
+    let dir = crate::cache::resolve_cache_root_with_suffix("cast_analysis").ok()?;
+    // Reclaim `*.bin.tmp.<pid>` staging files left by interrupted prior
+    // runs, once per process on first cache access. try_save writes a
+    // pid-suffixed temp then renames; a process that dies between the write
+    // and the rename (Ctrl-C / crash — notably on the detached precompute
+    // threads) orphans the temp, and nothing else reclaims it.
+    static SWEEP_ONCE: std::sync::Once = std::sync::Once::new();
+    SWEEP_ONCE.call_once(|| sweep_stale_tmp(&dir));
+    Some(dir)
+}
+
+/// Remove `*.bin.tmp.<pid>` staging files in `dir` whose owning pid is no
+/// longer alive (`kill(pid, 0)` -> ESRCH). A file owned by a LIVE pid is a
+/// concurrent run's in-flight write and is left untouched; the final
+/// `.bin` cache files (no `.tmp.<pid>` suffix) are never matched.
+fn sweep_stale_tmp(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let self_pid = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.rsplit_once(".bin.tmp."))
+            .and_then(|(_, p)| p.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        // Skip non-positive pids (kill(0)/kill(-N) probe process GROUPS)
+        // and our own in-flight writes.
+        if pid <= 0 || pid == self_pid as i32 {
+            continue;
+        }
+        let dead = matches!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH),
+        );
+        if dead {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Compile-time fingerprint of the cast-analysis source, emitted by
@@ -240,6 +281,30 @@ pub(super) fn try_save(
 mod tests {
     use super::*;
     use crate::test_support::test_helpers::{isolated_cache_dir, lock_env};
+
+    #[test]
+    fn sweep_removes_dead_pid_tmp_keeps_live_and_final() {
+        // A `*.bin.tmp.<pid>` staging file owned by a dead pid is reclaimed;
+        // one owned by our own (live) pid and the final `.bin` cache file
+        // are kept. pid 2147483647 (i32::MAX) is above pid_max -> ESRCH.
+        let base = std::env::temp_dir().join(format!("ktstr-castsweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("mk temp root");
+        let dead = base.join("abc.bin.tmp.2147483647");
+        let live = base.join(format!("abc.bin.tmp.{}", std::process::id()));
+        let final_cache = base.join("abc.bin");
+        for p in [&dead, &live, &final_cache] {
+            std::fs::write(p, b"x").expect("write fixture");
+        }
+
+        sweep_stale_tmp(&base);
+
+        assert!(!dead.exists(), "a dead-owner .bin.tmp file is reclaimed");
+        assert!(live.exists(), "our own (live) .bin.tmp file is kept");
+        assert!(final_cache.exists(), "the final .bin cache file is untouched");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn roundtrip_save_load() {

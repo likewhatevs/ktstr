@@ -57,6 +57,47 @@ use crate::kernel::{
     encode_kernel_list, path_kernel_label, resolve_kernel_image, resolve_kernel_set,
 };
 
+/// Sweep verifier result dirs orphaned by interrupted prior runs.
+///
+/// The result dir is keyed on the dispatcher pid, so a run killed before
+/// its post-run `remove_dir_all` (Ctrl-C / SIGKILL / crash) orphans its
+/// dir — and nothing reclaims it later, since the per-run wipe only
+/// targets the CURRENT pid. This runs at startup and removes every
+/// `ktstr-verifier-results-<pid>` dir whose owning pid is no longer alive
+/// (`kill(pid, 0)` -> ESRCH), mirroring `cleanup_stale_shm`'s next-run
+/// reclamation. A dir owned by a LIVE pid is a concurrent verifier run and
+/// is left untouched.
+fn sweep_stale_result_dirs(temp_root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(temp_root) else {
+        return;
+    };
+    let self_pid = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("ktstr-verifier-results-"))
+            .and_then(|p| p.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        // Skip non-positive pids (kill(0)/kill(-N) probe process GROUPS,
+        // not a single process) and our own dir (owned by the run below).
+        if pid <= 0 || pid == self_pid as i32 {
+            continue;
+        }
+        // Only a definitively-dead owner (ESRCH) is an orphan. A live pid
+        // (Ok) or a permission error (EPERM) is left alone.
+        let dead = matches!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH),
+        );
+        if dead {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Dispatch the `cargo ktstr verifier` subcommand.
 ///
 /// The trailing `args` are forwarded verbatim to the inner
@@ -152,10 +193,13 @@ pub(crate) fn run_verifier(
     // Per-cell result dir: each verifier cell writes its PASS/FAIL record
     // here (via KTSTR_VERIFIER_RESULT_DIR), and after nextest returns we
     // read them back to render the summary table. Unique per dispatcher pid
-    // so concurrent `cargo ktstr verifier` runs don't cross-read; wiped
-    // first so a stale dir from a crashed prior run can't leak old records.
-    let result_dir =
-        std::env::temp_dir().join(format!("ktstr-verifier-results-{}", std::process::id()));
+    // so concurrent `cargo ktstr verifier` runs don't cross-read. First
+    // sweep dirs orphaned by dead-pid prior runs (an interrupted run skips
+    // the post-run wipe below), then wipe our own pid's dir in case a prior
+    // run reused this pid.
+    let temp_root = std::env::temp_dir();
+    sweep_stale_result_dirs(&temp_root);
+    let result_dir = temp_root.join(format!("ktstr-verifier-results-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&result_dir);
     if let Err(e) = std::fs::create_dir_all(&result_dir) {
         return Err(format!(
@@ -178,6 +222,9 @@ pub(crate) fn run_verifier(
         },
     );
 
+    // Survive Ctrl-C / SIGTERM so the result-dir cleanup below runs; nextest
+    // tears down its own test children (see crate::interrupt).
+    let interrupt_guard = crate::interrupt::InterruptGuard::install();
     let status = cmd
         .status()
         .map_err(|e| format!("spawn cargo nextest run: {e}"))?;
@@ -196,6 +243,12 @@ pub(crate) fn run_verifier(
         print!("{table}");
     }
     let _ = std::fs::remove_dir_all(&result_dir);
+    // Cleanup done; if interrupted, propagate as 128+signal now.
+    let caught = interrupt_guard.interrupted();
+    drop(interrupt_guard);
+    if let Some(sig) = caught {
+        crate::interrupt::reraise(sig);
+    }
 
     // Decide the outcome from nextest's exit + the records. With
     // `--no-tests pass` a zero-cell selection exits 0, so an empty record
@@ -209,4 +262,31 @@ pub(crate) fn run_verifier(
         scheduler.as_deref(),
         status.code(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sweep_removes_dead_pid_result_dirs_keeps_live() {
+        // A result dir owned by a dead pid is reclaimed; one owned by our
+        // own (live) pid is kept. pid 2147483647 (i32::MAX) is above
+        // pid_max, so kill() returns ESRCH. Each nextest test is its own
+        // process, so the shared temp dir is test-isolated by pid.
+        let base = std::env::temp_dir().join(format!("ktstr-vsweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("mk temp root");
+        let dead = base.join("ktstr-verifier-results-2147483647");
+        let live = base.join(format!("ktstr-verifier-results-{}", std::process::id()));
+        std::fs::create_dir(&dead).expect("mk dead dir");
+        std::fs::create_dir(&live).expect("mk live dir");
+
+        sweep_stale_result_dirs(&base);
+
+        assert!(!dead.exists(), "a dead-owner result dir is reclaimed");
+        assert!(live.exists(), "our own (live) result dir is kept");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
