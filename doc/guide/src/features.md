@@ -105,23 +105,29 @@ guest memory. Topology is a real verification axis: values baked into
 `.rodata` (like CPU counts) change what the verifier explores, so a
 scheduler can attach on one topology and be rejected on another.
 
-<!-- captured: cargo ktstr verifier --kernel 7.0 --scheduler ktstr_sched --test kaslr_axis_e2e tiny-1llc tiny-2llc odd-3llc smt-2llc | ktstr 0.23.0 | kernel 7.0.14 -->
-<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr verifier --kernel 7.0 --scheduler ktstr_sched</span></div>
+<!-- captured: cargo ktstr verifier --kernel <local sched_ext dev tree> --test docs_real_scheds tiny-1llc tiny-2llc odd-3llc smt-2llc | ktstr 0.23.0 | kernel sched_ext-for-7.2 b4dc42d2 -->
+<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr verifier --kernel ../linux --test my_schedulers</span></div>
 
-<pre>        PASS [  12.406s] (1/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/odd-3llc
-...
-verifier verified_insns (per scheduler; rows: kernel, cols: BPF program, cell: range across topologies):
+<pre>verifier verified_insns (per scheduler; rows: kernel, cols: BPF program, cell: range across topologies):
 
-ktstr_sched:
- kernel      ktstr_dispatch  ktstr_dump  ktstr_dump_cpu  ktstr_dump_task  ktstr_enqueue  ktstr_exit  ktstr_exit_task  ktstr_init  ktstr_init_task  ktstr_select_cp  ktstr_yield 
- kernel_7_0  102             81          13              70               74             25          419              2296        29077            39               8           
+scx_p2dq:
+ kernel        p2dq_dequeue  p2dq_dispatch  p2dq_enqueue  p2dq_exit  p2dq_exit_task  p2dq_init  p2dq_init_task  p2dq_running  p2dq_select_cpu  ...
+ kernel_local  5             1159..2130     2026..5118    25         419             2121       27601           609           801..887         ...
 
-<span class="t-grn">verifier summary: 4 ✅  0 ❌  0 🇽</span>
- topology   ktstr_sched 
- odd-3llc   ✅          
- smt-2llc   ✅          
- tiny-1llc  ✅          
- tiny-2llc  ✅          </pre></div>
+verifier summary: 8 ✅  <span class="t-red">4 ❌</span>  0 🇽
+ topology   scx_bpfland  scx_lavd  scx_p2dq
+ odd-3llc   ✅           <span class="t-red">❌</span>        ✅
+ smt-2llc   ✅           <span class="t-red">❌</span>        ✅
+ tiny-1llc  ✅           <span class="t-red">❌</span>        ✅
+ tiny-2llc  ✅           <span class="t-red">❌</span>        ✅</pre></div>
+
+That sweep is real: on this development kernel `scx_bpfland` and
+`scx_p2dq` verify, attach, and dispatch on all four topologies, while
+`scx_lavd` fails every cell — the kernel removed the deprecated
+`scx_bpf_cpu_rq()` kfunc that lavd still requires, and the failing
+cells' logs name it (`extern (func ksym) 'scx_bpf_cpu_rq': not found
+in kernel or module BTFs`). See
+[BPF Verifier Sweep](running-tests/verifier.md) for the full run.
 
 On rejection, the log is cycle-collapsed — repeated loop-unrolling
 iterations are deduplicated so the offending access is readable:

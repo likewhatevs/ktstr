@@ -210,6 +210,19 @@ read `false`.
   let result = v.into_result();
   ```
 
+- **`claim_better`** — the comparison primitive for "candidate beats
+  baseline" gates (a scheduler vs EEVDF, this run vs a recorded
+  number). It looks up the metric's polarity in the registry, so you
+  never write the wrong direction:
+
+  ```rust,ignore
+  // wakeup latency is lower-better; 60 vs 50 fails, correctly
+  v.claim_better(BuiltinMetric::WakeupP99LatencyUs, cand).than(base);
+  // require a 10% margin, not just any improvement
+  v.claim_better(BuiltinMetric::TaobenchTotalQps, cand).than_by(base, 0.10);
+  ```
+
+  An unregistered metric yields Inconclusive, never a silent pass.
 - **`AbsoluteThresholds`** — flat per-run bounds
   (`max_p99_wake_latency_ns`, `max_iteration_cost_p99_ns`,
   `max_migrations`, `min_work_units`) checked in one call:

@@ -93,7 +93,7 @@ A metric only appears in a comparison if the run actually emitted it.
 | schedstat counters / rates | `total_run_delay_ns_per_sched`, `total_ttwu_count`, `sched_count_per_sec` | schedstat sampling over the run | schedstat capture enabled |
 | IRQ / pressure | `avg_irq_util`, `total_irq_pressure_us`, `max_cgroup_psi_irq_avg10` | IRQ-heavy scenarios, periodic host-pressure capture | those captures ran |
 | NUMA locality | `worst_page_locality`, `worst_cross_node_migration_ratio` | NUMA-aware scenarios | multi-node topology |
-| Payload metrics | `sched_delay_msg_us`, `taobench_total_qps`, `schbench_loop_count` | schbench / taobench payloads | the payload ran and reported |
+| Built-in benchmark workloads | `sched_delay_msg_us`, `taobench_total_qps`, `schbench_loop_count` | the in-process `Schbench` / `Taobench` work types | a built-in `Schbench` / `Taobench` workload ran (not the `schbench`/`fio` binary payloads, which emit their own JSON keys) |
 
 Not every registry name can back a gate: `perf-delta --must-fail`
 rejects unknown names, internal rate components, per-phase-only

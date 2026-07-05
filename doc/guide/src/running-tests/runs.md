@@ -89,6 +89,30 @@ The resolved baseline is shortened to the 7-hex form sidecars
 record, and the command bails if it resolves to HEAD (nothing to
 compare).
 
+A real comparison — one schbench perf test, two commits, on a
+heavily loaded host (which is exactly the noise the gate exists to
+absorb):
+
+<!-- captured: cargo ktstr perf-delta --base 73730e0 | ktstr 0.23.0 | sidecars from kernel 7.0.14 runs -->
+<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr perf-delta --base 73730e0</span></div>
+
+<pre>averaged across 1 runs (73730e0) and 1 runs (6be77c7)
+ TEST                                                  METRIC                                  73730e0        6be77c7         DELTA             VERDICT
+ performance_mode_schbench_steady/7.0.14/perf_scx/...  max_imbalance_ratio                     3.00           4.00            +1.00x            <span class="t-red">REGRESSION</span>
+ performance_mode_schbench_steady/7.0.14/perf_scx/...  system_time_ns                          0.00           6992960.00      +6992960.00ns     <span class="t-red">REGRESSION</span>
+ performance_mode_schbench_steady/7.0.14/perf_scx/...  user_time_ns                            8498190459.00  17508213019.00  +9010022560.00ns  <span class="t-red">REGRESSION</span>
+ performance_mode_schbench_steady/7.0.14/perf_scx/...  schbench_worker_run_delay_ns_per_sched  6450.24        7615.48         +1165.24ns        <span class="t-red">REGRESSION</span>
+summary: 4 regressions, 0 improvements, 0 informational, 45 unchanged
+host delta ('73730e0' → '6be77c7'):
+  heap_state:
+    allocated_bytes: 110558488 → 111278120
+<span class="t-dim">    ...</span>
+<span class="t-grn">exit 0</span>   # 4 &lt; --fail-threshold (5): noisy, not gated</pre></div>
+
+The same data trips the gate when you tighten it — `--fail-threshold
+1` or `--must-fail user_time_ns` both exit 1. That is the CI
+contract: thresholds decide, not eyeballs.
+
 **Two ways to get the baseline's numbers:**
 
 - **Cached (default)** — both sides' sidecars must already be in

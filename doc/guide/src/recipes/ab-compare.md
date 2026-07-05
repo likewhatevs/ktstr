@@ -59,11 +59,11 @@ cd ~/src/my-sched
 # Baseline: check out and run the baseline branch's suite.
 git worktree add ~/src/my-sched-main upstream/main
 cd ~/src/my-sched-main
-cargo ktstr test --kernel ../linux -- -E 'test(/performance_mode/)'
+KTSTR_PERF_ONLY=1 cargo ktstr test --kernel ../linux
 
 # Experimental: run HEAD's suite.
 cd ~/src/my-sched
-cargo ktstr test --kernel ../linux -- -E 'test(/performance_mode/)'
+KTSTR_PERF_ONLY=1 cargo ktstr test --kernel ../linux
 
 # Compare the pooled sidecars: HEAD vs the baseline commit.
 cargo ktstr perf-delta --base <baseline-short-hex>

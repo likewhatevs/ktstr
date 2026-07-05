@@ -18,48 +18,50 @@ locations (DWARF for kernel functions, BPF line info for callbacks).
 Where fexit captured post-mutation state, changed fields show an
 arrow between entry and exit values:
 
-<!-- captured: prior run of ktstr/bpf_crash_auto_repro_e2e against a sched_ext_exit-patched kernel; format pinned by src/probe/output.rs | ktstr 0.23.0 -->
+<!-- captured: cargo ktstr test --kernel local-8cd2b47 (v7.1 + sched_ext_exit tracepoint) --features integration,wprof -E 'test(=ktstr/bpf_crash_auto_repro_e2e)' --no-capture; ktstr 0.23.0 + pending trigger-signature fix and probe-ship hold (scratchpad patches) | full run: captures/autorepro-live.txt -->
 <div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr test — auto-repro trail after a scheduler crash</span></div>
 
-<pre>ktstr_test 'bpf_crash_auto_repro_e2e' [sched=scx-ktstr] [topo=1n1l4c1t] failed:
-  scheduler process died unexpectedly during workload (2.0s into test)
+<pre>--- probe pipeline ---
+  extracted:   9 functions from crash backtrace
+  kprobes:     5 attached
+  fentry:      11 attached
+  <span class="t-grn">trigger:     fired (tp_btf)</span>
+  events:      125 captured, 8 after stitch
 
---- auto-repro ---
 === AUTO-PROBE: scx_exit fired ===
 
-  ktstr_enqueue                                                   main.bpf.c:21
+  ktstr_select_cpu                                              main.bpf.c:380
     task_struct *p
-      pid         97
-      cpus_ptr    0xf(0-3)
-      dsq_id      SCX_DSQ_INVALID
-      enq_flags   NONE
-      slice       0
-      vtime       0
-      weight      100
-      sticky_cpu  -1
-      scx_flags   QUEUED|ENABLED
-  do_enqueue_task                                               kernel/sched/ext.c
+      pid                 40
+      cpus_ptr            0xf(0-3)
+      <span class="t-grn">dsq_id              SCX_DSQ_INVALID  →  SCX_DSQ_LOCAL</span>
+      enq_flags           NONE
+      <span class="t-grn">slice               19982063         →  20000000</span>
+      vtime               0
+      weight              100
+      scx_flags           RESET_RUNNABLE_AT|DEQD_FOR_SLEEP|ENABLED
+  do_enqueue_task                                               kernel/sched/ext.c:1885
     rq *rq
-      cpu         1
+      cpu                 0
     task_struct *p
-      pid         97
-      cpus_ptr    0xf(0-3)
-      <span class="t-grn">dsq_id      SCX_DSQ_INVALID          →  SCX_DSQ_LOCAL</span>
-      enq_flags   NONE
-      <span class="t-grn">slice       20000000</span>
-      vtime       0
-      weight      100
-      sticky_cpu  -1
-      <span class="t-grn">scx_flags   QUEUED|DEQD_FOR_SLEEP    →  QUEUED</span></pre></div>
+      pid                 40
+      dsq_id              SCX_DSQ_LOCAL
+      slice               20000000
+      scx_flags           QUEUED|DEQD_FOR_SLEEP|ENABLED
+<span class="t-dim">  ...</span>
+  scx_bpf_error_bstr+0x8a/0xd0
+  <span class="t-red">bpf_prog_9a11f2edaac0b52f_ktstr_dispatch+0x57/0x1db</span>
+  do_pick_task_scx+0x50e/0x940
+  __schedule+0x5a3/0x10c0</pre></div>
 
-Reading it: the task entered the scheduler's `enqueue` callback with
-`dsq_id = SCX_DSQ_INVALID` (on no dispatch queue) and an expired
-slice. By the time `do_enqueue_task` returned, the task sat on the
-local DSQ (`SCX_DSQ_INVALID → SCX_DSQ_LOCAL`) with a refilled
-default slice (20000000 ns), and the `DEQD_FOR_SLEEP` flag had been
-cleared. That is a healthy enqueue path — captured at the moment
-`scx_exit` fired, so you can see exactly what the scheduler did with
-its last tasks before the error.
+Reading it as a progression: pid 40 entered `select_cpu` off any
+dispatch queue with a nearly expired slice; by exit it sat on the
+local DSQ with a refilled 20 ms slice (`SCX_DSQ_INVALID →
+SCX_DSQ_LOCAL`, `19982063 → 20000000`); the kernel's
+`do_enqueue_task` then queued it. Healthy scheduling decisions,
+captured right up to the frame where `ktstr_dispatch` called
+`scx_bpf_error()` — the chain shows what the scheduler did with its
+last tasks on the way into the error, not just where it died.
 
 After the probe data, the section appends the repro VM's wall time
 and, when non-empty, the last lines of its scheduler log, sched_ext

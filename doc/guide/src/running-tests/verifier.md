@@ -30,6 +30,10 @@ cargo ktstr verifier --kernel ../linux
 # Sweep across kernels (each cell runs against its own)
 cargo ktstr verifier --kernel 6.14.2 --kernel 7.0
 
+# Every stable/longterm release in a range (add --include-eol for
+# end-of-life series)
+cargo ktstr verifier --kernel 6.12..6.14
+
 # One scheduler across topologies
 cargo ktstr verifier --scheduler scx-ktstr
 
@@ -40,37 +44,58 @@ cargo ktstr verifier --raw
 See [cargo-ktstr verifier](cargo-ktstr.md#verifier) for the flag
 list.
 
-## A healthy sweep
+## A real sweep
 
-Four small cells, one scheduler, one kernel — each cell boots its own
-VM, loads the scheduler, and confirms attach + dispatch:
+Three real schedulers from the [scx](https://github.com/sched-ext/scx)
+tree, four topologies, one development kernel — each of the twelve
+cells boots its own VM, loads the scheduler, and confirms
+attach + dispatch. Declare the schedulers once (in any linked test
+file), pointing at the prebuilt binaries:
 
-<!-- captured: cargo ktstr verifier --kernel 7.0 --scheduler ktstr_sched --test kaslr_axis_e2e tiny-1llc tiny-2llc odd-3llc smt-2llc | ktstr 0.23.0 | kernel 7.0.14 -->
-<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr verifier --kernel 7.0 --scheduler ktstr_sched --test kaslr_axis_e2e tiny-1llc tiny-2llc odd-3llc smt-2llc</span></div>
+```rust,ignore
+ktstr::declare_scheduler!(BPFLAND, {
+    name = "scx_bpfland",
+    binary_path = "../scx/target/release/scx_bpfland",
+});
+// ... same for scx_lavd, scx_p2dq
+```
 
-<pre>cargo ktstr: resolved kernel "7.0"
-cargo ktstr verifier: dispatching to nextest (verifier/ cells only) on 1 resolved kernel(s) forwarding to nextest: --test kaslr_axis_e2e tiny-1llc tiny-2llc odd-3llc smt-2llc
-...
-    Starting 4 tests across 1 binary (55 tests skipped)
-        PASS [  12.406s] (1/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/odd-3llc
-        PASS [  12.432s] (2/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/smt-2llc
-        PASS [  12.656s] (3/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/tiny-1llc
-        PASS [  12.929s] (4/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/tiny-2llc
-────────────
-     Summary [  12.929s] 4 tests run: 4 passed, 55 skipped
+<!-- captured: cargo ktstr verifier --kernel <local sched_ext dev tree> --test docs_real_scheds tiny-1llc tiny-2llc odd-3llc smt-2llc | ktstr 0.23.0 | kernel sched_ext-for-7.2 b4dc42d2 -->
+<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr verifier --kernel ../linux --test my_schedulers tiny-1llc tiny-2llc odd-3llc smt-2llc</span></div>
 
-<span class="t-b">verifier verified_insns (per scheduler; rows: kernel, cols: BPF program, cell: range across topologies):</span>
+<pre><span class="t-b">verifier verified_insns (per scheduler; rows: kernel, cols: BPF program, cell: range across topologies):</span>
 
-ktstr_sched:
- kernel      ktstr_dispatch  ktstr_dump  ktstr_dump_cpu  ktstr_dump_task  ktstr_enqueue  ktstr_exit  ktstr_exit_task  ktstr_init  ktstr_init_task  ktstr_select_cp  ktstr_yield
- kernel_7_0  102             81          13              70               74             25          419              2296        29077            39               8
+scx_bpfland:
+ kernel        bpfland_dispatc  bpfland_enable  bpfland_enqueue  bpfland_exit  bpfland_init  bpfland_init_ta  bpfland_runnabl  bpfland_running  bpfland_select_  bpfland_stoppin
+ kernel_local  269..304         5               766              25            302           11               44               122              571..611         52
 
-<span class="t-grn">verifier summary: 4 ✅  0 ❌  0 🇽</span>
- topology   ktstr_sched
- odd-3llc   ✅
- smt-2llc   ✅
- tiny-1llc  ✅
- tiny-2llc  ✅</pre></div>
+scx_p2dq:
+ kernel        p2dq_dequeue  p2dq_dispatch  p2dq_enqueue  p2dq_exit  p2dq_exit_task  p2dq_init  p2dq_init_task  p2dq_running  p2dq_select_cpu  p2dq_set_cpumas  p2dq_stopping  p2dq_update_idl
+ kernel_local  5             1159..2130     2026..5118    25         419             2121       27601           609           801..887         149              853            723
+
+verifier summary: 8 ✅  <span class="t-red">4 ❌</span>  0 🇽
+ topology   scx_bpfland  scx_lavd  scx_p2dq
+ odd-3llc   ✅           <span class="t-red">❌</span>        ✅
+ smt-2llc   ✅           <span class="t-red">❌</span>        ✅
+ tiny-1llc  ✅           <span class="t-red">❌</span>        ✅
+ tiny-2llc  ✅           <span class="t-red">❌</span>        ✅
+
+failing combinations (scheduler / kernel / topology):
+  scx_lavd / kernel_local / odd-3llc
+  ...</pre></div>
+
+That ❌ column is the sweep doing its job. This development kernel
+removed the deprecated `scx_bpf_cpu_rq()` kfunc; `scx_lavd` still
+requires it, so its BPF skeleton fails at load in every cell — caught
+here, not on a user's machine. The failing cells' captured output
+names the exact break:
+
+<!-- captured: same sweep, scx_lavd cell scheduler log | ktstr 0.23.0 | kernel sched_ext-for-7.2 b4dc42d2 -->
+```text
+libbpf: extern (func ksym) 'scx_bpf_cpu_rq': not found in kernel or module BTFs
+libbpf: failed to load BPF skeleton 'bpf_bpf': -EINVAL
+Error: Failed to load BPF program (Invalid argument, os error 22)
+```
 
 A cell in the `verified_insns` table shows a single number when the
 count is flat across topologies, `lo..hi` when it varies, and `-`
@@ -79,8 +104,53 @@ means the scheduler verified, attached, and dispatched on every
 kernel that ran the cell; ❌ means it failed on every kernel; 🇽 means
 mixed results across kernels (the 🇽 glyph renders inconsistently in
 some terminal fonts — the failing-combinations list below the grid is
-the authoritative record). This 4-cell sweep ran its VMs in parallel
-and finished in about 13 seconds of test time.
+the authoritative record).
+
+> [!NOTE]
+> For a scheduler outside your workspace, declare it with
+> `binary_path` as above. A bare `binary = "name"` (discovery) emits
+> verifier cells only for workspace members, even when
+> `KTSTR_SCHEDULER_BIN_<NAME>` points at a binary.
+
+## The kernel axis
+
+`--kernel` takes the same grammar everywhere — repeatable flags, a
+`START..END` range, versions, cache keys, paths, git refs (see
+[kernel resolution](cargo-ktstr.md#test)). A range expands against
+kernel.org's active releases, so end-of-life series silently drop
+unless you ask for them:
+
+<!-- captured: cargo ktstr kernel list --kernel 6.12..6.14 [--include-eol] | ktstr 0.23.0 -->
+```text
+$ cargo ktstr kernel list --kernel 6.12..6.14
+kernel list: range expanded to 1 kernel(s): 6.12.95
+
+$ cargo ktstr kernel list --kernel 6.12..6.14 --include-eol
+kernel list: range expanded to 3 kernel(s): 6.12.95, 6.13.12, 6.14.11
+```
+
+With multiple kernels resolved, each cell runs against its own, the
+`verified_insns` table grows one row per kernel, and the pass/fail
+grid folds kernels into each cell (✅ passed on every kernel, ❌
+failed on every kernel, 🇽 mixed — the failing-combinations list is
+authoritative):
+
+<!-- captured: cargo ktstr verifier --kernel 7.0.14-tarball-x86_64-kcabd40422 --kernel local-8cd2b47-x86_64-kcabd40422 --scheduler ktstr_sched --test kaslr_axis_e2e tiny-1llc tiny-2llc | ktstr 0.23.0 | kernels 7.0.14 + v7.1-patched -->
+<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr verifier --kernel 7.0 --kernel ../linux --scheduler ktstr_sched tiny-1llc tiny-2llc</span></div>
+
+<pre>ktstr_sched:
+ kernel               ktstr_dispatch  ktstr_dump  ktstr_dump_cpu  ktstr_dump_task  ktstr_enqueue  ktstr_exit  ktstr_exit_task  ktstr_init  ktstr_init_task  ktstr_select_cp  ktstr_yield
+ kernel_7_0_14        102             81          13              70               74             25          419              2296        29077            39               8
+ kernel_local_8cd2b4  102             81          13              70               74             25          419              2296        29077            39               8
+
+verifier summary: 2 ✅  0 ❌  0 🇽
+ topology   ktstr_sched
+ tiny-1llc  ✅
+ tiny-2llc  ✅</pre></div>
+
+Flat rows across kernels are the boring, reassuring case — the same
+BPF verified identically on both. A kfunc or verifier change between
+kernels shows up as diverging counts, or as a 🇽 cell.
 
 ## What a cell checks
 
@@ -202,7 +272,11 @@ operator-supplied kernel set:
 - Version specs (`"6.14.2"`) — match entries whose label equals the
   version (raw or sanitized form).
 - Range specs (`"6.14..6.16"`, `"6.14..=6.16"`) — match entries whose
-  version falls in the inclusive range.
+  version falls in the inclusive range. One asymmetry vs the CLI:
+  `--kernel 6.14..6.16` widens a two-component end to the whole
+  `6.16.x` series, but a declaration filter compares the end
+  literally — `kernels = ["6.14..6.16"]` does not match a `6.16.5`
+  entry.
 - Path / cache-key / git specs — match by sanitized-label equality.
 
 ```sh

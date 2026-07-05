@@ -59,27 +59,28 @@ attaches BPF probes along the crash path, and reruns the scenario. Each
 probed function prints decoded struct fields; `→` marks fields that
 changed between entry and exit:
 
-<!-- captured: cargo ktstr test (ktstr/bpf_crash_auto_repro_e2e) — prior-run sample preserved from running-tests/auto-repro.md | ktstr 0.23.0 | kernel with the sched_ext_exit tracepoint -->
+<!-- captured: cargo ktstr test --kernel local-8cd2b47 (v7.1 + sched_ext_exit tracepoint) -E 'test(=ktstr/bpf_crash_auto_repro_e2e)' --no-capture; ktstr 0.23.0 + pending trigger-signature fix | full run: captures/autorepro-live.txt -->
 <div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr test — auto-repro output after a scheduler crash</span></div>
 
 <pre><span class="t-b">=== AUTO-PROBE: scx_exit fired ===</span>
 
-  ktstr_enqueue                                                   main.bpf.c:21
+  ktstr_select_cpu                                              main.bpf.c:380
     task_struct *p
-      pid         97
-      cpus_ptr    0xf(0-3)
-      dsq_id      SCX_DSQ_INVALID
-<span class="t-dim">      ...</span>
-      scx_flags   QUEUED|ENABLED
-  do_enqueue_task                                               kernel/sched/ext.c
+      pid                 40
+      cpus_ptr            0xf(0-3)
+<span class="t-grn">      dsq_id              SCX_DSQ_INVALID  →  SCX_DSQ_LOCAL</span>
+<span class="t-grn">      slice               19982063         →  20000000</span>
+      weight              100
+      scx_flags           RESET_RUNNABLE_AT|DEQD_FOR_SLEEP|ENABLED
+  do_enqueue_task                                               kernel/sched/ext.c:1885
     rq *rq
-      cpu         1
+      cpu                 0
     task_struct *p
-      pid         97
-      cpus_ptr    0xf(0-3)
-<span class="t-grn">      dsq_id      SCX_DSQ_INVALID          →  SCX_DSQ_LOCAL</span>
-<span class="t-dim">      ...</span>
-<span class="t-grn">      scx_flags   QUEUED|DEQD_FOR_SLEEP    →  QUEUED</span></pre></div>
+      pid                 40
+      dsq_id              SCX_DSQ_LOCAL
+      scx_flags           QUEUED|DEQD_FOR_SLEEP|ENABLED
+<span class="t-dim">  ...</span>
+<span class="t-red">  bpf_prog_9a11f2edaac0b52f_ktstr_dispatch+0x57/0x1db</span></pre></div>
 
 Auto-repro is on by default and needs a kernel with the `sched_ext_exit`
 tracepoint — see [Auto-Repro](running-tests/auto-repro.md). For the
