@@ -1467,15 +1467,37 @@ pub(crate) struct RunDirSummary {
     /// Count of `.wprof.pb` traces written this run (excludes the
     /// `.repro.wprof.pb` auto-repro variant).
     pub(crate) wprof_traces: usize,
+    /// Tests skipped because THIS HOST cannot run them, as
+    /// `(test_name, class)` where `class` is the host-insufficiency
+    /// tag written by [`write_host_skip_marker`]
+    /// (`topology_insufficient` / `resource_contention` /
+    /// `perf_mode_unavailable`). Ordered by `test_name`. The footer
+    /// groups these by class so an operator sees, per class, how many
+    /// tests this host could not run and which.
+    pub(crate) host_skips: Vec<(String, String)>,
+    /// Tests whose auto-repro probe pipeline had a problem, as
+    /// `(test_name, reason)` written by [`write_probe_health_marker`]
+    /// (trigger failed to load/attach, kprobes attached 0 while
+    /// functions were traceable, or probes attached but captured 0
+    /// events). Ordered by `test_name`; one footer line each.
+    pub(crate) probe_issues: Vec<(String, String)>,
 }
 
-/// The five per-test artifact shapes a run directory holds.
+/// The per-test artifact shapes a run directory holds.
 enum RunArtifactKind {
     FailureDump,
     ReproFailureDump,
     StatsSidecar,
     Wprof,
     ReproWprof,
+    /// `{test}-{hash}.host-skip.json` — a host-insufficiency skip
+    /// marker ([`write_host_skip_marker`]). Its JSON body carries the
+    /// skip `class`.
+    HostSkip,
+    /// `{test}-{hash}.probe-health.json` — an auto-repro probe-pipeline
+    /// problem marker ([`write_probe_health_marker`]). Its JSON body
+    /// carries a short `reason`.
+    ProbeHealth,
 }
 
 /// Split a `{test}-{16-hex variant hash}` stem into `(test, hash)`.
@@ -1521,6 +1543,14 @@ fn split_variant_stem(stem: &str) -> (&str, u64) {
 /// `test_name = {test}` rather than the bare-`.failure-dump.json`
 /// branch stripping less and yielding `{test}-{hash}.repro`.
 fn classify_run_artifact(name: &str) -> Option<(&str, u64, RunArtifactKind)> {
+    if let Some(stem) = name.strip_suffix(".host-skip.json") {
+        let (test, hash) = split_variant_stem(stem);
+        return Some((test, hash, RunArtifactKind::HostSkip));
+    }
+    if let Some(stem) = name.strip_suffix(".probe-health.json") {
+        let (test, hash) = split_variant_stem(stem);
+        return Some((test, hash, RunArtifactKind::ProbeHealth));
+    }
     if let Some(stem) = name.strip_suffix(".repro.failure-dump.json") {
         let (test, hash) = split_variant_stem(stem);
         return Some((test, hash, RunArtifactKind::ReproFailureDump));
@@ -1608,6 +1638,12 @@ fn summarize_one_run_dir(
         // for the FAILED block header; `None` when no variant sidecar
         // parsed as a failure (a dump-only pre-sidecar failure).
         fail_variant: Option<(String, String)>,
+        // Host-insufficiency skip class from a `.host-skip.json` marker
+        // (whichever variant scanned last — a plain skip has one).
+        host_skip_class: Option<String>,
+        // Short auto-repro probe-pipeline problem reason from a
+        // `.probe-health.json` marker (last variant scanned wins).
+        probe_health_reason: Option<String>,
     }
     let entries = std::fs::read_dir(dir).ok()?;
     let mut by_test: BTreeMap<String, Acc> = BTreeMap::new();
@@ -1679,13 +1715,47 @@ fn summarize_one_run_dir(
                 }
                 acc.stats_sidecars.push(path);
             }
+            RunArtifactKind::HostSkip => {
+                // Read the marker's `class` field. A malformed / absent
+                // body leaves the class unset — the marker's presence
+                // alone is not enough to name a class, so it is dropped
+                // rather than rendered as an unlabelled skip.
+                if let Some(class) = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| v.get("class").and_then(|c| c.as_str()).map(String::from))
+                {
+                    acc.host_skip_class = Some(class);
+                }
+            }
+            RunArtifactKind::ProbeHealth => {
+                if let Some(reason) = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(String::from))
+                {
+                    acc.probe_health_reason = Some(reason);
+                }
+            }
         }
     }
     if by_test.is_empty() {
         return None;
     }
     let mut failed = Vec::new();
+    let mut host_skips = Vec::new();
+    let mut probe_issues = Vec::new();
     for (test_name, mut acc) in by_test {
+        // Host-insufficiency skip and probe-pipeline problem are
+        // orthogonal to the FAILED gate below (a host skip is not a
+        // failure, and a probe problem rides an otherwise-passing
+        // auto-repro run), so collect them BEFORE the failure `continue`.
+        if let Some(class) = acc.host_skip_class.take() {
+            host_skips.push((test_name.clone(), class));
+        }
+        if let Some(reason) = acc.probe_health_reason.take() {
+            probe_issues.push((test_name.clone(), reason));
+        }
         // A test FAILED this run if ANY of its variant sidecars records
         // `is_fail` (the FINAL post-inversion verdict), OR it left a
         // failure dump WITHOUT any parsed sidecar. A dump with no sidecar
@@ -1730,6 +1800,8 @@ fn summarize_one_run_dir(
         failed,
         stats_sidecars,
         wprof_traces,
+        host_skips,
+        probe_issues,
     })
 }
 
@@ -1832,10 +1904,58 @@ pub fn format_run_artifact_footer(
                 ));
             }
         }
+        out.push_str(&render_host_skips(&s.host_skips));
+        out.push_str(&render_probe_issues(&s.probe_issues));
         out.push_str(&format!(
             "    ({} stats sidecar(s), {} wprof trace(s) written this run)\n",
             s.stats_sidecars, s.wprof_traces,
         ));
+    }
+    out
+}
+
+/// Render the host-topology-skip block: one line per skip class, each
+/// naming its count and the tests this host could not run. Returns the
+/// empty string when there are no host skips (the common case), so the
+/// footer stays silent unless this host actually forced a skip.
+///
+/// `skips` is `(test_name, class)` collected from the run dir's
+/// `.host-skip.json` markers; classes are grouped (BTreeMap →
+/// class-alphabetical, deterministic) and each group's tests are listed
+/// in the input order (already `test_name`-sorted by
+/// `summarize_one_run_dir`'s BTreeMap walk).
+fn render_host_skips(skips: &[(String, String)]) -> String {
+    if skips.is_empty() {
+        return String::new();
+    }
+    let mut by_class: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for (test, class) in skips {
+        by_class.entry(class).or_default().push(test);
+    }
+    let mut out = String::from("    host-skipped (this host cannot run):\n");
+    for (class, tests) in by_class {
+        out.push_str(&format!(
+            "      {} ({}): {}\n",
+            class,
+            tests.len(),
+            tests.join(", "),
+        ));
+    }
+    out
+}
+
+/// Render the auto-repro probe-health block: one line per test whose
+/// probe pipeline had a problem, with its short reason. Empty string
+/// when every probe pipeline was healthy, so the footer says nothing on
+/// a clean run.
+fn render_probe_issues(issues: &[(String, String)]) -> String {
+    if issues.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("    probe pipeline problems:\n");
+    for (test, reason) in issues {
+        out.push_str(&format!("      {test}: {reason}\n"));
     }
     out
 }
@@ -3674,6 +3794,65 @@ pub(crate) fn write_skip_sidecar(
         run_source: detect_run_source(),
     };
     serialize_and_write_sidecar(&sidecar, "skip sidecar")
+}
+
+/// Best-effort write of a small per-test run marker JSON to the current
+/// sidecar dir as `{test}-{variant_hash:016x}.{suffix}`. Shared by the
+/// host-skip and probe-health markers the footer scans
+/// ([`summarize_one_run_dir`]). Not variant-clashing with the sidecar /
+/// dump artifacts (distinct suffix). Failures log at warn and are
+/// swallowed — a missing marker only costs the footer one advisory line,
+/// never a run's correctness. NOT atomically staged: the body is a
+/// single small object a partial read would fail to parse (dropped by
+/// the reader), and the mtime gate excludes any prior-run residue.
+fn write_run_marker(entry_name: &str, variant_hash: u64, suffix: &str, body: &serde_json::Value) {
+    let dir = sidecar_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(error = %e, path = %dir.display(), "ktstr: create dir for {suffix} marker");
+        return;
+    }
+    let path = dir.join(format!("{entry_name}-{variant_hash:016x}.{suffix}"));
+    match serde_json::to_string_pretty(body) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                tracing::warn!(error = %e, path = %path.display(), "ktstr: write {suffix} marker");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "ktstr: serialize {suffix} marker for '{entry_name}'"),
+    }
+}
+
+/// Record a `.host-skip.json` marker for a test this HOST cannot run.
+/// `class` is the host-insufficiency tag
+/// (`topology_insufficient` / `resource_contention` /
+/// `perf_mode_unavailable`); the footer groups by it. Keyed by the same
+/// variant hash the skip's `.ktstr.json` sidecar uses so a gauntlet's
+/// per-preset skips do not clobber.
+pub(crate) fn write_host_skip_marker(
+    entry: &KtstrTestEntry,
+    resolved_topology: &crate::vmm::topology::Topology,
+    class: &str,
+) {
+    let variant_hash =
+        variant_hash_from_parts(entry, resolved_topology, &super::args::current_work_type());
+    write_run_marker(
+        entry.name,
+        variant_hash,
+        "host-skip.json",
+        &serde_json::json!({ "test_name": entry.name, "class": class }),
+    );
+}
+
+/// Record a `.probe-health.json` marker naming a per-test auto-repro
+/// probe-pipeline problem with a short `reason`, for the footer's probe
+/// block. `variant_hash` matches the run's other per-test artifacts.
+pub(crate) fn write_probe_health_marker(entry_name: &str, variant_hash: u64, reason: &str) {
+    write_run_marker(
+        entry_name,
+        variant_hash,
+        "probe-health.json",
+        &serde_json::json!({ "test_name": entry_name, "reason": reason }),
+    );
 }
 
 /// Write a sidecar JSON file for post-run analysis.

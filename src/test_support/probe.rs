@@ -1023,6 +1023,16 @@ fn format_repro_output(
         )
     };
 
+    // Record a per-test probe-health marker when the auto-repro probe
+    // pipeline had a problem (trigger failed to load/attach, kprobes
+    // attached 0 while targets were traceable, or probes attached but
+    // captured 0 events) so the end-of-run footer surfaces it without the
+    // operator reading per-test output. Skipped on a stall exit — its
+    // empty event set is expected (no causal task), not a probe fault.
+    if !is_stall && let Some(reason) = probe_health_issue(&repro_result.output) {
+        super::sidecar::write_probe_health_marker(entry.name, repro_result.variant_hash, &reason);
+    }
+
     // Build diagnostic tails from the repro VM's output.
     const REPRO_TAIL_LINES: usize = 40;
 
@@ -1158,6 +1168,83 @@ pub(crate) fn extract_probe_output(
         &payload.render_hints,
     ));
     Some(out)
+}
+
+/// Inspect the repro VM's probe payload for a pipeline problem worth a
+/// one-line footer advisory, returning a short reason or `None` when the
+/// pipeline was healthy. The three problems, in priority order:
+///
+///  1. the trigger program failed to load/attach
+///     ([`ProbeDiagnostics::trigger_attach_error`], now carrying the
+///     forwarded libbpf log) — nothing downstream can fire;
+///  2. kprobes attached 0 while the pipeline DID expand traceable
+///     targets — the probes were resolvable but none took;
+///  3. probes attached but captured 0 events — attach succeeded yet the
+///     run produced no samples.
+///
+/// Parses with no partial-dump sink (the caller's `extract_probe_output`
+/// already wrote it on the same payload) so a malformed/truncated
+/// payload — which carries no `diagnostics` — simply yields `None`
+/// rather than a second stale-file write.
+///
+/// [`ProbeDiagnostics::trigger_attach_error`]: crate::probe::process::ProbeDiagnostics::trigger_attach_error
+fn probe_health_issue(output: &str) -> Option<String> {
+    let json = crate::probe::output::extract_section(output, PROBE_OUTPUT_START, PROBE_OUTPUT_END);
+    if json.is_empty() {
+        return None;
+    }
+    let payload = parse_probe_payload(&json, None)?;
+    // A recovered-from-truncation payload has no diagnostics; without the
+    // skeleton counters none of the three conditions is assessable.
+    let diag = payload.diagnostics.as_ref()?;
+    let sk = &diag.skeleton;
+    if let Some(err) = &sk.trigger_attach_error {
+        return Some(format!(
+            "probe trigger failed to attach: {}",
+            condense_probe_reason(err),
+        ));
+    }
+    if sk.kprobe_attached == 0 && diag.pipeline.total_after_expand > 0 {
+        return Some(format!(
+            "kprobes attached 0 of {} traceable target(s)",
+            diag.pipeline.total_after_expand,
+        ));
+    }
+    if sk.kprobe_attached > 0 && payload.events.is_empty() {
+        return Some(format!(
+            "{} kprobe(s) attached but captured 0 events",
+            sk.kprobe_attached,
+        ));
+    }
+    None
+}
+
+/// Condense a (possibly multi-line, libbpf-log-bearing)
+/// `trigger_attach_error` into a single short footer clause. Prefers the
+/// TAIL of the forwarded libbpf log — the BTF / verifier rejection reason
+/// (e.g. "failed to find kernel BTF type ID of 'sched_ext_exit'") lands
+/// at the end, whereas the leading text is the bare errno — then collapses
+/// whitespace and truncates.
+fn condense_probe_reason(err: &str) -> String {
+    const MARKER: &str = "LIBBPF-LOG>>>";
+    let core = if let Some(start) = err.find(MARKER) {
+        let after = &err[start + MARKER.len()..];
+        let log = after.split("<<<LIBBPF-LOG").next().unwrap_or(after);
+        log.lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or(err)
+    } else {
+        err
+    };
+    let condensed = core.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX: usize = 200;
+    if condensed.chars().count() > MAX {
+        format!("{}…", condensed.chars().take(MAX - 1).collect::<String>())
+    } else {
+        condensed
+    }
 }
 
 /// Try to deserialize the probe payload, recovering as much data as

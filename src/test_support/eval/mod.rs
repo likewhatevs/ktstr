@@ -175,9 +175,7 @@ pub(crate) fn run_ktstr_test_inner(
 ) -> Result<AssertResult> {
     let result = run_ktstr_test_inner_impl(entry, topo);
     if let Err(ref e) = result
-        && (super::is_resource_contention(e)
-            || super::is_topology_insufficient(e)
-            || super::is_perf_mode_unavailable(e))
+        && let Some(host_skip_class) = super::host_skip_class(e)
     {
         // Late catch-all for a skip-class error (ResourceContention,
         // TopologyInsufficient, or PerfModeUnavailable) from any early-bail
@@ -192,7 +190,15 @@ pub(crate) fn run_ktstr_test_inner(
         // sidecar. Not strictly idempotent — a second write refreshes
         // run_id and timestamp — but the skip classification round-trips
         // identically, so stats tooling sees the same outcome.
-        record_skip_sidecar(entry, topo);
+        let resolved_topology = record_skip_sidecar(entry, topo);
+        // Host-driven skip: also drop a `.host-skip.json` marker so the
+        // end-of-run footer's host-skip block names this test under its
+        // class. Same variant hash as the skip sidecar just written.
+        crate::test_support::sidecar::write_host_skip_marker(
+            entry,
+            &resolved_topology,
+            host_skip_class,
+        );
     }
     // `expect_auto_repro = true` inversion: when the primary VM
     // failed AND the auto-repro VM landed a shape-valid
@@ -1144,11 +1150,13 @@ fn run_ktstr_test_inner_impl(
             // KtstrKvm::new's "create VM"): walk the chain so a wrapped
             // skip-class error is still recorded here, matching the late
             // catch-all in run_ktstr_test_inner.
-            if super::is_resource_contention(&e)
-                || super::is_topology_insufficient(&e)
-                || super::is_perf_mode_unavailable(&e)
-            {
-                record_skip_sidecar(entry, topo);
+            if let Some(class) = super::host_skip_class(&e) {
+                let resolved_topology = record_skip_sidecar(entry, topo);
+                crate::test_support::sidecar::write_host_skip_marker(
+                    entry,
+                    &resolved_topology,
+                    class,
+                );
             }
             return Err(e.context("build ktstr_test VM"));
         }
@@ -1157,11 +1165,13 @@ fn run_ktstr_test_inner_impl(
         Ok(r) => r,
         Err(e) => {
             // Chain-aware, as in the build arm above.
-            if super::is_resource_contention(&e)
-                || super::is_topology_insufficient(&e)
-                || super::is_perf_mode_unavailable(&e)
-            {
-                record_skip_sidecar(entry, topo);
+            if let Some(class) = super::host_skip_class(&e) {
+                let resolved_topology = record_skip_sidecar(entry, topo);
+                crate::test_support::sidecar::write_host_skip_marker(
+                    entry,
+                    &resolved_topology,
+                    class,
+                );
             }
             return Err(e.context("run ktstr_test VM"));
         }

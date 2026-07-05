@@ -3419,6 +3419,109 @@ fn format_footer_empty_without_fresh_artifacts() {
     assert!(format_run_artifact_footer(root.path(), std::time::SystemTime::now()).is_empty());
 }
 
+// -- host-skip block rendering (Task: host-topology skips) --
+
+#[test]
+fn render_host_skips_groups_by_class_with_counts_and_names() {
+    // Two classes; topology_insufficient has two tests, resource
+    // contention one. Rendered one line per class: "<class> (<n>): a, b".
+    let skips = vec![
+        ("wide_smp".to_string(), "topology_insufficient".to_string()),
+        (
+            "big_gauntlet".to_string(),
+            "resource_contention".to_string(),
+        ),
+        ("fat_llc".to_string(), "topology_insufficient".to_string()),
+    ];
+    let out = render_host_skips(&skips);
+    assert!(
+        out.contains("host-skipped (this host cannot run):"),
+        "{out}"
+    );
+    assert!(
+        out.contains("topology_insufficient (2): wide_smp, fat_llc"),
+        "grouped class line missing/wrong: {out}"
+    );
+    assert!(
+        out.contains("resource_contention (1): big_gauntlet"),
+        "{out}"
+    );
+    // Exactly one line per class (plus the header).
+    assert_eq!(
+        out.lines().count(),
+        3,
+        "one header + two class lines: {out}"
+    );
+}
+
+#[test]
+fn render_host_skips_empty_is_silent() {
+    assert!(render_host_skips(&[]).is_empty());
+}
+
+#[test]
+fn render_probe_issues_one_line_per_test() {
+    let issues = vec![
+        (
+            "bpf_crash_auto_repro_e2e".to_string(),
+            "probe trigger failed to attach: sched_ext_exit BTF id absent".to_string(),
+        ),
+        (
+            "other".to_string(),
+            "3 kprobe(s) attached but captured 0 events".to_string(),
+        ),
+    ];
+    let out = render_probe_issues(&issues);
+    assert!(out.contains("probe pipeline problems:"), "{out}");
+    assert!(
+        out.contains(
+            "bpf_crash_auto_repro_e2e: probe trigger failed to attach: sched_ext_exit BTF id absent"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("other: 3 kprobe(s) attached but captured 0 events"),
+        "{out}"
+    );
+    assert_eq!(out.lines().count(), 3, "one header + two test lines: {out}");
+}
+
+#[test]
+fn render_probe_issues_empty_is_silent() {
+    assert!(render_probe_issues(&[]).is_empty());
+}
+
+#[test]
+fn format_footer_surfaces_host_skip_and_probe_markers() {
+    // A run dir carrying a host-skip marker and a probe-health marker
+    // (no failures) must render both advisory blocks even though no test
+    // FAILED. Markers are `{test}-{16hex}.{suffix}` JSON bodies.
+    let root = tempfile::TempDir::new().unwrap();
+    let run = root.path().join("7.1.0-abc1234");
+    std::fs::create_dir(&run).unwrap();
+    std::fs::write(
+        run.join("wide_smp_boot-0000000000000001.host-skip.json"),
+        br#"{"test_name":"wide_smp_boot","class":"topology_insufficient"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        run.join("bpf_crash-0000000000000002.probe-health.json"),
+        br#"{"test_name":"bpf_crash","reason":"probe trigger failed to attach: ESRCH"}"#,
+    )
+    .unwrap();
+    let out = format_run_artifact_footer(root.path(), std::time::UNIX_EPOCH);
+    assert!(
+        out.contains("topology_insufficient (1): wide_smp_boot"),
+        "host-skip block missing: {out}"
+    );
+    assert!(
+        out.contains("bpf_crash: probe trigger failed to attach: ESRCH"),
+        "probe-health block missing: {out}"
+    );
+    // A pure-advisory run lists no FAILED tests.
+    assert!(!out.contains("FAILED"), "no test failed here: {out}");
+}
+
 // -- runs_root KTSTR_RUNS_ROOT anchoring (workspace footer fix) --
 
 #[test]
