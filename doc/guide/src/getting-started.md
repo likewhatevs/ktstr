@@ -187,14 +187,20 @@ Reading it:
 
 ## What gets checked
 
-> [!WARNING]
-> Nothing, by default. A bare `#[ktstr_test]` boots the VM, runs the
-> scenario, and reports pass even if the scheduler stalled, starved
-> workers, or never dispatched a task.
+A scheduler that dies fails the test by default: a crash, a load
+failure, or a stall (the kernel watchdog kicks a stalled scheduler out
+with an error) all exit non-zero and come back red, with the failure
+trail from [Reading Failure Output](running-tests/failures.md).
 
-Every check is an opt-in attribute: `not_starved = true` enables the
-starvation/fairness/gap trio, `max_spread_pct`, `min_iteration_rate`,
-and friends set explicit thresholds. [Checking](concepts/checking.md)
+> [!WARNING]
+> Behavioral checks are a different story: nothing is asserted by
+> default. A bare `#[ktstr_test]` reports pass even if the scheduler
+> starved workers or spread CPU time wildly — as long as it stayed
+> alive.
+
+Every behavioral check is an opt-in attribute: `not_starved = true`
+enables the starvation/fairness/gap trio, `max_spread_pct`,
+`min_iteration_rate`, and friends set explicit thresholds. [Checking](concepts/checking.md)
 explains the model;
 [Customize Checking](recipes/custom-checking.md) shows the override
 flow.
