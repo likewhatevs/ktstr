@@ -193,7 +193,30 @@ The dump comes in two shapes. When the scheduler attached and its
 exit path triggered, it is a full post-mortem: BPF map contents with
 BTF-typed field names, per-vCPU registers, per-program runtime stats
 — the JSON form of what [Snapshots](../writing-tests/snapshots.md)
-renders. When the failure happened before the BPF probe attached, a
+renders. Every BPF map is walked with BTF, so values come back as
+named struct members, not hex:
+
+<!-- captured: target/ktstr/7.1.0/failure_dump_renders_bss_fields-*.failure-dump.json (trimmed) | ktstr 0.23.0 | kernel v7.1-patched -->
+```json
+{
+  "schema": "single",
+  "maps": [
+    { "name": "arena", "map_type": 33, "arena": { "pages": 13, "..." : "..." } },
+    { "name": "bpf_bpf.bss", "map_type": 2, "value_size": 280,
+      "value": { "kind": "struct", "type_name": ".bss", "members": [
+        { "name": "chunk_pool", "value": { "kind": "struct", "type_name": "sdt_pool",
+          "members": [
+            { "name": "elem_size", "value": { "kind": "uint", "bits": 64, "value": 4096 } },
+            "..."
+        ] } },
+        "..."
+      ] } },
+    "..."
+  ]
+}
+```
+
+When the failure happened before the capture path could adopt, a
 placeholder is written instead, and says so:
 
 <!-- captured: target/ktstr/7.0.14-73730e0-dirty/failure_dump_renders_bss_fields-69298e1249f472ef.failure-dump.json | ktstr 0.23.0 | kernel 7.0.14 -->
