@@ -521,10 +521,17 @@ static __KTSTR_ENTRY_FAILURE_DUMP_BSS: ktstr::test_support::KtstrTestEntry =
         // dispatch after 1 second of operation, triggering
         // SCX_EXIT_ERROR_STALL via the kernel watchdog.
         extra_sched_args: &["--stall-after=1"],
-        // Watchdog timeout snug to the stall budget so the run
-        // teardown stays under the test duration.
+        // watchdog_timeout sets the GUEST scx watchdog (scx_sched.
+        // watchdog_timeout), so a stalled task trips SCX_EXIT_ERROR_STALL
+        // ~3s after it parks. duration drives the HOST watchdog deadline
+        // (max(watchdog_timeout, duration) + boot headroom); it must sit
+        // comfortably above scheduler-attach time + the 3s guest watchdog
+        // + the freeze/dump walk, or the host tears the VM down before the
+        // coordinator captures and the dump lands as a placeholder. On a
+        // slow-booting host attach alone can run past 15s, so keep the
+        // deadline generous.
         watchdog_timeout: std::time::Duration::from_secs(3),
-        duration: std::time::Duration::from_secs(10),
+        duration: std::time::Duration::from_secs(20),
         // expect_err inverts the SCX_EXIT_ERROR_STALL (the expected
         // outcome of --stall-after=1) to PASS. The real render
         // assertions live in `check_bss_dump`, a post_vm_unconditional
@@ -560,8 +567,11 @@ static __KTSTR_ENTRY_FAILURE_DUMP_BSS: ktstr::test_support::KtstrTestEntry =
 #[ktstr_test(
     scheduler = KTSTR_SCHED,
     extra_sched_args = ["--stall-after=1"],
+    // watchdog_timeout_s sets the guest scx watchdog (~3s to trip the
+    // stall); duration_s drives the host deadline and must clear
+    // attach + the 3s watchdog + the freeze walk (see the BSS entry).
     watchdog_timeout_s = 3,
-    duration_s = 10,
+    duration_s = 20,
     expect_err = true,
     post_vm_unconditional = check_array_entries_dump,
 )]
@@ -974,10 +984,17 @@ static __KTSTR_ENTRY_FAILURE_DUMP_CAPTURES: ktstr::test_support::KtstrTestEntry 
         // dispatch after 1 second of operation, triggering
         // SCX_EXIT_ERROR_STALL via the kernel watchdog.
         extra_sched_args: &["--stall-after=1"],
-        // Watchdog timeout snug to the stall budget so the run
-        // teardown stays under the test duration.
+        // watchdog_timeout sets the GUEST scx watchdog (scx_sched.
+        // watchdog_timeout), so a stalled task trips SCX_EXIT_ERROR_STALL
+        // ~3s after it parks. duration drives the HOST watchdog deadline
+        // (max(watchdog_timeout, duration) + boot headroom); it must sit
+        // comfortably above scheduler-attach time + the 3s guest watchdog
+        // + the freeze/dump walk, or the host tears the VM down before the
+        // coordinator captures and the dump lands as a placeholder. On a
+        // slow-booting host attach alone can run past 15s, so keep the
+        // deadline generous.
         watchdog_timeout: std::time::Duration::from_secs(3),
-        duration: std::time::Duration::from_secs(10),
+        duration: std::time::Duration::from_secs(20),
         // expect_err inverts the SCX_EXIT_ERROR_STALL (the expected
         // outcome of --stall-after=1) to PASS. The real capture
         // assertions live in `check_capture_dump`, a
@@ -1131,10 +1148,17 @@ static __KTSTR_ENTRY_FAILURE_DUMP_PROBE_COUNTERS: ktstr::test_support::KtstrTest
         // bumps `KTSTR_PCPU_TRIGGER_COUNT` on every fire, so a
         // single stall produces a non-zero cross-CPU sum.
         extra_sched_args: &["--stall-after=1"],
-        // Watchdog timeout snug to the stall budget so the run
-        // teardown stays under the test duration.
+        // watchdog_timeout sets the GUEST scx watchdog (scx_sched.
+        // watchdog_timeout), so a stalled task trips SCX_EXIT_ERROR_STALL
+        // ~3s after it parks. duration drives the HOST watchdog deadline
+        // (max(watchdog_timeout, duration) + boot headroom); it must sit
+        // comfortably above scheduler-attach time + the 3s guest watchdog
+        // + the freeze/dump walk, or the host tears the VM down before the
+        // coordinator captures and the dump lands as a placeholder. On a
+        // slow-booting host attach alone can run past 15s, so keep the
+        // deadline generous.
         watchdog_timeout: std::time::Duration::from_secs(3),
-        duration: std::time::Duration::from_secs(10),
+        duration: std::time::Duration::from_secs(20),
         // expect_err inverts the SCX_EXIT_ERROR_STALL (the expected
         // outcome of --stall-after=1) to PASS. The real counter
         // assertions live in `check_probe_dump`, a
