@@ -55,7 +55,7 @@ pub mod basic;
 pub mod bpf_pin;
 pub mod cpuset;
 pub mod dynamic;
-pub mod host_stall;
+pub mod host_stuck;
 pub mod interaction;
 pub mod nested;
 pub mod ops;

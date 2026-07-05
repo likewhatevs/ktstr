@@ -50,7 +50,10 @@ fn thresholds_default_values() {
         t.max_local_dsq_depth, 50,
         "default max_local_dsq_depth drifted",
     );
-    assert!(t.fail_on_stall, "default fail_on_stall drifted");
+    assert!(
+        t.fail_on_rq_clock_stuck,
+        "default fail_on_rq_clock_stuck drifted"
+    );
     assert_eq!(t.sustained_samples, 5, "default sustained_samples drifted");
     assert!(
         (t.max_fallback_rate - 200.0).abs() < f64::EPSILON,
@@ -73,7 +76,7 @@ fn thresholds_default_matches_const() {
     let b = MonitorThresholds::new();
     assert!((a.max_imbalance_ratio - b.max_imbalance_ratio).abs() < f64::EPSILON);
     assert_eq!(a.max_local_dsq_depth, b.max_local_dsq_depth);
-    assert_eq!(a.fail_on_stall, b.fail_on_stall);
+    assert_eq!(a.fail_on_rq_clock_stuck, b.fail_on_rq_clock_stuck);
     assert_eq!(a.sustained_samples, b.sustained_samples);
     assert!((a.max_fallback_rate - b.max_fallback_rate).abs() < f64::EPSILON);
     assert!((a.max_keep_last_rate - b.max_keep_last_rate).abs() < f64::EPSILON);
@@ -186,7 +189,7 @@ fn thresholds_dsq_depth_sustained_fails() {
     let t = MonitorThresholds {
         sustained_samples: 3,
         max_local_dsq_depth: 10,
-        fail_on_stall: false,
+        fail_on_rq_clock_stuck: false,
         enforce: true,
         ..Default::default()
     };
@@ -229,7 +232,7 @@ fn thresholds_dsq_depth_below_sustained_passes() {
     let t = MonitorThresholds {
         sustained_samples: 3,
         max_local_dsq_depth: 10,
-        fail_on_stall: false,
+        fail_on_rq_clock_stuck: false,
         ..Default::default()
     };
     // Only 2 consecutive DSQ violations, then a clean sample.
@@ -273,7 +276,7 @@ fn thresholds_stuck_fails() {
     // a single stuck pair triggers failure. `enforce: true` opts out of
     // the report-only default so the violation flips `passed` to false.
     let t = MonitorThresholds {
-        fail_on_stall: true,
+        fail_on_rq_clock_stuck: true,
         sustained_samples: 1,
         enforce: true,
         ..Default::default()
@@ -329,17 +332,17 @@ fn thresholds_stuck_fails() {
 
 #[test]
 fn thresholds_stuck_disabled_passes() {
-    // Test the `fail_on_stall: false` toggle: a CPU with a
+    // Test the `fail_on_rq_clock_stuck: false` toggle: a CPU with a
     // stuck `rq_clock` must NOT fail the verdict when stall
     // detection is disabled. The setup uses 2 CPUs with mixed
     // rq_clock (cpu0 stuck at 5000/5000, cpu1 advancing
     // 6000/7500) so `data_looks_valid` returns true (rq_clocks
     // are not all identical) and the no-signal Inconclusive
     // arm doesn't fire — the test isolates the
-    // `fail_on_stall=false` toggle from the data-validity
+    // `fail_on_rq_clock_stuck=false` toggle from the data-validity
     // path.
     let t = MonitorThresholds {
-        fail_on_stall: false,
+        fail_on_rq_clock_stuck: false,
         sustained_samples: 100,
         ..Default::default()
     };
@@ -390,7 +393,7 @@ fn thresholds_stuck_disabled_passes() {
     let v = t.evaluate(&report);
     assert!(
         v.is_pass(),
-        "fail_on_stall=false must pass even with stuck cpu0: {:?}",
+        "fail_on_rq_clock_stuck=false must pass even with stuck cpu0: {:?}",
         v.details
     );
 }
@@ -401,7 +404,7 @@ fn thresholds_imbalance_interrupted_by_balanced_resets() {
     let t = MonitorThresholds {
         sustained_samples: 5,
         max_imbalance_ratio: 4.0,
-        fail_on_stall: false,
+        fail_on_rq_clock_stuck: false,
         ..Default::default()
     };
     let mut samples = Vec::new();
@@ -469,7 +472,7 @@ fn thresholds_multiple_violations() {
     let t = MonitorThresholds {
         sustained_samples: 2,
         max_imbalance_ratio: 2.0,
-        fail_on_stall: true,
+        fail_on_rq_clock_stuck: true,
         enforce: true,
         ..Default::default()
     };
@@ -658,7 +661,7 @@ fn thresholds_all_same_clocks_yields_inconclusive() {
     // Pass) — same silent-pass guard as
     // [`thresholds_uninitialized_memory_yields_inconclusive`].
     let t = MonitorThresholds {
-        fail_on_stall: true,
+        fail_on_rq_clock_stuck: true,
         ..Default::default()
     };
     let samples = vec![
@@ -763,7 +766,7 @@ fn thresholds_single_cpu_single_sample_valid() {
     // A single reading cannot be compared, so all_clocks_same with
     // total_readings=1 should still be treated as valid.
     let t = MonitorThresholds {
-        fail_on_stall: true,
+        fail_on_rq_clock_stuck: true,
         sustained_samples: 1,
         enforce: true,
         ..Default::default()

@@ -161,7 +161,7 @@ static __KTSTR_ENTRY_BPF_API: ktstr::test_support::KtstrTestEntry =
         func: scenario_bpf_api_link,
         scheduler: &KTSTR_SCHED,
         auto_repro: false,
-        assert: ktstr::assert::Assert::NO_OVERRIDES.fail_on_stall(false),
+        assert: ktstr::assert::Assert::NO_OVERRIDES.fail_on_rq_clock_stuck(false),
         bpf_map_write: &[&BPF_NOOP],
         // The link scenario holds a fixed 2s. The cold-BTF
         // bpf_map_write phase-1 latency (the wait_for_map_write block

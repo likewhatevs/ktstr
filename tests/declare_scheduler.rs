@@ -220,7 +220,7 @@ declare_scheduler!(DECLARE_SCHEDULER_WITH_ASSERT, {
         .check_not_starved()
         .max_gap_ms(5000)
         .max_imbalance_ratio(2.5)
-        .fail_on_stall(true)
+        .fail_on_rq_clock_stuck(true)
         .sustained_samples(15),
 });
 
@@ -233,7 +233,7 @@ fn assert_field_threads_to_scheduler() {
         Some(2.5)
     );
     assert_eq!(
-        DECLARE_SCHEDULER_WITH_ASSERT.assert.fail_on_stall,
+        DECLARE_SCHEDULER_WITH_ASSERT.assert.fail_on_rq_clock_stuck,
         Some(true)
     );
     assert_eq!(
@@ -281,7 +281,10 @@ fn omitted_assert_defaults_to_no_overrides() {
     // Verified via DECLARE_SCHEDULER_MINIMAL which omits assert.
     assert_eq!(DECLARE_SCHEDULER_MINIMAL.assert.not_starved, None);
     assert_eq!(DECLARE_SCHEDULER_MINIMAL.assert.max_gap_ms, None);
-    assert_eq!(DECLARE_SCHEDULER_MINIMAL.assert.fail_on_stall, None);
+    assert_eq!(
+        DECLARE_SCHEDULER_MINIMAL.assert.fail_on_rq_clock_stuck,
+        None
+    );
 }
 
 declare_scheduler!(DECLARE_SCHEDULER_CFG_DEF, {

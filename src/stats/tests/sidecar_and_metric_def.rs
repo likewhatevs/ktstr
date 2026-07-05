@@ -782,7 +782,7 @@ fn infer_higher_is_worse_latency_shaped() {
         "scheduling_delay",
         "task_run_delay_ns",
         "io_completion_ms",
-        "stall_count",
+        "stuck_count",
         "stuck_count",
         "schedule_jitter_cv",
         "max_gap_us",

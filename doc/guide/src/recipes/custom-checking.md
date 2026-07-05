@@ -65,7 +65,7 @@ declare_scheduler!(RELAXED, {
     assert = Assert::NO_OVERRIDES
         .max_imbalance_ratio(5.0)    // tolerate 5:1 imbalance
         .max_fallback_rate(500.0)    // higher fallback rate ok
-        .fail_on_stall(false),       // don't fail on stall
+        .fail_on_rq_clock_stuck(false),  // don't fail on stuck rq_clock
 });
 ```
 

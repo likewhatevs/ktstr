@@ -1242,8 +1242,8 @@ fn fold_monitor_into_bucket(
     if let Some(v) = pm.max_imbalance {
         put("max_imbalance_ratio", v);
     }
-    if pm.stall_count > 0 {
-        put("stuck_count", pm.stall_count as f64);
+    if pm.stuck_count > 0 {
+        put("stuck_count", pm.stuck_count as f64);
     }
     if synthesized {
         if let Some(v) = pm.avg_dsq_depth {

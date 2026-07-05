@@ -1,6 +1,6 @@
-//! Unit tests for stall detection behavior, plus the negative
+//! Unit tests for stuck detection behavior, plus the negative
 //! threshold cases (imbalance / DSQ / stuck rq_clock) and the
-//! vCPU CPU-time gating that suppresses false-positive stalls
+//! vCPU CPU-time gating that suppresses false-positive stuck verdicts
 //! when the vCPU was preempted by the host.
 //! Co-located via the sibling `*_tests.rs` pattern.
 
@@ -17,7 +17,7 @@ fn neg_tight_imbalance_threshold_catches_mild_imbalance() {
     let t = MonitorThresholds {
         max_imbalance_ratio: 1.0,
         sustained_samples: 2,
-        fail_on_stall: false,
+        fail_on_rq_clock_stuck: false,
         enforce: true,
         ..Default::default()
     };
@@ -46,7 +46,7 @@ fn neg_tight_imbalance_threshold_catches_mild_imbalance() {
         summary.max_imbalance_ratio >= 1.5,
         "summary must capture ratio"
     );
-    assert_eq!(summary.stuck_count, 0, "no stall in this scenario");
+    assert_eq!(summary.stuck_count, 0, "no stuck cpu in this scenario");
     assert_eq!(summary.total_samples, 3);
     let report = MonitorReport {
         samples,
@@ -89,7 +89,7 @@ fn neg_tight_dsq_threshold_catches_small_depth() {
     let t = MonitorThresholds {
         max_local_dsq_depth: 1,
         sustained_samples: 2,
-        fail_on_stall: false,
+        fail_on_rq_clock_stuck: false,
         enforce: true,
         ..Default::default()
     };
@@ -153,7 +153,7 @@ fn neg_stuck_detection_catches_frozen_rq_clock() {
     // Stuck checks use sustained_samples window. sustained_samples=1 means
     // a single stuck pair triggers failure.
     let t = MonitorThresholds {
-        fail_on_stall: true,
+        fail_on_rq_clock_stuck: true,
         sustained_samples: 1,
         enforce: true,
         ..Default::default()
@@ -295,7 +295,7 @@ fn neg_combined_imbalance_and_stuck_both_reported() {
     let t = MonitorThresholds {
         max_imbalance_ratio: 2.0,
         sustained_samples: 1,
-        fail_on_stall: true,
+        fail_on_rq_clock_stuck: true,
         enforce: true,
         ..Default::default()
     };
@@ -355,11 +355,11 @@ fn neg_combined_imbalance_and_stuck_both_reported() {
         imb.contains("exceeded threshold 2.0"),
         "imbalance format: {imb}"
     );
-    let stall = v
+    let stuck = v
         .failure_details()
         .find(|d| d.contains("rq_clock stuck"))
         .unwrap();
-    assert!(stall.contains("cpu0"), "stall format: {stall}");
+    assert!(stuck.contains("cpu0"), "stuck format: {stuck}");
     assert!(
         v.details.len() >= 2,
         "both violations must be reported, got {}",
@@ -371,9 +371,9 @@ fn neg_combined_imbalance_and_stuck_both_reported() {
 #[test]
 fn stuck_idle_cpu_exempt() {
     // nr_running==0 on both samples: idle CPU, NOHZ tick stopped.
-    // rq_clock not advancing is expected, not a stall.
+    // rq_clock not advancing is expected, not stuck.
     let t = MonitorThresholds {
-        fail_on_stall: true,
+        fail_on_rq_clock_stuck: true,
         sustained_samples: 1,
         enforce: true,
         ..Default::default()
@@ -419,7 +419,7 @@ fn stuck_idle_cpu_exempt() {
     let summary = MonitorSummary::from_samples(&samples);
     assert_eq!(
         summary.stuck_count, 0,
-        "idle CPU should not trigger stall in summary"
+        "idle CPU should not trigger stuck detection in summary"
     );
     let report = MonitorReport {
         samples,
@@ -429,7 +429,7 @@ fn stuck_idle_cpu_exempt() {
     let v = t.evaluate(&report);
     assert!(
         v.is_pass(),
-        "idle CPU should not trigger stall: {:?}",
+        "idle CPU should not trigger stuck detection: {:?}",
         v.details
     );
 }
@@ -437,11 +437,11 @@ fn stuck_idle_cpu_exempt() {
 #[test]
 fn stuck_idle_to_busy_not_exempt() {
     // nr_running transitions from 0 to 1 — the CPU woke up but
-    // rq_clock didn't advance. This IS a stall (the CPU is now
+    // rq_clock didn't advance. This IS stuck (the CPU is now
     // busy but the scheduler tick hasn't fired).
     // Second CPU has a different clock value so data_looks_valid passes.
     let t = MonitorThresholds {
-        fail_on_stall: true,
+        fail_on_rq_clock_stuck: true,
         sustained_samples: 1,
         enforce: true,
         ..Default::default()
@@ -487,7 +487,7 @@ fn stuck_idle_to_busy_not_exempt() {
     let summary = MonitorSummary::from_samples(&samples);
     assert_eq!(
         summary.stuck_count, 1,
-        "busy CPU with frozen clock is a stall"
+        "busy CPU with frozen clock is stuck"
     );
     let report = MonitorReport {
         samples,
@@ -504,15 +504,15 @@ fn stuck_idle_to_busy_not_exempt() {
 
 #[test]
 fn stuck_sustained_window_filters_transient() {
-    // With sustained_samples=3, a 2-sample stall doesn't trigger.
+    // With sustained_samples=3, a 2-sample stuck run doesn't trigger.
     // Second CPU has a different clock value so data_looks_valid passes.
     let t = MonitorThresholds {
-        fail_on_stall: true,
+        fail_on_rq_clock_stuck: true,
         sustained_samples: 3,
         ..Default::default()
     };
     let mut samples = Vec::new();
-    // 3 samples: 2 consecutive stall pairs for cpu0, then clock advances.
+    // 3 samples: 2 consecutive stuck pairs for cpu0, then clock advances.
     for i in 0..3u64 {
         samples.push(MonitorSample {
             bpf_map_fields: Vec::new(),
@@ -559,24 +559,24 @@ fn stuck_sustained_window_filters_transient() {
         ..Default::default()
     };
     let v = t.evaluate(&report);
-    // 2 consecutive stall pairs < sustained_samples=3
-    assert!(v.passed, "2 stall pairs < sustained=3: {:?}", v.details);
+    // 2 consecutive stuck pairs < sustained_samples=3
+    assert!(v.passed, "2 stuck pairs < sustained=3: {:?}", v.details);
 }
 
 #[test]
 fn stuck_sustained_window_catches_real_stuck() {
-    // With sustained_samples=3, 3+ consecutive stall pairs trigger.
+    // With sustained_samples=3, 3+ consecutive stuck pairs trigger.
     // Second CPU has a different clock value so data_looks_valid passes.
     // `enforce: true` opts the verdict out of report-only mode (the
-    // default), so the recorded stall violation flips `passed` to
+    // default), so the recorded stuck violation flips `passed` to
     // false.
     let t = MonitorThresholds {
-        fail_on_stall: true,
+        fail_on_rq_clock_stuck: true,
         sustained_samples: 3,
         enforce: true,
         ..Default::default()
     };
-    // 4 samples = 3 consecutive stall pairs for cpu0. cpu1 advances.
+    // 4 samples = 3 consecutive stuck pairs for cpu0. cpu1 advances.
     let samples: Vec<_> = (0..4u64)
         .map(|i| MonitorSample {
             bpf_map_fields: Vec::new(),
@@ -604,13 +604,13 @@ fn stuck_sustained_window_catches_real_stuck() {
         ..Default::default()
     };
     let v = t.evaluate(&report);
-    assert!(!v.passed, "3 consecutive stall pairs must fail");
+    assert!(!v.passed, "3 consecutive stuck pairs must fail");
     assert!(v.details.iter().any(|d| d.contains("rq_clock stuck")));
 }
 
 #[test]
 fn from_samples_idle_cpu_no_stuck() {
-    // from_samples should not flag stall when both samples have
+    // from_samples should not flag stuck when both samples have
     // nr_running==0 on the stuck CPU.
     let s1 = MonitorSample {
         bpf_map_fields: Vec::new(),
@@ -654,10 +654,10 @@ fn from_samples_idle_cpu_no_stuck() {
 
 #[test]
 fn stuck_below_sustained_passes() {
-    // 1 stall pair with sustained_samples=5 should pass.
+    // 1 stuck pair with sustained_samples=5 should pass.
     // Second CPU has a different clock value so data_looks_valid passes.
     let t = MonitorThresholds {
-        fail_on_stall: true,
+        fail_on_rq_clock_stuck: true,
         sustained_samples: 5,
         ..Default::default()
     };
@@ -725,7 +725,7 @@ fn stuck_below_sustained_passes() {
         ..Default::default()
     };
     let v = t.evaluate(&report);
-    assert!(v.passed, "1 stall < sustained=5: {:?}", v.details);
+    assert!(v.passed, "1 stuck pair < sustained=5: {:?}", v.details);
 }
 
 // -- vCPU CPU time gating tests --
@@ -733,10 +733,10 @@ fn stuck_below_sustained_passes() {
 #[test]
 fn evaluate_suppresses_stuck_when_vcpu_preempted() {
     // vcpu_cpu_time_ns shows < threshold advancement -> vCPU was
-    // preempted, stall should be suppressed. Use explicit threshold
+    // preempted, the stuck verdict should be suppressed. Use explicit threshold
     // (10ms) to avoid host CONFIG_HZ dependency.
     let t = MonitorThresholds {
-        fail_on_stall: true,
+        fail_on_rq_clock_stuck: true,
         sustained_samples: 1,
         enforce: true,
         ..Default::default()
@@ -786,7 +786,7 @@ fn evaluate_suppresses_stuck_when_vcpu_preempted() {
     let summary = MonitorSummary::from_samples_with_threshold(&samples, 10_000_000);
     assert_eq!(
         summary.stuck_count, 0,
-        "preempted vCPU should not flag stall in summary"
+        "preempted vCPU should not flag stuck in summary"
     );
     let report = MonitorReport {
         samples,
@@ -800,7 +800,7 @@ fn evaluate_suppresses_stuck_when_vcpu_preempted() {
     let v = t.evaluate(&report);
     assert!(
         v.is_pass(),
-        "preempted vCPU should suppress stall: {:?}",
+        "preempted vCPU should suppress stuck: {:?}",
         v.details
     );
 }
@@ -808,11 +808,11 @@ fn evaluate_suppresses_stuck_when_vcpu_preempted() {
 #[test]
 fn evaluate_catches_stuck_when_vcpu_running() {
     // vcpu_cpu_time_ns shows advancement >= threshold -> vCPU was
-    // running, stall is real. Use explicit threshold (10ms) to avoid
+    // running, the stuck verdict is real. Use explicit threshold (10ms) to avoid
     // host CONFIG_HZ dependency (DEFAULT_HZ=250 gives 40ms threshold,
     // which would mask the 10ms advance).
     let t = MonitorThresholds {
-        fail_on_stall: true,
+        fail_on_rq_clock_stuck: true,
         sustained_samples: 1,
         enforce: true,
         ..Default::default()
@@ -862,7 +862,7 @@ fn evaluate_catches_stuck_when_vcpu_running() {
     let summary = MonitorSummary::from_samples_with_threshold(&samples, 10_000_000);
     assert_eq!(
         summary.stuck_count, 1,
-        "running vCPU with stuck clock is a stall"
+        "running vCPU with stuck clock is stuck"
     );
     let report = MonitorReport {
         samples,
@@ -874,7 +874,7 @@ fn evaluate_catches_stuck_when_vcpu_running() {
         scx_event_counters_supported: false,
     };
     let v = t.evaluate(&report);
-    assert!(!v.passed, "running vCPU stall must fail: {:?}", v.details);
+    assert!(!v.passed, "running vCPU stuck must fail: {:?}", v.details);
     assert!(v.details.iter().any(|d| d.contains("rq_clock stuck")));
 }
 
@@ -882,7 +882,7 @@ fn evaluate_catches_stuck_when_vcpu_running() {
 fn evaluate_stuck_none_vcpu_time_falls_back_to_current_behavior() {
     // vcpu_cpu_time_ns is None -> assume vCPU was running (don't suppress).
     let t = MonitorThresholds {
-        fail_on_stall: true,
+        fail_on_rq_clock_stuck: true,
         sustained_samples: 1,
         enforce: true,
         ..Default::default()
@@ -928,7 +928,7 @@ fn evaluate_stuck_none_vcpu_time_falls_back_to_current_behavior() {
     let summary = MonitorSummary::from_samples(&samples);
     assert_eq!(
         summary.stuck_count, 1,
-        "None vcpu time should not suppress stall"
+        "None vcpu time should not suppress stuck"
     );
     let report = MonitorReport {
         samples,
@@ -938,7 +938,7 @@ fn evaluate_stuck_none_vcpu_time_falls_back_to_current_behavior() {
     let v = t.evaluate(&report);
     assert!(
         !v.is_pass(),
-        "None vcpu time should detect stall: {:?}",
+        "None vcpu time should detect stuck: {:?}",
         v.details
     );
 }
@@ -990,6 +990,6 @@ fn from_samples_suppresses_stuck_when_vcpu_preempted() {
     let summary = MonitorSummary::from_samples_with_threshold(&[s1, s2], 10_000_000);
     assert_eq!(
         summary.stuck_count, 0,
-        "preempted vCPU should not flag stall"
+        "preempted vCPU should not flag stuck"
     );
 }

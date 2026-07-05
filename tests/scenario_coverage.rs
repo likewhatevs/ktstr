@@ -356,7 +356,7 @@ fn cover_fan_out_compute(ctx: &Ctx) -> Result<AssertResult> {
     watchdog_timeout_s = 60,
     duration_s = 30,
     max_imbalance_ratio = 10.0,
-    fail_on_stall = false,
+    fail_on_rq_clock_stuck = false,
 )]
 fn cover_watchdog_long_timeout_survives(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::basic::custom_sched_mixed(ctx)
@@ -427,7 +427,7 @@ static __KTSTR_ENTRY_FORCED_STALL: KtstrTestEntry = KtstrTestEntry {
 #[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_STALL_DETECT: KtstrTestEntry = KtstrTestEntry {
-    name: "neg_stall_detection_scx_exit",
+    name: "neg_stuck_detection_scx_exit",
     func: ktstr::scenario::basic::custom_crash_light,
     topology: TOPO_1L_4C_1T,
     scheduler: &KTSTR_SCHED,

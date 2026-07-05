@@ -337,7 +337,7 @@ pub struct PhaseMetrics {
     /// kept out of the run-level ext re-pool (see `populate_run_ext_metrics_from_phases`).
     pub avg_nr_running: Option<f64>,
     pub max_dsq_depth: u32,
-    pub stall_count: usize,
+    pub stuck_count: usize,
     /// select_cpu_fallback events per second. None when event counters unavailable.
     pub fallback_rate: Option<f64>,
     /// dispatch_keep_last events per second. None when event counters unavailable.
@@ -882,7 +882,7 @@ impl Timeline {
                 || m.max_dsq_depth > 0
                 || m.fallback_rate.is_some()
                 || m.keep_last_rate.is_some()
-                || m.stall_count > 0;
+                || m.stuck_count > 0;
             if m.sample_count > 0 || has_monitor_metrics {
                 out.push_str(&format!(
                     "  imbalance: avg={} max={} | dsq: avg={} max={} | nr_run: avg={}",
@@ -914,8 +914,8 @@ impl Timeline {
                     out.push_str(&format!(" | throughput: {ir:.0} iter/s{suffix}"));
                 }
                 out.push('\n');
-                if m.stall_count > 0 {
-                    out.push_str(&format!("  stuck: {}\n", m.stall_count));
+                if m.stuck_count > 0 {
+                    out.push_str(&format!("  stuck: {}\n", m.stuck_count));
                 }
             } else if let Some(ir) = m.iteration_rate {
                 // Synthesized zero-capture step (the
@@ -973,7 +973,7 @@ impl Timeline {
     /// | `max_dsq_depth`         | `max_dsq_depth`         |
     /// | `avg_dsq_depth`         | `avg_dsq_depth`         |
     /// | `avg_nr_running`        | `avg_nr_running`        |
-    /// | `stuck_count`           | `stall_count`           |
+    /// | `stuck_count`           | `stuck_count`           |
     /// | `total_fallback`        | `fallback_rate` (rate)  |
     /// | `total_keep_last`       | `keep_last_rate` (rate) |
     /// | `iteration_rate`        | `iteration_rate`        |
@@ -1110,7 +1110,7 @@ fn phase_from_bucket(b: &crate::assert::PhaseBucket, sorted_events: &[&StimulusE
             .get("max_dsq_depth")
             .map(|v| v.round() as u32)
             .unwrap_or(0),
-        stall_count: b
+        stuck_count: b
             .metrics
             .get("stuck_count")
             .map(|v| v.round() as usize)
@@ -1268,7 +1268,7 @@ fn format_phase_cgroups(
 /// from the guest kernel's `CONFIG_HZ` via
 /// `crate::monitor::vcpu_preemption_threshold_ns` — the same resolution
 /// [`MonitorSummary::from_samples_with_threshold`](crate::monitor::MonitorSummary::from_samples_with_threshold)
-/// applies, so the per-phase `stall_count` applies the SAME per-(CPU,
+/// applies, so the per-phase `stuck_count` applies the SAME per-(CPU,
 /// window) `is_cpu_stuck` predicate as the run-level
 /// `MonitorSummary::stuck_count` (run-level `>=` Σ per-phase: it also
 /// windows across phase boundaries).
@@ -1300,7 +1300,7 @@ pub(crate) fn compute_metrics(
     let mut total_dsq = 0.0f64;
     let mut total_nr_running = 0.0f64;
     let mut max_dsq = 0u32;
-    let mut stall_count = 0usize;
+    let mut stuck_count = 0usize;
 
     for sample in &valid {
         for cpu in &sample.cpus {
@@ -1346,7 +1346,7 @@ pub(crate) fn compute_metrics(
         let cpu_count = prev.cpus.len().min(curr.cpus.len());
         for cpu in 0..cpu_count {
             if crate::monitor::reader::is_cpu_stuck(&prev.cpus[cpu], &curr.cpus[cpu], threshold) {
-                stall_count += 1;
+                stuck_count += 1;
             }
         }
     }
@@ -1398,7 +1398,7 @@ pub(crate) fn compute_metrics(
         avg_dsq_depth: (valid_count > 0).then(|| total_dsq / n),
         avg_nr_running: (valid_count > 0).then(|| total_nr_running / n),
         max_dsq_depth: max_dsq,
-        stall_count,
+        stuck_count,
         fallback_rate,
         keep_last_rate,
         iteration_rate: None,
@@ -2248,12 +2248,12 @@ mod tests {
             sample(700, vec![(1, 0, 5000), (1, 0, 7000)]), // cpu0 stalled
         ];
         let t = Timeline::build(&events, &samples, 0);
-        assert_eq!(t.phases[0].metrics.stall_count, 1);
+        assert_eq!(t.phases[0].metrics.stuck_count, 1);
     }
 
     #[test]
-    fn compute_metrics_stall_count_accumulates_across_windows() {
-        // cpu0 frozen across TWO consecutive windows -> stall_count == 2.
+    fn compute_metrics_stuck_count_accumulates_across_windows() {
+        // cpu0 frozen across TWO consecutive windows -> stuck_count == 2.
         // Pins that the per-phase path counts every stuck (CPU, window),
         // mirroring the run-level accumulation (both breaks removed).
         let s1 = sample(100, vec![(1, 0, 5000), (1, 0, 6000)]);
@@ -2261,7 +2261,7 @@ mod tests {
         let s3 = sample(300, vec![(1, 0, 5000), (1, 0, 6200)]);
         let refs: Vec<&MonitorSample> = vec![&s1, &s2, &s3];
         let m = compute_metrics(&refs, 0);
-        assert_eq!(m.stall_count, 2);
+        assert_eq!(m.stuck_count, 2);
     }
 
     #[test]
@@ -2283,7 +2283,7 @@ mod tests {
         let phase_a: Vec<&MonitorSample> = vec![&samples[0], &samples[1]];
         let phase_b: Vec<&MonitorSample> = vec![&samples[2]];
         let sum_per_phase =
-            compute_metrics(&phase_a, 0).stall_count + compute_metrics(&phase_b, 0).stall_count;
+            compute_metrics(&phase_a, 0).stuck_count + compute_metrics(&phase_b, 0).stuck_count;
         assert_eq!(
             sum_per_phase, 1,
             "the (s2,s3) boundary pair is in neither phase"

@@ -5,7 +5,7 @@
 //! [`MonitorThresholds::summarize`].
 //!
 //! `evaluate` itself is covered end-to-end by the threshold,
-//! stall_detection, event_rates, and enforce sibling test modules.
+//! stuck_detection, event_rates, and enforce sibling test modules.
 //! These tests anchor each helper to its specific contract so a
 //! regression in one aspect surfaces here directly — rather than as
 //! a churn of failures across every evaluate-based fixture that
@@ -107,7 +107,7 @@ fn track_imbalance_and_dsq_empty_cpus_records_non_violation() {
 #[test]
 fn track_rq_clock_stuck_sizes_vec_to_max_cpu_count_across_samples() {
     let t = MonitorThresholds {
-        fail_on_stall: true,
+        fail_on_rq_clock_stuck: true,
         ..Default::default()
     };
     let s1 = MonitorSample {
@@ -167,7 +167,7 @@ fn track_rq_clock_stuck_sizes_vec_to_max_cpu_count_across_samples() {
 #[test]
 fn track_rq_clock_stuck_respects_vcpu_preemption_threshold() {
     let t = MonitorThresholds {
-        fail_on_stall: true,
+        fail_on_rq_clock_stuck: true,
         ..Default::default()
     };
     let s1 = MonitorSample {

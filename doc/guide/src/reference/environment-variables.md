@@ -58,7 +58,7 @@ interact; the first two are mutually exclusive at every entry point.
 | `KTSTR_CONTENTION_BYPASS` | Make transient KVM errnos hard failures instead of `ResourceContention` skips (only when the host is not near its limits) — stricter, for catching kernel-side regressions. | Exactly `"1"` | Skip on contention |
 | `KTSTR_HOST_CGROUP_PARENT` | cgroup-v2 parent under which `host_only` tests create per-test cgroups. Must be a non-root subdirectory of `/sys/fs/cgroup`. | Path under `/sys/fs/cgroup` | `/sys/fs/cgroup/ktstr` |
 | `KTSTR_CGROUP_WALK_ROOT` | Where the setup-time controller-enable walk starts, for delegated cgroup subtrees (systemd `Delegate=yes`, container `nsdelegate`). Must be a prefix of the configured parent. | Path prefix of the parent | `/sys/fs/cgroup` |
-| `KTSTR_STALL_POLL_MS` | Host-mode stall-monitor poll cadence. | Milliseconds; empty / `0` / unparseable falls back | 500 ms |
+| `KTSTR_STUCK_POLL_MS` | Host-mode stuck-monitor poll cadence. | Milliseconds; empty / `0` / unparseable falls back | 500 ms |
 | `KTSTR_WORKER_READY_MARKER_OVERRIDE` | Path where the jemalloc alloc worker writes its ready marker, for `noexec` or quota-constrained temp filesystems. | Absolute path | `/tmp/ktstr-worker-ready-<pid>` |
 
 ## Set by ktstr itself

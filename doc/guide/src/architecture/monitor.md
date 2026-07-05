@@ -69,7 +69,7 @@ event-counter deltas. Averages are computed over valid samples only
 |-----------|---------|------------|
 | `max_imbalance_ratio` | 4.0 | max/min per-CPU `nr_running` exceeds the ratio |
 | `max_local_dsq_depth` | 50 | any CPU's local DSQ exceeds the depth |
-| `fail_on_stall` | true | a CPU's `rq_clock` stops advancing (exemptions below) |
+| `fail_on_rq_clock_stuck` | true | a CPU's `rq_clock` stops advancing (exemptions below) |
 | `max_fallback_rate` | 200.0/s | sustained select-cpu-fallback event rate |
 | `max_keep_last_rate` | 100.0/s | sustained dispatch-keep-last event rate |
 | `sustained_samples` | 5 | — window: a violation must persist this many consecutive samples |
@@ -83,7 +83,7 @@ reasoning behind each default value lives in
 
 Test authors do not construct `MonitorThresholds` directly: the
 `#[ktstr_test]` threshold attributes (`max_imbalance_ratio`,
-`fail_on_stall`, …) and `Assert::with_monitor_defaults()` feed it —
+`fail_on_rq_clock_stuck`, …) and `Assert::with_monitor_defaults()` feed it —
 see [the macro reference](../writing-tests/ktstr-test-macro.md).
 
 **`enforce` is the on/off gate for the threshold-violation path.**
@@ -91,7 +91,7 @@ The default is report-only: monitor evaluations record every
 violation in the verdict's details, but the verdict passes. Opting in
 — via `Assert::with_monitor_defaults()`, which fills unset threshold
 fields and sets `enforce` — promotes recorded violations to failures.
-Setting a field like `fail_on_stall` without enforcement is a no-op
+Setting a field like `fail_on_rq_clock_stuck` without enforcement is a no-op
 for the violation path: the violation appears in the monitor report,
 the verdict still passes, and the summary carries a report-only
 advisory flagging the missing enforcement.

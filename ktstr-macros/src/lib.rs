@@ -26,7 +26,7 @@ mod scheduler;
 /// sixteen boolean attributes (`auto_repro`, `expect_auto_repro`,
 /// `not_starved`, `isolation`, `performance_mode`, `pci`, `no_perf_mode`,
 /// `requires_smt`, `expect_err`, `survives_storm`, `allow_inconclusive`,
-/// `fail_on_stall`, `host_only`, `ignore`, `kaslr`, `wprof`) also accept a
+/// `fail_on_rq_clock_stuck`, `host_only`, `ignore`, `kaslr`, `wprof`) also accept a
 /// bare form as shorthand for `= true` — e.g.
 /// `#[ktstr_test(host_only)]` is equivalent to
 /// `#[ktstr_test(host_only = true)]`. Of the sixteen, `auto_repro`
@@ -608,7 +608,7 @@ mod tests {
         assert_eq!(d.max_spread_pct, None);
         assert_eq!(d.max_imbalance_ratio, None);
         assert_eq!(d.max_local_dsq_depth, None);
-        assert_eq!(d.fail_on_stall, None);
+        assert_eq!(d.fail_on_rq_clock_stuck, None);
         assert_eq!(d.sustained_samples, None);
         assert_eq!(d.max_throughput_cv, None);
         assert_eq!(d.min_work_rate, None);

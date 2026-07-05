@@ -1771,13 +1771,13 @@ pub(crate) fn evaluate_preempted(prev: Option<u64>, curr: Option<u64>, threshold
 /// This helper exists to keep the stall-detection paths in lock-step: the
 /// post-hoc `MonitorSummary::from_samples` (run-level `stuck_count`), the
 /// reactive `MonitorThresholds::evaluate` (SysRq-D trigger), and the
-/// per-phase `crate::timeline::compute_metrics` (`stall_count`) all route
+/// per-phase `crate::timeline::compute_metrics` (`stuck_count`) all route
 /// through this predicate. Previously each site re-implemented the same
 /// conjunction and drifting one would let the SysRq-D trigger fire on
 /// conditions the post-hoc verdict accepted (or vice versa), and let the
 /// per-phase count classify a window differently from the run-level one.
 /// All callers now agree on a single definition of "stuck", so the
-/// per-phase `stall_count` and the run-level `stuck_count` apply an
+/// per-phase `stuck_count` and the run-level `stuck_count` apply an
 /// identical predicate; the run-level count is `>=` the sum of per-phase
 /// counts (it also windows across phase boundaries and over out-of-phase
 /// samples that no phase covers).
@@ -3186,7 +3186,7 @@ pub(crate) fn monitor_loop(
             // exemptions. `vcpu_cpu_time_ns` is already stamped into
             // `cpus[i]` (and into the last pushed sample) above, so the
             // helper sees the same vCPU timing the post-hoc path sees.
-            if t.fail_on_stall
+            if t.fail_on_rq_clock_stuck
                 && let Some(prev) = samples.last()
             {
                 let n = prev.cpus.len().min(cpus.len()).min(stall_trackers.len());
@@ -4856,7 +4856,7 @@ mod tests {
             thresholds: super::super::MonitorThresholds {
                 max_imbalance_ratio: 2.0,
                 sustained_samples: 2,
-                fail_on_stall: false,
+                fail_on_rq_clock_stuck: false,
                 ..Default::default()
             },
             virtio_con: Some(virtio_con.clone()),
@@ -4923,7 +4923,7 @@ mod tests {
             thresholds: super::super::MonitorThresholds {
                 max_imbalance_ratio: 100.0,
                 max_local_dsq_depth: 10000,
-                fail_on_stall: true,
+                fail_on_rq_clock_stuck: true,
                 sustained_samples: 2,
                 ..Default::default()
             },
@@ -4972,7 +4972,7 @@ mod tests {
     #[test]
     fn monitor_loop_dump_trigger_idle_cpu_no_stall() {
         // Reactive path: nr_running==0 (idle) with stuck rq_clock should
-        // NOT trigger the dump, even with fail_on_stall=true.
+        // NOT trigger the dump, even with fail_on_rq_clock_stuck=true.
         let offsets = test_offsets();
         // CPU idle: nr_running=0, rq_clock stuck at 5000.
         let buf = make_rq_buffer(&offsets, 0, 0, 0, 5000, 0);
@@ -4990,7 +4990,7 @@ mod tests {
             thresholds: super::super::MonitorThresholds {
                 max_imbalance_ratio: 100.0,
                 max_local_dsq_depth: 10000,
-                fail_on_stall: true,
+                fail_on_rq_clock_stuck: true,
                 sustained_samples: 1,
                 ..Default::default()
             },
@@ -5070,7 +5070,7 @@ mod tests {
             thresholds: super::super::MonitorThresholds {
                 max_imbalance_ratio: 100.0,
                 max_local_dsq_depth: 10000,
-                fail_on_stall: true,
+                fail_on_rq_clock_stuck: true,
                 sustained_samples: 1,
                 ..Default::default()
             },
@@ -5155,7 +5155,7 @@ mod tests {
             thresholds: super::super::MonitorThresholds {
                 max_imbalance_ratio: 100.0,
                 max_local_dsq_depth: 10000,
-                fail_on_stall: true,
+                fail_on_rq_clock_stuck: true,
                 sustained_samples: 2,
                 ..Default::default()
             },
@@ -5240,7 +5240,7 @@ mod tests {
         let thresholds = super::super::MonitorThresholds {
             max_imbalance_ratio: 100.0,
             max_local_dsq_depth: 10000,
-            fail_on_stall: true,
+            fail_on_rq_clock_stuck: true,
             sustained_samples: 2,
             enforce: true,
             ..Default::default()
@@ -5328,7 +5328,7 @@ mod tests {
         let thresholds = super::super::MonitorThresholds {
             max_imbalance_ratio: 100.0,
             max_local_dsq_depth: 10000,
-            fail_on_stall: true,
+            fail_on_rq_clock_stuck: true,
             sustained_samples: 1,
             ..Default::default()
         };

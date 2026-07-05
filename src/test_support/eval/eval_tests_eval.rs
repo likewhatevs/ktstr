@@ -747,7 +747,7 @@ fn eval_monitor_fail_has_fingerprint() {
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES
         .max_imbalance_ratio(4.0)
-        .fail_on_stall(true)
+        .fail_on_rq_clock_stuck(true)
         .with_monitor_defaults();
     let msg = format!(
         "{}",
@@ -1214,7 +1214,7 @@ fn eval_monitor_fail_includes_sched_log() {
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES
         .max_imbalance_ratio(4.0)
-        .fail_on_stall(true)
+        .fail_on_rq_clock_stuck(true)
         .with_monitor_defaults();
     let msg = format!(
         "{}",
@@ -3134,7 +3134,7 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES
         .max_imbalance_ratio(4.0)
-        .fail_on_stall(true)
+        .fail_on_rq_clock_stuck(true)
         .with_monitor_defaults();
     let ar = evaluate_vm_result(
         &entry,

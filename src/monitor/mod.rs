@@ -52,7 +52,7 @@ mod kernel_hz_tests;
 #[cfg(test)]
 mod schedstat_tests;
 #[cfg(test)]
-mod stall_detection_tests;
+mod stuck_detection_tests;
 #[cfg(test)]
 mod summary_tests;
 #[cfg(test)]
@@ -834,7 +834,7 @@ pub struct MonitorSummary {
     /// CPU's `rq_clock` failed to advance. Idle CPUs (`nr_running == 0`
     /// in both samples) and host-preempted vCPUs are exempt (see
     /// `reader::is_cpu_stuck`). This is the run-level analog of the
-    /// per-phase `PhaseMetrics::stall_count`: both apply the SAME
+    /// per-phase `PhaseMetrics::stuck_count`: both apply the SAME
     /// per-(CPU, window) `is_cpu_stuck` predicate, but this counts over
     /// the full sample stream while the per-phase path windows within
     /// each phase, so run-level `>=` the sum of per-phase counts (it
@@ -1246,7 +1246,7 @@ impl MonitorSummary {
         // observations whose rq_clock did not advance. Skip invalid samples.
         // Counts EVERY hit across all CPUs and all window pairs (no early
         // break). Windowed over the full sample stream, so this is `>=` the
-        // sum of per-phase `PhaseMetrics::stall_count` (both route through
+        // sum of per-phase `PhaseMetrics::stuck_count` (both route through
         // `is_cpu_stuck`; the per-phase path windows within each phase and
         // drops cross-boundary pairs + out-of-phase samples).
         // Exempt idle CPUs: nr_running==0 in both samples means the tick
@@ -1732,7 +1732,7 @@ pub struct MonitorThresholds {
     /// Max allowed local DSQ depth on any CPU in any sample.
     pub max_local_dsq_depth: u32,
     /// Flag when any CPU's rq_clock does not advance between consecutive samples.
-    pub fail_on_stall: bool,
+    pub fail_on_rq_clock_stuck: bool,
     /// Number of consecutive samples that must violate a threshold before flagging.
     pub sustained_samples: usize,
     /// Max sustained select_cpu_fallback events/s across all CPUs.
@@ -1770,7 +1770,7 @@ pub struct MonitorThresholds {
     ///   propagates to this field via
     ///   [`Assert::monitor_thresholds`](crate::assert::Assert::monitor_thresholds).
     ///
-    /// Without this opt-in, a test that sets `fail_on_stall: true`
+    /// Without this opt-in, a test that sets `fail_on_rq_clock_stuck: true`
     /// and asserts `!verdict.passed` on a THRESHOLD VIOLATION
     /// will PASS despite the violation: the violation is recorded
     /// in `details` and the verdict's `summary` carries the
@@ -1798,8 +1798,8 @@ impl MonitorThresholds {
     ///   depth > 50 means the scheduler is not consuming dispatched tasks.
     ///   Transient spikes during cpuset changes are filtered by the
     ///   sustained_samples window.
-    /// - fail_on_stall true: rq_clock not advancing on a CPU with
-    ///   runnable tasks means the scheduler stalled. Idle CPUs
+    /// - fail_on_rq_clock_stuck true: rq_clock not advancing on a CPU with
+    ///   runnable tasks means the scheduler is stuck. Idle CPUs
     ///   (nr_running==0 in both samples) are exempt because NOHZ
     ///   stops the tick. Preempted vCPUs are exempt when the vCPU
     ///   thread's CPU time didn't advance past the preemption
@@ -1817,7 +1817,7 @@ impl MonitorThresholds {
         Self {
             max_imbalance_ratio: 4.0,
             max_local_dsq_depth: 50,
-            fail_on_stall: true,
+            fail_on_rq_clock_stuck: true,
             sustained_samples: 5,
             max_fallback_rate: 200.0,
             max_keep_last_rate: 100.0,
@@ -2048,7 +2048,7 @@ impl MonitorThresholds {
             ));
         }
 
-        if self.fail_on_stall {
+        if self.fail_on_rq_clock_stuck {
             for (cpu, tracker) in self.track_rq_clock_stuck(report).iter().enumerate() {
                 if tracker.sustained(self.sustained_samples) {
                     failed = true;

@@ -24,7 +24,7 @@ fn assert_default_checks_is_no_overrides() {
     assert!(v.isolation.is_none());
     assert!(v.max_imbalance_ratio.is_none());
     assert!(v.max_local_dsq_depth.is_none());
-    assert!(v.fail_on_stall.is_none());
+    assert!(v.fail_on_rq_clock_stuck.is_none());
     assert!(v.sustained_samples.is_none());
     assert!(v.max_fallback_rate.is_none());
     assert!(v.max_keep_last_rate.is_none());
@@ -168,9 +168,9 @@ fn with_monitor_defaults_fills_all_unset_threshold_fields() {
         "max_local_dsq_depth must be auto-filled with DEFAULT"
     );
     assert_eq!(
-        assert.fail_on_stall,
-        Some(d.fail_on_stall),
-        "fail_on_stall must be auto-filled with DEFAULT"
+        assert.fail_on_rq_clock_stuck,
+        Some(d.fail_on_rq_clock_stuck),
+        "fail_on_rq_clock_stuck must be auto-filled with DEFAULT"
     );
     assert_eq!(
         assert.sustained_samples,
@@ -232,7 +232,7 @@ fn with_monitor_defaults_preserves_user_set_values() {
     // the type allows; bool / counter axes flip / shift respectively.
     let custom_imbalance = d.max_imbalance_ratio * 0.5;
     let custom_local_dsq = d.max_local_dsq_depth * 2;
-    let custom_fail_on_stall = !d.fail_on_stall;
+    let custom_fail_on_rq_clock_stuck = !d.fail_on_rq_clock_stuck;
     let custom_sustained = d.sustained_samples * 2;
     let custom_fallback = d.max_fallback_rate * 0.5;
     let custom_keep_last = d.max_keep_last_rate * 0.5;
@@ -252,7 +252,7 @@ fn with_monitor_defaults_preserves_user_set_values() {
         "test derivation produced custom_local_dsq == DEFAULT — DEFAULT.max_local_dsq_depth may have shifted to 0"
     );
     assert_ne!(
-        custom_fail_on_stall, d.fail_on_stall,
+        custom_fail_on_rq_clock_stuck, d.fail_on_rq_clock_stuck,
         "bool flip should always differ"
     );
     assert_ne!(
@@ -270,7 +270,7 @@ fn with_monitor_defaults_preserves_user_set_values() {
     let assert = Assert::NO_OVERRIDES
         .max_imbalance_ratio(custom_imbalance)
         .max_local_dsq_depth(custom_local_dsq)
-        .fail_on_stall(custom_fail_on_stall)
+        .fail_on_rq_clock_stuck(custom_fail_on_rq_clock_stuck)
         .sustained_samples(custom_sustained)
         .max_fallback_rate(custom_fallback)
         .max_keep_last_rate(custom_keep_last)
@@ -285,9 +285,9 @@ fn with_monitor_defaults_preserves_user_set_values() {
         "max_local_dsq_depth user-set value must survive"
     );
     assert_eq!(
-        assert.fail_on_stall,
-        Some(custom_fail_on_stall),
-        "fail_on_stall user-set value must survive"
+        assert.fail_on_rq_clock_stuck,
+        Some(custom_fail_on_rq_clock_stuck),
+        "fail_on_rq_clock_stuck user-set value must survive"
     );
     assert_eq!(
         assert.sustained_samples,
@@ -344,7 +344,7 @@ fn has_monitor_thresholds_true_when_any_set() {
     let _ = MonitorThresholds {
         max_imbalance_ratio: 0.0,
         max_local_dsq_depth: 0,
-        fail_on_stall: false,
+        fail_on_rq_clock_stuck: false,
         sustained_samples: 0,
         max_fallback_rate: 0.0,
         max_keep_last_rate: 0.0,
@@ -362,7 +362,9 @@ fn has_monitor_thresholds_true_when_any_set() {
         ("max_local_dsq_depth", || {
             Assert::NO_OVERRIDES.max_local_dsq_depth(64)
         }),
-        ("fail_on_stall", || Assert::NO_OVERRIDES.fail_on_stall(true)),
+        ("fail_on_rq_clock_stuck", || {
+            Assert::NO_OVERRIDES.fail_on_rq_clock_stuck(true)
+        }),
         ("sustained_samples", || {
             Assert::NO_OVERRIDES.sustained_samples(7)
         }),
@@ -476,14 +478,14 @@ fn assert_monitor_thresholds_extraction() {
     let v = Assert::NO_OVERRIDES
         .max_imbalance_ratio(2.5)
         .max_local_dsq_depth(100)
-        .fail_on_stall(false)
+        .fail_on_rq_clock_stuck(false)
         .sustained_samples(10)
         .max_fallback_rate(50.0)
         .max_keep_last_rate(25.0);
     let t = v.monitor_thresholds();
     assert!((t.max_imbalance_ratio - 2.5).abs() < f64::EPSILON);
     assert_eq!(t.max_local_dsq_depth, 100);
-    assert!(!t.fail_on_stall);
+    assert!(!t.fail_on_rq_clock_stuck);
     assert_eq!(t.sustained_samples, 10);
     assert!((t.max_fallback_rate - 50.0).abs() < f64::EPSILON);
     assert!((t.max_keep_last_rate - 25.0).abs() < f64::EPSILON);
@@ -507,7 +509,7 @@ fn assert_chain_all_setters() {
         .max_spread_pct(5.0)
         .max_imbalance_ratio(3.0)
         .max_local_dsq_depth(20)
-        .fail_on_stall(true)
+        .fail_on_rq_clock_stuck(true)
         .sustained_samples(3)
         .max_fallback_rate(100.0)
         .max_keep_last_rate(50.0);
@@ -517,7 +519,7 @@ fn assert_chain_all_setters() {
     assert_eq!(v.max_spread_pct, Some(5.0));
     assert_eq!(v.max_imbalance_ratio, Some(3.0));
     assert_eq!(v.max_local_dsq_depth, Some(20));
-    assert_eq!(v.fail_on_stall, Some(true));
+    assert_eq!(v.fail_on_rq_clock_stuck, Some(true));
     assert_eq!(v.sustained_samples, Some(3));
     assert_eq!(v.max_fallback_rate, Some(100.0));
     assert_eq!(v.max_keep_last_rate, Some(50.0));
@@ -546,11 +548,14 @@ fn assert_merge_max_spread_pct() {
 }
 
 #[test]
-fn assert_merge_fail_on_stall() {
-    let base = Assert::NO_OVERRIDES.fail_on_stall(true);
-    let other = Assert::NO_OVERRIDES.fail_on_stall(false);
-    assert_eq!(base.merge(&other).fail_on_stall, Some(false));
-    assert_eq!(base.merge(&Assert::NO_OVERRIDES).fail_on_stall, Some(true));
+fn assert_merge_fail_on_rq_clock_stuck() {
+    let base = Assert::NO_OVERRIDES.fail_on_rq_clock_stuck(true);
+    let other = Assert::NO_OVERRIDES.fail_on_rq_clock_stuck(false);
+    assert_eq!(base.merge(&other).fail_on_rq_clock_stuck, Some(false));
+    assert_eq!(
+        base.merge(&Assert::NO_OVERRIDES).fail_on_rq_clock_stuck,
+        Some(true)
+    );
 }
 
 #[test]
@@ -622,11 +627,11 @@ fn assert_merge_no_overrides_preserves_base() {
     let base = Assert::NO_OVERRIDES
         .check_not_starved()
         .max_imbalance_ratio(4.0)
-        .fail_on_stall(true);
+        .fail_on_rq_clock_stuck(true);
     let merged = base.merge(&Assert::NO_OVERRIDES);
     assert_eq!(merged.not_starved, Some(true));
     assert_eq!(merged.max_imbalance_ratio, Some(4.0));
-    assert_eq!(merged.fail_on_stall, Some(true));
+    assert_eq!(merged.fail_on_rq_clock_stuck, Some(true));
 }
 
 /// `default_checks()` is `NO_OVERRIDES`, so merging in either
@@ -653,7 +658,7 @@ fn assert_merge_runtime_chain_with_no_overrides_yields_defaults() {
     assert!(merged.not_starved.is_none());
     assert!(merged.max_imbalance_ratio.is_none());
     assert!(merged.max_local_dsq_depth.is_none());
-    assert!(merged.fail_on_stall.is_none());
+    assert!(merged.fail_on_rq_clock_stuck.is_none());
 }
 
 #[test]
@@ -708,14 +713,14 @@ fn assert_monitor_thresholds_overridden() {
     let v = Assert::NO_OVERRIDES
         .max_imbalance_ratio(99.0)
         .max_local_dsq_depth(42)
-        .fail_on_stall(false)
+        .fail_on_rq_clock_stuck(false)
         .sustained_samples(10)
         .max_fallback_rate(0.5)
         .max_keep_last_rate(0.3);
     let t = v.monitor_thresholds();
     assert_eq!(t.max_imbalance_ratio, 99.0);
     assert_eq!(t.max_local_dsq_depth, 42);
-    assert!(!t.fail_on_stall);
+    assert!(!t.fail_on_rq_clock_stuck);
     assert_eq!(t.sustained_samples, 10);
     assert_eq!(t.max_fallback_rate, 0.5);
     assert_eq!(t.max_keep_last_rate, 0.3);
@@ -784,7 +789,7 @@ fn assert_single_field_has_worker_checks() {
 fn assert_monitor_only_no_worker_checks() {
     let a = Assert::NO_OVERRIDES
         .max_imbalance_ratio(5.0)
-        .fail_on_stall(true);
+        .fail_on_rq_clock_stuck(true);
     assert!(!a.has_worker_checks());
 }
 
@@ -800,7 +805,7 @@ fn assert_merge_all_field_categories() {
         .max_spread_pct(50.0)
         .max_p99_wake_latency_ns(100_000)
         .max_migration_ratio(0.5)
-        .fail_on_stall(true);
+        .fail_on_rq_clock_stuck(true);
 
     // Layer 3: test overrides a worker field and sets isolation.
     let test = Assert::NO_OVERRIDES.check_isolation().max_spread_pct(80.0);
@@ -815,7 +820,7 @@ fn assert_merge_all_field_categories() {
     // test sets isolation.
     assert_eq!(merged.isolation, Some(true));
     // sched's monitor fields survive (test didn't set them).
-    assert_eq!(merged.fail_on_stall, Some(true));
+    assert_eq!(merged.fail_on_rq_clock_stuck, Some(true));
 }
 
 /// `Assert::expect_scx_bpf_error_contains` builder is `const fn` so
@@ -1498,7 +1503,7 @@ fn assert_serde_roundtrip_preserves_every_non_skipped_field() {
         max_migration_ratio: Some(0.05),
         max_imbalance_ratio: Some(2.5),
         max_local_dsq_depth: Some(64),
-        fail_on_stall: Some(true),
+        fail_on_rq_clock_stuck: Some(true),
         sustained_samples: Some(3),
         max_fallback_rate: Some(0.01),
         max_keep_last_rate: Some(0.005),
@@ -1523,7 +1528,7 @@ fn assert_serde_roundtrip_preserves_every_non_skipped_field() {
     assert_eq!(a.max_migration_ratio, b.max_migration_ratio);
     assert_eq!(a.max_imbalance_ratio, b.max_imbalance_ratio);
     assert_eq!(a.max_local_dsq_depth, b.max_local_dsq_depth);
-    assert_eq!(a.fail_on_stall, b.fail_on_stall);
+    assert_eq!(a.fail_on_rq_clock_stuck, b.fail_on_rq_clock_stuck);
     assert_eq!(a.sustained_samples, b.sustained_samples);
     assert_eq!(a.max_fallback_rate, b.max_fallback_rate);
     assert_eq!(a.max_keep_last_rate, b.max_keep_last_rate);

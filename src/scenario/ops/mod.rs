@@ -163,7 +163,7 @@ struct StepState<'a> {
     /// are killed during step-teardown / cgroup removal so cgroupfs
     /// cleanup never trips EBUSY on a live process.
     payload_handles: Vec<PayloadEntry>,
-    /// Host-mode worker stall monitor, started lazily at the end of
+    /// Host-mode worker stuck monitor, started lazily at the end of
     /// the first successful [`apply_setup`] when running outside a
     /// VM (no `is_guest`, no `cargo_test_mode`) and at least one
     /// worker exists. The handle's [`Drop`] joins the polling
@@ -171,11 +171,11 @@ struct StepState<'a> {
     /// any accumulated reports before that drop so they reach the
     /// scenario's [`AssertResult`]. `None` in every guest-side
     /// scenario and in `cargo_test_mode` runs — the host-side
-    /// monitor is the only stall signal available in host-mode,
+    /// monitor is the only stuck signal available in host-mode,
     /// where the freeze coordinator / KVM-side stall plumbing is
-    /// not running. See [`crate::scenario::host_stall`] for the
+    /// not running. See [`crate::scenario::host_stuck`] for the
     /// signal definition and detection latency contract.
-    stall_monitor: Option<crate::scenario::host_stall::StallMonitorHandle>,
+    stuck_monitor: Option<crate::scenario::host_stuck::StuckMonitorHandle>,
 }
 
 impl<'a> StepState<'a> {
@@ -186,7 +186,7 @@ impl<'a> StepState<'a> {
             handles: Vec::new(),
             cpusets: std::collections::HashMap::new(),
             payload_handles: Vec::new(),
-            stall_monitor: None,
+            stuck_monitor: None,
         }
     }
 }
@@ -2185,14 +2185,14 @@ fn collect_step(
     // EBUSY. Metrics are emitted to the SHM ring by PayloadHandle::kill
     // via the `evaluate()` pipeline.
     drain_all_payload_handles(&mut step_state.payload_handles);
-    // Drain any host-mode stall reports that accumulated during the
+    // Drain any host-mode stuck reports that accumulated during the
     // step BEFORE dropping the monitor handle (Drop joins the
     // polling thread). Reports get folded into the merged
     // [`AssertResult`] below as
     // [`crate::assert::DetailKind::WorkerStalled`] failures. `take`
     // ensures the handle drops here (joining the thread) so the
     // polling thread exits before per-step teardown returns.
-    let stall_reports = if let Some(handle) = step_state.stall_monitor.take() {
+    let stuck_reports = if let Some(handle) = step_state.stuck_monitor.take() {
         let reports = handle.drain();
         drop(handle);
         reports
@@ -2209,20 +2209,20 @@ fn collect_step(
         Some(topo),
         step_index,
     );
-    for report in stall_reports {
+    for report in stuck_reports {
         result.record_fail(crate::assert::AssertDetail::new(
             crate::assert::DetailKind::WorkerStalled,
-            format_stall_report(&report),
+            format_stuck_report(&report),
         ));
     }
     result
 }
 
-/// Render a [`crate::scenario::host_stall::StallReport`] as a
-/// human-readable single-string assertion detail. Emits the stalled
+/// Render a [`crate::scenario::host_stuck::StuckReport`] as a
+/// human-readable single-string assertion detail. Emits the stuck
 /// pid + comm, the sample-window summary (first and last values
 /// for both counters PLUS the computed `last - first` delta — both
-/// expected to be zero for a true stall but rendered from the
+/// expected to be zero for a true stuck condition but rendered from the
 /// samples themselves so a predicate-tolerance refactor stays
 /// observable), and the diagnostic subset (state, wchan, syscall,
 /// cgroup, host loadavg, optional kernel stack). The diagnostic's
@@ -2230,17 +2230,17 @@ fn collect_step(
 /// `state` letter carries the actionable signal and the full
 /// status file is verbose; sidecar consumers keying off
 /// [`crate::assert::DetailKind::WorkerStalled`] can match on the
-/// kind discriminator and read the full StallReport (carries the
+/// kind discriminator and read the full StuckReport (carries the
 /// status_full field) without parsing this message.
 ///
 /// Format is multi-line so the operator can read the trip at a
 /// glance without parsing structured output.
-fn format_stall_report(report: &crate::scenario::host_stall::StallReport) -> String {
+fn format_stuck_report(report: &crate::scenario::host_stuck::StuckReport) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "worker stall detected: pid={} comm={:?} (host-mode /proc/<pid>/sched polling)",
+        "worker stuck detected: pid={} comm={:?} (host-mode /proc/<pid>/sched polling)",
         report.pid, report.comm,
     );
     if let (Some(first), Some(last)) = (report.samples.first(), report.samples.last()) {

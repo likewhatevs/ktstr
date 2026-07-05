@@ -361,8 +361,8 @@ fn bare_expect_err_compile(_ctx: &Ctx) -> Result<AssertResult> {
     ))
 }
 
-#[ktstr_test(fail_on_stall, host_only = true)]
-fn bare_fail_on_stall_compile(_ctx: &Ctx) -> Result<AssertResult> {
+#[ktstr_test(fail_on_rq_clock_stuck, host_only = true)]
+fn bare_fail_on_rq_clock_stuck_compile(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
@@ -455,12 +455,12 @@ fn entry_bare_expect_err() {
 }
 
 #[test]
-fn entry_bare_fail_on_stall() {
-    let e = ktstr::test_support::find_test("bare_fail_on_stall_compile").unwrap();
+fn entry_bare_fail_on_rq_clock_stuck() {
+    let e = ktstr::test_support::find_test("bare_fail_on_rq_clock_stuck_compile").unwrap();
     assert_eq!(
-        e.assert.fail_on_stall,
+        e.assert.fail_on_rq_clock_stuck,
         Some(true),
-        "bare `fail_on_stall` must set entry.assert.fail_on_stall=Some(true)"
+        "bare `fail_on_rq_clock_stuck` must set entry.assert.fail_on_rq_clock_stuck=Some(true)"
     );
 }
 

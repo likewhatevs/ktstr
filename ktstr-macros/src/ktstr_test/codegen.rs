@@ -62,7 +62,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         max_spread_pct,
         max_imbalance_ratio,
         max_local_dsq_depth,
-        fail_on_stall,
+        fail_on_rq_clock_stuck,
         sustained_samples,
         max_throughput_cv,
         min_work_rate,
@@ -194,7 +194,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     let spread_tokens = option_tokens(&max_spread_pct);
     let imbalance_tokens = option_tokens(&max_imbalance_ratio);
     let dsq_tokens = option_tokens(&max_local_dsq_depth);
-    let stall_tokens = option_tokens(&fail_on_stall);
+    let stuck_tokens = option_tokens(&fail_on_rq_clock_stuck);
     let sustained_tokens = option_tokens(&sustained_samples);
     let throughput_cv_tokens = option_tokens(&max_throughput_cv);
     let work_rate_tokens = option_tokens(&min_work_rate);
@@ -346,7 +346,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         || max_migration_ratio.is_some()
         || max_imbalance_ratio.is_some()
         || max_local_dsq_depth.is_some()
-        || fail_on_stall.is_some()
+        || fail_on_rq_clock_stuck.is_some()
         || sustained_samples.is_some()
         || max_fallback_rate.is_some()
         || max_keep_last_rate.is_some()
@@ -372,7 +372,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
                 max_migration_ratio: #mig_ratio_tokens,
                 max_imbalance_ratio: #imbalance_tokens,
                 max_local_dsq_depth: #dsq_tokens,
-                fail_on_stall: #stall_tokens,
+                fail_on_rq_clock_stuck: #stuck_tokens,
                 sustained_samples: #sustained_tokens,
                 max_fallback_rate: #fallback_rate_tokens,
                 max_keep_last_rate: #keep_last_rate_tokens,

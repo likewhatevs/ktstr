@@ -121,7 +121,7 @@ pub struct Assert {
     pub max_local_dsq_depth: Option<u32>,
     /// Treat a stall verdict from the monitor as a hard failure. Same
     /// tri-state semantics as `not_starved`.
-    pub fail_on_stall: Option<bool>,
+    pub fail_on_rq_clock_stuck: Option<bool>,
     /// Minimum number of consecutive samples that must exceed the
     /// monitor threshold before a verdict is raised. Smooths out
     /// single-sample spikes.
@@ -284,7 +284,11 @@ impl Assert {
         row(&mut out, "max_migration_ratio", &self.max_migration_ratio);
         row(&mut out, "max_imbalance_ratio", &self.max_imbalance_ratio);
         row(&mut out, "max_local_dsq_depth", &self.max_local_dsq_depth);
-        row(&mut out, "fail_on_stall", &self.fail_on_stall);
+        row(
+            &mut out,
+            "fail_on_rq_clock_stuck",
+            &self.fail_on_rq_clock_stuck,
+        );
         row(&mut out, "sustained_samples", &self.sustained_samples);
         row(&mut out, "max_fallback_rate", &self.max_fallback_rate);
         row(&mut out, "max_keep_last_rate", &self.max_keep_last_rate);
@@ -327,7 +331,7 @@ impl Assert {
         max_migration_ratio: None,
         max_imbalance_ratio: None,
         max_local_dsq_depth: None,
-        fail_on_stall: None,
+        fail_on_rq_clock_stuck: None,
         sustained_samples: None,
         max_fallback_rate: None,
         max_keep_last_rate: None,
@@ -439,8 +443,8 @@ impl Assert {
     }
 
     /// Control whether a monitor stall verdict fails the assertion.
-    pub const fn fail_on_stall(mut self, v: bool) -> Self {
-        self.fail_on_stall = Some(v);
+    pub const fn fail_on_rq_clock_stuck(mut self, v: bool) -> Self {
+        self.fail_on_rq_clock_stuck = Some(v);
         self
     }
 
@@ -562,9 +566,9 @@ impl Assert {
                 Some(v) => Some(v),
                 None => self.max_local_dsq_depth,
             },
-            fail_on_stall: match other.fail_on_stall {
+            fail_on_rq_clock_stuck: match other.fail_on_rq_clock_stuck {
                 Some(v) => Some(v),
-                None => self.fail_on_stall,
+                None => self.fail_on_rq_clock_stuck,
             },
             sustained_samples: match other.sustained_samples {
                 Some(v) => Some(v),
@@ -680,7 +684,7 @@ impl Assert {
     pub(crate) fn has_monitor_thresholds(&self) -> bool {
         self.max_imbalance_ratio.is_some()
             || self.max_local_dsq_depth.is_some()
-            || self.fail_on_stall.is_some()
+            || self.fail_on_rq_clock_stuck.is_some()
             || self.sustained_samples.is_some()
             || self.max_fallback_rate.is_some()
             || self.max_keep_last_rate.is_some()
@@ -692,7 +696,9 @@ impl Assert {
         MonitorThresholds {
             max_imbalance_ratio: self.max_imbalance_ratio.unwrap_or(d.max_imbalance_ratio),
             max_local_dsq_depth: self.max_local_dsq_depth.unwrap_or(d.max_local_dsq_depth),
-            fail_on_stall: self.fail_on_stall.unwrap_or(d.fail_on_stall),
+            fail_on_rq_clock_stuck: self
+                .fail_on_rq_clock_stuck
+                .unwrap_or(d.fail_on_rq_clock_stuck),
             sustained_samples: self.sustained_samples.unwrap_or(d.sustained_samples),
             max_fallback_rate: self.max_fallback_rate.unwrap_or(d.max_fallback_rate),
             max_keep_last_rate: self.max_keep_last_rate.unwrap_or(d.max_keep_last_rate),
@@ -719,8 +725,8 @@ impl Assert {
         if self.max_local_dsq_depth.is_none() {
             self.max_local_dsq_depth = Some(d.max_local_dsq_depth);
         }
-        if self.fail_on_stall.is_none() {
-            self.fail_on_stall = Some(d.fail_on_stall);
+        if self.fail_on_rq_clock_stuck.is_none() {
+            self.fail_on_rq_clock_stuck = Some(d.fail_on_rq_clock_stuck);
         }
         if self.sustained_samples.is_none() {
             self.sustained_samples = Some(d.sustained_samples);
