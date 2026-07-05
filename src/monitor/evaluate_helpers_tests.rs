@@ -150,9 +150,9 @@ fn track_rq_clock_stuck_sizes_vec_to_max_cpu_count_across_samples() {
         summary: MonitorSummary::default(),
         ..Default::default()
     };
-    let stall = t.track_rq_clock_stuck(&report);
+    let stuck = t.track_rq_clock_stuck(&report);
     assert_eq!(
-        stall.len(),
+        stuck.len(),
         3,
         "must size vec to max cpu count across samples"
     );
@@ -203,11 +203,11 @@ fn track_rq_clock_stuck_respects_vcpu_preemption_threshold() {
         boot_wait_outcome: BootWaitOutcome::NotConfigured,
         scx_event_counters_supported: false,
     };
-    let stall = t.track_rq_clock_stuck(&report);
-    assert_eq!(stall.len(), 1);
+    let stuck = t.track_rq_clock_stuck(&report);
+    assert_eq!(stuck.len(), 1);
     assert_eq!(
-        stall[0].worst_run, 0,
-        "preempted vCPU must not register as a stall"
+        stuck[0].worst_run, 0,
+        "preempted vCPU must not register as stuck"
     );
 }
 

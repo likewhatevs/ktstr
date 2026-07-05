@@ -113,7 +113,7 @@ const PREEMPTION_TICK_MULTIPLE: u64 = 10;
 
 /// Default HZ when CONFIG_HZ cannot be determined from the kernel.
 /// 250 is the most conservative common value (longest tick period =
-/// highest threshold), avoiding false stall detection.
+/// highest threshold), avoiding false stuck detection.
 const DEFAULT_HZ: u64 = 250;
 
 /// Compute the vCPU preemption threshold for a given kernel.
@@ -346,7 +346,7 @@ pub struct MonitorReport {
     pub summary: MonitorSummary,
     /// vCPU preemption threshold (ns) derived from the guest kernel's
     /// CONFIG_HZ at the time the VM ran. Used by evaluate() to gate
-    /// stall detection. 0 means use a default.
+    /// stuck detection. 0 means use a default.
     pub preemption_threshold_ns: u64,
     /// Post-write readback of the scx_sched.watchdog_timeout field.
     /// Framework-internal regression guard that the host-side override
@@ -605,7 +605,7 @@ pub struct CpuSnapshot {
     pub scx_nr_running: u32,
     /// Depth of the scx local dispatch queue (`scx_rq.local_dsq.nr`).
     pub local_dsq_depth: u32,
-    /// Runqueue clock value (`rq.clock`). Non-advancing clock indicates a stall.
+    /// Runqueue clock value (`rq.clock`). Non-advancing clock indicates the CPU is stuck.
     pub rq_clock: u64,
     /// sched_ext flags for this CPU (`scx_rq.flags`).
     pub scx_flags: u32,
@@ -626,7 +626,7 @@ pub struct CpuSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedstat: Option<RqSchedstat>,
     /// Cumulative CPU time (ns) of the vCPU thread hosting this CPU.
-    /// Used by evaluate() to distinguish real stalls from host preemption.
+    /// Used by evaluate() to distinguish real stuck CPUs from host preemption.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vcpu_cpu_time_ns: Option<u64>,
     /// Host-side hardware perf counters for the vCPU thread that owns
@@ -1167,7 +1167,7 @@ impl MonitorSummary {
     }
 
     /// Like [`from_samples`](Self::from_samples) but uses an explicit
-    /// preemption threshold (ns) for stall detection. Pass 0 to derive
+    /// preemption threshold (ns) for stuck detection. Pass 0 to derive
     /// the threshold from the guest kernel's `CONFIG_HZ` by calling
     /// [`vcpu_preemption_threshold_ns`], which tries (in order) the
     /// embedded IKCONFIG in the guest `vmlinux`, a `.config` beside
@@ -2157,20 +2157,20 @@ impl MonitorThresholds {
             .map(|s| s.cpus.len())
             .max()
             .unwrap_or(0);
-        let mut stall: Vec<SustainedViolationTracker> =
+        let mut stuck: Vec<SustainedViolationTracker> =
             vec![SustainedViolationTracker::default(); num_cpus];
 
         for i in 1..report.samples.len() {
             let prev = &report.samples[i - 1];
             let curr = &report.samples[i];
             let cpu_count = prev.cpus.len().min(curr.cpus.len());
-            for (cpu, stall_tracker) in stall.iter_mut().enumerate().take(cpu_count) {
-                let is_stall = reader::is_cpu_stuck(&prev.cpus[cpu], &curr.cpus[cpu], threshold);
-                stall_tracker.record(is_stall, curr.cpus[cpu].rq_clock as f64, i);
+            for (cpu, stuck_tracker) in stuck.iter_mut().enumerate().take(cpu_count) {
+                let is_stuck = reader::is_cpu_stuck(&prev.cpus[cpu], &curr.cpus[cpu], threshold);
+                stuck_tracker.record(is_stuck, curr.cpus[cpu].rq_clock as f64, i);
             }
         }
 
-        stall
+        stuck
     }
 
     /// Per-interval event-counter rate computation against fallback /

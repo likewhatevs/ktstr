@@ -130,7 +130,7 @@ pub struct VmResult {
     /// Captured guest stderr (separated from `output` when the guest
     /// reported them distinctly).
     pub stderr: String,
-    /// Host-side monitor report: sampled per-CPU state, stall
+    /// Host-side monitor report: sampled per-CPU state, stuck
     /// verdicts, and SCX event deltas. `None` when the monitor did
     /// not run (host-only tests, early VM failure).
     pub monitor: Option<monitor::MonitorReport>,

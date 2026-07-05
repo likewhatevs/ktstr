@@ -406,7 +406,7 @@ pub struct IncrementalCapture {
     /// Surfaced so the operator can correlate snapshot timing
     /// against the failure window.
     pub steady_hz: f64,
-    /// Escalation frequency (Hz) used during stall detection —
+    /// Escalation frequency (Hz) used during stuck detection —
     /// typically 10. Reflects the actual frequency at trigger
     /// time, not the configured ceiling.
     pub trigger_hz: f64,

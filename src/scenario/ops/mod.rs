@@ -2189,7 +2189,7 @@ fn collect_step(
     // step BEFORE dropping the monitor handle (Drop joins the
     // polling thread). Reports get folded into the merged
     // [`AssertResult`] below as
-    // [`crate::assert::DetailKind::WorkerStalled`] failures. `take`
+    // [`crate::assert::DetailKind::WorkerStuck`] failures. `take`
     // ensures the handle drops here (joining the thread) so the
     // polling thread exits before per-step teardown returns.
     let stuck_reports = if let Some(handle) = step_state.stuck_monitor.take() {
@@ -2211,7 +2211,7 @@ fn collect_step(
     );
     for report in stuck_reports {
         result.record_fail(crate::assert::AssertDetail::new(
-            crate::assert::DetailKind::WorkerStalled,
+            crate::assert::DetailKind::WorkerStuck,
             format_stuck_report(&report),
         ));
     }
@@ -2229,7 +2229,7 @@ fn collect_step(
 /// `status_full` field is intentionally OMITTED — the parsed
 /// `state` letter carries the actionable signal and the full
 /// status file is verbose; sidecar consumers keying off
-/// [`crate::assert::DetailKind::WorkerStalled`] can match on the
+/// [`crate::assert::DetailKind::WorkerStuck`] can match on the
 /// kind discriminator and read the full StuckReport (carries the
 /// status_full field) without parsing this message.
 ///

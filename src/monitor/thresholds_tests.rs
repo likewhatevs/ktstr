@@ -333,7 +333,7 @@ fn thresholds_stuck_fails() {
 #[test]
 fn thresholds_stuck_disabled_passes() {
     // Test the `fail_on_rq_clock_stuck: false` toggle: a CPU with a
-    // stuck `rq_clock` must NOT fail the verdict when stall
+    // stuck `rq_clock` must NOT fail the verdict when stuck
     // detection is disabled. The setup uses 2 CPUs with mixed
     // rq_clock (cpu0 stuck at 5000/5000, cpu1 advancing
     // 6000/7500) so `data_looks_valid` returns true (rq_clocks
@@ -375,7 +375,7 @@ fn thresholds_stuck_disabled_passes() {
                     nr_running: 1,
                     rq_clock: 5000,
                     ..Default::default()
-                }, // cpu0 stuck but stall check disabled
+                }, // cpu0 stuck but stuck check disabled
                 CpuSnapshot {
                     nr_running: 1,
                     rq_clock: 7500,
@@ -465,9 +465,9 @@ fn thresholds_imbalance_interrupted_by_balanced_resets() {
 
 #[test]
 fn thresholds_multiple_violations() {
-    // Both imbalance and stall in the same report. Both need to
+    // Both imbalance and stuck in the same report. Both need to
     // reach sustained_samples to trigger. 3 samples = 2 consecutive
-    // stall pairs for cpu0 (clock stuck at 1000), 2 consecutive
+    // stuck pairs for cpu0 (clock stuck at 1000), 2 consecutive
     // imbalance violations (ratio=5.0 > 2.0).
     let t = MonitorThresholds {
         sustained_samples: 2,
@@ -505,7 +505,7 @@ fn thresholds_multiple_violations() {
                     nr_running: 1,
                     rq_clock: 1000,
                     ..Default::default()
-                }, // stall + imbalance
+                }, // stuck + imbalance
                 CpuSnapshot {
                     nr_running: 5,
                     rq_clock: 3000,
@@ -523,7 +523,7 @@ fn thresholds_multiple_violations() {
                     nr_running: 1,
                     rq_clock: 1000,
                     ..Default::default()
-                }, // stall continues
+                }, // stuck continues
                 CpuSnapshot {
                     nr_running: 5,
                     rq_clock: 4000,

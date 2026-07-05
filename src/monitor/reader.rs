@@ -1633,11 +1633,11 @@ pub(crate) fn resolve_event_pcpu_pas(
     Some(pas)
 }
 
-/// Per-vCPU host thread timing info for gating stall detection.
+/// Per-vCPU host thread timing info for gating stuck detection.
 ///
 /// When the host is loaded, vCPU threads get preempted and rq_clock
 /// cannot advance. Reading per-thread CPU time distinguishes real
-/// stalls (vCPU running but clock stuck) from host preemption
+/// stuck CPUs (vCPU running but clock stuck) from host preemption
 /// (vCPU not scheduled, clock can't advance).
 pub(crate) struct VcpuTiming {
     /// pthread_t handles for each vCPU, indexed by vCPU ID.
@@ -1650,19 +1650,19 @@ impl VcpuTiming {
     /// on success, `None` when the per-thread clock could not be read.
     ///
     /// `None` propagates through `CpuSnapshot::vcpu_cpu_time_ns`.
-    /// Downstream stall detection (`evaluate_preempted`) treats a
+    /// Downstream stuck detection (`evaluate_preempted`) treats a
     /// `None` on either side of a pair as `preempted=false` — the
-    /// stall check falls through to `rq_clock` comparison and fires
+    /// stuck check falls through to `rq_clock` comparison and fires
     /// if progress isn't observed there. This deliberately prefers
-    /// spurious alerts (better visibility) over missed stalls (silent
+    /// spurious alerts (better visibility) over missed stuck CPUs (silent
     /// failure) when clock reads are unavailable. The previous bug
     /// did the opposite: a silent `0` collided with `saturating_sub`
     /// to fabricate "no delta", which looked like preemption and
-    /// suppressed every stall after the first clock-read failure.
+    /// suppressed every stuck detection after the first clock-read failure.
     ///
     /// Emits a one-shot `tracing::warn` per vCPU (debounced via
     /// `reported_err`) naming the failing syscall + errno so a user
-    /// can diagnose why stall gating has degraded to "no data".
+    /// can diagnose why stuck gating has degraded to "no data".
     fn read_cpu_times(&self, reported_err: &mut [bool]) -> Vec<Option<u64>> {
         self.pthreads
             .iter()
@@ -1678,7 +1678,7 @@ impl VcpuTiming {
                             vcpu,
                             ret,
                             errno = std::io::Error::last_os_error().raw_os_error(),
-                            "pthread_getcpuclockid failed; stall gating unavailable for this vCPU"
+                            "pthread_getcpuclockid failed; stuck gating unavailable for this vCPU"
                         );
                         *slot = true;
                     }
@@ -1697,7 +1697,7 @@ impl VcpuTiming {
                             vcpu,
                             ret,
                             errno = std::io::Error::last_os_error().raw_os_error(),
-                            "clock_gettime on pthread clock failed; stall gating unavailable for this vCPU"
+                            "clock_gettime on pthread clock failed; stuck gating unavailable for this vCPU"
                         );
                         *slot = true;
                     }
@@ -1715,7 +1715,7 @@ impl VcpuTiming {
                             vcpu,
                             tv_sec = ts.tv_sec,
                             tv_nsec = ts.tv_nsec,
-                            "negative clock_gettime result; stall gating unavailable for this vCPU"
+                            "negative clock_gettime result; stuck gating unavailable for this vCPU"
                         );
                         *slot = true;
                     }
@@ -1768,7 +1768,7 @@ pub(crate) fn evaluate_preempted(prev: Option<u64>, curr: Option<u64>, threshold
 /// task that hasn't run. The two conditions can co-occur but have
 /// different root causes and detection paths.
 ///
-/// This helper exists to keep the stall-detection paths in lock-step: the
+/// This helper exists to keep the stuck-detection paths in lock-step: the
 /// post-hoc `MonitorSummary::from_samples` (run-level `stuck_count`), the
 /// reactive `MonitorThresholds::evaluate` (SysRq-D trigger), and the
 /// per-phase `crate::timeline::compute_metrics` (`stuck_count`) all route
@@ -2118,7 +2118,7 @@ pub(crate) struct MonitorConfig<'a> {
     /// `branch_misses` per vCPU into [`super::CpuSnapshot::vcpu_perf`].
     /// `None` skips the per-vCPU PMU capture.
     pub perf_capture: Option<&'a super::perf_counters::PerfCountersCapture>,
-    /// Preemption threshold in nanoseconds used for stall detection.
+    /// Preemption threshold in nanoseconds used for stuck detection.
     /// Pass 0 to derive it from the guest kernel's CONFIG_HZ.
     pub preemption_threshold_ns: u64,
     /// Optional BPF program statistics context; when present, each
@@ -2701,7 +2701,7 @@ pub(crate) fn monitor_loop(
     // `MonitorThresholds::evaluate` running over the full sample vec.
     let mut imbalance_tracker = super::SustainedViolationTracker::default();
     let mut dsq_tracker = super::SustainedViolationTracker::default();
-    let mut stall_trackers: Vec<super::SustainedViolationTracker> =
+    let mut stuck_trackers: Vec<super::SustainedViolationTracker> =
         vec![super::SustainedViolationTracker::default(); num_cpus];
     let mut dump_requested = false;
     let mut cpus: Vec<CpuSnapshot> = Vec::with_capacity(num_cpus);
@@ -3189,15 +3189,15 @@ pub(crate) fn monitor_loop(
             if t.fail_on_rq_clock_stuck
                 && let Some(prev) = samples.last()
             {
-                let n = prev.cpus.len().min(cpus.len()).min(stall_trackers.len());
+                let n = prev.cpus.len().min(cpus.len()).min(stuck_trackers.len());
                 for i in 0..n {
-                    let is_stall = is_cpu_stuck(&prev.cpus[i], &cpus[i], preemption_threshold_ns);
-                    stall_trackers[i].record(is_stall, cpus[i].rq_clock as f64, sample_idx);
+                    let is_stuck = is_cpu_stuck(&prev.cpus[i], &cpus[i], preemption_threshold_ns);
+                    stuck_trackers[i].record(is_stuck, cpus[i].rq_clock as f64, sample_idx);
                 }
             }
             let sustained = imbalance_tracker.sustained(t.sustained_samples)
                 || dsq_tracker.sustained(t.sustained_samples)
-                || stall_trackers
+                || stuck_trackers
                     .iter()
                     .any(|s| s.sustained(t.sustained_samples));
 
@@ -3504,9 +3504,9 @@ mod tests {
 
     #[test]
     fn evaluate_preempted_first_read_failed_is_not_preempted() {
-        // Prev missing: we have no baseline, so the stall path must
+        // Prev missing: we have no baseline, so the stuck path must
         // fire if other conditions match. Treating this as preempted
-        // would mask every first-sample stall.
+        // would mask every first-sample stuck condition.
         assert!(!evaluate_preempted(None, Some(1_000_000_000), THRESHOLD_NS));
     }
 
@@ -3564,7 +3564,7 @@ mod tests {
     #[test]
     fn evaluate_preempted_zero_threshold_never_preempted() {
         // Degenerate case: with threshold=0, nothing is strictly below,
-        // so preempted is always false (stall path always fires).
+        // so preempted is always false (stuck path always fires).
         assert!(!evaluate_preempted(Some(100), Some(100), 0));
         assert!(!evaluate_preempted(Some(100), Some(200), 0));
     }
@@ -4899,9 +4899,9 @@ mod tests {
     }
 
     #[test]
-    fn monitor_loop_dump_trigger_stall_with_sustained_window() {
-        // Reactive stall path: stuck rq_clock with nr_running>0 triggers
-        // dump after sustained_samples consecutive stall pairs.
+    fn monitor_loop_dump_trigger_stuck_with_sustained_window() {
+        // Reactive stuck path: stuck rq_clock with nr_running>0 triggers
+        // dump after sustained_samples consecutive stuck pairs.
         let offsets = test_offsets();
         // Single CPU: nr_running=2 (busy), rq_clock stuck at 5000.
         // Need a second CPU with a different clock value so samples
@@ -4954,17 +4954,17 @@ mod tests {
         );
         handle.join().unwrap();
 
-        // Should have enough samples for 2+ stall pairs.
+        // Should have enough samples for 2+ stuck pairs.
         assert!(
             samples.len() >= 3,
-            "need >= 3 samples for 2 stall pairs, got {}",
+            "need >= 3 samples for 2 stuck pairs, got {}",
             samples.len()
         );
-        // Dump should have fired due to sustained stall.
+        // Dump should have fired due to sustained stuck condition.
         let pending = virtio_con.lock().pending_rx_bytes_for_test();
         assert!(
             pending.contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP),
-            "stall should trigger SIGNAL_VC_DUMP after sustained_samples=2; \
+            "stuck condition should trigger SIGNAL_VC_DUMP after sustained_samples=2; \
              pending RX bytes: {pending:?}"
         );
     }
@@ -5035,9 +5035,9 @@ mod tests {
     }
 
     #[test]
-    fn monitor_loop_vcpu_timing_preempted_no_stall() {
+    fn monitor_loop_vcpu_timing_preempted_no_stuck() {
         // Sleeping thread: CPU time stays near zero between samples.
-        // rq_clock stuck + CPU time not advancing = preempted, suppress stall.
+        // rq_clock stuck + CPU time not advancing = preempted, suppress stuck.
         // 30ms interval gives margin on loaded hosts. Explicit threshold
         // (10ms) avoids host CONFIG_HZ dependency.
         let offsets = test_offsets();
@@ -5118,11 +5118,11 @@ mod tests {
     }
 
     #[test]
-    fn monitor_loop_vcpu_timing_running_stall_fires() {
+    fn monitor_loop_vcpu_timing_running_stuck_fires() {
         // Busy-spinning thread: accumulates CPU time every interval.
         // 30ms interval ensures spinner clears the 10ms preemption
         // threshold with margin.
-        // rq_clock stuck + CPU time advancing = real stall. Explicit
+        // rq_clock stuck + CPU time advancing = real stuck condition. Explicit
         // threshold (10ms) avoids host CONFIG_HZ dependency (CONFIG_HZ=250
         // gives 40ms threshold, which would mask 30ms of spin time).
         let offsets = test_offsets();
@@ -5163,7 +5163,7 @@ mod tests {
         };
 
         // 2 s wall-clock budget for the monitor loop to land >= 3
-        // samples (need 2 stall pairs) and queue SIGNAL_VC_DUMP.
+        // samples (need 2 stuck pairs) and queue SIGNAL_VC_DUMP.
         // The 30 ms sample interval normally produces ~60 samples in
         // this window — vastly more headroom than the 3 required.
         // Original 200 ms budget assumed 6 samples and flaked under
@@ -5203,22 +5203,22 @@ mod tests {
 
         assert!(
             samples.len() >= 3,
-            "need >= 3 samples for 2 stall pairs, got {}",
+            "need >= 3 samples for 2 stuck pairs, got {}",
             samples.len()
         );
         let pending = virtio_con.lock().pending_rx_bytes_for_test();
         assert!(
             pending.contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP),
-            "real stall (vCPU running, clock stuck, nr_running>0) should queue \
+            "real stuck condition (vCPU running, clock stuck, nr_running>0) should queue \
              SIGNAL_VC_DUMP; pending RX bytes: {pending:?}"
         );
     }
 
     #[test]
-    fn reactive_and_evaluate_stall_consistency() {
+    fn reactive_and_evaluate_stuck_consistency() {
         // Check that the reactive path (monitor_loop with dump_trigger)
-        // and the post-hoc path (evaluate) agree on stall detection.
-        // Build a scenario where stall fires: stuck rq_clock, nr_running>0,
+        // and the post-hoc path (evaluate) agree on stuck detection.
+        // Build a scenario where the stuck condition fires: stuck rq_clock, nr_running>0,
         // sustained_samples=2.
         // Two CPUs: cpu0 stuck (rq_clock=5000), cpu1 has a different
         // clock value from cpu0 in each sample, so data_looks_valid
@@ -5285,7 +5285,7 @@ mod tests {
         // Reactive path result: check if dump fired (via the
         // SIGNAL_VC_DUMP wake byte queued for the guest).
         let pending = virtio_con.lock().pending_rx_bytes_for_test();
-        let reactive_stall = pending.contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP);
+        let reactive_stuck = pending.contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP);
 
         // Post-hoc evaluate path on the same samples.
         let summary = super::super::MonitorSummary::from_samples(&samples);
@@ -5296,16 +5296,16 @@ mod tests {
         };
         let verdict = thresholds.evaluate(&report);
 
-        // Both paths should agree: stall detected on cpu0.
-        assert!(reactive_stall, "reactive path should detect stall");
+        // Both paths should agree: stuck detected on cpu0.
+        assert!(reactive_stuck, "reactive path should detect stuck");
         assert!(
             !verdict.is_pass(),
-            "evaluate should detect stall: {:?}",
+            "evaluate should detect stuck: {:?}",
             verdict.details
         );
         assert!(
             verdict.details.iter().any(|d| d.contains("rq_clock stuck")),
-            "evaluate details should mention stall: {:?}",
+            "evaluate details should mention stuck: {:?}",
             verdict.details
         );
     }
@@ -5383,14 +5383,14 @@ mod tests {
             "from_samples: idle CPU should not flag stuck"
         );
 
-        // Evaluate verdict: must not Fail (no stall on idle CPU).
+        // Evaluate verdict: must not Fail (no stuck condition on idle CPU).
         // Either Pass or Inconclusive is acceptable here — a
         // single-CPU idle scenario produces all-same rq_clock
         // samples, which trips MonitorThresholds::data_looks_valid
         // returning false, which routes to the no-signal
         // Inconclusive arm. The test's invariant is "idle CPU
-        // does not surface as a stall," which both Pass and
-        // Inconclusive satisfy; only Fail would mean a stall
+        // does not surface as stuck," which both Pass and
+        // Inconclusive satisfy; only Fail would mean a stuck
         // detection regression.
         let report = super::super::MonitorReport {
             samples,
@@ -5400,7 +5400,7 @@ mod tests {
         let verdict = thresholds.evaluate(&report);
         assert!(
             !verdict.is_fail(),
-            "evaluate: idle CPU must not surface as stall \
+            "evaluate: idle CPU must not surface as stuck \
              (Pass or Inconclusive both acceptable): {:?}",
             verdict.details
         );

@@ -1,5 +1,5 @@
 //! Unit tests for `MonitorSummary::from_samples`: imbalance ratio,
-//! local-DSQ depth, stall detection, average fields, and the
+//! local-DSQ depth, stuck detection, average fields, and the
 //! field-shape regression guard.
 //! Co-located via the sibling `*_tests.rs` pattern.
 
@@ -159,7 +159,7 @@ fn all_zero_snapshots() {
     // initial max_imbalance_ratio is 1.0 and 0.0 < 1.0, so stays 1.0.
     assert!((summary.max_imbalance_ratio - 1.0).abs() < f64::EPSILON);
     assert_eq!(summary.max_local_dsq_depth, 0);
-    // rq_clock=0 is excluded from stall detection
+    // rq_clock=0 is excluded from stuck detection
     assert_eq!(summary.stuck_count, 0);
     // avg: valid sample with 2 all-zero CPUs
     assert_eq!(summary.avg_imbalance_ratio, 0.0);
@@ -302,7 +302,7 @@ fn advancing_clocks_no_stuck() {
 
 #[test]
 fn different_length_cpu_vecs() {
-    // First sample has 2 CPUs, second has 3. Stall detection uses
+    // First sample has 2 CPUs, second has 3. Stuck detection uses
     // min(prev.len, curr.len) = 2, so only CPUs 0-1 are compared.
     let s1 = MonitorSample {
         bpf_map_fields: Vec::new(),

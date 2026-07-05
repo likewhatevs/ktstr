@@ -119,7 +119,7 @@ pub struct Assert {
     /// Max local DSQ depth observed by the monitor. Fails if any
     /// sampled CPU's local DSQ grew beyond this.
     pub max_local_dsq_depth: Option<u32>,
-    /// Treat a stall verdict from the monitor as a hard failure. Same
+    /// Treat an rq_clock-stuck verdict from the monitor as a hard failure. Same
     /// tri-state semantics as `not_starved`.
     pub fail_on_rq_clock_stuck: Option<bool>,
     /// Minimum number of consecutive samples that must exceed the
@@ -442,7 +442,7 @@ impl Assert {
         self
     }
 
-    /// Control whether a monitor stall verdict fails the assertion.
+    /// Control whether a monitor rq_clock-stuck verdict fails the assertion.
     pub const fn fail_on_rq_clock_stuck(mut self, v: bool) -> Self {
         self.fail_on_rq_clock_stuck = Some(v);
         self

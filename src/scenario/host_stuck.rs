@@ -2,7 +2,7 @@
 //!
 //! When a scenario runs in host-mode (no VM boot — `!is_guest()` AND
 //! `!cargo_test_mode_active()`), the freeze coordinator / KVM-side
-//! stall plumbing is unavailable. This module fills that gap by
+//! stuck plumbing is unavailable. This module fills that gap by
 //! polling every worker pid's `/proc/<pid>/sched` file from a
 //! background thread and flagging a "task did not run" condition
 //! when both `nr_switches` and `sum_exec_runtime` are unchanged

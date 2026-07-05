@@ -77,7 +77,7 @@ pub enum DetailKind {
     /// [`DetailKind::SchedulerExitedCleanly`] /
     /// [`DetailKind::SchedulerDiedUnknownReason`]) and
     /// [`DetailKind::Monitor`] (imbalance / DSQ-depth /
-    /// rq_clock-stall): this kind flags individual event-counter
+    /// rq_clock-stuck): this kind flags individual event-counter
     /// regressions surfaced by [`assert_scx_events_clean`]. The
     /// counters themselves originate in the kernel's per-task
     /// `scx_event_stats` (see `kernel/sched/ext.c` —
@@ -98,7 +98,7 @@ pub enum DetailKind {
     /// `test_support::output` aggregates the same kind into
     /// per-assertion pass/fail rows.
     Temporal,
-    /// Host-mode worker stall detected by
+    /// Host-mode stuck worker detected by
     /// [`crate::scenario::host_stuck`]. The polling thread
     /// observed `Δnr_switches == 0` AND `Δsum_exec_runtime == 0`
     /// across the configured window for a worker pid — the task
@@ -107,9 +107,9 @@ pub enum DetailKind {
     /// [`DetailKind::Stuck`] (worker-side report: a worker was
     /// off-CPU longer than the in-test gap threshold): this kind
     /// fires from the host-side polling thread when running
-    /// host-mode (no VM boot) and is the only stall signal
+    /// host-mode (no VM boot) and is the only stuck-worker signal
     /// available in that mode.
-    WorkerStalled,
+    WorkerStuck,
     /// Skip notification (scenario could not run under this topology/flags).
     Skip,
     /// Uncategorized — falls through when a detail has no specific kind.

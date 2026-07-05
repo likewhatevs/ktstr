@@ -106,7 +106,7 @@ pub(super) fn apply_setup(
     // Start the host-mode stuck monitor once we've spawned workers
     // for the first apply_setup in this step. Skip when:
     // - running inside the guest (the VM-side freeze coordinator
-    //   owns stall detection there; the host-mode poller would
+    //   owns stuck detection there; the host-mode poller would
     //   read its own guest /proc/sched, which has no relevance);
     // - running under cargo_test_mode (in-process VMM tests share
     //   the host's /proc with the test harness itself and a poller

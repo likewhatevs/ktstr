@@ -871,7 +871,7 @@ impl Timeline {
             // samples: a SYNTHESIZED zero-capture bucket
             // (build_phase_buckets_with_stimulus) has sample_count 0 but
             // fold_monitor_into_bucket fills its imbalance / dsq / fallback
-            // / stall from in-window monitor samples — render them for
+            // / stuck from in-window monitor samples — render them for
             // parity with the legacy Timeline::build path (which a
             // zero-capture-with-monitor run took before the synthesize
             // seam flipped it onto from_phase_buckets).
@@ -1262,9 +1262,9 @@ fn format_phase_cgroups(
 /// Reduce a phase's monitor samples to [`PhaseMetrics`].
 ///
 /// `preemption_threshold_ns` is the vCPU-preemption exemption window for
-/// stall detection: a non-advancing `rq_clock` on a CPU whose
+/// stuck detection: a non-advancing `rq_clock` on a CPU whose
 /// `vcpu_cpu_time_ns` advanced by less than this is a host-preemption
-/// artifact, not a scheduler stall, and is exempt. Pass `0` to derive it
+/// artifact, not a genuine stuck condition, and is exempt. Pass `0` to derive it
 /// from the guest kernel's `CONFIG_HZ` via
 /// `crate::monitor::vcpu_preemption_threshold_ns` — the same resolution
 /// [`MonitorSummary::from_samples_with_threshold`](crate::monitor::MonitorSummary::from_samples_with_threshold)
@@ -1328,9 +1328,9 @@ pub(crate) fn compute_metrics(
         total_nr_running += avg_nr_this;
     }
 
-    // Stall detection between consecutive valid samples in this phase.
+    // Stuck detection between consecutive valid samples in this phase.
     // Route through `is_cpu_stuck` (the shared predicate the run-level
-    // `MonitorSummary` path also uses) so the per-phase stall count and the
+    // `MonitorSummary` path also uses) so the per-phase stuck count and the
     // run-level stuck count apply the identical NOHZ-idle and
     // vCPU-preemption exemptions — the per-phase count uses the SAME
     // predicate as the run-level one (run-level `>=` Σ per-phase: it also
@@ -2241,7 +2241,7 @@ mod tests {
     }
 
     #[test]
-    fn stall_detected_in_phase() {
+    fn stuck_detected_in_phase() {
         let events = vec![stimulus(0, "ScenarioStart")];
         let samples = vec![
             sample(600, vec![(1, 0, 5000), (1, 0, 6000)]),

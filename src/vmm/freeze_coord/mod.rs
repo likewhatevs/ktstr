@@ -1750,7 +1750,7 @@ impl KtstrVm {
             set_rt_priority(1, "BSP (vCPU 0)");
         }
 
-        // Collect vCPU pthread_t handles for monitor stall detection.
+        // Collect vCPU pthread_t handles for monitor stuck detection.
         // BSP runs on the current thread; APs have spawned threads.
         let vcpu_pthreads = {
             let mut pts = Vec::with_capacity(1 + guard.ap_threads.len());

@@ -19,7 +19,7 @@ use super::*;
 /// Parallel to `stuck_sustained_window_catches_real_stuck` in
 /// `stuck_detection_tests.rs` (same fixture) but explicitly asserts
 /// the end-to-end arithmetic
-/// rather than the canary-style "stall must fail" framing.
+/// rather than the canary-style "stuck must fail" framing.
 #[test]
 fn enforce_true_with_violation_yields_passed_false() {
     let t = MonitorThresholds {
