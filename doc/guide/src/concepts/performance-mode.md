@@ -1,167 +1,13 @@
 # Performance Mode
 
-Performance mode reduces noise during VM execution by applying
-host-side isolation (vCPU pinning, hugepages, NUMA mbind, RT
-scheduling). On x86_64, additionally: a guest-visible CPUID hint
-(KVM_HINTS_REALTIME) and KVM exit suppression (PAUSE and HLT VM
-exits disabled). On aarch64, the four host-side optimizations apply
-(vCPU pinning, hugepages, NUMA mbind, RT scheduling); KVM exit
-suppression and CPUID hints are not available.
-
-## What it does
-
-On x86_64, seven optimizations are applied when `performance_mode`
-is enabled (six host-side, one guest-visible via CPUID). On aarch64,
-four of these apply (vCPU pinning, hugepages, NUMA mbind, RT
-scheduling); the x86-specific items (PAUSE/HLT exit disabling,
-KVM_HINTS_REALTIME CPUID, halt poll) are not available.
-
-Host-side `KVM_CAP_HALT_POLL` is explicitly skipped on x86_64 —
-the guest haltpoll cpuidle driver disables it via
-`MSR_KVM_POLL_CONTROL` (see the "Skip host-side halt poll" item
-below).
-
-**vCPU pinning** -- each virtual LLC is mapped to a physical LLC
-group on the host. vCPU threads are pinned to cores within their
-assigned LLC via `sched_setaffinity`. This prevents the host scheduler
-from migrating vCPU threads across LLCs, which would add cache
-thrashing noise to measurements.
-
-**Hugepages** -- guest memory is allocated with 2MB hugepages
-(`MAP_HUGETLB`) when sufficient free hugepages exist. This eliminates
-TLB pressure from host-side page walks during guest execution.
-
-**NUMA mbind** -- guest memory is bound to the NUMA node(s) of the
-pinned vCPUs via `mbind(MPOL_BIND)`. This ensures memory allocations
-are local to the CPUs executing vCPU threads, avoiding cross-node
-memory access latency. `MPOL_BIND` is strict: the kernel allocator
-does not fall back to non-mask nodes when the bound nodes are
-exhausted, failing the allocation with `-ENOMEM` instead (see
-`do_mbind` at `mm/mempolicy.c` for the policy entry point and
-`policy_nodemask` at `mm/mempolicy.c` for the allocator-side
-mask restriction). Contrast `MPOL_PREFERRED`, which expresses a
-preference but falls back silently — undocumented locality drift
-would defeat the noise-reduction purpose, so `MPOL_BIND` is the
-correct primitive here.
-
-**RT scheduling** -- vCPU threads are set to `SCHED_FIFO` priority 1.
-The watchdog and monitor threads run at priority 2 on a dedicated
-host CPU not assigned to any vCPU, so they can preempt for
-timeout/sampling without competing for vCPU cores. The serial console
-mutex uses `PTHREAD_PRIO_INHERIT` to avoid priority inversion between
-RT vCPU threads and service threads. Priority 2 strictly preempts
-priority 1: `wakeup_preempt_rt` at `kernel/sched/rt.c:1619` runs
-`resched_curr()` when a higher-priority RT task wakes on the
-runqueue of a lower-priority RT task — the kernel inverts userspace
-priority to internal `p->prio` via `__normal_prio` at
-`kernel/sched/syscalls.c:19` (`prio = MAX_RT_PRIO - 1 - rt_prio`),
-so userspace priority 2 maps to `p->prio = 97` and beats priority 1
-at `p->prio = 98`. The watchdog and monitor are therefore guaranteed
-to preempt a vCPU thread on the same CPU; only DL- or stop-class
-tasks can preempt them. Priority 0 is reserved for fair-class
-policies (SCHED_FIFO requires priority >= 1).
-
-**Disable PAUSE VM exits** (x86_64 only) -- `KVM_CAP_X86_DISABLE_EXITS` with
-`KVM_X86_DISABLE_EXITS_PAUSE` suppresses VM exits on PAUSE
-instructions. Guest spinlocks execute PAUSE in tight loops; each
-PAUSE normally causes a vmexit so the hypervisor can schedule other
-vCPUs. With dedicated cores (vCPU pinning), this reschedule is
-unnecessary overhead. The capability is optional --
-if unsupported, a warning is logged and the VM proceeds without it.
-
-**Disable HLT VM exits** (x86_64 only) -- `KVM_X86_DISABLE_EXITS_HLT` suppresses
-VM exits on HLT instructions, the most frequent exit type during
-boot and idle. BSP shutdown detection uses I8042 reset (port 0x64,
-value 0xFE via `reboot=k`) and `VcpuExit::Shutdown` instead of
-`VcpuExit::Hlt`. KVM blocks HLT disable when `mitigate_smt_rsb` is
-active (host has `X86_BUG_SMT_RSB` and `cpu_smt_possible()`); in that case,
-only PAUSE exits are disabled.
-
-**KVM_HINTS_REALTIME CPUID** (x86_64 only) -- sets bit 0 of CPUID leaf 0x40000001
-EDX, telling the guest kernel that vCPUs are pinned to dedicated host
-cores. The guest disables PV spinlocks, PV TLB flush, and PV
-sched_yield (all add hypercall overhead unnecessary on dedicated
-cores), and enables haltpoll cpuidle (polls briefly before halting,
-reducing wakeup latency). PV spinlocks require
-CONFIG_PARAVIRT_SPINLOCKS, which is not in ktstr.kconfig, so that
-disable is a no-op for ktstr guests.
-
-**Skip host-side halt poll** (x86_64 only) -- when a guest vCPU halts (executes
-HLT with nothing to do), KVM can busy-wait briefly on the host
-before putting the vCPU thread to sleep, reducing wakeup latency at
-the cost of host CPU time. `KVM_CAP_HALT_POLL` controls this
-per-VM ceiling. In performance mode it is not set because the guest
-haltpoll cpuidle driver (enabled by KVM_HINTS_REALTIME above)
-handles polling inside the guest and writes `MSR_KVM_POLL_CONTROL=0`
-to disable host-side polling via `kvm_arch_no_poll()`.
-Non-performance-mode VMs set `KVM_CAP_HALT_POLL` to 200µs (matching
-the x86 kernel default `KVM_HALT_POLL_NS_DEFAULT` in
-`arch/x86/include/asm/kvm_host.h`; aarch64's kernel default is
-500µs in `arch/arm64/include/asm/kvm_host.h`), or 0 when vCPUs
-exceed host CPUs.
-
-## Prerequisites
-
-**Sufficient host CPUs** -- the host must have at least
-`(llcs * cores_per_llc * threads_per_core) + 1` online CPUs. The extra
-CPU is reserved for service threads (monitor, watchdog) so they do not
-share a core with any RT vCPU. The host must also have at least as many
-LLC groups as virtual LLCs. (See [Boot process](../architecture/vmm.md#boot-process)
-for the per-vCPU init cost that scales with the chosen topology.)
-
-**2MB hugepages** (optional) -- the host must have free 2MB hugepages
-(check `/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages`).
-Without them, guest memory uses regular pages. A warning is printed.
-
-**CAP_SYS_NICE or rtprio limit** (optional) -- `SCHED_FIFO` requires
-either `CAP_SYS_NICE` (root) or an `RLIMIT_RTPRIO` >= the requested
-priority. Set an rtprio limit for non-root use:
-
-```text
-# /etc/security/limits.conf
-username  -  rtprio  99
-```
-
-Log out and back in for the limit to take effect. Without either
-capability, RT scheduling is skipped with a warning and vCPU threads
-run at normal priority (results may be noisy).
-
-## Validation
-
-`validate_performance_mode()` runs during VM build and applies two
-levels of checks:
-
-**Host-insufficiency -- all surface as `PerfModeUnavailable`, a permanent
-host-insufficiency that skips by default (exit 0 / SKIP, with a visible
-banner and a recorded skip sidecar) and is promoted to a hard FAIL
-(exit 1) only under `KTSTR_NO_SKIP_MODE`, mirroring `ResourceContention` /
-`TopologyInsufficient`. The VM never runs unisolated (the build errors
-before boot), so the explicitly requested isolation guarantee is never
-silently violated:**
-- Total vCPUs + 1 service CPU exceed available host CPUs.
-- Virtual LLCs exceed available LLC groups.
-- Pinning plan cannot be satisfied (an LLC group has fewer available
-  CPUs than the virtual LLC requires).
-- No free host CPU for service threads after vCPU assignment.
-
-**Warnings (non-fatal):**
-- Insufficient free hugepages -- regular page allocation is used.
-- Host load is high -- `procs_running` from `/proc/stat` exceeds
-  half the vCPU count, results may be noisy. `procs_running` is
-  `nr_running()` summed across online CPUs (`kernel/sched/core.c`),
-  i.e. the total count of runnable tasks system-wide including
-  currently-running ones. (No-perf-mode VMs use the
-  [Resource Budget](resource-budget.md) `CpuCap` mechanism instead
-  of this warning — the cgroup-cpuset enforcement bounds concurrency
-  rather than warning about it.)
-- TSC not stable (x86_64 only, checked at VM creation time) --
-  `KVM_CLOCK_TSC_STABLE` not set after `KVM_GET_CLOCK`, kvmclock
-  falls back to per-vCPU timekeeping. Timing measurements may have
-  higher variance. Common in nested virtualization.
+Without performance mode, a 50ms scheduling gap in a measurement could
+be host noise; with it, the same gap indicates a scheduler problem.
+Performance mode removes host-side variance — vCPU threads pinned to
+dedicated cores, hugepage-backed guest memory, NUMA-local allocation,
+real-time scheduling — so timing thresholds measure the scheduler
+under test, not the host it happens to share.
 
 ## Usage
-
-In `#[ktstr_test]`:
 
 ```rust,ignore
 #[ktstr_test(
@@ -171,311 +17,128 @@ In `#[ktstr_test]`:
     performance_mode = true,
 )]
 fn my_perf_test(ctx: &Ctx) -> Result<AssertResult> {
-    // vCPUs are pinned, hugepage-backed
-    Ok(AssertResult::pass())
+    scenarios::steady(ctx)
 }
 ```
 
-Via the builder API:
-
-```rust,ignore
-let vm = vmm::KtstrVm::builder()
-    .kernel(&kernel_path)
-    .init_binary(&ktstr_binary)
-    .topology(Topology::new(1, 2, 4, 2))
-    .memory_mib(4096)
-    .performance_mode(true)
-    .build()?
-    .run()?;
-```
+The VM builder API takes the same switch:
+`KtstrVm::builder().performance_mode(true)`.
 
 ## When to use
 
 Performance mode is for tests where host-side scheduling noise affects
-results -- fairness spread measurements, scheduling gap detection,
+results — fairness spread measurements, scheduling gap detection,
 imbalance ratio checks. It is not needed for correctness tests (cpuset
 isolation, starvation detection) where pass/fail is binary.
 
-The gauntlet runs many VMs in parallel. Performance mode on
-parallel VMs can oversubscribe the host if scheduled naively.
-Avoid `performance_mode` unless the host has enough CPUs for the
-topology matrix.
+The gauntlet runs many VMs in parallel. Performance mode on parallel
+VMs can oversubscribe the host if scheduled naively. Avoid
+`performance_mode` unless the host has enough CPUs for the topology
+matrix.
 
-## Two dimensions
+With stable measurements, tests can set tight thresholds
+(`max_gap_ms`, `min_iteration_rate`, `max_p99_wake_latency_ns`) to
+catch regressions against a fixed bar;
+[`cargo ktstr perf-delta`](../running-tests/runs.md) builds on the
+same tests to catch regressions against a previous commit. Perf-mode
+results are comparable only against runs on the same host — guest-side
+jitter from shared caches and memory bandwidth remains.
 
-Performance mode serves two purposes:
+## What it does
 
-**Noise reduction** -- pinning, hugepages, NUMA mbind, and RT
-scheduling reduce measurement variance on both architectures. On
-x86_64, PAUSE and HLT VM exit disabling, the KVM_HINTS_REALTIME
-CPUID hint, and skipping host-side halt poll further reduce noise. Scheduling gaps, spread, and throughput checks
-become meaningful because host jitter is controlled. Without
-performance mode, a 50ms gap could be host noise; with it, the same
-gap indicates a scheduler problem.
+On x86_64:
 
-**Performance assertions** -- with stable measurements, tests can set
-tight thresholds (`max_gap_ms`, `min_iteration_rate`,
-`max_p99_wake_latency_ns`) to detect scheduling regressions. A test
-using `execute_steps_with` can pass custom `Assert` checks that are
-evaluated inside the guest against worker telemetry. These thresholds
-are only meaningful under performance mode's controlled environment.
+- **vCPU pinning** — each virtual LLC maps to a physical LLC group
+  and vCPU threads are pinned to cores within it, so the host
+  scheduler cannot migrate them across cache domains mid-measurement.
+- **Hugepages** — guest memory is allocated from 2MB hugepages when
+  enough are free, eliminating host-side TLB pressure.
+- **NUMA mbind** — guest memory is bound (`MPOL_BIND`, strict — no
+  silent fallback to remote nodes) to the NUMA nodes of the pinned
+  vCPUs.
+- **RT scheduling** — vCPU threads run `SCHED_FIFO` priority 1; the
+  monitor and watchdog run at priority 2 on a dedicated host CPU no
+  vCPU shares, so sampling and timeout enforcement can always
+  preempt a vCPU thread.
+- **PAUSE and HLT exit suppression** — guest spinlock `PAUSE` loops
+  and idle `HLT` normally trap to the hypervisor so it can schedule
+  other vCPUs; with dedicated cores that reschedule is pure overhead,
+  so both exits are disabled. (HLT disable is skipped when the host's
+  SMT-RSB mitigation forbids it; PAUSE alone is still disabled.)
+- **KVM_HINTS_REALTIME** — a CPUID hint telling the guest kernel its
+  vCPUs own dedicated cores; the guest drops paravirt yield paths and
+  polls briefly before halting instead of paying wakeup latency.
 
-Cross-commit regression gating builds on the same tests:
-[`cargo ktstr perf-delta`](../running-tests/cargo-ktstr.md#perf-delta)
-runs the `performance_mode` suite at HEAD and at a baseline commit and
-A/B-compares the metrics, exiting non-zero once enough metrics regress
-to trip the failure gate (by default 5 or more). The in-guest
-`Assert` thresholds above catch a regression against a fixed bar;
-perf-delta catches one against the previous commit.
+On aarch64, the four host-side items apply (pinning, hugepages, NUMA
+mbind, RT scheduling); the x86-specific exit suppression and CPUID
+hint do not exist there.
 
-## Nextest parallelism
+## Prerequisites
 
-Performance-mode tests each consume one LLC group on the host.
-The `vm-perf` test group in `.config/nextest.toml` sets a static
-`max-threads` limit. The flock-based LLC slot reservation
-(`acquire_resource_locks`) handles runtime contention: if all LLC
-slots are busy, the test returns `ResourceContention`.
+**Sufficient host CPUs** — at least
+`(llcs * cores * threads) + 1` online CPUs; the extra CPU hosts the
+monitor and watchdog threads. The host also needs at least as many
+physical LLC groups as the test declares virtual LLCs.
 
-On contention, the test returns exit code 0 (skip) -- it never ran.
-The `SKIP:` prefix in stderr distinguishes skips from real passes.
+**2MB hugepages** (optional) — check
+`/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages`. Without
+them guest memory uses regular pages and a warning is printed.
 
-## LLC exclusivity validation
+**CAP_SYS_NICE or an rtprio limit** (optional) — `SCHED_FIFO`
+requires root or `RLIMIT_RTPRIO` at or above the requested priority.
+For non-root use:
 
-When `performance_mode` is enabled, the build step validates LLC
-exclusivity: each virtual LLC must reserve the entire physical
-LLC group it maps to. The validation sums the actual CPU count of
-each LLC group and checks the total (plus service CPU) fits within
-the host's online CPUs. If validation fails, the build returns
-`PerfModeUnavailable`, a permanent host-insufficiency: it skips by
-default (exit 0 / SKIP) and is promoted to a hard FAIL only under
-`KTSTR_NO_SKIP_MODE`. A too-small host can never honor the perf-mode
-isolation guarantee, so this is a permanent skip — distinct from the
-transient all-slots-busy `ResourceContention` skip above, which a retry
-can resolve.
+```text
+# /etc/security/limits.conf
+username  -  rtprio  99
+```
 
-## Three-way mode tier
+Log out and back in for the limit to take effect. Without it, RT
+scheduling is skipped with a warning and results may be noisier.
 
-ktstr's host-side resource coordination has three effective tiers,
-selected by the combination of `performance_mode`,
-`--no-perf-mode`/`KTSTR_NO_PERF_MODE`, and `--cpu-cap`/`KTSTR_CPU_CAP`:
+## Sizing the host
 
-### Tier 1: performance mode (full isolation)
+A single perf-mode test needs `(llcs * cores * threads) + 1` online
+CPUs and `llcs` free physical LLC groups — the test holds an
+exclusive lock on one host LLC group per virtual LLC for the run's
+duration. To run `K` perf-mode tests concurrently without contention
+skips, the host needs `K * llcs` free LLC groups; with fewer, the
+excess tests skip with `ResourceContention` and nextest retries them
+after a holder releases. The `vm-perf` test group in
+`.config/nextest.toml` caps how many run at once.
 
-Enabled when `performance_mode=true` is set on the VM builder (or
-via `#[ktstr_test(performance_mode = true)]`). Acquires `LOCK_EX`
-on each selected LLC's `/tmp/ktstr-llc-{N}.lock` — the LLC-level
-exclusive lock already covers every CPU in the group, so per-CPU
-`/tmp/ktstr-cpu-{C}.lock` files are NOT touched
-(`try_acquire_all` in `vmm/host_topology/mod.rs` short-circuits the
-per-CPU loop when `LlcLockMode == Exclusive`). Applies every
-isolation feature listed under "What it does": vCPU pinning via
-`sched_setaffinity`, 2 MB hugepages, NUMA mbind, RT `SCHED_FIFO`
-scheduling, and (x86_64) PAUSE/HLT exit suppression +
-KVM_HINTS_REALTIME CPUID.
+## Failure modes
 
-### Tier 2: no-perf-mode with CPU-cap reservation
+Performance mode never runs unisolated: if the host cannot honor the
+guarantee, the build fails before boot and the test skips visibly
+rather than shipping a measurement that does not match what was asked
+for.
 
-Enabled by `--no-perf-mode` / `KTSTR_NO_PERF_MODE=1`. Every
-no-perf-mode VM goes through `acquire_llc_plan`: the reservation
-is `LOCK_SH` across a NUMA-aware, consolidation-aware set of
-LLCs, sized to meet the CPU budget — either `--cpu-cap N` (or
-`KTSTR_CPU_CAP=N`) if set, or the no-perf default `max(30% of the
-calling process's sched_getaffinity cpuset, min(vcpus, allowed))`
-(floored at 1) if not — so a wide VM's vCPU threads are not
-host-oversubscribed by a flat 30% mask. The flock granularity
-stays per-LLC; `plan.cpus` holds EXACTLY the budget (partial-take
-on the last LLC when the budget falls mid-LLC). Multiple
-no-perf-mode VMs coexist on the same LLCs because shared locks
-are reentrant; a concurrent perf-mode VM attempting `LOCK_EX`
-blocks until every no-perf-mode peer has released.
+- **`PerfModeUnavailable`** — permanent host insufficiency: too few
+  CPUs or LLC groups for the topology, no satisfiable pinning plan,
+  or no free CPU left for service threads. Skips by default with a
+  visible banner (`ktstr: SKIP: <reason>` on stderr, exit 0, skip
+  recorded in the run sidecar); promoted to a hard fail under
+  `KTSTR_NO_SKIP_MODE` for runs that demand execution.
+- **`ResourceContention`** — transient: another run holds a lock on
+  a needed LLC or CPU (the reason names it, e.g. `LLC 3 busy`).
+  Skips with the same `SKIP:` banner; a retry after the holder
+  finishes succeeds.
+- **Warnings (non-fatal)** — insufficient free hugepages (regular
+  pages used); high host load (`procs_running` above half the vCPU
+  count — results may be noisy); unstable TSC (x86_64, common in
+  nested virtualization — timing variance is higher).
 
-Enforcement under `--cpu-cap`:
-
-- **cgroup v2 cpuset sandbox** — the reserved CPUs and derived NUMA
-  nodes are written to a child cgroup's `cpuset.cpus` and
-  `cpuset.mems`, and the build pid is migrated into that cgroup, so
-  `make -jN` gcc children inherit the binding. Under `--cpu-cap`,
-  narrowing by a parent cgroup is a fatal error; without the flag
-  (but with `acquire_llc_plan` still running on the 30% default)
-  the sandbox warns and proceeds.
-- **Soft-mask affinity** — vCPU threads receive a
-  `sched_setaffinity` mask covering only the reserved CPUs, so the
-  guest's CPU placement respects the budget even though no pinning is
-  applied.
-- **No RT scheduling, no hugepages, no mbind, no KVM exit
-  suppression** — these remain off; `--cpu-cap` is not a partial
-  performance mode.
-- **`make -jN` hint** — kernel-build pipelines pass `plan.cpus.len()`
-  to `make` so gcc's fan-out matches the reserved capacity rather
-  than `nproc`.
-
-This tier is mutually exclusive with `performance_mode=true` (on
-the CLI, clap `requires = "no_perf_mode"` rejects `--cpu-cap`
-without `--no-perf-mode` at parse time) and with
-`KTSTR_BYPASS_LLC_LOCKS=1` (rejected at every entry point because
-the contract and the bypass escape hatch are contradictory).
-Library consumers that set `performance_mode=true` on
-`KtstrVmBuilder` directly bypass the CLI parse — `KTSTR_CPU_CAP`
-is silently ignored in that path because the builder's perf-mode
-branch never consults `CpuCap::resolve`.
-
-See [Resource Budget](resource-budget.md) for the `CpuCap`,
-`LlcPlan`, and `ktstr locks` surfaces in detail.
-
-### Tier 3: default (LLC LOCK_SH + per-CPU LOCK_EX)
-
-Selected when neither `performance_mode=true` nor
-`--no-perf-mode`/`KTSTR_NO_PERF_MODE` is set — the default path
-for `#[ktstr_test]` entries that don't declare `performance_mode`
-(entry.rs `KtstrTestEntry::DEFAULT` sets `performance_mode:
-false`). `KtstrVm::acquire_run_locks` (its default-else arm, in
-`vmm/mod.rs`) picks a starting LLC slot via `pid_window_offset`,
-walks the LLC offsets computing a `compute_pinning` candidate per
-offset, and acquires that plan through `acquire_resource_locks` in
-`LlcLockMode::Shared` (`vmm/host_topology/mod.rs`): it takes
-`LOCK_SH` on the plan's LLC lockfiles (`/tmp/ktstr-llc-{N}.lock`),
-then `LOCK_EX` on each assigned host CPU's lockfile
-(`/tmp/ktstr-cpu-{C}.lock`) over the plan's vCPU→CPU assignments.
-(Tier 3 reserves no service CPU: its `compute_pinning` call passes
-`reserve_service_cpu=false`, so the plan's `service_cpu` is
-`None`.) The LLC `LOCK_SH` prevents a perf-mode (tier 1) VM from
-grabbing `LOCK_EX` on an LLC this path is using.
-No pinning, no isolation, no cgroup sandbox — the per-CPU
-reservation is purely for host-scheduling-noise avoidance between
-concurrent VMs.
-
-This is the ONLY tier that actually flocks per-CPU lockfiles.
-`try_acquire_all` takes per-CPU `LOCK_EX` only when the LLC mode
-is non-exclusive AND the plan carries real vCPU→CPU assignments.
-Tier 1 skips them: its `Exclusive` LLC lock already covers every
-CPU in the group, so the per-CPU loop is bypassed. Tier 2 is
-`Shared` (non-exclusive) but passes an empty-`assignments` stub
-plan, so its per-CPU loop iterates zero times — its capped LLC
-`SH` is enforced via the cgroup cpuset, and the per-LLC flock is
-sufficient coordination.
-
-When the default path cannot place the topology 1:1 it does NOT skip.
-`acquire_run_locks` tracks whether any LLC offset produced a valid
-`compute_pinning` candidate, which splits the two ways the offset walk
-comes up empty:
-
-- **No candidate (topology cannot be placed)** — `compute_pinning`
-  fails for every offset: the host has either fewer online CPUs than
-  the guest needs, or enough CPUs but too few LLC groups (it rejects
-  `virtual_llcs > host_llc_groups` regardless of CPU count). Both gates
-  read the host's online topology. Rather than skipping, the run masks
-  every vCPU thread onto `host_allowed_cpus()` and overrides the sidecar
-  `cpu_budget` to that masked allowed-CPU count. Whether the overcommit
-  is surfaced turns on the ALLOWED cpuset, not the online count: when
-  `host_allowed_cpus()` is SMALLER than `vcpus` — genuine
-  oversubscription, including a process cpuset narrower than the guest
-  (a CI runner or systemd slice can be narrower than the online host) —
-  an overcommit warning is emitted, the stamped `cpu_budget` falls below
-  `vcpus`, and the A/B-compare overcommit marker fires, so the confound
-  is durable, not silent. When the allowed cpuset still covers at least
-  `vcpus` CPUs (the candidate failed only on LLC-group count), the vCPUs
-  mask onto the full allowed set with no oversubscription, so neither
-  the warning nor the marker fires. The no-cached-topology case (sysfs
-  unreadable at build time) takes the same masked fallback.
-- **A candidate exists but every offset is busy (transient)** — a 1:1
-  plan maps, but a peer holds the lock on every offset (a perf-mode
-  `LOCK_EX` on the LLC, or a non-perf peer on the per-CPU `LOCK_EX`
-  set). The run returns `ResourceContention` (exit 0, skip); nextest
-  retries after the holder releases. It does NOT overcommit, so a
-  default test never runs on the CPUs a concurrent perf-mode test
-  reserved.
-
-## Sizing the host for tight balance
-
-"Tight balance" is running a topology on a host with just enough CPUs
-— or several `performance_mode` tests concurrently, each needing its
-own LLC. The three tiers diverge when the host cannot fit the requested
-topology, so the mode choice determines whether a too-small host fails,
-skips, or runs degraded:
-
-| Tier | Host too small for the topology | Exit |
-|------|----------------------------------|------|
-| Tier 1 (`performance_mode`) | `PerfModeUnavailable` — the isolation guarantee cannot be honored | 0 / SKIP (1 / FAIL under `KTSTR_NO_SKIP_MODE`) |
-| Tier 2 — operator `--cpu-cap` exceeds the allowed cpuset | `CpuBudgetUnsatisfiable` — the operator-typed cap is impossible | 1 / FAIL |
-| Tier 2 — per-test `cpu_budget` exceeds the allowed cpuset | `TopologyInsufficient` — the author's requirement needs a bigger host | 0 / SKIP (1 / FAIL under `KTSTR_NO_SKIP_MODE`) |
-| Tier 2 — default budget (no explicit cap) | sizes down to `max(30%, min(vcpus, allowed))` and runs | 0 |
-| Tier 3 (default) | masks onto the allowed CPUs; warns + marks the sidecar only when that set is smaller than `vcpus` | 0 |
-
-The asymmetry is deliberate: an EXPLICIT request for a guarantee the host
-cannot provide must never silently downscale into a measurement that does
-not match what was asked for. What differs is the VERDICT, split by
-PROVENANCE. A too-small `performance_mode` host SKIPS — the VM never runs
-unisolated, so no wrong measurement ships. An author's per-test `cpu_budget`
-over the allowance likewise SKIPS (`TopologyInsufficient`): a `#[ktstr_test]`
-attribute is a capability REQUIREMENT — the scenario needs that many CPUs to
-be meaningful, and a bigger host would run it, exactly like a topology
-requirement. Both promote to a hard FAIL under `KTSTR_NO_SKIP_MODE` for runs
-that demand execution. An operator `--cpu-cap` the host cannot satisfy
-instead stays a hard error (`CpuBudgetUnsatisfiable`): a number typed for
-THIS run on THIS host that does not exist here is a misconfiguration, not a
-host-capability gap. The DEFAULT path (no explicit cap) makes the test run
-regardless, surfacing any oversubscription confound through the overcommit
-warning and the sidecar `cpu_budget` stamp rather than failing.
-
-To size a host so a `performance_mode` test passes (Tier 1), provide
-`(llcs * cores * threads) + 1` online CPUs and at least `llcs` LLC
-groups (see [Prerequisites](#prerequisites)). To run `K`
-`performance_mode` tests CONCURRENTLY without `ResourceContention`
-skips, the host needs `K * llcs` free LLC groups — each perf-mode test
-holds `LOCK_EX` on its LLCs for the run's duration (see
-[Nextest parallelism](#nextest-parallelism)); a host with fewer LLCs
-serializes the excess via the flock retry.
+The full skip-vs-fail model — which requester gets a skip, which gets
+a hard error, and what the default path does instead — is in
+[Resource Budget](resource-budget.md#too-small-hosts-who-asked-determines-the-verdict).
 
 ## Disabling performance mode
 
 `--no-perf-mode` (or `KTSTR_NO_PERF_MODE=1`) forces
-`performance_mode=false`. The result is **tier 2 above** — a
-CPU-capped `LOCK_SH` reservation (either explicit `--cpu-cap N`
-or the no-perf default `max(30% of allowed, min(vcpus, allowed))`).
-The feature differences
-relative to tier 1 are:
-
-- **LLC flock mode** — tier 1 holds `LOCK_EX` on each reserved LLC;
-  tier 2 holds `LOCK_SH`. Multiple shared holders coexist; an
-  exclusive holder blocks every shared acquirer and vice-versa.
-- **Per-CPU flocks** — tier 1 relies on LLC-level `LOCK_EX` for
-  exclusivity; per-CPU `/tmp/ktstr-cpu-{C}.lock` files are skipped
-  (`try_acquire_all` in `vmm/host_topology/mod.rs` short-circuits the
-  per-CPU loop when `LlcLockMode == Exclusive` because the LLC
-  lock already covers every CPU in the group). Tier 2 also skips
-  them — the cgroup cpuset is the enforcement layer.
-- **vCPU pinning** — tier 1 pins via `sched_setaffinity` to the
-  reserved LLC's CPUs. Tier 2 applies soft-mask affinity
-  (budget-scoped but no 1:1 vCPU-to-CPU binding).
-- **RT scheduling** — tier 1 only; tier 2 runs vCPU threads at
-  normal priority.
-- **Hugepages** — tier 1 only; tier 2 uses regular pages.
-- **NUMA mbind** — tier 1 only; tier 2 instead writes `cpuset.mems`
-  on its child cgroup to achieve NUMA locality at the cgroup layer.
-- **KVM exit suppression** (x86_64) — tier 1 only; tier 2 leaves
-  PAUSE and HLT exits enabled.
-- **KVM_HINTS_REALTIME CPUID** (x86_64) — tier 1 only; tier 2 leaves
-  the guest on PV spinlocks and standard cpuidle.
-
-Use tier 2 on multi-tenant hosts where you want bounded concurrency
-(at most `N` concurrent builds or no-perf-mode VMs per host) but
-cannot afford the full perf-mode contract. Use tier 1 for
-regression measurement where host jitter must be controlled.
-
-Available via:
-
-- `ktstr shell --no-perf-mode`
-- `cargo ktstr test --no-perf-mode`
-- `cargo ktstr coverage --no-perf-mode`
-- `cargo ktstr llvm-cov --no-perf-mode`
-- `cargo ktstr shell --no-perf-mode`
-- `KTSTR_NO_PERF_MODE=1` (any value; presence is sufficient)
-
-`--cpu-cap N` is the **CLI flag** for `ktstr shell`, `ktstr kernel
-build`, `cargo ktstr shell`, and `cargo ktstr kernel build` only —
-`cargo ktstr test`, `cargo ktstr coverage`, and `cargo ktstr llvm-cov`
-do NOT carry the flag. For the test/coverage/llvm-cov paths the cap is
-set via the `KTSTR_CPU_CAP` environment variable (the env var is read
-by every VM-builder call site). When absent, the no-perf VM default
-`max(30% of allowed, min(vcpus, allowed))` applies automatically (the
-kernel-build path uses a flat 30%-of-allowed default).
+`performance_mode = false` and routes the run through the budgeted
+coordination path: a shared LLC reservation sized to a CPU budget,
+enforced by a cgroup cpuset instead of pinning — none of the
+isolation features above apply. The mode comparison, the CPU budget,
+and the `--cpu-cap` flag live in
+[Resource Budget](resource-budget.md#the-three-coordination-modes).

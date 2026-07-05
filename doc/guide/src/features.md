@@ -1,95 +1,46 @@
 <style>
 :root { --content-max-width: 1000px; }
-details { margin-bottom: 0.75em; }
 </style>
 
-# Features
+# ktstr in Action
 
-ktstr is a test framework for Linux process schedulers.
-See [Overview](overview.md) for a quick introduction with code
-examples.
-
-## Supported kernels
-
-ktstr's runtime dispatches to per-kernel-version fallback paths for
-the watchdog timeout and event counters. CI explicitly exercises
-6.14 and 7.1 on both x86_64 and aarch64. On 7.1+ kernels the watchdog
-override uses `scx_sched.watchdog_timeout` via BTF detection;
-older kernels use the static `scx_watchdog_timeout` symbol.
-
-Event counters follow a different layout split: 6.18+ kernels
-(backported to 6.17.7+ stable) read via
-`scx_sched.pcpu -> scx_sched_pcpu.event_stats`; 6.16-6.17 kernels
-read `scx_sched.event_stats_cpu` directly. When neither path is
-available, event-counter sampling is silently disabled.
+The feature tour: each capability in a few sentences, with real output
+where output is the point — captured from actual runs (ktstr 0.23.0,
+kernel 7.0.14 unless noted), trimmed but never edited.
 
 ## Testing
 
-<details>
-<summary><b>Real kernel, clean slate, x86/arm parity</b> — every VM test boots its own Linux kernel in KVM, fresh state each run</summary>
+### Real kernel, clean slate, x86/arm parity
 
-Tests boot a real Linux kernel in a KVM virtual machine with
-configurable topology: NUMA nodes, LLCs, cores per LLC, threads per core.
-Multi-NUMA topologies produce NUMA domains via ACPI SRAT/SLIT/HMAT
-tables on x86_64. On aarch64, CPU topology is described via FDT cpu
-nodes with MPIDR affinity. Both architectures are supported (24
-topology presets on x86_64, 14 on aarch64).
-See [Gauntlet](running-tests/gauntlet.md) for the full preset list.
+Every VM test boots its own Linux kernel in KVM — fresh state each run,
+no shared daemons, no containers. Topology is configurable per test:
+NUMA nodes, LLCs, cores per LLC, threads per core, with real ACPI
+SRAT/SLIT tables on x86_64 and FDT cpu nodes on aarch64 — 24 topology
+presets on x86_64, 14 on aarch64. The framework drives the whole
+lifecycle: boot, attach, scenario, collect, teardown. See
+[Topology](concepts/topology.md).
 
-</details>
-
-<details>
-<summary><b>Fast boot</b> — compressed initramfs SHM cache with COW overlay, VMs boot in ms, not s</summary>
+### Fast boot
 
 The initramfs base (test binary + busybox + shared libraries) is
-LZ4-compressed and cached in a shared memory segment. Concurrent VMs
-COW-map the cached base into guest memory, avoiding per-VM
-compression and copy. Per-test arguments are packed as a small
-suffix appended to the cached base. Result: VM
-boot time is dominated by kernel init, not initramfs preparation.
+LZ4-compressed and cached in shared memory; concurrent VMs COW-map the
+cached base instead of rebuilding it, so boot is dominated by kernel
+init, not initramfs preparation. Measured on a 64-CPU host:
 
-</details>
+<!-- captured: cargo ktstr test --kernel 7.0 (VM setup timings, stderr) | ktstr 0.23.0 | kernel 7.0.14 -->
+```text
+  initramfs spawn: 55.583µs
+  kvm+kernel: 867.005µs
+  setup_memory (joins initramfs): 1.409360963s
+  setup_vcpus: 1.409565321s
+VM setup total: 1.409619773s
+```
 
-<details>
-<summary><b>Automatic shared library resolution</b> — recursive DT_NEEDED discovery, no need to link statically</summary>
+### Declarative scheduler registration
 
-Shared library dependencies for the test binary and any injected
-host files are resolved automatically by walking `DT_NEEDED` entries
-in ELF headers. The framework builds a complete closure of transitive
-dependencies — no manual `.so` lists or `LD_LIBRARY_PATH` hacks.
-
-</details>
-
-<details>
-<summary><b>Bare-metal mode</b> — run the same scenarios on real hardware without VMs</summary>
-
-`cargo ktstr export` packages a registered test as a self-extracting
-`.run` script that reproduces the scenario on bare metal without
-a VM. The runfile validates host topology and sched_ext support,
-checks that no other sched_ext scheduler is already attached (it
-errors out rather than displacing one), then launches the test's
-bundled scheduler (the binary frozen at registration) and runs the
-scenario under it; non-scheduler (EEVDF) tests run under the kernel
-default. Config files declared via `Scheduler::config_file`
-or `config_content` (paired with `config_file_def`) are packed into
-the archive and the scheduler launch line includes the matching
-`--config`/`{file}` arg, so a layered/lavd-class test reproduces
-with the same scheduler config the live test used. Used for testing
-under production schedulers and real topology.
-
-</details>
-
-<details>
-<summary><b>Declarative scheduler registration</b> — one macro declares the binary, default topology, kernels, and assertions</summary>
-
-Tests load [sched_ext](https://github.com/sched-ext/scx) schedulers
-via BPF struct_ops inside the VM. The
-[`declare_scheduler!`](writing-tests/scheduler-definitions.md)
-macro registers a scheduler in the `KTSTR_SCHEDULERS` distributed
-slice — binary path, default topology, kernel filter for the
-verifier sweep, assertion overrides, and always-on CLI args all
-land in one declaration that tests reference via the bare const
-ident the macro emits.
+One macro declares a scheduler — binary, default topology, kernel filter
+for the verifier sweep, assertion overrides, always-on CLI args — and
+tests reference the const it emits:
 
 ```rust,ignore
 use ktstr::declare_scheduler;
@@ -102,523 +53,317 @@ declare_scheduler!(MITOSIS, {
 });
 ```
 
-Without a `scheduler = …` attribute on `#[ktstr_test]`, tests run
-under the kernel's default scheduler (EEVDF).
+Schedulers that take a `--config` JSON file declare the arg template
+once; each test supplies its config inline via `config = …`. See
+[Scheduler Definitions](writing-tests/scheduler-definitions.md) and
+[The #\[ktstr_test\] Attribute](writing-tests/ktstr-test-macro.md).
 
-</details>
+### Data-driven scenarios
 
-<details>
-<summary><b>Data-driven scenarios</b> — declare what you want, the framework handles cgroups, cpusets, and workers</summary>
+You declare intent as data — cgroups, cpusets, workloads, mid-run ops —
+and the framework creates cgroups, spawns workers, applies policies and
+affinity, and tears it all down. Canned scenarios grouped by scheduling
+concern — affinity, cpusets, dynamic cgroups, nesting, contention,
+stress — cover the common patterns; the `ops` DSL underneath (`Step`,
+`Op`, `Backdrop`) expresses the rest. See
+[Scenarios](concepts/scenarios.md) and
+[Ops, Steps, and Backdrop](concepts/ops.md).
 
-Scenarios are composable sequences of
-[steps and ops](concepts/ops.md). You declare intent as data —
-the framework creates cgroups, assigns cpusets, spawns workers,
-sets scheduling policies, and manages affinity. 50+
-[canned scenarios](concepts/scenarios.md) across 8 scenario
-submodules cover basic, cpuset, dynamic, stress, interaction,
-affinity, nested, and performance patterns. (The `ops` module
-is the underlying DSL that every scenario is expressed in, not
-a scenario category; the `scenarios` module is the top-level
-catalog aggregator.)
+### 45 work types
 
-**API types:**
-- `CgroupDef` — declarative cgroup: name + cpuset + workload(s)
-- `Step` — sequence of ops followed by a hold period
-- `Op` — atomic operation (add/remove cgroup, set/swap/clear cpuset, spawn, stop, set affinity, move tasks)
-- `CpusetSpec` — topology-relative cpuset (LLC-aligned, NUMA-aligned, disjoint, overlapping, range, exact)
-- `HoldSpec` — hold duration (fractional, fixed, or looped)
-- `AffinityIntent` — per-worker affinity (inherit, random subset, LLC-aligned, SMT-sibling-pair, cross-cgroup, single CPU, exact)
-- `SchedPolicy` — Linux scheduling policy (Normal, Batch, Idle, Fifo, RoundRobin, Deadline)
-- `WorkSpec` — workload definition for a group of workers
-- `Backdrop` — long-lived cgroups, payloads, and ops that span the whole scenario; the framework applies them before any Step runs and tears them down after the last Step completes
+Each work type targets a specific scheduling pressure, so a test can pin
+the kernel path a regression lives in. A sample of the 45:
 
-</details>
+| Pressure | Examples |
+|---|---|
+| CPU and IPC | `SpinWait`, `AluHot`, `IpcVariance` |
+| Wakeup placement | `FutexPingPong`, `WakeChain`, `PipeIo` |
+| Task churn | `ForkExit`, `CgroupAttachStorm`, `AffinityChurn` |
+| Priority and starvation | `PreemptStorm`, `RtStarvation`, `PriorityInversion` |
+| Memory and NUMA | `CachePressure`, `PageFaultChurn`, `NumaWorkingSetSweep` |
+| IRQ and I/O | `IrqWake`, `NetTraffic`, `IoConvoy` |
+| Benchmarks | `Schbench`, `Taobench` |
 
-<details>
-<summary><b>Gauntlet</b> — one test declaration, dozens of topology variants with budget-aware CI selection</summary>
+Workers can also set `comm`, nice level, and thread-group-leader name
+(`pcomm`) to model real applications, and `Custom` takes a user-supplied
+work function. Full catalog: [Work Types](concepts/work-types.md).
 
-A single [`#[ktstr_test]`](writing-tests/ktstr-test-macro.md)
-auto-expands across topology presets. Multi-kernel runs
-(`cargo ktstr test --kernel A --kernel B`) add the kernel as
-an additional dimension. Budget-based selection
-(`KTSTR_BUDGET_SECS`) picks the subset that maximizes coverage
-within a CI time limit.
+### Gauntlet
 
-**Constraint attributes:**
-- `min_llcs`, `max_llcs`, `min_cpus`, `max_cpus`, `min_numa_nodes`, `max_numa_nodes`, `requires_smt` — topology gates
-- `extra_sched_args` — per-test scheduler CLI arguments
+A single `#[ktstr_test]` auto-expands across topology presets, and
+multi-kernel runs (`--kernel A --kernel B`) add the kernel as another
+matrix dimension. Budget-based selection maximizes coverage within a CI
+time limit; multi-NUMA and very large presets are opt-in via constraint
+attributes. See [Gauntlet](running-tests/gauntlet.md).
 
-</details>
+### Real-kernel BPF verifier analysis
 
-<details>
-<summary><b><code>#[ktstr_test]</code> proc macro</b> — zero-boilerplate test declaration with nextest integration</summary>
+The verifier sweep boots a VM per (scheduler × kernel × topology
+preset), loads the scheduler through struct_ops — the same path
+production uses — and reads actual verified instruction counts from
+guest memory. Topology is a real verification axis: values baked into
+`.rodata` (like CPU counts) change what the verifier explores, so a
+scheduler can attach on one topology and be rejected on another.
 
-Declares tests with topology, scheduler, and constraint attributes.
-Generates both nextest-compatible entries and standard `#[test]`
-wrappers. No custom harness or `main()` needed.
-See [The #\[ktstr_test\] Macro](writing-tests/ktstr-test-macro.md).
+<!-- captured: cargo ktstr verifier --kernel 7.0 --scheduler ktstr_sched --test kaslr_axis_e2e tiny-1llc tiny-2llc odd-3llc smt-2llc | ktstr 0.23.0 | kernel 7.0.14 -->
+<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr verifier --kernel 7.0 --scheduler ktstr_sched</span></div>
 
-</details>
+<pre>        PASS [  12.406s] (1/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/odd-3llc
+...
+verifier verified_insns (per scheduler; rows: kernel, cols: BPF program, cell: range across topologies):
 
-<details>
-<summary><b>Library-first</b> — add as a dev-dependency, write tests in your own crate</summary>
+ktstr_sched:
+ kernel      ktstr_dispatch  ktstr_dump  ktstr_dump_cpu  ktstr_dump_task  ktstr_enqueue  ktstr_exit  ktstr_exit_task  ktstr_init  ktstr_init_task  ktstr_select_cp  ktstr_yield 
+ kernel_7_0  102             81          13              70               74             25          419              2296        29077            39               8           
 
-Add `ktstr` as a dev-dependency. `ktstr::prelude` re-exports
-all test-authoring types.
-See [Getting Started](getting-started.md) for setup.
+<span class="t-grn">verifier summary: 4 ✅  0 ❌  0 🇽</span>
+ topology   ktstr_sched 
+ odd-3llc   ✅          
+ smt-2llc   ✅          
+ tiny-1llc  ✅          
+ tiny-2llc  ✅          </pre></div>
 
-</details>
+On rejection, the log is cycle-collapsed — repeated loop-unrolling
+iterations are deduplicated so the offending access is readable:
 
-<details>
-<summary><b>Automatic lifecycle</b> — boot, load scheduler, run scenario, collect results, shutdown — all handled</summary>
+<!-- captured: cargo ktstr verifier --kernel 7.0 --scheduler ktstr_broken --test verifier_pipeline tiny-1llc | ktstr 0.23.0 | kernel 7.0.14 -->
+```text
+Global function ktstr_dispatch() doesn't return scalar. Only those are supported.
+...
+--- 8x of the following 25 lines ---
+; u64 t = bpf_ktime_get_ns(); @ main.bpf.c:453
+38: (85) call bpf_ktime_get_ns#5      ; R0=scalar()
+...
+--- 6 identical iterations omitted ---
+...
+--- end repeat ---
+192: (63) *(u32 *)(r1 +0) = r2
+R1 invalid mem access 'scalar'
+processed 186 insns (limit 1000000) max_states_per_insn 0 total_states 7 peak_states 7 mark_read 0
+```
 
-The framework manages the full VM lifecycle: boot, scheduler start,
-scenario execution, result collection, and shutdown. Bidirectional
-SHM signal slots coordinate graceful shutdown, BPF map writes, and
-readiness gates between host and guest.
+See [BPF Verifier Sweep](running-tests/verifier.md).
 
-</details>
+### Bare-metal export
 
-<details>
-<summary><b>45 work types</b> — configurable workload profiles for different scheduling pressures</summary>
+`cargo ktstr export` packages a registered test as a self-extracting
+`.run` script that reproduces the scenario on real hardware, no VM. The
+script freezes the scheduler binary, its args and config files, and the
+required topology; it validates the host and refuses to displace an
+already-attached sched_ext scheduler.
 
-Workers are `fork()`ed processes placed in cgroups:
+<!-- captured: cargo ktstr export sched_basic_proportional --package ktstr -o /tmp/sched_basic_proportional.run | ktstr 0.23.0 | host-side, no VM -->
+```text
+wrote /tmp/sched_basic_proportional.run (90074903 bytes archive, 0 include files)
+----- head -40 of the generated script -----
+#!/bin/bash
+# Generated by `cargo ktstr export`. Do not edit; regenerate to update.
+...
+# --- frozen test specification ---
+KTSTR_TEST_NAME=sched_basic_proportional
+KTSTR_SCHED_NAME=ktstr_sched
+KTSTR_GIT_HASH=73730e0
+NEED_LLCS=1
+NEED_CORES_PER_LLC=2
+NEED_THREADS_PER_CORE=1
+NEED_NUMA_NODES=1
+...
+```
 
-- `SpinWait` — tight CPU spin loop
-- `YieldHeavy` — repeated sched_yield with minimal CPU work
-- `Mixed` — CPU spin burst followed by sched_yield
-- `AluHot` — independent integer multiply chains at high IPC (≥ 2.0)
-- `SmtSiblingSpin` — paired PAUSE-spin pinned across two SMT siblings
-- `IpcVariance` — alternating high-IPC (multiplies) / low-IPC (cache touches) phases
-- `IoSyncWrite` — 16 × 4 KB pwrites + fdatasync per iteration (O_SYNC)
-- `IoRandRead` — 4 KB random pread (O_DIRECT)
-- `IoConvoy` — interleaved sequential pwrite + random pread with periodic fdatasync (O_DIRECT)
-- `Bursty` — CPU burst then sleep (parameterized via `Duration`)
-- `IdleChurn` — CPU burst then `nanosleep` (hrtimer + idle-class path)
-- `TimerLatency` — cyclictest-style periodic wake via `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)`; per-cycle jitter feeds the `timer_latencies_ns` reservoir
-- `PipeIo` — CPU burst then pipe exchange (cross-CPU wake placement)
-- `FutexPingPong` — paired futex wait/wake (non-WF_SYNC)
-- `FutexFanOut` — 1:N fan-out wake
-- `CachePressure` — strided RMW sized to pressure L1
-- `CacheYield` — cache pressure + sched_yield
-- `CachePipe` — cache pressure + pipe exchange
-- `Sequence` — compound: loop through phases
-- `ForkExit` — rapid fork+_exit cycling
-- `NiceSweep` — cycle nice level from -20 to 19
-- `AffinityChurn` — rapid self-directed sched_setaffinity
-- `CrossAffinityChurn` — each worker rewrites its cgroup-siblings' affinity via sched_setaffinity (distinct from `AffinityChurn`, which churns the worker's own affinity)
-- `PolicyChurn` — cycle SCHED_OTHER → BATCH → IDLE (→ FIFO/RR with CAP_SYS_NICE)
-- `NumaMigrationChurn` — rotate sched_setaffinity across NUMA nodes
-- `CgroupChurn` — cycle cgroup membership between sibling cgroups
-- `CgroupAttachStorm` — rapid fork + migrate each child into a destination cgroup's `cgroup.procs` (attach storm)
-- `FanOutCompute` — messenger/worker fan-out with matrix-multiply compute
-- `AsymmetricWaker` — paired workers in mismatched scheduling classes share one futex word
-- `WakeChain` — ring of waker-wakee hops (Pipe with WF_SYNC, or Futex)
-- `EpollStorm` — eventfd producers + epoll_wait consumers
-- `ThunderingHerd` — N waiters on one global futex word; broadcast wake
-- `PageFaultChurn` — rapid mmap/fault/MADV_DONTNEED cycling
-- `NumaWorkingSetSweep` — rotate working-set memory across NUMA nodes via mbind
-- `MutexContention` — N-way futex mutex contention
-- `PriorityInversion` — three-tier lock contention (Pi or Plain futex)
-- `ProducerConsumerImbalance` — unbalanced producer/consumer pipeline (queue grows)
-- `SignalStorm` — paired workers fire tkill(partner, SIGUSR2) between CPU bursts
-- `PreemptStorm` — one SCHED_FIFO worker preempts CFS spinners at ~kHz
-- `RtStarvation` — SCHED_FIFO workers monopolise CPU; SCHED_NORMAL workers starve
-- `Schbench` — schbench default-mode benchmark re-expressed natively (message/worker threads; request-latency measurement)
-- `Taobench` — bounded, evicting key-value object-cache benchmark (closed-loop clients over a sharded in-process cache; fast hit path + slow backing-miss path)
-- `NetTraffic` — AF_PACKET traffic generator driving the virtio-net NIC's RX hardirq + NAPI softirq
-- `IrqWake` — paired sender/receiver; the receiver blocks in `recvfrom` and is woken from NET_RX softirq context
-- `Custom` — user-supplied work function
-
-See [WorkType](concepts/work-types.md).
-
-</details>
+See [cargo ktstr](running-tests/cargo-ktstr.md).
 
 ## Observability
 
-<details>
-<summary><b>Zero-overhead introspection</b> — read/write kernel state and BPF maps from the host w/o the guest knowing</summary>
+### Zero-perturbation introspection
 
-All observability is built on direct read/write of guest physical
-memory from the host via the KVM memory mapping, with page table
-walks for dynamically allocated addresses. No guest-side
-instrumentation, no BPF syscalls — the observer does not perturb the
-scheduler under test.
+Everything is built on direct reads of guest physical memory from the
+host via the KVM memory mapping. Kernel state — per-CPU runqueues,
+sched_domain trees, schedstat and sched_ext event counters — is read
+through BTF-resolved struct offsets; BPF maps get typed field access via
+program BTF. No guest-side instrumentation, no BPF syscalls: the
+observer does not perturb the scheduler under test. See
+[Monitor](architecture/monitor.md).
 
-**Kernel state**: per-CPU runqueues, sched_domain trees, schedstat
-counters, and sched_ext event counters — read via BTF-resolved
-struct offsets from vmlinux.
-See [Monitor](architecture/monitor.md).
+### Cast analysis
 
-**BPF state**: maps discovered by walking kernel data structures
-through page table translation. Array and percpu_array maps support
-typed field access via BPF program BTF; hash maps return raw
-key-value pairs. Read/write — write enables host-initiated crash
-reproduction.
+Schedulers stash kernel and arena pointers in BPF map fields declared as
+`u64`, because BTF cannot express those pointer types. The cast analyzer
+walks the scheduler's instruction stream and proves which fields are
+really pointers and to what — so dumps chase through them and print
+typed structs annotated `(cast→arena)` or `(cast→kernel)` instead of raw
+hex. It runs on every scheduler load, no configuration (the failure-dump
+excerpt below shows it in action). See
+[Monitor](architecture/monitor.md).
 
-**Types:** `GuestMem`, `GuestKernel`, `BpfMapAccessor`
+### Periodic capture and temporal assertions
 
-</details>
+`#[ktstr_test(num_snapshots = N)]` samples BPF map fields and scheduler
+stats at N points across the workload window, from outside the guest.
+Temporal patterns — `nondecreasing`, `rate_within`, `steady_within`,
+`converges_to`, and friends — assert over the whole series; on-demand
+and write-triggered snapshots share the same machinery. See
+[Periodic Capture](writing-tests/periodic-capture.md),
+[Temporal Assertions](writing-tests/temporal-assertions.md), and
+[Snapshots](writing-tests/snapshots.md).
 
-<details>
-<summary><b>Cast analysis</b> — recover typed pointers from <code>u64</code> map fields automatically; no annotations required</summary>
+### Statistical regression detection
 
-Schedulers stash kernel kptrs (`task_struct *`, `cgroup *`, …) and
-arena pointers in BPF map fields the BTF declares as `u64` because
-BTF cannot express a pointer to a per-allocation type. The cast
-analyzer walks the scheduler's `.bpf.o` instruction stream, tracks
-register state across LDX / STX / stack-spill / kfunc-return, and
-records every `(source_struct, field_offset) → target_struct`
-mapping it can prove from the program's own access pattern.
-
-The renderer feeds those mappings into `render_cast_pointer` so a
-field that previously surfaced as a raw `0xffff…` integer now
-chases through to the target struct's fields and prints with a
-`(cast→arena)` or `(cast→kernel)` annotation distinguishing
-cast-recovered pointers from BTF-typed ones. Failure dumps,
-periodic captures, and on-demand snapshots all benefit
-automatically.
-
-A complementary `sdt_alloc` bridge recovers a chase target's real
-struct id when the scheduler's program BTF declares the pointee as
-a `BTF_KIND_FWD` forward declaration (the typical shape for
-`struct sdt_data __arena *` fields whose body lives in a separate
-library BTF). The freeze pre-pass populates a
-`slot_start → ArenaSlotInfo` range index from each live
-`sdt_alloc` allocator slot — one entry per slot, carrying
-`elem_size`, `header_size`, and the resolved payload type id.
-When a chase lands on a Fwd terminal, the renderer range-looks
-up the slot the chased address falls in and renders the recovered
-payload struct from the slot's payload start (skipping the
-`union sdt_id` header when the chased pointer lands at slot-start
-rather than payload-start). The result carries an `sdt_alloc`
-annotation suffix: `(sdt_alloc)` for the BTF-typed `Type::Ptr`
-arm, or `cast→arena (sdt_alloc)` / `cast→kernel (sdt_alloc)`
-when the chase originated from a cast-analyzer hit.
-
-A parallel cross-BTF Fwd resolution path covers a different
-multi-BTF shape: a `BTF_KIND_FWD` whose body lives in a sibling
-embedded BPF object's BTF rather than an `sdt_alloc` slot — the
-typical scheduler shape where one `.bpf.c` declares
-`struct cgx_target;` (forward) and another defines the body. The
-cast-analysis pre-pass builds a name-keyed index over every
-parsed embedded program BTF (one entry per complete `!is_fwd`
-`Struct` / `Union`; first-write-wins on duplicate names; anonymous
-types skipped). When a chase target survives the local same-BTF
-Fwd resolve as a Fwd, the renderer consults the cross-BTF index
-by name (matching aggregate kind — `struct` vs `union`); a hit
-switches the recursion to the resolved sibling BTF and renders
-the full body. No new annotation is introduced — the recovered
-subtree carries whatever annotation it would have had if the
-struct body lived in the entry BTF.
-
-Runs unconditionally on every scheduler load; no test-author
-configuration. False negatives (a missed cast — renderer falls
-back to raw `u64`, the prior behavior) are acceptable; false
-positives (a misidentified cast) are not, so the analyzer is
-deliberately conservative on conflicting evidence and branch
-joins. See [Monitor → Cast analysis](architecture/monitor.md#cast-analysis).
-
-</details>
-
-<details>
-<summary><b>Unified timeline</b> — correlate scenario phases with scheduler telemetry</summary>
-
-Stimulus events (cgroup ops, cpuset changes, step transitions)
-correlated with monitor samples for per-phase scheduler behavior
-analysis. Each event carries timestamps, operation details, and
-cumulative worker iteration counts.
-
-</details>
-
-<details>
-<summary><b>Periodic capture + temporal assertions</b> — cadenced sampling across the workload window with monotonicity, rate, steady-state, convergence, and ratio patterns</summary>
-
-`#[ktstr_test(num_snapshots = N)]` fires `N` host-side
-`freeze_and_dispatch` boundaries inside the workload's 10 %–90 %
-window, anchored at the first `MSG_TYPE_SCENARIO_START`. Each
-capture is stored on the `SnapshotBridge` under `periodic_NNN`
-along with the parallel scx_stats JSON observed pre-freeze and a
-pause-adjusted elapsed-ms timestamp.
-
-A `post_vm` callback drains the bridge into a `SampleSeries` and
-projects per-sample columns (`SeriesField<T>`) along the BPF or
-stats axis. Seven temporal patterns evaluate the projections:
-
-- `nondecreasing` — counter monotonicity (`v[i] <= v[i+1]`)
-- `strictly_increasing` — strict counter monotonicity (`v[i] < v[i+1]`)
-- `rate_within(lo, hi)` — bounded delta-per-millisecond
-- `steady_within(warmup_ms, tolerance)` — post-warmup mean band
-- `converges_to(target, tolerance, deadline_ms)` — three-consecutive-in-band witness before deadline
-- `always_true` — boolean invariant at every sample
-- `ratio_within(other, lo, hi)` — cross-field correlation between two series
-
-Per-sample projection errors render with the underlying
-`SnapshotError` variant (PlaceholderSample, MissingStats,
-FieldNotFound, TypeMismatch, …) so coverage gaps surface with
-their cause without re-running. See
-[Periodic Capture](writing-tests/periodic-capture.md) and
-[Temporal Assertions](writing-tests/temporal-assertions.md).
-
-</details>
-
-<details>
-<summary><b>Worker comm / nice / pcomm</b> — set <code>task->comm</code>, nice level, and thread-group leader name on every worker</summary>
-
-`CgroupDef::comm("name")` calls `prctl(PR_SET_NAME)` on every
-worker. `CgroupDef::nice(n)` calls `setpriority(PRIO_PROCESS, 0, n)`
-on every worker. `CgroupDef::pcomm("name")` triggers ktstr's
-fork-then-thread spawn path: workers sharing a pcomm value coalesce
-into ONE forked thread-group leader whose `task->group_leader->comm`
-is the pcomm string, with worker threads inside it. Each worker
-thread additionally sets its own `task->comm` via the per-WorkSpec
-`.comm()`. Models real applications like `chrome` (pcomm) hosting
-`ThreadPoolForeg` (per-thread comm). `PipeIo`/`CachePipe` and
-`SignalStorm` work correctly under Fork and Thread clone modes,
-including inside pcomm-coalesced thread groups. See [Tutorial: Step 11](tutorial.md#step-11-name-and-prioritize-workers).
-
-</details>
-
-<details>
-<summary><b>Inline scheduler configs</b> — pass JSON config strings directly into the test, framework writes to guest path</summary>
-
-Schedulers that take a `--config` JSON file (`scx_layered`,
-`scx_lavd`, …) declare the arg template + guest path via
-`Scheduler::config_file_def(arg_template, guest_path)`. Tests
-supply the inline JSON via `#[ktstr_test(config = LAYERED_CONFIG)]`.
-The framework writes the content to a temp file, packs it into the
-initramfs at the guest path, and substitutes `{file}` in the arg
-template before launching the scheduler. A bidirectional pairing
-gate (compile time + runtime) catches mismatched declarations: a
-scheduler with `config_file_def` REQUIRES `config = …` on every
-test, and a scheduler without it REJECTS `config = …`. See
-[Tutorial: Step 12](tutorial.md#step-12-inline-scheduler-config) and
-[The #\[ktstr_test\] Macro](writing-tests/ktstr-test-macro.md#inline-scheduler-config).
-
-</details>
-
-<details>
-<summary><b>no_perf_mode</b> — decouple virtual topology from host hardware for tests with NUMA / LLC counts the host can't satisfy</summary>
-
-`#[ktstr_test(no_perf_mode = true)]` (or `KTSTR_NO_PERF_MODE=1`)
-builds the VM with the declared `numa_nodes` / `llcs` / `cores` /
-`threads` even on smaller hosts. vCPU pinning, hugepages, NUMA
-mbind, RT scheduling, and KVM exit suppression are skipped, and
-gauntlet preset filtering relaxes host-topology checks to the
-single "host has enough total CPUs" inequality. Mutually exclusive
-with `performance_mode = true` (rejected at compile time by the
-`#[ktstr_test]` proc macro; `KtstrTestEntry::validate` provides a
-second-line gate for programmatic-entry construction). See
-[Tutorial: Step 13](tutorial.md#step-13-decouple-virtual-topology-from-host-hardware)
-and [Performance Mode](concepts/performance-mode.md#tier-2-no-perf-mode-with-cpu-cap-reservation).
-
-</details>
-
-<details>
-<summary><b>Statistical regression detection</b> — cross-run analysis across combinatoric test matrices</summary>
-
-Cross-run aggregation computes scheduling
-metrics across runs. Run-to-run compare with dual-gate
-significance thresholds (absolute and relative) catches regressions
-that single-run assertions miss.
-
-**Metrics:**
-- `worst_spread` — CPU time fairness (0.0 = perfect)
-- `worst_gap_ms` — longest scheduling gap
-- `total_migrations` / `worst_migration_ratio` — cross-CPU migration volume
-- `max_imbalance_ratio` — runqueue length imbalance
-- `worst_p99_wake_latency_us` — tail wake-to-run latency
-- `worst_mean_run_delay_us` — workload-thread mean schedstat run delay
-- `total_iterations` — throughput
-- `total_run_delay_ns_per_sched` — system-wide per-schedule mean runqueue-wait
-  delay (duration-invariant; the all-task system-wide analog of
-  `worst_mean_run_delay_us`)
-- `ttwu_local_fraction` — wakeup locality (share of wakeups kept on the waking CPU)
-
-The system-wide schedstat metrics are read host-side from guest memory at
-freeze, so they add zero observer effect. Alongside the gated metrics above,
-the raw schedstat counters (`total_run_delay`, `total_pcount`,
-`total_ttwu_count`, `total_ttwu_local`, `total_sched_count`, `total_yld_count`,
-`total_sched_goidle`) are surfaced as directionless **informational** metrics —
-shown in comparisons for context but never gated (more wakeups or
-context-switches is neither inherently better nor worse). For the full registry,
-run `cargo ktstr stats list-metrics`.
-
-</details>
+Every run writes machine-readable results; cross-run comparison with
+dual-gate significance thresholds (absolute and relative) catches
+regressions single-run assertions miss. Gated metrics include
+`worst_spread`, `worst_gap_ms`, `worst_p99_wake_latency_us`, and the
+duration-invariant `total_run_delay_ns_per_sched`; run
+`cargo ktstr stats list-metrics` for the registry. See
+[Runs and Regression Gates](running-tests/runs.md) and
+[Assertable Metrics](reference/assertable-metrics.md).
 
 ## Debugging
 
-<details>
-<summary><b>Auto-repro</b> — automatically captures function arguments and struct state at crash-path call sites</summary>
+### Failure dumps
 
-On scheduler crash, extracts the crash stack and discovers
-struct_ops callbacks. Attaches BPF kprobes and fentry/fexit probes,
-triggers on `sched_ext_exit`, and reruns the scenario to capture
-function arguments and struct field state at each crash-path call
-site. See [Auto-Repro](running-tests/auto-repro.md).
+A failing test's stderr carries the whole story: the tripped check,
+per-cgroup stats, a phase timeline, the scheduler log, the monitor's
+verdict. On scheduler crash, ktstr also snapshots every BPF map with
+fields rendered by name through BTF — `.bss` globals, arena allocator
+state, typed pointer chases — plus vCPU registers at the instant of
+death:
 
-</details>
+<!-- captured: cargo ktstr test --kernel 7.0 -- --features integration -E 'test(=ktstr/throughput_gate)' | ktstr 0.23.0 | kernel 7.0.14 -->
+<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr test — failure dump excerpt</span></div>
 
-<details>
-<summary><b>Interactive shell</b> — busybox shell inside the VM with host file injection (debugging, not tests — too slow)</summary>
+<pre>--- repro VM failure dump ---
+DualFailureDumpReport: early=absent (max_age never crossed threshold (peak=66j, threshold=2500j)), late=(12 maps, 2 vcpu_regs)
+...
+map bpf_bpf.bss (type=array, value_size=448, max_entries=1)
+<span class="t-yel">.bss:</span>
+  scx_arena_verify_once=true   ktstr_alloc_count=76   nr_dispatched=907
+  nr_enqueued=495              nr_select_cpu=372      stats_magic=6004496034161779060
+...
+  scx_task_allocator scx_allocator:
+...
+    root 0x100000006000 → sdt_desc:
+      nr_free=512
+<span class="t-grn">      chunk 0x100000007000 (sdt_alloc) → ktstr_arena_ctx{}</span>
+...
+<span class="t-b">vcpu_regs:</span>
+  vcpu 0: ip=0xffffffff96347fbf sp=0xffffffff97203e78 ptroot=0x0000000001e85003
+  vcpu 1: ip=0xffffffff9560bdc5 sp=0xff3b18cb8000f778 ptroot=0x0000000001e85003</pre></div>
 
-`ktstr shell` boots a VM with busybox and drops into an interactive
-shell. `--include-files` injects host binaries and libraries with
-automatic shared library resolution.
+The same report is written as a JSON artifact next to the run's stats
+sidecar. See [Reading Failure Output](running-tests/failures.md) and
+[Snapshots](writing-tests/snapshots.md).
 
-</details>
+### Auto-repro
 
-<details>
-<summary><b>--exec mode</b> — run commands inside the VM non-interactively</summary>
+On a scheduler crash, ktstr extracts the crash stack, discovers the
+struct_ops callbacks, and reruns the scenario in a second VM with BPF
+probes attached along the crash path — decoded function arguments and
+struct state at each call site, `→` arrows marking entry-to-exit
+changes:
 
-`ktstr shell --exec "command"` runs a command inside the VM and
-exits.
+<!-- captured: cargo ktstr test (ktstr/bpf_crash_auto_repro_e2e) — prior-run sample preserved from running-tests/auto-repro.md | ktstr 0.23.0 | kernel with the sched_ext_exit tracepoint -->
+```text
+do_enqueue_task                                               kernel/sched/ext.c
+  rq *rq
+    cpu         1
+  task_struct *p
+    pid         97
+    cpus_ptr    0xf(0-3)
+    dsq_id      SCX_DSQ_INVALID          →  SCX_DSQ_LOCAL
+...
+    scx_flags   QUEUED|DEQD_FOR_SLEEP    →  QUEUED
+```
 
-</details>
+On by default; requires a kernel with the `sched_ext_exit` tracepoint.
+See [Auto-Repro](running-tests/auto-repro.md).
+
+### Interactive shell
+
+`ktstr shell` boots a busybox VM and drops you into it.
+`--include-files` injects host binaries with their shared-library
+closure resolved automatically (recursive `DT_NEEDED` discovery);
+`--exec "cmd"` runs one command non-interactively. For debugging, not
+tests. See [ktstr (standalone)](running-tests/ktstr.md).
+
+### ctprof
+
+`ktstr ctprof capture` snapshots per-task and per-cgroup scheduler
+telemetry on the host — no VM involved. Capture before and after a
+change, then `compare` to see which processes scheduled differently:
+
+<!-- captured: ktstr ctprof compare base.ctprof.zst cand.ctprof.zst --limit 24 | ktstr 0.23.0 | host-side, no VM -->
+```text
+## Primary metrics
+ comm                              threads  metric             value                delta      %         %uptime 
+ kworker/{N}:{N}-mm_percpu_wq                                                                                    
+     kworker/{N}:{N}-mm_percpu_wq  11→37    voluntary_csw      8.697K → 101.154K    +92.457K   +1063.1%  93%     
+     kworker/{N}:{N}-mm_percpu_wq  11→37    timeslices         8.699K → 101.166K    +92.467K   +1063.0%  93%     
+     kworker/{N}:{N}-mm_percpu_wq  11→37    wait_time_ns       2.684s → 27.653s     +24.969s   +930.2%   93%     
+...
+```
+
+See [ctprof](reference/ctprof.md).
 
 ## Infrastructure
 
-<details>
-<summary><b>Kernel management</b> — build, cache, and auto-discover kernels from any source</summary>
+### Supported kernels
 
-`ktstr kernel build` builds and caches kernel images from version
-numbers, local source paths, or git URLs. Automatic kernel discovery
-resolves cached images, host kernels, and CI-provided paths without
-manual configuration.
+| Capability | Kernel requirement |
+|---|---|
+| CI-tested series | 6.14 and 7.1, on x86_64 and aarch64, every push |
+| Watchdog-timeout override | 7.1+ via BTF (`scx_sched.watchdog_timeout`); older kernels via the static `scx_watchdog_timeout` symbol |
+| sched_ext event counters | 6.16+ (two BTF layouts); sampling is disabled when neither is present |
+| Auto-repro probe trigger | kernels with the `sched_ext_exit` tracepoint |
 
-</details>
+Outside the CI-tested series, the monitor degrades feature by feature
+rather than failing: tests still run, and unavailable capabilities are
+reported as absent.
 
-<details>
-<summary><b>Performance mode</b> — host-side isolation-ish and topology mirroring for maybe workable results</summary>
+### Kernel management
 
-vCPU pinning, 2MB hugepages with pre-fault allocation, NUMA mbind,
-RT scheduling (SCHED_FIFO), KVM exit suppression (PAUSE + HLT), and
-KVM_HINTS_REALTIME CPUID — isolates the VM from host noise for
-reproducible measurements. Topology mirroring maps the VM's LLC
-structure to match the host's physical layout, so cache-aware
-scheduling decisions in the guest reflect real hardware behavior
-rather than synthetic geometry. Kinda.
-See [Performance Mode](concepts/performance-mode.md).
+`cargo ktstr kernel build` builds and caches kernel images from version
+numbers, local source paths, or git URLs; automatic discovery resolves
+cached images, host kernels, and CI-provided paths, and an optional GHA
+cache backend shares built kernels across CI runs. See
+[cargo ktstr](running-tests/cargo-ktstr.md) and [CI](ci.md).
 
-</details>
+### Performance mode
 
-<details>
-<summary><b>Resource-budget coordination</b> — <code>--cpu-cap N</code> bounds concurrent kernel builds and no-perf-mode VMs per host</summary>
+Performance mode pins vCPUs to reserved host cores, pre-faults 2 MB
+hugepages, runs vCPU threads under SCHED_FIFO, and suppresses PAUSE/HLT
+exits — removing host scheduling noise so a latency spike in the guest
+points at the scheduler under test, not the host. Guest-side jitter from
+shared LLCs and memory bandwidth remains, so compare performance-mode
+runs only against the same host. When the host can't physically satisfy
+a declared topology, `no_perf_mode` builds the VM anyway and skips the
+isolation. See [Performance Mode](concepts/performance-mode.md).
 
-`--cpu-cap N` (or `KTSTR_CPU_CAP=N`) constrains a no-perf-mode VM or
-kernel build to exactly `N` host CPUs, selected by walking whole LLCs
-in NUMA-aware, consolidation-aware order (filtered to the calling
-process's sched_getaffinity cpuset), and partial-taking the last LLC
-so `plan.cpus.len() == N`. The full LLC is still flocked for
-per-LLC coordination with concurrent ktstr peers. When the flag is
-absent, the planner defaults to 30% of the allowed-CPU set (minimum
-1). The plan writes the reserved CPUs and NUMA nodes into a cgroup
-v2 cpuset sandbox so `make -jN` gcc fan-out and vCPU soft-mask
-affinity respect the budget. On `shell`, mutually exclusive with
-`performance_mode=true` (clap parse rejection); library consumers
-see the env var silently ignored under perf-mode. Mutually exclusive
-with `KTSTR_BYPASS_LLC_LOCKS=1` at every entry point (contract vs.
-bypass conflict rejected at CLI parse plus the library and
-kernel-build-pipeline sites). `ktstr locks` / `ktstr locks --json`
-enumerates every held LLC + per-CPU + cache-entry flock on the host
-with holder PID + cmdline for contention diagnosis. See
-[Resource Budget](concepts/resource-budget.md).
+### Resource-budget coordination
 
-</details>
+`--cpu-cap N` confines kernel builds and no-perf-mode VMs to `N` host
+CPUs, reserved whole-LLC-at-a-time and coordinated between concurrent
+ktstr processes through per-LLC locks — so a kernel build and a
+performance run can share a box without trampling each other.
+`ktstr locks` lists every held lock with its holder. See
+[Resource Budget](concepts/resource-budget.md) and
+[ktstr (standalone)](running-tests/ktstr.md).
 
-<details>
-<summary><b>Guest coverage</b> — profraw collection from inside the VM, merged with host coverage</summary>
+### Change-scoped selection
 
-Guest-side profraw collection via shared memory. The host merges
-guest and host coverage for unified `cargo llvm-cov` reports.
+`cargo ktstr affected` attributes a `base..HEAD` diff to the schedulers
+it touches and emits a JSON array ready for a GitHub Actions dynamic
+matrix — one job per affected scheduler instead of the whole fleet.
+`--relevant` applies the same attribution to the local working tree for
+a fast inner loop. Any uncertainty widens to "run all": silently
+skipping an affected scheduler is the worst outcome. See [CI](ci.md).
 
-</details>
+### Guest coverage
 
-<details>
-<summary><b>cargo-ktstr</b> — cargo subcommand for the full workflow, more introspection less shell scripts</summary>
-
-Wraps `cargo nextest run` with automatic kernel resolution.
-Subcommands (in `--help` order): `test`, `coverage`, `llvm-cov`,
-`stats`, `replay`, `perf-delta`, `kernel`, `verifier`,
-`completions`, `show-host`, `show-thresholds`, `affected`,
-`export`, `locks`, `shell`.
-See [`cargo-ktstr`](running-tests/cargo-ktstr.md).
-
-</details>
-
-<details>
-<summary><b>Change-scoped selection</b> — <code>affected</code> emits a CI matrix of only the schedulers a diff touches; <code>--relevant</code> narrows a local run to only the affected tests</summary>
-
-`cargo ktstr affected` (run inside a scheduler repo) attributes the
-`base..HEAD` diff to declared schedulers and prints the affected
-scheduler package names as a flat JSON array — a GitHub Actions dynamic
-matrix (`strategy.matrix.scheduler: ${{ fromJSON(...) }}`) then spawns
-one job per affected scheduler instead of the whole fleet. Attribution
-unions two layers: the cargo dependency closure (a changed Rust file →
-its owning crate → every scheduler that depends on it) and, only when a
-native (C/BPF) or unattributable path changed, each scheduler's cargo
-`.d` dep-info (built once to read the exact BPF/header/skeleton input
-set, including cross-scheduler text-includes and shared headers). Every
-uncertainty widens to "run all" (a false negative — silently skipping an
-affected scheduler — is the worst outcome); a strictly docs-only change
-emits `[]`.
-
-`cargo ktstr test --relevant` (and `coverage --relevant`, `perf-delta
---relevant`) applies the same attribution to the LOCAL working tree
-(committed `base..HEAD` UNIONed with uncommitted + untracked edits) and
-narrows the run to only the tests whose scheduler the change touched —
-the fast inner-loop counterpart to the CI matrix. See
-[`cargo-ktstr`](running-tests/cargo-ktstr.md#affected).
-
-</details>
-
-<details>
-<summary><b>Remote kernel cache</b> — GHA cache backend for cross-run kernel sharing</summary>
-
-GHA cache backend for CI kernel sharing. When `KTSTR_GHA_CACHE=1`
-and `ACTIONS_CACHE_URL` are set, all cache lookups check the remote
-after a local miss before falling back to download (for versions) or
-erroring (for cache keys). All successful builds are pushed to the
-remote automatically. Non-fatal on failure; local cache is
-authoritative.
-
-</details>
-
-<details>
-<summary><b>Real-kernel verifier analysis</b> — boots the kernel, loads the scheduler, reads actual verified instruction counts</summary>
-
-Runs the BPF verifier against every `declare_scheduler!`-registered
-scheduler's struct_ops programs inside a real kernel. Reports
-per-program verified instruction counts with cycle collapse —
-deduplicating repeated verifier paths to show true unique cost.
-The sweep emits one nextest cell per (declared scheduler ×
-kernel-list entry × accepted topology preset) tuple, with
-parallelism and retries handled natively by nextest.
-
-Reads `bpf_prog_aux.verified_insns` from guest memory after loading
-the scheduler via struct_ops — the same path production uses.
-Captures real-world verification costs including map sharing, BTF
-resolution, and program composition.
-See [Verifier](running-tests/verifier.md).
-
-</details>
-
-<details>
-<summary><b>Host-guest signaling</b> — bidirectional host/VM coordination built into the test library</summary>
-
-SHM signal slots enable the host and guest to coordinate without
-a network stack, serial protocol, or guest-side daemon. Graceful
-shutdown, readiness gates, and BPF map write triggers flow through
-shared memory mapped into both address spaces.
-
-</details>
-
-<details>
-<summary><b>High test coverage</b> — broad self-coverage of the framework itself <a href="https://codecov.io/gh/likewhatevs/ktstr"><img src="https://codecov.io/gh/likewhatevs/ktstr/graph/badge.svg?token=E7GRAO2KZM" alt="codecov"></a></summary>
-
-</details>
+Profraw data is collected inside the VM over shared memory and merged
+with host coverage, so guest-side code paths count toward the same
+`cargo llvm-cov` report as host-side ones.
 
 ---
 
-See [Getting Started](getting-started.md) to set up your first test,
-or browse the [Recipes](recipes.md) for common workflows.
+Ready to try it? [Getting Started](getting-started.md) sets up your
+first test; the [Recipes](recipes.md) cover complete workflows.

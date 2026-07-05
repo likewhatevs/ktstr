@@ -1,263 +1,381 @@
-# The #\[ktstr_test\] Macro
+# The #\[ktstr_test\] Attribute
 
-`#[ktstr_test]` registers a function as an integration test that runs
-inside a VM.
+`#[ktstr_test]` registers a function as an integration test that
+boots a VM with a declared topology and runs the function body inside
+it. This page is the attribute reference.
 
-## Basic usage
+Most tests need only a handful of attributes: a scheduler, a
+topology dimension or two, a duration, and the checking thresholds
+the test is actually about.
 
 ```rust,ignore
 use ktstr::prelude::*;
 
-#[ktstr_test(llcs = 2, cores = 4, threads = 2)]
-fn my_test(ctx: &Ctx) -> Result<AssertResult> {
-    // ctx provides cgroup manager, topology, duration, etc.
-    Ok(AssertResult::pass())
-}
-```
-
-When a scheduler with a default topology is specified, the topology
-can be omitted:
-
-```rust,ignore
-use ktstr::declare_scheduler;
-
 declare_scheduler!(MY_SCHED, {
     name = "my_sched",
     binary = "scx_my_sched",
-    //          numa, llcs, cores/llc, threads/core
-    topology = (1,    2,    4,         1),
+    topology = (1, 2, 4, 1),
 });
 
-#[ktstr_test(scheduler = MY_SCHED)]
-fn inherited_topo(ctx: &Ctx) -> Result<AssertResult> {
-    // Inherits 1n2l4c1t from MY_SCHED
-    Ok(AssertResult::pass())
+#[ktstr_test(
+    scheduler = MY_SCHED,   // scheduler under test (default: kernel EEVDF)
+    threads = 2,            // override one dimension; the rest inherit
+    duration_s = 10,        // workload window (default 12 s)
+    not_starved = true,     // enable starvation / spread / gap checks
+    max_spread_pct = 20.0,  // tighten the fairness-spread threshold
+)]
+fn smt_fairness(ctx: &Ctx) -> Result<AssertResult> {
+    execute_defs(ctx, vec![ctx.cgroup_def("cg_a"), ctx.cgroup_def("cg_b")])
 }
 ```
 
-`declare_scheduler!` emits a `pub static MY_SCHED: Scheduler` and
-registers a private linkme static in the `KTSTR_SCHEDULERS`
-distributed slice. The `scheduler =` slot expects
-`&'static Scheduler` — pass the bare `MY_SCHED` ident; the macro
-takes a reference internally.
+The function signature is
+`fn(&Ctx) -> anyhow::Result<AssertResult>`. `scheduler =` expects the
+bare const emitted by `declare_scheduler!` — see
+[Scheduler Definitions](scheduler-definitions.md).
 
-The function must have signature
-`fn(&ktstr::scenario::Ctx) -> anyhow::Result<ktstr::assert::AssertResult>`.
+## Attribute forms
 
-## What the macro generates
+All attributes are optional, with defaults, and most take
+`key = value`. The sixteen bool attributes (`auto_repro`,
+`expect_auto_repro`, `not_starved`, `isolation`, `performance_mode`,
+`pci`, `no_perf_mode`, `requires_smt`, `expect_err`,
+`survives_storm`, `allow_inconclusive`, `fail_on_stall`, `host_only`,
+`ignore`, `kaslr`, `wprof`) also accept a bare form as shorthand for
+`= true` — `#[ktstr_test(host_only)]` equals
+`#[ktstr_test(host_only = true)]`. `auto_repro` and `kaslr` default
+to `true`, so their meaningful spelling is `auto_repro = false` /
+`kaslr = false`; the other fourteen default to `false` (or unset).
 
-1. Renames the function to `__ktstr_inner_{name}`.
-2. Registers it in the `KTSTR_TESTS` distributed slice via linkme.
-3. Emits a `#[test]` wrapper that calls `run_ktstr_test()`.
+Each attribute key may appear at most once per invocation; a
+duplicate key fails at macro expansion rather than silently letting
+the later value win.
 
-The `#[test]` wrapper boots a VM with the specified topology and runs
-the function inside it.
-
-## Attributes
-
-All attributes are optional with defaults. Most take `key = value`;
-the sixteen bool attributes (`auto_repro`, `expect_auto_repro`,
-`not_starved`, `isolation`, `performance_mode`, `pci`, `no_perf_mode`,
-`requires_smt`, `expect_err`, `survives_storm`, `allow_inconclusive`,
-`fail_on_stall`, `host_only`, `ignore`, `kaslr`, `wprof`) also accept a
-bare form as shorthand for `= true` — `#[ktstr_test(host_only)]` is equivalent to
-`#[ktstr_test(host_only = true)]`. `auto_repro` and `kaslr` default to
-`true`, so bare `auto_repro` / `kaslr` is a no-op; use
-`auto_repro = false` / `kaslr = false` to disable. The other fourteen
-default to `false` (or `None`), so the bare form is the meaningful
-shorthand for those.
-
-### Topology
+## Topology
 
 | Attribute | Default | Description |
 |---|---|---|
-| `llcs` | inherited | Number of LLCs |
-| `numa_nodes` | inherited | Number of NUMA nodes |
+| `numa_nodes` | inherited | NUMA nodes |
+| `llcs` | inherited | Total LLCs (not per node) |
 | `cores` | inherited | Cores per LLC |
 | `threads` | inherited | Threads per core |
-| `memory_mib` | 2048 | VM memory in MiB (minimum; see scaling below) |
+| `memory_mib` | 2048 | VM memory floor in MiB (see below) |
 
 Each dimension independently inherits from `Scheduler.topology` when
-a `scheduler` is specified and that dimension is not explicitly set.
-Without a scheduler, unset dimensions use macro defaults (numa_nodes=1,
-llcs=1, cores=2, threads=1). The default is a single-NUMA topology,
-so most tests do not need to set `numa_nodes`. See
-[Default topology](scheduler-definitions.md#default-topology).
+a `scheduler` is specified and that dimension is not set. Without a
+scheduler, unset dimensions use the macro defaults (`numa_nodes = 1`,
+`llcs = 1`, `cores = 2`, `threads = 1`). See
+[Topology](../concepts/topology.md) for the notation and what the
+guest actually gets.
 
-### Memory scaling
+### Memory
 
-`memory_mib` is one of three floors; the framework picks
-`max(total_cpus * 64, 256, memory_mib)` MiB at VM-launch time. For
-tests with more than 32 vCPUs the cpu-based floor (`total_cpus *
-64`) dominates the default `memory_mib = 2048`, so a 126-vCPU test
-allocates 8064 MiB regardless. Below ~4 vCPUs the absolute 256-MiB
-floor wins if `memory_mib` is also below it. Setting `memory_mib`
-above the cpu-based floor is only meaningful when the test needs
-more headroom than the per-cpu budget. The unit is binary
-mebibytes; the conversion at VM-launch is `value << 20` bytes,
-not `value * 1_000_000`.
+`memory_mib` is one of three floors: the framework allocates
+`max(total_cpus * 64, 256, memory_mib)` MiB at VM launch. Above 32
+vCPUs the CPU-based floor dominates the default 2048, so a 126-vCPU
+test gets 8064 MiB regardless. Raise `memory_mib` only when the test
+needs more headroom than the per-CPU budget provides.
 
-### Boot timing
-
-The host VM timeout adds vCPU-scaled boot headroom to the test's
-`watchdog_timeout`/`duration` base, and the guest's send-sys-rdy
-retry budget scales the same way: `min(90s, 10s + vcpus * 150ms)`.
-A 126-vCPU test gets 28.9 s for the virtio-console multiport
-handshake; tests are not expected to override either knob.
-
-### Scheduler
+## Timing
 
 | Attribute | Default | Description |
 |---|---|---|
-| `scheduler = CONST` | `&Scheduler::EEVDF` | Rust const path to a `&'static Scheduler`. The bare const emitted by `declare_scheduler!` (e.g. `MY_SCHED`) is the expected form. The default `Scheduler::EEVDF` runs tests under the kernel's default scheduler (EEVDF on Linux 6.6+) so tests without an explicit `scheduler =` run under the kernel default. |
-| `extra_sched_args = [...]` | `[]` | Extra CLI args for the scheduler, appended after `Scheduler::sched_args`. |
-| `watchdog_timeout_s` | 5 | scx watchdog override (seconds). Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels (BTF-detected) and via the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override logs a `tracing::warn!` and continues without overriding. |
+| `duration_s` | 12 | Workload window in seconds (`ctx.duration`) |
+| `watchdog_timeout_s` | 5 | sched_ext watchdog override in seconds |
 
-### Payloads
+The watchdog override is applied via `scx_sched.watchdog_timeout` on
+7.1+ kernels and via the static `scx_watchdog_timeout` symbol on
+earlier kernels; when neither path is available the override logs a
+warning and the kernel default stands.
+
+## Checking thresholds {#checking}
+
+Checking attributes override the merged check set
+(library defaults → scheduler-level `assert` → per-test attributes).
+[Checking](../concepts/checking.md) explains the two evaluation
+channels; [Customize Checking](../recipes/custom-checking.md) owns
+the merge rules and worked overrides. Everything here is inherited
+when unset.
+
+Worker checks — evaluated from per-worker telemetry after the
+scenario:
+
+| Attribute | Unit | Example | Fails when |
+|---|---|---|---|
+| `not_starved` | bool | `not_starved = true` | any worker finishes with zero work units; also enables the spread and gap checks |
+| `isolation` | bool | `isolation = true` | a worker ran on a CPU outside its cgroup's cpuset |
+| `max_gap_ms` | ms | `max_gap_ms = 500` | a worker's longest scheduling gap exceeds the cap |
+| `max_spread_pct` | percentage points | `max_spread_pct = 20.0` | max−min worker off-CPU% exceeds the cap |
+| `max_throughput_cv` | coefficient of variation | `max_throughput_cv = 0.35` | per-worker throughput CV exceeds the cap |
+| `min_work_rate` | work units / CPU-second | `min_work_rate = 1000.0` | a worker's work rate falls below the floor |
+| `min_iteration_rate` | iterations / second | `min_iteration_rate = 50000.0` | a worker's wall-clock iteration rate falls below the floor |
+| `max_migration_ratio` | migrations / iteration | `max_migration_ratio = 0.5` | a cgroup's migration ratio exceeds the cap |
+| `max_p99_wake_latency_ns` | ns | `max_p99_wake_latency_ns = 2000000` | p99 wake latency exceeds the cap |
+| `max_wake_latency_cv` | coefficient of variation | `max_wake_latency_cv = 1.0` | wake-latency CV exceeds the cap |
+| `min_page_locality` | fraction 0.0–1.0 | `min_page_locality = 0.9` | fraction of pages on expected NUMA nodes falls below the floor |
+| `max_cross_node_migration_ratio` | fraction 0.0–1.0 | `max_cross_node_migration_ratio = 0.1` | NUMA-migrated pages / total pages exceeds the cap |
+| `max_slow_tier_ratio` | fraction 0.0–1.0 | `max_slow_tier_ratio = 0.05` | pages on memory-only (CXL) nodes exceed the cap |
+
+Monitor thresholds — evaluated from the host monitor's samples of
+guest scheduler state:
+
+| Attribute | Unit | Example | Fails when |
+|---|---|---|---|
+| `max_imbalance_ratio` | ratio | `max_imbalance_ratio = 2.0` | observed run-queue imbalance exceeds the cap |
+| `max_local_dsq_depth` | tasks | `max_local_dsq_depth = 8` | a local DSQ grows deeper than the cap |
+| `fail_on_stall` | bool | `fail_on_stall` | the monitor's stall detection fails the test instead of reporting |
+| `sustained_samples` | samples | `sustained_samples = 3` | window size a violation must persist for before it counts |
+| `max_fallback_rate` | events/s | `max_fallback_rate = 5.0` | fallback-dispatch event rate exceeds the cap |
+| `max_keep_last_rate` | events/s | `max_keep_last_rate = 100.0` | keep-last event rate exceeds the cap |
+
+### What a failing gate looks like
+
+A deliberately unreachable floor, to show the output shape — 50M
+iterations/s is far beyond what two workers deliver:
+
+```rust,ignore
+declare_scheduler!(MY_SCHED, { name = "my_sched", binary = "scx-ktstr" });
+
+#[ktstr_test(scheduler = MY_SCHED, llcs = 1, cores = 2, threads = 1, duration_s = 5)]
+fn throughput_gate(ctx: &Ctx) -> Result<AssertResult> {
+    let checks = Assert::default_checks().min_iteration_rate(50_000_000.0);
+    let steps = vec![Step {
+        setup: vec![ctx.cgroup_def("cg_a"), ctx.cgroup_def("cg_b")].into(),
+        ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
+    execute_steps_with(ctx, steps, Some(&checks))
+}
+```
+
+<!-- captured: cargo ktstr test --kernel 7.0 -- -E 'test(throughput_gate)' | ktstr 0.23.0 | kernel 7.0.14 -->
+<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr test --kernel 7.0 -- -E 'test(throughput_gate)'</span></div>
+
+<pre>  TRY 1 FAIL [  31.810s] (───) ktstr::docs_demo ktstr/throughput_gate
+  stderr ───
+...
+    <span class="t-b">ktstr_test 'throughput_gate' [sched=scx-ktstr] [topo=1n1l2c1t] failed:</span>
+      <span class="t-red">worker 71 iteration rate 41903.3/s below floor 50000000.0/s</span>
+      <span class="t-red">worker 73 iteration rate 37834.5/s below floor 50000000.0/s</span>
+
+    --- stats ---
+    2 workers, 4 cpus, 2 migrations, worst_spread=0.0%, worst_gap=21ms
+      cg0: workers=1 cpus=2 spread=0.0% gap=10ms migrations=1 iter=209600
+      cg1: workers=1 cpus=2 spread=0.0% gap=21ms migrations=1 iter=189252
+...
+    --- monitor ---
+    samples=41 max_imbalance=2.00 max_dsq_depth=0 stuck=0
+    avg: imbalance=1.32 nr_running/cpu=1.2 dsq/cpu=0.0
+    events: fallback=0 (0.0/s) keep_last=210 (52.5/s) offline=0
+...
+    <span class="t-dim">verdict: monitor OK</span></pre></div>
+
+The failure names the worker, the measured value, and the threshold
+it crossed; the stats and monitor sections that follow are the
+context for deciding whether the threshold or the scheduler is
+wrong. [Reading Failure Output](../running-tests/failures.md) walks
+the full transcript.
+
+### Expected-error matchers
+
+Two attributes narrow which failure counts as the expected bug in an
+`expect_err = true` reproducer test (both require `expect_err`; both
+may be set, composing with AND semantics):
+
+- `expect_scx_bpf_error_contains = "literal"` — the captured
+  `scx_bpf_error` text must contain the literal substring. Empty
+  strings panic at construction.
+- `expect_scx_bpf_error_matches = "regex"` — the text must match the
+  regex. Empty patterns, invalid syntax, and any pattern that
+  matches the empty string (`a?`, `.*`, `^$`) panic at construction,
+  so a vacuous matcher can never silently pass. `^`/`$` anchor to
+  the whole string by default (use `(?m)` for line anchors), and a
+  bare `\b` slips the vacuity gate — prefer a substring.
+
+See [Investigate a Crash](../recipes/investigate-crash.md) for the
+pin-an-error-as-a-regression-test workflow these serve.
+
+## Topology constraints {#topology-constraints}
+
+These filter which gauntlet presets a test expands into; the base
+`ktstr/` variant is unaffected.
 
 | Attribute | Default | Description |
 |---|---|---|
-| `payload = CONST` | `None` | Rust const path to a binary-kind `Payload` (`PayloadKind::Binary`). Populates `KtstrTestEntry::payload`; the test body can run it via `ctx.payload(&CONST)`. Scheduler-kind payloads are rejected at run time by `KtstrTestEntry::validate` (the macro sees only a path and cannot read the const's kind at expand time) — use the `scheduler = …` slot for those. |
-| `workloads = [CONST, …]` | `[]` | Array of binary-kind `Payload` const paths composed alongside the primary `payload`. Each entry is runnable from the test body via `ctx.payload(&CONST)`; the include-file pipeline packages every referenced binary into the guest automatically. |
-| `extra_include_files = ["path", …]` | `[]` | Array of string-literal paths to extra host-side files (datasets, fixture configs, helper scripts) that the framework packages into the guest initramfs alongside the binaries declared by `scheduler` / `payload` / `workloads`. Maps onto `KtstrTestEntry::extra_include_files` (`&'static [&'static str]`); union with per-payload `Payload::include_files` is computed at run time via `KtstrTestEntry::all_include_files`. Use this slot for test-level dependencies that don't belong on a specific `Payload`. |
+| `min_llcs` / `max_llcs` | 1 / 12 | LLC-count bounds |
+| `min_numa_nodes` / `max_numa_nodes` | 1 / 1 | NUMA-node bounds — multi-NUMA presets are opt-in |
+| `min_cpus` / `max_cpus` | 1 / 192 | Total-CPU bounds |
+| `requires_smt` | `false` | Only SMT (threads > 1) presets; skips the test entirely on aarch64, which ships no SMT presets |
 
-See [Payload Definitions](scheduler-definitions.md#derive-payload) for
-authoring new `Payload` fixtures; `tests/common/fixtures.rs` carries
-reusable examples (`FIO`, `FIO_JSON`, `STRESS_NG`, `SCHBENCH_JSON`).
+The gauntlet skips presets that fail any bound. See
+[Gauntlet](../running-tests/gauntlet.md) for the preset table,
+filtering rules, and a worked expansion.
 
-### Checking
+## Execution attributes {#execution}
 
-| Attribute | Default | Description |
-|---|---|---|
-| `not_starved` | inherited | Enable starvation (zero work units), fairness spread, and scheduling gap checks |
-| `isolation` | inherited | Enable cpuset isolation check (workers must stay on assigned CPUs) |
-| `max_gap_ms` | inherited | Max scheduling gap threshold |
-| `max_spread_pct` | inherited | Max fairness spread threshold |
-| `max_throughput_cv` | inherited | Max coefficient of variation for worker throughput |
-| `min_work_rate` | inherited | Minimum work_units per CPU-second per worker |
-| `max_imbalance_ratio` | inherited | Monitor imbalance ratio |
-| `max_local_dsq_depth` | inherited | Monitor DSQ depth |
-| `fail_on_stall` | inherited | Fail on stall detection |
-| `sustained_samples` | inherited | Sample window for sustained violations |
-| `max_fallback_rate` | inherited | Max fallback event rate |
-| `max_keep_last_rate` | inherited | Max keep-last event rate |
-| `max_p99_wake_latency_ns` | inherited | Max p99 wake latency in nanoseconds |
-| `max_wake_latency_cv` | inherited | Max wake latency coefficient of variation |
-| `min_iteration_rate` | inherited | Minimum iterations per wall-clock second per worker |
-| `max_migration_ratio` | inherited | Max migration ratio (migrations/iterations) per cgroup |
-| `min_page_locality` | inherited | Min fraction of pages on expected NUMA nodes (0.0-1.0) |
-| `max_cross_node_migration_ratio` | inherited | Max ratio of NUMA-migrated pages to total pages (0.0-1.0) |
-| `max_slow_tier_ratio` | inherited | Max fraction of pages on memory-only (CXL) nodes (0.0-1.0) |
-| `expect_scx_bpf_error_contains = "literal"` | `None` | Reproducer-mode literal-substring matcher for the captured scx_bpf_error text. Requires `expect_err = true`. Empty strings panic at construction. Composes with `expect_scx_bpf_error_matches` via AND semantics. See [Pin a known error as a regression test](../recipes/investigate-crash.md#pin-a-known-error-as-a-regression-test). |
-| `expect_scx_bpf_error_matches = "regex"` | `None` | Reproducer-mode regex matcher for the captured scx_bpf_error text. Requires `expect_err = true`. Empty patterns, invalid regex syntax, and any pattern satisfying `is_match("")` panic at construction — the predicate catches both pass-vacuously patterns (`a?`, `.*`, `(?:)`) and the fail-vacuously empty-anchor case (`^$`) with one check. Bare `\b` slips the gate (no word characters in `""`); use a substring instead. Regex anchors `^`/`$` default to STRING boundaries (not line); `.` excludes `\n`. Opt into line-level anchoring with `(?m)` and newline-spanning `.` with `(?s)`. Composes with `expect_scx_bpf_error_contains` via AND semantics. See [Pin a known error as a regression test](../recipes/investigate-crash.md#pin-a-known-error-as-a-regression-test). |
+### `auto_repro` / `expect_auto_repro`
 
-`not_starved = true` enables three distinct checks: starvation (any
-worker with zero work units), fairness spread (max-min off-CPU% below
-`max_spread_pct`), and scheduling gaps (longest gap below `max_gap_ms`).
-Each threshold can be overridden independently. See
-[Customize Checking](../recipes/custom-checking.md) for
-override examples and [Checking](../concepts/checking.md) for
-the merge chain.
+On scheduler crash, `auto_repro` (default `true`) boots a second VM
+with probes attached to capture the state on the way to the crash —
+see [Auto-Repro](../running-tests/auto-repro.md). Set
+`auto_repro = false` for faster iteration; `expect_err = true` also
+disables it. `expect_auto_repro = true` inverts the assertion: the
+test fails unless the auto-repro path actually fired (used to pin
+the repro machinery itself). It requires a scheduler and `wprof`,
+and is rejected alongside `auto_repro = false`, `expect_err`, or
+`host_only`.
 
-### Topology constraints
+### `expect_err` / `survives_storm` / `allow_inconclusive`
 
-| Attribute | Default | Description |
-|---|---|---|
-| `min_llcs` | 1 | Minimum LLCs for gauntlet topology filtering |
-| `max_llcs` | 12 | Maximum LLCs for gauntlet topology filtering |
-| `min_cpus` | 1 | Minimum total CPU count for gauntlet topology filtering |
-| `max_cpus` | 192 | Maximum total CPU count for gauntlet topology filtering |
-| `min_numa_nodes` | 1 | Minimum NUMA nodes for gauntlet topology filtering |
-| `max_numa_nodes` | 1 | Maximum NUMA nodes for gauntlet topology filtering |
-| `requires_smt` | `false` | Require SMT (threads > 1) topologies. On aarch64 the gauntlet ships only non-SMT presets, so any test with `requires_smt = true` is skipped entirely on that arch. |
+`expect_err = true` asserts the run returns `Err` — the negative
+test: a scheduler crash or scenario failure is the expected outcome,
+and a clean pass fails the test. `survives_storm = true` is the
+positive inverse: the scx scheduler must stay attached and alive
+through every hold; a death or ejection fails with a
+survival-specific explainer. It requires a scheduler and is mutually
+exclusive with `expect_err` and `expect_auto_repro`.
+`allow_inconclusive = true` lets an Inconclusive verdict pass
+instead of exiting 2 — see
+[Checking](../concepts/checking.md) for when Inconclusive arises.
 
-The gauntlet skips presets that do not satisfy these constraints.
-Multi-NUMA presets are excluded by default (`max_numa_nodes = 1`).
-See [Gauntlet](../running-tests/gauntlet.md#constraint-filtering)
-for filtering rules and
-[Gauntlet Tests](gauntlet-tests.md#worked-example) for a worked
-example.
+### `performance_mode` / `no_perf_mode` / `cpu_budget`
 
-### Execution
+`performance_mode = true` pins vCPUs to reserved host cores with
+hugepages, NUMA binding, and RT scheduling, for runs whose numbers
+must be comparable — see
+[Performance Mode](../concepts/performance-mode.md).
+`no_perf_mode = true` goes the other way: build the VM with the
+declared topology even on a smaller host, skipping all pinning.
+The two are mutually exclusive (rejected at compile time).
+`cpu_budget = N` overrides the auto-derived host-CPU mask size in
+no-perf mode (must be > 0, requires `no_perf_mode`; an explicit
+`--cpu-cap` / `KTSTR_CPU_CAP` still wins) — see
+[Resource Budget](../concepts/resource-budget.md).
 
-| Attribute | Default | Description |
-|---|---|---|
-| `auto_repro` | `true` | On scheduler crash, boot a second VM with probes attached. Set to `false` for fast iteration. |
-| `expect_auto_repro` | `false` | Assert that auto-repro actually ran on a scheduler crash (pins that the auto-repro path itself works). |
-| `kaslr` | `true` | Boot the guest kernel with KASLR enabled (`CONFIG_RANDOMIZE_BASE=y` + `CONFIG_RANDOMIZE_MEMORY=y`, no `nokaslr` karg). Set to `false` to opt out per-test — appends `nokaslr` to the kernel command line. Scheduler-wide opt-out is available via `Scheduler::kargs(&["nokaslr"])`. |
-| `performance_mode` | `false` | Pin vCPUs to host cores, hugepages, NUMA mbind, RT scheduling, LLC exclusivity validation |
-| `pci` | `false` | Expose the virtio-PCI transport: a host bridge at `00:00.0` plus the PCI ECAM/CAM config-access windows. When `false`, no PCI host bridge is exposed and the guest cmdline carries `pci=off`. On x86_64, attaching a `disk` or `networks` device auto-enables this (virtio-blk / virtio-net are virtio-PCI functions there), so the attribute is only needed to force the bridge on without a device. |
-| `no_perf_mode` | `false` | Decouple the virtual topology from host hardware: build the VM with the declared `numa_nodes` / `llcs` / `cores` / `threads` even on smaller hosts; skip vCPU pinning, hugepages, NUMA mbind, RT scheduling, and KVM exit suppression; relax gauntlet preset filtering to the single "host has enough total CPUs" check. Mutually exclusive with `performance_mode = true` (rejected at compile time by the `#[ktstr_test]` proc macro; `KtstrTestEntry::validate` provides a second-line gate for programmatic-entry construction). Equivalent to setting `KTSTR_NO_PERF_MODE=1` per-test — either source forces the no-perf path. See [Performance Mode](../concepts/performance-mode.md#tier-2-no-perf-mode-with-cpu-cap-reservation). |
-| `duration_s` | 2 | Per-scenario duration in seconds |
-| `cpu_budget = N` | `None` | Explicit host-CPU mask size for no-perf mode (must be > 0); overrides the auto-derived budget. An explicit `--cpu-cap` / `KTSTR_CPU_CAP` still takes precedence. |
-| `expect_err` | `false` | Test expects `run_ktstr_test` to return `Err`; disables auto-repro |
-| `survives_storm` | `false` | Assert the scx scheduler SURVIVES the run (does not die or get ejected during any hold) — the positive inverse of `expect_err`. Requires an active scheduler; mutually exclusive with `expect_err` and `expect_auto_repro` (rejected at compile time and by `KtstrTestEntry::validate`). Enforced on scenarios driven through `execute_defs` / `execute_steps` / `execute_scenario` (which run the liveness probe); a survival violation surfaces as EXIT_FAIL with a survival-specific explainer. |
-| `allow_inconclusive` | `false` | Permit an Inconclusive verdict to pass instead of failing the test (routes the per-test exit code from `2` to `0`). `expect_err` still dominates. |
-| `bpf_map_write = CONST` (or `[A, B]`) | empty | Rust const path to a `BpfMapWrite`, or a `[A, B]` array of them; host writes each value to a BPF map after the scheduler loads. The entry field is a slice and the macro borrows each declared path into it (one path yields a one-element slice). |
-| `watch_bpf_maps = CONST` (or `[A, B]`) | empty | Rust const path to a `WatchBpfMap`, or a `[A, B]` array of them; the entry field is a slice and the macro borrows each declared path into it (one path yields a one-element slice). The free-running host monitor reads each named scheduler BPF-map field observer-effect-free into a run-level metric. Read it back with `result.run_metric("<scheduler-obj>_<label>")` (scalar) or `"<scheduler-obj>_<label>_{avg,max}"` (per-CPU). See [Watching scheduler BPF-map fields](#watching-scheduler-bpf-map-fields). |
-| `perf_delta_assertions = CONST` (or `[A, B]`) | empty | Rust const path to a `PerfDeltaAssertion`, or a `[A, B]` array of them; the entry field is a slice and the macro borrows each declared path into it. A per-test perf-regression gate that overrides one metric's confident-regression gate (relative / absolute threshold, direction, phase scope). Inert in a normal `cargo ktstr test` run — enforced ONLY under `cargo ktstr perf-delta --noise-adjust`. Requires `performance_mode` (rejected at compile time otherwise). See [Assertable Metrics](../reference/assertable-metrics.md#perfdeltaassertion-how-to). |
-| `host_only` | `false` | Run the test function directly on the host instead of inside a VM. Use for tests that need host tools (e.g. cargo, nested VMs) unavailable in the guest initramfs. |
-| `disk = CONST` | `None` | Rust const path to a `const DiskConfig`; attaches a virtio-blk device whose backing the framework owns (a tempfile for `Raw`, a FICLONE-cloned template for `Btrfs`). Construct via `DiskConfig::DEFAULT` chained setters (e.g. `.with_name("data")`). Mutually exclusive with `host_only = true`. |
-| `networks = [CONST, …]` | `[]` | Array of `const NetConfig` const paths; each attaches a virtio-net device. Construct via `NetConfig::DEFAULT` chained setters. On x86_64 each NIC is a virtio-PCI function (slots `1..=N`); aarch64 supports at most one. |
-| `wprof = bool` | `false` | Attach the wprof BPF tracer to the workload VM. Requires the `wprof` cargo feature. |
-| `wprof_args = "..."` | `None` | Space-separated wprof CLI args. Requires `wprof = true` and the `wprof` cargo feature. |
-| `staged_schedulers = [PATH, ...]` | `[]` | Additional `&'static Scheduler` consts staged into the VM alongside the primary `scheduler`. Required for tests that invoke `Op::ReplaceScheduler` / `Op::AttachScheduler` — the framework packs every binary into the guest at boot so a runtime swap has its target on disk. |
-| `workload_root_cgroup = "/path"` | `None` | Guest cgroup path under which the framework creates per-test workload cgroups. Decoupled from the scheduler's `cgroup_parent` (which controls scheduler-side cell rooting) — use this when the test author wants workload cgroups to land at a specific path independent of where the scheduler manages cells. |
-| `num_snapshots = N` | `0` | Fire `N` periodic snapshot boundaries inside the workload's 10 %–90 % window; each capture is stored on the host `SnapshotBridge` under `periodic_NNN`. `0` disables periodic capture entirely. Validated against `MAX_STORED_SNAPSHOTS` (= 64), `host_only = true`, and a 100 ms minimum-spacing rule. See [Periodic Capture](periodic-capture.md) and [Temporal Assertions](temporal-assertions.md). |
-| `cleanup_budget_ms = N` | `None` | Sub-watchdog cap on host-side VM teardown wall time. When the budget is exceeded the test's `AssertResult` is folded with a failing `AssertDetail`. `None` disables the check. |
-| `post_vm = PATH` | `default_post_vm_periodic_fired` (always installed when `post_vm` is omitted; no-op unless `num_snapshots > 0`) | Host-side callback invoked after `vm.run()` returns. Signature: `fn(&VmResult) -> anyhow::Result<()>`. Use for assertions that need host-side state — e.g. draining `VmResult.snapshot_bridge` for periodic-capture analysis (see [Periodic Capture](periodic-capture.md)). When `num_snapshots > 0` and `post_vm` is omitted, the macro auto-installs `default_post_vm_periodic_fired` as a smoke floor that asserts at least one periodic boundary fired with real (non-placeholder) BPF state. **SUPPRESSED on guest-reported fail** — use `post_vm_unconditional` for the always-runs sibling. |
-| `post_vm_unconditional = PATH` | `None` | Host-side callback that ALWAYS runs after `vm.run()` returns, bypassing the guest-fail suppression that gates `post_vm`. Same signature as `post_vm`. Use when the callback must observe host-side state regardless of guest-side outcome — e.g. verifying a sidecar artifact landed even when the guest reported a deliberate fail. The callback is responsible for guarding against missing state when the scheduler crashed before producing it — the canonical guard is `if !result.success { return Ok(()); }` at the top of the callback body. Setting `post_vm_unconditional` does NOT invert the test verdict — a guest-reported fail still fails the test even when the unconditional callback returns Ok. Both `post_vm` and `post_vm_unconditional` may be set on the same entry; if both return `Err` in the same run, the framework surfaces both errors chained as `post_vm: <conditional_err>; post_vm_unconditional: <unconditional_err>`. |
-| `config = EXPR` | `None` | Inline scheduler config content (string literal or path to a `const &'static str`). Written to the guest path declared by the scheduler's `config_file_def`; the framework substitutes `{file}` in the scheduler's arg template with the guest path. Required when the scheduler declares `config_file_def`; rejected when it doesn't. The pairing is enforced at compile time via a `const` assertion against the `scheduler =` const's `Scheduler.config_file_def`, and again at runtime by `KtstrTestEntry::validate`. See [Inline scheduler config](#inline-scheduler-config). |
+### `kaslr`
 
-See [Performance Mode](../concepts/performance-mode.md) for details on
-what `performance_mode` enables, prerequisites, and validation behavior.
+Default `true`: the guest boots with KASLR enabled, so tests run
+against the memory layout real systems have. `kaslr = false`
+appends `nokaslr` to the guest command line for the rare workflow
+that needs stable kernel addresses.
 
-### Attribute syntax rules
+### `host_only`
 
-Each attribute KEY may appear at most once per `#[ktstr_test]`
-invocation; duplicate keys (whether the values match or differ) fail
-at expansion rather than silently letting the later value win.
-List values like `workloads = [FIO, FIO]` are NOT affected by this
-rule — the duplicate check is on attribute keys, not on values
-within an array.
+Run the function directly on the host — no VM. For tests that need
+host tools (cargo, nested VMs) unavailable in the guest initramfs.
+Mutually exclusive with `scheduler`, `num_snapshots > 0`,
+`auto_repro = true`, `disk`, and `networks` — everything that
+requires a VM to exist.
 
-| Form | Result |
-|---|---|
-| `#[ktstr_test(host_only = false, host_only)]` | ``error: duplicate attribute `host_only` — each attribute may appear at most once on a single `#[ktstr_test]` invocation`` |
-| `#[ktstr_test(llcs = 4, llcs = 8)]` | ``error: duplicate attribute `llcs` ...`` |
-| `#[ktstr_test(payload = FIO, payload = STRESS_NG)]` | ``error: duplicate `payload = ...` — each test declares at most one primary payload; extras belong in `workloads = [..]` `` |
-| `#[ktstr_test(workloads = [FIO], workloads = [STRESS_NG])]` | ``error: duplicate `workloads = [...]` — combine all entries into a single array`` |
-| `#[ktstr_test(config = "...", config = OTHER)]` | ``error: duplicate `config = ...` — each test declares at most one inline scheduler config`` |
-| `#[ktstr_test(expect_scx_bpf_error_contains = "a", expect_scx_bpf_error_contains = "b")]` | ``error: duplicate `expect_scx_bpf_error_contains = ...` — each test declares at most one literal matcher`` |
-| `#[ktstr_test(expect_scx_bpf_error_matches = "a", expect_scx_bpf_error_matches = "b")]` | ``error: duplicate `expect_scx_bpf_error_matches = ...` — each test declares at most one regex matcher`` |
+### `ignore`
 
-The bare form (`host_only`) and explicit form (`host_only = true`) of
-the same attribute collide — they refer to the same slot, so
-`host_only = false, host_only` fails the duplicate check on the key,
-regardless of which value each form supplies.
+Emits `#[ignore]` on the generated test, so it is skipped by default
+and runs only under nextest's `--run-ignored`. Use for
+slow-by-design tests that should not gate every local run.
 
-Two non-key/non-value `Meta` forms are also rejected at the attribute
-arm, before duplicate detection runs. Multi-segment paths
-(`crate::host_only`) fail whether they appear as bare attributes, as
-keys in `key = value`, or as the head of a `key(args)` form — all
-three route to the same diagnostic so the operator sees one combined
-error rather than chasing two.
+### `pci` / `disk` / `networks`
 
-| Form | Result |
-|---|---|
-| `#[ktstr_test(crate::host_only)]` (multi-segment path, bare) | ``error: unexpected multi-segment path `crate :: host_only` — `#[ktstr_test]` accepts either `key = value` ... or the bare single-segment form for bool attributes (...)`` |
-| `#[ktstr_test(crate::host_only = true)]` (multi-segment path as key) | same as above |
-| `#[ktstr_test(host_only(false))]` (parenthesised arguments) | ``error: unexpected parenthesised arguments on `host_only`; use `host_only = value` for value attributes or bare `host_only` for bool attributes (...)`` |
-| `#[ktstr_test(crate::host_only(false))]` (multi-segment + parenthesised) | same as the multi-segment-path message — the single-segment requirement bails before the parenthesised-form check |
+`disk = CONST` attaches a virtio-blk device from a `const
+DiskConfig` (built via `DiskConfig::DEFAULT` chained setters); the
+framework owns the backing file. `networks = [CONST, …]` attaches
+one virtio-net device per `const NetConfig` (aarch64 supports at
+most one). On x86_64 either device auto-enables the virtio-PCI
+transport; `pci = true` forces the PCI host bridge on without a
+device (default: no bridge, `pci=off` on the guest command line).
 
-## Inline scheduler config
+### `bpf_map_write`
 
-Some schedulers (e.g. `scx_layered`, `scx_lavd`) accept a JSON config
-file via a CLI argument like `--config /path/to/config.json`. Two
-pieces wire this into a test:
+`bpf_map_write = CONST` (or `[A, B]`) writes a u32 into a named
+scheduler BPF-map field from the host, once, after the scheduler
+loads — pre-seeding guest state before workers start. See
+[Snapshots — composing reads with writes](snapshots.md#composing-reads-with-writes).
 
-1. **Scheduler declaration** — the `Scheduler` builder declares the
-   arg template and the guest path via `.config_file_def`:
+### `watch_bpf_maps`
+
+`watch_bpf_maps = CONST` (or `[A, B]`) samples named scheduler
+BPF-map fields observer-effect-free during the run and surfaces each
+as a run-level metric. Full semantics in
+[Watching BPF-map fields](#watching-bpf-map-fields) below.
+
+### `perf_delta_assertions`
+
+`perf_delta_assertions = CONST` (or `[A, B]`) declares per-test
+performance-regression gates. Inert in a normal `cargo ktstr test`
+run — enforced only under `cargo ktstr perf-delta --noise-adjust`.
+Requires `performance_mode` (rejected at compile time otherwise,
+since unpinned numbers would make the gate misfire). See
+[Assertable Metrics](../reference/assertable-metrics.md).
+
+### `num_snapshots`
+
+`num_snapshots = N` fires N periodic BPF-state captures inside the
+workload's 10%–90% window. `0` (default) disables periodic capture.
+Validated against the 64-capture bridge cap, `host_only`, and a
+100 ms minimum boundary spacing. See
+[Periodic Capture](periodic-capture.md).
+
+### `post_vm` / `post_vm_unconditional`
+
+Host-side callbacks (`fn(&VmResult) -> anyhow::Result<()>`) invoked
+after the VM exits — the place to drain snapshot bridges, read run
+metrics, and run [temporal assertions](temporal-assertions.md).
+`post_vm` is suppressed when the guest reported failure;
+`post_vm_unconditional` always runs (guard it with
+`if !result.success { return Ok(()); }` when it reads state a crash
+may not have produced, and note it never turns a guest failure into
+a pass). When `num_snapshots > 0` and `post_vm` is omitted, the
+macro installs a default callback asserting at least one periodic
+capture landed with real BPF state.
+
+### `cleanup_budget_ms`
+
+Caps host-side VM teardown wall time; exceeding the budget folds a
+failing detail into the test result. Unset disables the check; `0`
+is rejected.
+
+### `staged_schedulers`
+
+`staged_schedulers = [PATH, …]` packs additional `&'static
+Scheduler` binaries into the guest at boot. Required for scenarios
+that invoke `Op::ReplaceScheduler` / `Op::AttachScheduler` — the
+swap target must already be on disk in the guest. See
+[Ops](../concepts/ops.md).
+
+### `workload_root_cgroup`
+
+`workload_root_cgroup = "/path"` places the per-test workload
+cgroups under a specific guest cgroup path, decoupled from the
+scheduler's `cgroup_parent` (which roots scheduler-side cells).
+
+### `wprof` / `wprof_args`
+
+`wprof = true` attaches the wprof BPF tracer to the workload VM;
+`wprof_args = "..."` passes space-separated CLI args. Both require
+the `wprof` cargo feature.
+
+### `payload` / `workloads` / `extra_include_files` / `extra_sched_args`
+
+`payload = CONST` declares the test's primary benchmark binary and
+`workloads = [A, B]` composes more alongside it; the include-file
+pipeline packs every referenced binary into the guest. See
+[Payloads and Included Files](payloads.md).
+`extra_include_files = ["path", …]` adds test-level host files that
+belong to no particular payload. `extra_sched_args = ["--flag", …]`
+appends scheduler CLI args after the scheduler's own `sched_args`.
+
+### `config`
+
+Inline scheduler config content, paired with a scheduler that
+declares `config_file_def` — covered next.
+
+## Inline scheduler config {#inline-scheduler-config}
+
+Some schedulers (e.g. `scx_layered`, `scx_lavd`) accept a JSON
+config file via a CLI argument like `--config /path/to/config.json`.
+Two pieces wire this into a test:
+
+1. **Scheduler declaration** — declares the arg template and the
+   guest path via `config_file_def`:
 
    ```rust,ignore
    const LAYERED_SCHED: Scheduler = Scheduler::named("layered")
@@ -266,12 +384,10 @@ pieces wire this into a test:
    ```
 
    `{file}` in the arg template is replaced with the guest path. The
-   framework `mkdir -p`s the parent and writes the config content to
-   `/include-files/layered.json` inside the guest before the
-   scheduler binary starts.
+   framework writes the config content to that path inside the guest
+   before the scheduler binary starts.
 
-2. **Test attribute** — the test supplies the inline JSON via
-   `config = …`:
+2. **Test attribute** — supplies the inline content:
 
    ```rust,ignore
    const LAYERED_CONFIG: &str = r#"{ "layers": [...] }"#;
@@ -282,109 +398,53 @@ pieces wire this into a test:
    }
    ```
 
-   `config = "..."` (string literal) and `config = SOME_CONST` (path
-   to a `const &'static str`) are both accepted.
+   Both a string literal and a path to a `const &'static str` are
+   accepted.
 
-The pairing gate is bidirectional:
-- A scheduler with `config_file_def` set **requires** `config = …`
-  on every test (otherwise the scheduler binary would launch
-  without `--config`).
-- A scheduler without `config_file_def` **rejects** `config = …` on
-  the test (the content would be silently dropped at dispatch).
+The pairing gate is bidirectional and enforced at compile time (and
+again at runtime for programmatic entry construction): a scheduler
+with `config_file_def` requires `config = …` on every test, and a
+scheduler without it rejects `config = …` — the content would
+otherwise be silently dropped.
 
-Both halves are validated at compile time via a `const` assertion
-emitted by the macro AND at runtime by `KtstrTestEntry::validate`,
-so direct programmatic-entry construction sees the same gate.
+For schedulers that take the same config file on every test, use
+`Scheduler::config_file(host_path)` instead — see
+[Scheduler Definitions](scheduler-definitions.md).
 
-For schedulers that take a config file from a host-side path
-instead of inline content, use `Scheduler::config_file(host_path)`
-instead of `config_file_def`. The framework packs the host file into
-the initramfs at `/include-files/{filename}` and prepends `--config
-/include-files/{filename}` to scheduler args; no `config = …` on
-the test is needed in that flavor.
+## Watching BPF-map fields {#watching-bpf-map-fields}
 
-## Example with custom scheduler
+`watch_bpf_maps` turns "the scheduler computed X" into a post-VM
+assertion. The free-running host monitor reads the named field from
+the running guest's BPF-map memory via BTF — without freezing vCPUs
+— and folds the samples into a run-level metric.
 
-Define the scheduler with `declare_scheduler!` (see
-[Scheduler Definitions](scheduler-definitions.md)), then
-reference it in `#[ktstr_test]`:
+Each declared const is one `WatchBpfMap::new(map_name_suffix, field,
+agg, label)`:
 
-```rust,ignore
-use ktstr::declare_scheduler;
-use ktstr::prelude::*;
-
-declare_scheduler!(MY_SCHED, {
-    name = "my_sched",
-    binary = "scx_my_sched",
-    topology = (1, 2, 4, 1),
-    sched_args = ["--enable-llc", "--enable-stealing"],
-});
-
-#[ktstr_test(
-    scheduler = MY_SCHED,
-    not_starved = true,
-    max_gap_ms = 5000,
-)]
-fn my_sched_basic(ctx: &Ctx) -> Result<AssertResult> {
-    // Inherits 1n2l4c1t from MY_SCHED
-    Ok(AssertResult::pass())
-}
-```
-
-`declare_scheduler!` emits a `pub static MY_SCHED: Scheduler`
-and registers it in the `KTSTR_SCHEDULERS` distributed slice via
-a private linkme static so `cargo ktstr verifier` discovers it.
-The bare `MY_SCHED` ident is what `#[ktstr_test(scheduler = ...)]`
-expects. See
-[Scheduler Definitions](scheduler-definitions.md#defining-a-scheduler)
-for the full macro grammar.
-
-For the manual builder pattern (no distributed-slice
-registration), see
-[Scheduler Definitions: Manual definition](scheduler-definitions.md#manual-definition).
-
-## Watching scheduler BPF-map fields
-
-`watch_bpf_maps = CONST` reads NAMED scheduler BPF-map fields
-*observer-effect-free* — the free-running host monitor reads the running
-guest's BPF-map memory via BTF, without freezing vCPUs — and surfaces each as
-an assertable run-level metric. This turns "the scheduler computed X" into a
-post-VM assertion.
-
-Each declared const is a single `WatchBpfMap`; pass one (`watch_bpf_maps = W`) or
-an array (`watch_bpf_maps = [A, B]`) and the macro borrows each into the entry's
-`&[&WatchBpfMap]` slice. Each `WatchBpfMap::new(map_name_suffix, field, agg, label)`
-declares one target:
-
-- `map_name_suffix` — matched against a loaded BPF map by `ends_with` (e.g. `".bss"`
-  for a section global, or a named map like `"cpu_ctx_stor"`).
-- `field` — a dot-path into the map's value type (`"sys_stat.avg_lat_cri"`, or
-  a bare global like `"lat_headroom"`).
+- `map_name_suffix` — matched against a loaded BPF map by
+  `ends_with` (`".bss"` for a section global, or a named map like
+  `"cpu_ctx_stor"`).
+- `field` — a dot-path into the map's value type
+  (`"sys_stat.avg_lat_cri"`, or a bare global like `"lat_headroom"`).
 - `agg` — pick by the field's semantic class:
-  - `BpfMapAgg::Scalar` — a single gauge value (a current level), folded as
-    the mean over the run's reporting samples.
-  - `BpfMapAgg::ScalarCounter` — a single monotonic-counter value (an
-    accumulating total like `ktstr_alloc_count`), folded as the value at the
-    last reporting sample (the final total — not the mean of a rising series).
-  - `BpfMapAgg::PerCpu` — a per-CPU array GAUGE, folded into a cross-CPU mean
-    and spatial max.
-  - `BpfMapAgg::PerCpuCounter` — a per-CPU array that is a monotonic counter,
-    folded as the cross-CPU sum at the last reporting sample (the accumulated
-    total across all reporting CPUs). Watch at u64 width so no per-CPU slot
-    truncates before the sum.
-- `label` — the metric-key leaf.
+  - `BpfMapAgg::Scalar` — a gauge; folded as the mean over the
+    run's samples.
+  - `BpfMapAgg::ScalarCounter` — a monotonic counter; folded as the
+    value at the last sample (the final total, not a mean of a
+    rising series).
+  - `BpfMapAgg::PerCpu` — a per-CPU gauge array; folded into a
+    cross-CPU mean and max.
+  - `BpfMapAgg::PerCpuCounter` — a per-CPU counter array; folded as
+    the cross-CPU sum at the last sample. Watch at u64 width so no
+    per-CPU slot truncates before the sum.
+- `label` — the metric-key leaf; must be unique within a test.
 
-The metric key is the active scheduler's object prefix plus the label:
-`<scheduler-obj>_<label>` for a scalar, scalar-counter, or per-CPU-counter,
-and `<scheduler-obj>_<label>_avg` / `_max` for a per-CPU gauge. The object
-prefix comes from the scheduler's global-section map name — this is libbpf's
-object name, which can differ from the scheduler's source / ops name (e.g. an
-object named `scx_lavd` → prefix
-`scx_lavd`, but scx-ktstr's object is `bpf_bpf`, so its prefix is `bpf_bpf`).
-Each target's `label` must be unique within a test (duplicate labels resolve to
-one metric key and are rejected at VM build time). Read it back with
-[`VmResult::run_metric`] in a `post_vm` hook; an absent metric returns `None`
-(loud-absent — the field never resolved), never a false `0.0`.
+The metric key is `<scheduler-obj>_<label>` (per-CPU gauges get
+`_avg` / `_max` variants). The prefix is libbpf's object name from
+the scheduler's global-section map, which can differ from the ops
+name — scx-ktstr's object is `bpf_bpf`, so its prefix is `bpf_bpf`.
+Read the metric back with `VmResult::run_metric` in a `post_vm`
+hook; an absent metric returns `None`, never a false `0.0`.
 
 ```rust,ignore
 const AVG_LAT_CRI: WatchBpfMap =
@@ -401,7 +461,6 @@ fn check(result: &VmResult) -> anyhow::Result<()> {
     Ok(())
 }
 
-// Pass an array to watch several fields; a single field is `watch_bpf_maps = W`.
 #[ktstr_test(
     scheduler = SCX_LAVD,
     watch_bpf_maps = [AVG_LAT_CRI, LAT_HEADROOM],
@@ -410,8 +469,14 @@ fn check(result: &VmResult) -> anyhow::Result<()> {
 fn lat_metrics_surface(ctx: &Ctx) -> anyhow::Result<AssertResult> { /* workload */ }
 ```
 
-Resolution is lazy: the maps appear only after the scheduler attaches, so the
-monitor retries until the named map is present, then caches the resolved
-offset/width and re-reads only the leaf bytes each tick.
+Resolution is lazy: the maps appear only after the scheduler
+attaches, so the monitor retries until the named map is present,
+then caches the resolved offset and re-reads only the leaf bytes
+each tick.
 
-[`VmResult::run_metric`]: https://docs.rs/ktstr/latest/ktstr/prelude/struct.VmResult.html#method.run_metric
+## What the macro generates
+
+The macro renames the function, registers it in the `KTSTR_TESTS`
+distributed slice, and emits a `#[test]` wrapper that boots the VM
+and dispatches. Details in the
+[attribute rustdoc](https://ktstr.dev/rustdoc/ktstr/attr.ktstr_test.html).

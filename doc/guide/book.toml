@@ -6,9 +6,17 @@ language = "en"
 src = "src"
 
 [output.html]
-default-theme = "rust"
+default-theme = "light"
+preferred-dark-theme = "coal"
+additional-css = ["css/ktstr.css"]
 git-repository-url = "https://github.com/likewhatevs/ktstr"
 edit-url-template = "https://github.com/likewhatevs/ktstr/edit/main/doc/guide/{path}"
+
+[output.html.redirect]
+# Pages merged away in the docs overhaul; keep inbound links alive.
+"/running-tests/single-scenario.html" = "../running-tests.html"
+"/writing-tests/gauntlet-tests.html" = "../running-tests/gauntlet.html"
+"/architecture/workload-handle.html" = "workers.html"
 
 [output.linkcheck2]
 follow-web-links = false

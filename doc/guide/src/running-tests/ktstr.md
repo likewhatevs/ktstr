@@ -1,19 +1,21 @@
-# ktstr
+# ktstr (standalone)
 
 `ktstr` is the standalone debugging companion to the
 [`#[ktstr_test]`](../writing-tests/ktstr-test-macro.md) test harness.
-It owns kernel cache management, interactive VM shells, host-wide
+It owns interactive VM shells, host topology inspection, host-wide
 per-thread profiling, and lock introspection — the operations a
 scheduler author reaches for when investigating a test failure.
 
-To reproduce a test scenario as a self-contained shell script
-without a VM, use [`cargo ktstr export`](cargo-ktstr.md#export).
 To run the test suite, use
-[`cargo ktstr test`](cargo-ktstr.md#test).
+[`cargo ktstr test`](cargo-ktstr.md#test); to reproduce a test as a
+self-contained script without a VM, use
+[`cargo ktstr export`](cargo-ktstr.md#export).
 
-See also [`cargo ktstr`](cargo-ktstr.md) for the cargo-integrated
-companion that also covers test execution, coverage, BPF verifier
-stats, and gauntlet statistics.
+A typical failure investigation chains the two binaries: a test
+fails ([read the output](failures.md)), you boot the same
+environment interactively with `cargo ktstr shell --test NAME`, and
+if the question is "what else changed on this host?", you bracket
+the workload with `ktstr ctprof capture` and diff the snapshots.
 
 Build from the workspace:
 
@@ -25,235 +27,194 @@ cargo build --bin ktstr
 
 ### topo
 
-Show the host CPU topology (CPUs, LLCs, NUMA nodes):
+Show the host CPU topology — the same view the resource planner and
+performance mode use:
 
-```sh
-ktstr topo
+<!-- captured: ktstr topo | ktstr 0.23.0 -->
+```text
+$ ktstr topo
+CPUs:       64
+LLCs:       4
+NUMA nodes: 1
+  LLC 0 (node 0): [0, 1, 2, 3, 4, 5, 6, 7, 32, 33, 34, 35, 36, 37, 38, 39]
+  LLC 1 (node 0): [8, 9, 10, 11, 12, 13, 14, 15, 40, 41, 42, 43, 44, 45, 46, 47]
+  LLC 2 (node 0): [16, 17, 18, 19, 20, 21, 22, 23, 48, 49, 50, 51, 52, 53, 54, 55]
+  LLC 3 (node 0): [24, 25, 26, 27, 28, 29, 30, 31, 56, 57, 58, 59, 60, 61, 62, 63]
 ```
+
+This box is `1n4l8c2t` in ktstr's
+[topology notation](../concepts/topology.md): 1 NUMA node, 4 LLCs,
+8 cores per LLC, 2 threads per core — note the SMT siblings (CPU 0
+pairs with CPU 32).
 
 ### kernel
 
-The `kernel` subcommand manages cached kernel images. Subcommands:
-`list`, `build`, `clean`. See
-[cargo-ktstr kernel](cargo-ktstr.md#kernel) for full documentation
--- the kernel subcommands are identical in both binaries.
+Manage cached kernel images: `list`, `build`, `clean`. Identical to
+the [cargo-ktstr kernel](cargo-ktstr.md#kernel) subcommands — see
+there for full documentation.
 
 ### shell
 
-Boot an interactive shell in a KVM virtual machine. Launches a VM
-with busybox and drops into a shell.
+Boot an interactive shell in a KVM VM. The guest is a busybox
+userland with your files mounted at `/include-files/`:
 
 ```sh
 ktstr shell
 ktstr shell --kernel ../linux
-ktstr shell --kernel 6.14.2
-ktstr shell --topology 1,2,4,1
-ktstr shell -i /path/to/binary
-ktstr shell -i my_tool -i another_tool
+ktstr shell --kernel 6.14.2 --topology 1,2,4,1
+ktstr shell -i ./my-binary -i strace
+ktstr shell --exec 'cat /proc/schedstat'
 ```
 
-Files and directories passed via `-i` are available at
+Files and directories passed via `-i` land at
 `/include-files/<name>` inside the guest. Directories are walked
-recursively, preserving structure (e.g. `-i ./release` includes all
-files under `release/` at `/include-files/release/...`). Bare names
-(without path separators) are resolved via `PATH` lookup.
-Dynamically-linked ELF binaries get automatic shared library
-resolution via ELF DT_NEEDED parsing. Non-ELF files are copied as-is.
+recursively; bare names (no path separator) are resolved via `PATH`;
+dynamically-linked ELF binaries get automatic shared-library
+resolution, and non-ELF files are copied as-is.
 
-Stdin is a terminal requirement. The host terminal enters raw mode
-for bidirectional stdin/stdout forwarding. Terminal state is restored
-on all exit paths.
+Stdin must be a terminal: the host terminal enters raw mode for
+bidirectional forwarding, and the saved terminal state is restored
+on exit paths ktstr controls (normal exit, errors, catchable fatal
+signals). A SIGKILL cannot be intercepted — run `reset` if the
+terminal is left raw.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--kernel ID` | auto | Kernel identifier: a source directory path (e.g. `../linux`), a version (`6.14.2` or major.minor prefix `6.14`), or a cache key (see `ktstr kernel list`). Raw image files are rejected. Source directories auto-build; versions auto-download from kernel.org on cache miss. When absent, resolves via cache then filesystem and falls back to downloading the latest stable kernel. |
-| `--topology N,L,C,T` | `1,1,1,1` | Virtual CPU topology as `numa_nodes,llcs,cores,threads`. All values must be >= 1. |
-| `-i, --include-files PATH` | -- | Files or directories to include in the guest. Repeatable. Directories are walked recursively. |
-| `--memory-mib MiB` | auto | Guest memory in mebibytes (minimum 128). `--memory-mib 2048` allocates `2048 << 20` = 2 GiB. When absent, estimated from payload and include file sizes. |
-| `--dmesg` | off | Forward kernel console (COM1/dmesg) to stderr in real-time. Sets loglevel=7 for verbose kernel output. |
-| `--exec CMD` | -- | Run a command in the VM instead of an interactive shell. The VM exits after the command completes. |
-| `--exec-timeout DURATION` | `120s` | Max wall-clock for a `--exec` payload before the VM is force-killed. Parsed by humantime (`30s`, `5m`, `1h`). Ignored without `--exec`. |
-| `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
-| `--cpu-cap N` | unset | Reserve only N host CPUs for the shell VM (integer ≥ 1). **Requires `--no-perf-mode`** — perf-mode already holds every LLC exclusively, so capping under perf-mode would double-reserve. The planner walks whole LLCs in consolidation- and NUMA-aware order, partial-taking the last LLC so `plan.cpus.len() == N` exactly. Mutually exclusive with `KTSTR_BYPASS_LLC_LOCKS=1`. Also settable via `KTSTR_CPU_CAP` env var (CLI flag wins when both are present). |
-| `--disk SIZE` | unset | Attach a raw (unformatted) virtio-blk disk at `/dev/vda`, backed by a fresh sparse tempfile per invocation. SIZE is a human-readable IEC size (case-insensitive suffix `b`, `kib`, `mib`, `gib`); SI suffixes (`kb`/`mb`/`gb`) are rejected. Size must be a positive whole number of MiB, e.g. `256mib`, `1gib`. |
+| `--kernel ID` | auto | Same kernel grammar as [`cargo ktstr test --kernel`](cargo-ktstr.md#common-flags) (path, version, cache key, range, git source), resolving to a single kernel; raw image files are rejected here. When absent, resolves via cache then filesystem, falling back to downloading the latest stable kernel. |
+| `--topology N,L,C,T` | `1,1,1,1` | Virtual topology as `numa_nodes,llcs,cores,threads`. All values must be >= 1. |
+| `-i, --include-files PATH` | — | Files or directories to include in the guest. Repeatable. |
+| `--memory-mib MiB` | auto | Guest memory in MiB (minimum 128). When absent, estimated from payload and include-file sizes. |
+| `--dmesg` | off | Forward the guest kernel console (COM1/dmesg) to stderr in real time; sets `loglevel=7`. |
+| `--exec CMD` | — | Run a command instead of an interactive shell; the VM exits when it completes. |
+| `--exec-timeout DURATION` | `120s` | Max wall-clock for a `--exec` payload before the VM is killed (`30s`, `5m`, `1h`). |
+| `--no-perf-mode` | off | Disable all [performance mode](../concepts/performance-mode.md) features. Also via `KTSTR_NO_PERF_MODE`. |
+| `--cpu-cap N` | unset | Reserve only N host CPUs for the shell VM; requires `--no-perf-mode`. See [Resource Budget](../concepts/resource-budget.md). |
+| `--disk SIZE` | unset | Attach a raw virtio-blk disk at `/dev/vda`, backed by a fresh sparse tempfile. IEC sizes only (`256mib`, `1gib`). |
 
-`cargo ktstr shell` runs the same VM boot flow and differs in two
-respects: it accepts raw image file paths for `--kernel` (e.g.
-`bzImage`, `Image`), and it adds a `--test NAME` flag that derives
-topology / memory / include-files from a registered `#[ktstr_test]`
-(mutually exclusive with `--topology` and `--memory-mib`; `-i` is
-additive). Source-tree directories auto-build and no-kernel
-invocations auto-download — same as `ktstr shell`.
+[`cargo ktstr shell`](cargo-ktstr.md#shell) runs the same boot flow
+with two additions: it accepts raw kernel image files for
+`--kernel`, and it has `--test NAME` to derive topology, memory, and
+include files from a registered `#[ktstr_test]`.
 
 ### ctprof
 
-Capture or compare a host-wide per-thread state snapshot. Useful
-for diagnosing "the scheduler looks fine but something on the
-host is still behaving oddly" by producing a baseline/candidate
-diff of every live thread's scheduling, memory, and I/O
-counters — a superset of what any single test's sidecar
-captures.
+Capture or compare a host-wide per-thread snapshot — for "the
+scheduler looks fine but something on the host is still behaving
+oddly". Every visible thread's scheduling, memory, and I/O counters
+are snapshotted as zstd-compressed JSON:
 
 ```sh
 ktstr ctprof capture --output baseline.ctprof.zst
-# ... run workload of interest ...
+# ... run the workload of interest ...
 ktstr ctprof capture --output candidate.ctprof.zst
 ktstr ctprof compare baseline.ctprof.zst candidate.ctprof.zst
 ```
 
-**`capture`** walks `/proc` at capture time and snapshots every
-visible thread's scheduling, memory, and I/O metrics as
-zstd-compressed JSON (conventional extension `.ctprof.zst`). The
-snapshot spans four metric kinds:
+Cumulative counters and lifetime peaks are probe-timing-invariant —
+sampled twice, a value either increased monotonically or stayed at
+its high-water mark — so a diff between two snapshots measures
+exactly the activity over the window. Capture uses no kprobes or
+kernel tracing and does not modify thread state; the only exception
+is the jemalloc-only memory fields, read by briefly ptrace-attaching
+jemalloc-linked processes (needs root, `CAP_SYS_PTRACE`, or
+`ptrace_scope=0`; recorded as zero when denied).
 
-- **cumulative counters** — from schedstat / sched / status CSW /
-  page faults / I/O bytes / taskstats.
-- **lifetime peaks** — schedstat `*_max` and `hiwater_*`.
-- **instantaneous gauges** sampled at capture time — `nr_threads`,
-  `fair_slice_ns`, `state`.
-- **categorical / ordinal scalars** — `policy`, `nice`,
-  `cpu_affinity`, identity strings.
+`compare` joins two snapshots on a grouping axis and renders
+per-metric baseline/candidate/delta rows, sorted by largest relative
+change. Real output (a cargo build ran between the snapshots):
 
-Cumulative counters and lifetime
-peaks are probe-timing-invariant — sampled twice, the value
-either monotonically increased or stayed at its high-water mark
-— so a diff between two snapshots measures exactly the
-activity over the window. Instantaneous gauges and categorical
-scalars are point-in-time readings that can legitimately differ
-between two probes of the same thread. Per-cgroup aggregates
-(`cpu.stat`, `memory.current`) are captured once per distinct
-path. Capture does not modify thread state and uses no kprobes or
-kernel tracing. The jemalloc-only memory fields
-(`allocated_bytes`/`deallocated_bytes`) are read by briefly
-`ptrace`-attaching each thread of jemalloc-linked processes
-(`PTRACE_SEIZE`), which needs root, `CAP_SYS_PTRACE`, or
-`kernel.yama.ptrace_scope=0`. For targets not linked against jemalloc,
-or when the ptrace attach is denied, those two fields are recorded as
-zero while the rest of the snapshot still populates.
+<!-- captured: ktstr ctprof compare /tmp/ktstr-docs-base.ctprof.zst /tmp/ktstr-docs-cand.ctprof.zst --limit 24 | ktstr 0.23.0 -->
+```text
+## Primary metrics
+ comm                              threads  metric             value                delta      %         %uptime
+ kworker/{N}:{N}-mm_percpu_wq
+     kworker/{N}:{N}-mm_percpu_wq  11→37    voluntary_csw      8.697K → 101.154K    +92.457K   +1063.1%  93%
+     kworker/{N}:{N}-mm_percpu_wq  11→37    timeslices         8.699K → 101.166K    +92.467K   +1063.0%  93%
+     kworker/{N}:{N}-mm_percpu_wq  11→37    wait_time_ns       2.684s → 27.653s     +24.969s   +930.2%   93%
+     kworker/{N}:{N}-mm_percpu_wq  11→37    stime_clock_ticks  22ticks → 217ticks   +195ticks  +886.4%   93%
+     kworker/{N}:{N}-mm_percpu_wq  11→37    run_time_ns        243.378ms → 2.320s   +2.077s    +853.4%   93%
+...
+```
+
+Thread names are token-normalized (`kworker/3:1` and `kworker/7:0`
+fold into `kworker/{N}:{N}`), so the join key survives across
+process restarts and even across hosts — deltas reflect the named
+workload, not a specific pid.
+
+Choosing `--group-by`: start with the default `all` (cgroup, then
+process, then thread pattern — it folds renamed-but-identical
+cgroups together); use `pcomm` when you think in processes, `cgroup`
+when comparing services or containers, and `comm` / `comm-exact`
+when a single thread pool is the suspect. Most-used compare flags:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-o`, `--output PATH` | required | Destination path (convention: `.ctprof.zst`). Existing files are overwritten. |
+| `--group-by AXIS` | `all` | `all`, `pcomm`, `cgroup`, `comm`, or `comm-exact` (literal thread names). |
+| `--sections NAMES` | every | Sub-tables to render, e.g. `primary`, `taskstats-delay`, `derived`, `pressure`, `smaps-rollup`. |
+| `--metrics NAMES` | every | Metric allowlist (names from `ktstr ctprof metric-list`). |
+| `--sort-by SPEC` | largest `\|delta_pct\|` | Multi-key sort: `metric[:asc\|desc],...`. |
+| `--limit N` | `500` | Max rendered lines per section; `0` disables truncation. |
 
-**`compare`** joins two snapshots on the selected grouping
-axis (`all` by default) and renders a per-metric
-baseline/candidate/delta table. The join key survives across
-captures taken on different hosts or after process restarts, so
-deltas reflect the behavior of the named workload rather than a
-specific pid. Metrics with cumulative semantics (CPU time, page
-faults, wait time) show the candidate-minus-baseline delta;
-instantaneous metrics (affinity, cgroup path) show the value at
-candidate capture time. See the
-[ctprof reference](../reference/ctprof.md) for the full metric
-registry, aggregation rules, derived-metric formulas, and
-taskstats kconfig gating.
-
-| Arg / Flag | Default | Description |
-|------|---------|-------------|
-| `BASELINE` | required | Path to the baseline `.ctprof.zst` snapshot. |
-| `CANDIDATE` | required | Path to the candidate `.ctprof.zst` snapshot. |
-| `--group-by AXIS` | `all` | Grouping axis: `all` (default; runs cgroup → pcomm → comm, folding renamed-but-identical cgroups together), `pcomm` (process name), `cgroup` (cgroup v2 path), `comm` (thread-name pattern, token-normalized), or `comm-exact` (literal thread name, thread axis only: unlike `comm --no-thread-normalize`, `smaps_rollup` keying stays pcomm-pattern normalized). |
-| `--cgroup-flatten GLOB` | -- | Glob pattern that collapses dynamic cgroup path segments before grouping (e.g. `'/kubepods/*/workload'`). Repeatable; explicit globs apply before auto-normalize. |
-| `--no-thread-normalize` | off | Disable token-based pattern normalization across every name axis: `--group-by comm`, `--group-by pcomm`, and the `smaps_rollup` per-process keying (which reverts to literal `pcomm[tgid]`). Names group literally; smaps rows keep per-PID identity. No effect under `comm-exact` (already literal) or `cgroup` (use `--no-cg-normalize`). |
-| `--no-cg-normalize` | off | Disable token-based normalization for `--group-by cgroup`. Cgroup paths group by literal post-flatten path. |
-| `--sort-by SPEC` | by largest `\|delta_pct\|` | Multi-key sort spec: `metric1[:dir1],metric2[:dir2],...`. Each `metric` is a name from `ctprof metric-list`; each `dir` is `asc` or `desc` (default `desc`). |
-| `--display-format FORMAT` | `arrow` | Per-row column layout. `arrow` (default; collapses baseline/candidate into a single `baseline → candidate` cell), `full` (7 columns), `delta-only` (drop baseline+candidate), `no-pct`, or `pct-only`. |
-| `--columns NAMES` | -- | Comma-separated column list overriding `--display-format`. Valid names: `group`, `threads`, `metric`, `baseline`, `candidate`, `delta`, `%`, `arrow`, `tags`, `uptime`. Order is the rendered order. |
-| `--sections NAMES` | every | Comma-separated sub-table list. Valid names: `primary`, `taskstats-delay`, `derived`, `cgroup-stats`, `cgroup-limits`, `memory-stat`, `memory-events`, `pressure`, `host-pressure`, `smaps-rollup`, `sched-ext`. Empty renders every section that has data. |
-| `--metrics NAMES` | every | Comma-separated metric-name allowlist for primary + derived rows. Names must come from `ctprof metric-list`. Composes multiplicatively with `--sections`. |
-| `--wrap` | off | Wrap table cells to fit terminal width. Only fires when stdout is a TTY; piped output stays unwrapped so awk/grep pipelines see the same byte sequence. |
-| `--limit N` | `500` | Maximum rendered lines per section; sections that exceed it are truncated with a notice. `0` disables truncation. |
-
-**`show`** renders a single snapshot's per-(group, metric)
-values without diff math. Same flag vocabulary as `compare`,
-minus the baseline/candidate/delta/pct columns:
-
-```sh
-ktstr ctprof show snapshot.ctprof.zst --group-by cgroup
-ktstr ctprof show snapshot.ctprof.zst --sections taskstats-delay
-```
-
-| Arg / Flag | Default | Description |
-|------|---------|-------------|
-| `SNAPSHOT` | required | Path to the `.ctprof.zst` snapshot. |
-| `--group-by AXIS` | `pcomm` | Same as `compare`. |
-| `--cgroup-flatten GLOB` | -- | Same as `compare`. Repeatable. |
-| `--no-thread-normalize` | off | Same as `compare`. |
-| `--no-cg-normalize` | off | Same as `compare`. |
-| `--sort-by SPEC` | alphabetical | Sort spec; ranks groups by absolute aggregated value (no delta — single snapshot). |
-| `--columns NAMES` | -- | Comma-separated column list. Show-only valid names: `group`, `threads`, `metric`, `value`, `tags`, `uptime`. The compare-only column names are rejected at parse time. |
-| `--sections NAMES` | every | Same as `compare`. |
-| `--metrics NAMES` | every | Same as `compare`. |
-| `--wrap` | off | Same as `compare`. |
-| `--limit N` | `500` | Same as `compare`. |
-
-**`metric-list`** prints every registered metric in two tables:
-primary metrics with their tags (kconfig gate + sched_class scope)
-and description, and derived metrics with their unit, inputs, and
-description. Use this to discover the vocabulary `--sort-by` and
-`--metrics` accept.
-
-```sh
-ktstr ctprof metric-list
-```
+`show` renders a single snapshot without diff math, and
+`metric-list` prints the metric vocabulary — see the
+[ctprof reference](../reference/ctprof.md) for those, the full flag
+tables, aggregation rules, and taskstats kconfig gating.
 
 ### locks
 
-Enumerate every ktstr flock held on this host. Read-only —
-does NOT attempt any flock acquire. Useful as a troubleshooting
-companion for `--cpu-cap` contention: when a build or test is
-stalled behind a peer's reservation, `ktstr locks` names the
-peer (PID + cmdline) without disturbing any of its flocks.
+Enumerate every ktstr flock held on this host — read-only, never
+acquires anything. When a build or test stalls behind a peer's
+reservation, `ktstr locks` names the peer without disturbing it:
 
-Scans four lock-file roots:
+<!-- captured: ktstr locks | ktstr 0.23.0 -->
+```text
+$ ktstr locks
+LLC locks:
+ LLC  NODE  LOCKFILE               HOLDERS
+ 0    0     /tmp/ktstr-llc-0.lock  <none recorded>
+ 1    0     /tmp/ktstr-llc-1.lock  <none recorded>
+...
+
+Run-dir locks:
+ RUN KEY               LOCKFILE                                       HOLDERS
+ 7.0.14-73730e0-dirty  target/ktstr/.locks/7.0.14-73730e0-dirty.lock  <none recorded>
+```
+
+An idle host shows `<none recorded>`; while a lock is held, the
+`HOLDERS` column names the holder's PID and cmdline
+(cross-referenced against `/proc/locks`). Four lock-file roots are
+scanned:
 
 - `{KTSTR_LOCK_DIR}/ktstr-llc-*.lock` (default `/tmp`) — per-LLC
   reservations held by perf-mode test runs and `--cpu-cap`-bounded
   builds.
-- `{KTSTR_LOCK_DIR}/ktstr-cpu-*.lock` (default `/tmp`) — per-CPU
-  reservations from the same flow.
-- `{cache_root}/.locks/*.lock` — cache-entry locks held
-  during `kernel build` writes, and `source-{path_hash}.lock`
-  files held for the duration of `kernel build --kernel <path>` and
-  `cargo ktstr test --kernel <path>` against the same source tree.
-- `{runs_root}/.locks/{kernel}-{project_commit}.lock` —
-  per-run-key sidecar-write locks held for the duration of
-  the (pre-clear + write) cycle to serialize concurrent
-  ktstr processes targeting the same run directory.
-
-Each lock is cross-referenced against `/proc/locks` to name the
-holder PID and cmdline.
-
-```sh
-ktstr locks                       # one-shot snapshot
-ktstr locks --json                # JSON snapshot
-ktstr locks --watch 1s            # redraw every second until SIGINT
-ktstr locks --watch 1s --json     # ndjson stream, one object per interval
-```
+- `{KTSTR_LOCK_DIR}/ktstr-cpu-*.lock` — per-CPU reservations from
+  the same flow.
+- `{cache_root}/.locks/*.lock` — kernel-cache entry locks held
+  during `kernel build` writes, plus per-source-tree locks held
+  while building from a path.
+- `{runs_root}/.locks/{kernel}-{project_commit}.lock` — sidecar
+  write locks serializing concurrent runs targeting the same run
+  directory.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--json` | off | Emit the snapshot as JSON. Pretty-printed in one-shot mode; compact (one object per line, ndjson-style) under `--watch`. Stable field names — schema documented on `ktstr::cli::list_locks`. |
-| `--watch DURATION` | unset | Redraw the snapshot at the given interval until SIGINT. Value is parsed by `humantime`: `100ms`, `1s`, `5m`, `1h`. Human output clears and redraws in place; `--json` emits one line-terminated object per interval. |
+| `--json` | off | JSON snapshot (pretty in one-shot mode; ndjson under `--watch`). |
+| `--watch DURATION` | unset | Redraw at the interval until SIGINT (`100ms`, `1s`, `5m`). |
 
-The same subcommand is available as `cargo ktstr locks` with
-identical flag semantics.
+Available identically as `cargo ktstr locks`. The reservation model
+behind these locks is documented in
+[Resource Budget](../concepts/resource-budget.md).
 
 ### completions
 
-Generate shell completions for ktstr.
+Generate shell completions (`bash`, `zsh`, `fish`, `elvish`,
+`powershell`):
 
 ```sh
 ktstr completions bash
-ktstr completions zsh
-ktstr completions fish
 ```
 
-| Arg / Flag | Default | Description |
-|------|---------|-------------|
-| `SHELL` | required | Shell to generate completions for (`bash`, `zsh`, `fish`, `elvish`, `powershell`). |
-| `--binary NAME` | `ktstr` | Binary name to register the completion under. Override when invoking ktstr through a symlink with a different name (the shell looks up completions by argv\[0]). |
-
-The same subcommand is available as `cargo ktstr completions`
-with identical flag semantics (`--binary` accepted on both;
-defaults to the respective binary name).
+`--binary NAME` overrides the registered name when invoking ktstr
+through a differently-named symlink. The same subcommand exists as
+`cargo ktstr completions`.
