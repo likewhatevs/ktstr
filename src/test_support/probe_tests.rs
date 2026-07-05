@@ -2748,3 +2748,108 @@ fn emit_probe_payload_empty_events_round_trips_diagnostics_only() {
          appended since events_before_stitch == 0): {formatted}",
     );
 }
+
+// -- probe-health detection (auto-repro probe-pipeline problem markers) --
+
+/// Wrap a `ProbeBytes` in the guest's PROBE_OUTPUT delimiters the way the
+/// bulk-port stdout stream carries it, so `probe_health_issue` can
+/// `extract_section` + parse it exactly as it does in production.
+fn probe_output_with(
+    trigger_attach_error: Option<&str>,
+    kprobe_attached: u32,
+    total_after_expand: u32,
+) -> String {
+    let payload = ProbeBytes {
+        events: Vec::new(),
+        func_names: Vec::new(),
+        bpf_source_locs: Default::default(),
+        diagnostics: Some(ProbeBytesDiagnostics {
+            pipeline: PipelineDiagnostics {
+                stack_extracted: 0,
+                filter_dropped: Vec::new(),
+                bpf_discovered: 0,
+                total_after_expand,
+            },
+            skeleton: crate::probe::process::ProbeDiagnostics {
+                kprobe_attached,
+                trigger_attach_error: trigger_attach_error.map(String::from),
+                ..Default::default()
+            },
+        }),
+        nr_cpus: None,
+        param_names: Default::default(),
+        render_hints: Default::default(),
+    };
+    format!(
+        "{PROBE_OUTPUT_START}\n{}\n{PROBE_OUTPUT_END}\n",
+        serde_json::to_string(&payload).unwrap()
+    )
+}
+
+#[test]
+fn probe_health_issue_flags_trigger_attach_failure() {
+    // Condition 1 has priority: a trigger load/attach failure short-
+    // circuits before the kprobe-count / event-count checks.
+    let out = probe_output_with(Some("skeleton load (retry): No such process"), 0, 0);
+    let issue = probe_health_issue(&out).expect("trigger failure must flag");
+    assert!(
+        issue.starts_with("probe trigger failed to attach:"),
+        "got: {issue}"
+    );
+}
+
+#[test]
+fn probe_health_issue_flags_zero_kprobes_with_traceable_targets() {
+    // Condition 2: no trigger error, kprobes attached 0, but the pipeline
+    // expanded traceable targets.
+    let out = probe_output_with(None, 0, 7);
+    assert_eq!(
+        probe_health_issue(&out).as_deref(),
+        Some("kprobes attached 0 of 7 traceable target(s)"),
+    );
+}
+
+#[test]
+fn probe_health_issue_flags_attached_but_no_events() {
+    // Condition 3: kprobes attached but the run captured 0 events.
+    let out = probe_output_with(None, 4, 4);
+    assert_eq!(
+        probe_health_issue(&out).as_deref(),
+        Some("4 kprobe(s) attached but captured 0 events"),
+    );
+}
+
+#[test]
+fn probe_health_issue_silent_when_healthy() {
+    // No trigger error, no traceable targets left unattached, and nothing
+    // attached that could have captured events -> healthy, no advisory.
+    let out = probe_output_with(None, 0, 0);
+    assert_eq!(probe_health_issue(&out), None);
+    // No probe section at all (non-probe output) -> None.
+    assert_eq!(probe_health_issue("no probe markers here"), None);
+}
+
+#[test]
+fn condense_probe_reason_prefers_libbpf_log_tail() {
+    // The BTF/verifier rejection lands at the END of the forwarded log;
+    // condense_probe_reason surfaces that tail line, not the leading errno.
+    let err = "skeleton load (retry): Permission denied; original error \
+               before retry: Permission denied; LIBBPF-LOG>>>\n\
+               libbpf: prog 'ktstr_trigger_tp': BPF program load failed\n\
+               libbpf: failed to find kernel BTF type ID of 'sched_ext_exit': -3\n\
+               <<<LIBBPF-LOG";
+    let condensed = condense_probe_reason(err);
+    assert_eq!(
+        condensed,
+        "libbpf: failed to find kernel BTF type ID of 'sched_ext_exit': -3",
+    );
+}
+
+#[test]
+fn condense_probe_reason_collapses_and_truncates_plain_error() {
+    let short = condense_probe_reason("skeleton  open:\n  No such\tprocess");
+    assert_eq!(short, "skeleton open: No such process");
+    let long = condense_probe_reason(&"x ".repeat(300));
+    assert!(long.chars().count() <= 200, "must truncate: {}", long.len());
+    assert!(long.ends_with('…'), "truncation marker: {long}");
+}

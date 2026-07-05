@@ -94,6 +94,33 @@ where
         .unwrap_or_else(|| "<unknown>".to_string())
 }
 
+/// Tag a host-DRIVEN skip-class error with the short class string the
+/// end-of-run footer groups by, or `None` when `e` is not one of the
+/// three host-insufficiency skip types.
+///
+/// Scoped deliberately narrower than [`classify_host_error`]: only the
+/// three types whose skip is caused by THIS HOST's shape —
+/// [`TopologyInsufficient`] (host lacks the CPUs/LLCs to boot the
+/// topology), [`ResourceContention`] (host's slots are transiently
+/// busy), and [`PerfModeUnavailable`] (host too small for perf mode).
+/// The unconditional hard-fail types and `KernelUnavailable`
+/// ("harness not configured", not a host-shape fact) are excluded — the
+/// footer's host-skip block answers "what could THIS HOST not run", and
+/// only these three are host-shape driven. Chain-aware via the shared
+/// `is_*` predicates. Guard order is arbitrary (the three types are
+/// mutually exclusive).
+pub(crate) fn host_skip_class(e: &anyhow::Error) -> Option<&'static str> {
+    if is_topology_insufficient(e) {
+        Some("topology_insufficient")
+    } else if is_resource_contention(e) {
+        Some("resource_contention")
+    } else if is_perf_mode_unavailable(e) {
+        Some("perf_mode_unavailable")
+    } else {
+        None
+    }
+}
+
 /// Classify a test-body error against the host-insufficiency taxonomy.
 ///
 /// `no_skip` is `KTSTR_NO_SKIP_MODE` — passed in (not read from the
@@ -339,6 +366,59 @@ mod tests {
                 other => panic!("expected Fail (no_skip={no_skip}), got {other:?}"),
             }
         }
+    }
+
+    /// `host_skip_class` tags exactly the three host-shape skip types and
+    /// nothing else — the footer's host-skip block is scoped to "what
+    /// could THIS HOST not run", so a hard-fail type, KernelUnavailable,
+    /// or a plain error must yield `None`.
+    #[test]
+    fn host_skip_class_tags_only_host_shape_skips() {
+        assert_eq!(
+            host_skip_class(&anyhow::Error::new(TopologyInsufficient {
+                reason: "too few CPUs".into()
+            })),
+            Some("topology_insufficient"),
+        );
+        assert_eq!(
+            host_skip_class(&anyhow::Error::new(ResourceContention {
+                reason: "slots busy".into()
+            })),
+            Some("resource_contention"),
+        );
+        assert_eq!(
+            host_skip_class(&anyhow::Error::new(PerfModeUnavailable {
+                reason: "host too small".into()
+            })),
+            Some("perf_mode_unavailable"),
+        );
+        // Chain-aware, matching the classifier.
+        assert_eq!(
+            host_skip_class(
+                &anyhow::Error::new(ResourceContention {
+                    reason: "slots busy".into()
+                })
+                .context("run ktstr_test VM")
+            ),
+            Some("resource_contention"),
+        );
+        // Not host-shape: a hard-fail type, a missing kernel, a plain error.
+        assert_eq!(
+            host_skip_class(&anyhow::Error::new(CpuBudgetUnsatisfiable {
+                reason: "cap too big".into()
+            })),
+            None,
+        );
+        assert_eq!(
+            host_skip_class(&anyhow::Error::new(KernelUnavailable {
+                diagnostic: "no kernel".into()
+            })),
+            None,
+        );
+        assert_eq!(
+            host_skip_class(&anyhow::anyhow!("scheduler regression")),
+            None
+        );
     }
 
     /// A plain (non-typed) error and the test-outcome markers are NOT

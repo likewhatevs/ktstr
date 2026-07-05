@@ -59,7 +59,7 @@ attaches BPF probes along the crash path, and reruns the scenario. Each
 probed function prints decoded struct fields; `→` marks fields that
 changed between entry and exit:
 
-<!-- captured: cargo ktstr test --kernel local-8cd2b47 (v7.1 + sched_ext_exit tracepoint) -E 'test(=ktstr/bpf_crash_auto_repro_e2e)' --no-capture; ktstr 0.23.0 + pending trigger-signature fix | full run: captures/autorepro-live.txt -->
+<!-- captured: cargo ktstr test --kernel local-8cd2b47 (v7.1 + sched_ext_exit tracepoint) -E 'test(=ktstr/bpf_crash_auto_repro_e2e)' --no-capture | ktstr 0.23.0 (with the probe trigger fix) | full run: captures/autorepro-live.txt -->
 <div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr test — auto-repro output after a scheduler crash</span></div>
 
 <pre><span class="t-b">=== AUTO-PROBE: scx_exit fired ===</span>
@@ -116,7 +116,8 @@ not perturb the scheduler under test. See
   mid-run.
 - **Affinity** — the scheduler respects thread affinity constraints.
 - **Stress** — many cgroups, many workers, rapid topology changes.
-- **Stall detection** — the scheduler doesn't drop tasks.
+- **Stuck-task detection** — the scheduler doesn't leave runnable
+  tasks unrun.
 
 > [!NOTE]
 > ktstr is pre-release. 0.x APIs change between releases, so pin the

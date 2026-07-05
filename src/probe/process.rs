@@ -935,6 +935,27 @@ pub fn run_probe_skeleton(
 
     let mut diag = ProbeDiagnostics::default();
 
+    // Capture libbpf's own log (verifier rejection reasons, "load
+    // failed: -E..." lines) into a buffer so a skeleton-load failure
+    // surfaces its ROOT CAUSE through `diag.trigger_attach_error`
+    // rather than the bare errno. The guest's stderr is not forwarded
+    // to the host, so without this the pipeline reports a one-line
+    // "Permission denied" for a verifier rejection whose actual reason
+    // (e.g. a bad program prototype) lives only in the swallowed log.
+    // `set_print` is process-global; the buffer is cleared at entry so
+    // each load attempt starts fresh, and only its tail is read back
+    // on failure below.
+    static LIBBPF_LOG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    fn libbpf_log_capture(_lvl: libbpf_rs::PrintLevel, msg: String) {
+        if let Ok(mut b) = LIBBPF_LOG.lock() {
+            b.push_str(&msg);
+        }
+    }
+    libbpf_rs::set_print(Some((libbpf_rs::PrintLevel::Debug, libbpf_log_capture)));
+    if let Ok(mut b) = LIBBPF_LOG.lock() {
+        b.clear();
+    }
+
     // Open skeleton. Two MaybeUninit slots: the first backs the
     // initial load attempt; the second backs the fallback retry when
     // optional programs cause ESRCH. Both must outlive `skel`.
@@ -1006,8 +1027,22 @@ pub fn run_probe_skeleton(
                         "probe skeleton load failed (retry); \
                          surfacing both original and retry errors"
                     );
+                    let libbpf_log = LIBBPF_LOG
+                        .lock()
+                        .map(|b| {
+                            // Keep the tail: the verifier's rejection
+                            // reason and the "load failed: -E..." line
+                            // land at the end of the log. Slice on bytes
+                            // and lossily reconstitute so a cut through a
+                            // multi-byte char cannot panic.
+                            let bytes = b.as_bytes();
+                            let start = bytes.len().saturating_sub(8000);
+                            String::from_utf8_lossy(&bytes[start..]).into_owned()
+                        })
+                        .unwrap_or_default();
                     diag.trigger_attach_error = Some(format!(
-                        "skeleton load (retry): {e}; original error before retry: {first_err}"
+                        "skeleton load (retry): {e}; original error before retry: {first_err}; \
+                         LIBBPF-LOG>>>\n{libbpf_log}\n<<<LIBBPF-LOG"
                     ));
                     ready.set();
                     return (None, diag, Vec::new());

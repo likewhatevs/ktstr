@@ -4,8 +4,8 @@
 //! declared cgroup, resolve its cpuset / cpu / memory / io / pids
 //! controllers, partition `WorkSpec`s by `pcomm`, spawn worker handles,
 //! and start any [`CgroupDef::workload`] payload. After the per-def
-//! loop finishes it triggers [`maybe_start_stall_monitor`] for the
-//! host-mode worker-stall poller.
+//! loop finishes it triggers [`maybe_start_stuck_monitor`] for the
+//! host-mode worker-stuck poller.
 //!
 //! Sibling to [`super::apply_ops`]; both mutate the same
 //! [`super::ScenarioState`] view over step-local + backdrop state.
@@ -103,10 +103,10 @@ pub(super) fn apply_setup(
         spawn_def_workers(ctx, state, def, resolved_works)?;
         spawn_def_payload(ctx, state, def)?;
     }
-    // Start the host-mode stall monitor once we've spawned workers
+    // Start the host-mode stuck monitor once we've spawned workers
     // for the first apply_setup in this step. Skip when:
     // - running inside the guest (the VM-side freeze coordinator
-    //   owns stall detection there; the host-mode poller would
+    //   owns stuck detection there; the host-mode poller would
     //   read its own guest /proc/sched, which has no relevance);
     // - running under cargo_test_mode (in-process VMM tests share
     //   the host's /proc with the test harness itself and a poller
@@ -121,7 +121,7 @@ pub(super) fn apply_setup(
     //   already runs);
     // - no workers exist (degenerate scenarios with all worker
     //   spawns deferred to apply_ops or with zero spawns at all).
-    maybe_start_stall_monitor(state);
+    maybe_start_stuck_monitor(state);
     Ok(())
 }
 
@@ -729,7 +729,7 @@ fn spawn_def_payload(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, def: &CgroupD
     Ok(())
 }
 
-/// Helper for [`apply_setup`]: spawn the host-mode stall monitor
+/// Helper for [`apply_setup`]: spawn the host-mode stuck monitor
 /// against every step-local worker pid the just-completed setup
 /// pass left in [`super::StepState::handles`]. Idempotent —
 /// re-invocation when the monitor is already started is a no-op.
@@ -741,7 +741,7 @@ fn spawn_def_payload(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, def: &CgroupD
 /// is spawned in one apply_setup pass) and avoids the
 /// add-while-polling synchronization complexity of a dynamic
 /// pid set.
-pub(super) fn maybe_start_stall_monitor(state: &mut ScenarioState<'_, '_>) {
+pub(super) fn maybe_start_stuck_monitor(state: &mut ScenarioState<'_, '_>) {
     // Backdrop-setup pass: monitor is scoped to the step, not the
     // backdrop. Skip and let the next per-step apply_setup install
     // it if/when step-local workers spawn.
@@ -749,7 +749,7 @@ pub(super) fn maybe_start_stall_monitor(state: &mut ScenarioState<'_, '_>) {
         return;
     }
     // Already started for this step.
-    if state.step.stall_monitor.is_some() {
+    if state.step.stuck_monitor.is_some() {
         return;
     }
     // VM-side scenarios use the freeze coordinator's stall plumbing,
@@ -764,7 +764,7 @@ pub(super) fn maybe_start_stall_monitor(state: &mut ScenarioState<'_, '_>) {
     // backdrop-owned handles that survive across steps. The
     // monitor's lifetime is per-step (re-installed at each step
     // boundary), but the pid set must include backdrop workers
-    // because a stalled backdrop worker (e.g. a long-running
+    // because a stuck backdrop worker (e.g. a long-running
     // payload pinned to a contended cpuset) would otherwise be
     // silent across the entire scenario.
     let pids: Vec<libc::pid_t> = state
@@ -777,16 +777,16 @@ pub(super) fn maybe_start_stall_monitor(state: &mut ScenarioState<'_, '_>) {
     if pids.is_empty() {
         return;
     }
-    match crate::scenario::host_stall::spawn_monitor(&pids) {
+    match crate::scenario::host_stuck::spawn_monitor(&pids) {
         Ok(handle) => {
-            state.step.stall_monitor = Some(handle);
+            state.step.stuck_monitor = Some(handle);
         }
         Err(e) => {
             // Spawn failure is non-fatal — the scenario itself can
             // still run and report worker results. Surface the
             // defect via tracing so an operator can spot the
-            // missing stall coverage.
-            tracing::warn!(err = %format!("{e:#}"), "host_stall::spawn_monitor failed; stall monitor disabled for this step");
+            // missing stuck coverage.
+            tracing::warn!(err = %format!("{e:#}"), "host_stuck::spawn_monitor failed; stuck monitor disabled for this step");
         }
     }
 }

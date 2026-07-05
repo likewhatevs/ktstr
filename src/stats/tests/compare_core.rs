@@ -204,10 +204,10 @@ fn compare_rows_subinteger_stuck_count_difference_is_unchanged() {
     );
 }
 
-/// Contrast: a genuine whole-stall `stuck_count` regression IS still
+/// Contrast: a genuine whole-stuck `stuck_count` regression IS still
 /// flagged. A-side mean 1.0 vs B-side 2.5 (delta 1.5 >= abs 1.0, rel
 /// 150% >= 50%) is a regression — the f64 fix preserves the
-/// deliberate single-whole-stall sensitivity (`default_abs` = 1.0),
+/// deliberate single-whole-stuck sensitivity (`default_abs` = 1.0),
 /// it only stops fabricating regressions from sub-integer noise.
 #[test]
 fn compare_rows_genuine_stuck_count_regression_is_flagged() {

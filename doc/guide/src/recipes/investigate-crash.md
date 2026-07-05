@@ -103,7 +103,7 @@ own accounting, so you can always see how much of the chain
 attached. On a kernel with the `sched_ext_exit` tracepoint, the same
 crash replayed under probes:
 
-<!-- captured: cargo ktstr test --kernel local-8cd2b47 (v7.1 + sched_ext_exit tracepoint) --features integration,wprof -E 'test(=ktstr/bpf_crash_auto_repro_e2e)' --no-capture; ktstr 0.23.0 + pending trigger-signature fix and probe-ship hold | full run: captures/autorepro-live.txt -->
+<!-- captured: cargo ktstr test --kernel local-8cd2b47 (v7.1 + sched_ext_exit tracepoint) --features integration,wprof -E 'test(=ktstr/bpf_crash_auto_repro_e2e)' --no-capture | ktstr 0.23.0 (with the probe trigger + ship-gate fixes) | full run: captures/autorepro-live.txt -->
 <div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">--- auto-repro --- (repro VM, probes on the crash chain)</span></div>
 
 <pre>--- probe pipeline ---

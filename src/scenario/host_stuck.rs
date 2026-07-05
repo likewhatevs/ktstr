@@ -1,8 +1,8 @@
-//! Host-mode worker stall detection via `/proc/<pid>/sched` polling.
+//! Host-mode worker stuck detection via `/proc/<pid>/sched` polling.
 //!
 //! When a scenario runs in host-mode (no VM boot — `!is_guest()` AND
 //! `!cargo_test_mode_active()`), the freeze coordinator / KVM-side
-//! stall plumbing is unavailable. This module fills that gap by
+//! stuck plumbing is unavailable. This module fills that gap by
 //! polling every worker pid's `/proc/<pid>/sched` file from a
 //! background thread and flagging a "task did not run" condition
 //! when both `nr_switches` and `sum_exec_runtime` are unchanged
@@ -26,7 +26,7 @@
 //! `wait_sum` via BPF) supplement this with their own latency
 //! probes via the `--ktstr-probe-stack` pipeline.
 //!
-//! Stall heuristic: if `Δnr_switches == 0` AND
+//! Stuck heuristic: if `Δnr_switches == 0` AND
 //! `Δsum_exec_runtime == 0` across W consecutive samples, the task
 //! has neither been picked nor preempted for `W * poll_interval` —
 //! a stronger signal than either counter alone (a busy-loop on one
@@ -37,12 +37,12 @@
 //!
 //! Default poll interval is 500 ms; window size W = 4 yields a 2 s
 //! detection latency. The interval is overridable via the
-//! [`crate::KTSTR_STALL_POLL_MS_ENV`] env var (empty / unset / 0 /
+//! [`crate::KTSTR_STUCK_POLL_MS_ENV`] env var (empty / unset / 0 /
 //! unparseable falls back to the default).
 //!
 //! # Diagnostic capture
 //!
-//! When a stall fires, the polling thread captures a one-shot
+//! When a stuck condition fires, the polling thread captures a one-shot
 //! diagnostic snapshot from `/proc/<pid>/{wchan, syscall, status,
 //! stack, cgroup}` and `/proc/<pid>/task/<pid>/stat`, plus the
 //! host's `/proc/loadavg`. Each field is read independently and
@@ -59,9 +59,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::KTSTR_STALL_POLL_MS_ENV;
+use crate::KTSTR_STUCK_POLL_MS_ENV;
 
-/// Default poll cadence when [`KTSTR_STALL_POLL_MS_ENV`] is unset /
+/// Default poll cadence when [`KTSTR_STUCK_POLL_MS_ENV`] is unset /
 /// empty / 0 / unparseable. 500 ms × W=4 yields a 2 s detection
 /// latency — short enough to catch a stuck scheduler within a
 /// typical ktstr test duration, long enough that procfs reads stay
@@ -69,7 +69,7 @@ use crate::KTSTR_STALL_POLL_MS_ENV;
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 500;
 
 /// Sliding-window size: number of consecutive flat samples that
-/// flip the stall predicate. W=4 with [`DEFAULT_POLL_INTERVAL_MS`]
+/// flip the stuck predicate. W=4 with [`DEFAULT_POLL_INTERVAL_MS`]
 /// = 2 s detection latency. Constant rather than env-tunable —
 /// the operator already controls latency via the poll interval,
 /// and a smaller W would false-positive on transient idle.
@@ -81,14 +81,14 @@ pub const DEFAULT_POLL_INTERVAL_MS: u64 = 500;
 /// "stuck" for the full W-sample window because both counters
 /// stay flat between the worker's wakeups. The fire is a true
 /// "no forward progress" observation — the operator distinguishes
-/// false-positive (intentional slow period) from true stall
-/// (kernel-side hang) via the [`StallDiagnostic::wchan`] field on
+/// false-positive (intentional slow period) from a true stuck condition
+/// (kernel-side hang) via the [`StuckDiagnostic::wchan`] field on
 /// the report: a healthy slow-period worker shows a `do_nanosleep`
-/// / `pipe_read` / `epoll_wait` wchan, while a true stall shows
+/// / `pipe_read` / `epoll_wait` wchan, while a true stuck condition shows
 /// the offending kernel function. Per the no-silent-drops
 /// policy the framework opts for the loud-fire path rather than
 /// guessing the worker's intended cadence.
-pub const STALL_WINDOW: usize = 4;
+pub const STUCK_WINDOW: usize = 4;
 
 /// Snapshot of the two scheduler counters this monitor watches.
 ///
@@ -110,7 +110,7 @@ pub struct SchedSample {
     /// — Instant is a monotonic-clock opaque value with no portable
     /// wire form; serde consumers reading a sidecar dump will see
     /// `Instant::now()` as the default. The wall-clock context for
-    /// the report is carried separately by [`StallReport::captured_at`]
+    /// the report is carried separately by [`StuckReport::captured_at`]
     /// (also `#[serde(skip)]` for the same reason; sidecar dump
     /// consumers anchoring across runs should pair the report with
     /// the run's start timestamp from elsewhere).
@@ -118,17 +118,17 @@ pub struct SchedSample {
     pub captured_at: Instant,
 }
 
-/// One-shot diagnostic snapshot captured at stall-trip time.
+/// One-shot diagnostic snapshot captured at stuck-trip time.
 ///
 /// Each field is the contents of a `/proc/<pid>/<field>` file
 /// (or a stand-in describing why the read failed). Field
 /// extraction is best-effort: a missing `/proc/<pid>/stack`
 /// (requires `CAP_SYS_ADMIN`) does NOT block the diagnostic;
 /// every field carries its own `"[unreadable: <reason>]"` stand-in
-/// so an operator triaging the stall can tell apart "kernel
+/// so an operator triaging the stuck worker can tell apart "kernel
 /// didn't expose it" from "monitor failed to read it".
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct StallDiagnostic {
+pub struct StuckDiagnostic {
     /// `/proc/<pid>/wchan` — kernel symbol the task is sleeping
     /// in, or `0` when the task is runnable / wchan is unresolvable.
     pub wchan: String,
@@ -150,24 +150,24 @@ pub struct StallDiagnostic {
     /// `/proc/<pid>/cgroup` — v2 path the task belongs to.
     pub cgroup: String,
     /// Host's `/proc/loadavg` at trip time — useful for ruling
-    /// out "stall" caused by extreme host load rather than
+    /// out a false "stuck" verdict caused by extreme host load rather than
     /// scheduler misbehavior.
     pub host_loadavg: String,
 }
 
-/// One stall report: a worker pid plus the sample window that
-/// triggered the stall predicate plus the captured diagnostic.
+/// One stuck report: a worker pid plus the sample window that
+/// triggered the stuck predicate plus the captured diagnostic.
 ///
-/// Pushed onto `StallMonitor::reports` by the polling thread the
+/// Pushed onto `StuckMonitor::reports` by the polling thread the
 /// moment the predicate fires. The thread continues running so
-/// subsequent stalls on the same pid (or other pids) also surface,
+/// subsequent stuck events on the same pid (or other pids) also surface,
 /// but a pid is "re-armed" only after observing forward progress
 /// (any non-zero delta) so a permanently-stuck task fires once and
 /// then stays silent until it moves again — preventing a single
-/// stall from spamming the report list every poll cycle.
+/// stuck event from spamming the report list every poll cycle.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct StallReport {
-    /// The stalled worker's pid.
+pub struct StuckReport {
+    /// The stuck worker's pid.
     pub pid: libc::pid_t,
     /// `comm` field from `/proc/<pid>/comm` at trip time — the
     /// task's name (`SpinWait_0`, etc.) so an operator can map
@@ -175,7 +175,7 @@ pub struct StallReport {
     /// the diagnostic's full status file.
     pub comm: String,
     /// The sample window that triggered the predicate. Length
-    /// equals [`STALL_WINDOW`] at the moment of fire; later
+    /// equals [`STUCK_WINDOW`] at the moment of fire; later
     /// samples are NOT appended (each report is a snapshot, not
     /// a rolling view).
     pub samples: Vec<SchedSample>,
@@ -184,53 +184,53 @@ pub struct StallReport {
     #[serde(skip, default = "Instant::now")]
     pub captured_at: Instant,
     /// Diagnostic snapshot captured immediately after the trip.
-    pub diagnostic: StallDiagnostic,
+    pub diagnostic: StuckDiagnostic,
 }
 
 /// Background polling thread + shared report buffer.
 ///
 /// Framework-internal — the test author never constructs a
-/// `StallMonitor` directly; the scenario engine spawns one via
+/// `StuckMonitor` directly; the scenario engine spawns one via
 /// [`spawn_monitor`] in `apply_setup` when running host-mode.
-/// Drop the [`StallMonitorHandle`] to stop polling and join the
+/// Drop the [`StuckMonitorHandle`] to stop polling and join the
 /// thread.
-pub(crate) struct StallMonitor {
-    /// Shutdown flag — flipped to `true` by [`StallMonitorHandle::drop`]
+pub(crate) struct StuckMonitor {
+    /// Shutdown flag — flipped to `true` by [`StuckMonitorHandle::drop`]
     /// to terminate the polling loop at the next sleep boundary.
     shutdown: Arc<AtomicBool>,
-    /// Accumulated stall reports. The polling thread appends; the
-    /// owner drains via [`StallMonitorHandle::drain`].
-    reports: Arc<Mutex<Vec<StallReport>>>,
+    /// Accumulated stuck reports. The polling thread appends; the
+    /// owner drains via [`StuckMonitorHandle::drain`].
+    reports: Arc<Mutex<Vec<StuckReport>>>,
 }
 
 /// Owned handle returned by [`spawn_monitor`]. Dropping joins the
 /// polling thread; calling [`Self::drain`] returns accumulated
 /// reports before the drop point.
 ///
-/// Framework-internal — held by `StepState.stall_monitor` for the
+/// Framework-internal — held by `StepState.stuck_monitor` for the
 /// per-step lifetime; test authors don't construct or hand out
 /// handles.
-#[must_use = "StallMonitorHandle stops polling on Drop; bind it to a local for the scenario lifetime"]
-pub(crate) struct StallMonitorHandle {
-    monitor: StallMonitor,
+#[must_use = "StuckMonitorHandle stops polling on Drop; bind it to a local for the scenario lifetime"]
+pub(crate) struct StuckMonitorHandle {
+    monitor: StuckMonitor,
     thread: Option<JoinHandle<()>>,
 }
 
-impl StallMonitorHandle {
+impl StuckMonitorHandle {
     /// Take ownership of every report accumulated so far.
-    /// Returns an empty Vec when no stalls have been observed.
+    /// Returns an empty Vec when no stuck events have been observed.
     /// Safe to call any number of times.
-    pub(crate) fn drain(&self) -> Vec<StallReport> {
+    pub(crate) fn drain(&self) -> Vec<StuckReport> {
         let mut guard = self
             .monitor
             .reports
             .lock()
-            .expect("stall-monitor reports mutex poisoned");
+            .expect("stuck-monitor reports mutex poisoned");
         std::mem::take(&mut *guard)
     }
 }
 
-impl Drop for StallMonitorHandle {
+impl Drop for StuckMonitorHandle {
     fn drop(&mut self) {
         // Flip the shutdown flag so the polling loop exits at the
         // next sleep boundary, then join the thread. The thread
@@ -242,18 +242,18 @@ impl Drop for StallMonitorHandle {
             // a panicked thread already has the shutdown flag
             // honored implicitly (it's no longer running).
             if let Err(e) = handle.join() {
-                tracing::warn!(?e, "stall-monitor polling thread panicked");
+                tracing::warn!(?e, "stuck-monitor polling thread panicked");
             }
         }
     }
 }
 
 /// Spawn a background polling thread that watches each pid in
-/// `pids` for stalls. Returns a [`StallMonitorHandle`] whose
-/// [`StallMonitorHandle::drain`] yields the accumulated reports
+/// `pids` for stuck workers. Returns a [`StuckMonitorHandle`] whose
+/// [`StuckMonitorHandle::drain`] yields the accumulated reports
 /// and whose `Drop` stops the thread.
 ///
-/// The poll cadence is read from [`crate::KTSTR_STALL_POLL_MS_ENV`]
+/// The poll cadence is read from [`crate::KTSTR_STUCK_POLL_MS_ENV`]
 /// (empty / unset / 0 / unparseable → [`DEFAULT_POLL_INTERVAL_MS`]).
 ///
 /// Empty `pids` is accepted: the polling thread starts but its
@@ -261,36 +261,36 @@ impl Drop for StallMonitorHandle {
 /// the `spawn_monitor` call on `!pids.is_empty()` for the common
 /// case so no thread is spawned at all; the no-op branch exists so
 /// the constructor itself is total.
-pub(crate) fn spawn_monitor(pids: &[libc::pid_t]) -> Result<StallMonitorHandle> {
+pub(crate) fn spawn_monitor(pids: &[libc::pid_t]) -> Result<StuckMonitorHandle> {
     let interval = resolve_poll_interval();
     let pids: Vec<libc::pid_t> = pids.to_vec();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let reports: Arc<Mutex<Vec<StallReport>>> = Arc::new(Mutex::new(Vec::new()));
+    let reports: Arc<Mutex<Vec<StuckReport>>> = Arc::new(Mutex::new(Vec::new()));
 
     let thread_shutdown = Arc::clone(&shutdown);
     let thread_reports = Arc::clone(&reports);
 
     let thread = thread::Builder::new()
-        .name("ktstr-stall-mon".to_string())
+        .name("ktstr-stuck-mon".to_string())
         .spawn(move || {
             poll_loop(pids, interval, thread_shutdown, thread_reports);
         })
-        .map_err(|e| anyhow::anyhow!("failed to spawn stall-monitor thread: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to spawn stuck-monitor thread: {e}"))?;
 
-    Ok(StallMonitorHandle {
-        monitor: StallMonitor { shutdown, reports },
+    Ok(StuckMonitorHandle {
+        monitor: StuckMonitor { shutdown, reports },
         thread: Some(thread),
     })
 }
 
-/// Resolve the poll interval from [`KTSTR_STALL_POLL_MS_ENV`].
+/// Resolve the poll interval from [`KTSTR_STUCK_POLL_MS_ENV`].
 ///
 /// Contract: empty / unset / `0` / unparseable falls back to
 /// [`DEFAULT_POLL_INTERVAL_MS`]. Any positive `u64` value is honored
 /// verbatim. Mirrors the empty-string-as-unset contract documented
 /// on the env-var const.
 fn resolve_poll_interval() -> Duration {
-    let ms = std::env::var(KTSTR_STALL_POLL_MS_ENV)
+    let ms = std::env::var(KTSTR_STUCK_POLL_MS_ENV)
         .ok()
         .filter(|v| !v.is_empty())
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -301,22 +301,22 @@ fn resolve_poll_interval() -> Duration {
 
 /// Polling loop body. Runs until `shutdown` flips. Each iteration
 /// samples every pid in `pids`, advances per-pid sliding windows,
-/// and appends a [`StallReport`] when the predicate trips.
+/// and appends a [`StuckReport`] when the predicate trips.
 fn poll_loop(
     pids: Vec<libc::pid_t>,
     interval: Duration,
     shutdown: Arc<AtomicBool>,
-    reports: Arc<Mutex<Vec<StallReport>>>,
+    reports: Arc<Mutex<Vec<StuckReport>>>,
 ) {
     // Per-pid state: the sliding sample window plus an "armed"
     // flag that prevents a permanently-stuck pid from spamming the
     // report list every iteration. The pid stays "disarmed" until
     // forward progress is observed (any non-zero delta in either
     // counter), at which point it re-arms and can fire again on
-    // the next stall window.
+    // the next stuck window.
     let mut windows: Vec<(libc::pid_t, VecDeque<SchedSample>, bool)> = pids
         .iter()
-        .map(|&p| (p, VecDeque::with_capacity(STALL_WINDOW), true))
+        .map(|&p| (p, VecDeque::with_capacity(STUCK_WINDOW), true))
         .collect();
 
     while !shutdown.load(Ordering::SeqCst) {
@@ -336,7 +336,7 @@ fn poll_loop(
                 let comm =
                     read_comm(*pid).unwrap_or_else(|reason| format!("[unreadable: {reason}]"));
                 let diagnostic = capture_diagnostic(*pid);
-                let report = StallReport {
+                let report = StuckReport {
                     pid: *pid,
                     comm,
                     samples,
@@ -346,7 +346,7 @@ fn poll_loop(
                 {
                     let mut guard = reports
                         .lock()
-                        .expect("stall-monitor reports mutex poisoned");
+                        .expect("stuck-monitor reports mutex poisoned");
                     guard.push(report);
                 }
             }
@@ -376,15 +376,15 @@ fn poll_loop(
 ///
 /// 1. Push `sample` onto `window`.
 /// 2. Evict the oldest sample if the window now exceeds
-///    [`STALL_WINDOW`].
+///    [`STUCK_WINDOW`].
 /// 3. Re-arm `armed` when the two most recent samples show
 ///    forward progress in either counter (`nr_switches` or
 ///    `sum_exec_runtime_ns`).
-/// 4. When `armed` AND [`stall_predicate`] fires, return `true`
-///    (caller emits a [`StallReport`]) and disarm.
+/// 4. When `armed` AND [`stuck_predicate`] fires, return `true`
+///    (caller emits a [`StuckReport`]) and disarm.
 ///
-/// Returns `true` when this iteration produced a stall — the
-/// caller is expected to construct a [`StallReport`] from the
+/// Returns `true` when this iteration produced a stuck fire — the
+/// caller is expected to construct a [`StuckReport`] from the
 /// window contents and the pid. Returns `false` otherwise.
 ///
 /// Extracted from [`poll_loop`] so unit tests can exercise the
@@ -397,7 +397,7 @@ pub(crate) fn process_iteration(
     armed: &mut bool,
 ) -> bool {
     window.push_back(sample);
-    while window.len() > STALL_WINDOW {
+    while window.len() > STUCK_WINDOW {
         window.pop_front();
     }
     // Re-arm whenever forward progress is observed between the
@@ -412,7 +412,7 @@ pub(crate) fn process_iteration(
             *armed = true;
         }
     }
-    if *armed && stall_predicate(window.make_contiguous()) {
+    if *armed && stuck_predicate(window.make_contiguous()) {
         *armed = false;
         true
     } else {
@@ -420,16 +420,16 @@ pub(crate) fn process_iteration(
     }
 }
 
-/// Stall predicate: returns `true` when `samples.len() >=
-/// STALL_WINDOW` AND every consecutive pair has both `nr_switches`
+/// Stuck predicate: returns `true` when `samples.len() >=
+/// STUCK_WINDOW` AND every consecutive pair has both `nr_switches`
 /// delta == 0 AND `sum_exec_runtime_ns` delta == 0. A window
-/// shorter than [`STALL_WINDOW`] never fires (insufficient signal).
+/// shorter than [`STUCK_WINDOW`] never fires (insufficient signal).
 ///
 /// Extracted as a free function so a unit test can exercise the
 /// predicate directly with synthetic [`SchedSample`] sequences
 /// without spinning up the polling thread.
-pub fn stall_predicate(samples: &[SchedSample]) -> bool {
-    if samples.len() < STALL_WINDOW {
+pub fn stuck_predicate(samples: &[SchedSample]) -> bool {
+    if samples.len() < STUCK_WINDOW {
         return false;
     }
     for pair in samples.windows(2) {
@@ -536,12 +536,12 @@ fn read_comm(pid: libc::pid_t) -> std::result::Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Capture a [`StallDiagnostic`] for a stalled pid. Every field is
+/// Capture a [`StuckDiagnostic`] for a stuck pid. Every field is
 /// read independently; an unreadable field becomes a
 /// `"[unreadable: <reason>]"` stand-in rather than aborting the
 /// snapshot — `/proc/<pid>/stack` in particular is privileged and
 /// commonly absent.
-fn capture_diagnostic(pid: libc::pid_t) -> StallDiagnostic {
+fn capture_diagnostic(pid: libc::pid_t) -> StuckDiagnostic {
     let wchan = read_proc_field(pid, "wchan");
     let syscall = read_proc_field(pid, "syscall");
     let status_full = read_proc_field(pid, "status");
@@ -553,7 +553,7 @@ fn capture_diagnostic(pid: libc::pid_t) -> StallDiagnostic {
     let host_loadavg = std::fs::read_to_string("/proc/loadavg")
         .map(|s| s.trim_end_matches('\n').to_string())
         .unwrap_or_else(|e| format!("[unreadable: {e}]"));
-    StallDiagnostic {
+    StuckDiagnostic {
         wchan,
         syscall,
         state,
@@ -567,7 +567,7 @@ fn capture_diagnostic(pid: libc::pid_t) -> StallDiagnostic {
 /// Read `/proc/<pid>/<field>` and return its contents trimmed.
 /// Failures (EACCES, ENOENT) become a `"[unreadable: <reason>]"`
 /// stand-in so the diagnostic always carries a value per field —
-/// the operator triaging a stall can tell apart "kernel didn't
+/// the operator triaging a stuck worker can tell apart "kernel didn't
 /// expose it" from "monitor failed to read it".
 fn read_proc_field(pid: libc::pid_t, field: &str) -> String {
     match std::fs::read_to_string(format!("/proc/{pid}/{field}")) {
@@ -668,12 +668,12 @@ clock-delta                                  :                       0
     }
 
     /// Window with W consecutive identical samples → predicate
-    /// fires. Pins the core stall detection contract.
+    /// fires. Pins the core stuck detection contract.
     #[test]
-    fn stall_predicate_fires_after_w_samples_no_delta() {
-        let samples: Vec<SchedSample> = (0..STALL_WINDOW).map(|_| s(100, 5_000)).collect();
+    fn stuck_predicate_fires_after_w_samples_no_delta() {
+        let samples: Vec<SchedSample> = (0..STUCK_WINDOW).map(|_| s(100, 5_000)).collect();
         assert!(
-            stall_predicate(&samples),
+            stuck_predicate(&samples),
             "all-flat window of W samples must fire"
         );
     }
@@ -682,30 +682,30 @@ clock-delta                                  :                       0
     /// does NOT fire, even if every other pair is flat. Pins the
     /// "any progress disqualifies" semantic.
     #[test]
-    fn stall_predicate_skips_when_delta_present() {
+    fn stuck_predicate_skips_when_delta_present() {
         // Three flat samples then one with a switch — the
         // last-pair delta is non-zero so predicate stays false.
         let samples = vec![s(100, 5_000), s(100, 5_000), s(100, 5_000), s(101, 5_000)];
         assert!(
-            !stall_predicate(&samples),
+            !stuck_predicate(&samples),
             "any non-zero delta in any consecutive pair must keep predicate false",
         );
         // Same for an exec_runtime move.
         let samples = vec![s(100, 5_000), s(100, 5_000), s(100, 5_001), s(100, 5_001)];
         assert!(
-            !stall_predicate(&samples),
+            !stuck_predicate(&samples),
             "exec_runtime delta in any pair must keep predicate false",
         );
         // And a window shorter than W never fires regardless.
-        let short: Vec<SchedSample> = (0..STALL_WINDOW - 1).map(|_| s(100, 5_000)).collect();
+        let short: Vec<SchedSample> = (0..STUCK_WINDOW - 1).map(|_| s(100, 5_000)).collect();
         assert!(
-            !stall_predicate(&short),
-            "window shorter than STALL_WINDOW must not fire (insufficient signal)",
+            !stuck_predicate(&short),
+            "window shorter than STUCK_WINDOW must not fire (insufficient signal)",
         );
     }
 
     /// `capture_diagnostic` against pid 0 (an invalid pid that
-    /// fails every read) returns a populated [`StallDiagnostic`]
+    /// fails every read) returns a populated [`StuckDiagnostic`]
     /// where every string field carries the `"[unreadable: ...]"`
     /// stand-in and `stack` is `None`. Pins the
     /// graceful-degradation contract: a privileged or missing
@@ -747,7 +747,7 @@ clock-delta                                  :                       0
         );
     }
 
-    /// Sliding window honors [`STALL_WINDOW`]: once full, the
+    /// Sliding window honors [`STUCK_WINDOW`]: once full, the
     /// oldest sample is evicted as new ones arrive, so the
     /// predicate always sees the most-recent W samples. Pins the
     /// "predicate sees last W" guarantee.
@@ -757,18 +757,18 @@ clock-delta                                  :                       0
         // spinning the actual thread: push samples through a
         // VecDeque with the same eviction policy and verify the
         // contents.
-        let mut window: VecDeque<SchedSample> = VecDeque::with_capacity(STALL_WINDOW);
+        let mut window: VecDeque<SchedSample> = VecDeque::with_capacity(STUCK_WINDOW);
         // Push 6 samples (more than W=4): values 0..6.
-        for i in 0..(STALL_WINDOW + 2) {
+        for i in 0..(STUCK_WINDOW + 2) {
             window.push_back(s(i as u64, i as u64 * 10));
-            while window.len() > STALL_WINDOW {
+            while window.len() > STUCK_WINDOW {
                 window.pop_front();
             }
         }
         assert_eq!(
             window.len(),
-            STALL_WINDOW,
-            "window size must stay at STALL_WINDOW after overflow",
+            STUCK_WINDOW,
+            "window size must stay at STUCK_WINDOW after overflow",
         );
         // The oldest two were evicted; the head should be sample
         // index 2 (out of 0..6 pushed).
@@ -780,7 +780,7 @@ clock-delta                                  :                       0
         let tail = window.back().expect("window non-empty");
         assert_eq!(
             tail.nr_switches,
-            (STALL_WINDOW + 1) as u64,
+            (STUCK_WINDOW + 1) as u64,
             "newest sample must be the last pushed (index W+1)",
         );
         // None of these consecutive pairs is flat (every pair
@@ -788,7 +788,7 @@ clock-delta                                  :                       0
         // though the window is full.
         let snap: Vec<SchedSample> = window.iter().copied().collect();
         assert!(
-            !stall_predicate(&snap),
+            !stuck_predicate(&snap),
             "monotonic samples must not trip predicate"
         );
     }
@@ -796,29 +796,29 @@ clock-delta                                  :                       0
     // -- process_iteration tests --
     //
     // Pin the per-pid state machine extracted from poll_loop:
-    // re-arm after stall-then-resume, spawn-gate behavior
+    // re-arm after stuck-then-resume, spawn-gate behavior
     // when the initial window is empty, and the fire-disarm
     // sequence so a permanently-stuck pid produces ONE report
-    // per stall window, not one per polling iteration.
+    // per stuck window, not one per polling iteration.
 
     /// Spawn-gate behavior: an initial window starts armed but
-    /// empty. The first STALL_WINDOW samples can't fire (predicate
-    /// requires >= STALL_WINDOW samples). Only the STALL_WINDOW'th
-    /// flat sample can trip the stall.
+    /// empty. The first STUCK_WINDOW samples can't fire (predicate
+    /// requires >= STUCK_WINDOW samples). Only the STUCK_WINDOW'th
+    /// flat sample can trip the predicate.
     #[test]
     fn process_iteration_spawn_gate_short_window_never_fires() {
-        let mut window: VecDeque<SchedSample> = VecDeque::with_capacity(STALL_WINDOW);
+        let mut window: VecDeque<SchedSample> = VecDeque::with_capacity(STUCK_WINDOW);
         let mut armed = true;
-        // Feed STALL_WINDOW - 1 identical samples; predicate
+        // Feed STUCK_WINDOW - 1 identical samples; predicate
         // sees a short window every iteration and stays false.
-        for _ in 0..(STALL_WINDOW - 1) {
+        for _ in 0..(STUCK_WINDOW - 1) {
             assert!(
                 !process_iteration(s(100, 5_000), &mut window, &mut armed),
                 "short window must not fire (spawn-gate semantic)",
             );
         }
         assert!(armed, "no resume seen → stays armed");
-        // The STALL_WINDOW'th identical sample fills the window
+        // The STUCK_WINDOW'th identical sample fills the window
         // → predicate fires.
         assert!(
             process_iteration(s(100, 5_000), &mut window, &mut armed),
@@ -827,17 +827,17 @@ clock-delta                                  :                       0
         assert!(!armed, "fire path disarms");
     }
 
-    /// Re-arm after stall-then-resume: a fired stall disarms
+    /// Re-arm after stuck-then-resume: a fired stuck event disarms
     /// the pid; resume (forward progress) re-arms; a subsequent
     /// flat window fires AGAIN. A regression that
     /// dropped the re-arm branch would never produce the second
-    /// report, silently hiding recurrent stalls.
+    /// report, silently hiding recurrent stuck events.
     #[test]
-    fn process_iteration_rearm_after_stall_then_resume() {
-        let mut window: VecDeque<SchedSample> = VecDeque::with_capacity(STALL_WINDOW);
+    fn process_iteration_rearm_after_stuck_then_resume() {
+        let mut window: VecDeque<SchedSample> = VecDeque::with_capacity(STUCK_WINDOW);
         let mut armed = true;
-        // Fill window with flat samples → first stall fires.
-        for _ in 0..STALL_WINDOW {
+        // Fill window with flat samples → first stuck event fires.
+        for _ in 0..STUCK_WINDOW {
             process_iteration(s(100, 5_000), &mut window, &mut armed);
         }
         assert!(!armed, "after first fire, disarmed");
@@ -849,11 +849,11 @@ clock-delta                                  :                       0
             "resume sample must not fire (last pair has delta)",
         );
         assert!(armed, "resume sample must re-arm");
-        // Re-stall: feed STALL_WINDOW identical samples. Need to
-        // overwrite the resume sample first, so STALL_WINDOW more
+        // Re-stuck: feed STUCK_WINDOW identical samples. Need to
+        // overwrite the resume sample first, so STUCK_WINDOW more
         // flat samples are needed to refill the window.
         let mut second_fire_iter = None;
-        for i in 0..STALL_WINDOW {
+        for i in 0..STUCK_WINDOW {
             if process_iteration(s(101, 5_001), &mut window, &mut armed) {
                 second_fire_iter = Some(i);
                 break;
@@ -861,24 +861,24 @@ clock-delta                                  :                       0
         }
         assert!(
             second_fire_iter.is_some(),
-            "second stall window must fire after re-arm; got no fire across {} iters",
-            STALL_WINDOW,
+            "second stuck window must fire after re-arm; got no fire across {} iters",
+            STUCK_WINDOW,
         );
         assert!(!armed, "second fire disarms");
     }
 
     /// Permanently-stuck pid produces EXACTLY ONE report per
-    /// stall window, not one per polling iteration. Pins the
+    /// stuck window, not one per polling iteration. Pins the
     /// "stays disarmed until forward progress" semantic so a
     /// hung process doesn't spam the reports vec across hundreds
     /// of iterations.
     #[test]
-    fn process_iteration_permanent_stall_fires_only_once() {
-        let mut window: VecDeque<SchedSample> = VecDeque::with_capacity(STALL_WINDOW);
+    fn process_iteration_permanent_stuck_fires_only_once() {
+        let mut window: VecDeque<SchedSample> = VecDeque::with_capacity(STUCK_WINDOW);
         let mut armed = true;
         // Fill window + fire (one report).
         let mut fire_count = 0;
-        for _ in 0..STALL_WINDOW {
+        for _ in 0..STUCK_WINDOW {
             if process_iteration(s(100, 5_000), &mut window, &mut armed) {
                 fire_count += 1;
             }

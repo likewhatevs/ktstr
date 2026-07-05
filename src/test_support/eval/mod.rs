@@ -175,9 +175,7 @@ pub(crate) fn run_ktstr_test_inner(
 ) -> Result<AssertResult> {
     let result = run_ktstr_test_inner_impl(entry, topo);
     if let Err(ref e) = result
-        && (super::is_resource_contention(e)
-            || super::is_topology_insufficient(e)
-            || super::is_perf_mode_unavailable(e))
+        && let Some(host_skip_class) = super::host_skip_class(e)
     {
         // Late catch-all for a skip-class error (ResourceContention,
         // TopologyInsufficient, or PerfModeUnavailable) from any early-bail
@@ -192,7 +190,15 @@ pub(crate) fn run_ktstr_test_inner(
         // sidecar. Not strictly idempotent — a second write refreshes
         // run_id and timestamp — but the skip classification round-trips
         // identically, so stats tooling sees the same outcome.
-        record_skip_sidecar(entry, topo);
+        let resolved_topology = record_skip_sidecar(entry, topo);
+        // Host-driven skip: also drop a `.host-skip.json` marker so the
+        // end-of-run footer's host-skip block names this test under its
+        // class. Same variant hash as the skip sidecar just written.
+        crate::test_support::sidecar::write_host_skip_marker(
+            entry,
+            &resolved_topology,
+            host_skip_class,
+        );
     }
     // `expect_auto_repro = true` inversion: when the primary VM
     // failed AND the auto-repro VM landed a shape-valid
@@ -283,6 +289,19 @@ pub(crate) fn run_ktstr_test_inner(
             crate::test_support::sidecar::suppress_failure_dumps(entry.name, variant_hash)
         }
         None => {}
+    }
+    // Run-footer advisory: an `expect_err` inversion that PASSED only
+    // because the scheduler failed to LOAD/attach (never ran the runtime
+    // path the test intends). `take_primary_load_failure` drains the flag
+    // the impl set from the primary VM's `AttachOutcome`; gate on
+    // `entry.expect_err && passed` so the marker is written exactly when
+    // the inversion turned a load failure into a green test — the tell of
+    // a suite silently passing on a kernel where no scheduler can load.
+    // Drained unconditionally so the per-process thread-local never leaks
+    // into a later run.
+    let load_failure = take_primary_load_failure();
+    if entry.expect_err && passed && load_failure {
+        crate::test_support::sidecar::write_expect_err_load_marker(entry.name, variant_hash);
     }
     final_result
 }
@@ -537,6 +556,47 @@ fn contention_not_attached_skip_reason(
          `enabling` at the deadline, not a load/verify reject) — widen the \
          process cpuset or shrink the guest topology"
     ))
+}
+
+thread_local! {
+    /// Set by [`run_ktstr_test_inner_impl`] when the primary VM's
+    /// scheduler FAILED TO LOAD/attach ([`primary_scheduler_load_failed`])
+    /// on a run that produced a failure. Read + cleared by
+    /// [`run_ktstr_test_inner`] to decide whether an `expect_err`
+    /// inversion that ended in a PASS was satisfied by a load failure
+    /// (surfaced in the run footer) rather than the intended runtime
+    /// error. nextest is process-per-test, so one run sets it and the
+    /// paired take in the finalize wrapper drains it; an early bail before
+    /// the impl sets it leaves the default `false`.
+    static PRIMARY_LOAD_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record whether the primary VM's scheduler failed to load/attach on
+/// this run (see [`PRIMARY_LOAD_FAILURE`]).
+fn set_primary_load_failure(v: bool) {
+    PRIMARY_LOAD_FAILURE.with(|c| c.set(v));
+}
+
+/// Take (read + clear) the primary-VM load-failure flag for this run.
+fn take_primary_load_failure() -> bool {
+    PRIMARY_LOAD_FAILURE.with(|c| c.replace(false))
+}
+
+/// True when the primary VM's scheduler NEVER ATTACHED — it exited during
+/// BPF load/startup ([`crate::verifier::AttachOutcome::Died`]) or never
+/// reached sched_ext `enabled` (`NotAttached`). Distinct from a RUNTIME
+/// scheduler error (a stall or BPF abort AFTER attach, which leaves an
+/// `Attached` outcome): those are the failures `expect_err` tests
+/// legitimately intend. `Unconfirmed` (an early guest kernel panic with
+/// no lifecycle frame) is NOT counted — it is a kernel-level failure, not
+/// a scheduler load reject, and claiming "load failure" for it would
+/// mislead. Drives the run-footer advisory that makes a suite silently
+/// green because no scheduler could load on this kernel visible.
+fn primary_scheduler_load_failed(result: &vmm::VmResult) -> bool {
+    matches!(
+        crate::verifier::attach_outcome_from_messages(result.guest_messages.as_ref()),
+        crate::verifier::AttachOutcome::Died | crate::verifier::AttachOutcome::NotAttached(_)
+    )
 }
 
 fn run_ktstr_test_inner_impl(
@@ -1144,11 +1204,13 @@ fn run_ktstr_test_inner_impl(
             // KtstrKvm::new's "create VM"): walk the chain so a wrapped
             // skip-class error is still recorded here, matching the late
             // catch-all in run_ktstr_test_inner.
-            if super::is_resource_contention(&e)
-                || super::is_topology_insufficient(&e)
-                || super::is_perf_mode_unavailable(&e)
-            {
-                record_skip_sidecar(entry, topo);
+            if let Some(class) = super::host_skip_class(&e) {
+                let resolved_topology = record_skip_sidecar(entry, topo);
+                crate::test_support::sidecar::write_host_skip_marker(
+                    entry,
+                    &resolved_topology,
+                    class,
+                );
             }
             return Err(e.context("build ktstr_test VM"));
         }
@@ -1157,11 +1219,13 @@ fn run_ktstr_test_inner_impl(
         Ok(r) => r,
         Err(e) => {
             // Chain-aware, as in the build arm above.
-            if super::is_resource_contention(&e)
-                || super::is_topology_insufficient(&e)
-                || super::is_perf_mode_unavailable(&e)
-            {
-                record_skip_sidecar(entry, topo);
+            if let Some(class) = super::host_skip_class(&e) {
+                let resolved_topology = record_skip_sidecar(entry, topo);
+                crate::test_support::sidecar::write_host_skip_marker(
+                    entry,
+                    &resolved_topology,
+                    class,
+                );
             }
             return Err(e.context("run ktstr_test VM"));
         }
@@ -1571,6 +1635,15 @@ fn run_ktstr_test_inner_impl(
             eval_result = Ok(AssertResult::skip(skip_reason));
         }
     }
+    // Record, for the run-footer advisory, whether this run's failure was
+    // a scheduler LOAD/attach failure (the scheduler never turned on) as
+    // opposed to a runtime scheduler error. Computed AFTER the contention
+    // reclassification so a contention SKIP (now `Ok`) is not counted —
+    // only a still-failing run whose primary scheduler never attached.
+    // The finalize wrapper (`run_ktstr_test_inner`) reads this to flag an
+    // `expect_err` inversion that passed only because no scheduler could
+    // load. See `primary_scheduler_load_failed` / `PRIMARY_LOAD_FAILURE`.
+    set_primary_load_failure(eval_result.is_err() && primary_scheduler_load_failed(&result));
     // Set result.expect_auto_repro_satisfied based on the artifact-on-disk
     // probe. Called AFTER evaluate_vm_result so the auto-repro VM has had
     // a chance to land its .repro.wprof.pb artifact via the host's

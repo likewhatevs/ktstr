@@ -156,7 +156,7 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
                 r.record_fail(crate::assert::AssertDetail::new(
                     crate::assert::DetailKind::Stuck,
                     format!(
-                        "pinned worker {} on CPU {} had {}ms gap (dispatch contention stall)",
+                        "pinned worker {} on CPU {} had {}ms gap (dispatch contention)",
                         w.tid,
                         w.cpus_used.iter().next().unwrap_or(&0),
                         w.max_gap_ms

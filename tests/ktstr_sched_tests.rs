@@ -161,7 +161,7 @@ static __KTSTR_ENTRY_BPF_API: ktstr::test_support::KtstrTestEntry =
         func: scenario_bpf_api_link,
         scheduler: &KTSTR_SCHED,
         auto_repro: false,
-        assert: ktstr::assert::Assert::NO_OVERRIDES.fail_on_stall(false),
+        assert: ktstr::assert::Assert::NO_OVERRIDES.fail_on_rq_clock_stuck(false),
         bpf_map_write: &[&BPF_NOOP],
         // The link scenario holds a fixed 2s. The cold-BTF
         // bpf_map_write phase-1 latency (the wait_for_map_write block
@@ -419,11 +419,15 @@ fn scenario_watchdog_timing_precision(
 /// `scx_sched.watchdog_timeout`; they must match. That readback is
 /// eager and in-DRAM, so (unlike the kernel-measured stall duration) it is
 /// immune to the watchdog-kworker starvation a deterministic stall
-/// induces. Tier 2: the watchdog actually FIRED a stall — the scenario
-/// forwards the guest kmsg via `ktstr::send_kmsg`, and a
+/// induces. Tier 2: the watchdog actually FIRED a stall — a
 /// SCX_EXIT_ERROR_STALL stall line must be present (presence, not the
 /// starvation-noisy duration), proving the death was a watchdog stall
-/// rather than a different scx exit. Runs unconditionally; its Err is a
+/// rather than a different scx exit. Two sources carry that line: the
+/// guest kmsg the scenario forwards via `ktstr::send_kmsg` (the kernel's
+/// own printk, but its emit races the resumed payload's read — see the
+/// tier-2 body) and the scheduler's forwarded log (its `uei_report` echo
+/// of the same exit reason, flushed race-free over the bulk port); a stall
+/// line in EITHER satisfies the tier. Runs unconditionally; its Err is a
 /// hard FAIL via PostVmAssertionFailure even though expect_err inverts
 /// the scheduler-died outcome to PASS.
 fn check_watchdog_timing(result: &VmResult) -> Result<()> {
@@ -452,6 +456,14 @@ fn check_watchdog_timing(result: &VmResult) -> Result<()> {
     // enforced, not just configured). Presence of a stall line is the
     // signal; the duration itself reflects when the starved watchdog
     // kworker finally ran, not the 2s timeout, so it is not asserted.
+    //
+    // An empty guest kmsg means the payload never resumed to forward it:
+    // on a host/kernel where the stall is suppressed (a quiet host can
+    // starve the watchdog kworker before it observes the parked workload,
+    // so SCX_EXIT_ERROR_STALL never fires and the workload task stays
+    // parked for the whole run), the scenario is force-rebooted mid-hold
+    // and `send_kmsg` never runs. Treat that as inconclusive, not a
+    // failure — tier 1 already proved the override value landed.
     let kmsg = result.guest_kmsg();
     if kmsg.is_empty() {
         return Err(post_vm_skip(
@@ -461,12 +473,28 @@ fn check_watchdog_timing(result: &VmResult) -> Result<()> {
              the run is inconclusive",
         ));
     }
+    // A non-empty kmsg means the payload resumed, so the scheduler DIED and
+    // its tasks fell back to fair. The kernel's stall printk
+    // (`scx_log_sched_disable`'s `pr_err` in kernel/sched/ext.c) reaches
+    // /dev/kmsg only from the disable workfn, which runs AFTER scx enters
+    // bypass and re-releases tasks — so the resumed payload's `read_kmsg`
+    // can race ahead of it and forward a kmsg that lacks the line. The
+    // scheduler's own `uei_report` echo of the SAME SCX_EXIT_ERROR_STALL
+    // reason ("… failed to run for {d}s") is flushed to its captured log
+    // over the fast bulk port during the crash grace window, race-free;
+    // corroborate against it so the tier holds regardless of which side of
+    // that race the kmsg read landed on. Failing only when NEITHER source
+    // carries a stall line still catches a death via a different scx exit
+    // path or a changed printk format.
+    let sched_log = result.scheduler_log();
     anyhow::ensure!(
-        parse_stall_duration_seconds(&kmsg).is_some(),
-        "watchdog override landed ({observed_jiffies} jiffies) but the guest \
-         kmsg has no SCX_EXIT_ERROR_STALL stall line ('failed to run for' / \
-         'watchdog failed to check in for') — the scheduler exited via a \
-         different path, or the kernel printk format changed. kmsg: {kmsg}"
+        parse_stall_duration_seconds(&kmsg).is_some()
+            || parse_stall_duration_seconds(&sched_log).is_some(),
+        "watchdog override landed ({observed_jiffies} jiffies) but neither \
+         the guest kmsg nor the scheduler log has an SCX_EXIT_ERROR_STALL \
+         stall line ('failed to run for' / 'watchdog failed to check in \
+         for') — the scheduler exited via a different path, or the kernel \
+         printk format changed. kmsg: {kmsg}\nsched_log: {sched_log}"
     );
     eprintln!(
         "watchdog override applied + enforced: scx_sched.watchdog_timeout = \

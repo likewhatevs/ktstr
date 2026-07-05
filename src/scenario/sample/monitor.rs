@@ -83,10 +83,10 @@ impl<'a> MonitorView<'a> {
         &self.report.samples
     }
 
-    /// vCPU-preemption exemption window (ns) for stall detection,
+    /// vCPU-preemption exemption window (ns) for stuck detection,
     /// derived from the guest kernel's `CONFIG_HZ` at run time. `0`
     /// means "derive from a default" — callers folding per-phase
-    /// stall counts pass it through to
+    /// stuck counts pass it through to
     /// `crate::timeline::compute_metrics` so the per-phase predicate
     /// matches the run-level `MonitorSummary::stuck_count` one.
     pub fn preemption_threshold_ns(&self) -> u64 {

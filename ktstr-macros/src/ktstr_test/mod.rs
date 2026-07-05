@@ -336,7 +336,7 @@ pub(crate) const BOOL_ATTR_NAMES: &[&str] = &[
     "expect_err",
     "survives_storm",
     "allow_inconclusive",
-    "fail_on_stall",
+    "fail_on_rq_clock_stuck",
     "host_only",
     "ignore",
     "kaslr",
@@ -467,7 +467,7 @@ pub(crate) struct AttrValues {
     pub(crate) max_spread_pct: Option<f64>,
     pub(crate) max_imbalance_ratio: Option<f64>,
     pub(crate) max_local_dsq_depth: Option<u32>,
-    pub(crate) fail_on_stall: Option<bool>,
+    pub(crate) fail_on_rq_clock_stuck: Option<bool>,
     pub(crate) sustained_samples: Option<usize>,
     pub(crate) max_throughput_cv: Option<f64>,
     pub(crate) min_work_rate: Option<f64>,
@@ -573,7 +573,7 @@ impl Default for AttrValues {
             max_spread_pct: None,
             max_imbalance_ratio: None,
             max_local_dsq_depth: None,
-            fail_on_stall: None,
+            fail_on_rq_clock_stuck: None,
             sustained_samples: None,
             max_throughput_cv: None,
             min_work_rate: None,
@@ -688,7 +688,7 @@ impl AttrValues {
                 self.allow_inconclusive = value;
                 self.allow_inconclusive_set = true;
             }
-            "fail_on_stall" => self.fail_on_stall = Some(value),
+            "fail_on_rq_clock_stuck" => self.fail_on_rq_clock_stuck = Some(value),
             "host_only" => {
                 self.host_only = value;
                 self.host_only_set = true;

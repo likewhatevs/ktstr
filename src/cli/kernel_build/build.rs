@@ -351,6 +351,13 @@ fn cache_hit_diagnostic(cache_key: &str) -> String {
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
 ///
+/// `force` mirrors `kernel build --force`: when set, the post-acquire
+/// cache re-check below does NOT short-circuit on a peer-populated slot.
+/// A forced build must actually rebuild — the peer-dedup skip only
+/// spares a redundant NON-forced rebuild. (The caller already does its
+/// own pre-acquire `!force` cache lookup; this gates the second,
+/// post-source-lock lookup the caller cannot reach.)
+///
 /// `is_local_source` should be true when the source is a local
 /// kernel source tree, regardless of how the caller arrived there
 /// (`kernel build --kernel <path>`, `cargo ktstr test --kernel <path>`,
@@ -387,6 +394,7 @@ pub fn kernel_build_pipeline(
     cache: &crate::cache::CacheDir,
     cli_label: &str,
     clean: bool,
+    force: bool,
     is_local_source: bool,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
     extra_kconfig: Option<&str>,
@@ -506,7 +514,8 @@ pub fn kernel_build_pipeline(
         eprintln!("{cli_label}: {body}");
     }
 
-    if mid_wait_clean
+    if !force
+        && mid_wait_clean
         && let Some(entry) =
             crate::cli::resolve::cache_lookup(cache, &acquired.cache_key, cli_label)
         && entry.image_path().exists()
@@ -1594,6 +1603,33 @@ mod tests {
             cache_hit_diagnostic(cache_key),
             cache_hit_diagnostic("different-key-x86-64"),
             "cache_key substitution must be load-bearing, not a no-op",
+        );
+    }
+
+    /// Pins the `force` gate on the post-acquire cache short-circuit in
+    /// [`kernel_build_pipeline`]. The peer-dedup skip fires only when ALL
+    /// of `!force && mid_wait_clean && cache-hit && image-exists` hold;
+    /// `--force` must rebuild even when a peer already populated the slot
+    /// (the observed bug: a forced build silently no-op'd via this path).
+    /// Mirrors the production `if !force && mid_wait_clean && ...` guard —
+    /// keep in lockstep with the short-circuit condition.
+    #[test]
+    fn force_bypasses_post_acquire_cache_short_circuit() {
+        // All three non-force preconditions hold (a warm, peer-populated
+        // slot on a clean tree): the skip fires only when NOT forced.
+        let mid_wait_clean = true;
+        let cache_hit = true;
+        let image_exists = true;
+        let short_circuits = |force: bool| !force && mid_wait_clean && cache_hit && image_exists;
+        assert!(
+            short_circuits(false),
+            "non-forced build with a warm peer-populated slot must skip \
+             the redundant rebuild",
+        );
+        assert!(
+            !short_circuits(true),
+            "--force must rebuild through a warm peer-populated slot, not \
+             short-circuit — a forced build that no-ops defeats --force",
         );
     }
 

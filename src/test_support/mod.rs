@@ -72,6 +72,12 @@ mod output;
 pub(crate) use output::parse_assert_result_from_drain;
 mod payload;
 mod probe;
+// Reachable crate-wide so the freeze coordinator can detect the guest's
+// probe-payload end delimiter in the drained bulk-port stdout stream and
+// hold teardown until Phase 6b has shipped (see freeze_coord's wprof-ship
+// kill gating). The const itself is pub(crate); this lifts it out of the
+// private `probe` module onto a stable `test_support::` path.
+pub(crate) use probe::PROBE_OUTPUT_END;
 mod probe_metrics;
 mod profraw;
 pub use eval::post_vm_skip;
@@ -146,6 +152,7 @@ pub use entry::{
 };
 pub use eval::{KernelUnavailable, ResolveSource, resolve_scheduler, resolve_test_kernel};
 pub(crate) use eval::{record_skip_sidecar, run_ktstr_test_inner};
+pub(crate) use host_class::host_skip_class;
 pub use host_class::{HostClass, classify_host_error};
 pub use metrics::{
     MAX_WALK_DEPTH, WALK_TRUNCATION_SENTINEL_NAME, extract_metrics, is_truncation_sentinel_name,

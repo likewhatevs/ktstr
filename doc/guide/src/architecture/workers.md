@@ -106,7 +106,7 @@ call is a no-op. Call it after cgroup placement.
 
 **`snapshot_iterations()`** reads every worker's current iteration
 count from a shared-memory region without stopping anything. Call it
-periodically during the run window to detect stalls or compute
+periodically during the run window to detect stuck workers or compute
 instantaneous rates; final totals come from `stop_and_collect()`.
 
 ## Stop and collect

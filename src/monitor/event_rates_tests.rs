@@ -54,7 +54,7 @@ fn thresholds_fallback_rate_sustained_fails() {
     let t = MonitorThresholds {
         sustained_samples: 3,
         max_fallback_rate: 10.0,
-        fail_on_stall: false,
+        fail_on_rq_clock_stuck: false,
         enforce: true,
         ..Default::default()
     };
@@ -78,7 +78,7 @@ fn thresholds_fallback_rate_below_sustained_passes() {
     let t = MonitorThresholds {
         sustained_samples: 3,
         max_fallback_rate: 10.0,
-        fail_on_stall: false,
+        fail_on_rq_clock_stuck: false,
         ..Default::default()
     };
     let mut samples: Vec<_> = (0..3)
@@ -101,7 +101,7 @@ fn thresholds_keep_last_rate_sustained_fails() {
     let t = MonitorThresholds {
         sustained_samples: 3,
         max_keep_last_rate: 10.0,
-        fail_on_stall: false,
+        fail_on_rq_clock_stuck: false,
         enforce: true,
         ..Default::default()
     };
@@ -124,7 +124,7 @@ fn thresholds_keep_last_rate_below_sustained_passes() {
     let t = MonitorThresholds {
         sustained_samples: 3,
         max_keep_last_rate: 10.0,
-        fail_on_stall: false,
+        fail_on_rq_clock_stuck: false,
         ..Default::default()
     };
     let mut samples: Vec<_> = (0..3)
@@ -148,7 +148,7 @@ fn thresholds_event_rate_interrupted_resets() {
     let t = MonitorThresholds {
         sustained_samples: 3,
         max_fallback_rate: 10.0,
-        fail_on_stall: false,
+        fail_on_rq_clock_stuck: false,
         ..Default::default()
     };
     let mut samples = Vec::new();
@@ -197,7 +197,7 @@ fn thresholds_no_event_counters_skips_rate_check() {
         sustained_samples: 1,
         max_fallback_rate: 0.0, // any rate would fail
         max_keep_last_rate: 0.0,
-        fail_on_stall: false,
+        fail_on_rq_clock_stuck: false,
         ..Default::default()
     };
     let samples: Vec<_> = (0..5)
@@ -348,7 +348,7 @@ fn neg_fallback_rate_threshold_fires() {
     let t = MonitorThresholds {
         sustained_samples: 2,
         max_fallback_rate: 5.0,
-        fail_on_stall: false,
+        fail_on_rq_clock_stuck: false,
         enforce: true,
         ..Default::default()
     };
@@ -392,7 +392,7 @@ fn neg_keep_last_rate_threshold_fires() {
     let t = MonitorThresholds {
         sustained_samples: 2,
         max_keep_last_rate: 5.0,
-        fail_on_stall: false,
+        fail_on_rq_clock_stuck: false,
         enforce: true,
         ..Default::default()
     };

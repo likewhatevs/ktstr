@@ -14,6 +14,14 @@ enum {
 	SHARED_DSQ = 0,
 };
 
+/* `PF_KTHREAD` (include/linux/sched.h) is a CPP macro, not a BTF enum,
+ * so it is absent from the CO-RE `vmlinux.h`; define it locally to test
+ * `task_struct->flags` for kernel threads. Stable ABI value across every
+ * kernel scx-ktstr targets. */
+#ifndef PF_KTHREAD
+#define PF_KTHREAD 0x00200000
+#endif
+
 char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
@@ -382,16 +390,22 @@ s32 BPF_STRUCT_OPS(ktstr_select_cpu, struct task_struct *p,
 {
 	bool is_idle = false;
 	s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
-	/* When stalling, skip the idle-CPU direct-dispatch fast path: a
-	 * SCX_DSQ_LOCAL insert here bypasses both SHARED_DSQ and the
-	 * `if (stall) return` guard in ktstr_dispatch, so the task keeps
+	/* When stalling a WORKLOAD task, skip the idle-CPU direct-dispatch
+	 * fast path: a SCX_DSQ_LOCAL insert here bypasses both SHARED_DSQ and
+	 * the `if (stall) return` guard in ktstr_dispatch, so the task keeps
 	 * running and the kernel watchdog never sees it runnable past
 	 * watchdog_timeout (check_rq_for_timeouts, kernel/sched/ext.c).
 	 * Under host load the idle-CPU rate is high enough that this leak
 	 * suppresses the stall entirely. Gating on `stall` routes the
 	 * wakeup through ktstr_enqueue -> SHARED_DSQ, where the dispatch
-	 * guard holds it and the watchdog fires deterministically. */
-	if (!stall && is_idle)
+	 * guard holds it and the watchdog fires deterministically.
+	 *
+	 * Kernel threads are EXEMPT even while stalling (`p->flags &
+	 * PF_KTHREAD`): in full-switch mode scx-ktstr owns the kworker that
+	 * runs the watchdog itself, so parking kthreads would stall the
+	 * watchdog and the stall would never be detected (see ktstr_enqueue).
+	 * Keep them on the fast path so the watchdog kworker keeps running. */
+	if ((!stall || (p->flags & PF_KTHREAD)) && is_idle)
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 	__sync_fetch_and_add(&nr_select_cpu, 1);
 	return cpu;
@@ -400,6 +414,22 @@ s32 BPF_STRUCT_OPS(ktstr_select_cpu, struct task_struct *p,
 void BPF_STRUCT_OPS(ktstr_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	__sync_fetch_and_add(&nr_enqueued, 1);
+	/* A stall must trap only the workload's SCHED_NORMAL tasks — never
+	 * kernel threads. In full-switch mode (no SCX_OPS_SWITCH_PARTIAL)
+	 * scx-ktstr owns every SCHED_NORMAL task, INCLUDING the kworker that
+	 * runs the sched_ext runnable-timeout watchdog
+	 * (scx_watchdog_workfn on system_unbound_wq). Parking that kworker in
+	 * SHARED_DSQ under the `if (stall) return` dispatch guard stalls the
+	 * watchdog itself, so it never runs to observe the stalled workload
+	 * and SCX_EXIT_ERROR_STALL never fires — the stall is silently
+	 * suppressed on a quiet host where no other activity keeps the
+	 * watchdog kworker off scx's DSQs. Keep kthreads on a local DSQ so
+	 * the watchdog kworker (and other kernel machinery) keeps running and
+	 * fires deterministically on the parked workload task. */
+	if (stall && (p->flags & PF_KTHREAD)) {
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
+		return;
+	}
 	if (scattershot || degrade || degrade_rt) {
 		const struct cpumask *online;
 		u32 nr = scx_bpf_nr_cpu_ids();

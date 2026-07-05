@@ -927,7 +927,7 @@ pub mod prelude {
     // `Op::ReadKernel{Hot,Cold}`. Mirrors the existing exports for
     // `VirtioBlkCountersSnapshot` etc. — observability types the
     // post_vm contract requires in scope.
-    pub use crate::scenario::host_stall::{StallDiagnostic, StallReport};
+    pub use crate::scenario::host_stuck::{StuckDiagnostic, StuckReport};
     pub use crate::vmm::wire::{KernelOpReplyPayload, KernelOpValue};
     pub use crate::workload::{
         AffinityIntent, AluWidth, CloneMode, CustomCfg, CustomFn, FutexLockMode, MemPolicy,
@@ -1174,26 +1174,26 @@ pub const KTSTR_HOST_CGROUP_PARENT_ENV: &str = "KTSTR_HOST_CGROUP_PARENT";
 pub const KTSTR_CGROUP_WALK_ROOT_ENV: &str = "KTSTR_CGROUP_WALK_ROOT";
 
 /// Name of the environment variable that overrides the poll cadence
-/// (in milliseconds) of the host-mode stall monitor in
-/// [`crate::scenario::host_stall`].
+/// (in milliseconds) of the host-mode stuck monitor in
+/// [`crate::scenario::host_stuck`].
 ///
 /// The monitor runs in a background thread and samples
 /// `/proc/<pid>/sched` every N ms for every worker pid the scenario
 /// spawned; W consecutive samples with `Δnr_switches == 0` AND
-/// `Δsum_exec_runtime == 0` flip the stall predicate. Default
+/// `Δsum_exec_runtime == 0` flip the stuck predicate. Default
 /// cadence is 500 ms × W=4 = 2 s detection latency.
 ///
 /// # **Empty = unset** (also: `0` / unparseable)
 ///
 /// Empty / unset / `0` / unparseable falls back to the default
-/// ([`crate::scenario::host_stall::DEFAULT_POLL_INTERVAL_MS`]).
+/// ([`crate::scenario::host_stuck::DEFAULT_POLL_INTERVAL_MS`]).
 /// Mirrors the empty-as-unset contract documented on the sibling
-/// `KTSTR_*_ENV` constants so a shell `KTSTR_STALL_POLL_MS=` quirk
+/// `KTSTR_*_ENV` constants so a shell `KTSTR_STUCK_POLL_MS=` quirk
 /// silently degrades to default behavior rather than poisoning the
 /// poller with a zero interval (which would either busy-loop or be
 /// no-op-rejected).
 ///
-/// Read once at `crate::scenario::host_stall::spawn_monitor` when the
+/// Read once at `crate::scenario::host_stuck::spawn_monitor` when the
 /// scenario engine spawns the monitor; mid-scenario env mutations
 /// are NOT observed by the running thread.
 ///
@@ -1202,7 +1202,7 @@ pub const KTSTR_CGROUP_WALK_ROOT_ENV: &str = "KTSTR_CGROUP_WALK_ROOT";
 /// constant-defined naming convention; a single grep across
 /// `KTSTR_*_ENV` consts gives the operator the complete env-var
 /// inventory.
-pub const KTSTR_STALL_POLL_MS_ENV: &str = "KTSTR_STALL_POLL_MS";
+pub const KTSTR_STUCK_POLL_MS_ENV: &str = "KTSTR_STUCK_POLL_MS";
 
 /// Name of the environment variable that overrides the rayon
 /// pool width used by `cargo ktstr`'s `resolve_kernel_set` to

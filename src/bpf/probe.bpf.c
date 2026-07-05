@@ -551,10 +551,20 @@ int ktstr_probe(struct pt_regs *ctx)
  * its own tracepoint instance, in the context of the current task at
  * exit time.
  *
- * Typed arg gives the exit kind directly.
+ * The prototype must mirror the kernel tracepoint's
+ * `TP_PROTO(struct scx_sched *sch, enum scx_exit_kind kind)`: `kind`
+ * is the SECOND argument. Declaring only `unsigned int kind` binds it
+ * to arg0 (the `scx_sched *`), so the handler reads a pointer as the
+ * exit kind and the verifier rejects the resulting u32 sign-extension
+ * (`r9 <<= 32`) with EACCES, failing the whole skeleton load. `sch` is
+ * unused here (the exit-kind path needs only `kind`); it exists solely
+ * to align the argument positions. The leading `struct scx_sched *`
+ * adds no new BTF dependency on kernels lacking the type — the handler
+ * body already CO-RE-reads `struct scx_sched` (see scx_root /
+ * scx_sched___fwd above).
  */
 SEC("tp_btf/sched_ext_exit")
-int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
+int BPF_PROG(ktstr_trigger_tp, struct scx_sched *sch, unsigned int kind)
 {
 	ktstr_pcpu_inc(KTSTR_PCPU_TRIGGER_COUNT);
 

@@ -787,6 +787,7 @@ fn kernel_build_one(
         &cache,
         "ktstr",
         clean,
+        force,
         source.is_some(),
         resolved_cap,
         extra_kconfig,

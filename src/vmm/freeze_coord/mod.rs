@@ -174,6 +174,25 @@ fn is_sched_exit_frame(msg: &crate::vmm::bulk::BulkMessage) -> bool {
     msg.crc_ok && msg.msg_type == crate::vmm::wire::MSG_TYPE_SCHED_EXIT
 }
 
+/// True iff `msg` is a crc-valid guest stdout frame carrying the
+/// probe-payload end delimiter. On an auto-repro (dual_snapshot) wprof
+/// run the guest ships its probe report (Phase 6b,
+/// `collect_and_print_probe_data` -> `println!(PROBE_OUTPUT_END)` over
+/// the bulk-port stdout forwarder) AFTER the Phase-5 wprof trace, so the
+/// coordinator gates the ship-grace kill on this frame instead of the
+/// bare `WprofTrace` — killing on the trace would preempt Phase 6b and
+/// drop the `=== AUTO-PROBE: ... ===` report. A frame torn mid-marker
+/// (delimiter split across two chunks) simply does not match; the
+/// `WPROF_SHIP_GRACE` backstop then bounds teardown, so a missed match
+/// degrades to the deadline rather than a hang.
+fn is_probe_output_end_frame(msg: &crate::vmm::bulk::BulkMessage) -> bool {
+    let needle = crate::test_support::PROBE_OUTPUT_END.as_bytes();
+    msg.crc_ok
+        && msg.msg_type == crate::vmm::wire::MSG_TYPE_STDOUT
+        && msg.payload.len() >= needle.len()
+        && msg.payload.windows(needle.len()).any(|w| w == needle)
+}
+
 /// Extend the watchdog's reset deadline so it accommodates an armed
 /// wprof-ship grace. The watchdog fires at
 /// `effective_deadline = reset_deadline.max(hard_deadline)` where
@@ -1731,7 +1750,7 @@ impl KtstrVm {
             set_rt_priority(1, "BSP (vCPU 0)");
         }
 
-        // Collect vCPU pthread_t handles for monitor stall detection.
+        // Collect vCPU pthread_t handles for monitor stuck detection.
         // BSP runs on the current thread; APs have spawned threads.
         let vcpu_pthreads = {
             let mut pts = Vec::with_capacity(1 + guard.ap_threads.len());
@@ -4221,7 +4240,43 @@ impl KtstrVm {
                                     // the teardown trigger. Clearing the
                                     // deadline makes the per-iteration
                                     // backstop below a no-op afterward.
-                                    if wprof_ship_deadline.is_some()
+                                    //
+                                    // EXCEPTION — auto-repro (dual_snapshot)
+                                    // runs with an active probe stack: the
+                                    // guest ships its probe payload (Phase 6b,
+                                    // `PROBE_OUTPUT_END` over stdout,
+                                    // init.rs `finalize_probe_after_unwind`)
+                                    // AFTER the Phase-5 wprof trace. Killing on
+                                    // the WprofTrace frame here would preempt
+                                    // Phase 6b, so the `=== AUTO-PROBE ... ===`
+                                    // report never ships. On those runs, hold
+                                    // for the probe payload: skip the kill on
+                                    // the trace and instead promote it when the
+                                    // `PROBE_OUTPUT_END` stdout frame drains
+                                    // (arm below). The `WPROF_SHIP_GRACE`
+                                    // backstop still bounds teardown if the
+                                    // guest wedges before shipping the payload
+                                    // (e.g. a stall-exit repro that skipped
+                                    // probe attachment ships no payload) —
+                                    // keeping 7fe5cc7e's anti-hang property.
+                                    if freeze_coord_dual_snapshot {
+                                        if wprof_ship_deadline.is_some()
+                                            && drained
+                                                .messages
+                                                .iter()
+                                                .any(is_probe_output_end_frame)
+                                        {
+                                            eprintln!(
+                                                "freeze-coord: probe payload shipped \
+                                                 (PROBE_OUTPUT_END); kill triggered after ship"
+                                            );
+                                            trigger_freeze_coord_kill(
+                                                &freeze_coord_kill,
+                                                &freeze_coord_kill_evt,
+                                            );
+                                            wprof_ship_deadline = None;
+                                        }
+                                    } else if wprof_ship_deadline.is_some()
                                         && drained.messages.iter().any(is_wprof_ship_frame)
                                     {
                                         eprintln!(
@@ -13875,12 +13930,17 @@ mod exit_kind_warrants_dump_tests {
 mod wprof_grace_tests {
     //! Unit coverage for the wprof-ship grace predicates the
     //! coordinator's error-exit grace relies on: [`is_wprof_ship_frame`]
-    //! (which drained frame ends the grace), [`is_sched_exit_frame`]
-    //! (which drained frame ARMS the grace on a wprof run), and
+    //! (which drained frame ends the grace on a plain wprof run),
+    //! [`is_sched_exit_frame`] (which drained frame ARMS the grace on a
+    //! wprof run), [`is_probe_output_end_frame`] (which drained frame
+    //! ends the grace on an auto-repro probe run), and
     //! [`wprof_grace_should_kill`] (the bounded deadline backstop).
-    use super::{is_sched_exit_frame, is_wprof_ship_frame, wprof_grace_should_kill};
+    use super::{
+        is_probe_output_end_frame, is_sched_exit_frame, is_wprof_ship_frame,
+        wprof_grace_should_kill,
+    };
     use crate::vmm::bulk::BulkMessage;
-    use crate::vmm::wire::{MSG_TYPE_SCHED_EXIT, MSG_TYPE_WPROF_TRACE};
+    use crate::vmm::wire::{MSG_TYPE_SCHED_EXIT, MSG_TYPE_STDOUT, MSG_TYPE_WPROF_TRACE};
     use std::time::{Duration, Instant};
 
     fn frame(msg_type: u32, payload: &[u8], crc_ok: bool) -> BulkMessage {
@@ -13924,6 +13984,30 @@ mod wprof_grace_tests {
         assert!(
             !is_sched_exit_frame(&frame(MSG_TYPE_WPROF_TRACE, b"pb", true)),
             "a WprofTrace is not a SCHED_EXIT"
+        );
+    }
+
+    #[test]
+    fn is_probe_output_end_frame_accepts_only_crc_valid_stdout_with_marker() {
+        let end = crate::test_support::PROBE_OUTPUT_END.as_bytes();
+        let mut framed = b"...json...\n".to_vec();
+        framed.extend_from_slice(end);
+        framed.extend_from_slice(b"\n");
+        assert!(
+            is_probe_output_end_frame(&frame(MSG_TYPE_STDOUT, &framed, true)),
+            "a crc-valid stdout frame carrying PROBE_OUTPUT_END ends the grace"
+        );
+        assert!(
+            !is_probe_output_end_frame(&frame(MSG_TYPE_STDOUT, &framed, false)),
+            "torn CRC must not end the grace — a garbled/hostile frame is not the payload"
+        );
+        assert!(
+            !is_probe_output_end_frame(&frame(MSG_TYPE_STDOUT, b"ordinary stdout line\n", true)),
+            "stdout without the marker is not the probe-payload terminator"
+        );
+        assert!(
+            !is_probe_output_end_frame(&frame(MSG_TYPE_WPROF_TRACE, end, true)),
+            "the marker on a non-stdout frame type does not count"
         );
     }
 

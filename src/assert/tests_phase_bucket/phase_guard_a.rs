@@ -236,12 +236,12 @@ fn build_phase_buckets_avg_imbalance_excludes_out_of_window_monitor_samples() {
 /// fall to `_ => None`), so before the gate fix they surfaced ONLY on
 /// synthesized buckets and a captured (common-case) phase dropped them.
 /// max_imbalance = max sample ratio; stuck_count = consecutive
-/// frozen-`rq_clock` non-idle CPU stalls.
+/// frozen-`rq_clock` non-idle CPUs.
 #[test]
 fn build_phase_buckets_captured_bucket_carries_max_imbalance_and_stuck() {
     use crate::monitor::{CpuSnapshot, MonitorReport, MonitorSample};
     // cpu(nr, clk): nr_running + a frozen rq_clock so two consecutive
-    // samples sharing the SAME non-zero clock register a per-CPU stall.
+    // samples sharing the SAME non-zero clock register a per-CPU stuck event.
     let cpu = |nr: u32, clk: u64| CpuSnapshot {
         nr_running: nr,
         rq_clock: clk,
@@ -249,7 +249,7 @@ fn build_phase_buckets_captured_bucket_carries_max_imbalance_and_stuck() {
     };
     // s_60:  [nr=4, nr=2] -> imbalance 4 / max(1,2) = 2.0; rq_clock 1000
     // s_120: [nr=6, nr=2] -> imbalance 6 / max(1,2) = 3.0; rq_clock 1000
-    //   frozen vs s_60 + both CPUs non-idle -> stall_count = 2.
+    //   frozen vs s_60 + both CPUs non-idle -> stuck_count = 2.
     let mon = MonitorReport {
         samples: vec![
             MonitorSample::new(60, vec![cpu(4, 1000), cpu(2, 1000)]),
@@ -287,15 +287,15 @@ fn build_phase_buckets_captured_bucket_carries_max_imbalance_and_stuck() {
         .expect("captured bucket must now carry stuck_count");
     assert!(
         (stuck - 2.0).abs() < f64::EPSILON,
-        "two frozen-clock non-idle CPUs => stall_count 2, got {stuck}",
+        "two frozen-clock non-idle CPUs => stuck_count 2, got {stuck}",
     );
 }
 
 /// Boundary: `stuck_count` needs `windows(2)` of monitor samples, so
-/// a phase with a single in-window monitor sample has NO stall to report —
+/// a phase with a single in-window monitor sample has NO stuck event to report —
 /// `stuck_count` must be ABSENT (not present as 0), while `max_imbalance_ratio`
 /// (computed from the single sample) is still folded. Pins that the
-/// `if pm.stall_count > 0` gate leaves the key out rather than writing a
+/// `if pm.stuck_count > 0` gate leaves the key out rather than writing a
 /// misleading zero.
 #[test]
 fn build_phase_buckets_single_in_window_sample_has_no_stuck_count() {
@@ -306,7 +306,7 @@ fn build_phase_buckets_single_in_window_sample_has_no_stuck_count() {
         ..Default::default()
     };
     // ONE in-window sample: imbalance 4/2 = 2.0; no second sample => no
-    // windows(2) => stall_count 0 => stuck_count not written.
+    // windows(2) => stuck_count 0 => stuck_count not written.
     let mon = MonitorReport {
         samples: vec![MonitorSample::new(100, vec![cpu(4, 1000), cpu(2, 1000)])],
         ..Default::default()
@@ -329,20 +329,20 @@ fn build_phase_buckets_single_in_window_sample_has_no_stuck_count() {
     );
     assert!(
         !step0.metrics.contains_key("stuck_count"),
-        "no consecutive-sample stall => stuck_count must be ABSENT, not 0: {:?}",
+        "no consecutive-sample stuck event => stuck_count must be ABSENT, not 0: {:?}",
         step0.metrics.get("stuck_count"),
     );
 }
 
 /// Boundary: stuck_count scopes to in-window samples. The in_window
-/// filter runs BEFORE compute_metrics' `windows(2)` stall detection, so a
-/// stall pair never forms across the phase edge — an out-of-window sample
+/// filter runs BEFORE compute_metrics' `windows(2)` stuck detection, so a
+/// stuck pair never forms across the phase edge — an out-of-window sample
 /// cannot pair with the last in-window sample. Two frozen-clock in-window
 /// samples plus one far-out sample must yield stuck_count = 2 (the single
 /// fully-in-window pair x 2 CPUs), NOT 4. Guards against a regression that
-/// windowed AFTER stall computation and mis-attributed a cross-phase stall.
+/// windowed AFTER stuck computation and mis-attributed a cross-phase stuck pair.
 #[test]
-fn build_phase_buckets_stuck_count_excludes_cross_window_stall_pair() {
+fn build_phase_buckets_stuck_count_excludes_cross_window_stuck_pair() {
     use crate::monitor::{CpuSnapshot, MonitorReport, MonitorSample};
     let cpu = |nr: u32, clk: u64| CpuSnapshot {
         nr_running: nr,
@@ -350,9 +350,9 @@ fn build_phase_buckets_stuck_count_excludes_cross_window_stall_pair() {
         ..Default::default()
     };
     // s_100 + s_200 are in [50,250); their frozen rq_clock pairs them ->
-    // stall_count 2 (both CPUs). s_9999 is OUT of window; it is filtered
+    // stuck_count 2 (both CPUs). s_9999 is OUT of window; it is filtered
     // before compute_metrics, so the (s_200, s_9999) pair never forms. If
-    // windowing ran AFTER stall detection, that pair would add 2 more.
+    // windowing ran AFTER stuck detection, that pair would add 2 more.
     let mon = MonitorReport {
         samples: vec![
             MonitorSample::new(100, vec![cpu(4, 1000), cpu(2, 1000)]),
@@ -372,7 +372,7 @@ fn build_phase_buckets_stuck_count_excludes_cross_window_stall_pair() {
         .metrics
         .get("stuck_count")
         .copied()
-        .expect("in-window stall pair yields stuck_count");
+        .expect("in-window stuck pair yields stuck_count");
     assert!(
         (stuck - 2.0).abs() < f64::EPSILON,
         "only the fully-in-window pair counts => stuck_count 2 (not 4 with a cross-window pair), got {stuck}",

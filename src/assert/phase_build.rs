@@ -96,7 +96,7 @@ pub fn build_phase_buckets_with_stimulus(
 ) -> Vec<PhaseBucket> {
     let monitor_samples: &[crate::monitor::MonitorSample] =
         samples.monitor().map(|m| m.samples()).unwrap_or(&[]);
-    // vCPU-preemption exemption window for the per-phase stall predicate,
+    // vCPU-preemption exemption window for the per-phase stuck predicate,
     // threaded into fold_monitor_into_bucket -> compute_metrics so the
     // per-phase stuck_count uses the SAME predicate as the run-level
     // MonitorSummary::stuck_count. 0 (no monitor) derives from CONFIG_HZ
@@ -406,7 +406,7 @@ pub fn build_phase_buckets(samples: &crate::scenario::sample::SampleSeries) -> V
     // was attached, e.g. host-only fixture tests).
     let monitor_samples: &[crate::monitor::MonitorSample] =
         samples.monitor().map(|m| m.samples()).unwrap_or(&[]);
-    // vCPU-preemption exemption window for the per-phase stall predicate
+    // vCPU-preemption exemption window for the per-phase stuck predicate
     // (see build_phase_buckets_with_stimulus). 0 (no monitor) derives from
     // CONFIG_HZ inside compute_metrics.
     let preemption_threshold_ns: u64 = samples
@@ -1231,8 +1231,8 @@ fn fold_monitor_into_bucket(
     // would otherwise never carry them — they would surface only on synthesized
     // (zero-capture) buckets. Fold them for EVERY monitor-bearing bucket — like
     // avg_imbalance_ratio above — so a captured (common-case) phase reports its
-    // per-phase imbalance peak and stall count instead of dropping them. (Both
-    // are monitor-axis signals: imbalance from full-class rq.nr_running, stalls
+    // per-phase imbalance peak and stuck count instead of dropping them. (Both
+    // are monitor-axis signals: imbalance from full-class rq.nr_running, stuck
     // from non-advancing rq.clock across consecutive samples — neither is in
     // the guest Snapshot read_sample observes. Both ALSO carry a typed
     // run-level GauntletRow accessor, so this per-phase fold feeds per-phase
@@ -1242,8 +1242,8 @@ fn fold_monitor_into_bucket(
     if let Some(v) = pm.max_imbalance {
         put("max_imbalance_ratio", v);
     }
-    if pm.stall_count > 0 {
-        put("stuck_count", pm.stall_count as f64);
+    if pm.stuck_count > 0 {
+        put("stuck_count", pm.stuck_count as f64);
     }
     if synthesized {
         if let Some(v) = pm.avg_dsq_depth {

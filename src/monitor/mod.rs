@@ -52,7 +52,7 @@ mod kernel_hz_tests;
 #[cfg(test)]
 mod schedstat_tests;
 #[cfg(test)]
-mod stall_detection_tests;
+mod stuck_detection_tests;
 #[cfg(test)]
 mod summary_tests;
 #[cfg(test)]
@@ -113,7 +113,7 @@ const PREEMPTION_TICK_MULTIPLE: u64 = 10;
 
 /// Default HZ when CONFIG_HZ cannot be determined from the kernel.
 /// 250 is the most conservative common value (longest tick period =
-/// highest threshold), avoiding false stall detection.
+/// highest threshold), avoiding false stuck detection.
 const DEFAULT_HZ: u64 = 250;
 
 /// Compute the vCPU preemption threshold for a given kernel.
@@ -346,7 +346,7 @@ pub struct MonitorReport {
     pub summary: MonitorSummary,
     /// vCPU preemption threshold (ns) derived from the guest kernel's
     /// CONFIG_HZ at the time the VM ran. Used by evaluate() to gate
-    /// stall detection. 0 means use a default.
+    /// stuck detection. 0 means use a default.
     pub preemption_threshold_ns: u64,
     /// Post-write readback of the scx_sched.watchdog_timeout field.
     /// Framework-internal regression guard that the host-side override
@@ -605,7 +605,7 @@ pub struct CpuSnapshot {
     pub scx_nr_running: u32,
     /// Depth of the scx local dispatch queue (`scx_rq.local_dsq.nr`).
     pub local_dsq_depth: u32,
-    /// Runqueue clock value (`rq.clock`). Non-advancing clock indicates a stall.
+    /// Runqueue clock value (`rq.clock`). Non-advancing clock indicates the CPU is stuck.
     pub rq_clock: u64,
     /// sched_ext flags for this CPU (`scx_rq.flags`).
     pub scx_flags: u32,
@@ -626,7 +626,7 @@ pub struct CpuSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedstat: Option<RqSchedstat>,
     /// Cumulative CPU time (ns) of the vCPU thread hosting this CPU.
-    /// Used by evaluate() to distinguish real stalls from host preemption.
+    /// Used by evaluate() to distinguish real stuck CPUs from host preemption.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vcpu_cpu_time_ns: Option<u64>,
     /// Host-side hardware perf counters for the vCPU thread that owns
@@ -834,7 +834,7 @@ pub struct MonitorSummary {
     /// CPU's `rq_clock` failed to advance. Idle CPUs (`nr_running == 0`
     /// in both samples) and host-preempted vCPUs are exempt (see
     /// `reader::is_cpu_stuck`). This is the run-level analog of the
-    /// per-phase `PhaseMetrics::stall_count`: both apply the SAME
+    /// per-phase `PhaseMetrics::stuck_count`: both apply the SAME
     /// per-(CPU, window) `is_cpu_stuck` predicate, but this counts over
     /// the full sample stream while the per-phase path windows within
     /// each phase, so run-level `>=` the sum of per-phase counts (it
@@ -1167,7 +1167,7 @@ impl MonitorSummary {
     }
 
     /// Like [`from_samples`](Self::from_samples) but uses an explicit
-    /// preemption threshold (ns) for stall detection. Pass 0 to derive
+    /// preemption threshold (ns) for stuck detection. Pass 0 to derive
     /// the threshold from the guest kernel's `CONFIG_HZ` by calling
     /// [`vcpu_preemption_threshold_ns`], which tries (in order) the
     /// embedded IKCONFIG in the guest `vmlinux`, a `.config` beside
@@ -1246,7 +1246,7 @@ impl MonitorSummary {
         // observations whose rq_clock did not advance. Skip invalid samples.
         // Counts EVERY hit across all CPUs and all window pairs (no early
         // break). Windowed over the full sample stream, so this is `>=` the
-        // sum of per-phase `PhaseMetrics::stall_count` (both route through
+        // sum of per-phase `PhaseMetrics::stuck_count` (both route through
         // `is_cpu_stuck`; the per-phase path windows within each phase and
         // drops cross-boundary pairs + out-of-phase samples).
         // Exempt idle CPUs: nr_running==0 in both samples means the tick
@@ -1732,7 +1732,7 @@ pub struct MonitorThresholds {
     /// Max allowed local DSQ depth on any CPU in any sample.
     pub max_local_dsq_depth: u32,
     /// Flag when any CPU's rq_clock does not advance between consecutive samples.
-    pub fail_on_stall: bool,
+    pub fail_on_rq_clock_stuck: bool,
     /// Number of consecutive samples that must violate a threshold before flagging.
     pub sustained_samples: usize,
     /// Max sustained select_cpu_fallback events/s across all CPUs.
@@ -1770,7 +1770,7 @@ pub struct MonitorThresholds {
     ///   propagates to this field via
     ///   [`Assert::monitor_thresholds`](crate::assert::Assert::monitor_thresholds).
     ///
-    /// Without this opt-in, a test that sets `fail_on_stall: true`
+    /// Without this opt-in, a test that sets `fail_on_rq_clock_stuck: true`
     /// and asserts `!verdict.passed` on a THRESHOLD VIOLATION
     /// will PASS despite the violation: the violation is recorded
     /// in `details` and the verdict's `summary` carries the
@@ -1798,8 +1798,8 @@ impl MonitorThresholds {
     ///   depth > 50 means the scheduler is not consuming dispatched tasks.
     ///   Transient spikes during cpuset changes are filtered by the
     ///   sustained_samples window.
-    /// - fail_on_stall true: rq_clock not advancing on a CPU with
-    ///   runnable tasks means the scheduler stalled. Idle CPUs
+    /// - fail_on_rq_clock_stuck true: rq_clock not advancing on a CPU with
+    ///   runnable tasks means the scheduler is stuck. Idle CPUs
     ///   (nr_running==0 in both samples) are exempt because NOHZ
     ///   stops the tick. Preempted vCPUs are exempt when the vCPU
     ///   thread's CPU time didn't advance past the preemption
@@ -1817,7 +1817,7 @@ impl MonitorThresholds {
         Self {
             max_imbalance_ratio: 4.0,
             max_local_dsq_depth: 50,
-            fail_on_stall: true,
+            fail_on_rq_clock_stuck: true,
             sustained_samples: 5,
             max_fallback_rate: 200.0,
             max_keep_last_rate: 100.0,
@@ -2048,12 +2048,12 @@ impl MonitorThresholds {
             ));
         }
 
-        if self.fail_on_stall {
-            for (cpu, tracker) in self.track_stall(report).iter().enumerate() {
+        if self.fail_on_rq_clock_stuck {
+            for (cpu, tracker) in self.track_rq_clock_stuck(report).iter().enumerate() {
                 if tracker.sustained(self.sustained_samples) {
                     failed = true;
                     details.push(format!(
-                        "rq_clock stall on cpu{} for {} consecutive samples (ending at sample {}, clock={})",
+                        "rq_clock stuck on cpu{} for {} consecutive samples (ending at sample {}, clock={})",
                         cpu,
                         tracker.worst_run,
                         tracker.worst_at,
@@ -2136,15 +2136,15 @@ impl MonitorThresholds {
         (imbalance, dsq, worst_dsq_cpu)
     }
 
-    /// Per-CPU stall detection over consecutive sample pairs. Exempts
-    /// idle CPUs (NOHZ stopped the tick so rq_clock legitimately doesn't
-    /// advance) and preempted vCPUs (host stole the core, so the vCPU
-    /// couldn't tick the clock) via [`reader::is_cpu_stuck`].
+    /// Per-CPU rq_clock-stuck detection over consecutive sample pairs.
+    /// Exempts idle CPUs (NOHZ stopped the tick so rq_clock legitimately
+    /// doesn't advance) and preempted vCPUs (host stole the core, so the
+    /// vCPU couldn't tick the clock) via [`reader::is_cpu_stuck`].
     ///
     /// Returns one [`SustainedViolationTracker`] per CPU. Sized to the
     /// max `cpus.len()` across the report so a sample with fewer CPUs
     /// doesn't truncate the per-CPU vector mid-walk.
-    fn track_stall(&self, report: &MonitorReport) -> Vec<SustainedViolationTracker> {
+    fn track_rq_clock_stuck(&self, report: &MonitorReport) -> Vec<SustainedViolationTracker> {
         let threshold = if report.preemption_threshold_ns > 0 {
             report.preemption_threshold_ns
         } else {
@@ -2157,20 +2157,20 @@ impl MonitorThresholds {
             .map(|s| s.cpus.len())
             .max()
             .unwrap_or(0);
-        let mut stall: Vec<SustainedViolationTracker> =
+        let mut stuck: Vec<SustainedViolationTracker> =
             vec![SustainedViolationTracker::default(); num_cpus];
 
         for i in 1..report.samples.len() {
             let prev = &report.samples[i - 1];
             let curr = &report.samples[i];
             let cpu_count = prev.cpus.len().min(curr.cpus.len());
-            for (cpu, stall_tracker) in stall.iter_mut().enumerate().take(cpu_count) {
-                let is_stall = reader::is_cpu_stuck(&prev.cpus[cpu], &curr.cpus[cpu], threshold);
-                stall_tracker.record(is_stall, curr.cpus[cpu].rq_clock as f64, i);
+            for (cpu, stuck_tracker) in stuck.iter_mut().enumerate().take(cpu_count) {
+                let is_stuck = reader::is_cpu_stuck(&prev.cpus[cpu], &curr.cpus[cpu], threshold);
+                stuck_tracker.record(is_stuck, curr.cpus[cpu].rq_clock as f64, i);
             }
         }
 
-        stall
+        stuck
     }
 
     /// Per-interval event-counter rate computation against fallback /
