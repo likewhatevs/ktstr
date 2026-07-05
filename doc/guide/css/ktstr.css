@@ -276,17 +276,22 @@ body.sidebar-iframe-inner {
 
 /* ---------- menu bar ---------- */
 
-#menu-bar {
+#mdbook-menu-bar {
     border-block-end: 1px solid var(--kt-rule);
     background: color-mix(in srgb, var(--bg) 82%, transparent);
     backdrop-filter: blur(8px);
     -webkit-backdrop-filter: blur(8px);
 }
 
-#menu-bar .menu-title {
-    font-weight: 650;
-    letter-spacing: -0.01em;
-    font-size: 1.7rem;
+#mdbook-menu-bar h1.menu-title {
+    font-family: var(--mono-font);
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    font-size: 1.9rem;
+    background: linear-gradient(92deg, var(--kt-heading) 20%, var(--kt-accent) 62%, #7c5cff 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
 }
 
 /* ---------- landing page components ----------
@@ -320,10 +325,23 @@ body.sidebar-iframe-inner {
     line-height: 1.05;
     margin: 0 0 0.3em;
     width: fit-content;
-    background: linear-gradient(92deg, var(--kt-heading) 20%, var(--kt-accent) 65%, #7c5cff 105%);
+    background: linear-gradient(100deg,
+        var(--kt-heading) 12%, var(--kt-accent) 45%, #7c5cff 62%,
+        var(--kt-accent) 80%, var(--kt-heading) 100%);
+    background-size: 220% 100%;
     -webkit-background-clip: text;
     background-clip: text;
     -webkit-text-fill-color: transparent;
+    animation: kt-hue-drift 10s ease-in-out infinite alternate;
+}
+
+@keyframes kt-hue-drift {
+    from { background-position: 0% 50%; }
+    to { background-position: 100% 50%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .kt-hero h1 { animation: none; }
 }
 
 .kt-hero .kt-tagline {
@@ -510,4 +528,33 @@ a.kt-btn-ghost:hover {
 
 mark {
     border-radius: 3px;
+}
+
+/* ---------- card icons & figures ---------- */
+
+.kt-card > svg {
+    width: 24px;
+    height: 24px;
+    stroke: var(--kt-accent);
+    fill: none;
+    stroke-width: 1.7;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    margin-bottom: 0.2rem;
+}
+
+.kt-card > svg .fill {
+    fill: var(--kt-accent);
+    stroke: none;
+}
+
+.kt-figure {
+    margin: 1.6rem 0;
+    overflow-x: auto;
+}
+
+.kt-figure svg {
+    max-width: 100%;
+    height: auto;
+    font-family: var(--mono-font);
 }

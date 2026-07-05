@@ -1,6 +1,9 @@
 <div align="center">
 
-# ktstr
+<h1><picture>
+<source media="(prefers-color-scheme: dark)" srcset="doc/assets/wordmark-dark.png">
+<img alt="ktstr" src="doc/assets/wordmark-light.png" width="266">
+</picture></h1>
 
 **Test Linux schedulers like code.**
 
