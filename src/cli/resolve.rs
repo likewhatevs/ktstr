@@ -535,6 +535,7 @@ pub fn download_and_cache_version(
         cli_label,
         false,
         false,
+        false,
         cpu_cap,
         None,
         Some(group),
@@ -1002,6 +1003,7 @@ pub fn resolve_git_kernel(
         cli_label,
         clean,
         false,
+        false,
         cpu_cap,
         extra_kconfig,
         mp,
@@ -1195,7 +1197,7 @@ pub fn resolve_kernel_dir_to_entry(
     // kernel build`-only and feeds extras directly through that
     // dispatch.
     let result = kernel_build_pipeline(
-        &acquired, &cache, cli_label, false, true, cpu_cap, None, None,
+        &acquired, &cache, cli_label, false, false, true, cpu_cap, None, None,
     )?;
 
     // Prefer the cached entry directory (stable across rebuilds).
@@ -1265,7 +1267,7 @@ pub fn resolve_kernel_dir(
     // `resolve_kernel_dir_to_entry` rationale — `--extra-kconfig` is
     // a `cargo ktstr kernel build`-only flag.
     let result = kernel_build_pipeline(
-        &acquired, &cache, cli_label, false, true, cpu_cap, None, None,
+        &acquired, &cache, cli_label, false, false, true, cpu_cap, None, None,
     )?;
 
     // Prefer the cached image path (stable across rebuilds).
