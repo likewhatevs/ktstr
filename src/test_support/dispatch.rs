@@ -1789,6 +1789,34 @@ fn workspace_packages() -> &'static std::collections::HashSet<String> {
     })
 }
 
+/// Per-name env override (`KTSTR_SCHEDULER_BIN_<NAME>`) for a
+/// `Discover(pkg)` scheduler, resolved to an EXISTING path.
+///
+/// Mirrors the FIRST arm of the Discover resolution cascade in
+/// [`crate::test_support::eval::scheduler::resolve_scheduler`]: the
+/// per-name var pointed at an on-disk binary. Used at BOTH verifier cell
+/// EMISSION ([`list_verifier_cells_all`]) and cell RUNTIME
+/// ([`run_verifier_cell_inner`]) so an external Discover scheduler pointed
+/// at a pre-built binary EMITS a cell AND resolves to that same binary at
+/// run time. The two sites MUST agree: emitting a cell the runtime cannot
+/// resolve would fail the cell, and resolving a cell that was never
+/// emitted is unreachable — the lockstep is the whole point.
+///
+/// Deliberately per-name ONLY (no global [`crate::KTSTR_SCHEDULER_ENV`]
+/// fallback, unlike `resolve_scheduler`). The verifier's runtime resolver
+/// is [`crate::build_and_find_binary`] (a `cargo build -p <pkg>`), which
+/// honors NEITHER env var; the global var is also coarse — set once, it
+/// would resurrect every skipped `declare_scheduler!` fixture
+/// (`scx-full`, `scx-ee`, …) as a cell collapsed onto a single binary.
+/// The per-name var names one scheduler and one binary, matching the
+/// intent (a specific external Discover scheduler) without that blast
+/// radius.
+fn discover_env_override(pkg: &str) -> Option<std::path::PathBuf> {
+    let raw = std::env::var(crate::per_name_scheduler_env(pkg)).ok()?;
+    let path = std::path::PathBuf::from(raw);
+    path.exists().then_some(path)
+}
+
 /// Pure parse of `[workspace] members = [ ... ]` from a `Cargo.toml`
 /// string into the set of package names. The `.` member (the workspace
 /// root) maps to `root_pkg`; every other member's last path component is
@@ -1913,10 +1941,21 @@ fn list_verifier_cells_all() {
         // would make `cargo ktstr verifier --run-ignored` fail on
         // `cargo build -p <fixture>` for a nonexistent package. A
         // `Discover` of a real workspace member (scx-ktstr) and a `Path`
-        // that exists still emit. This is the emission-time counterpart to
-        // the resolve arms in `run_verifier_cell`.
+        // that exists still emit. A `Discover` of a NON-member ALSO emits
+        // when its per-name env override (`KTSTR_SCHEDULER_BIN_<NAME>`,
+        // via [`discover_env_override`]) points at an on-disk binary: an
+        // external scheduler declared with a bare `binary = "scx_foo"` and
+        // supplied a prebuilt binary through the env is resolvable, so its
+        // cell must emit. The runtime resolver in `run_verifier_cell_inner`
+        // consults the SAME [`discover_env_override`] before
+        // `build_and_find_binary`, so an emitted env-backed cell resolves
+        // at run time — the two stay in lockstep. This is the
+        // emission-time counterpart to the resolve arms in
+        // `run_verifier_cell`.
         match sched.binary {
-            SchedulerSpec::Discover(pkg) if !workspace_packages().contains(pkg) => {
+            SchedulerSpec::Discover(pkg)
+                if !workspace_packages().contains(pkg) && discover_env_override(pkg).is_none() =>
+            {
                 continue;
             }
             SchedulerSpec::Path(p) if !std::path::Path::new(p).exists() => {
@@ -2076,12 +2115,22 @@ fn run_verifier_cell_inner(
     };
 
     let sched_bin: std::path::PathBuf = match sched.binary {
-        SchedulerSpec::Discover(pkg) => match crate::build_and_find_binary(pkg) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("ktstr verifier: build scheduler {pkg:?}: {e:#}");
-                return 1;
-            }
+        // Per-name env override first (mirrors `resolve_scheduler`'s
+        // Discover cascade AND the emission-time gate in
+        // `list_verifier_cells_all`): an external scheduler pointed at a
+        // prebuilt binary via `KTSTR_SCHEDULER_BIN_<NAME>` resolves
+        // WITHOUT a `cargo build -p <pkg>` (which would fail for a
+        // non-workspace package). Falls through to `build_and_find_binary`
+        // for a workspace-member Discover with no env override.
+        SchedulerSpec::Discover(pkg) => match discover_env_override(pkg) {
+            Some(p) => p,
+            None => match crate::build_and_find_binary(pkg) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("ktstr verifier: build scheduler {pkg:?}: {e:#}");
+                    return 1;
+                }
+            },
         },
         SchedulerSpec::Path(p) => {
             let path = std::path::PathBuf::from(p);

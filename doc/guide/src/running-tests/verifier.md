@@ -107,10 +107,13 @@ some terminal fonts — the failing-combinations list below the grid is
 the authoritative record).
 
 > [!NOTE]
-> For a scheduler outside your workspace, declare it with
-> `binary_path` as above. A bare `binary = "name"` (discovery) emits
-> verifier cells only for workspace members, even when
-> `KTSTR_SCHEDULER_BIN_<NAME>` points at a binary.
+> For a scheduler outside your workspace, either declare it with
+> `binary_path` as above, or use a bare `binary = "name"` (discovery)
+> and point `KTSTR_SCHEDULER_BIN_<NAME>` at a prebuilt binary — an
+> env-resolved discovery scheduler now emits and runs verifier cells.
+> Discovery *without* that env var still emits cells only for workspace
+> members (a non-member with no env override has nothing to build or
+> resolve, so its cells stay filtered).
 
 ## The kernel axis
 
