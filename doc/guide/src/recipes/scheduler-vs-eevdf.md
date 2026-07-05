@@ -26,7 +26,10 @@ callback receives (the host-side hook that runs after the VM exits):
   distributions are run-level — pooled across cgroups into one whole-run
   value — so they cannot be split into the scheduler phase vs the EEVDF
   phase; to compare them, run the scheduler and EEVDF as two separate
-  tests and read each run's run-level metric. Everything else flows
+  tests and read each run's run-level metric. (The built-in
+  [`Schbench` workload](../concepts/work-types.md#schbench) is the
+  exception: it measures its own wakeup latency internally and emits
+  `wakeup_p99_latency_us` per phase.) Everything else flows
   through the one per-phase bucket pipeline, so a new metric becomes
   comparable here the moment it lands in that pipeline.
 

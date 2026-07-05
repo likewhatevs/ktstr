@@ -171,15 +171,72 @@ for these variants, `None` for ungrouped types.
 
 ## Schbench
 
-`Schbench` re-expresses schbench's default mode natively: message
+`Schbench` re-expresses schbench natively, in-process: message
 threads batch-wake worker threads (wakeup latency), each worker
 think-sleeps then does matrix work under a per-CPU lock (request
 latency). `SchbenchConfig`'s fields map schbench's
-`-m`/`-t`/`-F`/`-n`/`-s`/`-L`/`-R`/`-A`/`-p` flags — the rustdoc has
-the full CLI-parity table, including which knobs ktstr's topology
-sets for you. Use a single ktstr worker (`workers(1)`): the
+`-m`/`-t`/`-F`/`-n`/`-s`/`-L`/`-R`/`-A`/`--split`/`-p` flags — the
+rustdoc has the full CLI-parity table, including which knobs ktstr's
+topology sets for you. Use a single ktstr worker (`workers(1)`): the
 message/worker parallelism is this variant's internal thread
 topology, not ktstr worker processes.
+
+Beyond the default matrix mode: `requests_per_sec` (`-R`) injects a
+fixed request rate, `auto_rps` (`-A`) searches for the saturation
+rate, `split_percent` (`--split`) shifts matrix work between shared
+and private cache footprints, and `pipe_transfer_bytes` (`-p`)
+replaces matrix work with pipe transfers and reports per-worker
+throughput. Each phase carries `wakeup_*_latency_us` and
+`request_*_latency_us` percentiles, `schbench_loop_count`, and
+message/worker run-delay — assertable per phase (see
+[schbench_pipe_e2e.rs](https://github.com/likewhatevs/ktstr/blob/main/tests/schbench_pipe_e2e.rs)
+and
+[schbench_split_e2e.rs](https://github.com/likewhatevs/ktstr/blob/main/tests/schbench_split_e2e.rs)).
+
+The port's fidelity is measured, not assumed:
+[validation.md](https://github.com/likewhatevs/ktstr/blob/main/src/workload/schbench/validation.md)
+compares it per-flag against gcc and clang builds of upstream
+`schbench.c` — its percentiles and throughput land inside the
+gcc↔clang envelope on nearly every axis, i.e. it behaves like a third
+compilation of the same benchmark. Check it yourself on the host, no
+VM:
+
+<!-- captured: ktstr-schbench-validate | ktstr 0.23.0 | host, no VM -->
+```text
+average rps: 407.88
+sched delay: message 37 (usec) worker 317 (usec)
+```
+
+## Taobench
+
+`Taobench` is a native port of Meta's TaoBench cache-service
+benchmark: a bounded, sharded, FIFO-evicting KV cache with a fast
+in-cache hit path and a slow dispatcher miss path, settling to a
+target hit ratio by the eviction↔refill equilibrium. `TaobenchConfig`
+runs closed-loop by default; `arrival_rate` switches to open-loop
+fixed-rate arrival with coordinated-omission serve latency, and
+`slow_path_p99_us` adds a heavy-tailed Pareto service time to the
+miss path. Same `workers(1)` rule as schbench.
+
+Per phase and whole-run it emits `taobench_total_qps`,
+`taobench_{fast,slow}_qps`, `taobench_hit_ratio`, and — open-loop
+only — `taobench_serve_{p50,p90,p99,p999}_us` measured from intended
+arrival, so queueing delay is charged to the scheduler rather than
+hidden (see
+[taobench_e2e.rs](https://github.com/likewhatevs/ktstr/blob/main/tests/taobench_e2e.rs)).
+Its
+[validation.md](https://github.com/likewhatevs/ktstr/blob/main/src/workload/taobench/validation.md)
+documents the structural match against the reference (same hit-ratio
+equilibrium, ~9:1 fast:slow, same qps/hit-ratio formulas) and the
+deliberate divergences (no sockets/TLS; open-loop + Pareto tail are
+additions). The host-side check:
+
+<!-- captured: ktstr-taobench-validate (closed-loop, then -R 200000 open-loop) | ktstr 0.23.0 | host, no VM -->
+```text
+total_qps = 131870.7
+hit_ratio = 0.8999  (fast / (fast + slow))
+serve_us (coordinated-omission, from intended arrival): min=4 p50=3526656 p99=6545408
+```
 
 ## Worker teardown and process groups
 

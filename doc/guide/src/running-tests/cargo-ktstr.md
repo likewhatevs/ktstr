@@ -336,7 +336,9 @@ non-interactively).
 
 Sweep every `declare_scheduler!`-registered scheduler through the
 real kernel's BPF verifier across topologies, checking verify +
-attach + dispatch per cell:
+attach + dispatch per cell. Takes the same `--kernel` grammar as
+`test` — repeatable, ranges (`6.12..6.14`, with `--include-eol` for
+end-of-life series), paths, cache keys, git refs:
 
 ```sh
 cargo ktstr verifier --kernel 7.0
@@ -349,17 +351,36 @@ output, and the kernels-filter contract.
 
 ## shell
 
-Shares the VM boot flow and flags with
-[`ktstr shell`](ktstr.md#shell), plus two additions: `--kernel`
-also accepts raw image files (`bzImage`, `Image`), and `--test NAME`
-derives topology, memory, and include files from a registered
-`#[ktstr_test]` (mutually exclusive with `--topology` /
-`--memory-mib`; `-i` is additive):
+Boot any kernel ktstr can resolve and land in a busybox shell inside
+the VM — the fastest way to poke at a kernel you just built, check
+what a guest actually exposes, or reproduce a failing test's
+environment by hand:
 
 ```sh
-cargo ktstr shell --test my_failing_test
+cargo ktstr shell --test my_failing_test     # boot the exact VM a test gets
+cargo ktstr shell --kernel ../linux          # local tree
 cargo ktstr shell --kernel ./arch/x86/boot/bzImage
 ```
+
+`--test NAME` derives topology, memory, and include files from a
+registered `#[ktstr_test]` (mutually exclusive with `--topology` /
+`--memory-mib`; `-i` is additive) — so "why does this only fail on
+odd-3llc" becomes an interactive session in that exact machine.
+
+For scripted checks, `--exec` runs a command and exits with its
+status:
+
+<!-- captured: cargo ktstr shell --kernel local-8cd2b47... --no-perf-mode --exec 'uname -r; cat /sys/kernel/sched_ext/state; nproc' | ktstr 0.23.0 | kernel v7.1 + sched_ext_exit patch -->
+```text
+$ cargo ktstr shell --kernel ../linux --no-perf-mode \
+    --exec 'uname -r; cat /sys/kernel/sched_ext/state; nproc'
+7.1.0-00001-g8cd2b47fb188
+disabled
+1
+```
+
+The standalone [`ktstr shell`](ktstr.md#shell) is the same boot flow
+minus the cargo integration (`--test`, raw image paths).
 
 ## export
 

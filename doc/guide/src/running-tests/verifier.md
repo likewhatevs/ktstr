@@ -30,6 +30,10 @@ cargo ktstr verifier --kernel ../linux
 # Sweep across kernels (each cell runs against its own)
 cargo ktstr verifier --kernel 6.14.2 --kernel 7.0
 
+# Every stable/longterm release in a range (add --include-eol for
+# end-of-life series)
+cargo ktstr verifier --kernel 6.12..6.14
+
 # One scheduler across topologies
 cargo ktstr verifier --scheduler scx-ktstr
 
@@ -48,7 +52,7 @@ cells boots its own VM, loads the scheduler, and confirms
 attach + dispatch. Declare the schedulers once (in any linked test
 file), pointing at the prebuilt binaries:
 
-```rust
+```rust,ignore
 ktstr::declare_scheduler!(BPFLAND, {
     name = "scx_bpfland",
     binary_path = "../scx/target/release/scx_bpfland",
@@ -107,6 +111,46 @@ the authoritative record).
 > `binary_path` as above. A bare `binary = "name"` (discovery) emits
 > verifier cells only for workspace members, even when
 > `KTSTR_SCHEDULER_BIN_<NAME>` points at a binary.
+
+## The kernel axis
+
+`--kernel` takes the same grammar everywhere — repeatable flags, a
+`START..END` range, versions, cache keys, paths, git refs (see
+[kernel resolution](cargo-ktstr.md#test)). A range expands against
+kernel.org's active releases, so end-of-life series silently drop
+unless you ask for them:
+
+<!-- captured: cargo ktstr kernel list --kernel 6.12..6.14 [--include-eol] | ktstr 0.23.0 -->
+```text
+$ cargo ktstr kernel list --kernel 6.12..6.14
+kernel list: range expanded to 1 kernel(s): 6.12.95
+
+$ cargo ktstr kernel list --kernel 6.12..6.14 --include-eol
+kernel list: range expanded to 3 kernel(s): 6.12.95, 6.13.12, 6.14.11
+```
+
+With multiple kernels resolved, each cell runs against its own, the
+`verified_insns` table grows one row per kernel, and the pass/fail
+grid folds kernels into each cell (✅ passed on every kernel, ❌
+failed on every kernel, 🇽 mixed — the failing-combinations list is
+authoritative):
+
+<!-- captured: cargo ktstr verifier --kernel 7.0.14-tarball-x86_64-kcabd40422 --kernel local-8cd2b47-x86_64-kcabd40422 --scheduler ktstr_sched --test kaslr_axis_e2e tiny-1llc tiny-2llc | ktstr 0.23.0 | kernels 7.0.14 + v7.1-patched -->
+<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr verifier --kernel 7.0 --kernel ../linux --scheduler ktstr_sched tiny-1llc tiny-2llc</span></div>
+
+<pre>ktstr_sched:
+ kernel               ktstr_dispatch  ktstr_dump  ktstr_dump_cpu  ktstr_dump_task  ktstr_enqueue  ktstr_exit  ktstr_exit_task  ktstr_init  ktstr_init_task  ktstr_select_cp  ktstr_yield
+ kernel_7_0_14        102             81          13              70               74             25          419              2296        29077            39               8
+ kernel_local_8cd2b4  102             81          13              70               74             25          419              2296        29077            39               8
+
+verifier summary: 2 ✅  0 ❌  0 🇽
+ topology   ktstr_sched
+ tiny-1llc  ✅
+ tiny-2llc  ✅</pre></div>
+
+Flat rows across kernels are the boring, reassuring case — the same
+BPF verified identically on both. A kfunc or verifier change between
+kernels shows up as diverging counts, or as a 🇽 cell.
 
 ## What a cell checks
 
@@ -228,7 +272,11 @@ operator-supplied kernel set:
 - Version specs (`"6.14.2"`) — match entries whose label equals the
   version (raw or sanitized form).
 - Range specs (`"6.14..6.16"`, `"6.14..=6.16"`) — match entries whose
-  version falls in the inclusive range.
+  version falls in the inclusive range. One asymmetry vs the CLI:
+  `--kernel 6.14..6.16` widens a two-component end to the whole
+  `6.16.x` series, but a declaration filter compares the end
+  literally — `kernels = ["6.14..6.16"]` does not match a `6.16.5`
+  entry.
 - Path / cache-key / git specs — match by sanitized-label equality.
 
 ```sh
