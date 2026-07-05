@@ -1481,6 +1481,12 @@ pub(crate) struct RunDirSummary {
     /// functions were traceable, or probes attached but captured 0
     /// events). Ordered by `test_name`; one footer line each.
     pub(crate) probe_issues: Vec<(String, String)>,
+    /// `expect_err` tests whose inversion was satisfied by a scheduler
+    /// LOAD/startup failure (not the intended runtime error), written by
+    /// [`write_expect_err_load_marker`]. Ordered by `test_name`. The
+    /// footer names them on one line so a suite that is silently green
+    /// because no scheduler could load becomes visible.
+    pub(crate) expect_err_load: Vec<String>,
 }
 
 /// The per-test artifact shapes a run directory holds.
@@ -1498,6 +1504,15 @@ enum RunArtifactKind {
     /// problem marker ([`write_probe_health_marker`]). Its JSON body
     /// carries a short `reason`.
     ProbeHealth,
+    /// `{test}-{hash}.expect-err-load.json` — an `expect_err` inversion
+    /// that was satisfied by a scheduler LOAD/startup failure rather than
+    /// the runtime scheduler error the test intends
+    /// ([`write_expect_err_load_marker`]). The presence of the marker is
+    /// the signal; its JSON body carries only `test_name`. Surfaced so a
+    /// suite that looks green on a kernel where no scheduler can load
+    /// (every `expect_err` test's inversion satisfied by the load failure,
+    /// not the intended stall/crash) becomes visible.
+    ExpectErrLoad,
 }
 
 /// Split a `{test}-{16-hex variant hash}` stem into `(test, hash)`.
@@ -1550,6 +1565,10 @@ fn classify_run_artifact(name: &str) -> Option<(&str, u64, RunArtifactKind)> {
     if let Some(stem) = name.strip_suffix(".probe-health.json") {
         let (test, hash) = split_variant_stem(stem);
         return Some((test, hash, RunArtifactKind::ProbeHealth));
+    }
+    if let Some(stem) = name.strip_suffix(".expect-err-load.json") {
+        let (test, hash) = split_variant_stem(stem);
+        return Some((test, hash, RunArtifactKind::ExpectErrLoad));
     }
     if let Some(stem) = name.strip_suffix(".repro.failure-dump.json") {
         let (test, hash) = split_variant_stem(stem);
@@ -1644,6 +1663,11 @@ fn summarize_one_run_dir(
         // Short auto-repro probe-pipeline problem reason from a
         // `.probe-health.json` marker (last variant scanned wins).
         probe_health_reason: Option<String>,
+        // Presence of an `.expect-err-load.json` marker: this test's
+        // `expect_err` inversion was satisfied by a scheduler load
+        // failure (any variant sets it — a gauntlet test that load-failed
+        // on one preset still surfaces).
+        expect_err_load: bool,
     }
     let entries = std::fs::read_dir(dir).ok()?;
     let mut by_test: BTreeMap<String, Acc> = BTreeMap::new();
@@ -1737,6 +1761,15 @@ fn summarize_one_run_dir(
                     acc.probe_health_reason = Some(reason);
                 }
             }
+            RunArtifactKind::ExpectErrLoad => {
+                // Presence alone is the signal — the body carries only
+                // `test_name` (already the map key). A malformed body does
+                // not suppress it: the marker exists because the writer
+                // observed an `expect_err` inversion satisfied by a load
+                // failure, and that observability must not hinge on a
+                // parse.
+                acc.expect_err_load = true;
+            }
         }
     }
     if by_test.is_empty() {
@@ -1745,16 +1778,23 @@ fn summarize_one_run_dir(
     let mut failed = Vec::new();
     let mut host_skips = Vec::new();
     let mut probe_issues = Vec::new();
+    let mut expect_err_load = Vec::new();
     for (test_name, mut acc) in by_test {
-        // Host-insufficiency skip and probe-pipeline problem are
+        // Host-insufficiency skip, probe-pipeline problem, and an
+        // expect_err inversion satisfied by a load failure are all
         // orthogonal to the FAILED gate below (a host skip is not a
-        // failure, and a probe problem rides an otherwise-passing
-        // auto-repro run), so collect them BEFORE the failure `continue`.
+        // failure, a probe problem rides an otherwise-passing auto-repro
+        // run, and an expect_err-load test's FINAL verdict is a PASS so it
+        // never reaches `failed`), so collect them BEFORE the failure
+        // `continue`.
         if let Some(class) = acc.host_skip_class.take() {
             host_skips.push((test_name.clone(), class));
         }
         if let Some(reason) = acc.probe_health_reason.take() {
             probe_issues.push((test_name.clone(), reason));
+        }
+        if acc.expect_err_load {
+            expect_err_load.push(test_name.clone());
         }
         // A test FAILED this run if ANY of its variant sidecars records
         // `is_fail` (the FINAL post-inversion verdict), OR it left a
@@ -1802,6 +1842,7 @@ fn summarize_one_run_dir(
         wprof_traces,
         host_skips,
         probe_issues,
+        expect_err_load,
     })
 }
 
@@ -1906,6 +1947,7 @@ pub fn format_run_artifact_footer(
         }
         out.push_str(&render_host_skips(&s.host_skips));
         out.push_str(&render_probe_issues(&s.probe_issues));
+        out.push_str(&render_expect_err_load(&s.expect_err_load));
         out.push_str(&format!(
             "    ({} stats sidecar(s), {} wprof trace(s) written this run)\n",
             s.stats_sidecars, s.wprof_traces,
@@ -1958,6 +2000,27 @@ fn render_probe_issues(issues: &[(String, String)]) -> String {
         out.push_str(&format!("      {test}: {reason}\n"));
     }
     out
+}
+
+/// Render the `expect_err`-satisfied-by-load-failure block: one line
+/// naming every test whose `expect_err` inversion passed because the
+/// scheduler FAILED TO LOAD/attach, not because it hit the runtime error
+/// the test intends. Empty string when there are none, so the footer is
+/// silent on a normal run.
+///
+/// This is an ADVISORY, not a failure: each named test still PASSED
+/// (`expect_err` inverted the error). But a whole suite in this block is
+/// the tell that no scheduler could load on this kernel — the suite is
+/// green without having exercised anything. See
+/// [`write_expect_err_load_marker`].
+fn render_expect_err_load(tests: &[String]) -> String {
+    if tests.is_empty() {
+        return String::new();
+    }
+    format!(
+        "    expect_err satisfied by scheduler load failure (not a runtime error): {}\n",
+        tests.join(", "),
+    )
 }
 
 /// Detect the kernel version associated with the current test run.
@@ -3852,6 +3915,22 @@ pub(crate) fn write_probe_health_marker(entry_name: &str, variant_hash: u64, rea
         variant_hash,
         "probe-health.json",
         &serde_json::json!({ "test_name": entry_name, "reason": reason }),
+    );
+}
+
+/// Record an `.expect-err-load.json` marker for an `expect_err` test
+/// whose inversion was satisfied by a scheduler LOAD/startup failure
+/// (the scheduler never attached — [`crate::verifier::AttachOutcome::Died`]
+/// / `NotAttached`) rather than the runtime error the test intends. The
+/// footer names these so a suite that is silently green because no
+/// scheduler could load on this kernel becomes visible. `variant_hash`
+/// matches the run's other per-test artifacts.
+pub(crate) fn write_expect_err_load_marker(entry_name: &str, variant_hash: u64) {
+    write_run_marker(
+        entry_name,
+        variant_hash,
+        "expect-err-load.json",
+        &serde_json::json!({ "test_name": entry_name }),
     );
 }
 

@@ -3082,6 +3082,10 @@ fn classify_run_artifact_recognizes_each_shape() {
         classify_run_artifact("t.repro.failure-dump.json"),
         Some(("t", 0, RunArtifactKind::ReproFailureDump))
     ));
+    assert!(matches!(
+        classify_run_artifact("t-000000000000000a.expect-err-load.json"),
+        Some(("t", 0xa, RunArtifactKind::ExpectErrLoad))
+    ));
 }
 
 #[test]
@@ -3492,6 +3496,25 @@ fn render_probe_issues_empty_is_silent() {
 }
 
 #[test]
+fn render_expect_err_load_names_tests_on_one_line() {
+    let tests = vec!["neg_stall_a".to_string(), "neg_stall_b".to_string()];
+    let out = render_expect_err_load(&tests);
+    assert!(
+        out.contains(
+            "expect_err satisfied by scheduler load failure (not a runtime error): \
+             neg_stall_a, neg_stall_b"
+        ),
+        "{out}"
+    );
+    assert_eq!(out.lines().count(), 1, "one advisory line: {out}");
+}
+
+#[test]
+fn render_expect_err_load_empty_is_silent() {
+    assert!(render_expect_err_load(&[]).is_empty());
+}
+
+#[test]
 fn format_footer_surfaces_host_skip_and_probe_markers() {
     // A run dir carrying a host-skip marker and a probe-health marker
     // (no failures) must render both advisory blocks even though no test
@@ -3520,6 +3543,31 @@ fn format_footer_surfaces_host_skip_and_probe_markers() {
     );
     // A pure-advisory run lists no FAILED tests.
     assert!(!out.contains("FAILED"), "no test failed here: {out}");
+}
+
+#[test]
+fn format_footer_surfaces_expect_err_load_marker() {
+    // An `expect_err` test whose inversion passed because the scheduler
+    // never loaded writes an `.expect-err-load.json` marker. Its FINAL
+    // verdict is a PASS, so it is NOT in `failed` — the advisory line is
+    // the only signal, and it must render.
+    let root = tempfile::TempDir::new().unwrap();
+    let run = root.path().join("7.1.0-abc1234");
+    std::fs::create_dir(&run).unwrap();
+    std::fs::write(
+        run.join("neg_stall_detection-0000000000000003.expect-err-load.json"),
+        br#"{"test_name":"neg_stall_detection"}"#,
+    )
+    .unwrap();
+    let out = format_run_artifact_footer(root.path(), std::time::UNIX_EPOCH);
+    assert!(
+        out.contains(
+            "expect_err satisfied by scheduler load failure (not a runtime error): \
+             neg_stall_detection"
+        ),
+        "expect-err-load block missing: {out}"
+    );
+    assert!(!out.contains("FAILED"), "the test passed (inverted): {out}");
 }
 
 // -- runs_root KTSTR_RUNS_ROOT anchoring (workspace footer fix) --
