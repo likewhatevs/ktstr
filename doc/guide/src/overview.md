@@ -116,7 +116,8 @@ not perturb the scheduler under test. See
   mid-run.
 - **Affinity** — the scheduler respects thread affinity constraints.
 - **Stress** — many cgroups, many workers, rapid topology changes.
-- **Stall detection** — the scheduler doesn't drop tasks.
+- **Stuck-task detection** — the scheduler doesn't leave runnable
+  tasks unrun.
 
 > [!NOTE]
 > ktstr is pre-release. 0.x APIs change between releases, so pin the

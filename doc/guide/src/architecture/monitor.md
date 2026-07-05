@@ -57,7 +57,7 @@ the rest of the walk proceeds.
 The monitor takes periodic snapshots (`MonitorSample`) of all per-CPU
 state; each sample is a point-in-time view of every CPU.
 `MonitorSummary` aggregates samples into peak values (max imbalance
-ratio, max DSQ depth, stall detection), per-sample averages, and
+ratio, max DSQ depth, stuck-task detection), per-sample averages, and
 event-counter deltas. Averages are computed over valid samples only
 (excluding uninitialized guest memory — see below).
 
@@ -104,10 +104,10 @@ evaluate" is not the same as "evaluated and OK," so the no-signal
 path always surfaces distinct from Pass. Only threshold *violations*
 are gated by `enforce`.
 
-### Stall detection
+### Stuck-task detection
 
-A stall is detected when a CPU's `rq_clock` does not advance between
-consecutive samples. Three exemptions prevent false positives:
+A stuck task is detected when a CPU's `rq_clock` does not advance
+between consecutive samples. Three exemptions prevent false positives:
 
 - **Idle CPUs**: when `nr_running == 0` in both the current and
   previous sample, the CPU has no runnable tasks. The kernel stops
@@ -117,7 +117,7 @@ consecutive samples. Three exemptions prevent false positives:
   advance past the preemption threshold between samples, the host
   preempted the vCPU — the guest never got a chance to run, which is
   not the scheduler's fault.
-- **Sustained window**: stall detection uses per-CPU consecutive
+- **Sustained window**: stuck-task detection uses per-CPU consecutive
   counters and the `sustained_samples` threshold, matching the other
   checks. A single stuck sample does not trigger failure.
 

@@ -32,7 +32,7 @@ pub enum DetailKind {
     CrossNodeMigration,
     /// Slow-tier (memory tier) threshold failure.
     SlowTier,
-    /// Monitor-subsystem anomaly (imbalance, DSQ depth, rq_clock stall).
+    /// Monitor-subsystem anomaly (imbalance, DSQ depth, rq_clock stuck).
     /// Use one of [`DetailKind::SchedulerCrashed`] /
     /// [`DetailKind::SchedulerExitedCleanly`] /
     /// [`DetailKind::SchedulerDiedUnknownReason`] for scheduler-liveness failures.

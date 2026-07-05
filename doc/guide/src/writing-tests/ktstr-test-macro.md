@@ -123,7 +123,7 @@ guest scheduler state:
 |---|---|---|---|
 | `max_imbalance_ratio` | ratio | `max_imbalance_ratio = 2.0` | observed run-queue imbalance exceeds the cap |
 | `max_local_dsq_depth` | tasks | `max_local_dsq_depth = 8` | a local DSQ grows deeper than the cap |
-| `fail_on_stall` | bool | `fail_on_stall` | the monitor's stall detection fails the test instead of reporting |
+| `fail_on_stall` | bool | `fail_on_stall` | the monitor's stuck-task detection fails the test instead of reporting |
 | `sustained_samples` | samples | `sustained_samples = 3` | window size a violation must persist for before it counts |
 | `max_fallback_rate` | events/s | `max_fallback_rate = 5.0` | fallback-dispatch event rate exceeds the cap |
 | `max_keep_last_rate` | events/s | `max_keep_last_rate = 100.0` | keep-last event rate exceeds the cap |

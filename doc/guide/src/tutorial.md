@@ -370,7 +370,7 @@ What each new attribute gates:
   worker. Catches the case where every worker is equally slow (CV
   passes but absolute throughput is too low).
 
-Host-side monitor checks (imbalance ratio, DSQ depth, stall
+Host-side monitor checks (imbalance ratio, DSQ depth, stuck-task
 detection, event rates) also run on every test, but they are
 report-only by default — [Checking](concepts/checking.md) covers
 what they observe and how to make them enforce.

@@ -2049,11 +2049,11 @@ impl MonitorThresholds {
         }
 
         if self.fail_on_stall {
-            for (cpu, tracker) in self.track_stall(report).iter().enumerate() {
+            for (cpu, tracker) in self.track_rq_clock_stuck(report).iter().enumerate() {
                 if tracker.sustained(self.sustained_samples) {
                     failed = true;
                     details.push(format!(
-                        "rq_clock stall on cpu{} for {} consecutive samples (ending at sample {}, clock={})",
+                        "rq_clock stuck on cpu{} for {} consecutive samples (ending at sample {}, clock={})",
                         cpu,
                         tracker.worst_run,
                         tracker.worst_at,
@@ -2136,15 +2136,15 @@ impl MonitorThresholds {
         (imbalance, dsq, worst_dsq_cpu)
     }
 
-    /// Per-CPU stall detection over consecutive sample pairs. Exempts
-    /// idle CPUs (NOHZ stopped the tick so rq_clock legitimately doesn't
-    /// advance) and preempted vCPUs (host stole the core, so the vCPU
-    /// couldn't tick the clock) via [`reader::is_cpu_stuck`].
+    /// Per-CPU rq_clock-stuck detection over consecutive sample pairs.
+    /// Exempts idle CPUs (NOHZ stopped the tick so rq_clock legitimately
+    /// doesn't advance) and preempted vCPUs (host stole the core, so the
+    /// vCPU couldn't tick the clock) via [`reader::is_cpu_stuck`].
     ///
     /// Returns one [`SustainedViolationTracker`] per CPU. Sized to the
     /// max `cpus.len()` across the report so a sample with fewer CPUs
     /// doesn't truncate the per-CPU vector mid-walk.
-    fn track_stall(&self, report: &MonitorReport) -> Vec<SustainedViolationTracker> {
+    fn track_rq_clock_stuck(&self, report: &MonitorReport) -> Vec<SustainedViolationTracker> {
         let threshold = if report.preemption_threshold_ns > 0 {
             report.preemption_threshold_ns
         } else {

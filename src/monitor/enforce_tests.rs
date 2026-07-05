@@ -128,8 +128,8 @@ fn enforce_false_with_violation_yields_passed_true_and_records_details() {
         "violation must STILL be recorded in details even under report-only mode"
     );
     assert!(
-        v.details.iter().any(|d| d.contains("rq_clock stall")),
-        "details must carry the rq_clock stall violation: {:?}",
+        v.details.iter().any(|d| d.contains("rq_clock stuck")),
+        "details must carry the rq_clock stuck violation: {:?}",
         v.details
     );
     assert!(

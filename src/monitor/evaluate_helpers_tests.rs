@@ -1,6 +1,6 @@
 //! Direct unit tests for the per-aspect helpers
 //! [`MonitorThresholds::track_imbalance_and_dsq`],
-//! [`MonitorThresholds::track_stall`],
+//! [`MonitorThresholds::track_rq_clock_stuck`],
 //! [`MonitorThresholds::track_event_rates`], and
 //! [`MonitorThresholds::summarize`].
 //!
@@ -99,13 +99,13 @@ fn track_imbalance_and_dsq_empty_cpus_records_non_violation() {
     assert_eq!(dsq.worst_run, 0);
 }
 
-/// `track_stall` must size its per-CPU tracker vector to the
+/// `track_rq_clock_stuck` must size its per-CPU tracker vector to the
 /// maximum `cpus.len()` across all samples in the report, NOT just
 /// the first sample. A regression that uses `samples[0].cpus.len()`
-/// would silently drop stalls on CPUs that appear later (e.g. CPU
+/// would silently drop stuck CPUs that appear later (e.g. CPU
 /// hotplug increased the count mid-run).
 #[test]
-fn track_stall_sizes_vec_to_max_cpu_count_across_samples() {
+fn track_rq_clock_stuck_sizes_vec_to_max_cpu_count_across_samples() {
     let t = MonitorThresholds {
         fail_on_stall: true,
         ..Default::default()
@@ -150,7 +150,7 @@ fn track_stall_sizes_vec_to_max_cpu_count_across_samples() {
         summary: MonitorSummary::default(),
         ..Default::default()
     };
-    let stall = t.track_stall(&report);
+    let stall = t.track_rq_clock_stuck(&report);
     assert_eq!(
         stall.len(),
         3,
@@ -158,14 +158,14 @@ fn track_stall_sizes_vec_to_max_cpu_count_across_samples() {
     );
 }
 
-/// `track_stall` must suppress a frozen `rq_clock` when the vCPU
+/// `track_rq_clock_stuck` must suppress a frozen `rq_clock` when the vCPU
 /// `cpu_time_ns` shows the vCPU was preempted by the host (advance
 /// < threshold). This is the regression that
 /// `evaluate_suppresses_stuck_when_vcpu_preempted` covers
 /// end-to-end; pinning it at the helper boundary catches it without
 /// the verdict-formatting layer in the way.
 #[test]
-fn track_stall_respects_vcpu_preemption_threshold() {
+fn track_rq_clock_stuck_respects_vcpu_preemption_threshold() {
     let t = MonitorThresholds {
         fail_on_stall: true,
         ..Default::default()
@@ -203,7 +203,7 @@ fn track_stall_respects_vcpu_preemption_threshold() {
         boot_wait_outcome: BootWaitOutcome::NotConfigured,
         scx_event_counters_supported: false,
     };
-    let stall = t.track_stall(&report);
+    let stall = t.track_rq_clock_stuck(&report);
     assert_eq!(stall.len(), 1);
     assert_eq!(
         stall[0].worst_run, 0,

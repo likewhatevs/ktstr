@@ -5304,7 +5304,7 @@ mod tests {
             verdict.details
         );
         assert!(
-            verdict.details.iter().any(|d| d.contains("rq_clock stall")),
+            verdict.details.iter().any(|d| d.contains("rq_clock stuck")),
             "evaluate details should mention stall: {:?}",
             verdict.details
         );

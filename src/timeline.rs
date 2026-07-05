@@ -915,7 +915,7 @@ impl Timeline {
                 }
                 out.push('\n');
                 if m.stall_count > 0 {
-                    out.push_str(&format!("  stalls: {}\n", m.stall_count));
+                    out.push_str(&format!("  stuck: {}\n", m.stall_count));
                 }
             } else if let Some(ir) = m.iteration_rate {
                 // Synthesized zero-capture step (the
@@ -2513,7 +2513,7 @@ mod tests {
         ];
         let t = Timeline::build(&events, &samples, 0);
         let formatted = t.format_with_context(&TimelineContext::default());
-        assert!(formatted.contains("stalls: 1"));
+        assert!(formatted.contains("stuck: 1"));
     }
 
     // -- format with no samples in a phase --

@@ -210,7 +210,7 @@ fn neg_stuck_detection_catches_frozen_rq_clock() {
     assert!(!v.passed, "frozen rq_clock must be detected");
     let detail = v
         .failure_details()
-        .find(|d| d.contains("rq_clock stall"))
+        .find(|d| d.contains("rq_clock stuck"))
         .unwrap();
     assert!(detail.contains("cpu0"), "must name frozen CPU: {detail}");
     assert!(
@@ -357,7 +357,7 @@ fn neg_combined_imbalance_and_stuck_both_reported() {
     );
     let stall = v
         .failure_details()
-        .find(|d| d.contains("rq_clock stall"))
+        .find(|d| d.contains("rq_clock stuck"))
         .unwrap();
     assert!(stall.contains("cpu0"), "stall format: {stall}");
     assert!(
@@ -605,7 +605,7 @@ fn stuck_sustained_window_catches_real_stuck() {
     };
     let v = t.evaluate(&report);
     assert!(!v.passed, "3 consecutive stall pairs must fail");
-    assert!(v.details.iter().any(|d| d.contains("rq_clock stall")));
+    assert!(v.details.iter().any(|d| d.contains("rq_clock stuck")));
 }
 
 #[test]
@@ -875,7 +875,7 @@ fn evaluate_catches_stuck_when_vcpu_running() {
     };
     let v = t.evaluate(&report);
     assert!(!v.passed, "running vCPU stall must fail: {:?}", v.details);
-    assert!(v.details.iter().any(|d| d.contains("rq_clock stall")));
+    assert!(v.details.iter().any(|d| d.contains("rq_clock stuck")));
 }
 
 #[test]

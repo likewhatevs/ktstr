@@ -96,7 +96,7 @@ offsets, no guest instrumentation) roughly every 100ms and evaluates:
 - **Imbalance ratio** — `max(nr_running) / max(1, min(nr_running))`
   across CPUs.
 - **Local DSQ depth** — per-CPU dispatch queue depth.
-- **Stall detection** — `rq_clock` not advancing on a CPU with
+- **Stuck-task detection** — `rq_clock` not advancing on a CPU with
   runnable tasks; idle CPUs and preempted vCPUs are exempt.
 - **Event rates** — `select_cpu_fallback` and `dispatch_keep_last`
   counters per second.

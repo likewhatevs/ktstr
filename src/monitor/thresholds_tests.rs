@@ -324,7 +324,7 @@ fn thresholds_stuck_fails() {
     };
     let v = t.evaluate(&report);
     assert!(v.is_fail());
-    assert!(v.details.iter().any(|d| d.contains("rq_clock stall")));
+    assert!(v.details.iter().any(|d| d.contains("rq_clock stuck")));
 }
 
 #[test]
@@ -538,7 +538,7 @@ fn thresholds_multiple_violations() {
     let v = t.evaluate(&report);
     assert!(v.is_fail());
     assert!(v.details.iter().any(|d| d.contains("imbalance")));
-    assert!(v.details.iter().any(|d| d.contains("rq_clock stall")));
+    assert!(v.details.iter().any(|d| d.contains("rq_clock stuck")));
 }
 
 #[test]
