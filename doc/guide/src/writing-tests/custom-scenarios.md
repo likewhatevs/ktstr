@@ -1,146 +1,177 @@
 # Custom Scenarios
 
-For dynamic scenarios (cgroup creation/removal, cpuset changes), prefer
-the [ops/steps system](../concepts/ops.md) over a hand-written custom
-scenario function.
+The body of a `#[ktstr_test]` function *is* the scenario — there is
+no separate registration step. Most bodies hand control to a canned
+scenario or to `execute_defs` / `execute_steps`; a custom scenario
+is the same function keeping control and driving cgroups, workers,
+and assertions itself.
 
-A custom scenario is just a `fn(&Ctx) -> Result<AssertResult>` that
-runs in place of one of the canned `scenarios::*` entry points. Use
-this shape only when you need logic that the ops system cannot
-express.
+For dynamic scenarios (cgroup creation/removal, cpuset changes),
+prefer the [ops/steps system](../concepts/ops.md) over a
+hand-written scenario. Reach for custom code only when ops cannot
+express the logic:
 
-## Writing a custom scenario
+- Cgroups created, removed, or resized at fixed points in the run —
+  ops cover it.
+- Different work types, worker counts, or phase-scoped checks per
+  step — ops cover it.
+- Snapshot captures at chosen points — ops cover it
+  ([Snapshots](snapshots.md)).
+- Branching on state observed mid-run, computing cpusets from
+  runtime conditions, or asserting directly on raw `WorkerReport`s —
+  ops cannot; write a custom scenario.
+
+## A worked custom scenario
+
+Shrink one cgroup's cpuset mid-run — a decision ops cannot make,
+because the second half's cpuset and the assertion both depend on
+runtime state — then assert the scheduler actually moved the
+workers:
 
 ```rust,ignore
 use ktstr::prelude::*;
 use ktstr::scenario::*;
 
-fn my_custom_scenario(ctx: &Ctx) -> Result<AssertResult> {
+#[ktstr_test(llcs = 2, cores = 4, threads = 1, duration_s = 10)]
+fn workers_follow_cpuset_shrink(ctx: &Ctx) -> Result<AssertResult> {
     let wl = dfl_wl(ctx);
-    let (handles, _guard) = setup_cgroups(ctx, 2, &wl)?;
+    // Creates cg_0 and cg_1, spawns and starts workers in each.
+    let (mut handles, _guard) = setup_cgroups(ctx, 2, &wl)?;
 
-    // Custom logic: resize cpusets, move workers, etc.
-    std::thread::sleep(ctx.duration);
+    // First half: full topology.
+    std::thread::sleep(ctx.duration / 2);
 
-    Ok(collect_all(handles, &ctx.assert))
+    // Mid-run: pin cg_0 to LLC 1 only.
+    let llc1 = ctx.topo.llc_aligned_cpuset(1);
+    ctx.cgroups.set_cpuset("cg_0", &llc1)?;
+
+    // Second half: workers must migrate off LLC 0.
+    std::thread::sleep(ctx.duration / 2);
+
+    let cg0_reports = handles.remove(0).stop_and_collect();
+    let migrations: u64 = cg0_reports.iter().map(|r| r.migration_count).sum();
+    anyhow::ensure!(
+        migrations > 0,
+        "cpuset shrink forced no migrations — cg_0 workers never moved"
+    );
+
+    let mut result = ctx.assert.assert_cgroup(&cg0_reports, None);
+    result.merge(collect_all(handles, &ctx.assert));
+    Ok(result)
 }
 ```
 
-## Helper functions
+Bind the `CgroupGroup` to a named variable (`_guard`) so the cgroups
+live until end of scope — see
+[CgroupGroup](../architecture/cgroup-group.md) for drop semantics.
+Sleeping `ctx.duration` (rather than a hard-coded period) keeps the
+scenario composable with `duration_s = N` overrides and the gauntlet
+budget controller.
 
-**`setup_cgroups(ctx, n, wl)`** -- creates N cgroups, spawns workers,
-returns `Result<(Vec<`[`WorkloadHandle`](../architecture/workload-handle.md)`>, `[`CgroupGroup`](../architecture/cgroup-group.md)`)>`.
-Bind the `CgroupGroup` to a named variable (e.g. `_guard`) so it
-lives until end of scope.
-See [CgroupGroup](../architecture/cgroup-group.md) for drop semantics.
+> **Imports:** `setup_cgroups`, `dfl_wl`, `collect_all`, and
+> `spawn_diverse` live in `ktstr::scenario`, not in the prelude. The
+> `use ktstr::scenario::*;` line is required —
+> `use ktstr::prelude::*;` alone does not bring them into scope.
 
-> **Imports:** `setup_cgroups` and `dfl_wl` live in `ktstr::scenario`,
-> not in the prelude. The `use ktstr::scenario::*;` line in the
-> example above is required — `use ktstr::prelude::*;` alone does
-> not bring them into scope.
+## Helper functions {#helper-functions}
 
-**`collect_all(handles, checks)`** -- stops all workers and collects
-reports. Per-cgroup telemetry (`CgroupStats`) is always produced for
-every handle, regardless of which checks are configured; only the
-worker-check assertion outcomes are recorded for the checks the caller
-enabled. With no checks enabled the result stays `pass` because no
-failing outcome is recorded (there is no implicit `assert_not_starved`
-fallback). If any handle fails an enabled check, the overall result
-fails.
+**`setup_cgroups(ctx, n, wl)`** — creates cgroups `cg_0..cg_{n-1}`,
+spawns and starts workers in each, and returns
+`(Vec<WorkloadHandle>, CgroupGroup)` with handles in cgroup order.
 
-**`dfl_wl(ctx)`** -- creates a `WorkloadConfig` with
-`ctx.workers_per_cgroup` workers and default settings.
+**`collect_all(handles, checks)`** — stops all workers and collects
+reports. Per-cgroup telemetry is always produced; only the checks
+the caller enabled record assertion outcomes, and with no checks
+enabled the result stays `pass` (there is no implicit starvation
+fallback).
 
-**`spawn_diverse(ctx, cgroup_names)`** -- spawns different
-[work types](../concepts/work-types.md) across cgroups, rotating
-through (SpinWait, Bursty{50ms burst / 100ms sleep}, IoSyncWrite,
-Mixed, YieldHeavy). Each cgroup uses `ctx.workers_per_cgroup`
-workers except IoSyncWrite cgroups, which always use 2 workers so
-blocking IO does not drown the scenario.
+**`dfl_wl(ctx)`** — a `WorkloadConfig` with `ctx.workers_per_cgroup`
+workers and default settings (`WorkType::SpinWait`).
 
-## The Ctx struct
+**`spawn_diverse(ctx, cgroup_names)`** — spawns rotating
+[work types](../concepts/work-types.md) across cgroups (SpinWait,
+Bursty, IoSyncWrite, Mixed, YieldHeavy); IoSyncWrite cgroups always
+get 2 workers so blocking IO does not drown the scenario.
 
-Custom scenarios receive a `Ctx` reference:
+## Custom work functions
+
+When the built-in [work types](../concepts/work-types.md) don't
+generate the load pattern you need, `WorkType::Custom` runs a
+user-supplied work function inside each worker. The framework
+handles fork, cgroup placement, affinity, and signal setup; the
+function owns the work loop and all `WorkerReport` population —
+framework telemetry (migration tracking, gap detection, schedstat
+deltas) is not provided.
 
 ```rust,ignore
-#[non_exhaustive]
-pub struct Ctx<'a> {
-    pub cgroups: &'a dyn CgroupOps,
-    pub topo: &'a TestTopology,
-    pub duration: Duration,
-    pub workers_per_cgroup: usize,
-    pub sched_pid: Option<libc::pid_t>,
-    pub settle: Duration,
-    pub work_type_override: Option<WorkType>,
-    pub assert: Assert,
-    pub wait_for_map_write: bool,
-    pub current_step: Arc<AtomicU16>,
-    pub entry_name: Option<&'static str>,
-    pub variant_hash: u64,
+use std::sync::atomic::Ordering;
+use ktstr::workload::{WorkType, WorkerCtx, WorkerReport};
+
+fn my_workload(ctx: &WorkerCtx) -> WorkerReport {
+    let tid: i32 = std::process::id() as i32; // one worker = one process
+    let start = std::time::Instant::now();
+    let mut work_units = 0u64;
+    while !ctx.stop().load(Ordering::Relaxed) {
+        // ... custom work ...
+        work_units += 1;
+    }
+    // Start from default() so unpopulated fields stay zero/empty.
+    WorkerReport {
+        tid,
+        work_units,
+        iterations: work_units,
+        wall_time_ns: start.elapsed().as_nanos() as u64,
+        ..WorkerReport::default()
+    }
 }
+
+let wt = WorkType::custom("my_workload", my_workload);
 ```
 
-`current_step` is the live phase counter — `0` during BASELINE,
-`1..=N` while step ordinal N is running. Read via
-`ctx.current_step.load(Ordering::Acquire)` to gate scenario-side
-behavior on phase. The host-side periodic-capture pipeline stamps
-each capture with the same value.
+`WorkerCtx` exposes the stop flag (`ctx.stop()`), `ctx.cpus()`,
+`ctx.sibling_pids()`, `ctx.cgroup_dir()`, and `ctx.cfg()`. Only
+plain function pointers are accepted — they carry no captured state
+across the fork boundary; closures are not supported. To pass
+per-worker configuration, build the work type with
+`WorkType::custom_with(name, run, cfg)`: `CustomCfg` is a Copy POD
+payload inherited byte-faithfully across `fork`. For genuinely
+shared state, allocate a `MAP_SHARED` region and pass its address
+through a `u64` slot.
 
-**`cgroups`** -- create/remove cgroups, set cpusets, move tasks. The
-slot is a `&dyn CgroupOps` trait object, not a concrete
-[`CgroupManager`](../architecture/cgroup-manager.md), so tests can
-substitute a no-op double for host-only scenarios while production
-paths receive the real manager. Method signatures are defined on
-`CgroupOps`; see `CgroupManager` for the production implementation.
+> [!WARNING]
+> Every worker calls `setpgid(0, 0)` after fork, and teardown
+> SIGKILLs the worker's whole process group — twice (at collect and
+> at handle drop). Any child a custom function spawns inherits that
+> pgid and dies with it. A child that must outlive the worker needs
+> `setpgid(child_pid, 0)` after fork, or an explicit wait before the
+> function returns.
 
-**`topo`** -- query CPU topology (LLCs, NUMA nodes, memory info,
-distances). Provides CPU enumeration, LLC/NUMA partitioning, cpuset
-generation, and inter-node distance queries. See
-[TestTopology](../concepts/topology.md) for the full API reference.
+## The Ctx fields scenario authors use
 
-**`sched_pid`** -- scheduler process ID (`Option<libc::pid_t>`) for
-liveness checks. `None` when the test runs without an scx scheduler
-(the EEVDF default path has no userspace scheduler binary). Unwrap
-or `is_some_and(...)` before passing to a liveness check such as
-`kill(Pid::from_raw(pid), None)` (nix).
+- **`ctx.cgroups`** — create/remove cgroups, set cpusets, move
+  tasks. A `&dyn CgroupOps` trait object;
+  [CgroupManager](../architecture/cgroup-manager.md) is the
+  production implementation.
+- **`ctx.topo`** — CPU/LLC/NUMA queries and cpuset generation. See
+  [Topology](../concepts/topology.md).
+- **`ctx.duration`** — the workload wall-clock budget; sleep against
+  this, not a literal.
+- **`ctx.settle`** — time to wait after cgroup creation for the
+  scheduler to stabilize.
+- **`ctx.workers_per_cgroup`** — default per-cgroup worker count
+  (`dfl_wl` reads it; there is no `workers` test attribute — set
+  counts via `CgroupDef::named("x").workers(n)`).
+- **`ctx.sched_pid`** — scheduler PID for liveness checks; `None`
+  when running under kernel-default EEVDF.
+- **`ctx.assert`** — the merged check set (defaults → scheduler →
+  per-test). Pass to `collect_all` / `assert_cgroup` so attribute
+  overrides actually apply.
+- **`ctx.work_type_override`** — gauntlet-supplied work type applied
+  to `CgroupDef`s marked `swappable`; it does not affect `dfl_wl`.
+- **`ctx.current_step`** — live phase counter (0 = baseline, 1..=N =
+  step ordinal), readable via
+  `ctx.current_step.load(Ordering::Acquire)` to gate behavior on
+  phase; periodic captures are stamped with the same value.
 
-**`settle`** -- time to wait after cgroup creation for the scheduler
-to stabilize.
-
-**`duration`** -- total scenario wall-clock budget. Custom scenarios
-that hold workers running for a fixed period should sleep for this
-duration after `start()` and before `stop_and_collect()`. Honoring
-this value keeps custom scenarios composable with the gauntlet
-budget controller and with `#[ktstr_test(duration_s = N)]` overrides.
-
-**`workers_per_cgroup`** -- default per-cgroup worker count. Defaults
-to 1 (from `CtxBuilder`); there is no `workers` `#[ktstr_test]`
-attribute. `dfl_wl(ctx)` sources `num_workers` from this field. Set a
-different per-cgroup count in the scenario body via
-`CgroupDef::named("X").workers(N)`. Custom scenarios that hand-build a
-`WorkloadConfig` should source `num_workers` from this field unless
-the test explicitly wants a different value.
-
-**`work_type_override`** -- gauntlet-supplied or programmatic
-`WorkType` to swap in for any `CgroupDef` whose `swappable = true`
-(applied per-WorkSpec via `resolve_work_type`). It does NOT affect the
-`dfl_wl` default, which always uses `WorkType::SpinWait`. `None` keeps
-the per-cgroup work type the scenario specified.
-
-**`assert`** -- the merged `Assert` (`default_checks() →
-scheduler → per-test`) the test framework expects the scenario to
-evaluate against. Pass to `collect_all(handles, &ctx.assert)` or
-the manual `assert.assert_cgroup(...)` paths.
-
-**`wait_for_map_write`** -- when `true`, the framework will not
-spawn workers until the test's `bpf_map_write` declarations have
-been applied. Custom scenarios that don't gate worker spawn on BPF
-map state can ignore this field; the framework wires it
-automatically.
-
-## Checking in custom scenarios
-
-Use `Assert` for both direct report checking and ops-based scenarios.
-Call `assert.assert_cgroup(reports, cpuset)` for manual report
-collection, or use `execute_steps_with()` for ops-based scenarios. See
-[Checking](../concepts/checking.md#worker-checks-via-assert).
+The remaining fields are framework wiring; see the
+[Ctx rustdoc](https://ktstr.dev/rustdoc/ktstr/scenario/struct.Ctx.html).

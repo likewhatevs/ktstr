@@ -1,9 +1,10 @@
 # Running Tests
 
-Tests run via `cargo ktstr test --kernel ../linux`, which resolves the
-kernel and wraps `cargo nextest run` to boot KVM virtual machines for
-each `#[ktstr_test]` entry. Raw `cargo nextest run` remains available
-as a fallback once a kernel is in place via the discovery chain.
+Every `#[ktstr_test]` boots a fresh KVM microVM with the topology the
+test declares, on the exact kernel you target. `cargo ktstr test`
+resolves that kernel (building and caching it when needed) and wraps
+`cargo nextest run`, so nextest's filtering, retries, and parallelism
+all apply.
 
 ## Quick reference
 
@@ -17,120 +18,101 @@ cargo ktstr test --kernel ../linux -- -E 'test(sched_basic_proportional)'
 # Run all ktstr-managed tests, skipping non-ktstr tests in the same crate
 cargo ktstr test --kernel ../linux -- -E 'test(/^ktstr/)'
 
-# Run ignored gauntlet tests
+# Run ignored gauntlet variants
 cargo ktstr test --kernel ../linux -- --run-ignored ignored-only -E 'test(gauntlet/)'
 ```
 
-## Test name shapes
+## What's in this chapter
+
+- [cargo ktstr](running-tests/cargo-ktstr.md) — the host-side command:
+  kernel resolution, test dispatch, replay, coverage, export.
+- [ktstr (standalone)](running-tests/ktstr.md) — the debugging
+  companion: interactive VM shells, `topo`, `ctprof`, `locks`.
+- [Gauntlet](running-tests/gauntlet.md) — run every test across a
+  matrix of topology presets.
+- [BPF Verifier Sweep](running-tests/verifier.md) — verify, attach,
+  and dispatch every declared scheduler across topologies.
+- [Reading Failure Output](running-tests/failures.md) — what a failed
+  test prints, section by section, and how to investigate.
+- [Auto-Repro](running-tests/auto-repro.md) — the second VM that
+  replays a scheduler crash with probes attached.
+- [Runs and Regression Gates](running-tests/runs.md) — result
+  sidecars, `stats`, and `perf-delta`.
+
+## Test names and variants {#test-name-shapes}
 
 Tests registered through `#[ktstr_test]` show up in nextest output
-under one of four prefixes, all routed through ktstr's dispatch
-layer:
+under one of four prefixes:
 
-- `ktstr/{name}` — single-variant form. Single-kernel mode (no
-  `KTSTR_KERNEL_LIST` or exactly one entry), or any `host_only` test
-  regardless of kernel-list size (host_only tests never boot a VM,
-  so kernel identity does not multiply them).
-- `ktstr/{name}/{kernel}` — multi-kernel single-variant form. Active
-  when `KTSTR_KERNEL_LIST` carries 2+ kernels, so each (test ×
-  kernel) pair becomes its own nextest case.
-- `gauntlet/{name}/{preset}` — single-kernel gauntlet expansion. For
-  each `#[ktstr_test]`, ktstr emits one entry per gauntlet preset so
-  topology variants run as distinct nextest cases.
-- `gauntlet/{name}/{preset}/{kernel}` — multi-kernel gauntlet
-  expansion. Active when `KTSTR_KERNEL_LIST` carries 2+ kernels, so
-  each (test × preset × kernel) triple becomes its own case.
+- `ktstr/{name}` — single-kernel run (or any `host_only` test, which
+  never boots a VM and so never multiplies across kernels).
+- `ktstr/{name}/{kernel}` — one case per (test × kernel) when
+  `--kernel` resolves to two or more kernels.
+- `gauntlet/{name}/{preset}` — one case per topology preset
+  (see [Gauntlet](running-tests/gauntlet.md)).
+- `gauntlet/{name}/{preset}/{kernel}` — the full (test × preset ×
+  kernel) expansion under a multi-kernel run.
 
-Filter by prefix with `-E 'test(/^ktstr/)'` (all ktstr-managed
-single-variant tests) or `-E 'test(/^gauntlet/)'` (all gauntlet
-expansions). Substring matches like `-E 'test(ktstr/)'` also work;
-the `^` anchor avoids accidentally matching test names like
-`verify_ktstr/bar` from a sibling crate or `something_ktstr/foo`
-from a manually-named test that happens to contain `ktstr/` as a
-substring.
+This is what those names look like in a real run:
 
-The `#[ktstr_test]` attribute itself isn't a nextest filter
-selector — nextest filters on test names, and the prefix routing
-above is how `#[ktstr_test]`-marked tests surface as filterable
-names.
+<!-- captured: cargo ktstr test --kernel 7.0 -- --features integration -E 'test(=ktstr/failure_dump_renders_bss_fields)' | ktstr 0.23.0 | kernel 7.0.14 -->
+```text
+ Nextest run ID 98581174-246f-4824-a170-50992df166d7 with nextest profile: default
+    Starting 1 test across 121 binaries (12531 tests skipped)
+        PASS [  34.459s] (1/1) ktstr::failure_dump_e2e ktstr/failure_dump_renders_bss_fields
+```
 
-The `{kernel}` suffix is a sanitized kernel label: `kernel_`
-prefix, lowercase, every non-alphanumeric ASCII character collapsed
-to `_`, consecutive underscores collapsed, trailing underscores
-stripped. Version specs render as `kernel_<version>` — `6.16.1`
-becomes `kernel_6_16_1`. Path specs render as
-`kernel_path_<basename>_<hash6>` — `../linux` becomes
-`kernel_path_linux_<hash6>` (and `..._dirty` when the source tree
-is dirty). The 6-char path hash (a CRC32 over the canonical path
-string) disambiguates two different source paths that share a
-basename.
+<!-- captured: KTSTR_KERNEL=7.0 cargo nextest list --features integration -E 'test(gauntlet/) & binary(worktype_coverage_fork_gauntlet_e2e)' | ktstr 0.23.0 | kernel 7.0.14 -->
+```text
+...
+ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/smt-3llc
+ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/tiny-1llc
+ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/tiny-2llc
+```
 
-## Run analysis
+Filter by prefix with `-E 'test(/^ktstr/)'` or `-E 'test(/^gauntlet/)'`.
 
-Each test invocation writes a `*.ktstr.json` sidecar per variant
-into `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{project_commit}/`.
-`cargo ktstr stats list` enumerates runs; `list-values` and
-`show-host` inspect those sidecars, and `cargo ktstr perf-delta`
-compares them across commits.
-`list-metrics` is independent of the sidecar pool — it enumerates the
-static `ktstr::stats::METRICS` regression-metric registry (metric
-names, polarities, default abs/rel thresholds, units) and takes no
-run input. See [Runs](running-tests/runs.md) for the directory
-layout, last-writer-wins semantics, and the comparison workflow.
+> [!TIP]
+> `test(NAME)` is a substring match; the exact-match form `test(=NAME)`
+> matches the **full** nextest name, prefix included. Use
+> `test(=ktstr/sched_basic_proportional)`, not the bare function name —
+> `test(=sched_basic_proportional)` matches nothing.
+
+The `{kernel}` suffix is a sanitized kernel label: `kernel_` prefix,
+lowercase, non-alphanumeric characters collapsed to `_` — `6.16.1`
+becomes `kernel_6_16_1`, and a path spec becomes
+`kernel_path_{basename}_{hash6}` (with `_dirty` appended when the
+source tree has uncommitted changes). The 6-character hash
+disambiguates two source paths that share a basename.
+
+`RUST_BACKTRACE=1` controls panic backtraces and verbose failure
+output, not guest console streaming — see
+[Reading Failure Output](running-tests/failures.md) for the
+investigation knobs.
 
 ## Budget-based test selection
 
 Set `KTSTR_BUDGET_SECS` to select the subset of tests that maximizes
-feature coverage within a time budget. Useful for CI pipelines or
-quick smoke tests.
+configuration coverage within a time budget — useful for CI pipelines
+and quick smoke tests:
 
 ```sh
-# Run the best 5 minutes of tests
 KTSTR_BUDGET_SECS=300 cargo ktstr test --kernel ../linux
-
-# Budget applies to gauntlet variants too
-KTSTR_BUDGET_SECS=600 cargo ktstr test --kernel ../linux -- --run-ignored all
 ```
 
 The selector encodes each test as a bitset of properties (scheduler,
-topology class, SMT, workload characteristics) and greedily picks
-tests with the highest marginal coverage per estimated second.
-Duration estimates account for VM boot overhead based on vCPU count.
-
-A summary is printed to stderr during budget-mode `--list` (only
-when `KTSTR_BUDGET_SECS` is set):
+topology class, SMT, workload characteristics) and greedily picks the
+tests with the highest marginal coverage per estimated second, with
+duration estimates accounting for VM boot overhead by vCPU count. A
+summary is printed to stderr during budget-mode listing:
 
 ```text
 ktstr budget: 42/1200 tests, 295/300s used, 38/38 configurations covered
 ```
 
-When `KTSTR_BUDGET_SECS` is not set, all tests are listed as usual
-with no budget summary.
+## Testing your own scheduler
 
-## Custom scheduler
-
-Declare a scheduler with `declare_scheduler!` and reference the
-bare const from `#[ktstr_test(scheduler = ...)]`:
-
-```rust,ignore
-use ktstr::declare_scheduler;
-use ktstr::prelude::*;
-
-declare_scheduler!(MY_SCHED, {
-    name = "my_sched",
-    binary = "scx_my_sched",
-});
-
-#[ktstr_test(scheduler = MY_SCHED)]
-fn my_sched_test(ctx: &Ctx) -> Result<AssertResult> {
-    Ok(AssertResult::pass())
-}
-```
-
-The binary is injected into the VM's initramfs and started before
-scenarios run. See [Test a New Scheduler](recipes/test-new-scheduler.md)
-for the full end-to-end workflow, and
-[Payload Definitions](writing-tests/scheduler-definitions.md#derive-payload)
-for the `#[derive(Payload)]` macro that handles binary-kind
-workloads (`schbench`, `fio`, etc.) — distinct from the
-scheduler-under-test surface.
+Declare it with `declare_scheduler!` and reference it from
+`#[ktstr_test(scheduler = ...)]` — see
+[Scheduler Definitions](writing-tests/scheduler-definitions.md) and
+the [Test a New Scheduler](recipes/test-new-scheduler.md) recipe.

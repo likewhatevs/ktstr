@@ -1,0 +1,513 @@
+/* ktstr.dev theme
+ *
+ * Loaded via additional-css after the stock mdBook stylesheets (the
+ * toc iframe includes additional-css too, so these rules reach the
+ * no-JS sidebar as well). Two surfaces are themed deliberately:
+ * `.light` (default) and `.coal` (preferred dark). The other stock
+ * themes remain selectable and usable, just unbranded.
+ *
+ * Fonts are vendored in theme/fonts/ (Inter + JetBrains Mono, OFL).
+ */
+
+/* ---------- global ---------- */
+
+:root {
+    --mono-font: "JetBrains Mono", ui-monospace, "Cascadia Code",
+        Menlo, Consolas, "DejaVu Sans Mono", monospace;
+    --code-font-size: 0.855em;
+    --content-max-width: 780px;
+
+    /* brand tokens (theme blocks override the resolved values) */
+    --kt-accent: #2050c8;
+    --kt-accent-soft: rgba(32, 80, 200, 0.09);
+    --kt-rule: rgba(15, 23, 42, 0.1);
+    --kt-chip-bg: rgba(15, 23, 42, 0.055);
+    --kt-heading: #171b26;
+}
+
+html {
+    font-family: "Inter", ui-sans-serif, system-ui, -apple-system,
+        "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    font-feature-settings: "cv05", "cv08", "ss03";
+}
+
+body {
+    font-family: inherit;
+}
+
+/* ---------- palettes ---------- */
+
+.light,
+html:not(.js) {
+    --bg: #ffffff;
+    --fg: #2a2f3a;
+
+    --sidebar-bg: #fafafb;
+    --sidebar-fg: #454c59;
+    --sidebar-non-existant: #b0b6c0;
+    --sidebar-active: #2050c8;
+    --sidebar-spacer: #e3e5e9;
+
+    --scrollbar: #c9cdd4;
+
+    --icons: #9aa0ab;
+    --icons-hover: #2a2f3a;
+
+    --links: #2050c8;
+
+    --inline-code-color: #37405a;
+
+    --theme-popup-bg: #ffffff;
+    --theme-popup-border: #d8dbe1;
+    --theme-hover: #f1f2f5;
+
+    --quote-bg: #f7f8fa;
+    --quote-border: #e4e6eb;
+
+    --table-border-color: #e4e6eb;
+    --table-header-bg: #f4f5f7;
+    --table-alternate-bg: #fafafb;
+
+    --searchbar-border-color: #d8dbe1;
+    --searchbar-bg: #f4f5f7;
+    --searchbar-fg: #2a2f3a;
+    --searchbar-shadow-color: transparent;
+    --searchresults-header-fg: #6b7280;
+    --searchresults-border-color: #e4e6eb;
+    --searchresults-li-bg: #f7f8fa;
+    --search-mark-bg: #ffe9a8;
+
+    --footnote-highlight: #2050c8;
+    --sidebar-header-border-color: #e3e5e9;
+
+    --kt-accent: #2050c8;
+    --kt-accent-soft: rgba(32, 80, 200, 0.09);
+    --kt-rule: rgba(15, 23, 42, 0.1);
+    --kt-chip-bg: rgba(15, 23, 42, 0.055);
+    --kt-heading: #171b26;
+}
+
+.coal {
+    --bg: #0e1116;
+    --fg: #c6cdd8;
+
+    --sidebar-bg: #0a0d12;
+    --sidebar-fg: #99a3b3;
+    --sidebar-non-existant: #4b5563;
+    --sidebar-active: #8ab0ff;
+    --sidebar-spacer: #1d232e;
+
+    --scrollbar: #333c4d;
+
+    --icons: #5d6878;
+    --icons-hover: #c6cdd8;
+
+    --links: #7fa7ff;
+
+    --inline-code-color: #c2cbe0;
+
+    --theme-popup-bg: #151a22;
+    --theme-popup-border: #2a3342;
+    --theme-hover: #1a2029;
+
+    --quote-bg: #141922;
+    --quote-border: #232b38;
+
+    --table-border-color: #232b38;
+    --table-header-bg: #1a2029;
+    --table-alternate-bg: #12161d;
+
+    --searchbar-border-color: #2a3342;
+    --searchbar-bg: #151a22;
+    --searchbar-fg: #c6cdd8;
+    --searchbar-shadow-color: transparent;
+    --searchresults-header-fg: #8b93a5;
+    --searchresults-border-color: #2a3342;
+    --searchresults-li-bg: #151a22;
+    --search-mark-bg: #3b4d7a;
+
+    --footnote-highlight: #7fa7ff;
+    --sidebar-header-border-color: #1d232e;
+
+    --kt-accent: #8ab0ff;
+    --kt-accent-soft: rgba(138, 176, 255, 0.1);
+    --kt-rule: rgba(148, 163, 184, 0.16);
+    --kt-chip-bg: rgba(148, 163, 184, 0.1);
+    --kt-heading: #e8ecf3;
+}
+
+/* ---------- typography ---------- */
+
+.content main {
+    line-height: 1.65;
+}
+
+.content h1,
+.content h2,
+.content h3,
+.content h4 {
+    font-family: inherit;
+    color: var(--kt-heading);
+    font-weight: 650;
+    letter-spacing: -0.015em;
+    line-height: 1.25;
+}
+
+.content h1 {
+    font-size: 3.2rem;
+    letter-spacing: -0.022em;
+    margin-block-start: 0.4em;
+}
+
+.content h2 {
+    font-size: 2.2rem;
+    margin-block-start: 2.1em;
+}
+
+.content h3 {
+    font-size: 1.8rem;
+    margin-block-start: 1.8em;
+}
+
+.content a {
+    text-decoration: none;
+}
+
+.content a:hover {
+    text-decoration: underline;
+    text-underline-offset: 3px;
+}
+
+/* ---------- code ---------- */
+
+.content pre {
+    border: 1px solid var(--kt-rule);
+    border-radius: 10px;
+    line-height: 1.55;
+}
+
+.light .content pre > code.hljs {
+    background: #f7f8fa;
+}
+
+.content :not(pre) > code {
+    background: var(--kt-chip-bg);
+    border-radius: 5px;
+    padding: 0.1em 0.35em;
+    font-size: 0.84em;
+    font-weight: 450;
+}
+
+/* keep chips readable inside links and headings */
+.content a > code {
+    color: var(--links);
+    background: var(--kt-accent-soft);
+}
+
+.content h1 code,
+.content h2 code,
+.content h3 code {
+    background: none;
+    padding: 0;
+    font-size: 0.95em;
+}
+
+/* ---------- tables ---------- */
+
+.content table {
+    font-size: 1.5rem;
+}
+
+.content table th {
+    font-weight: 600;
+}
+
+/* ---------- sidebar ---------- */
+
+.sidebar {
+    font-size: 1.4rem;
+}
+
+.sidebar .sidebar-scrollbox,
+body.sidebar-iframe-inner {
+    padding: 14px 10px;
+}
+
+#sidebar,
+.sidebar-iframe-outer {
+    border-right: 1px solid var(--kt-rule);
+}
+
+.chapter li.part-title {
+    text-transform: uppercase;
+    font-size: 1.1rem;
+    font-weight: 650;
+    letter-spacing: 0.09em;
+    color: var(--sidebar-fg);
+    opacity: 0.62;
+    margin: 1.6em 0 0.4em;
+}
+
+.chapter li.chapter-item {
+    line-height: 1.9;
+    margin-block-start: 0.2rem;
+}
+
+.chapter .chapter-link-wrapper {
+    border-radius: 6px;
+}
+
+.chapter .chapter-link-wrapper:hover {
+    background: var(--theme-hover);
+}
+
+.chapter li a {
+    padding: 1px 8px;
+    border-radius: 6px;
+}
+
+.chapter li a.active {
+    color: var(--sidebar-active);
+    font-weight: 560;
+    background: var(--kt-accent-soft);
+}
+
+/* ---------- menu bar ---------- */
+
+#menu-bar {
+    border-block-end: 1px solid var(--kt-rule);
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+}
+
+#menu-bar .menu-title {
+    font-weight: 650;
+    letter-spacing: -0.01em;
+    font-size: 1.7rem;
+}
+
+/* ---------- landing page components ----------
+ * Used from raw HTML embedded in markdown pages. */
+
+.kt-hero {
+    position: relative;
+    margin: 3rem 0 3.4rem;
+}
+
+/* soft radial glow behind the hero, clipped to the content column */
+.kt-hero::before {
+    content: "";
+    position: absolute;
+    inset: -6rem -4rem auto -4rem;
+    height: 24rem;
+    background:
+        radial-gradient(38rem 18rem at 18% 20%,
+            color-mix(in srgb, var(--kt-accent) 14%, transparent), transparent 70%),
+        radial-gradient(30rem 16rem at 75% 0%,
+            color-mix(in srgb, #7c5cff 10%, transparent), transparent 70%);
+    pointer-events: none;
+    z-index: -1;
+}
+
+.kt-hero h1 {
+    font-family: var(--mono-font);
+    font-size: 5.4rem;
+    font-weight: 700;
+    letter-spacing: -0.04em;
+    line-height: 1.05;
+    margin: 0 0 0.3em;
+    width: fit-content;
+    background: linear-gradient(92deg, var(--kt-heading) 20%, var(--kt-accent) 65%, #7c5cff 105%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+
+.kt-hero .kt-tagline {
+    font-size: 1.9rem;
+    line-height: 1.55;
+    color: var(--fg);
+    opacity: 0.85;
+    max-width: 38em;
+    margin: 0 0 1.4em;
+}
+
+.kt-cta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.7rem;
+    align-items: center;
+}
+
+a.kt-btn {
+    display: inline-block;
+    padding: 0.55em 1.1em;
+    border-radius: 8px;
+    font-weight: 560;
+    font-size: 1.5rem;
+    text-decoration: none;
+    border: 1px solid transparent;
+    transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease, filter 0.12s ease;
+}
+
+a.kt-btn:hover {
+    transform: translateY(-1px);
+}
+
+a.kt-btn:hover {
+    text-decoration: none;
+}
+
+.content a.kt-btn-primary,
+a.kt-btn-primary {
+    background: linear-gradient(135deg, var(--kt-accent), color-mix(in srgb, var(--kt-accent) 72%, #7c5cff));
+    color: #ffffff;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.2), 0 4px 14px color-mix(in srgb, var(--kt-accent) 30%, transparent);
+}
+
+a.kt-btn-primary:hover {
+    filter: brightness(1.1);
+}
+
+.content a.kt-btn-ghost,
+a.kt-btn-ghost {
+    border-color: var(--kt-rule);
+    color: var(--fg);
+}
+
+a.kt-btn-ghost:hover {
+    border-color: var(--kt-accent);
+    color: var(--kt-accent);
+}
+
+.kt-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
+    gap: 0.9rem;
+    margin: 1.6rem 0;
+}
+
+.kt-card {
+    border: 1px solid var(--kt-rule);
+    border-radius: 12px;
+    padding: 1.4rem 1.5rem;
+    background: linear-gradient(180deg, color-mix(in srgb, var(--kt-accent) 3%, transparent), transparent 45%);
+    transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.kt-card:hover {
+    transform: translateY(-2px);
+    border-color: color-mix(in srgb, var(--kt-accent) 45%, var(--kt-rule));
+    box-shadow: 0 6px 22px color-mix(in srgb, var(--kt-accent) 12%, transparent);
+}
+
+.kt-card h3 {
+    margin: 0 0 0.35em;
+    font-size: 1.55rem;
+    font-weight: 650;
+    color: var(--kt-heading);
+}
+
+.kt-card p {
+    margin: 0;
+    font-size: 1.4rem;
+    line-height: 1.55;
+    opacity: 0.85;
+}
+
+.kt-card a {
+    font-size: 1.35rem;
+}
+
+/* ---------- terminal frames ----------
+ * Dark in both themes, like a real terminal. Content goes in a
+ * <pre> so long lines scroll horizontally inside the frame. */
+
+.kt-term {
+    background: linear-gradient(180deg, #11151f 0%, #0d1017 3.2rem);
+    border: 1px solid #232b3b;
+    border-radius: 12px;
+    margin: 1.6rem 0;
+    overflow: hidden;
+    box-shadow: 0 1px 2px rgba(2, 6, 16, 0.4), 0 12px 34px rgba(2, 6, 16, 0.35);
+}
+
+.kt-term-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.55rem 0.9rem;
+    border-block-end: 1px solid #1f2633;
+}
+
+.kt-term-bar::before {
+    content: "";
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #f4655f;
+    box-shadow: 15px 0 0 #f9bd4e, 30px 0 0 #43c645;
+    margin-inline-end: 30px;
+    flex: none;
+    opacity: 0.9;
+}
+
+.kt-term-title {
+    font-family: var(--mono-font);
+    font-size: 1.15rem;
+    color: #7d8aa5;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.kt-term pre {
+    margin: 0;
+    padding: 0.9rem 1.1rem;
+    background: transparent !important;
+    border: none;
+    border-radius: 0;
+    font-family: var(--mono-font);
+    font-size: 1.25rem;
+    line-height: 1.55;
+    color: #c9d4e5;
+    overflow-x: auto;
+}
+
+.kt-term pre code {
+    background: transparent !important;
+    padding: 0;
+    color: inherit;
+    font-size: inherit;
+}
+
+/* ANSI-ish highlight spans for captured output */
+.kt-term .t-red { color: #ff6b7d; }
+.kt-term .t-grn { color: #7ed491; }
+.kt-term .t-yel { color: #f5c96d; }
+.kt-term .t-blu { color: #7fa7ff; }
+.kt-term .t-mag { color: #c79bf2; }
+.kt-term .t-cyn { color: #6fd7e3; }
+.kt-term .t-dim { color: #64708a; }
+.kt-term .t-b { font-weight: 700; color: #e8eefb; }
+.kt-term .t-err {
+    color: #ff6b7d;
+    font-weight: 700;
+}
+
+/* ---------- misc polish ---------- */
+
+.content blockquote {
+    border-radius: 0 8px 8px 0;
+}
+
+.nav-chapters {
+    border-radius: 10px;
+}
+
+mark {
+    border-radius: 3px;
+}

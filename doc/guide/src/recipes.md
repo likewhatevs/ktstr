@@ -1,38 +1,55 @@
 # Recipes
 
-Standalone examples for common tasks. Each recipe is self-contained.
+Task-oriented walkthroughs. Each recipe is self-contained: pick the
+one that matches your problem and follow it top to bottom. For the
+model behind the commands, read [Core Concepts](concepts.md); for
+flag-by-flag detail, the [Running Tests](running-tests.md) chapters.
 
-> ktstr ships two distinct binaries. The recipes below mix both — the
-> command name on each line names which binary to invoke:
->
-> - **`cargo ktstr <subcommand>`** is the host-side cargo wrapper for
->   the `test`, `coverage`, `kernel`, `stats`, `show-host`, `verifier`,
->   `export`, `shell`, and related workflows. Lives in the
->   `cargo-ktstr` binary; runs on the host.
-> - **`ktstr <subcommand>`** is the standalone binary that doubles as
->   the guest-init binary AND as a host CLI for `ctprof`, `topo`,
->   `kernel`, `shell`, `locks`, and `completions`. Lives in the
->   `ktstr` binary. The `kernel` and `shell` surfaces overlap with
->   `cargo ktstr` for callers without cargo on PATH.
->
-> Both binaries are installed by `cargo install ktstr`.
+> [!NOTE]
+> Two binaries appear below. `cargo ktstr <subcommand>` is the
+> host-side cargo wrapper for test workflows; bare `ktstr` is the
+> guest-init binary that doubles as a host CLI for a few tools
+> (`ctprof`, `topo`, `locks`). Both install with `cargo install
+> ktstr`. See [cargo ktstr](running-tests/cargo-ktstr.md) and
+> [ktstr (standalone)](running-tests/ktstr.md).
 
-- [Test a new scheduler](recipes/test-new-scheduler.md) -- end-to-end
-  from binary to integration tests; includes
-  [hosting ktstr tests in an external scheduler crate](recipes/test-new-scheduler.md#9-host-a-ktstr-test-in-an-external-scheduler-crate)
-- [Investigate a crash](recipes/investigate-crash.md) -- auto-repro,
-  reading BPF probe output
-- [A/B compare branches](recipes/ab-compare.md) -- worktree setup,
-  run and compare
-- [Capture and compare host state](recipes/host-state.md) --
-  `cargo ktstr show-host` snapshot diff for kernel / sched_\*
-  tunable / NUMA layout drift
-- [Diagnose a slow scheduler with ctprof](recipes/diagnose-slow-scheduler.md) --
-  per-thread profile diff via `ktstr ctprof capture` /
-  `compare`, with the taskstats off-CPU lens
-- [Customize checking](recipes/custom-checking.md) -- scheduler
-  thresholds, per-test overrides
-- [Benchmarking and negative tests](recipes/benchmarking-tests.md) --
-  performance gates, intentional degradation, Assert checks
-- [Compare a scheduler vs EEVDF](recipes/scheduler-vs-eevdf.md) --
-  detach mid-run and compare per-phase throughput, latency, and CPU time
+## Which recipe do I want?
+
+| Symptom | Recipe |
+|---|---|
+| I have a scheduler binary and no tests | [Test a New Scheduler](recipes/test-new-scheduler.md) |
+| A test failed and the scheduler died | [Investigate a Crash](recipes/investigate-crash.md) |
+| Default checks don't fit my scheduler — or nothing is checked at all | [Customize Checking](recipes/custom-checking.md) |
+| I want gates that catch performance regressions — and proof they fire | [Benchmark Gates and Negative Tests](recipes/benchmarking-tests.md) |
+| Is my scheduler at least as good as the kernel default? | [Compare a Scheduler vs EEVDF](recipes/scheduler-vs-eevdf.md) |
+
+Three recipes compare two runs. They answer different questions:
+
+| Two runs differ because… | Recipe |
+|---|---|
+| …the scheduler source changed (branch vs baseline commit) | [A/B Compare Branches](recipes/ab-compare.md) |
+| …a workload got slower even though tests still pass | [Diagnose a Slow Scheduler with ctprof](recipes/diagnose-slow-scheduler.md) |
+| …the host changed (machine, reboot, sysctl drift) | [Capture and Compare Host State](recipes/host-state.md) |
+
+## All recipes
+
+In rough lifecycle order:
+
+- [Test a New Scheduler](recipes/test-new-scheduler.md) — define the
+  scheduler, write tests, sweep the BPF verifier, host the tests in
+  your own crate
+- [Investigate a Crash](recipes/investigate-crash.md) — read the
+  crash report, use auto-repro, pin the bug as a regression test
+- [A/B Compare Branches](recipes/ab-compare.md) — `cargo ktstr
+  perf-delta` between HEAD and a baseline commit
+- [Capture and Compare Host State](recipes/host-state.md) —
+  `cargo ktstr show-host` snapshots and the perf-delta host-delta
+  section
+- [Diagnose a Slow Scheduler with ctprof](recipes/diagnose-slow-scheduler.md) —
+  per-thread off-CPU diff between two `ktstr ctprof` snapshots
+- [Customize Checking](recipes/custom-checking.md) — scheduler-level
+  thresholds, per-test overrides, merge order
+- [Benchmark Gates and Negative Tests](recipes/benchmarking-tests.md) —
+  performance gates plus the negative tests that prove they fire
+- [Compare a Scheduler vs EEVDF](recipes/scheduler-vs-eevdf.md) —
+  detach the scheduler mid-run and compare phases within one test

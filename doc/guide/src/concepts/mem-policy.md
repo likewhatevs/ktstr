@@ -1,8 +1,14 @@
 # MemPolicy
 
-`MemPolicy` controls NUMA memory placement for worker processes. It
-wraps `set_mempolicy(2)` and is applied after fork, before the work
-loop starts.
+Testing whether a scheduler keeps tasks near their memory requires a
+measurable locality signal — workers whose pages verifiably live on
+specific NUMA nodes, so that placement decisions show up as page
+counts instead of guesswork. `MemPolicy` creates that signal: it
+wraps `set_mempolicy(2)` per worker (applied after fork, before the
+work loop), and the [NUMA checks](checking.md#numa-checks) then gate
+on where the pages actually landed. Pair it with multi-NUMA
+[gauntlet presets](../running-tests/gauntlet.md) to sweep the same
+test across node counts.
 
 ```rust,ignore
 pub enum MemPolicy {
@@ -16,80 +22,51 @@ pub enum MemPolicy {
 }
 ```
 
-## Variants
+- **`Default`** — inherit the parent's policy; no syscall made.
+- **`Bind(nodes)`** (`MemPolicy::bind([0, 1])`) — allocate only from
+  these nodes (`MPOL_BIND`); allocation fails with `ENOMEM` when
+  they are exhausted.
+- **`Preferred(node)`** (`::preferred(0)`) — prefer one node, fall
+  back silently when it is full (`MPOL_PREFERRED`).
+- **`Interleave(nodes)`** (`::interleave([0, 1])`) — round-robin
+  allocations across the nodes (`MPOL_INTERLEAVE`).
+- **`Local`** — nearest node to the allocating CPU (`MPOL_LOCAL`).
+- **`PreferredMany(nodes)`** (`::preferred_many([0, 1])`) — prefer
+  any of the nodes, fall back when all are full
+  (`MPOL_PREFERRED_MANY`, kernel 5.15+).
+- **`WeightedInterleave(nodes)`** (`::weighted_interleave([0, 1])`)
+  — interleave proportional to the per-node weights in
+  `/sys/kernel/mm/mempolicy/weighted_interleave/`
+  (`MPOL_WEIGHTED_INTERLEAVE`, kernel 6.9+).
 
-**`Default`** -- inherit the parent process's memory policy. No
-`set_mempolicy` syscall is made.
-
-**`Bind(nodes)`** -- allocate only from the specified NUMA nodes
-(`MPOL_BIND`). Allocation fails with `ENOMEM` if all specified nodes
-are exhausted.
-
-**`Preferred(node)`** -- prefer allocations from the specified node,
-falling back to others when the preferred node is full
-(`MPOL_PREFERRED`).
-
-**`Interleave(nodes)`** -- interleave allocations round-robin across
-the specified nodes (`MPOL_INTERLEAVE`).
-
-**`Local`** -- prefer the nearest node to the CPU where the allocation
-occurs (`MPOL_LOCAL`). No nodemask.
-
-**`PreferredMany(nodes)`** -- prefer allocations from any of the
-specified nodes, falling back to others when all preferred nodes are
-full (`MPOL_PREFERRED_MANY`, kernel 5.15+).
-
-**`WeightedInterleave(nodes)`** -- weighted interleave across the
-specified nodes. Page distribution is proportional to per-node weights
-set via `/sys/kernel/mm/mempolicy/weighted_interleave/nodeN`
-(`MPOL_WEIGHTED_INTERLEAVE`, kernel 6.9+).
-
-## Convenience constructors
-
-```rust,ignore
-MemPolicy::bind([0, 1])
-MemPolicy::preferred(0)
-MemPolicy::interleave([0, 1])
-MemPolicy::preferred_many([0, 1])
-MemPolicy::weighted_interleave([0, 1])
-```
-
-Node-set constructors (`bind`, `interleave`, `preferred_many`,
-`weighted_interleave`) accept any `IntoIterator<Item = usize>` --
-arrays, ranges, `Vec`, `BTreeSet`. `preferred` takes a single
-`usize` node ID.
+Node-set constructors accept any `IntoIterator<Item = usize>`.
+`MemPolicy::node_set()` returns the referenced nodes (empty for
+`Default` / `Local`).
 
 ## MpolFlags
 
-`MpolFlags` provides optional mode flags OR'd into the
-`set_mempolicy(2)` mode argument:
+Optional mode flags OR'd into the `set_mempolicy` mode:
 
-| Flag | Value | Description |
-|---|---|---|
-| `NONE` | 0 | No flags |
-| `STATIC_NODES` | `1 << 15` | Nodemask is absolute, not remapped when the task's cpuset changes |
-| `RELATIVE_NODES` | `1 << 14` | Nodemask is relative to the task's current cpuset |
-| `NUMA_BALANCING` | `1 << 13` | Enable NUMA balancing optimization for this policy |
+| Flag | Meaning |
+|---|---|
+| `NONE` | No flags |
+| `STATIC_NODES` | Nodemask is absolute — not remapped when the task's cpuset changes |
+| `RELATIVE_NODES` | Nodemask is relative to the task's current cpuset |
+| `NUMA_BALANCING` | Enable NUMA-balancing optimization for this policy |
 
-Flags combine with `|` or `MpolFlags::union()`:
+Flags combine with `|`. `STATIC_NODES | RELATIVE_NODES` is rejected
+at setup time (the kernel would return `EINVAL`), as is any unknown
+bit. The kernel accepts `NUMA_BALANCING` only alongside `MPOL_BIND`
+or `MPOL_PREFERRED_MANY` — ktstr does not pre-validate that pairing,
+so other combinations surface as `EINVAL` from the worker's
+`set_mempolicy` call.
+
+## Usage
+
+`WorkSpec` and `CgroupDef` both take `.mem_policy()` and
+`.mpol_flags()`:
 
 ```rust,ignore
-let flags = MpolFlags::STATIC_NODES | MpolFlags::NUMA_BALANCING;
-```
-
-## Usage in WorkSpec and CgroupDef
-
-`WorkSpec` and `CgroupDef` both expose `.mem_policy()` and
-`.mpol_flags()` builder methods:
-
-```rust,ignore
-use ktstr::prelude::*;
-
-let w = WorkSpec::default()
-    .workers(4)
-    .mem_policy(MemPolicy::bind([0]))
-    .mpol_flags(MpolFlags::STATIC_NODES);
-
 let def = CgroupDef::named("cg_0")
     .cpuset(CpusetSpec::numa(0))
     .workers(4)
@@ -98,53 +75,41 @@ let def = CgroupDef::named("cg_0")
 
 ## Cpuset validation
 
-When a cgroup has a cpuset and no cpuset-remapping flag is set, ktstr
-validates that the `MemPolicy`'s node set is covered by the NUMA nodes
-reachable from that cpuset. A `MemPolicy::Bind([1])` on a cgroup whose
-cpuset covers only NUMA node 0 (with no remapping flag) will fail with
-an error at setup time.
+When a cgroup has a cpuset and no remapping flag is set, ktstr
+validates at setup time that the policy's nodes are reachable from
+that cpuset — `MemPolicy::Bind([1])` on a cgroup confined to node 0
+fails before the run starts, not as a mystery `ENOMEM` mid-run.
 
-The coverage check is flag-dependent. `MpolFlags::STATIC_NODES`
-replaces it with a host-node-existence check: the nodemask is absolute
-and intentionally allowed to fall outside the cpuset, so
-`Bind([1])` with `STATIC_NODES` succeeds as long as node 1 exists on
-the host. `MpolFlags::RELATIVE_NODES` bypasses the coverage check
-entirely (the nodemask is a cpuset-relative ordinal the kernel remaps
-internally). Setup also rejects unknown `MpolFlags` bits and the
-mutually-exclusive `STATIC_NODES | RELATIVE_NODES` combination before
-any coverage check runs.
+The check is flag-aware: `STATIC_NODES` swaps it for a
+node-exists-on-host check (the nodemask is absolute and deliberately
+allowed outside the cpuset), and `RELATIVE_NODES` bypasses it (the
+kernel remaps the ordinals internally). Policies without a node set
+(`Default`, `Local`) skip validation.
 
-Policies without a node set (`Default`, `Local`) skip validation.
+## What gets checked
 
-## node_set()
+Locality results feed the [NUMA checking
+thresholds](checking.md#numa-checks) — `min_page_locality`,
+`max_cross_node_migration_ratio`, `max_slow_tier_ratio`. The
+expected node set is derived from the cgroup's *cpuset* at
+evaluation time, not from the worker's `MemPolicy`; in the common
+case where memory is bound to the same nodes the cpuset pins, the
+two coincide. A locality violation renders with the observed
+fraction, the threshold, and the page counts (format from the
+assertion source):
 
-`MemPolicy::node_set()` returns the NUMA node IDs referenced by the
-policy. Returns the node set for `Bind`, `Interleave`,
-`PreferredMany`, and `WeightedInterleave`; a single-element set for
-`Preferred`; and an empty set for `Default`/`Local`.
+```text
+page locality <observed> (<pct>%) below threshold <min> (<pct>%) (<local>/<total> pages local)
+```
 
-## NUMA checking
-
-Page locality and migration results from workers using `MemPolicy` are
-checked by the [NUMA checking
-assertions](checking.md#numa-checks). The expected node set for
-locality checks is derived from the cgroup's cpuset (via
-`TestTopology::numa_nodes_for_cpuset`) at evaluation time, not from the
-worker's `MemPolicy`. In the common case where memory is bound to the
-same node(s) the cpuset pins, the two coincide; a policy bound outside
-the cpuset (e.g. via `MpolFlags::STATIC_NODES`) is still checked
-against the cpuset's nodes.
-
-## Example: NUMA-aware test
-
-A complete test that checks page locality across two NUMA nodes:
+## Example: NUMA-aware locality test
 
 ```rust,ignore
 use ktstr::prelude::*;
 
 #[ktstr_test(
     numa_nodes = 2, llcs = 4, cores = 4, threads = 1,
-    min_numa_nodes = 2,
+    min_numa_nodes = 2, max_numa_nodes = 2,
     min_page_locality = 0.8,
 )]
 fn numa_locality(ctx: &Ctx) -> Result<AssertResult> {
@@ -161,7 +126,15 @@ fn numa_locality(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-Each cgroup's workers are pinned to a single NUMA node's CPUs via
-`CpusetSpec::numa()` and their memory allocations are bound to the
-same node via `MemPolicy::bind()`. The `min_page_locality` threshold
-fails the test if less than 80% of pages land on the expected node.
+Each cgroup's workers are pinned to one NUMA node's CPUs via
+`CpusetSpec::numa()` and their allocations bound to the same node
+via `MemPolicy::bind()`; the test fails if less than 80% of pages
+land where they were bound.
+
+Node-set policies only mean something on multi-NUMA topologies. The
+constraint pair `min_numa_nodes = 2, max_numa_nodes = 2` keeps
+gauntlet expansion on two-node presets — single-node presets are
+filtered out rather than failing. Both bounds are needed: the
+default constraints cap at one NUMA node, and an inverted pair
+(min above max) is rejected at validation time. See
+[Gauntlet](../running-tests/gauntlet.md) for the preset matrix.

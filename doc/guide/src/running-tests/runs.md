@@ -1,278 +1,220 @@
-# Runs
+# Runs and Regression Gates
 
-Each `cargo ktstr test --kernel ../linux` invocation writes per-test result
-sidecars into a *run directory* under
-`{CARGO_TARGET_DIR or "target"}/ktstr/`. The directory is the
-record of the latest test run for that (kernel, project commit)
-pair -- there is no separate "baselines" cache.
+Every test run writes machine-readable results — one JSON sidecar
+per test, grouped into a *run directory* keyed by (kernel, project
+commit). That makes "did my change regress anything?" a one-command
+question: `cargo ktstr perf-delta` pairs two commits' sidecars and
+fails the build when metrics regress past their gates.
 
-> **Warning:** Re-running the suite at the same kernel and
-> project commit reuses the same directory and **deletes prior
-> sidecars** at the first sidecar write of the new run. To
-> preserve a previous run's outputs, move the directory OUT of
-> the runs root (e.g. `mv target/ktstr/6.14-abc1234
-> ~/ktstr-archives/6.14-abc1234.archived-{date}`) — moving it
-> into a sibling under `target/ktstr/` would still let
-> `cargo ktstr stats list` walk into the archived copy because
-> the listing filter only excludes dotfiles. Alternatively
-> commit your changes (or amend to drop a `-dirty` suffix) so
-> the next run lands in a separate snapshot directory.
+## The workflow
 
-## Layout
-
-```text
-target/
-└── ktstr/
-    ├── 6.14-abc1234/        # one run: kernel 6.14, project commit abc1234 (clean)
-    │   ├── test_a.ktstr.json
-    │   └── test_b.ktstr.json
-    └── 7.0-def5678-dirty/   # another run: kernel 7.0, project commit def5678 with uncommitted changes
-        ├── test_a.ktstr.json
-        └── test_b.ktstr.json
-```
-
-Each subdirectory is keyed `{kernel}-{project_commit}`, where
-`{kernel}` is the kernel version resolved from whichever kernel
-selector applies — for a path-form `--kernel ../linux` it comes
-from the directory's `metadata.json:version` field, falling back
-to `include/config/kernel.release`; for a version selector
-(`--kernel 6.14`) or cache-key form, the resolved version is
-recorded directly; `unknown` only appears when no selector yields
-a version. `{project_commit}` is the project tree's HEAD short
-hex (7 chars), suffixed `-dirty` when the worktree differs from
-HEAD, or the literal `unknown` when `detect_project_commit`
-returns `None` — including the "test process not inside a git
-repo" case, but also unreadable cwd, an unborn HEAD with no
-commits, or a corrupt repo state.
-
-The commit is discovered by walking parents of the test process's
-working directory until a `.git` marker is found — for a scheduler
-crate using ktstr as a dev-dependency, this is the **scheduler
-crate's** commit, not ktstr's. The function
-that performs the probe (`detect_project_commit`) is called from
-the test process's cwd, so running tests from inside the scheduler
-crate's clone yields that crate's HEAD. Run from inside ktstr's
-clone if you want to record ktstr's HEAD instead.
-
-Two runs sharing the same kernel and project commit (the typical
-"re-run the suite without committing changes" loop) reuse the
-same directory: the second run pre-clears any prior
-`*.ktstr.json` files in the directory at first sidecar write so
-the directory is a last-writer-wins snapshot of (kernel, project
-commit), not an append-only archive of every invocation. Re-run
-the suite to regenerate the sidecars; commit your changes (or
-amend to drop the `-dirty` suffix) to land a separate snapshot
-directory.
-
-Pre-clear is **shallow** — only `*.ktstr.json` files in the
-immediate run directory are removed. Subdirectories created by
-external orchestrators (per-job gauntlet layouts, cluster shards)
-are left untouched, but `cargo ktstr stats` walks one level of
-subdirectories when collecting sidecars, so stale sidecar files
-left in subdirectories from a prior run will still appear in
-stats output. Operators driving subdirectory layouts must clean
-those subdirectories themselves; pre-clear's contract covers the
-top-level only.
-
-### Filesystem requirement
-
-The runs root must reside on a local filesystem (ext4, xfs,
-btrfs, tmpfs). NFS and other remote filesystems are rejected by
-the advisory lock used for cross-process sidecar-write
-serialization.
-
-### Unknown-commit collisions
-
-When the test process is not inside a git repository (so
-`detect_project_commit` returns `None`), the on-disk dirname uses
-the literal sentinel `unknown` in the commit slot — every such run
-lands in `{kernel}-unknown`. Concurrent or successive non-git runs
-collide on this single directory, with the latest run pre-clearing
-the previous one's sidecars. To disambiguate non-git runs, set
-`KTSTR_SIDECAR_DIR` to a per-run path or place the project tree
-under git so each run carries its own commit hash.
-
-ktstr emits a one-shot stderr warning on first sidecar write
-under this configuration; setting `KTSTR_SIDECAR_DIR` both
-disambiguates the run and suppresses the warning (the override
-branch returns from `sidecar_dir` before the warning site is
-reached).
-
-The `unknown` sentinel applies to the **dirname only**. The
-in-memory `SidecarResult.project_commit` field stays `None`
-(serialized as JSON `null`) for these runs — the dirname uses a
-filesystem-safe sentinel, while the JSON field preserves the
-original probe outcome. As a consequence, a `project_commit`
-filter for the literal `unknown` will **not** match a sidecar
-whose `project_commit` is `None` — the dirname sentinel and the
-JSON field diverge here.
-
-`KTSTR_SIDECAR_DIR` overrides the *sidecar* directory itself
-(used as-is, no key suffix), not the parent. The override only
-affects where new sidecars are written and what bare
-`cargo ktstr stats` reads. When the override is set, **pre-clear
-is skipped** — the operator chose that directory and owns its
-contents, so any pre-existing sidecars there are preserved.
-`cargo ktstr stats list`, `cargo ktstr stats list-values`, and
-`cargo ktstr stats show-host` all walk
-`{CARGO_TARGET_DIR or "target"}/ktstr/` by default — pass
-`--dir DIR` on `list-values` / `show-host` to
-point them at an alternate run root (e.g. an archived sidecar
-tree copied off a CI host). They do NOT consult
-`KTSTR_SIDECAR_DIR`.
-
-## Workflow
-
-1. **Run tests** for kernel A:
+1. **Run tests** — each invocation writes sidecars into
+   `target/ktstr/{kernel}-{project_commit}/`:
 
    ```sh
    cargo ktstr test --kernel 6.14
    ```
 
-2. **Run again** for kernel B:
+2. **List runs**:
 
-   ```sh
-   cargo ktstr test --kernel 7.0
+   <!-- captured: cargo ktstr stats list | ktstr 0.23.0 -->
+   ```text
+   $ cargo ktstr stats list
+    RUN                   TESTS  DATE                  ARCH
+    7.0.14-73730e0-dirty  1      2026-07-04T23:28:34Z  x86_64
+    7.1.0-73730e0-dirty   0      -                     -
+    7.1.1-73730e0-dirty   0      -                     -
+    7.0.0-73730e0-dirty   1      2026-07-04T22:16:24Z  x86_64
+    7.1.0-73730e0         6      2026-07-04T21:41:43Z  x86_64
    ```
 
-3. **List** runs:
+   Rows sort by directory mtime, most recent first. `DATE` is the
+   run's first sidecar timestamp; `ARCH` comes from the first
+   sidecar with host context (`-` when none has one).
+
+3. **Gate a change** against a baseline commit:
 
    ```sh
-   cargo ktstr stats list
+   cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14         # HEAD vs merge-base(HEAD, main)
+   cargo ktstr perf-delta --base abc1234                         # vs an explicit commit, cached sidecars
+   cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14 -E cgroup_steady   # narrow the perf set
    ```
 
-   Each row carries `RUN`, `TESTS`, `DATE`, and `ARCH` columns.
-   `DATE` is the earliest sidecar timestamp present in the
-   directory — under the last-writer-wins semantics, this equals
-   the **most recent run's first sidecar timestamp** (the prior
-   run's sidecars were pre-cleared at the new run's first write,
-   so only the new run's timestamps remain). `ARCH` is the
-   `host.arch` value (`x86_64`, `aarch64`, …) from the first
-   sidecar in the directory whose `host` field is populated
-   (sidecars without host context are skipped), or `-` when no
-   sidecar in the run carries one. Rows are ordered by directory
-   mtime, most recent first.
+   The canonical WIP-vs-baseline pattern: run `perf-delta --base
+   abc1234` from a `-dirty` working tree against the clean commit
+   you edited from.
 
-4. **Compare** HEAD against a baseline commit (regression gate):
-
-   ```sh
-   cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14        # HEAD vs merge-base(HEAD, main)
-   cargo ktstr perf-delta --base abc1234                        # vs an explicit baseline commit
-   cargo ktstr perf-delta --noise-adjust 5 --kernel 6.14 -E cgroup_steady  # narrow the perf set
-   ```
-
-   `perf-delta` pairs the baseline commit's `performance_mode`
-   sidecars against HEAD's per scenario and reports per-metric
-   regressions via the unified `MetricDef` registry (polarity,
-   absolute and relative thresholds). Output is colored: red for
-   regressions, green for improvements; it exits non-zero once enough
-   metrics regress past their gate to trip the failure gate (by default
-   5 or more; tune with `--fail-threshold` / `--must-fail`). The canonical WIP-vs-baseline
-   pattern is `perf-delta --base abc1234` from a `-dirty` working
-   tree against the clean commit it was edited from. See
-   [cargo-ktstr](cargo-ktstr.md#perf-delta) for the full flag set,
-   and `cargo ktstr stats list-values` to discover the values a
-   pool carries.
-
-5. **Print analysis** for the most recent run (no subcommand):
+4. **Print analysis** of the most recent run (gauntlet outliers,
+   BPF verifier stats, callback profile, KVM stats):
 
    ```sh
    cargo ktstr stats
    ```
 
-   Honors `KTSTR_SIDECAR_DIR` when set (non-empty); otherwise picks
-   the newest subdirectory under `target/ktstr/` by mtime. Prints
-   gauntlet analysis, BPF verifier stats, callback profile, and KVM
-   stats.
-
-6. **Inspect the archived host context** for a specific run:
+5. **Inspect a run's archived host context** (the fingerprint the
+   host-delta comparison uses — CPU identity, THP policy, sched
+   sysctls):
 
    ```sh
    cargo ktstr stats show-host --run 6.14-abc1234
-   cargo ktstr stats show-host --run archive-2024-01-15 --dir /tmp/archived-runs
    ```
 
-   Resolves `--run` against `target/ktstr/` (or `--dir` when set),
-   scans the run's sidecars in order, and renders the first populated
-   host-context field via `HostContext::format_human`: CPU model,
-   memory config, transparent-hugepage policy, NUMA node count, uname
-   triple, kernel cmdline, and every `/proc/sys/kernel/sched_*`
-   tunable. Same fingerprint the `perf-delta` host-delta section
-   uses, but available on a single run. Fails with an actionable
-   error when no sidecar carries a host field (pre-enrichment run).
+## perf-delta {#perf-delta}
 
-## Metric registry discovery
+`perf-delta` compares `performance_mode` test metrics between HEAD
+and a baseline commit, per scenario, using the metric registry's
+polarity and thresholds (enumerate it with
+`cargo ktstr stats list-metrics` — see
+[Assertable Metrics](../reference/assertable-metrics.md)). Output is
+one row per compared metric with the baseline and HEAD values,
+colored red for regressions and green for improvements; the command
+exits non-zero once enough metrics regress to trip the failure gate
+— by default 5 or more (`--fail-threshold`), so a lone noisy
+regression does not flip CI red, or any metric named in
+`--must-fail`. If the baseline produced no `performance_mode`
+sidecars at all, it prints a notice and exits 0 — an empty perf set
+is "nothing to compare", not a failure.
 
-Before configuring per-metric `ComparisonPolicy` overrides, enumerate
-the available metric names:
+**Baseline resolution** (highest precedence first):
 
-```sh
-cargo ktstr stats list-metrics
-cargo ktstr stats list-metrics --json
-```
+1. `--base <commit>` — compare HEAD directly against this
+   commit-ish, no merge-base.
+2. `--base-ref <ref>` — compare against `merge-base(HEAD, <ref>)`.
+3. `$GITHUB_BASE_REF` (set on `pull_request` events) — compare
+   against `merge-base(HEAD, origin/<ref>)`.
+4. Otherwise `merge-base(HEAD, main)` (override the branch with
+   `--default-branch`).
 
-Prints the `ktstr::stats::METRICS` registry: metric name, polarity
-(higher / lower better), `default_abs` and `default_rel` gate
-thresholds, and display unit. Use the metric names from this list as
-keys in `ComparisonPolicy.per_metric_percent`; unknown names are
-rejected at `--policy` load time so typos surface loudly. `--json`
-emits the same data as a serde array — the row accessor function is
-omitted (`#[serde(skip)]`) so the wire surface carries only
-wire-stable fields.
+The resolved baseline is shortened to the 7-hex form sidecars
+record, and the command bails if it resolves to HEAD (nothing to
+compare).
 
-## Sidecar format
+**Two ways to get the baseline's numbers:**
 
-Each test writes a `SidecarResult` JSON file containing the test name,
-topology, scheduler, work type, pass/fail, per-cgroup stats, monitor
-summary, stimulus events, verifier stats, KVM stats, effective sysctls,
-kernel command-line args, kernel version, timestamp, and run ID. Files
-are named with a `.ktstr.` infix for discovery. `cargo ktstr stats`
-reads all sidecar files from a run directory (recursing one level for
-gauntlet per-job subdirectories).
+- **Cached (default)** — both sides' sidecars must already be in
+  the pool (a prior run, or a CI artifact you downloaded).
+  `perf-delta` only resolves the pair and compares, applying
+  `--threshold PCT` (uniform gate) or `--policy PATH` (per-metric
+  JSON) over the registry defaults.
+- **`--noise-adjust N`** (requires `--kernel`, N ≥ 2) — produces
+  both sides fresh: it checks the baseline and HEAD out into
+  scratch checkouts, runs each side's `performance_mode` tests N
+  times, and gates on the observed spread. A regression counts only
+  when the two sides are *separated* (a two-sided Welch t-test at
+  α = 0.05, or fully disjoint min–max bands) **and** *material*
+  (past the registry's absolute + relative dual gate). This is the
+  mode to trust on a noisy machine; budget N × per-side wall time
+  for it.
 
-See also: [`KTSTR_SIDECAR_DIR`](../reference/environment-variables.md).
+`perf-delta` compares on the commit axis. A cross-config question —
+scheduler A vs scheduler B at the same commit — is answered in-test
+(see [Compare a Scheduler vs EEVDF](../recipes/scheduler-vs-eevdf.md));
+the worked A/B walkthrough with real gates is
+[A/B Compare Branches](../recipes/ab-compare.md), and the CI
+perf-gate job lives in [CI](../ci.md).
 
-## Failure-dump artifact
-
-Every failed test writes a JSON failure-dump file alongside the
-sidecar:
+## Run directories
 
 ```text
-{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{commit}/{test_name}-{variant_hash:016x}.failure-dump.json
+target/
+└── ktstr/
+    ├── 6.14-abc1234/        # kernel 6.14, project commit abc1234 (clean)
+    │   ├── test_a.ktstr.json
+    │   └── test_b.ktstr.json
+    └── 7.0-def5678-dirty/   # kernel 7.0, commit def5678 + uncommitted changes
+        ├── test_a.ktstr.json
+        └── test_b.ktstr.json
 ```
 
-The full dump (BPF state, per-vCPU registers, scheduler exit reason,
-map contents) is produced by the freeze coordinator when the
-scheduler attached AND its exit path triggered — the
-post-mortem snapshot path. Auto-repro runs additionally write a
-sibling `{test_name}-{variant_hash:016x}.repro.failure-dump.json` containing the
-auto-repro VM's own post-mortem snapshot (same schema as the
-primary, with the additional `early` snapshot when the entry
-enables dual-snapshot capture).
+The key is `{kernel}-{project_commit}`: the resolved kernel version,
+plus the project tree's HEAD short hex, suffixed `-dirty` when the
+worktree differs from HEAD.
 
-When the failure occurs BEFORE the BPF probe attaches —
-`send_sys_rdy` timeout, VM boot failures, scheduler binary load
-failures, anything that returns from `vm.run()` before the
-scheduler's BPF code runs — the framework writes a **placeholder**
-dump at the same path. The placeholder carries the lifecycle stage
-the run reached (per `classify_init_stage`) plus a "no BPF state
-captured" reason; every BPF-state field is set to `unavailable: Some(reason)`
-so stats tooling distinguishes "capture happened, no data" from
-"capture path failed for reason X". The `is_placeholder: true`
-field on the JSON makes the stub vs. real distinction explicit for
-machine consumers.
+The commit is discovered from the test process's working directory —
+for a scheduler crate using ktstr as a dev-dependency, that is the
+**scheduler crate's** commit, not ktstr's. Run from whichever clone
+you want the run keyed on.
 
-The placeholder write uses an atomic `.tmp` → `rename(2)` pattern
-so a concurrent reader either sees no file or sees a complete
-stub — never a truncated one.
+> [!WARNING]
+> A run directory is a last-writer-wins snapshot, not an archive.
+> Re-running the suite at the same kernel and project commit
+> pre-clears the prior sidecars at the new run's first write. To
+> preserve a run, move the directory *out of* the runs root
+> (`mv target/ktstr/6.14-abc1234 ~/ktstr-archives/...`) — a sibling
+> inside `target/ktstr/` would still be walked by `stats list` — or
+> commit your changes so the next run lands under a new key.
 
-The actionable diagnostic for pre-attach failures lives in the test
-stderr's `BUG SUMMARY:` line (extracted from the kernel's
-`triggered exit kind` emit or the scheduler log's `scx_bpf_error`
-substring) and the `--- sched_ext dump ---` section. The on-disk
-placeholder is for tooling that walks the sidecar dir; humans
-should read the stderr.
+Pre-clear is shallow: only `*.ktstr.json` files at the top level are
+removed. Subdirectories created by external orchestrators (per-job
+gauntlet layouts) are left alone but still read by `stats`, so clean
+those yourself when reusing them.
 
-The path is pre-cleared at the start of every primary VM dispatch
-so a passing rerun after a prior failed invocation does not leave
-stale dump content alongside the new sidecar.
+## Inspecting sidecars
+
+Each sidecar records the test name, topology, scheduler, work type,
+verdict, per-cgroup stats, monitor summary, verifier and KVM stats,
+kernel version, host context, and timestamps. Discovery tooling:
+
+- `cargo ktstr stats list-values` — the distinct values per
+  filterable dimension (kernel, commit, scheduler, topology, work
+  type, ...) across the pool: the upstream answer to "what have I
+  got?" before narrowing a `perf-delta`.
+- `cargo ktstr stats list-metrics` — the regression metric registry
+  (names, polarity, default gates, units).
+- `cargo ktstr stats explain-sidecar --run ID` — why optional
+  fields are absent, per sidecar, with a fix when one exists:
+
+  <!-- captured: cargo ktstr stats explain-sidecar --run 7.0.14-73730e0-dirty | ktstr 0.23.0 -->
+  ```text
+  walked 1 sidecar file(s), parsed 1 valid
+
+  test: throughput_gate
+    topology: 1n1l2c1t
+    scheduler: my_sched
+    ...
+    populated optional fields (8): resolve_source, project_commit, monitor, kvm_stats, kernel_version, host, cleanup_duration_ms, run_source
+    none fields (3):
+      scheduler_commit [expected]
+        - no SchedulerSpec variant currently exposes a reliable commit source — reserved on the schema for future enrichment (e.g. --version probe or ELF-note read on the resolved scheduler binary)
+      payload [expected]
+        - test declared no binary payload (scheduler-only test or pure-scenario test that never invokes ctx.payload(...))
+      kernel_commit [actionable]
+        - KTSTR_KERNEL is unset or empty
+        ...
+        fix: set KTSTR_KERNEL to a local kernel source tree that is a git repository (e.g. a git clone of the kernel)
+  ```
+
+  `expected` means `None` is the steady state; `actionable` means a
+  different environment would populate the field. `--json` emits an
+  aggregate object for dashboards.
+
+`stats list-values`, `show-host`, and `explain-sidecar` all take
+`--dir DIR` to point at an archived sidecar tree copied off a CI
+host.
+
+## Environment notes
+
+- **Local filesystem required.** The runs root must live on ext4 /
+  xfs / btrfs / tmpfs — the advisory lock that serializes concurrent
+  sidecar writes rejects NFS and other remote filesystems.
+- **Non-git runs collide.** When the test process is not in a git
+  repository, the commit slot is the literal `unknown`, and every
+  such run shares `{kernel}-unknown` (with pre-clear between them).
+  Set `KTSTR_SIDECAR_DIR` or put the tree under git to disambiguate.
+  The sidecar's own `project_commit` field stays `null` for these
+  runs — the dirname sentinel and the JSON field intentionally
+  diverge.
+- **`KTSTR_SIDECAR_DIR`** overrides the sidecar directory itself
+  (used as-is, no key suffix) for writes and for bare
+  `cargo ktstr stats` reads. Pre-clear is skipped under the
+  override — you chose the directory, you own its contents. The
+  `stats list` / `list-values` / `show-host` subcommands do not
+  consult it; use `--dir`.
+
+## Failure artifacts
+
+Failed tests additionally write a failure-dump JSON next to their
+sidecar — see
+[Reading Failure Output](failures.md#artifacts-on-disk) for the
+path scheme, the placeholder-vs-full distinction, and the
+investigation workflow.

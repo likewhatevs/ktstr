@@ -1,370 +1,235 @@
 # Getting Started
 
+Every `#[ktstr_test]` boots a real Linux kernel in a KVM microVM with
+the CPU topology the test declares, runs your workload inside it, and
+checks the scheduler's behavior from the host. This page takes you
+from nothing to a green run.
+
+## Zero to green
+
+```sh
+cargo install --locked cargo-nextest
+cargo install --locked ktstr             # installs `cargo-ktstr` + `ktstr`
+cargo ktstr kernel build --kernel 7.0    # one-time full kernel build; cached after
+$EDITOR tests/sched_test.rs              # write a #[ktstr_test] (below)
+cargo ktstr test --kernel 7.0
+```
+
+Both installs are required: `cargo ktstr test` delegates to nextest,
+and the `ktstr` package installs `cargo-ktstr` (the cargo plugin
+behind every command in this guide) plus the standalone `ktstr` host
+CLI. The kernel build is a real `make -j$(nproc)` kernel build —
+plan for that once; later runs reuse the cache. On a cached kernel,
+the run shown [below](#run-it) took about 35 seconds end to end.
+
 ## Prerequisites
 
 **Linux only (x86_64, aarch64).** ktstr boots KVM virtual machines;
 it does not build or run on other platforms.
 
-- Linux host with KVM access (`/dev/kvm`)
-- Rust >= 1.94.1 (the crate's MSRV). The ktstr repo itself pins
-  toolchain 1.94.1 via `rust-toolchain.toml`; dev-dependency
-  consumers only need a stable toolchain at or above the MSRV.
-- clang (BPF skeleton compilation)
-- pkg-config, make, gcc
-- autotools (autoconf, autopoint, flex, bison, gawk) -- vendored
+- KVM access (`/dev/kvm`) — see
+  [Troubleshooting](troubleshooting.md) if it's missing or unreadable
+- Rust ≥ 1.94.1 (the crate's MSRV)
+- clang, pkg-config, make, gcc, and autotools (autoconf, autopoint,
+  flex, bison, gawk) — BPF skeletons and the vendored
   libbpf/libelf/zlib build
-- BTF (`/sys/kernel/btf/vmlinux` -- present by default on most
-  distros; set `KTSTR_KERNEL` if missing)
-- Internet access on first build (downloads busybox source)
-- Linux kernel 6.12+ for sched_ext tests (check with `uname -r`).
-  The host kernel has no version requirement beyond KVM; the test
-  kernel is whichever you build or cache via `cargo ktstr kernel build`.
-  See [Supported kernels](features.md#supported-kernels) for
-  per-feature version boundaries.
+- BTF (`/sys/kernel/btf/vmlinux`) — present by default on most
+  distros
+- Internet access on first build (downloads busybox source; kernel
+  builds download tarballs from kernel.org)
 
-**Ubuntu/Debian:**
+The host kernel only needs KVM. The *guest* kernel — the one your
+tests boot — needs sched_ext, which landed in 6.12; the next section
+builds one.
 
 ```sh
+# Ubuntu/Debian
 sudo apt install clang pkg-config make gcc autoconf autopoint flex bison gawk
-```
-
-**Fedora:**
-
-```sh
+# Fedora
 sudo dnf install clang pkgconf make gcc autoconf gettext-devel flex bison gawk
 ```
 
-## Install tools
-
-```sh
-cargo install cargo-nextest           # required
-cargo install --locked ktstr   # required
-```
-
-`cargo-nextest` is required. `cargo ktstr test` delegates to nextest
-internally; without it, `cargo ktstr test` will fail.
-
-`cargo-ktstr` and `ktstr` are also required — every primary
-workflow verb in this guide (`cargo ktstr kernel build`, `cargo
-ktstr test`, `cargo ktstr shell`, `ktstr ctprof`) lives on these
-two binaries.
-
-`cargo install --locked ktstr`
-installs the two user-facing binaries (`ktstr` host-side CLI and
-`cargo-ktstr` dev workflow plugin). The four test-fixture binaries
-(`ktstr-jemalloc-probe`, `ktstr-jemalloc-alloc-worker`,
-`ktstr-schbench-validate`, `ktstr-taobench-validate`) the crate's
-integration tests spawn require the non-default `integration`
-feature, so a default install excludes them.
-
 ## Add the dependency
-
-Add ktstr as a dev-dependency:
 
 ```toml
 [dev-dependencies]
-ktstr = { version = "0.23.0" }
+ktstr = "=0.23.0"
 ```
 
-To host a ktstr test in an external scheduler crate (gated behind a
-feature so ktstr stays out of normal builds), see [Host a ktstr test in
-an external scheduler crate](recipes/test-new-scheduler.md#9-host-a-ktstr-test-in-an-external-scheduler-crate).
-
-## Kernel discovery
-
-Tests require a bootable Linux kernel. The test harness checks these
-locations in order:
-
-1. `KTSTR_TEST_KERNEL` environment variable (direct image path).
-2. `KTSTR_KERNEL` environment variable, parsed as one of three forms:
-   - Path: search that directory for `arch/<arch>/boot/<image>`
-   - Version (e.g. `6.14.2`): look up the version in XDG cache
-   - Cache key (from `cargo ktstr kernel list`): exact cache lookup
-3. XDG cache: most recent cached image (newest first); entries built
-   with a different kconfig fragment are skipped. When `KTSTR_KERNEL`
-   named an explicit version or cache key that was not present in the
-   cache, the cache scan is skipped entirely -- discovery moves on to
-   step 4 rather than substituting an unrelated cached kernel.
-4. `./linux/arch/<arch>/boot/<image>` (workspace-local build tree)
-5. `../linux/arch/<arch>/boot/<image>` (sibling directory)
-6. `/lib/modules/$(uname -r)/build/arch/<arch>/boot/<image>` (installed kernel build tree)
-7. `/lib/modules/$(uname -r)/vmlinuz` (installed kernel)
-8. `/boot/vmlinuz-$(uname -r)`
-9. `/boot/vmlinuz` (unversioned symlink)
-
-On x86_64, the build-tree image is `arch/x86/boot/bzImage`; on
-aarch64, `arch/arm64/boot/Image`.
-
-The host's installed kernel works for basic testing. For sched_ext
-tests, build a kernel with the ktstr config fragment (below). See
-[Troubleshooting](troubleshooting.md#no-kernel-found) for details.
-
-> **Implicit discovery reads existing cache entries but does not
-> run the build pipeline or produce a new cache entry.** The
-> chain reads existing cache entries on the read path
-> (most-recent-valid first; entries built with a different
-> kconfig fragment are skipped) and falls back to local build
-> trees and host paths when nothing matches. It does NOT compute
-> a `local-{hash7}-{arch}-kc{suffix}` cache key, run the build
-> pipeline, or store a new cache entry from whatever source-tree
-> image it ends up using. To opt into the build + cache-store
-> pipeline so a source tree's build is recorded and reused under
-> a stable cache key, pass the path explicitly via
-> `cargo ktstr test --kernel ../linux`; see
-> [cargo-ktstr — What it does](running-tests/cargo-ktstr.md#what-it-does-path-mode-only)
-> for the full path-mode flow including the cache-hit
-> short-circuit.
+ktstr is pre-release: pin the exact patch version and keep the
+installed `cargo-ktstr` on the same one — minor bumps may break the
+test-facing API. To keep ktstr out of a scheduler crate's normal
+builds, gate it behind a feature instead — see
+[Test a New Scheduler](recipes/test-new-scheduler.md).
 
 ## Build a kernel
 
-`cargo ktstr kernel build` downloads a kernel tarball from kernel.org,
-configures it with the embedded `ktstr.kconfig` fragment, builds it,
-and caches the result:
+`cargo ktstr kernel build` downloads a kernel tarball from
+kernel.org, applies the embedded `ktstr.kconfig` fragment (sched_ext,
+BPF, kprobes, minimal boot), builds it, and caches the result:
 
 ```sh
-cargo ktstr kernel build                       # latest stable series with >= 8 maintenance releases
-cargo ktstr kernel build --kernel 6.14.2       # specific version
-cargo ktstr kernel build --kernel 6.12         # highest 6.12.x patch release
-cargo ktstr kernel build --kernel 6            # highest 6.x.y release
+cargo ktstr kernel build                    # latest stable series with >= 8 point releases
+cargo ktstr kernel build --kernel 7.0       # highest 7.0.x release
+cargo ktstr kernel build --kernel 6.14.2    # exact version
+cargo ktstr kernel build --kernel ../linux  # local source tree
 ```
 
-The bare `cargo ktstr kernel build` skips series that have fewer
-than 8 maintenance releases to keep CI off brand-new majors whose
-early point releases tend to hit build issues on older toolchains;
-pass the specific version explicitly if you need a series that
-hasn't reached `.8` yet.
-
-Subsequent runs of `cargo ktstr test` or `cargo nextest run` will
-find the cached kernel automatically (step 3 in the discovery chain
-above).
-
-To build from a local source tree:
-
-```sh
-cargo ktstr kernel build --kernel ../linux
-```
-
-To list and manage cached kernels:
-
-```sh
-cargo ktstr kernel list
-cargo ktstr kernel clean --keep 3
-```
-
-See [cargo-ktstr](running-tests/cargo-ktstr.md#kernel) for all
-options.
-
-### Manual
-
-```sh
-cd /path/to/linux
-make defconfig
-cat /path/to/ktstr/ktstr.kconfig >> .config
-make olddefconfig
-make -j$(nproc)
-```
-
-`ktstr.kconfig` in the repo root contains a kernel config fragment
-tuned for scheduler testing (sched_ext, BPF, kprobes, minimal boot).
+The bare form skips series with fewer than 8 maintenance releases —
+brand-new majors tend to hit build issues on older toolchains; name
+a version explicitly to override. `cargo ktstr kernel list` shows
+the cache and `cargo ktstr kernel clean --keep 3` prunes it. You can
+also skip this step entirely — `cargo ktstr test --kernel 7.0`
+builds and caches on first use.
 
 ## Write a test
 
-Create a file in your crate's `tests/` directory (e.g.
-`tests/sched_test.rs`) and write a `#[ktstr_test]` function. The
-[`prelude`](https://ktstr.dev/rustdoc/ktstr/prelude/index.html)
-module re-exports the types you need.
+One mental model before the first example: your test function runs
+**inside the VM**, as the guest's init process. `execute_defs` and
+friends create real cgroups and spawn real workers; `ctx` hands you
+the guest topology (`ctx.topo`) and cgroup management
+(`ctx.cgroups`).
 
-The simplest test uses a canned scenario. `AssertResult` carries the
-pass/fail verdict, diagnostic messages, and per-cgroup statistics from
-the run.
+Create a file in your crate's `tests/` directory (e.g.
+`tests/sched_test.rs`). The simplest test runs a canned scenario:
 
 ```rust,ignore
 use ktstr::prelude::*;
 
 #[ktstr_test(llcs = 1, cores = 2, threads = 1)]  // llcs = last-level caches
 fn my_test(ctx: &Ctx) -> Result<AssertResult> {
-    // `scenarios::steady` is a canned scenario: two cgroups of equal
-    // CPU-spin workers, no cpuset restrictions, run for the default
-    // duration.
+    // Canned scenario: two cgroups of CPU spinners, default duration.
     scenarios::steady(ctx)
 }
 ```
 
-For custom cgroup topology, declare cgroups with `CgroupDef` and run
-them with `execute_defs`. A `CgroupDef` bundles the cgroup name,
-optional cpuset, and workload specification into a single declaration.
-This is the most common custom test pattern:
+No `scheduler` attribute means the test runs under the kernel's
+default EEVDF scheduler (see [Overview](overview.md)) — a useful
+baseline before pointing at your own.
 
-```rust,ignore
-use std::time::Duration;
-use ktstr::prelude::*;
+When the canned scenarios stop being enough, declare your own
+cgroups, workloads, and cpusets with `CgroupDef` — the
+[Tutorial](tutorial.md) builds that up one step at a time, and
+[Writing Tests](writing-tests.md) is the reference.
 
-#[ktstr_test(llcs = 1, cores = 2, threads = 1)]
-fn my_test(ctx: &Ctx) -> Result<AssertResult> {
-    execute_defs(ctx, vec![
-        CgroupDef::named("cg_0").workers(4),
-        CgroupDef::named("cg_1")
-            .workers(2)
-            // CPU burst for 50 ms, sleep for 100 ms, repeat.
-            .work_type(WorkType::bursty(
-                Duration::from_millis(50),
-                Duration::from_millis(100),
-            )),
-    ])
-}
-```
+## Point it at a sched_ext scheduler
 
-`execute_defs` is a convenience wrapper that creates a single step
-holding for the full duration -- use it when all cgroups run
-concurrently for one phase. Use `execute_steps` when you need
-multiple phases (e.g., adding cgroups mid-test or changing cpusets
-between phases).
-
-`Step::with_defs` pairs a list of `CgroupDef`s with a `HoldSpec` that
-controls how long the step runs. This example starts two cgroups, then
-adds a third mid-test:
+Declare your scheduler once and reference it from any test:
 
 ```rust,ignore
 use ktstr::prelude::*;
 
-#[ktstr_test(llcs = 1, cores = 4, threads = 1)]
-fn my_test(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![
-        // Phase 1: two cgroups for the first half.
-        Step::with_defs(
-            vec![
-                CgroupDef::named("cg_0").workers(2),
-                CgroupDef::named("cg_1").workers(2),
-            ],
-            HoldSpec::frac(0.5),
-        ),
-        // Phase 2: add a third cgroup for the remaining half.
-        Step::with_defs(
-            vec![CgroupDef::named("cg_2").workers(2)],
-            HoldSpec::frac(0.5),
-        ),
-    ];
-    execute_steps(ctx, steps)
+declare_scheduler!(MY_SCHED, {
+    name = "my_sched",
+    binary = "scx_mysched",   // your scheduler's binary name
+});
+
+#[ktstr_test(scheduler = MY_SCHED, llcs = 2, cores = 2, threads = 1)]
+fn my_sched_steady(ctx: &Ctx) -> Result<AssertResult> {
+    scenarios::steady(ctx)
 }
 ```
 
-### How it runs
+The binary is resolved on the host — `target/{debug,release}/`, the
+test binary's directory, or a `KTSTR_SCHEDULER=/path` override — and
+packed into the VM's initramfs. Full field reference:
+[Scheduler Definitions](writing-tests/scheduler-definitions.md);
+walkthrough: [Test a New Scheduler](recipes/test-new-scheduler.md).
 
-The framework boots a KVM VM with the requested topology and runs
-your test binary as the guest's init process. Your test function
-executes **inside the VM** -- `execute_defs` and `execute_steps`
-immediately create cgroups, spawn workers, run the workload, and
-return assertion results. `Ctx` provides the guest topology
-(`ctx.topo`) and cgroup management (`ctx.cgroups`).
-
-### What gets checked
-
-**Nothing, by default.** `Assert::default_checks()` is the no-overrides
-identity (`Self::NO_OVERRIDES`) — every worker check, fairness check,
-monitor threshold, and starvation gate is unset/off, so all are
-**opt-in**. A bare
-`#[ktstr_test]` boots the VM, runs the scenario, and reports `pass`
-even if the scheduler stalled, starved workers, or never dispatched
-a task.
-
-To turn checks ON, set the corresponding attribute on the test (or
-on the scheduler the test references) — `not_starved = true`,
-`max_gap_ms = 3000`, `max_imbalance_ratio = 4.0`, etc. The
-[Checking](concepts/checking.md) page enumerates every gate and its
-threshold; [Customize Checking](recipes/custom-checking.md) shows
-the override flow.
-
-## Run
-
-The recommended way to run `#[ktstr_test]` tests is `cargo ktstr test`,
-which handles kernel resolution and wraps `cargo nextest`:
+## Run it
 
 ```sh
-cargo ktstr test --kernel ../linux
+cargo ktstr test --kernel 7.0                          # everything
+cargo ktstr test --kernel 7.0 -- -E 'test(my_test)'    # one test (nextest filter)
 ```
 
-The ktstr ctor automatically intercepts nextest protocol args
-(`--list`, `--exact`) for gauntlet expansion and budget-driven test
-selection.
+`cargo ktstr test` resolves the kernel — an explicit `--kernel`
+version, path, or cache key, or, without the flag, a discovery chain
+through environment variables, the kernel cache, and host kernels —
+then wraps `cargo nextest run`. The full chain and flag grammar live
+in [cargo ktstr](running-tests/cargo-ktstr.md).
 
-Fallbacks:
+Here is a real run, on a cached kernel (transcript captured from
+ktstr's own suite — your run shows `ktstr/my_test` on the PASS line
+instead):
 
-- `cargo nextest run`: ctor intercepts, runs gauntlet-expanded tests
-  (you must supply your own kernel via `KTSTR_KERNEL` /
-  `KTSTR_TEST_KERNEL` or the discovery chain).
-- `cargo test`: standard harness runs the `#[test]` wrappers (base
-  topology only, no gauntlet expansion).
+<!-- captured: cargo ktstr test --kernel 7.0 -- --features integration -E 'test(=ktstr/failure_dump_renders_bss_fields)' | ktstr 0.23.0 | kernel 7.0.14 -->
+<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr test --kernel 7.0 -- -E 'test(=ktstr/failure_dump_renders_bss_fields)'</span></div>
 
-Requires `/dev/kvm`. See
-[Troubleshooting](troubleshooting.md#devkvm-not-accessible) if KVM
-is unavailable.
+<pre><span class="t-dim">cargo ktstr: fetching latest 7.0.x kernel version
+cargo ktstr: latest 7.0.x kernel: 7.0.14
+cargo ktstr: resolved kernel "7.0"</span>
+...
+────────────
+ Nextest run ID 24c18577-cd34-43bd-9d14-b0197701c187 with nextest profile: default
+    Starting 1 test across 121 binaries (12531 tests skipped)
+        <span class="t-grn">PASS [  34.451s] (1/1) ktstr::failure_dump_e2e ktstr/failure_dump_renders_bss_fields</span>
+────────────
+     <span class="t-b">Summary [  34.490s] 1 test run: 1 passed, 12531 skipped</span>
 
-Passing tests:
+cargo ktstr: test outputs
+...
+    (1 stats sidecar(s), 0 wprof trace(s) written this run)</pre></div>
 
+Reading it:
+
+- The first three lines are kernel resolution: `--kernel 7.0` picked
+  the newest 7.0.x release and found it already cached — no rebuild.
+- Test names have the shape `crate::binary ktstr/test_name`; the
+  `ktstr/` prefix marks the base variant, and the same test also
+  generates `gauntlet/` topology variants, skipped by default (see
+  [Running Tests](running-tests.md)). The 34 s covers everything:
+  VM boot, scenario, teardown, evaluation.
+- Every run writes a stats sidecar per test under
+  `target/ktstr/{kernel}-{commit}/` — the raw material for
+  regression gates ([Runs and Regression
+  Gates](running-tests/runs.md)).
+
+## What gets checked
+
+> [!WARNING]
+> Nothing, by default. A bare `#[ktstr_test]` boots the VM, runs the
+> scenario, and reports pass even if the scheduler stalled, starved
+> workers, or never dispatched a task.
+
+Every check is an opt-in attribute: `not_starved = true` enables the
+starvation/fairness/gap trio, `max_spread_pct`, `min_iteration_rate`,
+and friends set explicit thresholds. [Checking](concepts/checking.md)
+explains the model;
+[Customize Checking](recipes/custom-checking.md) shows the override
+flow.
+
+## When a check fails
+
+A failing check prints the violated threshold with the observed
+value, then per-cgroup statistics. This excerpt is from a real run
+that set an impossible `min_iteration_rate` floor:
+
+<!-- captured: cargo ktstr test --kernel 7.0 -- --features integration -E 'test(=ktstr/throughput_gate)' | ktstr 0.23.0 | kernel 7.0.14 -->
 ```text
-    PASS [  11.34s] my_crate::my_sched_tests ktstr/my_test
-```
-
-A failing test prints assertion details:
-
-```text
-    FAIL [  12.05s] my_crate::my_sched_tests ktstr/my_test
-
---- STDERR ---
-ktstr_test 'my_test' [topo=1n1l2c1t] failed:
-  stuck 3500ms on cpu1 at +1200ms
+ktstr_test 'throughput_gate' [sched=scx-ktstr] [topo=1n1l2c1t] failed:
+  worker 71 iteration rate 41903.3/s below floor 50000000.0/s
+  worker 73 iteration rate 37834.5/s below floor 50000000.0/s
 
 --- stats ---
-4 workers, 2 cpus, 8 migrations, worst_spread=12.3%, worst_gap=3500ms
-  cg0: workers=2 cpus=2 spread=5.1% gap=3500ms migrations=4 iter=15230
-  cg1: workers=2 cpus=2 spread=12.3% gap=890ms migrations=4 iter=14870
+2 workers, 4 cpus, 2 migrations, worst_spread=0.0%, worst_gap=21ms
+  cg0: workers=1 cpus=2 spread=0.0% gap=10ms migrations=1 iter=209600
+  cg1: workers=1 cpus=2 spread=0.0% gap=21ms migrations=1 iter=189252
+...
 ```
 
-Each test invocation writes results into
-`{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{project_commit}/`
-as one `*.ktstr.json` sidecar per `#[ktstr_test]` variant. Run
-`cargo ktstr stats list` to see runs (RUN, TESTS, DATE, ARCH
-columns). See [Runs](running-tests/runs.md) for the full layout
-and analysis workflow.
-
-### Using cargo-ktstr
-
-`cargo ktstr test` handles kernel resolution and test execution in
-one command:
-
-```sh
-cargo ktstr test                                              # auto-discover kernel
-cargo ktstr test --kernel ../linux                            # local source tree (builds + caches; subsequent runs hit cache)
-cargo ktstr test --kernel 6.14.2                              # version (auto-downloads on miss)
-cargo ktstr test -- -E 'test(my_test)'                        # pass nextest args
-```
-
-See [cargo-ktstr](running-tests/cargo-ktstr.md) for details.
-
-### Interactive shell
-
-`cargo ktstr shell` boots a VM with busybox for manual exploration:
-
-```sh
-cargo ktstr shell                              # default 1,1,1,1 topology
-cargo ktstr shell --topology 1,2,4,1           # 1 NUMA node, 2 LLCs, 4 cores/LLC, 1 thread/core
-cargo ktstr shell -i ./my-scheduler            # include a file in the guest
-cargo ktstr shell -i ./test-data/              # include a directory recursively
-```
-
-Included ELF binaries get automatic shared library resolution.
-Directories are walked recursively; their contents appear under
-`/include-files/<dirname>/` preserving the original structure.
-Individual files are available at `/include-files/<name>` inside the guest.
-See [cargo-ktstr shell](running-tests/cargo-ktstr.md#shell) for
-details.
+The header names the test, scheduler, and topology variant; each
+detail line names the check, observed value, and threshold. The full
+output continues with timeline, scheduler-log, and monitor sections,
+plus failure-dump artifacts and a ready-to-paste `cargo ktstr
+replay` command — [Reading Failure
+Output](running-tests/failures.md) walks the whole anatomy.
 
 ## Next steps
 
-To understand scenarios, flags, and checking:
-[Core Concepts](concepts.md).
-
-To write new tests: [Writing Tests](writing-tests.md).
-
-To test your own scheduler:
-[Test a New Scheduler](recipes/test-new-scheduler.md).
+- [Tutorial: Zero to ktstr](tutorial.md) — build a complete test
+  step by step, break it on purpose, and read the wreckage.
+- [Test a New Scheduler](recipes/test-new-scheduler.md) — you have
+  an `scx_*` binary and want it under test in five minutes.
+- [Writing Tests](writing-tests.md) — the authoring reference:
+  attributes, scenarios, snapshots, assertions.

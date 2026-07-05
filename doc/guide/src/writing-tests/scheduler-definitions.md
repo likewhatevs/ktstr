@@ -1,168 +1,9 @@
 # Scheduler Definitions
 
-A `Scheduler` tells the test framework how to launch and configure
-the scheduler under test. Tests reference one via
-`#[ktstr_test(scheduler = MY_SCHED)]`; the verifier sweep reads
-every declared scheduler from the `KTSTR_SCHEDULERS` distributed
-slice automatically.
-
-## The Scheduler type
-
-```rust,ignore
-pub struct Scheduler {
-    pub name: &'static str,
-    pub binary: SchedulerSpec,
-    pub sysctls: &'static [Sysctl],
-    pub kargs: &'static [&'static str],
-    pub assert: Assert,
-    pub cgroup_parent: Option<CgroupPath>,
-    pub sched_args: &'static [&'static str],
-    pub topology: Topology,
-    pub constraints: TopologyConstraints,
-    pub config_file: Option<&'static str>,
-    pub config_file_def: Option<(&'static str, &'static str)>,
-    pub kernels: &'static [&'static str],
-}
-```
-
-**Pick one of `config_file` / `config_file_def` — they are
-alternatives, not complements.** A scheduler that takes a
-config file at startup picks the field that matches the
-test-author surface:
-
-- The config is the SAME file across every test that uses the
-  scheduler → `config_file = "path/to/sched.toml"` (host-side file,
-  packed once into the initramfs).
-- The config VARIES per test (different test asserts different
-  bands, knobs, or topologies) → `config_file_def` (declares the
-  arg-template + guest-path pair; each test supplies the
-  `config_content` via `#[ktstr_test(config = …)]`).
-- The scheduler takes no config → omit both fields.
-
-Setting both fields on the same scheduler is a misconfiguration
-— pick one. The framework currently allows both to coexist (the
-`config_file` path is always packed and prepended; the
-`config_file_def`-driven inline config is written when a per-test
-`config = ...` attribute supplies content), but the resulting
-two-config behavior is rarely intended.
-
-`config_file` packs a host-side file into the initramfs at
-`/include-files/{filename}` and prepends `--config /include-files/{filename}`
-to scheduler args automatically.
-
-`config_file_def` declares an arg-template + guest-path pair for
-schedulers that take inline JSON content via the test attribute
-`#[ktstr_test(config = …)]`: the framework writes the test's
-`config_content` to the declared guest path and substitutes
-`{file}` in the arg template before launching the scheduler. See
-[The #\[ktstr_test\] Macro](ktstr-test-macro.md#inline-scheduler-config)
-for the inline pairing gate.
-
-`sysctls` takes `Sysctl` values. Construct them with
-`Sysctl::new("key", "value")` in `const` context. Use the
-dot-separated form for the key (e.g. `"kernel.foo"`, not
-`"kernel/foo"`); duplicate keys are applied in order and the
-last write wins.
-
-For a scheduler that needs several sysctls in lockstep, declare
-them as a `const` slice — every `Sysctl::new(...)` is `const fn`,
-so the array literal stays in `static`/`const` context and the
-scheduler `const` can reference it directly:
-
-```rust,ignore
-const RT_TUNING: &[Sysctl] = &[
-    Sysctl::new("kernel.sched_rt_runtime_us", "950000"),
-    Sysctl::new("kernel.sched_rt_period_us", "1000000"),
-    Sysctl::new("kernel.numa_balancing", "0"),
-];
-
-declare_scheduler!(RT_TUNED, {
-    name = "rt_tuned_scx",
-    binary = "scx_rt_tuned",
-    sysctls = RT_TUNING,
-});
-```
-
-The framework injects each `Sysctl` into the guest kernel command
-line as `sysctl.<key>=<value>` in declaration order; the kernel
-applies them at boot. Each test boots a fresh VM, so there is no
-separate per-scenario apply/revert step.
-
-`kargs` is the extra GUEST KERNEL command-line (not the scheduler
-binary's CLI — use `sched_args` for that). Do not override the
-kargs ktstr injects itself (`console=`, `loglevel=`, `rdinit=`):
-those break guest-side init and leave the VM unable to run tests.
-
-`kernels` is the **per-scheduler filter** on the
-[BPF Verifier sweep](../running-tests/verifier.md) matrix. The
-matrix dimension itself is the operator's `cargo ktstr verifier
---kernel <SPEC>` set (which the dispatcher always populates into
-`KTSTR_KERNEL_LIST`, including a single auto-discovered entry
-when `--kernel` is omitted). For each scheduler, the lister
-emits one cell per (kernel-list entry that passes this filter ×
-accepted topology preset).
-
-Each entry is a string consumed by `KernelId::parse` — the same
-parser as the `cargo ktstr verifier --kernel <SPEC>` CLI flag.
-Match semantics per variant:
-
-- Exact `Version` (`"6.14.2"`) — matches an entry whose raw or
-  sanitized label equals the version.
-- `Range` (`"6.14..7.0"` or `"6.14..=7.0"` — both inclusive on
-  both endpoints) — matches entries whose raw version falls
-  inside `[start, end]` via
-  `decompose_version_for_compare`.
-- `Path` / `CacheKey` / `Git` (`"git+URL#tag=NAME"`, `"path/to/dir"`,
-  `"6.14.2-tarball-x86_64-kc..."`) — matches by sanitized-label
-  equality.
-
-An empty `kernels = []` means **no filter** — the scheduler
-verifies against every kernel-list entry the operator supplied.
-
-## SchedulerSpec
-
-How to find the scheduler binary:
-
-```rust,ignore
-pub enum SchedulerSpec {
-    Eevdf,                   // No sched_ext binary -- use kernel EEVDF
-    Discover(&'static str),  // Auto-discover by name
-    Path(&'static str),      // Explicit path
-    KernelBuiltin {          // Kernel-built scheduler (no binary)
-        enable: &'static [&'static str],
-        disable: &'static [&'static str],
-    },
-}
-```
-
-`KernelBuiltin` is for schedulers compiled into the kernel (e.g.
-BPF-less sched_ext or debugfs-tuned variants). The `enable`
-commands run in the guest to activate the scheduler; `disable`
-commands run to deactivate it. No binary is injected into the
-VM.
-
-`SchedulerSpec::has_active_scheduling()` returns `true` for all
-variants except `Eevdf`. When `true`, the framework runs monitor
-threshold evaluation after the scenario and enables auto-repro
-on crash.
-
-`Eevdf` and `KernelBuiltin` are excluded from the verifier sweep
-at cell-emission time — neither has a userspace binary to load
-BPF programs from, so the verifier has nothing to verify.
-
-## Built-in: EEVDF
-
-`Scheduler::EEVDF` runs tests without a sched_ext scheduler,
-using the kernel's default EEVDF scheduler. Its binary is
-`SchedulerSpec::Eevdf`. It is the default scheduler for
-`#[ktstr_test]` entries that do not pass `scheduler = ...`.
-
-## Defining a scheduler
-
-`declare_scheduler!` is the preferred entry point: it constructs a
-`pub static Scheduler` and registers it in the `KTSTR_SCHEDULERS`
-distributed slice in one step, so the verifier sweep picks it up
-automatically.
+A `Scheduler` tells the framework how to find, configure, and launch
+the scheduler under test. `declare_scheduler!` builds one and
+registers it so both `#[ktstr_test]` and the
+[verifier sweep](../running-tests/verifier.md) can see it:
 
 ```rust,ignore
 use ktstr::declare_scheduler;
@@ -173,109 +14,96 @@ declare_scheduler!(MY_SCHED, {
     binary = "scx_my_sched",
     sched_args = ["--exit-dump-len", "1048576"],
     topology = (1, 2, 4, 1),
-    kernels = ["6.14", "6.15..=7.0"],
 });
-// `MY_SCHED` is the generated Rust handle test functions reference
-// via `#[ktstr_test(scheduler = MY_SCHED)]`. `name = "my_sched"` is
-// the user-visible label that appears in nextest output, sidecars,
-// and the `cargo ktstr` CLI. The two names are independent —
-// rename the Rust handle freely without touching anything else;
-// renaming the `name` string updates every downstream artifact.
 
 #[ktstr_test(scheduler = MY_SCHED)]
 fn basic(ctx: &Ctx) -> Result<AssertResult> {
-    execute_defs(ctx, vec![
-        CgroupDef::named("cg_0").workers(2),
-        CgroupDef::named("cg_1").workers(2),
-    ])
+    execute_defs(ctx, vec![ctx.cgroup_def("cg_0"), ctx.cgroup_def("cg_1")])
 }
 ```
 
-The macro emits:
+`MY_SCHED` is the Rust handle tests reference; `name = "my_sched"`
+is the user-visible label in nextest output, sidecars, and the CLI.
+Rename either independently. Once declared, the scheduler shows up
+in the verifier sweep's cells with no further wiring:
 
-- `pub static MY_SCHED: Scheduler` with the supplied fields.
-- A private `static __KTSTR_SCHED_REG_MY_SCHED: &'static Scheduler`
-  registered in the `KTSTR_SCHEDULERS` distributed slice via
-  `linkme` so `cargo ktstr verifier` discovers it.
+<!-- captured: cargo ktstr verifier --kernel 7.0 -- --test kaslr_axis_e2e tiny-1llc tiny-2llc odd-3llc smt-2llc | ktstr 0.23.0 | kernel 7.0.14 -->
+```text
+ Nextest run ID 3522bea7-... with nextest profile: default
+    Starting 4 tests across 1 binary (55 tests skipped)
+        PASS [  12.406s] (1/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/odd-3llc
+        PASS [  12.432s] (2/4) ktstr::kaslr_axis_e2e verifier/ktstr_sched/kernel_7_0/smt-2llc
+...
+```
 
-`#[ktstr_test(scheduler = ...)]` expects an `&'static Scheduler` —
-pass the bare ident (e.g. `MY_SCHED`). The macro takes a reference
-internally, so passing the bare const yields the correct
-`&Scheduler`.
+## Defining a scheduler {#defining-a-scheduler}
+
+`declare_scheduler!` emits a `pub static MY_SCHED: Scheduler` and
+registers a reference to it in the `KTSTR_SCHEDULERS` distributed
+slice, which is what `cargo ktstr verifier` enumerates.
+`#[ktstr_test(scheduler = ...)]` expects the bare ident; the macro
+takes the reference internally. The ident can carry a visibility
+prefix (`pub`, `pub(crate)`).
 
 ### Accepted fields
 
-`name` plus exactly one source key (`binary`, `binary_path`, or the
-`kernel_builtin_enable`/`kernel_builtin_disable` pair) are required;
-every other key is optional. Source keys are macro-only — they map
-to the appropriate `SchedulerSpec` variant at expansion time, and
-the macro rejects `SchedulerSpec::Variant(...)` literals on these
-keys (use the dedicated key instead).
+`name` plus exactly one binary-source key (`binary`, `binary_path`,
+or the `kernel_builtin_enable`/`kernel_builtin_disable` pair) are
+required; every other key is optional.
 
 - `name = "..."` — short human name (required).
-- `binary = "scx_name"` — string literal naming a binary the guest
-  will resolve via `which` / `PATH`. Maps to
-  `SchedulerSpec::Discover(name)`. Mutually exclusive with
-  `binary_path` and `kernel_builtin_*`.
-- `binary_path = "/abs/path/to/binary"` — string literal naming an
-  absolute path to a binary that gets injected into the guest
-  initramfs. Maps to `SchedulerSpec::Path(path)`. Mutually exclusive
-  with `binary` and `kernel_builtin_*`.
-- `kernel_builtin_enable = ["echo minlat > /sys/kernel/debug/sched/ext/root/ops"]`
-  + `kernel_builtin_disable = ["echo none > /sys/kernel/debug/sched/ext/root/ops"]`
-  — paired shell-command lists for activating / deactivating a
-  kernel-builtin scheduler (no userspace binary). Both keys must
-  appear together. Maps to
-  `SchedulerSpec::KernelBuiltin { enable, disable }`. Mutually
-  exclusive with `binary` and `binary_path`.
-- `sched_args = ["--a", "--b"]` — CLI args prepended to every
-  test that uses this scheduler.
-- `kernels = ["6.14", "6.15..=7.0", "git+URL#tag=NAME", "/path", "cache-key"]`
-  — verifier sweep set; see the field doc above.
-- `cgroup_parent = "/path"` — must begin with `/`, must not be
-  `"/"` alone, must not contain `..` segments (rejected at compile
-  time by `CgroupPath::new()`).
-- `kargs = ["nosmt"]` — guest-kernel cmdline additions.
-- `sysctls = [Sysctl::new("kernel.foo", "1")]` — applied before
-  the scheduler starts.
+- `binary = "scx_name"` — discover a binary by name. Resolution
+  happens entirely on the host, before the VM boots, and the
+  resolved binary is packed into the guest initramfs — nothing is
+  resolved inside the guest. The cascade: a per-name
+  `KTSTR_SCHEDULER_BIN_<NAME>` env override, then the global
+  `KTSTR_SCHEDULER`, then a fresh workspace build via
+  `cargo build -p <name>` — a failed build refuses to serve a
+  possibly-stale pre-built binary unless
+  `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK` is set, which enables the
+  pre-built fallbacks (a sibling of the test binary, then
+  `target/{release,debug}/`). Test binaries run outside the
+  cargo-ktstr pipeline (`KTSTR_CARGO_TEST_MODE=1`) skip the build
+  and consult the host `PATH` and the pre-built fallbacks first
+  instead.
+- `binary_path = "/abs/path"` — explicit pre-built binary; must
+  exist on the host, packed into the initramfs as-is.
+- `kernel_builtin_enable = [...]` + `kernel_builtin_disable = [...]`
+  — paired guest shell-command lists for a scheduler compiled into
+  the kernel (no userspace binary). Both keys must appear together.
+- `sched_args = ["--a", "--b"]` — scheduler CLI args applied to
+  every test; per-test `extra_sched_args` append after them.
+- `kargs = ["nosmt"]` — extra guest kernel command line (not the
+  scheduler's CLI — that's `sched_args`). Do not override the kargs
+  ktstr injects itself (`console=`, `loglevel=`, `rdinit=`); those
+  break guest init.
+- `sysctls = [Sysctl::new("kernel.foo", "1")]` — applied at guest
+  boot, before the scheduler starts (see below).
 - `topology = (numa_nodes, llcs, cores, threads)` — default VM
-  topology for `#[ktstr_test]` entries.
-- `constraints = TopologyConstraints { ... }` — gauntlet
-  topology constraints inherited by `#[ktstr_test]` entries.
-- `config_file = "configs/my_sched.toml"` — opaque host-side
-  config to pack into the guest initramfs.
-- `config_file_def = ("--config={file}", "/include-files/my.json")`
-  — alternative inline-config seam (see
-  [The #\[ktstr_test\] Macro](ktstr-test-macro.md#inline-scheduler-config)).
+  topology tests inherit dimension-by-dimension.
+- `constraints = TopologyConstraints { ... }` — gauntlet constraints
+  tests inherit; see the
+  [macro reference](ktstr-test-macro.md#topology-constraints).
+- `cgroup_parent = "/path"` — cgroup subtree the guest creates for
+  the scheduler before it starts (see below).
+- `config_file = "configs/my.toml"` / `config_file_def = (...)` —
+  the two config-file seams (see below).
 - `assert = Assert::NO_OVERRIDES.max_imbalance_ratio(2.0)` —
-  scheduler-level assertion overrides merged on top of
-  `Assert::default_checks()`. Chain additional `Assert` setters as
-  needed.
+  scheduler-level checking overrides, merged between the library
+  defaults and per-test attributes. See
+  [Customize Checking](../recipes/custom-checking.md).
+- `kernels = ["6.14", "6.15..=7.0"]` — filters which kernel-list
+  entries this scheduler verifies against in the verifier sweep.
+  Entries use the same grammar as `cargo ktstr verifier --kernel`
+  (exact versions, inclusive ranges, paths, git specs); empty means
+  no filter. Match semantics live in
+  [BPF Verifier Sweep](../running-tests/verifier.md).
 
-The `SchedulerSpec::Eevdf` variant is not reachable via
-`declare_scheduler!` — to test under the kernel-default EEVDF
-baseline, reference `Scheduler::EEVDF` from the `ktstr::test_support`
-module directly as the test attribute (this is also the default when
-`#[ktstr_test]` omits `scheduler = ...`).
+### Manual definition {#manual-definition}
 
-### Visibility
-
-The identifier can be `pub` or `pub(crate)`:
-
-```rust,ignore
-declare_scheduler!(pub MY_SCHED, { name = "my_sched", binary = "scx_my_sched" });
-declare_scheduler!(pub(crate) INTERNAL, { name = "internal", binary = "scx_internal" });
-```
-
-The macro emits `#[allow(missing_docs)]` on the generated static
-so crates with `#![deny(missing_docs)]` compile cleanly.
-
-### Manual definition
-
-The const builder pattern still works when the macro doesn't
-fit — e.g. when the scheduler is composed programmatically or
-when test-only fixtures need to avoid the distributed-slice
-registration:
+The const builder still works when the macro doesn't fit — e.g. a
+programmatically composed scheduler, or a fixture that must stay out
+of the verifier sweep:
 
 ```rust,ignore
 use ktstr::prelude::*;
@@ -288,215 +116,37 @@ const MITOSIS: Scheduler = Scheduler::named("scx_mitosis")
     .assert(Assert::NO_OVERRIDES.max_imbalance_ratio(2.0));
 ```
 
-The common discover-by-name case has sugar:
-`Scheduler::named("foo").binary_discover("scx_foo")` is shorthand for
-`Scheduler::named("foo").binary(SchedulerSpec::Discover("scx_foo"))`
-(the argument is the binary name to discover, not the scheduler name).
-
-A manually-defined `Scheduler` is not registered in
-`KTSTR_SCHEDULERS` automatically; the verifier sweep does not
-see it. Use `declare_scheduler!` for any scheduler that should
+`Scheduler::named("foo").binary_discover("scx_foo")` is shorthand
+for `.binary(SchedulerSpec::Discover("scx_foo"))` — the argument is
+the binary name to discover, not the scheduler name. A manual const
+is not registered in `KTSTR_SCHEDULERS`, so the verifier sweep does
+not see it; use `declare_scheduler!` for anything that should
 participate in `cargo ktstr verifier`.
 
-## Related test-attribute slots
-
-Two `#[ktstr_test]` attributes shape the scheduler runtime in
-ways that complement what `Scheduler` itself declares. They live
-on the test, not on the scheduler, but their interpretation
-depends on the `Scheduler` being referenced:
-
-- `staged_schedulers = [PATH, …]` — additional `&'static Scheduler`
-  consts packed into the guest at boot. Required for tests that
-  invoke `Op::ReplaceScheduler` / `Op::AttachScheduler` since the
-  swap target must be on disk before the runtime swap happens.
-- `workload_root_cgroup = "/path"` — guest cgroup path under which
-  the framework creates the per-test workload cgroups. Decoupled
-  from the scheduler's `cgroup_parent` (which controls scheduler-side
-  cell rooting) — use this when the test author wants workload
-  cgroups to land at a specific path independent of the scheduler.
-
-See [The #\[ktstr_test\] Macro](ktstr-test-macro.md) for both attributes
-in their authoritative attribute-table context.
-
-## Cgroup parent
-
-`Scheduler.cgroup_parent` specifies a cgroup subtree under
-`/sys/fs/cgroup` for the scheduler to manage. When set, the guest
-init creates the directory (enabling the cpuset/cpu controllers on its
-ancestors) before starting the scheduler. It does NOT pass
-`--cell-parent-cgroup` to the scheduler — a cell-aware scheduler that
-needs the flag must include it explicitly in `sched_args` (or per-test
-`extra_sched_args`). The field is `Option<CgroupPath>`. `CgroupPath::new()` is
-a const constructor that panics at compile time if the path
-does not begin with `/` or is `"/"` alone. The
-`Scheduler::cgroup_parent()` builder and the
-`declare_scheduler!` `cgroup_parent = "..."` field both accept
-`&'static str` and construct a `CgroupPath` internally.
+## SchedulerSpec
 
 ```rust,ignore
-declare_scheduler!(MITOSIS, {
-    name = "scx_mitosis",
-    binary = "scx_mitosis",
-    topology = (1, 2, 4, 1),
-    cgroup_parent = "/ktstr",
-});
+pub enum SchedulerSpec {
+    Eevdf,                   // no sched_ext binary — kernel EEVDF
+    Discover(&'static str),  // host-side discovery by name
+    Path(&'static str),      // explicit host path
+    KernelBuiltin {          // compiled into the kernel
+        enable: &'static [&'static str],
+        disable: &'static [&'static str],
+    },
+}
 ```
 
-This creates `/sys/fs/cgroup/ktstr` in the guest before the scheduler
-starts. It does not pass `--cell-parent-cgroup /ktstr` to the
-scheduler; add that to `sched_args` if `scx_mitosis` needs the flag.
+`Scheduler::EEVDF` (binary `SchedulerSpec::Eevdf`) runs tests under
+the kernel's default scheduler and is what `#[ktstr_test]` uses when
+`scheduler =` is omitted. It is not reachable via
+`declare_scheduler!` — reference `Scheduler::EEVDF` directly.
+`Eevdf` and `KernelBuiltin` are excluded from the verifier sweep:
+neither has a userspace binary to load BPF programs from.
 
-If the scheduler-def's `sched_args` or a test's `extra_sched_args`
-contains `--cell-parent-cgroup` (either as
-`["--cell-parent-cgroup", "/path"]` or
-`["--cell-parent-cgroup=/path"]`), it flows through to the scheduler
-as-is, and the guest-side init also creates the cgroup directory at
-that path. (The framework never adds its own copy of the flag, so
-there is no duplicate to suppress.)
-
-Supplying `--cell-parent-cgroup` with a value that does not name a
-valid per-test cgroup sub-path is rejected at test setup with a
-panic. The gate rejects empty (`["--cell-parent-cgroup="]` or
-`["--cell-parent-cgroup", ""]`), bare `/`
-(`["--cell-parent-cgroup=/"]`), and relative paths
-(`["--cell-parent-cgroup=my_test"]`). Such values would resolve to
-a path equal to or inside `/sys/fs/cgroup` (empty →
-`/sys/fs/cgroup`, the host cgroup root; bare `/` →
-`/sys/fs/cgroup/`, the same root; relative →
-`/sys/fs/cgroupmy_test`, a stray path next to the host root) and
-corrupt unrelated host cgroup state. The framework rejects both
-sources (the per-test `extra_sched_args` and the scheduler-def
-`sched_args`) regardless of whether the scheduler declared a
-default `cgroup_parent`. The gate mirrors the const-eval check in
-`CgroupPath::new`, so runtime values share the validation contract
-that compile-time `cgroup_parent = "..."` declarations already
-pass. To let the scheduler manage a cgroup without passing the flag,
-set the scheduler's `cgroup_parent` instead; to pass the flag, supply
-an absolute path under `/` with at least one segment beyond the root
-like `"/ktstr"`.
-
-A bare `--cell-parent-cgroup` with no following value
-(`["--cell-parent-cgroup"]` as the trailing token) is also
-rejected at the gate. Previously, this shape parsed as "absent"
-and let the framework's auto-inject fire — producing two copies
-of the flag in the final argv that the scheduler's clap parser
-then rejected with a confused "cannot be used multiple times"
-diagnostic, burying the actual missing-value mistake. The gate
-now distinguishes "absent" from "missing value" and surfaces an
-actionable panic anchored to the declaration site instead.
-
-## Config file
-
-`Scheduler.config_file` specifies a host-side path to an opaque
-config file that the scheduler binary reads at startup. The
-framework packs the file into the guest initramfs at
-`/include-files/{filename}` and prepends `--config /include-files/{filename}`
-to the scheduler args. ktstr does not parse or validate the
-file — it is passed through as-is.
-
-The `--config` flag name is not configurable. Schedulers that
-use `config_file` must accept `--config <path>`. For schedulers
-that use a different flag, use `config_file` to place the file
-in the guest and add the desired flag via `sched_args` — the
-scheduler will also receive `--config` and must not reject
-unknown flags.
+### Kernel-builtin example
 
 ```rust,ignore
-declare_scheduler!(MY_SCHED, {
-    name = "my_sched",
-    binary = "scx_my_sched",
-    topology = (1, 2, 4, 1),
-    config_file = "configs/my_sched.toml",
-});
-```
-
-This copies `configs/my_sched.toml` from the host into the
-guest at `/include-files/my_sched.toml` and passes
-`--config /include-files/my_sched.toml` to the scheduler binary.
-
-## Scheduler args
-
-`Scheduler.sched_args` provides default CLI args that apply to
-every test using this scheduler. They are prepended before
-per-test `extra_sched_args`.
-
-```rust,ignore
-declare_scheduler!(MITOSIS, {
-    name = "scx_mitosis",
-    binary = "scx_mitosis",
-    topology = (1, 2, 4, 1),
-    cgroup_parent = "/ktstr",
-    sched_args = ["--exit-dump-len", "1048576"],
-});
-```
-
-Merge order: `config_file` (`--config <path>`) injection, then
-`sched_args`, then per-test `extra_sched_args`. (No
-`--cell-parent-cgroup` is injected; `cgroup_parent` only creates the
-guest cgroup directory.)
-
-## Default topology
-
-`Scheduler.topology` sets the default VM topology for all tests
-using this scheduler. When `#[ktstr_test]` omits `llcs`,
-`cores`, and `threads`, the scheduler's topology is used.
-Explicit attributes on `#[ktstr_test]` override the scheduler
-default.
-
-```rust,ignore
-// (numa_nodes, llcs, cores_per_llc, threads_per_core)
-declare_scheduler!(MITOSIS, {
-    name = "scx_mitosis",
-    binary = "scx_mitosis",
-    topology = (1, 2, 4, 1),
-});
-```
-
-Arguments are `(numa_nodes, llcs, cores_per_llc, threads_per_core)`.
-Most schedulers use `numa_nodes = 1` (single NUMA node).
-`Scheduler::named()` defaults to `(1, 1, 2, 1)` — a minimal
-2-CPU single-NUMA VM, sufficient for tests that don't exercise
-topology-dependent scheduling.
-
-Tests that need a different topology (e.g. SMT) override
-individual dimensions. Unset dimensions still inherit from the
-scheduler:
-
-```rust,ignore
-// Inherits llcs=2, cores=4 from MITOSIS; overrides threads to 2
-#[ktstr_test(scheduler = MITOSIS, threads = 2)]
-fn smt_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
-```
-
-## Checking overrides
-
-`Scheduler.assert` provides scheduler-level checking defaults.
-These sit between `Assert::default_checks()` and per-test
-overrides in the merge chain.
-
-A scheduler that tolerates higher imbalance:
-
-```rust,ignore
-declare_scheduler!(RELAXED, {
-    name = "relaxed",
-    binary = "scx_relaxed",
-    assert = Assert::NO_OVERRIDES.max_imbalance_ratio(5.0),
-});
-```
-
-## Kernel-built scheduler example
-
-For schedulers compiled into the kernel (no userspace binary),
-use the paired `kernel_builtin_enable` and `kernel_builtin_disable`
-macro keys to declare the activate / deactivate shell-command
-lists. The macro maps both keys to a single
-`SchedulerSpec::KernelBuiltin { enable, disable }` at expansion
-time:
-
-```rust,ignore
-use ktstr::declare_scheduler;
-use ktstr::prelude::*;
-
 declare_scheduler!(MINLAT, {
     name = "minlat",
     kernel_builtin_enable = ["echo minlat > /sys/kernel/debug/sched/ext/root/ops"],
@@ -504,95 +154,97 @@ declare_scheduler!(MINLAT, {
 });
 ```
 
-The `enable` commands run in the guest before scenarios start.
-The `disable` commands run after scenarios complete.
+The `enable` commands run in the guest before scenarios start;
+`disable` runs after they complete.
 
-`KernelBuiltin` schedulers do not participate in the verifier
-sweep (no userspace binary to load BPF programs from); the
-declaration is still useful for `#[ktstr_test(scheduler = ...)]`
-attribution and sidecar identification.
+## Sysctls
 
-## Payload Definitions {#derive-payload}
+`sysctls` takes `Sysctl::new("key", "value")` pairs (dot-separated
+keys; duplicates apply in order, last write wins). The framework
+injects each as `sysctl.<key>=<value>` on the guest kernel command
+line, so the kernel applies them at boot — each test gets a fresh
+VM, so there is no apply/revert step. `Sysctl::new` is `const fn`,
+so a shared tuning block can live in a `const` slice:
 
-A `Payload` describes a binary workload that a test can run
-alongside its cgroup workers. The struct encodes
-`PayloadKind::Binary` (an external executable — `schbench`,
-`fio`, `stress-ng`) for the workload role. Tests reference a
-`Payload` via `#[ktstr_test(payload = FIXTURE)]` (primary slot)
-or `#[ktstr_test(workloads = [FIXTURE_A, FIXTURE_B])]`
-(additional slots); the test body then runs it via
-`ctx.payload(&FIXTURE)`.
+```rust,ignore
+const RT_TUNING: &[Sysctl] = &[
+    Sysctl::new("kernel.sched_rt_runtime_us", "950000"),
+    Sysctl::new("kernel.numa_balancing", "0"),
+];
 
-The `scheduler` slot is separate from the `payload` / `workloads`
-slots — `#[ktstr_test(scheduler = MY_SCHED)]` takes a bare
-`Scheduler` reference (the `declare_scheduler!` const), not a
-`Payload`.
+declare_scheduler!(RT_TUNED, {
+    name = "rt_tuned_scx",
+    binary = "scx_rt_tuned",
+    sysctls = RT_TUNING,
+});
+```
 
-### `#[non_exhaustive]` and construction rules
+## Config files
 
-`Payload` is `#[non_exhaustive]` (see [`crate::non_exhaustive`](https://ktstr.dev/rustdoc/ktstr/non_exhaustive/index.html)).
-Downstream crates **cannot** use struct-literal construction —
-a future ktstr bump can add fields without breaking callers
-only if everyone constructs through the provided associated
-functions:
+**Pick one of `config_file` / `config_file_def` — they are
+alternatives.**
 
-- [`Payload::binary(name, binary)`](https://ktstr.dev/rustdoc/ktstr/test_support/struct.Payload.html#method.binary)
-  — minimal binary-kind `Payload` with exit-code-only defaults
-  (no declared args, checks, metrics, or include files). Fills
-  `name`, sets `kind = PayloadKind::Binary(binary)`.
-- [`Payload::new(...)`](https://ktstr.dev/rustdoc/ktstr/test_support/struct.Payload.html#method.new)
-  — full positional constructor; the [`#[derive(Payload)]`](#derive-payload)
-  macro emits a call to this internally.
+- The config is the same file for every test →
+  `config_file = "configs/my_sched.toml"`. The framework packs the
+  host file into the guest at `/include-files/{filename}` and
+  prepends `--config /include-files/{filename}` to the scheduler
+  args. The `--config` flag name is fixed; a scheduler that uses a
+  different flag can still take the packed path via `sched_args`,
+  but must tolerate the extra `--config` argument.
+- The config varies per test → `config_file_def = ("--config={file}",
+  "/include-files/my.json")` declares the arg-template + guest-path
+  pair, and each test supplies content via
+  `#[ktstr_test(config = …)]`. The pairing is enforced both ways at
+  compile time — see
+  [Inline scheduler config](ktstr-test-macro.md#inline-scheduler-config).
 
-For richer binary payloads (custom default args, declared
-`MetricCheck`s, `MetricHint`s, `include_files`), use
-`#[derive(Payload)]` on a marker struct — the derive generates
-the matching `const` via the same non-exhaustive-preserving
-construction path. `tests/common/fixtures.rs` has worked
-examples — `FIO`, `FIO_JSON`, `STRESS_NG`, `SCHBENCH_JSON` —
-suitable as reference shapes to copy.
+Both fields may technically coexist (the `config_file` path is
+always packed and its flag prepended; the inline config is written
+when a test supplies `config = …`), but a two-config launch is
+rarely what anyone wants — pick one.
 
-### Quick reference: `Payload` fields
+## Cgroup parent
 
-The fields are listed here for readers tracing the fixture
-files, not as a license to hand-roll literals. Each is
-populated by `Payload::binary` + the derive's builder methods:
+`cgroup_parent = "/ktstr"` makes guest init create
+`/sys/fs/cgroup/ktstr` (enabling cpuset/cpu controllers on its
+ancestors) before the scheduler starts. It does not pass
+`--cell-parent-cgroup` to the scheduler — a cell-aware scheduler
+that needs the flag must carry it in `sched_args` or per-test
+`extra_sched_args`, and the guest then also creates the directory
+named by the flag. Paths are validated at compile time by
+`CgroupPath`: they must start with `/`, must not be `/` alone, and
+must not contain `..`.
 
-- `name: &'static str` — display name that appears in sidecar
-  JSON, stats tables, and test filtering. Distinct from the
-  binary name (`kind`) so e.g. `SCHBENCH_JSON` can run the
-  same `schbench` binary with a different label.
-- `kind: PayloadKind` — either `Binary(executable_name)` (for
-  test payloads like `schbench`) or `Scheduler(&'static Scheduler)`
-  (the in-memory shape of `Payload::KERNEL_DEFAULT` and similar
-  scheduler-wrapping payloads). Test authors normally do not
-  construct `PayloadKind::Scheduler` directly — the
-  `#[ktstr_test(scheduler = MY_SCHED)]` slot takes the bare
-  `Scheduler` ref without a Payload wrapper.
-- `output: OutputFormat` — how to interpret the payload's
-  stdout/stderr. `ExitCode` (status code only) or `Json` (parse
-  numeric leaves).
-- `default_args: &'static [&'static str]` — CLI args prepended
-  to every invocation. Per-test `ctx.payload(...).args(...)`
-  appends after these.
-- `default_checks: &'static [MetricCheck]` — static assertions
-  applied to the payload's output/exit (`min` / `max` / `range`
-  / `exists` / `exit_code_eq` constructors on `MetricCheck`).
-  Merged with per-test `.checks(...)`.
-- `metrics: &'static [MetricHint]` — declared metrics the
-  payload emits (name, unit, polarity). Drives `list-metrics`
-  and comparison thresholds.
-- `include_files: &'static [&'static str]` — extra files
-  packaged into the guest alongside the binary (config files,
-  datasets).
-- `uses_parent_pgrp: bool` — when true, the payload child
-  inherits the test's process group so the teardown SIGKILL
-  sweep reaches it. Most binaries leave this `false` and are
-  reaped explicitly.
-- `known_flags: Option<&'static [&'static str]>` — optional
-  allow-list of CLI flags the payload accepts; used by the
-  gauntlet-style flag expansion.
+The same validation applies to any `--cell-parent-cgroup` value
+found in `sched_args` / `extra_sched_args` at test setup: empty
+values, bare `/`, relative paths, and a trailing flag with no value
+all panic with an actionable message instead of resolving to (or
+next to) the host cgroup root and corrupting host state.
 
-For an end-to-end workflow from building a scheduler to running
-the gauntlet, see
-[Test a New Scheduler](../recipes/test-new-scheduler.md).
+## Default topology {#default-topology}
+
+`topology = (numa_nodes, llcs, cores_per_llc, threads_per_core)`
+sets the VM topology tests inherit. `Scheduler::named()` defaults to
+`(1, 1, 2, 1)` — a minimal 2-CPU VM. Tests override individual
+dimensions; unset ones still inherit:
+
+```rust,ignore
+// Inherits llcs=2, cores=4 from MITOSIS; overrides threads to 2.
+#[ktstr_test(scheduler = MITOSIS, threads = 2)]
+fn smt_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
+```
+
+## Related test-attribute slots
+
+Two `#[ktstr_test]` attributes complement the scheduler definition:
+`staged_schedulers = [PATH, …]` packs extra scheduler binaries for
+runtime swaps via `Op::ReplaceScheduler` / `Op::AttachScheduler`,
+and `workload_root_cgroup = "/path"` roots workload cgroups
+independently of the scheduler's `cgroup_parent`. Both are
+documented in [the macro reference](ktstr-test-macro.md#execution).
+
+## Payloads {#derive-payload}
+
+Payload authoring — `#[derive(Payload)]`, metric hints, include
+files — lives on its own page:
+[Payloads and Included Files](payloads.md).

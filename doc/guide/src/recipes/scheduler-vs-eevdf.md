@@ -1,6 +1,6 @@
 # Compare a Scheduler vs EEVDF
 
-A standard regression guard for an sched_ext scheduler: does it match (or
+A standard regression guard for a sched_ext scheduler: does it match (or
 beat) the kernel default (EEVDF) on the same workload — not just for
 throughput, but for latency and CPU overhead too? Run the workload under
 the scheduler in one phase, [detach the scheduler](../concepts/ops.md)
@@ -20,16 +20,15 @@ callback receives (the host-side hook that runs after the VM exits):
   periodic-capture pipeline, so throughput works even for
   `--cell-parent-cgroup` schedulers.
 - `VmResult::phase_metric(phase, name)` — any other per-phase metric by
-  its [registry](../concepts/checking.md) name: CPU overhead
-  (`system_time_ns`, `user_time_ns`) and scheduling quality
-  (`avg_imbalance_ratio`, `avg_dsq_depth`). (Wake-latency / run-delay
-  distributions are run-level — `MetricKind::Distribution`, pooled across
-  cgroups into one whole-run value — so they cannot be split into the
-  scheduler phase vs the EEVDF phase; to compare them, run the scheduler
-  and EEVDF as two separate tests and read each run's run-level metric.) All
-  flow through the one
-  per-phase bucket pipeline, so a new metric becomes comparable here the
-  moment it lands in that pipeline.
+  its registry name (see [Checking](../concepts/checking.md)): CPU
+  overhead (`system_time_ns`, `user_time_ns`) and scheduling quality
+  (`avg_imbalance_ratio`, `avg_dsq_depth`). Wake-latency and run-delay
+  distributions are run-level — pooled across cgroups into one whole-run
+  value — so they cannot be split into the scheduler phase vs the EEVDF
+  phase; to compare them, run the scheduler and EEVDF as two separate
+  tests and read each run's run-level metric. Everything else flows
+  through the one per-phase bucket pipeline, so a new metric becomes
+  comparable here the moment it lands in that pipeline.
 
 ```rust,ignore
 use anyhow::{ensure, Result};
@@ -40,6 +39,10 @@ use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{execute_scenario, CgroupDef, HoldSpec, Op, Step};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
+// Built directly rather than via declare_scheduler! so this comparison
+// harness stays out of the verifier sweep (manual consts are not
+// registered for sweeping). Use declare_scheduler! for the scheduler
+// definition you ship.
 const MY_SCHED: Scheduler =
     Scheduler::named("my_sched").binary(SchedulerSpec::Discover("scx_my_sched"));
 
@@ -59,13 +62,10 @@ fn compare_vs_eevdf(result: &VmResult) -> Result<()> {
         "my_sched throughput is {throughput:.2}x EEVDF (below the 0.8x floor)"
     );
 
-    // Scheduling quality: any PER-PHASE metric compares the same way via
-    // phase_metric. Skip the gate when a phase has no reading (None) rather
-    // than failing. (Wake-latency and run-delay distributions are RUN-LEVEL —
-    // MetricKind::Distribution, pooled across cgroups into one whole-run
-    // value — so they are NOT readable via phase_metric and cannot be
-    // attributed to either phase; compare them by running the scheduler and
-    // EEVDF as two separate tests and reading each run's run-level metrics.)
+    // Scheduling quality: any per-phase metric compares the same way via
+    // phase_metric. Skip the gate when a phase has no reading (None)
+    // rather than failing. (Wake-latency / run-delay distributions are
+    // run-level and not readable here — see the reader list above.)
     if let (Some(s), Some(e)) = (
         result.phase_metric(sched, "avg_imbalance_ratio"),
         result.phase_metric(eevdf, "avg_imbalance_ratio"),
@@ -91,7 +91,7 @@ fn compare_vs_eevdf(result: &VmResult) -> Result<()> {
     post_vm = compare_vs_eevdf,
 )]
 fn scheduler_vs_eevdf(ctx: &Ctx) -> Result<AssertResult> {
-    // Persistent Backdrop population: runs across BOTH phases so its
+    // Persistent Backdrop population: runs across both phases so its
     // cumulative counters span the detach.
     let backdrop = Backdrop::new().push_cgroup(CgroupDef::named("cg").workers(4));
     let steps = vec![
@@ -104,6 +104,14 @@ fn scheduler_vs_eevdf(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
+The `0.8x` / `1.5x` / `2.0x` bounds above are illustrative, not
+recommendations. Calibrate yours: run the test a few times with
+generous bounds, note the observed ratios (each `ensure!` message
+prints them; a run's failure output leads with whichever message
+tripped), and set each floor just outside the observed noise band.
+A gate inside the noise band fails honest runs; one far outside it
+never fails at all.
+
 Notes:
 
 - `Op::detach_scheduler()` cleanly hands the workload to the kernel default.
@@ -111,11 +119,15 @@ Notes:
   and the intentional detach is not promoted to a scheduler-died failure.
 - Phases are keyed by `Phase`: `Phase::step(0)` is the first scenario Step,
   `Phase::step(1)` the second. `Phase::BASELINE` is the pre-Step settle
-  window. Use `Phase` rather than the raw stimulus `step_index`, which is
-  1-indexed on the wire.
+  window. Use `Phase` rather than the raw stimulus `step_index`.
 - `phase_metric` returns `None` when a phase has no reading for a metric,
   so gate inside `if let (Some(..), Some(..))` rather than unwrapping —
   a metric that did not populate skips its gate instead of failing the run.
 - For cross-cell **balance** rather than a phase-vs-phase comparison, read
   `result.stats.cgroup_balance_ratio()` in the test body (the test body's
   `AssertResult` carries `stats`).
+
+This test gates scheduler-vs-EEVDF *within one run*. To gate your
+scheduler against its own past self *across commits*, use
+[`cargo ktstr perf-delta`](ab-compare.md) — the two nets catch
+different regressions, and CI wants both.

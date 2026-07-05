@@ -1,100 +1,27 @@
 # Auto-Repro
 
-When a test fails because the scheduler crashes or exits, auto-repro
-boots a second VM with BPF probes attached to capture function arguments
-and struct fields along the scheduling path. Stack functions extracted
-from the crash output seed the probe list; when no crash stack is
-available (e.g. a BPF text error or verifier failure with no backtrace),
-auto-repro falls back to dynamic BPF program discovery in the repro VM.
-
-## How it works
-
-1. **First VM** -- the test runs normally. If the scheduler crashes or
-   exits (BPF error, verifier failure, stall), ktstr captures any stack
-   trace from the scheduler log (COM2) or kernel console (COM1).
-
-2. **Stack extraction** -- function names are parsed from the crash
-   trace when available. BPF program symbols (`bpf_prog_*`) are
-   recognized and their short names extracted. Generic functions
-   (scheduler entry points, spinlocks, syscall handlers, sched_ext
-   exit machinery, BPF trampolines, stack dump helpers) are filtered
-   out. When no stack functions are found, the pipeline continues with
-   an empty probe list.
-
-3. **BPF discovery** -- in the repro VM, ktstr discovers loaded
-   struct_ops programs via libbpf-rs and adds them to the probe list
-   alongside any stack-extracted functions. Their kernel-side callers
-   are added (e.g. `enqueue` -> `do_enqueue_task`) for bridge kprobes.
-   This step ensures probes can capture variable states across the
-   scheduler exit call chain even when the crash produced no
-   extractable stack.
-
-4. **BTF resolution** -- function signatures are resolved from vmlinux
-   BTF (kernel functions) and program BTF (BPF callbacks). Known struct
-   types (task_struct, rq, scx_dispatch_q, etc.) have curated fields
-   resolved to byte offsets. Other struct pointer params have scalar,
-   enum, and cpumask pointer fields auto-discovered from vmlinux or
-   BPF program BTF.
-
-5. **Second VM** -- ktstr boots a new VM and reruns the scenario with
-   BPF probes:
-   - Kprobe skeleton for kernel function entry (uses `bpf_get_func_ip`)
-   - Fentry/fexit skeleton for BPF callbacks and kernel function exit
-     (batched in groups of 4, shares maps via `reuse_fd`). Fexit
-     re-reads struct fields after the function executes, capturing
-     post-mutation state alongside the entry snapshot.
-   - Tracepoint trigger (`tp_btf/sched_ext_exit`) fires inside
-     `scx_claim_exit()` in `kernel/sched/ext.c` after the
-     atomic exit-kind claim succeeds — one-shot per scheduler
-     instance, in the context of the current task at exit time,
-     before the disable work is queued
-
-6. **Stitching** -- the task_struct pointer is read from the trigger
-   event's `bpf_get_current_task()` value. Events with a task_struct
-   parameter are filtered to that pointer; events without a
-   task_struct parameter are retained if their `task_ptr` (from
-   `bpf_get_current_task()` at probe time) matches the triggering
-   task. Events are sorted by timestamp and
-   formatted with decoded field values (cpumask ranges, DSQ names,
-   enqueue flags, etc.) and source locations (DWARF for kernel,
-   line_info for BPF).
-
-7. **Diagnostic tails** -- the last 40 lines of the repro VM's
-   scheduler log (COM2, cycle-collapsed), sched_ext dump (COM1), the
-   freeze-coordinator failure-dump JSON (when an error-class SCX exit
-   fired), and kernel console (COM1) are appended after the probe
-   output when non-empty. A duration line reports total repro VM wall
-   time. When probe data is absent, a crash reproduction status line
-   indicates whether the crash reproduced.
-
-## Requirements
-
-Auto-repro requires a kernel with the `sched_ext_exit` tracepoint
-(used as the probe trigger). Kernels built with `CONFIG_SCHED_CLASS_EXT`
-and tracepoint support include this. If the tracepoint is unavailable,
-auto-repro is skipped and the pipeline diagnostics report the cause.
-
-## Enabling auto-repro
-
-In `#[ktstr_test]`:
-
-```rust,ignore
-#[ktstr_test(auto_repro = true)]
-fn my_test(ctx: &Ctx) -> Result<AssertResult> { ... }
-```
-
-`auto_repro` defaults to `true` in `#[ktstr_test]`.
+The crash log tells you where the scheduler died; auto-repro tells
+you what the state was on the way there. When a test fails because
+the scheduler crashed or exited, ktstr boots a second VM, reruns the
+scenario with BPF probes attached to the functions from the crash
+backtrace, and prints each probed call with decoded arguments and
+struct fields — entry and exit values side by side. The trail
+appears in the `--- auto-repro ---` section of the failure output
+(see [Reading Failure Output](failures.md)); the end-to-end
+debugging story is the
+[Investigate a Crash](../recipes/investigate-crash.md) recipe.
 
 ## Example output
 
-The `bpf_crash_auto_repro_e2e` test triggers a host-initiated crash
-via BPF map write and captures the scheduling path. Probe output shows
-each function with decoded struct fields and source locations. When
-fexit captures post-mutation state, changed fields show an arrow
-(`→`) between entry and exit values:
+The probe dump shows each function with decoded fields and source
+locations (DWARF for kernel functions, BPF line info for callbacks).
+Where fexit captured post-mutation state, changed fields show an
+arrow between entry and exit values:
 
-```text
-ktstr_test 'bpf_crash_auto_repro_e2e' [sched=scx-ktstr] [topo=1n1l4c1t] failed:
+<!-- captured: prior run of ktstr/bpf_crash_auto_repro_e2e against a sched_ext_exit-patched kernel; format pinned by src/probe/output.rs | ktstr 0.23.0 -->
+<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr test — auto-repro trail after a scheduler crash</span></div>
+
+<pre>ktstr_test 'bpf_crash_auto_repro_e2e' [sched=scx-ktstr] [topo=1n1l4c1t] failed:
   scheduler process died unexpectedly during workload (2.0s into test)
 
 --- auto-repro ---
@@ -117,82 +44,106 @@ ktstr_test 'bpf_crash_auto_repro_e2e' [sched=scx-ktstr] [topo=1n1l4c1t] failed:
     task_struct *p
       pid         97
       cpus_ptr    0xf(0-3)
-      dsq_id      SCX_DSQ_INVALID          →  SCX_DSQ_LOCAL
+      <span class="t-grn">dsq_id      SCX_DSQ_INVALID          →  SCX_DSQ_LOCAL</span>
       enq_flags   NONE
-      slice       20000000
+      <span class="t-grn">slice       20000000</span>
       vtime       0
       weight      100
       sticky_cpu  -1
-      scx_flags   QUEUED|DEQD_FOR_SLEEP    →  QUEUED
+      <span class="t-grn">scx_flags   QUEUED|DEQD_FOR_SLEEP    →  QUEUED</span></pre></div>
+
+Reading it: the task entered the scheduler's `enqueue` callback with
+`dsq_id = SCX_DSQ_INVALID` (on no dispatch queue) and an expired
+slice. By the time `do_enqueue_task` returned, the task sat on the
+local DSQ (`SCX_DSQ_INVALID → SCX_DSQ_LOCAL`) with a refilled
+default slice (20000000 ns), and the `DEQD_FOR_SLEEP` flag had been
+cleared. That is a healthy enqueue path — captured at the moment
+`scx_exit` fired, so you can see exactly what the scheduler did with
+its last tasks before the error.
+
+After the probe data, the section appends the repro VM's wall time
+and, when non-empty, the last lines of its scheduler log, sched_ext
+dump, failure-dump JSON, and dmesg.
+
+## Enabling it — and what it costs
+
+Auto-repro is on by default for every `#[ktstr_test]` with a
+scheduler. Opt out per test:
+
+```rust,ignore
+#[ktstr_test(scheduler = MY_SCHED, auto_repro = false)]
+fn my_test(ctx: &Ctx) -> Result<AssertResult> { ... }
 ```
 
-After the probe data, the auto-repro section includes the repro VM
-duration and the last 40 lines of the repro VM's scheduler log,
-sched_ext dump, inline failure-dump JSON, and dmesg (each only when
-non-empty).
+It fires only when the primary run fails, and it is disabled
+automatically when `expect_err = true` (no point probing a
+deliberately failing test). The cost is a second VM boot plus a full
+scenario rerun — in the captured demo below, the repro VM added
+about 17 seconds.
 
-## When the primary VM never reached the workload
+## How it works
 
-If the primary VM fails before its scheduler ever attached and the
-workload ever started, the auto-repro VM has nothing to reproduce.
-The framework prepends a `PRIMARY DID NOT REACH WORKLOAD` label to
-the repro verdict so the operator knows the repro is non-load-bearing
-— the bug to chase is in the primary's startup path, not in the
-repro VM's output:
+1. **Stack extraction** — function names are parsed from the crash
+   trace in the scheduler log or kernel console. BPF program symbols
+   (`bpf_prog_*`) are recognized and their short names extracted;
+   generic frames (spinlocks, syscall entry, sched_ext exit
+   machinery, trampolines) are filtered out.
+2. **BPF discovery** — in the repro VM, loaded struct_ops programs
+   are discovered and added to the probe list along with their
+   kernel-side callers (e.g. `enqueue` → `do_enqueue_task`), so the
+   pipeline still probes something when the crash produced no
+   extractable stack.
+3. **BTF resolution** — signatures come from vmlinux BTF and program
+   BTF; known structs (`task_struct`, `rq`, dispatch queues) have
+   curated fields resolved to offsets, and other struct pointers get
+   scalar/enum/cpumask fields auto-discovered.
+4. **Probed rerun** — the second VM reruns the scenario with kprobes
+   on kernel entry, fentry/fexit on BPF callbacks and kernel exits,
+   and a one-shot trigger on the `sched_ext_exit` tracepoint that
+   fires at the moment the exit is claimed.
+5. **Stitching** — events are filtered to the task that triggered the
+   exit, sorted by timestamp, and rendered with decoded values.
 
+If the primary VM failed before the scheduler ever attached and the
+workload ever ran, the repro has nothing to reproduce — the framework
+prepends a `PRIMARY DID NOT REACH WORKLOAD` label to the repro
+verdict so you chase the primary's startup failure (see its
+`--- diagnostics ---` and `--- timeline ---` sections) instead of
+reading the repro as evidence.
+
+## Kernel requirement
+
+The probe *trigger* needs the `sched_ext_exit` tracepoint, which is
+currently only in the sched_ext `for-7.2` development branch — no
+released stable kernel has it. On a kernel without it, the rest of
+the pipeline still runs — the crash call chain is extracted and
+probes are prepared — but the trigger cannot attach and no events are
+captured. The `--- probe pipeline ---` block says exactly that; this
+is the shape to recognize:
+
+<!-- captured: cargo ktstr test --kernel 7.0 -- --features integration,wprof -E 'test(=ktstr/bpf_crash_auto_repro_e2e)' --no-capture (expect_auto_repro demo test) | ktstr 0.23.0 | kernel 7.0.14 -->
 ```text
 --- auto-repro ---
-PRIMARY DID NOT REACH WORKLOAD — auto-repro is not load-bearing (the primary VM's failure prevented the bug from being exercised, so the repro's verdict below should not be read as evidence about bug reproducibility — the bug was never exercised by either run)
-{repro-verdict-line}
+--- probe pipeline ---
+  extracted:   10 functions from crash backtrace
+  traceable:   7 passed, 3 dropped: bpf_prog_1fed99378f3a8055_ktstr_dispatch, bpf__sched_ext_ops_dispatch, ret_from_fork_asm
+  bpf_discover: 0 programs found
+  after_expand: 7 total probe targets
+  kprobes:     0 attached
+  trigger:     attach failed (skeleton load (retry): No such process (os error 3); original error before retry: No such process (os error 3))
+  probe_data:  0 keys, 0 unmatched IPs
+  events:      0 captured, 0 after stitch
+
+repro VM duration: 16.9s
 ```
 
-The label is one long line emitted by the framework before the repro
-VM's verdict; `{repro-verdict-line}` is the repro VM's own pass / fail
-summary (still printed after the label, but the prepended sentence
-warns the operator not to treat it as bug-reproducibility evidence).
-
-Triggers include initramfs build failures, kernel boot panics before
-guest init, scheduler-binary missing inside the guest, and any error
-that fires before `ktstr-init` writes the `sys_rdy` token. The repro
-VM still runs and may emit probe data of its own, but the framework
-suppresses the usual verdict comparison because the primary lacked
-the workload run that any repro would be compared against.
-
-Inspect `--- diagnostics ---` for the VM exit kind and the last
-~20 lines of guest console output, and `--- timeline ---` for the
-init-stage progression — the primary-side failure cause lives there.
+The diagnostic tails (repro VM sched_ext dump, dmesg) are still
+appended, so the repro run remains useful as a crash-reproduction
+check even without probe events.
 
 ## Example test
 
-`bpf_crash_auto_repro_e2e` in `tests/scenario_coverage.rs` drives this
-path end to end: a host BPF-map write sets the scheduler's `crash`
-global, the scheduler calls `scx_bpf_error` and tears down, and the
-auto-repro VM replays it and lands a `.repro.wprof.pb` — inverting the
-verdict to PASS via `expect_auto_repro`. Its shape:
-
-```rust,ignore
-#[cfg(feature = "wprof")]
-#[ktstr_test(
-    scheduler = KTSTR_SCHED,
-    llcs = 1,
-    cores = 4,
-    threads = 1,
-    duration_s = 3,
-    watchdog_timeout_s = 60,
-    wprof,
-    auto_repro = true,
-    expect_auto_repro,
-    bpf_map_write = BPF_CRASH,
-)]
-fn bpf_crash_auto_repro_e2e(ctx: &Ctx) -> Result<AssertResult> {
-    ktstr::scenario::basic::custom_crash_light(ctx)
-}
-```
-
-It requires the `wprof` feature — the `.repro.wprof.pb` artifact that
-satisfies `expect_auto_repro` is written by the wprof binary in the
-auto-repro VM — so run it with that feature enabled:
-
-```sh
-cargo run --bin cargo-ktstr --features wprof -- ktstr test --kernel ../linux -E 'test(bpf_crash_auto_repro_e2e)'
-```
+`bpf_crash_auto_repro_e2e` in ktstr's `tests/scenario_coverage.rs`
+drives the path end to end: a host-side BPF map write sets the
+fixture scheduler's `crash` global, the scheduler calls
+`scx_bpf_error`, and the auto-repro VM replays it.

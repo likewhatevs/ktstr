@@ -1,220 +1,123 @@
-# TestTopology
+# Topology
 
-`TestTopology` provides CPU topology information for test
-configuration. It discovers CPUs, last-level caches (LLCs), and NUMA
-nodes, and generates cpuset partitions for scenarios.
+Schedulers make placement decisions across LLC and NUMA boundaries —
+where to wake a task, when a migration is worth the cache cost. Each
+ktstr test declares the topology those decisions should be tested
+against, and the VM it runs in actually has it: the declared NUMA
+nodes, cache domains, and SMT siblings are what the guest kernel
+sees.
 
-## CPU topology hierarchy
+## The notation
 
-ktstr models four levels of CPU topology, from largest to smallest:
+Topologies render as `{n}n{l}l{c}c{t}t` — NUMA nodes, LLCs, cores per
+LLC, threads per core. One quirk to internalize:
 
-- **NUMA node** -- a memory-proximity domain. Each node is a group of
-  CPUs with fast access to a local memory bank. Cross-node memory
-  access is slower.
-- **LLC** (last-level cache) -- the largest cache shared by a group of
-  cores. LLCs are the key scheduling boundary: tasks sharing an LLC
-  benefit from shared cache lines.
-- **Core** -- a physical execution unit with its own pipeline and L1/L2
-  caches.
-- **Thread** -- an SMT (simultaneous multithreading) sibling. Multiple
-  threads share a single core's execution resources.
+> [!NOTE]
+> The `l` count is the **total** LLC count across the VM, not
+> per-node. `2n4l4c2t` is 2 NUMA nodes and 4 LLCs total (2 per
+> node), 4 cores per LLC, 2 threads per core = 4 × 4 × 2 = 32 vCPUs.
 
-Containment: threads belong to a core, cores belong to an LLC, LLCs
-belong to a NUMA node. The render is `{numa}n{llcs}l{cores}c{threads}t`
-where `llcs` is the **total** count across the VM. So `2n4l4c2t`
-describes 2 NUMA nodes with a total of 4 LLCs (2 LLCs/node), 4
-cores per LLC, 2 threads per core = 2 × 4 × 2 = 16 vCPUs per node ×
-2 nodes = 32 vCPUs total (4 LLCs × 4 cores × 2 threads = 32). A
-smaller worked example: `1n2l4c2t` is 1 × 2 × 4 × 2 = 16 vCPUs.
+Containment is strict — threads in a core, cores in an LLC, LLCs in
+a NUMA node — and guest CPUs are numbered sequentially through it.
+`1n2l4c2t` (16 vCPUs) lays out as:
 
-Most tests use a single NUMA node (the default). NUMA matters when a
-scheduler makes placement decisions based on memory locality.
-Single-NUMA topologies (`numa_nodes = 1`) test scheduling without
-memory-locality effects. Multi-NUMA topologies test whether a
-scheduler keeps tasks close to their memory. See the
-[gauntlet NUMA presets](../running-tests/gauntlet.md#topology-presets)
-for multi-NUMA configurations.
-
-```rust,ignore
-use ktstr::prelude::*;
-
-pub struct TestTopology {
-    // private fields — use the accessors below
-}
+```text
+node 0
+├─ LLC 0                      ├─ LLC 1
+│  ├─ core 0: cpu 0, 1        │  ├─ core 4: cpu 8,  9
+│  ├─ core 1: cpu 2, 3        │  ├─ core 5: cpu 10, 11
+│  ├─ core 2: cpu 4, 5        │  ├─ core 6: cpu 12, 13
+│  └─ core 3: cpu 6, 7        │  └─ core 7: cpu 14, 15
 ```
 
-## Construction
+Most tests use one NUMA node; multi-NUMA topologies matter when the
+scheduler weighs memory locality. The
+[gauntlet](../running-tests/gauntlet.md) sweeps a test across a
+whole preset matrix of these shapes.
 
-**`from_system() -> Result<Self>`** -- reads sysfs
-(`/sys/devices/system/cpu/`) to discover the live topology. Reads LLC
-IDs, NUMA node IDs, core IDs, and cache sizes for each online CPU.
-Also scans `/sys/devices/system/node/` to discover memory-only nodes
-(CXL), reads per-node meminfo and inter-node distances.
+## What a test declares — and what it gets
 
-**`from_vm_topology(topo: &Topology) -> Self`** -- builds a topology
-from a VM spec. `Topology` fields are big-to-little: NUMA nodes,
-last-level caches, cores per LLC, threads per core. Multiple LLCs
-can share a NUMA node when `numa_nodes < llcs`; `llcs` must be an
-exact multiple of `numa_nodes` so LLCs partition evenly across nodes
-(the `declare_scheduler!` macro rejects violations at compile time
-and runtime callers inside ktstr hold the same invariant). CPUs
-numbered sequentially. Populates LLCs, NUMA nodes, distances,
-per-node memory info, and memory-only node flags. Used as a fallback
-when sysfs is incomplete inside a guest VM.
+The `#[ktstr_test]` attributes `numa_nodes`, `llcs`, `cores`,
+`threads` declare the shape (see the
+[macro reference](../writing-tests/ktstr-test-macro.md) for defaults
+and inheritance). The run output echoes the topology the guest
+booted with — the `[topo=...]` tag in failure headers and the
+timeline header:
 
-**`from_vm_topology_with_memory(topo, total_memory_mib) -> Self`** --
-same as `from_vm_topology` but accepts an optional total memory size
-for uniform topologies. When `Some`, divides memory evenly across
-nodes to populate `NodeMemInfo`; when `None`, memory info is omitted.
-
-**`synthetic(num_cpus, num_llcs) -> Self`** (`#[cfg(test)]`-gated; not
-callable from user code) -- creates a topology that distributes the
-CPUs across LLCs with the remainder landing on the last LLC.
-Requires `num_cpus >= num_llcs`. Used only in ktstr's own unit tests.
-
-## Topology queries
-
-**`total_cpus()`** -- total number of CPUs.
-
-**`num_llcs()`** -- number of last-level caches.
-
-**`num_numa_nodes()`** -- number of NUMA nodes.
-
-**`all_cpus() -> &[usize]`** -- all CPU IDs, sorted.
-
-**`all_cpuset() -> BTreeSet<usize>`** -- all CPU IDs as a set.
-
-**`usable_cpus() -> &[usize]`** -- CPUs available for workload
-placement. Reserves the last CPU for the root cgroup (cgroup 0) when
-the topology has more than 2 CPUs. On 8 CPUs: usable = 0-6, CPU 7
-reserved. Most built-in scenarios and `CgroupDef` cpuset specs
-operate on `usable_cpus()` automatically; test authors rarely need
-to query it directly.
-
-**`usable_cpuset() -> BTreeSet<usize>`** -- usable CPUs as a set.
-
-**`llcs() -> &[LlcInfo]`** -- all LLC domains with their CPUs, NUMA
-node, cache size, and core map.
-
-**`cpus_in_llc(idx) -> &[usize]`** -- CPUs belonging to LLC at index.
-
-**`llc_aligned_cpuset(idx) -> BTreeSet<usize>`** -- CPUs in LLC as a set.
-
-**`numa_aligned_cpuset(node) -> BTreeSet<usize>`** -- CPUs in all LLCs
-belonging to NUMA node `node`. Filters LLCs by `numa_node() == node`
-and collects their CPUs.
-
-**`numa_node_ids() -> &BTreeSet<usize>`** -- NUMA node IDs as a
-`BTreeSet`.
-
-**`numa_nodes_for_cpuset(cpus) -> BTreeSet<usize>`** -- NUMA nodes
-covered by the given CPU set. Returns the set of NUMA nodes that
-contain at least one LLC with a CPU in the given set.
-
-**`node_meminfo(node_id) -> Option<&NodeMemInfo>`** -- per-node
-memory info (total and free KiB). Returns `None` when the node ID
-is not present or meminfo is unavailable. `NodeMemInfo` has
-`total_kib`, `free_kib`, and `used_kib()` (saturating subtraction).
-
-**`numa_distance(from, to) -> u8`** -- inter-node NUMA distance.
-Returns 255 when either node ID is not present (matches the kernel's
-unreachable distance). For `from_vm_topology()` topologies without
-explicit distances, returns 10 for local and 20 for remote.
-
-**`is_memory_only(node_id) -> bool`** -- whether the node is
-memory-only (has RAM but no CPUs). Typical for CXL-attached memory
-tiers.
-
-## Ctx cpuset accessors
-
-**`Ctx::cpuset_cpus(&CpusetSpec) -> usize`** -- resolve a
-`CpusetSpec` against the context's topology and return the CPU
-count. Convenience for sizing worker counts proportional to a cpuset
-without computing the topology denominator by hand. The denominator
-is the topology-level cpuset, not any cgroup's currently-effective
-cpuset; for cgroup-aware sizing use
-[`CgroupDef::workers_pct`](ops.md#builder-methods) which resolves
-against the cgroup's own cpuset at apply-setup time.
-
-## Cpuset generation
-
-**`split_by_llc() -> Vec<BTreeSet<usize>>`** -- one set of CPUs per LLC.
-
-**`overlapping_cpusets(n, overlap_frac) -> Vec<BTreeSet<usize>>`** --
-generates `n` cpusets with `overlap_frac` overlap between adjacent
-sets. Available to scenarios that want to hand-build overlapping
-cpusets (e.g. via `CpusetSpec::Exact`); `CpusetSpec::Overlap`
-computes its slice inline rather than calling this helper.
-
-**`cpuset_string(cpus) -> String`** -- formats a CPU set as a compact
-range string (e.g. `"0-3,5,7-9"`). Used when writing `cpuset.cpus`.
-
-## LlcInfo
-
-Each LLC domain is represented by an `LlcInfo`:
-
-```rust,ignore
-pub struct LlcInfo {
-    cpus: Vec<usize>,
-    numa_node: usize,
-    cache_size_kib: Option<u64>,
-    cores: BTreeMap<usize, Vec<usize>>, // core_id -> SMT siblings
-}
+<!-- captured: cargo ktstr test --kernel 7.0 (throughput_gate demo test) | ktstr 0.23.0 | kernel 7.0.14 -->
+```text
+ktstr_test 'throughput_gate' [sched=scx-ktstr] [topo=1n1l2c1t] failed:
+...
+topology: 1n1l2c1t (2 cpus)  scheduler: my_sched  scenario: throughput_gate  duration: 15.0s
 ```
 
-Accessors: `cpus()`, `numa_node()`, `cache_size_kib()`, `cores()`,
-`num_cores()`.
+To see a host's physical layout in the same vocabulary, `ktstr topo`:
 
-`num_cores()` returns the number of physical cores (from the core map),
-or falls back to `cpus.len()` if no core map is populated (synthetic
-topologies).
+<!-- captured: ktstr topo | ktstr 0.23.0 | host, no VM -->
+```text
+CPUs:       64
+LLCs:       4
+NUMA nodes: 1
+  LLC 0 (node 0): [0, 1, 2, 3, 4, 5, 6, 7, 32, 33, 34, 35, 36, 37, 38, 39]
+  LLC 1 (node 0): [8, 9, 10, 11, 12, 13, 14, 15, 40, 41, 42, 43, 44, 45, 46, 47]
+  LLC 2 (node 0): [16, 17, 18, 19, 20, 21, 22, 23, 48, 49, 50, 51, 52, 53, 54, 55]
+  LLC 3 (node 0): [24, 25, 26, 27, 28, 29, 30, 31, 56, 57, 58, 59, 60, 61, 62, 63]
+```
 
-## How scenarios use topology
+(Host CPU numbering differs from the guest's sequential scheme —
+here SMT siblings sit 32 apart — which is exactly why tests declare
+a topology instead of inheriting the host's.)
 
-`TestTopology` is available to scenarios via `Ctx.topo`. The
-`CpusetSpec` variants use topology methods to resolve a cgroup's
-cpuset:
+## Cpusets from topology
 
-| CpusetSpec | Topology method |
-|---|---|
-| `Llc(idx)` | `llc_aligned_cpuset(idx)` |
-| `Numa(node)` | `numa_aligned_cpuset(node)` |
-| `Range { start_frac, end_frac }` | `usable_cpus()` sliced by fraction |
-| `Disjoint { index, of }` | `usable_cpus()` partitioned into `of` equal sets |
-| `Overlap { index, of, frac }` | `usable_cpus()` partitioned with neighbor overlap |
-| `Exact(set)` | no topology resolution (caller-supplied set) |
+Scenarios don't hard-code CPU lists; a
+[`CpusetSpec`](ops.md#cpusetspec) resolves against the test's
+topology at runtime. On `1n2l4c2t`, `CpusetSpec::Llc(0)` resolves to
+CPUs 0-7, so the cgroup's `cpuset.cpus` is written as `0-7`; `Llc`
+and `Numa` cover their full domain, while the fractional and
+partition variants (`Range`, `Disjoint`, `Overlap`) slice the
+usable-CPU pool.
 
-`Llc` confines a cgroup to a single LLC's CPUs; `Numa` spans all
-LLCs in a NUMA node. The fraction- and partition-style variants
-operate on the usable-CPUs pool the host reservation has granted.
+## Querying topology from a scenario {#topology-queries}
 
-See [Ops and Steps](ops.md#cpusetspec) for the full `CpusetSpec` enum.
+`Ctx.topo` is a `TestTopology`. The queries scenario authors
+actually use:
 
-## CPU list parsing
+- `total_cpus()`, `num_llcs()`, `num_numa_nodes()` — sizes, e.g. for
+  skip guards (`if ctx.topo.num_llcs() < 2 { return
+  Ok(AssertResult::skip(...)) }`).
+- `usable_cpus()` / `usable_cpuset()` — CPUs available for workload
+  placement. On topologies with more than 2 CPUs the last CPU is
+  reserved for the root cgroup (on 8 CPUs: usable = 0-6). Built-in
+  scenarios and fractional `CpusetSpec`s use this pool
+  automatically.
+- `llc_aligned_cpuset(idx)` / `numa_aligned_cpuset(node)` — the CPU
+  set of one LLC or one node's LLCs.
+- `numa_nodes_for_cpuset(cpus)` — which nodes a CPU set touches;
+  this derives the expected-node set for
+  [NUMA checks](checking.md#numa-checks).
+- `numa_distance(from, to)` — kernel conventions: 10 local, higher
+  is farther, 255 unreachable/unknown. VM topologies without
+  explicit distances report 10 local / 20 remote.
+- `node_meminfo(node)` / `is_memory_only(node)` — per-node memory
+  and CXL-style memory-only node detection.
 
-Two standalone functions parse CPU list strings:
+`Ctx::cpuset_cpus(&spec)` returns the CPU count a spec resolves to —
+useful for sizing worker counts by hand. Its denominator is the
+topology-level cpuset, not any cgroup's currently-effective one; for
+cgroup-aware sizing prefer
+[`CgroupDef::workers_pct`](ops.md#cpuset-scaled-worker-counts),
+which resolves against the cgroup's own cpuset at apply time.
 
-**`parse_cpu_list(s) -> Result<Vec<usize>>`** -- strict parsing of
-`"0-3,5,7-9"` format. Returns an error on invalid entries.
+The full method catalog (construction, `LlcInfo`, CPU-list parsing)
+is in the
+[`TestTopology` rustdoc](https://ktstr.dev/rustdoc/ktstr/topology/struct.TestTopology.html).
 
-**`parse_cpu_list_lenient(s) -> Vec<usize>`** -- lenient parsing that
-silently skips invalid entries.
+## Related
 
-See also: [CgroupManager](../architecture/cgroup-manager.md) for
-`set_cpuset()` which writes a cgroup cpuset from a `BTreeSet<usize>`,
-[CgroupGroup](../architecture/cgroup-group.md) for RAII cgroup
-management, [WorkloadHandle](../architecture/workload-handle.md) for
-worker lifecycle, [Scenarios](scenarios.md) for how `CpusetSpec`
-drives cpuset partitioning.
-
-## Host-side reservation
-
-`TestTopology::numa_distance` is also consumed at host-side
-`--cpu-cap` plan time: `acquire_llc_plan` uses it to order the
-spill from the seed NUMA node to nearest-by-distance neighbors
-when the CPU budget cannot fit within a single node. The
-resulting plan is a `LOCK_SH` reservation on every selected LLC
-(flock granularity stays per-LLC even when the last LLC is
-partial-taken for the CPU budget) with a `cpuset.mems` union
-written to a cgroup v2 sandbox. See [Resource Budget](resource-budget.md)
-for the full pipeline.
+- [Gauntlet](../running-tests/gauntlet.md) — preset topology
+  matrices and the constraints that filter them.
+- [MemPolicy](mem-policy.md) — NUMA memory placement to pair with
+  multi-node topologies.
+- [Resource Budget](resource-budget.md) — how the host's topology is
+  carved up when tests run concurrently.

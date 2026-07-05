@@ -2,36 +2,52 @@
 
 ktstr tests compose from three layers:
 
-1. **[Scenarios](concepts/scenarios.md)** -- what to test: cgroup
-   layout, CPU partitioning, workloads, custom logic. Composed from
-   `Step`s; each `Step` carries a list of [`Op`s](concepts/ops.md)
-   plus a hold spec.
+1. **[Scenarios](concepts/scenarios.md)** — the scheduling condition
+   the test creates: cgroup layout, CPU partitioning, workloads,
+   mid-run changes.
+2. **[Work types](concepts/work-types.md)** — what each worker
+   process does, each variant targeting a specific kernel scheduling
+   path.
+3. **[Checking](concepts/checking.md)** — how results are judged:
+   starvation, fairness, gaps, monitor thresholds, temporal patterns.
 
-2. **[WorkType](concepts/work-types.md)** -- what each worker
-   process does: CPU spin, yield, I/O, bursty patterns, pipe-based
-   IPC, signal storms, lock contention, page-fault churn, etc.
+One test, all three layers visible:
 
-3. **[Checking](concepts/checking.md)** -- how to evaluate results:
-   starvation, fairness, isolation, scheduling gaps, monitor
-   thresholds, temporal patterns.
+```rust,ignore
+#[ktstr_test(
+    scheduler = MY_SCHED,             // scheduler under test
+    llcs = 2, cores = 4, threads = 1, // topology the VM boots with
+    not_starved = true,               // checking: every worker progressed
+    max_spread_pct = 20.0,            // checking: fairness bound
+)]
+fn steady_two_cells(ctx: &Ctx) -> Result<AssertResult> {
+    scenarios::steady(ctx)  // scenario: 2 cgroups of CPU-spin workers
+                            // (work type: the default SpinWait)
+}
+```
 
-These compose orthogonally. A scenario runs with every valid
-topology and checks apply uniformly across all runs.
+The layers compose orthogonally: the same scenario body runs across
+every topology a [gauntlet](running-tests/gauntlet.md) sweep
+declares, and the checks apply uniformly to every variant.
 
-Five supporting concepts complete the picture:
+Five more concepts round out the picture:
 
-- [Ops and Steps](concepts/ops.md) — the primary API for defining
-  scenarios. Most tests use `CgroupDef` + `execute_defs`; tests that
-  need mid-scenario state changes (snapshot, replace scheduler,
-  read/write kernel memory) compose `Op`s into `Step`s and feed
-  them to `execute_steps` or `execute_scenario`.
-- [TestTopology](concepts/topology.md) — CPU and LLC layout for
-  cpuset partitioning.
-- [MemPolicy](concepts/mem-policy.md) — per-cgroup NUMA memory
-  policy (Bind, Interleave, WeightedInterleave, and more) for
-  tests that exercise the memory policy subsystem.
-- [Performance Mode](concepts/performance-mode.md) — host-side
+- **[Ops, Steps, and Backdrop](concepts/ops.md)** — the API scenarios
+  are built from. Most tests declare cgroups with `CgroupDef`; tests
+  that change state mid-run compose `Op`s into `Step`s.
+- **[Topology](concepts/topology.md)** — the NUMA/LLC/core/thread
+  layout a test declares and the VM actually boots with.
+- **[MemPolicy](concepts/mem-policy.md)** — per-worker NUMA memory
+  placement, for tests that measure memory locality.
+- **[Performance Mode](concepts/performance-mode.md)** — host-side
   isolation for noise-sensitive measurements.
-- [Resource Budget](concepts/resource-budget.md) — the `--cpu-cap`
-  tier that coordinates concurrent no-perf-mode VMs and kernel
-  builds via LLC flocks and cgroup v2 cpuset sandboxes.
+- **[Resource Budget](concepts/resource-budget.md)** — how concurrent
+  VMs and kernel builds share host CPUs safely.
+
+Read [Scenarios](concepts/scenarios.md), [Work
+types](concepts/work-types.md), and [Checking](concepts/checking.md)
+first — every test touches all three. [Ops](concepts/ops.md) matters
+once a canned scenario stops being enough, and
+[Topology](concepts/topology.md) once placement behavior is under
+test. Performance Mode and Resource Budget are operational: read them
+when measurements get noisy or hosts get shared.

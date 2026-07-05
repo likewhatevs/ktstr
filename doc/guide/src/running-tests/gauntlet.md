@@ -1,8 +1,14 @@
 # Gauntlet
 
-The gauntlet runs every test across 24 topology presets (14 on aarch64).
-Gauntlet variants are prefixed with `gauntlet/` and
-ignored by default.
+Some scheduler bugs only exist on topologies you don't develop on: a
+per-LLC work-splitting heuristic that breaks on an odd LLC count, an
+idle-core picker that lands both SMT siblings, a migration policy that
+never crosses a NUMA boundary. The gauntlet expands every
+`#[ktstr_test]` into one variant per topology preset — up to 24
+presets (14 on aarch64) — so those bugs surface as a named, re-runnable
+test case instead of a production report.
+
+Gauntlet variants are prefixed `gauntlet/` and ignored by default:
 
 ```sh
 # Run only base tests (default)
@@ -13,40 +19,40 @@ cargo ktstr test --kernel ../linux -- --run-ignored ignored-only -E 'test(gauntl
 
 # Run everything
 cargo ktstr test --kernel ../linux -- --run-ignored all
-```
 
-Entries with `host_only = true` never produce gauntlet variants
-(topology variation is meaningless without a VM). See
-[`host_only`](../writing-tests/ktstr-test-macro.md#execution) for
-how that flag is set.
-
-## Variant naming
-
-Single-kernel runs name each gauntlet variant
-`gauntlet/{test_name}/{preset}`:
-
-- `{test_name}` -- the `#[ktstr_test]` function name
-- `{preset}` -- one of the topology preset names below
-
-When `--kernel` resolves to two or more kernels (multiple
-`--kernel` flags or a `START..END` range that expands to
-several releases), `cargo ktstr test` / `coverage` /
-`llvm-cov` add the kernel as a third dimension and append a
-`{kernel_label}` suffix:
-`gauntlet/{test_name}/{preset}/{kernel_label}`. See
-[Multi-kernel: kernel as a gauntlet dimension](cargo-ktstr.md#multi-kernel-kernel-as-a-gauntlet-dimension)
-for how the kernel labels are derived (sanitized from the
-resolved version, range expansion, cache key, git source, or
-path basename).
-
-To run a single variant:
-
-```sh
+# Run a single variant
 cargo ktstr test --kernel ../linux -- --run-ignored ignored-only \
   -E 'test(=gauntlet/my_test/smt-2llc)'
 ```
 
+This is what the expansion looks like when nextest lists a test with
+`min_llcs = 1` and default constraints on this host:
+
+<!-- captured: KTSTR_KERNEL=7.0 cargo nextest list --features integration -E 'test(gauntlet/) & binary(worktype_coverage_fork_gauntlet_e2e)' | ktstr 0.23.0 | kernel 7.0.14 -->
+```text
+ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/medium-4llc
+ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/medium-4llc-nosmt
+ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/odd-3llc
+ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/smt-2llc
+ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/smt-3llc
+ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/tiny-1llc
+ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/tiny-2llc
+```
+
+Under a multi-kernel run a `{kernel_label}` segment is appended —
+`gauntlet/{name}/{preset}/{kernel}`. See
+[Test names and variants](../running-tests.md#test-name-shapes) for
+the label format.
+
 ## Topology presets
+
+> [!NOTE]
+> Multi-NUMA and scale-boundary presets are **opt-in**. The default
+> constraints (`max_numa_nodes = 1`, `max_llcs = 12`,
+> `max_cpus = 192`) exclude the five `numa*` presets plus
+> `near-max-llc`, `max-cpu`, and their `-nosmt` variants — 15 of the
+> 24 presets are active by default. Raise `max_numa_nodes`,
+> `max_llcs`, or `max_cpus` on the test to opt in.
 
 | Preset | Topology | CPUs | LLCs | NUMA | Description |
 |---|---|---|---|---|---|
@@ -76,18 +82,14 @@ cargo ktstr test --kernel ../linux -- --run-ignored ignored-only \
 | `numa4-12llc` | 4n12l8c2t | 192 | 12 | 4 | Multi-NUMA, 4 nodes, SMT |
 
 Topology format: `{numa_nodes}n{llcs}l{cores_per_llc}c{threads_per_core}t`
-(e.g. `1n2l4c2t` = 1 NUMA node, 2 LLCs, 4 cores per LLC, 2 threads
-per core = 16 CPUs). Presets are defined in `gauntlet_presets()`.
-Multi-NUMA presets are excluded by default (`max_numa_nodes: Some(1)`
-in `TopologyConstraints::DEFAULT`), as are the scale-boundary
-single-node presets that exceed the default caps `max_llcs: Some(12)`
-/ `max_cpus: Some(192)` — `near-max-llc` and `max-cpu` (240/252 CPUs,
-15/14 LLCs) and their `-nosmt` variants. Tests opt into these presets
-by raising `max_numa_nodes`, `max_llcs`, or `max_cpus` respectively.
+— `1n2l4c2t` is 1 NUMA node, 2 LLCs, 4 cores per LLC, 2 threads per
+core = 16 CPUs. Note that `llcs` is the total across the machine, not
+per node.
 
-> **aarch64:** ARM64 CPUs do not have SMT. Presets with
-> `threads_per_core > 1` are excluded on aarch64, leaving 14 presets
-> (the 5 small presets, 6 `-nosmt` variants, and 3 non-SMT NUMA presets).
+**aarch64:** ARM64 CPUs do not have SMT. Presets with
+`threads_per_core > 1` are excluded on aarch64, leaving 14 presets
+(the 5 small presets, 6 `-nosmt` variants, and 3 non-SMT NUMA
+presets).
 
 ## Constraint filtering
 
@@ -102,28 +104,52 @@ on. A preset is skipped when any constraint is not met:
 - `total_cpus() < min_cpus`
 - `max_cpus` is set and `total_cpus() > max_cpus`
 
-See [Topology Constraints](../writing-tests/ktstr-test-macro.md#topology-constraints)
-for the full attribute table and
-[Gauntlet Tests](../writing-tests/gauntlet-tests.md#worked-example)
-for a worked example showing which presets survive a given constraint
-set.
+See [The #\[ktstr_test\] Attribute](../writing-tests/ktstr-test-macro.md)
+for the attribute table.
 
-## Budget interaction
+## Authoring gauntlet-ready tests {#authoring}
 
-When `KTSTR_BUDGET_SECS` is set, greedy coverage maximization selects
-the most diverse set of test configurations within the time budget.
-Each candidate test is represented as a feature bitset (CPU count
-bucket, LLC count, SMT vs non-SMT, etc.). The selector greedily
-picks tests that cover the most uncovered feature bits per
-estimated second. The result is a mix of base tests and gauntlet
-variants that maximizes configuration diversity within the budget.
+### Worked example
 
-See [Budget-based test selection](../running-tests.md#budget-based-test-selection).
+A test with `min_llcs = 2`, `requires_smt = true`, and default
+`max_numa_nodes = 1` against the preset table above:
 
-## Memory allocation
+- `tiny-1llc` (1 LLC): excluded — below `min_llcs`
+- All non-SMT presets (`tiny-2llc`, `odd-*`, `*-nosmt`):
+  excluded — `requires_smt`
+- `near-max-llc` (15 LLCs): excluded — above default `max_llcs = 12`
+- `max-cpu` (252 CPUs, 14 LLCs): excluded — above default
+  `max_cpus = 192` (also above default `max_llcs = 12`)
+- All `numa*` presets: excluded — above default `max_numa_nodes = 1`
 
-Each gauntlet VM gets `max(topology_mib, initramfs_floor)` MiB of RAM,
-where `topology_mib = max(cpus * 64, 256, entry.memory_mib)` is the
-topology-requested minimum and `initramfs_floor` is computed from
-the actual initramfs size after build. For `max-cpu` (252 CPUs) the
-topology minimum is at least 16128 MiB.
+Result: 6 of 24 presets survive (`smt-2llc`, `smt-3llc`,
+`medium-4llc`, `medium-8llc`, `large-4llc`, `large-8llc`). On
+aarch64, none survive — all aarch64 presets lack SMT.
+
+### Variant count
+
+The total number of gauntlet variants for a test is
+`valid_presets × resolved_kernels`: the 6 surviving presets above
+produce 6 variants under a single kernel and 12 under
+`--kernel A --kernel B`.
+
+### Tests that skip gauntlet
+
+Entries with `host_only = true` never produce gauntlet variants —
+they run on the host without booting a VM, so topology variation
+carries no signal. Tests whose names start with `demo_` are ignored
+by default, gauntlet variants included.
+
+## Operator notes
+
+- **Wall time.** Each variant boots its own VM and runs the full
+  scenario, so a sweep costs roughly (surviving presets × the per-run
+  wall time you observe for the base test). nextest runs variants in
+  parallel within your host's budget. For a coverage-per-second subset
+  under a deadline, use
+  [budget-based selection](../running-tests.md#budget-based-test-selection).
+- **Memory.** Each gauntlet VM gets
+  `max(cpus × 64 MiB, 256 MiB, entry.memory_mib)` of guest RAM (plus
+  an initramfs-derived floor). For the 252-CPU `max-cpu` presets that
+  is at least 16128 MiB — the host needs that much free memory to run
+  the variant.

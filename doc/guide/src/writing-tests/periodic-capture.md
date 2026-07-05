@@ -1,19 +1,16 @@
 # Periodic Capture
 
-`Op::capture_snapshot` is **on-demand** — the test author picks the moment of
-capture. **Periodic capture** is the cadenced complement: the freeze
-coordinator runs the same capture pipeline as on-demand
-`Op::capture_snapshot` (freeze every vCPU, walk the BPF maps, store
-the report) at evenly-spaced points across the workload window
-without the scenario body asking. The
-result is a time-ordered series of `(report, stats, elapsed_ms)`
-samples that flows naturally into the
-[temporal-assertion](temporal-assertions.md) patterns.
+A single snapshot proves state was right once; scheduler bugs are
+usually about how state *evolves* — a counter that stops advancing,
+utilization that drifts after warmup. **Periodic capture** samples
+guest BPF state on a cadence across the workload window, driven
+entirely by the host: no scenario-code changes, no capture calls in
+the test body. The result is a time-ordered series of samples that
+feeds the [temporal assertion](temporal-assertions.md) patterns.
 
-## Enabling periodic capture
+## Enabling it
 
-Set `num_snapshots = N` on the `#[ktstr_test]` attribute. `N` is the
-number of interior boundaries to fire; `0` (the default) disables
+Set `num_snapshots = N` on the test; `0` (the default) disables
 periodic capture entirely.
 
 ```rust,ignore
@@ -29,96 +26,58 @@ fn paced_capture(ctx: &Ctx) -> Result<AssertResult> {
 
 ## When boundaries fire
 
-The window is the **10 %–90 % slice** of the workload duration,
-anchored at the **first `MSG_TYPE_SCENARIO_START`** the freeze
-coordinator observes. A 10 % pre-buffer at the start (workload
-ramp-up) and a 10 % post-buffer at the end (ramp-down) keep periodic
-samples off transient state.
-
-The remaining 80 % is divided into `N + 1` equal intervals, yielding
-`N` interior boundary points:
-
-| `num_snapshots = N` | Boundary timestamps (relative to scenario start) |
-|---|---|
-| `1` | `0.5·d` (midpoint) |
-| `3` | `0.3·d`, `0.5·d`, `0.7·d` |
-| `N ≥ 2` | `0.1·d + (i+1)·0.8·d / (N+1)` for `i ∈ 0..N` |
-
-For a 10 s workload, `N = 3` produces captures at scenario_start +
+The window is the **10%–90% slice** of the workload duration,
+anchored at the moment the scenario actually starts — VM boot and
+BPF verifier time do not eat the budget. The 10% buffers at each
+end keep samples off ramp-up and ramp-down transients. The
+remaining 80% divides into `N + 1` equal intervals, yielding `N`
+interior boundaries at `0.1·d + (i+1)·0.8·d/(N+1)`. For a 10 s
+workload, `num_snapshots = 3` captures at scenario start +
 {3 s, 5 s, 7 s}.
 
-Anchoring at `MSG_TYPE_SCENARIO_START` means VM boot, BPF verifier
-time, and any other pre-scenario work do NOT eat the budget — every
-boundary lands inside the workload's actual run window.
+The boundary clock is workload time, not wall-clock: a scenario
+pause shifts every un-fired boundary by the pause duration.
 
-`MSG_TYPE_SCENARIO_PAUSE` / `MSG_TYPE_SCENARIO_RESUME` from the guest
-shift every un-fired boundary by the cumulative pause duration. The
-boundary clock is **workload time**, not wall-clock: a guest that
-pauses for `P` ns delays each remaining boundary by `P` ns.
+Two validation rules, enforced when the entry is built:
 
-## Tag namespace
+- **Minimum spacing** — `0.8 · duration / (N + 1) >= 100 ms`.
+  Boundaries closer than that would fire back-to-back with no
+  workload progress between them. Reduce `num_snapshots` or extend
+  `duration_s`.
+- **Bridge cap** — `num_snapshots` cannot exceed 64
+  (`MAX_STORED_SNAPSHOTS`). Validation rejects higher values rather
+  than silently evicting the earliest samples.
 
-Each periodic capture is stored on the host's `SnapshotBridge` under
-`"periodic_NNN"` — zero-padded 3-digit ordinal index, e.g.
-`periodic_000`, `periodic_001`, `periodic_002`. The width is fixed at
-3 digits because the bridge cap (see below) maxes out at
-`MAX_STORED_SNAPSHOTS` (= 64 today), so 3 digits always suffices.
+## What a capture costs
 
-Periodic tags coexist with on-demand `Op::capture_snapshot` tags and
-watchpoint-fire tags on the same bridge. Use
-[`SampleSeries::periodic_only`](temporal-assertions.md#sampleseries) (or
-`periodic_ref()` for the borrowed equivalent) to filter to the
-periodic timeline before assertions.
+Each boundary runs the same pipeline as an on-demand
+`Op::capture_snapshot`: every vCPU is parked, the BPF maps are
+walked, the report is stored. On a healthy guest the freeze is tens
+of milliseconds (10–100 ms steady state; cold-cache or large
+guest-memory walks push higher). The host watchdog deadline is
+extended by each freeze's duration, so periodic captures do not eat
+the workload's wall-clock budget — but they do briefly stop the
+guest, which is why the spacing floor exists.
 
-## Capture cost
+## Tags and best-effort delivery
 
-Each periodic boundary runs the same capture pipeline that an
-on-demand `Op::capture_snapshot` dispatches:
+Each capture lands on the host `SnapshotBridge` under
+`periodic_NNN` (`periodic_000`, `periodic_001`, …), coexisting with
+on-demand and watchpoint tags on the same bridge — filter with
+`SampleSeries::periodic_only()` before asserting.
 
-1. Every vCPU is parked under `FREEZE_RENDEZVOUS_TIMEOUT` (30 s
-   hard ceiling).
-2. BPF maps are walked.
-3. The dump is serialised to JSON.
-4. The report is stored on the bridge.
-
-On a healthy guest with a typical scheduler-state map size, the
-freeze is tens of milliseconds (10–100 ms steady state; cold-cache
-or large guest-memory walks can push higher). The host-side
-watchdog deadline is **extended by the freeze duration after each
-fire**, so periodic captures do not eat into the workload's
-wall-clock budget.
-
-### Minimum spacing
-
-`KtstrTestEntry::validate` rejects entries where the per-boundary
-interval is below 100 ms — boundaries scheduled closer than that
-would fire back-to-back without any workload progress in between.
-The exact rule: `0.8 · duration / (N + 1) >= 100 ms`. Either
-reduce `num_snapshots` or extend `duration_s` if validation refuses
-the configuration.
-
-### Bridge cap
-
-`num_snapshots` cannot exceed `MAX_STORED_SNAPSHOTS` (= 64).
-Validation rejects higher values rather than silently FIFO-evicting
-the earliest periodic samples. Split into multiple test entries if
-a longer timeline is needed.
-
-## Best-effort delivery
-
-Up to `N` captures fire, but the run-loop stops servicing periodic
-boundaries the moment the kill flag fires. An early VM exit, BSP
-done, rendezvous timeout, or watchdog deadline can cut the periodic
-sequence short. Tests should assert
-`result.periodic_fired >= some_lower_bound` rather than equality:
+Delivery is best-effort: an early VM exit, rendezvous timeout, or
+watchdog deadline can cut the sequence short, and the run loop
+abandons the remainder after 2 consecutive rendezvous timeouts so a
+sustained host overload does not pile up placeholder samples. Under
+KASLR (the default), a boundary that would fire before the guest's
+address slide is published is deferred, not dropped — it fires on
+the next loop iteration. Assert a lower bound on coverage, not
+equality:
 
 ```rust,ignore
 fn check_coverage(result: &VmResult) -> Result<()> {
-    anyhow::ensure!(
-        result.periodic_target == 3,
-        "expected num_snapshots = 3, got {}",
-        result.periodic_target,
-    );
+    anyhow::ensure!(result.periodic_target == 3);
     anyhow::ensure!(
         result.periodic_fired >= 2,
         "too few periodic samples ({}/{})",
@@ -129,46 +88,19 @@ fn check_coverage(result: &VmResult) -> Result<()> {
 }
 ```
 
-`result.periodic_target` mirrors the configured `num_snapshots`;
-`result.periodic_fired` is the count actually serviced (including
-rendezvous-timeout placeholders). The pair lets a test compute
-coverage without re-reading the entry table.
-
-The run-loop additionally **abandons the remaining sequence after 2
-consecutive rendezvous timeouts** and emits a `tracing::warn` naming
-the consecutive-timeout count, so a sustained host overload does
-not pile up dozens of placeholder samples.
-
-**Boundary deferral on missing prereqs.** Each periodic boundary
-gates on three conditions:
-`kern_virt_kaslr_published() && owned_accessor.is_some() &&
-owned_prog_accessor.is_some()`. The `owned_prog_accessor` is an EXTRA
-prerequisite beyond the cold-path ColdOp dispatch (which gates only on
-kaslr-published + `owned_accessor`): the periodic dump's struct_ops
-walker needs the prog accessor to attribute the active scheduler
-across same-binary swaps, so a boundary firing before
-`owned_prog_accessor` adopts would emit a report with empty
-`active_map_kvas` and surface `NoActiveScheduler`.
-Under KASLR-on guests (the default) a boundary that would fire
-before the BSP MSR_LSTAR derive / guest-channel KERN_ADDRS publish
-lands is **deferred** to the next outer-loop iteration so the dump
-runs with the real KASLR slide instead of resolving per-CPU KVAs to
-wrong pages. Boundary anchor times are absolute and pause-adjusted,
-so deferral does not lose samples; the boundary fires once the
-publisher lands.
-
-`Op::capture_snapshot` captures composed by the test author land on the
-same bridge alongside the `periodic_NNN` tags; total bridge
-occupancy is `num_snapshots + user_captures` and the bridge
-FIFO-evicts past `MAX_STORED_SNAPSHOTS`.
+`periodic_target` mirrors the configured `num_snapshots`;
+`periodic_fired` counts boundaries actually serviced (including
+rendezvous-timeout placeholders). When `post_vm` is omitted on a
+periodic-configured test, the macro installs a default callback
+asserting at least one boundary fired with real BPF state.
 
 ## Draining the bridge
 
-The temporal-assertion pipeline runs on the **host**, so the drain
-happens after `vm.run()` returns — typically inside a `post_vm`
-callback. Use
-[`SnapshotBridge::drain_ordered_with_stats`](snapshots.md) to take
-ownership of the captured entries in insertion order:
+The assertion pipeline runs on the host after `vm.run()` returns —
+inside a `post_vm` callback. The recommended path is
+`drain_ordered_with_stats` fed into
+`SampleSeries::from_drained_typed`, which preserves insertion order,
+per-sample stats results, and timestamps:
 
 ```rust,ignore
 use ktstr::prelude::*;
@@ -185,7 +117,7 @@ fn post_vm(result: &VmResult) -> Result<()> {
         "no periodic samples — coordinator never fired",
     );
 
-    // ... walk samples or feed into temporal patterns ...
+    // ... project a field and feed a temporal pattern ...
     Ok(())
 }
 
@@ -197,86 +129,27 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-`drain_ordered_with_stats` returns a `Vec<DrainedSnapshotEntry>` in
-the order `store()` saw inserts. Each entry exposes `tag` (`String`),
-`report` (`FailureDumpReport`), `stats` (`Result<serde_json::Value,
-MissingStatsReason>`), `elapsed_ms` (`Option<u64>`),
-`boundary_offset_ms` (`Option<u64>` — the workload-relative boundary
-offset, `None` for non-periodic / on-demand captures, used by the
-phase-bucket aggregator), and `step_index`
-(`Option<u16>` — the phase stamp, 0 = baseline, 1.. = step ordinal).
-Periodic boundaries land `periodic_000` first, `periodic_NNN` last.
-The FIFO eviction at `MAX_STORED_SNAPSHOTS` drops the oldest tags
-from `order` and `reports` together, so a hot run that overflowed
-the cap returns the most recent `MAX_STORED_SNAPSHOTS` captures in
-insertion order.
+Each drained entry carries the tag, the captured report, the typed
+per-sample stats result (`Err(MissingStatsReason)` when the stats
+request failed or no scheduler stats client was wired), a
+pause-adjusted `elapsed_ms` timestamp, the scheduled
+`boundary_offset_ms`, and the scenario phase stamp (`step_index`).
+The other drain variants drop metadata the temporal pipeline needs —
+see the
+[`SnapshotBridge` rustdoc](https://ktstr.dev/rustdoc/ktstr/scenario/snapshot/struct.SnapshotBridge.html)
+if you need them.
 
-`SampleSeries::from_drained_typed` is the production-path constructor
-that preserves the typed `stats` failure mode. `SampleSeries::from_drained`
-is a test-fixture convenience that takes the legacy tuple shape
-(`Vec<(String, FailureDumpReport, Option<serde_json::Value>, Option<u64>)>`)
-and collapses `None` stats to `MissingStatsReason::NoSchedulerBinary`.
-
-`drain_ordered` (without `_with_stats`) drops the parallel stats /
-elapsed metadata; use it only when the test does not need either.
-`drain` (no ordering, no stats) returns a `HashMap` and loses the
-periodic timeline ordering — avoid for periodic data.
-
-## Sample anatomy
-
-Each drained tuple unpacks into a `Sample<'_>` view (via
-`SampleSeries::iter_samples`):
-
-```rust,ignore
-for sample in series.iter_samples() {
-    let tag: &str          = sample.tag;          // e.g. "periodic_001"
-    let elapsed_ms: Option<u64> = sample.elapsed_ms; // ms since run_start (None if unstamped)
-    let snap: Snapshot<'_> = sample.snapshot;     // BPF state view
-    let stats: Result<&serde_json::Value, &MissingStatsReason>
-                           = sample.stats;         // typed scx_stats result
-    let step_index: Option<u16> = sample.step_index; // phase stamp (0=baseline, 1.. step ordinal)
-    // ...
-}
-```
-
-`elapsed_ms` is **pause-adjusted**: the coordinator subtracts
-cumulative `MSG_TYPE_SCENARIO_PAUSE`/`RESUME` time (and any in-flight
-pause window) before stamping the value. The timestamp is captured
-AFTER the scx_stats request returns (or fails) and BEFORE entering
-the freeze rendezvous, so `elapsed_ms` reflects when the running
-scheduler's stats were observed; BPF state is observed up to
-`FREEZE_RENDEZVOUS_TIMEOUT` later than that anchor.
-
-`stats` is `Err(MissingStatsReason)` when the stats client was not
-wired (`scheduler_binary` is absent → `NoSchedulerBinary`), or the
-per-sample stats request failed (relay rejected, non-zero envelope
-errno, scheduler not yet listening). An `Err` slot surfaces through
-[`SampleSeries::stats`](temporal-assertions.md#projecting-from-scx_stats-json) as a
-`SnapshotError::MissingStats { tag, reason }` per-sample error —
-distinct from in-JSON path misses so the assertion site can branch on the
-cause.
-
-A sample whose underlying `FailureDumpReport` is a placeholder
-(rendezvous timeout fallback) surfaces through
-[`SampleSeries::bpf`](temporal-assertions.md#projecting-from-bpf-state) as a
-`SnapshotError::PlaceholderSample { tag, reason }` per-sample error
-rather than passing a hollow `Snapshot` to the projection closure.
+[Temporal Assertions](temporal-assertions.md) owns the sample
+anatomy and projection surface;
+[Snapshots](snapshots.md#errors-carry-the-fix) owns the per-sample
+error routing (`PlaceholderSample`, `MissingStats`).
 
 ## What to assert
 
-The standard shape is two-stage:
-
-1. **Compose the series** — drain, filter to periodic.
-2. **Project + assert** — pick a column, choose a temporal pattern.
-
-For monotonic counters (BPF `.bss` advancement, scx_stats counter
-fields), [`nondecreasing`](temporal-assertions.md#nondecreasing--strictly_increasing)
-is the canonical choice. For utilisation-style metrics that should
-hold steady once warmup ends,
-[`steady_within`](temporal-assertions.md#steady_withinwarmup_ms-tolerance-f64-only)
-captures the invariant. For "system stabilizes near `target`",
-[`converges_to`](temporal-assertions.md#converges_totarget-tolerance-deadline_ms-f64-only)
-witnesses the convergence.
-
-For the full pattern surface, projection helpers, and failure
-rendering, see [Temporal Assertions](temporal-assertions.md).
+Two stages: compose the series (drain, `periodic_only()`), then
+project a column and pick a pattern. For monotonic counters,
+`nondecreasing` is the canonical choice; for utilization-style
+metrics that should hold once warmup ends, `steady_within`; for
+"stabilizes near a target by a deadline", `converges_to`. The full
+pattern surface, projection helpers, and failure rendering live in
+[Temporal Assertions](temporal-assertions.md).

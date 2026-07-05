@@ -8,30 +8,79 @@ this.
 
 Install [just](https://github.com/casey/just) (`cargo install just`).
 All dev and CI commands are defined in the `justfile` — run
-`just --list` to see available recipes. CI uses the same recipes.
+`just --list` to see every recipe. CI runs the same recipes, so a
+green local run of a recipe is the same check CI applies.
 
-Pre-PR sanity check: run `just lint && just compile-fail && just
-link-check` locally before opening a PR. These mirror the `lint`,
-`compile-fail`, and `docs-link-check` GitHub Actions jobs that run
-on every pull-request (and on pushes to `main`); the heavier `test-x64`,
-`test-arm64`, `coverage-x64`, and `coverage-arm64` jobs run on
-self-hosted KVM runners and don't need to be run locally.
-`just compile-fail` shells `cargo nextest run`, so install
-nextest locally (`cargo install --locked cargo-nextest`) before
-running it.
+### Pre-PR checks (no kernel required)
 
-Doc tooling (needed only when you change `doc/guide/src/` and
-want to validate locally): `mdbook` for `just docs` (runs
-`mdbook build && mdbook test`); `mdbook-linkcheck2` + `lychee`
-for `just link-check` (runs `mdbook build`, then `mdbook test`,
-then `lychee` against the rendered HTML).
+Run these locally before opening a PR — they need no kernel or KVM and
+mirror the `lint`, `compile-fail`, `docs-link-check`, and
+`devdep-isolation` GitHub Actions jobs that run on every pull request
+(and on pushes to `main`):
+
+```
+just lint              # fmt --check, cargo check + clippy (both feature
+                       #   sets), rustdoc-warnings-as-errors
+just compile-fail      # trybuild diagnostic-snapshot fixtures
+just link-check        # guide build + mdbook test + lychee link walk
+just devdep-isolation  # keep ktstr out of a downstream release binary
+```
+
+`just compile-fail` shells `cargo nextest run` and `just
+devdep-isolation` shells `rust-script`, so install both first:
+
+```
+cargo install --locked cargo-nextest rust-script
+```
+
+### Running the test suite (needs KVM)
+
+The `test-x64`, `test-arm64`, `coverage-x64`, and `coverage-arm64` jobs
+boot the integration suite in VMs on self-hosted KVM runners, so they
+are not part of the pre-PR loop. To run them locally you need KVM access
+and `cargo-nextest`. Build a test kernel, then run the suite against it
+— the same two steps CI takes:
+
+```
+just kernel-build 6.14   # CI's matrix pins 6.14 and 7.1
+just test 6.14           # boot the integration suite in VMs
+```
+
+`just test <kernel>` wraps `cargo run --bin cargo-ktstr -- ktstr test
+--kernel <kernel>`, running the suite under nextest's `ci` profile with
+the `integration` feature. A trailing feature (e.g. `just test 6.14
+wprof`) is passed to both the `cargo-ktstr` build and the inner test
+feature list. `just coverage <kernel>` runs the same suite under
+`cargo-llvm-cov` and writes `lcov.info`.
+
+### Git hooks
+
+Optional local hooks live in `.githooks/`; enable them with:
+
+```
+git config core.hooksPath .githooks
+```
+
+`pre-commit` runs `cargo fmt` + clippy; `pre-push` runs `cargo build
+--tests` against the worktree, catching a commit that compiles the
+library but breaks the test build before it reaches shared history.
+Skip either with `--no-verify` when you have a deliberate WIP need.
+
+### Doc tooling
+
+Needed only when you change `doc/guide/src/` and want to validate
+locally: `mdbook` for `just docs` (runs `mdbook build && mdbook test`);
+`mdbook-linkcheck2` + `lychee` for `just link-check` (runs `mdbook
+build`, then `mdbook test`, then `lychee` against the rendered HTML).
+`just book-serve` renders the guide and opens it in a browser for a live
+preview.
 
 ```
 cargo install mdbook mdbook-linkcheck2 lychee --locked
 ```
 
-CI installs these automatically; install them locally only if you
-plan to validate guide changes before pushing.
+CI installs these automatically; install them locally only if you plan
+to validate guide changes before pushing.
 
 ## Compile-fail tests (trybuild)
 
