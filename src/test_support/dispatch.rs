@@ -1793,7 +1793,8 @@ fn workspace_packages() -> &'static std::collections::HashSet<String> {
 /// `Discover(pkg)` scheduler, resolved to an EXISTING path.
 ///
 /// Mirrors the FIRST arm of the Discover resolution cascade in
-/// [`crate::test_support::eval::scheduler::resolve_scheduler`]: the
+/// `eval::scheduler::resolve_scheduler` (private module, not
+/// linkable from here): the
 /// per-name var pointed at an on-disk binary. Used at BOTH verifier cell
 /// EMISSION ([`list_verifier_cells_all`]) and cell RUNTIME
 /// ([`run_verifier_cell_inner`]) so an external Discover scheduler pointed
