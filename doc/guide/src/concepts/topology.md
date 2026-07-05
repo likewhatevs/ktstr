@@ -7,6 +7,44 @@ against, and the VM it runs in actually has it: the declared NUMA
 nodes, cache domains, and SMT siblings are what the guest kernel
 sees.
 
+<div class="kt-figure"><svg width="680" height="250" viewBox="0 0 680 250" role="img" aria-label="Topology 1n2l4c2t: one NUMA node containing two LLCs, each with four cores of two threads">
+  <rect x="8" y="8" width="664" height="234" rx="12" fill="none" stroke="var(--kt-accent)" stroke-width="1.6"/>
+  <text x="24" y="32" font-size="13" fill="var(--kt-accent)" font-weight="700">NUMA node 0</text>
+  <g font-size="10.5" fill="var(--fg)">
+    <rect x="24" y="44" width="308" height="184" rx="10" fill="var(--kt-accent-soft)" stroke="var(--kt-rule)"/>
+    <text x="38" y="66" font-size="12" font-weight="700" opacity=".75">LLC 0</text>
+    <rect x="38" y="78" width="130" height="62" rx="7" fill="var(--bg)" stroke="var(--kt-rule)"/><text x="50" y="96">core 0</text>
+    <rect x="50" y="104" width="46" height="26" rx="4" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width=".7"/><text x="57" y="121" font-size="9.5">cpu 0</text>
+    <rect x="104" y="104" width="46" height="26" rx="4" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width=".7"/><text x="110" y="121" font-size="9.5">cpu 1</text>
+    <rect x="186" y="78" width="130" height="62" rx="7" fill="var(--bg)" stroke="var(--kt-rule)"/><text x="198" y="96">core 1</text>
+    <rect x="198" y="104" width="46" height="26" rx="4" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width=".7"/><text x="205" y="121" font-size="9.5">cpu 2</text>
+    <rect x="252" y="104" width="46" height="26" rx="4" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width=".7"/><text x="258" y="121" font-size="9.5">cpu 3</text>
+    <rect x="38" y="152" width="130" height="62" rx="7" fill="var(--bg)" stroke="var(--kt-rule)"/><text x="50" y="170">core 2</text>
+    <rect x="50" y="178" width="46" height="26" rx="4" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width=".7"/><text x="57" y="195" font-size="9.5">cpu 4</text>
+    <rect x="104" y="178" width="46" height="26" rx="4" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width=".7"/><text x="110" y="195" font-size="9.5">cpu 5</text>
+    <rect x="186" y="152" width="130" height="62" rx="7" fill="var(--bg)" stroke="var(--kt-rule)"/><text x="198" y="170">core 3</text>
+    <rect x="198" y="178" width="46" height="26" rx="4" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width=".7"/><text x="205" y="195" font-size="9.5">cpu 6</text>
+    <rect x="252" y="178" width="46" height="26" rx="4" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width=".7"/><text x="258" y="195" font-size="9.5">cpu 7</text>
+  </g>
+  <g font-size="10.5" fill="var(--fg)" opacity=".5">
+    <rect x="348" y="44" width="308" height="184" rx="10" fill="var(--kt-accent-soft)" stroke="var(--kt-rule)"/>
+    <text x="362" y="66" font-size="12" font-weight="700">LLC 1</text>
+    <rect x="362" y="78" width="130" height="62" rx="7" fill="var(--bg)" stroke="var(--kt-rule)"/><text x="374" y="96">core 4</text>
+    <rect x="374" y="104" width="46" height="26" rx="4" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width=".7"/><text x="381" y="121" font-size="9.5">cpu 8</text>
+    <rect x="428" y="104" width="46" height="26" rx="4" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width=".7"/><text x="434" y="121" font-size="9.5">cpu 9</text>
+    <rect x="510" y="78" width="130" height="62" rx="7" fill="var(--bg)" stroke="var(--kt-rule)"/><text x="522" y="96">core 5</text>
+    <rect x="522" y="104" width="46" height="26" rx="4" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width=".7"/><text x="528" y="121" font-size="9.5">cpu 10</text>
+    <rect x="576" y="104" width="46" height="26" rx="4" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width=".7"/><text x="582" y="121" font-size="9.5">cpu 11</text>
+    <rect x="362" y="152" width="130" height="62" rx="7" fill="var(--bg)" stroke="var(--kt-rule)"/><text x="374" y="170">core 6</text>
+    <rect x="374" y="178" width="46" height="26" rx="4" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width=".7"/><text x="380" y="195" font-size="9.5">cpu 12</text>
+    <rect x="428" y="178" width="46" height="26" rx="4" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width=".7"/><text x="434" y="195" font-size="9.5">cpu 13</text>
+    <rect x="510" y="152" width="130" height="62" rx="7" fill="var(--bg)" stroke="var(--kt-rule)"/><text x="522" y="170">core 7</text>
+    <rect x="522" y="178" width="46" height="26" rx="4" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width=".7"/><text x="528" y="195" font-size="9.5">cpu 14</text>
+    <rect x="576" y="178" width="46" height="26" rx="4" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width=".7"/><text x="582" y="195" font-size="9.5">cpu 15</text>
+  </g>
+</svg></div>
+
+
 ## The notation
 
 Topologies render as `{n}n{l}l{c}c{t}t` — NUMA nodes, LLCs, cores per

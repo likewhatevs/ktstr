@@ -134,3 +134,18 @@ This test gates scheduler-vs-EEVDF *within one run*. To gate your
 scheduler against its own past self *across commits*, use
 [`cargo ktstr perf-delta`](ab-compare.md) — the two nets catch
 different regressions, and CI wants both.
+
+<div class="kt-figure"><svg width="700" height="150" viewBox="0 0 700 150" role="img" aria-label="Two-phase timeline: the same workers run under the scheduler in phase 0, the scheduler detaches mid-run, EEVDF takes over for phase 1, and per-phase metrics compare across the boundary">
+  <path d="M20 96 L 688 96" stroke="var(--fg)" stroke-width="1.4"/>
+  <path d="M681 92 L 688 96 L 681 100" fill="none" stroke="var(--fg)" stroke-width="1.4"/>
+  <rect x="40" y="30" width="290" height="44" rx="9" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.3"/>
+  <text x="60" y="57" font-size="12.5" font-weight="700" fill="var(--kt-accent)">Phase 0 · your scheduler</text>
+  <rect x="366" y="30" width="290" height="44" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.3"/>
+  <text x="386" y="57" font-size="12.5" font-weight="700" fill="var(--fg)" opacity=".8">Phase 1 · EEVDF</text>
+  <path d="M348 24 L 348 104" stroke="var(--fg)" stroke-width="1.2" stroke-dasharray="4 4"/>
+  <text x="248" y="20" font-size="10.5" fill="var(--fg)" font-family="var(--mono-font)">Op::detach_scheduler()</text>
+  <g font-size="10" fill="var(--fg)" opacity=".75">
+    <text x="40" y="120">same cumulative workers across the boundary — counters never reset,</text>
+    <text x="40" y="136">so phase_metric(0) vs phase_metric(1) is a like-for-like delta</text>
+  </g>
+</svg></div>

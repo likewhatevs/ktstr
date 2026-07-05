@@ -89,6 +89,33 @@ The resolved baseline is shortened to the 7-hex form sidecars
 record, and the command bails if it resolves to HEAD (nothing to
 compare).
 
+
+<div class="kt-figure"><svg width="700" height="188" viewBox="0 0 700 188" role="img" aria-label="perf-delta noise-adjust: baseline and HEAD are checked out into scratch dirs, each runs the perf set N times, and the Welch t-test plus min-max band gate decides significance">
+  <defs><marker id="kt-arr2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
+  <g font-size="10.5" fill="var(--fg)">
+    <rect x="10" y="16" width="188" height="60" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.2"/>
+    <text x="26" y="38" font-weight="700" opacity=".85">merge-base(HEAD, main)</text>
+    <text x="26" y="58" opacity=".7" font-family="var(--mono-font)">gix checkout → /tmp</text>
+    <rect x="10" y="106" width="188" height="60" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.2"/>
+    <text x="26" y="128" font-weight="700" opacity=".85">HEAD (dirty snapshotted)</text>
+    <text x="26" y="148" opacity=".7" font-family="var(--mono-font)">gix checkout → /tmp</text>
+    <path d="M200 46 L 262 46" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#kt-arr2)"/>
+    <path d="M200 136 L 262 136" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#kt-arr2)"/>
+    <rect x="266" y="16" width="150" height="60" rx="9" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.2"/>
+    <text x="282" y="42" font-weight="700" fill="var(--kt-accent)">N runs</text>
+    <text x="282" y="60" opacity=".7">KTSTR_PERF_ONLY=1</text>
+    <rect x="266" y="106" width="150" height="60" rx="9" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.2"/>
+    <text x="282" y="132" font-weight="700" fill="var(--kt-accent)">N runs</text>
+    <text x="282" y="150" opacity=".7">KTSTR_PERF_ONLY=1</text>
+    <path d="M418 46 L 470 82" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#kt-arr2)"/>
+    <path d="M418 136 L 470 100" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#kt-arr2)"/>
+    <rect x="474" y="61" width="216" height="60" rx="9" fill="none" stroke="var(--kt-accent)" stroke-width="1.4"/>
+    <text x="490" y="84" font-weight="700" fill="var(--kt-accent)">separated AND material?</text>
+    <text x="490" y="102" opacity=".75">Welch t (α=.05) ∨ disjoint bands;</text>
+    <text x="490" y="116" opacity=".75">abs ∧ rel registry gates</text>
+  </g>
+</svg></div>
+
 A real comparison — one schbench perf test, two commits, on a
 heavily loaded host (which is exactly the noise the gate exists to
 absorb):

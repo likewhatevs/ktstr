@@ -15,6 +15,38 @@ debugging story is the
 
 The probe dump shows each function with decoded fields and source
 locations (DWARF for kernel functions, BPF line info for callbacks).
+
+<div class="kt-figure"><svg width="700" height="206" viewBox="0 0 700 206" role="img" aria-label="Auto-repro cycle: crash in VM 1, host extracts the crash chain and plans probes, replay in VM 2 with the trigger armed, producing the AUTO-PROBE report">
+  <defs><marker id="kt-arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
+  <rect x="10" y="26" width="170" height="120" rx="12" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.4"/>
+  <text x="30" y="52" font-size="12.5" font-weight="700" fill="var(--kt-accent)">VM 1 · scenario</text>
+  <g font-size="10.5" fill="var(--fg)">
+    <text x="30" y="76" opacity=".8">scheduler attached</text>
+    <text x="30" y="94" opacity=".8">workload running</text>
+    <text x="30" y="120" font-weight="700">✗ scheduler error</text>
+  </g>
+  <path d="M182 86 L 248 86" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#kt-arr)"/>
+  <text x="186" y="76" font-size="9.5" fill="var(--fg)" opacity=".7">crash backtrace</text>
+  <rect x="252" y="26" width="180" height="120" rx="12" fill="none" stroke="var(--kt-rule)" stroke-width="1.4" stroke-dasharray="5 4"/>
+  <g font-size="10.5" fill="var(--fg)">
+    <text x="272" y="52" font-size="12.5" font-weight="700" opacity=".8">host</text>
+    <text x="272" y="76" opacity=".8">extract crash chain</text>
+    <text x="272" y="94" opacity=".8">plan kprobes + fentry</text>
+    <text x="272" y="112" opacity=".8">arm tp_btf trigger</text>
+  </g>
+  <path d="M434 86 L 500 86" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#kt-arr)"/>
+  <text x="446" y="76" font-size="9.5" fill="var(--fg)" opacity=".7">replay</text>
+  <rect x="504" y="26" width="186" height="120" rx="12" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.4"/>
+  <g font-size="10.5" fill="var(--fg)">
+    <text x="524" y="52" font-size="12.5" font-weight="700" fill="var(--kt-accent)">VM 2 · probes</text>
+    <text x="524" y="76" opacity=".8">same scenario, probed</text>
+    <text x="524" y="94" opacity=".8">args captured per call</text>
+    <text x="524" y="120" font-weight="700">✓ scx_exit fires trigger</text>
+  </g>
+  <path d="M597 150 L 597 172 L 120 172 L 120 152" stroke="var(--fg)" stroke-width="1.3" fill="none" marker-end="url(#kt-arr)"/>
+  <text x="180" y="192" font-size="11" fill="var(--fg)" font-weight="700" font-family="var(--mono-font)">=== AUTO-PROBE report: entry → exit deltas along the chain ===</text>
+</svg></div>
+
 Where fexit captured post-mutation state, changed fields show an
 arrow between entry and exit values:
 
