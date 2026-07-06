@@ -30,6 +30,37 @@ per-callback invocation counts and mean cost from the guest kernel's
 BPF program-runtime stats; `verdict` is what folds into the test
 result.
 
+
+<div class="kt-figure"><svg width="700" height="220" viewBox="0 0 700 220" role="img" aria-label="The host-side monitor resolves struct offsets from BTF and reads guest memory directly; nothing is injected into the guest">
+  <defs><marker id="kt-arr3" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--kt-accent)"/></marker></defs>
+  <rect x="10" y="14" width="300" height="188" rx="12" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.4"/>
+  <text x="28" y="40" font-size="12.5" font-weight="700" fill="var(--kt-accent)">guest VM · untouched</text>
+  <g font-size="10.5" fill="var(--fg)">
+    <rect x="28" y="54" width="264" height="38" rx="7" fill="var(--bg)" stroke="var(--kt-rule)"/>
+    <text x="42" y="77" font-family="var(--mono-font)">runqueues · DSQs · schedstat</text>
+    <rect x="28" y="100" width="264" height="38" rx="7" fill="var(--bg)" stroke="var(--kt-rule)"/>
+    <text x="42" y="123" font-family="var(--mono-font)">scheduler BPF maps · .bss · arena</text>
+    <rect x="28" y="146" width="264" height="38" rx="7" fill="var(--bg)" stroke="var(--kt-rule)"/>
+    <text x="42" y="169" font-family="var(--mono-font)">task_structs · cgroups</text>
+  </g>
+  <g>
+    <path d="M395 74 L 314 74" stroke="var(--kt-accent)" stroke-width="1.5" marker-end="url(#kt-arr3)"/>
+    <path d="M395 120 L 314 120" stroke="var(--kt-accent)" stroke-width="1.5" marker-end="url(#kt-arr3)"/>
+    <path d="M395 166 L 314 166" stroke="var(--kt-accent)" stroke-width="1.5" marker-end="url(#kt-arr3)"/>
+    <text x="322" y="62" font-size="9.5" fill="var(--fg)" opacity=".65">reads only</text>
+  </g>
+  <rect x="400" y="14" width="290" height="188" rx="12" fill="none" stroke="var(--kt-rule)" stroke-width="1.4"/>
+  <text x="418" y="40" font-size="12.5" font-weight="700" fill="var(--fg)" opacity=".85">host · monitor</text>
+  <g font-size="10.5" fill="var(--fg)">
+    <text x="418" y="70" opacity=".8">BTF resolves struct offsets</text>
+    <text x="418" y="90" opacity=".8">guest memory mapped read-only</text>
+    <text x="418" y="110" opacity=".8">samples on its own clock</text>
+    <text x="418" y="140" font-weight="700">no BPF injected, no guest agent —</text>
+    <text x="418" y="158" font-weight="700">observation cannot perturb</text>
+    <text x="418" y="176" font-weight="700">the scheduler under test</text>
+  </g>
+</svg></div>
+
 ## What it reads
 
 The monitor resolves kernel structure offsets from the guest kernel's

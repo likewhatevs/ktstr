@@ -6,6 +6,39 @@ telemetry (`WorkerReport`) when the workload stops. `WorkloadHandle`
 is the RAII handle that owns their whole lifecycle: spawn → place →
 start → stop and collect → drop.
 
+<div class="kt-figure"><svg width="700" height="300" viewBox="0 0 700 300" role="img" aria-label="Worker and cgroup process model. Inside the guest VM, workers run as fork-mode child processes, each in its own process group (pid = pgid), grouped into per-cgroup cpuset boxes. Each worker produces a WorkerReport, collected by the host and rolled up per cgroup into stats. At teardown, SIGKILL is delivered to each worker's process group unconditionally — a process-group sweep. A footgun: a child a Custom work function spawns inherits the worker's pgid and is SIGKILLed too unless setpgid detaches it.">
+  <defs><marker id="kt-arr11" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
+  <rect x="14" y="34" width="456" height="212" rx="12" fill="none" stroke="var(--kt-rule)" stroke-width="1.4"/>
+  <text x="30" y="26" font-size="11" font-weight="700" fill="var(--fg)">guest VM</text>
+  <rect x="32" y="54" width="200" height="150" rx="10" fill="var(--kt-accent-soft)" stroke="var(--kt-rule)" stroke-width="1.2"/>
+  <text x="46" y="74" font-size="10.5" font-weight="700" fill="var(--fg)">cg_0 · cpuset</text>
+  <rect x="48" y="84" width="168" height="30" rx="6" fill="var(--bg)" stroke="var(--kt-accent)" stroke-width=".8"/>
+  <text x="60" y="103" font-size="9.5" fill="var(--fg)">worker · pid = pgid</text>
+  <rect x="48" y="120" width="168" height="30" rx="6" fill="var(--bg)" stroke="var(--kt-accent)" stroke-width=".8"/>
+  <text x="60" y="139" font-size="9.5" fill="var(--fg)">worker · pid = pgid</text>
+  <text x="46" y="172" font-size="8.5" fill="var(--fg)" opacity=".7">fork: own tgid → cgroup.procs</text>
+  <text x="46" y="186" font-size="8.5" fill="var(--fg)" opacity=".7">each calls setpgid(0, 0)</text>
+  <rect x="252" y="54" width="200" height="150" rx="10" fill="var(--kt-accent-soft)" stroke="var(--kt-rule)" stroke-width="1.2"/>
+  <text x="266" y="74" font-size="10.5" font-weight="700" fill="var(--fg)">cg_1 · cpuset</text>
+  <rect x="268" y="84" width="168" height="30" rx="6" fill="var(--bg)" stroke="var(--kt-accent)" stroke-width=".8"/>
+  <text x="280" y="103" font-size="9.5" fill="var(--fg)">worker · pid = pgid</text>
+  <rect x="268" y="120" width="168" height="30" rx="6" fill="var(--bg)" stroke="var(--kt-accent)" stroke-width=".8"/>
+  <text x="280" y="139" font-size="9.5" fill="var(--fg)">worker (Custom) · pgid</text>
+  <rect x="286" y="160" width="150" height="26" rx="6" fill="none" stroke="var(--kt-rule)" stroke-width="1.1" stroke-dasharray="4 3"/>
+  <text x="298" y="177" font-size="9" fill="var(--fg)" opacity=".8">child: execv / subshell</text>
+  <path d="M352 150 L 352 158" stroke="var(--fg)" stroke-width="1.1" opacity=".6" marker-end="url(#kt-arr11)"/>
+  <rect x="512" y="70" width="172" height="86" rx="11" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.6"/>
+  <text x="528" y="94" font-size="11" font-weight="700" fill="var(--kt-accent)">host · collector</text>
+  <text x="528" y="112" font-size="9" fill="var(--fg)" opacity=".85">WorkerReport per worker,</text>
+  <text x="528" y="126" font-size="9" fill="var(--fg)" opacity=".85">rolled up per cgroup</text>
+  <text x="528" y="140" font-size="9" fill="var(--fg)" opacity=".85">→ stats</text>
+  <path d="M470 113 L 508 113" stroke="var(--kt-accent)" stroke-width="1.5" marker-end="url(#kt-arr11)"/>
+  <text x="598" y="63" font-size="8.5" fill="var(--kt-accent)" text-anchor="middle">stop_and_collect</text>
+  <line x1="14" y1="256" x2="684" y2="256" stroke="var(--kt-rule)" stroke-width="1"/>
+  <text x="14" y="274" font-size="9.5" fill="var(--fg)" opacity=".8">teardown: SIGKILL → each worker's process group (pgid) — a process-group sweep.</text>
+  <text x="14" y="289" font-size="9.5" fill="var(--fg)" opacity=".8">footgun: a Custom child inherits the worker's pgid and is killed too, unless setpgid detaches it.</text>
+</svg></div>
+
 ## Spawning
 
 ```rust,ignore

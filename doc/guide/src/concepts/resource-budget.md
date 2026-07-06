@@ -41,6 +41,50 @@ nobody else touches those CPUs. Default runs additionally exclude
 each other per CPU, so two default VMs never time-slice the same
 host CPU. Kernel builds take the budgeted path.
 
+<div class="kt-figure"><svg width="700" height="272" viewBox="0 0 700 272" role="img" aria-label="Host LLC lock coordination: a performance-mode run holds whole LLCs under exclusive flock (LOCK_EX) while budgeted no-perf-mode runs share the remaining LLCs under shared flock (LOCK_SH). An exclusive holder blocks every shared acquirer and vice versa; shared holders coexist. Below, when the process cpuset is narrower than the guest vCPU count the CPU budget collapses to it and the host time-slices the vCPU threads.">
+  <defs><marker id="kt-arr8" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
+  <text x="24" y="20" font-size="12.5" font-weight="700" fill="var(--kt-accent)">host — one flock per LLC</text>
+  <rect x="25" y="30" width="310" height="30" rx="8" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.5"/>
+  <text x="40" y="49" font-size="10.5" fill="var(--kt-accent)" font-weight="700">run A · performance_mode</text>
+  <text x="322" y="49" font-size="9.5" fill="var(--kt-accent)" text-anchor="end">LOCK_EX</text>
+  <rect x="345" y="26" width="300" height="19" rx="6" fill="var(--kt-accent-soft)" stroke="var(--kt-rule)" stroke-width="1.2"/>
+  <text x="358" y="39" font-size="9.5" fill="var(--fg)">run B · budgeted</text>
+  <text x="632" y="39" font-size="9" fill="var(--fg)" text-anchor="end" opacity=".8">LOCK_SH</text>
+  <rect x="355" y="46" width="300" height="19" rx="6" fill="var(--kt-accent-soft)" stroke="var(--kt-rule)" stroke-width="1.2"/>
+  <text x="368" y="59" font-size="9.5" fill="var(--fg)">run C · budgeted</text>
+  <text x="642" y="59" font-size="9" fill="var(--fg)" text-anchor="end" opacity=".8">LOCK_SH</text>
+  <path d="M100 60 L 100 106" stroke="var(--kt-accent)" stroke-width="1.3" marker-end="url(#kt-arr8)"/>
+  <path d="M260 60 L 260 106" stroke="var(--kt-accent)" stroke-width="1.3" marker-end="url(#kt-arr8)"/>
+  <path d="M420 65 L 420 106" stroke="var(--fg)" stroke-width="1.2" opacity=".55" marker-end="url(#kt-arr8)"/>
+  <path d="M580 65 L 580 106" stroke="var(--fg)" stroke-width="1.2" opacity=".55" marker-end="url(#kt-arr8)"/>
+  <g fill="var(--fg)">
+    <rect x="25" y="110" width="150" height="52" rx="9" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.6"/>
+    <text x="100" y="133" text-anchor="middle" font-size="11" font-weight="700">LLC 0</text>
+    <text x="100" y="150" text-anchor="middle" font-size="9" fill="var(--kt-accent)">held · exclusive</text>
+    <rect x="185" y="110" width="150" height="52" rx="9" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.6"/>
+    <text x="260" y="133" text-anchor="middle" font-size="11" font-weight="700">LLC 1</text>
+    <text x="260" y="150" text-anchor="middle" font-size="9" fill="var(--kt-accent)">held · exclusive</text>
+    <rect x="345" y="110" width="150" height="52" rx="9" fill="var(--kt-accent-soft)" stroke="var(--kt-rule)" stroke-width="1.3"/>
+    <text x="420" y="133" text-anchor="middle" font-size="11" font-weight="700">LLC 2</text>
+    <text x="420" y="150" text-anchor="middle" font-size="9" opacity=".8">shared · B + C</text>
+    <rect x="505" y="110" width="150" height="52" rx="9" fill="var(--kt-accent-soft)" stroke="var(--kt-rule)" stroke-width="1.3"/>
+    <text x="580" y="133" text-anchor="middle" font-size="11" font-weight="700">LLC 3</text>
+    <text x="580" y="150" text-anchor="middle" font-size="9" opacity=".8">shared · B + C</text>
+  </g>
+  <text x="24" y="184" font-size="9.5" fill="var(--fg)" opacity=".78">Exclusive blocks every shared acquirer and vice versa — shared holders coexist; a perf-mode run waits for release.</text>
+  <line x1="24" y1="200" x2="676" y2="200" stroke="var(--kt-rule)" stroke-width="1"/>
+  <g opacity=".62">
+    <text x="24" y="222" font-size="10.5" font-weight="700" fill="var(--fg)">budget collapse — process cpuset narrower than the guest</text>
+    <rect x="24" y="230" width="150" height="34" rx="8" fill="none" stroke="var(--kt-rule)" stroke-width="1.2"/>
+    <text x="99" y="251" text-anchor="middle" font-size="10" fill="var(--fg)">guest · 16 vCPUs</text>
+    <path d="M176 247 L 232 247" stroke="var(--fg)" stroke-width="1.2" marker-end="url(#kt-arr8)"/>
+    <rect x="236" y="230" width="150" height="34" rx="8" fill="none" stroke="var(--kt-rule)" stroke-width="1.2"/>
+    <text x="311" y="251" text-anchor="middle" font-size="10" fill="var(--fg)">8 allowed host CPUs</text>
+    <text x="400" y="244" font-size="9.5" fill="var(--fg)">2× oversubscription — the host time-slices the vCPU</text>
+    <text x="400" y="257" font-size="9.5" fill="var(--fg)">threads; guest-scheduler measurement is confounded.</text>
+  </g>
+</svg></div>
+
 When the default path cannot map its topology 1:1 onto the host it
 does not fail: if a plan exists but every slot is busy, the run skips
 with `ResourceContention` and nextest retries; if no plan can exist

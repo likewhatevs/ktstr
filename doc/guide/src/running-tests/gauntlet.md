@@ -8,6 +8,35 @@ never crosses a NUMA boundary. The gauntlet expands every
 presets (14 on aarch64) — so those bugs surface as a named, re-runnable
 test case instead of a production report.
 
+<div class="kt-figure"><svg width="700" height="180" viewBox="0 0 700 180" role="img" aria-label="Gauntlet fan-out: one #[ktstr_test] declaration expands to one variant per topology preset; some presets are filtered out by constraints or host budget, and the whole matrix repeats for each --kernel">
+  <defs><marker id="kt-arr5" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
+  <rect x="8" y="70" width="150" height="62" rx="12" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.6"/>
+  <text x="83" y="97" font-size="11.5" font-weight="700" fill="var(--kt-accent)" text-anchor="middle">#[ktstr_test]</text>
+  <text x="83" y="115" font-size="10" fill="var(--fg)" text-anchor="middle" opacity=".8">one declaration</text>
+  <path d="M158 101 L 296 53" stroke="var(--fg)" stroke-width="1.2" fill="none" marker-end="url(#kt-arr5)"/>
+  <path d="M158 101 L 296 91" stroke="var(--fg)" stroke-width="1.2" fill="none" marker-end="url(#kt-arr5)"/>
+  <path d="M158 101 L 296 129" stroke="var(--fg)" stroke-width="1.2" fill="none" marker-end="url(#kt-arr5)"/>
+  <text x="170" y="150" font-size="9.5" fill="var(--fg)" opacity=".7">one variant / preset</text>
+  <g font-size="9.5">
+    <rect x="300" y="40" width="100" height="26" rx="6" fill="var(--kt-accent-soft)" stroke="var(--kt-rule)"/><text x="350" y="57" fill="var(--fg)" text-anchor="middle">tiny-1llc</text>
+    <rect x="410" y="40" width="100" height="26" rx="6" fill="var(--kt-accent-soft)" stroke="var(--kt-rule)"/><text x="460" y="57" fill="var(--fg)" text-anchor="middle">tiny-2llc</text>
+    <rect x="520" y="40" width="100" height="26" rx="6" fill="var(--kt-accent-soft)" stroke="var(--kt-rule)"/><text x="570" y="57" fill="var(--fg)" text-anchor="middle">odd-3llc</text>
+    <rect x="300" y="78" width="100" height="26" rx="6" fill="var(--kt-accent-soft)" stroke="var(--kt-rule)"/><text x="350" y="95" fill="var(--fg)" text-anchor="middle">smt-2llc</text>
+    <rect x="410" y="78" width="100" height="26" rx="6" fill="var(--kt-accent-soft)" stroke="var(--kt-rule)"/><text x="460" y="95" fill="var(--fg)" text-anchor="middle">medium-4llc</text>
+    <rect x="520" y="78" width="100" height="26" rx="6" fill="var(--kt-accent-soft)" stroke="var(--kt-rule)"/><text x="570" y="95" fill="var(--fg)" text-anchor="middle">medium-8llc</text>
+    <rect x="300" y="116" width="100" height="26" rx="6" fill="var(--kt-accent-soft)" stroke="var(--kt-rule)"/><text x="350" y="133" fill="var(--fg)" text-anchor="middle">large-4llc</text>
+    <g opacity=".5">
+      <rect x="410" y="116" width="100" height="26" rx="6" fill="none" stroke="var(--kt-rule)"/><text x="460" y="133" fill="var(--fg)" text-anchor="middle">near-max-llc</text>
+      <line x1="414" y1="140" x2="506" y2="118" stroke="var(--kt-rule)" stroke-width="1"/>
+      <rect x="520" y="116" width="100" height="26" rx="6" fill="none" stroke="var(--kt-rule)"/><text x="570" y="133" fill="var(--fg)" text-anchor="middle">numa2-4llc</text>
+      <line x1="524" y1="140" x2="616" y2="118" stroke="var(--kt-rule)" stroke-width="1"/>
+    </g>
+  </g>
+  <text x="515" y="162" font-size="9.5" fill="var(--fg)" text-anchor="middle" opacity=".7">filtered: constraints / host budget</text>
+  <path d="M640 40 L 646 40 L 646 142 L 640 142" fill="none" stroke="var(--kt-rule)" stroke-width="1.2"/>
+  <text transform="rotate(90 666 91)" x="666" y="91" font-size="10.5" fill="var(--fg)" text-anchor="middle" opacity=".75">× each --kernel</text>
+</svg></div>
+
 Gauntlet variants are prefixed `gauntlet/` and ignored by default:
 
 ```sh
