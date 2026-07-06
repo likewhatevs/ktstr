@@ -159,10 +159,11 @@ cargo ktstr shell -i ./target/debug/scx_my_sched
 
 Inside the guest, run `/include-files/scx_my_sched` manually to
 inspect behavior. Use `--exec CMD` to run a single command
-non-interactively instead. See
-[ktstr (standalone)](../running-tests/ktstr.md) and the
-[cargo ktstr](../running-tests/cargo-ktstr.md) reference for all
-flags, and [Investigate a Crash](investigate-crash.md) for the
+non-interactively instead. See the
+[cargo ktstr](../running-tests/cargo-ktstr.md) reference (and its
+[standalone `ktstr`](../running-tests/cargo-ktstr.md#the-standalone-ktstr-binary)
+section) for all flags, and
+[Investigate a Crash](investigate-crash.md) for the
 crash-report workflow.
 
 ## 7. Write a crash test

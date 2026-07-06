@@ -15,9 +15,7 @@
   - [Scheduler Definitions](writing-tests/scheduler-definitions.md)
   - [Payloads and Included Files](writing-tests/payloads.md)
   - [Custom Scenarios](writing-tests/custom-scenarios.md)
-  - [Snapshots](writing-tests/snapshots.md)
-  - [Watch Snapshots](writing-tests/watch-snapshots.md)
-  - [Periodic Capture](writing-tests/periodic-capture.md)
+  - [Snapshots and Live Capture](writing-tests/snapshots.md)
   - [Temporal Assertions](writing-tests/temporal-assertions.md)
 
 # Running Tests
@@ -33,12 +31,10 @@
 # Core Concepts
 
 - [Core Concepts](concepts.md)
-  - [Scenarios](concepts/scenarios.md)
   - [Ops, Steps, and Backdrop](concepts/ops.md)
   - [Work Types](concepts/work-types.md)
   - [Checking](concepts/checking.md)
   - [Topology](concepts/topology.md)
-  - [MemPolicy](concepts/mem-policy.md)
   - [Performance Mode](concepts/performance-mode.md)
   - [Resource Budget](concepts/resource-budget.md)
 
@@ -60,8 +56,7 @@
   - [VMM](architecture/vmm.md)
   - [Monitor](architecture/monitor.md)
   - [Workers and Workloads](architecture/workers.md)
-  - [CgroupManager](architecture/cgroup-manager.md)
-  - [CgroupGroup](architecture/cgroup-group.md)
+  - [CgroupManager and CgroupGroup](architecture/cgroup-manager.md)
 
 # Reference
 
@@ -69,6 +64,6 @@
 - [Troubleshooting](troubleshooting.md)
 - [Environment Variables](reference/environment-variables.md)
 - [ctprof](reference/ctprof.md)
-- [ktstr (standalone)](running-tests/ktstr.md)
 - [Assertable Metrics](reference/assertable-metrics.md)
+- [Glossary](reference/glossary.md)
 - [API Reference](reference/api.md)

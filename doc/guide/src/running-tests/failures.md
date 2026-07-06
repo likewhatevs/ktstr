@@ -276,7 +276,7 @@ line and the `--- sched_ext dump ---` section.
 5. Poke at the same environment interactively:
    `cargo ktstr shell --test my_test` boots a VM with the test's
    topology, memory, and include files (see
-   [ktstr shell](ktstr.md#shell)).
+   [cargo ktstr shell](cargo-ktstr.md#shell)).
 
 ## Verbosity knobs
 

@@ -72,7 +72,7 @@ affinity, and tears it all down. Canned scenarios grouped by scheduling
 concern — affinity, cpusets, dynamic cgroups, nesting, contention,
 stress — cover the common patterns; the `ops` DSL underneath (`Step`,
 `Op`, `Backdrop`) expresses the rest. See
-[Scenarios](concepts/scenarios.md) and
+[Scenarios](writing-tests.md#scenarios) and
 [Ops, Steps, and Backdrop](concepts/ops.md).
 
 ### 45 work types
@@ -213,9 +213,8 @@ stats at N points across the workload window, from outside the guest.
 Temporal patterns — `nondecreasing`, `rate_within`, `steady_within`,
 `converges_to`, and friends — assert over the whole series; on-demand
 and write-triggered snapshots share the same machinery. See
-[Periodic Capture](writing-tests/periodic-capture.md),
-[Temporal Assertions](writing-tests/temporal-assertions.md), and
-[Snapshots](writing-tests/snapshots.md).
+[Snapshots and Live Capture](writing-tests/snapshots.md) and
+[Temporal Assertions](writing-tests/temporal-assertions.md).
 
 ### Statistical regression detection
 
@@ -295,7 +294,7 @@ See [Auto-Repro](running-tests/auto-repro.md).
 `--include-files` injects host binaries with their shared-library
 closure resolved automatically (recursive `DT_NEEDED` discovery);
 `--exec "cmd"` runs one command non-interactively. For debugging, not
-tests. See [ktstr (standalone)](running-tests/ktstr.md).
+tests. See [the standalone ktstr binary](running-tests/cargo-ktstr.md#the-standalone-ktstr-binary).
 
 ### ctprof
 
@@ -359,7 +358,7 @@ ktstr processes through per-LLC locks — so a kernel build and a
 performance run can share a box without trampling each other.
 `ktstr locks` lists every held lock with its holder. See
 [Resource Budget](concepts/resource-budget.md) and
-[ktstr (standalone)](running-tests/ktstr.md).
+[cargo ktstr locks](running-tests/cargo-ktstr.md#locks).
 
 ### Change-scoped selection
 

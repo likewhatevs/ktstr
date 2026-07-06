@@ -128,7 +128,7 @@ Which placement tool, when:
 | You want to | Use |
 |-------------|-----|
 | Pin one worker to CPUs | `handle.set_affinity(idx, cpus)` |
-| Pin a whole cgroup of workers | [`CgroupGroup::add_cgroup`](cgroup-group.md) (writes `cpuset.cpus` once, RAII-removes on drop) |
+| Pin a whole cgroup of workers | [`CgroupGroup::add_cgroup`](cgroup-manager.md#cgroupgroup) (writes `cpuset.cpus` once, RAII-removes on drop) |
 | A cgroup that outlives the current scope | [`CgroupManager`](cgroup-manager.md) directly |
 
 ## Start and observing progress

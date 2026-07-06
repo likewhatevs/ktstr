@@ -17,6 +17,12 @@ edit-url-template = "https://github.com/likewhatevs/ktstr/edit/main/doc/guide/{p
 "/running-tests/single-scenario.html" = "../running-tests.html"
 "/writing-tests/gauntlet-tests.html" = "../running-tests/gauntlet.html"
 "/architecture/workload-handle.html" = "workers.html"
+"/writing-tests/watch-snapshots.html" = "snapshots.html"
+"/writing-tests/periodic-capture.html" = "snapshots.html"
+"/architecture/cgroup-group.html" = "cgroup-manager.html"
+"/concepts/scenarios.html" = "../writing-tests.html"
+"/concepts/mem-policy.html" = "topology.html"
+"/running-tests/ktstr.html" = "cargo-ktstr.html"
 
 [output.linkcheck2]
 follow-web-links = false

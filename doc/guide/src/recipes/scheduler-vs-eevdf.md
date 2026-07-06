@@ -17,7 +17,7 @@ callback receives (the host-side hook that runs after the VM exits):
 
 - `VmResult::throughput_ratio(a, b)` — iterations/sec from the stimulus
   timeline. The timeline carries per-step boundaries independent of the
-  periodic-capture pipeline, so throughput works even for
+  periodic capture pipeline, so throughput works even for
   `--cell-parent-cgroup` schedulers.
 - `VmResult::phase_metric(phase, name)` — any other per-phase metric by
   its registry name (see [Checking](../concepts/checking.md)): CPU

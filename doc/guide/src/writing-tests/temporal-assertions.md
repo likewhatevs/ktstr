@@ -33,7 +33,7 @@ Every pattern takes `&mut Verdict` and returns it, so assertions
 chain onto one accumulator; each failure records a
 `DetailKind::Temporal` detail, and coverage gaps record `Note`s.
 For enabling capture and draining the bridge, see
-[Periodic Capture](periodic-capture.md) — this page covers
+[Periodic capture](snapshots.md#periodic-capture) — this page covers
 projection and assertion.
 
 ## SampleSeries
@@ -361,6 +361,6 @@ fn dispatch_counter_advances(ctx: &Ctx) -> Result<AssertResult> {
 ```
 
 For capture wiring and `num_snapshots` semantics, see
-[Periodic Capture](periodic-capture.md); for the `Snapshot`
+[Periodic capture](snapshots.md#periodic-capture); for the `Snapshot`
 accessors the projection closures call into, see
-[Snapshots](snapshots.md).
+[Snapshots and Live Capture](snapshots.md).

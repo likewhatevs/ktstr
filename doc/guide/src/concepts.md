@@ -3,7 +3,7 @@
 ktstr tests compose from three layers:
 
 <div class="kt-steps">
-<div class="kt-step" data-step="1"><strong><a href="concepts/scenarios.html">Scenarios</a></strong><p>The condition the test creates: cgroups, CPU partitioning, workloads, and mid-run changes.</p></div>
+<div class="kt-step" data-step="1"><strong><a href="writing-tests.html#scenarios">Scenarios</a></strong><p>The condition the test creates: cgroups, CPU partitioning, workloads, and mid-run changes.</p></div>
 <div class="kt-step" data-step="2"><strong><a href="concepts/work-types.html">Work types</a></strong><p>What each worker process does, with variants aimed at specific scheduler paths.</p></div>
 <div class="kt-step" data-step="3"><strong><a href="concepts/checking.html">Checking</a></strong><p>How results are judged: worker progress, spread, stuck gaps, monitor thresholds, and temporal patterns.</p></div>
 </div>
@@ -32,12 +32,12 @@ Five more concepts round out the picture:
 <div class="kt-doc-grid">
 <div class="kt-doc-card"><strong><a href="concepts/ops.html">Ops, Steps, and Backdrop</a></strong><p>The lower-level API behind scenarios, used when state changes mid-run.</p></div>
 <div class="kt-doc-card"><strong><a href="concepts/topology.html">Topology</a></strong><p>The NUMA/LLC/core/thread layout a test declares and the VM actually boots.</p></div>
-<div class="kt-doc-card"><strong><a href="concepts/mem-policy.html">MemPolicy</a></strong><p>Per-worker NUMA memory placement for locality-sensitive tests.</p></div>
+<div class="kt-doc-card"><strong><a href="concepts/topology.html#memory-policy">MemPolicy</a></strong><p>Per-worker NUMA memory placement for locality-sensitive tests.</p></div>
 <div class="kt-doc-card"><strong><a href="concepts/performance-mode.html">Performance Mode</a></strong><p>Host-side isolation for noise-sensitive measurements.</p></div>
 <div class="kt-doc-card"><strong><a href="concepts/resource-budget.html">Resource Budget</a></strong><p>How concurrent VMs and kernel builds share host CPUs safely.</p></div>
 </div>
 
-Read [Scenarios](concepts/scenarios.md), [Work
+Read [Scenarios](writing-tests.md#scenarios), [Work
 types](concepts/work-types.md), and [Checking](concepts/checking.md)
 first — every test touches all three. [Ops](concepts/ops.md) matters
 once a canned scenario stops being enough, and

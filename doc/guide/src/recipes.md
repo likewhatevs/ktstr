@@ -17,7 +17,7 @@ flag-by-flag detail, the [Running Tests](running-tests.md) chapters.
 > guest-init binary that doubles as a host CLI for a few tools
 > (`ctprof`, `topo`, `locks`). Both install with `cargo install
 > ktstr`. See [cargo ktstr](running-tests/cargo-ktstr.md) and
-> [ktstr (standalone)](running-tests/ktstr.md).
+> [the standalone ktstr binary](running-tests/cargo-ktstr.md#the-standalone-ktstr-binary).
 
 ## Which recipe do I want?
 

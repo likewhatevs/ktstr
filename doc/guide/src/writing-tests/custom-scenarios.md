@@ -69,7 +69,7 @@ fn workers_follow_cpuset_shrink(ctx: &Ctx) -> Result<AssertResult> {
 
 Bind the `CgroupGroup` to a named variable (`_guard`) so the cgroups
 live until end of scope — see
-[CgroupGroup](../architecture/cgroup-group.md) for drop semantics.
+[CgroupGroup](../architecture/cgroup-manager.md#cgroupgroup) for drop semantics.
 Sleeping `ctx.duration` (rather than a hard-coded period) keeps the
 scenario composable with `duration_s = N` overrides and the gauntlet
 budget controller.

@@ -18,7 +18,7 @@ re-exports everything a test author needs.
 |---|---|---|---|
 | Declare a test | `#[ktstr_test]` | [attr.ktstr_test](https://ktstr.dev/rustdoc/ktstr/attr.ktstr_test.html) | [The #\[ktstr_test\] Attribute](../writing-tests/ktstr-test-macro.md) |
 | Declare a scheduler | `declare_scheduler!`, `Scheduler`, `SchedulerSpec` | [macro.declare_scheduler](https://ktstr.dev/rustdoc/ktstr/macro.declare_scheduler.html), [test_support](https://ktstr.dev/rustdoc/ktstr/test_support/index.html) | [Scheduler Definitions](../writing-tests/scheduler-definitions.md) |
-| Drive a scenario | `Ctx`, `scenarios::*` | [scenario](https://ktstr.dev/rustdoc/ktstr/scenario/index.html) | [Scenarios](../concepts/scenarios.md), [Custom Scenarios](../writing-tests/custom-scenarios.md) |
+| Drive a scenario | `Ctx`, `scenarios::*` | [scenario](https://ktstr.dev/rustdoc/ktstr/scenario/index.html) | [Scenarios](../writing-tests.md#scenarios), [Custom Scenarios](../writing-tests/custom-scenarios.md) |
 | Compose steps and ops | `Step`, `Op`, `HoldSpec`, `Backdrop` | [scenario::ops](https://ktstr.dev/rustdoc/ktstr/scenario/ops/index.html) | [Ops, Steps, and Backdrop](../concepts/ops.md) |
 | Shape cgroups and cpusets | `CgroupDef`, `CpusetSpec` | [scenario::ops](https://ktstr.dev/rustdoc/ktstr/scenario/ops/index.html) | [Topology](../concepts/topology.md) |
 | Check results | `Assert`, `AssertResult`, `Verdict`, `claim!` | [assert](https://ktstr.dev/rustdoc/ktstr/assert/index.html) | [Checking](../concepts/checking.md), [Customize Checking](../recipes/custom-checking.md) |

@@ -1,4 +1,4 @@
-# Snapshots
+# Snapshots and Live Capture
 
 Was the scheduler's per-task state right in the middle of the run?
 A **snapshot** answers that: the freeze coordinator pauses every
@@ -14,20 +14,23 @@ was actually there.
 <div class="kt-doc-card"><strong>Periodic</strong><p>Periodic capture turns repeated snapshots into time-series assertions.</p></div>
 </div>
 
-Three capture triggers share this machinery:
+The same freeze-and-render pipeline backs three triggers; they
+differ only in what fires the capture:
 
 | Capture | Trigger | The question it answers |
 |---|---|---|
-| `Op::capture_snapshot` (this page) | a chosen point in the scenario | what does state look like *right now*? |
-| [Watch Snapshots](watch-snapshots.md) | a kernel write to a named symbol | what was state at the instant the kernel touched X? |
-| [Periodic Capture](periodic-capture.md) | evenly spaced boundaries | how does state evolve across the run? |
+| `Op::capture_snapshot` (on demand) | a chosen point in the scenario | what does state look like *right now*? |
+| [Watch snapshots](#watch-snapshots) | a kernel write to a named symbol | what was state at the instant the kernel touched X? |
+| [Periodic capture](#periodic-capture) | evenly spaced boundaries | how does state evolve across the run? |
 
 In a `#[ktstr_test]` scenario the pipeline is wired automatically:
-the op sends a request from the guest to the host coordinator, which
-freezes, captures, and stores the report on the host-side
+the trigger sends a request from the guest to the host coordinator,
+which freezes, captures, and stores the report on the host-side
 `SnapshotBridge`. The test reads captures after the VM exits, in a
-`post_vm` callback. No bridge setup is needed — manual wiring exists
-only for [host-side unit tests](#harness-internals-manual-bridge-wiring).
+`post_vm` callback — every trigger lands on the same bridge and is
+read back through the same accessors. No bridge setup is needed —
+manual wiring exists only for
+[host-side unit tests](#harness-internals-manual-bridge-wiring).
 
 ## Capturing and reading
 
@@ -67,7 +70,8 @@ assertions that depend on it pass vacuously.
 ## The accessor surface
 
 `Snapshot::new(report)` builds a borrowed view; accessors walk the
-report in place.
+report in place. Every capture kind — on-demand, watch, periodic —
+produces the same `Snapshot`, so the surface below reads any of them.
 
 ### Maps and globals
 
@@ -203,38 +207,265 @@ the allocator bridge. The full annotation taxonomy lives in
 
 ## Composing reads with writes
 
-Snapshots are the read half of host↔guest interaction. The write
-half is the `#[ktstr_test]` attribute `bpf_map_write = CONST` — a
-one-shot host-side poke at scheduler-load time:
-
-```rust,ignore
-use ktstr::prelude::*;
-
-const TRIGGER_FAULT: BpfMapWrite = BpfMapWrite::new(".bss", "crash", 1);
-// (map_name_suffix, BPF global variable name, u32 value). The
-// variable's byte offset is resolved from the map's program BTF at
-// write time.
-
-#[ktstr_test(scheduler = MY_SCHED, bpf_map_write = TRIGGER_FAULT, expect_err = true)]
-fn fault_then_inspect(ctx: &Ctx) -> Result<AssertResult> {
-    // The host writes 1 into the scheduler's `crash` global before
-    // workers start; the scheduler reads the flag and reacts.
-    /* Op::capture_snapshot + post_vm read as above */
-    Ok(AssertResult::pass())
-}
-```
-
-The write waits for the scheduler's map to appear, resolves the
-named variable to an offset via BTF, writes the value, and signals
-completion to the guest before workers spawn. Only
-`BPF_MAP_TYPE_ARRAY` maps are supported. A read+write test then
-composes naturally: seed a flag with `bpf_map_write`, run the
-scenario, capture with `Op::capture_snapshot`, assert on the
-scheduler's reaction through the `Snapshot` accessors.
+Snapshots are the read half of host↔guest interaction. The write half
+is the `#[ktstr_test]` attribute
+[`bpf_map_write = CONST`](ktstr-test-macro.md#bpf_map_write) — a
+one-shot host-side poke at a scheduler global at load time, before
+workers spawn. A read+write test composes naturally: seed a flag with
+`bpf_map_write`, run the scenario, capture with `Op::capture_snapshot`,
+and assert on the scheduler's reaction through the `Snapshot`
+accessors.
 
 There is no op for runtime writes — mid-scenario mutation belongs to
 interfaces the scheduler itself exports (sysfs, debugfs, a BPF map
 command interface) driven from a workload process.
+
+## Watch snapshots — live streaming variant {#watch-snapshots}
+
+An on-demand capture fires where *your* scenario says so. A **watch
+snapshot** fires where the *kernel* does:
+`Op::watch_snapshot("symbol")` arms a hardware data-write watchpoint
+on a named kernel symbol, and every guest write to it triggers a full
+snapshot capture, tagged with the symbol name. That answers "what was
+state the instant the kernel touched X" — a state field flipping, a
+counter the scheduler bumps on a specific event.
+
+Watch snapshots are supported on x86_64 and aarch64 KVM hosts; each
+architecture's KVM plumbing maps the slots onto its native
+hardware-watchpoint facility.
+
+```rust,ignore
+use ktstr::prelude::*;
+
+fn read_watch_fires(result: &VmResult) -> anyhow::Result<()> {
+    let drained = result.snapshot_bridge.drain_ordered_with_stats();
+    // Each fire is stored under the symbol name as its tag.
+    let fires = drained.iter().filter(|e| e.tag == "scx_watchdog_timestamp");
+    anyhow::ensure!(fires.count() > 0, "watchpoint never fired");
+    Ok(())
+}
+
+#[ktstr_test(scheduler = MY_SCHED, post_vm = read_watch_fires)]
+fn watch_watchdog_writes(ctx: &Ctx) -> Result<AssertResult> {
+    let steps = vec![
+        Step::with_defs(vec![ctx.cgroup_def("workers")], HoldSpec::FULL)
+            .set_ops(vec![Op::watch_snapshot("scx_watchdog_timestamp")]),
+    ];
+    execute_steps(ctx, steps)
+}
+```
+
+The op registers the symbol with the host coordinator, which resolves
+the address from the vmlinux ELF, arms a free hardware watchpoint slot
+via `KVM_SET_GUEST_DEBUG`, and stores one capture per fire on the
+host-side bridge. Read the fires in `post_vm` through the same
+[accessors](#the-accessor-surface) every capture kind shares. When a
+sidecar dump path is configured for the run, each fire's report is
+also mirrored to a tagged JSON file for post-hoc inspection.
+
+### Choosing a symbol
+
+Production resolution is a verbatim, byte-for-byte match against the
+vmlinux ELF symbol table — no prefix stripping, no BTF lookup, no
+kallsyms walk. Use exactly the name `nm` prints:
+
+```sh
+nm vmlinux | grep -w scx_watchdog_timestamp
+```
+
+A string that matches nothing fails the step with
+`symbol '<name>' not found in vmlinux symtab` (typo, symbol stripped
+from the build, or a non-ELF kernel image).
+
+> [!WARNING]
+> High-frequency symbols soft-lock the guest. Watching a symbol the
+> kernel writes every jiffy (e.g. `jiffies_64` at `HZ=1000`) fires
+> 1000+ captures per second, and each capture freezes all vCPUs for
+> the full dump pipeline. The guest spends almost all of its wall
+> time paused — schedulers stall, watchdogs fire, and the test
+> wedges before any meaningful work runs. Pick symbols the kernel
+> writes at scenario-relevant cadence: a state field, a per-event
+> counter.
+
+### Three watches per scenario
+
+The cap is 3, tied to the hardware watchpoint slots KVM exposes:
+slot 0 is permanently reserved for the `*scx_root->exit_kind`
+trigger that drives the failure-dump pipeline on `SCX_EXIT_ERROR`
+(it always runs, whether or not a scenario declares watches), and
+the remaining three user slots are yours. A fourth
+`Op::watch_snapshot` fails the step with the pinned message:
+
+```text
+Op::WatchSnapshot cap exceeded: scenario already registered 3
+watchpoints (3 user watchpoint slots occupied; slot 0 reserved for
+the error-class exit_kind trigger). Drop a watch or use
+Op::CaptureSnapshot for a time-driven capture instead.
+```
+
+A failed registration — cap exceeded, resolution failure, callback
+error — does not consume a slot; the bridge rolls the count back so
+the scenario can retry with a different symbol.
+
+### Failure modes
+
+Registration is the single point where the production pipeline can
+fail. The callback returns an error when:
+
+- The symbol does not match any vmlinux ELF symtab entry.
+- The resolved address is not 4-byte aligned (the 4-byte watch
+  length requires `addr & 0x3 == 0` on every supported
+  architecture).
+- All three user watchpoint slots are already allocated.
+- `KVM_SET_GUEST_DEBUG` rejected the arm (host kernel limitation).
+
+When registration fails, the executor bails the step immediately
+with the symbol and the reason. Silent degradation is deliberately
+avoided — a watch that never fires would look identical to a
+healthy passing run, and the test author would never notice the
+captures were missing.
+
+## Periodic capture {#periodic-capture}
+
+A single snapshot proves state was right once; scheduler bugs are
+usually about how state *evolves* — a counter that stops advancing,
+utilization that drifts after warmup. **Periodic capture** samples
+guest BPF state on a cadence across the workload window, driven
+entirely by the host: no scenario-code changes, no capture calls in
+the test body. The result is a time-ordered series of samples that
+feeds the [temporal assertion](temporal-assertions.md) patterns.
+
+### Enabling it
+
+Set `num_snapshots = N` on the test; `0` (the default) disables
+periodic capture entirely.
+
+```rust,ignore
+use ktstr::prelude::*;
+
+#[ktstr_test(num_snapshots = 3, duration_s = 10)]
+fn paced_capture(ctx: &Ctx) -> Result<AssertResult> {
+    execute_defs(ctx, vec![
+        CgroupDef::named("workers").workers(2).work_type(WorkType::SpinWait),
+    ])
+}
+```
+
+### When boundaries fire
+
+The window is the **10%–90% slice** of the workload duration,
+anchored at the moment the scenario actually starts — VM boot and
+BPF verifier time do not eat the budget. The 10% buffers at each
+end keep samples off ramp-up and ramp-down transients. The
+remaining 80% divides into `N + 1` equal intervals, yielding `N`
+interior boundaries at `0.1·d + (i+1)·0.8·d/(N+1)`. For a 10 s
+workload, `num_snapshots = 3` captures at scenario start +
+{3 s, 5 s, 7 s}.
+
+The boundary clock is workload time, not wall-clock: a scenario
+pause shifts every un-fired boundary by the pause duration.
+
+Two validation rules, enforced when the entry is built:
+
+- **Minimum spacing** — `0.8 · duration / (N + 1) >= 100 ms`.
+  Boundaries closer than that would fire back-to-back with no
+  workload progress between them. Reduce `num_snapshots` or extend
+  `duration_s`.
+- **Bridge cap** — `num_snapshots` cannot exceed 64
+  (`MAX_STORED_SNAPSHOTS`). Validation rejects higher values rather
+  than silently evicting the earliest samples.
+
+### What a capture costs
+
+Each boundary runs the same freeze pipeline as an on-demand capture.
+On a healthy guest that is tens of milliseconds (10–100 ms steady
+state; cold-cache or large guest-memory walks push higher). The host
+watchdog deadline is extended by each freeze, so periodic captures do
+not eat the workload's wall-clock budget — but they do briefly stop
+the guest, which is why the spacing floor exists.
+
+### Tags and best-effort delivery
+
+Each capture lands on the host `SnapshotBridge` under
+`periodic_NNN` (`periodic_000`, `periodic_001`, …), coexisting with
+on-demand and watchpoint tags on the same bridge — filter with
+`SampleSeries::periodic_only()` before asserting.
+
+Delivery is best-effort: an early VM exit, rendezvous timeout, or
+watchdog deadline can cut the sequence short, and the run loop
+abandons the remainder after 2 consecutive rendezvous timeouts so a
+sustained host overload does not pile up placeholder samples. Under
+KASLR (the default), a boundary that would fire before the guest's
+address slide is published is deferred, not dropped — it fires on
+the next loop iteration. Assert a lower bound on coverage, not
+equality:
+
+```rust,ignore
+fn check_coverage(result: &VmResult) -> Result<()> {
+    anyhow::ensure!(result.periodic_target == 3);
+    anyhow::ensure!(
+        result.periodic_fired >= 2,
+        "too few periodic samples ({}/{})",
+        result.periodic_fired,
+        result.periodic_target,
+    );
+    Ok(())
+}
+```
+
+`periodic_target` mirrors the configured `num_snapshots`;
+`periodic_fired` counts boundaries actually serviced (including
+rendezvous-timeout placeholders). When `post_vm` is omitted on a
+periodic-configured test, the macro installs a default callback
+asserting at least one boundary fired with real BPF state.
+
+### Draining the bridge
+
+The assertion pipeline runs on the host after `vm.run()` returns —
+inside a `post_vm` callback. The recommended path is
+`drain_ordered_with_stats` fed into
+`SampleSeries::from_drained_typed`, which preserves insertion order,
+per-sample stats results, and timestamps:
+
+```rust,ignore
+use ktstr::prelude::*;
+
+fn post_vm(result: &VmResult) -> Result<()> {
+    let series = SampleSeries::from_drained_typed(
+        result.snapshot_bridge.drain_ordered_with_stats(),
+        result.monitor.clone(),
+    )
+    .periodic_only();
+
+    anyhow::ensure!(
+        !series.is_empty(),
+        "no periodic samples — coordinator never fired",
+    );
+
+    // ... project a field and feed a temporal pattern ...
+    Ok(())
+}
+```
+
+Wire it in with `#[ktstr_test(num_snapshots = 3, post_vm = post_vm)]`.
+Each drained entry carries the tag, the captured report, the typed
+per-sample stats result (`Err(MissingStatsReason)` when the stats
+request failed or no scheduler stats client was wired), a
+pause-adjusted `elapsed_ms` timestamp, the scheduled
+`boundary_offset_ms`, and the scenario phase stamp (`step_index`).
+The other drain variants drop metadata the temporal pipeline needs —
+see the
+[`SnapshotBridge` rustdoc](https://ktstr.dev/rustdoc/ktstr/scenario/snapshot/struct.SnapshotBridge.html)
+if you need them.
+
+Then assert in two stages: build the series (drain, `periodic_only()`),
+then project a column and pick a pattern — `nondecreasing` for
+monotonic counters, `steady_within` for utilization-style metrics that
+should hold once warmup ends, `converges_to` for "stabilizes near a
+target by a deadline". [Temporal Assertions](temporal-assertions.md)
+owns the sample anatomy, the full pattern surface, and the projection
+helpers; [Errors carry the fix](#errors-carry-the-fix) above owns the
+per-sample error routing (`PlaceholderSample`, `MissingStats`).
 
 ## Harness internals: manual bridge wiring
 
@@ -261,3 +492,16 @@ let _guard = bridge.set_thread_local();
 drop; bind it to `_guard`, not `let _ =` — the latter drops the
 guard immediately and clears the bridge before any op runs.
 `tests/snapshot_e2e.rs` exercises this pattern end-to-end.
+
+Watch ops need a second callback. A bridge built with only
+`SnapshotBridge::new(cb)` rejects every `Op::watch_snapshot` with an
+error naming the missing wiring; add the register hook:
+
+```rust,ignore
+let reg: WatchRegisterCallback = std::sync::Arc::new(|symbol: &str| {
+    println!("would arm watchpoint on {symbol}");
+    Ok(())
+});
+let bridge = SnapshotBridge::new(cb).with_watch_register(reg);
+let _guard = bridge.set_thread_local();
+```

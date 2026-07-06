@@ -750,7 +750,7 @@ lockfiles because `flock(2)` semantics there are unreliable — see
 
 - `cargo ktstr locks` (or `ktstr locks --watch 1s`) prints every
   ktstr flock currently held on the host with PID + cmdline — see
-  [ktstr (standalone)](running-tests/ktstr.md).
+  [cargo ktstr locks](running-tests/cargo-ktstr.md#locks).
 - `cat /proc/locks | grep '<lockfile-path-from-error>'` falls back to
   the kernel's own flock enumeration when the holder is outside ktstr.
 - `stat -f -c '%T' <runs-root>` reports the filesystem type.

@@ -40,9 +40,9 @@ More patterns:
 ## What's in this chapter
 
 - [cargo ktstr](running-tests/cargo-ktstr.md) — the host-side command:
-  kernel resolution, test dispatch, replay, coverage, export.
-- [ktstr (standalone)](running-tests/ktstr.md) — the debugging
-  companion: interactive VM shells, `topo`, `ctprof`, `locks`.
+  kernel resolution, test dispatch, replay, coverage, export, plus the
+  interactive shell, `topo`, `ctprof`, and `locks` debugging tools
+  (and the standalone `ktstr` binary that carries them without cargo).
 - [Gauntlet](running-tests/gauntlet.md) — run every test across a
   matrix of topology presets.
 - [BPF Verifier Sweep](running-tests/verifier.md) — verify, attach,

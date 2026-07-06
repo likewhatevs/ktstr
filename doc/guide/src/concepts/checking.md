@@ -126,7 +126,7 @@ violation must persist for N consecutive samples before it counts.
 
 ## NUMA checks
 
-For workers with a [`MemPolicy`](mem-policy.md), three thresholds
+For workers with a [`MemPolicy`](topology.md#memory-policy), three thresholds
 gate page placement:
 
 - **`min_page_locality`** — minimum fraction of pages on the

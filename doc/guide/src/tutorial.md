@@ -636,7 +636,7 @@ Each of these builds directly on the test you just wrote.
   captures BPF state at evenly spaced points across the run, and a
   `post_vm` callback asserts temporal patterns over the series
   (nondecreasing counters, bounded rates, convergence). See
-  [Periodic Capture](writing-tests/periodic-capture.md) and
+  [Periodic capture](writing-tests/snapshots.md#periodic-capture) and
   [Temporal Assertions](writing-tests/temporal-assertions.md).
 - **Performance mode.** For benchmark-grade runs, ktstr pins vCPUs
   to reserved host cores and strips host scheduling noise; for

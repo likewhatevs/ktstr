@@ -33,7 +33,7 @@ instead: `cargo build --bin cargo-ktstr`.
 | Analyze results, gate regressions | [`cargo ktstr stats` / `perf-delta`](#stats) | [Runs](runs.md) |
 | Narrow CI to affected schedulers | [`cargo ktstr affected`](#affected) | [CI](../ci.md) |
 | Reproduce a test on bare metal | [`cargo ktstr export`](#export) | this page |
-| Debug interactively in a VM | [`cargo ktstr shell`](#shell) | [ktstr shell](ktstr.md#shell) |
+| Debug interactively in a VM | [`cargo ktstr shell`](#shell) | this page |
 
 ## Common flags {#common-flags}
 
@@ -383,8 +383,9 @@ disabled
 1
 ```
 
-The standalone [`ktstr shell`](ktstr.md#shell) is the same boot flow
-minus the cargo integration (`--test`, raw image paths).
+The [standalone `ktstr shell`](#the-standalone-ktstr-binary) is the
+same boot flow minus the cargo integration (`--test`, raw image
+paths).
 
 ## export
 
@@ -492,8 +493,78 @@ documented with the complete CI workflow in [CI](../ci.md).
 
 ## locks {#locks}
 
-Enumerate every ktstr flock held on this host, read-only, naming
-holder PIDs and cmdlines — the troubleshooting companion when a run
-is blocked behind a peer's reservation. Identical to
-[`ktstr locks`](ktstr.md#locks), where the lock roots and real
-output are documented.
+Enumerate every ktstr flock held on this host — read-only, never
+acquires anything. When a build or test is blocked behind a peer's
+reservation, `cargo ktstr locks` names the peer without disturbing it:
+
+<!-- captured: ktstr locks | ktstr 0.23.0 -->
+```text
+$ ktstr locks
+LLC locks:
+ LLC  NODE  LOCKFILE               HOLDERS
+ 0    0     /tmp/ktstr-llc-0.lock  <none recorded>
+ 1    0     /tmp/ktstr-llc-1.lock  <none recorded>
+...
+
+Run-dir locks:
+ RUN KEY               LOCKFILE                                       HOLDERS
+ 7.0.14-73730e0-dirty  target/ktstr/.locks/7.0.14-73730e0-dirty.lock  <none recorded>
+```
+
+An idle host shows `<none recorded>`; while a lock is held, the
+`HOLDERS` column names the holder's PID and cmdline
+(cross-referenced against `/proc/locks`). Four lock-file roots are
+scanned:
+
+- `{KTSTR_LOCK_DIR}/ktstr-llc-*.lock` (default `/tmp`) — per-LLC
+  reservations held by perf-mode test runs and `--cpu-cap`-bounded
+  builds.
+- `{KTSTR_LOCK_DIR}/ktstr-cpu-*.lock` — per-CPU reservations from
+  the same flow.
+- `{cache_root}/.locks/*.lock` — kernel-cache entry locks held
+  during `kernel build` writes, plus per-source-tree locks held
+  while building from a path.
+- `{runs_root}/.locks/{kernel}-{project_commit}.lock` — sidecar
+  write locks serializing concurrent runs targeting the same run
+  directory.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--json` | off | JSON snapshot (pretty in one-shot mode; ndjson under `--watch`). |
+| `--watch DURATION` | unset | Redraw at the interval until SIGINT (`100ms`, `1s`, `5m`). |
+
+Available identically as the standalone `ktstr locks`. The
+reservation model behind these locks is documented in
+[Resource Budget](../concepts/resource-budget.md).
+
+## The standalone ktstr binary {#the-standalone-ktstr-binary}
+
+`cargo install ktstr` also installs a bare `ktstr` — the same engine
+without the cargo front-end. It is the guest-init binary (it runs as
+PID 1 inside every test VM) that doubles as a host CLI for the tools
+that don't need a cargo project: `ktstr topo`, `ktstr locks`,
+`ktstr ctprof`, `ktstr kernel`, and `ktstr shell`. Each mirrors its
+`cargo ktstr` counterpart.
+
+Reach for it when you are debugging outside a cargo project — poking
+at a kernel you just built, or inspecting a host with no ktstr
+workspace checked out. The common case is `ktstr shell`, an
+interactive KVM VM on any kernel ktstr can resolve:
+
+```sh
+ktstr shell --kernel ../linux
+ktstr shell --kernel 6.14.2 --topology 1,2,4,1
+ktstr shell -i ./my-binary -i strace --exec 'cat /proc/schedstat'
+```
+
+Files passed with `-i` land at `/include-files/<name>` inside the
+guest (directories walked recursively, dynamically-linked ELF
+binaries get their shared-library closure resolved). It takes the
+same [`--kernel`](#common-flags) grammar as `cargo ktstr test`, plus
+`--topology N,L,C,T`, `--memory-mib`, `--disk`, `--dmesg`, and
+`--exec`.
+
+`cargo ktstr` is the primary interface: it resolves kernels from your
+workspace, accepts raw kernel-image paths, and adds `--test NAME` to
+reuse a registered test's exact VM shape. Drop to `ktstr` only when
+you are not inside a project.

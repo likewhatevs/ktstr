@@ -312,7 +312,7 @@ since unpinned numbers would make the gate misfire). See
 workload's 10%–90% window. `0` (default) disables periodic capture.
 Validated against the 64-capture bridge cap, `host_only`, and a
 100 ms minimum boundary spacing. See
-[Periodic Capture](periodic-capture.md).
+[Periodic capture](snapshots.md#periodic-capture).
 
 ### `post_vm` / `post_vm_unconditional`
 

@@ -61,6 +61,5 @@ eliminates observer effects on scheduling decisions.
   and how violations become verdicts.
 - [Workers and Workloads](architecture/workers.md) — worker lifecycle
   and the telemetry each worker reports.
-- [CgroupManager](architecture/cgroup-manager.md) /
-  [CgroupGroup](architecture/cgroup-group.md) — cgroup plumbing and
-  RAII cleanup inside the guest.
+- [CgroupManager and CgroupGroup](architecture/cgroup-manager.md) —
+  cgroup plumbing and RAII cleanup inside the guest.

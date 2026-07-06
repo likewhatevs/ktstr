@@ -129,7 +129,7 @@ Payloads declare their guest-filesystem dependencies on the
 `Payload` itself via `#[include_files(...)]`, instead of relying on
 the CLI `-i` / `--include-files` flag at every invocation. Specs are
 resolved at test time through the same pipeline the CLI flag uses
-(see [ktstr shell](../running-tests/ktstr.md)).
+(see [cargo ktstr shell](../running-tests/cargo-ktstr.md#shell)).
 
 ### Spec shapes
 
