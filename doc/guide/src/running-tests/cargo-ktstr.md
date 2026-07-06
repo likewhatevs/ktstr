@@ -397,9 +397,9 @@ before launching.
 
 ```sh
 cargo ktstr export my_test -o /tmp/my_test.run
-<!-- captured: cargo ktstr export sched_basic_proportional --package ktstr -o /tmp/sched_basic_proportional.run | ktstr 0.23.0 -->
 ```
 
+<!-- captured: cargo ktstr export sched_basic_proportional --package ktstr -o /tmp/sched_basic_proportional.run | ktstr 0.23.0 -->
 ```text
 wrote /tmp/sched_basic_proportional.run (90074903 bytes archive, 0 include files)
 ```
@@ -494,6 +494,6 @@ documented with the complete CI workflow in [CI](../ci.md).
 
 Enumerate every ktstr flock held on this host, read-only, naming
 holder PIDs and cmdlines — the troubleshooting companion when a run
-is stalled behind a peer's reservation. Identical to
+is blocked behind a peer's reservation. Identical to
 [`ktstr locks`](ktstr.md#locks), where the lock roots and real
 output are documented.

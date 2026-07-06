@@ -169,7 +169,7 @@ tables, aggregation rules, and taskstats kconfig gating.
 ### locks
 
 Enumerate every ktstr flock held on this host — read-only, never
-acquires anything. When a build or test stalls behind a peer's
+acquires anything. When a build or test is blocked behind a peer's
 reservation, `ktstr locks` names the peer without disturbing it:
 
 <!-- captured: ktstr locks | ktstr 0.23.0 -->

@@ -315,7 +315,7 @@ request failed), `FieldNotFound` (typo / wrong map), and
 nr_dispatched (nondecreasing): skipped 1 sample(s) with projection errors: \
     periodic_002(+500ms): snapshot has no global variable 'nrdispatch' \
     in any *.bss/*.data/*.rodata map (available globals: ["nr_dispatched", \
-    "stall"])
+    "nr_enqueued"])
 ```
 
 ## Worked example

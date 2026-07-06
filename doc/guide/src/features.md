@@ -154,8 +154,6 @@ iterations are deduplicated so the offending access is readable:
 <span class="t-red">R1 invalid mem access 'scalar'</span>
 processed 186 insns (limit 1000000) max_states_per_insn 0 total_states 7 peak_states 7 mark_read 0</pre></div>
 
-See [BPF Verifier Sweep](running-tests/verifier.md).
-
 ### Bare-metal export
 
 `cargo ktstr export` packages a registered test as a self-extracting

@@ -89,7 +89,7 @@ producers + `epoll_wait` consumers (exclusive autoremove wake).
 one futex word, broadcast-woken.
 
 **Timer and IRQ wakes** (the AF_PACKET variants need
-`#[ktstr_test(network = ...)]`). `TimerLatency { interval_us }` —
+`#[ktstr_test(networks = ...)]`). `TimerLatency { interval_us }` —
 cyclictest-style absolute-deadline hrtimer wake. `NetTraffic` —
 AF_PACKET self-traffic driving virtio-net RX hardirq + NAPI softirq.
 `IrqWake` — paired sender/receiver; the receiver blocked in

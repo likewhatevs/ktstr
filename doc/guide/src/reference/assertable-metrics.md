@@ -23,9 +23,9 @@ enumerates the registry directly, so it never drifts from the code:
 ```sh
 cargo ktstr stats list-metrics          # text table
 cargo ktstr stats list-metrics --json   # machine-readable (includes kind + every field)
-<!-- captured: cargo ktstr stats list-metrics | ktstr 0.23.0 | host-side (no VM) -->
 ```
 
+<!-- captured: cargo ktstr stats list-metrics | ktstr 0.23.0 | host-side (no VM) -->
 ```text
  NAME                                    POLARITY       DEFAULT_ABS  DEFAULT_REL  UNIT
  worst_spread                            lower          5            0.25         %

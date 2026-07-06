@@ -26,7 +26,7 @@ and the `ktstr` package installs `cargo-ktstr` (the cargo plugin
 behind every command in this guide) plus the standalone `ktstr` host
 CLI. The kernel build is a real `make -j$(nproc)` kernel build —
 plan for that once; later runs reuse the cache. On a cached kernel,
-the run shown [below](#run-it) took about 35 seconds end to end.
+the run shown [below](#run-it) took about nine seconds end to end.
 
 The shortest useful test file looks like this:
 
@@ -219,7 +219,7 @@ Reading it:
 - Test names have the shape `crate::binary ktstr/test_name`; the
   `ktstr/` prefix marks the base variant, and the same test also
   generates `gauntlet/` topology variants, skipped by default (see
-  [Running Tests](running-tests.md)). The 34 s covers everything:
+  [Running Tests](running-tests.md)). The 8.6 s covers everything:
   VM boot, scenario, teardown, evaluation.
 - Every run writes a stats sidecar per test under
   `target/ktstr/{kernel}-{commit}/` — the raw material for
