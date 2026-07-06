@@ -129,6 +129,45 @@ Two details worth internalizing:
   stream carries a CRC32, so a corrupted result is detected rather
   than mis-parsed.
 
+<div class="kt-figure"><svg width="700" height="262" viewBox="0 0 700 262" role="img" aria-label="VMM device anatomy. The guest kernel is flanked by two serial ports and five virtio devices. COM1 carries the guest kernel console to host stderr with --dmesg; COM2 carries crash diagnostics only. virtio-console port 0 is the interactive shell console; port 1 is the primary guest-to-host data channel for results, exit codes, scenario markers, metrics, coverage, and scheduler-exit; port 2 relays scx_stats bytes. virtio-blk serves disk-shaped workloads and virtio-net serves network-shaped workloads.">
+  <rect x="268" y="60" width="164" height="150" rx="12" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.7"/>
+  <text x="350" y="128" text-anchor="middle" font-size="13" font-weight="700" fill="var(--kt-accent)">guest</text>
+  <text x="350" y="146" text-anchor="middle" font-size="9.5" fill="var(--fg)" opacity=".8">kernel under test</text>
+  <g fill="var(--fg)">
+    <rect x="20" y="18" width="200" height="46" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.3"/>
+    <text x="34" y="38" font-size="10.5" font-weight="700">COM1 (serial)</text>
+    <text x="34" y="54" font-size="9" opacity=".8">guest kernel console → stderr</text>
+    <rect x="20" y="90" width="200" height="46" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.3"/>
+    <text x="34" y="110" font-size="10.5" font-weight="700">COM2 (serial)</text>
+    <text x="34" y="126" font-size="9" opacity=".8">crash only — PANIC: + backtrace</text>
+    <rect x="20" y="162" width="200" height="46" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.3"/>
+    <text x="34" y="182" font-size="10.5" font-weight="700">virtio-console port 0</text>
+    <text x="34" y="198" font-size="9" opacity=".8">/dev/hvc0 · shell console</text>
+  </g>
+  <rect x="480" y="14" width="204" height="60" rx="9" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.5"/>
+  <text x="494" y="33" font-size="10.5" font-weight="700" fill="var(--kt-accent)">virtio-console port 1</text>
+  <text x="494" y="49" font-size="9" fill="var(--fg)" opacity=".85">primary data: results, exit codes,</text>
+  <text x="494" y="63" font-size="9" fill="var(--fg)" opacity=".85">markers, metrics, coverage, sched-exit</text>
+  <g fill="var(--fg)">
+    <rect x="480" y="86" width="204" height="42" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.3"/>
+    <text x="494" y="105" font-size="10.5" font-weight="700">virtio-console port 2</text>
+    <text x="494" y="120" font-size="9" opacity=".8">scx_stats byte relay</text>
+    <rect x="480" y="140" width="204" height="42" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.3"/>
+    <text x="494" y="159" font-size="10.5" font-weight="700">virtio-blk</text>
+    <text x="494" y="174" font-size="9" opacity=".8">disk-shaped workloads</text>
+    <rect x="480" y="194" width="204" height="42" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.3"/>
+    <text x="494" y="213" font-size="10.5" font-weight="700">virtio-net</text>
+    <text x="494" y="228" font-size="9" opacity=".8">network-shaped workloads</text>
+  </g>
+  <path d="M220 41 L 268 82" stroke="var(--fg)" stroke-width="1.2" opacity=".5"/>
+  <path d="M220 113 L 268 122" stroke="var(--fg)" stroke-width="1.2" opacity=".5"/>
+  <path d="M220 185 L 268 160" stroke="var(--fg)" stroke-width="1.2" opacity=".5"/>
+  <path d="M480 44 L 432 92" stroke="var(--kt-accent)" stroke-width="1.6"/>
+  <path d="M480 107 L 432 122" stroke="var(--fg)" stroke-width="1.2" opacity=".5"/>
+  <path d="M480 161 L 432 152" stroke="var(--fg)" stroke-width="1.2" opacity=".5"/>
+  <path d="M480 215 L 432 188" stroke="var(--fg)" stroke-width="1.2" opacity=".5"/>
+</svg></div>
+
 ## Performance mode
 
 When performance mode is enabled, the VMM applies host-side isolation

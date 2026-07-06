@@ -208,6 +208,43 @@ terminal verdict is the fold over all of them, most severe first:
 | `Inconclusive` | the assertion ran but had no signal to evaluate |
 | `Skip` | the scenario couldn't run (unmet precondition) |
 
+<div class="kt-figure"><svg width="700" height="216" viewBox="0 0 700 216" role="img" aria-label="Verdict lattice and its projection to process exit codes. A result's terminal verdict is the fold over all outcomes, most severe first: Fail, then Inconclusive, then Pass, then Skip. Default projection: Fail exits 1, Inconclusive exits 2, and Pass and Skip exit 0. Two modifiers bend the mapping: expect_err makes a clean Pass exit 1, and allow_inconclusive makes an Inconclusive exit 0; under --no-skip-mode a Skip exits 1 instead of 0.">
+  <defs><marker id="kt-arr9" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
+  <text x="28" y="16" font-size="11" font-weight="700" fill="var(--kt-accent)">terminal verdict = fold over all outcomes (most severe wins)</text>
+  <text x="28" y="32" font-size="10" fill="var(--fg)" opacity=".8">Fail &gt; Inconclusive &gt; Pass &gt; Skip</text>
+  <g fill="var(--fg)">
+    <rect x="28" y="42" width="214" height="30" rx="8" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.6"/>
+    <text x="44" y="61" font-size="11.5" font-weight="700" fill="var(--kt-accent)">Fail</text>
+    <text x="230" y="61" font-size="9" text-anchor="end" opacity=".75">ran · violated bound</text>
+    <rect x="28" y="80" width="214" height="30" rx="8" fill="none" stroke="var(--kt-rule)" stroke-width="1.3"/>
+    <text x="44" y="99" font-size="11.5" font-weight="700">Inconclusive</text>
+    <text x="230" y="99" font-size="9" text-anchor="end" opacity=".75">ran · no signal</text>
+    <rect x="28" y="118" width="214" height="30" rx="8" fill="none" stroke="var(--kt-rule)" stroke-width="1.3"/>
+    <text x="44" y="137" font-size="11.5" font-weight="700">Pass</text>
+    <text x="230" y="137" font-size="9" text-anchor="end" opacity=".75">ran · satisfied bound</text>
+    <rect x="28" y="156" width="214" height="30" rx="8" fill="none" stroke="var(--kt-rule)" stroke-width="1.3" opacity=".8"/>
+    <text x="44" y="175" font-size="11.5" font-weight="700" opacity=".85">Skip</text>
+    <text x="230" y="175" font-size="9" text-anchor="end" opacity=".7">couldn't run · precondition</text>
+  </g>
+  <path d="M242 57 L 458 46" stroke="var(--kt-accent)" stroke-width="1.4" fill="none" marker-end="url(#kt-arr9)"/>
+  <path d="M242 95 L 458 102" stroke="var(--fg)" stroke-width="1.3" fill="none" marker-end="url(#kt-arr9)"/>
+  <path d="M242 133 L 458 158" stroke="var(--fg)" stroke-width="1.3" fill="none" marker-end="url(#kt-arr9)"/>
+  <path d="M242 171 L 458 162" stroke="var(--fg)" stroke-width="1.3" fill="none" marker-end="url(#kt-arr9)"/>
+  <path d="M242 128 Q 360 74 458 50" stroke="var(--kt-accent)" stroke-width="1.2" fill="none" stroke-dasharray="5 4" opacity=".85" marker-end="url(#kt-arr9)"/>
+  <text x="300" y="70" font-size="9" fill="var(--kt-accent)" opacity=".9">expect_err · clean pass → 1</text>
+  <path d="M242 100 Q 365 150 458 160" stroke="var(--fg)" stroke-width="1.2" fill="none" stroke-dasharray="5 4" opacity=".75" marker-end="url(#kt-arr9)"/>
+  <text x="300" y="140" font-size="9" fill="var(--fg)" opacity=".8">allow_inconclusive → 0</text>
+  <g>
+    <rect x="460" y="30" width="180" height="34" rx="8" fill="none" stroke="var(--kt-rule)" stroke-width="1.4"/>
+    <text x="476" y="52" font-size="11" font-weight="700" fill="var(--fg)">exit 1 · Fail</text>
+    <rect x="460" y="86" width="180" height="34" rx="8" fill="none" stroke="var(--kt-rule)" stroke-width="1.4"/>
+    <text x="476" y="108" font-size="11" font-weight="700" fill="var(--fg)">exit 2 · Inconclusive</text>
+    <rect x="460" y="142" width="180" height="34" rx="8" fill="var(--kt-accent-soft)" stroke="var(--kt-rule)" stroke-width="1.4"/>
+    <text x="476" y="164" font-size="11" font-weight="700" fill="var(--fg)">exit 0 · Pass / Skip</text>
+  </g>
+  <text x="460" y="196" font-size="9" fill="var(--fg)" opacity=".65">--no-skip-mode: Skip → exit 1</text>
+</svg></div>
+
 `Inconclusive` exists for instrument-derived denominators — a ratio
 whose denominator (iterations, samples, wall-clock interval)
 legitimately reached zero because the workload produced no signal.
