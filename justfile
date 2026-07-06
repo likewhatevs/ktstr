@@ -32,6 +32,7 @@ lint:
     run "clippy"                   cargo clippy --workspace --all-targets
     run "clippy wprof,integration" cargo clippy --workspace --all-targets --features wprof,integration
     run "doc-strict"               just doc-strict
+    run "check docsrs-mode"        env DOCS_RS=1 cargo check -p ktstr --lib --no-default-features --features export
     if [ ${#failed[@]} -ne 0 ]; then
         echo
         echo "lint: ${#failed[@]} leg(s) FAILED: ${failed[*]}"
