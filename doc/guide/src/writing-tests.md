@@ -189,6 +189,8 @@ anatomy.
 - [Snapshots and Live Capture](writing-tests/snapshots.md) — freeze
   and read scheduler BPF state on demand, when the kernel writes a
   chosen symbol, or on a cadence across the workload window.
-- [Temporal Assertions](writing-tests/temporal-assertions.md) —
-  assert on trajectories: counters that only advance, metrics that
-  hold steady, systems that converge.
+- [Projections and Temporal
+  Assertions](writing-tests/temporal-assertions.md) — turn your
+  scheduler's own counters (scx_stats, BPF state, host timelines)
+  into test signals, and assert on trajectories: counters that only
+  advance, metrics that hold steady, systems that converge.

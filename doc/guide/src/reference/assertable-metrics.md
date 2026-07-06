@@ -107,6 +107,27 @@ metrics, and — without `--noise-adjust` — whole-run distribution
 metrics and informational metrics, up front rather than silently
 never firing.
 
+## What the registry does not contain
+
+The registry is closed: its metrics come from fixed populators (BPF
+snapshot reads, schedstat and taskstats deltas, PSI/IRQ pressure,
+worker reports) plus keys extracted from
+[payload JSON output](../writing-tests/payloads.md). Two things a
+reader might expect here are deliberately absent:
+
+- **scx_stats fields.** Your scheduler's own stats output never
+  enters the sidecar, so no scx_stats field is gateable by
+  `perf-delta`. To assert on one within a run, project it —
+  [Projections and Temporal
+  Assertions](../writing-tests/temporal-assertions.md) is that lever.
+- **Projected series.** A `SeriesField` built from BPF state or
+  host timelines feeds temporal patterns and `Verdict` claims only;
+  its values stay in the test's `AssertResult`, not the sidecar.
+
+To regression-gate a scheduler-specific number across runs, emit it
+from a payload with JSON output — extracted payload keys do land in
+the sidecar and participate in `--noise-adjust` comparisons.
+
 ## PerfDeltaAssertion how-to
 
 A `PerfDeltaAssertion` is a per-test performance-regression gate. It

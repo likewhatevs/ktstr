@@ -25,7 +25,7 @@ re-exports everything a test author needs.
 | Gate performance regressions | `PerfDeltaAssertion` | [test_support](https://ktstr.dev/rustdoc/ktstr/test_support/index.html) | [Assertable Metrics](assertable-metrics.md) |
 | Generate load | `WorkType`, `WorkloadConfig`, `WorkloadHandle` | [workload](https://ktstr.dev/rustdoc/ktstr/workload/index.html) | [Work Types](../concepts/work-types.md), [Workers and Workloads](../architecture/workers.md) |
 | Run guest binaries | `#[derive(Payload)]`, `Payload` | [derive.Payload](https://ktstr.dev/rustdoc/ktstr/derive.Payload.html) | [Payloads and Included Files](../writing-tests/payloads.md) |
-| Capture guest state | `Snapshot`, `SnapshotBridge`, `Sample`, `SampleSeries` | [scenario::snapshot](https://ktstr.dev/rustdoc/ktstr/scenario/snapshot/index.html), [scenario::sample](https://ktstr.dev/rustdoc/ktstr/scenario/sample/index.html) | [Snapshots](../writing-tests/snapshots.md), [Temporal Assertions](../writing-tests/temporal-assertions.md) |
+| Capture guest state | `Snapshot`, `SnapshotBridge`, `Sample`, `SampleSeries` | [scenario::snapshot](https://ktstr.dev/rustdoc/ktstr/scenario/snapshot/index.html), [scenario::sample](https://ktstr.dev/rustdoc/ktstr/scenario/sample/index.html) | [Snapshots](../writing-tests/snapshots.md), [Projections and Temporal Assertions](../writing-tests/temporal-assertions.md) |
 
 The `#[ktstr_test]` attribute's arguments (topology dimensions,
 thresholds, execution flags) are documented in the

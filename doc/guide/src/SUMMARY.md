@@ -16,7 +16,7 @@
   - [Payloads and Included Files](writing-tests/payloads.md)
   - [Custom Scenarios](writing-tests/custom-scenarios.md)
   - [Snapshots and Live Capture](writing-tests/snapshots.md)
-  - [Temporal Assertions](writing-tests/temporal-assertions.md)
+  - [Projections and Temporal Assertions](writing-tests/temporal-assertions.md)
 
 # Running Tests
 

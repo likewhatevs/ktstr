@@ -1,14 +1,17 @@
-# Temporal Assertions
+# Projections and Temporal Assertions
 
-Periodic snapshots produce a series of samples over time. **Temporal
-assertions** answer questions about the *trajectory* — does a
-counter only ever advance? Does a utilization metric stay near its
-mean once warmup ends? Does a load average converge before a
-deadline?
+The built-in [checks](../concepts/checking.md) assert on what ktstr
+measures for you. **Projections** assert on what *your scheduler*
+measures: any per-sample value the harness can see — a field in the
+scheduler's own scx_stats output, any global or map entry in the
+frozen BPF snapshots, per-CPU host time — projects into a typed
+column, and every pattern and claim on this page applies to it. A
+scheduler's internal counters become first-class test signals
+without ktstr knowing their names.
 
 <div class="kt-steps">
 <div class="kt-step" data-step="1"><strong>Capture</strong><p>Enable periodic snapshots so ktstr records comparable samples during the run.</p></div>
-<div class="kt-step" data-step="2"><strong>Project</strong><p>Turn BPF state or scx_stats paths into one typed <code>SeriesField&lt;T&gt;</code>.</p></div>
+<div class="kt-step" data-step="2"><strong>Project</strong><p>Turn a scx_stats path, BPF value, or host-CPU field into one typed <code>SeriesField&lt;T&gt;</code>.</p></div>
 <div class="kt-step" data-step="3"><strong>Assert</strong><p>Apply monotonicity, rate, convergence, ratio, or scalar checks to one verdict.</p></div>
 </div>
 
@@ -71,6 +74,9 @@ one test needs both views.
   `_f64`.
 - `bpf_map(map_name)` / `stats_path(path)` — typed auto-projection
   (see [Auto-projection](#auto-projection)).
+- `host()` / `monitor()` — the two host-side data sources: a
+  per-sample per-CPU time timeline, and the run-level monitor
+  aggregate (see [The host and monitor axes](#the-host-and-monitor-axes)).
 - `by_stamped_phase()` — group samples by the bridge-stamped
   scenario phase (`BTreeMap<u16, Vec<Sample>>`; 0 = baseline,
   1..=N = step ordinals). Prefer
@@ -119,6 +125,15 @@ scheduler stats client was wired) yields a
 an in-JSON path miss (`FieldNotFound` / `TypeMismatch`) so coverage
 gaps and data errors stay distinguishable.
 
+Each sample's stats slot is the scheduler's response stored
+**verbatim** — ktstr issues a fresh scx_stats request just before
+each freeze and never diffs consecutive responses. Whether a field
+is cumulative-since-attach or per-interval is the *scheduler's*
+convention, and it decides which assertion is sound: a cumulative
+counter fits `nondecreasing` and per-phase
+`counter_delta_per_phase()`, while a per-interval value fed to a
+delta reducer double-subtracts and asserts on noise.
+
 ### Auto-projection
 
 The typed auto-projectors emit ready-to-feed `SeriesField`s without
@@ -145,7 +160,44 @@ useful for blanket "every counter must be nondecreasing" sweeps.
 The typed `field_*` helpers reach top-level scalars only; nested
 members (`"ctx.weight"`) need the closure path. Per-CPU maps use
 the projector's cross-CPU reductions (`field_cpu_sum_*` /
-`field_cpu_max_*` / `field_cpu_min_*`) or `.cpu(n).field_*`.
+`field_cpu_max_*` / `field_cpu_min_*`) or `.cpu(n).field_*`. When
+several counters must come from the *same* scheduler section,
+`live_bpf_vars_via([names; N], picker)` resolves them per-sample
+through one shared picker call and returns N parallel fields.
+
+## The host and monitor axes
+
+Two more data sources ride the same series, both captured host-side:
+
+**`series.host()`** returns a per-sample **per-CPU time timeline**
+(`None` when no sample carried per-CPU data). `cpus()` lists every
+captured CPU; `per_cpu_field_u64(cpu, label, |t| …)` projects one
+field of the per-CPU kernel cpustat readings (`cpustat_user_ns`,
+`cpustat_system_ns`, `cpustat_irq_ns`, `cpustat_idle_ns`, …) into a
+`SeriesField<u64>` — the same shape as `series.bpf`, so the identical
+patterns apply:
+
+```rust,ignore
+if let Some(host) = series.host() {
+    for cpu in host.cpus() {
+        host.per_cpu_field_u64(cpu, format!("cpu{cpu}_system_ns"),
+            |t| t.cpustat_system_ns)
+            .nondecreasing(&mut v);
+    }
+}
+```
+
+A sample that missed a CPU surfaces as a per-sample
+`HostFieldUnavailable` slot, routed like any other projection error.
+
+**`series.monitor()`** is not a series — it is the run-level
+**aggregate** view over the monitor thread's own sampling cadence
+(`None` when no monitor report was attached). `summary()` exposes
+imbalance ratios, nr_running averages, DSQ depths, and schedstat
+deltas; `scx_events()` the SCX event-counter deltas. These are
+scalars: feed them to [`claim!` and the Verdict
+comparators](../concepts/checking.md#verdict-the-claim-accumulator),
+not the trajectory patterns.
 
 ## The patterns
 
@@ -359,6 +411,27 @@ fn dispatch_counter_advances(ctx: &Ctx) -> Result<AssertResult> {
     ])
 }
 ```
+
+## Where projected values travel
+
+A projected value has exactly two sinks: the temporal patterns and
+the `Verdict` claim comparators. Both terminate in the test's
+`AssertResult` — its pass/fail verdict and failure details.
+
+Projected values do **not** enter the stats sidecar, so they are not
+visible to `cargo ktstr stats` or gateable by `perf-delta` /
+`PerfDeltaAssertion`. That pipeline is fed exclusively by the
+[metric registry](../reference/assertable-metrics.md)'s fixed
+populators; scx_stats JSON never reaches it at all. The two levers
+are complementary, not interchangeable:
+
+- **Cross-run regression gating** on a scheduler-specific number:
+  emit it from a workload payload with JSON output
+  ([Payloads](payloads.md)), whose extracted keys *do* land in the
+  sidecar.
+- **Within-run assertions** on scheduler internals — trajectory,
+  bounds, phase A/B: project it here. No registration, no payload,
+  any name your scheduler exports.
 
 For capture wiring and `num_snapshots` semantics, see
 [Periodic capture](snapshots.md#periodic-capture); for the `Snapshot`

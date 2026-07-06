@@ -71,7 +71,10 @@ assertions that depend on it pass vacuously.
 
 `Snapshot::new(report)` builds a borrowed view; accessors walk the
 report in place. Every capture kind — on-demand, watch, periodic —
-produces the same `Snapshot`, so the surface below reads any of them.
+produces the same `Snapshot`, so the surface below reads any of them;
+the same type also appears per-sample inside a `SampleSeries`, where
+[projections](temporal-assertions.md) apply these accessors across
+every capture at once.
 
 ### Maps and globals
 
@@ -462,7 +465,7 @@ Then assert in two stages: build the series (drain, `periodic_only()`),
 then project a column and pick a pattern — `nondecreasing` for
 monotonic counters, `steady_within` for utilization-style metrics that
 should hold once warmup ends, `converges_to` for "stabilizes near a
-target by a deadline". [Temporal Assertions](temporal-assertions.md)
+target by a deadline". [Projections and Temporal Assertions](temporal-assertions.md)
 owns the sample anatomy, the full pattern surface, and the projection
 helpers; [Errors carry the fix](#errors-carry-the-fix) above owns the
 per-sample error routing (`PlaceholderSample`, `MissingStats`).

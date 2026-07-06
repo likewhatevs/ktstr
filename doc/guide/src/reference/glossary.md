@@ -37,6 +37,7 @@ kernel meaning; ktstr terms are defined by ktstr's own behavior.
 | **stuck** | A worker whose gap between progress checkpoints exceeded the threshold — ktstr's own liveness word (the kernel's is *stall*, above). |
 | **unfair** | Off-CPU share spread across a cgroup's workers beyond the threshold. |
 | **claim** | One labeled assertion inside a `Verdict` — the accumulator custom scenarios use. `claim_better` compares candidate vs baseline with registry polarity. |
+| **projection** | Turning a per-sample value — an scx_stats field, a BPF global or map entry, a host per-CPU reading — into a typed `SeriesField` column for temporal patterns and claims. See [Projections](../writing-tests/temporal-assertions.md). |
 | **sidecar** | The per-test JSON stats file written under `target/ktstr/{kernel}-{commit}/` — the raw material for `stats` and `perf-delta`. |
 
 ## Running at scale

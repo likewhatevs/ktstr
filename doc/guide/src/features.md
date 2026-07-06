@@ -214,7 +214,7 @@ Temporal patterns — `nondecreasing`, `rate_within`, `steady_within`,
 `converges_to`, and friends — assert over the whole series; on-demand
 and write-triggered snapshots share the same machinery. See
 [Snapshots and Live Capture](writing-tests/snapshots.md) and
-[Temporal Assertions](writing-tests/temporal-assertions.md).
+[Projections and Temporal Assertions](writing-tests/temporal-assertions.md).
 
 ### Statistical regression detection
 

@@ -395,7 +395,7 @@ a scenario that bailed in setup returns `None` from every
 `phase(Phase::step(k))` lookup. `PhaseBucket::expect_metric` panics
 with the bucket's label, sample count, and the metric keys actually
 present, so a typo'd name and an empty phase are distinguishable at
-a glance. [Temporal Assertions](../writing-tests/temporal-assertions.md)
+a glance. [Projections and Temporal Assertions](../writing-tests/temporal-assertions.md)
 builds per-phase pattern checks on top of this.
 
 The per-phase timeline also renders in every failure report:

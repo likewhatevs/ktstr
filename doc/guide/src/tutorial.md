@@ -637,7 +637,7 @@ Each of these builds directly on the test you just wrote.
   `post_vm` callback asserts temporal patterns over the series
   (nondecreasing counters, bounded rates, convergence). See
   [Periodic capture](writing-tests/snapshots.md#periodic-capture) and
-  [Temporal Assertions](writing-tests/temporal-assertions.md).
+  [Projections and Temporal Assertions](writing-tests/temporal-assertions.md).
 - **Performance mode.** For benchmark-grade runs, ktstr pins vCPUs
   to reserved host cores and strips host scheduling noise; for
   topologies your host can't mirror, `no_perf_mode = true` builds

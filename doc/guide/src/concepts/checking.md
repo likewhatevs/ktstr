@@ -290,6 +290,15 @@ read `false`.
   ```
 
   An unregistered metric yields Inconclusive, never a silent pass.
+- **Claim variants and measurements** — `claim_present!(v, opt)`
+  fails loudly on `None` instead of vacuously passing; `claim_set` /
+  `claim_seq` assert membership, length, and subset bounds over
+  collections;
+  `note(msg)` records free-text context and `note_value(key, val)`
+  a typed measurement into `AssertResult::measurements` — triage
+  payload attached to the verdict, not a metric (nothing recorded
+  through claims or notes reaches the stats sidecar or `perf-delta`;
+  see [Assertable Metrics](../reference/assertable-metrics.md)).
 - **`AbsoluteThresholds`** — flat per-run bounds
   (`max_p99_wake_latency_ns`, `max_iteration_cost_p99_ns`,
   `max_migrations`, `min_work_units`) checked in one call:
@@ -303,5 +312,7 @@ read `false`.
 Signatures, comparators, and construction details are in the
 [`ktstr::assert` rustdoc](https://ktstr.dev/rustdoc/ktstr/assert/index.html).
 For phase-scoped checks over a stepped scenario, see
-[Phases](ops.md#phases) and
-[Temporal Assertions](../writing-tests/temporal-assertions.md).
+[Phases](ops.md#phases). To assert on your scheduler's *own*
+counters — scx_stats fields, BPF globals and maps — see
+[Projections and Temporal
+Assertions](../writing-tests/temporal-assertions.md).
