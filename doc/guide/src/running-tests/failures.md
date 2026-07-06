@@ -169,6 +169,27 @@ and the monitor-side violations.
 
 ## Artifacts on disk
 
+<div class="kt-figure"><svg width="700" height="120" viewBox="0 0 700 120" role="img" aria-label="Failure dump pipeline: a scheduler error trips the freeze coordinator, vCPUs freeze, the monitor walks BTF-typed state, and the dump is written as JSON and rendered sections">
+  <defs><marker id="kt-arr4" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
+  <g font-size="10.5" fill="var(--fg)">
+    <rect x="8" y="26" width="130" height="56" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.2"/>
+    <text x="22" y="49" font-weight="700" opacity=".85">scx exit fires</text>
+    <text x="22" y="67" opacity=".7">error / watchdog</text>
+    <path d="M140 54 L 172 54" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#kt-arr4)"/>
+    <rect x="176" y="26" width="130" height="56" rx="9" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.2"/>
+    <text x="190" y="49" font-weight="700" fill="var(--kt-accent)">vCPUs freeze</text>
+    <text x="190" y="67" opacity=".7">state can't decay</text>
+    <path d="M308 54 L 340 54" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#kt-arr4)"/>
+    <rect x="344" y="26" width="160" height="56" rx="9" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.2"/>
+    <text x="358" y="49" font-weight="700" fill="var(--kt-accent)">monitor walks state</text>
+    <text x="358" y="67" opacity=".7">BTF-typed maps · regs · rq</text>
+    <path d="M506 54 L 538 54" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#kt-arr4)"/>
+    <rect x="542" y="26" width="150" height="56" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.2"/>
+    <text x="556" y="49" font-weight="700" opacity=".85">failure dump</text>
+    <text x="556" y="67" opacity=".7" font-family="var(--mono-font)">.json + rendered</text>
+  </g>
+</svg></div>
+
 After the run, `cargo ktstr` prints where everything landed:
 
 <!-- captured: cargo ktstr test --kernel 7.0 -- --features integration -E 'test(=ktstr/throughput_gate)' (tail of the same failing run) | ktstr 0.23.0 | kernel 7.0.14 -->

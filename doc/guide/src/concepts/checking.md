@@ -165,6 +165,36 @@ sets it, it stays set. Worked override recipes live in
 `execute_steps_with(ctx, steps, Some(&assert))` bypasses the merged
 config with an explicit `Assert` for that scenario's worker checks.
 
+<div class="kt-figure"><svg width="700" height="250" viewBox="0 0 700 250" role="img" aria-label="Configuration merge cascade: three Assert layers merge last-Some-wins — baseline with all fields None, then the scheduler's assert, then per-test #[ktstr_test] attributes — yielding the merged Assert used for worker checks; execute_steps_with bypasses the merge with an explicit Assert">
+  <defs><marker id="kt-arr6" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
+  <g opacity=".7">
+    <rect x="40" y="14" width="280" height="42" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.2"/>
+    <text x="56" y="34" font-size="12" font-weight="700" fill="var(--fg)">baseline</text>
+    <text x="56" y="50" font-size="9.5" fill="var(--fg)" opacity=".8">every field None — inherit</text>
+  </g>
+  <path d="M180 56 L 180 72" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#kt-arr6)"/>
+  <text x="190" y="70" font-size="9" fill="var(--fg)" opacity=".55">override</text>
+  <rect x="40" y="74" width="280" height="42" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.2"/>
+  <text x="56" y="94" font-size="12" font-weight="700" fill="var(--fg)">scheduler's assert</text>
+  <text x="56" y="110" font-size="9.5" fill="var(--fg)" opacity=".75">scheduler-wide bound</text>
+  <path d="M180 116 L 180 132" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#kt-arr6)"/>
+  <text x="190" y="130" font-size="9" fill="var(--fg)" opacity=".55">override</text>
+  <rect x="40" y="134" width="280" height="42" rx="9" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.4"/>
+  <text x="56" y="154" font-size="12" font-weight="700" fill="var(--kt-accent)">per-test #[ktstr_test] attributes</text>
+  <text x="56" y="170" font-size="9.5" fill="var(--fg)" opacity=".8">max_gap_ms, max_spread_pct, …</text>
+  <path d="M180 176 L 180 192" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#kt-arr6)"/>
+  <rect x="40" y="194" width="280" height="42" rx="9" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.6"/>
+  <text x="56" y="214" font-size="12" font-weight="700" fill="var(--kt-accent)">merged Assert → worker checks</text>
+  <text x="56" y="230" font-size="9.5" fill="var(--fg)" opacity=".8">last Some wins</text>
+  <rect x="430" y="74" width="240" height="64" rx="9" fill="none" stroke="var(--kt-rule)" stroke-width="1.3" stroke-dasharray="5 4"/>
+  <text x="446" y="98" font-size="11" font-weight="700" fill="var(--fg)">execute_steps_with</text>
+  <text x="446" y="115" font-size="9.5" fill="var(--fg)" opacity=".75">(ctx, steps, Some(&amp;assert))</text>
+  <text x="446" y="130" font-size="9.5" fill="var(--fg)" opacity=".75">explicit Assert</text>
+  <path d="M430 122 C 384 154, 362 196, 326 214" stroke="var(--fg)" stroke-width="1.3" fill="none" marker-end="url(#kt-arr6)"/>
+  <text x="392" y="200" font-size="9.5" fill="var(--fg)" opacity=".7">bypasses the merge</text>
+  <text x="40" y="248" font-size="9.5" fill="var(--fg)" opacity=".6">enforce_monitor_thresholds is sticky: once any layer sets it, it stays set.</text>
+</svg></div>
+
 ## Verdicts and outcomes
 
 Every assertion produces one of four outcomes, and a result's

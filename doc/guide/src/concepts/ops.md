@@ -237,6 +237,43 @@ pub struct Step {
 }
 ```
 
+<div class="kt-figure"><svg width="700" height="176" viewBox="0 0 700 176" role="img" aria-label="Step and phase timeline: a settle window (Phase BASELINE) precedes Step 0 and Step 1; each step applies ops, then setup, then holds, phase boundaries fall at step edges, and metrics bucket per phase — Phase::BASELINE, Phase::step(0), Phase::step(1)">
+  <defs><marker id="kt-arr7" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
+  <g opacity=".6">
+    <rect x="20" y="44" width="100" height="48" rx="8" fill="none" stroke="var(--kt-rule)" stroke-width="1.2"/>
+    <text x="70" y="66" font-size="10.5" font-weight="700" fill="var(--fg)" text-anchor="middle">BASELINE</text>
+    <text x="70" y="82" font-size="9" fill="var(--fg)" text-anchor="middle">settle window</text>
+  </g>
+  <text x="260" y="38" font-size="11" font-weight="700" fill="var(--kt-accent)" text-anchor="middle">Step 0</text>
+  <rect x="120" y="44" width="280" height="48" rx="8" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.4"/>
+  <rect x="121" y="45" width="57" height="46" fill="var(--bg)" stroke="var(--kt-rule)" stroke-width=".8"/>
+  <rect x="178" y="45" width="58" height="46" fill="var(--bg)" stroke="var(--kt-rule)" stroke-width=".8"/>
+  <text x="149" y="72" font-size="9.5" fill="var(--fg)" text-anchor="middle">ops</text>
+  <text x="207" y="72" font-size="9.5" fill="var(--fg)" text-anchor="middle">setup</text>
+  <text x="318" y="72" font-size="10" font-weight="700" fill="var(--kt-accent)" text-anchor="middle">hold</text>
+  <text x="540" y="38" font-size="11" font-weight="700" fill="var(--kt-accent)" text-anchor="middle">Step 1</text>
+  <rect x="400" y="44" width="280" height="48" rx="8" fill="var(--kt-accent-soft)" stroke="var(--kt-accent)" stroke-width="1.4"/>
+  <rect x="401" y="45" width="57" height="46" fill="var(--bg)" stroke="var(--kt-rule)" stroke-width=".8"/>
+  <rect x="458" y="45" width="58" height="46" fill="var(--bg)" stroke="var(--kt-rule)" stroke-width=".8"/>
+  <text x="429" y="72" font-size="9.5" fill="var(--fg)" text-anchor="middle">ops</text>
+  <text x="487" y="72" font-size="9.5" fill="var(--fg)" text-anchor="middle">setup</text>
+  <text x="598" y="72" font-size="10" font-weight="700" fill="var(--kt-accent)" text-anchor="middle">hold</text>
+  <g stroke="var(--kt-rule)" stroke-width="1" stroke-dasharray="3 3" opacity=".7">
+    <line x1="20" y1="92" x2="20" y2="108"/>
+    <line x1="120" y1="92" x2="120" y2="108"/>
+    <line x1="400" y1="92" x2="400" y2="108"/>
+    <line x1="680" y1="92" x2="680" y2="108"/>
+  </g>
+  <g font-size="9.5" fill="var(--fg)" opacity=".8">
+    <text x="70" y="120" text-anchor="middle">Phase::BASELINE</text>
+    <text x="260" y="120" text-anchor="middle">Phase::step(0)</text>
+    <text x="540" y="120" text-anchor="middle">Phase::step(1)</text>
+  </g>
+  <path d="M20 140 L 684 140" stroke="var(--kt-rule)" stroke-width="1.2" marker-end="url(#kt-arr7)"/>
+  <text x="350" y="155" font-size="9.5" fill="var(--fg)" text-anchor="middle" opacity=".7">scenario duration →</text>
+  <text x="20" y="170" font-size="9.5" fill="var(--fg)" opacity=".6">each step: ops → setup → hold; captures and assertions stamp with the active phase</text>
+</svg></div>
+
 `Setup` is `Defs(Vec<CgroupDef>)` or a topology-dependent
 `Setup::with_factory(fn(&Ctx) -> Vec<CgroupDef>)`.
 
