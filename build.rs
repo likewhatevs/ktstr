@@ -2,10 +2,17 @@
 // Uses the shared kernel resolver (src/kernel_path.rs) to find the
 // BTF source. See resolve_btf() for the full search order.
 
+// Without `vendored` (docs.rs only) the real build pipeline is compiled
+// out, leaving its helpers and toolchain imports unused. Suppress the
+// resulting warnings only in that configuration so a normal build still
+// flags genuine dead code.
+#![cfg_attr(not(feature = "vendored"), allow(dead_code, unused_imports))]
+
 use std::env;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+#[cfg(feature = "vendored")]
 use libbpf_cargo::SkeletonBuilder;
 
 include!("src/kernel_path.rs");
@@ -14,6 +21,72 @@ include!("src/build_helpers.rs");
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
+    // docs.rs / non-`vendored` builds cannot compile the vendored libbpf
+    // C stack (the docs.rs sandbox has no flex/bison) or fetch build-time
+    // blobs (no network), and without `vendored` there is no libbpf-cargo
+    // to generate BPF skeletons. Emit the `$OUT_DIR` artifacts the crate
+    // `include!`s / `env!`s (stub skeletons, shift registry, blob
+    // placeholders, fingerprint env vars) so rustdoc still compiles the
+    // full public API, then stop. Strict no-op for every normal build:
+    // `vendored` is default-on, so this branch is compiled out and the
+    // real pipeline below is byte-for-byte the historical `main`. The two
+    // arms are mutually exclusive via cfg, so exactly one is compiled.
+    #[cfg(not(feature = "vendored"))]
+    emit_docsrs_stubs(&out_dir);
+    #[cfg(feature = "vendored")]
+    vendored_main(out_dir);
+}
+
+/// Emit the `$OUT_DIR` artifacts the crate `include!`s / `env!`s so
+/// rustdoc can compile the whole crate without the BPF toolchain. Runs
+/// on docs.rs and any `default-features = false` build that omits
+/// `vendored`. The skeleton stubs (`src/bpf/docsrs_*.rs`) reproduce the
+/// exact shape `src/probe/process.rs` compiles against; every other
+/// artifact is an inert placeholder — this build cannot load BPF.
+#[cfg(not(feature = "vendored"))]
+fn emit_docsrs_stubs(out_dir: &std::path::Path) {
+    if std::env::var_os("DOCS_RS").is_none() {
+        println!(
+            "cargo:warning=building ktstr without the `vendored` feature: BPF \
+             skeletons are stubbed and cannot be loaded at runtime. Add \
+             `features = [\"vendored\"]` for a functional build."
+        );
+    }
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    for (src, dst) in [
+        ("src/bpf/docsrs_probe_skel.rs", "probe_skel.rs"),
+        ("src/bpf/docsrs_fentry_skel.rs", "fentry_probe_skel.rs"),
+    ] {
+        let src = manifest_dir.join(src);
+        println!("cargo:rerun-if-changed={}", src.display());
+        std::fs::copy(&src, out_dir.join(dst))
+            .unwrap_or_else(|e| panic!("copy docs.rs skeleton stub {}: {e}", src.display()));
+    }
+
+    // `budget.rs` `include!`s this; the generator is hermetic (it scans
+    // `src/budget.rs`, no toolchain), so keep it real.
+    generate_shift_registry(out_dir);
+
+    // Inert blob placeholders. Only the cli-bins binaries `include_bytes!`
+    // these and docs.rs drops cli-bins, but emit them anyway so a docs
+    // build that opts cli-bins back in still compiles.
+    for blob in ["busybox", "wprof"] {
+        std::fs::write(out_dir.join(blob), b"")
+            .unwrap_or_else(|e| panic!("write {blob} placeholder: {e}"));
+    }
+
+    // `persist.rs` consumes these via `env!`; they gate the on-disk cast
+    // cache, which a docs build never touches, so stub them.
+    println!("cargo:rustc-env=KTSTR_CAST_ANALYZER_FINGERPRINT=0000000000000000");
+    println!("cargo:rustc-env=KTSTR_CARGO_LOCK_FINGERPRINT=0000000000000000");
+}
+
+/// The real build pipeline: vmlinux.h generation, BPF skeleton builds,
+/// busybox/wprof compilation. Compiled only with the `vendored` feature
+/// (default-on); docs.rs drops it. Unchanged from the historical `main`
+/// body apart from taking `out_dir` as a parameter.
+#[cfg(feature = "vendored")]
+fn vendored_main(out_dir: PathBuf) {
     // Cache invalidation: track the env var that selects a kernel
     // and the build-script inputs (kernel_path resolver, C generator
     // source). Deliberately NOT emitting a `rerun-if-changed` on the

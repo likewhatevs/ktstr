@@ -14,6 +14,7 @@ without touching the guest.
 [![CI](https://github.com/likewhatevs/ktstr/actions/workflows/ci.yml/badge.svg)](https://github.com/likewhatevs/ktstr/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/likewhatevs/ktstr/graph/badge.svg?token=E7GRAO2KZM)](https://codecov.io/gh/likewhatevs/ktstr)
 [![crates.io](https://img.shields.io/crates/v/ktstr.svg)](https://crates.io/crates/ktstr)
+[![docs.rs](https://img.shields.io/docsrs/ktstr)](https://docs.rs/ktstr)
 [![docs](https://img.shields.io/badge/docs-ktstr.dev-blue)](https://ktstr.dev/guide/)
 [![api](https://img.shields.io/badge/docs-api-blue)](https://ktstr.dev/rustdoc/ktstr/)
 
@@ -117,7 +118,7 @@ and
 
 ```toml
 [dev-dependencies]
-ktstr = "0.23.0"
+ktstr = "0.24.0"
 ```
 
 ```sh

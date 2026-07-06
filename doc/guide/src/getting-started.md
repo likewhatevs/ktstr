@@ -53,7 +53,7 @@ sudo dnf install clang pkgconf make gcc autoconf gettext-devel flex bison gawk
 
 ```toml
 [dev-dependencies]
-ktstr = "=0.23.0"
+ktstr = "=0.24.0"
 ```
 
 ktstr is pre-release: pin the exact patch version and keep the
