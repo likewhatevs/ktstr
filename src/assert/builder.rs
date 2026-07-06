@@ -57,7 +57,6 @@ pub struct Assert {
     /// worker reports. `Some(true)` enables, `Some(false)` explicitly
     /// disables (overriding any enabling merge from a lower layer),
     /// `None` inherits from the merge parent.
-    #[serde(alias = "not_starved")]
     pub not_stuck: Option<bool>,
     /// Enable per-worker CPU isolation checks (ensure workers remain
     /// within their assigned cpuset). Same tri-state semantics as
