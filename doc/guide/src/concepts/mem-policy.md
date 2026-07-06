@@ -10,6 +10,12 @@ on where the pages actually landed. Pair it with multi-NUMA
 [gauntlet presets](../running-tests/gauntlet.md) to sweep the same
 test across node counts.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Bind</strong><p>Force pages onto one node set when locality must be strict.</p></div>
+<div class="kt-doc-card"><strong>Prefer</strong><p>Bias allocation toward a node or set while allowing fallback.</p></div>
+<div class="kt-doc-card"><strong>Interleave</strong><p>Spread pages across nodes for bandwidth or cross-node fairness tests.</p></div>
+</div>
+
 ```rust,ignore
 pub enum MemPolicy {
     Default,

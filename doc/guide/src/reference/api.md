@@ -8,6 +8,12 @@ workspace crate is published at
 [`ktstr::prelude`](https://ktstr.dev/rustdoc/ktstr/prelude/index.html)
 re-exports everything a test author needs.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Author tests</strong><p>Use the guide for flow and rustdoc for exact signatures.</p></div>
+<div class="kt-doc-card"><strong>Find modules</strong><p>The table maps every common task to the crate API and relevant chapter.</p></div>
+<div class="kt-doc-card"><strong>Stay current</strong><p>Pre-1.0 API details move quickly; rustdoc is the signature source of truth.</p></div>
+</div>
+
 | You want to | Reach for | Rustdoc | Guide chapter |
 |---|---|---|---|
 | Declare a test | `#[ktstr_test]` | [attr.ktstr_test](https://ktstr.dev/rustdoc/ktstr/attr.ktstr_test.html) | [The #\[ktstr_test\] Attribute](../writing-tests/ktstr-test-macro.md) |

@@ -56,7 +56,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
         post_vm_unconditional,
         disk,
         networks,
-        not_starved,
+        not_stuck,
         isolation,
         max_gap_ms,
         max_spread_pct,
@@ -188,7 +188,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     };
 
     // Build Assert field tokens.
-    let not_starved_tokens = option_tokens(&not_starved);
+    let not_stuck_tokens = option_tokens(&not_stuck);
     let isolation_tokens = option_tokens(&isolation);
     let gap_tokens = option_tokens(&max_gap_ms);
     let spread_tokens = option_tokens(&max_spread_pct);
@@ -334,7 +334,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     // none are set the spread inherits `Assert::NO_OVERRIDES` from
     // `KtstrTestEntry::DEFAULT`, which is bit-for-bit identical to
     // the all-`None` Assert the prior unconditional emission produced.
-    let any_assert_set = not_starved.is_some()
+    let any_assert_set = not_stuck.is_some()
         || isolation.is_some()
         || max_gap_ms.is_some()
         || max_spread_pct.is_some()
@@ -360,7 +360,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     let assert_field = if any_assert_set {
         quote! {
             assert: ::ktstr::assert::Assert {
-                not_starved: #not_starved_tokens,
+                not_stuck: #not_stuck_tokens,
                 isolation: #isolation_tokens,
                 max_gap_ms: #gap_tokens,
                 max_spread_pct: #spread_tokens,

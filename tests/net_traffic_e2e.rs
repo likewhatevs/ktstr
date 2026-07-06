@@ -96,7 +96,7 @@ fn net_traffic_raises_nic_irq_count(_ctx: &Ctx) -> Result<AssertResult> {
 /// With NO NIC attached (no `networks = ...`), the guest has only `lo`, so
 /// NetTraffic must be a LOUD no-op: the workers find no interface, warn once,
 /// and report `work_units == 0` (the contract the send-path e2e's `sent > 0`
-/// guard and the starvation gate rely on) while the dispatch loop still
+/// guard and the zero-work-units gate rely on) while the dispatch loop still
 /// iterates. This is the CI-runnable invariant pairing the host-gated
 /// send-path e2e above, and the only test that exercises the no-NIC branch.
 #[ktstr_test(

@@ -80,26 +80,13 @@ only `cargo ktstr shell` does.)
 
 ```sh
 cargo ktstr test                    # auto-discover from cache / KTSTR_KERNEL
-cargo ktstr test --kernel 7.0       # pin to a version (latest 7.0.x)
+cargo ktstr test --kernel 7.0       # pin to the 7.0 series
 cargo ktstr test --kernel ../linux  # pin to a local source checkout
 ```
 
-A run looks like this — each `PASS` line is a fresh VM that booted,
-ran the scenario, and shut down:
-
-<!-- captured: cargo ktstr test --kernel 7.0 -- --features integration -E 'test(=ktstr/failure_dump_renders_bss_fields)' | ktstr 0.23.0 | kernel 7.0.14 -->
-```text
-cargo ktstr: fetching latest 7.0.x kernel version
-cargo ktstr: latest 7.0.x kernel: 7.0.14
-cargo ktstr: resolved kernel "7.0"
-...
- Nextest run ID 24c18577-cd34-43bd-9d14-b0197701c187 with nextest profile: default
-    Starting 1 test across 121 binaries (12531 tests skipped)
-        PASS [  34.451s] (1/1) ktstr::failure_dump_e2e ktstr/failure_dump_renders_bss_fields
-────────────
-     Summary [  34.490s] 1 test run: 1 passed, 12531 skipped
-...
-```
+Each `PASS` line is a fresh VM that booted, ran the scenario, and
+shut down ([Getting Started](../getting-started.md#run-it) walks a
+full transcript).
 
 The run footer names the output directory
 (`target/ktstr/{kernel}-{project_commit}`) where per-test stats

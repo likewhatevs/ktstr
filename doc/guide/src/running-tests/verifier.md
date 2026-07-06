@@ -58,9 +58,9 @@ ktstr::declare_scheduler!(BPFLAND, {
     binary_path = "../scx/target/release/scx_bpfland",
 });
 // ... same for scx_lavd, scx_p2dq
+<!-- captured: cargo ktstr verifier --kernel <local sched_ext dev tree> --test docs_real_scheds tiny-1llc tiny-2llc odd-3llc smt-2llc | ktstr 0.23.0 | kernel sched_ext-for-7.2 b4dc42d2 -->
 ```
 
-<!-- captured: cargo ktstr verifier --kernel <local sched_ext dev tree> --test docs_real_scheds tiny-1llc tiny-2llc odd-3llc smt-2llc | ktstr 0.23.0 | kernel sched_ext-for-7.2 b4dc42d2 -->
 <div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr verifier --kernel ../linux --test my_schedulers tiny-1llc tiny-2llc odd-3llc smt-2llc</span></div>
 
 <pre><span class="t-b">verifier verified_insns (per scheduler; rows: kernel, cols: BPF program, cell: range across topologies):</span>

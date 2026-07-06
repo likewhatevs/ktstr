@@ -327,7 +327,7 @@ pub(crate) const DEFAULT_MEMORY_MIB: u32 = 2048;
 pub(crate) const BOOL_ATTR_NAMES: &[&str] = &[
     "auto_repro",
     "expect_auto_repro",
-    "not_starved",
+    "not_stuck",
     "isolation",
     "performance_mode",
     "pci",
@@ -461,7 +461,7 @@ pub(crate) struct AttrValues {
     pub(crate) disk: Option<syn::Path>,
     pub(crate) networks: Option<Vec<syn::Path>>,
     // -- Assert overrides (Option<T>) --
-    pub(crate) not_starved: Option<bool>,
+    pub(crate) not_stuck: Option<bool>,
     pub(crate) isolation: Option<bool>,
     pub(crate) max_gap_ms: Option<u64>,
     pub(crate) max_spread_pct: Option<f64>,
@@ -567,7 +567,7 @@ impl Default for AttrValues {
             disk: None,
             networks: None,
             // Assert overrides
-            not_starved: None,
+            not_stuck: None,
             isolation: None,
             max_gap_ms: None,
             max_spread_pct: None,
@@ -658,7 +658,7 @@ impl AttrValues {
                 self.expect_auto_repro = value;
                 self.expect_auto_repro_set = true;
             }
-            "not_starved" => self.not_starved = Some(value),
+            "not_stuck" => self.not_stuck = Some(value),
             "isolation" => self.isolation = Some(value),
             "performance_mode" => {
                 self.performance_mode = value;

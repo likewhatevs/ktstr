@@ -4,6 +4,12 @@ Tests are Rust functions annotated with `#[ktstr_test]`. Each test
 boots a KVM VM, runs the scenario inside it, and evaluates results
 on the host.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong><a href="writing-tests/ktstr-test-macro.html">Attribute shape</a></strong><p>Topology, timing, checks, snapshots, scheduler selection, and execution knobs.</p></div>
+<div class="kt-doc-card"><strong><a href="writing-tests/scheduler-definitions.html">Scheduler setup</a></strong><p>Declare an <code>scx_*</code> binary once, then reuse it across tests and verifier sweeps.</p></div>
+<div class="kt-doc-card"><strong><a href="concepts/checking.html">Assertions</a></strong><p>Checks are opt-in: choose worker progress, spread, stuck gaps, throughput, and temporal gates deliberately.</p></div>
+</div>
+
 ```rust,ignore
 use ktstr::prelude::*;
 
@@ -21,21 +27,12 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
 common case. Use `CgroupDef::named(...).workers(N).work_type(...)`
 directly when the test needs to customize worker count or work type.
 
-Run with `cargo ktstr test --kernel 7.0` (see
-[Getting Started](getting-started.md) for setup). A passing run is
-one nextest line per test; the VM boot, scenario, and teardown all
-happen inside the reported duration:
+Run with `cargo ktstr test --kernel ../linux` or a released kernel
+version such as `7.0` (see [Getting Started](getting-started.md) for
+setup). A passing run is one nextest line per test; the VM boot,
+scenario, and teardown all happen inside the reported duration —
+[Getting Started](getting-started.md#run-it) shows a full transcript.
 
-<!-- captured: cargo ktstr test --kernel 7.0 -- -E 'test(failure_dump_renders_bss_fields)' | ktstr 0.23.0 | kernel 7.0.14 -->
-```text
-cargo ktstr: resolved kernel "7.0"
-...
- Nextest run ID 24c18577-... with nextest profile: default
-    Starting 1 test across 121 binaries (12531 tests skipped)
-        PASS [  34.451s] (1/1) ktstr::failure_dump_e2e ktstr/failure_dump_renders_bss_fields
-...
-     Summary [  34.490s] 1 test run: 1 passed, 12531 skipped
-```
 
 Every test gets the same machinery for free: a fresh VM per test (no
 state shared between tests), a failure dump with BTF-rendered
@@ -48,9 +45,45 @@ into gauntlet variants across topology presets — see
 
 > [!WARNING]
 > No worker checks run by default. The example above passes as long
-> as nothing crashes — it does not assert fairness, starvation, or
-> gaps. Opt in with `not_starved = true` and the threshold
+> as nothing crashes — it does not assert worker progress, fairness,
+> or stuck gaps. Opt in with `not_stuck = true` and the threshold
 > attributes; see [Checking](concepts/checking.md) for the model.
+
+## Common shapes
+
+```rust,ignore
+// Baseline: run the canned steady scenario under EEVDF.
+#[ktstr_test(llcs = 1, cores = 2, threads = 1)]
+fn baseline(ctx: &Ctx) -> Result<AssertResult> {
+    scenarios::steady(ctx)
+}
+
+// Scheduler smoke test: crash/watchdog failures plus worker-progress checks.
+#[ktstr_test(
+    scheduler = MY_SCHED,
+    llcs = 2,
+    cores = 2,
+    threads = 1,
+    not_stuck = true,
+)]
+fn scheduler_smoke(ctx: &Ctx) -> Result<AssertResult> {
+    scenarios::steady(ctx)
+}
+
+// Custom shape: two cgroups pinned to different LLCs.
+#[ktstr_test(scheduler = MY_SCHED, llcs = 2, cores = 2, threads = 1)]
+fn split_llc(ctx: &Ctx) -> Result<AssertResult> {
+    execute_defs(ctx, vec![
+        CgroupDef::named("left").cpuset(CpusetSpec::Llc(0)),
+        CgroupDef::named("right").cpuset(CpusetSpec::Llc(1)),
+    ])
+}
+```
+
+Start with the smallest shape that can fail for the behavior you care
+about. Add topology, workers, snapshots, and temporal assertions when
+they give you a new signal; otherwise they only make the run slower and
+the failure harder to read.
 
 ## Where to go next
 

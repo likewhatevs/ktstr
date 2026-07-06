@@ -7,6 +7,12 @@ binary once: its default args, how to parse its output, the metrics
 it emits, the checks that gate them, and the files it needs packed
 into the guest.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Declare</strong><p>Use <code>#[derive(Payload)]</code> to name the binary, args, metrics, and expected checks.</p></div>
+<div class="kt-doc-card"><strong>Pack</strong><p>Include the executable and helper files in the guest initramfs automatically.</p></div>
+<div class="kt-doc-card"><strong>Gate</strong><p>Parse JSON, exit codes, and metric leaves into sidecars and regression checks.</p></div>
+</div>
+
 ## Declaring a payload {#derive-payload}
 
 `#[derive(Payload)]` on a marker struct generates a `const Payload`.

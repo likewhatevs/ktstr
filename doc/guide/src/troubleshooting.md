@@ -1,5 +1,15 @@
 # Troubleshooting
 
+Most failures fall into one of three buckets: host setup, kernel or
+scheduler discovery, and runtime verdicts from the VM. Match the exact
+message first, then use the linked section for the smallest fix.
+
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Host setup</strong><p>Toolchain packages, <code>/dev/kvm</code>, hugepages, cgroups, flock, and cache state.</p></div>
+<div class="kt-doc-card"><strong>Kernel + scheduler</strong><p>Kernel resolution, BTF mismatch, missing <code>scx_*</code> binaries, verifier rejection, and load errors.</p></div>
+<div class="kt-doc-card"><strong>Runtime verdicts</strong><p>Worker checks, stuck-task observations, dumps, replay commands, and CI-only flakes.</p></div>
+</div>
+
 Find your error message, jump to its section:
 
 | You see | Go to |
@@ -194,7 +204,7 @@ download-specific errors.
 ## Scheduler not found
 
 ```text
-scheduler 'scx_mitosis' not found. Set KTSTR_SCHEDULER or
+scheduler 'scx_my_sched' not found. Set KTSTR_SCHEDULER or
 place it next to the test binary or in target/{debug,release}/
 ```
 
@@ -224,7 +234,7 @@ the host. The order depends on how the test was launched:
 
 **Fixes:**
 
-- `cargo build -p scx_mitosis` — on the orchestrated path this only
+- `cargo build -p scx_my_sched` — on the orchestrated path this only
   primes the cache; on the bare path it makes the probe hit.
 - Set `KTSTR_SCHEDULER=/path/to/binary` (or the per-name
   `KTSTR_SCHEDULER_BIN_<NAME>` variant).
@@ -277,8 +287,8 @@ R1 invalid mem access 'scalar'
 processed 186 insns (limit 1000000) max_states_per_insn 0 total_states 7 peak_states 7 mark_read 0
 ```
 
-<!-- captured: cargo ktstr verifier --kernel 7.0 (fixture scheduler with --verify-loop rejection knob) | ktstr 0.23.0 | kernel 7.0.14 -->
 
+<!-- captured: cargo ktstr verifier --kernel 7.0 (fixture scheduler with --verify-loop rejection knob) | ktstr 0.23.0 | kernel 7.0.14 -->
 The in-guest BPF verifier rejected the program, so the scheduler
 never attached. Read the log bottom-up: the last few lines name the
 rejected instruction (`R1 invalid mem access 'scalar'`) and the
@@ -302,8 +312,8 @@ libbpf: failed to load BPF skeleton 'bpf_bpf': -EINVAL
 Error: Failed to load BPF program
 ```
 
-<!-- captured: cargo ktstr test (scx-ktstr, scenario_coverage) | ktstr 0.23.0 | kernel: local git build c5d2724 (7.1 merge window, reports 7.0.0) -->
 
+<!-- captured: cargo ktstr test (scx-ktstr, scenario_coverage) | ktstr 0.23.0 | kernel: local git build c5d2724 (7.1 merge window, reports 7.0.0) -->
 ktstr surfaces this as `scheduler did not turn on — scheduler process
 exited during BPF load/startup` in verifier cells, or as a scheduler
 death / `no test result received from guest` in test runs — with the
@@ -361,7 +371,7 @@ overcommit.
 The diagnostic fields split the cause in two:
 
 - `port_exists=false` — the virtio-console port device never
-  appeared in the guest. Almost always a slow or starved boot (or an
+  appeared in the guest. Almost always a slow or CPU-deprived boot (or an
   early guest panic — check the `--- diagnostics ---` console tail).
 - `port_exists=true` — the port exists but writes did not complete.
   This is a host-side virtio-console issue, not guest CPU
@@ -370,11 +380,11 @@ The diagnostic fields split the cause in two:
 **Fixes (for the `port_exists=false` case):**
 
 - Pass `--no-perf-mode` (or `KTSTR_NO_PERF_MODE=1`) to reduce
-  host-side contention starving the guest's vCPU threads.
+  host-side contention that deprives the guest's vCPU threads.
 - Reduce the test's topology — fewer vCPUs boot faster.
 - KASAN / KCSAN / lockdep kernels add substantial boot overhead;
   re-run on a non-instrumented kernel to separate instrumentation
-  cost from a real stall.
+  cost from a real scheduler watchdog event.
 
 ## Insufficient hugepages
 

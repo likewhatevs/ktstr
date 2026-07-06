@@ -6,6 +6,12 @@ counter only ever advance? Does a utilization metric stay near its
 mean once warmup ends? Does a load average converge before a
 deadline?
 
+<div class="kt-steps">
+<div class="kt-step" data-step="1"><strong>Capture</strong><p>Enable periodic snapshots so ktstr records comparable samples during the run.</p></div>
+<div class="kt-step" data-step="2"><strong>Project</strong><p>Turn BPF state or scx_stats paths into one typed <code>SeriesField&lt;T&gt;</code>.</p></div>
+<div class="kt-step" data-step="3"><strong>Assert</strong><p>Apply monotonicity, rate, convergence, ratio, or scalar checks to one verdict.</p></div>
+</div>
+
 The shape is two-stage: build a [`SampleSeries`](#sampleseries) from
 the drained periodic captures, then **project** a
 [`SeriesField<T>`](#seriesfield) — one column of `T`-typed values

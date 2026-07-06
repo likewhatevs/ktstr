@@ -14,7 +14,7 @@ use super::*;
 /// macro accepts `assert = Assert::NO_OVERRIDES.foo()`-style chains
 /// at the scheduler level. The `#[ktstr_test]` proc macro does NOT
 /// accept an `assert = …` attribute on test entries; per-field
-/// attribute shortcuts (`max_gap_ms = N`, `not_starved = true`, …)
+/// attribute shortcuts (`max_gap_ms = N`, `not_stuck = true`, …)
 /// compose into the equivalent struct literal at expansion time.
 ///
 /// Merge order: `Assert::default_checks()` -> `Scheduler.assert` -> per-test `assert`.
@@ -30,7 +30,7 @@ use super::*;
 ///     .merge(&sched_assert)
 ///     .merge(&Assert::NO_OVERRIDES.max_gap_ms(5000));
 ///
-/// assert_eq!(merged.not_starved, None);              // not opted in
+/// assert_eq!(merged.not_stuck, None);              // not opted in
 /// assert_eq!(merged.max_imbalance_ratio, Some(5.0)); // from sched
 /// assert_eq!(merged.max_gap_ms, Some(5000));         // from test
 /// ```
@@ -53,14 +53,15 @@ use super::*;
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Assert {
     // Worker checks
-    /// Enable starvation, fairness spread, and gap checks across
+    /// Enable zero-work, fairness-spread, and stuck-gap checks across
     /// worker reports. `Some(true)` enables, `Some(false)` explicitly
     /// disables (overriding any enabling merge from a lower layer),
     /// `None` inherits from the merge parent.
-    pub not_starved: Option<bool>,
+    #[serde(alias = "not_starved")]
+    pub not_stuck: Option<bool>,
     /// Enable per-worker CPU isolation checks (ensure workers remain
     /// within their assigned cpuset). Same tri-state semantics as
-    /// `not_starved`.
+    /// `not_stuck`.
     pub isolation: Option<bool>,
     /// Max per-worker scheduling gap in milliseconds. Fails the
     /// assertion if any worker's longest off-CPU stretch exceeds this.
@@ -97,7 +98,7 @@ pub struct Assert {
     /// Both are computed from the same underlying
     /// [`WorkerReport::wake_latencies_ns`] samples — see
     /// [`assert_benchmarks`] for the threshold path and
-    /// [`assert_not_starved`] for the reporting path. A bare
+    /// [`assert_not_stuck`] for the reporting path. A bare
     /// comparison of `max_p99_wake_latency_ns` against
     /// `CgroupStats::p99_wake_latency_us` is a unit-mismatch bug;
     /// `assert_benchmarks` never does this — it consumes the raw
@@ -120,7 +121,7 @@ pub struct Assert {
     /// sampled CPU's local DSQ grew beyond this.
     pub max_local_dsq_depth: Option<u32>,
     /// Treat an rq_clock-stuck verdict from the monitor as a hard failure. Same
-    /// tri-state semantics as `not_starved`.
+    /// tri-state semantics as `not_stuck`.
     pub fail_on_rq_clock_stuck: Option<bool>,
     /// Minimum number of consecutive samples that must exceed the
     /// monitor threshold before a verdict is raised. Smooths out
@@ -268,7 +269,7 @@ impl Assert {
                 None => writeln!(out, "  {name:<38}: none").unwrap(),
             }
         }
-        row(&mut out, "not_starved", &self.not_starved);
+        row(&mut out, "not_stuck", &self.not_stuck);
         row(&mut out, "isolation", &self.isolation);
         row(&mut out, "max_gap_ms", &self.max_gap_ms);
         row(&mut out, "max_spread_pct", &self.max_spread_pct);
@@ -319,7 +320,7 @@ impl Assert {
     /// the const is for spread-into-struct-literal composition, the
     /// const fn is the method-style entry point.
     pub const NO_OVERRIDES: Assert = Assert {
-        not_starved: None,
+        not_stuck: None,
         isolation: None,
         max_gap_ms: None,
         max_spread_pct: None,
@@ -351,7 +352,7 @@ impl Assert {
     /// overrides.
     ///
     /// For spread-into-struct-literal composition
-    /// (`Assert { not_starved: Some(true), ..Assert::NO_OVERRIDES }`)
+    /// (`Assert { not_stuck: Some(true), ..Assert::NO_OVERRIDES }`)
     /// use the equivalent const [`Self::NO_OVERRIDES`]; this const fn
     /// is the method-style entry point that pairs with `.verdict()`
     /// and the builder setters.
@@ -382,8 +383,8 @@ impl Assert {
         Verdict::with_assert(self)
     }
 
-    pub const fn check_not_starved(mut self) -> Self {
-        self.not_starved = Some(true);
+    pub const fn check_not_stuck(mut self) -> Self {
+        self.not_stuck = Some(true);
         self
     }
 
@@ -487,7 +488,7 @@ impl Assert {
     /// only opt-in part). Retained as public API for callers composing an
     /// `Assert` who need to know whether any worker check is set.
     pub const fn has_worker_checks(&self) -> bool {
-        self.not_starved.is_some()
+        self.not_stuck.is_some()
             || self.isolation.is_some()
             || self.max_gap_ms.is_some()
             || self.max_spread_pct.is_some()
@@ -518,9 +519,9 @@ impl Assert {
         // this way until `const fn` can call `Option::or`; at that
         // point the 21 match blocks collapse to 21 `.or()` calls.
         Assert {
-            not_starved: match other.not_starved {
+            not_stuck: match other.not_stuck {
                 Some(v) => Some(v),
-                None => self.not_starved,
+                None => self.not_stuck,
             },
             isolation: match other.isolation {
                 Some(v) => Some(v),
@@ -610,7 +611,7 @@ impl Assert {
     /// Extract an `AssertPlan` for worker-side checks.
     pub(crate) fn worker_plan(&self) -> AssertPlan {
         AssertPlan {
-            not_starved: self.not_starved.unwrap_or(false),
+            not_stuck: self.not_stuck.unwrap_or(false),
             isolation: self.isolation.unwrap_or(false),
             max_gap_ms: self.max_gap_ms,
             max_spread_pct: self.max_spread_pct,
@@ -744,7 +745,7 @@ impl Assert {
     /// Const-fn builder for [`Self::expect_scx_bpf_error_contains`].
     /// Chains with the other const-fn setters so a scheduler-def or
     /// per-test assertion block can compose
-    /// `Assert::NO_OVERRIDES.expect_scx_bpf_error_contains(...).check_not_starved()`.
+    /// `Assert::NO_OVERRIDES.expect_scx_bpf_error_contains(...).check_not_stuck()`.
     ///
     /// Empty strings panic at construction (an empty literal would
     /// silently match every message and turn this assertion into a

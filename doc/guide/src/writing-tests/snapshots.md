@@ -8,6 +8,12 @@ code reads it back through a typed accessor whose errors carry the
 available alternatives — a typo'd map or field name tells you what
 was actually there.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>One-shot</strong><p><code>Op::capture_snapshot</code> freezes at a scenario point and stores a named report.</p></div>
+<div class="kt-doc-card"><strong>Watch</strong><p>Watch snapshots capture state when a kernel symbol is written.</p></div>
+<div class="kt-doc-card"><strong>Periodic</strong><p>Periodic capture turns repeated snapshots into time-series assertions.</p></div>
+</div>
+
 Three capture triggers share this machinery:
 
 | Capture | Trigger | The question it answers |

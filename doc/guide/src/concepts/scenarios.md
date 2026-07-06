@@ -7,6 +7,12 @@ conditions have names: `scenarios::steady(ctx)` produces the same
 reproducible condition against every scheduler you point it at, which
 is what makes results comparable across schedulers and commits.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Start simple</strong><p><code>steady</code> proves the scheduler survives ordinary balanced load.</p></div>
+<div class="kt-doc-card"><strong>Add movement</strong><p>Cpuset, affinity, and cgroup-change scenarios exercise dynamic callbacks.</p></div>
+<div class="kt-doc-card"><strong>Mix signals</strong><p>Specialized scenarios combine workload types when one primitive is too narrow.</p></div>
+</div>
+
 ```rust,ignore
 use ktstr::prelude::*;
 

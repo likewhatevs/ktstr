@@ -1,8 +1,8 @@
 //! `AssertPlan` builder + dispatch tests. Pins per-check toggles,
 //! custom-threshold paths (gap, spread), and the
-//! permissive-overrides-strip-but-keep-starved invariant that
+//! permissive-overrides-strip-but-keep-no-progress invariant that
 //! lets a per-test plan loosen specific bounds without
-//! suppressing genuine starvation findings.
+//! suppressing genuine zero-work findings.
 
 use super::tests_common::rpt;
 use super::*;
@@ -10,15 +10,15 @@ use super::*;
 #[test]
 fn plan_default_empty() {
     let plan = AssertPlan::new();
-    assert!(!plan.not_starved);
+    assert!(!plan.not_stuck);
     assert!(!plan.isolation);
     assert!(plan.max_gap_ms.is_none());
     assert!(plan.max_spread_pct.is_none());
 }
 
 #[test]
-fn plan_check_not_starved() {
-    let plan = AssertPlan::new().check_not_starved();
+fn plan_check_not_stuck() {
+    let plan = AssertPlan::new().check_not_stuck();
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
     let r = plan.assert_cgroup(&reports, None, None);
     assert!(r.is_pass());
@@ -27,7 +27,7 @@ fn plan_check_not_starved() {
 
 #[test]
 fn plan_check_isolation_with_cpuset() {
-    let plan = AssertPlan::new().check_not_starved().check_isolation();
+    let plan = AssertPlan::new().check_not_stuck().check_isolation();
     let expected: BTreeSet<usize> = [0, 1].into_iter().collect();
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 4], 50)];
     let r = plan.assert_cgroup(&reports, Some(&expected), None);
@@ -49,7 +49,7 @@ fn plan_isolation_skipped_without_cpuset() {
 
 #[test]
 fn plan_custom_gap_threshold_pass() {
-    let plan = AssertPlan::new().check_not_starved().max_gap_ms(3000);
+    let plan = AssertPlan::new().check_not_stuck().max_gap_ms(3000);
     // 2500ms gap: passes with 3000ms threshold.
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 2500)];
     let r = plan.assert_cgroup(&reports, None, None);
@@ -58,7 +58,7 @@ fn plan_custom_gap_threshold_pass() {
 
 #[test]
 fn plan_custom_gap_threshold_fail() {
-    let plan = AssertPlan::new().check_not_starved().max_gap_ms(1500);
+    let plan = AssertPlan::new().check_not_stuck().max_gap_ms(1500);
     // 2000ms gap: fails with 1500ms threshold.
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 2000)];
     let r = plan.assert_cgroup(&reports, None, None);
@@ -78,7 +78,7 @@ fn plan_custom_gap_threshold_produces_stuck_kind() {
     // AssertPlan's custom-threshold stuck re-emission must tag
     // DetailKind::Stuck so downstream kind filters (and any test
     // expecting structural categorization) see it.
-    let plan = AssertPlan::new().check_not_starved().max_gap_ms(1500);
+    let plan = AssertPlan::new().check_not_stuck().max_gap_ms(1500);
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 2000)];
     let r = plan.assert_cgroup(&reports, None, None);
     assert!(r.is_fail());
@@ -91,14 +91,14 @@ fn plan_custom_gap_threshold_produces_stuck_kind() {
 }
 
 #[test]
-fn plan_permissive_overrides_clear_unfair_and_stuck_preserve_starved() {
+fn plan_permissive_overrides_clear_unfair_and_stuck_preserve_no_progress() {
     // When custom spread + gap thresholds are permissive enough
     // to absorb the default-threshold failures, AssertPlan must
     // strip the Unfair/Stuck details it generated but keep the
-    // Starved detail (kind-based filtering, not substring match).
+    // NoProgress detail (kind-based filtering, not substring match).
     //
     // Worker 1: 10% off-CPU, 500ms gap — fair, not stuck.
-    // Worker 2: work=0 — starved (kind=Starved).
+    // Worker 2: work=0 — no progress (kind=NoProgress).
     // Worker 3: 80% off-CPU — would trigger default Unfair; absorbed
     //                         by permissive max_spread_pct.
     // Worker 4: 4000ms gap — would trigger default Stuck; absorbed
@@ -110,14 +110,14 @@ fn plan_permissive_overrides_clear_unfair_and_stuck_preserve_starved() {
         rpt(4, 1000, 5e9 as u64, 5e8 as u64, &[0], 4000),
     ];
     let mut plan = AssertPlan::new();
-    plan.not_starved = true;
+    plan.not_stuck = true;
     plan.max_spread_pct = Some(100.0);
     plan.max_gap_ms = Some(5000);
     let r = plan.assert_cgroup(&reports, None, None);
     assert!(
         r.failure_details()
-            .any(|d| matches!(d.kind, DetailKind::Starved)),
-        "starved detail must survive permissive overrides: {:?}",
+            .any(|d| matches!(d.kind, DetailKind::NoProgress)),
+        "no-progress detail must survive permissive overrides: {:?}",
         r.outcomes
     );
     assert!(
@@ -132,13 +132,13 @@ fn plan_permissive_overrides_clear_unfair_and_stuck_preserve_starved() {
         "stuck detail must be cleared by permissive gap: {:?}",
         r.outcomes
     );
-    assert!(!r.is_pass(), "starved alone is still a failure");
+    assert!(!r.is_pass(), "no-progress alone is still a failure");
 }
 
 #[test]
 fn plan_no_checks_always_passes() {
     let plan = AssertPlan::new();
-    let reports = [rpt(1, 0, 0, 0, &[], 5000)]; // starved + stuck
+    let reports = [rpt(1, 0, 0, 0, &[], 5000)]; // no progress + stuck
     let r = plan.assert_cgroup(&reports, None, None);
     assert!(r.is_pass(), "no checks enabled should pass");
 }
@@ -148,7 +148,7 @@ fn plan_default_all_checks_disabled() {
     // Default::default() must produce the same state as new() —
     // all checks disabled, no gap override.
     let plan = AssertPlan::default();
-    assert!(!plan.not_starved, "default must not enable not_starved");
+    assert!(!plan.not_stuck, "default must not enable not_stuck");
     assert!(!plan.isolation, "default must not enable isolation");
     assert!(
         plan.max_gap_ms.is_none(),
@@ -170,7 +170,7 @@ fn assert_plan_default_equals_new() {
     // equivalence and that both produce identical assert_cgroup results.
     let d = AssertPlan::default();
     let n = AssertPlan::new();
-    assert_eq!(d.not_starved, n.not_starved);
+    assert_eq!(d.not_stuck, n.not_stuck);
     assert_eq!(d.isolation, n.isolation);
     assert_eq!(d.max_gap_ms, n.max_gap_ms);
     assert_eq!(d.max_spread_pct, n.max_spread_pct);
@@ -182,23 +182,23 @@ fn assert_plan_default_equals_new() {
 }
 
 #[test]
-fn plan_starved_still_fails_with_custom_gap() {
-    // A starved worker (work_units=0) must still cause failure even
+fn plan_no_progress_still_fails_with_custom_gap() {
+    // A no-progress worker (work_units=0) must still cause failure even
     // when the custom max_gap_ms threshold is high enough that the
     // gap check passes.
-    let plan = AssertPlan::new().check_not_starved().max_gap_ms(5000);
+    let plan = AssertPlan::new().check_not_stuck().max_gap_ms(5000);
     let reports = [
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 100), // healthy
-        rpt(2, 0, 5e9 as u64, 0, &[1], 1500),            // starved, gap < threshold
+        rpt(2, 0, 5e9 as u64, 0, &[1], 1500),            // no progress, gap < threshold
     ];
     let r = plan.assert_cgroup(&reports, None, None);
     assert!(
         !r.is_pass(),
-        "starved worker must fail even with relaxed gap threshold"
+        "no-progress worker must fail even with relaxed gap threshold"
     );
     assert!(
         r.failure_details()
-            .any(|d| matches!(d.kind, DetailKind::Starved))
+            .any(|d| matches!(d.kind, DetailKind::NoProgress))
     );
     // The gap (1500ms) is below the 5000ms threshold, so no Stuck detail.
     assert!(
@@ -210,17 +210,14 @@ fn plan_starved_still_fails_with_custom_gap() {
 // -- per-cgroup telemetry decoupled from worker-check assertions --
 
 #[test]
-fn telemetry_populated_without_not_starved() {
+fn telemetry_populated_without_not_stuck() {
     // Per-cgroup telemetry is pure measurement and must populate even
-    // when `not_starved` is NOT set — here only a (huge, non-firing)
+    // when `not_stuck` is NOT set — here only a (huge, non-firing)
     // max_gap_ms is configured. Pre-fix the CgroupStats build lived
-    // inside `if self.not_starved`, so stats.cgroups came back [] despite
+    // inside `if self.not_stuck`, so stats.cgroups came back [] despite
     // real reports.
     let plan = AssertPlan::new().max_gap_ms(1_000_000);
-    assert!(
-        !plan.not_starved,
-        "guard: not_starved must be off for this pin"
-    );
+    assert!(!plan.not_stuck, "guard: not_stuck must be off for this pin");
     let reports = [
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
         rpt(2, 1000, 5e9 as u64, 6e8 as u64, &[1], 60),
@@ -229,7 +226,7 @@ fn telemetry_populated_without_not_starved() {
     assert_eq!(
         r.stats.cgroups.len(),
         1,
-        "telemetry must be built without a not_starved check; got {:?}",
+        "telemetry must be built without a not_stuck check; got {:?}",
         r.stats.cgroups,
     );
     assert_eq!(r.stats.total_workers, 2);
@@ -240,8 +237,8 @@ fn telemetry_populated_without_not_starved() {
 fn empty_cgroup_surfaced_not_dropped() {
     // A declared cgroup whose handle collected zero reports must surface
     // as a num_workers=0 telemetry entry, not vanish. Pre-fix
-    // assert_not_starved early-returned empty stats on reports.is_empty().
-    let plan = AssertPlan::new().check_not_starved();
+    // assert_not_stuck early-returned empty stats on reports.is_empty().
+    let plan = AssertPlan::new().check_not_stuck();
     let r = plan.assert_cgroup(&[], None, None);
     assert_eq!(
         r.stats.cgroups.len(),
@@ -253,12 +250,12 @@ fn empty_cgroup_surfaced_not_dropped() {
 }
 
 #[test]
-fn max_spread_pct_fires_without_not_starved() {
+fn max_spread_pct_fires_without_not_stuck() {
     // A custom spread bound must be evaluated on its own field, not gated
-    // behind not_starved (pre-fix the re-check was nested inside
-    // `if self.not_starved`, so max_spread_pct alone was inert).
+    // behind not_stuck (pre-fix the re-check was nested inside
+    // `if self.not_stuck`, so max_spread_pct alone was inert).
     let plan = AssertPlan::new().max_spread_pct(5.0);
-    assert!(!plan.not_starved);
+    assert!(!plan.not_stuck);
     let reports = [
         rpt(1, 1000, 1e9 as u64, 1e8 as u64, &[0], 50), // 10% off-cpu
         rpt(2, 1000, 1e9 as u64, 9e8 as u64, &[1], 50), // 90% off-cpu -> spread 80%
@@ -267,22 +264,22 @@ fn max_spread_pct_fires_without_not_starved() {
     assert!(
         r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Unfair)),
-        "spread 80% > 5% threshold must fire Unfair without not_starved; got {:?}",
+        "spread 80% > 5% threshold must fire Unfair without not_stuck; got {:?}",
         r.outcomes,
     );
 }
 
 #[test]
-fn max_gap_ms_fires_without_not_starved() {
+fn max_gap_ms_fires_without_not_stuck() {
     // Same independence pin for the custom gap bound.
     let plan = AssertPlan::new().max_gap_ms(100);
-    assert!(!plan.not_starved);
+    assert!(!plan.not_stuck);
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 500)];
     let r = plan.assert_cgroup(&reports, None, None);
     assert!(
         r.failure_details()
             .any(|d| matches!(d.kind, DetailKind::Stuck)),
-        "gap 500ms > 100ms threshold must fire Stuck without not_starved; got {:?}",
+        "gap 500ms > 100ms threshold must fire Stuck without not_stuck; got {:?}",
         r.outcomes,
     );
 }
@@ -290,10 +287,10 @@ fn max_gap_ms_fires_without_not_starved() {
 #[test]
 fn assert_cgroup_no_double_count_telemetry() {
     // Exactly one CgroupStats per assert_cgroup call, even with both
-    // not_starved and a custom spread bound active — guards against the
+    // not_stuck and a custom spread bound active — guards against the
     // telemetry being built twice once it no longer flows through a single
-    // assert_not_starved call.
-    let plan = AssertPlan::new().check_not_starved().max_spread_pct(50.0);
+    // assert_not_stuck call.
+    let plan = AssertPlan::new().check_not_stuck().max_spread_pct(50.0);
     let reports = [
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
         rpt(2, 1000, 5e9 as u64, 6e8 as u64, &[1], 60),

@@ -15,7 +15,7 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum DetailKind {
     /// A worker made zero progress.
-    Starved,
+    NoProgress,
     /// A worker was stuck off-CPU longer than the gap threshold.
     Stuck,
     /// Spread between best and worst worker exceeded the fairness threshold.
@@ -645,11 +645,11 @@ impl std::fmt::Display for AssertDetail {
 /// assert!(a.is_pass());
 ///
 /// let mut b = AssertResult::pass();
-/// b.record_fail(AssertDetail::new(DetailKind::Starved, "worker starved"));
+/// b.record_fail(AssertDetail::new(DetailKind::NoProgress, "worker made no progress"));
 ///
 /// a.merge(b);
 /// assert!(a.is_fail());
-/// assert!(a.failure_details().any(|d| d.kind == DetailKind::Starved));
+/// assert!(a.failure_details().any(|d| d.kind == DetailKind::NoProgress));
 /// ```
 /// Structured measurement value attached via
 /// [`AssertResult::note_value`] / [`Verdict::note_value`].

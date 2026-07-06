@@ -6,6 +6,12 @@ resolves that kernel (building and caching it when needed) and wraps
 `cargo nextest run`, so nextest's filtering, retries, and parallelism
 all apply.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong><a href="running-tests/failures.html">A run failed</a></strong><p>Read the assertion, timeline, scheduler log, monitor verdict, dumps, and replay command.</p></div>
+<div class="kt-doc-card"><strong><a href="running-tests/gauntlet.html">Need topology coverage?</a></strong><p>Expand one test across presets, then select variants with nextest filters or a CI budget.</p></div>
+<div class="kt-doc-card"><strong><a href="running-tests/runs.html">Need regression gates?</a></strong><p>Use run sidecars and <code>perf-delta</code> instead of comparing terminal output by eye.</p></div>
+</div>
+
 ## Quick reference
 
 ```sh
@@ -21,6 +27,15 @@ cargo ktstr test --kernel ../linux -- -E 'test(/^ktstr/)'
 # Run ignored gauntlet variants
 cargo ktstr test --kernel ../linux -- --run-ignored ignored-only -E 'test(gauntlet/)'
 ```
+
+More patterns:
+
+| Goal | Command |
+|---|---|
+| Re-run one exact ktstr case | `cargo ktstr test --kernel 7.0 -- -E 'test(=ktstr/my_test)'` |
+| Compare two kernels | `cargo ktstr test --kernel 6.14 --kernel 7.0` |
+| Stay inside a CI time budget | `KTSTR_BUDGET_SECS=300 cargo ktstr test --kernel 7.0` |
+| Open the same VM shape manually | `cargo ktstr shell --kernel 7.0 --test my_test` |
 
 ## What's in this chapter
 
@@ -56,19 +71,22 @@ under one of four prefixes:
 This is what those names look like in a real run:
 
 <!-- captured: cargo ktstr test --kernel 7.0 -- --features integration -E 'test(=ktstr/failure_dump_renders_bss_fields)' | ktstr 0.23.0 | kernel 7.0.14 -->
-```text
+<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">nextest case name: base ktstr variant</span></div>
+
+<pre>
  Nextest run ID 98581174-246f-4824-a170-50992df166d7 with nextest profile: default
     Starting 1 test across 121 binaries (12531 tests skipped)
-        PASS [  34.459s] (1/1) ktstr::failure_dump_e2e ktstr/failure_dump_renders_bss_fields
-```
+        <span class="t-grn">PASS [  34.459s] (1/1) ktstr::failure_dump_e2e ktstr/failure_dump_renders_bss_fields</span></pre></div>
 
 <!-- captured: KTSTR_KERNEL=7.0 cargo nextest list --features integration -E 'test(gauntlet/) & binary(worktype_coverage_fork_gauntlet_e2e)' | ktstr 0.23.0 | kernel 7.0.14 -->
-```text
+<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">nextest list: gauntlet variants</span></div>
+
+<pre>
 ...
 ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/smt-3llc
 ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/tiny-1llc
 ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/tiny-2llc
-```
+</pre></div>
 
 Filter by prefix with `-E 'test(/^ktstr/)'` or `-E 'test(/^gauntlet/)'`.
 
@@ -106,9 +124,9 @@ tests with the highest marginal coverage per estimated second, with
 duration estimates accounting for VM boot overhead by vCPU count. A
 summary is printed to stderr during budget-mode listing:
 
-```text
-ktstr budget: 42/1200 tests, 295/300s used, 38/38 configurations covered
-```
+<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">budget-mode selection summary</span></div>
+
+<pre><span class="t-b">ktstr budget:</span> <span class="t-grn">42/1200 tests</span>, 295/300s used, 38/38 configurations covered</pre></div>
 
 ## Testing your own scheduler
 

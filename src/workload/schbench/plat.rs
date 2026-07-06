@@ -208,7 +208,7 @@ impl PlatStats {
     /// schbench's `combine_message_thread_stats` (`schbench.c:1690-1699`)
     /// folds EVERY worker UNCONDITIONALLY, and the per-interval accumulator
     /// is re-folded over all workers each interval (`schbench.c:1785-1792`),
-    /// so an idle/starved worker — whose stat is empty (`min == 0`, e.g.
+    /// so an idle/no-progress worker — whose stat is empty (`min == 0`, e.g.
     /// every delta dropped by the `delta > 0` gate) — gets folded after a
     /// non-empty one, where `0 < d->min` fires and ZEROS the accumulated
     /// `min`. That is a real schbench bug: a single idle worker corrupts

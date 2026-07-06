@@ -1,6 +1,6 @@
 //! `assert_benchmarks` and `AssertPlan` benchmarking-path tests:
 //! p99 / CV / iteration-rate thresholds, the ns-vs-µs unit
-//! invariant, wake-latency populate paths in `assert_not_starved`,
+//! invariant, wake-latency populate paths in `assert_not_stuck`,
 //! schedstat run-delay aggregation, and the `assert_cgroup`
 //! migration-ratio gate.
 
@@ -91,8 +91,8 @@ fn assert_benchmarks_p99_n100_below_old_p100_passes() {
 }
 
 #[test]
-fn assert_not_starved_p99_n100_is_99_microseconds() {
-    // assert_not_starved computes p99 as microseconds on the per-cgroup
+fn assert_not_stuck_p99_n100_is_99_microseconds() {
+    // assert_not_stuck computes p99 as microseconds on the per-cgroup
     // CgroupStats. Samples = [1000, 2000, ..., 100_000] ns
     // (100 values at kilo-ns spacing) so the reported p99 is
     // exactly 99.0us with the correct index
@@ -100,7 +100,7 @@ fn assert_not_starved_p99_n100_is_99_microseconds() {
     // An off-by-one that returns sorted[99] would yield 100us.
     let latencies: Vec<u64> = (1..=100).map(|v: u64| v * 1000).collect();
     let reports = [rpt_with_latencies(1, latencies, 100, 5_000_000_000)];
-    let r = assert_not_starved(&reports);
+    let r = assert_not_stuck(&reports);
     assert_eq!(
         r.stats.cgroups[0].p99_wake_latency_us, 99.0,
         "p99 must equal 99.0us (sorted[98] = 99_000ns), got {}us",
@@ -167,12 +167,12 @@ fn assert_p99_ns_threshold_compares_against_ns_latencies() {
          1000 (treating it as µs)",
     );
 
-    // Cross-check the reporting path: `assert_not_starved` computes
+    // Cross-check the reporting path: `assert_not_stuck` computes
     // `CgroupStats::p99_wake_latency_us` in MICROSECONDS (ns / 1000). A
     // regression that conflated the reporting field with the threshold input
     // would surface as either `us == ns` (forgot to divide) or
     // `us == ns/1_000_000` (double-converted).
-    let stats = assert_not_starved(&reports);
+    let stats = assert_not_stuck(&reports);
     assert_eq!(
         stats.stats.cgroups[0].p99_wake_latency_us, 5.0,
         "5000 ns / 1000 = 5.0 µs — if this renders as 5000 (forgot /1000) \
@@ -348,7 +348,7 @@ fn assert_benchmarks_wake_latency_cv_zero_mean_yields_inconclusive() {
     );
 }
 
-// -- wake latency stats in assert_not_starved --
+// -- wake latency stats in assert_not_stuck --
 //
 // These assert the PER-CGROUP reductions (`r.stats.cgroups[0].*`), the
 // source CgroupStats fields. The run-level surface that re-pools them
@@ -358,12 +358,12 @@ fn assert_benchmarks_wake_latency_cv_zero_mean_yields_inconclusive() {
 // run's run-level pooled value reproduces these cgroup_stats reductions.
 
 #[test]
-fn not_starved_wake_latency_stats() {
+fn not_stuck_wake_latency_stats() {
     let reports = [
         rpt_with_latencies(1, vec![1000, 2000, 3000, 4000, 5000], 100, 5_000_000_000),
         rpt_with_latencies(2, vec![6000, 7000, 8000, 9000, 10000], 200, 5_000_000_000),
     ];
-    let r = assert_not_starved(&reports);
+    let r = assert_not_stuck(&reports);
     assert!(r.is_pass(), "{:?}", r.outcomes);
     let cg = &r.stats.cgroups[0];
     // p99 of [1000,2000,3000,4000,5000,6000,7000,8000,9000,10000] in us:
@@ -388,9 +388,9 @@ fn not_starved_wake_latency_stats() {
 }
 
 #[test]
-fn not_starved_empty_latencies_zero_stats() {
+fn not_stuck_empty_latencies_zero_stats() {
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
-    let r = assert_not_starved(&reports);
+    let r = assert_not_stuck(&reports);
     assert!(r.is_pass());
     assert_eq!(r.stats.cgroups[0].p99_wake_latency_us, 0.0);
     assert_eq!(r.stats.cgroups[0].median_wake_latency_us, 0.0);
@@ -398,12 +398,12 @@ fn not_starved_empty_latencies_zero_stats() {
 }
 
 #[test]
-fn not_starved_run_delay_stats() {
+fn not_stuck_run_delay_stats() {
     let mut w1 = rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50);
     w1.schedstat_run_delay_ns = 100_000; // 100us
     let mut w2 = rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 50);
     w2.schedstat_run_delay_ns = 300_000; // 300us
-    let r = assert_not_starved(&[w1, w2]);
+    let r = assert_not_stuck(&[w1, w2]);
     assert!(r.is_pass(), "{:?}", r.outcomes);
     // mean_run_delay = (100 + 300) / 2 = 200us
     assert!(
@@ -424,7 +424,7 @@ fn not_starved_run_delay_stats() {
 #[test]
 fn plan_benchmarks_p99_via_assert_cgroup() {
     let plan = AssertPlan {
-        not_starved: false,
+        not_stuck: false,
         isolation: false,
         max_gap_ms: None,
         max_spread_pct: None,
@@ -460,7 +460,7 @@ fn plan_migration_ratio_gate() {
     w.iterations = 100;
     // ratio = 10/100 = 0.10, threshold 0.05 → fail
     let plan = AssertPlan {
-        not_starved: false,
+        not_stuck: false,
         isolation: false,
         max_gap_ms: None,
         max_spread_pct: None,
@@ -490,7 +490,7 @@ fn plan_migration_ratio_gate_pass() {
     w.iterations = 100;
     // ratio = 2/100 = 0.02, threshold 0.05 → pass
     let plan = AssertPlan {
-        not_starved: false,
+        not_stuck: false,
         isolation: false,
         max_gap_ms: None,
         max_spread_pct: None,
@@ -523,7 +523,7 @@ fn plan_migration_ratio_zero_iterations_is_inconclusive_not_pass() {
     w.migration_count = 5;
     w.iterations = 0; // zero denominator — workload did not iterate
     let plan = AssertPlan {
-        not_starved: false,
+        not_stuck: false,
         isolation: false,
         max_gap_ms: None,
         max_spread_pct: None,
@@ -566,7 +566,7 @@ fn plan_migration_ratio_zero_iterations_is_inconclusive_not_pass() {
 #[test]
 fn plan_benchmarks_iteration_rate_via_assert_cgroup() {
     let plan = AssertPlan {
-        not_starved: false,
+        not_stuck: false,
         isolation: false,
         max_gap_ms: None,
         max_spread_pct: None,

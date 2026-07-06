@@ -14,14 +14,14 @@ use super::*;
 /// downstream shell pipelines that parse by line number.
 ///
 /// The numeric order pinned here matches the struct definition:
-/// worker checks first (not_starved → max_spread_pct), then
+/// worker checks first (not_stuck → max_spread_pct), then
 /// throughput, benchmarking, monitor, NUMA blocks, and the
 /// reproducer-matcher tail (`expect_scx_bpf_error_contains` /
 /// `expect_scx_bpf_error_matches`).
 #[test]
 fn assert_format_human_field_order_is_stable() {
     let a = Assert::NO_OVERRIDES
-        .check_not_starved()
+        .check_not_stuck()
         .check_isolation()
         .max_gap_ms(2000)
         .max_spread_pct(15.0)
@@ -41,7 +41,7 @@ fn assert_format_human_field_order_is_stable() {
     // max_slow_tier_ratio so a reorder that floats one of
     // them past the matcher tail trips here.
     let pairs = [
-        ("not_starved", "isolation"),
+        ("not_stuck", "isolation"),
         ("isolation", "max_gap_ms"),
         ("max_gap_ms", "max_spread_pct"),
         ("max_spread_pct", "max_throughput_cv"),
@@ -89,11 +89,11 @@ fn assert_format_human_no_overrides_renders_all_none() {
     );
     // `format_human` is header-free — the first line carries
     // the first threshold field. A reintroduced banner header
-    // would push `not_starved` off the first-line position
+    // would push `not_stuck` off the first-line position
     // and trip this assertion; pinning the first row's shape
     // keeps the caller-owns-header contract intact.
     assert!(
-        out.starts_with("  not_starved"),
+        out.starts_with("  not_stuck"),
         "format_human must open with the first threshold row \
          (header ownership belongs to the caller); got: {out}",
     );
@@ -139,7 +139,10 @@ fn is_skip_false_for_pass_result() {
 fn is_skip_false_for_fail_result() {
     let mut r = AssertResult::pass();
 
-    r.record_fail(AssertDetail::new(DetailKind::Starved, "worker starved"));
+    r.record_fail(AssertDetail::new(
+        DetailKind::NoProgress,
+        "worker made no progress",
+    ));
     assert!(
         !r.is_skip(),
         "fail is not a skip even with non-skip details"
@@ -308,7 +311,7 @@ fn wire_format_omits_derived_ratio_keys() {
 /// Computed accessor edge cases not covered by the main
 /// stored-vs-computed equivalence test: non-finite inputs and
 /// a negative median. The production populator at
-/// [`assert_not_starved`] sanitizes upstream values before
+/// [`assert_not_stuck`] sanitizes upstream values before
 /// they reach `CgroupStats`, but the accessors are reader-
 /// side helpers that may be called on deserialized sidecars,
 /// hand-constructed fixtures, or future call sites that don't

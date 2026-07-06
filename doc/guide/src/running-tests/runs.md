@@ -17,8 +17,8 @@ fails the build when metrics regress past their gates.
 
 2. **List runs**:
 
-   <!-- captured: cargo ktstr stats list | ktstr 0.23.0 -->
-   ```text
+      <!-- captured: cargo ktstr stats list | ktstr 0.23.0 -->
+      ```text
    $ cargo ktstr stats list
     RUN                   TESTS  DATE                  ARCH
     7.0.14-73730e0-dirty  1      2026-07-04T23:28:34Z  x86_64
@@ -215,8 +215,8 @@ kernel version, host context, and timestamps. Discovery tooling:
 - `cargo ktstr stats explain-sidecar --run ID` — why optional
   fields are absent, per sidecar, with a fix when one exists:
 
-  <!-- captured: cargo ktstr stats explain-sidecar --run 7.0.14-73730e0-dirty | ktstr 0.23.0 -->
-  ```text
+    <!-- captured: cargo ktstr stats explain-sidecar --run 7.0.14-73730e0-dirty | ktstr 0.23.0 -->
+    ```text
   walked 1 sidecar file(s), parsed 1 valid
 
   test: throughput_gate

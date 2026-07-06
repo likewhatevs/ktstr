@@ -13,6 +13,12 @@ Watch snapshots are supported on x86_64 and aarch64 KVM hosts; each
 architecture's KVM plumbing maps the slots onto its native
 hardware-watchpoint facility.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Arm</strong><p>Register a symbol with <code>Op::watch_snapshot</code> before the workload runs.</p></div>
+<div class="kt-doc-card"><strong>Trap</strong><p>KVM guest debug catches writes with hardware watchpoint slots.</p></div>
+<div class="kt-doc-card"><strong>Read</strong><p>Each fire becomes a named snapshot available from the post-VM bridge.</p></div>
+</div>
+
 ## Issuing a watch
 
 ```rust,ignore

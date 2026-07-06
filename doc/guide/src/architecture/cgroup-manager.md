@@ -7,6 +7,12 @@ cleanup has to survive kernel-side hangs a buggy scheduler can cause.
 parent directory, with timeouts and failure caps where the kernel can
 wedge.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Create</strong><p>Set up the ktstr parent, enable controllers, and create scenario cgroups.</p></div>
+<div class="kt-doc-card"><strong>Mutate</strong><p>Move tasks, resize cpusets, update weights, and exercise scheduler callbacks.</p></div>
+<div class="kt-doc-card"><strong>Clean up</strong><p>Bound teardown so a broken scheduler does not hang the host-side test forever.</p></div>
+</div>
+
 Scenarios reach it through `Ctx.cgroups`. The typical pattern pairs it
 with the RAII guard:
 

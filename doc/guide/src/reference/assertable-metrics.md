@@ -9,6 +9,12 @@ significance thresholds, and a display unit. This chapter explains
 those fields, how to enumerate the live catalog, which workloads emit
 which metric families, and how to pin a per-test regression gate.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Catalog</strong><p><code>stats list-metrics</code> prints the live registry directly from the code.</p></div>
+<div class="kt-doc-card"><strong>Direction</strong><p>Metric polarity decides whether higher, lower, or target values are regressions.</p></div>
+<div class="kt-doc-card"><strong>Gate</strong><p>Per-test <code>PerfDeltaAssertion</code> checks sidecar metrics against baselines.</p></div>
+</div>
+
 ## The catalog: `stats list-metrics`
 
 The authoritative, always-current catalog is the command output — it
@@ -17,9 +23,9 @@ enumerates the registry directly, so it never drifts from the code:
 ```sh
 cargo ktstr stats list-metrics          # text table
 cargo ktstr stats list-metrics --json   # machine-readable (includes kind + every field)
+<!-- captured: cargo ktstr stats list-metrics | ktstr 0.23.0 | host-side (no VM) -->
 ```
 
-<!-- captured: cargo ktstr stats list-metrics | ktstr 0.23.0 | host-side (no VM) -->
 ```text
  NAME                                    POLARITY       DEFAULT_ABS  DEFAULT_REL  UNIT
  worst_spread                            lower          5            0.25         %

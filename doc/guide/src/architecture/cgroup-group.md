@@ -4,6 +4,12 @@
 prevents cgroup leaks when workload spawning or any other operation
 fails between cgroup creation and cleanup.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Track</strong><p>Remember every cgroup created during a scenario scope.</p></div>
+<div class="kt-doc-card"><strong>Guard</strong><p>Drop cleanup runs on both happy paths and early errors.</p></div>
+<div class="kt-doc-card"><strong>Warn</strong><p>Teardown errors are logged with context instead of panicking in <code>Drop</code>.</p></div>
+</div>
+
 ```rust,ignore
 #[must_use = "dropping a CgroupGroup immediately destroys the cgroups it manages"]
 pub struct CgroupGroup<'a> { /* ... */ }

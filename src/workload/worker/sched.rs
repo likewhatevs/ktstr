@@ -36,7 +36,7 @@ use super::super::config::SchedPolicy;
 /// "zero observed" — the previous `(0, 0, 0)`-on-failure return was
 /// silently ambiguous across "CONFIG_SCHED_INFO off", "I/O error",
 /// and "worker genuinely did no work yet", which caused
-/// `assert_not_starved`-style checks to ratify the wrong invariant
+/// `assert_not_stuck`-style checks to ratify the wrong invariant
 /// on kernels without `CONFIG_SCHED_INFO`.
 ///
 /// Emits a process-wide one-shot warning to stderr the first time

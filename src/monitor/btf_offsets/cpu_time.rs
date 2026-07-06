@@ -5,6 +5,8 @@
 //!
 //! - `struct kernel_cpustat` (`include/linux/kernel_stat.h`):
 //!   `u64 cpustat[NR_STATS]` per CPU, indexed by `enum cpu_usage_stat`.
+//!   The array is not assumed to be at offset 0; kernels with
+//!   `CONFIG_NO_HZ_COMMON` can place idle-accounting fields before it.
 //! - `struct kernel_stat` (`include/linux/kernel_stat.h`):
 //!   `unsigned long irqs_sum` plus `unsigned int softirqs[NR_SOFTIRQS]`
 //!   per CPU.
@@ -154,10 +156,9 @@ const _: () = {
 #[derive(Debug, Clone, Copy)]
 pub struct CpuTimeOffsets {
     /// Offset of `cpustat[]` (the `u64[NR_STATS]` array) within
-    /// `struct kernel_cpustat`. Always zero on every kernel since
-    /// the introduction of the struct, but resolved via BTF rather
-    /// than hard-coded so a future addition of a leading field
-    /// surfaces here without silent miscalculation.
+    /// `struct kernel_cpustat`. Resolved via BTF rather than
+    /// hard-coded because kernels with `CONFIG_NO_HZ_COMMON` can
+    /// place idle-accounting fields before the array.
     pub kernel_cpustat_cpustat: usize,
     /// Offset of `irqs_sum` (`unsigned long`) within `struct kernel_stat`.
     pub kstat_irqs_sum: usize,
@@ -211,8 +212,8 @@ mod tests {
     /// Resolve [`CpuTimeOffsets`] against the test vmlinux. Pins the
     /// offsets the per-CPU CPU-time / softirq / IRQ failure-dump
     /// capture path consumes:
-    ///   - `kernel_cpustat::cpustat[]` is at offset 0 (single-field
-    ///     struct).
+    ///   - `kernel_cpustat::cpustat[]` resolves to a u64-aligned
+    ///     field offset.
     ///   - `kstat.irqs_sum` and `kstat.softirqs[]` are distinct.
     ///   - `tick_sched::iowait_sleeptime` is best-effort (Some only
     ///     under CONFIG_NO_HZ_COMMON).
@@ -231,9 +232,9 @@ mod tests {
             Err(e) => skip!("CpuTimeOffsets::from_btf failed: {e}"),
         };
         assert_eq!(
-            offsets.kernel_cpustat_cpustat, 0,
-            "kernel_cpustat::cpustat[] must live at offset 0 \
-             (single-field struct in include/linux/kernel_stat.h)"
+            offsets.kernel_cpustat_cpustat % std::mem::align_of::<u64>(),
+            0,
+            "kernel_cpustat::cpustat[] must be u64-aligned"
         );
         assert_ne!(
             offsets.kstat_irqs_sum, offsets.kstat_softirqs,

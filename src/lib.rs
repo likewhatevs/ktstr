@@ -159,7 +159,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! ktstr = "0.23.0"
+//! ktstr = "0.24.0"
 //! ```
 //!
 //! Lean dev-dep (drops the host-tooling crates: tikv-jemallocator,
@@ -167,7 +167,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! ktstr = { version = "0.23.0", default-features = false }
+//! ktstr = { version = "0.24.0", default-features = false }
 //! ```
 //!
 //! # Feature flags
@@ -202,7 +202,7 @@
 //! - [`remote_cache`] -- GitHub Actions cache integration
 //! - [`scenario`] -- declarative ops API (`CgroupDef`, `Step`, `Op`, `Backdrop`, `execute_defs`, `execute_steps`, `execute_scenario`)
 //! - [`scenario::scenarios`] -- curated canned scenarios for common patterns
-//! - [`mod@assert`] -- pass/fail assertions (starvation, isolation, fairness)
+//! - [`mod@assert`] -- pass/fail assertions (worker progress, isolation, fairness)
 //! - [`test_support`] -- `#[ktstr_test]` runtime and registration
 //! - [`topology`] -- CPU topology abstraction (LLCs, NUMA nodes)
 //! - [`verifier`] -- BPF verifier log parsing, cycle detection, and output formatting

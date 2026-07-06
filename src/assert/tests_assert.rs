@@ -10,7 +10,7 @@ use super::*;
 #[test]
 fn assert_no_overrides_has_no_checks() {
     let v = Assert::NO_OVERRIDES;
-    assert!(v.not_starved.is_none());
+    assert!(v.not_stuck.is_none());
     assert!(v.isolation.is_none());
     assert!(v.max_gap_ms.is_none());
     assert!(v.max_spread_pct.is_none());
@@ -20,7 +20,7 @@ fn assert_no_overrides_has_no_checks() {
 #[test]
 fn assert_default_checks_is_no_overrides() {
     let v = Assert::default_checks();
-    assert!(v.not_starved.is_none());
+    assert!(v.not_stuck.is_none());
     assert!(v.isolation.is_none());
     assert!(v.max_imbalance_ratio.is_none());
     assert!(v.max_local_dsq_depth.is_none());
@@ -388,11 +388,11 @@ fn has_monitor_thresholds_true_when_any_set() {
 fn assert_merge_other_overrides_self() {
     let base = Assert::NO_OVERRIDES;
     let other = Assert::NO_OVERRIDES
-        .check_not_starved()
+        .check_not_stuck()
         .max_gap_ms(5000)
         .max_imbalance_ratio(2.0);
     let merged = base.merge(&other);
-    assert_eq!(merged.not_starved, Some(true));
+    assert_eq!(merged.not_stuck, Some(true));
     assert_eq!(merged.max_gap_ms, Some(5000));
     assert_eq!(merged.max_imbalance_ratio, Some(2.0));
 }
@@ -400,10 +400,10 @@ fn assert_merge_other_overrides_self() {
 #[test]
 fn assert_merge_preserves_self_when_other_is_none() {
     let base = Assert::NO_OVERRIDES
-        .check_not_starved()
+        .check_not_stuck()
         .max_imbalance_ratio(4.0);
     let merged = base.merge(&Assert::NO_OVERRIDES);
-    assert_eq!(merged.not_starved, Some(true));
+    assert_eq!(merged.not_stuck, Some(true));
     assert_eq!(merged.max_imbalance_ratio, Some(4.0));
 }
 
@@ -417,23 +417,23 @@ fn assert_merge_other_takes_precedence() {
 
 #[test]
 fn assert_merge_last_some_wins() {
-    let base = Assert::NO_OVERRIDES.check_not_starved();
+    let base = Assert::NO_OVERRIDES.check_not_stuck();
     let other = Assert::NO_OVERRIDES.check_isolation();
     let merged = base.merge(&other);
-    assert_eq!(merged.not_starved, Some(true));
+    assert_eq!(merged.not_stuck, Some(true));
     assert_eq!(merged.isolation, Some(true));
 }
 
 #[test]
-fn assert_merge_child_disables_not_starved() {
-    let base = Assert::NO_OVERRIDES.check_not_starved();
+fn assert_merge_child_disables_not_stuck() {
+    let base = Assert::NO_OVERRIDES.check_not_stuck();
     let other = Assert {
-        not_starved: Some(false),
+        not_stuck: Some(false),
         ..Assert::NO_OVERRIDES
     };
     let merged = base.merge(&other);
-    assert_eq!(merged.not_starved, Some(false));
-    assert!(!merged.worker_plan().not_starved);
+    assert_eq!(merged.not_stuck, Some(false));
+    assert!(!merged.worker_plan().not_stuck);
 }
 
 #[test]
@@ -451,14 +451,14 @@ fn assert_merge_child_disables_isolation() {
 #[test]
 fn assert_worker_plan_extraction() {
     let v = Assert::NO_OVERRIDES
-        .check_not_starved()
+        .check_not_stuck()
         .check_isolation()
         .max_gap_ms(3000)
         .max_spread_pct(25.0);
-    assert_eq!(v.not_starved, Some(true));
+    assert_eq!(v.not_stuck, Some(true));
     assert_eq!(v.isolation, Some(true));
     let plan = v.worker_plan();
-    assert!(plan.not_starved);
+    assert!(plan.not_stuck);
     assert!(plan.isolation);
     assert_eq!(plan.max_gap_ms, Some(3000));
     assert_eq!(plan.max_spread_pct, Some(25.0));
@@ -466,7 +466,7 @@ fn assert_worker_plan_extraction() {
 
 #[test]
 fn assert_cgroup_delegates_to_plan() {
-    let v = Assert::NO_OVERRIDES.check_not_starved();
+    let v = Assert::NO_OVERRIDES.check_not_stuck();
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
     let r = v.assert_cgroup(&reports, None);
     assert!(r.is_pass());
@@ -503,7 +503,7 @@ fn assert_monitor_thresholds_defaults_when_none() {
 #[test]
 fn assert_chain_all_setters() {
     let v = Assert::NO_OVERRIDES
-        .check_not_starved()
+        .check_not_stuck()
         .check_isolation()
         .max_gap_ms(1000)
         .max_spread_pct(5.0)
@@ -513,7 +513,7 @@ fn assert_chain_all_setters() {
         .sustained_samples(3)
         .max_fallback_rate(100.0)
         .max_keep_last_rate(50.0);
-    assert_eq!(v.not_starved, Some(true));
+    assert_eq!(v.not_stuck, Some(true));
     assert_eq!(v.isolation, Some(true));
     assert_eq!(v.max_gap_ms, Some(1000));
     assert_eq!(v.max_spread_pct, Some(5.0));
@@ -615,7 +615,7 @@ fn assert_merge_three_layers() {
         .max_fallback_rate(50.0);
     let test = Assert::NO_OVERRIDES.max_gap_ms(5000);
     let merged = defaults.merge(&sched).merge(&test);
-    assert_eq!(merged.not_starved, None);
+    assert_eq!(merged.not_stuck, None);
     assert_eq!(merged.max_imbalance_ratio, Some(2.0));
     assert_eq!(merged.max_fallback_rate, Some(50.0));
     assert_eq!(merged.max_gap_ms, Some(5000));
@@ -625,11 +625,11 @@ fn assert_merge_three_layers() {
 #[test]
 fn assert_merge_no_overrides_preserves_base() {
     let base = Assert::NO_OVERRIDES
-        .check_not_starved()
+        .check_not_stuck()
         .max_imbalance_ratio(4.0)
         .fail_on_rq_clock_stuck(true);
     let merged = base.merge(&Assert::NO_OVERRIDES);
-    assert_eq!(merged.not_starved, Some(true));
+    assert_eq!(merged.not_stuck, Some(true));
     assert_eq!(merged.max_imbalance_ratio, Some(4.0));
     assert_eq!(merged.fail_on_rq_clock_stuck, Some(true));
 }
@@ -639,7 +639,7 @@ fn assert_merge_no_overrides_preserves_base() {
 #[test]
 fn assert_merge_no_overrides_is_left_identity() {
     let merged = Assert::NO_OVERRIDES.merge(&Assert::default_checks());
-    assert!(merged.not_starved.is_none());
+    assert!(merged.not_stuck.is_none());
     assert!(merged.max_imbalance_ratio.is_none());
     assert!(merged.max_gap_ms.is_none());
     assert!(merged.isolation.is_none());
@@ -655,7 +655,7 @@ fn assert_merge_runtime_chain_with_no_overrides_yields_defaults() {
     let merged = Assert::default_checks()
         .merge(&scheduler_assert)
         .merge(&test_assert);
-    assert!(merged.not_starved.is_none());
+    assert!(merged.not_stuck.is_none());
     assert!(merged.max_imbalance_ratio.is_none());
     assert!(merged.max_local_dsq_depth.is_none());
     assert!(merged.fail_on_rq_clock_stuck.is_none());
@@ -667,9 +667,9 @@ fn assert_merge_overrides_fields() {
     let overrides = Assert::NO_OVERRIDES
         .max_imbalance_ratio(5.0)
         .max_gap_ms(1000)
-        .check_not_starved();
+        .check_not_stuck();
     let merged = base.merge(&overrides);
-    assert_eq!(merged.not_starved, Some(true));
+    assert_eq!(merged.not_stuck, Some(true));
     assert_eq!(merged.max_imbalance_ratio, Some(5.0));
     assert_eq!(merged.max_gap_ms, Some(1000));
 }
@@ -685,14 +685,14 @@ fn assert_merge_later_overrides_earlier() {
 #[test]
 fn assert_worker_plan_extracts_fields() {
     let v = Assert::NO_OVERRIDES
-        .check_not_starved()
+        .check_not_stuck()
         .check_isolation()
         .max_gap_ms(500)
         .max_spread_pct(10.0);
-    assert_eq!(v.not_starved, Some(true));
+    assert_eq!(v.not_stuck, Some(true));
     assert_eq!(v.isolation, Some(true));
     let plan = v.worker_plan();
-    assert!(plan.not_starved);
+    assert!(plan.not_stuck);
     assert!(plan.isolation);
     assert_eq!(plan.max_gap_ms, Some(500));
     assert_eq!(plan.max_spread_pct, Some(10.0));
@@ -1491,7 +1491,7 @@ fn assert_implements_serialize_and_deserialize() {
 #[test]
 fn assert_serde_roundtrip_preserves_every_non_skipped_field() {
     let a = Assert {
-        not_starved: Some(true),
+        not_stuck: Some(true),
         isolation: Some(true),
         max_gap_ms: Some(1234),
         max_spread_pct: Some(12.5),
@@ -1516,7 +1516,7 @@ fn assert_serde_roundtrip_preserves_every_non_skipped_field() {
     };
     let json = serde_json::to_string(&a).unwrap();
     let b: Assert = serde_json::from_str(&json).unwrap();
-    assert_eq!(a.not_starved, b.not_starved);
+    assert_eq!(a.not_stuck, b.not_stuck);
     assert_eq!(a.isolation, b.isolation);
     assert_eq!(a.max_gap_ms, b.max_gap_ms);
     assert_eq!(a.max_spread_pct, b.max_spread_pct);
@@ -1711,11 +1711,11 @@ fn assert_result_outcome_folds_outcomes_vec() {
     assert!(d.message.contains("topology missing"));
 
     // Fail result → Outcome::Fail carrying the non-Skip detail.
-    let fail_result = AssertResult::fail(AssertDetail::new(DetailKind::Starved, "boom"));
+    let fail_result = AssertResult::fail(AssertDetail::new(DetailKind::NoProgress, "boom"));
     let Outcome::Fail(d) = fail_result.outcome() else {
         panic!("expected Outcome::Fail, got {:?}", fail_result.outcome());
     };
-    assert_eq!(d.kind, DetailKind::Starved);
+    assert_eq!(d.kind, DetailKind::NoProgress);
     assert!(d.message.contains("boom"));
 }
 
@@ -1766,11 +1766,11 @@ fn assert_result_outcome_multi_skip_returns_first_payload() {
 #[test]
 fn outcome_as_ref_preserves_discriminant_and_payload() {
     assert!(matches!(Outcome::Pass.as_ref(), OutcomeRef::Pass));
-    let fail = Outcome::Fail(AssertDetail::new(DetailKind::Starved, "boom"));
+    let fail = Outcome::Fail(AssertDetail::new(DetailKind::NoProgress, "boom"));
     let OutcomeRef::Fail(d) = fail.as_ref() else {
         panic!("Fail as_ref should be Fail variant");
     };
-    assert_eq!(d.kind, DetailKind::Starved);
+    assert_eq!(d.kind, DetailKind::NoProgress);
     assert!(d.message.contains("boom"));
     let skip = Outcome::Skip(AssertDetail::new(DetailKind::Skip, "missing"));
     let OutcomeRef::Skip(d) = skip.as_ref() else {
@@ -1816,7 +1816,7 @@ fn assert_result_outcome_ref_matches_owned_outcome_shape() {
     // Any Fail → Fail with first Fail's payload.
     let mut fail = AssertResult::pass();
     fail.record_fail(AssertDetail::new(DetailKind::Stuck, "first-fail"));
-    fail.record_fail(AssertDetail::new(DetailKind::Starved, "second-fail"));
+    fail.record_fail(AssertDetail::new(DetailKind::NoProgress, "second-fail"));
     let OutcomeRef::Fail(d) = fail.outcome_ref() else {
         panic!("any-Fail stream should yield Fail");
     };
@@ -1886,7 +1886,7 @@ fn assert_result_outcome_ref_matches_owned_outcome_shape() {
 fn assert_result_record_fail_appends_and_folds_fail() {
     let mut r = AssertResult::pass();
     assert!(r.is_pass(), "fresh AssertResult::pass is_pass");
-    r.record_fail(AssertDetail::new(DetailKind::Starved, "first"));
+    r.record_fail(AssertDetail::new(DetailKind::NoProgress, "first"));
     r.record_fail(AssertDetail::new(DetailKind::Stuck, "second"));
     assert_eq!(r.outcomes.len(), 2);
     assert!(r.is_fail());
@@ -1894,7 +1894,7 @@ fn assert_result_record_fail_appends_and_folds_fail() {
         panic!("expected Outcome::Fail, got {:?}", r.outcome());
     };
     // LEFT-wins on Fail+Fail ties: first record_fail's detail wins.
-    assert_eq!(d.kind, DetailKind::Starved);
+    assert_eq!(d.kind, DetailKind::NoProgress);
     assert!(d.message.contains("first"));
     // Iteration helper surfaces both fails.
     let collected: Vec<&AssertDetail> = r.failure_details().collect();

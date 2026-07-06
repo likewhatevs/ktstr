@@ -10,7 +10,7 @@ sandbox.
 
 ## When to use it
 
-- **Multi-tenant CI hosts** where unbounded parallelism starves
+- **Multi-tenant CI hosts** where unbounded parallelism overloads
   concurrent jobs but the full [performance-mode](performance-mode.md)
   contract (RT scheduling, hugepages, NUMA mbind) is too heavy.
 - **Kernel builds beside perf-mode tests** — the build's shared lock

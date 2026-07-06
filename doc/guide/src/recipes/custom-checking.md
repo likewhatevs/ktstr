@@ -5,6 +5,12 @@ schedulers that tolerate higher imbalance, different gap
 thresholds, or relaxed event rates — and opt in to the checks that
 are off by default.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Opt in</strong><p>Start with <code>not_stuck</code>, isolation, and explicit rate or gap thresholds.</p></div>
+<div class="kt-doc-card"><strong>Override</strong><p>Set scheduler-wide defaults, then tighten or relax individual tests.</p></div>
+<div class="kt-doc-card"><strong>Read</strong><p>Separate worker-gate failures from monitor verdicts and scheduler crashes.</p></div>
+</div>
+
 > [!WARNING]
 > `Assert::default_checks()` is `Assert::NO_OVERRIDES` — every
 > field `None`. Until a scheduler-level or per-test override sets a
@@ -79,7 +85,7 @@ Attributes on `#[ktstr_test]` merge last and win:
 ```rust,ignore
 #[ktstr_test(
     scheduler = RELAXED,
-    not_starved = true,
+    not_stuck = true,
     max_gap_ms = 5000,
     max_imbalance_ratio = 10.0,
     sustained_samples = 10,
@@ -90,8 +96,8 @@ fn high_imbalance_test(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-`not_starved = true` enables the starvation, fairness-spread, and
-scheduling-gap checks as a group; each threshold can still be
+`not_stuck = true` enables the zero-work-units, fairness-spread, and
+stuck-gap checks as a group; each threshold can still be
 overridden independently. The full attribute list and default
 thresholds live in the
 [`#[ktstr_test]` reference](../writing-tests/ktstr-test-macro.md).
@@ -123,7 +129,7 @@ will evaluate, with `none` for unset fields.
 ```rust,ignore
 fn my_scenario(ctx: &Ctx) -> Result<AssertResult> {
     let checks = Assert::NO_OVERRIDES
-        .check_not_starved()
+        .check_not_stuck()
         .max_gap_ms(3000);
 
     let steps = vec![/* ... */];

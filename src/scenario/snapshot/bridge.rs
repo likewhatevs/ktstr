@@ -166,7 +166,7 @@ pub const MAX_STORED_EVENTS: usize = 1024;
 /// instead of grepping stderr.
 ///
 /// Distinct from [`crate::assert::AssertDetail`]: an `AssertDetail`
-/// is a per-assertion outcome (Starved / Stuck / etc.); a
+/// is a per-assertion outcome (NoProgress / Stuck / etc.); a
 /// `SnapshotBridgeEvent` is a per-bridge meta-event about the
 /// storage pipeline itself. Mixing them at the assertion level
 /// would conflate "scheduler behavior failed" with "bridge dropped

@@ -6,6 +6,12 @@ It owns interactive VM shells, host topology inspection, host-wide
 per-thread profiling, and lock introspection — the operations a
 scheduler author reaches for when investigating a test failure.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Inspect</strong><p><code>topo</code>, <code>kernel</code>, and <code>locks</code> explain the host and cache state.</p></div>
+<div class="kt-doc-card"><strong>Debug</strong><p><code>shell</code> boots an interactive VM with the same kernel and topology plumbing.</p></div>
+<div class="kt-doc-card"><strong>Profile</strong><p><code>ctprof</code> captures host scheduler state before and after suspicious workloads.</p></div>
+</div>
+
 To run the test suite, use
 [`cargo ktstr test`](cargo-ktstr.md#test); to reproduce a test as a
 self-contained script without a VM, use

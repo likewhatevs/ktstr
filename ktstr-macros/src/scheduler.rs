@@ -453,7 +453,7 @@ pub(crate) fn declare_scheduler_inner(
                 // `assert` lands in a `pub static`, so the expression
                 // must be const-evaluable. Unlike `constraints`, the
                 // canonical Assert pattern is METHOD-CHAINING on const
-                // fns (`Assert::NO_OVERRIDES.check_not_starved()...`),
+                // fns (`Assert::NO_OVERRIDES.check_not_stuck()...`),
                 // so the assert validator accepts MethodCall chains
                 // and Path-rooted Calls (`Assert::default_checks()`,
                 // `Some(x)`). Only bare single-segment lowercase
@@ -1090,7 +1090,7 @@ enum ConstEligibility {
     /// helper). Required because `Assert`'s canonical const
     /// constructors are snake_case: `Assert::NO_OVERRIDES`,
     /// `Assert::default_checks()`, and the
-    /// `Assert::NO_OVERRIDES.check_not_starved()` chain pattern.
+    /// `Assert::NO_OVERRIDES.check_not_stuck()` chain pattern.
     AllowConstMethodChains,
 }
 
@@ -1326,7 +1326,7 @@ const CONSTRAINTS_ACCEPTED_SHAPES: &str = "Use a struct literal `TopologyConstra
 /// Field-specific accepted-shapes sentence for `assert`.
 const ASSERT_ACCEPTED_SHAPES: &str = "Use a const path like `Assert::NO_OVERRIDES`, a const-fn call like \
      `Assert::default_checks()`, or a chain of const-fn setters like \
-     `Assert::NO_OVERRIDES.check_not_starved().max_gap_ms(50)`.";
+     `Assert::NO_OVERRIDES.check_not_stuck().max_gap_ms(50)`.";
 
 /// Walk a `TopologyConstraints { .. }` struct literal and reject
 /// fields whose literal values make the declared scheduler topology

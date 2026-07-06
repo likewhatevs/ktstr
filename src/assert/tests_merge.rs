@@ -8,11 +8,11 @@ use super::*;
 
 #[test]
 fn merge_cgroups() {
-    let r1 = assert_not_starved(&[
+    let r1 = assert_not_stuck(&[
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50),
         rpt(2, 1000, 5e9 as u64, 6e8 as u64, &[0, 1], 60),
     ]);
-    let r2 = assert_not_starved(&[
+    let r2 = assert_not_stuck(&[
         rpt(3, 1000, 5e9 as u64, 25e8 as u64, &[2, 3], 50),
         rpt(4, 1000, 5e9 as u64, 26e8 as u64, &[2, 3], 50),
     ]);
@@ -25,8 +25,8 @@ fn merge_cgroups() {
 
 #[test]
 fn merge_takes_worst_gap() {
-    let r1 = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 100)]);
-    let r2 = assert_not_starved(&[rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 500)]);
+    let r1 = assert_not_stuck(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 100)]);
+    let r2 = assert_not_stuck(&[rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 500)]);
     let mut m = r1;
     m.merge(r2);
     assert_eq!(m.stats.worst_gap_ms, 500);
@@ -51,8 +51,8 @@ fn merge_takes_worst_gap_reverse_self_retains() {
     // gap (200ms on cpu 1). After merge, self must keep both
     // its 700ms AND its cpu 0 — not adopt cpu 1 from the
     // loser's report.
-    let r1 = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 700)]);
-    let r2 = assert_not_starved(&[rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 200)]);
+    let r1 = assert_not_stuck(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 700)]);
+    let r2 = assert_not_stuck(&[rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 200)]);
     let mut m = r1;
     m.merge(r2);
     assert_eq!(
@@ -68,11 +68,11 @@ fn merge_takes_worst_gap_reverse_self_retains() {
 
 #[test]
 fn merge_takes_worst_spread() {
-    let r1 = assert_not_starved(&[
+    let r1 = assert_not_stuck(&[
         rpt(1, 1000, 5e9 as u64, 1e9 as u64, &[0], 50),
         rpt(2, 1000, 5e9 as u64, 12e8 as u64, &[0], 50),
     ]); // spread = 4%
-    let r2 = assert_not_starved(&[
+    let r2 = assert_not_stuck(&[
         rpt(3, 1000, 5e9 as u64, 1e9 as u64, &[1], 50),
         rpt(4, 1000, 5e9 as u64, 15e8 as u64, &[1], 50),
     ]); // spread = 10%
@@ -126,8 +126,8 @@ fn merge_skip_plus_fail_is_fail_not_skip() {
 
 #[test]
 fn merge_accumulates_totals() {
-    let r1 = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)]);
-    let r2 = assert_not_starved(&[rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 50)]);
+    let r1 = assert_not_stuck(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)]);
+    let r2 = assert_not_stuck(&[rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 50)]);
     let mut m = r1;
     m.merge(r2);
     assert_eq!(m.stats.total_workers, 2);

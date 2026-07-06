@@ -1,4 +1,4 @@
-//! Worker-level checks: `assert_not_starved`, `assert_isolation`,
+//! Worker-level checks: `assert_not_stuck`, `assert_isolation`,
 //! gap / spread / stuck classification, single-worker passthroughs,
 //! and negative-diagnostic-message tests that pin the
 //! human-readable strings every consumer greps for.
@@ -8,7 +8,7 @@ use super::*;
 
 #[test]
 fn healthy_pass() {
-    let r = assert_not_starved(&[
+    let r = assert_not_stuck(&[
         rpt(1, 1000, 5_000_000_000, 500_000_000, &[0, 1], 50),
         rpt(2, 1000, 5_000_000_000, 600_000_000, &[0, 1], 60),
         rpt(3, 1000, 5_000_000_000, 550_000_000, &[0, 1], 45),
@@ -17,26 +17,26 @@ fn healthy_pass() {
 }
 
 #[test]
-fn starved_fail() {
-    let r = assert_not_starved(&[
+fn no_progress_fails() {
+    let r = assert_not_stuck(&[
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
         rpt(2, 0, 5e9 as u64, 5e9 as u64, &[0], 50),
     ]);
     assert!(r.is_fail());
     assert!(
         r.failure_details()
-            .any(|d| matches!(d.kind, DetailKind::Starved))
+            .any(|d| matches!(d.kind, DetailKind::NoProgress))
     );
 }
 
 /// work_units-vs-iterations split: a report with `work_units > 0` but
 /// `iterations == 0` (the naive-Custom-author footgun; `rpt` always sets
 /// `iterations: 0`) reports ZERO throughput — `CgroupStats::total_iterations`
-/// reads `iterations`, not `work_units` — yet PASSES the starvation gate,
+/// reads `iterations`, not `work_units` — yet PASSES the zero-work-units gate,
 /// which reads `work_units`. Pins both halves of the split and would catch a
 /// forbidden silent `iterations == 0 ? work_units` fallback in the reducer.
 #[test]
-fn work_units_without_iterations_is_zero_throughput_but_not_starved() {
+fn work_units_without_iterations_is_zero_throughput_but_not_stuck() {
     let reports = [
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50),
         rpt(2, 1000, 5e9 as u64, 6e8 as u64, &[0, 1], 50),
@@ -47,17 +47,17 @@ fn work_units_without_iterations_is_zero_throughput_but_not_starved() {
         "total_iterations reads WorkerReport::iterations (0), NOT work_units (1000)"
     );
     assert!(
-        assert_not_starved(&reports).is_pass(),
-        "the starvation gate reads work_units (1000 > 0), so it must pass"
+        assert_not_stuck(&reports).is_pass(),
+        "the zero-work-units gate reads work_units (1000 > 0), so it must pass"
     );
 }
 
 /// Inverse: `work_units == 0` but `iterations > 0` reports throughput
-/// (`total_iterations` sums `iterations`) yet trips the starvation gate
+/// (`total_iterations` sums `iterations`) yet trips the zero-work-units gate
 /// (which reads `work_units == 0`). Pins that the two counters are not
 /// interchangeable in either direction.
 #[test]
-fn iterations_without_work_units_reports_throughput_but_starves() {
+fn iterations_without_work_units_reports_throughput_but_is_not_stuck_failure() {
     let reports = [
         WorkerReport {
             iterations: 1000,
@@ -73,18 +73,21 @@ fn iterations_without_work_units_reports_throughput_but_starves() {
         2000,
         "total_iterations sums WorkerReport::iterations (1000+1000), independent of work_units (0)"
     );
-    let r = assert_not_starved(&reports);
-    assert!(r.is_fail(), "work_units == 0 must trip the starvation gate");
+    let r = assert_not_stuck(&reports);
+    assert!(
+        r.is_fail(),
+        "work_units == 0 must trip the zero-work-units gate"
+    );
     assert!(
         r.failure_details()
-            .any(|d| matches!(d.kind, DetailKind::Starved)),
-        "the starvation gate reads work_units == 0 → Starved"
+            .any(|d| matches!(d.kind, DetailKind::NoProgress)),
+        "the zero-work-units gate reads work_units == 0 → NoProgress"
     );
 }
 
 #[test]
 fn unfair_spread_fail() {
-    let r = assert_not_starved(&[
+    let r = assert_not_stuck(&[
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50), // 10%
         rpt(2, 500, 5e9 as u64, 4e9 as u64, &[0, 1], 50),  // 80%
         rpt(3, 800, 5e9 as u64, 2e9 as u64, &[0, 1], 50),  // 40%
@@ -98,7 +101,7 @@ fn unfair_spread_fail() {
 
 #[test]
 fn fair_oversubscribed_pass() {
-    let r = assert_not_starved(&[
+    let r = assert_not_stuck(&[
         rpt(1, 100, 5e9 as u64, (3.75e9) as u64, &[0], 50),
         rpt(2, 100, 5e9 as u64, (3.70e9) as u64, &[0], 50),
         rpt(3, 100, 5e9 as u64, (3.80e9) as u64, &[0], 50),
@@ -110,7 +113,7 @@ fn fair_oversubscribed_pass() {
 #[test]
 fn stuck_fail() {
     let threshold = gap_threshold_ms();
-    let r = assert_not_starved(&[
+    let r = assert_not_stuck(&[
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
         rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold + 500),
     ]);
@@ -154,7 +157,7 @@ fn spread_boundary() {
     // At threshold exactly - pass
     // Worker 1: 10% off-CPU, Worker 2: 10%+threshold off-CPU
     let at_threshold_ns = ((10.0 + threshold) / 100.0 * 5e9) as u64;
-    let r = assert_not_starved(&[
+    let r = assert_not_stuck(&[
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50), // 10%
         rpt(2, 1000, 5e9 as u64, at_threshold_ns, &[0], 50), // 10% + threshold
     ]);
@@ -165,7 +168,7 @@ fn spread_boundary() {
     );
     // Above threshold - fail
     let above_ns = ((15.0 + threshold) / 100.0 * 5e9) as u64;
-    let r = assert_not_starved(&[
+    let r = assert_not_stuck(&[
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50), // 10%
         rpt(2, 1000, 5e9 as u64, above_ns, &[0], 50),   // 10% + threshold + 5%
     ]);
@@ -174,25 +177,25 @@ fn spread_boundary() {
 
 #[test]
 fn empty_pass() {
-    assert!(assert_not_starved(&[]).is_pass());
+    assert!(assert_not_stuck(&[]).is_pass());
 }
 
 #[test]
 fn zero_wall_time() {
-    let r = assert_not_starved(&[
+    let r = assert_not_stuck(&[
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
         rpt(2, 0, 0, 0, &[], 0),
     ]);
     assert!(r.is_fail());
     assert!(
         r.failure_details()
-            .any(|d| matches!(d.kind, DetailKind::Starved))
+            .any(|d| matches!(d.kind, DetailKind::NoProgress))
     );
 }
 
 #[test]
 fn single_worker_always_pass() {
-    let r = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50)]);
+    let r = assert_not_stuck(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50)]);
     assert!(r.is_pass());
     assert_eq!(r.stats.total_workers, 1);
     assert_eq!(r.stats.cgroups.len(), 1);
@@ -200,7 +203,7 @@ fn single_worker_always_pass() {
 
 #[test]
 fn stats_accuracy() {
-    let r = assert_not_starved(&[
+    let r = assert_not_stuck(&[
         rpt(1, 1000, 5e9 as u64, 1e9 as u64, &[0], 50),  // 20%
         rpt(2, 1000, 5e9 as u64, 15e8 as u64, &[1], 60), // 30%
     ]);
@@ -223,7 +226,7 @@ fn isolation_empty_reports() {
 #[test]
 fn gap_boundary_at_threshold_pass() {
     let threshold = gap_threshold_ms();
-    let r = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold)]);
+    let r = assert_not_stuck(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold)]);
     assert!(
         r.is_pass(),
         "gap at threshold should pass: {:?}",
@@ -234,7 +237,7 @@ fn gap_boundary_at_threshold_pass() {
 #[test]
 fn gap_boundary_above_threshold_fail() {
     let threshold = gap_threshold_ms();
-    let r = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold + 1)]);
+    let r = assert_not_stuck(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold + 1)]);
     assert!(r.is_fail());
     assert!(
         r.failure_details()
@@ -245,7 +248,7 @@ fn gap_boundary_above_threshold_fail() {
 #[test]
 fn multiple_stuck_workers() {
     let threshold = gap_threshold_ms();
-    let r = assert_not_starved(&[
+    let r = assert_not_stuck(&[
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], threshold + 500),
         rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], threshold + 1500),
     ]);
@@ -261,13 +264,13 @@ fn multiple_stuck_workers() {
 fn migration_tracking() {
     let mut report = rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 2], 50);
     report.migration_count = 5;
-    let r = assert_not_starved(&[report]);
+    let r = assert_not_stuck(&[report]);
     assert_eq!(r.stats.total_migrations, 5);
 }
 
 #[test]
 fn single_worker_spread_zero() {
-    let r = assert_not_starved(&[rpt(1, 500, 5e9 as u64, 25e8 as u64, &[0, 1], 50)]);
+    let r = assert_not_stuck(&[rpt(1, 500, 5e9 as u64, 25e8 as u64, &[0, 1], 50)]);
     assert!(r.is_pass());
     let c = &r.stats.cgroups[0];
     // Single worker with measurable wall time: a real measured zero
@@ -278,9 +281,9 @@ fn single_worker_spread_zero() {
 #[test]
 fn zero_wall_time_nonzero_work() {
     // wall_time=0 but work_units>0: the worker did work but the timer
-    // didn't advance. Should not produce a starved failure since work was done.
+    // didn't advance. Should not produce a no-progress failure since work was done.
     // The off_cpu_pct computation skips this worker (no pcts entry).
-    let r = assert_not_starved(&[rpt(1, 100, 0, 0, &[0], 0)]);
+    let r = assert_not_stuck(&[rpt(1, 100, 0, 0, &[0], 0)]);
     assert!(
         r.is_pass(),
         "nonzero work with zero wall_time: {:?}",
@@ -343,26 +346,26 @@ fn isolation_all_unexpected_cpus() {
 // ---------------------------------------------------------------
 
 #[test]
-fn neg_starvation_zero_work_detected() {
-    let r = assert_not_starved(&[
+fn neg_no_progress_zero_work_detected() {
+    let r = assert_not_stuck(&[
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50),
-        rpt(2, 0, 5e9 as u64, 0, &[0], 0), // starved
+        rpt(2, 0, 5e9 as u64, 0, &[0], 0), // no progress
         rpt(3, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50),
     ]);
-    assert!(!r.is_pass(), "starvation must be caught");
-    let starved = r
+    assert!(!r.is_pass(), "zero-work worker must be caught");
+    let no_progress = r
         .failure_details()
-        .filter(|d| matches!(d.kind, DetailKind::Starved))
+        .filter(|d| matches!(d.kind, DetailKind::NoProgress))
         .count();
-    assert_eq!(starved, 1, "exactly one starved worker expected");
-    // Format: "tid 2 starved (0 work units)"
+    assert_eq!(no_progress, 1, "exactly one no-progress worker expected");
+    // Format: "tid 2 made no progress (0 work units)"
     let detail = r
         .failure_details()
-        .find(|d| matches!(d.kind, DetailKind::Starved))
+        .find(|d| matches!(d.kind, DetailKind::NoProgress))
         .unwrap();
     assert!(
         detail.message.contains("tid 2"),
-        "must name the starved tid: {detail}"
+        "must name the no-progress tid: {detail}"
     );
     assert!(
         detail.message.contains("0 work units"),
@@ -402,7 +405,7 @@ fn neg_isolation_violation_outside_cpuset() {
 
 #[test]
 fn neg_unfairness_extreme_spread_detected() {
-    let r = assert_not_starved(&[
+    let r = assert_not_stuck(&[
         rpt(1, 100, 5e9 as u64, 25e7 as u64, &[0, 1], 50), // 5%
         rpt(2, 5000, 5e9 as u64, 475e7 as u64, &[0, 1], 50), // 95%
     ]);
@@ -446,7 +449,7 @@ fn neg_unfairness_extreme_spread_detected() {
 fn neg_scheduling_gap_exceeds_threshold() {
     let threshold = gap_threshold_ms();
     let gap = threshold + 2000;
-    let r = assert_not_starved(&[
+    let r = assert_not_stuck(&[
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
         rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], gap),
     ]);
@@ -491,7 +494,7 @@ fn neg_scheduling_gap_exceeds_threshold() {
 
 #[test]
 fn neg_plan_custom_gap_catches_lower_threshold() {
-    let plan = AssertPlan::new().check_not_starved().max_gap_ms(500);
+    let plan = AssertPlan::new().check_not_stuck().max_gap_ms(500);
     let reports = [
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
         rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 1000),
@@ -523,8 +526,8 @@ fn neg_plan_custom_gap_catches_lower_threshold() {
 }
 
 #[test]
-fn neg_isolation_plus_starvation_both_reported() {
-    let plan = AssertPlan::new().check_not_starved().check_isolation();
+fn neg_isolation_plus_no_progress_both_reported() {
+    let plan = AssertPlan::new().check_not_stuck().check_isolation();
     let expected: BTreeSet<usize> = [0, 1].into_iter().collect();
     let reports = [
         rpt(1, 0, 5e9 as u64, 0, &[0], 0),
@@ -532,18 +535,18 @@ fn neg_isolation_plus_starvation_both_reported() {
     ];
     let r = plan.assert_cgroup(&reports, Some(&expected), None);
     assert!(r.is_fail());
-    // Starvation detail must name tid 1 with "0 work units".
-    let starved_detail = r
+    // No-progress detail must name tid 1 with "0 work units".
+    let no_progress_detail = r
         .failure_details()
-        .find(|d| matches!(d.kind, DetailKind::Starved))
+        .find(|d| matches!(d.kind, DetailKind::NoProgress))
         .unwrap();
     assert!(
-        starved_detail.message.contains("tid 1"),
-        "starved tid: {starved_detail}"
+        no_progress_detail.message.contains("tid 1"),
+        "no-progress tid: {no_progress_detail}"
     );
     assert!(
-        starved_detail.message.contains("0 work units"),
-        "format: {starved_detail}"
+        no_progress_detail.message.contains("0 work units"),
+        "format: {no_progress_detail}"
     );
     // Isolation detail must name tid 2 with CPUs {4, 5}.
     let iso_detail = r
@@ -566,7 +569,7 @@ fn neg_isolation_plus_starvation_both_reported() {
 
 #[test]
 fn neg_assert_cgroup_via_assert_struct() {
-    let v = Assert::NO_OVERRIDES.check_not_starved().check_isolation();
+    let v = Assert::NO_OVERRIDES.check_not_stuck().check_isolation();
     let expected: BTreeSet<usize> = [0].into_iter().collect();
     let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1, 2], 50)];
     let r = v.assert_cgroup(&reports, Some(&expected));
@@ -585,7 +588,7 @@ fn neg_assert_cgroup_via_assert_struct() {
 
 #[test]
 fn neg_plan_custom_gap_passes_below_threshold() {
-    let plan = AssertPlan::new().check_not_starved().max_gap_ms(5000);
+    let plan = AssertPlan::new().check_not_stuck().max_gap_ms(5000);
     let reports = [
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
         rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 1000),
@@ -599,11 +602,11 @@ fn neg_plan_custom_gap_passes_below_threshold() {
 }
 
 #[test]
-fn not_starved_empty_reports_surface_zero_worker_cgroup() {
+fn not_stuck_empty_reports_surface_zero_worker_cgroup() {
     // no-silent-drop: a declared cgroup that collected zero reports
     // must surface as a num_workers=0 telemetry entry, not vanish. Pre-fix
-    // assert_not_starved early-returned empty stats on reports.is_empty().
-    let r = assert_not_starved(&[]);
+    // assert_not_stuck early-returned empty stats on reports.is_empty().
+    let r = assert_not_stuck(&[]);
     assert!(r.is_pass(), "no workers -> no fairness fail");
     assert_eq!(
         r.stats.cgroups.len(),
@@ -615,11 +618,11 @@ fn not_starved_empty_reports_surface_zero_worker_cgroup() {
 }
 
 #[test]
-fn not_starved_no_double_count() {
-    // assert_not_starved builds telemetry via the shared `cgroup_stats`
+fn not_stuck_no_double_count() {
+    // assert_not_stuck builds telemetry via the shared `cgroup_stats`
     // builder exactly once — a regression re-introducing a second build
     // site would yield two cgroup entries for one call.
-    let r = assert_not_starved(&[
+    let r = assert_not_stuck(&[
         rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50),
         rpt(2, 1000, 5e9 as u64, 6e8 as u64, &[1], 60),
     ]);

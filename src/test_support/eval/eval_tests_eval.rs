@@ -2135,7 +2135,7 @@ fn evaluate_failure_message_renders_per_cgroup_via_folded_timeline() {
     let mut guest_assert = build_assert_result(
         false,
         vec![crate::assert::AssertDetail::new(
-            crate::assert::DetailKind::Starved,
+            crate::assert::DetailKind::NoProgress,
             "deliberate failure for the render test".to_string(),
         )],
     );

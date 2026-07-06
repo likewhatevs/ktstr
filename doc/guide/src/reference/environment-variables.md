@@ -7,6 +7,12 @@ exceptions are called out per row.
 Most of these have a CLI flag equivalent; prefer the flag in scripts
 and the variable in CI job-level `env:` blocks.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Daily knobs</strong><p>Kernel selection, scheduler overrides, perf mode, skip mode, logging, and budgets.</p></div>
+<div class="kt-doc-card"><strong>Caches</strong><p>Kernel cache roots, busybox/wprof build inputs, remote cache, and parallelism.</p></div>
+<div class="kt-doc-card"><strong>Diagnostics</strong><p>Sidecar directories, CI stamps, guest console verbosity, and escape hatches.</p></div>
+</div>
+
 ## Daily knobs
 
 | Variable | Effect | Accepted values | Default |
@@ -72,7 +78,7 @@ and CI logs — do not set them by hand.
 | `KTSTR_KERNEL_LIST` | Multi-kernel fan-out list (`label=path;…`) when a run resolves 2+ kernels; each test expands to one variant per kernel. Takes precedence over `KTSTR_KERNEL` during variant expansion. |
 | `KTSTR_KERNEL_COMMIT` | `dir=commit` map of each source kernel's HEAD, so per-test processes skip re-walking the kernel tree. |
 | `KTSTR_PROJECT_COMMIT` | The project commit label perf-delta children must record in their sidecars. |
-| `KTSTR_ORCHESTRATED` | Orchestration marker; VM-booting integration tests skip when it is absent (raw `cargo nextest run` would starve their resource budgets). |
+| `KTSTR_ORCHESTRATED` | Orchestration marker; VM-booting integration tests skip when it is absent (raw `cargo nextest run` would bypass their resource budgets). |
 | `KTSTR_RUN_EPOCH` | Per-invocation session token that keeps parallel test processes from pre-clearing each other's freshly written sidecars. |
 | `KTSTR_RUNS_ROOT` | Absolute runs root, stamped once so sidecar writers and post-run readers resolve the same directory regardless of CWD. |
 | `KTSTR_PERF_ONLY` | Set by `perf-delta` runs: skip every test without `performance_mode`. Exporting it manually restricts any run the same way. |

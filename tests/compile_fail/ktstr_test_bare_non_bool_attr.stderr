@@ -1,4 +1,4 @@
-error: bare attribute `llcs` is not a bool flag; only bool attributes accept the bare form. Other attributes require `key = value`. Bool attrs: auto_repro, expect_auto_repro, not_starved, isolation, performance_mode, pci, no_perf_mode, requires_smt, expect_err, survives_storm, allow_inconclusive, fail_on_rq_clock_stuck, host_only, ignore, kaslr, wprof.
+error: bare attribute `llcs` is not a bool flag; only bool attributes accept the bare form. Other attributes require `key = value`. Bool attrs: auto_repro, expect_auto_repro, not_stuck, isolation, performance_mode, pci, no_perf_mode, requires_smt, expect_err, survives_storm, allow_inconclusive, fail_on_rq_clock_stuck, host_only, ignore, kaslr, wprof.
  --> tests/compile_fail/ktstr_test_bare_non_bool_attr.rs:3:14
   |
 3 | #[ktstr_test(llcs)]

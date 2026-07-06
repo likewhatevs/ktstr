@@ -5,6 +5,12 @@ the scheduler under test. `declare_scheduler!` builds one and
 registers it so both `#[ktstr_test]` and the
 [verifier sweep](../running-tests/verifier.md) can see it:
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Find</strong><p>Discover a built <code>scx_*</code> binary, point at an absolute path, or use a kernel built-in scheduler.</p></div>
+<div class="kt-doc-card"><strong>Configure</strong><p>Attach scheduler args, default topology, constraints, and scheduler-wide assertions.</p></div>
+<div class="kt-doc-card"><strong>Reuse</strong><p>One declaration feeds tests, verifier cells, staged swaps, sidecars, and CLI labels.</p></div>
+</div>
+
 ```rust,ignore
 use ktstr::declare_scheduler;
 use ktstr::prelude::*;
@@ -108,20 +114,20 @@ of the verifier sweep:
 ```rust,ignore
 use ktstr::prelude::*;
 
-const MITOSIS: Scheduler = Scheduler::named("scx_mitosis")
-    .binary(SchedulerSpec::Discover("scx_mitosis"))
+const MY_SCHED: Scheduler = Scheduler::named("my_sched")
+    .binary_discover("scx_my_sched")
     .topology(1, 2, 4, 1)
     .sched_args(&["--exit-dump-len", "1048576"])
     .cgroup_parent("/ktstr")
     .assert(Assert::NO_OVERRIDES.max_imbalance_ratio(2.0));
 ```
 
-`Scheduler::named("foo").binary_discover("scx_foo")` is shorthand
-for `.binary(SchedulerSpec::Discover("scx_foo"))` — the argument is
-the binary name to discover, not the scheduler name. A manual const
-is not registered in `KTSTR_SCHEDULERS`, so the verifier sweep does
-not see it; use `declare_scheduler!` for anything that should
-participate in `cargo ktstr verifier`.
+`binary_discover("scx_my_sched")` is host-side binary discovery; the
+argument is the binary name to discover, not the scheduler label. It is
+shorthand for `.binary(SchedulerSpec::Discover("scx_my_sched"))`. A
+manual const is not registered in `KTSTR_SCHEDULERS`, so the verifier
+sweep does not see it; use `declare_scheduler!` for anything that
+should participate in `cargo ktstr verifier`.
 
 ## SchedulerSpec
 

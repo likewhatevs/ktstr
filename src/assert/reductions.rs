@@ -82,7 +82,7 @@ pub(crate) fn percentile(sorted: &[u64], p: f64) -> u64 {
 /// Build per-cgroup telemetry (pure measurement, no assertions) from
 /// worker reports. This is the SINGLE telemetry builder on the assertion
 /// path: `AssertPlan::assert_cgroup` calls it unconditionally and
-/// [`assert_not_starved`] wraps it with the default fairness checks, so
+/// [`assert_not_stuck`] wraps it with the default fairness checks, so
 /// per-cgroup [`CgroupStats`] is never gated behind whether a worker-check
 /// assertion was configured. Empty `reports` yield a `num_workers == 0`
 /// `CgroupStats` (the reduces below collapse to 0.0/0), so a declared
@@ -785,11 +785,11 @@ pub(crate) fn scenario_stats_for_cgroup(cg: &CgroupStats) -> ScenarioStats {
     }
 }
 
-/// Record the DEFAULT fairness outcomes (Starved / Unfair / Stuck) for one
+/// Record the DEFAULT fairness outcomes (NoProgress / Unfair / Stuck) for one
 /// cgroup against the framework default thresholds
 /// ([`spread_threshold_pct`] / [`gap_threshold_ms`]). Telemetry is built
 /// separately by [`cgroup_stats`]; this only appends fail outcomes, so it
-/// is shared by [`assert_not_starved`] and the `not_starved` arm of
+/// is shared by [`assert_not_stuck`] and the `not_stuck` arm of
 /// [`AssertPlan::assert_cgroup`] without rebuilding stats.
 pub(crate) fn record_default_fairness(
     r: &mut AssertResult,
@@ -799,8 +799,8 @@ pub(crate) fn record_default_fairness(
     for w in reports {
         if w.work_units == 0 {
             r.record_fail(AssertDetail::new(
-                DetailKind::Starved,
-                format!("tid {} starved (0 work units)", w.tid),
+                DetailKind::NoProgress,
+                format!("tid {} made no progress (0 work units)", w.tid),
             ));
         }
     }
@@ -842,12 +842,12 @@ pub(crate) fn record_default_fairness(
 }
 
 /// Default fairness check for one cgroup's worker reports: builds the
-/// per-cgroup telemetry ([`cgroup_stats`]) and records Starved / Unfair /
+/// per-cgroup telemetry ([`cgroup_stats`]) and records NoProgress / Unfair /
 /// Stuck against the framework default thresholds. Telemetry is ALWAYS
 /// populated — including a `num_workers == 0` entry for empty reports — so
 /// `r.stats.cgroups` is never empty for a declared cgroup, independent of
 /// whether any fail outcome fired.
-pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
+pub fn assert_not_stuck(reports: &[WorkerReport]) -> AssertResult {
     let cg = cgroup_stats(reports);
     let mut r = AssertResult::pass();
     record_default_fairness(&mut r, &cg, reports);
@@ -1275,12 +1275,12 @@ pub struct AbsoluteThresholds {
     /// regardless of how many iterations completed.
     pub max_migrations: Option<u64>,
     /// Minimum acceptable per-worker work_units. Every worker must
-    /// have completed at least this many work units; one starved
+    /// have completed at least this many work units; one below-floor
     /// worker fails the check. `None` skips. Distinct from
-    /// [`assert_not_starved`]'s zero-work-units check, which gates
+    /// [`assert_not_stuck`]'s zero-work-units check, which gates
     /// only against literal zero — this gate accepts a non-zero
     /// floor so a test can reject "barely made progress" runs that
-    /// pass the strict starvation gate.
+    /// pass the strict zero-work-units gate.
     pub min_work_units: Option<u64>,
 }
 
@@ -1344,7 +1344,7 @@ impl AbsoluteThresholds {
 /// - `max_migrations` -> sum of `migration_count` across workers;
 ///   tagged [`DetailKind::Migration`].
 /// - `min_work_units` -> per-worker `work_units >= floor`; tagged
-///   [`DetailKind::Starved`] when a worker is below the floor.
+///   [`DetailKind::NoProgress`] when a worker is below the floor.
 ///
 /// The wake-latency check delegates to [`assert_benchmarks`] for the
 /// percentile path so the same nearest-rank algorithm applies; the
@@ -1459,12 +1459,12 @@ pub fn assert_thresholds(
     }
 
     // Per-worker work_units floor: every worker must have completed
-    // at least `min` work units. One starved worker fails the check.
+    // at least `min` work units. One no-progress worker fails the check.
     if let Some(min_units) = thresholds.min_work_units {
         for w in reports {
             if w.work_units < min_units {
                 r.record_fail(AssertDetail::new(
-                    DetailKind::Starved,
+                    DetailKind::NoProgress,
                     format!(
                         "tid {} work_units {} below floor {min_units}",
                         w.tid, w.work_units,
@@ -1485,5 +1485,5 @@ pub fn assert_thresholds(
 // expression-labeled claims. Both produce
 // [`ClaimBuilder`]/[`SetClaim`]/[`SeqClaim`] under the hood and
 // record outcomes onto the same [`AssertResult`] envelope that
-// `assert_not_starved` / `assert_isolation` produce, so the two
+// `assert_not_stuck` / `assert_isolation` produce, so the two
 // paths compose via [`Verdict::merge`].)

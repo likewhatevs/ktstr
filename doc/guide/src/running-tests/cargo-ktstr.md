@@ -5,6 +5,12 @@ resolves (and if needed builds and caches) the kernel, then drives
 `cargo nextest run` so every `#[ktstr_test]` boots its VM against
 exactly the kernel you asked for.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Run</strong><p><code>test</code>, <code>replay</code>, and common flags for ordinary ktstr suites.</p></div>
+<div class="kt-doc-card"><strong>Prepare</strong><p><code>kernel</code>, <code>shell</code>, <code>export</code>, and cache-management flows.</p></div>
+<div class="kt-doc-card"><strong>Analyze</strong><p><code>verifier</code>, <code>stats</code>, <code>perf-delta</code>, <code>ctprof</code>, and CI targeting.</p></div>
+</div>
+
 ## Install
 
 ```sh
@@ -108,36 +114,34 @@ cargo ktstr test --kernel 7.0 -- --features integration    # cargo features
 cargo ktstr test --relevant                                # only tests my edits affect
 ```
 
-A real single-test run (the `7.0` series was already built and
-cached, so resolution maps `7.0` to the latest patch release and
-reuses the cached image):
+A real single-test run against a local kernel tree looks like this.
+The source tree was already built, so ktstr resolved it to a cache key
+and reused the image:
 
-<!-- captured: cargo ktstr test --kernel 7.0 -- --features integration -E 'test(=ktstr/failure_dump_renders_bss_fields)' | ktstr 0.23.0 | kernel 7.0.14 -->
+<!-- captured: cargo ktstr test --kernel ../linux --no-perf-mode -- --features integration -E 'test(=ktstr/scx_empty_run_exits_under_watchdog)' | ktstr 0.24.0-dev | kernel ../linux (b4dc42d2, sched_ext-for-7.2) | verified by independent rerun -->
 ```text
-$ cargo ktstr test --kernel 7.0 -- --features integration -E 'test(=ktstr/failure_dump_renders_bss_fields)'
-cargo ktstr: fetching latest 7.0.x kernel version
-cargo ktstr: latest 7.0.x kernel: 7.0.14
-cargo ktstr: resolved kernel "7.0"
+$ cargo ktstr test --kernel ../linux --no-perf-mode -- --features integration -E 'test(=ktstr/scx_empty_run_exits_under_watchdog)'
+cargo ktstr: resolved kernel "path_linux_b5562c"
+cargo ktstr: BTF type anchor at ~/ktstr/target/ktstr_btf_anchor.h
 ...
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 27.24s
 ────────────
- Nextest run ID 98581174-246f-4824-a170-50992df166d7 with nextest profile: default
-    Starting 1 test across 121 binaries (12531 tests skipped)
-        PASS [  34.459s] (1/1) ktstr::failure_dump_e2e ktstr/failure_dump_renders_bss_fields
+ Nextest run ID d79da4e4-df49-4b40-a415-c1dff2739ce6 with nextest profile: default
+    Starting 1 test across 120 binaries (13597 tests skipped)
+        PASS [   8.601s] (1/1) ktstr::scx_cleanup_test ktstr/scx_empty_run_exits_under_watchdog
 ────────────
-     Summary [  34.498s] 1 test run: 1 passed, 12531 skipped
+     Summary [   8.642s] 1 test run: 1 passed, 13597 skipped
 
 cargo ktstr: test outputs
-  ~/ktstr/target/ktstr/7.0.14-73730e0-dirty
+  ~/ktstr/target/ktstr/7.1.0-486fe68-dirty
     (1 stats sidecar(s), 0 wprof trace(s) written this run)
 ```
 
-An immediate re-run of the same command took the same ~34 s — with
-the kernel cached, wall time is the test itself, not
-infrastructure. For a `--kernel <path>` source tree, a cache hit is
-announced on stderr as
-`cargo ktstr: cache hit for {path} ({cache_key}, built {age} ago)`
-and skips the build entirely.
+The VM part of this run took about nine seconds; the longer compile
+line was Rust rebuilding the test harness. For a `--kernel <path>`
+source tree, a cache hit is announced on stderr as
+`cargo ktstr: cache hit for {path} ({cache_key}, built {age} ago)` and
+skips the kernel build entirely.
 
 ### Per-test exit codes
 
@@ -166,7 +170,7 @@ result sidecars under `target/ktstr/`:
 ```sh
 cargo ktstr replay              # print the nextest filter (dry-run)
 cargo ktstr replay --exec       # actually run it
-cargo ktstr replay -E starve    # narrow by test-name substring
+cargo ktstr replay -E crash     # narrow by test-name substring
 cargo ktstr replay --dir PATH   # source sidecars from an archived tree
 ```
 
@@ -393,9 +397,9 @@ before launching.
 
 ```sh
 cargo ktstr export my_test -o /tmp/my_test.run
+<!-- captured: cargo ktstr export sched_basic_proportional --package ktstr -o /tmp/sched_basic_proportional.run | ktstr 0.23.0 -->
 ```
 
-<!-- captured: cargo ktstr export sched_basic_proportional --package ktstr -o /tmp/sched_basic_proportional.run | ktstr 0.23.0 -->
 ```text
 wrote /tmp/sched_basic_proportional.run (90074903 bytes archive, 0 include files)
 ```

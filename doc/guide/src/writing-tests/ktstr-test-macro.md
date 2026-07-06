@@ -21,7 +21,7 @@ declare_scheduler!(MY_SCHED, {
     scheduler = MY_SCHED,   // scheduler under test (default: kernel EEVDF)
     threads = 2,            // override one dimension; the rest inherit
     duration_s = 10,        // workload window (default 12 s)
-    not_starved = true,     // enable starvation / spread / gap checks
+    not_stuck = true,     // enable zero-work / spread / stuck-gap checks
     max_spread_pct = 20.0,  // tighten the fairness-spread threshold
 )]
 fn smt_fairness(ctx: &Ctx) -> Result<AssertResult> {
@@ -38,7 +38,7 @@ bare const emitted by `declare_scheduler!` — see
 
 All attributes are optional, with defaults, and most take
 `key = value`. The sixteen bool attributes (`auto_repro`,
-`expect_auto_repro`, `not_starved`, `isolation`, `performance_mode`,
+`expect_auto_repro`, `not_stuck`, `isolation`, `performance_mode`,
 `pci`, `no_perf_mode`, `requires_smt`, `expect_err`,
 `survives_storm`, `allow_inconclusive`, `fail_on_rq_clock_stuck`, `host_only`,
 `ignore`, `kaslr`, `wprof`) also accept a bare form as shorthand for
@@ -102,7 +102,7 @@ scenario:
 
 | Attribute | Unit | Example | Fails when |
 |---|---|---|---|
-| `not_starved` | bool | `not_starved = true` | any worker finishes with zero work units; also enables the spread and gap checks |
+| `not_stuck` | bool | `not_stuck = true` | any worker finishes with zero work units; also enables the spread and stuck-gap checks |
 | `isolation` | bool | `isolation = true` | a worker ran on a CPU outside its cgroup's cpuset |
 | `max_gap_ms` | ms | `max_gap_ms = 500` | a worker's longest scheduling gap exceeds the cap |
 | `max_spread_pct` | percentage points | `max_spread_pct = 20.0` | max−min worker off-CPU% exceeds the cap |
@@ -146,9 +146,9 @@ fn throughput_gate(ctx: &Ctx) -> Result<AssertResult> {
     }];
     execute_steps_with(ctx, steps, Some(&checks))
 }
+<!-- captured: cargo ktstr test --kernel 7.0 -- -E 'test(throughput_gate)' | ktstr 0.23.0 | kernel 7.0.14 -->
 ```
 
-<!-- captured: cargo ktstr test --kernel 7.0 -- -E 'test(throughput_gate)' | ktstr 0.23.0 | kernel 7.0.14 -->
 <div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr test --kernel 7.0 -- -E 'test(throughput_gate)'</span></div>
 
 <pre>  TRY 1 FAIL [  31.810s] (───) ktstr::docs_demo ktstr/throughput_gate

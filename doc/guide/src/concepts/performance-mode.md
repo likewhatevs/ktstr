@@ -7,6 +7,12 @@ dedicated cores, hugepage-backed guest memory, NUMA-local allocation,
 real-time scheduling — so timing thresholds measure the scheduler
 under test, not the host it happens to share.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Reserve</strong><p>Use host CPU locks and topology checks so noisy neighbors do not share the same cores.</p></div>
+<div class="kt-doc-card"><strong>Pin</strong><p>Bind vCPU threads, memory policy, and hugepages to the reserved host resources.</p></div>
+<div class="kt-doc-card"><strong>Measure</strong><p>Use tighter gap, latency, and iteration thresholds only when perf mode is actually available.</p></div>
+</div>
+
 ## Usage
 
 ```rust,ignore
@@ -29,7 +35,7 @@ The VM builder API takes the same switch:
 Performance mode is for tests where host-side scheduling noise affects
 results — fairness spread measurements, scheduling gap detection,
 imbalance ratio checks. It is not needed for correctness tests (cpuset
-isolation, starvation detection) where pass/fail is binary.
+isolation, zero-work detection) where pass/fail is binary.
 
 The gauntlet runs many VMs in parallel. Performance mode on parallel
 VMs can oversubscribe the host if scheduled naively. Avoid

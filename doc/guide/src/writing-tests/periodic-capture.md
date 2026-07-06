@@ -8,6 +8,12 @@ entirely by the host: no scenario-code changes, no capture calls in
 the test body. The result is a time-ordered series of samples that
 feeds the [temporal assertion](temporal-assertions.md) patterns.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Cadence</strong><p><code>num_snapshots</code> places samples inside the stable middle of the workload.</p></div>
+<div class="kt-doc-card"><strong>Bridge</strong><p>The host captures BPF state and stats without adding guest-side capture code.</p></div>
+<div class="kt-doc-card"><strong>Series</strong><p>Post-VM code drains samples into <code>SampleSeries</code> for temporal checks.</p></div>
+</div>
+
 ## Enabling it
 
 Set `num_snapshots = N` on the test; `0` (the default) disables
