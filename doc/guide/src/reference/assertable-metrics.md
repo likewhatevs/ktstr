@@ -9,6 +9,12 @@ significance thresholds, and a display unit. This chapter explains
 those fields, how to enumerate the live catalog, which workloads emit
 which metric families, and how to pin a per-test regression gate.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Catalog</strong><p><code>stats list-metrics</code> prints the live registry directly from the code.</p></div>
+<div class="kt-doc-card"><strong>Direction</strong><p>Metric polarity decides whether higher, lower, or target values are regressions.</p></div>
+<div class="kt-doc-card"><strong>Gate</strong><p>Per-test <code>PerfDeltaAssertion</code> checks sidecar metrics against baselines.</p></div>
+</div>
+
 ## The catalog: `stats list-metrics`
 
 The authoritative, always-current catalog is the command output — it
@@ -100,6 +106,27 @@ rejects unknown names, internal rate components, per-phase-only
 metrics, and — without `--noise-adjust` — whole-run distribution
 metrics and informational metrics, up front rather than silently
 never firing.
+
+## What the registry does not contain
+
+The registry is closed: its metrics come from fixed populators (BPF
+snapshot reads, schedstat and taskstats deltas, PSI/IRQ pressure,
+worker reports) plus keys extracted from
+[payload JSON output](../writing-tests/payloads.md). Two things a
+reader might expect here are deliberately absent:
+
+- **scx_stats fields.** Your scheduler's own stats output never
+  enters the sidecar, so no scx_stats field is gateable by
+  `perf-delta`. To assert on one within a run, project it —
+  [Projections and Temporal
+  Assertions](../writing-tests/temporal-assertions.md) is that lever.
+- **Projected series.** A `SeriesField` built from BPF state or
+  host timelines feeds temporal patterns and `Verdict` claims only;
+  its values stay in the test's `AssertResult`, not the sidecar.
+
+To regression-gate a scheduler-specific number across runs, emit it
+from a payload with JSON output — extracted payload keys do land in
+the sidecar and participate in `--noise-adjust` comparisons.
 
 ## PerfDeltaAssertion how-to
 

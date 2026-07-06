@@ -7834,7 +7834,8 @@ fn resolve_cross_btf_fwd_in_index_rejects_kind_mismatch() {
 ///   - per-CPU stride: 0x4000 (CPU 0 at +0x0, CPU 1 at +0x4000)
 ///
 /// CpuTimeOffsets in-struct layout:
-///   - kernel_cpustat.cpustat[]   at struct offset 0  (8 u64 = 64B)
+///   - kernel_cpustat.cpustat[]   at struct offset 0 in this fixture
+///     (real kernels can place CONFIG_NO_HZ_COMMON fields before it)
 ///   - kernel_stat.irqs_sum       at struct offset 0  (1 u64 = 8B)
 ///   - kernel_stat.softirqs[]     at struct offset 8  (NR_SOFTIRQS u32)
 ///   - tick_sched.iowait_sleeptime at struct offset 0 (1 u64 = 8B)

@@ -6,6 +6,12 @@ scenario or to `execute_defs` / `execute_steps`; a custom scenario
 is the same function keeping control and driving cgroups, workers,
 and assertions itself.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Prefer ops</strong><p>Use <code>Step</code> and <code>Op</code> for fixed cgroup changes, captures, holds, and checks.</p></div>
+<div class="kt-doc-card"><strong>Use custom code</strong><p>Branch on runtime state, compute cpusets dynamically, or assert on raw reports.</p></div>
+<div class="kt-doc-card"><strong>Return one result</strong><p>Collect every worker group, merge assertion results, and keep teardown deterministic.</p></div>
+</div>
+
 For dynamic scenarios (cgroup creation/removal, cpuset changes),
 prefer the [ops/steps system](../concepts/ops.md) over a
 hand-written scenario. Reach for custom code only when ops cannot
@@ -63,7 +69,7 @@ fn workers_follow_cpuset_shrink(ctx: &Ctx) -> Result<AssertResult> {
 
 Bind the `CgroupGroup` to a named variable (`_guard`) so the cgroups
 live until end of scope — see
-[CgroupGroup](../architecture/cgroup-group.md) for drop semantics.
+[CgroupGroup](../architecture/cgroup-manager.md#cgroupgroup) for drop semantics.
 Sleeping `ctx.duration` (rather than a hard-coded period) keeps the
 scenario composable with `duration_s = N` overrides and the gauntlet
 budget controller.
@@ -82,7 +88,7 @@ spawns and starts workers in each, and returns
 **`collect_all(handles, checks)`** — stops all workers and collects
 reports. Per-cgroup telemetry is always produced; only the checks
 the caller enabled record assertion outcomes, and with no checks
-enabled the result stays `pass` (there is no implicit starvation
+enabled the result stays `pass` (there is no implicit worker-progress
 fallback).
 
 **`dfl_wl(ctx)`** — a `WorkloadConfig` with `ctx.workers_per_cgroup`

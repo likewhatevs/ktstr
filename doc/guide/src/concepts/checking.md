@@ -9,7 +9,7 @@ attributes passes as long as the VM boots and the scenario completes.
 
 Which API to reach for:
 
-- **`#[ktstr_test]` attributes** — cover most tests: `not_starved`,
+- **`#[ktstr_test]` attributes** — cover most tests: `not_stuck`,
   `max_gap_ms`, `max_spread_pct`, `min_iteration_rate`, and every
   other threshold below has an attribute (see the
   [macro reference](../writing-tests/ktstr-test-macro.md)).
@@ -26,8 +26,8 @@ After each scenario, ktstr collects a
 [`WorkerReport`](../architecture/workers.md) from every worker and
 runs the opted-in checks against them:
 
-- **Starvation** (`not_starved`) — any worker with zero work units
-  fails: `tid N starved (0 work units)`.
+- **Zero work units** (`not_stuck`) — any worker with no measured
+  work fails: `tid N made no progress (0 work units)`.
 - **Scheduling gaps** (`max_gap_ms`) — the longest wall-clock gap
   observed at work-unit checkpoints. A violation renders as
   `tid N stuck Xms on cpuY at +Zms (threshold Nms)`.
@@ -62,9 +62,9 @@ fn throughput_gate(ctx: &Ctx) -> Result<AssertResult> {
         CgroupDef::named("cg_b").workers(1).cpuset(CpusetSpec::disjoint(1, 2)),
     ])
 }
+<!-- captured: cargo ktstr test --kernel 7.0 (throughput_gate demo test) | ktstr 0.23.0 | kernel 7.0.14 -->
 ```
 
-<!-- captured: cargo ktstr test --kernel 7.0 (throughput_gate demo test) | ktstr 0.23.0 | kernel 7.0.14 -->
 <div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr test --kernel 7.0</span></div>
 
 <pre><span class="t-b">ktstr_test 'throughput_gate' [sched=scx-ktstr] [topo=1n1l2c1t] failed:</span>
@@ -119,14 +119,14 @@ The defaults `with_monitor_defaults()` applies:
 | `fail_on_rq_clock_stuck` | true | Fail when `rq_clock` does not advance on a CPU with runnable tasks. Idle CPUs (NOHZ) and preempted vCPUs are exempt. |
 | `sustained_samples` | 5 | At ~100ms sample interval, requires ~500ms of sustained violation. Filters transient spikes from cpuset reconfiguration. |
 | `max_fallback_rate` | 200.0/s | `select_cpu_fallback` events per second across all CPUs. Sustained rate indicates systematic `select_cpu` failure. |
-| `max_keep_last_rate` | 100.0/s | `dispatch_keep_last` events per second across all CPUs. Sustained rate indicates dispatch starvation. |
+| `max_keep_last_rate` | 100.0/s | `dispatch_keep_last` events per second across all CPUs. Sustained rate indicates the scheduler keeps reusing the previous dispatch target instead of making progress through the normal path. |
 
 Every monitor threshold uses the `sustained_samples` window — a
 violation must persist for N consecutive samples before it counts.
 
 ## NUMA checks
 
-For workers with a [`MemPolicy`](mem-policy.md), three thresholds
+For workers with a [`MemPolicy`](topology.md#memory-policy), three thresholds
 gate page placement:
 
 - **`min_page_locality`** — minimum fraction of pages on the
@@ -140,7 +140,7 @@ gate page placement:
 
 ## Default thresholds
 
-`not_starved = true` also enables the built-in fairness and gap
+`not_stuck = true` also enables the built-in fairness and stuck-gap
 checks at these defaults:
 
 | Check | Release | Debug |
@@ -290,6 +290,15 @@ read `false`.
   ```
 
   An unregistered metric yields Inconclusive, never a silent pass.
+- **Claim variants and measurements** — `claim_present!(v, opt)`
+  fails loudly on `None` instead of vacuously passing; `claim_set` /
+  `claim_seq` assert membership, length, and subset bounds over
+  collections;
+  `note(msg)` records free-text context and `note_value(key, val)`
+  a typed measurement into `AssertResult::measurements` — triage
+  payload attached to the verdict, not a metric (nothing recorded
+  through claims or notes reaches the stats sidecar or `perf-delta`;
+  see [Assertable Metrics](../reference/assertable-metrics.md)).
 - **`AbsoluteThresholds`** — flat per-run bounds
   (`max_p99_wake_latency_ns`, `max_iteration_cost_p99_ns`,
   `max_migrations`, `min_work_units`) checked in one call:
@@ -303,5 +312,7 @@ read `false`.
 Signatures, comparators, and construction details are in the
 [`ktstr::assert` rustdoc](https://ktstr.dev/rustdoc/ktstr/assert/index.html).
 For phase-scoped checks over a stepped scenario, see
-[Phases](ops.md#phases) and
-[Temporal Assertions](../writing-tests/temporal-assertions.md).
+[Phases](ops.md#phases). To assert on your scheduler's *own*
+counters — scx_stats fields, BPF globals and maps — see
+[Projections and Temporal
+Assertions](../writing-tests/temporal-assertions.md).

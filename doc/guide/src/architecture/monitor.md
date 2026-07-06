@@ -1,6 +1,6 @@
 # Monitor
 
-When your scheduler leaves a CPU starving, the monitor is what
+When your scheduler leaves runnable work stuck on a CPU, the monitor is what
 notices. It runs on the host while the guest executes and reads
 scheduler state directly out of guest memory — the scheduler under
 test never executes an extra instruction to be observed, and no BPF
@@ -197,7 +197,7 @@ module's rustdoc (`cargo doc --document-private-items`).
 The monitor also discovers and reads/writes the scheduler's BPF maps
 directly through guest physical memory — no guest cooperation, no BPF
 syscalls. Maps are found by walking the kernel's `map_idr` and
-matched by name suffix (`".bss"` matches `"mitosis.bss"`); values are
+matched by name suffix (`".bss"` matches `"my_sched.bss"`); values are
 read at BTF-resolved offsets, including per-CPU array maps. When a
 map carries program BTF, the dump renderer uses it to render the
 value struct field by field — which is why failure dumps show your

@@ -8,66 +8,29 @@ the test declared; and the kernel is the exact build you targeted.
 
 ktstr has three execution domains:
 
-1. **Host process** — the test binary running on the host. Manages
-   [VM lifecycle](architecture/vmm.md), monitors guest memory,
-   evaluates results.
-
-2. **Guest process** — the same test binary running inside the VM
-   as PID 1. Mounts filesystems, starts the scheduler, creates
-   cgroups, forks [workers](architecture/workers.md), runs scenarios,
-   and writes results back to the host.
-
-3. **[Monitor](architecture/monitor.md) thread** — runs on the host
-   while the guest executes. Reads guest VM memory directly to observe
-   scheduler state without instrumenting it.
+<div class="kt-steps">
+<div class="kt-step" data-step="1"><strong>Host process</strong><p>The test binary on the host manages VM lifecycle, monitors guest memory, and evaluates results.</p></div>
+<div class="kt-step" data-step="2"><strong>Guest process</strong><p>The same binary runs inside the VM as PID 1: mounts filesystems, starts the scheduler, creates cgroups, forks workers, and writes results back.</p></div>
+<div class="kt-step" data-step="3"><strong><a href="architecture/monitor.html">Monitor thread</a></strong><p>A host thread reads guest VM memory directly, observing scheduler state without instrumenting the guest.</p></div>
+</div>
 
 ## Execution flow
 
-```text
-Host                          Guest
-----                          -----
-test binary                   
-  |                           
-  +-- build initramfs         
-  |   (test binary as /init   
-  |    + optional scheduler)  
-  |                           
-  +-- boot KVM VM             
-  |                           test binary (PID 1 init)
-  |                             |
-  +-- start monitor thread      +-- mount filesystems
-  |   (reads guest memory)      +-- start scheduler (if any)
-  |                             +-- create cgroups
-  |                             +-- fork workers
-  |                             +-- move workers to cgroups
-  |                             +-- signal workers to start
-  |                             +-- poll scheduler liveness
-  |                             +-- stop workers, collect reports
-  |                             +-- evaluate results
-  |                             +-- write result to virtio-console port 1
-  |                           
-  +-- read result from virtio-console port 1
-  +-- evaluate monitor data   
-  +-- report pass/fail        
-```
+<div class="kt-sequence">
+<div class="kt-seq-row"><span class="kt-seq-num">01</span><div class="kt-seq-card host"><strong data-lane="host">Package the guest</strong><p>The host builds an initramfs that contains the same test binary as <code>/init</code>, plus the scheduler binary, payloads, and files the test declared.</p></div></div>
+<div class="kt-seq-row"><span class="kt-seq-num">02</span><div class="kt-seq-card host"><strong data-lane="host">Boot the target kernel</strong><p>KVM starts a disposable VM using the requested kernel, topology, memory, transports, and performance-mode settings.</p></div></div>
+<div class="kt-seq-row"><span class="kt-seq-num">03</span><div class="kt-seq-card guest"><strong data-lane="guest">Re-enter as PID 1</strong><p>Inside the VM, the test binary takes the guest path: mount filesystems, read the host-provided test spec, and prepare cgroup state.</p></div></div>
+<div class="kt-seq-row"><span class="kt-seq-num">04</span><div class="kt-seq-card monitor"><strong data-lane="monitor">Start observation</strong><p>A host thread begins reading guest memory through KVM mappings, resolving BTF offsets and watching scheduler state without injecting code into the guest.</p></div></div>
+<div class="kt-seq-row"><span class="kt-seq-num">05</span><div class="kt-seq-card guest"><strong data-lane="guest">Run the scenario</strong><p>The guest starts the scheduler, creates cgroups and cpusets, forks workers, applies ops, and records worker reports.</p></div></div>
+<div class="kt-seq-row"><span class="kt-seq-num">06</span><div class="kt-seq-card monitor"><strong data-lane="monitor">Capture violations and state</strong><p>The monitor records stuck observations, snapshots, event counters, dumps, and scheduler-exit context while the workload runs.</p></div></div>
+<div class="kt-seq-row"><span class="kt-seq-num">07</span><div class="kt-seq-card guest"><strong data-lane="guest">Return the scenario verdict</strong><p>The guest evaluates worker checks and writes the structured result to virtio-console port 1.</p></div></div>
+<div class="kt-seq-row"><span class="kt-seq-num">08</span><div class="kt-seq-card host"><strong data-lane="host">Merge and report</strong><p>The host combines guest results with monitor findings, writes artifacts, and returns the nextest case outcome.</p></div></div>
+</div>
 
 Results travel on virtio-console port 1; panics, crashes, and other
 non-blockable diagnostics fall back to the COM2 serial port (see
 [VMM — guest–host transports](architecture/vmm.md#transports)).
 
-From the host, a passing run looks like this:
-
-<!-- captured: cargo ktstr test --kernel 7.0 -E 'test(failure_dump_renders_bss_fields)' | ktstr 0.23.0 | kernel 7.0.14 -->
-```text
-cargo ktstr: fetching latest 7.0.x kernel version
-cargo ktstr: latest 7.0.x kernel: 7.0.14
-cargo ktstr: resolved kernel "7.0"
-...
-    Starting 1 test across 121 binaries (12531 tests skipped)
-        PASS [  34.451s] (1/1) ktstr::failure_dump_e2e ktstr/failure_dump_renders_bss_fields
-...
-     Summary [  34.490s] 1 test run: 1 passed, 12531 skipped
-```
 
 ## Key design decisions
 
@@ -98,6 +61,5 @@ eliminates observer effects on scheduling decisions.
   and how violations become verdicts.
 - [Workers and Workloads](architecture/workers.md) — worker lifecycle
   and the telemetry each worker reports.
-- [CgroupManager](architecture/cgroup-manager.md) /
-  [CgroupGroup](architecture/cgroup-group.md) — cgroup plumbing and
-  RAII cleanup inside the guest.
+- [CgroupManager and CgroupGroup](architecture/cgroup-manager.md) —
+  cgroup plumbing and RAII cleanup inside the guest.

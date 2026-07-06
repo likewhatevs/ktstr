@@ -269,7 +269,7 @@ impl ScenarioStats {
     /// The ext family is populated only by the `#[ktstr_test]` eval
     /// flow's post-merge producer
     /// ([`populate_run_distribution_metrics`]). An `AssertResult` built
-    /// by a DIRECT host assertion (`assert_not_starved` /
+    /// by a DIRECT host assertion (`assert_not_stuck` /
     /// `AssertPlan::assert_cgroup`, which never run that producer)
     /// carries the per-cgroup values on [`Self::cgroups`] but none of
     /// these run-level roll-ups, so `run_metric` returns `None` for them

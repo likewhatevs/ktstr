@@ -111,7 +111,6 @@ The scheduler-log section carries the kernel's full debug dump for
 scheduler exits — exit kind, backtrace, and (if the scheduler
 implements `ops.dump`) its own state:
 
-<!-- captured: same bpf_crash_auto_repro_e2e run | ktstr 0.23.0 | kernel 7.0.14 -->
 ```text
 --- scheduler log ---
 ...
@@ -157,8 +156,8 @@ format string is pinned by a unit test, so these stay accurate):
 
 - `worker {N} iteration rate {R}/s below floor {F}/s` — a benchmark
   rate gate failed.
-- `tid {N} starved (0 work units)` — a worker made no progress at
-  all (`not_starved`).
+- `tid {N} made no progress (0 work units)` — a worker made no
+  measured progress (`not_stuck`).
 - `tid {N} stuck {X}ms on cpu{C} at +{T}ms (threshold {N}ms)` — a
   worker's longest off-CPU gap crossed `max_gap_ms`.
 - `unfair cgroup: spread={P}% ({lo}-{hi}%) {N} workers on {N} cpus (threshold {P}%)`
@@ -277,7 +276,7 @@ line and the `--- sched_ext dump ---` section.
 5. Poke at the same environment interactively:
    `cargo ktstr shell --test my_test` boots a VM with the test's
    topology, memory, and include files (see
-   [ktstr shell](ktstr.md#shell)).
+   [cargo ktstr shell](cargo-ktstr.md#shell)).
 
 ## Verbosity knobs
 

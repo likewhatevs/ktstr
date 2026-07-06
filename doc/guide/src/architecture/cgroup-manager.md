@@ -1,11 +1,18 @@
-# CgroupManager
+# CgroupManager and CgroupGroup
 
 sched_ext schedulers see cgroups — weights, cpusets, hierarchy — so
 ktstr scenarios create, mutate, and destroy cgroups mid-test, and the
 cleanup has to survive kernel-side hangs a buggy scheduler can cause.
 `CgroupManager` is that layer: cgroup v2 filesystem operations under a
 parent directory, with timeouts and failure caps where the kernel can
-wedge.
+wedge. [`CgroupGroup`](#cgroupgroup) is the RAII wrapper that makes
+those operations leak-safe under early returns.
+
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Create</strong><p>Set up the ktstr parent, enable controllers, and create scenario cgroups.</p></div>
+<div class="kt-doc-card"><strong>Mutate</strong><p>Move tasks, resize cpusets, update weights, and exercise scheduler callbacks.</p></div>
+<div class="kt-doc-card"><strong>Clean up</strong><p>Bound teardown so a broken scheduler does not hang the host-side test forever.</p></div>
+</div>
 
 Scenarios reach it through `Ctx.cgroups`. The typical pattern pairs it
 with the RAII guard:
@@ -26,9 +33,9 @@ fn custom_scenario(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-Bypass [`CgroupGroup`](cgroup-group.md) only when the cgroup's
-lifetime must outlive the current scope; the RAII wrapper removes the
-cgroup on every error path, not just the happy one.
+Bypass [`CgroupGroup`](#cgroupgroup) only when the cgroup's lifetime
+must outlive the current scope; the RAII wrapper removes the cgroup on
+every error path, not just the happy one.
 
 ## Construction
 
@@ -143,6 +150,75 @@ This bounds the leak from a churn scenario outrunning the kernel's
 cleanup instead of accumulating writer threads without limit.
 `outstanding_removes()` exposes the count for diagnostics.
 
-See also: [CgroupGroup](cgroup-group.md) for RAII cleanup,
-[Workers and Workloads](workers.md) for worker lifecycle,
+## CgroupGroup
+
+`CgroupGroup` is the RAII guard over `CgroupManager`: it removes every
+cgroup it created when it drops, so a workload spawn or any other
+operation that fails between cgroup creation and cleanup cannot leak a
+cgroup. It is the standard cgroup-lifecycle pattern for custom
+scenarios — the worked example at the top of this page is the shape in
+full.
+
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Track</strong><p>Remember every cgroup created during a scenario scope.</p></div>
+<div class="kt-doc-card"><strong>Guard</strong><p>Drop cleanup runs on both happy paths and early errors.</p></div>
+<div class="kt-doc-card"><strong>Warn</strong><p>Teardown errors are logged with context instead of panicking in <code>Drop</code>.</p></div>
+</div>
+
+```rust,ignore
+#[must_use = "dropping a CgroupGroup immediately destroys the cgroups it manages"]
+pub struct CgroupGroup<'a> { /* ... */ }
+```
+
+The `#[must_use]` is deliberate: binding the guard to `_` (rather
+than `_guard`) drops it immediately and destroys the cgroups before
+the workload runs.
+
+**`new(cgroups: &dyn CgroupOps)`** — creates an empty group bound to
+any `CgroupOps` implementor (`CgroupManager` in production, an
+in-memory fake in tests).
+
+**`add_cgroup(name, cpuset)`** — creates a cgroup and sets its
+cpuset. Auto-enables the `Cpuset` controller on the parent's
+`cgroup.subtree_control` first — the difference that matters vs
+`add_cgroup_no_cpuset`, which creates the cgroup without a cpuset and
+without touching controllers. Both track the cgroup for removal on
+drop.
+
+**`names()`** — the names of all tracked cgroups.
+
+The helper `setup_cgroups(ctx, n, &wl)` bundles the pattern: it
+creates `n` cgroups, spawns workers in each, and returns the handles
+alongside the guard.
+
+### Drop behavior
+
+On drop, the group calls `remove_cgroup()` on each tracked cgroup in
+reverse insertion order, so nested children are removed before their
+parents (a parent still holding child directories fails with
+`ENOTEMPTY`).
+
+`ENOENT` is the one errno the drop swallows silently: it means the
+directory is already gone, so the post-condition already holds and no
+cleanup is owed. (It can legitimately appear via a narrow race
+between the existence check and `remove_dir`.) Every other error
+surfaces as a `tracing::warn!` record carrying the cgroup name and
+the full error chain — the drop never panics, but teardown failures
+are visible in logs rather than silently swallowed. The record's
+shape:
+
+```text
+CgroupGroup::drop: remove_cgroup returned non-ENOENT error
+  cgroup=<name> err=<error chain>
+  hint=EBUSY: cgroup still has live tasks — workloads were not drained before teardown
+```
+
+`EBUSY` at drop means exactly what the hint says: something is still
+running in the cgroup — typically a `WorkloadHandle` that outlives
+the guard, so its workers were never stopped before teardown. Drop
+(or `stop_and_collect`) the handle before the guard goes out of
+scope. `EACCES` gets its own hint pointing at cgroup ownership and
+delegation.
+
+See also: [Workers and Workloads](workers.md) for worker lifecycle,
 [Topology](../concepts/topology.md) for cpuset generation.

@@ -247,7 +247,7 @@ fn verdict_failing_claims_label_with_stringify_tokens() {
 
 /// `Verdict` mixes upstream `AssertResult` values via [`Verdict::merge`]
 /// alongside pointwise claims. Real production tests fold an
-/// `assert_not_starved` (or similar) result into a verdict that also
+/// `assert_not_stuck` (or similar) result into a verdict that also
 /// carries pointwise claims; this test pins that the merge path
 /// preserves both passing pointwise records and a failing merged
 /// upstream.

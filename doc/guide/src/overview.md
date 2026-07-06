@@ -1,16 +1,26 @@
 <div class="kt-hero">
 <h1>ktstr</h1>
-<p class="kt-tagline">Test Linux schedulers like code. Every test boots a real kernel in a KVM micro-VM with the topology it declares — and ktstr watches what your scheduler does from the host, without touching the guest.</p>
+<p class="kt-tagline">Test Linux schedulers like code. Declare the topology, boot a real kernel in KVM, run real workloads, and let host-side checks explain what happened.</p>
+<div class="kt-hero-meta">
+<div><strong>Real kernels</strong><span>released, local, or git-built</span></div>
+<div><strong>Topology as code</strong><span>NUMA, LLCs, cores, SMT</span></div>
+<div><strong>Actionable failures</strong><span>stats, dumps, auto-repro</span></div>
+</div>
 <div class="kt-cta-row"><a class="kt-btn kt-btn-primary" href="getting-started.html">Get started</a><a class="kt-btn kt-btn-ghost" href="features.html">See it in action</a></div>
 </div>
 
 Scheduler bugs hide in topology: the fairness regression that only shows
-up on an odd LLC count, the starvation that needs SMT siblings, the crash
-that wants a NUMA crossing. Testing a
-[sched_ext](https://github.com/sched-ext/scx) scheduler against those
-shapes has meant scrounging hardware and hand-running repro scripts.
-ktstr turns it into `cargo test`: declare the topology on the test, and
-the VM actually has it.
+up on an odd LLC count, the no-progress case that needs SMT siblings, the crash
+that wants a NUMA crossing. ktstr turns those cases into ordinary Rust
+tests for [sched_ext](https://github.com/sched-ext/scx) schedulers:
+the test declares the machine shape, the VM boots with that shape, and
+the host watches without instrumenting the guest.
+
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong><a href="getting-started.html">New to ktstr?</a></strong><p>Install the CLI, build a guest kernel, and run your first green test.</p></div>
+<div class="kt-doc-card"><strong><a href="recipes/test-new-scheduler.html">Already have a scheduler?</a></strong><p>Register an <code>scx_*</code> binary and put it under test quickly.</p></div>
+<div class="kt-doc-card"><strong><a href="running-tests/failures.html">Debugging a failure?</a></strong><p>Read the verdict, timeline, dumps, and auto-repro output in order.</p></div>
+</div>
 
 ## Quick taste
 
@@ -28,28 +38,35 @@ fn steady_under_my_sched(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-Run it against any kernel — a released version, a local source tree, or
-a git URL:
+Run it against any target kernel. A path points at a local kernel tree;
+a version such as `7.0` points at ktstr's kernel cache:
 
 ```sh
-cargo ktstr test --kernel 7.0
+cargo ktstr test --kernel ../linux --no-perf-mode
 ```
 
-<!-- captured: cargo ktstr test --kernel 7.0 -- --features integration -E 'test(=ktstr/failure_dump_renders_bss_fields)' | ktstr 0.23.0 | kernel 7.0.14 -->
-```text
-cargo ktstr: fetching latest 7.0.x kernel version
-cargo ktstr: latest 7.0.x kernel: 7.0.14
-cargo ktstr: resolved kernel "7.0"
+<!-- captured: cargo ktstr test --kernel ../linux --no-perf-mode -- --features integration -E 'test(=ktstr/scx_empty_run_exits_under_watchdog)' | ktstr 0.24.0-dev | kernel ../linux (b4dc42d2, sched_ext-for-7.2) | verified by independent rerun -->
+<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr test --kernel ../linux --no-perf-mode</span></div>
+
+<pre><span class="t-dim">cargo ktstr: resolved kernel "path_linux_b5562c"
+cargo ktstr: BTF type anchor at target/ktstr_btf_anchor.h</span>
 ...
- Nextest run ID 98581174-… with nextest profile: default
-    Starting 1 test across 121 binaries (12531 tests skipped)
-        PASS [  34.459s] (1/1) ktstr::failure_dump_e2e ktstr/failure_dump_renders_bss_fields
+ Nextest run ID d79da4e4-… with nextest profile: default
+    Starting 1 test across 120 binaries (13597 tests skipped)
+        <span class="t-grn">PASS [   8.601s] (1/1) ktstr::scx_cleanup_test ktstr/scx_empty_run_exits_under_watchdog</span>
 ...
-     Summary [  34.498s] 1 test run: 1 passed, 12531 skipped
-```
+     <span class="t-b">Summary [   8.642s] 1 test run: 1 passed, 13597 skipped</span></pre></div>
 
 Without a `scheduler` attribute, tests run under the kernel's default
 scheduler (EEVDF) — useful for baselines and A/B comparisons.
+
+<div class="kt-section-kicker">Mental model</div>
+
+<div class="kt-steps">
+<div class="kt-step" data-step="1"><strong>Describe the machine</strong><p><code>llcs</code>, <code>cores</code>, <code>threads</code>, NUMA, and gauntlet constraints become the VM's CPU topology.</p></div>
+<div class="kt-step" data-step="2"><strong>Run real work</strong><p>Scenarios create cgroups, cpusets, workers, benchmarks, and mid-run operations inside the guest.</p></div>
+<div class="kt-step" data-step="3"><strong>Check behavior</strong><p>Opt-in assertions judge worker progress, spread, stuck gaps, throughput, temporal patterns, and regressions.</p></div>
+</div>
 
 ## When it breaks, you see why
 
@@ -109,8 +126,8 @@ not perturb the scheduler under test. See
 
 ## What it tests
 
-- **Fair scheduling** — workers get CPU time without starvation or
-  excessive scheduling gaps.
+- **Fair scheduling** — workers get CPU time without zero-work outliers
+  or excessive scheduling gaps.
 - **Cpuset isolation** — workers stay on assigned CPUs.
 - **Dynamic operations** — cgroups created, destroyed, and resized
   mid-run.

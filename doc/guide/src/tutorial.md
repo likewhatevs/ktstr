@@ -10,30 +10,22 @@ familiar.
 > **Already have a scheduler binary?** This tutorial teaches ktstr
 > from the ground up. If you have an existing `scx_X` you want to
 > test, jump to one of the targeted recipes instead:
-> [test-new-scheduler.md](recipes/test-new-scheduler.md) (5 minutes,
-> validates basic behavior), [ab-compare.md](recipes/ab-compare.md)
+> [Test a New Scheduler](recipes/test-new-scheduler.md) (5 minutes,
+> validates basic behavior), [A/B Compare Branches](recipes/ab-compare.md)
 > (compare two scheduler builds), or
-> [diagnose-slow-scheduler.md](recipes/diagnose-slow-scheduler.md)
+> [Diagnose a Slow Scheduler](recipes/diagnose-slow-scheduler.md)
 > (debug performance regressions).
 
 ## What you'll build
 
 A test named `mixed_workloads` that:
 
-- Runs **two cgroups** on **separate LLCs**:
-  - `background_spinner` — a persistent CPU-bound load that runs
-    for the entire test duration.
-  - `phased_worker` — a worker that loops through explicit
-    `Spin → Yield → Spin → Yield …` phases via `WorkType::Sequence`.
-- Targets a **2-LLC, 4-core topology** so the scheduler has a real
-  cache boundary to respect.
-- Sets an explicit **test duration**.
-- Asserts **fairness** (per-cgroup spread), **throughput parity**
-  (CV across workers + minimum rate), and **cpuset isolation**
-  (workers stay on their assigned CPUs).
-- Fails once, deliberately, so you learn the failure output.
-- Captures a **snapshot** of the scheduler's BPF state after the
-  workload.
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Two cgroups</strong><p><code>background_spinner</code> runs continuously; <code>phased_worker</code> loops through <code>Spin -> Yield</code> phases.</p></div>
+<div class="kt-doc-card"><strong>Real topology</strong><p>A 2-LLC, 4-core VM gives the scheduler a cache boundary to respect.</p></div>
+<div class="kt-doc-card"><strong>Explicit checks</strong><p>Fairness, throughput parity, cpuset isolation, and one deliberate failure.</p></div>
+<div class="kt-doc-card"><strong>Scheduler state</strong><p>A post-workload snapshot captures BPF state for inspection and assertions.</p></div>
+</div>
 
 The complete test is at the [end of this page](#the-complete-test).
 
@@ -302,10 +294,10 @@ Every check is opt-in — no threshold is compared until you turn its
 check on, either at the scheduler level or on the per-test attribute
 ([Checking](concepts/checking.md) explains the model, and
 [Customize Checking](recipes/custom-checking.md) the override
-chain). The first check to opt into is `not_starved = true`, which
+chain). The first check to opt into is `not_stuck = true`, which
 enables three related worker-level checks together:
 
-- **Starvation** — any worker with zero work units fails the test.
+- **Zero work units** — any worker with no measured work fails the test.
 - **Fairness spread** — per-cgroup `max(off-CPU%) - min(off-CPU%)`
   must stay under the spread threshold (release default 15%; debug
   default 35% — debug builds in small VMs show higher spread, so
@@ -328,7 +320,7 @@ use ktstr::prelude::*;
     threads = 1,
     duration_s = 20,
     isolation = true,
-    not_starved = true,
+    not_stuck = true,
     max_spread_pct = 20.0,
     max_throughput_cv = 0.5,
     min_work_rate = 1.0,
@@ -355,12 +347,12 @@ What each new attribute gates:
 - `isolation = true` — workers must only run on CPUs in their
   assigned cpuset; any execution on an unexpected CPU fails the
   test.
-- `not_starved = true` — enables the starvation/spread/gap trio
+- `not_stuck = true` — enables the zero-work, spread, and stuck-gap trio
   described above, at the default thresholds.
 - `max_spread_pct = 20.0` — custom fairness threshold. It replaces
-  the default-threshold spread verdict from `not_starved` with your
+  the default-threshold spread verdict from `not_stuck` with your
   limit (and enables the spread check on its own even without
-  `not_starved`). 20.0 loosens the release default of 15.0 slightly
+  `not_stuck`). 20.0 loosens the release default of 15.0 slightly
   to absorb noise from the phased worker's yield-driven
   re-placement.
 - `max_throughput_cv = 0.5` — coefficient of variation of
@@ -385,31 +377,30 @@ cargo ktstr test --kernel 7.0 -- -E 'test(mixed_workloads)'
 
 `cargo ktstr test` resolves the kernel image, boots a VM with the
 declared topology, runs the test as the guest's init, and reports
-the result. A real passing run looks like this (transcript captured
-from ktstr's own suite — your run shows `ktstr/mixed_workloads` on
-the PASS line instead):
+the result. A real passing run against a local kernel tree looks like
+this (transcript captured from ktstr's own suite — your run shows
+`ktstr/mixed_workloads` on the PASS line instead):
 
-<!-- captured: cargo ktstr test --kernel 7.0 -- --features integration -E 'test(=ktstr/failure_dump_renders_bss_fields)' | ktstr 0.23.0 | kernel 7.0.14 -->
-<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr test --kernel 7.0 -- -E 'test(=ktstr/failure_dump_renders_bss_fields)'</span></div>
+<!-- captured: cargo ktstr test --kernel ../linux --no-perf-mode -- --features integration -E 'test(=ktstr/scx_empty_run_exits_under_watchdog)' | ktstr 0.24.0-dev | kernel ../linux (b4dc42d2, sched_ext-for-7.2) | verified by independent rerun -->
+<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr test --kernel ../linux --no-perf-mode -- -E 'test(=ktstr/scx_empty_run_exits_under_watchdog)'</span></div>
 
-<pre><span class="t-dim">cargo ktstr: fetching latest 7.0.x kernel version
-cargo ktstr: latest 7.0.x kernel: 7.0.14
-cargo ktstr: resolved kernel "7.0"</span>
+<pre><span class="t-dim">cargo ktstr: resolved kernel "path_linux_b5562c"
+cargo ktstr: BTF type anchor at target/ktstr_btf_anchor.h</span>
 ...
 ────────────
- Nextest run ID 98581174-246f-4824-a170-50992df166d7 with nextest profile: default
-    Starting 1 test across 121 binaries (12531 tests skipped)
-        <span class="t-grn">PASS [  34.459s] (1/1) ktstr::failure_dump_e2e ktstr/failure_dump_renders_bss_fields</span>
+ Nextest run ID d79da4e4-df49-4b40-a415-c1dff2739ce6 with nextest profile: default
+    Starting 1 test across 120 binaries (13597 tests skipped)
+        <span class="t-grn">PASS [   8.601s] (1/1) ktstr::scx_cleanup_test ktstr/scx_empty_run_exits_under_watchdog</span>
 ────────────
-     <span class="t-b">Summary [  34.498s] 1 test run: 1 passed, 12531 skipped</span>
+     <span class="t-b">Summary [   8.642s] 1 test run: 1 passed, 13597 skipped</span>
 
 cargo ktstr: test outputs
 ...
     (1 stats sidecar(s), 0 wprof trace(s) written this run)</pre></div>
 
-That run took about 35 seconds end to end on a cached kernel — VM
-boot, scenario, teardown, and evaluation included. The `ktstr/`
-prefix on the test name marks the base variant; see
+The VM portion took about nine seconds; Rust may add compile time
+when the test binary changed. The `ktstr/` prefix on the test name
+marks the base variant; see
 [Running Tests](running-tests.md) for the name shapes and the
 sidecar files each run writes.
 
@@ -444,7 +435,7 @@ what comes out. Add an iteration-rate floor no 2-core VM can meet:
     threads = 1,
     duration_s = 20,
     isolation = true,
-    not_starved = true,
+    not_stuck = true,
     max_spread_pct = 20.0,
     max_throughput_cv = 0.5,
     min_work_rate = 1.0,
@@ -585,7 +576,7 @@ declare_scheduler!(KTSTR_SCHED, {
     threads = 1,
     duration_s = 20,
     isolation = true,
-    not_starved = true,
+    not_stuck = true,
     max_spread_pct = 20.0,
     max_throughput_cv = 0.5,
     min_work_rate = 1.0,
@@ -645,8 +636,8 @@ Each of these builds directly on the test you just wrote.
   captures BPF state at evenly spaced points across the run, and a
   `post_vm` callback asserts temporal patterns over the series
   (nondecreasing counters, bounded rates, convergence). See
-  [Periodic Capture](writing-tests/periodic-capture.md) and
-  [Temporal Assertions](writing-tests/temporal-assertions.md).
+  [Periodic capture](writing-tests/snapshots.md#periodic-capture) and
+  [Projections and Temporal Assertions](writing-tests/temporal-assertions.md).
 - **Performance mode.** For benchmark-grade runs, ktstr pins vCPUs
   to reserved host cores and strips host scheduling noise; for
   topologies your host can't mirror, `no_perf_mode = true` builds

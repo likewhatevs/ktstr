@@ -9,6 +9,12 @@ metrics from benchmark payloads like schbench or fio is covered in
 cross-commit regression gates are
 [A/B Compare Branches](ab-compare.md).)
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Positive</strong><p>Set a realistic floor or ceiling on the scheduler behavior you expect.</p></div>
+<div class="kt-doc-card"><strong>Negative</strong><p>Deliberately degrade the fixture so the gate proves it can fail.</p></div>
+<div class="kt-doc-card"><strong>Regression</strong><p>Reuse the same metric in sidecar-based comparisons against a baseline commit.</p></div>
+</div>
+
 ## Positive: gate a scenario
 
 ```rust,ignore

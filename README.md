@@ -118,7 +118,7 @@ and
 
 ```toml
 [dev-dependencies]
-ktstr = "0.24.0"
+ktstr = "0.25.0"
 ```
 
 ```sh

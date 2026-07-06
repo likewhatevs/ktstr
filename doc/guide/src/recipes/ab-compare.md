@@ -8,6 +8,12 @@ metrics regress to trip the failure gate. (For host-context diffs
 or per-thread profiling instead, see the
 [compare picker](../recipes.md#which-recipe-do-i-want).)
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Pick baseline</strong><p>Default to the merge-base, or pass <code>--base-ref</code> for release branches.</p></div>
+<div class="kt-doc-card"><strong>Repeat</strong><p><code>--noise-adjust N</code> runs both sides enough times to separate noise from signal.</p></div>
+<div class="kt-doc-card"><strong>Fail clearly</strong><p>Metric polarity and significance gates decide whether CI should go red.</p></div>
+</div>
+
 ## Automated: `perf-delta --noise-adjust`
 
 ```sh

@@ -4536,7 +4536,7 @@ mod tests {
         assert_eq!(s.name, "eevdf");
         assert!(s.sysctls.is_empty());
         assert!(s.kargs.is_empty());
-        assert!(s.assert.not_starved.is_none());
+        assert!(s.assert.not_stuck.is_none());
         assert!(s.assert.max_imbalance_ratio.is_none());
     }
 
@@ -4562,10 +4562,10 @@ mod tests {
     #[test]
     fn scheduler_with_check() {
         let v = crate::assert::Assert::NO_OVERRIDES
-            .check_not_starved()
+            .check_not_stuck()
             .max_imbalance_ratio(3.0);
         let s = Scheduler::named("sched").assert(v);
-        assert_eq!(s.assert.not_starved, Some(true));
+        assert_eq!(s.assert.not_stuck, Some(true));
         assert_eq!(s.assert.max_imbalance_ratio, Some(3.0));
     }
 

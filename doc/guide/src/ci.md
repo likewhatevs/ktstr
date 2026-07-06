@@ -7,20 +7,11 @@ kernel, by far the slowest step in any workflow. Once the kernel cache
 is warm, the kernel resolves in under a second and wall-clock is
 dominated by the tests themselves:
 
-<!-- captured: cargo ktstr test --kernel 7.0 (warm kernel cache, single-test filter) | ktstr 0.23.0 | kernel 7.0.14 -->
-```text
-cargo ktstr: fetching latest 7.0.x kernel version
-cargo ktstr: latest 7.0.x kernel: 7.0.14
-cargo ktstr: resolved kernel "7.0"
-...
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
-────────────
- Nextest run ID 24c18577-cd34-43bd-9d14-b0197701c187 with nextest profile: default
-    Starting 1 test across 121 binaries (12531 tests skipped)
-        PASS [  34.451s] (1/1) ktstr::failure_dump_e2e ktstr/failure_dump_renders_bss_fields
-────────────
-     Summary [  34.490s] 1 test run: 1 passed, 12531 skipped
-```
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Runner</strong><p>Use self-hosted machines with <code>/dev/kvm</code>, enough CPUs, and stable cgroup setup.</p></div>
+<div class="kt-doc-card"><strong>Cache</strong><p>Persist kernels, BTF anchors, and build artifacts so CI spends time on tests.</p></div>
+<div class="kt-doc-card"><strong>Gate</strong><p>Keep sidecars, run affected suites, and compare metrics with <code>perf-delta</code>.</p></div>
+</div>
 
 Everything below is a variation on: get KVM, cache the kernel, run the
 tests, keep the stats. This repo's own CI is the living reference:

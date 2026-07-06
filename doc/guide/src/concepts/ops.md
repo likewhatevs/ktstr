@@ -85,8 +85,9 @@ bridge installed it fails loudly rather than dropping the capture.
 symbol; the name must match the guest kernel's vmlinux symbol table
 verbatim, and at most 3 watch ops fit in a scenario (hardware debug
 slots; one is reserved for the error-exit trigger). Details and
-failure modes: [Snapshots](../writing-tests/snapshots.md) and
-[Watch Snapshots](../writing-tests/watch-snapshots.md).
+failure modes: [Snapshots and Live
+Capture](../writing-tests/snapshots.md) and its [watch
+snapshots](../writing-tests/snapshots.md#watch-snapshots) section.
 
 ### Kernel-memory ops
 
@@ -182,7 +183,7 @@ Builder methods:
 - `.affinity(AffinityIntent)` — per-worker affinity (default
   `Inherit`).
 - `.mem_policy(MemPolicy)` / `.mpol_flags(MpolFlags)` — NUMA memory
-  placement; see [MemPolicy](mem-policy.md).
+  placement; see [Memory policy](topology.md#memory-policy).
 - `.nice(n)`, `.comm(name)`, `.pcomm(name)`, `.uid(u)` / `.gid(g)`,
   `.numa_node(node)` — per-worker identity defaults, merged into
   every `WorkSpec` that doesn't set its own.
@@ -394,7 +395,7 @@ a scenario that bailed in setup returns `None` from every
 `phase(Phase::step(k))` lookup. `PhaseBucket::expect_metric` panics
 with the bucket's label, sample count, and the metric keys actually
 present, so a typo'd name and an empty phase are distinguishable at
-a glance. [Temporal Assertions](../writing-tests/temporal-assertions.md)
+a glance. [Projections and Temporal Assertions](../writing-tests/temporal-assertions.md)
 builds per-phase pattern checks on top of this.
 
 The per-phase timeline also renders in every failure report:

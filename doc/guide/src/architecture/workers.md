@@ -128,7 +128,7 @@ Which placement tool, when:
 | You want to | Use |
 |-------------|-----|
 | Pin one worker to CPUs | `handle.set_affinity(idx, cpus)` |
-| Pin a whole cgroup of workers | [`CgroupGroup::add_cgroup`](cgroup-group.md) (writes `cpuset.cpus` once, RAII-removes on drop) |
+| Pin a whole cgroup of workers | [`CgroupGroup::add_cgroup`](cgroup-manager.md#cgroupgroup) (writes `cpuset.cpus` once, RAII-removes on drop) |
 | A cgroup that outlives the current scope | [`CgroupManager`](cgroup-manager.md) directly |
 
 ## Start and observing progress
@@ -158,8 +158,8 @@ corrupt data) gets a zeroed sentinel report: `completed: false`,
 (`Exited(code)` / `Signaled(sig)` / `TimedOut` / `WaitFailed` /
 `Panicked`). Live-worker reports always carry `exit_info: None`, so
 consumers can distinguish "ran to completion and did nothing" from
-"died before reporting" — and the starvation gate counts dead workers
-as starved instead of silently passing.
+"died before reporting" — and the zero-work-units gate counts dead
+workers as failed-progress reports instead of silently passing.
 
 After collection, SIGKILL is delivered to each fork worker's process
 group unconditionally to reap stragglers.
@@ -189,11 +189,11 @@ assert on:
 
 | Field | Meaning | Populated by |
 |-------|---------|--------------|
-| `work_units` | Cumulative work counter; feeds the starvation gate | Every framework work type |
+| `work_units` | Cumulative work counter; feeds the zero-work-units gate | Every framework work type |
 | `iterations` | Outer-loop count; feeds throughput rates | Every framework work type |
 | `cpu_time_ns` / `wall_time_ns` / `off_cpu_ns` | On-CPU vs total vs off-CPU time | Every framework work type |
 | `migration_count`, `migrations`, `cpus_used` | Cross-CPU movement | Checked every 1024 work units |
-| `max_gap_ms` (+ `_cpu`, `_at_ms`) | Longest wall-clock gap between checkpoints — the starvation/preemption tell | Every framework work type |
+| `max_gap_ms` (+ `_cpu`, `_at_ms`) | Longest wall-clock gap between checkpoints — the stuck/preemption tell | Every framework work type |
 | `wake_latencies_ns` + `wake_sample_total` | Per-wakeup latency samples | Blocking work types only (futex, pipe, I/O, yield, sleep) |
 | `iteration_costs_ns` + `iteration_cost_sample_total` | Per-iteration wall-clock cost | Pure-compute variants (`AluHot`, `SmtSiblingSpin`, `IpcVariance`) |
 | `timer_latencies_ns` + `timer_sample_total` | Timer-wake jitter vs absolute deadline | `TimerLatency` only |
@@ -245,7 +245,7 @@ run:
 `migrations` sums `migration_count`, and `cpus` counts distinct
 `cpus_used` entries. Reading this one: both cgroups made steady
 progress with sub-25ms worst gaps — the workers were scheduled fine;
-this failure came from a throughput floor, not starvation. A report
+this failure came from a throughput floor, not the zero-work-units gate. A report
 showing `migrations=0` plus a growing `gap` on a multi-CPU cpuset
 would tell the opposite story: the scheduler is not spreading.
 

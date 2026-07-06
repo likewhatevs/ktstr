@@ -5,13 +5,19 @@ one that matches your problem and follow it top to bottom. For the
 model behind the commands, read [Core Concepts](concepts.md); for
 flag-by-flag detail, the [Running Tests](running-tests.md) chapters.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong><a href="recipes/test-new-scheduler.html">First scheduler test</a></strong><p>Define a scheduler, run a smoke scenario, then add checks.</p></div>
+<div class="kt-doc-card"><strong><a href="recipes/investigate-crash.html">Crash investigation</a></strong><p>Use the failure dump and auto-repro trail to turn a crash into a small regression test.</p></div>
+<div class="kt-doc-card"><strong><a href="recipes/diagnose-slow-scheduler.html">Performance regression</a></strong><p>Capture host scheduler state with <code>ctprof</code>, compare runs, and find the changed workload.</p></div>
+</div>
+
 > [!NOTE]
 > Two binaries appear below. `cargo ktstr <subcommand>` is the
 > host-side cargo wrapper for test workflows; bare `ktstr` is the
 > guest-init binary that doubles as a host CLI for a few tools
 > (`ctprof`, `topo`, `locks`). Both install with `cargo install
 > ktstr`. See [cargo ktstr](running-tests/cargo-ktstr.md) and
-> [ktstr (standalone)](running-tests/ktstr.md).
+> [the standalone ktstr binary](running-tests/cargo-ktstr.md#the-standalone-ktstr-binary).
 
 ## Which recipe do I want?
 

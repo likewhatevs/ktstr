@@ -24,7 +24,7 @@ mod scheduler;
 ///
 /// Every attribute is optional. Most take a `key = value` form; the
 /// sixteen boolean attributes (`auto_repro`, `expect_auto_repro`,
-/// `not_starved`, `isolation`, `performance_mode`, `pci`, `no_perf_mode`,
+/// `not_stuck`, `isolation`, `performance_mode`, `pci`, `no_perf_mode`,
 /// `requires_smt`, `expect_err`, `survives_storm`, `allow_inconclusive`,
 /// `fail_on_rq_clock_stuck`, `host_only`, `ignore`, `kaslr`, `wprof`) also accept a
 /// bare form as shorthand for `= true` — e.g.
@@ -268,9 +268,9 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```rust,ignore
 /// use ktstr::prelude::*;
 ///
-/// declare_scheduler!(MITOSIS, {
-///     name = "mitosis",
-///     binary = "scx_mitosis",
+/// declare_scheduler!(MY_SCHED, {
+///     name = "my_sched",
+///     binary = "scx_my_sched",
 ///     cgroup_parent = "/ktstr",
 ///     sched_args = ["--exit-dump-len", "1048576"],
 ///     kernels = ["6.14", "7.0..=7.2"],
@@ -338,7 +338,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// | `kargs = [..]` | no | Extra guest kernel cmdline args. |
 /// | `kernels = ["6.14", "7.0..=7.2", ..]` | no | Kernel specs the verifier sweeps. Same parser as the `--kernel` CLI flag — accepts exact versions, ranges (`..` or `..=`, both inclusive), git refs (`git+URL#tag=NAME`), paths, and cache keys. Each entry is validated at macro-expand time via the same `KernelId::parse` + `validate` the verifier uses at runtime; empty entries, inverted ranges, and `..`-containing strings whose endpoints aren't version-shaped (e.g. `"abc..def"`) are rejected. |
 /// | `constraints = TopologyConstraints { .. }` | no | Gauntlet preset constraints — maps directly onto `Scheduler::constraints`. Filters which gauntlet topology presets exercise this scheduler. When given as a struct literal, the macro additionally cross-checks each literal field against the effective topology (explicit `topology` field if present, otherwise the `(1, 1, 2, 1)` default from `Scheduler::named`) and rejects infeasible pairings; non-struct-literal forms (e.g. `OTHER::CONST_CONSTRAINTS`) skip that check. |
-/// | `assert = Assert::NO_OVERRIDES.method().chain()` | no | Scheduler-wide assertion overrides — maps directly onto `Scheduler::assert`. Merged with `Assert::default_checks()` and the per-test `assert` at runtime (`default ← scheduler ← per-test`). Accepts any const-evaluable expression: a const path like `Assert::NO_OVERRIDES`, a const-fn call like `Assert::default_checks()`, or a chain of const-fn setters like `Assert::NO_OVERRIDES.check_not_starved().max_gap_ms(50)`. The macro accepts MethodCall chains and Path-rooted (type/module-prefixed) Calls — only bare single-segment lowercase Calls like `helper()` are rejected as non-const free-fn patterns; non-const methods on a Path receiver slip through and surface as a deep const-eval failure at the spread site. |
+/// | `assert = Assert::NO_OVERRIDES.method().chain()` | no | Scheduler-wide assertion overrides — maps directly onto `Scheduler::assert`. Merged with `Assert::default_checks()` and the per-test `assert` at runtime (`default ← scheduler ← per-test`). Accepts any const-evaluable expression: a const path like `Assert::NO_OVERRIDES`, a const-fn call like `Assert::default_checks()`, or a chain of const-fn setters like `Assert::NO_OVERRIDES.check_not_stuck().max_gap_ms(50)`. The macro accepts MethodCall chains and Path-rooted (type/module-prefixed) Calls — only bare single-segment lowercase Calls like `helper()` are rejected as non-const free-fn patterns; non-const methods on a Path receiver slip through and surface as a deep const-eval failure at the spread site. |
 /// | `config_file = "..."` | no | Host-side config file path. |
 /// | `config_file_def = ("--config {file}", "/include-files/cfg.json")` | no | Inline-config plumbing — maps directly onto `Scheduler::config_file_def`. 2-tuple of string literals: arg_template (CLI arg with `{file}` placeholder substituted at run time) and guest_path (absolute path where the framework writes the JSON inside the guest). Distinct from `config_file` (which references a pre-existing host file). The macro validates: tuple-arity = 2, both elements non-empty string literals, `{file}` placeholder present in arg_template, guest_path absolute. |
 ///
@@ -602,7 +602,7 @@ mod tests {
         assert!(d.networks.is_none());
 
         // -- Assert overrides --
-        assert_eq!(d.not_starved, None);
+        assert_eq!(d.not_stuck, None);
         assert_eq!(d.isolation, None);
         assert_eq!(d.max_gap_ms, None);
         assert_eq!(d.max_spread_pct, None);

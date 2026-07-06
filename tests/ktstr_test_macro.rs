@@ -329,8 +329,8 @@ fn bare_auto_repro_compile(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-#[ktstr_test(not_starved, host_only = true)]
-fn bare_not_starved_compile(_ctx: &Ctx) -> Result<AssertResult> {
+#[ktstr_test(not_stuck, host_only = true)]
+fn bare_not_stuck_compile(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
@@ -408,12 +408,12 @@ fn entry_auto_repro_false() {
 }
 
 #[test]
-fn entry_bare_not_starved() {
-    let e = ktstr::test_support::find_test("bare_not_starved_compile").unwrap();
+fn entry_bare_not_stuck() {
+    let e = ktstr::test_support::find_test("bare_not_stuck_compile").unwrap();
     assert_eq!(
-        e.assert.not_starved,
+        e.assert.not_stuck,
         Some(true),
-        "bare `not_starved` must set entry.assert.not_starved=Some(true)"
+        "bare `not_stuck` must set entry.assert.not_stuck=Some(true)"
     );
 }
 

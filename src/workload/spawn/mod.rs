@@ -340,7 +340,7 @@ pub struct WorkerReport {
     /// (kill/waitpid/Pid::from_raw).
     pub tid: i32,
     /// Cumulative work iterations (incremented by `spin_burst` or I/O loops).
-    /// Read by the fairness/starvation gate (`assert_not_starved` /
+    /// Read by the fairness/no-progress gate (`assert_not_stuck` /
     /// `min_work_units`) and `assert_throughput_parity`; NOT summed into
     /// `CgroupStats::total_iterations`, which reads [`iterations`](Self::iterations).
     /// A `Custom` worker that wants throughput assertions must also populate
@@ -457,7 +457,7 @@ pub struct WorkerReport {
     /// Outer-loop iteration count. What `CgroupStats::total_iterations` sums
     /// and what the derived throughput rates (`iterations_per_worker` /
     /// `iterations_per_cpu_sec`) and `migration_ratio` divide by; NOT read by
-    /// the starvation gate, which reads [`work_units`](Self::work_units). A
+    /// the zero-work-units gate, which reads [`work_units`](Self::work_units). A
     /// `Custom` worker that wants the starvation / `min_work_units` gate
     /// honored must also populate [`work_units`](Self::work_units).
     pub iterations: u64,
@@ -2248,7 +2248,7 @@ pub(super) struct PcommGroupResources {
 ///
 /// On a decode-failure or short payload, the parent emits one
 /// sentinel report per expected worker so per-group filtering and
-/// `assert_not_starved` see the correct cardinality.
+/// `assert_not_stuck` see the correct cardinality.
 ///
 /// # Lifecycle
 ///
@@ -5007,7 +5007,7 @@ impl WorkloadHandle {
     ///
     /// Workers that fail to produce a report (died, timed out, or wrote
     /// corrupt data) get a zeroed-out sentinel report with `work_units: 0`.
-    /// This ensures `assert_not_starved` catches dead workers as starvation
+    /// This ensures `assert_not_stuck` catches dead workers as starvation
     /// failures.
     ///
     /// # Shutdown latency
@@ -5285,7 +5285,7 @@ impl WorkloadHandle {
         }
 
         // Collect reports with a shared 5s deadline across all workers.
-        // Each worker gets the remaining budget, so starved workers
+        // Each worker gets the remaining budget, so no-progress workers
         // (e.g. under degrade mode) don't serially exhaust the VM
         // timeout.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -5415,7 +5415,7 @@ impl WorkloadHandle {
             // prefix; the parent's `read_to_end` provides framing.
             // On a decode failure, emit one sentinel per expected
             // report so downstream consumers (per-group filtering,
-            // assert_not_starved) see the correct cardinality.
+            // assert_not_stuck) see the correct cardinality.
             match child.kind {
                 ForkedChildKind::Worker { group_idx } => {
                     let decoded: Result<WorkerReport, _> = postcard::from_bytes(report_slice);
@@ -5474,7 +5474,7 @@ impl WorkloadHandle {
                             // Surplus reports (decoded > total_workers)
                             // must not leak into the parent's report
                             // stream — downstream cardinality assertions
-                            // (per-group filtering, assert_not_starved)
+                            // (per-group filtering, assert_not_stuck)
                             // assume exactly `total_workers` entries.
                             // Truncate to the layout's total before the
                             // `got..total_workers` loop runs (which is

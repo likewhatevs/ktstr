@@ -1002,7 +1002,7 @@ impl AssertResult {
 /// instead.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AssertPlan {
-    pub(crate) not_starved: bool,
+    pub(crate) not_stuck: bool,
     pub(crate) isolation: bool,
     pub(crate) max_gap_ms: Option<u64>,
     pub(crate) max_spread_pct: Option<f64>,
@@ -1088,18 +1088,18 @@ impl AssertPlan {
         r
     }
 
-    /// Fairness CHECKS (Starved / Unfair / Stuck), in order: the
-    /// default-threshold `not_starved` arm, then the custom
+    /// Fairness CHECKS (NoProgress / Unfair / Stuck), in order: the
+    /// default-threshold `not_stuck` arm, then the custom
     /// `max_spread_pct` and `max_gap_ms` arms. Each appends onto `r`.
     fn eval_fairness(&self, r: &mut AssertResult, cg: &CgroupStats, reports: &[WorkerReport]) {
-        // `not_starved`: default-threshold fairness (Starved / Unfair /
+        // `not_stuck`: default-threshold fairness (NoProgress / Unfair /
         // Stuck) on top of the telemetry already built above.
-        if self.not_starved {
+        if self.not_stuck {
             record_default_fairness(r, cg, reports);
         }
-        // Custom spread threshold — independent of `not_starved` (it gates
+        // Custom spread threshold — independent of `not_stuck` (it gates
         // on its own field). Strip any default-threshold Unfair outcome
-        // (present only when `not_starved` also ran) before re-evaluating
+        // (present only when `not_stuck` also ran) before re-evaluating
         // against the caller's limit.
         if let Some(spread_limit) = self.max_spread_pct {
             r.outcomes
@@ -1130,7 +1130,7 @@ impl AssertPlan {
                 ));
             }
         }
-        // Custom gap threshold — independent of `not_starved`. Strip any
+        // Custom gap threshold — independent of `not_stuck`. Strip any
         // default-threshold Stuck outcome before re-evaluating.
         if let Some(threshold) = self.max_gap_ms {
             r.outcomes
@@ -1470,8 +1470,8 @@ pub fn assert_cross_node_migration(
 
 #[cfg(test)]
 impl AssertPlan {
-    pub(crate) fn check_not_starved(mut self) -> Self {
-        self.not_starved = true;
+    pub(crate) fn check_not_stuck(mut self) -> Self {
+        self.not_stuck = true;
         self
     }
 

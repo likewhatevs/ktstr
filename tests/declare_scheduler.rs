@@ -217,7 +217,7 @@ declare_scheduler!(DECLARE_SCHEDULER_WITH_ASSERT, {
     name = "declare_scheduler_with_assert",
     binary = "scx-assert",
     assert = Assert::NO_OVERRIDES
-        .check_not_starved()
+        .check_not_stuck()
         .max_gap_ms(5000)
         .max_imbalance_ratio(2.5)
         .fail_on_rq_clock_stuck(true)
@@ -226,7 +226,7 @@ declare_scheduler!(DECLARE_SCHEDULER_WITH_ASSERT, {
 
 #[test]
 fn assert_field_threads_to_scheduler() {
-    assert_eq!(DECLARE_SCHEDULER_WITH_ASSERT.assert.not_starved, Some(true));
+    assert_eq!(DECLARE_SCHEDULER_WITH_ASSERT.assert.not_stuck, Some(true));
     assert_eq!(DECLARE_SCHEDULER_WITH_ASSERT.assert.max_gap_ms, Some(5000));
     assert_eq!(
         DECLARE_SCHEDULER_WITH_ASSERT.assert.max_imbalance_ratio,
@@ -270,7 +270,7 @@ fn assert_accepts_bare_const_path() {
     // no method-chain or call. Validator must accept Expr::Path
     // alongside the MethodCall and Call shapes the other
     // declarations exercise.
-    assert_eq!(DECLARE_SCHEDULER_BARE_NO_OVERRIDES.assert.not_starved, None);
+    assert_eq!(DECLARE_SCHEDULER_BARE_NO_OVERRIDES.assert.not_stuck, None);
     assert_eq!(DECLARE_SCHEDULER_BARE_NO_OVERRIDES.assert.max_gap_ms, None);
 }
 
@@ -279,7 +279,7 @@ fn omitted_assert_defaults_to_no_overrides() {
     // When the macro omits `assert = ...`, Scheduler::named's
     // default (`Assert::NO_OVERRIDES`, all-None) flows through.
     // Verified via DECLARE_SCHEDULER_MINIMAL which omits assert.
-    assert_eq!(DECLARE_SCHEDULER_MINIMAL.assert.not_starved, None);
+    assert_eq!(DECLARE_SCHEDULER_MINIMAL.assert.not_stuck, None);
     assert_eq!(DECLARE_SCHEDULER_MINIMAL.assert.max_gap_ms, None);
     assert_eq!(
         DECLARE_SCHEDULER_MINIMAL.assert.fail_on_rq_clock_stuck,

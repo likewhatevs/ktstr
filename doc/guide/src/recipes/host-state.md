@@ -10,6 +10,12 @@ between two runs in a host-delta section so you can see what moved.
 [ctprof](diagnose-slow-scheduler.md); for scheduler-behavior diffs
 between commits see [A/B Compare Branches](ab-compare.md).)
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>Live host</strong><p><code>show-host</code> reads the machine exactly as it is before the next run.</p></div>
+<div class="kt-doc-card"><strong>Archived run</strong><p><code>stats show-host --run</code> shows the host context stored with a sidecar.</p></div>
+<div class="kt-doc-card"><strong>Delta</strong><p><code>perf-delta</code> surfaces host changes next to metric changes.</p></div>
+</div>
+
 ## Live vs archived
 
 Two subcommands print host context; pick the one whose target

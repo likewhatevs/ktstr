@@ -288,7 +288,7 @@ fn plan_slow_tier_ratio_no_numa_signal_is_inconclusive() {
     let b = rpt(2, 1000, 1_000_000_000, 0, &[0], 0);
     // Both workers have empty numa_pages — no NUMA signal at all.
     let plan = AssertPlan {
-        not_starved: false,
+        not_stuck: false,
         isolation: false,
         max_gap_ms: None,
         max_spread_pct: None,
@@ -703,7 +703,7 @@ fn plan_cross_node_migration_aggregates_cgroup_total() {
     a.vmstat_numa_pages_migrated = 5;
     b.vmstat_numa_pages_migrated = 5;
     let plan = AssertPlan {
-        not_starved: false,
+        not_stuck: false,
         isolation: false,
         max_gap_ms: None,
         max_spread_pct: None,
@@ -737,7 +737,7 @@ fn plan_cross_node_migration_emits_one_failure_not_per_worker() {
     a.vmstat_numa_pages_migrated = 50;
     b.vmstat_numa_pages_migrated = 50;
     let plan = AssertPlan {
-        not_starved: false,
+        not_stuck: false,
         isolation: false,
         max_gap_ms: None,
         max_spread_pct: None,
@@ -776,7 +776,7 @@ fn plan_min_page_locality_fails_on_zero_allocation_cgroup() {
     let a = rpt(1, 1000, 1_000_000_000, 0, &[0], 0);
     let b = rpt(2, 1000, 1_000_000_000, 0, &[0], 0);
     let plan = AssertPlan {
-        not_starved: false,
+        not_stuck: false,
         isolation: false,
         max_gap_ms: None,
         max_spread_pct: None,
@@ -816,7 +816,7 @@ fn plan_min_page_locality_aggregates_across_cgroup() {
     a.numa_pages = [(0, 100)].into_iter().collect();
     b.numa_pages = [(1, 100)].into_iter().collect();
     let plan = AssertPlan {
-        not_starved: false,
+        not_stuck: false,
         isolation: false,
         max_gap_ms: None,
         max_spread_pct: None,

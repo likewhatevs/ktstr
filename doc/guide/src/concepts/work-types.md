@@ -8,6 +8,12 @@ code path a regression lives in. `ForkExit` hammers
 `migration_cpu_stop`. If you know which path your scheduler change
 touches, there is usually a work type aimed at it.
 
+<div class="kt-doc-grid">
+<div class="kt-doc-card"><strong>CPU paths</strong><p>Spin, yield, fork/exit, affinity churn, scheduling-class transitions, and SMT pressure.</p></div>
+<div class="kt-doc-card"><strong>Wake paths</strong><p>Pipe, futex, epoll, fan-out, timers, IRQ/softirq, and request/response workloads.</p></div>
+<div class="kt-doc-card"><strong>Locality + I/O</strong><p>Cache pressure, NUMA working sets, page faults, block I/O, taobench, and schbench parity.</p></div>
+</div>
+
 ## Choosing a work type
 
 | Scheduler behavior to test | Work type |
@@ -33,7 +39,7 @@ touches, there is usually a work type aimed at it.
 | NUMA locality under migration | `NumaWorkingSetSweep` |
 | Lock contention / convoy effect | `MutexContention` |
 | Priority inversion | `PriorityInversion` |
-| RT starving or preempting CFS | `RtStarvation`, `PreemptStorm` |
+| RT monopolizing or preempting CFS | `RtStarvation`, `PreemptStorm` |
 | Signal delivery pressure | `SignalStorm` |
 | Producer/consumer imbalance | `ProducerConsumerImbalance` |
 | Block-I/O D-state cycles | `IoSyncWrite`, `IoRandRead`, `IoConvoy` |
@@ -83,7 +89,7 @@ producers + `epoll_wait` consumers (exclusive autoremove wake).
 one futex word, broadcast-woken.
 
 **Timer and IRQ wakes** (the AF_PACKET variants need
-`#[ktstr_test(network = ...)]`). `TimerLatency { interval_us }` —
+`#[ktstr_test(networks = ...)]`). `TimerLatency { interval_us }` —
 cyclictest-style absolute-deadline hrtimer wake. `NetTraffic` —
 AF_PACKET self-traffic driving virtio-net RX hardirq + NAPI softirq.
 `IrqWake` — paired sender/receiver; the receiver blocked in
@@ -116,7 +122,7 @@ contending for one lock, PI or plain futex mode.
 **Signal / preemption pressure.** `SignalStorm` — paired workers
 fire `tkill(partner, SIGUSR2)` between bursts. `PreemptStorm` — one
 `SCHED_FIFO` worker preempts CFS spinners at ~kHz. `RtStarvation` —
-`SCHED_FIFO` workers monopolize CPUs while CFS workers starve.
+`SCHED_FIFO` workers monopolize CPUs while CFS workers get no runtime.
 
 **Compound.** `Sequence { first, rest }` — ordered `WorkPhase`s
 (`Spin` / `Sleep` / `Yield` / `Io` / `AluHot`, each with a

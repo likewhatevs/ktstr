@@ -70,7 +70,7 @@ fn log_passes_default() -> bool {
 #[derive(Debug, Clone)]
 pub struct Verdict {
     /// Threshold config the verdict was opened against. Carried so
-    /// downstream merge sites (e.g. retrofitted `assert_not_starved`)
+    /// downstream merge sites (e.g. retrofitted `assert_not_stuck`)
     /// can read thresholds out of the verdict directly without an
     /// extra parameter. Optional because [`Verdict::new`] does not
     /// require an `Assert`; tests that only run pointwise claims
@@ -319,7 +319,7 @@ impl Verdict {
 
     /// Fold an external [`AssertResult`] into this verdict. Useful when
     /// a test combines pointwise claims with the result of an upstream
-    /// `assert_*` call (e.g. `assert_not_starved`). Mirrors
+    /// `assert_*` call (e.g. `assert_not_stuck`). Mirrors
     /// [`AssertResult::merge`] semantics — `other.outcomes` are
     /// appended to this verdict's outcome stream, so the merge
     /// lattice (`Fail > Inconclusive > Pass > Skip`) folds across

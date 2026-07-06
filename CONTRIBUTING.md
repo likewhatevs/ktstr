@@ -20,7 +20,8 @@ mirror the `lint`, `compile-fail`, `docs-link-check`, and
 
 ```
 just lint              # fmt --check, cargo check + clippy (both feature
-                       #   sets), rustdoc-warnings-as-errors
+                       #   sets), rustdoc-warnings-as-errors, docs.rs-mode
+                       #   check
 just compile-fail      # trybuild diagnostic-snapshot fixtures
 just link-check        # guide build + mdbook test + lychee link walk
 just devdep-isolation  # keep ktstr out of a downstream release binary

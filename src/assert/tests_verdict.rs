@@ -582,7 +582,10 @@ fn verdict_merge_folds_in_external_assert_result() {
 
     let mut external = AssertResult::pass();
 
-    external.record_fail(AssertDetail::new(DetailKind::Starved, "tid 7 starved"));
+    external.record_fail(AssertDetail::new(
+        DetailKind::NoProgress,
+        "tid 7 made no progress",
+    ));
     v.merge(external);
 
     let b = 5u64;
@@ -593,7 +596,7 @@ fn verdict_merge_folds_in_external_assert_result() {
     assert_eq!(r.outcomes.len(), 2);
     assert!(
         r.failure_details()
-            .any(|d| matches!(d.kind, DetailKind::Starved))
+            .any(|d| matches!(d.kind, DetailKind::NoProgress))
     );
     assert!(
         r.failure_details()

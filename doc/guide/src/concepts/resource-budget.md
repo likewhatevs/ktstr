@@ -10,7 +10,7 @@ sandbox.
 
 ## When to use it
 
-- **Multi-tenant CI hosts** where unbounded parallelism starves
+- **Multi-tenant CI hosts** where unbounded parallelism overloads
   concurrent jobs but the full [performance-mode](performance-mode.md)
   contract (RT scheduling, hugepages, NUMA mbind) is too heavy.
 - **Kernel builds beside perf-mode tests** — the build's shared lock
@@ -222,7 +222,7 @@ locks — with each holder's PID and command line. It is read-only and
 takes no locks itself. Use it when an acquire fails with
 `ResourceContention`: the error names the busy LLCs, the snapshot
 shows every contending peer at once. The full output and flags are in
-[ktstr (standalone)](../running-tests/ktstr.md).
+[cargo ktstr locks](../running-tests/cargo-ktstr.md#locks).
 
 ## `KTSTR_BYPASS_LLC_LOCKS` — escape hatch
 
