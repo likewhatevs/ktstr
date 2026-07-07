@@ -52,10 +52,13 @@ use std::time::Duration;
 /// `immediate_exit` kick failed to interrupt.
 pub(super) const FREEZE_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Why [`super::KtstrVm::run_bsp_loop`] exited. Logged at break time
-/// so an operator reading stderr (`BSP: loop exit reason=...`) can
-/// diagnose a `code=-1` exit without correlating to peer-vCPU
-/// stderr or `tracing` output.
+/// Why [`super::KtstrVm::run_bsp_loop`] exited. Returned to the
+/// caller, which logs it (`BSP: loop exit reason=...`) so an operator
+/// reading stderr can diagnose a `code=-1` exit without correlating
+/// to peer-vCPU stderr or `tracing` output. The log site is
+/// caller-side rather than at loop break because the interactive
+/// shell's terminal is still in raw mode when the loop exits — the
+/// shell path defers the line until after terminal restore.
 ///
 /// Mapping to the BSP loop's exit_code:
 ///   - [`Shutdown`](Self::Shutdown) → exit_code = 0 (the only path
@@ -67,8 +70,10 @@ pub(super) const FREEZE_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(30);
 ///     sentinel) when either is present, so a `-1` from the BSP
 ///     run-loop is not authoritative for caller-visible test
 ///     outcome.
+// `pub(crate)` (not `pub(super)`): part of `run_bsp_loop`'s return
+// tuple, whose shell-mode caller lives in `crate::vmm`.
 #[derive(Debug, Clone, Copy)]
-pub(super) enum BspExitReason {
+pub(crate) enum BspExitReason {
     /// `kill.load(Acquire)` returned `true` at the top of the loop —
     /// some peer (an AP that observed [`super::exit_dispatch::ExitAction::Shutdown`] or
     /// [`super::exit_dispatch::ExitAction::Fatal`], the panic hook, the monitor thread on
