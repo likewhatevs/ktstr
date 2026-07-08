@@ -79,7 +79,7 @@ sudo dnf install clang pkgconf make gcc autoconf gettext-devel flex bison gawk
 
 ```toml
 [dev-dependencies]
-ktstr = "=0.25.0"
+ktstr = "=0.26.0"
 ```
 
 ktstr is pre-release: pin the exact patch version and keep the
@@ -91,7 +91,7 @@ builds, gate it behind a feature instead — see
 Install the matching CLI when pinning a specific crate version:
 
 ```sh
-cargo install --locked --bin cargo-ktstr ktstr@0.25.0
+cargo install --locked --bin cargo-ktstr ktstr@0.26.0
 ```
 
 ## Build a kernel

@@ -111,6 +111,16 @@ CONFIG_BPF_EVENTS=y
 CONFIG_DEBUG_FS=y
 CONFIG_FUNCTION_TRACER=y
 CONFIG_DYNAMIC_FTRACE=y
+# FTRACE_SYSCALLS: per-syscall entry/exit tracepoints — what bpftrace
+# exposes as tracepoint:syscalls:sys_enter_*/sys_exit_*. Default n and
+# absent from both arch defconfigs, so a debugging binary shipped into
+# shell mode via --include-files (e.g. bpftrace) had no syscall
+# tracepoints to attach to. Dormant cost is zero for scheduler timing:
+# the syscall-path work is gated on the per-task SYSCALL_TRACEPOINT
+# syscall-work flag, which syscall_regfunc (kernel/tracepoint.c) sets
+# only while at least one syscall tracepoint is registered. Both
+# x86_64 and arm64 select HAVE_SYSCALL_TRACEPOINTS.
+CONFIG_FTRACE_SYSCALLS=y
 # Preempt-disabled duration capture (#64).
 # tp_btf/preempt_disable + preempt_enable handlers in probe.bpf.c
 # attach to the trace_preempt_off / trace_preempt_on tracepoints
@@ -304,6 +314,15 @@ CONFIG_KALLSYMS_ALL=y
 # IKCONFIG_PROC exposes /proc/config.gz for runtime inspection.
 CONFIG_IKCONFIG=y
 CONFIG_IKCONFIG_PROC=y
+# IKHEADERS exposes /sys/kernel/kheaders.tar.xz — the in-kernel copy
+# of the headers that BPF tooling (bpftrace/BCC) falls back to when no
+# kernel headers are installed. The ktstr guest is initramfs-only (no
+# /lib/modules, no headers on disk), so without this a bpftrace binary
+# shipped into shell mode via --include-files cannot compile programs
+# that need kernel headers beyond what vmlinux BTF provides. Tristate;
+# =y builds the archive into the image (the guest loads no modules, so
+# a kheaders.ko would be unloadable anyway).
+CONFIG_IKHEADERS=y
 
 # -- Accounting --
 # TASK_IO_ACCOUNTING: gates /proc/<tid>/io

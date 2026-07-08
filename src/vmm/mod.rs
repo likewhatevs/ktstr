@@ -1777,7 +1777,12 @@ impl KtstrVm {
         }
         register_vcpu_signal_handler();
         let interactive_timeout = Duration::from_secs(24 * 60 * 60);
-        self.run_bsp_loop(
+        // Exit code and timeout flag are unused here: interactive
+        // exit status is not derived from the run-loop sentinel
+        // (shell mode returns Ok(None)), and the 24h pseudo-timeout
+        // above means `timed_out` never flips. The exit reason is
+        // kept for the post-restore diagnostic line below.
+        let (_exit_code, _timed_out, bsp_exit_reason) = self.run_bsp_loop(
             &mut bsp,
             &com1,
             &com2,
@@ -1864,6 +1869,19 @@ impl KtstrVm {
         // _raw_guard drops here, restoring terminal and signal handlers.
         drop(_raw_guard);
 
+        // Diagnostic exit-reason line, deferred until after the raw-mode
+        // restore. Printing it at loop break (as run_vm's caller does)
+        // staircases: raw mode has ONLCR off, so the bare `\n` moves the
+        // cursor down without returning it to column 0, and the line
+        // glues onto the guest's final echo. The leading blank eprintln
+        // terminates that echo line — the guest's shell usually powers
+        // off before the hvc0->stdout forwarder drains the echoed
+        // newline of the final `exit`, leaving the cursor mid-line.
+        if !exec_mode {
+            eprintln!();
+        }
+        eprintln!("BSP: loop exit reason={bsp_exit_reason:?}");
+
         // Surface any device-IRQ routing failures the userspace IOAPIC hit
         // during the run. The operator's terminal showed the guest console,
         // not the host's per-failure tracing, so an unrouted IRQ would
@@ -1917,8 +1935,11 @@ impl KtstrVm {
 
         // Print kernel console output (COM1) to stderr if non-empty.
         // Skip when --dmesg was active (already streamed to stderr).
+        // `output_display` (not `output`) so the serial8250 IRQ-probe
+        // 0xFF byte doesn't surface: on a quiet boot it is COM1's only
+        // content, and a raw dump printed a lone `�` here.
         if !self.dmesg {
-            let console_output = com1.lock().output();
+            let console_output = com1.lock().output_display();
             if !console_output.is_empty() {
                 eprintln!("{console_output}");
             }

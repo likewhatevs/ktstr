@@ -1534,8 +1534,8 @@ impl KtstrVm {
         // watchdog fired its hard-deadline branch. The watchdog
         // thread sets this to `true` ONLY on the
         // `Instant::now() >= effective_deadline` arm; the BSP
-        // reads it post-loop and the resulting `(exit_code,
-        // timed_out)` tuple flows through `run_bsp_loop` →
+        // reads it post-loop and the resulting `timed_out` element
+        // of `run_bsp_loop`'s return tuple flows through
         // `VmRunState::timed_out` → `VmResult::timed_out`.
         let timed_out_flag = Arc::new(AtomicBool::new(false));
         // Wake fd paired with the `kill` AtomicBool. Setters that
@@ -10986,7 +10986,7 @@ impl KtstrVm {
         // `spawn_ap_threads` above, which runs even for a zero-AP VM,
         // so the hook is live by the time BSP enters its loop.
         eprintln!("BSP: entering run loop");
-        let (exit_code, timed_out) = vcpu_panic::with_vcpu_panic_ctx(
+        let (exit_code, timed_out, bsp_exit_reason) = vcpu_panic::with_vcpu_panic_ctx(
             vcpu_panic::VcpuPanicCtx {
                 kill: kill.clone(),
                 exited: bsp_done.clone(),
@@ -11044,6 +11044,13 @@ impl KtstrVm {
         // join — so a panic anywhere in this window (defense-in-depth against a
         // future fallible op added here) still joins every spawned thread before
         // bsp / vm drop rather than detaching them.
+        //
+        // Caller-side log of the loop's exit reason (see the
+        // `run_bsp_loop` doc for why the loop doesn't print it
+        // itself: the interactive-shell caller must defer this
+        // past raw-mode terminal restore; here there is no raw
+        // terminal, so print immediately).
+        eprintln!("BSP: loop exit reason={bsp_exit_reason:?}");
         bsp_done.store(true, Ordering::Release);
         // Wake the freeze coordinator's epoll loop. Failure
         // (counter overflow / EAGAIN under EFD_NONBLOCK) is benign
@@ -12787,7 +12794,8 @@ impl KtstrVm {
         Ok(Some(handle))
     }
 
-    /// Unified BSP KVM_RUN loop. Returns `(exit_code, timed_out)`.
+    /// Unified BSP KVM_RUN loop. Returns `(exit_code, timed_out,
+    /// exit_reason)`.
     ///
     /// `exit_code` semantics:
     ///   - `0` only when the BSP itself observed
@@ -12804,11 +12812,17 @@ impl KtstrVm {
     ///     COM2 `KTSTR_EXIT:` sentinel) before constructing
     ///     [`super::result::VmResult`], so the value caller-visible
     ///     code reads is the guest's reported exit code, not this
-    ///     local sentinel. [`BspExitReason`] is logged at break time
-    ///     so an operator reading stderr can distinguish
-    ///     "AP saw Shutdown first" from "BSP itself saw Fatal" or
-    ///     "BSP run() returned a permanent error" without correlating
-    ///     to other diagnostics.
+    ///     local sentinel. [`BspExitReason`] is returned so the
+    ///     caller can log it (`BSP: loop exit reason=...`) and an
+    ///     operator reading stderr can distinguish "AP saw Shutdown
+    ///     first" from "BSP itself saw Fatal" or "BSP run() returned
+    ///     a permanent error" without correlating to other
+    ///     diagnostics. Logging is the caller's job because the
+    ///     interactive-shell terminal is still in raw mode when this
+    ///     loop exits — a bare `eprintln!` here staircases into the
+    ///     session output (LF without CR, glued to the guest's last
+    ///     echo); the shell path defers the line until after
+    ///     terminal restore.
     ///
     /// Handles arch-specific I/O dispatch (port I/O on x86_64, MMIO on
     /// aarch64). HLT/WFI checks the kill flag and continues (both arches).
@@ -12893,7 +12907,7 @@ impl KtstrVm {
         // BSP-side derive short-circuits in that case and the
         // shared Arc stays at 0 until the guest channel publishes.
         entry_syscall_64_link_kva: u64,
-    ) -> (i32, bool) {
+    ) -> (i32, bool, BspExitReason) {
         let mut exit_code: i32 = -1;
         // Track which path drove the BSP out of the loop so the
         // post-loop log line is actionable. Without this, an operator
@@ -13211,7 +13225,6 @@ impl KtstrVm {
             }
         }
 
-        eprintln!("BSP: loop exit reason={exit_reason:?}");
         // The watchdog sets `timed_out_flag` only on its hard-
         // deadline branch (NOT on "kill set by AP"). Reading it
         // here propagates the watchdog's hard-timeout verdict
@@ -13220,7 +13233,7 @@ impl KtstrVm {
         // watchdog-driven kill from a clean shutdown or a
         // panic-driven kill.
         let timed_out = timed_out_flag.load(Ordering::Acquire);
-        (exit_code, timed_out)
+        (exit_code, timed_out, exit_reason)
     }
 
     /// Whether the run has a real BPF `struct_ops` scheduler

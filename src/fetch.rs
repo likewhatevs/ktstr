@@ -694,6 +694,105 @@ const DOWNLOAD_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(300);
 /// than a wedged build.
 const SHA256SUMS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Retry policy for [`get_with_transient_retry`]: attempt count and
+/// the unit the exponential backoff scales from (sleep =
+/// `backoff_unit << attempt`, i.e. 2s/4s/8s for a 1s unit — the same
+/// timing as `build_helpers::retry_with_backoff`, which covers the
+/// build-script blob downloads; this covers the runtime kernel-source
+/// fetches). A struct rather than two bare params so the production
+/// sites share one const and the fetch_tests seam can inject a
+/// zero-backoff policy without sleeping through real backoff.
+struct HttpRetry {
+    attempts: u32,
+    backoff_unit: Duration,
+}
+
+/// Production retry policy: 4 attempts, 2s/4s/8s between them.
+/// Matches `MAX_TARBALL_ATTEMPTS`/`MAX_CLONE_ATTEMPTS` in build.rs so
+/// every network fetch in the project tolerates the same outage
+/// window (~14s) before giving up.
+const TRANSIENT_HTTP_RETRY: HttpRetry = HttpRetry {
+    attempts: 4,
+    backoff_unit: Duration::from_secs(1),
+};
+
+/// Whether an HTTP status is worth retrying: 429 (rate limit) and the
+/// gateway trio 502/503/504. kernel.org fronts cdn.kernel.org with
+/// Varnish, which returns bursts of `503` with `retry-after: 0`
+/// during cache churn — the exact failure that killed every
+/// `just kernel-build` job in one CI run. 500 is deliberately NOT
+/// retried: it signals a server bug rather than a transient edge
+/// condition, and the existing contract (pinned by
+/// `download_stable_tarball_500_is_hard_error_without_marker`) treats
+/// it as an immediate hard error.
+fn is_transient_http_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 502 | 503 | 504)
+}
+
+/// GET `url`, retrying transient failures (transport errors and
+/// [`is_transient_http_status`] statuses) per `retry`.
+///
+/// The failure surface is IDENTICAL to a bare
+/// `client.get(url).send()`: every non-transient response — success,
+/// 404, or any other status — is returned to the caller untouched, so
+/// each call site keeps its own status routing (the 404 →
+/// [`TarballNotFound`] git-fallback marker, the RC/codeload bespoke
+/// 404 messages) and its exact error wording. A transient status on
+/// the FINAL attempt is likewise returned (the caller's status gate
+/// bails with the same `HTTP 503` text an unretried call would have
+/// produced); a transport error on the final attempt propagates with
+/// the same `"{what} {url}"` context the call sites previously
+/// attached. Retries are purely additive.
+///
+/// `what` is the call site's error-context verb ("download" /
+/// "fetch") so the transport-error context matches the wording each
+/// site used before retries existed.
+///
+/// Only the GET is retried — response-body streaming failures are
+/// out of scope (the tarball sites stream through [`DownloadStream`]
+/// with its own watchdog, and a mid-stream abort after a 200 leaves
+/// staging state a plain re-GET could not resume anyway).
+fn get_with_transient_retry(
+    client: &Client,
+    url: &str,
+    timeout: Option<Duration>,
+    what: &str,
+    retry: &HttpRetry,
+) -> Result<reqwest::blocking::Response> {
+    assert!(retry.attempts > 0, "HttpRetry.attempts must be >= 1");
+    for attempt in 1..=retry.attempts {
+        let mut req = client.get(url);
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
+        match req.send() {
+            Ok(response) => {
+                let status = response.status();
+                if !is_transient_http_status(status) || attempt == retry.attempts {
+                    return Ok(response);
+                }
+                tracing::warn!(
+                    %url, %status, attempt, max_attempts = retry.attempts,
+                    "{what} hit a transient HTTP status; retrying",
+                );
+            }
+            Err(e) => {
+                if attempt == retry.attempts {
+                    return Err(anyhow::Error::new(e).context(format!("{what} {url}")));
+                }
+                tracing::warn!(
+                    %url, err = %e, attempt, max_attempts = retry.attempts,
+                    "{what} failed in transport; retrying",
+                );
+            }
+        }
+        // Reached only on a transient failure with attempts left:
+        // both match arms return on the final attempt.
+        std::thread::sleep(retry.backoff_unit * (1u32 << attempt));
+    }
+    unreachable!("the attempt == retry.attempts arms above return on the final iteration")
+}
+
 /// Construct the cdn.kernel.org `sha256sums.asc` URL for a stable
 /// major series:
 /// `https://cdn.kernel.org/pub/linux/kernel/v{major}.x/sha256sums.asc`.
@@ -719,11 +818,13 @@ fn sha256sums_url(major: u32) -> String {
 /// URL is pinned by [`sha256sums_url`].
 fn fetch_sha256sums_from_url(client: &Client, url: &str) -> Result<String> {
     tracing::info!(%url, "fetching kernel tarball sha256sums (requires network)");
-    let response = client
-        .get(url)
-        .timeout(SHA256SUMS_REQUEST_TIMEOUT)
-        .send()
-        .with_context(|| format!("fetch {url}"))?;
+    let response = get_with_transient_retry(
+        client,
+        url,
+        Some(SHA256SUMS_REQUEST_TIMEOUT),
+        "fetch",
+        &TRANSIENT_HTTP_RETRY,
+    )?;
     if !response.status().is_success() {
         anyhow::bail!("fetch {url}: HTTP {}", response.status());
     }
@@ -988,11 +1089,13 @@ fn download_stable_tarball_from_url(
     let expected_sha256 = resolve_expected_sha256(client, major, &tarball_name, skip_sha256);
 
     tracing::info!(%url, "downloading stable kernel tarball (requires network)");
-    let response = client
-        .get(url)
-        .timeout(DOWNLOAD_REQUEST_READ_TIMEOUT)
-        .send()
-        .with_context(|| format!("download {url}"))?;
+    let response = get_with_transient_retry(
+        client,
+        url,
+        Some(DOWNLOAD_REQUEST_READ_TIMEOUT),
+        "download",
+        &TRANSIENT_HTTP_RETRY,
+    )?;
     if !response.status().is_success() {
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             // Pruned tarball (EOL series or superseded point release).
@@ -1177,11 +1280,13 @@ fn download_rc_tarball(
     let url = format!("https://git.kernel.org/torvalds/t/linux-{version}.tar.gz");
     tracing::info!(%url, "downloading RC kernel tarball (requires network)");
 
-    let response = client
-        .get(&url)
-        .timeout(DOWNLOAD_REQUEST_READ_TIMEOUT)
-        .send()
-        .with_context(|| format!("download {url}"))?;
+    let response = get_with_transient_retry(
+        client,
+        &url,
+        Some(DOWNLOAD_REQUEST_READ_TIMEOUT),
+        "download",
+        &TRANSIENT_HTTP_RETRY,
+    )?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         anyhow::bail!(
             "RC tarball not found: {url}\n  \
@@ -1269,11 +1374,13 @@ pub(crate) fn download_github_archive(
     mp: Option<&crate::cli::FetchProgress>,
 ) -> Result<AcquiredSource> {
     tracing::info!(%archive_url, "downloading GitHub codeload snapshot (requires network)");
-    let response = client
-        .get(archive_url)
-        .timeout(DOWNLOAD_REQUEST_READ_TIMEOUT)
-        .send()
-        .with_context(|| format!("download {archive_url}"))?;
+    let response = get_with_transient_retry(
+        client,
+        archive_url,
+        Some(DOWNLOAD_REQUEST_READ_TIMEOUT),
+        "download",
+        &TRANSIENT_HTTP_RETRY,
+    )?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         anyhow::bail!(
             "codeload snapshot not found: {archive_url}\n  \
@@ -1467,10 +1574,7 @@ pub(crate) const RELEASES_URL: &str = "https://www.kernel.org/releases.json";
 /// returns canned `releases.json` content.
 pub(crate) fn fetch_releases(client: &Client, url: &str) -> Result<Vec<Release>> {
     tracing::info!(%url, "fetching kernel.org releases index (requires network)");
-    let response = client
-        .get(url)
-        .send()
-        .with_context(|| format!("fetch {url}"))?;
+    let response = get_with_transient_retry(client, url, None, "fetch", &TRANSIENT_HTTP_RETRY)?;
     if !response.status().is_success() {
         anyhow::bail!("fetch {url}: HTTP {}", response.status());
     }

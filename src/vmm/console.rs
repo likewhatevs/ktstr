@@ -538,6 +538,32 @@ impl Serial {
         String::from_utf8_lossy(self.inner.writer()).to_string()
     }
 
+    /// Captured output for operator display: [`Self::output`] with raw
+    /// `0xFF` bytes stripped before the lossy UTF-8 conversion.
+    ///
+    /// The guest's serial8250 IRQ autoprobe writes a bare `0xFF` to the
+    /// TX register at port-config time (`autoconfig_irq()`,
+    /// `drivers/tty/serial/8250/8250_port.c` — the write that coaxes a
+    /// THRI interrupt out of the UART so `probe_irq_off` can identify
+    /// its line), and the device model captures it like any other data
+    /// write. On a quiet boot (`loglevel=0`, the interactive-shell
+    /// default) that probe byte is the ONLY byte on the kernel
+    /// console, so an `output()` dump renders as a lone U+FFFD `�`.
+    /// `0xFF` cannot appear anywhere in valid UTF-8, so stripping it
+    /// never drops console text. The strip is display-only — the
+    /// underlying capture stays byte-faithful for the panic latch and
+    /// `output_contains` consumers.
+    pub fn output_display(&self) -> String {
+        let bytes: Vec<u8> = self
+            .inner
+            .writer()
+            .iter()
+            .copied()
+            .filter(|&b| b != 0xFF)
+            .collect();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
     /// Return true when the captured output contains `needle` as a
     /// contiguous byte sequence. Resumes from the prior cursor so
     /// repeat polls amortize to O(N) over the buffer growth instead
@@ -1050,6 +1076,25 @@ mod tests {
         let mut lsr = [0u8; 1];
         s.handle_in(COM1_BASE + LSR, &mut lsr);
         assert_ne!(lsr[0] & LSR_DR, 0, "data should be ready after queue_input");
+    }
+
+    #[test]
+    fn output_display_strips_8250_irq_probe_byte() {
+        let mut s = Serial::default();
+        // Quiet-boot shape: the serial8250 autoconfig_irq probe byte
+        // is the only thing on the console.
+        s.handle_out(COM1_BASE, &[0xFF]);
+        assert_eq!(s.output(), "\u{FFFD}", "raw output stays faithful");
+        assert!(s.output_display().is_empty());
+        // Probe byte embedded in real console text (verbose boot).
+        for c in b"before " {
+            s.handle_out(COM1_BASE, &[*c]);
+        }
+        s.handle_out(COM1_BASE, &[0xFF]);
+        for c in b"after" {
+            s.handle_out(COM1_BASE, &[*c]);
+        }
+        assert_eq!(s.output_display(), "before after");
     }
 
     #[test]
