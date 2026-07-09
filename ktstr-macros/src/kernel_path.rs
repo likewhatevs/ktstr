@@ -53,19 +53,25 @@
 /// changes.
 pub const KERNEL_ID_GRAMMAR: &str = "exact version (`6.14`), inclusive range (`6.14..7.0` or \
      `6.14..=7.0`), git source (`git+URL#tag=NAME`, `git+URL#branch=NAME`, or \
-     `git+URL#sha=<40-hex>`), absolute or `~`-prefixed path, or cache key";
+     `git+URL#sha=<40-hex>`), absolute or `~`-prefixed path, local kernel package \
+     (`*.rpm` or `*.deb`), distro kernel (`fedora`/`fedora-44`/`f44`, \
+     `ubuntu`/`ubuntu-24.04`, `amazonlinux`/`amazonlinux-2023`/`al2023`), or cache key";
 
 /// Kernel identifier: filesystem path, version string, cache key,
 /// stable-release range, or git source.
 ///
 /// Parsing heuristic (see [`KernelId::parse`]):
-/// - Contains `/` (without a `git+` prefix) or starts with `.` or `~`:
-///   [`KernelId::Path`]
 /// - Starts with `git+`: [`KernelId::Git`] (form `git+URL#tag=NAME` /
 ///   `git+URL#branch=NAME` / `git+URL#sha=<40-hex>`)
+/// - Ends with `.rpm` or `.deb`: [`KernelId::Package`]
+/// - Contains `/` (without a `git+` prefix) or starts with `.` or `~`:
+///   [`KernelId::Path`]
 /// - Contains `..` between two version-shaped tokens:
 ///   [`KernelId::Range`] (inclusive on both endpoints)
 /// - Matches `MAJOR.MINOR[.PATCH][-rcN]`: [`KernelId::Version`]
+/// - A distro name (`fedora` / `ubuntu` / `amazonlinux`, an
+///   explicit-release `NAME-REL`, or shorthand `f44` / `al2023`):
+///   [`KernelId::Distro`]
 /// - Otherwise: [`KernelId::CacheKey`]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KernelId {
@@ -134,6 +140,46 @@ pub enum KernelId {
         /// bare `#REF` or unrecognized selector that `validate` rejects.
         ref_kind: GitRefKind,
     },
+    /// Local kernel package: an `.rpm` or `.deb` file on disk, to be
+    /// unpacked for its prebuilt kernel image and modules. Classified
+    /// by [`KernelId::parse`] on the case-sensitive `.rpm` / `.deb`
+    /// suffix ahead of the path check, so `./foo.rpm`, `/abs/foo.deb`,
+    /// and a bare `foo.rpm` all land here rather than as
+    /// [`KernelId::Path`]. The `path` is `~`-expanded identically to
+    /// the Path variant.
+    Package {
+        /// Path to the `.rpm` / `.deb` file.
+        path: std::path::PathBuf,
+    },
+    /// Distro-provided prebuilt kernel: download a specific build for a
+    /// named distribution and (optional) release. A bare distro name
+    /// (`fedora`) leaves `release` `None` — the resolver picks the
+    /// distro's default; an explicit release (`fedora-44`, `f44`,
+    /// `ubuntu-24.04`, `amazonlinux-2023`, `al2023`) pins one. The
+    /// release string's grammar is distro-specific and enforced by
+    /// [`KernelId::validate`], not `parse`: a distro name with a
+    /// malformed release parses to this variant and is rejected at
+    /// validate time (mirroring the git arm's parse/validate split),
+    /// never silently demoted to [`KernelId::CacheKey`].
+    Distro {
+        /// Which distribution.
+        kind: DistroKind,
+        /// Release identifier (e.g. "44", "24.04", "2023"), or `None`
+        /// for the distro's default.
+        release: Option<String>,
+    },
+}
+
+/// Which distribution a [`KernelId::Distro`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistroKind {
+    /// Fedora (`fedora`, `fedora-44`, or shorthand `f44`).
+    Fedora,
+    /// Ubuntu (`ubuntu`, `ubuntu-24.04`).
+    Ubuntu,
+    /// Amazon Linux (`amazonlinux`, `amazonlinux-2023`, or shorthand
+    /// `al2023`).
+    AmazonLinux,
 }
 
 /// Which git ref namespace a [`KernelId::Git`]'s `git_ref` names,
@@ -167,6 +213,9 @@ impl KernelId {
     ///   empty `url` — both of which [`KernelId::validate`] rejects
     ///   with an actionable error rather than the resolver later
     ///   reporting a confusing "path not found".
+    /// - `.rpm`/`.deb`-suffixed → [`KernelId::Package`]. Checked ahead
+    ///   of the path test so `./foo.rpm`, `/abs/foo.deb`, and a bare
+    ///   `foo.rpm` all classify as a package rather than a path.
     /// - `START..=END` or `START..END` where both endpoints are
     ///   version-shaped → [`KernelId::Range`]. The endpoints are
     ///   ALWAYS inclusive — both `..` and `..=` spellings produce a
@@ -175,6 +224,11 @@ impl KernelId {
     ///   authors and CLI users can write whichever feels natural.
     /// - `/`-containing or `.`/`~`-prefixed → [`KernelId::Path`].
     /// - Version-shaped → [`KernelId::Version`].
+    /// - A distro name (`fedora` / `ubuntu` / `amazonlinux`, an
+    ///   explicit-release `NAME-REL`, or shorthand `f44` / `al2023`) →
+    ///   [`KernelId::Distro`]. The release grammar is checked by
+    ///   `validate`, not here — a malformed release still classifies as
+    ///   `Distro` (not `CacheKey`) so `validate` can reject it.
     /// - Anything else → [`KernelId::CacheKey`].
     pub fn parse(s: &str) -> Self {
         if let Some(rest) = s.strip_prefix("git+") {
@@ -205,6 +259,14 @@ impl KernelId {
                 ref_kind,
             };
         }
+        // Case-sensitive suffix, checked before the path arm so a
+        // package spec with directory separators (`/abs/foo.deb`) or a
+        // `.`-prefix (`./foo.rpm`) still classifies as a package.
+        if s.ends_with(".rpm") || s.ends_with(".deb") {
+            return KernelId::Package {
+                path: expand_tilde(s),
+            };
+        }
         if let Some((start, end)) = s.split_once("..=")
             && _is_version_string(start)
             && _is_version_string(end)
@@ -230,6 +292,9 @@ impl KernelId {
         }
         if _is_version_string(s) {
             return KernelId::Version(s.to_string());
+        }
+        if let Some(distro) = parse_distro(s) {
+            return distro;
         }
         KernelId::CacheKey(s.to_string())
     }
@@ -259,9 +324,17 @@ impl KernelId {
     ///   parse time because both endpoints are valid version strings
     ///   in isolation; the inversion only surfaces when the two are
     ///   compared.
+    /// - [`KernelId::Git`] with an `Unknown` ref kind, an empty
+    ///   url/ref, or a `#sha=` that isn't a full 40-hex id.
+    /// - [`KernelId::Distro`] whose explicit release does not match the
+    ///   distro's grammar (Fedora `\d{2,3}`, Ubuntu `YY.MM`, Amazon
+    ///   Linux `\d{4}`). As with git, the parser defers the release
+    ///   check here so a malformed release classifies as `Distro`
+    ///   rather than silently becoming a `CacheKey`.
     ///
-    /// All other variants always return `Ok(())` — this is a hook for
-    /// future per-variant invariants, not a general-purpose validator.
+    /// The remaining variants (Path, Version, CacheKey, Package) always
+    /// return `Ok(())` — this is a hook for per-variant invariants, not
+    /// a general-purpose validator.
     /// Use `Result<(), String>` rather than `anyhow::Result` because
     /// this file is included from `build.rs` (see file header rule
     /// #1, no non-std imports outside `cfg(test)`).
@@ -348,7 +421,43 @@ impl KernelId {
                 }
                 Ok(())
             }
-            KernelId::Path(_) | KernelId::Version(_) | KernelId::CacheKey(_) => Ok(()),
+            KernelId::Distro { kind, release } => {
+                let Some(rel) = release.as_deref() else {
+                    return Ok(());
+                };
+                let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+                let (ok, expected) = match kind {
+                    // 2–3 digits: `44` today, `100`+ future-proofed.
+                    DistroKind::Fedora => (
+                        (2..=3).contains(&rel.len()) && all_digits(rel),
+                        "a 2- or 3-digit release number (e.g. `fedora-44` or `f44`)",
+                    ),
+                    // `YY.MM`, e.g. `24.04`.
+                    DistroKind::Ubuntu => (
+                        matches!(rel.split_once('.'), Some((y, m))
+                            if y.len() == 2 && m.len() == 2 && all_digits(y) && all_digits(m)),
+                        "a `YY.MM` release (e.g. `ubuntu-24.04`)",
+                    ),
+                    // 4-digit year, e.g. `2023`.
+                    DistroKind::AmazonLinux => (
+                        rel.len() == 4 && all_digits(rel),
+                        "a 4-digit year release (e.g. `amazonlinux-2023` or `al2023`)",
+                    ),
+                };
+                if ok {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "distro kernel `{self}`: `{rel}` is not a valid \
+                         {kind} release — expected {expected}.",
+                        kind = kind.as_str(),
+                    ))
+                }
+            }
+            KernelId::Path(_)
+            | KernelId::Version(_)
+            | KernelId::CacheKey(_)
+            | KernelId::Package { .. } => Ok(()),
         }
     }
 }
@@ -379,8 +488,76 @@ impl std::fmt::Display for KernelId {
                 // `parse(Display(x)) == x` still holds for the Unknown case.
                 GitRefKind::Unknown => write!(f, "git+{url}#{git_ref}"),
             },
+            KernelId::Package { path } => write!(f, "{}", path.display()),
+            KernelId::Distro { kind, release } => {
+                let name = kind.as_str();
+                match release {
+                    // Shorthand inputs (`f44`, `al2023`) render in long
+                    // form; `parse(Display(x))` still yields an equal id
+                    // (both spellings parse to the same variant).
+                    Some(rel) => write!(f, "{name}-{rel}"),
+                    None => write!(f, "{name}"),
+                }
+            }
         }
     }
+}
+
+impl DistroKind {
+    /// The canonical long-form distro name.
+    fn as_str(self) -> &'static str {
+        match self {
+            DistroKind::Fedora => "fedora",
+            DistroKind::Ubuntu => "ubuntu",
+            DistroKind::AmazonLinux => "amazonlinux",
+        }
+    }
+}
+
+/// Classify a distro kernel spec, or `None` so the caller falls
+/// through to [`KernelId::CacheKey`].
+///
+/// Recognizes the long form — an exact distro name (`fedora`, release
+/// `None`) or `NAME-REL` (`fedora-44`) — and the shorthands `f<rel>`
+/// (Fedora) and `al<rel>` (Amazon Linux), where `<rel>` is a run of
+/// digits. The release portion is carried verbatim; its per-distro
+/// digit grammar is enforced by [`KernelId::validate`], not here — so a
+/// name with a malformed release (`fedora-abc`, `f4`) classifies as
+/// `Distro` and surfaces an actionable validation error rather than a
+/// silent cache-key miss (mirroring the git arm's parse/validate
+/// split). A shorthand whose remainder is not all digits (`foo`,
+/// `alpha`) is not a distro spec and stays a cache key.
+fn parse_distro(s: &str) -> Option<KernelId> {
+    for (name, kind) in [
+        ("fedora", DistroKind::Fedora),
+        ("ubuntu", DistroKind::Ubuntu),
+        ("amazonlinux", DistroKind::AmazonLinux),
+    ] {
+        if s == name {
+            return Some(KernelId::Distro {
+                kind,
+                release: None,
+            });
+        }
+        if let Some(rel) = s.strip_prefix(name).and_then(|r| r.strip_prefix('-')) {
+            return Some(KernelId::Distro {
+                kind,
+                release: Some(rel.to_string()),
+            });
+        }
+    }
+    for (prefix, kind) in [("f", DistroKind::Fedora), ("al", DistroKind::AmazonLinux)] {
+        if let Some(rel) = s.strip_prefix(prefix)
+            && !rel.is_empty()
+            && rel.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Some(KernelId::Distro {
+                kind,
+                release: Some(rel.to_string()),
+            });
+        }
+    }
+    None
 }
 
 /// Check if a string matches a kernel version pattern.

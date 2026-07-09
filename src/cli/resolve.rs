@@ -343,6 +343,18 @@ pub fn resolve_cached_kernel(
                  version, cache key, or path"
             )
         }
+        // Local packages and distro kernels aren't wired into the
+        // single-image resolver yet. Validate first so a malformed
+        // distro release surfaces its specific diagnostic.
+        KernelId::Package { .. } | KernelId::Distro { .. } => {
+            id.validate()
+                .map_err(|e| anyhow::anyhow!("--kernel {id}: {e}"))?;
+            bail!(
+                "--kernel {id}: local kernel packages and distro kernels \
+                 are not yet supported in this context — use a single \
+                 kernel version, cache key, or path"
+            )
+        }
     }
 }
 
@@ -430,6 +442,15 @@ pub fn resolve_kernel_image(
                     "--kernel {val}: kernel ranges and git sources are not \
                      yet supported in this context — use a single kernel \
                      version, cache key, or path"
+                )
+            }
+            id @ (KernelId::Package { .. } | KernelId::Distro { .. }) => {
+                id.validate()
+                    .map_err(|e| anyhow::anyhow!("--kernel {val}: {e}"))?;
+                bail!(
+                    "--kernel {val}: local kernel packages and distro \
+                     kernels are not yet supported in this context — use a \
+                     single kernel version, cache key, or path"
                 )
             }
         }

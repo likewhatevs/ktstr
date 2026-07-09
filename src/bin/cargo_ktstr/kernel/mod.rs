@@ -297,6 +297,16 @@ pub(crate) fn resolve_one(
                  call `resolve_one` per version"
             ))
         }
+        id @ (KernelId::Package { .. } | KernelId::Distro { .. }) => {
+            // Local packages and distro kernels aren't wired into the
+            // resolve pipeline yet. Validate first so a malformed distro
+            // release surfaces its specific diagnostic.
+            id.validate().map_err(|e| format!("--kernel {id}: {e}"))?;
+            Err(format!(
+                "--kernel {id}: local kernel packages and distro kernels \
+                 are not yet supported"
+            ))
+        }
     }
 }
 
@@ -772,6 +782,12 @@ pub(crate) fn kernel_build(
              (`git+URL#tag=NAME`). A relative source directory must be \
              spelled `./{key}` to be read as a path, not a cache key. Run \
              `kernel list` to see cached entries.",
+        )),
+        // Local packages and distro kernels aren't wired into the build
+        // path yet (validated above, before this match).
+        Some(id @ (KernelId::Package { .. } | KernelId::Distro { .. })) => Err(format!(
+            "--kernel {id}: local kernel packages and distro kernels are \
+             not yet supported"
         )),
     }
 }

@@ -1569,8 +1569,10 @@ pub const KTSTR_KERNEL_HINT: &str = "set KTSTR_KERNEL to one of: \
     exact version (`6.14`), inclusive range (`6.14..7.0` or \
     `6.14..=7.0`), git source (`git+URL#tag=NAME`, \
     `git+URL#branch=NAME`, or `git+URL#sha=<40-hex>`), absolute or \
-    `~`-prefixed path, or cache key. List cached keys with \
-    `cargo ktstr kernel list`; build new ones with \
+    `~`-prefixed path, local kernel package (`*.rpm` or `*.deb`), \
+    distro kernel (`fedora`/`fedora-44`/`f44`, `ubuntu`/`ubuntu-24.04`, \
+    `amazonlinux`/`amazonlinux-2023`/`al2023`), or cache key. List \
+    cached keys with `cargo ktstr kernel list`; build new ones with \
     `cargo ktstr kernel build`";
 
 /// Read [`KTSTR_KERNEL_ENV`] once, normalizing the raw value:
@@ -1709,6 +1711,20 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
                      Use --kernel on the test/coverage/verifier \
                      subcommands, or set KTSTR_KERNEL to a single \
                      version, cache key, or path."
+                );
+            }
+            // Local packages and distro kernels aren't wired into the
+            // env-var resolver yet. Validate first so a malformed distro
+            // release surfaces its specific diagnostic before the
+            // generic "not yet supported" bail.
+            id @ (KernelId::Package { .. } | KernelId::Distro { .. }) => {
+                if let Err(e) = id.validate() {
+                    anyhow::bail!("KTSTR_KERNEL={val}: {e}");
+                }
+                anyhow::bail!(
+                    "KTSTR_KERNEL={val}: local kernel packages and distro \
+                     kernels are not yet supported — set KTSTR_KERNEL to a \
+                     single version, cache key, or path."
                 );
             }
         }

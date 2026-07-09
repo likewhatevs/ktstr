@@ -658,6 +658,12 @@ fn kernel_build(
              spelled `./{key}` to be read as a path, not a cache key. Run \
              `kernel list` to see cached entries.",
         ),
+        // Local packages and distro kernels aren't wired into the build
+        // path yet (validated above, before this match).
+        Some(id @ (KernelId::Package { .. } | KernelId::Distro { .. })) => anyhow::bail!(
+            "--kernel {id}: local kernel packages and distro kernels are \
+             not yet supported"
+        ),
     }
 }
 
