@@ -62,6 +62,7 @@ pub(crate) mod shared_test_helpers;
 pub use cache_dir::{CacheDir, ExclusiveLockGuard, SharedLockGuard};
 pub use metadata::{
     CacheArtifacts, CacheEntry, KconfigStatus, KernelMetadata, KernelSource, ListedEntry,
+    boot_modules_for_image, ordered_boot_modules_in,
 };
 pub use resolve::{prefer_source_tree_for_dwarf, recover_local_source_tree};
 

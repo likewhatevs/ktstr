@@ -25,6 +25,7 @@ pub use kernel_cmd::{
 
 pub use kernel_list::{format_entry_row, kernel_clean, kernel_list, kernel_list_range_preview};
 
+pub(crate) use kernel_build::critical_config_options;
 pub use kernel_build::{
     KernelBuildResult, append_extra_kconfig_suffix, kernel_build_pipeline, make_kernel_with_output,
     read_extra_kconfig, run_make, run_make_with_output, validate_kernel_config,

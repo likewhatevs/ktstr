@@ -61,6 +61,24 @@ pub enum KernelSource {
         /// reproducer.
         git_hash: Option<String>,
     },
+    /// Prebuilt distro kernel downloaded from an official repo
+    /// (`--kernel fedora` / `ubuntu` / `amazonlinux`). Serialized as
+    /// `{"type": "distropackage", "distro": ..., "packages": [...]}`.
+    DistroPackage {
+        /// Short distro tag (e.g. `"fedora44"`, `"ubuntu24.04-hwe"`,
+        /// `"al2023"`) from the repo resolver.
+        distro: String,
+        /// The `name-version` of each package that was extracted
+        /// (kernel image/modules + debuginfo), for provenance.
+        packages: Vec<String>,
+    },
+    /// Prebuilt kernel unpacked from local `.rpm`/`.deb` files
+    /// (`--kernel ./pkg.rpm`). Serialized as
+    /// `{"type": "localpackage", "packages": [...]}`.
+    LocalPackage {
+        /// Basenames of the local package files that were extracted.
+        packages: Vec<String>,
+    },
 }
 
 impl fmt::Display for KernelSource {
@@ -69,6 +87,8 @@ impl fmt::Display for KernelSource {
             KernelSource::Tarball => f.write_str("tarball"),
             KernelSource::Git { .. } => f.write_str("git"),
             KernelSource::Local { .. } => f.write_str("local"),
+            KernelSource::DistroPackage { .. } => f.write_str("distro-package"),
+            KernelSource::LocalPackage { .. } => f.write_str("local-package"),
         }
     }
 }
@@ -269,6 +289,17 @@ pub struct CacheArtifacts<'a> {
     /// Optional path to the raw (unstripped) vmlinux ELF. `store()`
     /// strips it internally before caching.
     pub vmlinux: Option<&'a Path>,
+    /// Ordered, already-decompressed `.ko` boot modules to embed in
+    /// the cache entry under `modules/NNN-<name>` (dependency-first).
+    /// Consumed by prebuilt distro kernels whose virtio drivers are
+    /// modular; empty for built kernels (which need none). `store()`
+    /// preserves the slice order in the `NNN` index so the boot side
+    /// loads them in the same order.
+    pub modules: &'a [PathBuf],
+    /// Optional kernel `.config` to save alongside the image (as
+    /// `config`), for provenance and post-hoc inspection of a prebuilt
+    /// kernel's feature set.
+    pub config: Option<&'a Path>,
 }
 
 impl<'a> CacheArtifacts<'a> {
@@ -277,12 +308,26 @@ impl<'a> CacheArtifacts<'a> {
         CacheArtifacts {
             image,
             vmlinux: None,
+            modules: &[],
+            config: None,
         }
     }
 
     /// Attach the raw (unstripped) vmlinux ELF.
     pub fn with_vmlinux(mut self, vmlinux: &'a Path) -> Self {
         self.vmlinux = Some(vmlinux);
+        self
+    }
+
+    /// Attach the ordered boot-module set (already-decompressed `.ko`).
+    pub fn with_modules(mut self, modules: &'a [PathBuf]) -> Self {
+        self.modules = modules;
+        self
+    }
+
+    /// Attach the kernel `.config` to save into the entry.
+    pub fn with_config(mut self, config: &'a Path) -> Self {
+        self.config = Some(config);
         self
     }
 }
@@ -360,6 +405,14 @@ impl CacheEntry {
         self.path.join("disk-template.img")
     }
 
+    /// Ordered boot modules embedded in this entry
+    /// (`<entry>/modules/NNN-*.ko`), dependency-first, or empty when
+    /// the entry carries none (every built kernel). Scans the
+    /// directory so the layout is the single source of truth.
+    pub fn boot_modules(&self) -> Vec<PathBuf> {
+        ordered_boot_modules_in(&self.path.join("modules"))
+    }
+
     /// Compare this entry's kconfig hash against `current_hash`.
     pub fn kconfig_status(&self, current_hash: &str) -> KconfigStatus {
         match self.metadata.ktstr_kconfig_hash.as_deref() {
@@ -376,6 +429,36 @@ impl CacheEntry {
     /// `--extra-kconfig` fragment.
     pub fn has_extra_kconfig(&self) -> bool {
         self.metadata.extra_kconfig_hash.is_some()
+    }
+}
+
+/// Ordered boot modules under `modules_dir` (`NNN-*.ko`), sorted by
+/// file name so the zero-padded `NNN` index reproduces the load order
+/// `CacheDir::store` wrote. Non-directory / missing paths yield an
+/// empty vector. Pure over one `read_dir`.
+pub fn ordered_boot_modules_in(modules_dir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(modules_dir) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<PathBuf> = rd
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    entries
+}
+
+/// Ordered boot modules for a cached kernel image, discovered from the
+/// `modules/` subdirectory that sits beside the image in its cache
+/// entry (`<entry>/bzImage` + `<entry>/modules/`). Empty for built
+/// kernels and build-tree images (no sibling `modules/`), so callers
+/// can pass the result to `KtstrVmBuilder::kernel_modules`
+/// unconditionally — an empty set is a no-op.
+pub fn boot_modules_for_image(image: &Path) -> Vec<PathBuf> {
+    match image.parent() {
+        Some(dir) => ordered_boot_modules_in(&dir.join("modules")),
+        None => Vec::new(),
     }
 }
 

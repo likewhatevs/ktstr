@@ -1714,19 +1714,34 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
                      version, cache key, or path."
                 );
             }
-            // Local packages and distro kernels aren't wired into the
-            // env-var resolver yet. Validate first so a malformed distro
-            // release surfaces its specific diagnostic before the
-            // generic "not yet supported" bail.
-            id @ (KernelId::Package { .. } | KernelId::Distro { .. }) => {
+            // Local packages and distro kernels acquire into the cache
+            // (download + extract, or unpack local files) and resolve to
+            // the boot image inside the resulting entry. Validate first
+            // so a malformed distro release surfaces its specific
+            // diagnostic. Note the runner injects a cache DIR into
+            // KTSTR_KERNEL (a Path, handled above) rather than a
+            // package/distro spec — this arm serves an operator who sets
+            // KTSTR_KERNEL=fedora / KTSTR_KERNEL=./kernel.rpm directly.
+            ref id @ (KernelId::Package { .. } | KernelId::Distro { .. }) => {
                 if let Err(e) = id.validate() {
                     anyhow::bail!("KTSTR_KERNEL={val}: {e}");
                 }
-                anyhow::bail!(
-                    "KTSTR_KERNEL={val}: local kernel packages and distro \
-                     kernels are not yet supported — set KTSTR_KERNEL to a \
-                     single version, cache key, or path."
-                );
+                let cache_dir = match id {
+                    KernelId::Package { path } => {
+                        distro::acquire::acquire_package_kernel(std::slice::from_ref(path))
+                    }
+                    KernelId::Distro { kind, release } => distro::acquire::acquire_distro_kernel(
+                        *kind,
+                        release.as_deref(),
+                        "ktstr",
+                        None,
+                    ),
+                    _ => unreachable!("arm guarded to Package | Distro"),
+                }?;
+                let image = kernel_path::find_image_in_dir(&cache_dir).ok_or_else(|| {
+                    anyhow::anyhow!("no kernel image found in {}", cache_dir.display())
+                })?;
+                return Ok(Some(image));
             }
         }
     }
@@ -1748,6 +1763,21 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
             // could still boot correctly, and skipping them would
             // permanently orphan legacy cache entries.
             if entry.kconfig_status(&kc_hash).is_stale() {
+                continue;
+            }
+            // Skip prebuilt distro / local-package entries. Those are
+            // OPT-IN kernels — requested explicitly via `--kernel fedora`
+            // / `--kernel ./pkg.rpm` or their cache key — not
+            // auto-fallback candidates: they are not ktstr-built, carry
+            // no kconfig hash (so they read as `Untracked`, not stale),
+            // and may not run scx schedulers. Auto-selecting one here
+            // would let a cached `kernel build --kernel fedora` silently
+            // hijack a later kernel-less `cargo ktstr test`.
+            if matches!(
+                entry.metadata.source,
+                cache::KernelSource::DistroPackage { .. }
+                    | cache::KernelSource::LocalPackage { .. }
+            ) {
                 continue;
             }
             let image = entry.image_path();
@@ -2115,6 +2145,10 @@ pub fn run_shell(
     }
     let mut builder = vmm::KtstrVm::builder()
         .kernel(&kernel)
+        // Prebuilt distro kernels ship virtio as modules; embed the
+        // ordered boot-module set from the cache entry beside the image
+        // (empty for built kernels — a no-op).
+        .kernel_modules(cache::boot_modules_for_image(&kernel))
         .init_binary(&payload)
         .topology(vmm::Topology::new(numa_nodes, llcs, cores, threads))
         .cmdline(&cmdline)

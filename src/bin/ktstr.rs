@@ -658,12 +658,29 @@ fn kernel_build(
              spelled `./{key}` to be read as a path, not a cache key. Run \
              `kernel list` to see cached entries.",
         ),
-        // Local packages and distro kernels aren't wired into the build
-        // path yet (validated above, before this match).
-        Some(id @ (KernelId::Package { .. } | KernelId::Distro { .. })) => anyhow::bail!(
-            "--kernel {id}: local kernel packages and distro kernels are \
-             not yet supported"
-        ),
+        // For a local package or distro spec, "build" means acquire the
+        // prebuilt kernel into the cache (download + extract, or unpack
+        // local files) — there is nothing to compile. Validated above,
+        // before this match.
+        Some(id @ (KernelId::Package { .. } | KernelId::Distro { .. })) => {
+            let dir = match &id {
+                KernelId::Package { path } => {
+                    ktstr::distro::acquire::acquire_package_kernel(std::slice::from_ref(path))
+                }
+                KernelId::Distro { kind, release } => {
+                    ktstr::distro::acquire::acquire_distro_kernel(
+                        *kind,
+                        release.as_deref(),
+                        "ktstr",
+                        None,
+                    )
+                }
+                _ => unreachable!("arm guarded to Package | Distro"),
+            }
+            .map_err(|e| anyhow::anyhow!("acquire --kernel {id}: {e:#}"))?;
+            eprintln!("ktstr: prebuilt kernel cached at {}", dir.display());
+            Ok(())
+        }
     }
 }
 

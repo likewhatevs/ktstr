@@ -499,7 +499,13 @@ const VALIDATE_CONFIG_CRITICAL_X86: &[(&str, &str)] = &[(
 /// the arch-neutral [`VALIDATE_CONFIG_CRITICAL`] plus, on x86_64, the x86-only
 /// [`VALIDATE_CONFIG_CRITICAL_X86`]. Single source of truth for both the
 /// post-build check and its tests, so the two never drift.
-fn critical_config_options() -> Vec<(&'static str, &'static str)> {
+///
+/// `pub(crate)` so the distro-kernel config gate
+/// ([`crate::distro::acquire`]) reuses the same option/hint list rather
+/// than duplicating it — a prebuilt distro kernel that lacks one of
+/// these ktstr-feature options warns with the identical hint the build
+/// path would have hard-failed with.
+pub(crate) fn critical_config_options() -> Vec<(&'static str, &'static str)> {
     #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
     let mut opts = VALIDATE_CONFIG_CRITICAL.to_vec();
     #[cfg(target_arch = "x86_64")]

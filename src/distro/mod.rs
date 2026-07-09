@@ -7,5 +7,6 @@
 //! boot a VM (a raw bootable image plus the matching module tree,
 //! config, `System.map`, and optional `vmlinux`).
 
+pub mod acquire;
 pub mod extract;
 pub mod repo;

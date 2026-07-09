@@ -1506,6 +1506,12 @@ fn build_template_vm(
     let busybox_bytes = crate::vmm::blobs::load_busybox_bytes()
         .context("load busybox blob for disk-template build VM")?;
     let build_result = crate::vmm::KtstrVm::builder()
+        // Prebuilt distro kernels ship virtio as modules; embed the
+        // ordered boot-module set from the cache entry (no-op for built
+        // kernels). A distro kernel used for a disk-template build would
+        // otherwise hang the same way a test-runner boot would. Computed
+        // before `.kernel(kernel)` moves the path.
+        .kernel_modules(crate::cache::boot_modules_for_image(&kernel))
         .kernel(kernel)
         // The build VM boots THIS binary as its guest /init: the ctor's
         // PID==1 branch dispatches to ktstr_guest_init, which sees

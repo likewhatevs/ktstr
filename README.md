@@ -102,7 +102,11 @@ and
   per-phase metrics.
 - **[Gauntlet](https://ktstr.dev/guide/running-tests/gauntlet.html)** —
   one test fans out across a matrix of topology presets; multiple
-  `--kernel` flags (or a `6.12..6.14` range) add the kernel axis.
+  `--kernel` flags (or a `6.12..6.14` range) add the kernel axis. A
+  `--kernel` value can be a version, a source tree, a `git+URL#tag=…`
+  source, a local `.rpm`/`.deb` package, or a prebuilt distro kernel
+  (`fedora`/`ubuntu`/`amazonlinux`, downloaded from the distro's repos
+  and cached like a built kernel).
 - **[Verifier sweep](https://ktstr.dev/guide/running-tests/verifier.html)** —
   every declared scheduler load-tested against the real kernel
   verifier across topologies, with per-program instruction counts and

@@ -343,17 +343,19 @@ pub fn resolve_cached_kernel(
                  version, cache key, or path"
             )
         }
-        // Local packages and distro kernels aren't wired into the
-        // single-image resolver yet. Validate first so a malformed
+        // Local packages and distro kernels acquire into the cache
+        // (download + extract, or unpack local files) and resolve to
+        // the resulting entry directory. Validate first so a malformed
         // distro release surfaces its specific diagnostic.
-        KernelId::Package { .. } | KernelId::Distro { .. } => {
+        KernelId::Package { path } => {
             id.validate()
                 .map_err(|e| anyhow::anyhow!("--kernel {id}: {e}"))?;
-            bail!(
-                "--kernel {id}: local kernel packages and distro kernels \
-                 are not yet supported in this context — use a single \
-                 kernel version, cache key, or path"
-            )
+            crate::distro::acquire::acquire_package_kernel(std::slice::from_ref(path))
+        }
+        KernelId::Distro { kind, release } => {
+            id.validate()
+                .map_err(|e| anyhow::anyhow!("--kernel {id}: {e}"))?;
+            crate::distro::acquire::acquire_distro_kernel(*kind, release.as_deref(), cli_label, mp)
         }
     }
 }
@@ -447,11 +449,10 @@ pub fn resolve_kernel_image(
             id @ (KernelId::Package { .. } | KernelId::Distro { .. }) => {
                 id.validate()
                     .map_err(|e| anyhow::anyhow!("--kernel {val}: {e}"))?;
-                bail!(
-                    "--kernel {val}: local kernel packages and distro \
-                     kernels are not yet supported in this context — use a \
-                     single kernel version, cache key, or path"
-                )
+                let cache_dir = resolve_cached_kernel(&id, policy.cli_label, None)?;
+                crate::kernel_path::find_image_in_dir(&cache_dir).ok_or_else(|| {
+                    anyhow::anyhow!("no kernel image found in {}", cache_dir.display())
+                })
             }
         }
     } else {

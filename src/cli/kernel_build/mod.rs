@@ -20,5 +20,6 @@ mod kconfig;
 mod make;
 
 pub use build::{KernelBuildResult, kernel_build_pipeline};
+pub(crate) use kconfig::critical_config_options;
 pub use kconfig::{append_extra_kconfig_suffix, read_extra_kconfig, validate_kernel_config};
 pub use make::{make_kernel_with_output, run_make, run_make_with_output};

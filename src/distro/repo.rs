@@ -33,8 +33,8 @@
 //!   EVR; debuginfo from the sibling `debuginfo` mirror.
 //!
 //! All metadata fetches ride the shared HTTP client and transient-retry
-//! seam via [`crate::fetch::fetch_metadata_bytes`] /
-//! [`crate::fetch::fetch_metadata_text`]. Parsing/selection is factored
+//! seam via `crate::fetch::fetch_metadata_bytes` /
+//! `crate::fetch::fetch_metadata_text`. Parsing/selection is factored
 //! into pure functions over `&[u8]` / `&str` so the unit tests exercise
 //! them on small fixtures without touching the network.
 
@@ -48,17 +48,7 @@ use quick_xml::reader::Reader;
 use reqwest::Url;
 use sha2::{Digest, Sha256};
 
-/// Which distro a spec resolves to.
-///
-/// Defined locally for now; a parallel branch is adding the same enum
-/// to `src/kernel_path.rs` for spec parsing.
-// unify with kernel_path::DistroKind at integration
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DistroKind {
-    Fedora,
-    Ubuntu,
-    AmazonLinux,
-}
+pub use crate::kernel_path::DistroKind;
 
 /// A single resolved package: name, version, download URL, and the
 /// sha256 the repo metadata declares for it.

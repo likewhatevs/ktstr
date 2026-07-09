@@ -575,6 +575,29 @@ impl CacheDir {
             (false, false)
         };
 
+        // Ordered boot modules (prebuilt distro kernels only): copy each
+        // already-decompressed `.ko` to `modules/NNN-<name>` so the boot
+        // side reloads them in the same dependency-first order the caller
+        // supplied. Empty for built kernels — no `modules/` dir is created.
+        if !artifacts.modules.is_empty() {
+            let modules_dir = tmp_dir.join("modules");
+            fs::create_dir_all(&modules_dir).context("create cache modules dir")?;
+            for (idx, module) in artifacts.modules.iter().enumerate() {
+                let file_name = module.file_name().ok_or_else(|| {
+                    anyhow::anyhow!("boot module has no file name: {}", module.display())
+                })?;
+                let dest = modules_dir.join(format!("{idx:03}-{}", file_name.to_string_lossy()));
+                crate::reflink::reflink_or_copy(module, &dest)
+                    .with_context(|| format!("copy boot module {}", module.display()))?;
+            }
+        }
+
+        // Kernel `.config` provenance sidecar, when supplied.
+        if let Some(config) = artifacts.config {
+            crate::reflink::reflink_or_copy(config, &tmp_dir.join("config"))
+                .context("copy kernel config to cache")?;
+        }
+
         let mut meta = metadata.clone();
         meta.set_has_vmlinux(has_vmlinux);
         meta.set_vmlinux_stripped(vmlinux_stripped);

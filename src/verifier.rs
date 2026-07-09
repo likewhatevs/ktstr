@@ -839,6 +839,10 @@ pub fn collect_verifier_output(
     // type-level invariants).
     let vm = crate::vmm::KtstrVm::builder()
         .kernel(kernel)
+        // Prebuilt distro kernels ship virtio as modules; embed the
+        // ordered boot-module set from the cache entry (no-op for built
+        // kernels, which have no sibling modules/ dir).
+        .kernel_modules(crate::cache::boot_modules_for_image(kernel))
         .init_binary(ktstr_bin)
         .scheduler_binary(sched_bin)
         .sched_args(&sched_args)

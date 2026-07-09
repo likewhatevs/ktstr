@@ -12,6 +12,8 @@
 //! parent module (`super`), reached via the glob below.
 use super::*;
 
+use std::ffi::CString;
+
 use nix::kmod::{ModuleInitFlags, finit_module};
 
 /// Directory the host writes initramfs-embedded modules into. Files are
@@ -51,17 +53,71 @@ pub(crate) fn load_kernel_modules() {
         entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
     modules.sort();
 
+    // The kernel applies `modname.param=value` command-line params only
+    // to BUILTIN modules; one loaded via `finit_module` gets only the
+    // params passed as its load args. ktstr describes the virtio-MMIO
+    // console/block/net devices via `virtio_mmio.device=...@...:...`
+    // cmdline tokens (see `vmm::setup`), so for a modular virtio_mmio
+    // those tokens must be forwarded as load args or the driver binds no
+    // device and `/dev/hvc0` / `/dev/vport0p1` never appear (init then
+    // hangs waiting for the control port). Reproduce the builtin
+    // behavior: pass each module the matching `modname.*` cmdline params.
+    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
+
     for module in &modules {
         let file = match fs::File::open(module) {
             Ok(f) => f,
             Err(e) => fatal_module_error(&format!("open {}: {e}", module.display())),
         };
-        match finit_module(&file, c"", ModuleInitFlags::empty()) {
+        let args = module_load_args(module, &cmdline);
+        match finit_module(&file, &args, ModuleInitFlags::empty()) {
             Ok(()) => {}
             Err(nix::errno::Errno::EEXIST) => {}
             Err(e) => fatal_module_error(&format!("finit_module {}: {e}", module.display())),
         }
     }
+}
+
+/// Build the `finit_module(2)` param string for `module` from the
+/// kernel `cmdline`: every `modname.param=value` token, with the
+/// `modname.` prefix stripped, space-joined — the same set the kernel
+/// would have applied had the module been builtin.
+///
+/// The module name is the archive filename with its `NNN-` load-order
+/// prefix and `.ko` suffix removed, dashes folded to underscores (the
+/// kernel normalizes both the module name and the cmdline param prefix
+/// this way). A module with no matching cmdline params yields an empty
+/// string (equivalent to the previous no-args load).
+fn module_load_args(module: &std::path::Path, cmdline: &str) -> CString {
+    let file_name = module.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    // Strip the `.ko` suffix and every leading `NNN-` load-order prefix.
+    // Two layers add one each — the cache entry (`000-virtio_mmio.ko`)
+    // and the initramfs packer (`000-000-virtio_mmio.ko`) — so strip all
+    // of them, then fold dashes to underscores (the kernel normalizes
+    // both the module name and the cmdline param prefix this way).
+    let mut stem = file_name.strip_suffix(".ko").unwrap_or(file_name);
+    while let Some(pos) = stem.find('-') {
+        let (head, tail) = stem.split_at(pos);
+        if !head.is_empty() && head.bytes().all(|b| b.is_ascii_digit()) {
+            stem = &tail[1..];
+        } else {
+            break;
+        }
+    }
+    let modname = stem.replace('-', "_");
+    let prefix = format!("{modname}.");
+
+    let mut parts: Vec<&str> = Vec::new();
+    for tok in cmdline.split_whitespace() {
+        if let Some(param) = tok.strip_prefix(&prefix)
+            && param.contains('=')
+        {
+            parts.push(param);
+        }
+    }
+    // NUL can't appear in a whitespace-split cmdline token, so the
+    // CString build cannot fail; default to empty on the impossible case.
+    CString::new(parts.join(" ")).unwrap_or_default()
 }
 
 /// Report a fatal module-load failure to every pre-console diagnostic
@@ -80,4 +136,37 @@ fn fatal_module_error(msg: &str) -> ! {
     let _ = fs::write(COM2, &line);
     let _ = fs::write(COM1, &line);
     force_reboot()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::module_load_args;
+    use std::path::Path;
+
+    const CMDLINE: &str = "console=ttyS0 rdinit=/init virtio_mmio.device=0x1000@0xc0000000:5 \
+                           KTSTR_MODE=shell";
+
+    /// The doubled `NNN-` prefix (cache entry + initramfs packer) must be
+    /// stripped so the derived module name matches the cmdline param
+    /// prefix and the `device=` token is forwarded — the fix for the
+    /// modular-virtio_mmio boot hang.
+    #[test]
+    fn forwards_virtio_mmio_device_through_double_prefix() {
+        let args = module_load_args(Path::new("/modules/000-000-virtio_mmio.ko"), CMDLINE);
+        assert_eq!(args.to_str().unwrap(), "device=0x1000@0xc0000000:5");
+    }
+
+    #[test]
+    fn single_prefix_also_resolves() {
+        let args = module_load_args(Path::new("/modules/000-virtio_mmio.ko"), CMDLINE);
+        assert_eq!(args.to_str().unwrap(), "device=0x1000@0xc0000000:5");
+    }
+
+    /// A module with no matching cmdline params loads with empty args,
+    /// and a module name containing an underscore is preserved.
+    #[test]
+    fn no_matching_params_yields_empty() {
+        let args = module_load_args(Path::new("/modules/002-002-net_failover.ko"), CMDLINE);
+        assert_eq!(args.to_str().unwrap(), "");
+    }
 }
