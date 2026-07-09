@@ -50,6 +50,11 @@ cargo ktstr test --kernel 6.14                        # major.minor prefix → l
 cargo ktstr test --kernel 6.14.2-tarball-x86_64-kc... # cache key (from `kernel list`)
 cargo ktstr test --kernel 6.12..6.14                  # range: every stable+longterm release inside
 cargo ktstr test --kernel git+https://example.com/r.git#tag=v6.14   # git tag (#branch= / #sha= too)
+cargo ktstr test --kernel fedora                      # prebuilt distro kernel (latest; fedora-44/f44 pin)
+cargo ktstr test --kernel ubuntu                      # latest LTS HWE kernel (ubuntu-24.04 pins the LTS)
+cargo ktstr test --kernel amazonlinux                 # AL2023's newest kernel stream (al2023 works too)
+cargo ktstr test --kernel steamos                     # Valve's linux-neptune (x86_64 only; steamos-3.8 pins)
+cargo ktstr test --kernel ./kernel-core.rpm           # local package (.rpm / .deb / .pkg.tar.zst)
 cargo ktstr test --kernel 6.14.2 --kernel 7.0         # repeatable → multi-kernel matrix
 ```
 
@@ -58,6 +63,22 @@ are series-inclusive (`6.11..6.14` covers every `6.14.N`; spell
 `6.14.2` for an exact bound), and EOL series silently drop out
 unless you pass `--include-eol`. Git sources are fetched at the ref,
 built, and cached; a moved branch tip rebuilds.
+
+Distro specs skip the build entirely: the kernel is resolved from
+the distro's official repo metadata (so a bare name always means the
+latest published kernel — re-resolved every run), downloaded with
+sha256 verification alongside its debuginfo, and cached like any
+built kernel. Prebuilt kernels ship virtio as modules; ktstr
+extracts the needed drivers from the package and loads them in the
+guest before any device is touched, so `shell`, `test`, `coverage`,
+and `verifier` all work unchanged. The package's config is checked
+on acquire: anything the kernel can't boot without fails fast, and
+missing ktstr-feature options (e.g. `CONFIG_SCHED_CLASS_EXT` on an
+older kernel) warn up front instead of failing mid-run. Local
+`.rpm`/`.deb`/`.pkg.tar.zst` files take the same path — note Fedora
+and Ubuntu split the kernel image and its modules across packages,
+so for those use the distro spec (which fetches the full set) rather
+than a single file.
 
 When `--kernel` resolves to two or more kernels, the kernel becomes
 another gauntlet dimension: each (test × preset × kernel) tuple is a
