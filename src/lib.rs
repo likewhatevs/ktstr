@@ -359,7 +359,6 @@ pub mod non_exhaustive {}
 
 pub mod cache;
 pub mod cgroup;
-pub mod distro;
 pub mod flock;
 
 /// Map a raw errno value to its C constant name.
@@ -470,6 +469,7 @@ pub mod cli;
 pub mod cpu_util;
 pub mod ctprof;
 pub mod ctprof_compare;
+pub mod distro;
 pub(crate) mod elf_strip;
 #[cfg(feature = "export")]
 pub mod export;

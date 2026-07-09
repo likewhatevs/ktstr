@@ -92,6 +92,18 @@ zstd = { version = "0.13", features = ["zstdmt"] }
 lz4_flex = { version = "0.13", features = ["frame"] }
 flate2 = "1"
 glob = "0.3"
+# Pure-Rust RPM parser/builder for the `--kernel` prebuilt-package path
+# (src/distro/extract.rs): parses the lead/signature/main headers to
+# recover arch + NEVRA and hands back the raw cpio payload plus its
+# declared compressor, which the module decompresses with the already-
+# vendored xz2/zstd/flate2 stack rather than pulling rpm's own liblzma
+# backend. `default-features = false` drops the PGP signing/verification
+# tree (pgp, chrono, getrandom) the extractor never touches; `payload`
+# + `gzip-compression` + `zstd-compression` enable the PackageBuilder
+# compressor stack (reusing the vendored flate2 + zstd, no new codec
+# crate) that the unit tests use to synthesize fixture rpms at test
+# time; production only parses.
+rpm = { version = "0.25", default-features = false, features = ["payload", "gzip-compression", "zstd-compression"] }
 # Stack-resident iovec/guard scratch for the virtio-blk vectored
 # read/write handlers (src/vmm/virtio_blk/device.rs): inline capacity
 # MAX_BLK_IOVECS (SEG_MAX*2 = 256) covers the proven worst case so a
