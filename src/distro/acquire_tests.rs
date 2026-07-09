@@ -102,6 +102,20 @@ fn write_config(lines: &[&str]) -> tempfile::NamedTempFile {
     f
 }
 
+/// [`ExtractedKernel`] shell for driving [`gate_config`] with a chosen
+/// config / module-tree presence; the label surfaces as
+/// `kernel_release` in gate errors.
+fn extracted(label: &str, config: Option<&Path>, modules_dir: Option<&Path>) -> ExtractedKernel {
+    ExtractedKernel {
+        kernel_release: label.to_string(),
+        image: PathBuf::from("/nonexistent/bzImage"),
+        config: config.map(Path::to_path_buf),
+        system_map: None,
+        modules_dir: modules_dir.map(Path::to_path_buf),
+        vmlinux: None,
+    }
+}
+
 #[test]
 fn gate_all_builtin_selects_no_modules() {
     let cfg = write_config(&[
@@ -109,7 +123,7 @@ fn gate_all_builtin_selects_no_modules() {
         "CONFIG_VIRTIO_MMIO=y",
         "CONFIG_VIRTIO_CONSOLE=y",
     ]);
-    let gate = gate_config(Some(cfg.path()), "test").unwrap();
+    let gate = gate_config(&extracted("test", Some(cfg.path()), None)).unwrap();
     assert!(
         gate.critical.is_empty() && gate.feature.is_empty(),
         "all builtin ⇒ no modules to load: {:?}/{:?}",
@@ -125,7 +139,7 @@ fn gate_modular_boot_critical_selected() {
         "CONFIG_VIRTIO_MMIO=m",
         "CONFIG_VIRTIO_CONSOLE=m",
     ]);
-    let gate = gate_config(Some(cfg.path()), "test").unwrap();
+    let gate = gate_config(&extracted("test", Some(cfg.path()), None)).unwrap();
     assert!(gate.critical.contains(&"virtio_mmio"));
     assert!(gate.critical.contains(&"virtio_console"));
     assert!(
@@ -138,7 +152,7 @@ fn gate_modular_boot_critical_selected() {
 fn gate_missing_boot_critical_hard_fails() {
     // VIRTIO_MMIO absent entirely (not even `is not set`).
     let cfg = write_config(&["CONFIG_VIRTIO=y", "CONFIG_VIRTIO_CONSOLE=y"]);
-    let err = gate_config(Some(cfg.path()), "badkernel").unwrap_err();
+    let err = gate_config(&extracted("badkernel", Some(cfg.path()), None)).unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("CONFIG_VIRTIO_MMIO"),
@@ -157,7 +171,7 @@ fn gate_disabled_boot_critical_hard_fails() {
         "CONFIG_VIRTIO_MMIO=y",
         "# CONFIG_VIRTIO_CONSOLE is not set",
     ]);
-    let err = gate_config(Some(cfg.path()), "k").unwrap_err();
+    let err = gate_config(&extracted("k", Some(cfg.path()), None)).unwrap_err();
     assert!(format!("{err}").contains("CONFIG_VIRTIO_CONSOLE"));
 }
 
@@ -170,7 +184,7 @@ fn gate_modular_feature_selected_absent_feature_warns_not_fails() {
         "CONFIG_VIRTIO_BLK=m",
         // VIRTIO_NET / BTRFS_FS absent → warn, not fail.
     ]);
-    let gate = gate_config(Some(cfg.path()), "test").unwrap();
+    let gate = gate_config(&extracted("test", Some(cfg.path()), None)).unwrap();
     assert!(
         gate.feature.contains(&"virtio_blk"),
         "modular feature must be bundled: {:?}",
@@ -179,9 +193,75 @@ fn gate_modular_feature_selected_absent_feature_warns_not_fails() {
 }
 
 #[test]
-fn gate_no_config_skips_and_selects_nothing() {
-    let gate = gate_config(None, "test").unwrap();
+fn gate_no_config_and_no_tree_skips_and_selects_nothing() {
+    let gate = gate_config(&extracted("test", None, None)).unwrap();
     assert!(gate.critical.is_empty() && gate.feature.is_empty());
+}
+
+/// No `.config` but a module tree present (pacman kernels): the gate
+/// lists EVERY boot-critical and feature driver so the tree decides —
+/// `select_boot_modules`' closure run skips builtins per
+/// `modules.builtin`, loads shipped `.ko`s, and hard-errors on a
+/// boot-critical driver found in neither.
+#[test]
+fn gate_no_config_with_tree_defers_to_module_tree() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let gate = gate_config(&extracted("test", None, Some(dir.path()))).unwrap();
+    assert_eq!(
+        gate.critical,
+        vec!["virtio", "virtio_mmio", "virtio_console"]
+    );
+    assert!(gate.feature.contains(&"virtio_net"));
+    assert!(gate.feature.contains(&"btrfs"));
+}
+
+/// End-to-end tree gate over a synthetic module tree shaped like
+/// linux-neptune: virtio + virtio_console builtin, virtio_mmio a
+/// shipped module — the critical closure must resolve to exactly the
+/// virtio_mmio `.ko` and skip the builtins.
+#[test]
+fn tree_gate_resolves_neptune_shaped_module_split() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let rel = "6.18.33-valve2";
+    let base = dir.path().join(format!("lib/modules/{rel}"));
+    fs::create_dir_all(base.join("kernel/drivers/virtio")).unwrap();
+    fs::write(
+        base.join("kernel/drivers/virtio/virtio_mmio.ko"),
+        b"fake-ko",
+    )
+    .unwrap();
+    fs::write(
+        base.join("modules.dep"),
+        "kernel/drivers/virtio/virtio_mmio.ko:
+",
+    )
+    .unwrap();
+    fs::write(
+        base.join("modules.builtin"),
+        "kernel/drivers/virtio/virtio.ko
+         kernel/drivers/virtio/virtio_ring.ko
+         kernel/drivers/char/virtio_console.ko
+         kernel/drivers/block/virtio_blk.ko
+",
+    )
+    .unwrap();
+
+    let mut ext = extracted(rel, None, Some(dir.path()));
+    ext.kernel_release = rel.to_string();
+    let gate = gate_config(&ext).unwrap();
+    let mods = select_boot_modules(&ext, &gate).unwrap();
+    let names: Vec<String> = mods
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names.contains(&"virtio_mmio.ko".to_string()),
+        "shipped =m driver must be selected: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains("virtio_console")),
+        "builtin drivers must not be selected: {names:?}"
+    );
 }
 
 // -- boot-module selection --

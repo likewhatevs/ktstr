@@ -54,9 +54,9 @@
 pub const KERNEL_ID_GRAMMAR: &str = "exact version (`6.14`), inclusive range (`6.14..7.0` or \
      `6.14..=7.0`), git source (`git+URL#tag=NAME`, `git+URL#branch=NAME`, or \
      `git+URL#sha=<40-hex>`), absolute or `~`-prefixed path, local kernel package \
-     (`*.rpm` or `*.deb`), distro kernel (`fedora`/`fedora-44`/`f44`, \
+     (`*.rpm`, `*.deb`, or `*.pkg.tar.zst`), distro kernel (`fedora`/`fedora-44`/`f44`, \
      `ubuntu`/`ubuntu-24.04`, `amazonlinux`/`amazonlinux-2023`/`al2023`, \
-     `almalinux`/`almalinux-10`/`alma10`), or cache key";
+     `almalinux`/`almalinux-10`/`alma10`, `steamos`/`steamos-3.8`), or cache key";
 
 /// Kernel identifier: filesystem path, version string, cache key,
 /// stable-release range, or git source.
@@ -64,15 +64,15 @@ pub const KERNEL_ID_GRAMMAR: &str = "exact version (`6.14`), inclusive range (`6
 /// Parsing heuristic (see [`KernelId::parse`]):
 /// - Starts with `git+`: [`KernelId::Git`] (form `git+URL#tag=NAME` /
 ///   `git+URL#branch=NAME` / `git+URL#sha=<40-hex>`)
-/// - Ends with `.rpm` or `.deb`: [`KernelId::Package`]
+/// - Ends with `.rpm`, `.deb`, or `.pkg.tar.zst`: [`KernelId::Package`]
 /// - Contains `/` (without a `git+` prefix) or starts with `.` or `~`:
 ///   [`KernelId::Path`]
 /// - Contains `..` between two version-shaped tokens:
 ///   [`KernelId::Range`] (inclusive on both endpoints)
 /// - Matches `MAJOR.MINOR[.PATCH][-rcN]`: [`KernelId::Version`]
-/// - A distro name (`fedora` / `ubuntu` / `amazonlinux` / `almalinux`,
-///   an explicit-release `NAME-REL`, or shorthand `f44` / `al2023` /
-///   `alma10`): [`KernelId::Distro`]
+/// - A distro name (`fedora` / `ubuntu` / `amazonlinux` / `almalinux` /
+///   `steamos`, an explicit-release `NAME-REL`, or shorthand `f44` /
+///   `al2023` / `alma10`): [`KernelId::Distro`]
 /// - Otherwise: [`KernelId::CacheKey`]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KernelId {
@@ -141,15 +141,16 @@ pub enum KernelId {
         /// bare `#REF` or unrecognized selector that `validate` rejects.
         ref_kind: GitRefKind,
     },
-    /// Local kernel package: an `.rpm` or `.deb` file on disk, to be
-    /// unpacked for its prebuilt kernel image and modules. Classified
-    /// by [`KernelId::parse`] on the case-sensitive `.rpm` / `.deb`
-    /// suffix ahead of the path check, so `./foo.rpm`, `/abs/foo.deb`,
-    /// and a bare `foo.rpm` all land here rather than as
+    /// Local kernel package: an `.rpm`, `.deb`, or pacman
+    /// `.pkg.tar.zst` file on disk, to be unpacked for its prebuilt
+    /// kernel image and modules. Classified by [`KernelId::parse`] on
+    /// the case-sensitive `.rpm` / `.deb` / `.pkg.tar.zst` suffix
+    /// ahead of the path check, so `./foo.rpm`, `/abs/foo.deb`, and a
+    /// bare `foo.rpm` all land here rather than as
     /// [`KernelId::Path`]. The `path` is `~`-expanded identically to
     /// the Path variant.
     Package {
-        /// Path to the `.rpm` / `.deb` file.
+        /// Path to the `.rpm` / `.deb` / `.pkg.tar.zst` file.
         path: std::path::PathBuf,
     },
     /// Distro-provided prebuilt kernel: download a specific build for a
@@ -157,7 +158,7 @@ pub enum KernelId {
     /// (`fedora`) leaves `release` `None` — the resolver picks the
     /// distro's default; an explicit release (`fedora-44`, `f44`,
     /// `ubuntu-24.04`, `amazonlinux-2023`, `al2023`, `almalinux-10`,
-    /// `alma10`) pins one. The
+    /// `alma10`, `steamos-3.8`) pins one. The
     /// release string's grammar is distro-specific and enforced by
     /// [`KernelId::validate`], not `parse`: a distro name with a
     /// malformed release parses to this variant and is rejected at
@@ -184,6 +185,9 @@ pub enum DistroKind {
     AmazonLinux,
     /// AlmaLinux (`almalinux`, `almalinux-10`, or shorthand `alma10`).
     AlmaLinux,
+    /// SteamOS (`steamos`, or a pinned channel `steamos-3.8`).
+    /// x86_64 only — Valve publishes no other architecture.
+    SteamOs,
 }
 
 /// Which git ref namespace a [`KernelId::Git`]'s `git_ref` names,
@@ -217,9 +221,10 @@ impl KernelId {
     ///   empty `url` — both of which [`KernelId::validate`] rejects
     ///   with an actionable error rather than the resolver later
     ///   reporting a confusing "path not found".
-    /// - `.rpm`/`.deb`-suffixed → [`KernelId::Package`]. Checked ahead
-    ///   of the path test so `./foo.rpm`, `/abs/foo.deb`, and a bare
-    ///   `foo.rpm` all classify as a package rather than a path.
+    /// - `.rpm`/`.deb`/`.pkg.tar.zst`-suffixed → [`KernelId::Package`].
+    ///   Checked ahead of the path test so `./foo.rpm`, `/abs/foo.deb`,
+    ///   and a bare `foo.rpm` all classify as a package rather than a
+    ///   path.
     /// - `START..=END` or `START..END` where both endpoints are
     ///   version-shaped → [`KernelId::Range`]. The endpoints are
     ///   ALWAYS inclusive — both `..` and `..=` spellings produce a
@@ -229,8 +234,8 @@ impl KernelId {
     /// - `/`-containing or `.`/`~`-prefixed → [`KernelId::Path`].
     /// - Version-shaped → [`KernelId::Version`].
     /// - A distro name (`fedora` / `ubuntu` / `amazonlinux` /
-    ///   `almalinux`, an explicit-release `NAME-REL`, or shorthand
-    ///   `f44` / `al2023` / `alma10`) →
+    ///   `almalinux` / `steamos`, an explicit-release `NAME-REL`, or
+    ///   shorthand `f44` / `al2023` / `alma10`) →
     ///   [`KernelId::Distro`]. The release grammar is checked by
     ///   `validate`, not here — a malformed release still classifies as
     ///   `Distro` (not `CacheKey`) so `validate` can reject it.
@@ -267,7 +272,7 @@ impl KernelId {
         // Case-sensitive suffix, checked before the path arm so a
         // package spec with directory separators (`/abs/foo.deb`) or a
         // `.`-prefix (`./foo.rpm`) still classifies as a package.
-        if s.ends_with(".rpm") || s.ends_with(".deb") {
+        if s.ends_with(".rpm") || s.ends_with(".deb") || s.ends_with(".pkg.tar.zst") {
             return KernelId::Package {
                 path: expand_tilde(s),
             };
@@ -333,8 +338,9 @@ impl KernelId {
     ///   url/ref, or a `#sha=` that isn't a full 40-hex id.
     /// - [`KernelId::Distro`] whose explicit release does not match the
     ///   distro's grammar (Fedora `\d{2,3}`, Ubuntu `YY.MM`, Amazon
-    ///   Linux `\d{4}`, AlmaLinux `\d{1,2}`). As with git, the parser
-    ///   defers the release
+    ///   Linux `\d{4}`, AlmaLinux `\d{1,2}`, SteamOS
+    ///   `\d{1,2}.\d{1,2}`). As with git, the parser defers the
+    ///   release
     ///   check here so a malformed release classifies as `Distro`
     ///   rather than silently becoming a `CacheKey`.
     ///
@@ -454,6 +460,13 @@ impl KernelId {
                         (1..=2).contains(&rel.len()) && all_digits(rel),
                         "a 1- or 2-digit major release (e.g. `almalinux-10` or `alma10`)",
                     ),
+                    // `MAJOR.MINOR` channel version, e.g. `3.8`.
+                    DistroKind::SteamOs => (
+                        matches!(rel.split_once('.'), Some((maj, min))
+                            if (1..=2).contains(&maj.len()) && (1..=2).contains(&min.len())
+                                && all_digits(maj) && all_digits(min)),
+                        "a `MAJOR.MINOR` channel version (e.g. `steamos-3.8`)",
+                    ),
                 };
                 if ok {
                     Ok(())
@@ -522,6 +535,7 @@ impl DistroKind {
             DistroKind::Ubuntu => "ubuntu",
             DistroKind::AmazonLinux => "amazonlinux",
             DistroKind::AlmaLinux => "almalinux",
+            DistroKind::SteamOs => "steamos",
         }
     }
 }
@@ -550,6 +564,7 @@ fn parse_distro(s: &str) -> Option<KernelId> {
         ("ubuntu", DistroKind::Ubuntu),
         ("amazonlinux", DistroKind::AmazonLinux),
         ("almalinux", DistroKind::AlmaLinux),
+        ("steamos", DistroKind::SteamOs),
     ] {
         if s == name {
             return Some(KernelId::Distro {

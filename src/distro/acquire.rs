@@ -159,13 +159,36 @@ struct GateResult {
 /// absent in any form (neither `=y` nor `=m`) are a hard error; every
 /// other classified option warns and proceeds.
 ///
-/// `config` is the extracted `.config` path; `None` (a package that
-/// shipped no config) skips the gate with a warning — the caller then
-/// bundles no modules and trusts the kernel to have virtio built in.
-fn gate_config(config: Option<&Path>, kernel_label: &str) -> Result<GateResult> {
-    let Some(config_path) = config else {
+/// A package that shipped no `.config` (SteamOS's linux-neptune
+/// carries neither a config file nor an embedded IKCONFIG — verified
+/// against a live jupiter-3.8 package) but did ship a module tree is
+/// gated on the TREE instead: every boot-critical and feature
+/// driver is listed for [`select_boot_modules`], whose
+/// `module_closure` run skips drivers built in per `modules.builtin`,
+/// resolves shipped `.ko`s, hard-errors on a boot-critical driver
+/// found in neither, and warns per missing feature driver — the same
+/// outcomes the config gate produces, derived from what the package
+/// actually carries. With neither config nor module tree, the gate is
+/// skipped with a warning and the kernel is trusted to have virtio
+/// built in.
+fn gate_config(extracted: &ExtractedKernel) -> Result<GateResult> {
+    let kernel_label = &extracted.kernel_release;
+    let Some(config_path) = extracted.config.as_deref() else {
+        if extracted.modules_dir.is_some() {
+            tracing::warn!(
+                kernel = %kernel_label,
+                "prebuilt kernel shipped no .config — gating boot-critical \
+                 virtio drivers on the module tree (modules.builtin + \
+                 modules.dep) instead; config-derived feature warnings are \
+                 unavailable for this kernel"
+            );
+            return Ok(GateResult {
+                critical: BOOT_CRITICAL.iter().map(|(_, m)| *m).collect(),
+                feature: FEATURE_MODULES.iter().map(|(_, m)| *m).collect(),
+            });
+        }
         tracing::warn!(
-            kernel = kernel_label,
+            kernel = %kernel_label,
             "prebuilt kernel shipped no .config — skipping config gate. If the \
              guest hangs at boot, the kernel likely lacks CONFIG_VIRTIO_MMIO / \
              CONFIG_VIRTIO_CONSOLE (which ktstr needs for its console/control port)."
@@ -268,8 +291,8 @@ fn select_boot_modules(extracted: &ExtractedKernel, gate: &GateResult) -> Result
     // reach the ktstr console/control port and is unsupported.
     let crit = module_closure(modules_dir, release, &gate.critical).with_context(|| {
         format!(
-            "prebuilt kernel {release} does not ship a boot-critical virtio \
-             module {:?} that its config declares =m — ktstr cannot reach its \
+            "prebuilt kernel {release} neither builds in nor ships a \
+             boot-critical virtio module among {:?} — ktstr cannot reach its \
              console/host control port without it, so this kernel is unsupported \
              (some distros split virtio-console into a subpackage the resolver \
              must include)",
@@ -312,7 +335,7 @@ fn install_extracted(
     extracted: &ExtractedKernel,
     source: KernelSource,
 ) -> Result<PathBuf> {
-    let gate = gate_config(extracted.config.as_deref(), &extracted.kernel_release)?;
+    let gate = gate_config(extracted)?;
     let modules = select_boot_modules(extracted, &gate)?;
 
     let (arch, image_name) = crate::fetch::arch_info();
@@ -426,9 +449,12 @@ fn sha256_file(path: &Path) -> Result<String> {
 ///
 /// Resolves repo metadata, composes the cache key, and on a hit returns
 /// immediately. On a miss: downloads every kernel package AND its
-/// (mandatory) debuginfo with sha256 verification, checks each against
-/// the host arch, extracts, runs the config gate + boot-module
-/// selection, and installs atomically.
+/// debuginfo with sha256 verification, checks each against the host
+/// arch, extracts, runs the config gate + boot-module selection, and
+/// installs atomically. Debuginfo is mandatory for every distro whose
+/// repos publish it (the resolvers fail hard on a missing package); a
+/// distro that publishes none (SteamOS) resolves with an empty
+/// debuginfo set and proceeds with a warning naming what degrades.
 pub fn acquire_distro_kernel(
     kind: DistroKind,
     release: Option<&str>,
@@ -455,6 +481,24 @@ pub fn acquire_distro_kernel(
     match mp {
         Some(fp) => fp.println(&msg),
         None => eprintln!("{msg}"),
+    }
+    if resolved.debuginfo.is_empty() {
+        // A distro with no published debug packages (SteamOS) is exempt
+        // from the otherwise-mandatory debuginfo: the cache entry gets
+        // no vmlinux, so the monitor's vmlinux-dependent features
+        // (symbolized stacks, probe file:line resolution) surface their
+        // normal "no vmlinux" error if actually used.
+        let warn = format!(
+            "{cli_label}: {} publishes no kernel debuginfo — proceeding \
+             without vmlinux; monitor features that need it (symbolized \
+             stacks, probe file:line) will be unavailable for this kernel",
+            resolved.distro,
+        );
+        match mp {
+            Some(fp) => fp.println(&warn),
+            None => eprintln!("{warn}"),
+        }
+        tracing::warn!(distro = %resolved.distro, "no debuginfo published; caching kernel without vmlinux");
     }
 
     let scratch = scratch_dir()?;

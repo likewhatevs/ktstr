@@ -1570,10 +1570,11 @@ pub const KTSTR_KERNEL_HINT: &str = "set KTSTR_KERNEL to one of: \
     exact version (`6.14`), inclusive range (`6.14..7.0` or \
     `6.14..=7.0`), git source (`git+URL#tag=NAME`, \
     `git+URL#branch=NAME`, or `git+URL#sha=<40-hex>`), absolute or \
-    `~`-prefixed path, local kernel package (`*.rpm` or `*.deb`), \
-    distro kernel (`fedora`/`fedora-44`/`f44`, `ubuntu`/`ubuntu-24.04`, \
-    `amazonlinux`/`amazonlinux-2023`/`al2023`, \
-    `almalinux`/`almalinux-10`/`alma10`), or cache key. List \
+    `~`-prefixed path, local kernel package (`*.rpm`, `*.deb`, or \
+    `*.pkg.tar.zst`), distro kernel (`fedora`/`fedora-44`/`f44`, \
+    `ubuntu`/`ubuntu-24.04`, `amazonlinux`/`amazonlinux-2023`/`al2023`, \
+    `almalinux`/`almalinux-10`/`alma10`, `steamos`/`steamos-3.8`), or \
+    cache key. List \
     cached keys with `cargo ktstr kernel list`; build new ones with \
     `cargo ktstr kernel build`";
 

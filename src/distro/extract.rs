@@ -19,8 +19,14 @@
 //!   `/lib/modules/`, or `/usr/lib/modules/` on usrmerge packages);
 //!   the two debs merge into one tree. A `-dbgsym` ddeb contributes
 //!   `vmlinux`.
+//! - **Arch / SteamOS**: a pacman `.pkg.tar.zst` is a plain
+//!   zstd-compressed tarball; `linux-neptune-*` carries `vmlinuz` and
+//!   the module tree under `/usr/lib/modules/<release>/` (usrmerge)
+//!   with the package arch in the `.PKGINFO` member's `arch = ` field
+//!   (verified against a live jupiter-3.8 package). No kernel
+//!   `.config` is shipped and there is no debuginfo package.
 //!
-//! Neither distro ships `modules.dep` in the package — depmod
+//! None of these distros ship `modules.dep` in the package — depmod
 //! generates it at install time — so extraction runs the host's
 //! `depmod -b` over the tree as a best-effort step (see
 //! `ensure_modules_dep`).
@@ -100,6 +106,7 @@ pub fn extract_kernel_packages(packages: &[&Path], dest: &Path) -> Result<Extrac
         match package_kind(pkg)? {
             PackageKind::Rpm => extract_rpm(pkg, &dest)?,
             PackageKind::Deb => extract_deb(pkg, &dest)?,
+            PackageKind::Pacman => extract_pacman(pkg, &dest)?,
         }
     }
 
@@ -222,6 +229,7 @@ pub fn package_arch(path: &Path) -> Result<String> {
             Ok(meta.get_arch()?.to_string())
         }
         PackageKind::Deb => deb_arch(path),
+        PackageKind::Pacman => pacman_arch(path),
     }
 }
 
@@ -261,11 +269,21 @@ pub fn ensure_arch_matches_host(pkg_arch: &str, pkg: &Path) -> Result<()> {
 enum PackageKind {
     Rpm,
     Deb,
+    Pacman,
 }
 
-/// Classify a package by extension, falling back to the leading magic
-/// bytes (rpm lead `ed ab ee db`, ar/deb `!<arch>\n`).
+/// Classify a package by extension (`.pkg.tar.zst` is matched on the
+/// full name — `Path::extension` only sees the final `.zst`), falling
+/// back to the leading magic bytes (rpm lead `ed ab ee db`, ar/deb
+/// `!<arch>\n`, zstd frame `28 b5 2f fd` for a pacman package).
 fn package_kind(path: &Path) -> Result<PackageKind> {
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".pkg.tar.zst"))
+    {
+        return Ok(PackageKind::Pacman);
+    }
     match path.extension().and_then(|e| e.to_str()) {
         Some("rpm") => return Ok(PackageKind::Rpm),
         Some("deb" | "ddeb" | "udeb") => return Ok(PackageKind::Deb),
@@ -279,8 +297,10 @@ fn package_kind(path: &Path) -> Result<PackageKind> {
         Ok(PackageKind::Rpm)
     } else if magic.starts_with(b"!<arch>\n") {
         Ok(PackageKind::Deb)
+    } else if magic.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        Ok(PackageKind::Pacman)
     } else {
-        bail!("{} is neither an rpm nor a deb package", path.display())
+        bail!("{} is not an rpm, deb, or pacman package", path.display())
     }
 }
 
@@ -575,6 +595,48 @@ fn read_tar_entry(member_name: &str, data: Vec<u8>, basename: &str) -> Option<Ve
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Pacman (.pkg.tar.zst) extraction
+// ---------------------------------------------------------------------------
+
+/// A pacman package is one zstd-compressed tarball; stream it through
+/// the vendored decoder into the hardened tar extractor. The
+/// `.PKGINFO`/`.MTREE`/`.BUILDINFO` metadata members land as dot-files
+/// in the destination root, where no artifact lookup ever visits them.
+fn extract_pacman(path: &Path, dest: &Path) -> Result<()> {
+    let f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = zstd::stream::read::Decoder::new(BufReader::new(f))
+        .with_context(|| format!("init zstd decoder for {}", path.display()))?;
+    extract_tar(reader, dest).with_context(|| format!("extract pacman {}", path.display()))
+}
+
+/// Parse the pacman package architecture from the `.PKGINFO` member's
+/// `arch = <arch>` line.
+fn pacman_arch(path: &Path) -> Result<String> {
+    let f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = zstd::stream::read::Decoder::new(BufReader::new(f))
+        .with_context(|| format!("init zstd decoder for {}", path.display()))?;
+    let mut archive = tar::Archive::new(reader);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if entry.path()?.as_os_str() != ".PKGINFO" {
+            continue;
+        }
+        let mut text = String::new();
+        entry.read_to_string(&mut text)?;
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("arch") {
+                let v = v.trim_start();
+                if let Some(v) = v.strip_prefix('=') {
+                    return Ok(v.trim().to_string());
+                }
+            }
+        }
+        bail!("{}: .PKGINFO has no `arch =` field", path.display());
+    }
+    bail!("{}: no .PKGINFO member found", path.display())
 }
 
 fn filename_arch(path: &Path) -> Result<String> {

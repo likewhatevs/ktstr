@@ -454,6 +454,145 @@ fn alma_latest_major_picks_numeric_dirs_only() {
     assert_eq!(alma_latest_major("<html>no releases</html>"), None);
 }
 
+// ---- SteamOS pacman channels ---------------------------------------
+
+const NEPTUNE_DESC: &str = "\
+%FILENAME%
+linux-neptune-618-6.18.33.valve2-1.1-x86_64.pkg.tar.zst
+
+%NAME%
+linux-neptune-618
+
+%VERSION%
+6.18.33.valve2-1.1
+
+%CSIZE%
+148103715
+
+%SHA256SUM%
+982329544c326401344d0787aa40b651d4fbcd620fc69b18c42bd2ebaced1180
+
+%ARCH%
+x86_64
+";
+
+#[test]
+fn pacman_desc_parses_resolver_fields() {
+    let pkg = parse_pacman_desc(NEPTUNE_DESC);
+    assert_eq!(pkg.name, "linux-neptune-618");
+    assert_eq!(pkg.version, "6.18.33.valve2-1.1");
+    assert_eq!(
+        pkg.filename,
+        "linux-neptune-618-6.18.33.valve2-1.1-x86_64.pkg.tar.zst"
+    );
+    assert_eq!(pkg.sha256.len(), 64);
+    assert_eq!(pkg.csize, Some(148103715));
+    assert_eq!(pkg.arch, "x86_64");
+}
+
+#[test]
+fn pacman_db_round_trips_through_tar_and_codecs() {
+    // Build a two-package db tar at test time; `desc` must be matched
+    // by basename inside the `<name>-<version>/` entry dir.
+    let mut builder = tar::Builder::new(Vec::new());
+    for (dir, desc) in [
+        ("linux-neptune-618-6.18.33.valve2-1.1", NEPTUNE_DESC),
+        (
+            "bash-5.2-1",
+            "%NAME%\nbash\n\n%VERSION%\n5.2-1\n\n%ARCH%\nx86_64\n",
+        ),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(desc.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, format!("{dir}/desc"), desc.as_bytes())
+            .unwrap();
+    }
+    let tar_bytes = builder.into_inner().unwrap();
+
+    // The live jupiter dbs are xz; gz/zst/plain accepted for robustness.
+    let mut xz = xz2::write::XzEncoder::new(Vec::new(), 6);
+    std::io::Write::write_all(&mut xz, &tar_bytes).unwrap();
+    let xz_bytes = xz.finish().unwrap();
+    for bytes in [&tar_bytes, &xz_bytes] {
+        let pkgs = parse_pacman_db(decompress_pacman_db(bytes).unwrap()).unwrap();
+        assert_eq!(pkgs.len(), 2);
+        assert_eq!(pkgs[0].name, "linux-neptune-618");
+        assert_eq!(pkgs[1].name, "bash");
+    }
+}
+
+#[test]
+fn steamos_kernel_series_classification() {
+    // The legacy base package and versioned series classify.
+    assert_eq!(
+        steamos_kernel_series("linux-neptune"),
+        Some("linux-neptune")
+    );
+    assert_eq!(
+        steamos_kernel_series("linux-neptune-618"),
+        Some("linux-neptune-618")
+    );
+    // Variant packages never classify (from the live jupiter-3.8 db).
+    for name in [
+        "linux-neptune-618-headers",
+        "linux-neptune-618-devel",
+        "linux-neptune-618-drm-exec",
+        "linux-neptune-65-kasan",
+        "linux-neptune-rtw-debug",
+        "linux-neptune-headers",
+        "linux-firmware",
+        "bash",
+    ] {
+        assert_eq!(steamos_kernel_series(name), None, "{name:?}");
+    }
+}
+
+#[test]
+fn steamos_picks_newest_kernel_series_by_version() {
+    let mk = |name: &str, version: &str| PacmanPkg {
+        name: name.into(),
+        version: version.into(),
+        filename: format!("{name}-{version}-x86_64.pkg.tar.zst"),
+        sha256: "deadbeef".into(),
+        csize: Some(1),
+        arch: "x86_64".into(),
+    };
+    // Mirrors the live jupiter-3.8 spread: the older 6.16 series has a
+    // far higher valve build number and pkgrel than 6.18, so only the
+    // kernel-version compare picks the right series.
+    let pkgs = vec![
+        mk("linux-neptune", "5.13.0.valve37-1"),
+        mk("linux-neptune-616", "6.16.12.valve24.2-2.1"),
+        mk("linux-neptune-618", "6.18.33.valve2-1.1"),
+        mk("linux-neptune-618-headers", "6.18.99.valve9-1"),
+    ];
+    let best = steamos_pick_kernel(&pkgs).unwrap();
+    assert_eq!(best.name, "linux-neptune-618");
+    assert_eq!(best.version, "6.18.33.valve2-1.1");
+}
+
+#[test]
+fn steamos_latest_channel_skips_non_numeric() {
+    // Shape of the live mirror listing: numbered trains, point/suffix
+    // channels, and the rel/main/staging/ci churn.
+    let html = r#"<a href="../">../</a>
+<a href="holo-3.8/">holo-3.8/</a>
+<a href="jupiter-3.3.1/">jupiter-3.3.1/</a>
+<a href="jupiter-3.7/">jupiter-3.7/</a>
+<a href="jupiter-3.8/">jupiter-3.8/</a>
+<a href="jupiter-3.8.1x/">jupiter-3.8.1x/</a>
+<a href="jupiter-ci-test/">jupiter-ci-test/</a>
+<a href="jupiter-main/">jupiter-main/</a>
+<a href="jupiter-rel/">jupiter-rel/</a>
+<a href="jupiter-staging/">jupiter-staging/</a>
+"#;
+    assert_eq!(steamos_latest_channel(html).as_deref(), Some("3.8"));
+    assert_eq!(steamos_latest_channel("<html></html>"), None);
+}
+
 // ---- Fedora releases.json -----------------------------------------
 
 #[test]
@@ -536,6 +675,35 @@ fn live_almalinux() {
         assert_eq!(r.packages.len(), 2);
         assert_eq!(r.packages[1].name, "kernel-modules-core");
     }
+}
+
+#[test]
+fn steamos_rejects_non_x86_64_before_any_fetch() {
+    // The arch guard fires before any network access, so this runs in
+    // the offline suite.
+    let err = resolve_for_arch(DistroKind::SteamOs, None, "aarch64")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("x86_64 only"), "{err}");
+}
+
+#[test]
+#[ignore = "hits the live SteamOS mirror"]
+fn live_steamos() {
+    let r = resolve_for_arch(DistroKind::SteamOs, None, "x86_64").unwrap();
+    eprintln!(
+        "steamos/x86_64: {} {} pkgs={:?}",
+        r.distro,
+        r.kernel_release,
+        r.packages.iter().map(|p| &p.name).collect::<Vec<_>>(),
+    );
+    assert!(!r.packages.is_empty());
+    assert!(r.packages[0].name.starts_with("linux-neptune"));
+    assert_eq!(r.packages[0].sha256.len(), 64);
+    assert!(r.packages[0].url.starts_with("http"));
+    // No debug packages exist for linux-neptune — the documented
+    // mandatory-debuginfo exemption.
+    assert!(r.debuginfo.is_empty());
 }
 
 #[test]

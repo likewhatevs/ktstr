@@ -56,6 +56,28 @@
 //!   kernel-core config), so acquisition currently stops at the
 //!   config gate — ktstr's console/control port needs the
 //!   virtio-MMIO transport.
+//! - **SteamOS** — Valve's official package mirror
+//!   `https://steamdeck-packages.steamos.cloud/archlinux-mirror/`.
+//!   The kernel lives in the `jupiter-<MAJOR.MINOR>` channels (Valve's
+//!   per-release trains; verified live: `jupiter-3.7`, `jupiter-3.8`).
+//!   A bare `steamos` picks the highest version-numbered jupiter
+//!   channel — the newest release train Valve publishes — because the
+//!   mirror exposes no machine-readable stable pointer: `jupiter-rel`
+//!   is the legacy 3.0-era channel (its newest kernel is 5.13) and
+//!   `-main`/`-staging`/`-ci-test` are development churn, so the
+//!   numbered trains are the only sane axis; pin `steamos-3.7` to
+//!   hold an older train. The channel's pacman database
+//!   (`jupiter-<v>.db`, a compressed tar of per-package `desc`
+//!   files) declares name/version/sha256/filename; the kernel package
+//!   is `linux-neptune[-<series>]` (`linux-neptune-618` today) and
+//!   the newest series wins by kernel version (compared with
+//!   `rpmvercmp`, whose plain alnum-segment ordering matches pacman's
+//!   `vercmp` for these dotted versions). x86_64 only — Valve
+//!   publishes no other architecture. No debug packages exist for
+//!   linux-neptune anywhere on the mirror (the `*-debug-*` repos only
+//!   mirror Arch's own core/extra split), so SteamOS resolves with NO
+//!   debuginfo — the one distro exempt from the mandatory-vmlinux
+//!   policy; acquisition warns about what that degrades.
 //!
 //! All metadata fetches ride the shared HTTP client and transient-retry
 //! seam via `crate::fetch::fetch_metadata_bytes` /
@@ -132,6 +154,7 @@ pub(crate) fn resolve_for_arch(
         DistroKind::Ubuntu => resolve_ubuntu(release, arch),
         DistroKind::AmazonLinux => resolve_amazonlinux(release, arch),
         DistroKind::AlmaLinux => resolve_almalinux(release, arch),
+        DistroKind::SteamOs => resolve_steamos(release, arch),
     }
 }
 
@@ -1189,6 +1212,200 @@ fn resolve_almalinux(release: Option<&str>, arch: &str) -> Result<ResolvedDistro
         arch: arch.to_string(),
         packages,
         debuginfo,
+    })
+}
+
+const STEAMOS_MIRROR: &str = "https://steamdeck-packages.steamos.cloud/archlinux-mirror/";
+
+/// One package parsed out of a pacman repo database's `desc` file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PacmanPkg {
+    name: String,
+    version: String,
+    filename: String,
+    sha256: String,
+    csize: Option<u64>,
+    arch: String,
+}
+
+/// Parse a pacman repo database — a (compressed) tar whose
+/// `<name>-<version>/desc` members carry `%FIELD%\n<value>` records —
+/// into package rows. Fields the resolver does not consume are skipped.
+fn parse_pacman_db<R: Read>(reader: R) -> Result<Vec<PacmanPkg>> {
+    let mut archive = tar::Archive::new(reader);
+    let mut out = Vec::new();
+    for entry in archive.entries().with_context(|| "read pacman db tar")? {
+        let mut entry = entry.with_context(|| "read pacman db entry")?;
+        let path = entry.path().with_context(|| "pacman db entry path")?;
+        if path.file_name().and_then(|n| n.to_str()) != Some("desc") {
+            continue;
+        }
+        let mut text = String::new();
+        entry
+            .read_to_string(&mut text)
+            .with_context(|| "read pacman desc")?;
+        out.push(parse_pacman_desc(&text));
+    }
+    Ok(out)
+}
+
+/// Parse one `desc` file: `%FIELD%` header lines each followed by the
+/// field's value line(s); the resolver's fields are all single-line.
+fn parse_pacman_desc(text: &str) -> PacmanPkg {
+    let mut pkg = PacmanPkg {
+        name: String::new(),
+        version: String::new(),
+        filename: String::new(),
+        sha256: String::new(),
+        csize: None,
+        arch: String::new(),
+    };
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let field = line.trim();
+        if !(field.starts_with('%') && field.ends_with('%')) {
+            continue;
+        }
+        let Some(value) = lines.next().map(str::trim) else {
+            break;
+        };
+        match field {
+            "%NAME%" => pkg.name = value.to_string(),
+            "%VERSION%" => pkg.version = value.to_string(),
+            "%FILENAME%" => pkg.filename = value.to_string(),
+            "%SHA256SUM%" => pkg.sha256 = value.to_string(),
+            "%CSIZE%" => pkg.csize = value.parse().ok(),
+            "%ARCH%" => pkg.arch = value.to_string(),
+            _ => {}
+        }
+    }
+    pkg
+}
+
+/// Wrap a downloaded pacman `.db` in the decompressor its leading
+/// magic implies. Valve's live databases are xz tars
+/// (`jupiter-3.8.db`); gzip and zstd are accepted for robustness
+/// against a repo-tooling change, plain tar as the last resort.
+fn decompress_pacman_db(bytes: &[u8]) -> Result<Box<dyn Read + '_>> {
+    let cursor = Cursor::new(bytes);
+    if bytes.starts_with(&[0xfd, 0x37, 0x7a, 0x58, 0x5a]) {
+        Ok(Box::new(xz2::read::XzDecoder::new(cursor)))
+    } else if bytes.starts_with(&[0x1f, 0x8b]) {
+        Ok(Box::new(flate2::read::GzDecoder::new(cursor)))
+    } else if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        Ok(Box::new(
+            zstd::Decoder::new(cursor).with_context(|| "init zstd decoder")?,
+        ))
+    } else {
+        Ok(Box::new(cursor))
+    }
+}
+
+/// The SteamOS kernel-package family a pacman package name belongs to:
+/// the legacy `linux-neptune` (5.13) or a versioned
+/// `linux-neptune-<digits>` series (`linux-neptune-618`). Returns
+/// `None` for every other neptune-adjacent name (`-headers`, `-devel`,
+/// `-kasan`, `-drm-exec`, `-rtw-debug`, …).
+fn steamos_kernel_series(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("linux-neptune")?;
+    if rest.is_empty() {
+        return Some(name);
+    }
+    let digits = rest.strip_prefix('-')?;
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(name)
+}
+
+/// Highest version-numbered `jupiter-<MAJOR.MINOR>` channel in the
+/// mirror's top-level listing. Point/suffix channels (`jupiter-3.3.1`,
+/// `jupiter-3.8.1x`) and the non-numeric channels (`-rel`, `-main`,
+/// `-staging`, `-ci-test`) are skipped — see the module docs for why
+/// the numbered trains are the selection axis.
+fn steamos_latest_channel(listing_html: &str) -> Option<String> {
+    listing_html
+        .split("href=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split_once('"').map(|(href, _)| href))
+        .filter_map(|href| href.strip_suffix('/'))
+        .filter_map(|dir| dir.strip_prefix("jupiter-"))
+        .filter_map(|ver| {
+            let (maj, min) = ver.split_once('.')?;
+            let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+            (digits(maj) && digits(min))
+                .then(|| (maj.parse::<u32>().ok(), min.parse::<u32>().ok(), ver))
+        })
+        .filter_map(|(maj, min, ver)| Some((maj?, min?, ver)))
+        .max_by_key(|(maj, min, _)| (*maj, *min))
+        .map(|(_, _, ver)| ver.to_string())
+}
+
+/// Pick the newest kernel among the `linux-neptune*` series rows: by
+/// kernel version (`rpmvercmp` on the pkgver before the `-pkgrel`,
+/// e.g. `6.18.33.valve2` > `6.16.12.valve24.2`), tying back to the
+/// full version string for determinism. Same cross-series principle as
+/// [`al2023_pick_stream`]: only the kernel version orders different
+/// package names.
+fn steamos_pick_kernel(pkgs: &[PacmanPkg]) -> Option<&PacmanPkg> {
+    let pkgver = |v: &str| {
+        v.rsplit_once('-')
+            .map_or_else(|| v.to_string(), |(v, _)| v.to_string())
+    };
+    pkgs.iter()
+        .filter(|p| steamos_kernel_series(&p.name).is_some())
+        .max_by(|a, b| {
+            rpmvercmp(&pkgver(&a.version), &pkgver(&b.version))
+                .then_with(|| rpmvercmp(&a.version, &b.version))
+        })
+}
+
+fn resolve_steamos(release: Option<&str>, arch: &str) -> Result<ResolvedDistroKernel> {
+    if arch != "x86_64" {
+        bail!(
+            "SteamOS kernels are published for x86_64 only \
+             (Valve's mirror has no {arch} packages)"
+        );
+    }
+    let channel_ver = match release {
+        Some(r) => r.to_string(),
+        None => {
+            let listing = crate::fetch::fetch_metadata_text(STEAMOS_MIRROR, "fetch")?;
+            steamos_latest_channel(&listing).ok_or_else(|| {
+                anyhow!("no jupiter-<MAJOR.MINOR> channel found under {STEAMOS_MIRROR}")
+            })?
+        }
+    };
+    let channel = format!("jupiter-{channel_ver}");
+    let base = format!("{STEAMOS_MIRROR}{channel}/os/{arch}/");
+    let db_url = format!("{base}{channel}.db");
+    let db = crate::fetch::fetch_metadata_bytes(&db_url, "fetch")?;
+    let pkgs = parse_pacman_db(decompress_pacman_db(&db)?)
+        .with_context(|| format!("parse pacman db {db_url}"))?;
+    let kernel = steamos_pick_kernel(&pkgs)
+        .ok_or_else(|| anyhow!("no linux-neptune kernel package in {channel}"))?;
+    if kernel.arch != arch {
+        bail!(
+            "{} in {channel} declares arch {} (expected {arch})",
+            kernel.name,
+            kernel.arch
+        );
+    }
+    let packages = vec![PackageRef {
+        name: kernel.name.clone(),
+        version: kernel.version.clone(),
+        url: format!("{base}{}", kernel.filename),
+        sha256: kernel.sha256.clone(),
+        size: kernel.csize,
+    }];
+
+    Ok(ResolvedDistroKernel {
+        distro: format!("steamos{channel_ver}"),
+        kernel_release: kernel.version.clone(),
+        arch: arch.to_string(),
+        packages,
+        // Valve publishes no debug packages for linux-neptune (the
+        // mirror's *-debug-* repos only carry Arch's own core/extra
+        // split), so SteamOS is exempt from the mandatory-debuginfo
+        // policy; acquisition warns about the degraded features.
+        debuginfo: Vec::new(),
     })
 }
 

@@ -239,11 +239,13 @@ pub const KERNEL_HELP_NO_RAW: &str = "Kernel identifier — one of: \
      (3) a git source (`git+URL#tag=NAME`, `git+URL#branch=NAME`, or \
      `git+URL#sha=<40-hex>`); \
      (4) a source directory path (`./linux`, `~/linux`, or an absolute path); \
-     (5) a local kernel package (`*.rpm` / `*.deb`, one file per `--kernel`); \
+     (5) a local kernel package (`*.rpm` / `*.deb` / `*.pkg.tar.zst`, one \
+     file per `--kernel`); \
      (6) a prebuilt distro kernel — `fedora` / `fedora-44` / `f44`, \
      `ubuntu` / `ubuntu-24.04` (resolves to the latest LTS HWE kernel), \
      `amazonlinux` / `amazonlinux-2023` / `al2023`, \
-     `almalinux` / `almalinux-10` / `alma10` (a bare distro name picks \
+     `almalinux` / `almalinux-10` / `alma10`, \
+     `steamos` / `steamos-3.8` (a bare distro name picks \
      the distro's current release); or \
      (7) a cache key (see `kernel list`). Raw \
      image files are rejected. Source directories auto-build (can be slow \
@@ -273,11 +275,13 @@ pub const KERNEL_HELP_RAW_OK: &str = "Kernel identifier — one of: \
      (2) a raw image file (`bzImage` / `Image`); \
      (3) an exact version (`6.14.2`, `6.15-rc3`), a major.minor prefix \
      (`6.14`, latest patch), or a bare major (`6`); \
-     (4) a local kernel package (`*.rpm` / `*.deb`, one file per `--kernel`); \
+     (4) a local kernel package (`*.rpm` / `*.deb` / `*.pkg.tar.zst`, one \
+     file per `--kernel`); \
      (5) a prebuilt distro kernel — `fedora` / `fedora-44` / `f44`, \
      `ubuntu` / `ubuntu-24.04` (resolves to the latest LTS HWE kernel), \
      `amazonlinux` / `amazonlinux-2023` / `al2023`, \
-     `almalinux` / `almalinux-10` / `alma10`; or \
+     `almalinux` / `almalinux-10` / `alma10`, \
+     `steamos` / `steamos-3.8`; or \
      (6) a cache key (see `kernel list`). Source directories auto-build \
      (can be slow on a fresh tree); versions auto-download from kernel.org \
      on cache miss; distro kernels download the prebuilt kernel + debuginfo \
@@ -306,11 +310,13 @@ pub const KERNEL_HELP_BUILD: &str = "Kernel to build (or, for a prebuilt \
      relative source dir with `./`); \
      (4) a git source (`git+URL#tag=NAME`, `git+URL#branch=NAME`, or \
      `git+URL#sha=<40-hex>`); \
-     (5) a local kernel package (`*.rpm` / `*.deb`, one file per `--kernel`); \
+     (5) a local kernel package (`*.rpm` / `*.deb` / `*.pkg.tar.zst`, one \
+     file per `--kernel`); \
      or (6) a prebuilt distro kernel — `fedora` / `fedora-44` / `f44`, \
      `ubuntu` / `ubuntu-24.04` (resolves to the latest LTS HWE kernel), \
      `amazonlinux` / `amazonlinux-2023` / `al2023`, \
-     `almalinux` / `almalinux-10` / `alma10`. Omitted, the latest \
+     `almalinux` / `almalinux-10` / `alma10`, \
+     `steamos` / `steamos-3.8`. Omitted, the latest \
      stable release is built. For a local package or distro spec, `build` \
      downloads/unpacks the prebuilt kernel into the cache rather than \
      compiling. A cache key (an already-built entry from `kernel list`) is \
