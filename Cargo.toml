@@ -67,6 +67,14 @@ postcard = { version = "1", features = ["use-std"] }
 itoa = "1"
 gix = { version = "0.83", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation", "status", "revision", "progress-tree", "tree-editor"] }
 reqwest = { version = "0.13", features = ["blocking"] }
+# Streaming XML pull-parser for distro repo metadata (repomd.xml and
+# the multi-MB primary.xml the Fedora / Amazon Linux resolvers walk in
+# `src/distro/repo.rs`). Used in streaming (`Reader::read_event`) mode
+# so a 70+ MB decompressed primary.xml is filtered package-by-package
+# without materializing a DOM. Already present transitively; pinned as
+# a direct dep so the distro resolver doesn't lean on another crate's
+# re-export surface.
+quick-xml = "0.38"
 tar = "0.4"
 tempfile = "3"
 xz2 = { version = "0.1", features = ["static"] }

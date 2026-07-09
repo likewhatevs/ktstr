@@ -793,6 +793,44 @@ fn get_with_transient_retry(
     unreachable!("the attempt == retry.attempts arms above return on the final iteration")
 }
 
+/// GET `url` through the process-wide [`shared_client`] with the
+/// standard [`TRANSIENT_HTTP_RETRY`] policy and return the full
+/// response body as bytes.
+///
+/// The distro repo-metadata resolver ([`crate::distro::repo`]) fetches
+/// repomd.xml, primary.xml.{gz,zst,xz}, `Packages.gz`, and `mirror.list`
+/// through this so every metadata fetch rides the same retry/backoff
+/// seam as the kernel-source downloads. `what` is the error-context
+/// verb ("fetch"). A non-success status is a hard error carrying the
+/// status; the caller adds its own context. No total-request timeout
+/// (mirrors [`fetch_releases`]) — the connect timeout still bounds a
+/// dead route, and metadata bodies are single-digit MiB.
+pub(crate) fn fetch_metadata_bytes(url: &str, what: &str) -> Result<Vec<u8>> {
+    let response =
+        get_with_transient_retry(shared_client(), url, None, what, &TRANSIENT_HTTP_RETRY)?;
+    if !response.status().is_success() {
+        anyhow::bail!("{what} {url}: HTTP {}", response.status());
+    }
+    Ok(response
+        .bytes()
+        .with_context(|| format!("read body of {url}"))?
+        .to_vec())
+}
+
+/// GET `url` like [`fetch_metadata_bytes`] but decode the body as
+/// UTF-8 text — for the plain-text metadata endpoints (`mirror.list`,
+/// `meta-release-lts`).
+pub(crate) fn fetch_metadata_text(url: &str, what: &str) -> Result<String> {
+    let response =
+        get_with_transient_retry(shared_client(), url, None, what, &TRANSIENT_HTTP_RETRY)?;
+    if !response.status().is_success() {
+        anyhow::bail!("{what} {url}: HTTP {}", response.status());
+    }
+    response
+        .text()
+        .with_context(|| format!("read body of {url}"))
+}
+
 /// Construct the cdn.kernel.org `sha256sums.asc` URL for a stable
 /// major series:
 /// `https://cdn.kernel.org/pub/linux/kernel/v{major}.x/sha256sums.asc`.

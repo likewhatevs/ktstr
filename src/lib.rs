@@ -359,6 +359,7 @@ pub mod non_exhaustive {}
 
 pub mod cache;
 pub mod cgroup;
+pub mod distro;
 pub mod flock;
 
 /// Map a raw errno value to its C constant name.

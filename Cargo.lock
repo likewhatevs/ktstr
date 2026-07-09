@@ -3734,6 +3734,7 @@ dependencies = [
  "predicates",
  "proc-macro2",
  "proptest",
+ "quick-xml",
  "quote",
  "rand 0.10.1",
  "rayon",
