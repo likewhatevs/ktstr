@@ -1572,7 +1572,8 @@ pub const KTSTR_KERNEL_HINT: &str = "set KTSTR_KERNEL to one of: \
     `git+URL#branch=NAME`, or `git+URL#sha=<40-hex>`), absolute or \
     `~`-prefixed path, local kernel package (`*.rpm` or `*.deb`), \
     distro kernel (`fedora`/`fedora-44`/`f44`, `ubuntu`/`ubuntu-24.04`, \
-    `amazonlinux`/`amazonlinux-2023`/`al2023`), or cache key. List \
+    `amazonlinux`/`amazonlinux-2023`/`al2023`, \
+    `almalinux`/`almalinux-10`/`alma10`), or cache key. List \
     cached keys with `cargo ktstr kernel list`; build new ones with \
     `cargo ktstr kernel build`";
 

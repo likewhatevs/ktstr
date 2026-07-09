@@ -55,7 +55,8 @@ pub const KERNEL_ID_GRAMMAR: &str = "exact version (`6.14`), inclusive range (`6
      `6.14..=7.0`), git source (`git+URL#tag=NAME`, `git+URL#branch=NAME`, or \
      `git+URL#sha=<40-hex>`), absolute or `~`-prefixed path, local kernel package \
      (`*.rpm` or `*.deb`), distro kernel (`fedora`/`fedora-44`/`f44`, \
-     `ubuntu`/`ubuntu-24.04`, `amazonlinux`/`amazonlinux-2023`/`al2023`), or cache key";
+     `ubuntu`/`ubuntu-24.04`, `amazonlinux`/`amazonlinux-2023`/`al2023`, \
+     `almalinux`/`almalinux-10`/`alma10`), or cache key";
 
 /// Kernel identifier: filesystem path, version string, cache key,
 /// stable-release range, or git source.
@@ -69,9 +70,9 @@ pub const KERNEL_ID_GRAMMAR: &str = "exact version (`6.14`), inclusive range (`6
 /// - Contains `..` between two version-shaped tokens:
 ///   [`KernelId::Range`] (inclusive on both endpoints)
 /// - Matches `MAJOR.MINOR[.PATCH][-rcN]`: [`KernelId::Version`]
-/// - A distro name (`fedora` / `ubuntu` / `amazonlinux`, an
-///   explicit-release `NAME-REL`, or shorthand `f44` / `al2023`):
-///   [`KernelId::Distro`]
+/// - A distro name (`fedora` / `ubuntu` / `amazonlinux` / `almalinux`,
+///   an explicit-release `NAME-REL`, or shorthand `f44` / `al2023` /
+///   `alma10`): [`KernelId::Distro`]
 /// - Otherwise: [`KernelId::CacheKey`]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KernelId {
@@ -155,7 +156,8 @@ pub enum KernelId {
     /// named distribution and (optional) release. A bare distro name
     /// (`fedora`) leaves `release` `None` — the resolver picks the
     /// distro's default; an explicit release (`fedora-44`, `f44`,
-    /// `ubuntu-24.04`, `amazonlinux-2023`, `al2023`) pins one. The
+    /// `ubuntu-24.04`, `amazonlinux-2023`, `al2023`, `almalinux-10`,
+    /// `alma10`) pins one. The
     /// release string's grammar is distro-specific and enforced by
     /// [`KernelId::validate`], not `parse`: a distro name with a
     /// malformed release parses to this variant and is rejected at
@@ -180,6 +182,8 @@ pub enum DistroKind {
     /// Amazon Linux (`amazonlinux`, `amazonlinux-2023`, or shorthand
     /// `al2023`).
     AmazonLinux,
+    /// AlmaLinux (`almalinux`, `almalinux-10`, or shorthand `alma10`).
+    AlmaLinux,
 }
 
 /// Which git ref namespace a [`KernelId::Git`]'s `git_ref` names,
@@ -224,8 +228,9 @@ impl KernelId {
     ///   authors and CLI users can write whichever feels natural.
     /// - `/`-containing or `.`/`~`-prefixed → [`KernelId::Path`].
     /// - Version-shaped → [`KernelId::Version`].
-    /// - A distro name (`fedora` / `ubuntu` / `amazonlinux`, an
-    ///   explicit-release `NAME-REL`, or shorthand `f44` / `al2023`) →
+    /// - A distro name (`fedora` / `ubuntu` / `amazonlinux` /
+    ///   `almalinux`, an explicit-release `NAME-REL`, or shorthand
+    ///   `f44` / `al2023` / `alma10`) →
     ///   [`KernelId::Distro`]. The release grammar is checked by
     ///   `validate`, not here — a malformed release still classifies as
     ///   `Distro` (not `CacheKey`) so `validate` can reject it.
@@ -328,7 +333,8 @@ impl KernelId {
     ///   url/ref, or a `#sha=` that isn't a full 40-hex id.
     /// - [`KernelId::Distro`] whose explicit release does not match the
     ///   distro's grammar (Fedora `\d{2,3}`, Ubuntu `YY.MM`, Amazon
-    ///   Linux `\d{4}`). As with git, the parser defers the release
+    ///   Linux `\d{4}`, AlmaLinux `\d{1,2}`). As with git, the parser
+    ///   defers the release
     ///   check here so a malformed release classifies as `Distro`
     ///   rather than silently becoming a `CacheKey`.
     ///
@@ -443,6 +449,11 @@ impl KernelId {
                         rel.len() == 4 && all_digits(rel),
                         "a 4-digit year release (e.g. `amazonlinux-2023` or `al2023`)",
                     ),
+                    // 1-2 digit major, e.g. `9` / `10`.
+                    DistroKind::AlmaLinux => (
+                        (1..=2).contains(&rel.len()) && all_digits(rel),
+                        "a 1- or 2-digit major release (e.g. `almalinux-10` or `alma10`)",
+                    ),
                 };
                 if ok {
                     Ok(())
@@ -510,6 +521,7 @@ impl DistroKind {
             DistroKind::Fedora => "fedora",
             DistroKind::Ubuntu => "ubuntu",
             DistroKind::AmazonLinux => "amazonlinux",
+            DistroKind::AlmaLinux => "almalinux",
         }
     }
 }
@@ -519,8 +531,13 @@ impl DistroKind {
 ///
 /// Recognizes the long form — an exact distro name (`fedora`, release
 /// `None`) or `NAME-REL` (`fedora-44`) — and the shorthands `f<rel>`
-/// (Fedora) and `al<rel>` (Amazon Linux), where `<rel>` is a run of
-/// digits. The release portion is carried verbatim; its per-distro
+/// (Fedora), `alma<rel>` (AlmaLinux), and `al<rel>` (Amazon Linux),
+/// where `<rel>` is a run of digits. `alma` is matched before `al` so
+/// `alma10` never mis-parses as Amazon Linux release `ma10` (which the
+/// all-digits check would in fact reject into a cache key — the
+/// ordering keeps the intent explicit either way); a bare `al<digits>`
+/// (`al2023`, or a malformed `al9`) stays Amazon Linux.
+/// The release portion is carried verbatim; its per-distro
 /// digit grammar is enforced by [`KernelId::validate`], not here — so a
 /// name with a malformed release (`fedora-abc`, `f4`) classifies as
 /// `Distro` and surfaces an actionable validation error rather than a
@@ -532,6 +549,7 @@ fn parse_distro(s: &str) -> Option<KernelId> {
         ("fedora", DistroKind::Fedora),
         ("ubuntu", DistroKind::Ubuntu),
         ("amazonlinux", DistroKind::AmazonLinux),
+        ("almalinux", DistroKind::AlmaLinux),
     ] {
         if s == name {
             return Some(KernelId::Distro {
@@ -546,7 +564,12 @@ fn parse_distro(s: &str) -> Option<KernelId> {
             });
         }
     }
-    for (prefix, kind) in [("f", DistroKind::Fedora), ("al", DistroKind::AmazonLinux)] {
+    // `alma` before `al`: prefix matching is first-match-wins.
+    for (prefix, kind) in [
+        ("f", DistroKind::Fedora),
+        ("alma", DistroKind::AlmaLinux),
+        ("al", DistroKind::AmazonLinux),
+    ] {
         if let Some(rel) = s.strip_prefix(prefix)
             && !rel.is_empty()
             && rel.bytes().all(|b| b.is_ascii_digit())
@@ -1990,6 +2013,7 @@ mod tests {
             ("fedora", DistroKind::Fedora),
             ("ubuntu", DistroKind::Ubuntu),
             ("amazonlinux", DistroKind::AmazonLinux),
+            ("almalinux", DistroKind::AlmaLinux),
         ] {
             assert_eq!(
                 KernelId::parse(spec),
@@ -2025,10 +2049,17 @@ mod tests {
                 release: Some("2023".to_string()),
             },
         );
+        assert_eq!(
+            KernelId::parse("almalinux-10"),
+            KernelId::Distro {
+                kind: DistroKind::AlmaLinux,
+                release: Some("10".to_string()),
+            },
+        );
     }
 
-    /// `f44` and `al2023` shorthands map to the same variants their
-    /// long forms produce.
+    /// `f44`, `al2023`, and `alma10` shorthands map to the same
+    /// variants their long forms produce.
     #[test]
     fn kernel_id_parse_distro_shorthand() {
         assert_eq!(
@@ -2044,6 +2075,43 @@ mod tests {
                 kind: DistroKind::AmazonLinux,
                 release: Some("2023".to_string()),
             },
+        );
+        for (spec, rel) in [("alma9", "9"), ("alma10", "10")] {
+            assert_eq!(
+                KernelId::parse(spec),
+                KernelId::Distro {
+                    kind: DistroKind::AlmaLinux,
+                    release: Some(rel.to_string()),
+                },
+            );
+        }
+    }
+
+    /// Shorthand precedence: `alma<digits>` is AlmaLinux (matched
+    /// before the `al` prefix), while `al<digits>` stays Amazon Linux —
+    /// `al9` parses as Amazon Linux release `9` and is then REJECTED by
+    /// validate (not a 4-digit year), never silently read as
+    /// AlmaLinux 9.
+    #[test]
+    fn kernel_id_parse_distro_shorthand_alma_vs_al_precedence() {
+        assert_eq!(
+            KernelId::parse("al9"),
+            KernelId::Distro {
+                kind: DistroKind::AmazonLinux,
+                release: Some("9".to_string()),
+            },
+        );
+        let err = KernelId::parse("al9")
+            .validate()
+            .expect_err("al9 must fail amazonlinux release validation");
+        assert!(
+            err.contains("amazonlinux") && err.contains("4-digit"),
+            "al9 rejection must steer to the amazonlinux grammar: {err}",
+        );
+        // `alma` with no digits is not a spec at all.
+        assert_eq!(
+            KernelId::parse("alma"),
+            KernelId::CacheKey("alma".to_string()),
         );
     }
 
@@ -2106,6 +2174,12 @@ mod tests {
             "amazonlinux",
             "amazonlinux-2023",
             "al2023",
+            "almalinux",
+            "almalinux-8",
+            "almalinux-9",
+            "almalinux-10",
+            "alma9",
+            "alma10",
         ] {
             assert!(
                 KernelId::parse(spec).validate().is_ok(),
@@ -2140,6 +2214,16 @@ mod tests {
                 "amazonlinux spec {spec:?} must be rejected",
             );
         }
+        // AlmaLinux: more than 2 digits, non-digits.
+        for spec in ["almalinux-100", "alma100", "almalinux-abc"] {
+            let err = KernelId::parse(spec)
+                .validate()
+                .expect_err("almalinux spec must be rejected");
+            assert!(
+                err.contains("almalinux"),
+                "almalinux reject for {spec:?} must name the distro: {err}",
+            );
+        }
     }
 
     /// Distro Display renders the canonical long form; shorthand and
@@ -2160,7 +2244,16 @@ mod tests {
             "fedora-44",
             "shorthand renders in long form",
         );
-        for spec in ["fedora", "fedora-44", "f44", "ubuntu-24.04", "al2023"] {
+        for spec in [
+            "fedora",
+            "fedora-44",
+            "f44",
+            "ubuntu-24.04",
+            "al2023",
+            "almalinux",
+            "almalinux-10",
+            "alma9",
+        ] {
             let id = KernelId::parse(spec);
             assert_eq!(
                 KernelId::parse(&id.to_string()),
