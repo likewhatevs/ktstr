@@ -585,21 +585,61 @@ fn fedora_latest_from_json_picks_max_numeric() {
 
 // ---- Live smoke tests (network; run with --ignored) ---------------
 
+/// Shape checks every resolved package must satisfy: non-empty
+/// name/version, an `http(s)` URL, and a 64-hex sha256.
+fn assert_pkg_shape(p: &PackageRef) {
+    assert!(!p.name.is_empty(), "empty package name");
+    assert!(!p.version.is_empty(), "empty version for {}", p.name);
+    assert!(p.url.starts_with("http"), "bad url: {}", p.url);
+    assert_eq!(
+        p.sha256.len(),
+        64,
+        "sha256 not 64 hex: {} ({})",
+        p.sha256,
+        p.name
+    );
+    assert!(p.sha256.bytes().all(|c| c.is_ascii_hexdigit()));
+}
+
+/// Shape of a fully-resolved distro kernel that publishes debuginfo
+/// (every distro except SteamOS): non-empty tag/release, at least one
+/// kernel package, at least one debuginfo package, all well-shaped.
 fn assert_resolved_shape(r: &ResolvedDistroKernel) {
     assert!(!r.distro.is_empty());
     assert!(!r.kernel_release.is_empty());
     assert!(!r.packages.is_empty(), "no kernel packages resolved");
     assert!(!r.debuginfo.is_empty(), "no debuginfo resolved");
     for p in r.packages.iter().chain(r.debuginfo.iter()) {
-        assert!(p.url.starts_with("http"), "bad url: {}", p.url);
-        assert_eq!(
-            p.sha256.len(),
-            64,
-            "sha256 not 64 hex: {} ({})",
-            p.sha256,
-            p.name
-        );
-        assert!(p.sha256.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_pkg_shape(p);
+    }
+}
+
+/// Verify a resolved package URL exists upstream WITHOUT downloading its
+/// body: a ranged GET (`Range: bytes=0-0`) whose status we inspect and
+/// whose body we drop unread. Ranged GET rather than HEAD so the probe is
+/// robust against a mirror that rejects HEAD; a server that ignores the
+/// `Range` header still only ships headers here — the blocking body is
+/// lazily read and we never read it, so no full package is pulled.
+/// `ddebs.ubuntu.com` is plain http, which the shared client handles. A
+/// non-success status (notably 404) is a hard failure so an upstream
+/// URL/layout change trips CI in advance of any real download.
+fn assert_url_exists(url: &str) {
+    let resp = crate::fetch::shared_client()
+        .get(url)
+        .header(reqwest::header::RANGE, "bytes=0-0")
+        .send()
+        .unwrap_or_else(|e| panic!("existence probe for {url} failed: {e}"));
+    let status = resp.status();
+    assert!(
+        status.is_success(),
+        "package URL does not exist upstream ({status}): {url}",
+    );
+}
+
+/// Probe every resolved kernel + debuginfo URL for upstream existence.
+fn assert_urls_exist(r: &ResolvedDistroKernel) {
+    for p in r.packages.iter().chain(r.debuginfo.iter()) {
+        assert_url_exists(&p.url);
     }
 }
 
@@ -616,6 +656,7 @@ fn live_fedora() {
             r.debuginfo.iter().map(|p| &p.name).collect::<Vec<_>>(),
         );
         assert_resolved_shape(&r);
+        assert_urls_exist(&r);
     }
 }
 
@@ -632,6 +673,7 @@ fn live_ubuntu() {
             r.debuginfo.iter().map(|p| &p.name).collect::<Vec<_>>(),
         );
         assert_resolved_shape(&r);
+        assert_urls_exist(&r);
     }
 }
 
@@ -648,6 +690,7 @@ fn steamos_rejects_non_x86_64_before_any_fetch() {
 #[test]
 #[ignore = "hits the live SteamOS mirror"]
 fn live_steamos() {
+    // x86_64 only — Valve publishes no other architecture.
     let r = resolve_for_arch(DistroKind::SteamOs, None, "x86_64").unwrap();
     eprintln!(
         "steamos/x86_64: {} {} pkgs={:?}",
@@ -657,11 +700,13 @@ fn live_steamos() {
     );
     assert!(!r.packages.is_empty());
     assert!(r.packages[0].name.starts_with("linux-neptune"));
-    assert_eq!(r.packages[0].sha256.len(), 64);
-    assert!(r.packages[0].url.starts_with("http"));
+    for p in &r.packages {
+        assert_pkg_shape(p);
+    }
     // No debug packages exist for linux-neptune — the documented
     // mandatory-debuginfo exemption.
     assert!(r.debuginfo.is_empty());
+    assert_urls_exist(&r);
 }
 
 #[test]
@@ -681,5 +726,6 @@ fn live_amazonlinux() {
         // subpackage (virtio_console.ko lives there).
         assert_eq!(r.packages.len(), 2, "expected kernel + modules-extra");
         assert!(r.packages[1].name.ends_with("-modules-extra"));
+        assert_urls_exist(&r);
     }
 }

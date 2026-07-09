@@ -339,3 +339,98 @@ fn boot_modules_absent_dir_is_empty() {
     assert!(boot_modules_for_image(&dir.path().join("bzImage")).is_empty());
     assert!(ordered_boot_modules_in(&dir.path().join("modules")).is_empty());
 }
+
+// -- synthetic local-package boot fixture (CI-driven, #[ignore]) --
+
+/// Pack the already-built CI kernel (the tarball cache entry for
+/// `KTSTR_E2E_KERNEL_VERSION`) into a minimal synthetic `.rpm` at
+/// `KTSTR_E2E_RPM_OUT`, so the CI `local-package-boot` recipe can drive
+/// the local-package acquire+boot path end to end with ZERO network:
+/// `shell --kernel <that.rpm> --exec 'uname -r'` then extracts, gates,
+/// caches, and boots it.
+///
+/// The rpm carries the real boot image at `/boot/vmlinuz-<rel>` plus a
+/// minimal `/boot/config-<rel>` declaring the three boot-critical virtio
+/// options `=y`. A ktstr-built kernel always compiles those in (the
+/// build path requires them), so the config gate sees them builtin and
+/// the entry needs no module tree — the config-gate happy path. Reuses
+/// the same `rpm::PackageBuilder` fixture path the extract unit tests
+/// use.
+///
+/// `#[ignore]` because it reaches into the on-disk kernel cache and only
+/// makes sense under CI (which runs `kernel-build` first); the recipe
+/// invokes it by exact name with the two env vars set.
+#[test]
+#[ignore = "CI-only: packs the built kernel cache entry into an rpm for the boot e2e"]
+fn pack_built_kernel_into_synthetic_rpm() {
+    use crate::cache::KernelSource;
+
+    let version =
+        std::env::var("KTSTR_E2E_KERNEL_VERSION").expect("KTSTR_E2E_KERNEL_VERSION must be set");
+    let out =
+        PathBuf::from(std::env::var("KTSTR_E2E_RPM_OUT").expect("KTSTR_E2E_RPM_OUT must be set"));
+
+    // Newest-first list; take the first tarball build for this version.
+    let cache = CacheDir::new().expect("open kernel cache");
+    let entries = cache.list().expect("list cache");
+    let entry = entries
+        .iter()
+        .filter_map(|e| e.as_valid())
+        .find(|e| {
+            matches!(e.metadata.source, KernelSource::Tarball)
+                && e.metadata
+                    .version
+                    .as_deref()
+                    .is_some_and(|v| v.starts_with(&version))
+        })
+        .unwrap_or_else(|| {
+            panic!("no built (tarball) cache entry for kernel {version}; run kernel-build first")
+        });
+
+    let rel = entry
+        .metadata
+        .version
+        .clone()
+        .unwrap_or_else(|| version.clone());
+    let image = fs::read(entry.image_path()).expect("read cached boot image");
+    let image_mib = image.len() / (1024 * 1024);
+    let (arch, _) = crate::fetch::arch_info();
+
+    let mut builder = rpm::PackageBuilder::new(
+        "ktstr-synthetic-kernel",
+        "1.0.0",
+        "GPL-2.0-only",
+        arch,
+        "ktstr local-package boot e2e fixture",
+    );
+    builder.using_config(rpm::BuildConfig::default().compression(rpm::CompressionType::Zstd));
+    let files: [(String, Vec<u8>); 2] = [
+        (format!("/boot/vmlinuz-{rel}"), image),
+        (
+            format!("/boot/config-{rel}"),
+            b"CONFIG_VIRTIO=y\nCONFIG_VIRTIO_MMIO=y\nCONFIG_VIRTIO_CONSOLE=y\n".to_vec(),
+        ),
+    ];
+    for (path, body) in files {
+        builder
+            .with_file_contents(
+                body,
+                rpm::FileOptions::new(path.as_str()).permissions(0o644),
+            )
+            .expect("add rpm file");
+    }
+    let pkg = builder.build().expect("build synthetic rpm");
+    if let Some(parent) = out.parent() {
+        fs::create_dir_all(parent).expect("create output dir");
+    }
+    pkg.write_file(&out).expect("write synthetic rpm");
+
+    // The produced rpm must be a well-formed, host-arch package so the
+    // CLI boot step's acquire doesn't trip on a malformed fixture.
+    let produced_arch = package_arch(&out).expect("read produced rpm arch");
+    ensure_arch_matches_host(&produced_arch, &out).expect("synthetic rpm targets host arch");
+    eprintln!(
+        "packed kernel {rel} ({image_mib} MiB image) -> {}",
+        out.display()
+    );
+}
