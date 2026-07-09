@@ -56,7 +56,7 @@ pub const KERNEL_ID_GRAMMAR: &str = "exact version (`6.14`), inclusive range (`6
      `git+URL#sha=<40-hex>`), absolute or `~`-prefixed path, local kernel package \
      (`*.rpm`, `*.deb`, or `*.pkg.tar.zst`), distro kernel (`fedora`/`fedora-44`/`f44`, \
      `ubuntu`/`ubuntu-24.04`, `amazonlinux`/`amazonlinux-2023`/`al2023`, \
-     `almalinux`/`almalinux-10`/`alma10`, `steamos`/`steamos-3.8`), or cache key";
+     `steamos`/`steamos-3.8`), or cache key";
 
 /// Kernel identifier: filesystem path, version string, cache key,
 /// stable-release range, or git source.
@@ -70,9 +70,9 @@ pub const KERNEL_ID_GRAMMAR: &str = "exact version (`6.14`), inclusive range (`6
 /// - Contains `..` between two version-shaped tokens:
 ///   [`KernelId::Range`] (inclusive on both endpoints)
 /// - Matches `MAJOR.MINOR[.PATCH][-rcN]`: [`KernelId::Version`]
-/// - A distro name (`fedora` / `ubuntu` / `amazonlinux` / `almalinux` /
+/// - A distro name (`fedora` / `ubuntu` / `amazonlinux` /
 ///   `steamos`, an explicit-release `NAME-REL`, or shorthand `f44` /
-///   `al2023` / `alma10`): [`KernelId::Distro`]
+///   `al2023`): [`KernelId::Distro`]
 /// - Otherwise: [`KernelId::CacheKey`]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KernelId {
@@ -157,8 +157,8 @@ pub enum KernelId {
     /// named distribution and (optional) release. A bare distro name
     /// (`fedora`) leaves `release` `None` — the resolver picks the
     /// distro's default; an explicit release (`fedora-44`, `f44`,
-    /// `ubuntu-24.04`, `amazonlinux-2023`, `al2023`, `almalinux-10`,
-    /// `alma10`, `steamos-3.8`) pins one. The
+    /// `ubuntu-24.04`, `amazonlinux-2023`, `al2023`,
+    /// `steamos-3.8`) pins one. The
     /// release string's grammar is distro-specific and enforced by
     /// [`KernelId::validate`], not `parse`: a distro name with a
     /// malformed release parses to this variant and is rejected at
@@ -183,8 +183,6 @@ pub enum DistroKind {
     /// Amazon Linux (`amazonlinux`, `amazonlinux-2023`, or shorthand
     /// `al2023`).
     AmazonLinux,
-    /// AlmaLinux (`almalinux`, `almalinux-10`, or shorthand `alma10`).
-    AlmaLinux,
     /// SteamOS (`steamos`, or a pinned channel `steamos-3.8`).
     /// x86_64 only — Valve publishes no other architecture.
     SteamOs,
@@ -234,8 +232,8 @@ impl KernelId {
     /// - `/`-containing or `.`/`~`-prefixed → [`KernelId::Path`].
     /// - Version-shaped → [`KernelId::Version`].
     /// - A distro name (`fedora` / `ubuntu` / `amazonlinux` /
-    ///   `almalinux` / `steamos`, an explicit-release `NAME-REL`, or
-    ///   shorthand `f44` / `al2023` / `alma10`) →
+    ///   `steamos`, an explicit-release `NAME-REL`, or
+    ///   shorthand `f44` / `al2023`) →
     ///   [`KernelId::Distro`]. The release grammar is checked by
     ///   `validate`, not here — a malformed release still classifies as
     ///   `Distro` (not `CacheKey`) so `validate` can reject it.
@@ -338,7 +336,7 @@ impl KernelId {
     ///   url/ref, or a `#sha=` that isn't a full 40-hex id.
     /// - [`KernelId::Distro`] whose explicit release does not match the
     ///   distro's grammar (Fedora `\d{2,3}`, Ubuntu `YY.MM`, Amazon
-    ///   Linux `\d{4}`, AlmaLinux `\d{1,2}`, SteamOS
+    ///   Linux `\d{4}`, SteamOS
     ///   `\d{1,2}.\d{1,2}`). As with git, the parser defers the
     ///   release
     ///   check here so a malformed release classifies as `Distro`
@@ -455,11 +453,6 @@ impl KernelId {
                         rel.len() == 4 && all_digits(rel),
                         "a 4-digit year release (e.g. `amazonlinux-2023` or `al2023`)",
                     ),
-                    // 1-2 digit major, e.g. `9` / `10`.
-                    DistroKind::AlmaLinux => (
-                        (1..=2).contains(&rel.len()) && all_digits(rel),
-                        "a 1- or 2-digit major release (e.g. `almalinux-10` or `alma10`)",
-                    ),
                     // `MAJOR.MINOR` channel version, e.g. `3.8`.
                     DistroKind::SteamOs => (
                         matches!(rel.split_once('.'), Some((maj, min))
@@ -534,7 +527,6 @@ impl DistroKind {
             DistroKind::Fedora => "fedora",
             DistroKind::Ubuntu => "ubuntu",
             DistroKind::AmazonLinux => "amazonlinux",
-            DistroKind::AlmaLinux => "almalinux",
             DistroKind::SteamOs => "steamos",
         }
     }
@@ -545,12 +537,11 @@ impl DistroKind {
 ///
 /// Recognizes the long form — an exact distro name (`fedora`, release
 /// `None`) or `NAME-REL` (`fedora-44`) — and the shorthands `f<rel>`
-/// (Fedora), `alma<rel>` (AlmaLinux), and `al<rel>` (Amazon Linux),
-/// where `<rel>` is a run of digits. `alma` is matched before `al` so
-/// `alma10` never mis-parses as Amazon Linux release `ma10` (which the
-/// all-digits check would in fact reject into a cache key — the
-/// ordering keeps the intent explicit either way); a bare `al<digits>`
-/// (`al2023`, or a malformed `al9`) stays Amazon Linux.
+/// (Fedora) and `al<rel>` (Amazon Linux), where `<rel>` is a run of
+/// digits. A bare `al<digits>` (`al2023`, or a malformed `al9`) is
+/// Amazon Linux; a non-digit remainder (`alma9`, whose `al`-stripped
+/// tail `ma9` is not all digits) is not a distro spec and stays a
+/// cache key.
 /// The release portion is carried verbatim; its per-distro
 /// digit grammar is enforced by [`KernelId::validate`], not here — so a
 /// name with a malformed release (`fedora-abc`, `f4`) classifies as
@@ -563,7 +554,6 @@ fn parse_distro(s: &str) -> Option<KernelId> {
         ("fedora", DistroKind::Fedora),
         ("ubuntu", DistroKind::Ubuntu),
         ("amazonlinux", DistroKind::AmazonLinux),
-        ("almalinux", DistroKind::AlmaLinux),
         ("steamos", DistroKind::SteamOs),
     ] {
         if s == name {
@@ -579,12 +569,7 @@ fn parse_distro(s: &str) -> Option<KernelId> {
             });
         }
     }
-    // `alma` before `al`: prefix matching is first-match-wins.
-    for (prefix, kind) in [
-        ("f", DistroKind::Fedora),
-        ("alma", DistroKind::AlmaLinux),
-        ("al", DistroKind::AmazonLinux),
-    ] {
+    for (prefix, kind) in [("f", DistroKind::Fedora), ("al", DistroKind::AmazonLinux)] {
         if let Some(rel) = s.strip_prefix(prefix)
             && !rel.is_empty()
             && rel.bytes().all(|b| b.is_ascii_digit())

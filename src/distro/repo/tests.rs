@@ -431,29 +431,6 @@ fn parse_mirror_list_normalizes_trailing_slash() {
     assert_eq!(parse_mirror_list("\n\n"), None);
 }
 
-// ---- AlmaLinux directory listing -----------------------------------
-
-#[test]
-fn alma_latest_major_picks_numeric_dirs_only() {
-    // Shape of the live repo.almalinux.org/almalinux/ listing: bare
-    // majors, point releases, key files, and rpms.
-    let html = r#"<html><body><pre>
-<a href="../">../</a>
-<a href="10/">10/</a>
-<a href="10.2/">10.2/</a>
-<a href="8/">8/</a>
-<a href="8.10/">8.10/</a>
-<a href="9/">9/</a>
-<a href="9.8/">9.8/</a>
-<a href="almalinux-release-latest-10.x86_64.rpm">almalinux-release-latest-10.x86_64.rpm</a>
-<a href="RPM-GPG-KEY-AlmaLinux">RPM-GPG-KEY-AlmaLinux</a>
-</pre></body></html>"#;
-    // 10 beats 9 numerically (a lexical max would pick 9); point
-    // releases (10.2) and non-numeric entries are skipped.
-    assert_eq!(alma_latest_major(html), Some(10));
-    assert_eq!(alma_latest_major("<html>no releases</html>"), None);
-}
-
 // ---- SteamOS pacman channels ---------------------------------------
 
 const NEPTUNE_DESC: &str = "\
@@ -655,25 +632,6 @@ fn live_ubuntu() {
             r.debuginfo.iter().map(|p| &p.name).collect::<Vec<_>>(),
         );
         assert_resolved_shape(&r);
-    }
-}
-
-#[test]
-#[ignore = "hits the live AlmaLinux CDN + vault"]
-fn live_almalinux() {
-    for arch in ["x86_64", "aarch64"] {
-        let r = resolve_for_arch(DistroKind::AlmaLinux, None, arch).unwrap();
-        eprintln!(
-            "almalinux/{arch}: {} {} pkgs={:?} dbg={:?}",
-            r.distro,
-            r.kernel_release,
-            r.packages.iter().map(|p| &p.name).collect::<Vec<_>>(),
-            r.debuginfo.iter().map(|p| &p.name).collect::<Vec<_>>(),
-        );
-        assert_resolved_shape(&r);
-        // kernel-core (image) + kernel-modules-core (virtio .kos).
-        assert_eq!(r.packages.len(), 2);
-        assert_eq!(r.packages[1].name, "kernel-modules-core");
     }
 }
 

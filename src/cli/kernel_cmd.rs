@@ -244,7 +244,6 @@ pub const KERNEL_HELP_NO_RAW: &str = "Kernel identifier — one of: \
      (6) a prebuilt distro kernel — `fedora` / `fedora-44` / `f44`, \
      `ubuntu` / `ubuntu-24.04` (resolves to the latest LTS HWE kernel), \
      `amazonlinux` / `amazonlinux-2023` / `al2023`, \
-     `almalinux` / `almalinux-10` / `alma10`, \
      `steamos` / `steamos-3.8` (a bare distro name picks \
      the distro's current release); or \
      (7) a cache key (see `kernel list`). Raw \
@@ -280,7 +279,6 @@ pub const KERNEL_HELP_RAW_OK: &str = "Kernel identifier — one of: \
      (5) a prebuilt distro kernel — `fedora` / `fedora-44` / `f44`, \
      `ubuntu` / `ubuntu-24.04` (resolves to the latest LTS HWE kernel), \
      `amazonlinux` / `amazonlinux-2023` / `al2023`, \
-     `almalinux` / `almalinux-10` / `alma10`, \
      `steamos` / `steamos-3.8`; or \
      (6) a cache key (see `kernel list`). Source directories auto-build \
      (can be slow on a fresh tree); versions auto-download from kernel.org \
@@ -315,7 +313,6 @@ pub const KERNEL_HELP_BUILD: &str = "Kernel to build (or, for a prebuilt \
      or (6) a prebuilt distro kernel — `fedora` / `fedora-44` / `f44`, \
      `ubuntu` / `ubuntu-24.04` (resolves to the latest LTS HWE kernel), \
      `amazonlinux` / `amazonlinux-2023` / `al2023`, \
-     `almalinux` / `almalinux-10` / `alma10`, \
      `steamos` / `steamos-3.8`. Omitted, the latest \
      stable release is built. For a local package or distro spec, `build` \
      downloads/unpacks the prebuilt kernel into the cache rather than \

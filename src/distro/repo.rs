@@ -38,24 +38,6 @@
 //!   the same EVR; debuginfo (`<stream>-debuginfo`, which carries the
 //!   full vmlinux on its own) comes from the sibling `debuginfo`
 //!   mirror.
-//! - **AlmaLinux** — official CDN `https://repo.almalinux.org/almalinux/`.
-//!   The latest release is the highest all-numeric major directory in
-//!   the top-level listing (the bare `{major}/` dir tracks the newest
-//!   point release: `10/` and `10.2/` serve identical repomd
-//!   revisions, verified live). Kernel packages come from
-//!   `{major}/BaseOS/{arch}/os/` repodata with the RHEL-style split:
-//!   `kernel-core` carries vmlinuz/config/System.map and
-//!   `kernel-modules-core` the virtio `.ko.xz` set including
-//!   `virtio_console` (verified against the live filelists; the
-//!   `kernel-modules`/`-extra` subpackages add nothing ktstr boots
-//!   with). debuginfo (`kernel-debuginfo`, which carries the full
-//!   vmlinux) is published on `https://vault.almalinux.org/` under
-//!   `{major}/BaseOS/debug/{arch}/`, versioned in lockstep with the
-//!   os repo. NOTE: el9/el10 x86_64 kernels build with
-//!   `CONFIG_VIRTIO_MMIO` unset (verified from the extracted
-//!   kernel-core config), so acquisition currently stops at the
-//!   config gate — ktstr's console/control port needs the
-//!   virtio-MMIO transport.
 //! - **SteamOS** — Valve's official package mirror
 //!   `https://steamdeck-packages.steamos.cloud/archlinux-mirror/`.
 //!   The kernel lives in the `jupiter-<MAJOR.MINOR>` channels (Valve's
@@ -153,7 +135,6 @@ pub(crate) fn resolve_for_arch(
         DistroKind::Fedora => resolve_fedora(release, arch),
         DistroKind::Ubuntu => resolve_ubuntu(release, arch),
         DistroKind::AmazonLinux => resolve_amazonlinux(release, arch),
-        DistroKind::AlmaLinux => resolve_almalinux(release, arch),
         DistroKind::SteamOs => resolve_steamos(release, arch),
     }
 }
@@ -1155,64 +1136,6 @@ fn resolve_amazonlinux(_release: Option<&str>, arch: &str) -> Result<ResolvedDis
 fn al2023_repo_base(mirror_url: &str) -> Result<String> {
     let list = crate::fetch::fetch_metadata_text(mirror_url, "fetch")?;
     parse_mirror_list(&list).ok_or_else(|| anyhow!("empty mirror.list at {mirror_url}"))
-}
-
-const ALMA_MIRROR: &str = "https://repo.almalinux.org/almalinux/";
-const ALMA_VAULT: &str = "https://vault.almalinux.org/";
-
-/// Highest all-numeric major release directory (`8/`, `9/`, `10/`) in
-/// the AlmaLinux top-level directory listing. Point-release dirs
-/// (`10.2/`) and non-release entries (`RPM-GPG-KEY-...`, rpms) carry a
-/// dot or non-digits and are skipped. The bare major dir tracks the
-/// newest point release (same repomd revision, verified live), so it
-/// is the right "latest" target without enumerating point releases.
-fn alma_latest_major(listing_html: &str) -> Option<u32> {
-    listing_html
-        .split("href=\"")
-        .skip(1)
-        .filter_map(|rest| rest.split_once('\"').map(|(href, _)| href))
-        .filter_map(|href| href.strip_suffix('/'))
-        .filter(|dir| !dir.is_empty() && dir.bytes().all(|b| b.is_ascii_digit()))
-        .filter_map(|dir| dir.parse().ok())
-        .max()
-}
-
-fn resolve_almalinux(release: Option<&str>, arch: &str) -> Result<ResolvedDistroKernel> {
-    let major = match release {
-        Some(r) => r.to_string(),
-        None => {
-            let listing = crate::fetch::fetch_metadata_text(ALMA_MIRROR, "fetch")?;
-            alma_latest_major(&listing)
-                .ok_or_else(|| anyhow!("no numeric release directory under {ALMA_MIRROR}"))?
-                .to_string()
-        }
-    };
-
-    // RHEL-style split: `kernel-core` (vmlinuz + config + System.map)
-    // and `kernel-modules-core` (the virtio .ko.xz set, virtio_console
-    // included). Both are load-bearing, so both are strict.
-    let base = format!("{ALMA_MIRROR}{major}/BaseOS/{arch}/os/");
-    let pkg_names = ["kernel-core", "kernel-modules-core"];
-    let cands = fetch_repo_candidates(&base, &pkg_names)?;
-    let target = newest_evr(&cands, "kernel-core")
-        .ok_or_else(|| anyhow!("no kernel-core found in AlmaLinux {major} repo for {arch}"))?;
-    let packages = build_package_set(&cands, &base, &pkg_names, &target, true)?;
-
-    // `kernel-debuginfo` alone carries the full vmlinux
-    // (`/usr/lib/debug/lib/modules/<rel>/vmlinux`); the
-    // `-common-{arch}` sibling only adds `/usr/src/debug` sources.
-    let debug_base = format!("{ALMA_VAULT}{major}/BaseOS/debug/{arch}/");
-    let debug_names = ["kernel-debuginfo"];
-    let debug_cands = fetch_repo_candidates(&debug_base, &debug_names)?;
-    let debuginfo = build_package_set(&debug_cands, &debug_base, &debug_names, &target, true)?;
-
-    Ok(ResolvedDistroKernel {
-        distro: format!("almalinux{major}"),
-        kernel_release: target.display(),
-        arch: arch.to_string(),
-        packages,
-        debuginfo,
-    })
 }
 
 const STEAMOS_MIRROR: &str = "https://steamdeck-packages.steamos.cloud/archlinux-mirror/";
