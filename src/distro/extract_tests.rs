@@ -453,6 +453,46 @@ fn debuginfo_vmlinux_pickup() {
     assert_eq!(fs::read(vmlinux).unwrap(), b"\x7fELF-fake-vmlinux");
 }
 
+/// The distro acquire path extracts the kernel packages first (gating
+/// before any debuginfo download), then runs a SECOND extraction pass
+/// for the debuginfo via `extract_vmlinux` into the same dest. Pin that
+/// the second pass merges onto the already-populated tree and recovers
+/// vmlinux at the known release.
+#[test]
+fn extract_vmlinux_second_pass_merges_into_existing_tree() {
+    let tmp = TempDir::new().unwrap();
+    let kernel = tmp.path().join("kernel-core.rpm");
+    build_rpm(
+        &kernel,
+        "kernel-core",
+        host_rpm_arch(),
+        &kernel_rpm_files(),
+        rpm::CompressionType::Zstd,
+    );
+    let dest = tmp.path().join("out");
+    let k = extract_kernel_packages(&[&kernel], &dest).expect("extract kernel");
+    assert!(
+        k.vmlinux.is_none(),
+        "no debuginfo supplied to the first pass"
+    );
+
+    let debug = tmp.path().join("kernel-debuginfo.rpm");
+    let vmlinux_path = concat_leak("usr/lib/debug/lib/modules/", "/vmlinux");
+    build_rpm(
+        &debug,
+        "kernel-debuginfo",
+        host_rpm_arch(),
+        &[(vmlinux_path, b"\x7fELF-fake-vmlinux".to_vec())],
+        rpm::CompressionType::Zstd,
+    );
+    let vmlinux = extract_vmlinux(&[&debug], &dest, &k.kernel_release)
+        .expect("second pass")
+        .expect("vmlinux recovered");
+    assert_eq!(fs::read(&vmlinux).unwrap(), b"\x7fELF-fake-vmlinux");
+    // The first pass's artifacts must still be present under the tree.
+    assert!(k.image.exists(), "kernel image survives the second pass");
+}
+
 #[test]
 fn arch_mismatch_is_rejected() {
     let tmp = TempDir::new().unwrap();

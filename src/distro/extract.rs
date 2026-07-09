@@ -154,6 +154,41 @@ pub fn extract_kernel_packages(packages: &[&Path], dest: &Path) -> Result<Extrac
     })
 }
 
+/// Extract debuginfo package(s) into `dest` — merging onto a kernel
+/// tree already materialized there by [`extract_kernel_packages`] — and
+/// return the `vmlinux` path they carry, if any.
+///
+/// Split out from [`extract_kernel_packages`] so the distro acquisition
+/// path can run its config gate on the kernel packages BEFORE fetching
+/// the (mandatory, up to ~1 GiB) debuginfo: a kernel that cannot boot
+/// under ktstr fails at the gate with no debuginfo bytes crossing the
+/// wire. `release` is the kernel release already discovered from the
+/// kernel tree; the lookup uses the same `vmlinux` candidates
+/// [`extract_kernel_packages`] checks. A second extraction pass into the
+/// same `dest` is safe — the debuginfo packages only add
+/// `usr/lib/debug/…` paths and are arch-checked like any package.
+pub fn extract_vmlinux(packages: &[&Path], dest: &Path, release: &str) -> Result<Option<PathBuf>> {
+    let dest = dest
+        .canonicalize()
+        .with_context(|| format!("canonicalize destination {}", dest.display()))?;
+    for pkg in packages {
+        let arch = package_arch(pkg)?;
+        ensure_arch_matches_host(&arch, pkg)?;
+        match package_kind(pkg)? {
+            PackageKind::Rpm => extract_rpm(pkg, &dest)?,
+            PackageKind::Deb => extract_deb(pkg, &dest)?,
+            PackageKind::Pacman => extract_pacman(pkg, &dest)?,
+        }
+    }
+    Ok(find_first(
+        &dest,
+        &[
+            format!("usr/lib/debug/lib/modules/{release}/vmlinux"),
+            format!("usr/lib/debug/boot/vmlinux-{release}"),
+        ],
+    ))
+}
+
 /// Fold the usrmerge module layout onto the classic one.
 ///
 /// Newer Ubuntu debs ship modules under `usr/lib/modules/<rel>/`

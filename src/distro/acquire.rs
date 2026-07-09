@@ -44,10 +44,10 @@ use sha2::{Digest, Sha256};
 
 use crate::cache::{CacheArtifacts, CacheDir, KernelMetadata, KernelSource};
 use crate::distro::extract::{
-    ExtractedKernel, ensure_arch_matches_host, extract_kernel_packages, module_closure,
-    package_arch,
+    ExtractedKernel, ensure_arch_matches_host, extract_kernel_packages, extract_vmlinux,
+    module_closure, package_arch,
 };
-use crate::distro::repo::{DistroKind, ResolvedDistroKernel, resolve_distro_kernel};
+use crate::distro::repo::{DistroKind, PackageRef, ResolvedDistroKernel, resolve_distro_kernel};
 
 /// Kernel config options whose driver the ktstr VMM needs present in
 /// SOME form for EVERY guest boot, mapped to the module ktstr must load
@@ -327,22 +327,23 @@ fn select_boot_modules(extracted: &ExtractedKernel, gate: &GateResult) -> Result
     Ok(out)
 }
 
-/// Gate the config, select boot modules, and atomically install the
-/// extracted kernel into the cache under `cache_key`. Returns the cache
-/// entry directory. Shared tail of the distro and local-package paths.
+/// Atomically install the extracted kernel + already-selected boot
+/// modules into the cache under `cache_key`. Returns the cache entry
+/// directory. Shared tail of the distro and local-package paths; the
+/// config gate and boot-module selection run in the caller (before this)
+/// so the distro path can gate a kernel before downloading its
+/// debuginfo.
 fn install_extracted(
     cache_key: &str,
     extracted: &ExtractedKernel,
+    modules: &[PathBuf],
     source: KernelSource,
 ) -> Result<PathBuf> {
-    let gate = gate_config(extracted)?;
-    let modules = select_boot_modules(extracted, &gate)?;
-
     let (arch, image_name) = crate::fetch::arch_info();
     let meta = KernelMetadata::new(source, arch, image_name, crate::test_support::now_iso8601())
         .with_version(&extracted.kernel_release);
 
-    let mut artifacts = CacheArtifacts::new(&extracted.image).with_modules(&modules);
+    let mut artifacts = CacheArtifacts::new(&extracted.image).with_modules(modules);
     if let Some(vmlinux) = extracted.vmlinux.as_deref() {
         artifacts = artifacts.with_vmlinux(vmlinux);
     }
@@ -448,13 +449,17 @@ fn sha256_file(path: &Path) -> Result<String> {
 /// return its cache-entry directory.
 ///
 /// Resolves repo metadata, composes the cache key, and on a hit returns
-/// immediately. On a miss: downloads every kernel package AND its
-/// debuginfo with sha256 verification, checks each against the host
-/// arch, extracts, runs the config gate + boot-module selection, and
-/// installs atomically. Debuginfo is mandatory for every distro whose
-/// repos publish it (the resolvers fail hard on a missing package); a
-/// distro that publishes none (SteamOS) resolves with an empty
-/// debuginfo set and proceeds with a warning naming what degrades.
+/// immediately. On a miss: downloads the kernel image/modules packages
+/// with sha256 verification, checks each against the host arch,
+/// extracts, and runs the config gate + boot-module selection — all
+/// BEFORE fetching the debuginfo, so an unsupported kernel fails without
+/// any (up to ~1 GiB) debuginfo bytes crossing the wire. Only once the
+/// gate passes does it download + extract the debuginfo, merge its
+/// vmlinux, and install atomically. Debuginfo is mandatory for every
+/// distro whose repos publish it (the resolvers fail hard on a missing
+/// package); a distro that publishes none (SteamOS) resolves with an
+/// empty debuginfo set and proceeds with a warning naming what
+/// degrades.
 pub fn acquire_distro_kernel(
     kind: DistroKind,
     release: Option<&str>,
@@ -505,11 +510,9 @@ pub fn acquire_distro_kernel(
     let download_dir = scratch.path().join("pkgs");
     fs::create_dir_all(&download_dir)?;
 
-    // Download every package (kernel image/modules first, then the
-    // mandatory debuginfo) sequentially, each with its own progress
-    // line and its own sha256 verification against the repo metadata.
-    let mut local_paths: Vec<PathBuf> = Vec::new();
-    for pkg in resolved.packages.iter().chain(resolved.debuginfo.iter()) {
+    // Download one package with its own progress line + sha256 check,
+    // then guard it against the host arch before it is unpacked.
+    let download = |pkg: &PackageRef| -> Result<PathBuf> {
         let file_name = pkg
             .url
             .rsplit('/')
@@ -527,13 +530,40 @@ pub fn acquire_distro_kernel(
         )
         .with_context(|| format!("download {}", pkg.name))?;
         ensure_arch_matches_host(&package_arch(&dest)?, &dest)?;
-        local_paths.push(dest);
-    }
+        Ok(dest)
+    };
 
+    // Download + extract the kernel image/modules packages FIRST, then
+    // gate the config and select boot modules — all before touching the
+    // mandatory (up to ~1 GiB) debuginfo. A kernel that cannot boot
+    // under ktstr (e.g. one built without CONFIG_VIRTIO_MMIO) fails at
+    // the gate here with no debuginfo bytes fetched.
     let extract_dir = scratch.path().join("tree");
-    let refs: Vec<&Path> = local_paths.iter().map(PathBuf::as_path).collect();
-    let extracted = extract_kernel_packages(&refs, &extract_dir)
+    let kernel_paths: Vec<PathBuf> = resolved
+        .packages
+        .iter()
+        .map(&download)
+        .collect::<Result<_>>()?;
+    let kernel_refs: Vec<&Path> = kernel_paths.iter().map(PathBuf::as_path).collect();
+    let mut extracted = extract_kernel_packages(&kernel_refs, &extract_dir)
         .with_context(|| format!("extract {} packages", resolved.distro))?;
+
+    let gate = gate_config(&extracted)?;
+    let modules = select_boot_modules(&extracted, &gate)?;
+
+    // Gate passed — only now fetch the debuginfo and merge its vmlinux
+    // into the extracted set. SteamOS publishes none (debuginfo empty,
+    // warned about above) and is skipped here.
+    if !resolved.debuginfo.is_empty() {
+        let debug_paths: Vec<PathBuf> = resolved
+            .debuginfo
+            .iter()
+            .map(&download)
+            .collect::<Result<_>>()?;
+        let debug_refs: Vec<&Path> = debug_paths.iter().map(PathBuf::as_path).collect();
+        extracted.vmlinux = extract_vmlinux(&debug_refs, &extract_dir, &extracted.kernel_release)
+            .with_context(|| format!("extract {} debuginfo", resolved.distro))?;
+    }
 
     let packages_meta: Vec<String> = resolved
         .packages
@@ -545,7 +575,7 @@ pub fn acquire_distro_kernel(
         distro: resolved.distro.clone(),
         packages: packages_meta,
     };
-    install_extracted(&cache_key, &extracted, source)
+    install_extracted(&cache_key, &extracted, &modules, source)
 }
 
 /// Acquire a kernel from one or more local `.rpm`/`.deb` files into the
@@ -587,6 +617,8 @@ pub fn acquire_package_kernel(paths: &[PathBuf]) -> Result<PathBuf> {
     let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
     let extracted = extract_kernel_packages(&refs, &extract_dir)
         .with_context(|| "extract local kernel packages")?;
+    let gate = gate_config(&extracted)?;
+    let modules = select_boot_modules(&extracted, &gate)?;
 
     let packages_meta: Vec<String> = paths
         .iter()
@@ -595,7 +627,7 @@ pub fn acquire_package_kernel(paths: &[PathBuf]) -> Result<PathBuf> {
     let source = KernelSource::LocalPackage {
         packages: packages_meta,
     };
-    install_extracted(&cache_key, &extracted, source)
+    install_extracted(&cache_key, &extracted, &modules, source)
 }
 
 #[cfg(test)]
