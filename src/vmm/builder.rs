@@ -82,6 +82,11 @@ pub struct KtstrVmBuilder {
     sched_enable_cmds: Vec<String>,
     sched_disable_cmds: Vec<String>,
     include_files: Vec<(String, PathBuf)>,
+    /// Raw (already-decompressed) `.ko` images to load in the guest,
+    /// in load order, before it touches any virtio device. Empty for
+    /// ktstr-built kernels (virtio =y); populated for prebuilt distro
+    /// kernels (virtio =m). See [`KtstrVmBuilder::kernel_modules`].
+    kernel_modules: Vec<PathBuf>,
     /// v0 holds at most one DiskConfig; rendered as `/dev/vda`.
     /// The optional single virtio-blk disk (set by `.disk()`). ktstr wires one
     /// blk device; a single backing disk suffices for scheduler tests.
@@ -259,6 +264,7 @@ impl Default for KtstrVmBuilder {
             sched_enable_cmds: Vec::new(),
             sched_disable_cmds: Vec::new(),
             include_files: Vec::new(),
+            kernel_modules: Vec::new(),
             disk: None,
             networks: Vec::new(),
             busybox_bytes: None,
@@ -738,6 +744,19 @@ impl KtstrVmBuilder {
         self
     }
 
+    /// Kernel modules to load in the guest before it touches any virtio
+    /// device, in load order. Each path is a raw (already-decompressed)
+    /// `.ko`; the guest's `rust_init` loads them via `finit_module(2)`
+    /// right after mounting devtmpfs. Required for prebuilt distro
+    /// kernels that ship virtio (blk/console/net) as modules; leave
+    /// empty for ktstr-built kernels (virtio =y). The caller owns
+    /// dependency ordering — modules are loaded exactly as given.
+    #[allow(dead_code)]
+    pub fn kernel_modules(mut self, modules: Vec<PathBuf>) -> Self {
+        self.kernel_modules = modules;
+        self
+    }
+
     /// Attach a disk to the VM. Each call replaces any previously
     /// attached disk; the framework reserves a single MMIO + IRQ
     /// pair, so today the VM exposes at most one virtio-blk device
@@ -1117,6 +1136,7 @@ impl KtstrVmBuilder {
             sched_enable_cmds: self.sched_enable_cmds,
             sched_disable_cmds: self.sched_disable_cmds,
             include_files: self.include_files,
+            kernel_modules: self.kernel_modules,
             disk: self.disk,
             networks: self.networks,
             busybox_bytes: self.busybox_bytes,

@@ -1136,6 +1136,19 @@ pub struct SuffixParams<'a> {
     /// file emitted ⇒ scheduler runs at the cgroup root without
     /// explicit framework placement.
     pub scheduler_cgroup_parent: Option<&'a str>,
+    /// Kernel modules to load in the guest, in caller-determined load
+    /// order. Each is a raw (already-decompressed) `.ko`; `build_suffix`
+    /// embeds them under `modules/NNN-<filename>` (zero-padded index) so
+    /// a lexical sort in the guest reproduces this slice's order. The
+    /// guest's `rust_init::load_kernel_modules` loads them via
+    /// `finit_module(2)` right after mounting devtmpfs and BEFORE
+    /// touching any virtio device — required for prebuilt distro kernels
+    /// that ship virtio (blk/console/net) as modules. Empty ⇒ no
+    /// `modules/` entries are emitted and the suffix bytes are identical
+    /// to the pre-module output; the ktstr-built kernels pin virtio =y
+    /// and pass an empty slice. Which modules to include is the caller's
+    /// decision (host integration derives them from the target kernel).
+    pub kernel_modules: &'a [PathBuf],
 }
 
 /// Build the suffix that completes a base archive: `/init` (the
@@ -1243,6 +1256,39 @@ pub fn build_suffix(base_len: usize, params: &SuffixParams<'_>) -> Result<Vec<u8
         );
         let data = args.join("\n");
         write_entry(&mut suffix, &archive_path, data.as_bytes(), 0o100644)?;
+    }
+
+    // Kernel modules for the guest to load before touching any virtio
+    // device. Emitted only when non-empty so the zero-module suffix is
+    // byte-identical to the pre-module output. The `modules` directory
+    // entry is written first — the base archive never registers it, and
+    // the kernel's cpio extractor silently drops a file whose parent
+    // directory entry has not yet appeared (same requirement documented
+    // in `build_initramfs_base`'s `register_parent_dirs` loop). Each
+    // module rides at `modules/NNN-<filename>`: the zero-padded index
+    // makes the guest's lexical readdir sort reproduce this slice's
+    // caller-chosen load order (see
+    // `rust_init::load_kernel_modules`). Modules are copied verbatim —
+    // they are already-decompressed `.ko` images the caller resolved
+    // from the target kernel, so no `strip_debug` (which only knows the
+    // userspace ELF section set).
+    if !params.kernel_modules.is_empty() {
+        write_entry(&mut suffix, "modules", &[], 0o40755)?;
+        for (idx, module) in params.kernel_modules.iter().enumerate() {
+            let file_name = module
+                .file_name()
+                .and_then(|n| n.to_str())
+                .with_context(|| {
+                    format!(
+                        "kernel module path has no valid filename: {}",
+                        module.display()
+                    )
+                })?;
+            let data = std::fs::read(module)
+                .with_context(|| format!("read kernel module: {}", module.display()))?;
+            let archive_path = format!("modules/{idx:03}-{file_name}");
+            write_entry(&mut suffix, &archive_path, &data, 0o100644)?;
+        }
     }
 
     // Sentinel: the LAST entry before the trailer. The kernel extracts the

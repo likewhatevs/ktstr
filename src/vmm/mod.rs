@@ -455,6 +455,15 @@ pub struct KtstrVm {
     /// Files to include in the guest initramfs at their archive paths.
     /// Each entry is (archive_path, host_path).
     pub(crate) include_files: Vec<(String, PathBuf)>,
+    /// Raw (already-decompressed) `.ko` images the guest loads via
+    /// `finit_module(2)` before touching any virtio device, in load
+    /// order. Threaded verbatim into [`initramfs::SuffixParams::kernel_modules`]
+    /// by [`Self::suffix_params`]; empty for ktstr-built kernels
+    /// (virtio =y), populated for prebuilt distro kernels (virtio =m).
+    /// Rides the per-run suffix, not the cached base — so it does not
+    /// participate in the `BaseKey` cache key and an empty slice leaves
+    /// the suffix bytes identical to the pre-module output.
+    pub(crate) kernel_modules: Vec<PathBuf>,
     /// The optional single virtio-blk disk, rendered as `/dev/vda`. ktstr
     /// wires one blk device; multi-disk would be N PCI functions (re-addable
     /// pre-1.0). The backing file is produced by the template-VM lifecycle
@@ -697,6 +706,7 @@ impl KtstrVm {
             staged_sched_args: &self.staged_sched_args_packed,
             workload_root_cgroup: self.workload_root_cgroup.as_deref(),
             scheduler_cgroup_parent: self.scheduler_cgroup_parent.as_deref(),
+            kernel_modules: &self.kernel_modules,
         }
     }
 

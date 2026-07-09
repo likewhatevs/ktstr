@@ -110,7 +110,7 @@ smallvec = { version = "1", features = ["const_generics"] }
 # proc-macro form stays compilable for downstream consumers.
 ctor = "1"
 libc = "0.2"
-nix = { version = "0.31", features = ["event", "feature", "fs", "inotify", "mount", "poll", "process", "ptrace", "reboot", "sched", "signal", "term", "uio"] }
+nix = { version = "0.31", features = ["event", "feature", "fs", "inotify", "kmod", "mount", "poll", "process", "ptrace", "reboot", "sched", "signal", "term", "uio"] }
 blazesym = { version = "0.2", features = ["dwarf"] }
 rand = "0.10"
 rmesg = { version = "1", default-features = false, features = ["sync"] }
