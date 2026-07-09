@@ -59,6 +59,92 @@ fn evr_selects_newest_al2023_kernel() {
     assert_eq!(newest.display(), "6.1.176-220.360.amzn2023");
 }
 
+// ---- AL2023 kernel streams ----------------------------------------
+
+#[test]
+fn al2023_stream_classification() {
+    // Bare stream packages and their modules-extra map to the stream.
+    assert_eq!(al2023_stream("kernel"), Some("kernel"));
+    assert_eq!(al2023_stream("kernel6.12"), Some("kernel6.12"));
+    assert_eq!(al2023_stream("kernel6.18"), Some("kernel6.18"));
+    assert_eq!(al2023_stream("kernel-modules-extra"), Some("kernel"));
+    assert_eq!(
+        al2023_stream("kernel6.18-modules-extra"),
+        Some("kernel6.18")
+    );
+    // Everything else kernel-adjacent is not a stream member.
+    for name in [
+        "kernel-devel",
+        "kernel-headers",
+        "kernel-tools",
+        "kernel-libbpf",
+        "kernel-livepatch-6.1.176-220.360",
+        "kernel-modules-extra-common",
+        "kernel6.18-devel",
+        "kernel6.18-modules-extra-common",
+        "kernel6.18-tools-devel",
+        "kernel6-modules-extra",
+        "bash",
+    ] {
+        assert_eq!(al2023_stream(name), None, "{name:?} must not classify");
+    }
+}
+
+#[test]
+fn al2023_picks_newest_stream_and_pairs_modules_extra() {
+    // Mirrors the live AL2023 spread: the default 6.1 stream has a far
+    // HIGHER release number — and here a higher EPOCH — than the 6.18
+    // stream, so a whole-EVR max across package names (epoch-first)
+    // would pick the wrong stream; the kernel version must dominate
+    // across streams.
+    let mk = |name: &str, epoch: &str, ver: &str, rel: &str| RpmCand {
+        name: name.into(),
+        arch: "x86_64".into(),
+        evr: Evr {
+            epoch: epoch.into(),
+            ver: ver.into(),
+            rel: format!("{rel}.amzn2023"),
+        },
+        sha256: format!("sha-{name}-{ver}"),
+        href: format!("../../blobstore/x/{name}-{ver}-{rel}.amzn2023.x86_64.rpm"),
+        size: Some(1),
+    };
+    let cands = vec![
+        mk("kernel", "1", "6.1.176", "220.360"),
+        mk("kernel-modules-extra", "1", "6.1.176", "220.360"),
+        mk("kernel6.12", "1", "6.12.94", "123.176"),
+        mk("kernel6.12-modules-extra", "1", "6.12.94", "123.176"),
+        // Stale 6.18 build: must lose to 69.136 within the stream.
+        mk("kernel6.18", "0", "6.18.35", "68.129"),
+        mk("kernel6.18-modules-extra", "0", "6.18.35", "68.129"),
+        mk("kernel6.18", "0", "6.18.36", "69.136"),
+        mk("kernel6.18-modules-extra", "0", "6.18.36", "69.136"),
+    ];
+    let (stream, target) = al2023_pick_stream(&cands).unwrap();
+    assert_eq!(stream, "kernel6.18");
+    assert_eq!(target.display(), "6.18.36-69.136.amzn2023");
+
+    let extra = format!("{stream}-modules-extra");
+    let names = [stream, extra.as_str()];
+    let refs = build_package_set(&cands, "https://example/repo/", &names, &target, true).unwrap();
+    assert_eq!(refs.len(), 2);
+    assert_eq!(refs[0].name, "kernel6.18");
+    assert_eq!(refs[1].name, "kernel6.18-modules-extra");
+    assert_eq!(refs[1].version, "6.18.36-69.136.amzn2023");
+
+    // A stream whose modules-extra is absent at the kernel's EVR is a
+    // hard error (virtio_console lives there).
+    let missing: Vec<RpmCand> = cands
+        .iter()
+        .filter(|c| c.name != "kernel6.18-modules-extra")
+        .cloned()
+        .collect();
+    let err = build_package_set(&missing, "https://example/repo/", &names, &target, true)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("kernel6.18-modules-extra"), "{err}");
+}
+
 #[test]
 fn evr_epoch_dominates() {
     let a = Evr {
@@ -173,7 +259,8 @@ const PRIMARY_XML: &str = r#"<?xml version="1.0"?>
 #[test]
 fn parse_primary_filters_and_selects_newest() {
     let wanted = ["kernel-core", "kernel-modules-core"];
-    let cands = parse_primary(Cursor::new(PRIMARY_XML.as_bytes()), &wanted).unwrap();
+    let cands =
+        parse_primary(Cursor::new(PRIMARY_XML.as_bytes()), |n| wanted.contains(&n)).unwrap();
     // bash filtered out; two kernel-core + one kernel-modules-core.
     assert_eq!(cands.len(), 3);
     assert!(cands.iter().all(|c| c.name != "bash"));
@@ -422,5 +509,9 @@ fn live_amazonlinux() {
             r.debuginfo.iter().map(|p| &p.name).collect::<Vec<_>>(),
         );
         assert_resolved_shape(&r);
+        // The kernel stream must be paired with its modules-extra
+        // subpackage (virtio_console.ko lives there).
+        assert_eq!(r.packages.len(), 2, "expected kernel + modules-extra");
+        assert!(r.packages[1].name.ends_with("-modules-extra"));
     }
 }

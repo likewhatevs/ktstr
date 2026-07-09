@@ -602,6 +602,38 @@ fn try_cow_overlay_rejects_cross_region_span() {
 // a live LZ4 SHM segment. The `try_cow_overlay_rejects_cross_region_span`
 // test below remains as the vm_memory `get_slice` dependency-contract pin.
 
+/// Each non-LZ4 format must round-trip through the matching vendored
+/// decoder — the same codec family the kernel's RD_* unpacker uses —
+/// and Uncompressed must pass bytes through verbatim. (LZ4 legacy has
+/// no vendored decoder; its format is pinned by `lz4_legacy_compress`'s
+/// magic/chunk layout and the live-boot tests.)
+#[test]
+fn compress_initrd_part_round_trips() {
+    use std::io::Read;
+    let data: Vec<u8> = (0..200_000u32).flat_map(|i| i.to_le_bytes()).collect();
+
+    let z = compress_initrd_part(InitrdCompression::Zstd, &data).unwrap();
+    let mut out = Vec::new();
+    zstd::stream::read::Decoder::new(std::io::Cursor::new(&z))
+        .unwrap()
+        .read_to_end(&mut out)
+        .unwrap();
+    assert_eq!(out, data);
+
+    let g = compress_initrd_part(InitrdCompression::Gzip, &data).unwrap();
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(std::io::Cursor::new(&g))
+        .read_to_end(&mut out)
+        .unwrap();
+    assert_eq!(out, data);
+
+    let u = compress_initrd_part(InitrdCompression::Uncompressed, &data).unwrap();
+    assert_eq!(u, data);
+
+    let l = compress_initrd_part(InitrdCompression::Lz4, &data).unwrap();
+    assert_eq!(l[..4], LZ4_LEGACY_MAGIC);
+}
+
 #[test]
 fn load_initramfs_parts_sequential() {
     let part1 = vec![0xAAu8; 4096];

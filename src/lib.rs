@@ -2149,6 +2149,9 @@ pub fn run_shell(
         // ordered boot-module set from the cache entry beside the image
         // (empty for built kernels — a no-op).
         .kernel_modules(cache::boot_modules_for_image(&kernel))
+        // Match the initrd compression to the guest kernel's RD_* set
+        // (from the config cached beside the image; LZ4 when absent).
+        .initrd_compression(cache::initrd_compression_for_image(&kernel))
         .init_binary(&payload)
         .topology(vmm::Topology::new(numa_nodes, llcs, cores, threads))
         .cmdline(&cmdline)

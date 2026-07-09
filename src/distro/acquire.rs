@@ -149,8 +149,8 @@ struct GateResult {
     /// or acquisition fails (the kernel cannot boot in ktstr).
     critical: Vec<&'static str>,
     /// `=m` feature drivers — best-effort: a module the kernel declares
-    /// `=m` but does not actually ship (as AL2023 does for several
-    /// virtio drivers) only disables that feature, not the boot.
+    /// `=m` but does not actually ship in the resolved packages only
+    /// disables that feature, not the boot.
     feature: Vec<&'static str>,
 }
 
@@ -247,8 +247,8 @@ fn gate_config(config: Option<&Path>, kernel_label: &str) -> Result<GateResult> 
 /// Resolve the gate's module NAMES into the ordered, dependency-first,
 /// already-decompressed `.ko` paths to embed. Boot-critical modules
 /// must all resolve; a feature module the kernel declares `=m` but does
-/// not actually ship (an AL2023-style incomplete package) is warned and
-/// skipped rather than failing the whole acquisition.
+/// not actually ship in the extracted packages is warned and skipped
+/// rather than failing the whole acquisition.
 fn select_boot_modules(extracted: &ExtractedKernel, gate: &GateResult) -> Result<Vec<PathBuf>> {
     if gate.critical.is_empty() && gate.feature.is_empty() {
         return Ok(Vec::new());
@@ -271,7 +271,8 @@ fn select_boot_modules(extracted: &ExtractedKernel, gate: &GateResult) -> Result
             "prebuilt kernel {release} does not ship a boot-critical virtio \
              module {:?} that its config declares =m — ktstr cannot reach its \
              console/host control port without it, so this kernel is unsupported \
-             (AWS/AL2023 kernels omit virtio-console, for example)",
+             (some distros split virtio-console into a subpackage the resolver \
+             must include)",
             gate.critical
         )
     })?;

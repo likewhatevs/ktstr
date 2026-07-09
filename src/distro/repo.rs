@@ -27,10 +27,17 @@
 //!   `-dbgsym` ddeb from `ddebs.ubuntu.com`.
 //! - **Amazon Linux 2023** — repo base from
 //!   `https://cdn.amazonlinux.com/al2023/core/mirrors/latest/{arch}/mirror.list`.
-//!   AL2023 ships a single `kernel` package rather than the Fedora
-//!   kernel-core/modules split (verified against the live metadata:
-//!   no `kernel-core`/`kernel-modules` names present), selected by RPM
-//!   EVR; debuginfo from the sibling `debuginfo` mirror.
+//!   AL2023 carries parallel kernel STREAMS as differently-named
+//!   packages — the default `kernel` (6.1) plus versioned
+//!   `kernel6.12` / `kernel6.18` — with no Fedora-style
+//!   kernel-core/modules split; each stream splits a handful of extra
+//!   drivers, `virtio_console` among them, into a
+//!   `<stream>-modules-extra` subpackage (verified against the live
+//!   filelists metadata). The resolver picks the stream with the
+//!   newest kernel by RPM EVR and pairs it with its modules-extra at
+//!   the same EVR; debuginfo (`<stream>-debuginfo`, which carries the
+//!   full vmlinux on its own) comes from the sibling `debuginfo`
+//!   mirror.
 //!
 //! All metadata fetches ride the shared HTTP client and transient-retry
 //! seam via `crate::fetch::fetch_metadata_bytes` /
@@ -429,10 +436,13 @@ struct RpmCand {
 }
 
 /// Stream a (decompressed) `primary.xml`, collecting every package
-/// whose `<name>` is in `wanted`. Streaming keeps the multi-MB metadata
-/// out of memory: each `<package>` is filtered as its `</package>`
-/// closes rather than materializing a DOM.
-fn parse_primary<R: std::io::BufRead>(reader: R, wanted: &[&str]) -> Result<Vec<RpmCand>> {
+/// whose `<name>` satisfies `wanted`. Streaming keeps the multi-MB
+/// metadata out of memory: each `<package>` is filtered as its
+/// `</package>` closes rather than materializing a DOM.
+fn parse_primary<R: std::io::BufRead, F: Fn(&str) -> bool>(
+    reader: R,
+    wanted: F,
+) -> Result<Vec<RpmCand>> {
     let mut reader = Reader::from_reader(reader);
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
@@ -471,7 +481,7 @@ fn parse_primary<R: std::io::BufRead>(reader: R, wanted: &[&str]) -> Result<Vec<
             Event::End(e) => {
                 if e.local_name().as_ref() == b"package"
                     && let Some(c) = cur.take()
-                    && wanted.iter().any(|w| *w == c.name)
+                    && wanted(&c.name)
                 {
                     out.push(c);
                 }
@@ -745,6 +755,13 @@ fn verify_metadata_sha256(bytes: &[u8], expected: &str, href: &str) -> Result<()
 /// metadata it references, verify the compressed file's declared
 /// sha256, and stream-parse it for the `wanted` package names.
 fn fetch_repo_candidates(base: &str, wanted: &[&str]) -> Result<Vec<RpmCand>> {
+    fetch_repo_candidates_where(base, |name| wanted.contains(&name))
+}
+
+/// Predicate-driven form of [`fetch_repo_candidates`], for resolvers
+/// whose package names are not known up front (AL2023's dynamic
+/// `kernel<X>.<Y>` stream names).
+fn fetch_repo_candidates_where<F: Fn(&str) -> bool>(base: &str, wanted: F) -> Result<Vec<RpmCand>> {
     let repomd_url = join_url(base, "repodata/repomd.xml")?;
     let repomd = crate::fetch::fetch_metadata_bytes(&repomd_url, "fetch")?;
     let datas = parse_repomd(&repomd)?;
@@ -772,8 +789,9 @@ fn newest_evr(cands: &[RpmCand], name: &str) -> Option<Evr> {
 
 /// Build [`PackageRef`]s for `names` (in order) at exactly `target`
 /// EVR. Missing names are skipped when `strict` is false; when `strict`
-/// (debuginfo — mandatory in this design) a missing name is a hard
-/// error.
+/// (debuginfo — mandatory in this design — and package sets where every
+/// member is load-bearing, like AL2023's kernel + modules-extra pair) a
+/// missing name is a hard error.
 fn build_package_set(
     cands: &[RpmCand],
     base: &str,
@@ -792,8 +810,7 @@ fn build_package_set(
                 size: c.size,
             }),
             None if strict => bail!(
-                "{name}-{} not found in repo metadata at {base} \
-                 (required for kernel debuginfo)",
+                "{name}-{} not found in repo metadata at {base}",
                 target.display()
             ),
             None => {}
@@ -1016,21 +1033,71 @@ fn deb_package_ref(p: &DebPkg, base: &str) -> Result<PackageRef> {
 
 const AL2023_MIRROR: &str = "https://cdn.amazonlinux.com/al2023/core/mirrors/latest";
 
+/// The AL2023 kernel-stream family a package name belongs to: the
+/// default `kernel` (6.1) stream or a versioned `kernel<MAJ>.<MIN>`
+/// stream (`kernel6.12`, `kernel6.18`), each with a `-modules-extra`
+/// subpackage. Returns `Some(stream)` for the bare stream package and
+/// its modules-extra, `None` for every other kernel-adjacent name
+/// (`-devel`, `-headers`, `-tools`, `-libbpf*`, `-livepatch-*`,
+/// `-modules-extra-common`, …).
+fn al2023_stream(name: &str) -> Option<&str> {
+    let stream = name.strip_suffix("-modules-extra").unwrap_or(name);
+    let rest = stream.strip_prefix("kernel")?;
+    if rest.is_empty() {
+        return Some(stream);
+    }
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let (major, minor) = rest.split_once('.')?;
+    (digits(major) && digits(minor)).then_some(stream)
+}
+
+/// Pick the AL2023 stream with the newest kernel, as `(stream, evr)`.
+/// Selection is two-level: WITHIN a stream, the newest build by full
+/// RPM EVR (epoch included — the live repo carries epoch 0 and 1
+/// builds under one stream name); ACROSS streams, by the kernel
+/// version alone (`rpmvercmp` on `ver`: `6.18.36` > `6.1.176`).
+/// Epoch and release only order builds of the SAME package name, so
+/// letting a whole-EVR compare span streams would let an epoch bump
+/// in an old stream outrank a newer stream's kernel.
+fn al2023_pick_stream(cands: &[RpmCand]) -> Option<(&str, Evr)> {
+    let streams: std::collections::BTreeSet<&str> = cands
+        .iter()
+        .filter(|c| al2023_stream(&c.name) == Some(c.name.as_str()))
+        .map(|c| c.name.as_str())
+        .collect();
+    streams
+        .into_iter()
+        .filter_map(|s| newest_evr(cands, s).map(|evr| (s, evr)))
+        .max_by(|(_, a), (_, b)| rpmvercmp(&a.ver, &b.ver).then_with(|| a.cmp(b)))
+}
+
 fn resolve_amazonlinux(_release: Option<&str>, arch: &str) -> Result<ResolvedDistroKernel> {
     // AL2023 is a single rolling stream; `release` (Some("2023")/None)
     // always resolves to the latest dated build.
     let core_base = al2023_repo_base(&format!("{AL2023_MIRROR}/{arch}/mirror.list"))?;
-    // AL2023 ships a single `kernel` package (no kernel-core/modules
-    // split like Fedora — verified against the live primary.xml).
-    let pkg_names = ["kernel"];
-    let cands = fetch_repo_candidates(&core_base, &pkg_names)?;
-    let target = newest_evr(&cands, "kernel")
-        .ok_or_else(|| anyhow!("no kernel package in AL2023 {arch} repo"))?;
-    let packages = build_package_set(&cands, &core_base, &pkg_names, &target, false)?;
+    // Resolve every kernel stream (`kernel`, `kernel6.12`, `kernel6.18`,
+    // …) plus each stream's `-modules-extra` subpackage — which carries
+    // `virtio_console.ko`, without which ktstr's console cannot come up
+    // — and pick the stream with the newest kernel. Both packages are
+    // strict: a stream missing its modules-extra at the kernel's exact
+    // EVR cannot boot under ktstr.
+    let cands = fetch_repo_candidates_where(&core_base, |n| al2023_stream(n).is_some())?;
+    let (stream, target) = al2023_pick_stream(&cands)
+        .ok_or_else(|| anyhow!("no kernel stream package in AL2023 {arch} repo"))?;
+    let extra = format!("{stream}-modules-extra");
+    let pkg_names = [stream, extra.as_str()];
+    let packages = build_package_set(&cands, &core_base, &pkg_names, &target, true)?;
 
     let debug_base = al2023_repo_base(&format!("{AL2023_MIRROR}/debuginfo/{arch}/mirror.list"))?;
-    let common = format!("kernel-debuginfo-common-{arch}");
-    let debug_names = ["kernel-debuginfo", common.as_str()];
+    // `<stream>-debuginfo` alone carries the complete vmlinux
+    // (`/usr/lib/debug/lib/modules/<rel>/vmlinux`). The sibling
+    // `-debuginfo-common-{arch}` is deliberately NOT fetched: it only
+    // adds `/usr/src/debug` sources, plus a second
+    // `<rel>.microvm/vmlinux.debug` flavor tree (verified against the
+    // live filelists) that would make the extracted packages disagree
+    // on the kernel release.
+    let dbg = format!("{stream}-debuginfo");
+    let debug_names = [dbg.as_str()];
     let debug_cands = fetch_repo_candidates(&debug_base, &debug_names)?;
     let debuginfo = build_package_set(&debug_cands, &debug_base, &debug_names, &target, true)?;
 

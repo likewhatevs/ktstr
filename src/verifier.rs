@@ -843,6 +843,7 @@ pub fn collect_verifier_output(
         // ordered boot-module set from the cache entry (no-op for built
         // kernels, which have no sibling modules/ dir).
         .kernel_modules(crate::cache::boot_modules_for_image(kernel))
+        .initrd_compression(crate::cache::initrd_compression_for_image(kernel))
         .init_binary(ktstr_bin)
         .scheduler_binary(sched_bin)
         .sched_args(&sched_args)

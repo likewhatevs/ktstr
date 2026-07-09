@@ -1164,13 +1164,16 @@ impl KtstrVm {
     ) -> Result<u32> {
         let uncompressed_size = base_bytes.len() + suffix.len();
 
-        // Compress base and suffix as separate LZ4 legacy streams. The
-        // kernel initramfs decompressor handles concatenated LZ4 natively
-        // (re-encountering the magic mid-stream resets the decoder).
-        // Keeping them separate lets us COW-map the base from SHM.
+        // Compress base and suffix as separate streams of the guest
+        // kernel's format (LZ4 legacy unless the kernel lacks RD_LZ4).
+        // The kernel's unpack_to_rootfs loop decodes one concatenated
+        // archive per iteration whatever the format (and the LZ4
+        // decoder additionally resets on re-encountering the magic
+        // mid-stream). Keeping base and suffix separate lets us
+        // COW-map the LZ4 base from SHM.
         let t0 = Instant::now();
         let lz4_base = self.get_or_compress_base(base_bytes, key)?;
-        let lz4_suffix = initramfs::lz4_legacy_compress(suffix);
+        let lz4_suffix = initramfs::compress_initrd_part(self.initrd_compression, suffix)?;
         let total_compressed = lz4_base.len() + lz4_suffix.len();
         tracing::debug!(
             elapsed_us = t0.elapsed().as_micros(),
@@ -1199,9 +1202,13 @@ impl KtstrVm {
         );
 
         // Try COW overlay: mmap compressed base from SHM fd directly
-        // into guest memory, sharing physical pages across VMs.
+        // into guest memory, sharing physical pages across VMs. LZ4
+        // only — the SHM segment always holds the LZ4 encoding of the
+        // base, which is not what a non-LZ4 boot wrote into lz4_base.
         let t0 = Instant::now();
-        let cow_guard = Self::try_cow_overlay(&vm.guest_mem, key, lz4_base.len(), load_addr);
+        let cow_guard = (self.initrd_compression == initramfs::InitrdCompression::Lz4)
+            .then(|| Self::try_cow_overlay(&vm.guest_mem, key, lz4_base.len(), load_addr))
+            .flatten();
         // IMPORTANT: stash the guard on the VM IMMEDIATELY — before
         // any fallible operation below. If a `?` unwinds this function
         // with a locally-held guard still on the stack, the guard
@@ -1396,7 +1403,7 @@ impl KtstrVm {
         );
         // Compress first to get actual compressed size for validation.
         let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
-        let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);
+        let lz4_suffix = initramfs::compress_initrd_part(self.initrd_compression, &suffix)?;
         let compressed_size = lz4_base.len() + lz4_suffix.len();
         let kernel_init_size = read_kernel_init_size(&self.kernel)?;
         let (init_coverage_instrumented, instrumented_reserve_bytes) =
@@ -1463,7 +1470,7 @@ impl KtstrVm {
 
         let t0_compress = Instant::now();
         let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
-        let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);
+        let lz4_suffix = initramfs::compress_initrd_part(self.initrd_compression, &suffix)?;
         let compressed_size = lz4_base.len() + lz4_suffix.len();
         tracing::debug!(
             elapsed_us = t0_compress.elapsed().as_micros(),
@@ -1520,11 +1527,16 @@ impl KtstrVm {
         }
     }
 
-    /// Get or build the compressed base, delegating to the SHM
-    /// one-compressor election in `initramfs_cache`. Thin wrapper: the
-    /// SHM logic uses no builder state, only the content hash.
+    /// Get or build the compressed base. LZ4 delegates to the SHM
+    /// one-compressor election in `initramfs_cache` (which uses no
+    /// builder state, only the content hash); any other format —
+    /// the prebuilt-distro fallback for kernels without RD_LZ4 —
+    /// compresses locally, outside the LZ4-shaped SHM/COW machinery.
     fn get_or_compress_base(&self, base_bytes: &[u8], key: &BaseKey) -> Result<Vec<u8>> {
-        Ok(get_or_compress_base_shm(key.0, base_bytes))
+        match self.initrd_compression {
+            initramfs::InitrdCompression::Lz4 => Ok(get_or_compress_base_shm(key.0, base_bytes)),
+            other => initramfs::compress_initrd_part(other, base_bytes),
+        }
     }
 
     /// Try to COW-overlay the compressed base from LZ4 SHM into guest
@@ -2046,7 +2058,7 @@ impl KtstrVm {
         // compress_and_load_initrd call hits the cache instead of
         // recompressing.
         let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
-        let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);
+        let lz4_suffix = initramfs::compress_initrd_part(self.initrd_compression, &suffix)?;
         let compressed_size = lz4_base.len() + lz4_suffix.len();
 
         // Validate the operator-supplied memory_mib against the
@@ -2118,7 +2130,7 @@ impl KtstrVm {
         // subsequent compress_and_load_initrd call hits it.
         let t0_compress = Instant::now();
         let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
-        let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);
+        let lz4_suffix = initramfs::compress_initrd_part(self.initrd_compression, &suffix)?;
         let compressed_size = lz4_base.len() + lz4_suffix.len();
         tracing::debug!(
             elapsed_us = t0_compress.elapsed().as_micros(),

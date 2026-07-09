@@ -1833,6 +1833,59 @@ pub fn load_initramfs_parts(
     Ok((load_addr, offset as u32))
 }
 
+/// Which compression the guest kernel's initramfs unpacker can decode
+/// for the initrd ktstr assembles.
+///
+/// ktstr-built kernels pin `CONFIG_RD_LZ4=y` (ktstr.kconfig), but a
+/// prebuilt distro kernel chooses its own `CONFIG_RD_*` set — AL2023,
+/// for instance, ships only `RD_GZIP` + `RD_ZSTD` — and an initrd in a
+/// format the kernel lacks dies at boot with "Initramfs unpacking
+/// failed: decompressor failed". The boot path selects a variant from
+/// the kernel's extracted `.config`
+/// (`crate::cache::initrd_compression_for_image`), defaulting to
+/// [`InitrdCompression::Lz4`] when no config is available (built
+/// kernels, raw images — today's behavior).
+///
+/// The base and suffix are compressed as SEPARATE streams of the
+/// chosen format and concatenated; the kernel's `unpack_to_rootfs`
+/// loop (init/initramfs.c) decodes one compressed archive per
+/// iteration, advancing by the decompressor-reported consumed length,
+/// so back-to-back frames of any supported format unpack like a single
+/// initramfs. `Uncompressed` is plain newc cpio, which every kernel
+/// unpacks with no `CONFIG_RD_*` at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitrdCompression {
+    /// LZ4 legacy frames (`CONFIG_RD_LZ4`-gated) — the default, and
+    /// the only variant backed by the SHM base cache + COW overlay.
+    Lz4,
+    /// One zstd frame per part (`CONFIG_RD_ZSTD`). Level 1: the
+    /// window log stays far under the unpacker's 8 MiB
+    /// `ZSTD_WINDOWSIZE_MAX` cap (lib/decompress_unzstd.c).
+    Zstd,
+    /// One gzip member per part (`CONFIG_RD_GZIP`).
+    Gzip,
+    /// Plain newc cpio — universally bootable last resort.
+    Uncompressed,
+}
+
+/// Compress one initrd part (base or suffix) in `comp`'s format. The
+/// non-LZ4 variants are the prebuilt-distro fallback path: compressed
+/// locally on every boot, with no SHM cache or COW overlay backing.
+pub(crate) fn compress_initrd_part(comp: InitrdCompression, data: &[u8]) -> Result<Vec<u8>> {
+    match comp {
+        InitrdCompression::Lz4 => Ok(lz4_legacy_compress(data)),
+        InitrdCompression::Zstd => {
+            zstd::stream::encode_all(data, 1).context("zstd-compress initrd part")
+        }
+        InitrdCompression::Gzip => {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            enc.write_all(data).context("gzip-compress initrd part")?;
+            enc.finish().context("finish gzip initrd part")
+        }
+        InitrdCompression::Uncompressed => Ok(data.to_vec()),
+    }
+}
+
 /// LZ4 legacy format magic number (`0x184C2102` little-endian).
 /// This is the format the kernel's initramfs decompressor expects
 /// (CONFIG_RD_LZ4 / lib/decompress_unlz4.c).

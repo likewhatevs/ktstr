@@ -464,6 +464,12 @@ pub struct KtstrVm {
     /// participate in the `BaseKey` cache key and an empty slice leaves
     /// the suffix bytes identical to the pre-module output.
     pub(crate) kernel_modules: Vec<PathBuf>,
+    /// Initrd compression the guest kernel can unpack. LZ4 for
+    /// ktstr-built kernels; prebuilt distro kernels without
+    /// `CONFIG_RD_LZ4` get a format from their own `CONFIG_RD_*` set
+    /// (see [`initramfs::InitrdCompression`]). Non-LZ4 formats bypass
+    /// the SHM base cache + COW overlay and compress on every boot.
+    pub(crate) initrd_compression: initramfs::InitrdCompression,
     /// The optional single virtio-blk disk, rendered as `/dev/vda`. ktstr
     /// wires one blk device; multi-disk would be N PCI functions (re-addable
     /// pre-1.0). The backing file is produced by the template-VM lifecycle

@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::vmm::initramfs::InitrdCompression;
+
 /// How a cached kernel's source was acquired, with per-variant
 /// payload (git details for `Git`, source-tree path and git hash for
 /// `Local`).
@@ -462,6 +464,41 @@ pub fn boot_modules_for_image(image: &Path) -> Vec<PathBuf> {
     }
 }
 
+/// Initrd compression the kernel behind `image` can unpack, discovered
+/// from the `config` file that sits beside the image in its cache entry
+/// (`<entry>/bzImage` + `<entry>/config`). No config (built kernels
+/// pin `CONFIG_RD_LZ4=y` via ktstr.kconfig; raw images carry no
+/// sidecar) defaults to LZ4 — today's behavior. With a config, the
+/// first of `RD_LZ4` / `RD_ZSTD` / `RD_GZIP` the kernel enables wins,
+/// falling back to uncompressed cpio (which needs no `CONFIG_RD_*`)
+/// when it enables none. Callers pass the result to
+/// `KtstrVmBuilder::initrd_compression` (crate-private) unconditionally.
+pub fn initrd_compression_for_image(image: &Path) -> InitrdCompression {
+    let Some(config) = image.parent().map(|d| d.join("config")) else {
+        return InitrdCompression::Lz4;
+    };
+    let Ok(text) = std::fs::read_to_string(&config) else {
+        return InitrdCompression::Lz4;
+    };
+    initrd_compression_for_config(&text)
+}
+
+/// Pure core of [`initrd_compression_for_image`]: pick the best
+/// initrd compression from a kernel `.config`'s `CONFIG_RD_*` set.
+fn initrd_compression_for_config(text: &str) -> InitrdCompression {
+    // The RD_* decompressor options are bool symbols: `=y` or absent.
+    let enabled = |opt: &str| text.lines().any(|l| l.strip_prefix(opt) == Some("=y"));
+    if enabled("CONFIG_RD_LZ4") {
+        InitrdCompression::Lz4
+    } else if enabled("CONFIG_RD_ZSTD") {
+        InitrdCompression::Zstd
+    } else if enabled("CONFIG_RD_GZIP") {
+        InitrdCompression::Gzip
+    } else {
+        InitrdCompression::Uncompressed
+    }
+}
+
 /// Entry yielded by [`crate::cache::CacheDir::list`]. Distinguishes
 /// valid entries from corrupt ones.
 #[derive(Debug)]
@@ -632,6 +669,55 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    // -- initrd compression discovery --
+
+    #[test]
+    fn cache_initrd_compression_prefers_lz4_then_zstd_then_gzip() {
+        // ktstr-built / Fedora shape: RD_LZ4 present wins outright.
+        let all = "CONFIG_RD_GZIP=y\nCONFIG_RD_LZ4=y\nCONFIG_RD_ZSTD=y\n";
+        assert_eq!(initrd_compression_for_config(all), InitrdCompression::Lz4);
+        // AL2023 shape: no RD_LZ4, RD_ZSTD present.
+        let al2023 = "CONFIG_RD_GZIP=y\n# CONFIG_RD_LZ4 is not set\nCONFIG_RD_ZSTD=y\n";
+        assert_eq!(
+            initrd_compression_for_config(al2023),
+            InitrdCompression::Zstd
+        );
+        let gzip_only = "CONFIG_RD_GZIP=y\n# CONFIG_RD_LZ4 is not set\n";
+        assert_eq!(
+            initrd_compression_for_config(gzip_only),
+            InitrdCompression::Gzip
+        );
+        // No decompressor at all: plain cpio still boots.
+        assert_eq!(
+            initrd_compression_for_config("CONFIG_FOO=y\n"),
+            InitrdCompression::Uncompressed
+        );
+        // A prefix-colliding symbol must not count as enabled.
+        assert_eq!(
+            initrd_compression_for_config("CONFIG_RD_LZ4_EXTRA=y\nCONFIG_RD_ZSTD=y\n"),
+            InitrdCompression::Zstd
+        );
+    }
+
+    #[test]
+    fn cache_initrd_compression_for_image_defaults_to_lz4() {
+        let tmp = TempDir::new().unwrap();
+        let image = tmp.path().join("bzImage");
+        fs::write(&image, b"fake").unwrap();
+        // No config sibling: LZ4 (built kernels / raw images).
+        assert_eq!(initrd_compression_for_image(&image), InitrdCompression::Lz4);
+        // With an AL2023-shaped config sibling: zstd.
+        fs::write(
+            tmp.path().join("config"),
+            "# CONFIG_RD_LZ4 is not set\nCONFIG_RD_ZSTD=y\n",
+        )
+        .unwrap();
+        assert_eq!(
+            initrd_compression_for_image(&image),
+            InitrdCompression::Zstd
+        );
+    }
 
     // -- KernelMetadata serde --
 
