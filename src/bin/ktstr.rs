@@ -1335,6 +1335,12 @@ fn main() -> Result<()> {
             // size errors at CLI-argument time, never mid-VM-setup.
             let disk_cfg = cli::parse_disk_arg(disk.as_deref())?;
             cli::check_kvm()?;
+            // No `--kernel`: default to the cwd when it is a kernel
+            // source tree so `ktstr shell` run from inside a tree
+            // builds and boots that kernel without an explicit
+            // `--kernel .`. Scoped to `shell`; other flows keep their
+            // cache/auto-download defaults.
+            let kernel = cli::shell_kernel_or_cwd(kernel, "ktstr");
             let kernel_path = cli::resolve_kernel_image(
                 kernel.as_deref(),
                 &cli::KernelResolvePolicy {
