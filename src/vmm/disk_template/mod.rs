@@ -26,9 +26,9 @@
 //! 1. **Cache lookup.** [`ensure_template`] is called by
 //!    `KtstrVm::init_virtio_blk` (or callers that
 //!    pre-warm the cache). The lookup keys off
-//!    `(Filesystem::cache_tag, capacity_mib, mkfs_version_fingerprint)`.
-//!    Hit → return the template path. The mkfs-version fingerprint
-//!    component (see [`mkfs_version_fingerprint`]) ensures an mkfs
+//!    `(Filesystem::cache_tag, capacity_mib, mkfs_fingerprint)`.
+//!    Hit → return the template path. The mkfs fingerprint
+//!    component (see [`mkfs_fingerprint`]) ensures an mkfs
 //!    upgrade rotates the key and forces a fresh template build.
 //! 2. **Lockfile.** Miss → acquire an exclusive flock under
 //!    `<cache>/disk_templates/.locks/<key>.lock`. If a peer process is
@@ -332,15 +332,15 @@ pub(crate) fn verify_cache_dir_supports_reflink(dir: &Path) -> Result<()> {
 ///   bytes) so every entry has the same magnitude regardless of
 ///   compiler-side rounding; the `m` suffix disambiguates from any
 ///   future GiB/sector-count keying.
-/// - `version_fp` is a 16-hex-char SHA-256 prefix derived from the
-///   host `mkfs.<fstype> --version` output (see
-///   [`mkfs_version_fingerprint`]). It captures the on-disk format
-///   the host's mkfs binary produces; an mkfs upgrade that changes
-///   the version output rotates the fingerprint and forces a fresh
-///   template build. Without this component the cache would silently
-///   reuse stale templates whose internal format the new kernel may
-///   reject ([`clean_all`] is the operator-driven escape hatch when
-///   the fingerprint somehow misses a relevant change). Variants
+/// - `version_fp` is a 16-hex-char SHA-256 prefix of the host
+///   `mkfs.<fstype>` binary's contents (see [`mkfs_fingerprint`]).
+///   It captures the on-disk format the host's mkfs binary produces;
+///   an mkfs upgrade that changes the binary rotates the fingerprint
+///   and forces a fresh template build. Without this component the
+///   cache would silently reuse stale templates whose internal
+///   format the new kernel may reject ([`clean_all`] is the
+///   operator-driven escape hatch when the fingerprint somehow
+///   misses a relevant change). Variants
 ///   whose [`Filesystem::mkfs_binary_name`] returns `None` (today
 ///   only `Raw`) pass `version_fp = "noversion"` because there is no
 ///   formatter to fingerprint.
@@ -364,14 +364,13 @@ pub(crate) fn template_cache_key(fs: Filesystem, capacity_bytes: u64, version_fp
 /// production fallback in [`ensure_template`].
 const NOVERSION_FP: &str = "noversion";
 
-/// Per-process cache for [`mkfs_version_fingerprint`] keyed by
-/// `mkfs_path`. The fingerprint is invariant for a binary whose
-/// `--version` output is deterministic (the production case for
-/// `mkfs.btrfs` / `mkfs.xfs`), so paying the fork+exec cost once per
-/// process is sufficient. Without this cache every `ensure_template`
-/// call — i.e. every VM boot in the parallel test run — re-spawns
-/// the same `--version` command and rehashes the same bytes, adding
-/// a fork+exec + read on the hot path of test startup.
+/// Per-process cache for [`mkfs_fingerprint`] keyed by `mkfs_path`.
+/// The fingerprint is invariant for a given binary file (the
+/// production case for `mkfs.btrfs` / `mkfs.xfs`), so paying the
+/// read+hash cost once per process is sufficient. Without this cache
+/// every `ensure_template` call — i.e. every VM boot in the parallel
+/// test run — re-reads and rehashes the same binary, adding a file
+/// read on the hot path of test startup.
 ///
 /// Keyed by [`PathBuf`] (not the resolved canonical path) because
 /// the caller is [`locate_host_mkfs`], which already returns the
@@ -382,18 +381,18 @@ const NOVERSION_FP: &str = "noversion";
 /// `std::sync::Mutex` is sufficient — contention is bounded to
 /// first-use per binary path (after which every subsequent call is
 /// a `HashMap::get` under the lock), and the critical section never
-/// runs the fork+exec while holding the lock (see
-/// [`mkfs_version_fingerprint`] for the read-then-insert shape).
-fn mkfs_version_fingerprint_cache()
--> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, String>> {
+/// runs the read+hash while holding the lock (see
+/// [`mkfs_fingerprint`] for the read-then-insert shape).
+fn mkfs_fingerprint_cache() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, String>>
+{
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<PathBuf, String>>,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Compute a 16-hex-char SHA-256 prefix of the `mkfs.<fstype>
-/// --version` output, memoized per process by `mkfs_path`.
+/// Compute a 16-hex-char SHA-256 prefix of the `mkfs.<fstype>`
+/// binary's contents, memoized per process by `mkfs_path`.
 ///
 /// Used by [`template_cache_key`]: the fingerprint participates in
 /// the cache key so an mkfs upgrade rotates the key and forces a
@@ -402,30 +401,30 @@ fn mkfs_version_fingerprint_cache()
 /// feature flag default) would silently reuse the stale template
 /// whose internal format the new kernel may reject.
 ///
-/// The fingerprint is the SHA-256 hash of the binary's stdout
-/// concatenated with stderr from a single `--version` invocation,
-/// truncated to the first 16 hex characters. Both streams are
-/// included because some `mkfs.<fstype>` builds emit version
-/// information on stderr (e.g. when stdout is reserved for
-/// machine-readable output). 16 hex chars (~64 bits) is well below
-/// the birthday-collision threshold for the dozens-to-hundreds of
-/// versions a single host will see across its lifetime.
+/// The fingerprint is the SHA-256 hash of the binary file's bytes —
+/// the same bytes the template-build VM packs into its initramfs and
+/// execs against `/dev/vda` — truncated to the first 16 hex
+/// characters. Hashing the binary itself rather than its `--version`
+/// banner rotates the key on any change to the formatter, including a
+/// downstream rebuild that alters on-disk behaviour without touching
+/// the version string. 16 hex chars (~64 bits) is well below the
+/// birthday-collision threshold for the dozens-to-hundreds of
+/// binaries a single host will see across its lifetime.
 ///
-/// The full output is captured via `Command::output` (no shell, no
-/// PATH search — `mkfs_path` is the canonicalized path returned by
-/// [`locate_host_mkfs`]). Failure paths surface as bail messages
-/// naming the binary path so an operator can rerun by hand.
+/// The bytes are read directly from `mkfs_path` (the canonicalized
+/// path returned by [`locate_host_mkfs`]). A read failure surfaces as
+/// a bail message naming the binary path so an operator can rerun by
+/// hand.
 ///
 /// # Process-lifetime caching
 ///
 /// Results are cached in a per-process map keyed by `mkfs_path`
-/// (see [`mkfs_version_fingerprint_cache`]). The first call for a
-/// given path performs the fork+exec + hash; subsequent calls (in
-/// the same process) return the cached string without spawning the
-/// child. This matters because `ensure_template` runs on every VM
-/// boot — without the cache, parallel-test runs spawn N
-/// `mkfs.<fstype> --version` children for N tests against a binary
-/// that hasn't changed across the run.
+/// (see [`mkfs_fingerprint_cache`]). The first call for a given path
+/// reads the binary and hashes it; subsequent calls (in the same
+/// process) return the cached string without touching the disk. This
+/// matters because `ensure_template` runs on every VM boot — without
+/// the cache, parallel-test runs re-read and rehash the same binary
+/// for N tests against a file that hasn't changed across the run.
 ///
 /// The cache is never invalidated. An mkfs upgrade between calls in
 /// the same process would not be observed, but mkfs binaries do not
@@ -434,75 +433,51 @@ fn mkfs_version_fingerprint_cache()
 /// template the run already produced, so reusing the prior key is
 /// correct.
 ///
-/// # Output stability
+/// # Fingerprint stability
 ///
-/// `mkfs.btrfs --version` and `mkfs.xfs --version` write a short
-/// banner that includes a version string and a build-info tail.
-/// Different distros may patch the banner; the SHA-256 hash absorbs
-/// that without parsing. As long as a given binary produces
-/// deterministic output for `--version` (no timestamp, no
-/// random-id), the fingerprint is stable across runs of the same
-/// binary — verified by the
-/// `mkfs_version_fingerprint_is_deterministic` unit test.
-///
-/// # When the version output is non-deterministic
-///
-/// A buggy mkfs that emits a timestamp on `--version` would rotate
-/// the fingerprint on every call and defeat caching. The
-/// per-process memoization above also masks this — once the first
-/// call lands, every subsequent call returns the cached value
-/// regardless of what `--version` would emit. Operators who suspect
-/// non-determinism should run `<mkfs> --version | sha256sum` twice
-/// in a row and compare.
-fn mkfs_version_fingerprint(mkfs_path: &Path) -> Result<String> {
+/// The hash covers the binary file's bytes, which are fixed for a
+/// given install, so the fingerprint is stable across runs of the
+/// same binary and rotates only when the file itself changes (a
+/// reinstall or upgrade) — verified by the
+/// `mkfs_fingerprint_is_deterministic` unit test.
+fn mkfs_fingerprint(mkfs_path: &Path) -> Result<String> {
     // Hot path: cached. The lock is held only for the map lookup
-    // and (on miss) for the insertion; the fork+exec runs after the
+    // and (on miss) for the insertion; the read+hash runs after the
     // first lookup so concurrent first-use against different paths
     // does not serialize.
-    if let Some(cached) = mkfs_version_fingerprint_cache()
+    if let Some(cached) = mkfs_fingerprint_cache()
         .lock()
-        .expect("mkfs_version_fingerprint cache mutex poisoned")
+        .expect("mkfs_fingerprint cache mutex poisoned")
         .get(mkfs_path)
     {
         return Ok(cached.clone());
     }
     use sha2::Digest;
-    let output = std::process::Command::new(mkfs_path)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("spawn {mkfs_path:?} --version for cache-key fingerprint"))?;
-    // Don't gate on exit code: some mkfs binaries return non-zero on
-    // --version (e.g. exit 1 when stdout is not a tty). The hash
-    // covers both stdout and stderr regardless of exit status, so the
-    // fingerprint is well-defined as long as the binary produced any
-    // bytes at all.
-    if output.stdout.is_empty() && output.stderr.is_empty() {
+    let bytes = std::fs::read(mkfs_path)
+        .with_context(|| format!("read {mkfs_path:?} for cache-key fingerprint"))?;
+    if bytes.is_empty() {
         bail!(
-            "{mkfs_path:?} --version produced no output \
-             (stdout/stderr both empty, status={status:?}). Cannot \
-             fingerprint the binary for the disk-template cache \
-             key — the binary may be a stub or corrupted.",
-            status = output.status,
+            "{mkfs_path:?} is empty. Cannot fingerprint the binary for \
+             the disk-template cache key — the binary may be a stub or \
+             corrupted."
         );
     }
     let mut hasher = sha2::Sha256::new();
-    hasher.update(&output.stdout);
-    hasher.update(&output.stderr);
+    hasher.update(&bytes);
     let digest = hasher.finalize();
     // 16 hex chars = 64 bits. Birthday collision around ~2^32
-    // distinct versions; vastly more than any host will ever see.
+    // distinct binaries; vastly more than any host will ever see.
     let fp = hex::encode(&digest[..8]);
     // Memoize for the rest of this process. A concurrent first-use
     // against the same path would compute the fingerprint twice
-    // (the lookup-then-insert is not atomic), but both children
-    // hash the same bytes and produce the same string, so the
-    // map's eventual value is deterministic regardless of which
-    // insertion wins. The redundant fork+exec is bounded by the
-    // number of concurrent first-callers — a one-time cost paid
-    // before the cache is warm.
-    mkfs_version_fingerprint_cache()
+    // (the lookup-then-insert is not atomic), but both reads hash the
+    // same bytes and produce the same string, so the map's eventual
+    // value is deterministic regardless of which insertion wins. The
+    // redundant read is bounded by the number of concurrent
+    // first-callers — a one-time cost paid before the cache is warm.
+    mkfs_fingerprint_cache()
         .lock()
-        .expect("mkfs_version_fingerprint cache mutex poisoned")
+        .expect("mkfs_fingerprint cache mutex poisoned")
         .insert(mkfs_path.to_path_buf(), fp.clone());
     Ok(fp)
 }
@@ -1080,11 +1055,11 @@ fn locate_host_binary(name: &str, package_hint: &str) -> Result<PathBuf> {
 /// Misses acquire the per-key flock, re-check, then build the
 /// template via [`build_template_via_vm`] and atomically install it.
 ///
-/// The cache key includes a fingerprint derived from
-/// `mkfs.<fstype> --version` (see [`mkfs_version_fingerprint`]) so
-/// an mkfs upgrade rotates the key and forces a fresh template
-/// build. The version query runs once per [`ensure_template`] call;
-/// the cache lookup short-circuits on hit before any further work.
+/// The cache key includes a fingerprint of the `mkfs.<fstype>`
+/// binary's contents (see [`mkfs_fingerprint`]) so an mkfs upgrade
+/// rotates the key and forces a fresh template build. The binary is
+/// read once per [`ensure_template`] call; the cache lookup
+/// short-circuits on hit before any further work.
 ///
 /// # Tradeoff: hit path needs the formatter present (formatter-dependent variants only)
 ///
@@ -1145,7 +1120,7 @@ pub(crate) fn ensure_template(fs: Filesystem, capacity_bytes: u64) -> Result<Pat
     // `KtstrVm::init_virtio_blk` short-circuits
     // first), so this branch is defensive.
     let version_fp = match locate_host_mkfs(fs)? {
-        Some((mkfs_path, _name)) => mkfs_version_fingerprint(&mkfs_path)?,
+        Some((mkfs_path, _name)) => mkfs_fingerprint(&mkfs_path)?,
         None => NOVERSION_FP.to_string(),
     };
     let key = template_cache_key(fs, capacity_bytes, &version_fp);

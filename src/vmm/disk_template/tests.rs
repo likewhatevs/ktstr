@@ -311,73 +311,26 @@ fn locate_host_mkfs_raw_returns_none() {
     );
 }
 
-/// [`mkfs_version_fingerprint`] is deterministic for the same
-/// binary: two invocations against the same path produce
-/// byte-identical fingerprints. Pin the determinism contract so
-/// a regression that includes a timestamp / random nonce in the
-/// fingerprint would surface here. Without this property the
-/// cache key would rotate on every call and defeat caching
-/// entirely.
+/// [`mkfs_fingerprint`] hashes the binary file's contents: two
+/// calls against the same path produce byte-identical fingerprints,
+/// distinct file contents produce distinct fingerprints, and the
+/// first call populates the per-process cache. Pins the content-hash
+/// contract so a regression (e.g. reverting to a `--version` banner
+/// hash, or dropping the memoization) surfaces here.
 ///
-/// Searches `PATH` for a series of binaries known to emit a
-/// stable `--version` banner (coreutils `cat`, `ls`, `true`).
-/// At least one of these is on every Linux distro ktstr
-/// supports; the first to produce non-empty output for
-/// `--version` wins. We don't care WHAT the fingerprint says,
-/// only that it's stable across two invocations.
-///
-/// Skips when none of the candidate binaries produces output
-/// for `--version` (extremely rare — would require a
-/// busybox-only system that strips `--version` from every
-/// candidate).
+/// Uses temp files rather than a real formatter so the test is
+/// hermetic and does not depend on any host binary being installed.
 #[test]
-fn mkfs_version_fingerprint_is_deterministic() {
-    let path_var = match std::env::var_os("PATH") {
-        Some(p) => p,
-        None => return,
-    };
-    // Try several candidates; the first to produce non-empty
-    // `--version` output wins. `cat`/`ls` are GNU coreutils
-    // mainstays that emit a multi-line banner on `--version`;
-    // even on busybox, `cat --version` typically emits a
-    // banner-shaped one-liner.
-    let mut working_binary: Option<PathBuf> = None;
-    for name in &["cat", "ls", "true"] {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join(name);
-            if !std::fs::metadata(&candidate)
-                .map(|m| m.is_file())
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            // Probe: does `--version` produce any output?
-            let probe = std::process::Command::new(&candidate)
-                .arg("--version")
-                .output();
-            let Ok(output) = probe else {
-                continue;
-            };
-            if !output.stdout.is_empty() || !output.stderr.is_empty() {
-                working_binary = Some(candidate);
-                break;
-            }
-        }
-        if working_binary.is_some() {
-            break;
-        }
-    }
-    let Some(binary_path) = working_binary else {
-        return;
-    };
-    let fp1 =
-        mkfs_version_fingerprint(&binary_path).expect("first --version invocation must succeed");
-    let fp2 =
-        mkfs_version_fingerprint(&binary_path).expect("second --version invocation must succeed");
+fn mkfs_fingerprint_hashes_binary_contents() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let bin = dir.path().join("mkfs.fake");
+    std::fs::write(&bin, b"fake mkfs binary v1\n").expect("write fake binary");
+
+    let fp1 = mkfs_fingerprint(&bin).expect("first fingerprint must succeed");
+    let fp2 = mkfs_fingerprint(&bin).expect("second fingerprint must succeed");
     assert_eq!(
         fp1, fp2,
-        "fingerprint must be deterministic across repeated \
-             invocations of the same binary"
+        "fingerprint must be deterministic for the same binary file"
     );
     assert_eq!(
         fp1.len(),
@@ -388,21 +341,48 @@ fn mkfs_version_fingerprint_is_deterministic() {
         fp1.chars().all(|c| c.is_ascii_hexdigit()),
         "fingerprint must be hex-only: {fp1}",
     );
+
     // The first call must have populated the per-process cache.
-    // Pin the cache write so a regression that drops the
-    // memoization (and re-execs `--version` on every call)
-    // surfaces here.
-    let cached = mkfs_version_fingerprint_cache()
+    // Pin the cache write so a regression that drops the memoization
+    // (and re-reads the binary on every call) surfaces here.
+    let cached = mkfs_fingerprint_cache()
         .lock()
         .expect("cache mutex")
-        .get(&binary_path)
+        .get(&bin)
         .cloned();
     assert_eq!(
         cached.as_deref(),
         Some(fp1.as_str()),
         "first call must populate the per-process fingerprint cache; \
-             without the cache, ensure_template re-execs `--version` on \
+             without the cache, ensure_template re-reads the binary on \
              every VM boot",
+    );
+
+    // Distinct binary contents must rotate the fingerprint — this is
+    // exactly the property that forces a fresh template build when the
+    // host formatter is upgraded.
+    let bin2 = dir.path().join("mkfs.fake.v2");
+    std::fs::write(&bin2, b"fake mkfs binary v2\n").expect("write second fake binary");
+    let fp3 = mkfs_fingerprint(&bin2).expect("fingerprint of second binary must succeed");
+    assert_ne!(
+        fp1, fp3,
+        "distinct binary contents must produce distinct fingerprints"
+    );
+}
+
+/// [`mkfs_fingerprint`] bails on an empty binary rather than
+/// fingerprinting a zero-byte stub — a corrupted or failed-install
+/// leftover must surface as an error, not silently key the cache.
+#[test]
+fn mkfs_fingerprint_rejects_empty_binary() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let bin = dir.path().join("mkfs.empty");
+    std::fs::write(&bin, b"").expect("write empty file");
+    let err = mkfs_fingerprint(&bin).expect_err("empty binary must be rejected");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("empty"),
+        "error must name the empty-binary condition: {msg}",
     );
 }
 

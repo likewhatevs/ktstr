@@ -803,7 +803,7 @@ impl KtstrVmBuilder {
     /// [`super::disk_template::cache_root`]) so operators can
     /// inspect what's been built, GC stale entries by hand, and warm
     /// the cache out-of-band by running a Btrfs test once. The cache
-    /// is keyed by `(filesystem_tag, capacity_mib, mkfs_version_fingerprint)` and the
+    /// is keyed by `(filesystem_tag, capacity_mib, mkfs_fingerprint)` and the
     /// directory layout is `<cache>/disk_templates/<key>/template.img`
     /// — see [`super::disk_template`] module docs for the full encoding.
     ///
