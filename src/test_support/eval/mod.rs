@@ -1440,11 +1440,16 @@ fn run_ktstr_test_inner_impl(
                 // remaining verdict-bearing variants in this arm
                 // (TestResult, Exit, SchedExit, ScenarioStart,
                 // ScenarioPause, ScenarioResume, Stdout, SchedLog,
-                // Lifecycle, ExecExit, Dmesg, ProbeOutput, SnapshotReply,
-                // Crash) are consumed by other walkers further down the
-                // pipeline (parse_assert_result_from_drain, bulk_exit
+                // SchedStdout, SchedStderr, Lifecycle, ExecExit, Dmesg,
+                // ProbeOutput, SnapshotReply, Crash) are consumed by
+                // other walkers further down the pipeline
+                // (parse_assert_result_from_drain, bulk_exit
                 // lookup in collect_results, lifecycle classifier,
-                // sched_log concatenator, etc.). No per-entry side effect
+                // sched_log concatenator, etc.). The live scheduler
+                // SchedStdout/SchedStderr streams are consumed only by
+                // the verifier cell path (`concat_sched_std*_chunks`);
+                // for a normal test VM they are diagnostic no-ops here.
+                // No per-entry side effect
                 // here. (Stderr is NOT in this arm — it has its own arm
                 // below that streams to host stderr.) WprofTrace +
                 // WprofTraceChunk are no-ops here: the #[cfg(feature="wprof")]
@@ -1468,6 +1473,8 @@ fn run_ktstr_test_inner_impl(
                     | crate::vmm::wire::MsgType::ScenarioResume
                     | crate::vmm::wire::MsgType::Stdout
                     | crate::vmm::wire::MsgType::SchedLog
+                    | crate::vmm::wire::MsgType::SchedStdout
+                    | crate::vmm::wire::MsgType::SchedStderr
                     | crate::vmm::wire::MsgType::Lifecycle
                     | crate::vmm::wire::MsgType::ExecExit
                     | crate::vmm::wire::MsgType::Dmesg

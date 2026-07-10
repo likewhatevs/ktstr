@@ -22,6 +22,12 @@ const SCHED_LOG_CHUNK_BYTES: usize = 64 * 1024;
 /// scheduler author still sees the kernel's verifier rejection
 /// text in the host-side failure render.
 pub(crate) fn dump_sched_output(log_path: &str) {
+    // The child's output reaches the log file through the live-stream
+    // forwarder threads; every dump caller runs after the child was
+    // reaped, but the forwarders may still be draining the final pipe
+    // bytes. Wait (bounded) so the dumped file — and the live
+    // SchedStdout/SchedStderr streams — carry the complete output.
+    super::scheduler::wait_sched_forwarders_drained(log_path);
     crate::vmm::guest_comms::send_sched_log(crate::verifier::SCHED_OUTPUT_START.as_bytes());
     send_sched_log_file(log_path);
     crate::vmm::guest_comms::send_sched_log(crate::verifier::SCHED_OUTPUT_END.as_bytes());

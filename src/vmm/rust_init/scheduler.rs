@@ -549,6 +549,172 @@ impl std::fmt::Display for SpawnSchedulerError {
 
 impl std::error::Error for SpawnSchedulerError {}
 
+/// Live stdio-forwarder threads still draining a scheduler child's
+/// pipes, keyed by the log path they append to.
+///
+/// Before the live-streaming split the child wrote `/tmp/sched.log`
+/// directly, so reaping the child alone guaranteed a complete file.
+/// With the forwarders in between, the file (and the live stream)
+/// trails the pipe until each thread hits EOF —
+/// [`wait_sched_forwarders_drained`] lets the dump paths restore the
+/// old completeness guarantee by waiting (bounded) on this registry
+/// before reading the file.
+static SCHED_FWD_THREADS: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Vec<std::thread::JoinHandle<()>>>>,
+> = OnceLock::new();
+
+/// Wait (bounded) for the stdio forwarders registered against
+/// `log_path` to finish draining the dead child's pipes, so the merged
+/// log file and the live `SchedStdout`/`SchedStderr` streams both carry
+/// the child's complete output. Callers run AFTER the child was
+/// reaped, so EOF is already pending on both pipes and the wait is
+/// normally a few polls; the bound only trips if a forwarder wedges
+/// (e.g. blocked on virtio backpressure the host never drains), in
+/// which case the dump proceeds with whatever reached the file — the
+/// pre-streaming behavior for a torn-down VM. No-op when no forwarder
+/// was registered for the path (file-only fallback wiring, or a
+/// second dump of the same path).
+pub(crate) fn wait_sched_forwarders_drained(log_path: &str) {
+    use std::time::{Duration, Instant};
+    const DRAIN_BOUND: Duration = Duration::from_secs(5);
+    let Some(map) = SCHED_FWD_THREADS.get() else {
+        return;
+    };
+    let Some(handles) = map.lock().unwrap().remove(log_path) else {
+        return;
+    };
+    let deadline = Instant::now() + DRAIN_BOUND;
+    for h in handles {
+        while !h.is_finished() {
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    log_path,
+                    "scheduler stdio forwarders still draining at dump time; \
+                     the dumped log may be missing the child's final output"
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let _ = h.join();
+    }
+}
+
+/// Forwarder thread for one scheduler-child pipe: read chunks from
+/// `read_end` until EOF (child closed the write end), and for each
+/// chunk (a) append it to the merged `/tmp/sched.log` clone `log` and
+/// (b) ship it live to the host via `sender`.
+///
+/// The `log` append preserves the pre-streaming merged-file view: both
+/// forwarders hold clones of the SAME open file description (from
+/// `File::try_clone`), so their appends share one offset and interleave
+/// in read order exactly as the child's two direct-to-file fds did.
+/// The `sender` ship is best-effort (a not-yet-open bulk port drops the
+/// chunk); neither a file write error nor a send failure stops the
+/// drain — the thread reads to EOF so the pipe never wedges the child
+/// on backpressure.
+///
+/// The handle is registered in [`SCHED_FWD_THREADS`] under `log_path`
+/// so the dump paths can wait for the drain to finish
+/// ([`wait_sched_forwarders_drained`]); a thread-spawn failure
+/// registers nothing and the stream is silently absent, same as the
+/// stdio forwarders in [`super::modes::redirect_stdio_to_bulk_port`].
+fn spawn_sched_log_forwarder(
+    mut read_end: fs::File,
+    mut log: Option<fs::File>,
+    log_path: &str,
+    name: &'static str,
+    sender: fn(&[u8]) -> bool,
+) {
+    let spawned = std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let mut buf = [0u8; STDIO_CHUNK_BYTES];
+            loop {
+                match read_end.read(&mut buf) {
+                    Ok(0) => break, // EOF — child closed its stdout/stderr.
+                    Ok(n) => {
+                        if let Some(f) = log.as_mut() {
+                            let _ = f.write_all(&buf[..n]);
+                        }
+                        let _ = sender(&buf[..n]);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+    if let Ok(handle) = spawned {
+        SCHED_FWD_THREADS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .entry(log_path.to_string())
+            .or_default()
+            .push(handle);
+    }
+}
+
+/// Build the `(stdout, stderr)` [`Stdio`] pair for the scheduler child,
+/// wiring each stream through a live-streaming forwarder thread (pipe →
+/// merged log append + bulk-port ship).
+///
+/// On ANY pipe-setup failure, falls back to handing the child the
+/// merged log-file fds directly (the pre-streaming file-only wiring),
+/// or [`Stdio::null`] when no log file could be created. The streaming
+/// plumbing must never fail the spawn — a lost live stream degrades to
+/// the prior teardown-only dump, it does not abort the scheduler.
+fn sched_child_stdio(log_file: Option<&fs::File>, log_path: &str) -> (Stdio, Stdio) {
+    if let Some(streamed) = try_stream_sched_stdio(log_file, log_path) {
+        return streamed;
+    }
+    // Fallback: file-only (both fds share the merged log's open file
+    // description, as before), or null when no log file exists.
+    let stdout = match log_file.and_then(|f| f.try_clone().ok()) {
+        Some(f) => Stdio::from(f),
+        None => Stdio::null(),
+    };
+    let stderr = match log_file.and_then(|f| f.try_clone().ok()) {
+        Some(f) => Stdio::from(f),
+        None => Stdio::null(),
+    };
+    (stdout, stderr)
+}
+
+/// Try the streaming wiring: two pipes, two forwarder threads, and the
+/// two pipe write ends handed back as the child's `(stdout, stderr)`.
+/// Returns `None` if either pipe could not be created so the caller
+/// falls back to the file-only wiring.
+///
+/// The child receives the pipe WRITE ends; after `Command::spawn` the
+/// parent's copies are closed by the spawn machinery, so the child is
+/// the sole holder and the forwarders' `read`s see EOF on child exit.
+fn try_stream_sched_stdio(log_file: Option<&fs::File>, log_path: &str) -> Option<(Stdio, Stdio)> {
+    let (stdout_r, stdout_w) = super::modes::make_pipe()?;
+    let (stderr_r, stderr_w) = super::modes::make_pipe()?;
+    // Clone the merged log file per forwarder so both append through
+    // the SAME open file description (shared offset → interleave in
+    // read order). A clone failure just drops the file append for that
+    // stream; the live bulk-port ship still runs.
+    let stdout_log = log_file.and_then(|f| f.try_clone().ok());
+    let stderr_log = log_file.and_then(|f| f.try_clone().ok());
+    spawn_sched_log_forwarder(
+        stdout_r,
+        stdout_log,
+        log_path,
+        "ktstr-sched-stdout-fwd",
+        crate::vmm::guest_comms::send_sched_stdout_chunk,
+    );
+    spawn_sched_log_forwarder(
+        stderr_r,
+        stderr_log,
+        log_path,
+        "ktstr-sched-stderr-fwd",
+        crate::vmm::guest_comms::send_sched_stderr_chunk,
+    );
+    Some((Stdio::from(stdout_w), Stdio::from(stderr_w)))
+}
+
 /// Pure spawn helper — runs the spawn → poll-startup → poll-attached
 /// pipeline and returns a `Result` so callers can choose how to
 /// handle each failure mode. The boot path uniformly responds with
@@ -584,14 +750,15 @@ pub(crate) fn try_spawn_scheduler(
     };
 
     let log_file = fs::File::create(log_path).ok();
-    let stdout = match log_file.as_ref().and_then(|f| f.try_clone().ok()) {
-        Some(f) => Stdio::from(f),
-        None => Stdio::null(),
-    };
-    let stderr = match log_file {
-        Some(f) => Stdio::from(f),
-        None => Stdio::null(),
-    };
+    // Wire the child's stdout/stderr through bulk-port forwarder threads
+    // that BOTH append each read chunk to the merged `/tmp/sched.log`
+    // AND ship it live to the host (MSG_TYPE_SCHED_STDOUT /
+    // MSG_TYPE_SCHED_STDERR). The live stream means the scheduler's
+    // output survives a watchdog timeout that never reaches the
+    // teardown `dump_sched_output`; the file append keeps the merged
+    // view `dump_sched_output`, the boot-failure dumps, and the
+    // `SCHED_OUTPUT_*` marker parsing all read unchanged.
+    let (stdout, stderr) = sched_child_stdio(log_file.as_ref(), log_path);
 
     // Build RUST_LOG for the scheduler: append libbpf noise
     // suppression to whatever the guest already has. libbpf
