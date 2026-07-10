@@ -111,6 +111,60 @@ test-macros:
 test-doc:
     cargo test --doc
 
+# Live distro-resolution smoke suite. For every supported distro (both
+# arches where the distro supports them; SteamOS x86_64-only) resolve
+# against the real repo metadata and existence-probe every resolved
+# kernel + debuginfo URL (ranged GET, no body) so an upstream URL or
+# metadata-layout change trips CI in ADVANCE of anyone downloading the
+# kernel. The tests are #[ignore]d (network) for local dev; CI runs them
+# via --run-ignored only. The filter is anchored to the distro test
+# module so it never sweeps in the VM-gauntlet `live_host_*` tests. The
+# `ci` profile's retries absorb transient CDN hiccups.
+test-distro-resolve:
+    cargo nextest run -p ktstr --profile ci --run-ignored only -E 'test(/distro::repo::tests::live_/)'
+
+# Acquire a prebuilt distro kernel into the cache (`kernel build`) and
+# boot it (`shell --exec 'uname -r'`), asserting the guest's kernel
+# release matches `pattern` — so a boot that prints the WRONG kernel, or
+# fails to boot at all, fails CI. A cache hit is normal and expected; a
+# NEW upstream kernel naturally re-exercises the full download + extract
+# + config-gate + boot. `uname -r` is read from the guest's stdout alone
+# (ktstr chatter and the kernel console go to stderr), so `pattern`
+# matches the release string only.
+distro-boot spec pattern:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo run --bin cargo-ktstr -- ktstr kernel build --kernel {{spec}}
+    errlog=$(mktemp)
+    rel=$(cargo run --bin cargo-ktstr -- ktstr shell --kernel {{spec}} --exec 'uname -r' 2>"$errlog") \
+        || { echo "FAIL: {{spec}} boot exited nonzero; stderr:"; cat "$errlog"; rm -f "$errlog"; exit 1; }
+    rm -f "$errlog"
+    printf 'boot %-12s uname -r => %s\n' '{{spec}}' "$rel"
+    grep -Eq '{{pattern}}' <<<"$rel" \
+        || { echo "FAIL: {{spec}} booted kernel '$rel', not matching /{{pattern}}/"; exit 1; }
+
+# Hermetic (zero-network) local-package acquire+boot e2e. Pack the
+# already-built kernel `ver` (its tarball cache entry — build it first
+# with `just kernel-build {{ver}}`) into a synthetic .rpm via the
+# pack_built_kernel_into_synthetic_rpm test, then boot it through the
+# local-package path (`shell --kernel <rpm>`), asserting the guest
+# reports `ver`. Exercises extract + config-gate + cache + boot for a
+# local `.rpm` every CI run with no network.
+local-package-boot ver:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rpm="$(pwd)/target/ktstr-synthetic-{{ver}}.rpm"
+    KTSTR_E2E_KERNEL_VERSION='{{ver}}' KTSTR_E2E_RPM_OUT="$rpm" \
+        cargo nextest run -p ktstr --run-ignored only \
+        -E 'test(pack_built_kernel_into_synthetic_rpm)'
+    errlog=$(mktemp)
+    rel=$(cargo run --bin cargo-ktstr -- ktstr shell --kernel "$rpm" --exec 'uname -r' 2>"$errlog") \
+        || { echo "FAIL: synthetic-rpm boot exited nonzero; stderr:"; cat "$errlog"; rm -f "$errlog"; exit 1; }
+    rm -f "$errlog"
+    printf 'local-package boot uname -r => %s\n' "$rel"
+    grep -q '{{ver}}' <<<"$rel" \
+        || { echo "FAIL: synthetic-rpm booted kernel '$rel', not matching {{ver}}"; exit 1; }
+
 # Verify ktstr stays out of a downstream consumer's release binary.
 # Thin wrapper over the `scripts::devdep-isolation` rust-script recipe
 # (see scripts.just): it builds the dev-dep fixture and asserts

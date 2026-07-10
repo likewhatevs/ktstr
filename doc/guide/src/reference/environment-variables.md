@@ -17,7 +17,7 @@ and the variable in CI job-level `env:` blocks.
 
 | Variable | Effect | Accepted values | Default |
 |---|---|---|---|
-| `KTSTR_KERNEL` | Selects the kernel for every entry point (build-time BTF resolution and runtime image discovery). Set automatically by `cargo ktstr test --kernel`. | Exact version (`6.14`), range (`6.14..7.0`), `git+URL#tag=…`/`#branch=…`/`#sha=…`, path, or cache key | Auto-discovered |
+| `KTSTR_KERNEL` | Selects the kernel for every entry point (build-time BTF resolution and runtime image discovery). Set automatically by `cargo ktstr test --kernel`. | Exact version (`6.14`), range (`6.14..7.0`), `git+URL#tag=…`/`#branch=…`/`#sha=…`, path, local package (`.rpm`/`.deb`/`.pkg.tar.zst`), distro spec (`fedora[-44]`/`f44`, `ubuntu[-24.04]`, `amazonlinux[-2023]`/`al2023`, `steamos[-3.8]`), or cache key | Auto-discovered |
 | `KTSTR_TEST_KERNEL` | Points the test harness directly at a bootable image (`bzImage` on x86_64, `Image` on aarch64). Set-but-empty is a hard error, not a fallback. | Image path | Auto-discovered |
 | `KTSTR_SCHEDULER` | Global binary override for every `SchedulerSpec::Discover` scheduler. See [Troubleshooting](../troubleshooting.md#scheduler-not-found) for the full resolution order. | Binary path | Build/discover cascade |
 | `KTSTR_SCHEDULER_BIN_<NAME>` | Per-scheduler binary override, checked before the global one. `<NAME>` is the discover name uppercased with non-alphanumerics mapped to `_` (`scx-ktstr` → `KTSTR_SCHEDULER_BIN_SCX_KTSTR`). | Binary path | Unset |

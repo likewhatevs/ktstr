@@ -455,6 +455,21 @@ pub struct KtstrVm {
     /// Files to include in the guest initramfs at their archive paths.
     /// Each entry is (archive_path, host_path).
     pub(crate) include_files: Vec<(String, PathBuf)>,
+    /// Raw (already-decompressed) `.ko` images the guest loads via
+    /// `finit_module(2)` before touching any virtio device, in load
+    /// order. Threaded verbatim into [`initramfs::SuffixParams::kernel_modules`]
+    /// by [`Self::suffix_params`]; empty for ktstr-built kernels
+    /// (virtio =y), populated for prebuilt distro kernels (virtio =m).
+    /// Rides the per-run suffix, not the cached base — so it does not
+    /// participate in the `BaseKey` cache key and an empty slice leaves
+    /// the suffix bytes identical to the pre-module output.
+    pub(crate) kernel_modules: Vec<PathBuf>,
+    /// Initrd compression the guest kernel can unpack. LZ4 for
+    /// ktstr-built kernels; prebuilt distro kernels without
+    /// `CONFIG_RD_LZ4` get a format from their own `CONFIG_RD_*` set
+    /// (see [`initramfs::InitrdCompression`]). Non-LZ4 formats bypass
+    /// the SHM base cache + COW overlay and compress on every boot.
+    pub(crate) initrd_compression: initramfs::InitrdCompression,
     /// The optional single virtio-blk disk, rendered as `/dev/vda`. ktstr
     /// wires one blk device; multi-disk would be N PCI functions (re-addable
     /// pre-1.0). The backing file is produced by the template-VM lifecycle
@@ -697,6 +712,7 @@ impl KtstrVm {
             staged_sched_args: &self.staged_sched_args_packed,
             workload_root_cgroup: self.workload_root_cgroup.as_deref(),
             scheduler_cgroup_parent: self.scheduler_cgroup_parent.as_deref(),
+            kernel_modules: &self.kernel_modules,
         }
     }
 
@@ -916,6 +932,46 @@ impl KtstrVm {
                 &self.topology,
                 self.watchdog_timeout,
             )
+        }
+    }
+
+    /// Run-lock acquisition for the interactive / one-shot shell path
+    /// ([`Self::run_interactive`]). Wraps [`Self::acquire_run_locks`] and
+    /// degrades a transient `ResourceContention` (every candidate LLC slot busy
+    /// under a concurrent peer's `LOCK_EX`) to a lock-free best-effort boot
+    /// instead of failing. The test path ([`Self::run`]) propagates contention
+    /// verbatim so nextest can retry the cell after the holder finishes; a
+    /// one-shot `ktstr shell` has no such retry, so on a busy shared host it
+    /// boots without an exclusive reservation rather than aborting. Non-
+    /// contention errors still propagate.
+    fn acquire_interactive_run_locks(&self) -> Result<RunLocks> {
+        Self::degrade_contention_to_overcommit(self.acquire_run_locks())
+    }
+
+    /// Map an [`Self::acquire_run_locks`] result for the one-shot shell path: a
+    /// transient `ResourceContention` becomes a lock-free best-effort
+    /// `RunLocks`; every other outcome (including non-contention errors) passes
+    /// through unchanged. Associated fn over the input `Result` so the degrade
+    /// policy is unit-testable — `acquire_resource_locks` short-circuits to
+    /// Acquired in cargo-test mode, so the contention branch is otherwise
+    /// unreachable from a test.
+    fn degrade_contention_to_overcommit(acquired: Result<RunLocks>) -> Result<RunLocks> {
+        match acquired {
+            Err(e)
+                if e.downcast_ref::<host_topology::ResourceContention>()
+                    .is_some() =>
+            {
+                eprintln!(
+                    "ktstr: host CPUs busy ({e}); booting the shell without an \
+                     exclusive CPU reservation"
+                );
+                Ok(RunLocks {
+                    locks: Vec::new(),
+                    default_cpu_mask: None,
+                    pinning_plan: None,
+                })
+            }
+            other => other,
         }
     }
 
@@ -1302,7 +1358,7 @@ impl KtstrVm {
         // returns. Held via a binding so RAII drop fires on
         // every exit path (including the `?` early-returns
         // below).
-        let _run_locks = self.acquire_run_locks()?;
+        let _run_locks = self.acquire_interactive_run_locks()?;
         // Shell/interactive path mirrors run_vm: no-perf + --cpu-cap
         // applies the LlcPlan's CPU list as a sched_setaffinity mask
         // on every vCPU thread. Perf-mode's pin_targets doesn't

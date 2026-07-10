@@ -793,6 +793,44 @@ fn get_with_transient_retry(
     unreachable!("the attempt == retry.attempts arms above return on the final iteration")
 }
 
+/// GET `url` through the process-wide [`shared_client`] with the
+/// standard [`TRANSIENT_HTTP_RETRY`] policy and return the full
+/// response body as bytes.
+///
+/// The distro repo-metadata resolver ([`crate::distro::repo`]) fetches
+/// repomd.xml, primary.xml.{gz,zst,xz}, `Packages.gz`, and `mirror.list`
+/// through this so every metadata fetch rides the same retry/backoff
+/// seam as the kernel-source downloads. `what` is the error-context
+/// verb ("fetch"). A non-success status is a hard error carrying the
+/// status; the caller adds its own context. No total-request timeout
+/// (mirrors [`fetch_releases`]) — the connect timeout still bounds a
+/// dead route, and metadata bodies are single-digit MiB.
+pub(crate) fn fetch_metadata_bytes(url: &str, what: &str) -> Result<Vec<u8>> {
+    let response =
+        get_with_transient_retry(shared_client(), url, None, what, &TRANSIENT_HTTP_RETRY)?;
+    if !response.status().is_success() {
+        anyhow::bail!("{what} {url}: HTTP {}", response.status());
+    }
+    Ok(response
+        .bytes()
+        .with_context(|| format!("read body of {url}"))?
+        .to_vec())
+}
+
+/// GET `url` like [`fetch_metadata_bytes`] but decode the body as
+/// UTF-8 text — for the plain-text metadata endpoints (`mirror.list`,
+/// `meta-release-lts`).
+pub(crate) fn fetch_metadata_text(url: &str, what: &str) -> Result<String> {
+    let response =
+        get_with_transient_retry(shared_client(), url, None, what, &TRANSIENT_HTTP_RETRY)?;
+    if !response.status().is_success() {
+        anyhow::bail!("{what} {url}: HTTP {}", response.status());
+    }
+    response
+        .text()
+        .with_context(|| format!("read body of {url}"))
+}
+
 /// Construct the cdn.kernel.org `sha256sums.asc` URL for a stable
 /// major series:
 /// `https://cdn.kernel.org/pub/linux/kernel/v{major}.x/sha256sums.asc`.
@@ -1543,6 +1581,61 @@ pub fn download_tarball(
         is_dirty: false,
         is_git: true,
     })
+}
+
+/// Download a single file from `url` to `dest`, streaming through the
+/// `DownloadStream` watchdog + progress bar and verifying the
+/// resulting SHA-256 against `expected_sha256` (hex, case-insensitive).
+///
+/// Used by prebuilt-distro-kernel acquisition
+/// (`crate::distro::acquire`) to fetch each `.rpm`/`.deb` package and
+/// its (up to ~1 GiB) debuginfo. Rides the same transient-retry seam
+/// (`TRANSIENT_HTTP_RETRY`) and no-progress watchdog
+/// (`DOWNLOAD_NO_PROGRESS_TIMEOUT`, which tracks body progress rather
+/// than total time so a large but progressing download is never
+/// aborted) as the kernel-source tarball path. Unlike the tarball
+/// downloaders it does not extract — the bytes land verbatim at `dest`
+/// for the caller to unpack. `label` names the package on its progress
+/// bar; `cli_label` prefixes the size status line.
+pub fn download_verified_file(
+    url: &str,
+    dest: &Path,
+    expected_sha256: &str,
+    label: &str,
+    cli_label: &str,
+    mp: Option<&crate::cli::FetchProgress>,
+) -> Result<()> {
+    let client = shared_client();
+    tracing::info!(%url, "downloading distro kernel package (requires network)");
+    let response = get_with_transient_retry(
+        client,
+        url,
+        Some(DOWNLOAD_REQUEST_READ_TIMEOUT),
+        "download",
+        &TRANSIENT_HTTP_RETRY,
+    )?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("package not found: {url}");
+    }
+    if !response.status().is_success() {
+        anyhow::bail!("download {url}: HTTP {}", response.status());
+    }
+    reject_html_response(&response, url)?;
+    print_download_size(&response, url, cli_label, mp);
+    let total = response.content_length();
+    let download_bar = mp.map(|fp| fp.download_bar(label, total));
+    let mut stream =
+        DownloadStream::with_progress(response, download_bar.as_ref().map(|b| b.bar()));
+    let mut file =
+        std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
+    std::io::copy(&mut stream, &mut file)
+        .with_context(|| format!("stream {url} to {}", dest.display()))?;
+    let (actual_hex, _bytes) = stream.finalize();
+    if let Some(bar) = &download_bar {
+        bar.finish();
+    }
+    verify_sha256(&actual_hex, expected_sha256, url)?;
+    Ok(())
 }
 
 /// Parse the patch level from a kernel version string.

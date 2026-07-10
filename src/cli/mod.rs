@@ -25,6 +25,7 @@ pub use kernel_cmd::{
 
 pub use kernel_list::{format_entry_row, kernel_clean, kernel_list, kernel_list_range_preview};
 
+pub(crate) use kernel_build::critical_config_options;
 pub use kernel_build::{
     KernelBuildResult, append_extra_kconfig_suffix, kernel_build_pipeline, make_kernel_with_output,
     read_extra_kconfig, run_make, run_make_with_output, validate_kernel_config,
@@ -34,9 +35,10 @@ pub use parse::{DISK_HELP, parse_disk_arg, parse_disk_size_mib, parse_topology_s
 
 pub use resolve::{
     KernelDirCacheHit, KernelDirOutcome, KernelResolvePolicy, auto_download_kernel, cache_lookup,
-    check_kvm, check_tools, download_and_cache_version, expand_kernel_range, resolve_cached_kernel,
-    resolve_git_kernel, resolve_include_files, resolve_kernel_dir, resolve_kernel_dir_to_entry,
-    resolve_kernel_image, resolve_kernel_parallelism,
+    check_kvm, check_tools, download_and_cache_version, expand_kernel_range, is_kernel_source_tree,
+    resolve_cached_kernel, resolve_git_kernel, resolve_include_files, resolve_kernel_dir,
+    resolve_kernel_dir_to_entry, resolve_kernel_image, resolve_kernel_parallelism,
+    shell_kernel_or_cwd,
 };
 
 pub use stats_cmds::{

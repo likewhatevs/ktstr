@@ -91,6 +91,16 @@ pub(crate) fn ktstr_guest_init() -> ! {
     mount_filesystems();
     let t_mounts = t0.elapsed();
 
+    // Phase 1b: Load initramfs-embedded kernel modules BEFORE any
+    // virtio device is touched. Prebuilt distro kernels ship virtio
+    // (blk/console/net) as modules, so /dev/vport0p1, /dev/vda, and
+    // /dev/hvc0 do not exist until the drivers load; devtmpfs (mounted
+    // just above) then materialises the nodes. No-op for the ktstr-built
+    // kernels, which pin virtio =y and ship no modules. Diagnostics for
+    // a load failure route to /dev/kmsg so they survive even when the
+    // console itself is the module that failed.
+    load_kernel_modules();
+
     // Install the tracing subscriber as early as possible — right after
     // `mount_filesystems()` so /proc is available for the RUST_LOG
     // cmdline extraction below, and BEFORE the rest of guest init runs

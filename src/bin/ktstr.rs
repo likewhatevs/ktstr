@@ -24,6 +24,16 @@ use ktstr::topology::TestTopology;
 #[path = "ktstr/show_render.rs"]
 mod show_render;
 
+/// Statically-linked busybox binary, compiled by `build.rs` into
+/// `$OUT_DIR/busybox` (a 0-byte placeholder under
+/// `KTSTR_SKIP_BUSYBOX_BUILD`). Embedded in the `ktstr` binary — but
+/// NOT in `ktstr.rlib` — so standalone `ktstr shell` boots a guest
+/// without depending on `cargo-ktstr` to provide the blob. The
+/// `cargo-ktstr` binary carries its own copy via the same
+/// `include_bytes!` mechanism (`src/bin/cargo_ktstr/blobs.rs`); both
+/// embed whatever `build.rs` produced for the build's target arch.
+const BUSYBOX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/busybox"));
+
 #[derive(Parser)]
 #[command(
     name = "ktstr",
@@ -658,6 +668,29 @@ fn kernel_build(
              spelled `./{key}` to be read as a path, not a cache key. Run \
              `kernel list` to see cached entries.",
         ),
+        // For a local package or distro spec, "build" means acquire the
+        // prebuilt kernel into the cache (download + extract, or unpack
+        // local files) — there is nothing to compile. Validated above,
+        // before this match.
+        Some(id @ (KernelId::Package { .. } | KernelId::Distro { .. })) => {
+            let dir = match &id {
+                KernelId::Package { path } => {
+                    ktstr::distro::acquire::acquire_package_kernel(std::slice::from_ref(path))
+                }
+                KernelId::Distro { kind, release } => {
+                    ktstr::distro::acquire::acquire_distro_kernel(
+                        *kind,
+                        release.as_deref(),
+                        "ktstr",
+                        None,
+                    )
+                }
+                _ => unreachable!("arm guarded to Package | Distro"),
+            }
+            .map_err(|e| anyhow::anyhow!("acquire --kernel {id}: {e:#}"))?;
+            eprintln!("ktstr: prebuilt kernel cached at {}", dir.display());
+            Ok(())
+        }
     }
 }
 
@@ -1217,6 +1250,20 @@ fn main() -> Result<()> {
     // in `cli::restore_sigpipe_default`; see that doc for the
     // rationale + SAFETY text.
     ktstr::cli::restore_sigpipe_default();
+    // Export the embedded busybox blob's path so shell-mode VMs
+    // (`ktstr shell`) load it with no external env var. An already-set
+    // KTSTR_BUSYBOX_PATH wins (tests / explicit override); an empty
+    // embedded blob (KTSTR_SKIP_BUSYBOX_BUILD) leaves the var unset so
+    // shell mode fails loudly rather than exec'ing a 0-byte file. MUST
+    // run before tracing init or anything that spawns a thread — the
+    // internal `set_var` requires no concurrent reader (see
+    // `install_blob_env_if_unset` safety doc).
+    if let Err(e) =
+        ktstr::install_blob_env_if_unset(ktstr::KTSTR_BUSYBOX_PATH_ENV, "busybox", BUSYBOX_BYTES)
+    {
+        eprintln!("error: extract embedded busybox blob: {e}");
+        std::process::exit(1);
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1312,6 +1359,12 @@ fn main() -> Result<()> {
             // size errors at CLI-argument time, never mid-VM-setup.
             let disk_cfg = cli::parse_disk_arg(disk.as_deref())?;
             cli::check_kvm()?;
+            // No `--kernel`: default to the cwd when it is a kernel
+            // source tree so `ktstr shell` run from inside a tree
+            // builds and boots that kernel without an explicit
+            // `--kernel .`. Scoped to `shell`; other flows keep their
+            // cache/auto-download defaults.
+            let kernel = cli::shell_kernel_or_cwd(kernel, "ktstr");
             let kernel_path = cli::resolve_kernel_image(
                 kernel.as_deref(),
                 &cli::KernelResolvePolicy {

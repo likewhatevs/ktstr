@@ -181,6 +181,86 @@ jobs:
           files: target/nextest/ci/junit.xml
           report_type: test_results
 
+  # Live distro-resolution smoke suite (Layer 1): resolves every
+  # supported distro against its real repo metadata and existence-probes
+  # every resolved kernel + debuginfo URL WITHOUT downloading a body, so
+  # an upstream URL/metadata-layout change trips CI in advance of anyone
+  # trying to acquire the kernel. Cheap (metadata + ranged-GET probes),
+  # so it runs every CI run on BOTH self-hosted runners — that also
+  # covers each runner's network egress per arch. The tests resolve both
+  # arches' metadata regardless of the host arch (metadata-only), so a
+  # single runner already spans x86_64 + aarch64.
+  distro-resolve:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ktstr-x64, ktstr-arm64]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Provision Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+      - run: cargo install just
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: just test-distro-resolve
+
+  # Full acquire+boot e2e (Layer 2): `kernel build --kernel <spec>` then
+  # a real `shell --kernel <spec> --exec 'uname -r'` boot per bootable
+  # distro, asserting the guest reports the RIGHT kernel. Sibling to the
+  # test jobs on the same self-hosted runners (they have KVM); a sibling
+  # rather than a matrix step so the boots run once, not once per
+  # kernel-version × features cell. Cache hits are normal — a new
+  # upstream kernel re-exercises the full download/extract/gate/boot. The
+  # `local-package-boot` step packs the just-built kernel into a
+  # synthetic .rpm and boots it, exercising the local-package path with
+  # zero network. SteamOS is x86_64-only (Valve ships no other arch).
+  distro-boot-x64:
+    runs-on: [ktstr-x64]
+    env:
+      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Provision Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+      - run: cargo install just
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # Build the kernel the hermetic local-package boot repacks.
+      - run: just kernel-build 6.14
+      - run: just distro-boot fedora 'fc[0-9]'
+      - run: just distro-boot ubuntu generic
+      - run: just distro-boot amazonlinux amzn2023
+      - run: just distro-boot steamos neptune
+      - run: just local-package-boot 6.14
+
+  distro-boot-arm64:
+    runs-on: [ktstr-arm64]
+    env:
+      CARGO_BUILD_JOBS: "32"
+      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Provision Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+      - run: cargo install just
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: just kernel-build 6.14
+      - run: just distro-boot fedora 'fc[0-9]'
+      - run: just distro-boot ubuntu generic
+      - run: just distro-boot amazonlinux amzn2023
+      - run: just local-package-boot 6.14
+
   coverage-x64:
     runs-on: [ktstr-x64]
     env:

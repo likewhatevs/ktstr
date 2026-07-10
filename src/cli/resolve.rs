@@ -343,6 +343,20 @@ pub fn resolve_cached_kernel(
                  version, cache key, or path"
             )
         }
+        // Local packages and distro kernels acquire into the cache
+        // (download + extract, or unpack local files) and resolve to
+        // the resulting entry directory. Validate first so a malformed
+        // distro release surfaces its specific diagnostic.
+        KernelId::Package { path } => {
+            id.validate()
+                .map_err(|e| anyhow::anyhow!("--kernel {id}: {e}"))?;
+            crate::distro::acquire::acquire_package_kernel(std::slice::from_ref(path))
+        }
+        KernelId::Distro { kind, release } => {
+            id.validate()
+                .map_err(|e| anyhow::anyhow!("--kernel {id}: {e}"))?;
+            crate::distro::acquire::acquire_distro_kernel(*kind, release.as_deref(), cli_label, mp)
+        }
     }
 }
 
@@ -431,6 +445,14 @@ pub fn resolve_kernel_image(
                      yet supported in this context — use a single kernel \
                      version, cache key, or path"
                 )
+            }
+            id @ (KernelId::Package { .. } | KernelId::Distro { .. }) => {
+                id.validate()
+                    .map_err(|e| anyhow::anyhow!("--kernel {val}: {e}"))?;
+                let cache_dir = resolve_cached_kernel(&id, policy.cli_label, None)?;
+                crate::kernel_path::find_image_in_dir(&cache_dir).ok_or_else(|| {
+                    anyhow::anyhow!("no kernel image found in {}", cache_dir.display())
+                })
             }
         }
     } else {
@@ -1285,8 +1307,7 @@ pub fn resolve_kernel_dir(
 /// [`resolve_kernel_dir_to_entry`] so the validation diagnostic
 /// and `local_source` error stringification live in one place.
 fn acquire_local_source_tree(path: &Path) -> Result<crate::fetch::AcquiredSource> {
-    let is_source_tree = path.join("Makefile").exists() && path.join("Kconfig").exists();
-    if !is_source_tree {
+    if !is_kernel_source_tree(path) {
         bail!(
             "no kernel image found in {} (not a kernel source tree — \
              missing Makefile or Kconfig)",
@@ -1294,6 +1315,46 @@ fn acquire_local_source_tree(path: &Path) -> Result<crate::fetch::AcquiredSource
         );
     }
     crate::fetch::local_source(path).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Whether `path` is the root of a Linux kernel source tree.
+///
+/// Uses the same Makefile + Kconfig heuristic that
+/// `acquire_local_source_tree` gates on, so a directory this
+/// predicate accepts is exactly one `--kernel <path>` would auto-build
+/// from. Shared with the `shell` subcommand's cwd auto-selection
+/// ([`shell_kernel_or_cwd`]) to keep detection and resolution in sync.
+pub fn is_kernel_source_tree(path: &Path) -> bool {
+    path.join("Makefile").exists() && path.join("Kconfig").exists()
+}
+
+/// Default the `shell` subcommand's `--kernel` to the current
+/// directory when it is a kernel source tree.
+///
+/// When `kernel` is already set the operator's choice is returned
+/// unchanged. When it is `None` and the process's cwd is a kernel
+/// source tree (per [`is_kernel_source_tree`]), the cwd is returned as
+/// the kernel spec and an info line naming it is printed. Otherwise
+/// `None` is returned so [`resolve_kernel_image`] falls through to its
+/// cache / auto-download behavior.
+///
+/// Scoped to `shell`: the test/build/run flows keep their existing
+/// no-`--kernel` defaults. `cli_label` prefixes the status line
+/// (`"ktstr"` / `"cargo ktstr"`).
+pub fn shell_kernel_or_cwd(kernel: Option<String>, cli_label: &str) -> Option<String> {
+    if kernel.is_some() {
+        return kernel;
+    }
+    match std::env::current_dir() {
+        Ok(cwd) if is_kernel_source_tree(&cwd) => {
+            status(&format!(
+                "{cli_label}: no --kernel given, using kernel source tree at {}",
+                cwd.display()
+            ));
+            Some(cwd.to_string_lossy().into_owned())
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -2091,6 +2152,101 @@ mod tests {
             "cache miss without a real kernel toolchain must surface the build failure, \
              got Ok({:?})",
             result.as_ref().ok().map(|o| &o.dir),
+        );
+    }
+
+    /// Positive: a directory with both Makefile and Kconfig at its
+    /// root is detected as a kernel source tree — the same pair
+    /// `acquire_local_source_tree` gates on, so cwd auto-selection
+    /// and explicit `--kernel <path>` agree.
+    #[test]
+    fn is_kernel_source_tree_detects_makefile_plus_kconfig() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("Makefile"), "# fixture\n").unwrap();
+        std::fs::write(dir.path().join("Kconfig"), "# fixture\n").unwrap();
+        assert!(
+            is_kernel_source_tree(dir.path()),
+            "Makefile + Kconfig at the root must detect as a kernel tree",
+        );
+    }
+
+    /// Negative: a Makefile without a Kconfig is not a kernel tree —
+    /// a lone build file (e.g. a plain project) must not be
+    /// auto-selected.
+    #[test]
+    fn is_kernel_source_tree_rejects_makefile_without_kconfig() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("Makefile"), "# fixture\n").unwrap();
+        assert!(
+            !is_kernel_source_tree(dir.path()),
+            "a Makefile alone (no Kconfig) must not detect as a kernel tree",
+        );
+    }
+
+    /// Negative: an empty (non-kernel) directory is not a kernel tree.
+    #[test]
+    fn is_kernel_source_tree_rejects_empty_dir() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        assert!(
+            !is_kernel_source_tree(dir.path()),
+            "an empty directory must not detect as a kernel tree",
+        );
+    }
+
+    /// `shell_kernel_or_cwd` returns the operator's `--kernel`
+    /// unchanged — cwd auto-selection never overrides an explicit
+    /// choice.
+    #[test]
+    fn shell_kernel_or_cwd_preserves_explicit_kernel() {
+        let explicit = Some("6.14".to_string());
+        assert_eq!(
+            shell_kernel_or_cwd(explicit.clone(), "ktstr"),
+            explicit,
+            "an explicit --kernel must pass through untouched",
+        );
+    }
+
+    /// `shell_kernel_or_cwd` with no `--kernel` in a non-kernel cwd
+    /// returns `None`, preserving the cache / auto-download fallthrough.
+    #[test]
+    fn shell_kernel_or_cwd_none_in_non_kernel_cwd_returns_none() {
+        let _lock = crate::test_support::test_helpers::lock_env();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let restore = std::env::current_dir().ok();
+        std::env::set_current_dir(dir.path()).expect("chdir into non-kernel tempdir");
+        let result = shell_kernel_or_cwd(None, "ktstr");
+        if let Some(prev) = restore {
+            std::env::set_current_dir(prev).expect("restore cwd");
+        }
+        assert_eq!(
+            result, None,
+            "a non-kernel cwd with no --kernel must not auto-select a kernel",
+        );
+    }
+
+    /// `shell_kernel_or_cwd` with no `--kernel` in a kernel-tree cwd
+    /// auto-selects that cwd as the kernel spec.
+    #[test]
+    fn shell_kernel_or_cwd_none_in_kernel_cwd_selects_cwd() {
+        let _lock = crate::test_support::test_helpers::lock_env();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("Makefile"), "# fixture\n").unwrap();
+        std::fs::write(dir.path().join("Kconfig"), "# fixture\n").unwrap();
+        let restore = std::env::current_dir().ok();
+        std::env::set_current_dir(dir.path()).expect("chdir into kernel tempdir");
+        let result = shell_kernel_or_cwd(None, "ktstr");
+        let cwd = std::env::current_dir().ok();
+        if let Some(prev) = restore {
+            std::env::set_current_dir(prev).expect("restore cwd");
+        }
+        // Compare against the cwd as observed inside the tempdir:
+        // TempDir paths can be symlinked (e.g. /tmp -> /private/tmp),
+        // so the canonicalized cwd, not `dir.path()`, is the spec
+        // the helper returns.
+        let expected = cwd.map(|p| p.to_string_lossy().into_owned());
+        assert_eq!(
+            result, expected,
+            "a kernel-tree cwd with no --kernel must auto-select the cwd",
         );
     }
 }

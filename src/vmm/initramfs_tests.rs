@@ -422,6 +422,128 @@ fn suffix_skips_staged_entries_with_empty_args() {
     );
 }
 
+/// Empty `kernel_modules` must emit no `modules/` entries, and the
+/// suffix bytes must be byte-identical to a suffix built without the
+/// field at all — the byte-identical guarantee the default-kernel path
+/// (virtio =y, no modules shipped) relies on.
+#[test]
+fn suffix_omits_module_entries_when_empty() {
+    let exe = crate::resolve_current_exe().unwrap();
+    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+
+    let with_empty = build_suffix(
+        base.len(),
+        &SuffixParams {
+            kernel_modules: &[],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let default = build_suffix(base.len(), &SuffixParams::default()).unwrap();
+    assert_eq!(
+        with_empty, default,
+        "empty kernel_modules must produce byte-identical suffix output",
+    );
+
+    let mut archive = base.clone();
+    archive.extend_from_slice(&with_empty);
+    let names = cpio_entry_names(&archive);
+    assert!(
+        !names
+            .iter()
+            .any(|n| n == "modules" || n.starts_with("modules/")),
+        "empty kernel_modules must not emit a modules dir or entries: {names:?}",
+    );
+}
+
+/// Non-empty `kernel_modules` must materialize a `modules` directory
+/// entry followed by one `modules/NNN-<filename>` entry per module in
+/// the caller's slice order — the zero-padded index makes the guest's
+/// lexical readdir sort reproduce that order. Each entry carries the
+/// raw `.ko` bytes verbatim (no strip) as a plain data file; the guest
+/// `load_kernel_modules` finit_module's them in exactly this order.
+#[test]
+fn suffix_emits_kernel_modules_in_order() {
+    let exe = crate::resolve_current_exe().unwrap();
+    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+
+    let dir = tempfile::Builder::new()
+        .prefix("ktstr-kmod-suffix-test-")
+        .tempdir()
+        .unwrap();
+    // Distinct byte payloads; the numeric prefix (not the filename)
+    // determines order, so a load order that does not match the
+    // filename sort is the interesting case.
+    let mods: [(&str, &[u8]); 3] = [
+        ("virtio_ring.ko", b"KO-ring-bytes"),
+        ("virtio.ko", b"KO-core-bytes-xx"),
+        ("virtio_blk.ko", b"KO-blk"),
+    ];
+    let paths: Vec<std::path::PathBuf> = mods
+        .iter()
+        .map(|(name, data)| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, data).unwrap();
+            p
+        })
+        .collect();
+
+    let suffix = build_suffix(
+        base.len(),
+        &SuffixParams {
+            kernel_modules: &paths,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut archive = base.clone();
+    archive.extend_from_slice(&suffix);
+
+    let names = cpio_entry_names(&archive);
+    // The `modules` directory entry must precede its files: the kernel
+    // cpio extractor drops a file whose parent dir has not yet appeared.
+    let dir_pos = names
+        .iter()
+        .position(|n| n == "modules")
+        .expect("modules dir entry must be present");
+    let expected = [
+        "modules/000-virtio_ring.ko",
+        "modules/001-virtio.ko",
+        "modules/002-virtio_blk.ko",
+    ];
+    let positions: Vec<usize> = expected
+        .iter()
+        .map(|e| {
+            names
+                .iter()
+                .position(|n| n == e)
+                .unwrap_or_else(|| panic!("missing module entry {e}: {names:?}"))
+        })
+        .collect();
+    assert!(dir_pos < positions[0], "modules dir must precede its files");
+    assert!(
+        positions.windows(2).all(|w| w[0] < w[1]),
+        "module entries must appear in slice order: {names:?}",
+    );
+
+    // The `modules` entry is a directory; each module is a plain data
+    // file carrying the raw `.ko` bytes verbatim.
+    let entries = cpio_entries(&archive);
+    let dir_entry = entries.iter().find(|(n, ..)| n == "modules").unwrap();
+    assert_eq!(dir_entry.2, 0o40755, "modules must be a directory entry");
+    for (idx, (name, data)) in mods.iter().enumerate() {
+        let archive_path = format!("modules/{idx:03}-{name}");
+        let got = cpio_entry_data(&archive, &archive_path)
+            .unwrap_or_else(|| panic!("missing data for {archive_path}"));
+        assert_eq!(&got, data, "{archive_path} bytes must match the raw .ko");
+        let entry = entries.iter().find(|(n, ..)| n == &archive_path).unwrap();
+        assert_eq!(
+            entry.2, 0o100644,
+            "{archive_path} must be a plain data file (finit_module reads the fd)",
+        );
+    }
+}
+
 #[test]
 fn try_cow_overlay_rejects_cross_region_span() {
     // The bounds check in try_cow_overlay relies on
@@ -479,6 +601,38 @@ fn try_cow_overlay_rejects_cross_region_span() {
 // in `src/vmm/setup/tests.rs`, which drive the real function against
 // a live LZ4 SHM segment. The `try_cow_overlay_rejects_cross_region_span`
 // test below remains as the vm_memory `get_slice` dependency-contract pin.
+
+/// Each non-LZ4 format must round-trip through the matching vendored
+/// decoder — the same codec family the kernel's RD_* unpacker uses —
+/// and Uncompressed must pass bytes through verbatim. (LZ4 legacy has
+/// no vendored decoder; its format is pinned by `lz4_legacy_compress`'s
+/// magic/chunk layout and the live-boot tests.)
+#[test]
+fn compress_initrd_part_round_trips() {
+    use std::io::Read;
+    let data: Vec<u8> = (0..200_000u32).flat_map(|i| i.to_le_bytes()).collect();
+
+    let z = compress_initrd_part(InitrdCompression::Zstd, &data).unwrap();
+    let mut out = Vec::new();
+    zstd::stream::read::Decoder::new(std::io::Cursor::new(&z))
+        .unwrap()
+        .read_to_end(&mut out)
+        .unwrap();
+    assert_eq!(out, data);
+
+    let g = compress_initrd_part(InitrdCompression::Gzip, &data).unwrap();
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(std::io::Cursor::new(&g))
+        .read_to_end(&mut out)
+        .unwrap();
+    assert_eq!(out, data);
+
+    let u = compress_initrd_part(InitrdCompression::Uncompressed, &data).unwrap();
+    assert_eq!(u, data);
+
+    let l = compress_initrd_part(InitrdCompression::Lz4, &data).unwrap();
+    assert_eq!(l[..4], LZ4_LEGACY_MAGIC);
+}
 
 #[test]
 fn load_initramfs_parts_sequential() {

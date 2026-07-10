@@ -300,7 +300,12 @@ pub fn find_test_vmlinux() -> Option<std::path::PathBuf> {
         // fallbacks pick a vmlinux if one exists; the env value
         // would have surfaced a hard error at the actual VM-boot
         // entry point instead.
-        Some(KernelId::Range { .. }) | Some(KernelId::Git { .. }) => None,
+        // Ranges, git, packages, and distro kernels cannot resolve to a
+        // single BTF source here — treat as "no env hint".
+        Some(KernelId::Range { .. })
+        | Some(KernelId::Git { .. })
+        | Some(KernelId::Package { .. })
+        | Some(KernelId::Distro { .. }) => None,
         None => None,
     };
     let result = crate::kernel_path::resolve_btf(resolved_dir.as_deref());

@@ -267,16 +267,44 @@ fn ensure_tracefs_mounted() {
     }
     // Try mounting tracefs first (lighter than debugfs).
     let _ = std::fs::create_dir_all("/sys/kernel/tracing");
-    let _ = std::process::Command::new("mount")
-        .args(["-t", "tracefs", "tracefs", "/sys/kernel/tracing"])
-        .status();
+    try_mount_fs("tracefs", "/sys/kernel/tracing");
     if std::path::Path::new("/sys/kernel/tracing/available_filter_functions").exists() {
         return;
     }
     // Fall back to debugfs which exposes tracefs under tracing/.
-    let _ = std::process::Command::new("mount")
-        .args(["-t", "debugfs", "debugfs", "/sys/kernel/debug"])
-        .status();
+    try_mount_fs("debugfs", "/sys/kernel/debug");
+}
+
+/// Mount `fstype` at `target` (source name == fstype, no options),
+/// mirroring `mount -t <fstype> <fstype> <target>`.
+///
+/// Runs in the guest VM (see `test_support::probe`), where the target
+/// may already be mounted. `EBUSY` (already mounted) is treated as
+/// success so a pre-mounted tracefs/debugfs keeps the accurate
+/// `available_filter_functions` source. Any other error is logged and
+/// swallowed: [`filter_traceable`] then falls back to `/proc/kallsyms`,
+/// the same degraded path the discarded shell-out exit status produced.
+fn try_mount_fs(fstype: &str, target: &str) {
+    use nix::mount::{MsFlags, mount};
+    match mount(
+        Some(fstype),
+        target,
+        Some(fstype),
+        MsFlags::empty(),
+        None::<&str>,
+    ) {
+        Ok(()) | Err(nix::errno::Errno::EBUSY) => {}
+        Err(e) => {
+            tracing::warn!(
+                fstype,
+                target,
+                error = %e,
+                "ensure_tracefs_mounted: mount failed; filter_traceable \
+                 falls back to /proc/kallsyms (includes notrace/noinstr \
+                 functions kprobes reject)"
+            );
+        }
+    }
 }
 
 /// Filter functions to only those traceable via kprobe.

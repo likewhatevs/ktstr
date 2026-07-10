@@ -268,14 +268,14 @@ pub fn clean_orphaned_tmp_dirs(cache_root: &Path) -> Result<usize> {
 ///
 /// 2. **Defense against a fingerprint-blind upgrade.** The cache
 ///    key includes a fingerprint derived from
-///    [`mkfs_version_fingerprint`] (the SHA-256 prefix of
-///    `mkfs.<fstype> --version` output), so an mkfs upgrade that
-///    changes the version banner rotates the key automatically
-///    and the cache self-invalidates. `clean_all` remains the
-///    fallback when the version banner does NOT change across an
-///    upgrade (a downstream patch that bumps the on-disk format
-///    without bumping `--version`) — a rare distro-specific case
-///    that operators discover via "the new kernel rejects the
+///    [`mkfs_fingerprint`] (the SHA-256 prefix of the
+///    `mkfs.<fstype>` binary's contents), so any change to the
+///    formatter binary rotates the key automatically and the cache
+///    self-invalidates. `clean_all` remains the fallback for the
+///    cases the fingerprint cannot see — e.g. a guest-kernel change
+///    (not an mkfs change) that rejects a previously-valid on-disk
+///    format — a rare case that operators discover via "the new
+///    kernel rejects the
 ///    cached template" failures.
 ///
 /// 3. **Cleanup before benchmarking.** Empty cache state lets a

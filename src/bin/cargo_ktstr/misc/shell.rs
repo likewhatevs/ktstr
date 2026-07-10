@@ -198,6 +198,11 @@ pub(crate) fn run_shell(
     // every knob except `capacity_mib` when present.
     let disk_cfg = cli::parse_disk_arg(disk.as_deref()).map_err(|e| format!("{e:#}"))?;
     cli::check_kvm().map_err(|e| format!("{e:#}"))?;
+    // No `--kernel`: default to the cwd when it is a kernel source
+    // tree so `cargo ktstr shell` run from inside a tree builds and
+    // boots that kernel without an explicit `--kernel .`. Scoped to
+    // `shell`; other flows keep their cache/auto-download defaults.
+    let kernel = cli::shell_kernel_or_cwd(kernel, "cargo ktstr");
     let kernel_path = resolve_kernel_image(kernel.as_deref())?;
 
     // `--test <NAME>`: probe each workspace test binary for a

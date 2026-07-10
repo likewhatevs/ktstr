@@ -297,6 +297,36 @@ pub(crate) fn resolve_one(
                  call `resolve_one` per version"
             ))
         }
+        ref id @ (KernelId::Package { .. } | KernelId::Distro { .. }) => {
+            // Local packages and distro kernels acquire into the cache
+            // (download + extract, or unpack local files) and resolve to
+            // the entry directory the gauntlet boots. Validate first so a
+            // malformed distro release surfaces its specific diagnostic.
+            id.validate().map_err(|e| format!("--kernel {id}: {e}"))?;
+            match id {
+                KernelId::Package { path } => {
+                    let dir =
+                        ktstr::distro::acquire::acquire_package_kernel(std::slice::from_ref(path))
+                            .map_err(|e| format!("--kernel {id}: {e:#}"))?;
+                    let label = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "package".to_string());
+                    Ok((label, canonicalize_cache_dir(dir)))
+                }
+                KernelId::Distro { kind, release } => {
+                    let dir = ktstr::distro::acquire::acquire_distro_kernel(
+                        *kind,
+                        release.as_deref(),
+                        "cargo ktstr",
+                        mp,
+                    )
+                    .map_err(|e| format!("--kernel {id}: {e:#}"))?;
+                    Ok((id.to_string(), canonicalize_cache_dir(dir)))
+                }
+                _ => unreachable!("arm guarded to Package | Distro"),
+            }
+        }
     }
 }
 
@@ -773,6 +803,29 @@ pub(crate) fn kernel_build(
              spelled `./{key}` to be read as a path, not a cache key. Run \
              `kernel list` to see cached entries.",
         )),
+        // For a local package or distro spec, "build" means acquire the
+        // prebuilt kernel into the cache (download + extract, or unpack
+        // local files) — there is nothing to compile. Validated above,
+        // before this match.
+        Some(id @ (KernelId::Package { .. } | KernelId::Distro { .. })) => {
+            let dir = match &id {
+                KernelId::Package { path } => {
+                    ktstr::distro::acquire::acquire_package_kernel(std::slice::from_ref(path))
+                }
+                KernelId::Distro { kind, release } => {
+                    ktstr::distro::acquire::acquire_distro_kernel(
+                        *kind,
+                        release.as_deref(),
+                        "cargo ktstr",
+                        None,
+                    )
+                }
+                _ => unreachable!("arm guarded to Package | Distro"),
+            }
+            .map_err(|e| format!("acquire --kernel {id}: {e:#}"))?;
+            eprintln!("cargo ktstr: prebuilt kernel cached at {}", dir.display());
+            Ok(())
+        }
     }
 }
 

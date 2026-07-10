@@ -126,6 +126,7 @@ const SCX_DUMP_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 mod asmsig;
 mod dump;
 mod init;
+mod kmod;
 mod modes;
 mod mounts;
 mod process;
@@ -137,6 +138,7 @@ mod verifier_workload;
 pub(crate) use asmsig::*;
 pub(crate) use dump::*;
 pub(crate) use init::*;
+pub(crate) use kmod::*;
 pub(crate) use modes::*;
 pub(crate) use mounts::*;
 pub(crate) use process::*;

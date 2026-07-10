@@ -24,7 +24,7 @@ use super::host_topology;
 use super::net_config;
 use super::topology::{self, Topology};
 use super::vcpu::{BpfMapWriteParams, WatchBpfMapParams};
-use super::{KtstrVm, disk_config};
+use super::{KtstrVm, disk_config, initramfs};
 
 /// Builder for [`super::KtstrVm`].
 ///
@@ -82,6 +82,17 @@ pub struct KtstrVmBuilder {
     sched_enable_cmds: Vec<String>,
     sched_disable_cmds: Vec<String>,
     include_files: Vec<(String, PathBuf)>,
+    /// Raw (already-decompressed) `.ko` images to load in the guest,
+    /// in load order, before it touches any virtio device. Empty for
+    /// ktstr-built kernels (virtio =y); populated for prebuilt distro
+    /// kernels (virtio =m). See [`KtstrVmBuilder::kernel_modules`].
+    kernel_modules: Vec<PathBuf>,
+    /// Initrd compression the guest kernel can unpack. `Lz4` for
+    /// ktstr-built kernels (ktstr.kconfig pins `CONFIG_RD_LZ4=y`);
+    /// prebuilt distro kernels that lack `RD_LZ4` need a format from
+    /// their own `CONFIG_RD_*` set. See
+    /// [`KtstrVmBuilder::initrd_compression`].
+    initrd_compression: initramfs::InitrdCompression,
     /// v0 holds at most one DiskConfig; rendered as `/dev/vda`.
     /// The optional single virtio-blk disk (set by `.disk()`). ktstr wires one
     /// blk device; a single backing disk suffices for scheduler tests.
@@ -259,6 +270,8 @@ impl Default for KtstrVmBuilder {
             sched_enable_cmds: Vec::new(),
             sched_disable_cmds: Vec::new(),
             include_files: Vec::new(),
+            kernel_modules: Vec::new(),
+            initrd_compression: initramfs::InitrdCompression::Lz4,
             disk: None,
             networks: Vec::new(),
             busybox_bytes: None,
@@ -738,6 +751,32 @@ impl KtstrVmBuilder {
         self
     }
 
+    /// Kernel modules to load in the guest before it touches any virtio
+    /// device, in load order. Each path is a raw (already-decompressed)
+    /// `.ko`; the guest's `rust_init` loads them via `finit_module(2)`
+    /// right after mounting devtmpfs. Required for prebuilt distro
+    /// kernels that ship virtio (blk/console/net) as modules; leave
+    /// empty for ktstr-built kernels (virtio =y). The caller owns
+    /// dependency ordering — modules are loaded exactly as given.
+    #[allow(dead_code)]
+    pub fn kernel_modules(mut self, modules: Vec<PathBuf>) -> Self {
+        self.kernel_modules = modules;
+        self
+    }
+
+    /// Initrd compression format the guest kernel can unpack
+    /// (`CONFIG_RD_*`). Defaults to LZ4 — correct for ktstr-built
+    /// kernels and raw images. For a prebuilt distro kernel pass
+    /// [`crate::cache::initrd_compression_for_image`]'s answer, derived
+    /// from the config cached beside the image; a kernel booted with an
+    /// initrd format it cannot decode panics before reaching userspace
+    /// ("Initramfs unpacking failed").
+    #[allow(dead_code)]
+    pub fn initrd_compression(mut self, comp: initramfs::InitrdCompression) -> Self {
+        self.initrd_compression = comp;
+        self
+    }
+
     /// Attach a disk to the VM. Each call replaces any previously
     /// attached disk; the framework reserves a single MMIO + IRQ
     /// pair, so today the VM exposes at most one virtio-blk device
@@ -764,7 +803,7 @@ impl KtstrVmBuilder {
     /// [`super::disk_template::cache_root`]) so operators can
     /// inspect what's been built, GC stale entries by hand, and warm
     /// the cache out-of-band by running a Btrfs test once. The cache
-    /// is keyed by `(filesystem_tag, capacity_mib, mkfs_version_fingerprint)` and the
+    /// is keyed by `(filesystem_tag, capacity_mib, mkfs_fingerprint)` and the
     /// directory layout is `<cache>/disk_templates/<key>/template.img`
     /// — see [`super::disk_template`] module docs for the full encoding.
     ///
@@ -1117,6 +1156,8 @@ impl KtstrVmBuilder {
             sched_enable_cmds: self.sched_enable_cmds,
             sched_disable_cmds: self.sched_disable_cmds,
             include_files: self.include_files,
+            kernel_modules: self.kernel_modules,
+            initrd_compression: self.initrd_compression,
             disk: self.disk,
             networks: self.networks,
             busybox_bytes: self.busybox_bytes,

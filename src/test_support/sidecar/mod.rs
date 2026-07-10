@@ -2079,7 +2079,10 @@ pub(crate) fn detect_kernel_version() -> Option<String> {
         // the env value is somehow a range or git spec, return
         // `None` rather than guessing one endpoint, and the sidecar
         // record will leave `kernel_version` as null.
-        KernelId::Range { .. } | KernelId::Git { .. } => None,
+        KernelId::Range { .. }
+        | KernelId::Git { .. }
+        | KernelId::Package { .. }
+        | KernelId::Distro { .. } => None,
     }
 }
 
@@ -2656,7 +2659,10 @@ pub fn source_dir_for(raw: &str) -> Option<std::path::PathBuf> {
             let cache = crate::cache::CacheDir::new().ok()?;
             resolve_kernel_source_dir_with_cache(&id, &cache)
         }
-        KernelId::Range { .. } | KernelId::Git { .. } => None,
+        KernelId::Range { .. }
+        | KernelId::Git { .. }
+        | KernelId::Package { .. }
+        | KernelId::Distro { .. } => None,
     }
 }
 

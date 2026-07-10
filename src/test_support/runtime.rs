@@ -902,6 +902,11 @@ pub(crate) fn build_vm_builder_base(
     // just landed.
     let mut builder = crate::vmm::KtstrVm::builder()
         .kernel(kernel)
+        // Prebuilt distro kernels ship virtio as modules; embed the
+        // ordered boot-module set from the cache entry beside the image
+        // (empty for built kernels — a no-op).
+        .kernel_modules(crate::cache::boot_modules_for_image(kernel))
+        .initrd_compression(crate::cache::initrd_compression_for_image(kernel))
         .init_binary(ktstr_bin)
         .topology(vm_topology)
         .memory_deferred_min(memory_mib)

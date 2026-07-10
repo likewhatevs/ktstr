@@ -9,7 +9,7 @@ repository = "https://github.com/likewhatevs/ktstr"
 
 [package]
 name = "ktstr"
-version = "0.26.0"
+version = "0.27.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -67,6 +67,14 @@ postcard = { version = "1", features = ["use-std"] }
 itoa = "1"
 gix = { version = "0.83", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation", "status", "revision", "progress-tree", "tree-editor"] }
 reqwest = { version = "0.13", features = ["blocking"] }
+# Streaming XML pull-parser for distro repo metadata (repomd.xml and
+# the multi-MB primary.xml the Fedora / Amazon Linux resolvers walk in
+# `src/distro/repo.rs`). Used in streaming (`Reader::read_event`) mode
+# so a 70+ MB decompressed primary.xml is filtered package-by-package
+# without materializing a DOM. Already present transitively; pinned as
+# a direct dep so the distro resolver doesn't lean on another crate's
+# re-export surface.
+quick-xml = "0.38"
 tar = "0.4"
 tempfile = "3"
 xz2 = { version = "0.1", features = ["static"] }
@@ -84,6 +92,18 @@ zstd = { version = "0.13", features = ["zstdmt"] }
 lz4_flex = { version = "0.13", features = ["frame"] }
 flate2 = "1"
 glob = "0.3"
+# Pure-Rust RPM parser/builder for the `--kernel` prebuilt-package path
+# (src/distro/extract.rs): parses the lead/signature/main headers to
+# recover arch + NEVRA and hands back the raw cpio payload plus its
+# declared compressor, which the module decompresses with the already-
+# vendored xz2/zstd/flate2 stack rather than pulling rpm's own liblzma
+# backend. `default-features = false` drops the PGP signing/verification
+# tree (pgp, chrono, getrandom) the extractor never touches; `payload`
+# + `gzip-compression` + `zstd-compression` enable the PackageBuilder
+# compressor stack (reusing the vendored flate2 + zstd, no new codec
+# crate) that the unit tests use to synthesize fixture rpms at test
+# time; production only parses.
+rpm = { version = "0.25", default-features = false, features = ["payload", "gzip-compression", "zstd-compression"] }
 # Stack-resident iovec/guard scratch for the virtio-blk vectored
 # read/write handlers (src/vmm/virtio_blk/device.rs): inline capacity
 # MAX_BLK_IOVECS (SEG_MAX*2 = 256) covers the proven worst case so a
@@ -102,7 +122,7 @@ smallvec = { version = "1", features = ["const_generics"] }
 # proc-macro form stays compilable for downstream consumers.
 ctor = "1"
 libc = "0.2"
-nix = { version = "0.31", features = ["event", "feature", "fs", "inotify", "mount", "poll", "process", "ptrace", "reboot", "sched", "signal", "term", "uio"] }
+nix = { version = "0.31", features = ["event", "feature", "fs", "inotify", "kmod", "mount", "poll", "process", "ptrace", "reboot", "sched", "signal", "term", "uio"] }
 blazesym = { version = "0.2", features = ["dwarf"] }
 rand = "0.10"
 rmesg = { version = "1", default-features = false, features = ["sync"] }
@@ -134,7 +154,7 @@ virtio-queue = "0.17"
 vm-superio = "0.8.1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 linkme = "0.3"
-ktstr-macros = { version = "0.26.0", path = "ktstr-macros" }
+ktstr-macros = { version = "0.27.0", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
 # Memory-map /proc/self/exe in the coverage-instrumentation detection
 # probe (`is_coverage_instrumented_binary` / `find_symbol_vaddrs` in

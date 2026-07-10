@@ -231,14 +231,29 @@ pub enum KernelCommand {
 /// hard-to-diagnose mid-run failures.
 /// `cargo ktstr shell` accepts raw images because its flow does not
 /// need that companion metadata; see [`KERNEL_HELP_RAW_OK`].
-pub const KERNEL_HELP_NO_RAW: &str = "Kernel identifier: a source directory \
-     path (e.g. `../linux`), a version (`6.14.2`, or major.minor prefix \
-     `6.14` for latest patch), a cache key (see `kernel list`), a \
-     version range (`6.12..6.14`), or a git source \
-     (`git+URL#tag=NAME`, `git+URL#branch=NAME`, or `git+URL#sha=<40-hex>`). Raw \
+pub const KERNEL_HELP_NO_RAW: &str = "Kernel identifier — one of: \
+     (1) an exact version (`6.14.2`, `6.15-rc3`), a major.minor prefix \
+     (`6.14`, latest patch in the series), or a bare major (`6`, latest \
+     `6.x`); \
+     (2) an inclusive version range (`6.12..6.14` or `6.12..=6.14`); \
+     (3) a git source (`git+URL#tag=NAME`, `git+URL#branch=NAME`, or \
+     `git+URL#sha=<40-hex>`); \
+     (4) a source directory path (`./linux`, `~/linux`, or an absolute path); \
+     (5) a local kernel package (`*.rpm` / `*.deb` / `*.pkg.tar.zst`, one \
+     file per `--kernel`); \
+     (6) a prebuilt distro kernel — `fedora` / `fedora-44` / `f44`, \
+     `ubuntu` / `ubuntu-24.04` (resolves to the latest LTS HWE kernel), \
+     `amazonlinux` / `amazonlinux-2023` / `al2023`, \
+     `steamos` / `steamos-3.8` (a bare distro name picks \
+     the distro's current release); or \
+     (7) a cache key (see `kernel list`). Raw \
      image files are rejected. Source directories auto-build (can be slow \
      on a fresh tree); versions auto-download from kernel.org on cache \
-     miss. The flag is REPEATABLE on `test`, `coverage`, and `llvm-cov` \
+     miss; distro kernels download the prebuilt kernel + debuginfo from the \
+     distro's official repos (cached like a built kernel). Ubuntu splits its \
+     image and modules across two debs, so a modular Ubuntu image needs the \
+     `ubuntu` distro form (which downloads both) rather than a single local \
+     `.deb`. The flag is REPEATABLE on `test`, `coverage`, and `llvm-cov` \
      — passing multiple `--kernel` flags fans the gauntlet across every \
      resolved kernel; each (test × scenario × topology × kernel) \
      tuple becomes a distinct nextest test case so nextest's parallelism, \
@@ -254,15 +269,24 @@ pub const KERNEL_HELP_NO_RAW: &str = "Kernel identifier: a source directory \
 /// `KernelResolvePolicy { accept_raw_image: true, .. }`. See
 /// [`KERNEL_HELP_NO_RAW`] for the converse and the rationale for
 /// the asymmetry.
-pub const KERNEL_HELP_RAW_OK: &str = "Kernel identifier: a source directory \
-     path (e.g. `../linux`), a raw image file (`bzImage` / `Image`), a \
-     version (`6.14.2`, or major.minor prefix `6.14` for latest patch), \
-     or a cache key (see `kernel list`). Source directories auto-build \
+pub const KERNEL_HELP_RAW_OK: &str = "Kernel identifier — one of: \
+     (1) a source directory path (`./linux`, `~/linux`, or an absolute path); \
+     (2) a raw image file (`bzImage` / `Image`); \
+     (3) an exact version (`6.14.2`, `6.15-rc3`), a major.minor prefix \
+     (`6.14`, latest patch), or a bare major (`6`); \
+     (4) a local kernel package (`*.rpm` / `*.deb` / `*.pkg.tar.zst`, one \
+     file per `--kernel`); \
+     (5) a prebuilt distro kernel — `fedora` / `fedora-44` / `f44`, \
+     `ubuntu` / `ubuntu-24.04` (resolves to the latest LTS HWE kernel), \
+     `amazonlinux` / `amazonlinux-2023` / `al2023`, \
+     `steamos` / `steamos-3.8`; or \
+     (6) a cache key (see `kernel list`). Source directories auto-build \
      (can be slow on a fresh tree); versions auto-download from kernel.org \
-     on cache miss. When absent, resolves via cache then filesystem, \
-     falling back to downloading the latest stable kernel. Ranges \
-     (`START..END`) and git sources (`git+URL#tag=NAME`) are not supported \
-     in this context; pass a single kernel.";
+     on cache miss; distro kernels download the prebuilt kernel + debuginfo \
+     from the distro's official repos (cached like a built kernel). When \
+     absent, resolves via cache then filesystem, falling back to downloading \
+     the latest stable kernel. Version ranges (`START..END`) and git sources \
+     (`git+URL#tag=NAME`) are not supported here — pass a single kernel.";
 
 /// Help text for `--kernel` on `kernel build` (`ktstr` and
 /// `cargo ktstr`). Unlike [`KERNEL_HELP_NO_RAW`], this surface builds a
@@ -272,17 +296,29 @@ pub const KERNEL_HELP_RAW_OK: &str = "Kernel identifier: a source directory \
 /// build). A source-directory path auto-builds; a version / range
 /// auto-downloads; a git source is fetched and built. Omitting `--kernel`
 /// builds the latest stable release.
-pub const KERNEL_HELP_BUILD: &str = "Kernel to build: a version (`6.14.2`, \
-     a `MAJOR.MINOR` prefix `6.14` for the latest patch in that series, or a \
-     bare `MAJOR` prefix `6` for the latest patch across all `6.x`), a version range \
-     (`6.11..6.14` — builds every stable/longterm release in the range), a \
-     source directory path (`./linux`, `~/linux`, or an absolute path; a \
-     bare relative name like `linux` is read as a cache key, so prefix a \
-     relative source dir with `./`), or a git source (`git+URL#tag=NAME`, \
-     `git+URL#branch=NAME`, or `git+URL#sha=<40-hex>`). Omitted, the latest \
-     stable release is built. A cache key (an already-built entry from \
-     `kernel list`) is rejected — it names a built kernel, so there is \
-     nothing to build. Build one kernel (or one range) per invocation.";
+pub const KERNEL_HELP_BUILD: &str = "Kernel to build (or, for a prebuilt \
+     spec, acquire into the cache) — one of: \
+     (1) a version (`6.14.2`, `6.15-rc3`), a `MAJOR.MINOR` prefix (`6.14`, \
+     latest patch in that series), or a bare `MAJOR` prefix (`6`, latest \
+     `6.x`); \
+     (2) an inclusive version range (`6.11..6.14` or `6.11..=6.14` — builds \
+     every stable/longterm release in the range); \
+     (3) a source directory path (`./linux`, `~/linux`, or an absolute path; \
+     a bare relative name like `linux` is read as a cache key, so prefix a \
+     relative source dir with `./`); \
+     (4) a git source (`git+URL#tag=NAME`, `git+URL#branch=NAME`, or \
+     `git+URL#sha=<40-hex>`); \
+     (5) a local kernel package (`*.rpm` / `*.deb` / `*.pkg.tar.zst`, one \
+     file per `--kernel`); \
+     or (6) a prebuilt distro kernel — `fedora` / `fedora-44` / `f44`, \
+     `ubuntu` / `ubuntu-24.04` (resolves to the latest LTS HWE kernel), \
+     `amazonlinux` / `amazonlinux-2023` / `al2023`, \
+     `steamos` / `steamos-3.8`. Omitted, the latest \
+     stable release is built. For a local package or distro spec, `build` \
+     downloads/unpacks the prebuilt kernel into the cache rather than \
+     compiling. A cache key (an already-built entry from `kernel list`) is \
+     rejected — it names a built kernel, so there is nothing to build. Build \
+     (or acquire) one kernel per invocation (or one range).";
 
 /// Help text for the `--include-eol` flag, shared by every command
 /// that expands a `START..END` kernel range (`cargo ktstr test`,

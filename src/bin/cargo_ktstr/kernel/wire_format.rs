@@ -361,8 +361,12 @@ pub(crate) fn preflight_collision_check(specs: &[String]) -> Result<(), String> 
                 git_ref,
                 ref_kind,
             } => Some(git_kernel_label(url, git_ref, *ref_kind)),
-            // Path / Range deferred to post-resolve check.
-            KernelId::Path(_) | KernelId::Range { .. } => None,
+            // Path / Range / Package / Distro deferred to post-resolve
+            // check.
+            KernelId::Path(_)
+            | KernelId::Range { .. }
+            | KernelId::Package { .. }
+            | KernelId::Distro { .. } => None,
         };
         if let Some(label) = label {
             let sanitized = ktstr::test_support::sanitize_kernel_label(&label);

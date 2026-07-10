@@ -1136,6 +1136,19 @@ pub struct SuffixParams<'a> {
     /// file emitted ⇒ scheduler runs at the cgroup root without
     /// explicit framework placement.
     pub scheduler_cgroup_parent: Option<&'a str>,
+    /// Kernel modules to load in the guest, in caller-determined load
+    /// order. Each is a raw (already-decompressed) `.ko`; `build_suffix`
+    /// embeds them under `modules/NNN-<filename>` (zero-padded index) so
+    /// a lexical sort in the guest reproduces this slice's order. The
+    /// guest's `rust_init::load_kernel_modules` loads them via
+    /// `finit_module(2)` right after mounting devtmpfs and BEFORE
+    /// touching any virtio device — required for prebuilt distro kernels
+    /// that ship virtio (blk/console/net) as modules. Empty ⇒ no
+    /// `modules/` entries are emitted and the suffix bytes are identical
+    /// to the pre-module output; the ktstr-built kernels pin virtio =y
+    /// and pass an empty slice. Which modules to include is the caller's
+    /// decision (host integration derives them from the target kernel).
+    pub kernel_modules: &'a [PathBuf],
 }
 
 /// Build the suffix that completes a base archive: `/init` (the
@@ -1243,6 +1256,39 @@ pub fn build_suffix(base_len: usize, params: &SuffixParams<'_>) -> Result<Vec<u8
         );
         let data = args.join("\n");
         write_entry(&mut suffix, &archive_path, data.as_bytes(), 0o100644)?;
+    }
+
+    // Kernel modules for the guest to load before touching any virtio
+    // device. Emitted only when non-empty so the zero-module suffix is
+    // byte-identical to the pre-module output. The `modules` directory
+    // entry is written first — the base archive never registers it, and
+    // the kernel's cpio extractor silently drops a file whose parent
+    // directory entry has not yet appeared (same requirement documented
+    // in `build_initramfs_base`'s `register_parent_dirs` loop). Each
+    // module rides at `modules/NNN-<filename>`: the zero-padded index
+    // makes the guest's lexical readdir sort reproduce this slice's
+    // caller-chosen load order (see
+    // `rust_init::load_kernel_modules`). Modules are copied verbatim —
+    // they are already-decompressed `.ko` images the caller resolved
+    // from the target kernel, so no `strip_debug` (which only knows the
+    // userspace ELF section set).
+    if !params.kernel_modules.is_empty() {
+        write_entry(&mut suffix, "modules", &[], 0o40755)?;
+        for (idx, module) in params.kernel_modules.iter().enumerate() {
+            let file_name = module
+                .file_name()
+                .and_then(|n| n.to_str())
+                .with_context(|| {
+                    format!(
+                        "kernel module path has no valid filename: {}",
+                        module.display()
+                    )
+                })?;
+            let data = std::fs::read(module)
+                .with_context(|| format!("read kernel module: {}", module.display()))?;
+            let archive_path = format!("modules/{idx:03}-{file_name}");
+            write_entry(&mut suffix, &archive_path, &data, 0o100644)?;
+        }
     }
 
     // Sentinel: the LAST entry before the trailer. The kernel extracts the
@@ -1785,6 +1831,59 @@ pub fn load_initramfs_parts(
         offset += part.len() as u64;
     }
     Ok((load_addr, offset as u32))
+}
+
+/// Which compression the guest kernel's initramfs unpacker can decode
+/// for the initrd ktstr assembles.
+///
+/// ktstr-built kernels pin `CONFIG_RD_LZ4=y` (ktstr.kconfig), but a
+/// prebuilt distro kernel chooses its own `CONFIG_RD_*` set — AL2023,
+/// for instance, ships only `RD_GZIP` + `RD_ZSTD` — and an initrd in a
+/// format the kernel lacks dies at boot with "Initramfs unpacking
+/// failed: decompressor failed". The boot path selects a variant from
+/// the kernel's extracted `.config`
+/// (`crate::cache::initrd_compression_for_image`), defaulting to
+/// [`InitrdCompression::Lz4`] when no config is available (built
+/// kernels, raw images — today's behavior).
+///
+/// The base and suffix are compressed as SEPARATE streams of the
+/// chosen format and concatenated; the kernel's `unpack_to_rootfs`
+/// loop (init/initramfs.c) decodes one compressed archive per
+/// iteration, advancing by the decompressor-reported consumed length,
+/// so back-to-back frames of any supported format unpack like a single
+/// initramfs. `Uncompressed` is plain newc cpio, which every kernel
+/// unpacks with no `CONFIG_RD_*` at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitrdCompression {
+    /// LZ4 legacy frames (`CONFIG_RD_LZ4`-gated) — the default, and
+    /// the only variant backed by the SHM base cache + COW overlay.
+    Lz4,
+    /// One zstd frame per part (`CONFIG_RD_ZSTD`). Level 1: the
+    /// window log stays far under the unpacker's 8 MiB
+    /// `ZSTD_WINDOWSIZE_MAX` cap (lib/decompress_unzstd.c).
+    Zstd,
+    /// One gzip member per part (`CONFIG_RD_GZIP`).
+    Gzip,
+    /// Plain newc cpio — universally bootable last resort.
+    Uncompressed,
+}
+
+/// Compress one initrd part (base or suffix) in `comp`'s format. The
+/// non-LZ4 variants are the prebuilt-distro fallback path: compressed
+/// locally on every boot, with no SHM cache or COW overlay backing.
+pub(crate) fn compress_initrd_part(comp: InitrdCompression, data: &[u8]) -> Result<Vec<u8>> {
+    match comp {
+        InitrdCompression::Lz4 => Ok(lz4_legacy_compress(data)),
+        InitrdCompression::Zstd => {
+            zstd::stream::encode_all(data, 1).context("zstd-compress initrd part")
+        }
+        InitrdCompression::Gzip => {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            enc.write_all(data).context("gzip-compress initrd part")?;
+            enc.finish().context("finish gzip initrd part")
+        }
+        InitrdCompression::Uncompressed => Ok(data.to_vec()),
+    }
 }
 
 /// LZ4 legacy format magic number (`0x184C2102` little-endian).

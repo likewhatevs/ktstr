@@ -469,6 +469,7 @@ pub mod cli;
 pub mod cpu_util;
 pub mod ctprof;
 pub mod ctprof_compare;
+pub mod distro;
 pub(crate) mod elf_strip;
 #[cfg(feature = "export")]
 pub mod export;
@@ -568,6 +569,14 @@ pub mod worker_ready;
 
 #[cfg(feature = "wprof")]
 pub use vmm::wprof::{WPROF_MIN_MEMORY_MIB, apply_wprof_memory_floor};
+
+/// Re-export of the blob extract / install helpers so the `ktstr`
+/// and `cargo-ktstr` binaries (separate crates linking this lib) can
+/// extract their `include_bytes!`-embedded blobs and export the paths
+/// at startup. The bytes live in each binary; the mechanism lives in
+/// the lib (the `vmm::blobs` module). Re-exported here because `vmm`
+/// is `pub(crate)`, mirroring the `wprof` re-export above.
+pub use vmm::blobs::{extract_blob, install_blob_env_if_unset};
 
 /// Re-export of [`test_support::runtime::bypass_llc_locks_active`]
 /// so the bin/cargo_ktstr + bin/ktstr CLI surfaces (separate
@@ -1569,8 +1578,12 @@ pub const KTSTR_KERNEL_HINT: &str = "set KTSTR_KERNEL to one of: \
     exact version (`6.14`), inclusive range (`6.14..7.0` or \
     `6.14..=7.0`), git source (`git+URL#tag=NAME`, \
     `git+URL#branch=NAME`, or `git+URL#sha=<40-hex>`), absolute or \
-    `~`-prefixed path, or cache key. List cached keys with \
-    `cargo ktstr kernel list`; build new ones with \
+    `~`-prefixed path, local kernel package (`*.rpm`, `*.deb`, or \
+    `*.pkg.tar.zst`), distro kernel (`fedora`/`fedora-44`/`f44`, \
+    `ubuntu`/`ubuntu-24.04`, `amazonlinux`/`amazonlinux-2023`/`al2023`, \
+    `steamos`/`steamos-3.8`), or \
+    cache key. List \
+    cached keys with `cargo ktstr kernel list`; build new ones with \
     `cargo ktstr kernel build`";
 
 /// Read [`KTSTR_KERNEL_ENV`] once, normalizing the raw value:
@@ -1711,6 +1724,35 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
                      version, cache key, or path."
                 );
             }
+            // Local packages and distro kernels acquire into the cache
+            // (download + extract, or unpack local files) and resolve to
+            // the boot image inside the resulting entry. Validate first
+            // so a malformed distro release surfaces its specific
+            // diagnostic. Note the runner injects a cache DIR into
+            // KTSTR_KERNEL (a Path, handled above) rather than a
+            // package/distro spec — this arm serves an operator who sets
+            // KTSTR_KERNEL=fedora / KTSTR_KERNEL=./kernel.rpm directly.
+            ref id @ (KernelId::Package { .. } | KernelId::Distro { .. }) => {
+                if let Err(e) = id.validate() {
+                    anyhow::bail!("KTSTR_KERNEL={val}: {e}");
+                }
+                let cache_dir = match id {
+                    KernelId::Package { path } => {
+                        distro::acquire::acquire_package_kernel(std::slice::from_ref(path))
+                    }
+                    KernelId::Distro { kind, release } => distro::acquire::acquire_distro_kernel(
+                        *kind,
+                        release.as_deref(),
+                        "ktstr",
+                        None,
+                    ),
+                    _ => unreachable!("arm guarded to Package | Distro"),
+                }?;
+                let image = kernel_path::find_image_in_dir(&cache_dir).ok_or_else(|| {
+                    anyhow::anyhow!("no kernel image found in {}", cache_dir.display())
+                })?;
+                return Ok(Some(image));
+            }
         }
     }
 
@@ -1731,6 +1773,21 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
             // could still boot correctly, and skipping them would
             // permanently orphan legacy cache entries.
             if entry.kconfig_status(&kc_hash).is_stale() {
+                continue;
+            }
+            // Skip prebuilt distro / local-package entries. Those are
+            // OPT-IN kernels — requested explicitly via `--kernel fedora`
+            // / `--kernel ./pkg.rpm` or their cache key — not
+            // auto-fallback candidates: they are not ktstr-built, carry
+            // no kconfig hash (so they read as `Untracked`, not stale),
+            // and may not run scx schedulers. Auto-selecting one here
+            // would let a cached `kernel build --kernel fedora` silently
+            // hijack a later kernel-less `cargo ktstr test`.
+            if matches!(
+                entry.metadata.source,
+                cache::KernelSource::DistroPackage { .. }
+                    | cache::KernelSource::LocalPackage { .. }
+            ) {
                 continue;
             }
             let image = entry.image_path();
@@ -2098,6 +2155,13 @@ pub fn run_shell(
     }
     let mut builder = vmm::KtstrVm::builder()
         .kernel(&kernel)
+        // Prebuilt distro kernels ship virtio as modules; embed the
+        // ordered boot-module set from the cache entry beside the image
+        // (empty for built kernels — a no-op).
+        .kernel_modules(cache::boot_modules_for_image(&kernel))
+        // Match the initrd compression to the guest kernel's RD_* set
+        // (from the config cached beside the image; LZ4 when absent).
+        .initrd_compression(cache::initrd_compression_for_image(&kernel))
         .init_binary(&payload)
         .topology(vmm::Topology::new(numa_nodes, llcs, cores, threads))
         .cmdline(&cmdline)

@@ -1731,9 +1731,11 @@ fn entry_matches_spec(entry: &KernelEntry, spec: &str) -> bool {
             };
             entry_t >= start_t && entry_t <= end_t
         }
-        KernelId::CacheKey(_) | KernelId::Path(_) | KernelId::Git { .. } => {
-            entry.sanitized.as_str() == sanitize_kernel_label(spec)
-        }
+        KernelId::CacheKey(_)
+        | KernelId::Path(_)
+        | KernelId::Git { .. }
+        | KernelId::Package { .. }
+        | KernelId::Distro { .. } => entry.sanitized.as_str() == sanitize_kernel_label(spec),
     }
 }
 

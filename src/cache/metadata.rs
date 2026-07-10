@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::vmm::initramfs::InitrdCompression;
+
 /// How a cached kernel's source was acquired, with per-variant
 /// payload (git details for `Git`, source-tree path and git hash for
 /// `Local`).
@@ -61,6 +63,24 @@ pub enum KernelSource {
         /// reproducer.
         git_hash: Option<String>,
     },
+    /// Prebuilt distro kernel downloaded from an official repo
+    /// (`--kernel fedora` / `ubuntu` / `amazonlinux`). Serialized as
+    /// `{"type": "distropackage", "distro": ..., "packages": [...]}`.
+    DistroPackage {
+        /// Short distro tag (e.g. `"fedora44"`, `"ubuntu24.04-hwe"`,
+        /// `"al2023"`) from the repo resolver.
+        distro: String,
+        /// The `name-version` of each package that was extracted
+        /// (kernel image/modules + debuginfo), for provenance.
+        packages: Vec<String>,
+    },
+    /// Prebuilt kernel unpacked from local `.rpm`/`.deb` files
+    /// (`--kernel ./pkg.rpm`). Serialized as
+    /// `{"type": "localpackage", "packages": [...]}`.
+    LocalPackage {
+        /// Basenames of the local package files that were extracted.
+        packages: Vec<String>,
+    },
 }
 
 impl fmt::Display for KernelSource {
@@ -69,6 +89,8 @@ impl fmt::Display for KernelSource {
             KernelSource::Tarball => f.write_str("tarball"),
             KernelSource::Git { .. } => f.write_str("git"),
             KernelSource::Local { .. } => f.write_str("local"),
+            KernelSource::DistroPackage { .. } => f.write_str("distro-package"),
+            KernelSource::LocalPackage { .. } => f.write_str("local-package"),
         }
     }
 }
@@ -269,6 +291,17 @@ pub struct CacheArtifacts<'a> {
     /// Optional path to the raw (unstripped) vmlinux ELF. `store()`
     /// strips it internally before caching.
     pub vmlinux: Option<&'a Path>,
+    /// Ordered, already-decompressed `.ko` boot modules to embed in
+    /// the cache entry under `modules/NNN-<name>` (dependency-first).
+    /// Consumed by prebuilt distro kernels whose virtio drivers are
+    /// modular; empty for built kernels (which need none). `store()`
+    /// preserves the slice order in the `NNN` index so the boot side
+    /// loads them in the same order.
+    pub modules: &'a [PathBuf],
+    /// Optional kernel `.config` to save alongside the image (as
+    /// `config`), for provenance and post-hoc inspection of a prebuilt
+    /// kernel's feature set.
+    pub config: Option<&'a Path>,
 }
 
 impl<'a> CacheArtifacts<'a> {
@@ -277,12 +310,26 @@ impl<'a> CacheArtifacts<'a> {
         CacheArtifacts {
             image,
             vmlinux: None,
+            modules: &[],
+            config: None,
         }
     }
 
     /// Attach the raw (unstripped) vmlinux ELF.
     pub fn with_vmlinux(mut self, vmlinux: &'a Path) -> Self {
         self.vmlinux = Some(vmlinux);
+        self
+    }
+
+    /// Attach the ordered boot-module set (already-decompressed `.ko`).
+    pub fn with_modules(mut self, modules: &'a [PathBuf]) -> Self {
+        self.modules = modules;
+        self
+    }
+
+    /// Attach the kernel `.config` to save into the entry.
+    pub fn with_config(mut self, config: &'a Path) -> Self {
+        self.config = Some(config);
         self
     }
 }
@@ -360,6 +407,14 @@ impl CacheEntry {
         self.path.join("disk-template.img")
     }
 
+    /// Ordered boot modules embedded in this entry
+    /// (`<entry>/modules/NNN-*.ko`), dependency-first, or empty when
+    /// the entry carries none (every built kernel). Scans the
+    /// directory so the layout is the single source of truth.
+    pub fn boot_modules(&self) -> Vec<PathBuf> {
+        ordered_boot_modules_in(&self.path.join("modules"))
+    }
+
     /// Compare this entry's kconfig hash against `current_hash`.
     pub fn kconfig_status(&self, current_hash: &str) -> KconfigStatus {
         match self.metadata.ktstr_kconfig_hash.as_deref() {
@@ -376,6 +431,71 @@ impl CacheEntry {
     /// `--extra-kconfig` fragment.
     pub fn has_extra_kconfig(&self) -> bool {
         self.metadata.extra_kconfig_hash.is_some()
+    }
+}
+
+/// Ordered boot modules under `modules_dir` (`NNN-*.ko`), sorted by
+/// file name so the zero-padded `NNN` index reproduces the load order
+/// `CacheDir::store` wrote. Non-directory / missing paths yield an
+/// empty vector. Pure over one `read_dir`.
+pub fn ordered_boot_modules_in(modules_dir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(modules_dir) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<PathBuf> = rd
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    entries
+}
+
+/// Ordered boot modules for a cached kernel image, discovered from the
+/// `modules/` subdirectory that sits beside the image in its cache
+/// entry (`<entry>/bzImage` + `<entry>/modules/`). Empty for built
+/// kernels and build-tree images (no sibling `modules/`), so callers
+/// can pass the result to `KtstrVmBuilder::kernel_modules`
+/// unconditionally — an empty set is a no-op.
+pub fn boot_modules_for_image(image: &Path) -> Vec<PathBuf> {
+    match image.parent() {
+        Some(dir) => ordered_boot_modules_in(&dir.join("modules")),
+        None => Vec::new(),
+    }
+}
+
+/// Initrd compression the kernel behind `image` can unpack, discovered
+/// from the `config` file that sits beside the image in its cache entry
+/// (`<entry>/bzImage` + `<entry>/config`). No config (built kernels
+/// pin `CONFIG_RD_LZ4=y` via ktstr.kconfig; raw images carry no
+/// sidecar) defaults to LZ4 — today's behavior. With a config, the
+/// first of `RD_LZ4` / `RD_ZSTD` / `RD_GZIP` the kernel enables wins,
+/// falling back to uncompressed cpio (which needs no `CONFIG_RD_*`)
+/// when it enables none. Callers pass the result to
+/// `KtstrVmBuilder::initrd_compression` (crate-private) unconditionally.
+pub fn initrd_compression_for_image(image: &Path) -> InitrdCompression {
+    let Some(config) = image.parent().map(|d| d.join("config")) else {
+        return InitrdCompression::Lz4;
+    };
+    let Ok(text) = std::fs::read_to_string(&config) else {
+        return InitrdCompression::Lz4;
+    };
+    initrd_compression_for_config(&text)
+}
+
+/// Pure core of [`initrd_compression_for_image`]: pick the best
+/// initrd compression from a kernel `.config`'s `CONFIG_RD_*` set.
+fn initrd_compression_for_config(text: &str) -> InitrdCompression {
+    // The RD_* decompressor options are bool symbols: `=y` or absent.
+    let enabled = |opt: &str| text.lines().any(|l| l.strip_prefix(opt) == Some("=y"));
+    if enabled("CONFIG_RD_LZ4") {
+        InitrdCompression::Lz4
+    } else if enabled("CONFIG_RD_ZSTD") {
+        InitrdCompression::Zstd
+    } else if enabled("CONFIG_RD_GZIP") {
+        InitrdCompression::Gzip
+    } else {
+        InitrdCompression::Uncompressed
     }
 }
 
@@ -549,6 +669,55 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    // -- initrd compression discovery --
+
+    #[test]
+    fn cache_initrd_compression_prefers_lz4_then_zstd_then_gzip() {
+        // ktstr-built / Fedora shape: RD_LZ4 present wins outright.
+        let all = "CONFIG_RD_GZIP=y\nCONFIG_RD_LZ4=y\nCONFIG_RD_ZSTD=y\n";
+        assert_eq!(initrd_compression_for_config(all), InitrdCompression::Lz4);
+        // AL2023 shape: no RD_LZ4, RD_ZSTD present.
+        let al2023 = "CONFIG_RD_GZIP=y\n# CONFIG_RD_LZ4 is not set\nCONFIG_RD_ZSTD=y\n";
+        assert_eq!(
+            initrd_compression_for_config(al2023),
+            InitrdCompression::Zstd
+        );
+        let gzip_only = "CONFIG_RD_GZIP=y\n# CONFIG_RD_LZ4 is not set\n";
+        assert_eq!(
+            initrd_compression_for_config(gzip_only),
+            InitrdCompression::Gzip
+        );
+        // No decompressor at all: plain cpio still boots.
+        assert_eq!(
+            initrd_compression_for_config("CONFIG_FOO=y\n"),
+            InitrdCompression::Uncompressed
+        );
+        // A prefix-colliding symbol must not count as enabled.
+        assert_eq!(
+            initrd_compression_for_config("CONFIG_RD_LZ4_EXTRA=y\nCONFIG_RD_ZSTD=y\n"),
+            InitrdCompression::Zstd
+        );
+    }
+
+    #[test]
+    fn cache_initrd_compression_for_image_defaults_to_lz4() {
+        let tmp = TempDir::new().unwrap();
+        let image = tmp.path().join("bzImage");
+        fs::write(&image, b"fake").unwrap();
+        // No config sibling: LZ4 (built kernels / raw images).
+        assert_eq!(initrd_compression_for_image(&image), InitrdCompression::Lz4);
+        // With an AL2023-shaped config sibling: zstd.
+        fs::write(
+            tmp.path().join("config"),
+            "# CONFIG_RD_LZ4 is not set\nCONFIG_RD_ZSTD=y\n",
+        )
+        .unwrap();
+        assert_eq!(
+            initrd_compression_for_image(&image),
+            InitrdCompression::Zstd
+        );
+    }
 
     // -- KernelMetadata serde --
 
