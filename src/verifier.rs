@@ -1215,18 +1215,18 @@ pub fn build_nextest_args(nextest_profile: Option<&str>, forward: &[String]) -> 
 /// cell is:
 /// - ✅ every kernel that ran this (topology, scheduler) passed,
 /// - ❌ every kernel that ran it failed,
-/// - 🇽 mixed — at least one kernel passed AND at least one failed,
+/// - ❎ mixed — at least one kernel passed AND at least one failed,
 /// - `-` no kernel ran this (topology, scheduler) (e.g. the scheduler's
 ///   constraints rejected the preset).
 ///
 /// After the grid, the specific failing `(scheduler, kernel, topology)`
-/// combinations are listed so a ❌ or 🇽 cell can be drilled to the exact
+/// combinations are listed so a ❌ or ❎ cell can be drilled to the exact
 /// kernel(s) that failed. Returns `None` for an empty record set (the
 /// caller prints nothing).
 ///
 /// Rows, columns, and the failing list are BTreeSet-sorted so the same
 /// run renders the same output (shell-pipeline stable). The header line
-/// carries a ✅/❌/🇽 tally counting grid cells.
+/// carries a ✅/❌/❎ tally counting grid cells.
 pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
     if records.is_empty() {
         return None;
@@ -1276,7 +1276,7 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
                 }
                 Some(_) => {
                     n_mixed += 1;
-                    "🇽"
+                    "❎"
                 }
             };
             line.push(text.to_string());
@@ -1284,7 +1284,7 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
         table.add_row(line);
     }
 
-    let mut out = format!("\nverifier summary: {n_pass} ✅  {n_fail} ❌  {n_mixed} 🇽\n{table}\n");
+    let mut out = format!("\nverifier summary: {n_pass} ✅  {n_fail} ❌  {n_mixed} ❎\n{table}\n");
     if !failing.is_empty() {
         out.push_str("\nfailing combinations (scheduler / kernel / topology):\n");
         for (sched, kernel, topo) in &failing {
@@ -1432,7 +1432,7 @@ mod tests {
     }
 
     /// The summary grid aggregates across kernels per (topology,
-    /// scheduler): all-pass -> ✅, all-fail -> ❌, with a ✅/❌/🇽 tally.
+    /// scheduler): all-pass -> ✅, all-fail -> ❌, with a ✅/❌/❎ tally.
     /// Failing (scheduler, kernel, topology) combinations are listed after
     /// the grid; an empty record set renders nothing.
     #[test]
@@ -1455,7 +1455,7 @@ mod tests {
         ];
         let out = render_result_table(&recs).expect("non-empty records -> Some");
         assert!(
-            out.contains("verifier summary: 1 ✅  1 ❌  0 🇽"),
+            out.contains("verifier summary: 1 ✅  1 ❌  0 ❎"),
             "tally: {out}"
         );
         // Columns are scheduler-only (kernels fold into the cell), so no
@@ -1493,12 +1493,12 @@ mod tests {
     }
 
     /// A (topology, scheduler) where one kernel passes and another fails
-    /// renders 🇽 (mixed); an all-pass (topology, scheduler) across kernels
+    /// renders ❎ (mixed); an all-pass (topology, scheduler) across kernels
     /// renders ✅. Only the failing kernel appears in the failing list.
     #[test]
-    fn render_result_table_mixed_kernels_blue_x() {
+    fn render_result_table_mixed_kernels_squared_x() {
         let recs = vec![
-            // tiny-1llc / scx_a: 6_14 passes, 6_15 fails -> mixed -> 🇽.
+            // tiny-1llc / scx_a: 6_14 passes, 6_15 fails -> mixed -> ❎.
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_14".into(),
@@ -1531,7 +1531,7 @@ mod tests {
         ];
         let out = render_result_table(&recs).expect("Some");
         assert!(
-            out.contains("verifier summary: 1 ✅  0 ❌  1 🇽"),
+            out.contains("verifier summary: 1 ✅  0 ❌  1 ❎"),
             "tally counts one all-pass + one mixed cell: {out}"
         );
         let mixed_row = out
@@ -1539,8 +1539,8 @@ mod tests {
             .find(|l| l.contains("tiny-1llc"))
             .expect("tiny-1llc row present");
         assert!(
-            mixed_row.contains('🇽'),
-            "mixed (some pass, some fail) cell renders 🇽: {mixed_row}"
+            mixed_row.contains('❎'),
+            "mixed (some pass, some fail) cell renders ❎: {mixed_row}"
         );
         let pass_row = out
             .lines()
