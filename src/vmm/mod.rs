@@ -1925,18 +1925,22 @@ impl KtstrVm {
         // _raw_guard drops here, restoring terminal and signal handlers.
         drop(_raw_guard);
 
-        // Diagnostic exit-reason line, deferred until after the raw-mode
-        // restore. Printing it at loop break (as run_vm's caller does)
-        // staircases: raw mode has ONLCR off, so the bare `\n` moves the
-        // cursor down without returning it to column 0, and the line
-        // glues onto the guest's final echo. The leading blank eprintln
-        // terminates that echo line — the guest's shell usually powers
-        // off before the hvc0->stdout forwarder drains the echoed
-        // newline of the final `exit`, leaving the cursor mid-line.
+        // Terminate the guest's final echo line, deferred until after
+        // the raw-mode restore: raw mode has ONLCR off, and the guest's
+        // shell usually powers off before the hvc0->stdout forwarder
+        // drains the echoed newline of the final `exit`, leaving the
+        // cursor mid-line — without this the host prompt (or the
+        // diagnostic below) glues onto the guest's final echo.
         if !exec_mode {
             eprintln!();
         }
-        eprintln!("BSP: loop exit reason={bsp_exit_reason:?}");
+        // Exit-reason diagnostic, only for abnormal exits (Fatal /
+        // RunError / GuestPanic). A routine poweroff reaches here as
+        // Shutdown or ExternalKill (see `BspExitReason::is_abnormal`)
+        // and stays silent.
+        if bsp_exit_reason.is_abnormal() {
+            eprintln!("BSP: loop exit reason={bsp_exit_reason:?}");
+        }
 
         // Surface any device-IRQ routing failures the userspace IOAPIC hit
         // during the run. The operator's terminal showed the guest console,
@@ -2002,7 +2006,6 @@ impl KtstrVm {
         }
 
         if !exec_mode {
-            eprintln!("Connection to VM closed.");
             return Ok(None);
         }
 
