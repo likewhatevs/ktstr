@@ -171,9 +171,10 @@ fn my_sched_steady(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-The binary is resolved on the host — `target/{debug,release}/`, the
-test binary's directory, or a `KTSTR_SCHEDULER=/path` override — and
-packed into the VM's initramfs. Full field reference:
+The binary is resolved on the host — a `KTSTR_SCHEDULER=/path`
+override, else built via `cargo build -p <name>` in the declaring
+crate's workspace — and packed into the VM's initramfs. Full field
+reference:
 [Scheduler Definitions](writing-tests/scheduler-definitions.md);
 walkthrough: [Test a New Scheduler](recipes/test-new-scheduler.md).
 

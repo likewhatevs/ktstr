@@ -61,20 +61,17 @@ required; every other key is optional.
 - `binary = "scx_name"` — discover a binary by name. Resolution
   happens entirely on the host, before the VM boots, and the
   resolved binary is packed into the guest initramfs — nothing is
-  resolved inside the guest. The cascade: the global
-  `KTSTR_SCHEDULER` override, then a fresh build via
-  `cargo build -p <name>` run in the workspace of the crate that
-  *declared* the scheduler (the `declare_scheduler!` call site's
-  `CARGO_MANIFEST_DIR`). Cargo owns freshness — it rebuilds when the
-  scheduler's sources change, no-ops when they are up to date, and
-  fails when it cannot build. A failed build refuses to serve a
-  possibly-stale pre-built binary unless
-  `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK` is set, which enables the
-  pre-built fallbacks (a sibling of the test binary, then
-  `target/{release,debug}/`). Test binaries run outside the
-  cargo-ktstr pipeline (`KTSTR_CARGO_TEST_MODE=1`) skip the build
-  and consult the host `PATH` and the pre-built fallbacks first
-  instead.
+  resolved inside the guest. The order: the global `KTSTR_SCHEDULER`
+  override, then a fresh build via `cargo build -p <name>` run in the
+  workspace of the crate that *declared* the scheduler (the
+  `declare_scheduler!` call site's `CARGO_MANIFEST_DIR`). Cargo owns
+  freshness — it rebuilds when the scheduler's sources change,
+  no-ops when they are up to date, and fails when it cannot build. A
+  failed build is a hard error: there is no pre-built fallback,
+  because a scheduler that will not build is a failed test. Test
+  binaries run outside the cargo-ktstr pipeline
+  (`KTSTR_CARGO_TEST_MODE=1`) consult the host `PATH` before the
+  build, so an installed scheduler resolves without an in-tree build.
 
   Because the build runs in the declaring crate's own workspace, a
   scheduler living in a *separate* workspace just needs its

@@ -39,10 +39,10 @@ pub enum SchedulerSpec {
     /// name is fixed so the assertion isn't coupled to the kernel
     /// version's default.
     Eevdf,
-    /// Auto-discover the scheduler binary by name (looks in
-    /// `KTSTR_SCHEDULER` env, the ktstr binary's sibling dir,
-    /// `target/debug/`, `target/release/`, and invokes
-    /// `cargo build` if nothing's found).
+    /// Auto-discover the scheduler binary by name (the
+    /// `KTSTR_SCHEDULER` env override, then in cargo-test mode a
+    /// `$PATH` lookup, otherwise `cargo build -p <name>` in the
+    /// declaring crate's workspace).
     Discover(&'static str),
     /// Explicit filesystem path to a scheduler binary. The file must
     /// already exist; `resolve_scheduler` does not auto-build this
@@ -139,15 +139,15 @@ impl SchedulerSpec {
     /// - `Eevdf` — no userspace scheduler binary at all. Kernel
     ///   default; the running kernel's identity belongs in
     ///   `host.kernel_release`, not here.
-    /// - `Discover(_)` — `resolve_scheduler` has a 5-path cascade
-    ///   (`KTSTR_SCHEDULER` env override → sibling of the ktstr
-    ///   binary → `target/debug/` → `target/release/` → cargo
-    ///   rebuild fallback). Only the rebuild path guarantees the
-    ///   resulting binary was built from the current tree; the
-    ///   four pre-built discovery paths can point at a binary
-    ///   whose commit is unknown to this process. Synthesizing a
-    ///   commit would be a lie in 4 of 5 cases and would silently
-    ///   attribute regressions to the wrong commit. A future
+    /// - `Discover(_)` — `resolve_scheduler` resolves via three
+    ///   steps (`KTSTR_SCHEDULER` env override → cargo-test-mode
+    ///   `$PATH` lookup → `cargo build -p <name>`). Only the build
+    ///   path guarantees the resulting binary was built from the
+    ///   current tree; the env-override and `$PATH` paths can point
+    ///   at a binary whose commit is unknown to this process.
+    ///   Synthesizing a commit would be a lie in 2 of 3 cases and
+    ///   would silently attribute regressions to the wrong commit.
+    ///   A future
     ///   enhancement can probe the binary itself (e.g.
     ///   `--version` output, an ELF note) and return `Some(..)`
     ///   ONLY when the actual commit is introspected; until then,
@@ -5155,10 +5155,10 @@ mod tests {
     // -- SchedulerSpec::scheduler_commit --
     //
     // Conservative by design: EVERY variant currently returns
-    // None, including `Discover(_)`. `resolve_scheduler`'s 5-path
-    // cascade can pick up a binary whose commit is unknown to this
-    // process in four of the five paths, so `Discover` returns
-    // None to avoid lying. The sidecar's nullable
+    // None, including `Discover(_)`. `resolve_scheduler`'s three
+    // steps can pick up a binary whose commit is unknown to this
+    // process in two of the three (env override, `$PATH`), so
+    // `Discover` returns None to avoid lying. The sidecar's nullable
     // semantics distinguish "unset" from a sentinel so consumers
     // can tell "no userspace binary" (Eevdf, KernelBuiltin) from
     // "external binary, commit unknown" (Path) and "discovered
@@ -5182,13 +5182,12 @@ mod tests {
 
     #[test]
     fn scheduler_commit_discover_returns_none() {
-        // `Discover` is resolved by `resolve_scheduler`'s 5-path
-        // cascade. Only the rebuild fallback guarantees the binary
-        // matches the current tree; the four pre-built discovery
-        // paths (KTSTR_SCHEDULER env, ktstr-binary sibling dir,
-        // target/debug/, target/release/) can pick up a binary
-        // whose commit is unknown to this process. Synthesizing a
-        // commit would be a lie in 4 of 5 cases — so the honest
+        // `Discover` is resolved by `resolve_scheduler`'s three
+        // steps. Only the build path guarantees the binary matches
+        // the current tree; the env-override and cargo-test-mode
+        // `$PATH` paths can pick up a binary whose commit is unknown
+        // to this process. Synthesizing a commit would be a lie in
+        // 2 of 3 cases — so the honest
         // answer today is `None`. A future enhancement that probes
         // the binary (e.g. `--version`, ELF note) can flip this to
         // `Some(..)` when an authoritative commit is available;
@@ -5199,8 +5198,8 @@ mod tests {
                 .scheduler_commit()
                 .is_none(),
             "Discover(_) must return None — resolve_scheduler's \
-             cascade can pick up a binary whose commit doesn't \
-             match the workspace. Got: {:?}",
+             env-override / `$PATH` steps can pick up a binary whose \
+             commit doesn't match the workspace. Got: {:?}",
             SchedulerSpec::Discover("scx_mitosis").scheduler_commit(),
         );
     }

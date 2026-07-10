@@ -1457,10 +1457,9 @@ pub const KTSTR_SIDECAR_DIR_ENV: &str = "KTSTR_SIDECAR_DIR";
 /// scheduler regardless of name, so a test declaring multiple distinct
 /// schedulers points them all at the same binary through it.
 ///
-/// Resolution precedence: this global var is checked before the
-/// PATH-lookup / sibling / target-dir cascade and the on-demand
-/// workspace build; if it does not resolve, the cascade falls through
-/// to the build.
+/// Resolution precedence: this global var is checked first — before the
+/// cargo-test-mode `$PATH` lookup and the on-demand workspace build; if
+/// it does not resolve, resolution falls through to the build.
 pub const KTSTR_SCHEDULER_ENV: &str = "KTSTR_SCHEDULER";
 
 /// Name of the environment variable that overrides the kernel
@@ -1818,26 +1817,12 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
 /// profile is set separately.
 pub const KTSTR_SCHEDULER_PROFILE_ENV: &str = "KTSTR_SCHEDULER_PROFILE";
 
-/// Name of the presence-only opt-out env var that re-enables the
-/// pre-built-binary fallback after a FAILED orchestrated scheduler
-/// build. When set to a NON-EMPTY value, a failed `cargo build -p
-/// <sched>` in the non-cargo-test `Discover` path falls back to a
-/// sibling / `target/{debug,release}/` binary AS-IS instead of failing
-/// the test. Default (unset / empty) REFUSES the stale fallback so a
-/// build that fails for a new reason cannot silently validate the test
-/// against an old scheduler. Empty-string rejection mirrors
-/// `KTSTR_CARGO_TEST_MODE` (`cargo_test_mode_active`) — NOT the
-/// presence-only [`KTSTR_ORCHESTRATED_ENV`], which activates on an empty
-/// value — so a stray `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK=` cannot
-/// re-enable the hazard.
-pub const KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV: &str = "KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK";
-
 /// The cargo build profile NAME for the scheduler-under-test:
 /// [`KTSTR_SCHEDULER_PROFILE_ENV`] when set non-empty, else the
-/// `"release"` default. Single source of the default so
-/// [`build_and_find_binary`] (which builds it) and the `Discover`
-/// fallback probe (which locates a pre-built one) never disagree on
-/// which `target/<dir>/` the scheduler lands in.
+/// `"release"` default. Consumed by [`build_and_find_binary`] (which
+/// passes it as `cargo build --profile <name>` and reads the artifact
+/// path back from cargo's JSON output) and by the `affected` scheduler
+/// prebuild, so every scheduler build agrees on the profile.
 pub fn scheduler_profile_name() -> String {
     resolve_scheduler_profile(std::env::var(KTSTR_SCHEDULER_PROFILE_ENV).ok())
 }
