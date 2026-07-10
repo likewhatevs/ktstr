@@ -833,7 +833,12 @@ fn find_first(dest: &Path, candidates: &[String]) -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 /// "HdrS" setup-header magic at offset 0x202 of an x86 bzImage.
+/// Consumed only by the x86_64 `normalize_image` and by the unit tests
+/// (which synthesize host images on every arch), so gate accordingly to
+/// stay dead-code-free in the aarch64 non-test build under `-D warnings`.
+#[cfg(any(target_arch = "x86_64", test))]
 const BZIMAGE_MAGIC_OFFSET: usize = 0x202;
+#[cfg(any(target_arch = "x86_64", test))]
 const BZIMAGE_MAGIC: [u8; 4] = *b"HdrS";
 /// arm64 flat `Image` magic ("ARM\x64") at offset 0x38.
 const ARM64_MAGIC_OFFSET: usize = 0x38;
@@ -905,6 +910,9 @@ fn normalize_arm64_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(image)
 }
 
+/// Used only by the x86_64 `normalize_image` (the aarch64 path reads
+/// the whole image via `fs::read`), so gate it off the aarch64 build.
+#[cfg(target_arch = "x86_64")]
 fn read_prefix(path: &Path, len: usize) -> Result<Vec<u8>> {
     let mut f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut buf = vec![0u8; len];
