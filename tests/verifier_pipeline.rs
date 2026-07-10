@@ -14,7 +14,7 @@ fn resolve_verifier_paths(
     let Some(kernel) = ktstr::find_kernel()? else {
         return Ok(None);
     };
-    let sched_bin = ktstr::build_and_find_binary(package)?;
+    let sched_bin = ktstr::build_and_find_binary(package, env!("CARGO_MANIFEST_DIR"))?;
     let ktstr_bin = std::env::current_exe()?;
     Ok(Some((sched_bin, ktstr_bin, kernel)))
 }

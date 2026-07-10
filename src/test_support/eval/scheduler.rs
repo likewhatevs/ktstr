@@ -227,17 +227,19 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 /// `resolver` is a closure rather than a direct call to
 /// [`resolve_scheduler`] so unit tests can drive the order-
 /// preservation contract with a synthetic resolver that returns
-/// known paths without touching the host filesystem.
+/// known paths without touching the host filesystem. It receives the
+/// whole staged [`Scheduler`](crate::test_support::Scheduler) so the
+/// production closure can forward `manifest_dir` to `resolve_scheduler`.
 pub(crate) fn resolve_staged_schedulers_strict<F>(
     entry: &KtstrTestEntry,
     mut resolver: F,
 ) -> Result<Vec<(String, PathBuf, Vec<String>)>>
 where
-    F: FnMut(&SchedulerSpec) -> Result<Option<PathBuf>>,
+    F: FnMut(&crate::test_support::Scheduler) -> Result<Option<PathBuf>>,
 {
     let mut out = Vec::with_capacity(entry.staged_schedulers.len());
     for staged in entry.staged_schedulers {
-        let Some(host_path) = resolver(&staged.binary)? else {
+        let Some(host_path) = resolver(staged)? else {
             continue;
         };
         out.push((
@@ -274,6 +276,11 @@ fn allow_stale_scheduler_fallback() -> bool {
 /// current workspace tree; every other variant locates a
 /// pre-existing file whose git hash is UNKNOWN to this process.
 ///
+/// `manifest_dir` is the declaring crate's `CARGO_MANIFEST_DIR` (from
+/// [`Scheduler::manifest_dir`](crate::test_support::Scheduler::manifest_dir)),
+/// forwarded to [`crate::build_and_find_binary`] so the on-demand
+/// `Discover` build runs in the scheduler's OWN workspace.
+///
 /// Variant mapping:
 /// - `Eevdf` / `KernelBuiltin { .. }` → `(None, NotFound)` (no
 ///   user-space binary).
@@ -298,7 +305,10 @@ fn allow_stale_scheduler_fallback() -> bool {
 ///   `scx_layered` ahead of a workspace-built one would corrupt
 ///   gauntlet runs whose results must reflect the in-tree
 ///   scheduler revision.
-pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, ResolveSource)> {
+pub fn resolve_scheduler(
+    spec: &SchedulerSpec,
+    manifest_dir: &str,
+) -> Result<(Option<PathBuf>, ResolveSource)> {
     match spec {
         SchedulerSpec::Eevdf | SchedulerSpec::KernelBuiltin { .. } => {
             Ok((None, ResolveSource::NotFound))
@@ -317,19 +327,6 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, Resol
             Ok((Some(path), ResolveSource::Path))
         }
         SchedulerSpec::Discover(name) => {
-            // 0. Per-name override KTSTR_SCHEDULER_BIN_<NAME>. Checked FIRST
-            // so a test declaring multiple distinct Discover schedulers
-            // can point each at its own binary; the global
-            // KTSTR_SCHEDULER below collapses them all to one path. A
-            // set-but-missing path falls through to the global + cascade
-            // (lenient, matching the global's own behavior).
-            if let Ok(p) = std::env::var(crate::per_name_scheduler_env(name)) {
-                let path = PathBuf::from(&p);
-                if path.exists() {
-                    return Ok((Some(path), ResolveSource::EnvVar));
-                }
-            }
-
             // 1. KTSTR_SCHEDULER env var (global / coarse fallback —
             // applies to every Discover scheduler regardless of name).
             if let Ok(p) = std::env::var(crate::KTSTR_SCHEDULER_ENV) {
@@ -375,7 +372,7 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, Resol
             // installed scheduler (PATH lookup above) without a
             // workspace build, so its cascade is legitimate.
             if !crate::cargo_test_mode::cargo_test_mode_active() {
-                match crate::build_and_find_binary(name) {
+                match crate::build_and_find_binary(name, manifest_dir) {
                     Ok(path) => return Ok((Some(path), ResolveSource::AutoBuilt)),
                     Err(e) => {
                         if !allow_stale_scheduler_fallback() {
@@ -450,7 +447,7 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, Resol
             // re-running the build here would be redundant; skip straight to
             // the bail.
             if crate::cargo_test_mode::cargo_test_mode_active() {
-                match crate::build_and_find_binary(name) {
+                match crate::build_and_find_binary(name, manifest_dir) {
                     Ok(path) => return Ok((Some(path), ResolveSource::AutoBuilt)),
                     Err(e) => {
                         eprintln!("ktstr_test: auto-build scheduler '{name}' failed: {e:#}")

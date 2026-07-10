@@ -213,19 +213,20 @@ the host. The order depends on how the test was launched:
 
 **Under `cargo ktstr test` (the normal path):**
 
-1. `KTSTR_SCHEDULER_BIN_<NAME>`, then `KTSTR_SCHEDULER` env overrides.
-2. `cargo build -p <scheduler>` — the build runs up front, so an
-   edited scheduler is never validated against a stale pre-built
-   binary. If that build fails, the test hard-fails rather than
-   falling back; set `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK=1` to
-   re-enable the sibling / `target/{debug,release}/` pre-built
-   fallback while the workspace build is broken.
+1. `KTSTR_SCHEDULER` env override.
+2. `cargo build -p <scheduler>` run in the workspace of the crate that
+   *declared* the scheduler — the build runs up front, so an edited
+   scheduler is never validated against a stale pre-built binary. If
+   that build fails, the test hard-fails rather than falling back; set
+   `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK=1` to re-enable the sibling /
+   `target/{debug,release}/` pre-built fallback while the workspace
+   build is broken.
 
 **Under bare `cargo test` / `cargo nextest run` (marked with
 `KTSTR_CARGO_TEST_MODE=1`):**
 
-1. The env overrides, with `$PATH` also consulted — so an installed
-   scheduler binary resolves without an in-tree build.
+1. The `KTSTR_SCHEDULER` env override, with `$PATH` also consulted — so
+   an installed scheduler binary resolves without an in-tree build.
 2. Sibling of the test binary, then the `target/release/` and
    `target/debug/` build dirs — the scheduler's build profile
    (release by default) is probed first.
@@ -236,8 +237,7 @@ the host. The order depends on how the test was launched:
 
 - `cargo build -p scx_my_sched` — on the orchestrated path this only
   primes the cache; on the bare path it makes the probe hit.
-- Set `KTSTR_SCHEDULER=/path/to/binary` (or the per-name
-  `KTSTR_SCHEDULER_BIN_<NAME>` variant).
+- Set `KTSTR_SCHEDULER=/path/to/binary`.
 - Use `SchedulerSpec::Path` for an explicit path.
 
 ## Scheduler died

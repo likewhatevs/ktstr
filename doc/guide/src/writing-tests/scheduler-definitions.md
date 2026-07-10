@@ -61,10 +61,13 @@ required; every other key is optional.
 - `binary = "scx_name"` — discover a binary by name. Resolution
   happens entirely on the host, before the VM boots, and the
   resolved binary is packed into the guest initramfs — nothing is
-  resolved inside the guest. The cascade: a per-name
-  `KTSTR_SCHEDULER_BIN_<NAME>` env override, then the global
-  `KTSTR_SCHEDULER`, then a fresh workspace build via
-  `cargo build -p <name>` — a failed build refuses to serve a
+  resolved inside the guest. The cascade: the global
+  `KTSTR_SCHEDULER` override, then a fresh build via
+  `cargo build -p <name>` run in the workspace of the crate that
+  *declared* the scheduler (the `declare_scheduler!` call site's
+  `CARGO_MANIFEST_DIR`). Cargo owns freshness — it rebuilds when the
+  scheduler's sources change, no-ops when they are up to date, and
+  fails when it cannot build. A failed build refuses to serve a
   possibly-stale pre-built binary unless
   `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK` is set, which enables the
   pre-built fallbacks (a sibling of the test binary, then
@@ -72,6 +75,12 @@ required; every other key is optional.
   cargo-ktstr pipeline (`KTSTR_CARGO_TEST_MODE=1`) skip the build
   and consult the host `PATH` and the pre-built fallbacks first
   instead.
+
+  Because the build runs in the declaring crate's own workspace, a
+  scheduler living in a *separate* workspace just needs its
+  `declare_scheduler!` to be compiled in that workspace — no env var
+  is required. In CI, a prior `cargo build --release -p <name>` in
+  the same workspace makes the in-test build a cache no-op.
 - `binary_path = "/abs/path"` — explicit pre-built binary; must
   exist on the host, packed into the initramfs as-is.
 - `kernel_builtin_enable = [...]` + `kernel_builtin_disable = [...]`

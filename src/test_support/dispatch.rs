@@ -1773,91 +1773,92 @@ fn format_unknown_kernel_label_error(
     )
 }
 
-/// The set of workspace PACKAGE names, parsed once from the workspace
-/// `Cargo.toml` baked in at compile time. [`list_verifier_cells_all`]
+/// The set of PACKAGE names in the workspace rooted at `manifest_dir`,
+/// queried once per dir via `cargo metadata`. [`list_verifier_cells_all`]
 /// uses it to skip `declare_scheduler!` decls whose `Discover(pkg)` is
-/// not a real workspace package — the macro-expansion FIXTURES in
-/// tests/declare_scheduler.rs register into `KTSTR_SCHEDULERS` but have
-/// no buildable package, so their cells must not be emitted.
+/// not a real member of the DECLARING crate's workspace — the
+/// macro-expansion FIXTURES in tests/declare_scheduler.rs register into
+/// `KTSTR_SCHEDULERS` but name packages that are not members of ktstr's
+/// own workspace, so their cells must not be emitted.
 ///
-/// `CARGO_MANIFEST_DIR` is the ktstr crate dir, which IS the workspace
-/// root in this repo, so its `Cargo.toml` carries `[workspace] members`.
-fn workspace_packages() -> &'static std::collections::HashSet<String> {
+/// `cargo metadata --no-deps` is the authoritative answer to "which
+/// packages live in this workspace": it resolves glob members like
+/// `"scheds/rust/*"` (which scx uses) and package-name≠dir-name renames
+/// that a hand-parse of `[workspace] members` would miss.
+///
+/// Memoized per `manifest_dir` (the value is `Box::leak`ed to `'static`).
+/// On `cargo metadata` failure the returned set is EMPTY (every
+/// `Discover` cell in that workspace is then skipped) and a one-time
+/// warning is emitted to stderr, matching the diagnostic style of the
+/// surrounding lister code.
+fn workspace_member_packages(manifest_dir: &str) -> &'static std::collections::HashSet<String> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
     use std::sync::OnceLock;
-    static PKGS: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
-    PKGS.get_or_init(|| {
-        const ROOT_TOML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
-        parse_workspace_member_packages(ROOT_TOML, env!("CARGO_PKG_NAME"))
-    })
-}
-
-/// Per-name env override (`KTSTR_SCHEDULER_BIN_<NAME>`) for a
-/// `Discover(pkg)` scheduler, resolved to an EXISTING path.
-///
-/// Mirrors the FIRST arm of the Discover resolution cascade in
-/// `eval::scheduler::resolve_scheduler` (private module, not
-/// linkable from here): the
-/// per-name var pointed at an on-disk binary. Used at BOTH verifier cell
-/// EMISSION ([`list_verifier_cells_all`]) and cell RUNTIME
-/// ([`run_verifier_cell_inner`]) so an external Discover scheduler pointed
-/// at a pre-built binary EMITS a cell AND resolves to that same binary at
-/// run time. The two sites MUST agree: emitting a cell the runtime cannot
-/// resolve would fail the cell, and resolving a cell that was never
-/// emitted is unreachable — the lockstep is the whole point.
-///
-/// Deliberately per-name ONLY (no global [`crate::KTSTR_SCHEDULER_ENV`]
-/// fallback, unlike `resolve_scheduler`). The verifier's runtime resolver
-/// is [`crate::build_and_find_binary`] (a `cargo build -p <pkg>`), which
-/// honors NEITHER env var; the global var is also coarse — set once, it
-/// would resurrect every skipped `declare_scheduler!` fixture
-/// (`scx-full`, `scx-ee`, …) as a cell collapsed onto a single binary.
-/// The per-name var names one scheduler and one binary, matching the
-/// intent (a specific external Discover scheduler) without that blast
-/// radius.
-fn discover_env_override(pkg: &str) -> Option<std::path::PathBuf> {
-    let raw = std::env::var(crate::per_name_scheduler_env(pkg)).ok()?;
-    let path = std::path::PathBuf::from(raw);
-    path.exists().then_some(path)
-}
-
-/// Pure parse of `[workspace] members = [ ... ]` from a `Cargo.toml`
-/// string into the set of package names. The `.` member (the workspace
-/// root) maps to `root_pkg`; every other member's last path component is
-/// taken as its package name (this workspace's convention: member dir
-/// `scx-ktstr` = package `scx-ktstr`). Pure so it is unit-testable.
-fn parse_workspace_member_packages(
-    cargo_toml: &str,
-    root_pkg: &str,
-) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
-    // Anchor on the [workspace] section so a stray `members` key
-    // elsewhere can't be mistaken for the workspace member list.
-    let Some(ws) = cargo_toml.find("[workspace]") else {
-        return out;
-    };
-    let after_ws = &cargo_toml[ws..];
-    let Some(m) = after_ws.find("members") else {
-        return out;
-    };
-    let after = &after_ws[m..];
-    let Some(open) = after.find('[') else {
-        return out;
-    };
-    let Some(close_rel) = after[open..].find(']') else {
-        return out;
-    };
-    for tok in after[open + 1..open + close_rel].split(',') {
-        let name = tok.trim().trim_matches('"').trim();
-        if name.is_empty() {
-            continue;
-        }
-        if name == "." {
-            out.insert(root_pkg.to_string());
-        } else {
-            out.insert(name.rsplit('/').next().unwrap_or(name).to_string());
-        }
+    static CACHE: OnceLock<Mutex<HashMap<String, &'static std::collections::HashSet<String>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(set) = guard.get(manifest_dir) {
+        return set;
     }
-    out
+    let set: &'static std::collections::HashSet<String> =
+        Box::leak(Box::new(query_workspace_member_packages(manifest_dir)));
+    guard.insert(manifest_dir.to_string(), set);
+    set
+}
+
+/// Run `cargo metadata --no-deps` against `<manifest_dir>/Cargo.toml` and
+/// collect the `packages[].name` set. Returns an EMPTY set (with a
+/// one-time stderr warning) when cargo cannot be spawned, exits non-zero,
+/// or emits JSON the walker cannot parse — every `Discover` cell rooted
+/// in that workspace is then gated out rather than emitted for a package
+/// the runtime resolver could not build.
+fn query_workspace_member_packages(manifest_dir: &str) -> std::collections::HashSet<String> {
+    let manifest_path = std::path::Path::new(manifest_dir).join("Cargo.toml");
+    let output = std::process::Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .arg("--manifest-path")
+        .arg(&manifest_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            eprintln!(
+                "ktstr verifier: `cargo metadata` for {} failed ({}); \
+                 skipping this workspace's Discover schedulers:\n{}",
+                manifest_path.display(),
+                o.status,
+                String::from_utf8_lossy(&o.stderr).trim(),
+            );
+            return std::collections::HashSet::new();
+        }
+        Err(e) => {
+            eprintln!(
+                "ktstr verifier: could not run `cargo metadata` for {} ({e}); \
+                 skipping this workspace's Discover schedulers",
+                manifest_path.display(),
+            );
+            return std::collections::HashSet::new();
+        }
+    };
+    let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        eprintln!(
+            "ktstr verifier: `cargo metadata` for {} produced unparsable JSON; \
+             skipping this workspace's Discover schedulers",
+            manifest_path.display(),
+        );
+        return std::collections::HashSet::new();
+    };
+    meta.get("packages")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|pkg| pkg.get("name").and_then(|n| n.as_str()))
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Emit `verifier/<sched>/<kernel>/<preset>: test` lines — one per
@@ -1937,27 +1938,24 @@ fn list_verifier_cells_all() {
             continue;
         }
         // Skip declarations whose binary is not a real, buildable
-        // scheduler. The macro-expansion FIXTURES in
-        // tests/declare_scheduler.rs (`binary = "scx-full"`, `"scx-ee"`,
-        // …) register into KTSTR_SCHEDULERS but expand to `Discover` of a
-        // package that is NOT a workspace member; emitting their cells
-        // would make `cargo ktstr verifier --run-ignored` fail on
+        // scheduler. The invariant is "a cell emits iff the runtime
+        // resolver can build it": emission checks package membership of
+        // the DECLARING crate's workspace (via
+        // [`workspace_member_packages`] keyed on `sched.manifest_dir`),
+        // and the runtime resolver in `run_verifier_cell_inner` builds in
+        // that SAME workspace with `cargo build -p <pkg>` run from
+        // `sched.manifest_dir` — so the two stay in lockstep. The
+        // macro-expansion FIXTURES in tests/declare_scheduler.rs
+        // (`binary = "scx-full"`, `"scx-ee"`, …) are declared in ktstr's
+        // own tests and name packages that are NOT members of ktstr's
+        // workspace, so they are gated out; emitting their cells would
+        // make `cargo ktstr verifier --run-ignored` fail on
         // `cargo build -p <fixture>` for a nonexistent package. A
         // `Discover` of a real workspace member (scx-ktstr) and a `Path`
-        // that exists still emit. A `Discover` of a NON-member ALSO emits
-        // when its per-name env override (`KTSTR_SCHEDULER_BIN_<NAME>`,
-        // via [`discover_env_override`]) points at an on-disk binary: an
-        // external scheduler declared with a bare `binary = "scx_foo"` and
-        // supplied a prebuilt binary through the env is resolvable, so its
-        // cell must emit. The runtime resolver in `run_verifier_cell_inner`
-        // consults the SAME [`discover_env_override`] before
-        // `build_and_find_binary`, so an emitted env-backed cell resolves
-        // at run time — the two stay in lockstep. This is the
-        // emission-time counterpart to the resolve arms in
-        // `run_verifier_cell`.
+        // that exists still emit.
         match sched.binary {
             SchedulerSpec::Discover(pkg)
-                if !workspace_packages().contains(pkg) && discover_env_override(pkg).is_none() =>
+                if !workspace_member_packages(sched.manifest_dir).contains(pkg) =>
             {
                 continue;
             }
@@ -2118,23 +2116,21 @@ fn run_verifier_cell_inner(
     };
 
     let sched_bin: std::path::PathBuf = match sched.binary {
-        // Per-name env override first (mirrors `resolve_scheduler`'s
-        // Discover cascade AND the emission-time gate in
-        // `list_verifier_cells_all`): an external scheduler pointed at a
-        // prebuilt binary via `KTSTR_SCHEDULER_BIN_<NAME>` resolves
-        // WITHOUT a `cargo build -p <pkg>` (which would fail for a
-        // non-workspace package). Falls through to `build_and_find_binary`
-        // for a workspace-member Discover with no env override.
-        SchedulerSpec::Discover(pkg) => match discover_env_override(pkg) {
-            Some(p) => p,
-            None => match crate::build_and_find_binary(pkg) {
+        // Build the scheduler in the DECLARING crate's workspace with
+        // `cargo build -p <pkg>` run from `sched.manifest_dir` — the same
+        // workspace whose membership the emission-time gate in
+        // `list_verifier_cells_all` checked, so an emitted cell always
+        // names a buildable package. Cargo owns freshness (rebuild when
+        // sources changed, no-op when up to date, fail when unbuildable).
+        SchedulerSpec::Discover(pkg) => {
+            match crate::build_and_find_binary(pkg, sched.manifest_dir) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("ktstr verifier: build scheduler {pkg:?}: {e:#}");
                     return 1;
                 }
-            },
-        },
+            }
+        }
         SchedulerSpec::Path(p) => {
             let path = std::path::PathBuf::from(p);
             if !path.exists() {

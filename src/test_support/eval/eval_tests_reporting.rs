@@ -734,12 +734,12 @@ fn resolve_staged_schedulers_strict_preserves_entry_iteration_order() {
         staged_schedulers: SCHEDS,
         ..crate::test_support::entry::KtstrTestEntry::DEFAULT
     };
-    let resolved = resolve_staged_schedulers_strict(&entry, |spec| {
+    let resolved = resolve_staged_schedulers_strict(&entry, |sched| {
         // Encode the spec as a deterministic synthetic path so
         // the resolver is pure (no FS) and the test can pin
         // both the order AND that the resolver was called per
         // staged entry.
-        let key = match spec {
+        let key = match &sched.binary {
             SchedulerSpec::Discover(s) => s.to_string(),
             _ => "unexpected_variant".to_string(),
         };
@@ -788,7 +788,7 @@ fn resolve_staged_schedulers_strict_skips_resolver_none() {
         staged_schedulers: SCHEDS,
         ..crate::test_support::entry::KtstrTestEntry::DEFAULT
     };
-    let resolved = resolve_staged_schedulers_strict(&entry, |spec| match spec {
+    let resolved = resolve_staged_schedulers_strict(&entry, |sched| match &sched.binary {
         SchedulerSpec::Discover("scx_skip") => Ok(None),
         SchedulerSpec::Discover(s) => Ok(Some(PathBuf::from(format!("/synthetic/{s}")))),
         _ => Ok(None),
@@ -814,7 +814,7 @@ fn resolve_staged_schedulers_strict_propagates_resolver_error() {
         staged_schedulers: SCHEDS,
         ..crate::test_support::entry::KtstrTestEntry::DEFAULT
     };
-    let err = resolve_staged_schedulers_strict(&entry, |_spec| {
+    let err = resolve_staged_schedulers_strict(&entry, |_sched| {
         Err::<Option<PathBuf>, _>(anyhow::anyhow!(
             "synthetic resolver error — staged binary not found on host"
         ))

@@ -516,10 +516,11 @@ fn scheduler_input_set_from_artifact(
 /// parse-what-was-emitted keeps the successful schedulers precise while the
 /// failed ones fall through to the conservative `None`.
 ///
-/// Deliberately NOT [`ktstr::build_and_find_binary`], which pins cargo's cwd to
-/// ktstr's own manifest dir (baked via `env!("CARGO_MANIFEST_DIR")` at compile
-/// time) -- wrong here, because `affected` runs INSIDE the target repo, whose
-/// schedulers are what we build. Uses the SAME profile
+/// Deliberately NOT [`ktstr::build_and_find_binary`], which builds a SINGLE
+/// package from a caller-supplied workspace dir. `affected` runs INSIDE the
+/// target repo and builds MANY scheduler packages in one `cargo build`
+/// invocation with the inherited cwd (the target repo), so it drives cargo
+/// directly. Uses the SAME profile
 /// (`ktstr::scheduler_profile_name`: `KTSTR_SCHEDULER_PROFILE` or the release
 /// default) the scheduler-under-test is built with, so the `.d` lands in the
 /// matching `target/<profile>/` and a warm build is reused.

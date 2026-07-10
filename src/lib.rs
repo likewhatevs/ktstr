@@ -1452,55 +1452,16 @@ pub const KTSTR_SIDECAR_DIR_ENV: &str = "KTSTR_SIDECAR_DIR";
 
 /// Name of the environment variable that overrides the scheduler
 /// binary path test_support::eval uses for in-process scheduler
-/// dispatch. Read at `crate::test_support::eval`. This is the COARSE
+/// dispatch. Read at `crate::test_support::eval`. This is a COARSE
 /// (global) override: it applies to EVERY `SchedulerSpec::Discover`
 /// scheduler regardless of name, so a test declaring multiple distinct
-/// schedulers can't point them at different binaries through it — use
-/// the per-name variant ([`per_name_scheduler_env`]) for that.
+/// schedulers points them all at the same binary through it.
 ///
-/// Resolution precedence: the per-name override is checked FIRST; this
-/// global var is the fallback when no per-name var is set; if neither
-/// resolves, the cascade falls through to the workspace build.
+/// Resolution precedence: this global var is checked before the
+/// PATH-lookup / sibling / target-dir cascade and the on-demand
+/// workspace build; if it does not resolve, the cascade falls through
+/// to the build.
 pub const KTSTR_SCHEDULER_ENV: &str = "KTSTR_SCHEDULER";
-
-/// Per-scheduler-NAME override environment variable for a
-/// `SchedulerSpec::Discover(name)` scheduler:
-/// `KTSTR_SCHEDULER_BIN_<NAME>`, where `<NAME>` is the discover name
-/// uppercased with every non-alphanumeric character replaced by `_`
-/// (e.g. `scx_layered` -> `KTSTR_SCHEDULER_BIN_SCX_LAYERED`,
-/// `scx-ktstr` -> `KTSTR_SCHEDULER_BIN_SCX_KTSTR`).
-///
-/// The `BIN` infix keeps the per-name namespace disjoint from the
-/// `KTSTR_SCHEDULER_*` meta-variables ([`KTSTR_SCHEDULER_ENV`] = the
-/// global override, [`KTSTR_SCHEDULER_PROFILE_ENV`] = the build
-/// profile): without it a scheduler named `profile` would derive
-/// `KTSTR_SCHEDULER_PROFILE` and shadow the build-profile selector.
-/// `-` and `_` both map to `_` (env-var names can't contain `-`), so
-/// `scx-foo` and `scx_foo` derive the same var — not a practical
-/// ambiguity, as a scheduler is referred to by one canonical spelling
-/// per run.
-///
-/// Checked BEFORE the global [`KTSTR_SCHEDULER_ENV`] in the Discover
-/// resolution cascade, so a test that declares several distinct
-/// Discover schedulers (one `entry.scheduler` plus staged schedulers)
-/// can point each at its own pre-built binary. The global var remains
-/// the coarse fallback for the common single-scheduler case. A set
-/// per-name var whose path does not exist falls through to the global
-/// var and then the build cascade (lenient, matching the global var's
-/// own missing-path behavior).
-pub fn per_name_scheduler_env(name: &str) -> String {
-    let suffix: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("KTSTR_SCHEDULER_BIN_{suffix}")
-}
 
 /// Name of the environment variable that overrides the kernel
 /// path the eval dispatch reads (orthogonal to
@@ -1935,10 +1896,14 @@ mod scheduler_profile_tests {
 
 /// Build a cargo binary package and return its output path.
 ///
-/// Runs from the ktstr crate's manifest directory (which is also the
-/// workspace root in this repo) so that workspace-level feature
-/// unification (e.g. vendored libbpf-sys) is always in effect,
-/// regardless of the calling process's working directory.
+/// Runs `cargo build -p <package>` from `workspace_dir` — the manifest
+/// directory of the crate that DECLARED the scheduler. Cargo walks up
+/// from there to that crate's workspace root, so the lockfile, feature
+/// unification (e.g. vendored libbpf-sys), and target dir all come from
+/// the scheduler's own workspace, regardless of the calling process's
+/// working directory. For a `declare_scheduler!` scheduler `workspace_dir`
+/// is the invoking crate's `CARGO_MANIFEST_DIR`; for ktstr's own in-tree
+/// builders it is ktstr's crate dir (the workspace root in this repo).
 ///
 /// The scheduler-under-test is built with the RELEASE profile by
 /// DEFAULT: a debug sched_ext scheduler is far slower and its BPF
@@ -1949,7 +1914,10 @@ mod scheduler_profile_tests {
 /// <name>` verbatim (`dev` = the default profile, `release` == `--release`,
 /// any custom `[profile.<name>]`), so the returned artifact path resolves
 /// under the matching `target/<dir>/`.
-pub fn build_and_find_binary(package: &str) -> anyhow::Result<std::path::PathBuf> {
+pub fn build_and_find_binary(
+    package: &str,
+    workspace_dir: &str,
+) -> anyhow::Result<std::path::PathBuf> {
     let profile = scheduler_profile_name();
     let build_args: Vec<String> = vec![
         "build".into(),
@@ -1961,7 +1929,7 @@ pub fn build_and_find_binary(package: &str) -> anyhow::Result<std::path::PathBuf
     ];
     let output = std::process::Command::new("cargo")
         .args(&build_args)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .current_dir(workspace_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()

@@ -178,7 +178,7 @@ pub fn export_test(test_name: &str, output: Option<PathBuf>) -> Result<()> {
 /// under `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK`. cargo-test-mode
 /// resolves via `$PATH` first.
 fn resolve_scheduler_for_export(entry: &KtstrTestEntry) -> Result<Option<PathBuf>> {
-    let (path, _source) = resolve_scheduler(&entry.scheduler.binary)
+    let (path, _source) = resolve_scheduler(&entry.scheduler.binary, entry.scheduler.manifest_dir)
         .with_context(|| format!("resolve scheduler binary for test '{}'", entry.name))?;
     Ok(path)
 }

@@ -1275,6 +1275,22 @@ pub struct Scheduler {
     /// Empty (`&[]`) means no filter — the scheduler verifies
     /// against every entry in `KTSTR_KERNEL_LIST`.
     pub kernels: &'static [&'static str],
+    /// Manifest directory of the crate that DECLARED this scheduler —
+    /// the `CARGO_MANIFEST_DIR` captured at the `declare_scheduler!`
+    /// call site. A [`SchedulerSpec::Discover`] scheduler is built with
+    /// `cargo build -p <pkg>` run FROM this directory, so cargo walks up
+    /// to the declaring crate's own workspace root: lockfile, feature
+    /// unification, and target dir all come from that workspace, and
+    /// verifier-cell emission checks package membership of that same
+    /// workspace.
+    ///
+    /// `declare_scheduler!` fills this automatically with the invoking
+    /// crate's `CARGO_MANIFEST_DIR`. Direct [`Scheduler::named`] builder
+    /// users default to ktstr's own crate dir (the workspace root in
+    /// this repo); a direct builder user OUTSIDE the ktstr tree whose
+    /// scheduler lives in another workspace should pass their own
+    /// `env!("CARGO_MANIFEST_DIR")` via [`Self::manifest_dir`].
+    pub manifest_dir: &'static str,
 }
 
 impl Scheduler {
@@ -1324,6 +1340,7 @@ impl Scheduler {
         config_file: None,
         config_file_def: None,
         kernels: &[],
+        manifest_dir: env!("CARGO_MANIFEST_DIR"),
     };
 
     /// Const constructor for defining schedulers in static context.
@@ -1358,6 +1375,11 @@ impl Scheduler {
     /// - `kernels`: empty slice — verifies against every kernel
     ///   in the operator's `--kernel` set (no per-scheduler
     ///   filter).
+    /// - `manifest_dir`: ktstr's own `CARGO_MANIFEST_DIR` (the
+    ///   workspace root in this repo). `declare_scheduler!` overrides
+    ///   this with the invoking crate's dir; a direct builder user
+    ///   whose scheduler lives in a different workspace overrides via
+    ///   [`Self::manifest_dir`].
     pub const fn named(name: &'static str) -> Scheduler {
         Scheduler {
             name,
@@ -1379,12 +1401,27 @@ impl Scheduler {
             config_file: None,
             config_file_def: None,
             kernels: &[],
+            manifest_dir: env!("CARGO_MANIFEST_DIR"),
         }
     }
 
     /// Set the binary spec. Returns self for const chaining.
     pub const fn binary(mut self, binary: SchedulerSpec) -> Self {
         self.binary = binary;
+        self
+    }
+
+    /// Set the declaring crate's manifest directory — the workspace a
+    /// [`SchedulerSpec::Discover`] scheduler is built in. Returns self
+    /// for const chaining.
+    ///
+    /// `declare_scheduler!` passes the call-site
+    /// `CARGO_MANIFEST_DIR` automatically; direct builder users outside
+    /// the ktstr tree should pass their own `env!("CARGO_MANIFEST_DIR")`
+    /// so cargo builds the scheduler in ITS workspace rather than
+    /// ktstr's. See the [field doc](field@Self::manifest_dir).
+    pub const fn manifest_dir(mut self, dir: &'static str) -> Self {
+        self.manifest_dir = dir;
         self
     }
 
@@ -4181,6 +4218,7 @@ mod tests {
             config_file: None,
             config_file_def: Some(("--config {file}", "/include-files/cfg.json")),
             kernels: &[],
+            manifest_dir: env!("CARGO_MANIFEST_DIR"),
         };
         fn good_test_func(_: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -4263,6 +4301,7 @@ mod tests {
             config_file: None,
             config_file_def: Some(("f:{file}", "/include-files/p.json")),
             kernels: &[],
+            manifest_dir: env!("CARGO_MANIFEST_DIR"),
         };
         fn good_test_func(_: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -5055,6 +5094,7 @@ mod tests {
             config_file: None,
             config_file_def: None,
             kernels: &[],
+            manifest_dir: env!("CARGO_MANIFEST_DIR"),
         };
         let entry = KtstrTestEntry {
             name: "test_inverted_scheduler",

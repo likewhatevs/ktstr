@@ -345,7 +345,7 @@ pub(crate) fn require_vmlinux(kernel_path: &std::path::Path) -> std::path::PathB
 /// infrastructure failure -- the workspace is broken, not the test.
 #[cfg(test)]
 pub(crate) fn require_binary(package: &str) -> std::path::PathBuf {
-    crate::build_and_find_binary(package).unwrap_or_else(|e| {
+    crate::build_and_find_binary(package, env!("CARGO_MANIFEST_DIR")).unwrap_or_else(|e| {
         panic!(
             "ktstr_test: build of `{package}` failed: {e:#}. \
              Run `cargo build -p {package}` to reproduce and diagnose."

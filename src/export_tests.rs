@@ -519,6 +519,7 @@ fn generate_preamble_does_not_auto_inject_cell_parent_cgroup_from_cgroup_parent(
         config_file: None,
         config_file_def: None,
         kernels: &[],
+        manifest_dir: env!("CARGO_MANIFEST_DIR"),
     };
     let entry = KtstrTestEntry {
         name: "no_auto_inject_smoke",
@@ -562,6 +563,7 @@ fn generate_preamble_passes_user_supplied_cell_parent_cgroup_through() {
         config_file: None,
         config_file_def: None,
         kernels: &[],
+        manifest_dir: env!("CARGO_MANIFEST_DIR"),
     };
     let entry = KtstrTestEntry {
         name: "user_supplied_smoke",
@@ -640,6 +642,7 @@ fn config_file_addition_emits_hardcoded_config_arg_with_dir_expansion() {
         config_file: Some(host_cfg_str),
         config_file_def: None,
         kernels: &[],
+        manifest_dir: env!("CARGO_MANIFEST_DIR"),
     }));
     let entry = KtstrTestEntry {
         name: "config_file_export_smoke",
@@ -696,6 +699,7 @@ fn config_content_addition_writes_temp_file_and_substitutes_template() {
         config_file: None,
         config_file_def: Some(("--layered-config {file}", "/include-files/layers.json")),
         kernels: &[],
+        manifest_dir: env!("CARGO_MANIFEST_DIR"),
     };
     const CONTENT: &str = "{\"layers\": [\"foo\", \"bar\"]}\n";
     let entry = KtstrTestEntry {
@@ -756,6 +760,7 @@ fn config_content_addition_writes_inside_process_scratch_dir() {
         config_file: None,
         config_file_def: Some(("--config={file}", "/include-files/dirpin.json")),
         kernels: &[],
+        manifest_dir: env!("CARGO_MANIFEST_DIR"),
     };
     let entry = KtstrTestEntry {
         name: "scratch_dir_pin_smoke",
@@ -806,6 +811,7 @@ fn config_content_addition_same_content_same_canonical_path() {
         config_file: None,
         config_file_def: Some(("--config={file}", "/include-files/idem.json")),
         kernels: &[],
+        manifest_dir: env!("CARGO_MANIFEST_DIR"),
     };
     const CONTENT: &str = "{\"idem\": 42}\n";
     let entry = KtstrTestEntry {
@@ -869,6 +875,7 @@ fn config_content_addition_rejects_basename_with_shell_metacharacters() {
         // scratch write fires.
         config_file_def: Some(("--config={file}", "/include-files/$evil.json")),
         kernels: &[],
+        manifest_dir: env!("CARGO_MANIFEST_DIR"),
     };
     let entry = KtstrTestEntry {
         name: "metachar_pin_smoke",
@@ -916,6 +923,7 @@ fn generate_preamble_prepends_config_addition_prefix() {
         config_file: None,
         config_file_def: None,
         kernels: &[],
+        manifest_dir: env!("CARGO_MANIFEST_DIR"),
     };
     let entry = KtstrTestEntry {
         name: "preamble_config_smoke",
@@ -975,6 +983,7 @@ fn generate_preamble_emits_config_addition_before_base_sched_args() {
         config_file: None,
         config_file_def: None,
         kernels: &[],
+        manifest_dir: env!("CARGO_MANIFEST_DIR"),
     };
     let entry = KtstrTestEntry {
         name: "order_pin_test",
@@ -1038,6 +1047,7 @@ fn compute_config_export_additions_dual_fire_when_file_and_content_set() {
         config_file: Some(host_cfg_str),
         config_file_def: Some(("--layered-config {file}", "/include-files/layers.json")),
         kernels: &[],
+        manifest_dir: env!("CARGO_MANIFEST_DIR"),
     }));
     let entry = KtstrTestEntry {
         name: "dual_fire_smoke",
@@ -1101,6 +1111,7 @@ fn config_file_addition_rejects_directory_with_actionable_error() {
         config_file: Some(dir_path_str),
         config_file_def: None,
         kernels: &[],
+        manifest_dir: env!("CARGO_MANIFEST_DIR"),
     }));
     let entry = KtstrTestEntry {
         name: "directory_reject_smoke",
@@ -1162,6 +1173,7 @@ fn config_file_addition_rejects_basename_with_shell_metacharacters() {
         config_file: Some(evil_path_str),
         config_file_def: None,
         kernels: &[],
+        manifest_dir: env!("CARGO_MANIFEST_DIR"),
     }));
     let entry = KtstrTestEntry {
         name: "metachar_reject_smoke",
@@ -1220,6 +1232,7 @@ fn archive_basename_matches_args_shell_prefix_for_config_file() {
         config_file: Some(host_cfg_str),
         config_file_def: None,
         kernels: &[],
+        manifest_dir: env!("CARGO_MANIFEST_DIR"),
     }));
     let entry = KtstrTestEntry {
         name: "basename_parity_smoke",

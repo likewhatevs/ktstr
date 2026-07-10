@@ -2803,6 +2803,7 @@ mod tests {
             config_file: None,
             config_file_def: Some(("--config={file}", "/include-files/p.json")),
             kernels: &[],
+            manifest_dir: env!("CARGO_MANIFEST_DIR"),
         };
         fn func(_: &Ctx) -> anyhow::Result<crate::assert::AssertResult> {
             Ok(crate::assert::AssertResult::pass())
@@ -2860,6 +2861,7 @@ mod tests {
             config_file: None,
             config_file_def: Some(("--config={file}", "/include-files/p.json")),
             kernels: &[],
+            manifest_dir: env!("CARGO_MANIFEST_DIR"),
         };
         fn func(_: &Ctx) -> anyhow::Result<crate::assert::AssertResult> {
             Ok(crate::assert::AssertResult::pass())

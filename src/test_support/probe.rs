@@ -578,7 +578,7 @@ fn build_repro_vm_builder(
     // its own dump.
     let mut resolved_staged: Vec<(String, std::path::PathBuf, Vec<String>)> = Vec::new();
     for staged in entry.staged_schedulers {
-        match super::eval::resolve_scheduler(&staged.binary) {
+        match super::eval::resolve_scheduler(&staged.binary, staged.manifest_dir) {
             Ok((Some(host_path), _src)) => {
                 resolved_staged.push((
                     staged.name.to_string(),
