@@ -844,6 +844,18 @@ const BZIMAGE_MAGIC: [u8; 4] = *b"HdrS";
 const ARM64_MAGIC_OFFSET: usize = 0x38;
 const ARM64_MAGIC: [u8; 4] = [b'A', b'R', b'M', 0x64];
 
+/// EFI zboot container header, from linux
+/// `drivers/firmware/efi/libstub/zboot-header.S`: a PE/COFF DOS
+/// signature ("MZ") at 0x00 and a "zimg" marker at 0x04, the compressed
+/// payload's offset and size as u32-LE at 0x08 and 0x0c, and the
+/// NUL-terminated compression-type string ("gzip"/"zstd") at 0x18. The
+/// size field already excludes the trailing uncompressed-length word
+/// (`ZBOOT_SIZE_LEN`), so it delimits exactly the compressed stream.
+const ZBOOT_ZIMG_OFFSET: usize = 0x04;
+const ZBOOT_PAYLOAD_OFFSET_FIELD: usize = 0x08;
+const ZBOOT_PAYLOAD_SIZE_FIELD: usize = 0x0c;
+const ZBOOT_COMP_TYPE_OFFSET: usize = 0x18;
+
 fn has_magic(bytes: &[u8], offset: usize, magic: &[u8; 4]) -> bool {
     bytes
         .get(offset..offset + 4)
@@ -865,9 +877,10 @@ fn gunzip(bytes: &[u8]) -> Result<Vec<u8>> {
 /// Normalize a distro image to a raw bootable image for the host arch.
 ///
 /// x86_64 distro images (including EFI-signed ones) are already valid
-/// bzImages and pass through after a magic check. aarch64 images are
-/// often gzip-wrapped flat `Image`s; those are decompressed to a new
-/// file beside the tree.
+/// bzImages and pass through after a magic check. aarch64 images are a
+/// flat `Image` that may be gzip-wrapped or carried in an EFI zboot
+/// container (Fedora's aarch64 kernels ship the latter); either wrapper
+/// is decompressed to a new file beside the tree.
 #[cfg(target_arch = "x86_64")]
 fn normalize_image(src: &Path, _dest: &Path, _release: &str) -> Result<PathBuf> {
     let prefix = read_prefix(src, BZIMAGE_MAGIC_OFFSET + 4)?;
@@ -883,15 +896,15 @@ fn normalize_image(src: &Path, _dest: &Path, _release: &str) -> Result<PathBuf> 
 #[cfg(target_arch = "aarch64")]
 fn normalize_image(src: &Path, dest: &Path, release: &str) -> Result<PathBuf> {
     let raw = fs::read(src).with_context(|| format!("read image {}", src.display()))?;
-    if has_gzip_magic(&raw) {
-        let image = normalize_arm64_bytes(&raw)?;
-        let out = dest.join(format!("vmlinuz-{release}.img"));
-        fs::write(&out, &image).with_context(|| format!("write image {}", out.display()))?;
-        Ok(out)
-    } else {
-        normalize_arm64_bytes(&raw)?;
-        Ok(src.to_path_buf())
+    // A bare flat Image boots as-is; a gzip- or EFI-zboot-wrapped image
+    // must be decompressed to a new file beside the tree.
+    if has_magic(&raw, ARM64_MAGIC_OFFSET, &ARM64_MAGIC) {
+        return Ok(src.to_path_buf());
     }
+    let image = normalize_arm64_bytes(&raw)?;
+    let out = dest.join(format!("vmlinuz-{release}.img"));
+    fs::write(&out, &image).with_context(|| format!("write image {}", out.display()))?;
+    Ok(out)
 }
 
 /// Decompress (if gzip-wrapped) and verify an aarch64 flat `Image`,
@@ -899,7 +912,9 @@ fn normalize_image(src: &Path, dest: &Path, release: &str) -> Result<PathBuf> {
 /// testable on any host.
 #[cfg_attr(not(test), allow(dead_code))]
 fn normalize_arm64_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
-    let image = if has_gzip_magic(bytes) {
+    let image = if is_zboot(bytes) {
+        decompress_zboot(bytes)?
+    } else if has_gzip_magic(bytes) {
         gunzip(bytes)?
     } else {
         bytes.to_vec()
@@ -908,6 +923,50 @@ fn normalize_arm64_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
         bail!("decompressed image is not a valid aarch64 Image (missing ARM\\x64 magic)");
     }
     Ok(image)
+}
+
+/// Detect an EFI zboot container by its PE "MZ" signature and "zimg"
+/// marker (see [`ZBOOT_ZIMG_OFFSET`] and the constants above it).
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_zboot(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"MZ")
+        && bytes.get(ZBOOT_ZIMG_OFFSET..ZBOOT_ZIMG_OFFSET + 4) == Some(b"zimg".as_slice())
+}
+
+/// Slice the compressed payload out of an EFI zboot container and
+/// decompress it per the header's compression-type string. Every offset
+/// and length taken from the (attacker-controlled) header is
+/// bounds-checked, so a truncated or malformed container errors rather
+/// than panics.
+#[cfg_attr(not(test), allow(dead_code))]
+fn decompress_zboot(bytes: &[u8]) -> Result<Vec<u8>> {
+    let read_u32 = |off: usize| -> Result<usize> {
+        let raw = bytes
+            .get(off..off + 4)
+            .ok_or_else(|| anyhow!("EFI zboot header truncated at offset {off:#x}"))?;
+        Ok(u32::from_le_bytes(raw.try_into().unwrap()) as usize)
+    };
+    let payload_offset = read_u32(ZBOOT_PAYLOAD_OFFSET_FIELD)?;
+    let payload_size = read_u32(ZBOOT_PAYLOAD_SIZE_FIELD)?;
+    let comp_region = bytes
+        .get(ZBOOT_COMP_TYPE_OFFSET..)
+        .ok_or_else(|| anyhow!("EFI zboot header truncated before the compression type"))?;
+    let comp_len = comp_region
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| anyhow!("EFI zboot compression type is not NUL-terminated"))?;
+    let comp = std::str::from_utf8(&comp_region[..comp_len])
+        .map_err(|_| anyhow!("EFI zboot compression type is not valid UTF-8"))?;
+    let end = payload_offset
+        .checked_add(payload_size)
+        .ok_or_else(|| anyhow!("EFI zboot payload bounds overflow"))?;
+    let payload = bytes.get(payload_offset..end).ok_or_else(|| {
+        anyhow!(
+            "EFI zboot payload [{payload_offset:#x}..{end:#x}] extends past the {}-byte image",
+            bytes.len()
+        )
+    })?;
+    decompress_bytes(comp, payload).with_context(|| format!("decompress EFI zboot {comp} payload"))
 }
 
 /// Used only by the x86_64 `normalize_image` (the aarch64 path reads
@@ -1031,6 +1090,26 @@ fn module_key(path: &str) -> String {
         .or_else(|| base.strip_suffix(".ko"))
         .unwrap_or(base);
     stem.replace('-', "_")
+}
+
+/// Decompress an in-memory buffer with the codec named by `codec`,
+/// accepting both the file-extension spelling (`gz`/`zst`/`xz`) and the
+/// zboot `COMP_TYPE` spelling (`gzip`/`zstd`); an unrecognized codec is
+/// an error naming it. Shares the flate2/zstd/xz2 stack the rest of the
+/// module already streams `.ko` and archive payloads through.
+#[cfg_attr(not(test), allow(dead_code))]
+fn decompress_bytes(codec: &str, data: &[u8]) -> Result<Vec<u8>> {
+    let mut reader: Box<dyn Read> = match codec {
+        "gz" | "gzip" => Box::new(flate2::read::GzDecoder::new(data)),
+        "zst" | "zstd" => Box::new(zstd::stream::read::Decoder::new(data)?),
+        "xz" => Box::new(xz2::read::XzDecoder::new(data)),
+        other => bail!("unsupported compression {other:?}"),
+    };
+    let mut out = Vec::new();
+    reader
+        .read_to_end(&mut out)
+        .with_context(|| format!("decompress {codec} stream"))?;
+    Ok(out)
 }
 
 /// Decompress a compressed `.ko` in place (writing the raw `.ko`

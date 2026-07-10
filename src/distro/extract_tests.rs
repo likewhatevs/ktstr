@@ -626,6 +626,61 @@ fn arm64_gzip_image_is_decompressed_and_verified() {
     assert!(normalize_arm64_bytes(&gz_compress(&bad)).is_err());
 }
 
+/// Assemble a minimal EFI zboot container around an already-compressed
+/// `payload`, matching the header layout in linux
+/// `drivers/firmware/efi/libstub/zboot-header.S`: "MZ" at 0x00, "zimg"
+/// at 0x04, payload offset/size (u32-LE) at 0x08/0x0c, NUL-terminated
+/// compression type at 0x18, PE magic at 0x38. The payload is placed at
+/// 0x40, just past the header.
+fn build_zboot(comp: &str, payload: &[u8]) -> Vec<u8> {
+    let payload_offset: u32 = 0x40;
+    let mut out = vec![0u8; payload_offset as usize];
+    out[0..2].copy_from_slice(b"MZ");
+    out[ZBOOT_ZIMG_OFFSET..ZBOOT_ZIMG_OFFSET + 4].copy_from_slice(b"zimg");
+    out[ZBOOT_PAYLOAD_OFFSET_FIELD..ZBOOT_PAYLOAD_OFFSET_FIELD + 4]
+        .copy_from_slice(&payload_offset.to_le_bytes());
+    out[ZBOOT_PAYLOAD_SIZE_FIELD..ZBOOT_PAYLOAD_SIZE_FIELD + 4]
+        .copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    let comp = comp.as_bytes();
+    out[ZBOOT_COMP_TYPE_OFFSET..ZBOOT_COMP_TYPE_OFFSET + comp.len()].copy_from_slice(comp);
+    // The zeroed buffer NUL-terminates the string and pads to the PE
+    // header at 0x38.
+    out[0x38..0x3c].copy_from_slice(b"PE\0\0");
+    out.extend_from_slice(payload);
+    out
+}
+
+#[test]
+fn arm64_zboot_image_is_decompressed_and_verified() {
+    let mut image = vec![0u8; 0x100];
+    image[ARM64_MAGIC_OFFSET..ARM64_MAGIC_OFFSET + 4].copy_from_slice(&ARM64_MAGIC);
+
+    // Fedora's aarch64 kernels ship a zstd payload; a gzip payload is
+    // also supported. Both round-trip to the raw flat Image.
+    let zstd_container = build_zboot("zstd", &zst_compress(&image));
+    assert!(is_zboot(&zstd_container));
+    assert_eq!(normalize_arm64_bytes(&zstd_container).unwrap(), image);
+
+    let gzip_container = build_zboot("gzip", &gz_compress(&image));
+    assert_eq!(normalize_arm64_bytes(&gzip_container).unwrap(), image);
+
+    // An unsupported compression type is a clear, named error.
+    let lz4_container = build_zboot("lz4", &image);
+    let err = normalize_arm64_bytes(&lz4_container).unwrap_err();
+    assert!(err.to_string().contains("lz4"), "{err}");
+
+    // A header whose payload bounds run past EOF is rejected, not
+    // panicked.
+    let mut truncated = build_zboot("zstd", &zst_compress(&image));
+    truncated.truncate(0x42);
+    assert!(normalize_arm64_bytes(&truncated).is_err());
+
+    // A well-formed header wrapping a garbage (non-zstd) payload fails
+    // at decompression rather than yielding a bogus image.
+    let garbage = build_zboot("zstd", b"not-a-zstd-frame");
+    assert!(normalize_arm64_bytes(&garbage).is_err());
+}
+
 #[test]
 fn magic_helpers() {
     let mut bz = vec![0u8; 0x400];
