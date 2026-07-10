@@ -570,6 +570,14 @@ pub mod worker_ready;
 #[cfg(feature = "wprof")]
 pub use vmm::wprof::{WPROF_MIN_MEMORY_MIB, apply_wprof_memory_floor};
 
+/// Re-export of the blob extract / install helpers so the `ktstr`
+/// and `cargo-ktstr` binaries (separate crates linking this lib) can
+/// extract their `include_bytes!`-embedded blobs and export the paths
+/// at startup. The bytes live in each binary; the mechanism lives in
+/// the lib (the `vmm::blobs` module). Re-exported here because `vmm`
+/// is `pub(crate)`, mirroring the `wprof` re-export above.
+pub use vmm::blobs::{extract_blob, install_blob_env_if_unset};
+
 /// Re-export of [`test_support::runtime::bypass_llc_locks_active`]
 /// so the bin/cargo_ktstr + bin/ktstr CLI surfaces (separate
 /// crates linking against this lib) can apply the canonical
