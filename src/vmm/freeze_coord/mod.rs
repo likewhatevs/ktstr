@@ -12822,7 +12822,9 @@ impl KtstrVm {
     ///     loop exits — a bare `eprintln!` here staircases into the
     ///     session output (LF without CR, glued to the guest's last
     ///     echo); the shell path defers the line until after
-    ///     terminal restore.
+    ///     terminal restore and gates it on
+    ///     [`BspExitReason::is_abnormal`] so a routine poweroff
+    ///     exits silently.
     ///
     /// Handles arch-specific I/O dispatch (port I/O on x86_64, MMIO on
     /// aarch64). HLT/WFI checks the kill flag and continues (both arches).

@@ -58,7 +58,10 @@ pub(super) const FREEZE_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(30);
 /// to peer-vCPU stderr or `tracing` output. The log site is
 /// caller-side rather than at loop break because the interactive
 /// shell's terminal is still in raw mode when the loop exits — the
-/// shell path defers the line until after terminal restore.
+/// shell path defers the line until after terminal restore, and
+/// gates it on [`is_abnormal`](Self::is_abnormal) so a routine
+/// poweroff exits silently. The test-harness caller logs
+/// unconditionally.
 ///
 /// Mapping to the BSP loop's exit_code:
 ///   - [`Shutdown`](Self::Shutdown) → exit_code = 0 (the only path
@@ -106,6 +109,21 @@ pub(crate) enum BspExitReason {
     /// the latched panic line is logged at break time so the operator sees
     /// the cause.
     GuestPanic,
+}
+
+impl BspExitReason {
+    /// True for the variants worth surfacing on the operator's
+    /// terminal ([`Fatal`](Self::Fatal), [`RunError`](Self::RunError),
+    /// [`GuestPanic`](Self::GuestPanic)). A clean guest poweroff
+    /// reaches the shell/exec caller as [`Shutdown`](Self::Shutdown)
+    /// or — when the i8042 reset OUT lands on a non-BSP vCPU —
+    /// [`ExternalKill`](Self::ExternalKill), so both are treated as
+    /// routine and the caller stays silent. `ExternalKill` also covers
+    /// an AP-observed fatal exit, but the AP dispatch arm already
+    /// emits `tracing::error!("AP fatal exit")` on that path.
+    pub(crate) fn is_abnormal(self) -> bool {
+        matches!(self, Self::Fatal | Self::RunError | Self::GuestPanic)
+    }
 }
 
 /// Decoded contents of a guest-side `MSG_TYPE_SNAPSHOT_REQUEST` TLV
