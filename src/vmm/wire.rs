@@ -157,6 +157,23 @@ pub enum MsgType {
     /// embedded BPF verifier section are preserved verbatim
     /// inside the chunk bytes.
     SchedLog,
+    /// Guest→host scheduler-STDOUT chunk. Payload: opaque UTF-8 bytes
+    /// read live from the scheduler child's stdout pipe. Distinct from
+    /// [`Self::SchedLog`] (which ships the merged `/tmp/sched.log` file
+    /// only at teardown / boot-failure): these frames stream each read
+    /// chunk as it arrives, so the scheduler's stdout survives a
+    /// watchdog timeout that never reaches the teardown dump. The host
+    /// concatenates chunks in arrival order. Unlike `SchedLog`, these
+    /// carry NO `SCHED_OUTPUT_START/END` framing — the stream is the
+    /// raw child output, delimited only by the frame boundaries.
+    SchedStdout,
+    /// Guest→host scheduler-STDERR chunk. Payload: opaque UTF-8 bytes
+    /// read live from the scheduler child's stderr pipe. Same live
+    /// streaming semantics as [`Self::SchedStdout`]; with the split
+    /// streams, libbpf / log-crate output (including the BPF verifier
+    /// log region between the `-- BEGIN/END PROG LOAD LOG --` markers)
+    /// typically lands here.
+    SchedStderr,
     /// Guest→host lifecycle phase event. Payload: 1-byte
     /// [`LifecyclePhase`] discriminant followed by an optional
     /// UTF-8 reason buffer (used by `SchedulerNotAttached`'s
@@ -289,6 +306,8 @@ impl MsgType {
             MsgType::Stdout => MSG_TYPE_STDOUT,
             MsgType::Stderr => MSG_TYPE_STDERR,
             MsgType::SchedLog => MSG_TYPE_SCHED_LOG,
+            MsgType::SchedStdout => MSG_TYPE_SCHED_STDOUT,
+            MsgType::SchedStderr => MSG_TYPE_SCHED_STDERR,
             MsgType::Lifecycle => MSG_TYPE_LIFECYCLE,
             MsgType::ExecExit => MSG_TYPE_EXEC_EXIT,
             MsgType::Dmesg => MSG_TYPE_DMESG,
@@ -324,6 +343,8 @@ impl MsgType {
             MSG_TYPE_STDOUT => Some(MsgType::Stdout),
             MSG_TYPE_STDERR => Some(MsgType::Stderr),
             MSG_TYPE_SCHED_LOG => Some(MsgType::SchedLog),
+            MSG_TYPE_SCHED_STDOUT => Some(MsgType::SchedStdout),
+            MSG_TYPE_SCHED_STDERR => Some(MsgType::SchedStderr),
             MSG_TYPE_LIFECYCLE => Some(MsgType::Lifecycle),
             MSG_TYPE_EXEC_EXIT => Some(MsgType::ExecExit),
             MSG_TYPE_DMESG => Some(MsgType::Dmesg),
@@ -556,6 +577,24 @@ pub const MSG_TYPE_STDERR: u32 = 0x5345_5252; // "SERR"
 /// markers and the BPF verifier section travel verbatim inside
 /// the chunk bytes.
 pub const MSG_TYPE_SCHED_LOG: u32 = 0x5343_4c47; // "SCLG"
+
+/// Guest→host scheduler-STDOUT chunk (payload: opaque UTF-8 bytes).
+///
+/// Live per-read chunk of the scheduler child's stdout, shipped as it
+/// arrives so the stream survives a watchdog timeout that never reaches
+/// the teardown `dump_sched_output`. See [`MsgType::SchedStdout`].
+/// Distinct from [`MSG_TYPE_SCHED_LOG`]: no `SCHED_OUTPUT_START/END`
+/// framing travels in these frames — the payload is the raw child
+/// stream, delimited only by frame boundaries.
+pub const MSG_TYPE_SCHED_STDOUT: u32 = 0x5353_544f; // "SSTO"
+
+/// Guest→host scheduler-STDERR chunk (payload: opaque UTF-8 bytes).
+///
+/// Same live streaming semantics as [`MSG_TYPE_SCHED_STDOUT`], applied
+/// to the scheduler child's stderr (where libbpf / log-crate output —
+/// including the BPF verifier log region — typically lands). See
+/// [`MsgType::SchedStderr`].
+pub const MSG_TYPE_SCHED_STDERR: u32 = 0x5353_5445; // "SSTE"
 
 /// Guest→host lifecycle phase event.
 ///
@@ -1624,6 +1663,8 @@ mod tests {
             MsgType::Stdout,
             MsgType::Stderr,
             MsgType::SchedLog,
+            MsgType::SchedStdout,
+            MsgType::SchedStderr,
             MsgType::Lifecycle,
             MsgType::ExecExit,
             MsgType::Dmesg,
@@ -1689,6 +1730,8 @@ mod tests {
         assert_eq!(MsgType::Stdout.wire_value(), MSG_TYPE_STDOUT);
         assert_eq!(MsgType::Stderr.wire_value(), MSG_TYPE_STDERR);
         assert_eq!(MsgType::SchedLog.wire_value(), MSG_TYPE_SCHED_LOG);
+        assert_eq!(MsgType::SchedStdout.wire_value(), MSG_TYPE_SCHED_STDOUT);
+        assert_eq!(MsgType::SchedStderr.wire_value(), MSG_TYPE_SCHED_STDERR);
         assert_eq!(MsgType::Lifecycle.wire_value(), MSG_TYPE_LIFECYCLE);
         assert_eq!(MsgType::ExecExit.wire_value(), MSG_TYPE_EXEC_EXIT);
         assert_eq!(MsgType::Dmesg.wire_value(), MSG_TYPE_DMESG);
@@ -1741,6 +1784,8 @@ mod tests {
             MsgType::Stdout,
             MsgType::Stderr,
             MsgType::SchedLog,
+            MsgType::SchedStdout,
+            MsgType::SchedStderr,
             MsgType::Lifecycle,
             MsgType::ExecExit,
             MsgType::Dmesg,

@@ -2216,6 +2216,14 @@ fn run_verifier_cell_inner(
         Ok(result) => {
             let output = crate::verifier::format_verifier_output("verifier", &result, raw);
             print!("{output}");
+            // Propagate the scheduler's captured stderr to the test's
+            // real stderr (best-effort — whatever streamed before a
+            // watchdog kill). Emitted BEFORE the `... FAILED:` verdict
+            // line below so the verdict stays the last thing on stderr.
+            let sched_stderr = crate::verifier::format_verifier_stderr("verifier", &result, raw);
+            if !sched_stderr.is_empty() {
+                eprint!("{sched_stderr}");
+            }
             // PASS requires verify + attach (sched_ext `enabled`) +
             // dispatch (the injected workload made progress).
             // `cell_verdict` names the first failing gate (timed_out →

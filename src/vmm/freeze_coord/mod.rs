@@ -10512,7 +10512,9 @@ impl KtstrVm {
                 // the last coordinator drain, and `parse_tlv_stream`
                 // completes the frame.
                 let coord_exit_t = std::time::Instant::now();
-                eprintln!("CLEANUP: coord loop exited");
+                if crate::vmm::debug_logging_enabled() {
+                    eprintln!("CLEANUP: coord loop exited");
+                }
                 // Periodic-capture teardown summary. When
                 // `num_snapshots > 0`, log the fired/total ratio so
                 // an operator reading the test's tracing output can
@@ -10652,7 +10654,9 @@ impl KtstrVm {
                 if let Some(handle) = accessor_init_handle {
                     let jt = std::time::Instant::now();
                     let _ = handle.join();
-                    eprintln!("CLEANUP: accessor-init worker joined {:?}", jt.elapsed());
+                    if crate::vmm::debug_logging_enabled() {
+                        eprintln!("CLEANUP: accessor-init worker joined {:?}", jt.elapsed());
+                    }
                 }
                 // Extract the prog accessor for collect_verifier_stats
                 // and stash it in the shared slot so run_vm can pass
@@ -10673,7 +10677,9 @@ impl KtstrVm {
                     });
                     *slot.lock_unpoisoned() = extracted;
                 }
-                eprintln!("CLEANUP: coord closure done {:?}", coord_exit_t.elapsed());
+                if crate::vmm::debug_logging_enabled() {
+                    eprintln!("CLEANUP: coord closure done {:?}", coord_exit_t.elapsed());
+                }
             })
             .context("spawn freeze coordinator thread")?;
         // The coordinator holds bsp + AP ImmediateExitHandles and a raw pointer
@@ -10985,7 +10991,9 @@ impl KtstrVm {
         // `vcpu_panic::install_once` was already called in
         // `spawn_ap_threads` above, which runs even for a zero-AP VM,
         // so the hook is live by the time BSP enters its loop.
-        eprintln!("BSP: entering run loop");
+        if crate::vmm::debug_logging_enabled() {
+            eprintln!("BSP: entering run loop");
+        }
         let (exit_code, timed_out, bsp_exit_reason) = vcpu_panic::with_vcpu_panic_ctx(
             vcpu_panic::VcpuPanicCtx {
                 kill: kill.clone(),
@@ -11050,7 +11058,9 @@ impl KtstrVm {
         // itself: the interactive-shell caller must defer this
         // past raw-mode terminal restore; here there is no raw
         // terminal, so print immediately).
-        eprintln!("BSP: loop exit reason={bsp_exit_reason:?}");
+        if crate::vmm::debug_logging_enabled() {
+            eprintln!("BSP: loop exit reason={bsp_exit_reason:?}");
+        }
         bsp_done.store(true, Ordering::Release);
         // Wake the freeze coordinator's epoll loop. Failure
         // (counter overflow / EAGAIN under EFD_NONBLOCK) is benign
@@ -11082,10 +11092,12 @@ impl KtstrVm {
         // derived from bulk-port `MSG_TYPE_EXIT` or the COM2 `KTSTR_EXIT:`
         // sentinel inside [`KtstrVm::collect_results`], not from
         // this value.
-        eprintln!(
-            "BSP: exited run loop, code={exit_code} timed_out={timed_out} \
-             (run-loop sentinel — final exit code comes from bulk port / COM2 in collect_results)"
-        );
+        if crate::vmm::debug_logging_enabled() {
+            eprintln!(
+                "BSP: exited run loop, code={exit_code} timed_out={timed_out} \
+                 (run-loop sentinel — final exit code comes from bulk port / COM2 in collect_results)"
+            );
+        }
 
         // Surface IOAPIC routing-install failures (split-irqchip path). A
         // nonzero count means a guest-programmed device IRQ never got its MSI
@@ -11146,7 +11158,9 @@ impl KtstrVm {
         if let Some(h) = watchdog {
             let _ = h.join();
         }
-        eprintln!("CLEANUP: watchdog joined");
+        if crate::vmm::debug_logging_enabled() {
+            eprintln!("CLEANUP: watchdog joined");
+        }
 
         // Join the freeze coordinator BEFORE `bsp` falls out of scope at
         // the end of this function. The coordinator's captured BSP
@@ -11171,7 +11185,9 @@ impl KtstrVm {
         if let Some(h) = freeze_coord_handle {
             let _ = h.join();
         }
-        eprintln!("CLEANUP: freeze_coord joined");
+        if crate::vmm::debug_logging_enabled() {
+            eprintln!("CLEANUP: freeze_coord joined");
+        }
         bsp_alive.store(false, Ordering::Release);
 
         // Make sure freeze is cleared before vCPU teardown so the APs
@@ -13319,7 +13335,9 @@ impl KtstrVm {
         // join) that `RunVmThreadGuard`'s `Drop` runs on the early-return path.
         // `kill` / `kill_evt` / `freeze` were set above, as the helper requires.
         kick_and_join_ap_threads(run.ap_threads);
-        eprintln!("CLEANUP: all AP threads joined");
+        if crate::vmm::debug_logging_enabled() {
+            eprintln!("CLEANUP: all AP threads joined");
+        }
 
         // Invalidate the watchpoint slots BEFORE `run.vm` drops at
         // the end of this function. `kind_host_ptr` addresses a host
@@ -13398,13 +13416,17 @@ impl KtstrVm {
                 }
                 None => (None, BulkDrainResult::default(), Vec::new()),
             };
-        eprintln!("CLEANUP: monitor joined");
+        if crate::vmm::debug_logging_enabled() {
+            eprintln!("CLEANUP: monitor joined");
+        }
         let cleanup_t = std::time::Instant::now();
 
         if let Some(h) = run.bpf_write_handle {
             let _ = h.join();
         }
-        eprintln!("CLEANUP: bpf_write joined {:?}", cleanup_t.elapsed());
+        if crate::vmm::debug_logging_enabled() {
+            eprintln!("CLEANUP: bpf_write joined {:?}", cleanup_t.elapsed());
+        }
 
         // Drain the virtio-console port-1 TX accumulator: the guest
         // wrote bulk TLV-framed messages (STIMULUS, EXIT, SCHED_EXIT,
@@ -13592,12 +13614,16 @@ impl KtstrVm {
                 if let Some(ref prog) = run.prog_accessor {
                     use crate::monitor::bpf_prog::BpfProgAccessor;
                     vs_path = "prebuilt_accessor";
-                    eprintln!("CLEANUP: verifier_stats using pre-built accessor");
+                    if crate::vmm::debug_logging_enabled() {
+                        eprintln!("CLEANUP: verifier_stats using pre-built accessor");
+                    }
                     let a = prog.as_accessor();
                     a.struct_ops_progs()
                 } else {
                     vs_path = "fallback_full_parse";
-                    eprintln!("CLEANUP: verifier_stats fallback (full parse)");
+                    if crate::vmm::debug_logging_enabled() {
+                        eprintln!("CLEANUP: verifier_stats fallback (full parse)");
+                    }
                     self.collect_verifier_stats(
                         &run.vm,
                         run.tcr_el1.as_ref(),
@@ -13615,7 +13641,9 @@ impl KtstrVm {
             n_progs = verifier_stats.len(),
             "auto_repro: collect_verifier_stats",
         );
-        eprintln!("CLEANUP: verifier_stats done {:?}", vs_t.elapsed());
+        if crate::vmm::debug_logging_enabled() {
+            eprintln!("CLEANUP: verifier_stats done {:?}", vs_t.elapsed());
+        }
 
         // Sample cleanup elapsed AFTER every blocking step that runs on
         // the post-BSP-exit critical path so the duration captures the
@@ -13632,7 +13660,9 @@ impl KtstrVm {
             cleanup_window_ms = cleanup_duration.map(|d| d.as_millis() as u64).unwrap_or(0),
             "auto_repro: collect_results",
         );
-        eprintln!("CLEANUP: collect_results done {:?}", cleanup_t.elapsed());
+        if crate::vmm::debug_logging_enabled() {
+            eprintln!("CLEANUP: collect_results done {:?}", cleanup_t.elapsed());
+        }
 
         // Forward the scheduler-stats client. `run.stats_client` is
         // `Some(_)` when the run has a scheduler attached and

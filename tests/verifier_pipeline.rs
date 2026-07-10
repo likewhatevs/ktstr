@@ -114,14 +114,25 @@ fn __ktstr_inner_verifier_cycle_collapse(_ctx: &Ctx) -> Result<AssertResult> {
         &sched_args,
         ktstr::test_support::TopologyJson::SINGLE_CPU,
     )?;
+    // The test scheduler (like most scx schedulers) logs through the
+    // log crate, so the libbpf verifier trace lands on the live STDERR
+    // stream: the cycle collapse must appear in the stderr rendering,
+    // and the stdout rendering must NOT re-print the merged teardown
+    // dump (that would duplicate the stderr section).
     let output = ktstr::verifier::format_verifier_output("scx-ktstr", &result, false);
+    let stderr_out = ktstr::verifier::format_verifier_stderr("scx-ktstr", &result, false);
     anyhow::ensure!(
-        output.contains("scheduler log"),
-        "output should contain scheduler log section"
+        stderr_out.contains("scheduler stderr"),
+        "stderr rendering should contain the scheduler stderr section"
     );
     anyhow::ensure!(
-        output.contains("identical iterations omitted"),
+        stderr_out.contains("identical iterations omitted"),
         "cycle collapse should compress verifier loop traces"
+    );
+    anyhow::ensure!(
+        !output.contains("scheduler log"),
+        "stdout rendering must not duplicate the merged dump when live \
+         stderr arrived; got:\n{output}"
     );
     Ok(AssertResult::pass())
 }

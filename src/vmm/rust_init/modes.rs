@@ -4,6 +4,38 @@
 //! parent module (`super`), reached via the glob below.
 use super::*;
 
+/// Create an anonymous `pipe(2)` and return its `(read_end, write_end)`
+/// as owned `File`s. Returns `None` on `pipe(2)` failure.
+///
+/// Deliberately does NOT set `O_CLOEXEC`: the pipe ends must survive
+/// across any `exec`/`fork` the caller performs — the stdio-redirect
+/// path dup2's the write end onto fd 1 / fd 2, and the scheduler-spawn
+/// path hands the write end to a child `Command` as its stdout/stderr,
+/// both of which require the fd to cross the fork.
+///
+/// Shared by [`redirect_stdio_to_bulk_port`] (guest stdout/stderr) and
+/// `crate::vmm::rust_init::scheduler::try_spawn_scheduler` (the
+/// scheduler child's stdout/stderr live-stream forwarders).
+pub(crate) fn make_pipe() -> Option<(std::fs::File, std::fs::File)> {
+    use std::os::unix::io::FromRawFd;
+    let mut fds = [0i32; 2];
+    // SAFETY: `fds` is a valid `&mut [i32; 2]`; `pipe(2)` writes
+    // exactly two file descriptors on success.  Passing `O_CLOEXEC`
+    // would belong on `pipe2`, but we deliberately want the pipe
+    // ends to survive across any forks the caller performs — see the
+    // fn-level doc.
+    let r = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if r < 0 {
+        return None;
+    }
+    // SAFETY: `pipe(2)` just returned with the two fds populated.
+    // `from_raw_fd` takes ownership of each side; both close on
+    // drop.  Held by `File` for the natural Read/Write impls.
+    let read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    let write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+    Some((read_end, write_end))
+}
+
 /// Redirect stdout and stderr through bulk-port forwarder threads.
 ///
 /// Pre-bulk-port-migration: dup2'd `/dev/ttyS1` over fd 1 and fd 2 so
@@ -37,27 +69,7 @@ use super::*;
 /// attached to whatever fd they pointed at on entry.
 pub(crate) fn redirect_stdio_to_bulk_port() {
     use std::io::Read;
-    use std::os::unix::io::{AsRawFd, FromRawFd};
-
-    fn make_pipe() -> Option<(std::fs::File, std::fs::File)> {
-        let mut fds = [0i32; 2];
-        // SAFETY: `fds` is a valid `&mut [i32; 2]`; `pipe(2)` writes
-        // exactly two file descriptors on success.  Passing `O_CLOEXEC`
-        // would belong on `pipe2`, but we deliberately want the pipe
-        // ends to survive across any forks the test may perform — the
-        // dup2'd write end carries fd 1 / fd 2 across exec/fork, which
-        // is the entire point.
-        let r = unsafe { libc::pipe(fds.as_mut_ptr()) };
-        if r < 0 {
-            return None;
-        }
-        // SAFETY: `pipe(2)` just returned with the two fds populated.
-        // `from_raw_fd` takes ownership of each side; both close on
-        // drop.  Held by `File` for the natural Read/Write impls.
-        let read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
-        let write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
-        Some((read_end, write_end))
-    }
+    use std::os::unix::io::AsRawFd;
 
     fn spawn_forwarder(mut read_end: std::fs::File, name: &'static str, sender: fn(&[u8]) -> bool) {
         let _ = std::thread::Builder::new()

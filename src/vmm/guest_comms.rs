@@ -934,6 +934,31 @@ pub fn send_sched_log(buf: &[u8]) {
     write_msg(MsgType::SchedLog.wire_value(), buf);
 }
 
+/// Send a scheduler-STDOUT chunk to the host. Payload: opaque UTF-8
+/// bytes read live from the scheduler child's stdout pipe.
+///
+/// Frames with [`MsgType::SchedStdout`]. The scheduler-spawn forwarder
+/// thread (in `try_spawn_scheduler`) ships each pipe read chunk through
+/// this sender as it arrives, so the stdout stream survives a watchdog
+/// timeout that never reaches the teardown `dump_sched_output`. Same
+/// chunked semantics and not-yet-open-port fallback as
+/// [`send_stdout_chunk`]; unlike [`send_sched_log`] the payload carries
+/// NO `SCHED_OUTPUT_START/END` framing — it is the raw child stream.
+pub fn send_sched_stdout_chunk(buf: &[u8]) -> bool {
+    write_msg(MsgType::SchedStdout.wire_value(), buf)
+}
+
+/// Send a scheduler-STDERR chunk to the host. Payload: opaque UTF-8
+/// bytes read live from the scheduler child's stderr pipe.
+///
+/// Frames with [`MsgType::SchedStderr`]. Same live streaming semantics
+/// as [`send_sched_stdout_chunk`], applied to the child's stderr (where
+/// libbpf / log-crate output — including the BPF verifier log region —
+/// typically lands).
+pub fn send_sched_stderr_chunk(buf: &[u8]) -> bool {
+    write_msg(MsgType::SchedStderr.wire_value(), buf)
+}
+
 /// Send a lifecycle phase event to the host. Payload: 1-byte
 /// [`LifecyclePhase`] discriminant followed by a UTF-8 reason
 /// suffix (only `SchedulerNotAttached` populates `reason`; every

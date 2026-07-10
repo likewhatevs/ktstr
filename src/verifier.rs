@@ -64,12 +64,48 @@ pub(crate) fn parse_sched_output(output: &str) -> Option<&str> {
 pub(crate) fn concat_sched_log_chunks(
     drain: Option<&crate::vmm::host_comms::BulkDrainResult>,
 ) -> String {
+    concat_chunks_of(drain, crate::vmm::wire::MSG_TYPE_SCHED_LOG)
+}
+
+/// Concatenate every CRC-valid `MSG_TYPE_SCHED_STDOUT` chunk in the
+/// bulk-port drain into one `String`, in arrival order.
+///
+/// These are the scheduler child's LIVE stdout chunks (shipped as each
+/// pipe read arrives, not the teardown-only merged file), so they
+/// survive a watchdog timeout that never reaches `dump_sched_output`.
+/// Unlike [`concat_sched_log_chunks`] the payload carries no
+/// `SCHED_OUTPUT_START/END` framing — it is the raw child stream, so
+/// callers use it directly rather than through [`parse_sched_output`].
+/// Empty / `None` drain yields an empty string.
+pub(crate) fn concat_sched_stdout_chunks(
+    drain: Option<&crate::vmm::host_comms::BulkDrainResult>,
+) -> String {
+    concat_chunks_of(drain, crate::vmm::wire::MSG_TYPE_SCHED_STDOUT)
+}
+
+/// Concatenate every CRC-valid `MSG_TYPE_SCHED_STDERR` chunk in the
+/// bulk-port drain into one `String`, in arrival order. The scheduler
+/// child's live stderr stream (where libbpf / log-crate output,
+/// including the BPF verifier log region, typically lands). Same
+/// semantics as [`concat_sched_stdout_chunks`].
+pub(crate) fn concat_sched_stderr_chunks(
+    drain: Option<&crate::vmm::host_comms::BulkDrainResult>,
+) -> String {
+    concat_chunks_of(drain, crate::vmm::wire::MSG_TYPE_SCHED_STDERR)
+}
+
+/// Concatenate every CRC-valid chunk of one `msg_type` in the drain,
+/// in arrival order. Shared inner for the per-stream concat helpers.
+fn concat_chunks_of(
+    drain: Option<&crate::vmm::host_comms::BulkDrainResult>,
+    msg_type: u32,
+) -> String {
     let Some(drain) = drain else {
         return String::new();
     };
     let mut acc = String::new();
     for e in &drain.entries {
-        if e.msg_type != crate::vmm::wire::MSG_TYPE_SCHED_LOG || !e.crc_ok {
+        if e.msg_type != msg_type || !e.crc_ok {
             continue;
         }
         acc.push_str(&String::from_utf8_lossy(&e.payload));
@@ -701,9 +737,29 @@ pub struct VerifierVmResult {
     /// Per-program verifier statistics from host-side memory
     /// introspection (`bpf_prog_aux->verified_insns`).
     pub stats: Vec<ProgStats>,
-    /// Scheduler log (stdout+stderr) from the VM. Contains libbpf's
-    /// verifier instruction traces when BPF load fails.
+    /// Scheduler log (merged stdout+stderr) from the VM's teardown
+    /// `dump_sched_output` (the `/tmp/sched.log` file bracketed by the
+    /// `SCHED_OUTPUT_START/END` markers). Contains libbpf's verifier
+    /// instruction traces when BPF load fails. Present only when the run
+    /// reached a dump path (teardown / scheduler-exit / boot-failure);
+    /// a watchdog timeout kills the VM before any dump, leaving this
+    /// empty — [`Self::scheduler_stdout`] / [`Self::scheduler_stderr`]
+    /// are the live-streamed fallbacks that survive that case.
     pub scheduler_log: String,
+    /// The scheduler child's LIVE stdout, concatenated from the
+    /// `MSG_TYPE_SCHED_STDOUT` frames shipped per pipe-read as the run
+    /// progressed. Best-effort: whatever reached the host before the VM
+    /// exited or was watchdog-killed. Populated UNCONDITIONALLY (timeout
+    /// included) so a hung VM still surfaces its stdout. Raw child stream
+    /// — no `SCHED_OUTPUT_START/END` framing.
+    pub scheduler_stdout: String,
+    /// The scheduler child's LIVE stderr, concatenated from the
+    /// `MSG_TYPE_SCHED_STDERR` frames. Same best-effort / unconditional
+    /// semantics as [`Self::scheduler_stdout`]. With the split streams,
+    /// libbpf / log-crate output (including the BPF verifier log region
+    /// between the `-- BEGIN/END PROG LOAD LOG --` markers) typically
+    /// lands here.
+    pub scheduler_stderr: String,
     /// Whether the scheduler positively confirmed attach. Derived from
     /// the guest's lifecycle frames ([`AttachOutcome`]). Attach is
     /// necessary but NOT sufficient for a cell PASS: this must be
@@ -875,6 +931,15 @@ pub fn collect_verifier_output(
         parse_sched_output(&result.output).unwrap_or("").to_string()
     };
 
+    // Concatenate the LIVE scheduler stdout / stderr streams. These are
+    // populated UNCONDITIONALLY — including on `result.timed_out`, the
+    // core case the merged-file dump misses: a watchdog kill never
+    // reaches `dump_sched_output`, but any live chunk that arrived
+    // before the kill survives in `guest_messages`. Raw child streams
+    // (no `SCHED_OUTPUT_START/END` framing), so no `parse_sched_output`.
+    let scheduler_stdout = concat_sched_stdout_chunks(result.guest_messages.as_ref());
+    let scheduler_stderr = concat_sched_stderr_chunks(result.guest_messages.as_ref());
+
     // Build ProgStats from host-side ProgVerifierStats. Each program
     // that loaded successfully is visible in prog_idr with its
     // verified_insns count.
@@ -893,6 +958,8 @@ pub fn collect_verifier_output(
     Ok(VerifierVmResult {
         stats,
         scheduler_log,
+        scheduler_stdout,
+        scheduler_stderr,
         attach,
         dispatched,
         timed_out: result.timed_out,
@@ -909,6 +976,31 @@ pub fn collect_verifier_output(
 /// no markers are found (backward compat with logs that contain only
 /// raw verifier output).
 pub fn extract_verifier_log(scheduler_log: &str) -> Option<&str> {
+    let (start, end) = verifier_log_region(scheduler_log)?;
+    // `end` includes the trailing newline before the END-marker line;
+    // trim it (and any earlier trailing blanks) to match the historical
+    // extracted-content shape parse_verifier_stats consumes.
+    Some(scheduler_log[start..end].trim_end_matches('\n'))
+}
+
+/// Locate the libbpf verifier-log region inside a scheduler log blob:
+/// the byte range `[start, end)` of the content between libbpf's
+///   `-- BEGIN PROG LOAD LOG --`
+///   `-- END PROG LOAD LOG --`
+/// markers. `start` is just past the BEGIN marker (skipping the marker's
+/// own trailing newline); `end` is the byte AFTER the last content
+/// newline preceding the END marker — so the region includes that
+/// trailing newline but excludes the END-marker line itself (and any
+/// partial `libbpf: ` prefix when the END marker sits mid-line). Returns
+/// `None` when either marker is absent.
+///
+/// Shared marker-location logic for [`extract_verifier_log`] (which
+/// trims the region into the collapsible trace) and
+/// [`collapse_verifier_region`] (which replaces the region in place),
+/// so the two stay consistent — notably on the mid-line-END case where
+/// the partial prefix stays OUTSIDE the region and thus byte-identical
+/// in the in-place transform.
+fn verifier_log_region(scheduler_log: &str) -> Option<(usize, usize)> {
     const BEGIN: &str = "-- BEGIN PROG LOAD LOG --";
     const END: &str = "-- END PROG LOAD LOG --";
 
@@ -920,15 +1012,39 @@ pub fn extract_verifier_log(scheduler_log: &str) -> Option<&str> {
     } else {
         content_start
     };
-    let end_pos = scheduler_log[content_start..].find(END)?;
-    let content = &scheduler_log[content_start..content_start + end_pos];
+    let rel_end = scheduler_log[content_start..].find(END)?;
+    let raw_end = content_start + rel_end;
     // The END marker may appear mid-line (e.g. "libbpf: -- END ...").
-    // Trim back to the last newline to drop the partial prefix.
-    let content = content
-        .rfind('\n')
-        .map(|p| &content[..p])
-        .unwrap_or(content);
-    Some(content.trim_end_matches('\n'))
+    // Anchor the region end at the last content newline before the
+    // marker (inclusive), so the partial "libbpf: " prefix stays in the
+    // suffix — keeping it byte-identical under the in-place collapse.
+    let region_end = match scheduler_log[content_start..raw_end].rfind('\n') {
+        Some(p) => content_start + p + 1,
+        None => raw_end,
+    };
+    Some((content_start, region_end))
+}
+
+/// Return `s` with the libbpf verifier-log region (between the
+/// `-- BEGIN/END PROG LOAD LOG --` markers) replaced by
+/// [`collapse_cycles`] of that region — collapsed IN PLACE, with every
+/// byte OUTSIDE the region (the surrounding scheduler output, the BEGIN
+/// and END marker lines, any mid-line-END partial prefix) preserved
+/// exactly. Input WITHOUT the marker pair is returned unchanged.
+///
+/// This replaces the prior extract-and-drop rendering: the scheduler's
+/// full output is preserved and only the (potentially huge, cyclic)
+/// verifier trace is compressed, rather than discarding everything
+/// outside the trace.
+pub fn collapse_verifier_region(s: &str) -> String {
+    let Some((start, end)) = verifier_log_region(s) else {
+        return s.to_string();
+    };
+    let mut out = String::with_capacity(s.len());
+    out.push_str(&s[..start]);
+    out.push_str(&collapse_cycles(&s[start..end]));
+    out.push_str(&s[end..]);
+    out
 }
 
 /// Format verifier results as text: brief lines per program and collapsed
@@ -960,12 +1076,25 @@ pub fn format_verifier_output(label: &str, result: &VerifierVmResult, raw: bool)
         ));
     }
 
-    if !result.scheduler_log.is_empty() {
-        // Extract the verifier log from between libbpf's markers.
-        // Falls back to the full scheduler_log when no markers exist.
-        let verifier_log =
-            extract_verifier_log(&result.scheduler_log).unwrap_or(&result.scheduler_log);
-
+    // verifier stats: parse from whichever stream actually carries the
+    // libbpf `-- BEGIN/END PROG LOAD LOG --` markers. With the split
+    // live streams the verifier log usually lands on stderr; fall back
+    // to stdout, then the teardown merged-file dump. When no stream has
+    // the markers, parse the first non-empty stream whole — backward
+    // compat with logs that contain only raw verifier output (the same
+    // fallback `extract_verifier_log` documents). Renders on the
+    // timed_out branch too (the streams survive a watchdog kill).
+    let streams = [
+        result.scheduler_stderr.as_str(),
+        result.scheduler_stdout.as_str(),
+        result.scheduler_log.as_str(),
+    ];
+    let stats_src = streams
+        .into_iter()
+        .find(|s| extract_verifier_log(s).is_some())
+        .or_else(|| streams.into_iter().find(|s| !s.is_empty()));
+    if let Some(src) = stats_src {
+        let verifier_log = extract_verifier_log(src).unwrap_or(src);
         let vs = parse_verifier_stats(verifier_log);
         if vs.processed_insns > 0 {
             out.push_str(&format!("\n{label} --- verifier stats ---\n"));
@@ -981,16 +1110,60 @@ pub fn format_verifier_output(label: &str, result: &VerifierVmResult, raw: bool)
             }
             out.push('\n');
         }
+    }
 
+    // The scheduler-log section renders the FULL scheduler stdout — the
+    // live-streamed `scheduler_stdout` (which survives a watchdog kill
+    // that never reaches the teardown dump). NOT extract-and-drop: the
+    // verifier trace is collapsed IN PLACE via `collapse_verifier_region`,
+    // keeping everything around it. Emitted on the timed_out branch as
+    // well — that is the core bug this fixes. The merged teardown dump
+    // `scheduler_log` is the fallback ONLY when NEITHER live stream
+    // arrived (streaming failed or the guest predates the split): when
+    // live stderr did arrive, an empty live stdout means the scheduler
+    // wrote nothing to stdout, and rendering the merged dump here would
+    // duplicate the stderr section (the common libbpf/log-crate case —
+    // schedulers that log exclusively to stderr).
+    let stdout_src = if !result.scheduler_stdout.is_empty() {
+        result.scheduler_stdout.as_str()
+    } else if result.scheduler_stderr.is_empty() {
+        result.scheduler_log.as_str()
+    } else {
+        ""
+    };
+    if !stdout_src.is_empty() {
         out.push_str(&format!("\n{label} --- scheduler log ---\n"));
         if raw {
-            out.push_str(&result.scheduler_log);
+            out.push_str(stdout_src);
         } else {
-            out.push_str(&collapse_cycles(verifier_log));
+            out.push_str(&collapse_verifier_region(stdout_src));
         }
     }
 
     out
+}
+
+/// Format the scheduler's captured STDERR for emission to the test's
+/// stderr, or the empty string when there is no stderr to show.
+///
+/// Best-effort: renders whatever `scheduler_stderr` streamed before the
+/// VM exited or was watchdog-killed. Non-raw runs collapse the libbpf
+/// verifier-log region IN PLACE via [`collapse_verifier_region`] (the
+/// verifier trace usually lands on stderr with the split streams); raw
+/// runs pass the bytes through unmodified. A leading `--- scheduler
+/// stderr ---` header labels the section to match the stdout section's
+/// style so a reader can tell the two streams apart. The caller emits
+/// the result via `eprint!` so it lands on the test's real stderr.
+pub fn format_verifier_stderr(label: &str, result: &VerifierVmResult, raw: bool) -> String {
+    if result.scheduler_stderr.is_empty() {
+        return String::new();
+    }
+    let body = if raw {
+        result.scheduler_stderr.clone()
+    } else {
+        collapse_verifier_region(&result.scheduler_stderr)
+    };
+    format!("\n{label} --- scheduler stderr ---\n{body}")
 }
 
 /// Format an A/B diff table comparing two sets of verifier stats.
@@ -1215,18 +1388,18 @@ pub fn build_nextest_args(nextest_profile: Option<&str>, forward: &[String]) -> 
 /// cell is:
 /// - ✅ every kernel that ran this (topology, scheduler) passed,
 /// - ❌ every kernel that ran it failed,
-/// - 🇽 mixed — at least one kernel passed AND at least one failed,
+/// - ❎ mixed — at least one kernel passed AND at least one failed,
 /// - `-` no kernel ran this (topology, scheduler) (e.g. the scheduler's
 ///   constraints rejected the preset).
 ///
 /// After the grid, the specific failing `(scheduler, kernel, topology)`
-/// combinations are listed so a ❌ or 🇽 cell can be drilled to the exact
+/// combinations are listed so a ❌ or ❎ cell can be drilled to the exact
 /// kernel(s) that failed. Returns `None` for an empty record set (the
 /// caller prints nothing).
 ///
 /// Rows, columns, and the failing list are BTreeSet-sorted so the same
 /// run renders the same output (shell-pipeline stable). The header line
-/// carries a ✅/❌/🇽 tally counting grid cells.
+/// carries a ✅/❌/❎ tally counting grid cells.
 pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
     if records.is_empty() {
         return None;
@@ -1276,7 +1449,7 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
                 }
                 Some(_) => {
                     n_mixed += 1;
-                    "🇽"
+                    "❎"
                 }
             };
             line.push(text.to_string());
@@ -1284,7 +1457,7 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
         table.add_row(line);
     }
 
-    let mut out = format!("\nverifier summary: {n_pass} ✅  {n_fail} ❌  {n_mixed} 🇽\n{table}\n");
+    let mut out = format!("\nverifier summary: {n_pass} ✅  {n_fail} ❌  {n_mixed} ❎\n{table}\n");
     if !failing.is_empty() {
         out.push_str("\nfailing combinations (scheduler / kernel / topology):\n");
         for (sched, kernel, topo) in &failing {
@@ -1432,7 +1605,7 @@ mod tests {
     }
 
     /// The summary grid aggregates across kernels per (topology,
-    /// scheduler): all-pass -> ✅, all-fail -> ❌, with a ✅/❌/🇽 tally.
+    /// scheduler): all-pass -> ✅, all-fail -> ❌, with a ✅/❌/❎ tally.
     /// Failing (scheduler, kernel, topology) combinations are listed after
     /// the grid; an empty record set renders nothing.
     #[test]
@@ -1455,7 +1628,7 @@ mod tests {
         ];
         let out = render_result_table(&recs).expect("non-empty records -> Some");
         assert!(
-            out.contains("verifier summary: 1 ✅  1 ❌  0 🇽"),
+            out.contains("verifier summary: 1 ✅  1 ❌  0 ❎"),
             "tally: {out}"
         );
         // Columns are scheduler-only (kernels fold into the cell), so no
@@ -1493,12 +1666,12 @@ mod tests {
     }
 
     /// A (topology, scheduler) where one kernel passes and another fails
-    /// renders 🇽 (mixed); an all-pass (topology, scheduler) across kernels
+    /// renders ❎ (mixed); an all-pass (topology, scheduler) across kernels
     /// renders ✅. Only the failing kernel appears in the failing list.
     #[test]
-    fn render_result_table_mixed_kernels_blue_x() {
+    fn render_result_table_mixed_kernels_squared_x() {
         let recs = vec![
-            // tiny-1llc / scx_a: 6_14 passes, 6_15 fails -> mixed -> 🇽.
+            // tiny-1llc / scx_a: 6_14 passes, 6_15 fails -> mixed -> ❎.
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_14".into(),
@@ -1531,7 +1704,7 @@ mod tests {
         ];
         let out = render_result_table(&recs).expect("Some");
         assert!(
-            out.contains("verifier summary: 1 ✅  0 ❌  1 🇽"),
+            out.contains("verifier summary: 1 ✅  0 ❌  1 ❎"),
             "tally counts one all-pass + one mixed cell: {out}"
         );
         let mixed_row = out
@@ -1539,8 +1712,8 @@ mod tests {
             .find(|l| l.contains("tiny-1llc"))
             .expect("tiny-1llc row present");
         assert!(
-            mixed_row.contains('🇽'),
-            "mixed (some pass, some fail) cell renders 🇽: {mixed_row}"
+            mixed_row.contains('❎'),
+            "mixed (some pass, some fail) cell renders ❎: {mixed_row}"
         );
         let pass_row = out
             .lines()
@@ -1971,6 +2144,8 @@ mod tests {
         let base = |attach: AttachOutcome, dispatched: bool, timed_out: bool| VerifierVmResult {
             stats: Vec::new(),
             scheduler_log: String::new(),
+            scheduler_stdout: String::new(),
+            scheduler_stderr: String::new(),
             attach,
             dispatched,
             timed_out,
@@ -2056,6 +2231,8 @@ mod tests {
         let result = VerifierVmResult {
             stats: Vec::new(),
             scheduler_log: String::new(),
+            scheduler_stdout: String::new(),
+            scheduler_stderr: String::new(),
             attach: AttachOutcome::Attached,
             dispatched: false,
             timed_out: true,
@@ -2081,6 +2258,8 @@ mod tests {
         let result = VerifierVmResult {
             stats: Vec::new(),
             scheduler_log: String::new(),
+            scheduler_stdout: String::new(),
+            scheduler_stderr: String::new(),
             attach: AttachOutcome::Attached,
             dispatched: false,
             timed_out: false,
@@ -2830,6 +3009,219 @@ libbpf: failed to load BPF skeleton 'ktstr_ops': -22
         );
     }
 
+    // -----------------------------------------------------------------------
+    // collapse_verifier_region — in-place collapse of the verifier trace,
+    // preserving everything outside the BEGIN/END markers.
+    // -----------------------------------------------------------------------
+
+    /// Markers present: the region between them is collapsed while the
+    /// prefix (surrounding scheduler chatter + BEGIN marker) and suffix
+    /// (END marker + trailing chatter) survive byte-for-byte. Built with
+    /// a genuine cycle (a >=5-line block repeated >=3x) so the collapse
+    /// fires and we can assert the omission marker lands INSIDE the
+    /// region without disturbing the surrounding text.
+    #[test]
+    fn collapse_verifier_region_collapses_in_place() {
+        // 6-line repeating block × 4 → detect_cycle fires (>=5 period,
+        // >=3 reps). Distinct addresses per copy so normalization maps
+        // them together.
+        let mut trace = String::new();
+        for i in 0..24 {
+            trace.push_str(&format!("{}: (07) r1 += 8 ; op{}\n", i, i % 6));
+        }
+        let prefix = "scheduler: starting up\nlibbpf: loading\n";
+        let suffix = "libbpf: load failed: -22\nscheduler exiting\n";
+        let input =
+            format!("{prefix}-- BEGIN PROG LOAD LOG --\n{trace}-- END PROG LOAD LOG --\n{suffix}",);
+
+        let out = collapse_verifier_region(&input);
+
+        // Everything before the BEGIN marker's content and everything
+        // from the END marker onward is byte-identical.
+        assert!(
+            out.starts_with(&format!("{prefix}-- BEGIN PROG LOAD LOG --\n")),
+            "prefix + BEGIN marker must be preserved verbatim: {out}",
+        );
+        assert!(
+            out.contains(&format!("-- END PROG LOAD LOG --\n{suffix}")),
+            "END marker + suffix must be preserved verbatim: {out}",
+        );
+        // The collapse fired inside the region.
+        assert!(
+            out.contains("identical iterations omitted"),
+            "the cyclic region must be collapsed in place: {out}",
+        );
+    }
+
+    /// No markers: identity (returned unchanged), even when the input
+    /// contains a collapsible cycle — without the markers there is no
+    /// region to collapse.
+    #[test]
+    fn collapse_verifier_region_identity_without_markers() {
+        let mut input = String::from("scheduler output with no verifier markers\n");
+        for i in 0..24 {
+            input.push_str(&format!("{}: (07) r1 += 8 ; op{}\n", i, i % 6));
+        }
+        assert_eq!(
+            collapse_verifier_region(&input),
+            input,
+            "input without BEGIN/END markers must be returned unchanged",
+        );
+    }
+
+    /// Mid-line END marker (`libbpf: -- END ...`): the partial `libbpf: `
+    /// prefix line stays OUTSIDE the collapsed region (in the suffix),
+    /// consistent with `extract_verifier_log`'s trim-back-to-newline
+    /// behavior — so the region boundary the two functions compute agree.
+    #[test]
+    fn collapse_verifier_region_midline_end_matches_extract() {
+        let input = "\
+head\n\
+-- BEGIN PROG LOAD LOG --\n\
+0: R1=ctx()\n\
+processed 5 insns (limit 1) total_states 3 peak_states 1\n\
+libbpf: -- END PROG LOAD LOG --\n\
+tail\n";
+        // Short region → no collapse; collapse_verifier_region is an
+        // identity transform on the bytes here, so the whole input is
+        // preserved AND the `libbpf: -- END` line is intact.
+        let out = collapse_verifier_region(input);
+        assert_eq!(
+            out, input,
+            "short region must round-trip byte-for-byte: {out}"
+        );
+        // The extracted region must NOT include the partial libbpf END
+        // line — cross-check that the shared region logic agrees.
+        let extracted = extract_verifier_log(input).unwrap();
+        assert!(
+            extracted.contains("processed 5 insns"),
+            "extract must include the last real content line: {extracted}",
+        );
+        assert!(
+            !extracted.contains("-- END"),
+            "extract must not include the END-marker line: {extracted}",
+        );
+    }
+
+    /// A timed-out run STILL renders the live-streamed scheduler stdout:
+    /// the core bug fix — a watchdog kill never reaches the teardown
+    /// merged-file dump (`scheduler_log` empty), but whatever streamed
+    /// over `scheduler_stdout` before the kill must appear.
+    #[test]
+    fn format_verifier_output_timed_out_prints_live_stdout() {
+        let result = VerifierVmResult {
+            stats: Vec::new(),
+            scheduler_log: String::new(),
+            scheduler_stdout: "scheduler: entered main loop\ndispatching tasks...\n".to_string(),
+            scheduler_stderr: String::new(),
+            attach: AttachOutcome::Attached,
+            dispatched: false,
+            timed_out: true,
+        };
+        let out = format_verifier_output("verifier", &result, false);
+        assert!(
+            out.contains("scheduler: UNKNOWN — VM timed out"),
+            "timed-out run must show UNKNOWN: {out}",
+        );
+        assert!(
+            out.contains("--- scheduler log ---"),
+            "timed-out run must still render the scheduler-log section: {out}",
+        );
+        assert!(
+            out.contains("scheduler: entered main loop") && out.contains("dispatching tasks..."),
+            "the live-streamed stdout captured before the watchdog kill must be printed: {out}",
+        );
+    }
+
+    /// Merged-dump fallback selection: with live stderr present and live
+    /// stdout empty, the stdout section renders NOTHING — the merged
+    /// teardown dump would duplicate the stderr section (schedulers that
+    /// log exclusively to stderr, the common libbpf/log-crate case). The
+    /// dump only renders when NEITHER live stream arrived.
+    #[test]
+    fn format_verifier_output_no_dump_duplication_with_live_stderr() {
+        let base = |stdout: &str, stderr: &str, log: &str| VerifierVmResult {
+            stats: Vec::new(),
+            scheduler_log: log.to_string(),
+            scheduler_stdout: stdout.to_string(),
+            scheduler_stderr: stderr.to_string(),
+            attach: AttachOutcome::Died,
+            dispatched: false,
+            timed_out: false,
+        };
+        // Live stderr arrived, live stdout empty: the merged dump (same
+        // bytes as stderr here) must NOT render on stdout.
+        let with_stderr = base("", "load failed: EINVAL\n", "load failed: EINVAL\n");
+        let out = format_verifier_output("verifier", &with_stderr, false);
+        assert!(
+            !out.contains("--- scheduler log ---") && !out.contains("load failed"),
+            "live stderr present -> no merged-dump duplication on stdout: {out}",
+        );
+        // No live stream at all: the merged dump is the fallback.
+        let dump_only = base("", "", "load failed: EINVAL\n");
+        let out = format_verifier_output("verifier", &dump_only, false);
+        assert!(
+            out.contains("--- scheduler log ---") && out.contains("load failed"),
+            "no live streams -> merged dump renders: {out}",
+        );
+    }
+
+    /// The stderr formatter labels the section and collapses the verifier
+    /// region in place (non-raw); empty stderr yields the empty string so
+    /// the caller emits nothing.
+    #[test]
+    fn format_verifier_stderr_labels_and_collapses() {
+        let empty = VerifierVmResult {
+            stats: Vec::new(),
+            scheduler_log: String::new(),
+            scheduler_stdout: String::new(),
+            scheduler_stderr: String::new(),
+            attach: AttachOutcome::Attached,
+            dispatched: true,
+            timed_out: false,
+        };
+        assert_eq!(
+            format_verifier_stderr("verifier", &empty, false),
+            "",
+            "empty stderr must format to the empty string",
+        );
+
+        let mut trace = String::new();
+        for i in 0..24 {
+            trace.push_str(&format!("{}: (07) r1 += 8 ; op{}\n", i, i % 6));
+        }
+        let with_err = VerifierVmResult {
+            stats: Vec::new(),
+            scheduler_log: String::new(),
+            scheduler_stdout: String::new(),
+            scheduler_stderr: format!(
+                "libbpf: -- BEGIN PROG LOAD LOG --\n{trace}-- END PROG LOAD LOG --\nload failed\n",
+            ),
+            attach: AttachOutcome::Died,
+            dispatched: false,
+            timed_out: false,
+        };
+        let s = format_verifier_stderr("verifier", &with_err, false);
+        assert!(
+            s.contains("--- scheduler stderr ---"),
+            "stderr section must carry a labeled header: {s}",
+        );
+        assert!(
+            s.contains("identical iterations omitted"),
+            "non-raw stderr must collapse the verifier region: {s}",
+        );
+        assert!(
+            s.contains("load failed"),
+            "text outside the verifier region must be preserved: {s}",
+        );
+        // Raw mode: no collapsing.
+        let raw = format_verifier_stderr("verifier", &with_err, true);
+        assert!(
+            !raw.contains("identical iterations omitted"),
+            "raw mode must not collapse: {raw}",
+        );
+    }
+
     // -- insta snapshot tests --
 
     #[test]
@@ -2850,6 +3242,8 @@ libbpf: failed to load BPF skeleton 'ktstr_ops': -22
                 },
             ],
             scheduler_log: String::new(),
+            scheduler_stdout: String::new(),
+            scheduler_stderr: String::new(),
             attach: AttachOutcome::Attached,
             dispatched: true,
             timed_out: false,
@@ -2871,6 +3265,8 @@ processed 42 insns (limit 1000000) max_states_per_insn 1 total_states 10 peak_st
                 verified_insns: 42,
             }],
             scheduler_log: log.into(),
+            scheduler_stdout: String::new(),
+            scheduler_stderr: String::new(),
             // A load log present means the scheduler printed a verifier
             // trace then exited — the SchedulerDied failure path.
             attach: AttachOutcome::Died,

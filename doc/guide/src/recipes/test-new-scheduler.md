@@ -131,7 +131,7 @@ ktstr_sched:
  kernel      ktstr_dispatch  ktstr_dump  ktstr_dump_cpu  ktstr_dump_task  ktstr_enqueue  ktstr_exit  ktstr_exit_task  ktstr_init  ktstr_init_task  ktstr_select_cp  ktstr_yield
  kernel_7_0  102             81          13              70               74             25          419              2296        <span class="t-yel">29077</span>            39               8
 
-<span class="t-grn">verifier summary: 4 ✅  0 ❌  0 🇽</span>
+<span class="t-grn">verifier summary: 4 ✅  0 ❌  0 ❎</span>
  topology   ktstr_sched
  odd-3llc   ✅
  smt-2llc   ✅

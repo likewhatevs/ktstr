@@ -1373,6 +1373,27 @@ pub const KTSTR_LOCK_DIR_ENV: &str = "KTSTR_LOCK_DIR";
 /// arch: x86_64 and aarch64); both readers identical.
 pub const KTSTR_VERBOSE_ENV: &str = "KTSTR_VERBOSE";
 
+/// Name of the environment variable that enables the VMM's verbose
+/// host-side diagnostics (per-vCPU affinity-mask lines, the BSP
+/// run-loop trace, and the `CLEANUP:` teardown timings). Value-typed:
+/// only the exact string `"1"` enables; unset / empty / any other
+/// value is disabled. Read once via
+/// `crate::vmm::debug_logging_enabled` (crate-private), which
+/// OR-combines it with [`RUNNER_DEBUG_ENV`]. Default-off keeps these
+/// lines out of normal
+/// CI logs where they otherwise bury the scheduler failure under
+/// investigation.
+pub const KTSTR_DEBUG_ENV: &str = "KTSTR_DEBUG";
+
+/// Name of the environment variable GitHub Actions exports (set to
+/// `"1"`) when a job is re-run with "Enable debug logging". Not a
+/// `KTSTR_*` variable, but honoured alongside [`KTSTR_DEBUG_ENV`] by
+/// `crate::vmm::debug_logging_enabled` (crate-private) so a failed CI
+/// job re-run in debug mode gets the full VMM diagnostics without any
+/// ktstr-specific
+/// knob. Value-typed: only `"1"` enables.
+pub const RUNNER_DEBUG_ENV: &str = "RUNNER_DEBUG";
+
 /// Name of the environment variable that bypasses LLC resource
 /// locks at scenario setup (test_support::dispatch / cargo-ktstr
 /// shell). Set by the `--bypass-llc-locks` CLI flag.
