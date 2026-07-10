@@ -935,6 +935,46 @@ impl KtstrVm {
         }
     }
 
+    /// Run-lock acquisition for the interactive / one-shot shell path
+    /// ([`Self::run_interactive`]). Wraps [`Self::acquire_run_locks`] and
+    /// degrades a transient `ResourceContention` (every candidate LLC slot busy
+    /// under a concurrent peer's `LOCK_EX`) to a lock-free best-effort boot
+    /// instead of failing. The test path ([`Self::run`]) propagates contention
+    /// verbatim so nextest can retry the cell after the holder finishes; a
+    /// one-shot `ktstr shell` has no such retry, so on a busy shared host it
+    /// boots without an exclusive reservation rather than aborting. Non-
+    /// contention errors still propagate.
+    fn acquire_interactive_run_locks(&self) -> Result<RunLocks> {
+        Self::degrade_contention_to_overcommit(self.acquire_run_locks())
+    }
+
+    /// Map an [`Self::acquire_run_locks`] result for the one-shot shell path: a
+    /// transient `ResourceContention` becomes a lock-free best-effort
+    /// `RunLocks`; every other outcome (including non-contention errors) passes
+    /// through unchanged. Associated fn over the input `Result` so the degrade
+    /// policy is unit-testable — `acquire_resource_locks` short-circuits to
+    /// Acquired in cargo-test mode, so the contention branch is otherwise
+    /// unreachable from a test.
+    fn degrade_contention_to_overcommit(acquired: Result<RunLocks>) -> Result<RunLocks> {
+        match acquired {
+            Err(e)
+                if e.downcast_ref::<host_topology::ResourceContention>()
+                    .is_some() =>
+            {
+                eprintln!(
+                    "ktstr: host CPUs busy ({e}); booting the shell without an \
+                     exclusive CPU reservation"
+                );
+                Ok(RunLocks {
+                    locks: Vec::new(),
+                    default_cpu_mask: None,
+                    pinning_plan: None,
+                })
+            }
+            other => other,
+        }
+    }
+
     /// Default (non-perf, non-no-perf) run-lock acquisition: try each LLC offset
     /// for a 1:1 LOCK_SH pin. If a candidate MAPS but every offset's locks are
     /// busy -> transient ResourceContention (nextest retry resolves it after the
@@ -1318,7 +1358,7 @@ impl KtstrVm {
         // returns. Held via a binding so RAII drop fires on
         // every exit path (including the `?` early-returns
         // below).
-        let _run_locks = self.acquire_run_locks()?;
+        let _run_locks = self.acquire_interactive_run_locks()?;
         // Shell/interactive path mirrors run_vm: no-perf + --cpu-cap
         // applies the LlcPlan's CPU list as a sched_setaffinity mask
         // on every vCPU thread. Perf-mode's pin_targets doesn't

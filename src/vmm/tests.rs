@@ -73,6 +73,54 @@ fn acquire_default_run_locks_overcommits_when_host_too_small() {
     assert!(rl.pinning_plan.is_none());
 }
 
+/// degrade_contention_to_overcommit converts a transient ResourceContention
+/// into a lock-free best-effort RunLocks: the one-shot shell has no nextest
+/// retry to wait out a peer's LOCK_EX, so it boots overcommitted rather than
+/// aborting. No locks, no mask, no pinning plan.
+#[test]
+fn degrade_contention_to_overcommit_maps_contention_to_lockfree() {
+    let contended = Err(anyhow::Error::new(host_topology::ResourceContention {
+        reason: "all 3 LLC slots busy (LOCK_SH)".into(),
+    }));
+    let rl = KtstrVm::degrade_contention_to_overcommit(contended)
+        .expect("contention degrades to Ok, not an error");
+    assert!(
+        rl.locks.is_empty(),
+        "best-effort boot holds no resource locks"
+    );
+    assert!(rl.default_cpu_mask.is_none());
+    assert!(rl.pinning_plan.is_none());
+}
+
+/// degrade_contention_to_overcommit passes a successful acquire through
+/// unchanged — the degrade only fires on ResourceContention.
+#[test]
+fn degrade_contention_to_overcommit_passes_success_through() {
+    let ok = Ok(RunLocks {
+        locks: Vec::new(),
+        default_cpu_mask: Some(vec![0, 1]),
+        pinning_plan: None,
+    });
+    let rl = KtstrVm::degrade_contention_to_overcommit(ok).expect("Ok passes through");
+    assert_eq!(rl.default_cpu_mask, Some(vec![0, 1]));
+}
+
+/// degrade_contention_to_overcommit propagates a non-contention error rather
+/// than masking a genuine failure as an overcommit boot.
+#[test]
+fn degrade_contention_to_overcommit_propagates_other_errors() {
+    let boom = Err::<RunLocks, _>(anyhow::anyhow!("disk gone"));
+    let err = match KtstrVm::degrade_contention_to_overcommit(boom) {
+        Ok(_) => panic!("non-contention error must propagate, not degrade"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("disk gone"));
+    assert!(
+        err.downcast_ref::<host_topology::ResourceContention>()
+            .is_none()
+    );
+}
+
 #[test]
 fn detect_guest_failure_surfaces_alloc_oom_panic_and_generic() {
     // Rust alloc-error on COM2 → actionable OOM cause, echoing the line.
