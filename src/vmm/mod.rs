@@ -654,6 +654,30 @@ struct RunLocks {
     pinning_plan: Option<host_topology::PinningPlan>,
 }
 
+/// Process-wide gate for the VMM's verbose host-side diagnostics.
+///
+/// Returns `true` when either [`crate::KTSTR_DEBUG_ENV`] or
+/// [`crate::RUNNER_DEBUG_ENV`] is set to exactly `"1"`. The per-vCPU
+/// affinity-mask lines, the BSP run-loop trace, and the `CLEANUP:`
+/// teardown timings route through this gate so they stay out of normal
+/// CI logs — where they otherwise bury the scheduler test failure a
+/// run is investigating — yet reappear on demand. `RUNNER_DEBUG=1` is
+/// what GitHub Actions exports when a job is re-run with "Enable debug
+/// logging", so a failed CI job re-run in debug mode gets the full
+/// diagnostics for free.
+///
+/// The env read is memoized in a [`OnceLock`](std::sync::OnceLock)
+/// because these lines are emitted from the hot per-vCPU paths; the
+/// value is fixed for the process lifetime.
+pub(crate) fn debug_logging_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        [crate::KTSTR_DEBUG_ENV, crate::RUNNER_DEBUG_ENV]
+            .iter()
+            .any(|k| std::env::var(k).is_ok_and(|v| v == "1"))
+    })
+}
+
 /// Human-readable summary of device-IRQ routing-install failures, for
 /// `run_interactive`'s teardown. `None` when there were none. `n` is a count of
 /// `KVM_SET_GSI_ROUTING` installs that errored, each leaving a device IRQ

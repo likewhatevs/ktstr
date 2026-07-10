@@ -433,7 +433,11 @@ pub(crate) fn set_thread_cpumask(cpus: &[usize], label: &str) {
         parts.join(",")
     };
     match nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &cpuset) {
-        Ok(()) => eprintln!("no_perf_mode: mask {label} to {n} CPUs ({cpu_list_str})"),
+        Ok(()) => {
+            if crate::vmm::debug_logging_enabled() {
+                eprintln!("no_perf_mode: mask {label} to {n} CPUs ({cpu_list_str})")
+            }
+        }
         Err(e) => {
             eprintln!("no_perf_mode: WARNING: mask {label} to {n} CPUs ({cpu_list_str}): {e}")
         }
