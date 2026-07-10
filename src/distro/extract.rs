@@ -27,9 +27,9 @@
 //!   `.config` is shipped and there is no debuginfo package.
 //!
 //! None of these distros ship `modules.dep` in the package — depmod
-//! generates it at install time — so extraction runs the host's
-//! `depmod -b` over the tree as a best-effort step (see
-//! `ensure_modules_dep`).
+//! generates it at install time — so extraction synthesizes it in
+//! process from each module's `.modinfo` section (see
+//! `ensure_modules_dep`), without relying on a host `depmod`.
 //!
 //! ## Compression
 //!
@@ -196,9 +196,9 @@ pub fn extract_vmlinux(packages: &[&Path], dest: &Path, release: &str) -> Result
 /// installed system `/lib` is a symlink into `/usr`, but the
 /// extracted tree has no such link. Bridge the two `modules`
 /// directories with a relative symlink so every downstream lookup —
-/// and `depmod -b`, whichever `MODULE_DIRECTORY` the host kmod was
-/// built with — resolves through the classic `lib/modules/<rel>`
-/// path (and vice versa).
+/// image discovery, `modules.dep` synthesis, and `module_closure` —
+/// resolves through the classic `lib/modules/<rel>` path (and vice
+/// versa) regardless of which layout the package shipped.
 fn unify_modules_layout(dest: &Path) -> Result<()> {
     let classic = dest.join("lib/modules");
     let usrmerge = dest.join("usr/lib/modules");
@@ -214,40 +214,153 @@ fn unify_modules_layout(dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort `modules.dep` generation for packages that don't ship
-/// one. Neither Fedora's kernel-core rpm nor Ubuntu's linux-modules
-/// deb contains `modules.dep` — depmod generates it at package
-/// install time — so run the host's `depmod -b <dest> <release>`
-/// when the file is absent. Failure (no depmod on the host, or a
-/// depmod error) is a warning, not an error: [`module_closure`] gives
-/// an actionable message if the file is still missing when modules
-/// are actually requested.
+/// Synthesize `modules.dep` for a package that doesn't ship one.
+///
+/// Neither Fedora's kernel-core rpm nor Ubuntu's linux-modules deb
+/// contains `modules.dep` — depmod generates it at package install
+/// time. Rather than shell out to the host `depmod` (whose kmod may be
+/// unable to decompress the tree's `.ko.xz` modules, silently emitting
+/// an incomplete file), build it in process from each module's
+/// `.modinfo` (see [`build_modules_dep`]). A failure is a warning, not
+/// a hard error: [`module_closure`] still emits an actionable message
+/// if the file is missing when modules are actually requested.
 fn ensure_modules_dep(dest: &Path, release: &str) {
-    if dest
-        .join(format!("lib/modules/{release}/modules.dep"))
-        .exists()
-    {
+    let modules_dir = dest.join(format!("lib/modules/{release}"));
+    let dep_path = modules_dir.join("modules.dep");
+    if dep_path.exists() {
         return;
     }
-    let result = std::process::Command::new("depmod")
-        .arg("-b")
-        .arg(dest)
-        .arg(release)
-        .output();
-    match result {
-        Ok(out) if out.status.success() => {}
-        Ok(out) => tracing::warn!(
-            release,
-            status = %out.status,
-            stderr = %String::from_utf8_lossy(&out.stderr),
-            "depmod failed; module_closure will not resolve dependencies for this tree"
-        ),
+    match build_modules_dep(&modules_dir) {
+        Ok(text) => {
+            if let Err(e) = fs::write(&dep_path, text) {
+                tracing::warn!(
+                    release,
+                    error = %e,
+                    "could not write synthesized modules.dep; module_closure will not resolve dependencies for this tree"
+                );
+            }
+        }
         Err(e) => tracing::warn!(
             release,
             error = %e,
-            "could not run depmod; module_closure will not resolve dependencies for this tree"
+            "could not synthesize modules.dep; module_closure will not resolve dependencies for this tree"
         ),
     }
+}
+
+/// `.modinfo` fields ktstr needs to reconstruct `modules.dep`.
+struct ModInfo {
+    /// The module's registered name (`name=` field), if present.
+    name: Option<String>,
+    /// Direct dependency module names (`depends=`, comma-separated).
+    depends: Vec<String>,
+}
+
+/// Build `modules.dep` text for the module tree rooted at
+/// `modules_dir` (a `lib/modules/<release>/` directory).
+///
+/// Walks every module file, reads its `.modinfo` for the module name
+/// and direct `depends`, and emits one depmod-format line per module:
+/// the module's path, a colon, then the space-separated paths of its
+/// direct dependencies — all relative to `modules_dir`, exactly the
+/// shape [`module_closure`] parses. Dependency names are resolved to
+/// paths through the name→path map; a `depends` entry with no matching
+/// module file (a built-in, or one outside the tree) is dropped, as
+/// real depmod does. Lines are sorted for a deterministic file.
+fn build_modules_dep(modules_dir: &Path) -> Result<String> {
+    let mut entries: Vec<(String, Vec<String>)> = Vec::new();
+    let mut name_to_path: HashMap<String, String> = HashMap::new();
+
+    for entry in walkdir::WalkDir::new(modules_dir).follow_links(false) {
+        let entry = entry.with_context(|| format!("walk {}", modules_dir.display()))?;
+        if !entry.file_type().is_file() || !is_module_file(entry.path()) {
+            continue;
+        }
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(modules_dir)
+            .expect("walkdir entry is under modules_dir")
+            .to_str()
+            .ok_or_else(|| anyhow!("non-utf8 module path {}", path.display()))?
+            .to_string();
+
+        let raw = fs::read(path).with_context(|| format!("read module {}", path.display()))?;
+        let elf = match path.extension().and_then(|e| e.to_str()) {
+            Some("ko") => raw,
+            Some(ext) => decompress_bytes(ext, &raw)
+                .with_context(|| format!("decompress module {}", path.display()))?,
+            None => raw,
+        };
+        let info =
+            parse_modinfo(&elf).with_context(|| format!("read .modinfo of {}", path.display()))?;
+        let name = info.name.unwrap_or_else(|| module_key(&rel));
+        name_to_path.insert(module_key(&name), rel.clone());
+        entries.push((rel, info.depends));
+    }
+
+    let mut lines: Vec<String> = entries
+        .iter()
+        .map(|(rel, depends)| {
+            let deps: Vec<&str> = depends
+                .iter()
+                .filter_map(|d| name_to_path.get(&module_key(d)).map(String::as_str))
+                .collect();
+            if deps.is_empty() {
+                format!("{rel}:")
+            } else {
+                format!("{rel}: {}", deps.join(" "))
+            }
+        })
+        .collect();
+    lines.sort();
+    Ok(lines.join("\n") + "\n")
+}
+
+/// Whether `path`'s basename is a loadable module (`.ko` or a
+/// `.ko.{xz,zst,gz}` compressed module).
+fn is_module_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name.ends_with(".ko")
+        || name.ends_with(".ko.xz")
+        || name.ends_with(".ko.zst")
+        || name.ends_with(".ko.gz")
+}
+
+/// Read the `name=` and `depends=` fields from a module's `.modinfo`
+/// ELF section (NUL-separated `key=value` pairs).
+fn parse_modinfo(elf: &[u8]) -> Result<ModInfo> {
+    let obj = goblin::elf::Elf::parse(elf).context("parse module ELF")?;
+    let section = obj
+        .section_headers
+        .iter()
+        .find(|sh| obj.shdr_strtab.get_at(sh.sh_name) == Some(".modinfo"))
+        .ok_or_else(|| anyhow!("module has no .modinfo section"))?;
+    let start = section.sh_offset as usize;
+    let end = start
+        .checked_add(section.sh_size as usize)
+        .ok_or_else(|| anyhow!(".modinfo section size overflows"))?;
+    let blob = elf
+        .get(start..end)
+        .ok_or_else(|| anyhow!(".modinfo section [{start:#x}..{end:#x}] out of bounds"))?;
+
+    let mut name = None;
+    let mut depends = Vec::new();
+    for field in blob.split(|&b| b == 0).filter(|f| !f.is_empty()) {
+        let field =
+            std::str::from_utf8(field).map_err(|_| anyhow!(".modinfo field is not UTF-8"))?;
+        if let Some(v) = field.strip_prefix("name=") {
+            name = Some(v.to_string());
+        } else if let Some(v) = field.strip_prefix("depends=") {
+            depends = v
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+    }
+    Ok(ModInfo { name, depends })
 }
 
 // ---------------------------------------------------------------------------
@@ -1097,7 +1210,6 @@ fn module_key(path: &str) -> String {
 /// zboot `COMP_TYPE` spelling (`gzip`/`zstd`); an unrecognized codec is
 /// an error naming it. Shares the flate2/zstd/xz2 stack the rest of the
 /// module already streams `.ko` and archive payloads through.
-#[cfg_attr(not(test), allow(dead_code))]
 fn decompress_bytes(codec: &str, data: &[u8]) -> Result<Vec<u8>> {
     let mut reader: Box<dyn Read> = match codec {
         "gz" | "gzip" => Box::new(flate2::read::GzDecoder::new(data)),

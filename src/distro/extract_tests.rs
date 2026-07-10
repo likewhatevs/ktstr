@@ -778,6 +778,123 @@ fn module_key_normalizes() {
 }
 
 // ---------------------------------------------------------------------------
+// modules.dep synthesis
+// ---------------------------------------------------------------------------
+
+/// Append a 64-byte ELF64 section header.
+fn push_shdr(out: &mut Vec<u8>, name: u32, sh_type: u32, offset: u64, size: u64) {
+    out.extend_from_slice(&name.to_le_bytes()); // sh_name
+    out.extend_from_slice(&sh_type.to_le_bytes()); // sh_type
+    out.extend_from_slice(&0u64.to_le_bytes()); // sh_flags
+    out.extend_from_slice(&0u64.to_le_bytes()); // sh_addr
+    out.extend_from_slice(&offset.to_le_bytes()); // sh_offset
+    out.extend_from_slice(&size.to_le_bytes()); // sh_size
+    out.extend_from_slice(&0u32.to_le_bytes()); // sh_link
+    out.extend_from_slice(&0u32.to_le_bytes()); // sh_info
+    out.extend_from_slice(&0u64.to_le_bytes()); // sh_addralign
+    out.extend_from_slice(&0u64.to_le_bytes()); // sh_entsize
+}
+
+/// Build a minimal ELF64-LE relocatable object carrying just a
+/// `.modinfo` section with `name=` and `depends=` fields — the shape
+/// `parse_modinfo` reads out of a real `.ko`.
+fn make_module_elf(name: &str, depends: &str) -> Vec<u8> {
+    let mut modinfo = Vec::new();
+    for field in [
+        format!("name={name}"),
+        format!("depends={depends}"),
+        "license=GPL".into(),
+    ] {
+        modinfo.extend_from_slice(field.as_bytes());
+        modinfo.push(0);
+    }
+    // shstrtab: "\0.modinfo\0.shstrtab\0" — `.modinfo` at offset 1,
+    // `.shstrtab` at offset 10.
+    let shstrtab: &[u8] = b"\0.modinfo\0.shstrtab\0";
+
+    let eh_size = 64usize;
+    let modinfo_off = eh_size;
+    let shstrtab_off = modinfo_off + modinfo.len();
+    let shoff = shstrtab_off + shstrtab.len();
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0]); // e_ident[0..8]
+    out.extend_from_slice(&[0u8; 8]); // e_ident[8..16]
+    out.extend_from_slice(&1u16.to_le_bytes()); // e_type = ET_REL
+    out.extend_from_slice(&0x3eu16.to_le_bytes()); // e_machine = EM_X86_64
+    out.extend_from_slice(&1u32.to_le_bytes()); // e_version
+    out.extend_from_slice(&0u64.to_le_bytes()); // e_entry
+    out.extend_from_slice(&0u64.to_le_bytes()); // e_phoff
+    out.extend_from_slice(&(shoff as u64).to_le_bytes()); // e_shoff
+    out.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+    out.extend_from_slice(&(eh_size as u16).to_le_bytes()); // e_ehsize
+    out.extend_from_slice(&0u16.to_le_bytes()); // e_phentsize
+    out.extend_from_slice(&0u16.to_le_bytes()); // e_phnum
+    out.extend_from_slice(&64u16.to_le_bytes()); // e_shentsize
+    out.extend_from_slice(&3u16.to_le_bytes()); // e_shnum
+    out.extend_from_slice(&2u16.to_le_bytes()); // e_shstrndx
+    assert_eq!(out.len(), eh_size);
+
+    out.extend_from_slice(&modinfo);
+    out.extend_from_slice(shstrtab);
+
+    push_shdr(&mut out, 0, 0, 0, 0); // null section
+    push_shdr(&mut out, 1, 1, modinfo_off as u64, modinfo.len() as u64); // .modinfo, SHT_PROGBITS
+    push_shdr(&mut out, 10, 3, shstrtab_off as u64, shstrtab.len() as u64); // .shstrtab, SHT_STRTAB
+    out
+}
+
+#[test]
+fn parse_modinfo_reads_name_and_depends() {
+    let info = parse_modinfo(&make_module_elf("virtio_mmio", "virtio,virtio_ring")).unwrap();
+    assert_eq!(info.name.as_deref(), Some("virtio_mmio"));
+    assert_eq!(info.depends, vec!["virtio", "virtio_ring"]);
+
+    // An empty `depends=` yields an empty list, not `[""]`.
+    let leaf = parse_modinfo(&make_module_elf("virtio", "")).unwrap();
+    assert!(leaf.depends.is_empty());
+}
+
+#[test]
+fn synthesized_modules_dep_round_trips_through_module_closure() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path().join(format!("lib/modules/{REL}/kernel"));
+    fs::create_dir_all(&base).unwrap();
+    // virtio_mmio depends on virtio; ship it compressed (.ko.xz, as
+    // Fedora does) to exercise the decompress-before-parse path, and
+    // virtio as a raw .ko.
+    fs::write(
+        base.join("virtio_mmio.ko.xz"),
+        xz_compress(&make_module_elf("virtio_mmio", "virtio")),
+    )
+    .unwrap();
+    fs::write(base.join("virtio.ko"), make_module_elf("virtio", "")).unwrap();
+
+    ensure_modules_dep(tmp.path(), REL);
+
+    let dep =
+        fs::read_to_string(tmp.path().join(format!("lib/modules/{REL}/modules.dep"))).unwrap();
+    assert!(
+        dep.contains("kernel/virtio_mmio.ko.xz: kernel/virtio.ko"),
+        "dependent line names the dependency path: {dep}"
+    );
+    assert!(
+        dep.contains("kernel/virtio.ko:"),
+        "leaf line has no deps: {dep}"
+    );
+
+    // The synthesized file drives module_closure: requesting the
+    // previously-unresolvable virtio_mmio now yields its dependency
+    // first, then itself (compressed module decompressed in place).
+    let closure = module_closure(tmp.path(), REL, &["virtio_mmio"]).unwrap();
+    let names: Vec<String> = closure
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["virtio.ko", "virtio_mmio.ko"]);
+}
+
+// ---------------------------------------------------------------------------
 // Arch helpers
 // ---------------------------------------------------------------------------
 
