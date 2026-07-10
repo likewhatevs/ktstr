@@ -130,13 +130,16 @@ pub struct SidecarResult {
     pub scheduler_commit: Option<String>,
     /// How the userspace scheduler binary was resolved for this run —
     /// the snake_case [`crate::test_support::ResolveSource::as_str`] tag
-    /// (`"path"`, `"env_var"`, `"path_lookup"`, `"sibling_dir"`,
-    /// `"target_debug"`, `"target_release"`, `"auto_built"`,
-    /// `"not_found"`). Provenance, not identity: distinct from
+    /// (`"path"`, `"env_var"`, `"path_lookup"`, `"auto_built"`,
+    /// `"not_found"`). Historical sidecars may carry retired tags
+    /// (`"sibling_dir"`, `"target_debug"`, `"target_release"`) from the
+    /// pre-built-fallback cascade the resolver no longer runs; the stats
+    /// CLI reads `resolve_source` as an opaque string, so those still
+    /// filter and display. Provenance, not identity: distinct from
     /// [`SidecarResult::scheduler_commit`] (the binary's git commit) —
-    /// this records the discovery PATH, so the stats CLI can answer "was
+    /// this records the resolution PATH, so the stats CLI can answer "was
     /// this run's scheduler auto-built from the workspace HEAD, or
-    /// resolved from a possibly-stale `target/` or `$PATH` binary?".
+    /// resolved from a possibly-stale `$PATH` binary?".
     /// `"auto_built"` is the only tag whose source commit is known to
     /// match the workspace tree; every other tag carries the stale-binary
     /// hazard documented on the [`crate::test_support::ResolveSource`]
@@ -1330,13 +1333,13 @@ fn format_run_dirname(kernel: Option<&str>, commit: Option<&str>) -> String {
 ///    / `replay` reads AND the child test processes' sidecar writes
 ///    resolve the SAME directory regardless of CWD. This is the
 ///    primary path under `cargo ktstr`.
-/// 2. `{CARGO_TARGET_DIR}/ktstr` when that env is set non-empty.
-/// 3. `target/ktstr` (CWD-relative) — the raw `cargo nextest run`
-///    fallback. CWD-relative is fragile across a Cargo workspace (the
-///    test binary's CWD is the package dir, which differs from a
-///    workspace-root invocation), which is exactly why the
-///    orchestrator pins the absolute override above; raw nextest has
-///    no footer to mismatch, so the fallback is acceptable there.
+/// 2. `{cargo target directory}/ktstr` — the raw `cargo test` /
+///    `cargo nextest run` fallback, with the target directory resolved
+///    by `cargo_target_dir` (which asks cargo, so a
+///    `.cargo/config [build] target-dir` is honored, not just
+///    `CARGO_TARGET_DIR`). Only this unpinned path pays the
+///    one-per-process `cargo metadata` spawn; the orchestrator pins the
+///    absolute override above and never reaches it.
 ///
 /// Used by `cargo ktstr stats` / `replay` and the post-run footer to
 /// enumerate runs without reconstructing a specific run key.
@@ -1344,12 +1347,64 @@ pub fn runs_root() -> PathBuf {
     if let Some(root) = std::env::var_os(crate::KTSTR_RUNS_ROOT_ENV).filter(|v| !v.is_empty()) {
         return PathBuf::from(root);
     }
-    let target = std::env::var("CARGO_TARGET_DIR")
+    cargo_target_dir().join("ktstr")
+}
+
+/// The cargo target directory for the unpinned [`runs_root`] fallback.
+///
+/// Asks cargo via `cargo metadata --no-deps` and reads
+/// `target_directory`, so the answer reflects `CARGO_TARGET_DIR`, a
+/// `.cargo/config [build] target-dir`, AND the workspace location — a
+/// bare `CARGO_TARGET_DIR`-or-`"target"` read honors the env var but
+/// silently ignores a config `target-dir`, landing sidecars under a
+/// `target/ktstr` that no other tool writes to. Memoized in a
+/// `OnceLock`: the answer depends only on the process's CWD + config
+/// (stable for a suite run) and the subprocess spawn is far too costly
+/// to repeat per sidecar write. Only the raw `cargo test` / nextest
+/// path reaches here; the `cargo ktstr` orchestrator pins
+/// [`crate::KTSTR_RUNS_ROOT_ENV`] and short-circuits [`runs_root`]
+/// before this runs.
+///
+/// On any `cargo metadata` failure (cargo absent, non-zero exit,
+/// unparsable JSON, missing `target_directory`) it falls back to the
+/// bare behavior: `CARGO_TARGET_DIR` when set non-empty, else the
+/// CWD-relative `"target"`.
+fn cargo_target_dir() -> PathBuf {
+    static TARGET_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    if let Some(cached) = TARGET_DIR.get() {
+        return cached.clone();
+    }
+    let resolved = std::env::current_dir()
         .ok()
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target"));
-    target.join("ktstr")
+        .and_then(|cwd| cargo_metadata_target_dir(&cwd))
+        .unwrap_or_else(|| {
+            std::env::var("CARGO_TARGET_DIR")
+                .ok()
+                .filter(|d| !d.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("target"))
+        });
+    let _ = TARGET_DIR.set(resolved.clone());
+    resolved
+}
+
+/// Run `cargo metadata --no-deps` in `dir` and return its
+/// `target_directory`. `None` on any failure (cargo absent, non-zero
+/// exit, unparsable JSON, missing key) so the caller can fall back.
+/// The subprocess CWD is set on the `Command` from `dir`, never via a
+/// process-wide `chdir`, so tests drive it against a tempdir-workspace
+/// without racing the ambient CWD of concurrent tests.
+fn cargo_metadata_target_dir(dir: &std::path::Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    value.get("target_directory")?.as_str().map(PathBuf::from)
 }
 
 /// Predicate: is `entry` a candidate run directory under

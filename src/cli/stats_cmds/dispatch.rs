@@ -17,8 +17,8 @@ use crate::stats::{ComparisonPolicy, RowFilter};
 ///
 /// Source directory:
 /// - `KTSTR_SIDECAR_DIR` if set, else
-/// - the most recently modified subdirectory under
-///   `{CARGO_TARGET_DIR or "target"}/ktstr/`.
+/// - the most recently modified subdirectory under the cargo target
+///   directory's `ktstr/` (see [`crate::test_support::runs_root`]).
 ///
 /// `cargo ktstr stats` doesn't itself run a kernel, so it can't
 /// reconstruct the `{kernel}-{project_commit}` key the test process
@@ -43,7 +43,8 @@ pub fn print_stats_report() -> Option<String> {
     report
 }
 
-/// List test runs under `{CARGO_TARGET_DIR or "target"}/ktstr/`.
+/// List test runs under the cargo target directory's `ktstr/` (see
+/// [`crate::test_support::runs_root`]).
 pub fn list_runs() -> Result<()> {
     crate::stats::list_runs()
 }
