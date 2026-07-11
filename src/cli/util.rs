@@ -82,6 +82,106 @@ pub fn new_wrapped_table() -> comfy_table::Table {
     t
 }
 
+/// Whether the environment ASKS for color on a non-TTY stdout (cached
+/// per process, like [`stdout_color`]): any of `GITHUB_ACTIONS`,
+/// `CLICOLOR_FORCE`, or `FORCE_COLOR` is set. GitHub Actions' log
+/// viewer renders ANSI color but its pipes are not TTYs, so plain
+/// TTY detection would strip the styling CI logs can actually show;
+/// the latter two are the conventional user-facing force-color knobs.
+/// Consulted only by [`new_bordered_table`]'s color policy — and only
+/// when `NO_COLOR` is unset, which always wins.
+fn env_forces_color() -> bool {
+    static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCE.get_or_init(|| {
+        ["GITHUB_ACTIONS", "CLICOLOR_FORCE", "FORCE_COLOR"]
+            .iter()
+            .any(|v| std::env::var_os(v).is_some())
+    })
+}
+
+/// Whether `NO_COLOR` is set (cached per process). Per the no-color
+/// convention, presence — any value — disables color; it outranks
+/// every force-color knob in [`new_bordered_table`]'s color policy.
+fn env_no_color() -> bool {
+    static NO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NO.get_or_init(|| std::env::var_os("NO_COLOR").is_some())
+}
+
+/// Apply [`new_bordered_table`]'s cell-color policy to `t`, with the
+/// three environment probes passed in as plain bools so unit tests can
+/// pin every branch deterministically (the probes themselves are
+/// process-cached and environment-dependent). Precedence:
+/// 1. `no_color` (NO_COLOR set) — `force_no_tty()`: no styling, ever.
+/// 2. `tty` ([`stdout_color`]) — leave comfy-table's own TTY detection
+///    in charge (it styles, and measures the terminal it sees).
+/// 3. `force_color` ([`env_forces_color`]) — `force_no_tty()` +
+///    `enforce_styling()`: emit cell colors despite the non-TTY stdout.
+/// 4. otherwise — `force_no_tty()`: plain piped output, no escapes.
+fn apply_bordered_color_policy(
+    t: &mut comfy_table::Table,
+    no_color: bool,
+    tty: bool,
+    force_color: bool,
+) {
+    if no_color {
+        t.force_no_tty();
+    } else if tty {
+        // Interactive stdout: comfy-table's default TTY detection
+        // already styles cells; nothing to override.
+    } else if force_color {
+        t.force_no_tty();
+        t.enforce_styling();
+    } else {
+        t.force_no_tty();
+    }
+}
+
+/// Build a BORDERED comfy-table. Unlike [`new_table`] (the borderless
+/// NOTHING preset), this loads comfy-table's `UTF8_FULL` preset plus the
+/// `UTF8_SOLID_INNER_BORDERS` modifier, so the rendered grid carries
+/// solid box-drawing borders (`│`, `─`, `┼`, …) around every cell rather
+/// than the preset's default dashed inner lines (`┆`, `╌`). Same
+/// `ContentArrangement::Disabled` (columns expand to their content, no
+/// terminal-width wrapping) as [`new_table`].
+///
+/// Cell-color policy (see [`apply_bordered_color_policy`]): colors
+/// render on an interactive TTY as with [`new_table`], but ALSO —
+/// deliberately unlike [`new_table`], which stays escape-free on every
+/// non-TTY stdout — on a non-TTY stdout when `GITHUB_ACTIONS`,
+/// `CLICOLOR_FORCE`, or `FORCE_COLOR` is set (via comfy-table's
+/// `enforce_styling`), so GitHub Actions logs render the PASS/FAIL grid
+/// green/red the way nextest's own output already does there. `NO_COLOR`
+/// outranks everything and disables styling. The env probes are cached
+/// per process like [`stdout_color`].
+///
+/// Used only by the verifier's per-scheduler PASS/FAIL grids
+/// ([`crate::verifier::render_result_table`]), where the border visually
+/// separates the tally line above each grid from the grid itself and
+/// delimits one scheduler's grid from the next. Every other table
+/// (locks, stats, `verified_insns`, the A/B diff) stays on the
+/// borderless [`new_table`] so its output remains byte-stable for
+/// shell-pipeline consumers.
+pub fn new_bordered_table() -> comfy_table::Table {
+    let mut t = bordered_table_base();
+    apply_bordered_color_policy(&mut t, env_no_color(), stdout_color(), env_forces_color());
+    t
+}
+
+/// The preset/arrangement half of [`new_bordered_table`], WITHOUT the
+/// environment-derived color policy. Split out so the policy tests can
+/// start from a virgin table and drive [`apply_bordered_color_policy`]
+/// with explicit bools instead of the process-cached env probes.
+fn bordered_table_base() -> comfy_table::Table {
+    use comfy_table::{
+        ContentArrangement, Table, modifiers::UTF8_SOLID_INNER_BORDERS, presets::UTF8_FULL,
+    };
+    let mut t = Table::new();
+    t.load_preset(UTF8_FULL);
+    t.apply_modifier(UTF8_SOLID_INNER_BORDERS);
+    t.set_content_arrangement(ContentArrangement::Disabled);
+    t
+}
+
 /// Restore SIGPIPE to its default action (terminate the process)
 /// so piping a ktstr binary's output to a reader that closes
 /// early (e.g. `... | head`) does not panic inside `print!` /
@@ -694,6 +794,86 @@ mod tests {
         // Cell content still rendered.
         assert!(rendered.contains("A"), "header A must render: {rendered}");
         assert!(rendered.contains("1"), "row cell 1 must render: {rendered}");
+    }
+
+    /// `new_bordered_table()` loads the `UTF8_FULL` preset, so the
+    /// rendered grid MUST contain box-drawing characters — the mirror
+    /// image of `new_table_uses_borderless_preset`. Pins the border
+    /// signature the verifier's PASS/FAIL grids rely on: a regression
+    /// that swapped `UTF8_FULL` back to `NOTHING` would drop every
+    /// box-drawing char and surface here.
+    #[test]
+    fn new_bordered_table_uses_bordered_preset() {
+        let mut t = new_bordered_table();
+        t.set_header(["A", "B"]);
+        t.add_row(["1", "2"]);
+        let rendered = t.to_string();
+        let mut saw_box = false;
+        for ch in ['│', '─', '┼', '┴', '┬', '├', '┤'] {
+            if rendered.contains(ch) {
+                saw_box = true;
+                break;
+            }
+        }
+        assert!(
+            saw_box,
+            "bordered table must contain box-drawing chars: {rendered}",
+        );
+        // Cell content still rendered alongside the borders.
+        assert!(rendered.contains("A"), "header A must render: {rendered}");
+        assert!(rendered.contains("1"), "row cell 1 must render: {rendered}");
+    }
+
+    /// `apply_bordered_color_policy` escape emission per branch, driven
+    /// with explicit bools so every assertion is deterministic no matter
+    /// what TTY/env the test process actually has (the real probes are
+    /// process-cached and CI sets `GITHUB_ACTIONS`):
+    /// - non-TTY + force-color -> `enforce_styling` -> `Cell::fg` colors
+    ///   ARE emitted (the GITHUB_ACTIONS / CLICOLOR_FORCE / FORCE_COLOR
+    ///   branch that makes GHA logs render green/red);
+    /// - plain non-TTY -> `force_no_tty` -> colors suppressed;
+    /// - NO_COLOR -> suppressed, outranking BOTH the force knobs and a
+    ///   real TTY.
+    ///
+    /// The TTY branch (leave comfy-table's own detection in charge) is
+    /// not asserted — its outcome depends on the process's real stdout.
+    #[test]
+    fn bordered_color_policy_escape_emission() {
+        use comfy_table::{Attribute, Cell, Color};
+        let render = |no_color: bool, tty: bool, force_color: bool| -> String {
+            let mut t = bordered_table_base();
+            apply_bordered_color_policy(&mut t, no_color, tty, force_color);
+            t.set_header(["h"]);
+            t.add_row([Cell::new("✓")
+                .fg(Color::Green)
+                .add_attribute(Attribute::Bold)]);
+            t.to_string()
+        };
+        let styled = render(false, false, true);
+        assert!(
+            styled.contains('\x1b'),
+            "force-color on a non-TTY must emit ANSI escapes: {styled:?}"
+        );
+        let plain = render(false, false, false);
+        assert!(
+            !plain.contains('\x1b'),
+            "plain non-TTY must suppress ANSI escapes: {plain:?}"
+        );
+        // Styling changes only the escapes, not the visible glyphs.
+        assert!(
+            styled.contains('✓') && plain.contains('✓'),
+            "cell glyph renders on both paths"
+        );
+        let no_color_beats_force = render(true, false, true);
+        assert!(
+            !no_color_beats_force.contains('\x1b'),
+            "NO_COLOR outranks the force-color knobs: {no_color_beats_force:?}"
+        );
+        let no_color_beats_tty = render(true, true, false);
+        assert!(
+            !no_color_beats_tty.contains('\x1b'),
+            "NO_COLOR outranks a real TTY: {no_color_beats_tty:?}"
+        );
     }
 
     /// `new_wrapped_table()` follows the same NOTHING preset (no

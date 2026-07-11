@@ -49,7 +49,8 @@ pub use stats_cmds::{
 pub use locks::list_locks;
 
 pub use util::{
-    Spinner, new_table, new_wrapped_table, restore_sigpipe_default, stderr_color, stdout_color,
+    Spinner, new_bordered_table, new_table, new_wrapped_table, restore_sigpipe_default,
+    stderr_color, stdout_color,
 };
 
 /// `FetchProgress` is the public handle the `ktstr` / `cargo-ktstr`

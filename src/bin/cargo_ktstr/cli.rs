@@ -563,7 +563,8 @@ pub(crate) enum KtstrCommand {
     /// verify). `--scheduler <NAME>` restricts the sweep to a single
     /// declared scheduler across topologies. After nextest finishes, one
     /// `verified_insns` table per scheduler (rows = kernel, cols = BPF
-    /// program) and a topology × scheduler PASS/FAIL grid are printed.
+    /// program) and one PASS/FAIL grid per scheduler (rows = topology,
+    /// cols = kernel) are printed.
     ///
     /// The `declare_scheduler!` verifier cells carry no `required-features`,
     /// so they build without a feature flag — no `--features` passthrough

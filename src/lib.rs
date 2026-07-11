@@ -1265,7 +1265,8 @@ pub const KTSTR_VERIFIER_RAW_ENV: &str = "KTSTR_VERIFIER_RAW";
 /// The `cargo ktstr verifier` dispatcher creates the dir, exports this
 /// var (inherited by the spawned `cargo nextest run` and thus by every
 /// cell process), and after nextest returns reads the records back to
-/// render the per-(topology × scheduler) summary grid. Unset
+/// render one PASS/FAIL grid per scheduler (rows = topology, cols =
+/// kernel). Unset
 /// when a verifier cell runs outside the dispatcher (a hand-driven
 /// `--exact verifier/...`): the cell then simply skips the record write.
 /// Single source of truth so the name is not spelled by hand at the
