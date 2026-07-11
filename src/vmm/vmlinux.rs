@@ -90,6 +90,121 @@ pub(crate) fn cached_vmlinux_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
     Some(arc)
 }
 
+/// Process-global cache of the *parsed* vmlinux products, keyed the
+/// same way as [`VMLINUX_BYTES_CACHE`] (canonical path + mtime).
+///
+/// A VM run parses the host vmlinux twice: the freeze-coord inline path
+/// derives the link-time text/syscall KVAs from `KernelSymbols`, and
+/// `start_monitor` re-derives `KernelSymbols` plus the BTF-backed
+/// `KernelOffsets`/`BpfProgOffsets`/`PsiGroupOffsets`. The file read is
+/// already deduped by [`VMLINUX_BYTES_CACHE`], but each consumer still
+/// ran its own `goblin::elf::Elf::parse` (and the monitor its own BTF
+/// parse) over ~50 MB+ of debug vmlinux — seconds of pure CPU repeated
+/// per VM. Caching the *derived* products (all owned `u64`s / small
+/// structs / an `Arc<Btf>`, so no self-referential borrow of the byte
+/// buffer) collapses every consumer past the first to a hash lookup +
+/// clone, once per (canonical path, mtime) per process.
+static VMLINUX_ARTIFACTS_CACHE: OnceLock<
+    RwLock<std::collections::HashMap<PathBuf, CachedArtifacts>>,
+> = OnceLock::new();
+
+/// One slot in [`VMLINUX_ARTIFACTS_CACHE`]. The mtime gates the parsed
+/// products exactly as [`CachedEntry`] gates the bytes.
+struct CachedArtifacts {
+    mtime: std::time::SystemTime,
+    artifacts: Arc<VmlinuxArtifacts>,
+}
+
+/// Parsed vmlinux products shared between the freeze-coord inline
+/// link-KVA resolution and the monitor thread.
+///
+/// Every field is owned (no borrow of the underlying ELF bytes), so a
+/// single parse can be cached and cloned by both consumers.
+pub(crate) struct VmlinuxArtifacts {
+    /// ELF symbol addresses. Present whenever the ELF parsed and the
+    /// mandatory symbols resolved. The inline link-KVA path needs only
+    /// this; a symbol-parse failure fails the whole artifact (returns
+    /// `None`), matching the pre-cache inline path's `.ok()` degrade.
+    pub symbols: crate::monitor::symbols::KernelSymbols,
+    /// BTF-derived products the monitor thread needs. `None` when BTF
+    /// load or `KernelOffsets` resolution failed — `start_monitor`
+    /// then returns no monitor thread, exactly as its pre-cache
+    /// per-consumer parse did, while the inline path still gets
+    /// `symbols`.
+    pub monitor: Option<MonitorArtifacts>,
+}
+
+/// The monitor-only subset of [`VmlinuxArtifacts`]: the BTF-backed
+/// offset tables plus the shared `Btf` handle.
+pub(crate) struct MonitorArtifacts {
+    pub offsets: crate::monitor::btf_offsets::KernelOffsets,
+    pub prog_offsets: Option<crate::monitor::btf_offsets::BpfProgOffsets>,
+    pub psi_offsets: Option<crate::monitor::btf_offsets::PsiGroupOffsets>,
+    pub btf: Arc<btf_rs::Btf>,
+}
+
+/// Parse the vmlinux bytes into [`VmlinuxArtifacts`], deriving the ELF
+/// symbols once and the BTF-backed offsets once. `None` when the ELF
+/// parse or mandatory-symbol resolution fails (both consumers degrade);
+/// a BTF/offset failure leaves `symbols` intact with `monitor: None`.
+fn parse_vmlinux_artifacts(data: &[u8], path: &Path) -> Option<VmlinuxArtifacts> {
+    let elf = goblin::elf::Elf::parse(data).ok()?;
+    let symbols = crate::monitor::symbols::KernelSymbols::from_elf(&elf).ok()?;
+    // BTF-backed products fail independently of `symbols`: a closure so
+    // any early `?` yields `monitor: None` without dropping `symbols`.
+    let monitor = (|| {
+        let btf = crate::monitor::btf_offsets::load_btf_from_elf(&elf, data, path).ok()?;
+        let offsets = crate::monitor::btf_offsets::KernelOffsets::from_btf(&btf).ok()?;
+        let prog_offsets = crate::monitor::btf_offsets::BpfProgOffsets::from_btf(&btf).ok();
+        let psi_offsets = crate::monitor::btf_offsets::PsiGroupOffsets::from_btf(&btf).ok();
+        Some(MonitorArtifacts {
+            offsets,
+            prog_offsets,
+            psi_offsets,
+            btf: Arc::new(btf),
+        })
+    })();
+    Some(VmlinuxArtifacts { symbols, monitor })
+}
+
+/// Return the cached parsed products for `path`, parsing once on the
+/// first request for a given (canonical path, mtime) and cloning the
+/// `Arc` on every subsequent hit.
+///
+/// Keying, mtime invalidation, and the not-cached error path mirror
+/// [`cached_vmlinux_bytes`] (whose byte cache backs the read here).
+/// `None` when the file is unreadable or the ELF/symbol parse fails.
+pub(crate) fn cached_vmlinux_artifacts(path: &Path) -> Option<Arc<VmlinuxArtifacts>> {
+    let canon = std::fs::canonicalize(path)
+        .ok()
+        .unwrap_or_else(|| path.to_path_buf());
+    let mtime = std::fs::metadata(&canon).and_then(|m| m.modified()).ok()?;
+    let slot =
+        VMLINUX_ARTIFACTS_CACHE.get_or_init(|| RwLock::new(std::collections::HashMap::new()));
+    {
+        let read = slot.read_unpoisoned();
+        if let Some(entry) = read.get(&canon)
+            && entry.mtime == mtime
+        {
+            return Some(Arc::clone(&entry.artifacts));
+        }
+    }
+    // Parse outside the write lock so a slow parse doesn't block other
+    // canonical paths' lookups. The byte read is served by
+    // `cached_vmlinux_bytes` (its own cache + mtime gate).
+    let data = cached_vmlinux_bytes(&canon)?;
+    let artifacts = Arc::new(parse_vmlinux_artifacts(&data, &canon)?);
+    let mut write = slot.write_unpoisoned();
+    write.insert(
+        canon,
+        CachedArtifacts {
+            mtime,
+            artifacts: Arc::clone(&artifacts),
+        },
+    );
+    Some(artifacts)
+}
+
 /// Clear every cached entry. Used by `#[cfg(test)]` tests that need
 /// to assert against a clean cache state without inheriting entries
 /// from prior tests in the same process — a regular use case for
@@ -98,6 +213,9 @@ pub(crate) fn cached_vmlinux_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
 #[cfg(test)]
 pub(crate) fn clear_vmlinux_cache_for_tests() {
     if let Some(slot) = VMLINUX_BYTES_CACHE.get() {
+        slot.write_unpoisoned().clear();
+    }
+    if let Some(slot) = VMLINUX_ARTIFACTS_CACHE.get() {
         slot.write_unpoisoned().clear();
     }
 }

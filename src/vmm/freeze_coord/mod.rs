@@ -1865,9 +1865,10 @@ impl KtstrVm {
         // and `run_bsp_loop` (the BSP MSR_LSTAR path subtracts
         // `entry_SYSCALL_64`) share a single source of truth.
         // `find_vmlinux` is cheap path discovery; the
-        // `cached_vmlinux_bytes` hit is shared with the monitor's
-        // later parse so the host pays the ELF read at most once
-        // per process. Both fields land 0 when the symbol is
+        // `cached_vmlinux_artifacts` hit is shared with the monitor's
+        // later `start_monitor` lookup so the host pays the ELF read
+        // AND the symbol/BTF parse at most once per (path, mtime) per
+        // process. Both fields land 0 when the symbol is
         // absent — `_text` only on extremely stripped vmlinux,
         // `entry_SYSCALL_64` on aarch64 and non-x86_64 builds.
         // Both paths short-circuit on a 0 link KVA, leaving the
@@ -1879,10 +1880,8 @@ impl KtstrVm {
         // different values.
         let host_kernel_symbols: Option<crate::monitor::symbols::KernelSymbols> =
             find_vmlinux(&self.kernel)
-                .and_then(|p| cached_vmlinux_bytes(&p))
-                .and_then(|data| {
-                    crate::monitor::symbols::KernelSymbols::from_vmlinux_bytes(&data).ok()
-                });
+                .and_then(|p| super::vmlinux::cached_vmlinux_artifacts(&p))
+                .map(|a| a.symbols.clone());
         let kernel_text_link_kva: u64 = host_kernel_symbols
             .as_ref()
             .and_then(|s| s.kernel_text_kva)
@@ -11581,47 +11580,47 @@ impl KtstrVm {
         let Some(vmlinux) = find_vmlinux(&self.kernel) else {
             return Ok(None);
         };
-        // Read the vmlinux bytes once and feed both the BTF loader
-        // and the ELF symbol parser. The previous structure called
-        // `load_btf_from_path` and `KernelSymbols::from_vmlinux` back
-        // to back, each running its own `std::fs::read` — on a debug
-        // vmlinux that is two ~1 GB reads through the page cache for
-        // a single byte slice's worth of work.
-        let vmlinux_data_arc = match super::vmlinux::cached_vmlinux_bytes(&vmlinux) {
-            Some(d) => d,
-            None => return Ok(None),
+        // Parse the vmlinux once per (path, mtime) per process and
+        // share the derived products with the freeze-coord inline
+        // link-KVA path (which populated this same cache entry earlier
+        // in `run_vm`). The previous structure re-ran
+        // `goblin::elf::Elf::parse` over ~50 MB+ of vmlinux and
+        // `KernelSymbols::from_elf` here even though the inline path
+        // already did both — seconds of duplicate CPU per VM. The BTF
+        // parse (previously here, hitting `load_btf_from_elf` +
+        // `Btf::from_bytes` once) is now folded into the same cached
+        // parse so it still happens exactly once; the boot-window
+        // concern (early samples seeing the rq's pre-AP-online state
+        // when BTF was parsed twice) is preserved. All products are
+        // owned, so the monitor closure below clones them out of the
+        // shared `Arc` exactly as if it had parsed them itself.
+        let Some(artifacts) = super::vmlinux::cached_vmlinux_artifacts(&vmlinux) else {
+            return Ok(None);
         };
-        let vmlinux_data = &*vmlinux_data_arc;
-        let elf = match goblin::elf::Elf::parse(vmlinux_data) {
-            Ok(e) => e,
-            Err(_) => return Ok(None),
+        // `monitor: None` means the BTF load or `KernelOffsets`
+        // resolution failed — no monitor thread, matching the pre-cache
+        // `load_btf_from_elf` / `from_btf` early returns. `symbols`
+        // resolving but `monitor` absent is the same "symbols Ok,
+        // offsets Err → Ok(None)" the old `(Ok, Ok)` gate produced.
+        let Some(mon) = artifacts.monitor.as_ref() else {
+            return Ok(None);
         };
-        // Single BTF parse for both `KernelOffsets` and
-        // `BpfProgOffsets`. The previous structure parsed BTF twice
-        // (KernelOffsets up here, BpfProgOffsets inside the spawned
-        // monitor thread closure), each call hitting
-        // `load_btf_from_path` and `Btf::from_bytes`. On debug-built
-        // vmlinux the parse is hundreds of ms; doing it twice
-        // pushed the monitor thread past the no-scheduler boot
-        // window so early samples saw the rq's pre-AP-online state.
-        // One parse, two `from_btf` consumers, both share the
-        // resolved offsets. On a BTF sidecar cache hit the supplied
-        // `elf` is unused; on a miss `load_btf_from_elf` reuses it
-        // instead of running its own `Elf::parse`.
-        let btf = match monitor::btf_offsets::load_btf_from_elf(&elf, vmlinux_data, &vmlinux) {
-            Ok(b) => b,
-            Err(_) => return Ok(None),
-        };
-        let offsets = monitor::btf_offsets::KernelOffsets::from_btf(&btf);
-        let prog_offsets = monitor::btf_offsets::BpfProgOffsets::from_btf(&btf).ok();
+        let symbols = artifacts.symbols.clone();
+        let offsets = mon.offsets.clone();
+        let prog_offsets = mon.prog_offsets.clone();
         // System-wide PSI-irq host-walk offsets (psi_group total/avg + the
         // PSI_IRQ_FULL index). `None` when CONFIG_IRQ_TIME_ACCOUNTING is off
         // (PSI_IRQ_FULL absent from BTF) or psi_group is absent → loud-absent.
-        let psi_offsets = monitor::btf_offsets::PsiGroupOffsets::from_btf(&btf).ok();
-        let symbols = monitor::symbols::KernelSymbols::from_elf(&elf);
-
-        let (Ok(offsets), Ok(symbols)) = (offsets, symbols) else {
-            return Ok(None);
+        let psi_offsets = mon.psi_offsets;
+        let btf = Arc::clone(&mon.btf);
+        // Raw vmlinux bytes for the `watch_bpf_maps` per-map program-BTF
+        // split-base. A byte-cache hit — `cached_vmlinux_artifacts`
+        // above already read and cached these. Only consumed when the
+        // test declared watch targets; the `None` arm keeps the
+        // pre-cache "unreadable vmlinux → no monitor" early return.
+        let vmlinux_data_arc = match super::vmlinux::cached_vmlinux_bytes(&vmlinux) {
+            Some(d) => d,
+            None => return Ok(None),
         };
         // BTF-capability probe for the `SCX_EV_*` event counters:
         // `event_offsets` resolves only on kernels that expose the
@@ -11639,8 +11638,8 @@ impl KtstrVm {
         // `prog_stats_ctx` builder below consumes the original; the test
         // entry's `WatchBpfMap` list is lowered to the monitor-local target
         // form. All are moved into the monitor closure and consumed there
-        // only when the test declared watch targets.
-        let btf = Arc::new(btf);
+        // only when the test declared watch targets. `btf` is already an
+        // `Arc<Btf>` cloned from the shared parse artifact above.
         let watch_prog_offsets = prog_offsets.clone();
         let watch_targets: Vec<monitor::reader::WatchBpfMapTarget> = self
             .watch_bpf_maps
