@@ -710,9 +710,10 @@ fn run_ktstr_test_inner_impl(
     // stamps it into SidecarResult::resolve_source below. The downstream
     // sites (VM builder, auto_repro) take only the PathBuf; the source is
     // a Copy enum that rides to the sidecar write unchanged.
-    let (scheduler, scheduler_resolve_source) = resolve_scheduler(&entry.scheduler.binary)?;
-    let resolved_staged = resolve_staged_schedulers_strict(entry, |spec| {
-        resolve_scheduler(spec).map(|(opt, _src)| opt)
+    let (scheduler, scheduler_resolve_source) =
+        resolve_scheduler(&entry.scheduler.binary, entry.scheduler.manifest_dir)?;
+    let resolved_staged = resolve_staged_schedulers_strict(entry, |staged| {
+        resolve_scheduler(&staged.binary, staged.manifest_dir).map(|(opt, _src)| opt)
     })?;
     let ktstr_bin = crate::resolve_current_exe()?;
 

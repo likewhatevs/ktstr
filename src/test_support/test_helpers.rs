@@ -244,6 +244,7 @@ pub(crate) static SCHED_TEST: Scheduler = Scheduler {
     config_file: None,
     config_file_def: None,
     kernels: &[],
+    manifest_dir: env!("CARGO_MANIFEST_DIR"),
 };
 
 /// Build a minimal `KtstrTestEntry` bound to the scx-style

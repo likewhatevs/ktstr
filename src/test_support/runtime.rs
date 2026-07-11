@@ -929,7 +929,7 @@ pub(crate) fn build_vm_builder_base(
 
     // Push each pre-resolved staged scheduler into the builder's
     // staging set. Caller is responsible for running each entry
-    // through the resolve_scheduler cascade so this fn stays
+    // through resolve_scheduler so this fn stays
     // infallible (sibling to the boot-time `scheduler: Option<&Path>`
     // shape which is also caller-resolved). KernelBuiltin / Eevdf
     // staged entries (no binary to resolve) are skipped at the
@@ -2803,6 +2803,7 @@ mod tests {
             config_file: None,
             config_file_def: Some(("--config={file}", "/include-files/p.json")),
             kernels: &[],
+            manifest_dir: env!("CARGO_MANIFEST_DIR"),
         };
         fn func(_: &Ctx) -> anyhow::Result<crate::assert::AssertResult> {
             Ok(crate::assert::AssertResult::pass())
@@ -2860,6 +2861,7 @@ mod tests {
             config_file: None,
             config_file_def: Some(("--config={file}", "/include-files/p.json")),
             kernels: &[],
+            manifest_dir: env!("CARGO_MANIFEST_DIR"),
         };
         fn func(_: &Ctx) -> anyhow::Result<crate::assert::AssertResult> {
             Ok(crate::assert::AssertResult::pass())

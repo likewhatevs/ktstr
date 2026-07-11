@@ -106,13 +106,16 @@ mixed results across kernels (the failing-combinations list below the
 grid is the authoritative record).
 
 > [!NOTE]
-> For a scheduler outside your workspace, either declare it with
-> `binary_path` as above, or use a bare `binary = "name"` (discovery)
-> and point `KTSTR_SCHEDULER_BIN_<NAME>` at a prebuilt binary — an
-> env-resolved discovery scheduler now emits and runs verifier cells.
-> Discovery *without* that env var still emits cells only for workspace
-> members (a non-member with no env override has nothing to build or
-> resolve, so its cells stay filtered).
+> A scheduler in a *separate* workspace works with a bare
+> `binary = "name"` (discovery) as long as its `declare_scheduler!` is
+> compiled in that workspace: verifier cells are built with
+> `cargo build -p <name>` run in the declaring crate's own workspace, and
+> emission checks membership of that same workspace — so no env var is
+> needed. `binary_path` (an explicit prebuilt binary) also works. In CI, a
+> prior `cargo build --release -p <name>` in that workspace makes the
+> in-test build a cache no-op. A `binary = "name"` whose package is not a
+> member of the declaring crate's workspace has nothing to build, so its
+> cells stay filtered.
 
 ## The kernel axis
 

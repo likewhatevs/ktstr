@@ -42,8 +42,8 @@ pub enum SchedulerKind {
     /// kernel-builtin lifecycle. The no-scx control.
     #[default]
     Eevdf,
-    /// Userspace scx binary located via `resolve_scheduler` cascade
-    /// (name-only, path is discovered at run time).
+    /// Userspace scx binary located via `resolve_scheduler`
+    /// (name-only, path is resolved at run time).
     Discover,
     /// Userspace scx binary at a fully-qualified path.
     Path,

@@ -1225,6 +1225,35 @@ fn write_sidecar_defaults_to_target_dir_without_env() {
     );
 }
 
+/// `cargo_metadata_target_dir` asks cargo for the target directory of
+/// the package rooted at the given dir. Stage a minimal package in a
+/// tempdir and confirm the reported `target_directory` is that
+/// package's `target/`, proving `runs_root`'s unpinned fallback honors
+/// a workspace's real target layout (incl. a `.cargo/config target-dir`)
+/// rather than a bare CWD-relative `target/`. The subprocess CWD is set
+/// on the `Command` via the `dir` argument — never a process-wide chdir
+/// — so the test stays hermetic against concurrent tests.
+#[test]
+fn cargo_metadata_target_dir_reads_package_target_directory() {
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        ws.path().join("Cargo.toml"),
+        "[package]\nname = \"ktstr_runs_root_probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir(ws.path().join("src")).unwrap();
+    std::fs::write(ws.path().join("src").join("lib.rs"), "").unwrap();
+
+    let target = cargo_metadata_target_dir(ws.path())
+        .expect("cargo metadata must resolve target_directory for a valid package");
+    // cargo reports the target dir under the canonicalized workspace
+    // root (tempdirs can sit behind a symlinked temp dir), so canonicalize
+    // the expected base before comparing. The `target/` leaf itself need
+    // not exist — cargo metadata does not create it.
+    let expected = ws.path().canonicalize().unwrap().join("target");
+    assert_eq!(target, expected);
+}
+
 // -- KTSTR_SIDECAR_DIR override: empty-string falls back to default --
 
 /// `KTSTR_SIDECAR_DIR=""` (defensively-cleared empty string)
@@ -2867,7 +2896,7 @@ fn scheduler_fingerprint_uses_display_name_for_discover() {
         commit.is_none(),
         "Discover variant currently returns None via \
          `SchedulerSpec::scheduler_commit` — \
-         `resolve_scheduler`'s cascade does not guarantee a \
+         `resolve_scheduler` does not guarantee a \
          fresh build, so there is no authoritative source for \
          the scheduler binary's commit and `scheduler_commit` \
          reports None honestly. Got: {commit:?}",
@@ -3593,24 +3622,37 @@ fn runs_root_honors_absolute_override() {
 
 #[test]
 fn runs_root_falls_back_without_override() {
-    // No KTSTR_RUNS_ROOT (raw `cargo nextest run`): fall back to
-    // {CARGO_TARGET_DIR or "target"}/ktstr.
+    // No KTSTR_RUNS_ROOT (raw `cargo nextest run`): fall back to the
+    // cargo-reported target directory's `ktstr/`, resolved via
+    // `cargo metadata` (so a `.cargo/config target-dir` is honored) —
+    // NOT a bare CWD-relative `target/`. `cargo_target_dir` is memoized,
+    // so this pins the resolved value against the same helper rather
+    // than toggling `CARGO_TARGET_DIR` mid-test.
     let _lock = lock_env();
     let _g0 = EnvVarGuard::remove(crate::KTSTR_RUNS_ROOT_ENV);
-    let _g1 = EnvVarGuard::set("CARGO_TARGET_DIR", "/custom/target");
-    assert_eq!(runs_root(), std::path::Path::new("/custom/target/ktstr"));
-    let _g2 = EnvVarGuard::remove("CARGO_TARGET_DIR");
-    assert_eq!(runs_root(), std::path::PathBuf::from("target/ktstr"));
+    let cwd = std::env::current_dir().unwrap();
+    let expected = cargo_metadata_target_dir(&cwd)
+        .expect("cargo metadata resolves the workspace target dir")
+        .join("ktstr");
+    assert_eq!(runs_root(), expected);
+    assert!(
+        runs_root().is_absolute(),
+        "the cargo-reported target dir is absolute, so the fallback is \
+         CWD-independent"
+    );
 }
 
 #[test]
 fn runs_root_empty_override_falls_through() {
     // An empty KTSTR_RUNS_ROOT must NOT alias the runs root to a bare
-    // path — it falls through to the default.
+    // path — it falls through to the cargo target-dir default.
     let _lock = lock_env();
     let _g0 = EnvVarGuard::set(crate::KTSTR_RUNS_ROOT_ENV, "");
-    let _g1 = EnvVarGuard::remove("CARGO_TARGET_DIR");
-    assert_eq!(runs_root(), std::path::PathBuf::from("target/ktstr"));
+    let cwd = std::env::current_dir().unwrap();
+    let expected = cargo_metadata_target_dir(&cwd)
+        .expect("cargo metadata resolves the workspace target dir")
+        .join("ktstr");
+    assert_eq!(runs_root(), expected);
 }
 
 // -- pre_clear_run_dir_once session sentinel (cross-test loss fix) --

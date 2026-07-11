@@ -686,6 +686,13 @@ pub(crate) fn declare_scheduler_inner(
     if let Some((arg, path)) = &sched_config_file_def {
         builder_chain = quote! { #builder_chain.config_file_def(#arg, #path) };
     }
+    // Capture the DECLARING crate's manifest dir. These tokens compile in
+    // the invoking crate, so `env!("CARGO_MANIFEST_DIR")` resolves to that
+    // crate's directory — a `binary = "pkg"` scheduler is built with
+    // `cargo build -p pkg` run from there, i.e. in its own workspace.
+    builder_chain = quote! {
+        #builder_chain.manifest_dir(::core::env!("CARGO_MANIFEST_DIR"))
+    };
 
     let registry_ident = format_ident!("__KTSTR_SCHED_REG_{}", const_name);
 

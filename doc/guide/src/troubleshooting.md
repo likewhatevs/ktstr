@@ -204,8 +204,8 @@ download-specific errors.
 ## Scheduler not found
 
 ```text
-scheduler 'scx_my_sched' not found. Set KTSTR_SCHEDULER or
-place it next to the test binary or in target/{debug,release}/
+ktstr_test: workspace build of scheduler 'scx_my_sched' failed; a
+scheduler that cannot be built is a failed test. Fix the build.
 ```
 
 `SchedulerSpec::Discover` resolves the scheduler binary entirely on
@@ -213,31 +213,27 @@ the host. The order depends on how the test was launched:
 
 **Under `cargo ktstr test` (the normal path):**
 
-1. `KTSTR_SCHEDULER_BIN_<NAME>`, then `KTSTR_SCHEDULER` env overrides.
-2. `cargo build -p <scheduler>` — the build runs up front, so an
-   edited scheduler is never validated against a stale pre-built
-   binary. If that build fails, the test hard-fails rather than
-   falling back; set `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK=1` to
-   re-enable the sibling / `target/{debug,release}/` pre-built
-   fallback while the workspace build is broken.
+1. `KTSTR_SCHEDULER` env override.
+2. `cargo build -p <scheduler>` run in the workspace of the crate that
+   *declared* the scheduler. Cargo owns freshness — it rebuilds on
+   source change, no-ops when up to date, and fails when the scheduler
+   cannot build. A failed build is a hard error: there is no pre-built
+   fallback, because a scheduler that will not build is a failed test,
+   never a silently-stale binary.
 
 **Under bare `cargo test` / `cargo nextest run` (marked with
 `KTSTR_CARGO_TEST_MODE=1`):**
 
-1. The env overrides, with `$PATH` also consulted — so an installed
-   scheduler binary resolves without an in-tree build.
-2. Sibling of the test binary, then the `target/release/` and
-   `target/debug/` build dirs — the scheduler's build profile
-   (release by default) is probed first.
-3. The on-demand `cargo build -p <scheduler>` runs last, only after
-   the pre-built probes miss.
+1. The `KTSTR_SCHEDULER` env override, then a `$PATH` lookup — so an
+   installed scheduler binary resolves without an in-tree build.
+2. The on-demand `cargo build -p <scheduler>`, run when the `$PATH`
+   lookup misses. Same hard-error-on-failure contract as above.
 
 **Fixes:**
 
-- `cargo build -p scx_my_sched` — on the orchestrated path this only
-  primes the cache; on the bare path it makes the probe hit.
-- Set `KTSTR_SCHEDULER=/path/to/binary` (or the per-name
-  `KTSTR_SCHEDULER_BIN_<NAME>` variant).
+- `cargo build -p scx_my_sched` — primes the cache so the in-test
+  build is a no-op (or surfaces the build error directly).
+- Set `KTSTR_SCHEDULER=/path/to/binary`.
 - Use `SchedulerSpec::Path` for an explicit path.
 
 ## Scheduler died

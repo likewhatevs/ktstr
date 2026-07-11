@@ -104,10 +104,10 @@ discovers it automatically. The `scheduler =` slot expects the bare
 const name. The fields used here:
 
 - `name` — scheduler name for display and result files.
-- `binary` — binary name, resolved on the host: `target/{debug,release}/`,
-  the directory containing the test binary, or a `KTSTR_SCHEDULER`
-  override path. The resolved binary is packed into the VM's
-  initramfs.
+- `binary` — binary name, resolved on the host: a `KTSTR_SCHEDULER`
+  override path, else built via `cargo build -p <name>` in the
+  declaring crate's workspace. The resolved binary is packed into the
+  VM's initramfs.
 
 Other commonly used fields: `topology = (numa, llcs, cores,
 threads)` sets a default VM topology that per-test attributes can
@@ -411,11 +411,10 @@ If something goes wrong instead:
   cannot locate. Run `cargo ktstr kernel build` to populate the
   cache — see
   [Getting Started: Build a kernel](getting-started.md#build-a-kernel).
-- **"scheduler binary not found"** — the declared `binary = "..."`
-  from Step 2 didn't land where the discovery cascade looks. Set
-  `KTSTR_SCHEDULER=/path/to/binary` to pin an explicit path, or
-  rebuild the scheduler crate so the binary lands under
-  `target/{debug,release}/`.
+- **scheduler build failed** — the declared `binary = "..."` from
+  Step 2 could not be built via `cargo build -p <name>`. Fix the
+  scheduler build, or set `KTSTR_SCHEDULER=/path/to/binary` to pin an
+  already-built binary.
 - **probe-related errors** ("probe skeleton load failed", "trigger
   attach failed") — re-run with `RUST_LOG=ktstr=debug` to see the
   underlying libbpf reason; see

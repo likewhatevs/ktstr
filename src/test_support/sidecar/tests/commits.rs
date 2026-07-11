@@ -958,14 +958,14 @@ fn sidecar_variant_hash_excludes_run_source() {
     );
 }
 
-/// `resolve_source` (the scheduler discovery-path tag) must not
+/// `resolve_source` (the scheduler resolution-path tag) must not
 /// influence the variant hash. Two runs of the same semantic variant
 /// resolved via different paths — one auto-built from the workspace
-/// HEAD, one from a possibly-stale `target/` binary — must produce the
-/// same sidecar filename so `compare_partitions` can diff them across
-/// the resolution boundary. Mirrors the commit / run_source exclusion
-/// tests: covers `None` vs `Some` and two distinct populated tags so a
-/// regression distinguishing only one pair is still caught.
+/// HEAD, one from an operator-supplied `KTSTR_SCHEDULER` binary — must
+/// produce the same sidecar filename so `compare_partitions` can diff
+/// them across the resolution boundary. Mirrors the commit / run_source
+/// exclusion tests: covers `None` vs `Some` and two distinct populated
+/// tags so a regression distinguishing only one pair is still caught.
 #[test]
 fn sidecar_variant_hash_excludes_resolve_source() {
     let none = SidecarResult {
@@ -985,16 +985,16 @@ fn sidecar_variant_hash_excludes_resolve_source() {
          Some(\"auto_built\") case",
     );
 
-    let stale = SidecarResult {
+    let env = SidecarResult {
         topology: "1n1l2c1t".to_string(),
-        resolve_source: Some("target_debug".to_string()),
+        resolve_source: Some("env_var".to_string()),
         ..SidecarResult::test_fixture()
     };
     assert_eq!(
         sidecar_variant_hash(&auto),
-        sidecar_variant_hash(&stale),
+        sidecar_variant_hash(&env),
         "resolve_source must not influence variant hash — \
-         Some(\"auto_built\") vs Some(\"target_debug\") case",
+         Some(\"auto_built\") vs Some(\"env_var\") case",
     );
 }
 

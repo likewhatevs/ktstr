@@ -23,10 +23,10 @@
 /// 3. Skips gauntlet variant expansion in nextest discovery —
 ///    each `#[ktstr_test]` runs once with its declared topology.
 ///    No multi-kernel fan-out via `KTSTR_KERNEL_LIST`.
-/// 4. Resolves `SchedulerSpec::Discover(name)` via `$PATH` first
-///    (before the sibling-dir / target-dir / build chain) so a
-///    user can install scx_layered on PATH and run their test
-///    without driving the cargo-ktstr build pipeline.
+/// 4. Resolves `SchedulerSpec::Discover(name)` via a `$PATH` lookup
+///    (before the workspace build) so a user can install scx_layered
+///    on PATH and run their test without driving the cargo-ktstr
+///    build pipeline.
 /// 5. Suppresses the early-dispatch coverage-gap warnings that fire
 ///    under bare `cargo test` when a binary registers real
 ///    `#[ktstr_test]` entries OR `declare_scheduler!` declarations

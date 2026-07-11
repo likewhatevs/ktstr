@@ -170,15 +170,14 @@ pub fn export_test(test_name: &str, output: Option<PathBuf>) -> Result<()> {
 ///
 /// Reuses `crate::test_support::eval::resolve_scheduler` so the
 /// resolution matches the in-guest path: `KTSTR_SCHEDULER` env wins;
-/// then, outside cargo-test-mode, a fresh `cargo build -p {name}` so an
-/// edited scheduler is never exported stale. A build FAILURE REFUSES by
-/// default — the error propagates (the `?` below), so export rejects
-/// rather than packaging a possibly-stale binary — falling back to a
-/// pre-built sibling-exe / target/debug / target/release binary only
-/// under `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK`. cargo-test-mode
-/// resolves via `$PATH` first.
+/// in cargo-test-mode a `$PATH` lookup is consulted next; otherwise a
+/// fresh `cargo build -p {name}` in the declaring crate's workspace so
+/// an edited scheduler is never exported stale. A build FAILURE is a
+/// hard error — the error propagates (the `?` below), so export rejects
+/// rather than packaging a possibly-stale binary; there is no pre-built
+/// fallback.
 fn resolve_scheduler_for_export(entry: &KtstrTestEntry) -> Result<Option<PathBuf>> {
-    let (path, _source) = resolve_scheduler(&entry.scheduler.binary)
+    let (path, _source) = resolve_scheduler(&entry.scheduler.binary, entry.scheduler.manifest_dir)
         .with_context(|| format!("resolve scheduler binary for test '{}'", entry.name))?;
     Ok(path)
 }

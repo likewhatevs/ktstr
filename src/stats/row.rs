@@ -154,8 +154,9 @@ pub struct GauntletRow {
     pub run_source: Option<String>,
     /// Scheduler-resolution provenance carried from
     /// [`crate::test_support::SidecarResult::resolve_source`] —
-    /// the snake_case discovery-path tag (`"auto_built"`,
-    /// `"target_debug"`, `"path"`, ...). `None` for sidecars produced
+    /// the snake_case resolution-path tag (`"auto_built"`,
+    /// `"env_var"`, `"path"`, ...; historical sidecars may carry retired
+    /// tags such as `"target_debug"`). `None` for sidecars produced
     /// before the field existed (pre-1.0 disposable schema) and for skip
     /// rows (no binary resolved). Surfaced via the typed
     /// [`RowFilter::resolve_sources`] (`--resolve-source`) for narrowing +
@@ -163,7 +164,7 @@ pub struct GauntletRow {
     /// `stats list-values`. Provenance, not identity: distinct
     /// from `scheduler` / `kernel_commit` — it records HOW the scheduler
     /// binary was found, so a reader can tell an auto-built-from-HEAD run
-    /// from a possibly-stale `target/` or `$PATH` binary.
+    /// from a possibly-stale `$PATH` binary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolve_source: Option<String>,
     /// True when the underlying [`crate::assert::AssertResult::is_pass`] returned
@@ -529,7 +530,8 @@ pub struct RowFilter {
     /// skip resolved no binary) never matches a non-empty filter —
     /// same opt-in semantic as `run_sources`. Values are the
     /// [`crate::test_support::ResolveSource::as_str`] tags
-    /// (`"auto_built"`, `"target_debug"`, `"path"`, ...). Distinct from
+    /// (`"auto_built"`, `"env_var"`, `"path"`, ...; historical sidecars
+    /// may also carry retired tags such as `"target_debug"`). Distinct from
     /// `run_sources` (the run ENVIRONMENT): this is HOW the scheduler
     /// binary was found. Backs the [`Dimension::ResolveSource`] filter +
     /// pairing dim (`--resolve-source`).

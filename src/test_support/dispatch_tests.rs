@@ -2890,37 +2890,20 @@ fn list_verifier_cells_all_no_schedulers_emits_no_cells() {
     );
 }
 
-/// Pure parse of `[workspace] members`: `.` maps to the root package
-/// name, other members' last path component is the package name, and a
-/// non-member (a fixture scheduler) is absent.
+/// `workspace_member_packages` queried against ktstr's OWN workspace
+/// (`CARGO_MANIFEST_DIR`) via `cargo metadata` includes the real
+/// scheduler package (its cells emit) and EXCLUDES the macro-expansion
+/// fixture scheduler names from tests/declare_scheduler.rs (their cells
+/// are gated out of the sweep so `--run-ignored` doesn't fail on
+/// `cargo build -p <fixture>`). Spawning `cargo metadata` here is
+/// acceptable — sibling tests already spawn cargo builds.
 #[test]
-fn parse_workspace_member_packages_maps_dot_and_dirs() {
-    let toml = "\
-[workspace]
-members = [\".\", \"ktstr-macros\", \"scx-ktstr\", \"nested/pkg\"]
-resolver = \"2\"
-";
-    let pkgs = parse_workspace_member_packages(toml, "ktstr");
-    assert!(pkgs.contains("ktstr"), "`.` maps to the root package name");
-    assert!(pkgs.contains("ktstr-macros"));
-    assert!(pkgs.contains("scx-ktstr"));
-    assert!(pkgs.contains("pkg"), "nested member -> last path component");
+fn workspace_member_packages_includes_real_scheduler_excludes_fixtures() {
+    let pkgs = workspace_member_packages(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        !pkgs.contains("scx-full"),
-        "a non-member fixture scheduler is absent",
+        pkgs.contains("ktstr"),
+        "the root ktstr crate must be a workspace member",
     );
-    assert_eq!(pkgs.len(), 4);
-}
-
-/// Regression pin for the verifier fixture-gate: parsed from the REAL
-/// baked workspace `Cargo.toml`, the set includes the real scheduler
-/// package (its cells emit) and EXCLUDES the macro-expansion fixture
-/// scheduler names from tests/declare_scheduler.rs (their cells are
-/// gated out of the sweep so `--run-ignored` doesn't fail on
-/// `cargo build -p <fixture>`).
-#[test]
-fn workspace_packages_includes_real_scheduler_excludes_fixtures() {
-    let pkgs = workspace_packages();
     assert!(
         pkgs.contains("scx-ktstr"),
         "the real scheduler package must be a workspace member (emits verifier cells)",
@@ -2928,6 +2911,19 @@ fn workspace_packages_includes_real_scheduler_excludes_fixtures() {
     assert!(
         !pkgs.contains("scx-full") && !pkgs.contains("scx-ee") && !pkgs.contains("scx-both"),
         "declare_scheduler.rs fixture schedulers must NOT be workspace members (cells gated out)",
+    );
+}
+
+/// A nonexistent manifest dir yields the empty set: `cargo metadata`
+/// fails (no `Cargo.toml` there) and the query degrades to "no members",
+/// which gates out every `Discover` cell rooted in that dir rather than
+/// emitting cells the runtime resolver could not build.
+#[test]
+fn workspace_member_packages_missing_manifest_dir_is_empty() {
+    let pkgs = workspace_member_packages("/nonexistent/ktstr_workspace_xyz");
+    assert!(
+        pkgs.is_empty(),
+        "a manifest dir with no Cargo.toml must yield an empty member set; got: {pkgs:?}",
     );
 }
 

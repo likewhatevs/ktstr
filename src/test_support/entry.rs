@@ -39,10 +39,10 @@ pub enum SchedulerSpec {
     /// name is fixed so the assertion isn't coupled to the kernel
     /// version's default.
     Eevdf,
-    /// Auto-discover the scheduler binary by name (looks in
-    /// `KTSTR_SCHEDULER` env, the ktstr binary's sibling dir,
-    /// `target/debug/`, `target/release/`, and invokes
-    /// `cargo build` if nothing's found).
+    /// Auto-discover the scheduler binary by name (the
+    /// `KTSTR_SCHEDULER` env override, then in cargo-test mode a
+    /// `$PATH` lookup, otherwise `cargo build -p <name>` in the
+    /// declaring crate's workspace).
     Discover(&'static str),
     /// Explicit filesystem path to a scheduler binary. The file must
     /// already exist; `resolve_scheduler` does not auto-build this
@@ -139,15 +139,15 @@ impl SchedulerSpec {
     /// - `Eevdf` — no userspace scheduler binary at all. Kernel
     ///   default; the running kernel's identity belongs in
     ///   `host.kernel_release`, not here.
-    /// - `Discover(_)` — `resolve_scheduler` has a 5-path cascade
-    ///   (`KTSTR_SCHEDULER` env override → sibling of the ktstr
-    ///   binary → `target/debug/` → `target/release/` → cargo
-    ///   rebuild fallback). Only the rebuild path guarantees the
-    ///   resulting binary was built from the current tree; the
-    ///   four pre-built discovery paths can point at a binary
-    ///   whose commit is unknown to this process. Synthesizing a
-    ///   commit would be a lie in 4 of 5 cases and would silently
-    ///   attribute regressions to the wrong commit. A future
+    /// - `Discover(_)` — `resolve_scheduler` resolves via three
+    ///   steps (`KTSTR_SCHEDULER` env override → cargo-test-mode
+    ///   `$PATH` lookup → `cargo build -p <name>`). Only the build
+    ///   path guarantees the resulting binary was built from the
+    ///   current tree; the env-override and `$PATH` paths can point
+    ///   at a binary whose commit is unknown to this process.
+    ///   Synthesizing a commit would be a lie in 2 of 3 cases and
+    ///   would silently attribute regressions to the wrong commit.
+    ///   A future
     ///   enhancement can probe the binary itself (e.g.
     ///   `--version` output, an ELF note) and return `Some(..)`
     ///   ONLY when the actual commit is introspected; until then,
@@ -1275,6 +1275,22 @@ pub struct Scheduler {
     /// Empty (`&[]`) means no filter — the scheduler verifies
     /// against every entry in `KTSTR_KERNEL_LIST`.
     pub kernels: &'static [&'static str],
+    /// Manifest directory of the crate that DECLARED this scheduler —
+    /// the `CARGO_MANIFEST_DIR` captured at the `declare_scheduler!`
+    /// call site. A [`SchedulerSpec::Discover`] scheduler is built with
+    /// `cargo build -p <pkg>` run FROM this directory, so cargo walks up
+    /// to the declaring crate's own workspace root: lockfile, feature
+    /// unification, and target dir all come from that workspace, and
+    /// verifier-cell emission checks package membership of that same
+    /// workspace.
+    ///
+    /// `declare_scheduler!` fills this automatically with the invoking
+    /// crate's `CARGO_MANIFEST_DIR`. Direct [`Scheduler::named`] builder
+    /// users default to ktstr's own crate dir (the workspace root in
+    /// this repo); a direct builder user OUTSIDE the ktstr tree whose
+    /// scheduler lives in another workspace should pass their own
+    /// `env!("CARGO_MANIFEST_DIR")` via [`Self::manifest_dir`].
+    pub manifest_dir: &'static str,
 }
 
 impl Scheduler {
@@ -1324,6 +1340,7 @@ impl Scheduler {
         config_file: None,
         config_file_def: None,
         kernels: &[],
+        manifest_dir: env!("CARGO_MANIFEST_DIR"),
     };
 
     /// Const constructor for defining schedulers in static context.
@@ -1358,6 +1375,11 @@ impl Scheduler {
     /// - `kernels`: empty slice — verifies against every kernel
     ///   in the operator's `--kernel` set (no per-scheduler
     ///   filter).
+    /// - `manifest_dir`: ktstr's own `CARGO_MANIFEST_DIR` (the
+    ///   workspace root in this repo). `declare_scheduler!` overrides
+    ///   this with the invoking crate's dir; a direct builder user
+    ///   whose scheduler lives in a different workspace overrides via
+    ///   [`Self::manifest_dir`].
     pub const fn named(name: &'static str) -> Scheduler {
         Scheduler {
             name,
@@ -1379,12 +1401,27 @@ impl Scheduler {
             config_file: None,
             config_file_def: None,
             kernels: &[],
+            manifest_dir: env!("CARGO_MANIFEST_DIR"),
         }
     }
 
     /// Set the binary spec. Returns self for const chaining.
     pub const fn binary(mut self, binary: SchedulerSpec) -> Self {
         self.binary = binary;
+        self
+    }
+
+    /// Set the declaring crate's manifest directory — the workspace a
+    /// [`SchedulerSpec::Discover`] scheduler is built in. Returns self
+    /// for const chaining.
+    ///
+    /// `declare_scheduler!` passes the call-site
+    /// `CARGO_MANIFEST_DIR` automatically; direct builder users outside
+    /// the ktstr tree should pass their own `env!("CARGO_MANIFEST_DIR")`
+    /// so cargo builds the scheduler in ITS workspace rather than
+    /// ktstr's. See the [field doc](field@Self::manifest_dir).
+    pub const fn manifest_dir(mut self, dir: &'static str) -> Self {
+        self.manifest_dir = dir;
         self
     }
 
@@ -4181,6 +4218,7 @@ mod tests {
             config_file: None,
             config_file_def: Some(("--config {file}", "/include-files/cfg.json")),
             kernels: &[],
+            manifest_dir: env!("CARGO_MANIFEST_DIR"),
         };
         fn good_test_func(_: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -4263,6 +4301,7 @@ mod tests {
             config_file: None,
             config_file_def: Some(("f:{file}", "/include-files/p.json")),
             kernels: &[],
+            manifest_dir: env!("CARGO_MANIFEST_DIR"),
         };
         fn good_test_func(_: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -5055,6 +5094,7 @@ mod tests {
             config_file: None,
             config_file_def: None,
             kernels: &[],
+            manifest_dir: env!("CARGO_MANIFEST_DIR"),
         };
         let entry = KtstrTestEntry {
             name: "test_inverted_scheduler",
@@ -5115,10 +5155,10 @@ mod tests {
     // -- SchedulerSpec::scheduler_commit --
     //
     // Conservative by design: EVERY variant currently returns
-    // None, including `Discover(_)`. `resolve_scheduler`'s 5-path
-    // cascade can pick up a binary whose commit is unknown to this
-    // process in four of the five paths, so `Discover` returns
-    // None to avoid lying. The sidecar's nullable
+    // None, including `Discover(_)`. `resolve_scheduler`'s three
+    // steps can pick up a binary whose commit is unknown to this
+    // process in two of the three (env override, `$PATH`), so
+    // `Discover` returns None to avoid lying. The sidecar's nullable
     // semantics distinguish "unset" from a sentinel so consumers
     // can tell "no userspace binary" (Eevdf, KernelBuiltin) from
     // "external binary, commit unknown" (Path) and "discovered
@@ -5142,13 +5182,12 @@ mod tests {
 
     #[test]
     fn scheduler_commit_discover_returns_none() {
-        // `Discover` is resolved by `resolve_scheduler`'s 5-path
-        // cascade. Only the rebuild fallback guarantees the binary
-        // matches the current tree; the four pre-built discovery
-        // paths (KTSTR_SCHEDULER env, ktstr-binary sibling dir,
-        // target/debug/, target/release/) can pick up a binary
-        // whose commit is unknown to this process. Synthesizing a
-        // commit would be a lie in 4 of 5 cases — so the honest
+        // `Discover` is resolved by `resolve_scheduler`'s three
+        // steps. Only the build path guarantees the binary matches
+        // the current tree; the env-override and cargo-test-mode
+        // `$PATH` paths can pick up a binary whose commit is unknown
+        // to this process. Synthesizing a commit would be a lie in
+        // 2 of 3 cases — so the honest
         // answer today is `None`. A future enhancement that probes
         // the binary (e.g. `--version`, ELF note) can flip this to
         // `Some(..)` when an authoritative commit is available;
@@ -5159,8 +5198,8 @@ mod tests {
                 .scheduler_commit()
                 .is_none(),
             "Discover(_) must return None — resolve_scheduler's \
-             cascade can pick up a binary whose commit doesn't \
-             match the workspace. Got: {:?}",
+             env-override / `$PATH` steps can pick up a binary whose \
+             commit doesn't match the workspace. Got: {:?}",
             SchedulerSpec::Discover("scx_mitosis").scheduler_commit(),
         );
     }

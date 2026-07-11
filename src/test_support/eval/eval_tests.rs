@@ -533,7 +533,8 @@ fn sigrtmin_save_install_restore_roundtrip() {
 
 #[test]
 fn resolve_scheduler_eevdf() {
-    let (path, source) = resolve_scheduler(&SchedulerSpec::Eevdf).unwrap();
+    let (path, source) =
+        resolve_scheduler(&SchedulerSpec::Eevdf, env!("CARGO_MANIFEST_DIR")).unwrap();
     assert!(path.is_none());
     assert_eq!(
         source,
@@ -544,10 +545,13 @@ fn resolve_scheduler_eevdf() {
 
 #[test]
 fn resolve_scheduler_kernel_builtin_is_not_found() {
-    let (path, source) = resolve_scheduler(&SchedulerSpec::KernelBuiltin {
-        enable: &[],
-        disable: &[],
-    })
+    let (path, source) = resolve_scheduler(
+        &SchedulerSpec::KernelBuiltin {
+            enable: &[],
+            disable: &[],
+        },
+        env!("CARGO_MANIFEST_DIR"),
+    )
     .unwrap();
     assert!(path.is_none());
     assert_eq!(
@@ -560,9 +564,12 @@ fn resolve_scheduler_kernel_builtin_is_not_found() {
 #[test]
 fn resolve_scheduler_path_exists() {
     let exe = crate::resolve_current_exe().unwrap();
-    let (path, source) = resolve_scheduler(&SchedulerSpec::Path(Box::leak(
-        exe.to_str().unwrap().to_string().into_boxed_str(),
-    )))
+    let (path, source) = resolve_scheduler(
+        &SchedulerSpec::Path(Box::leak(
+            exe.to_str().unwrap().to_string().into_boxed_str(),
+        )),
+        env!("CARGO_MANIFEST_DIR"),
+    )
     .unwrap();
     assert!(path.is_some());
     assert_eq!(
@@ -574,7 +581,10 @@ fn resolve_scheduler_path_exists() {
 
 #[test]
 fn resolve_scheduler_path_missing() {
-    let result = resolve_scheduler(&SchedulerSpec::Path("/nonexistent/scheduler"));
+    let result = resolve_scheduler(
+        &SchedulerSpec::Path("/nonexistent/scheduler"),
+        env!("CARGO_MANIFEST_DIR"),
+    );
     assert!(result.is_err());
 }
 
@@ -582,74 +592,34 @@ fn resolve_scheduler_path_missing() {
 fn resolve_scheduler_discover_missing() {
     let _lock = lock_env();
     let _env = EnvVarGuard::remove(crate::KTSTR_SCHEDULER_ENV);
-    let result = resolve_scheduler(&SchedulerSpec::Discover("__nonexistent_scheduler_xyz__"));
+    let result = resolve_scheduler(
+        &SchedulerSpec::Discover("__nonexistent_scheduler_xyz__"),
+        env!("CARGO_MANIFEST_DIR"),
+    );
     assert!(result.is_err());
 }
 
-/// Core fix: in the orchestrated (non-cargo-test) Discover path a
-/// failed `cargo build -p <name>` REFUSES — it returns the build error
-/// rather than silently falling through to a possibly-stale pre-built
-/// binary. Pinned at the seam: a non-package name makes
-/// `build_and_find_binary` error, and with the opt-out unset
-/// `resolve_scheduler` returns that error wrapped with the refusal
-/// context, proving it returned BEFORE the sibling/target-dir cascade.
+/// Core contract: a failed `Discover` `cargo build -p <name>` is a hard
+/// error — there is no pre-built fallback. Pinned at the seam: a
+/// non-package name makes `build_and_find_binary` error, and
+/// `resolve_scheduler` returns that error wrapped with the
+/// build-failure context rather than serving a possibly-stale binary.
 #[test]
-fn resolve_scheduler_discover_build_failure_refuses_stale_fallback() {
+fn resolve_scheduler_discover_build_failure_is_hard_error() {
     let _lock = lock_env();
     let _no_global = EnvVarGuard::remove(crate::KTSTR_SCHEDULER_ENV);
     let _no_cargo_test_mode = EnvVarGuard::remove(crate::KTSTR_CARGO_TEST_MODE_ENV);
-    let _no_optout = EnvVarGuard::remove(crate::KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV);
-    let result = resolve_scheduler(&SchedulerSpec::Discover("__nonexistent_scheduler_pkg__"));
+    let result = resolve_scheduler(
+        &SchedulerSpec::Discover("__nonexistent_scheduler_pkg__"),
+        env!("CARGO_MANIFEST_DIR"),
+    );
     let rendered = format!(
         "{:#}",
-        result.expect_err("a failed build must refuse, not serve a stale binary")
+        result.expect_err("a failed build must error, not serve a stale binary")
     );
     assert!(
-        rendered.contains("refusing") && rendered.contains("KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK"),
-        "the refusal error must name the hazard + the opt-out; got: {rendered}"
-    );
-}
-
-/// Escape hatch: with `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK` set a
-/// failed orchestrated build no longer returns early — control falls
-/// through to the sibling/target-dir cascade, which (for a bogus name
-/// with no env/sibling/target hit) bails with the cascade-exhaustion
-/// "not found" error, NOT the refusal. Pins that the opt-out is wired
-/// and the legacy fallthrough still works.
-#[test]
-fn resolve_scheduler_discover_build_failure_env_optout_falls_through() {
-    let _lock = lock_env();
-    let _no_global = EnvVarGuard::remove(crate::KTSTR_SCHEDULER_ENV);
-    let _no_cargo_test_mode = EnvVarGuard::remove(crate::KTSTR_CARGO_TEST_MODE_ENV);
-    let _optout = EnvVarGuard::set(crate::KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV, "1");
-    let result = resolve_scheduler(&SchedulerSpec::Discover("__nonexistent_scheduler_pkg__"));
-    let rendered = format!(
-        "{:#}",
-        result.expect_err("a bogus name still bails after the cascade")
-    );
-    assert!(
-        rendered.contains("not found") && !rendered.contains("refusing"),
-        "with the opt-out set the error must be the cascade-exhaustion bail, \
-         not the refusal; got: {rendered}"
-    );
-}
-
-/// Empty-string rejection: `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK=""`
-/// (a stray CI pass-through) must NOT enable the stale fallback — the
-/// presence-only contract treats empty as unset, so a failed build still
-/// refuses. Mirrors `cargo_test_mode_active`'s empty-string rejection.
-#[test]
-fn resolve_scheduler_allow_stale_fallback_empty_string_rejected() {
-    let _lock = lock_env();
-    let _no_global = EnvVarGuard::remove(crate::KTSTR_SCHEDULER_ENV);
-    let _no_cargo_test_mode = EnvVarGuard::remove(crate::KTSTR_CARGO_TEST_MODE_ENV);
-    let _empty = EnvVarGuard::set(crate::KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK_ENV, "");
-    let result = resolve_scheduler(&SchedulerSpec::Discover("__nonexistent_scheduler_pkg__"));
-    let rendered = format!("{:#}", result.expect_err("empty opt-out must still refuse"));
-    assert!(
-        rendered.contains("refusing"),
-        "empty-string KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK must NOT enable the \
-         stale fallback (presence-only contract); got: {rendered}"
+        rendered.contains("failed") && rendered.contains("Fix the build"),
+        "the build-failure error must name the failure + the fix; got: {rendered}"
     );
 }
 
@@ -658,7 +628,11 @@ fn resolve_scheduler_discover_via_env() {
     let _lock = lock_env();
     let exe = crate::resolve_current_exe().unwrap();
     let _env = EnvVarGuard::set(crate::KTSTR_SCHEDULER_ENV, &exe);
-    let (path, source) = resolve_scheduler(&SchedulerSpec::Discover("anything")).unwrap();
+    let (path, source) = resolve_scheduler(
+        &SchedulerSpec::Discover("anything"),
+        env!("CARGO_MANIFEST_DIR"),
+    )
+    .unwrap();
     assert_eq!(path.unwrap(), exe);
     assert_eq!(
         source,
@@ -667,109 +641,13 @@ fn resolve_scheduler_discover_via_env() {
     );
 }
 
-/// The per-name override `KTSTR_SCHEDULER_BIN_<NAME>` wins over the global
-/// `KTSTR_SCHEDULER` so a test declaring distinct Discover
-/// schedulers can point each at its own binary. Both vars point at
-/// existing-but-different paths; the per-name one must be the resolved
-/// result.
-#[test]
-fn resolve_scheduler_discover_per_name_env_wins_over_global() {
-    let _lock = lock_env();
-    let exe = crate::resolve_current_exe().unwrap();
-    // Global points at a different existing binary; per-name points at
-    // `exe`. The per-name override is checked first, so `exe` wins.
-    let global_dir = TempDir::new().expect("tempdir");
-    let global_bin = global_dir.path().join("global_sched");
-    std::fs::write(&global_bin, b"stub").expect("write global stub");
-    let _global = EnvVarGuard::set(crate::KTSTR_SCHEDULER_ENV, &global_bin);
-    let _per = EnvVarGuard::set(crate::per_name_scheduler_env("scx_demo"), &exe);
-    let (path, source) = resolve_scheduler(&SchedulerSpec::Discover("scx_demo")).unwrap();
-    assert_eq!(
-        path.unwrap(),
-        exe,
-        "per-name KTSTR_SCHEDULER_BIN_SCX_DEMO must win over the global KTSTR_SCHEDULER",
-    );
-    assert_eq!(source, ResolveSource::EnvVar);
-}
-
-/// A per-name override pointing at a NON-existent path falls through
-/// to the global var (the documented lenient behavior, matching the
-/// global var's own missing-path handling).
-#[test]
-fn resolve_scheduler_discover_per_name_missing_falls_back_to_global() {
-    let _lock = lock_env();
-    let exe = crate::resolve_current_exe().unwrap();
-    let _per = EnvVarGuard::set(
-        crate::per_name_scheduler_env("scx_demo"),
-        "/nonexistent/per_name_scheduler",
-    );
-    let _global = EnvVarGuard::set(crate::KTSTR_SCHEDULER_ENV, &exe);
-    let (path, source) = resolve_scheduler(&SchedulerSpec::Discover("scx_demo")).unwrap();
-    assert_eq!(
-        path.unwrap(),
-        exe,
-        "a set-but-missing per-name path must fall through to the global var",
-    );
-    assert_eq!(source, ResolveSource::EnvVar);
-}
-
-/// Two DISTINCT Discover names with two distinct per-name overrides
-/// resolve to two distinct binaries — the regression the per-name override fixes (the
-/// global var collapsed every Discover scheduler to one path).
-#[test]
-fn resolve_scheduler_discover_per_name_distinguishes_two_schedulers() {
-    let _lock = lock_env();
-    let _no_global = EnvVarGuard::remove(crate::KTSTR_SCHEDULER_ENV);
-    let dir = TempDir::new().expect("tempdir");
-    let bin_a = dir.path().join("sched_a");
-    let bin_b = dir.path().join("sched_b");
-    std::fs::write(&bin_a, b"a").expect("write a");
-    std::fs::write(&bin_b, b"b").expect("write b");
-    let _a = EnvVarGuard::set(crate::per_name_scheduler_env("scx_a"), &bin_a);
-    let _b = EnvVarGuard::set(crate::per_name_scheduler_env("scx_b"), &bin_b);
-    let (pa, _) = resolve_scheduler(&SchedulerSpec::Discover("scx_a")).unwrap();
-    let (pb, _) = resolve_scheduler(&SchedulerSpec::Discover("scx_b")).unwrap();
-    assert_eq!(pa.unwrap(), bin_a);
-    assert_eq!(pb.unwrap(), bin_b);
-}
-
-/// The per-name env var name derivation: `KTSTR_SCHEDULER_BIN_` +
-/// uppercase + non-alphanumeric to `_`.
-#[test]
-fn per_name_scheduler_env_derivation() {
-    assert_eq!(
-        crate::per_name_scheduler_env("scx_layered"),
-        "KTSTR_SCHEDULER_BIN_SCX_LAYERED",
-    );
-    assert_eq!(
-        crate::per_name_scheduler_env("scx-ktstr"),
-        "KTSTR_SCHEDULER_BIN_SCX_KTSTR",
-    );
-}
-
-/// The profile-aware target-dir probe order: with
-/// `prefer_release` the release dir is probed first (so a scheduler on
-/// the release default — or `--profile release` — prefers
-/// `target/release/` over a stale `target/debug/` binary); otherwise
-/// debug-first (`--profile dev`). Pins the reorder branch without
-/// staging a CWD.
-#[test]
-fn target_dir_probe_order_prefers_profile_match() {
-    let rel = super::scheduler::target_dir_probe_order(true);
-    assert_eq!(rel[0], ("target/release", ResolveSource::TargetRelease));
-    assert_eq!(rel[1], ("target/debug", ResolveSource::TargetDebug));
-    let dbg = super::scheduler::target_dir_probe_order(false);
-    assert_eq!(dbg[0], ("target/debug", ResolveSource::TargetDebug));
-    assert_eq!(dbg[1], ("target/release", ResolveSource::TargetRelease));
-}
-
 /// `ResolveSource::as_str` is the load-bearing enum -> persisted-tag
 /// bridge: it produces the snake_case string stamped into
 /// `SidecarResult::resolve_source` (eval/mod.rs stamps it post-run) and
 /// surfaced by `stats list-values` (resolve_source column). The
 /// roundtrip / propagation tests pin
 /// the String values INDEPENDENTLY (they hardcode the expected tags), so
-/// a typo here (e.g. `SiblingDir => "sibling-dir"`) would silently ship
+/// a typo here (e.g. `PathLookup => "path-lookup"`) would silently ship
 /// a malformed JSON contract without failing those tests. Pin every
 /// variant -> tag mapping; the exhaustive match in `as_str` (no wildcard)
 /// already forces a new variant to add an arm, and this fixes the string.
@@ -778,29 +656,8 @@ fn resolve_source_as_str_tags() {
     assert_eq!(ResolveSource::Path.as_str(), "path");
     assert_eq!(ResolveSource::EnvVar.as_str(), "env_var");
     assert_eq!(ResolveSource::PathLookup.as_str(), "path_lookup");
-    assert_eq!(ResolveSource::SiblingDir.as_str(), "sibling_dir");
-    assert_eq!(ResolveSource::TargetDebug.as_str(), "target_debug");
-    assert_eq!(ResolveSource::TargetRelease.as_str(), "target_release");
     assert_eq!(ResolveSource::AutoBuilt.as_str(), "auto_built");
     assert_eq!(ResolveSource::NotFound.as_str(), "not_found");
-}
-
-/// The `BIN` infix keeps the per-name namespace disjoint from the
-/// `KTSTR_SCHEDULER_*` meta-variables: a scheduler named "profile" must NOT
-/// derive the build-profile selector `KTSTR_SCHEDULER_PROFILE`
-/// (namespace-collision guard).
-#[test]
-fn per_name_scheduler_env_does_not_collide_with_meta_vars() {
-    assert_ne!(
-        crate::per_name_scheduler_env("profile"),
-        crate::KTSTR_SCHEDULER_PROFILE_ENV,
-        "Discover(\"profile\") must not shadow KTSTR_SCHEDULER_PROFILE",
-    );
-    assert_ne!(
-        crate::per_name_scheduler_env("anything"),
-        crate::KTSTR_SCHEDULER_ENV,
-        "per-name vars must not collide with the global KTSTR_SCHEDULER",
-    );
 }
 
 /// `KTSTR_CARGO_TEST_MODE=1` enables the `$PATH` lookup branch of
@@ -823,8 +680,11 @@ fn resolve_scheduler_discover_path_lookup_under_cargo_test_mode() {
     perms.set_mode(0o755);
     std::fs::set_permissions(&bin_path, perms).expect("chmod 0755");
     let _path_env = EnvVarGuard::set("PATH", dir.path());
-    let (path, source) =
-        resolve_scheduler(&SchedulerSpec::Discover("__test_path_scheduler__")).unwrap();
+    let (path, source) = resolve_scheduler(
+        &SchedulerSpec::Discover("__test_path_scheduler__"),
+        env!("CARGO_MANIFEST_DIR"),
+    )
+    .unwrap();
     assert_eq!(path.expect("found on PATH"), bin_path);
     assert_eq!(
         source,
@@ -834,14 +694,13 @@ fn resolve_scheduler_discover_path_lookup_under_cargo_test_mode() {
 }
 
 /// Without `KTSTR_CARGO_TEST_MODE`, the `$PATH` lookup branch is
-/// inert: the orchestrated path runs the workspace build
-/// FIRST, so a bogus package name errors there (the build fails and
-/// is refused, `KTSTR_SCHEDULER_ALLOW_STALE_FALLBACK` unset) before
-/// the `$PATH` / sibling / target-dir branches are ever consulted.
-/// Pins the production-path contract: gauntlet runs land on the
-/// workspace-built scheduler revision, never a system-wide install.
-/// The test stages a stub on PATH but expects the resolution to NOT
-/// pick it up (never report `PathLookup`) — it errors instead.
+/// inert: the orchestrated path skips the lookup and goes straight to
+/// the workspace build, so a bogus package name errors at the build
+/// step before `$PATH` is ever consulted. Pins the production-path
+/// contract: gauntlet runs land on the workspace-built scheduler
+/// revision, never a system-wide install. The test stages a stub on
+/// PATH but expects the resolution to NOT pick it up (never report
+/// `PathLookup`) — it errors instead.
 #[test]
 fn resolve_scheduler_discover_path_lookup_inert_without_cargo_test_mode() {
     use std::os::unix::fs::PermissionsExt;
@@ -855,20 +714,23 @@ fn resolve_scheduler_discover_path_lookup_inert_without_cargo_test_mode() {
     perms.set_mode(0o755);
     std::fs::set_permissions(&bin_path, perms).expect("chmod 0755");
     let _path_env = EnvVarGuard::set("PATH", dir.path());
-    // Without the cargo-test-mode flag the orchestrated
-    // workspace build runs first; `cargo build -p
-    // __test_inert_path_scheduler__` fails (bogus package) and is
-    // refused (opt-out unset), so the call errors at the build step — before
-    // the $PATH / sibling / target-dir branches — never PathLookup.
-    let result = resolve_scheduler(&SchedulerSpec::Discover("__test_inert_path_scheduler__"));
+    // Without the cargo-test-mode flag the $PATH lookup is skipped and
+    // the workspace build runs; `cargo build -p
+    // __test_inert_path_scheduler__` fails (bogus package), so the call
+    // errors at the build step — the $PATH branch never runs, so the
+    // staged stub is never picked up as PathLookup.
+    let result = resolve_scheduler(
+        &SchedulerSpec::Discover("__test_inert_path_scheduler__"),
+        env!("CARGO_MANIFEST_DIR"),
+    );
     match result {
         Ok((_, source)) => {
             panic!("PATH lookup must be inert without KTSTR_CARGO_TEST_MODE; got source {source:?}",)
         }
         Err(_) => {
-            // Expected: the workspace build of the bogus package failed
-            // and was refused, so the $PATH lookup never ran. The
-            // staged stub on PATH is deliberately ignored.
+            // Expected: the workspace build of the bogus package failed,
+            // so the $PATH lookup never ran. The staged stub on PATH is
+            // deliberately ignored.
         }
     }
 }
