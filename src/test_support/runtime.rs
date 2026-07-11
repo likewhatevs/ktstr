@@ -878,6 +878,48 @@ pub(crate) fn vm_timeout_from_entry(
     base + vm_boot_headroom(vcpus).mul_f64(oversub)
 }
 
+/// Base host-side budget for a verifier sweep cell's guest lifecycle
+/// past boot: scheduler spawn, BPF load/verify, attach gate, the
+/// dispatch probe, and teardown. The boot phase is budgeted
+/// separately by the vCPU- and oversubscription-scaled headroom in
+/// [`verifier_vm_timeout`], mirroring [`vm_timeout_from_entry`]'s
+/// base-vs-headroom split.
+pub(crate) const VERIFIER_BASE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Post-attach budget for a verifier cell, wired into the builder's
+/// `workload_duration` so the watchdog's scheduler-attach reset arms:
+/// a cell whose boot ate most of the deadline still gets this much
+/// wall time AFTER attach for the dispatch probe + teardown (the
+/// reset is extend-only — `max(reset, hard_deadline)`). Sized above
+/// the guest probe's `DISPATCH_DEADLINE_CAP` (30s, see
+/// `vmm::rust_init::verifier_workload`) plus teardown/dump slack.
+/// Before this, verifier cells passed no `workload_duration` at all,
+/// which made the attach-reset dead code on the sweep path — the
+/// watchdog dump always read `reset_by_scheduler_attach=false`.
+pub(crate) const VERIFIER_WORKLOAD_BUDGET: Duration = Duration::from_secs(60);
+
+/// Host-side VM timeout for a verifier sweep cell: the flat
+/// [`VERIFIER_BASE_TIMEOUT`] plus the same oversubscription-scaled
+/// boot headroom the `#[ktstr_test]` path gets from
+/// [`vm_timeout_from_entry`]. The sweep previously hard-coded 120s
+/// with no headroom at all, so a wide-topology cell (128 vCPUs) that
+/// boots fine but slowly under CI concurrency was killed mid-attach
+/// — the "VM timed out (hung after attach, before exit)" class from
+/// the scx verifier sweep.
+pub(crate) fn verifier_vm_timeout(booted_vcpus: u32) -> Duration {
+    verifier_vm_timeout_for(
+        booted_vcpus,
+        crate::vmm::host_topology::host_allowed_cpus().len(),
+    )
+}
+
+/// Pure core of [`verifier_vm_timeout`] over `(vcpus, allowed_cpus)`
+/// so the scaling is unit-testable without reading the host cpuset.
+pub(crate) fn verifier_vm_timeout_for(booted_vcpus: u32, allowed_cpus: usize) -> Duration {
+    let oversub = overcommit_ratio(booted_vcpus, allowed_cpus, None).min(OVERCOMMIT_HEADROOM_CAP);
+    VERIFIER_BASE_TIMEOUT + vm_boot_headroom(booted_vcpus).mul_f64(oversub)
+}
+
 /// Configure the ktstr_test VM builder prefix shared by the main
 /// test path ([`super::eval::run_ktstr_test_inner`]) and the
 /// auto-repro path ([`super::probe::attempt_auto_repro`]).
@@ -2696,6 +2738,34 @@ mod tests {
         assert_eq!(
             vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
             Duration::from_millis(362_400)
+        );
+    }
+
+    #[test]
+    fn verifier_vm_timeout_mirrors_test_path_scaling() {
+        // Fitting host (128 vCPUs on 192 allowed CPUs, ratio floors
+        // at 1.0): 120 s base + vm_boot_headroom(128) = 10 s kernel
+        // init + (10_000 + 128×150 = 29_200 ms) sys_rdy = 39.2 s →
+        // 159.2 s. The old flat 120 s left ZERO boot headroom for
+        // exactly this shape — the "VM timed out (hung after attach,
+        // before exit)" class from the scx verifier sweep.
+        assert_eq!(
+            verifier_vm_timeout_for(128, 192),
+            Duration::from_millis(159_200)
+        );
+        // Oversubscribed dev host (128 vCPUs on 16 CPUs = 8x) clamps
+        // the headroom multiplier at OVERCOMMIT_HEADROOM_CAP (6x):
+        // 120 + 39.2×6 = 355.2 s. The nextest verifier override
+        // (240 s × 2 in .config/nextest.toml) must stay above this
+        // plus the 60 s attach-reset extension.
+        assert_eq!(
+            verifier_vm_timeout_for(128, 16),
+            Duration::from_millis(355_200)
+        );
+        assert!(
+            verifier_vm_timeout_for(128, 16) + VERIFIER_WORKLOAD_BUDGET < Duration::from_secs(480),
+            "worst-case verifier deadline (incl. attach-reset extension) \
+             must fit the 240s x 2 nextest override",
         );
     }
 
