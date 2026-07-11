@@ -73,22 +73,52 @@ scx_p2dq:
  kernel        p2dq_dequeue  p2dq_dispatch  p2dq_enqueue  p2dq_exit  p2dq_exit_task  p2dq_init  p2dq_init_task  p2dq_running  p2dq_select_cpu  p2dq_set_cpumas  p2dq_stopping  p2dq_update_idl
  kernel_local  5             1159..2130     2026..5118    25         419             2121       27601           609           801..887         149              853            723
 
-verifier summary: 8 ✅  <span class="t-red">4 ❌</span>  0 ❎
- topology   scx_bpfland  scx_lavd  scx_p2dq
- odd-3llc   ✅           <span class="t-red">❌</span>        ✅
- smt-2llc   ✅           <span class="t-red">❌</span>        ✅
- tiny-1llc  ✅           <span class="t-red">❌</span>        ✅
- tiny-2llc  ✅           <span class="t-red">❌</span>        ✅
+verifier results (per scheduler; rows: topology, cols: kernel):
 
-failing combinations (scheduler / kernel / topology):
-  scx_lavd / kernel_local / odd-3llc
-  ...</pre></div>
+scx_bpfland: 4 ✅  0 ❌
+┌───────────┬──────────────┐
+│ topology  │ kernel_local │
+╞═══════════╪══════════════╡
+│ odd-3llc  │ <span class="t-grn">✓</span>            │
+├───────────┼──────────────┤
+│ smt-2llc  │ <span class="t-grn">✓</span>            │
+├───────────┼──────────────┤
+│ tiny-1llc │ <span class="t-grn">✓</span>            │
+├───────────┼──────────────┤
+│ tiny-2llc │ <span class="t-grn">✓</span>            │
+└───────────┴──────────────┘
 
-That ❌ column is the sweep doing its job. This development kernel
-removed the deprecated `scx_bpf_cpu_rq()` kfunc; `scx_lavd` still
-requires it, so its BPF skeleton fails at load in every cell — caught
-here, not on a user's machine. The failing cells' captured output
-names the exact break:
+scx_lavd: 0 ✅  <span class="t-red">4 ❌</span>
+┌───────────┬──────────────┐
+│ topology  │ kernel_local │
+╞═══════════╪══════════════╡
+│ odd-3llc  │ <span class="t-red">✗</span>            │
+├───────────┼──────────────┤
+│ smt-2llc  │ <span class="t-red">✗</span>            │
+├───────────┼──────────────┤
+│ tiny-1llc │ <span class="t-red">✗</span>            │
+├───────────┼──────────────┤
+│ tiny-2llc │ <span class="t-red">✗</span>            │
+└───────────┴──────────────┘
+
+scx_p2dq: 4 ✅  0 ❌
+┌───────────┬──────────────┐
+│ topology  │ kernel_local │
+╞═══════════╪══════════════╡
+│ odd-3llc  │ <span class="t-grn">✓</span>            │
+├───────────┼──────────────┤
+│ smt-2llc  │ <span class="t-grn">✓</span>            │
+├───────────┼──────────────┤
+│ tiny-1llc │ <span class="t-grn">✓</span>            │
+├───────────┼──────────────┤
+│ tiny-2llc │ <span class="t-grn">✓</span>            │
+└───────────┴──────────────┘</pre></div>
+
+That all-✗ `scx_lavd` grid is the sweep doing its job. This
+development kernel removed the deprecated `scx_bpf_cpu_rq()` kfunc;
+`scx_lavd` still requires it, so its BPF skeleton fails at load in
+every cell — caught here, not on a user's machine. The failing cells'
+captured output names the exact break:
 
 <!-- captured: same sweep, scx_lavd cell scheduler log | ktstr 0.23.0 | kernel sched_ext-for-7.2 b4dc42d2 -->
 ```text
@@ -99,11 +129,15 @@ Error: Failed to load BPF program (Invalid argument, os error 22)
 
 A cell in the `verified_insns` table shows a single number when the
 count is flat across topologies, `lo..hi` when it varies, and `-`
-when that program reported no stats on that kernel. In the grid, ✅
-means the scheduler verified, attached, and dispatched on every
-kernel that ran the cell; ❌ means it failed on every kernel; ❎ means
-mixed results across kernels (the failing-combinations list below the
-grid is the authoritative record).
+when that program reported no stats on that kernel; a kernel that ran
+but produced no stats at all — e.g. every cell died at BPF load, so no
+program existed to introspect — is still shown as an all-`-` row
+rather than vanishing. Each PASS/FAIL grid is per scheduler, one row
+per topology and one column per kernel: a green ✓ means the scheduler
+verified, attached, and dispatched on that kernel; a red ✗ means it
+failed. The ✅/❌ emoji appear only on the tally line above each grid —
+grid cells use single-width glyphs so the box-drawing columns stay
+aligned in GitHub's log viewer.
 
 > [!NOTE]
 > A scheduler in a *separate* workspace works with a bare
@@ -135,10 +169,9 @@ kernel list: range expanded to 3 kernel(s): 6.12.95, 6.13.12, 6.14.11
 ```
 
 With multiple kernels resolved, each cell runs against its own, the
-`verified_insns` table grows one row per kernel, and the pass/fail
-grid folds kernels into each cell (✅ passed on every kernel, ❌
-failed on every kernel, ❎ mixed — the failing-combinations list is
-authoritative):
+`verified_insns` table grows one row per kernel, and each scheduler's
+pass/fail grid grows one column per kernel, so a per-kernel ✓/✗ is
+read straight off the cell — no separate failing list:
 
 <!-- captured: cargo ktstr verifier --kernel 7.0.14-tarball-x86_64-kcabd40422 --kernel local-8cd2b47-x86_64-kcabd40422 --scheduler ktstr_sched --test kaslr_axis_e2e tiny-1llc tiny-2llc | ktstr 0.23.0 | kernels 7.0.14 + v7.1-patched -->
 <div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr verifier --kernel 7.0 --kernel ../linux --scheduler ktstr_sched tiny-1llc tiny-2llc</span></div>
@@ -148,14 +181,21 @@ authoritative):
  kernel_7_0_14        102             81          13              70               74             25          419              2296        29077            39               8
  kernel_local_8cd2b4  102             81          13              70               74             25          419              2296        29077            39               8
 
-verifier summary: 2 ✅  0 ❌  0 ❎
- topology   ktstr_sched
- tiny-1llc  ✅
- tiny-2llc  ✅</pre></div>
+verifier results (per scheduler; rows: topology, cols: kernel):
+
+ktstr_sched: 4 ✅  0 ❌
+┌───────────┬───────────────┬─────────────────────┐
+│ topology  │ kernel_7_0_14 │ kernel_local_8cd2b4 │
+╞═══════════╪═══════════════╪═════════════════════╡
+│ tiny-1llc │ <span class="t-grn">✓</span>             │ <span class="t-grn">✓</span>                   │
+├───────────┼───────────────┼─────────────────────┤
+│ tiny-2llc │ <span class="t-grn">✓</span>             │ <span class="t-grn">✓</span>                   │
+└───────────┴───────────────┴─────────────────────┘</pre></div>
 
 Flat rows across kernels are the boring, reassuring case — the same
 BPF verified identically on both. A kfunc or verifier change between
-kernels shows up as diverging counts, or as a ❎ cell.
+kernels shows up as diverging counts, or as a ✗ in one kernel's
+column while the other stays ✓.
 
 ## What a cell checks
 
@@ -231,13 +271,14 @@ Global function ktstr_dispatch() doesn't return scalar. Only those are supported
 <span class="t-red">R1 invalid mem access 'scalar'</span>
 processed 186 insns (limit 1000000) max_states_per_insn 0 total_states 7 peak_states 7 mark_read 0
 ...
-verifier summary: 0 ✅  1 ❌  0 ❎
- topology   ktstr_broken
- tiny-1llc  ❌
+verifier results (per scheduler; rows: topology, cols: kernel):
 
-failing combinations (scheduler / kernel / topology):
-  <span class="t-red">ktstr_broken / kernel_7_0 / tiny-1llc</span>
-error: cargo nextest run exited with 100</pre></div>
+ktstr_broken: 0 ✅  <span class="t-red">1 ❌</span>
+┌───────────┬────────────┐
+│ topology  │ kernel_7_0 │
+╞═══════════╪════════════╡
+│ tiny-1llc │ <span class="t-red">✗</span>          │
+└───────────┴────────────┘</pre></div>
 
 The interleaved `; source line @ file:line` comments name the C
 statement each instruction group came from — the offending store is

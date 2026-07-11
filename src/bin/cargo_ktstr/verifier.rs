@@ -39,8 +39,8 @@
 //! `collect_verifier_output`). After nextest returns, the dispatcher
 //! reads each cell's PASS/FAIL record (written under
 //! `KTSTR_VERIFIER_RESULT_DIR`) and prints one `verified_insns` table
-//! per declared scheduler followed by a topology × scheduler PASS/FAIL
-//! grid.
+//! per declared scheduler followed by one PASS/FAIL grid per declared
+//! scheduler (rows = topology, cols = kernel).
 //!
 //! `KTSTR_KERNEL_LIST` is ALWAYS populated by this dispatcher — even
 //! with no `--kernel` flag the dispatcher auto-discovers one kernel
@@ -230,11 +230,11 @@ pub(crate) fn run_verifier(
         .map_err(|e| format!("spawn cargo nextest run: {e}"))?;
 
     // From the records each cell wrote into `result_dir`: print the
-    // per-scheduler verified_insns tables first, then the topology ×
-    // scheduler PASS/FAIL grid LAST so the operator's final view is the
-    // pass/fail matrix. Both print on success AND failure so failing cells
-    // stay visible. Best-effort: no records (e.g. 0 cells ran) -> the
-    // renderers return None and nothing prints.
+    // per-scheduler verified_insns tables first, then the per-scheduler
+    // topology × kernel PASS/FAIL grids LAST so the operator's final view
+    // is the pass/fail matrix. Both print on success AND failure so
+    // failing cells stay visible. Best-effort: no records (e.g. 0 cells
+    // ran) -> the renderers return None and nothing prints.
     let records = ktstr::verifier::read_cell_records(&result_dir);
     if let Some(tables) = ktstr::verifier::render_instruction_count_tables(&records) {
         print!("{tables}");
@@ -255,13 +255,24 @@ pub(crate) fn run_verifier(
     // set on success is diagnosed here (a `--scheduler` typo, no scheduler
     // declared, or no topology preset fits this host) rather than
     // surfacing nextest's generic no-tests error. A real build/exec
-    // failure still exits non-zero and is surfaced verbatim.
-    ktstr::verifier::classify_run_outcome(
+    // failure still exits non-zero and is surfaced verbatim — EXCEPT when
+    // the failure is a real cell failure the grid above already shows
+    // (SilentExit): there the process exits with nextest's code but emits
+    // no stderr error line, which would otherwise interleave into the
+    // stdout report under CI's unordered pipes.
+    match ktstr::verifier::classify_run_outcome(
         status.success(),
         records.is_empty(),
+        records.iter().any(|r| !r.passed),
         scheduler.as_deref(),
         status.code(),
-    )
+    ) {
+        ktstr::verifier::RunOutcome::Success => Ok(()),
+        ktstr::verifier::RunOutcome::Failed(msg) => Err(msg),
+        // Report + cleanup already ran above; exit silently with nextest's
+        // own code.
+        ktstr::verifier::RunOutcome::SilentExit(code) => std::process::exit(code),
+    }
 }
 
 #[cfg(test)]

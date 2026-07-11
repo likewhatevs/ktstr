@@ -1200,8 +1200,9 @@ pub fn format_verifier_diff(
 /// One `cargo ktstr verifier` cell's outcome. The cell process writes it
 /// (via `write_cell_record`) into the directory named by
 /// [`crate::KTSTR_VERIFIER_RESULT_DIR_ENV`]; after nextest returns the
-/// dispatcher reads them back (via [`read_cell_records`]) and renders the
-/// per-(topology × scheduler) summary table. A cell is one
+/// dispatcher reads them back (via [`read_cell_records`]) and renders one
+/// PASS/FAIL grid per scheduler (rows = topology, cols = kernel). A cell
+/// is one
 /// (scheduler, kernel, topology): the verifier sweeps each declared
 /// scheduler across topologies, so topology IS a result axis — a
 /// scheduler can pass on one topology and fail on another.
@@ -1221,7 +1222,7 @@ pub struct VerifierCellRecord {
     /// producing stats. Drives the per-scheduler `verified_insns` tables
     /// ([`render_instruction_count_tables`], rows = kernel, cols = BPF
     /// program, cell = the count summarized across topologies) that the
-    /// dispatcher prints before the PASS/FAIL grid.
+    /// dispatcher prints before the PASS/FAIL grids.
     pub stats: Vec<ProgStats>,
 }
 
@@ -1305,9 +1306,32 @@ pub fn read_cell_records(dir: &std::path::Path) -> Vec<VerifierCellRecord> {
         .collect()
 }
 
+/// The terminal disposition of a `cargo ktstr verifier` run, decided by
+/// [`classify_run_outcome`] after nextest returns and the report grids
+/// have been printed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// Clean success — the dispatcher returns `Ok(())`.
+    Success,
+    /// A diagnosable failure whose message the dispatcher routes through
+    /// main's stderr error handler (exit 1). Covers a nextest nonzero
+    /// exit with NO failed cell (a build / internal failure — nothing in
+    /// the grid to point at), a signal exit (no numeric code), and the
+    /// empty-record diagnostics.
+    Failed(String),
+    /// nextest exited nonzero AND the printed grid already shows at least
+    /// one failing (✗) cell, so the failure is already visible on stdout.
+    /// The dispatcher exits with this (nextest's own) code but does NOT emit a
+    /// redundant `error: cargo nextest run exited with N` line: that line
+    /// goes to stderr while the report goes to stdout, and with two
+    /// unordered pipes it otherwise interleaves mid-report in CI logs.
+    SilentExit(i32),
+}
+
 /// Decide the `cargo ktstr verifier` run outcome from nextest's exit
-/// success, whether any per-cell records were produced, and the optional
-/// `--scheduler` filter.
+/// success, whether any per-cell records were produced, whether any of
+/// those records is a FAILED cell (already shown as a ✗ in the printed
+/// grid), and the optional `--scheduler` filter.
 ///
 /// The dispatcher runs nextest with `--no-tests=pass`, so a run that
 /// selects zero verifier cells exits 0 (success) with empty records
@@ -1321,19 +1345,34 @@ pub fn read_cell_records(dir: &std::path::Path) -> Vec<VerifierCellRecord> {
 ///   constraints rejected all topology presets on this host.
 ///
 /// A genuine build/exec failure still fails nextest (exit non-zero, which
-/// `--no-tests=pass` does not mask), surfaced via the `exit_code` arm.
+/// `--no-tests=pass` does not mask). When that nonzero exit is a REAL
+/// cell failure — `has_failed_cell` true and nextest handed back a
+/// numeric `exit_code` — the printed grid already shows the failing
+/// cell(s), so the outcome is [`RunOutcome::SilentExit`] (carry nextest's
+/// code, emit no stderr line). Every other nonzero case — a build /
+/// internal failure that produced no failed cell, or a signal exit with
+/// no numeric code — stays [`RunOutcome::Failed`] with the descriptive
+/// message, as does each empty-record diagnostic.
 pub fn classify_run_outcome(
     success: bool,
     records_empty: bool,
+    has_failed_cell: bool,
     scheduler: Option<&str>,
     exit_code: Option<i32>,
-) -> Result<(), String> {
+) -> RunOutcome {
     if !success {
+        // The printed grid already shows the failing cell(s): carry
+        // nextest's code out silently instead of a stderr error line that
+        // would interleave mid-report. Only with a numeric code — a
+        // signal exit (None) keeps the descriptive message.
+        if has_failed_cell && let Some(code) = exit_code {
+            return RunOutcome::SilentExit(code);
+        }
         let code = exit_code.map_or_else(|| "signal".to_string(), |c| c.to_string());
-        return Err(format!("cargo nextest run exited with {code}"));
+        return RunOutcome::Failed(format!("cargo nextest run exited with {code}"));
     }
     if records_empty {
-        return Err(match scheduler {
+        return RunOutcome::Failed(match scheduler {
             Some(name) => format!(
                 "--scheduler {name:?}: matched no verifier cell — no declared BPF \
                  scheduler by that name, or no topology preset fits this host for \
@@ -1347,7 +1386,7 @@ pub fn classify_run_outcome(
                 .to_string(),
         });
     }
-    Ok(())
+    RunOutcome::Success
 }
 
 /// Build the `cargo nextest run` argument vector for the verifier sweep.
@@ -1383,86 +1422,110 @@ pub fn build_nextest_args(nextest_profile: Option<&str>, forward: &[String]) -> 
     args
 }
 
-/// Render the per-cell records into a summary grid: one row per topology
-/// preset, one column per scheduler, aggregating across kernels. Each
-/// cell is:
-/// - ✅ every kernel that ran this (topology, scheduler) passed,
-/// - ❌ every kernel that ran it failed,
-/// - ❎ mixed — at least one kernel passed AND at least one failed,
-/// - `-` no kernel ran this (topology, scheduler) (e.g. the scheduler's
-///   constraints rejected the preset).
+/// Render the per-cell records into one PASS/FAIL grid PER declared
+/// scheduler (BTreeSet-sorted). Each scheduler's section is a tally line
+/// followed by a bordered grid whose rows are the topology presets that
+/// ran the scheduler (BTreeSet) and whose columns are the kernels that
+/// ran it (BTreeSet); the header row's first column is `topology`. Each
+/// grid cell is the (topology, kernel) result FOR THAT SCHEDULER,
+/// rendered nextest-style:
+/// - `✓` (bold green) — every record for the triple passed,
+/// - `✗` (bold red) — any record for it failed; this also absorbs the
+///   defensive duplicate-record case where one triple somehow carries
+///   both a pass and a fail — any failure means failure,
+/// - `-` (plain) — no record (the scheduler's constraints rejected the
+///   preset on that kernel, or the cell never ran).
 ///
-/// After the grid, the specific failing `(scheduler, kernel, topology)`
-/// combinations are listed so a ❌ or ❎ cell can be drilled to the exact
-/// kernel(s) that failed. Returns `None` for an empty record set (the
-/// caller prints nothing).
+/// Cells are single-width glyphs (U+2713 / U+2717), not emoji: emoji
+/// are not exactly two monospace cells in GitHub's log viewer / code
+/// blocks, so they drift the box-drawing columns. The glyph styling
+/// comes from [`comfy_table::Cell::fg`] + `Attribute::Bold`, with
+/// emission governed by [`crate::cli::new_bordered_table`]'s color
+/// policy (styled on a TTY and in color-forcing CI, plain otherwise).
+/// The tally line keeps the emoji — `{sched}: {n_pass} ✅  {n_fail} ❌`
+/// — because it is prose with nothing to column-align. The counts tally
+/// the grid CELLS (a `-` cell counts toward neither; a cell with any
+/// failing record counts toward `n_fail`). The kernel is a grid axis
+/// rather than folded into the cell, so a ✗ cell already names the
+/// exact kernel that failed — the old flat `failing combinations
+/// (scheduler / kernel / topology)` list it used to need is gone.
 ///
-/// Rows, columns, and the failing list are BTreeSet-sorted so the same
-/// run renders the same output (shell-pipeline stable). The header line
-/// carries a ✅/❌/❎ tally counting grid cells.
+/// Returns `None` for an empty record set (the caller prints nothing).
+/// Schedulers, rows, and columns are BTreeSet-sorted so the same run
+/// renders the same output (shell-pipeline stable). Uses
+/// [`crate::cli::new_bordered_table`] (box-drawing borders) so each
+/// scheduler's grid is visually delimited from its tally line and from
+/// the next scheduler's section.
 pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
     if records.is_empty() {
         return None;
     }
     use std::collections::{BTreeMap, BTreeSet};
-    let mut schedulers: BTreeSet<String> = BTreeSet::new(); // columns
-    let mut rows: BTreeSet<String> = BTreeSet::new(); // topology presets
-    // (topology, scheduler) -> (passes, fails) aggregated across kernels.
-    let mut agg: BTreeMap<(String, String), (u32, u32)> = BTreeMap::new();
-    // Distinct failing (scheduler, kernel, topology) combinations.
-    let mut failing: BTreeSet<(String, String, String)> = BTreeSet::new();
+    let mut schedulers: BTreeSet<String> = BTreeSet::new();
+    // scheduler -> topology rows that ran it.
+    let mut sched_rows: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // scheduler -> kernel columns that ran it.
+    let mut sched_cols: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // scheduler -> (topology, kernel) -> whether EVERY record for the
+    // triple passed. Normally one record per triple; a defensive
+    // duplicate carrying any fail flips the cell to FAIL.
+    let mut agg: BTreeMap<String, BTreeMap<(String, String), bool>> = BTreeMap::new();
     for r in records {
         schedulers.insert(r.scheduler.clone());
-        rows.insert(r.topology.clone());
-        let counts = agg
-            .entry((r.topology.clone(), r.scheduler.clone()))
-            .or_insert((0, 0));
-        if r.passed {
-            counts.0 += 1;
-        } else {
-            counts.1 += 1;
-            failing.insert((r.scheduler.clone(), r.kernel.clone(), r.topology.clone()));
-        }
+        sched_rows
+            .entry(r.scheduler.clone())
+            .or_default()
+            .insert(r.topology.clone());
+        sched_cols
+            .entry(r.scheduler.clone())
+            .or_default()
+            .insert(r.kernel.clone());
+        let all_passed = agg
+            .entry(r.scheduler.clone())
+            .or_default()
+            .entry((r.topology.clone(), r.kernel.clone()))
+            .or_insert(true);
+        *all_passed &= r.passed;
     }
 
-    let (mut n_pass, mut n_fail, mut n_mixed) = (0usize, 0usize, 0usize);
-    let mut table = crate::cli::new_table();
-    let mut header: Vec<String> = vec!["topology".to_string()];
+    let mut out =
+        String::from("\nverifier results (per scheduler; rows: topology, cols: kernel):\n");
     for sched in &schedulers {
-        header.push(sched.clone());
-    }
-    table.set_header(header);
-    for topo in &rows {
-        let mut line: Vec<String> = vec![topo.clone()];
-        for sched in &schedulers {
-            // An entry only exists with >= 1 record, so (_, 0) means all
-            // passed, (0, _) means all failed, and both-nonzero is mixed.
-            let text = match agg.get(&(topo.clone(), sched.clone())) {
-                None => "-",
-                Some((_, 0)) => {
-                    n_pass += 1;
-                    "✅"
-                }
-                Some((0, _)) => {
-                    n_fail += 1;
-                    "❌"
-                }
-                Some(_) => {
-                    n_mixed += 1;
-                    "❎"
-                }
-            };
-            line.push(text.to_string());
+        let rows = &sched_rows[sched];
+        let cols = &sched_cols[sched];
+        let cells = &agg[sched];
+        let (mut n_pass, mut n_fail) = (0usize, 0usize);
+        let mut table = crate::cli::new_bordered_table();
+        let mut header: Vec<String> = vec!["topology".to_string()];
+        for kernel in cols {
+            header.push(kernel.clone());
         }
-        table.add_row(line);
-    }
-
-    let mut out = format!("\nverifier summary: {n_pass} ✅  {n_fail} ❌  {n_mixed} ❎\n{table}\n");
-    if !failing.is_empty() {
-        out.push_str("\nfailing combinations (scheduler / kernel / topology):\n");
-        for (sched, kernel, topo) in &failing {
-            out.push_str(&format!("  {sched} / {kernel} / {topo}\n"));
+        table.set_header(header);
+        for topo in rows {
+            let mut line: Vec<comfy_table::Cell> = vec![comfy_table::Cell::new(topo)];
+            for kernel in cols {
+                // An entry only exists with >= 1 record; `true` means
+                // every record passed, `false` means at least one failed.
+                let cell = match cells.get(&(topo.clone(), kernel.clone())).copied() {
+                    None => comfy_table::Cell::new("-"),
+                    Some(true) => {
+                        n_pass += 1;
+                        comfy_table::Cell::new("✓")
+                            .fg(comfy_table::Color::Green)
+                            .add_attribute(comfy_table::Attribute::Bold)
+                    }
+                    Some(false) => {
+                        n_fail += 1;
+                        comfy_table::Cell::new("✗")
+                            .fg(comfy_table::Color::Red)
+                            .add_attribute(comfy_table::Attribute::Bold)
+                    }
+                };
+                line.push(cell);
+            }
+            table.add_row(line);
         }
+        out.push_str(&format!("\n{sched}: {n_pass} ✅  {n_fail} ❌\n{table}\n"));
     }
     Some(out)
 }
@@ -1485,6 +1548,14 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
 /// separately on purpose (they are run separately). Returns `None` when no
 /// record carries any per-program stats (the caller prints nothing).
 ///
+/// A kernel that ran a scheduler but produced NO stats at all — e.g.
+/// every cell on it died during BPF load, so no program existed to
+/// introspect — still gets a row (all cells `-`) as long as the
+/// scheduler has at least one program column from some OTHER kernel.
+/// Without it the stats-less kernel would silently vanish from the
+/// table, hiding that it ran and failed to load; the explicit all-`-`
+/// row makes that absence visible.
+///
 /// Schedulers, kernels, and programs are BTree-sorted so the same run
 /// renders the same output (shell-pipeline stable). The range drops which
 /// topology produced which count; a per-topology breakdown is a separate
@@ -1499,7 +1570,16 @@ pub fn render_instruction_count_tables(records: &[VerifierCellRecord]) -> Option
     let mut by_sched: VerifiedInsnSpans = BTreeMap::new();
     // scheduler -> the union of program names it reported (the columns).
     let mut sched_progs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // scheduler -> every kernel that has a record for it, whether or not
+    // it contributed stats. A kernel present here but absent from
+    // `by_sched[sched]` ran the scheduler yet produced no program stats,
+    // so it becomes an all-`-` row rather than vanishing.
+    let mut sched_all_kernels: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for r in records {
+        sched_all_kernels
+            .entry(r.scheduler.clone())
+            .or_default()
+            .insert(r.kernel.clone());
         for s in &r.stats {
             let span = by_sched
                 .entry(r.scheduler.clone())
@@ -1532,10 +1612,14 @@ pub fn render_instruction_count_tables(records: &[VerifierCellRecord]) -> Option
             header.push(p.clone());
         }
         table.set_header(header);
-        for (kernel, prog_map) in kernels {
+        // Iterate over EVERY kernel that ran this scheduler, not only the
+        // ones that produced stats, so a load-failure kernel surfaces as
+        // an all-`-` row instead of vanishing.
+        for kernel in &sched_all_kernels[sched] {
             let mut line: Vec<String> = vec![kernel.clone()];
+            let prog_map = kernels.get(kernel);
             for p in progs {
-                let text = match prog_map.get(p) {
+                let text = match prog_map.and_then(|m| m.get(p)) {
                     Some((lo, hi)) if lo == hi => lo.to_string(),
                     Some((lo, hi)) => format!("{lo}..{hi}"),
                     None => "-".to_string(),
@@ -1604,146 +1688,152 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The summary grid aggregates across kernels per (topology,
-    /// scheduler): all-pass -> ✅, all-fail -> ❌, with a ✅/❌/❎ tally.
-    /// Failing (scheduler, kernel, topology) combinations are listed after
-    /// the grid; an empty record set renders nothing.
+    /// Per-scheduler PASS/FAIL grids: one section per declared scheduler
+    /// (rows = topology, cols = kernel), each a tally line plus a bordered
+    /// grid whose cells are single-width ✓/✗ glyphs (emoji only on the
+    /// tally line). Covers a multi-scheduler / multi-kernel run, a `-`
+    /// cell (no record for the triple), the defensive duplicate-record
+    /// case (a pass AND a fail for one triple -> ✗, any failure means
+    /// failure), and the box-drawing borders of the bordered table. An
+    /// empty record set renders nothing.
+    ///
+    /// Cell assertions use `contains` on the glyph/word so they hold
+    /// whether or not ANSI escapes are present — the color policy styles
+    /// cells on a TTY and under `GITHUB_ACTIONS`/`FORCE_COLOR`, so this
+    /// test must not assert the ABSENCE of escapes (it runs under GHA in
+    /// CI). Tally lines are built with plain `format!` (never styled), so
+    /// exact-match assertions on them are safe everywhere.
     #[test]
-    fn render_result_table_matrix_tally_and_empty() {
+    fn render_result_table_per_scheduler_grids_tally_and_borders() {
         let recs = vec![
+            // scx_a across two kernels and two topologies; the
+            // (large-4llc, kernel_6_15) cell has no record -> `-`.
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_14".into(),
                 topology: "tiny-1llc".into(),
                 passed: true,
+                stats: vec![],
+            },
+            VerifierCellRecord {
+                scheduler: "scx_a".into(),
+                kernel: "kernel_6_15".into(),
+                topology: "tiny-1llc".into(),
+                passed: false,
                 stats: vec![],
             },
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_14".into(),
                 topology: "large-4llc".into(),
+                passed: true,
+                stats: vec![],
+            },
+            // scx_b: a duplicate (scheduler, kernel, topology) triple with
+            // one pass AND one fail -> ✗ (any failure means failure).
+            VerifierCellRecord {
+                scheduler: "scx_b".into(),
+                kernel: "kernel_6_14".into(),
+                topology: "tiny-1llc".into(),
+                passed: true,
+                stats: vec![],
+            },
+            VerifierCellRecord {
+                scheduler: "scx_b".into(),
+                kernel: "kernel_6_14".into(),
+                topology: "tiny-1llc".into(),
                 passed: false,
                 stats: vec![],
             },
         ];
         let out = render_result_table(&recs).expect("non-empty records -> Some");
         assert!(
-            out.contains("verifier summary: 1 ✅  1 ❌  0 ❎"),
-            "tally: {out}"
+            out.contains("verifier results (per scheduler; rows: topology, cols: kernel):"),
+            "per-scheduler header: {out}"
         );
-        // Columns are scheduler-only (kernels fold into the cell), so no
-        // `scheduler @ kernel` labeling appears.
+        // The grid uses the bordered (UTF8_FULL) table, so box-drawing
+        // characters must appear — distinct from every other verifier
+        // table, which stays borderless.
         assert!(
-            out.contains("scx_a") && !out.contains(" @ "),
-            "columns: {out}"
+            ['│', '─', '┼', '├', '┤', '┬', '┴']
+                .iter()
+                .any(|c| out.contains(*c)),
+            "bordered grid must carry box-drawing chars: {out}"
         );
-        // The emoji must render in the GRID CELLS, not merely the tally
-        // line: locate each topology's row and assert its cell glyph
-        // (neither topology name appears on the `verifier summary:` line).
-        let pass_row = out
+        // Split into the two scheduler sections at scx_b's tally.
+        let (a_sec, b_sec) = out.split_once("scx_b:").expect("scx_b section present");
+        // scx_a tally: 2 ✅ + 1 ❌ (emoji live ONLY on the tally line).
+        let a_tally = a_sec
             .lines()
-            .find(|l| l.contains("tiny-1llc"))
-            .expect("tiny-1llc row present");
-        assert!(
-            pass_row.contains('✅'),
-            "all-pass cell renders ✅ in the grid row: {pass_row}"
+            .find(|l| l.trim_start().starts_with("scx_a:"))
+            .expect("scx_a tally line");
+        assert_eq!(
+            a_tally.trim(),
+            "scx_a: 2 ✅  1 ❌",
+            "scx_a tally counts grid cells: {a_tally}"
         );
-        let fail_row = out
+        // Kernel is a grid axis (a column per kernel), not folded away.
+        assert!(
+            a_sec.contains("kernel_6_14") && a_sec.contains("kernel_6_15"),
+            "scx_a kernel columns present: {a_sec}"
+        );
+        // The (large-4llc, kernel_6_15) triple has no record -> `-`,
+        // alongside the (large-4llc, kernel_6_14) ✓. The space-padded
+        // " - " match avoids the hyphens inside topology names.
+        let a_large = a_sec
             .lines()
             .find(|l| l.contains("large-4llc"))
-            .expect("large-4llc row present");
+            .expect("scx_a large-4llc row");
         assert!(
-            fail_row.contains('❌'),
-            "all-fail cell renders ❌ in the grid row: {fail_row}"
+            a_large.contains('✓') && a_large.contains(" - "),
+            "missing-record cell renders `-`: {a_large}"
         );
-        // The single failure is listed after the grid.
-        assert!(
-            out.contains("failing combinations (scheduler / kernel / topology):")
-                && out.contains("scx_a / kernel_6_14 / large-4llc"),
-            "failing combinations listed: {out}"
-        );
-        assert!(render_result_table(&[]).is_none(), "empty -> None");
-    }
-
-    /// A (topology, scheduler) where one kernel passes and another fails
-    /// renders ❎ (mixed); an all-pass (topology, scheduler) across kernels
-    /// renders ✅. Only the failing kernel appears in the failing list.
-    #[test]
-    fn render_result_table_mixed_kernels_squared_x() {
-        let recs = vec![
-            // tiny-1llc / scx_a: 6_14 passes, 6_15 fails -> mixed -> ❎.
-            VerifierCellRecord {
-                scheduler: "scx_a".into(),
-                kernel: "kernel_6_14".into(),
-                topology: "tiny-1llc".into(),
-                passed: true,
-                stats: vec![],
-            },
-            VerifierCellRecord {
-                scheduler: "scx_a".into(),
-                kernel: "kernel_6_15".into(),
-                topology: "tiny-1llc".into(),
-                passed: false,
-                stats: vec![],
-            },
-            // smt-2llc / scx_a: both kernels pass -> ✅.
-            VerifierCellRecord {
-                scheduler: "scx_a".into(),
-                kernel: "kernel_6_14".into(),
-                topology: "smt-2llc".into(),
-                passed: true,
-                stats: vec![],
-            },
-            VerifierCellRecord {
-                scheduler: "scx_a".into(),
-                kernel: "kernel_6_15".into(),
-                topology: "smt-2llc".into(),
-                passed: true,
-                stats: vec![],
-            },
-        ];
-        let out = render_result_table(&recs).expect("Some");
-        assert!(
-            out.contains("verifier summary: 1 ✅  0 ❌  1 ❎"),
-            "tally counts one all-pass + one mixed cell: {out}"
-        );
-        let mixed_row = out
+        // tiny-1llc row: kernel_6_14 ✓, kernel_6_15 ✗ — the failing
+        // kernel is named by its own column, no separate failing list.
+        let a_tiny = a_sec
             .lines()
             .find(|l| l.contains("tiny-1llc"))
-            .expect("tiny-1llc row present");
+            .expect("scx_a tiny-1llc row");
         assert!(
-            mixed_row.contains('❎'),
-            "mixed (some pass, some fail) cell renders ❎: {mixed_row}"
+            a_tiny.contains('✓') && a_tiny.contains('✗'),
+            "tiny-1llc row shows the pass and the fail per kernel: {a_tiny}"
         );
-        let pass_row = out
+        // scx_b: the duplicate pass+fail triple is ONE cell, counted as a
+        // fail — any failure means failure, no partial state.
+        assert!(
+            b_sec.starts_with(" 0 ✅  1 ❌"),
+            "duplicate pass+fail triple tallies as one fail: {b_sec}"
+        );
+        let b_tiny = b_sec
             .lines()
-            .find(|l| l.contains("smt-2llc"))
-            .expect("smt-2llc row present");
+            .find(|l| l.contains("tiny-1llc"))
+            .expect("scx_b tiny-1llc row");
         assert!(
-            pass_row.contains('✅'),
-            "all-kernels-pass cell renders ✅: {pass_row}"
+            b_tiny.contains('✗') && !b_tiny.contains('✓'),
+            "a pass+fail duplicate-record cell renders ✗: {b_tiny}"
         );
-        // Only the failing kernel is listed after the grid.
+        // Emoji stay OFF the grid rows (they drift box-drawing columns in
+        // GitHub's log viewer); the retired glyphs and flat list are gone.
+        for row in out.lines().filter(|l| l.contains('│')) {
+            assert!(
+                !row.contains('✅') && !row.contains('❌'),
+                "grid rows carry ✓/✗ glyphs, not emoji: {row}"
+            );
+        }
         assert!(
-            out.contains("scx_a / kernel_6_15 / tiny-1llc"),
-            "the failing kernel is listed: {out}"
+            !out.contains('❎') && !out.contains('🟡') && !out.contains("failing combinations"),
+            "retired ❎ / 🟡 / failing-combinations list must not appear: {out}"
         );
-        assert!(
-            !out.contains("kernel_6_14 / tiny-1llc"),
-            "the passing kernel on the mixed topology is not listed: {out}"
-        );
-        assert!(
-            !out.contains("/ smt-2llc"),
-            "the all-pass topology contributes no failing combination: {out}"
-        );
+        assert!(render_result_table(&[]).is_none(), "empty -> None");
     }
 
     /// Per-scheduler verified_insns tables: one section per declared
     /// scheduler; within it rows = kernel version, columns = BPF program,
     /// each cell that program's verified_insns across the topologies that
     /// ran it — a single number when topology-invariant, `lo..hi` when it
-    /// varies. A (kernel, program) that reported no stats shows `-`; an
-    /// empty record set renders nothing.
+    /// varies. A (kernel, program) that reported no stats shows `-`; a
+    /// kernel that ran a scheduler but produced NO stats at all still gets
+    /// an all-`-` row; an empty record set renders nothing.
     #[test]
     fn instruction_count_tables_per_scheduler_kernel_program_range() {
         let recs = vec![
@@ -1815,6 +1905,16 @@ mod tests {
                     verified_insns: 200,
                 }],
             },
+            // scx_a / kernel_6_16: a record but NO stats — every cell died
+            // during BPF load, so no program existed to introspect. It must
+            // still surface as an all-`-` row, not vanish from the table.
+            VerifierCellRecord {
+                scheduler: "scx_a".into(),
+                kernel: "kernel_6_16".into(),
+                topology: "tiny".into(),
+                passed: false,
+                stats: vec![],
+            },
         ];
         let out = render_instruction_count_tables(&recs).expect("stats present -> Some");
         // One section per declared scheduler.
@@ -1850,6 +1950,17 @@ mod tests {
             out.contains('-'),
             "a (kernel, program) with no stats renders '-': {out}"
         );
+        // kernel_6_16 ran scx_a but produced NO stats -> an all-`-` row
+        // (one `-` per program column, kept visible rather than dropped).
+        let k616_row = out
+            .lines()
+            .find(|l| l.contains("kernel_6_16"))
+            .expect("stats-less kernel row present");
+        assert_eq!(
+            k616_row.matches('-').count(),
+            2,
+            "stats-less kernel row is all `-` across both program columns: {k616_row}"
+        );
         // Topology is NOT a table axis (folded into the range), so no
         // topology label appears in the output.
         assert!(
@@ -1871,21 +1982,35 @@ mod tests {
         );
     }
 
-    /// classify_run_outcome: a build/exec failure surfaces nextest's exit;
-    /// a successful-but-empty run is diagnosed by the dispatcher (friendly
-    /// no-such-scheduler message when --scheduler was set, no-cells-ran
-    /// message otherwise); a successful run with records is Ok.
+    /// classify_run_outcome maps nextest's exit + the records into a
+    /// [`RunOutcome`]: a successful run with records is `Success`; a
+    /// successful-but-empty run is a diagnosed `Failed` (friendly
+    /// no-such-scheduler when --scheduler was set, no-cells-ran otherwise);
+    /// a nonzero exit whose failed cell the grid ALREADY shows is a
+    /// message-less `SilentExit` carrying nextest's code, while a nonzero
+    /// exit with NO failed cell (build/internal failure) or a signal exit
+    /// stays a descriptive `Failed`.
     #[test]
     fn classify_run_outcome_cases() {
-        // Records present + success -> Ok regardless of --scheduler.
-        assert!(classify_run_outcome(true, false, None, Some(0)).is_ok());
-        assert!(classify_run_outcome(true, false, Some("ktstr_sched"), Some(0)).is_ok());
+        use RunOutcome::{Failed, SilentExit, Success};
+
+        // Records present + success -> Success regardless of --scheduler.
+        assert_eq!(
+            classify_run_outcome(true, false, false, None, Some(0)),
+            Success
+        );
+        assert_eq!(
+            classify_run_outcome(true, false, false, Some("ktstr_sched"), Some(0)),
+            Success
+        );
 
         // Success + empty + --scheduler -> friendly "no such scheduler".
         // Reachable ONLY because --no-tests=pass turns a 0-cell match into
         // exit 0; under the old `auto` default a 0-match exited 4 -> the
         // failure arm, leaving this message dead.
-        let e = classify_run_outcome(true, true, Some("nope"), Some(0)).unwrap_err();
+        let Failed(e) = classify_run_outcome(true, true, false, Some("nope"), Some(0)) else {
+            panic!("expected Failed");
+        };
         assert!(
             e.contains("--scheduler \"nope\"") && e.contains("matched no verifier cell"),
             "scheduler-empty diagnostic: {e}"
@@ -1893,22 +2018,35 @@ mod tests {
 
         // Success + empty + no --scheduler -> "no cells ran" diagnosis
         // (must NOT silently succeed under --no-tests=pass).
-        let e = classify_run_outcome(true, true, None, Some(0)).unwrap_err();
+        let Failed(e) = classify_run_outcome(true, true, false, None, Some(0)) else {
+            panic!("expected Failed");
+        };
         assert!(
             e.contains("no verifier cells ran") && e.contains("declare_scheduler!"),
             "no-cells diagnostic: {e}"
         );
 
-        // Failure surfaces nextest's exit code; a signal (no code) renders
-        // as "signal".
+        // Nonzero exit WITH a failed cell + numeric code -> SilentExit: the
+        // printed grid already shows the ✗, so carry nextest's code out
+        // without a redundant stderr line that would interleave mid-report.
         assert_eq!(
-            classify_run_outcome(false, true, None, Some(4)).unwrap_err(),
-            "cargo nextest run exited with 4"
+            classify_run_outcome(false, false, true, None, Some(100)),
+            SilentExit(100)
         );
-        assert_eq!(
-            classify_run_outcome(false, false, Some("x"), None).unwrap_err(),
-            "cargo nextest run exited with signal"
-        );
+
+        // Nonzero exit with NO failed cell (build/internal failure) keeps
+        // the descriptive message — nothing in the grid to point at.
+        let Failed(e) = classify_run_outcome(false, true, false, None, Some(101)) else {
+            panic!("expected Failed");
+        };
+        assert_eq!(e, "cargo nextest run exited with 101");
+
+        // A signal exit (no numeric code) keeps the message EVEN with a
+        // failed cell present — there is no code to carry out silently.
+        let Failed(e) = classify_run_outcome(false, false, true, None, None) else {
+            panic!("expected Failed");
+        };
+        assert_eq!(e, "cargo nextest run exited with signal");
     }
 
     /// build_nextest_args carries the flags that make the friendly

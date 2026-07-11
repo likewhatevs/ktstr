@@ -120,12 +120,46 @@ scx_p2dq:
  kernel        p2dq_dequeue  p2dq_dispatch  p2dq_enqueue  p2dq_exit  p2dq_exit_task  p2dq_init  p2dq_init_task  p2dq_running  p2dq_select_cpu  ...
  kernel_local  5             1159..2130     2026..5118    25         419             2121       27601           609           801..887         ...
 
-verifier summary: 8 ✅  <span class="t-red">4 ❌</span>  0 ❎
- topology   scx_bpfland  scx_lavd  scx_p2dq
- odd-3llc   ✅           <span class="t-red">❌</span>        ✅
- smt-2llc   ✅           <span class="t-red">❌</span>        ✅
- tiny-1llc  ✅           <span class="t-red">❌</span>        ✅
- tiny-2llc  ✅           <span class="t-red">❌</span>        ✅</pre></div>
+verifier results (per scheduler; rows: topology, cols: kernel):
+
+scx_bpfland: 4 ✅  0 ❌
+┌───────────┬──────────────┐
+│ topology  │ kernel_local │
+╞═══════════╪══════════════╡
+│ odd-3llc  │ <span class="t-grn">✓</span>            │
+├───────────┼──────────────┤
+│ smt-2llc  │ <span class="t-grn">✓</span>            │
+├───────────┼──────────────┤
+│ tiny-1llc │ <span class="t-grn">✓</span>            │
+├───────────┼──────────────┤
+│ tiny-2llc │ <span class="t-grn">✓</span>            │
+└───────────┴──────────────┘
+
+scx_lavd: 0 ✅  <span class="t-red">4 ❌</span>
+┌───────────┬──────────────┐
+│ topology  │ kernel_local │
+╞═══════════╪══════════════╡
+│ odd-3llc  │ <span class="t-red">✗</span>            │
+├───────────┼──────────────┤
+│ smt-2llc  │ <span class="t-red">✗</span>            │
+├───────────┼──────────────┤
+│ tiny-1llc │ <span class="t-red">✗</span>            │
+├───────────┼──────────────┤
+│ tiny-2llc │ <span class="t-red">✗</span>            │
+└───────────┴──────────────┘
+
+scx_p2dq: 4 ✅  0 ❌
+┌───────────┬──────────────┐
+│ topology  │ kernel_local │
+╞═══════════╪══════════════╡
+│ odd-3llc  │ <span class="t-grn">✓</span>            │
+├───────────┼──────────────┤
+│ smt-2llc  │ <span class="t-grn">✓</span>            │
+├───────────┼──────────────┤
+│ tiny-1llc │ <span class="t-grn">✓</span>            │
+├───────────┼──────────────┤
+│ tiny-2llc │ <span class="t-grn">✓</span>            │
+└───────────┴──────────────┘</pre></div>
 
 That sweep is real: on this development kernel `scx_bpfland` and
 `scx_p2dq` verify, attach, and dispatch on all four topologies, while
