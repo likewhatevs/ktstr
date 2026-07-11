@@ -1220,8 +1220,8 @@ pub struct VerifierCellRecord {
     /// captured for this cell, copied from the VM run's
     /// [`VerifierVmResult::stats`]. Empty when the cell failed before
     /// producing stats. Drives the per-scheduler `verified_insns` tables
-    /// ([`render_instruction_count_tables`], rows = kernel, cols = BPF
-    /// program, cell = the count summarized across topologies) that the
+    /// ([`render_instruction_count_tables`], rows = BPF program, cols =
+    /// kernel, cell = the count summarized across topologies) that the
     /// dispatcher prints before the PASS/FAIL grids.
     pub stats: Vec<ProgStats>,
 }
@@ -1531,7 +1531,7 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
 }
 
 /// Render one `verified_insns` table per declared scheduler. Within each
-/// scheduler's section: rows = kernel version, columns = BPF program, and
+/// scheduler's section: rows = BPF program, columns = kernel version, and
 /// each cell is that program's `verified_insns` for the (scheduler,
 /// kernel) summarized ACROSS the topologies that ran it — a single number
 /// when topology-invariant, `lo..hi` when it varies (`-` when that program
@@ -1543,18 +1543,23 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
 /// `.rodata`, e.g. `nr_cpus`, processes a different count per topology).
 /// So topology is folded into the cell as a range rather than shown as its
 /// own (usually all-identical) axis; the axes it genuinely varies on — BPF
-/// program (x) and kernel version (y) — are the table axes, sectioned per
-/// declared scheduler. Identical-binary declarations are sectioned
+/// program (y) and kernel version (x) — are the table axes, sectioned per
+/// declared scheduler. Program is the ROW axis because a scheduler declares
+/// many programs (scx_lavd has ~26) and the count is unbounded, so rows
+/// scale down the page without wrapping; kernel is the COLUMN axis because
+/// a sweep runs only a handful of kernels, so the columns stay narrow
+/// enough to read in a CI log. Identical-binary declarations are sectioned
 /// separately on purpose (they are run separately). Returns `None` when no
 /// record carries any per-program stats (the caller prints nothing).
 ///
 /// A kernel that ran a scheduler but produced NO stats at all — e.g.
 /// every cell on it died during BPF load, so no program existed to
-/// introspect — still gets a row (all cells `-`) as long as the
-/// scheduler has at least one program column from some OTHER kernel.
+/// introspect — still gets a column (all cells `-`) as long as the
+/// scheduler has at least one program row from some OTHER kernel.
 /// Without it the stats-less kernel would silently vanish from the
 /// table, hiding that it ran and failed to load; the explicit all-`-`
-/// row makes that absence visible.
+/// column makes that absence visible. Kernel columns therefore come from
+/// every kernel that ran the scheduler, not only those that produced stats.
 ///
 /// Schedulers, kernels, and programs are BTree-sorted so the same run
 /// renders the same output (shell-pipeline stable). The range drops which
@@ -1573,7 +1578,7 @@ pub fn render_instruction_count_tables(records: &[VerifierCellRecord]) -> Option
     // scheduler -> every kernel that has a record for it, whether or not
     // it contributed stats. A kernel present here but absent from
     // `by_sched[sched]` ran the scheduler yet produced no program stats,
-    // so it becomes an all-`-` row rather than vanishing.
+    // so it becomes an all-`-` column rather than vanishing.
     let mut sched_all_kernels: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for r in records {
         sched_all_kernels
@@ -1601,25 +1606,25 @@ pub fn render_instruction_count_tables(records: &[VerifierCellRecord]) -> Option
     }
 
     let mut out = String::from(
-        "\nverifier verified_insns (per scheduler; rows: kernel, cols: BPF program, \
+        "\nverifier verified_insns (per scheduler; rows: BPF program, cols: kernel, \
          cell: range across topologies):\n",
     );
     for (sched, kernels) in &by_sched {
         let progs = &sched_progs[sched];
-        let mut table = crate::cli::new_table();
-        let mut header: Vec<String> = vec!["kernel".to_string()];
-        for p in progs {
-            header.push(p.clone());
+        // EVERY kernel that ran this scheduler, not only the ones that
+        // produced stats, so a load-failure kernel surfaces as an all-`-`
+        // column instead of vanishing.
+        let all_kernels = &sched_all_kernels[sched];
+        let mut table = crate::cli::new_bordered_table();
+        let mut header: Vec<String> = vec!["program".to_string()];
+        for kernel in all_kernels {
+            header.push(kernel.clone());
         }
         table.set_header(header);
-        // Iterate over EVERY kernel that ran this scheduler, not only the
-        // ones that produced stats, so a load-failure kernel surfaces as
-        // an all-`-` row instead of vanishing.
-        for kernel in &sched_all_kernels[sched] {
-            let mut line: Vec<String> = vec![kernel.clone()];
-            let prog_map = kernels.get(kernel);
-            for p in progs {
-                let text = match prog_map.and_then(|m| m.get(p)) {
+        for p in progs {
+            let mut line: Vec<String> = vec![p.clone()];
+            for kernel in all_kernels {
+                let text = match kernels.get(kernel).and_then(|m| m.get(p)) {
                     Some((lo, hi)) if lo == hi => lo.to_string(),
                     Some((lo, hi)) => format!("{lo}..{hi}"),
                     None => "-".to_string(),
@@ -1828,12 +1833,12 @@ mod tests {
     }
 
     /// Per-scheduler verified_insns tables: one section per declared
-    /// scheduler; within it rows = kernel version, columns = BPF program,
+    /// scheduler; within it rows = BPF program, columns = kernel version,
     /// each cell that program's verified_insns across the topologies that
     /// ran it — a single number when topology-invariant, `lo..hi` when it
     /// varies. A (kernel, program) that reported no stats shows `-`; a
     /// kernel that ran a scheduler but produced NO stats at all still gets
-    /// an all-`-` row; an empty record set renders nothing.
+    /// an all-`-` column; an empty record set renders nothing.
     #[test]
     fn instruction_count_tables_per_scheduler_kernel_program_range() {
         let recs = vec![
@@ -1873,7 +1878,7 @@ mod tests {
             },
             // scx_a / kernel_6_15: ktstr_dispatch DIFFERS across topologies
             // -> `lo..hi` range; ktstr_enqueue is absent on this kernel
-            // -> `-` in that column's kernel_6_15 row.
+            // -> `-` in the ktstr_enqueue row's kernel_6_15 column.
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_15".into(),
@@ -1907,7 +1912,7 @@ mod tests {
             },
             // scx_a / kernel_6_16: a record but NO stats — every cell died
             // during BPF load, so no program existed to introspect. It must
-            // still surface as an all-`-` row, not vanish from the table.
+            // still surface as an all-`-` column, not vanish from the table.
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_16".into(),
@@ -1922,14 +1927,14 @@ mod tests {
             out.contains("scx_a:") && out.contains("scx_b:"),
             "one section per declared scheduler: {out}"
         );
-        // Columns = BPF programs; rows = kernel version.
+        // Rows = BPF programs; columns = kernel version.
         assert!(
             out.contains("ktstr_dispatch") && out.contains("ktstr_enqueue"),
-            "BPF-program columns: {out}"
+            "BPF-program rows: {out}"
         );
         assert!(
             out.contains("kernel_6_14") && out.contains("kernel_6_15"),
-            "kernel-version rows: {out}"
+            "kernel-version columns: {out}"
         );
         // Topology folded into the cell as a range: flat -> "128",
         // varies across topologies -> "130..150".
@@ -1950,16 +1955,28 @@ mod tests {
             out.contains('-'),
             "a (kernel, program) with no stats renders '-': {out}"
         );
-        // kernel_6_16 ran scx_a but produced NO stats -> an all-`-` row
-        // (one `-` per program column, kept visible rather than dropped).
-        let k616_row = out
+        // kernel_6_16 ran scx_a but produced NO stats -> it stays as a
+        // column (named in the header) rather than vanishing. Its all-`-`
+        // column shows up as a `-` in every program row: the ktstr_enqueue
+        // row is absent on both kernel_6_15 and kernel_6_16, so it carries
+        // exactly two `-` cells (the box-drawing borders use `─`/`│`, not
+        // ASCII `-`, so they do not count).
+        let header = out
             .lines()
-            .find(|l| l.contains("kernel_6_16"))
-            .expect("stats-less kernel row present");
+            .find(|l| l.contains("program") && l.contains("kernel_6_16"))
+            .expect("stats-less kernel kept as a column in the header");
+        assert!(
+            header.contains("kernel_6_14") && header.contains("kernel_6_15"),
+            "every kernel that ran is a column: {header}"
+        );
+        let enqueue_row = out
+            .lines()
+            .find(|l| l.contains("ktstr_enqueue"))
+            .expect("ktstr_enqueue row present");
         assert_eq!(
-            k616_row.matches('-').count(),
+            enqueue_row.matches('-').count(),
             2,
-            "stats-less kernel row is all `-` across both program columns: {k616_row}"
+            "ktstr_enqueue is absent on kernel_6_15 and kernel_6_16: {enqueue_row}"
         );
         // Topology is NOT a table axis (folded into the range), so no
         // topology label appears in the output.
