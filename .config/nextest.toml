@@ -198,14 +198,21 @@ slow-timeout = { period = "10s", terminate-after = 2 }
 filter = "test(boot_kernel) | test(bench_boot)"
 slow-timeout = { period = "180s", terminate-after = 2 }
 
-# Verifier cells: internal 120s VM watchdog, nextest must exceed that.
-# Cell names are slash-delimited (`verifier/<sched>/<kernel>/<preset>`,
-# emitted by the dispatch macro) — the old `test(verifier_)` substring
-# filter silently matched nothing, leaving cells on the profile-base
-# 60s x 2 budget that races the 120s watchdog.
+# Verifier cells: the internal VM watchdog is a 120s lifecycle base
+# plus vCPU/oversubscription-scaled boot headroom plus the extend-only
+# scheduler-attach reset (`verifier_vm_timeout` +
+# `VERIFIER_WORKLOAD_BUDGET` in test_support/runtime.rs) — worst case
+# ~440s for a 128-vCPU preset at the 6x headroom cap. nextest must
+# exceed that so the watchdog verdict, not a nextest kill, decides the
+# cell (240s x 2 = 480s; the ci profile's 180s x 3 = 540s already
+# clears it). Cell names are slash-delimited
+# (`verifier/<sched>/<kernel>/<preset>`, emitted by the dispatch
+# macro) — the old `test(verifier_)` substring filter silently matched
+# nothing, leaving cells on the profile-base 60s x 2 budget that raced
+# the watchdog.
 [[profile.default.overrides]]
 filter = "test(/^verifier\\//)"
-slow-timeout = { period = "180s", terminate-after = 2 }
+slow-timeout = { period = "240s", terminate-after = 2 }
 
 # Demo tests: exploration/failure scenarios, should not retry.
 [[profile.default.overrides]]

@@ -491,7 +491,7 @@ fn acquire_llc_plan_none_cap_reserves_thirty_percent_cpus() {
     // TestTopology only needs to be a valid synthetic().
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
 
-    let plan = acquire_llc_plan(&topo, &test_topo, None)
+    let plan = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate)
         .expect("clean pool must allow SH on every selected LLC");
     // 30% of 10 CPUs = ceil(3.0) = 3 CPUs. 2-CPU LLCs: LLC 0
     // contributes 2, LLC 1 contributes 1 (partial-take), total
@@ -539,7 +539,7 @@ fn acquire_llc_plan_bails_on_exclusive_peer() {
         .expect("peer EX must acquire on clean pool");
 
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
-    let err = acquire_llc_plan(&topo, &test_topo, None)
+    let err = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate)
         .expect_err("EX peer must block SH acquisition of the only LLC");
     let rendered = format!("{err:#}");
     assert!(
@@ -575,7 +575,7 @@ fn acquire_llc_plan_coexists_with_shared_peer() {
         .expect("peer SH must acquire on clean pool");
 
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
-    let plan = acquire_llc_plan(&topo, &test_topo, None)
+    let plan = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate)
         .expect("second SH caller must coexist with the first");
     assert_eq!(
         plan.locks.len(),

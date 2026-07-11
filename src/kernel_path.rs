@@ -270,7 +270,17 @@ impl KernelId {
         // Case-sensitive suffix, checked before the path arm so a
         // package spec with directory separators (`/abs/foo.deb`) or a
         // `.`-prefix (`./foo.rpm`) still classifies as a package.
-        if s.ends_with(".rpm") || s.ends_with(".deb") || s.ends_with(".pkg.tar.zst") {
+        // Classification requires a non-empty file stem before the
+        // extension: a bare `.deb` / `.rpm` / `.pkg.tar.zst` (or a
+        // path ending in such a component) is a HIDDEN-FILE name, not
+        // a package spec — it falls through to the Path arm via its
+        // `.` prefix or `/` content, preserving the dot-prefix → Path
+        // contract the property tests pin.
+        let base = s.rsplit('/').next().unwrap_or(s);
+        if [".rpm", ".deb", ".pkg.tar.zst"]
+            .iter()
+            .any(|ext| base.ends_with(ext) && base.len() > ext.len())
+        {
             return KernelId::Package {
                 path: expand_tilde(s),
             };
@@ -1969,6 +1979,33 @@ mod tests {
             KernelId::Package {
                 path: PathBuf::from("./local.pkg.tar.zst"),
             },
+        );
+    }
+
+    /// A bare extension with no stem is a HIDDEN-FILE name, not a
+    /// package spec: `.deb` / `.rpm` / `.pkg.tar.zst` classify as
+    /// Path via the dot-prefix arm, and a path whose last component
+    /// is such a name classifies as Path via the `/` arm. Regression:
+    /// the suffix check used to run without a stem requirement, so
+    /// proptest's `\.[a-z]{1,10}` generator (which pins dot-prefix →
+    /// Path) failed the moment it drew `.deb`.
+    #[test]
+    fn kernel_id_parse_bare_extension_is_path_not_package() {
+        assert_eq!(
+            KernelId::parse(".deb"),
+            KernelId::Path(PathBuf::from(".deb"))
+        );
+        assert_eq!(
+            KernelId::parse(".rpm"),
+            KernelId::Path(PathBuf::from(".rpm"))
+        );
+        assert_eq!(
+            KernelId::parse(".pkg.tar.zst"),
+            KernelId::Path(PathBuf::from(".pkg.tar.zst")),
+        );
+        assert_eq!(
+            KernelId::parse("/abs/dir/.deb"),
+            KernelId::Path(PathBuf::from("/abs/dir/.deb")),
         );
     }
 

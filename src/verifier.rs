@@ -944,7 +944,17 @@ pub fn collect_verifier_output(
             .run_args(&[crate::test_support::VERIFIER_WORKLOAD_FLAG.to_string()])
             .topology(validated)
             .memory_deferred_min(memory_min_mib)
-            .timeout(std::time::Duration::from_secs(120))
+            // Timeout mirrors the `#[ktstr_test]` path's shape: a flat
+            // lifecycle base plus oversubscription-scaled boot headroom
+            // (`vm_timeout_from_entry`'s split), so a wide cell booting
+            // slowly under CI concurrency is not killed mid-attach.
+            // `workload_duration` arms the watchdog's attach reset: a
+            // slow boot cannot eat the probe/teardown budget (the reset
+            // is extend-only).
+            .timeout(crate::test_support::runtime::verifier_vm_timeout(
+                validated.total_cpus(),
+            ))
+            .workload_duration(crate::test_support::runtime::VERIFIER_WORKLOAD_BUDGET)
             .no_perf_mode(true)
             .build()
             .context("build verifier VM")?;
