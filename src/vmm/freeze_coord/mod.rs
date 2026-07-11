@@ -10724,7 +10724,9 @@ impl KtstrVm {
                 // is set; absent, the load is skipped entirely
                 // (no workload duration → nothing to reset to).
                 let mut reset_deadline: Option<Instant> = None;
-                eprintln!("watchdog: started, timeout={timeout:?}");
+                if crate::vmm::debug_logging_enabled() {
+                    eprintln!("watchdog: started, timeout={timeout:?}");
+                }
 
                 // Wake plumbing. `tick_tfd` is a periodic 100 ms
                 // timerfd that drives the deadline-progress checks
@@ -10789,7 +10791,9 @@ impl KtstrVm {
 
                 loop {
                     if bsp_done_for_wd.load(Ordering::Acquire) {
-                        eprintln!("watchdog: BSP done, returning");
+                        if crate::vmm::debug_logging_enabled() {
+                            eprintln!("watchdog: BSP done, returning");
+                        }
                         return;
                     }
                     // Decode a pending scheduler-attach reset
@@ -10807,11 +10811,13 @@ impl KtstrVm {
                                 || reset_deadline.is_some_and(|prev| candidate > prev)
                             {
                                 reset_deadline = Some(candidate);
-                                eprintln!(
-                                    "watchdog: scheduler attach observed, hard \
-                                     deadline reset to {:?} from VM start",
-                                    candidate.saturating_duration_since(run_start),
-                                );
+                                if crate::vmm::debug_logging_enabled() {
+                                    eprintln!(
+                                        "watchdog: scheduler attach observed, hard \
+                                         deadline reset to {:?} from VM start",
+                                        candidate.saturating_duration_since(run_start),
+                                    );
+                                }
                             }
                         }
                     }
@@ -10826,7 +10832,9 @@ impl KtstrVm {
                         // bsp_ie) may be dropped. Writing to ie after drop
                         // is a use-after-free.
                         if bsp_done_for_wd.load(Ordering::Acquire) {
-                            eprintln!("watchdog: BSP already done, returning");
+                            if crate::vmm::debug_logging_enabled() {
+                                eprintln!("watchdog: BSP already done, returning");
+                            }
                             return;
                         }
                         let hard_timeout_fired = Instant::now() >= effective_deadline;
