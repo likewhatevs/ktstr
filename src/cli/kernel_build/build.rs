@@ -119,8 +119,16 @@ pub(crate) fn acquire_build_reservation(
         None
     } else if let Ok(host_topo) = crate::vmm::host_topology::HostTopology::from_sysfs() {
         let test_topo = crate::topology::TestTopology::from_system()?;
-        let acquired_plan =
-            crate::vmm::host_topology::acquire_llc_plan(&host_topo, &test_topo, cpu_cap)?;
+        // Builds keep Consolidate placement: packing onto already-held
+        // LLCs leaves whole LLCs free for exclusive perf-mode
+        // reservations, and a build is throughput-elastic where a VM's
+        // vCPU threads are not (VMs use Spread — see `PlacementPolicy`).
+        let acquired_plan = crate::vmm::host_topology::acquire_llc_plan(
+            &host_topo,
+            &test_topo,
+            cpu_cap,
+            crate::vmm::host_topology::PlacementPolicy::Consolidate,
+        )?;
         crate::vmm::host_topology::warn_if_cross_node_spill(&acquired_plan, &host_topo);
         Some(acquired_plan)
     } else {

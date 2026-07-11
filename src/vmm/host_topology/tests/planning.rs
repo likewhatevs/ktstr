@@ -277,8 +277,8 @@ fn acquire_llc_plan_rejects_cap_over_allowed_cpus() {
     let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
     let cap = CpuCap::new(3).unwrap();
-    let err =
-        acquire_llc_plan(&topo, &test_topo, Some(cap)).expect_err("cap > allowed_cpus must error");
+    let err = acquire_llc_plan(&topo, &test_topo, Some(cap), PlacementPolicy::Consolidate)
+        .expect_err("cap > allowed_cpus must error");
     assert!(
         err.downcast_ref::<CpuBudgetUnsatisfiable>().is_some(),
         "must be CpuBudgetUnsatisfiable: {err:#}"
@@ -347,6 +347,7 @@ fn plan_from_snapshots_returns_ascending_indices() {
         &topo,
         &allowed,
         |_, _| 10, // everything same-node
+        PlacementPolicy::Consolidate,
     );
     // Step e of plan_from_snapshots is
     // `selected.sort_unstable()` — guarantees ascending llc_idx
@@ -374,9 +375,23 @@ fn plan_from_snapshots_target_ge_all_selects_every_llc() {
         })
         .collect();
     let allowed: std::collections::BTreeSet<usize> = (0..3).collect();
-    let selected = plan_from_snapshots(&snapshots, 3, &topo, &allowed, |_, _| 10);
+    let selected = plan_from_snapshots(
+        &snapshots,
+        3,
+        &topo,
+        &allowed,
+        |_, _| 10,
+        PlacementPolicy::Consolidate,
+    );
     assert_eq!(selected, vec![0, 1, 2]);
-    let selected_over = plan_from_snapshots(&snapshots, 999, &topo, &allowed, |_, _| 10);
+    let selected_over = plan_from_snapshots(
+        &snapshots,
+        999,
+        &topo,
+        &allowed,
+        |_, _| 10,
+        PlacementPolicy::Consolidate,
+    );
     assert_eq!(selected_over, vec![0, 1, 2], "target > len clamps");
 }
 
@@ -394,7 +409,14 @@ fn plan_from_snapshots_target_zero_returns_empty() {
         holder_count: 0,
     }];
     let allowed: std::collections::BTreeSet<usize> = [0].into_iter().collect();
-    let selected = plan_from_snapshots(&snapshots, 0, &topo, &allowed, |_, _| 10);
+    let selected = plan_from_snapshots(
+        &snapshots,
+        0,
+        &topo,
+        &allowed,
+        |_, _| 10,
+        PlacementPolicy::Consolidate,
+    );
     assert!(selected.is_empty());
 }
 
@@ -433,7 +455,14 @@ fn plan_from_snapshots_prefers_higher_holder_count() {
     // Same-node distance closure so placement doesn't bias by
     // NUMA — isolates the consolidation preference signal.
     let allowed: std::collections::BTreeSet<usize> = (0..2).collect();
-    let selected = plan_from_snapshots(&snapshots, 1, &topo, &allowed, |_, _| 10);
+    let selected = plan_from_snapshots(
+        &snapshots,
+        1,
+        &topo,
+        &allowed,
+        |_, _| 10,
+        PlacementPolicy::Consolidate,
+    );
     assert_eq!(
         selected,
         vec![1],
@@ -484,7 +513,14 @@ fn plan_from_snapshots_always_ascending_across_target_range() {
     // ascending-order invariant is agnostic to CPU-count vs
     // LLC-count semantics — the post-step-e sort holds regardless.
     for target_cpus in 1..=snapshots.len() {
-        let selected = plan_from_snapshots(&snapshots, target_cpus, &topo, &allowed, |_, _| 10);
+        let selected = plan_from_snapshots(
+            &snapshots,
+            target_cpus,
+            &topo,
+            &allowed,
+            |_, _| 10,
+            PlacementPolicy::Consolidate,
+        );
         assert_eq!(
             selected.len(),
             target_cpus,
@@ -753,7 +789,7 @@ fn acquire_llc_plan_consolidates_on_peer_held_llc() {
 
     let test_topo = crate::topology::TestTopology::synthetic(2, 1);
     let cap = CpuCap::new(1).expect("cap=1 valid");
-    let plan = acquire_llc_plan(&topo, &test_topo, Some(cap))
+    let plan = acquire_llc_plan(&topo, &test_topo, Some(cap), PlacementPolicy::Consolidate)
         .expect("SH is reentrant — parent SH must coexist with child SH");
 
     // Consolidation picked LLC 1 (the one with a holder) over
@@ -816,8 +852,12 @@ fn acquire_llc_plan_retry_succeeds_on_attempt_one() {
 
     let test_topo = crate::topology::TestTopology::synthetic(2, 1);
     let counter = std::cell::Cell::new(0u32);
-    let plan =
-        acquire_llc_plan_with_acquire_fn(&topo, &test_topo, None, |_selected, _snapshots| {
+    let plan = acquire_llc_plan_with_acquire_fn(
+        &topo,
+        &test_topo,
+        None,
+        PlacementPolicy::Consolidate,
+        |_selected, _snapshots| {
             let n = counter.get();
             counter.set(n + 1);
             if n == 0 {
@@ -830,8 +870,9 @@ fn acquire_llc_plan_retry_succeeds_on_attempt_one() {
                 // contract is exercised elsewhere).
                 Ok(Some(Vec::new()))
             }
-        })
-        .expect("retry on attempt 1 must succeed");
+        },
+    )
+    .expect("retry on attempt 1 must succeed");
     // Attempt 1 produced locks (empty vec is fine — the plan
     // constructor accepts any Vec<OwnedFd>).
     assert_eq!(counter.get(), 2, "acquire_fn called exactly twice");
@@ -860,10 +901,16 @@ fn acquire_llc_plan_retry_exhausted_bails_with_resource_contention() {
     let test_topo = crate::topology::TestTopology::synthetic(1, 1);
 
     let counter = std::cell::Cell::new(0u32);
-    let err = acquire_llc_plan_with_acquire_fn(&topo, &test_topo, None, |_selected, _snapshots| {
-        counter.set(counter.get() + 1);
-        Ok(None)
-    })
+    let err = acquire_llc_plan_with_acquire_fn(
+        &topo,
+        &test_topo,
+        None,
+        PlacementPolicy::Consolidate,
+        |_selected, _snapshots| {
+            counter.set(counter.get() + 1);
+            Ok(None)
+        },
+    )
     .expect_err("every attempt returns None — must bail after retries");
 
     // The retry budget consumes exactly ACQUIRE_MAX_TOCTOU_RETRIES
@@ -912,7 +959,14 @@ fn plan_from_snapshots_consolidation_overrides_fresh_ordering() {
         })
         .collect();
     let allowed: std::collections::BTreeSet<usize> = (0..4).collect();
-    let selected = plan_from_snapshots(&snapshots, 1, &topo, &allowed, |_, _| 10);
+    let selected = plan_from_snapshots(
+        &snapshots,
+        1,
+        &topo,
+        &allowed,
+        |_, _| 10,
+        PlacementPolicy::Consolidate,
+    );
     assert_eq!(
         selected,
         vec![3],
@@ -948,9 +1002,14 @@ fn plan_from_snapshots_single_node_fit_no_spill() {
         .collect();
     // Canonical distance: same-node 10, cross-node 20.
     let allowed: std::collections::BTreeSet<usize> = (0..4).collect();
-    let selected = plan_from_snapshots(&snapshots, 2, &topo, &allowed, |from, to| {
-        if from == to { 10 } else { 20 }
-    });
+    let selected = plan_from_snapshots(
+        &snapshots,
+        2,
+        &topo,
+        &allowed,
+        |from, to| if from == to { 10 } else { 20 },
+        PlacementPolicy::Consolidate,
+    );
     assert_eq!(
         selected,
         vec![0, 1],
@@ -981,7 +1040,14 @@ fn plan_from_snapshots_equal_scores_tiebreak_ascending() {
         })
         .collect();
     let allowed: std::collections::BTreeSet<usize> = (0..4).collect();
-    let selected = plan_from_snapshots(&snapshots, 2, &topo, &allowed, |_, _| 10);
+    let selected = plan_from_snapshots(
+        &snapshots,
+        2,
+        &topo,
+        &allowed,
+        |_, _| 10,
+        PlacementPolicy::Consolidate,
+    );
     assert_eq!(
         selected,
         vec![0, 1],
@@ -1071,7 +1137,7 @@ fn acquire_llc_plan_bails_when_no_llc_overlaps_allowed() {
     let _allowed = AllowedCpusGuard::new(vec![100, 101]);
     let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
-    let err = acquire_llc_plan(&topo, &test_topo, None)
+    let err = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate)
         .expect_err("no LLC overlap must bail, not silently run");
     let msg = format!("{err:#}");
     assert!(
@@ -1116,7 +1182,14 @@ fn plan_from_snapshots_filters_llcs_outside_allowed_set() {
         })
         .collect();
     let allowed: std::collections::BTreeSet<usize> = [0, 1, 4, 5].into_iter().collect();
-    let selected = plan_from_snapshots(&snapshots, 3, &topo, &allowed, |_, _| 10);
+    let selected = plan_from_snapshots(
+        &snapshots,
+        3,
+        &topo,
+        &allowed,
+        |_, _| 10,
+        PlacementPolicy::Consolidate,
+    );
     assert_eq!(
         selected,
         vec![0, 2],
@@ -1141,7 +1214,7 @@ fn acquire_llc_plan_partial_take_last_llc_matches_exact_budget() {
     let topo = HostTopology::new_for_tests(&[(vec![0, 1, 2, 3], 0), (vec![4, 5, 6, 7], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
     let cap = CpuCap::new(5).expect("cap=5 valid");
-    let plan = acquire_llc_plan(&topo, &test_topo, Some(cap))
+    let plan = acquire_llc_plan(&topo, &test_topo, Some(cap), PlacementPolicy::Consolidate)
         .expect("clean pool must allow SH on both LLCs");
 
     assert_eq!(
@@ -1179,7 +1252,14 @@ fn plan_from_snapshots_partial_llc_overlap_counted_correctly() {
         })
         .collect();
     let allowed: std::collections::BTreeSet<usize> = [0, 2].into_iter().collect();
-    let selected = plan_from_snapshots(&snapshots, 2, &topo, &allowed, |_, _| 10);
+    let selected = plan_from_snapshots(
+        &snapshots,
+        2,
+        &topo,
+        &allowed,
+        |_, _| 10,
+        PlacementPolicy::Consolidate,
+    );
     assert_eq!(
         selected,
         vec![0, 1],
@@ -1215,7 +1295,7 @@ fn acquire_llc_plan_cross_node_spill_mems_union() {
     let test_topo = crate::topology::TestTopology::synthetic(4, 2);
     // Each LLC has 1 CPU, so cap=3 CPUs → exactly 3 LLCs.
     let cap = CpuCap::new(3).expect("cap=3 valid");
-    let plan = acquire_llc_plan(&topo, &test_topo, Some(cap))
+    let plan = acquire_llc_plan(&topo, &test_topo, Some(cap), PlacementPolicy::Consolidate)
         .expect("clean pool must allow 3-CPU acquisition");
 
     assert_eq!(
@@ -1302,5 +1382,158 @@ fn acquire_resource_locks_cargo_test_mode_empty_string_inert() {
          standard `Exclusive` path to take exactly one LLC fd, \
          got {}",
         locks.len(),
+    );
+}
+
+// ---------------------------------------------------------------
+// Spread placement — no-perf VM plans fan out instead of stacking
+// ---------------------------------------------------------------
+
+/// Snapshot fixture for the Spread tests: `n` single-CPU LLCs on
+/// node 0 with the given per-LLC holder counts.
+fn spread_snapshots(holder_counts: &[usize]) -> Vec<LlcSnapshot> {
+    holder_counts
+        .iter()
+        .enumerate()
+        .map(|(idx, &holder_count)| LlcSnapshot {
+            llc_idx: idx,
+            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
+            holders: Vec::new(),
+            holder_count,
+        })
+        .collect()
+}
+
+/// Spread inverts the consolidation preference: with peers holding
+/// LLCs 0-1, a Spread plan lands on the FRESH LLCs 2-3 (a
+/// Consolidate plan picks the held ones — pinned by
+/// `plan_from_snapshots_returns_ascending_indices`). This is the
+/// heart of the scx-sweep fix: a VM cell must move AWAY from the
+/// load, not toward it.
+#[test]
+fn plan_from_snapshots_spread_prefers_least_held_llcs() {
+    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
+    let snapshots = spread_snapshots(&[5, 5, 0, 0]);
+    let allowed: std::collections::BTreeSet<usize> = (0..4).collect();
+    let selected = plan_from_snapshots(
+        &snapshots,
+        2,
+        &topo,
+        &allowed,
+        |_, _| 10,
+        PlacementPolicy::Spread { rotation: 0 },
+    );
+    assert_eq!(
+        selected,
+        vec![2, 3],
+        "spread must select the zero-holder LLCs, not the peer-held ones",
+    );
+}
+
+/// The pid-derived rotation breaks the zero-knowledge symmetry:
+/// concurrent planners that all snapshot ZERO holders (plans are
+/// computed at build() while the LOCK_SH set defers to run(), so a
+/// simultaneous fan-out sees no peers) select DIFFERENT LLC windows
+/// instead of all stacking on the LLC-0 prefix. Also pins the
+/// wrap-around (rotation near the end wraps to LLC 0) and the step-e
+/// ascending re-sort under Spread.
+#[test]
+fn plan_from_snapshots_spread_rotation_fans_out_zero_holder_snapshots() {
+    let topo = synth_host_topo(&[
+        (vec![0], 0),
+        (vec![1], 0),
+        (vec![2], 0),
+        (vec![3], 0),
+        (vec![4], 0),
+        (vec![5], 0),
+    ]);
+    let snapshots = spread_snapshots(&[0; 6]);
+    let allowed: std::collections::BTreeSet<usize> = (0..6).collect();
+    let window = |rotation: usize| {
+        plan_from_snapshots(
+            &snapshots,
+            2,
+            &topo,
+            &allowed,
+            |_, _| 10,
+            PlacementPolicy::Spread { rotation },
+        )
+    };
+    assert_eq!(window(0), vec![0, 1], "rotation 0 starts at LLC 0");
+    assert_eq!(window(3), vec![3, 4], "rotation 3 starts at LLC 3");
+    assert_eq!(
+        window(5),
+        vec![0, 5],
+        "rotation 5 wraps (LLC 5 then LLC 0) and step e still \
+         returns ascending acquire order",
+    );
+    assert_eq!(
+        window(9),
+        vec![3, 4],
+        "rotation reduces modulo the eligible count (9 % 6 == 3)",
+    );
+}
+
+/// Rotation positions are computed over the ELIGIBLE list, not raw
+/// llc_idx values: with LLC 1 filtered out by the allowed cpuset,
+/// rotation 1 must start at the second ELIGIBLE LLC (idx 2), and a
+/// full-wrap rotation must cover exactly the eligible set.
+#[test]
+fn plan_from_snapshots_spread_rotation_uses_eligible_positions() {
+    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
+    let snapshots = spread_snapshots(&[0; 4]);
+    // LLC 1's only CPU is outside the allowed set — ineligible.
+    let allowed: std::collections::BTreeSet<usize> = [0usize, 2, 3].into_iter().collect();
+    let selected = plan_from_snapshots(
+        &snapshots,
+        1,
+        &topo,
+        &allowed,
+        |_, _| 10,
+        PlacementPolicy::Spread { rotation: 1 },
+    );
+    assert_eq!(
+        selected,
+        vec![2],
+        "rotation 1 must land on the second eligible LLC (2), \
+         not raw index 1 (ineligible)",
+    );
+}
+
+/// Spread still honours NUMA seeding: the rotated first choice
+/// anchors the seed node and the walk fills that node before
+/// spilling, so a rotated plan is NUMA-coherent rather than a
+/// round-robin scatter.
+#[test]
+fn plan_from_snapshots_spread_rotated_seed_fills_its_node_first() {
+    // Two nodes, two single-CPU LLCs each.
+    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 1), (vec![3], 1)]);
+    let snapshots = spread_snapshots(&[0; 4]);
+    let allowed: std::collections::BTreeSet<usize> = (0..4).collect();
+    let selected = plan_from_snapshots(
+        &snapshots,
+        2,
+        &topo,
+        &allowed,
+        |from, to| if from == to { 10 } else { 20 },
+        PlacementPolicy::Spread { rotation: 2 },
+    );
+    assert_eq!(
+        selected,
+        vec![2, 3],
+        "rotation 2 seeds on LLC 2 (node 1) and fills node 1 \
+         before any spill back to node 0",
+    );
+}
+
+/// `spread_for_process` is stable within a process (pure pid hash):
+/// the same process always plans the same windows, so its own
+/// affinity masks and lock sets stay aligned across build()-time
+/// planning and any diagnostics that re-derive the rotation.
+#[test]
+fn spread_for_process_rotation_is_stable() {
+    assert_eq!(
+        PlacementPolicy::spread_for_process(),
+        PlacementPolicy::spread_for_process(),
     );
 }

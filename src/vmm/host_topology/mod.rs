@@ -936,8 +936,9 @@ pub(crate) fn pid_window_offset(pid: u32, max_start: usize) -> usize {
 // [`acquire_resource_locks`] for its `LOCK_EX` reservation contract.
 //
 // The pipeline has three phases: discover (snapshot holders per
-// LLC, filtered to the process's allowed cpuset), plan (NUMA-aware,
-// consolidation-aware selection), acquire (non-blocking `LOCK_SH`
+// LLC, filtered to the process's allowed cpuset), plan (NUMA-aware
+// selection under the caller's [`PlacementPolicy`] — Consolidate
+// for builds, Spread for no-perf VMs), acquire (non-blocking `LOCK_SH`
 // on each selected LLC). Up to ACQUIRE_MAX_TOCTOU_RETRIES retries
 // absorb the window between the discover snapshot and the
 // non-blocking acquire; between retries the loop sleeps for an
@@ -1128,6 +1129,56 @@ impl CpuCap {
     }
 }
 
+/// Placement policy for the PLAN phase of [`acquire_llc_plan`]:
+/// which LLCs a reservation prefers when more are eligible than the
+/// budget needs.
+///
+/// `Consolidate` packs onto the LLCs already holding peers
+/// (holder_count DESC, llc_idx ASC) so the rest of the host stays
+/// whole for exclusive perf-mode reservations. Right for kernel-build
+/// sandboxes: a build is throughput-elastic and indifferent to
+/// sharing its cache domain with another build.
+///
+/// `Spread` picks the LEAST-held LLCs (holder_count ASC), breaking
+/// ties by the eligible-list position rotated by `rotation`. Right
+/// for no-perf VM vCPU placement, where Consolidate is
+/// pathological: every concurrent VM cell would mask its vCPU
+/// threads onto the same most-held LLCs — and since plans are
+/// computed at `build()` while the `LOCK_SH` set is deferred to
+/// `run()`, a fan-out of simultaneously-planning cells all snapshot
+/// ZERO holders and the llc_idx-ASC tiebreak stacks every one of
+/// them onto the identical LLC-0-upward prefix. Observed in the scx
+/// verifier sweep: a 30-cell matrix on a 16-LLC runner piled every
+/// small and mid-sized cell's mask onto the same low-LLC prefix
+/// (the widest cells' whole-host masks overlapping it) while the
+/// high LLCs ran near-idle — guests starved hard enough that
+/// attached schedulers tripped the guest kernel's sched_ext stall
+/// watchdog and wide-topology boots outran the VM deadline. The
+/// per-process `rotation` (derive it via `pid_window_offset`) is
+/// what breaks that zero-knowledge symmetry; holder_count ASC then
+/// keeps later arrivals off whichever LLCs the earlier ones
+/// actually locked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementPolicy {
+    /// Pack onto already-held LLCs (kernel builds).
+    Consolidate,
+    /// Fan out across least-held LLCs, tie-broken by `rotation`
+    /// (no-perf VM placement). `rotation` is reduced modulo the
+    /// eligible-LLC count internally; any process-stable value works.
+    Spread { rotation: usize },
+}
+
+impl PlacementPolicy {
+    /// `Spread` seeded for this process: rotation from
+    /// `pid_window_offset` over a wide domain so the later
+    /// modulo-by-eligible-count stays uniform for any LLC count.
+    pub fn spread_for_process() -> Self {
+        PlacementPolicy::Spread {
+            rotation: pid_window_offset(std::process::id(), 1 << 16),
+        }
+    }
+}
+
 /// Per-LLC discover snapshot: identity + current holder set.
 /// Constructed by [`discover_llc_snapshots`] before the PLAN phase.
 /// `pub(crate)` so the in-crate PLAN pipeline and this module's tests
@@ -1293,11 +1344,17 @@ fn discover_llc_snapshots(
 /// PLAN phase — NUMA-aware placement over discover snapshots.
 ///
 /// Composite sort driven by three ordered keys:
-///   1. Consolidation — prefer LLCs already holding peers.
+///   1. Placement policy — [`PlacementPolicy::Consolidate`] prefers
+///      LLCs already holding peers (holder_count DESC);
+///      [`PlacementPolicy::Spread`] prefers the least-held LLCs
+///      (holder_count ASC) with a caller-rotated tiebreak.
 ///   2. NUMA locality — after seeding on the highest-scored LLC's
 ///      node, greedily fill the seed node before spilling.
-///   3. LLC index ASC — tiebreak + final ACQUIRE ordering for livelock
-///      safety.
+///   3. LLC index tiebreak — ASC for Consolidate, ASC rotated by the
+///      policy's offset for Spread. The final ACQUIRE ordering is
+///      plain ASC under BOTH policies (step e re-sorts), so every
+///      concurrent acquirer walks lockfiles in one global order and
+///      the livelock-safety argument is policy-independent.
 ///
 /// `target_cpus` is the exact number of allowed CPUs the plan
 /// reserves. The walk selects whole LLCs (filtered to their
@@ -1322,6 +1379,7 @@ fn plan_from_snapshots(
     topo: &HostTopology,
     allowed: &std::collections::BTreeSet<usize>,
     distance_fn: impl Fn(usize, usize) -> u8,
+    policy: PlacementPolicy,
 ) -> Vec<usize> {
     if target_cpus == 0 {
         return Vec::new();
@@ -1354,29 +1412,64 @@ fn plan_from_snapshots(
 
     // Step a: partition + sort. Only LLCs with at least one allowed
     // CPU are eligible — locking an out-of-cpuset LLC is useless.
-    // Consolidation candidates first (holder_count DESC, llc_idx ASC);
-    // fresh candidates after, sorted by llc_idx ASC. A single
-    // composite sort would do the same work but the two-partition
-    // form is easier to read and lets future "prefer consolidation
-    // only if score ≥ threshold" tweaks slot in.
     let eligible = |s: &&LlcSnapshot| -> bool { llc_allowed_cpus(s.llc_idx) > 0 };
-    let mut consolidation: Vec<&LlcSnapshot> = snapshots
-        .iter()
-        .filter(|s| s.holder_count > 0)
-        .filter(eligible)
-        .collect();
-    let mut fresh: Vec<&LlcSnapshot> = snapshots
-        .iter()
-        .filter(|s| s.holder_count == 0)
-        .filter(eligible)
-        .collect();
-    consolidation.sort_by(|a, b| {
-        b.holder_count
-            .cmp(&a.holder_count)
-            .then(a.llc_idx.cmp(&b.llc_idx))
-    });
-    fresh.sort_by_key(|s| s.llc_idx);
-    let ranked: Vec<&LlcSnapshot> = consolidation.into_iter().chain(fresh).collect();
+    let ranked: Vec<&LlcSnapshot> = match policy {
+        // Consolidation candidates first (holder_count DESC, llc_idx
+        // ASC); fresh candidates after, sorted by llc_idx ASC. A
+        // single composite sort would do the same work but the
+        // two-partition form is easier to read and lets future
+        // "prefer consolidation only if score ≥ threshold" tweaks
+        // slot in.
+        PlacementPolicy::Consolidate => {
+            let mut consolidation: Vec<&LlcSnapshot> = snapshots
+                .iter()
+                .filter(|s| s.holder_count > 0)
+                .filter(eligible)
+                .collect();
+            let mut fresh: Vec<&LlcSnapshot> = snapshots
+                .iter()
+                .filter(|s| s.holder_count == 0)
+                .filter(eligible)
+                .collect();
+            consolidation.sort_by(|a, b| {
+                b.holder_count
+                    .cmp(&a.holder_count)
+                    .then(a.llc_idx.cmp(&b.llc_idx))
+            });
+            fresh.sort_by_key(|s| s.llc_idx);
+            consolidation.into_iter().chain(fresh).collect()
+        }
+        // Least-held first, ties broken by rotated eligible position
+        // so simultaneous planners with identical (typically
+        // all-zero) holder snapshots fan out across the host instead
+        // of converging on the same LLC-0-upward prefix. The rotation
+        // is reduced modulo the ELIGIBLE count — rotating over raw
+        // LLC indices would bias toward whichever indices survive the
+        // cpuset filter.
+        PlacementPolicy::Spread { rotation } => {
+            let mut spread: Vec<&LlcSnapshot> = snapshots.iter().filter(eligible).collect();
+            spread.sort_by_key(|s| s.llc_idx);
+            let n = spread.len();
+            if n > 0 {
+                let start = rotation % n;
+                // Rotated position of each eligible snapshot in the
+                // llc_idx-ASC ordering (`start` maps to 0), keyed by
+                // llc_idx. Precomputed: the comparator below cannot
+                // itself search `spread` mid-sort.
+                let rotated_pos: std::collections::HashMap<usize, usize> = spread
+                    .iter()
+                    .enumerate()
+                    .map(|(p, s)| (s.llc_idx, (p + n - start) % n))
+                    .collect();
+                spread.sort_by(|a, b| {
+                    a.holder_count
+                        .cmp(&b.holder_count)
+                        .then(rotated_pos[&a.llc_idx].cmp(&rotated_pos[&b.llc_idx]))
+                });
+            }
+            spread
+        }
+    };
     if ranked.is_empty() {
         // No LLC on this host overlaps the caller's allowed cpuset.
         // Bail upstream handles this as ResourceContention; here we
@@ -1476,7 +1569,11 @@ fn try_acquire_llc_plan_locks(
 /// fallback — so plans are always schedulable under cgroup-restricted
 /// runners (CI hosts, systemd slices, sudo under a limited cpuset).
 ///
-/// Consolidation uses the host distance matrix from [`crate::topology::TestTopology`]
+/// `policy` picks the placement preference among eligible LLCs —
+/// [`PlacementPolicy::Consolidate`] for builds,
+/// [`PlacementPolicy::Spread`] for no-perf VM placement (see the enum
+/// docs for the clustering failure Spread exists to prevent). Both
+/// policies use the host distance matrix from [`crate::topology::TestTopology`]
 /// so spill order matches actual NUMA cost. Hosts whose
 /// `/sys/devices/system/node/*/distance` failed to parse degrade to a
 /// numerically-adjacent ordering via the distance closure (`10` for
@@ -1485,6 +1582,7 @@ pub fn acquire_llc_plan(
     topo: &HostTopology,
     test_topo: &crate::topology::TestTopology,
     cpu_cap: Option<CpuCap>,
+    policy: PlacementPolicy,
 ) -> Result<LlcPlan> {
     if crate::cargo_test_mode::cargo_test_mode_active() {
         // Bare `cargo test` mode: no peer-coordination contract.
@@ -1537,7 +1635,7 @@ pub fn acquire_llc_plan(
             locks: Vec::new(),
         });
     }
-    acquire_llc_plan_with_acquire_fn(topo, test_topo, cpu_cap, try_acquire_llc_plan_locks)
+    acquire_llc_plan_with_acquire_fn(topo, test_topo, cpu_cap, policy, try_acquire_llc_plan_locks)
 }
 
 /// Parameterized form of [`acquire_llc_plan`] that takes the
@@ -1563,6 +1661,7 @@ fn acquire_llc_plan_with_acquire_fn<F>(
     topo: &HostTopology,
     test_topo: &crate::topology::TestTopology,
     cpu_cap: Option<CpuCap>,
+    policy: PlacementPolicy,
     mut acquire_fn: F,
 ) -> Result<LlcPlan>
 where
@@ -1626,9 +1725,14 @@ where
             discover_llc_snapshots(topo, &allowed, &mountinfo).map_err(|e| ResourceContention {
                 reason: format!("discover LLC snapshots: {e}"),
             })?;
-        let selected = plan_from_snapshots(&snapshots, target_cpus, topo, &allowed, |from, to| {
-            test_topo.numa_distance(from, to)
-        });
+        let selected = plan_from_snapshots(
+            &snapshots,
+            target_cpus,
+            topo,
+            &allowed,
+            |from, to| test_topo.numa_distance(from, to),
+            policy,
+        );
         if selected.is_empty() {
             // Every LLC's CPU set lies outside the allowed cpuset —
             // sysfs disagrees with sched_getaffinity. This is a host

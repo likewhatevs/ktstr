@@ -1320,8 +1320,19 @@ impl KtstrVmBuilder {
                 // `plan.locked_llcs` via `acquire_resource_locks`
                 // just before vCPU spawn so the build-to-run
                 // setup window holds no flocks.
-                let mut plan =
-                    host_topology::acquire_llc_plan(&host_topo, &test_topo, effective_cap)?;
+                // Spread placement: concurrent no-perf VMs fan out
+                // across least-held LLCs (pid-rotated tiebreak)
+                // instead of Consolidate-stacking onto the same
+                // LLC-0-upward prefix — the clustering that piled a
+                // 30-cell verifier sweep's affinity masks onto the
+                // low LLCs of a 16-LLC runner. Builds keep
+                // Consolidate (see `PlacementPolicy`).
+                let mut plan = host_topology::acquire_llc_plan(
+                    &host_topo,
+                    &test_topo,
+                    effective_cap,
+                    host_topology::PlacementPolicy::spread_for_process(),
+                )?;
                 host_topology::warn_if_cross_node_spill(&plan, &host_topo);
                 // Strip the flock fds — they release on drop. The
                 // plan's `cpus` / `locked_llcs` / `mems` fields
