@@ -45,6 +45,13 @@ use super::{KtstrVm, disk_config, initramfs};
 ///   by [`topology`](Self::topology))
 /// - `performance_mode` — `false` (operator opts in via
 ///   [`performance_mode`](Self::performance_mode))
+///
+/// `Clone` lets a cell rebuild a fresh VM from the same configuration
+/// across boot attempts — the AP-bring-up-gap boot retry
+/// (`crate::test_support::run_vm_with_ap_gap_retry`) clones before each
+/// `build()` because `build` consumes the builder. The clone is cheap on
+/// a test-mode VM (no busybox / large embedded blobs).
+#[derive(Clone)]
 pub struct KtstrVmBuilder {
     kernel: Option<PathBuf>,
     init_binary: Option<PathBuf>,

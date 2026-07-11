@@ -404,6 +404,129 @@ pub(crate) fn parse_online_cpus(content: &str) -> Option<u32> {
     Some(count)
 }
 
+/// Kernel cpulists are bounded by `CONFIG_NR_CPUS`. Reject any index or
+/// range endpoint wildly larger so a corrupt sysfs read cannot balloon
+/// the materialised id vec in [`parse_cpu_list`] — the parallel to the
+/// `checked_add` overflow guard in [`parse_online_cpus`].
+const CPU_ID_CEILING: u32 = 1 << 16;
+
+/// Parse a cpulist string (kernel `/sys/.../{online,possible}` format)
+/// into the explicit, ascending set of CPU IDs it covers. Same grammar
+/// as [`parse_online_cpus`] (comma-separated single indices or inclusive
+/// `start-end` ranges), but materialises the IDs instead of only
+/// counting them, so callers can diff two lists. Returns `None` on any
+/// unparseable token, inverted range, empty content, or an id/endpoint
+/// at or beyond [`CPU_ID_CEILING`].
+pub(crate) fn parse_cpu_list(content: &str) -> Option<Vec<u32>> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut ids = Vec::new();
+    for range in trimmed.split(',') {
+        if let Some((start, end)) = range.split_once('-') {
+            let s: u32 = start.parse().ok()?;
+            let e: u32 = end.parse().ok()?;
+            if e < s || e >= CPU_ID_CEILING {
+                return None;
+            }
+            ids.extend(s..=e);
+        } else {
+            let id: u32 = range.parse().ok()?;
+            if id >= CPU_ID_CEILING {
+                return None;
+            }
+            ids.push(id);
+        }
+    }
+    Some(ids)
+}
+
+/// Outcome of diffing the kernel's `possible` and `online` cpulists.
+pub(crate) struct OfflineCpus {
+    /// Possible-but-offline CPU IDs, ascending. Empty when every
+    /// possible CPU is online — the healthy case.
+    pub missing: Vec<u32>,
+    /// Total online CPUs.
+    pub online: u32,
+    /// Total possible CPUs.
+    pub possible: u32,
+}
+
+/// Diff a `possible` cpulist against an `online` cpulist, returning the
+/// possible-but-offline CPU IDs (ascending) plus both totals. `None`
+/// when either list is unparseable — the caller degrades to skipping
+/// the check rather than firing on a procfs hiccup.
+pub(crate) fn offline_possible_cpus(possible: &str, online: &str) -> Option<OfflineCpus> {
+    let possible = parse_cpu_list(possible)?;
+    let online: std::collections::BTreeSet<u32> = parse_cpu_list(online)?.into_iter().collect();
+    let missing: Vec<u32> = possible
+        .iter()
+        .copied()
+        .filter(|c| !online.contains(c))
+        .collect();
+    Some(OfflineCpus {
+        missing,
+        online: online.len() as u32,
+        possible: possible.len() as u32,
+    })
+}
+
+/// Verify every *possible* CPU is *online* before the topology is handed
+/// to the scheduler. On oversubscribed hosts an AP can miss its INIT-SIPI
+/// alive-window (the kernel's `cpuhp_wait_for_sync_state` gives it 10 s of
+/// guest WALL-CLOCK, which host stalls burn while the AP thread gets no
+/// cycles) and land present-but-offline; a sched_ext scheduler then aborts
+/// on the resulting CPU-ID gap with a cryptic error ("Holes in CPU IDs
+/// detected") that surfaces as a scheduler failure rather than the infra
+/// fault it is. Detection only — deliberately NO hotplug re-online here:
+/// CPU hotplug is rare on real hardware, and a hotplug-assembled topology
+/// could send scheduler developers chasing virtualization-only artifacts.
+/// The caller's PANIC + reboot instead hands recovery to the host, which
+/// can re-run the whole boot so the scheduler only ever sees a topology
+/// assembled by a clean cold boot.
+///
+/// Returns `Err(message)` naming the missing CPUs and the online/possible
+/// tally. Degrades to `Ok(())` when either sysfs list is missing or
+/// unparseable — the same conservative stance as [`count_online_cpus`]'s
+/// fallback. Every ktstr scenario boots with all vCPUs online (no
+/// maxcpus / nr_cpus / offline path), so a non-empty gap is always a
+/// fault.
+pub(crate) fn all_possible_cpus_online() -> Result<(), String> {
+    let (Ok(possible), Ok(online)) = (
+        fs::read_to_string("/sys/devices/system/cpu/possible"),
+        fs::read_to_string("/sys/devices/system/cpu/online"),
+    ) else {
+        return Ok(());
+    };
+    let Some(report) = offline_possible_cpus(&possible, &online) else {
+        return Ok(());
+    };
+    if report.missing.is_empty() {
+        return Ok(());
+    }
+    Err(format_ap_gap_message(
+        &report.missing,
+        report.online,
+        report.possible,
+    ))
+}
+
+/// Format the AP-bring-up-gap panic message that the caller PANICs with.
+///
+/// Built around [`crate::test_support::AP_BRINGUP_GAP_MARKER`] so the
+/// host's boot-retry detection (`run_vm_with_ap_gap_retry`, which keys on
+/// `crash_message.contains(MARKER)`) stays in lockstep with this format:
+/// a reword here that dropped the marker would silently disable the
+/// retry. Factored out of [`all_possible_cpus_online`] so a unit test can
+/// pin that sync without a sysfs read.
+pub(crate) fn format_ap_gap_message(missing: &[u32], online: u32, possible: u32) -> String {
+    format!(
+        "CPUs {missing:?} {}; {online}/{possible} online)",
+        crate::test_support::AP_BRINGUP_GAP_MARKER,
+    )
+}
+
 /// Print the include-files line for the shell MOTD.
 ///
 /// Scans /include-files/ and lists each entry. Executable files

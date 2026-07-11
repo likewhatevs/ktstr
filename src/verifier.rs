@@ -796,6 +796,14 @@ pub struct VerifierVmResult {
     /// on it too — but NOT on the guest exit code, which is `1` even on
     /// the verifier success path (no `#[ktstr_test]` body to dispatch).
     pub timed_out: bool,
+    /// The guest's structured crash message (a `PANIC:`-prefixed line
+    /// routed through the host's `extract_panic_message` into
+    /// [`crate::vmm::VmResult::crash_message`]), if any. A self-describing
+    /// guest infra fault — most notably the AP-bring-up gap the boot
+    /// retry exhausts — that [`Self::cell_verdict`] surfaces ABOVE the
+    /// attach/dispatch gates, mirroring `test_support::eval`'s
+    /// crash_message priority. `None` on the common no-crash path.
+    pub crash_message: Option<String>,
 }
 
 impl VerifierVmResult {
@@ -816,6 +824,15 @@ impl VerifierVmResult {
         // during teardown.
         if self.timed_out {
             return Err("VM timed out (hung after attach, before exit)".to_string());
+        }
+        // A self-describing guest infra fault outranks the attach/dispatch
+        // gates: the guest PID-1 panicked before the scheduler ran (most
+        // notably the AP-bring-up gap the boot retry could not clear), so
+        // "scheduler did not turn on" would misattribute an infra failure
+        // to the scheduler. Surface the crash verbatim, mirroring
+        // `test_support::eval`'s crash_message priority.
+        if let Some(crash) = &self.crash_message {
+            return Err(crash.clone());
         }
         // PASS requires the scheduler to have turned ON, not just to have
         // loaded + verified its BPF.
@@ -904,29 +921,36 @@ pub fn collect_verifier_output(
     // no wprof, so no wprof floor applies here.
     let memory_min_mib =
         crate::test_support::runtime::cpu_scaled_memory_mib(validated.total_cpus());
-    let vm = crate::vmm::KtstrVm::builder()
-        .kernel(kernel)
-        // Prebuilt distro kernels ship virtio as modules; embed the
-        // ordered boot-module set from the cache entry (no-op for built
-        // kernels, which have no sibling modules/ dir).
-        .kernel_modules(crate::cache::boot_modules_for_image(kernel))
-        .initrd_compression(crate::cache::initrd_compression_for_image(kernel))
-        .init_binary(ktstr_bin)
-        .scheduler_binary(sched_bin)
-        .sched_args(&sched_args)
-        // Boot the guest into the verifier dispatch probe: the sweep VM
-        // has no `#[ktstr_test]` body, so Phase 5 spawns a SpinWait
-        // workload and emits `WorkloadDispatched` on confirmed progress.
-        // The PASS verdict requires that frame in addition to attach.
-        .run_args(&[crate::test_support::VERIFIER_WORKLOAD_FLAG.to_string()])
-        .topology(validated)
-        .memory_deferred_min(memory_min_mib)
-        .timeout(std::time::Duration::from_secs(120))
-        .no_perf_mode(true)
-        .build()
-        .context("build verifier VM")?;
+    // Bounded whole-boot retry on the guest AP-bring-up-gap infra fault
+    // (an AP that missed its INIT-SIPI window → the guest PID-1 panics
+    // pre-test). Rebuild the VM each attempt: `build` consumes the
+    // builder and `run` consumes the boot. Every other failure returns
+    // on the first attempt — the retry keys strictly on the marker.
+    let result = crate::test_support::run_vm_with_ap_gap_retry(|| {
+        let vm = crate::vmm::KtstrVm::builder()
+            .kernel(kernel)
+            // Prebuilt distro kernels ship virtio as modules; embed the
+            // ordered boot-module set from the cache entry (no-op for built
+            // kernels, which have no sibling modules/ dir).
+            .kernel_modules(crate::cache::boot_modules_for_image(kernel))
+            .initrd_compression(crate::cache::initrd_compression_for_image(kernel))
+            .init_binary(ktstr_bin)
+            .scheduler_binary(sched_bin)
+            .sched_args(&sched_args)
+            // Boot the guest into the verifier dispatch probe: the sweep VM
+            // has no `#[ktstr_test]` body, so Phase 5 spawns a SpinWait
+            // workload and emits `WorkloadDispatched` on confirmed progress.
+            // The PASS verdict requires that frame in addition to attach.
+            .run_args(&[crate::test_support::VERIFIER_WORKLOAD_FLAG.to_string()])
+            .topology(validated)
+            .memory_deferred_min(memory_min_mib)
+            .timeout(std::time::Duration::from_secs(120))
+            .no_perf_mode(true)
+            .build()
+            .context("build verifier VM")?;
 
-    let result = vm.run().context("run verifier VM")?;
+        vm.run().context("run verifier VM")
+    })?;
 
     // Concatenate bulk-port `MSG_TYPE_SCHED_LOG` chunks, then run
     // the marker-pair extractor on the merged stream — the
@@ -974,6 +998,7 @@ pub fn collect_verifier_output(
         attach,
         dispatched,
         timed_out: result.timed_out,
+        crash_message: result.crash_message.clone(),
     })
 }
 
@@ -2315,6 +2340,7 @@ mod tests {
             attach,
             dispatched,
             timed_out,
+            crash_message: None,
         };
 
         // Verified + attached + dispatched, no hang -> PASS.
@@ -2357,6 +2383,25 @@ mod tests {
         assert!(
             both.as_ref().unwrap_err().contains("did not turn on"),
             "attach failure reported before dispatch failure: {both:?}",
+        );
+
+        // A guest crash message (a self-describing infra fault — e.g. the
+        // AP-bring-up gap the boot retry exhausted) is surfaced VERBATIM
+        // and outranks the attach gate: the scheduler never ran, so
+        // "did not turn on" would misattribute the infra failure. Sits
+        // below timed_out (a hang has no crash message) but above attach.
+        let mut crashed = base(AttachOutcome::NotAttached(String::new()), false, false);
+        crashed.crash_message =
+            Some("CPUs [4] failed to come online (AP bring-up failed; 127/128 online)".to_string());
+        let verdict = crashed.cell_verdict();
+        assert_eq!(
+            verdict,
+            Err("CPUs [4] failed to come online (AP bring-up failed; 127/128 online)".to_string()),
+            "a crash message must be surfaced verbatim, above the attach gate",
+        );
+        assert!(
+            !verdict.as_ref().unwrap_err().contains("did not turn on"),
+            "crash message must not be masked by the attach gate: {verdict:?}",
         );
     }
 
@@ -2402,6 +2447,7 @@ mod tests {
             attach: AttachOutcome::Attached,
             dispatched: false,
             timed_out: true,
+            crash_message: None,
         };
         let out = format_verifier_output("verifier", &result, false);
         assert!(
@@ -2429,6 +2475,7 @@ mod tests {
             attach: AttachOutcome::Attached,
             dispatched: false,
             timed_out: false,
+            crash_message: None,
         };
         let out = format_verifier_output("verifier", &result, false);
         assert!(
@@ -3283,6 +3330,7 @@ tail\n";
             attach: AttachOutcome::Attached,
             dispatched: false,
             timed_out: true,
+            crash_message: None,
         };
         let out = format_verifier_output("verifier", &result, false);
         assert!(
@@ -3314,6 +3362,7 @@ tail\n";
             attach: AttachOutcome::Died,
             dispatched: false,
             timed_out: false,
+            crash_message: None,
         };
         // Live stderr arrived, live stdout empty: the merged dump (same
         // bytes as stderr here) must NOT render on stdout.
@@ -3345,6 +3394,7 @@ tail\n";
             attach: AttachOutcome::Attached,
             dispatched: true,
             timed_out: false,
+            crash_message: None,
         };
         assert_eq!(
             format_verifier_stderr("verifier", &empty, false),
@@ -3366,6 +3416,7 @@ tail\n";
             attach: AttachOutcome::Died,
             dispatched: false,
             timed_out: false,
+            crash_message: None,
         };
         let s = format_verifier_stderr("verifier", &with_err, false);
         assert!(
@@ -3413,6 +3464,7 @@ tail\n";
             attach: AttachOutcome::Attached,
             dispatched: true,
             timed_out: false,
+            crash_message: None,
         };
         insta::assert_snapshot!(format_verifier_output("default", &result, false));
     }
@@ -3438,6 +3490,7 @@ processed 42 insns (limit 1000000) max_states_per_insn 1 total_states 10 peak_st
             attach: AttachOutcome::Died,
             dispatched: false,
             timed_out: false,
+            crash_message: None,
         };
         insta::assert_snapshot!(format_verifier_output("llc+steal", &result, false));
     }

@@ -4,6 +4,33 @@
 //! parent module (`super`), reached via the glob below.
 use super::*;
 
+/// AP-bring-up-gap check with a host-controlled fault-injection hook.
+///
+/// The production verdict is [`all_possible_cpus_online`] — a pure
+/// two-sysfs read, left untouched so its all-online fast path is exactly
+/// what bare metal exercises. This wrapper layers a deterministic fault
+/// ON TOP of that pure check: when the host sets `KTSTR_FAULT_AP_GAP` on
+/// the kernel cmdline it fabricates an AP-gap failure even though every
+/// CPU is online. The token's value is parsed as the "missing" CPU id
+/// (an absent / unparseable value defaults to CPU 1); the message is
+/// built by [`format_ap_gap_message`] so it carries the real
+/// [`crate::test_support::AP_BRINGUP_GAP_MARKER`] the host keys its boot
+/// retry on. This is the fault the `boot_kernel_ap_gap_retry_e2e` e2e
+/// test injects to drive the whole guest-PANIC → serial →
+/// `crash_message` → `run_vm_with_ap_gap_retry` pipeline on a genuinely
+/// all-online guest, then clears on the second boot. Absent the token
+/// the hook costs one extra cmdline lookup — one of several init already
+/// does — and defers entirely to the real check.
+fn ap_gap_check_with_fault_injection() -> Result<(), String> {
+    if let Some(val) = cmdline_val("KTSTR_FAULT_AP_GAP") {
+        // Synthetic "one AP short" report: CPU `missing` offline out of
+        // `missing + 1` possible (ids 0..=missing), so `missing` online.
+        let missing = val.trim().parse::<u32>().unwrap_or(1);
+        return Err(format_ap_gap_message(&[missing], missing, missing + 1));
+    }
+    all_possible_cpus_online()
+}
+
 /// Full guest init lifecycle. Called from the ctor when PID 1 is
 /// detected. Mounts filesystems, then either runs the test lifecycle
 /// (scheduler + dispatch + reboot) or drops into an interactive
@@ -211,12 +238,44 @@ pub(crate) fn ktstr_guest_init() -> ! {
         crate::vmm::guest_comms::read_kernel_page_offset_base_from_kallsyms().unwrap_or(0);
     let kern_addrs =
         crate::vmm::wire::KernAddrs::new(kern_phys_base, kern_page_offset_base_kva, kern_text_kva);
+    // Detect any AP bring-up gap before the scheduler starts. On
+    // oversubscribed CI hosts an AP can miss its INIT-SIPI alive-window and
+    // land present-but-offline; a sched_ext scheduler later aborts on the
+    // CPU-ID gap with a cryptic error that ktstr would otherwise wrap as
+    // "scheduler did not turn on". Detection only — no hotplug re-online
+    // (see `all_possible_cpus_online`); the reboot below hands recovery to
+    // the host, which can re-run the whole boot so the scheduler only ever
+    // sees a topology assembled by a clean cold boot. Reported as a
+    // self-describing guest infra fault: the `PANIC:` prefix routes the
+    // message through the host's `extract_panic_message` into
+    // `result.crash_message`, which the eval failure path surfaces ABOVE
+    // any scheduler-exit classification (see `test_support::eval`). Same
+    // COM2/COM1 + dmesg + force_reboot transport as the
+    // initramfs-incomplete fatal above. The common all-online path costs
+    // only the two sysfs reads inside the check (plus the
+    // fault-injection hook's single cmdline lookup — see
+    // [`ap_gap_check_with_fault_injection`]).
+    if let Err(msg) = ap_gap_check_with_fault_injection() {
+        // Dump dmesg to serial so the host also sees the kernel-side
+        // AP bring-up failure (smpboot messages) corroborating the gap.
+        if let Ok(raw) = rmesg::logs_raw(rmesg::Backend::Default, false) {
+            let _ = fs::write(COM2, &raw);
+            let _ = fs::write(COM1, &raw);
+        }
+        let line = format!("PANIC: {msg}\n");
+        let _ = fs::write(COM2, &line);
+        let _ = fs::write(COM1, &line);
+        tracing::error!("{msg}");
+        force_reboot();
+    }
+
     // `count_online_cpus()` reads /sys/devices/system/cpu/online which
     // `mount_filesystems()` mounted earlier. Fallback to 1 yields the
     // single-vCPU budget (base + 1×per-vCPU) if the read fails —
     // preserves the original single-CPU default rather than panicking
     // on a procfs hiccup.
     let vcpus = count_online_cpus().unwrap_or(1);
+
     let budget = std::time::Duration::from_millis(crate::test_support::sys_rdy_budget_ms(vcpus));
     send_sys_rdy_with_retry(
         budget,
