@@ -1417,6 +1417,14 @@ impl KtstrVm {
                 )
             })
             .collect();
+        // Interactive shell does not gate guest boot on AP readiness (it has
+        // no thread-join guard for a post-spawn early return, and human-driven
+        // sessions are not run oversubscribed the way CI batches are). Allocate
+        // boot latches only to satisfy the shared spawn signature; the APs fire
+        // them and nothing waits — same throwaway pattern as `ap_tid_slots`.
+        let ap_boot_latches: Vec<Arc<crate::sync::Latch>> = (0..n_aps)
+            .map(|_| Arc::new(crate::sync::Latch::new()))
+            .collect();
         let (ap_threads, _ap_freeze) = self.spawn_ap_threads(
             vcpus,
             has_immediate_exit,
@@ -1434,6 +1442,7 @@ impl KtstrVm {
             &ap_pins,
             no_perf_mask,
             &ap_tid_slots,
+            &ap_boot_latches,
             // Interactive shell does not run a freeze coordinator,
             // so no parked_evt / thaw_evt to plumb. The
             // `vcpu_run_loop_unified` honours `freeze` only when it

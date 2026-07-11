@@ -1688,6 +1688,30 @@ impl KtstrVm {
             })
             .collect();
 
+        // Per-AP boot-ordering latches — each AP fires its latch at the
+        // instant it is about to enter `vcpu_run_loop_unified` (after
+        // signal-handler registration, affinity, and RT-prio setup,
+        // immediately before its first KVM_RUN). The BSP blocks on all of
+        // them below before it starts executing guest code.
+        //
+        // Why this gate exists: the guest kernel's `do_boot_cpu` brings APs
+        // up strictly sequentially, INIT-SIPI'ing each one and then waiting a
+        // bounded ~10s for it to check in before moving on. KVM buffers the
+        // INIT/SIPI for a vCPU already blocked in KVM_RUN with
+        // MP_STATE_UNINITIALIZED, so an AP that is inside its run loop cannot
+        // miss its wakeup. But `spawn_ap_threads` only *creates* the host
+        // threads and returns — on an oversubscribed host an AP host-thread
+        // that the scheduler hasn't yet run into KVM_RUN when its INIT-SIPI
+        // arrives misses the window, and the guest marks that CPU
+        // present-but-offline (observed in CI as 128-vCPU guests
+        // intermittently losing 1-2 mid-range CPUs). Gating guest boot on
+        // every AP being in KVM_RUN closes that race. One-shot `Latch` per AP
+        // (many producers, single BSP waiter) — reusing the module's existing
+        // primitive rather than a new counter type.
+        let ap_boot_latches: Vec<Arc<crate::sync::Latch>> = (0..vcpus.len())
+            .map(|_| Arc::new(crate::sync::Latch::new()))
+            .collect();
+
         // BSP-done signal pair, hoisted above the first thread spawn so the
         // `RunVmThreadGuard` below can carry it (its Drop signals `bsp_done` so
         // the freeze coordinator takes its clean teardown exit — see the guard's
@@ -1715,6 +1739,7 @@ impl KtstrVm {
             &ap_pins,
             no_perf_mask,
             &ap_tid_slots,
+            &ap_boot_latches,
             Some(&parked_evt),
             Some(&thaw_evt),
         )?;
@@ -10990,6 +11015,57 @@ impl KtstrVm {
         // there is still covered).
         guard.watchdog = Some(watchdog);
 
+        // Boot-ordering gate: block the BSP until every AP host thread has
+        // reached the point immediately before its first KVM_RUN (each AP
+        // fires its latch at the tail of the closure in `spawn_ap_threads`;
+        // see that latch's creation above for the full rationale). The guest
+        // kernel's `do_boot_cpu` brings APs up sequentially with a bounded
+        // per-CPU wait, and an AP thread the host scheduler hasn't run into
+        // KVM_RUN by the time its INIT-SIPI arrives misses the window and goes
+        // present-but-offline. Holding guest boot until every AP is in KVM_RUN
+        // (where KVM buffers the pending INIT/SIPI) closes that race. On the
+        // fast path every latch is already set — APs reach KVM_RUN within a
+        // few ms of spawn — so this costs a handful of uncontended lock
+        // acquisitions; the timeout is purely a safety net so a wedged or
+        // panicked AP can never hang the VM here. `kill` is polled inside the
+        // wait so a panicking AP (whose panic hook stores `kill`) releases the
+        // gate at once rather than waiting out the full timeout, and the
+        // subsequent not-ready check turns that into a propagated error.
+        {
+            // Milliseconds on the fast path. The run watchdog covers the whole
+            // VM at 120s, so a 30s bring-up cap sits comfortably below it while
+            // staying generous for a badly oversubscribed host.
+            const AP_READY_TIMEOUT: Duration = Duration::from_secs(30);
+            let deadline = Instant::now() + AP_READY_TIMEOUT;
+            for latch in &ap_boot_latches {
+                while !latch.is_set() {
+                    if kill.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    latch.wait_timeout((deadline - now).min(Duration::from_millis(100)));
+                }
+            }
+            // Report by guest CPU id: AP index `i` is thread `vcpu-{i+1}`
+            // (the BSP is vCPU 0), matching the spawn-loop naming.
+            let not_ready: Vec<usize> = ap_boot_latches
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| !l.is_set())
+                .map(|(i, _)| i + 1)
+                .collect();
+            if !not_ready.is_empty() {
+                anyhow::bail!(
+                    "vCPU threads {not_ready:?} not ready after {}s — host CPU \
+                     starvation during bring-up",
+                    AP_READY_TIMEOUT.as_secs()
+                );
+            }
+        }
+
         // BSP run loop. Wrapped in the same `with_vcpu_panic_ctx`
         // scope the APs use (symmetric panic-hook signaling) —
         // `kill` plus `bsp_done` are the pair analogous to a
@@ -11357,6 +11433,7 @@ impl KtstrVm {
         pin_targets: &[Option<usize>],
         no_perf_mask: Option<&[usize]>,
         ap_tid_slots: &[(Arc<AtomicI32>, Arc<crate::sync::Latch>)],
+        ap_boot_latches: &[Arc<crate::sync::Latch>],
         parked_evt: Option<&Arc<EventFd>>,
         thaw_evt: Option<&Arc<EventFd>>,
     ) -> Result<(Vec<VcpuThread>, ApFreezeHandles)> {
@@ -11367,6 +11444,7 @@ impl KtstrVm {
         vcpu_panic::install_once();
         let n = vcpus.len();
         debug_assert_eq!(ap_tid_slots.len(), n);
+        debug_assert_eq!(ap_boot_latches.len(), n);
         // Guard the partially-built AP set: a mid-loop `?` below (exit-eventfd
         // alloc / thread spawn) must kick+join the already-spawned APs before
         // the caller's `vm` munmaps guest_mem — the outer RunVmThreadGuard is
@@ -11457,6 +11535,7 @@ impl KtstrVm {
                 let (s, l) = &ap_tid_slots[i];
                 (Arc::clone(s), Arc::clone(l))
             };
+            let boot_latch_clone = Arc::clone(&ap_boot_latches[i]);
             // Clone the shared parked_evt + thaw_evt for this AP.
             // None when the caller (interactive shell) doesn't run a
             // freeze coordinator; in that case `vcpu_run_loop_unified`
@@ -11501,6 +11580,21 @@ impl KtstrVm {
                     // publishes the resolved KVA AFTER the AP has
                     // entered the loop (once a sched_ext scheduler
                     // attaches and `*scx_root != 0`).
+                    // Boot-ordering signal: everything the AP must do before
+                    // it can safely receive INIT-SIPI is now complete (signal
+                    // handler, affinity, RT prio); the KVM_RUN that follows
+                    // will block with MP_STATE_UNINITIALIZED, at which point
+                    // KVM buffers the guest's INIT/SIPI. Fire the latch here,
+                    // the last statement before the run loop, so the BSP gate
+                    // in `run_vm` cannot release until this AP is guaranteed
+                    // to catch its bring-up IPI. This is the last point in the
+                    // closure that is not inside `vcpu_run_loop_unified`; the
+                    // pre-loop steps above are all infallible (they log and
+                    // continue on error), so the only way to reach the run
+                    // loop without firing this latch is a panic — which the
+                    // installed vcpu panic hook turns into a `kill` store that
+                    // the BSP gate also observes, so it never hangs.
+                    boot_latch_clone.set();
                     vcpu_panic::with_vcpu_panic_ctx(panic_ctx, || {
                         vcpu_run_loop_unified(
                             &mut vcpu,
