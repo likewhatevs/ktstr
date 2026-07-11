@@ -893,6 +893,17 @@ pub fn collect_verifier_output(
     // Pass the validated Topology directly so misorder cannot occur
     // at the builder boundary (the TryFrom above already enforces the
     // type-level invariants).
+    //
+    // Size memory exactly like a normal `#[ktstr_test]` cell: the
+    // shared cpu-scaling floor for this topology, fed through the
+    // deferred path. The verifier /init is a large instrumented test
+    // binary, so the deferred budget model raises the actual
+    // allocation to fit the real initramfs (floor enforced at
+    // `initramfs_min_memory_mib(&budget).max(self.memory_min_mib)` in
+    // `vmm::setup::join_compute_memory_and_load`). Verifier cells have
+    // no wprof, so no wprof floor applies here.
+    let memory_min_mib =
+        crate::test_support::runtime::cpu_scaled_memory_mib(validated.total_cpus());
     let vm = crate::vmm::KtstrVm::builder()
         .kernel(kernel)
         // Prebuilt distro kernels ship virtio as modules; embed the
@@ -909,7 +920,7 @@ pub fn collect_verifier_output(
         // The PASS verdict requires that frame in addition to attach.
         .run_args(&[crate::test_support::VERIFIER_WORKLOAD_FLAG.to_string()])
         .topology(validated)
-        .memory_mib(2048)
+        .memory_deferred_min(memory_min_mib)
         .timeout(std::time::Duration::from_secs(120))
         .no_perf_mode(true)
         .build()

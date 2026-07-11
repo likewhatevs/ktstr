@@ -386,10 +386,25 @@ pub(crate) fn attach_wprof_if_requested(
     Ok(builder.wprof(Some(config)))
 }
 
+/// Per-cpu memory-scaling core shared by every VM sizing site.
+///
+/// Returns `(cpus * 64).max(256)` — 64 MiB per vCPU, floored at
+/// 256 MiB. 64 MiB/cpu matches `derive_test_memory_mib`'s established
+/// scaling (it was cut from 256 to 64 MiB/cpu when the compressed
+/// initramfs landed and dropped peak guest memory; commit 5b6063a0);
+/// no per-cpu budget beyond that heuristic is documented.
+///
+/// The returned value is a LOWER BOUND: every call site feeds it to
+/// `.memory_deferred_min(mib)`, which raises the actual allocation to
+/// fit the real initramfs, so the final boot memory may exceed this.
+pub(crate) fn cpu_scaled_memory_mib(cpus: u32) -> u32 {
+    (cpus * 64).max(256)
+}
+
 /// Derive the test VM's memory floor from a CPU count + entry.
 ///
-/// Returns `max(cpus * 64, 256, entry.memory_mib)`. When the
-/// `wprof` feature is enabled and `entry.wprof` is true, bumps
+/// Returns `max(cpu_scaled_memory_mib(cpus), entry.memory_mib)`. When
+/// the `wprof` feature is enabled and `entry.wprof` is true, bumps
 /// to `WPROF_MIN_MEMORY_MIB` if below that floor.
 ///
 /// The returned value is the LOWER BOUND on guest memory; the
@@ -397,7 +412,7 @@ pub(crate) fn attach_wprof_if_requested(
 /// also accounts for the initramfs size, so the final boot memory
 /// may exceed this value.
 pub(crate) fn derive_test_memory_mib(cpus: u32, entry: &KtstrTestEntry) -> u32 {
-    let raw = (cpus * 64).max(256).max(entry.memory_mib);
+    let raw = cpu_scaled_memory_mib(cpus).max(entry.memory_mib);
     #[cfg(feature = "wprof")]
     {
         use crate::vmm::wprof::{WPROF_MIN_MEMORY_MIB, apply_wprof_memory_floor};
@@ -1496,6 +1511,37 @@ mod tests {
         };
         let mem = derive_test_memory_mib(2, &entry);
         assert_eq!(mem, 256, "2 cpus * 64 = 128, floor 256 wins");
+    }
+
+    #[test]
+    fn cpu_scaled_memory_mib_scales_and_floors() {
+        // Shared scaling core used by both derive_test_memory_mib and
+        // the verifier cell. Below the crossover (256/64 = 4 cpus) the
+        // 256 MiB floor wins; at/above it the 64 MiB/cpu term wins.
+        assert_eq!(cpu_scaled_memory_mib(1), 256, "1 cpu * 64 = 64, floor 256");
+        assert_eq!(cpu_scaled_memory_mib(4), 256, "4 cpus * 64 = 256, tie");
+        assert_eq!(cpu_scaled_memory_mib(8), 512, "8 cpus * 64 = 512 wins");
+        assert_eq!(cpu_scaled_memory_mib(16), 1024, "16 cpus * 64 = 1024 wins");
+    }
+
+    #[test]
+    fn cpu_scaled_memory_mib_backs_derive_test_memory_mib() {
+        // The entry-aware wrapper must reduce to the shared core when no
+        // per-entry override raises it — the invariant that lets the
+        // verifier cell reuse cpu_scaled_memory_mib directly.
+        let entry = KtstrTestEntry {
+            name: "shared",
+            memory_mib: 0,
+            ..KtstrTestEntry::DEFAULT
+        };
+        for cpus in [1u32, 4, 8, 32] {
+            assert_eq!(
+                derive_test_memory_mib(cpus, &entry),
+                cpu_scaled_memory_mib(cpus),
+                "derive_test_memory_mib must equal the shared core for \
+                 {cpus} cpus when entry.memory_mib=0"
+            );
+        }
     }
 
     #[cfg(feature = "wprof")]

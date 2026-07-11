@@ -408,7 +408,9 @@ impl KtstrVmBuilder {
 
     /// Pin guest memory to an explicit MiB value and clear the
     /// deferred-sizing hint. Use `memory_deferred` when the payload
-    /// size should drive the allocation.
+    /// size should drive the allocation. Only tests pin memory this
+    /// way now; every production VM sizes via `memory_deferred_min`.
+    #[allow(dead_code)]
     pub fn memory_mib(mut self, mib: u32) -> Self {
         self.memory_mib = Some(mib);
         self.memory_min_mib = 0;
