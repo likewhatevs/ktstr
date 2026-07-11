@@ -14,7 +14,11 @@
 //! only for a worker that BOTH advanced non-zero `iterations` AND had its
 //! SCHED_EXT set succeed (`sched_policy_error` is None) — so a fair-class
 //! fallback cannot false-confirm — proof the scheduler actually
-//! dispatched a task onto a CPU. The host
+//! dispatched a task onto a CPU. The deadline scales with the worker
+//! count ([`dispatch_deadline`]): wall clock is not guest CPU time on
+//! a wide, host-time-sliced topology, so a flat window gives a
+//! 64+-CPU guest under CI concurrency almost no per-vCPU compute
+//! before the probe gives up on a working scheduler. The host
 //! verdict ([`crate::verifier::collect_verifier_output`]) PASSes a cell
 //! only when BOTH `PayloadStarting` (attached) AND `WorkloadDispatched`
 //! (dispatched) frames arrive.
@@ -36,10 +40,33 @@ use crate::vmm::wire::LifecyclePhase;
 use crate::workload::{SchedPolicy, WorkType, WorkloadConfig, WorkloadHandle};
 use std::time::{Duration, Instant};
 
-/// Longest we wait for the scheduler to dispatch a worker before
+/// Base wait for the scheduler to dispatch the probe workers before
 /// concluding it did not. Bounded so a wedged scheduler fails the cell
-/// quickly rather than hanging until the host watchdog (120s).
-const DISPATCH_DEADLINE: Duration = Duration::from_secs(5);
+/// quickly rather than hanging until the host watchdog.
+const DISPATCH_DEADLINE_BASE: Duration = Duration::from_secs(5);
+
+/// Per-worker widening of the dispatch deadline. The probe spawns one
+/// worker per online guest CPU and waits for EVERY worker to advance;
+/// on a wide guest (128+ CPUs) whose vCPU threads are time-sliced on
+/// the host, a flat 5s of wall clock is not 5s of guest CPU — the
+/// widest topologies need proportionally more wall time for all
+/// workers to fork, set SCHED_EXT, and take a first dispatch.
+const DISPATCH_DEADLINE_PER_WORKER: Duration = Duration::from_millis(100);
+
+/// Ceiling on the scaled deadline so a genuinely wedged scheduler
+/// still fails in bounded time. Must stay below the host-side
+/// `VERIFIER_WORKLOAD_BUDGET` (60s post-attach, see
+/// `test_support::runtime`) with room for teardown, so the probe
+/// verdict — not the watchdog — decides the cell.
+const DISPATCH_DEADLINE_CAP: Duration = Duration::from_secs(30);
+
+/// Dispatch deadline for `workers` probe workers: base plus a
+/// per-worker term, capped.
+fn dispatch_deadline(workers: usize) -> Duration {
+    DISPATCH_DEADLINE_BASE
+        .saturating_add(DISPATCH_DEADLINE_PER_WORKER.saturating_mul(workers as u32))
+        .min(DISPATCH_DEADLINE_CAP)
+}
 
 /// Inter-poll pause. `snapshot_iterations` is a polled shared-memory
 /// counter (no eventfd to block on), so the wait is a bounded poll that
@@ -88,7 +115,7 @@ pub(crate) fn run_and_confirm_dispatch() {
     // we stop; a working scheduler dispatches all of them quickly, and the
     // deadline bounds one that starves a worker (the gate still confirms
     // via any qualifying worker that did advance).
-    let deadline = Instant::now() + DISPATCH_DEADLINE;
+    let deadline = Instant::now() + dispatch_deadline(workers);
     loop {
         let iters = handle.snapshot_iterations();
         if !iters.is_empty() && iters.iter().all(|&it| it >= 1) {
@@ -119,6 +146,32 @@ pub(crate) fn run_and_confirm_dispatch() {
         tracing::warn!(
             "verifier workload: no worker confirmed dispatched (0 iterations, or the \
              SCHED_EXT set was rejected leaving the worker in fair)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deadline scaling: base for a 1-worker probe, linear growth in
+    /// the mid-range, and the cap binding on the widest topologies —
+    /// while staying under the host's post-attach
+    /// `VERIFIER_WORKLOAD_BUDGET` so the probe verdict, not the
+    /// watchdog, decides the cell.
+    #[test]
+    fn dispatch_deadline_scales_and_caps() {
+        assert_eq!(
+            dispatch_deadline(1),
+            DISPATCH_DEADLINE_BASE + DISPATCH_DEADLINE_PER_WORKER,
+        );
+        assert_eq!(dispatch_deadline(64), Duration::from_millis(11_400));
+        assert_eq!(dispatch_deadline(128), Duration::from_millis(17_800));
+        assert_eq!(dispatch_deadline(512), DISPATCH_DEADLINE_CAP, "cap binds");
+        assert!(
+            DISPATCH_DEADLINE_CAP < crate::test_support::runtime::VERIFIER_WORKLOAD_BUDGET,
+            "probe cap must leave post-attach room for teardown inside \
+             the host's workload budget",
         );
     }
 }
