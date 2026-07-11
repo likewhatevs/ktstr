@@ -658,8 +658,11 @@ struct RunLocks {
 ///
 /// Returns `true` when either [`crate::KTSTR_DEBUG_ENV`] or
 /// [`crate::RUNNER_DEBUG_ENV`] is set to exactly `"1"`. The per-vCPU
-/// affinity-mask lines, the BSP run-loop trace, and the `CLEANUP:`
-/// teardown timings route through this gate so they stay out of normal
+/// affinity-mask lines, the BSP run-loop trace, the `CLEANUP:`
+/// teardown timings, the `KtstrVm::run` VM-setup timing lines, and the
+/// watchdog lifecycle lines (started / BSP-done / scheduler-attach
+/// reset — but not the timeout/kick diagnostics on the failure path)
+/// route through this gate so they stay out of normal
 /// CI logs — where they otherwise bury the scheduler test failure a
 /// run is investigating — yet reappear on demand. `RUNNER_DEBUG=1` is
 /// what GitHub Actions exports when a job is re-run with "Enable debug
@@ -743,18 +746,27 @@ impl KtstrVm {
     /// Boot the VM, run until shutdown/timeout, return captured output.
     pub fn run(&self) -> Result<VmResult> {
         let start = Instant::now();
+        let dbg = debug_logging_enabled();
 
         let initramfs_handle = self.spawn_initramfs_resolve();
-        eprintln!("  initramfs spawn: {:?}", start.elapsed());
+        if dbg {
+            eprintln!("  initramfs spawn: {:?}", start.elapsed());
+        }
         let (mut vm, kernel_result) = self.create_vm_and_load_kernel()?;
-        eprintln!("  kvm+kernel: {:?}", start.elapsed());
+        if dbg {
+            eprintln!("  kvm+kernel: {:?}", start.elapsed());
+        }
 
         #[cfg(target_arch = "x86_64")]
         let _kernel_result = {
             let kr = self.setup_memory(&mut vm, kernel_result, initramfs_handle)?;
-            eprintln!("  setup_memory (joins initramfs): {:?}", start.elapsed());
+            if dbg {
+                eprintln!("  setup_memory (joins initramfs): {:?}", start.elapsed());
+            }
             self.setup_vcpus(&vm, kr.entry)?;
-            eprintln!("  setup_vcpus: {:?}", start.elapsed());
+            if dbg {
+                eprintln!("  setup_vcpus: {:?}", start.elapsed());
+            }
             kr
         };
         #[cfg(target_arch = "aarch64")]
@@ -769,7 +781,9 @@ impl KtstrVm {
             tracing::debug!("KVM_GET_STATS_FD not supported, skipping stats collection");
         }
 
-        eprintln!("VM setup total: {:?}", start.elapsed());
+        if dbg {
+            eprintln!("VM setup total: {:?}", start.elapsed());
+        }
         tracing::debug!(elapsed_us = start.elapsed().as_micros(), "total_setup");
 
         // Run-phase clock approximates the watchdog's hard_deadline
@@ -1403,6 +1417,14 @@ impl KtstrVm {
                 )
             })
             .collect();
+        // Interactive shell does not gate guest boot on AP readiness (it has
+        // no thread-join guard for a post-spawn early return, and human-driven
+        // sessions are not run oversubscribed the way CI batches are). Allocate
+        // boot latches only to satisfy the shared spawn signature; the APs fire
+        // them and nothing waits — same throwaway pattern as `ap_tid_slots`.
+        let ap_boot_latches: Vec<Arc<crate::sync::Latch>> = (0..n_aps)
+            .map(|_| Arc::new(crate::sync::Latch::new()))
+            .collect();
         let (ap_threads, _ap_freeze) = self.spawn_ap_threads(
             vcpus,
             has_immediate_exit,
@@ -1420,6 +1442,7 @@ impl KtstrVm {
             &ap_pins,
             no_perf_mask,
             &ap_tid_slots,
+            &ap_boot_latches,
             // Interactive shell does not run a freeze coordinator,
             // so no parked_evt / thaw_evt to plumb. The
             // `vcpu_run_loop_unified` honours `freeze` only when it

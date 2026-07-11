@@ -303,6 +303,66 @@ fn parse_online_cpus_large_topology() {
     assert_eq!(parse_online_cpus("0-255"), Some(256));
 }
 
+#[test]
+fn parse_cpu_list_enumerates_ids() {
+    assert_eq!(parse_cpu_list("0"), Some(vec![0]));
+    assert_eq!(parse_cpu_list("0-3"), Some(vec![0, 1, 2, 3]));
+    assert_eq!(parse_cpu_list("0-1,4-7"), Some(vec![0, 1, 4, 5, 6, 7]));
+    assert_eq!(parse_cpu_list("0-2,4,6-7"), Some(vec![0, 1, 2, 4, 6, 7]));
+    assert_eq!(parse_cpu_list("0-3\n"), Some(vec![0, 1, 2, 3]));
+}
+
+#[test]
+fn parse_cpu_list_rejects_malformed() {
+    assert_eq!(parse_cpu_list(""), None);
+    assert_eq!(parse_cpu_list("   "), None);
+    assert_eq!(parse_cpu_list("abc"), None);
+    assert_eq!(parse_cpu_list("0,"), None); // trailing comma
+    assert_eq!(parse_cpu_list("10-3"), None); // inverted range
+    // Absurd range would balloon the id vec — rejected at the ceiling,
+    // parallel to parse_online_cpus's overflow guard.
+    assert_eq!(parse_cpu_list(&format!("0-{}", u32::MAX)), None);
+}
+
+#[test]
+fn offline_possible_cpus_all_online_reports_no_gap() {
+    // Healthy 128-vCPU boot: possible == online, no missing CPUs.
+    let report = offline_possible_cpus("0-127", "0-127").unwrap();
+    assert!(report.missing.is_empty());
+    assert_eq!(report.online, 128);
+    assert_eq!(report.possible, 128);
+}
+
+#[test]
+fn offline_possible_cpus_names_missing_ids() {
+    // 128 possible, CPUs 4 and 6 failed AP bring-up → online has a hole.
+    let online = "0-3,5,7-127";
+    let report = offline_possible_cpus("0-127", online).unwrap();
+    assert_eq!(report.missing, vec![4, 6]);
+    assert_eq!(report.online, 126);
+    assert_eq!(report.possible, 128);
+    // The message the operator sees, built from this report through the
+    // SAME formatter the guest PANICs with. Pins the exact wording AND
+    // that it still carries the host-side retry marker — a reword that
+    // dropped the marker would silently disable the boot retry.
+    let msg = format_ap_gap_message(&report.missing, report.online, report.possible);
+    assert_eq!(
+        msg,
+        "CPUs [4, 6] failed to come online (AP bring-up failed; 126/128 online)"
+    );
+    assert!(
+        msg.contains(crate::test_support::AP_BRINGUP_GAP_MARKER),
+        "guest AP-gap message must contain the host retry marker: {msg}",
+    );
+}
+
+#[test]
+fn offline_possible_cpus_unparseable_list_is_none() {
+    // A procfs hiccup on either list degrades to "skip the check".
+    assert!(offline_possible_cpus("garbage", "0-127").is_none());
+    assert!(offline_possible_cpus("0-127", "").is_none());
+}
+
 /// Zero budget: loop exits within one sleep step and emits the
 /// WARN with the expected diagnostic fields. The `traced_test`
 /// attribute installs a capturing subscriber so `logs_contain`

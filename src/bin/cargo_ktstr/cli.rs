@@ -562,8 +562,8 @@ pub(crate) enum KtstrCommand {
     /// variants are skipped at cell-emission time (no userspace binary to
     /// verify). `--scheduler <NAME>` restricts the sweep to a single
     /// declared scheduler across topologies. After nextest finishes, one
-    /// `verified_insns` table per scheduler (rows = kernel, cols = BPF
-    /// program) and one PASS/FAIL grid per scheduler (rows = topology,
+    /// `verified_insns` table per scheduler (rows = BPF program, cols =
+    /// kernel) and one PASS/FAIL grid per scheduler (rows = topology,
     /// cols = kernel) are printed.
     ///
     /// The `declare_scheduler!` verifier cells carry no `required-features`,

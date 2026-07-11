@@ -1688,6 +1688,30 @@ impl KtstrVm {
             })
             .collect();
 
+        // Per-AP boot-ordering latches — each AP fires its latch at the
+        // instant it is about to enter `vcpu_run_loop_unified` (after
+        // signal-handler registration, affinity, and RT-prio setup,
+        // immediately before its first KVM_RUN). The BSP blocks on all of
+        // them below before it starts executing guest code.
+        //
+        // Why this gate exists: the guest kernel's `do_boot_cpu` brings APs
+        // up strictly sequentially, INIT-SIPI'ing each one and then waiting a
+        // bounded ~10s for it to check in before moving on. KVM buffers the
+        // INIT/SIPI for a vCPU already blocked in KVM_RUN with
+        // MP_STATE_UNINITIALIZED, so an AP that is inside its run loop cannot
+        // miss its wakeup. But `spawn_ap_threads` only *creates* the host
+        // threads and returns — on an oversubscribed host an AP host-thread
+        // that the scheduler hasn't yet run into KVM_RUN when its INIT-SIPI
+        // arrives misses the window, and the guest marks that CPU
+        // present-but-offline (observed in CI as 128-vCPU guests
+        // intermittently losing 1-2 mid-range CPUs). Gating guest boot on
+        // every AP being in KVM_RUN closes that race. One-shot `Latch` per AP
+        // (many producers, single BSP waiter) — reusing the module's existing
+        // primitive rather than a new counter type.
+        let ap_boot_latches: Vec<Arc<crate::sync::Latch>> = (0..vcpus.len())
+            .map(|_| Arc::new(crate::sync::Latch::new()))
+            .collect();
+
         // BSP-done signal pair, hoisted above the first thread spawn so the
         // `RunVmThreadGuard` below can carry it (its Drop signals `bsp_done` so
         // the freeze coordinator takes its clean teardown exit — see the guard's
@@ -1715,6 +1739,7 @@ impl KtstrVm {
             &ap_pins,
             no_perf_mask,
             &ap_tid_slots,
+            &ap_boot_latches,
             Some(&parked_evt),
             Some(&thaw_evt),
         )?;
@@ -1865,9 +1890,10 @@ impl KtstrVm {
         // and `run_bsp_loop` (the BSP MSR_LSTAR path subtracts
         // `entry_SYSCALL_64`) share a single source of truth.
         // `find_vmlinux` is cheap path discovery; the
-        // `cached_vmlinux_bytes` hit is shared with the monitor's
-        // later parse so the host pays the ELF read at most once
-        // per process. Both fields land 0 when the symbol is
+        // `cached_vmlinux_artifacts` hit is shared with the monitor's
+        // later `start_monitor` lookup so the host pays the ELF read
+        // AND the symbol/BTF parse at most once per (path, mtime) per
+        // process. Both fields land 0 when the symbol is
         // absent — `_text` only on extremely stripped vmlinux,
         // `entry_SYSCALL_64` on aarch64 and non-x86_64 builds.
         // Both paths short-circuit on a 0 link KVA, leaving the
@@ -1879,10 +1905,8 @@ impl KtstrVm {
         // different values.
         let host_kernel_symbols: Option<crate::monitor::symbols::KernelSymbols> =
             find_vmlinux(&self.kernel)
-                .and_then(|p| cached_vmlinux_bytes(&p))
-                .and_then(|data| {
-                    crate::monitor::symbols::KernelSymbols::from_vmlinux_bytes(&data).ok()
-                });
+                .and_then(|p| super::vmlinux::cached_vmlinux_artifacts(&p))
+                .map(|a| a.symbols.clone());
         let kernel_text_link_kva: u64 = host_kernel_symbols
             .as_ref()
             .and_then(|s| s.kernel_text_kva)
@@ -10724,7 +10748,9 @@ impl KtstrVm {
                 // is set; absent, the load is skipped entirely
                 // (no workload duration → nothing to reset to).
                 let mut reset_deadline: Option<Instant> = None;
-                eprintln!("watchdog: started, timeout={timeout:?}");
+                if crate::vmm::debug_logging_enabled() {
+                    eprintln!("watchdog: started, timeout={timeout:?}");
+                }
 
                 // Wake plumbing. `tick_tfd` is a periodic 100 ms
                 // timerfd that drives the deadline-progress checks
@@ -10789,7 +10815,9 @@ impl KtstrVm {
 
                 loop {
                     if bsp_done_for_wd.load(Ordering::Acquire) {
-                        eprintln!("watchdog: BSP done, returning");
+                        if crate::vmm::debug_logging_enabled() {
+                            eprintln!("watchdog: BSP done, returning");
+                        }
                         return;
                     }
                     // Decode a pending scheduler-attach reset
@@ -10807,11 +10835,13 @@ impl KtstrVm {
                                 || reset_deadline.is_some_and(|prev| candidate > prev)
                             {
                                 reset_deadline = Some(candidate);
-                                eprintln!(
-                                    "watchdog: scheduler attach observed, hard \
-                                     deadline reset to {:?} from VM start",
-                                    candidate.saturating_duration_since(run_start),
-                                );
+                                if crate::vmm::debug_logging_enabled() {
+                                    eprintln!(
+                                        "watchdog: scheduler attach observed, hard \
+                                         deadline reset to {:?} from VM start",
+                                        candidate.saturating_duration_since(run_start),
+                                    );
+                                }
                             }
                         }
                     }
@@ -10826,7 +10856,9 @@ impl KtstrVm {
                         // bsp_ie) may be dropped. Writing to ie after drop
                         // is a use-after-free.
                         if bsp_done_for_wd.load(Ordering::Acquire) {
-                            eprintln!("watchdog: BSP already done, returning");
+                            if crate::vmm::debug_logging_enabled() {
+                                eprintln!("watchdog: BSP already done, returning");
+                            }
                             return;
                         }
                         let hard_timeout_fired = Instant::now() >= effective_deadline;
@@ -10982,6 +11014,57 @@ impl KtstrVm {
         // joins (deferred past the infallible post-loop teardown, so a panic
         // there is still covered).
         guard.watchdog = Some(watchdog);
+
+        // Boot-ordering gate: block the BSP until every AP host thread has
+        // reached the point immediately before its first KVM_RUN (each AP
+        // fires its latch at the tail of the closure in `spawn_ap_threads`;
+        // see that latch's creation above for the full rationale). The guest
+        // kernel's `do_boot_cpu` brings APs up sequentially with a bounded
+        // per-CPU wait, and an AP thread the host scheduler hasn't run into
+        // KVM_RUN by the time its INIT-SIPI arrives misses the window and goes
+        // present-but-offline. Holding guest boot until every AP is in KVM_RUN
+        // (where KVM buffers the pending INIT/SIPI) closes that race. On the
+        // fast path every latch is already set — APs reach KVM_RUN within a
+        // few ms of spawn — so this costs a handful of uncontended lock
+        // acquisitions; the timeout is purely a safety net so a wedged or
+        // panicked AP can never hang the VM here. `kill` is polled inside the
+        // wait so a panicking AP (whose panic hook stores `kill`) releases the
+        // gate at once rather than waiting out the full timeout, and the
+        // subsequent not-ready check turns that into a propagated error.
+        {
+            // Milliseconds on the fast path. The run watchdog covers the whole
+            // VM at 120s, so a 30s bring-up cap sits comfortably below it while
+            // staying generous for a badly oversubscribed host.
+            const AP_READY_TIMEOUT: Duration = Duration::from_secs(30);
+            let deadline = Instant::now() + AP_READY_TIMEOUT;
+            for latch in &ap_boot_latches {
+                while !latch.is_set() {
+                    if kill.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    latch.wait_timeout((deadline - now).min(Duration::from_millis(100)));
+                }
+            }
+            // Report by guest CPU id: AP index `i` is thread `vcpu-{i+1}`
+            // (the BSP is vCPU 0), matching the spawn-loop naming.
+            let not_ready: Vec<usize> = ap_boot_latches
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| !l.is_set())
+                .map(|(i, _)| i + 1)
+                .collect();
+            if !not_ready.is_empty() {
+                anyhow::bail!(
+                    "vCPU threads {not_ready:?} not ready after {}s — host CPU \
+                     starvation during bring-up",
+                    AP_READY_TIMEOUT.as_secs()
+                );
+            }
+        }
 
         // BSP run loop. Wrapped in the same `with_vcpu_panic_ctx`
         // scope the APs use (symmetric panic-hook signaling) —
@@ -11350,6 +11433,7 @@ impl KtstrVm {
         pin_targets: &[Option<usize>],
         no_perf_mask: Option<&[usize]>,
         ap_tid_slots: &[(Arc<AtomicI32>, Arc<crate::sync::Latch>)],
+        ap_boot_latches: &[Arc<crate::sync::Latch>],
         parked_evt: Option<&Arc<EventFd>>,
         thaw_evt: Option<&Arc<EventFd>>,
     ) -> Result<(Vec<VcpuThread>, ApFreezeHandles)> {
@@ -11360,6 +11444,7 @@ impl KtstrVm {
         vcpu_panic::install_once();
         let n = vcpus.len();
         debug_assert_eq!(ap_tid_slots.len(), n);
+        debug_assert_eq!(ap_boot_latches.len(), n);
         // Guard the partially-built AP set: a mid-loop `?` below (exit-eventfd
         // alloc / thread spawn) must kick+join the already-spawned APs before
         // the caller's `vm` munmaps guest_mem — the outer RunVmThreadGuard is
@@ -11450,6 +11535,7 @@ impl KtstrVm {
                 let (s, l) = &ap_tid_slots[i];
                 (Arc::clone(s), Arc::clone(l))
             };
+            let boot_latch_clone = Arc::clone(&ap_boot_latches[i]);
             // Clone the shared parked_evt + thaw_evt for this AP.
             // None when the caller (interactive shell) doesn't run a
             // freeze coordinator; in that case `vcpu_run_loop_unified`
@@ -11494,6 +11580,21 @@ impl KtstrVm {
                     // publishes the resolved KVA AFTER the AP has
                     // entered the loop (once a sched_ext scheduler
                     // attaches and `*scx_root != 0`).
+                    // Boot-ordering signal: everything the AP must do before
+                    // it can safely receive INIT-SIPI is now complete (signal
+                    // handler, affinity, RT prio); the KVM_RUN that follows
+                    // will block with MP_STATE_UNINITIALIZED, at which point
+                    // KVM buffers the guest's INIT/SIPI. Fire the latch here,
+                    // the last statement before the run loop, so the BSP gate
+                    // in `run_vm` cannot release until this AP is guaranteed
+                    // to catch its bring-up IPI. This is the last point in the
+                    // closure that is not inside `vcpu_run_loop_unified`; the
+                    // pre-loop steps above are all infallible (they log and
+                    // continue on error), so the only way to reach the run
+                    // loop without firing this latch is a panic — which the
+                    // installed vcpu panic hook turns into a `kill` store that
+                    // the BSP gate also observes, so it never hangs.
+                    boot_latch_clone.set();
                     vcpu_panic::with_vcpu_panic_ctx(panic_ctx, || {
                         vcpu_run_loop_unified(
                             &mut vcpu,
@@ -11573,47 +11674,47 @@ impl KtstrVm {
         let Some(vmlinux) = find_vmlinux(&self.kernel) else {
             return Ok(None);
         };
-        // Read the vmlinux bytes once and feed both the BTF loader
-        // and the ELF symbol parser. The previous structure called
-        // `load_btf_from_path` and `KernelSymbols::from_vmlinux` back
-        // to back, each running its own `std::fs::read` — on a debug
-        // vmlinux that is two ~1 GB reads through the page cache for
-        // a single byte slice's worth of work.
-        let vmlinux_data_arc = match super::vmlinux::cached_vmlinux_bytes(&vmlinux) {
-            Some(d) => d,
-            None => return Ok(None),
+        // Parse the vmlinux once per (path, mtime) per process and
+        // share the derived products with the freeze-coord inline
+        // link-KVA path (which populated this same cache entry earlier
+        // in `run_vm`). The previous structure re-ran
+        // `goblin::elf::Elf::parse` over ~50 MB+ of vmlinux and
+        // `KernelSymbols::from_elf` here even though the inline path
+        // already did both — seconds of duplicate CPU per VM. The BTF
+        // parse (previously here, hitting `load_btf_from_elf` +
+        // `Btf::from_bytes` once) is now folded into the same cached
+        // parse so it still happens exactly once; the boot-window
+        // concern (early samples seeing the rq's pre-AP-online state
+        // when BTF was parsed twice) is preserved. All products are
+        // owned, so the monitor closure below clones them out of the
+        // shared `Arc` exactly as if it had parsed them itself.
+        let Some(artifacts) = super::vmlinux::cached_vmlinux_artifacts(&vmlinux) else {
+            return Ok(None);
         };
-        let vmlinux_data = &*vmlinux_data_arc;
-        let elf = match goblin::elf::Elf::parse(vmlinux_data) {
-            Ok(e) => e,
-            Err(_) => return Ok(None),
+        // `monitor: None` means the BTF load or `KernelOffsets`
+        // resolution failed — no monitor thread, matching the pre-cache
+        // `load_btf_from_elf` / `from_btf` early returns. `symbols`
+        // resolving but `monitor` absent is the same "symbols Ok,
+        // offsets Err → Ok(None)" the old `(Ok, Ok)` gate produced.
+        let Some(mon) = artifacts.monitor.as_ref() else {
+            return Ok(None);
         };
-        // Single BTF parse for both `KernelOffsets` and
-        // `BpfProgOffsets`. The previous structure parsed BTF twice
-        // (KernelOffsets up here, BpfProgOffsets inside the spawned
-        // monitor thread closure), each call hitting
-        // `load_btf_from_path` and `Btf::from_bytes`. On debug-built
-        // vmlinux the parse is hundreds of ms; doing it twice
-        // pushed the monitor thread past the no-scheduler boot
-        // window so early samples saw the rq's pre-AP-online state.
-        // One parse, two `from_btf` consumers, both share the
-        // resolved offsets. On a BTF sidecar cache hit the supplied
-        // `elf` is unused; on a miss `load_btf_from_elf` reuses it
-        // instead of running its own `Elf::parse`.
-        let btf = match monitor::btf_offsets::load_btf_from_elf(&elf, vmlinux_data, &vmlinux) {
-            Ok(b) => b,
-            Err(_) => return Ok(None),
-        };
-        let offsets = monitor::btf_offsets::KernelOffsets::from_btf(&btf);
-        let prog_offsets = monitor::btf_offsets::BpfProgOffsets::from_btf(&btf).ok();
+        let symbols = artifacts.symbols.clone();
+        let offsets = mon.offsets.clone();
+        let prog_offsets = mon.prog_offsets.clone();
         // System-wide PSI-irq host-walk offsets (psi_group total/avg + the
         // PSI_IRQ_FULL index). `None` when CONFIG_IRQ_TIME_ACCOUNTING is off
         // (PSI_IRQ_FULL absent from BTF) or psi_group is absent → loud-absent.
-        let psi_offsets = monitor::btf_offsets::PsiGroupOffsets::from_btf(&btf).ok();
-        let symbols = monitor::symbols::KernelSymbols::from_elf(&elf);
-
-        let (Ok(offsets), Ok(symbols)) = (offsets, symbols) else {
-            return Ok(None);
+        let psi_offsets = mon.psi_offsets;
+        let btf = Arc::clone(&mon.btf);
+        // Raw vmlinux bytes for the `watch_bpf_maps` per-map program-BTF
+        // split-base. A byte-cache hit — `cached_vmlinux_artifacts`
+        // above already read and cached these. Only consumed when the
+        // test declared watch targets; the `None` arm keeps the
+        // pre-cache "unreadable vmlinux → no monitor" early return.
+        let vmlinux_data_arc = match super::vmlinux::cached_vmlinux_bytes(&vmlinux) {
+            Some(d) => d,
+            None => return Ok(None),
         };
         // BTF-capability probe for the `SCX_EV_*` event counters:
         // `event_offsets` resolves only on kernels that expose the
@@ -11631,8 +11732,8 @@ impl KtstrVm {
         // `prog_stats_ctx` builder below consumes the original; the test
         // entry's `WatchBpfMap` list is lowered to the monitor-local target
         // form. All are moved into the monitor closure and consumed there
-        // only when the test declared watch targets.
-        let btf = Arc::new(btf);
+        // only when the test declared watch targets. `btf` is already an
+        // `Arc<Btf>` cloned from the shared parse artifact above.
         let watch_prog_offsets = prog_offsets.clone();
         let watch_targets: Vec<monitor::reader::WatchBpfMapTarget> = self
             .watch_bpf_maps

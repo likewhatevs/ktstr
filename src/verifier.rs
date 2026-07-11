@@ -796,6 +796,14 @@ pub struct VerifierVmResult {
     /// on it too — but NOT on the guest exit code, which is `1` even on
     /// the verifier success path (no `#[ktstr_test]` body to dispatch).
     pub timed_out: bool,
+    /// The guest's structured crash message (a `PANIC:`-prefixed line
+    /// routed through the host's `extract_panic_message` into
+    /// [`crate::vmm::VmResult::crash_message`]), if any. A self-describing
+    /// guest infra fault — most notably the AP-bring-up gap the boot
+    /// retry exhausts — that [`Self::cell_verdict`] surfaces ABOVE the
+    /// attach/dispatch gates, mirroring `test_support::eval`'s
+    /// crash_message priority. `None` on the common no-crash path.
+    pub crash_message: Option<String>,
 }
 
 impl VerifierVmResult {
@@ -816,6 +824,15 @@ impl VerifierVmResult {
         // during teardown.
         if self.timed_out {
             return Err("VM timed out (hung after attach, before exit)".to_string());
+        }
+        // A self-describing guest infra fault outranks the attach/dispatch
+        // gates: the guest PID-1 panicked before the scheduler ran (most
+        // notably the AP-bring-up gap the boot retry could not clear), so
+        // "scheduler did not turn on" would misattribute an infra failure
+        // to the scheduler. Surface the crash verbatim, mirroring
+        // `test_support::eval`'s crash_message priority.
+        if let Some(crash) = &self.crash_message {
+            return Err(crash.clone());
         }
         // PASS requires the scheduler to have turned ON, not just to have
         // loaded + verified its BPF.
@@ -893,29 +910,47 @@ pub fn collect_verifier_output(
     // Pass the validated Topology directly so misorder cannot occur
     // at the builder boundary (the TryFrom above already enforces the
     // type-level invariants).
-    let vm = crate::vmm::KtstrVm::builder()
-        .kernel(kernel)
-        // Prebuilt distro kernels ship virtio as modules; embed the
-        // ordered boot-module set from the cache entry (no-op for built
-        // kernels, which have no sibling modules/ dir).
-        .kernel_modules(crate::cache::boot_modules_for_image(kernel))
-        .initrd_compression(crate::cache::initrd_compression_for_image(kernel))
-        .init_binary(ktstr_bin)
-        .scheduler_binary(sched_bin)
-        .sched_args(&sched_args)
-        // Boot the guest into the verifier dispatch probe: the sweep VM
-        // has no `#[ktstr_test]` body, so Phase 5 spawns a SpinWait
-        // workload and emits `WorkloadDispatched` on confirmed progress.
-        // The PASS verdict requires that frame in addition to attach.
-        .run_args(&[crate::test_support::VERIFIER_WORKLOAD_FLAG.to_string()])
-        .topology(validated)
-        .memory_mib(2048)
-        .timeout(std::time::Duration::from_secs(120))
-        .no_perf_mode(true)
-        .build()
-        .context("build verifier VM")?;
+    //
+    // Size memory exactly like a normal `#[ktstr_test]` cell: the
+    // shared cpu-scaling floor for this topology, fed through the
+    // deferred path. The verifier /init is a large instrumented test
+    // binary, so the deferred budget model raises the actual
+    // allocation to fit the real initramfs (floor enforced at
+    // `initramfs_min_memory_mib(&budget).max(self.memory_min_mib)` in
+    // `vmm::setup::join_compute_memory_and_load`). Verifier cells have
+    // no wprof, so no wprof floor applies here.
+    let memory_min_mib =
+        crate::test_support::runtime::cpu_scaled_memory_mib(validated.total_cpus());
+    // Bounded whole-boot retry on the guest AP-bring-up-gap infra fault
+    // (an AP that missed its INIT-SIPI window → the guest PID-1 panics
+    // pre-test). Rebuild the VM each attempt: `build` consumes the
+    // builder and `run` consumes the boot. Every other failure returns
+    // on the first attempt — the retry keys strictly on the marker.
+    let result = crate::test_support::run_vm_with_ap_gap_retry(|| {
+        let vm = crate::vmm::KtstrVm::builder()
+            .kernel(kernel)
+            // Prebuilt distro kernels ship virtio as modules; embed the
+            // ordered boot-module set from the cache entry (no-op for built
+            // kernels, which have no sibling modules/ dir).
+            .kernel_modules(crate::cache::boot_modules_for_image(kernel))
+            .initrd_compression(crate::cache::initrd_compression_for_image(kernel))
+            .init_binary(ktstr_bin)
+            .scheduler_binary(sched_bin)
+            .sched_args(&sched_args)
+            // Boot the guest into the verifier dispatch probe: the sweep VM
+            // has no `#[ktstr_test]` body, so Phase 5 spawns a SpinWait
+            // workload and emits `WorkloadDispatched` on confirmed progress.
+            // The PASS verdict requires that frame in addition to attach.
+            .run_args(&[crate::test_support::VERIFIER_WORKLOAD_FLAG.to_string()])
+            .topology(validated)
+            .memory_deferred_min(memory_min_mib)
+            .timeout(std::time::Duration::from_secs(120))
+            .no_perf_mode(true)
+            .build()
+            .context("build verifier VM")?;
 
-    let result = vm.run().context("run verifier VM")?;
+        vm.run().context("run verifier VM")
+    })?;
 
     // Concatenate bulk-port `MSG_TYPE_SCHED_LOG` chunks, then run
     // the marker-pair extractor on the merged stream — the
@@ -963,6 +998,7 @@ pub fn collect_verifier_output(
         attach,
         dispatched,
         timed_out: result.timed_out,
+        crash_message: result.crash_message.clone(),
     })
 }
 
@@ -1220,8 +1256,8 @@ pub struct VerifierCellRecord {
     /// captured for this cell, copied from the VM run's
     /// [`VerifierVmResult::stats`]. Empty when the cell failed before
     /// producing stats. Drives the per-scheduler `verified_insns` tables
-    /// ([`render_instruction_count_tables`], rows = kernel, cols = BPF
-    /// program, cell = the count summarized across topologies) that the
+    /// ([`render_instruction_count_tables`], rows = BPF program, cols =
+    /// kernel, cell = the count summarized across topologies) that the
     /// dispatcher prints before the PASS/FAIL grids.
     pub stats: Vec<ProgStats>,
 }
@@ -1531,7 +1567,7 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
 }
 
 /// Render one `verified_insns` table per declared scheduler. Within each
-/// scheduler's section: rows = kernel version, columns = BPF program, and
+/// scheduler's section: rows = BPF program, columns = kernel version, and
 /// each cell is that program's `verified_insns` for the (scheduler,
 /// kernel) summarized ACROSS the topologies that ran it — a single number
 /// when topology-invariant, `lo..hi` when it varies (`-` when that program
@@ -1543,18 +1579,23 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
 /// `.rodata`, e.g. `nr_cpus`, processes a different count per topology).
 /// So topology is folded into the cell as a range rather than shown as its
 /// own (usually all-identical) axis; the axes it genuinely varies on — BPF
-/// program (x) and kernel version (y) — are the table axes, sectioned per
-/// declared scheduler. Identical-binary declarations are sectioned
+/// program (y) and kernel version (x) — are the table axes, sectioned per
+/// declared scheduler. Program is the ROW axis because a scheduler declares
+/// many programs (scx_lavd has ~26) and the count is unbounded, so rows
+/// scale down the page without wrapping; kernel is the COLUMN axis because
+/// a sweep runs only a handful of kernels, so the columns stay narrow
+/// enough to read in a CI log. Identical-binary declarations are sectioned
 /// separately on purpose (they are run separately). Returns `None` when no
 /// record carries any per-program stats (the caller prints nothing).
 ///
 /// A kernel that ran a scheduler but produced NO stats at all — e.g.
 /// every cell on it died during BPF load, so no program existed to
-/// introspect — still gets a row (all cells `-`) as long as the
-/// scheduler has at least one program column from some OTHER kernel.
+/// introspect — still gets a column (all cells `-`) as long as the
+/// scheduler has at least one program row from some OTHER kernel.
 /// Without it the stats-less kernel would silently vanish from the
 /// table, hiding that it ran and failed to load; the explicit all-`-`
-/// row makes that absence visible.
+/// column makes that absence visible. Kernel columns therefore come from
+/// every kernel that ran the scheduler, not only those that produced stats.
 ///
 /// Schedulers, kernels, and programs are BTree-sorted so the same run
 /// renders the same output (shell-pipeline stable). The range drops which
@@ -1573,7 +1614,7 @@ pub fn render_instruction_count_tables(records: &[VerifierCellRecord]) -> Option
     // scheduler -> every kernel that has a record for it, whether or not
     // it contributed stats. A kernel present here but absent from
     // `by_sched[sched]` ran the scheduler yet produced no program stats,
-    // so it becomes an all-`-` row rather than vanishing.
+    // so it becomes an all-`-` column rather than vanishing.
     let mut sched_all_kernels: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for r in records {
         sched_all_kernels
@@ -1601,25 +1642,25 @@ pub fn render_instruction_count_tables(records: &[VerifierCellRecord]) -> Option
     }
 
     let mut out = String::from(
-        "\nverifier verified_insns (per scheduler; rows: kernel, cols: BPF program, \
+        "\nverifier verified_insns (per scheduler; rows: BPF program, cols: kernel, \
          cell: range across topologies):\n",
     );
     for (sched, kernels) in &by_sched {
         let progs = &sched_progs[sched];
-        let mut table = crate::cli::new_table();
-        let mut header: Vec<String> = vec!["kernel".to_string()];
-        for p in progs {
-            header.push(p.clone());
+        // EVERY kernel that ran this scheduler, not only the ones that
+        // produced stats, so a load-failure kernel surfaces as an all-`-`
+        // column instead of vanishing.
+        let all_kernels = &sched_all_kernels[sched];
+        let mut table = crate::cli::new_bordered_table();
+        let mut header: Vec<String> = vec!["program".to_string()];
+        for kernel in all_kernels {
+            header.push(kernel.clone());
         }
         table.set_header(header);
-        // Iterate over EVERY kernel that ran this scheduler, not only the
-        // ones that produced stats, so a load-failure kernel surfaces as
-        // an all-`-` row instead of vanishing.
-        for kernel in &sched_all_kernels[sched] {
-            let mut line: Vec<String> = vec![kernel.clone()];
-            let prog_map = kernels.get(kernel);
-            for p in progs {
-                let text = match prog_map.and_then(|m| m.get(p)) {
+        for p in progs {
+            let mut line: Vec<String> = vec![p.clone()];
+            for kernel in all_kernels {
+                let text = match kernels.get(kernel).and_then(|m| m.get(p)) {
                     Some((lo, hi)) if lo == hi => lo.to_string(),
                     Some((lo, hi)) => format!("{lo}..{hi}"),
                     None => "-".to_string(),
@@ -1828,12 +1869,12 @@ mod tests {
     }
 
     /// Per-scheduler verified_insns tables: one section per declared
-    /// scheduler; within it rows = kernel version, columns = BPF program,
+    /// scheduler; within it rows = BPF program, columns = kernel version,
     /// each cell that program's verified_insns across the topologies that
     /// ran it — a single number when topology-invariant, `lo..hi` when it
     /// varies. A (kernel, program) that reported no stats shows `-`; a
     /// kernel that ran a scheduler but produced NO stats at all still gets
-    /// an all-`-` row; an empty record set renders nothing.
+    /// an all-`-` column; an empty record set renders nothing.
     #[test]
     fn instruction_count_tables_per_scheduler_kernel_program_range() {
         let recs = vec![
@@ -1873,7 +1914,7 @@ mod tests {
             },
             // scx_a / kernel_6_15: ktstr_dispatch DIFFERS across topologies
             // -> `lo..hi` range; ktstr_enqueue is absent on this kernel
-            // -> `-` in that column's kernel_6_15 row.
+            // -> `-` in the ktstr_enqueue row's kernel_6_15 column.
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_15".into(),
@@ -1907,7 +1948,7 @@ mod tests {
             },
             // scx_a / kernel_6_16: a record but NO stats — every cell died
             // during BPF load, so no program existed to introspect. It must
-            // still surface as an all-`-` row, not vanish from the table.
+            // still surface as an all-`-` column, not vanish from the table.
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_16".into(),
@@ -1922,14 +1963,14 @@ mod tests {
             out.contains("scx_a:") && out.contains("scx_b:"),
             "one section per declared scheduler: {out}"
         );
-        // Columns = BPF programs; rows = kernel version.
+        // Rows = BPF programs; columns = kernel version.
         assert!(
             out.contains("ktstr_dispatch") && out.contains("ktstr_enqueue"),
-            "BPF-program columns: {out}"
+            "BPF-program rows: {out}"
         );
         assert!(
             out.contains("kernel_6_14") && out.contains("kernel_6_15"),
-            "kernel-version rows: {out}"
+            "kernel-version columns: {out}"
         );
         // Topology folded into the cell as a range: flat -> "128",
         // varies across topologies -> "130..150".
@@ -1950,16 +1991,28 @@ mod tests {
             out.contains('-'),
             "a (kernel, program) with no stats renders '-': {out}"
         );
-        // kernel_6_16 ran scx_a but produced NO stats -> an all-`-` row
-        // (one `-` per program column, kept visible rather than dropped).
-        let k616_row = out
+        // kernel_6_16 ran scx_a but produced NO stats -> it stays as a
+        // column (named in the header) rather than vanishing. Its all-`-`
+        // column shows up as a `-` in every program row: the ktstr_enqueue
+        // row is absent on both kernel_6_15 and kernel_6_16, so it carries
+        // exactly two `-` cells (the box-drawing borders use `─`/`│`, not
+        // ASCII `-`, so they do not count).
+        let header = out
             .lines()
-            .find(|l| l.contains("kernel_6_16"))
-            .expect("stats-less kernel row present");
+            .find(|l| l.contains("program") && l.contains("kernel_6_16"))
+            .expect("stats-less kernel kept as a column in the header");
+        assert!(
+            header.contains("kernel_6_14") && header.contains("kernel_6_15"),
+            "every kernel that ran is a column: {header}"
+        );
+        let enqueue_row = out
+            .lines()
+            .find(|l| l.contains("ktstr_enqueue"))
+            .expect("ktstr_enqueue row present");
         assert_eq!(
-            k616_row.matches('-').count(),
+            enqueue_row.matches('-').count(),
             2,
-            "stats-less kernel row is all `-` across both program columns: {k616_row}"
+            "ktstr_enqueue is absent on kernel_6_15 and kernel_6_16: {enqueue_row}"
         );
         // Topology is NOT a table axis (folded into the range), so no
         // topology label appears in the output.
@@ -2287,6 +2340,7 @@ mod tests {
             attach,
             dispatched,
             timed_out,
+            crash_message: None,
         };
 
         // Verified + attached + dispatched, no hang -> PASS.
@@ -2329,6 +2383,25 @@ mod tests {
         assert!(
             both.as_ref().unwrap_err().contains("did not turn on"),
             "attach failure reported before dispatch failure: {both:?}",
+        );
+
+        // A guest crash message (a self-describing infra fault — e.g. the
+        // AP-bring-up gap the boot retry exhausted) is surfaced VERBATIM
+        // and outranks the attach gate: the scheduler never ran, so
+        // "did not turn on" would misattribute the infra failure. Sits
+        // below timed_out (a hang has no crash message) but above attach.
+        let mut crashed = base(AttachOutcome::NotAttached(String::new()), false, false);
+        crashed.crash_message =
+            Some("CPUs [4] failed to come online (AP bring-up failed; 127/128 online)".to_string());
+        let verdict = crashed.cell_verdict();
+        assert_eq!(
+            verdict,
+            Err("CPUs [4] failed to come online (AP bring-up failed; 127/128 online)".to_string()),
+            "a crash message must be surfaced verbatim, above the attach gate",
+        );
+        assert!(
+            !verdict.as_ref().unwrap_err().contains("did not turn on"),
+            "crash message must not be masked by the attach gate: {verdict:?}",
         );
     }
 
@@ -2374,6 +2447,7 @@ mod tests {
             attach: AttachOutcome::Attached,
             dispatched: false,
             timed_out: true,
+            crash_message: None,
         };
         let out = format_verifier_output("verifier", &result, false);
         assert!(
@@ -2401,6 +2475,7 @@ mod tests {
             attach: AttachOutcome::Attached,
             dispatched: false,
             timed_out: false,
+            crash_message: None,
         };
         let out = format_verifier_output("verifier", &result, false);
         assert!(
@@ -3255,6 +3330,7 @@ tail\n";
             attach: AttachOutcome::Attached,
             dispatched: false,
             timed_out: true,
+            crash_message: None,
         };
         let out = format_verifier_output("verifier", &result, false);
         assert!(
@@ -3286,6 +3362,7 @@ tail\n";
             attach: AttachOutcome::Died,
             dispatched: false,
             timed_out: false,
+            crash_message: None,
         };
         // Live stderr arrived, live stdout empty: the merged dump (same
         // bytes as stderr here) must NOT render on stdout.
@@ -3317,6 +3394,7 @@ tail\n";
             attach: AttachOutcome::Attached,
             dispatched: true,
             timed_out: false,
+            crash_message: None,
         };
         assert_eq!(
             format_verifier_stderr("verifier", &empty, false),
@@ -3338,6 +3416,7 @@ tail\n";
             attach: AttachOutcome::Died,
             dispatched: false,
             timed_out: false,
+            crash_message: None,
         };
         let s = format_verifier_stderr("verifier", &with_err, false);
         assert!(
@@ -3385,6 +3464,7 @@ tail\n";
             attach: AttachOutcome::Attached,
             dispatched: true,
             timed_out: false,
+            crash_message: None,
         };
         insta::assert_snapshot!(format_verifier_output("default", &result, false));
     }
@@ -3410,6 +3490,7 @@ processed 42 insns (limit 1000000) max_states_per_insn 1 total_states 10 peak_st
             attach: AttachOutcome::Died,
             dispatched: false,
             timed_out: false,
+            crash_message: None,
         };
         insta::assert_snapshot!(format_verifier_output("llc+steal", &result, false));
     }

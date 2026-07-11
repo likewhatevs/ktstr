@@ -144,7 +144,7 @@ fn apply_bordered_color_policy(
 /// `ContentArrangement::Disabled` (columns expand to their content, no
 /// terminal-width wrapping) as [`new_table`].
 ///
-/// Cell-color policy (see [`apply_bordered_color_policy`]): colors
+/// Cell-color policy (see `apply_bordered_color_policy`): colors
 /// render on an interactive TTY as with [`new_table`], but ALSO —
 /// deliberately unlike [`new_table`], which stays escape-free on every
 /// non-TTY stdout — on a non-TTY stdout when `GITHUB_ACTIONS`,

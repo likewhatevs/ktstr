@@ -39,7 +39,7 @@ filter = "test(boot_kernel) | test(bench_boot)"
 slow-timeout = { period = "180s", terminate-after = 3 }
 
 [[profile.ci.overrides]]
-filter = "test(verifier_)"
+filter = "test(/^verifier\\//)"
 slow-timeout = { period = "180s", terminate-after = 3 }
 
 [[profile.ci.overrides]]
@@ -198,9 +198,13 @@ slow-timeout = { period = "10s", terminate-after = 2 }
 filter = "test(boot_kernel) | test(bench_boot)"
 slow-timeout = { period = "180s", terminate-after = 2 }
 
-# Verifier tests: internal 120s timeout, nextest must exceed that.
+# Verifier cells: internal 120s VM watchdog, nextest must exceed that.
+# Cell names are slash-delimited (`verifier/<sched>/<kernel>/<preset>`,
+# emitted by the dispatch macro) — the old `test(verifier_)` substring
+# filter silently matched nothing, leaving cells on the profile-base
+# 60s x 2 budget that races the 120s watchdog.
 [[profile.default.overrides]]
-filter = "test(verifier_)"
+filter = "test(/^verifier\\//)"
 slow-timeout = { period = "180s", terminate-after = 2 }
 
 # Demo tests: exploration/failure scenarios, should not retry.

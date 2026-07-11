@@ -383,6 +383,100 @@ fn bench_boot_time() {
     }
 }
 
+/// End-to-end AP-bring-up-gap boot retry: exercises the REAL pipeline
+/// (guest PID-1 PANIC → serial → `extract_panic_message` →
+/// `VmResult::crash_message` → `run_vm_with_ap_gap_retry` → clean second
+/// boot) that the `boot_retry` unit tests can only simulate with fake
+/// `VmResult`s.
+///
+/// The gap is injected deterministically, not raced: the guest honors a
+/// `KTSTR_FAULT_AP_GAP` cmdline token (see
+/// `rust_init::init::ap_gap_check_with_fault_injection`) and fabricates
+/// the AP-gap PANIC on an all-online guest. The closure passed to the
+/// retry helper builds a fresh init-running VM each attempt — WITH the
+/// fault token on attempt 1, WITHOUT it on attempt ≥2 — so the first
+/// boot PANICs with the marker and the second boots clean, proving the
+/// helper both detects the marker in a genuine `crash_message` and stops
+/// once a clean boot arrives.
+///
+/// Named `boot_kernel_*` so the nextest slow-timeout override
+/// (`test(boot_kernel) | test(bench_boot)`) covers its two cold boots.
+/// Follows the sibling boot tests' `skip_on_contention!` convention for
+/// the /dev/kvm + host-resource gate.
+#[test]
+fn boot_kernel_ap_gap_retry_e2e() {
+    let kernel = crate::test_support::require_kernel();
+    let exe = crate::resolve_current_exe().unwrap();
+
+    // Attempt counter and attempt-1 crash message, mutated from inside
+    // the FnMut closure via interior mutability.
+    let attempts = std::cell::Cell::new(0u32);
+    let first_crash: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
+
+    let outcome = crate::test_support::run_vm_with_ap_gap_retry(|| {
+        let n = attempts.get() + 1;
+        attempts.set(n);
+        let mut builder = KtstrVm::builder()
+            .kernel(&kernel)
+            .init_binary(&exe)
+            .topology(Topology::new(1, 1, 1, 1))
+            .memory_deferred()
+            .timeout(Duration::from_secs(30));
+        // Inject the AP-gap fault ONLY on the first attempt; the retry
+        // must then re-boot WITHOUT it and come up clean.
+        if n == 1 {
+            builder = builder.cmdline("KTSTR_FAULT_AP_GAP=1");
+        }
+        let vm = builder.build()?;
+        let result = vm.run()?;
+        if n == 1 {
+            first_crash.set(result.crash_message.clone());
+        }
+        Ok(result)
+    });
+
+    // A build/run host-insufficiency error (no kernel resolvable,
+    // resource contention) skips rather than fails — the retry helper
+    // propagates such an Err immediately (it is not a marker result).
+    let outcome = skip_on_contention!(outcome);
+
+    // A cold / contended host can leave the fault-injection boot short of
+    // the guest AP-gap PANIC when it overruns the per-boot timeout: the
+    // result then carries no `crash_message`, the helper sees no marker
+    // and returns after a single attempt. That is inconclusive infra
+    // slowness, not a retry regression — skip, mirroring
+    // `boot_kernel_with_monitor`'s slow-cold-boot skip. A non-timed-out
+    // single attempt IS a real regression and trips the assert below.
+    if attempts.get() == 1 && outcome.timed_out {
+        skip!(
+            "attempt 1's fault-injection boot overran the per-boot timeout \
+             before the guest AP-gap PANIC (slow/cold host); e2e inconclusive"
+        );
+    }
+
+    assert_eq!(
+        attempts.get(),
+        2,
+        "expected exactly one fault-injected boot then one clean retry; \
+         attempt 1 should PANIC with the AP-gap marker and attempt 2 \
+         (no fault token) should boot clean",
+    );
+    assert!(
+        outcome.crash_message.is_none(),
+        "the retried clean boot must carry no crash_message; got {:?}",
+        outcome.crash_message,
+    );
+    let attempt1 = first_crash
+        .take()
+        .expect("attempt 1 must have produced a crash_message");
+    assert!(
+        attempt1.contains(crate::test_support::AP_BRINGUP_GAP_MARKER),
+        "attempt 1's crash_message must be the AP-bring-up-gap marker \
+         routed through the guest PANIC → serial → extract_panic_message \
+         path; got {attempt1:?}",
+    );
+}
+
 #[test]
 fn kvm_has_immediate_exit_cap() {
     let topo = Topology {

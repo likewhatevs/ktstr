@@ -58,6 +58,11 @@ mod args;
 // same workload cgroup root the host-side setup uses but lives outside the
 // private `args` module's subtree.
 pub(crate) use args::resolve_cgroup_root;
+mod boot_retry;
+// Shared by the guest (rust_init formats the AP-gap panic around the
+// marker) and the host cell layer (verifier + eval retry the whole boot
+// when a run's crash_message carries it).
+pub(crate) use boot_retry::{AP_BRINGUP_GAP_MARKER, run_vm_with_ap_gap_retry};
 mod dispatch;
 mod entry;
 mod entry_validate;

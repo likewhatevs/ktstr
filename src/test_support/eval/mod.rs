@@ -1198,39 +1198,48 @@ fn run_ktstr_test_inner_impl(
         )));
     }
 
-    let vm = match builder.build() {
-        Ok(vm) => vm,
-        Err(e) => {
-            // Chain-aware (the error can arrive .context()-wrapped, e.g.
-            // KtstrKvm::new's "create VM"): walk the chain so a wrapped
-            // skip-class error is still recorded here, matching the late
-            // catch-all in run_ktstr_test_inner.
-            if let Some(class) = super::host_skip_class(&e) {
-                let resolved_topology = record_skip_sidecar(entry, topo);
-                crate::test_support::sidecar::write_host_skip_marker(
-                    entry,
-                    &resolved_topology,
-                    class,
-                );
+    // Bounded whole-boot retry on the guest AP-bring-up-gap infra fault:
+    // the guest PID-1 panics pre-test when an AP missed its INIT-SIPI
+    // window, and a fresh cold boot (what bare metal does) is the fix.
+    // `build` consumes the builder and `run` consumes the boot, so each
+    // attempt clones the builder and rebuilds. Every other failure kind
+    // returns on the first attempt (the retry keys strictly on the
+    // marker); the skip-marker error handling below is unchanged.
+    let mut result = crate::test_support::run_vm_with_ap_gap_retry(|| {
+        let vm = match builder.clone().build() {
+            Ok(vm) => vm,
+            Err(e) => {
+                // Chain-aware (the error can arrive .context()-wrapped, e.g.
+                // KtstrKvm::new's "create VM"): walk the chain so a wrapped
+                // skip-class error is still recorded here, matching the late
+                // catch-all in run_ktstr_test_inner.
+                if let Some(class) = super::host_skip_class(&e) {
+                    let resolved_topology = record_skip_sidecar(entry, topo);
+                    crate::test_support::sidecar::write_host_skip_marker(
+                        entry,
+                        &resolved_topology,
+                        class,
+                    );
+                }
+                return Err(e.context("build ktstr_test VM"));
             }
-            return Err(e.context("build ktstr_test VM"));
-        }
-    };
-    let mut result = match vm.run() {
-        Ok(r) => r,
-        Err(e) => {
-            // Chain-aware, as in the build arm above.
-            if let Some(class) = super::host_skip_class(&e) {
-                let resolved_topology = record_skip_sidecar(entry, topo);
-                crate::test_support::sidecar::write_host_skip_marker(
-                    entry,
-                    &resolved_topology,
-                    class,
-                );
+        };
+        match vm.run() {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                // Chain-aware, as in the build arm above.
+                if let Some(class) = super::host_skip_class(&e) {
+                    let resolved_topology = record_skip_sidecar(entry, topo);
+                    crate::test_support::sidecar::write_host_skip_marker(
+                        entry,
+                        &resolved_topology,
+                        class,
+                    );
+                }
+                Err(e.context("run ktstr_test VM"))
             }
-            return Err(e.context("run ktstr_test VM"));
         }
-    };
+    })?;
     // Stamp the macro-emitted test fn name onto the VmResult so
     // post_vm callbacks can derive per-test sidecar paths via
     // `result.wprof_pb_path()` / `result.repro_wprof_pb_path()`
@@ -1361,12 +1370,12 @@ fn run_ktstr_test_inner_impl(
         write_placeholder_failure_dump_if_missing(&primary_dump_path, &result);
     }
 
-    // Release VM resources (CPU/LLC flocks, guest memory) before
-    // the post-VM-exit eval work (sidecar write, auto-repro,
-    // post_vm callbacks) so concurrent peers can acquire the same
-    // LLC slots while that runs.
+    // VM resources (CPU/LLC flocks, guest memory) are already released:
+    // the boot-retry helper owns the VM and drops it the moment
+    // `vm.run()` returns, so concurrent peers can acquire the same LLC
+    // slots while the post-VM-exit eval work (sidecar write, auto-repro,
+    // post_vm callbacks) runs.
     let post_vm_t = std::time::Instant::now();
-    drop(vm);
     // Release the kernel-cache reader flock — the VM no longer
     // maps the kernel image, so concurrent `cargo ktstr kernel
     // build` can proceed.
