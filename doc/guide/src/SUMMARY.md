@@ -35,6 +35,7 @@
   - [Work Types](concepts/work-types.md)
   - [Checking](concepts/checking.md)
   - [Topology](concepts/topology.md)
+  - [Run Modes](concepts/run-modes.md)
   - [Performance Mode](concepts/performance-mode.md)
   - [Resource Budget](concepts/resource-budget.md)
 

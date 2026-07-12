@@ -145,6 +145,7 @@ a hard error, and what the default path does instead — is in
 `performance_mode = false` and routes the run through the budgeted
 coordination path: a shared LLC reservation sized to a CPU budget,
 enforced by a cgroup cpuset instead of pinning — none of the
-isolation features above apply. The mode comparison, the CPU budget,
-and the `--cpu-cap` flag live in
+isolation features above apply. [Run Modes](run-modes.md) sets this mode
+beside the default and performance modes; the CPU budget, the `--cpu-cap`
+flag, and the coordination-mode comparison live in
 [Resource Budget](resource-budget.md#the-three-coordination-modes).

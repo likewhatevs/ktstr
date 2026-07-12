@@ -215,3 +215,248 @@ nextest-visible `expect_err` family is green in the branch's full suite.
 The branch-only dilation samples read ~1.08 (steady) / ~1.20 (detach demo)
 on this quiet host — plausible near-1.0 values confirming the new
 collection works without perturbing the measurements it annotates.
+
+
+## Wide-topology validation (post Tier-1 max-per-vCPU redesign)
+
+Commit `643b99e3` reworked the progress watchdog's Tier-1 evidence after
+CI's 192-CPU runners false-killed four healthy 256-vCPU cells six seconds
+into Attach: the phase anchor was incoherent and the budget was denominated
+in **summed** CPU, so a wide guest's diffuse idle-vCPU background burn
+(ticks + IPIs across 256 vCPUs) crossed a per-vCPU-linear budget with no
+wedge anywhere. The fix moves Tier-1 to a monitor-owned **max single-vCPU
+in-phase** burn against a **flat, width-independent** budget; the summed CPU
+still feeds Tier-2 trickle-stall and the Tier-3 deadman. This section is the
+captured evidence that the reworked wide paths (a) still emit performance
+measurements out of a wide cell, (b) still catch a real wide spinning wedge
+fast, and (c) leave a legitimately-idle wide cell alive — plus the honest
+limit of the summed-trickle detectors at width. (That §2 idle-wedge limit
+was subsequently REMOVED by the Tier-2 CPU-term drop — see the addendum §4.)
+
+### Why a wide shape needs near-1:1 — the CI-only regime
+
+The false-fire only reproduces when a wide guest runs at **near 1:1**
+vCPU:host-CPU — mostly-idle vCPUs each accruing *undiluted* background CPU.
+CI's 256-vCPU shapes on 192-CPU runners were that regime; a 64-CPU host
+cannot make 256 vCPUs run near-1:1 (they are 4x oversubscribed and heavily
+diluted, so the per-vCPU background never reaches the budget scale that
+tripped the old Tier-1). The reproduction here is therefore a **near-1:1
+wide** guest: 56-64 vCPUs on the 64 host CPUs, undiluted — the same
+per-vCPU-currency regime CI hit. Host dilation on the perf cell reads ~1.13
+(below), confirming the vCPUs are near-1:1, not diluted.
+
+### 1. Wide perf measurement, before/after
+
+No committed test measures *performance* on a wide guest —
+`snapshot_real_capture_wide_smp` captures BPF/vcpu-reg **state** at 256
+vCPUs, not schbench metrics. So the measurement uses an **uncommitted scratch
+copy** of `performance_mode_schbench_steady` (the low-variance steady A/B
+shape) retopologized to a near-1:1 wide guest, run identically on both sides.
+
+**Scratch shape** (both sides, `tests/performance_mode_e2e.rs`,
+`wide_perf_schbench_steady_scratch`): `llcs = 8, cores = 7, threads = 1`
+(**56 vCPUs**), `no_perf_mode`, same warmup(3s)+steady(15s) schbench backdrop
+and `scheduler = scx-ktstr` as the committed steady test. **Mode choice:**
+`no_perf_mode`, not `performance_mode` — perf-mode 1:1-pins each vCPU to a
+host CPU, and 56-64 vCPUs on a 64-CPU host would leave no host CPU for the
+monitor/schbench-worker service threads (64 vCPUs leaves literally none).
+`no_perf_mode` floats the vCPU threads on the full host mask, which is also
+the exact mode the false-firing wide-SMP cells use; 56 (not 64) keeps the
+guest near-1:1 while reserving host headroom so the measurement is not
+self-contended. The two sides differ only in the branch post_vm additionally
+printing the branch-only per-cell dilation (baseline `cc78f447` has no
+`host_vcpu_schedstat` field); the measured schbench values come from the
+`*.ktstr.json` sidecar (`stats.phases[step_index=2].metrics.*`) identically
+on both.
+
+Steady phase (Step[1]) schbench metrics, **avg-of-6 [min-max]** per side (the
+headline N=3 was re-run +3 to resolve the out-of-envelope cells, per the
+narrow doc's precedent). Latencies µs, lower=better; rps/loop higher=better.
+
+| metric | baseline (cc78f447) | branch | branch in baseline envelope |
+|---|---|---|---|
+| wakeup p99 (us) | 10214.7 [6776–13008] | 14266.7 [13008–15024] | **NO (+39.7%, branch slower) — see [W1]** |
+| request p50 (us) | 92800.0 [90240–94848] | 89813.3 [89472–90752] | NO (−3.2%, branch FASTER) — see [W2] |
+| request p99 (us) | 119125.3 [117888–119936] | 119722.7 [117376–123008] | yes (+0.5%) |
+| rps p50 | 658.0 [655–661] | 656.3 [653–661] | yes |
+| schbench loop count | 9847.2 [9816–9875] | 9821.3 [9762–9895] | yes |
+
+Branch-only observational: host dilation avg **1.1323** [1.1198–1.1518] over
+the 6 branch runs — near-1:1, undiluted, confirming the CI regime is
+reproduced (not a diluted-oversubscribed shape). **No watchdog tier fired on
+any of the 6 branch runs** — every run exit 0, no `cause=` line in any run's
+stderr: the reworked width-independent Tier-1 does not false-kill a near-1:1
+wide perf cell, and the wide cell still yields the full schbench metric set on
+both sides.
+
+- **[W1] wakeup p99 — the one systematic out-of-envelope cell, flagged for
+  review.** Branch avg 14266.7 sits above the baseline envelope (the edges
+  touch at 13008); across all 12 runs branch spans 13008–15024 and baseline
+  6776–13008 — a clean ~40% separation. It is not a host-load artifact: the
+  baseline re-runs at 1-min load 29–34 were still *faster* than branch runs at
+  load 17–31, and the first-round branch runs at load 1–20 already showed the
+  same high tail, so the shift is consistent across the load range both sides
+  saw. Direction: branch is WORSE (higher wakeup tail). Mechanism: the branch's
+  unconditionally-RT (FIFO-2) sensing threads — added to default/`no_perf`
+  runs on this stack (see "Why perf-mode measurements should be
+  identical-mechanism") — preempt the guest vCPU threads on the host; at width
+  there are ~56 vCPU threads for the RT sensing to preempt, and wakeup p99 is
+  the most preemption-sensitive schbench metric, so the cost that was
+  invisible at the narrow 2-vCPU scale (pipe/split, notes [2]/[3]) surfaces as
+  a measurable ~40% tail on the wide cell. Throughput is unaffected (loop
+  count and rps within envelope) and request p50 is faster [W2], so this is a
+  latency-tail redistribution under the new sensing, not a throughput
+  regression or a blunted threshold — anyone using wide-cell wakeup-p99 as a
+  cross-commit absolute baseline should re-baseline on this branch.
+- **[W2] request p50:** branch 89472–90752 vs baseline 90240–94848 overlap
+  only at the top edge — branch is ~3.2% FASTER on the median request
+  (lower=better), the same directional default-path improvement the narrow
+  split cell showed (note [3]).
+
+### 2. Wide-wedge catch (branch)
+
+Scratch copies of the Tier-1 spin and idle wedge fixtures at a wide topology
+(`tests/progress_watchdog_e2e.rs`, `llcs = 8, cores = 8` = **64 vCPUs**,
+`no_perf_mode`, reusing the committed `TEARDOWN_SPIN_SCHED` /
+`TEARDOWN_IDLE_SCHED` injectors): the teardown fault injector spins/sleeps
+**one** guest thread among 63 otherwise-idle vCPUs — the shape whose diffuse
+background burn false-fired the old summed Tier-1.
+
+**Spin wedge — Tier-1 fires, width-sound**
+(`wide_teardown_spin_wedge_killed_by_tier1_scratch`):
+
+```
+watchdog: tier1-cpu-budget, kicking BSP
+watchdog: deadline expired at 16.473224173s from VM start
+  cause=tier1-cpu-budget, hard_timeout_fired=false, kill_set_by_AP=false
+  phase=Teardown (Infra), monitor_live=true, evidence_channels_live=true
+  max_vcpu_cpu_in_phase=12.031525413s vs budget=12s (currency=pthread), cpu_sum=18.557365599s, cpu_trickle_stalled=false
+  effective_deadline=179.27319229s from VM start
+WIDE_WEDGE_SPIN timed_out=true duration_s=18.8
+```
+
+Killed at **18.8 s** wall — « the 60 s fixture bound, and « the ~179 s
+deadman the same dump reports for 64 vCPUs. The discriminator is exactly the
+redesign: the lone spinner's `max_vcpu_cpu_in_phase = 12.03 s` crossed the
+flat 12 s Teardown budget (8 s widened 3/2 for the pthread currency), while
+`cpu_sum = 18.56 s` — the summed currency the OLD Tier-1 charged — is 54%
+higher and folds in the 63 idle vCPUs' ~6.5 s of diffuse background. The max
+evidence catches the real one-vCPU wedge without charging it the width. Same
+bounded latency class as the 1-vCPU spin fixture (≈ 20-27 s expected there).
+
+**Idle wedge — the honest conservative limit at width**
+(`wide_teardown_idle_wedge_scratch`): the injector sleeps one thread among 63
+idle vCPUs. The cell booted and reached the Teardown idle wedge (the wedge
+family boots silently — the known-good spin cell above emitted nothing but
+the vCPU-pin line before its fire), then **survived un-killed through both a
+400 s and a 260 s run** — no `cause=` line ever emitted (the watchdog's kill
+dump goes to unbuffered stderr; its absence is a definite no-fire), and the
+179 s deadman deadline passed without a kill. Neither Tier-2 nor the Tier-3
+deadman fired, and they cannot at this width: both gate on
+`cpu_trickle_stalled`, and at 64 idle vCPUs the **summed** idle trickle (the
+currency `643b99e3` deliberately kept for Tier-2/deadman) stays far above the
+25 ms / 10 s pthread floor — the 63 idle vCPUs alone contributed ~6.5 s of
+background CPU inside the spin cell's 12 s window — so the stall discriminator
+never latches. Reported honestly: **the wide *idle* wedge is bounded only by
+the outer harness `terminate-after` (or a dead monitor), not by any progress
+tier** — it is NOT bounded « the deadman, because the deadman is itself
+trickle-gated. This is the same summed-trickle property that (correctly) keeps
+a *healthy* wide idle cell alive in §3: `643b99e3` narrowed only Tier-1's
+width-unsoundness (the false-KILL of a healthy wide cell) and deliberately did
+not tighten Tier-2/deadman's width-conservatism (the miss of a wide idle
+wedge). The wide spin wedge — the CPU-burning shape the whole rework targets —
+is caught fast; the wide idle wedge is left to the harness bound.
+**Since resolved:** the Tier-2 CPU-term drop removed this limit — see §4.
+
+### 3. Wide idle survival (branch, at 0c04d555)
+
+The previously-false-killed CI shapes, re-run once each at this commit as the
+recorded-in-doc confirmation they are green (256 vCPUs = 16 LLC × 16 core,
+`no_perf_mode`, > 254-APIC-ID split-irqchip path):
+
+| test | result |
+|---|---|
+| `wide_smp_guest_boots_all_cpus_online` | **PASS** (exit 0) — guest reports `total_cpus=256 online='0-255' n_online=256`: every vCPU online, no watchdog fire during the 4 s idle body |
+| `snapshot_real_capture_wide_smp` | **PASS** (exit 0) — all 256 `vcpu_regs` slots captured through the freeze rendezvous; the "4.0x oversubscription" line is the expected informational warning (state capture, not timing) and non-fatal |
+
+Both survive the long wide-idle phases the old Tier-1 killed at 6 s.
+
+### 4. Addendum: the wide idle wedge is now caught — Tier-2's CPU term dropped
+
+The §2 limit was a design defect, not physics: Tier-2's trickle conjunct was
+belt-and-braces duplicating the protection its runnable conjunct already
+carries. A starved cell WITH work always shows queued-or-running tasks in its
+own rq memory (`nr_running` includes the on-CPU task, and guest memory is
+readable regardless of host scheduling), so `!runnable_demand` alone exempts
+every starved-alive shape — while no width-stable CPU floor can exist (the
+guest housekeeping CPU's timekeeping/RCU duty measures 20-45 ms per 10 s
+window at 64 vCPUs even on the busiest-single-vCPU currency, vs 1-10 ms at
+1 vCPU). Tier-2 therefore dropped the CPU term entirely: `Infra &&
+channels_live && !runnable_demand && wall_in_phase > backstop`. The trickle
+discriminator survives only as the Tier-3 deadman's deferral gate,
+re-denominated to the busiest single vCPU via per-vCPU window anchors (a
+summed or per-tick-max currency degrades to ~the sum at width because idle
+background burn rotates and serialises); a width misread there can only
+DEFER, and the deferred runnable-piled shape stays bounded by the guest scx
+watchdog.
+
+The §2 scratch shapes are now COMMITTED fixtures
+(`tests/progress_watchdog_e2e.rs`,
+`teardown_{idle,spin}_wedge_wide_killed_by_tier{2,1}`, 64 vCPUs,
+`no_perf_mode`), green alongside their narrow siblings (kernel 7.1.3,
+sequential, quiet host):
+
+| fixture | cause | watchdog kill | total | bound |
+|---|---|---|---|---|
+| narrow idle | tier2-idle-wedge | 18.7 s (wall_in_phase 15.05 s vs 15 s backstop) | 19.0 s | < 90 s |
+| narrow spin | tier1-cpu-budget | 16.0 s (12.08 s vs 12 s budget) | 16.2 s | < 60 s |
+| **wide idle (the §2 miss)** | **tier2-idle-wedge** | **18.8 s (wall_in_phase 15.04 s vs 15 s)** | **19.2 s** | < 90 s |
+| wide spin | tier1-cpu-budget | 34.9 s (12.01 s vs 12 s; wedge-start variance — a prior run killed at 16.5 s) | 35.2 s | < 60 s |
+| idle body survives | (no kill) | — | 12.0 s | no fire |
+
+The wide-idle kill dump proves the mechanism — Tier-2 fires on the wall
+backstop while the trickle verdict (deadman-only now) still reads "alive" on
+exactly the housekeeping width residual that formerly made this wedge
+immortal (`busiest_vcpu_window=38.6ms` > the 25 ms floor):
+
+```
+ktstr-watchdog: tier2-idle-wedge, kicking BSP
+ktstr-watchdog: deadline expired at 18.791573169s from VM start
+  cause=tier2-idle-wedge, hard_timeout_fired=false, kill_set_by_AP=false
+  phase=Teardown (Infra), monitor_live=true, evidence_channels_live=true
+  max_vcpu_cpu_in_phase=54.209745ms vs budget=12s (currency=pthread), cpu_sum=4.832328108s, cpu_trickle_stalled=false
+  busiest_vcpu_window=38.603751ms vs trickle_floor=25ms
+  wall_in_phase=15.036764228s vs backstop=15s
+  progress_epoch=5 (milestones), wall_since_milestone=15.036764228s, runnable_demand=false, deadman_deferrals=0
+```
+
+(Watchdog output is branded `ktstr-watchdog` as of this change; the §2 dumps
+above quote the older `watchdog:` prefix verbatim as captured.)
+
+### Methodology / reproduction
+
+- **Scratch copies, not committed.** Three functions were added to two test
+  files on the branch and one on the baseline, exercised, then reverted;
+  `git status` after this run shows only this doc modified.
+  - `tests/performance_mode_e2e.rs` — `wide_perf_schbench_steady_scratch`
+    (56 vCPUs, `no_perf_mode`, steady schbench A/B; branch prints dilation,
+    baseline omits it since `cc78f447` lacks `host_vcpu_schedstat`).
+  - `tests/progress_watchdog_e2e.rs` —
+    `wide_teardown_spin_wedge_killed_by_tier1_scratch` (asserts `< 60 s`) and
+    `wide_teardown_idle_wedge_scratch` (records the outcome; does not assert
+    the 1-vCPU Tier-2 bound), both 64 vCPUs `no_perf_mode`.
+- **Sides & build.** baseline `cc78f447` in its own detached worktree with its
+  own build; branch `0c04d555` (`verifier-hang-fixes` tip) in the main tree.
+- **Dispatch.** Same direct-nextest protocol as the narrow validation:
+  `KTSTR_KERNEL=<7.1.3 cache dir> KTSTR_SIDECAR_DIR=<fresh> NEXTEST=1
+  <test_bin> --exact ktstr/<name>`, one at a time on the quiet 64-CPU host,
+  kernel **7.1.3** (`7.1.3-tarball-x86_64-kcbe1d947f`). The `ktstr/`-exact
+  name is required so the scratch cell's own 56/64-vCPU topology runs (the
+  `gauntlet/` variants would override it). Perf N=6/side; wedge and survival
+  1 run each.
+- **Acceptance criterion** is the narrow doc's honest-envelope test: branch
+  avg-of-6 inside the baseline `[min-max]` for every metric, out-of-envelope
+  cells reported as-is with mechanism analysis (including where the branch is
+  faster), plus the wide spin wedge killed « its deadman. The wide-idle
+  miss (§2) is recorded as the summed-trickle detectors' documented width
+  limit, not a pass/fail of this validation.

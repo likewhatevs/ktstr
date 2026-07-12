@@ -248,6 +248,8 @@ pass through.
 
 ## Related
 
+- [Run Modes](run-modes.md) — how this budgeted path sits alongside the
+  default and performance modes, and the shared reliability machinery.
 - [Performance Mode](performance-mode.md) — the full-isolation mode.
 - [Environment Variables](../reference/environment-variables.md) —
   `KTSTR_CPU_CAP`, `KTSTR_LOCK_DIR`, `KTSTR_BYPASS_LLC_LOCKS`.
