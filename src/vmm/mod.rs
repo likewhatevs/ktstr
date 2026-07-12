@@ -843,6 +843,21 @@ impl KtstrVm {
         let run_start = Instant::now();
 
         let run_locks = self.acquire_run_locks()?;
+
+        // Per-VM halt-poll (W2f): keyed on the run-lock outcome now that it is
+        // resolved. `default_cpu_mask` is set only on the default-path
+        // overcommit fallback (see `build_overcommit_run_locks`), so it is the
+        // overcommit signal. `KVM_CAP_HALT_POLL` is settable at any time
+        // (api.rst 7.20), so applying it here — after vCPU create, before the
+        // run loop — is valid. `None` leaves the host module default.
+        if let Some(ns) = setup::halt_poll_policy(
+            self.no_perf_mode,
+            self.performance_mode,
+            run_locks.default_cpu_mask.is_some(),
+        ) {
+            vm.set_halt_poll(ns);
+        }
+
         let effective_plan = run_locks
             .pinning_plan
             .as_ref()

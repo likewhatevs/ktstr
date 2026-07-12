@@ -2331,5 +2331,45 @@ impl KtstrVm {
     }
 }
 
+/// Per-VM halt-poll interval to apply via `KVM_CAP_HALT_POLL`, or `None` to
+/// leave the host's `kvm.halt_poll_ns` module default in place.
+///
+/// Keyed on signals resolved by the time `KtstrVm::run` calls this — the
+/// build-time mode flags plus the run-time `acquire_run_locks` outcome
+/// (`overcommit` is true when the default path fell back to an overcommitted
+/// CPU mask rather than a 1:1 pin, i.e. `RunLocks::default_cpu_mask` is set):
+///
+/// * `no_perf_mode` → `Some(0)`: the guest deliberately shares host CPUs with
+///   peers, so halt polling burns CPU that belongs to others.
+/// * `performance_mode` → `None`: perf mode disables HLT exits and enables the
+///   guest's own haltpoll cpuidle (see `tune_kvm_caps`), which drives
+///   `MSR_KVM_POLL_CONTROL` — host halt polling is redundant, leave the module
+///   default.
+/// * default mode, overcommit fallback → `Some(0)`: vCPUs exceed the acquired
+///   host CPUs, so polling wastes contended CPU time.
+/// * default mode, 1:1 pin → `None`: each vCPU owns a host CPU; leave the
+///   module default (200_000 == KVM_HALT_POLL_NS_DEFAULT on stock x86), which
+///   is exactly what the prior build-time policy set explicitly.
+///
+/// `no_perf_mode` is checked first: `build()` forces `performance_mode=false`
+/// under it, and overcommit only arises on the default path, so the arms are
+/// mutually exclusive — the order only fixes a defensive precedence.
+pub(super) fn halt_poll_policy(
+    no_perf_mode: bool,
+    performance_mode: bool,
+    overcommit: bool,
+) -> Option<u64> {
+    if no_perf_mode {
+        return Some(0);
+    }
+    if performance_mode {
+        return None;
+    }
+    if overcommit {
+        return Some(0);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests;

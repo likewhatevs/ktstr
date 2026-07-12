@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use kvm_bindings::{
     KVM_ARM_VCPU_PMU_V3_CTRL, KVM_ARM_VCPU_PMU_V3_INIT, KVM_ARM_VCPU_PMU_V3_IRQ,
-    KVM_ARM_VCPU_PVTIME_CTRL, KVM_ARM_VCPU_PVTIME_IPA, KVM_DEV_ARM_VGIC_CTRL_INIT,
+    KVM_ARM_VCPU_PVTIME_CTRL, KVM_ARM_VCPU_PVTIME_IPA, KVM_CAP_HALT_POLL, KVM_DEV_ARM_VGIC_CTRL_INIT,
     KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_GRP_NR_IRQS,
     KVM_IRQ_ROUTING_IRQCHIP, KVM_VGIC_V3_ADDR_TYPE_DIST, KVM_VGIC_V3_ADDR_TYPE_REDIST,
     KvmIrqRouting, kvm_create_device, kvm_device_attr, kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3,
-    kvm_irq_routing_entry, kvm_irq_routing_entry__bindgen_ty_1, kvm_irq_routing_irqchip,
+    kvm_enable_cap, kvm_irq_routing_entry, kvm_irq_routing_entry__bindgen_ty_1,
+    kvm_irq_routing_irqchip,
 };
 use kvm_ioctls::{Cap, DeviceFd, Kvm, VcpuFd, VmFd};
 use std::mem::ManuallyDrop;
@@ -233,6 +234,33 @@ impl KtstrKvm {
         self._reservation = Some(alloc.reservation);
         self.numa_layout = Some(layout);
         Ok(())
+    }
+
+    /// Set the per-VM halt-poll interval via `KVM_CAP_HALT_POLL`.
+    ///
+    /// Called from `KtstrVm::run` after `acquire_run_locks` resolves the
+    /// mode/outcome the policy keys on (see `KtstrVm::halt_poll_policy`).
+    /// `KVM_CAP_HALT_POLL` is a VM-target capability, "Architectures: all",
+    /// settable at any time per the KVM API (Documentation/virt/kvm/api.rst,
+    /// 7.20), so setting it post-vCPU-create is valid on arm64 as on x86. A
+    /// `halt_poll_ns` of 0 disables host halt polling for this VM.
+    ///
+    /// Best-effort: a host without the cap warns once and continues on the
+    /// module default rather than failing the run.
+    pub(crate) fn set_halt_poll(&self, halt_poll_ns: u64) {
+        let mut cap = kvm_enable_cap {
+            cap: KVM_CAP_HALT_POLL,
+            ..Default::default()
+        };
+        cap.args[0] = halt_poll_ns;
+        if let Err(e) = self.vm_fd.enable_cap(&cap) {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "kvm: WARNING: KVM_CAP_HALT_POLL not supported ({e}), using kernel default"
+                );
+            });
+        }
     }
 
     fn new_inner(

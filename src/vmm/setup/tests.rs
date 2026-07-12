@@ -780,3 +780,29 @@ fn numa_balancing_token_uses_kernel_accepted_spellings() {
     assert!(cxl.has_memory_only_nodes());
     assert_eq!(numa_balancing_cmdline_token(&cxl), " numa_balancing=enable");
 }
+
+/// Truth table for [`halt_poll_policy`]: the run-lock outcome and mode
+/// flags map to the halt-poll interval (or `None` = leave the module
+/// default). Mirrors the W2f policy documented on the fn.
+#[test]
+fn halt_poll_policy_truth_table() {
+    // (no_perf_mode, performance_mode, overcommit) -> expected
+    let cases = [
+        // no_perf_mode always disables polling (shared host CPUs).
+        ((true, false, false), Some(0u64)),
+        ((true, false, true), Some(0)),
+        // performance_mode leaves the module default (guest haltpoll drives it).
+        ((false, true, false), None),
+        // default mode, 1:1 pin -> leave the module default.
+        ((false, false, false), None),
+        // default mode, overcommit fallback -> disable polling.
+        ((false, false, true), Some(0)),
+    ];
+    for ((no_perf, perf, over), expected) in cases {
+        assert_eq!(
+            halt_poll_policy(no_perf, perf, over),
+            expected,
+            "halt_poll_policy(no_perf={no_perf}, perf={perf}, overcommit={over})",
+        );
+    }
+}

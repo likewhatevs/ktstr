@@ -266,6 +266,31 @@ CONFIG_X86_X2APIC=y
 # timing — unwanted in a scheduler test tool). 512 covers ktstr's wide-SMP
 # guests (the 256-vCPU split-irqchip e2e; the documented 512 ceiling).
 CONFIG_NR_CPUS=512
+# HOTPLUG_PARALLEL: parallel AP bring-up. On x86_64 the CPUHP_BP_PARALLEL_*
+# states run the INIT/SIPI (send-init, wait-for-callin) startup phase of every
+# AP concurrently in smp_init, instead of the fully serial per-CPU
+# bringup_nonboot_cpus loop (kernel/cpu.c cpuhp_bringup_cpus_parallel, added in
+# 6.5). For the wide-SMP guests ktstr boots (the 256-vCPU e2es) that serialized
+# INIT-SIPI-SIPI handshake is the dominant boot handoff chain, and it stretches
+# further when the host is contended and every vCPU's wall-clock is diluted;
+# parallelizing it collapses the chain so wide guests reach userspace sooner.
+# x86_64-only: `arch/x86/Kconfig` `select HOTPLUG_PARALLEL if SMP && X86_64`, so
+# on an x86_64 SMP build this is already y from the arch select — the symbol is
+# a promptless `bool` in `arch/Kconfig` (not directly settable), so this line
+# documents the dependency ktstr's wide-SMP boot relies on rather than forcing
+# it, and `make olddefconfig` drops it on arm64 (arm64 does not select it; GICv3
+# AP bring-up is a different path) without any effect. Deliberately NOT in
+# VALIDATE_CONFIG_CRITICAL: it is unsettable and arm64-absent, so a presence
+# check would false-fail there.
+#
+# Does NOT change the boot-ordering invariant the scheduler path depends on:
+# smp_init runs to completion (all APs onlined) before the kernel starts PID 1,
+# and ktstr's PID-1 init independently gates scheduler spawn on
+# `all_possible_cpus_online()` before Phase 3 — see
+# `src/vmm/rust_init/topology.rs` and its caller in `rust_init/init.rs`
+# (the AP-gap check precedes `start_scheduler`). Parallel bring-up only changes
+# HOW FAST the APs come online, never whether they are all online first.
+CONFIG_HOTPLUG_PARALLEL=y
 CONFIG_NUMA=y
 # HMAT: parses ACPI HMAT for memory tiering (CXL nodes).
 # NUMA_BALANCING: auto-migrates pages to local node based on access.
