@@ -2696,6 +2696,84 @@ impl<'a> BpfMapWatcher<'a> {
 /// the wait returns within microseconds of the flip and the
 /// `kill.load(Acquire)` re-check at the top of the loop body
 /// observes the new state.
+/// Which CPU-time source the progress ledger bills against, latched once
+/// (see [`select_cpu_currency`]).
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) enum CurrencySource {
+    /// PMU SW task-clock ns (guest-only, via `exclude_host`).
+    Pmu,
+    /// Per-vCPU pthread clock ns (includes host-side time in the thread).
+    Pthread,
+}
+
+/// Pick `(cpu_ns_now, currency_byte)` for one ledger tick, latching the
+/// SOURCE on the first tick.
+///
+/// LATCH INVARIANT: `latched` is `None` only on the very first tick; this
+/// fn writes it and the caller feeds the SAME cell back forever after, so
+/// the source is chosen exactly once. Task-clock ns and pthread-clock ns
+/// are DIFFERENT magnitudes for the same wall interval (the task clock
+/// excludes host-side time), so mixing them across ticks would make the
+/// ledger's `cpu_since_progress` / `cpu_ns_at_phase` anchors incoherent —
+/// a source flip could send `cpu_ns_now` backwards (consumers `saturating_sub`
+/// it, reading the regression as a 0 delta). Capabilities do not change
+/// mid-run (the counters arm at monitor start), so the first tick's
+/// availability is authoritative: PMU iff EVERY sampled vCPU carried a
+/// task clock on tick 1, else pthread — for the whole run.
+///
+/// ALL-or-fallback (never a mixed sum): PMU is chosen only when the
+/// `task_clocks` slice is non-empty and every entry is `Some`. A single
+/// absent task clock falls the whole tick back to the pthread sum, exactly
+/// as before this currency existed. Under the pthread source the currency
+/// byte is `PTHREAD` when any pthread time was present, else `NONE` (both
+/// pthread-magnitude, so switching between them mid-run is coherent).
+///
+/// `task_clocks[i]` / `pthread[i]` are vCPU `i`'s task-clock and pthread
+/// readings this tick; the two slices are the same length (one entry per
+/// sampled CPU, `None` where that source was absent).
+pub(crate) fn select_cpu_currency(
+    latched: &mut Option<CurrencySource>,
+    task_clocks: &[Option<u64>],
+    pthread: &[Option<u64>],
+) -> (u64, u8) {
+    let source = *latched.get_or_insert_with(|| {
+        if !task_clocks.is_empty() && task_clocks.iter().all(Option::is_some) {
+            CurrencySource::Pmu
+        } else {
+            CurrencySource::Pthread
+        }
+    });
+    match source {
+        // Latched PMU: sum the task clocks. Once latched, capabilities
+        // don't change so every entry stays `Some`; `flatten` is defensive
+        // (a stray `None` contributes 0 rather than aborting) and keeps the
+        // currency byte at PMU so the magnitude never flips mid-run.
+        CurrencySource::Pmu => {
+            let cpu_ns_now = task_clocks
+                .iter()
+                .flatten()
+                .fold(0u64, |a, &t| a.saturating_add(t));
+            (cpu_ns_now, super::CPU_CURRENCY_PMU)
+        }
+        // Latched pthread: identical to the pre-PMU behavior — sum the
+        // available pthread clocks, currency PTHREAD if any present else NONE.
+        CurrencySource::Pthread => {
+            let mut cpu_ns_now = 0u64;
+            let mut any = false;
+            for t in pthread.iter().flatten() {
+                cpu_ns_now = cpu_ns_now.saturating_add(*t);
+                any = true;
+            }
+            let currency = if any {
+                super::CPU_CURRENCY_PTHREAD
+            } else {
+                super::CPU_CURRENCY_NONE
+            };
+            (cpu_ns_now, currency)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn monitor_loop(
     mem: &GuestMem,
@@ -2819,6 +2897,9 @@ pub(crate) fn monitor_loop(
     let mut dump_requested = false;
     let mut cpus: Vec<CpuSnapshot> = Vec::with_capacity(num_cpus);
     let mut perf_read_err_reported = false;
+    // Progress-ledger CPU currency source, latched on the first ledger
+    // tick and never changed (see `select_cpu_currency`).
+    let mut ledger_currency: Option<CurrencySource> = None;
     let mut vcpu_timing_err_reported: Vec<bool> = vcpu_timing
         .map(|vt| vec![false; vt.pthreads.len()])
         .unwrap_or_default();
@@ -3511,24 +3592,22 @@ pub(crate) fn monitor_loop(
         // `samples.last()` is still the PREVIOUS tick (the same
         // predecessor the reactive stuck-check reads above).
         if let Some(ledger) = cfg.progress_ledger {
-            // (a) Sum available per-vCPU CPU-time; `read_cpu_times`
-            // tolerates absent vCPUs by leaving `vcpu_cpu_time_ns` None,
-            // so skip those. Currency is pthread when ANY was Some, none
-            // when all were absent (the PMU currency, value 2, is a
-            // later commit's concern).
-            let mut cpu_ns_now: u64 = 0;
-            let mut any_cpu_time = false;
-            for cpu in &cpus {
-                if let Some(t) = cpu.vcpu_cpu_time_ns {
-                    cpu_ns_now = cpu_ns_now.saturating_add(t);
-                    any_cpu_time = true;
-                }
-            }
-            let cpu_currency = if any_cpu_time {
-                super::CPU_CURRENCY_PTHREAD
-            } else {
-                super::CPU_CURRENCY_NONE
-            };
+            // (a) Choose the CPU-time currency and its sum. Prefer the
+            // PMU SW task-clock (guest-only ns, via exclude_host) when
+            // EVERY sampled vCPU carries one; else fall back to the
+            // per-vCPU pthread clock exactly as before. The source is
+            // latched on the first tick so the magnitude never flips
+            // mid-run (see `select_cpu_currency`). Both slices are one
+            // entry per CPU: task clock from `vcpu_perf`, pthread from
+            // `vcpu_cpu_time_ns`, `None` where that source was absent.
+            let task_clocks: Vec<Option<u64>> = cpus
+                .iter()
+                .map(|c| c.vcpu_perf.and_then(|p| p.task_clock_ns))
+                .collect();
+            let pthread: Vec<Option<u64>> =
+                cpus.iter().map(|c| c.vcpu_cpu_time_ns).collect();
+            let (cpu_ns_now, cpu_currency) =
+                select_cpu_currency(&mut ledger_currency, &task_clocks, &pthread);
             // (d) Runnable demand: any CPU had queued work this sample.
             let runnable_demand = cpus
                 .iter()
@@ -7249,6 +7328,80 @@ mod tests {
             }]
         };
         assert!(!progress_evidence(&bypass(1_000), &bypass(2_000_000)));
+    }
+
+    // ---- select_cpu_currency: currency selection + latch ----
+
+    #[test]
+    fn currency_all_task_clocks_present_selects_pmu() {
+        let mut latch = None;
+        let tc = [Some(10u64), Some(20), Some(30)];
+        let pt = [Some(100u64), Some(200), Some(300)];
+        let (ns, cur) = select_cpu_currency(&mut latch, &tc, &pt);
+        assert_eq!(cur, super::super::CPU_CURRENCY_PMU);
+        assert_eq!(ns, 60, "PMU sums the task clocks, not the pthread clocks");
+        assert_eq!(latch, Some(CurrencySource::Pmu));
+    }
+
+    #[test]
+    fn currency_any_task_clock_absent_falls_back_to_pthread() {
+        let mut latch = None;
+        let tc = [Some(10u64), None, Some(30)];
+        let pt = [Some(100u64), Some(200), Some(300)];
+        let (ns, cur) = select_cpu_currency(&mut latch, &tc, &pt);
+        assert_eq!(cur, super::super::CPU_CURRENCY_PTHREAD);
+        assert_eq!(ns, 600, "pthread source sums the available pthread clocks");
+        assert_eq!(latch, Some(CurrencySource::Pthread));
+    }
+
+    #[test]
+    fn currency_no_source_is_none() {
+        let mut latch = None;
+        let tc = [None, None];
+        let pt = [None, None];
+        let (ns, cur) = select_cpu_currency(&mut latch, &tc, &pt);
+        assert_eq!(cur, super::super::CPU_CURRENCY_NONE);
+        assert_eq!(ns, 0);
+        // Latched to pthread source: NONE is the pthread-magnitude "nothing
+        // present" byte, not a distinct source.
+        assert_eq!(latch, Some(CurrencySource::Pthread));
+    }
+
+    #[test]
+    fn currency_empty_slices_do_not_latch_pmu() {
+        // Guard the `all()`-on-empty trap: an empty task-clock slice must
+        // NOT read as "all present" and latch PMU forever with ns=0.
+        let mut latch = None;
+        let (ns, cur) = select_cpu_currency(&mut latch, &[], &[]);
+        assert_eq!(cur, super::super::CPU_CURRENCY_NONE);
+        assert_eq!(ns, 0);
+        assert_eq!(latch, Some(CurrencySource::Pthread));
+    }
+
+    #[test]
+    fn currency_latch_pmu_stays_pmu_after_flip() {
+        // Tick 1: all task clocks present → latch PMU.
+        let mut latch = None;
+        let (_, cur1) = select_cpu_currency(&mut latch, &[Some(10)], &[Some(100)]);
+        assert_eq!(cur1, super::super::CPU_CURRENCY_PMU);
+        // Tick 2: a task clock vanishes (shouldn't happen mid-run, but the
+        // latch must hold PMU regardless — no flip to pthread magnitude).
+        let (ns2, cur2) = select_cpu_currency(&mut latch, &[None], &[Some(100)]);
+        assert_eq!(cur2, super::super::CPU_CURRENCY_PMU);
+        assert_eq!(ns2, 0, "missing task clock contributes 0 under latched PMU");
+    }
+
+    #[test]
+    fn currency_latch_pthread_stays_pthread_after_flip() {
+        // Tick 1: a task clock is absent → latch pthread.
+        let mut latch = None;
+        let (_, cur1) = select_cpu_currency(&mut latch, &[None, Some(5)], &[Some(50), Some(60)]);
+        assert_eq!(cur1, super::super::CPU_CURRENCY_PTHREAD);
+        // Tick 2: now ALL task clocks present — but the latch holds pthread,
+        // it must NOT flip to PMU magnitude.
+        let (ns2, cur2) = select_cpu_currency(&mut latch, &[Some(5), Some(5)], &[Some(50), Some(60)]);
+        assert_eq!(cur2, super::super::CPU_CURRENCY_PTHREAD);
+        assert_eq!(ns2, 110, "pthread source keeps summing pthread clocks");
     }
 
     // ---- ProgressLedger: monitor-loop integration ----

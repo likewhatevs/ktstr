@@ -40,8 +40,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use perf_event_open_sys as pes;
 use pes::bindings::{
     PERF_COUNT_HW_BRANCH_MISSES, PERF_COUNT_HW_CACHE_MISSES, PERF_COUNT_HW_CPU_CYCLES,
-    PERF_COUNT_HW_INSTRUCTIONS, PERF_FORMAT_TOTAL_TIME_ENABLED, PERF_FORMAT_TOTAL_TIME_RUNNING,
-    PERF_TYPE_HARDWARE, perf_event_attr,
+    PERF_COUNT_HW_INSTRUCTIONS, PERF_COUNT_SW_TASK_CLOCK, PERF_FORMAT_TOTAL_TIME_ENABLED,
+    PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_TYPE_HARDWARE, PERF_TYPE_SOFTWARE, perf_event_attr,
 };
 
 /// One per-vCPU sample for the four hardware counters. Fields are raw
@@ -77,6 +77,15 @@ pub struct VcpuPerfSample {
     /// counts by `time_enabled_ns / time_running_ns` to recover the
     /// scaled estimate.
     pub time_running_ns: u64,
+    /// `PERF_COUNT_SW_TASK_CLOCK` (PERF_TYPE_SOFTWARE) reading: ns of
+    /// task execution time. With `exclude_host=1` this counts only the
+    /// ns the vCPU thread spent executing INSIDE the guest — the "guest
+    /// CPU received" currency the progress ledger prefers over the
+    /// pthread clock (which includes host-side time in the vCPU thread).
+    /// `None` when the task-clock counter never opened for this vCPU
+    /// (independently optional from the four HW counters — see
+    /// [`VcpuPerfCounters::open`]) or a transient read on it failed.
+    pub task_clock_ns: Option<u64>,
 }
 
 impl VcpuPerfSample {
@@ -95,17 +104,25 @@ impl VcpuPerfSample {
     }
 }
 
-/// Four `perf_event_open` file descriptors targeting one vCPU thread
-/// (cycles, instructions, cache-misses, branch-misses) — all
-/// configured with `exclude_host=1` so they only count while the
-/// vCPU is executing inside the guest.
+/// Up to five `perf_event_open` file descriptors targeting one vCPU
+/// thread: four HW counters (cycles, instructions, cache-misses,
+/// branch-misses) plus an OPTIONAL SW task-clock — all configured with
+/// `exclude_host=1` so they only count while the vCPU is executing
+/// inside the guest.
 ///
-/// `Drop` closes the four fds via `OwnedFd`.
+/// The four HW counters are all-or-nothing (see [`Self::open`]); the
+/// task clock is independently optional (`Option<OwnedFd>`), so a vCPU
+/// can carry HW counters without a task clock. `Drop` closes every fd
+/// via `OwnedFd`.
 pub struct VcpuPerfCounters {
     cycles: OwnedFd,
     instructions: OwnedFd,
     cache_misses: OwnedFd,
     branch_misses: OwnedFd,
+    /// `PERF_COUNT_SW_TASK_CLOCK` fd. `None` when its open failed while
+    /// the four HW counters succeeded — the vCPU degrades to
+    /// no-task-clock rather than dropping the HW set.
+    task_clock: Option<OwnedFd>,
 }
 
 impl VcpuPerfCounters {
@@ -115,7 +132,7 @@ impl VcpuPerfCounters {
     /// across host CPUs.
     ///
     /// Returns `Err` when `perf_event_open(2)` fails on any of the
-    /// four counters. The first error short-circuits — already-opened
+    /// four HW counters. The first error short-circuits — already-opened
     /// fds are dropped/closed by `OwnedFd`'s `Drop`. Common failure
     /// modes: `EACCES` (perf_event_paranoid too high or
     /// CAP_PERFMON missing), `ENODEV` (counter not available on this
@@ -124,16 +141,32 @@ impl VcpuPerfCounters {
     /// differently — `exclude_host` may be rejected when KVM is the
     /// guest hypervisor). Caller treats `Err` as "perf data
     /// unavailable for this vCPU" and continues without it.
+    ///
+    /// The SW task clock is INDEPENDENTLY optional. It rides the same
+    /// CAP_PERFMON gate as the HW counters (an `exclude_host` SW event
+    /// still demands the guest-visibility permission), so in the common
+    /// case it opens iff the four HW counters did. But a PMU-virtualizing
+    /// host can accept the SW task-clock while rejecting a HW event or
+    /// the reverse; the HW four keep their all-or-nothing contract (their
+    /// failure returns `Err` here before we reach the task clock), and a
+    /// task-clock failure that occurs AFTER the HW four succeeded
+    /// degrades THIS vCPU to no-task-clock (`task_clock = None`) without
+    /// dropping the committed HW counters. `.ok()` swallows that open
+    /// error — the ledger's currency selector reads a `None` task clock
+    /// as "PMU currency unavailable" and falls back to the pthread sum.
     pub fn open(tid: libc::pid_t) -> io::Result<Self> {
-        let cycles = open_one(tid, PERF_COUNT_HW_CPU_CYCLES as u64)?;
-        let instructions = open_one(tid, PERF_COUNT_HW_INSTRUCTIONS as u64)?;
-        let cache_misses = open_one(tid, PERF_COUNT_HW_CACHE_MISSES as u64)?;
-        let branch_misses = open_one(tid, PERF_COUNT_HW_BRANCH_MISSES as u64)?;
+        let cycles = open_one(tid, PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES as u64)?;
+        let instructions = open_one(tid, PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS as u64)?;
+        let cache_misses = open_one(tid, PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES as u64)?;
+        let branch_misses = open_one(tid, PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_MISSES as u64)?;
+        let task_clock =
+            open_one(tid, PERF_TYPE_SOFTWARE, PERF_COUNT_SW_TASK_CLOCK as u64).ok();
         Ok(Self {
             cycles,
             instructions,
             cache_misses,
             branch_misses,
+            task_clock,
         })
     }
 
@@ -151,6 +184,18 @@ impl VcpuPerfCounters {
         let (instructions, _, _) = read_one(&self.instructions)?;
         let (cache_misses, _, _) = read_one(&self.cache_misses)?;
         let (branch_misses, _, _) = read_one(&self.branch_misses)?;
+        // Task clock: `value` is the ns count directly; the time_enabled
+        // / time_running pair is irrelevant for a SW task clock (it is
+        // never multiplexed) so we discard it. A read error on the
+        // optional task-clock fd degrades to `None` (via `.ok()`) rather
+        // than dropping the whole sample — preserving the HW counters,
+        // consistent with the task clock's independent-optional contract
+        // in `open`. `None` when the fd never opened for this vCPU.
+        let task_clock_ns = self
+            .task_clock
+            .as_ref()
+            .and_then(|fd| read_one(fd).ok())
+            .map(|(v, _, _)| v);
         Ok(VcpuPerfSample {
             cycles,
             instructions,
@@ -158,14 +203,15 @@ impl VcpuPerfCounters {
             branch_misses,
             time_enabled_ns,
             time_running_ns,
+            task_clock_ns,
         })
     }
 }
 
-fn open_one(tid: libc::pid_t, config: u64) -> io::Result<OwnedFd> {
+fn open_one(tid: libc::pid_t, type_: u32, config: u64) -> io::Result<OwnedFd> {
     let mut attr = perf_event_attr {
         size: std::mem::size_of::<perf_event_attr>() as u32,
-        type_: PERF_TYPE_HARDWARE,
+        type_,
         config,
         read_format: (PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING) as u64,
         ..Default::default()
@@ -324,12 +370,50 @@ mod tests {
         // Cycles fit in u63 in any sane scenario — guard against an
         // accidental sign-extension bug in the read path.
         assert!(sample.cycles < (1u64 << 63));
+        // Task clock is independently optional: on hosts where the SW
+        // task-clock open failed but the HW four succeeded it is `None`;
+        // otherwise it reads a plausible ns count. With exclude_host=1 on
+        // a non-guest self-thread the count is ~0 (no guest entry). Assert
+        // only the structural shape so the test is robust across envs.
+        if let Some(tc) = sample.task_clock_ns {
+            assert!(tc < (1u64 << 63), "task_clock_ns sign-extension: {tc}");
+        }
     }
 
     #[test]
     fn ipc_zero_when_cycles_zero() {
         let s = VcpuPerfSample::default();
         assert_eq!(s.ipc(), 0.0);
+    }
+
+    /// A default sample carries no task clock — the ledger's currency
+    /// selector must read `None` (not a spurious `Some(0)`) so a fake
+    /// harness with no perf counters falls back to the pthread sum.
+    #[test]
+    fn default_sample_has_no_task_clock() {
+        assert_eq!(VcpuPerfSample::default().task_clock_ns, None);
+    }
+
+    /// Partial availability: a vCPU whose SW task-clock open failed keeps
+    /// its four HW counters and reports `task_clock_ns = None`. We can't
+    /// force an open failure from a unit test, but the read path must
+    /// preserve a `None` task clock rather than fabricating a reading —
+    /// pin the shape via a sample built with the HW fields set and the
+    /// task clock absent (the exact struct `read()` yields when the
+    /// task_clock fd was `None`).
+    #[test]
+    fn partial_availability_hw_without_task_clock() {
+        let s = VcpuPerfSample {
+            cycles: 1_000,
+            instructions: 1_500,
+            cache_misses: 3,
+            branch_misses: 1,
+            time_enabled_ns: 10_000,
+            time_running_ns: 10_000,
+            task_clock_ns: None,
+        };
+        assert_eq!(s.task_clock_ns, None);
+        assert!((s.ipc() - 1.5).abs() < 1e-9);
     }
 
     #[test]
@@ -408,6 +492,7 @@ mod tests {
             branch_misses: 2,
             time_enabled_ns: 1_000_000,
             time_running_ns: 600_000,
+            task_clock_ns: None,
         };
         let mut v = Verdict::new();
         crate::claim!(v, s.time_running_ns).eq(s.time_enabled_ns);

@@ -65,19 +65,20 @@ pub(crate) enum KillDecision {
 /// and still made no progress".
 const TIER2_CPU_EPSILON_NS: u64 = 10_000_000;
 
-/// Widen a CPU budget for the trust level of its currency. PMU cycles
-/// (`exclude_host`) measure guest CPU directly, so the budget is used
-/// as-is. Per-vCPU pthread CPU time additionally charges VM-exit /
-/// host-side overhead to the guest, inflating the apparent CPU burn by a
-/// documented margin; widen the budget by 3/2 (integer `b + b/2`) so
-/// that overhead does not push a healthy phase over its Tier-1 budget.
-/// Saturating so a `u64::MAX` (Body sentinel) budget cannot wrap.
+/// Widen a CPU budget for the trust level of its currency. The PMU
+/// SW task-clock (`exclude_host`) measures guest-only CPU time directly,
+/// so the budget is used as-is. Per-vCPU pthread CPU time additionally
+/// charges VM-exit / host-side overhead to the guest, inflating the
+/// apparent CPU burn by a documented margin; widen the budget by 3/2
+/// (integer `b + b/2`) so that overhead does not push a healthy phase
+/// over its Tier-1 budget. Saturating so a `u64::MAX` (Body sentinel)
+/// budget cannot wrap.
 const fn widen_budget_for_currency(budget: u64, cpu_currency: u8) -> u64 {
     match cpu_currency {
         // pthread time includes VM-exit overhead — degrade the budget by
         // widening it 3/2 (integer math).
         CPU_CURRENCY_PTHREAD => budget.saturating_add(budget / 2),
-        // PMU (or any other trusted source) measures guest cycles
+        // PMU (or any other trusted source) measures guest-only CPU time
         // directly — no widening.
         _ => budget,
     }

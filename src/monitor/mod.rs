@@ -629,9 +629,12 @@ pub(crate) const CPU_CURRENCY_NONE: u8 = 0;
 /// pthread clock (`CpuSnapshot::vcpu_cpu_time_ns`).
 pub(crate) const CPU_CURRENCY_PTHREAD: u8 = 1;
 /// [`ProgressLedger::cpu_currency`]: CPU-time sourced from the host PMU
-/// (`exclude_host` cycle counter). Reserved — never written by this
-/// commit; a later commit that folds the PMU currency uses it.
-#[allow(dead_code)]
+/// SW task-clock (`PERF_COUNT_SW_TASK_CLOCK` with `exclude_host=1`),
+/// counting only ns the vCPU executed inside the guest. Written by the
+/// monitor loop when every sampled vCPU carries a task clock on the
+/// first tick (see [`reader::select_cpu_currency`]); the source is
+/// latched for the whole run so this never mixes with pthread-magnitude
+/// ns mid-run.
 pub(crate) const CPU_CURRENCY_PMU: u8 = 2;
 
 /// Coarse lifecycle stage of a guest cell, tracked live in the
@@ -790,9 +793,11 @@ pub(crate) struct ProgressLedger {
     /// a kill.
     pub(crate) runnable_demand: AtomicBool,
     /// Provenance of `cpu_ns_now`: [`CPU_CURRENCY_NONE`],
-    /// [`CPU_CURRENCY_PTHREAD`], or [`CPU_CURRENCY_PMU`] (the last never
-    /// written this commit). Relaxed — diagnostic-adjacent; a stale
-    /// currency never changes a kill decision by itself.
+    /// [`CPU_CURRENCY_PTHREAD`], or [`CPU_CURRENCY_PMU`]. Latched to one
+    /// source on the first tick (see [`reader::select_cpu_currency`]) so
+    /// PMU and pthread magnitudes never mix mid-run. Relaxed —
+    /// diagnostic-adjacent; a stale currency never changes a kill
+    /// decision by itself.
     pub(crate) cpu_currency: AtomicU8,
 }
 
