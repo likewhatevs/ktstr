@@ -307,6 +307,10 @@ struct RunPlans {
     mbind_node_map: Vec<Vec<usize>>,
     no_perf_plan: Option<host_topology::LlcPlan>,
     host_topo: Option<host_topology::HostTopology>,
+    /// Effective `CpuCap` the no-perf build-time plan targeted, so the
+    /// run-time replan in `acquire_run_locks` reuses the same budget.
+    /// `None` on every non-no-perf / degraded path.
+    no_perf_effective_cap: Option<host_topology::CpuCap>,
 }
 
 impl KtstrVmBuilder {
@@ -1029,9 +1033,25 @@ impl KtstrVmBuilder {
         let RunPlans {
             pinning_plan,
             mbind_node_map,
-            no_perf_plan,
+            mut no_perf_plan,
             host_topo: cached_host_topo,
+            no_perf_effective_cap,
         } = self.resolve_run_plans(no_perf_mode)?;
+
+        // Move the no-perf plan's build-time `LOCK_SH` fds off the plan
+        // into their own slot so `acquire_run_locks` (which sees `&self`)
+        // can drop them once its run-time replan holds fresh locks. Held
+        // on the plan they would outlive the replan — a cell that replans
+        // to different LLCs would keep phantom holds on the abandoned
+        // build-time LLCs until `KtstrVm` drop, undercutting the truthful
+        // holder counts this reservation exists to establish. The plan
+        // keeps its shape fields (`cpus` / `locked_llcs` / `mems`) for the
+        // build-time setup consumers. `None` / non-no-perf plans yield an
+        // empty slot.
+        let no_perf_build_locks = no_perf_plan
+            .as_mut()
+            .map(|p| std::mem::take(&mut p.locks))
+            .unwrap_or_default();
 
         let kernel = self.kernel.context("kernel path required")?;
         anyhow::ensure!(kernel.exists(), "kernel not found: {}", kernel.display());
@@ -1161,6 +1181,8 @@ impl KtstrVmBuilder {
             pinning_plan,
             mbind_node_map,
             no_perf_plan,
+            no_perf_effective_cap,
+            no_perf_build_locks: std::sync::Mutex::new(no_perf_build_locks),
             host_topo: cached_host_topo,
             sched_enable_cmds: self.sched_enable_cmds,
             sched_disable_cmds: self.sched_disable_cmds,
@@ -1206,6 +1228,14 @@ impl KtstrVmBuilder {
         // through `acquire_resource_locks` and do not need the
         // topology at run time.
         let mut cached_host_topo: Option<host_topology::HostTopology> = None;
+        // No-perf run-time replan budget: the exact effective `CpuCap`
+        // the build-time plan targeted, carried onto `KtstrVm` so
+        // `acquire_run_locks` re-plans against the SAME budget (not one
+        // recomputed from a possibly-shifted allowed set) after the
+        // build-time holds have made peers' holder counts truthful.
+        // `None` for perf-mode and the degraded-sysfs / bypass no-perf
+        // branches, which never replan.
+        let mut no_perf_effective_cap: Option<host_topology::CpuCap> = None;
 
         let (pinning_plan, mbind_node_map, no_perf_plan) = if no_perf_mode {
             // No-perf-mode VMs would otherwise have unrestricted vCPU
@@ -1314,12 +1344,6 @@ impl KtstrVmBuilder {
                         }
                     }
                 }
-                // Compute the plan and immediately drop the flocks:
-                // we want the plan SHAPE on KtstrVm but not the
-                // RAII fds. `run()` re-takes fresh `LOCK_SH` on
-                // `plan.locked_llcs` via `acquire_resource_locks`
-                // just before vCPU spawn so the build-to-run
-                // setup window holds no flocks.
                 // Spread placement: concurrent no-perf VMs fan out
                 // across least-held LLCs (pid-rotated tiebreak)
                 // instead of Consolidate-stacking onto the same
@@ -1327,19 +1351,32 @@ impl KtstrVmBuilder {
                 // 30-cell verifier sweep's affinity masks onto the
                 // low LLCs of a 16-LLC runner. Builds keep
                 // Consolidate (see `PlacementPolicy`).
-                let mut plan = host_topology::acquire_llc_plan(
+                let plan = host_topology::acquire_llc_plan(
                     &host_topo,
                     &test_topo,
                     effective_cap,
                     host_topology::PlacementPolicy::spread_for_process(),
                 )?;
                 host_topology::warn_if_cross_node_spill(&plan, &host_topo);
-                // Strip the flock fds — they release on drop. The
-                // plan's `cpus` / `locked_llcs` / `mems` fields
-                // stay populated for build-time setup paths
-                // (no_perf_cpus on virtio-blk worker, mask
-                // computation in run_vm/freeze_coord).
-                drop(std::mem::take(&mut plan.locks));
+                // Keep the plan's `LOCK_SH` flock fds ALIVE — do NOT
+                // strip them. Those held fds are precisely what makes a
+                // concurrent peer's DISCOVER of these LLCs see a truthful
+                // holder count. The historical `drop(take(&mut
+                // plan.locks))` here released every reservation before any
+                // peer reached its own PLAN phase, so a concurrent no-perf
+                // sweep observed zero holders and every cell Spread-planned
+                // as if it were alone: the holder-count feedback was dead
+                // and the cells re-clustered onto the same low LLCs the
+                // Spread policy exists to avoid. `build()` moves these fds
+                // off `plan.locks` into `KtstrVm::no_perf_build_locks`,
+                // where they are held through the setup window and released
+                // the moment `run()`'s `acquire_run_locks` re-plans against
+                // the now-truthful counts and adopts the fresh plan's own
+                // fds — acquire-before-release, so retained LLCs never
+                // flicker free (see `KtstrVm::no_perf_effective_cap` for
+                // the replan budget). `plan.cpus` / `locked_llcs` / `mems`
+                // stay populated for the build-time setup paths regardless.
+                no_perf_effective_cap = effective_cap;
                 cached_host_topo = Some(host_topo);
                 (None, Vec::new(), Some(plan))
             } else {
@@ -1382,6 +1419,7 @@ impl KtstrVmBuilder {
             mbind_node_map,
             no_perf_plan,
             host_topo: cached_host_topo,
+            no_perf_effective_cap,
         })
     }
 

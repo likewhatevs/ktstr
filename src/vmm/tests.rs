@@ -27,6 +27,10 @@ fn build_overcommit_run_locks_uses_allowed_as_mask() {
     assert_eq!(rl.default_cpu_mask, Some(vec![0, 1, 2, 3]));
     assert!(rl.locks.is_empty());
     assert!(rl.pinning_plan.is_none());
+    // The overcommit path is not the no-perf replan path — it must not
+    // populate `no_perf_cpus` (only `acquire_run_locks`' no-perf arm
+    // does, from its fresh LLC plan).
+    assert!(rl.no_perf_cpus.is_none());
 }
 
 /// acquire_default_run_locks overcommits (default_cpu_mask = the allowed cpuset)
@@ -47,6 +51,7 @@ fn acquire_default_run_locks_overcommits_with_no_host_topo() {
         "overcommit uses the allowed cpuset as the mask",
     );
     assert!(rl.pinning_plan.is_none());
+    assert!(rl.no_perf_cpus.is_none());
 }
 
 /// acquire_default_run_locks overcommits when the host is too small for a 1:1
@@ -71,6 +76,7 @@ fn acquire_default_run_locks_overcommits_when_host_too_small() {
         "host too small for a 1:1 pin overcommits to the allowed cpuset",
     );
     assert!(rl.pinning_plan.is_none());
+    assert!(rl.no_perf_cpus.is_none());
 }
 
 /// degrade_contention_to_overcommit converts a transient ResourceContention
@@ -100,6 +106,7 @@ fn degrade_contention_to_overcommit_passes_success_through() {
         locks: Vec::new(),
         default_cpu_mask: Some(vec![0, 1]),
         pinning_plan: None,
+        no_perf_cpus: None,
     });
     let rl = KtstrVm::degrade_contention_to_overcommit(ok).expect("Ok passes through");
     assert_eq!(rl.default_cpu_mask, Some(vec![0, 1]));

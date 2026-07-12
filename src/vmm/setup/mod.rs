@@ -524,6 +524,13 @@ impl KtstrVm {
     pub(super) fn init_virtio_blk(
         &self,
         vm: &kvm::KtstrKvm,
+        // No-perf worker-placement override from `run_vm`'s run-time
+        // replan. `Some` on the no-perf test path — the fresh LLC plan's
+        // CPUs, which name the LLCs the run-scoped flocks hold; the worker
+        // shares that budget. `None` on the interactive path (no replan
+        // runs) and every non-no-perf run, where the placement falls back
+        // to the build-time `self.no_perf_plan.cpus` exactly as before.
+        no_perf_cpus: Option<&[usize]>,
     ) -> Result<Option<Arc<PiMutex<virtio_blk::VirtioBlk>>>> {
         let Some(disk) = self.disk.as_ref() else {
             return Ok(None);
@@ -593,10 +600,15 @@ impl KtstrVm {
         // fallback). The setter only takes effect on the next worker
         // spawn — `with_options` deferred initial spawn to DRIVER_OK
         // (matching the respawn path), so this call lands inside the
-        // window and the first worker observes the placement.
+        // window and the first worker observes the placement. The
+        // run-time-replan `no_perf_cpus` override wins over the
+        // build-time `no_perf_plan.cpus` so the worker binds to the same
+        // LLCs the run-scoped flocks hold.
         let placement = virtio_blk::WorkerPlacement {
             service_cpu: self.pinning_plan.as_ref().and_then(|p| p.service_cpu),
-            no_perf_cpus: self.no_perf_plan.as_ref().map(|p| p.cpus.clone()),
+            no_perf_cpus: no_perf_cpus
+                .map(<[usize]>::to_vec)
+                .or_else(|| self.no_perf_plan.as_ref().map(|p| p.cpus.clone())),
         };
         blk.set_worker_placement(placement);
         blk.set_mem((*vm.guest_mem).clone());
@@ -858,6 +870,10 @@ impl KtstrVm {
         vm: &kvm::KtstrKvm,
         pci_bus: &Arc<PiMutex<pci::PciBus>>,
         msix_sink: Option<Arc<dyn virtio_msix::MsixRouteSink>>,
+        // No-perf worker-placement override — same semantics as the MMIO
+        // twin `init_virtio_blk`: the run-time-replan CPUs when `Some`,
+        // else the build-time `self.no_perf_plan.cpus` fallback.
+        no_perf_cpus: Option<&[usize]>,
     ) -> Result<Option<BlkDeviceHandles>> {
         let Some(disk) = self.disk.as_ref() else {
             return Ok(None);
@@ -876,10 +892,13 @@ impl KtstrVm {
             virtio_blk::VirtioBlk::with_options(backing, capacity, disk.throttle, disk.read_only);
         // Worker placement + guest memory — same as `init_virtio_blk`. Both land
         // before the deferred initial worker spawn (DRIVER_OK), so the first
-        // worker observes the placement and guest memory.
+        // worker observes the placement and guest memory. The run-time-replan
+        // `no_perf_cpus` override wins over the build-time `no_perf_plan.cpus`.
         let placement = virtio_blk::WorkerPlacement {
             service_cpu: self.pinning_plan.as_ref().and_then(|p| p.service_cpu),
-            no_perf_cpus: self.no_perf_plan.as_ref().map(|p| p.cpus.clone()),
+            no_perf_cpus: no_perf_cpus
+                .map(<[usize]>::to_vec)
+                .or_else(|| self.no_perf_plan.as_ref().map(|p| p.cpus.clone())),
         };
         blk.set_worker_placement(placement);
         blk.set_mem((*vm.guest_mem).clone());

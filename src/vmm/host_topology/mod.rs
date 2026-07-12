@@ -1330,7 +1330,21 @@ fn discover_llc_snapshots(
         crate::flock::materialize(&path)?;
         let holders =
             crate::flock::read_holders_with_mountinfo(&path, mountinfo).unwrap_or_default();
-        let holder_count = holders.len();
+        // Exclude the calling process from the PLAN-driving holder
+        // count. No-perf `build()` now holds this LLC's `LOCK_SH` from
+        // build through run, so at the run-time replan our own
+        // build-time fd shows up in `/proc/locks` for this very LLC.
+        // Counting it would make every LLC we already reserved look one
+        // holder busier to ourselves and push the Spread policy to FLEE
+        // our own reservation onto a different LLC — the opposite of the
+        // truthful-holder-count fix. At build time we hold nothing yet,
+        // so this filter is a no-op there. The full `holders` vec is
+        // kept intact for diagnostics / `ktstr locks`; only the sort key
+        // drops self.
+        let holder_count = holders
+            .iter()
+            .filter(|h| h.pid != std::process::id())
+            .count();
         snapshots.push(LlcSnapshot {
             llc_idx,
             lockfile_path: path,

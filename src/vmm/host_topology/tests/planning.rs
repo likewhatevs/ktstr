@@ -809,6 +809,216 @@ fn acquire_llc_plan_consolidates_on_peer_held_llc() {
     let _ = child.wait();
 }
 
+/// `discover_llc_snapshots` EXCLUDES the calling process from the
+/// PLAN-driving `holder_count`, but keeps it in the diagnostic
+/// `holders` vec — while a PEER process's hold DOES count.
+///
+/// Rationale: no-perf `build()` now holds each planned LLC's
+/// `LOCK_SH` from build through run (the fd strip was removed), so at
+/// the run-time replan our own build-time fd is present in
+/// `/proc/locks` for the very LLCs we already reserved. If
+/// `holder_count` counted it, the Spread policy — which prefers the
+/// LEAST-held LLCs — would flee our own reservation onto a different
+/// LLC, the exact opposite of the truthful-holder-count fix. This
+/// test holds `LOCK_SH` on LLC 0 from the test PROCESS and on LLC 1
+/// from a `flock(1)` CHILD, then asserts LLC 0's `holder_count` is 0
+/// (self excluded) with self still in the `holders` vec, and LLC 1's
+/// `holder_count` is 1 (the peer counts).
+///
+/// Uses `flock(1)` for the peer so the holder is a genuinely
+/// different pid; absent util-linux the test skips rather than fails
+/// (same convention as `acquire_llc_plan_consolidates_on_peer_held_llc`).
+#[test]
+fn discover_excludes_self_pid_from_holder_count() {
+    let _llc_prefix = LlcLockPrefixGuard::new();
+    // 2 LLCs on the same node; both CPUs in `allowed` so neither LLC
+    // is skipped by discover's allowed-overlap filter.
+    let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
+    let allowed: std::collections::BTreeSet<usize> = [0usize, 1].into_iter().collect();
+
+    // Self-hold SH on LLC 0 from this process/thread.
+    let self_lock_path = llc_lock_path(0);
+    crate::flock::materialize(&self_lock_path).expect("materialize self lockfile");
+    let _self_hold = try_flock(&self_lock_path, FlockMode::Shared)
+        .expect("open self lockfile")
+        .expect("self SH on a fresh LLC 0 lockfile must succeed");
+
+    // Peer child holds SH on LLC 1 via flock(1). Materialize first so
+    // the child opens the same inode the parent's discover stats.
+    let peer_lock_path = llc_lock_path(1);
+    crate::flock::materialize(&peer_lock_path).expect("materialize peer lockfile");
+    let child = std::process::Command::new("flock")
+        .args(["-s", "-n", &peer_lock_path, "sleep", "2"])
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "discover_excludes_self_pid_from_holder_count: \
+                 flock(1) not available, skipping ({e})"
+            );
+            return;
+        }
+        Err(e) => panic!("spawn flock(1): {e}"),
+    };
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo");
+    let snapshots =
+        discover_llc_snapshots(&topo, &allowed, &mountinfo).expect("discover must succeed");
+
+    let llc0 = snapshots
+        .iter()
+        .find(|s| s.llc_idx == 0)
+        .expect("LLC 0 snapshot present");
+    let llc1 = snapshots
+        .iter()
+        .find(|s| s.llc_idx == 1)
+        .expect("LLC 1 snapshot present");
+
+    let self_pid = std::process::id();
+    assert!(
+        llc0.holders.iter().any(|h| h.pid == self_pid),
+        "self must remain in the diagnostic holders vec for LLC 0; \
+         holders={:?}",
+        llc0.holders,
+    );
+    assert_eq!(
+        llc0.holder_count, 0,
+        "self-held SH must be EXCLUDED from LLC 0's holder_count (got \
+         {}, holders={:?})",
+        llc0.holder_count, llc0.holders,
+    );
+    assert_eq!(
+        llc1.holder_count, 1,
+        "a peer process's SH must COUNT toward LLC 1's holder_count \
+         (got {}, holders={:?})",
+        llc1.holder_count, llc1.holders,
+    );
+    assert!(
+        llc1.holders.iter().all(|h| h.pid != self_pid),
+        "self never locked LLC 1, so must not appear there; holders={:?}",
+        llc1.holders,
+    );
+
+    // Child exits after sleep 2; reap it so we don't leave zombies.
+    let _ = child.wait();
+}
+
+/// The plan `acquire_llc_plan` returns carries its `LOCK_SH` flock
+/// fds LIVE: held through the plan's lifetime, visible to a peer's
+/// `/proc/locks` read, and released on drop. This is the precondition
+/// the no-perf `build()` fix relies on — `build()` now forwards the
+/// plan's `locks` onto `KtstrVm::no_perf_plan` UNSTRIPPED (the
+/// historical `drop(std::mem::take(&mut plan.locks))` is gone), so a
+/// concurrent peer's DISCOVER observes a truthful holder count from
+/// build through run. With the fds stripped (the old behavior) the
+/// Spread policy's holder-count feedback was dead.
+///
+/// Asserts: (1) `plan.locks` is non-empty; (2) our pid is a holder of
+/// the locked LLC's lockfile while the plan lives; (3) after
+/// `drop(plan)` our pid is gone from that lockfile's holders.
+#[test]
+fn acquire_llc_plan_holds_locks_live_until_drop() {
+    let _llc_prefix = LlcLockPrefixGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![0, 1]);
+    let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(2, 1);
+    let cap = CpuCap::new(1).expect("cap=1 valid");
+
+    let plan = acquire_llc_plan(
+        &topo,
+        &test_topo,
+        Some(cap),
+        PlacementPolicy::spread_for_process(),
+    )
+    .expect("acquire_llc_plan must succeed on a fresh two-LLC host");
+    assert!(
+        !plan.locks.is_empty(),
+        "the plan must carry its live LOCK_SH fds (the build-time fd \
+         strip is gone); got empty locks",
+    );
+
+    let locked = *plan
+        .locked_llcs
+        .first()
+        .expect("a cap=1 plan locks exactly one LLC");
+    let lock_path = std::path::PathBuf::from(llc_lock_path(locked));
+    let self_pid = std::process::id();
+
+    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo while plan alive");
+    let held = crate::flock::read_holders_with_mountinfo(&lock_path, &mountinfo)
+        .expect("read holders while plan alive");
+    assert!(
+        held.iter().any(|h| h.pid == self_pid),
+        "our LOCK_SH must be visible in /proc/locks while the plan \
+         lives; holders={held:?}",
+    );
+
+    drop(plan);
+
+    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo after drop");
+    let after = crate::flock::read_holders_with_mountinfo(&lock_path, &mountinfo)
+        .expect("read holders after drop");
+    assert!(
+        after.iter().all(|h| h.pid != self_pid),
+        "dropping the plan must release our LOCK_SH; holders still \
+         list us: {after:?}",
+    );
+}
+
+/// The build-time no-perf fds live in a `Mutex<Vec<OwnedFd>>` on
+/// `KtstrVm` (not on the plan) so `acquire_run_locks`, which only has
+/// `&self`, can release them the moment its replan adopts fresh locks.
+/// This test exercises exactly that release path: park a held
+/// `LOCK_SH` fd in such a slot, confirm our pid is a holder, then run
+/// the `drop(std::mem::take(&mut *slot.lock().unwrap()))` release
+/// through a SHARED (`&`) borrow of the slot — the same expression the
+/// no-perf replan arm runs — and confirm our pid drops out of
+/// `/proc/locks`. Without the interior-mutable slot the fd could only
+/// release at `KtstrVm` drop, leaving a phantom hold on any LLC the
+/// replan abandoned for the whole run.
+#[test]
+fn parked_build_locks_release_through_shared_borrow() {
+    let _llc_prefix = LlcLockPrefixGuard::new();
+    let lock_path_s = llc_lock_path(0);
+    let lock_path = std::path::PathBuf::from(&lock_path_s);
+    crate::flock::materialize(&lock_path_s).expect("materialize lockfile");
+    let fd = try_flock(&lock_path_s, FlockMode::Shared)
+        .expect("open lockfile")
+        .expect("SH on a fresh lockfile must succeed");
+
+    // The slot as it lives on `KtstrVm`. Bind by shared ref to prove
+    // the release needs only `&self`, not `&mut`.
+    let slot: std::sync::Mutex<Vec<std::os::fd::OwnedFd>> = std::sync::Mutex::new(vec![fd]);
+    let slot_ref: &std::sync::Mutex<Vec<std::os::fd::OwnedFd>> = &slot;
+
+    let self_pid = std::process::id();
+    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo while parked");
+    let held = crate::flock::read_holders_with_mountinfo(&lock_path, &mountinfo)
+        .expect("read holders while parked");
+    assert!(
+        held.iter().any(|h| h.pid == self_pid),
+        "the parked fd must hold LOCK_SH; holders={held:?}",
+    );
+
+    // The exact release expression from `acquire_run_locks`' no-perf arm.
+    drop(std::mem::take(&mut *slot_ref.lock().unwrap()));
+
+    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo after release");
+    let after = crate::flock::read_holders_with_mountinfo(&lock_path, &mountinfo)
+        .expect("read holders after release");
+    assert!(
+        after.iter().all(|h| h.pid != self_pid),
+        "take-and-drop through the shared borrow must release our \
+         LOCK_SH; holders still list us: {after:?}",
+    );
+    assert!(
+        slot_ref.lock().unwrap().is_empty(),
+        "the slot must be drained after the take",
+    );
+}
+
 /// `ACQUIRE_MAX_TOCTOU_RETRIES` pins the retry budget at 3 —
 /// one DISCOVER + up to three retry DISCOVERs (four total
 /// attempts), each separated by an ascending micro-sleep

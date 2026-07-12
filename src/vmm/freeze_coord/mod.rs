@@ -1216,6 +1216,14 @@ impl KtstrVm {
         mut vm: kvm::KtstrKvm,
         default_cpu_mask: Option<&[usize]>,
         effective_pinning_plan: Option<&super::host_topology::PinningPlan>,
+        // Refreshed no-perf CPU list from `acquire_run_locks`' run-time
+        // replan. `Some` only on the no-perf path; used in preference to
+        // the stale build-time `self.no_perf_plan.cpus` for every affinity
+        // mask below (vCPU-thread mask, BSP mask, virtio-blk worker
+        // placement) so those masks match the LLCs the run-scoped flocks
+        // hold. `None` keeps the pre-replan `no_perf_plan` / default-mask
+        // fallback (the interactive path and every non-no-perf run).
+        effective_no_perf_cpus: Option<&[usize]>,
     ) -> Result<VmRunState> {
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
@@ -1481,15 +1489,17 @@ impl KtstrVm {
         #[cfg(target_arch = "x86_64")]
         let (virtio_blk, blk_device, _blk_resample_evt): (Option<_>, Option<_>, Option<_>) =
             match pci_bus_handle.as_ref() {
-                Some(bus) => match self.init_virtio_blk_pci(&vm, bus, msix_sink)? {
-                    Some(h) => (None, Some(h.device), h.resample_evt),
-                    None => (None, None, None),
-                },
+                Some(bus) => {
+                    match self.init_virtio_blk_pci(&vm, bus, msix_sink, effective_no_perf_cpus)? {
+                        Some(h) => (None, Some(h.device), h.resample_evt),
+                        None => (None, None, None),
+                    }
+                }
                 None => (None, None, None),
             };
         #[cfg(not(target_arch = "x86_64"))]
         let (virtio_blk, blk_device): (Option<_>, Option<_>) = {
-            let dev = self.init_virtio_blk(&vm)?;
+            let dev = self.init_virtio_blk(&vm, effective_no_perf_cpus)?;
             (dev.clone(), dev)
         };
         // Plumb the shared parked_evt into the device (both transports) so its
@@ -1664,10 +1674,15 @@ impl KtstrVm {
         // No-perf + --cpu-cap: flat CPU list from the LLC plan gets
         // sched_setaffinity'd on every vCPU thread as a mask (not a
         // hard pin). Mutually exclusive with perf-mode's pin_targets.
-        let no_perf_mask: Option<&[usize]> = self
-            .no_perf_plan
-            .as_ref()
-            .map(|p| p.cpus.as_slice())
+        // The run-time replan's `effective_no_perf_cpus` wins over the
+        // build-time `no_perf_plan.cpus`: they name the LLCs the
+        // run-scoped flocks actually hold, whereas the build-time plan
+        // may have Spread-planned against then-truthful-now-stale holder
+        // counts. Falls through to `no_perf_plan` (interactive path,
+        // where no replan runs) and finally `default_cpu_mask`
+        // (overcommit).
+        let no_perf_mask: Option<&[usize]> = effective_no_perf_cpus
+            .or(self.no_perf_plan.as_ref().map(|p| p.cpus.as_slice()))
             .or(default_cpu_mask);
 
         // Per-AP TID slots — each AP thread stamps gettid() into its
