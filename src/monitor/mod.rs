@@ -866,6 +866,60 @@ impl ProgressLedger {
         self.record_progress(cpu_ns_now, wall_ns);
         true
     }
+
+    /// Read every field the watchdog folds each tick in one shot, under
+    /// the payload-before-epoch contract. `progress_epoch` is loaded
+    /// FIRST with Acquire ordering so the `cpu_ns_at_progress` /
+    /// `wall_ns_at_progress` payload reads that follow are ordered after
+    /// it: the writer stores that payload (Relaxed) then bumps the epoch
+    /// (Release — see [`Self::record_progress`]), so an Acquire load
+    /// observing a given epoch also observes its payload. The remaining
+    /// fields are Relaxed (per the ledger's one-tick-staleness contract);
+    /// a torn combination only makes a kill decision MORE conservative.
+    pub(crate) fn snapshot(&self) -> LedgerSnapshot {
+        let progress_epoch = self.progress_epoch.load(Ordering::Acquire);
+        let cpu_ns_at_progress = self.cpu_ns_at_progress.load(Ordering::Relaxed);
+        let wall_ns_at_progress = self.wall_ns_at_progress.load(Ordering::Relaxed);
+        LedgerSnapshot {
+            phase: self.phase.load(Ordering::Relaxed),
+            cpu_ns_now: self.cpu_ns_now.load(Ordering::Relaxed),
+            cpu_ns_at_phase: self.cpu_ns_at_phase.load(Ordering::Relaxed),
+            cpu_ns_at_progress,
+            wall_ns_at_progress,
+            progress_epoch,
+            monitor_heartbeat: self.monitor_heartbeat.load(Ordering::Relaxed),
+            runnable_demand: self.runnable_demand.load(Ordering::Relaxed),
+            cpu_currency: self.cpu_currency.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Immutable one-tick snapshot of the [`ProgressLedger`] fields the VM
+/// watchdog folds into a kill decision, taken via
+/// [`ProgressLedger::snapshot`] so the memory-ordering contract stays
+/// co-located with the ledger. A plain value struct — the watchdog
+/// evaluates it against the pure `vmm::freeze_coord::watchdog_step`
+/// tiers without holding any atomic across the decision.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LedgerSnapshot {
+    /// Live lifecycle stage id ([`LifecycleStage`] as `u8`).
+    pub(crate) phase: u8,
+    /// Summed per-vCPU CPU-time (ns) as of the latest monitor tick.
+    pub(crate) cpu_ns_now: u64,
+    /// `cpu_ns_now` captured at the last stage advance.
+    pub(crate) cpu_ns_at_phase: u64,
+    /// `cpu_ns_now` captured at the last progress epoch.
+    pub(crate) cpu_ns_at_progress: u64,
+    /// `run_start`-relative wall time (ns) at the last progress epoch.
+    pub(crate) wall_ns_at_progress: u64,
+    /// Monotone count of NEW-WORK observations.
+    pub(crate) progress_epoch: u64,
+    /// Monitor liveness pulse (bumped unconditionally every tick).
+    pub(crate) monitor_heartbeat: u64,
+    /// The guest had queued work at the latest sample.
+    pub(crate) runnable_demand: bool,
+    /// Provenance of `cpu_ns_now` ([`CPU_CURRENCY_NONE`]/`PTHREAD`/`PMU`).
+    pub(crate) cpu_currency: u8,
 }
 
 #[cfg(test)]

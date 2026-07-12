@@ -20,9 +20,10 @@
 //! Tier-3 (the guest-derived hard deadline) and the AP-kill path stay in
 //! the existing watchdog deadline logic — this module is only the two
 //! progress-derived tiers.
-#![allow(dead_code)]
 
-use crate::monitor::{CPU_CURRENCY_NONE, CPU_CURRENCY_PTHREAD};
+use crate::monitor::{
+    CPU_CURRENCY_NONE, CPU_CURRENCY_PTHREAD, LedgerSnapshot, LifecycleStage, StageClass,
+};
 use crate::test_support::runtime::{phase_cpu_budget_ns, phase_wall_backstop_ns};
 
 /// Lifecycle-phase *class* the watchdog treats a phase as, decoupled
@@ -166,6 +167,111 @@ pub(crate) fn watchdog_step(
     }
 
     KillDecision::None
+}
+
+/// The widened Tier-1 CPU budget (ns) the watchdog charges `phase` at
+/// `vcpus` under CPU-time provenance `cpu_currency` — the SAME number
+/// [`watchdog_step`] compares `cpu_since_progress_ns` against. Exposed so
+/// the watchdog's failure dump can render `cpu_since_progress vs budget`
+/// against the effective (currency-widened) budget rather than the raw
+/// [`phase_cpu_budget_ns`].
+pub(crate) fn widened_cpu_budget_ns(phase: u8, vcpus: u32, cpu_currency: u8) -> u64 {
+    widen_budget_for_currency(phase_cpu_budget_ns(phase, vcpus), cpu_currency)
+}
+
+/// Fold one live [`LedgerSnapshot`] into a [`KillDecision`]: the glue
+/// between the ledger and the pure [`watchdog_step`]. Derives the two
+/// since-progress deltas and maps the lifecycle stage onto a
+/// [`PhaseClass`], then defers to `watchdog_step`. Kept pure (the wall
+/// clock arrives as `now_wall_ns`) so the ledger-read → tier-decision
+/// path is unit-testable without a live watchdog thread.
+///
+/// `now_wall_ns` is `run_start`-relative — the SAME `run_start` the
+/// monitor anchors `wall_ns_at_progress` to — so `wall_since_progress`
+/// aligns.
+///
+/// INITIAL STATE: before the first progress epoch both
+/// `cpu_ns_at_progress` and `wall_ns_at_progress` are 0, so
+/// `cpu_since_progress == cpu_ns_now` and `wall_since_progress ==
+/// now_wall_ns`. Boot's budgets thus count from run start — intended
+/// (Boot owes its first milestone), and the arithmetic yields it with no
+/// special-casing. Saturating subtraction guards the benign torn read
+/// where a fresher `*_at_progress` payload races an older `now`/`cpu_now`
+/// (clamps the delta to 0 — more conservative, never a spurious kill).
+pub(crate) fn evaluate_progress(
+    snap: &LedgerSnapshot,
+    now_wall_ns: u64,
+    monitor_live: bool,
+    vcpus: u32,
+) -> KillDecision {
+    let cpu_since_progress = snap.cpu_ns_now.saturating_sub(snap.cpu_ns_at_progress);
+    let wall_since_progress = now_wall_ns.saturating_sub(snap.wall_ns_at_progress);
+    let class = match LifecycleStage::from_u8(snap.phase).class() {
+        StageClass::Body => PhaseClass::Body,
+        StageClass::Infra => PhaseClass::Infra,
+    };
+    watchdog_step(
+        snap.phase,
+        class,
+        cpu_since_progress,
+        wall_since_progress,
+        snap.runnable_demand,
+        monitor_live,
+        snap.cpu_currency,
+        vcpus,
+    )
+}
+
+/// Consecutive stalled watchdog ticks (frozen `monitor_heartbeat`) before
+/// the monitor is declared not-live, which suppresses BOTH progress tiers
+/// (see [`watchdog_step`]'s `monitor_live` gate). The watchdog ticks
+/// every 100 ms and the monitor samples on the same nominal 100 ms
+/// cadence, but under heavy host-compile contention the monitor's tick
+/// slips and several watchdog ticks can pass between heartbeat bumps. 20
+/// ticks = 2 s is comfortably above any realistic single monitor-interval
+/// slip (so a merely slow monitor is never misread as dead) yet short
+/// enough that a genuinely wedged monitor disables the CPU/wall tiers
+/// within 2 s, leaving only the Tier-3 hard deadline. This is ALSO the
+/// natural degraded / no-monitor path: a host where `start_monitor`
+/// returned no monitor never bumps the heartbeat, so `monitor_live`
+/// latches false here after 2 s and the cell runs Tier-3-only.
+pub(crate) const WATCHDOG_MONITOR_LIVENESS_MISS_TICKS: u32 = 20;
+
+/// Watchdog-thread-local tracker for monitor liveness: the monitor reads
+/// live iff its `monitor_heartbeat` advanced within the last
+/// [`WATCHDOG_MONITOR_LIVENESS_MISS_TICKS`] ticks. A pure state machine —
+/// no clocks, no atomics — so the stall/recover behaviour is unit-
+/// testable in isolation.
+pub(crate) struct MonitorLiveness {
+    prev_heartbeat: u64,
+    misses: u32,
+}
+
+impl MonitorLiveness {
+    /// Seed at the heartbeat's zero-init value. Before any monitor tick
+    /// the heartbeat is 0; the first `observe` that sees a bumped value
+    /// clears the miss counter. If no monitor ever runs the heartbeat
+    /// stays 0, so this seeds the natural no-monitor stall.
+    pub(crate) fn new() -> Self {
+        Self {
+            prev_heartbeat: 0,
+            misses: 0,
+        }
+    }
+
+    /// Fold this tick's `monitor_heartbeat` and return whether the monitor
+    /// is currently live. An advance resets the miss counter; a frozen
+    /// heartbeat increments it, and once it reaches the miss budget the
+    /// monitor reads not-live until the heartbeat advances again.
+    pub(crate) fn observe(&mut self, heartbeat: u64) -> bool {
+        if heartbeat != self.prev_heartbeat {
+            self.prev_heartbeat = heartbeat;
+            self.misses = 0;
+        } else {
+            self.misses = self.misses.saturating_add(1);
+        }
+        self.misses < WATCHDOG_MONITOR_LIVENESS_MISS_TICKS
+    }
 }
 
 #[cfg(test)]
@@ -492,6 +598,131 @@ mod tests {
             1,
         );
         assert_eq!(d, KillDecision::Tier2IdleWedge);
+    }
+
+    // -- Monitor-liveness tracker: stall → not-live after N, recovers --
+
+    #[test]
+    fn monitor_liveness_stalls_after_miss_budget_and_recovers() {
+        let n = WATCHDOG_MONITOR_LIVENESS_MISS_TICKS;
+        let mut live = MonitorLiveness::new();
+        // First advance from the zero seed: live.
+        assert!(live.observe(1), "advancing heartbeat is live");
+        // Freeze the heartbeat: still live through the (n-1)th stall, then
+        // not-live on the nth (misses == n).
+        for i in 1..n {
+            assert!(live.observe(1), "stall {i} within budget stays live");
+        }
+        assert!(
+            !live.observe(1),
+            "the {n}th consecutive stall crosses the miss budget → not live"
+        );
+        // A single fresh advance clears the miss count and recovers.
+        assert!(live.observe(2), "a heartbeat advance recovers liveness");
+    }
+
+    #[test]
+    fn monitor_liveness_no_monitor_seed_latches_dead() {
+        // A host with no monitor never bumps the heartbeat off 0. The
+        // tracker seeds at 0, so every observe(0) is a stall and after the
+        // full miss budget the monitor reads not-live (Tier-3-only path).
+        let mut live = MonitorLiveness::new();
+        let n = WATCHDOG_MONITOR_LIVENESS_MISS_TICKS;
+        let mut last = true;
+        for _ in 0..n {
+            last = live.observe(0);
+        }
+        assert!(!last, "a heartbeat frozen at 0 latches not-live after N ticks");
+    }
+
+    // -- evaluate_progress: ledger snapshot → tier decision glue --
+
+    fn snap(
+        phase: u8,
+        cpu_ns_now: u64,
+        cpu_ns_at_progress: u64,
+        wall_ns_at_progress: u64,
+        runnable_demand: bool,
+        cpu_currency: u8,
+    ) -> LedgerSnapshot {
+        LedgerSnapshot {
+            phase,
+            cpu_ns_now,
+            cpu_ns_at_phase: 0,
+            cpu_ns_at_progress,
+            wall_ns_at_progress,
+            progress_epoch: 0,
+            monitor_heartbeat: 0,
+            runnable_demand,
+            cpu_currency,
+        }
+    }
+
+    #[test]
+    fn evaluate_progress_infra_idle_wedge_fires_tier2() {
+        // INFRA (Boot) phase, heartbeat-live monitor, no progress epoch
+        // (wall_at_progress==0) so wall_since == now, past the backstop,
+        // no runnable demand and no CPU burned → a silent idle wedge.
+        let now = boot_backstop_ns() + S;
+        let d = evaluate_progress(
+            &snap(BOOT, 0, 0, 0, false, CPU_CURRENCY_PMU),
+            now,
+            true,
+            1,
+        );
+        assert_eq!(d, KillDecision::Tier2IdleWedge);
+    }
+
+    #[test]
+    fn evaluate_progress_initial_state_counts_from_run_start() {
+        // Before the first progress epoch both anchors are 0, so a Boot
+        // that has burned past its CPU budget since run start fires Tier-1
+        // — the initial-state arithmetic charges Boot from run start.
+        let d = evaluate_progress(
+            &snap(BOOT, boot_budget_ns() + 100 * S, 0, 0, false, CPU_CURRENCY_PMU),
+            0,
+            true,
+            1,
+        );
+        assert_eq!(d, KillDecision::Tier1CpuBudget);
+    }
+
+    #[test]
+    fn evaluate_progress_dead_monitor_suppresses_tiers() {
+        // Same idle-wedge shape, but monitor_live=false → both tiers off.
+        let now = boot_backstop_ns() + S;
+        let d = evaluate_progress(
+            &snap(BOOT, 0, 0, 0, false, CPU_CURRENCY_PMU),
+            now,
+            false,
+            1,
+        );
+        assert_eq!(d, KillDecision::None);
+    }
+
+    #[test]
+    fn evaluate_progress_body_never_fires() {
+        // BODY maps to PhaseClass::Body and the sentinel budgets — no
+        // shape trips a tier even long past every INFRA bound.
+        let now = 1_000 * S;
+        let d = evaluate_progress(
+            &snap(BODY, u64::MAX - 1, 0, 0, false, CPU_CURRENCY_PMU),
+            now,
+            true,
+            1,
+        );
+        assert_eq!(d, KillDecision::None);
+    }
+
+    #[test]
+    fn widened_cpu_budget_matches_currency_widening() {
+        // pthread widens the raw Boot budget 3/2; PMU leaves it raw.
+        let raw = boot_budget_ns();
+        assert_eq!(widened_cpu_budget_ns(BOOT, 1, CPU_CURRENCY_PMU), raw);
+        assert_eq!(
+            widened_cpu_budget_ns(BOOT, 1, CPU_CURRENCY_PTHREAD),
+            raw + raw / 2
+        );
     }
 
     // -- Unknown phase id: never kill --

@@ -277,6 +277,58 @@ impl WatchdogResetTag {
     }
 }
 
+/// Which rule fired the watchdog, recorded so the deadline-expired dump
+/// names the true cause. Mirrors [`WatchdogResetTag`]'s shape (a `#[repr(u8)]`
+/// tag with `from_u8`/`render`). The watchdog thread owns the sole
+/// [`std::sync::atomic::AtomicU8`] holding this: it is stored on the fire
+/// path and loaded back for the dump within the same thread, so no
+/// cross-thread ordering is required — the atomic keeps the store/render
+/// idiom uniform with the reset tag and leaves room for a future shared
+/// reader (e.g. the verdict) without reshaping the type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum KillReasonTag {
+    /// No kill recorded yet (the initial value).
+    Unset = 0,
+    /// Tier-1: guest CPU burned past the phase budget with no progress —
+    /// a spinning wedge (`watchdog_step::KillDecision::Tier1CpuBudget`).
+    Tier1Cpu = 1,
+    /// Tier-2: no progress past the phase wall backstop with no runnable
+    /// demand — a silent idle wedge (`KillDecision::Tier2IdleWedge`).
+    Tier2Idle = 2,
+    /// Tier-3: the guest-derived hard deadline expired — the deadman
+    /// backstop that governs even when the progress tiers are suppressed.
+    Tier3Deadman = 3,
+    /// An AP set the kill flag (a panic-driven kill), not a watchdog
+    /// timeout. Distinct so the dump does not mislabel it as an expiry.
+    ApKill = 4,
+}
+
+impl KillReasonTag {
+    /// Decode a raw atomic byte. Any unrecognized value maps to
+    /// [`KillReasonTag::Unset`].
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Tier1Cpu,
+            2 => Self::Tier2Idle,
+            3 => Self::Tier3Deadman,
+            4 => Self::ApKill,
+            _ => Self::Unset,
+        }
+    }
+
+    /// Human-facing token for the watchdog dump's `kill_reason=` key.
+    fn render(self) -> &'static str {
+        match self {
+            Self::Unset => "none",
+            Self::Tier1Cpu => "tier1-cpu-budget",
+            Self::Tier2Idle => "tier2-idle-wedge",
+            Self::Tier3Deadman => "tier3-deadman-deadline",
+            Self::ApKill => "ap-kill",
+        }
+    }
+}
+
 /// Extend the watchdog's reset deadline so it accommodates an armed
 /// wprof-ship grace. The watchdog fires at
 /// `effective_deadline = reset_deadline.max(hard_deadline)` where
@@ -322,9 +374,35 @@ fn arm_wprof_grace(
 
 #[cfg(test)]
 mod watchdog_reset_tag_tests {
-    use super::WatchdogResetTag;
+    use super::{KillReasonTag, WatchdogResetTag};
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
     use std::time::{Duration, Instant};
+
+    /// The dump-facing tokens and the decode round-trip are stable — the
+    /// watchdog dump's `kill_reason=` key relies on both, and the fire
+    /// path stores each variant into an `AtomicU8` the dump decodes.
+    #[test]
+    fn kill_reason_render_and_decode() {
+        for (tag, token) in [
+            (KillReasonTag::Unset, "none"),
+            (KillReasonTag::Tier1Cpu, "tier1-cpu-budget"),
+            (KillReasonTag::Tier2Idle, "tier2-idle-wedge"),
+            (KillReasonTag::Tier3Deadman, "tier3-deadman-deadline"),
+            (KillReasonTag::ApKill, "ap-kill"),
+        ] {
+            assert_eq!(tag.render(), token);
+            assert_eq!(KillReasonTag::from_u8(tag as u8), tag);
+            // Round-trip through the atomic slot the watchdog stores into.
+            let slot = AtomicU8::new(KillReasonTag::Unset as u8);
+            slot.store(tag as u8, Ordering::Relaxed);
+            assert_eq!(
+                KillReasonTag::from_u8(slot.load(Ordering::Relaxed)),
+                tag
+            );
+        }
+        // Any unknown byte decodes to Unset (a never-written slot).
+        assert_eq!(KillReasonTag::from_u8(200), KillReasonTag::Unset);
+    }
 
     /// The dump-facing tokens and the decode round-trip are stable — the
     /// watchdog dump's `reset_armed_by=` key relies on both.
@@ -2428,6 +2506,20 @@ impl KtstrVm {
         let watchdog_reset_for_wd = watchdog_reset_ns.clone();
         let watchdog_reset_tag_for_wd = watchdog_reset_tag.clone();
         let workload_duration_for_wd = self.workload_duration;
+        // Progress-ledger consumer handle for the watchdog. The monitor
+        // (producer) took its clone at the `start_monitor` site above and
+        // the coordinator's dispatch sinks another; this third clone lets
+        // the watchdog READ the ledger each tick to fold the Tier-1/2
+        // progress verdicts alongside the Tier-3 deadline. All three hold
+        // the same Arc, so the watchdog sees the monitor's liveness/CPU
+        // stores and dispatch's phase advances in one ledger.
+        let progress_ledger_for_wd = progress_ledger.clone();
+        // Guest vCPU count for the per-phase CPU budget
+        // (`watchdog_step::widened_cpu_budget_ns` scales the Tier-1 budget
+        // by it). `total_cpus()` is the VM's own topology — the number of
+        // vCPU threads the guest boots — captured by value for the
+        // watchdog's `move` closure.
+        let wd_vcpus: u32 = self.topology.total_cpus();
 
         // Freeze coordinator thread: triggers a failure-dump freeze when
         // the BPF probe's `ktstr_err_exit_detected` .bss latch fires
@@ -11101,6 +11193,16 @@ impl KtstrVm {
                     None
                 };
                 let mut soft_fired = false;
+                // Progress-tier state. `monitor_liveness` tracks whether
+                // the monitor's heartbeat is still advancing (a dead
+                // monitor suppresses both progress tiers — see
+                // `watchdog_step::MonitorLiveness`). `kill_reason` records
+                // which rule fires so the dump names the true cause
+                // (Tier-1/2 progress verdict, the Tier-3 hard deadline, or
+                // an AP-set kill). Watchdog-local — see [`KillReasonTag`].
+                let mut monitor_liveness = watchdog_step::MonitorLiveness::new();
+                let kill_reason =
+                    std::sync::atomic::AtomicU8::new(KillReasonTag::Unset as u8);
                 // Cached scheduler-attach reset deadline. Decoded
                 // lazily from `watchdog_reset_for_wd` after the
                 // host monitor stores a non-zero value (the
@@ -11217,12 +11319,39 @@ impl KtstrVm {
                             }
                         }
                     }
+                    // Progress-tier evaluation, BEFORE the deadline
+                    // compare so a wedge is caught on its phase budget
+                    // rather than waiting out the full Tier-3 deadline.
+                    // Read the ledger once, fold monitor liveness, and run
+                    // the pure `watchdog_step` tiers. `now_wall_ns` is
+                    // `run_start`-relative — the same anchor the monitor
+                    // stamps `wall_ns_at_progress` with — so the wall
+                    // deltas align. `snapshot` and `monitor_live` are read
+                    // here and reused by the dump in this same iteration. A
+                    // dead monitor makes `evaluate_progress` return None
+                    // (both tiers off), so a degraded / no-monitor host
+                    // naturally falls back to Tier-3-only.
+                    let snapshot = progress_ledger_for_wd.snapshot();
+                    let monitor_live = monitor_liveness.observe(snapshot.monitor_heartbeat);
+                    let now_wall_ns = run_start.elapsed().as_nanos() as u64;
+                    let progress_decision = watchdog_step::evaluate_progress(
+                        &snapshot,
+                        now_wall_ns,
+                        monitor_live,
+                        wd_vcpus,
+                    );
+                    let tier_fire = !matches!(
+                        progress_decision,
+                        watchdog_step::KillDecision::None
+                    );
                     let effective_deadline =
                         reset_deadline.map_or(hard_deadline, |r| r.max(hard_deadline));
                     if kill_for_watchdog.load(Ordering::Acquire)
                         || Instant::now() >= effective_deadline
+                        || tier_fire
                     {
-                        // Either an AP set kill or hard timeout expired.
+                        // A progress tier fired, an AP set kill, or the
+                        // hard timeout expired.
                         // Re-check bsp_done: if the BSP already exited its
                         // run loop, the VcpuFd (and kvm_run mmap backing
                         // bsp_ie) may be dropped. Writing to ie after drop
@@ -11234,12 +11363,30 @@ impl KtstrVm {
                             return;
                         }
                         let hard_timeout_fired = Instant::now() >= effective_deadline;
-                        let reason = if hard_timeout_fired {
-                            "hard timeout expired"
-                        } else {
-                            "kill set by AP"
+                        // Cause precedence: a progress-tier verdict is the
+                        // most specific (it names WHICH wedge), so it wins
+                        // over the generic hard deadline; the AP-set kill
+                        // is last (and, unlike the tiers/deadline, is not a
+                        // timeout). Mirrors the old hard-over-AP order.
+                        let reason_tag = match progress_decision {
+                            watchdog_step::KillDecision::Tier1CpuBudget => {
+                                KillReasonTag::Tier1Cpu
+                            }
+                            watchdog_step::KillDecision::Tier2IdleWedge => {
+                                KillReasonTag::Tier2Idle
+                            }
+                            watchdog_step::KillDecision::None if hard_timeout_fired => {
+                                KillReasonTag::Tier3Deadman
+                            }
+                            watchdog_step::KillDecision::None => KillReasonTag::ApKill,
                         };
-                        eprintln!("watchdog: {reason}, kicking BSP");
+                        kill_reason.store(reason_tag as u8, Ordering::Relaxed);
+                        // Decode back through the atomic the fire path just
+                        // stored into, mirroring the reset-tag round-trip;
+                        // this token is the dump's authoritative kill cause.
+                        let kill_reason_str =
+                            KillReasonTag::from_u8(kill_reason.load(Ordering::Relaxed)).render();
+                        eprintln!("watchdog: {kill_reason_str}, kicking BSP");
                         // Actionable diagnostics. Without this dump the
                         // operator-visible failure is just `timed_out =
                         // true` with no clue why. Print the deadline
@@ -11278,11 +11425,86 @@ impl KtstrVm {
                             watchdog_reset_tag_for_wd.load(Ordering::Relaxed),
                         )
                         .render();
-                        eprintln!("watchdog: deadline expired at {elapsed:?} from VM start");
+                        // Progress evidence for the dump, from this tick's
+                        // ledger snapshot. `cpu_in_phase` is CPU
+                        // burned in the current stage; `cpu_since_progress`
+                        // / `wall_since_progress` are the deltas the tiers
+                        // compare against the (currency-widened) CPU budget
+                        // and the wall backstop. The `u64::MAX` sentinel
+                        // budgets (Body / unmodeled phase) render as `off`
+                        // rather than an absurd Duration.
+                        let stage = crate::monitor::LifecycleStage::from_u8(snapshot.phase);
+                        let cpu_in_phase = snapshot
+                            .cpu_ns_now
+                            .saturating_sub(snapshot.cpu_ns_at_phase);
+                        let cpu_since_progress = snapshot
+                            .cpu_ns_now
+                            .saturating_sub(snapshot.cpu_ns_at_progress);
+                        let wall_since_progress =
+                            now_wall_ns.saturating_sub(snapshot.wall_ns_at_progress);
+                        let cpu_budget = watchdog_step::widened_cpu_budget_ns(
+                            snapshot.phase,
+                            wd_vcpus,
+                            snapshot.cpu_currency,
+                        );
+                        let wall_backstop = crate::test_support::runtime::phase_wall_backstop_ns(
+                            snapshot.phase,
+                        );
+                        // Sentinel-aware ns→Duration renderer for a budget.
+                        let render_budget = |ns: u64| {
+                            if ns == u64::MAX {
+                                "off".to_string()
+                            } else {
+                                format!("{:?}", Duration::from_nanos(ns))
+                            }
+                        };
+                        let cpu_currency_str = match snapshot.cpu_currency {
+                            crate::monitor::CPU_CURRENCY_PMU => "pmu",
+                            crate::monitor::CPU_CURRENCY_PTHREAD => "pthread",
+                            _ => "none",
+                        };
+                        // A pre-attach (Boot) progress-tier kill is an
+                        // infrastructure fault, not a test failure — prefix
+                        // the header with a greppable marker so triage can
+                        // separate framework wedges from workload timeouts.
+                        let infra_fault = matches!(
+                            reason_tag,
+                            KillReasonTag::Tier1Cpu | KillReasonTag::Tier2Idle
+                        ) && snapshot.phase
+                            == crate::monitor::LifecycleStage::Boot as u8;
+                        let header_prefix = if infra_fault { "ktstr infra fault: " } else { "" };
                         eprintln!(
-                            "  cause={reason}, hard_timeout_fired={hard_timeout_fired}, \
-                             kill_set_by_AP={}",
-                            !hard_timeout_fired
+                            "{header_prefix}watchdog: deadline expired at {elapsed:?} from VM start"
+                        );
+                        eprintln!(
+                            "  cause={kill_reason_str}, \
+                             hard_timeout_fired={hard_timeout_fired}, kill_set_by_AP={}",
+                            reason_tag == KillReasonTag::ApKill
+                        );
+                        // Progress-tier evidence block. `monitor_live` gates
+                        // BOTH progress tiers — when false the tiers were
+                        // suppressed and this kill is Tier-3 / AP only.
+                        eprintln!(
+                            "  phase={stage:?} ({:?}), monitor_live={monitor_live}",
+                            stage.class()
+                        );
+                        eprintln!(
+                            "  cpu_in_phase={:?}, cpu_since_progress={:?} vs budget={} \
+                             (currency={cpu_currency_str})",
+                            Duration::from_nanos(cpu_in_phase),
+                            Duration::from_nanos(cpu_since_progress),
+                            render_budget(cpu_budget),
+                        );
+                        eprintln!(
+                            "  wall_since_progress={:?} vs backstop={}",
+                            Duration::from_nanos(wall_since_progress),
+                            render_budget(wall_backstop),
+                        );
+                        eprintln!(
+                            "  progress_epoch={} (age={:?}), runnable_demand={}",
+                            snapshot.progress_epoch,
+                            Duration::from_nanos(wall_since_progress),
+                            snapshot.runnable_demand,
                         );
                         eprintln!(
                             "  effective_deadline={effective_offset:?} from VM start \
@@ -11300,12 +11522,13 @@ impl KtstrVm {
                              derived as max(watchdog_timeout, duration) so raising \
                              duration also extends the host watchdog deadline"
                         );
-                        // Set `timed_out` ONLY for the hard-deadline
-                        // branch. The "kill set by AP" path is not a
-                        // watchdog timeout — propagating it as
-                        // `timed_out=true` would mislabel a panic-
-                        // driven kill as a deadline expiry.
-                        if hard_timeout_fired {
+                        // All watchdog VERDICT timeouts set `timed_out`: the
+                        // Tier-3 hard deadline AND the Tier-1/2 progress
+                        // tiers (a wedge is a timeout by another name). The
+                        // AP-set-kill path does NOT — it is a panic-driven
+                        // kill, and propagating it as `timed_out=true` would
+                        // mislabel it as a deadline expiry.
+                        if hard_timeout_fired || tier_fire {
                             timed_out_for_watchdog.store(true, Ordering::Release);
                         }
                         // Propagate kill so handle_freeze's poll loop
