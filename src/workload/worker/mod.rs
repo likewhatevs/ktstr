@@ -269,6 +269,13 @@ pub(super) fn worker_main(
     // knob — not the WorkType — gates the park so a single-dispatch
     // proof collapses to a sleep-poll under any work body.
     park_after: Option<u64>,
+    // Signal this eventfd exactly once, after the worker's first counted
+    // iteration, so a waiter (the verifier dispatch probe) can block on the
+    // edge instead of polling `iter_slot`. `-1` (every workload but the
+    // opted-in fork probe, and all thread / pcomm dispatch) disables it.
+    // Independent of `park_after`: the probe sets both, and the signal
+    // fires BEFORE the park below so a parking worker still signals once.
+    first_iter_signal_fd: i32,
     iter_slot: *mut AtomicU64,
     // Single shared phase-epoch word — the SAME pointer for every worker in
     // the group. Allocated non-null for every handle; the scenario engine
@@ -520,6 +527,9 @@ pub(super) fn worker_main(
     let mut iteration_costs_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
     let mut iteration_cost_sample_count: u64 = 0;
     let mut iterations: u64 = 0;
+    // One-shot latch for the first-iteration eventfd signal (C6). Flipped
+    // true after the single `write(2)` so the worker signals exactly once.
+    let mut first_iter_signaled = false;
     // AffinityChurn / CrossAffinityChurn: read the effective cpuset
     // once at start via sched_getaffinity (read_effective_cpus).
     // Custom: hand the user function a WorkerCtx. Affinity and
@@ -3825,6 +3835,38 @@ pub(super) fn worker_main(
                 unsafe { &*iter_slot }.store(iterations, Ordering::Relaxed);
                 last_iter_slot_publish = now;
             }
+        }
+
+        // First-iteration eventfd signal (C6): one-shot `write(2)` of a
+        // `1` the first time this worker counts at least one outer-loop
+        // iteration, so a waiter (the verifier dispatch probe) wakes on the
+        // edge instead of polling `iter_slot`. Placed BEFORE the park block
+        // below so a worker that also parks (the probe sets both knobs)
+        // still signals once before sleeping. The eventfd is EFD_CLOEXEC —
+        // safe because fork workers never `exec` — and counter-mode, so the
+        // per-worker `1`s sum in the fd and the parent's
+        // `wait_first_iteration_all` wakes once `n` workers have advanced.
+        // A `sched_policy_error` worker (EACCES left it SCHED_OTHER but it
+        // still loops and counts iterations) signals too, matching the
+        // probe's "advanced at all" wait contract; the host-side dispatch
+        // gate separately excludes such workers from the verdict.
+        // Independent of `park_after`. `-1` disables it (thread / pcomm /
+        // opt-out workloads).
+        if first_iter_signal_fd >= 0 && !first_iter_signaled && iterations >= 1 {
+            let one: u64 = 1;
+            // SAFETY: `first_iter_signal_fd` is a live eventfd (a fork-time
+            // fd-table copy of the parent's `OwnedFd`); an 8-byte write of a
+            // `u64` is the eventfd(2) contract. EFD_NONBLOCK cannot block; a
+            // spurious short/failed write only delays the parent's wake to
+            // its deadline fallback, so the result is ignored.
+            unsafe {
+                libc::write(
+                    first_iter_signal_fd,
+                    &one as *const u64 as *const libc::c_void,
+                    std::mem::size_of::<u64>(),
+                );
+            }
+            first_iter_signaled = true;
         }
 
         // Park once the worker has counted `park_after` iterations:

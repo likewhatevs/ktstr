@@ -81,6 +81,24 @@ pub struct WorkloadConfig {
     /// existed.
     #[serde(default)]
     pub park_after_iterations: Option<u64>,
+    /// Signal a shared eventfd once each fork worker has counted its
+    /// first outer-loop iteration, so a waiter (the verifier dispatch
+    /// probe) can block on the edge instead of polling
+    /// `snapshot_iterations`. `false` (the default) creates no eventfd
+    /// and every worker runs unchanged; `true` makes
+    /// [`WorkloadHandle::spawn`](crate::workload::WorkloadHandle::spawn)
+    /// allocate an `eventfd(EFD_NONBLOCK|EFD_CLOEXEC)` before the fork
+    /// loop and each fork worker `write(2)` a single `1` the first time
+    /// its iteration count reaches 1 — the counter sums the per-worker
+    /// signals so `WorkloadHandle::wait_first_iteration_all` can wake as
+    /// soon as `n` workers have advanced. Independent of
+    /// `park_after_iterations`: the probe sets both, and a worker signals
+    /// once BEFORE parking. Only fork workers signal (thread / pcomm
+    /// dispatch pass a `-1` fd and never write). `#[serde(default)]` so
+    /// the field round-trips over the host→guest wire without breaking
+    /// configs serialized before it existed.
+    #[serde(default)]
+    pub signal_first_iteration: bool,
     /// Linux scheduling policy.
     pub sched_policy: SchedPolicy,
     /// NUMA memory placement policy.
@@ -225,6 +243,7 @@ impl Default for WorkloadConfig {
             affinity: AffinityIntent::Inherit,
             work_type: WorkType::SpinWait,
             park_after_iterations: None,
+            signal_first_iteration: false,
             sched_policy: SchedPolicy::Normal,
             mem_policy: MemPolicy::Default,
             mpol_flags: MpolFlags::NONE,
@@ -314,6 +333,7 @@ impl WorkloadConfig {
             affinity,
             work_type,
             park_after_iterations: None,
+            signal_first_iteration: false,
             sched_policy: work.sched_policy,
             mem_policy: work.mem_policy.clone(),
             mpol_flags: work.mpol_flags,
@@ -485,6 +505,18 @@ impl WorkloadConfig {
     #[must_use = "builder methods consume self; bind the result"]
     pub fn park_after_iterations(mut self, n: Option<u64>) -> Self {
         self.park_after_iterations = n;
+        self
+    }
+
+    /// Set the first-iteration eventfd-signal knob. `true` makes each
+    /// fork worker signal a shared eventfd once it counts its first
+    /// outer-loop iteration so a waiter can block on the edge via
+    /// [`WorkloadHandle::wait_first_iteration_all`](crate::workload::WorkloadHandle::wait_first_iteration_all)
+    /// instead of polling; `false` (the default) creates no eventfd. See
+    /// [`WorkloadConfig::signal_first_iteration`].
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn signal_first_iteration(mut self, on: bool) -> Self {
+        self.signal_first_iteration = on;
         self
     }
 
@@ -689,6 +721,29 @@ mod tests {
     #[should_panic(expected = "WorkloadConfig::comm: empty string rejected")]
     fn workload_config_comm_rejects_empty() {
         let _ = WorkloadConfig::default().comm("");
+    }
+
+    /// The first-iteration signal knob defaults to `false` (no eventfd,
+    /// unchanged workers) and the builder flips it.
+    #[test]
+    fn signal_first_iteration_default_false_and_builder() {
+        assert!(
+            !WorkloadConfig::default().signal_first_iteration,
+            "signal_first_iteration must default to false",
+        );
+        assert!(
+            WorkloadConfig::default()
+                .signal_first_iteration(true)
+                .signal_first_iteration,
+            "builder must set the knob true",
+        );
+        assert!(
+            !WorkloadConfig::default()
+                .signal_first_iteration(true)
+                .signal_first_iteration(false)
+                .signal_first_iteration,
+            "builder must set the knob back to false",
+        );
     }
 
     #[test]

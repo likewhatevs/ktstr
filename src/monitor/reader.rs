@@ -2301,17 +2301,22 @@ pub(crate) struct WatchdogReset<'a> {
     /// as nanoseconds since `run_start` (added to `Instant::now()
     /// - run_start` at attach time and stored into [`reset_ns`]).
     pub workload_duration: Duration,
-    /// Shared atomic written once on the first scheduler-attach
-    /// observation. The watchdog thread reads this each tick and,
-    /// when non-zero, uses `run_start +
-    /// Duration::from_nanos(value)` as its hard deadline (capped
-    /// at the original `timeout`-derived deadline).
+    /// Shared atomic the watchdog thread reads each tick and, when
+    /// non-zero, uses `run_start + Duration::from_nanos(value)` as its hard
+    /// deadline (capped at the original `timeout`-derived deadline). The
+    /// polled latch here is a FALLBACK: it arms this via a
+    /// `compare_exchange(0, ..)` on the first non-null `*scx_root`
+    /// observation, so it only wins when the guest's authoritative
+    /// `LifecyclePhase::SchedulerAttached` frame (dispatch-thread writer,
+    /// `WatchdogResetTag::GuestAttachConfirm`) has not already armed it.
     pub reset_ns: &'a AtomicU64,
     /// Parallel provenance tag for [`reset_ns`], one of the
     /// `WatchdogResetTag` byte values owned by
-    /// [`crate::vmm::freeze_coord`]. Stamped `ScxRootLatch` (value 1)
-    /// alongside the `reset_ns` store so the watchdog dump can name the
-    /// attach latch as the writer. Relaxed store — diagnostic only.
+    /// [`crate::vmm::freeze_coord`]. Stamped `ScxRootLatch` (value 1) ONLY
+    /// when this polled latch WINS its `reset_ns` CAS, so a lost CAS (the
+    /// guest attach frame armed the deadline first) leaves the honest
+    /// `GuestAttachConfirm` provenance intact. Relaxed store — diagnostic
+    /// only.
     pub reset_tag: &'a std::sync::atomic::AtomicU8,
 }
 
@@ -3018,12 +3023,40 @@ pub(crate) fn monitor_loop(
                     .as_nanos()
                     .saturating_add(reset.workload_duration.as_nanos());
                 let encoded = u64::try_from(target_ns).unwrap_or(u64::MAX).max(1);
-                reset.reset_ns.store(encoded, Ordering::Release);
-                // Stamp provenance so the watchdog dump attributes the
-                // deadline to the scx_root attach latch (value 1 =
-                // `WatchdogResetTag::ScxRootLatch`). Relaxed — diagnostic
-                // only; a benign race with the ns store is acceptable.
-                reset.reset_tag.store(1, Ordering::Relaxed);
+                // FALLBACK arm (C6): the authoritative attach signal is now
+                // the guest's evented `LifecyclePhase::SchedulerAttached`
+                // frame, which the dispatch thread stores as
+                // `WatchdogResetTag::GuestAttachConfirm`. This polled
+                // `*scx_root` latch only arms the deadline when the guest
+                // frame has NOT already done so — a `compare_exchange(0, ..)`,
+                // not the prior unconditional store. Two race orders, both
+                // benign:
+                //   1. Guest frame first: it stored a non-zero `reset_ns`
+                //      under `GuestAttachConfirm`; this CAS(0,..) FAILS, so
+                //      the more-authoritative provenance is NOT downgraded to
+                //      the latch tag (the tag store is gated on CAS success).
+                //   2. Latch first: this CAS wins from 0 and stamps
+                //      `ScxRootLatch`; a later guest frame's PLAIN `Release`
+                //      store overwrites `reset_ns` and re-stamps
+                //      `GuestAttachConfirm`, so the upgrade to the honest
+                //      provenance still happens.
+                // The one-shot local `watchdog_reset_signaled` still latches
+                // off after the first attempt so a transient null-read /
+                // scheduler reload cannot re-arm from a fresh `now`; it
+                // flips on the OBSERVATION (scx_sched_kva != 0), not the CAS
+                // outcome, so a CAS lost to the guest frame does not re-poll.
+                if reset
+                    .reset_ns
+                    .compare_exchange(0, encoded, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    // Stamp provenance only when THIS latch won the arm (value
+                    // 1 = `WatchdogResetTag::ScxRootLatch`). Relaxed —
+                    // diagnostic only; a benign race with the ns store is
+                    // acceptable. On a lost CAS we leave the guest frame's
+                    // `GuestAttachConfirm` tag intact.
+                    reset.reset_tag.store(1, Ordering::Relaxed);
+                }
                 watchdog_reset_signaled = true;
             }
         }
@@ -5024,6 +5057,76 @@ mod tests {
             reset_tag.load(Ordering::Relaxed),
             1,
             "the scx_root attach latch must stamp ScxRootLatch (1)",
+        );
+    }
+
+    /// C6 fallback demotion: when the guest's evented
+    /// `SchedulerAttached` frame has ALREADY armed `reset_ns` (non-zero)
+    /// with `GuestAttachConfirm` provenance, the polled scx_root latch's
+    /// `compare_exchange(0, ..)` FAILS, so it must NOT overwrite the
+    /// deadline and must NOT downgrade the provenance tag to `ScxRootLatch`.
+    #[test]
+    fn monitor_loop_watchdog_reset_latch_yields_to_prearmed_guest_frame() {
+        let offsets = test_offsets();
+        // Non-null scx_root slot so the latch arm's observation fires.
+        let rq_buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
+        let scx_root_pa = rq_buf.len() as u64;
+        let mut combined = rq_buf;
+        combined.extend_from_slice(&0xDEAD_BEEF_u64.to_ne_bytes());
+        combined.extend_from_slice(&[0u8; 64]);
+
+        // SAFETY: combined is a live local buffer whose backing storage
+        // outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+
+        // Pre-arm reset_ns non-zero (as the dispatch thread's
+        // SchedulerAttached arm would) with GuestAttachConfirm (5).
+        const PREARMED_NS: u64 = 123_456_789;
+        let reset_ns = AtomicU64::new(PREARMED_NS);
+        let guest_confirm_tag = crate::vmm::freeze_coord::WatchdogResetTag::GuestAttachConfirm as u8;
+        let reset_tag = std::sync::atomic::AtomicU8::new(guest_confirm_tag);
+        let wr = WatchdogReset {
+            scx_root_pa,
+            workload_duration: Duration::from_secs(60),
+            reset_ns: &reset_ns,
+            reset_tag: &reset_tag,
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let cfg = MonitorConfig {
+            watchdog_reset: Some(wr),
+            ..test_config()
+        };
+        let _ = monitor_loop(
+            &mem,
+            &[0],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+
+        assert_eq!(
+            reset_ns.load(Ordering::Acquire),
+            PREARMED_NS,
+            "the polled latch overwrote a pre-armed guest deadline",
+        );
+        assert_eq!(
+            reset_tag.load(Ordering::Relaxed),
+            guest_confirm_tag,
+            "the polled latch downgraded GuestAttachConfirm provenance on a lost CAS",
         );
     }
 

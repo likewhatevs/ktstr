@@ -1200,6 +1200,17 @@ pub struct WorkloadHandle {
     /// Thread-mode chain workers don't observe `EBADF` mid-run.
     /// Empty when `work_type` is not `WakeChain { wake: Pipe }`.
     chain_pipes: Vec<Vec<[i32; 2]>>,
+    /// Shared first-iteration signal eventfd. `Some` only when the
+    /// workload set [`WorkloadConfig::signal_first_iteration`] AND the
+    /// dispatch is fork with at least one worker; each fork worker
+    /// `write(2)`s a `1` after its first counted iteration and the parent
+    /// blocks on this fd in
+    /// [`Self::wait_first_iteration_all`]. The [`std::os::fd::OwnedFd`]
+    /// closes the parent's copy on `Drop`; fork children hold their own
+    /// fd-table copies (the fd is `EFD_CLOEXEC`, harmless — fork workers
+    /// never `exec`). `None` for every other workload — the polled
+    /// `snapshot_iterations` path is unchanged.
+    first_iter_signal: Option<std::os::fd::OwnedFd>,
 }
 
 /// Per-variant byte length for the MAP_SHARED futex region.
@@ -1252,6 +1263,80 @@ pub(super) fn futex_region_size_for(work_type: &WorkType) -> usize {
         // needs 8 bytes, not the default single u32.
         WorkType::SignalStorm { .. } => 2 * std::mem::size_of::<u32>(),
         _ => std::mem::size_of::<u32>(),
+    }
+}
+
+/// Block on a counter-mode eventfd `raw` until its accumulated count
+/// reaches `need`, or `deadline` passes. Returns `true` when the count is
+/// reached, `false` on timeout / unexpected error. Extracted from
+/// [`WorkloadHandle::wait_first_iteration_all`] so the poll/accumulate
+/// logic is unit-testable against a raw eventfd without spawning workers.
+///
+/// Each `read(2)` on a counter-mode eventfd returns the current counter
+/// and resets it to 0, so the value is accumulated across reads. `need ==
+/// 0` returns `true` immediately (vacuous). EINTR (poll or read) and a
+/// spurious EFD_NONBLOCK EAGAIN re-poll against the same deadline; any
+/// other error returns `false`.
+fn poll_eventfd_reaches(raw: i32, deadline: Instant, need: u64) -> bool {
+    if need == 0 {
+        return true;
+    }
+    let mut acc: u64 = 0;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let remaining = deadline - now;
+        // poll(2) timeout in ms: truncating `as_millis` under-waits by
+        // <1ms (the outer deadline re-check bounds the total), and the
+        // `.max(1)` avoids a busy-spin on a sub-ms remainder.
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128).max(1) as i32;
+        let mut pfd = libc::pollfd {
+            fd: raw,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            // EINTR (e.g. SIGCHLD coalescing under the probe's forked
+            // workers): re-poll against the same deadline.
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if ret == 0 {
+            // Timed out this slice; the loop top re-checks the deadline.
+            continue;
+        }
+        if pfd.revents & libc::POLLIN != 0 {
+            // Counter-mode read: returns the summed counter and resets it
+            // to 0, so accumulate across reads.
+            let mut buf: u64 = 0;
+            let r = unsafe {
+                libc::read(
+                    raw,
+                    &mut buf as *mut u64 as *mut libc::c_void,
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if r == std::mem::size_of::<u64>() as isize {
+                acc = acc.saturating_add(buf);
+                if acc >= need {
+                    return true;
+                }
+            } else if r < 0 {
+                let err = std::io::Error::last_os_error();
+                // EAGAIN: EFD_NONBLOCK spurious wake with no pending count;
+                // EINTR: signal mid-read. Either way re-poll.
+                if matches!(err.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EINTR)) {
+                    continue;
+                }
+                return false;
+            }
+        }
     }
 }
 
@@ -1318,6 +1403,12 @@ pub(super) struct SpawnGuard {
     /// thread, since threads share the parent's address space and
     /// must be drained cooperatively (no `kill` equivalent).
     threads: Vec<ThreadWorker>,
+    /// First-iteration signal eventfd (transferred to the handle on
+    /// success; see [`WorkloadHandle::first_iter_signal`]). The
+    /// [`std::os::fd::OwnedFd`] closes on the guard's `Drop`, so the
+    /// early-bail path releases the fd exactly like the iter_counters
+    /// mmap it is allocated beside — no explicit cleanup needed.
+    first_iter_signal: Option<std::os::fd::OwnedFd>,
 }
 
 impl SpawnGuard {
@@ -1333,6 +1424,7 @@ impl SpawnGuard {
             phase_epoch_bytes: 0,
             children: Vec::new(),
             threads: Vec::new(),
+            first_iter_signal: None,
         }
     }
 
@@ -1360,6 +1452,7 @@ impl SpawnGuard {
         let phase_epoch_bytes = std::mem::replace(&mut self.phase_epoch_bytes, 0);
         let pipe_pairs = std::mem::take(&mut self.pipe_pairs);
         let chain_pipes = std::mem::take(&mut self.chain_pipes);
+        let first_iter_signal = self.first_iter_signal.take();
         WorkloadHandle {
             children,
             threads,
@@ -1372,6 +1465,7 @@ impl SpawnGuard {
             phase_epoch_bytes,
             pipe_pairs,
             chain_pipes,
+            first_iter_signal,
         }
     }
 }
@@ -1616,6 +1710,13 @@ pub(super) struct GroupParams {
     /// [`WorkSpec`] counterpart), so composed groups always inherit
     /// `None` through [`Self::from_work_spec`].
     park_after: Option<u64>,
+    /// Signal the handle's first-iteration eventfd after each fork
+    /// worker's first counted iteration. Like `park_after`, only the
+    /// primary group can carry `true`
+    /// ([`WorkloadConfig::signal_first_iteration`] has no [`WorkSpec`]
+    /// counterpart), so composed groups always inherit `false` through
+    /// [`Self::from_work_spec`].
+    signal_first_iteration: bool,
     sched_policy: SchedPolicy,
     mem_policy: MemPolicy,
     mpol_flags: MpolFlags,
@@ -1658,6 +1759,10 @@ impl GroupParams {
             // from `WorkloadConfig::park_after_iterations`, composed
             // groups keep `None`.
             park_after: None,
+            // Same shape as `park_after`: no WorkSpec counterpart, so
+            // `primary` overrides from `WorkloadConfig::signal_first_iteration`
+            // and composed groups keep `false`.
+            signal_first_iteration: false,
             sched_policy: spec.sched_policy,
             mem_policy: spec.mem_policy.clone(),
             mpol_flags: spec.mpol_flags,
@@ -1788,6 +1893,8 @@ impl GroupParams {
         // The park-after knob lives on WorkloadConfig, not the
         // synthesised WorkSpec above, so carry it in after the copy.
         params.park_after = config.park_after_iterations;
+        // Same for the first-iteration signal knob.
+        params.signal_first_iteration = config.signal_first_iteration;
         Ok(params)
     }
 
@@ -1979,6 +2086,11 @@ pub(super) fn spawn_thread_worker(
     worker_futex: Option<(*mut u32, usize)>,
     iter_slot: *mut AtomicU64,
     phase_epoch: *mut AtomicU32,
+    // First-iteration signal fd (`-1` = absent). Always `-1` on this
+    // thread path: the eventfd is allocated only for fork dispatch, so a
+    // thread-mode worker never signals (a plain `i32` copy, captured by
+    // the closure below).
+    first_iter_signal_fd: i32,
 ) -> Result<()> {
     use std::sync::Arc;
     use std::sync::atomic::AtomicI32;
@@ -2116,6 +2228,7 @@ pub(super) fn spawn_thread_worker(
                 worker_pipe_fds,
                 futex,
                 park_after,
+                first_iter_signal_fd,
                 slot,
                 epoch,
                 &stop_thread,
@@ -2790,6 +2903,12 @@ pub(super) fn spawn_pcomm_container(
                                 worker_pipe_fds,
                                 futex,
                                 park_after,
+                                // pcomm containers run threads inside a
+                                // forked container; the first-iteration
+                                // eventfd is allocated only on the plain
+                                // fork-dispatch path, so pcomm workers never
+                                // signal.
+                                -1,
                                 slot,
                                 epoch,
                                 &STOP,
@@ -3729,6 +3848,40 @@ impl WorkloadHandle {
             guard.phase_epoch_bytes = epoch_size;
         }
 
+        // First-iteration signal eventfd (C6). Allocated BEFORE the fork
+        // loop — like the iter_counters mmap above — so every forked child
+        // inherits its fd-table copy. Only when the workload opted in AND
+        // the dispatch is fork with ≥1 worker: thread / pcomm dispatch pass
+        // a `-1` fd to `worker_main` and never signal, and a zero-worker
+        // spawn has nothing to wait on. Counter mode (`0` initial value)
+        // so the parent's `wait_first_iteration_all` reads the SUM of the
+        // per-worker `1`s. EFD_NONBLOCK keeps the worker's post-first-iter
+        // `write` non-blocking; EFD_CLOEXEC is safe because fork workers
+        // never `exec` (a stale fd across an exec would only leak, not
+        // misbehave). The `OwnedFd` lives on the guard (closed on early
+        // bail) and transfers to the handle on success.
+        if config.signal_first_iteration
+            && matches!(dispatch, Dispatch::Fork)
+            && total_workers > 0
+        {
+            let raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+            if raw < 0 {
+                let errno = std::io::Error::last_os_error();
+                anyhow::bail!(
+                    "eventfd(0, EFD_NONBLOCK|EFD_CLOEXEC) for the first-iteration \
+                     signal failed: {errno}; this fd lets the verifier dispatch \
+                     probe block on the first-iteration edge instead of polling \
+                     snapshot_iterations. Remediation: raise the process fd limit \
+                     (RLIMIT_NOFILE).",
+                );
+            }
+            // SAFETY: `raw` is a fresh, exclusively-owned eventfd from the
+            // successful `eventfd(2)` above; wrapping it in OwnedFd takes
+            // sole ownership so it is closed exactly once on Drop.
+            guard.first_iter_signal =
+                Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
+        }
+
         // Spawn each group in declaration order. `iter_offset`
         // tracks the running offset into the iter_counters mmap
         // (slot allocation per the layout commented above). Each
@@ -3996,6 +4149,24 @@ impl WorkloadHandle {
             // workers observe no change and emit no slices.
             let phase_epoch_ptr: *mut AtomicU32 = guard.phase_epoch;
 
+            // First-iteration signal fd for this worker (C6). `-1` (absent)
+            // unless the group opted in AND the handle allocated the
+            // eventfd — which happens only for fork dispatch (thread /
+            // pcomm groups leave `guard.first_iter_signal` None, so this
+            // resolves to `-1` and the worker never signals). A plain `i32`
+            // copy, so it crosses the fork/thread closure boundary without
+            // a Send newtype.
+            let first_iter_signal_fd: i32 = if group.signal_first_iteration {
+                use std::os::unix::io::AsRawFd;
+                guard
+                    .first_iter_signal
+                    .as_ref()
+                    .map(|f| f.as_raw_fd())
+                    .unwrap_or(-1)
+            } else {
+                -1
+            };
+
             // Per-mode dispatch. Thread-mode workers do not need
             // pipes — the rendezvous and report channels are
             // in-process Rust primitives (`mpsc::sync_channel(0)` +
@@ -4011,6 +4182,7 @@ impl WorkloadHandle {
                         worker_futex,
                         iter_slot,
                         phase_epoch_ptr,
+                        first_iter_signal_fd,
                     )?;
                     continue;
                 }
@@ -4669,6 +4841,11 @@ impl WorkloadHandle {
                                 worker_pipe_fds,
                                 worker_futex,
                                 group.park_after,
+                                // Fork worker: the real signal fd (or `-1`
+                                // when the group did not opt in). The child
+                                // holds its own fd-table copy of the parent's
+                                // eventfd, inherited across `fork()`.
+                                first_iter_signal_fd,
                                 iter_slot,
                                 phase_epoch_ptr,
                                 &STOP,
@@ -4982,6 +5159,34 @@ impl WorkloadHandle {
                 unsafe { &*self.iter_counters.add(i) }.load(Ordering::Relaxed)
             })
             .collect()
+    }
+
+    /// Block until at least `n` workers have signalled their first counted
+    /// iteration, or `deadline` passes. Returns `true` on the former,
+    /// `false` on timeout. The evented counterpart to polling
+    /// [`Self::snapshot_iterations`]: workers `write(2)` a `1` into the
+    /// shared first-iteration eventfd (see
+    /// [`WorkloadConfig::signal_first_iteration`]) and this drains the
+    /// counter — which sums those `1`s — accumulating across reads until it
+    /// reaches `n`.
+    ///
+    /// Caller contract: only meaningful when the workload set
+    /// `signal_first_iteration` (and thus spawned fork workers with the
+    /// eventfd). Without the eventfd there is nothing to wait on, so this
+    /// returns `false` immediately (a `debug_assert` catches a misuse in
+    /// debug builds). `n == 0` returns `true` vacuously.
+    pub(crate) fn wait_first_iteration_all(&self, deadline: Instant, n: usize) -> bool {
+        let Some(signal_fd) = self.first_iter_signal.as_ref() else {
+            debug_assert!(
+                false,
+                "wait_first_iteration_all called on a handle with no first-iteration \
+                 eventfd (workload did not set signal_first_iteration, or dispatch \
+                 was not fork)",
+            );
+            return false;
+        };
+        use std::os::unix::io::AsRawFd;
+        poll_eventfd_reaches(signal_fd.as_raw_fd(), deadline, n as u64)
     }
 
     /// Broadcast the current scenario phase to this handle's workers.
@@ -6026,6 +6231,101 @@ mod tests_drain_bound {
         // SAFETY: `r` still open and owned.
         unsafe {
             libc::close(r);
+        }
+    }
+}
+
+/// Direct tests for `poll_eventfd_reaches` (the evented first-iteration
+/// wait's core) against a raw counter-mode eventfd — no worker spawn
+/// needed. Covers the two contract halves the verifier probe relies on:
+/// fewer than `n` signals times out at the deadline; exactly `n` (summed
+/// across writes) wakes early.
+#[cfg(test)]
+mod tests_poll_eventfd {
+    use super::poll_eventfd_reaches;
+    use std::time::{Duration, Instant};
+
+    // Counter-mode eventfd (EFD_NONBLOCK so a drained read cannot block).
+    fn make_eventfd() -> i32 {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        assert!(fd >= 0, "eventfd() failed: {}", std::io::Error::last_os_error());
+        fd
+    }
+
+    fn signal(fd: i32, times: u64) {
+        for _ in 0..times {
+            let one: u64 = 1;
+            let n = unsafe {
+                libc::write(fd, &one as *const u64 as *const libc::c_void, 8)
+            };
+            assert_eq!(n, 8, "eventfd write short: {}", std::io::Error::last_os_error());
+        }
+    }
+
+    /// Fewer than `n` signals: the wait must time out at the deadline and
+    /// return `false` (a never-run worker leaves the count short).
+    #[test]
+    fn under_count_times_out_false() {
+        let fd = make_eventfd();
+        signal(fd, 2); // k = 2 < n = 4
+        let start = Instant::now();
+        let ok = poll_eventfd_reaches(fd, Instant::now() + Duration::from_millis(200), 4);
+        let elapsed = start.elapsed();
+        assert!(!ok, "under-count must not report all-signalled");
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "returned before the deadline: {elapsed:?}",
+        );
+        assert!(elapsed < Duration::from_secs(3), "exceeded the deadline bound: {elapsed:?}");
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    /// Exactly `n` signals (accumulated in the counter): the wait wakes
+    /// early with `true`, well before a generous deadline.
+    #[test]
+    fn full_count_returns_true_early() {
+        let fd = make_eventfd();
+        signal(fd, 4); // n = 4
+        let start = Instant::now();
+        let ok = poll_eventfd_reaches(fd, Instant::now() + Duration::from_secs(5), 4);
+        assert!(ok, "n signals must report all-signalled");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "did not wake promptly on the count: {:?}",
+            start.elapsed(),
+        );
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    /// The count sums across SEPARATE reads: signals that arrive after the
+    /// first drained read still accumulate toward `n`.
+    #[test]
+    fn count_accumulates_across_reads() {
+        let fd = make_eventfd();
+        signal(fd, 3);
+        // First: 3 < 4, short deadline → false, draining the counter to 0.
+        assert!(!poll_eventfd_reaches(fd, Instant::now() + Duration::from_millis(120), 4));
+        // A single further signal added to the fresh (drained) counter is
+        // only 1, so a second call still needs the FULL 4 — the accumulator
+        // is per-call, matching one probe run. Confirm 4 fresh signals wake.
+        signal(fd, 4);
+        assert!(poll_eventfd_reaches(fd, Instant::now() + Duration::from_secs(5), 4));
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    /// `need == 0` (no workers) returns `true` vacuously without polling.
+    #[test]
+    fn zero_need_is_vacuously_true() {
+        let fd = make_eventfd();
+        assert!(poll_eventfd_reaches(fd, Instant::now(), 0));
+        unsafe {
+            libc::close(fd);
         }
     }
 }

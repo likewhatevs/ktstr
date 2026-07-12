@@ -434,6 +434,24 @@ pub enum LifecyclePhase {
     /// workload — a distinct, worse failure than never attaching. Carries
     /// an empty suffix. Has no legacy COM2 sentinel equivalent.
     WorkloadDispatched,
+    /// A real sched_ext scheduler attached: the scheduler process is
+    /// alive AND `poll_scx_attached` observed `root/ops` registered with
+    /// `state == Enabled` (see `try_spawn_scheduler`). Emitted by the boot
+    /// wrapper `spawn_scheduler_from_paths` on its `Ok(Some(..))` success
+    /// arm — the single site where attach is definitively known with a
+    /// live child — so it is NOT emitted for a no-scheduler / EEVDF run
+    /// (binary absent → `Ok(None)`) nor when the scheduler died or never
+    /// bound (those emit `SchedulerDied` / `SchedulerNotAttached`
+    /// instead). Distinct from `PayloadStarting`: this frame lands at
+    /// Phase-3 end (before `PayloadStarting`, which the guest emits at
+    /// Phase 5 for EVERY run regardless of attach), so its presence is a
+    /// positive, live-scheduler attach proof the host uses to arm the
+    /// progress watchdog's workload deadline from the confirmed-attach
+    /// moment (see `freeze_coord::dispatch`'s Lifecycle arm). Carries an
+    /// empty suffix. Additive — the post-hoc `AttachOutcome` verdict scan
+    /// keys on `PayloadStarting` / `SchedulerDied` / `SchedulerNotAttached`
+    /// only, so this frame passes through it harmlessly.
+    SchedulerAttached,
 }
 
 impl LifecyclePhase {
@@ -447,6 +465,7 @@ impl LifecyclePhase {
             LifecyclePhase::SchedulerDied => 3,
             LifecyclePhase::SchedulerNotAttached => 4,
             LifecyclePhase::WorkloadDispatched => 5,
+            LifecyclePhase::SchedulerAttached => 6,
         }
     }
 
@@ -461,6 +480,7 @@ impl LifecyclePhase {
             3 => Some(LifecyclePhase::SchedulerDied),
             4 => Some(LifecyclePhase::SchedulerNotAttached),
             5 => Some(LifecyclePhase::WorkloadDispatched),
+            6 => Some(LifecyclePhase::SchedulerAttached),
             _ => None,
         }
     }
@@ -1832,6 +1852,7 @@ mod tests {
             LifecyclePhase::SchedulerDied,
             LifecyclePhase::SchedulerNotAttached,
             LifecyclePhase::WorkloadDispatched,
+            LifecyclePhase::SchedulerAttached,
         ];
         for p in all {
             let v = p.wire_value();
@@ -1860,6 +1881,7 @@ mod tests {
         assert_eq!(LifecyclePhase::SchedulerDied.wire_value(), 3);
         assert_eq!(LifecyclePhase::SchedulerNotAttached.wire_value(), 4);
         assert_eq!(LifecyclePhase::WorkloadDispatched.wire_value(), 5);
+        assert_eq!(LifecyclePhase::SchedulerAttached.wire_value(), 6);
     }
 
     /// `SnapshotRequestPayload` round-trips through bytes — guards

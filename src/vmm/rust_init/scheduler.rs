@@ -918,7 +918,27 @@ pub(crate) fn spawn_scheduler_from_paths(
 ) -> (Option<Child>, Option<String>) {
     match try_spawn_scheduler(binary_path, args_path, log_path) {
         Ok(None) => (None, None),
-        Ok(Some((child, log))) => (Some(child), Some(log)),
+        Ok(Some((child, log))) => {
+            // Attach is DEFINITIVELY confirmed here and only here on the
+            // boot path: `try_spawn_scheduler` returns `Ok(Some(..))` only
+            // after `poll_scx_attached` observed `root/ops` registered with
+            // `state == Enabled` AND the child is alive. Emit
+            // `SchedulerAttached` so the host arms the progress watchdog's
+            // workload deadline from this confirmed-attach moment. NOT
+            // emitted on `Ok(None)` (no scheduler configured / EEVDF run —
+            // binary absent) nor on any `Err` arm (Died / NotAttached each
+            // send their own frame + force_reboot below), so the frame's
+            // presence is an unambiguous live-scheduler attach proof. The
+            // Op-dispatch re-attach path calls `try_spawn_scheduler`
+            // directly and emits no lifecycle frame, matching the
+            // Died/NotAttached asymmetry — this boot wrapper is the sole
+            // lifecycle-emitting attach site.
+            crate::vmm::guest_comms::send_lifecycle(
+                crate::vmm::wire::LifecyclePhase::SchedulerAttached,
+                "",
+            );
+            (Some(child), Some(log))
+        }
         Err(SpawnSchedulerError::SpawnFailed(e)) => {
             tracing::error!(err = %e, "ktstr-init: spawn scheduler failed");
             // Synthesize a minimal sched-log payload framed by

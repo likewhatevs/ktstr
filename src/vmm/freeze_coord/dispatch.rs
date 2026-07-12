@@ -274,6 +274,28 @@ fn record_boot_progress(sinks: &BulkDispatchSinks<'_>) {
     }
 }
 
+/// Arm the watchdog reset deadline to `elapsed + workload_duration` and
+/// stamp `tag` as its provenance, mirroring the [`crate::vmm::wire::MsgType::ScenarioStart`]
+/// arm's arithmetic. `elapsed` is `run_start.elapsed()` sampled by the
+/// caller (so a single clock read serves both the deadline and any
+/// sibling stamp). Plain `Release` store of `reset_ns` (not a max-style
+/// compare) — a fresh confirmed-progress frame re-anchors the workload
+/// clock unconditionally; the tag store is Relaxed (diagnostic only).
+/// No-op without a wired `watchdog_reset` budget (the CRC-defense /
+/// tx-dispatch unit fixtures leave it `None`).
+fn arm_watchdog_reset(
+    sinks: &BulkDispatchSinks<'_>,
+    elapsed: std::time::Duration,
+    tag: crate::vmm::freeze_coord::WatchdogResetTag,
+) {
+    if let Some((reset_ns, duration, _, reset_tag)) = sinks.watchdog_reset.as_ref() {
+        let target_ns = elapsed.as_nanos().saturating_add(duration.as_nanos());
+        let encoded = u64::try_from(target_ns).unwrap_or(u64::MAX).max(1);
+        reset_ns.store(encoded, std::sync::atomic::Ordering::Release);
+        reset_tag.store(tag as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Apply the live-stage side effect of a `Lifecycle` frame: decode the
 /// 1-byte [`crate::vmm::wire::LifecyclePhase`] discriminant (payload[0])
 /// and advance the ledger / record boot progress accordingly. Crc-gated
@@ -306,6 +328,29 @@ fn lifecycle_stage_advance(sinks: &BulkDispatchSinks<'_>, msg: &crate::vmm::bulk
         // either advances).
         crate::vmm::wire::LifecyclePhase::WorkloadDispatched => {
             advance_stage(sinks, crate::monitor::LifecycleStage::Body)
+        }
+        // SchedulerAttached: a REAL sched_ext scheduler bound with a live
+        // child (see `spawn_scheduler_from_paths`). This lands DURING the
+        // Attach stage — `SysRdy` already moved Boot→Attach and the
+        // →Dispatch/→Body advances come from `PayloadStarting` /
+        // `ScenarioStart` / `WorkloadDispatched` — so it records PROGRESS
+        // (confirmed attach is new-work evidence) WITHOUT advancing the
+        // coarse stage. THE MAIN ACT: arm the watchdog reset to
+        // now + workload_duration, tagged `GuestAttachConfirm`, so the
+        // progress watchdog measures the workload budget from the
+        // guest-confirmed attach moment rather than from VM boot. This is
+        // the authoritative, evented counterpart to the monitor's polled
+        // `*scx_root` latch (now demoted to a CAS fallback in
+        // `monitor::reader`): the guest frame's plain store wins over a
+        // later latch store, and the latch's CAS(0,..) fails once this
+        // frame has armed the deadline.
+        crate::vmm::wire::LifecyclePhase::SchedulerAttached => {
+            record_boot_progress(sinks);
+            arm_watchdog_reset(
+                sinks,
+                sinks.run_start.elapsed(),
+                crate::vmm::freeze_coord::WatchdogResetTag::GuestAttachConfirm,
+            );
         }
         // SchedulerDied / SchedulerNotAttached: NO stage change and NO
         // progress. The guest continues to Phase 5 regardless of an
@@ -1094,6 +1139,14 @@ mod stage_tests {
         scenario_pause_cumulative_ns: AtomicU64,
         run_start: Instant,
         current_step: Arc<AtomicU16>,
+        /// Watchdog-reset deadline atomic + provenance tag. Wired into
+        /// `watchdog_reset` only when `wire_reset` is set (the default is
+        /// `None`, matching the pre-C6 fixture so every stage test that
+        /// does not opt in observes the original no-budget behavior).
+        reset_ns: AtomicU64,
+        reset_tag: std::sync::atomic::AtomicU8,
+        workload_duration: std::time::Duration,
+        wire_reset: bool,
     }
 
     impl SinkState {
@@ -1115,7 +1168,18 @@ mod stage_tests {
                 scenario_pause_cumulative_ns: AtomicU64::new(0),
                 run_start: Instant::now(),
                 current_step: Arc::new(AtomicU16::new(0)),
+                reset_ns: AtomicU64::new(0),
+                reset_tag: std::sync::atomic::AtomicU8::new(0),
+                workload_duration: std::time::Duration::from_secs(60),
+                wire_reset: false,
             }
+        }
+
+        /// Opt this fixture into a wired `watchdog_reset` budget so the
+        /// dispatch arms that arm the deadline (ScenarioStart, ScenarioEnd,
+        /// the SchedulerAttached Lifecycle arm) exercise their reset stores.
+        fn arm_reset(&mut self) {
+            self.wire_reset = true;
         }
 
         fn sinks(&mut self) -> BulkDispatchSinks<'_> {
@@ -1131,7 +1195,16 @@ mod stage_tests {
                 kern_virt_kaslr: &self.kern_virt_kaslr,
                 kern_virt_kaslr_evt: &self.kern_virt_kaslr_evt,
                 kernel_text_link_kva: 0,
-                watchdog_reset: None,
+                watchdog_reset: if self.wire_reset {
+                    Some((
+                        &self.reset_ns,
+                        self.workload_duration,
+                        self.run_start,
+                        &self.reset_tag,
+                    ))
+                } else {
+                    None
+                },
                 watchdog_pause_ns: &self.watchdog_pause_ns,
                 scenario_start_ns: &self.scenario_start_ns,
                 sched_swap_notify: &self.sched_swap_notify,
@@ -1164,6 +1237,12 @@ mod stage_tests {
         }
         fn cpu_ns_at_phase(&self) -> u64 {
             self.ledger.cpu_ns_at_phase.load(Ordering::Relaxed)
+        }
+        fn reset_ns(&self) -> u64 {
+            self.reset_ns.load(Ordering::Acquire)
+        }
+        fn reset_tag(&self) -> u8 {
+            self.reset_tag.load(Ordering::Relaxed)
         }
     }
 
@@ -1285,6 +1364,50 @@ mod stage_tests {
         assert_eq!(s.phase(), LifecycleStage::Dispatch as u8);
         assert_eq!(s.phase_epoch(), pe);
         assert_eq!(s.progress_epoch(), pr);
+    }
+
+    /// `SchedulerAttached` records PROGRESS but does NOT advance the coarse
+    /// stage (it lands during Attach; the stage advances come from
+    /// PayloadStarting / ScenarioStart / WorkloadDispatched), and it does
+    /// NOT bump `phase_epoch`.
+    #[test]
+    fn scheduler_attached_is_progress_without_stage_advance() {
+        let mut s = SinkState::new();
+        // SysRdy first so the stage is Attach when the confirm lands.
+        s.dispatch(&frame(MsgType::SysRdy.wire_value(), Vec::new(), true));
+        assert_eq!(s.phase(), LifecycleStage::Attach as u8);
+        let pe = s.phase_epoch();
+        let pr = s.progress_epoch();
+
+        s.dispatch(&lifecycle(LifecyclePhase::SchedulerAttached, true));
+        assert_eq!(s.phase(), LifecycleStage::Attach as u8, "SchedulerAttached advanced the stage");
+        assert_eq!(s.phase_epoch(), pe, "SchedulerAttached bumped phase_epoch");
+        assert_eq!(s.progress_epoch(), pr + 1, "SchedulerAttached was not counted as progress");
+    }
+
+    /// `SchedulerAttached` arms the watchdog reset deadline to
+    /// now + workload_duration and stamps `GuestAttachConfirm` provenance —
+    /// the evented counterpart to the monitor's polled scx_root latch. A
+    /// CRC-bad confirm frame must NOT arm it (a torn frame must not forge a
+    /// deadline).
+    #[test]
+    fn scheduler_attached_arms_watchdog_reset_with_confirm_tag() {
+        let mut s = SinkState::new();
+        s.arm_reset();
+        assert_eq!(s.reset_ns(), 0, "precondition: reset not yet armed");
+
+        // CRC-bad confirm: no arm.
+        s.dispatch(&lifecycle(LifecyclePhase::SchedulerAttached, false));
+        assert_eq!(s.reset_ns(), 0, "a torn SchedulerAttached forged a deadline");
+
+        // CRC-ok confirm: arm + stamp.
+        s.dispatch(&lifecycle(LifecyclePhase::SchedulerAttached, true));
+        assert_ne!(s.reset_ns(), 0, "confirmed attach must arm the reset deadline");
+        assert_eq!(
+            s.reset_tag(),
+            crate::vmm::freeze_coord::WatchdogResetTag::GuestAttachConfirm as u8,
+            "the confirm arm must stamp GuestAttachConfirm provenance",
+        );
     }
 
     /// A CRC-bad lifecycle frame must NOT forge stage progress, but STILL

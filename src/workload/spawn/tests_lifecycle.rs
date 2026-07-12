@@ -756,6 +756,50 @@ fn park_after_iterations_parks_after_first_counted_iteration() {
     );
 }
 
+/// `signal_first_iteration(true)` on an N-fork-worker SpinWait: the
+/// evented `wait_first_iteration_all` returns `true` well before its
+/// deadline (every worker signals its first iteration), and every
+/// worker's report carries `iterations >= 1`. Also exercises the
+/// park interaction — both knobs set (as the verifier probe does) — so a
+/// parked worker still signals exactly once before sleeping.
+#[test]
+fn signal_first_iteration_wakes_before_deadline_all_workers_advance() {
+    const N: usize = 4;
+    let config = WorkloadConfig {
+        num_workers: N,
+        work_type: WorkType::SpinWait,
+        // Both knobs, mirroring the verifier dispatch probe.
+        park_after_iterations: Some(1),
+        signal_first_iteration: true,
+        ..Default::default()
+    };
+    let mut h = WorkloadHandle::spawn(&config).unwrap();
+    h.start();
+
+    // A generous deadline; a working fork-worker set signals all N first
+    // iterations in well under this, so the wait returns early and true.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let waited = Instant::now();
+    let all = h.wait_first_iteration_all(deadline, N);
+    let wait_elapsed = waited.elapsed();
+    assert!(all, "every worker should signal its first iteration");
+    assert!(
+        wait_elapsed < Duration::from_secs(9),
+        "wait_first_iteration_all should wake on the signals, not the \
+         deadline; took {wait_elapsed:?}",
+    );
+
+    let reports = h.stop_and_collect();
+    assert_eq!(reports.len(), N, "one report per worker");
+    for r in &reports {
+        assert!(
+            r.iterations >= 1,
+            "every worker must have advanced at least one iteration; got {}",
+            r.iterations,
+        );
+    }
+}
+
 /// Control for `park_after_iterations_parks_after_first_counted_iteration`:
 /// with the knob at its `None` default the worker runs to stop
 /// exactly as before, so after a spin window its `iterations` count

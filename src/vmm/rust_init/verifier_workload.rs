@@ -7,8 +7,9 @@
 //! `PayloadStarting` frame, this spawns a SpinWait workload — as
 //! SCHED_EXT tasks, so the BPF scheduler dispatches them under any switch
 //! mode (full or `SCX_OPS_SWITCH_PARTIAL`) — sized to the guest's online
-//! CPU count, waits (by polling live per-worker iteration counts, not a
-//! blind fixed sleep) until every worker has advanced at least one
+//! CPU count, waits (by BLOCKING on a shared first-iteration eventfd the
+//! workers signal, not a blind fixed sleep or a polled counter) until
+//! every worker has advanced at least one
 //! iteration or a bounded deadline elapses, then stops the workload. The
 //! workers are configured to park (`park_after_iterations(Some(1))`)
 //! after their first counted iteration rather than spinning until stop:
@@ -67,6 +68,11 @@ const DISPATCH_DEADLINE_PER_WORKER: Duration = Duration::from_millis(100);
 /// verdict — not the watchdog — decides the cell.
 const DISPATCH_DEADLINE_CAP: Duration = Duration::from_secs(30);
 
+// NOTE: no inter-poll interval — the wait is evented. Each fork worker
+// signals a shared first-iteration eventfd (`signal_first_iteration`), and
+// `WorkloadHandle::wait_first_iteration_all` blocks on that fd until every
+// worker has advanced, replacing the prior 5ms `snapshot_iterations` poll.
+
 /// Dispatch deadline for `workers` probe workers: base plus a
 /// per-worker term, capped.
 fn dispatch_deadline(workers: usize) -> Duration {
@@ -74,11 +80,6 @@ fn dispatch_deadline(workers: usize) -> Duration {
         .saturating_add(DISPATCH_DEADLINE_PER_WORKER.saturating_mul(workers as u32))
         .min(DISPATCH_DEADLINE_CAP)
 }
-
-/// Inter-poll pause. `snapshot_iterations` is a polled shared-memory
-/// counter (no eventfd to block on), so the wait is a bounded poll that
-/// breaks the instant a worker advances — not a fixed sleep-then-stop.
-const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Run the SpinWait probe and, on confirmed dispatch, emit
 /// [`LifecyclePhase::WorkloadDispatched`]. See the module docs.
@@ -107,7 +108,13 @@ pub(crate) fn run_and_confirm_dispatch() {
         // load starving other cells' bring-up. Parked workers still
         // publish their final count and respond to stop, so the
         // wait-for-all loop and the dispatch gate below are unchanged.
-        .park_after_iterations(Some(1));
+        .park_after_iterations(Some(1))
+        // Signal a shared eventfd after each worker's first counted
+        // iteration so the wait below BLOCKS on the dispatch edge instead
+        // of polling `snapshot_iterations`. Independent of the park knob:
+        // a worker signals once BEFORE parking. Fork workers only (the
+        // probe spawns CloneMode::Fork), which is exactly this path.
+        .signal_first_iteration(true);
     let mut handle = match WorkloadHandle::spawn(&cfg) {
         Ok(h) => h,
         Err(e) => {
@@ -117,30 +124,21 @@ pub(crate) fn run_and_confirm_dispatch() {
     };
     handle.start();
 
-    // Poll live per-worker progress until EVERY worker has advanced at
-    // least one outer-loop iteration, or the deadline elapses. We wait for
-    // ALL workers, not the first: `snapshot_iterations` reports only
-    // per-index counts and cannot see which workers actually became
-    // SCHED_EXT, so breaking on the FIRST advance could stop while a
-    // fair-class fallback worker (whose SCHED_EXT set was rejected under a
-    // subset-`scx.disallow` scheduler) had progressed but a real SCHED_EXT
-    // worker was still at zero — the dispatch gate below would then find no
-    // qualifying worker and false-FAIL a working scheduler. Waiting for all
-    // workers guarantees every SCHED_EXT worker has had its chance before
-    // we stop; a working scheduler dispatches all of them quickly, and the
-    // deadline bounds one that starves a worker (the gate still confirms
-    // via any qualifying worker that did advance).
+    // Block until EVERY worker has signalled its first outer-loop
+    // iteration, or the deadline elapses. We wait for ALL workers, not the
+    // first: the eventfd counter sums per-worker signals but cannot see
+    // which workers actually became SCHED_EXT, so waking on the FIRST
+    // signal could stop while a fair-class fallback worker (whose SCHED_EXT
+    // set was rejected under a subset-`scx.disallow` scheduler) had
+    // progressed but a real SCHED_EXT worker was still at zero — the
+    // dispatch gate below would then find no qualifying worker and
+    // false-FAIL a working scheduler. Waiting for all workers guarantees
+    // every SCHED_EXT worker has had its chance before we stop; a working
+    // scheduler dispatches all of them quickly, and the deadline bounds one
+    // that starves a worker (the gate still confirms via any qualifying
+    // worker that did advance).
     let deadline = Instant::now() + dispatch_deadline(workers);
-    loop {
-        let iters = handle.snapshot_iterations();
-        if !iters.is_empty() && iters.iter().all(|&it| it >= 1) {
-            break;
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(POLL_INTERVAL);
-    }
+    handle.wait_first_iteration_all(deadline, workers);
 
     // `stop_and_collect` returns authoritative post-run reports (a worker
     // that never reported back is a zeroed sentinel: `iterations == 0`,

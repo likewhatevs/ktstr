@@ -239,6 +239,15 @@ pub(crate) enum WatchdogResetTag {
     /// A wprof-ship grace extended the reset to cover the ship window
     /// (`extend_watchdog_reset_for_grace`).
     WprofGrace = 4,
+    /// The guest emitted a `LifecyclePhase::SchedulerAttached` frame — a
+    /// REAL sched_ext scheduler bound with a live child — and the dispatch
+    /// thread re-armed the reset to attach-moment + workload duration. The
+    /// evented, authoritative counterpart to [`Self::ScxRootLatch`]: unlike
+    /// the polled `*scx_root` latch, this frame is only sent on a confirmed
+    /// live-scheduler attach (never for an EEVDF/no-scheduler run or a dead
+    /// scheduler), so — unlike `ScenarioStart` — it DOES imply a live
+    /// scheduler. See `freeze_coord::dispatch`'s Lifecycle arm.
+    GuestAttachConfirm = 5,
 }
 
 impl WatchdogResetTag {
@@ -250,6 +259,7 @@ impl WatchdogResetTag {
             2 => Self::ScenarioStart,
             3 => Self::FreezeExtend,
             4 => Self::WprofGrace,
+            5 => Self::GuestAttachConfirm,
             _ => Self::Unset,
         }
     }
@@ -262,6 +272,7 @@ impl WatchdogResetTag {
             Self::ScenarioStart => "scenario-start",
             Self::FreezeExtend => "freeze-extend",
             Self::WprofGrace => "wprof-grace",
+            Self::GuestAttachConfirm => "guest-attach-confirm",
         }
     }
 }
@@ -325,6 +336,7 @@ mod watchdog_reset_tag_tests {
             (WatchdogResetTag::ScenarioStart, "scenario-start"),
             (WatchdogResetTag::FreezeExtend, "freeze-extend"),
             (WatchdogResetTag::WprofGrace, "wprof-grace"),
+            (WatchdogResetTag::GuestAttachConfirm, "guest-attach-confirm"),
         ] {
             assert_eq!(tag.render(), token);
             assert_eq!(WatchdogResetTag::from_u8(tag as u8), tag);
