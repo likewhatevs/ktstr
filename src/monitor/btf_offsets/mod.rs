@@ -395,7 +395,11 @@ fn is_raw_btf(data: &[u8]) -> bool {
 /// Is the sidecar at least as new as its vmlinux? Returns false when
 /// either file is missing or any mtime cannot be read (safe-default:
 /// treat as miss and re-extract from ELF).
-fn sidecar_fresh(sidecar: &Path, vmlinux: &Path) -> bool {
+///
+/// Shared with the `<vmlinux>.artifacts` sidecar
+/// ([`crate::vmm::vmlinux`]) so both sidecars apply the identical mtime
+/// freshness rule against their vmlinux.
+pub(crate) fn sidecar_fresh(sidecar: &Path, vmlinux: &Path) -> bool {
     let Ok(sidecar_mtime) = std::fs::metadata(sidecar).and_then(|m| m.modified()) else {
         return false;
     };
@@ -425,9 +429,53 @@ fn write_btf_sidecar(sidecar: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Load BTF for `path` from the `.btf` sidecar ALONE — never reading or
+/// parsing the multi-hundred-MB vmlinux ELF.
+///
+/// This is the reconstruction half of the `<vmlinux>.artifacts` sidecar
+/// (see [`crate::vmm::vmlinux::cached_vmlinux_artifacts`]): the derived
+/// offset tables are stored in `.artifacts`, but a `MonitorArtifacts`
+/// also carries an `Arc<Btf>` that is NOT serialized, so an
+/// `.artifacts` hit rebuilds the handle from the paired `.btf` sidecar
+/// here. Reuses the same gating the ELF loader applies on write —
+/// `path_inside_cache_root` membership plus [`sidecar_fresh`] — so a
+/// sidecar the loader would not have written is never trusted on read.
+///
+/// Returns `None` on any miss (path outside the cache, sidecar absent /
+/// stale / unreadable, or the bytes fail the raw-BTF magic or parse).
+/// The caller must then fall back to a full ELF parse — the
+/// `.artifacts` sidecar's BTF-derived products are only trustworthy
+/// paired with a matching `.btf` sidecar.
+pub(crate) fn load_btf_from_sidecar(path: &Path) -> Option<Btf> {
+    let canon = std::fs::canonicalize(path).ok()?;
+    if !crate::cache::path_inside_cache_root(&canon) {
+        return None;
+    }
+    let sidecar = btf_sidecar_path(&canon);
+    if !sidecar_fresh(&sidecar, &canon) {
+        return None;
+    }
+    let cached = std::fs::read(&sidecar).ok()?;
+    if !is_raw_btf(&cached) {
+        return None;
+    }
+    Btf::from_bytes(&cached).ok()
+}
+
+/// True iff the `.btf` sidecar for `path` exists and is fresh relative
+/// to `path` ([`sidecar_fresh`]). The `.artifacts` writer gates its
+/// write on this so a stored `.artifacts` carrying BTF-derived offsets
+/// is always paired with a `.btf` sidecar that can reconstruct the
+/// `Arc<Btf>` on load; without the pair the offsets would be
+/// unrecoverable. `path` is taken as already canonical (the caller
+/// canonicalizes once and shares the result).
+pub(crate) fn btf_sidecar_fresh_for(canon_path: &Path) -> bool {
+    sidecar_fresh(&btf_sidecar_path(canon_path), canon_path)
+}
+
 /// Byte offsets of kernel struct fields needed for host-side rq monitoring.
 /// All offsets are relative to the start of their containing struct.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KernelOffsets {
     /// Offset of `cpu` within `struct rq`. The kernel sets each
     /// runqueue's `cpu` field to its own CPU index at boot via
@@ -482,7 +530,7 @@ pub struct KernelOffsets {
 ///
 /// The host reads `*scx_root` to find the struct, then writes jiffies
 /// at this offset.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScxWatchdogOffsets {
     /// Offset of `watchdog_timeout` within `struct scx_sched`.
     pub scx_sched_watchdog_timeout_off: usize,
@@ -499,7 +547,7 @@ pub struct ScxWatchdogOffsets {
 ///
 /// The host resolves per-CPU addresses via `scx_root -> scx_sched`
 /// plus `__per_cpu_offset[cpu]`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScxEventOffsets {
     /// Offset of the percpu pointer within `struct scx_sched`.
     /// On 6.18+: offset of `pcpu` (`__percpu *scx_sched_pcpu`).
@@ -1168,7 +1216,7 @@ pub(crate) fn resolve_map_field_offset_width(
 /// Schedstat fields are guarded by `CONFIG_SCHEDSTATS` in the kernel.
 /// Resolution is optional — `resolve_schedstat_offsets()` returns `Err`
 /// when the required fields are missing from BTF.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SchedstatOffsets {
     /// Offset of `rq_sched_info` (struct sched_info) within `struct rq`.
     pub rq_sched_info: usize,
@@ -1486,7 +1534,7 @@ impl BpfMapOffsets {
 
 /// Byte offsets within kernel BPF program structures needed for
 /// host-side BPF program enumeration and verifier stats collection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BpfProgOffsets {
     /// Offset of `type` (enum bpf_prog_type, u32) within `struct bpf_prog`.
     pub prog_type: usize,

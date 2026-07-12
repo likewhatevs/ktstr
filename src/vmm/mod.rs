@@ -165,7 +165,7 @@ pub(crate) use vcpu::{
     BpfMapWriteParams, ImmediateExitHandle, WatchBpfMapParams, register_vcpu_signal_handler,
     set_thread_cpumask, vcpu_signal,
 };
-pub(crate) use vmlinux::find_vmlinux;
+pub(crate) use vmlinux::{cached_vmlinux_artifacts, cached_vmlinux_bytes, find_vmlinux};
 
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;

@@ -151,7 +151,7 @@ pub(crate) const VMLINUX_ZERO_DATA_SECTIONS: &[&[u8]] = &[
 ];
 
 /// Kernel symbol addresses extracted from vmlinux ELF.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct KernelSymbols {
     /// Link-time kernel virtual address of the `runqueues` per-CPU
     /// template. Despite living in `.data..percpu`, x86_64 vmlinux

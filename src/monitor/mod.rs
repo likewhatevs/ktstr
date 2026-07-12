@@ -194,18 +194,38 @@ pub(crate) const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
 
 /// Extract CONFIG_HZ from the embedded IKCONFIG blob in a vmlinux ELF.
 ///
+/// Prefers the cross-process `<vmlinux>.artifacts` sidecar (via
+/// [`crate::vmm::cached_vmlinux_artifacts`]): the derived `guest_hz`
+/// is scanned once at parse time and stored there, so a sidecar hit
+/// returns it WITHOUT re-reading the multi-hundred-MB ELF. The
+/// artifacts cache returns `None` only when the ELF is unreadable or
+/// the mandatory-symbol parse fails; in that case we still recover HZ
+/// from a process-cached byte read + a direct IKCONFIG scan, matching
+/// the pre-cache behaviour (HZ resolution does not depend on symbols).
+fn read_hz_from_ikconfig(vmlinux_path: &std::path::Path) -> Option<u64> {
+    if let Some(artifacts) = crate::vmm::cached_vmlinux_artifacts(vmlinux_path) {
+        return artifacts.guest_hz;
+    }
+    let data = crate::vmm::cached_vmlinux_bytes(vmlinux_path)?;
+    hz_from_vmlinux_bytes(&data)
+}
+
+/// Scan raw vmlinux ELF bytes for the embedded IKCONFIG blob and parse
+/// CONFIG_HZ from it.
+///
 /// The kernel (when built with CONFIG_IKCONFIG) embeds a gzip-compressed
 /// copy of `.config` in `.rodata`, bracketed by `IKCFG_ST` / `IKCFG_ED`
-/// markers. This function scans the raw bytes for the marker, decompresses
-/// the gzip data, and parses CONFIG_HZ from the result.
-fn read_hz_from_ikconfig(vmlinux_path: &std::path::Path) -> Option<u64> {
-    let data = std::fs::read(vmlinux_path).ok()?;
+/// markers. This scans the raw bytes for the marker, decompresses the
+/// gzip data, and parses CONFIG_HZ from the result. Called once per
+/// (path, mtime) at vmlinux-artifacts parse time so the derived HZ can
+/// be cached in the `.artifacts` sidecar.
+pub(crate) fn hz_from_vmlinux_bytes(data: &[u8]) -> Option<u64> {
     // vmlinux images are tens of MB; the old
     // `windows(8).position(|w| w == IKCFG_ST)` was a naive O(n)
     // byte-wise scan. memchr's two-way matcher uses the available
     // SIMD path (x86_64 AVX2 / aarch64 Neon) and cuts scan time by
     // a constant factor on every host we care about.
-    let pos = memchr::memmem::find(&data, IKCONFIG_MAGIC)?;
+    let pos = memchr::memmem::find(data, IKCONFIG_MAGIC)?;
     let gz_start = pos + IKCONFIG_MAGIC.len();
     if gz_start >= data.len() {
         return None;
