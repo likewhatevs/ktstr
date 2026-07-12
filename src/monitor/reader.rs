@@ -1959,6 +1959,98 @@ pub(crate) enum WatchdogOverride {
     },
 }
 
+/// Loop-local state for the `scx_watchdog_timestamp` forge latch.
+///
+/// The host forges the guest's `scx_watchdog_timestamp` to bridge the
+/// gap between installing the overridden `scx_watchdog_interval` and the
+/// guest kworker re-arming at that new interval. Forging must be bounded:
+/// `scx_tick` is the guest's last-resort stall detector when the kworker
+/// itself is starved (the attach-then-stall case), and it fires off
+/// `scx_watchdog_timestamp`. Forging forever permanently pacifies it, so a
+/// genuinely stalled scheduler is never evicted. This state ends forging
+/// on either of two conditions (see [`forge_step`]).
+#[derive(Debug, Default)]
+struct WatchdogForgeState {
+    /// Latched once forging has stopped; no further timestamp writes.
+    forge_done: bool,
+    /// The jiffies value written on the previous forging iteration. A
+    /// guest-visible timestamp that differs from this means the guest
+    /// refreshed it independently (kworker fired / scheduler re-attached).
+    last_forged_ts: Option<u64>,
+    /// `jiffies_64` observed on the first forging iteration — the origin
+    /// of the fallback bound below.
+    forge_start_j: Option<u64>,
+    /// The guest's original `watchdog_timeout` (guest jiffies), captured
+    /// before the override clobbered it. Bounds how long the host forges.
+    original_timeout_j: Option<u64>,
+}
+
+/// Outcome of one [`forge_step`] decision.
+enum ForgeAction {
+    /// Do not write the timestamp this iteration.
+    Skip,
+    /// Write this jiffies value to `scx_watchdog_timestamp`.
+    Forge(u64),
+}
+
+/// Clamp the guest's original `watchdog_timeout` (guest jiffies) to a
+/// defensive upper bound. `wd_jiffies` is the override timeout in guest
+/// jiffies (5 s by default → `5 * HZ`), so `6 * wd_jiffies == 30 * HZ ==
+/// SCX_WATCHDOG_MAX_TIMEOUT` for the default and stays a safe ceiling for
+/// larger overrides. The guest kernel already clamps its own
+/// `watchdog_timeout` to `SCX_WATCHDOG_MAX_TIMEOUT`, so this only binds on
+/// a garbage or zero read (the loop reads guest memory before the
+/// scheduler has necessarily written the field), which falls back to the
+/// clamp rather than forging for an absurd duration.
+fn clamp_original_timeout(raw: u64, wd_jiffies: u64) -> u64 {
+    let clamp = wd_jiffies.saturating_mul(6);
+    if raw == 0 || raw > clamp {
+        clamp
+    } else {
+        raw
+    }
+}
+
+/// Decide whether to forge `scx_watchdog_timestamp` this iteration, given
+/// the current guest-visible timestamp `cur_ts` and current `jiffies_64`
+/// `now_j` (both read before this call). Mutates the latch state.
+///
+/// Two stop conditions, either of which hands the guest's last-resort
+/// stall detector back to the guest:
+///   - Takeover: the guest refreshed the timestamp itself (kworker fired
+///     at ~the original interval, or a re-attach) — the healthy path.
+///   - Fallback bound: in a genuinely stalled scheduler the kworker never
+///     fires, so the takeover latch alone would forge forever. Stop after
+///     roughly the guest's original timeout. Worst-case eviction: forge
+///     ≤ `original_timeout` (≤ 30 s) then `scx_tick` fires at
+///     `last_forge + overridden_timeout` (5 s) → `SCX_EXIT_ERROR_STALL` →
+///     bounded clean FAIL, versus the 145-175 s of unbounded forging.
+fn forge_step(
+    st: &mut WatchdogForgeState,
+    cur_ts: u64,
+    now_j: u64,
+    margin_j: u64,
+) -> ForgeAction {
+    if st.forge_done {
+        return ForgeAction::Skip;
+    }
+    if let Some(prev) = st.last_forged_ts {
+        if cur_ts != prev {
+            st.forge_done = true;
+            return ForgeAction::Skip;
+        }
+    }
+    let start = *st.forge_start_j.get_or_insert(now_j);
+    if let Some(orig) = st.original_timeout_j {
+        if now_j.saturating_sub(start) > orig.saturating_add(margin_j) {
+            st.forge_done = true;
+            return ForgeAction::Skip;
+        }
+    }
+    st.last_forged_ts = Some(now_j);
+    ForgeAction::Forge(now_j)
+}
+
 /// BPF program stats context for the monitor loop.
 ///
 /// Holds the static parameters [`super::bpf_prog::walk_struct_ops_runtime_stats`]
@@ -2723,6 +2815,9 @@ pub(crate) fn monitor_loop(
     // null-read or scheduler reload does not stomp the attach
     // moment with a fresh `Instant::now()`.
     let mut watchdog_reset_signaled = false;
+    // Latch state for the `scx_watchdog_timestamp` forge. See
+    // [`WatchdogForgeState`] / [`forge_step`] for why forging is bounded.
+    let mut watchdog_forge = WatchdogForgeState::default();
 
     // Cadence + wake plumbing. `tick_tfd` is a periodic
     // `CLOCK_MONOTONIC` timerfd that fires every `interval` so the
@@ -2948,6 +3043,17 @@ pub(crate) fn monitor_loop(
                 } => (*interval_pa, *timestamp_pa, *jiffies_64_pa),
             };
             if let Some(pa) = write_pa {
+                // Capture the guest's original `watchdog_timeout` ONCE,
+                // before the override write below clobbers it, to bound
+                // how long the host forges the timestamp (see below).
+                // Works for both variants: `pa`/`write_offset` is the
+                // deref'd `sch_pa + watchdog_offset` (ScxSched) or the
+                // static `watchdog_timeout_pa` at offset 0 (StaticGlobal).
+                if !watchdog_forge.forge_done && watchdog_forge.original_timeout_j.is_none() {
+                    let raw = mem.read_u64(pa, write_offset);
+                    watchdog_forge.original_timeout_j =
+                        Some(clamp_original_timeout(raw, wd_jiffies));
+                }
                 mem.write_u64(pa, write_offset, wd_jiffies);
                 if let Some(intv_pa) = interval_pa {
                     let intv = std::cmp::max(wd_jiffies / 2, 1);
@@ -2962,9 +3068,30 @@ pub(crate) fn monitor_loop(
                 // above only takes effect on the kworker's NEXT firing.
                 // Without this, scx_tick sees a 5s threshold but the
                 // timestamp is 15s stale → SCX_EXIT_ERROR_STALL.
+                //
+                // The forge is LATCHED (unlike the timeout/interval writes
+                // above, which stay unconditional — scx_tick reads the
+                // overridden timeout, so keeping it fresh is what makes
+                // post-forge eviction fast). scx_tick is the guest's
+                // last-resort stall detector when the kworker itself is
+                // starved, and it fires off this timestamp; forging it
+                // forever would permanently pacify it and a genuinely
+                // stalled scheduler would never be evicted. `forge_step`
+                // stops on takeover (guest refreshed it) or a fallback
+                // bound (kworker never fires) — see its doc for the math.
                 if let (Some(ts_pa), Some(j64_pa)) = (timestamp_pa, jiffies_64_pa) {
-                    let now = mem.read_u64(j64_pa, 0);
-                    mem.write_u64(ts_pa, 0, now);
+                    if !watchdog_forge.forge_done {
+                        let cur_ts = mem.read_u64(ts_pa, 0);
+                        let now_j = mem.read_u64(j64_pa, 0);
+                        // ~2 s of guest jiffies (`wd_jiffies` == 5 s worth),
+                        // absorbing scx_tick jitter around the bound.
+                        let margin_j = std::cmp::max(wd_jiffies * 2 / 5, 1);
+                        if let ForgeAction::Forge(v) =
+                            forge_step(&mut watchdog_forge, cur_ts, now_j, margin_j)
+                        {
+                            mem.write_u64(ts_pa, 0, v);
+                        }
+                    }
                 }
                 if watchdog_observation.is_none() {
                     let observed = mem.read_u64(pa, write_offset);
@@ -4830,6 +4957,164 @@ mod tests {
         let obs = watchdog_observation.expect("watchdog_observation should be Some");
         assert_eq!(obs.expected_jiffies, 77777);
         assert_eq!(obs.observed_jiffies, 77777);
+    }
+
+    #[test]
+    fn clamp_original_timeout_keeps_sane_reads() {
+        // wd_jiffies == 5 s worth (HZ = 100 here) → clamp == 30 s worth.
+        let wd = 500u64;
+        // A plausible original (15 s) passes through unchanged.
+        assert_eq!(clamp_original_timeout(1500, wd), 1500);
+        // Zero (field not yet written) falls back to the clamp.
+        assert_eq!(clamp_original_timeout(0, wd), 3000);
+        // Garbage above the ceiling falls back to the clamp.
+        assert_eq!(clamp_original_timeout(u64::MAX, wd), 3000);
+    }
+
+    #[test]
+    fn forge_step_stops_at_fallback_bound_when_guest_never_refreshes() {
+        // Stalled scheduler: the kworker never fires, so the guest never
+        // refreshes the timestamp on its own. Forging must stop once
+        // now_j - start exceeds original_timeout + margin.
+        let mut st = WatchdogForgeState {
+            original_timeout_j: Some(15),
+            ..Default::default()
+        };
+        let margin = 2u64;
+        // Guest timestamp memory the host forges into; the guest never
+        // touches it independently, so cur_ts always reads back the last
+        // forged value.
+        let mut guest_ts = 0u64;
+        let mut forges = 0u32;
+        let mut stopped_at = None;
+        // start = first now_j = 100; bound: now_j - 100 > 15 + 2 = 17.
+        for j in 100u64..200 {
+            match forge_step(&mut st, guest_ts, j, margin) {
+                ForgeAction::Forge(v) => {
+                    guest_ts = v;
+                    forges += 1;
+                }
+                ForgeAction::Skip => {
+                    stopped_at = Some(j);
+                    break;
+                }
+            }
+        }
+        assert!(st.forge_done, "forging must latch off at the fallback bound");
+        // Forged for now_j in 100..=117 (18 iterations), stopped at 118.
+        assert_eq!(forges, 18);
+        assert_eq!(stopped_at, Some(118));
+    }
+
+    #[test]
+    fn forge_step_stops_on_guest_takeover() {
+        // Healthy path: the guest kworker refreshes the timestamp itself.
+        // The takeover latch must stop forging even though the fallback
+        // bound is far away.
+        let mut st = WatchdogForgeState {
+            original_timeout_j: Some(100_000),
+            ..Default::default()
+        };
+        let margin = 2u64;
+        let mut guest_ts = 0u64;
+        let mut forges = 0u32;
+        let mut took_over_at = None;
+        for j in 100u64..200 {
+            // At j == 105 the guest kworker writes a fresh, independent
+            // timestamp before the host's read this iteration.
+            if j == 105 {
+                guest_ts = 999_999;
+            }
+            match forge_step(&mut st, guest_ts, j, margin) {
+                ForgeAction::Forge(v) => {
+                    guest_ts = v;
+                    forges += 1;
+                }
+                ForgeAction::Skip => {
+                    took_over_at = Some(j);
+                    break;
+                }
+            }
+        }
+        assert!(st.forge_done, "forging must latch off on guest takeover");
+        // Forged j in 100..=104 (5 iterations), takeover detected at 105.
+        assert_eq!(forges, 5);
+        assert_eq!(took_over_at, Some(105));
+    }
+
+    #[test]
+    fn monitor_loop_watchdog_forges_and_bounds_timestamp() {
+        // End-to-end wiring: with timestamp_pa + jiffies_64_pa present the
+        // loop forges scx_watchdog_timestamp to the current jiffies_64 and
+        // captures the original timeout for the fallback bound.
+        let offsets = test_offsets();
+        let rq_buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
+        // Layout after rq_buf: watchdog_timeout | interval | timestamp | jiffies_64.
+        let base = rq_buf.len() as u64;
+        let timeout_pa = base;
+        let interval_pa = base + 8;
+        let timestamp_pa = base + 16;
+        let jiffies_64_pa = base + 24;
+
+        let mut combined = rq_buf;
+        combined.extend_from_slice(&1500u64.to_ne_bytes()); // original timeout (15 s @ HZ=100)
+        combined.extend_from_slice(&0u64.to_ne_bytes()); // interval
+        combined.extend_from_slice(&0u64.to_ne_bytes()); // timestamp
+        combined.extend_from_slice(&424242u64.to_ne_bytes()); // jiffies_64
+
+        // SAFETY: combined is a live local buffer whose backing storage
+        // outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+
+        let wd = WatchdogOverride::StaticGlobal {
+            watchdog_timeout_pa: timeout_pa,
+            jiffies: 500, // override = 5 s @ HZ=100
+            interval_pa: Some(interval_pa),
+            timestamp_pa: Some(timestamp_pa),
+            jiffies_64_pa: Some(jiffies_64_pa),
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let cfg = MonitorConfig {
+            watchdog_override: Some(&wd),
+            ..test_config()
+        };
+        let MonitorLoopResult { samples, .. } = monitor_loop(
+            &mem,
+            &[0],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+
+        assert!(!samples.is_empty());
+        // Override timeout landed.
+        let ts_written =
+            u64::from_ne_bytes(combined[timeout_pa as usize..timeout_pa as usize + 8].try_into().unwrap());
+        assert_eq!(ts_written, 500);
+        // Timestamp was forged to the (static) jiffies_64 value. jiffies_64
+        // never advances in this fake, so cur_ts == last_forged after the
+        // first write and the loop keeps forging the same value without the
+        // fallback bound ever tripping (now_j - start == 0).
+        let forged = u64::from_ne_bytes(
+            combined[timestamp_pa as usize..timestamp_pa as usize + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(forged, 424242);
     }
 
     #[test]
