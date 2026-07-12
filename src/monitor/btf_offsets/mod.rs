@@ -397,7 +397,7 @@ fn is_raw_btf(data: &[u8]) -> bool {
 /// treat as miss and re-extract from ELF).
 ///
 /// Shared with the `<vmlinux>.artifacts` sidecar
-/// ([`crate::vmm::vmlinux`]) so both sidecars apply the identical mtime
+/// (`vmm::vmlinux`) so both sidecars apply the identical mtime
 /// freshness rule against their vmlinux.
 pub(crate) fn sidecar_fresh(sidecar: &Path, vmlinux: &Path) -> bool {
     let Ok(sidecar_mtime) = std::fs::metadata(sidecar).and_then(|m| m.modified()) else {
@@ -433,7 +433,7 @@ fn write_btf_sidecar(sidecar: &Path, bytes: &[u8]) -> Result<()> {
 /// parsing the multi-hundred-MB vmlinux ELF.
 ///
 /// This is the reconstruction half of the `<vmlinux>.artifacts` sidecar
-/// (see [`crate::vmm::vmlinux::cached_vmlinux_artifacts`]): the derived
+/// (see `vmm::vmlinux::cached_vmlinux_artifacts`): the derived
 /// offset tables are stored in `.artifacts`, but a `MonitorArtifacts`
 /// also carries an `Arc<Btf>` that is NOT serialized, so an
 /// `.artifacts` hit rebuilds the handle from the paired `.btf` sidecar

@@ -252,8 +252,7 @@ pub(super) struct BulkDispatchSinks<'a> {
 /// ledger (unit fixtures).
 fn advance_stage(sinks: &BulkDispatchSinks<'_>, stage: crate::monitor::LifecycleStage) {
     if let Some(ledger) = sinks.progress_ledger {
-        let wall_ns =
-            u64::try_from(sinks.run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let wall_ns = u64::try_from(sinks.run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         ledger.advance_phase(stage as u8, wall_ns);
     }
 }
@@ -265,11 +264,8 @@ fn advance_stage(sinks: &BulkDispatchSinks<'_>, stage: crate::monitor::Lifecycle
 /// without a wired ledger.
 fn record_boot_progress(sinks: &BulkDispatchSinks<'_>) {
     if let Some(ledger) = sinks.progress_ledger {
-        let wall_ns =
-            u64::try_from(sinks.run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let cpu_ns_now = ledger
-            .cpu_ns_now
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let wall_ns = u64::try_from(sinks.run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let cpu_ns_now = ledger.cpu_ns_now.load(std::sync::atomic::Ordering::Relaxed);
         ledger.record_progress(cpu_ns_now, wall_ns);
     }
 }
@@ -297,7 +293,7 @@ fn arm_watchdog_reset(
 }
 
 /// Apply the live-stage side effect of a `Lifecycle` frame: decode the
-/// 1-byte [`crate::vmm::wire::LifecyclePhase`] discriminant (payload[0])
+/// 1-byte [`crate::vmm::wire::LifecyclePhase`] discriminant (`payload[0]`)
 /// and advance the ledger / record boot progress accordingly. Crc-gated
 /// — a torn frame must not forge stage progress. Pure ledger side
 /// effect; the caller still buckets the frame verbatim. Extracted from
@@ -1155,7 +1151,9 @@ mod stage_tests {
                 ledger: ProgressLedger::default(),
                 kill: Arc::new(AtomicBool::new(false)),
                 kill_evt: Arc::new(EventFd::new(EFD_NONBLOCK).expect("kill eventfd")),
-                sys_rdy_evt: Some(Arc::new(EventFd::new(EFD_NONBLOCK).expect("sys_rdy eventfd"))),
+                sys_rdy_evt: Some(Arc::new(
+                    EventFd::new(EFD_NONBLOCK).expect("sys_rdy eventfd"),
+                )),
                 snapshot_requests_pending: Vec::new(),
                 kernel_op_requests_pending: Vec::new(),
                 kern_phys_base: Arc::new(AtomicU64::new(0)),
@@ -1215,12 +1213,6 @@ mod stage_tests {
             }
         }
 
-        /// Publish a synthetic `cpu_ns_now` (as the monitor would) so the
-        /// next advance snapshots a known anchor into `cpu_ns_at_phase`.
-        fn set_cpu_ns(&self, v: u64) {
-            self.ledger.cpu_ns_now.store(v, Ordering::Relaxed);
-        }
-
         fn dispatch(&mut self, msg: &crate::vmm::bulk::BulkMessage) -> Option<ShmEntry> {
             let mut sinks = self.sinks();
             dispatch_bulk_message(msg, &mut sinks)
@@ -1234,9 +1226,6 @@ mod stage_tests {
         }
         fn progress_epoch(&self) -> u64 {
             self.ledger.progress_epoch.load(Ordering::Acquire)
-        }
-        fn cpu_ns_at_phase(&self) -> u64 {
-            self.ledger.cpu_ns_at_phase.load(Ordering::Relaxed)
         }
         fn reset_ns(&self) -> u64 {
             self.reset_ns.load(Ordering::Acquire)
@@ -1257,13 +1246,17 @@ mod stage_tests {
     }
 
     fn lifecycle(phase: LifecyclePhase, crc_ok: bool) -> crate::vmm::bulk::BulkMessage {
-        frame(MsgType::Lifecycle.wire_value(), vec![phase.wire_value()], crc_ok)
+        frame(
+            MsgType::Lifecycle.wire_value(),
+            vec![phase.wire_value()],
+            crc_ok,
+        )
     }
 
     /// Test cell path: Boot →(SysRdy)→ Attach →(PayloadStarting)→
     /// Dispatch →(ScenarioStart)→ Body →(Exit)→ Teardown. Each forward
-    /// step bumps both epochs by exactly one and snapshots the CPU anchor
-    /// the monitor had published.
+    /// step bumps both epochs by exactly one. (The Tier-1 CPU anchor is
+    /// monitor-side now, so no `cpu_ns_at_phase` snapshot is asserted here.)
     #[test]
     fn test_cell_stage_walk() {
         let mut s = SinkState::new();
@@ -1271,33 +1264,29 @@ mod stage_tests {
         assert_eq!(s.phase_epoch(), 0);
         assert_eq!(s.progress_epoch(), 0);
 
-        s.set_cpu_ns(100);
         s.dispatch(&frame(MsgType::SysRdy.wire_value(), Vec::new(), true));
         assert_eq!(s.phase(), LifecycleStage::Attach as u8);
         assert_eq!(s.phase_epoch(), 1);
         assert_eq!(s.progress_epoch(), 1);
-        assert_eq!(s.cpu_ns_at_phase(), 100);
 
-        s.set_cpu_ns(200);
         s.dispatch(&lifecycle(LifecyclePhase::PayloadStarting, true));
         assert_eq!(s.phase(), LifecycleStage::Dispatch as u8);
         assert_eq!(s.phase_epoch(), 2);
         assert_eq!(s.progress_epoch(), 2);
-        assert_eq!(s.cpu_ns_at_phase(), 200);
 
-        s.set_cpu_ns(300);
-        s.dispatch(&frame(MsgType::ScenarioStart.wire_value(), Vec::new(), true));
+        s.dispatch(&frame(
+            MsgType::ScenarioStart.wire_value(),
+            Vec::new(),
+            true,
+        ));
         assert_eq!(s.phase(), LifecycleStage::Body as u8);
         assert_eq!(s.phase_epoch(), 3);
         assert_eq!(s.progress_epoch(), 3);
-        assert_eq!(s.cpu_ns_at_phase(), 300);
 
-        s.set_cpu_ns(400);
         s.dispatch(&frame(MsgType::Exit.wire_value(), Vec::new(), true));
         assert_eq!(s.phase(), LifecycleStage::Teardown as u8);
         assert_eq!(s.phase_epoch(), 4);
         assert_eq!(s.progress_epoch(), 4);
-        assert_eq!(s.cpu_ns_at_phase(), 400);
     }
 
     /// Verifier cell path reaches Body via `WorkloadDispatched` (not
@@ -1325,10 +1314,22 @@ mod stage_tests {
         let pe = s.phase_epoch();
         let pr = s.progress_epoch();
 
-        s.dispatch(&frame(MsgType::ScenarioStart.wire_value(), Vec::new(), true));
-        assert_eq!(s.phase(), LifecycleStage::Teardown as u8, "stray ScenarioStart regressed the stage");
+        s.dispatch(&frame(
+            MsgType::ScenarioStart.wire_value(),
+            Vec::new(),
+            true,
+        ));
+        assert_eq!(
+            s.phase(),
+            LifecycleStage::Teardown as u8,
+            "stray ScenarioStart regressed the stage"
+        );
         assert_eq!(s.phase_epoch(), pe, "no-op advance bumped phase_epoch");
-        assert_eq!(s.progress_epoch(), pr, "no-op advance bumped progress_epoch");
+        assert_eq!(
+            s.progress_epoch(),
+            pr,
+            "no-op advance bumped progress_epoch"
+        );
     }
 
     /// InitStarted is a boot heartbeat: it records PROGRESS but does NOT
@@ -1339,7 +1340,11 @@ mod stage_tests {
         s.dispatch(&lifecycle(LifecyclePhase::InitStarted, true));
         assert_eq!(s.phase(), LifecycleStage::Boot as u8);
         assert_eq!(s.phase_epoch(), 0, "InitStarted advanced the stage");
-        assert_eq!(s.progress_epoch(), 1, "InitStarted was not counted as progress");
+        assert_eq!(
+            s.progress_epoch(),
+            1,
+            "InitStarted was not counted as progress"
+        );
     }
 
     /// An attach-failure lifecycle frame (`SchedulerDied` /
@@ -1380,9 +1385,17 @@ mod stage_tests {
         let pr = s.progress_epoch();
 
         s.dispatch(&lifecycle(LifecyclePhase::SchedulerAttached, true));
-        assert_eq!(s.phase(), LifecycleStage::Attach as u8, "SchedulerAttached advanced the stage");
+        assert_eq!(
+            s.phase(),
+            LifecycleStage::Attach as u8,
+            "SchedulerAttached advanced the stage"
+        );
         assert_eq!(s.phase_epoch(), pe, "SchedulerAttached bumped phase_epoch");
-        assert_eq!(s.progress_epoch(), pr + 1, "SchedulerAttached was not counted as progress");
+        assert_eq!(
+            s.progress_epoch(),
+            pr + 1,
+            "SchedulerAttached was not counted as progress"
+        );
     }
 
     /// `SchedulerAttached` arms the watchdog reset deadline to
@@ -1398,11 +1411,19 @@ mod stage_tests {
 
         // CRC-bad confirm: no arm.
         s.dispatch(&lifecycle(LifecyclePhase::SchedulerAttached, false));
-        assert_eq!(s.reset_ns(), 0, "a torn SchedulerAttached forged a deadline");
+        assert_eq!(
+            s.reset_ns(),
+            0,
+            "a torn SchedulerAttached forged a deadline"
+        );
 
         // CRC-ok confirm: arm + stamp.
         s.dispatch(&lifecycle(LifecyclePhase::SchedulerAttached, true));
-        assert_ne!(s.reset_ns(), 0, "confirmed attach must arm the reset deadline");
+        assert_ne!(
+            s.reset_ns(),
+            0,
+            "confirmed attach must arm the reset deadline"
+        );
         assert_eq!(
             s.reset_tag(),
             crate::vmm::freeze_coord::WatchdogResetTag::GuestAttachConfirm as u8,
@@ -1416,7 +1437,11 @@ mod stage_tests {
     fn crc_bad_lifecycle_does_not_advance_but_buckets() {
         let mut s = SinkState::new();
         let entry = s.dispatch(&lifecycle(LifecyclePhase::PayloadStarting, false));
-        assert_eq!(s.phase(), LifecycleStage::Boot as u8, "torn frame forged a stage advance");
+        assert_eq!(
+            s.phase(),
+            LifecycleStage::Boot as u8,
+            "torn frame forged a stage advance"
+        );
         assert_eq!(s.phase_epoch(), 0);
         let entry = entry.expect("Lifecycle must still bucket even CRC-bad");
         assert_eq!(entry.msg_type, MsgType::Lifecycle.wire_value());
@@ -1430,7 +1455,11 @@ mod stage_tests {
         let mut s = SinkState::new();
         let payload = vec![LifecyclePhase::WorkloadDispatched.wire_value()];
         let entry = s
-            .dispatch(&frame(MsgType::Lifecycle.wire_value(), payload.clone(), true))
+            .dispatch(&frame(
+                MsgType::Lifecycle.wire_value(),
+                payload.clone(),
+                true,
+            ))
             .expect("Lifecycle must bucket");
         assert_eq!(entry.msg_type, MsgType::Lifecycle.wire_value());
         assert_eq!(entry.payload, payload, "bucketed payload not verbatim");
@@ -1444,7 +1473,9 @@ mod stage_tests {
     fn exit_and_test_result_drive_teardown_and_bucket() {
         for wire in [MsgType::Exit.wire_value(), MsgType::TestResult.wire_value()] {
             let mut s = SinkState::new();
-            let entry = s.dispatch(&frame(wire, vec![1, 2, 3], true)).expect("must bucket");
+            let entry = s
+                .dispatch(&frame(wire, vec![1, 2, 3], true))
+                .expect("must bucket");
             assert_eq!(entry.msg_type, wire);
             assert_eq!(entry.payload, vec![1, 2, 3]);
             assert_eq!(s.phase(), LifecycleStage::Teardown as u8);

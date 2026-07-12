@@ -11,9 +11,9 @@
 //! untripped). The current model (`src/vmm/freeze_coord/watchdog_step.rs`)
 //! anchors progress on MILESTONES (lifecycle stage advances) only, and
 //! reasons about a phase's CPU burn and CPU trickle:
-//!   - **Tier-1** — `cpu_in_phase` exceeded the phase's
-//!     `phase_cpu_budget_ns` without reaching a milestone: a *spinning*
-//!     wedge.
+//!   - **Tier-1** — the busiest vCPU's `max_vcpu_cpu_in_phase` exceeded the
+//!     phase's flat `phase_cpu_budget_ns` without reaching a milestone: a
+//!     *spinning* wedge.
 //!   - **Tier-2** — an INFRA phase sat past its `phase_wall_backstop_ns`
 //!     with live evidence channels, no runnable demand, and its CPU
 //!     trickle-stalled (two consecutive 10 s windows under the 1 ms floor):
@@ -21,6 +21,7 @@
 //!   - **Tier-3** — the dead-man wall deadline, deferring while the cell is
 //!     alive (CPU accruing or a recent milestone) and firing only on a dead
 //!     monitor or a truly inert cell.
+//!
 //! Both progress tiers fire ONLY in INFRA stages (Boot / Attach / Dispatch
 //! / Teardown); the Body stage is exempt via the `u64::MAX` Body budgets in
 //! `test_support::runtime::{phase_cpu_budget_ns, phase_wall_backstop_ns}`.
@@ -65,12 +66,12 @@
 //!     start, so the kill lands ≈ 40-50 s total. Asserted `< 90s` — 0.6×
 //!     the deadman, generous for host-load jitter yet strictly
 //!     discriminating (a deadman kill cannot beat ~150 s).
-//!   - **Tier-1 spin**: the Teardown CPU budget is
-//!     `5_000ms + 50ms × vcpus` ≈ 5.05 s (≤ 7.6 s if pthread-widened 3/2);
-//!     a 1-vCPU spinner accrues ~1 s CPU per wall-second, so Tier-1 fires
-//!     ≈ 5-8 s after the wedge starts — ≈ 20-25 s total. Asserted `< 60s`
-//!     (0.4× the deadman): tighter than the idle bound because Tier-1 needs
-//!     no trickle windows.
+//!   - **Tier-1 spin**: the Teardown CPU budget is now the flat 8 s
+//!     (≤ 12 s if pthread-widened 3/2), charged against the MAX per-vCPU
+//!     in-phase burn; a 1-vCPU spinner IS the max and accrues ~1 s CPU per
+//!     wall-second, so Tier-1 fires ≈ 8-12 s after the wedge starts —
+//!     ≈ 20-27 s total. Asserted `< 60s` (0.4× the deadman): tighter than
+//!     the idle bound because Tier-1 needs no trickle windows.
 //!
 //! The kill CAUSE line (`cause=tier1-cpu-budget` / `cause=tier2-idle-wedge`)
 //! goes to the watchdog's stderr dump — captured by nextest, not carried on
@@ -107,9 +108,9 @@ const TEARDOWN_SPIN_SCHED: Scheduler =
 /// worst-case trickle latch); the Tier-3 deadman cannot land under ~150 s.
 const TIER2_IDLE_BOUND: Duration = Duration::from_secs(90);
 
-/// Upper bound on a Tier-1 spin-wedge kill's wall time. Expected ≈ 20-25 s
-/// (wedge start + ≤8 s CPU-budget burn); tighter than the idle bound
-/// because Tier-1 needs no trickle windows.
+/// Upper bound on a Tier-1 spin-wedge kill's wall time. Expected ≈ 20-27 s
+/// (wedge start + ≤12 s widened CPU-budget burn); tighter than the idle
+/// bound because Tier-1 needs no trickle windows.
 const TIER1_SPIN_BOUND: Duration = Duration::from_secs(60);
 
 /// Host-side gate for the idle (Tier-2) fixture: the injected Teardown
@@ -148,7 +149,7 @@ fn assert_tier1_spin_fast_kill(result: &VmResult) -> Result<()> {
         result.duration < TIER1_SPIN_BOUND,
         "Teardown spin-wedge timed out but too slowly ({:.1}s >= {:.1}s \
          bound): the kill looks like the Tier-3 dead-man deadline (~150s+), \
-         not the Tier-1 Teardown CPU budget (~5-8s of in-phase burn)",
+         not the Tier-1 Teardown CPU budget (~8-12s of in-phase burn)",
         result.duration.as_secs_f64(),
         TIER1_SPIN_BOUND.as_secs_f64(),
     );
@@ -206,8 +207,9 @@ fn teardown_idle_wedge_killed_by_tier2(_ctx: &Ctx) -> Result<AssertResult> {
 
 /// Tier-1 (spinning wedge): after publishing its PASS, the guest busy-spins
 /// forever in the Teardown stage, burning CPU with no milestone. The
-/// watchdog's Tier-1 rule kills it once `cpu_in_phase` exceeds the ~5 s
-/// Teardown CPU budget — earlier than Tier-2's backstop+trickle latch and
+/// watchdog's Tier-1 rule kills it once its `max_vcpu_cpu_in_phase` exceeds
+/// the flat 8 s Teardown CPU budget (the lone spinning vCPU IS the max) —
+/// earlier than Tier-2's backstop+trickle latch and
 /// far below Tier-3. Green iff the kill lands fast (see
 /// `assert_tier1_spin_fast_kill`).
 #[ktstr_test(

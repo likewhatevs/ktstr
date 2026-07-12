@@ -495,11 +495,11 @@ pub struct VmResult {
     pub variant_hash: u64,
     /// Host-side vCPU scheduling dilation for this run — RAW schedstat
     /// totals summed over the vCPU host threads (see
-    /// [`HostVcpuSchedstat`]). Populated by `run_vm` teardown from each
+    /// `HostVcpuSchedstat`). Populated by `run_vm` teardown from each
     /// vCPU thread's `/proc/self/task/<tid>/schedstat` while the threads
     /// are still alive; `None` on hosts without `CONFIG_SCHEDSTATS`, on
     /// synthesized/fixture results, and whenever no vCPU thread was
-    /// sampled. Consumers call [`HostVcpuSchedstat::dilation`] for the
+    /// sampled. Consumers call `HostVcpuSchedstat::dilation` for the
     /// derived `D` ratio. Purely observational — never affects the
     /// verdict or exit code.
     pub host_vcpu_schedstat: Option<HostVcpuSchedstat>,

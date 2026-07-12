@@ -33,7 +33,9 @@
 //! accrues only microseconds/s of parked-vCPU ISR time — orders of
 //! magnitude apart, so a fixed floor separates them cleanly.
 
-use crate::monitor::{CPU_CURRENCY_NONE, CPU_CURRENCY_PTHREAD, LedgerSnapshot, LifecycleStage, StageClass};
+use crate::monitor::{
+    CPU_CURRENCY_NONE, CPU_CURRENCY_PTHREAD, LedgerSnapshot, LifecycleStage, StageClass,
+};
 use crate::test_support::runtime::{phase_cpu_budget_ns, phase_wall_backstop_ns};
 
 /// Lifecycle-phase *class* the watchdog treats a phase as, decoupled
@@ -160,9 +162,12 @@ pub(crate) const fn trickle_floor_for_currency(cpu_currency: u8) -> u64 {
 ///     (raw `u8` so this fn carries no dependency on that enum).
 ///   - `class`: [`PhaseClass::Infra`] vs [`PhaseClass::Body`] — gates
 ///     Tier-2.
-///   - `cpu_in_phase_ns`: guest CPU burned since this phase was entered
-///     (the last milestone). Since progress is milestone-only and a phase
-///     entry IS a milestone, this is also "CPU since the last milestone".
+///   - `max_vcpu_cpu_in_phase_ns`: the MAX over vCPUs of per-vCPU guest CPU
+///     burned since this phase was entered (the last milestone) — the
+///     monitor's width-independent Tier-1 evidence. A spinning wedge is a
+///     hot thread, so its max crosses a flat budget; a wide idle guest's
+///     summed background burn does NOT (that summed number lives in
+///     `cpu_ns_now`, which feeds only Tier-2/Tier-3).
 ///   - `wall_in_phase_ns`: wall time since this phase was entered (the
 ///     last milestone).
 ///   - `runnable_demand`: the guest had runnable-but-not-running tasks —
@@ -177,21 +182,19 @@ pub(crate) const fn trickle_floor_for_currency(cpu_currency: u8) -> u64 {
 ///     is receiving essentially no CPU.
 ///   - `monitor_live`: the monitor thread is producing fresh ledger
 ///     writes.
-///   - `cpu_currency`: provenance of `cpu_in_phase_ns`
+///   - `cpu_currency`: provenance of `max_vcpu_cpu_in_phase_ns`
 ///     ([`CPU_CURRENCY_NONE`]/`PTHREAD`/`PMU`).
-///   - `vcpus`: guest vCPU count, scaling the per-phase CPU budget.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn watchdog_step(
     phase: u8,
     class: PhaseClass,
-    cpu_in_phase_ns: u64,
+    max_vcpu_cpu_in_phase_ns: u64,
     wall_in_phase_ns: u64,
     runnable_demand: bool,
     channels_live: bool,
     cpu_trickle_stalled: bool,
     monitor_live: bool,
     cpu_currency: u8,
-    vcpus: u32,
 ) -> KillDecision {
     // A dead monitor invalidates BOTH tiers' evidence. Tier-1's CPU signal
     // comes from monitor ledger writes, so a stale monitor makes it
@@ -214,10 +217,10 @@ pub(crate) fn watchdog_step(
     // Tier-1 is structurally off for Body via the budget table, not a
     // class check.
     if cpu_currency != CPU_CURRENCY_NONE {
-        let budget = widen_budget_for_currency(phase_cpu_budget_ns(phase, vcpus), cpu_currency);
-        // Strict `>`: a phase that burned *exactly* its budget has not yet
-        // exceeded it.
-        if cpu_in_phase_ns > budget {
+        let budget = widen_budget_for_currency(phase_cpu_budget_ns(phase), cpu_currency);
+        // Strict `>`: a phase whose busiest vCPU burned *exactly* the budget
+        // has not yet exceeded it.
+        if max_vcpu_cpu_in_phase_ns > budget {
             return KillDecision::Tier1CpuBudget;
         }
     }
@@ -254,14 +257,14 @@ pub(crate) fn watchdog_step(
     KillDecision::None
 }
 
-/// The widened Tier-1 CPU budget (ns) the watchdog charges `phase` at
-/// `vcpus` under CPU-time provenance `cpu_currency` — the SAME number
-/// [`watchdog_step`] compares `cpu_in_phase_ns` against. Exposed so the
-/// watchdog's failure dump can render `cpu_in_phase vs budget` against the
+/// The widened Tier-1 CPU budget (ns) the watchdog charges `phase` under
+/// CPU-time provenance `cpu_currency` — the SAME number [`watchdog_step`]
+/// compares `max_vcpu_cpu_in_phase_ns` against. Exposed so the watchdog's
+/// failure dump can render `max_vcpu_cpu_in_phase vs budget` against the
 /// effective (currency-widened) budget rather than the raw
-/// [`phase_cpu_budget_ns`].
-pub(crate) fn widened_cpu_budget_ns(phase: u8, vcpus: u32, cpu_currency: u8) -> u64 {
-    widen_budget_for_currency(phase_cpu_budget_ns(phase, vcpus), cpu_currency)
+/// [`phase_cpu_budget_ns`]. Width-independent — no vCPU count.
+pub(crate) fn widened_cpu_budget_ns(phase: u8, cpu_currency: u8) -> u64 {
+    widen_budget_for_currency(phase_cpu_budget_ns(phase), cpu_currency)
 }
 
 /// Fold one live [`LedgerSnapshot`] into a [`KillDecision`]: the glue
@@ -274,25 +277,25 @@ pub(crate) fn widened_cpu_budget_ns(phase: u8, vcpus: u32, cpu_currency: u8) -> 
 ///
 /// `now_wall_ns` is `run_start`-relative — the SAME `run_start` the
 /// monitor/dispatch anchor `wall_ns_at_progress` to — so `wall_in_phase`
-/// aligns. Because progress is milestone-only and a phase entry IS a
-/// milestone, `cpu_ns_at_phase` and the milestone anchor `cpu_ns_at_progress`
-/// coincide; this uses `cpu_ns_at_phase` for the CPU delta and the
-/// milestone anchor `wall_ns_at_progress` for the wall delta.
+/// aligns. The Tier-1 CPU evidence is the monitor's
+/// `max_vcpu_cpu_in_phase_ns` (already anchored monitor-side to the current
+/// phase — see [`crate::monitor::ProgressLedger::max_vcpu_cpu_in_phase_ns`]),
+/// used as-is; the wall delta uses the milestone anchor
+/// `wall_ns_at_progress`.
 ///
-/// INITIAL STATE: before the first milestone both anchors are 0, so
-/// `cpu_in_phase == cpu_ns_now` and `wall_in_phase == now_wall_ns`. Boot's
-/// budgets thus count from run start — intended (Boot owes its first
-/// milestone). Saturating subtraction guards the benign torn read where a
-/// fresher anchor races an older `now`/`cpu_now` (clamps to 0 — more
-/// conservative, never a spurious kill).
+/// INITIAL STATE: before the monitor's first re-anchor of a fresh phase,
+/// `max_vcpu_cpu_in_phase_ns` reads 0 (the monitor re-anchors before
+/// computing), and before the first milestone `wall_ns_at_progress` is 0 so
+/// `wall_in_phase == now_wall_ns`. Boot's wall backstop thus counts from run
+/// start — intended (Boot owes its first milestone). Saturating subtraction
+/// guards the benign torn read where a fresher anchor races an older `now`
+/// (clamps to 0 — more conservative, never a spurious kill).
 pub(crate) fn evaluate_progress(
     snap: &LedgerSnapshot,
     now_wall_ns: u64,
     cpu_trickle_stalled: bool,
     monitor_live: bool,
-    vcpus: u32,
 ) -> KillDecision {
-    let cpu_in_phase = snap.cpu_ns_now.saturating_sub(snap.cpu_ns_at_phase);
     let wall_in_phase = now_wall_ns.saturating_sub(snap.wall_ns_at_progress);
     let class = match LifecycleStage::from_u8(snap.phase).class() {
         StageClass::Body => PhaseClass::Body,
@@ -301,14 +304,13 @@ pub(crate) fn evaluate_progress(
     watchdog_step(
         snap.phase,
         class,
-        cpu_in_phase,
+        snap.max_vcpu_cpu_in_phase_ns,
         wall_in_phase,
         snap.runnable_demand,
         snap.evidence_channels_live,
         cpu_trickle_stalled,
         monitor_live,
         snap.cpu_currency,
-        vcpus,
     )
 }
 
@@ -360,8 +362,7 @@ pub(crate) fn deadman_should_fire(
     wall_since_milestone_ns: u64,
     cpu_trickle_stalled: bool,
 ) -> bool {
-    !monitor_live
-        || (cpu_trickle_stalled && wall_since_milestone_ns > TIER3_PROGRESS_GRACE_NS)
+    !monitor_live || (cpu_trickle_stalled && wall_since_milestone_ns > TIER3_PROGRESS_GRACE_NS)
 }
 
 /// Watchdog-thread-local tracker that turns the ledger's monotone summed
@@ -502,20 +503,20 @@ mod tests {
 
     const S: u64 = 1_000_000_000;
 
-    // Boot(0), 1 vCPU: cpu budget 8_400 ms, wall backstop 45 s.
+    // Boot(0): flat cpu budget 15 s, wall backstop 45 s.
     fn boot_budget_ns() -> u64 {
-        phase_cpu_budget_ns(BOOT, 1)
+        phase_cpu_budget_ns(BOOT)
     }
     fn boot_backstop_ns() -> u64 {
         phase_wall_backstop_ns(BOOT)
     }
 
-    /// Common Boot/INFRA, monitor-live, 1-vCPU caller. Each row varies the
-    /// inputs that matter to it: `cpu_in_phase`, `wall_in_phase`,
+    /// Common Boot/INFRA, monitor-live caller. Each row varies the inputs
+    /// that matter to it: `max_vcpu_cpu_in_phase`, `wall_in_phase`,
     /// `runnable`, `channels`, `trickle_stalled`, `currency`.
     #[allow(clippy::too_many_arguments)]
     fn boot_step(
-        cpu_in_phase: u64,
+        max_vcpu_cpu_in_phase: u64,
         wall_in_phase: u64,
         runnable: bool,
         channels: bool,
@@ -525,14 +526,13 @@ mod tests {
         watchdog_step(
             BOOT,
             PhaseClass::Infra,
-            cpu_in_phase,
+            max_vcpu_cpu_in_phase,
             wall_in_phase,
             runnable,
             channels,
             trickle_stalled,
             true, // monitor_live
             currency,
-            1,
         )
     }
 
@@ -579,7 +579,6 @@ mod tests {
             false,
             true,
             CPU_CURRENCY_PMU,
-            1,
         );
         assert_eq!(d, KillDecision::None);
     }
@@ -601,6 +600,32 @@ mod tests {
     }
 
     #[test]
+    fn tier1_wide_idle_guest_max_stays_tiny_no_fire() {
+        // THE WIDE-SMP REGRESSION ROW: a 256-vCPU idle guest in Attach whose
+        // 256 vCPUs each burn a diffuse background trickle. The old summed
+        // evidence charged ~141 s against a per-vCPU-linear budget and false-
+        // fired; the max-per-vCPU evidence is only ~50 ms (one vCPU's share),
+        // far under the flat 35 s Attach budget (pthread-widened to 52.5 s) →
+        // None. Width no longer moves Tier-1.
+        const ATTACH: u8 = 1;
+        let max_vcpu = 50_000_000; // 50 ms: busiest single vCPU's in-phase burn
+        for &currency in &[CPU_CURRENCY_PMU, CPU_CURRENCY_PTHREAD] {
+            let d = watchdog_step(
+                ATTACH,
+                PhaseClass::Infra,
+                max_vcpu,
+                30 * S, // deep into the phase by wall
+                false,
+                true,
+                false,
+                true,
+                currency,
+            );
+            assert_eq!(d, KillDecision::None, "currency={currency}");
+        }
+    }
+
+    #[test]
     fn zero_cpu_is_never_tier1_at_any_wall() {
         // Zero CPU burned in-phase: never Tier-1, at any wall.
         for wall in [0, boot_backstop_ns() + S, 100 * S] {
@@ -616,7 +641,14 @@ mod tests {
     fn tier2_idle_wedge_fires_when_all_conjuncts_hold() {
         // No runnable demand, channels live, CPU trickle-stalled, past the
         // wall backstop → a silent idle wedge.
-        let d = boot_step(0, boot_backstop_ns() + S, false, true, true, CPU_CURRENCY_PMU);
+        let d = boot_step(
+            0,
+            boot_backstop_ns() + S,
+            false,
+            true,
+            true,
+            CPU_CURRENCY_PMU,
+        );
         assert_eq!(d, KillDecision::Tier2IdleWedge);
     }
 
@@ -626,7 +658,14 @@ mod tests {
         // backstop, BUT the CPU is still trickling above the floor (NOT
         // trickle-stalled) — a host-starved but ALIVE cell. Tier-2 must
         // NOT fire; the deadman defers it too.
-        let d = boot_step(5_000_000, boot_backstop_ns() + S, false, true, false, CPU_CURRENCY_PMU);
+        let d = boot_step(
+            5_000_000,
+            boot_backstop_ns() + S,
+            false,
+            true,
+            false,
+            CPU_CURRENCY_PMU,
+        );
         assert_eq!(d, KillDecision::None);
     }
 
@@ -635,7 +674,14 @@ mod tests {
         // Runnable demand present → not an idle wedge even when
         // trickle-stalled and past the backstop (the deadman bounds a
         // runnable-piled-up stalled cell instead).
-        let d = boot_step(0, boot_backstop_ns() + S, true, true, true, CPU_CURRENCY_PMU);
+        let d = boot_step(
+            0,
+            boot_backstop_ns() + S,
+            true,
+            true,
+            true,
+            CPU_CURRENCY_PMU,
+        );
         assert_eq!(d, KillDecision::None);
     }
 
@@ -645,7 +691,14 @@ mod tests {
         // absence of demand is blind here (the acceptance storm's 33 false
         // kills), so Tier-2 must NOT fire. currency=none (the storm's
         // pre-resolution shape) so Tier-1 is also off → None.
-        let d = boot_step(0, boot_backstop_ns() + S, false, false, true, CPU_CURRENCY_NONE);
+        let d = boot_step(
+            0,
+            boot_backstop_ns() + S,
+            false,
+            false,
+            true,
+            CPU_CURRENCY_NONE,
+        );
         assert_eq!(d, KillDecision::None);
     }
 
@@ -653,7 +706,14 @@ mod tests {
     fn tier2_needs_no_cpu_currency() {
         // Idle wedge under currency=NONE still fires: Tier-2 reasons about
         // the trickle bool + channels, not the CPU sum's currency.
-        let d = boot_step(0, boot_backstop_ns() + S, false, true, true, CPU_CURRENCY_NONE);
+        let d = boot_step(
+            0,
+            boot_backstop_ns() + S,
+            false,
+            true,
+            true,
+            CPU_CURRENCY_NONE,
+        );
         assert_eq!(d, KillDecision::Tier2IdleWedge);
     }
 
@@ -672,7 +732,6 @@ mod tests {
             true,
             true,
             CPU_CURRENCY_PMU,
-            1,
         );
         assert_eq!(d, KillDecision::None);
     }
@@ -680,7 +739,14 @@ mod tests {
     #[test]
     fn tier2_below_backstop_does_not_fire() {
         // All Tier-2 conjuncts but the wall is still short of the backstop.
-        let d = boot_step(0, boot_backstop_ns() - S, false, true, true, CPU_CURRENCY_PMU);
+        let d = boot_step(
+            0,
+            boot_backstop_ns() - S,
+            false,
+            true,
+            true,
+            CPU_CURRENCY_PMU,
+        );
         assert_eq!(d, KillDecision::None);
     }
 
@@ -713,7 +779,6 @@ mod tests {
             false,
             false, // monitor dead
             CPU_CURRENCY_PMU,
-            1,
         );
         assert_eq!(tier1_shape, KillDecision::None);
 
@@ -727,7 +792,6 @@ mod tests {
             true,
             false, // monitor dead
             CPU_CURRENCY_PMU,
-            1,
         );
         assert_eq!(tier2_shape, KillDecision::None);
     }
@@ -764,9 +828,9 @@ mod tests {
     fn widened_cpu_budget_matches_currency_widening() {
         // pthread widens the raw Boot budget 3/2; PMU leaves it raw.
         let raw = boot_budget_ns();
-        assert_eq!(widened_cpu_budget_ns(BOOT, 1, CPU_CURRENCY_PMU), raw);
+        assert_eq!(widened_cpu_budget_ns(BOOT, CPU_CURRENCY_PMU), raw);
         assert_eq!(
-            widened_cpu_budget_ns(BOOT, 1, CPU_CURRENCY_PTHREAD),
+            widened_cpu_budget_ns(BOOT, CPU_CURRENCY_PTHREAD),
             raw + raw / 2
         );
     }
@@ -785,7 +849,6 @@ mod tests {
             true,
             true,
             CPU_CURRENCY_PMU,
-            1,
         );
         assert_eq!(d, KillDecision::None);
     }
@@ -806,7 +869,11 @@ mod tests {
         // starved-but-alive cell defers past the wall deadline no matter
         // how long since the last milestone. Bounded by the harness, not
         // this deadman.
-        assert!(!deadman_should_fire(true, TIER3_PROGRESS_GRACE_NS + S, false));
+        assert!(!deadman_should_fire(
+            true,
+            TIER3_PROGRESS_GRACE_NS + S,
+            false
+        ));
         assert!(!deadman_should_fire(true, 1_000 * S, false));
     }
 
@@ -827,7 +894,11 @@ mod tests {
         // Trickle-stalled but a milestone landed within the grace → defer
         // (a recent milestone means the cell is still advancing its
         // lifecycle).
-        assert!(!deadman_should_fire(true, TIER3_PROGRESS_GRACE_NS - S, true));
+        assert!(!deadman_should_fire(
+            true,
+            TIER3_PROGRESS_GRACE_NS - S,
+            true
+        ));
     }
 
     // ---- CpuTrickleTracker ----
@@ -960,7 +1031,10 @@ mod tests {
         // PMU keeps the tight guest-only floor; pthread (and the
         // no-currency tick) get the widened floor that absorbs VM-exit
         // overhead charged to an idle guest.
-        assert_eq!(trickle_floor_for_currency(CPU_CURRENCY_PMU), TRICKLE_FLOOR_NS);
+        assert_eq!(
+            trickle_floor_for_currency(CPU_CURRENCY_PMU),
+            TRICKLE_FLOOR_NS
+        );
         assert_eq!(
             trickle_floor_for_currency(CPU_CURRENCY_PTHREAD),
             TRICKLE_FLOOR_PTHREAD_NS
@@ -1043,7 +1117,10 @@ mod tests {
         for _ in 0..n {
             last = live.observe(0);
         }
-        assert!(!last, "a heartbeat frozen at 0 latches not-live after N ticks");
+        assert!(
+            !last,
+            "a heartbeat frozen at 0 latches not-live after N ticks"
+        );
     }
 
     // ---- evaluate_progress: ledger snapshot → tier decision glue ----
@@ -1051,8 +1128,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn snap(
         phase: u8,
-        cpu_ns_now: u64,
-        cpu_ns_at_phase: u64,
+        max_vcpu_cpu_in_phase_ns: u64,
         wall_ns_at_progress: u64,
         runnable_demand: bool,
         channels_live: bool,
@@ -1060,8 +1136,10 @@ mod tests {
     ) -> LedgerSnapshot {
         LedgerSnapshot {
             phase,
-            cpu_ns_now,
-            cpu_ns_at_phase,
+            // Summed CPU is Tier-2/Tier-3's; Tier-1 (what evaluate_progress
+            // charges) reads only the max-per-vCPU field below.
+            cpu_ns_now: 0,
+            max_vcpu_cpu_in_phase_ns,
             wall_ns_at_progress,
             progress_epoch: 0,
             monitor_heartbeat: 0,
@@ -1078,11 +1156,10 @@ mod tests {
         // channels live, trickle-stalled → a silent idle wedge.
         let now = boot_backstop_ns() + S;
         let d = evaluate_progress(
-            &snap(BOOT, 0, 0, 0, false, true, CPU_CURRENCY_PMU),
+            &snap(BOOT, 0, 0, false, true, CPU_CURRENCY_PMU),
             now,
             true, // trickle_stalled
             true, // monitor_live
-            1,
         );
         assert_eq!(d, KillDecision::Tier2IdleWedge);
     }
@@ -1093,41 +1170,46 @@ mod tests {
         // window) → Tier-2 suppressed → None.
         let now = boot_backstop_ns() + S;
         let d = evaluate_progress(
-            &snap(BOOT, 0, 0, 0, false, false, CPU_CURRENCY_PMU),
+            &snap(BOOT, 0, 0, false, false, CPU_CURRENCY_PMU),
             now,
             true,
             true,
-            1,
         );
         assert_eq!(d, KillDecision::None);
     }
 
     #[test]
     fn evaluate_progress_channels_dead_still_fires_tier1() {
-        // Storm scenario end-to-end: channels dead, currency=pthread, CPU
-        // in-phase over the widened budget → Tier-1 STILL fires (host-side
-        // CPU evidence).
+        // Storm scenario end-to-end: channels dead, currency=pthread, the
+        // busiest vCPU's in-phase burn over the widened budget → Tier-1
+        // STILL fires (host-side CPU evidence).
         let over = boot_budget_ns() + boot_budget_ns() / 2 + S;
         let d = evaluate_progress(
-            &snap(BOOT, over, 0, 0, false, false, CPU_CURRENCY_PTHREAD),
+            &snap(BOOT, over, 0, false, false, CPU_CURRENCY_PTHREAD),
             0,
             false,
             true,
-            1,
         );
         assert_eq!(d, KillDecision::Tier1CpuBudget);
     }
 
     #[test]
     fn evaluate_progress_initial_state_counts_from_run_start() {
-        // Before the first milestone both anchors are 0, so a Boot that
-        // burned past its CPU budget since run start fires Tier-1.
+        // Before the monitor re-anchors, the max-in-phase reads whatever the
+        // monitor last published; a Boot whose busiest vCPU burned past its
+        // CPU budget fires Tier-1.
         let d = evaluate_progress(
-            &snap(BOOT, boot_budget_ns() + 100 * S, 0, 0, false, false, CPU_CURRENCY_PMU),
+            &snap(
+                BOOT,
+                boot_budget_ns() + 100 * S,
+                0,
+                false,
+                false,
+                CPU_CURRENCY_PMU,
+            ),
             0,
             false,
             true,
-            1,
         );
         assert_eq!(d, KillDecision::Tier1CpuBudget);
     }
@@ -1136,11 +1218,10 @@ mod tests {
     fn evaluate_progress_dead_monitor_suppresses_tiers() {
         let now = boot_backstop_ns() + S;
         let d = evaluate_progress(
-            &snap(BOOT, 0, 0, 0, false, true, CPU_CURRENCY_PMU),
+            &snap(BOOT, 0, 0, false, true, CPU_CURRENCY_PMU),
             now,
             true,
             false, // monitor dead
-            1,
         );
         assert_eq!(d, KillDecision::None);
     }
@@ -1149,11 +1230,10 @@ mod tests {
     fn evaluate_progress_body_never_fires() {
         let now = 1_000 * S;
         let d = evaluate_progress(
-            &snap(BODY, u64::MAX - 1, 0, 0, false, true, CPU_CURRENCY_PMU),
+            &snap(BODY, u64::MAX - 1, 0, false, true, CPU_CURRENCY_PMU),
             now,
             true,
             true,
-            1,
         );
         assert_eq!(d, KillDecision::None);
     }

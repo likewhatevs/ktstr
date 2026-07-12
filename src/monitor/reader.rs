@@ -2004,11 +2004,7 @@ enum ForgeAction {
 /// clamp rather than forging for an absurd duration.
 fn clamp_original_timeout(raw: u64, wd_jiffies: u64) -> u64 {
     let clamp = wd_jiffies.saturating_mul(6);
-    if raw == 0 || raw > clamp {
-        clamp
-    } else {
-        raw
-    }
+    if raw == 0 || raw > clamp { clamp } else { raw }
 }
 
 /// Decide whether to forge `scx_watchdog_timestamp` this iteration, given
@@ -2025,27 +2021,22 @@ fn clamp_original_timeout(raw: u64, wd_jiffies: u64) -> u64 {
 ///     ≤ `original_timeout` (≤ 30 s) then `scx_tick` fires at
 ///     `last_forge + overridden_timeout` (5 s) → `SCX_EXIT_ERROR_STALL` →
 ///     bounded clean FAIL, versus the 145-175 s of unbounded forging.
-fn forge_step(
-    st: &mut WatchdogForgeState,
-    cur_ts: u64,
-    now_j: u64,
-    margin_j: u64,
-) -> ForgeAction {
+fn forge_step(st: &mut WatchdogForgeState, cur_ts: u64, now_j: u64, margin_j: u64) -> ForgeAction {
     if st.forge_done {
         return ForgeAction::Skip;
     }
-    if let Some(prev) = st.last_forged_ts {
-        if cur_ts != prev {
-            st.forge_done = true;
-            return ForgeAction::Skip;
-        }
+    if let Some(prev) = st.last_forged_ts
+        && cur_ts != prev
+    {
+        st.forge_done = true;
+        return ForgeAction::Skip;
     }
     let start = *st.forge_start_j.get_or_insert(now_j);
-    if let Some(orig) = st.original_timeout_j {
-        if now_j.saturating_sub(start) > orig.saturating_add(margin_j) {
-            st.forge_done = true;
-            return ForgeAction::Skip;
-        }
+    if let Some(orig) = st.original_timeout_j
+        && now_j.saturating_sub(start) > orig.saturating_add(margin_j)
+    {
+        st.forge_done = true;
+        return ForgeAction::Skip;
     }
     st.last_forged_ts = Some(now_j);
     ForgeAction::Forge(now_j)
@@ -2310,7 +2301,7 @@ pub(crate) struct WatchdogReset<'a> {
     /// `LifecyclePhase::SchedulerAttached` frame (dispatch-thread writer,
     /// `WatchdogResetTag::GuestAttachConfirm`) has not already armed it.
     pub reset_ns: &'a AtomicU64,
-    /// Parallel provenance tag for [`reset_ns`], one of the
+    /// Parallel provenance tag for `reset_ns`, one of the
     /// `WatchdogResetTag` byte values owned by
     /// [`crate::vmm::freeze_coord`]. Stamped `ScxRootLatch` (value 1) ONLY
     /// when this polled latch WINS its `reset_ns` CAS, so a lost CAS (the
@@ -2714,9 +2705,10 @@ pub(crate) enum CurrencySource {
 /// the source is chosen exactly once. Task-clock ns and pthread-clock ns
 /// are DIFFERENT magnitudes for the same wall interval (the task clock
 /// excludes host-side time), so mixing them across ticks would make the
-/// ledger's `cpu_since_progress` / `cpu_ns_at_phase` anchors incoherent —
-/// a source flip could send `cpu_ns_now` backwards (consumers `saturating_sub`
-/// it, reading the regression as a 0 delta). Capabilities do not change
+/// ledger's `cpu_ns_now` sum and the per-vCPU max-in-phase anchor
+/// incoherent — a source flip could send `cpu_ns_now` backwards (consumers
+/// `saturating_sub` it, reading the regression as a 0 delta). Capabilities
+/// do not change
 /// mid-run (the counters arm at monitor start), so the first tick's
 /// availability is authoritative: PMU iff EVERY sampled vCPU carried a
 /// task clock on tick 1, else pthread — for the whole run.
@@ -2771,6 +2763,81 @@ pub(crate) fn select_cpu_currency(
             };
             (cpu_ns_now, currency)
         }
+    }
+}
+
+/// Per-vCPU CPU-time readings (ns) for the LATCHED currency `source`, one
+/// entry per sampled vCPU with an absent reading rendered as 0 (matching
+/// the flatten-to-0 the pthread/PMU sums use). Picking by the SAME latched
+/// source [`select_cpu_currency`] summed keeps the per-vCPU max and the
+/// sum on one magnitude. Index-stable: vCPU `i` is always `readings[i]`.
+fn active_per_vcpu_cpu_ns(
+    source: CurrencySource,
+    task_clocks: &[Option<u64>],
+    pthread: &[Option<u64>],
+) -> Vec<u64> {
+    let active = match source {
+        CurrencySource::Pmu => task_clocks,
+        CurrencySource::Pthread => pthread,
+    };
+    active.iter().map(|o| o.unwrap_or(0)).collect()
+}
+
+/// Monitor-thread-local tracker deriving the ledger's
+/// `max_vcpu_cpu_in_phase_ns` — the MAX over vCPUs of per-vCPU CPU burned
+/// since the current lifecycle phase was entered. Pure state machine (no
+/// atomics, no clocks) so its anchor arithmetic is unit-testable; the
+/// monitor feeds it each tick's active-currency readings
+/// ([`active_per_vcpu_cpu_ns`]) and the ledger's current `phase_epoch`.
+///
+/// WHY MAX, NOT SUM: a spinning wedge is one (or a few) hot thread(s), so
+/// its max-per-vCPU crosses a flat per-phase budget in bounded wall time;
+/// a wide idle guest's diffuse per-vCPU background burn (timer ticks / IPIs
+/// — tens of ms/s/vCPU) sums to seconds across hundreds of vCPUs yet its
+/// MAX stays tens of ms. Width-independent, so Tier-1 never false-fires on
+/// guest width alone (the 256-vCPU wide-SMP false kill this replaces).
+///
+/// RE-ANCHOR DISCIPLINE: it holds a per-vCPU `anchor` vector and the
+/// `phase_epoch` that anchor belongs to. On the FIRST observe, and on any
+/// observe whose `phase_epoch` differs (a lifecycle stage advanced) or
+/// whose vCPU count differs, it RE-ANCHORS to the current readings BEFORE
+/// computing and returns 0 for that tick — so a freshly-entered phase never
+/// charges the prior phase's accumulated CPU. Between re-anchors it returns
+/// `max_i(readings[i] - anchor[i])` (saturating, so an absent or regressed
+/// reading contributes 0 — conservative, never a spurious kill).
+pub(crate) struct MaxVcpuInPhaseTracker {
+    anchor: Vec<u64>,
+    phase_epoch: u32,
+    seeded: bool,
+}
+
+impl MaxVcpuInPhaseTracker {
+    pub(crate) fn new() -> Self {
+        Self {
+            anchor: Vec::new(),
+            phase_epoch: 0,
+            seeded: false,
+        }
+    }
+
+    /// Fold this tick's per-vCPU `readings` (active-currency CPU-time ns,
+    /// absent → 0, index-stable per vCPU) and the ledger's current
+    /// `phase_epoch`; return the max per-vCPU CPU burned since the phase
+    /// was entered. Re-anchors (returns 0) on the first tick, on a
+    /// `phase_epoch` change, or on a vCPU-count change.
+    pub(crate) fn observe(&mut self, readings: &[u64], phase_epoch: u32) -> u64 {
+        if !self.seeded || phase_epoch != self.phase_epoch || self.anchor.len() != readings.len() {
+            self.anchor = readings.to_vec();
+            self.phase_epoch = phase_epoch;
+            self.seeded = true;
+            return 0;
+        }
+        readings
+            .iter()
+            .zip(&self.anchor)
+            .map(|(&r, &a)| r.saturating_sub(a))
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -2900,6 +2967,13 @@ pub(crate) fn monitor_loop(
     // Progress-ledger CPU currency source, latched on the first ledger
     // tick and never changed (see `select_cpu_currency`).
     let mut ledger_currency: Option<CurrencySource> = None;
+    // Monitor-side per-vCPU max-in-phase tracker: derives the ledger's
+    // width-independent Tier-1 evidence (`max_vcpu_cpu_in_phase_ns`),
+    // re-anchored on every `phase_epoch` advance it observes. Kept here (not
+    // dispatch-side) so the anchor and the per-vCPU reads it charges come
+    // from the SAME monitor tick — the fix for the cross-thread ~0-anchor
+    // incoherence.
+    let mut max_vcpu_tracker = MaxVcpuInPhaseTracker::new();
     let mut vcpu_timing_err_reported: Vec<bool> = vcpu_timing
         .map(|vt| vec![false; vt.pthreads.len()])
         .unwrap_or_default();
@@ -3214,18 +3288,18 @@ pub(crate) fn monitor_loop(
                 // stalled scheduler would never be evicted. `forge_step`
                 // stops on takeover (guest refreshed it) or a fallback
                 // bound (kworker never fires) — see its doc for the math.
-                if let (Some(ts_pa), Some(j64_pa)) = (timestamp_pa, jiffies_64_pa) {
-                    if !watchdog_forge.forge_done {
-                        let cur_ts = mem.read_u64(ts_pa, 0);
-                        let now_j = mem.read_u64(j64_pa, 0);
-                        // ~2 s of guest jiffies (`wd_jiffies` == 5 s worth),
-                        // absorbing scx_tick jitter around the bound.
-                        let margin_j = std::cmp::max(wd_jiffies * 2 / 5, 1);
-                        if let ForgeAction::Forge(v) =
-                            forge_step(&mut watchdog_forge, cur_ts, now_j, margin_j)
-                        {
-                            mem.write_u64(ts_pa, 0, v);
-                        }
+                if let (Some(ts_pa), Some(j64_pa)) = (timestamp_pa, jiffies_64_pa)
+                    && !watchdog_forge.forge_done
+                {
+                    let cur_ts = mem.read_u64(ts_pa, 0);
+                    let now_j = mem.read_u64(j64_pa, 0);
+                    // ~2 s of guest jiffies (`wd_jiffies` == 5 s worth),
+                    // absorbing scx_tick jitter around the bound.
+                    let margin_j = std::cmp::max(wd_jiffies * 2 / 5, 1);
+                    if let ForgeAction::Forge(v) =
+                        forge_step(&mut watchdog_forge, cur_ts, now_j, margin_j)
+                    {
+                        mem.write_u64(ts_pa, 0, v);
                     }
                 }
                 if watchdog_observation.is_none() {
@@ -3630,6 +3704,21 @@ pub(crate) fn monitor_loop(
                 .unwrap_or_default();
             let (cpu_ns_now, cpu_currency) =
                 select_cpu_currency(&mut ledger_currency, &task_clocks, &pthread_times);
+            // Tier-1 evidence (width-independent): the MAX over vCPUs of
+            // per-vCPU CPU burned since the current phase was entered. Uses
+            // the SAME latched currency source `select_cpu_currency`
+            // summed, so the max and the sum share one magnitude, and
+            // re-anchors on the ledger's `phase_epoch` (Acquire) so a
+            // freshly-entered phase charges only its own burn — never the
+            // prior phase's accumulated CPU. Computed monitor-side from
+            // this tick's own reads, so the anchor is always coherent.
+            let per_vcpu_cpu_ns = active_per_vcpu_cpu_ns(
+                ledger_currency.expect("select_cpu_currency latched the source"),
+                &task_clocks,
+                &pthread_times,
+            );
+            let phase_epoch = ledger.phase_epoch.load(Ordering::Acquire);
+            let max_vcpu_cpu_in_phase_ns = max_vcpu_tracker.observe(&per_vcpu_cpu_ns, phase_epoch);
             // Evidence channels: per-CPU GUEST data actually resolved this
             // tick (`data_valid` latched AND `cpus` non-empty). The SAME
             // condition that makes `runnable_demand` meaningful — false
@@ -3648,6 +3737,7 @@ pub(crate) fn monitor_loop(
             // (a)+(b)+(d): stamp liveness and bump the heartbeat.
             ledger.record_liveness(
                 cpu_ns_now,
+                max_vcpu_cpu_in_phase_ns,
                 cpu_currency,
                 runnable_demand,
                 evidence_channels_live,
@@ -5209,7 +5299,8 @@ mod tests {
         // SchedulerAttached arm would) with GuestAttachConfirm (5).
         const PREARMED_NS: u64 = 123_456_789;
         let reset_ns = AtomicU64::new(PREARMED_NS);
-        let guest_confirm_tag = crate::vmm::freeze_coord::WatchdogResetTag::GuestAttachConfirm as u8;
+        let guest_confirm_tag =
+            crate::vmm::freeze_coord::WatchdogResetTag::GuestAttachConfirm as u8;
         let reset_tag = std::sync::atomic::AtomicU8::new(guest_confirm_tag);
         let wr = WatchdogReset {
             scx_root_pa,
@@ -5358,7 +5449,10 @@ mod tests {
                 }
             }
         }
-        assert!(st.forge_done, "forging must latch off at the fallback bound");
+        assert!(
+            st.forge_done,
+            "forging must latch off at the fallback bound"
+        );
         // Forged for now_j in 100..=117 (18 iterations), stopped at 118.
         assert_eq!(forges, 18);
         assert_eq!(stopped_at, Some(118));
@@ -5460,8 +5554,11 @@ mod tests {
 
         assert!(!samples.is_empty());
         // Override timeout landed.
-        let ts_written =
-            u64::from_ne_bytes(combined[timeout_pa as usize..timeout_pa as usize + 8].try_into().unwrap());
+        let ts_written = u64::from_ne_bytes(
+            combined[timeout_pa as usize..timeout_pa as usize + 8]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(ts_written, 500);
         // Timestamp was forged to the (static) jiffies_64 value. jiffies_64
         // never advances in this fake, so cur_ts == last_forged after the
@@ -7359,9 +7456,84 @@ mod tests {
         assert_eq!(cur1, super::super::CPU_CURRENCY_PTHREAD);
         // Tick 2: now ALL task clocks present — but the latch holds pthread,
         // it must NOT flip to PMU magnitude.
-        let (ns2, cur2) = select_cpu_currency(&mut latch, &[Some(5), Some(5)], &[Some(50), Some(60)]);
+        let (ns2, cur2) =
+            select_cpu_currency(&mut latch, &[Some(5), Some(5)], &[Some(50), Some(60)]);
         assert_eq!(cur2, super::super::CPU_CURRENCY_PTHREAD);
         assert_eq!(ns2, 110, "pthread source keeps summing pthread clocks");
+    }
+
+    // ---- MaxVcpuInPhaseTracker: width-independent Tier-1 evidence ----
+
+    #[test]
+    fn active_per_vcpu_picks_source_and_zeros_absent() {
+        let tc = [Some(10), None, Some(30)];
+        let pt = [Some(100), Some(200), None];
+        assert_eq!(
+            active_per_vcpu_cpu_ns(CurrencySource::Pmu, &tc, &pt),
+            vec![10, 0, 30]
+        );
+        assert_eq!(
+            active_per_vcpu_cpu_ns(CurrencySource::Pthread, &tc, &pt),
+            vec![100, 200, 0]
+        );
+    }
+
+    #[test]
+    fn max_vcpu_first_tick_re_anchors_to_zero() {
+        // Boot readings already carry accumulated CPU; the first observe
+        // anchors to them and reports 0 — never charges pre-phase burn.
+        let mut t = MaxVcpuInPhaseTracker::new();
+        assert_eq!(t.observe(&[500_000_000, 600_000_000, 550_000_000], 0), 0);
+    }
+
+    #[test]
+    fn max_vcpu_reports_max_delta_within_a_phase() {
+        let mut t = MaxVcpuInPhaseTracker::new();
+        assert_eq!(t.observe(&[100, 100, 100], 1), 0); // anchor
+        // vCPU 1 burned 250, the others 10/30 → max delta 250.
+        assert_eq!(t.observe(&[110, 350, 130], 1), 250);
+    }
+
+    #[test]
+    fn max_vcpu_re_anchors_on_phase_epoch_change() {
+        // A phase advance re-anchors BEFORE computing, so the tick that
+        // detects the epoch change reads 0 even though the readings jumped
+        // — the new phase never inherits the prior phase's accumulated CPU.
+        let mut t = MaxVcpuInPhaseTracker::new();
+        assert_eq!(t.observe(&[0, 0], 1), 0); // anchor at phase 1
+        assert_eq!(t.observe(&[9_000_000_000, 1_000_000], 1), 9_000_000_000);
+        // phase_epoch 1→2: re-anchor to the huge readings, report 0.
+        assert_eq!(t.observe(&[9_000_000_000, 1_000_000], 2), 0);
+        // Subsequent burn in phase 2 charges only from the re-anchor.
+        assert_eq!(t.observe(&[9_000_005_000, 1_000_000], 2), 5_000);
+    }
+
+    #[test]
+    fn max_vcpu_wide_idle_guest_stays_tiny_while_sum_is_huge() {
+        // THE REGRESSION ROW: 256 vCPUs each accruing a diffuse background
+        // burn (here ~40 ms over the phase) — the SUM is ~10.4 s (which the
+        // old summed Tier-1 evidence would charge against a per-vCPU-linear
+        // budget and false-fire), but the MAX per vCPU is only ~40 ms, so
+        // Tier-1 sees a tiny number and never fires on width alone.
+        let mut t = MaxVcpuInPhaseTracker::new();
+        let anchor = vec![500_000_000u64; 256];
+        assert_eq!(t.observe(&anchor, 5), 0);
+        // Each vCPU advanced by a jittered 30-40 ms; none is a hot spinner.
+        let readings: Vec<u64> = (0..256)
+            .map(|i| 500_000_000 + 30_000_000 + (i as u64 % 11) * 1_000_000)
+            .collect();
+        let max = t.observe(&readings, 5);
+        assert_eq!(max, 40_000_000, "max per vCPU is ~40 ms, not the ~10 s sum");
+    }
+
+    #[test]
+    fn max_vcpu_vcpu_count_change_re_anchors() {
+        // A vCPU-count change (slice length differs) re-anchors rather than
+        // zipping mismatched indices — returns 0 that tick.
+        let mut t = MaxVcpuInPhaseTracker::new();
+        assert_eq!(t.observe(&[100, 200], 1), 0);
+        assert_eq!(t.observe(&[100, 200, 300], 1), 0, "len change re-anchors");
+        assert_eq!(t.observe(&[110, 250, 330], 1), 50);
     }
 
     // ---- ProgressLedger: monitor-loop integration ----
@@ -7461,7 +7633,7 @@ mod tests {
         // exactly the shape that must NOT be read as a Tier-2 idle wedge.
         let offsets = test_offsets();
         // 64 zero bytes: `__per_cpu_offset[]` reads all-zero → never latches.
-        let mem_buf = vec![0u8; 64];
+        let mem_buf = [0u8; 64];
         // SAFETY: mem_buf outlives the GuestMem use (borrowed for this call).
         let mem = unsafe { GuestMem::new(mem_buf.as_ptr() as *mut u8, mem_buf.len() as u64) };
         let refresh = RqRefresh {
@@ -7527,7 +7699,10 @@ mod tests {
         // cpus (data_valid never latched).
         assert!(!samples.is_empty());
         for s in &samples {
-            assert!(s.cpus.is_empty(), "data_valid must never latch on zero offsets");
+            assert!(
+                s.cpus.is_empty(),
+                "data_valid must never latch on zero offsets"
+            );
         }
         // Fix 2: channels stayed blind (guest per-CPU data never resolved).
         assert!(

@@ -812,7 +812,7 @@ pub struct VerifierVmResult {
     pub crash_message: Option<String>,
     /// Host-side vCPU scheduling dilation for this cell's VM run —
     /// `D = 1 + Σrun_delay/Σon_cpu` over the vCPU host threads (see
-    /// [`crate::vmm::result::HostVcpuSchedstat`]). `None` on hosts
+    /// `vmm::result::HostVcpuSchedstat`). `None` on hosts
     /// without `CONFIG_SCHEDSTATS` or when no vCPU thread was sampled.
     /// Purely observational: surfaced in the per-cell output and the
     /// summary grid but NEVER folded into [`Self::cell_verdict`] or the
@@ -848,12 +848,10 @@ impl VerifierVmResult {
                     "VM timed out (hung after attach, before exit)".to_string()
                 }
                 _ => match self.attach.failure_reason() {
-                    Some(reason) => format!(
-                        "VM timed out (hung with no confirmed scheduler attach — {reason})"
-                    ),
-                    None => {
-                        "VM timed out (hung with no confirmed scheduler attach)".to_string()
+                    Some(reason) => {
+                        format!("VM timed out (hung with no confirmed scheduler attach — {reason})")
                     }
+                    None => "VM timed out (hung with no confirmed scheduler attach)".to_string(),
                 },
             });
         }
@@ -1833,11 +1831,7 @@ mod tests {
         assert_eq!(recs[0].stats, stats, "stats roundtrip via serde");
         // Host dilation survives the JSON roundtrip and reflects the final
         // (retry) write.
-        assert_eq!(
-            recs[0].dilation,
-            Some(1.05),
-            "dilation roundtrip via serde"
-        );
+        assert_eq!(recs[0].dilation, Some(1.05), "dilation roundtrip via serde");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -744,16 +744,27 @@ pub(crate) struct ProgressLedger {
     /// `progress_epoch`. Release store / Acquire load. Not written by the
     /// monitor. The watchdog reader lands in a LATER commit.
     pub(crate) phase_epoch: AtomicU32,
-    /// `cpu_ns_now` captured at the last stage advance, so the watchdog
-    /// can charge CPU time against the stage in which it was spent.
-    /// Written by [`ProgressLedger::advance_phase`]; not written by the
-    /// monitor. The watchdog reader lands in a LATER commit.
-    pub(crate) cpu_ns_at_phase: AtomicU64,
+    /// The Tier-1 spinning-wedge evidence: the MAXIMUM over vCPUs of the
+    /// per-vCPU CPU-time (ns) burned since the current phase was entered,
+    /// as of the latest monitor tick. Written by the MONITOR (which reads
+    /// per-vCPU CPU times each tick and keeps its own per-vCPU anchor
+    /// vector, re-anchored on every `phase_epoch` change it observes), NOT
+    /// by the dispatch thread — so the anchor and the reading are always
+    /// coherent (same thread, same tick), curing the cross-thread ~0-anchor
+    /// incoherence the old dispatch-snapshotted `cpu_ns_at_phase` suffered.
+    /// WIDTH-INDEPENDENT by construction: a spinning wedge is one (or a
+    /// few) hot thread(s), so the max crosses a flat per-phase budget; a
+    /// wide idle guest's diffuse per-vCPU background burn (ticks/IPIs) keeps
+    /// the max tiny no matter how many vCPUs sum into `cpu_ns_now`. Relaxed
+    /// — one-tick staleness only under-counts, deferring a kill.
+    pub(crate) max_vcpu_cpu_in_phase_ns: AtomicU64,
 
     /// Summed available per-vCPU CPU-time (ns) as of the latest monitor
     /// tick. Relaxed — a one-tick-stale total only under-counts consumed
     /// CPU, deferring a kill. Absent vCPU times are skipped (see
-    /// `cpu_currency`).
+    /// `cpu_currency`). Sum-based, so it feeds the width-insensitive
+    /// trickle/deadman logic (Tier-2/Tier-3), NOT Tier-1 — see
+    /// `max_vcpu_cpu_in_phase_ns`.
     pub(crate) cpu_ns_now: AtomicU64,
     /// Bumped UNCONDITIONALLY every monitor tick — pure liveness. A
     /// stalled `monitor_heartbeat` means the monitor thread itself is
@@ -831,13 +842,17 @@ impl ProgressLedger {
     pub(crate) fn record_liveness(
         &self,
         cpu_ns_now: u64,
+        max_vcpu_cpu_in_phase_ns: u64,
         cpu_currency: u8,
         runnable_demand: bool,
         evidence_channels_live: bool,
     ) {
         self.cpu_ns_now.store(cpu_ns_now, Ordering::Relaxed);
+        self.max_vcpu_cpu_in_phase_ns
+            .store(max_vcpu_cpu_in_phase_ns, Ordering::Relaxed);
         self.cpu_currency.store(cpu_currency, Ordering::Relaxed);
-        self.runnable_demand.store(runnable_demand, Ordering::Relaxed);
+        self.runnable_demand
+            .store(runnable_demand, Ordering::Relaxed);
         self.evidence_channels_live
             .store(evidence_channels_live, Ordering::Relaxed);
         // Unconditional — this is the monitor's own liveness pulse.
@@ -892,12 +907,17 @@ impl ProgressLedger {
                 Err(observed) => cur = observed,
             }
         }
-        // Snapshot the CPU anchor for the stage just entered, then
-        // publish the phase epoch (Release) so an Acquire reader that
-        // sees the bump also sees the anchor (payload-before-epoch). The
-        // advance is progress, so also fold it into `progress_epoch`.
+        // Publish the phase epoch (Release) so an Acquire reader that sees
+        // the bump also sees the milestone payload (payload-before-epoch).
+        // The Tier-1 CPU anchor is NO LONGER snapshotted here: the monitor
+        // Acquire-loads this epoch to re-anchor its own per-vCPU
+        // max-in-phase tracker on the stage just entered, keeping the
+        // anchor coherent with the per-vCPU reads it charges (the old
+        // cross-thread `cpu_ns_now` snapshot could read ~0 before the
+        // monitor's first publish, producing a phantom multi-second
+        // in-phase burn). The advance is progress, so also fold it into
+        // `progress_epoch`.
         let cpu_ns_now = self.cpu_ns_now.load(Ordering::Relaxed);
-        self.cpu_ns_at_phase.store(cpu_ns_now, Ordering::Relaxed);
         self.phase_epoch.fetch_add(1, Ordering::Release);
         self.record_progress(cpu_ns_now, wall_ns);
         true
@@ -918,7 +938,7 @@ impl ProgressLedger {
         LedgerSnapshot {
             phase: self.phase.load(Ordering::Relaxed),
             cpu_ns_now: self.cpu_ns_now.load(Ordering::Relaxed),
-            cpu_ns_at_phase: self.cpu_ns_at_phase.load(Ordering::Relaxed),
+            max_vcpu_cpu_in_phase_ns: self.max_vcpu_cpu_in_phase_ns.load(Ordering::Relaxed),
             wall_ns_at_progress,
             progress_epoch,
             monitor_heartbeat: self.monitor_heartbeat.load(Ordering::Relaxed),
@@ -939,11 +959,15 @@ impl ProgressLedger {
 pub(crate) struct LedgerSnapshot {
     /// Live lifecycle stage id ([`LifecycleStage`] as `u8`).
     pub(crate) phase: u8,
-    /// Summed per-vCPU CPU-time (ns) as of the latest monitor tick.
+    /// Summed per-vCPU CPU-time (ns) as of the latest monitor tick. Feeds
+    /// the width-insensitive Tier-2/Tier-3 trickle/deadman logic.
     pub(crate) cpu_ns_now: u64,
-    /// `cpu_ns_now` captured at the last stage advance (= the last
-    /// milestone; the watchdog's `cpu_in_phase` anchor).
-    pub(crate) cpu_ns_at_phase: u64,
+    /// The Tier-1 evidence: MAX over vCPUs of per-vCPU CPU burned since the
+    /// current phase was entered, published by the monitor (see
+    /// [`ProgressLedger::max_vcpu_cpu_in_phase_ns`]). Width-independent, so
+    /// a spinning wedge crosses a flat per-phase budget while a wide idle
+    /// guest never does.
+    pub(crate) max_vcpu_cpu_in_phase_ns: u64,
     /// `run_start`-relative wall time (ns) at the last milestone
     /// (`progress_epoch` bump); the watchdog's `wall_in_phase` /
     /// `wall_since_milestone` anchor.
@@ -982,40 +1006,45 @@ mod progress_ledger_tests {
         let l = ProgressLedger::default();
         assert!(!l.snapshot().evidence_channels_live, "default is false");
 
-        l.record_liveness(123, CPU_CURRENCY_PTHREAD, true, true);
+        l.record_liveness(123, 45, CPU_CURRENCY_PTHREAD, true, true);
         let s = l.snapshot();
         assert!(s.evidence_channels_live);
         assert_eq!(s.cpu_ns_now, 123);
+        assert_eq!(s.max_vcpu_cpu_in_phase_ns, 45);
         assert_eq!(s.cpu_currency, CPU_CURRENCY_PTHREAD);
         assert!(s.runnable_demand);
 
-        l.record_liveness(200, CPU_CURRENCY_PTHREAD, false, false);
+        l.record_liveness(200, 0, CPU_CURRENCY_PTHREAD, false, false);
         let s2 = l.snapshot();
         assert!(!s2.evidence_channels_live);
         assert_eq!(s2.cpu_ns_now, 200);
+        assert_eq!(s2.max_vcpu_cpu_in_phase_ns, 0);
     }
 
     #[test]
-    fn advance_phase_walks_forward_bumping_epochs_and_anchors() {
+    fn advance_phase_walks_forward_bumping_epochs_and_wall_anchor() {
         let l = ProgressLedger::default();
         assert_eq!(l.phase.load(Ordering::Relaxed), LifecycleStage::Boot as u8);
 
-        // Boot→Attach: both epochs bump, anchor snapshots cpu_ns_now.
-        l.cpu_ns_now.store(100, Ordering::Relaxed);
+        // Boot→Attach: both epochs bump and the wall milestone anchor
+        // stamps. The Tier-1 CPU anchor is NOT touched here — it lives
+        // monitor-side (`max_vcpu_cpu_in_phase_ns`), re-anchored when the
+        // monitor observes this `phase_epoch` bump.
         assert!(l.advance_phase(LifecycleStage::Attach as u8, 11));
-        assert_eq!(l.phase.load(Ordering::Relaxed), LifecycleStage::Attach as u8);
+        assert_eq!(
+            l.phase.load(Ordering::Relaxed),
+            LifecycleStage::Attach as u8
+        );
         assert_eq!(l.phase_epoch.load(Ordering::Acquire), 1);
         assert_eq!(l.progress_epoch.load(Ordering::Acquire), 1);
-        assert_eq!(l.cpu_ns_at_phase.load(Ordering::Relaxed), 100);
         assert_eq!(l.wall_ns_at_progress.load(Ordering::Relaxed), 11);
 
-        // Attach→Body (a skip is still forward): anchors re-snapshot.
-        l.cpu_ns_now.store(250, Ordering::Relaxed);
+        // Attach→Body (a skip is still forward): epochs + wall anchor move.
         assert!(l.advance_phase(LifecycleStage::Body as u8, 22));
         assert_eq!(l.phase.load(Ordering::Relaxed), LifecycleStage::Body as u8);
         assert_eq!(l.phase_epoch.load(Ordering::Acquire), 2);
         assert_eq!(l.progress_epoch.load(Ordering::Acquire), 2);
-        assert_eq!(l.cpu_ns_at_phase.load(Ordering::Relaxed), 250);
+        assert_eq!(l.wall_ns_at_progress.load(Ordering::Relaxed), 22);
     }
 
     #[test]
@@ -1024,17 +1053,20 @@ mod progress_ledger_tests {
         assert!(l.advance_phase(LifecycleStage::Teardown as u8, 5));
         let pe = l.phase_epoch.load(Ordering::Acquire);
         let pr = l.progress_epoch.load(Ordering::Acquire);
-        let anchor = l.cpu_ns_at_phase.load(Ordering::Relaxed);
+        let wall = l.wall_ns_at_progress.load(Ordering::Relaxed);
 
         // Lower stage: no-op, returns false, touches nothing.
         assert!(!l.advance_phase(LifecycleStage::Body as u8, 6));
         // Equal stage (duplicate): no-op too.
         assert!(!l.advance_phase(LifecycleStage::Teardown as u8, 7));
 
-        assert_eq!(l.phase.load(Ordering::Relaxed), LifecycleStage::Teardown as u8);
+        assert_eq!(
+            l.phase.load(Ordering::Relaxed),
+            LifecycleStage::Teardown as u8
+        );
         assert_eq!(l.phase_epoch.load(Ordering::Acquire), pe);
         assert_eq!(l.progress_epoch.load(Ordering::Acquire), pr);
-        assert_eq!(l.cpu_ns_at_phase.load(Ordering::Relaxed), anchor);
+        assert_eq!(l.wall_ns_at_progress.load(Ordering::Relaxed), wall);
     }
 
     #[test]

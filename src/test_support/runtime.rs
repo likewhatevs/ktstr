@@ -699,59 +699,59 @@ pub(crate) fn vm_boot_headroom(vcpus: u32) -> Duration {
 /// Per-phase CPU-time budget (nanoseconds) charged against a single
 /// lifecycle phase before the progress watchdog's Tier-1 rule
 /// (`vmm::freeze_coord::watchdog_step`) treats "CPU burned without
-/// progress" as a wedge. `phase` is the [`monitor::LifecycleStage`]
+/// progress" as a wedge. `phase` is the [`crate::monitor::LifecycleStage`]
 /// discriminant (Boot=0, Attach=1, Dispatch=2, Body=3, Teardown=4);
 /// this fn is deliberately phrased over the raw `u8` so it carries no
 /// dependency on that enum and stays testable in isolation.
 ///
-/// Each budget is `base_ms + per_vcpu_ms * vcpus`, mirroring the
-/// additive base-plus-linear shape of [`sys_rdy_budget_ms`] and
-/// [`vm_boot_headroom`] — a fixed first-CPU / device-enumeration cost
-/// plus a per-vCPU term for the work that fans out across the topology:
-///   - Boot (8_000 + 400·v ms): the widest term. A cold guest boot's
-///     per-vCPU CPU cost (AP bring-up, per-CPU virtio-console handshake,
-///     kernel init) dominates, so the per-vCPU slope is the steepest of
-///     any phase — a 256-vCPU boot legitimately burns tens of seconds of
-///     guest CPU before the first progress epoch.
-///   - Attach (30_000 + 50·v ms): the flattest slope but the largest
-///     base — BPF load + verifier time is a mostly-serial, vCPU-count-
-///     insensitive cost (the verifier walks the program, not the CPUs),
-///     yet a cold vmlinux/BTF parse under host-compile contention makes
-///     the fixed floor the tallest of any phase.
-///   - Dispatch (5_000 + 100·v ms): the probe forks one worker per vCPU
-///     and waits for a first dispatch, so cost grows with topology; the
-///     base covers scheduler warm-up.
-///   - Body (`u64::MAX`): the workload phase has no CPU-time budget —
-///     a body test is *supposed* to burn CPU, so Tier-1 is structurally
+/// WIDTH-INDEPENDENT (no `vcpus` term): Tier-1's evidence is now the MAX
+/// per-vCPU CPU burned in-phase (the monitor's
+/// `max_vcpu_cpu_in_phase_ns`), not the SUM across vCPUs. A spinning wedge
+/// is one (or a few) hot thread(s), so the sound budget is what a SINGLE
+/// vCPU may legitimately burn in the phase — a per-vCPU-linear budget
+/// against a summed evidence was the wide-SMP false-kill bug (256 idle
+/// vCPUs summed ~141 s of diffuse background burn and crossed a 64 s
+/// budget with zero wedge). Each flat budget carries 2-3x margin over the
+/// heaviest single-vCPU burn observed for that phase:
+///   - Boot (15 s): a cold guest's per-vCPU boot cost (AP bring-up, this
+///     vCPU's virtio-console handshake, kernel init) is a few CPU-seconds
+///     on the busiest CPU; 15 s is ~3x margin.
+///   - Attach (35 s): single-threaded BPF load + verifier time dominates
+///     and lands on one vCPU; host-side cold-BTF/vmlinux waits accrue NO
+///     guest CPU (the guest is blocked, not spinning), so even a cold
+///     parse under host-compile contention leaves the max per-vCPU burn
+///     well under this.
+///   - Dispatch (8 s): the probe's first-dispatch warm-up on the busiest
+///     worker vCPU; 8 s is generous for a single vCPU reaching first
+///     dispatch.
+///   - Body (`u64::MAX`): the workload phase has no CPU-time budget — a
+///     body test is *supposed* to burn CPU, so Tier-1 is structurally
 ///     disabled here via this sentinel (the watchdog never charges a CPU
 ///     budget it can exceed). Body wedges are caught by the existing
 ///     deadline logic, not Tier-1.
-///   - Teardown (5_000 + 50·v ms): unwind / dump / VM-exit; a small base
-///     plus a modest per-vCPU term for per-CPU teardown work.
+///   - Teardown (8 s): unwind / dump / VM-exit on the busiest vCPU.
 ///
 /// Unknown phases (>4) return `u64::MAX` — an id this fn does not model
-/// must never be killed on a CPU budget it cannot justify. Saturating
-/// throughout so a pathological `vcpus` can only *lengthen* a budget,
-/// never wrap it short.
-pub(crate) const fn phase_cpu_budget_ns(phase: u8, vcpus: u32) -> u64 {
-    const MS_TO_NS: u64 = 1_000_000;
-    let v = vcpus as u64;
-    let ms = match phase {
+/// must never be killed on a CPU budget it cannot justify. The pthread
+/// currency's 3/2 widening (`widen_budget_for_currency`) still applies on
+/// top of these in the watchdog.
+pub(crate) const fn phase_cpu_budget_ns(phase: u8) -> u64 {
+    const S_TO_NS: u64 = 1_000_000_000;
+    let s = match phase {
         // Boot
-        0 => 8_000u64.saturating_add(400u64.saturating_mul(v)),
+        0 => 15u64,
         // Attach
-        1 => 30_000u64.saturating_add(50u64.saturating_mul(v)),
+        1 => 35u64,
         // Dispatch
-        2 => 5_000u64.saturating_add(100u64.saturating_mul(v)),
-        // Body — Tier-1 off (see doc); return the sentinel directly so
-        // no ms→ns multiply can clip it.
+        2 => 8u64,
+        // Body — Tier-1 off (see doc).
         3 => return u64::MAX,
         // Teardown
-        4 => 5_000u64.saturating_add(50u64.saturating_mul(v)),
+        4 => 8u64,
         // Unknown phase → never kill.
         _ => return u64::MAX,
     };
-    ms.saturating_mul(MS_TO_NS)
+    s.saturating_mul(S_TO_NS)
 }
 
 /// Per-phase WALL-time backstop (nanoseconds) for the progress
@@ -834,7 +834,7 @@ pub(crate) const OVERCOMMIT_SKIP_RATIO: f64 = 6.0;
 ///
 /// This is NOT a timeout bump. The progress watchdog's Tier-1
 /// (CPU-burned-without-progress) and Tier-2 (silent idle-wedge) rules in
-/// [`crate::vmm::freeze_coord::watchdog_step`] are the primary hang
+/// `vmm::freeze_coord::watchdog_step` are the primary hang
 /// detectors: a wedge dies on those tiers inside a bounded per-phase
 /// budget no matter how loose this deadline is, and a healthy-but-slow
 /// cell is progress-protected by the same tiers. So no healthy or wedged
@@ -948,7 +948,7 @@ pub(crate) fn overcommit_skip_reason(
 /// generous wall-clock backstop, NOT the primary hang detector. The
 /// primary detectors are the progress watchdog's Tier-1
 /// (CPU-burned-without-progress) and Tier-2 (silent idle-wedge) rules in
-/// [`crate::vmm::freeze_coord::watchdog_step`]: a wedge dies on those
+/// `vmm::freeze_coord::watchdog_step`: a wedge dies on those
 /// tiers inside a bounded per-phase budget, and a healthy-but-slow cell
 /// is progress-protected by them. So no healthy or wedged cell reaches
 /// this deadline; it fires only when the progress machinery itself is
@@ -1022,7 +1022,7 @@ pub(crate) const VERIFIER_WORKLOAD_BUDGET: Duration = Duration::from_secs(60);
 /// [`VERIFIER_BASE_TIMEOUT`] plus the same vCPU-scaled dead-man boot
 /// headroom the `#[ktstr_test]` path gets from [`vm_timeout_from_entry`]
 /// — its Tier-3 backstop, not the primary hang detector (Tier-1/2 in
-/// [`crate::vmm::freeze_coord::watchdog_step`] own that). The sweep
+/// `vmm::freeze_coord::watchdog_step` own that). The sweep
 /// previously hard-coded 120s with no headroom at all, so a
 /// wide-topology cell (128 vCPUs) that boots fine but slowly under CI
 /// concurrency was killed mid-attach — reported by the scx verifier
@@ -2911,47 +2911,25 @@ mod tests {
     // -- phase_cpu_budget_ns / phase_wall_backstop_ns --
 
     #[test]
-    fn phase_cpu_budget_ns_additive_base_plus_per_vcpu() {
-        const MS: u64 = 1_000_000;
-        // Boot: 8_000 + 400·v ms.
-        assert_eq!(phase_cpu_budget_ns(0, 0), 8_000 * MS);
-        assert_eq!(phase_cpu_budget_ns(0, 1), 8_400 * MS);
-        assert_eq!(phase_cpu_budget_ns(0, 256), (8_000 + 400 * 256) * MS);
-        // Attach: 30_000 + 50·v ms — tall base, flat slope.
-        assert_eq!(phase_cpu_budget_ns(1, 0), 30_000 * MS);
-        assert_eq!(phase_cpu_budget_ns(1, 128), (30_000 + 50 * 128) * MS);
-        // Dispatch: 5_000 + 100·v ms.
-        assert_eq!(phase_cpu_budget_ns(2, 0), 5_000 * MS);
-        assert_eq!(phase_cpu_budget_ns(2, 64), (5_000 + 100 * 64) * MS);
-        // Teardown: 5_000 + 50·v ms.
-        assert_eq!(phase_cpu_budget_ns(4, 0), 5_000 * MS);
-        assert_eq!(phase_cpu_budget_ns(4, 64), (5_000 + 50 * 64) * MS);
+    fn phase_cpu_budget_ns_flat_width_independent() {
+        const S: u64 = 1_000_000_000;
+        // Flat per-phase budgets — NO vcpu term (Tier-1's evidence is the
+        // max per-vCPU burn, so a single vCPU's legitimate in-phase cost
+        // sets the budget, independent of guest width).
+        assert_eq!(phase_cpu_budget_ns(0), 15 * S); // Boot
+        assert_eq!(phase_cpu_budget_ns(1), 35 * S); // Attach
+        assert_eq!(phase_cpu_budget_ns(2), 8 * S); // Dispatch
+        assert_eq!(phase_cpu_budget_ns(4), 8 * S); // Teardown
     }
 
     #[test]
     fn phase_cpu_budget_ns_body_and_unknown_are_sentinel() {
         // Body (3): Tier-1 structurally off — the sentinel makes any
         // `cpu > budget` comparison unsatisfiable.
-        assert_eq!(phase_cpu_budget_ns(3, 0), u64::MAX);
-        assert_eq!(phase_cpu_budget_ns(3, 512), u64::MAX);
+        assert_eq!(phase_cpu_budget_ns(3), u64::MAX);
         // Unknown phase ids never carry a killable budget.
-        assert_eq!(phase_cpu_budget_ns(5, 0), u64::MAX);
-        assert_eq!(phase_cpu_budget_ns(u8::MAX, 512), u64::MAX);
-    }
-
-    #[test]
-    fn phase_cpu_budget_ns_monotonic_and_bounded_at_max_vcpus() {
-        // A pathological vCPU count can only LENGTHEN the budget, never
-        // wrap it short. No u32 vCPU count is large enough to overflow
-        // the ms→ns product (Boot at u32::MAX vCPUs is 8_000 + 400·v ms
-        // = ~1.72e12 ms → ~1.72e18 ns, an order of magnitude under the
-        // u64::MAX sentinel), so the saturating ops are pure defense and
-        // the widest input still returns a real, finite budget above the
-        // 1-vCPU one.
-        let wide = phase_cpu_budget_ns(0, u32::MAX);
-        assert!(wide > phase_cpu_budget_ns(0, 1));
-        assert!(wide < u64::MAX, "widest budget stays below the sentinel");
-        assert_eq!(wide, 1_717_986_926_000_000_000);
+        assert_eq!(phase_cpu_budget_ns(5), u64::MAX);
+        assert_eq!(phase_cpu_budget_ns(u8::MAX), u64::MAX);
     }
 
     #[test]

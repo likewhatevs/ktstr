@@ -511,7 +511,7 @@ impl WorkloadConfig {
     /// Set the first-iteration eventfd-signal knob. `true` makes each
     /// fork worker signal a shared eventfd once it counts its first
     /// outer-loop iteration so a waiter can block on the edge via
-    /// [`WorkloadHandle::wait_first_iteration_all`](crate::workload::WorkloadHandle::wait_first_iteration_all)
+    /// `WorkloadHandle::wait_first_iteration_all`
     /// instead of polling; `false` (the default) creates no eventfd. See
     /// [`WorkloadConfig::signal_first_iteration`].
     #[must_use = "builder methods consume self; bind the result"]

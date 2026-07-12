@@ -381,7 +381,7 @@ fn arm_wprof_grace(
 #[cfg(test)]
 mod watchdog_reset_tag_tests {
     use super::{KillReasonTag, WatchdogResetTag};
-    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     /// The dump-facing tokens and the decode round-trip are stable — the
@@ -401,10 +401,7 @@ mod watchdog_reset_tag_tests {
             // Round-trip through the atomic slot the watchdog stores into.
             let slot = AtomicU8::new(KillReasonTag::Unset as u8);
             slot.store(tag as u8, Ordering::Relaxed);
-            assert_eq!(
-                KillReasonTag::from_u8(slot.load(Ordering::Relaxed)),
-                tag
-            );
+            assert_eq!(KillReasonTag::from_u8(slot.load(Ordering::Relaxed)), tag);
         }
         // Any unknown byte decodes to Unset (a never-written slot).
         assert_eq!(KillReasonTag::from_u8(200), KillReasonTag::Unset);
@@ -1313,7 +1310,7 @@ struct RunVmHandles {
 /// per-thread kernel evidence in `evidence` rather than asserted.
 ///
 /// `pub(crate)` (and a named type, not an anyhow message) so
-/// [`crate::test_support::boot_retry::run_vm_with_ap_gap_retry`] can
+/// `test_support::boot_retry::run_vm_with_ap_gap_retry` can
 /// `downcast_ref` it out of the (context-wrapped) error chain and retry the
 /// cold boot, the same recovery the guest-side AP-bring-up-gap marker gets.
 #[derive(Debug, thiserror::Error)]
@@ -1438,7 +1435,7 @@ impl Drop for RunVmThreadGuard {
 ///   (a) AP host threads `clone(2)` from this thread and inherit its affinity
 ///       at spawn, so a leaked narrow mask would confine the next VM's APs to
 ///       the previous VM's BSP CPU(s); and
-///   (b) [`host_topology::host_allowed_cpus`] seeds the CPU budget from THIS
+///   (b) [`crate::vmm::host_topology::host_allowed_cpus`] seeds the CPU budget from THIS
 ///       thread's `sched_getaffinity`, so a leaked mask would make replanning
 ///       compute against the previous VM's cpuset instead of the host's.
 /// Captured BEFORE the narrowing and restored on `Drop`, keeping `run_vm`
@@ -2278,8 +2275,9 @@ impl KtstrVm {
         // watchdog dump can name it (see [`WatchdogResetTag`]). Cloned to
         // each writer alongside the ns atomic; the two are always stored
         // back-to-back.
-        let watchdog_reset_tag: Arc<std::sync::atomic::AtomicU8> =
-            Arc::new(std::sync::atomic::AtomicU8::new(WatchdogResetTag::Unset as u8));
+        let watchdog_reset_tag: Arc<std::sync::atomic::AtomicU8> = Arc::new(
+            std::sync::atomic::AtomicU8::new(WatchdogResetTag::Unset as u8),
+        );
         // Lock-free progress/liveness ledger. The monitor thread writes
         // it every tick (heartbeat, cpu_ns, progress epochs); the VM
         // watchdog and freeze coordinator will read it in LATER commits
@@ -2519,12 +2517,6 @@ impl KtstrVm {
         // the same Arc, so the watchdog sees the monitor's liveness/CPU
         // stores and dispatch's phase advances in one ledger.
         let progress_ledger_for_wd = progress_ledger.clone();
-        // Guest vCPU count for the per-phase CPU budget
-        // (`watchdog_step::widened_cpu_budget_ns` scales the Tier-1 budget
-        // by it). `total_cpus()` is the VM's own topology — the number of
-        // vCPU threads the guest boots — captured by value for the
-        // watchdog's `move` closure.
-        let wd_vcpus: u32 = self.topology.total_cpus();
 
         // Freeze coordinator thread: triggers a failure-dump freeze when
         // the BPF probe's `ktstr_err_exit_detected` .bss latch fires
@@ -11237,8 +11229,7 @@ impl KtstrVm {
                 // (Tier-1/2 progress verdict, the Tier-3 hard deadline, or
                 // an AP-set kill). Watchdog-local — see [`KillReasonTag`].
                 let mut monitor_liveness = watchdog_step::MonitorLiveness::new();
-                let kill_reason =
-                    std::sync::atomic::AtomicU8::new(KillReasonTag::Unset as u8);
+                let kill_reason = std::sync::atomic::AtomicU8::new(KillReasonTag::Unset as u8);
                 // Cached scheduler-attach reset deadline. Decoded
                 // lazily from `watchdog_reset_for_wd` after the
                 // host monitor stores a non-zero value (the
@@ -11409,12 +11400,8 @@ impl KtstrVm {
                         now_wall_ns,
                         cpu_trickle_stalled,
                         monitor_live,
-                        wd_vcpus,
                     );
-                    let tier_fire = !matches!(
-                        progress_decision,
-                        watchdog_step::KillDecision::None
-                    );
+                    let tier_fire = !matches!(progress_decision, watchdog_step::KillDecision::None);
                     let effective_deadline =
                         reset_deadline.map_or(hard_deadline, |r| r.max(hard_deadline));
                     let kill_set = kill_for_watchdog.load(Ordering::Acquire);
@@ -11460,12 +11447,8 @@ impl KtstrVm {
                         // is last (and, unlike the tiers/deadline, is not a
                         // timeout). Mirrors the old hard-over-AP order.
                         let reason_tag = match progress_decision {
-                            watchdog_step::KillDecision::Tier1CpuBudget => {
-                                KillReasonTag::Tier1Cpu
-                            }
-                            watchdog_step::KillDecision::Tier2IdleWedge => {
-                                KillReasonTag::Tier2Idle
-                            }
+                            watchdog_step::KillDecision::Tier1CpuBudget => KillReasonTag::Tier1Cpu,
+                            watchdog_step::KillDecision::Tier2IdleWedge => KillReasonTag::Tier2Idle,
                             watchdog_step::KillDecision::None if hard_timeout_fired => {
                                 KillReasonTag::Tier3Deadman
                             }
@@ -11517,28 +11500,26 @@ impl KtstrVm {
                         )
                         .render();
                         // Evidence for the dump, from this tick's ledger
-                        // snapshot. `cpu_in_phase` (CPU burned since the
-                        // phase/milestone was entered) is what Tier-1
-                        // compares against the currency-widened budget;
-                        // `wall_in_phase` (wall since the last milestone)
-                        // is what Tier-2 / the deadman compare against the
-                        // backstop / grace. The `u64::MAX` sentinel budgets
-                        // (Body / unmodeled phase) render as `off` rather
-                        // than an absurd Duration.
+                        // snapshot. `max_vcpu_cpu_in_phase` (the busiest
+                        // vCPU's CPU burned since the phase was entered) is
+                        // what Tier-1 compares against the currency-widened
+                        // budget — width-independent; the summed `cpu_ns_now`
+                        // is rendered alongside for context (it feeds only
+                        // Tier-2/Tier-3). `wall_in_phase` (wall since the last
+                        // milestone) is what Tier-2 / the deadman compare
+                        // against the backstop / grace. The `u64::MAX`
+                        // sentinel budgets (Body / unmodeled phase) render as
+                        // `off` rather than an absurd Duration.
                         let stage = crate::monitor::LifecycleStage::from_u8(snapshot.phase);
-                        let cpu_in_phase = snapshot
-                            .cpu_ns_now
-                            .saturating_sub(snapshot.cpu_ns_at_phase);
+                        let max_vcpu_cpu_in_phase = snapshot.max_vcpu_cpu_in_phase_ns;
                         let wall_in_phase =
                             now_wall_ns.saturating_sub(snapshot.wall_ns_at_progress);
                         let cpu_budget = watchdog_step::widened_cpu_budget_ns(
                             snapshot.phase,
-                            wd_vcpus,
                             snapshot.cpu_currency,
                         );
-                        let wall_backstop = crate::test_support::runtime::phase_wall_backstop_ns(
-                            snapshot.phase,
-                        );
+                        let wall_backstop =
+                            crate::test_support::runtime::phase_wall_backstop_ns(snapshot.phase);
                         // Sentinel-aware ns→Duration renderer for a budget.
                         let render_budget = |ns: u64| {
                             if ns == u64::MAX {
@@ -11561,7 +11542,11 @@ impl KtstrVm {
                             KillReasonTag::Tier1Cpu | KillReasonTag::Tier2Idle
                         ) && snapshot.phase
                             == crate::monitor::LifecycleStage::Boot as u8;
-                        let header_prefix = if infra_fault { "ktstr infra fault: " } else { "" };
+                        let header_prefix = if infra_fault {
+                            "ktstr infra fault: "
+                        } else {
+                            ""
+                        };
                         eprintln!(
                             "{header_prefix}watchdog: deadline expired at {elapsed:?} from VM start"
                         );
@@ -11583,10 +11568,12 @@ impl KtstrVm {
                             snapshot.evidence_channels_live,
                         );
                         eprintln!(
-                            "  cpu_in_phase={:?} vs budget={} (currency={cpu_currency_str}), \
+                            "  max_vcpu_cpu_in_phase={:?} vs budget={} \
+                             (currency={cpu_currency_str}), cpu_sum={:?}, \
                              cpu_trickle_stalled={cpu_trickle_stalled}",
-                            Duration::from_nanos(cpu_in_phase),
+                            Duration::from_nanos(max_vcpu_cpu_in_phase),
                             render_budget(cpu_budget),
+                            Duration::from_nanos(snapshot.cpu_ns_now),
                         );
                         eprintln!(
                             "  wall_in_phase={:?} vs backstop={}",
@@ -11841,7 +11828,11 @@ impl KtstrVm {
                     let schedstat = read1("schedstat");
                     let wait_ns = schedstat.split_whitespace().nth(1).unwrap_or("?");
                     let wchan = read1("wchan");
-                    let wchan = if wchan.is_empty() { "?" } else { wchan.as_str() };
+                    let wchan = if wchan.is_empty() {
+                        "?"
+                    } else {
+                        wchan.as_str()
+                    };
                     let status = read1("status");
                     let nonvol = status
                         .lines()
