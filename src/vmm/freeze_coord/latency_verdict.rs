@@ -35,13 +35,12 @@
 //! phase). Every rounding in this module is biased toward MORE indeterminate
 //! / never a wrong `FailConfirmed`.
 //!
-//! SEAM PENDING: this whole module is the PURE verdict core; the seam that
-//! calls it (rendering the tri-state annotation into the test verdict) is a
-//! LATER pass per the task. Until then every public item here has no in-tree
-//! caller outside its own unit tests, so the module carries `allow(dead_code)`
-//! — the same "consumed by a later commit" precedent the progress-ledger /
-//! `LifecycleStage::class` code used.
-#![allow(dead_code)]
+//! CONSUMED BY THE EVAL SEAM: this module is the PURE verdict core; the seam
+//! that calls it — `crate::test_support::eval::apply_contention_verdict` —
+//! re-runs the tri-state over the guest's wall-latency gate failures with
+//! the host-side Body-phase witness, demoting the indeterminate ones and
+//! confirming the refutation-proof ones. `perf_isolation_violated` /
+//! `PERF_ISOLATION_D_MAX` back the seam's perf-mode isolation-fault check.
 
 /// Peak host-contention contamination (ns) over any contiguous run of
 /// monitor ticks spanning at least `window_ns` — the `W(L)` bound.

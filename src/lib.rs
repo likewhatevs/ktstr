@@ -925,13 +925,13 @@ pub mod prelude {
     // along: they are the public `VmResult::contention_witness`
     // payload a callback destructures.
     pub use crate::vmm::VmResult;
-    pub use crate::vmm::{
-        BodyContentionWindow, ContentionWitness, HostVcpuSchedstat, PerPhaseSchedstat,
-    };
     pub use crate::vmm::disk_config::{
         DiskConfig, DiskThrottle, DiskThrottleValidationError, Filesystem, ThrottleDimension,
     };
     pub use crate::vmm::net_config::NetConfig;
+    pub use crate::vmm::{
+        BodyContentionWindow, ContentionWitness, HostVcpuSchedstat, PerPhaseSchedstat,
+    };
     // Surfaced for `post_vm` callbacks that drain the snapshot
     // bridge's per-tag kernel-op reply log via
     // `VmResult::snapshot_bridge::drain_kernel_ops`: the returned

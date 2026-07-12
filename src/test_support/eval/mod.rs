@@ -2088,6 +2088,200 @@ fn populate_run_stats_and_folded_timeline(
     })
 }
 
+/// Greppable prefix on the `contention-indeterminate` annotation block
+/// [`apply_contention_verdict`] pushes when it demotes a wall-latency
+/// failure the witnessed host contention could explain. Rides both the
+/// [`crate::assert::InfoNote`] stream (sidecar + failure-block `--- info
+/// ---`) and the stderr echo, so a passing-after-demotion run's captured
+/// output still names the demoted gate.
+pub(crate) const CONTENTION_INDETERMINATE_PREFIX: &str = "contention-indeterminate:";
+
+/// Greppable prefix on the LOUD perf-mode host-isolation-fault verdict
+/// [`apply_contention_verdict`] records for a `performance_mode` cell
+/// whose Body dilation exceeded
+/// [`crate::vmm::freeze_coord::latency_verdict::PERF_ISOLATION_D_MAX`].
+pub(crate) const PERF_ISOLATION_VIOLATED_PREFIX: &str = "perf-mode isolation violated:";
+
+/// Format a ns duration as milliseconds for the contention annotations —
+/// the seam speaks ms because the excess / `W` figures are workload-scale
+/// (tens of ms), where ns is unreadable.
+fn contention_ms(ns: u64) -> String {
+    format!("{:.1}ms", ns as f64 / 1e6)
+}
+
+/// Host-side contention re-evaluation of the guest's wall-latency gate
+/// failures — the seam that consumes the tri-state verdict core
+/// ([`crate::vmm::freeze_coord::latency_verdict`]).
+///
+/// The ns-latency ceilings (`max_p99_wake_latency_ns`) fire IN-GUEST and
+/// stamp their failing [`AssertDetail`](crate::assert::AssertDetail) with
+/// [`LatencyGate`](crate::assert::LatencyGate) evidence; the Body-phase
+/// contention witness lives only HOST-side. This walks
+/// `check_result.outcomes`, and for every failing detail carrying that
+/// evidence, WHEN a witness is present, re-runs `latency_verdict` against
+/// the Body dilation `D` and the peak-window contamination bound
+/// `W(measured)`:
+///
+///   - FailConfirmed → the detail STAYS a failure; its message gains a
+///     `(contention-checked: excess X > W Y — no witnessed host
+///     contention explains it)` note.
+///   - ContentionIndeterminatePass → USER RULING: indeterminate == pass.
+///     The failing outcome is DROPPED (demoted to non-blocking) and a
+///     loud `contention-indeterminate` [`InfoNote`](crate::assert::InfoNote)
+///     carrying measured / threshold / excess / W / D is pushed so it
+///     stays visible even when the demotion flips the whole result to
+///     passing. `info_notes` is the pass-with-notes channel (rendered in
+///     the failure block's `--- info ---` section and persisted to the
+///     sidecar); it is ALSO echoed to stderr here so a passing-after-
+///     demotion run's captured output still shows the annotation.
+///   - SATURATED Body series → `W` is a prefix-only LOWER bound (later
+///     Body ticks were dropped past the cap), so a FailConfirmed on it
+///     cannot be trusted; treated as indeterminate (demoted) with a
+///     saturation note. NEVER FailConfirm on a saturated series.
+///
+/// No witness (`None`) → the failure is left untouched (the render-time
+/// `dilation_annotation` still applies). A latency-gate detail re-derives
+/// `measured > threshold` from the same guest numbers, so `latency_verdict`
+/// never returns `Pass` here; the defensive `Pass` arm leaves the failure
+/// intact rather than silently passing it.
+///
+/// Independently, for a `performance_mode` cell whose Body dilation `D`
+/// exceeds [`PERF_ISOLATION_D_MAX`](crate::vmm::freeze_coord::latency_verdict::PERF_ISOLATION_D_MAX),
+/// a LOUD isolation-fault failure is recorded REGARDLESS of any gate
+/// outcome: the 1:1-pinned vCPUs lost their host CPUs, so every timing
+/// verdict this run produced is untrustworthy — an infra/isolation fault,
+/// not a scheduler-under-test fault. Default-mode cells get no such check
+/// (the tri-state already covers their host contention).
+///
+/// Runs at the eval seam BEFORE the sidecar write and the pass/fail
+/// projection, so both the demotions and the isolation fault are captured
+/// in the persisted verdict.
+pub(crate) fn apply_contention_verdict(
+    check_result: &mut crate::assert::AssertResult,
+    result: &vmm::VmResult,
+    performance_mode: bool,
+) {
+    use crate::assert::{AssertDetail, DetailKind, InfoNote, Outcome};
+    use crate::vmm::freeze_coord::latency_verdict::{
+        LatencyVerdict, PERF_ISOLATION_D_MAX, latency_verdict, peak_window_delay_ns,
+        perf_isolation_violated,
+    };
+
+    let witness = result.contention_witness.as_ref();
+
+    // Tri-state re-evaluation of every latency-gate failure. Rebuild the
+    // outcomes vec so demoted failures can be dropped while confirmed ones
+    // keep (with an appended note) and every non-latency outcome passes
+    // through untouched.
+    let mut kept: Vec<Outcome> = Vec::with_capacity(check_result.outcomes.len());
+    let mut demotions: Vec<String> = Vec::new();
+    for outcome in std::mem::take(&mut check_result.outcomes) {
+        let Outcome::Fail(mut detail) = outcome else {
+            kept.push(outcome);
+            continue;
+        };
+        let Some(gate) = detail.latency_gate else {
+            kept.push(Outcome::Fail(detail));
+            continue;
+        };
+        let Some(w) = witness else {
+            // No host witness — leave the failure exactly as the guest
+            // reported it (dilation_annotation still fires at render).
+            kept.push(Outcome::Fail(detail));
+            continue;
+        };
+        let phase_d = w.body_dilation();
+        let saturated = w.body_window.saturated;
+        let verdict = latency_verdict(gate.measured_ns, gate.threshold_ns, phase_d, |l| {
+            peak_window_delay_ns(&w.body_window.tick_deltas, w.body_window.tick_ns, l)
+        });
+        // `saturated` forces indeterminate: `W` is a lower bound, so an
+        // "excess > W" refutation is not sound. Extract the excess / W the
+        // verdict carried (FailConfirmed and ContentionIndeterminatePass
+        // both carry them); a defensive Pass keeps the failure intact.
+        let (excess_ns, window_bound_ns) = match verdict {
+            LatencyVerdict::FailConfirmed {
+                excess_ns,
+                window_bound_ns,
+                ..
+            }
+            | LatencyVerdict::ContentionIndeterminatePass {
+                excess_ns,
+                window_bound_ns,
+                ..
+            } => (excess_ns, window_bound_ns),
+            LatencyVerdict::Pass => {
+                // Unreachable in practice (the gate fired on measured >
+                // threshold), but never silently pass a recorded failure.
+                kept.push(Outcome::Fail(detail));
+                continue;
+            }
+        };
+        // A saturated Body series makes `W` a lower bound, so its
+        // "excess > W" refutation is unsound — never confirm on it.
+        let confirmed = verdict.is_blocking() && !saturated;
+        if confirmed {
+            detail.message.push_str(&format!(
+                " (contention-checked: excess {} > W {} — no witnessed host contention explains it)",
+                contention_ms(excess_ns),
+                contention_ms(window_bound_ns),
+            ));
+            kept.push(Outcome::Fail(detail));
+        } else {
+            // Demote: drop the failing outcome, keep a loud annotation.
+            let d_str = phase_d.map_or_else(|| "n/a".to_string(), |d| format!("{d:.2}x"));
+            let sat_note = if saturated {
+                " (Body contention series saturated — W is a prefix-only lower bound)"
+            } else {
+                ""
+            };
+            // Neutral `excess vs W` rather than `excess <= W`: for the
+            // plain indeterminate case `excess <= W` holds, but a
+            // saturated series can demote a would-be FailConfirmed where
+            // `excess > W` — the saturation note explains W is only a
+            // lower bound there, so asserting the inequality would be
+            // false. Both figures are shown; the operator compares.
+            demotions.push(format!(
+                "{CONTENTION_INDETERMINATE_PREFIX} {} — measured {} vs threshold {}: excess {} vs contention bound W {} (Body dilation D={d_str}){sat_note}; non-blocking pass, witnessed host contention could account for the excess",
+                detail.message,
+                contention_ms(gate.measured_ns),
+                contention_ms(gate.threshold_ns),
+                contention_ms(excess_ns),
+                contention_ms(window_bound_ns),
+            ));
+        }
+    }
+    check_result.outcomes = kept;
+    for block in demotions {
+        // Loud on stderr so a passing-after-demotion run's captured output
+        // shows it; structured on info_notes for the sidecar + failure
+        // block's `--- info ---` section.
+        eprintln!("{block}");
+        check_result.info_notes.push(InfoNote::new(block));
+    }
+
+    // Perf-mode host-isolation fault: LOUD failure regardless of the gate
+    // outcomes above. Only performance_mode cells (1:1-pinned) have the
+    // isolation expectation this checks.
+    if performance_mode
+        && let Some(w) = witness
+        && perf_isolation_violated(w.body_dilation())
+    {
+        let d_str = w
+            .body_dilation()
+            .map_or_else(|| "n/a".to_string(), |d| format!("{d:.2}x"));
+        check_result.record_fail(AssertDetail::new(
+            DetailKind::PerfIsolation,
+            format!(
+                "{PERF_ISOLATION_VIOLATED_PREFIX} Body dilation D={d_str} exceeds the \
+                 performance-mode isolation ceiling {PERF_ISOLATION_D_MAX:.1}x — the 1:1-pinned \
+                 vCPUs lost their dedicated host CPUs, so this run's timing verdicts are \
+                 untrustworthy (an infra/isolation fault, not a scheduler-under-test fault)"
+            ),
+        ));
+    }
+}
+
 /// Render the failure-verdict message for a non-passing `check_result` and
 /// return it as the `anyhow::Error` the driver returns. Wraps the Error with
 /// [`ScxBpfErrorMatcherMismatch`] when `matcher_mismatch` so dispatch-time
@@ -2714,6 +2908,15 @@ fn evaluate_vm_result(
             stimulus_events,
         );
 
+        // Host-side contention seam: re-run the tri-state verdict over the
+        // guest's wall-latency gate failures with the Body-phase witness in
+        // hand — confirm the refutation-proof ones, demote the ones the
+        // witnessed host contention could explain (indeterminate == pass),
+        // and record a loud perf-mode isolation fault when a 1:1-pinned
+        // cell lost its host CPUs. Runs BEFORE write_sidecar so the persisted
+        // verdict and its info_notes reflect the final tri-state outcome.
+        apply_contention_verdict(&mut check_result, result, entry.performance_mode);
+
         // Write sidecar before checking pass/fail so both outcomes are captured.
         // A sidecar write failure is logged but not propagated: the test
         // verdict itself is still valid — only post-run stats tooling
@@ -2814,6 +3017,8 @@ fn evaluate_vm_result(
 
 #[cfg(test)]
 mod eval_tests;
+#[cfg(test)]
+mod eval_tests_contention;
 #[cfg(test)]
 mod eval_tests_eval;
 #[cfg(test)]

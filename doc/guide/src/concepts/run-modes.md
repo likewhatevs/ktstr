@@ -365,6 +365,24 @@ reserved cores, `D` should read ~1.0, so a departure is an
 default and no-perf mode, where vCPUs share host CPUs, `D` **quantifies
 the overcommit** the mode accepted.
 
+### The contention witness and the wall-latency verdict
+
+The Body (measurement) phase's dilation `D` — plus a per-tick series of
+the host run-delay accrued during that phase — form the **contention
+witness** the wall-latency ceilings consume. From the series ktstr
+derives `W(L)`, the worst host delay any interval of length `L` could
+have absorbed; pairing that with a gate's measured latency turns
+`max_p99_wake_latency_ns` from a plain threshold into the contention-aware
+tri-state (pass always sound / fail only when refutation-proof /
+indeterminate = a non-blocking annotated pass) described under
+[Wall-latency ceilings under host contention](checking.md#wall-latency-ceilings-under-host-contention).
+
+The same page covers the perf-mode counterpart to the isolation-violation
+indicator above: when a `performance_mode` cell's Body `D` exceeds the
+perf-isolation ceiling, that is not a scheduler failure but an infra
+fault, and the run's timing verdicts are marked untrustworthy regardless
+of any gate outcome.
+
 ## Lock interaction across concurrent modes
 
 The flock semantics compose so the modes can share a host safely. Shared

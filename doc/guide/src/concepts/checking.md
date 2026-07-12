@@ -263,6 +263,53 @@ if r.is_skip() || r.is_inconclusive() { /* no verdict — triage */ }
 `is_pass()` is deliberately strict: inconclusive and all-skip both
 read `false`.
 
+## Wall-latency ceilings under host contention
+
+`max_p99_wake_latency_ns` measures a **guest-wall** interval — the time
+a request waited to run, as the guest saw it. There is no steal-adjusted
+guest clock that subtracts it out, so host-side scheduling delay during
+the measurement (a noisy neighbour starving the vCPU threads) inflates
+the reading directly. A plain `measured <= T` gate would blame the
+scheduler under test for the host's noise.
+
+So the wall-latency verdict is **tri-state**. Each run carries a
+contention *witness* over its Body (measurement) phase — the host
+dilation `D` and a peak-window bound `W(L)`, the worst host run-delay
+any interval of length `L` could have absorbed (both from the same
+shared machinery the [run modes](run-modes.md) page documents). The
+gate fires in the guest; the host re-judges it with the witness in
+hand:
+
+| Verdict | Condition | Result |
+|---|---|---|
+| **Pass** | `measured <= T` | always sound — contention only ever *inflates* a wall interval |
+| **Fail (confirmed)** | excess over `T` exceeds `W(measured)` | no witnessed host contention explains it — a real failure at any load; the message gains a `contention-checked` note |
+| **Indeterminate** | excess within `W(measured)` | the failure *might* be host contention — non-blocking (**indeterminate is a pass**), surfaced as a `contention-indeterminate` note carrying measured / threshold / excess / `W` / `D` |
+
+An indeterminate demotion drops the failing outcome; if it was the only
+failure the whole result flips to `Pass`, and the annotation rides the
+[notes channel](#verdict-the-claim-accumulator) so it stays visible in
+the passing run's output and its sidecar. If the Body contention series
+*saturated* (it hit its tick cap and only a prefix survives), `W` is a
+lower bound, so the verdict never confirms on it — it is treated as
+indeterminate with a saturation note.
+
+Only ns-denominated latency exemplars take part. `max_wake_latency_cv`
+(a dimensionless ratio) and `max_spread_pct` (an off-CPU percentage)
+have no ns interval for `W` to bound, so they stay **annotate-only**:
+under measured dilation their failure carries a `--- host dilation ---`
+note (D and which ceilings include host preemption), but the verdict is
+unchanged.
+
+**Performance mode is different.** A `performance_mode` cell pins each
+vCPU 1:1 to a host CPU, so it should read `D ≈ 1`. If its Body dilation
+exceeds the perf-mode isolation ceiling, the cell lost that isolation —
+every timing verdict this run produced is untrustworthy. That is a
+`perf-mode isolation violated` failure, recorded **regardless of gate
+outcomes**: it is an infra/isolation fault, not a scheduler-under-test
+fault. Default-mode cells get no such check — the tri-state already
+accounts for their host contention.
+
 ## Beyond attributes {#verdict-the-claim-accumulator}
 
 - **`Verdict` + `claim!`** — the claim accumulator for custom

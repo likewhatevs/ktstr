@@ -814,6 +814,11 @@ pub(crate) fn record_default_fairness(
         && spread > spread_limit
         && measurable >= 2
     {
+        // NO `with_latency_gate`: off-CPU spread is a dimensionless
+        // PERCENTAGE difference across workers, not a ns interval, so the
+        // seam's ns-denominated `W(measured)` bound cannot score it. Like
+        // CV it stays annotate-only via `dilation_annotation`; only genuine
+        // ns-latency exemplars feed the tri-state (see [`LatencyGate`]).
         r.record_fail(AssertDetail::new(
             DetailKind::Unfair,
             format!(
@@ -1086,13 +1091,24 @@ pub fn assert_benchmarks(
         sorted.sort_unstable();
         let p99 = percentile(&sorted, 0.99);
         if p99 > p99_limit {
-            r.record_fail(AssertDetail::new(
-                DetailKind::Benchmark,
-                format!(
-                    "p99 wake latency {p99}ns exceeds limit {p99_limit}ns ({} samples)",
-                    sorted.len()
-                ),
-            ));
+            // IN-SCOPE for the host contention seam: p99 wake latency is a
+            // ns-denominated GUEST-WALL exemplar (one request's wakeup
+            // wait), so host preemption during the Body phase inflates it
+            // directly. Stamp the (measured, threshold) evidence so the
+            // seam can re-run the tri-state verdict against its Body-phase
+            // witness (`peak_window_delay_ns` bounds a single p99-long
+            // interval's contamination). The gate fires in-guest where no
+            // witness exists; the evidence is what lets the host judge.
+            r.record_fail(
+                AssertDetail::new(
+                    DetailKind::Benchmark,
+                    format!(
+                        "p99 wake latency {p99}ns exceeds limit {p99_limit}ns ({} samples)",
+                        sorted.len()
+                    ),
+                )
+                .with_latency_gate(p99, p99_limit),
+            );
         }
     }
 
@@ -1109,6 +1125,15 @@ pub fn assert_benchmarks(
                 / n;
             let cv = variance.sqrt() / mean;
             if cv > cv_limit {
+                // NO `with_latency_gate`: CV is a dimensionless ratio
+                // (stddev/mean), not a ns interval, so the seam's
+                // ns-denominated `W(measured)` contamination bound cannot
+                // score it — converting it to ns is not sound (a burst of
+                // host run-delay can widen OR tighten a CV depending on
+                // where in the sample set it lands). It stays annotate-only:
+                // `dilation_annotation` already flags CV under measured
+                // dilation. Only genuine ns-latency exemplars get the
+                // tri-state (see the p99 gate above / [`LatencyGate`]).
                 r.record_fail(AssertDetail::new(
                     DetailKind::Benchmark,
                     format!(
