@@ -92,6 +92,14 @@ ratio, max DSQ depth, stuck-task detection), per-sample averages, and
 event-counter deltas. Averages are computed over valid samples only
 (excluding uninitialized guest memory — see below).
 
+Each tick the monitor also samples the HOST side: the vCPU threads'
+own `/proc/self/task/<tid>/schedstat` (on-CPU vs run-delay), which it
+attributes to the guest's current lifecycle phase. This is what feeds
+the per-cell host dilation `D` on verdict lines and the per-phase
+contention witness — the guest-side `struct rq` reads measure the
+scheduler *under test*, the host-side reads measure the weather the
+cell ran in. See [Run Modes](../concepts/run-modes.md#dilation-reporting).
+
 ## Threshold evaluation
 
 `MonitorThresholds` defines the pass/fail conditions:

@@ -99,6 +99,10 @@ where the branch is *better*.
 
 Latencies are µs, lower=better; `loop_count`/`iter_rate` higher=better.
 Verdict `yes` = branch avg inside the baseline `[min–max]` envelope.
+DELTA CONVENTION (this narrow section): out-of-envelope percentages
+measure the branch avg's distance to the NEAREST baseline envelope
+edge (the smallest defensible gap), not avg-to-avg; the wide section
+below uses avg-to-avg and says so at its table.
 
 ### `performance_mode_schbench_steady` (perf mode, steady phase Step[1])
 
@@ -272,6 +276,8 @@ on both.
 Steady phase (Step[1]) schbench metrics, **avg-of-6 [min-max]** per side (the
 headline N=3 was re-run +3 to resolve the out-of-envelope cells, per the
 narrow doc's precedent). Latencies µs, lower=better; rps/loop higher=better.
+DELTA CONVENTION (this wide section): percentages are avg-to-avg —
+unlike the narrow section's nearest-envelope-edge convention.
 
 | metric | baseline (cc78f447) | branch | branch in baseline envelope |
 |---|---|---|---|

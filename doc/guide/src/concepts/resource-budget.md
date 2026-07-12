@@ -39,7 +39,12 @@ default runs share LLCs among themselves, a perf-mode run waits for
 all of them to release, and while a perf-mode run holds its LLCs
 nobody else touches those CPUs. Default runs additionally exclude
 each other per CPU, so two default VMs never time-slice the same
-host CPU. Kernel builds take the budgeted path.
+host CPU. Kernel builds take the budgeted path, and so do
+`cargo ktstr test` / `cargo ktstr verifier` harness compiles: each
+dispatcher runs a reserved `cargo … --no-run` warm-up under the same
+shared LLC locks and cpuset sandbox, releasing both before any cell
+starts — a harness build on one runner never invades a peer runner's
+exclusive reservation, and never contends with its own cells' locks.
 
 <div class="kt-figure"><svg width="700" height="272" viewBox="0 0 700 272" role="img" aria-label="Host LLC lock coordination: a performance-mode run holds whole LLCs under exclusive flock (LOCK_EX) while budgeted no-perf-mode runs share the remaining LLCs under shared flock (LOCK_SH). An exclusive holder blocks every shared acquirer and vice versa; shared holders coexist. Below, when the process cpuset is narrower than the guest vCPU count the CPU budget collapses to it and the host time-slices the vCPU threads.">
   <defs><marker id="kt-arr8" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
