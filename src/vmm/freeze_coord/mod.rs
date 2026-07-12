@@ -1067,6 +1067,40 @@ struct RunVmHandles {
     watchdog: Option<JoinHandle<()>>,
 }
 
+/// The AP-ready boot gate in [`KtstrVm::run_vm`] timed out (or was cut short by
+/// `kill`) with one or more AP host threads not yet in `KVM_RUN`. Carries the
+/// facts observed at the trip and NOTHING inferred: the prior fixed
+/// "host CPU starvation" message was empirically refuted (fair-scheduler
+/// contention cannot trip this gate even at 25x oversubscription), so the real
+/// cause — pure starvation, D-state blocking, a wedged AP — is left to the
+/// per-thread kernel evidence in `evidence` rather than asserted.
+///
+/// `pub(crate)` (and a named type, not an anyhow message) so
+/// [`crate::test_support::boot_retry::run_vm_with_ap_gap_retry`] can
+/// `downcast_ref` it out of the (context-wrapped) error chain and retry the
+/// cold boot, the same recovery the guest-side AP-bring-up-gap marker gets.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "vCPU bring-up gate tripped: vCPU(s) {not_ready:?} did not reach KVM_RUN \
+     within {elapsed:?} of waiting (kill flag: {killed}; when set the wait was \
+     cut short by a panicking/exiting vCPU rather than running out the full \
+     bring-up cap, so `elapsed` is the real wait, not the cap). No cause is \
+     asserted — per-thread kernel evidence follows:\n{evidence}"
+)]
+pub(crate) struct ApGateTimeout {
+    /// Guest CPU ids (BSP is vCPU 0; AP index `i` is vCPU `i + 1`) whose
+    /// boot latch never fired.
+    pub(crate) not_ready: Vec<usize>,
+    /// Real time spent in the gate wait, from the gate-start `Instant`.
+    pub(crate) elapsed: Duration,
+    /// Whether `kill` was set when the wait ended — a set flag means the
+    /// wait broke early, so `elapsed` is below the cap by design.
+    pub(crate) killed: bool,
+    /// Per-not-ready-vCPU kernel evidence, one line each (see the gate's
+    /// dump code for the fields and their meaning).
+    pub(crate) evidence: String,
+}
+
 /// RAII guard that joins the vCPU / monitor / bpf-write / freeze-coordinator /
 /// watchdog threads [`KtstrVm::run_vm`] spawns BEFORE the `vm` local (and its
 /// `guest_mem` mmap) drops, on EVERY exit path. The normal Ok teardown
@@ -1155,6 +1189,45 @@ impl Drop for RunVmThreadGuard {
         }
         if let Some(h) = self.bpf_write.take() {
             let _ = h.join();
+        }
+    }
+}
+
+/// Restores the calling (BSP) thread's CPU affinity on every exit path from
+/// [`KtstrVm::run_vm`]. `run_vm` narrows this thread to the BSP host mask (via
+/// [`pin_current_thread`] / [`set_thread_cpumask`]) and never widens it back,
+/// which leaked the narrowed mask two ways when the same process ran a second
+/// VM (a boot retry, or a subsequent cell in the same process):
+///   (a) AP host threads `clone(2)` from this thread and inherit its affinity
+///       at spawn, so a leaked narrow mask would confine the next VM's APs to
+///       the previous VM's BSP CPU(s); and
+///   (b) [`host_topology::host_allowed_cpus`] seeds the CPU budget from THIS
+///       thread's `sched_getaffinity`, so a leaked mask would make replanning
+///       compute against the previous VM's cpuset instead of the host's.
+/// Captured BEFORE the narrowing and restored on `Drop`, keeping `run_vm`
+/// affinity-neutral for its caller. Only `run_vm` needs this; the interactive
+/// shell path is one-shot-then-exit.
+struct BspAffinityGuard {
+    /// The pre-narrowing affinity, or `None` if `sched_getaffinity` failed —
+    /// then `Drop` is a no-op (nothing trustworthy to restore).
+    saved: Option<nix::sched::CpuSet>,
+}
+
+impl BspAffinityGuard {
+    /// Snapshot the calling thread's affinity. Call this BEFORE applying the
+    /// BSP mask. Mirrors the module's `sched_setaffinity(Pid::from_raw(0), ..)`
+    /// idiom (pid 0 = calling thread) in the reverse direction.
+    fn capture() -> Self {
+        Self {
+            saved: nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).ok(),
+        }
+    }
+}
+
+impl Drop for BspAffinityGuard {
+    fn drop(&mut self) {
+        if let Some(saved) = &self.saved {
+            let _ = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), saved);
         }
     }
 }
@@ -1767,6 +1840,14 @@ impl KtstrVm {
         // coordinator / watchdog handles as they spawn; the Ok path `disarm`s it.
         // Declared after `bsp` (above) so it joins the watchdog + coordinator
         // (which hold bsp's ImmediateExitHandle) before `bsp` drops.
+        //
+        // Snapshot the BSP thread's affinity BEFORE the mask narrowing below,
+        // and declare the restore guard BEFORE `RunVmThreadGuard` so — Rust
+        // dropping locals in reverse declaration order — the thread-join guard
+        // drops FIRST (joining every AP) and this guard restores affinity
+        // AFTER, leaving `run_vm` affinity-neutral for any retry/next VM in the
+        // same process. See [`BspAffinityGuard`] for why the leak matters.
+        let _bsp_affinity_guard = BspAffinityGuard::capture();
         let mut guard = RunVmThreadGuard {
             ap_threads,
             monitor: None,
@@ -11051,7 +11132,10 @@ impl KtstrVm {
             // VM at 120s, so a 30s bring-up cap sits comfortably below it while
             // staying generous for a badly oversubscribed host.
             const AP_READY_TIMEOUT: Duration = Duration::from_secs(30);
-            let deadline = Instant::now() + AP_READY_TIMEOUT;
+            // Real gate-start instant so the error can report the ACTUAL wait,
+            // not the cap — a kill-break can trip the gate at ~0s elapsed.
+            let gate_start = Instant::now();
+            let deadline = gate_start + AP_READY_TIMEOUT;
             for latch in &ap_boot_latches {
                 while !latch.is_set() {
                     if kill.load(Ordering::Acquire) {
@@ -11073,11 +11157,80 @@ impl KtstrVm {
                 .map(|(i, _)| i + 1)
                 .collect();
             if !not_ready.is_empty() {
-                anyhow::bail!(
-                    "vCPU threads {not_ready:?} not ready after {}s — host CPU \
-                     starvation during bring-up",
-                    AP_READY_TIMEOUT.as_secs()
-                );
+                // Evidence dump — runs ONLY on the trip path. The old fixed
+                // "host CPU starvation" message was empirically refuted (fair
+                // scheduler contention cannot trip this gate even at 25x
+                // oversubscription), so instead of asserting a cause we collect
+                // per-thread kernel state and let the reader judge. For each AP
+                // whose boot latch never fired, read its published TID slot: the
+                // TID is stamped as the FIRST act of the AP closure, so a slot
+                // still 0 means the host thread ran zero instructions — the pure
+                // "never scheduled" signal. Comm-based attribution is NOT used:
+                // Rust sets a thread's name via prctl from INSIDE the thread, so
+                // a never-scheduled thread still carries the parent's comm. For a
+                // thread that did run, read
+                // /proc/self/task/{tid}/{stat,schedstat,wchan,status} once and
+                // pull the starved-vs-blocked discriminators. All reads are
+                // best-effort — a vanished TID yields "?" rather than failing.
+                use std::fmt::Write as _;
+                let mut evidence = String::new();
+                for (i, (tid_slot, _)) in ap_tid_slots.iter().enumerate() {
+                    if ap_boot_latches[i].is_set() {
+                        continue;
+                    }
+                    let vcpu_id = i + 1;
+                    let tid = tid_slot.load(Ordering::Acquire);
+                    if tid == 0 {
+                        let _ = writeln!(
+                            evidence,
+                            "  vCPU {vcpu_id}: never scheduled (no TID stamped) — \
+                             the host thread ran zero instructions of its closure \
+                             (pure starvation)"
+                        );
+                        continue;
+                    }
+                    let base = format!("/proc/self/task/{tid}");
+                    let read1 = |f: &str| {
+                        std::fs::read_to_string(format!("{base}/{f}"))
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_default()
+                    };
+                    // Split off everything after "(comm) " so a comm containing
+                    // ") " (or spaces) can't shift field indices. In that tail
+                    // field 0 is `state` (proc stat field 3); `processor` (last
+                    // CPU) is stat field 39, i.e. tail index 36.
+                    let stat = read1("stat");
+                    let tail = stat.rsplit(") ").next().unwrap_or("");
+                    let sf: Vec<&str> = tail.split(' ').collect();
+                    let state = sf.first().copied().unwrap_or("?");
+                    let last_cpu = sf.get(36).copied().unwrap_or("?");
+                    // schedstat field 2 = time runnable-but-not-running (ns):
+                    // large here means "wanted the CPU, didn't get it"
+                    // (starvation); near-zero with a kernel `wchan` means the
+                    // thread was blocked in-kernel, not starved.
+                    let schedstat = read1("schedstat");
+                    let wait_ns = schedstat.split_whitespace().nth(1).unwrap_or("?");
+                    let wchan = read1("wchan");
+                    let wchan = if wchan.is_empty() { "?" } else { wchan.as_str() };
+                    let status = read1("status");
+                    let nonvol = status
+                        .lines()
+                        .find_map(|l| l.strip_prefix("nonvoluntary_ctxt_switches:"))
+                        .map(str::trim)
+                        .unwrap_or("?");
+                    let _ = writeln!(
+                        evidence,
+                        "  vCPU {vcpu_id} (tid {tid}): state={state} \
+                         last_cpu={last_cpu} runnable_wait_ns={wait_ns} \
+                         wchan={wchan} nonvoluntary_ctxt_switches={nonvol}"
+                    );
+                }
+                return Err(anyhow::Error::new(ApGateTimeout {
+                    not_ready,
+                    elapsed: gate_start.elapsed(),
+                    killed: kill.load(Ordering::Acquire),
+                    evidence,
+                }));
             }
         }
 
