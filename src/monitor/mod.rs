@@ -634,6 +634,83 @@ pub(crate) const CPU_CURRENCY_PTHREAD: u8 = 1;
 #[allow(dead_code)]
 pub(crate) const CPU_CURRENCY_PMU: u8 = 2;
 
+/// Coarse lifecycle stage of a guest cell, tracked live in the
+/// [`ProgressLedger`] by the scenario-dispatch thread as it observes
+/// the guest's port-1 lifecycle / scenario frames.
+///
+/// Distinct from [`crate::vmm::wire::LifecyclePhase`] (the on-wire
+/// 1-byte frame discriminant): this is the host-side stage the watchdog
+/// charges CPU time against, collapsing several wire frames into one
+/// stage. The class stack is `Boot`/`Attach`/`Dispatch`/`Teardown` =
+/// INFRA (framework overhead) and `Body` = BODY (the test's own work).
+///
+/// The ordinal IS the monotone advance order: a stage may only move
+/// FORWARD (see [`ProgressLedger::advance_phase`]). `Boot` is `0` so the
+/// zero-initialised `phase` atomic starts there without an explicit
+/// store.
+#[repr(u8)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) enum LifecycleStage {
+    /// Booting: init / devtmpfs / initramfs up to SYS_RDY. INFRA.
+    Boot = 0,
+    /// SYS_RDY seen; the scheduler is attaching to sched_ext. INFRA.
+    Attach = 1,
+    /// PayloadStarting seen; guest dispatch is entering the workload /
+    /// test-body preamble. INFRA.
+    Dispatch = 2,
+    /// The test body / injected workload is running (`WorkloadDispatched`
+    /// for a verifier cell, `ScenarioStart` for a test cell). BODY — the
+    /// only stage whose CPU time is the test's own.
+    Body = 3,
+    /// Teardown: `ScenarioEnd` / `Exit` / `TestResult` seen; the guest is
+    /// winding down. INFRA.
+    Teardown = 4,
+}
+
+/// Coarse class of a [`LifecycleStage`]: whether CPU time charged to it
+/// is framework INFRA overhead or the test's own BODY work. Consumed by
+/// the watchdog (a LATER commit) to pick a deadline model; `allow`ed
+/// until that reader lands.
+#[allow(dead_code)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) enum StageClass {
+    /// Framework overhead — boot, attach, dispatch preamble, teardown.
+    Infra,
+    /// The test body / injected workload proper.
+    Body,
+}
+
+impl LifecycleStage {
+    /// Class of this stage. Only [`LifecycleStage::Body`] is BODY; every
+    /// other stage is framework INFRA. Consumed by the watchdog (a LATER
+    /// commit); `allow`ed until that reader lands.
+    #[allow(dead_code)]
+    pub(crate) fn class(self) -> StageClass {
+        match self {
+            LifecycleStage::Body => StageClass::Body,
+            _ => StageClass::Infra,
+        }
+    }
+
+    /// Reverse the `phase` atomic byte into a stage. Conservative on an
+    /// unknown value: an out-of-range byte (a torn read, or a future
+    /// stage this build predates) maps to `Boot` — the earliest, most-
+    /// lenient stage — so a garbled phase never charges the test body's
+    /// tighter deadline model. Consumed by the watchdog (a LATER commit);
+    /// `allow`ed until that reader lands.
+    #[allow(dead_code)]
+    pub(crate) fn from_u8(v: u8) -> Self {
+        match v {
+            1 => LifecycleStage::Attach,
+            2 => LifecycleStage::Dispatch,
+            3 => LifecycleStage::Body,
+            4 => LifecycleStage::Teardown,
+            // 0 and every unknown byte: conservative Boot.
+            _ => LifecycleStage::Boot,
+        }
+    }
+}
+
 /// Lock-free progress/liveness ledger shared from the monitor thread to
 /// the VM watchdog. The watchdog that will later read this runs
 /// SCHED_FIFO priority 2 and must NEVER block on the monitor, so every
@@ -653,22 +730,21 @@ pub(crate) const CPU_CURRENCY_PMU: u8 = 2;
 /// stale scalar only defers a kill).
 #[derive(Debug, Default)]
 pub(crate) struct ProgressLedger {
-    /// Lifecycle phase id (0 = `Boot`, the initial value). Written by
-    /// the guest scenario-dispatch thread in a LATER commit; defined
-    /// now so the type is stable. Not written by the monitor. `allow`ed
-    /// until the writer and the watchdog reader land.
-    #[allow(dead_code)]
+    /// Lifecycle stage id ([`LifecycleStage`]; 0 = `Boot`, the initial
+    /// value). Written FORWARD-ONLY by the guest scenario-dispatch thread
+    /// via [`ProgressLedger::advance_phase`]. Not written by the monitor.
+    /// The watchdog reader that folds it lands in a LATER commit.
     pub(crate) phase: AtomicU8,
-    /// Bumped by the dispatch thread on every lifecycle phase advance
-    /// (a LATER commit). A phase advance is itself progress evidence,
-    /// so the watchdog folds this epoch alongside `progress_epoch`.
-    /// Release store / Acquire load. Not written by the monitor.
-    #[allow(dead_code)]
+    /// Bumped by the dispatch thread on every lifecycle stage advance
+    /// (see [`ProgressLedger::advance_phase`]). A stage advance is itself
+    /// progress evidence, so the watchdog folds this epoch alongside
+    /// `progress_epoch`. Release store / Acquire load. Not written by the
+    /// monitor. The watchdog reader lands in a LATER commit.
     pub(crate) phase_epoch: AtomicU32,
-    /// `cpu_ns_now` captured at the last phase advance (a LATER commit),
-    /// so the watchdog can charge CPU time against the phase in which it
-    /// was spent. Not written by the monitor.
-    #[allow(dead_code)]
+    /// `cpu_ns_now` captured at the last stage advance, so the watchdog
+    /// can charge CPU time against the stage in which it was spent.
+    /// Written by [`ProgressLedger::advance_phase`]; not written by the
+    /// monitor. The watchdog reader lands in a LATER commit.
     pub(crate) cpu_ns_at_phase: AtomicU64,
 
     /// Summed available per-vCPU CPU-time (ns) as of the latest monitor
@@ -740,6 +816,121 @@ impl ProgressLedger {
         self.cpu_ns_at_progress.store(cpu_ns_now, Ordering::Relaxed);
         self.wall_ns_at_progress.store(wall_ns, Ordering::Relaxed);
         self.progress_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    /// Advance the lifecycle stage to `new_stage` ([`LifecycleStage`] as
+    /// `u8`), FORWARD-ONLY. A stage advance is itself new-work evidence,
+    /// so on a real advance this ALSO bumps `phase_epoch` and folds the
+    /// transition into `progress_epoch` (term (1) of the progress
+    /// invariant) via [`Self::record_progress`].
+    ///
+    /// MONOTONE (hard invariant): the stage never regresses. A late,
+    /// duplicated, or out-of-order frame — e.g. a stray `ScenarioStart`
+    /// arriving after `Exit` already moved the cell to `Teardown` — must
+    /// NOT pull the stage back, or the watchdog would charge later CPU
+    /// time against an earlier (wrong) stage's deadline model. The CAS
+    /// loop drops any non-forward move: `new_stage <= current` returns
+    /// `false` WITHOUT touching an epoch (no phantom progress from a
+    /// duplicate). Dispatch is single-threaded today, but the CAS keeps
+    /// the monotone invariant self-contained in the atomic rather than
+    /// relying on caller serialisation.
+    ///
+    /// `wall_ns` is the `run_start`-relative wall time the caller (the
+    /// dispatch thread) sampled for the triggering frame; it lands in
+    /// `wall_ns_at_progress` via `record_progress`. Returns `true` iff
+    /// the stage actually advanced.
+    pub(crate) fn advance_phase(&self, new_stage: u8, wall_ns: u64) -> bool {
+        let mut cur = self.phase.load(Ordering::Relaxed);
+        loop {
+            // Forward-only: equal or lower is a no-op (never regress).
+            if new_stage <= cur {
+                return false;
+            }
+            match self.phase.compare_exchange_weak(
+                cur,
+                new_stage,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+        // Snapshot the CPU anchor for the stage just entered, then
+        // publish the phase epoch (Release) so an Acquire reader that
+        // sees the bump also sees the anchor (payload-before-epoch). The
+        // advance is progress, so also fold it into `progress_epoch`.
+        let cpu_ns_now = self.cpu_ns_now.load(Ordering::Relaxed);
+        self.cpu_ns_at_phase.store(cpu_ns_now, Ordering::Relaxed);
+        self.phase_epoch.fetch_add(1, Ordering::Release);
+        self.record_progress(cpu_ns_now, wall_ns);
+        true
+    }
+}
+
+#[cfg(test)]
+mod progress_ledger_tests {
+    //! Direct unit coverage for [`ProgressLedger::advance_phase`]'s
+    //! forward-only (monotone) contract and its epoch/anchor bookkeeping,
+    //! independent of the dispatch driver.
+    use super::{LifecycleStage, ProgressLedger, StageClass};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn advance_phase_walks_forward_bumping_epochs_and_anchors() {
+        let l = ProgressLedger::default();
+        assert_eq!(l.phase.load(Ordering::Relaxed), LifecycleStage::Boot as u8);
+
+        // Boot→Attach: both epochs bump, anchor snapshots cpu_ns_now.
+        l.cpu_ns_now.store(100, Ordering::Relaxed);
+        assert!(l.advance_phase(LifecycleStage::Attach as u8, 11));
+        assert_eq!(l.phase.load(Ordering::Relaxed), LifecycleStage::Attach as u8);
+        assert_eq!(l.phase_epoch.load(Ordering::Acquire), 1);
+        assert_eq!(l.progress_epoch.load(Ordering::Acquire), 1);
+        assert_eq!(l.cpu_ns_at_phase.load(Ordering::Relaxed), 100);
+        assert_eq!(l.wall_ns_at_progress.load(Ordering::Relaxed), 11);
+
+        // Attach→Body (a skip is still forward): anchors re-snapshot.
+        l.cpu_ns_now.store(250, Ordering::Relaxed);
+        assert!(l.advance_phase(LifecycleStage::Body as u8, 22));
+        assert_eq!(l.phase.load(Ordering::Relaxed), LifecycleStage::Body as u8);
+        assert_eq!(l.phase_epoch.load(Ordering::Acquire), 2);
+        assert_eq!(l.progress_epoch.load(Ordering::Acquire), 2);
+        assert_eq!(l.cpu_ns_at_phase.load(Ordering::Relaxed), 250);
+    }
+
+    #[test]
+    fn advance_phase_never_regresses() {
+        let l = ProgressLedger::default();
+        assert!(l.advance_phase(LifecycleStage::Teardown as u8, 5));
+        let pe = l.phase_epoch.load(Ordering::Acquire);
+        let pr = l.progress_epoch.load(Ordering::Acquire);
+        let anchor = l.cpu_ns_at_phase.load(Ordering::Relaxed);
+
+        // Lower stage: no-op, returns false, touches nothing.
+        assert!(!l.advance_phase(LifecycleStage::Body as u8, 6));
+        // Equal stage (duplicate): no-op too.
+        assert!(!l.advance_phase(LifecycleStage::Teardown as u8, 7));
+
+        assert_eq!(l.phase.load(Ordering::Relaxed), LifecycleStage::Teardown as u8);
+        assert_eq!(l.phase_epoch.load(Ordering::Acquire), pe);
+        assert_eq!(l.progress_epoch.load(Ordering::Acquire), pr);
+        assert_eq!(l.cpu_ns_at_phase.load(Ordering::Relaxed), anchor);
+    }
+
+    #[test]
+    fn stage_class_and_from_u8_are_conservative() {
+        assert_eq!(LifecycleStage::Boot.class(), StageClass::Infra);
+        assert_eq!(LifecycleStage::Attach.class(), StageClass::Infra);
+        assert_eq!(LifecycleStage::Dispatch.class(), StageClass::Infra);
+        assert_eq!(LifecycleStage::Body.class(), StageClass::Body);
+        assert_eq!(LifecycleStage::Teardown.class(), StageClass::Infra);
+
+        assert_eq!(LifecycleStage::from_u8(0), LifecycleStage::Boot);
+        assert_eq!(LifecycleStage::from_u8(3), LifecycleStage::Body);
+        assert_eq!(LifecycleStage::from_u8(4), LifecycleStage::Teardown);
+        // Unknown byte → conservative Boot.
+        assert_eq!(LifecycleStage::from_u8(200), LifecycleStage::Boot);
     }
 }
 

@@ -113,6 +113,9 @@ impl SinkState {
             scenario_pause_cumulative_ns: &self.scenario_pause_cumulative_ns,
             run_start: self.run_start,
             current_step: &self.current_step,
+            // No ledger wired: these CRC-gate fixtures do not assert
+            // lifecycle-stage side effects, so every advance site no-ops.
+            progress_ledger: None,
         }
     }
 }

@@ -2275,6 +2275,14 @@ impl KtstrVm {
         guard.monitor = monitor_handle;
         let watchdog_reset_for_coord = watchdog_reset_ns.clone();
         let watchdog_reset_tag_for_coord = watchdog_reset_tag.clone();
+        // Second clone of the progress ledger for the coordinator's
+        // dispatch sinks: the first (above) went to `start_monitor` as
+        // the monitor's producer handle; this one lets the scenario-
+        // dispatch arms advance the live lifecycle stage as guest
+        // lifecycle / scenario frames arrive. Both hold the same Arc, so
+        // dispatch's forward-only stage stores and the monitor's per-tick
+        // liveness stores land in one ledger.
+        let progress_ledger_for_coord = progress_ledger.clone();
         let watchdog_pause_ns: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let watchdog_pause_for_coord = watchdog_pause_ns.clone();
@@ -4561,6 +4569,9 @@ impl KtstrVm {
                                             scenario_pause_cumulative_for_coord.as_ref(),
                                         run_start,
                                         current_step: &freeze_coord_current_step,
+                                        progress_ledger: Some(
+                                            progress_ledger_for_coord.as_ref(),
+                                        ),
                                     };
                                     for msg in &drained.messages {
                                         if let Some(entry) =
