@@ -61,6 +61,7 @@ mod dispatch;
 mod lazy_init;
 mod snapshot;
 mod state;
+mod watchdog_step;
 mod watchpoint;
 
 #[cfg(test)]
