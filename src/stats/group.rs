@@ -270,8 +270,15 @@ impl PairingKey {
     /// field via the `+mixed` marker in
     /// `group_and_average_by`'s `render_mixed_dirty` helper.
     pub fn from_row(row: &GauntletRow, pairing_dims: &[Dimension]) -> Self {
-        let mut parts = Vec::with_capacity(1 + pairing_dims.len());
+        let mut parts = Vec::with_capacity(2 + pairing_dims.len());
         parts.push(row.scenario.clone());
+        // Throughput-denomination era is ALWAYS the second component (not an
+        // operator Dimension): the throughput rate keys kept their names
+        // across the wall→CPU-second denomination change, so a wall-era row
+        // must never pair with — or group-average into — a cpu-era row.
+        // Slot index 1 is a stable contract: `denomination_agnostic` blanks
+        // it to detect cross-era near-misses for the compare diagnostic.
+        parts.push(row.throughput_denomination.as_str().to_string());
         for &dim in pairing_dims {
             parts.push(match dim {
                 Dimension::Kernel => row.kernel_version.clone().unwrap_or_default(),
@@ -290,6 +297,35 @@ impl PairingKey {
             });
         }
         PairingKey(parts)
+    }
+
+    /// The same key with the throughput-denomination slot (index 1, see
+    /// [`Self::from_row`]) blanked. Two rows whose full keys differ but whose
+    /// denomination-agnostic keys match are the SAME logical run pair split
+    /// only by the wall→CPU-second denomination change — the compare path
+    /// counts these as `denomination_mismatches` so the refusal to pair them
+    /// is flagged, not silent.
+    pub fn denomination_agnostic(&self) -> PairingKey {
+        let mut parts = self.0.clone();
+        if parts.len() > 1 {
+            parts[1] = String::new();
+        }
+        PairingKey(parts)
+    }
+
+    /// Human-readable `/`-joined label WITHOUT the throughput-denomination
+    /// slot: the denomination is a schema-era marker, not row identity an
+    /// operator narrows by, and stuttering `wall`/`cpu_sec` into every
+    /// finding label would bloat the tables for zero disambiguation (a
+    /// mixed-era cohort never pairs, so a rendered pair is single-era by
+    /// construction). Render sites use this; the raw `self.0` remains the
+    /// join/uniqueness key.
+    pub fn label(&self) -> String {
+        let mut parts: Vec<&str> = self.0.iter().map(String::as_str).collect();
+        if parts.len() > 1 {
+            parts.remove(1);
+        }
+        parts.join("/")
     }
 }
 
@@ -792,6 +828,10 @@ impl<'a> Accumulator<'a> {
             // value is metadata only.
             cpu_budget: acc.first.cpu_budget,
             vcpus: acc.first.vcpus,
+            // First-seen like the fields above — and safe by construction:
+            // the denomination era is an unconditional PairingKey component
+            // (slot 1), so every contributor in a group shares one value.
+            throughput_denomination: acc.first.throughput_denomination,
             // ALL must pass: any failed, inconclusive, or skipped
             // contributor flips the aggregate. A group with zero
             // passes_observed (every contributor failed, was
@@ -1198,6 +1238,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         // identity, so they don't pair into a "budget 0" bucket.
         cpu_budget: (sc.cpu_budget != 0).then_some(sc.cpu_budget),
         vcpus: (sc.vcpus != 0).then_some(sc.vcpus),
+        throughput_denomination: sc.throughput_denomination,
         passed: sc.is_pass(),
         skipped: sc.is_skip(),
         inconclusive: sc.is_inconclusive(),

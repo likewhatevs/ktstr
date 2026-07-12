@@ -2235,14 +2235,25 @@ fn render_failure_verdict_message(
     } else {
         "failed"
     };
+    // Host-dilation evidence: when this run was measurably dilated
+    // (vCPU threads starved by the host) AND a wall-clock latency gate
+    // tripped, append the measured D and a note that those ceilings
+    // include host preemption. Evidence only — no verdict change. D is
+    // a host-side measurement (result.host_vcpu_schedstat), unavailable
+    // in-guest where the gate fired, so it is stamped here at render.
+    let dilation_section = crate::assert::dilation_annotation(
+        result.host_vcpu_schedstat.and_then(|s| s.dilation()),
+        check_result,
+    );
     let msg = format!(
-        "{}{}ktstr_test '{}'{} [topo={}] {verdict_word}:\n  {}{}{}{}{}{}{}{}{}{}{}",
+        "{}{}ktstr_test '{}'{} [topo={}] {verdict_word}:\n  {}{}{}{}{}{}{}{}{}{}{}{}",
         fingerprint_line,
         bug_summary_line(),
         entry.name,
         sched_label,
         topo,
         details,
+        dilation_section,
         info_section,
         stats_section,
         console_section,
@@ -2414,7 +2425,7 @@ fn render_no_result_message(
         // test-output message.
         let vm_timeout = vm_timeout_from_entry(entry, topo.total_cpus());
         let watchdog_section = format!(
-            "\n\n--- watchdog ---\n\
+            "\n\n--- ktstr-watchdog ---\n\
              elapsed={:?} (VM run wall-clock)\n\
              vm_timeout={:?} (Tier-3 dead-man deadline = max(watchdog_timeout, \
              duration, 1s) + vCPU-scaled vm_boot_headroom x deadman multiplier \

@@ -561,10 +561,26 @@ pub struct TaobenchStats {
     pub fast_ops: u64,
     /// Misses served via the slow path (response time).
     pub slow_ops: u64,
-    /// Wall-clock window this stat covers, ns — the qps denominator. Per-phase:
-    /// the phase segment; whole-run: the run window. Merged as MAX (the window is
-    /// shared by the concurrent threads/workers being pooled, not summed).
+    /// Wall-clock window this stat covers, ns. Per-phase: the phase segment;
+    /// whole-run: the run window. Merged as MAX (the window is shared by the
+    /// concurrent threads/workers being pooled, not summed). NOT the qps
+    /// denominator anymore (that is `cpu_time_ns`); kept for the standalone /
+    /// validate surface (upstream wall-qps shape) and as the window evidence
+    /// from which the wall picture reconstructs exactly (`ops / elapsed`).
     pub elapsed_ns: u64,
+    /// Σ client-thread `CLOCK_THREAD_CPUTIME_ID` over the window, ns — the
+    /// CPU time the clients actually received, the `taobench_*_qps` /
+    /// `taobench_*_ops_per_sec` DENOMINATOR. CPU-clock denominated so the
+    /// throughput measures the workload, not host/guest scheduling delay;
+    /// under host dilation the wall picture is `cpu_rate / D` (the sidecar's
+    /// `host_dilation`). Dispatcher (slow-path service) CPU is EXCLUDED —
+    /// dispatchers model backing-store latency (mostly sleeping), and ops
+    /// complete on client threads. Merged as SUM (per-thread CPU is
+    /// disjoint, unlike the shared wall window). `#[serde(default)]`:
+    /// pre-field sidecars deserialize with 0 (the qps keys then read
+    /// absent, never a false rate).
+    #[serde(default)]
+    pub cpu_time_ns: u64,
 }
 
 impl TaobenchStats {
@@ -581,6 +597,8 @@ impl TaobenchStats {
         // The wall window is shared across the pooled concurrent threads/workers
         // (they run the same phase at the same time), so MAX, not sum.
         self.elapsed_ns = self.elapsed_ns.max(o.elapsed_ns);
+        // Per-thread CPU is disjoint across the pooled threads/workers: SUM.
+        self.cpu_time_ns = self.cpu_time_ns.saturating_add(o.cpu_time_ns);
     }
     /// Completed ops (fast + slow) — the throughput numerator.
     pub fn total_ops(&self) -> u64 {
@@ -647,11 +665,18 @@ struct ThreadAccum {
     phase_start_ns: u64,
     /// When this thread started (ns) — the whole-run window start.
     thread_start_ns: u64,
+    /// `CLOCK_THREAD_CPUTIME_ID` at the current phase segment's start (ns) —
+    /// baselines the per-phase client-CPU delta (the CPU-qps denominator).
+    phase_start_cpu_ns: u64,
+    /// `CLOCK_THREAD_CPUTIME_ID` at thread start (ns) — baselines the
+    /// whole-run client-CPU delta.
+    thread_start_cpu_ns: u64,
 }
 
 impl ThreadAccum {
     fn new(epoch: u32) -> Self {
         let now = monotonic_nanos();
+        let cpu_now = crate::workload::worker::sched::thread_cpu_time_ns();
         ThreadAccum {
             cur_epoch: epoch,
             cur: TaobenchPhaseStats::default(),
@@ -659,18 +684,23 @@ impl ThreadAccum {
             whole: TaobenchStats::default(),
             phase_start_ns: now,
             thread_start_ns: now,
+            phase_start_cpu_ns: cpu_now,
+            thread_start_cpu_ns: cpu_now,
         }
     }
-    /// Roll the current bucket into `phases` (stamping its segment wall) and start
-    /// a fresh one for `epoch`.
+    /// Roll the current bucket into `phases` (stamping its segment wall + CPU
+    /// windows) and start a fresh one for `epoch`.
     fn roll_to(&mut self, epoch: u32) {
         if epoch != self.cur_epoch {
             let now = monotonic_nanos();
+            let cpu_now = crate::workload::worker::sched::thread_cpu_time_ns();
             let mut cur = std::mem::take(&mut self.cur);
             cur.counters.elapsed_ns = now.saturating_sub(self.phase_start_ns);
+            cur.counters.cpu_time_ns = cpu_now.saturating_sub(self.phase_start_cpu_ns);
             self.phases.entry(self.cur_epoch).or_default().merge(&cur);
             self.cur_epoch = epoch;
             self.phase_start_ns = now;
+            self.phase_start_cpu_ns = cpu_now;
         }
     }
     /// Record a lookup at request time in `epoch`.
@@ -704,14 +734,17 @@ impl ThreadAccum {
         let us = (ns / 1000).min(u32::MAX as u64) as u32;
         self.cur.serve_lat.add_lat(us);
     }
-    /// Flush the last open bucket (stamping its segment wall) and stamp the
-    /// whole-run window.
+    /// Flush the last open bucket (stamping its segment wall + CPU windows)
+    /// and stamp the whole-run wall + CPU windows.
     fn finalize(mut self) -> Self {
         let now = monotonic_nanos();
+        let cpu_now = crate::workload::worker::sched::thread_cpu_time_ns();
         let mut cur = std::mem::take(&mut self.cur);
         cur.counters.elapsed_ns = now.saturating_sub(self.phase_start_ns);
+        cur.counters.cpu_time_ns = cpu_now.saturating_sub(self.phase_start_cpu_ns);
         self.phases.entry(self.cur_epoch).or_default().merge(&cur);
         self.whole.elapsed_ns = now.saturating_sub(self.thread_start_ns);
+        self.whole.cpu_time_ns = cpu_now.saturating_sub(self.thread_start_cpu_ns);
         self
     }
 }
@@ -1054,6 +1087,12 @@ pub fn run_standalone(config: &TaobenchConfig, run_secs: u64) -> TaobenchStandal
 /// (= fast / total). Under open-loop arrival (`arrival_rate > 0`) it also carries
 /// the coordinated-omission serve-latency percentiles; these are `None` in closed
 /// loop (no intended-arrival schedule, so no serve latency is measured).
+///
+/// DENOMINATION: the qps fields here are WALL-clock (`ops / elapsed`) on
+/// purpose — this is the standalone/validate surface whose output shape must
+/// stay byte-identical to the reference taobench report. The ktstr sidecar's
+/// `taobench_*_qps` / `taobench_*_ops_per_sec` metrics are CPU-second
+/// denominated instead (see [`TaobenchStats::cpu_time_ns`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TaobenchStandaloneReport {
     /// (fast + slow) ops per second over the measured window.
@@ -1162,6 +1201,7 @@ mod tests {
             fast_ops: u64::MAX,
             slow_ops: 1,
             elapsed_ns: 1000,
+            cpu_time_ns: u64::MAX,
         };
         let b = TaobenchStats {
             get_cmds: 5,
@@ -1169,6 +1209,7 @@ mod tests {
             fast_ops: 5,
             slow_ops: 5,
             elapsed_ns: 9000,
+            cpu_time_ns: 5,
         };
         a.merge(&b);
         assert_eq!(a.get_cmds, u64::MAX, "saturates, not wraps to 4");
@@ -1282,6 +1323,7 @@ mod tests {
             fast_ops: 850,
             slow_ops: 150,
             elapsed_ns: 9_000_000_000,
+            cpu_time_ns: 4_200_000_000,
         };
         let json = serde_json::to_string(&s).expect("TaobenchStats must serialize");
         let back: TaobenchStats =
@@ -1324,6 +1366,7 @@ mod tests {
                 fast_ops: 8,
                 slow_ops: 2,
                 elapsed_ns: 1000,
+                cpu_time_ns: 700,
             },
             ..Default::default()
         };
@@ -1336,6 +1379,7 @@ mod tests {
                 fast_ops: 5,
                 slow_ops: 1,
                 elapsed_ns: 4000,
+                cpu_time_ns: 300,
             },
             ..Default::default()
         };
@@ -1345,6 +1389,10 @@ mod tests {
         assert_eq!(a.counters.fast_ops, 13, "Σ fast_ops");
         assert_eq!(a.counters.slow_ops, 3, "Σ slow_ops");
         assert_eq!(a.counters.elapsed_ns, 4000, "wall is MAX, not summed");
+        assert_eq!(
+            a.counters.cpu_time_ns, 1000,
+            "cpu is SUM (disjoint per-thread)"
+        );
         assert_eq!(
             a.serve_lat.sample_count(),
             3,
@@ -1363,6 +1411,7 @@ mod tests {
                 fast_ops: 850,
                 slow_ops: 150,
                 elapsed_ns: 9_000_000_000,
+                cpu_time_ns: 4_200_000_000,
             },
             ..Default::default()
         };

@@ -233,58 +233,170 @@ fn assert_benchmarks_iteration_rate_fail() {
 }
 
 #[test]
-fn assert_benchmarks_zero_wall_time_yields_inconclusive() {
-    // Single worker with zero wall_time = all-zero case. Previously
-    // the gate skipped silently and returned Pass; now it records
-    // Inconclusive so a broken run that produced no signal at all
-    // doesn't masquerade as a passing benchmark.
+fn assert_benchmarks_zero_cpu_time_fails_floor() {
+    // A worker that spent zero CPU time (`cpu_time_ns == 0`, here via a
+    // zero wall_time report) has NO proven throughput. The
+    // CPU-denominated gate rates it 0 and fails any positive floor —
+    // no CPU spent means no work demonstrated. There is no Inconclusive
+    // arm: this is a real, actionable failure, not an unknowable one.
     let reports = [rpt_with_latencies(1, vec![], 10, 0)];
     let r = assert_benchmarks(&reports, None, None, Some(100.0));
     assert!(
-        r.is_inconclusive(),
-        "all-zero wall_time must be Inconclusive, not Pass: {:?}",
+        r.is_fail(),
+        "zero cpu_time must fail the floor, not pass or go inconclusive: {:?}",
         r.outcomes,
     );
-    assert!(!r.is_pass(), "must not silently pass on zero denominator");
-    assert!(!r.is_fail(), "no actual rate violation to report");
-    let reason = r
-        .inconclusive_details()
-        .find(|d| d.kind == DetailKind::Benchmark)
-        .unwrap_or_else(|| panic!("expected Inconclusive reason, got {:?}", r.outcomes));
     assert!(
-        reason.message.contains("zero wall_time_ns"),
-        "diagnostic must name the root cause: {reason}"
+        !r.is_inconclusive(),
+        "zero CPU is a hard failure, not unknowable"
     );
+    let reason = r
+        .failure_details()
+        .find(|d| d.kind == DetailKind::Benchmark)
+        .unwrap_or_else(|| panic!("expected Benchmark failure, got {:?}", r.outcomes));
     assert!(
-        reason.message.contains("able to run"),
-        "diagnostic must surface the operator-actionable hint: {reason}"
+        reason.message.contains("0.0/cpu-s") && reason.message.contains("floor"),
+        "diagnostic must show the zero CPU rate against the floor: {reason}"
     );
 }
 
 #[test]
-fn assert_benchmarks_mixed_zero_and_nonzero_wall_does_not_short_circuit() {
-    // One worker has zero wall_time (skipped) but another worker has
-    // valid wall_time = the gate evaluates the non-zero worker
-    // normally and does NOT record Inconclusive (only the all-zero
-    // case is Inconclusive). Pins the zero_wall_count == reports.len()
-    // guard — a regression that triggered on any zero-wall worker
-    // would hide real rate failures on the workers that did run.
+fn assert_benchmarks_mixed_zero_and_nonzero_cpu_both_fail() {
+    // With CPU-denomination there is no zero-worker skip: a zero-CPU
+    // worker rates 0 (fails) and a below-floor worker fails on its own
+    // rate. Both surface — the gate never short-circuits on one
+    // worker's zero CPU time.
     let reports = [
-        rpt_with_latencies(1, vec![], 10, 0),
-        rpt_with_latencies(2, vec![], 1, 5_000_000_000), // 0.2/s < 100/s
+        rpt_with_latencies(1, vec![], 10, 0), // cpu 0 -> rate 0 -> fail
+        rpt_with_latencies(2, vec![], 1, 5_000_000_000), // cpu 2.5s, 1 iter -> 0.4/cpu-s < 100
     ];
     let r = assert_benchmarks(&reports, None, None, Some(100.0));
     assert!(
         r.is_fail(),
-        "non-zero-wall worker below floor must fail: {:?}",
+        "both workers below floor must fail: {:?}",
         r.outcomes,
     );
-    assert!(!r.is_inconclusive(), "only all-zero is Inconclusive");
+    assert!(!r.is_inconclusive());
     assert!(
         r.failure_details()
             .any(|d| d.message.contains("worker 2") && d.message.contains("iteration rate")),
         "expected worker-2 rate failure: {:?}",
         r.outcomes,
+    );
+}
+
+#[test]
+fn assert_benchmarks_iteration_rate_is_dilation_safe() {
+    // The whole point of CPU-denomination: a worker starved of CPU by a
+    // busy host (wall ≫ CPU) is judged on the CPU it actually got, not
+    // wall-clock. iterations=100, cpu_time=50s, wall=200s:
+    //   CPU rate  = 100 / 50  = 2.0/cpu-s  -> PASSES floor 1.5
+    //   wall rate = 100 / 200 = 0.5/s      -> would FALSE-FAIL floor 1.5
+    // The old wall-denominated gate false-failed this honest workload
+    // under host dilation; the CPU gate passes it.
+    let mut w = rpt_with_latencies(1, vec![], 100, 200_000_000_000);
+    w.cpu_time_ns = 50_000_000_000;
+    let r = assert_benchmarks(&[w], None, None, Some(1.5));
+    assert!(
+        r.is_pass(),
+        "CPU rate 2.0/cpu-s must pass floor 1.5 despite wall rate 0.5/s: {:?}",
+        r.outcomes,
+    );
+}
+
+#[test]
+fn assert_benchmarks_iteration_rate_detects_below_floor_regardless_of_wall() {
+    // Detection is preserved: a worker whose CPU rate is below the floor
+    // fails even when its wall rate looks healthy. iterations=10,
+    // cpu_time=10s (CPU rate 1.0/cpu-s), wall=1ms (wall rate 10000/s):
+    // the CPU verdict fails floor 100 while the wall rate would sail
+    // past it — the CPU gate is not fooled by a tiny wall window.
+    let mut w = rpt_with_latencies(1, vec![], 10, 1_000_000);
+    w.cpu_time_ns = 10_000_000_000;
+    let r = assert_benchmarks(&[w], None, None, Some(100.0));
+    assert!(
+        r.is_fail(),
+        "CPU rate 1.0/cpu-s must fail floor 100 despite high wall rate: {:?}",
+        r.outcomes,
+    );
+    let reason = r
+        .failure_details()
+        .find(|d| d.kind == DetailKind::Benchmark)
+        .unwrap_or_else(|| panic!("expected Benchmark failure, got {:?}", r.outcomes));
+    assert!(
+        reason.message.contains("1.0/cpu-s") && reason.message.contains("wall rate 10000.0/s"),
+        "message must show CPU verdict rate and wall context: {reason}"
+    );
+}
+
+#[test]
+fn dilation_annotation_fires_on_latency_failure_under_dilation() {
+    // Synthetic D=3.0 with a wall-denominated latency failure present:
+    // the annotation renders the measured dilation, the CPU-share
+    // percent (1/3 ≈ 33%), and the wall-latency caveat.
+    let mut r = AssertResult::pass();
+    r.record_fail(AssertDetail::new(
+        DetailKind::Benchmark,
+        "p99 wake latency 9000ns exceeds limit 1ns".to_string(),
+    ));
+    let note = dilation_annotation(Some(3.0), &r);
+    assert!(
+        note.contains("--- host dilation ---"),
+        "section header: {note}"
+    );
+    assert!(note.contains("D=3.00x"), "measured D: {note}");
+    assert!(note.contains("33%"), "1/D CPU-share percent: {note}");
+    assert!(
+        note.contains("include host preemption"),
+        "wall-latency caveat: {note}"
+    );
+}
+
+#[test]
+fn dilation_annotation_silent_in_performance_mode() {
+    // D at/below 1.05 is effectively undilated (perf mode) — nothing to
+    // explain even with a latency failure present.
+    let mut r = AssertResult::pass();
+    r.record_fail(AssertDetail::new(
+        DetailKind::Benchmark,
+        "p99 wake latency over limit".to_string(),
+    ));
+    assert!(dilation_annotation(Some(1.02), &r).is_empty());
+    // None (schedstats-off host) is treated as D=1.0 -> no annotation.
+    assert!(dilation_annotation(None, &r).is_empty());
+}
+
+#[test]
+fn dilation_annotation_requires_a_confounded_failure() {
+    // A failure kind for which D carries no context (an isolation
+    // violation) must NOT draw the note, even at high dilation.
+    let mut r = AssertResult::pass();
+    r.record_fail(AssertDetail::new(
+        DetailKind::Isolation,
+        "tid 1 used cpu 7 outside cpuset".to_string(),
+    ));
+    assert!(
+        dilation_annotation(Some(3.0), &r).is_empty(),
+        "a non-dilation-confounded kind must not trigger the note",
+    );
+}
+
+#[test]
+fn dilation_annotation_fires_on_stuck_for_wall_gap_context() {
+    // A Stuck failure DOES draw the note: the verdict is the CPU gap
+    // (dilation-safe), but the message carries wall-gap evidence and D is
+    // what relates the two (wall ≈ cpu × D under pure host preemption; a
+    // wall gap far beyond that points at guest-side starvation).
+    let mut r = AssertResult::pass();
+    r.record_fail(AssertDetail::new(
+        DetailKind::Stuck,
+        "tid 1 stuck 9000ms cpu-gap on cpu0 at +1000ms (threshold 50ms, wall gap 9100ms)"
+            .to_string(),
+    ));
+    let note = dilation_annotation(Some(3.0), &r);
+    assert!(
+        note.contains("D=3.00x") && note.contains("wall-gap evidence"),
+        "Stuck must draw the D note as wall-gap context: {note}",
     );
 }
 

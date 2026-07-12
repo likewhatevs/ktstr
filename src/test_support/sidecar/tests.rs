@@ -279,6 +279,8 @@ fn sidecar_result_roundtrip() {
         scheduler: "scx_mitosis".to_string(),
         vcpus: 16,
         cpu_budget: 4,
+        host_dilation: Some(1.25),
+        throughput_denomination: ThroughputDenomination::CpuSec,
         scheduler_commit: Some("abc123".to_string()),
         resolve_source: Some("path".to_string()),
         project_commit: Some("def4567".to_string()),
@@ -374,6 +376,8 @@ fn sidecar_result_roundtrip() {
         scheduler,
         vcpus,
         cpu_budget,
+        host_dilation,
+        throughput_denomination,
         scheduler_commit,
         project_commit,
         payload,
@@ -410,6 +414,16 @@ fn sidecar_result_roundtrip() {
     // (vcpus, cpu_budget) round-trip — distinct values catch a field swap.
     assert_eq!(vcpus, 16, "vcpus must round-trip the literal");
     assert_eq!(cpu_budget, 4, "cpu_budget must round-trip the literal");
+    assert_eq!(
+        host_dilation,
+        Some(1.25),
+        "host_dilation must round-trip the literal"
+    );
+    assert_eq!(
+        throughput_denomination,
+        ThroughputDenomination::CpuSec,
+        "throughput_denomination must round-trip the literal"
+    );
     // Nullable string metadata fields.
     assert_eq!(scheduler_commit.as_deref(), Some("abc123"));
     assert_eq!(project_commit.as_deref(), Some("def4567"));
@@ -551,6 +565,8 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
         scheduler: "scx_audit".to_string(),
         vcpus: 256,
         cpu_budget: 95,
+        host_dilation: Some(1.4),
+        throughput_denomination: ThroughputDenomination::CpuSec,
         scheduler_commit: Some("deadbeef1234567890abcdef".to_string()),
         resolve_source: Some("auto_built".to_string()),
         project_commit: Some("cafebab-dirty".to_string()),

@@ -1657,6 +1657,7 @@ fn phase_buckets_derives_schbench_perphase_metrics() {
         worker_run_delay_ns: 0,
         worker_pcount: 0,
         loop_count: 42,
+        worker_cpu_ns: 0,
     };
     let mut guest_assert = build_assert_result(true, vec![]);
     let mut pc = std::collections::BTreeMap::new();
@@ -1746,6 +1747,7 @@ fn better_across_phases_orients_by_polarity_end_to_end() {
                 worker_run_delay_ns: 0,
                 worker_pcount: 0,
                 loop_count: loops,
+                worker_cpu_ns: 0,
             }),
             ..Default::default()
         }
@@ -1884,6 +1886,7 @@ fn phase_cgroup_metric_and_better_across_phases_cgroup_end_to_end() {
                 worker_run_delay_ns: 0,
                 worker_pcount: 0,
                 loop_count: loops,
+                worker_cpu_ns: 0,
             }),
             total_migrations: migs,
             ..Default::default()
@@ -2610,7 +2613,7 @@ fn eval_timeout_sched_exited_reason_override() {
         "the override must replace the default ERR_TIMED_OUT_NO_RESULT body, got: {msg}",
     );
     assert!(
-        msg.contains("--- watchdog ---"),
+        msg.contains("--- ktstr-watchdog ---"),
         "watchdog diagnostic block must render on the timed-out arm, got: {msg}",
     );
 }
@@ -2652,7 +2655,7 @@ fn eval_timeout_sched_exited_empty_message() {
         "the override must replace the default ERR_TIMED_OUT_NO_RESULT body, got: {msg}",
     );
     assert!(
-        msg.contains("--- watchdog ---"),
+        msg.contains("--- ktstr-watchdog ---"),
         "watchdog diagnostic block must render, got: {msg}",
     );
 }

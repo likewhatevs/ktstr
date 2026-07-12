@@ -376,9 +376,18 @@ pub(super) fn worker_main(
     // worst-case, more than enough for a non-zero delta.
     let mut last_iter_slot_publish = start;
     const IT_SLOT_PUBLISH_INTERVAL: Duration = Duration::from_millis(1);
+    // Whole-run gap peaks. `max_gap_ns` is the GATE gap — worker CPU-time
+    // between 1024-work-unit checkpoints; `max_gap_wall_ns` is the historical
+    // wall-clock gap kept as EVIDENCE (`max_gap_wall_ms`); see the checkpoint
+    // block below for the full denomination rationale.
     let mut max_gap_ns: u64 = 0;
+    let mut max_gap_wall_ns: u64 = 0;
     let mut max_gap_cpu: usize = last_cpu;
     let mut max_gap_at_ns: u64 = 0;
+    // CLOCK_THREAD_CPUTIME_ID baseline for the checkpoint CPU-gap; advanced
+    // at every checkpoint (blocked time accrues no CPU, so unlike
+    // `last_iter_time` it needs no per-blocking-site resets).
+    let mut last_ckpt_cpu_ns = thread_cpu_time_ns();
     // Lazily allocated per-worker cache buffer (CachePressure, CacheYield, CachePipe, FanOutCompute).
     let mut cache_pressure_buf: Option<Vec<u8>> = None;
     // Separate Vec<u64> for the matrix_multiply helper: the matrix
@@ -3909,20 +3918,44 @@ pub(super) fn worker_main(
 
         if work_units.is_multiple_of(1024) || epoch_changed {
             let now = *now_for_gate.get_or_insert_with(Instant::now);
-            let gap = now.duration_since(last_iter_time).as_nanos() as u64;
-            if gap > max_gap_ns {
-                max_gap_ns = gap;
+            // GATE gap: worker CPU-time consumed between checkpoints
+            // (CLOCK_THREAD_CPUTIME_ID delta — one extra clock read per
+            // 1024-work-unit checkpoint, amortized over the work body).
+            // CPU-denominated so the Stuck gate measures the workload
+            // (compute-without-progress: a livelock or a pathologically
+            // expensive iteration), not host/guest scheduling delay — a
+            // BLOCKED or starved-runnable worker accrues no CPU, so
+            // blocked-stuck detection is the cell watchdog's domain, not
+            // this gate's. Checkpoint granularity: the gap resolves to
+            // multiples of the 1024-unit checkpoint interval (plus the
+            // epoch-transition extra sample), same cadence the wall gap
+            // always had.
+            let cpu_now = thread_cpu_time_ns();
+            let cpu_gap = cpu_now.saturating_sub(last_ckpt_cpu_ns);
+            // EVIDENCE gap: the historical wall-clock measure, verbatim
+            // (max over checkpoints, from `last_iter_time` with its
+            // blocking-site resets) — carried as `max_gap_wall_ms` so the
+            // old signal (starvation shows up as wall-without-CPU) stays
+            // visible in reports while the verdict rides the CPU gap.
+            let wall_gap = now.duration_since(last_iter_time).as_nanos() as u64;
+            if cpu_gap > max_gap_ns {
+                max_gap_ns = cpu_gap;
                 max_gap_cpu = last_cpu;
                 max_gap_at_ns = now.duration_since(start).as_nanos() as u64;
             }
-            // Per-phase max gap, argmax-paired with the pre-migration CPU
-            // exactly like the whole-run pair above (a separate threshold
-            // since the per-phase peak resets at each boundary).
-            if gap > phase_max_gap_ns {
-                phase_max_gap_ns = gap;
+            if wall_gap > max_gap_wall_ns {
+                max_gap_wall_ns = wall_gap;
+            }
+            // Per-phase max gap (CPU, like the whole-run gate), argmax-paired
+            // with the pre-migration CPU exactly like the whole-run pair
+            // above (a separate threshold since the per-phase peak resets at
+            // each boundary).
+            if cpu_gap > phase_max_gap_ns {
+                phase_max_gap_ns = cpu_gap;
                 phase_max_gap_cpu = last_cpu;
             }
             last_iter_time = now;
+            last_ckpt_cpu_ns = cpu_now;
 
             let cpu = sched_getcpu();
             phase_cpus_used.insert(cpu);
@@ -4108,6 +4141,7 @@ pub(super) fn worker_main(
         cpus_used,
         migrations,
         max_gap_ms: max_gap_ns / 1_000_000,
+        max_gap_wall_ms: max_gap_wall_ns / 1_000_000,
         max_gap_cpu,
         max_gap_at_ms: max_gap_at_ns / 1_000_000,
         wake_latencies_ns: wake.run,
@@ -4890,7 +4924,10 @@ pub(crate) fn reservoir_push(buf: &mut Vec<u64>, count: &mut u64, sample: u64, c
 // this file under the per-file line budget. Re-imported via
 // `use sched::*;` so the dispatch arms reference the items without
 // qualification, matching the pre-split call sites.
-mod sched;
+// `pub(crate)`: `sched::thread_cpu_time_ns` is also the CPU-second
+// throughput-denominator clock for the schbench / taobench engines
+// (outside `workload::worker`).
+pub(crate) mod sched;
 use sched::*;
 
 #[cfg(test)]

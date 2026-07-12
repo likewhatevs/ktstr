@@ -28,6 +28,7 @@ fn stub_custom_fn(_ctx: &WorkerCtx) -> WorkerReport {
         cpus_used: BTreeSet::new(),
         migrations: vec![],
         max_gap_ms: 0,
+        max_gap_wall_ms: 0,
         max_gap_cpu: 0,
         max_gap_at_ms: 0,
         wake_latencies_ns: vec![],

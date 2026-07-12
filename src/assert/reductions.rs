@@ -829,12 +829,22 @@ pub(crate) fn record_default_fairness(
     }
     let gap_limit = gap_threshold_ms();
     for w in reports {
+        // `max_gap_ms` is CPU-time between progress checkpoints
+        // (compute-without-progress; dilation-safe). The wall gap rides
+        // along as evidence — under starvation it diverges upward from
+        // the CPU gap (and the host appends the measured dilation D).
         if w.max_gap_ms > gap_limit {
             r.record_fail(AssertDetail::new(
                 DetailKind::Stuck,
                 format!(
-                    "tid {} stuck {}ms on cpu{} at +{}ms (threshold {}ms)",
-                    w.tid, w.max_gap_ms, w.max_gap_cpu, w.max_gap_at_ms, gap_limit,
+                    "tid {} stuck {}ms cpu-gap on cpu{} at +{}ms (threshold {}ms, \
+                     wall gap {}ms)",
+                    w.tid,
+                    w.max_gap_ms,
+                    w.max_gap_cpu,
+                    w.max_gap_at_ms,
+                    gap_limit,
+                    w.max_gap_wall_ms,
                 ),
             ));
         }
@@ -1013,6 +1023,15 @@ pub fn assert_throughput_parity(
 /// Check benchmarking metrics: p99 wake latency, wake latency CV,
 /// and minimum iteration rate.
 ///
+/// `min_iter_rate` is a floor on each worker's CPU-denominated
+/// iteration rate — `iterations / cpu_time_sec`, the iterations per
+/// CPU-second the worker actually received. This is intrinsically
+/// dilation-safe: host preemption inflates wall time but not CPU
+/// time, so the verdict measures the workload, not the host. In
+/// performance mode (wall ≈ CPU) it reproduces the old wall-rate
+/// number. A worker with `cpu_time_ns == 0` has a rate of 0 and
+/// fails any positive floor (no CPU time spent ⇒ no work proven).
+///
 /// ```
 /// # use ktstr::assert::assert_benchmarks;
 /// # use ktstr::workload::WorkerReport;
@@ -1122,42 +1141,117 @@ pub fn assert_benchmarks(
     }
 
     if let Some(rate_floor) = min_iter_rate {
-        // Skip per-worker zero-wall cases (rate is unknowable when
-        // wall_time_ns == 0) but count them: if every worker had
-        // zero wall_time, the gate silently passed before — record
-        // Inconclusive instead so a broken run that produced no
-        // signal at all doesn't masquerade as a passing benchmark.
-        let mut zero_wall_count = 0usize;
+        // CPU-DENOMINATED rate: iterations per CPU-second the worker
+        // actually received (`cpu_time_ns`, a CLOCK_THREAD_CPUTIME_ID
+        // reading), single-sourced through `iterations_per_cpu_sec_of`
+        // so the denomination is bit-identical to the run-level fold.
+        //
+        // This makes the floor INTRINSICALLY dilation-safe: under host
+        // preemption wall time inflates but CPU time does not, so a busy
+        // worker's rate is unchanged (perf mode, where wall ≈ CPU, gives
+        // numerically the same figure the old wall-rate gate produced).
+        // The floor now means "iterations per CPU-second the worker was
+        // GIVEN" — a semantic sharpening: a think-time / sleepy
+        // workload's idle no longer sits in the denominator, so its rate
+        // reflects work-per-CPU, not work-per-wall.
+        //
+        // A never-ran worker (`cpu_time_ns == 0`) has NO proven
+        // throughput, so its rate is 0 and it fails any positive floor
+        // — the correct verdict (no CPU time was spent, so no work was
+        // demonstrated). There is deliberately no Inconclusive arm: 0
+        // CPU time is a real, actionable failure, not an unknowable one.
         for w in reports {
-            if w.wall_time_ns == 0 {
-                zero_wall_count += 1;
-                continue;
-            }
-            let rate = w.iterations as f64 / (w.wall_time_ns as f64 / 1e9);
-            if rate < rate_floor {
+            let cpu_rate = iterations_per_cpu_sec_of(1, w.cpu_time_ns, w.iterations).unwrap_or(0.0);
+            if cpu_rate < rate_floor {
+                // Wall-denominated rate for CONTEXT only. When it diverges
+                // from the CPU rate the gap is host scheduling delay (or
+                // the workload's own think-time) — the very confound the
+                // CPU-denominated verdict excludes, surfaced here so the
+                // divergence is visible in the failure text. The host adds
+                // the measured dilation D alongside this at render time
+                // (D is a host-side measurement, unavailable in-guest).
+                let wall_rate = if w.wall_time_ns > 0 {
+                    w.iterations as f64 / (w.wall_time_ns as f64 / 1e9)
+                } else {
+                    0.0
+                };
                 r.record_fail(AssertDetail::new(
                     DetailKind::Benchmark,
                     format!(
-                        "worker {} iteration rate {rate:.1}/s below floor {rate_floor:.1}/s",
+                        "worker {} iteration rate {cpu_rate:.1}/cpu-s below floor \
+                         {rate_floor:.1}/s (wall rate {wall_rate:.1}/s)",
                         w.tid
                     ),
                 ));
             }
         }
-        if zero_wall_count == reports.len() {
-            r.record_inconclusive(AssertDetail::new(
-                DetailKind::Benchmark,
-                format!(
-                    "min iteration rate inconclusive: all {} workers recorded zero wall_time_ns — \
-                     denominator is zero, rate cannot be computed; floor {rate_floor:.1}/s \
-                     neither pass nor fail (was the workload able to run?)",
-                    reports.len()
-                ),
-            ));
-        }
     }
 
     r
+}
+
+/// Failure kinds for which the measured host dilation D is load-bearing
+/// context in the failure message:
+///
+/// - [`DetailKind::Benchmark`] (p99 / CV wake latency) and
+///   [`DetailKind::Unfair`] (off-CPU spread): these ceilings remain
+///   WALL-clock denominated, so a trip can be host-preemption noise —
+///   honest only in performance mode (D≈1.0).
+/// - [`DetailKind::Stuck`] (the `max_gap_ms` gate): the VERDICT is
+///   CPU-denominated (compute-without-progress — real at any D), but its
+///   message carries the wall-gap EVIDENCE, and D is what relates the two
+///   (wall ≈ cpu × D under pure host preemption; a wall gap far beyond
+///   cpu × D points at guest-side starvation instead).
+///
+/// The iteration-rate gate also lands under `Benchmark` but is
+/// CPU-denominated and dilation-safe; annotating it is harmless (the note
+/// leads with the measured D, legitimate context for any failure under
+/// load).
+fn is_dilation_confounded_kind(kind: DetailKind) -> bool {
+    matches!(
+        kind,
+        DetailKind::Benchmark | DetailKind::Unfair | DetailKind::Stuck
+    )
+}
+
+/// Host-dilation annotation appended to a FAILING verdict's rendered
+/// message. Evidence only — no pass/fail behavior changes.
+///
+/// Returns empty unless BOTH a meaningful host dilation was measured
+/// (`D > 1.05`; at or below that the run was effectively undilated —
+/// performance mode — and there is nothing to explain) AND the verdict
+/// carries at least one failure for which D is load-bearing context
+/// ([`is_dilation_confounded_kind`]).
+///
+/// `dilation` is the host vCPU-schedstat `D` (`1 + Σrun_delay/Σon_cpu`),
+/// a HOST-side measurement of the vCPU threads' schedstat — unavailable
+/// in-guest where the gate actually fired, so this is applied at render
+/// time in the test harness. `None` (a host without `CONFIG_SCHEDSTATS`)
+/// is treated as `D = 1.0`: no annotation, no normalization.
+pub(crate) fn dilation_annotation(dilation: Option<f64>, result: &AssertResult) -> String {
+    let Some(d) = dilation else {
+        return String::new();
+    };
+    if d <= 1.05
+        || !result
+            .failure_details()
+            .any(|det| is_dilation_confounded_kind(det.kind))
+    {
+        return String::new();
+    }
+    // vCPUs received 1/D of the CPU they were runnable for (D = 1 +
+    // run_delay/on_cpu ⇒ on_cpu/(on_cpu+run_delay) = 1/D).
+    let pct = (100.0 / d).round() as u64;
+    format!(
+        "\n\n--- host dilation ---\n  \
+         measured host dilation D={d:.2}x this run (vCPUs received {pct}% of the CPU they \
+         were runnable for).\n  \
+         wall-clock latency ceilings (max_p99_wake_latency_ns / max_wake_latency_cv / \
+         max_spread_pct) include host preemption — these ceilings are honest in performance \
+         mode, where D≈1.0. CPU-denominated gates (min_iteration_rate, max_gap_ms) are \
+         dilation-safe; a Stuck failure's wall-gap evidence scales as ≈ cpu-gap × D under \
+         host preemption alone — a wall gap far beyond that points at guest-side starvation."
+    )
 }
 
 /// Assert that every SCX event counter in `events` is at or below

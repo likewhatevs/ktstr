@@ -366,13 +366,31 @@ pub struct WorkerReport {
     pub cpus_used: BTreeSet<usize>,
     /// Ordered list of CPU migration events with timestamps.
     pub migrations: Vec<Migration>,
-    /// Longest wall-clock gap observed at 1024-work-unit checkpoints
-    /// (ms). High values indicate the task was preempted or descheduled
-    /// near a checkpoint boundary.
+    /// Longest worker CPU-TIME gap observed between 1024-work-unit
+    /// checkpoints (ms) — the `CLOCK_THREAD_CPUTIME_ID` delta the worker
+    /// consumed without crossing a progress checkpoint. This is the Stuck
+    /// gate's measure (`max_gap_ms` thresholds compare against it): a high
+    /// value means compute-without-progress (livelock, a pathologically
+    /// expensive iteration), which is real at ANY host dilation — CPU time
+    /// excludes host preemption and guest run-queue wait by construction.
+    /// A BLOCKED or starved-runnable worker accrues no CPU here; detecting
+    /// blocked-stuck is the cell watchdog's domain. Granularity: multiples
+    /// of the checkpoint interval (1024 work units, plus one extra sample
+    /// at each phase transition).
     pub max_gap_ms: u64,
-    /// CPU where the longest gap happened.
+    /// Longest WALL-CLOCK gap between checkpoints (ms) — the historical
+    /// pre-CPU-conversion gate measure, kept verbatim (including its
+    /// blocking-site baseline resets) as EVIDENCE: under host dilation or
+    /// guest starvation wall-without-CPU shows up here while
+    /// [`max_gap_ms`](Self::max_gap_ms) stays low. Independent maximum —
+    /// its peak may come from a different checkpoint than the CPU peak.
+    /// `#[serde(default)]`: sidecar JSON written before this field existed
+    /// reads 0 (guest→host postcard is same-binary, always in sync).
+    #[serde(default)]
+    pub max_gap_wall_ms: u64,
+    /// CPU where the longest (CPU-time) gap happened.
     pub max_gap_cpu: usize,
-    /// When the longest gap happened (ms from start).
+    /// When the longest (CPU-time) gap happened (wall ms from start).
     pub max_gap_at_ms: u64,
     /// Per-wakeup latency samples (ns). Measures off-CPU time
     /// between the call that blocks (any blocking primitive — pipe

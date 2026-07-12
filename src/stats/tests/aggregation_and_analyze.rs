@@ -1953,9 +1953,16 @@ fn every_metric_has_kind_consistent_with_naming() {
         // (1 - misses/cmds, a command-time hit FRACTION, not a per-second rate);
         // it is MetricKind::PerPhase (skipped at the cross-run ext fold) so the
         // mean-of-ratios bug this gate guards cannot apply.
+        // schbench_loops_per_cpu_sec is the PER-PHASE CPU-second throughput
+        // (derived at the producer from one phase's loop_count /
+        // worker_cpu_ns, like the taobench per-phase qps) — PerPhase is
+        // skipped at the cross-run ext fold, so the mean-of-ratios bug this
+        // gate guards cannot apply; the pooled cohort rate IS a Rate under
+        // the distinct name `schbench_total_loops_per_cpu_sec`.
         if looks_like_rate
             && m.name != "worst_iterations_per_cpu_sec"
             && m.name != "taobench_hit_rate"
+            && m.name != "schbench_loops_per_cpu_sec"
         {
             assert!(
                 matches!(m.kind, MetricKind::Rate { .. }),

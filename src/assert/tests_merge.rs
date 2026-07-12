@@ -686,9 +686,11 @@ fn populate_run_pooled_iterations_per_cpu_sec_tiny_denominator_stays_finite() {
 /// concurrent cohorts, so it is taken as MAX, never summed — a summed window
 /// would deflate every qps). With cg1 (fast 800, slow 200, 10 s) and cg2 (fast
 /// 300, slow 700, 8 s), the pool is fast 1100, slow 900, ops 2000, wall
-/// MAX(10,8) = 10 s, giving total 200/s, fast 110/s, slow 90/s, and hit
-/// 1100/2000 = 0.55. A summed-wall denominator (18 s) would give total roughly
-/// 111/s, so the MAX window is observable.
+/// MAX(10,8) = 10 s, client CPU Σ(10,8) = 18 s, giving the CPU-second rates
+/// total 2000/18, fast 1100/18, slow 900/18, and hit 1100/2000 = 0.55. The
+/// MAX wall window (10, not Σ 18) stays observable via the wall_sec
+/// component; the SUM CPU window is observable in the rates (a MAX-folded
+/// CPU denominator would give 200/s).
 #[test]
 fn populate_run_pooled_taobench_repools_across_cgroups() {
     let tb = |fast: u64, slow: u64, secs: u64| {
@@ -698,6 +700,9 @@ fn populate_run_pooled_taobench_repools_across_cgroups() {
             fast_ops: fast,
             slow_ops: slow,
             elapsed_ns: secs * 1_000_000_000,
+            // CPU mirrors the wall window per cgroup; unlike the MAX-folded
+            // wall it SUMs across cgroups (the qps denominator).
+            cpu_time_ns: secs * 1_000_000_000,
         })
     };
     let cg1 = CgroupStats {
@@ -724,7 +729,7 @@ fn populate_run_pooled_taobench_repools_across_cgroups() {
     acc.merge(mk(&cg2));
     populate_run_pooled_taobench(&mut acc.stats);
     let e = &acc.stats.ext_metrics;
-    // Counter components: Σ ops, MAX wall.
+    // Counter components: Σ ops, MAX wall, Σ client CPU.
     assert_eq!(e.get("total_taobench_ops").copied(), Some(2000.0));
     assert_eq!(e.get("total_taobench_fast_ops").copied(), Some(1100.0));
     assert_eq!(e.get("total_taobench_slow_ops").copied(), Some(900.0));
@@ -733,10 +738,37 @@ fn populate_run_pooled_taobench_repools_across_cgroups() {
         Some(10.0),
         "wall is MAX(10,8) = 10, not Σ = 18",
     );
-    // Derived Rates = Σnum / Σden over the cohort.
-    assert_eq!(e.get("taobench_total_ops_per_sec").copied(), Some(200.0));
-    assert_eq!(e.get("taobench_fast_ops_per_sec").copied(), Some(110.0));
-    assert_eq!(e.get("taobench_slow_ops_per_sec").copied(), Some(90.0));
+    assert_eq!(
+        e.get("total_taobench_cpu_sec").copied(),
+        Some(18.0),
+        "client CPU is Σ(10,8) = 18 (disjoint per-thread), not MAX",
+    );
+    // Derived Rates = Σnum / Σ CLIENT-CPU-sec over the cohort (CPU-second
+    // denominated: 2000/18 etc.), NOT per wall second.
+    let total = e
+        .get("taobench_total_ops_per_sec")
+        .copied()
+        .expect("rate derived");
+    assert!(
+        (total - 2000.0 / 18.0).abs() < 1e-9,
+        "Σops/Σcpu = 2000/18, got {total}",
+    );
+    let fast = e
+        .get("taobench_fast_ops_per_sec")
+        .copied()
+        .expect("rate derived");
+    assert!(
+        (fast - 1100.0 / 18.0).abs() < 1e-9,
+        "Σfast/Σcpu = 1100/18, got {fast}",
+    );
+    let slow = e
+        .get("taobench_slow_ops_per_sec")
+        .copied()
+        .expect("rate derived");
+    assert!(
+        (slow - 900.0 / 18.0).abs() < 1e-9,
+        "Σslow/Σcpu = 900/18, got {slow}",
+    );
     let hit = e
         .get("taobench_hit_fraction")
         .copied()
@@ -783,6 +815,7 @@ fn populate_run_pooled_taobench_absent_on_zero_wall() {
             fast_ops: 90,
             slow_ops: 10,
             elapsed_ns: 0,
+            cpu_time_ns: 0,
         }),
         num_workers: 1,
         ..CgroupStats::default()
@@ -813,6 +846,7 @@ fn populate_run_pooled_taobench_hit_fraction_absent_when_no_ops() {
             fast_ops: 0,
             slow_ops: 0,
             elapsed_ns: 5_000_000_000,
+            cpu_time_ns: 5_000_000_000,
         }),
         num_workers: 1,
         ..CgroupStats::default()
@@ -860,6 +894,9 @@ fn populate_run_pooled_taobench_command_hit_diverges_from_response() {
             fast_ops: fast,
             slow_ops: slow,
             elapsed_ns: secs * 1_000_000_000,
+            // CPU mirrors the wall window per cgroup; unlike the MAX-folded
+            // wall it SUMs across cgroups (the qps denominator).
+            cpu_time_ns: secs * 1_000_000_000,
         })
     };
     let cg1 = CgroupStats {

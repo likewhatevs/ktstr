@@ -2217,6 +2217,8 @@ mod tests {
             periodic_target: 0,
             vcpus: 1,
             cpu_budget: 1,
+            host_dilation: None,
+            throughput_denomination: ktstr::test_support::ThroughputDenomination::CpuSec,
             stimulus_events: Vec::new(),
             work_type: "SpinWait".to_string(),
             verifier_stats: Vec::new(),

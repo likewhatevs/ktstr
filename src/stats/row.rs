@@ -57,6 +57,18 @@ pub struct GauntletRow {
     /// timing metrics are then host-contention-confounded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vcpus: Option<u32>,
+    /// Denomination of this row's workload-throughput rate metrics,
+    /// carried from `SidecarResult::throughput_denomination`
+    /// (`#[serde(default)]` = `Wall` for pre-marker rows). NOT an
+    /// operator-facing Dimension — it is an unconditional part of every
+    /// `PairingKey` (like `scenario`; see `super::group`), so a
+    /// wall-era row never pairs with, or group-averages into, a
+    /// cpu-era row: the throughput keys kept their names across the
+    /// denomination change and their values are not comparable across it.
+    /// Cross-era near-misses are surfaced by
+    /// `CompareReport::denomination_mismatches`.
+    #[serde(default)]
+    pub throughput_denomination: crate::test_support::ThroughputDenomination,
     /// Scheduler binary name carried from the source sidecar
     /// (`SidecarResult::scheduler`). Surfaced through the substring
     /// filter in [`compare_rows_by`] and the typed

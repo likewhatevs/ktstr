@@ -808,12 +808,14 @@ pub fn populate_run_pooled_iterations_per_cpu_sec(stats: &mut ScenarioStats) {
 /// `stats.ext_metrics`, pooled across the run's `WorkType::Taobench` cgroups.
 /// Each cgroup carries its workers' merged whole-run aggregate
 /// ([`crate::assert::CgroupStats::taobench_whole`]); this folds those across
-/// cgroups (Σ ops, MAX wall window — the window is shared by the concurrent
-/// cohorts, per `TaobenchStats::merge`) and writes the six `total_taobench_*`
-/// Counter components (`ops`, `fast_ops`, `slow_ops`, `wall_sec`, plus the
-/// command-time `get_cmds` / `get_hits`), from which
-/// `crate::stats::derive_rate_metrics` derives `taobench_total_ops_per_sec`,
-/// `taobench_fast_ops_per_sec`, `taobench_slow_ops_per_sec`, the response-time
+/// cgroups (Σ ops, MAX wall window, Σ client CPU — per `TaobenchStats::merge`)
+/// and writes the `total_taobench_*` Counter components (`ops`, `fast_ops`,
+/// `slow_ops`, `wall_sec`, `cpu_sec`, plus the command-time `get_cmds` /
+/// `get_hits`), from which `crate::stats::derive_rate_metrics` derives the
+/// CPU-SECOND-denominated `taobench_total_ops_per_sec`,
+/// `taobench_fast_ops_per_sec`, `taobench_slow_ops_per_sec` (Σops / Σclient
+/// CPU-sec — dilation-safe; wall reconstructs as `rate / D` or exactly as
+/// `Σops / total_taobench_wall_sec`), the response-time
 /// `taobench_hit_fraction` (Σfast/Σcompleted), and the command-time
 /// `taobench_command_hit_rate` (Σhits/Σcmds). The whole-run Rate keys are
 /// registered METRICS, so — unlike the per-phase `taobench_*_qps`
@@ -887,6 +889,19 @@ pub fn populate_run_pooled_taobench(stats: &mut ScenarioStats) {
         TOTAL_TAOBENCH_WALL_SEC.to_string(),
         c.elapsed_ns as f64 / 1e9,
     );
+    // CPU-second window: Σ client-thread CLOCK_THREAD_CPUTIME_ID across the
+    // pooled cgroups — the `taobench_*_ops_per_sec` Rate DENOMINATOR (the
+    // wall window above stays as a component: it is window evidence, not a
+    // throughput rate, and preserves the exact wall reconstruction
+    // `Σops / Σwall` alongside the `rate / D` approximation). Inserted only
+    // when measured (>0) so the CPU rates read absent — never a false rate —
+    // on a pre-field carrier.
+    if c.cpu_time_ns > 0 {
+        stats.ext_metrics.insert(
+            crate::stats::TOTAL_TAOBENCH_CPU_SEC.to_string(),
+            c.cpu_time_ns as f64 / 1e9,
+        );
+    }
     // Command-time hit components: hits = cmds − misses (request-time). The Rate
     // taobench_command_hit_rate = Σhits / Σcmds re-derives via derive_rate_metrics
     // (skipped, hence absent, when no lookups issued). Diverges from the
@@ -1006,19 +1021,22 @@ pub fn populate_run_pooled_schbench(stats: &mut ScenarioStats) {
     let mut worker_run_delay_ns: u64 = 0;
     let mut worker_pcount: u64 = 0;
     let mut loops: u64 = 0;
+    let mut worker_cpu_ns: u64 = 0;
     let mut any = false;
     for phase in &stats.phases {
         for pc in phase.per_cgroup.values() {
             if let Some(s) = pc.schbench.as_ref() {
                 any = true;
-                // saturating: guest-runtime run-delay-ns / pcount / loop
-                // counters pooled across phases+cgroups (matches the already-
-                // saturating SchbenchPhaseStats::merge); never wrap a gate-Rate.
+                // saturating: guest-runtime run-delay-ns / pcount / loop /
+                // cpu counters pooled across phases+cgroups (matches the
+                // already-saturating SchbenchPhaseStats::merge); never wrap a
+                // gate-Rate.
                 msg_run_delay_ns = msg_run_delay_ns.saturating_add(s.msg_run_delay_ns);
                 msg_pcount = msg_pcount.saturating_add(s.msg_pcount);
                 worker_run_delay_ns = worker_run_delay_ns.saturating_add(s.worker_run_delay_ns);
                 worker_pcount = worker_pcount.saturating_add(s.worker_pcount);
                 loops = loops.saturating_add(s.loop_count);
+                worker_cpu_ns = worker_cpu_ns.saturating_add(s.worker_cpu_ns);
             }
         }
     }
@@ -1028,6 +1046,18 @@ pub fn populate_run_pooled_schbench(stats: &mut ScenarioStats) {
     stats
         .ext_metrics
         .insert(TOTAL_SCHBENCH_LOOPS.to_string(), loops as f64);
+    // Whole-run worker CPU-second window — the CPU-SECOND-denominated
+    // `schbench_total_loops_per_cpu_sec` Rate denominator (Σloops / Σworker
+    // CPU-sec; message-thread CPU excluded, mirroring schbench's Σ worker
+    // runtimes). Dilation-safe; wall reconstructs as `rate / D` via the
+    // sidecar's `host_dilation`. Inserted only when measured (>0) so the
+    // Rate reads absent on a pre-field carrier, never a false rate.
+    if worker_cpu_ns > 0 {
+        stats.ext_metrics.insert(
+            crate::stats::TOTAL_SCHBENCH_WORKER_CPU_SEC.to_string(),
+            worker_cpu_ns as f64 / 1e9,
+        );
+    }
     if msg_pcount > 0 {
         stats.ext_metrics.insert(
             TOTAL_SCHBENCH_MSG_RUN_DELAY_NS.to_string(),
@@ -2144,6 +2174,20 @@ fn write_schbench_scalars(
     // measured value; HigherBetter → worst), distinct from a non-schbench carrier
     // which has no schbench data at all (the caller skips it).
     out.insert(SCHBENCH_LOOP_COUNT.to_string(), p.loop_count as f64);
+    // CPU-second-denominated throughput: completed cycles per CPU-second the
+    // phase's WORKER threads actually received (Σ CLOCK_THREAD_CPUTIME_ID
+    // deltas — message-thread CPU excluded, mirroring schbench's Σ worker
+    // runtimes). Dilation-safe by construction; the wall picture reconstructs
+    // as `rate / D` via the sidecar's `host_dilation`. ABSENT when no worker
+    // CPU was measured (pre-field carrier, or a phase in which no worker ran).
+    // The `schbench_rps_*` per-second samples above deliberately stay WALL
+    // (upstream `rps_stats` parity — see the `SchbenchPhaseStats::rps` doc).
+    if p.worker_cpu_ns > 0 {
+        out.insert(
+            crate::stats::SCHBENCH_LOOPS_PER_CPU_SEC.to_string(),
+            p.loop_count as f64 / (p.worker_cpu_ns as f64 / 1e9),
+        );
+    }
 }
 
 /// Write the per-phase taobench scalar metrics derived from ONE
@@ -2151,9 +2195,17 @@ fn write_schbench_scalars(
 /// into `out`, keyed by registry [`crate::stats::MetricDef`] name. The sole
 /// producer of these keys for both the per-cgroup ([`PhaseCgroupStats::metrics`])
 /// and pooled ([`PhaseBucket::metrics`]) maps. ABSENT discipline: the qps keys
-/// only when the wall window was measured (`elapsed_ns > 0`); hit_ratio only when
-/// ops completed (`total > 0`); hit_rate only when lookups were issued
+/// only when client CPU time was measured (`cpu_time_ns > 0`); hit_ratio only
+/// when ops completed (`total > 0`); hit_rate only when lookups were issued
 /// (`get_cmds > 0`) — a not-measured value reads as missing, never a false 0.
+///
+/// DENOMINATION: the `taobench_*_qps` keys are CPU-SECOND denominated —
+/// completed ops per CPU-second the phase's client threads actually received
+/// (Σ `CLOCK_THREAD_CPUTIME_ID`), not per wall second. Dilation-safe by
+/// construction; the wall picture reconstructs as `rate / D` via the
+/// sidecar's `host_dilation` (or exactly from the carrier's ops + wall
+/// window). Same key names as the historical wall rates — the sidecar-level
+/// `throughput_denomination` marker gates cross-era comparison.
 fn write_taobench_scalars(
     p: &crate::workload::taobench::run::TaobenchPhaseStats,
     out: &mut std::collections::BTreeMap<String, f64>,
@@ -2164,11 +2216,11 @@ fn write_taobench_scalars(
     };
     let c = &p.counters;
     let total = c.total_ops();
-    if c.elapsed_ns > 0 {
-        let secs = c.elapsed_ns as f64 / 1e9;
-        out.insert(TAOBENCH_TOTAL_QPS.to_string(), total as f64 / secs);
-        out.insert(TAOBENCH_FAST_QPS.to_string(), c.fast_ops as f64 / secs);
-        out.insert(TAOBENCH_SLOW_QPS.to_string(), c.slow_ops as f64 / secs);
+    if c.cpu_time_ns > 0 {
+        let cpu_secs = c.cpu_time_ns as f64 / 1e9;
+        out.insert(TAOBENCH_TOTAL_QPS.to_string(), total as f64 / cpu_secs);
+        out.insert(TAOBENCH_FAST_QPS.to_string(), c.fast_ops as f64 / cpu_secs);
+        out.insert(TAOBENCH_SLOW_QPS.to_string(), c.slow_ops as f64 / cpu_secs);
     }
     if total > 0 {
         out.insert(

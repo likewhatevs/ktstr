@@ -482,11 +482,21 @@ fn render_explain_sidecar_text(
                 sc.cpu_budget,
             );
         } else if sc.cpu_budget < sc.vcpus {
+            // Cite the MEASURED dilation when the run recorded one: paper
+            // overcommit (cpu_budget < vcpus) predicts contention, but D
+            // = 1 + Σrun_delay/Σon_cpu is what the vCPU threads actually
+            // suffered — an on-paper-overcommitted run on an otherwise
+            // idle host can still read D≈1.0. `None` (schedstats-off host
+            // or pre-field sidecar) drops the clause.
+            let dilation_note = match sc.host_dilation {
+                Some(d) => format!(" measured host dilation D={d:.2}x this run;"),
+                None => String::new(),
+            };
             let _ = writeln!(
                 out,
                 "  cpu_budget: {} / {} vcpus  [OVERCOMMIT: host time-slices the \
-                 guest vCPUs -> wake-latency / off-CPU / run-delay timing metrics \
-                 are host-contention-confounded; compare the overcommit-invariant \
+                 guest vCPUs ->{dilation_note} wake-latency / off-CPU / run-delay timing \
+                 metrics are host-contention-confounded; compare the overcommit-invariant \
                  worst_iterations_per_cpu_sec, not raw timing]",
                 sc.cpu_budget, sc.vcpus,
             );
@@ -1218,6 +1228,41 @@ mod tests {
         assert!(
             malformed.contains("[malformed") && !malformed.contains("OVERCOMMIT"),
             "budget>0 with vcpus==0 must render the malformed note, not overcommit: {malformed}",
+        );
+    }
+
+    /// The OVERCOMMIT marker cites the MEASURED host dilation D when the
+    /// sidecar recorded one, and omits the clause when it did not (host
+    /// without CONFIG_SCHEDSTATS / pre-field sidecar → `host_dilation`
+    /// None). Both flavors still render the base OVERCOMMIT marker.
+    #[test]
+    fn explain_sidecar_overcommit_cites_measured_dilation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let render = |name: &str, dilation: Option<f64>| -> String {
+            let run_dir = tmp.path().join(name);
+            std::fs::create_dir(&run_dir).unwrap();
+            let mut sc = crate::test_support::SidecarResult::test_fixture();
+            sc.cpu_budget = 4;
+            sc.vcpus = 16;
+            sc.host_dilation = dilation;
+            std::fs::write(
+                run_dir.join("t-0000000000000000.ktstr.json"),
+                serde_json::to_string(&sc).unwrap(),
+            )
+            .unwrap();
+            explain_sidecar(name, Some(tmp.path()), false).unwrap()
+        };
+
+        let with_d = render("run-d", Some(3.0));
+        assert!(
+            with_d.contains("[OVERCOMMIT") && with_d.contains("measured host dilation D=3.00x"),
+            "OVERCOMMIT marker must cite the measured D when present: {with_d}",
+        );
+
+        let without_d = render("run-nod", None);
+        assert!(
+            without_d.contains("[OVERCOMMIT") && !without_d.contains("measured host dilation"),
+            "OVERCOMMIT marker must omit the D clause when host_dilation is None: {without_d}",
         );
     }
 

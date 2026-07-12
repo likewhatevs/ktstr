@@ -1530,6 +1530,18 @@ pub(crate) const TOTAL_SCHBENCH_MSG_PCOUNT: &str = "total_schbench_msg_pcount";
 pub(crate) const TOTAL_SCHBENCH_WORKER_RUN_DELAY_NS: &str = "total_schbench_worker_run_delay_ns";
 pub(crate) const TOTAL_SCHBENCH_WORKER_PCOUNT: &str = "total_schbench_worker_pcount";
 pub(crate) const TOTAL_SCHBENCH_LOOPS: &str = "total_schbench_loops";
+// CPU-SECOND throughput pair: `total_schbench_worker_cpu_sec` is the whole-run
+// Σ worker CLOCK_THREAD_CPUTIME_ID window (Counter component,
+// RENDER_SUPPRESSED; message-thread CPU excluded, mirroring schbench's
+// Σ worker runtimes) and `schbench_total_loops_per_cpu_sec` the derived Rate
+// (Σloops / Σworker CPU-sec) — completed cycles per CPU-second the workers
+// actually received. Dilation-safe by construction (host preemption inflates
+// wall, not CPU); the wall picture reconstructs as `rate / D` via the
+// sidecar's `host_dilation`. The per-phase sibling is
+// `schbench_loops_per_cpu_sec` (PerPhase, from the same carrier field).
+pub(crate) const TOTAL_SCHBENCH_WORKER_CPU_SEC: &str = "total_schbench_worker_cpu_sec";
+pub(crate) const SCHBENCH_TOTAL_LOOPS_PER_CPU_SEC: &str = "schbench_total_loops_per_cpu_sec";
+pub(crate) const SCHBENCH_LOOPS_PER_CPU_SEC: &str = "schbench_loops_per_cpu_sec";
 pub(crate) const SCHBENCH_MSG_RUN_DELAY_NS_PER_SCHED: &str = "schbench_msg_run_delay_ns_per_sched";
 pub(crate) const SCHBENCH_WORKER_RUN_DELAY_NS_PER_SCHED: &str =
     "schbench_worker_run_delay_ns_per_sched";
@@ -1597,6 +1609,14 @@ pub(crate) const TOTAL_TAOBENCH_OPS: &str = "total_taobench_ops";
 pub(crate) const TOTAL_TAOBENCH_FAST_OPS: &str = "total_taobench_fast_ops";
 pub(crate) const TOTAL_TAOBENCH_SLOW_OPS: &str = "total_taobench_slow_ops";
 pub(crate) const TOTAL_TAOBENCH_WALL_SEC: &str = "total_taobench_wall_sec";
+// CPU-SECOND window: Σ client-thread CLOCK_THREAD_CPUTIME_ID (Counter
+// component) — the DENOMINATOR of the three `taobench_*_ops_per_sec` Rates
+// below (CPU-second denominated: ops per CPU-second the client threads
+// actually received; dilation-safe, wall reconstructs as `rate / D` or
+// exactly as Σops / `total_taobench_wall_sec`, which stays as window
+// evidence). Same Rate key names as the historical wall rates — the
+// sidecar-level `throughput_denomination` marker gates cross-era comparison.
+pub(crate) const TOTAL_TAOBENCH_CPU_SEC: &str = "total_taobench_cpu_sec";
 pub(crate) const TAOBENCH_TOTAL_OPS_PER_SEC: &str = "taobench_total_ops_per_sec";
 pub(crate) const TAOBENCH_FAST_OPS_PER_SEC: &str = "taobench_fast_ops_per_sec";
 pub(crate) const TAOBENCH_SLOW_OPS_PER_SEC: &str = "taobench_slow_ops_per_sec";
@@ -3172,14 +3192,18 @@ pub static METRICS: &[MetricDef] = &[
     // taobench per-phase qps + hit ratios (WorkType::Taobench engine, derived by
     // write_taobench_scalars). total/fast qps HigherBetter (throughput); slow_qps
     // + hit_ratio + hit_rate Informational (a component / run-validity signals,
-    // never a regression direction — see classify_direction).
+    // never a regression direction — see classify_direction). The qps keys are
+    // CPU-SECOND denominated (ops per client CPU-second received — dilation-safe;
+    // wall reconstructs as rate / D via the sidecar's host_dilation); the
+    // sidecar-level `throughput_denomination` marker gates comparison against
+    // wall-era sidecars carrying the same key names.
     MetricDef {
         name: TAOBENCH_TOTAL_QPS,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::PerPhase,
         default_abs: 10.0,
         default_rel: 0.10,
-        display_unit: "ops/s",
+        display_unit: "ops/cpu-s",
         accessor: |_| None,
     },
     MetricDef {
@@ -3188,7 +3212,7 @@ pub static METRICS: &[MetricDef] = &[
         kind: MetricKind::PerPhase,
         default_abs: 10.0,
         default_rel: 0.10,
-        display_unit: "ops/s",
+        display_unit: "ops/cpu-s",
         accessor: |_| None,
     },
     MetricDef {
@@ -3197,7 +3221,7 @@ pub static METRICS: &[MetricDef] = &[
         kind: MetricKind::PerPhase,
         default_abs: 10.0,
         default_rel: 0.10,
-        display_unit: "ops/s",
+        display_unit: "ops/cpu-s",
         accessor: |_| None,
     },
     MetricDef {
@@ -3320,10 +3344,11 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |_| None,
     },
     MetricDef {
-        // Whole-run wall window (ns→s applied once at the producer), the qps
-        // DENOMINATOR. Counter — cross-RUN SUM, mirroring `total_cpu_time_sec`,
-        // so Σops/Σwall re-pools the cohort throughput. `total_` prefix satisfies
-        // the Counter naming gate.
+        // Whole-run wall window (ns→s applied once at the producer). Counter —
+        // cross-RUN SUM, mirroring `total_cpu_time_sec`. NOT the qps
+        // denominator anymore (that is `total_taobench_cpu_sec`); kept as
+        // window EVIDENCE from which the wall picture reconstructs exactly
+        // (Σops / Σwall). `total_` prefix satisfies the Counter naming gate.
         name: TOTAL_TAOBENCH_WALL_SEC,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::Counter,
@@ -3333,37 +3358,53 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |_| None,
     },
     MetricDef {
-        // Whole-run total throughput = Σcompleted ops / Σwall-seconds.
-        // HigherBetter (throughput). Shares the per-phase `taobench_total_qps`
-        // thresholds. Absent when no Taobench cgroup ran or the wall window was
-        // unmeasured (components absent).
+        // Whole-run Σ client-thread CLOCK_THREAD_CPUTIME_ID window (ns→s at
+        // the producer) — the qps DENOMINATOR (rate component; suppressed).
+        // Dispatcher CPU excluded (modeled backing-store latency, not
+        // workload throughput CPU).
+        name: TOTAL_TAOBENCH_CPU_SEC,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Counter,
+        default_abs: 1.0,
+        default_rel: 0.30,
+        display_unit: "s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Whole-run total throughput = Σcompleted ops / Σclient CPU-seconds
+        // received (CPU-SECOND denominated — dilation-safe; the wall picture
+        // reconstructs as `rate / D` via the sidecar's `host_dilation`, or
+        // exactly as Σops / `total_taobench_wall_sec`). HigherBetter
+        // (throughput). Shares the per-phase `taobench_total_qps` thresholds.
+        // Absent when no Taobench cgroup ran or no client CPU was measured
+        // (components absent).
         name: TAOBENCH_TOTAL_OPS_PER_SEC,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::Rate {
             numerator: TOTAL_TAOBENCH_OPS,
-            denominator: TOTAL_TAOBENCH_WALL_SEC,
+            denominator: TOTAL_TAOBENCH_CPU_SEC,
         },
         default_abs: 10.0,
         default_rel: 0.10,
-        display_unit: "ops/s",
+        display_unit: "ops/cpu-s",
         accessor: |_| None,
     },
     MetricDef {
-        // Whole-run hit (fast-path) throughput = Σfast ops / Σwall-seconds.
-        // HigherBetter.
+        // Whole-run hit (fast-path) throughput = Σfast ops / Σclient
+        // CPU-seconds. HigherBetter.
         name: TAOBENCH_FAST_OPS_PER_SEC,
         polarity: crate::test_support::Polarity::HigherBetter,
         kind: MetricKind::Rate {
             numerator: TOTAL_TAOBENCH_FAST_OPS,
-            denominator: TOTAL_TAOBENCH_WALL_SEC,
+            denominator: TOTAL_TAOBENCH_CPU_SEC,
         },
         default_abs: 10.0,
         default_rel: 0.10,
-        display_unit: "ops/s",
+        display_unit: "ops/cpu-s",
         accessor: |_| None,
     },
     MetricDef {
-        // Whole-run slow-path throughput = Σslow ops / Σwall-seconds.
+        // Whole-run slow-path throughput = Σslow ops / Σclient CPU-seconds.
         // Informational — the slow path is a component of total throughput, not a
         // standalone regression direction (mirrors the per-phase
         // `taobench_slow_qps`).
@@ -3371,11 +3412,11 @@ pub static METRICS: &[MetricDef] = &[
         polarity: crate::test_support::Polarity::Informational,
         kind: MetricKind::Rate {
             numerator: TOTAL_TAOBENCH_SLOW_OPS,
-            denominator: TOTAL_TAOBENCH_WALL_SEC,
+            denominator: TOTAL_TAOBENCH_CPU_SEC,
         },
         default_abs: 10.0,
         default_rel: 0.10,
-        display_unit: "ops/s",
+        display_unit: "ops/cpu-s",
         accessor: |_| None,
     },
     MetricDef {
@@ -3572,6 +3613,48 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 1.0,
         default_rel: 0.10,
         display_unit: "",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Whole-run Σ worker CLOCK_THREAD_CPUTIME_ID window (s) — the
+        // CPU-second throughput denominator (rate component; suppressed).
+        // Message-thread CPU excluded (schbench's Σ worker runtimes analog).
+        name: TOTAL_SCHBENCH_WORKER_CPU_SEC,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Counter,
+        default_abs: 1.0,
+        default_rel: 0.30,
+        display_unit: "s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Whole-run CPU-SECOND throughput: Σ completed cycles / Σ worker
+        // CPU-seconds received. Dilation-safe (host preemption inflates wall,
+        // not CPU); the wall picture reconstructs as `rate / D` via the
+        // sidecar's `host_dilation`. HigherBetter; shares the throughput
+        // rel 0.10 of its numerator `total_schbench_loops`.
+        name: SCHBENCH_TOTAL_LOOPS_PER_CPU_SEC,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Rate {
+            numerator: TOTAL_SCHBENCH_LOOPS,
+            denominator: TOTAL_SCHBENCH_WORKER_CPU_SEC,
+        },
+        default_abs: 1.0,
+        default_rel: 0.10,
+        display_unit: "ops/cpu-s",
+        accessor: |_| None,
+    },
+    MetricDef {
+        // Per-phase CPU-SECOND throughput: the phase's completed cycles per
+        // worker CPU-second received (same denomination as the whole-run
+        // Rate above; PerPhase twin of `schbench_loop_count`'s window, with
+        // the same small-sample-window rel 0.30 as `schbench_loop_count`).
+        name: SCHBENCH_LOOPS_PER_CPU_SEC,
+        polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::PerPhase,
+        default_abs: 1.0,
+        default_rel: 0.30,
+        display_unit: "ops/cpu-s",
         accessor: |_| None,
     },
     MetricDef {
@@ -4128,6 +4211,7 @@ const RENDER_SUPPRESSED_COMPONENTS: &[&str] = &[
     TOTAL_TAOBENCH_FAST_OPS,
     TOTAL_TAOBENCH_SLOW_OPS,
     TOTAL_TAOBENCH_WALL_SEC,
+    TOTAL_TAOBENCH_CPU_SEC,
     // taobench command-time hit Rate components (get_cmds + get_hits): suppressed
     // so compare shows `taobench_command_hit_rate`, not the raw get counts; remain
     // in the row for the cross-RUN Σhits/Σcmds re-pool.
@@ -4142,6 +4226,9 @@ const RENDER_SUPPRESSED_COMPONENTS: &[&str] = &[
     TOTAL_SCHBENCH_MSG_PCOUNT,
     TOTAL_SCHBENCH_WORKER_RUN_DELAY_NS,
     TOTAL_SCHBENCH_WORKER_PCOUNT,
+    // CPU-second throughput denominator (schbench_total_loops_per_cpu_sec's
+    // component); suppressed like the wall/cpu windows above.
+    TOTAL_SCHBENCH_WORKER_CPU_SEC,
 ];
 
 /// True when `name` is a Rate component suppressed from compare output (see

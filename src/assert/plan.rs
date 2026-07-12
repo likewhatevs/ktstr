@@ -1131,7 +1131,9 @@ impl AssertPlan {
             }
         }
         // Custom gap threshold — independent of `not_stuck`. Strip any
-        // default-threshold Stuck outcome before re-evaluating.
+        // default-threshold Stuck outcome before re-evaluating. The gap is
+        // CPU-time between progress checkpoints (see
+        // `WorkerReport::max_gap_ms`); the wall gap rides as evidence.
         if let Some(threshold) = self.max_gap_ms {
             r.outcomes
                 .retain(|o| !matches!(o, Outcome::Fail(d) if d.kind == DetailKind::Stuck));
@@ -1140,8 +1142,14 @@ impl AssertPlan {
                     r.record_fail(AssertDetail::new(
                         DetailKind::Stuck,
                         format!(
-                            "tid {} stuck {}ms on cpu{} at +{}ms (threshold {}ms)",
-                            w.tid, w.max_gap_ms, w.max_gap_cpu, w.max_gap_at_ms, threshold,
+                            "tid {} stuck {}ms cpu-gap on cpu{} at +{}ms (threshold {}ms, \
+                             wall gap {}ms)",
+                            w.tid,
+                            w.max_gap_ms,
+                            w.max_gap_cpu,
+                            w.max_gap_at_ms,
+                            threshold,
+                            w.max_gap_wall_ms,
                         ),
                     ));
                 }

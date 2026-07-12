@@ -39,6 +39,7 @@ fn sps(loop_count: u64, msg_pc: u64, worker_pc: u64) -> SchbenchPhaseStats {
         worker_run_delay_ns: 80_000,
         worker_pcount: worker_pc,
         loop_count,
+        worker_cpu_ns: 0,
     }
 }
 

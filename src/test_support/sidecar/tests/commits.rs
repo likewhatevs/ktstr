@@ -384,6 +384,8 @@ fn sidecar_payload_and_metrics_always_emit_when_empty() {
         scheduler: _,
         vcpus: _,
         cpu_budget: _,
+        host_dilation: _,
+        throughput_denomination: _,
         scheduler_commit,
         project_commit,
         payload,

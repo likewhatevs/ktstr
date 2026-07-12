@@ -100,6 +100,44 @@ use crate::vmm;
 use super::entry::KtstrTestEntry;
 use super::timefmt::{generate_run_id, now_iso8601};
 
+/// Which time base denominates this sidecar's workload-THROUGHPUT rate
+/// metrics (`taobench_*_qps` / `taobench_*_ops_per_sec` /
+/// `schbench_*loops_per_cpu_sec` / `iterations_per_cpu_sec`, and any future
+/// throughput rate). The rate KEY NAMES did not change when the denomination
+/// moved from wall-clock to CPU-seconds, so a number from a wall-era sidecar
+/// is NOT comparable to the same key from a cpu-era sidecar — the compare
+/// pipeline keys its row pairing and its group-averaging on this marker so
+/// cross-denomination values are never silently folded or diffed (see
+/// `PairingKey::from_row` and the `denomination_mismatches` counter in
+/// `CompareReport`).
+///
+/// Event-frequency metrics (IRQ/sec, per-second RPS samples) and latency
+/// metrics are wall-based in BOTH eras — a frequency's meaning is real time —
+/// so they are outside this marker's scope.
+///
+/// `#[serde(default)]` on the carrying field + `Default = Wall`: a sidecar
+/// written before the marker existed is by definition wall-era.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThroughputDenomination {
+    /// Throughput rates are work / wall-second (pre-marker sidecars).
+    #[default]
+    Wall,
+    /// Throughput rates are work / CPU-second received
+    /// (`CLOCK_THREAD_CPUTIME_ID`) — the current denomination.
+    CpuSec,
+}
+
+impl ThroughputDenomination {
+    /// Stable string form used in pairing keys and diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThroughputDenomination::Wall => "wall",
+            ThroughputDenomination::CpuSec => "cpu_sec",
+        }
+    }
+}
+
 /// Test result sidecar written to KTSTR_SIDECAR_DIR for post-run analysis.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct SidecarResult {
@@ -292,6 +330,28 @@ pub struct SidecarResult {
     pub vcpus: u32,
     /// See [`Self::vcpus`].
     pub cpu_budget: u32,
+    /// Host-side vCPU scheduling dilation for this run — the
+    /// `HostVcpuSchedstat::dilation` ratio `1 + Σrun_delay/Σon_cpu`
+    /// over the vCPU host threads. `> 1.0`
+    /// quantifies how much the HOST time-sliced the guest's vCPUs; the
+    /// direct EVIDENCE behind the `cpu_budget < vcpus` overcommit marker
+    /// (a run can overcommit on paper yet see D≈1.0 if the host was
+    /// otherwise idle). `None` when no vCPU ran or the host lacks
+    /// `CONFIG_SCHEDSTATS` (every schedstat line reads `0 0 0`) — kept
+    /// distinguishable from a genuine `D == 1.0`.
+    ///
+    /// `#[serde(default)]`: sidecars written before this field existed
+    /// deserialize with `None` (disposable schema; a re-run repopulates).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_dilation: Option<f64>,
+    /// Denomination of this sidecar's workload-throughput rate metrics.
+    /// `#[serde(default)]` = [`ThroughputDenomination::Wall`] for
+    /// pre-marker sidecars; the writer stamps the current
+    /// [`ThroughputDenomination::CpuSec`]. Keys row pairing and group
+    /// averaging in the compare pipeline so cross-denomination values are
+    /// never silently compared (see the enum doc).
+    #[serde(default)]
+    pub throughput_denomination: ThroughputDenomination,
     /// Ordered stimulus events published by the guest step executor
     /// while the scenario ran.
     pub stimulus_events: Vec<StimulusEvent>,
@@ -649,6 +709,8 @@ impl SidecarResult {
             periodic_target: 0,
             vcpus: 1,
             cpu_budget: 1,
+            host_dilation: None,
+            throughput_denomination: ThroughputDenomination::CpuSec,
             stimulus_events: Vec::new(),
             work_type: "SpinWait".to_string(),
             verifier_stats: Vec::new(),
@@ -3891,6 +3953,11 @@ pub(crate) fn write_skip_sidecar(
         // value, marks them).
         vcpus: 0,
         cpu_budget: 0,
+        // A skip never booted the VM, so no vCPU schedstat was sampled.
+        host_dilation: None,
+        // Era marker: even a skip row carries the current denomination so a
+        // pool never mixes eras within one marker value.
+        throughput_denomination: ThroughputDenomination::CpuSec,
         stimulus_events: Vec::new(),
         // A skip never ran the workload, but it carries the SAME
         // work_type a run of this config would (current_work_type reads
@@ -4063,6 +4130,12 @@ pub(crate) fn write_sidecar(
         periodic_target: vm_result.periodic_target,
         vcpus: vm_result.vcpus,
         cpu_budget: vm_result.cpu_budget,
+        // Measured host dilation (evidence for the overcommit marker),
+        // derived from the run's raw vCPU-thread schedstat totals.
+        host_dilation: vm_result.host_vcpu_schedstat.and_then(|s| s.dilation()),
+        // Era marker: this build's throughput rates are CPU-second
+        // denominated (see ThroughputDenomination).
+        throughput_denomination: ThroughputDenomination::CpuSec,
         stimulus_events: stimulus_events.to_vec(),
         work_type: work_type.to_string(),
         verifier_stats: vm_result.verifier_stats.clone(),

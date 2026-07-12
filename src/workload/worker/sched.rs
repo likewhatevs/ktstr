@@ -232,7 +232,11 @@ pub(super) fn warn_clock_gettime_failed_once(clk: libc::clockid_t) {
 /// since 2.6.12). If this lands in a hostile environment where
 /// failure is real, callers should migrate to `clock_gettime_ns`
 /// directly and handle `None`.
-pub(super) fn thread_cpu_time_ns() -> u64 {
+///
+/// `pub(crate)`: also read by the schbench / taobench engine threads
+/// (their per-phase and whole-run CPU-second throughput denominators),
+/// which live outside `workload::worker`.
+pub(crate) fn thread_cpu_time_ns() -> u64 {
     clock_gettime_ns(libc::CLOCK_THREAD_CPUTIME_ID).unwrap_or(0)
 }
 

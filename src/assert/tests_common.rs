@@ -25,6 +25,8 @@ pub fn rpt(
         cpus_used: cpus.iter().copied().collect(),
         migrations: vec![],
         max_gap_ms: gap_ms,
+        // Wall evidence mirrors the cpu gap in fixtures (an undilated run).
+        max_gap_wall_ms: gap_ms,
         max_gap_cpu: cpus.first().copied().unwrap_or(0),
         max_gap_at_ms: 1000,
         wake_latencies_ns: vec![],
@@ -66,6 +68,7 @@ pub fn rpt_with_latencies(
         cpus_used: [0].into_iter().collect(),
         migrations: vec![],
         max_gap_ms: 50,
+        max_gap_wall_ms: 50,
         max_gap_cpu: 0,
         max_gap_at_ms: 1000,
         wake_latencies_ns: latencies,

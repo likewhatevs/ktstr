@@ -915,19 +915,25 @@ fn sched_goidle_fraction_derives_and_pools_sigma_over_sigma() {
 
 /// Whole-run taobench qps + hit Rates derive per-run from their Counter ext
 /// components and pool Σ/Σ across runs (the `MetricKind::Rate` cross-run fold),
-/// NOT a mean of per-run qps. Unequal wall windows make the two disagree: run A
-/// 900 fast + 100 slow over 1 s, run B 100 fast + 2900 slow over 99 s. Σfast
-/// 1000, Σslow 3000, Σops 4000, Σwall 100 s → total 40/s, fast 10/s, slow 30/s,
-/// hit 1000/4000 = 0.25; the mean-of-ratios would give ~515 / ~451 / ~65 / 0.47.
+/// NOT a mean of per-run qps. The denominator is the CPU-second window
+/// (`total_taobench_cpu_sec`); the wall window stays a pooled Counter
+/// component (evidence). Unequal CPU windows make the two disagree: run A
+/// 900 fast + 100 slow over 1 cpu-s, run B 100 fast + 2900 slow over 99
+/// cpu-s. Σfast 1000, Σslow 3000, Σops 4000, Σcpu 100 s → total 40/cpu-s,
+/// fast 10/cpu-s, slow 30/cpu-s, hit 1000/4000 = 0.25; the mean-of-ratios
+/// would give ~515 / ~451 / ~65 / 0.47.
 #[test]
 fn taobench_whole_run_rates_derive_and_pool_sigma_over_sigma() {
-    let mk = |fast: f64, slow: f64, wall: f64| {
+    let mk = |fast: f64, slow: f64, cpu: f64| {
         let mut r = make_row("t", "tiny-1llc", true, 0.0);
         r.ext_metrics
             .insert("total_taobench_ops".into(), fast + slow);
         r.ext_metrics.insert("total_taobench_fast_ops".into(), fast);
         r.ext_metrics.insert("total_taobench_slow_ops".into(), slow);
-        r.ext_metrics.insert("total_taobench_wall_sec".into(), wall);
+        // Wall window rides as a pooled component (evidence); the rates
+        // divide by the CPU window below.
+        r.ext_metrics.insert("total_taobench_wall_sec".into(), cpu);
+        r.ext_metrics.insert("total_taobench_cpu_sec".into(), cpu);
         r
     };
     let read = |row: &_, name: &str| metric_def(name).unwrap().read(row).expect("rate derived");
@@ -967,7 +973,7 @@ fn taobench_whole_run_rates_derive_and_pool_sigma_over_sigma() {
     let total = read(row, "taobench_total_ops_per_sec");
     assert!(
         (total - 40.0).abs() < 1e-9,
-        "Σops/Σwall = 4000/100 = 40, got {total} (mean-of-ratios ~515)",
+        "Σops/Σcpu = 4000/100 = 40, got {total} (mean-of-ratios ~515)",
     );
     assert!((read(row, "taobench_fast_ops_per_sec") - 10.0).abs() < 1e-9);
     assert!((read(row, "taobench_slow_ops_per_sec") - 30.0).abs() < 1e-9);

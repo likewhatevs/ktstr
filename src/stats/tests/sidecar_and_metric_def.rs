@@ -1607,6 +1607,7 @@ fn throughput_rate_floors_are_near_idle() {
         "softirq/s",
         "iter/s",
         "iter/cpu-s",
+        "ops/cpu-s",
     ];
     for m in METRICS {
         // Throughput carriers: Rate, plus the phase-aware kinds that hold a
@@ -1829,6 +1830,7 @@ fn all_metric_units_are_known() {
         "softirq/s",  // softirq rate (varying)
         "iter/s",     // iteration rate (varying)
         "iter/cpu-s", // overcommit-invariant iteration rate (varying)
+        "ops/cpu-s",  // CPU-second-denominated ops throughput (varying)
     ];
     for m in METRICS {
         assert!(
