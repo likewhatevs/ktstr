@@ -509,7 +509,7 @@ pub struct VmResult {
     /// monitor assembles it per tick off the same lifecycle-stage machinery
     /// the watchdog uses. `None` when the monitor did not run, ran without a
     /// progress ledger, or sampled no vCPU TIDs. Consumed by a LATER seam
-    /// pass — [`crate::vmm::freeze_coord::latency_verdict::latency_verdict`]
+    /// pass — `latency_verdict`
     /// — to make latency threshold verdicts tri-state under contention;
     /// purely observational until then.
     pub contention_witness: Option<ContentionWitness>,
@@ -1452,7 +1452,7 @@ impl HostVcpuSchedstat {
     }
 }
 
-/// Number of [`crate::monitor::LifecycleStage`] variants (Boot, Attach,
+/// Number of `LifecycleStage` variants (Boot, Attach,
 /// Dispatch, Body, Teardown) — the length of the per-phase witness array.
 /// Kept in lock-step with that enum; [`PerPhaseSchedstat::for_stage`] indexes
 /// by `stage as usize`, so a new stage variant needs this bumped.
@@ -1460,14 +1460,14 @@ pub const NUM_LIFECYCLE_STAGES: usize = 5;
 
 /// Array index of the BODY stage (the measurement phase) — pinned to the
 /// enum discriminant so it can never drift from
-/// [`crate::monitor::LifecycleStage::Body`].
+/// `LifecycleStage::Body`.
 pub const BODY_STAGE_INDEX: usize = crate::monitor::LifecycleStage::Body as usize;
 
 /// Per-lifecycle-phase host-dilation witness: one [`HostVcpuSchedstat`] DELTA
 /// per stage, each covering exactly its own stage's span (the schedstat
 /// accrued between the phase-boundary snapshots the monitor takes when it
 /// observes a lifecycle stage advance). Indexed by
-/// [`crate::monitor::LifecycleStage`] `as usize`.
+/// `LifecycleStage` `as usize`.
 ///
 /// Distinct from the whole-run [`VmResult::host_vcpu_schedstat`] (which is
 /// the verdict-line `D` over the entire run): here each phase gets its OWN
@@ -1505,7 +1505,7 @@ impl PerPhaseSchedstat {
 
     /// The schedstat delta for one lifecycle stage (diagnostic access to the
     /// Boot/Attach/Dispatch/Teardown phases). `pub(crate)`: takes the
-    /// crate-internal [`crate::monitor::LifecycleStage`]. `allow(dead_code)`:
+    /// crate-internal `LifecycleStage`. `allow(dead_code)`:
     /// the diagnostic Boot/Attach `D` readers land with the LATER seam pass;
     /// `body()` is the wired accessor.
     #[allow(dead_code)]
@@ -1517,14 +1517,14 @@ impl PerPhaseSchedstat {
 /// Body-phase peak-window contamination series: the per-tick TOTAL host
 /// run-delay deltas (Σ over the vCPU threads) the monitor accrued during the
 /// Body phase, one entry per monitor tick. Feeds
-/// [`crate::vmm::freeze_coord::latency_verdict::peak_window_delay_ns`], which
+/// `peak_window_delay_ns`, which
 /// slides a window of `ceil(L / tick_ns) + 1` ticks (the +1 covers grid
 /// straddle) to bound `W(L)` — the worst host contamination any `L`-long
 /// interval of the phase could contribute.
 ///
 /// Bounded storage: ticks are 100 ms and Body phases run minutes, so a few
 /// thousand entries is typical; the series is capped and `saturated` is set
-/// if the cap is hit (see [`crate::monitor::reader::BODY_TICK_CAP`]). When
+/// if the cap is hit (see `BODY_TICK_CAP`). When
 /// `saturated`, the series is a PREFIX of the phase, so `W` computed from it
 /// is a LOWER bound — a later verdict pass should treat that as reducing
 /// confidence in a `FailConfirmed` rather than trusting a possibly-short `W`.
@@ -1544,7 +1544,7 @@ pub struct BodyContentionWindow {
 /// The Body-phase contention witness assembled by the monitor: the per-phase
 /// dilation array plus the Body-phase peak-window run-delay series. Carried
 /// on [`VmResult::contention_witness`] so a later seam pass can call
-/// [`crate::vmm::freeze_coord::latency_verdict::latency_verdict`] to turn a
+/// `latency_verdict` to turn a
 /// latency threshold into a tri-state, contention-aware verdict.
 ///
 /// `None` on [`VmResult`] when the monitor did not run, ran without a

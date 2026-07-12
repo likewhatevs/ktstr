@@ -921,8 +921,13 @@ pub mod prelude {
     // Surfaced for `#[ktstr_test(post_vm = ...)]` callbacks: the
     // hook signature is `fn(&VmResult) -> anyhow::Result<()>`, and
     // a test author writing the callback needs the type in scope
-    // to declare the parameter.
+    // to declare the parameter. The contention-witness types ride
+    // along: they are the public `VmResult::contention_witness`
+    // payload a callback destructures.
     pub use crate::vmm::VmResult;
+    pub use crate::vmm::{
+        BodyContentionWindow, ContentionWitness, HostVcpuSchedstat, PerPhaseSchedstat,
+    };
     pub use crate::vmm::disk_config::{
         DiskConfig, DiskThrottle, DiskThrottleValidationError, Filesystem, ThrottleDimension,
     };

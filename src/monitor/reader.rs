@@ -1742,7 +1742,8 @@ impl VcpuTiming {
     }
 
     /// Live vCPU TIDs (`Acquire`-loaded from [`Self::tids`]) for a schedstat
-    /// read. Includes 0-slots verbatim — [`read_host_vcpu_schedstat`] skips
+    /// read. Includes 0-slots verbatim —
+    /// [`crate::vmm::freeze_coord::read_host_vcpu_schedstat`] skips
     /// them — so the returned length tracks the configured vCPU count, not
     /// the number that have stamped yet. Empty when no TID slots were wired.
     fn live_tids(&self) -> Vec<i32> {
