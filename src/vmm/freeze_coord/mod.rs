@@ -296,8 +296,14 @@ pub(crate) enum KillReasonTag {
     /// Tier-2: no progress past the phase wall backstop with no runnable
     /// demand — a silent idle wedge (`KillDecision::Tier2IdleWedge`).
     Tier2Idle = 2,
-    /// Tier-3: the guest-derived hard deadline expired — the deadman
-    /// backstop that governs even when the progress tiers are suppressed.
+    /// Tier-3: the guest-derived hard deadline expired AND the deadman was
+    /// not deferred — the monitor was dead (`!monitor_live`) or the cell
+    /// was inert (CPU trickle-stalled AND no milestone within
+    /// [`watchdog_step::TIER3_PROGRESS_GRACE_NS`]). NOT an unconditional
+    /// wall clock: a starved-but-alive cell (still accruing CPU) outlives
+    /// the wall deadline by design and is bounded by the harness/operator
+    /// instead; the deadman only kills when the machinery is dead or the
+    /// cell is wedged.
     Tier3Deadman = 3,
     /// An AP set the kill flag (a panic-driven kill), not a watchdog
     /// timeout. Distinct so the dump does not mislabel it as an expiry.
@@ -11222,6 +11228,19 @@ impl KtstrVm {
                 // is set; absent, the load is skipped entirely
                 // (no workload duration → nothing to reset to).
                 let mut reset_deadline: Option<Instant> = None;
+                // Tier-2 / Tier-3 CPU-trickle discriminator. Folds the
+                // ledger's summed `cpu_ns_now` over a trailing window into
+                // a "receiving essentially no CPU" verdict, telling a
+                // starved-but-alive cell (keeps accruing CPU → not
+                // stalled) apart from an idle/wedged one (ISR-only µs →
+                // stalled). See [`watchdog_step::CpuTrickleTracker`].
+                let mut trickle = watchdog_step::CpuTrickleTracker::new();
+                // Tier-3 deadman deferral bookkeeping. `deadman_deferrals`
+                // counts ticks the wall deadline was reached but the
+                // deadman deferred (cell alive); folded into the eventual
+                // kill dump so a deferred-then-killed cell shows its
+                // history.
+                let mut deadman_deferrals: u64 = 0;
                 if crate::vmm::debug_logging_enabled() {
                     eprintln!("watchdog: started, timeout={timeout:?}");
                 }
@@ -11334,9 +11353,23 @@ impl KtstrVm {
                     let snapshot = progress_ledger_for_wd.snapshot();
                     let monitor_live = monitor_liveness.observe(snapshot.monitor_heartbeat);
                     let now_wall_ns = run_start.elapsed().as_nanos() as u64;
+                    // CPU-trickle verdict for this tick — the load-bearing
+                    // discriminator for Tier-2 and the Tier-3 deferral.
+                    // Fed the ledger's summed CPU and a run_start-relative
+                    // wall reading; reports whether the guest is receiving
+                    // essentially no CPU over the trailing window.
+                    let cpu_trickle_stalled = trickle.observe(snapshot.cpu_ns_now, now_wall_ns);
+                    // Wall time since the last MILESTONE (progress_epoch
+                    // anchor) — milestone-only, so a live kernel's
+                    // scheduling noise never resets it. Same quantity as
+                    // Tier-2's `wall_in_phase` (a phase entry is a
+                    // milestone); reused by the deadman deferral gate.
+                    let wall_since_milestone_ns =
+                        now_wall_ns.saturating_sub(snapshot.wall_ns_at_progress);
                     let progress_decision = watchdog_step::evaluate_progress(
                         &snapshot,
                         now_wall_ns,
+                        cpu_trickle_stalled,
                         monitor_live,
                         wd_vcpus,
                     );
@@ -11346,10 +11379,24 @@ impl KtstrVm {
                     );
                     let effective_deadline =
                         reset_deadline.map_or(hard_deadline, |r| r.max(hard_deadline));
-                    if kill_for_watchdog.load(Ordering::Acquire)
-                        || Instant::now() >= effective_deadline
-                        || tier_fire
-                    {
+                    let kill_set = kill_for_watchdog.load(Ordering::Acquire);
+                    let hard_deadline_reached = Instant::now() >= effective_deadline;
+                    // Tier-3 deadman deferral: reaching the wall deadline
+                    // only KILLS when the monitor is dead or the cell is
+                    // inert (CPU trickle-stalled AND no milestone within
+                    // the grace). A starved-but-alive cell keeps accruing
+                    // CPU → not stalled → deferred past the wall deadline
+                    // by design (bounded by the harness/operator). A
+                    // userspace-wedged cell on a live kernel trickle-stalls
+                    // and reaches no milestone → fires here, BOUNDED. See
+                    // [`watchdog_step::deadman_should_fire`].
+                    let deadman_fire = hard_deadline_reached
+                        && watchdog_step::deadman_should_fire(
+                            monitor_live,
+                            wall_since_milestone_ns,
+                            cpu_trickle_stalled,
+                        );
+                    if kill_set || deadman_fire || tier_fire {
                         // A progress tier fired, an AP set kill, or the
                         // hard timeout expired.
                         // Re-check bsp_done: if the BSP already exited its
@@ -11362,7 +11409,13 @@ impl KtstrVm {
                             }
                             return;
                         }
-                        let hard_timeout_fired = Instant::now() >= effective_deadline;
+                        // The deadman is the CAUSE only when it actually
+                        // fired (wall deadline reached AND not deferred),
+                        // not merely because the wall deadline passed while
+                        // the cell stayed alive. So a kill_set arriving
+                        // past a deferred deadline is labeled AP-kill, not
+                        // Tier-3, and does not set `timed_out`.
+                        let hard_timeout_fired = deadman_fire;
                         // Cause precedence: a progress-tier verdict is the
                         // most specific (it names WHICH wedge), so it wins
                         // over the generic hard deadline; the AP-set kill
@@ -11425,22 +11478,20 @@ impl KtstrVm {
                             watchdog_reset_tag_for_wd.load(Ordering::Relaxed),
                         )
                         .render();
-                        // Progress evidence for the dump, from this tick's
-                        // ledger snapshot. `cpu_in_phase` is CPU
-                        // burned in the current stage; `cpu_since_progress`
-                        // / `wall_since_progress` are the deltas the tiers
-                        // compare against the (currency-widened) CPU budget
-                        // and the wall backstop. The `u64::MAX` sentinel
-                        // budgets (Body / unmodeled phase) render as `off`
-                        // rather than an absurd Duration.
+                        // Evidence for the dump, from this tick's ledger
+                        // snapshot. `cpu_in_phase` (CPU burned since the
+                        // phase/milestone was entered) is what Tier-1
+                        // compares against the currency-widened budget;
+                        // `wall_in_phase` (wall since the last milestone)
+                        // is what Tier-2 / the deadman compare against the
+                        // backstop / grace. The `u64::MAX` sentinel budgets
+                        // (Body / unmodeled phase) render as `off` rather
+                        // than an absurd Duration.
                         let stage = crate::monitor::LifecycleStage::from_u8(snapshot.phase);
                         let cpu_in_phase = snapshot
                             .cpu_ns_now
                             .saturating_sub(snapshot.cpu_ns_at_phase);
-                        let cpu_since_progress = snapshot
-                            .cpu_ns_now
-                            .saturating_sub(snapshot.cpu_ns_at_progress);
-                        let wall_since_progress =
+                        let wall_in_phase =
                             now_wall_ns.saturating_sub(snapshot.wall_ns_at_progress);
                         let cpu_budget = watchdog_step::widened_cpu_budget_ns(
                             snapshot.phase,
@@ -11481,29 +11532,34 @@ impl KtstrVm {
                              hard_timeout_fired={hard_timeout_fired}, kill_set_by_AP={}",
                             reason_tag == KillReasonTag::ApKill
                         );
-                        // Progress-tier evidence block. `monitor_live` gates
-                        // BOTH progress tiers — when false the tiers were
-                        // suppressed and this kill is Tier-3 / AP only.
+                        // Evidence block. `monitor_live` gates BOTH
+                        // progress tiers; `evidence_channels_live` gates
+                        // Tier-2 specifically (per-CPU guest reads
+                        // resolved this tick) — when false, `runnable_demand`
+                        // is blind and Tier-2 was suppressed, so an
+                        // early-boot kill here is Tier-1 / Tier-3 only.
                         eprintln!(
-                            "  phase={stage:?} ({:?}), monitor_live={monitor_live}",
-                            stage.class()
+                            "  phase={stage:?} ({:?}), monitor_live={monitor_live}, \
+                             evidence_channels_live={}",
+                            stage.class(),
+                            snapshot.evidence_channels_live,
                         );
                         eprintln!(
-                            "  cpu_in_phase={:?}, cpu_since_progress={:?} vs budget={} \
-                             (currency={cpu_currency_str})",
+                            "  cpu_in_phase={:?} vs budget={} (currency={cpu_currency_str}), \
+                             cpu_trickle_stalled={cpu_trickle_stalled}",
                             Duration::from_nanos(cpu_in_phase),
-                            Duration::from_nanos(cpu_since_progress),
                             render_budget(cpu_budget),
                         );
                         eprintln!(
-                            "  wall_since_progress={:?} vs backstop={}",
-                            Duration::from_nanos(wall_since_progress),
+                            "  wall_in_phase={:?} vs backstop={}",
+                            Duration::from_nanos(wall_in_phase),
                             render_budget(wall_backstop),
                         );
                         eprintln!(
-                            "  progress_epoch={} (age={:?}), runnable_demand={}",
+                            "  progress_epoch={} (milestones), wall_since_milestone={:?}, \
+                             runnable_demand={}, deadman_deferrals={deadman_deferrals}",
                             snapshot.progress_epoch,
-                            Duration::from_nanos(wall_since_progress),
+                            Duration::from_nanos(wall_since_milestone_ns),
                             snapshot.runnable_demand,
                         );
                         eprintln!(
@@ -11566,9 +11622,32 @@ impl KtstrVm {
                     // no soft phase configured) — the reset path
                     // inherits that decision rather than
                     // synthesising a soft phase out of nothing.
+                    //
+                    // Tier-3 deferral consistency: the soft request PRECEDES
+                    // the hard fire (3 s before), so it is gated by the SAME
+                    // deferral predicate — only nudge the guest toward a
+                    // flush+reboot when the deadman WOULD fire (monitor dead
+                    // or cell inert). A starved-but-alive cell is deferred,
+                    // so it must never be told to shut down: that would kill
+                    // the very cell the deferral protects. Once the wall
+                    // deadline is reached but deferred, count it (no
+                    // per-tick log — would spam for the whole deferral span)
+                    // and skip soft entirely.
                     let effective_soft = soft_deadline
                         .and_then(|_| effective_deadline.checked_sub(Duration::from_secs(3)));
-                    if !soft_fired && effective_soft.is_some_and(|d| Instant::now() >= d) {
+                    if hard_deadline_reached {
+                        // Reached the wall deadline this tick but did not
+                        // fire (deadman deferred; kill/tier not set) — the
+                        // cell is alive but past its budget.
+                        deadman_deferrals = deadman_deferrals.saturating_add(1);
+                    } else if !soft_fired
+                        && effective_soft.is_some_and(|d| Instant::now() >= d)
+                        && watchdog_step::deadman_should_fire(
+                            monitor_live,
+                            wall_since_milestone_ns,
+                            cpu_trickle_stalled,
+                        )
+                    {
                         soft_fired = true;
                         eprintln!("watchdog: soft deadline, requesting graceful shutdown");
                         super::host_comms::request_shutdown(&wd_virtio_con);

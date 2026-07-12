@@ -20,7 +20,7 @@ use super::btf_offsets::{
 };
 use super::{
     BpfMapFieldSample, CpuSnapshot, Kva, MonitorSample, ProgressLedger, RqSchedstat,
-    SchedDomainSnapshot, SchedDomainStats, ScxEventCounters, progress_evidence,
+    SchedDomainSnapshot, SchedDomainStats, ScxEventCounters,
 };
 use crate::sync::MutexExt;
 
@@ -3324,6 +3324,33 @@ pub(crate) fn monitor_loop(
             per_cpu_offsets_buf = fresh;
         }
 
+        // Host-side per-vCPU timing sources, read EVERY tick independent
+        // of guest-memory resolution: the pthread CPU clocks and the PMU
+        // SW task-clock read host thread / fd state, not the guest's
+        // `struct rq`. Pre-boot — before the guest populates its per-CPU
+        // runqueue structures and `data_valid` latches, so `cpus` is still
+        // empty — these are the ONLY CPU-time evidence available, so the
+        // progress ledger below sources `cpu_ns_now` from them DIRECTLY
+        // rather than summing (absent) `CpuSnapshot` fields. Stamped into
+        // `cpus` for the stuck-detection paths only when `data_valid`.
+        let pthread_times: Vec<Option<u64>> = vcpu_timing
+            .map(|vt| vt.read_cpu_times(&mut vcpu_timing_err_reported))
+            .unwrap_or_default();
+        let perf_samples: Option<Vec<super::perf_counters::VcpuPerfSample>> =
+            perf_capture.and_then(|pc| match pc.read_all() {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    if !perf_read_err_reported {
+                        tracing::warn!(
+                            err = %e,
+                            "perf counter read failed; vcpu_perf will be None until next successful sample"
+                        );
+                        perf_read_err_reported = true;
+                    }
+                    None
+                }
+            });
+
         // Pre-validity short circuit: skip every guest-memory walk
         // until both `__per_cpu_offset[]` and `page_offset` are
         // resolved. See the `data_valid` declaration for why
@@ -3374,41 +3401,32 @@ pub(crate) fn monitor_loop(
                 }
             }
 
-            // Stamp vCPU CPU times into the per-CPU snapshots. Reactive
-            // stuck detection below reads these via `is_cpu_stuck`; the
-            // post-hoc `MonitorThresholds::evaluate` path reads them off
-            // the pushed samples.
-            if let Some(vt) = vcpu_timing {
-                let times = vt.read_cpu_times(&mut vcpu_timing_err_reported);
+            // Stamp vCPU CPU times into the per-CPU snapshots from the
+            // `pthread_times` read once above (independent of guest-memory
+            // resolution; the ledger sources its CPU currency from the
+            // same read). Reactive stuck detection below reads these via
+            // `is_cpu_stuck`; the post-hoc `MonitorThresholds::evaluate`
+            // path reads them off the pushed samples.
+            if vcpu_timing.is_some() {
                 for (i, cpu) in cpus.iter_mut().enumerate() {
-                    if let Some(&t) = times.get(i) {
+                    if let Some(&t) = pthread_times.get(i) {
                         cpu.vcpu_cpu_time_ns = t;
                     }
                 }
             }
         }
 
-        // Read per-vCPU PMU counters (cycles / instructions /
-        // cache-misses / branch-misses) into each snapshot. Errors
-        // here are surfaced as `vcpu_perf = None` for that sample;
-        // we don't fail the monitor over a transient read error.
-        if let Some(pc) = perf_capture {
-            match pc.read_all() {
-                Ok(samples) => {
-                    for (i, cpu) in cpus.iter_mut().enumerate() {
-                        if let Some(s) = samples.get(i) {
-                            cpu.vcpu_perf = Some(*s);
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !perf_read_err_reported {
-                        tracing::warn!(
-                            err = %e,
-                            "perf counter read failed; vcpu_perf will be None until next successful sample"
-                        );
-                        perf_read_err_reported = true;
-                    }
+        // Stamp per-vCPU PMU counters (cycles / instructions /
+        // cache-misses / branch-misses) into each snapshot from the
+        // `perf_samples` read once above (hoisted so the ledger can source
+        // its CPU currency from the same read pre-`data_valid`). A read
+        // error left `perf_samples` `None` (warned once), leaving every
+        // `vcpu_perf` at `None` for this sample — we don't fail the
+        // monitor over a transient read error.
+        if let Some(samples) = perf_samples.as_ref() {
+            for (i, cpu) in cpus.iter_mut().enumerate() {
+                if let Some(s) = samples.get(i) {
+                    cpu.vcpu_perf = Some(*s);
                 }
             }
         }
@@ -3592,36 +3610,63 @@ pub(crate) fn monitor_loop(
         // `samples.last()` is still the PREVIOUS tick (the same
         // predecessor the reactive stuck-check reads above).
         if let Some(ledger) = cfg.progress_ledger {
-            // (a) Choose the CPU-time currency and its sum. Prefer the
-            // PMU SW task-clock (guest-only ns, via exclude_host) when
-            // EVERY sampled vCPU carries one; else fall back to the
-            // per-vCPU pthread clock exactly as before. The source is
-            // latched on the first tick so the magnitude never flips
-            // mid-run (see `select_cpu_currency`). Both slices are one
-            // entry per CPU: task clock from `vcpu_perf`, pthread from
-            // `vcpu_cpu_time_ns`, `None` where that source was absent.
-            let task_clocks: Vec<Option<u64>> = cpus
-                .iter()
-                .map(|c| c.vcpu_perf.and_then(|p| p.task_clock_ns))
-                .collect();
-            let pthread: Vec<Option<u64>> =
-                cpus.iter().map(|c| c.vcpu_cpu_time_ns).collect();
+            // (a) Choose the CPU-time currency and its sum from the
+            // host-side timing sources read at the top of this tick —
+            // NOT from `cpus`, which is EMPTY until `data_valid` latches.
+            // Sourcing them directly is what makes CPU evidence available
+            // from tick 1 of a booting guest (currency=pthread at
+            // minimum), so Tier-1 governs a spinning boot wedge even
+            // before the guest kernel brings up its per-CPU runqueue
+            // structures. Prefer the PMU SW task-clock (guest-only ns, via
+            // exclude_host) when EVERY sampled vCPU carries one; else fall
+            // back to the per-vCPU pthread clock. The source is latched on
+            // the first tick so the magnitude never flips mid-run (see
+            // `select_cpu_currency`). Both slices are one entry per vCPU:
+            // task clock from `perf_samples`, pthread from `pthread_times`,
+            // `None` where that source was absent.
+            let task_clocks: Vec<Option<u64>> = perf_samples
+                .as_ref()
+                .map(|s| s.iter().map(|p| p.task_clock_ns).collect())
+                .unwrap_or_default();
             let (cpu_ns_now, cpu_currency) =
-                select_cpu_currency(&mut ledger_currency, &task_clocks, &pthread);
+                select_cpu_currency(&mut ledger_currency, &task_clocks, &pthread_times);
+            // Evidence channels: per-CPU GUEST data actually resolved this
+            // tick (`data_valid` latched AND `cpus` non-empty). The SAME
+            // condition that makes `runnable_demand` meaningful — false
+            // pre-boot-resolution, true after. The watchdog's Tier-2
+            // (absence-of-demand ⇒ idle
+            // wedge) is only valid when this holds; a starved early-boot
+            // guest reads `runnable_demand=false` purely because the
+            // channel is blind, not because it is idle.
+            let evidence_channels_live = data_valid && !cpus.is_empty();
             // (d) Runnable demand: any CPU had queued work this sample.
+            // Pre-resolution `cpus` is empty → false, which is exactly why
+            // `evidence_channels_live` must gate Tier-2's use of it.
             let runnable_demand = cpus
                 .iter()
                 .any(|c| c.nr_running > 0 || c.scx_nr_running > 0 || c.local_dsq_depth > 0);
             // (a)+(b)+(d): stamp liveness and bump the heartbeat.
-            ledger.record_liveness(cpu_ns_now, cpu_currency, runnable_demand);
-            // (c) NEW-WORK evidence vs the previous tick. No predecessor
-            // on the first tick means no baseline, hence no progress —
-            // correct: a single sample cannot show a delta.
-            if let Some(prev) = samples.last()
-                && progress_evidence(&prev.cpus, &cpus)
-            {
-                ledger.record_progress(cpu_ns_now, run_start.elapsed().as_nanos() as u64);
-            }
+            ledger.record_liveness(
+                cpu_ns_now,
+                cpu_currency,
+                runnable_demand,
+                evidence_channels_live,
+            );
+            // NO progress-epoch bump here. `progress_epoch` is
+            // MILESTONE-ONLY: bumped exclusively by lifecycle stage
+            // advances (the dispatch thread's `advance_phase` /
+            // boot-heartbeat frames). Kernel scheduling noise is NEVER
+            // progress — a live guest kernel bumps ttwu_count /
+            // sched_count / pcount every tick from background kthread
+            // wakeups (RCU, timers, workqueues, ktstr's own guest poll
+            // threads), and a wakeup bumps ttwu even when the woken task
+            // never runs, so noise-based progress would reset every tick
+            // on ANY live kernel — a SCHED_FIFO spinner and a 60 s idle
+            // teardown sleeper alike would look "progressing" forever.
+            // scx discrete-event counters are equally unsafe (they tick
+            // from enqueue paths under a stalled scheduler). The watchdog
+            // instead governs spinning wedges by the Tier-1 CPU budget and
+            // idle wedges by the Tier-2 trickle-stall test.
         }
 
         samples.push(MonitorSample {
@@ -7245,91 +7290,6 @@ mod tests {
         assert!(mem.host_ptr_for_pa(0xC000_0000, 8).is_none());
     }
 
-    // ---- ProgressLedger: pure decision helper ----
-
-    /// Build a one-CPU snapshot slice carrying only the given schedstat
-    /// NEW-WORK counters (all other fields default/absent).
-    fn ss_cpu(ttwu_count: u32, sched_count: u32, pcount: u64) -> Vec<CpuSnapshot> {
-        vec![CpuSnapshot {
-            schedstat: Some(RqSchedstat {
-                ttwu_count,
-                sched_count,
-                pcount,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }]
-    }
-
-    #[test]
-    fn progress_evidence_schedstat_ttwu_delta_fires() {
-        // A single ttwu_count advance is NEW-WORK.
-        assert!(progress_evidence(&ss_cpu(10, 5, 100), &ss_cpu(11, 5, 100)));
-        // sched_count advance.
-        assert!(progress_evidence(&ss_cpu(10, 5, 100), &ss_cpu(10, 6, 100)));
-        // pcount advance.
-        assert!(progress_evidence(&ss_cpu(10, 5, 100), &ss_cpu(10, 5, 101)));
-    }
-
-    #[test]
-    fn progress_evidence_identical_schedstat_no_fire() {
-        // No delta anywhere → no progress (the static-buffer case).
-        assert!(!progress_evidence(&ss_cpu(10, 5, 100), &ss_cpu(10, 5, 100)));
-        // A REGRESSION (counter went down — impossible for cumulative
-        // kernel counters, but the helper must not fire on it) is also
-        // not progress.
-        assert!(!progress_evidence(&ss_cpu(10, 5, 100), &ss_cpu(9, 5, 100)));
-    }
-
-    #[test]
-    fn progress_evidence_dsq_drain_fires() {
-        let deep = vec![CpuSnapshot {
-            local_dsq_depth: 5,
-            ..Default::default()
-        }];
-        let drained = vec![CpuSnapshot {
-            local_dsq_depth: 3,
-            ..Default::default()
-        }];
-        // A shrinking local DSQ means work was dispatched out.
-        assert!(progress_evidence(&deep, &drained));
-        // A GROWING DSQ, with no other evidence, is not progress.
-        assert!(!progress_evidence(&drained, &deep));
-    }
-
-    #[test]
-    fn progress_evidence_scx_event_delta_fires() {
-        let ev = |keep_last: i64| -> Vec<CpuSnapshot> {
-            vec![CpuSnapshot {
-                event_counters: Some(ScxEventCounters {
-                    dispatch_keep_last: keep_last,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }]
-        };
-        // A discrete scx event counter rising is NEW-WORK.
-        assert!(progress_evidence(&ev(0), &ev(1)));
-        // Unchanged event counters are not progress.
-        assert!(!progress_evidence(&ev(4), &ev(4)));
-    }
-
-    #[test]
-    fn progress_evidence_bypass_duration_alone_is_not_progress() {
-        // bypass_duration is a wall-time accumulator, excluded from the
-        // activity sum: a VM wedged in bypass must NOT look alive.
-        let bypass = |dur: i64| -> Vec<CpuSnapshot> {
-            vec![CpuSnapshot {
-                event_counters: Some(ScxEventCounters {
-                    bypass_duration: dur,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }]
-        };
-        assert!(!progress_evidence(&bypass(1_000), &bypass(2_000_000)));
-    }
-
     // ---- select_cpu_currency: currency selection + latch ----
 
     #[test]
@@ -7443,9 +7403,10 @@ mod tests {
 
     #[test]
     fn monitor_loop_ledger_heartbeat_advances_static_no_progress() {
-        // Static buffer with queued work: heartbeat pulses every tick,
-        // but no per-tick delta ever appears (identical reads), so
-        // progress_epoch must stay 0 while runnable_demand is true.
+        // Static buffer with queued work, `data_valid` latched (rq_refresh
+        // None → resolved from tick 1): heartbeat pulses every tick, the
+        // guest evidence channels are live, but progress_epoch stays 0
+        // (milestone-only; the monitor never bumps it from kernel noise).
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, 2, 1, 3, 500, 0);
         let ledger = run_ledger_loop(&buf, 50);
@@ -7456,10 +7417,16 @@ mod tests {
             "heartbeat did not advance: {}",
             ledger.monitor_heartbeat.load(Ordering::Relaxed)
         );
-        // (c) a static buffer yields no NEW-WORK evidence.
+        // Milestone-only: a static buffer never bumps progress_epoch
+        // (kernel scheduling noise is not progress).
         assert_eq!(ledger.progress_epoch.load(Ordering::Acquire), 0);
-        // (d) nr_running/dsq queued → demand.
+        // nr_running/dsq queued → demand, and the channels are live so
+        // that reading is trustworthy.
         assert!(ledger.runnable_demand.load(Ordering::Relaxed));
+        assert!(
+            ledger.evidence_channels_live.load(Ordering::Relaxed),
+            "data_valid + non-empty cpus → channels live"
+        );
         // No vcpu_timing configured → no CPU-time currency this run.
         assert_eq!(
             ledger.cpu_currency.load(Ordering::Relaxed),
@@ -7480,5 +7447,104 @@ mod tests {
         assert!(ledger.monitor_heartbeat.load(Ordering::Relaxed) >= 2);
         assert!(!ledger.runnable_demand.load(Ordering::Relaxed));
         assert_eq!(ledger.progress_epoch.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn monitor_loop_ledger_pre_resolution_channels_dead_cpu_accrues() {
+        // Fix 1 + Fix 2 together, in the pre-resolution (pre-boot) window:
+        // an rq_refresh whose `__per_cpu_offset[]` never populates keeps
+        // `data_valid` false forever, so `cpus` stays EMPTY every tick
+        // (the guest kernel hasn't brought up its per-CPU rq structures).
+        // With a real vCPU pthread wired, the ledger must STILL accrue CPU
+        // (currency=pthread, sourced host-side directly) while
+        // `evidence_channels_live` stays FALSE (guest channels blind) —
+        // exactly the shape that must NOT be read as a Tier-2 idle wedge.
+        let offsets = test_offsets();
+        // 64 zero bytes: `__per_cpu_offset[]` reads all-zero → never latches.
+        let mem_buf = vec![0u8; 64];
+        // SAFETY: mem_buf outlives the GuestMem use (borrowed for this call).
+        let mem = unsafe { GuestMem::new(mem_buf.as_ptr() as *mut u8, mem_buf.len() as u64) };
+        let refresh = RqRefresh {
+            pco_pa: 0,
+            runqueues_kva: 0,
+            num_cpus: 1,
+            page_offset_base_pa: None,
+            event: None,
+            kaslr_offset: std::sync::Arc::new(AtomicU64::new(0)),
+        };
+
+        // A busy-spinning thread accrues real pthread CPU time so
+        // `cpu_ns_now` advances host-side, independent of guest memory.
+        let spin_kill = std::sync::Arc::new(AtomicBool::new(false));
+        let spin_kill_c = spin_kill.clone();
+        let spinner = std::thread::Builder::new()
+            .name("pre-res-spinner".into())
+            .spawn(move || {
+                let mut x: u64 = 0;
+                while !spin_kill_c.load(Ordering::Acquire) {
+                    x = x.wrapping_add(1);
+                    std::hint::black_box(x);
+                }
+            })
+            .unwrap();
+        let pt = {
+            use std::os::unix::thread::JoinHandleExt;
+            spinner.as_pthread_t() as libc::pthread_t
+        };
+        let vcpu_timing = VcpuTiming { pthreads: vec![pt] };
+
+        let ledger = ProgressLedger::default();
+        let cfg = MonitorConfig {
+            rq_refresh: Some(&refresh),
+            vcpu_timing: Some(&vcpu_timing),
+            progress_ledger: Some(&ledger),
+            ..test_config()
+        };
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(80));
+                kill.store(true, Ordering::Release);
+            })
+        };
+        let MonitorLoopResult { samples, .. } = monitor_loop(
+            &mem,
+            &[],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+        spin_kill.store(true, Ordering::Release);
+        let _ = spinner.join();
+
+        // Pre-resolution held the whole run: every pushed sample has empty
+        // cpus (data_valid never latched).
+        assert!(!samples.is_empty());
+        for s in &samples {
+            assert!(s.cpus.is_empty(), "data_valid must never latch on zero offsets");
+        }
+        // Fix 2: channels stayed blind (guest per-CPU data never resolved).
+        assert!(
+            !ledger.evidence_channels_live.load(Ordering::Relaxed),
+            "evidence_channels_live must be false pre-resolution"
+        );
+        // Fix 1: CPU still accrued from the host pthread clock, with
+        // pthread currency — so Tier-1 governs a spinning boot wedge even
+        // while the guest channels are blind.
+        assert_eq!(
+            ledger.cpu_currency.load(Ordering::Relaxed),
+            super::super::CPU_CURRENCY_PTHREAD,
+            "pthread clock present → currency latches pthread pre-resolution"
+        );
+        assert!(
+            ledger.cpu_ns_now.load(Ordering::Relaxed) > 0,
+            "cpu_ns_now must accrue from the host pthread clock pre-resolution"
+        );
     }
 }
