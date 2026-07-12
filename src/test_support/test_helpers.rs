@@ -308,6 +308,7 @@ pub(crate) fn make_vm_result(
         entry_name: None,
         variant_hash: 0,
         host_vcpu_schedstat: None,
+        contention_witness: None,
         periodic_series_cache: std::sync::OnceLock::new(),
     }
 }

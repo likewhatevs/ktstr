@@ -744,6 +744,7 @@ fn eval_monitor_fail_has_fingerprint() {
         entry_name: None,
         variant_hash: 0,
         host_vcpu_schedstat: None,
+        contention_witness: None,
         periodic_series_cache: std::sync::OnceLock::new(),
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES
@@ -1103,6 +1104,7 @@ fn eval_sched_exit_includes_monitor() {
         entry_name: None,
         variant_hash: 0,
         host_vcpu_schedstat: None,
+        contention_witness: None,
         periodic_series_cache: std::sync::OnceLock::new(),
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES;
@@ -1213,6 +1215,7 @@ fn eval_monitor_fail_includes_sched_log() {
         entry_name: None,
         variant_hash: 0,
         host_vcpu_schedstat: None,
+        contention_witness: None,
         periodic_series_cache: std::sync::OnceLock::new(),
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES
@@ -3134,6 +3137,7 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
         entry_name: None,
         variant_hash: 0,
         host_vcpu_schedstat: None,
+        contention_witness: None,
         periodic_series_cache: std::sync::OnceLock::new(),
     };
     let assertions = crate::assert::Assert::NO_OVERRIDES

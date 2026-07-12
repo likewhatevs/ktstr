@@ -27,7 +27,7 @@ use crate::sync::MutexExt;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::EventFd;
@@ -1643,6 +1643,16 @@ pub(crate) struct VcpuTiming {
     /// pthread_t handles for each vCPU, indexed by vCPU ID.
     /// Used with `pthread_getcpuclockid()` + `clock_gettime()`.
     pub pthreads: Vec<libc::pthread_t>,
+    /// Live vCPU host-thread TID slots (the same `vcpu_tid_slots` the freeze
+    /// coordinator reads at teardown), for the monitor's per-phase schedstat
+    /// witness ([`PhaseWitnessTracker`]). Each slot is stamped by its vCPU
+    /// thread before it enters `KVM_RUN`; a slot still 0 is skipped (that AP
+    /// never scheduled). Read LIVE every tick (`Acquire`) — not snapshotted
+    /// once — so the Body phase, which runs long after every AP has stamped,
+    /// always reads real TIDs. Empty on the test paths that build a
+    /// `VcpuTiming` for pthread-clock coverage only; the witness then stays
+    /// absent (no TIDs to read schedstat from).
+    pub tids: Vec<Arc<AtomicI32>>,
 }
 
 impl VcpuTiming {
@@ -1728,6 +1738,17 @@ impl VcpuTiming {
                 }
                 Some(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
             })
+            .collect()
+    }
+
+    /// Live vCPU TIDs (`Acquire`-loaded from [`Self::tids`]) for a schedstat
+    /// read. Includes 0-slots verbatim — [`read_host_vcpu_schedstat`] skips
+    /// them — so the returned length tracks the configured vCPU count, not
+    /// the number that have stamped yet. Empty when no TID slots were wired.
+    fn live_tids(&self) -> Vec<i32> {
+        self.tids
+            .iter()
+            .map(|t| t.load(Ordering::Acquire))
             .collect()
     }
 }
@@ -2151,6 +2172,12 @@ pub(crate) struct MonitorLoopResult {
     /// saw a live prog) — [`crate::vmm::freeze_coord`] then falls back to
     /// the post-teardown walk.
     pub(crate) verified_insns: Vec<super::bpf_prog::ProgVerifierStats>,
+    /// Per-phase host-contention witness assembled by
+    /// [`PhaseWitnessTracker`] over the run (per-phase `D` + the Body-phase
+    /// peak-window run-delay series). `None` on the pre-loop setup-failure
+    /// early returns and whenever no witness was seeded (no ledger / no vCPU
+    /// TID slots). Forwarded to [`crate::vmm::result::VmResult::contention_witness`].
+    pub(crate) contention_witness: Option<crate::vmm::result::ContentionWitness>,
 }
 
 /// System-wide PSI-irq host-walk inputs: the resolved `struct psi_group`
@@ -2841,6 +2868,144 @@ impl MaxVcpuInPhaseTracker {
     }
 }
 
+/// Cap on the Body-phase per-tick run-delay series
+/// ([`crate::vmm::result::BodyContentionWindow::tick_deltas`]). At the 100 ms
+/// monitor cadence 36 000 ticks is one hour of Body — far past any real test
+/// body (minutes) — so the cap is effectively unreachable; it exists only to
+/// bound the Vec against a runaway/never-exiting cell. On hit the series
+/// stops growing and `saturated` is set, marking `W` as a prefix-only lower
+/// bound (see the field docs).
+pub(crate) const BODY_TICK_CAP: usize = 36_000;
+
+/// Monitor-thread-local tracker for the per-phase host-contention witness
+/// (the "weather witness"). Consumes each tick's cumulative host vCPU
+/// schedstat totals ([`crate::vmm::result::HostVcpuSchedstat`], summed over
+/// the vCPU TIDs) and the live lifecycle STAGE, and produces
+/// [`crate::vmm::result::ContentionWitness`]: a per-phase schedstat DELTA
+/// array (each phase's own-span `D`) plus the Body-phase per-tick run-delay
+/// series for the `W(L)` peak-window bound.
+///
+/// Pure state machine (no clocks, no I/O — the caller does the schedstat
+/// read), so the boundary/attribution arithmetic is unit-testable. Mirrors
+/// [`MaxVcpuInPhaseTracker`]'s re-anchor discipline, but anchors on the
+/// STAGE id (not `phase_epoch`) because it attributes schedstat to a specific
+/// [`crate::monitor::LifecycleStage`] slot.
+///
+/// PER-PHASE ATTRIBUTION: it holds the cumulative schedstat `anchor` at the
+/// current stage's start and, each tick, RE-WRITES `per_phase[stage] = cur -
+/// anchor` (a running delta). When the observed stage advances it re-anchors
+/// (`anchor = cur`), which FREEZES the just-ended stage's slot at its last
+/// running value and starts the new stage's slot at 0 — so each slot ends up
+/// holding exactly its own span's schedstat delta. Forward-only staging is
+/// assumed (the ledger's `advance_phase` is monotone); a non-advancing
+/// re-observation of the same stage just keeps extending its running delta.
+///
+/// PER-TICK BODY SERIES: independently, each tick's TOTAL run-delay delta
+/// (`cur.run_delay - prev.run_delay`, saturating) is pushed to the Body
+/// series WHILE the observed stage is Body. The first Body tick's delta spans
+/// the Dispatch→Body transition interval (over-counts Body contention →
+/// larger `W` → more indeterminate = conservative); the final partial Body
+/// interval is ceded to Teardown — the same one-tick boundary slop the
+/// per-phase array carries.
+pub(crate) struct PhaseWitnessTracker {
+    /// Cumulative schedstat at the current stage's start.
+    anchor: crate::vmm::result::HostVcpuSchedstat,
+    /// The full cumulative schedstat read on the PREVIOUS tick — both for the
+    /// per-tick run-delay delta AND as the re-anchor point on a stage advance
+    /// (so the new stage absorbs the transition interval rather than dropping
+    /// it; see [`Self::observe`]).
+    prev: crate::vmm::result::HostVcpuSchedstat,
+    /// The stage observed on the previous tick.
+    prev_stage: u8,
+    /// Per-stage running schedstat deltas, indexed by `LifecycleStage as
+    /// usize`.
+    per_phase: crate::vmm::result::PerPhaseSchedstat,
+    /// Body-phase per-tick run-delay deltas (capped at [`BODY_TICK_CAP`]).
+    body_tick_deltas: Vec<u64>,
+    /// True once the Body series hit the cap and later ticks were dropped.
+    body_saturated: bool,
+    /// The monitor tick period (ns) — carried onto the Body window so the
+    /// pure window math can quantise `L` into ticks.
+    tick_ns: u64,
+    seeded: bool,
+}
+
+impl PhaseWitnessTracker {
+    pub(crate) fn new(tick_ns: u64) -> Self {
+        Self {
+            anchor: crate::vmm::result::HostVcpuSchedstat::default(),
+            prev: crate::vmm::result::HostVcpuSchedstat::default(),
+            prev_stage: 0,
+            per_phase: crate::vmm::result::PerPhaseSchedstat::default(),
+            body_tick_deltas: Vec::new(),
+            body_saturated: false,
+            tick_ns,
+            seeded: false,
+        }
+    }
+
+    /// Fold one tick: `cur` is the cumulative host schedstat over the vCPU
+    /// TIDs THIS tick, `stage` the live [`crate::monitor::LifecycleStage`]
+    /// `as u8`. The first call seeds the anchors and attributes nothing (no
+    /// prior reading to diff). `stage` out of range is tolerated — the
+    /// `usize` index is bounds-checked against the fixed array via
+    /// [`crate::monitor::LifecycleStage::from_u8`] before use.
+    pub(crate) fn observe(&mut self, cur: crate::vmm::result::HostVcpuSchedstat, stage: u8) {
+        if !self.seeded {
+            self.anchor = cur;
+            self.prev = cur;
+            self.prev_stage = stage;
+            self.seeded = true;
+            return;
+        }
+        // Per-tick TOTAL run-delay delta (saturating: a regressed cumulative
+        // — a TID that vanished then reappeared — contributes 0, never wraps).
+        let tick_delta = cur
+            .total_run_delay_ns
+            .saturating_sub(self.prev.total_run_delay_ns);
+        // Stage advance → re-anchor at the PREVIOUS tick's cumulative (not
+        // `cur`): the monitor sees the advance one tick late, so anchoring at
+        // `prev` gives the transition interval to the NEW stage. This freezes
+        // the ended stage's slot at its last same-stage running value and
+        // starts the new stage covering from the last pre-advance reading —
+        // the documented one-tick boundary slop (each phase absorbs up to one
+        // tick of its predecessor's tail; conservative for the Body window).
+        if stage != self.prev_stage {
+            self.anchor = self.prev;
+            self.prev_stage = stage;
+        }
+        // Running delta for the current stage. Normalise the stage byte
+        // through `from_u8` so a torn/garbled value can't index out of bounds.
+        let idx = crate::monitor::LifecycleStage::from_u8(stage) as usize;
+        self.per_phase.phases[idx] = cur.delta_from(&self.anchor);
+        // Body-phase per-tick series (bounded).
+        if crate::monitor::LifecycleStage::from_u8(stage) == crate::monitor::LifecycleStage::Body {
+            if self.body_tick_deltas.len() < BODY_TICK_CAP {
+                self.body_tick_deltas.push(tick_delta);
+            } else {
+                self.body_saturated = true;
+            }
+        }
+        self.prev = cur;
+    }
+
+    /// Assemble the witness. `None` when nothing was ever observed (never
+    /// seeded — no monitor tick ran with a stage to attribute).
+    pub(crate) fn finish(self) -> Option<crate::vmm::result::ContentionWitness> {
+        if !self.seeded {
+            return None;
+        }
+        Some(crate::vmm::result::ContentionWitness {
+            per_phase: self.per_phase,
+            body_window: crate::vmm::result::BodyContentionWindow {
+                tick_deltas: self.body_tick_deltas,
+                tick_ns: self.tick_ns,
+                saturated: self.body_saturated,
+            },
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn monitor_loop(
     mem: &GuestMem,
@@ -2982,6 +3147,13 @@ pub(crate) fn monitor_loop(
     // scalar ledger cannot carry; the watchdog reads the published verdict.
     // See [`crate::vmm::freeze_coord::watchdog_step::CpuTrickleTracker`].
     let mut trickle_tracker = crate::vmm::freeze_coord::watchdog_step::CpuTrickleTracker::new();
+    // Per-phase host-contention witness ("weather witness"): reads the vCPU
+    // threads' cumulative host schedstat each tick and attributes the
+    // run-delay to lifecycle phases (per-phase `D`) + a Body-phase per-tick
+    // series for the peak-window `W(L)` bound. Wired only when BOTH the
+    // ledger (lifecycle STAGE source) and vCPU TID slots are present; on the
+    // test / no-ledger / no-TID paths it stays unseeded → `finish()` = None.
+    let mut phase_witness = PhaseWitnessTracker::new(interval.as_nanos() as u64);
     let mut vcpu_timing_err_reported: Vec<bool> = vcpu_timing
         .map(|vt| vec![false; vt.pthreads.len()])
         .unwrap_or_default();
@@ -3031,6 +3203,7 @@ pub(crate) fn monitor_loop(
                 // Pre-loop setup failure: no sample was ever taken, so no
                 // live prog was observed. Cleanup falls back to its walk.
                 verified_insns: Vec::new(),
+                contention_witness: None,
             };
         }
     };
@@ -3050,6 +3223,7 @@ pub(crate) fn monitor_loop(
             // Pre-loop setup failure: no sample was ever taken, so no
             // live prog was observed. Cleanup falls back to its walk.
             verified_insns: Vec::new(),
+            contention_witness: None,
         };
     }
     let epoll = match Epoll::new() {
@@ -3069,6 +3243,7 @@ pub(crate) fn monitor_loop(
                 // Pre-loop setup failure: no sample was ever taken, so no
                 // live prog was observed. Cleanup falls back to its walk.
                 verified_insns: Vec::new(),
+                contention_witness: None,
             };
         }
     };
@@ -3093,6 +3268,7 @@ pub(crate) fn monitor_loop(
             // Pre-loop setup failure: no sample was ever taken, so no
             // live prog was observed. Cleanup falls back to its walk.
             verified_insns: Vec::new(),
+            contention_witness: None,
         };
     }
     if let Err(e) = epoll.ctl(
@@ -3114,6 +3290,7 @@ pub(crate) fn monitor_loop(
             // Pre-loop setup failure: no sample was ever taken, so no
             // live prog was observed. Cleanup falls back to its walk.
             verified_insns: Vec::new(),
+            contention_witness: None,
         };
     }
     let mut epoll_buf = [EpollEvent::default(); 2];
@@ -3785,6 +3962,29 @@ pub(crate) fn monitor_loop(
             // from enqueue paths under a stalled scheduler). The watchdog
             // instead governs spinning wedges by the Tier-1 CPU budget and
             // idle wedges by the Tier-2 trickle-stall test.
+
+            // Per-phase host-contention witness. Read the vCPU threads'
+            // CUMULATIVE host schedstat (Σ on-cpu / Σ run-delay over the live
+            // TIDs) and fold it against the live lifecycle STAGE. This is a
+            // NEW per-tick read — the same file `read_host_vcpu_schedstat`
+            // reads once at teardown for the whole-run `D` — costing O(vcpus)
+            // tiny `/proc/self/task/<tid>/schedstat` reads per 100 ms, the
+            // same cost class as the per-vCPU pthread-clock reads above. Only
+            // runs when TID slots were wired (`vcpu_timing.tids`); the stage
+            // comes from this ledger. The witness detects the stage advance
+            // one tick late (documented one-tick boundary slop) — conservative.
+            if let Some(vt) = vcpu_timing
+                && !vt.tids.is_empty()
+            {
+                let tids = vt.live_tids();
+                // Cumulative totals this tick; `None` (all TIDs still 0 in
+                // early boot, or schedstats off) folds to an all-zero reading
+                // so the anchor/diff stays coherent without a special case.
+                let cur =
+                    crate::vmm::freeze_coord::read_host_vcpu_schedstat(&tids).unwrap_or_default();
+                let stage = ledger.phase.load(Ordering::Relaxed);
+                phase_witness.observe(cur, stage);
+            }
         }
 
         samples.push(MonitorSample {
@@ -3838,6 +4038,9 @@ pub(crate) fn monitor_loop(
         boot_wait_outcome: super::BootWaitOutcome::NotConfigured,
         scx_event_counters_supported: false,
         verified_insns: verified_insns_capture,
+        // Per-phase contention witness assembled over the run; `None` on the
+        // no-ledger / no-TID paths where the tracker never seeded.
+        contention_witness: phase_witness.finish(),
     }
 }
 
@@ -5831,7 +6034,10 @@ mod tests {
             .unwrap();
 
         let pt = sleeper.as_pthread_t() as libc::pthread_t;
-        let vcpu_timing = VcpuTiming { pthreads: vec![pt] };
+        let vcpu_timing = VcpuTiming {
+            pthreads: vec![pt],
+            tids: Vec::new(),
+        };
 
         let virtio_con = test_virtio_console();
         let trigger = DumpTrigger {
@@ -5916,7 +6122,10 @@ mod tests {
             .unwrap();
 
         let pt = spinner.as_pthread_t() as libc::pthread_t;
-        let vcpu_timing = VcpuTiming { pthreads: vec![pt] };
+        let vcpu_timing = VcpuTiming {
+            pthreads: vec![pt],
+            tids: Vec::new(),
+        };
 
         let virtio_con = test_virtio_console();
         let trigger = DumpTrigger {
@@ -7564,6 +7773,101 @@ mod tests {
         assert_eq!(t.observe(&[110, 250, 330], 1), 50);
     }
 
+    // ---- PhaseWitnessTracker: per-phase schedstat attribution ----
+
+    fn ss(on_cpu: u64, run_delay: u64) -> crate::vmm::result::HostVcpuSchedstat {
+        crate::vmm::result::HostVcpuSchedstat {
+            total_on_cpu_ns: on_cpu,
+            total_run_delay_ns: run_delay,
+            sampled_vcpus: 2,
+        }
+    }
+
+    const BODY: u8 = 3; // LifecycleStage::Body
+    const DISPATCH: u8 = 2;
+    const TEARDOWN: u8 = 4;
+
+    #[test]
+    fn phase_witness_attributes_deltas_to_own_span() {
+        // First tick seeds (attributes nothing). Then two Dispatch ticks, two
+        // Body ticks, one Teardown tick — each stage's slot must hold exactly
+        // its own span's cumulative-schedstat delta, not the whole run's.
+        let mut t = PhaseWitnessTracker::new(100_000_000);
+        t.observe(ss(1_000, 100), DISPATCH); // seed anchor at (1000,100)
+        t.observe(ss(1_500, 150), DISPATCH); // Dispatch running: delta (500,50)
+        t.observe(ss(2_000, 200), DISPATCH); // Dispatch running: delta (1000,100)
+        // Advance to Body: re-anchor at (2000,200). Body slot starts from here.
+        t.observe(ss(2_400, 260), BODY); // Body running: delta (400,60)
+        t.observe(ss(3_000, 500), BODY); // Body running: delta (1000,300)
+        // Advance to Teardown: re-anchor at (3000,500).
+        t.observe(ss(3_100, 900), TEARDOWN); // Teardown: delta (100,400)
+        let w = t.finish().expect("seeded");
+        let disp = w
+            .per_phase
+            .for_stage(crate::monitor::LifecycleStage::Dispatch);
+        assert_eq!((disp.total_on_cpu_ns, disp.total_run_delay_ns), (1000, 100));
+        let body = w.per_phase.body();
+        assert_eq!((body.total_on_cpu_ns, body.total_run_delay_ns), (1000, 300));
+        // Body D = 1 + 300/1000 = 1.3.
+        assert_eq!(w.per_phase.body_dilation(), Some(1.3));
+        let tear = w
+            .per_phase
+            .for_stage(crate::monitor::LifecycleStage::Teardown);
+        assert_eq!((tear.total_on_cpu_ns, tear.total_run_delay_ns), (100, 400));
+    }
+
+    #[test]
+    fn phase_witness_body_tick_series_and_tick_ns() {
+        // The per-tick TOTAL run-delay delta is pushed while the stage is
+        // Body. The transition tick into Body pushes its (Dispatch→Body-span)
+        // delta too — over-count = conservative. tick_ns is carried through.
+        let mut t = PhaseWitnessTracker::new(100_000_000);
+        t.observe(ss(0, 0), DISPATCH); // seed
+        t.observe(ss(10, 5), DISPATCH); // Dispatch tick: NOT in body series
+        t.observe(ss(20, 25), BODY); // first Body tick: run_delay delta = 20
+        t.observe(ss(30, 40), BODY); // Body tick: run_delay delta = 15
+        t.observe(ss(40, 90), BODY); // Body tick: run_delay delta = 50
+        let w = t.finish().expect("seeded");
+        assert_eq!(w.body_window.tick_deltas, vec![20, 15, 50]);
+        assert_eq!(w.body_window.tick_ns, 100_000_000);
+        assert!(!w.body_window.saturated);
+    }
+
+    #[test]
+    fn phase_witness_saturating_delta_never_wraps() {
+        // A cumulative schedstat that REGRESSES (a TID vanished then a fresh
+        // one with a smaller total reappeared) yields a 0 per-tick delta, not
+        // a wrapped huge value.
+        let mut t = PhaseWitnessTracker::new(100_000_000);
+        t.observe(ss(0, 0), BODY); // seed
+        t.observe(ss(1_000, 1_000), BODY); // delta 1000
+        t.observe(ss(500, 400), BODY); // regressed → saturating 0
+        let w = t.finish().expect("seeded");
+        assert_eq!(w.body_window.tick_deltas, vec![1_000, 0]);
+    }
+
+    #[test]
+    fn phase_witness_unseeded_is_none() {
+        // No observation → no witness.
+        let t = PhaseWitnessTracker::new(100_000_000);
+        assert!(t.finish().is_none());
+    }
+
+    #[test]
+    fn phase_witness_body_series_saturates_at_cap() {
+        // Filling past BODY_TICK_CAP stops growing the Vec and sets the flag.
+        let mut t = PhaseWitnessTracker::new(1);
+        t.observe(ss(0, 0), BODY); // seed
+        let mut cum = 0u64;
+        for _ in 0..(BODY_TICK_CAP + 5) {
+            cum += 1;
+            t.observe(ss(cum, cum), BODY);
+        }
+        let w = t.finish().expect("seeded");
+        assert_eq!(w.body_window.tick_deltas.len(), BODY_TICK_CAP);
+        assert!(w.body_window.saturated);
+    }
+
     // ---- ProgressLedger: monitor-loop integration ----
 
     /// Drive `monitor_loop` for a short run with a `ProgressLedger`
@@ -7691,7 +7995,10 @@ mod tests {
             use std::os::unix::thread::JoinHandleExt;
             spinner.as_pthread_t() as libc::pthread_t
         };
-        let vcpu_timing = VcpuTiming { pthreads: vec![pt] };
+        let vcpu_timing = VcpuTiming {
+            pthreads: vec![pt],
+            tids: Vec::new(),
+        };
 
         let ledger = ProgressLedger::default();
         let cfg = MonitorConfig {

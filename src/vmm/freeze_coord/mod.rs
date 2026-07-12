@@ -58,6 +58,7 @@ use super::x86_64::kvm;
 use super::DRAM_BASE;
 
 mod dispatch;
+pub(crate) mod latency_verdict;
 mod lazy_init;
 mod snapshot;
 mod state;
@@ -1516,7 +1517,12 @@ impl Drop for PartialApSpawnGuard {
 /// CONFIG_SCHEDSTATS-off host renders this as `"0 0 0"`, which parses to
 /// `Some((0, 0))` — the caller's on-cpu==0 folds that into a `None`
 /// dilation, keeping "schedstats unavailable" distinct from a real 1.0.
-fn parse_schedstat_line(line: &str) -> Option<(u64, u64)> {
+///
+/// `pub(crate)`: shared with the monitor loop's per-tick per-phase
+/// contention witness ([`crate::monitor::reader`]), which reads the same
+/// schedstat file every tick to attribute host run-delay to lifecycle
+/// phases — one parser, one format contract.
+pub(crate) fn parse_schedstat_line(line: &str) -> Option<(u64, u64)> {
     let mut it = line.split_whitespace();
     let on_cpu = it.next()?.parse::<u64>().ok()?;
     let run_delay = it.next()?.parse::<u64>().ok()?;
@@ -1536,7 +1542,13 @@ fn parse_schedstat_line(line: &str) -> Option<(u64, u64)> {
 /// joined and their `/proc/self/task/<tid>` dirs vanish). Each vCPU thread
 /// lives exactly one VM run, so these whole-thread-life totals ARE this
 /// run's totals — no baseline subtraction is needed.
-fn read_host_vcpu_schedstat(tids: &[i32]) -> Option<HostVcpuSchedstat> {
+///
+/// `pub(crate)`: the monitor loop calls this every tick with the LIVE vCPU
+/// TIDs to snapshot the running cumulative totals, then diffs consecutive
+/// snapshots for its per-phase / peak-window contention witness (see
+/// [`crate::monitor::reader::PhaseWitnessTracker`]). The whole-run
+/// [`VmResult::host_vcpu_schedstat`] read at teardown uses the same fn.
+pub(crate) fn read_host_vcpu_schedstat(tids: &[i32]) -> Option<HostVcpuSchedstat> {
     let mut acc = HostVcpuSchedstat::default();
     for &tid in tids {
         if tid == 0 {
@@ -2350,12 +2362,21 @@ impl KtstrVm {
             .unwrap_or(0);
         let accessor_ready_evt = Arc::new(EventFd::new(0).expect("eventfd for accessor_ready"));
 
+        // TID handles for the monitor's per-phase schedstat witness — one
+        // per `vcpu_tid_slots` entry (index 0 BSP, 1.. APs), read live each
+        // tick. Cloned (not moved) so the teardown whole-run schedstat read
+        // still has `vcpu_tid_slots`.
+        let vcpu_tid_atomics: Vec<Arc<AtomicI32>> = vcpu_tid_slots
+            .iter()
+            .map(|(slot, _)| slot.clone())
+            .collect();
         let monitor_handle = self.start_monitor(
             &vm,
             &kill,
             &kill_evt,
             run_start,
             vcpu_pthreads,
+            vcpu_tid_atomics,
             perf_capture.clone(),
             Some(virtio_con.clone()),
             sys_rdy_evt.clone(),
@@ -12476,6 +12497,12 @@ impl KtstrVm {
         kill_evt: &Arc<EventFd>,
         run_start: Instant,
         vcpu_pthreads: Vec<libc::pthread_t>,
+        // Live vCPU-thread TID slots (`vcpu_tid_slots` handles), moved into
+        // the monitor closure and read every tick for the per-phase
+        // schedstat contention witness. Parallel to `vcpu_pthreads` — both
+        // index by vCPU id — and the same slots the teardown whole-run
+        // schedstat read polls.
+        vcpu_tid_atomics: Vec<Arc<AtomicI32>>,
         perf_capture: Arc<Option<monitor::perf_counters::PerfCountersCapture>>,
         virtio_con: Option<Arc<PiMutex<virtio_console::VirtioConsole>>>,
         sys_rdy_evt: Option<Arc<EventFd>>,
@@ -12744,6 +12771,7 @@ impl KtstrVm {
                             scx_event_counters_supported,
                             // Monitor torn down before sampling: no live prog seen.
                             verified_insns: Vec::new(),
+                            contention_witness: None,
                         };
                     }
                     let kill_fd = kill_evt_clone.as_raw_fd();
@@ -12803,6 +12831,7 @@ impl KtstrVm {
                             scx_event_counters_supported,
                             // Monitor torn down before sampling: no live prog seen.
                             verified_insns: Vec::new(),
+                            contention_witness: None,
                         };
                     }
                 }
@@ -12948,6 +12977,7 @@ impl KtstrVm {
                         scx_event_counters_supported,
                         // Monitor torn down before sampling: no live prog seen.
                         verified_insns: Vec::new(),
+                        contention_witness: None,
                     };
                 }
 
@@ -13051,6 +13081,7 @@ impl KtstrVm {
                         scx_event_counters_supported,
                         // Monitor torn down before sampling: no live prog seen.
                         verified_insns: Vec::new(),
+                        contention_witness: None,
                     };
                 }
 
@@ -13120,6 +13151,9 @@ impl KtstrVm {
 
                 let vcpu_timing = monitor::reader::VcpuTiming {
                     pthreads: vcpu_pthreads,
+                    // Live TID slots for the per-tick per-phase schedstat
+                    // witness — read `Acquire` each tick (see `VcpuTiming::tids`).
+                    tids: vcpu_tid_atomics,
                 };
 
                 // The legacy SHM signal slot 1 (`SIGNAL_PROBES_READY`)
@@ -13200,6 +13234,7 @@ impl KtstrVm {
                         scx_event_counters_supported,
                         // Monitor torn down before sampling: no live prog seen.
                         verified_insns: Vec::new(),
+                        contention_witness: None,
                     };
                 }
                 // aarch64 TCR_EL1 (granule + T1SZ) for the
@@ -13282,6 +13317,7 @@ impl KtstrVm {
                         scx_event_counters_supported,
                         // Monitor torn down before sampling: no live prog seen.
                         verified_insns: Vec::new(),
+                        contention_witness: None,
                     };
                 }
 
@@ -14312,7 +14348,7 @@ impl KtstrVm {
             slot.hit.store(false, Ordering::Release);
         }
 
-        let (monitor_report, mid_flight_drain, mid_run_verified_insns) =
+        let (monitor_report, mid_flight_drain, mid_run_verified_insns, contention_witness) =
             match run.monitor_handle.and_then(|h| h.join().ok()) {
                 Some(monitor::reader::MonitorLoopResult {
                     samples,
@@ -14323,6 +14359,7 @@ impl KtstrVm {
                     boot_wait_outcome,
                     scx_event_counters_supported,
                     verified_insns,
+                    contention_witness,
                 }) => {
                     // `preemption_threshold_ns` was resolved once
                     // inside `start_monitor` (and threaded through
@@ -14347,9 +14384,9 @@ impl KtstrVm {
                         boot_wait_outcome,
                         scx_event_counters_supported,
                     };
-                    (Some(report), drain, verified_insns)
+                    (Some(report), drain, verified_insns, contention_witness)
                 }
-                None => (None, BulkDrainResult::default(), Vec::new()),
+                None => (None, BulkDrainResult::default(), Vec::new(), None),
             };
         if crate::vmm::debug_logging_enabled() {
             eprintln!("CLEANUP: monitor joined");
@@ -14695,6 +14732,13 @@ impl KtstrVm {
             // observational — never affects `success` above or the exit
             // code.
             host_vcpu_schedstat: run.host_vcpu_schedstat,
+            // Per-phase contention witness assembled by the monitor
+            // (per-phase D + Body-phase peak-window run-delay series). Moved
+            // out of the joined `MonitorLoopResult` above; `None` when the
+            // monitor did not run or seeded no witness. Observational —
+            // never affects `success` or the exit code (the seam that
+            // consumes it lands later).
+            contention_witness,
             // Empty cache: the single bridge drain is deferred to the
             // first `captures_series()` call on the host (post_vm or
             // evaluate_vm_result). See the `periodic_series_cache`
