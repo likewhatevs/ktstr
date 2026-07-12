@@ -2037,6 +2037,7 @@ fn list_verifier_cells_all() {
 fn run_verifier_cell_inner(
     full_name: &str,
     out_stats: &mut Vec<crate::verifier::ProgStats>,
+    out_dilation: &mut Option<f64>,
 ) -> i32 {
     use super::SchedulerSpec;
 
@@ -2233,10 +2234,14 @@ fn run_verifier_cell_inner(
                     1
                 }
             };
-            // Hand the per-program verified_insns out to the record writer
-            // so the dispatcher can render the instruction-count tables.
-            // Only this arm has stats; every earlier return (skip, kernel
-            // resolution error, build failure) leaves out_stats empty.
+            // Hand the per-program verified_insns and the host-dilation
+            // sample out to the record writer so the dispatcher can render
+            // the instruction-count tables and the summary grid's
+            // dilation. Only this arm produces them; every earlier return
+            // (skip, kernel resolution error, build failure) leaves both
+            // at their empty/None default. Read dilation (Copy) before
+            // moving `stats` out.
+            *out_dilation = result.dilation;
             *out_stats = result.stats;
             code
         }
@@ -2258,13 +2263,15 @@ fn run_verifier_cell_inner(
 /// final attempt's outcome is the one that lands in the table.
 fn run_verifier_cell(full_name: &str) -> i32 {
     let mut stats = Vec::new();
-    let code = run_verifier_cell_inner(full_name, &mut stats);
+    let mut dilation = None;
+    let code = run_verifier_cell_inner(full_name, &mut stats, &mut dilation);
     if let Some(dir) = std::env::var_os(crate::KTSTR_VERIFIER_RESULT_DIR_ENV) {
         crate::verifier::write_cell_record(
             std::path::Path::new(&dir),
             full_name,
             code == 0,
             &stats,
+            dilation,
         );
     }
     code

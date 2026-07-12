@@ -31,7 +31,7 @@ use crate::sync::MutexExt;
 use super::exit_dispatch::{self, ExitAction, classify_exit, vcpu_run_loop_unified};
 use super::host_comms::BulkDrainResult;
 use super::pi_mutex::PiMutex;
-use super::result::{VmResult, VmRunState};
+use super::result::{HostVcpuSchedstat, VmResult, VmRunState};
 use super::vcpu::{
     ApFreezeHandles, BpfMapWriteParams, ImmediateExitHandle, VcpuThread, WatchpointArm,
     duration_to_jiffies, load_probe_bss_offset, open_vcpu_perf_capture, pin_current_thread,
@@ -1405,6 +1405,86 @@ impl Drop for PartialApSpawnGuard {
         let _ = self.kill_evt.write(1);
         self.freeze.store(false, Ordering::Release);
         kick_and_join_ap_threads(std::mem::take(&mut self.ap_threads));
+    }
+}
+
+/// Parse the on-CPU / run-delay pair from a `/proc/<pid>/task/<tid>/schedstat`
+/// line. The file holds three space-separated numbers:
+///   field 1 = time spent on the CPU (ns),
+///   field 2 = time spent runnable-but-not-running (ns),
+///   field 3 = number of timeslices run on this CPU.
+/// Returns `(on_cpu_ns, run_delay_ns)`, or `None` when either of the first
+/// two fields is missing or non-numeric (a short/malformed line). A
+/// CONFIG_SCHEDSTATS-off host renders this as `"0 0 0"`, which parses to
+/// `Some((0, 0))` — the caller's on-cpu==0 folds that into a `None`
+/// dilation, keeping "schedstats unavailable" distinct from a real 1.0.
+fn parse_schedstat_line(line: &str) -> Option<(u64, u64)> {
+    let mut it = line.split_whitespace();
+    let on_cpu = it.next()?.parse::<u64>().ok()?;
+    let run_delay = it.next()?.parse::<u64>().ok()?;
+    Some((on_cpu, run_delay))
+}
+
+/// Sum the host-side schedstat totals over the given vCPU thread TIDs.
+///
+/// Reads `/proc/self/task/<tid>/schedstat` for each TID and accumulates
+/// fields 1 and 2 (see [`parse_schedstat_line`]). A `tid == 0` (an AP that
+/// never stamped its TID — it never scheduled) and any TID whose schedstat
+/// is unreadable or malformed are skipped. Returns `None` when NOTHING was
+/// sampled (every TID skipped); otherwise `Some(HostVcpuSchedstat)` with
+/// the raw sums and the sampled-thread count.
+///
+/// MUST be called while the vCPU threads are still alive (before they are
+/// joined and their `/proc/self/task/<tid>` dirs vanish). Each vCPU thread
+/// lives exactly one VM run, so these whole-thread-life totals ARE this
+/// run's totals — no baseline subtraction is needed.
+fn read_host_vcpu_schedstat(tids: &[i32]) -> Option<HostVcpuSchedstat> {
+    let mut acc = HostVcpuSchedstat::default();
+    for &tid in tids {
+        if tid == 0 {
+            continue;
+        }
+        let Ok(s) = std::fs::read_to_string(format!("/proc/self/task/{tid}/schedstat")) else {
+            continue;
+        };
+        let Some((on_cpu, run_delay)) = parse_schedstat_line(s.trim()) else {
+            continue;
+        };
+        acc.total_on_cpu_ns = acc.total_on_cpu_ns.saturating_add(on_cpu);
+        acc.total_run_delay_ns = acc.total_run_delay_ns.saturating_add(run_delay);
+        acc.sampled_vcpus += 1;
+    }
+    (acc.sampled_vcpus > 0).then_some(acc)
+}
+
+#[cfg(test)]
+mod schedstat_tests {
+    use super::{parse_schedstat_line, read_host_vcpu_schedstat};
+
+    /// A valid three-field line yields `(on_cpu, run_delay)`; a
+    /// two-field line still parses (field 3 is unused); a one-field or
+    /// non-numeric line is `None`. The CONFIG_SCHEDSTATS-off `"0 0 0"`
+    /// parses to `Some((0, 0))` (folded to a `None` dilation upstream).
+    #[test]
+    fn parse_schedstat_line_valid_malformed_short() {
+        assert_eq!(parse_schedstat_line("12345 678 9"), Some((12345, 678)));
+        assert_eq!(parse_schedstat_line("100 200"), Some((100, 200)));
+        assert_eq!(parse_schedstat_line("0 0 0"), Some((0, 0)));
+        assert_eq!(parse_schedstat_line(""), None, "empty line");
+        assert_eq!(parse_schedstat_line("42"), None, "short: one field");
+        assert_eq!(parse_schedstat_line("abc def"), None, "non-numeric");
+        assert_eq!(parse_schedstat_line("100 x"), None, "second field bad");
+    }
+
+    /// An all-zero (or empty) TID list samples nothing -> `None`. tid==0
+    /// is skipped without a read attempt.
+    #[test]
+    fn read_host_vcpu_schedstat_none_when_nothing_sampled() {
+        assert!(read_host_vcpu_schedstat(&[]).is_none(), "empty -> None");
+        assert!(
+            read_host_vcpu_schedstat(&[0, 0]).is_none(),
+            "all tid==0 skipped -> None"
+        );
     }
 }
 
@@ -11676,6 +11756,26 @@ impl KtstrVm {
             cr3_cache.store(val, Ordering::Release);
         }
 
+        // Host-side vCPU scheduling-dilation sample. Read HERE — after the
+        // watchdog/freeze-coord joins above but BEFORE `ap_threads` move
+        // into `VmRunState` (they are joined only later, in
+        // `collect_results`). The read must precede that join: once a vCPU
+        // thread terminates its `/proc/self/task/<tid>` dir vanishes and
+        // the schedstat becomes unreadable. TIDs come from the same
+        // `vcpu_tid_slots` the monitor uses — index 0 is the BSP (this
+        // thread), 1.. are the AP slots each AP stamped before entering
+        // KVM_RUN; a slot still 0 means that AP never scheduled and is
+        // skipped by `read_host_vcpu_schedstat`. Each vCPU thread lives
+        // exactly one VM run (BSP is this thread; APs are spawned fresh
+        // per `run_vm` in `spawn_ap_threads` and never reused), so the
+        // whole-thread-life schedstat totals are this run's totals — no
+        // baseline subtraction is needed.
+        let host_vcpu_tids: Vec<i32> = vcpu_tid_slots
+            .iter()
+            .map(|(slot, _)| slot.load(Ordering::Acquire))
+            .collect();
+        let host_vcpu_schedstat = read_host_vcpu_schedstat(&host_vcpu_tids);
+
         Ok(VmRunState {
             exit_code,
             timed_out,
@@ -11751,6 +11851,10 @@ impl KtstrVm {
             // invalidate `kind_host_ptr` and `request_kva` after
             // every vCPU thread joins but before `vm` drops.
             watchpoint,
+            // Host-side vCPU dilation sample read just above, while the
+            // vCPU threads are still alive. Forwarded verbatim to
+            // `VmResult::host_vcpu_schedstat` by `collect_results`.
+            host_vcpu_schedstat,
         })
     }
 
@@ -14217,6 +14321,11 @@ impl KtstrVm {
             // vm.run() returns, alongside entry_name; freeze_coord is
             // entry-agnostic, so `0` here is correct and overwritten.
             variant_hash: 0,
+            // Host-side vCPU scheduling dilation, read at `run_vm`
+            // teardown while the vCPU threads were still alive. Purely
+            // observational — never affects `success` above or the exit
+            // code.
+            host_vcpu_schedstat: run.host_vcpu_schedstat,
             // Empty cache: the single bridge drain is deferred to the
             // first `captures_series()` call on the host (post_vm or
             // evaluate_vm_result). See the `periodic_series_cache`

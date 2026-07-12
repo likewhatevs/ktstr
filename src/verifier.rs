@@ -810,6 +810,14 @@ pub struct VerifierVmResult {
     /// attach/dispatch gates, mirroring `test_support::eval`'s
     /// crash_message priority. `None` on the common no-crash path.
     pub crash_message: Option<String>,
+    /// Host-side vCPU scheduling dilation for this cell's VM run —
+    /// `D = 1 + Σrun_delay/Σon_cpu` over the vCPU host threads (see
+    /// [`crate::vmm::result::HostVcpuSchedstat`]). `None` on hosts
+    /// without `CONFIG_SCHEDSTATS` or when no vCPU thread was sampled.
+    /// Purely observational: surfaced in the per-cell output and the
+    /// summary grid but NEVER folded into [`Self::cell_verdict`] or the
+    /// exit code.
+    pub dilation: Option<f64>,
 }
 
 impl VerifierVmResult {
@@ -1033,6 +1041,13 @@ pub fn collect_verifier_output(
         dispatched,
         timed_out: result.timed_out,
         crash_message: result.crash_message.clone(),
+        // Host-side vCPU dilation, derived from the run's raw schedstat
+        // totals. `None` when schedstats were unavailable or no vCPU was
+        // sampled — carried through untouched, never gating the verdict.
+        dilation: result
+            .host_vcpu_schedstat
+            .as_ref()
+            .and_then(|s| s.dilation()),
     })
 }
 
@@ -1138,6 +1153,20 @@ pub fn format_verifier_output(label: &str, result: &VerifierVmResult, raw: bool)
             }
             Some(reason) => out.push_str(&format!("  scheduler: NOT ATTACHED — {reason}\n")),
         }
+    }
+    // Host-side vCPU scheduling dilation. `D = 1 + run_delay/on_cpu`, so
+    // the fraction of the CPU the vCPUs actually received when runnable is
+    // `on_cpu/(on_cpu+run_delay) == 1/D` exactly — rendered as a whole
+    // percent. `None` (schedstats off / nothing sampled) is stated as
+    // such, distinct from a genuine 1.00x.
+    match result.dilation {
+        Some(d) => {
+            let pct = (100.0 / d).round() as u32;
+            out.push_str(&format!(
+                "  host dilation: {d:.2}x (vCPUs received {pct}% of the CPU they were runnable for)\n"
+            ));
+        }
+        None => out.push_str("  host dilation: n/a (host schedstat unavailable)\n"),
     }
     for ps in &result.stats {
         out.push_str(&format!(
@@ -1276,7 +1305,10 @@ pub fn format_verifier_diff(
 /// (scheduler, kernel, topology): the verifier sweeps each declared
 /// scheduler across topologies, so topology IS a result axis — a
 /// scheduler can pass on one topology and fail on another.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+// No `Eq`: the `dilation: Option<f64>` field carries an `f64`, which is
+// `PartialEq` but not `Eq` (NaN). Record equality is only used in tests
+// (`assert_eq!` on built records), for which `PartialEq` suffices.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VerifierCellRecord {
     /// Declared scheduler name (the `<sched>` cell-name segment).
     pub scheduler: String,
@@ -1294,6 +1326,16 @@ pub struct VerifierCellRecord {
     /// kernel, cell = the count summarized across topologies) that the
     /// dispatcher prints before the PASS/FAIL grids.
     pub stats: Vec<ProgStats>,
+    /// Host-side vCPU scheduling dilation for the cell's VM run
+    /// (`D = 1 + Σrun_delay/Σon_cpu`), copied from
+    /// [`VerifierVmResult::dilation`]. `None` when host schedstats were
+    /// unavailable or no vCPU was sampled. Rendered inside the glyph
+    /// cell of [`render_result_table`]; observational only, never part
+    /// of the pass/fail decision. `#[serde(default)]` so records written
+    /// by an older cell binary (no `dilation` key) still deserialize —
+    /// the dispatcher and cells can skew across a rolling upgrade.
+    #[serde(default)]
+    pub dilation: Option<f64>,
 }
 
 /// Map a cell's full name to a filesystem-safe record filename: every
@@ -1327,6 +1369,7 @@ pub(crate) fn write_cell_record(
     full_name: &str,
     passed: bool,
     stats: &[ProgStats],
+    dilation: Option<f64>,
 ) {
     let Some(rest) = full_name.strip_prefix("verifier/") else {
         return;
@@ -1341,6 +1384,7 @@ pub(crate) fn write_cell_record(
         topology: parts[2].to_string(),
         passed,
         stats: stats.to_vec(),
+        dilation,
     };
     let path = dir.join(cell_record_filename(full_name));
     match serde_json::to_vec(&record) {
@@ -1540,6 +1584,11 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
     // triple passed. Normally one record per triple; a defensive
     // duplicate carrying any fail flips the cell to FAIL.
     let mut agg: BTreeMap<String, BTreeMap<(String, String), bool>> = BTreeMap::new();
+    // scheduler -> (topology, kernel) -> MAX host dilation across the
+    // triple's records. A duplicate fold keeps the highest (worst)
+    // dilation; `None` throughout means no record reported one (host
+    // schedstats unavailable) -> the cell renders the glyph alone.
+    let mut agg_dil: BTreeMap<String, BTreeMap<(String, String), Option<f64>>> = BTreeMap::new();
     for r in records {
         schedulers.insert(r.scheduler.clone());
         sched_rows
@@ -1556,6 +1605,14 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
             .entry((r.topology.clone(), r.kernel.clone()))
             .or_insert(true);
         *all_passed &= r.passed;
+        let dil = agg_dil
+            .entry(r.scheduler.clone())
+            .or_default()
+            .entry((r.topology.clone(), r.kernel.clone()))
+            .or_insert(None);
+        if let Some(d) = r.dilation {
+            *dil = Some(dil.map_or(d, |cur| cur.max(d)));
+        }
     }
 
     let mut out =
@@ -1574,19 +1631,31 @@ pub fn render_result_table(records: &[VerifierCellRecord]) -> Option<String> {
         for topo in rows {
             let mut line: Vec<comfy_table::Cell> = vec![comfy_table::Cell::new(topo)];
             for kernel in cols {
+                // Max host dilation for this (topology, kernel) cell, if
+                // any record reported one. Rendered INSIDE the glyph cell
+                // (`✓  1.03`) so the number rides along with the verdict
+                // without adding a column; `None` -> glyph alone.
+                let dil = agg_dil[sched]
+                    .get(&(topo.clone(), kernel.clone()))
+                    .copied()
+                    .flatten();
+                let with_dil = |glyph: &str| match dil {
+                    Some(d) => format!("{glyph}  {d:.2}"),
+                    None => glyph.to_string(),
+                };
                 // An entry only exists with >= 1 record; `true` means
                 // every record passed, `false` means at least one failed.
                 let cell = match cells.get(&(topo.clone(), kernel.clone())).copied() {
                     None => comfy_table::Cell::new("-"),
                     Some(true) => {
                         n_pass += 1;
-                        comfy_table::Cell::new("✓")
+                        comfy_table::Cell::new(with_dil("✓"))
                             .fg(comfy_table::Color::Green)
                             .add_attribute(comfy_table::Attribute::Bold)
                     }
                     Some(false) => {
                         n_fail += 1;
-                        comfy_table::Cell::new("✗")
+                        comfy_table::Cell::new(with_dil("✗"))
                             .fg(comfy_table::Color::Red)
                             .add_attribute(comfy_table::Attribute::Bold)
                     }
@@ -1726,11 +1795,11 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mk temp dir");
         // Malformed: no verifier/ prefix, and a 2-segment name (no
         // <preset> after the kernel) — both skipped.
-        write_cell_record(&dir, "not_a_cell", true, &[]);
-        write_cell_record(&dir, "verifier/only/two", true, &[]);
+        write_cell_record(&dir, "not_a_cell", true, &[], None);
+        write_cell_record(&dir, "verifier/only/two", true, &[], None);
         // Well-formed cell: fail, then a retry passes -> overwrites.
         let name = "verifier/scx_a/kernel_6_14/tiny-1llc";
-        write_cell_record(&dir, name, false, &[]);
+        write_cell_record(&dir, name, false, &[], None);
         // The retry passes and carries per-program verified_insns, so the
         // final record has both the PASS outcome and the stats.
         let stats = [
@@ -1743,7 +1812,7 @@ mod tests {
                 verified_insns: 123,
             },
         ];
-        write_cell_record(&dir, name, true, &stats);
+        write_cell_record(&dir, name, true, &stats, Some(1.05));
         let recs = read_cell_records(&dir);
         assert_eq!(
             recs.len(),
@@ -1760,6 +1829,13 @@ mod tests {
         // Per-program verified_insns survive the JSON roundtrip and reflect
         // the final (retry) write, not the earlier stat-less fail.
         assert_eq!(recs[0].stats, stats, "stats roundtrip via serde");
+        // Host dilation survives the JSON roundtrip and reflects the final
+        // (retry) write.
+        assert_eq!(
+            recs[0].dilation,
+            Some(1.05),
+            "dilation roundtrip via serde"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1783,12 +1859,16 @@ mod tests {
         let recs = vec![
             // scx_a across two kernels and two topologies; the
             // (large-4llc, kernel_6_15) cell has no record -> `-`.
+            // scx_a's cells all lack a dilation sample (None) -> each
+            // renders the glyph alone, so its whole section carries no
+            // decimal number (the None-rendering case).
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_14".into(),
                 topology: "tiny-1llc".into(),
                 passed: true,
                 stats: vec![],
+                dilation: None,
             },
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
@@ -1796,6 +1876,7 @@ mod tests {
                 topology: "tiny-1llc".into(),
                 passed: false,
                 stats: vec![],
+                dilation: None,
             },
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
@@ -1803,15 +1884,19 @@ mod tests {
                 topology: "large-4llc".into(),
                 passed: true,
                 stats: vec![],
+                dilation: None,
             },
             // scx_b: a duplicate (scheduler, kernel, topology) triple with
-            // one pass AND one fail -> ✗ (any failure means failure).
+            // one pass AND one fail -> ✗ (any failure means failure). The
+            // two records also carry different dilations (1.10 and 1.40);
+            // the fold keeps the MAX (1.40), rendered in-glyph.
             VerifierCellRecord {
                 scheduler: "scx_b".into(),
                 kernel: "kernel_6_14".into(),
                 topology: "tiny-1llc".into(),
                 passed: true,
                 stats: vec![],
+                dilation: Some(1.10),
             },
             VerifierCellRecord {
                 scheduler: "scx_b".into(),
@@ -1819,6 +1904,7 @@ mod tests {
                 topology: "tiny-1llc".into(),
                 passed: false,
                 stats: vec![],
+                dilation: Some(1.40),
             },
         ];
         let out = render_result_table(&recs).expect("non-empty records -> Some");
@@ -1887,6 +1973,25 @@ mod tests {
             b_tiny.contains('✗') && !b_tiny.contains('✓'),
             "a pass+fail duplicate-record cell renders ✗: {b_tiny}"
         );
+        // Host dilation rides INSIDE the glyph cell. scx_a's cells are all
+        // dilation-None -> glyph alone, so no decimal number appears in
+        // its section (kernel labels / topology names / the tally carry
+        // no '.').
+        assert!(
+            !a_sec.contains('.'),
+            "None-dilation cells render the glyph alone, no number: {a_sec}"
+        );
+        // scx_b's duplicate (pass+fail) triple folds to one ✗ cell whose
+        // in-glyph dilation is the MAX across the folded records — 1.40,
+        // not the lower 1.10 — keeping the ✓/✗ styling around it.
+        assert!(
+            b_sec.contains("✗  1.40"),
+            "folded fail cell shows the max dilation in-glyph: {b_sec}"
+        );
+        assert!(
+            !b_sec.contains("1.10"),
+            "duplicate fold keeps the max dilation, drops the lower: {b_sec}"
+        );
         // Emoji stay OFF the grid rows (they drift box-drawing columns in
         // GitHub's log viewer); the retired glyphs and flat list are gone.
         for row in out.lines().filter(|l| l.contains('│')) {
@@ -1929,6 +2034,7 @@ mod tests {
                         verified_insns: 64,
                     },
                 ],
+                dilation: None,
             },
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
@@ -1945,6 +2051,7 @@ mod tests {
                         verified_insns: 64,
                     },
                 ],
+                dilation: None,
             },
             // scx_a / kernel_6_15: ktstr_dispatch DIFFERS across topologies
             // -> `lo..hi` range; ktstr_enqueue is absent on this kernel
@@ -1958,6 +2065,7 @@ mod tests {
                     name: "ktstr_dispatch".into(),
                     verified_insns: 130,
                 }],
+                dilation: None,
             },
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
@@ -1968,6 +2076,7 @@ mod tests {
                     name: "ktstr_dispatch".into(),
                     verified_insns: 150,
                 }],
+                dilation: None,
             },
             // scx_b: a separate section (its own declaration).
             VerifierCellRecord {
@@ -1979,6 +2088,7 @@ mod tests {
                     name: "ktstr_dispatch".into(),
                     verified_insns: 200,
                 }],
+                dilation: None,
             },
             // scx_a / kernel_6_16: a record but NO stats — every cell died
             // during BPF load, so no program existed to introspect. It must
@@ -1989,6 +2099,7 @@ mod tests {
                 topology: "tiny".into(),
                 passed: false,
                 stats: vec![],
+                dilation: None,
             },
         ];
         let out = render_instruction_count_tables(&recs).expect("stats present -> Some");
@@ -2062,6 +2173,7 @@ mod tests {
             topology: "tiny".into(),
             passed: false,
             stats: vec![],
+            dilation: None,
         }];
         assert!(
             render_instruction_count_tables(&bare).is_none(),
@@ -2375,6 +2487,7 @@ mod tests {
             dispatched,
             timed_out,
             crash_message: None,
+            dilation: None,
         };
 
         // Verified + attached + dispatched, no hang -> PASS.
@@ -2522,6 +2635,7 @@ mod tests {
             dispatched: false,
             timed_out: true,
             crash_message: None,
+            dilation: None,
         };
         let out = format_verifier_output("verifier", &result, false);
         assert!(
@@ -2550,6 +2664,7 @@ mod tests {
             dispatched: false,
             timed_out: false,
             crash_message: None,
+            dilation: None,
         };
         let out = format_verifier_output("verifier", &result, false);
         assert!(
@@ -3405,6 +3520,7 @@ tail\n";
             dispatched: false,
             timed_out: true,
             crash_message: None,
+            dilation: None,
         };
         let out = format_verifier_output("verifier", &result, false);
         assert!(
@@ -3437,6 +3553,7 @@ tail\n";
             dispatched: false,
             timed_out: false,
             crash_message: None,
+            dilation: None,
         };
         // Live stderr arrived, live stdout empty: the merged dump (same
         // bytes as stderr here) must NOT render on stdout.
@@ -3469,6 +3586,7 @@ tail\n";
             dispatched: true,
             timed_out: false,
             crash_message: None,
+            dilation: None,
         };
         assert_eq!(
             format_verifier_stderr("verifier", &empty, false),
@@ -3491,6 +3609,7 @@ tail\n";
             dispatched: false,
             timed_out: false,
             crash_message: None,
+            dilation: None,
         };
         let s = format_verifier_stderr("verifier", &with_err, false);
         assert!(
@@ -3539,6 +3658,7 @@ tail\n";
             dispatched: true,
             timed_out: false,
             crash_message: None,
+            dilation: None,
         };
         insta::assert_snapshot!(format_verifier_output("default", &result, false));
     }
@@ -3565,6 +3685,7 @@ processed 42 insns (limit 1000000) max_states_per_insn 1 total_states 10 peak_st
             dispatched: false,
             timed_out: false,
             crash_message: None,
+            dilation: None,
         };
         insta::assert_snapshot!(format_verifier_output("llc+steal", &result, false));
     }

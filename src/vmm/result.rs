@@ -493,6 +493,16 @@ pub struct VmResult {
     /// variant hash. `0` on a synthesized/fixture result (which has
     /// `entry_name = None` and thus bails before reading this).
     pub variant_hash: u64,
+    /// Host-side vCPU scheduling dilation for this run — RAW schedstat
+    /// totals summed over the vCPU host threads (see
+    /// [`HostVcpuSchedstat`]). Populated by `run_vm` teardown from each
+    /// vCPU thread's `/proc/self/task/<tid>/schedstat` while the threads
+    /// are still alive; `None` on hosts without `CONFIG_SCHEDSTATS`, on
+    /// synthesized/fixture results, and whenever no vCPU thread was
+    /// sampled. Consumers call [`HostVcpuSchedstat::dilation`] for the
+    /// derived `D` ratio. Purely observational — never affects the
+    /// verdict or exit code.
+    pub host_vcpu_schedstat: Option<HostVcpuSchedstat>,
     /// Memoized single drain of [`Self::snapshot_bridge`].
     ///
     /// The snapshot bridge yields each capture exactly once, but two
@@ -1170,6 +1180,7 @@ impl VmResult {
             kern_kaslr_offset: 0,
             entry_name: None,
             variant_hash: 0,
+            host_vcpu_schedstat: None,
             periodic_series_cache: std::sync::OnceLock::new(),
         }
     }
@@ -1361,6 +1372,55 @@ impl VmResult {
 pub(crate) fn empty_snapshot_bridge_for_tests() -> crate::scenario::snapshot::SnapshotBridge {
     let cb: crate::scenario::snapshot::CaptureCallback = std::sync::Arc::new(|_| None);
     crate::scenario::snapshot::SnapshotBridge::new(cb)
+}
+
+/// Host-side vCPU scheduling-dilation sample, summed over the run's
+/// vCPU host threads.
+///
+/// Dilation `D = 1 + Σrun_delay / Σon_cpu`, where the two sums are
+/// taken over each vCPU host thread's `/proc/self/task/<tid>/schedstat`
+/// (field 1 = time on-CPU ns, field 2 = time runnable-but-not-running
+/// ns). `D == 1.0` means the vCPU threads always got the CPU the instant
+/// they were runnable; `D > 1.0` quantifies host-side scheduling delay
+/// (e.g. `1.03x` = threads waited 3% on top of their run time).
+///
+/// Idle-immune: a halted vCPU is blocked (not runnable), so it accrues
+/// no `run_delay` — halt time never inflates `D`. Measured HOST-side
+/// deliberately: the guest run-queue's own `run_delay` would measure the
+/// scheduler under test, which is the thing being evaluated; the host
+/// thread's schedstat measures the CPU the vCPU thread was starved of by
+/// the HOST, orthogonal to the guest scheduler.
+///
+/// RAW totals are stored (not the ratio) so future consumers can
+/// recompute or re-aggregate; [`Self::dilation`] derives the ratio.
+///
+/// `total_on_cpu_ns == 0` yields `dilation() == None` — this happens
+/// BOTH when no vCPU thread ran at all AND on a host built without
+/// `CONFIG_SCHEDSTATS` (every schedstat line reads `"0 0 0"`). `None` is
+/// thus graceful and distinguishable from a genuine `D == 1.0`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HostVcpuSchedstat {
+    /// Σ schedstat field 1 (time the vCPU threads spent ON-CPU), ns.
+    pub total_on_cpu_ns: u64,
+    /// Σ schedstat field 2 (time the vCPU threads spent runnable but
+    /// not running — host-side scheduling delay), ns.
+    pub total_run_delay_ns: u64,
+    /// Number of vCPU host threads that contributed to the sums (a TID
+    /// still 0 — an AP that never stamped its TID — and an unreadable
+    /// schedstat are both skipped).
+    pub sampled_vcpus: u32,
+}
+
+impl HostVcpuSchedstat {
+    /// Host dilation `D = 1 + Σrun_delay / Σon_cpu`, or `None` when no
+    /// on-CPU time was sampled (no vCPU ran, or the host lacks
+    /// `CONFIG_SCHEDSTATS` and every line read `"0 0 0"`). `None` is
+    /// deliberately distinguishable from a true `D == 1.0` (which needs
+    /// nonzero on-CPU time with zero run-delay).
+    pub fn dilation(&self) -> Option<f64> {
+        (self.total_on_cpu_ns > 0)
+            .then(|| 1.0 + self.total_run_delay_ns as f64 / self.total_on_cpu_ns as f64)
+    }
 }
 
 /// Per-vCPU KVM stats read after VM exit. Each map holds cumulative
@@ -1627,6 +1687,12 @@ pub(crate) struct VmRunState {
     /// [`VmResult::periodic_target`] so test code can compute
     /// coverage as `fired / target`.
     pub(crate) periodic_target: u32,
+    /// Host-side vCPU scheduling-dilation sample, read at `run_vm`
+    /// teardown from each vCPU thread's `/proc/self/task/<tid>/schedstat`
+    /// (see [`HostVcpuSchedstat`]). Forwarded verbatim to
+    /// [`VmResult::host_vcpu_schedstat`]. `None` on hosts without
+    /// `CONFIG_SCHEDSTATS` or when no vCPU thread was sampled.
+    pub(crate) host_vcpu_schedstat: Option<HostVcpuSchedstat>,
 }
 #[cfg(test)]
 mod tests {
@@ -1682,6 +1748,39 @@ mod tests {
             }],
         });
         assert_eq!(bad.scheduler_log(), "", "crc-bad frame dropped -> empty");
+    }
+
+    /// `HostVcpuSchedstat::dilation` = `1 + run_delay/on_cpu`, `None`
+    /// when no on-CPU time was sampled (idle/no-vCPU or a
+    /// CONFIG_SCHEDSTATS-off host reading `0 0 0`). Directional endpoints:
+    /// zero run-delay -> exactly 1.0; run-delay == on-cpu -> 2.0; zero
+    /// on-cpu -> None (distinguishable from a genuine 1.0).
+    #[test]
+    fn host_vcpu_schedstat_dilation_endpoints() {
+        // R == 0 -> D == 1.0 (always got the CPU when runnable).
+        let d = HostVcpuSchedstat {
+            total_on_cpu_ns: 1_000,
+            total_run_delay_ns: 0,
+            sampled_vcpus: 1,
+        }
+        .dilation();
+        assert_eq!(d, Some(1.0), "no run delay -> exactly 1.0");
+        // R == C -> D == 2.0 (waited as long as it ran).
+        let d = HostVcpuSchedstat {
+            total_on_cpu_ns: 1_000,
+            total_run_delay_ns: 1_000,
+            sampled_vcpus: 2,
+        }
+        .dilation();
+        assert_eq!(d, Some(2.0), "run delay == on-cpu -> 2.0");
+        // C == 0 -> None (no on-cpu time: idle, no vCPU, or schedstats off).
+        let d = HostVcpuSchedstat {
+            total_on_cpu_ns: 0,
+            total_run_delay_ns: 500,
+            sampled_vcpus: 0,
+        }
+        .dilation();
+        assert_eq!(d, None, "zero on-cpu -> None, not a synthetic 1.0");
     }
 
     /// A StepStart/StepEnd/terminal `StimulusEvent` for the

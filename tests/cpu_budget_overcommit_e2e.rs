@@ -18,9 +18,39 @@
 use anyhow::{Result, ensure};
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
-use ktstr::prelude::WorkType;
+use ktstr::prelude::{VmResult, WorkType};
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{HoldSpec, Step, execute_steps};
+
+/// post_vm: the same 4x overcommit that accrues guest steal (above) also
+/// shows up host-side as vCPU scheduling dilation. With 8 vCPU threads
+/// masked onto 2 host CPUs, each thread spends real time runnable but not
+/// running, so `D = 1 + Σ host run_delay / Σ host on_cpu` exceeds 1.0.
+/// This is the host-side counterpart of the guest-steal gate: steal is
+/// what the guest sees, dilation is what the host scheduler did to the
+/// vCPU threads. Directional lower bound only (> 1.0) — the exact figure
+/// moves with host load. `Some` requires CONFIG_SCHEDSTATS on the host
+/// (the CI runners carry it).
+fn assert_overcommit_dilation(result: &VmResult) -> Result<()> {
+    let d = result
+        .host_vcpu_schedstat
+        .as_ref()
+        .and_then(|s| s.dilation())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no host vCPU dilation sampled — CONFIG_SCHEDSTATS must be set on the host \
+                 and at least one vCPU thread must have run"
+            )
+        })?;
+    ensure!(
+        d > 1.0,
+        "expected host vCPU dilation > 1.0 under 4x cpu_budget overcommit \
+         (8 vCPU threads masked to 2 host CPUs) but got {d:.3}x — the vCPU \
+         threads were not host-starved, so the cpu_budget mask may not be \
+         enforced"
+    );
+    Ok(())
+}
 
 /// Steal time (USER_HZ ticks) from the aggregate `cpu` line of
 /// `/proc/stat`. Field layout after the `cpu` label: user nice system idle
@@ -51,7 +81,8 @@ fn read_steal_ticks() -> Result<u64> {
     threads = 1,
     no_perf_mode,
     cpu_budget = 2,
-    duration_s = 5
+    duration_s = 5,
+    post_vm = assert_overcommit_dilation,
 )]
 fn cpu_budget_overcommit_accrues_guest_steal(ctx: &Ctx) -> Result<AssertResult> {
     let total = ctx.topo.total_cpus();

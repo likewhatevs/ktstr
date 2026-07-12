@@ -66,6 +66,23 @@ fn assert_perphase_metrics_survive_detach(result: &VmResult) -> Result<()> {
         !v.is_inconclusive(),
         "better_across_phases was inconclusive — could not read both phases or orient by polarity"
     );
+
+    // Gate 3: host-side vCPU scheduling dilation is sampled and stays low.
+    // performance_mode pins each vCPU 1:1 to a host CPU, so the vCPU
+    // threads are never meaningfully starved of the host CPU — dilation
+    // (D = 1 + host run_delay / host on_cpu) sits near 1.0. Directional
+    // upper bound only (< 1.5), never an exact value: host noise moves the
+    // low-order digits. `Some` requires CONFIG_SCHEDSTATS on the host (the
+    // CI runners carry it); on a schedstats-off host this would read None.
+    let d = result
+        .host_vcpu_schedstat
+        .as_ref()
+        .and_then(|s| s.dilation())
+        .expect("host schedstat sampled (CONFIG_SCHEDSTATS present on the host)");
+    anyhow::ensure!(
+        d < 1.5,
+        "performance_mode pins vCPUs 1:1, so host dilation should stay near 1.0; got {d:.3}x"
+    );
     Ok(())
 }
 
