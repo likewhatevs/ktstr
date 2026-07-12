@@ -11,6 +11,14 @@ use kvm_bindings::{
 use kvm_ioctls::{Cap, DeviceFd, Kvm, VcpuFd, VmFd};
 use std::mem::ManuallyDrop;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
+use vmm_sys_util::ioctl_iow_nr;
+
+// `kvm_ioctls::VmFd::enable_cap` is cfg-gated to x86_64/s390x/powerpc even
+// though `KVM_ENABLE_CAP` on a VM fd is "Architectures: all" in the kernel
+// (Documentation/virt/kvm/api.rst 7.x; include/uapi/linux/kvm.h:
+// `_IOW(KVMIO, 0xa3, struct kvm_enable_cap)`), so arm64 issues the ioctl
+// directly — same raw-ioctl pattern as `kvm_stats::KVM_GET_STATS_FD`.
+ioctl_iow_nr!(KVM_ENABLE_CAP_VM, kvm_bindings::KVMIO, 0xa3, kvm_enable_cap);
 
 use crate::vmm::numa_mem::{NumaMemoryLayout, ReservationGuard};
 use crate::vmm::topology::Topology;
@@ -253,7 +261,18 @@ impl KtstrKvm {
             ..Default::default()
         };
         cap.args[0] = halt_poll_ns;
-        if let Err(e) = self.vm_fd.enable_cap(&cap) {
+        // Raw ioctl: `VmFd::enable_cap` is not exposed on aarch64 by
+        // kvm-ioctls (cfg-gated to x86_64/s390x/powerpc) though the VM-fd
+        // ioctl itself is architecture-generic — see the
+        // `KVM_ENABLE_CAP_VM` definition at the top of this file.
+        // SAFETY: `vm_fd` is a live KVM VM fd for the whole `&self` borrow;
+        // `cap` is a properly initialized `kvm_enable_cap` matching the
+        // ioctl's write-only argument struct.
+        let ret = unsafe {
+            vmm_sys_util::ioctl::ioctl_with_ref(&*self.vm_fd, KVM_ENABLE_CAP_VM(), &cap)
+        };
+        if ret < 0 {
+            let e = std::io::Error::last_os_error();
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| {
                 eprintln!(
