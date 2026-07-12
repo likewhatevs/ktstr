@@ -151,21 +151,22 @@ retries = 3
 
 # Wide-SMP boot tests: every ~256-vCPU topology (16-LLC × 16-core, or
 # 14×9×2) overcommits its vCPU threads onto the host cpuset (~1.3x on a
-# 192-CPU runner). The boot wall-clock grows with the overcommit ratio,
-# so `vm_timeout_from_entry` scales the boot headroom by that ratio
-# (clamped at 6x), giving each VM a per-VM framework watchdog of up to
-# ~470s at the near-6x auto-skip boundary (base max(watchdog_timeout_s,
-# duration, 1) + vm_boot_headroom(256)=58.4s × 6). The binding case is
-# pos_expect_auto_repro_satisfied_wide_smp: it boots TWO 256-vCPU VMs
-# sequentially (primary + auto-repro), each with its OWN ~470s watchdog,
-# so a healthy two-VM run can reach ~940s. That two-VM wprof-inversion
-# chain now auto-skips above EXPECT_AUTO_REPRO_SKIP_RATIO (2.0x) — far
-# below the 6x boot cap — because its repro-VM trace transport is fragile
-# under host time-slicing; so it RUNS (and can reach ~940s) only on a host
-# with MORE than 128 CPUs (256 vCPUs at < 2.0x; exactly 128 CPUs = 2.0x
-# SKIPS, the cap being inclusive) and SKIPS cleanly on a 96-CPU runner
-# (2.7x) instead of hard-failing, while single-VM wide-SMP boot tests keep
-# the 6x cap. slow-timeout 960s/terminate-after 1 covers that two-VM
+# 192-CPU runner). Boot wall-clock stretches under that overcommit, but
+# the wall deadline no longer scales with it: `vm_timeout_from_entry` is
+# the Tier-3 dead-man formula (base max(watchdog_timeout_s, duration, 1)
+# + vm_boot_headroom(256)=58.4s × DEADMAN_HEADROOM_MULT=3 ≈ 235s for
+# these tests), and a slow-but-progressing boot is protected by the
+# progress watchdog instead of a ratio-scaled deadline. The binding case
+# is pos_expect_auto_repro_satisfied_wide_smp: it boots TWO 256-vCPU VMs
+# sequentially (primary + auto-repro), each with its OWN ~235s deadman,
+# so a healthy two-VM run can reach ~470s. That two-VM wprof-inversion
+# chain auto-skips above EXPECT_AUTO_REPRO_SKIP_RATIO (2.0x) — far below
+# the OVERCOMMIT_SKIP_RATIO (6x) boot-or-skip gate — because its repro-VM
+# trace transport is fragile under host time-slicing; so it RUNS only on
+# a host with MORE than 128 CPUs (256 vCPUs at < 2.0x; exactly 128 CPUs =
+# 2.0x SKIPS, the cap being inclusive) and SKIPS cleanly on a 96-CPU
+# runner (2.7x) instead of hard-failing, while single-VM wide-SMP boot
+# tests keep the 6x skip gate. slow-timeout 960s/terminate-after 1 covers that two-VM
 # worst running case so the per-VM framework watchdog fires FIRST (a
 # clean failure dump) rather than nextest blunt-killing a still-booting
 # second VM; single-VM wide tests fail at their ≤470s watchdog long
@@ -198,11 +199,12 @@ slow-timeout = { period = "10s", terminate-after = 2 }
 filter = "test(boot_kernel) | test(bench_boot)"
 slow-timeout = { period = "180s", terminate-after = 2 }
 
-# Verifier cells: the internal VM watchdog is a 120s lifecycle base
-# plus vCPU/oversubscription-scaled boot headroom plus the extend-only
-# scheduler-attach reset (`verifier_vm_timeout` +
+# Verifier cells: the internal VM wall deadline (Tier-3 dead-man) is a
+# 120s lifecycle base plus vm_boot_headroom(vcpus) x 3 plus the
+# extend-only scheduler-attach reset (`verifier_vm_timeout` +
 # `VERIFIER_WORKLOAD_BUDGET` in test_support/runtime.rs) — worst case
-# ~440s for a 128-vCPU preset at the 6x headroom cap. nextest must
+# ~415s for a 256-vCPU preset (295.2s + 60s); wedges die far earlier on
+# the progress watchdog's per-phase budgets. nextest must
 # exceed that so the watchdog verdict, not a nextest kill, decides the
 # cell (240s x 2 = 480s; the ci profile's 180s x 3 = 540s already
 # clears it). Cell names are slash-delimited
@@ -276,7 +278,7 @@ retries = 0
 # Wide-SMP boot tests: mirror of the profile.ci override (nextest does
 # not inherit overrides across profiles). 960s/terminate-after 1 covers
 # the two-VM auto-repro test's worst running case so the per-VM framework
-# watchdog (vm_timeout_from_entry, oversub-scaled boot headroom) fires
+# watchdog (vm_timeout_from_entry, flat dead-man boot headroom) fires
 # before nextest's kill even under a local dev box's higher overcommit
 # ratio; the wide-smp test-group serializes the heavy 256-vCPU boots.
 # See the profile.ci copy for the full rationale.

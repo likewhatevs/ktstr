@@ -667,7 +667,10 @@ pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<Stri
 /// oversubscribed boot its `send_sys_rdy_with_retry` loop may exhaust
 /// and WARN, but that is non-fatal (the host monitor's `data_valid`
 /// gate keeps reads safe). The host's [`vm_timeout_from_entry`] is the
-/// authoritative deadline and DOES scale by the overcommit ratio.
+/// Tier-3 dead-man deadline this budget feeds; it multiplies the
+/// headroom by a flat [`DEADMAN_HEADROOM_MULT`] and no longer scales by
+/// the host overcommit ratio — the progress watchdog's Tier-1/2 rules,
+/// not the wall deadline, now absorb an oversubscribed host.
 pub(crate) const fn sys_rdy_budget_ms(vcpus: u32) -> u64 {
     const BASE_MS: u64 = 10_000;
     const CAP_MS: u64 = 90_000;
@@ -813,8 +816,8 @@ const COLD_BTF_PHASE1_BUDGET: Duration = Duration::from_secs(30);
 
 /// Oversubscription ratio at or beyond which a default/no-perf (auto)
 /// overcommit is SKIPPED rather than booted. Above it the host
-/// time-slices the vCPU threads so heavily the boot would race even the
-/// oversub-scaled [`vm_timeout_from_entry`] deadline, so the dispatch
+/// time-slices the vCPU threads so heavily the boot cannot make forward
+/// progress, so the dispatch
 /// (`run_ktstr_test_inner_impl`) skips with a "host topology
 /// insufficient" signal instead of hard-failing. Set above the 4× the
 /// `cpu_budget` overcommit tests deliberately exercise (those carry an
@@ -824,16 +827,23 @@ const COLD_BTF_PHASE1_BUDGET: Duration = Duration::from_secs(30);
 /// rather than skipping, so the boot invariant is never masked.
 pub(crate) const OVERCOMMIT_SKIP_RATIO: f64 = 6.0;
 
-/// Ceiling on the boot-headroom oversubscription multiplier in
-/// [`vm_timeout_from_entry`]. The boot-headroom term is multiplied by
-/// the host overcommit ratio (an oversubscribed boot's wall-clock grows
-/// ~linearly with the ratio as the host time-slices the vCPU threads),
-/// clamped here so the deadline stays bounded. Kept equal to
-/// [`OVERCOMMIT_SKIP_RATIO`] so the scaled deadline always covers every
-/// ratio that is allowed to run: auto-collapse beyond the ratio skips,
-/// and an explicit `cpu_budget` deeper than this clamp is a deliberate
-/// extreme the author budgets for via `duration`/`watchdog_timeout`.
-const OVERCOMMIT_HEADROOM_CAP: f64 = OVERCOMMIT_SKIP_RATIO;
+/// Flat multiplier on the vCPU-scaled [`vm_boot_headroom`] term of the
+/// Tier-3 dead-man deadline ([`vm_timeout_from_entry`] and
+/// [`verifier_vm_timeout`]). The approved ~2.5x rounded up to an
+/// integer — integer math, and the extra generosity is free here.
+///
+/// This is NOT a timeout bump. The progress watchdog's Tier-1
+/// (CPU-burned-without-progress) and Tier-2 (silent idle-wedge) rules in
+/// [`crate::vmm::freeze_coord::watchdog_step`] are the primary hang
+/// detectors: a wedge dies on those tiers inside a bounded per-phase
+/// budget no matter how loose this deadline is, and a healthy-but-slow
+/// cell is progress-protected by the same tiers. So no healthy or wedged
+/// cell ever reaches Tier-3 — it fires only when the progress machinery
+/// itself is dead (a monitor-dead pathology or the unforeseen). That is
+/// why overcommit scaling is retired from this path: Tier-1/2, not a
+/// wall-clock oversub multiplier, now absorb a loaded host, and a flat
+/// generous factor suffices as the dead-man's switch.
+const DEADMAN_HEADROOM_MULT: u32 = 3;
 
 /// Stricter skip ratio for the `expect_auto_repro` chain. That inversion
 /// boots a SECOND wide-SMP VM which must replay the forced failure and land
@@ -841,7 +851,7 @@ const OVERCOMMIT_HEADROOM_CAP: f64 = OVERCOMMIT_SKIP_RATIO;
 /// time-slicing than a single boot: the repro VM's system-wide wprof
 /// capture over hundreds of vCPUs stops reliably producing a transportable
 /// trace once the host oversubscribes (the boots themselves still finish
-/// inside the oversub-scaled deadline; the trace transport is what breaks).
+/// inside the Tier-3 dead-man deadline; the trace transport is what breaks).
 /// So this chain auto-skips well below the generic [`OVERCOMMIT_SKIP_RATIO`],
 /// while single-VM wide-SMP BOOT tests keep running (and validating boot) up
 /// to the generic cap. Tuned to sit between the ~1.3x a 256-vCPU guest hits
@@ -861,14 +871,17 @@ pub(crate) const EXPECT_AUTO_REPRO_SKIP_RATIO: f64 = 2.0;
 /// `allowed < vcpus`, else a fitting 1:1 pin). Under
 /// `KTSTR_CARGO_TEST_MODE` the planner ignores the explicit budget and
 /// masks to the full allowed cpuset, so with a `cpu_budget` the
-/// returned ratio is an UPPER bound there — deadline-safe, since
-/// over-estimating only lengthens the timeout (CI runs `cargo ktstr
-/// test` with that mode OFF, where the budget IS enforced and the ratio
-/// is exact). Floored at 1.0 (a
-/// fitting host is never under-subscribed for timeout purposes) and
-/// divide-by-zero-guarded (an unenumerable cpuset yields 1.0). Pure
-/// over `(vcpus, allowed_cpus, cpu_budget)` so the scaling is
-/// unit-testable without reading the host cpuset.
+/// returned ratio is an UPPER bound there (CI runs `cargo ktstr test`
+/// with that mode OFF, where the budget IS enforced and the ratio is
+/// exact). Floored at 1.0 (a fitting host is never under-subscribed) and
+/// divide-by-zero-guarded (an unenumerable cpuset yields 1.0).
+///
+/// Feeds only the boot-or-skip gate ([`overcommit_skip_reason`]) and the
+/// operator overcommit warning — NOT the Tier-3 dead-man deadline, which
+/// no longer scales with this ratio (the progress watchdog's Tier-1/2
+/// rules absorb a loaded host). Pure over `(vcpus, allowed_cpus,
+/// cpu_budget)` so the skip boundary is unit-testable without reading the
+/// host cpuset.
 pub(crate) fn overcommit_ratio(vcpus: u32, allowed_cpus: usize, cpu_budget: Option<u32>) -> f64 {
     let allowed = allowed_cpus.max(1);
     let effective = match cpu_budget {
@@ -883,8 +896,8 @@ pub(crate) fn overcommit_ratio(vcpus: u32, allowed_cpus: usize, cpu_budget: Opti
 /// `None` to run it. The default/no-perf path collapses the vCPU threads
 /// onto the allowed cpuset (`build_overcommit_run_locks` /
 /// `no_perf_cpu_budget`); at or beyond [`OVERCOMMIT_SKIP_RATIO`] the host
-/// time-slices so hard the boot would race even the oversub-scaled
-/// [`vm_timeout_from_entry`] deadline, so the dispatch
+/// time-slices so hard the boot cannot make forward progress, so the
+/// dispatch
 /// (`run_ktstr_test_inner_impl`) skips with this reason — the "overcommit
 /// OR auto-skip, never hard-fail" contract. Returns `None` (runs) for:
 /// the fitting / mildly-oversubscribed case (< the ratio, e.g. a 256-vCPU
@@ -931,30 +944,38 @@ pub(crate) fn overcommit_skip_reason(
 }
 
 /// Derive the host-side VM timeout from the test entry's watchdog and
-/// duration. Adds vCPU-scaled boot headroom so the workload gets its
-/// full duration even after a slow boot on a large topology, then
-/// multiplies THAT headroom by the host [`overcommit_ratio`] (clamped
-/// to [`OVERCOMMIT_HEADROOM_CAP`]) so an oversubscribed boot — whose
-/// wall-clock grows ~linearly with the ratio as the host time-slices
-/// the vCPU threads — still finishes inside the deadline. Only the boot
-/// headroom scales: `base` is the guest's own workload/watchdog budget
-/// plus the absolute host-side [`COLD_BTF_PHASE1_BUDGET`], neither of
-/// which is the AP-bring-up wall time the ratio models; the headroom's
-/// slack absorbs the small extra host wall-clock a short workload
-/// accrues under time-slicing. [`COLD_BTF_PHASE1_BUDGET`] is added when
-/// the entry declares a `bpf_map_write` (the guest blocks on the host's
-/// cold-BTF accessor build before the workload starts), and
+/// duration. This is the watchdog's TIER-3 dead-man's switch — the
+/// generous wall-clock backstop, NOT the primary hang detector. The
+/// primary detectors are the progress watchdog's Tier-1
+/// (CPU-burned-without-progress) and Tier-2 (silent idle-wedge) rules in
+/// [`crate::vmm::freeze_coord::watchdog_step`]: a wedge dies on those
+/// tiers inside a bounded per-phase budget, and a healthy-but-slow cell
+/// is progress-protected by them. So no healthy or wedged cell reaches
+/// this deadline; it fires only when the progress machinery itself is
+/// dead (a monitor-dead pathology or the unforeseen).
+///
+/// Shape: `base + vm_boot_headroom(booted_vcpus) * DEADMAN_HEADROOM_MULT`.
+/// The vCPU-scaled boot headroom covers a slow boot on a large topology;
+/// the flat [`DEADMAN_HEADROOM_MULT`] makes it generous. This is NOT a
+/// timeout bump and does NOT scale with the host overcommit ratio — the
+/// old oversub multiplier existed to stop wall-clock false-timeouts on a
+/// loaded host, a job Tier-1/2 now own, so a flat generous factor
+/// replaces it (and the overcommit-scaling machinery is retired from this
+/// path). `base` is the guest's own workload/watchdog budget:
+/// [`COLD_BTF_PHASE1_BUDGET`] is added when the entry declares a
+/// `bpf_map_write` (the guest blocks on the host's cold-BTF accessor
+/// build before the workload starts), and
 /// [`crate::vmm::freeze_coord::WPROF_SHIP_GRACE`] when it declares
 /// `wprof` (a crashing scheduler's late Phase-5 trace ship is held for
-/// that window before teardown).
+/// that window before teardown). The soft (reset) deadline rides this
+/// Tier-3 value via `max(reset, hard_deadline)`.
 ///
 /// `booted_vcpus` is the vCPU count of the topology the VM actually
 /// boots (`resolve_vm_topology(entry, topo).0.total_cpus()`), NOT the
 /// declared `entry.topology`: under a `TopoOverride` (gauntlet preset /
-/// `--ktstr-topo`) they diverge, and both the vCPU-scaled boot headroom
-/// and the oversubscription multiplier must scale to the topology that
-/// boots — otherwise the watchdog fires mid-boot on a larger-than-declared
-/// preset.
+/// `--ktstr-topo`) they diverge, and the vCPU-scaled boot headroom must
+/// scale to the topology that boots — otherwise the deadline is sized for
+/// a smaller-than-booted preset.
 pub(crate) fn vm_timeout_from_entry(
     entry: &super::entry::KtstrTestEntry,
     booted_vcpus: u32,
@@ -974,20 +995,13 @@ pub(crate) fn vm_timeout_from_entry(
     if entry.wprof {
         base += crate::vmm::freeze_coord::WPROF_SHIP_GRACE;
     }
-    let vcpus = booted_vcpus;
-    let oversub = overcommit_ratio(
-        vcpus,
-        crate::vmm::host_topology::host_allowed_cpus().len(),
-        entry.cpu_budget,
-    )
-    .min(OVERCOMMIT_HEADROOM_CAP);
-    base + vm_boot_headroom(vcpus).mul_f64(oversub)
+    base + vm_boot_headroom(booted_vcpus) * DEADMAN_HEADROOM_MULT
 }
 
 /// Base host-side budget for a verifier sweep cell's guest lifecycle
 /// past boot: scheduler spawn, BPF load/verify, attach gate, the
 /// dispatch probe, and teardown. The boot phase is budgeted
-/// separately by the vCPU- and oversubscription-scaled headroom in
+/// separately by the vCPU-scaled dead-man headroom in
 /// [`verifier_vm_timeout`], mirroring [`vm_timeout_from_entry`]'s
 /// base-vs-headroom split.
 pub(crate) const VERIFIER_BASE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1005,25 +1019,17 @@ pub(crate) const VERIFIER_BASE_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) const VERIFIER_WORKLOAD_BUDGET: Duration = Duration::from_secs(60);
 
 /// Host-side VM timeout for a verifier sweep cell: the flat
-/// [`VERIFIER_BASE_TIMEOUT`] plus the same oversubscription-scaled
-/// boot headroom the `#[ktstr_test]` path gets from
-/// [`vm_timeout_from_entry`]. The sweep previously hard-coded 120s
-/// with no headroom at all, so a wide-topology cell (128 vCPUs) that
-/// boots fine but slowly under CI concurrency was killed mid-attach
-/// — reported by the scx verifier sweep as a VM timeout (now worded
-/// "hung with no confirmed scheduler attach" for that shape).
+/// [`VERIFIER_BASE_TIMEOUT`] plus the same vCPU-scaled dead-man boot
+/// headroom the `#[ktstr_test]` path gets from [`vm_timeout_from_entry`]
+/// — its Tier-3 backstop, not the primary hang detector (Tier-1/2 in
+/// [`crate::vmm::freeze_coord::watchdog_step`] own that). The sweep
+/// previously hard-coded 120s with no headroom at all, so a
+/// wide-topology cell (128 vCPUs) that boots fine but slowly under CI
+/// concurrency was killed mid-attach — reported by the scx verifier
+/// sweep as a VM timeout (now worded "hung with no confirmed scheduler
+/// attach" for that shape).
 pub(crate) fn verifier_vm_timeout(booted_vcpus: u32) -> Duration {
-    verifier_vm_timeout_for(
-        booted_vcpus,
-        crate::vmm::host_topology::host_allowed_cpus().len(),
-    )
-}
-
-/// Pure core of [`verifier_vm_timeout`] over `(vcpus, allowed_cpus)`
-/// so the scaling is unit-testable without reading the host cpuset.
-pub(crate) fn verifier_vm_timeout_for(booted_vcpus: u32, allowed_cpus: usize) -> Duration {
-    let oversub = overcommit_ratio(booted_vcpus, allowed_cpus, None).min(OVERCOMMIT_HEADROOM_CAP);
-    VERIFIER_BASE_TIMEOUT + vm_boot_headroom(booted_vcpus).mul_f64(oversub)
+    VERIFIER_BASE_TIMEOUT + vm_boot_headroom(booted_vcpus) * DEADMAN_HEADROOM_MULT
 }
 
 /// Configure the ktstr_test VM builder prefix shared by the main
@@ -1230,25 +1236,6 @@ mod tests {
     use super::super::entry::Scheduler;
     use super::super::test_helpers::{EnvVarGuard, lock_env};
     use super::*;
-
-    /// RAII pin of the host allowed-CPU set so [`vm_timeout_from_entry`]'s
-    /// overcommit scaling is deterministic regardless of the runner's
-    /// real cpuset. Mirrors `host_topology::tests::AllowedCpusGuard`
-    /// (which is private to that test module). Sets the thread-local
-    /// `ALLOWED_CPUS_OVERRIDE` and clears it on drop so a panicking test
-    /// never leaks the override to a sibling sharing the thread.
-    struct AllowedCpusPin;
-    impl AllowedCpusPin {
-        fn new(cpus: Vec<usize>) -> Self {
-            crate::vmm::host_topology::ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = Some(cpus));
-            AllowedCpusPin
-        }
-    }
-    impl Drop for AllowedCpusPin {
-        fn drop(&mut self) {
-            crate::vmm::host_topology::ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = None);
-        }
-    }
 
     #[test]
     fn vm_timeout_from_entry_adds_cold_btf_budget_for_bpf_map_write() {
@@ -2560,13 +2547,14 @@ mod tests {
 
     // -- vm_timeout_from_entry tests --
 
+    // The Tier-3 dead-man deadline is `base + vm_boot_headroom(vcpus) *
+    // DEADMAN_HEADROOM_MULT`; the headroom no longer scales by the host
+    // overcommit ratio, so these are host-cpuset-independent (no pin).
+
     #[test]
     fn vm_timeout_from_entry_uses_watchdog_when_largest() {
-        // DEFAULT topology = 2 vCPUs → sys_rdy_budget_ms = 10_300
-        // (10_000 base + 2×150) → vm_boot_headroom = 20.3 s; base =
-        // max(60s, 30s, 1s) = 60s. Pin a wide cpuset so 2 vCPUs are
-        // never oversubscribed (overcommit_ratio floors to 1.0).
-        let _pin = AllowedCpusPin::new((0..256).collect());
+        // DEFAULT topology = 2 vCPUs → vm_boot_headroom(2) = 20.3 s ×3 =
+        // 60.9 s. base = max(60s, 30s, 1s) = 60s → 120.9 s.
         let entry = KtstrTestEntry {
             name: "wdog",
             watchdog_timeout: Duration::from_secs(60),
@@ -2575,30 +2563,28 @@ mod tests {
         };
         assert_eq!(
             vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
-            Duration::from_millis(80_300)
+            Duration::from_millis(120_900)
         );
     }
 
     #[test]
     fn vm_timeout_from_entry_uses_duration_when_largest() {
-        let _pin = AllowedCpusPin::new((0..256).collect());
         let entry = KtstrTestEntry {
             name: "dur",
             watchdog_timeout: Duration::from_secs(5),
             duration: Duration::from_secs(120),
             ..KtstrTestEntry::DEFAULT
         };
-        // base = max(5s, 120s, 1s) = 120s; vm_boot_headroom(2) = 20.3 s.
+        // base = max(5s, 120s, 1s) = 120s; headroom(2)×3 = 60.9 s.
         assert_eq!(
             vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
-            Duration::from_millis(140_300)
+            Duration::from_millis(180_900)
         );
     }
 
     #[test]
     fn vm_timeout_from_entry_floor_when_both_small() {
-        // base floors at 1 s; vm_boot_headroom for 2 vCPUs is 20.3 s.
-        let _pin = AllowedCpusPin::new((0..256).collect());
+        // base floors at 1 s; headroom(2)×3 = 60.9 s → 61.9 s.
         let entry = KtstrTestEntry {
             name: "tiny",
             watchdog_timeout: Duration::from_millis(10),
@@ -2607,36 +2593,31 @@ mod tests {
         };
         assert_eq!(
             vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
-            Duration::from_millis(21_300)
+            Duration::from_millis(61_900)
         );
     }
 
     #[test]
     fn vm_timeout_from_default_entry() {
         // DEFAULT watchdog = 5 s, duration = 12 s → base = 12 s.
-        // vm_boot_headroom for 2 vCPUs = 20.3 s → 32.3 s total.
-        let _pin = AllowedCpusPin::new((0..256).collect());
+        // headroom(2)×3 = 60.9 s → 72.9 s total.
         let entry = KtstrTestEntry {
             name: "default",
             ..KtstrTestEntry::DEFAULT
         };
         assert_eq!(
             vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
-            Duration::from_millis(32_300)
+            Duration::from_millis(72_900)
         );
     }
 
     #[test]
     fn vm_timeout_from_entry_scales_headroom_with_topology() {
         // A reported case: numa=1, llcs=7, cores=9, threads=2 → 126 vCPUs.
-        // sys_rdy_budget_ms(126) = 28_900 ms (10_000 base + 126×150) →
-        // vm_boot_headroom = 38.9 s. base = max(5 s watchdog, 12 s
-        // duration, 1 s) = 12 s → total = 50.9 s.
-        // Pins the `entry.topology.total_cpus()` → `vm_boot_headroom` wiring.
-        // Pin a 256-CPU cpuset so 126 vCPUs are not oversubscribed
-        // (overcommit_ratio = 126/256 floors to 1.0); the oversub
-        // multiplier is exercised separately below.
-        let _pin = AllowedCpusPin::new((0..256).collect());
+        // vm_boot_headroom(126) = 38.9 s ×3 = 116.7 s. base = max(5 s
+        // watchdog, 12 s duration, 1 s) = 12 s → total = 128.7 s.
+        // Pins the `entry.topology.total_cpus()` → `vm_boot_headroom`
+        // wiring; the flat ×3 headroom is host-cpuset-independent.
         let entry = KtstrTestEntry {
             name: "large_topo",
             topology: crate::vmm::topology::Topology {
@@ -2651,7 +2632,7 @@ mod tests {
         };
         assert_eq!(
             vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
-            Duration::from_millis(50_900)
+            Duration::from_millis(128_700)
         );
     }
 
@@ -2661,24 +2642,21 @@ mod tests {
         // entry.topology declares; the boot-headroom deadline must scale
         // to the BOOTED count passed in, not entry.topology. A default
         // 2-vCPU entry "booted" at 126 vCPUs must get the 126-vCPU
-        // headroom (50.9 s, matching the declared-126 case above), not
-        // the declared 2-vCPU headroom (32.3 s). Pin a wide cpuset so
-        // neither count is oversubscribed (multiplier = 1.0). The
-        // declared-vs-booted gap is otherwise untested — every other
-        // vm_timeout test passes entry.topology.total_cpus() (declared ==
-        // booted).
-        let _pin = AllowedCpusPin::new((0..256).collect());
+        // headroom (128.7 s, matching the declared-126 case above), not
+        // the declared 2-vCPU headroom (72.9 s). The declared-vs-booted
+        // gap is otherwise untested — every other vm_timeout test passes
+        // entry.topology.total_cpus() (declared == booted).
         let entry = KtstrTestEntry {
             name: "booted_override",
             ..KtstrTestEntry::DEFAULT
         };
         assert_eq!(
             vm_timeout_from_entry(&entry, 126),
-            Duration::from_millis(50_900),
+            Duration::from_millis(128_700),
         );
         assert_eq!(
             vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
-            Duration::from_millis(32_300),
+            Duration::from_millis(72_900),
         );
         assert_ne!(
             vm_timeout_from_entry(&entry, 126),
@@ -2795,15 +2773,17 @@ mod tests {
     }
 
     #[test]
-    fn vm_timeout_scales_boot_headroom_by_overcommit_ratio() {
-        // 256 vCPUs (16 LLCs × 16 cores) on a 64-CPU allowed cpuset =
-        // 4x auto-collapse. The boot headroom (58.4 s) scales by 4x;
-        // base = max(5 s watchdog, 12 s duration, 1 s) = 12 s →
-        // 12 + 58.4×4 = 245.6 s. Pins that the ratio multiplies ONLY
-        // the headroom, not base.
-        let _pin = AllowedCpusPin::new((0..64).collect());
+    fn vm_timeout_headroom_is_flat_deadman_mult() {
+        // Tier-3 dead-man: the headroom term is a FLAT
+        // vm_boot_headroom(vcpus) × DEADMAN_HEADROOM_MULT, with NO host
+        // overcommit scaling. 256 vCPUs (16 LLCs × 16 cores):
+        // vm_boot_headroom(256) = 58.4 s ×3 = 175.2 s; base = max(5 s
+        // watchdog, 12 s duration, 1 s) = 12 s → 187.2 s. The old path
+        // multiplied this headroom by the host overcommit ratio; it no
+        // longer does (Tier-1/2 absorb a loaded host), so the value is
+        // independent of the host cpuset.
         let entry = KtstrTestEntry {
-            name: "oversub",
+            name: "flat",
             topology: crate::vmm::topology::Topology {
                 llcs: 16,
                 cores_per_llc: 16,
@@ -2814,62 +2794,57 @@ mod tests {
             },
             ..KtstrTestEntry::DEFAULT
         };
-        // 12_000 + 58_400 × 4 = 245_600 ms.
+        // 12_000 + 58_400 × 3 = 187_200 ms.
         assert_eq!(
             vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
-            Duration::from_millis(245_600)
+            Duration::from_millis(187_200)
         );
     }
 
     #[test]
-    fn vm_timeout_overcommit_multiplier_clamps_at_cap() {
-        // 256 vCPUs on an 8-CPU cpuset = 32x, but the headroom
-        // multiplier clamps at OVERCOMMIT_HEADROOM_CAP (6x) so the
-        // deadline stays bounded: 12 + 58.4×6 = 362.4 s. (Such a host
-        // auto-SKIPS upstream; this pins the clamp independently.)
-        let _pin = AllowedCpusPin::new((0..8).collect());
+    fn vm_timeout_headroom_does_not_scale_with_overcommit() {
+        // The deadline reads no host cpuset: the headroom above `base` is
+        // EXACTLY vm_boot_headroom(vcpus) × DEADMAN_HEADROOM_MULT for any
+        // vcpu count, so an oversubscribed host cannot lengthen it. Pins
+        // the structural shape (base = 12 s = max(5 s wdog, 12 s dur, 1 s)
+        // for a DEFAULT entry).
         let entry = KtstrTestEntry {
-            name: "clamp",
-            topology: crate::vmm::topology::Topology {
-                llcs: 16,
-                cores_per_llc: 16,
-                threads_per_core: 1,
-                numa_nodes: 1,
-                nodes: None,
-                distances: None,
-            },
+            name: "no_oversub",
             ..KtstrTestEntry::DEFAULT
         };
-        // 12_000 + 58_400 × 6 = 362_400 ms.
-        assert_eq!(
-            vm_timeout_from_entry(&entry, entry.topology.total_cpus()),
-            Duration::from_millis(362_400)
-        );
+        let base = Duration::from_secs(12);
+        for vcpus in [2u32, 64, 128, 256] {
+            assert_eq!(
+                vm_timeout_from_entry(&entry, vcpus) - base,
+                vm_boot_headroom(vcpus) * DEADMAN_HEADROOM_MULT,
+                "headroom must be the flat dead-man term at {vcpus} vCPUs",
+            );
+        }
     }
 
     #[test]
-    fn verifier_vm_timeout_mirrors_test_path_scaling() {
-        // Fitting host (128 vCPUs on 192 allowed CPUs, ratio floors
-        // at 1.0): 120 s base + vm_boot_headroom(128) = 10 s kernel
-        // init + (10_000 + 128×150 = 29_200 ms) sys_rdy = 39.2 s →
-        // 159.2 s. The old flat 120 s left ZERO boot headroom for
-        // exactly this shape — the mid-attach VM-timeout class from
-        // the scx verifier sweep.
-        assert_eq!(
-            verifier_vm_timeout_for(128, 192),
-            Duration::from_millis(159_200)
-        );
-        // Oversubscribed dev host (128 vCPUs on 16 CPUs = 8x) clamps
-        // the headroom multiplier at OVERCOMMIT_HEADROOM_CAP (6x):
-        // 120 + 39.2×6 = 355.2 s. The nextest verifier override
-        // (240 s × 2 in .config/nextest.toml) must stay above this
-        // plus the 60 s attach-reset extension.
-        assert_eq!(
-            verifier_vm_timeout_for(128, 16),
-            Duration::from_millis(355_200)
-        );
+    fn verifier_vm_timeout_is_flat_deadman() {
+        // Verifier Tier-3 dead-man: VERIFIER_BASE_TIMEOUT (120 s) plus a
+        // FLAT vm_boot_headroom(vcpus) × DEADMAN_HEADROOM_MULT, no host
+        // overcommit scaling. 128 vCPUs: vm_boot_headroom(128) = 10 s
+        // kernel init + (10_000 + 128×150 = 29_200 ms) sys_rdy = 39.2 s
+        // ×3 = 117.6 s → 237.6 s. The old flat 120 s left ZERO boot
+        // headroom for exactly this shape — the mid-attach VM-timeout
+        // class from the scx verifier sweep.
+        assert_eq!(verifier_vm_timeout(128), Duration::from_millis(237_600));
+        // Structural: the headroom above the base is exactly the flat
+        // dead-man term for any vcpu count (no cpuset read).
+        for vcpus in [2u32, 128, 256] {
+            assert_eq!(
+                verifier_vm_timeout(vcpus) - VERIFIER_BASE_TIMEOUT,
+                vm_boot_headroom(vcpus) * DEADMAN_HEADROOM_MULT,
+            );
+        }
+        // The worst-case verifier deadline (widest realistic 256-vCPU
+        // preset) plus the extend-only attach-reset extension must still
+        // fit the 240s x 2 = 480s nextest verifier override.
         assert!(
-            verifier_vm_timeout_for(128, 16) + VERIFIER_WORKLOAD_BUDGET < Duration::from_secs(480),
+            verifier_vm_timeout(256) + VERIFIER_WORKLOAD_BUDGET < Duration::from_secs(480),
             "worst-case verifier deadline (incl. attach-reset extension) \
              must fit the 240s x 2 nextest override",
         );

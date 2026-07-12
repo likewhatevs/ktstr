@@ -464,8 +464,8 @@ fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vm
 /// unit-testable without booting a VM (the sibling `performance_mode` /
 /// `perf_only` skips are env-driven; this one is topology-driven). When
 /// the host cannot run the BOOTED topology (`resolve_vm_topology`, which
-/// honors a gauntlet/CLI preset override) without racing the
-/// oversub-scaled boot watchdog
+/// honors a gauntlet/CLI preset override) without an overcommit so
+/// severe boot cannot complete usefully
 /// ([`super::runtime::overcommit_skip_reason`]), emits the operator SKIP
 /// banner, records the skip sidecar, and returns the skip
 /// [`AssertResult`]; otherwise returns `None` to proceed to boot. Only
@@ -686,8 +686,8 @@ fn run_ktstr_test_inner_impl(
         return Ok(AssertResult::skip(REASON));
     }
     // Auto-skip a default/no-perf overcommit so severe the guest boot
-    // would race even the oversub-scaled host watchdog — the "overcommit
-    // OR auto-skip, never hard-fail" contract. See `overcommit_skip` for
+    // serves no purpose even though the progress watchdog would tolerate
+    // it — the "overcommit OR auto-skip, never hard-fail" contract. See `overcommit_skip` for
     // the full rationale; it skips ONLY the auto-collapse case past
     // `OVERCOMMIT_SKIP_RATIO`, so an explicit `cpu_budget` and the CI
     // ~1.3x case both RUN and are validated here, never masked.
@@ -2416,20 +2416,18 @@ fn render_no_result_message(
         let watchdog_section = format!(
             "\n\n--- watchdog ---\n\
              elapsed={:?} (VM run wall-clock)\n\
-             vm_timeout={:?} (host watchdog deadline = max(watchdog_timeout, \
-             duration, 1s) + overcommit-scaled vCPU vm_boot_headroom [+ 30s \
-             cold-BTF budget for bpf_map_write tests])\n\
+             vm_timeout={:?} (Tier-3 dead-man deadline = max(watchdog_timeout, \
+             duration, 1s) + vCPU-scaled vm_boot_headroom x deadman multiplier \
+             [+ 30s cold-BTF budget for bpf_map_write tests])\n\
              watchdog_timeout={:?} (scx_sched.watchdog_timeout override)\n\
              duration={:?} (workload duration)\n\
              hint: if the test body needs more wall time, increase \
              duration (the `duration` field on `KtstrTestEntry` / \
-             `#[ktstr_test(duration_ms = ...)]`); the VM timeout adds \
-             vCPU-scaled boot headroom — itself multiplied by the host \
-             overcommit ratio (vCPUs / allowed host CPUs, clamped) so an \
-             oversubscribed boot gets proportionally longer — on top of \
-             max(watchdog_timeout, duration, 1s). Raising duration extends \
-             the deadline; widening the process cpuset shrinks the \
-             overcommit multiplier",
+             `#[ktstr_test(duration_ms = ...)]`). Note this wall deadline \
+             is only the dead-man backstop: the progress watchdog (Tiers \
+             1-2) kills a wedged VM on its per-phase progress budget long \
+             before this fires, and a slow-but-progressing VM is never \
+             killed by host load alone",
             result.duration, vm_timeout, entry.watchdog_timeout, entry.duration,
         );
         let timeout_reason = {

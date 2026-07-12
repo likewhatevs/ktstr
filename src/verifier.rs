@@ -977,9 +977,11 @@ pub fn collect_verifier_output(
             .topology(validated)
             .memory_deferred_min(memory_min_mib)
             // Timeout mirrors the `#[ktstr_test]` path's shape: a flat
-            // lifecycle base plus oversubscription-scaled boot headroom
-            // (`vm_timeout_from_entry`'s split), so a wide cell booting
-            // slowly under CI concurrency is not killed mid-attach.
+            // lifecycle base plus vCPU-scaled dead-man boot headroom
+            // (`vm_timeout_from_entry`'s split). This is only Tier-3 —
+            // the progress watchdog governs wedges, and a wide cell
+            // booting slowly under CI concurrency is progress-protected
+            // rather than deadline-raced.
             // `workload_duration` arms the watchdog's attach reset: a
             // slow boot cannot eat the probe/teardown budget (the reset
             // is extend-only).
