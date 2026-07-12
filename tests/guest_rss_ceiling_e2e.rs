@@ -64,10 +64,8 @@ fn assert_host_rss_under_ceiling(result: &VmResult) -> Result<()> {
         result.exit_code,
         result.crash_message,
     );
-    let status =
-        std::fs::read_to_string("/proc/self/status").context("read /proc/self/status")?;
-    let hwm_kb = parse_vm_hwm_kb(&status)
-        .context("no parseable VmHWM in /proc/self/status")?;
+    let status = std::fs::read_to_string("/proc/self/status").context("read /proc/self/status")?;
+    let hwm_kb = parse_vm_hwm_kb(&status).context("no parseable VmHWM in /proc/self/status")?;
     eprintln!("GUEST_RSS host VmHWM={hwm_kb} kB ceiling={RSS_CEILING_KB} kB");
     ensure!(
         hwm_kb < RSS_CEILING_KB,

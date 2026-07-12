@@ -142,10 +142,7 @@ fn decompressed_sidecar_path(path: &std::path::Path) -> std::path::PathBuf {
 /// The mmap (not `fs::read`) is deliberate: concurrent cells loading the same
 /// cached kernel share the sidecar's page cache, and `PE::load` reads volatile
 /// straight into guest memory without a heap copy of the whole image.
-fn load_pe_from_sidecar(
-    guest_mem: &GuestMemoryMmap,
-    sidecar: &std::path::Path,
-) -> Result<u64> {
+fn load_pe_from_sidecar(guest_mem: &GuestMemoryMmap, sidecar: &std::path::Path) -> Result<u64> {
     use linux_loader::loader::{KernelLoader, pe::PE};
     let file = std::fs::File::open(sidecar)
         .with_context(|| format!("open decompressed sidecar: {}", sidecar.display()))?;
@@ -156,8 +153,13 @@ fn load_pe_from_sidecar(
     let mmap = unsafe { memmap2::Mmap::map(&file) }
         .with_context(|| format!("mmap decompressed sidecar: {}", sidecar.display()))?;
     let mut cursor = std::io::Cursor::new(mmap);
-    let result = PE::load(guest_mem, Some(GuestAddress(KERNEL_LOAD_ADDR)), &mut cursor, None)
-        .context("load decompressed Image from sidecar")?;
+    let result = PE::load(
+        guest_mem,
+        Some(GuestAddress(KERNEL_LOAD_ADDR)),
+        &mut cursor,
+        None,
+    )
+    .context("load decompressed Image from sidecar")?;
     Ok(result.kernel_load.raw_value())
 }
 

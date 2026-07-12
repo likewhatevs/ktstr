@@ -2386,7 +2386,11 @@ mod tests {
             distances: None,
         };
         let vm = KtstrKvm::new(topo, 128, false);
-        assert!(vm.is_ok(), "non-perf VM construction failed: {:?}", vm.err());
+        assert!(
+            vm.is_ok(),
+            "non-perf VM construction failed: {:?}",
+            vm.err()
+        );
     }
 
     #[test]

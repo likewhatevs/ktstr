@@ -727,7 +727,7 @@ mod tests {
 
     fn synthetic_kernel_offsets() -> crate::monitor::btf_offsets::KernelOffsets {
         use crate::monitor::btf_offsets::{
-            KernelOffsets, ScxEventOffsets, ScxWatchdogOffsets, SchedstatOffsets,
+            KernelOffsets, SchedstatOffsets, ScxEventOffsets, ScxWatchdogOffsets,
         };
         use crate::monitor::btf_offsets::{SchedDomainOffsets, SchedDomainStatsOffsets};
         KernelOffsets {

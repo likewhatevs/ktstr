@@ -39,8 +39,9 @@ fn ap_gap_check_with_fault_injection() -> Result<(), String> {
 /// (`tests/progress_watchdog_e2e.rs`) can drive the Tier-1 / Tier-2 kill
 /// rules end-to-end on an otherwise-healthy guest:
 ///   - `KTSTR_FAULT_TEARDOWN_WEDGE=spin`: busy-loop FOREVER — the guest
-///     burns CPU in-phase with no milestone, tripping Tier-1 once
-///     `cpu_in_phase` exceeds the Teardown `phase_cpu_budget_ns`.
+///     burns CPU in-phase with no milestone, tripping Tier-1 once the
+///     busiest vCPU's in-phase burn (`max_vcpu_cpu_in_phase_ns`) exceeds
+///     the flat Teardown `phase_cpu_budget_ns`.
 ///   - `KTSTR_FAULT_TEARDOWN_WEDGE=idle`: sleep FOREVER — the guest goes
 ///     fully quiescent (no runnable demand, ISR-only CPU trickle),
 ///     tripping Tier-2 once the trickle-stall discriminator latches and
@@ -55,9 +56,10 @@ fn ap_gap_check_with_fault_injection() -> Result<(), String> {
 /// design) — both surface as a red fixture, never a hung suite.
 ///
 /// Emitting `ScenarioEnd` first advances the host lifecycle stage to
-/// Teardown — a MILESTONE, anchoring `cpu_ns_at_phase` /
-/// `wall_ns_at_progress` at the wedge start so the in-phase deltas the
-/// tiers charge are exactly the wedge's own burn/wall. An empty-body
+/// Teardown — a MILESTONE that re-anchors the monitor's per-vCPU
+/// max-in-phase tracker and stamps `wall_ns_at_progress` at the wedge
+/// start, so the in-phase deltas the tiers charge are exactly the wedge's
+/// own burn/wall. An empty-body
 /// `#[ktstr_test]` otherwise sits in the Body stage (`send_scenario_start`
 /// fires unconditionally at dispatch), where both tiers are structurally
 /// off via the `u64::MAX` Body budgets. The advance is forward-only on the

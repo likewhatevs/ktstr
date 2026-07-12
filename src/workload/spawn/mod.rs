@@ -3860,9 +3860,7 @@ impl WorkloadHandle {
         // never `exec` (a stale fd across an exec would only leak, not
         // misbehave). The `OwnedFd` lives on the guard (closed on early
         // bail) and transfers to the handle on success.
-        if config.signal_first_iteration
-            && matches!(dispatch, Dispatch::Fork)
-            && total_workers > 0
+        if config.signal_first_iteration && matches!(dispatch, Dispatch::Fork) && total_workers > 0
         {
             let raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
             if raw < 0 {
@@ -3878,8 +3876,7 @@ impl WorkloadHandle {
             // SAFETY: `raw` is a fresh, exclusively-owned eventfd from the
             // successful `eventfd(2)` above; wrapping it in OwnedFd takes
             // sole ownership so it is closed exactly once on Drop.
-            guard.first_iter_signal =
-                Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
+            guard.first_iter_signal = Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
         }
 
         // Spawn each group in declaration order. `iter_offset`
@@ -5456,8 +5453,7 @@ impl WorkloadHandle {
                 // File-drop close is now an explicit `close`).
                 let mut chunk = [0u8; 64 * 1024];
                 loop {
-                    let remaining =
-                        deadline.saturating_duration_since(std::time::Instant::now());
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                     // ms == 0 is fine: a zero-timeout poll still drains
                     // data already buffered in the pipe without
                     // blocking, which keeps the healthy at-deadline-edge
@@ -5472,8 +5468,7 @@ impl WorkloadHandle {
                     // SAFETY: single owned pollfd; nfds == 1; ms >= 0.
                     let ret = unsafe { libc::poll(&mut pfd, 1, ms) };
                     if ret < 0 {
-                        if std::io::Error::last_os_error().kind()
-                            == std::io::ErrorKind::Interrupted
+                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
                         {
                             continue;
                         }
@@ -5896,8 +5891,7 @@ fn drain_ready_bytes(mut pending: Vec<i32>, deadline: Instant) {
                     // SAFETY: `&mut byte` is a valid 1-byte buffer; `fd`
                     // is the report read end the caller owns until
                     // collect drains it. 0 / -1 returns handled below.
-                    let n =
-                        unsafe { libc::read(fd, &mut byte as *mut u8 as *mut libc::c_void, 1) };
+                    let n = unsafe { libc::read(fd, &mut byte as *mut u8 as *mut libc::c_void, 1) };
                     if n >= 0 {
                         // n == 1: byte consumed. n == 0: EOF pre-write.
                         // Either way drop from pending.
@@ -6248,17 +6242,24 @@ mod tests_poll_eventfd {
     // Counter-mode eventfd (EFD_NONBLOCK so a drained read cannot block).
     fn make_eventfd() -> i32 {
         let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        assert!(fd >= 0, "eventfd() failed: {}", std::io::Error::last_os_error());
+        assert!(
+            fd >= 0,
+            "eventfd() failed: {}",
+            std::io::Error::last_os_error()
+        );
         fd
     }
 
     fn signal(fd: i32, times: u64) {
         for _ in 0..times {
             let one: u64 = 1;
-            let n = unsafe {
-                libc::write(fd, &one as *const u64 as *const libc::c_void, 8)
-            };
-            assert_eq!(n, 8, "eventfd write short: {}", std::io::Error::last_os_error());
+            let n = unsafe { libc::write(fd, &one as *const u64 as *const libc::c_void, 8) };
+            assert_eq!(
+                n,
+                8,
+                "eventfd write short: {}",
+                std::io::Error::last_os_error()
+            );
         }
     }
 
@@ -6276,7 +6277,10 @@ mod tests_poll_eventfd {
             elapsed >= Duration::from_millis(150),
             "returned before the deadline: {elapsed:?}",
         );
-        assert!(elapsed < Duration::from_secs(3), "exceeded the deadline bound: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "exceeded the deadline bound: {elapsed:?}"
+        );
         unsafe {
             libc::close(fd);
         }
@@ -6308,12 +6312,20 @@ mod tests_poll_eventfd {
         let fd = make_eventfd();
         signal(fd, 3);
         // First: 3 < 4, short deadline → false, draining the counter to 0.
-        assert!(!poll_eventfd_reaches(fd, Instant::now() + Duration::from_millis(120), 4));
+        assert!(!poll_eventfd_reaches(
+            fd,
+            Instant::now() + Duration::from_millis(120),
+            4
+        ));
         // A single further signal added to the fresh (drained) counter is
         // only 1, so a second call still needs the FULL 4 — the accumulator
         // is per-call, matching one probe run. Confirm 4 fresh signals wake.
         signal(fd, 4);
-        assert!(poll_eventfd_reaches(fd, Instant::now() + Duration::from_secs(5), 4));
+        assert!(poll_eventfd_reaches(
+            fd,
+            Instant::now() + Duration::from_secs(5),
+            4
+        ));
         unsafe {
             libc::close(fd);
         }

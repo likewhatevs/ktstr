@@ -159,8 +159,7 @@ impl VcpuPerfCounters {
         let instructions = open_one(tid, PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS as u64)?;
         let cache_misses = open_one(tid, PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES as u64)?;
         let branch_misses = open_one(tid, PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_MISSES as u64)?;
-        let task_clock =
-            open_one(tid, PERF_TYPE_SOFTWARE, PERF_COUNT_SW_TASK_CLOCK as u64).ok();
+        let task_clock = open_one(tid, PERF_TYPE_SOFTWARE, PERF_COUNT_SW_TASK_CLOCK as u64).ok();
         Ok(Self {
             cycles,
             instructions,
