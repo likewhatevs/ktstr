@@ -2493,7 +2493,6 @@ impl KtstrVm {
         // instead of polling on a 100 ms thread::sleep cadence.
         let kill_evt_for_watchdog = kill_evt.clone();
         let bsp_done_evt_for_wd = bsp_done_evt.clone();
-        let rt_watchdog = self.performance_mode;
         let wd_service_cpu = effective_pinning_plan.and_then(|p| p.service_cpu);
         // Clone the virtio-console Arc into the watchdog so the
         // soft-deadline path can push `SIGNAL_VC_SHUTDOWN` to
@@ -3086,6 +3085,24 @@ impl KtstrVm {
         let freeze_coord_handle = std::thread::Builder::new()
             .name("vmm-freeze-coord".into())
             .spawn(move || {
+                // The hang detector's own sensing must not dilate with the
+                // load it measures. This thread runs the dispatch sinks whose
+                // `advance_stage` -> `ProgressLedger::record_progress` bumps
+                // `progress_epoch` — the MILESTONE anchor the Tier-3 deadman
+                // reads as `wall_since_milestone_ns`. If it starves under host
+                // dilation, a milestone the guest already earned lands late,
+                // `wall_since_milestone` grows, and it feeds an inert misread.
+                // So it gets the same UNCONDITIONAL FIFO-2 as the watchdog and
+                // monitor. It is NOT pinned, deliberately: the watchdog and
+                // monitor pin to the single reserved `service_cpu`, and this
+                // thread's freeze-time guest-memory scans would head-of-line
+                // block those same-priority FIFO threads if colocated there —
+                // the exact monitor starvation being fixed. Left unpinned it
+                // may briefly preempt a FIFO-1 vCPU on wake in perf mode
+                // (intended, sensing wins) but is epoll-idle between events,
+                // so it does not erode perf-mode vCPU isolation during a body
+                // run. Best-effort — warns once/process without CAP_SYS_NICE.
+                set_rt_priority(2, "freeze-coord");
                 // Per-CPU runnable_at scanner context. Holds every
                 // input the scanner needs, all resolved once and
                 // cached for the rest of the run. Only built when
@@ -11187,9 +11204,22 @@ impl KtstrVm {
                 if let Some(cpu) = wd_service_cpu {
                     pin_current_thread(cpu, "watchdog");
                 }
-                if rt_watchdog {
-                    set_rt_priority(2, "watchdog");
-                }
+                // The hang detector's own sensing must not dilate with the
+                // load it measures. FIFO-2 is therefore UNCONDITIONAL (not
+                // perf-mode-gated): under extreme host dilation a SCHED_OTHER
+                // watchdog misses its own 100 ms tick / 2 s monitor-liveness
+                // window, so `monitor_live` latches false and the deadman
+                // fires on wall-clock against a cell that was actively
+                // progressing (an observed dump had a milestone 6 s before
+                // the kill). The thread burns ~µs per 100 ms tick, so FIFO-2
+                // grants scheduling immunity at no meaningful CPU cost: in
+                // perf mode vCPUs at FIFO-1 stay below it; in no-perf/default
+                // mode it now outranks SCHED_OTHER vCPUs — intended, sensing
+                // must win. Best-effort — warns once/process without
+                // CAP_SYS_NICE (see `set_rt_priority`). The service-CPU PIN
+                // above stays perf-mode-gated: `wd_service_cpu` is `None`
+                // without a reserved CPU, so there is nothing to pin to.
+                set_rt_priority(2, "watchdog");
                 let hard_deadline = Instant::now() + timeout;
                 // Soft phase needs enough headroom for the guest to
                 // flush serial and reboot. Skip when timeout < 5s.
@@ -12592,7 +12622,6 @@ impl KtstrVm {
         // see its doc for why the seconds-based form is wrong.
         let watchdog_jiffies = self.watchdog_timeout.map(|d| duration_to_jiffies(d, hz));
         let preemption_threshold_ns = monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
-        let rt_monitor = self.performance_mode;
         let service_cpu = self.pinning_plan.as_ref().and_then(|p| p.service_cpu);
         // Workload duration captured for the scheduler-attach
         // watchdog reset. `Some(d)` enables the reset; the
@@ -12611,9 +12640,22 @@ impl KtstrVm {
                 if let Some(cpu) = service_cpu {
                     pin_current_thread(cpu, "monitor");
                 }
-                if rt_monitor {
-                    set_rt_priority(2, "monitor");
-                }
+                // The hang detector's own sensing must not dilate with the
+                // load it measures. FIFO-2 is UNCONDITIONAL (not perf-mode-
+                // gated): the monitor bumps `monitor_heartbeat` and writes
+                // the ledger the watchdog reads, so a SCHED_OTHER monitor
+                // that slips its ~100 ms sample under extreme host dilation
+                // makes the watchdog latch `monitor_live=false` and fire the
+                // deadman on a still-progressing cell (the monitor-starvation
+                // residual). The per-tick cost is ~µs, so FIFO-2 grants
+                // scheduling immunity at no meaningful CPU cost: perf-mode
+                // vCPUs at FIFO-1 stay below it; in no-perf/default mode it
+                // now outranks SCHED_OTHER vCPUs — intended, sensing must
+                // win. Best-effort — warns once/process without CAP_SYS_NICE
+                // (see `set_rt_priority`). The service-CPU PIN above stays
+                // perf-mode-gated: `service_cpu` is `None` without a reserved
+                // CPU.
+                set_rt_priority(2, "monitor");
                 // Pre-resolution boot-complete wait, hoisted ABOVE
                 // the `phys_base` / `pco_pa` / scx_root_pa /
                 // watchdog_pa / `page_offset_base_pa` resolution

@@ -83,6 +83,19 @@ const TRICKLE_STALL_WINDOW_NS: u64 = 10_000_000_000;
 /// as wedged nor an idle wedge as alive.
 const TRICKLE_FLOOR_NS: u64 = 1_000_000;
 
+/// Consecutive sub-floor [`TRICKLE_STALL_WINDOW_NS`] windows required
+/// before [`CpuTrickleTracker`] reports `stalled`. A SINGLE 10 s window can
+/// legitimately accrue below the floor on a live cell: at a 100-300x
+/// scheduling tail a bursty host gap can deny a still-alive guest CPU for
+/// the whole window (the trickle-window-misread residual — a cell inert-
+/// killed on one stalled window during a ~285x gap). Two CONSECUTIVE
+/// windows are 20 s of continuous sub-millisecond accrual, which cleanly
+/// separates a genuinely inert guest (µs/s ISR trickle, every window sub-
+/// floor) from bursty starvation (some window recovers, resetting the
+/// streak) while still bounding a true wedge within ~20 s + the Tier-3
+/// grace.
+const TRICKLE_STALL_CONSECUTIVE_WINDOWS: u32 = 2;
+
 /// Widen a CPU budget for the trust level of its currency. The PMU
 /// SW task-clock (`exclude_host`) measures guest-only CPU time directly,
 /// so the budget is used as-is. Per-vCPU pthread CPU time additionally
@@ -322,16 +335,25 @@ pub(crate) fn deadman_should_fire(
 ///
 /// Measures accrual over a trailing [`TRICKLE_STALL_WINDOW_NS`]: it holds
 /// a `(now_ns, cpu_ns_now)` anchor and, each time at least a full window
-/// has elapsed since the anchor, recomputes `stalled = accrued <
-/// TRICKLE_FLOOR_NS` and slides the anchor forward. Between window
-/// closures it reports the last verdict. Before the FIRST window closes it
-/// reports `false` (not stalled) — conservative during the boot CPU ramp,
-/// so a cell is never declared stalled before a full window of evidence
-/// exists.
+/// has elapsed since the anchor, closes the window — classifying it as
+/// sub-floor (`accrued < TRICKLE_FLOOR_NS`) or not — and slides the anchor
+/// forward. It reports `stalled` only once
+/// [`TRICKLE_STALL_CONSECUTIVE_WINDOWS`] windows have closed sub-floor
+/// back-to-back; any window that recovers above the floor resets the
+/// streak. Between window closures it reports the last verdict. Before the
+/// FIRST window closes it reports `false` (not stalled) — conservative
+/// during the boot CPU ramp, so a cell is never declared stalled before a
+/// full window of evidence exists.
 pub(crate) struct CpuTrickleTracker {
     anchor_ns: u64,
     anchor_cpu_ns: u64,
+    /// Held output verdict, refreshed at each window close and reported
+    /// between closes.
     stalled: bool,
+    /// Consecutive closed windows that each accrued below the floor. Any
+    /// above-floor window resets it to 0; `stalled` latches true once it
+    /// reaches [`TRICKLE_STALL_CONSECUTIVE_WINDOWS`].
+    consecutive_stalls: u32,
     seeded: bool,
 }
 
@@ -341,6 +363,7 @@ impl CpuTrickleTracker {
             anchor_ns: 0,
             anchor_cpu_ns: 0,
             stalled: false,
+            consecutive_stalls: 0,
             seeded: false,
         }
     }
@@ -358,7 +381,12 @@ impl CpuTrickleTracker {
         }
         if now_ns.saturating_sub(self.anchor_ns) >= TRICKLE_STALL_WINDOW_NS {
             let accrued = cpu_ns_now.saturating_sub(self.anchor_cpu_ns);
-            self.stalled = accrued < TRICKLE_FLOOR_NS;
+            if accrued < TRICKLE_FLOOR_NS {
+                self.consecutive_stalls = self.consecutive_stalls.saturating_add(1);
+            } else {
+                self.consecutive_stalls = 0;
+            }
+            self.stalled = self.consecutive_stalls >= TRICKLE_STALL_CONSECUTIVE_WINDOWS;
             self.anchor_ns = now_ns;
             self.anchor_cpu_ns = cpu_ns_now;
         }
@@ -769,15 +797,34 @@ mod tests {
         assert!(!t.observe(0, TRICKLE_STALL_WINDOW_NS - S));
     }
 
+    // Window length alias for the multi-window trickle tests below.
+    const W: u64 = TRICKLE_STALL_WINDOW_NS;
+
     #[test]
-    fn trickle_idle_cell_stalls_after_a_window() {
-        // Idle/wedged guest: only ISR trickle (10 µs) accrues over the 10 s
-        // window — below the 1 ms floor → stalled.
+    fn trickle_single_stalled_window_is_not_stalled() {
+        // One sub-floor window is NOT enough: a single 10 s window can
+        // legitimately accrue below the floor on a live cell at a 100-300x
+        // scheduling tail (the trickle-window-misread residual). The streak
+        // must reach TRICKLE_STALL_CONSECUTIVE_WINDOWS.
         let mut t = CpuTrickleTracker::new();
         assert!(!t.observe(0, 0)); // seed
         assert!(
-            t.observe(10_000, TRICKLE_STALL_WINDOW_NS),
-            "10 µs over the window is below the floor → stalled"
+            !t.observe(10_000, W),
+            "one sub-floor (10 µs) window must NOT report stalled"
+        );
+    }
+
+    #[test]
+    fn trickle_idle_cell_stalls_after_two_windows() {
+        // Idle/wedged guest: only ISR trickle (10 µs) accrues each 10 s
+        // window — below the 1 ms floor. Two CONSECUTIVE sub-floor windows
+        // → stalled.
+        let mut t = CpuTrickleTracker::new();
+        assert!(!t.observe(0, 0)); // seed
+        assert!(!t.observe(10_000, W), "window 1 sub-floor → streak 1, not yet stalled");
+        assert!(
+            t.observe(20_000, 2 * W),
+            "window 2 consecutively sub-floor → streak 2 → stalled"
         );
     }
 
@@ -785,40 +832,72 @@ mod tests {
     fn trickle_starved_cell_stays_alive() {
         // Host-starved cell at ~40x dilation still accrues tens of ms/s;
         // over a 10 s window that is hundreds of ms — far above the floor →
-        // NOT stalled.
+        // NOT stalled (streak never even reaches 1).
         let mut t = CpuTrickleTracker::new();
         assert!(!t.observe(0, 0)); // seed
         assert!(
-            !t.observe(200_000_000, TRICKLE_STALL_WINDOW_NS),
+            !t.observe(200_000_000, W),
             "200 ms over the window is above the floor → alive"
+        );
+        assert!(
+            !t.observe(400_000_000, 2 * W),
+            "still above the floor a second window → alive"
+        );
+    }
+
+    #[test]
+    fn trickle_interleaved_recovery_resets_streak() {
+        // A window that recovers above the floor between two sub-floor
+        // windows resets the streak, so bursty starvation never latches.
+        let mut t = CpuTrickleTracker::new();
+        assert!(!t.observe(0, 0)); // seed
+        assert!(!t.observe(0, W), "sub-floor → streak 1");
+        assert!(!t.observe(200_000_000, 2 * W), "above floor → streak reset to 0");
+        assert!(!t.observe(200_000_000, 3 * W), "sub-floor again → only streak 1");
+        assert!(
+            t.observe(200_000_000, 4 * W),
+            "second consecutive sub-floor → streak 2 → stalled"
         );
     }
 
     #[test]
     fn trickle_floor_boundary() {
-        // Exactly the floor is NOT below the floor → not stalled; one ns
-        // under is → stalled.
+        // Exactly the floor is NOT below the floor → never accrues a stall,
+        // even across two windows.
         let mut t = CpuTrickleTracker::new();
         assert!(!t.observe(0, 0));
-        assert!(!t.observe(TRICKLE_FLOOR_NS, TRICKLE_STALL_WINDOW_NS));
+        assert!(!t.observe(TRICKLE_FLOOR_NS, W));
+        assert!(!t.observe(2 * TRICKLE_FLOOR_NS, 2 * W));
 
+        // One ns under the floor is sub-floor, but a single window is not
+        // yet stalled; a second consecutive sub-floor window crosses the
+        // streak.
         let mut t2 = CpuTrickleTracker::new();
         assert!(!t2.observe(0, 0));
-        assert!(t2.observe(TRICKLE_FLOOR_NS - 1, TRICKLE_STALL_WINDOW_NS));
+        assert!(
+            !t2.observe(TRICKLE_FLOOR_NS - 1, W),
+            "one sub-floor window not yet stalled"
+        );
+        assert!(
+            t2.observe(2 * (TRICKLE_FLOOR_NS - 1), 2 * W),
+            "second consecutive sub-floor window → stalled"
+        );
     }
 
     #[test]
     fn trickle_holds_verdict_between_window_closures() {
-        // After a stalled verdict at one window close, sub-window ticks
-        // keep reporting stalled until the next window closes and
-        // re-evaluates (here to alive on a fresh accrual).
+        // After a stalled verdict (two consecutive sub-floor windows),
+        // sub-window ticks keep reporting stalled until the next window
+        // closes and re-evaluates — here to alive on a fresh accrual, which
+        // also resets the streak.
         let mut t = CpuTrickleTracker::new();
         assert!(!t.observe(0, 0)); // seed
-        assert!(t.observe(0, TRICKLE_STALL_WINDOW_NS)); // first close → stalled
+        assert!(!t.observe(0, W)); // window 1 sub-floor → streak 1
+        assert!(t.observe(0, 2 * W)); // window 2 sub-floor → streak 2 → stalled
         // Sub-window tick, still stalled (held).
-        assert!(t.observe(500_000_000, TRICKLE_STALL_WINDOW_NS + S));
+        assert!(t.observe(500_000_000, 2 * W + S));
         // Next full window with big accrual → re-evaluates to alive.
-        assert!(!t.observe(1_000_000_000, 2 * TRICKLE_STALL_WINDOW_NS + S));
+        assert!(!t.observe(1_000_000_000, 3 * W + S));
     }
 
     // ---- Monitor-liveness tracker: stall → not-live after N, recovers ----
