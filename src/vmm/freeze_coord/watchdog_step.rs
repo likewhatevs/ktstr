@@ -73,15 +73,34 @@ const TRICKLE_STALL_WINDOW_NS: u64 = 10_000_000_000;
 
 /// Minimum summed guest CPU (ns) that must accrue over one
 /// [`TRICKLE_STALL_WINDOW_NS`] for the guest to count as "receiving CPU"
-/// (NOT trickle-stalled). 1 ms / 10 s discriminates the two populations
-/// the watchdog must tell apart: an idle-or-wedged guest still takes timer
-/// interrupts on its parked vCPUs and accrues only microseconds/s (tens of
-/// µs over the window — below the floor → stalled), while even a cell
-/// starved at ~40x host dilation accrues tens of ms/s (hundreds of ms over
-/// the window — far above the floor → not stalled). The floor sits in the
-/// wide gap between them, so it never misjudges a starved-but-alive cell
-/// as wedged nor an idle wedge as alive.
+/// (NOT trickle-stalled) under the PMU currency. 1 ms / 10 s discriminates
+/// the two populations the watchdog must tell apart: an idle-or-wedged
+/// guest still takes timer interrupts on its parked vCPUs but the PMU SW
+/// task-clock (`exclude_host`) counts only guest-mode execution, so it
+/// accrues just the in-guest ISR bodies — tens of µs over the window,
+/// below the floor → stalled — while even a cell starved at ~40x host
+/// dilation accrues tens of ms/s (hundreds of ms over the window — far
+/// above the floor → not stalled). The floor sits in the wide gap between
+/// them, so it never misjudges a starved-but-alive cell as wedged nor an
+/// idle wedge as alive.
 const TRICKLE_FLOOR_NS: u64 = 1_000_000;
+
+/// [`TRICKLE_FLOOR_NS`]'s sibling for the PTHREAD currency, mirroring the
+/// Tier-1 budget's [`widen_budget_for_currency`]: the per-vCPU pthread
+/// clock charges the FULL VM-exit/entry/host-ISR path for every residual
+/// idle kernel tick (clocksource watchdog, RCU, hrtimers), so an
+/// idle-wedged guest's measured trickle is orders of magnitude above the
+/// PMU magnitude the 1 ms floor was calibrated for. Measured on an
+/// idle-wedged 1-vCPU cell under pthread currency: 1-10 ms per 10 s
+/// window — ABOVE the 1 ms floor, which made the idle wedge invisible to
+/// Tier-2 and the Tier-3 deadman (both defer while "not stalled"); a
+/// starved-but-alive cell at even ~100x dilation accrues 100+ ms per
+/// window. 25 ms sits in that measured gap with ~2.5x margin in both
+/// directions. The deadman additionally requires a 60 s-stale milestone
+/// ([`TIER3_PROGRESS_GRACE_NS`]), so the joint false-kill condition is
+/// sub-0.25%-CPU-delivery for 60+ s at the wall deadline — a defensible
+/// operator bound.
+const TRICKLE_FLOOR_PTHREAD_NS: u64 = 25_000_000;
 
 /// Consecutive sub-floor [`TRICKLE_STALL_WINDOW_NS`] windows required
 /// before [`CpuTrickleTracker`] reports `stalled`. A SINGLE 10 s window can
@@ -115,6 +134,24 @@ const fn widen_budget_for_currency(budget: u64, cpu_currency: u8) -> u64 {
     }
 }
 
+/// The trickle-stall floor (ns per [`TRICKLE_STALL_WINDOW_NS`]) for the
+/// trust level of the CPU currency — [`widen_budget_for_currency`]'s
+/// sibling for the [`CpuTrickleTracker`]. PMU measures guest-only time, so
+/// the tight [`TRICKLE_FLOOR_NS`] applies; pthread time inflates an idle
+/// guest's trickle with VM-exit overhead, so the widened
+/// [`TRICKLE_FLOOR_PTHREAD_NS`] applies (see its doc for the measured
+/// populations). `CPU_CURRENCY_NONE` gets the pthread floor too: with no
+/// per-vCPU source this tick the sum carries no trusted magnitude, and the
+/// wider floor is the conservative-against-immortality choice — an idle
+/// wedge must stay killable — while the deadman's 60 s milestone grace
+/// still guards a live cell.
+pub(crate) const fn trickle_floor_for_currency(cpu_currency: u8) -> u64 {
+    match cpu_currency {
+        crate::monitor::CPU_CURRENCY_PMU => TRICKLE_FLOOR_NS,
+        _ => TRICKLE_FLOOR_PTHREAD_NS,
+    }
+}
+
 /// Decide whether a single lifecycle phase has wedged, from a snapshot
 /// of its evidence. Pure — see the module doc.
 ///
@@ -134,9 +171,10 @@ const fn widen_budget_for_currency(budget: u64, cpu_currency: u8) -> u64 {
 ///   - `channels_live`: the per-CPU GUEST evidence channels resolved this
 ///     tick (see [`crate::monitor::ProgressLedger::evidence_channels_live`]).
 ///     Gates Tier-2 — `runnable_demand` is only meaningful when true.
-///   - `cpu_trickle_stalled`: the guest's summed CPU accrued below
-///     [`TRICKLE_FLOOR_NS`] over the last [`TRICKLE_STALL_WINDOW_NS`]
-///     ([`CpuTrickleTracker`]) — i.e. it is receiving essentially no CPU.
+///   - `cpu_trickle_stalled`: the guest's summed CPU accrued below the
+///     currency-dependent floor ([`trickle_floor_for_currency`]) over the
+///     last [`TRICKLE_STALL_WINDOW_NS`] ([`CpuTrickleTracker`]) — i.e. it
+///     is receiving essentially no CPU.
 ///   - `monitor_live`: the monitor thread is producing fresh ledger
 ///     writes.
 ///   - `cpu_currency`: provenance of `cpu_in_phase_ns`
@@ -336,8 +374,9 @@ pub(crate) fn deadman_should_fire(
 /// Measures accrual over a trailing [`TRICKLE_STALL_WINDOW_NS`]: it holds
 /// a `(now_ns, cpu_ns_now)` anchor and, each time at least a full window
 /// has elapsed since the anchor, closes the window — classifying it as
-/// sub-floor (`accrued < TRICKLE_FLOOR_NS`) or not — and slides the anchor
-/// forward. It reports `stalled` only once
+/// sub-floor (`accrued < floor_ns`, the caller-supplied currency-dependent
+/// floor from [`trickle_floor_for_currency`]) or not — and slides the
+/// anchor forward. It reports `stalled` only once
 /// [`TRICKLE_STALL_CONSECUTIVE_WINDOWS`] windows have closed sub-floor
 /// back-to-back; any window that recovers above the floor resets the
 /// streak. Between window closures it reports the last verdict. Before the
@@ -371,8 +410,13 @@ impl CpuTrickleTracker {
     /// Fold this tick's `(cpu_ns_now, now_ns)` and return whether the
     /// guest is currently trickle-stalled. `cpu_ns_now` is the ledger's
     /// summed per-vCPU CPU time; `now_ns` is a `run_start`-relative wall
-    /// reading (monotone across ticks).
-    pub(crate) fn observe(&mut self, cpu_ns_now: u64, now_ns: u64) -> bool {
+    /// reading (monotone across ticks); `floor_ns` is the currency-
+    /// dependent stall floor ([`trickle_floor_for_currency`]) the closing
+    /// window's accrual is classified against. The floor is a parameter —
+    /// not captured state — so the tracker stays pure and the caller can
+    /// follow a mid-run currency change (the ledger latches the currency
+    /// on the first tick, so in practice the floor is constant per run).
+    pub(crate) fn observe(&mut self, cpu_ns_now: u64, now_ns: u64, floor_ns: u64) -> bool {
         if !self.seeded {
             self.anchor_ns = now_ns;
             self.anchor_cpu_ns = cpu_ns_now;
@@ -381,7 +425,7 @@ impl CpuTrickleTracker {
         }
         if now_ns.saturating_sub(self.anchor_ns) >= TRICKLE_STALL_WINDOW_NS {
             let accrued = cpu_ns_now.saturating_sub(self.anchor_cpu_ns);
-            if accrued < TRICKLE_FLOOR_NS {
+            if accrued < floor_ns {
                 self.consecutive_stalls = self.consecutive_stalls.saturating_add(1);
             } else {
                 self.consecutive_stalls = 0;
@@ -792,9 +836,9 @@ mod tests {
     fn trickle_reports_false_before_first_window_closes() {
         let mut t = CpuTrickleTracker::new();
         // Seed tick, then sub-window ticks: not enough evidence yet.
-        assert!(!t.observe(0, 0));
-        assert!(!t.observe(0, S));
-        assert!(!t.observe(0, TRICKLE_STALL_WINDOW_NS - S));
+        assert!(!t.observe(0, 0, TRICKLE_FLOOR_NS));
+        assert!(!t.observe(0, S, TRICKLE_FLOOR_NS));
+        assert!(!t.observe(0, TRICKLE_STALL_WINDOW_NS - S, TRICKLE_FLOOR_NS));
     }
 
     // Window length alias for the multi-window trickle tests below.
@@ -807,23 +851,26 @@ mod tests {
         // scheduling tail (the trickle-window-misread residual). The streak
         // must reach TRICKLE_STALL_CONSECUTIVE_WINDOWS.
         let mut t = CpuTrickleTracker::new();
-        assert!(!t.observe(0, 0)); // seed
+        assert!(!t.observe(0, 0, TRICKLE_FLOOR_NS)); // seed
         assert!(
-            !t.observe(10_000, W),
+            !t.observe(10_000, W, TRICKLE_FLOOR_NS),
             "one sub-floor (10 µs) window must NOT report stalled"
         );
     }
 
     #[test]
     fn trickle_idle_cell_stalls_after_two_windows() {
-        // Idle/wedged guest: only ISR trickle (10 µs) accrues each 10 s
-        // window — below the 1 ms floor. Two CONSECUTIVE sub-floor windows
-        // → stalled.
+        // Idle/wedged guest under PMU currency: only in-guest ISR trickle
+        // (10 µs) accrues each 10 s window — below the 1 ms floor. Two
+        // CONSECUTIVE sub-floor windows → stalled.
         let mut t = CpuTrickleTracker::new();
-        assert!(!t.observe(0, 0)); // seed
-        assert!(!t.observe(10_000, W), "window 1 sub-floor → streak 1, not yet stalled");
+        assert!(!t.observe(0, 0, TRICKLE_FLOOR_NS)); // seed
         assert!(
-            t.observe(20_000, 2 * W),
+            !t.observe(10_000, W, TRICKLE_FLOOR_NS),
+            "window 1 sub-floor → streak 1, not yet stalled"
+        );
+        assert!(
+            t.observe(20_000, 2 * W, TRICKLE_FLOOR_NS),
             "window 2 consecutively sub-floor → streak 2 → stalled"
         );
     }
@@ -834,13 +881,13 @@ mod tests {
         // over a 10 s window that is hundreds of ms — far above the floor →
         // NOT stalled (streak never even reaches 1).
         let mut t = CpuTrickleTracker::new();
-        assert!(!t.observe(0, 0)); // seed
+        assert!(!t.observe(0, 0, TRICKLE_FLOOR_NS)); // seed
         assert!(
-            !t.observe(200_000_000, W),
+            !t.observe(200_000_000, W, TRICKLE_FLOOR_NS),
             "200 ms over the window is above the floor → alive"
         );
         assert!(
-            !t.observe(400_000_000, 2 * W),
+            !t.observe(400_000_000, 2 * W, TRICKLE_FLOOR_NS),
             "still above the floor a second window → alive"
         );
     }
@@ -850,12 +897,18 @@ mod tests {
         // A window that recovers above the floor between two sub-floor
         // windows resets the streak, so bursty starvation never latches.
         let mut t = CpuTrickleTracker::new();
-        assert!(!t.observe(0, 0)); // seed
-        assert!(!t.observe(0, W), "sub-floor → streak 1");
-        assert!(!t.observe(200_000_000, 2 * W), "above floor → streak reset to 0");
-        assert!(!t.observe(200_000_000, 3 * W), "sub-floor again → only streak 1");
+        assert!(!t.observe(0, 0, TRICKLE_FLOOR_NS)); // seed
+        assert!(!t.observe(0, W, TRICKLE_FLOOR_NS), "sub-floor → streak 1");
         assert!(
-            t.observe(200_000_000, 4 * W),
+            !t.observe(200_000_000, 2 * W, TRICKLE_FLOOR_NS),
+            "above floor → streak reset to 0"
+        );
+        assert!(
+            !t.observe(200_000_000, 3 * W, TRICKLE_FLOOR_NS),
+            "sub-floor again → only streak 1"
+        );
+        assert!(
+            t.observe(200_000_000, 4 * W, TRICKLE_FLOOR_NS),
             "second consecutive sub-floor → streak 2 → stalled"
         );
     }
@@ -865,21 +918,21 @@ mod tests {
         // Exactly the floor is NOT below the floor → never accrues a stall,
         // even across two windows.
         let mut t = CpuTrickleTracker::new();
-        assert!(!t.observe(0, 0));
-        assert!(!t.observe(TRICKLE_FLOOR_NS, W));
-        assert!(!t.observe(2 * TRICKLE_FLOOR_NS, 2 * W));
+        assert!(!t.observe(0, 0, TRICKLE_FLOOR_NS));
+        assert!(!t.observe(TRICKLE_FLOOR_NS, W, TRICKLE_FLOOR_NS));
+        assert!(!t.observe(2 * TRICKLE_FLOOR_NS, 2 * W, TRICKLE_FLOOR_NS));
 
         // One ns under the floor is sub-floor, but a single window is not
         // yet stalled; a second consecutive sub-floor window crosses the
         // streak.
         let mut t2 = CpuTrickleTracker::new();
-        assert!(!t2.observe(0, 0));
+        assert!(!t2.observe(0, 0, TRICKLE_FLOOR_NS));
         assert!(
-            !t2.observe(TRICKLE_FLOOR_NS - 1, W),
+            !t2.observe(TRICKLE_FLOOR_NS - 1, W, TRICKLE_FLOOR_NS),
             "one sub-floor window not yet stalled"
         );
         assert!(
-            t2.observe(2 * (TRICKLE_FLOOR_NS - 1), 2 * W),
+            t2.observe(2 * (TRICKLE_FLOOR_NS - 1), 2 * W, TRICKLE_FLOOR_NS),
             "second consecutive sub-floor window → stalled"
         );
     }
@@ -891,13 +944,78 @@ mod tests {
         // closes and re-evaluates — here to alive on a fresh accrual, which
         // also resets the streak.
         let mut t = CpuTrickleTracker::new();
-        assert!(!t.observe(0, 0)); // seed
-        assert!(!t.observe(0, W)); // window 1 sub-floor → streak 1
-        assert!(t.observe(0, 2 * W)); // window 2 sub-floor → streak 2 → stalled
+        assert!(!t.observe(0, 0, TRICKLE_FLOOR_NS)); // seed
+        assert!(!t.observe(0, W, TRICKLE_FLOOR_NS)); // window 1 sub-floor → streak 1
+        assert!(t.observe(0, 2 * W, TRICKLE_FLOOR_NS)); // window 2 sub-floor → stalled
         // Sub-window tick, still stalled (held).
-        assert!(t.observe(500_000_000, 2 * W + S));
+        assert!(t.observe(500_000_000, 2 * W + S, TRICKLE_FLOOR_NS));
         // Next full window with big accrual → re-evaluates to alive.
-        assert!(!t.observe(1_000_000_000, 3 * W + S));
+        assert!(!t.observe(1_000_000_000, 3 * W + S, TRICKLE_FLOOR_NS));
+    }
+
+    // ---- Currency-dependent trickle floor ----
+
+    #[test]
+    fn trickle_floor_for_currency_selects_per_currency() {
+        // PMU keeps the tight guest-only floor; pthread (and the
+        // no-currency tick) get the widened floor that absorbs VM-exit
+        // overhead charged to an idle guest.
+        assert_eq!(trickle_floor_for_currency(CPU_CURRENCY_PMU), TRICKLE_FLOOR_NS);
+        assert_eq!(
+            trickle_floor_for_currency(CPU_CURRENCY_PTHREAD),
+            TRICKLE_FLOOR_PTHREAD_NS
+        );
+        assert_eq!(
+            trickle_floor_for_currency(CPU_CURRENCY_NONE),
+            TRICKLE_FLOOR_PTHREAD_NS
+        );
+    }
+
+    #[test]
+    fn trickle_idle_pthread_accrual_stalls_under_pthread_floor() {
+        // The measured idle-wedge population under pthread currency:
+        // 1-10 ms per 10 s window (VM-exit overhead for residual idle
+        // kernel ticks). 10 ms/window sits ABOVE the 1 ms PMU floor —
+        // the miscalibration that made an idle wedge immortal — but BELOW
+        // the 25 ms pthread floor, so two consecutive windows latch
+        // stalled.
+        let f = trickle_floor_for_currency(CPU_CURRENCY_PTHREAD);
+        let mut t = CpuTrickleTracker::new();
+        assert!(!t.observe(0, 0, f)); // seed
+        assert!(
+            !t.observe(10_000_000, W, f),
+            "window 1: 10 ms idle-pthread accrual is sub-floor → streak 1"
+        );
+        assert!(
+            t.observe(20_000_000, 2 * W, f),
+            "window 2: consecutively sub-floor → stalled"
+        );
+
+        // Control: the same 10 ms/window accrual under the PMU floor never
+        // stalls — this is exactly the pre-calibration immortality shape.
+        let mut pmu = CpuTrickleTracker::new();
+        assert!(!pmu.observe(0, 0, TRICKLE_FLOOR_NS));
+        assert!(!pmu.observe(10_000_000, W, TRICKLE_FLOOR_NS));
+        assert!(!pmu.observe(20_000_000, 2 * W, TRICKLE_FLOOR_NS));
+    }
+
+    #[test]
+    fn trickle_starved_pthread_accrual_stays_alive_under_pthread_floor() {
+        // The measured starved-but-alive population: 100+ ms per 10 s
+        // window even at ~100x dilation — above the 25 ms pthread floor
+        // with ~4x margin, so a starved cell is never misjudged as
+        // stalled.
+        let f = trickle_floor_for_currency(CPU_CURRENCY_PTHREAD);
+        let mut t = CpuTrickleTracker::new();
+        assert!(!t.observe(0, 0, f)); // seed
+        assert!(
+            !t.observe(100_000_000, W, f),
+            "100 ms/window starved-alive accrual is above the pthread floor → alive"
+        );
+        assert!(
+            !t.observe(200_000_000, 2 * W, f),
+            "still above the floor a second window → alive"
+        );
     }
 
     // ---- Monitor-liveness tracker: stall → not-live after N, recovers ----

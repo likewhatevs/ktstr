@@ -31,6 +31,90 @@ fn ap_gap_check_with_fault_injection() -> Result<(), String> {
     all_possible_cpus_online()
 }
 
+/// Teardown-stage progress-watchdog fault injection, gated on a host-set
+/// kernel-cmdline token. Sibling to [`ap_gap_check_with_fault_injection`]:
+/// the host injects the token via the test scheduler's `kargs`, the guest
+/// reads it with [`cmdline_val`] and fabricates a deterministic wedge in
+/// the Teardown lifecycle stage so the progress-watchdog e2e fixtures
+/// (`tests/progress_watchdog_e2e.rs`) can drive the Tier-1 / Tier-2 kill
+/// rules end-to-end on an otherwise-healthy guest:
+///   - `KTSTR_FAULT_TEARDOWN_WEDGE=spin`: busy-loop FOREVER — the guest
+///     burns CPU in-phase with no milestone, tripping Tier-1 once
+///     `cpu_in_phase` exceeds the Teardown `phase_cpu_budget_ns`.
+///   - `KTSTR_FAULT_TEARDOWN_WEDGE=idle`: sleep FOREVER — the guest goes
+///     fully quiescent (no runnable demand, ISR-only CPU trickle),
+///     tripping Tier-2 once the trickle-stall discriminator latches and
+///     `wall_in_phase` exceeds the Teardown `phase_wall_backstop_ns`.
+///
+/// The wedge is deliberately unbounded: the watchdog MUST be what ends the
+/// VM (`timed_out = true`), so the fixture's host-side timing assertion can
+/// discriminate a progress-tier kill from the Tier-3 dead-man deadline. On
+/// a tier regression the idle shape is still bounded by the deadman (an
+/// inert cell fires it at the wall deadline) and the spin shape by
+/// nextest's `terminate-after` (a CPU-accruing cell defers the deadman by
+/// design) — both surface as a red fixture, never a hung suite.
+///
+/// Emitting `ScenarioEnd` first advances the host lifecycle stage to
+/// Teardown — a MILESTONE, anchoring `cpu_ns_at_phase` /
+/// `wall_ns_at_progress` at the wedge start so the in-phase deltas the
+/// tiers charge are exactly the wedge's own burn/wall. An empty-body
+/// `#[ktstr_test]` otherwise sits in the Body stage (`send_scenario_start`
+/// fires unconditionally at dispatch), where both tiers are structurally
+/// off via the `u64::MAX` Body budgets. The advance is forward-only on the
+/// host, so a scenario body that already emitted `ScenarioEnd` makes this a
+/// host-side no-op.
+///
+/// Call site: the END of Phase 6, after the background threads
+/// (vc-poll, stats relay, trace_pipe reader) have been stopped and joined —
+/// the guest's only remaining activity is kernel ISR trickle, giving the
+/// idle arm the truly-quiescent shape Tier-2's sub-1ms/10s trickle floor
+/// discriminates on. The test body has already published its PASS
+/// AssertResult (`publish_result_and_collect` runs at end-of-dispatch), so
+/// the host records a passing base verdict and the fixture's
+/// `post_vm_unconditional` timing gate owns the pass/fail decision.
+/// `send_exit` has NOT been sent, so the host cannot mistake the wedge for
+/// a clean exit.
+///
+/// Absent the token (every production run) the hook is one `/proc/cmdline`
+/// read and a return — the same cost class as the AP-gap hook's lookup.
+fn maybe_inject_teardown_wedge_fault() {
+    let Some(mode) = cmdline_val("KTSTR_FAULT_TEARDOWN_WEDGE") else {
+        return;
+    };
+    // Force the host stage to Teardown (a milestone) so the wedge is
+    // charged against the Teardown budgets from a fresh anchor.
+    crate::vmm::guest_comms::send_scenario_end(0, 0);
+    match mode.trim() {
+        "spin" => {
+            // Tier-1 shape: burn guest CPU forever in a loop the optimizer
+            // cannot elide, so the per-vCPU CPU clocks genuinely accrue
+            // against the Teardown budget.
+            let mut acc: u64 = 0;
+            loop {
+                for _ in 0..4096 {
+                    acc = acc.wrapping_add(std::hint::black_box(1));
+                }
+                std::hint::black_box(acc);
+            }
+        }
+        "idle" => {
+            // Tier-2 shape: fully quiesced forever — off-CPU, no runnable
+            // demand, ISR-only trickle.
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+        }
+        other => {
+            // Unknown mode: loud and inert — a typo'd fixture must fail on
+            // its own "expected timed_out" assertion, not silently wedge.
+            eprintln!(
+                "ktstr-init: KTSTR_FAULT_TEARDOWN_WEDGE={other:?} not \
+                 recognized (expected \"spin\" or \"idle\"); ignoring"
+            );
+        }
+    }
+}
+
 /// Full guest init lifecycle. Called from the ctor when PID 1 is
 /// detected. Mounts filesystems, then either runs the test lifecycle
 /// (scheduler + dispatch + reboot) or drops into an interactive
@@ -860,6 +944,14 @@ pub(crate) fn ktstr_guest_init() -> ! {
             libc::tcdrain(com1.as_raw_fd());
         }
     }
+
+    // Progress-watchdog fault injection (Teardown-stage wedge). Placed at
+    // the end of Phase 6 — every background thread above is stopped, so
+    // the idle arm is truly quiescent — and BEFORE Phase 7's send_exit, so
+    // the host watchdog (not a clean exit) ends the VM. No-op without the
+    // KTSTR_FAULT_TEARDOWN_WEDGE cmdline token; never returns with it (for
+    // a recognized mode).
+    maybe_inject_teardown_wedge_fault();
 
     // Phase 7: Exit.
     // Push buffered stdout/stderr bytes into the pipe write ends so

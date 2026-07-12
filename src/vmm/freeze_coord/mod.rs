@@ -11385,10 +11385,18 @@ impl KtstrVm {
                     let now_wall_ns = run_start.elapsed().as_nanos() as u64;
                     // CPU-trickle verdict for this tick — the load-bearing
                     // discriminator for Tier-2 and the Tier-3 deferral.
-                    // Fed the ledger's summed CPU and a run_start-relative
-                    // wall reading; reports whether the guest is receiving
-                    // essentially no CPU over the trailing window.
-                    let cpu_trickle_stalled = trickle.observe(snapshot.cpu_ns_now, now_wall_ns);
+                    // Fed the ledger's summed CPU, a run_start-relative
+                    // wall reading, and the currency-dependent stall floor
+                    // (pthread charges VM-exit overhead to an idle guest,
+                    // so its floor is wider — see
+                    // `trickle_floor_for_currency`); reports whether the
+                    // guest is receiving essentially no CPU over the
+                    // trailing window.
+                    let cpu_trickle_stalled = trickle.observe(
+                        snapshot.cpu_ns_now,
+                        now_wall_ns,
+                        watchdog_step::trickle_floor_for_currency(snapshot.cpu_currency),
+                    );
                     // Wall time since the last MILESTONE (progress_epoch
                     // anchor) — milestone-only, so a live kernel's
                     // scheduling noise never resets it. Same quantity as

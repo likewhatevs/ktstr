@@ -85,6 +85,20 @@ filter = "test(eevdf_)"
 slow-timeout = { period = "75s", terminate-after = 3 }
 retries = 6
 
+# Progress-watchdog wedge fixtures: two of the three deliberately inject a
+# forever-wedge the watchdog must kill on Tier-1/Tier-2, so a watchdog
+# timeout is the EXPECTED outcome, never a transient flake — retries=0 (a
+# re-run burns the same ~25-50s again). The Tier-3 dead-man deadline for
+# these 1-vCPU, watchdog_timeout_s=90 cells is ~150s (see the binary's
+# module doc); 150s x 2 keeps the framework watchdog — not nextest — the
+# arbiter even on the regression path where a broken tier falls through to
+# Tier-3 (idle shape) or defers the deadman entirely (spin shape, ended by
+# this terminate-after).
+[[profile.ci.overrides]]
+filter = "binary(progress_watchdog_e2e)"
+slow-timeout = { period = "150s", terminate-after = 2 }
+retries = 0
+
 [[profile.ci.overrides]]
 filter = "test(shell_exec_)"
 test-group = "vm-cli"
@@ -273,6 +287,20 @@ retries = 0
 [[profile.default.overrides]]
 filter = "test(eevdf_)"
 slow-timeout = { period = "75s", terminate-after = 2 }
+retries = 0
+
+# Progress-watchdog wedge fixtures (mirror of the profile.ci override —
+# nextest does not inherit overrides across profiles). Two fixtures inject
+# a forever-wedge the watchdog must kill on Tier-1/Tier-2, so a watchdog
+# timeout is the EXPECTED outcome — retries=0. 150s x 2 sits above the
+# ~150s Tier-3 deadman of these 1-vCPU watchdog_timeout_s=90 cells so the
+# framework watchdog decides the cell on the idle regression path, and the
+# terminate-after bounds the spin regression path (a CPU-accruing cell
+# defers the deadman by design). See the binary's module doc for the full
+# timing derivation.
+[[profile.default.overrides]]
+filter = "binary(progress_watchdog_e2e)"
+slow-timeout = { period = "150s", terminate-after = 2 }
 retries = 0
 
 # Wide-SMP boot tests: mirror of the profile.ci override (nextest does
