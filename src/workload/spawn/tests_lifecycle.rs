@@ -712,3 +712,72 @@ fn wait_for_file_or_panic_detects_liveness_death() {
         "panic must name the early-exit path, got: {msg}"
     );
 }
+
+/// `park_after_iterations(Some(1))` — the verifier dispatch probe's
+/// opt-in — must make every worker count exactly its first iteration
+/// and then park: the report still carries `iterations >= 1` (the
+/// dispatch proof), and `stop_and_collect` returns promptly because
+/// the park loop polls the same stop predicate the outer loop does.
+/// A SpinWait worker breaks out of the work loop on the pass that
+/// takes `iterations` to 1, so the terminal count is exactly 1 —
+/// pinning that the park fires after the first counted iteration, not
+/// after an unbounded spin.
+#[test]
+fn park_after_iterations_parks_after_first_counted_iteration() {
+    let config = WorkloadConfig {
+        num_workers: 3,
+        work_type: WorkType::SpinWait,
+        park_after_iterations: Some(1),
+        ..Default::default()
+    };
+    let mut h = WorkloadHandle::spawn(&config).unwrap();
+    h.start();
+    // Let the workers reach and pass the park point before stopping.
+    std::thread::sleep(Duration::from_millis(200));
+    let stop_started = Instant::now();
+    let reports = h.stop_and_collect();
+    let stop_elapsed = stop_started.elapsed();
+    assert_eq!(reports.len(), 3, "one report per worker");
+    for r in &reports {
+        assert_eq!(
+            r.iterations, 1,
+            "a parked SpinWait worker counts exactly its first \
+             iteration then parks; got {}",
+            r.iterations,
+        );
+    }
+    // The park loop polls stop every ~5 ms, so collection is not
+    // gated on any spin — a generous ceiling that still trips if the
+    // park loop ever failed to observe stop.
+    assert!(
+        stop_elapsed < Duration::from_secs(3),
+        "parked workers must respond to stop promptly; \
+         stop_and_collect took {stop_elapsed:?}",
+    );
+}
+
+/// Control for `park_after_iterations_parks_after_first_counted_iteration`:
+/// with the knob at its `None` default the worker runs to stop
+/// exactly as before, so after a spin window its `iterations` count
+/// is far above the parked case's 1 — the parking behavior is gated
+/// by the knob, not by the WorkType.
+#[test]
+fn without_park_after_worker_runs_until_stop() {
+    let config = WorkloadConfig {
+        num_workers: 1,
+        work_type: WorkType::SpinWait,
+        ..Default::default()
+    };
+    assert_eq!(config.park_after_iterations, None, "default is None");
+    let mut h = WorkloadHandle::spawn(&config).unwrap();
+    h.start();
+    std::thread::sleep(Duration::from_millis(200));
+    let reports = h.stop_and_collect();
+    assert_eq!(reports.len(), 1);
+    assert!(
+        reports[0].iterations > 1,
+        "an un-parked SpinWait worker keeps iterating until stop; \
+         a 200 ms window yields far more than one iteration, got {}",
+        reports[0].iterations,
+    );
+}

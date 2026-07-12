@@ -9,7 +9,14 @@
 //! mode (full or `SCX_OPS_SWITCH_PARTIAL`) — sized to the guest's online
 //! CPU count, waits (by polling live per-worker iteration counts, not a
 //! blind fixed sleep) until every worker has advanced at least one
-//! iteration or a bounded deadline elapses, then stops the workload. It
+//! iteration or a bounded deadline elapses, then stops the workload. The
+//! workers are configured to park (`park_after_iterations(Some(1))`)
+//! after their first counted iteration rather than spinning until stop:
+//! one dispatch under SCHED_EXT is the whole proof, and a per-CPU spin
+//! across the concurrent CI cells would dominate the host load and
+//! starve other cells' bring-up. A parked worker still publishes its
+//! final count and responds to stop, so the wait and the dispatch verdict
+//! are unchanged. It
 //! emits a [`LifecyclePhase::WorkloadDispatched`] frame
 //! only for a worker that BOTH advanced non-zero `iterations` AND had its
 //! SCHED_EXT set succeed (`sched_policy_error` is None) — so a fair-class
@@ -92,7 +99,15 @@ pub(crate) fn run_and_confirm_dispatch() {
         // SCHED_OTHER); the dispatch check below excludes any worker
         // whose `sched_policy_error` is set, so a fair-class fallback
         // cannot false-confirm dispatch.
-        .sched_policy(SchedPolicy::Ext);
+        .sched_policy(SchedPolicy::Ext)
+        // Park each worker the instant it counts its first iteration:
+        // one counted iteration under SCHED_EXT is the whole proof the
+        // probe needs, and a spinning SpinWait worker per online CPU
+        // across ~30 concurrent CI cells is the dominant background
+        // load starving other cells' bring-up. Parked workers still
+        // publish their final count and respond to stop, so the
+        // wait-for-all loop and the dispatch gate below are unchanged.
+        .park_after_iterations(Some(1));
     let mut handle = match WorkloadHandle::spawn(&cfg) {
         Ok(h) => h,
         Err(e) => {

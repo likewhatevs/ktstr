@@ -1610,6 +1610,12 @@ impl SendPhaseEpochPtr {
 #[derive(Clone)]
 pub(super) struct GroupParams {
     work_type: WorkType,
+    /// Park each worker after `n` counted iterations rather than
+    /// running to stop. Only the primary group can carry a non-`None`
+    /// value ([`WorkloadConfig::park_after_iterations`] has no
+    /// [`WorkSpec`] counterpart), so composed groups always inherit
+    /// `None` through [`Self::from_work_spec`].
+    park_after: Option<u64>,
     sched_policy: SchedPolicy,
     mem_policy: MemPolicy,
     mpol_flags: MpolFlags,
@@ -1648,6 +1654,10 @@ impl GroupParams {
     ) -> Self {
         Self {
             work_type: spec.work_type.clone(),
+            // WorkSpec has no park-after knob; `primary` overrides this
+            // from `WorkloadConfig::park_after_iterations`, composed
+            // groups keep `None`.
+            park_after: None,
             sched_policy: spec.sched_policy,
             mem_policy: spec.mem_policy.clone(),
             mpol_flags: spec.mpol_flags,
@@ -1774,12 +1784,11 @@ impl GroupParams {
             pcomm: None,
             workers_pct: None,
         };
-        Ok(Self::from_work_spec(
-            &spec,
-            0,
-            resolved_affinity,
-            config.num_workers,
-        ))
+        let mut params = Self::from_work_spec(&spec, 0, resolved_affinity, config.num_workers);
+        // The park-after knob lives on WorkloadConfig, not the
+        // synthesised WorkSpec above, so carry it in after the copy.
+        params.park_after = config.park_after_iterations;
+        Ok(params)
     }
 
     /// Resolve a composed [`WorkSpec`] into per-group parameters,
@@ -2010,6 +2019,7 @@ pub(super) fn spawn_thread_worker(
     let tid_thread = Arc::clone(&tid);
     let exit_evt_thread = Arc::clone(&exit_evt);
     let work_type = group.work_type.clone();
+    let park_after = group.park_after;
     let sched_policy = group.sched_policy;
     let mem_policy = group.mem_policy.clone();
     let mpol_flags = group.mpol_flags;
@@ -2105,6 +2115,7 @@ pub(super) fn spawn_thread_worker(
                 numa_node,
                 worker_pipe_fds,
                 futex,
+                park_after,
                 slot,
                 epoch,
                 &stop_thread,
@@ -2696,6 +2707,7 @@ pub(super) fn spawn_pcomm_container(
                     let phase_epoch_send = SendPhaseEpochPtr::new(phase_epoch_base);
 
                     let work_type = group.work_type.clone();
+                    let park_after = group.park_after;
                     let sched_policy = group.sched_policy;
                     let mem_policy = group.mem_policy.clone();
                     let mpol_flags = group.mpol_flags;
@@ -2777,6 +2789,7 @@ pub(super) fn spawn_pcomm_container(
                                 numa_node,
                                 worker_pipe_fds,
                                 futex,
+                                park_after,
                                 slot,
                                 epoch,
                                 &STOP,
@@ -4655,6 +4668,7 @@ impl WorkloadHandle {
                                 group.numa_node,
                                 worker_pipe_fds,
                                 worker_futex,
+                                group.park_after,
                                 iter_slot,
                                 phase_epoch_ptr,
                                 &STOP,

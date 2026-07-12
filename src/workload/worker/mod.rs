@@ -263,6 +263,12 @@ pub(super) fn worker_main(
     numa_node: Option<u32>,
     pipe_fds: Option<(i32, i32)>,
     futex: Option<(*mut u32, usize)>,
+    // Park the worker after it has counted this many outer-loop
+    // iterations instead of spinning to stop. `None` (every workload
+    // but the verifier dispatch probe) runs to stop unchanged. The
+    // knob — not the WorkType — gates the park so a single-dispatch
+    // proof collapses to a sleep-poll under any work body.
+    park_after: Option<u64>,
     iter_slot: *mut AtomicU64,
     // Single shared phase-epoch word — the SAME pointer for every worker in
     // the group. Allocated non-null for every handle; the scenario engine
@@ -3819,6 +3825,32 @@ pub(super) fn worker_main(
                 unsafe { &*iter_slot }.store(iterations, Ordering::Relaxed);
                 last_iter_slot_publish = now;
             }
+        }
+
+        // Park once the worker has counted `park_after` iterations:
+        // it has proven whatever the caller needed the iterations to
+        // prove (the verifier probe needs one dispatch), so sleep-poll
+        // for stop instead of burning a CPU. Gated by the knob, not
+        // the WorkType, so it is dead code for every workload that
+        // leaves `park_after` at `None`.
+        if park_after.is_some_and(|n| iterations >= n) {
+            // Force the final count into the slot BEFORE parking,
+            // bypassing the IT_SLOT_PUBLISH_INTERVAL gate above: the
+            // probe's wait-for-all loop polls `snapshot_iterations`
+            // and must observe this worker's terminal value promptly
+            // rather than up to one publish interval late. SAFETY: as
+            // the gated publish above.
+            if !iter_slot.is_null() {
+                unsafe { &*iter_slot }.store(iterations, Ordering::Relaxed);
+            }
+            // Sleep-poll the SAME stop predicate the outer loop checks
+            // so a stop request (SIGUSR1-driven STOP or the per-worker
+            // flag) lands within one poll and the worker falls through
+            // to the normal report path — it still writes its report.
+            while !stop_requested(stop) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            break;
         }
 
         // Poll the shared phase epoch every outer iteration (one cheap

@@ -67,6 +67,20 @@ pub struct WorkloadConfig {
     pub affinity: AffinityIntent,
     /// What each worker does.
     pub work_type: WorkType,
+    /// Park each worker after it has counted at least `n` outer-loop
+    /// iterations instead of spinning until stop. `None` (the
+    /// default) preserves the run-until-stop behavior every workload
+    /// user relies on; `Some(n)` makes the worker publish its final
+    /// iteration count and then sleep-poll for the stop request,
+    /// collapsing background load once it has proven whatever the
+    /// caller needed the iterations to prove. Used by the verifier
+    /// dispatch probe (`Some(1)`), which only needs each worker to
+    /// take a single dispatch — not to burn a CPU until teardown.
+    /// `#[serde(default)]` so the field round-trips over the
+    /// host→guest wire without breaking configs serialized before it
+    /// existed.
+    #[serde(default)]
+    pub park_after_iterations: Option<u64>,
     /// Linux scheduling policy.
     pub sched_policy: SchedPolicy,
     /// NUMA memory placement policy.
@@ -210,6 +224,7 @@ impl Default for WorkloadConfig {
             num_workers: 1,
             affinity: AffinityIntent::Inherit,
             work_type: WorkType::SpinWait,
+            park_after_iterations: None,
             sched_policy: SchedPolicy::Normal,
             mem_policy: MemPolicy::Default,
             mpol_flags: MpolFlags::NONE,
@@ -298,6 +313,7 @@ impl WorkloadConfig {
             num_workers,
             affinity,
             work_type,
+            park_after_iterations: None,
             sched_policy: work.sched_policy,
             mem_policy: work.mem_policy.clone(),
             mpol_flags: work.mpol_flags,
@@ -457,6 +473,18 @@ impl WorkloadConfig {
     #[must_use = "builder methods consume self; bind the result"]
     pub fn work_type(mut self, wt: WorkType) -> Self {
         self.work_type = wt;
+        self
+    }
+
+    /// Set the park-after-iterations knob. `Some(n)` parks each
+    /// worker once it has counted `n` outer-loop iterations; `None`
+    /// (the default) runs every worker until stop. Takes an
+    /// `Option<u64>` rather than a bare `u64` so a call site can
+    /// thread a computed opt-in through without an intermediate
+    /// branch. See [`WorkloadConfig::park_after_iterations`].
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn park_after_iterations(mut self, n: Option<u64>) -> Self {
+        self.park_after_iterations = n;
         self
     }
 
