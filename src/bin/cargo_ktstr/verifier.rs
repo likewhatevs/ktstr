@@ -139,6 +139,21 @@ pub(crate) fn run_verifier(
         &args,
     ));
 
+    // Hand the child build cargo-ktstr's embedded busybox / wprof
+    // (mirrors run_cargo_sub): `build.rs` watches `KTSTR_BUSYBOX_BIN` /
+    // `KTSTR_WPROF_BIN` via rerun-if-env-changed, so setting them here —
+    // and identically on the reserved warm-up below — keeps the verifier
+    // sweep on the SAME build fingerprint as `cargo ktstr test`, sharing
+    // one cached harness build across both subcommands. Kept in
+    // `blob_envs` for the warm-up's cache-parity application.
+    let blob_envs = crate::run_cargo::prebuilt_blob_bin_envs(
+        std::env::var_os(ktstr::KTSTR_BUSYBOX_PATH_ENV),
+        std::env::var_os("KTSTR_WPROF_PATH"),
+    );
+    for (var, val) in &blob_envs {
+        cmd.env(var, val);
+    }
+
     if raw {
         cmd.env(ktstr::KTSTR_VERIFIER_RAW_ENV, "1");
     }
@@ -189,6 +204,35 @@ pub(crate) fn run_verifier(
     // VM-boot tests can skip when run under raw nextest. Mirrors
     // the `cargo ktstr test` dispatcher in run_cargo.rs.
     cmd.env(ktstr::KTSTR_ORCHESTRATED_ENV, "1");
+
+    // Reserve + cgroup-confine the harness COMPILE phase only, exactly as
+    // `run_cargo_sub` does for `cargo ktstr test` (see the block comment
+    // there): `cargo nextest run` builds then runs in one process, so an
+    // explicit `--no-run` warm-up compiles every test binary under a
+    // machine-global LLC LOCK_SH + cpuset cgroup (Consolidate placement —
+    // a compile is throughput-elastic; packing leaves whole LLCs free for
+    // exclusive perf-mode reservations), then releases BOTH before the
+    // combined run below, whose cells take their own reservations
+    // (the in-cell `build_and_find_binary` scheduler build is test-runtime
+    // work those reservations already cover). The verifier sweep is the
+    // primary colocated-CI workload, so this is the path where an
+    // unreserved harness compile would invade a peer runner's perf-mode
+    // reservation. Cache parity with the combined run: identical nextest
+    // argv (+`--no-run`), same `blob_envs`, and `KTSTR_KERNEL` (the only
+    // kernel-resolution env `build.rs` fingerprints via
+    // rerun-if-env-changed — KTSTR_KERNEL_LIST and the KTSTR_VERIFIER_*
+    // vars are runtime-only). No BTF-anchor `BPF_EXTRA_CFLAGS_PRE_INCL`
+    // handling: the verifier dispatcher injects none, so warm-up and run
+    // inherit the identical process env.
+    let mut warm = Command::new("cargo");
+    warm.args(crate::run_cargo::prebuild_no_run_args(
+        &ktstr::verifier::build_nextest_args(nextest_profile.as_deref(), &args),
+    ));
+    for (var, val) in &blob_envs {
+        warm.env(var, val);
+    }
+    warm.env(ktstr::KTSTR_KERNEL_ENV, &resolved[0].1);
+    crate::run_cargo::run_reserved_prebuild(warm, "cargo ktstr verifier")?;
 
     // Per-cell result dir: each verifier cell writes its PASS/FAIL record
     // here (via KTSTR_VERIFIER_RESULT_DIR), and after nextest returns we
@@ -299,5 +343,49 @@ mod tests {
         assert!(live.exists(), "our own (live) result dir is kept");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The verifier's reserved warm-up argv is the combined run's
+    /// `build_nextest_args` output plus exactly a trailing `--no-run` —
+    /// same nextest profile, cell filter, and forwarded user args — so
+    /// the warm-up compiles the identical target set and the combined
+    /// run finds everything cached. Mirrors run_cargo's
+    /// `warmup_command_mirrors_run_argv_plus_no_run`.
+    #[test]
+    fn verifier_warmup_argv_is_run_argv_plus_no_run() {
+        let forwarded = vec!["--cargo-profile".to_string(), "release".to_string()];
+        let run_argv = ktstr::verifier::build_nextest_args(Some("ci"), &forwarded);
+        let warm_argv = crate::run_cargo::prebuild_no_run_args(&run_argv);
+        assert_eq!(
+            warm_argv[..warm_argv.len() - 1],
+            run_argv[..],
+            "warm-up must share the run's argv prefix verbatim",
+        );
+        assert_eq!(
+            warm_argv.last().map(String::as_str),
+            Some("--no-run"),
+            "warm-up must append exactly --no-run",
+        );
+        // The reachability-critical flags survive into the warm-up: the
+        // cell filter bounds what gets compiled-for-run selection, and
+        // the profiles pin the same build fingerprint.
+        assert!(
+            warm_argv
+                .iter()
+                .any(|a| a == "test(/^verifier/) & !test(/^verifier::/)"),
+            "verifier-cell filter present in warm-up: {warm_argv:?}",
+        );
+        assert!(
+            warm_argv
+                .windows(2)
+                .any(|w| w[0] == "--profile" && w[1] == "ci"),
+            "nextest profile present in warm-up: {warm_argv:?}",
+        );
+        assert!(
+            warm_argv
+                .windows(2)
+                .any(|w| w[0] == "--cargo-profile" && w[1] == "release"),
+            "forwarded cargo profile present in warm-up: {warm_argv:?}",
+        );
     }
 }
