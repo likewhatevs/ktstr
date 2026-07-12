@@ -2103,6 +2103,17 @@ impl KtstrVm {
         // back-to-back.
         let watchdog_reset_tag: Arc<std::sync::atomic::AtomicU8> =
             Arc::new(std::sync::atomic::AtomicU8::new(WatchdogResetTag::Unset as u8));
+        // Lock-free progress/liveness ledger. The monitor thread writes
+        // it every tick (heartbeat, cpu_ns, progress epochs); the VM
+        // watchdog and freeze coordinator will read it in LATER commits
+        // to distinguish a genuinely wedged guest from one that is idle
+        // or still making scheduling progress. Declared here beside
+        // `watchdog_reset_tag` and cloned into `start_monitor` so the
+        // monitor closure owns a producer handle; consumers are wired
+        // later (this commit is observability only, so the Arc has a
+        // single clone — no unused-binding warnings).
+        let progress_ledger: Arc<monitor::ProgressLedger> =
+            Arc::new(monitor::ProgressLedger::default());
         let kern_phys_base: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let kern_phys_base_evt = Arc::new(EventFd::new(0).expect("eventfd for kern_phys_base"));
@@ -2173,6 +2184,7 @@ impl KtstrVm {
             cr3_cache.clone(),
             watchdog_reset_ns.clone(),
             watchdog_reset_tag.clone(),
+            progress_ledger.clone(),
             kern_phys_base.clone(),
             kern_phys_base_evt.clone(),
             kern_virt_kaslr.clone(),
@@ -12010,6 +12022,7 @@ impl KtstrVm {
         cr3: Arc<std::sync::atomic::AtomicU64>,
         watchdog_reset_ns: Arc<std::sync::atomic::AtomicU64>,
         watchdog_reset_tag: Arc<std::sync::atomic::AtomicU8>,
+        progress_ledger: Arc<monitor::ProgressLedger>,
         kern_phys_base_shared: Arc<std::sync::atomic::AtomicU64>,
         kern_phys_base_evt: Arc<EventFd>,
         kern_virt_kaslr_shared: Arc<std::sync::atomic::AtomicU64>,
@@ -12888,6 +12901,10 @@ impl KtstrVm {
                     }),
                     watchdog_reset: watchdog_reset_cfg,
                     watch_bpf_maps: watch_cfg.as_ref(),
+                    // Producer handle for the progress/liveness ledger.
+                    // The `move` closure owns the `progress_ledger` Arc;
+                    // borrow it for the loop's per-tick writes.
+                    progress_ledger: Some(progress_ledger.as_ref()),
                 };
                 // `rq_pas` empty: the loop sources every per-CPU
                 // PA from `rq_refresh` per iteration so the static

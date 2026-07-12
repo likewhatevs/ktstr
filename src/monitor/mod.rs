@@ -179,6 +179,7 @@ pub(crate) fn guest_kernel_hz(kernel_path: Option<&std::path::Path>) -> u64 {
 }
 
 use crate::vmm::find_vmlinux;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// IKCONFIG marker: gzip data starts immediately after this 8-byte sequence.
 const IKCONFIG_MAGIC: &[u8] = b"IKCFG_ST";
@@ -619,6 +620,202 @@ pub(crate) fn imbalance_ratio_of(cpus: &[CpuSnapshot]) -> f64 {
         max_nr = max_nr.max(cpu.nr_running);
     }
     max_nr as f64 / min_nr.max(1) as f64
+}
+
+/// [`ProgressLedger::cpu_currency`]: no per-vCPU CPU-time source was
+/// available this tick (every `vcpu_cpu_time_ns` was `None`).
+pub(crate) const CPU_CURRENCY_NONE: u8 = 0;
+/// [`ProgressLedger::cpu_currency`]: CPU-time sourced from the per-vCPU
+/// pthread clock (`CpuSnapshot::vcpu_cpu_time_ns`).
+pub(crate) const CPU_CURRENCY_PTHREAD: u8 = 1;
+/// [`ProgressLedger::cpu_currency`]: CPU-time sourced from the host PMU
+/// (`exclude_host` cycle counter). Reserved — never written by this
+/// commit; a later commit that folds the PMU currency uses it.
+#[allow(dead_code)]
+pub(crate) const CPU_CURRENCY_PMU: u8 = 2;
+
+/// Lock-free progress/liveness ledger shared from the monitor thread to
+/// the VM watchdog. The watchdog that will later read this runs
+/// SCHED_FIFO priority 2 and must NEVER block on the monitor, so every
+/// field is an atomic — no `Mutex`, no lock of any kind.
+///
+/// Benign one-tick-staleness contract (same discipline as the
+/// `watchdog_reset_ns` deadline atomic — see
+/// `vmm::freeze_coord::WatchdogResetTag`): the watchdog reads these
+/// fields racing the monitor's next store, so it can observe values up
+/// to one monitor tick stale, or (across the epoch/payload pair) a torn
+/// combination. Every such race is deliberately biased so a stale or
+/// torn read only makes a FUTURE kill decision MORE conservative (more
+/// likely to see recent progress / demand, hence less likely to kill),
+/// never less. The epoch fields carry Release/Acquire ordering so a
+/// reader that observes a bumped epoch also sees the payload stored
+/// before it; the scalar liveness/demand fields are Relaxed (a one-tick
+/// stale scalar only defers a kill).
+#[derive(Debug, Default)]
+pub(crate) struct ProgressLedger {
+    /// Lifecycle phase id (0 = `Boot`, the initial value). Written by
+    /// the guest scenario-dispatch thread in a LATER commit; defined
+    /// now so the type is stable. Not written by the monitor. `allow`ed
+    /// until the writer and the watchdog reader land.
+    #[allow(dead_code)]
+    pub(crate) phase: AtomicU8,
+    /// Bumped by the dispatch thread on every lifecycle phase advance
+    /// (a LATER commit). A phase advance is itself progress evidence,
+    /// so the watchdog folds this epoch alongside `progress_epoch`.
+    /// Release store / Acquire load. Not written by the monitor.
+    #[allow(dead_code)]
+    pub(crate) phase_epoch: AtomicU32,
+    /// `cpu_ns_now` captured at the last phase advance (a LATER commit),
+    /// so the watchdog can charge CPU time against the phase in which it
+    /// was spent. Not written by the monitor.
+    #[allow(dead_code)]
+    pub(crate) cpu_ns_at_phase: AtomicU64,
+
+    /// Summed available per-vCPU CPU-time (ns) as of the latest monitor
+    /// tick. Relaxed — a one-tick-stale total only under-counts consumed
+    /// CPU, deferring a kill. Absent vCPU times are skipped (see
+    /// `cpu_currency`).
+    pub(crate) cpu_ns_now: AtomicU64,
+    /// Bumped UNCONDITIONALLY every monitor tick — pure liveness. A
+    /// stalled `monitor_heartbeat` means the monitor thread itself is
+    /// wedged (distinct from the guest making no progress), which the
+    /// watchdog must not misread as a guest hang. Relaxed.
+    pub(crate) monitor_heartbeat: AtomicU64,
+    /// Bumped only when this tick produced NEW-WORK evidence (see the
+    /// LOAD-BEARING invariant below). Release store / Acquire load so a
+    /// reader observing a fresh epoch also sees the `cpu_ns_at_progress`
+    /// / `wall_ns_at_progress` payload stored before it.
+    ///
+    /// LOAD-BEARING PROGRESS INVARIANT (hard invariant — do not relax):
+    /// `progress_epoch` counts NEW-WORK evidence ONLY. The admissible
+    /// sources are (1) a lifecycle phase advance [a later commit bumps
+    /// `phase_epoch`], (2) a positive schedstat delta in
+    /// ttwu_count/sched_count/pcount summed across CPUs, (3) any positive
+    /// scx discrete-event-counter delta, and (4) a local-DSQ drain (a
+    /// CPU's `local_dsq_depth` fell). jiffies / `rq_clock` advance is
+    /// NEVER progress: a task pinned to one CPU spinning in a tight loop
+    /// advances jiffies and `rq_clock` every tick while doing zero
+    /// scheduling work, so counting clock advance would make a spinning
+    /// wedge look alive forever and render it immortal to the watchdog.
+    /// The evidence terms above are exactly the signals a live scheduler
+    /// emits and a wedged one does not.
+    pub(crate) progress_epoch: AtomicU64,
+    /// `cpu_ns_now` captured at the last `progress_epoch` bump. Relaxed
+    /// store paired with the epoch's Release (payload-before-epoch).
+    pub(crate) cpu_ns_at_progress: AtomicU64,
+    /// `run_start`-relative wall time (ns) at the last `progress_epoch`
+    /// bump. Relaxed store paired with the epoch's Release.
+    pub(crate) wall_ns_at_progress: AtomicU64,
+    /// True when the latest sample saw queued work anywhere
+    /// (`nr_running`, `scx_nr_running`, or `local_dsq_depth` non-zero on
+    /// any CPU). Distinguishes "idle, nothing to do" (no demand, never a
+    /// hang) from "work queued but not progressing" (a real wedge).
+    /// Relaxed — one-tick staleness only over-reports demand, deferring
+    /// a kill.
+    pub(crate) runnable_demand: AtomicBool,
+    /// Provenance of `cpu_ns_now`: [`CPU_CURRENCY_NONE`],
+    /// [`CPU_CURRENCY_PTHREAD`], or [`CPU_CURRENCY_PMU`] (the last never
+    /// written this commit). Relaxed — diagnostic-adjacent; a stale
+    /// currency never changes a kill decision by itself.
+    pub(crate) cpu_currency: AtomicU8,
+}
+
+impl ProgressLedger {
+    /// Stamp the per-tick liveness fields and bump `monitor_heartbeat`
+    /// unconditionally. Called every monitor tick regardless of whether
+    /// progress was observed.
+    pub(crate) fn record_liveness(&self, cpu_ns_now: u64, cpu_currency: u8, runnable_demand: bool) {
+        self.cpu_ns_now.store(cpu_ns_now, Ordering::Relaxed);
+        self.cpu_currency.store(cpu_currency, Ordering::Relaxed);
+        self.runnable_demand.store(runnable_demand, Ordering::Relaxed);
+        // Unconditional — this is the monitor's own liveness pulse.
+        self.monitor_heartbeat.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a NEW-WORK observation: publish the payload, then bump
+    /// `progress_epoch`. The payload stores are Relaxed and the epoch
+    /// RMW is Release, so an Acquire reader that observes the new epoch
+    /// also observes this payload (payload-before-epoch).
+    pub(crate) fn record_progress(&self, cpu_ns_now: u64, wall_ns: u64) {
+        self.cpu_ns_at_progress.store(cpu_ns_now, Ordering::Relaxed);
+        self.wall_ns_at_progress.store(wall_ns, Ordering::Relaxed);
+        self.progress_epoch.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Sum the discrete scx event counters across CPUs. `None` when no CPU
+/// carries `event_counters` (offsets unavailable / scx not attached).
+///
+/// `bypass_duration` is deliberately EXCLUDED: it accumulates nanoseconds
+/// of wall time spent in bypass mode, not a count of discrete events, so
+/// a VM wedged in bypass would grow it every tick — exactly the
+/// clock-advance-as-progress trap the progress invariant forbids. Every
+/// other field is a monotonic event count that only a live scheduler
+/// emits.
+fn scx_event_activity(cpus: &[CpuSnapshot]) -> Option<i64> {
+    let mut total = 0i64;
+    let mut any = false;
+    for cpu in cpus {
+        if let Some(ev) = &cpu.event_counters {
+            any = true;
+            total = total
+                .saturating_add(ev.select_cpu_fallback)
+                .saturating_add(ev.dispatch_local_dsq_offline)
+                .saturating_add(ev.dispatch_keep_last)
+                .saturating_add(ev.enq_skip_exiting)
+                .saturating_add(ev.enq_skip_migration_disabled)
+                .saturating_add(ev.reenq_immed)
+                .saturating_add(ev.reenq_local_repeat)
+                .saturating_add(ev.refill_slice_dfl)
+                .saturating_add(ev.bypass_dispatch)
+                .saturating_add(ev.bypass_activate)
+                .saturating_add(ev.insert_not_owned)
+                .saturating_add(ev.sub_bypass_dispatch);
+        }
+    }
+    any.then_some(total)
+}
+
+/// Pure NEW-WORK decision for a single monitor tick: does `curr` show
+/// progress relative to `prev`? Encodes terms (2)-(4) of the
+/// [`ProgressLedger::progress_epoch`] invariant (the phase-advance term
+/// (1) is folded separately from `phase_epoch`). Extracted as a pure fn
+/// so the decision is unit-testable without driving the monitor loop.
+///
+/// Where schedstat offsets were absent every `schedstat` is `None`, so
+/// the schedstat term contributes 0 on both sides and the evidence
+/// degrades to the scx-event and DSQ-drain terms — never a false hang,
+/// never a false progress.
+pub(crate) fn progress_evidence(prev: &[CpuSnapshot], curr: &[CpuSnapshot]) -> bool {
+    // Schedstat term: a positive summed delta in any of the NEW-WORK
+    // counters. Summed across CPUs (missing schedstat contributes 0).
+    let sum_ss = |cpus: &[CpuSnapshot], f: fn(&RqSchedstat) -> u64| -> u64 {
+        cpus.iter().filter_map(|c| c.schedstat.as_ref().map(&f)).sum()
+    };
+    let ss_advanced =
+        |f: fn(&RqSchedstat) -> u64| -> bool { sum_ss(curr, f) > sum_ss(prev, f) };
+    if ss_advanced(|s| s.ttwu_count as u64)
+        || ss_advanced(|s| s.sched_count as u64)
+        || ss_advanced(|s| s.pcount)
+    {
+        return true;
+    }
+
+    // scx event term: the summed discrete-event activity rose. Only
+    // when BOTH samples carry event counters (else no comparable base).
+    if let (Some(p), Some(c)) = (scx_event_activity(prev), scx_event_activity(curr))
+        && c > p
+    {
+        return true;
+    }
+
+    // DSQ-drain term: any CPU's local dispatch queue got shorter — work
+    // was dispatched out of it. Per-CPU (not summed) so a drain on one
+    // CPU still counts even if another filled; firing more readily is
+    // the conservative (less-killing) direction.
+    curr.iter()
+        .zip(prev)
+        .any(|(c, p)| c.local_dsq_depth < p.local_dsq_depth)
 }
 
 /// Per-CPU state read from guest VM memory.

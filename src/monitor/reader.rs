@@ -19,8 +19,8 @@ use super::btf_offsets::{
     SchedstatOffsets, ScxEventOffsets, resolve_map_field_offset_width,
 };
 use super::{
-    BpfMapFieldSample, CpuSnapshot, Kva, MonitorSample, RqSchedstat, SchedDomainSnapshot,
-    SchedDomainStats, ScxEventCounters,
+    BpfMapFieldSample, CpuSnapshot, Kva, MonitorSample, ProgressLedger, RqSchedstat,
+    SchedDomainSnapshot, SchedDomainStats, ScxEventCounters, progress_evidence,
 };
 use crate::sync::MutexExt;
 
@@ -2269,6 +2269,16 @@ pub(crate) struct MonitorConfig<'a> {
     /// it (post-attach) and reads each target per tick into
     /// [`MonitorSample::bpf_map_fields`].
     pub watch_bpf_maps: Option<&'a WatchBpfMapsCfg>,
+    /// Optional lock-free progress/liveness ledger. When `Some`, the
+    /// loop stamps per-tick liveness (`cpu_ns_now`, `cpu_currency`,
+    /// `runnable_demand`, an unconditional `monitor_heartbeat` bump) and
+    /// bumps `progress_epoch` on any tick showing NEW-WORK evidence (see
+    /// [`ProgressLedger`]). Every write is derived from data the loop
+    /// already read this tick — no extra guest-memory reads. `None`
+    /// (test path / callers that don't wire the watchdog) disables it.
+    /// OBSERVABILITY ONLY at this commit: the watchdog that consumes the
+    /// ledger is wired in a later commit.
+    pub progress_ledger: Option<&'a ProgressLedger>,
 }
 
 /// Inputs the monitor needs to push a watchdog-reset deadline when
@@ -3461,6 +3471,47 @@ pub(crate) fn monitor_loop(
             Vec::new()
         };
 
+        // ProgressLedger writes (OBSERVABILITY ONLY this commit; the
+        // watchdog that consumes it is wired later). Everything here is
+        // derived from data already read into `cpus` this tick — no
+        // extra guest-memory reads. Runs before the sample is pushed so
+        // `samples.last()` is still the PREVIOUS tick (the same
+        // predecessor the reactive stuck-check reads above).
+        if let Some(ledger) = cfg.progress_ledger {
+            // (a) Sum available per-vCPU CPU-time; `read_cpu_times`
+            // tolerates absent vCPUs by leaving `vcpu_cpu_time_ns` None,
+            // so skip those. Currency is pthread when ANY was Some, none
+            // when all were absent (the PMU currency, value 2, is a
+            // later commit's concern).
+            let mut cpu_ns_now: u64 = 0;
+            let mut any_cpu_time = false;
+            for cpu in &cpus {
+                if let Some(t) = cpu.vcpu_cpu_time_ns {
+                    cpu_ns_now = cpu_ns_now.saturating_add(t);
+                    any_cpu_time = true;
+                }
+            }
+            let cpu_currency = if any_cpu_time {
+                super::CPU_CURRENCY_PTHREAD
+            } else {
+                super::CPU_CURRENCY_NONE
+            };
+            // (d) Runnable demand: any CPU had queued work this sample.
+            let runnable_demand = cpus
+                .iter()
+                .any(|c| c.nr_running > 0 || c.scx_nr_running > 0 || c.local_dsq_depth > 0);
+            // (a)+(b)+(d): stamp liveness and bump the heartbeat.
+            ledger.record_liveness(cpu_ns_now, cpu_currency, runnable_demand);
+            // (c) NEW-WORK evidence vs the previous tick. No predecessor
+            // on the first tick means no baseline, hence no progress —
+            // correct: a single sample cannot show a delta.
+            if let Some(prev) = samples.last()
+                && progress_evidence(&prev.cpus, &cpus)
+            {
+                ledger.record_progress(cpu_ns_now, run_start.elapsed().as_nanos() as u64);
+            }
+        }
+
         samples.push(MonitorSample {
             bpf_map_fields,
             elapsed_ms: run_start.elapsed().as_millis() as u64,
@@ -3734,6 +3785,7 @@ mod tests {
             psi: None,
             watchdog_reset: None,
             watch_bpf_maps: None,
+            progress_ledger: None,
         }
     }
 
@@ -4032,6 +4084,7 @@ mod tests {
             psi: None,
             watchdog_reset: None,
             watch_bpf_maps: None,
+            progress_ledger: None,
         };
         let kernel_offsets = test_offsets();
         let kill = std::sync::Arc::new(AtomicBool::new(false));
@@ -7008,5 +7061,168 @@ mod tests {
         );
         // The gap itself stays unbacked (resolve_ptr None's it).
         assert!(mem.host_ptr_for_pa(0xC000_0000, 8).is_none());
+    }
+
+    // ---- ProgressLedger: pure decision helper ----
+
+    /// Build a one-CPU snapshot slice carrying only the given schedstat
+    /// NEW-WORK counters (all other fields default/absent).
+    fn ss_cpu(ttwu_count: u32, sched_count: u32, pcount: u64) -> Vec<CpuSnapshot> {
+        vec![CpuSnapshot {
+            schedstat: Some(RqSchedstat {
+                ttwu_count,
+                sched_count,
+                pcount,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]
+    }
+
+    #[test]
+    fn progress_evidence_schedstat_ttwu_delta_fires() {
+        // A single ttwu_count advance is NEW-WORK.
+        assert!(progress_evidence(&ss_cpu(10, 5, 100), &ss_cpu(11, 5, 100)));
+        // sched_count advance.
+        assert!(progress_evidence(&ss_cpu(10, 5, 100), &ss_cpu(10, 6, 100)));
+        // pcount advance.
+        assert!(progress_evidence(&ss_cpu(10, 5, 100), &ss_cpu(10, 5, 101)));
+    }
+
+    #[test]
+    fn progress_evidence_identical_schedstat_no_fire() {
+        // No delta anywhere → no progress (the static-buffer case).
+        assert!(!progress_evidence(&ss_cpu(10, 5, 100), &ss_cpu(10, 5, 100)));
+        // A REGRESSION (counter went down — impossible for cumulative
+        // kernel counters, but the helper must not fire on it) is also
+        // not progress.
+        assert!(!progress_evidence(&ss_cpu(10, 5, 100), &ss_cpu(9, 5, 100)));
+    }
+
+    #[test]
+    fn progress_evidence_dsq_drain_fires() {
+        let deep = vec![CpuSnapshot {
+            local_dsq_depth: 5,
+            ..Default::default()
+        }];
+        let drained = vec![CpuSnapshot {
+            local_dsq_depth: 3,
+            ..Default::default()
+        }];
+        // A shrinking local DSQ means work was dispatched out.
+        assert!(progress_evidence(&deep, &drained));
+        // A GROWING DSQ, with no other evidence, is not progress.
+        assert!(!progress_evidence(&drained, &deep));
+    }
+
+    #[test]
+    fn progress_evidence_scx_event_delta_fires() {
+        let ev = |keep_last: i64| -> Vec<CpuSnapshot> {
+            vec![CpuSnapshot {
+                event_counters: Some(ScxEventCounters {
+                    dispatch_keep_last: keep_last,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]
+        };
+        // A discrete scx event counter rising is NEW-WORK.
+        assert!(progress_evidence(&ev(0), &ev(1)));
+        // Unchanged event counters are not progress.
+        assert!(!progress_evidence(&ev(4), &ev(4)));
+    }
+
+    #[test]
+    fn progress_evidence_bypass_duration_alone_is_not_progress() {
+        // bypass_duration is a wall-time accumulator, excluded from the
+        // activity sum: a VM wedged in bypass must NOT look alive.
+        let bypass = |dur: i64| -> Vec<CpuSnapshot> {
+            vec![CpuSnapshot {
+                event_counters: Some(ScxEventCounters {
+                    bypass_duration: dur,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]
+        };
+        assert!(!progress_evidence(&bypass(1_000), &bypass(2_000_000)));
+    }
+
+    // ---- ProgressLedger: monitor-loop integration ----
+
+    /// Drive `monitor_loop` for a short run with a `ProgressLedger`
+    /// wired in, killing the loop from a helper thread. Returns the
+    /// ledger for assertions.
+    fn run_ledger_loop(buf: &[u8], run_ms: u64) -> ProgressLedger {
+        let offsets = test_offsets();
+        // SAFETY: buf outlives the GuestMem use (borrowed for this call).
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+        let ledger = ProgressLedger::default();
+        let cfg = MonitorConfig {
+            progress_ledger: Some(&ledger),
+            ..test_config()
+        };
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(run_ms));
+                kill.store(true, Ordering::Release);
+            })
+        };
+        let _ = monitor_loop(
+            &mem,
+            &[0],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+        ledger
+    }
+
+    #[test]
+    fn monitor_loop_ledger_heartbeat_advances_static_no_progress() {
+        // Static buffer with queued work: heartbeat pulses every tick,
+        // but no per-tick delta ever appears (identical reads), so
+        // progress_epoch must stay 0 while runnable_demand is true.
+        let offsets = test_offsets();
+        let buf = make_rq_buffer(&offsets, 2, 1, 3, 500, 0);
+        let ledger = run_ledger_loop(&buf, 50);
+
+        // (a) heartbeat advances across the short (~5-tick) run.
+        assert!(
+            ledger.monitor_heartbeat.load(Ordering::Relaxed) >= 2,
+            "heartbeat did not advance: {}",
+            ledger.monitor_heartbeat.load(Ordering::Relaxed)
+        );
+        // (c) a static buffer yields no NEW-WORK evidence.
+        assert_eq!(ledger.progress_epoch.load(Ordering::Acquire), 0);
+        // (d) nr_running/dsq queued → demand.
+        assert!(ledger.runnable_demand.load(Ordering::Relaxed));
+        // No vcpu_timing configured → no CPU-time currency this run.
+        assert_eq!(
+            ledger.cpu_currency.load(Ordering::Relaxed),
+            super::super::CPU_CURRENCY_NONE
+        );
+        assert_eq!(ledger.cpu_ns_now.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn monitor_loop_ledger_no_demand_when_idle() {
+        // All-zero rq: no nr_running, no scx tasks, no DSQ depth → the
+        // guest is idle, not wedged, so runnable_demand must be false
+        // even though the heartbeat keeps pulsing.
+        let offsets = test_offsets();
+        let buf = make_rq_buffer(&offsets, 0, 0, 0, 0, 0);
+        let ledger = run_ledger_loop(&buf, 50);
+
+        assert!(ledger.monitor_heartbeat.load(Ordering::Relaxed) >= 2);
+        assert!(!ledger.runnable_demand.load(Ordering::Relaxed));
+        assert_eq!(ledger.progress_epoch.load(Ordering::Acquire), 0);
     }
 }
