@@ -193,6 +193,78 @@ fn is_probe_output_end_frame(msg: &crate::vmm::bulk::BulkMessage) -> bool {
         && msg.payload.windows(needle.len()).any(|w| w == needle)
 }
 
+/// Provenance tag for the shared `watchdog_reset_ns` deadline atomic.
+///
+/// FOUR independent subsystems store into that single `AtomicU64`
+/// (the monitor's scx_root attach latch, the guest scenario-dispatch
+/// arms, freeze-cycle extension, and wprof-ship grace), so a watchdog
+/// dump keyed only on "was the deadline reset at all" cannot say WHICH
+/// one armed it. Worse, the scenario-start arm fires even when the
+/// scheduler already died, so the old `reset_by_scheduler_attach=`
+/// key mislabeled dead schedulers as attached during triage. This
+/// parallel `AtomicU8` records the last writer so the dump renders the
+/// true provenance.
+///
+/// A SEPARATE atomic (not bit-packed into the u64) because the freeze
+/// and grace writers do load/compare arithmetic on the raw ns value —
+/// a packed tag would corrupt that. Each writer stores its ns and its
+/// tag back-to-back under Relaxed ordering, so a reader can transiently
+/// observe a fresh ns with a stale tag (or vice-versa). That race is
+/// benign: the tag feeds human-facing diagnostics only, never a control
+/// decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum WatchdogResetTag {
+    /// No writer has armed the reset deadline yet (the initial value).
+    Unset = 0,
+    /// The host monitor observed `*scx_root` transition null → non-null
+    /// (a scheduler attached) and reset the deadline to attach-moment +
+    /// workload duration. See `monitor::reader::monitor_loop`'s
+    /// watchdog-reset arm.
+    ScxRootLatch = 1,
+    /// The guest's scenario-dispatch machinery armed/extended the reset:
+    /// a `ScenarioStart` (start the workload clock at scenario start),
+    /// `ScenarioResume` (add the paused span back), or `ScenarioEnd`
+    /// (re-anchor to now + duration) frame — all three carry this one
+    /// tag since they are the same subsystem. NOTE: the `ScenarioStart`
+    /// arm fires even when the scheduler already DIED, so this tag does
+    /// NOT imply a live scheduler — the exact ambiguity that misled the
+    /// old `reset_by_scheduler_attach` key.
+    ScenarioStart = 2,
+    /// A freeze cycle extended the reset by the freeze duration so the
+    /// frozen span does not eat the workload budget
+    /// (`extend_watchdog_for_freeze`).
+    FreezeExtend = 3,
+    /// A wprof-ship grace extended the reset to cover the ship window
+    /// (`extend_watchdog_reset_for_grace`).
+    WprofGrace = 4,
+}
+
+impl WatchdogResetTag {
+    /// Decode a raw atomic byte. Any unrecognized value (only reachable
+    /// via a never-written slot) maps to [`WatchdogResetTag::Unset`].
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::ScxRootLatch,
+            2 => Self::ScenarioStart,
+            3 => Self::FreezeExtend,
+            4 => Self::WprofGrace,
+            _ => Self::Unset,
+        }
+    }
+
+    /// Human-facing token for the watchdog dump's `reset_armed_by=` key.
+    fn render(self) -> &'static str {
+        match self {
+            Self::Unset => "none",
+            Self::ScxRootLatch => "scx-root-attach-latch",
+            Self::ScenarioStart => "scenario-start",
+            Self::FreezeExtend => "freeze-extend",
+            Self::WprofGrace => "wprof-grace",
+        }
+    }
+}
+
 /// Extend the watchdog's reset deadline so it accommodates an armed
 /// wprof-ship grace. The watchdog fires at
 /// `effective_deadline = reset_deadline.max(hard_deadline)` where
@@ -206,6 +278,7 @@ fn is_probe_output_end_frame(msg: &crate::vmm::bulk::BulkMessage) -> bool {
 /// a larger existing reset is never shrunk.
 fn extend_watchdog_reset_for_grace(
     reset_ns: &std::sync::atomic::AtomicU64,
+    reset_tag: &std::sync::atomic::AtomicU8,
     run_start: Instant,
     grace: Duration,
 ) {
@@ -213,6 +286,10 @@ fn extend_watchdog_reset_for_grace(
     let encoded = u64::try_from(target.as_nanos()).unwrap_or(u64::MAX).max(1);
     if encoded > reset_ns.load(Ordering::Acquire) {
         reset_ns.store(encoded, Ordering::Release);
+        // Stamp provenance whenever we win the max-style store, so the
+        // watchdog dump attributes this deadline to the grace and not
+        // to a stale earlier writer. Relaxed is fine — diagnostic only.
+        reset_tag.store(WatchdogResetTag::WprofGrace as u8, Ordering::Relaxed);
     }
 }
 
@@ -224,10 +301,73 @@ fn extend_watchdog_reset_for_grace(
 fn arm_wprof_grace(
     run_start: Instant,
     reset_ns: &std::sync::atomic::AtomicU64,
+    reset_tag: &std::sync::atomic::AtomicU8,
     grace: Duration,
 ) -> Instant {
-    extend_watchdog_reset_for_grace(reset_ns, run_start, grace);
+    extend_watchdog_reset_for_grace(reset_ns, reset_tag, run_start, grace);
     Instant::now() + grace
+}
+
+#[cfg(test)]
+mod watchdog_reset_tag_tests {
+    use super::WatchdogResetTag;
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// The dump-facing tokens and the decode round-trip are stable — the
+    /// watchdog dump's `reset_armed_by=` key relies on both.
+    #[test]
+    fn tag_render_and_decode() {
+        for (tag, token) in [
+            (WatchdogResetTag::Unset, "none"),
+            (WatchdogResetTag::ScxRootLatch, "scx-root-attach-latch"),
+            (WatchdogResetTag::ScenarioStart, "scenario-start"),
+            (WatchdogResetTag::FreezeExtend, "freeze-extend"),
+            (WatchdogResetTag::WprofGrace, "wprof-grace"),
+        ] {
+            assert_eq!(tag.render(), token);
+            assert_eq!(WatchdogResetTag::from_u8(tag as u8), tag);
+        }
+        // Any unknown byte decodes to Unset (a never-written slot).
+        assert_eq!(WatchdogResetTag::from_u8(200), WatchdogResetTag::Unset);
+    }
+
+    /// The wprof-grace writer stamps its tag alongside the ns store when
+    /// (and only when) it wins the max-style store.
+    #[test]
+    fn grace_writer_stamps_wprof_tag_on_win() {
+        let reset_ns = AtomicU64::new(0);
+        let reset_tag = AtomicU8::new(WatchdogResetTag::ScxRootLatch as u8);
+        // First arm from a zero deadline: the grace store wins, so both
+        // the ns and the tag move.
+        super::extend_watchdog_reset_for_grace(
+            &reset_ns,
+            &reset_tag,
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+        assert_ne!(reset_ns.load(Ordering::Acquire), 0);
+        assert_eq!(
+            WatchdogResetTag::from_u8(reset_tag.load(Ordering::Relaxed)),
+            WatchdogResetTag::WprofGrace,
+        );
+
+        // A far-future existing deadline is NOT shrunk, so the grace does
+        // not win and must not overwrite the prior tag.
+        let reset_ns = AtomicU64::new(u64::MAX);
+        let reset_tag = AtomicU8::new(WatchdogResetTag::ScxRootLatch as u8);
+        super::extend_watchdog_reset_for_grace(
+            &reset_ns,
+            &reset_tag,
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+        assert_eq!(reset_ns.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(
+            WatchdogResetTag::from_u8(reset_tag.load(Ordering::Relaxed)),
+            WatchdogResetTag::ScxRootLatch,
+        );
+    }
 }
 
 /// Three-way result of polling the BPF probe's `.bss` latch via the
@@ -1956,6 +2096,13 @@ impl KtstrVm {
         // watchdog setup site.
         let watchdog_reset_ns: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Parallel provenance tag for `watchdog_reset_ns` — records
+        // which of the four writers last armed the reset deadline so the
+        // watchdog dump can name it (see [`WatchdogResetTag`]). Cloned to
+        // each writer alongside the ns atomic; the two are always stored
+        // back-to-back.
+        let watchdog_reset_tag: Arc<std::sync::atomic::AtomicU8> =
+            Arc::new(std::sync::atomic::AtomicU8::new(WatchdogResetTag::Unset as u8));
         let kern_phys_base: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let kern_phys_base_evt = Arc::new(EventFd::new(0).expect("eventfd for kern_phys_base"));
@@ -2025,6 +2172,7 @@ impl KtstrVm {
             tcr_el1_cache.clone(),
             cr3_cache.clone(),
             watchdog_reset_ns.clone(),
+            watchdog_reset_tag.clone(),
             kern_phys_base.clone(),
             kern_phys_base_evt.clone(),
             kern_virt_kaslr.clone(),
@@ -2034,6 +2182,7 @@ impl KtstrVm {
         // into guest_mem). Reclaimed by `guard.disarm()` on the Ok path.
         guard.monitor = monitor_handle;
         let watchdog_reset_for_coord = watchdog_reset_ns.clone();
+        let watchdog_reset_tag_for_coord = watchdog_reset_tag.clone();
         let watchdog_pause_ns: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let watchdog_pause_for_coord = watchdog_pause_ns.clone();
@@ -2164,6 +2313,7 @@ impl KtstrVm {
         // time when `workload_duration_for_wd` is `None` — see
         // the watchdog's per-tick reset block.
         let watchdog_reset_for_wd = watchdog_reset_ns.clone();
+        let watchdog_reset_tag_for_wd = watchdog_reset_tag.clone();
         let workload_duration_for_wd = self.workload_duration;
 
         // Freeze coordinator thread: triggers a failure-dump freeze when
@@ -4304,7 +4454,12 @@ impl KtstrVm {
                                         kern_virt_kaslr_evt: &kern_virt_kaslr_evt,
                                         kernel_text_link_kva,
                                         watchdog_reset: workload_duration_for_coord.map(|d| {
-                                            (watchdog_reset_for_coord.as_ref(), d, run_start)
+                                            (
+                                                watchdog_reset_for_coord.as_ref(),
+                                                d,
+                                                run_start,
+                                                watchdog_reset_tag_for_coord.as_ref(),
+                                            )
                                         }),
                                         watchdog_pause_ns: watchdog_pause_for_coord.as_ref(),
                                         scenario_start_ns: scenario_start_ns_for_coord.as_ref(),
@@ -4344,7 +4499,7 @@ impl KtstrVm {
                                              arming wprof ship grace ({WPROF_SHIP_GRACE:?})"
                                         );
                                         wprof_ship_deadline =
-                                            Some(arm_wprof_grace(run_start, &watchdog_reset_for_coord, WPROF_SHIP_GRACE));
+                                            Some(arm_wprof_grace(run_start, &watchdog_reset_for_coord, &watchdog_reset_tag_for_coord, WPROF_SHIP_GRACE));
                                     }
                                     // wprof-ship grace: if an error-exit arm
                                     // (or the SCHED_EXIT arm above) armed
@@ -7541,6 +7696,11 @@ impl KtstrVm {
                                 prior_ns.saturating_add(freeze_duration.as_nanos());
                             let encoded = u64::try_from(new_target_ns).unwrap_or(u64::MAX).max(1);
                             watchdog_reset_for_coord.store(encoded, Ordering::Release);
+                            // Stamp provenance so the watchdog dump
+                            // attributes the deadline to the freeze
+                            // extension. Relaxed — diagnostic only.
+                            watchdog_reset_tag_for_coord
+                                .store(WatchdogResetTag::FreezeExtend as u8, Ordering::Relaxed);
                         }
                     };
                     // Helper: persist the JSON to the optional file
@@ -10128,7 +10288,7 @@ impl KtstrVm {
                                          awaiting wprof ship (grace {WPROF_SHIP_GRACE:?})"
                                     );
                                     wprof_ship_deadline =
-                                        Some(arm_wprof_grace(run_start, &watchdog_reset_for_coord, WPROF_SHIP_GRACE));
+                                        Some(arm_wprof_grace(run_start, &watchdog_reset_for_coord, &watchdog_reset_tag_for_coord, WPROF_SHIP_GRACE));
                                 } else {
                                     eprintln!(
                                         "freeze-coord: kill triggered after \
@@ -10299,7 +10459,7 @@ impl KtstrVm {
                                          awaiting wprof ship (grace {WPROF_SHIP_GRACE:?})"
                                     );
                                     wprof_ship_deadline =
-                                        Some(arm_wprof_grace(run_start, &watchdog_reset_for_coord, WPROF_SHIP_GRACE));
+                                        Some(arm_wprof_grace(run_start, &watchdog_reset_for_coord, &watchdog_reset_tag_for_coord, WPROF_SHIP_GRACE));
                                 } else {
                                     eprintln!(
                                         "freeze-coord: kill triggered after \
@@ -10987,7 +11147,21 @@ impl KtstrVm {
                             effective_deadline.saturating_duration_since(run_start);
                         let hard_offset = hard_deadline.saturating_duration_since(run_start);
                         let elapsed = now.saturating_duration_since(run_start);
-                        let was_reset = reset_deadline.is_some();
+                        // Decode WHICH writer last armed the reset
+                        // deadline, not merely whether one did. The old
+                        // `reset_by_scheduler_attach` key keyed on
+                        // `reset_deadline.is_some()`, which reads true
+                        // even when the scenario-start arm (not a live
+                        // scheduler) armed it — mislabeling dead
+                        // schedulers during triage. Relaxed load pairs
+                        // with the writers' Relaxed stores; a benign race
+                        // with `watchdog_reset_for_wd` can show a fresh
+                        // deadline against a stale tag, acceptable for a
+                        // human-facing dump.
+                        let reset_armed_by = WatchdogResetTag::from_u8(
+                            watchdog_reset_tag_for_wd.load(Ordering::Relaxed),
+                        )
+                        .render();
                         eprintln!("watchdog: deadline expired at {elapsed:?} from VM start");
                         eprintln!(
                             "  cause={reason}, hard_timeout_fired={hard_timeout_fired}, \
@@ -10996,7 +11170,7 @@ impl KtstrVm {
                         );
                         eprintln!(
                             "  effective_deadline={effective_offset:?} from VM start \
-                             (reset_by_scheduler_attach={was_reset})"
+                             (reset_armed_by={reset_armed_by})"
                         );
                         eprintln!("  hard_deadline={hard_offset:?} from VM start (timeout knob)");
                         eprintln!(
@@ -11835,6 +12009,7 @@ impl KtstrVm {
         tcr_el1: Option<Arc<std::sync::atomic::AtomicU64>>,
         cr3: Arc<std::sync::atomic::AtomicU64>,
         watchdog_reset_ns: Arc<std::sync::atomic::AtomicU64>,
+        watchdog_reset_tag: Arc<std::sync::atomic::AtomicU8>,
         kern_phys_base_shared: Arc<std::sync::atomic::AtomicU64>,
         kern_phys_base_evt: Arc<EventFd>,
         kern_virt_kaslr_shared: Arc<std::sync::atomic::AtomicU64>,
@@ -12639,6 +12814,7 @@ impl KtstrVm {
                         scx_root_pa,
                         workload_duration,
                         reset_ns: watchdog_reset_ns.as_ref(),
+                        reset_tag: watchdog_reset_tag.as_ref(),
                     },
                 );
                 // Named-BPF-map watch config: present only when the test

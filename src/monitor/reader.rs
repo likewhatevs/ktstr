@@ -2274,14 +2274,14 @@ pub(crate) struct MonitorConfig<'a> {
 /// Inputs the monitor needs to push a watchdog-reset deadline when
 /// a scheduler attaches.
 ///
-/// All three fields move together — none of them are useful alone —
-/// so they're bundled to keep [`MonitorConfig`] flat. Construction
-/// is owned by [`crate::vmm::freeze_coord`] inside `start_monitor`,
-/// where `scx_root_pa` is the text-mapped PA of the kernel's
-/// `scx_root` global, `workload_duration` flows from
+/// All fields move together — none of them are useful alone — so
+/// they're bundled to keep [`MonitorConfig`] flat. Construction is
+/// owned by [`crate::vmm::freeze_coord`] inside `start_monitor`, where
+/// `scx_root_pa` is the text-mapped PA of the kernel's `scx_root`
+/// global, `workload_duration` flows from
 /// [`crate::vmm::KtstrVm::workload_duration`] (which mirrors the
-/// test entry's `duration`), and `reset_ns` is shared with the
-/// watchdog thread.
+/// test entry's `duration`), and `reset_ns` / `reset_tag` are shared
+/// with the watchdog thread.
 pub(crate) struct WatchdogReset<'a> {
     /// PA of the `scx_root` global pointer (text mapping). The
     /// loop reads `mem.read_u64(scx_root_pa, 0)` each iteration
@@ -2297,6 +2297,12 @@ pub(crate) struct WatchdogReset<'a> {
     /// Duration::from_nanos(value)` as its hard deadline (capped
     /// at the original `timeout`-derived deadline).
     pub reset_ns: &'a AtomicU64,
+    /// Parallel provenance tag for [`reset_ns`], one of the
+    /// `WatchdogResetTag` byte values owned by
+    /// [`crate::vmm::freeze_coord`]. Stamped `ScxRootLatch` (value 1)
+    /// alongside the `reset_ns` store so the watchdog dump can name the
+    /// attach latch as the writer. Relaxed store — diagnostic only.
+    pub reset_tag: &'a std::sync::atomic::AtomicU8,
 }
 
 /// One watched scheduler BPF-map field, in monitor-local form. Lowered from
@@ -3003,6 +3009,11 @@ pub(crate) fn monitor_loop(
                     .saturating_add(reset.workload_duration.as_nanos());
                 let encoded = u64::try_from(target_ns).unwrap_or(u64::MAX).max(1);
                 reset.reset_ns.store(encoded, Ordering::Release);
+                // Stamp provenance so the watchdog dump attributes the
+                // deadline to the scx_root attach latch (value 1 =
+                // `WatchdogResetTag::ScxRootLatch`). Relaxed — diagnostic
+                // only; a benign race with the ns store is acceptable.
+                reset.reset_tag.store(1, Ordering::Relaxed);
                 watchdog_reset_signaled = true;
             }
         }
@@ -4893,6 +4904,73 @@ mod tests {
         assert!(
             watchdog_observation.is_none(),
             "watchdog_observation should be None when scx_root is null"
+        );
+    }
+
+    /// The scheduler-attach watchdog reset stamps its provenance tag
+    /// (`WatchdogResetTag::ScxRootLatch` == 1) alongside the `reset_ns`
+    /// store on the first non-null `*scx_root` observation, so the
+    /// watchdog dump can attribute the reset to the attach latch.
+    #[test]
+    fn monitor_loop_watchdog_reset_stamps_scx_root_latch_tag() {
+        let offsets = test_offsets();
+        // Layout: rq_buf | scx_root slot (non-null => scheduler
+        // attached). The reset arm only tests the slot for non-zero; it
+        // does not deref the KVA, so any non-zero value arms it.
+        let rq_buf = make_rq_buffer(&offsets, 1, 1, 1, 100, 0);
+        let scx_root_pa = rq_buf.len() as u64;
+        let mut combined = rq_buf;
+        combined.extend_from_slice(&0xDEAD_BEEF_u64.to_ne_bytes());
+        combined.extend_from_slice(&[0u8; 64]);
+
+        // SAFETY: combined is a live local buffer whose backing storage
+        // outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+
+        let reset_ns = AtomicU64::new(0);
+        let reset_tag = std::sync::atomic::AtomicU8::new(0);
+        let wr = WatchdogReset {
+            scx_root_pa,
+            workload_duration: Duration::from_secs(60),
+            reset_ns: &reset_ns,
+            reset_tag: &reset_tag,
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let cfg = MonitorConfig {
+            watchdog_reset: Some(wr),
+            ..test_config()
+        };
+        let _ = monitor_loop(
+            &mem,
+            &[0],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+
+        assert_ne!(
+            reset_ns.load(Ordering::Acquire),
+            0,
+            "a non-null scx_root must arm the reset deadline",
+        );
+        assert_eq!(
+            reset_tag.load(Ordering::Relaxed),
+            1,
+            "the scx_root attach latch must stamp ScxRootLatch (1)",
         );
     }
 

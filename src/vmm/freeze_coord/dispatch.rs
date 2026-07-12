@@ -157,14 +157,20 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// defined in `vmlinux.lds.S` on every architecture so the
     /// host-side extraction is cross-arch.
     pub kernel_text_link_kva: u64,
-    /// Watchdog reset atomic + workload duration. SCENARIO_START
-    /// stores `(now - run_start + duration).as_nanos()` so the
-    /// watchdog starts the workload clock from scenario start, not
-    /// from boot or SYS_RDY.
+    /// Watchdog reset atomic + workload duration + `run_start` anchor +
+    /// the parallel provenance tag. SCENARIO_START stores
+    /// `(now - run_start + duration).as_nanos()` so the watchdog starts
+    /// the workload clock from scenario start, not from boot or SYS_RDY;
+    /// SCENARIO_RESUME / SCENARIO_END re-arm it too. Every arm that
+    /// stores `reset_ns` also stamps the tag with
+    /// `WatchdogResetTag::ScenarioStart` (one tag for the whole
+    /// scenario-dispatch subsystem) so the watchdog dump does not read a
+    /// stale earlier writer's tag.
     pub watchdog_reset: Option<(
         &'a std::sync::atomic::AtomicU64,
         std::time::Duration,
         std::time::Instant,
+        &'a std::sync::atomic::AtomicU8,
     )>,
     /// Pause timestamp (nanos since run_start). 0 = not paused.
     /// ScenarioPause stores current elapsed; ScenarioStart clears
@@ -698,10 +704,17 @@ pub(super) fn dispatch_bulk_message(
                     std::sync::atomic::Ordering::Relaxed,
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                if let Some((reset_ns, duration, _)) = sinks.watchdog_reset.as_ref() {
+                if let Some((reset_ns, duration, _, reset_tag)) = sinks.watchdog_reset.as_ref() {
                     let target_ns = elapsed.as_nanos().saturating_add(duration.as_nanos());
                     let encoded = u64::try_from(target_ns).unwrap_or(u64::MAX).max(1);
                     reset_ns.store(encoded, std::sync::atomic::Ordering::Release);
+                    // Stamp provenance alongside the ns store (Relaxed —
+                    // diagnostic only) so the watchdog dump attributes
+                    // the deadline to scenario dispatch, not a stale tag.
+                    reset_tag.store(
+                        crate::vmm::freeze_coord::WatchdogResetTag::ScenarioStart as u8,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
             }
             Some(crate::vmm::wire::ShmEntry {
@@ -715,7 +728,7 @@ pub(super) fn dispatch_bulk_message(
                 let elapsed = sinks
                     .watchdog_reset
                     .as_ref()
-                    .map(|(_, _, run_start)| run_start.elapsed().as_nanos())
+                    .map(|(_, _, run_start, _)| run_start.elapsed().as_nanos())
                     .unwrap_or(0);
                 let encoded = u64::try_from(elapsed).unwrap_or(u64::MAX).max(1);
                 sinks
@@ -730,7 +743,7 @@ pub(super) fn dispatch_bulk_message(
         }
         Some(crate::vmm::wire::MsgType::ScenarioResume) => {
             if msg.crc_ok
-                && let Some((reset_ns, _, run_start)) = sinks.watchdog_reset.as_ref()
+                && let Some((reset_ns, _, run_start, reset_tag)) = sinks.watchdog_reset.as_ref()
             {
                 let paused_at = sinks
                     .watchdog_pause_ns
@@ -742,6 +755,13 @@ pub(super) fn dispatch_bulk_message(
                     let extended = (prior as u128).saturating_add(pause_duration);
                     let encoded = u64::try_from(extended).unwrap_or(u64::MAX).max(1);
                     reset_ns.store(encoded, std::sync::atomic::Ordering::Release);
+                    // Same scenario-dispatch subsystem as ScenarioStart —
+                    // stamp the tag so the dump never shows a stale
+                    // writer after a resume re-arms the deadline.
+                    reset_tag.store(
+                        crate::vmm::freeze_coord::WatchdogResetTag::ScenarioStart as u8,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     // Bump the periodic-capture cumulative pause
                     // counter by the same `pause_duration`. Periodic
                     // boundaries are anchored to workload time, so a
@@ -770,12 +790,19 @@ pub(super) fn dispatch_bulk_message(
         }
         Some(crate::vmm::wire::MsgType::ScenarioEnd) => {
             if msg.crc_ok
-                && let Some((reset_ns, duration, run_start)) = sinks.watchdog_reset.as_ref()
+                && let Some((reset_ns, duration, run_start, reset_tag)) =
+                    sinks.watchdog_reset.as_ref()
             {
                 let elapsed = run_start.elapsed();
                 let target_ns = elapsed.as_nanos().saturating_add(duration.as_nanos());
                 let encoded = u64::try_from(target_ns).unwrap_or(u64::MAX).max(1);
                 reset_ns.store(encoded, std::sync::atomic::Ordering::Release);
+                // Same scenario-dispatch subsystem — stamp the tag so a
+                // scenario-end re-arm is not attributed to a stale writer.
+                reset_tag.store(
+                    crate::vmm::freeze_coord::WatchdogResetTag::ScenarioStart as u8,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
             Some(crate::vmm::wire::ShmEntry {
                 msg_type: msg.msg_type,

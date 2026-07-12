@@ -895,7 +895,7 @@ pub(crate) const VERIFIER_BASE_TIMEOUT: Duration = Duration::from_secs(120);
 /// `vmm::rust_init::verifier_workload`) plus teardown/dump slack.
 /// Before this, verifier cells passed no `workload_duration` at all,
 /// which made the attach-reset dead code on the sweep path — the
-/// watchdog dump always read `reset_by_scheduler_attach=false`.
+/// watchdog dump always read `reset_armed_by=none`.
 pub(crate) const VERIFIER_WORKLOAD_BUDGET: Duration = Duration::from_secs(60);
 
 /// Host-side VM timeout for a verifier sweep cell: the flat
@@ -904,8 +904,8 @@ pub(crate) const VERIFIER_WORKLOAD_BUDGET: Duration = Duration::from_secs(60);
 /// [`vm_timeout_from_entry`]. The sweep previously hard-coded 120s
 /// with no headroom at all, so a wide-topology cell (128 vCPUs) that
 /// boots fine but slowly under CI concurrency was killed mid-attach
-/// — the "VM timed out (hung after attach, before exit)" class from
-/// the scx verifier sweep.
+/// — reported by the scx verifier sweep as a VM timeout (now worded
+/// "hung with no confirmed scheduler attach" for that shape).
 pub(crate) fn verifier_vm_timeout(booted_vcpus: u32) -> Duration {
     verifier_vm_timeout_for(
         booted_vcpus,
@@ -2747,8 +2747,8 @@ mod tests {
         // at 1.0): 120 s base + vm_boot_headroom(128) = 10 s kernel
         // init + (10_000 + 128×150 = 29_200 ms) sys_rdy = 39.2 s →
         // 159.2 s. The old flat 120 s left ZERO boot headroom for
-        // exactly this shape — the "VM timed out (hung after attach,
-        // before exit)" class from the scx verifier sweep.
+        // exactly this shape — the mid-attach VM-timeout class from
+        // the scx verifier sweep.
         assert_eq!(
             verifier_vm_timeout_for(128, 192),
             Duration::from_millis(159_200)

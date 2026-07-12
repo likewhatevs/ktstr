@@ -786,15 +786,21 @@ pub struct VerifierVmResult {
     /// dispatch, unlike an scx-specific `nr_dispatched` counter.
     pub dispatched: bool,
     /// The host watchdog fired (hard-deadline hang) before the guest
-    /// exited. Orthogonal to [`Self::attach`]: the attach verdict already
-    /// fails a guest that vanished BEFORE the dispatch phase — an early
-    /// kernel panic reboots via `panic=-1` (an i8042 reset →
-    /// `ExitAction::Shutdown`, `timed_out == false`) and is
-    /// [`AttachOutcome::Unconfirmed`]. This flag catches the remaining
-    /// case: a guest that wedges AFTER attaching (during teardown), which
-    /// leaves `attach == Attached` but never exits. A verifier cell FAILs
-    /// on it too — but NOT on the guest exit code, which is `1` even on
-    /// the verifier success path (no `#[ktstr_test]` body to dispatch).
+    /// exited. NOT orthogonal to [`Self::attach`] in the way the message
+    /// once implied: a hang can occur EITHER after attach (a teardown
+    /// wedge, leaving `attach == Attached`) OR before it (a scheduler
+    /// that died / never reached `enabled` DURING BPF load and then
+    /// wedged without rebooting, leaving `attach` at
+    /// [`AttachOutcome::Died`] / [`AttachOutcome::NotAttached`] /
+    /// [`AttachOutcome::Unconfirmed`]). An early kernel panic is the one
+    /// case this flag does NOT cover: `panic=-1` reboots via an i8042
+    /// reset (`ExitAction::Shutdown`, `timed_out == false`), caught by
+    /// the attach gate as [`AttachOutcome::Unconfirmed`] instead. Because
+    /// the hang is not attach-implying, [`Self::cell_verdict`] words the
+    /// timeout message per [`Self::attach`] rather than always claiming
+    /// "after attach". A verifier cell FAILs on a hang — but NOT on the
+    /// guest exit code, which is `1` even on the verifier success path
+    /// (no `#[ktstr_test]` body to dispatch).
     pub timed_out: bool,
     /// The guest's structured crash message (a `PANIC:`-prefixed line
     /// routed through the host's `extract_panic_message` into
@@ -810,20 +816,38 @@ impl VerifierVmResult {
     /// The verifier cell PASS/FAIL verdict: `Ok(())` when the scheduler
     /// verified its BPF, attached (sched_ext `enabled`), AND dispatched
     /// the injected workload; `Err(reason)` naming the first failing gate
-    /// otherwise. Gate order — `timed_out` (a post-attach teardown hang),
-    /// then attach (did it turn on?), then dispatch (did it schedule a
-    /// task?) — so the root-cause failure is reported first: an attach
+    /// otherwise. Gate order — `timed_out` (a hang: a post-attach
+    /// teardown wedge OR a scheduler that died mid-load and then wedged
+    /// without rebooting), then attach (did it turn on?), then dispatch
+    /// (did it schedule a task?) — so the root-cause failure is reported
+    /// first: an attach
     /// failure is named before the dispatch gate it necessarily also
     /// trips. Does NOT key on the guest exit code, which is `1` even on
     /// the verifier success path (no `#[ktstr_test]` body to dispatch).
     pub fn cell_verdict(&self) -> Result<(), String> {
-        // A hard-deadline hang. The attach verdict (Unconfirmed) already
-        // fails a guest that vanished BEFORE the dispatch phase (an early
-        // panic reboots via panic=-1 with timed_out=false), so this
-        // catches the orthogonal case: a guest that wedges AFTER attaching,
-        // during teardown.
+        // A hard-deadline hang, reported FIRST (outranks crash_message
+        // and the attach/dispatch gates). The hang is NOT proof of a
+        // post-attach wedge: the watchdog also fires when the scheduler
+        // died / never reached `enabled` during BPF load and the guest
+        // then wedged without rebooting. So keep the exact historical
+        // "after attach" wording ONLY when attach was positively
+        // confirmed; otherwise say the timeout carried no confirmed
+        // attach and fold in the attach failure reason. Both arms keep
+        // the "timed out" substring the gate-order test asserts.
         if self.timed_out {
-            return Err("VM timed out (hung after attach, before exit)".to_string());
+            return Err(match self.attach {
+                AttachOutcome::Attached => {
+                    "VM timed out (hung after attach, before exit)".to_string()
+                }
+                _ => match self.attach.failure_reason() {
+                    Some(reason) => format!(
+                        "VM timed out (hung with no confirmed scheduler attach — {reason})"
+                    ),
+                    None => {
+                        "VM timed out (hung with no confirmed scheduler attach)".to_string()
+                    }
+                },
+            });
         }
         // A self-describing guest infra fault outranks the attach/dispatch
         // gates: the guest PID-1 panicked before the scheduler ran (most
@@ -2381,10 +2405,50 @@ mod tests {
         );
 
         // timed_out wins over everything, even a clean attach + dispatch.
+        // With a CONFIRMED attach the historical post-attach wording is
+        // preserved verbatim.
         let hung = base(AttachOutcome::Attached, true, true).cell_verdict();
+        assert_eq!(
+            hung,
+            Err("VM timed out (hung after attach, before exit)".to_string()),
+            "timed_out + Attached keeps the exact post-attach message: {hung:?}",
+        );
+
+        // A hang WITHOUT a confirmed attach (scheduler died / never
+        // reached `enabled` / unconfirmed during BPF load, then wedged)
+        // must NOT claim "after attach": it says the timeout carried no
+        // confirmed attach and folds in the attach failure reason, while
+        // still containing the "timed out" substring the gate-order
+        // machinery keys on.
+        for attach in [
+            AttachOutcome::Died,
+            AttachOutcome::NotAttached(String::new()),
+            AttachOutcome::NotAttached("sysfs absent".to_string()),
+            AttachOutcome::Unconfirmed,
+        ] {
+            let verdict = base(attach.clone(), false, true).cell_verdict();
+            let msg = verdict.as_ref().unwrap_err();
+            assert!(
+                msg.contains("timed out"),
+                "timeout must keep the 'timed out' substring for {attach:?}: {verdict:?}",
+            );
+            assert!(
+                msg.contains("no confirmed scheduler attach"),
+                "un-attached timeout must say so for {attach:?}: {verdict:?}",
+            );
+            assert!(
+                !msg.contains("hung after attach"),
+                "un-attached timeout must not claim post-attach for {attach:?}: {verdict:?}",
+            );
+        }
+
+        // timed_out still outranks the crash_message gate.
+        let mut hung_crash = base(AttachOutcome::Died, false, true);
+        hung_crash.crash_message = Some("PANIC: guest infra fault".to_string());
+        let verdict = hung_crash.cell_verdict();
         assert!(
-            hung.as_ref().unwrap_err().contains("timed out"),
-            "timed_out must win: {hung:?}",
+            verdict.as_ref().unwrap_err().contains("timed out"),
+            "timed_out must outrank crash_message: {verdict:?}",
         );
 
         // Attach failure outranks a co-present dispatch failure (root
