@@ -12,13 +12,14 @@
 //! noise (ttwu/sched_count/pcount/scx events) ticks every 100 ms on any
 //! live guest even under a wedged scheduler, so it is NEVER progress. The
 //! watchdog therefore does not lean on per-tick progress evidence; it
-//! reasons about a phase's CPU burn and CPU trickle instead:
+//! reasons about a phase's CPU burn and runnable demand instead:
 //!   - Tier-1 (CPU budget): the phase burned more guest CPU IN-PHASE than
 //!     its [`phase_cpu_budget_ns`] without reaching its milestone — a
 //!     *spinning* wedge.
 //!   - Tier-2 (idle wedge): an INFRA phase sat past its
-//!     [`phase_wall_backstop_ns`] with no runnable demand AND its summed
-//!     CPU trickle-stalled (below the ISR-noise floor) — a *silent* wedge.
+//!     [`phase_wall_backstop_ns`] with live evidence channels and no
+//!     runnable demand — a *silent* wedge. No CPU term: the runnable
+//!     conjunct alone carries the starvation protection (see the rule).
 //!   - Tier-3 (the guest-derived hard deadline) lives in the watchdog
 //!     thread ([`super`]); [`deadman_should_fire`] here is its deferral
 //!     gate. It fires at the wall deadline only when the monitor is dead
@@ -27,11 +28,23 @@
 //!     deadline by design and a userspace-wedged cell on a live kernel is
 //!     still bounded.
 //!
-//! The CPU-trickle discriminator ([`CpuTrickleTracker`]) is the load-
-//! bearing new idea: a starved-but-alive cell (even at ~40x host dilation)
-//! still accrues tens of ms/s of guest CPU, while an idle/wedged guest
-//! accrues only microseconds/s of parked-vCPU ISR time — orders of
-//! magnitude apart, so a fixed floor separates them cleanly.
+//! The CPU-trickle discriminator ([`CpuTrickleTracker`]) serves the Tier-3
+//! deadman's deferral gate ONLY: a starved-but-alive cell (even at ~40x
+//! host dilation) still lands tens of ms/s of guest CPU on its busiest
+//! vCPU → not stalled → the deadman defers a slow cell rather than
+//! false-killing it. It is denominated in the BUSIEST single vCPU's
+//! windowed accrual (`max_i(C_i(now) - C_i(window_start))` over the
+//! per-vCPU cumulatives), not the summed CPU nor a per-tick max: those grow
+//! with vCPU count faster (a wide idle guest's rotating background burn
+//! sums ~64x above a per-vCPU floor), while the per-vCPU windowed max
+//! collapses the rotation. Computed monitor-side and published as
+//! `cpu_trickle_stalled`. It is deliberately NOT a Tier-2 conjunct: the
+//! guest housekeeping CPU's timekeeping/RCU tick burns 20-45 ms/10 s at 64
+//! vCPUs (scaling with width), so no width-stable floor can separate
+//! wide-idle from starved-alive there — the runnable conjunct carries that
+//! protection instead (see the Tier-2 rule). The same width residual in the
+//! deadman only DEFERS (never kills); its runnable-piled remainder is
+//! bounded by the guest scx watchdog (see [`deadman_should_fire`]).
 
 use crate::monitor::{
     CPU_CURRENCY_NONE, CPU_CURRENCY_PTHREAD, LedgerSnapshot, LifecycleStage, StageClass,
@@ -61,30 +74,35 @@ pub(crate) enum KillDecision {
     /// Tier-1: guest CPU burned past the phase budget with no progress —
     /// a spinning wedge.
     Tier1CpuBudget,
-    /// Tier-2: INFRA phase past its wall backstop, no runnable demand, and
-    /// CPU trickle-stalled — a silent idle wedge.
+    /// Tier-2: INFRA phase past its wall backstop with live evidence
+    /// channels and no runnable demand — a silent idle wedge.
     Tier2IdleWedge,
 }
 
 /// Trailing window over which [`CpuTrickleTracker`] measures the guest's
-/// summed CPU accrual. 10 s is long enough to average out the 100 ms tick
-/// jitter and the bursty ISR pattern on parked vCPUs, yet short enough
-/// that the Tier-2 / Tier-3 stall verdicts refresh several times inside
-/// the 45 s wall backstop / 60 s deadman grace.
+/// busiest-vCPU CPU accrual. 10 s is long enough to average out the 100 ms
+/// tick jitter and the bursty ISR pattern on parked vCPUs, yet short enough
+/// that the deadman's stall verdict refreshes several times inside its
+/// 60 s milestone grace.
 const TRICKLE_STALL_WINDOW_NS: u64 = 10_000_000_000;
 
-/// Minimum summed guest CPU (ns) that must accrue over one
+/// Minimum busiest-vCPU guest CPU (ns) that must accrue over one
 /// [`TRICKLE_STALL_WINDOW_NS`] for the guest to count as "receiving CPU"
 /// (NOT trickle-stalled) under the PMU currency. 1 ms / 10 s discriminates
-/// the two populations the watchdog must tell apart: an idle-or-wedged
-/// guest still takes timer interrupts on its parked vCPUs but the PMU SW
-/// task-clock (`exclude_host`) counts only guest-mode execution, so it
-/// accrues just the in-guest ISR bodies — tens of µs over the window,
-/// below the floor → stalled — while even a cell starved at ~40x host
-/// dilation accrues tens of ms/s (hundreds of ms over the window — far
-/// above the floor → not stalled). The floor sits in the wide gap between
-/// them, so it never misjudges a starved-but-alive cell as wedged nor an
-/// idle wedge as alive.
+/// the two populations the deadman's deferral gate must tell apart: an
+/// idle-or-wedged guest still takes timer interrupts on its parked vCPUs
+/// but the PMU SW task-clock (`exclude_host`) counts only guest-mode
+/// execution, so its busiest vCPU accrues just the in-guest ISR bodies —
+/// tens of µs over the window at 1 vCPU, below the floor → stalled — while
+/// even a cell starved at ~40x host dilation lands tens of ms/s on its
+/// busiest vCPU (hundreds of ms over the window — far above the floor →
+/// not stalled → the deadman defers).
+///
+/// CALIBRATED ON 1-vCPU CELLS. At width the guest housekeeping CPU's
+/// timekeeping/RCU duty grows with vCPU count and can lift an idle guest's
+/// busiest vCPU over this floor (see [`CpuTrickleTracker`]); the misread
+/// only DEFERS the deadman — Tier-2 owns the idle-wedge kill and carries
+/// no trickle term — so the 1-vCPU calibration stays safe to keep.
 const TRICKLE_FLOOR_NS: u64 = 1_000_000;
 
 /// [`TRICKLE_FLOOR_NS`]'s sibling for the PTHREAD currency, mirroring the
@@ -94,14 +112,22 @@ const TRICKLE_FLOOR_NS: u64 = 1_000_000;
 /// idle-wedged guest's measured trickle is orders of magnitude above the
 /// PMU magnitude the 1 ms floor was calibrated for. Measured on an
 /// idle-wedged 1-vCPU cell under pthread currency: 1-10 ms per 10 s
-/// window — ABOVE the 1 ms floor, which made the idle wedge invisible to
-/// Tier-2 and the Tier-3 deadman (both defer while "not stalled"); a
+/// window — ABOVE the 1 ms floor (which back when trickle also gated
+/// Tier-2 made the idle wedge invisible to both consumers); a
 /// starved-but-alive cell at even ~100x dilation accrues 100+ ms per
-/// window. 25 ms sits in that measured gap with ~2.5x margin in both
-/// directions. The deadman additionally requires a 60 s-stale milestone
-/// ([`TIER3_PROGRESS_GRACE_NS`]), so the joint false-kill condition is
-/// sub-0.25%-CPU-delivery for 60+ s at the wall deadline — a defensible
-/// operator bound.
+/// window on its busiest vCPU. 25 ms sits in that measured gap with ~2.5x
+/// margin in both directions. The deadman additionally requires a 60 s-stale
+/// milestone ([`TIER3_PROGRESS_GRACE_NS`]), so the joint false-kill
+/// condition is sub-0.25%-CPU-delivery for 60+ s at the wall deadline — a
+/// defensible operator bound.
+///
+/// CALIBRATED ON 1-vCPU CELLS (where the summed and busiest-vCPU
+/// currencies coincide). At width the housekeeping-CPU duty lifts an idle
+/// guest's busiest vCPU to 20-45 ms per window at 64 vCPUs — over this
+/// floor — so the deadman can misread a wide idle guest as alive and
+/// DEFER. That is safe: Tier-2 owns the idle-wedge kill without any
+/// trickle term, and the deferral's runnable-piled remainder is bounded by
+/// the guest scx watchdog (see [`deadman_should_fire`]).
 const TRICKLE_FLOOR_PTHREAD_NS: u64 = 25_000_000;
 
 /// Consecutive sub-floor [`TRICKLE_STALL_WINDOW_NS`] windows required
@@ -143,10 +169,10 @@ const fn widen_budget_for_currency(budget: u64, cpu_currency: u8) -> u64 {
 /// guest's trickle with VM-exit overhead, so the widened
 /// [`TRICKLE_FLOOR_PTHREAD_NS`] applies (see its doc for the measured
 /// populations). `CPU_CURRENCY_NONE` gets the pthread floor too: with no
-/// per-vCPU source this tick the sum carries no trusted magnitude, and the
-/// wider floor is the conservative-against-immortality choice — an idle
-/// wedge must stay killable — while the deadman's 60 s milestone grace
-/// still guards a live cell.
+/// per-vCPU source this tick the readings carry no trusted magnitude, and
+/// the wider floor is the conservative-against-immortality choice — an
+/// inert cell must stay deadman-killable — while the deadman's 60 s
+/// milestone grace still guards a live cell.
 pub(crate) const fn trickle_floor_for_currency(cpu_currency: u8) -> u64 {
     match cpu_currency {
         crate::monitor::CPU_CURRENCY_PMU => TRICKLE_FLOOR_NS,
@@ -167,19 +193,16 @@ pub(crate) const fn trickle_floor_for_currency(cpu_currency: u8) -> u64 {
 ///     monitor's width-independent Tier-1 evidence. A spinning wedge is a
 ///     hot thread, so its max crosses a flat budget; a wide idle guest's
 ///     summed background burn does NOT (that summed number lives in
-///     `cpu_ns_now`, which feeds only Tier-2/Tier-3).
+///     `cpu_ns_now`, which no longer feeds any tier).
 ///   - `wall_in_phase_ns`: wall time since this phase was entered (the
 ///     last milestone).
-///   - `runnable_demand`: the guest had runnable-but-not-running tasks —
-///     an independent Tier-2 exempt (a runnable cell is not an idle wedge;
-///     if it is also stalled the Tier-3 deadman bounds it instead).
+///   - `runnable_demand`: the guest had queued-or-running tasks anywhere —
+///     THE Tier-2 exempt, carrying the starvation protection alone (a
+///     runnable cell is not an idle wedge; if it is also stalled the Tier-3
+///     deadman / guest scx watchdog bound it instead).
 ///   - `channels_live`: the per-CPU GUEST evidence channels resolved this
 ///     tick (see [`crate::monitor::ProgressLedger::evidence_channels_live`]).
 ///     Gates Tier-2 — `runnable_demand` is only meaningful when true.
-///   - `cpu_trickle_stalled`: the guest's summed CPU accrued below the
-///     currency-dependent floor ([`trickle_floor_for_currency`]) over the
-///     last [`TRICKLE_STALL_WINDOW_NS`] ([`CpuTrickleTracker`]) — i.e. it
-///     is receiving essentially no CPU.
 ///   - `monitor_live`: the monitor thread is producing fresh ledger
 ///     writes.
 ///   - `cpu_currency`: provenance of `max_vcpu_cpu_in_phase_ns`
@@ -192,7 +215,6 @@ pub(crate) fn watchdog_step(
     wall_in_phase_ns: u64,
     runnable_demand: bool,
     channels_live: bool,
-    cpu_trickle_stalled: bool,
     monitor_live: bool,
     cpu_currency: u8,
 ) -> KillDecision {
@@ -212,10 +234,9 @@ pub(crate) fn watchdog_step(
     // without reaching its milestone. Only valid when the CPU signal has a
     // trusted currency; with CPU_CURRENCY_NONE there is no per-vCPU
     // CPU-time source this tick, so the measurement is meaningless and
-    // Tier-1 is off (Tier-2 below needs no CPU currency — it reasons about
-    // the trickle bool). Body's budget is the `u64::MAX` sentinel, so
-    // Tier-1 is structurally off for Body via the budget table, not a
-    // class check.
+    // Tier-1 is off (Tier-2 below carries no CPU term at all). Body's
+    // budget is the `u64::MAX` sentinel, so Tier-1 is structurally off for
+    // Body via the budget table, not a class check.
     if cpu_currency != CPU_CURRENCY_NONE {
         let budget = widen_budget_for_currency(phase_cpu_budget_ns(phase), cpu_currency);
         // Strict `>`: a phase whose busiest vCPU burned *exactly* the budget
@@ -226,7 +247,7 @@ pub(crate) fn watchdog_step(
     }
 
     // Tier-2: silent idle wedge — an INFRA phase sat past its wall
-    // backstop with no runnable demand while its CPU trickle-stalled. Only
+    // backstop, with live evidence channels and no runnable demand. Only
     // INFRA phases qualify (a BODY phase may legitimately sit quiescent);
     // Body's backstop is the `u64::MAX` sentinel too, so a mislabeled Body
     // can never trip the wall comparison. Every conjunct is load-bearing:
@@ -237,18 +258,26 @@ pub(crate) fn watchdog_step(
     //     blind — the acceptance storm's 33 false kills at the Boot
     //     backstop. Gating on `channels_live` suppresses Tier-2 in that
     //     blind window.
-    //   - `!runnable_demand`: a runnable guest is not an idle wedge (it
-    //     wants CPU it may just not be getting). Kept as an independent
-    //     exempt; if such a cell is also stalled, the Tier-3 deadman
-    //     bounds it rather than Tier-2.
-    //   - `cpu_trickle_stalled`: the discriminator between a host-starved
-    //     but ALIVE cell (accruing tens of ms/s → not stalled → NOT
-    //     killed) and a truly idle/wedged guest (ISR-only µs/s → stalled).
-    //     This supersedes the old fixed CPU-epsilon guard.
+    //   - `!runnable_demand`: THE starvation protection, alone. A starved
+    //     cell WITH work always shows queued-or-running tasks in its own
+    //     rq memory (`nr_running` includes the on-CPU task, and guest
+    //     memory is readable regardless of host scheduling), so it is
+    //     exempt here; a cell with NOTHING runnable is not starved of
+    //     anything, and idle-in-INFRA past the backstop IS the wedge
+    //     definition. If a runnable-exempted cell is also stalled, the
+    //     Tier-3 deadman / guest scx watchdog bound it rather than Tier-2.
+    //
+    // Deliberately NO CPU-trickle conjunct. Trickle here was width-broken
+    // belt-and-braces duplicating the runnable protection: the guest
+    // housekeeping CPU's timekeeping/RCU tick burns 20-45 ms per 10 s
+    // window at 64 vCPUs (measured; scales with width), so no width-stable
+    // floor exists — a wide idle wedge read "not stalled" and became
+    // immortal to Tier-2 AND the trickle-gated deadman. The trickle
+    // discriminator remains the DEADMAN's deferral gate only
+    // ([`deadman_should_fire`]), where its residual merely defers.
     if class == PhaseClass::Infra
         && channels_live
         && !runnable_demand
-        && cpu_trickle_stalled
         && wall_in_phase_ns > phase_wall_backstop_ns(phase)
     {
         return KillDecision::Tier2IdleWedge;
@@ -268,12 +297,14 @@ pub(crate) fn widened_cpu_budget_ns(phase: u8, cpu_currency: u8) -> u64 {
 }
 
 /// Fold one live [`LedgerSnapshot`] into a [`KillDecision`]: the glue
-/// between the ledger and the pure [`watchdog_step`]. Derives the two
-/// in-phase deltas and maps the lifecycle stage onto a [`PhaseClass`],
+/// between the ledger and the pure [`watchdog_step`]. Derives the wall
+/// in-phase delta and maps the lifecycle stage onto a [`PhaseClass`],
 /// then defers to `watchdog_step`. Kept pure (the wall clock arrives as
-/// `now_wall_ns`, the trickle verdict as `cpu_trickle_stalled`) so the
-/// ledger-read → tier-decision path is unit-testable without a live
-/// watchdog thread.
+/// `now_wall_ns`) so the ledger-read → tier-decision path is unit-testable
+/// without a live watchdog thread. The ledger's `cpu_trickle_stalled` is
+/// NOT consumed here — it gates only the Tier-3 deadman
+/// ([`deadman_should_fire`]), which the watchdog thread evaluates
+/// separately.
 ///
 /// `now_wall_ns` is `run_start`-relative — the SAME `run_start` the
 /// monitor/dispatch anchor `wall_ns_at_progress` to — so `wall_in_phase`
@@ -293,7 +324,6 @@ pub(crate) fn widened_cpu_budget_ns(phase: u8, cpu_currency: u8) -> u64 {
 pub(crate) fn evaluate_progress(
     snap: &LedgerSnapshot,
     now_wall_ns: u64,
-    cpu_trickle_stalled: bool,
     monitor_live: bool,
 ) -> KillDecision {
     let wall_in_phase = now_wall_ns.saturating_sub(snap.wall_ns_at_progress);
@@ -308,7 +338,6 @@ pub(crate) fn evaluate_progress(
         wall_in_phase,
         snap.runnable_demand,
         snap.evidence_channels_live,
-        cpu_trickle_stalled,
         monitor_live,
         snap.cpu_currency,
     )
@@ -326,14 +355,20 @@ pub(crate) fn evaluate_progress(
 ///     the harness / operator (nextest `terminate-after`), NOT this
 ///     deadman — a slow cell is not a wedged cell.
 ///   - An idle userspace wedge on a LIVE kernel (the classic PID-1-blocked
-///     shape) trickles below the floor and reaches no milestone, so the
-///     deadman fires at the wall deadline — BOUNDED. (Milestone-only
+///     shape) shows no runnable demand, so Tier-2 kills it at the wall
+///     backstop long before this deadline; the deadman is its backstop-of-
+///     last-resort should Tier-2's channel gate stay blind. (Milestone-only
 ///     progress is what makes this work: kernel scheduling noise would
 ///     otherwise reset a wall-since-progress clock every tick and defer
 ///     forever.)
 ///   - A runnable-piled-up stalled-scx cell has `runnable_demand=true`, so
-///     Tier-2 exempts it — but its CPU also trickle-stalls (tasks never
-///     run), so this deadman bounds it at the wall deadline.
+///     Tier-2 exempts it — its CPU also trickle-stalls (tasks never run),
+///     so this deadman bounds it at the wall deadline. At wide vCPU counts
+///     the trickle can misread such a cell as alive (the housekeeping-CPU
+///     width residual — see [`CpuTrickleTracker`]) and this deadman then
+///     DEFERS; that residual is still bounded, by the guest scx watchdog
+///     (`scx_tick` fires `SCX_EXIT_ERROR_STALL` on a stalled scheduler),
+///     not by wall deferral here.
 ///   - A spinning wedge never reaches here: Tier-1 bounds it on the CPU
 ///     budget long before the deadline.
 ///
@@ -353,7 +388,11 @@ pub(crate) const TIER3_PROGRESS_GRACE_NS: u64 = 60_000_000_000;
 ///     scheduling noise does NOT reset it.
 ///   - `cpu_trickle_stalled`: the guest is receiving essentially no CPU
 ///     ([`CpuTrickleTracker`]). CPU still trickling above the floor = the
-///     guest is alive and merely slow → defer.
+///     guest is alive and merely slow → defer. This deadman is the trickle
+///     discriminator's ONLY consumer (Tier-2 dropped it as width-broken
+///     belt-and-braces): here a width residual can only DEFER a kill, and
+///     the runnable-piled cell it would defer is bounded by the guest scx
+///     watchdog instead.
 ///
 /// Fires iff the monitor is dead, OR the cell is inert: CPU trickle-stalled
 /// AND no milestone within the full [`TIER3_PROGRESS_GRACE_NS`].
@@ -365,35 +404,65 @@ pub(crate) fn deadman_should_fire(
     !monitor_live || (cpu_trickle_stalled && wall_since_milestone_ns > TIER3_PROGRESS_GRACE_NS)
 }
 
-/// Watchdog-thread-local tracker that turns the ledger's monotone summed
-/// `cpu_ns_now` into a boolean "the guest is receiving essentially no CPU"
-/// (trickle-stalled), the discriminator Tier-2 and the Tier-3 deadman both
-/// rely on. Pure state machine — no clocks, no atomics — so its window
-/// arithmetic is unit-testable in isolation; the watchdog feeds it
-/// `now_ns` (a `run_start`-relative wall reading) each tick.
+/// Pure state machine that turns each tick's PER-vCPU cumulative CPU-time
+/// readings into a boolean "the guest is receiving essentially no CPU"
+/// (trickle-stalled) — the Tier-3 deadman's deferral discriminator
+/// ([`deadman_should_fire`]), its ONLY consumer. No clocks, no atomics — so
+/// its window arithmetic is unit-testable in isolation. Driven by the
+/// MONITOR (which owns the per-vCPU CPU data), not the watchdog: the
+/// monitor feeds it each tick's active-currency per-vCPU cumulatives (the
+/// same readings the Tier-1
+/// [`crate::monitor::reader::MaxVcpuInPhaseTracker`] sees) and a `run_start`-
+/// relative `now_ns`, and publishes the resulting bool to the ledger.
 ///
-/// Measures accrual over a trailing [`TRICKLE_STALL_WINDOW_NS`]: it holds
-/// a `(now_ns, cpu_ns_now)` anchor and, each time at least a full window
-/// has elapsed since the anchor, closes the window — classifying it as
-/// sub-floor (`accrued < floor_ns`, the caller-supplied currency-dependent
-/// floor from [`trickle_floor_for_currency`]) or not — and slides the
-/// anchor forward. It reports `stalled` only once
+/// CURRENCY — THE BUSIEST SINGLE vCPU, computed with PER-vCPU WINDOW
+/// ANCHORS. The window's accrual is `max_i(readings[i] - anchor[i])` over
+/// the vCPUs, where `anchor[i]` is vCPU `i`'s cumulative at the window
+/// START — i.e. the true busiest-single-vCPU CPU burned across the window.
+/// This is the least width-sensitive currency available: a 64-vCPU idle
+/// guest's diffuse background burn (timer ticks / RCU / IPIs) rotates
+/// across vCPUs and SERIALISES — at any tick essentially one vCPU is active
+/// — so a summed currency grows ~linearly with count, and a per-TICK max
+/// summed over the window grows the same way (`Σ_ticks max_i(Δ_i)` ≈
+/// `Σ_ticks Σ_i(Δ_i)`; measured: ~42 ms per 10 s window at 64 vCPUs). The
+/// per-vCPU windowed MAX collapses that rotation down to the busiest
+/// vCPU's own share. A RESIDUAL width term remains even so — the guest
+/// housekeeping CPU's timekeeping/RCU duty grows with width (measured
+/// 20-45 ms per 10 s window at 64 vCPUs under pthread currency, vs 1-10 ms
+/// at 1 vCPU), which can exceed the 1-vCPU-calibrated floors and misread a
+/// wide idle guest as alive. That misread is why this discriminator gates
+/// ONLY the deadman's deferral (where it can merely DEFER a kill, bounded
+/// elsewhere) and is NOT a Tier-2 conjunct.
+///
+/// Measures accrual over a trailing [`TRICKLE_STALL_WINDOW_NS`]: it holds a
+/// `(now_ns, anchor[])` window anchor and, each time at least a full window
+/// has elapsed, closes the window — classifying `max_i(reading-anchor)` as
+/// sub-floor (`< floor_ns`, the caller-supplied currency-dependent floor
+/// from [`trickle_floor_for_currency`]) or not — and slides the anchor
+/// forward. It reports `stalled` only once
 /// [`TRICKLE_STALL_CONSECUTIVE_WINDOWS`] windows have closed sub-floor
 /// back-to-back; any window that recovers above the floor resets the
 /// streak. Between window closures it reports the last verdict. Before the
 /// FIRST window closes it reports `false` (not stalled) — conservative
-/// during the boot CPU ramp, so a cell is never declared stalled before a
-/// full window of evidence exists.
+/// during the boot CPU ramp. A vCPU-count change re-anchors (returns the
+/// held verdict) rather than zipping mismatched indices.
 pub(crate) struct CpuTrickleTracker {
     anchor_ns: u64,
-    anchor_cpu_ns: u64,
+    /// Per-vCPU cumulative CPU-time (ns) at the current window's START.
+    /// Index-stable: vCPU `i` is `anchor[i]`.
+    anchor: Vec<u64>,
     /// Held output verdict, refreshed at each window close and reported
     /// between closes.
     stalled: bool,
-    /// Consecutive closed windows that each accrued below the floor. Any
-    /// above-floor window resets it to 0; `stalled` latches true once it
-    /// reaches [`TRICKLE_STALL_CONSECUTIVE_WINDOWS`].
+    /// Consecutive closed windows whose busiest vCPU accrued below the
+    /// floor. Any above-floor window resets it to 0; `stalled` latches true
+    /// once it reaches [`TRICKLE_STALL_CONSECUTIVE_WINDOWS`].
     consecutive_stalls: u32,
+    /// Busiest-vCPU CPU accrued over the most recently CLOSED window (0
+    /// before the first close). Not part of the stall decision — surfaced
+    /// via [`Self::last_window_accrued`] for the failure dump's
+    /// `busiest_vcpu_window` evidence line and the ledger.
+    last_window_accrued: u64,
     seeded: bool,
 }
 
@@ -401,41 +470,59 @@ impl CpuTrickleTracker {
     pub(crate) fn new() -> Self {
         Self {
             anchor_ns: 0,
-            anchor_cpu_ns: 0,
+            anchor: Vec::new(),
             stalled: false,
             consecutive_stalls: 0,
+            last_window_accrued: 0,
             seeded: false,
         }
     }
 
-    /// Fold this tick's `(cpu_ns_now, now_ns)` and return whether the
-    /// guest is currently trickle-stalled. `cpu_ns_now` is the ledger's
-    /// summed per-vCPU CPU time; `now_ns` is a `run_start`-relative wall
-    /// reading (monotone across ticks); `floor_ns` is the currency-
-    /// dependent stall floor ([`trickle_floor_for_currency`]) the closing
-    /// window's accrual is classified against. The floor is a parameter —
-    /// not captured state — so the tracker stays pure and the caller can
-    /// follow a mid-run currency change (the ledger latches the currency
-    /// on the first tick, so in practice the floor is constant per run).
-    pub(crate) fn observe(&mut self, cpu_ns_now: u64, now_ns: u64, floor_ns: u64) -> bool {
-        if !self.seeded {
+    /// Fold this tick's per-vCPU cumulative `readings` (active-currency
+    /// CPU-time ns, absent → 0, index-stable per vCPU) and `now_ns` (a
+    /// `run_start`-relative wall reading, monotone across ticks); return
+    /// whether the guest is currently trickle-stalled. `floor_ns` is the
+    /// currency-dependent stall floor ([`trickle_floor_for_currency`]) the
+    /// closing window's busiest-vCPU accrual is classified against — a
+    /// parameter, not captured state, so the tracker stays pure (the ledger
+    /// latches the currency on the first tick, so in practice it is constant
+    /// per run). Re-anchors (returns the held verdict) on a vCPU-count
+    /// change rather than zipping mismatched indices.
+    pub(crate) fn observe(&mut self, readings: &[u64], now_ns: u64, floor_ns: u64) -> bool {
+        if !self.seeded || self.anchor.len() != readings.len() {
+            self.anchor = readings.to_vec();
             self.anchor_ns = now_ns;
-            self.anchor_cpu_ns = cpu_ns_now;
             self.seeded = true;
-            return false;
+            return self.stalled;
         }
         if now_ns.saturating_sub(self.anchor_ns) >= TRICKLE_STALL_WINDOW_NS {
-            let accrued = cpu_ns_now.saturating_sub(self.anchor_cpu_ns);
+            // Busiest single vCPU's accrual across the window: the max over
+            // vCPUs of each vCPU's OWN window delta (saturating, so an
+            // absent/regressed reading contributes 0). Width-independent.
+            let accrued = readings
+                .iter()
+                .zip(&self.anchor)
+                .map(|(&r, &a)| r.saturating_sub(a))
+                .max()
+                .unwrap_or(0);
+            self.last_window_accrued = accrued;
             if accrued < floor_ns {
                 self.consecutive_stalls = self.consecutive_stalls.saturating_add(1);
             } else {
                 self.consecutive_stalls = 0;
             }
             self.stalled = self.consecutive_stalls >= TRICKLE_STALL_CONSECUTIVE_WINDOWS;
+            self.anchor.copy_from_slice(readings);
             self.anchor_ns = now_ns;
-            self.anchor_cpu_ns = cpu_ns_now;
         }
         self.stalled
+    }
+
+    /// Busiest-vCPU CPU (ns) accrued over the most recently closed trickle
+    /// window (0 before the first window closes). Dump-only evidence — the
+    /// quantity the stall verdict compares against the floor.
+    pub(crate) fn last_window_accrued(&self) -> u64 {
+        self.last_window_accrued
     }
 }
 
@@ -513,14 +600,12 @@ mod tests {
 
     /// Common Boot/INFRA, monitor-live caller. Each row varies the inputs
     /// that matter to it: `max_vcpu_cpu_in_phase`, `wall_in_phase`,
-    /// `runnable`, `channels`, `trickle_stalled`, `currency`.
-    #[allow(clippy::too_many_arguments)]
+    /// `runnable`, `channels`, `currency`.
     fn boot_step(
         max_vcpu_cpu_in_phase: u64,
         wall_in_phase: u64,
         runnable: bool,
         channels: bool,
-        trickle_stalled: bool,
         currency: u8,
     ) -> KillDecision {
         watchdog_step(
@@ -530,7 +615,6 @@ mod tests {
             wall_in_phase,
             runnable,
             channels,
-            trickle_stalled,
             true, // monitor_live
             currency,
         )
@@ -539,27 +623,24 @@ mod tests {
     // ---- Tier-1: spinning wedge (cpu_in_phase over the phase budget) ----
 
     #[test]
-    fn tier1_high_cpu_fires_regardless_of_demand_or_trickle() {
+    fn tier1_high_cpu_fires_regardless_of_demand_or_channels() {
         // Way over the Boot CPU budget → Tier-1, whether the guest looks
-        // runnable or not and whatever the trickle/channel state: a
-        // spinning wedge is caught on CPU alone.
+        // runnable or not and whatever the channel state: a spinning wedge
+        // is caught on CPU alone.
         for &runnable in &[true, false] {
             for &channels in &[true, false] {
-                for &trickle in &[true, false] {
-                    let d = boot_step(
-                        boot_budget_ns() + 100 * S,
-                        0,
-                        runnable,
-                        channels,
-                        trickle,
-                        CPU_CURRENCY_PMU,
-                    );
-                    assert_eq!(
-                        d,
-                        KillDecision::Tier1CpuBudget,
-                        "runnable={runnable} channels={channels} trickle={trickle}"
-                    );
-                }
+                let d = boot_step(
+                    boot_budget_ns() + 100 * S,
+                    0,
+                    runnable,
+                    channels,
+                    CPU_CURRENCY_PMU,
+                );
+                assert_eq!(
+                    d,
+                    KillDecision::Tier1CpuBudget,
+                    "runnable={runnable} channels={channels}"
+                );
             }
         }
     }
@@ -576,7 +657,6 @@ mod tests {
             0,
             true,
             true,
-            false,
             true,
             CPU_CURRENCY_PMU,
         );
@@ -588,13 +668,13 @@ mod tests {
         let budget = boot_budget_ns(); // PMU: no widening
         // Exactly at budget → not over → no fire.
         assert_eq!(
-            boot_step(budget, 0, false, true, false, CPU_CURRENCY_PMU),
+            boot_step(budget, 0, false, true, CPU_CURRENCY_PMU),
             KillDecision::None,
             "cpu == budget is not over budget"
         );
         // One ns over → fire.
         assert_eq!(
-            boot_step(budget + 1, 0, false, true, false, CPU_CURRENCY_PMU),
+            boot_step(budget + 1, 0, false, true, CPU_CURRENCY_PMU),
             KillDecision::Tier1CpuBudget
         );
     }
@@ -606,7 +686,9 @@ mod tests {
         // evidence charged ~141 s against a per-vCPU-linear budget and false-
         // fired; the max-per-vCPU evidence is only ~50 ms (one vCPU's share),
         // far under the flat 35 s Attach budget (pthread-widened to 52.5 s) →
-        // None. Width no longer moves Tier-1.
+        // None. Width no longer moves Tier-1. Wall (30 s) is still under the
+        // 40 s Attach backstop, so Tier-2 stays quiet too — a healthy slow
+        // attach is not killed.
         const ATTACH: u8 = 1;
         let max_vcpu = 50_000_000; // 50 ms: busiest single vCPU's in-phase burn
         for &currency in &[CPU_CURRENCY_PMU, CPU_CURRENCY_PTHREAD] {
@@ -614,10 +696,9 @@ mod tests {
                 ATTACH,
                 PhaseClass::Infra,
                 max_vcpu,
-                30 * S, // deep into the phase by wall
+                30 * S, // deep into the phase, short of the 40 s backstop
                 false,
                 true,
-                false,
                 true,
                 currency,
             );
@@ -627,93 +708,76 @@ mod tests {
 
     #[test]
     fn zero_cpu_is_never_tier1_at_any_wall() {
-        // Zero CPU burned in-phase: never Tier-1, at any wall.
+        // Zero CPU burned in-phase: never Tier-1, at any wall. Runnable
+        // demand keeps Tier-2 exempt past the backstop, isolating Tier-1.
         for wall in [0, boot_backstop_ns() + S, 100 * S] {
-            let d = boot_step(0, wall, true, true, false, CPU_CURRENCY_PMU);
+            let d = boot_step(0, wall, true, true, CPU_CURRENCY_PMU);
             assert_eq!(d, KillDecision::None, "wall={wall}");
         }
     }
 
-    // ---- Tier-2: idle wedge (INFRA + channels + !runnable + trickle-
-    //      stalled + wall past backstop) ----
+    // ---- Tier-2: idle wedge (INFRA + channels + !runnable + wall past
+    //      backstop; deliberately NO CPU term — see the rule) ----
 
     #[test]
     fn tier2_idle_wedge_fires_when_all_conjuncts_hold() {
-        // No runnable demand, channels live, CPU trickle-stalled, past the
-        // wall backstop → a silent idle wedge.
+        // No runnable demand, channels live, past the wall backstop → a
+        // silent idle wedge. No CPU/trickle input exists to defer it.
+        let d = boot_step(0, boot_backstop_ns() + S, false, true, CPU_CURRENCY_PMU);
+        assert_eq!(d, KillDecision::Tier2IdleWedge);
+    }
+
+    #[test]
+    fn tier2_wide_idle_housekeeping_burn_cannot_defer() {
+        // THE WIDE-IDLE REGRESSION ROW (restores approved row D-infra): a
+        // 64-vCPU idle wedge whose housekeeping CPU burns 20-45 ms per 10 s
+        // window (the measured width residual that kept the old trickle
+        // conjunct reading "alive" and made the wedge immortal to Tier-2
+        // AND the trickle-gated deadman). With the trickle conjunct gone,
+        // that burn shows up only in `max_vcpu_cpu_in_phase` — far under
+        // the Tier-1 budget — and Tier-2 fires on the wall backstop alone:
+        // nothing runnable + INFRA past backstop IS the wedge.
+        let housekeeping_max = 45_000_000; // 45 ms in-phase on the busiest vCPU
         let d = boot_step(
-            0,
+            housekeeping_max,
             boot_backstop_ns() + S,
             false,
             true,
-            true,
-            CPU_CURRENCY_PMU,
+            CPU_CURRENCY_PTHREAD,
         );
         assert_eq!(d, KillDecision::Tier2IdleWedge);
     }
 
     #[test]
-    fn tier2_starved_but_alive_not_trickle_stalled_does_not_fire() {
-        // The KEY revised-design row: no runnable demand and past the wall
-        // backstop, BUT the CPU is still trickling above the floor (NOT
-        // trickle-stalled) — a host-starved but ALIVE cell. Tier-2 must
-        // NOT fire; the deadman defers it too.
-        let d = boot_step(
-            5_000_000,
-            boot_backstop_ns() + S,
-            false,
-            true,
-            false,
-            CPU_CURRENCY_PMU,
-        );
-        assert_eq!(d, KillDecision::None);
-    }
-
-    #[test]
-    fn tier2_runnable_is_an_independent_exempt() {
-        // Runnable demand present → not an idle wedge even when
-        // trickle-stalled and past the backstop (the deadman bounds a
-        // runnable-piled-up stalled cell instead).
-        let d = boot_step(
-            0,
-            boot_backstop_ns() + S,
-            true,
-            true,
-            true,
-            CPU_CURRENCY_PMU,
-        );
-        assert_eq!(d, KillDecision::None);
+    fn tier2_starved_with_runnable_work_is_exempt() {
+        // THE starvation protection, carried by the runnable conjunct
+        // alone: a host-starved cell WITH work always shows queued-or-
+        // running tasks in its own rq memory (`nr_running` includes the
+        // on-CPU task, and guest memory is readable regardless of host
+        // scheduling), so it is exempt however long the wall grows. If it
+        // is also inert, the Tier-3 deadman / guest scx watchdog bound it
+        // — never Tier-2.
+        for wall in [boot_backstop_ns() + S, 1_000 * S] {
+            let d = boot_step(0, wall, true, true, CPU_CURRENCY_PMU);
+            assert_eq!(d, KillDecision::None, "wall={wall}");
+        }
     }
 
     #[test]
     fn tier2_requires_live_channels() {
-        // Channels DEAD + quiet INFRA past the backstop + trickle-stalled:
-        // absence of demand is blind here (the acceptance storm's 33 false
-        // kills), so Tier-2 must NOT fire. currency=none (the storm's
-        // pre-resolution shape) so Tier-1 is also off → None.
-        let d = boot_step(
-            0,
-            boot_backstop_ns() + S,
-            false,
-            false,
-            true,
-            CPU_CURRENCY_NONE,
-        );
+        // Channels DEAD + quiet INFRA past the backstop: absence of demand
+        // is blind here (the acceptance storm's 33 false kills), so Tier-2
+        // must NOT fire. currency=none (the storm's pre-resolution shape)
+        // so Tier-1 is also off → None.
+        let d = boot_step(0, boot_backstop_ns() + S, false, false, CPU_CURRENCY_NONE);
         assert_eq!(d, KillDecision::None);
     }
 
     #[test]
     fn tier2_needs_no_cpu_currency() {
-        // Idle wedge under currency=NONE still fires: Tier-2 reasons about
-        // the trickle bool + channels, not the CPU sum's currency.
-        let d = boot_step(
-            0,
-            boot_backstop_ns() + S,
-            false,
-            true,
-            true,
-            CPU_CURRENCY_NONE,
-        );
+        // Idle wedge under currency=NONE still fires: Tier-2 carries no
+        // CPU term at all — it reasons about channels + demand + wall.
+        let d = boot_step(0, boot_backstop_ns() + S, false, true, CPU_CURRENCY_NONE);
         assert_eq!(d, KillDecision::Tier2IdleWedge);
     }
 
@@ -730,7 +794,6 @@ mod tests {
             false,
             true,
             true,
-            true,
             CPU_CURRENCY_PMU,
         );
         assert_eq!(d, KillDecision::None);
@@ -739,14 +802,7 @@ mod tests {
     #[test]
     fn tier2_below_backstop_does_not_fire() {
         // All Tier-2 conjuncts but the wall is still short of the backstop.
-        let d = boot_step(
-            0,
-            boot_backstop_ns() - S,
-            false,
-            true,
-            true,
-            CPU_CURRENCY_PMU,
-        );
+        let d = boot_step(0, boot_backstop_ns() - S, false, true, CPU_CURRENCY_PMU);
         assert_eq!(d, KillDecision::None);
     }
 
@@ -759,7 +815,7 @@ mod tests {
         // spinning boot wedge STILL fires even in the blind early-boot
         // window.
         let over = boot_budget_ns() + boot_budget_ns() / 2 + S; // > widened pthread budget
-        let d = boot_step(over, 0, false, false, false, CPU_CURRENCY_PTHREAD);
+        let d = boot_step(over, 0, false, false, CPU_CURRENCY_PTHREAD);
         assert_eq!(d, KillDecision::Tier1CpuBudget);
     }
 
@@ -776,7 +832,6 @@ mod tests {
             0,
             false,
             true,
-            false,
             false, // monitor dead
             CPU_CURRENCY_PMU,
         );
@@ -788,7 +843,6 @@ mod tests {
             0,
             boot_backstop_ns() + 100 * S,
             false,
-            true,
             true,
             false, // monitor dead
             CPU_CURRENCY_PMU,
@@ -803,12 +857,12 @@ mod tests {
         let budget = boot_budget_ns();
         let cpu = budget + budget / 4; // within (budget, 1.5·budget)
         assert_eq!(
-            boot_step(cpu, 0, false, true, false, CPU_CURRENCY_PMU),
+            boot_step(cpu, 0, false, true, CPU_CURRENCY_PMU),
             KillDecision::Tier1CpuBudget,
             "PMU currency uses the raw budget — this burn is over it"
         );
         assert_eq!(
-            boot_step(cpu, 0, false, true, false, CPU_CURRENCY_PTHREAD),
+            boot_step(cpu, 0, false, true, CPU_CURRENCY_PTHREAD),
             KillDecision::None,
             "pthread widens the budget 3/2 — this burn is under the widened budget"
         );
@@ -819,7 +873,7 @@ mod tests {
         let budget = boot_budget_ns();
         let cpu = budget + budget / 2 + S; // over even the widened budget
         assert_eq!(
-            boot_step(cpu, 0, false, true, false, CPU_CURRENCY_PTHREAD),
+            boot_step(cpu, 0, false, true, CPU_CURRENCY_PTHREAD),
             KillDecision::Tier1CpuBudget
         );
     }
@@ -845,7 +899,6 @@ mod tests {
             u64::MAX - 1,
             u64::MAX - 1,
             false,
-            true,
             true,
             true,
             CPU_CURRENCY_PMU,
@@ -907,9 +960,9 @@ mod tests {
     fn trickle_reports_false_before_first_window_closes() {
         let mut t = CpuTrickleTracker::new();
         // Seed tick, then sub-window ticks: not enough evidence yet.
-        assert!(!t.observe(0, 0, TRICKLE_FLOOR_NS));
-        assert!(!t.observe(0, S, TRICKLE_FLOOR_NS));
-        assert!(!t.observe(0, TRICKLE_STALL_WINDOW_NS - S, TRICKLE_FLOOR_NS));
+        assert!(!t.observe(&[0], 0, TRICKLE_FLOOR_NS));
+        assert!(!t.observe(&[0], S, TRICKLE_FLOOR_NS));
+        assert!(!t.observe(&[0], TRICKLE_STALL_WINDOW_NS - S, TRICKLE_FLOOR_NS));
     }
 
     // Window length alias for the multi-window trickle tests below.
@@ -922,9 +975,9 @@ mod tests {
         // scheduling tail (the trickle-window-misread residual). The streak
         // must reach TRICKLE_STALL_CONSECUTIVE_WINDOWS.
         let mut t = CpuTrickleTracker::new();
-        assert!(!t.observe(0, 0, TRICKLE_FLOOR_NS)); // seed
+        assert!(!t.observe(&[0], 0, TRICKLE_FLOOR_NS)); // seed
         assert!(
-            !t.observe(10_000, W, TRICKLE_FLOOR_NS),
+            !t.observe(&[10_000], W, TRICKLE_FLOOR_NS),
             "one sub-floor (10 µs) window must NOT report stalled"
         );
     }
@@ -935,13 +988,13 @@ mod tests {
         // (10 µs) accrues each 10 s window — below the 1 ms floor. Two
         // CONSECUTIVE sub-floor windows → stalled.
         let mut t = CpuTrickleTracker::new();
-        assert!(!t.observe(0, 0, TRICKLE_FLOOR_NS)); // seed
+        assert!(!t.observe(&[0], 0, TRICKLE_FLOOR_NS)); // seed
         assert!(
-            !t.observe(10_000, W, TRICKLE_FLOOR_NS),
+            !t.observe(&[10_000], W, TRICKLE_FLOOR_NS),
             "window 1 sub-floor → streak 1, not yet stalled"
         );
         assert!(
-            t.observe(20_000, 2 * W, TRICKLE_FLOOR_NS),
+            t.observe(&[20_000], 2 * W, TRICKLE_FLOOR_NS),
             "window 2 consecutively sub-floor → streak 2 → stalled"
         );
     }
@@ -952,13 +1005,13 @@ mod tests {
         // over a 10 s window that is hundreds of ms — far above the floor →
         // NOT stalled (streak never even reaches 1).
         let mut t = CpuTrickleTracker::new();
-        assert!(!t.observe(0, 0, TRICKLE_FLOOR_NS)); // seed
+        assert!(!t.observe(&[0], 0, TRICKLE_FLOOR_NS)); // seed
         assert!(
-            !t.observe(200_000_000, W, TRICKLE_FLOOR_NS),
+            !t.observe(&[200_000_000], W, TRICKLE_FLOOR_NS),
             "200 ms over the window is above the floor → alive"
         );
         assert!(
-            !t.observe(400_000_000, 2 * W, TRICKLE_FLOOR_NS),
+            !t.observe(&[400_000_000], 2 * W, TRICKLE_FLOOR_NS),
             "still above the floor a second window → alive"
         );
     }
@@ -968,18 +1021,21 @@ mod tests {
         // A window that recovers above the floor between two sub-floor
         // windows resets the streak, so bursty starvation never latches.
         let mut t = CpuTrickleTracker::new();
-        assert!(!t.observe(0, 0, TRICKLE_FLOOR_NS)); // seed
-        assert!(!t.observe(0, W, TRICKLE_FLOOR_NS), "sub-floor → streak 1");
+        assert!(!t.observe(&[0], 0, TRICKLE_FLOOR_NS)); // seed
         assert!(
-            !t.observe(200_000_000, 2 * W, TRICKLE_FLOOR_NS),
+            !t.observe(&[0], W, TRICKLE_FLOOR_NS),
+            "sub-floor → streak 1"
+        );
+        assert!(
+            !t.observe(&[200_000_000], 2 * W, TRICKLE_FLOOR_NS),
             "above floor → streak reset to 0"
         );
         assert!(
-            !t.observe(200_000_000, 3 * W, TRICKLE_FLOOR_NS),
+            !t.observe(&[200_000_000], 3 * W, TRICKLE_FLOOR_NS),
             "sub-floor again → only streak 1"
         );
         assert!(
-            t.observe(200_000_000, 4 * W, TRICKLE_FLOOR_NS),
+            t.observe(&[200_000_000], 4 * W, TRICKLE_FLOOR_NS),
             "second consecutive sub-floor → streak 2 → stalled"
         );
     }
@@ -989,21 +1045,21 @@ mod tests {
         // Exactly the floor is NOT below the floor → never accrues a stall,
         // even across two windows.
         let mut t = CpuTrickleTracker::new();
-        assert!(!t.observe(0, 0, TRICKLE_FLOOR_NS));
-        assert!(!t.observe(TRICKLE_FLOOR_NS, W, TRICKLE_FLOOR_NS));
-        assert!(!t.observe(2 * TRICKLE_FLOOR_NS, 2 * W, TRICKLE_FLOOR_NS));
+        assert!(!t.observe(&[0], 0, TRICKLE_FLOOR_NS));
+        assert!(!t.observe(&[TRICKLE_FLOOR_NS], W, TRICKLE_FLOOR_NS));
+        assert!(!t.observe(&[2 * TRICKLE_FLOOR_NS], 2 * W, TRICKLE_FLOOR_NS));
 
         // One ns under the floor is sub-floor, but a single window is not
         // yet stalled; a second consecutive sub-floor window crosses the
         // streak.
         let mut t2 = CpuTrickleTracker::new();
-        assert!(!t2.observe(0, 0, TRICKLE_FLOOR_NS));
+        assert!(!t2.observe(&[0], 0, TRICKLE_FLOOR_NS));
         assert!(
-            !t2.observe(TRICKLE_FLOOR_NS - 1, W, TRICKLE_FLOOR_NS),
+            !t2.observe(&[TRICKLE_FLOOR_NS - 1], W, TRICKLE_FLOOR_NS),
             "one sub-floor window not yet stalled"
         );
         assert!(
-            t2.observe(2 * (TRICKLE_FLOOR_NS - 1), 2 * W, TRICKLE_FLOOR_NS),
+            t2.observe(&[2 * (TRICKLE_FLOOR_NS - 1)], 2 * W, TRICKLE_FLOOR_NS),
             "second consecutive sub-floor window → stalled"
         );
     }
@@ -1015,13 +1071,13 @@ mod tests {
         // closes and re-evaluates — here to alive on a fresh accrual, which
         // also resets the streak.
         let mut t = CpuTrickleTracker::new();
-        assert!(!t.observe(0, 0, TRICKLE_FLOOR_NS)); // seed
-        assert!(!t.observe(0, W, TRICKLE_FLOOR_NS)); // window 1 sub-floor → streak 1
-        assert!(t.observe(0, 2 * W, TRICKLE_FLOOR_NS)); // window 2 sub-floor → stalled
+        assert!(!t.observe(&[0], 0, TRICKLE_FLOOR_NS)); // seed
+        assert!(!t.observe(&[0], W, TRICKLE_FLOOR_NS)); // window 1 sub-floor → streak 1
+        assert!(t.observe(&[0], 2 * W, TRICKLE_FLOOR_NS)); // window 2 sub-floor → stalled
         // Sub-window tick, still stalled (held).
-        assert!(t.observe(500_000_000, 2 * W + S, TRICKLE_FLOOR_NS));
+        assert!(t.observe(&[500_000_000], 2 * W + S, TRICKLE_FLOOR_NS));
         // Next full window with big accrual → re-evaluates to alive.
-        assert!(!t.observe(1_000_000_000, 3 * W + S, TRICKLE_FLOOR_NS));
+        assert!(!t.observe(&[1_000_000_000], 3 * W + S, TRICKLE_FLOOR_NS));
     }
 
     // ---- Currency-dependent trickle floor ----
@@ -1047,30 +1103,102 @@ mod tests {
 
     #[test]
     fn trickle_idle_pthread_accrual_stalls_under_pthread_floor() {
-        // The measured idle-wedge population under pthread currency:
+        // The measured 1-vCPU idle-wedge population under pthread currency:
         // 1-10 ms per 10 s window (VM-exit overhead for residual idle
-        // kernel ticks). 10 ms/window sits ABOVE the 1 ms PMU floor —
-        // the miscalibration that made an idle wedge immortal — but BELOW
-        // the 25 ms pthread floor, so two consecutive windows latch
-        // stalled.
+        // kernel ticks). 10 ms/window sits ABOVE the 1 ms PMU floor — the
+        // miscalibration that once made an idle wedge invisible to the
+        // trickle consumers — but BELOW the 25 ms pthread floor, so two
+        // consecutive windows latch stalled and the deadman can fire on an
+        // inert cell.
         let f = trickle_floor_for_currency(CPU_CURRENCY_PTHREAD);
         let mut t = CpuTrickleTracker::new();
-        assert!(!t.observe(0, 0, f)); // seed
+        assert!(!t.observe(&[0], 0, f)); // seed
         assert!(
-            !t.observe(10_000_000, W, f),
+            !t.observe(&[10_000_000], W, f),
             "window 1: 10 ms idle-pthread accrual is sub-floor → streak 1"
         );
         assert!(
-            t.observe(20_000_000, 2 * W, f),
+            t.observe(&[20_000_000], 2 * W, f),
             "window 2: consecutively sub-floor → stalled"
         );
 
         // Control: the same 10 ms/window accrual under the PMU floor never
         // stalls — this is exactly the pre-calibration immortality shape.
         let mut pmu = CpuTrickleTracker::new();
-        assert!(!pmu.observe(0, 0, TRICKLE_FLOOR_NS));
-        assert!(!pmu.observe(10_000_000, W, TRICKLE_FLOOR_NS));
-        assert!(!pmu.observe(20_000_000, 2 * W, TRICKLE_FLOOR_NS));
+        assert!(!pmu.observe(&[0], 0, TRICKLE_FLOOR_NS));
+        assert!(!pmu.observe(&[10_000_000], W, TRICKLE_FLOOR_NS));
+        assert!(!pmu.observe(&[20_000_000], 2 * W, TRICKLE_FLOOR_NS));
+    }
+
+    #[test]
+    fn trickle_wide_idle_busiest_vcpu_stays_sub_floor() {
+        // ROTATION-COLLAPSE ARITHMETIC: 64 vCPUs whose background burn is
+        // SPREAD across them — the sum is ~38 ms per 10 s window (above the
+        // 25 ms pthread floor) but each vCPU's OWN window accrual is only
+        // ~0.6 ms, so the per-vCPU windowed MAX is sub-floor and two
+        // consecutive windows latch stalled. This pins the property that a
+        // summed or per-tick-max currency lacks. (A REAL wide idle guest
+        // additionally concentrates 20-45 ms of housekeeping duty on one
+        // vCPU — over the floor — which is why the trickle verdict gates
+        // only the deadman's deferral, never a Tier-2 kill.)
+        let f = trickle_floor_for_currency(CPU_CURRENCY_PTHREAD);
+        let mut t = CpuTrickleTracker::new();
+        let anchor = vec![0u64; 64];
+        assert!(!t.observe(&anchor, 0, f)); // seed
+        // Window 1: each vCPU advanced a jittered 0.3-0.9 ms (sum ~38 ms,
+        // busiest single vCPU 0.9 ms < 25 ms floor).
+        let w1: Vec<u64> = (0..64)
+            .map(|i| 300_000 + (i as u64 % 7) * 100_000)
+            .collect();
+        assert!(
+            !t.observe(&w1, W, f),
+            "window 1 busiest-vCPU sub-floor → streak 1"
+        );
+        // Window 2: another ~0.3-0.9 ms per vCPU on top → busiest still
+        // sub-floor → stalled.
+        let w2: Vec<u64> = w1
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| c + 300_000 + (i as u64 % 7) * 100_000)
+            .collect();
+        assert!(
+            t.observe(&w2, 2 * W, f),
+            "window 2 consecutively sub-floor → stalled"
+        );
+    }
+
+    #[test]
+    fn trickle_wide_starved_alive_one_hot_vcpu_stays_alive() {
+        // A wide but starved-ALIVE guest: most vCPUs idle (µs deltas) but
+        // ONE vCPU lands a real 100 ms slice each window — the per-vCPU
+        // windowed max surfaces it, so the busiest vCPU is above the floor →
+        // never stalled. Width does not hide a live vCPU.
+        let f = trickle_floor_for_currency(CPU_CURRENCY_PTHREAD);
+        let mut t = CpuTrickleTracker::new();
+        let mut cum = vec![0u64; 64];
+        assert!(!t.observe(&cum, 0, f)); // seed
+        for win in 1..=3u64 {
+            for (i, c) in cum.iter_mut().enumerate() {
+                *c += if i == 40 { 100_000_000 } else { 20_000 };
+            }
+            assert!(
+                !t.observe(&cum, win * W, f),
+                "one hot vCPU at 100 ms/window keeps the busiest above the floor → alive"
+            );
+        }
+    }
+
+    #[test]
+    fn trickle_vcpu_count_change_re_anchors() {
+        // A vCPU-count change re-anchors (returns the held verdict) rather
+        // than zipping mismatched-length slices.
+        let mut t = CpuTrickleTracker::new();
+        assert!(!t.observe(&[0, 0], 0, TRICKLE_FLOOR_NS)); // seed at 2 vCPUs
+        // Grow to 3 vCPUs mid-run: re-anchor, hold (still not stalled).
+        assert!(!t.observe(&[0, 0, 0], W, TRICKLE_FLOOR_NS));
+        // From the fresh 3-vCPU anchor, a full sub-floor window streaks.
+        assert!(!t.observe(&[10_000, 10_000, 10_000], 2 * W, TRICKLE_FLOOR_NS));
+        assert!(t.observe(&[20_000, 20_000, 20_000], 3 * W, TRICKLE_FLOOR_NS));
     }
 
     #[test]
@@ -1081,13 +1209,13 @@ mod tests {
         // stalled.
         let f = trickle_floor_for_currency(CPU_CURRENCY_PTHREAD);
         let mut t = CpuTrickleTracker::new();
-        assert!(!t.observe(0, 0, f)); // seed
+        assert!(!t.observe(&[0], 0, f)); // seed
         assert!(
-            !t.observe(100_000_000, W, f),
+            !t.observe(&[100_000_000], W, f),
             "100 ms/window starved-alive accrual is above the pthread floor → alive"
         );
         assert!(
-            !t.observe(200_000_000, 2 * W, f),
+            !t.observe(&[200_000_000], 2 * W, f),
             "still above the floor a second window → alive"
         );
     }
@@ -1125,7 +1253,6 @@ mod tests {
 
     // ---- evaluate_progress: ledger snapshot → tier decision glue ----
 
-    #[allow(clippy::too_many_arguments)]
     fn snap(
         phase: u8,
         max_vcpu_cpu_in_phase_ns: u64,
@@ -1136,10 +1263,14 @@ mod tests {
     ) -> LedgerSnapshot {
         LedgerSnapshot {
             phase,
-            // Summed CPU is Tier-2/Tier-3's; Tier-1 (what evaluate_progress
-            // charges) reads only the max-per-vCPU field below.
+            // evaluate_progress reads only the max-per-vCPU field (Tier-1)
+            // and the demand/channel/wall fields (Tier-2); the ledger's
+            // cpu_trickle_stalled / cpu_ns_now / busiest_vcpu_window_ns feed
+            // the deadman and the dump, not this glue — inert here.
             cpu_ns_now: 0,
             max_vcpu_cpu_in_phase_ns,
+            cpu_trickle_stalled: false,
+            busiest_vcpu_window_ns: 0,
             wall_ns_at_progress,
             progress_epoch: 0,
             monitor_heartbeat: 0,
@@ -1153,12 +1284,11 @@ mod tests {
     fn evaluate_progress_infra_idle_wedge_fires_tier2() {
         // INFRA (Boot), live monitor, no milestone (wall_at_progress==0) so
         // wall_in_phase == now past the backstop, no runnable demand,
-        // channels live, trickle-stalled → a silent idle wedge.
+        // channels live → a silent idle wedge, no CPU term consulted.
         let now = boot_backstop_ns() + S;
         let d = evaluate_progress(
             &snap(BOOT, 0, 0, false, true, CPU_CURRENCY_PMU),
             now,
-            true, // trickle_stalled
             true, // monitor_live
         );
         assert_eq!(d, KillDecision::Tier2IdleWedge);
@@ -1169,12 +1299,7 @@ mod tests {
         // Same idle shape but channels dead (the storm's early-boot blind
         // window) → Tier-2 suppressed → None.
         let now = boot_backstop_ns() + S;
-        let d = evaluate_progress(
-            &snap(BOOT, 0, 0, false, false, CPU_CURRENCY_PMU),
-            now,
-            true,
-            true,
-        );
+        let d = evaluate_progress(&snap(BOOT, 0, 0, false, false, CPU_CURRENCY_PMU), now, true);
         assert_eq!(d, KillDecision::None);
     }
 
@@ -1187,7 +1312,6 @@ mod tests {
         let d = evaluate_progress(
             &snap(BOOT, over, 0, false, false, CPU_CURRENCY_PTHREAD),
             0,
-            false,
             true,
         );
         assert_eq!(d, KillDecision::Tier1CpuBudget);
@@ -1208,7 +1332,6 @@ mod tests {
                 CPU_CURRENCY_PMU,
             ),
             0,
-            false,
             true,
         );
         assert_eq!(d, KillDecision::Tier1CpuBudget);
@@ -1220,7 +1343,6 @@ mod tests {
         let d = evaluate_progress(
             &snap(BOOT, 0, 0, false, true, CPU_CURRENCY_PMU),
             now,
-            true,
             false, // monitor dead
         );
         assert_eq!(d, KillDecision::None);
@@ -1232,7 +1354,6 @@ mod tests {
         let d = evaluate_progress(
             &snap(BODY, u64::MAX - 1, 0, false, true, CPU_CURRENCY_PMU),
             now,
-            true,
             true,
         );
         assert_eq!(d, KillDecision::None);

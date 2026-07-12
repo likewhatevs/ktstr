@@ -61,7 +61,11 @@ mod dispatch;
 mod lazy_init;
 mod snapshot;
 mod state;
-mod watchdog_step;
+// `pub(crate)` so the monitor can drive `CpuTrickleTracker` /
+// `trickle_floor_for_currency`: the width-sound trickle-stall verdict is
+// computed monitor-side (it owns the per-vCPU CPU data the busiest-vCPU
+// windowed currency needs) and published to the ledger for the watchdog.
+pub(crate) mod watchdog_step;
 mod watchpoint;
 
 #[cfg(test)]
@@ -11191,10 +11195,10 @@ impl KtstrVm {
         guard.freeze_coord = Some(freeze_coord_handle);
 
         let watchdog = std::thread::Builder::new()
-            .name("vmm-watchdog".into())
+            .name("ktstr-watchdog".into())
             .spawn(move || {
                 if let Some(cpu) = wd_service_cpu {
-                    pin_current_thread(cpu, "watchdog");
+                    pin_current_thread(cpu, "ktstr-watchdog");
                 }
                 // The hang detector's own sensing must not dilate with the
                 // load it measures. FIFO-2 is therefore UNCONDITIONAL (not
@@ -11211,7 +11215,7 @@ impl KtstrVm {
                 // CAP_SYS_NICE (see `set_rt_priority`). The service-CPU PIN
                 // above stays perf-mode-gated: `wd_service_cpu` is `None`
                 // without a reserved CPU, so there is nothing to pin to.
-                set_rt_priority(2, "watchdog");
+                set_rt_priority(2, "ktstr-watchdog");
                 let hard_deadline = Instant::now() + timeout;
                 // Soft phase needs enough headroom for the guest to
                 // flush serial and reboot. Skip when timeout < 5s.
@@ -11249,13 +11253,6 @@ impl KtstrVm {
                 // is set; absent, the load is skipped entirely
                 // (no workload duration → nothing to reset to).
                 let mut reset_deadline: Option<Instant> = None;
-                // Tier-2 / Tier-3 CPU-trickle discriminator. Folds the
-                // ledger's summed `cpu_ns_now` over a trailing window into
-                // a "receiving essentially no CPU" verdict, telling a
-                // starved-but-alive cell (keeps accruing CPU → not
-                // stalled) apart from an idle/wedged one (ISR-only µs →
-                // stalled). See [`watchdog_step::CpuTrickleTracker`].
-                let mut trickle = watchdog_step::CpuTrickleTracker::new();
                 // Tier-3 deadman deferral bookkeeping. `deadman_deferrals`
                 // counts ticks the wall deadline was reached but the
                 // deadman deferred (cell alive); folded into the eventual
@@ -11263,7 +11260,7 @@ impl KtstrVm {
                 // history.
                 let mut deadman_deferrals: u64 = 0;
                 if crate::vmm::debug_logging_enabled() {
-                    eprintln!("watchdog: started, timeout={timeout:?}");
+                    eprintln!("ktstr-watchdog: started, timeout={timeout:?}");
                 }
 
                 // Wake plumbing. `tick_tfd` is a periodic 100 ms
@@ -11282,19 +11279,19 @@ impl KtstrVm {
                 let mut tick_tfd = match TimerFd::new() {
                     Ok(t) => t,
                     Err(e) => {
-                        tracing::error!(err = %e, "watchdog: timerfd_create failed");
+                        tracing::error!(err = %e, "ktstr-watchdog: timerfd_create failed");
                         return;
                     }
                 };
                 let tick = Duration::from_millis(100);
                 if let Err(e) = tick_tfd.reset(tick, Some(tick)) {
-                    tracing::error!(err = %e, "watchdog: timerfd_settime failed");
+                    tracing::error!(err = %e, "ktstr-watchdog: timerfd_settime failed");
                     return;
                 }
                 let epoll = match Epoll::new() {
                     Ok(e) => e,
                     Err(e) => {
-                        tracing::error!(err = %e, "watchdog: epoll_create1 failed");
+                        tracing::error!(err = %e, "ktstr-watchdog: epoll_create1 failed");
                         return;
                     }
                 };
@@ -11306,7 +11303,7 @@ impl KtstrVm {
                     tick_fd,
                     EpollEvent::new(EventSet::IN, tick_fd as u64),
                 ) {
-                    tracing::error!(err = %e, "watchdog: epoll_ctl add timerfd failed");
+                    tracing::error!(err = %e, "ktstr-watchdog: epoll_ctl add timerfd failed");
                     return;
                 }
                 if let Err(e) = epoll.ctl(
@@ -11314,7 +11311,7 @@ impl KtstrVm {
                     kill_fd,
                     EpollEvent::new(EventSet::IN, kill_fd as u64),
                 ) {
-                    tracing::error!(err = %e, "watchdog: epoll_ctl add kill_evt failed");
+                    tracing::error!(err = %e, "ktstr-watchdog: epoll_ctl add kill_evt failed");
                     return;
                 }
                 if let Err(e) = epoll.ctl(
@@ -11322,7 +11319,7 @@ impl KtstrVm {
                     bsp_done_fd,
                     EpollEvent::new(EventSet::IN, bsp_done_fd as u64),
                 ) {
-                    tracing::error!(err = %e, "watchdog: epoll_ctl add bsp_done_evt failed");
+                    tracing::error!(err = %e, "ktstr-watchdog: epoll_ctl add bsp_done_evt failed");
                     return;
                 }
                 let mut epoll_buf = [EpollEvent::default(); 3];
@@ -11330,7 +11327,7 @@ impl KtstrVm {
                 loop {
                     if bsp_done_for_wd.load(Ordering::Acquire) {
                         if crate::vmm::debug_logging_enabled() {
-                            eprintln!("watchdog: BSP done, returning");
+                            eprintln!("ktstr-watchdog: BSP done, returning");
                         }
                         return;
                     }
@@ -11351,7 +11348,7 @@ impl KtstrVm {
                                 reset_deadline = Some(candidate);
                                 if crate::vmm::debug_logging_enabled() {
                                     eprintln!(
-                                        "watchdog: scheduler attach observed, hard \
+                                        "ktstr-watchdog: scheduler attach observed, hard \
                                          deadline reset to {:?} from VM start",
                                         candidate.saturating_duration_since(run_start),
                                     );
@@ -11374,20 +11371,16 @@ impl KtstrVm {
                     let snapshot = progress_ledger_for_wd.snapshot();
                     let monitor_live = monitor_liveness.observe(snapshot.monitor_heartbeat);
                     let now_wall_ns = run_start.elapsed().as_nanos() as u64;
-                    // CPU-trickle verdict for this tick — the load-bearing
-                    // discriminator for Tier-2 and the Tier-3 deferral.
-                    // Fed the ledger's summed CPU, a run_start-relative
-                    // wall reading, and the currency-dependent stall floor
-                    // (pthread charges VM-exit overhead to an idle guest,
-                    // so its floor is wider — see
-                    // `trickle_floor_for_currency`); reports whether the
-                    // guest is receiving essentially no CPU over the
-                    // trailing window.
-                    let cpu_trickle_stalled = trickle.observe(
-                        snapshot.cpu_ns_now,
-                        now_wall_ns,
-                        watchdog_step::trickle_floor_for_currency(snapshot.cpu_currency),
-                    );
+                    // CPU-trickle verdict for this tick — the Tier-3
+                    // deadman's deferral discriminator (its ONLY consumer;
+                    // Tier-2 carries no CPU term). The MONITOR computes it
+                    // (it owns the per-vCPU CPU data the busiest-vCPU
+                    // windowed currency needs — see
+                    // `watchdog_step::CpuTrickleTracker`); the watchdog just
+                    // reads the published verdict. `true` = the guest's
+                    // busiest single vCPU accrued below the currency floor
+                    // over the trailing window.
+                    let cpu_trickle_stalled = snapshot.cpu_trickle_stalled;
                     // Wall time since the last MILESTONE (progress_epoch
                     // anchor) — milestone-only, so a live kernel's
                     // scheduling noise never resets it. Same quantity as
@@ -11395,12 +11388,8 @@ impl KtstrVm {
                     // milestone); reused by the deadman deferral gate.
                     let wall_since_milestone_ns =
                         now_wall_ns.saturating_sub(snapshot.wall_ns_at_progress);
-                    let progress_decision = watchdog_step::evaluate_progress(
-                        &snapshot,
-                        now_wall_ns,
-                        cpu_trickle_stalled,
-                        monitor_live,
-                    );
+                    let progress_decision =
+                        watchdog_step::evaluate_progress(&snapshot, now_wall_ns, monitor_live);
                     let tier_fire = !matches!(progress_decision, watchdog_step::KillDecision::None);
                     let effective_deadline =
                         reset_deadline.map_or(hard_deadline, |r| r.max(hard_deadline));
@@ -11430,7 +11419,7 @@ impl KtstrVm {
                         // is a use-after-free.
                         if bsp_done_for_wd.load(Ordering::Acquire) {
                             if crate::vmm::debug_logging_enabled() {
-                                eprintln!("watchdog: BSP already done, returning");
+                                eprintln!("ktstr-watchdog: BSP already done, returning");
                             }
                             return;
                         }
@@ -11460,7 +11449,7 @@ impl KtstrVm {
                         // this token is the dump's authoritative kill cause.
                         let kill_reason_str =
                             KillReasonTag::from_u8(kill_reason.load(Ordering::Relaxed)).render();
-                        eprintln!("watchdog: {kill_reason_str}, kicking BSP");
+                        eprintln!("ktstr-watchdog: {kill_reason_str}, kicking BSP");
                         // Actionable diagnostics. Without this dump the
                         // operator-visible failure is just `timed_out =
                         // true` with no clue why. Print the deadline
@@ -11504,8 +11493,8 @@ impl KtstrVm {
                         // vCPU's CPU burned since the phase was entered) is
                         // what Tier-1 compares against the currency-widened
                         // budget — width-independent; the summed `cpu_ns_now`
-                        // is rendered alongside for context (it feeds only
-                        // Tier-2/Tier-3). `wall_in_phase` (wall since the last
+                        // is rendered alongside as pure context (it feeds no
+                        // tier). `wall_in_phase` (wall since the last
                         // milestone) is what Tier-2 / the deadman compare
                         // against the backstop / grace. The `u64::MAX`
                         // sentinel budgets (Body / unmodeled phase) render as
@@ -11548,7 +11537,7 @@ impl KtstrVm {
                             ""
                         };
                         eprintln!(
-                            "{header_prefix}watchdog: deadline expired at {elapsed:?} from VM start"
+                            "{header_prefix}ktstr-watchdog: deadline expired at {elapsed:?} from VM start"
                         );
                         eprintln!(
                             "  cause={kill_reason_str}, \
@@ -11574,6 +11563,19 @@ impl KtstrVm {
                             Duration::from_nanos(max_vcpu_cpu_in_phase),
                             render_budget(cpu_budget),
                             Duration::from_nanos(snapshot.cpu_ns_now),
+                        );
+                        // Deadman trickle evidence: the BUSIEST single
+                        // vCPU's CPU accrued over the last closed 10 s
+                        // window (monitor-computed via per-vCPU window
+                        // anchors) vs the currency floor — what latched (or
+                        // deferred) `cpu_trickle_stalled` above. Deadman-
+                        // only; Tier-2 carries no CPU term.
+                        eprintln!(
+                            "  busiest_vcpu_window={:?} vs trickle_floor={:?}",
+                            Duration::from_nanos(snapshot.busiest_vcpu_window_ns),
+                            Duration::from_nanos(watchdog_step::trickle_floor_for_currency(
+                                snapshot.cpu_currency
+                            )),
                         );
                         eprintln!(
                             "  wall_in_phase={:?} vs backstop={}",
@@ -11622,7 +11624,7 @@ impl KtstrVm {
                         unsafe {
                             libc::pthread_kill(bsp_tid, vcpu_signal());
                         }
-                        eprintln!("watchdog: BSP kicked");
+                        eprintln!("ktstr-watchdog: BSP kicked");
                         return;
                     }
                     // Soft deadline: request graceful shutdown by
@@ -11674,7 +11676,7 @@ impl KtstrVm {
                         )
                     {
                         soft_fired = true;
-                        eprintln!("watchdog: soft deadline, requesting graceful shutdown");
+                        eprintln!("ktstr-watchdog: soft deadline, requesting graceful shutdown");
                         super::host_comms::request_shutdown(&wd_virtio_con);
                     }
                     // Block until the next tick or a kill_evt /
@@ -11706,7 +11708,7 @@ impl KtstrVm {
                         }
                         Err(e) => {
                             if e.raw_os_error() != Some(libc::EINTR) {
-                                tracing::warn!(err = %e, "watchdog: epoll_wait failed");
+                                tracing::warn!(err = %e, "ktstr-watchdog: epoll_wait failed");
                                 // Fall through to the next iteration
                                 // so the deadline check still runs;
                                 // a persistent failure is eventually

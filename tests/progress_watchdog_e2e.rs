@@ -10,17 +10,22 @@
 //! clock every tick (measured: a 60 s teardown idle-sleep sailed through
 //! untripped). The current model (`src/vmm/freeze_coord/watchdog_step.rs`)
 //! anchors progress on MILESTONES (lifecycle stage advances) only, and
-//! reasons about a phase's CPU burn and CPU trickle:
+//! reasons about a phase's CPU burn and runnable demand:
 //!   - **Tier-1** — the busiest vCPU's `max_vcpu_cpu_in_phase` exceeded the
 //!     phase's flat `phase_cpu_budget_ns` without reaching a milestone: a
 //!     *spinning* wedge.
 //!   - **Tier-2** — an INFRA phase sat past its `phase_wall_backstop_ns`
-//!     with live evidence channels, no runnable demand, and its CPU
-//!     trickle-stalled (two consecutive 10 s windows under the 1 ms floor):
-//!     a *silent idle* wedge.
+//!     with live evidence channels and no runnable demand: a *silent idle*
+//!     wedge. Deliberately NO CPU/trickle conjunct — the runnable conjunct
+//!     alone carries the starvation protection (a starved cell WITH work
+//!     always shows queued-or-running tasks in its own rq memory), and the
+//!     old trickle conjunct was width-broken belt-and-braces (a wide idle
+//!     guest's housekeeping burn cleared any 1-vCPU-calibrated floor and
+//!     made the wedge immortal). The `*_wide` fixtures (64 vCPUs) are the
+//!     regression guard for that.
 //!   - **Tier-3** — the dead-man wall deadline, deferring while the cell is
-//!     alive (CPU accruing or a recent milestone) and firing only on a dead
-//!     monitor or a truly inert cell.
+//!     alive (busiest-vCPU CPU trickle above the floor, or a recent
+//!     milestone) and firing only on a dead monitor or a truly inert cell.
 //!
 //! Both progress tiers fire ONLY in INFRA stages (Boot / Attach / Dispatch
 //! / Teardown); the Body stage is exempt via the `u64::MAX` Body budgets in
@@ -59,19 +64,16 @@
 //! deadman-speed kill can never land under ~150 s.
 //!
 //!   - **Tier-2 idle**: the wedge starts at ~10-15 s (boot ≈ 5-10 s + 1 s
-//!     body + bounded teardown preamble). Firing needs BOTH conjuncts:
-//!     `wall_in_phase > 15s` (the Teardown backstop) and trickle-stall =
-//!     two consecutive 10 s sub-1 ms windows — worst-case ≈ 10 s (partial
-//!     window contaminated by pre-wedge CPU) + 2 × 10 s = 30 s after wedge
-//!     start, so the kill lands ≈ 40-50 s total. Asserted `< 90s` — 0.6×
-//!     the deadman, generous for host-load jitter yet strictly
+//!     body + bounded teardown preamble; a few s later at 64 vCPUs). Tier-2
+//!     fires once `wall_in_phase > 15s` (the Teardown backstop) — no
+//!     trickle latch to wait out — so the kill lands ≈ 25-35 s total.
+//!     Asserted `< 90s` — generous for host-load jitter yet strictly
 //!     discriminating (a deadman kill cannot beat ~150 s).
-//!   - **Tier-1 spin**: the Teardown CPU budget is now the flat 8 s
+//!   - **Tier-1 spin**: the Teardown CPU budget is the flat 8 s
 //!     (≤ 12 s if pthread-widened 3/2), charged against the MAX per-vCPU
 //!     in-phase burn; a 1-vCPU spinner IS the max and accrues ~1 s CPU per
 //!     wall-second, so Tier-1 fires ≈ 8-12 s after the wedge starts —
-//!     ≈ 20-27 s total. Asserted `< 60s` (0.4× the deadman): tighter than
-//!     the idle bound because Tier-1 needs no trickle windows.
+//!     ≈ 20-27 s total. Asserted `< 60s` (0.4× the deadman).
 //!
 //! The kill CAUSE line (`cause=tier1-cpu-budget` / `cause=tier2-idle-wedge`)
 //! goes to the watchdog's stderr dump — captured by nextest, not carried on
@@ -103,14 +105,32 @@ const TEARDOWN_IDLE_SCHED: Scheduler =
 const TEARDOWN_SPIN_SCHED: Scheduler =
     Scheduler::named("progress_wd_teardown_spin").kargs(&["KTSTR_FAULT_TEARDOWN_WEDGE=spin"]);
 
+/// Wide-topology (64-vCPU) siblings of the two wedge shapes above. Same
+/// fault injectors; the wide topology is the REGRESSION GUARD for Tier-2's
+/// width-soundness. When Tier-2 still carried a CPU-trickle conjunct, a
+/// wide idle guest's background burn cleared the 1-vCPU-calibrated floor at
+/// width (summed: ~64x; even the busiest-single-vCPU windowed accrual reads
+/// 20-45 ms/10 s from the housekeeping CPU's timekeeping/RCU duty), so the
+/// trickle never latched "stalled" — Tier-2 AND the trickle-gated Tier-3
+/// deadman both deferred, and the wide idle wedge escaped to the harness
+/// bound. Tier-2 now fires on channels + no-demand + wall backstop alone
+/// (the runnable conjunct carries the starvation protection), so the wide
+/// idle wedge dies on the same bound as the narrow one. The wide spin wedge
+/// stays Tier-1: its lone hot vCPU IS the max-per-vCPU burn, so width does
+/// not move Tier-1's flat budget either.
+const TEARDOWN_IDLE_WIDE_SCHED: Scheduler =
+    Scheduler::named("progress_wd_teardown_idle_wide").kargs(&["KTSTR_FAULT_TEARDOWN_WEDGE=idle"]);
+const TEARDOWN_SPIN_WIDE_SCHED: Scheduler =
+    Scheduler::named("progress_wd_teardown_spin_wide").kargs(&["KTSTR_FAULT_TEARDOWN_WEDGE=spin"]);
+
 /// Upper bound on a Tier-2 idle-wedge kill's wall time. Derivation in the
-/// module doc: expected ≈ 40-50 s (wedge start + 15 s backstop ∥ ~30 s
-/// worst-case trickle latch); the Tier-3 deadman cannot land under ~150 s.
+/// module doc: expected ≈ 25-35 s (wedge start + the 15 s Teardown wall
+/// backstop, no trickle latch); the Tier-3 deadman cannot land under
+/// ~150 s.
 const TIER2_IDLE_BOUND: Duration = Duration::from_secs(90);
 
 /// Upper bound on a Tier-1 spin-wedge kill's wall time. Expected ≈ 20-27 s
-/// (wedge start + ≤12 s widened CPU-budget burn); tighter than the idle
-/// bound because Tier-1 needs no trickle windows.
+/// (wedge start + ≤12 s widened CPU-budget burn).
 const TIER1_SPIN_BOUND: Duration = Duration::from_secs(60);
 
 /// Host-side gate for the idle (Tier-2) fixture: the injected Teardown
@@ -128,7 +148,7 @@ fn assert_tier2_idle_fast_kill(result: &VmResult) -> Result<()> {
         result.duration < TIER2_IDLE_BOUND,
         "Teardown idle-wedge timed out but too slowly ({:.1}s >= {:.1}s \
          bound): the kill looks like the Tier-3 dead-man deadline (~150s+), \
-         not the Tier-2 wall backstop + trickle-stall latch (~40-50s)",
+         not the Tier-2 wall backstop (~25-35s)",
         result.duration.as_secs_f64(),
         TIER2_IDLE_BOUND.as_secs_f64(),
     );
@@ -173,22 +193,17 @@ fn assert_idle_body_survived(result: &VmResult) -> Result<()> {
 
 /// Tier-2 (silent idle-wedge): after publishing its PASS, the guest sleeps
 /// forever in the Teardown stage — no runnable demand, ISR-only CPU
-/// trickle. The watchdog's Tier-2 rule kills it once the trickle-stall
-/// discriminator latches (~2×10s windows) past the 15 s Teardown wall
-/// backstop — far below the ~150 s Tier-3 deadman. Green iff the kill
+/// trickle. The watchdog's Tier-2 rule kills it once `wall_in_phase`
+/// crosses the 15 s Teardown wall backstop (channels live, nothing
+/// runnable) — far below the ~150 s Tier-3 deadman. Green iff the kill
 /// lands fast (see `assert_tier2_idle_fast_kill`).
 ///
-/// This fixture is the regression test for the trickle floor's currency
-/// calibration: under the pthread currency fallback (any host where
-/// `perf_event_paranoid=2` rejects the PMU task-clock open in
-/// `monitor::perf_counters`), the pthread clock charges the full
-/// VM-exit/host path for every residual idle kernel tick — measured
-/// 1-10 ms per 10 s window on this exact idle-wedge shape — which sailed
-/// over the original PMU-calibrated 1 ms floor and made the wedge
-/// immortal to Tier-2 AND the deadman. The currency-dependent floor
-/// (`trickle_floor_for_currency` in `watchdog_step.rs`) is what makes
-/// this fixture fire; a revert of that calibration turns this test red
-/// at nextest's terminate-after.
+/// This fixture pins the Tier-2 conjuncts end-to-end: the guest's
+/// evidence channels are live and its rq memory reports nothing
+/// queued-or-running, so the idle-in-INFRA wedge dies on the wall backstop
+/// alone — no CPU/trickle term can defer it (the old trickle conjunct
+/// deferred exactly this shape whenever the measured idle trickle cleared
+/// the floor, and was width-broken besides — see `watchdog_step.rs`).
 #[ktstr_test(
     scheduler = TEARDOWN_IDLE_SCHED,
     llcs = 1,
@@ -209,9 +224,8 @@ fn teardown_idle_wedge_killed_by_tier2(_ctx: &Ctx) -> Result<AssertResult> {
 /// forever in the Teardown stage, burning CPU with no milestone. The
 /// watchdog's Tier-1 rule kills it once its `max_vcpu_cpu_in_phase` exceeds
 /// the flat 8 s Teardown CPU budget (the lone spinning vCPU IS the max) —
-/// earlier than Tier-2's backstop+trickle latch and
-/// far below Tier-3. Green iff the kill lands fast (see
-/// `assert_tier1_spin_fast_kill`).
+/// earlier than Tier-2's 15 s wall backstop and far below Tier-3. Green iff
+/// the kill lands fast (see `assert_tier1_spin_fast_kill`).
 #[ktstr_test(
     scheduler = TEARDOWN_SPIN_SCHED,
     llcs = 1,
@@ -225,6 +239,56 @@ fn teardown_idle_wedge_killed_by_tier2(_ctx: &Ctx) -> Result<AssertResult> {
     post_vm_unconditional = assert_tier1_spin_fast_kill,
 )]
 fn teardown_spin_wedge_killed_by_tier1(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
+/// Tier-2 idle wedge at WIDTH (8 llcs × 8 cores = 64 vCPUs) — THE
+/// regression test for Tier-2's width-soundness. When Tier-2 still carried
+/// a CPU-trickle conjunct, this exact shape was immortal: the 64-vCPU idle
+/// guest's background burn cleared the 1-vCPU-calibrated floor at width
+/// (measured 20-45 ms per 10 s window on the busiest vCPU alone — the
+/// housekeeping CPU's timekeeping/RCU duty scales with vCPU count), so the
+/// trickle never latched "stalled" and Tier-2 AND the trickle-gated Tier-3
+/// deadman both deferred — the wedge escaped to the harness bound. Tier-2
+/// now needs only channels + no-demand + the 15 s Teardown wall backstop,
+/// so this wedge dies on the same bound as the 1-vCPU fixture.
+/// Asserted `< 90s` — the wide deadman is ~179 s (64-vCPU boot headroom), so
+/// this bound strictly excludes a deadman-speed kill.
+#[ktstr_test(
+    scheduler = TEARDOWN_IDLE_WIDE_SCHED,
+    llcs = 8,
+    cores = 8,
+    threads = 1,
+    memory_mib = 256,
+    no_perf_mode,
+    duration_s = 1,
+    watchdog_timeout_s = 90,
+    auto_repro = false,
+    post_vm_unconditional = assert_tier2_idle_fast_kill,
+)]
+fn teardown_idle_wedge_wide_killed_by_tier2(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
+/// Tier-1 spin wedge at WIDTH (64 vCPUs): the control proving width does not
+/// move Tier-1. The `spin` fault burns CPU on a SINGLE vCPU, which IS the
+/// max-per-vCPU in-phase burn, so Tier-1 fires on its flat Teardown CPU
+/// budget exactly as at 1 vCPU — the other 63 idle vCPUs sum into
+/// `cpu_ns_now` but never into the width-independent Tier-1 evidence.
+/// Asserted `< 60s`.
+#[ktstr_test(
+    scheduler = TEARDOWN_SPIN_WIDE_SCHED,
+    llcs = 8,
+    cores = 8,
+    threads = 1,
+    memory_mib = 256,
+    no_perf_mode,
+    duration_s = 1,
+    watchdog_timeout_s = 90,
+    auto_repro = false,
+    post_vm_unconditional = assert_tier1_spin_fast_kill,
+)]
+fn teardown_spin_wedge_wide_killed_by_tier1(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 

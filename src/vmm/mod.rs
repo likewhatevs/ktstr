@@ -1594,7 +1594,7 @@ impl KtstrVm {
             let deadline = self.exec_timeout;
             Some(
                 std::thread::Builder::new()
-                    .name("interactive-exec-watchdog".into())
+                    .name("ktstr-exec-wdog".into())
                     .spawn(move || {
                         let start = std::time::Instant::now();
                         loop {
@@ -1626,7 +1626,7 @@ impl KtstrVm {
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         }
                     })
-                    .context("spawn interactive-exec-watchdog thread")?,
+                    .context("spawn ktstr-exec-wdog (interactive exec watchdog) thread")?,
             )
         } else {
             None

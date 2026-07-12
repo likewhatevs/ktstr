@@ -762,10 +762,30 @@ pub(crate) struct ProgressLedger {
     /// Summed available per-vCPU CPU-time (ns) as of the latest monitor
     /// tick. Relaxed — a one-tick-stale total only under-counts consumed
     /// CPU, deferring a kill. Absent vCPU times are skipped (see
-    /// `cpu_currency`). Sum-based, so it feeds the width-insensitive
-    /// trickle/deadman logic (Tier-2/Tier-3), NOT Tier-1 — see
-    /// `max_vcpu_cpu_in_phase_ns`.
+    /// `cpu_currency`). Retained for dilation context and the failure dump;
+    /// NO LONGER feeds a kill tier — the summed currency is width-unsound
+    /// (a wide idle guest's `Σ`-of-background-burn grows with vCPU count),
+    /// so the Tier-3 deadman consumes the busiest-vCPU
+    /// `cpu_trickle_stalled` verdict and Tier-2 carries no CPU term at all.
     pub(crate) cpu_ns_now: AtomicU64,
+    /// The Tier-3-deadman deferral verdict (its ONLY consumer — Tier-2
+    /// carries no CPU term), computed MONITOR-side each tick (the monitor
+    /// owns the per-vCPU CPU data the busiest-vCPU windowed currency needs
+    /// — see
+    /// [`CpuTrickleTracker`](crate::vmm::freeze_coord::watchdog_step::CpuTrickleTracker)):
+    /// `true` when the guest's BUSIEST single vCPU accrued below the currency
+    /// floor over the trailing window (two consecutive sub-floor windows).
+    /// The watchdog reads this verdict rather than re-deriving it, because
+    /// the busiest-vCPU quantity — `max_i(C_i(now) - C_i(window_start))` over
+    /// the per-vCPU cumulatives — needs per-vCPU window anchors the scalar
+    /// ledger cannot carry. Relaxed — a one-tick-stale bool only defers a
+    /// kill (the monitor-live gate dominates a dead monitor anyway).
+    pub(crate) cpu_trickle_stalled: AtomicBool,
+    /// Busiest-single-vCPU CPU (ns) accrued over the most recently closed
+    /// trickle window (0 before the first close). Diagnostic evidence for
+    /// the watchdog failure dump's `busiest_vcpu_window` line — the quantity
+    /// `cpu_trickle_stalled` compares against the floor. Relaxed.
+    pub(crate) busiest_vcpu_window_ns: AtomicU64,
     /// Bumped UNCONDITIONALLY every monitor tick — pure liveness. A
     /// stalled `monitor_heartbeat` means the monitor thread itself is
     /// wedged (distinct from the guest making no progress), which the
@@ -839,10 +859,13 @@ impl ProgressLedger {
     /// Stamp the per-tick liveness fields and bump `monitor_heartbeat`
     /// unconditionally. Called every monitor tick regardless of whether
     /// progress was observed.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_liveness(
         &self,
         cpu_ns_now: u64,
         max_vcpu_cpu_in_phase_ns: u64,
+        cpu_trickle_stalled: bool,
+        busiest_vcpu_window_ns: u64,
         cpu_currency: u8,
         runnable_demand: bool,
         evidence_channels_live: bool,
@@ -850,6 +873,10 @@ impl ProgressLedger {
         self.cpu_ns_now.store(cpu_ns_now, Ordering::Relaxed);
         self.max_vcpu_cpu_in_phase_ns
             .store(max_vcpu_cpu_in_phase_ns, Ordering::Relaxed);
+        self.cpu_trickle_stalled
+            .store(cpu_trickle_stalled, Ordering::Relaxed);
+        self.busiest_vcpu_window_ns
+            .store(busiest_vcpu_window_ns, Ordering::Relaxed);
         self.cpu_currency.store(cpu_currency, Ordering::Relaxed);
         self.runnable_demand
             .store(runnable_demand, Ordering::Relaxed);
@@ -939,6 +966,8 @@ impl ProgressLedger {
             phase: self.phase.load(Ordering::Relaxed),
             cpu_ns_now: self.cpu_ns_now.load(Ordering::Relaxed),
             max_vcpu_cpu_in_phase_ns: self.max_vcpu_cpu_in_phase_ns.load(Ordering::Relaxed),
+            cpu_trickle_stalled: self.cpu_trickle_stalled.load(Ordering::Relaxed),
+            busiest_vcpu_window_ns: self.busiest_vcpu_window_ns.load(Ordering::Relaxed),
             wall_ns_at_progress,
             progress_epoch,
             monitor_heartbeat: self.monitor_heartbeat.load(Ordering::Relaxed),
@@ -959,8 +988,9 @@ impl ProgressLedger {
 pub(crate) struct LedgerSnapshot {
     /// Live lifecycle stage id ([`LifecycleStage`] as `u8`).
     pub(crate) phase: u8,
-    /// Summed per-vCPU CPU-time (ns) as of the latest monitor tick. Feeds
-    /// the width-insensitive Tier-2/Tier-3 trickle/deadman logic.
+    /// Summed per-vCPU CPU-time (ns) as of the latest monitor tick. Dilation
+    /// context / dump only — no longer a kill-tier input (the summed
+    /// currency is width-unsound; see `cpu_trickle_stalled`).
     pub(crate) cpu_ns_now: u64,
     /// The Tier-1 evidence: MAX over vCPUs of per-vCPU CPU burned since the
     /// current phase was entered, published by the monitor (see
@@ -968,6 +998,15 @@ pub(crate) struct LedgerSnapshot {
     /// a spinning wedge crosses a flat per-phase budget while a wide idle
     /// guest never does.
     pub(crate) max_vcpu_cpu_in_phase_ns: u64,
+    /// The Tier-3-deadman deferral verdict (monitor-computed; see
+    /// [`ProgressLedger::cpu_trickle_stalled`]): the guest's busiest single
+    /// vCPU accrued below the currency floor over the trailing window. Its
+    /// only consumer is `deadman_should_fire` — Tier-2 carries no CPU term.
+    pub(crate) cpu_trickle_stalled: bool,
+    /// Busiest-single-vCPU CPU (ns) over the last closed trickle window —
+    /// dump evidence for the `busiest_vcpu_window` line (see
+    /// [`ProgressLedger::busiest_vcpu_window_ns`]).
+    pub(crate) busiest_vcpu_window_ns: u64,
     /// `run_start`-relative wall time (ns) at the last milestone
     /// (`progress_epoch` bump); the watchdog's `wall_in_phase` /
     /// `wall_since_milestone` anchor.
@@ -1006,19 +1045,25 @@ mod progress_ledger_tests {
         let l = ProgressLedger::default();
         assert!(!l.snapshot().evidence_channels_live, "default is false");
 
-        l.record_liveness(123, 45, CPU_CURRENCY_PTHREAD, true, true);
+        l.record_liveness(123, 45, true, 30, CPU_CURRENCY_PTHREAD, true, true);
         let s = l.snapshot();
         assert!(s.evidence_channels_live);
         assert_eq!(s.cpu_ns_now, 123);
         assert_eq!(s.max_vcpu_cpu_in_phase_ns, 45);
+        assert!(s.cpu_trickle_stalled);
+        assert_eq!(s.busiest_vcpu_window_ns, 30);
         assert_eq!(s.cpu_currency, CPU_CURRENCY_PTHREAD);
         assert!(s.runnable_demand);
 
-        l.record_liveness(200, 0, CPU_CURRENCY_PTHREAD, false, false);
+        // The trickle verdict and window tracks exactly what the monitor
+        // last wrote (both can drop back on a later tick).
+        l.record_liveness(200, 0, false, 12, CPU_CURRENCY_PTHREAD, false, false);
         let s2 = l.snapshot();
         assert!(!s2.evidence_channels_live);
         assert_eq!(s2.cpu_ns_now, 200);
         assert_eq!(s2.max_vcpu_cpu_in_phase_ns, 0);
+        assert!(!s2.cpu_trickle_stalled);
+        assert_eq!(s2.busiest_vcpu_window_ns, 12);
     }
 
     #[test]

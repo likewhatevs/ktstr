@@ -2974,6 +2974,14 @@ pub(crate) fn monitor_loop(
     // from the SAME monitor tick — the fix for the cross-thread ~0-anchor
     // incoherence.
     let mut max_vcpu_tracker = MaxVcpuInPhaseTracker::new();
+    // Monitor-side CPU-trickle tracker: computes the Tier-3 deadman's
+    // deferral verdict (its only consumer — Tier-2 carries no CPU term)
+    // from the per-vCPU cumulative CPU-time readings (the busiest single
+    // vCPU's windowed accrual vs the currency floor). Kept monitor-side
+    // because the busiest-vCPU quantity needs per-vCPU window anchors the
+    // scalar ledger cannot carry; the watchdog reads the published verdict.
+    // See [`crate::vmm::freeze_coord::watchdog_step::CpuTrickleTracker`].
+    let mut trickle_tracker = crate::vmm::freeze_coord::watchdog_step::CpuTrickleTracker::new();
     let mut vcpu_timing_err_reported: Vec<bool> = vcpu_timing
         .map(|vt| vec![false; vt.pthreads.len()])
         .unwrap_or_default();
@@ -3719,6 +3727,24 @@ pub(crate) fn monitor_loop(
             );
             let phase_epoch = ledger.phase_epoch.load(Ordering::Acquire);
             let max_vcpu_cpu_in_phase_ns = max_vcpu_tracker.observe(&per_vcpu_cpu_ns, phase_epoch);
+            // Tier-3-deadman deferral verdict (its only consumer — Tier-2
+            // carries no CPU term): the busiest SINGLE vCPU's CPU accrued
+            // over the trailing 10 s window vs the currency floor, from the
+            // SAME per-vCPU active-currency readings as the Tier-1 max
+            // above. Computed here (not watchdog-side) because the
+            // busiest-vCPU quantity `max_i(C_i(now) - C_i(window_start))`
+            // needs per-vCPU window anchors the scalar ledger cannot carry
+            // — the summed and per-tick-max scalars both leak vCPU width (a
+            // wide idle guest's rotating background burn sums above the
+            // per-vCPU floor). The ledger latches the currency on the first
+            // tick, so the floor is constant per run.
+            let now_rel_ns = u64::try_from(run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let cpu_trickle_stalled = trickle_tracker.observe(
+                &per_vcpu_cpu_ns,
+                now_rel_ns,
+                crate::vmm::freeze_coord::watchdog_step::trickle_floor_for_currency(cpu_currency),
+            );
+            let busiest_vcpu_window_ns = trickle_tracker.last_window_accrued();
             // Evidence channels: per-CPU GUEST data actually resolved this
             // tick (`data_valid` latched AND `cpus` non-empty). The SAME
             // condition that makes `runnable_demand` meaningful — false
@@ -3738,6 +3764,8 @@ pub(crate) fn monitor_loop(
             ledger.record_liveness(
                 cpu_ns_now,
                 max_vcpu_cpu_in_phase_ns,
+                cpu_trickle_stalled,
+                busiest_vcpu_window_ns,
                 cpu_currency,
                 runnable_demand,
                 evidence_channels_live,
