@@ -1501,9 +1501,9 @@ pub(crate) fn is_run_directory(entry: &std::fs::DirEntry) -> bool {
 
 /// Find the most recently modified run directory under [`runs_root`].
 ///
-/// Used by bare `cargo ktstr stats` (no subcommand) when
-/// `KTSTR_SIDECAR_DIR` isn't set: the stats command doesn't itself
-/// run a kernel, so it can't reconstruct the
+/// Used by `cargo ktstr stats last-run` when neither `--dir`,
+/// `KTSTR_SIDECAR_DIR`, nor `--kernel` is set: the stats command
+/// doesn't itself run a kernel, so it can't reconstruct the
 /// `{kernel}-{project_commit}` key that the test process used.
 /// Picking the newest subdirectory by mtime mirrors "show me the
 /// report from my last test run."
@@ -2065,10 +2065,24 @@ pub fn format_run_artifact_footer(
         out.push_str(&render_host_skips(&s.host_skips));
         out.push_str(&render_probe_issues(&s.probe_issues));
         out.push_str(&render_expect_err_load(&s.expect_err_load));
-        out.push_str(&format!(
-            "    ({} stats sidecar(s), {} wprof trace(s) written this run)\n",
-            s.stats_sidecars, s.wprof_traces,
-        ));
+        // Fold the "run stats-last-run for the analysis" discoverability
+        // hint into the existing count line, but only when this run
+        // actually wrote a stats sidecar — pointing at an empty analysis
+        // would be noise. The gauntlet analysis blob is no longer
+        // auto-printed after a test run; this line is how an operator
+        // finds it.
+        if s.stats_sidecars > 0 {
+            out.push_str(&format!(
+                "    ({} stats sidecar(s), {} wprof trace(s) written this run) \
+                 — run `cargo ktstr stats last-run` for the gauntlet analysis\n",
+                s.stats_sidecars, s.wprof_traces,
+            ));
+        } else {
+            out.push_str(&format!(
+                "    ({} stats sidecar(s), {} wprof trace(s) written this run)\n",
+                s.stats_sidecars, s.wprof_traces,
+            ));
+        }
     }
     out
 }

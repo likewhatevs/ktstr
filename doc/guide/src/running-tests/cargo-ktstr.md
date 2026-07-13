@@ -155,8 +155,12 @@ cargo ktstr: BTF type anchor at ~/ktstr/target/ktstr_btf_anchor.h
 
 cargo ktstr: test outputs
   ~/ktstr/target/ktstr/7.1.0-486fe68-dirty
-    (1 stats sidecar(s), 0 wprof trace(s) written this run)
+    (1 stats sidecar(s), 0 wprof trace(s) written this run) — run `cargo ktstr stats last-run` for the gauntlet analysis
 ```
+
+The gauntlet analysis (outlier scan, verifier stats, callback
+profile, KVM stats) is no longer dumped after every run; the footer
+points at [`stats last-run`](#stats), which prints it on demand.
 
 The VM part of this run took about nine seconds; the longer compile
 line was Rust rebuilding the test harness. For a `--kernel <path>`
@@ -475,11 +479,23 @@ cargo ktstr completions fish > ~/.config/fish/completions/cargo-ktstr.fish
 <a id="stats-show-host"></a>
 <a id="list-values"></a>
 
-Sidecar analysis for past runs: `stats` (analysis of the newest
-run), `stats list` (run table), `stats list-metrics` (the regression
-metric registry), `stats list-values` (distinct filter values in the
-pool), `stats show-host --run ID` (archived host context), and
-`stats explain-sidecar --run ID` (why optional fields are absent).
+Sidecar analysis for past runs: `stats last-run` (the gauntlet
+analysis — outlier scan, verifier stats, callback profile, KVM stats
+— of the newest run), `stats list` (run table), `stats list-metrics`
+(the regression metric registry), `stats list-values` (distinct
+filter values in the pool), `stats show-host --run ID` (archived host
+context), and `stats explain-sidecar --run ID` (why optional fields
+are absent). Bare `cargo ktstr stats` prints this subcommand list.
+
+```sh
+cargo ktstr stats last-run                 # newest run's analysis
+cargo ktstr stats last-run --kernel 7.1.3  # newest run for that kernel
+cargo ktstr stats last-run --dir PATH      # a specific run dir / archive
+```
+
+`last-run` resolves its source dir in precedence order: `--dir`, then
+`KTSTR_SIDECAR_DIR`, then `--kernel` (newest run dir whose leaf begins
+`{LABEL}-`), then the most-recently-modified run dir.
 `cargo ktstr show-host` prints the same host context live, and
 `cargo ktstr show-thresholds TEST` prints the merged assertion
 thresholds a test will run with. See

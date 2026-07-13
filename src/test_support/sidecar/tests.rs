@@ -3468,6 +3468,47 @@ fn format_footer_empty_without_fresh_artifacts() {
     assert!(format_run_artifact_footer(root.path(), std::time::SystemTime::now()).is_empty());
 }
 
+/// A run that wrote a stats sidecar gets the `stats last-run`
+/// discoverability hint folded into the count line — the gauntlet
+/// analysis is no longer auto-dumped, so this is how an operator
+/// finds it.
+#[test]
+fn format_footer_sidecar_count_line_carries_last_run_hint() {
+    let root = tempfile::TempDir::new().unwrap();
+    let run = root.path().join("7.1.0-abc1234");
+    std::fs::create_dir(&run).unwrap();
+    write_sidecar_fixture(&run, "passed", true, "scx_mitosis", "1n4l4c1t");
+    let out = format_run_artifact_footer(root.path(), std::time::UNIX_EPOCH);
+    assert!(
+        out.contains("1 stats sidecar(s)"),
+        "count line missing: {out}",
+    );
+    assert!(
+        out.contains("cargo ktstr stats last-run"),
+        "sidecar-bearing run must point at `stats last-run`: {out}",
+    );
+}
+
+/// A run that produced only a failure dump (no stats sidecar) reports
+/// `0 stats sidecar(s)` and must NOT carry the `stats last-run` hint —
+/// there is no analysis to point at.
+#[test]
+fn format_footer_no_sidecar_omits_last_run_hint() {
+    let root = tempfile::TempDir::new().unwrap();
+    let run = root.path().join("7.1.0-abc1234");
+    std::fs::create_dir(&run).unwrap();
+    std::fs::write(run.join("load_fail.failure-dump.json"), b"{}").unwrap();
+    let out = format_run_artifact_footer(root.path(), std::time::UNIX_EPOCH);
+    assert!(
+        out.contains("0 stats sidecar(s)"),
+        "count line missing: {out}",
+    );
+    assert!(
+        !out.contains("stats last-run"),
+        "a dump-only run has no analysis — must omit the hint: {out}",
+    );
+}
+
 // -- host-skip block rendering (Task: host-topology skips) --
 
 #[test]

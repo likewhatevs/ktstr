@@ -43,8 +43,8 @@ pub use resolve::{
 };
 
 pub use stats_cmds::{
-    compare_partitions, compare_partitions_noise, explain_sidecar, list_metrics, list_runs,
-    list_values, print_stats_report, show_host, show_run_host, show_thresholds,
+    compare_partitions, compare_partitions_noise, explain_sidecar, last_run_report, list_metrics,
+    list_runs, list_values, show_host, show_run_host, show_thresholds,
 };
 
 pub use locks::list_locks;
