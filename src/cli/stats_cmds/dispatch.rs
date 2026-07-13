@@ -23,7 +23,7 @@ use crate::stats::{ComparisonPolicy, RowFilter};
 ///    `analyze_sidecars(None)` honors.
 /// 3. `kernel` (the `--kernel` flag) when `Some` — the most recently
 ///    modified run dir whose leaf name begins `{kernel}-` (see
-///    [`newest_run_dir_for_kernel`]).
+///    `newest_run_dir_for_kernel`).
 /// 4. Otherwise the most recently modified run dir under the cargo
 ///    target directory's `ktstr/` ([`crate::test_support::newest_run_dir`]).
 ///
