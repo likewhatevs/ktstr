@@ -18,12 +18,31 @@ const MS: u64 = 1_000_000;
 const TICK: u64 = 100 * MS;
 
 /// A Body-phase witness with the given on-CPU / run-delay sums (which set
-/// `body_dilation()`) and per-tick run-delay series (which set `W`).
+/// `body_dilation()`) and per-tick run-delay series (which set `W`). The Body
+/// wall AND covered span are both set to the series' nominal span
+/// (`len * TICK`), i.e. FULLY spanning — so the coverage soundness gate is
+/// satisfied and these fixtures exercise the confirm/demote/saturated arms as
+/// before. Under-coverage is exercised by [`witness_cover`].
 fn witness(
     on_cpu_ns: u64,
     run_delay_ns: u64,
     tick_deltas: Vec<u64>,
     saturated: bool,
+) -> ContentionWitness {
+    let wall = tick_deltas.len() as u64 * TICK;
+    witness_cover(on_cpu_ns, run_delay_ns, tick_deltas, saturated, wall, wall)
+}
+
+/// Like [`witness`] but with an EXPLICIT Body wall span AND covered span, so a
+/// test can build an under-covering series (ticks spanning too little of a
+/// long Body wall) that the coverage gate must refuse to FailConfirm on.
+fn witness_cover(
+    on_cpu_ns: u64,
+    run_delay_ns: u64,
+    tick_deltas: Vec<u64>,
+    saturated: bool,
+    body_wall_ns: u64,
+    body_covered_ns: u64,
 ) -> ContentionWitness {
     let mut per_phase = PerPhaseSchedstat::default();
     per_phase.phases[BODY_STAGE_INDEX] = HostVcpuSchedstat {
@@ -37,6 +56,8 @@ fn witness(
             tick_deltas,
             tick_ns: TICK,
             saturated,
+            body_wall_ns,
+            body_covered_ns,
         },
     }
 }
@@ -153,6 +174,128 @@ fn saturated_series_never_confirms_even_on_gross_excess() {
         note.contains("saturated"),
         "must note the saturation: {note}"
     );
+}
+
+// ---- witness present: under-coverage never confirms (BUG 1 regression) ----
+
+#[test]
+fn empty_body_series_never_confirms_regression() {
+    // THE arm64 CI regression (verifier-hang-fixes,
+    // contention_indeterminate_pass_under_overcommit): 2 vCPUs, no_perf,
+    // cpu_budget=1, sibling burner. The SCHED_OTHER monitor never ticked
+    // INSIDE Body, so the Body series was EMPTY → peak_window(&[], ..) == 0 ==
+    // W. Pre-fix the seam read excess (229.06ms) > W (0) and wrongly CONFIRMED
+    // the failure — the one verdict the design forbids — even though the
+    // whole-run host dilation was 11.70x. The coverage rule now DEMOTES: an
+    // empty series (0 ticks, no Body wall observed) never covered Body, so W
+    // is not a trustworthy refutation bound.
+    let measured = 229_058_932; // ns — the real arm64 p99 wake latency
+    let threshold = 5 * MS; // the 5 ms gate
+    let mut cr = latency_gate_fail(measured, threshold);
+    // Empty series ⇒ per-phase Body schedstat is default ⇒ body_dilation None
+    // (the whole-run D=11.70x rides the render-time annotation, not the seam).
+    // No Body tick ⇒ zero wall and zero covered span.
+    let vr = vm_with_witness(Some(witness_cover(0, 0, vec![], false, 0, 0)));
+    apply_contention_verdict(&mut cr, &vr, false);
+    assert!(
+        cr.is_pass(),
+        "empty Body series (W==0) must demote, never FailConfirm"
+    );
+    let note = &cr.info_notes[0].message;
+    assert!(note.starts_with(CONTENTION_INDETERMINATE_PREFIX), "{note}");
+    assert!(
+        note.contains("under-covered the Body phase"),
+        "must carry the under-coverage note: {note}"
+    );
+    assert!(note.contains("0 ticks"), "empty series is 0 ticks: {note}");
+    // Pin the arm64 excess (229.06 - 5.00 = 224.06 ms) in the annotation.
+    assert!(note.contains("excess 224.1ms"), "{note}");
+}
+
+#[test]
+fn sparse_body_series_below_tick_floor_demotes() {
+    // A starved monitor that DID sample Body, but only once, over a ~100 s
+    // Body wall (Body dilation D = 1 + 1070/100 = 11.70x). One tick is below
+    // the 2-tick floor (zero span), so W built from it cannot refute the
+    // 224 ms excess — demote, never confirm.
+    let measured = 229_058_932;
+    let threshold = 5 * MS;
+    let mut cr = latency_gate_fail(measured, threshold);
+    let wall = 1_000 * TICK; // ~100 s Body wall
+    // Single tick ⇒ covered span 0.
+    let vr = vm_with_witness(Some(witness_cover(
+        100 * MS,
+        1_070 * MS,
+        vec![9 * MS],
+        false,
+        wall,
+        0,
+    )));
+    apply_contention_verdict(&mut cr, &vr, false);
+    assert!(cr.is_pass(), "single-tick series must demote");
+    let note = &cr.info_notes[0].message;
+    assert!(note.contains("under-covered the Body phase"), "{note}");
+    assert!(note.contains("1 ticks"), "{note}");
+    assert!(
+        note.contains("D=11.70x"),
+        "carries the Body dilation: {note}"
+    );
+}
+
+#[test]
+fn clustered_ticks_under_coverage_span_demotes() {
+    // Several ticks, clustered in a 0.2 s slice of a 10 s Body wall (the
+    // dense-then-silent shape): 2% span coverage, below the 50% floor. A
+    // 50 ms excess over a zero-W cluster would normally FailConfirm; the span
+    // gate demotes it because the ticks never reached across the phase.
+    let mut cr = latency_gate_fail(54 * MS, 4 * MS);
+    let wall = 100 * TICK; // 10 s Body wall
+    let covered = 2 * TICK; // 0.2 s spanned
+    let vr = vm_with_witness(Some(witness_cover(
+        100 * MS,
+        100 * MS,
+        vec![0, 0, 0],
+        false,
+        wall,
+        covered,
+    )));
+    apply_contention_verdict(&mut cr, &vr, false);
+    assert!(cr.is_pass(), "under-span coverage must demote");
+    let note = &cr.info_notes[0].message;
+    assert!(note.contains("under-covered the Body phase"), "{note}");
+    assert!(note.contains("3 ticks"), "{note}");
+}
+
+#[test]
+fn sparse_but_spanning_series_still_confirms() {
+    // The fix must NOT over-demote a COARSE-but-spanning series: only 2 ticks,
+    // but they reach from Body start to Body end (9 s span over a 10 s wall).
+    // The whole phase was watched, so a gross excess still confirms — density
+    // is not coverage.
+    let mut cr = latency_gate_fail(54 * MS, 4 * MS);
+    let wall = 100 * TICK; // 10 s
+    let covered = 90 * TICK; // 9 s spanned — 90% coverage
+    let vr = vm_with_witness(Some(witness_cover(
+        100 * MS,
+        100 * MS,
+        vec![0, 0],
+        false,
+        wall,
+        covered,
+    )));
+    apply_contention_verdict(&mut cr, &vr, false);
+    assert!(
+        cr.is_fail(),
+        "coarse-but-spanning gross excess must still confirm"
+    );
+    assert!(
+        cr.failure_details()
+            .next()
+            .unwrap()
+            .message
+            .contains("contention-checked")
+    );
+    assert!(cr.info_notes.is_empty(), "confirm must not demote");
 }
 
 // ---- witness absent: unchanged ----

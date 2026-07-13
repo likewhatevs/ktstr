@@ -2138,6 +2138,17 @@ fn contention_ms(ns: u64) -> String {
 ///     Body ticks were dropped past the cap), so a FailConfirmed on it
 ///     cannot be trusted; treated as indeterminate (demoted) with a
 ///     saturation note. NEVER FailConfirm on a saturated series.
+///   - UNDER-COVERING Body series → the witness watched too little of the
+///     Body phase for `W` to bound the excess (a starved monitor that
+///     ticked rarely or never inside Body — an empty series reads `W == 0`
+///     and would wrongly confirm a contention-caused failure). Confirmed
+///     ONLY when the series SPANNED the phase
+///     ([`body_series_covers_phase`](crate::vmm::freeze_coord::latency_verdict::body_series_covers_phase):
+///     at least 2 ticks AND the first→last Body-tick span covers at least half
+///     the real Body wall); otherwise demoted with an under-coverage note. This is the
+///     soundness rule that forbids the one wrong verdict the design must never
+///     emit. A COARSE but spanning series still confirms — density is not
+///     coverage (see the const docs).
 ///
 /// No witness (`None`) → the failure is left untouched (the render-time
 /// `dilation_annotation` still applies). A latency-gate detail re-derives
@@ -2163,8 +2174,8 @@ pub(crate) fn apply_contention_verdict(
 ) {
     use crate::assert::{AssertDetail, DetailKind, InfoNote, Outcome};
     use crate::vmm::freeze_coord::latency_verdict::{
-        LatencyVerdict, PERF_ISOLATION_D_MAX, latency_verdict, peak_window_delay_ns,
-        perf_isolation_violated,
+        LatencyVerdict, PERF_ISOLATION_D_MAX, body_series_covers_phase, latency_verdict,
+        peak_window_delay_ns, perf_isolation_violated,
     };
 
     let witness = result.contention_witness.as_ref();
@@ -2192,6 +2203,21 @@ pub(crate) fn apply_contention_verdict(
         };
         let phase_d = w.body_dilation();
         let saturated = w.body_window.saturated;
+        let n_ticks = w.body_window.tick_deltas.len();
+        // COVERAGE SOUNDNESS: a `FailConfirmed` refutes the failure with
+        // "excess > W", but `W` is only a trustworthy bound if the witness
+        // series actually WATCHED the Body phase. A starved monitor (no
+        // CAP_SYS_NICE, sharing a 1-host-CPU budget with the guest vCPUs) can
+        // tick rarely or never inside Body: an empty series reads `W == 0` and
+        // a bare "excess > W" would then CONFIRM a purely contention-caused
+        // failure — the exact false verdict this gate prevents. Only confirm
+        // when the series SPANNED enough of the phase (>= 2 ticks AND the
+        // first→last Body-tick span covers >= 50% of the real Body wall).
+        let covered = body_series_covers_phase(
+            n_ticks,
+            w.body_window.body_covered_ns,
+            w.body_window.body_wall_ns,
+        );
         let verdict = latency_verdict(gate.measured_ns, gate.threshold_ns, phase_d, |l| {
             peak_window_delay_ns(&w.body_window.tick_deltas, w.body_window.tick_ns, l)
         });
@@ -2217,9 +2243,29 @@ pub(crate) fn apply_contention_verdict(
                 continue;
             }
         };
-        // A saturated Body series makes `W` a lower bound, so its
-        // "excess > W" refutation is unsound — never confirm on it.
-        let confirmed = verdict.is_blocking() && !saturated;
+        // Confirm ONLY when the refutation is sound on every axis: the verdict
+        // refuted (`excess > W`), the series is not `saturated` (W would be a
+        // prefix-only lower bound) AND the series `covered` the Body phase (W
+        // built from too few samples is not a trustworthy bound). Any of the
+        // three failing demotes to a non-blocking indeterminate pass.
+        let confirmed = verdict.is_blocking() && !saturated && covered;
+        if verdict.is_blocking() && !saturated && !covered {
+            // Belt cross-check: the series claimed a refutable `W` yet
+            // under-covered the phase — the whole-run `D` (annotation) and
+            // this thin `W` disagree. Demote and record why at debug level.
+            tracing::debug!(
+                measured_ns = gate.measured_ns,
+                excess_ns,
+                window_bound_ns,
+                body_wall_ns = w.body_window.body_wall_ns,
+                body_covered_ns = w.body_window.body_covered_ns,
+                n_ticks,
+                phase_d = phase_d.unwrap_or(f64::NAN),
+                "contention seam: excess > W but the Body witness under-covered \
+                 the phase — demoting to indeterminate instead of confirming (W \
+                 is not a trustworthy bound: the ticks did not span the Body phase)"
+            );
+        }
         if confirmed {
             detail.message.push_str(&format!(
                 " (contention-checked: excess {} > W {} — no witnessed host contention explains it)",
@@ -2235,14 +2281,26 @@ pub(crate) fn apply_contention_verdict(
             } else {
                 ""
             };
+            // Under-coverage note: the witness watched too little of the Body
+            // phase for W to bound the excess. `N ticks spanning X of Y` — N
+            // ticks reached across X of the Y-long Body wall.
+            let cover_note = if !covered {
+                format!(
+                    " (witness under-covered the Body phase: {n_ticks} ticks spanning {} of {} Body wall — W is not a trustworthy bound)",
+                    contention_ms(w.body_window.body_covered_ns),
+                    contention_ms(w.body_window.body_wall_ns),
+                )
+            } else {
+                String::new()
+            };
             // Neutral `excess vs W` rather than `excess <= W`: for the
             // plain indeterminate case `excess <= W` holds, but a
-            // saturated series can demote a would-be FailConfirmed where
-            // `excess > W` — the saturation note explains W is only a
-            // lower bound there, so asserting the inequality would be
-            // false. Both figures are shown; the operator compares.
+            // saturated OR under-covering series can demote a would-be
+            // FailConfirmed where `excess > W` — the notes explain W is only a
+            // lower / untrustworthy bound there, so asserting the inequality
+            // would be false. Both figures are shown; the operator compares.
             demotions.push(format!(
-                "{CONTENTION_INDETERMINATE_PREFIX} {} — measured {} vs threshold {}: excess {} vs contention bound W {} (Body dilation D={d_str}){sat_note}; non-blocking pass, witnessed host contention could account for the excess",
+                "{CONTENTION_INDETERMINATE_PREFIX} {} — measured {} vs threshold {}: excess {} vs contention bound W {} (Body dilation D={d_str}){sat_note}{cover_note}; non-blocking pass, witnessed host contention could account for the excess",
                 detail.message,
                 contention_ms(gate.measured_ns),
                 contention_ms(gate.threshold_ns),

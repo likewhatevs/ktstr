@@ -1528,6 +1528,24 @@ impl PerPhaseSchedstat {
 /// `saturated`, the series is a PREFIX of the phase, so `W` computed from it
 /// is a LOWER bound — a later verdict pass should treat that as reducing
 /// confidence in a `FailConfirmed` rather than trusting a possibly-short `W`.
+///
+/// COVERAGE SOUNDNESS: `peak_window_delay_ns` is only a trustworthy `W`
+/// bound if the series' ticks actually SPANNED the Body phase. On a starved
+/// host (e.g. a CI cell whose SCHED_OTHER monitor thread shares a 1-host-CPU
+/// budget with the guest vCPUs) the monitor can tick rarely, or never, INSIDE
+/// the Body span — an empty series makes `W == 0`, and a bare `excess > W`
+/// gate would then wrongly CONFIRM a contention-caused failure, the one
+/// verdict the design forbids. [`Self::body_covered_ns`] (the wall the ticks
+/// actually spanned) and [`Self::body_wall_ns`] (the real Body phase wall) let
+/// the seam prove the series covered enough of the phase before trusting `W`
+/// for a `FailConfirmed` (see `body_series_covers_phase`).
+///
+/// The measure is a SPAN ratio, not a tick-density ratio: a monitor that
+/// ticks coarsely but from Body start to Body end still WATCHED the whole
+/// phase (each `tick_delta` captures ALL run-delay accrued since the prior
+/// tick, so `W` over such a series over-counts if anything — safe); only a
+/// series whose ticks fail to reach across the phase (empty, or clustered in a
+/// sub-window) leaves `W` untrustworthy.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BodyContentionWindow {
     /// Per-monitor-tick Σ-run-delay delta (ns) over the Body phase, in tick
@@ -1539,6 +1557,20 @@ pub struct BodyContentionWindow {
     /// True when [`Self::tick_deltas`] hit its cap and later Body ticks were
     /// dropped — the series is then a prefix and `W` from it is a lower bound.
     pub saturated: bool,
+    /// The REAL wall span (ns) of the Body phase — measured host-side from the
+    /// monitor's elapsed clock at the Body enter/exit stage transitions,
+    /// conservatively over-estimated at both ends (enter pinned at the
+    /// observation BEFORE the first Body tick, exit at the observation AFTER
+    /// Body) so it can only be too LARGE, never too small → the coverage ratio
+    /// is under-stated → the verdict is biased toward demote, never a wrong
+    /// `FailConfirmed`. `0` when the Body phase was never observed.
+    pub body_wall_ns: u64,
+    /// The wall span (ns) the series' ticks actually COVERED: the elapsed
+    /// between the FIRST and LAST Body tick. `body_covered_ns / body_wall_ns`
+    /// is the fraction of the Body phase the witness spanned; a series that
+    /// spans too little of the phase cannot support an "excess > W"
+    /// refutation. `0` when fewer than two Body ticks landed (no span).
+    pub body_covered_ns: u64,
 }
 
 /// The Body-phase contention witness assembled by the monitor: the per-phase

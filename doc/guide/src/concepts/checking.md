@@ -292,7 +292,16 @@ failure the whole result flips to `Pass`, and the annotation rides the
 the passing run's output and its sidecar. If the Body contention series
 *saturated* (it hit its tick cap and only a prefix survives), `W` is a
 lower bound, so the verdict never confirms on it — it is treated as
-indeterminate with a saturation note.
+indeterminate with a saturation note. The same guard applies when the
+witness **under-covered** the Body phase: a starved monitor (a
+`SCHED_OTHER` sensing thread sharing one host CPU with the guest vCPUs)
+can tick rarely or never inside Body, and an empty or sub-window series
+leaves `W` untrustworthy (an empty series reads `W = 0`, which would
+otherwise wrongly *confirm* a purely contention-caused failure), so a
+run confirms only when its ticks actually **spanned** at least half the
+Body wall (with ≥ 2 ticks); otherwise it demotes to indeterminate with
+an under-coverage note. Coarse-but-spanning sampling still confirms —
+span, not tick density, is what makes `W` trustworthy.
 
 Only ns-denominated latency exemplars take part. `max_wake_latency_cv`
 (a dimensionless ratio) and `max_spread_pct` (an off-CPU percentage)

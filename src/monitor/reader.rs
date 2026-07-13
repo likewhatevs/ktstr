@@ -2956,6 +2956,25 @@ pub(crate) struct PhaseWitnessTracker {
     /// The monitor tick period (ns) — carried onto the Body window so the
     /// pure window math can quantise `L` into ticks.
     tick_ns: u64,
+    /// The previous observation's elapsed-wall timestamp (ns since run start).
+    /// Used as the CONSERVATIVE (earlier) Body-enter wall on the transition
+    /// into Body, and — carried to `finish` — as the fallback Body-exit wall
+    /// when the phase never advanced out of Body.
+    prev_now_ns: u64,
+    /// Elapsed wall (ns) at the OBSERVATION BEFORE the first Body tick — the
+    /// conservative (earlier-than-true) Body-phase start. `None` until a Body
+    /// tick is seen. See [`crate::vmm::result::BodyContentionWindow::body_wall_ns`].
+    body_enter_wall_ns: Option<u64>,
+    /// Elapsed wall (ns) at the first observation AFTER Body (the conservative
+    /// later-than-true Body-phase end). `None` while still in Body / never
+    /// exited; `finish` then falls back to the last observation's wall.
+    body_exit_wall_ns: Option<u64>,
+    /// Elapsed wall (ns) at the FIRST Body tick; with `body_last_tick_wall_ns`
+    /// gives the span the series actually COVERED
+    /// ([`crate::vmm::result::BodyContentionWindow::body_covered_ns`]).
+    body_first_tick_wall_ns: Option<u64>,
+    /// Elapsed wall (ns) at the LAST Body tick observed so far.
+    body_last_tick_wall_ns: Option<u64>,
     seeded: bool,
 }
 
@@ -2969,21 +2988,40 @@ impl PhaseWitnessTracker {
             body_tick_deltas: Vec::new(),
             body_saturated: false,
             tick_ns,
+            prev_now_ns: 0,
+            body_enter_wall_ns: None,
+            body_exit_wall_ns: None,
+            body_first_tick_wall_ns: None,
+            body_last_tick_wall_ns: None,
             seeded: false,
         }
     }
 
     /// Fold one tick: `cur` is the cumulative host schedstat over the vCPU
     /// TIDs THIS tick, `stage` the live [`crate::monitor::LifecycleStage`]
-    /// `as u8`. The first call seeds the anchors and attributes nothing (no
-    /// prior reading to diff). `stage` out of range is tolerated — the
-    /// `usize` index is bounds-checked against the fixed array via
+    /// `as u8`, `now_ns` the monitor's elapsed wall (ns since run start) at
+    /// this observation. The first call seeds the anchors and attributes
+    /// nothing (no prior reading to diff). `stage` out of range is tolerated —
+    /// the `usize` index is bounds-checked against the fixed array via
     /// [`crate::monitor::LifecycleStage::from_u8`] before use.
-    pub(crate) fn observe(&mut self, cur: crate::vmm::result::HostVcpuSchedstat, stage: u8) {
+    ///
+    /// `now_ns` drives the Body-phase WALL span used for coverage soundness
+    /// (see [`crate::vmm::result::BodyContentionWindow::body_wall_ns`]): the
+    /// enter/exit walls are pinned CONSERVATIVELY (enter at the observation
+    /// BEFORE the first Body tick, exit at the observation AFTER Body) so the
+    /// span can only be too large — never too small — and the derived
+    /// coverage can only be under-stated, never over-stated.
+    pub(crate) fn observe(
+        &mut self,
+        cur: crate::vmm::result::HostVcpuSchedstat,
+        stage: u8,
+        now_ns: u64,
+    ) {
         if !self.seeded {
             self.anchor = cur;
             self.prev = cur;
             self.prev_stage = stage;
+            self.prev_now_ns = now_ns;
             self.seeded = true;
             return;
         }
@@ -3007,15 +3045,34 @@ impl PhaseWitnessTracker {
         // through `from_u8` so a torn/garbled value can't index out of bounds.
         let idx = crate::monitor::LifecycleStage::from_u8(stage) as usize;
         self.per_phase.phases[idx] = cur.delta_from(&self.anchor);
-        // Body-phase per-tick series (bounded).
+        // Body-phase per-tick series (bounded) + Body wall-span pinning.
         if crate::monitor::LifecycleStage::from_u8(stage) == crate::monitor::LifecycleStage::Body {
+            // Conservative Body-enter: the observation BEFORE this first Body
+            // tick (`prev_now_ns`) is <= the true Body start, so the recorded
+            // span is >= the true span → coverage under-stated → demote-safe.
+            // Set lazily so a monitor SEEDED already-in-Body still pins an
+            // enter (no Dispatch→Body transition to key on there).
+            if self.body_enter_wall_ns.is_none() {
+                self.body_enter_wall_ns = Some(self.prev_now_ns);
+            }
+            // First/last Body-tick walls bound the span the series COVERED.
+            if self.body_first_tick_wall_ns.is_none() {
+                self.body_first_tick_wall_ns = Some(now_ns);
+            }
+            self.body_last_tick_wall_ns = Some(now_ns);
             if self.body_tick_deltas.len() < BODY_TICK_CAP {
                 self.body_tick_deltas.push(tick_delta);
             } else {
                 self.body_saturated = true;
             }
+        } else if self.body_enter_wall_ns.is_some() && self.body_exit_wall_ns.is_none() {
+            // First observation AFTER Body (lifecycle staging is forward-only,
+            // so Body is a single contiguous span). `now_ns` >= the true Body
+            // end → span over-estimated on this end too → demote-safe.
+            self.body_exit_wall_ns = Some(now_ns);
         }
         self.prev = cur;
+        self.prev_now_ns = now_ns;
     }
 
     /// Assemble the witness. `None` when nothing was ever observed (never
@@ -3024,12 +3081,32 @@ impl PhaseWitnessTracker {
         if !self.seeded {
             return None;
         }
+        // Body wall span for coverage: enter→exit, exit falling back to the
+        // last observation when the phase never advanced out of Body (still in
+        // Body at kill, or the monitor went silent). `0` when no Body tick was
+        // ever seen — the seam reads that (with an empty series) as "witness
+        // never covered Body" and refuses to FailConfirm.
+        let body_wall_ns = match self.body_enter_wall_ns {
+            Some(enter) => self
+                .body_exit_wall_ns
+                .unwrap_or(self.prev_now_ns)
+                .saturating_sub(enter),
+            None => 0,
+        };
+        // Span the ticks actually covered: first→last Body tick. `0` when
+        // fewer than two Body ticks landed (either bound `None`, or equal).
+        let body_covered_ns = match (self.body_first_tick_wall_ns, self.body_last_tick_wall_ns) {
+            (Some(first), Some(last)) => last.saturating_sub(first),
+            _ => 0,
+        };
         Some(crate::vmm::result::ContentionWitness {
             per_phase: self.per_phase,
             body_window: crate::vmm::result::BodyContentionWindow {
                 tick_deltas: self.body_tick_deltas,
                 tick_ns: self.tick_ns,
                 saturated: self.body_saturated,
+                body_wall_ns,
+                body_covered_ns,
             },
         })
     }
@@ -4084,7 +4161,13 @@ pub(crate) fn monitor_loop(
                 let cur =
                     crate::vmm::freeze_coord::read_host_vcpu_schedstat(&tids).unwrap_or_default();
                 let stage = ledger.phase.load(Ordering::Relaxed);
-                phase_witness.observe(cur, stage);
+                // Elapsed wall at this observation drives the Body-phase span
+                // the witness needs for coverage soundness (a starved monitor
+                // that ticks rarely inside Body yields a span far larger than
+                // its `n_ticks * tick_ns` nominal coverage → the seam demotes
+                // rather than trusting a `W` built from too few samples).
+                let now_ns = run_start.elapsed().as_nanos() as u64;
+                phase_witness.observe(cur, stage, now_ns);
             }
         }
 
@@ -8012,15 +8095,19 @@ mod tests {
         // Body ticks, one Teardown tick — each stage's slot must hold exactly
         // its own span's cumulative-schedstat delta, not the whole run's.
         let mut t = PhaseWitnessTracker::new(100_000_000);
-        t.observe(ss(1_000, 100), DISPATCH); // seed anchor at (1000,100)
-        t.observe(ss(1_500, 150), DISPATCH); // Dispatch running: delta (500,50)
-        t.observe(ss(2_000, 200), DISPATCH); // Dispatch running: delta (1000,100)
+        const T: u64 = 100_000_000; // one nominal tick of wall
+        t.observe(ss(1_000, 100), DISPATCH, 0); // seed anchor at (1000,100)
+        t.observe(ss(1_500, 150), DISPATCH, T); // Dispatch running: delta (500,50)
+        t.observe(ss(2_000, 200), DISPATCH, 2 * T); // Dispatch running: delta (1000,100)
         // Advance to Body: re-anchor at (2000,200). Body slot starts from here.
-        t.observe(ss(2_400, 260), BODY); // Body running: delta (400,60)
-        t.observe(ss(3_000, 500), BODY); // Body running: delta (1000,300)
+        t.observe(ss(2_400, 260), BODY, 3 * T); // Body running: delta (400,60)
+        t.observe(ss(3_000, 500), BODY, 4 * T); // Body running: delta (1000,300)
         // Advance to Teardown: re-anchor at (3000,500).
-        t.observe(ss(3_100, 900), TEARDOWN); // Teardown: delta (100,400)
+        t.observe(ss(3_100, 900), TEARDOWN, 5 * T); // Teardown: delta (100,400)
         let w = t.finish().expect("seeded");
+        // Body enter = the pre-Body observation (2*T), exit = the post-Body
+        // observation (5*T) → wall 3 ticks. Two closed Body ticks over that.
+        assert_eq!(w.body_window.body_wall_ns, 3 * T);
         let disp = w
             .per_phase
             .for_stage(crate::monitor::LifecycleStage::Dispatch);
@@ -8041,15 +8128,21 @@ mod tests {
         // Body. The transition tick into Body pushes its (Dispatch→Body-span)
         // delta too — over-count = conservative. tick_ns is carried through.
         let mut t = PhaseWitnessTracker::new(100_000_000);
-        t.observe(ss(0, 0), DISPATCH); // seed
-        t.observe(ss(10, 5), DISPATCH); // Dispatch tick: NOT in body series
-        t.observe(ss(20, 25), BODY); // first Body tick: run_delay delta = 20
-        t.observe(ss(30, 40), BODY); // Body tick: run_delay delta = 15
-        t.observe(ss(40, 90), BODY); // Body tick: run_delay delta = 50
+        const T: u64 = 100_000_000;
+        t.observe(ss(0, 0), DISPATCH, 0); // seed
+        t.observe(ss(10, 5), DISPATCH, T); // Dispatch tick: NOT in body series
+        t.observe(ss(20, 25), BODY, 2 * T); // first Body tick: run_delay delta = 20
+        t.observe(ss(30, 40), BODY, 3 * T); // Body tick: run_delay delta = 15
+        t.observe(ss(40, 90), BODY, 4 * T); // Body tick: run_delay delta = 50
         let w = t.finish().expect("seeded");
         assert_eq!(w.body_window.tick_deltas, vec![20, 15, 50]);
         assert_eq!(w.body_window.tick_ns, 100_000_000);
         assert!(!w.body_window.saturated);
+        // Enter = pre-Body observation (T); no post-Body observation → exit
+        // falls back to the last observation (4*T). Wall = 3 ticks.
+        assert_eq!(w.body_window.body_wall_ns, 3 * T);
+        // Body ticks at 2*T, 3*T, 4*T → covered span = 4*T − 2*T = 2 ticks.
+        assert_eq!(w.body_window.body_covered_ns, 2 * T);
     }
 
     #[test]
@@ -8058,11 +8151,76 @@ mod tests {
         // one with a smaller total reappeared) yields a 0 per-tick delta, not
         // a wrapped huge value.
         let mut t = PhaseWitnessTracker::new(100_000_000);
-        t.observe(ss(0, 0), BODY); // seed
-        t.observe(ss(1_000, 1_000), BODY); // delta 1000
-        t.observe(ss(500, 400), BODY); // regressed → saturating 0
+        const T: u64 = 100_000_000;
+        t.observe(ss(0, 0), BODY, 0); // seed (already in Body)
+        t.observe(ss(1_000, 1_000), BODY, T); // delta 1000
+        t.observe(ss(500, 400), BODY, 2 * T); // regressed → saturating 0
         let w = t.finish().expect("seeded");
         assert_eq!(w.body_window.tick_deltas, vec![1_000, 0]);
+        // Seeded already in Body: enter pins at the seed observation (0),
+        // exit falls back to the last observation (2*T).
+        assert_eq!(w.body_window.body_wall_ns, 2 * T);
+    }
+
+    #[test]
+    fn phase_witness_no_body_tick_yields_zero_wall_and_span() {
+        // A monitor that ticked (Dispatch, Teardown) but NEVER landed a tick
+        // inside Body — the starved-CI shape that made `W == 0`. The Body
+        // series is empty and both the wall and the covered span are 0, so the
+        // seam has an explicit "witness never covered Body" signal to refuse a
+        // FailConfirm on.
+        let mut t = PhaseWitnessTracker::new(100_000_000);
+        const T: u64 = 100_000_000;
+        t.observe(ss(0, 0), DISPATCH, 0); // seed
+        t.observe(ss(10, 5), DISPATCH, T); // Dispatch
+        t.observe(ss(20, 25), TEARDOWN, 2 * T); // jumped straight past Body
+        let w = t.finish().expect("seeded");
+        assert!(w.body_window.tick_deltas.is_empty());
+        assert_eq!(w.body_window.body_wall_ns, 0);
+        assert_eq!(w.body_window.body_covered_ns, 0);
+    }
+
+    #[test]
+    fn phase_witness_coarse_ticks_span_the_body() {
+        // A STARVED monitor that landed only three Body ticks, spaced ~20 s
+        // apart (time-sliced off the shared host CPU) — but they reach from
+        // near Body start to near Body end. The covered span (first→last tick)
+        // is ~40 s of the ~61 s Body wall, so the series WATCHED most of the
+        // phase: density is coarse but coverage is honest (each tick's delta
+        // still captured the full 20 s gap's run-delay).
+        let mut t = PhaseWitnessTracker::new(100_000_000);
+        const S: u64 = 1_000_000_000; // 1 s
+        t.observe(ss(0, 0), DISPATCH, 0); // seed
+        t.observe(ss(10, 5), BODY, 20 * S); // first Body tick, 20 s in
+        t.observe(ss(20, 25), BODY, 40 * S); // second, +20 s
+        t.observe(ss(30, 40), BODY, 60 * S); // third, +20 s
+        t.observe(ss(40, 50), TEARDOWN, 61 * S); // exit
+        let w = t.finish().expect("seeded");
+        assert_eq!(w.body_window.tick_deltas.len(), 3);
+        // Enter = pre-Body observation (seed, 0), exit = post-Body (61 s).
+        assert_eq!(w.body_window.body_wall_ns, 61 * S);
+        // Covered = last Body tick (60 s) − first Body tick (20 s) = 40 s.
+        assert_eq!(w.body_window.body_covered_ns, 40 * S);
+    }
+
+    #[test]
+    fn phase_witness_clustered_ticks_low_covered_span() {
+        // The dense-then-silent shape: several Body ticks CLUSTERED near the
+        // start, then the monitor is silent until it observes Teardown far
+        // later. The covered span (first→last Body tick) is tiny relative to
+        // the enter→exit Body wall — the seam's under-coverage signal.
+        let mut t = PhaseWitnessTracker::new(100_000_000);
+        const S: u64 = 1_000_000_000; // 1 s
+        t.observe(ss(0, 0), DISPATCH, 0); // seed
+        t.observe(ss(10, 5), BODY, S); // Body ticks cluster at 1..1.2 s
+        t.observe(ss(20, 25), BODY, S + 100_000_000);
+        t.observe(ss(30, 40), BODY, S + 200_000_000);
+        t.observe(ss(40, 50), TEARDOWN, 60 * S); // silent, then exit at 60 s
+        let w = t.finish().expect("seeded");
+        assert_eq!(w.body_window.tick_deltas.len(), 3);
+        // Wall = enter (seed, 0) → exit (60 s). Covered = 1.2 s − 1 s = 0.2 s.
+        assert_eq!(w.body_window.body_wall_ns, 60 * S);
+        assert_eq!(w.body_window.body_covered_ns, 200_000_000);
     }
 
     #[test]
@@ -8076,11 +8234,11 @@ mod tests {
     fn phase_witness_body_series_saturates_at_cap() {
         // Filling past BODY_TICK_CAP stops growing the Vec and sets the flag.
         let mut t = PhaseWitnessTracker::new(1);
-        t.observe(ss(0, 0), BODY); // seed
+        t.observe(ss(0, 0), BODY, 0); // seed
         let mut cum = 0u64;
         for _ in 0..(BODY_TICK_CAP + 5) {
             cum += 1;
-            t.observe(ss(cum, cum), BODY);
+            t.observe(ss(cum, cum), BODY, cum);
         }
         let w = t.finish().expect("seeded");
         assert_eq!(w.body_window.tick_deltas.len(), BODY_TICK_CAP);

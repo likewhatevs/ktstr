@@ -107,6 +107,67 @@ pub(crate) fn peak_window_delay_ns(deltas: &[u64], tick_ns: u64, window_ns: u64)
     best
 }
 
+/// Minimum number of CLOSED Body ticks the witness series must hold before an
+/// "excess > W" refutation ([`LatencyVerdict::FailConfirmed`]) is sound.
+///
+/// Below this the series cannot even define a covered SPAN: an empty series
+/// reads `W == 0` for ANY window (the starved-CI shape that produced the false
+/// FailConfirmed this rule fixes), and a single tick is one point with zero
+/// span. Two is the floor at which the ticks reach ACROSS an interval that
+/// `peak_window_delay_ns` can slide a window over.
+pub(crate) const BODY_COVERAGE_MIN_TICKS: usize = 2;
+
+/// Minimum fraction of the Body phase's WALL span the witness series must
+/// actually SPAN (first Body tick → last Body tick) before a `FailConfirmed`
+/// is sound.
+///
+/// `W` is trustworthy only if the ticks reached ACROSS the phase — a
+/// contention burst in an un-sampled sub-interval would otherwise be invisible
+/// to `peak_window_delay_ns` and `W` would under-bound the real contamination,
+/// risking a wrong confirm. This is a SPAN ratio, not a tick-DENSITY ratio: a
+/// monitor that ticks coarsely but from Body start to Body end still watched
+/// the whole phase (each `tick_delta` captures all run-delay since the prior
+/// tick, so a sparse-but-spanning series makes `W` over-count if anything —
+/// safe), so density must NOT gate the verdict, only span. `body_covered_ns /
+/// body_wall_ns` below this fraction means the ticks clustered in a slice of
+/// the phase (or the phase was never observed), so `W` is not a trustworthy
+/// bound and the seam demotes. 50% is a deliberately permissive floor — a
+/// live monitor spans ~100% (first tick near Body start, last near Body end)
+/// regardless of density, so it trips only when the series genuinely failed to
+/// reach across the phase. Like every rounding here, an under-coverage verdict
+/// can only push toward a pass, never a wrong confirm.
+pub(crate) const BODY_COVERAGE_MIN_FRAC: f64 = 0.5;
+
+/// Whether the Body witness series SPANNED enough of the Body phase for an
+/// "excess > W" refutation ([`LatencyVerdict::FailConfirmed`]) to be sound:
+/// at least [`BODY_COVERAGE_MIN_TICKS`] closed ticks AND a covered span
+/// (`body_covered_ns`, first→last Body tick) of at least
+/// [`BODY_COVERAGE_MIN_FRAC`] of the Body phase wall `body_wall_ns`.
+/// `body_wall_ns == 0` (the Body phase was never observed) is NOT covered —
+/// there is no phase span to prove the series watched.
+///
+/// This ONLY gates `FailConfirmed`: a series that fails it demotes to
+/// indeterminate (non-blocking), never the reverse, so it can only push a
+/// verdict toward a pass. `body_wall_ns` is measured conservatively LARGE and
+/// `body_covered_ns` conservatively small host-side (see
+/// [`crate::vmm::result::BodyContentionWindow`]), so the ratio is under-stated
+/// — biasing further toward demote.
+pub(crate) fn body_series_covers_phase(
+    n_ticks: usize,
+    body_covered_ns: u64,
+    body_wall_ns: u64,
+) -> bool {
+    if n_ticks < BODY_COVERAGE_MIN_TICKS {
+        return false;
+    }
+    if body_wall_ns == 0 {
+        // No Body wall recorded — the phase was never observed, so the series
+        // cannot be proven to have spanned it.
+        return false;
+    }
+    body_covered_ns as f64 >= BODY_COVERAGE_MIN_FRAC * body_wall_ns as f64
+}
+
 /// Tri-state outcome of a contention-aware latency threshold check.
 ///
 /// Each variant carries the evidence the seam needs to render the verdict:
@@ -423,6 +484,51 @@ mod tests {
             v,
             LatencyVerdict::ContentionIndeterminatePass { .. }
         ));
+    }
+
+    // ---- body_series_covers_phase: coverage soundness ----
+
+    const S: u64 = 1_000_000_000; // 1 s of wall
+
+    #[test]
+    fn coverage_empty_series_never_covers() {
+        // 0 ticks: the starved-CI shape (W==0), zero covered span — never
+        // covered, whatever the wall. body_wall 0 (Body never observed) also
+        // never covered even with a claimed span.
+        assert!(!body_series_covers_phase(0, 0, 0));
+        assert!(!body_series_covers_phase(0, 0, 10 * S));
+        assert!(!body_series_covers_phase(3, 5 * S, 0));
+    }
+
+    #[test]
+    fn coverage_single_tick_never_covers() {
+        // One tick is a point (zero span) — below the min-ticks floor.
+        assert!(!body_series_covers_phase(1, 0, S));
+    }
+
+    #[test]
+    fn coverage_clustered_series_under_fraction_fails() {
+        // Ticks clustered in a 0.2 s slice of a 60 s Body wall (the
+        // dense-then-silent shape): plenty of ticks, but they span < 1% of the
+        // phase, so W is not trustworthy → not covered.
+        assert!(!body_series_covers_phase(3, 200_000_000, 60 * S));
+    }
+
+    #[test]
+    fn coverage_sparse_but_spanning_series_covers() {
+        // Only 2 coarse ticks, but they reach from Body start to Body end
+        // (span ~= the whole wall) — the whole phase was watched, so W (which
+        // over-counts a coarse series if anything) is trustworthy. Density
+        // must NOT gate; span does.
+        assert!(body_series_covers_phase(2, 9 * S, 10 * S));
+    }
+
+    #[test]
+    fn coverage_boundary_at_fraction_is_covered() {
+        // Exactly 50% span is INSIDE the covered band (`>=`), the permissive
+        // side; just under is not.
+        assert!(body_series_covers_phase(5, 5 * S, 10 * S));
+        assert!(!body_series_covers_phase(5, 4 * S, 10 * S));
     }
 
     // ---- perf_isolation_violated ----
