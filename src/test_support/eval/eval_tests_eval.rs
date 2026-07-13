@@ -710,6 +710,9 @@ fn eval_monitor_fail_has_fingerprint() {
         exit_code: 0,
         duration: std::time::Duration::from_secs(1),
         timed_out: false,
+        watchdog_kill_reason: None,
+        final_guest_phase: crate::vmm::GuestLifecyclePhase::Boot,
+        final_progress_epoch: 0,
         output,
         stderr: String::new(),
         monitor: Some(crate::monitor::MonitorReport {
@@ -1061,6 +1064,9 @@ fn eval_sched_exit_includes_monitor() {
         exit_code: 1,
         duration: std::time::Duration::from_secs(1),
         timed_out: false,
+        watchdog_kill_reason: None,
+        final_guest_phase: crate::vmm::GuestLifecyclePhase::Boot,
+        final_progress_epoch: 0,
         output: String::new(),
         stderr: String::new(),
         monitor: Some(crate::monitor::MonitorReport {
@@ -1181,6 +1187,9 @@ fn eval_monitor_fail_includes_sched_log() {
         exit_code: 0,
         duration: std::time::Duration::from_secs(1),
         timed_out: false,
+        watchdog_kill_reason: None,
+        final_guest_phase: crate::vmm::GuestLifecyclePhase::Boot,
+        final_progress_epoch: 0,
         output,
         stderr: String::new(),
         monitor: Some(crate::monitor::MonitorReport {
@@ -3106,6 +3115,9 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
         exit_code: 0,
         duration: std::time::Duration::from_secs(1),
         timed_out: false,
+        watchdog_kill_reason: None,
+        final_guest_phase: crate::vmm::GuestLifecyclePhase::Boot,
+        final_progress_epoch: 0,
         output: String::new(),
         stderr: String::new(),
         monitor: Some(crate::monitor::MonitorReport {

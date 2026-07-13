@@ -3791,6 +3791,25 @@ pub(crate) fn monitor_loop(
             {
                 data_valid = true;
                 latched_page_offset = page_offset;
+                // Late-latch follow-up to the pre-latch dump below: when
+                // the diag already fired ("will fall back to the Tier-3
+                // deadman") but the channels latched AFTERWARD, say so —
+                // otherwise a log reader pairs the dump with the eventual
+                // kill and concludes the channels were dead all run, when
+                // the truth is a starved/slow boot that recovered (the
+                // observed CI shape: guest at a few % host CPU, KERN_ADDRS
+                // publish landing minutes in, per-tick adoption healing
+                // the latch). The tick count times the sample interval is
+                // the boot-dilation witness for placement debugging.
+                if pre_latch_diag_emitted {
+                    eprintln!(
+                        "monitor: guest evidence channels latched LATE at tick \
+                         {pre_latch_ticks} (~{:.1}s at the sample cadence) — the \
+                         earlier pre-latch dump reflected a starved/slow boot, not \
+                         dead channels; watchdog tiers are live from this point.",
+                        pre_latch_ticks as f64 * interval.as_secs_f64(),
+                    );
+                }
             }
             // Bounded once-only resolution diagnostic. When the guest
             // evidence channels never latch — `data_valid` stays false

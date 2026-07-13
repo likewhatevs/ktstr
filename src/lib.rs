@@ -930,7 +930,8 @@ pub mod prelude {
     };
     pub use crate::vmm::net_config::NetConfig;
     pub use crate::vmm::{
-        BodyContentionWindow, ContentionWitness, HostVcpuSchedstat, PerPhaseSchedstat,
+        BodyContentionWindow, ContentionWitness, GuestLifecyclePhase, HostVcpuSchedstat,
+        PerPhaseSchedstat, WatchdogKillReason,
     };
     // Surfaced for `post_vm` callbacks that drain the snapshot
     // bridge's per-tag kernel-op reply log via

@@ -49,37 +49,55 @@
 //! The body publishes `AssertResult::pass()` BEFORE the wedge, so the
 //! host's parse-success arm records a passing base verdict (`timed_out`
 //! alone does not flip a parsed PASS). Each fixture's
-//! `post_vm_unconditional` callback then asserts the kill happened AND was
-//! fast; a callback `Err` rides the `PostVmAssertionFailure` marker, an
-//! unconditional hard `EXIT_FAIL`. So the fixture is GREEN exactly when the
-//! wedge dies fast on its progress tier, and RED when the watchdog does not
-//! fire or fires only at Tier-3 speed.
+//! `post_vm_unconditional` callback then asserts the kill happened AND
+//! names the expected tier; a callback `Err` rides the
+//! `PostVmAssertionFailure` marker, an unconditional hard `EXIT_FAIL`.
 //!
-//! # Timing bounds (1 vCPU, `no_perf_mode`, `watchdog_timeout_s = 90`)
+//! # Mechanism assertions, not wall bounds
 //!
-//! Tier-3 dead-man deadline (`vm_timeout_from_entry`):
-//! `max(watchdog_timeout_s, duration_s, 1s) + vm_boot_headroom(1) × 3`
-//! = `90s + (10s + 10.15s) × 3` ≈ **150.5 s** — and for the idle shape the
-//! deadman additionally waits out its 60 s milestone grace, so a
-//! deadman-speed kill can never land under ~150 s.
+//! These fixtures assert WHICH watchdog rule killed the wedge
+//! (`VmResult::watchdog_kill_reason` — the dump's `cause=` line), never
+//! how long the kill took on the wall clock. Earlier revisions bounded
+//! wall time (`< 90 s` for Tier-2, `< 60 s` for Tier-1) as a proxy for
+//! "the fast tier fired, not the deadman" — the disguised-wall-deadline
+//! anti-pattern living in the regression tests for the anti-wall-deadline
+//! machinery. Real arm64 CI runs falsified the proxy in both directions:
 //!
-//!   - **Tier-2 idle**: the wedge starts at ~10-15 s (boot ≈ 5-10 s + 1 s
-//!     body + bounded teardown preamble; a few s later at 64 vCPUs). Tier-2
-//!     fires once `wall_in_phase > 15s` (the Teardown backstop) — no
-//!     trickle latch to wait out — so the kill lands ≈ 25-35 s total.
-//!     Asserted `< 90s` — generous for host-load jitter yet strictly
-//!     discriminating (a deadman kill cannot beat ~150 s).
-//!   - **Tier-1 spin**: the Teardown CPU budget is the flat 8 s
-//!     (≤ 12 s if pthread-widened 3/2), charged against the MAX per-vCPU
-//!     in-phase burn; a 1-vCPU spinner IS the max and accrues ~1 s CPU per
-//!     wall-second, so Tier-1 fires ≈ 8-12 s after the wedge starts —
-//!     ≈ 20-27 s total. Asserted `< 60s` (0.4× the deadman).
+//!   - a 1-vCPU cell at ~14% host CPU share had Tier-1 fire EXACTLY on
+//!     its 12 s in-phase CPU budget (`cause=tier1-cpu-budget`,
+//!     `max_vcpu_cpu_in_phase=12.07s vs budget=12s`) — the mechanism on
+//!     spec — yet took 83 s of wall in-phase and failed the 60 s bound;
+//!   - a sibling cell at ~0.3% share sat in `Boot` for 172 s (the guest
+//!     never finished booting) and was correctly bounded by the Tier-3
+//!     deadman — nothing wedge-related can be asserted about a guest
+//!     that never reached the wedge.
 //!
-//! The kill CAUSE line (`cause=tier1-cpu-budget` / `cause=tier2-idle-wedge`)
-//! goes to the watchdog's stderr dump — captured by nextest, not carried on
-//! `VmResult` — so cause-exactness is pinned by the `watchdog_step` unit
-//! truth-table; here the discriminator is the injected wedge shape plus the
-//! fast-kill timing.
+//! The verdict logic (`assert_wedge_kill_mechanism`) is therefore:
+//!   (a) killed by the expected tier → PASS at any host dilation;
+//!   (b) the guest never reached the Teardown wedge phase
+//!       (`VmResult::final_guest_phase < Teardown`, the 0.3%-share
+//!       shape) → host-side SKIP (`post_vm_skip`): environmental
+//!       non-verdict, the injected wedge was never exercised;
+//!   (c) reached the wedge but killed by the wrong rule (deadman,
+//!       wrong tier, AP kill) → FAIL — the detection regression these
+//!       fixtures exist to catch;
+//!   (d) not killed at all → FAIL (the watchdog let the wedge escape;
+//!       the harness/terminate-after bound is the only outer net).
+//!
+//! # Timing expectations (documentation only — asserted nowhere)
+//!
+//! On a healthy, non-oversubscribed host (1 vCPU, `no_perf_mode`,
+//! `watchdog_timeout_s = 90`): the Tier-3 dead-man deadline
+//! (`vm_timeout_from_entry`) is `max(watchdog_timeout_s, duration_s, 1s)
+//! + vm_boot_headroom(1) × 3` = `90s + (10s + 10.15s) × 3` ≈ 150.5 s.
+//!   - **Tier-2 idle**: wedge starts at ~10-15 s (boot ≈ 5-10 s + 1 s
+//!     body + bounded teardown preamble); Tier-2 fires once
+//!     `wall_in_phase > 15s` (the Teardown backstop) → kill ≈ 25-35 s.
+//!   - **Tier-1 spin**: the Teardown CPU budget is the flat 8 s (≤ 12 s
+//!     pthread-widened 3/2) charged against the MAX per-vCPU in-phase
+//!     burn; a 1-vCPU spinner accrues ~1 s CPU per wall-second → kill
+//!     ≈ 20-27 s. Under host contention the same CPU budget stretches
+//!     across proportionally more wall — by design.
 //!
 //! # Out of scope here
 //!
@@ -90,10 +108,9 @@
 use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
-use ktstr::prelude::VmResult;
+use ktstr::prelude::{GuestLifecyclePhase, VmResult, WatchdogKillReason, post_vm_skip};
 use ktstr::scenario::Ctx;
 use ktstr::test_support::Scheduler;
-use std::time::Duration;
 
 /// EEVDF (no userspace scheduler) plus the cmdline token that makes the
 /// guest sleep forever in the Teardown stage — the Tier-2 idle-wedge shape.
@@ -123,57 +140,92 @@ const TEARDOWN_IDLE_WIDE_SCHED: Scheduler =
 const TEARDOWN_SPIN_WIDE_SCHED: Scheduler =
     Scheduler::named("progress_wd_teardown_spin_wide").kargs(&["KTSTR_FAULT_TEARDOWN_WEDGE=spin"]);
 
-/// Upper bound on a Tier-2 idle-wedge kill's wall time. Derivation in the
-/// module doc: expected ≈ 25-35 s (wedge start + the 15 s Teardown wall
-/// backstop, no trickle latch); the Tier-3 deadman cannot land under
-/// ~150 s.
-const TIER2_IDLE_BOUND: Duration = Duration::from_secs(90);
-
-/// Upper bound on a Tier-1 spin-wedge kill's wall time. Expected ≈ 20-27 s
-/// (wedge start + ≤12 s widened CPU-budget burn).
-const TIER1_SPIN_BOUND: Duration = Duration::from_secs(60);
-
-/// Host-side gate for the idle (Tier-2) fixture: the injected Teardown
-/// idle-wedge MUST time out under the watchdog, and fast enough to prove
-/// the Tier-2 backstop — not the ~150 s Tier-3 dead-man — killed it. An
-/// `Err` rides `PostVmAssertionFailure` → hard fail, never inverted.
-fn assert_tier2_idle_fast_kill(result: &VmResult) -> Result<()> {
+/// Shared mechanism gate for the wedge fixtures — the (a)-(d) verdict
+/// logic from the module doc. Asserts WHICH rule killed the run, never
+/// how long the kill took (see "Mechanism assertions, not wall bounds").
+///
+/// Order matters: the never-reached-the-wedge check (b) precedes the
+/// expected-tier check (a) so a kill that fired the right rule in the
+/// WRONG phase (e.g. Tier-2 on an idle guest still stuck in Boot — Boot
+/// is INFRA too, with its own backstop) reads as environmental SKIP
+/// rather than a false proof that the injected Teardown wedge was
+/// detected. A starved run can also leave the final ledger phase below
+/// Teardown when the kill outran the host's consumption of the guest's
+/// Teardown frame — likewise a non-verdict, not a regression.
+fn assert_wedge_kill_mechanism(
+    result: &VmResult,
+    expected: WatchdogKillReason,
+    wedge_desc: &str,
+) -> Result<()> {
+    // (d) Not killed at all: the watchdog let a forever-wedge escape to
+    // the harness bound — the machinery failed open.
     anyhow::ensure!(
         result.timed_out,
         "expected the progress watchdog to fire (timed_out) on the injected \
-         Teardown idle-wedge, but the run did not time out — Tier-2 \
-         (idle-wedge) did not kill the cell"
+         {wedge_desc}, but the run did not time out — the watchdog let the \
+         wedge escape"
     );
-    anyhow::ensure!(
-        result.duration < TIER2_IDLE_BOUND,
-        "Teardown idle-wedge timed out but too slowly ({:.1}s >= {:.1}s \
-         bound): the kill looks like the Tier-3 dead-man deadline (~150s+), \
-         not the Tier-2 wall backstop (~25-35s)",
+    // (b) The guest never reached the Teardown wedge phase: the injected
+    // fault never executed, so no wedge-detection claim — for or against —
+    // is testable. Environmental (observed: an arm64 cell at ~0.3% host
+    // CPU share sat in Boot for 172 s; nothing can boot at that share).
+    // SKIP, not FAIL: the deadman bounding such a cell is the DESIGNED
+    // degradation, not a detection regression.
+    if result.final_guest_phase < GuestLifecyclePhase::Teardown {
+        return Err(post_vm_skip(format!(
+            "guest never reached the Teardown wedge phase \
+             (final_guest_phase={:?}, progress_epoch={}, kill={:?} at \
+             {:.1}s): the host was too starved for the guest to boot to \
+             the injected {wedge_desc} — environmental non-verdict, the \
+             wedge mechanism was never exercised",
+            result.final_guest_phase,
+            result.final_progress_epoch,
+            result.watchdog_kill_reason,
+            result.duration.as_secs_f64(),
+        )));
+    }
+    // (a) Killed by the expected tier: mechanism proven, at any host
+    // dilation — a CPU budget stretches across wall proportionally to
+    // starvation by design (observed on-spec at ~14% share: Tier-1 at
+    // 12.07s-vs-12s CPU across 83 s of wall).
+    if result.watchdog_kill_reason == Some(expected) {
+        return Ok(());
+    }
+    // (c) Reached the wedge but the wrong rule killed it (deadman, wrong
+    // tier, AP kill, or no reason recorded): the detection regression
+    // these fixtures exist to catch.
+    anyhow::bail!(
+        "the injected {wedge_desc} was reached (final_guest_phase={:?}, \
+         progress_epoch={}) but the kill was {:?}, not {expected:?} \
+         (duration {:.1}s) — the expected tier failed to detect the wedge",
+        result.final_guest_phase,
+        result.final_progress_epoch,
+        result.watchdog_kill_reason,
         result.duration.as_secs_f64(),
-        TIER2_IDLE_BOUND.as_secs_f64(),
-    );
-    Ok(())
+    )
 }
 
-/// Host-side gate for the spin (Tier-1) fixture: the injected Teardown
-/// spin-wedge MUST time out fast enough to prove the Tier-1 CPU budget —
-/// not Tier-3 — killed it.
-fn assert_tier1_spin_fast_kill(result: &VmResult) -> Result<()> {
-    anyhow::ensure!(
-        result.timed_out,
-        "expected the progress watchdog to fire (timed_out) on the injected \
-         Teardown spin-wedge, but the run did not time out — Tier-1 \
-         (CPU-budget) did not kill the cell"
-    );
-    anyhow::ensure!(
-        result.duration < TIER1_SPIN_BOUND,
-        "Teardown spin-wedge timed out but too slowly ({:.1}s >= {:.1}s \
-         bound): the kill looks like the Tier-3 dead-man deadline (~150s+), \
-         not the Tier-1 Teardown CPU budget (~8-12s of in-phase burn)",
-        result.duration.as_secs_f64(),
-        TIER1_SPIN_BOUND.as_secs_f64(),
-    );
-    Ok(())
+/// Host-side gate for the idle (Tier-2) fixtures: the injected Teardown
+/// idle-wedge must die to `cause=tier2-idle-wedge`. An `Err` rides
+/// `PostVmAssertionFailure` → hard fail, never inverted; the
+/// starved-boot shape lands a host-side SKIP instead (see
+/// `assert_wedge_kill_mechanism`).
+fn assert_tier2_idle_kill(result: &VmResult) -> Result<()> {
+    assert_wedge_kill_mechanism(
+        result,
+        WatchdogKillReason::Tier2IdleWedge,
+        "Teardown idle-wedge",
+    )
+}
+
+/// Host-side gate for the spin (Tier-1) fixtures: the injected Teardown
+/// spin-wedge must die to `cause=tier1-cpu-budget`.
+fn assert_tier1_spin_kill(result: &VmResult) -> Result<()> {
+    assert_wedge_kill_mechanism(
+        result,
+        WatchdogKillReason::Tier1CpuBudget,
+        "Teardown spin-wedge",
+    )
 }
 
 /// Host-side gate for the Body-exemption control: a guest that sat fully
@@ -195,8 +247,8 @@ fn assert_idle_body_survived(result: &VmResult) -> Result<()> {
 /// forever in the Teardown stage — no runnable demand, ISR-only CPU
 /// trickle. The watchdog's Tier-2 rule kills it once `wall_in_phase`
 /// crosses the 15 s Teardown wall backstop (channels live, nothing
-/// runnable) — far below the ~150 s Tier-3 deadman. Green iff the kill
-/// lands fast (see `assert_tier2_idle_fast_kill`).
+/// runnable). Green iff `cause=tier2-idle-wedge` did the killing (see
+/// `assert_tier2_idle_kill`); wall time is documentation, not verdict.
 ///
 /// This fixture pins the Tier-2 conjuncts end-to-end: the guest's
 /// evidence channels are live and its rq memory reports nothing
@@ -214,7 +266,7 @@ fn assert_idle_body_survived(result: &VmResult) -> Result<()> {
     duration_s = 1,
     watchdog_timeout_s = 90,
     auto_repro = false,
-    post_vm_unconditional = assert_tier2_idle_fast_kill,
+    post_vm_unconditional = assert_tier2_idle_kill,
 )]
 fn teardown_idle_wedge_killed_by_tier2(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
@@ -224,8 +276,10 @@ fn teardown_idle_wedge_killed_by_tier2(_ctx: &Ctx) -> Result<AssertResult> {
 /// forever in the Teardown stage, burning CPU with no milestone. The
 /// watchdog's Tier-1 rule kills it once its `max_vcpu_cpu_in_phase` exceeds
 /// the flat 8 s Teardown CPU budget (the lone spinning vCPU IS the max) —
-/// earlier than Tier-2's 15 s wall backstop and far below Tier-3. Green iff
-/// the kill lands fast (see `assert_tier1_spin_fast_kill`).
+/// earlier than Tier-2's 15 s wall backstop. Green iff
+/// `cause=tier1-cpu-budget` did the killing (see `assert_tier1_spin_kill`);
+/// under host contention the same CPU budget takes proportionally more
+/// wall, which is correct and unasserted.
 #[ktstr_test(
     scheduler = TEARDOWN_SPIN_SCHED,
     llcs = 1,
@@ -236,7 +290,7 @@ fn teardown_idle_wedge_killed_by_tier2(_ctx: &Ctx) -> Result<AssertResult> {
     duration_s = 1,
     watchdog_timeout_s = 90,
     auto_repro = false,
-    post_vm_unconditional = assert_tier1_spin_fast_kill,
+    post_vm_unconditional = assert_tier1_spin_kill,
 )]
 fn teardown_spin_wedge_killed_by_tier1(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
@@ -251,9 +305,8 @@ fn teardown_spin_wedge_killed_by_tier1(_ctx: &Ctx) -> Result<AssertResult> {
 /// trickle never latched "stalled" and Tier-2 AND the trickle-gated Tier-3
 /// deadman both deferred — the wedge escaped to the harness bound. Tier-2
 /// now needs only channels + no-demand + the 15 s Teardown wall backstop,
-/// so this wedge dies on the same bound as the 1-vCPU fixture.
-/// Asserted `< 90s` — the wide deadman is ~179 s (64-vCPU boot headroom), so
-/// this bound strictly excludes a deadman-speed kill.
+/// so this wedge dies on the same rule as the 1-vCPU fixture — asserted
+/// via `cause=tier2-idle-wedge`, not wall time.
 #[ktstr_test(
     scheduler = TEARDOWN_IDLE_WIDE_SCHED,
     llcs = 8,
@@ -264,7 +317,7 @@ fn teardown_spin_wedge_killed_by_tier1(_ctx: &Ctx) -> Result<AssertResult> {
     duration_s = 1,
     watchdog_timeout_s = 90,
     auto_repro = false,
-    post_vm_unconditional = assert_tier2_idle_fast_kill,
+    post_vm_unconditional = assert_tier2_idle_kill,
 )]
 fn teardown_idle_wedge_wide_killed_by_tier2(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
@@ -275,7 +328,7 @@ fn teardown_idle_wedge_wide_killed_by_tier2(_ctx: &Ctx) -> Result<AssertResult> 
 /// max-per-vCPU in-phase burn, so Tier-1 fires on its flat Teardown CPU
 /// budget exactly as at 1 vCPU — the other 63 idle vCPUs sum into
 /// `cpu_ns_now` but never into the width-independent Tier-1 evidence.
-/// Asserted `< 60s`.
+/// Asserted via `cause=tier1-cpu-budget`, not wall time.
 #[ktstr_test(
     scheduler = TEARDOWN_SPIN_WIDE_SCHED,
     llcs = 8,
@@ -286,7 +339,7 @@ fn teardown_idle_wedge_wide_killed_by_tier2(_ctx: &Ctx) -> Result<AssertResult> 
     duration_s = 1,
     watchdog_timeout_s = 90,
     auto_repro = false,
-    post_vm_unconditional = assert_tier1_spin_fast_kill,
+    post_vm_unconditional = assert_tier1_spin_kill,
 )]
 fn teardown_spin_wedge_wide_killed_by_tier1(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())

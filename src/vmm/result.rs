@@ -26,6 +26,59 @@ use super::virtio_net::{VirtioNetCounters, VirtioNetCountersSnapshot};
 use super::wire;
 use crate::monitor;
 
+/// Which watchdog rule (if any) killed the VM — the public mirror of
+/// the watchdog-internal `freeze_coord::KillReasonTag`, rendered as
+/// `cause=` in the deadline-expired stderr dump. `None` on
+/// [`VmResult::watchdog_kill_reason`] means no watchdog kill was
+/// recorded (clean exit, crash, or a timeout path that never stamped a
+/// reason).
+///
+/// The variant IS the mechanism assertion e2e fixtures need: a
+/// wedge-injection fixture proves its tier by matching the reason,
+/// which stays correct at ANY host dilation — unlike a wall-time bound,
+/// which conflates detection latency with host CPU share (an observed
+/// arm64 cell proved Tier-1 firing exactly on its 12 s CPU budget while
+/// taking 83 s of wall at ~14% share).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchdogKillReason {
+    /// Tier-1: max per-vCPU CPU burned past the phase budget with no
+    /// milestone — a spinning wedge.
+    Tier1CpuBudget,
+    /// Tier-2: wall past the phase backstop with live evidence channels
+    /// and no runnable demand — a silent idle wedge.
+    Tier2IdleWedge,
+    /// Tier-3: the hard deadline expired and the deadman was not
+    /// deferred (monitor dead, or cell inert past the grace).
+    Tier3Deadman,
+    /// An AP set the kill flag (panic-driven), not a watchdog expiry.
+    ApKill,
+}
+
+/// Final guest lifecycle stage as tracked by the progress ledger —
+/// the public mirror of `monitor::LifecycleStage` (same forward-only
+/// ordinal order, so `Ord` compares boot progress). Snapshotted at
+/// run teardown onto [`VmResult::final_guest_phase`].
+///
+/// Fixtures use this to distinguish "the guest reached the phase under
+/// test and the watchdog misfired" (a real detection regression) from
+/// "the guest never got there" (an environmental non-verdict: an
+/// observed arm64 cell at 0.3% host CPU share sat in `Boot` for 172 s —
+/// nothing phase-dependent can be asserted about a guest that could
+/// not boot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GuestLifecyclePhase {
+    /// Booting: init up to SYS_RDY.
+    Boot,
+    /// SYS_RDY seen; scheduler attaching.
+    Attach,
+    /// Guest dispatch entering the workload preamble.
+    Dispatch,
+    /// The test body / workload proper.
+    Body,
+    /// Winding down (`ScenarioEnd` / `Exit` / `TestResult` seen).
+    Teardown,
+}
+
 /// Result of a VM execution.
 ///
 /// `Clone` is supported, but two field categories have different
@@ -125,6 +178,22 @@ pub struct VmResult {
     pub duration: Duration,
     /// True when the host hit its watchdog before the guest exited.
     pub timed_out: bool,
+    /// Which watchdog rule killed the VM (see [`WatchdogKillReason`]).
+    /// `None` when no watchdog kill was recorded — clean exits, but
+    /// also crash paths where the kill flag was never watchdog-set.
+    /// Loaded from the watchdog thread's kill-reason latch after its
+    /// join, so the value is final.
+    pub watchdog_kill_reason: Option<WatchdogKillReason>,
+    /// Final guest lifecycle stage per the progress ledger (see
+    /// [`GuestLifecyclePhase`]). Snapshotted at run teardown; stays
+    /// `Boot` when the guest never advanced (or no dispatch thread
+    /// consumed lifecycle frames — e.g. host-only paths).
+    pub final_guest_phase: GuestLifecyclePhase,
+    /// Final milestone count from the progress ledger (the dump's
+    /// `progress_epoch=` value): lifecycle-stage advances plus other
+    /// dispatch-recorded milestones. `0` means the guest never
+    /// published a milestone the host consumed.
+    pub final_progress_epoch: u64,
     /// Captured guest stdout (and any non-dmesg serial console content).
     pub output: String,
     /// Captured guest stderr (separated from `output` when the guest
@@ -1172,6 +1241,9 @@ impl VmResult {
             exit_code: 0,
             duration: Duration::from_secs(1),
             timed_out: false,
+            watchdog_kill_reason: None,
+            final_guest_phase: GuestLifecyclePhase::Boot,
+            final_progress_epoch: 0,
             output: String::new(),
             stderr: String::new(),
             monitor: None,
@@ -1679,6 +1751,17 @@ impl KvmStatsTotals {
 pub(crate) struct VmRunState {
     pub(crate) exit_code: i32,
     pub(crate) timed_out: bool,
+    /// Raw kill-reason byte loaded from the watchdog thread's latch
+    /// after its join (`freeze_coord::KillReasonTag` layout; 0 =
+    /// unset). Decoded into [`VmResult::watchdog_kill_reason`] by
+    /// `collect_results`, which owns the tag type.
+    pub(crate) watchdog_kill_reason_raw: u8,
+    /// Raw final lifecycle-stage byte from the progress ledger
+    /// (`monitor::LifecycleStage` layout). Decoded into
+    /// [`VmResult::final_guest_phase`] by `collect_results`.
+    pub(crate) final_guest_phase_raw: u8,
+    /// Final ledger milestone count → [`VmResult::final_progress_epoch`].
+    pub(crate) final_progress_epoch: u64,
     pub(crate) ap_threads: Vec<VcpuThread>,
     pub(crate) monitor_handle: Option<JoinHandle<monitor::reader::MonitorLoopResult>>,
     pub(crate) bpf_write_handle: Option<JoinHandle<()>>,

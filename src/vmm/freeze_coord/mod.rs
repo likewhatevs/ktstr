@@ -358,6 +358,38 @@ impl KillReasonTag {
     }
 }
 
+/// Decode the watchdog's raw kill-reason byte into the public
+/// [`crate::vmm::WatchdogKillReason`] mirror for `VmResult`. Kept here
+/// (not in `result.rs`) so the byte layout stays owned by
+/// [`KillReasonTag`]; `Unset` (and any unknown byte, via
+/// `KillReasonTag::from_u8`'s conservative mapping) decodes to `None` —
+/// "no watchdog kill recorded".
+fn decode_watchdog_kill_reason(raw: u8) -> Option<crate::vmm::WatchdogKillReason> {
+    use crate::vmm::WatchdogKillReason as Pub;
+    match KillReasonTag::from_u8(raw) {
+        KillReasonTag::Unset => None,
+        KillReasonTag::Tier1Cpu => Some(Pub::Tier1CpuBudget),
+        KillReasonTag::Tier2Idle => Some(Pub::Tier2IdleWedge),
+        KillReasonTag::Tier3Deadman => Some(Pub::Tier3Deadman),
+        KillReasonTag::ApKill => Some(Pub::ApKill),
+    }
+}
+
+/// Decode the ledger's raw lifecycle-stage byte into the public
+/// [`crate::vmm::GuestLifecyclePhase`] mirror for `VmResult`. Routes
+/// through `LifecycleStage::from_u8` so the conservative unknown→Boot
+/// mapping stays single-sourced.
+fn decode_guest_phase(raw: u8) -> crate::vmm::GuestLifecyclePhase {
+    use crate::vmm::GuestLifecyclePhase as Pub;
+    match monitor::LifecycleStage::from_u8(raw) {
+        monitor::LifecycleStage::Boot => Pub::Boot,
+        monitor::LifecycleStage::Attach => Pub::Attach,
+        monitor::LifecycleStage::Dispatch => Pub::Dispatch,
+        monitor::LifecycleStage::Body => Pub::Body,
+        monitor::LifecycleStage::Teardown => Pub::Teardown,
+    }
+}
+
 /// Extend the watchdog's reset deadline so it accommodates an armed
 /// wprof-ship grace. The watchdog fires at
 /// `effective_deadline = reset_deadline.max(hard_deadline)` where
@@ -403,9 +435,54 @@ fn arm_wprof_grace(
 
 #[cfg(test)]
 mod watchdog_reset_tag_tests {
-    use super::{KillReasonTag, WatchdogResetTag};
+    use super::{KillReasonTag, WatchdogResetTag, decode_guest_phase, decode_watchdog_kill_reason};
     use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
+
+    /// The VmResult plumbing decodes each fired tier's raw byte into the
+    /// public mirror, and the Unset/unknown bytes into `None` — so a clean
+    /// run (watchdog never fired, latch still 0) surfaces
+    /// `watchdog_kill_reason: None` and a fired tier surfaces its variant.
+    #[test]
+    fn watchdog_kill_reason_decode_per_tier_and_none_on_clean() {
+        use crate::vmm::WatchdogKillReason as Pub;
+        // Clean run: the latch stays at the initial Unset byte.
+        assert_eq!(
+            decode_watchdog_kill_reason(KillReasonTag::Unset as u8),
+            None
+        );
+        // Unknown byte (future variant / torn write): conservative None.
+        assert_eq!(decode_watchdog_kill_reason(200), None);
+        for (tag, expected) in [
+            (KillReasonTag::Tier1Cpu, Pub::Tier1CpuBudget),
+            (KillReasonTag::Tier2Idle, Pub::Tier2IdleWedge),
+            (KillReasonTag::Tier3Deadman, Pub::Tier3Deadman),
+            (KillReasonTag::ApKill, Pub::ApKill),
+        ] {
+            assert_eq!(decode_watchdog_kill_reason(tag as u8), Some(expected));
+        }
+    }
+
+    /// Phase decode: each ledger stage byte maps to its public mirror;
+    /// unknown bytes fall back to `Boot` (the ledger's own conservative
+    /// mapping). The public enum's `Ord` follows boot progress so
+    /// fixtures can ask "did the guest reach the wedge phase".
+    #[test]
+    fn guest_phase_decode_and_progress_order() {
+        use crate::vmm::GuestLifecyclePhase as Pub;
+        for (raw, expected) in [
+            (0u8, Pub::Boot),
+            (1, Pub::Attach),
+            (2, Pub::Dispatch),
+            (3, Pub::Body),
+            (4, Pub::Teardown),
+            (250, Pub::Boot), // unknown → conservative Boot
+        ] {
+            assert_eq!(decode_guest_phase(raw), expected);
+        }
+        assert!(Pub::Boot < Pub::Attach);
+        assert!(Pub::Body < Pub::Teardown);
+    }
 
     /// The dump-facing tokens and the decode round-trip are stable — the
     /// watchdog dump's `kill_reason=` key relies on both, and the fire
@@ -2560,6 +2637,19 @@ impl KtstrVm {
         // the same Arc, so the watchdog sees the monitor's liveness/CPU
         // stores and dispatch's phase advances in one ledger.
         let progress_ledger_for_wd = progress_ledger.clone();
+        // Fourth ledger clone, read once at `VmRunState` build: the final
+        // phase / progress_epoch land on `VmResult` so mechanism-asserting
+        // fixtures can distinguish "guest reached the phase under test"
+        // from "guest never booted" (see `VmResult::final_guest_phase`).
+        let progress_ledger_for_result = progress_ledger.clone();
+        // Kill-reason latch, shared between the watchdog thread (sole
+        // writer, on its fire path) and the `VmRunState` build (read after
+        // the watchdog join, so the value is final). Surfaces the dump's
+        // `cause=` verdict on `VmResult::watchdog_kill_reason` — the
+        // mechanism signal wedge fixtures assert instead of wall bounds.
+        let watchdog_kill_reason: Arc<std::sync::atomic::AtomicU8> =
+            Arc::new(std::sync::atomic::AtomicU8::new(KillReasonTag::Unset as u8));
+        let watchdog_kill_reason_for_wd = watchdog_kill_reason.clone();
 
         // Freeze coordinator thread: triggers a failure-dump freeze when
         // the BPF probe's `ktstr_err_exit_detected` .bss latch fires
@@ -11270,9 +11360,13 @@ impl KtstrVm {
                 // `watchdog_step::MonitorLiveness`). `kill_reason` records
                 // which rule fires so the dump names the true cause
                 // (Tier-1/2 progress verdict, the Tier-3 hard deadline, or
-                // an AP-set kill). Watchdog-local — see [`KillReasonTag`].
+                // an AP-set kill) — see [`KillReasonTag`]. The Arc is
+                // shared with `run_vm`, which loads the final value after
+                // this thread's join and surfaces it as
+                // `VmResult::watchdog_kill_reason` (no cross-thread
+                // ordering subtleties: the join is the synchronization).
                 let mut monitor_liveness = watchdog_step::MonitorLiveness::new();
-                let kill_reason = std::sync::atomic::AtomicU8::new(KillReasonTag::Unset as u8);
+                let kill_reason = watchdog_kill_reason_for_wd;
                 // Cached scheduler-attach reset deadline. Decoded
                 // lazily from `watchdog_reset_for_wd` after the
                 // host monitor stores a non-zero value (the
@@ -12172,9 +12266,19 @@ impl KtstrVm {
             .collect();
         let host_vcpu_schedstat = read_host_vcpu_schedstat(&host_vcpu_tids);
 
+        // Final ledger snapshot for the VmResult phase/milestone fields.
+        // The dispatch consumers that advance these are joined/dead by
+        // now, so this is the run's final state.
+        let final_ledger = progress_ledger_for_result.snapshot();
+
         Ok(VmRunState {
             exit_code,
             timed_out,
+            // Final kill-reason byte: the watchdog thread joined above, so
+            // this load observes its last store (the join synchronizes).
+            watchdog_kill_reason_raw: watchdog_kill_reason.load(Ordering::Acquire),
+            final_guest_phase_raw: final_ledger.phase,
+            final_progress_epoch: final_ledger.progress_epoch,
             ap_threads,
             monitor_handle,
             bpf_write_handle,
@@ -14726,6 +14830,13 @@ impl KtstrVm {
             exit_code,
             duration: start.elapsed(),
             timed_out,
+            // Mechanism verdicts for wedge fixtures: WHICH watchdog rule
+            // killed the run (the dump's `cause=`) and how far the guest
+            // got (final ledger phase / milestone count). Decoded from the
+            // raw bytes VmRunState captured post-join.
+            watchdog_kill_reason: decode_watchdog_kill_reason(run.watchdog_kill_reason_raw),
+            final_guest_phase: decode_guest_phase(run.final_guest_phase_raw),
+            final_progress_epoch: run.final_progress_epoch,
             output: app_output,
             stderr: console_output,
             monitor: monitor_report,

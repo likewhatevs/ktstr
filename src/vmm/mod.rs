@@ -153,8 +153,8 @@ pub use builder::KtstrVmBuilder;
 #[allow(unused_imports)]
 pub use result::KVM_INTERESTING_STATS;
 pub use result::{
-    BodyContentionWindow, ContentionWitness, HostVcpuSchedstat, KvmStatsTotals, PerPhaseSchedstat,
-    VmResult,
+    BodyContentionWindow, ContentionWitness, GuestLifecyclePhase, HostVcpuSchedstat,
+    KvmStatsTotals, PerPhaseSchedstat, VmResult, WatchdogKillReason,
 };
 #[allow(unused_imports)]
 pub use sched_stats::{SchedStatsClient, SchedStatsError, StatsRequest, StatsResponse};
