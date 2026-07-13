@@ -471,9 +471,12 @@ fn for_each_gauntlet_variant_visit_count_equals_accepted_preset_count() {
     let expected: usize = presets
         .iter()
         .filter(|p| {
-            entry
-                .constraints
-                .accepts(&p.topology, u32::MAX, u32::MAX, u32::MAX)
+            // Non-uniform (llc_cores) presets are verifier-only and skipped
+            // by for_each_gauntlet_variant regardless of constraints.
+            p.topology.llc_cores.is_none()
+                && entry
+                    .constraints
+                    .accepts(&p.topology, u32::MAX, u32::MAX, u32::MAX)
         })
         .count();
     let mut count = 0;

@@ -444,6 +444,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = crate::vmm::kvm::KtstrKvm::new(topo, 64, false).unwrap();
         let result = setup_regs(&vm.vcpus[0], 0x28_0000, 0x4000_0000);

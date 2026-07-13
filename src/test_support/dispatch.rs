@@ -1558,6 +1558,18 @@ fn for_each_gauntlet_variant<F>(
 {
     let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
     for preset in presets {
+        // Non-uniform presets (per-LLC core counts, e.g. uneven-11llc)
+        // are VERIFIER-ONLY: the gauntlet execution path reconstructs the
+        // topology from a `TopoOverride` (numa/llcs/cores/threads only),
+        // which cannot carry `llc_cores`, so a gauntlet variant would boot
+        // a WRONG uniform shape. The verifier path passes the full
+        // Topology (with llc_cores) directly, so it is the only path that
+        // renders these shapes faithfully. Skip them here regardless of
+        // constraints — this is why uneven-11llc's forced overcommit is
+        // realized only in the verifier battery.
+        if preset.topology.llc_cores.is_some() {
+            continue;
+        }
         // No-perf-mode tests run KVM-emulated topology — guest sees the
         // declared NUMA / LLC / per-LLC layout regardless of host
         // hardware — so the host-side LLC count and per-LLC CPU width
@@ -1884,8 +1896,11 @@ fn query_workspace_member_packages(manifest_dir: &str) -> std::collections::Hash
 /// The topology dimension is [`crate::gauntlet::gauntlet_presets`], gated
 /// per scheduler: the verifier VM always runs no_perf_mode, so a preset
 /// is emitted only when the scheduler's constraints accept it under
-/// [`super::TopologyConstraints::accepts_no_perf_mode`] (declared scope +
-/// host CPU budget). A scheduler that accepts no preset emits no cell.
+/// [`super::TopologyConstraints::accepts_verifier`] — the verifier-only
+/// gate that ignores DEFAULT caps (so an untouched scheduler reaches the
+/// beyond-host battery shapes) and imposes NO host-size bound for the
+/// correctness-only verify cells. A scheduler that accepts no preset
+/// emits no cell.
 ///
 /// Schedulers declared with [`super::SchedulerSpec::Eevdf`] or
 /// [`super::SchedulerSpec::KernelBuiltin`] are skipped at emission time
@@ -1910,7 +1925,9 @@ fn list_verifier_cells_all() {
         return;
     }
     let presets = crate::gauntlet::gauntlet_presets();
-    let (host_cpus, _host_llcs, _host_max_cpus_per_llc) = super::host_capacity();
+    // No host_capacity() read here: verifier preset selection has no
+    // host-size bound (see accepts_verifier) — a battery shape lists on
+    // any host regardless of CPU count.
 
     // `cargo ktstr verifier --scheduler <NAME>` filter (via
     // KTSTR_VERIFIER_SCHEDULER): when set, sweep only the named declared
@@ -1977,10 +1994,12 @@ fn list_verifier_cells_all() {
             // scheduler that bakes topology-derived config into .rodata
             // hands the verifier different known constants, so it
             // processes a different instruction count per topology). The
-            // verifier VM always
-            // runs no_perf_mode, so preset eligibility uses
-            // accepts_no_perf_mode: the KVM-emulated topology is gated by
-            // the scheduler's declared scope + the host CPU budget.
+            // verifier VM always runs no_perf_mode, so preset eligibility
+            // uses accepts_verifier: the KVM-emulated topology is gated by
+            // the scheduler's declared scope, with DEFAULT caps treated as
+            // "no opinion" and NO host-size bound — the correctness-only
+            // verify cells tolerate overcommit at any ratio (storm-validated
+            // + progress-watchdog), so beyond-host shapes always enter.
             for preset in presets.iter() {
                 if preset.name.contains('/') {
                     eprintln!(
@@ -1989,10 +2008,7 @@ fn list_verifier_cells_all() {
                     );
                     continue;
                 }
-                if !sched
-                    .constraints
-                    .accepts_no_perf_mode(&preset.topology, host_cpus)
-                {
+                if !sched.constraints.accepts_verifier(&preset.topology) {
                     continue;
                 }
                 println!(
@@ -2193,7 +2209,10 @@ fn run_verifier_cell_inner(
             }
         }
     };
-    let topology = super::TopologyJson::from(preset.topology);
+    // Pass the preset's Topology directly (uneven-11llc's per-LLC core
+    // counts must survive into the guest CPUID; the TopologyJson wire
+    // shape would drop them).
+    let topology = preset.topology;
     let sched_args: Vec<String> = sched.sched_args.iter().map(|s| s.to_string()).collect();
 
     // Raw mode is opt-in via the dispatcher's --raw flag, plumbed
@@ -2209,6 +2228,7 @@ fn run_verifier_cell_inner(
         &kernel_path,
         &sched_args,
         topology,
+        preset.forced_cpu_budget,
     ) {
         Ok(result) => {
             let output = crate::verifier::format_verifier_output("verifier", &result, raw);

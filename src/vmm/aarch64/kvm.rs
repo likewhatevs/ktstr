@@ -682,6 +682,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 128, false);
         assert!(vm.is_ok(), "VM creation failed: {:?}", vm.err());
@@ -698,6 +699,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 256, false);
         assert!(vm.is_ok(), "multi-LLC VM creation failed: {:?}", vm.err());
@@ -714,6 +716,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 64, false);
         assert!(vm.is_ok());
@@ -730,6 +733,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 256, false).unwrap();
         let total: u64 = vm.guest_mem.iter().map(|r| r.len()).sum();
@@ -746,6 +750,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         let region = vm.guest_mem.iter().next().unwrap();
@@ -765,6 +770,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         assert!(vm.has_immediate_exit);
@@ -827,6 +833,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert_eq!(topo.total_cpus(), MAX_VCPUS + 1);
         // `let Err` rather than `expect_err` (which needs the Ok type

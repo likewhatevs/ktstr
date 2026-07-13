@@ -436,6 +436,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let topo2 = Topology {
             llcs: 4,
@@ -444,6 +445,7 @@ mod tests {
             numa_nodes: 2,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let f1 = extract_features(&entry, &topo1, false, "numa_test");
         let f2 = extract_features(&entry, &topo2, false, "numa_test");
@@ -466,6 +468,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let features = extract_features(&entry, &topo, false, "basic_test");
         // Should have bits set for scheduler hash, cpu bucket 0 (2 CPUs),
@@ -487,6 +490,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let features = extract_features(&entry, &topo, false, "smt_test");
         assert_ne!(features & (1 << SMT_SHIFT), 0);
@@ -502,6 +506,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let features = extract_features(&entry, &topo, true, "gauntlet_test");
         assert_ne!(features & (1 << GAUNTLET_SHIFT), 0);
@@ -548,6 +553,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let smt_topo = Topology {
             llcs: 1,
@@ -556,6 +562,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
 
         // List every one-bit feature flag. Each row: (shift,
@@ -946,6 +953,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         // boot_overhead = 10 + 0 = 10, duration = 2, settle = 2
         assert_eq!(estimate_duration(&entry, &topo), 14.0);
@@ -964,6 +972,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         // 252 CPUs: boot_overhead = 10 + (252-16)/10 = 10 + 23 = 33
         // duration = 5, settle = 2 -> 40.0
@@ -984,6 +993,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         // boot_overhead = 10, duration = 2, settle = 2, perf = 3
         assert_eq!(estimate_duration(&entry, &topo), 17.0);
@@ -1228,6 +1238,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         // host_only: no VM boot overhead, just duration + 2
         assert_eq!(estimate_duration(&entry, &topo), 7.0);

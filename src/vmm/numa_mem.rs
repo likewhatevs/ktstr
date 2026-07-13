@@ -1303,6 +1303,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let layout = NumaMemoryLayout::compute(&topo, 8192, 0, X86_GAP).unwrap();
         let top = layout.top_gpa();

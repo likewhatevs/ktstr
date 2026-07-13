@@ -2475,6 +2475,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let result = build_vm_builder_base(
             &entry,
@@ -2627,6 +2628,7 @@ mod tests {
                 numa_nodes: 1,
                 nodes: None,
                 distances: None,
+                llc_cores: None,
             },
             ..KtstrTestEntry::DEFAULT
         };
@@ -2791,6 +2793,7 @@ mod tests {
                 numa_nodes: 1,
                 nodes: None,
                 distances: None,
+                llc_cores: None,
             },
             ..KtstrTestEntry::DEFAULT
         };
@@ -3039,6 +3042,7 @@ mod tests {
                 numa_nodes: 1,
                 nodes: None,
                 distances: None,
+                llc_cores: None,
             },
             constraints: TopologyConstraints::DEFAULT,
             config_file: None,
@@ -3097,6 +3101,7 @@ mod tests {
                 numa_nodes: 1,
                 nodes: None,
                 distances: None,
+                llc_cores: None,
             },
             constraints: TopologyConstraints::DEFAULT,
             config_file: None,

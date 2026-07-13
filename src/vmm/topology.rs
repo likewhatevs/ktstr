@@ -13,7 +13,12 @@ pub struct Topology {
     /// Total number of last-level caches across the whole VM; must be
     /// a multiple of `numa_nodes` when `nodes` is `None`.
     pub llcs: u32,
-    /// Physical cores grouped into each LLC.
+    /// Physical cores grouped into each LLC. When `llc_cores` is `Some`,
+    /// this is the PACKING WIDTH (the max per-LLC core count): the APIC
+    /// ID block reserved for every LLC is sized to `cores_per_llc`, and
+    /// individual LLCs populate only their `llc_cores[i]` cores within
+    /// that block. When `llc_cores` is `None` (the uniform default),
+    /// every LLC has exactly `cores_per_llc` cores.
     pub cores_per_llc: u32,
     /// Hardware threads exposed per core (`1` = no SMT, `2` = SMT-2).
     pub threads_per_core: u32,
@@ -28,6 +33,19 @@ pub struct Topology {
     /// 10 (local) / 20 (remote). When `Some`, the matrix dimension
     /// must equal `numa_nodes`.
     pub distances: Option<&'static NumaDistance>,
+    /// Per-LLC core count for NON-UNIFORM LLC sizing. `None` (the
+    /// default) means every LLC is uniform with `cores_per_llc` cores.
+    /// `Some(slice)` declares an uneven machine: `slice.len()` must
+    /// equal `llcs`, each entry must be in `1..=cores_per_llc`, and LLC
+    /// `i` gets `slice[i]` cores (`slice[i] * threads_per_core` logical
+    /// CPUs). The guest observes the uneven layout because APIC IDs are
+    /// packed into fixed-width per-LLC blocks (width = `cores_per_llc`)
+    /// but populated only up to each LLC's `slice[i]` — the same sparse
+    /// APIC-block mechanism a power-of-two-rounded uniform LLC already
+    /// uses, so no new ACPI/CPUID surface is required. Models chips
+    /// whose LLCs are not all the same size, the case that breaks
+    /// scheduler per-LLC math assuming equal-sized caches.
+    pub llc_cores: Option<&'static [u32]>,
 }
 
 /// Per-NUMA-node configuration.
@@ -374,6 +392,7 @@ impl std::str::FromStr for Topology {
             numa_nodes,
             nodes: None,
             distances: None,
+            llc_cores: None,
         })
     }
 }
@@ -393,6 +412,7 @@ impl Topology {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
 
     /// Validated const constructor for uniform topologies.
@@ -445,6 +465,7 @@ impl Topology {
             numa_nodes,
             nodes: None,
             distances: None,
+            llc_cores: None,
         }
     }
 
@@ -512,6 +533,7 @@ impl Topology {
             numa_nodes: nodes.len() as u32,
             nodes: Some(nodes),
             distances: None,
+            llc_cores: None,
         }
     }
 
@@ -595,12 +617,49 @@ impl Topology {
             }
             d.validate()?;
         }
+        if let Some(llc_cores) = self.llc_cores {
+            // len must equal llcs; each entry in 1..=cores_per_llc so the
+            // per-LLC APIC block (width = cores_per_llc) can hold it. The
+            // packing-width invariant is what keeps guest LLC grouping
+            // (apicid >> core_shift) correct across uneven LLCs.
+            if llc_cores.len() != self.llcs as usize {
+                return Err(format!(
+                    "llc_cores.len() ({}) must equal llcs ({})",
+                    llc_cores.len(),
+                    self.llcs,
+                ));
+            }
+            for (i, &cores) in llc_cores.iter().enumerate() {
+                if cores == 0 {
+                    return Err(format!("llc_cores[{i}] must be > 0"));
+                }
+                if cores > self.cores_per_llc {
+                    return Err(format!(
+                        "llc_cores[{i}] ({cores}) exceeds cores_per_llc packing width ({})",
+                        self.cores_per_llc,
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
-    /// Total vCPU count = `llcs * cores_per_llc * threads_per_core`.
+    /// Total vCPU count. Uniform: `llcs * cores_per_llc *
+    /// threads_per_core`. Non-uniform (`llc_cores` set): `(sum of
+    /// per-LLC cores) * threads_per_core`.
     pub fn total_cpus(&self) -> u32 {
-        self.llcs * self.cores_per_llc * self.threads_per_core
+        match self.llc_cores {
+            None => self.llcs * self.cores_per_llc * self.threads_per_core,
+            Some(cores) => cores.iter().sum::<u32>() * self.threads_per_core,
+        }
+    }
+
+    /// Cores in LLC `i`: `cores_per_llc` uniform, else `llc_cores[i]`.
+    pub fn cores_in_llc(&self, llc: u32) -> u32 {
+        match self.llc_cores {
+            None => self.cores_per_llc,
+            Some(cores) => cores[llc as usize],
+        }
     }
 
     /// Number of LLC domains in the topology.
@@ -747,13 +806,41 @@ impl Topology {
     }
 
     /// Decompose a logical CPU ID into (llc, core, thread).
+    ///
+    /// CPU IDs are dense (`0..total_cpus`) and laid out LLC-major. For
+    /// the uniform layout this is plain division. For a non-uniform
+    /// (`llc_cores`) machine the LLC boundaries fall at the running
+    /// prefix sums of `llc_cores[i] * threads_per_core`, so the LLC is
+    /// found by walking those prefix sums; `core_id` is always in
+    /// `0..cores_in_llc(llc)` and packs into that LLC's fixed-width
+    /// APIC block in the x86_64 `apic_id` synthesis.
     pub fn decompose(&self, cpu_id: u32) -> (u32, u32, u32) {
         let threads = self.threads_per_core;
-        let cores = self.cores_per_llc;
         let thread_id = cpu_id % threads;
-        let core_id = (cpu_id / threads) % cores;
-        let llc_id = cpu_id / (threads * cores);
-        (llc_id, core_id, thread_id)
+        match self.llc_cores {
+            None => {
+                let cores = self.cores_per_llc;
+                let core_id = (cpu_id / threads) % cores;
+                let llc_id = cpu_id / (threads * cores);
+                (llc_id, core_id, thread_id)
+            }
+            Some(llc_cores) => {
+                let mut remaining = cpu_id / threads; // core index, LLC-major
+                for (llc, &cores) in llc_cores.iter().enumerate() {
+                    if remaining < cores {
+                        return (llc as u32, remaining, thread_id);
+                    }
+                    remaining -= cores;
+                }
+                // cpu_id >= total_cpus: mirror the uniform path's
+                // wrap-free arithmetic by attributing overflow to the
+                // last LLC. Callers never pass out-of-range IDs (the
+                // vCPU loop is `0..total_cpus`); validate() guarantees
+                // a non-empty llc_cores.
+                let last = llc_cores.len() as u32 - 1;
+                (last, remaining, thread_id)
+            }
+        }
     }
 }
 
@@ -770,6 +857,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert_eq!(t.total_cpus(), 16);
     }
@@ -783,6 +871,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert_eq!(t.num_llcs(), 3);
     }
@@ -796,6 +885,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert_eq!(t.decompose(0), (0, 0, 0));
         assert_eq!(t.decompose(1), (0, 0, 1));
@@ -816,6 +906,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert_eq!(t.decompose(0), (0, 0, 0));
         assert_eq!(t.decompose(3), (0, 3, 0));
@@ -832,9 +923,70 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert_eq!(t.decompose(0), (0, 0, 0));
         assert_eq!(t.decompose(3), (0, 3, 0));
+    }
+
+    #[test]
+    fn non_uniform_llc_cores_total_and_partition() {
+        // uneven-11llc's shape: ten LLCs of 9 cores + one of 6, SMT-2.
+        static CORES: [u32; 11] = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 6];
+        let t = Topology {
+            llcs: 11,
+            cores_per_llc: 9, // packing width (max per-LLC core count)
+            threads_per_core: 2,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+            llc_cores: Some(&CORES),
+        };
+        t.validate().expect("uneven topology must validate");
+        assert_eq!(t.total_cpus(), 192); // (9*10 + 6) * 2
+        // decompose partitions the dense 0..192 CPU space into 11 LLCs
+        // sized {18 x10, 12 x1} — the guest-visible uneven layout.
+        let mut sizes = vec![0u32; 11];
+        let mut prev_llc = 0;
+        for cpu in 0..t.total_cpus() {
+            let (llc, core, thread) = t.decompose(cpu);
+            assert!(llc < 11);
+            assert!(core < t.cores_in_llc(llc));
+            assert!(thread < 2);
+            // LLC index is monotonic non-decreasing over dense cpu_ids.
+            assert!(llc >= prev_llc);
+            prev_llc = llc;
+            sizes[llc as usize] += 1;
+        }
+        assert_eq!(sizes.iter().filter(|&&s| s == 18).count(), 10);
+        assert_eq!(sizes.iter().filter(|&&s| s == 12).count(), 1);
+        assert_eq!(sizes.iter().sum::<u32>(), 192);
+    }
+
+    #[test]
+    fn non_uniform_llc_cores_validate_rejects_bad() {
+        static BAD_LEN: [u32; 3] = [4, 4, 4];
+        let t = Topology {
+            llcs: 4, // len 3 != 4
+            cores_per_llc: 4,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+            llc_cores: Some(&BAD_LEN),
+        };
+        assert!(t.validate().is_err());
+        static OVER_WIDTH: [u32; 2] = [4, 5]; // 5 > packing width 4
+        let t = Topology {
+            llcs: 2,
+            cores_per_llc: 4,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+            llc_cores: Some(&OVER_WIDTH),
+        };
+        assert!(t.validate().is_err());
     }
 
     #[test]
@@ -846,6 +998,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         for llc in 0..4 {
             assert_eq!(t.numa_node_of(llc), 0);
@@ -861,6 +1014,7 @@ mod tests {
             numa_nodes: 2,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert_eq!(t.llcs_per_numa_node(), 2);
         assert_eq!(t.numa_node_of(0), 0);
@@ -896,6 +1050,7 @@ mod tests {
             numa_nodes: 3,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert_eq!(t.num_numa_nodes(), 3);
         assert_eq!(t.llcs_per_numa_node(), 2);
@@ -920,6 +1075,7 @@ mod tests {
             numa_nodes: 0,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         t.llcs_per_numa_node();
     }
@@ -935,6 +1091,7 @@ mod tests {
             numa_nodes: 2,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         t.llcs_per_numa_node();
     }
@@ -965,6 +1122,7 @@ mod tests {
             numa_nodes: 2,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert!(t.validate().is_ok());
     }
@@ -978,6 +1136,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let err = t.validate().unwrap_err();
         assert!(err.contains("llcs must be > 0"), "got: {err}");
@@ -992,6 +1151,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let err = t.validate().unwrap_err();
         assert!(err.contains("cores_per_llc must be > 0"), "got: {err}");
@@ -1006,6 +1166,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let err = t.validate().unwrap_err();
         assert!(err.contains("threads_per_core must be > 0"), "got: {err}");
@@ -1020,6 +1181,7 @@ mod tests {
             numa_nodes: 0,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let err = t.validate().unwrap_err();
         assert!(err.contains("numa_nodes must be > 0"), "got: {err}");
@@ -1034,6 +1196,7 @@ mod tests {
             numa_nodes: 2,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let err = t.validate().unwrap_err();
         assert!(err.contains("divisible"), "got: {err}");
@@ -1093,6 +1256,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let err = t.validate().unwrap_err();
         assert!(err.contains("overflows"), "got: {err}");
@@ -1107,6 +1271,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert_eq!(t.to_string(), "1n2l4c2t");
     }
@@ -1120,6 +1285,7 @@ mod tests {
             numa_nodes: 2,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert_eq!(t.to_string(), "2n4l8c2t");
     }
@@ -1418,6 +1584,7 @@ mod tests {
             numa_nodes: 2,
             nodes: Some(&BAD),
             distances: None,
+            llc_cores: None,
         };
         let err = t.validate().unwrap_err();
         assert!(err.contains("sum of node LLCs"), "got: {err}");
@@ -1432,6 +1599,7 @@ mod tests {
             numa_nodes: 3,
             nodes: Some(&TWO_NODES),
             distances: None,
+            llc_cores: None,
         };
         let err = t.validate().unwrap_err();
         assert!(err.contains("nodes.len()"), "got: {err}");
@@ -1447,6 +1615,7 @@ mod tests {
             numa_nodes: 2,
             nodes: None,
             distances: Some(&BAD_DIST),
+            llc_cores: None,
         };
         let err = t.validate().unwrap_err();
         assert!(err.contains("dimension"), "got: {err}");
@@ -1462,6 +1631,7 @@ mod tests {
             numa_nodes: 2,
             nodes: Some(&BAD),
             distances: None,
+            llc_cores: None,
         };
         let err = t.validate().unwrap_err();
         assert!(err.contains("zero memory"), "got: {err}");

@@ -13,6 +13,7 @@ fn leaf_80000008_amd_topology() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -54,6 +55,7 @@ fn leaf_8000001e_amd_extended_apic() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
 
     // Check CPU 0
@@ -114,6 +116,7 @@ fn leaf_8000001e_multi_numa_node_id() {
         numa_nodes: 2,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let base = kvm
         .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -155,6 +158,7 @@ fn leaf_80000008_single_cpu() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -185,6 +189,7 @@ fn leaf1f_matches_leaf0b() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -223,6 +228,7 @@ fn leaf1_htt_not_set_for_single_cpu() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -255,6 +261,7 @@ fn leaf_80000001_cmplegacy_and_topoext_multi_cpu() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -288,6 +295,7 @@ fn leaf_80000001_not_set_for_single_cpu() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -350,6 +358,7 @@ fn leaf_80000008_apic_id_size_representative() {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let cpuid = generate_cpuid(
             kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -472,6 +481,7 @@ fn brand_string_not_clobbered() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -523,6 +533,7 @@ fn vendor_conditional_leaf4_on_intel() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -566,6 +577,7 @@ fn vendor_conditional_leaf8000001e_on_amd() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -605,6 +617,7 @@ fn vendor_conditional_leaf8000001d_on_amd() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -654,6 +667,7 @@ fn leaf8000001d_l1_l2_sharing_per_core() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -698,6 +712,7 @@ fn leaf8000001d_cache_ids_differ_across_llcs() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     // Generate CPUID for cpu 0 (LLC 0) and cpu 4 (LLC 1)
     let cpuid0 = generate_cpuid(
@@ -787,6 +802,7 @@ fn cache_ids_distinct_per_llc_representative() {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let cpus_per_llc = cores * threads;
 
@@ -845,6 +861,7 @@ fn leaf0b_core_subleaf_emitted_both_vendors() {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let cpuid = generate_cpuid(&base, &topo, 0, false);
         // The Core (index 1) subleaf MUST be present (not vacuous).
@@ -912,6 +929,7 @@ fn amd_cache_leaves_synthesized_host_independent() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(&base, &topo, 0, false);
     // L1d(0), L1i(1), L2(2), L3(3) chain must be emitted in order.
@@ -988,6 +1006,7 @@ fn amd_cache_0x8000001d_edx_flags_pinned() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(&base, &topo, 0, false);
     // (type, level, edx) per subleaf index 0..3 — type from EAX[4:0],
@@ -1034,6 +1053,7 @@ fn leaf_80000006_synthesized_when_absent() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(&base, &topo, 0, false);
     let l6 = cpuid
@@ -1055,6 +1075,7 @@ fn max_apic_id_single_cpu() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     assert_eq!(max_apic_id(&t), 0);
 }
@@ -1068,6 +1089,7 @@ fn max_apic_id_equals_last_cpu() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     assert_eq!(max_apic_id(&t), apic_id(&t, t.total_cpus() - 1));
 }
@@ -1082,6 +1104,7 @@ fn max_apic_id_large_topology() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     // core_bits = bits_needed(9) = 4, thread_bits = 1
     // last cpu = 251: LLC 13, core 8, thread 1
@@ -1099,6 +1122,7 @@ fn topology_single_thread_per_core() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     assert_eq!(smt_shift(&t), 0);
     // APIC IDs should still be unique
@@ -1116,6 +1140,7 @@ fn topology_1x1x1() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     assert_eq!(t.total_cpus(), 1);
     assert_eq!(apic_id(&t, 0), 0);
@@ -1135,6 +1160,7 @@ fn kvm_hints_realtime_set_in_performance_mode() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1182,6 +1208,7 @@ fn kvm_hints_realtime_not_set_without_performance_mode() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1233,6 +1260,7 @@ fn msi_ext_dest_id_set_for_wide_topology() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     // Precondition: this topology actually exceeds the xAPIC limit.
     assert!(
@@ -1291,6 +1319,7 @@ fn msi_ext_dest_id_absent_for_narrow_topology() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     assert!(max_apic_id(&narrow) <= crate::vmm::x86_64::kvm::MAX_XAPIC_ID);
     let cpuid = generate_cpuid(&base, &narrow, 0, false);
@@ -1348,6 +1377,7 @@ fn kvm_hints_realtime_preserves_other_edx_bits() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(&base, &topo, 0, true);
     let entry = cpuid

@@ -309,6 +309,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let mpidr = mpidr_from_topology(&t, 0);
         assert_eq!(mpidr & MPIDR_AFF_MASK, 0);
@@ -324,6 +325,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         // cpu 0: LLC 0, core 0, thread 0
         let m0 = mpidr_from_topology(&t, 0);
@@ -379,6 +381,7 @@ mod tests {
                 numa_nodes: 1,
                 nodes: None,
                 distances: None,
+                llc_cores: None,
             };
             let mpidrs: Vec<u64> = (0..t.total_cpus())
                 .map(|i| mpidr_from_topology(&t, i))
@@ -401,6 +404,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         for cpu in 0..t.total_cpus() {
             let mpidr = mpidr_from_topology(&t, cpu);
@@ -425,6 +429,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         for cpu in 0..t.total_cpus() {
             let (llc, core, thread) = t.decompose(cpu);

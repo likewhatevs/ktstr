@@ -905,16 +905,21 @@ pub fn collect_verifier_output(
     ktstr_bin: &std::path::Path,
     kernel: &std::path::Path,
     extra_sched_args: &[String],
-    topology: crate::test_support::TopologyJson,
+    topology: crate::vmm::topology::Topology,
+    forced_cpu_budget: Option<u32>,
 ) -> anyhow::Result<VerifierVmResult> {
     use anyhow::Context;
 
-    // Pre-validate via TryFrom so a clean "topology rejected" error
-    // surfaces here instead of the builder's Topology::new panic on
-    // bad input.
-    let validated: crate::vmm::topology::Topology = topology
-        .try_into()
-        .map_err(|e: String| anyhow::anyhow!("invalid topology {topology:?}: {e}"))?;
+    // Take the Topology directly (not the lossy TopologyJson wire shape,
+    // which drops `nodes` / `distances` / `llc_cores`): a preset like
+    // uneven-11llc carries per-LLC core counts that MUST reach the guest
+    // CPUID synthesis, so round-tripping through TopologyJson here would
+    // silently boot a uniform shape instead. Validate directly so a bad
+    // topology surfaces a clean error instead of the builder's panic.
+    let validated = topology;
+    validated
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid topology {validated:?}: {e}"))?;
 
     let sched_args: Vec<String> = extra_sched_args.to_vec();
 
@@ -957,7 +962,7 @@ pub fn collect_verifier_output(
     // builder and `run` consumes the boot. Every other failure returns
     // on the first attempt — the retry keys strictly on the marker.
     let result = crate::test_support::run_vm_with_ap_gap_retry(|| {
-        let vm = crate::vmm::KtstrVm::builder()
+        let mut builder = crate::vmm::KtstrVm::builder()
             .kernel(kernel)
             // Prebuilt distro kernels ship virtio as modules; embed the
             // ordered boot-module set from the cache entry (no-op for built
@@ -987,9 +992,26 @@ pub fn collect_verifier_output(
                 validated.total_cpus(),
             ))
             .workload_duration(crate::test_support::runtime::VERIFIER_WORKLOAD_BUDGET)
-            .no_perf_mode(true)
-            .build()
-            .context("build verifier VM")?;
+            .no_perf_mode(true);
+        // A preset with a forced CPU budget (uneven-11llc) pins the
+        // no-perf mask to that many host CPUs so its vCPUs ALWAYS
+        // overcommit — the deliberate, continuous time-slicing path.
+        // Absent (every stock preset) leaves budget auto-sized to the
+        // vCPU count, unchanged. no_perf_mode is already set above, so
+        // cpu_budget is on its valid path.
+        //
+        // Clamp to the host's allowed CPUs: the forced budget exists to
+        // FORCE overcommit, so on a host smaller than the budget it must
+        // COLLAPSE to what is available (deeper overcommit — e.g. 192
+        // vCPUs over 64 CPUs = 3x on this dev box) rather than hard-error
+        // the way an explicit per-test `cpu_budget` would. That collapse
+        // is the intended, storm-validated behavior. `.max(1)` guards the
+        // barely-runnable host whose allowed set reads empty.
+        if let Some(budget) = forced_cpu_budget {
+            let allowed = crate::vmm::host_topology::host_allowed_cpus().len().max(1) as u32;
+            builder = builder.cpu_budget(budget.min(allowed));
+        }
+        let vm = builder.build().context("build verifier VM")?;
 
         vm.run().context("run verifier VM")
     })?;

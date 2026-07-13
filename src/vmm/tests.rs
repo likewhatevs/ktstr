@@ -227,6 +227,7 @@ fn ap_mp_state_set_correctly() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let vm = kvm::KtstrKvm::new(topo, 128, false).unwrap();
     for vcpu in &vm.vcpus[1..] {
@@ -493,6 +494,7 @@ fn kvm_has_immediate_exit_cap() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
     // KVM_CAP_IMMEDIATE_EXIT has been available since Linux 4.12.

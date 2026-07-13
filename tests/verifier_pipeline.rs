@@ -28,7 +28,8 @@ fn __ktstr_inner_demo_verifier_brief(_ctx: &Ctx) -> Result<AssertResult> {
         &ktstr_bin,
         &kernel,
         &[],
-        ktstr::test_support::TopologyJson::SINGLE_CPU,
+        ktstr::test_support::Topology::new(1, 1, 1, 1),
+        None,
     )?;
     let output = ktstr::verifier::format_verifier_output("scx-ktstr", &result, false);
     anyhow::ensure!(
@@ -65,14 +66,16 @@ fn __ktstr_inner_demo_verifier_diff(_ctx: &Ctx) -> Result<AssertResult> {
         &ktstr_bin,
         &kernel,
         &[],
-        ktstr::test_support::TopologyJson::SINGLE_CPU,
+        ktstr::test_support::Topology::new(1, 1, 1, 1),
+        None,
     )?;
     let result_b = ktstr::verifier::collect_verifier_output(
         &sched_bin,
         &ktstr_bin,
         &kernel,
         &[],
-        ktstr::test_support::TopologyJson::SINGLE_CPU,
+        ktstr::test_support::Topology::new(1, 1, 1, 1),
+        None,
     )?;
     let output = ktstr::verifier::format_verifier_diff(
         "scx-ktstr",
@@ -112,7 +115,8 @@ fn __ktstr_inner_verifier_cycle_collapse(_ctx: &Ctx) -> Result<AssertResult> {
         &ktstr_bin,
         &kernel,
         &sched_args,
-        ktstr::test_support::TopologyJson::SINGLE_CPU,
+        ktstr::test_support::Topology::new(1, 1, 1, 1),
+        None,
     )?;
     // The test scheduler (like most scx schedulers) logs through the
     // log crate, so the libbpf verifier trace lands on the live STDERR

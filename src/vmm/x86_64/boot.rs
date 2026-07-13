@@ -815,6 +815,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_lapic(&vm.vcpus[0], true).unwrap();
@@ -844,6 +845,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_lapic(&vm.vcpus[1], false).unwrap();

@@ -260,6 +260,7 @@ impl Default for KtstrVmBuilder {
                 numa_nodes: 1,
                 nodes: None,
                 distances: None,
+                llc_cores: None,
             },
             memory_mib: Some(256),
             memory_min_mib: 0,

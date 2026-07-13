@@ -174,6 +174,7 @@ fn apic_ids_unique() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let ids: Vec<u32> = (0..t.total_cpus()).map(|i| apic_id(&t, i)).collect();
     let unique: std::collections::HashSet<u32> = ids.iter().copied().collect();
@@ -189,6 +190,7 @@ fn apic_ids_smt_siblings_adjacent() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     // SMT siblings should differ only in thread_id bits
     let smt_mask = (1u32 << smt_shift(&t)) - 1;
@@ -215,6 +217,7 @@ fn apic_ids_same_llc_share_upper_bits() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let pkg_mask = !((1u32 << core_shift(&t)) - 1);
     let cpus_per_llc = t.cores_per_llc * t.threads_per_core;
@@ -244,6 +247,7 @@ fn smt_shift_values() {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         }),
         0
     );
@@ -255,6 +259,7 @@ fn smt_shift_values() {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         }),
         1
     );
@@ -266,6 +271,7 @@ fn smt_shift_values() {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         }),
         2
     );
@@ -282,6 +288,7 @@ fn core_shift_values() {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         }),
         2
     );
@@ -294,6 +301,7 @@ fn core_shift_values() {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         }),
         3
     );
@@ -312,6 +320,7 @@ fn generate_cpuid_produces_entries() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -344,6 +353,7 @@ fn generate_cpuid_different_per_vcpu() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid0 = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -382,6 +392,7 @@ fn topology_odd_counts() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     assert_eq!(t.total_cpus(), 9);
     let ids: Vec<u32> = (0..9).map(|i| apic_id(&t, i)).collect();
@@ -406,6 +417,7 @@ fn leaf1_lpc_is_package_total() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     assert_eq!(topo.total_cpus(), 32);
     let cpuid = generate_cpuid(
@@ -449,6 +461,7 @@ fn apic_ids_unique_representative_topologies() {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let ids: Vec<u32> = (0..t.total_cpus()).map(|i| apic_id(&t, i)).collect();
         let unique: std::collections::HashSet<u32> = ids.iter().copied().collect();
@@ -473,6 +486,7 @@ fn leaf0b_subleaf0_ebx_is_threads_per_core() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -510,6 +524,7 @@ fn leaf0b_subleaf1_core_spans_package() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -547,6 +562,7 @@ fn leaf0b_ecx_includes_subleaf_index() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -589,6 +605,7 @@ fn leaf4_l3_shared_within_llc() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -624,6 +641,7 @@ fn leaf4_core_ids_apic_space() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -661,6 +679,7 @@ fn leaf1_hypervisor_bit_set() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -693,6 +712,7 @@ fn leaf1_clflush_set() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -722,6 +742,7 @@ fn leaf_0xa_pmu_v2_synthesized() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -807,6 +828,7 @@ fn leaf_0xa_absent_from_base_stays_absent() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(&base, &topo, 0, false);
     assert!(
@@ -851,6 +873,7 @@ fn leaf_0xa_zero_version_preserved() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(&base, &topo, 0, false);
     let leaf_a = cpuid
@@ -901,6 +924,7 @@ fn leaf_0xa_nonzero_version_synthesized_to_v2() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(&base, &topo, 0, false);
     let leaf_a = cpuid
@@ -954,6 +978,7 @@ fn leaf_0xa_amd_vendor_same_synthesis() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(&base, &topo, 0, false);
     let leaf_a = cpuid
@@ -1023,6 +1048,7 @@ fn max_hypervisor_leaf_not_lowered_in_performance_mode() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(&base, &topo, 0, true);
     let leaf40 = cpuid
@@ -1048,6 +1074,7 @@ fn hypervisor_leaf_present() {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     };
     let cpuid = generate_cpuid(
         kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1081,6 +1108,7 @@ fn decompose_roundtrip_representative_topologies() {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         for cpu in 0..t.total_cpus() {
             let (s, c, th) = t.decompose(cpu);
@@ -1094,4 +1122,53 @@ fn decompose_roundtrip_representative_topologies() {
             );
         }
     }
+}
+
+/// Guest-observation proof for NON-UNIFORM LLC sizing (uneven-11llc).
+///
+/// The guest kernel groups CPUs into L3 (LLC) domains by
+/// `cache_id = apicid >> order(num_threads_sharing + 1)`. ktstr encodes
+/// `num_threads_sharing` for L3 from `core_shift` (globally, from the
+/// packing width `cores_per_llc`), so the guest's shift is exactly
+/// `core_shift(topo)`. Reproducing that grouping over the synthesized
+/// APIC IDs must yield 11 domains sized {18 x10, 12 x1}: the APIC blocks
+/// are fixed-width (one per LLC, width `2^core_shift`) but populated only
+/// up to each LLC's core count, so the short LLC lands in its own
+/// distinct, smaller domain. This is precisely what the guest's
+/// cacheinfo builds (the fat-L3 integration tests establish that guest
+/// /sys mirrors this grouping), so it proves the guest observes the
+/// declared uneven layout without booting a VM.
+#[test]
+fn uneven_llc_apic_grouping_yields_uneven_l3_domains() {
+    use std::collections::BTreeMap;
+    static CORES: [u32; 11] = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 6];
+    let t = Topology {
+        llcs: 11,
+        cores_per_llc: 9, // packing width
+        threads_per_core: 2,
+        numa_nodes: 1,
+        nodes: None,
+        distances: None,
+        llc_cores: Some(&CORES),
+    };
+    let shift = core_shift(&t); // == the guest's L3 cache_id shift
+    let mut domains: BTreeMap<u32, u32> = BTreeMap::new();
+    for cpu in 0..t.total_cpus() {
+        let cache_id = apic_id(&t, cpu) >> shift;
+        *domains.entry(cache_id).or_default() += 1;
+    }
+    // Exactly 11 distinct L3 domains, one per declared LLC.
+    assert_eq!(domains.len(), 11, "domains: {domains:?}");
+    let sizes: Vec<u32> = domains.values().copied().collect();
+    assert_eq!(
+        sizes.iter().filter(|&&s| s == 18).count(),
+        10,
+        "expected ten 18-CPU L3 domains: {domains:?}"
+    );
+    assert_eq!(
+        sizes.iter().filter(|&&s| s == 12).count(),
+        1,
+        "expected one 12-CPU L3 domain: {domains:?}"
+    );
+    assert_eq!(sizes.iter().sum::<u32>(), 192);
 }

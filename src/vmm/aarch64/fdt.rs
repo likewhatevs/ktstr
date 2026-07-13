@@ -667,6 +667,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         }
     }
 
@@ -796,6 +797,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert_eq!(topo.total_cpus(), 16);
         let mpidrs = fake_mpidrs(topo.total_cpus());
@@ -861,6 +863,7 @@ mod tests {
             numa_nodes: 2,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let dtb = test_fdt(&topo, &mpidrs, 512, "console=ttyS0", None, None, 2, false);
@@ -885,6 +888,7 @@ mod tests {
             numa_nodes: 3,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let memory_mib: u32 = 1024;
@@ -1125,6 +1129,7 @@ mod tests {
             numa_nodes: 2,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let dtb = test_fdt(&topo, &mpidrs, 512, "console=ttyS0", None, None, 2, false).unwrap();
@@ -1139,6 +1144,7 @@ mod tests {
             numa_nodes: 2,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let mpidrs_smt = fake_mpidrs(topo_smt.total_cpus());
         let dtb_smt = test_fdt(
@@ -1164,6 +1170,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 2, false).unwrap();
@@ -1269,6 +1276,7 @@ mod tests {
             numa_nodes: 2,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
 
@@ -1301,6 +1309,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let memory_mib: u32 = 512;
@@ -1364,6 +1373,7 @@ mod tests {
             numa_nodes: 3,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let dtb = test_fdt(&topo, &mpidrs, 1024, "console=ttyS0", None, None, 2, false).unwrap();
@@ -1409,6 +1419,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let dtb = test_fdt(&topo, &mpidrs, 512, "console=ttyS0", None, None, 3, false).unwrap();
@@ -1483,6 +1494,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
         let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 3, false).unwrap();

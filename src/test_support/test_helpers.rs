@@ -239,6 +239,7 @@ pub(crate) static SCHED_TEST: Scheduler = Scheduler {
         numa_nodes: 1,
         nodes: None,
         distances: None,
+        llc_cores: None,
     },
     constraints: TopologyConstraints::DEFAULT,
     config_file: None,

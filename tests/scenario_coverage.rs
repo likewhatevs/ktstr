@@ -14,6 +14,7 @@ const TOPO_1L_4C_1T: Topology = Topology {
     numa_nodes: 1,
     nodes: None,
     distances: None,
+    llc_cores: None,
 };
 
 // -- basic --

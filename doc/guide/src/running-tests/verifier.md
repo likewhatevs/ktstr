@@ -309,7 +309,34 @@ skipped — no userspace binary to verify). Kernels come from the
 operator's `--kernel` set; with no flag, one auto-discovered kernel is
 used. The topology axis is the set of
 [gauntlet presets](gauntlet.md#topology-presets) each scheduler's
-constraints accept.
+constraints accept — but the verifier applies a **looser** acceptance
+rule than the gauntlet, because a verifier cell only boots, attaches,
+verifies, and exits (no timing or perf assertions):
+
+- **Default caps carry no opinion.** For `max_numa_nodes`, `max_llcs`,
+  and `max_cpus`, a value left at the `TopologyConstraints` default
+  (`Some(1)` / `Some(12)` / `Some(192)`) is treated as "no cap" — a
+  scheduler that never narrowed these should not have the conservative
+  gauntlet ceiling silently shrink its battery. An **explicitly
+  declared non-default** cap is still respected. (Writing the default
+  value verbatim is indistinguishable from leaving it at default, so
+  both read as "no cap".) The `min_*` floors and `requires_smt` always
+  bind — they state test scope, not a ceiling.
+- **No host-size bound.** Unlike the gauntlet's strict `total_cpus <=
+  host_cpus`, verifier selection drops the host check entirely: a
+  battery shape lists on any host. vCPU overcommit at any ratio is the
+  supported, storm-validated regime (measured to ~36x sustained), the
+  progress watchdog's deadman scales with vCPU count, and forced-budget
+  shapes make deep overcommit the deliberately-exercised path.
+
+Two catalog shapes exist mainly for this wider battery: `numa2-2llc`
+(2 nodes, one LLC each, SMT) and `uneven-11llc` — 192 vCPUs across
+**non-uniform** LLCs (ten of 18 CPUs, one of 12) that breaks per-LLC
+math assuming equal-sized caches. `uneven-11llc` additionally carries a
+forced 96-CPU budget, so its 192 vCPUs **always** overcommit (>=2x,
+deeper on smaller hosts) — continuous exercise of the time-slicing path.
+It is verifier-only: its non-uniform layout cannot be expressed through
+the gauntlet execution path.
 
 Each scheduler's `kernels = [...]` declaration filters the
 operator-supplied kernel set:

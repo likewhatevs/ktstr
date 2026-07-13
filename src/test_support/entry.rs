@@ -1034,6 +1034,72 @@ impl TopologyConstraints {
             && topo.total_cpus() <= host_cpus
     }
 
+    /// Verifier-battery variant of [`Self::accepts_no_perf_mode`].
+    ///
+    /// The verifier sweep is correctness-only — boot, attach, verify,
+    /// exit — with NO timing or perf assertions, so it tolerates a
+    /// battery far wider than perf-mode gauntlet cells. Two departures
+    /// from `accepts_no_perf_mode`:
+    ///
+    /// 1. **DEFAULT caps carry no opinion.** For each of `max_numa_nodes`,
+    ///    `max_llcs`, `max_cpus`, a value equal to the corresponding
+    ///    [`Self::DEFAULT`] field is read as `None` (unbounded). The
+    ///    default caps are the *conservative gauntlet* ceiling, chosen to
+    ///    keep perf-mode cells within host capacity — a scheduler that
+    ///    never touched them expressed no verifier-scope opinion, and the
+    ///    verifier should not inherit that ceiling and silently shrink the
+    ///    battery. An explicitly declared NON-default cap IS respected (a
+    ///    deliberate scope statement). NOTE the indistinguishability: a
+    ///    scheduler that explicitly writes the default value (e.g.
+    ///    `max_cpus: Some(192)`) is byte-identical to one that left it at
+    ///    default, so both read as "no cap" — there is no way to
+    ///    explicitly re-assert the default as a hard verifier ceiling. The
+    ///    `min_*` floors and `requires_smt` are ALWAYS honored: they
+    ///    express test SCOPE (the smallest / SMT shape the author wants
+    ///    exercised), not a conservative ceiling.
+    ///
+    /// 2. **No host-size bound at all.** Unlike `accepts` /
+    ///    `accepts_no_perf_mode` (strict `<= host_cpus`), verifier preset
+    ///    selection drops the total-CPU-vs-host check ENTIRELY — no
+    ///    multiple, no ceiling. A battery shape lists on any host. The
+    ///    rationale: verifier cells are correctness-only; vCPU overcommit
+    ///    at any ratio is the storm-validated supported regime (measured
+    ///    to ~36x sustained on this branch), the progress-watchdog's
+    ///    Tier-3 deadman scales with vCPU count so a slow oversubscribed
+    ///    boot is progress-protected rather than deadline-raced, and the
+    ///    forced-budget presets (see
+    ///    [`crate::gauntlet::TopoPreset::forced_cpu_budget`]) make deep
+    ///    overcommit the deliberately-exercised path. `host_cpus` is
+    ///    therefore unused here. Gauntlet / test selection keeps its
+    ///    strict host gates untouched.
+    pub fn accepts_verifier(&self, topo: &Topology) -> bool {
+        // Left-at-default cap == no opinion. `DEFAULT` fields are the
+        // canonical const, so equality here means "the author did not
+        // deviate" (or wrote the default verbatim — indistinguishable).
+        let max_numa_nodes = if self.max_numa_nodes == Self::DEFAULT.max_numa_nodes {
+            None
+        } else {
+            self.max_numa_nodes
+        };
+        let max_llcs = if self.max_llcs == Self::DEFAULT.max_llcs {
+            None
+        } else {
+            self.max_llcs
+        };
+        let max_cpus = if self.max_cpus == Self::DEFAULT.max_cpus {
+            None
+        } else {
+            self.max_cpus
+        };
+        topo.num_numa_nodes() >= self.min_numa_nodes
+            && max_numa_nodes.is_none_or(|max| topo.num_numa_nodes() <= max)
+            && topo.num_llcs() >= self.min_llcs
+            && max_llcs.is_none_or(|max| topo.num_llcs() <= max)
+            && (!self.requires_smt || topo.threads_per_core >= 2)
+            && topo.total_cpus() >= self.min_cpus
+            && max_cpus.is_none_or(|max| topo.total_cpus() <= max)
+    }
+
     /// Reject inverted ranges (any `max_*` strictly less than the
     /// matching `min_*`). An inverted range cannot match ANY topology
     /// — [`Self::accepts`] / [`Self::accepts_no_perf_mode`] would
@@ -1335,6 +1401,7 @@ impl Scheduler {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         },
         constraints: TopologyConstraints::DEFAULT,
         config_file: None,
@@ -1396,6 +1463,7 @@ impl Scheduler {
                 numa_nodes: 1,
                 nodes: None,
                 distances: None,
+                llc_cores: None,
             },
             constraints: TopologyConstraints::DEFAULT,
             config_file: None,
@@ -1491,6 +1559,7 @@ impl Scheduler {
             numa_nodes,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         self
     }
@@ -2253,6 +2322,7 @@ impl KtstrTestEntry {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         },
         constraints: TopologyConstraints::DEFAULT,
         memory_mib: 2048,
@@ -2912,6 +2982,7 @@ impl TryFrom<TopologyJson> for Topology {
             numa_nodes: value.num_numa_nodes,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         topo.validate()?;
         Ok(topo)
@@ -3142,6 +3213,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         });
         (cgroups, topo)
     }
@@ -4213,6 +4285,7 @@ mod tests {
                 numa_nodes: 1,
                 nodes: None,
                 distances: None,
+                llc_cores: None,
             },
             constraints: TopologyConstraints::DEFAULT,
             config_file: None,
@@ -4296,6 +4369,7 @@ mod tests {
                 numa_nodes: 1,
                 nodes: None,
                 distances: None,
+                llc_cores: None,
             },
             constraints: TopologyConstraints::DEFAULT,
             config_file: None,
@@ -4935,6 +5009,96 @@ mod tests {
         assert!(!c.accepts(&t, 128, 16, 8));
     }
 
+    // -- TopologyConstraints::accepts_verifier --
+    //
+    // The two beyond-host battery shapes added alongside this gate.
+    // WIDE_192 stands in for uneven-11llc's gating dimensions (11 LLCs,
+    // 192 CPUs, 1 node, SMT — the gate reads only num_llcs/total_cpus/
+    // numa/threads, not the per-LLC unevenness). NUMA2_2LLC: 2 nodes,
+    // 2 LLCs, 32 CPUs, SMT.
+    const WIDE_192: fn() -> Topology = || Topology::new(1, 11, 9, 2); // 198 (>host)
+    const NUMA2_2LLC: fn() -> Topology = || Topology::new(2, 2, 8, 2); // 32, 2 nodes
+
+    #[test]
+    fn accepts_verifier_default_admits_any_host_no_bound() {
+        // DEFAULT caps (numa=1, llcs=12, cpus=192) are all "no opinion"
+        // under accepts_verifier, and there is NO host-size bound: the
+        // wide + multi-numa shapes list on ANY host, including a
+        // deliberately tiny one. host_cpus is not even an argument.
+        let c = TopologyConstraints::DEFAULT;
+        assert!(c.accepts_verifier(&WIDE_192()));
+        assert!(c.accepts_verifier(&NUMA2_2LLC()));
+        // A truly enormous shape still lists (no ceiling at all).
+        assert!(c.accepts_verifier(&Topology::new(1, 8, 200, 2))); // 3200 CPUs
+    }
+
+    #[test]
+    fn accepts_verifier_respects_explicit_non_default_cap() {
+        // An explicitly-declared non-default max_cpus IS honored: it is a
+        // deliberate scope statement, not the conservative default.
+        let c = TopologyConstraints {
+            max_cpus: Some(64),
+            ..TopologyConstraints::DEFAULT
+        };
+        assert!(!c.accepts_verifier(&WIDE_192())); // 198 > 64
+        // A non-default max_llcs likewise gates the wide LLC count.
+        let c = TopologyConstraints {
+            max_llcs: Some(4),
+            ..TopologyConstraints::DEFAULT
+        };
+        assert!(!c.accepts_verifier(&WIDE_192())); // 11 > 4
+    }
+
+    #[test]
+    fn accepts_verifier_honors_min_floors_and_smt() {
+        // min_* floors and requires_smt express test SCOPE and always
+        // gate, unlike the ignored default caps.
+        let c = TopologyConstraints {
+            min_cpus: 512,
+            ..TopologyConstraints::DEFAULT
+        };
+        assert!(!c.accepts_verifier(&WIDE_192())); // 198 < 512
+        let c = TopologyConstraints {
+            requires_smt: true,
+            ..TopologyConstraints::DEFAULT
+        };
+        // A non-SMT wide shape is rejected under requires_smt.
+        assert!(!c.accepts_verifier(&Topology::new(1, 11, 18, 1)));
+        assert!(c.accepts_verifier(&WIDE_192())); // SMT present
+    }
+
+    #[test]
+    fn accepts_verifier_explicit_default_value_reads_as_no_cap() {
+        // Writing the default value verbatim is indistinguishable from
+        // leaving it at default — both read as "no cap". A scheduler
+        // cannot re-assert the default as a hard verifier ceiling.
+        let c = TopologyConstraints {
+            max_cpus: Some(192),     // == DEFAULT.max_cpus
+            max_numa_nodes: Some(1), // == DEFAULT.max_numa_nodes
+            max_llcs: Some(12),      // == DEFAULT.max_llcs
+            ..TopologyConstraints::DEFAULT
+        };
+        assert!(c.accepts_verifier(&WIDE_192()));
+        assert!(c.accepts_verifier(&NUMA2_2LLC()));
+    }
+
+    #[test]
+    fn accepts_verifier_leaves_gauntlet_acceptance_unchanged() {
+        // Regression pin: the verifier relaxation must not leak into the
+        // perf-mode gauntlet gate. accepts / accepts_no_perf_mode keep
+        // their strict host bound and default caps exactly as before.
+        let c = TopologyConstraints::DEFAULT;
+        // 64-CPU host: strict <= host_cpus keeps both wide shapes out of
+        // the gauntlet even ignoring caps, and the caps reject them too.
+        assert!(!c.accepts_no_perf_mode(&WIDE_192(), 64));
+        assert!(!c.accepts_no_perf_mode(&NUMA2_2LLC(), 64));
+        assert!(!c.accepts(&WIDE_192(), 4096, 4096, 4096)); // cap: numa? no — llcs 11<=12, cpus 198>192
+        assert!(!c.accepts(&NUMA2_2LLC(), 4096, 4096, 4096)); // cap: numa 2>1
+        // And the classic default-active presets still pass unchanged.
+        assert!(c.accepts_no_perf_mode(&Topology::new(1, 8, 4, 2), 4096)); // medium-8llc
+        assert!(c.accepts(&Topology::new(1, 8, 4, 2), 4096, 4096, 4096));
+    }
+
     // -- TopologyConstraints::validate --
 
     #[test]
@@ -5085,6 +5249,7 @@ mod tests {
                 numa_nodes: 1,
                 nodes: None,
                 distances: None,
+                llc_cores: None,
             },
             constraints: TopologyConstraints {
                 min_llcs: 8,
@@ -5498,6 +5663,7 @@ mod tests {
             numa_nodes: 2,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let json: TopologyJson = topo.into();
         assert_eq!(json.num_numa_nodes, 2);

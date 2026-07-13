@@ -2140,6 +2140,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 128, false);
         assert!(vm.is_ok(), "VM creation failed: {:?}", vm.err());
@@ -2156,6 +2157,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 256, false);
         assert!(vm.is_ok(), "multi-LLC VM creation failed: {:?}", vm.err());
@@ -2172,6 +2174,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 64, false);
         assert!(vm.is_ok());
@@ -2187,6 +2190,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 512, false);
         assert!(vm.is_ok(), "large topology failed: {:?}", vm.err());
@@ -2202,6 +2206,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 128, false);
         assert!(vm.is_ok(), "odd topology failed: {:?}", vm.err());
@@ -2218,6 +2223,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 256, false).unwrap();
         let total: u64 = vm.guest_mem.iter().map(|r| r.len()).sum();
@@ -2250,6 +2256,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         // max APIC ID = apic_id(15) = 1<<3 | 3<<1 | 1 = 15, well under 254
         assert!(max_apic_id(&topo) <= MAX_XAPIC_ID);
@@ -2271,6 +2278,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert!(
             max_apic_id(&topo) > MAX_XAPIC_ID,
@@ -2304,6 +2312,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert!(
             max_apic_id(&small) <= MAX_XAPIC_ID,
@@ -2321,6 +2330,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         assert!(
             max_apic_id(&still_small) <= MAX_XAPIC_ID,
@@ -2348,6 +2358,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 128, true);
         assert!(
@@ -2366,6 +2377,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm_normal = KtstrKvm::new(topo, 256, false).unwrap();
         let vm_perf = KtstrKvm::new(topo, 256, true).unwrap();
@@ -2384,6 +2396,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 128, false);
         assert!(
@@ -2404,6 +2417,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         vm.set_halt_poll(0);
@@ -2439,6 +2453,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 64, true).unwrap();
         let clock = vm.vm_fd.get_clock().unwrap();
@@ -2492,6 +2507,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         let raw_fd = vm.vm_fd.as_raw_fd();
@@ -2525,6 +2541,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         let raw_fd = vm.vm_fd.as_raw_fd();
@@ -2554,6 +2571,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         let raw_fd = vm.vm_fd.as_raw_fd();
@@ -2587,6 +2605,7 @@ mod tests {
             numa_nodes: 1,
             nodes: None,
             distances: None,
+            llc_cores: None,
         };
         let vm = KtstrKvm::new(topo, 128, true);
         assert!(

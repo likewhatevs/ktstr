@@ -4,7 +4,7 @@ Some scheduler bugs only exist on topologies you don't develop on: a
 per-LLC work-splitting heuristic that breaks on an odd LLC count, an
 idle-core picker that lands both SMT siblings, a migration policy that
 never crosses a NUMA boundary. The gauntlet expands every
-`#[ktstr_test]` into one variant per topology preset — up to 24
+`#[ktstr_test]` into one variant per topology preset — up to 25
 presets (14 on aarch64) — so those bugs surface as a named, re-runnable
 test case instead of a production report.
 
@@ -78,10 +78,16 @@ the label format.
 > [!NOTE]
 > Multi-NUMA and scale-boundary presets are **opt-in**. The default
 > constraints (`max_numa_nodes = 1`, `max_llcs = 12`,
-> `max_cpus = 192`) exclude the five `numa*` presets plus
+> `max_cpus = 192`) exclude the six `numa*` presets plus
 > `near-max-llc`, `max-cpu`, and their `-nosmt` variants — 15 of the
-> 24 presets are active by default. Raise `max_numa_nodes`,
+> 25 gauntlet presets are active by default. Raise `max_numa_nodes`,
 > `max_llcs`, or `max_cpus` on the test to opt in.
+>
+> The catalog has one further preset, `uneven-11llc` (26 in all), that
+> is **verifier-only**: its non-uniform LLC sizing cannot be expressed
+> through the gauntlet execution path, so it never fans out as a
+> `gauntlet/…` variant — only the [BPF Verifier
+> Sweep](verifier.md) boots it.
 
 | Preset | Topology | CPUs | LLCs | NUMA | Description |
 |---|---|---|---|---|---|
@@ -98,12 +104,14 @@ the label format.
 | `large-8llc` | 1n8l8c2t | 128 | 8 | 1 | Large, many LLCs |
 | `near-max-llc` | 1n15l8c2t | 240 | 15 | 1 | Near maximum |
 | `max-cpu` | 1n14l9c2t | 252 | 14 | 1 | Near KVM vCPU limit |
+| `uneven-11llc` | 1n11l\*c2t | 192 | 11 | 1 | **Verifier-only.** Non-uniform LLCs — ten of 18 CPUs + one of 12. Forces continuous overcommit (`forced_cpu_budget = 96`) so 192 vCPUs always time-slice. Targets schedulers assuming equal-sized caches. |
 | `medium-4llc-nosmt` | 1n4l8c1t | 32 | 4 | 1 | Medium, no SMT |
 | `medium-8llc-nosmt` | 1n8l8c1t | 64 | 8 | 1 | Medium, many LLCs, no SMT |
 | `large-4llc-nosmt` | 1n4l32c1t | 128 | 4 | 1 | Large, no SMT |
 | `large-8llc-nosmt` | 1n8l16c1t | 128 | 8 | 1 | Large, many LLCs, no SMT |
 | `near-max-llc-nosmt` | 1n15l16c1t | 240 | 15 | 1 | Near maximum, no SMT |
 | `max-cpu-nosmt` | 1n14l18c1t | 252 | 14 | 1 | Near KVM vCPU limit, no SMT |
+| `numa2-2llc` | 2n2l8c2t | 32 | 2 | 2 | Multi-NUMA, 2 nodes, one LLC per node, SMT |
 | `numa2-4llc` | 2n4l4c1t | 16 | 4 | 2 | Multi-NUMA, 2 nodes |
 | `numa2-8llc` | 2n8l8c2t | 128 | 8 | 2 | Multi-NUMA, 2 nodes, SMT |
 | `numa2-8llc-nosmt` | 2n8l16c1t | 128 | 8 | 2 | Multi-NUMA, 2 nodes, no SMT |
@@ -113,7 +121,10 @@ the label format.
 Topology format: `{numa_nodes}n{llcs}l{cores_per_llc}c{threads_per_core}t`
 — `1n2l4c2t` is 1 NUMA node, 2 LLCs, 4 cores per LLC, 2 threads per
 core = 16 CPUs. Note that `llcs` is the total across the machine, not
-per node.
+per node. A `*` in the cores field (`1n11l*c2t`) marks a **non-uniform**
+machine whose LLCs are not all the same size — `uneven-11llc` is ten
+LLCs of 9 cores plus one of 6 (packing width 9); the guest observes the
+uneven layout via fixed-width, partially-populated APIC-ID blocks.
 
 **aarch64:** ARM64 CPUs do not have SMT. Presets with
 `threads_per_core > 1` are excluded on aarch64, leaving 14 presets
@@ -151,8 +162,9 @@ A test with `min_llcs = 2`, `requires_smt = true`, and default
   `max_cpus = 192` (also above default `max_llcs = 12`)
 - All `numa*` presets: excluded — above default `max_numa_nodes = 1`
 
-Result: 6 of 24 presets survive (`smt-2llc`, `smt-3llc`,
-`medium-4llc`, `medium-8llc`, `large-4llc`, `large-8llc`). On
+Result: 6 of 25 gauntlet presets survive (`smt-2llc`, `smt-3llc`,
+`medium-4llc`, `medium-8llc`, `large-4llc`, `large-8llc`).
+(`uneven-11llc` is verifier-only and never in the gauntlet count.) On
 aarch64, none survive — all aarch64 presets lack SMT.
 
 ### Variant count

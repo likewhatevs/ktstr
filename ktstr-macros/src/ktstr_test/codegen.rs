@@ -174,6 +174,9 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
             numa_nodes: #numa_nodes_tokens,
             nodes: None,
             distances: None,
+            // `#[ktstr_test]` declares only uniform topologies; non-uniform
+            // LLC sizing is a gauntlet-preset-only shape.
+            llc_cores: None,
         }
     };
 
