@@ -420,10 +420,18 @@ impl KtstrKvm {
             vcpus.push(vcpu);
         }
 
-        // Override CLIDR_EL1 on each vCPU to match the host's real
-        // cache topology. Must happen after vcpu_init and before FDT
-        // creation so CLIDR and DT cache nodes agree on leaf counts.
-        super::topology::override_clidr(&vcpus)
+        // Override CLIDR_EL1 on each vCPU to match the host's real cache
+        // topology. Must happen after vcpu_init and before FDT creation so
+        // CLIDR and DT cache nodes agree on leaf counts. Multi-LLC guests
+        // present their LLC as L3 (the FDT chain terminates at level 3), so
+        // cap CLIDR at 3 levels; single-LLC guests emit no DT cache chain
+        // and keep the host's real level count.
+        let clidr_max_level = if topo.llcs > 1 {
+            super::fdt::GUEST_LLC_CACHE_LEVEL
+        } else {
+            super::topology::MAX_CACHE_LEVEL
+        };
+        super::topology::override_clidr(&vcpus, clidr_max_level)
             .context("override CLIDR_EL1 to match host cache topology")?;
 
         // Create GICv3 via KVM_CREATE_DEVICE.

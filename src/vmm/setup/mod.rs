@@ -2284,7 +2284,6 @@ impl KtstrVm {
 
         let mpidrs =
             aarch64::topology::read_mpidrs(&vm.vcpus).context("read vCPU MPIDRs for FDT")?;
-        let hw_cache_level = aarch64::topology::host_cache_levels();
         let guest_l1_unified = aarch64::topology::host_l1_is_unified();
         let dtb = aarch64::fdt::create_fdt(
             &self.topology,
@@ -2293,7 +2292,6 @@ impl KtstrVm {
             &cmdline,
             initrd_addr,
             initrd_size,
-            hw_cache_level,
             guest_l1_unified,
             vm.numa_layout.as_ref().expect(
                 "numa_layout is Some by the time FDT creation runs: \

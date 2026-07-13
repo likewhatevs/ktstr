@@ -52,9 +52,12 @@ const IRQ_TYPE_LEVEL_HIGH: u32 = 4;
 /// The FDT cpu node `reg` properties use the affinity fields from these
 /// values, ensuring the FDT matches KVM's actual MPIDR assignment.
 ///
-/// When `topo.llcs > 1` and `hw_cache_level >= 2`, DT cache nodes
-/// are emitted so the guest kernel discovers per-LLC cache domains
-/// via `next-level-cache` phandle chains in `cache_setup_of_node`.
+/// When `topo.llcs > 1`, DT cache nodes are emitted so the guest kernel
+/// discovers per-LLC cache domains via `next-level-cache` phandle chains
+/// in `cache_setup_of_node`. The chain always terminates at an L3 node
+/// (see `write_cpus`), so a multi-LLC guest presents its LLC as a shared
+/// level-3 cache regardless of the host's real cache-level count —
+/// mirroring the x86 path, where the LLC is always synthesized as L3.
 ///
 /// `guest_l1_unified` indicates the host's L1 cache is unified (from
 /// sysfs). When true, CPU nodes get `cache-unified` so
@@ -73,7 +76,6 @@ pub fn create_fdt(
     cmdline: &str,
     initrd_addr: Option<u64>,
     initrd_size: Option<u32>,
-    hw_cache_level: u32,
     guest_l1_unified: bool,
     numa_layout: &NumaMemoryLayout,
     has_virtio_blk: bool,
@@ -101,7 +103,7 @@ pub fn create_fdt(
 
     // /cpus — one node per vCPU with MPIDR from KVM, plus cache
     // topology nodes when the topology has multiple LLCs.
-    write_cpus(&mut fdt, topo, mpidrs, hw_cache_level, guest_l1_unified)?;
+    write_cpus(&mut fdt, topo, mpidrs, guest_l1_unified)?;
 
     // /intc — GICv3
     let num_cpus = mpidrs.len() as u32;
@@ -348,15 +350,35 @@ fn write_memory(
 }
 
 /// Phandle base for cache nodes. GIC uses phandle 1.
-/// Grouped by LLC: each LLC's chain occupies `chain_depth` consecutive
-/// phandles starting at `BASE + llc * chain_depth`.
+/// Grouped by LLC: each LLC's chain occupies `CACHE_CHAIN_DEPTH`
+/// consecutive phandles starting at `BASE + llc * CACHE_CHAIN_DEPTH`.
 const CACHE_PHANDLE_BASE: u32 = GIC_PHANDLE + 1;
+
+/// Cache level at which a multi-LLC guest presents its LLC boundary.
+///
+/// Fixed at 3 (L3), mirroring x86 where the LLC is always synthesized as
+/// L3, so the guest's presented LLC level is decoupled from the host's
+/// real cache-level count (e.g. arm hosts with only L1+L2). Consumed by
+/// `override_clidr` to cap CLIDR_EL1 to the same depth.
+pub const GUEST_LLC_CACHE_LEVEL: u32 = 3;
+
+/// Non-L1 cache nodes emitted per LLC: an L2 node chaining to an L3
+/// terminal node (`CPU -> L2 -> L3`). The guest kernel assigns each leaf's
+/// level by its position in the `next-level-cache` chain
+/// (populate_cache_leaves counts up from 1), NOT from the DT `cache-level`
+/// property, so reaching level 3 requires two non-L1 hops. On hosts whose
+/// CLIDR_EL1 reports fewer than 3 levels, the guest kernel's
+/// init_cache_level extends the count from the DT chain via
+/// of_find_last_cache_level (the "unified external cache" path), so the L3
+/// still materializes. CLIDR is capped to `GUEST_LLC_CACHE_LEVEL` in
+/// `override_clidr` so hosts with MORE levels don't report leaves the DT
+/// chain lacks (which makes cache_setup_of_node bail and drop DT grouping).
+const CACHE_CHAIN_DEPTH: usize = (GUEST_LLC_CACHE_LEVEL - 1) as usize;
 
 fn write_cpus(
     fdt: &mut FdtWriter,
     topo: &Topology,
     mpidrs: &[u64],
-    hw_cache_level: u32,
     guest_l1_unified: bool,
 ) -> Result<()> {
     let cpus = fdt.begin_node("cpus").context("begin cpus")?;
@@ -366,16 +388,13 @@ fn write_cpus(
         .context("cpus #size-cells")?;
 
     // cache_setup_of_node() walks next-level-cache once per non-L1
-    // hardware cache level. With N levels from CLIDR_EL1, the chain
-    // needs N-1 hops (L1 leaves stay at the CPU node). Each LLC gets
-    // its own chain so CPUs sharing an LLC share the same phandles.
+    // cache leaf (L1 leaves stay at the CPU node). Each LLC gets its own
+    // CPU->L2->L3 chain so CPUs sharing an LLC share the same phandles;
     // cache_leaves_are_shared() compares fw_token pointers set by
-    // cache_setup_of_node() — shared phandles produce shared IDs.
-    let chain_depth = if topo.llcs > 1 && hw_cache_level >= 2 {
-        (hw_cache_level - 1) as usize
-    } else {
-        0
-    };
+    // cache_setup_of_node(), so shared phandles produce a shared L3
+    // domain. Single-LLC guests emit no cache nodes (no LLC boundary to
+    // describe); the guest falls back to CLIDR-only arch cache info.
+    let chain_depth = if topo.llcs > 1 { CACHE_CHAIN_DEPTH } else { 0 };
 
     for (cpu_id, &mpidr) in mpidrs.iter().enumerate() {
         let reg = mpidr_to_fdt_reg(mpidr) as u32;
@@ -426,10 +445,12 @@ fn write_cpus(
         fdt.end_node(cpu).context("end cpu")?;
     }
 
-    // Cache node chains: for each LLC, create `chain_depth` nodes
-    // at levels 2..=hw_cache_level. Each non-terminal node chains
-    // to the next via next-level-cache. The terminal node is the
-    // LLC boundary — CPUs sharing it are in the same LLC domain.
+    // Cache node chains: for each LLC, create `chain_depth` nodes at
+    // levels 2..=(chain_depth+1) — i.e. an L2 node and an L3 terminal.
+    // Each non-terminal node chains to the next via next-level-cache.
+    // The terminal (L3) node is the LLC boundary — CPUs sharing it are in
+    // the same LLC domain. `cache-level` here is descriptive metadata; the
+    // guest assigns leaf levels by chain position, not this property.
     for llc in 0..topo.llcs {
         for d in 0..chain_depth {
             let phandle = CACHE_PHANDLE_BASE + llc * chain_depth as u32 + d as u32;
@@ -688,7 +709,6 @@ mod tests {
         cmdline: &str,
         initrd_addr: Option<u64>,
         initrd_size: Option<u32>,
-        hw_cache_level: u32,
         guest_l1_unified: bool,
     ) -> Result<Vec<u8>> {
         let layout = test_layout(topo, memory_mib);
@@ -699,7 +719,6 @@ mod tests {
             cmdline,
             initrd_addr,
             initrd_size,
-            hw_cache_level,
             guest_l1_unified,
             &layout,
             false,
@@ -712,7 +731,7 @@ mod tests {
     fn create_fdt_minimal() {
         let topo = default_topo();
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 0, false);
+        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, false);
         assert!(dtb.is_ok(), "FDT creation failed: {:?}", dtb.err());
         let dtb = dtb.unwrap();
         assert_eq!(&dtb[..4], &[0xd0, 0x0d, 0xfe, 0xed]);
@@ -739,7 +758,6 @@ mod tests {
             "console=ttyS0",
             Some(ADDR),
             Some(SIZE),
-            0,
             false,
         )
         .unwrap();
@@ -766,7 +784,7 @@ mod tests {
     fn create_fdt_no_initrd_props_absent() {
         let topo = default_topo();
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 0, false).unwrap();
+        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, false).unwrap();
         let props = parse_dtb_props(&dtb);
 
         assert_eq!(
@@ -781,13 +799,12 @@ mod tests {
         );
     }
 
-    /// Large SMP topology: 2 LLCs * 4 cores * 2 threads = 16 vCPUs,
-    /// `hw_cache_level = 2` (chain_depth = 1: each CPU points at its
-    /// LLC's single L2 node). Distinct from `fdt_cache_topology_multi_llc`
-    /// (4 vCPUs, hw_cache_level = 3, chain_depth = 2): this pins the
-    /// per-CPU node count for a 16-vCPU shape AND the single-hop L2
-    /// terminal-cache chain. Parses the DTB and asserts generated content
-    /// rather than mere non-panic.
+    /// Large SMP topology: 2 LLCs * 4 cores * 2 threads = 16 vCPUs.
+    /// Every multi-LLC guest presents a fixed CPU -> L2 -> L3 chain
+    /// (chain_depth = 2) so the LLC boundary lands at L3. Distinct from
+    /// `fdt_cache_topology_multi_llc` (4 vCPUs): this pins the per-CPU node
+    /// count for a 16-vCPU shape AND the two-hop L3 terminal chain. Parses
+    /// the DTB and asserts generated content rather than mere non-panic.
     #[test]
     fn create_fdt_smp() {
         let topo = Topology {
@@ -801,7 +818,7 @@ mod tests {
         };
         assert_eq!(topo.total_cpus(), 16);
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(&topo, &mpidrs, 1024, "console=ttyS0", None, None, 2, false).unwrap();
+        let dtb = test_fdt(&topo, &mpidrs, 1024, "console=ttyS0", None, None, false).unwrap();
         let props = parse_dtb_props(&dtb);
 
         // All 16 cpu@N nodes must exist (device_type present) and point
@@ -815,13 +832,13 @@ mod tests {
             );
             assert!(
                 prop_u32(&props, &node_path, "next-level-cache").is_some(),
-                "cpu {cpu_id}: missing next-level-cache (chain_depth=1)",
+                "cpu {cpu_id}: missing next-level-cache",
             );
         }
 
-        // chain_depth=1: each LLC emits exactly one terminal L2 node at
-        // level 2 with NO next-level-cache, and the two LLCs' L2 nodes
-        // carry distinct phandles.
+        // chain_depth=2: each LLC emits an L2 node (level 2, chaining to
+        // L3) and a terminal L3 node (level 3, NO next-level-cache). The
+        // two LLCs' L3 nodes carry distinct phandles.
         for llc in 0..topo.llcs {
             let l2_path = format!("cpus/l2-cache{llc}");
             assert_eq!(
@@ -830,19 +847,23 @@ mod tests {
                 "L2 cache{llc}: wrong cache-level",
             );
             assert!(
-                prop_u32(&props, &l2_path, "next-level-cache").is_none(),
-                "L2 cache{llc}: terminal node must not chain further (chain_depth=1)",
+                prop_u32(&props, &l2_path, "next-level-cache").is_some(),
+                "L2 cache{llc}: must chain to L3 (chain_depth=2)",
+            );
+            let l3_path = format!("cpus/l3-cache{llc}");
+            assert_eq!(
+                prop_u32(&props, &l3_path, "cache-level"),
+                Some(3),
+                "L3 cache{llc}: wrong cache-level",
+            );
+            assert!(
+                prop_u32(&props, &l3_path, "next-level-cache").is_none(),
+                "L3 cache{llc}: terminal node must not chain further",
             );
         }
-        let l2_0 = prop_u32(&props, "cpus/l2-cache0", "phandle").unwrap();
-        let l2_1 = prop_u32(&props, "cpus/l2-cache1", "phandle").unwrap();
-        assert_ne!(l2_0, l2_1, "per-LLC L2 phandles must differ");
-
-        // No L3 node exists for hw_cache_level=2.
-        assert!(
-            prop_u32(&props, "cpus/l3-cache0", "cache-level").is_none(),
-            "hw_cache_level=2 must not emit an L3 node",
-        );
+        let l3_0 = prop_u32(&props, "cpus/l3-cache0", "phandle").unwrap();
+        let l3_1 = prop_u32(&props, "cpus/l3-cache1", "phandle").unwrap();
+        assert_ne!(l3_0, l3_1, "per-LLC L3 phandles must differ");
 
         // CPUs sharing an LLC share the L2 phandle; CPUs in different
         // LLCs differ. cpu@0..@7 are LLC 0, cpu@8..@15 are LLC 1
@@ -866,7 +887,7 @@ mod tests {
             llc_cores: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(&topo, &mpidrs, 512, "console=ttyS0", None, None, 2, false);
+        let dtb = test_fdt(&topo, &mpidrs, 512, "console=ttyS0", None, None, false);
         assert!(dtb.is_ok(), "FDT creation failed: {:?}", dtb.err());
     }
 
@@ -899,7 +920,6 @@ mod tests {
             "console=ttyS0",
             None,
             None,
-            2,
             false,
         )
         .unwrap();
@@ -1078,7 +1098,7 @@ mod tests {
     fn parse_dtb_props_paths_no_leading_slash() {
         let topo = default_topo();
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 0, false).unwrap();
+        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, false).unwrap();
         let props = parse_dtb_props(&dtb);
 
         // Top-level node paths must not start with "/".
@@ -1132,7 +1152,7 @@ mod tests {
             llc_cores: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(&topo, &mpidrs, 512, "console=ttyS0", None, None, 2, false).unwrap();
+        let dtb = test_fdt(&topo, &mpidrs, 512, "console=ttyS0", None, None, false).unwrap();
         check_cpu_numa_node_ids(&topo, &parse_dtb_props(&dtb));
 
         // SMT variant: sibling threads share the same LLC and must get
@@ -1154,7 +1174,6 @@ mod tests {
             "console=ttyS0",
             None,
             None,
-            2,
             false,
         )
         .unwrap();
@@ -1173,7 +1192,7 @@ mod tests {
             llc_cores: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 2, false).unwrap();
+        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, false).unwrap();
         let props = parse_dtb_props(&dtb);
 
         // CPU nodes must NOT have numa-node-id when numa_nodes == 1.
@@ -1288,7 +1307,6 @@ mod tests {
             "console=ttyS0",
             None,
             None,
-            2,
             false,
         )
         .unwrap();
@@ -1320,7 +1338,6 @@ mod tests {
             "console=ttyS0",
             None,
             None,
-            2,
             false,
         )
         .unwrap();
@@ -1376,7 +1393,7 @@ mod tests {
             llc_cores: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(&topo, &mpidrs, 1024, "console=ttyS0", None, None, 2, false).unwrap();
+        let dtb = test_fdt(&topo, &mpidrs, 1024, "console=ttyS0", None, None, false).unwrap();
         let props = parse_dtb_props(&dtb);
 
         let matrix = prop_u32_array(&props, "distance-map", "distance-matrix")
@@ -1410,8 +1427,8 @@ mod tests {
 
     #[test]
     fn fdt_cache_topology_multi_llc() {
-        // 2 LLCs, 2 cores each, hw_cache_level=3 (L1/L2/L3).
-        // chain_depth = 2: CPU -> L2 node -> L3 node per LLC.
+        // 2 LLCs, 2 cores each. Multi-LLC guests always present L1/L2/L3
+        // (chain_depth = 2): CPU -> L2 node -> L3 node per LLC.
         let topo = Topology {
             llcs: 2,
             cores_per_llc: 2,
@@ -1422,7 +1439,7 @@ mod tests {
             llc_cores: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(&topo, &mpidrs, 512, "console=ttyS0", None, None, 3, false).unwrap();
+        let dtb = test_fdt(&topo, &mpidrs, 512, "console=ttyS0", None, None, false).unwrap();
         let props = parse_dtb_props(&dtb);
 
         // Each CPU must have next-level-cache pointing to its LLC's L2 node.
@@ -1497,7 +1514,7 @@ mod tests {
             llc_cores: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 3, false).unwrap();
+        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, false).unwrap();
         let props = parse_dtb_props(&dtb);
 
         // CPU 0 must NOT have next-level-cache.
@@ -1520,7 +1537,7 @@ mod tests {
         // pmuv3 driver attaches to so BPF perf-event syscalls succeed.
         let topo = default_topo();
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 0, false).unwrap();
+        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, false).unwrap();
         let props = parse_dtb_props(&dtb);
 
         let compat = props
@@ -1566,7 +1583,6 @@ mod tests {
             "console=ttyS0",
             None,
             None,
-            0,
             false,
             &layout,
             false,
@@ -1604,7 +1620,7 @@ mod tests {
         use crate::vmm::aarch64::kvm::PMU_INTID;
         let topo = default_topo();
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 0, false).unwrap();
+        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, false).unwrap();
         let props = parse_dtb_props(&dtb);
         let irq = prop_u32_array(&props, "pmu", "interrupts").expect("pmu interrupts must exist");
         assert_eq!(
