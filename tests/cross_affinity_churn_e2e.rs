@@ -36,6 +36,10 @@ const KTSTR_SCHED: Scheduler =
     threads = 1,
     memory_mib = 2048,
     sustained_samples = 25,
+    // Churn-heavy multi-profile fixture: the guest scx watchdog's 5s
+    // default evicts it under contended-runner starvation (the same
+    // margin its scenario_coverage siblings already declare).
+    watchdog_timeout_s = 15,
     max_keep_last_rate = 1000000000.0,
     max_fallback_rate = 1000000000.0
 )]

@@ -35,7 +35,7 @@ fn cover_cgroup_pipe_io(ctx: &Ctx) -> Result<AssertResult> {
 // fallback) that activate when ANY monitor threshold is set are
 // raised here to skip those checks while keeping sustained_samples
 // for the stall-pattern coverage.
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mib = 2048, sustained_samples = 25, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mib = 2048, sustained_samples = 25, watchdog_timeout_s = 15, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
 fn cover_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::basic::custom_sched_mixed(ctx)
 }
@@ -166,7 +166,7 @@ fn cover_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
 // Test exercises workload generation (heavy/light load oscillation
 // across phases), not scheduler correctness. See cover_sched_mixed
 // for rate-ceiling rationale.
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mib = 2048, sustained_samples = 25, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mib = 2048, sustained_samples = 25, watchdog_timeout_s = 15, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
 fn cover_cgroup_load_oscillation(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_load_oscillation(ctx)
 }
