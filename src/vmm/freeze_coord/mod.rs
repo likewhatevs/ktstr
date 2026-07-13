@@ -69,6 +69,24 @@ mod state;
 pub(crate) mod watchdog_step;
 mod watchpoint;
 
+/// Guest scx `watchdog_timeout` multiplier for COVERAGE builds only
+/// (cargo-llvm-cov compiles with `--cfg coverage`; plain builds get 1 =
+/// no-op, byte-identical). The in-guest test binary and fixture
+/// schedulers are llvm-cov-instrumented (~2x slower per measured host
+/// cost), and the coverage CI legs' deepened oversubscription on
+/// colocated runners starves single vCPUs long enough that the tight 5 s
+/// default evicts churn-heavy fixture schedulers the uninstrumented legs
+/// run green on the same hosts. 3x (5 s → 15 s) matches the margin the
+/// heaviest fixtures already declare explicitly and stays a fraction of
+/// the kernel's SCX_WATCHDOG_MAX_TIMEOUT (30 s) for the default.
+/// Deliberately compile-time: the tight default keeps its full
+/// stall-detection value in every non-coverage build, so a slow-stall
+/// bug can never hide behind this margin outside coverage runs.
+#[cfg(coverage)]
+const GUEST_SCX_WATCHDOG_COVERAGE_SCALE: u64 = 3;
+#[cfg(not(coverage))]
+const GUEST_SCX_WATCHDOG_COVERAGE_SCALE: u64 = 1;
+
 #[cfg(test)]
 mod bss_tests;
 
@@ -12648,7 +12666,29 @@ impl KtstrVm {
         let hz = monitor::guest_kernel_hz(Some(&self.kernel));
         // ms-precision conversion lives in [`duration_to_jiffies`];
         // see its doc for why the seconds-based form is wrong.
-        let watchdog_jiffies = self.watchdog_timeout.map(|d| duration_to_jiffies(d, hz));
+        //
+        // Under coverage instrumentation (cargo-llvm-cov builds set
+        // `--cfg coverage`) the guest scx watchdog timeout is scaled by
+        // [`GUEST_SCX_WATCHDOG_COVERAGE_SCALE`]: the in-guest test binary
+        // and fixture schedulers run instrumented (~2x slower), and the
+        // coverage CI legs run on colocated runners whose deepened
+        // oversubscription starves individual vCPUs asymmetrically — the
+        // measured combination that tripped the tight 5 s default on
+        // churn-heavy fixtures while the SAME tests pass uninstrumented
+        // on the SAME runners. Compile-time-gated so non-coverage builds
+        // are byte-identical and the tight default keeps its full bug-
+        // sorting value everywhere else; the loud log line below keeps a
+        // coverage-log reader from chasing a 15 s eviction as a mystery.
+        let watchdog_jiffies = self.watchdog_timeout.map(|d| {
+            let j = duration_to_jiffies(d, hz);
+            if GUEST_SCX_WATCHDOG_COVERAGE_SCALE > 1 {
+                eprintln!(
+                    "ktstr: coverage build — guest scx watchdog_timeout scaled \
+                     {GUEST_SCX_WATCHDOG_COVERAGE_SCALE}x ({d:?} base)",
+                );
+            }
+            j.saturating_mul(GUEST_SCX_WATCHDOG_COVERAGE_SCALE)
+        });
         let preemption_threshold_ns = monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
         let service_cpu = self.pinning_plan.as_ref().and_then(|p| p.service_cpu);
         // Workload duration captured for the scheduler-attach
