@@ -321,6 +321,16 @@ pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
     if !entry.kaslr {
         parts.push("nokaslr".to_string());
     }
+    // Periodic-capture window anchoring: a run that declares periodic
+    // captures gates its FIRST ScenarioStart (which opens the capture
+    // window) on the host's periodic-prereqs-ready signal, so the
+    // window opens over the live workload with the full declared
+    // duration instead of racing the KASLR publish (see
+    // `vmm::rust_init` Phase 5 and `SIGNAL_PERIODIC_READY`). Only
+    // periodic runs pay the wait; non-periodic runs never see the flag.
+    if entry.num_snapshots > 0 {
+        parts.push("KTSTR_AWAIT_PERIODIC_READY=1".to_string());
+    }
     if let Ok(bt) = std::env::var("RUST_BACKTRACE") {
         parts.push(format!("RUST_BACKTRACE={bt}"));
     }

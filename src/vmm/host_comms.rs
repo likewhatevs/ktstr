@@ -34,7 +34,8 @@ use zerocopy::FromBytes;
 use super::bulk::MAX_BULK_FRAME_PAYLOAD;
 use super::pi_mutex::PiMutex;
 use super::virtio_console::{
-    SIGNAL_ACCESSOR_READY, SIGNAL_BPF_WRITE_DONE, SIGNAL_VC_DUMP, SIGNAL_VC_SHUTDOWN, VirtioConsole,
+    SIGNAL_ACCESSOR_READY, SIGNAL_BPF_WRITE_DONE, SIGNAL_PERIODIC_READY, SIGNAL_VC_DUMP,
+    SIGNAL_VC_SHUTDOWN, VirtioConsole,
 };
 use super::wire::{FRAME_HEADER_SIZE, ShmEntry, ShmMessage};
 
@@ -215,6 +216,21 @@ pub fn request_bpf_map_write_done(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
 /// Mirrors [`request_bpf_map_write_done`].
 pub fn request_accessor_ready(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
     virtio_con.lock().queue_input(&[SIGNAL_ACCESSOR_READY]);
+}
+
+/// Notify a periodic-capture guest that ALL periodic-capture prereqs
+/// now hold — KASLR published AND both accessors adopted, the triad
+/// the boundary window anchors at. Pushes [`SIGNAL_PERIODIC_READY`]
+/// through the virtio-console RX queue; the guest's `hvc0_poll_loop`
+/// sets the `periodic_prereqs_ready` latch so a periodic-capture guest
+/// blocked before `send_scenario_start` resumes and opens the capture
+/// window over the LIVE workload with the full duration. Fired once,
+/// at the coordinator's readiness stamp, only when the run declares
+/// periodic captures. Mirrors [`request_accessor_ready`] but carries
+/// the KASLR-inclusive prereq state (accessor adoption alone can
+/// precede the KASLR publish on aarch64).
+pub fn request_periodic_prereqs_ready(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
+    virtio_con.lock().queue_input(&[SIGNAL_PERIODIC_READY]);
 }
 
 #[cfg(test)]

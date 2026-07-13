@@ -9230,6 +9230,22 @@ impl KtstrVm {
                         // Export for the post-run readiness-vs-window gate.
                         periodic_prereqs_ready_for_coord
                             .store(periodic_prereqs_ready_ns, Ordering::Release);
+                        // Signal a periodic-capture guest that ALL prereqs now
+                        // hold, so it can open the capture window (send its
+                        // ScenarioStart / start the workload) with the full
+                        // duration ahead of it instead of racing the KASLR
+                        // publish. Only meaningful when the run declares
+                        // periodic captures; the guest gates its wait on the
+                        // matching `KTSTR_AWAIT_PERIODIC_READY` karg, so the
+                        // byte is inert (sticky RX, consumed by the poll loop,
+                        // no waiter) on non-periodic runs — but skip the queue
+                        // push entirely on those to avoid needless RX traffic.
+                        // Fires once (the `== 0` stamp guard is one-shot).
+                        if freeze_coord_num_snapshots > 0 {
+                            super::host_comms::request_periodic_prereqs_ready(
+                                &freeze_coord_virtio_con,
+                            );
+                        }
                     }
                     if freeze_coord_num_snapshots > 0 && !periodic_abandoned {
                         if periodic_boundaries_ns.is_none()

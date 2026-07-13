@@ -748,6 +748,44 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // Phase 5: Dispatch.
     let _s_phase5 = tracing::debug_span!("phase5_dispatch").entered();
     tracing::debug!("dispatching test");
+    // Periodic-capture window anchoring: the FIRST ScenarioStart stamps
+    // the host's `scenario_anchor`, which opens the periodic-capture
+    // window. On a run that declares periodic captures the host sets
+    // `KTSTR_AWAIT_PERIODIC_READY=1`; here we block that first
+    // ScenarioStart until the host has stamped its periodic prereqs
+    // (KASLR published + both accessors adopted — the triad the window
+    // anchors at) and fired SIGNAL_PERIODIC_READY. Without this the
+    // workload — and thus the window — can start before the KASLR
+    // publish lands (the guest KERN_ADDRS handshake, or its detached
+    // background retry on a slow boot), collapsing the clamped window
+    // `[max(anchor, prereqs_ready), anchor + duration]` from the start
+    // and firing few/no boundaries. Bounded: no signal within the bound
+    // (a genuinely stuck host) falls through and the workload runs
+    // anyway — the host-side readiness-vs-window skip gate then records
+    // the environmental non-verdict. NO deadlock: the host's prereqs
+    // (KASLR via the boot-independent KERN_ADDRS retry, accessors via
+    // the MMU-only early build) resolve without the workload running.
+    // The hvc0 poll loop that sets the latch started in Phase 4, and
+    // the latch is sticky, so a signal that arrives before this wait
+    // (warm boot) returns immediately — no penalty when prereqs are
+    // already up.
+    if crate::vmm::rust_init::cmdline_val("KTSTR_AWAIT_PERIODIC_READY").is_some() {
+        // 45 s: comfortably covers the host's 60 s accessor-init budget's
+        // common case plus the KASLR-publish tail on a slow arm box,
+        // while staying well inside the watchdog deadline so a stuck
+        // prereq falls through to the skip gate rather than the deadman.
+        let latch = crate::vmm::rust_init::periodic_prereqs_ready_latch();
+        let fired = latch.wait_timeout(std::time::Duration::from_secs(45));
+        if fired {
+            tracing::debug!("periodic prereqs ready; opening the capture window");
+        } else {
+            tracing::warn!(
+                "ktstr-init: periodic prereqs not signalled within 45s; \
+                 opening the capture window anyway (host-side readiness gate \
+                 will record the shortfall)"
+            );
+        }
+    }
     crate::vmm::guest_comms::send_lifecycle(crate::vmm::wire::LifecyclePhase::PayloadStarting, "");
     crate::vmm::guest_comms::send_scenario_start();
 
