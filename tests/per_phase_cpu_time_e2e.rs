@@ -54,7 +54,7 @@ fn assert_per_phase_cpu_time(result: &VmResult) -> Result<()> {
     // capture regression — SKIP instead of failing the assertions
     // below. A quiet-host zero-capture run still falls through and
     // fails with the specific diagnosis. See `periodic_starvation_gate`.
-    ktstr::prelude::periodic_starvation_gate(result)?;
+    ktstr::prelude::periodic_starvation_gate(result, 2)?;
     anyhow::ensure!(
         result.periodic_fired >= 2,
         "periodic_fired = {} of {} — need >= 2 captures in a phase for a \

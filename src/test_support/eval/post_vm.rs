@@ -282,28 +282,58 @@ pub fn capture_starvation_witness(result: &crate::vmm::VmResult) -> Option<f64> 
     (d > CAPTURE_STARVATION_D_MAX).then_some(d)
 }
 
-/// One-line starvation gate for capture-requiring post_vm assertions:
-/// `Err(post_vm_skip(..))` when the run produced ZERO real periodic
-/// captures AND [`capture_starvation_witness`] proves the host was
-/// contended enough to explain it; `Ok(())` otherwise (including the
-/// quiet-host zero-capture case, which the caller's own assertions
-/// then fail with their specific diagnosis). Call at the TOP of a
-/// post_vm callback: `periodic_starvation_gate(result)?;`.
-pub fn periodic_starvation_gate(result: &crate::vmm::VmResult) -> anyhow::Result<()> {
-    if result.periodic_target > 0
-        && result.snapshot_bridge.periodic_real_count() == 0
+/// Generic sub-minimum starvation skip: `Err(post_vm_skip(..))` when the
+/// run produced FEWER data-bearing units than the caller's assertion
+/// requires (`have < need`) AND [`capture_starvation_witness`] proves the
+/// host was contended enough to explain the shortfall; `Ok(())`
+/// otherwise. The caller passes the SAME count its own assertion checks
+/// (real captures, PSI-carrying captures, series length, …) so the gate
+/// and the assertion cannot disagree about the boundary — an earlier
+/// zero-only gate let `1 of 6` runs through to fail on a `>= 2` minimum
+/// under the identical environmental condition. Quiet-host shortfalls
+/// (zero OR sub-minimum) still fall through and fail with the caller's
+/// specific diagnosis.
+pub fn starved_below_minimum_skip(
+    result: &crate::vmm::VmResult,
+    have: usize,
+    need: usize,
+    what: &str,
+) -> anyhow::Result<()> {
+    if have < need
         && let Some(d) = capture_starvation_witness(result)
     {
         return Err(post_vm_skip(format!(
-            "no real periodic captures under witnessed host contention \
-             (D={d:.2}, periodic_fired={} of {}): the readiness-gated \
-             capture chain (KASLR publish + accessor-init) was starved \
-             past the workload window — environmental non-verdict; the \
-             capture-dependent assertions below cannot be evaluated",
-            result.periodic_fired, result.periodic_target,
+            "only {have} of the required {need} {what} under witnessed host \
+             contention (D={d:.2}): the readiness-gated capture chain was \
+             starved below the assertion's minimum — environmental \
+             non-verdict; the dependent assertions cannot be evaluated",
         )));
     }
     Ok(())
+}
+
+/// Periodic-capture starvation gate for capture-requiring post_vm
+/// assertions: [`starved_below_minimum_skip`] keyed on the bridge's
+/// REAL (non-placeholder) capture count vs the test's stated minimum.
+/// Call at the TOP of a post_vm callback with the same minimum its
+/// assertions enforce: `periodic_starvation_gate(result, 2)?;`. Tests
+/// whose assertions key on a narrower data-bearing count (e.g. "N
+/// captures carrying per-cgroup PSI") should ALSO call
+/// [`starved_below_minimum_skip`] with that count at the assertion
+/// site. No-op when the entry configured no periodic captures.
+pub fn periodic_starvation_gate(
+    result: &crate::vmm::VmResult,
+    min_real: usize,
+) -> anyhow::Result<()> {
+    if result.periodic_target == 0 {
+        return Ok(());
+    }
+    starved_below_minimum_skip(
+        result,
+        result.snapshot_bridge.periodic_real_count() as usize,
+        min_real,
+        "real (non-placeholder) periodic captures",
+    )
 }
 
 /// Dispatch the entry's `post_vm` + `post_vm_unconditional`
@@ -536,21 +566,25 @@ mod starvation_witness_tests {
         assert!((d - 3.0).abs() < 1e-9);
     }
 
-    /// The gate skips ONLY on (target>0, zero real captures, witnessed
-    /// contention); every other combination returns Ok and lets the
-    /// caller's own assertions run.
+    /// The gate skips ONLY on (target>0, real captures BELOW the
+    /// caller's minimum, witnessed contention); every other combination
+    /// returns Ok and lets the caller's own assertions run. The
+    /// sub-minimum (not just zero) boundary is load-bearing: an
+    /// observed `1 of 6` starved run escaped a zero-only gate and then
+    /// failed its `>= 3` minimum under the identical environmental
+    /// condition.
     #[test]
     fn periodic_starvation_gate_arms() {
         // No periodic target: Ok even when contended.
         let r = with_dilation(10, 20);
-        assert!(periodic_starvation_gate(&r).is_ok());
-        // Target set, zero real captures, contended: Err carrying the
-        // HostSkipRequest marker.
+        assert!(periodic_starvation_gate(&r, 1).is_ok());
+        // Target set, zero real captures below min 1, contended: Err
+        // carrying the HostSkipRequest marker.
         let r = VmResult {
             periodic_target: 2,
             ..with_dilation(10, 20)
         };
-        let err = periodic_starvation_gate(&r).expect_err("starved run must gate");
+        let err = periodic_starvation_gate(&r, 1).expect_err("starved run must gate");
         assert!(
             err.downcast_ref::<HostSkipRequest>().is_some(),
             "gate must carry the HostSkipRequest skip marker"
@@ -561,6 +595,22 @@ mod starvation_witness_tests {
             periodic_target: 2,
             ..with_dilation(10, 1)
         };
-        assert!(periodic_starvation_gate(&r).is_ok());
+        assert!(periodic_starvation_gate(&r, 1).is_ok());
+    }
+
+    /// The generic sub-minimum gate: `have < need` + witness = skip;
+    /// `have >= need` never gates; quiet host never gates.
+    #[test]
+    fn starved_below_minimum_arms() {
+        let contended = with_dilation(10, 20);
+        // Sub-minimum + contended: skip (the 1-of-6 shape).
+        let err = starved_below_minimum_skip(&contended, 1, 3, "captures")
+            .expect_err("sub-minimum under contention must gate");
+        assert!(err.downcast_ref::<HostSkipRequest>().is_some());
+        // At/above minimum: never gates, even contended.
+        assert!(starved_below_minimum_skip(&contended, 3, 3, "captures").is_ok());
+        // Sub-minimum on a quiet host: falls through (caller fails).
+        let quiet = with_dilation(10, 1);
+        assert!(starved_below_minimum_skip(&quiet, 1, 3, "captures").is_ok());
     }
 }

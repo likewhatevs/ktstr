@@ -194,6 +194,17 @@ pub struct VmResult {
     /// dispatch-recorded milestones. `0` means the guest never
     /// published a milestone the host consumed.
     pub final_progress_epoch: u64,
+    /// Whether the entry's host-triggered BPF-map-write injections
+    /// (`KtstrTestEntry::bpf_map_write` — e.g. the neg_* fixtures'
+    /// crash flag) were delivered: `None` when no writes were
+    /// configured, `Some(true)` when every queued write landed and the
+    /// guest was signalled, `Some(false)` when the injection thread
+    /// never completed (killed mid-retry — e.g. the run ended while a
+    /// starved guest was still booting/attaching). Fixtures that
+    /// expect an injected bug consult this to distinguish "the bug
+    /// never fired because the injection never landed" (environmental
+    /// under witnessed contention) from a real detection failure.
+    pub bpf_map_writes_delivered: Option<bool>,
     /// Captured guest stdout (and any non-dmesg serial console content).
     pub output: String,
     /// Captured guest stderr (separated from `output` when the guest
@@ -238,6 +249,17 @@ pub struct VmResult {
     /// [`SidecarResult`](crate::test_support::SidecarResult) so stats
     /// tooling can flag cleanup regressions across runs.
     pub cleanup_duration: Option<Duration>,
+    /// The cleanup window's OWN dilation evidence: the join/drain
+    /// performer thread's schedstat delta (on-CPU + runnable-wait)
+    /// across exactly the [`Self::cleanup_duration`] window. The
+    /// cleanup-budget gate judges overruns against THIS — the
+    /// per-phase/whole-run witnesses cannot attest the window (the
+    /// monitor that feeds them is itself joined inside it, and join
+    /// wake-latency is a tail phenomenon a whole-run average
+    /// under-attests). `None` when schedstat was unreadable at either
+    /// edge; a `0` on-CPU delta (CONFIG_SCHEDSTATS off) is treated as
+    /// unattested by consumers.
+    pub cleanup_sched_delta: Option<HostVcpuSchedstat>,
     /// Host-side virtio-blk device counters, snapshotted after the
     /// guest has exited. `Some(_)` when the builder attached a disk
     /// via `super::KtstrVmBuilder::disk`; `None` when no disk was
@@ -1244,6 +1266,7 @@ impl VmResult {
             watchdog_kill_reason: None,
             final_guest_phase: GuestLifecyclePhase::Boot,
             final_progress_epoch: 0,
+            bpf_map_writes_delivered: None,
             output: String::new(),
             stderr: String::new(),
             monitor: None,
@@ -1252,6 +1275,7 @@ impl VmResult {
             kvm_stats: None,
             crash_message: None,
             cleanup_duration: None,
+            cleanup_sched_delta: None,
             virtio_blk_counters: None,
             virtio_net_counters: None,
             snapshot_bridge: empty_snapshot_bridge_for_tests(),
@@ -1762,6 +1786,14 @@ pub(crate) struct VmRunState {
     pub(crate) final_guest_phase_raw: u8,
     /// Final ledger milestone count → [`VmResult::final_progress_epoch`].
     pub(crate) final_progress_epoch: u64,
+    /// Raw BPF-map-write injection delivery state (0 = none
+    /// configured, 1 = pending/never delivered, 2 = delivered) —
+    /// decoded into [`VmResult::bpf_map_writes_delivered`].
+    pub(crate) bpf_map_write_delivery_raw: u8,
+    /// Cleanup-window-open schedstat snapshot of the run_vm caller
+    /// thread (the join/drain performer) — closed by `collect_results`
+    /// into [`VmResult::cleanup_sched_delta`].
+    pub(crate) cleanup_sched_t0: Option<HostVcpuSchedstat>,
     pub(crate) ap_threads: Vec<VcpuThread>,
     pub(crate) monitor_handle: Option<JoinHandle<monitor::reader::MonitorLoopResult>>,
     pub(crate) bpf_write_handle: Option<JoinHandle<()>>,

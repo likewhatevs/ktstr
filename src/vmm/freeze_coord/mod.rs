@@ -390,6 +390,20 @@ fn decode_guest_phase(raw: u8) -> crate::vmm::GuestLifecyclePhase {
     }
 }
 
+/// Decode the BPF-map-write injection delivery byte for
+/// [`crate::vmm::VmResult::bpf_map_writes_delivered`]: 0 = no writes
+/// configured (`None`), 2 = delivered-and-guest-signalled
+/// (`Some(true)`), anything else = configured but never delivered
+/// (`Some(false)` — conservative for unknown bytes: an undelivered
+/// injection must never read as delivered).
+fn decode_bpf_map_write_delivery(raw: u8) -> Option<bool> {
+    match raw {
+        0 => None,
+        2 => Some(true),
+        _ => Some(false),
+    }
+}
+
 /// Extend the watchdog's reset deadline so it accommodates an armed
 /// wprof-ship grace. The watchdog fires at
 /// `effective_deadline = reset_deadline.max(hard_deadline)` where
@@ -467,6 +481,17 @@ mod watchdog_reset_tag_tests {
     /// unknown bytes fall back to `Boot` (the ledger's own conservative
     /// mapping). The public enum's `Ord` follows boot progress so
     /// fixtures can ask "did the guest reach the wedge phase".
+    /// Injection-delivery decode: 0 (no writes) → None; 2 (delivered)
+    /// → Some(true); 1 and any unknown byte → Some(false) — an
+    /// undelivered injection must never decode as delivered.
+    #[test]
+    fn bpf_map_write_delivery_decode() {
+        assert_eq!(super::decode_bpf_map_write_delivery(0), None);
+        assert_eq!(super::decode_bpf_map_write_delivery(1), Some(false));
+        assert_eq!(super::decode_bpf_map_write_delivery(2), Some(true));
+        assert_eq!(super::decode_bpf_map_write_delivery(99), Some(false));
+    }
+
     #[test]
     fn guest_phase_decode_and_progress_order() {
         use crate::vmm::GuestLifecyclePhase as Pub;
@@ -1662,6 +1687,19 @@ pub(crate) fn read_host_vcpu_schedstat(tids: &[i32]) -> Option<HostVcpuSchedstat
     (acc.sampled_vcpus > 0).then_some(acc)
 }
 
+/// Snapshot the CALLING thread's own cumulative schedstat (on-CPU,
+/// run-delay) — the instrument for the cleanup-window dilation
+/// evidence. `read_host_vcpu_schedstat(&[gettid()])` with the same
+/// parser/format contract; `None` when the read fails or
+/// CONFIG_SCHEDSTATS is off (an all-zero line still parses; the
+/// upstream delta then reads 0 on-CPU and consumers treat the window
+/// as unattested).
+pub(crate) fn read_self_thread_schedstat() -> Option<HostVcpuSchedstat> {
+    // SAFETY: gettid(2) takes no arguments and cannot fail.
+    let tid = unsafe { libc::gettid() } as i32;
+    read_host_vcpu_schedstat(&[tid])
+}
+
 #[cfg(test)]
 mod schedstat_tests {
     use super::{parse_schedstat_line, read_host_vcpu_schedstat};
@@ -2477,6 +2515,11 @@ impl KtstrVm {
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let kern_addrs_frames_for_coord = kern_addrs_frames.clone();
         let kern_addrs_crc_bad_for_coord = kern_addrs_crc_bad.clone();
+        // Unknown-msg_type frame counter (the header-outside-CRC probe —
+        // see `BulkDispatchSinks::unknown_type_frames`).
+        let unknown_type_frames: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let unknown_type_frames_for_coord = unknown_type_frames.clone();
         let monitor_handle = self.start_monitor(
             &vm,
             &kill,
@@ -2576,6 +2619,16 @@ impl KtstrVm {
         let periodic_fired_for_coord = periodic_fired_slot.clone();
 
         // BPF map write thread: sleeps, discovers a BPF map, writes a value.
+        // Delivery evidence for host-triggered BPF-map-write injections
+        // (0 = no writes configured, 1 = configured but not yet
+        // delivered, 2 = delivered — see `VmResult::bpf_map_writes_delivered`).
+        // The injection thread stamps 2 after signalling the guest; the
+        // neg_* fixtures' starvation gates read the decoded value to
+        // distinguish "expected crash absent because the injection never
+        // landed" from a real detection failure.
+        let bpf_map_write_delivery: Arc<std::sync::atomic::AtomicU8> = Arc::new(
+            std::sync::atomic::AtomicU8::new(if self.bpf_map_writes.is_empty() { 0 } else { 1 }),
+        );
         let bpf_write_handle = self.start_bpf_map_write(
             &vm,
             &kill,
@@ -2585,6 +2638,7 @@ impl KtstrVm {
             cr3_cache.clone(),
             virtio_con.clone(),
             kern_phys_base.clone(),
+            bpf_map_write_delivery.clone(),
         )?;
         // Same as the monitor: the bpf-map-write thread holds a raw pointer into
         // guest_mem, so the guard must join it on an early-return past here.
@@ -2670,6 +2724,7 @@ impl KtstrVm {
         // arrived from one that arrived late, so the dump re-reads the
         // live counters at the kill.
         let kern_addrs_frames_for_wd = kern_addrs_frames_for_coord.clone();
+        let unknown_type_frames_for_wd = unknown_type_frames.clone();
         let kern_virt_kaslr_for_wd = kern_virt_kaslr.clone();
         let kern_phys_base_for_wd = kern_phys_base.clone();
 
@@ -4830,6 +4885,7 @@ impl KtstrVm {
                                         kernel_text_link_kva,
                                         kern_addrs_frames: &kern_addrs_frames_for_coord,
                                         kern_addrs_crc_bad: &kern_addrs_crc_bad_for_coord,
+                                        unknown_type_frames: &unknown_type_frames_for_coord,
                                         watchdog_reset: workload_duration_for_coord.map(|d| {
                                             (
                                                 watchdog_reset_for_coord.as_ref(),
@@ -11759,10 +11815,11 @@ impl KtstrVm {
                         // no runtime KVA).
                         eprintln!(
                             "  kern_addrs_frames={} (kill-time), kaslr_raw={:#x}, \
-                             phys_base_raw={:#x}",
+                             phys_base_raw={:#x}, unknown_type_frames={}",
                             kern_addrs_frames_for_wd.load(Ordering::Relaxed),
                             kern_virt_kaslr_for_wd.load(Ordering::Acquire),
                             kern_phys_base_for_wd.load(Ordering::Acquire),
+                            unknown_type_frames_for_wd.load(Ordering::Relaxed),
                         );
                         eprintln!(
                             "  effective_deadline={effective_offset:?} from VM start \
@@ -12134,6 +12191,15 @@ impl KtstrVm {
         // `Instant::now()` at the end and the difference becomes
         // `VmResult::cleanup_duration`.
         let cleanup_start = Instant::now();
+        // Cleanup-window dilation instrument: snapshot THIS thread's
+        // schedstat at the window open. run_vm and collect_results run on
+        // the same caller thread (the BSP thread), which performs every
+        // join/drain in the window, so the delta across the window is the
+        // cleanup performer's own on-CPU + runnable-wait — the evidence
+        // the cleanup-budget gate judges overruns against (the per-phase
+        // witness CANNOT attest this window: the monitor that feeds it is
+        // itself joined inside it).
+        let cleanup_sched_t0 = read_self_thread_schedstat();
         // `code` here is the run-loop sentinel (0 only on a BSP-
         // observed `ExitAction::Shutdown`, -1 otherwise — see
         // [`BspExitReason`] and the preceding `BSP: loop exit
@@ -12321,6 +12387,7 @@ impl KtstrVm {
             watchdog_kill_reason_raw: watchdog_kill_reason.load(Ordering::Acquire),
             final_guest_phase_raw: final_ledger.phase,
             final_progress_epoch: final_ledger.progress_epoch,
+            bpf_map_write_delivery_raw: bpf_map_write_delivery.load(Ordering::Acquire),
             ap_threads,
             monitor_handle,
             bpf_write_handle,
@@ -12336,6 +12403,7 @@ impl KtstrVm {
             freeze,
             vm,
             cleanup_start,
+            cleanup_sched_t0,
             virtio_blk_counters,
             virtio_net_counters,
             // Snapshot bridge owning every report stored by the
@@ -13682,6 +13750,7 @@ impl KtstrVm {
         cr3: Arc<std::sync::atomic::AtomicU64>,
         virtio_con: Arc<PiMutex<virtio_console::VirtioConsole>>,
         kern_phys_base: Arc<std::sync::atomic::AtomicU64>,
+        delivery: Arc<std::sync::atomic::AtomicU8>,
     ) -> Result<Option<JoinHandle<()>>> {
         if self.bpf_map_writes.is_empty() {
             return Ok(None);
@@ -13756,8 +13825,22 @@ impl KtstrVm {
                     }
                 };
                 let mem = Arc::new(mem);
-                let phase1_deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(30);
+                // NO wall deadline: this phase's success condition IS guest
+                // progress (phys_base published, MMU + page tables up), so
+                // it completes exactly when the guest reaches the state the
+                // injection targets — the milestone anchoring. A previous
+                // 30 s wall deadline here (counted from THREAD START,
+                // ticking through the whole guest boot) permanently aborted
+                // the injection on saturated hosts where boot alone outran
+                // it — the guest then ran wedge-free and the neg_* fixtures'
+                // "expected bug did not fire" was an injection no-show, not
+                // a detection regression. The retry is kill-bounded (the
+                // run's watchdog deadman is the outer clock) and stays loud:
+                // a progress line every ~30 s so a genuinely-stuck accessor
+                // build (config typo, unresolvable vmlinux) still surfaces
+                // in stderr instead of silently spinning to run end.
+                let phase1_t0 = std::time::Instant::now();
+                let mut phase1_last_log = phase1_t0;
                 let owned = loop {
                     let biased = kern_phys_base.load(std::sync::atomic::Ordering::Acquire);
                     if biased == 0 {
@@ -13782,9 +13865,13 @@ impl KtstrVm {
                             if kill_clone.load(Ordering::Acquire) {
                                 return;
                             }
-                            if std::time::Instant::now() >= phase1_deadline {
-                                eprintln!("bpf_map_write: accessor init timed out: {e:#}");
-                                return;
+                            if phase1_last_log.elapsed() >= std::time::Duration::from_secs(30) {
+                                phase1_last_log = std::time::Instant::now();
+                                eprintln!(
+                                    "bpf_map_write: accessor init still retrying after {:?} \
+                                     (kill-bounded, no wall deadline): {e:#}",
+                                    phase1_t0.elapsed(),
+                                );
                             }
                             poll_eventfd_until_ready_or_timeout(&probes_ready_evt, 200);
                         }
@@ -13832,8 +13919,16 @@ impl KtstrVm {
                         return;
                     }
                 };
-                let retry_deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(30);
+                // NO wall deadline (mirrors phase 1): a map with the
+                // requested field appears exactly when the scheduler's BPF
+                // object loads — guest progress, which saturated hosts
+                // dilate arbitrarily. The prior 30 s wall here aborted the
+                // injection while the scheduler was still attaching. Kill-
+                // bounded, with a loud ~30 s progress line so a genuinely
+                // unresolvable field (typo, wrong map suffix) still
+                // surfaces in stderr instead of spinning silently.
+                let phase2_t0 = std::time::Instant::now();
+                let mut phase2_last_log = phase2_t0;
                 let mut resolved: Vec<(BpfMapWriteParams, monitor::bpf_map::BpfMapInfo, usize, usize)> =
                     Vec::with_capacity(writes.len());
                 for params in writes.iter() {
@@ -13882,12 +13977,16 @@ impl KtstrVm {
                             eprintln!("bpf_map_write: VM exited during map/field search");
                             return;
                         }
-                        if std::time::Instant::now() >= retry_deadline {
+                        if phase2_last_log.elapsed() >= std::time::Duration::from_secs(30) {
+                            phase2_last_log = std::time::Instant::now();
                             eprintln!(
-                                "bpf_map_write: field '{}' unresolved in any '{}' map after {} attempts",
-                                params.field, params.map_name_suffix, attempt,
+                                "bpf_map_write: field '{}' still unresolved in any '{}' map \
+                                 after {} attempts / {:?} (kill-bounded, no wall deadline)",
+                                params.field,
+                                params.map_name_suffix,
+                                attempt,
+                                phase2_t0.elapsed(),
                             );
-                            return;
                         }
                         // Back off ~200 ms before re-walking the IDR, waking
                         // early on kill. Poll `kill_evt` rather than the shared,
@@ -13979,6 +14078,12 @@ impl KtstrVm {
                 // when the latch fires. Replaces the legacy SHM signal
                 // slot 0 notification.
                 super::host_comms::request_bpf_map_write_done(&virtio_con);
+                // Delivery evidence: every queued write landed and the guest
+                // was signalled. The neg_* starvation gates read the decoded
+                // `VmResult::bpf_map_writes_delivered` — `Some(true)` here
+                // means an absent expected-crash is a REAL detection failure,
+                // never an injection no-show.
+                delivery.store(2, Ordering::Release);
                 let _ = (&kill_clone, &probes_ready_evt, &mem);
             })
             .context("spawn bpf-map-write thread")?;
@@ -14832,6 +14937,14 @@ impl KtstrVm {
         // the result so the `Instant::now()` here is the latest possible
         // read.
         let cleanup_duration = Some(run.cleanup_start.elapsed());
+        // Close the cleanup-window dilation instrument on the same
+        // thread that opened it (see `cleanup_sched_t0`): the delta's
+        // run-delay is the wall the host scheduler ADDED to this
+        // window; its dilation D_cleanup feeds the budget gate.
+        let cleanup_sched_delta = match (run.cleanup_sched_t0, read_self_thread_schedstat()) {
+            (Some(t0), Some(t1)) => Some(t1.delta_from(&t0)),
+            _ => None,
+        };
         tracing::info!(
             elapsed_ms = collect_results_start.elapsed().as_millis() as u64,
             cleanup_window_ms = cleanup_duration.map(|d| d.as_millis() as u64).unwrap_or(0),
@@ -14883,6 +14996,10 @@ impl KtstrVm {
             watchdog_kill_reason: decode_watchdog_kill_reason(run.watchdog_kill_reason_raw),
             final_guest_phase: decode_guest_phase(run.final_guest_phase_raw),
             final_progress_epoch: run.final_progress_epoch,
+            // Injection delivery evidence (see the field doc): 0 = no
+            // writes configured, 1 = configured but never delivered,
+            // 2 = delivered-and-guest-signalled.
+            bpf_map_writes_delivered: decode_bpf_map_write_delivery(run.bpf_map_write_delivery_raw),
             output: app_output,
             stderr: console_output,
             monitor: monitor_report,
@@ -14891,6 +15008,7 @@ impl KtstrVm {
             kvm_stats: None,
             crash_message,
             cleanup_duration,
+            cleanup_sched_delta,
             // Snapshot at assignment, not earlier: VmRunState owns
             // the device's Arc<AtomicU64> counter handle until this
             // point. The sole sources of QUEUE_NOTIFY kicks for both

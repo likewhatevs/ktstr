@@ -48,7 +48,7 @@ fn assert_stats_round_trip(result: &VmResult) -> Result<()> {
     // capture regression — SKIP instead of failing the assertions
     // below. A quiet-host zero-capture run still falls through and
     // fails with the specific diagnosis. See `periodic_starvation_gate`.
-    ktstr::prelude::periodic_starvation_gate(result)?;
+    ktstr::prelude::periodic_starvation_gate(result, 1)?;
     anyhow::ensure!(
         result.periodic_target == 1,
         "periodic_target must mirror num_snapshots = 1, got {}",

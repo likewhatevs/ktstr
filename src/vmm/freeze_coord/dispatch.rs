@@ -165,6 +165,14 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// diagnostic-only.
     pub kern_addrs_frames: &'a std::sync::atomic::AtomicU64,
     pub kern_addrs_crc_bad: &'a std::sync::atomic::AtomicU64,
+    /// Count of frames whose `msg_type` matched NO known variant —
+    /// the decisive probe for the header-outside-CRC wire gap: the
+    /// 16-byte frame header (including `msg_type`) is NOT covered by
+    /// the payload CRC, so a corrupted type routes a frame here
+    /// INVISIBLY instead of to its real arm. `unknown > 0` alongside
+    /// `kern_addrs_frames == 0` on a dead-channel run fingers the
+    /// wire-format gap; `unknown == 0` exonerates it.
+    pub unknown_type_frames: &'a std::sync::atomic::AtomicU64,
     /// Watchdog reset atomic + workload duration + `run_start` anchor +
     /// the parallel provenance tag. SCENARIO_START stores
     /// `(now - run_start + duration).as_nanos()` so the watchdog starts
@@ -1102,9 +1110,13 @@ pub(super) fn dispatch_bulk_message(
             None
         }
         None => {
-            // Unknown msg_type — log once and drop. A future guest
-            // variant the host does not know about would otherwise
-            // produce a phantom verdict entry.
+            // Unknown msg_type — count (kill-dump probe: see the
+            // `unknown_type_frames` sink doc), log, and drop. A future
+            // guest variant the host does not know about would
+            // otherwise produce a phantom verdict entry.
+            sinks
+                .unknown_type_frames
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 msg_type = msg.msg_type,
                 len = msg.payload.len(),
@@ -1151,6 +1163,7 @@ mod stage_tests {
         kern_virt_kaslr_evt: EventFd,
         kern_addrs_frames: AtomicU64,
         kern_addrs_crc_bad: AtomicU64,
+        unknown_type_frames: AtomicU64,
         watchdog_pause_ns: AtomicU64,
         scenario_start_ns: AtomicU64,
         sched_swap_notify: AtomicBool,
@@ -1184,6 +1197,7 @@ mod stage_tests {
                 kern_virt_kaslr_evt: EventFd::new(EFD_NONBLOCK).expect("virt_kaslr eventfd"),
                 kern_addrs_frames: AtomicU64::new(0),
                 kern_addrs_crc_bad: AtomicU64::new(0),
+                unknown_type_frames: AtomicU64::new(0),
                 watchdog_pause_ns: AtomicU64::new(0),
                 scenario_start_ns: AtomicU64::new(0),
                 sched_swap_notify: AtomicBool::new(false),
@@ -1219,6 +1233,7 @@ mod stage_tests {
                 kernel_text_link_kva: 0,
                 kern_addrs_frames: &self.kern_addrs_frames,
                 kern_addrs_crc_bad: &self.kern_addrs_crc_bad,
+                unknown_type_frames: &self.unknown_type_frames,
                 watchdog_reset: if self.wire_reset {
                     Some((
                         &self.reset_ns,

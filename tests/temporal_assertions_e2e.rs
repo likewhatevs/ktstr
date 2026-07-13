@@ -57,7 +57,7 @@ fn assert_temporal_patterns(result: &VmResult) -> Result<()> {
     // capture regression — SKIP instead of failing the assertions
     // below. A quiet-host zero-capture run still falls through and
     // fails with the specific diagnosis. See `periodic_starvation_gate`.
-    ktstr::prelude::periodic_starvation_gate(result)?;
+    ktstr::prelude::periodic_starvation_gate(result, 2)?;
     // Drain in insertion order with the parallel scx_stats / elapsed
     // metadata so the resulting series carries both projection axes.
     // `periodic_only` strips any non-periodic capture entries the

@@ -38,7 +38,9 @@ pub(crate) use post_vm::{
     ExpectAutoReproSatisfied, HostSkipRequest, PostVmAssertionFailure, SchedulerBuildRefused,
     ScxBpfErrorMatcherMismatch, SurvivesStormViolated, record_skip_sidecar, run_post_vm_callbacks,
 };
-pub use post_vm::{capture_starvation_witness, periodic_starvation_gate, post_vm_skip};
+pub use post_vm::{
+    capture_starvation_witness, periodic_starvation_gate, post_vm_skip, starved_below_minimum_skip,
+};
 mod reporting;
 mod scheduler;
 use crate::verifier::{SCHED_OUTPUT_START, parse_sched_output};
@@ -1971,60 +1973,69 @@ fn evaluate_verdict_folds(
     // observed 6-12 s overruns on saturated 96-CPU CI runners for cells
     // that measure well under 5 s on the same hardware idle. A flat
     // wall bound conflates "teardown regressed" with "the box was
-    // busy" — the disguised-wall-deadline anti-pattern. Judge the
-    // overrun against the run's contention witness, mirroring the
-    // tri-state latency gates: BLOCK only when the witness shows a
-    // quiet host (no contention to blame — a real teardown regression,
-    // which quiet CI legs and local dev still catch); on a
-    // witnessed-contended host demote to a non-blocking stderr warning
-    // carrying the measurement. Witness: the Teardown-phase dilation
-    // `D` (the guest-teardown window immediately preceding host
-    // cleanup) when the per-phase witness sampled it, else the
-    // whole-run `D`. The 1.5 bar follows `PERF_ISOLATION_D_MAX`'s
-    // derivation (worst measured-quiet `D` ≈ 1.21; > 1.5 is unambiguous
-    // external contention, not jitter). An absent witness (`None`)
-    // keeps the check BLOCKING — absence of evidence must not launder
-    // a regression.
+    // busy" — the disguised-wall-deadline anti-pattern.
+    //
+    // Judge the overrun against the CLEANUP WINDOW'S OWN dilation
+    // evidence (`VmResult::cleanup_sched_delta`: the join/drain
+    // performer thread's schedstat delta across exactly this window).
+    // The per-phase / whole-run witnesses are the WRONG instrument
+    // here and are deliberately not consulted: the monitor that feeds
+    // them is itself joined INSIDE the window, and join wake-latency
+    // is a tail phenomenon a whole-run average under-attests (field
+    // case: a 7.06 s cleanup failed a 5 s budget with whole-run
+    // D = 1.21 on a busy box). Demotion (non-blocking warn) when
+    // EITHER window-local instrument explains the overrun:
+    //   - excess ≤ Δrun_delay — the host scheduler ADDED at least the
+    //     overrun in runnable-wait to this thread during the window
+    //     (direct wall accounting, the strongest form);
+    //   - D_cleanup = 1 + Δdelay/Δon_cpu > 1.5 — the window itself was
+    //     contended past the established quiet-host bar (same
+    //     derivation as `PERF_ISOLATION_D_MAX`). Covers the
+    //     under-attestation of the first rule: a joined thread's own
+    //     wake latency surfaces as the joiner SLEEPING longer (not
+    //     runnable-waiting), while the joiner's remaining wakes still
+    //     dilate measurably.
+    // Absent/unattested evidence (no snapshot at either edge, or zero
+    // on-CPU — CONFIG_SCHEDSTATS off) keeps the check BLOCKING:
+    // absence of evidence must not launder a regression, and quiet
+    // hosts (local dev, unsaturated legs) still catch real teardown
+    // regressions.
     const CLEANUP_CONTENTION_D_MAX: f64 = 1.5;
     if let (Some(budget), Some(measured)) = (entry.cleanup_budget, result.cleanup_duration)
         && measured > budget
     {
-        let teardown_d = result.contention_witness.as_ref().and_then(|w| {
-            w.per_phase
-                .for_stage(crate::monitor::LifecycleStage::Teardown)
-                .dilation()
-        });
-        let witness_d = teardown_d.or(result
-            .host_vcpu_schedstat
-            .as_ref()
-            .and_then(|s| s.dilation()));
-        if witness_d.is_some_and(|d| d > CLEANUP_CONTENTION_D_MAX) {
+        let excess = measured - budget;
+        let delta = result.cleanup_sched_delta.as_ref();
+        let delay_ns = delta.map(|d| d.total_run_delay_ns).unwrap_or(0);
+        let d_cleanup = delta.and_then(|d| d.dilation());
+        let delay_covers = delta.is_some() && excess.as_nanos() as u64 <= delay_ns;
+        let window_contended = d_cleanup.is_some_and(|d| d > CLEANUP_CONTENTION_D_MAX);
+        if delay_covers || window_contended {
             eprintln!(
-                "vm cleanup overran budget under witnessed host contention: \
-                 measured {:.3}s, budget {:.3}s, witness D={:.2} ({}) — \
-                 non-blocking; the join/drain sequence dilates with host \
-                 load by design, and a quiet-host overrun would fail here.",
+                "vm cleanup overran budget under witnessed cleanup-window \
+                 contention: measured {:.3}s, budget {:.3}s, window run-delay \
+                 {:.3}s, D_cleanup={} — non-blocking; the join/drain sequence \
+                 dilates with host load by design. A quiet-window overrun \
+                 would fail here.",
                 measured.as_secs_f64(),
                 budget.as_secs_f64(),
-                witness_d.unwrap_or(f64::NAN),
-                if teardown_d.is_some() {
-                    "teardown-phase"
-                } else {
-                    "whole-run"
-                },
+                delay_ns as f64 / 1e9,
+                d_cleanup.map_or("unsampled".to_string(), |d| format!("{d:.2}")),
             );
         } else {
             check_result.merge(AssertResult::fail(crate::assert::AssertDetail::new(
                 crate::assert::DetailKind::Other,
                 format!(
                     "vm cleanup overran budget: measured {:.3}s, budget {:.3}s \
-                     (witness D={} — no host contention explains the excess). \
-                     Likely a regression in host-side teardown — investigate \
-                     the post-BSP-exit join/drain path \
+                     (cleanup-window run-delay {:.3}s, D_cleanup={} — the \
+                     window's own dilation evidence does not explain the \
+                     excess). Likely a regression in host-side teardown — \
+                     investigate the post-BSP-exit join/drain path \
                      (`vmm::KtstrVm::collect_results`).",
                     measured.as_secs_f64(),
                     budget.as_secs_f64(),
-                    witness_d.map_or("unsampled".to_string(), |d| format!("{d:.2}")),
+                    delay_ns as f64 / 1e9,
+                    d_cleanup.map_or("unsampled".to_string(), |d| format!("{d:.2}")),
                 ),
             )));
         }

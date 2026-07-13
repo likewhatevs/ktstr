@@ -431,8 +431,8 @@ fn eval_cleanup_budget_overshoot_folds_failing_detail() {
 
 /// Cleanup-budget contention demotion: the SAME overshoot as
 /// `eval_cleanup_budget_overshoot_folds_failing_detail`, but with a
-/// contention witness proving the host was saturated (whole-run
-/// D = 3.0 > the 1.5 bar) — the overrun demotes to a non-blocking
+/// cleanup-window schedstat delta proving the window was contended
+/// (run-delay covers the excess; D_cleanup > 1.5) — the overrun demotes to a non-blocking
 /// stderr warning and the guest's passing verdict survives. The
 /// join/drain teardown dilates with host load by design; only a
 /// quiet-host overrun is a teardown regression.
@@ -445,10 +445,12 @@ fn eval_cleanup_budget_overshoot_demotes_under_witnessed_contention() {
     entry.cleanup_budget = Some(std::time::Duration::from_secs(1));
     let mut result = make_vm_result_with_assert("", "", 0, false, &assert);
     result.cleanup_duration = Some(std::time::Duration::from_secs(10));
-    // Whole-run witness: D = 1 + 20/10 = 3.0 — unambiguous contention.
-    result.host_vcpu_schedstat = Some(crate::vmm::HostVcpuSchedstat {
-        total_on_cpu_ns: 10,
-        total_run_delay_ns: 20,
+    // Cleanup-window instrument: the join/drain thread accrued 9 s of
+    // runnable-wait across the window — covering the 9 s excess
+    // (delay-covers arm) AND D_cleanup = 10 > 1.5 (contended-window arm).
+    result.cleanup_sched_delta = Some(crate::vmm::HostVcpuSchedstat {
+        total_on_cpu_ns: 1_000_000_000,
+        total_run_delay_ns: 9_000_000_000,
         sampled_vcpus: 1,
     });
     let assertions = crate::assert::Assert::NO_OVERRIDES;
@@ -753,6 +755,7 @@ fn eval_monitor_fail_has_fingerprint() {
         watchdog_kill_reason: None,
         final_guest_phase: crate::vmm::GuestLifecyclePhase::Boot,
         final_progress_epoch: 0,
+        bpf_map_writes_delivered: None,
         output,
         stderr: String::new(),
         monitor: Some(crate::monitor::MonitorReport {
@@ -773,6 +776,7 @@ fn eval_monitor_fail_has_fingerprint() {
         kvm_stats: None,
         crash_message: None,
         cleanup_duration: None,
+        cleanup_sched_delta: None,
         virtio_blk_counters: None,
         virtio_net_counters: None,
         snapshot_bridge: {
@@ -1107,6 +1111,7 @@ fn eval_sched_exit_includes_monitor() {
         watchdog_kill_reason: None,
         final_guest_phase: crate::vmm::GuestLifecyclePhase::Boot,
         final_progress_epoch: 0,
+        bpf_map_writes_delivered: None,
         output: String::new(),
         stderr: String::new(),
         monitor: Some(crate::monitor::MonitorReport {
@@ -1136,6 +1141,7 @@ fn eval_sched_exit_includes_monitor() {
         kvm_stats: None,
         crash_message: None,
         cleanup_duration: None,
+        cleanup_sched_delta: None,
         virtio_blk_counters: None,
         virtio_net_counters: None,
         snapshot_bridge: {
@@ -1230,6 +1236,7 @@ fn eval_monitor_fail_includes_sched_log() {
         watchdog_kill_reason: None,
         final_guest_phase: crate::vmm::GuestLifecyclePhase::Boot,
         final_progress_epoch: 0,
+        bpf_map_writes_delivered: None,
         output,
         stderr: String::new(),
         monitor: Some(crate::monitor::MonitorReport {
@@ -1250,6 +1257,7 @@ fn eval_monitor_fail_includes_sched_log() {
         kvm_stats: None,
         crash_message: None,
         cleanup_duration: None,
+        cleanup_sched_delta: None,
         virtio_blk_counters: None,
         virtio_net_counters: None,
         snapshot_bridge: {
@@ -3158,6 +3166,7 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
         watchdog_kill_reason: None,
         final_guest_phase: crate::vmm::GuestLifecyclePhase::Boot,
         final_progress_epoch: 0,
+        bpf_map_writes_delivered: None,
         output: String::new(),
         stderr: String::new(),
         monitor: Some(crate::monitor::MonitorReport {
@@ -3178,6 +3187,7 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
         kvm_stats: None,
         crash_message: None,
         cleanup_duration: None,
+        cleanup_sched_delta: None,
         virtio_blk_counters: None,
         virtio_net_counters: None,
         snapshot_bridge: {

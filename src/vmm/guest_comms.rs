@@ -886,9 +886,12 @@ pub fn read_phys_base_from_iomem() -> Option<u64> {
     {
         // First "System RAM" entry = lowest-addressed DRAM region.
         // KERNEL_LOAD_ADDR == DRAM_START by construction in our VMM,
-        // so the kernel always loads at this base.
+        // so the kernel always loads at this base. Parse the "Kernel
+        // code" START (the displacement-bearing quantity) and its END
+        // (the convention discriminator — see below).
         let mut ram_start: Option<u64> = None;
         let mut code_start: Option<u64> = None;
+        let mut code_end: Option<u64> = None;
         for line in iomem.lines() {
             let line = line.trim();
             if ram_start.is_none() && line.ends_with(": System RAM") {
@@ -898,25 +901,54 @@ pub fn read_phys_base_from_iomem() -> Option<u64> {
             }
             if line.ends_with(": Kernel code") {
                 let range = line.split(':').next()?.trim();
-                let start = range.split('-').next()?.trim();
-                code_start = Some(u64::from_str_radix(start, 16).ok()?);
+                let mut parts = range.split('-');
+                code_start = Some(u64::from_str_radix(parts.next()?.trim(), 16).ok()?);
+                code_end = Some(u64::from_str_radix(parts.next()?.trim(), 16).ok()?);
             }
         }
-        // Debias the resource-start convention: "Kernel code" starts
-        // at `_stext` on ≤6.14 arm64, `_text` on newer — subtracting
-        // the same-boot kallsyms gap makes the result the IMAGE-BASE
-        // displacement on both (see the fn doc). `_stext` and `_text`
-        // share the KASLR virtual slide, so their difference equals
-        // the physical gap between the resource start and the image
-        // base exactly.
+        let delta = code_start?.wrapping_sub(ram_start?);
+        // Debias the resource-start convention CONDITIONALLY. The
+        // resource starts at `__pa_symbol(_stext)` on ≤6.14 arm64 and
+        // `__pa_symbol(_text)` on newer kernels
+        // (arch/arm64/kernel/setup.c:217 in each), while the SYMBOL gap
+        // `_stext − _text` (the `.head.text` + SEGMENT_ALIGN pad,
+        // 0x10000 on our 4K-granule builds) exists on BOTH layouts — an
+        // earlier unconditional subtraction underflowed the 7.1-era
+        // value to −0x10000 and poisoned every host text translation.
+        //
+        // Discriminator: the resource SIZE. The end is `__init_begin−1`
+        // on both generations, so
+        //   size == __init_begin − _stext  ⇔ the start is `_stext`
+        //   size == __init_begin − _text   ⇔ the start is `_text`
+        // Symbol DIFFERENCES from the same-boot kallsyms are exact
+        // (every symbol carries the same virtual KASLR slide) and a
+        // physical load displacement shifts start and end together,
+        // never the size — so this discriminates correctly even under
+        // real physical KASLR, where the naive `delta == gap` test is
+        // ambiguous (delta = displacement + maybe-bias). When the gap
+        // is 0 the conventions coincide and no bias exists. An
+        // unrecognized size (neither candidate — unexpected layout, or
+        // `__init_begin` missing from kallsyms) publishes nothing
+        // rather than a guess: the host tolerates an absent publish
+        // (CR3-walk fallback + per-tick adoption), while a WRONG one
+        // poisons every translation.
         let stext = read_kallsyms_symbol_kva("_stext", &["T", "t"])?;
         let text = read_kallsyms_symbol_kva("_text", &["T", "t"])?;
-        let stext_bias = stext.wrapping_sub(text);
-        Some(
-            code_start?
-                .wrapping_sub(ram_start?)
-                .wrapping_sub(stext_bias),
-        )
+        let stext_gap = stext.wrapping_sub(text);
+        if stext_gap == 0 {
+            return Some(delta);
+        }
+        let init_begin = read_kallsyms_symbol_kva("__init_begin", &["D", "d", "T", "t", "R", "r"])?;
+        let size = code_end?.wrapping_sub(code_start?).wrapping_add(1);
+        let size_if_stext = init_begin.wrapping_sub(stext);
+        let size_if_text = init_begin.wrapping_sub(text);
+        if size == size_if_stext {
+            Some(delta.wrapping_sub(stext_gap))
+        } else if size == size_if_text {
+            Some(delta)
+        } else {
+            None
+        }
     }
 }
 

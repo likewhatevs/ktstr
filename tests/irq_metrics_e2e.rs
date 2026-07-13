@@ -60,7 +60,7 @@ fn assert_irq_metrics(result: &VmResult) -> Result<()> {
     // capture regression — SKIP instead of failing the assertions
     // below. A quiet-host zero-capture run still falls through and
     // fails with the specific diagnosis. See `periodic_starvation_gate`.
-    ktstr::prelude::periodic_starvation_gate(result)?;
+    ktstr::prelude::periodic_starvation_gate(result, 2)?;
     // Coverage guard: the Counter deltas need >= 2 freezes that actually
     // captured per-CPU time. periodic_fired counts ATTEMPTS — it includes
     // rendezvous-timeout placeholders and dump-degraded reports, both of which
@@ -76,6 +76,15 @@ fn assert_irq_metrics(result: &VmResult) -> Result<()> {
         .iter_samples()
         .filter(|s| !s.snapshot.per_cpu_time().is_empty())
         .count();
+    // Data-bearing starvation gate at the SAME predicate this assertion
+    // checks (see the sibling PSI test): degraded-but-real captures carry
+    // empty per_cpu_time, invisible to the top-of-fn real-capture gate.
+    ktstr::prelude::starved_below_minimum_skip(
+        result,
+        cpu_captures,
+        2,
+        "periodic captures carrying per-CPU time",
+    )?;
     ensure!(
         cpu_captures >= 2,
         "only {cpu_captures} of {} periodic captures carried per-CPU time — need \

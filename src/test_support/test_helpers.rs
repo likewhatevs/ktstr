@@ -290,6 +290,7 @@ pub(crate) fn make_vm_result(
         watchdog_kill_reason: None,
         final_guest_phase: crate::vmm::GuestLifecyclePhase::Boot,
         final_progress_epoch: 0,
+        bpf_map_writes_delivered: None,
         output: output.to_string(),
         stderr: stderr.to_string(),
         monitor: None,
@@ -298,6 +299,7 @@ pub(crate) fn make_vm_result(
         kvm_stats: None,
         crash_message: None,
         cleanup_duration: None,
+        cleanup_sched_delta: None,
         virtio_blk_counters: None,
         virtio_net_counters: None,
         snapshot_bridge: {

@@ -3192,15 +3192,7 @@ pub fn default_post_vm_periodic_fired(result: &crate::vmm::VmResult) -> anyhow::
     // an environmental non-verdict — rather than fail; a quiet-host
     // miss still fails below, which is the regression this floor
     // exists to catch.
-    if let Some(d) = crate::test_support::eval::capture_starvation_witness(result) {
-        return Err(crate::test_support::eval::post_vm_skip(format!(
-            "no real periodic captures under witnessed host contention \
-             (D={d:.2}, periodic_fired={}, target={}): the readiness-gated \
-             capture chain was starved past the workload window — \
-             environmental non-verdict, not a capture-pipeline regression",
-            result.periodic_fired, result.periodic_target,
-        )));
-    }
+    crate::test_support::eval::periodic_starvation_gate(result, 1)?;
     anyhow::bail!(
         "no periodic snapshot produced real BPF state \
          (periodic_real_count=0, periodic_fired={}, target={}) — \

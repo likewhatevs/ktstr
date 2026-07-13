@@ -411,6 +411,32 @@ const CRASH_ASSERT: ktstr::assert::Assert = ktstr::assert::Assert {
     ..ktstr::assert::Assert::NO_OVERRIDES
 };
 
+/// Starvation gate for the BPF_CRASH negative fixtures: the expected
+/// crash is HOST-INJECTED (`bpf_map_write` → the scheduler's `crash`
+/// .bss flag), so the injection LANDING is a precondition of the
+/// detection these tests exist to prove. When the run ends with the
+/// injection provably undelivered (`bpf_map_writes_delivered ==
+/// Some(false)` — the kill-bounded injection thread was still waiting
+/// on guest boot / scheduler attach) AND the contention witness proves
+/// the host was saturated, the absent crash is an injection no-show —
+/// an environmental SKIP, not a detection regression. Every other
+/// combination falls through to the matcher: delivered-but-absent is
+/// the REAL detection failure, and an undelivered injection on a QUIET
+/// host is a broken injection pipeline that must fail loudly.
+fn neg_crash_injection_starvation_gate(result: &ktstr::prelude::VmResult) -> anyhow::Result<()> {
+    if result.bpf_map_writes_delivered == Some(false)
+        && let Some(d) = ktstr::prelude::capture_starvation_witness(result)
+    {
+        return Err(ktstr::prelude::post_vm_skip(format!(
+            "host-triggered crash injection never delivered under witnessed \
+             host contention (D={d:.2}, bpf_map_writes_delivered=Some(false)): \
+             the kill-bounded injection thread was starved past the run — \
+             environmental non-verdict; crash DETECTION was never exercised"
+        )));
+    }
+    Ok(())
+}
+
 #[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::linkme)]
 static __KTSTR_ENTRY_FORCED_STALL: KtstrTestEntry = KtstrTestEntry {
@@ -472,6 +498,7 @@ static __KTSTR_ENTRY_CRASH_AFTER: KtstrTestEntry = KtstrTestEntry {
     topology: TOPO_1L_4C_1T,
     scheduler: &KTSTR_SCHED,
     bpf_map_write: &[&BPF_CRASH],
+    post_vm_unconditional: Some(neg_crash_injection_starvation_gate),
     expect_err: true,
     assert: CRASH_ASSERT,
     ..KtstrTestEntry::DEFAULT
@@ -486,6 +513,7 @@ static __KTSTR_ENTRY_CRASH_AFTER: KtstrTestEntry = KtstrTestEntry {
     bpf_map_write = BPF_CRASH,
     expect_err = true,
     expect_scx_bpf_error_matches = r"ktstr:\s+host-triggered\s+crash",
+    post_vm_unconditional = neg_crash_injection_starvation_gate,
 )]
 fn neg_expect_scx_bpf_error_matches_e2e(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::basic::custom_crash_light(ctx)
@@ -500,6 +528,7 @@ fn neg_expect_scx_bpf_error_matches_e2e(ctx: &Ctx) -> Result<AssertResult> {
     bpf_map_write = BPF_CRASH,
     expect_err = true,
     expect_scx_bpf_error_contains = "ktstr: host-triggered crash",
+    post_vm_unconditional = neg_crash_injection_starvation_gate,
 )]
 fn neg_expect_scx_bpf_error_contains_e2e(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::basic::custom_crash_light(ctx)
@@ -513,6 +542,7 @@ static __KTSTR_ENTRY_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
     topology: TOPO_1L_4C_1T,
     scheduler: &KTSTR_SCHED,
     bpf_map_write: &[&BPF_CRASH],
+    post_vm_unconditional: Some(neg_crash_injection_starvation_gate),
     expect_err: true,
     assert: CRASH_ASSERT,
     ..KtstrTestEntry::DEFAULT

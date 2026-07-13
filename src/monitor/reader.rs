@@ -3155,6 +3155,24 @@ impl PhaseWitnessTracker {
     }
 }
 
+/// Semantic validation of candidate per-CPU rq PAs: every slot's
+/// `rq.cpu` field must read back its own index. The kernel stamps
+/// `rq->cpu = i` at `sched_init` for every possible CPU, so a correct
+/// translation chain matches the full identity permutation; stable
+/// garbage from a displaced-but-mapped page does not (probability
+/// ~2^-32 per slot past slot 0). Residue: an OUT-OF-BOUNDS slot-0 PA
+/// silently reads 0 == index 0, so the 1-vCPU case additionally
+/// requires the PA to be in-bounds; a mapped-but-wrong in-bounds page
+/// whose u32 at the rq.cpu offset happens to be 0 remains the (small,
+/// documented) narrow-topology residue.
+fn rq_cpu_fields_match(mem: &GuestMem, rq_pas: &[u64], rq_cpu_off: usize) -> bool {
+    !rq_pas.is_empty()
+        && rq_pas.iter().enumerate().all(|(i, &pa)| {
+            pa.saturating_add(rq_cpu_off as u64 + 4) <= mem.size()
+                && mem.read_u32(pa, rq_cpu_off) == i as u32
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn monitor_loop(
     mem: &GuestMem,
@@ -3781,15 +3799,43 @@ pub(crate) fn monitor_loop(
             // sample computes correct PAs.
             let kaslr_raw = refresh.kaslr_offset.load(Ordering::Acquire);
             let kaslr_live = kaslr_raw.saturating_sub(1);
+            // Candidate per-CPU rq PAs from THIS tick's live inputs —
+            // computed before the latch so the semantic conjunct below
+            // can validate them.
+            rq_pas_buf = super::symbols::compute_rq_pas(
+                refresh.runqueues_kva,
+                &fresh,
+                page_offset,
+                kaslr_live,
+            );
             // Gate the latch on the slide being published (raw != 0:
             // N>=2 is a real offset, 1 is the biased KASLR-off/nokaslr
             // case, 0 is "no publisher yet"). Without this the latch
             // could fire on a pre-publish sample whose rq PAs are
             // garbage (valid per-CPU offsets but a zero slide).
+            //
+            // SEMANTIC conjunct (`rq_cpu_fields_match`): the candidate
+            // rq PAs must read back `rq[i].cpu == i` for EVERY slot.
+            // This validates the ENTIRE translation chain end-to-end
+            // (phys_base, PAGE_OFFSET, kaslr slide, per-CPU offsets,
+            // BTF rq layout) against guest ground truth. Field
+            // motivation: a poisoned phys_base publish (arm64 debias
+            // sign bug) displaced the `__per_cpu_offset[]` read onto a
+            // mapped-but-wrong page whose STABLE nonzero garbage
+            // passed the shape gates (aarch64 carries no bit-63
+            // invariant), latched `data_valid`, and produced FALSE
+            // Tier-2 evidence — `runnable_demand=false` from wrong-PA
+            // rq reads killed a SPINNING guest. Shape heuristics
+            // cannot exclude stable garbage; reading the kernel's own
+            // per-rq CPU id can (a displaced page matching the full
+            // identity permutation is astronomically unlikely at
+            // width; the 1-slot narrow case keeps a small silent-zero
+            // residue, documented at the helper).
             if !data_valid
                 && page_offset_resolved
                 && kaslr_raw != 0
                 && super::symbols::per_cpu_offsets_populated(&per_cpu_offsets_buf, &fresh)
+                && rq_cpu_fields_match(mem, &rq_pas_buf, offsets.rq_cpu)
             {
                 data_valid = true;
                 latched_page_offset = page_offset;
@@ -3895,12 +3941,7 @@ pub(crate) fn monitor_loop(
                     );
                 }
             }
-            rq_pas_buf = super::symbols::compute_rq_pas(
-                refresh.runqueues_kva,
-                &fresh,
-                page_offset,
-                kaslr_live,
-            );
+            // (`rq_pas_buf` was recomputed above, before the latch.)
             // `event_pcpu_pas` requires both fresh `__per_cpu_offset[]`
             // AND a non-null `*scx_root` (a scheduler must be
             // attached). Until the scheduler attaches, `scx_sched_kva`
@@ -5374,6 +5415,13 @@ mod tests {
         combined[8..16].copy_from_slice(&pco1.to_ne_bytes());
         combined.extend_from_slice(&rq0_buf);
         combined.extend_from_slice(&rq1_buf);
+        // Stamp each rq's `cpu` field with its own index — the latch's
+        // semantic conjunct (`rq_cpu_fields_match`) requires it, exactly
+        // as `sched_init` stamps real runqueues.
+        for (i, pa) in [rq0_pa, rq1_pa].into_iter().enumerate() {
+            let off = pa as usize + offsets.rq_cpu;
+            combined[off..off + 4].copy_from_slice(&(i as u32).to_ne_bytes());
+        }
 
         // SAFETY: combined is a live local buffer (Vec<u8> or stack
         // array) whose backing storage outlives the GuestMem use.
@@ -5478,6 +5526,11 @@ mod tests {
         combined.extend_from_slice(&pco1.to_ne_bytes());
         combined.extend_from_slice(&rq0_buf);
         combined.extend_from_slice(&rq1_buf);
+        // Semantic-conjunct stamp: rq[i].cpu = i (see the sibling test).
+        for (i, pa) in [rq0_pa, rq1_pa].into_iter().enumerate() {
+            let off = pa as usize + offsets.rq_cpu;
+            combined[off..off + 4].copy_from_slice(&(i as u32).to_ne_bytes());
+        }
 
         // SAFETY: combined is a live local buffer whose backing storage
         // outlives the GuestMem use.
@@ -5700,6 +5753,11 @@ mod tests {
         combined[8..16].copy_from_slice(&pco1.to_ne_bytes());
         combined.extend_from_slice(&rq0_buf);
         combined.extend_from_slice(&rq1_buf);
+        // Semantic-conjunct stamp: rq[i].cpu = i (see the sibling test).
+        for (i, pa) in [rq0_pa, rq1_pa].into_iter().enumerate() {
+            let off = pa as usize + offsets.rq_cpu;
+            combined[off..off + 4].copy_from_slice(&(i as u32).to_ne_bytes());
+        }
 
         // SAFETY: combined is a live local buffer outliving the GuestMem use.
         let mem = unsafe { GuestMem::new(combined.as_ptr() as *mut u8, combined.len() as u64) };

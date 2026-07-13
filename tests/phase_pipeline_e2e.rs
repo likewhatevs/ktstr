@@ -103,7 +103,7 @@ fn assert_phase_pipeline(result: &VmResult) -> Result<()> {
     // capture regression — SKIP instead of failing the assertions
     // below. A quiet-host zero-capture run still falls through and
     // fails with the specific diagnosis. See `periodic_starvation_gate`.
-    ktstr::prelude::periodic_starvation_gate(result)?;
+    ktstr::prelude::periodic_starvation_gate(result, 1)?;
     // The bridge must have captured something across the 2-Step
     // run with `num_snapshots = 4` — `periodic_fired >= 1` is
     // the lower bound the periodic-capture e2e already pins;
@@ -363,7 +363,7 @@ fn assert_phase_pipeline_three_step(result: &VmResult) -> Result<()> {
     // capture regression — SKIP instead of failing the assertions
     // below. A quiet-host zero-capture run still falls through and
     // fails with the specific diagnosis. See `periodic_starvation_gate`.
-    ktstr::prelude::periodic_starvation_gate(result)?;
+    ktstr::prelude::periodic_starvation_gate(result, 3)?;
     anyhow::ensure!(
         result.periodic_fired >= 3,
         "periodic_fired = {} of {} — fewer than 3 captures means \
@@ -481,7 +481,7 @@ fn assert_iteration_rate_first_and_last(result: &VmResult) -> Result<()> {
     // capture regression — SKIP instead of failing the assertions
     // below. A quiet-host zero-capture run still falls through and
     // fails with the specific diagnosis. See `periodic_starvation_gate`.
-    ktstr::prelude::periodic_starvation_gate(result)?;
+    ktstr::prelude::periodic_starvation_gate(result, 2)?;
     anyhow::ensure!(
         result.periodic_fired >= 2,
         "periodic_fired = {} of {} — need a capture in each Step window \
@@ -585,7 +585,7 @@ fn assert_per_step_cpuset_changes_metrics(result: &VmResult) -> Result<()> {
     // capture regression — SKIP instead of failing the assertions
     // below. A quiet-host zero-capture run still falls through and
     // fails with the specific diagnosis. See `periodic_starvation_gate`.
-    ktstr::prelude::periodic_starvation_gate(result)?;
+    ktstr::prelude::periodic_starvation_gate(result, 1)?;
     // The framework-canonical per-phase buckets via the phase-buckets accessor:
     // one shared captures_series() drain folded through
     // build_phase_buckets_with_stimulus over the COMPLETE timeline

@@ -83,7 +83,7 @@ fn write_all_asm(fd: libc::c_int, bytes: &[u8]) {
 unsafe extern "C" fn fatal_signal_handler(
     sig: libc::c_int,
     info: *mut libc::siginfo_t,
-    _ctx: *mut libc::c_void,
+    ctx: *mut libc::c_void,
 ) {
     // Static prefixes per signal. Hard-coded because signal-name
     // formatting via `strsignal(3)` allocates / touches locale
@@ -118,6 +118,49 @@ unsafe extern "C" fn fatal_signal_handler(
     let mut hex_buf = [0u8; 16];
     let hex = u64_to_hex_asm(addr, &mut hex_buf);
 
+    // Faulting INSTRUCTION POINTER from the ucontext, plus this
+    // handler's own runtime address as a relocation anchor. `si_addr`
+    // alone names the datum (0x0 / a small struct offset for a null
+    // deref) but not the CODE that faulted — observed CI init crashes
+    // (`SIGSEGV at addr 0x0` / `0x140` before init's first output)
+    // were unattributable without the IP. The binary is PIE, so the
+    // raw IP is load-slid; printing the runtime address of
+    // `fatal_signal_handler` alongside lets one offline lookup
+    // recover the link-time IP:
+    //   link_ip = nm(binary, "fatal_signal_handler") + (ip - handler)
+    // Pure memory reads off the ucontext — AS-safe. gnu-libc layout
+    // only (the dual-role binary ships as *-unknown-linux-gnu on both
+    // arches); other envs print ip=0, still leaving the anchor.
+    let ip: u64 = if ctx.is_null() {
+        0
+    } else {
+        #[cfg(all(target_arch = "x86_64", target_env = "gnu"))]
+        // SAFETY: for SA_SIGINFO handlers the third argument is a
+        // `ucontext_t *` (sigaction(2)); non-null checked above.
+        unsafe {
+            (*(ctx as *const libc::ucontext_t)).uc_mcontext.gregs[libc::REG_RIP as usize] as u64
+        }
+        #[cfg(all(target_arch = "aarch64", target_env = "gnu"))]
+        // SAFETY: as above; aarch64 exposes the faulting PC directly.
+        unsafe {
+            (*(ctx as *const libc::ucontext_t)).uc_mcontext.pc
+        }
+        #[cfg(not(all(
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            target_env = "gnu"
+        )))]
+        {
+            0
+        }
+    };
+    let mut ip_buf = [0u8; 16];
+    let ip_hex = u64_to_hex_asm(ip, &mut ip_buf);
+    let mut anchor_buf = [0u8; 16];
+    let anchor_hex = u64_to_hex_asm(
+        fatal_signal_handler as *const () as usize as u64,
+        &mut anchor_buf,
+    );
+
     // Open COM2 first (canonical destination), then COM1. Both with
     // `O_WRONLY | O_NONBLOCK` so the open and the `write_all_asm`
     // loop never block on guest-side flow control. `tcdrain(2)`
@@ -138,6 +181,14 @@ unsafe extern "C" fn fatal_signal_handler(
         }
         write_all_asm(fd, prefix);
         write_all_asm(fd, hex);
+        // IP + anchor breadcrumb on the same PANIC line (the host's
+        // `extract_panic_message` captures the whole line): see the
+        // `ip`/anchor derivation above for the offline attribution
+        // formula.
+        write_all_asm(fd, b" ip=0x");
+        write_all_asm(fd, ip_hex);
+        write_all_asm(fd, b" handler=0x");
+        write_all_asm(fd, anchor_hex);
         write_all_asm(fd, b"\n");
         // Seal the contract: tcdrain waits for the kernel's output
         // queue to drain before we issue `reboot(2)`. PIO commits
