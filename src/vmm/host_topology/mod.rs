@@ -13,6 +13,11 @@ use anyhow::{Context, Result};
 // (production + `super::*` tests) compiling unchanged.
 use crate::flock::{FlockMode, try_flock};
 
+// Cross-invocation acquisition protocol: the ticket queue, the head
+// license + claim visibility, the inotify wait, and progress-based
+// patience. See protocol.rs's module doc for the full model.
+pub(crate) mod protocol;
+
 /// Resource contention error — LLC slots or CPUs unavailable.
 /// Downcast via `anyhow::Error::downcast_ref::<ResourceContention>()`
 /// to distinguish from fatal errors.
@@ -208,6 +213,22 @@ pub struct PinningPlan {
     /// (and the KtstrVm holding it) is dropped, releasing all locks.
     #[allow(dead_code)] // RAII: flock fds released on Drop, not read after construction.
     pub(crate) locks: Vec<std::os::fd::OwnedFd>,
+}
+
+impl PinningPlan {
+    /// Duplicate the plan's DESCRIPTION (assignments, service CPU,
+    /// LLC indices) with an EMPTY lock set. `PinningPlan` cannot be
+    /// `Clone` — the fds are RAII lock holders — but candidate plans
+    /// (pure `compute_pinning` output, no locks yet) need copying
+    /// between the fast path's scan list and the acquired result.
+    pub(crate) fn clone_unlocked(&self) -> PinningPlan {
+        PinningPlan {
+            assignments: self.assignments.clone(),
+            service_cpu: self.service_cpu,
+            llc_indices: self.llc_indices.clone(),
+            locks: Vec::new(),
+        }
+    }
 }
 
 /// Process-wide cache for [`HostTopology::cached`]. Only
@@ -483,6 +504,30 @@ impl HostTopology {
         reserve_service_cpu: bool,
         llc_offset: usize,
     ) -> Result<PinningPlan> {
+        self.compute_pinning_at(topo, reserve_service_cpu, llc_offset, 0)
+    }
+
+    /// [`Self::compute_pinning`] with an additional INTRA-LLC slot:
+    /// `intra_offset` selects which disjoint `vcpus_per_llc`-sized CPU
+    /// window inside each mapped LLC the plan assigns. `intra_offset
+    /// == 0` is exactly `compute_pinning`. This is the default run
+    /// path's candidate-DIVERSITY lever: without it, every 1-vCPU
+    /// cell's candidate for a given LLC offset is the same CPU prefix,
+    /// so a 64-CPU / 4-LLC host serializes 1-vCPU cells FOUR wide (one
+    /// per LLC) while 60 CPUs idle — a placement concentration the old
+    /// skip-on-contention regime silently masked. With intra slots, an
+    /// LLC with 16 CPUs offers 16 disjoint 1-vCPU candidates, and the
+    /// suite's effective default-cell parallelism scales with CPUs,
+    /// not LLC count. Returns `TopologyInsufficient` when the window
+    /// does not fit (the caller enumerating candidates treats that as
+    /// end-of-slots).
+    pub fn compute_pinning_at(
+        &self,
+        topo: &super::topology::Topology,
+        reserve_service_cpu: bool,
+        llc_offset: usize,
+        intra_offset: usize,
+    ) -> Result<PinningPlan> {
         let cores = topo.cores_per_llc;
         let threads = topo.threads_per_core;
         let llcs = topo.llcs;
@@ -532,14 +577,19 @@ impl HostTopology {
                 .filter(|c| !used_cpus.contains(c))
                 .collect();
 
-            if available.len() < vcpus_per_llc as usize {
+            // The intra window shifts the assigned slice by whole
+            // vcpus_per_llc-sized steps so distinct intra slots never
+            // overlap (disjoint per-CPU lock sets by construction).
+            let window_start = intra_offset * vcpus_per_llc as usize;
+            if available.len() < window_start + vcpus_per_llc as usize {
                 return Err(anyhow::Error::new(TopologyInsufficient {
                     reason: format!(
-                        "performance_mode: LLC group {} has {} available CPUs, \
-                         need {} for virtual LLC {}",
+                        "LLC group {} has {} available CPUs, need {} at \
+                         intra slot {} for virtual LLC {}",
                         llc_idx,
                         available.len(),
                         vcpus_per_llc,
+                        intra_offset,
                         llc,
                     ),
                 }));
@@ -547,7 +597,7 @@ impl HostTopology {
 
             for vcpu_in_llc in 0..vcpus_per_llc {
                 let vcpu_id = llc * vcpus_per_llc + vcpu_in_llc;
-                let host_cpu = available[vcpu_in_llc as usize];
+                let host_cpu = available[window_start + vcpu_in_llc as usize];
                 used_cpus.insert(host_cpu);
                 assignments.push((vcpu_id, host_cpu));
             }
@@ -746,13 +796,24 @@ pub enum LockOutcome {
 /// - Skipped for `Exclusive` LLC mode (the LLC lock already provides
 ///   exclusivity over all CPUs in the group).
 ///
-/// Single non-blocking attempt — thin wrapper over
-/// [`acquire_resource_locks_waiting`] with no wait deadline. Returns
-/// `LockOutcome::Unavailable` immediately when any resource is busy.
+/// Single non-blocking, all-or-nothing attempt (the fast path of the
+/// acquisition protocol — see [`protocol`]). Returns
+/// `LockOutcome::Unavailable` immediately when any resource is busy,
+/// having released every lock it took (protocol rule: no fast-path
+/// partial ever persists; only the queue head may hold partials).
+/// Locks are walked in the canonical global order (LLC index
+/// ascending, then CPU index ascending).
+///
+/// Claim-aware: when a live queue head has published a claim
+/// intersecting this request, the attempt reports `Unavailable`
+/// WITHOUT touching the claimed locks — fast-path callers subtract
+/// the head's target from their view of free capacity so disjoint
+/// invocations don't snipe the slots the head is accumulating.
+///
 /// Used by the offset-scan probe in
 /// [`crate::vmm::KtstrVm::acquire_default_run_locks`] (which needs a
-/// fast "is this offset free?" answer per candidate) and by the
-/// locking tests.
+/// fast "is this offset free?" answer per candidate), by perf mode's
+/// fast path, and by the locking tests.
 ///
 /// `KTSTR_CARGO_TEST_MODE` short-circuits the entire flock dance and
 /// returns `Acquired` with an empty fd list — bare `cargo test`
@@ -764,43 +825,36 @@ pub fn acquire_resource_locks(
     llc_indices: &[usize],
     llc_mode: LlcLockMode,
 ) -> Result<LockOutcome> {
-    acquire_resource_locks_waiting(plan, llc_indices, llc_mode, None)
+    acquire_resource_locks_waiting(plan, llc_indices, llc_mode, false)
 }
 
-/// Poll interval for the bounded-wait acquire paths
-/// ([`acquire_resource_locks_waiting`] and the holder-wait tail of
-/// [`acquire_llc_plan_with_acquire_fn`]). `flock(2)` has no timed
-/// blocking variant, so both emulate one by retrying the non-blocking
-/// form on this cadence. 100 ms matches `crate::flock::acquire`'s poll
-/// interval: responsive enough that a peer's release is picked up
-/// within one tick, cheap enough that a parked acquirer wakes only
-/// ~10×/s.
-pub(crate) const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// Bounded-WAIT reservation acquire.
+/// Fixed-set reservation acquire with optional queue-and-wait.
 ///
-/// `wait_deadline == None` is a single non-blocking attempt — the
-/// interactive / one-shot `ktstr shell` path, which degrades a busy
-/// host to a lock-free overcommit rather than parking a human, and the
-/// per-offset probe in the default run path.
+/// `wait == false` is the single non-blocking fast-path attempt — the
+/// interactive / one-shot `ktstr shell` path (which degrades a busy
+/// host to a lock-free overcommit rather than parking a human), the
+/// per-offset probe in the default run path, and build-time
+/// pre-checks.
 ///
-/// `wait_deadline == Some(instant)` is the TEST run path: when the
-/// reservation is busy the helper POLLS [`try_acquire_all`] every
-/// [`WAIT_POLL_INTERVAL`] until it acquires or `instant` passes. This
-/// is the resource-budget model's contract — a budgeted / shared
-/// acquirer WAITS for an exclusive holder: a colocated peer's
-/// perf-mode `LOCK_EX` releases when its VM run finishes and the
-/// waiter then proceeds, instead of converting a *transient* hold into
-/// a host-skip. The outer governor is nextest `terminate-after` (see
-/// [`crate::vmm::KtstrVm`]'s `RUN_LOCK_ACQUIRE_WAIT`): a peer that
-/// wedges past the deadline yields `Unavailable`, which the run path
-/// surfaces as a RETRYABLE contention failure (nextest re-runs the
-/// cell), never a silent "this host cannot run" skip.
+/// `wait == true` is the TEST run path: on a busy reservation the
+/// caller joins the cross-invocation acquisition queue
+/// ([`protocol::wait_for_queue_turn`]) and, once head, accumulates
+/// the fixed target set incrementally under the head license —
+/// holding partials, waking on lock-dir inotify events as holders
+/// release, re-sweeping on every wake. This is the resource-budget
+/// model's contract — a budgeted / shared acquirer WAITS for an
+/// exclusive holder — with progress-based patience: waiting continues
+/// as long as the queue advances or the sweep gains locks, and only
+/// [`protocol::ACQUIRE_NO_PROGRESS_PATIENCE`] of ZERO progress (a
+/// wedged holder) yields `Unavailable`, which the run path surfaces
+/// as a RETRYABLE contention failure (nextest re-runs the cell) —
+/// never a silent "this host cannot run" skip.
 ///
-/// All-or-nothing per poll: [`try_acquire_all`] drops every fd it
-/// took the instant one lock is busy, so a waiter never holds a
-/// partial reservation across a sleep — no lock-ordering deadlock
-/// between two waiters contending overlapping sets.
+/// The fixed set is the degenerate re-plan case: the target cannot
+/// change, so "re-plan on every wake" reduces to re-sweeping the same
+/// canonical-order lock list against live state. Queued, this caller
+/// holds NO resource locks; as head, its partials are fenced by the
+/// published claim.
 ///
 /// `KTSTR_CARGO_TEST_MODE` short-circuits to `Acquired` with an empty
 /// fd list, same as [`acquire_resource_locks`].
@@ -808,7 +862,7 @@ pub fn acquire_resource_locks_waiting(
     plan: &PinningPlan,
     llc_indices: &[usize],
     llc_mode: LlcLockMode,
-    wait_deadline: Option<std::time::Instant>,
+    wait: bool,
 ) -> Result<LockOutcome> {
     if crate::cargo_test_mode::cargo_test_mode_active() {
         return Ok(LockOutcome::Acquired {
@@ -816,21 +870,81 @@ pub fn acquire_resource_locks_waiting(
             locks: Vec::new(),
         });
     }
-    loop {
-        match try_acquire_all(plan, llc_indices, llc_mode) {
-            Ok(locks) => {
-                return Ok(LockOutcome::Acquired {
-                    llc_offset: llc_indices.first().copied().unwrap_or(0),
-                    locks,
-                });
-            }
-            Err(reason) => match wait_deadline {
-                Some(d) if std::time::Instant::now() < d => {
-                    std::thread::sleep(WAIT_POLL_INTERVAL);
-                }
-                _ => return Ok(LockOutcome::Unavailable(reason)),
-            },
+    let llc_offset = llc_indices.first().copied().unwrap_or(0);
+    // Fast path: claim-subtracted, non-blocking, all-or-nothing.
+    let first_reason = match try_acquire_all(plan, llc_indices, llc_mode) {
+        Ok(locks) => return Ok(LockOutcome::Acquired { llc_offset, locks }),
+        Err(reason) => reason,
+    };
+    if !wait {
+        return Ok(LockOutcome::Unavailable(first_reason));
+    }
+    // Contended: queue up (arrival order, crash-safe ticket), then
+    // accumulate as head.
+    let Some(_queue) = protocol::wait_for_queue_turn()? else {
+        return Ok(LockOutcome::Unavailable(format!(
+            "queue for {first_reason} made no progress for {:?} — a peer              holder appears wedged",
+            protocol::patience(),
+        )));
+    };
+    let target = protocol::canonical_lock_order(
+        llc_indices,
+        match llc_mode {
+            LlcLockMode::Exclusive => FlockMode::Exclusive,
+            LlcLockMode::Shared => FlockMode::Shared,
+        },
+        &fixed_set_cpus(plan, llc_mode),
+    );
+    let claim = claim_for(llc_indices, plan, llc_mode);
+    let outcome = protocol::acquire_as_head(|held| {
+        let gained = held.sweep(&target)? > 0;
+        if held.covers(&target) {
+            Ok(protocol::HeadStep::Complete(held.take(&target)))
+        } else {
+            Ok(protocol::HeadStep::Waiting {
+                claim: claim.clone(),
+                gained,
+                stalled_on: held.first_missing(&target).unwrap_or("<none>").to_string(),
+            })
         }
+    })?;
+    Ok(match outcome {
+        protocol::HeadOutcome::Acquired(locks) => LockOutcome::Acquired { llc_offset, locks },
+        protocol::HeadOutcome::TimedOut { stalled_on, waited } => {
+            LockOutcome::Unavailable(format!(
+                "no acquisition progress for {:?} after waiting {waited:?}                  (stalled on {stalled_on}; holders: {}) — a peer holder                  appears wedged",
+                protocol::patience(),
+                crate::flock::format_holder_list(
+                    &crate::flock::read_holders(std::path::Path::new(&stalled_on))
+                        .unwrap_or_default()
+                ),
+            ))
+        }
+        protocol::HeadOutcome::Aborted { reason } => LockOutcome::Unavailable(reason),
+    })
+}
+
+/// The CPU-lock set for a fixed reservation: assignment CPUs plus the
+/// service CPU, or empty for `Exclusive` LLC mode (the LLC lock
+/// already covers its CPUs).
+fn fixed_set_cpus(plan: &PinningPlan, llc_mode: LlcLockMode) -> Vec<usize> {
+    if llc_mode == LlcLockMode::Exclusive {
+        return Vec::new();
+    }
+    let mut cpus: Vec<usize> = plan.assignments.iter().map(|&(_, c)| c).collect();
+    cpus.extend(plan.service_cpu);
+    cpus
+}
+
+/// The published claim for a fixed reservation.
+fn claim_for(
+    llc_indices: &[usize],
+    plan: &PinningPlan,
+    llc_mode: LlcLockMode,
+) -> protocol::ClaimSet {
+    protocol::ClaimSet {
+        llcs: llc_indices.iter().copied().collect(),
+        cpus: fixed_set_cpus(plan, llc_mode).into_iter().collect(),
     }
 }
 
@@ -855,12 +969,12 @@ thread_local! {
     /// indices at 0..<host-llcs>. See tests `acquire_llc_plan_*`
     /// that build a small synth topo and point the prefix at a
     /// `TempDir`.
-    static LLC_LOCK_PREFIX_OVERRIDE: std::cell::RefCell<Option<String>> =
+    pub(crate) static LLC_LOCK_PREFIX_OVERRIDE: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 
     /// Thread-local override for the per-CPU lock prefix. Symmetric
     /// with `LLC_LOCK_PREFIX_OVERRIDE`.
-    static CPU_LOCK_PREFIX_OVERRIDE: std::cell::RefCell<Option<String>> =
+    pub(crate) static CPU_LOCK_PREFIX_OVERRIDE: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -868,7 +982,7 @@ thread_local! {
 /// via `KTSTR_LOCK_DIR` (fallback `/tmp`); tests can override the
 /// prefix via `LLC_LOCK_PREFIX_OVERRIDE` to keep their lockfile
 /// pool isolated.
-fn llc_lock_path(llc_idx: usize) -> String {
+pub(crate) fn llc_lock_path(llc_idx: usize) -> String {
     #[cfg(test)]
     {
         if let Some(p) = LLC_LOCK_PREFIX_OVERRIDE.with(|p| p.borrow().clone()) {
@@ -881,7 +995,7 @@ fn llc_lock_path(llc_idx: usize) -> String {
 /// Compose the per-CPU lockfile path for `cpu`. Symmetric with
 /// [`llc_lock_path`] — production resolves via `KTSTR_LOCK_DIR`;
 /// tests can override via `CPU_LOCK_PREFIX_OVERRIDE`.
-fn cpu_lock_path(cpu: usize) -> String {
+pub(crate) fn cpu_lock_path(cpu: usize) -> String {
     #[cfg(test)]
     {
         if let Some(p) = CPU_LOCK_PREFIX_OVERRIDE.with(|p| p.borrow().clone()) {
@@ -891,9 +1005,19 @@ fn cpu_lock_path(cpu: usize) -> String {
     format!("{}{cpu}.lock", cpu_lock_prefix())
 }
 
-/// Try to acquire all resource locks (all-or-nothing).
-/// Returns the held fds on success, or an error string describing
-/// which resource was busy.
+/// Try to acquire all resource locks (all-or-nothing, non-blocking,
+/// canonical order — see [`protocol`] rule 3). Returns the held fds
+/// on success, or an error string describing which resource was
+/// busy; on ANY failure every lock taken so far is released before
+/// returning, so no fast-path partial ever persists (only the queue
+/// head may hold partials).
+///
+/// Claim-aware: a LIVE head claim ([`protocol::read_live_claim`])
+/// intersecting this request fails the attempt up front WITHOUT
+/// touching the claimed lockfiles — fast-path callers must not snipe
+/// the slots the head is accumulating. Claim staleness is tolerated:
+/// a caller acting on an outdated read at worst bounces once against
+/// the real flocks.
 fn try_acquire_all(
     plan: &PinningPlan,
     llc_indices: &[usize],
@@ -903,39 +1027,30 @@ fn try_acquire_all(
         LlcLockMode::Exclusive => FlockMode::Exclusive,
         LlcLockMode::Shared => FlockMode::Shared,
     };
-    let mut locks = Vec::new();
-
-    // Lock LLC files.
-    for &llc_idx in llc_indices {
-        let path = llc_lock_path(llc_idx);
-        match try_flock(&path, flock_mode) {
+    let claim = protocol::read_live_claim();
+    if !claim.is_empty() {
+        if let Some(&idx) = llc_indices.iter().find(|i| claim.llcs.contains(i)) {
+            return Err(format!("LLC {idx} claimed by the queue head"));
+        }
+        if let Some(&cpu) = fixed_set_cpus(plan, llc_mode)
+            .iter()
+            .find(|c| claim.cpus.contains(c))
+        {
+            return Err(format!("CPU {cpu} claimed by the queue head"));
+        }
+    }
+    let target =
+        protocol::canonical_lock_order(llc_indices, flock_mode, &fixed_set_cpus(plan, llc_mode));
+    let mut locks = Vec::with_capacity(target.len());
+    for (path, mode) in &target {
+        match try_flock(path, *mode) {
             Ok(Some(fd)) => locks.push(fd),
-            Ok(None) => return Err(format!("LLC {llc_idx} busy")),
-            Err(e) => return Err(format!("LLC {llc_idx}: {e}")),
+            // Dropping `locks` on return releases everything taken
+            // so far — the all-or-nothing contract.
+            Ok(None) => return Err(format!("{path} busy")),
+            Err(e) => return Err(format!("{path}: {e}")),
         }
     }
-
-    // Per-CPU locks: skip for exclusive LLC mode (the LLC lock covers
-    // all CPUs in the group).
-    if llc_mode != LlcLockMode::Exclusive {
-        for &(_vcpu, host_cpu) in &plan.assignments {
-            let path = cpu_lock_path(host_cpu);
-            match try_flock(&path, FlockMode::Exclusive) {
-                Ok(Some(fd)) => locks.push(fd),
-                Ok(None) => return Err(format!("CPU {host_cpu} busy")),
-                Err(e) => return Err(format!("CPU {host_cpu}: {e}")),
-            }
-        }
-        if let Some(cpu) = plan.service_cpu {
-            let path = cpu_lock_path(cpu);
-            match try_flock(&path, FlockMode::Exclusive) {
-                Ok(Some(fd)) => locks.push(fd),
-                Ok(None) => return Err(format!("service CPU {cpu} busy")),
-                Err(e) => return Err(format!("service CPU {cpu}: {e}")),
-            }
-        }
-    }
-
     Ok(locks)
 }
 
@@ -1647,12 +1762,15 @@ fn try_acquire_llc_plan_locks(
 ///
 /// Runs DISCOVER → PLAN → ACQUIRE with up to
 /// [`ACQUIRE_MAX_TOCTOU_RETRIES`] retries (each separated by a
-/// per-retry sleep from [`TOCTOU_RETRY_DELAYS`]) to absorb
-/// plan/acquire races, then — when `wait_deadline` is `Some` — keeps
-/// polling on the [`WAIT_POLL_INTERVAL`] cadence until it acquires or
-/// the deadline passes, waiting out a genuine holder (a colocated
-/// perf-mode `LOCK_EX`) rather than skipping. `wait_deadline == None`
-/// bails the moment the TOCTOU budget is spent (the interactive path).
+/// per-retry sleep from [`TOCTOU_RETRY_DELAYS`]) as the acquisition
+/// protocol's non-blocking FAST PHASE — claim-subtracted and
+/// all-or-nothing (see [`protocol`]). `wait == false` (builds, the
+/// interactive shell) bails with `ResourceContention` the moment that
+/// budget is spent. `wait == true` (the test run path) then joins the
+/// cross-invocation queue and, as head, RE-PLANS AGAINST LIVE HOLDER
+/// STATE ON EVERY WAKE — plans are never cached across waits — waiting
+/// out a genuine holder (a colocated perf-mode `LOCK_EX`) with
+/// progress-based patience rather than skipping.
 /// On
 /// success returns an [`LlcPlan`] holding the selected LLCs, their
 /// flattened CPUs (intersected with the calling process's allowed
@@ -1681,7 +1799,7 @@ pub fn acquire_llc_plan(
     test_topo: &crate::topology::TestTopology,
     cpu_cap: Option<CpuCap>,
     policy: PlacementPolicy,
-    wait_deadline: Option<std::time::Instant>,
+    wait: bool,
 ) -> Result<LlcPlan> {
     if crate::cargo_test_mode::cargo_test_mode_active() {
         // Bare `cargo test` mode: no peer-coordination contract.
@@ -1739,7 +1857,7 @@ pub fn acquire_llc_plan(
         test_topo,
         cpu_cap,
         policy,
-        wait_deadline,
+        wait,
         try_acquire_llc_plan_locks,
     )
 }
@@ -1759,30 +1877,34 @@ pub fn acquire_llc_plan(
 /// can track its own attempt counter via interior mutability
 /// ([`std::cell::Cell`], `Mutex`, atomic int).
 ///
-/// The outer loop body — DISCOVER, PLAN, retry budget, final
+/// The FAST-PHASE loop body — DISCOVER, PLAN, retry budget, final
 /// holder diagnostics — is shared between both entry points so the
 /// test seam exercises the exact retry-and-diagnose sequence
-/// production uses, not a parallel implementation.
+/// production uses, not a parallel implementation. (`acquire_fn` is
+/// a fast-phase seam only: the wait phase acquires through the
+/// protocol head engine against real lockfiles.)
 ///
-/// `wait_deadline` separates the two contention regimes the loop
-/// serves. The first [`ACQUIRE_MAX_TOCTOU_RETRIES`] retries always
-/// fire (with the short [`TOCTOU_RETRY_DELAYS`]) to absorb a
-/// plan/acquire *race* — a peer that grabbed a slot between our
-/// DISCOVER and ACQUIRE and is about to release it. Beyond that budget
-/// the behaviour forks: `None` (interactive / no-wait) bails with
-/// `ResourceContention` exactly as before; `Some(instant)` (the test
-/// run path) keeps re-running DISCOVER→PLAN→ACQUIRE on the
-/// [`WAIT_POLL_INTERVAL`] cadence until it acquires or `instant`
-/// passes — a genuine holder (a colocated perf-mode `LOCK_EX`) is
-/// WAITED OUT rather than skipped. Re-planning each poll (not just
-/// re-acquiring a frozen set) keeps the Spread policy honest against
-/// the live holder counts while it waits.
+/// `wait` separates the two contention regimes. The first
+/// [`ACQUIRE_MAX_TOCTOU_RETRIES`] retries always fire (with the short
+/// [`TOCTOU_RETRY_DELAYS`]) as the protocol fast path: non-blocking,
+/// all-or-nothing, claim-subtracted — they absorb plan/acquire
+/// *races* (a peer that grabbed a slot between our DISCOVER and
+/// ACQUIRE). Beyond that budget the behaviour forks: `wait == false`
+/// (builds / interactive) bails with `ResourceContention`; `wait ==
+/// true` (the test run path) joins the acquisition queue and, once
+/// head, re-runs DISCOVER→PLAN against LIVE holder state on every
+/// lock-dir wake — the re-plan-on-wake contract — accumulating
+/// `LOCK_SH` on the freshly selected LLCs under the head license
+/// (partials retained across re-plans exactly when the new plan still
+/// selects them) until the plan completes or progress-based patience
+/// expires. Waiting is event-driven (inotify on the lock dir), never
+/// polled.
 fn acquire_llc_plan_with_acquire_fn<F>(
     topo: &HostTopology,
     test_topo: &crate::topology::TestTopology,
     cpu_cap: Option<CpuCap>,
     policy: PlacementPolicy,
-    wait_deadline: Option<std::time::Instant>,
+    wait: bool,
     mut acquire_fn: F,
 ) -> Result<LlcPlan>
 where
@@ -1840,22 +1962,50 @@ where
         reason: format!("read /proc/self/mountinfo: {e}"),
     })?;
 
+    // ---- FAST PHASE: TOCTOU-bounded, non-blocking, all-or-nothing,
+    // claim-subtracted (protocol rules 2-4). Bounded attempts, then
+    // either bail (no-wait callers) or join the queue.
     let mut attempt: u32 = 0;
-    let wait_start = std::time::Instant::now();
     loop {
         let snapshots =
             discover_llc_snapshots(topo, &allowed, &mountinfo).map_err(|e| ResourceContention {
                 reason: format!("discover LLC snapshots: {e}"),
             })?;
-        let selected = plan_from_snapshots(
-            &snapshots,
-            target_cpus,
-            topo,
-            &allowed,
-            |from, to| test_topo.numa_distance(from, to),
-            policy,
-        );
-        if selected.is_empty() {
+        // Subtract a live queue head's claim from the eligible set:
+        // fast-path planners must not target the LLCs the head is
+        // accumulating (protocol rule 2). If the remainder cannot
+        // carry the budget, the attempt is a bounce — never an
+        // under-budget plan.
+        let claim = protocol::read_live_claim();
+        let eligible: Vec<LlcSnapshot> = snapshots
+            .iter()
+            .filter(|snap| !claim.llcs.contains(&snap.llc_idx))
+            .cloned()
+            .collect();
+        let claim_filtered = eligible.len() != snapshots.len();
+        let eligible_capacity: usize = eligible
+            .iter()
+            .map(|snap| {
+                topo.llc_groups[snap.llc_idx]
+                    .cpus
+                    .iter()
+                    .filter(|c| allowed.contains(c))
+                    .count()
+            })
+            .sum();
+        let selected = if eligible_capacity >= target_cpus {
+            plan_from_snapshots(
+                &eligible,
+                target_cpus,
+                topo,
+                &allowed,
+                |from, to| test_topo.numa_distance(from, to),
+                policy,
+            )
+        } else {
+            Vec::new()
+        };
+        if selected.is_empty() && !claim_filtered {
             // Every LLC's CPU set lies outside the allowed cpuset —
             // sysfs disagrees with sched_getaffinity. This is a host
             // misconfiguration (stale sysfs after hotplug, cgroup
@@ -1872,110 +2022,261 @@ where
             }
             .into());
         }
-        match acquire_fn(&selected, &snapshots).map_err(|e| ResourceContention {
-            reason: format!("acquire LLC locks: {e}"),
-        })? {
-            Some(locks) => {
-                // Success — materialize cpus + mems from the selected
-                // indices, intersecting each LLC's CPU list with
-                // `allowed` so `plan.cpus` never contains a CPU the
-                // process cannot run on, and TRUNCATING at exactly
-                // `target_cpus` so the last-LLC overshoot
-                // contributes only the prefix the budget needs. The
-                // full LLC is still flocked (the coordination unit
-                // is per-LLC), but the CPUs beyond `target_cpus`
-                // never appear in `plan.cpus` — sched_setaffinity
-                // masks and cgroup cpuset.cpus writes reflect the
-                // exact budget. `mems` collects the NUMA nodes of
-                // CPUs that actually appear in `plan.cpus`; an LLC
-                // that contributes a partial slice on a cross-node
-                // split only registers the nodes of its
-                // actually-used CPUs.
-                let mut cpus: Vec<usize> = Vec::new();
-                let mut mems: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-                'outer: for &idx in &selected {
-                    let group = &topo.llc_groups[idx];
-                    for &cpu in &group.cpus {
-                        if !allowed.contains(&cpu) {
-                            continue;
-                        }
-                        if cpus.len() >= target_cpus {
-                            break 'outer;
-                        }
-                        cpus.push(cpu);
-                        let node = topo.cpu_to_node.get(&cpu).copied().unwrap_or(0);
-                        mems.insert(node);
-                    }
-                }
-                return Ok(LlcPlan {
-                    locked_llcs: selected,
-                    cpus,
-                    mems,
-                    snapshot: snapshots,
-                    locks,
-                });
-            }
-            None => {
-                let toctou_exhausted = attempt >= ACQUIRE_MAX_TOCTOU_RETRIES;
-                // Keep polling past the TOCTOU budget only while a wait
-                // deadline is set AND unexpired — that is the "wait out
-                // a genuine holder" regime. With no deadline (or once it
-                // passes) the loop bails the instant the TOCTOU budget
-                // is spent, preserving the pre-wait behaviour exactly.
-                let keep_waiting = wait_deadline
-                    .map(|d| std::time::Instant::now() < d)
-                    .unwrap_or(false);
-                if toctou_exhausted && !keep_waiting {
-                    // Rebuild holder diagnostics from a FRESH read so
-                    // the error points at the peer that actually won.
-                    let final_snapshots = discover_llc_snapshots(topo, &allowed, &mountinfo)?;
-                    let holders: Vec<String> = final_snapshots
-                        .iter()
-                        .filter(|s| !s.holders.is_empty())
-                        .map(|s| {
-                            format!(
-                                "LLC {}: {}",
-                                s.llc_idx,
-                                crate::flock::format_holder_list(&s.holders)
-                            )
-                        })
-                        .collect();
-                    let holder_text = if holders.is_empty() {
-                        "<none recorded>".to_string()
-                    } else {
-                        holders.join("; ")
-                    };
-                    let waited = if wait_deadline.is_some() {
-                        format!(
-                            " after waiting {:?} for a peer to release",
-                            wait_start.elapsed()
-                        )
-                    } else {
-                        String::new()
-                    };
-                    return Err(anyhow::Error::new(ResourceContention {
-                        reason: format!(
-                            "acquire_llc_plan: could not reserve {target_cpus} \
-                             CPU(s) after {attempts} attempts{waited}; holders: \
-                             {holder_text}. Run `ktstr locks --json` to see \
-                             every ktstr lock on this host.",
-                            attempts = attempt + 1,
-                        ),
-                    }));
-                }
-                // Sleep between attempts. The first ACQUIRE_MAX_TOCTOU_RETRIES
-                // use the short TOCTOU backoff so a racing peer has time to
-                // drop its fds before the next DISCOVER; once that budget is
-                // spent the wait regime polls on the steady WAIT_POLL_INTERVAL
-                // cadence until the holder releases or the deadline passes.
-                let delay = TOCTOU_RETRY_DELAYS
-                    .get(attempt as usize)
-                    .copied()
-                    .unwrap_or(WAIT_POLL_INTERVAL);
-                std::thread::sleep(delay);
-                attempt = attempt.saturating_add(1);
-            }
+        let acquired = if selected.is_empty() {
+            // Claim-blocked: bounce without touching any lockfile.
+            None
+        } else {
+            acquire_fn(&selected, &snapshots).map_err(|e| ResourceContention {
+                reason: format!("acquire LLC locks: {e}"),
+            })?
+        };
+        if let Some(locks) = acquired {
+            return Ok(materialize_llc_plan(
+                selected,
+                snapshots,
+                locks,
+                topo,
+                &allowed,
+                target_cpus,
+            ));
         }
+        if attempt >= ACQUIRE_MAX_TOCTOU_RETRIES {
+            break;
+        }
+        // Short backoff between fast-phase attempts so a racing peer
+        // has time to drop its fds before the next DISCOVER.
+        std::thread::sleep(TOCTOU_RETRY_DELAYS[attempt as usize]);
+        attempt = attempt.saturating_add(1);
+    }
+
+    if !wait {
+        // Rebuild holder diagnostics from a FRESH read so the error
+        // points at the peer that actually won.
+        let final_snapshots = discover_llc_snapshots(topo, &allowed, &mountinfo)?;
+        let holders: Vec<String> = final_snapshots
+            .iter()
+            .filter(|s| !s.holders.is_empty())
+            .map(|s| {
+                format!(
+                    "LLC {}: {}",
+                    s.llc_idx,
+                    crate::flock::format_holder_list(&s.holders)
+                )
+            })
+            .collect();
+        let holder_text = if holders.is_empty() {
+            "<none recorded>".to_string()
+        } else {
+            holders.join("; ")
+        };
+        return Err(anyhow::Error::new(ResourceContention {
+            reason: format!(
+                "acquire_llc_plan: could not reserve {target_cpus} \
+                 CPU(s) after {attempts} attempts; holders: \
+                 {holder_text}. Run `ktstr locks --json` to see \
+                 every ktstr lock on this host.",
+                attempts = ACQUIRE_MAX_TOCTOU_RETRIES + 1,
+            ),
+        }));
+    }
+
+    // ---- WAIT PHASE: queue up, then accumulate as head with
+    // re-plan-on-every-wake (see `protocol`). Queued, this caller
+    // holds NO resource locks (every fast-phase attempt above was
+    // all-or-nothing); as head, its `LOCK_SH` partials are retained
+    // across re-plans exactly when the fresh plan still selects them.
+    let Some(_queue) = protocol::wait_for_queue_turn()? else {
+        return Err(anyhow::Error::new(ResourceContention {
+            reason: format!(
+                "acquire_llc_plan: acquisition queue made no progress \
+                 for {:?} — a peer holder appears wedged. Run `ktstr \
+                 locks --json` to see every ktstr lock on this host.",
+                protocol::patience(),
+            ),
+        }));
+    };
+    let outcome = protocol::acquire_as_head(|held| {
+        // RE-PLAN against live holder state on every wake — plans are
+        // never cached across waits. The freed capacity may satisfy a
+        // different selection than the one that was busy last wake.
+        let snapshots =
+            discover_llc_snapshots(topo, &allowed, &mountinfo).map_err(|e| ResourceContention {
+                reason: format!("discover LLC snapshots: {e}"),
+            })?;
+        let selected = plan_from_snapshots(
+            &snapshots,
+            target_cpus,
+            topo,
+            &allowed,
+            |from, to| test_topo.numa_distance(from, to),
+            policy,
+        );
+        if selected.is_empty() {
+            return Ok(protocol::HeadStep::Abort {
+                reason: format!(
+                    "no host LLC overlaps the process's {allowed_cpus}-CPU \
+                     allowed set — sysfs LLC groups and sched_getaffinity \
+                     disagree"
+                ),
+            });
+        }
+        let target = protocol::canonical_lock_order(&selected, FlockMode::Shared, &[]);
+        held.retain_paths(&target.iter().map(|(p, _)| p.clone()).collect());
+        let gained = held.sweep(&target)? > 0;
+        if held.covers(&target) {
+            let locks = held.take(&target);
+            Ok(protocol::HeadStep::Complete((selected, snapshots, locks)))
+        } else {
+            Ok(protocol::HeadStep::Waiting {
+                claim: protocol::ClaimSet {
+                    llcs: selected.iter().copied().collect(),
+                    cpus: std::collections::BTreeSet::new(),
+                },
+                gained,
+                stalled_on: held.first_missing(&target).unwrap_or("<none>").to_string(),
+            })
+        }
+    })?;
+    match outcome {
+        protocol::HeadOutcome::Acquired((selected, snapshots, locks)) => Ok(materialize_llc_plan(
+            selected,
+            snapshots,
+            locks,
+            topo,
+            &allowed,
+            target_cpus,
+        )),
+        protocol::HeadOutcome::TimedOut { stalled_on, waited } => {
+            Err(anyhow::Error::new(ResourceContention {
+                reason: format!(
+                    "acquire_llc_plan: no acquisition progress for {:?} \
+                     after waiting {waited:?} for a peer to release \
+                     (stalled on {stalled_on}; holders: {}) — the holder \
+                     appears wedged. Run `ktstr locks --json` to see every \
+                     ktstr lock on this host.",
+                    protocol::patience(),
+                    crate::flock::format_holder_list(
+                        &crate::flock::read_holders(std::path::Path::new(&stalled_on))
+                            .unwrap_or_default()
+                    ),
+                ),
+            }))
+        }
+        protocol::HeadOutcome::Aborted { reason } => {
+            Err(anyhow::Error::new(ResourceContention { reason }))
+        }
+    }
+}
+
+/// PLAN-ONLY variant of [`acquire_llc_plan`]: DISCOVER → PLAN →
+/// materialize, taking NO locks. Used by the no-perf build path when
+/// its non-blocking reservation is contended (a perf `LOCK_EX` head
+/// or its claim covering the pool): the build plan only shapes setup
+/// — budget size and affinity masks — and the run-time replan
+/// re-acquires real locks through the acquisition queue, so failing
+/// the build over a transient claim would only feed retry storms.
+/// The returned plan's `locks` is empty by construction; peers'
+/// DISCOVER will not see this cell's reservation until the run-time
+/// replan takes real fds (an accepted truthfulness gap — the cell
+/// owns nothing yet).
+pub fn plan_llc_selection_only(
+    topo: &HostTopology,
+    test_topo: &crate::topology::TestTopology,
+    cpu_cap: Option<CpuCap>,
+    policy: PlacementPolicy,
+) -> Result<LlcPlan> {
+    let allowed_vec = host_allowed_cpus();
+    if allowed_vec.is_empty() {
+        return Err(ResourceContention {
+            reason: "could not determine allowed CPU set \
+                     (sched_getaffinity and /proc/self/status both failed)"
+                .into(),
+        }
+        .into());
+    }
+    let allowed: std::collections::BTreeSet<usize> = allowed_vec.iter().copied().collect();
+    let target_cpus = match cpu_cap {
+        Some(cap) => cap.effective_count(allowed.len())?,
+        None => default_cpu_budget(allowed.len()),
+    };
+    let mountinfo = crate::flock::read_mountinfo().map_err(|e| ResourceContention {
+        reason: format!("read /proc/self/mountinfo: {e}"),
+    })?;
+    let snapshots =
+        discover_llc_snapshots(topo, &allowed, &mountinfo).map_err(|e| ResourceContention {
+            reason: format!("discover LLC snapshots: {e}"),
+        })?;
+    let selected = plan_from_snapshots(
+        &snapshots,
+        target_cpus,
+        topo,
+        &allowed,
+        |from, to| test_topo.numa_distance(from, to),
+        policy,
+    );
+    if selected.is_empty() {
+        return Err(ResourceContention {
+            reason: format!(
+                "no host LLC overlaps the process's {}-CPU allowed set — \
+                 sysfs LLC groups and sched_getaffinity disagree",
+                allowed.len(),
+            ),
+        }
+        .into());
+    }
+    Ok(materialize_llc_plan(
+        selected,
+        snapshots,
+        Vec::new(),
+        topo,
+        &allowed,
+        target_cpus,
+    ))
+}
+
+/// Materialize the final [`LlcPlan`] from a selected LLC set and its
+/// held locks: flatten each selected LLC's CPUs, intersecting with
+/// `allowed` so `plan.cpus` never contains a CPU the process cannot
+/// run on, and TRUNCATING at exactly `target_cpus` so the last-LLC
+/// overshoot contributes only the prefix the budget needs. The full
+/// LLC is still flocked (the coordination unit is per-LLC), but the
+/// CPUs beyond `target_cpus` never appear in `plan.cpus` —
+/// sched_setaffinity masks and cgroup cpuset.cpus writes reflect the
+/// exact budget. `mems` collects the NUMA nodes of CPUs that actually
+/// appear in `plan.cpus`; an LLC that contributes a partial slice on
+/// a cross-node split only registers the nodes of its actually-used
+/// CPUs. Shared by the fast-phase and head-phase success paths so the
+/// two cannot drift.
+fn materialize_llc_plan(
+    selected: Vec<usize>,
+    snapshots: Vec<LlcSnapshot>,
+    locks: Vec<std::os::fd::OwnedFd>,
+    topo: &HostTopology,
+    allowed: &std::collections::BTreeSet<usize>,
+    target_cpus: usize,
+) -> LlcPlan {
+    let mut cpus: Vec<usize> = Vec::new();
+    let mut mems: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    'outer: for &idx in &selected {
+        let group = &topo.llc_groups[idx];
+        for &cpu in &group.cpus {
+            if !allowed.contains(&cpu) {
+                continue;
+            }
+            if cpus.len() >= target_cpus {
+                break 'outer;
+            }
+            cpus.push(cpu);
+            let node = topo.cpu_to_node.get(&cpu).copied().unwrap_or(0);
+            mems.insert(node);
+        }
+    }
+    LlcPlan {
+        locked_llcs: selected,
+        cpus,
+        mems,
+        snapshot: snapshots,
+        locks,
     }
 }
 

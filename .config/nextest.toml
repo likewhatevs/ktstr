@@ -1,12 +1,28 @@
 # ── Profiles ──────────────────────────────────────────────────────────
 
-# The run path WAITS for a contended LLC/CPU reservation to free
-# (KtstrVm::RUN_LOCK_ACQUIRE_WAIT) rather than skipping, so most
-# contention never reaches nextest at all. A ResourceContention that
-# DOES surface (a peer wedged past the wait) is a RETRYABLE failure,
-# not a skip — these retries wait it out across re-runs, alongside the
-# true transient flakes, which typically resolve by retry 2-3.
-# max-delay keeps the per-failure budget tight.
+# SCHEDULING MODEL: nextest is a pure SPAWNER; the lock-dir queue is
+# the actual scheduler (see host_topology::protocol — the
+# "second-order scheduler"). nextest admits every cell at once; cells
+# park CHEAPLY in the acquisition queue (a ticket flock + an inotify
+# fd, no guest memory — acquisition runs before VM setup) until host
+# capacity frees. Consequences for this config:
+#
+#  - Reported per-test DURATIONS INCLUDE LOCK-QUEUE TIME. That is
+#    accepted; no effort is spent excluding queue wait from timings
+#    or slow-test flagging.
+#  - slow-timeout rails for lock-taking cells must exceed the FULL
+#    suite drain, not one cell's runtime, because the deepest-queued
+#    cell's wall approaches the whole makespan. The in-cell progress
+#    watchdog is the real hang detector and the queue's progress-based
+#    patience is the wedged-holder detector, so nextest terminate-after
+#    is a rail of LAST RESORT and generosity costs little detection
+#    quality. See the vm-cell override block below for the sizing
+#    derivation.
+#  - A ResourceContention that surfaces to nextest is a RETRYABLE
+#    failure (only a no-progress patience expiry — a wedged holder —
+#    produces one), never a skip; these retries re-run it, alongside
+#    the true transient flakes, which typically resolve by retry 2-3.
+#    max-delay keeps the per-failure budget tight.
 #
 # test-threads = 16 caps parallelism well below `num-cpus` on
 # high-core dev boxes so VM-pinning,
@@ -24,9 +40,19 @@ test-threads = 16
 [profile.default.junit]
 path = "junit.xml"
 
+# ci: test-threads = 64 so VM cells are ADMITTED (spawned into the
+# lock-dir queue) quickly instead of trickling in behind non-lock-
+# taking unit tests at the default 16-wide schedule. Queued waiters
+# are cheap (see the scheduling-model note above), so a wide spawn
+# costs ~nothing; the lock dir — not nextest — decides how many cells
+# actually execute. 64 rather than "all cells at once" because the
+# non-lock-taking unit tests interleaved in the same schedule DO use
+# real CPU, and 64 concurrent short tests already saturate admission
+# within seconds.
 [profile.ci]
 slow-timeout = { period = "90s", terminate-after = 3 }
 retries = { backoff = "exponential", count = 6, delay = "1s", jitter = true, max-delay = "3s" }
+test-threads = 64
 failure-output = "final"
 fail-fast = false
 
@@ -36,6 +62,27 @@ path = "junit.xml"
 # CI overrides — mirrors profile.default.overrides. nextest does not
 # inherit overrides across profiles, so every override that should
 # apply under --profile ci must be duplicated here.
+
+# LOCK-TAKING VM CELLS: last-resort rail sized for FULL-SUITE DRAIN,
+# not per-cell runtime (overrides are first-match per setting, so this
+# must stay FIRST to win slow-timeout for these filters; later
+# blocks still contribute retries / test-groups). Derivation: nextest
+# admits every cell at once and the lock-dir queue serializes to host
+# capacity, so the deepest-queued cell's nextest-visible wall ≈ the
+# whole VM-suite makespan (its reported duration INCLUDES queue time —
+# accepted). Measured local reference (64-CPU / 4-LLC dev box, full
+# `just test 7.1.3` at 64 test-threads): ~500 lock-taking cells, suite
+# nextest wall 413 s, worst single cell 359 s (queue-inclusive), 82
+# cells above 60 s. CI runners are ~200 CPUs / 24 LLCs but share the
+# lock dir THREE ways (colocated runner units), so cross-invocation
+# drain can stack several suites deep — call it 3× the local drain
+# plus long-cell tails. 180 s × 20 = 60 min of rail keeps nextest
+# strictly behind the real detectors — the in-cell progress watchdog
+# (hangs) and the queue's no-progress patience (wedged holders, 120 s)
+# — which both fire orders of magnitude sooner on genuine faults.
+[[profile.ci.overrides]]
+filter = "test(/^ktstr\\//) | test(/^verifier\\//) | test(demo_) | test(gauntlet/) | test(boot_kernel) | test(bench_boot) | test(sched_perf_) | test(shell_exec_) | test(eevdf_) | test(disk_template_e2e) | test(cached_releases_with_non_singleton_bypasses_cache)"
+slow-timeout = { period = "180s", terminate-after = 20 }
 
 [[profile.ci.overrides]]
 filter = "test(boot_kernel) | test(bench_boot)"
@@ -156,6 +203,14 @@ threads-required = 1
 # sibling would not accidentally inherit). Any current or future
 # sibling in the same binary picks up the budget — the cold-load
 # contention is binary-wide, not per-test.
+# LOCK-TAKING VM CELLS, default profile: same full-suite-drain rail as
+# profile.ci (see that block's derivation) — kept first so it wins
+# slow-timeout for these filters; later blocks still contribute their
+# other settings.
+[[profile.default.overrides]]
+filter = "test(/^ktstr\\//) | test(/^verifier\\//) | test(demo_) | test(gauntlet/) | test(boot_kernel) | test(bench_boot) | test(sched_perf_) | test(shell_exec_) | test(eevdf_) | test(disk_template_e2e) | test(cached_releases_with_non_singleton_bypasses_cache)"
+slow-timeout = { period = "180s", terminate-after = 20 }
+
 [[profile.default.overrides]]
 filter = "test(vmm::sched_stats::)"
 slow-timeout = { period = "180s", terminate-after = 1 }

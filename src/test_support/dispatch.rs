@@ -1016,8 +1016,9 @@ pub const EXIT_INCONCLUSIVE: i32 = 2;
 ///
 /// `ResourceContention` does NOT map to a skip: the run path WAITS for
 /// a contended reservation to free (see [`crate::vmm::KtstrVm`]'s
-/// `RUN_LOCK_ACQUIRE_WAIT`), so a contention that still surfaces here is
-/// a peer holding past that wait — [`classify_host_error`] routes it to
+/// the acquisition queue's progress-based patience), so a contention that
+/// still surfaces here means zero queue/acquisition progress for the whole
+/// patience window — a wedged peer. [`classify_host_error`] routes it to
 /// [`HostClass::Fail`] → [`EXIT_FAIL`], a RETRYABLE failure nextest
 /// re-runs once the holder releases. That is the correct mechanism: a
 /// skip is [`EXIT_PASS`], which nextest never retries, so the old

@@ -42,7 +42,7 @@ fn acquire_default_run_locks_overcommits_with_no_host_topo() {
     // AllowedCpusGuard is module-private; the override is thread-local +
     // per-test isolated, so a leak could not cross tests regardless.)
     host_topology::ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = Some(vec![0, 1]));
-    let rl = KtstrVm::acquire_default_run_locks(None, &Topology::new(1, 1, 1, 1), None, None);
+    let rl = KtstrVm::acquire_default_run_locks(None, &Topology::new(1, 1, 1, 1), None, false);
     host_topology::ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = None);
     let rl = rl.expect("no-host overcommit is Ok, not an error");
     assert_eq!(
@@ -67,7 +67,7 @@ fn acquire_default_run_locks_overcommits_when_host_too_small() {
     // AllowedCpusGuard is module-private; the override is thread-local +
     // per-test isolated, so a leak could not cross tests regardless.)
     host_topology::ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = Some(vec![0, 1]));
-    let rl = KtstrVm::acquire_default_run_locks(Some(&host), &topo, None, None);
+    let rl = KtstrVm::acquire_default_run_locks(Some(&host), &topo, None, false);
     host_topology::ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = None);
     let rl = rl.expect("a too-small host overcommits, it does not error or skip");
     assert_eq!(

@@ -90,17 +90,54 @@ exclusive reservation, and never contends with its own cells' locks.
   </g>
 </svg></div>
 
-When the default path cannot map its topology 1:1 onto the host it
-does not fail: if a plan exists but every slot is busy, the run
-*waits* — acquisition polls the busy reservations (bounded by the
-run path's acquire-wait budget) until a holder releases, so a peer's
-transient `LOCK_EX` costs throughput, never coverage. Contention that
-outlives the wait surfaces as a `ResourceContention` *failure* that
-nextest retries — it is never a skip, because a skip is a pass nextest
-does not retry. If no plan can exist
-(host too small), the run proceeds *overcommitted* — every vCPU
-thread masked to the allowed CPUs — and warns when that means
-oversubscription (see below).
+## The queue: a second-order scheduler under nextest
+
+nextest is a pure spawner: it launches every test process at once and
+retries failures. The lock dir is the actual scheduler — it decides
+which cells *execute* against host capacity (with the guest scheduler
+under test as the third layer down). The coordination protocol that
+makes this work across disjoint invocations sharing one
+`KTSTR_LOCK_DIR` (colocated runner units, concurrent nextest runs):
+
+- **Fast path.** Every acquirer first tries its whole planned lock
+  set non-blocking, all-or-nothing, in canonical lock order — cells
+  satisfiable *right now* never queue, and no fast-path partial ever
+  persists (everything is released on any bounce).
+- **The queue.** A bounced acquirer joins a single queue flock in the
+  lock dir (arrival order via the kernel's flock wait queue; tickets
+  are flocks, so a crashed waiter vanishes with its process). Waiters
+  are cheap: acquisition runs *before* VM setup, so a queued cell
+  holds a ticket and an inotify fd — no guest memory, no vCPUs. That
+  is what lets nextest admit hundreds of cells at once.
+- **The head license.** The queue holder — the head — is the only
+  agent anywhere allowed to hold a *partial* lock set while waiting
+  for more. One incremental acquirer cannot deadlock (a cycle needs
+  two holders-waiting) and cannot starve (it only accumulates), which
+  is the protocol's core safety argument.
+- **Re-plan on every wake.** The head sleeps on an inotify watch of
+  the lock dir; any lockfile release wakes it, and it re-plans
+  against *live* holder state — plans are never cached across waits,
+  so a freed resource that satisfies a different plan than the one
+  that was busy is taken immediately. Partials the fresh plan still
+  needs are kept; only abandoned ones release.
+- **Claims.** The head publishes its current target set; fast-path
+  planners in every process subtract it from their view of free
+  capacity, so nobody snipes the slots the head is accumulating —
+  while any *other* free capacity stays fair game (work conservation:
+  a small `LOCK_SH` cell never waits behind a hungry `LOCK_EX` head
+  it doesn't overlap).
+- **Progress-based patience.** Waiting is bounded by *progress*, not
+  wall time: as long as the queue turns over (or the head gains
+  locks) a waiter keeps waiting — a cell deep in a busy-but-advancing
+  queue is fine. Only a no-progress window (a wedged holder,
+  genuinely pathological) surfaces a `ResourceContention` *failure*
+  that nextest retries — never a skip, because a skip is a pass
+  nextest does not retry, which silently costs coverage.
+
+When the default path cannot map its topology 1:1 onto the host at
+all (no plan can exist — host too small), the run proceeds
+*overcommitted* — every vCPU thread masked to the allowed CPUs — and
+warns when that means oversubscription (see below).
 
 ## Too-small hosts: who asked determines the verdict
 
@@ -197,10 +234,10 @@ Budgeted acquisition runs three phases:
    all-or-nothing. If any lock is busy, every held lock is dropped
    and the whole cycle retries a few times with short ascending
    backoff (absorbing plan/acquire races). Test-run acquisition then
-   keeps polling the full cycle until a holder releases, bounded by
-   the run path's acquire-wait budget; build-time and interactive
-   acquisition stop at the short backoff. When its budget is
-   exhausted, either bails with a
+   joins the acquisition queue and completes as head — re-running
+   DISCOVER → PLAN against live holder state on every lock-dir wake
+   (see the queue section above); build-time and interactive
+   acquisition stop at the short backoff and bail with a
    `ResourceContention` error naming the winning holders.
 
 The lock granularity is per-LLC, but the reserved CPU list holds

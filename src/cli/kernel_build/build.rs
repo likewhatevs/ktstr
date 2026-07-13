@@ -158,11 +158,11 @@ pub fn acquire_build_reservation(
             cpu_cap,
             crate::vmm::host_topology::PlacementPolicy::Consolidate,
             // Build-time reservation keeps the non-blocking (TOCTOU-only)
-            // behaviour: the source-tree lock (acquire_source_tree_lock)
+            // fast path: the source-tree lock (acquire_source_tree_lock)
             // already serialises concurrent builds with a try-then-wait,
-            // and a build is throughput-elastic. The WAIT-for-holder policy
+            // and a build is throughput-elastic. The queue-and-wait policy
             // is the run path's (KtstrVm::run).
-            None,
+            false,
         )?;
         crate::vmm::host_topology::warn_if_cross_node_spill(&acquired_plan, &host_topo);
         Some(acquired_plan)

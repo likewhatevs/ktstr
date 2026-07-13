@@ -141,6 +141,198 @@ pub fn block_flock<P: AsRef<Path>>(path: P, mode: FlockMode) -> Result<OwnedFd> 
     Ok(fd)
 }
 
+/// RT signal used to interrupt a deadline-bounded blocking `flock(2)`
+/// ([`block_flock_deadline`]). `SIGRTMIN+4`: `SIGRTMIN` itself is the
+/// vCPU kick (`crate::vmm::vcpu::vcpu_signal`); +4 leaves headroom for
+/// future vCPU-adjacent signals without colliding. The handler is a
+/// no-op — the entire point is the `EINTR` the delivery forces out of
+/// the blocked `flock`.
+fn flock_deadline_signal() -> libc::c_int {
+    libc::SIGRTMIN() + 4
+}
+
+/// Install the no-op handler for [`flock_deadline_signal`] exactly
+/// once, process-wide. `sa_flags` deliberately OMITS `SA_RESTART`:
+/// the kernel must NOT transparently restart the interrupted `flock`,
+/// because the `EINTR` return is the deadline mechanism. The signal
+/// is delivered thread-directed (`SIGEV_THREAD_ID` targeting the
+/// blocked thread), so no other thread observes it.
+fn install_flock_deadline_handler() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        extern "C" fn noop(_: libc::c_int) {}
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = noop as *const () as usize;
+            sa.sa_flags = 0; // no SA_RESTART — EINTR is load-bearing.
+            libc::sigemptyset(&mut sa.sa_mask);
+            let rc = libc::sigaction(flock_deadline_signal(), &sa, std::ptr::null_mut());
+            assert_eq!(
+                rc,
+                0,
+                "install_flock_deadline_handler: sigaction(SIGRTMIN+4) failed: {} — \
+                 deadline-bounded flock waits would park forever",
+                std::io::Error::last_os_error(),
+            );
+        }
+    });
+}
+
+/// RAII POSIX per-thread interval timer that delivers
+/// [`flock_deadline_signal`] to the CREATING thread. Armed with a
+/// one-shot expiry at the deadline plus a periodic re-fire, so a
+/// signal that lands in the race window between the deadline check
+/// and the next blocking `flock` entry cannot strand the waiter —
+/// the next interval tick interrupts it again.
+struct DeadlineTimer {
+    id: libc::timer_t,
+}
+
+impl DeadlineTimer {
+    /// Create and arm a timer targeted at the calling thread: first
+    /// fire at `tick` (clamped to the remaining deadline budget),
+    /// re-firing every `tick` after.
+    fn arm(deadline: std::time::Instant, tick: std::time::Duration) -> Result<Self> {
+        install_flock_deadline_handler();
+        let remaining = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .min(tick)
+            .max(std::time::Duration::from_millis(1));
+        unsafe {
+            let mut sev: libc::sigevent = std::mem::zeroed();
+            sev.sigev_notify = libc::SIGEV_THREAD_ID;
+            sev.sigev_signo = flock_deadline_signal();
+            sev.sigev_notify_thread_id = libc::gettid();
+            let mut id: libc::timer_t = std::mem::zeroed();
+            if libc::timer_create(libc::CLOCK_MONOTONIC, &mut sev, &mut id) != 0 {
+                anyhow::bail!(
+                    "timer_create for deadline-bounded flock: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            let spec = libc::itimerspec {
+                it_value: libc::timespec {
+                    tv_sec: remaining.as_secs() as libc::time_t,
+                    tv_nsec: remaining.subsec_nanos() as libc::c_long,
+                },
+                // Periodic re-fire closes the check-then-block race:
+                // if a fire lands between the clock check and flock
+                // entry, the next tick still interrupts.
+                it_interval: libc::timespec {
+                    tv_sec: tick.as_secs() as libc::time_t,
+                    tv_nsec: tick.subsec_nanos() as libc::c_long,
+                },
+            };
+            if libc::timer_settime(id, 0, &spec, std::ptr::null_mut()) != 0 {
+                let e = std::io::Error::last_os_error();
+                libc::timer_delete(id);
+                anyhow::bail!("timer_settime for deadline-bounded flock: {e}");
+            }
+            Ok(DeadlineTimer { id })
+        }
+    }
+}
+
+impl Drop for DeadlineTimer {
+    fn drop(&mut self) {
+        // SAFETY: `id` came from a successful timer_create and is
+        // deleted exactly once (Drop).
+        unsafe {
+            libc::timer_delete(self.id);
+        }
+    }
+}
+
+/// Outcome of one [`block_flock_step`] blocking cycle.
+#[derive(Debug)]
+pub enum FlockWait {
+    /// Lock granted before the deadline; the fd holds it (RAII).
+    Granted(OwnedFd),
+    /// The periodic tick fired before the deadline: the caller gets
+    /// control back to re-evaluate (re-plan, re-scan alternatives)
+    /// and decide whether to call the step again. The kernel
+    /// wait-queue position is released with the step's fd.
+    Tick,
+    /// The deadline passed while blocked.
+    DeadlineExpired,
+}
+
+/// One deadline-bounded BLOCKING `flock(2)` cycle with a periodic
+/// re-evaluation tick.
+///
+/// Parks the calling thread in the kernel's per-inode flock wait
+/// queue — the wake-latency primitive the polling loops lacked: the
+/// kernel wakes the waiter at release time, so a freed lock is
+/// picked up in microseconds, not at the next poll interval.
+///
+/// Returns:
+///  - [`FlockWait::Granted`] when the lock is granted,
+///  - [`FlockWait::Tick`] when `tick` elapses first (caller
+///    re-evaluates live state — e.g. a queue head re-scanning for a
+///    fully-free alternative target — then typically calls again),
+///  - [`FlockWait::DeadlineExpired`] when `deadline` passes,
+///  - `Err` on open / unexpected-errno failures.
+///
+/// Mechanism: a thread-targeted `CLOCK_MONOTONIC` POSIX timer
+/// ([`DeadlineTimer`]) delivers `SIGRTMIN+4` (no-op handler, no
+/// `SA_RESTART`) to this thread every `tick` (clamped to the
+/// remaining deadline budget), forcing the blocked `flock` to return
+/// `EINTR`; the step maps that to `Tick` or `DeadlineExpired` by the
+/// clock. The interval re-fire means a signal landing in the gap
+/// between arming and blocking cannot strand the waiter.
+pub fn block_flock_step<P: AsRef<Path>>(
+    path: P,
+    mode: FlockMode,
+    deadline: std::time::Instant,
+    tick: std::time::Duration,
+) -> Result<FlockWait> {
+    use rustix::fs::{FlockOperation, flock};
+
+    if std::time::Instant::now() >= deadline {
+        return Ok(FlockWait::DeadlineExpired);
+    }
+    let path = path.as_ref();
+    let fd = open_lockfile(path)?;
+    let op = match mode {
+        FlockMode::Exclusive => FlockOperation::LockExclusive,
+        FlockMode::Shared => FlockOperation::LockShared,
+    };
+    let _timer = DeadlineTimer::arm(deadline, tick)?;
+    match flock(&fd, op) {
+        Ok(()) => Ok(FlockWait::Granted(fd)),
+        Err(e) if e == rustix::io::Errno::INTR => {
+            if std::time::Instant::now() >= deadline {
+                Ok(FlockWait::DeadlineExpired)
+            } else {
+                Ok(FlockWait::Tick)
+            }
+        }
+        Err(e) => anyhow::bail!("flock (blocking, deadline) {}: {e}", path.display()),
+    }
+}
+
+/// Deadline-bounded BLOCKING `flock(2)` with no tick observation:
+/// loops [`block_flock_step`] until granted or the deadline expires.
+/// Used where the caller has nothing to re-evaluate mid-wait — e.g.
+/// a contended acquirer parking on the acquisition-queue ticket.
+///
+/// Returns `Ok(Some(fd))` when granted before `deadline`, `Ok(None)`
+/// on expiry, `Err` on open / unexpected-errno failures.
+pub fn block_flock_deadline<P: AsRef<Path>>(
+    path: P,
+    mode: FlockMode,
+    deadline: std::time::Instant,
+) -> Result<Option<OwnedFd>> {
+    let path = path.as_ref();
+    loop {
+        match block_flock_step(path, mode, deadline, std::time::Duration::from_millis(500))? {
+            FlockWait::Granted(fd) => return Ok(Some(fd)),
+            FlockWait::Tick => continue,
+            FlockWait::DeadlineExpired => return Ok(None),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +377,113 @@ mod tests {
         );
 
         drop(fd);
+    }
+
+    /// `block_flock_step` tri-state contract: while a peer holds
+    /// `LOCK_EX`, a step with a short tick returns `Tick` (the
+    /// thread-targeted timer interrupted the blocked flock via EINTR —
+    /// this is the empirical pin for the SIGRTMIN+4 deadline
+    /// machinery), a step whose deadline lapses returns
+    /// `DeadlineExpired`, and once the peer releases, a step returns
+    /// `Granted` carrying the lock.
+    #[test]
+    fn block_flock_step_tick_expiry_and_grant() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("step.lock");
+        let peer = try_flock(&path, FlockMode::Exclusive)
+            .expect("open")
+            .expect("peer EX on fresh file");
+
+        // Tick: deadline far, tick near — the timer must interrupt
+        // the blocked flock rather than leaving it parked.
+        let start = std::time::Instant::now();
+        let step = block_flock_step(
+            &path,
+            FlockMode::Exclusive,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(150),
+        )
+        .expect("step must not error");
+        assert!(
+            matches!(step, FlockWait::Tick),
+            "near tick + far deadline must interrupt as Tick; got {step:?}",
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "the tick must fire near its interval, not hang; elapsed={:?}",
+            start.elapsed(),
+        );
+
+        // DeadlineExpired: deadline nearer than the tick.
+        let step = block_flock_step(
+            &path,
+            FlockMode::Exclusive,
+            std::time::Instant::now() + std::time::Duration::from_millis(150),
+            std::time::Duration::from_secs(30),
+        )
+        .expect("step must not error");
+        assert!(
+            matches!(step, FlockWait::DeadlineExpired),
+            "lapsed deadline must report DeadlineExpired; got {step:?}",
+        );
+
+        // Granted: kernel wakeup when the peer releases mid-block.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(peer);
+        });
+        let start = std::time::Instant::now();
+        let step = block_flock_step(
+            &path,
+            FlockMode::Exclusive,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(30),
+        )
+        .expect("step must not error");
+        releaser.join().expect("releaser");
+        assert!(
+            matches!(step, FlockWait::Granted(_)),
+            "release must grant the blocked step via kernel wakeup; got {step:?}",
+        );
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(150),
+            "grant must come from the release, not an instant win; elapsed={:?}",
+            start.elapsed(),
+        );
+    }
+
+    /// `block_flock_deadline` wraps the step loop: bounded `None` on a
+    /// never-released peer, `Some(fd)` when the peer releases within
+    /// the deadline.
+    #[test]
+    fn block_flock_deadline_bounds_and_grants() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("deadline.lock");
+        let peer = try_flock(&path, FlockMode::Exclusive)
+            .expect("open")
+            .expect("peer EX on fresh file");
+
+        let got = block_flock_deadline(
+            &path,
+            FlockMode::Exclusive,
+            std::time::Instant::now() + std::time::Duration::from_millis(250),
+        )
+        .expect("must not error");
+        assert!(got.is_none(), "held lock past the deadline must yield None");
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(peer);
+        });
+        let got = block_flock_deadline(
+            &path,
+            FlockMode::Exclusive,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .expect("must not error");
+        releaser.join().expect("releaser");
+        assert!(got.is_some(), "release within the deadline must grant");
     }
 }

@@ -305,9 +305,12 @@ fn resource_lock_service_cpu_contention() {
 
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
     let reason = expect_unavailable(outcome, Some("when service CPU is held"));
+    // The canonical-order acquire reports the busy LOCKFILE PATH
+    // (service CPU and assignment CPUs share the ktstr-cpu-* family);
+    // the service CPU's index in the path is what identifies it.
     assert!(
-        reason.contains("service CPU") && reason.contains("90901"),
-        "reason should mention service CPU 90901: {reason}",
+        reason.contains("90901") && reason.contains("busy"),
+        "reason should name the busy service-CPU lockfile 90901: {reason}",
     );
 
     // All prior locks should be released (all-or-nothing).
@@ -491,7 +494,7 @@ fn acquire_llc_plan_none_cap_reserves_thirty_percent_cpus() {
     // TestTopology only needs to be a valid synthetic().
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
 
-    let plan = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, None)
+    let plan = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, false)
         .expect("clean pool must allow SH on every selected LLC");
     // 30% of 10 CPUs = ceil(3.0) = 3 CPUs. 2-CPU LLCs: LLC 0
     // contributes 2, LLC 1 contributes 1 (partial-take), total
@@ -539,7 +542,7 @@ fn acquire_llc_plan_bails_on_exclusive_peer() {
         .expect("peer EX must acquire on clean pool");
 
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
-    let err = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, None)
+    let err = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, false)
         .expect_err("EX peer must block SH acquisition of the only LLC");
     let rendered = format!("{err:#}");
     assert!(
@@ -575,7 +578,7 @@ fn acquire_llc_plan_coexists_with_shared_peer() {
         .expect("peer SH must acquire on clean pool");
 
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
-    let plan = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, None)
+    let plan = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, false)
         .expect("second SH caller must coexist with the first");
     assert_eq!(
         plan.locks.len(),
@@ -613,13 +616,8 @@ fn resource_lock_wait_acquires_after_peer_release() {
         drop(holder);
     });
     let start = std::time::Instant::now();
-    let outcome = acquire_resource_locks_waiting(
-        &plan,
-        &[90700usize],
-        LlcLockMode::Exclusive,
-        Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
-    )
-    .unwrap();
+    let outcome =
+        acquire_resource_locks_waiting(&plan, &[90700usize], LlcLockMode::Exclusive, true).unwrap();
     let elapsed = start.elapsed();
     let (_, locks) = unwrap_acquired(outcome, Some("after the peer's timed release"));
     assert_eq!(locks.len(), 1);
@@ -630,14 +628,18 @@ fn resource_lock_wait_acquires_after_peer_release() {
     releaser.join().expect("releaser thread must not panic");
 }
 
-/// The WAIT deadline is honoured: with the peer's `LOCK_EX` never
-/// released, `acquire_resource_locks_waiting` polls until the deadline
-/// passes and then returns `Unavailable` (which the run path surfaces
-/// as retryable contention) — it neither bails early nor parks
-/// forever. Timing floor pins that it polled through the window.
+/// Progress-based patience is honoured: with the peer's `LOCK_EX`
+/// never released (a "wedged holder"), the head gains nothing, its
+/// no-progress patience (overridden short for the test) expires, and
+/// the acquire returns `Unavailable` (which the run path surfaces as
+/// retryable contention) — it neither bails early nor parks forever.
+/// Timing floor pins that it actually waited through the window.
 #[test]
-fn resource_lock_wait_deadline_expiry_returns_unavailable() {
+fn resource_lock_wait_patience_expiry_returns_unavailable() {
     let _prefixes = LockPrefixesGuard::new();
+    super::super::protocol::PATIENCE_OVERRIDE.with(|p| {
+        *p.borrow_mut() = Some(std::time::Duration::from_millis(400));
+    });
     let plan = PinningPlan {
         assignments: vec![(0, 90800)],
         service_cpu: None,
@@ -649,22 +651,23 @@ fn resource_lock_wait_deadline_expiry_returns_unavailable() {
         .unwrap()
         .expect("peer EX must acquire on clean pool");
     let start = std::time::Instant::now();
-    let outcome = acquire_resource_locks_waiting(
-        &plan,
-        &[90800usize],
-        LlcLockMode::Exclusive,
-        Some(std::time::Instant::now() + std::time::Duration::from_millis(350)),
-    )
-    .unwrap();
+    let outcome =
+        acquire_resource_locks_waiting(&plan, &[90800usize], LlcLockMode::Exclusive, true).unwrap();
     let elapsed = start.elapsed();
+    super::super::protocol::PATIENCE_OVERRIDE.with(|p| *p.borrow_mut() = None);
     let reason = expect_unavailable(outcome, Some("with the peer never releasing"));
     assert!(
         reason.contains("90800"),
-        "reason should identify the busy LLC: {reason}",
+        "reason should identify the stalled lock: {reason}",
     );
     assert!(
-        elapsed >= std::time::Duration::from_millis(300),
-        "acquire must poll until the deadline, not bail early; elapsed={elapsed:?}",
+        reason.contains("no acquisition progress"),
+        "reason must frame the bail as a no-progress verdict, not a \
+         wall deadline: {reason}",
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(350),
+        "acquire must wait out the patience window, not bail early; elapsed={elapsed:?}",
     );
 }
 
@@ -692,14 +695,8 @@ fn acquire_llc_plan_waits_out_real_exclusive_peer() {
     });
 
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
-    let plan = acquire_llc_plan(
-        &topo,
-        &test_topo,
-        None,
-        PlacementPolicy::Consolidate,
-        Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
-    )
-    .expect("wait-enabled acquisition must complete after the peer releases");
+    let plan = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, true)
+        .expect("wait-enabled acquisition must complete after the peer releases");
     assert_eq!(plan.locks.len(), 1, "one fd for the single released LLC");
     releaser.join().expect("releaser thread must not panic");
 }

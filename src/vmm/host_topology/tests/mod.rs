@@ -316,3 +316,4 @@ fn synth_host_topo(groups: &[(Vec<usize>, usize)]) -> HostTopology {
 mod locking;
 mod pinning;
 mod planning;
+mod protocol;

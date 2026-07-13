@@ -111,7 +111,8 @@ where
 /// [`ResourceContention`] is DELIBERATELY excluded: a busy slot is
 /// TRANSIENT, not a host-shape fact. The run path now WAITS for a
 /// holder to release (see [`crate::vmm::KtstrVm`]'s
-/// `RUN_LOCK_ACQUIRE_WAIT`), and any contention that still surfaces is
+/// the acquisition queue's progress-based patience), and any contention
+/// that still surfaces is
 /// routed to a RETRYABLE failure by [`classify_host_error`], never a
 /// host-skip marker — so a colocated peer's `LOCK_EX` can never be
 /// mislabelled "this host cannot run". The unconditional hard-fail
@@ -201,9 +202,10 @@ pub fn classify_host_error(e: &anyhow::Error, no_skip: bool) -> HostClass {
     if is_resource_contention(e) {
         let reason = extract_reason::<ResourceContention, _>(e, |rc| rc.reason.clone());
         // TRANSIENT contention, never permanent host incapacity. Two
-        // producers reach here: the run-lock path (which already WAITED
-        // `RUN_LOCK_ACQUIRE_WAIT` for the holder — reaching here means a
-        // peer outlived the wait) and the transient-KVM-errno mapper in
+        // producers reach here: the run-lock path (which already queued
+        // and waited with progress-based patience — reaching here means
+        // ZERO progress for the whole window: a wedged peer) and the
+        // transient-KVM-errno mapper in
         // `crate::vmm::contention` (ENOMEM / EMFILE / EBUSY under host
         // pressure). Both resolve on re-run, so route to a RETRYABLE
         // failure nextest re-runs — NOT a silent skip (a skip is a pass

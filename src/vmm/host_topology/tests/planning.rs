@@ -282,7 +282,7 @@ fn acquire_llc_plan_rejects_cap_over_allowed_cpus() {
         &test_topo,
         Some(cap),
         PlacementPolicy::Consolidate,
-        None,
+        false,
     )
     .expect_err("cap > allowed_cpus must error");
     assert!(
@@ -800,7 +800,7 @@ fn acquire_llc_plan_consolidates_on_peer_held_llc() {
         &test_topo,
         Some(cap),
         PlacementPolicy::Consolidate,
-        None,
+        false,
     )
     .expect("SH is reentrant — parent SH must coexist with child SH");
 
@@ -943,7 +943,7 @@ fn acquire_llc_plan_holds_locks_live_until_drop() {
         &test_topo,
         Some(cap),
         PlacementPolicy::spread_for_process(),
-        None,
+        false,
     )
     .expect("acquire_llc_plan must succeed on a fresh two-LLC host");
     assert!(
@@ -1080,7 +1080,7 @@ fn acquire_llc_plan_retry_succeeds_on_attempt_one() {
         &test_topo,
         None,
         PlacementPolicy::Consolidate,
-        None,
+        false,
         |_selected, _snapshots| {
             let n = counter.get();
             counter.set(n + 1);
@@ -1130,7 +1130,7 @@ fn acquire_llc_plan_retry_exhausted_bails_with_resource_contention() {
         &test_topo,
         None,
         PlacementPolicy::Consolidate,
-        None,
+        false,
         |_selected, _snapshots| {
             counter.set(counter.get() + 1);
             Ok(None)
@@ -1159,86 +1159,84 @@ fn acquire_llc_plan_retry_exhausted_bails_with_resource_contention() {
     );
 }
 
-/// WAIT regime via the acquire-fn seam: with `wait_deadline` set, the
-/// loop must keep polling PAST the TOCTOU retry budget and succeed
-/// when the (simulated) holder finally releases. The closure fails
-/// `ACQUIRE_MAX_TOCTOU_RETRIES + 3` times — beyond the pre-wait hard
-/// cutoff of `ACQUIRE_MAX_TOCTOU_RETRIES + 1` calls — then acquires.
-/// Before the wait fix this bailed `ResourceContention` on call
-/// `ACQUIRE_MAX_TOCTOU_RETRIES + 1` and the test-path caller turned
-/// that into a host-skip; now the cell waits and runs.
+/// Fast-phase seam contract under `wait = true`: the `acquire_fn`
+/// seam belongs to the FAST PHASE ONLY — exactly
+/// `ACQUIRE_MAX_TOCTOU_RETRIES + 1` calls — after which the wait
+/// phase acquires through the protocol head engine against REAL
+/// lockfiles, independent of the seam. The closure always bounces
+/// (simulating fast-path contention) while the real lockfile pool is
+/// free, so the head's first sweep completes immediately: the
+/// acquisition must SUCCEED even though the seam never returned
+/// locks. Before the queue design, a bouncing acquire_fn meant
+/// guaranteed failure; this pins the phase split.
 #[test]
-fn acquire_llc_plan_wait_regime_polls_past_toctou_budget() {
+fn acquire_llc_plan_wait_phase_acquires_beyond_the_seam() {
     let _llc_prefix = LlcLockPrefixGuard::new();
     let _allowed = AllowedCpusGuard::new(vec![93700]);
     let topo = synth_host_topo(&[(vec![93700], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(1, 1);
 
-    let busy_calls = ACQUIRE_MAX_TOCTOU_RETRIES + 3;
     let counter = std::cell::Cell::new(0u32);
     let plan = acquire_llc_plan_with_acquire_fn(
         &topo,
         &test_topo,
         None,
         PlacementPolicy::Consolidate,
-        Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+        true,
         |_selected, _snapshots| {
-            let n = counter.get();
-            counter.set(n + 1);
-            if n < busy_calls {
-                // Peer still holds the reservation.
-                Ok(None)
-            } else {
-                Ok(Some(Vec::new()))
-            }
+            counter.set(counter.get() + 1);
+            // Fast phase always bounces; the wait phase must succeed
+            // without this seam.
+            Ok(None)
         },
     )
-    .expect("wait regime must poll past the TOCTOU budget and acquire");
+    .expect("wait phase must acquire via real lockfiles after the fast phase exhausts");
     assert_eq!(
         counter.get(),
-        busy_calls + 1,
-        "acquire_fn must be called until the holder releases, not \
-         capped at ACQUIRE_MAX_TOCTOU_RETRIES + 1",
+        ACQUIRE_MAX_TOCTOU_RETRIES + 1,
+        "acquire_fn is a fast-phase seam: exactly TOCTOU+1 calls, \
+         never invoked by the head engine",
     );
     assert_eq!(plan.locked_llcs, vec![0]);
+    assert_eq!(
+        plan.locks.len(),
+        1,
+        "head-acquired LOCK_SH fd rides the plan"
+    );
 }
 
-/// WAIT deadline expiry via the acquire-fn seam: every attempt fails
-/// and the deadline passes mid-wait. The loop must bail with a
-/// `ResourceContention` whose message records that it WAITED (the
-/// "after waiting" clause with the elapsed time) — the operator-facing
-/// proof that the residual contention is a peer outliving the wait,
-/// not a first-touch busy signal — and must have kept polling past the
-/// TOCTOU call budget before giving up.
+/// Progress-based patience expiry in the wait phase: a peer holds
+/// `LOCK_EX` on the only LLC and never releases (a wedged holder), so
+/// the head gains nothing and the (test-shortened) no-progress window
+/// expires. The bail must be a `ResourceContention` whose message
+/// records that it WAITED (the "after waiting" clause) and frames the
+/// verdict as no-progress — the operator-facing proof that the
+/// residual contention is a wedged peer, not a first-touch busy
+/// signal.
 #[test]
-fn acquire_llc_plan_wait_deadline_expiry_bails_with_waited_diagnostic() {
+fn acquire_llc_plan_wait_patience_expiry_bails_with_waited_diagnostic() {
     let _llc_prefix = LlcLockPrefixGuard::new();
     let _allowed = AllowedCpusGuard::new(vec![93800]);
     let topo = synth_host_topo(&[(vec![93800], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(1, 1);
+    super::super::protocol::PATIENCE_OVERRIDE.with(|p| {
+        *p.borrow_mut() = Some(std::time::Duration::from_millis(400));
+    });
+    // Wedged peer: LOCK_EX on the only LLC, never released.
+    let _peer_ex = crate::flock::try_flock(llc_lock_path(0), crate::flock::FlockMode::Exclusive)
+        .unwrap()
+        .expect("peer EX must acquire on clean pool");
 
-    let counter = std::cell::Cell::new(0u32);
-    // 600 ms outlives the ~260 ms TOCTOU backoff plus several
-    // WAIT_POLL_INTERVAL polls, so expiry provably happens in the
-    // wait regime, not the TOCTOU regime.
     let err = acquire_llc_plan_with_acquire_fn(
         &topo,
         &test_topo,
         None,
         PlacementPolicy::Consolidate,
-        Some(std::time::Instant::now() + std::time::Duration::from_millis(600)),
-        |_selected, _snapshots| {
-            counter.set(counter.get() + 1);
-            Ok(None)
-        },
+        true,
+        try_acquire_llc_plan_locks,
     )
-    .expect_err("holder never releases — must bail once the deadline passes");
-    assert!(
-        counter.get() > ACQUIRE_MAX_TOCTOU_RETRIES + 1,
-        "wait regime must poll past the TOCTOU budget before expiring; \
-         calls={}",
-        counter.get(),
-    );
+    .expect_err("holder never releases — must bail once patience expires");
+    super::super::protocol::PATIENCE_OVERRIDE.with(|p| *p.borrow_mut() = None);
     assert!(
         err.downcast_ref::<ResourceContention>().is_some(),
         "must surface as ResourceContention: {err:#}",
@@ -1247,7 +1245,12 @@ fn acquire_llc_plan_wait_deadline_expiry_bails_with_waited_diagnostic() {
     assert!(
         msg.contains("after waiting"),
         "message must record the wait so residual contention reads as a \
-         peer outliving the deadline: {msg}",
+         wedged peer, not a first-touch busy signal: {msg}",
+    );
+    assert!(
+        msg.contains("no acquisition progress"),
+        "message must frame the bail as no-progress patience, not a \
+         wall deadline: {msg}",
     );
 }
 
@@ -1498,7 +1501,7 @@ fn acquire_llc_plan_bails_when_no_llc_overlaps_allowed() {
     let _allowed = AllowedCpusGuard::new(vec![100, 101]);
     let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
-    let err = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, None)
+    let err = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, false)
         .expect_err("no LLC overlap must bail, not silently run");
     let msg = format!("{err:#}");
     assert!(
@@ -1580,7 +1583,7 @@ fn acquire_llc_plan_partial_take_last_llc_matches_exact_budget() {
         &test_topo,
         Some(cap),
         PlacementPolicy::Consolidate,
-        None,
+        false,
     )
     .expect("clean pool must allow SH on both LLCs");
 
@@ -1667,7 +1670,7 @@ fn acquire_llc_plan_cross_node_spill_mems_union() {
         &test_topo,
         Some(cap),
         PlacementPolicy::Consolidate,
-        None,
+        false,
     )
     .expect("clean pool must allow 3-CPU acquisition");
 

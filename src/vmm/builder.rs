@@ -1356,19 +1356,47 @@ impl KtstrVmBuilder {
                 // 30-cell verifier sweep's affinity masks onto the
                 // low LLCs of a 16-LLC runner. Builds keep
                 // Consolidate (see `PlacementPolicy`).
-                let plan = host_topology::acquire_llc_plan(
+                // Build-time reservation stays non-blocking (TOCTOU-only
+                // fast path): the queue-and-wait policy lives in the
+                // run-time replan (`acquire_run_locks`' no-perf arm),
+                // which re-plans against live holder counts and waits
+                // there. Build-time CONTENTION (a perf `LOCK_EX` head or
+                // its claim covering the pool) therefore degrades to a
+                // PLAN-ONLY selection — same DISCOVER→PLAN, no locks —
+                // instead of failing the build: the build plan only
+                // shapes setup (budget size, masks) and the run replan
+                // re-acquires honestly through the queue. Failing here
+                // was a retry-storm source: nextest's second-scale
+                // backoff can never outlive a queued perf head's claim.
+                // The cost is holder-count truthfulness during THIS
+                // cell's setup window (peers see no reservation), which
+                // the run-time replan restores.
+                let plan = match host_topology::acquire_llc_plan(
                     &host_topo,
                     &test_topo,
                     effective_cap,
                     host_topology::PlacementPolicy::spread_for_process(),
-                    // Build-time reservation stays non-blocking (TOCTOU-only):
-                    // the WAIT-for-holder policy lives in the run-time replan
-                    // (`acquire_run_locks`' no-perf arm), which re-plans against
-                    // live holder counts and waits there. A contention that
-                    // surfaces here still routes to a retryable failure via
-                    // `classify_host_error`, so coverage is never silently lost.
-                    None,
-                )?;
+                    false,
+                ) {
+                    Ok(plan) => plan,
+                    Err(e)
+                        if e.downcast_ref::<host_topology::ResourceContention>()
+                            .is_some() =>
+                    {
+                        tracing::debug!(
+                            "no-perf build-time reservation contended ({e:#}); \
+                             proceeding with a lock-free plan — the run-time \
+                             replan queues for real locks"
+                        );
+                        host_topology::plan_llc_selection_only(
+                            &host_topo,
+                            &test_topo,
+                            effective_cap,
+                            host_topology::PlacementPolicy::spread_for_process(),
+                        )?
+                    }
+                    Err(e) => return Err(e),
+                };
                 host_topology::warn_if_cross_node_spill(&plan, &host_topo);
                 // Keep the plan's `LOCK_SH` flock fds ALIVE — do NOT
                 // strip them. Those held fds are precisely what makes a
@@ -1662,9 +1690,20 @@ fn resolve_cpu_budget(
 /// Returns `PerfModeUnavailable` when `compute_pinning` reports the host is
 /// too small for the perf topology (the isolation guarantee cannot be
 /// honored — a permanent host-insufficiency: a SKIP by default, a hard FAIL
-/// under `KTSTR_NO_SKIP_MODE`), or `ResourceContention` when the host fits
-/// but all slots are currently busy (transient; a retryable failure —
-/// nextest's retry backoff re-runs the cell after the holder releases).
+/// under `KTSTR_NO_SKIP_MODE`).
+///
+/// When the host FITS but every slot is currently busy, this is NOT a
+/// failure: the build-time acquire is a free-offset PROBE — `build()`
+/// strips the returned fds immediately and `run()` re-acquires the
+/// plan's `llc_indices` through the acquisition queue (fast path,
+/// then head accumulation with progress-based patience). So on
+/// all-busy the probe returns the FIRST mappable candidate with an
+/// empty lock set and lets the run path queue for it. Bailing here —
+/// the old behaviour — made perf cells fail instantly (~0.2 s,
+/// pre-boot) whenever the suite's default cells covered the LLCs with
+/// `LOCK_SH`, and nextest's second-scale retry backoff could never
+/// outlive that coverage: a retry-exhaustion storm the queue exists
+/// to prevent.
 fn acquire_slot_with_locks(
     host_topo: &host_topology::HostTopology,
     topo: &topology::Topology,
@@ -1674,6 +1713,7 @@ fn acquire_slot_with_locks(
     let max_slots = num_llcs.checked_div(llcs_needed).unwrap_or(num_llcs).max(1);
     let llc_mode = host_topology::LlcLockMode::Exclusive;
 
+    let mut first_mappable: Option<host_topology::PinningPlan> = None;
     for slot in 0..max_slots {
         let offset = slot * llcs_needed;
 
@@ -1707,16 +1747,28 @@ fn acquire_slot_with_locks(
                 );
                 return Ok(plan);
             }
-            host_topology::LockOutcome::Unavailable(_) => continue,
+            host_topology::LockOutcome::Unavailable(_) => {
+                if first_mappable.is_none() {
+                    first_mappable = Some(candidate);
+                }
+                continue;
+            }
         }
     }
 
-    Err(anyhow::Error::new(host_topology::ResourceContention {
-        reason: format!(
-            "all {max_slots} LLC slots busy\n  \
-             hint: pass --no-perf-mode or set KTSTR_NO_PERF_MODE=1 to run without CPU reservation"
-        ),
-    }))
+    // Host fits, every slot busy: hand the first mappable candidate
+    // (no locks) to the run path, which queues for its llc_indices.
+    let plan = first_mappable.expect(
+        "all-busy implies at least one candidate mapped — the \
+         no-candidate case returned PerfModeUnavailable above",
+    );
+    eprintln!(
+        "performance_mode: all {max_slots} LLC slots busy at build time; \
+         the run will queue for offset {} via the lock-dir acquisition \
+         queue",
+        plan.llc_indices.first().copied().unwrap_or(0),
+    );
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -1848,6 +1900,44 @@ mod tests {
             51,
             "a 50-vCPU no-perf VM gets its 50 host CPUs + 1 service CPU",
         );
+    }
+
+    /// acquire_slot_with_locks all-busy fallback: when the host FITS the
+    /// perf topology but every slot's `LOCK_EX` is currently held, the
+    /// build-time probe must return the first mappable candidate with an
+    /// EMPTY lock set — the run path queues for it — instead of the old
+    /// `ResourceContention` bail, which made perf cells fail pre-boot in
+    /// ~0.2 s whenever suite `LOCK_SH` coverage never left a free window
+    /// (a retry-exhaustion storm nextest backoff cannot outlive).
+    #[test]
+    fn acquire_slot_with_locks_all_busy_returns_unlocked_candidate() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let llc_prefix = format!("{}/llc-", tmp.path().display());
+        let cpu_prefix = format!("{}/cpu-", tmp.path().display());
+        host_topology::LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = Some(llc_prefix));
+        host_topology::CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = Some(cpu_prefix));
+
+        // One-LLC host, 1/1/1/1 perf topology (+ service CPU) fits.
+        let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1], 0)]);
+        let topo = topology::Topology::new(1, 1, 1, 1);
+        // Peer holds the only LLC slot EX.
+        let peer = crate::flock::try_flock(
+            host_topology::llc_lock_path(0),
+            crate::flock::FlockMode::Exclusive,
+        )
+        .expect("open")
+        .expect("peer EX on fresh pool");
+
+        let plan = acquire_slot_with_locks(&host, &topo)
+            .expect("all-busy must yield an unlocked candidate, not contention");
+        assert!(
+            plan.locks.is_empty(),
+            "all-busy fallback carries no locks — the run path queues",
+        );
+        assert_eq!(plan.llc_indices, vec![0], "first mappable candidate");
+        drop(peer);
+        host_topology::LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = None);
+        host_topology::CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = None);
     }
 
     /// acquire_slot_with_locks perf-mode re-map: when the host is too small
