@@ -1874,9 +1874,37 @@ pub(crate) struct DumpTrigger {
 /// later samples observe real values once the guest has booted
 /// past percpu setup.
 pub(crate) struct RqRefresh {
-    /// PA of the kernel's `__per_cpu_offset[]` array. Read each
-    /// iteration via [`super::symbols::read_per_cpu_offsets`].
-    pub pco_pa: u64,
+    /// Link-time KVA of the kernel's `__per_cpu_offset[]` array. The
+    /// PA to read from is recomputed EVERY sample iteration as
+    /// `text_kva_to_pa_with_base(per_cpu_offset_kva, start_kernel_map,
+    /// phys_base)`, where `start_kernel_map` is re-derived per tick
+    /// from [`Self::tcr_el1`] (see that field). It is NOT baked once
+    /// at construction for the same reason [`Self::kaslr_offset`] is
+    /// not: on aarch64 the kernel-image base (`KIMAGE_VADDR`) is a
+    /// FUNCTION of `TCR_EL1.T1SZ`/`TG1`, and the BSP loop's lazy
+    /// `tcr_el1_cache` CAS can fire AFTER the monitor thread resolves
+    /// its one-shot `start_kernel_map_for_thread` (which then falls
+    /// back to the 48-bit-VA default). A once-baked PA computed from
+    /// that stale base points the `__per_cpu_offset[]` read at the
+    /// wrong guest PA, every slot reads a silent zero, the bit-63
+    /// `data_valid` latch never fires, and the guest evidence
+    /// channels stay dead for the whole run (`evidence_channels_live`
+    /// false → the progress watchdog degrades to the Tier-3 deadman).
+    /// Re-deriving the base per tick self-heals the moment the guest
+    /// programs `TCR_EL1`, mirroring the kaslr-slide re-read below.
+    /// On x86_64 [`super::symbols::start_kernel_map_for_tcr`] ignores
+    /// `tcr_el1` and returns the compile-time base, so the per-tick
+    /// recompute is a constant and this path is a no-op.
+    pub per_cpu_offset_kva: u64,
+    /// Per-tick source for the aarch64 kernel-image base
+    /// (`KIMAGE_VADDR`). `Some` carries the shared `tcr_el1_cache`
+    /// Arc the BSP run-loop populates lazily; the monitor re-reads it
+    /// each iteration and feeds [`super::symbols::start_kernel_map_for_tcr`]
+    /// to recompute the `__per_cpu_offset[]` read PA (see
+    /// [`Self::per_cpu_offset_kva`]). `None` (x86_64, or when no TCR
+    /// cache is wired) makes the loop fall back to the config's static
+    /// `start_kernel_map`.
+    pub tcr_el1: Option<std::sync::Arc<AtomicU64>>,
     /// KVA of the `runqueues` percpu symbol. Combined with each
     /// CPU's offset to compute the per-CPU rq KVA, then reduced
     /// to a PA via [`super::symbols::kva_to_pa`].
@@ -3107,6 +3135,14 @@ pub(crate) fn monitor_loop(
     // carries SOME value (initialized from `cfg.page_offset`),
     // so it cannot itself signal "no observation made."
     let mut latched_page_offset: u64 = 0;
+    // Once-only pre-latch diagnostic (see the emission site below). At
+    // the 100 ms sample cadence, `PRE_LATCH_DIAG_TICKS` ticks (~10 s) is
+    // far beyond a healthy boot's latch time yet well under any watchdog
+    // deadline, so a run still unlatched at that point is genuinely stuck
+    // and worth one gate-breakdown line.
+    const PRE_LATCH_DIAG_TICKS: u32 = 100;
+    let mut pre_latch_ticks: u32 = 0;
+    let mut pre_latch_diag_emitted = false;
     // Authoritative CPU count: `rq_refresh` overrides `rq_pas.len()`
     // because the static seed slice may be empty in production
     // (where the boot-race fix sources every PA from the refresh).
@@ -3509,7 +3545,32 @@ pub(crate) fn monitor_loop(
             // `page_offset` was already refreshed at the top of this
             // iteration (before the watchdog write). `page_offset_resolved`
             // carries the result into the data_valid latch below.
-            let fresh = super::symbols::read_per_cpu_offsets(mem, refresh.pco_pa, refresh.num_cpus);
+            //
+            // Recompute the `__per_cpu_offset[]` read PA per iteration
+            // from a freshly re-read `TCR_EL1` rather than a
+            // construction-time bake. On aarch64 the kernel-image base
+            // (`KIMAGE_VADDR`) is derived from `TCR_EL1.T1SZ`/`TG1`, and
+            // the BSP loop's lazy `tcr_el1_cache` CAS can land AFTER the
+            // monitor thread resolved its one-shot base (which falls back
+            // to the 48-bit-VA default when TCR is still 0). A once-baked
+            // PA off that stale base reads silent zeros from every slot,
+            // the bit-63 latch never fires, and the guest evidence
+            // channels stay dead for the whole run. Re-deriving the base
+            // here self-heals the instant the guest programs TCR — the
+            // same per-iteration discipline the kaslr slide already uses.
+            // On x86_64 `start_kernel_map_for_tcr` ignores `tcr_el1` and
+            // returns the compile-time base, so this is a constant.
+            let pco_start_kernel_map = refresh
+                .tcr_el1
+                .as_ref()
+                .and_then(|c| super::symbols::start_kernel_map_for_tcr(c.load(Ordering::Acquire)))
+                .unwrap_or(start_kernel_map);
+            let pco_pa = super::symbols::text_kva_to_pa_with_base(
+                refresh.per_cpu_offset_kva,
+                pco_start_kernel_map,
+                phys_base,
+            );
+            let fresh = super::symbols::read_per_cpu_offsets(mem, pco_pa, refresh.num_cpus);
             // Latch `data_valid` once the guest has populated the
             // percpu offset table AND we've observed (or accepted
             // the absence of) the KASLR base. Both halves are
@@ -3566,6 +3627,45 @@ pub(crate) fn monitor_loop(
             {
                 data_valid = true;
                 latched_page_offset = page_offset;
+            }
+            // Bounded once-only resolution diagnostic. When the guest
+            // evidence channels never latch — `data_valid` stays false
+            // and `evidence_channels_live` reads false for the whole run
+            // (observed on aarch64 6.14, where the progress watchdog then
+            // degrades to the Tier-3 deadman) — the watchdog dump gave no
+            // signal for WHICH latch input never resolved. Emit the full
+            // gate breakdown exactly once, after enough sample ticks that
+            // a healthy boot would already have latched, so the failing
+            // arch/kernel leg self-reports the dead input (kaslr publish
+            // vs per_cpu_offset bit-63 vs the `pco_pa` translation base)
+            // without a re-run. Bounded (single emission) and cheap (a
+            // counter compare per tick until it fires once).
+            if !data_valid {
+                pre_latch_ticks = pre_latch_ticks.saturating_add(1);
+                if pre_latch_ticks == PRE_LATCH_DIAG_TICKS && !pre_latch_diag_emitted {
+                    pre_latch_diag_emitted = true;
+                    let bit63_set = fresh.iter().filter(|&&v| v & (1u64 << 63) != 0).count();
+                    tracing::warn!(
+                        pre_latch_ticks,
+                        page_offset_resolved,
+                        kaslr_raw = format_args!("{kaslr_raw:#x}"),
+                        num_cpus = refresh.num_cpus,
+                        pco_slots = fresh.len(),
+                        bit63_set,
+                        first_pco = format_args!("{:#x}", fresh.first().copied().unwrap_or(0)),
+                        pco_pa = format_args!("{pco_pa:#x}"),
+                        pco_start_kernel_map = format_args!("{pco_start_kernel_map:#x}"),
+                        per_cpu_offset_kva = format_args!("{:#x}", refresh.per_cpu_offset_kva),
+                        runqueues_kva = format_args!("{:#x}", refresh.runqueues_kva),
+                        page_offset = format_args!("{page_offset:#x}"),
+                        phys_base = format_args!("{phys_base:#x}"),
+                        "monitor: guest evidence channels have not latched (data_valid=false) \
+                         after {PRE_LATCH_DIAG_TICKS} sample ticks; the progress watchdog will \
+                         fall back to the Tier-3 deadman. data_valid requires \
+                         page_offset_resolved && kaslr_raw!=0 && a non-empty __per_cpu_offset[] \
+                         with every slot bit-63 set — the fields above isolate the dead input."
+                    );
+                }
             }
             rq_pas_buf = super::symbols::compute_rq_pas(
                 refresh.runqueues_kva,
@@ -5048,7 +5148,14 @@ mod tests {
         let kill_evt = test_kill_evt();
 
         let refresh = RqRefresh {
-            pco_pa: 0,
+            // pco_pa is recomputed per tick as
+            // `text_kva_to_pa_with_base(per_cpu_offset_kva, start_kernel_map,
+            // phys_base)`. With `tcr_el1: None` the loop uses the config's
+            // `start_kernel_map` (test_config: START_KERNEL_MAP) and
+            // `phys_base` (0), so `per_cpu_offset_kva == START_KERNEL_MAP`
+            // reproduces the previous `pco_pa: 0`.
+            per_cpu_offset_kva: super::super::symbols::START_KERNEL_MAP,
+            tcr_el1: None,
             runqueues_kva: 0,
             num_cpus: 2,
             page_offset_base_pa: None,
@@ -5090,6 +5197,103 @@ mod tests {
         assert_eq!(samples[0].cpus[0].nr_running, 11);
         assert_eq!(samples[0].cpus[1].rq_clock, 8888);
         assert_eq!(samples[0].cpus[1].nr_running, 22);
+    }
+
+    /// Regression guard for the aarch64-6.14 dead-channel bug: the
+    /// `__per_cpu_offset[]` read PA is derived per tick from the config's
+    /// live kernel-image base (`start_kernel_map`) and `phys_base`, NOT a
+    /// PA baked at `RqRefresh` construction. The old code baked
+    /// `pco_pa = text_kva_to_pa_with_base(per_cpu_offset, start_kernel_map_for_thread, phys_base)`
+    /// once; when that thread-time base was stale (aarch64 `TCR_EL1` not
+    /// yet programmed), every slot read a silent zero, the bit-63 latch
+    /// never fired, and `evidence_channels_live` stayed false for the run.
+    /// Here the offset table sits at a NON-zero guest PA and a NON-zero
+    /// `phys_base` displaces the translation, so `data_valid` can only
+    /// latch (non-empty `cpus`) if the loop recomputes the read PA from
+    /// those base inputs. A regression that ignored the base (read at
+    /// `per_cpu_offset_kva` or a zero PA) would miss the table and leave
+    /// `cpus` empty.
+    #[test]
+    fn monitor_loop_rq_refresh_pco_pa_from_live_base() {
+        let offsets = test_offsets();
+        // 24 bytes of leading padding so the offset table does NOT sit at
+        // guest PA 0 — the base arithmetic must place the read here.
+        const TABLE_PA: u64 = 24;
+        let rq0_buf = make_rq_buffer(&offsets, 33, 1, 1, 4321, 0);
+        let rq1_buf = make_rq_buffer(&offsets, 44, 2, 2, 5432, 0);
+        let rq0_pa = TABLE_PA + 16; // after the 2-slot (16-byte) table
+        let rq1_pa = rq0_pa + rq0_buf.len() as u64;
+        const KERNEL_HALF: u64 = 1u64 << 63;
+        let pco0 = KERNEL_HALF | rq0_pa;
+        let pco1 = KERNEL_HALF | rq1_pa;
+
+        let mut combined = vec![0u8; TABLE_PA as usize];
+        combined.extend_from_slice(&pco0.to_ne_bytes());
+        combined.extend_from_slice(&pco1.to_ne_bytes());
+        combined.extend_from_slice(&rq0_buf);
+        combined.extend_from_slice(&rq1_buf);
+
+        // SAFETY: combined is a live local buffer whose backing storage
+        // outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(combined.as_ptr() as *mut u8, combined.len() as u64) };
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+
+        // Non-degenerate base: pco_pa = per_cpu_offset_kva - S + P must
+        // equal TABLE_PA. Pick S/P non-zero so a base-ignoring regression
+        // reads the wrong PA.
+        let s = super::super::symbols::START_KERNEL_MAP;
+        let p: u64 = 0x10_0000; // 1 MiB phys displacement
+        let per_cpu_offset_kva = TABLE_PA.wrapping_add(s).wrapping_sub(p);
+
+        let refresh = RqRefresh {
+            per_cpu_offset_kva,
+            // None → loop falls back to cfg.start_kernel_map (== S below).
+            tcr_el1: None,
+            runqueues_kva: 0,
+            num_cpus: 2,
+            page_offset_base_pa: None,
+            event: None,
+            kaslr_offset: std::sync::Arc::new(AtomicU64::new(1)),
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let cfg = MonitorConfig {
+            rq_refresh: Some(&refresh),
+            page_offset: KERNEL_HALF,
+            start_kernel_map: s,
+            phys_base: p,
+            ..test_config()
+        };
+        let MonitorLoopResult { samples, .. } = monitor_loop(
+            &mem,
+            &[],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+
+        assert!(!samples.is_empty());
+        let latched = samples.iter().rev().find(|s| !s.cpus.is_empty()).expect(
+            "data_valid never latched — the per-tick pco_pa recompute did not \
+             locate the offset table via the live start_kernel_map/phys_base base",
+        );
+        assert_eq!(latched.cpus.len(), 2);
+        assert_eq!(latched.cpus[0].rq_clock, 4321);
+        assert_eq!(latched.cpus[0].nr_running, 33);
+        assert_eq!(latched.cpus[1].rq_clock, 5432);
+        assert_eq!(latched.cpus[1].nr_running, 44);
     }
 
     /// Regression: the monitor must RE-READ the KASLR-slide Arc each
@@ -5145,7 +5349,14 @@ mod tests {
 
         let kaslr = std::sync::Arc::new(AtomicU64::new(0)); // unpublished
         let refresh = RqRefresh {
-            pco_pa: 0,
+            // pco_pa is recomputed per tick as
+            // `text_kva_to_pa_with_base(per_cpu_offset_kva, start_kernel_map,
+            // phys_base)`. With `tcr_el1: None` the loop uses the config's
+            // `start_kernel_map` (test_config: START_KERNEL_MAP) and
+            // `phys_base` (0), so `per_cpu_offset_kva == START_KERNEL_MAP`
+            // reproduces the previous `pco_pa: 0`.
+            per_cpu_offset_kva: super::super::symbols::START_KERNEL_MAP,
+            tcr_el1: None,
             runqueues_kva: KERNEL_HALF, // high-half → per_cpu_kva applies the slide
             num_cpus: 2,
             page_offset_base_pa: None,
@@ -5234,7 +5445,14 @@ mod tests {
         let kill_evt = test_kill_evt();
 
         let refresh = RqRefresh {
-            pco_pa: 0,
+            // pco_pa is recomputed per tick as
+            // `text_kva_to_pa_with_base(per_cpu_offset_kva, start_kernel_map,
+            // phys_base)`. With `tcr_el1: None` the loop uses the config's
+            // `start_kernel_map` (test_config: START_KERNEL_MAP) and
+            // `phys_base` (0), so `per_cpu_offset_kva == START_KERNEL_MAP`
+            // reproduces the previous `pco_pa: 0`.
+            per_cpu_offset_kva: super::super::symbols::START_KERNEL_MAP,
+            tcr_el1: None,
             runqueues_kva: 0,
             num_cpus: 2,
             page_offset_base_pa: None,
@@ -7970,7 +8188,14 @@ mod tests {
         // SAFETY: mem_buf outlives the GuestMem use (borrowed for this call).
         let mem = unsafe { GuestMem::new(mem_buf.as_ptr() as *mut u8, mem_buf.len() as u64) };
         let refresh = RqRefresh {
-            pco_pa: 0,
+            // pco_pa is recomputed per tick as
+            // `text_kva_to_pa_with_base(per_cpu_offset_kva, start_kernel_map,
+            // phys_base)`. With `tcr_el1: None` the loop uses the config's
+            // `start_kernel_map` (test_config: START_KERNEL_MAP) and
+            // `phys_base` (0), so `per_cpu_offset_kva == START_KERNEL_MAP`
+            // reproduces the previous `pco_pa: 0`.
+            per_cpu_offset_kva: super::super::symbols::START_KERNEL_MAP,
+            tcr_el1: None,
             runqueues_kva: 0,
             num_cpus: 1,
             page_offset_base_pa: None,

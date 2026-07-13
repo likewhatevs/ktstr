@@ -12994,15 +12994,13 @@ impl KtstrVm {
                 // `start_kernel` populates every slot before SMP
                 // bringup IN THE GUEST — but the host monitor thread
                 // spawns before the guest BSP enters KVM_RUN, so a
-                // pre-loop one-shot read sees BSS zeros. Pass the
-                // PAs that drive the recompute through `RqRefresh`
-                // so the loop body re-reads each sample; see
-                // [`monitor::reader::RqRefresh`].
-                let pco_pa = monitor::symbols::text_kva_to_pa_with_base(
-                    symbols.per_cpu_offset,
-                    start_kernel_map_for_thread,
-                    phys_base,
-                );
+                // pre-loop one-shot read sees BSS zeros. The read PA
+                // itself is recomputed per sample inside the monitor
+                // loop from `RqRefresh::per_cpu_offset_kva` +
+                // `RqRefresh::tcr_el1`, so no base is baked here (a
+                // baked base off a not-yet-programmed TCR_EL1 would
+                // pin the read at the wrong PA for the whole run —
+                // see [`monitor::reader::RqRefresh`]).
 
                 let watchdog_override = watchdog_jiffies.and_then(|jiffies| {
                     // 7.1+ path: deref scx_root -> scx_sched.watchdog_timeout.
@@ -13141,7 +13139,14 @@ impl KtstrVm {
                     )
                 });
                 let rq_refresh = monitor::reader::RqRefresh {
-                    pco_pa,
+                    // Carry the link-time `__per_cpu_offset[]` KVA and the
+                    // TCR_EL1 cache so the monitor recomputes the read PA
+                    // per tick against the LIVE kernel-image base, rather
+                    // than the one-shot `start_kernel_map_for_thread` this
+                    // closure resolved (which can predate the guest's
+                    // TCR_EL1 program on aarch64 — see `RqRefresh`).
+                    per_cpu_offset_kva: symbols.per_cpu_offset,
+                    tcr_el1: tcr_el1.clone(),
                     runqueues_kva: symbols.runqueues,
                     kaslr_offset: kern_virt_kaslr_shared.clone(),
                     num_cpus,
