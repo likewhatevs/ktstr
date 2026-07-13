@@ -97,6 +97,13 @@ const KTSTR_SCHED: Scheduler =
 /// the drain explicitly so the assertions exercise the same
 /// pipeline path the framework uses.
 fn assert_phase_pipeline(result: &VmResult) -> Result<()> {
+    // Environmental starvation gate: zero real captures under a
+    // witnessed-contended host is a non-verdict (the readiness-gated
+    // capture chain was starved past the workload window), not a
+    // capture regression — SKIP instead of failing the assertions
+    // below. A quiet-host zero-capture run still falls through and
+    // fails with the specific diagnosis. See `periodic_starvation_gate`.
+    ktstr::prelude::periodic_starvation_gate(result)?;
     // The bridge must have captured something across the 2-Step
     // run with `num_snapshots = 4` — `periodic_fired >= 1` is
     // the lower bound the periodic-capture e2e already pins;
@@ -350,6 +357,13 @@ fn phase_pipeline_no_periodic_samples_yields_empty_phases(ctx: &Ctx) -> Result<A
 /// would indicate either a step_index advancement bug or a
 /// silent-drop in `by_stimulus_phase`.
 fn assert_phase_pipeline_three_step(result: &VmResult) -> Result<()> {
+    // Environmental starvation gate: zero real captures under a
+    // witnessed-contended host is a non-verdict (the readiness-gated
+    // capture chain was starved past the workload window), not a
+    // capture regression — SKIP instead of failing the assertions
+    // below. A quiet-host zero-capture run still falls through and
+    // fails with the specific diagnosis. See `periodic_starvation_gate`.
+    ktstr::prelude::periodic_starvation_gate(result)?;
     anyhow::ensure!(
         result.periodic_fired >= 3,
         "periodic_fired = {} of {} — fewer than 3 captures means \
@@ -461,6 +475,13 @@ fn phase_pipeline_three_step_e2e(ctx: &Ctx) -> Result<AssertResult> {
 /// just the synthetic-fixture unit path that previously bypassed
 /// `from_wire`.
 fn assert_iteration_rate_first_and_last(result: &VmResult) -> Result<()> {
+    // Environmental starvation gate: zero real captures under a
+    // witnessed-contended host is a non-verdict (the readiness-gated
+    // capture chain was starved past the workload window), not a
+    // capture regression — SKIP instead of failing the assertions
+    // below. A quiet-host zero-capture run still falls through and
+    // fails with the specific diagnosis. See `periodic_starvation_gate`.
+    ktstr::prelude::periodic_starvation_gate(result)?;
     anyhow::ensure!(
         result.periodic_fired >= 2,
         "periodic_fired = {} of {} — need a capture in each Step window \
@@ -558,6 +579,13 @@ fn phase_pipeline_iteration_rate_backdrop_e2e(ctx: &Ctx) -> Result<AssertResult>
 /// that the two configurations produce DIFFERENT readings, not
 /// that they differ by a specific amount.
 fn assert_per_step_cpuset_changes_metrics(result: &VmResult) -> Result<()> {
+    // Environmental starvation gate: zero real captures under a
+    // witnessed-contended host is a non-verdict (the readiness-gated
+    // capture chain was starved past the workload window), not a
+    // capture regression — SKIP instead of failing the assertions
+    // below. A quiet-host zero-capture run still falls through and
+    // fails with the specific diagnosis. See `periodic_starvation_gate`.
+    ktstr::prelude::periodic_starvation_gate(result)?;
     // The framework-canonical per-phase buckets via the phase-buckets accessor:
     // one shared captures_series() drain folded through
     // build_phase_buckets_with_stimulus over the COMPLETE timeline

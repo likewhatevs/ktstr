@@ -833,20 +833,40 @@ fn read_kallsyms_symbol_kva(name: &str, allowed_types: &[&str]) -> Option<u64> {
 
 /// Derive the KASLR physical displacement from `/proc/iomem`.
 ///
-/// On both x86_64 and aarch64 the kernel registers a "Kernel code"
-/// resource in `/proc/iomem` whose start address is the physical
-/// load address of `_text`. The KASLR offset is the difference
-/// between this runtime PA and the default (non-KASLR) load PA.
+/// The published value's CONTRACT is "the displacement the host adds
+/// to its text-KVA → PA translations" (`text_kva_to_pa_with_base`'s
+/// `phys_base` argument) — the offset of the kernel IMAGE BASE
+/// (`_text`) from its default load PA.
 ///
-/// x86_64: default load PA = `LOAD_PHYSICAL_ADDR` (0x100_0000,
-/// CONFIG_PHYSICAL_START). `phys_base = code_pa - 0x100_0000`.
+/// x86_64: the "Kernel code" resource starts at `__pa_symbol(_text)`
+/// (arch/x86/kernel/setup.c), and the default load PA is
+/// `LOAD_PHYSICAL_ADDR` (0x100_0000, CONFIG_PHYSICAL_START):
+/// `phys_base = code_pa - 0x100_0000`.
 ///
-/// aarch64: default load PA = DRAM base (`System RAM` start from
-/// iomem) + `TEXT_OFFSET`. `TEXT_OFFSET` is 0 on kernels since
-/// v5.8 (commit 2b5fcc5), so `phys_base = code_pa - ram_start`.
-/// Older kernels with `TEXT_OFFSET = 0x80000` (or randomized via
-/// `CONFIG_ARM64_RANDOMIZE_TEXT_OFFSET`) would produce a biased
-/// value; ktstr.kconfig targets 6.x where `TEXT_OFFSET = 0`.
+/// aarch64: the resource start is VERSION-DEPENDENT —
+/// `__pa_symbol(_stext)` up to v6.14 and `__pa_symbol(_text)` on
+/// newer kernels (arch/arm64/kernel/setup.c:217 in each) — and
+/// `_stext - _text` is the `.head.text` + SEGMENT_ALIGN gap
+/// (0x10000 on our 6.14 4K-granule builds, absorbed into `_text`
+/// on ≥6.15-era layouts). Naively publishing `code_pa − ram_start`
+/// therefore reported the `_stext` bias, NOT a load displacement:
+/// an observed arm64/6.14 guest published `0x10000` and the host's
+/// per-tick adoption displaced every text translation by it,
+/// reading a stable-garbage `__per_cpu_offset[]` page and keeping
+/// the evidence channels dead all run (7.1 kernels publish 0 and
+/// were unaffected — the version split that made the failure
+/// 6.14-only). Subtract the same-boot `_stext − _text` gap from
+/// kallsyms so the resource-start convention cancels on every
+/// kernel generation: with `KERNEL_LOAD_ADDR == DRAM_START` by VMM
+/// construction (aarch64/kvm.rs) and no physical self-relocation on
+/// arm64 (KASLR randomizes the VIRTUAL mapping only), the debiased
+/// value is 0 today — matching the accessor-init worker's
+/// documented `phys_base = 0` decouple invariant
+/// (`freeze_coord/mod.rs`) — and stays correct if a future VMM
+/// loads the Image displaced. When kallsyms is unreadable the
+/// aarch64 arm returns `None` rather than a possibly-biased guess
+/// (the host's CR3-walk fallback and per-tick adoption tolerate an
+/// absent publish; a WRONG publish poisons every translation).
 pub fn read_phys_base_from_iomem() -> Option<u64> {
     let iomem = std::fs::read_to_string("/proc/iomem").ok()?;
     #[cfg(target_arch = "x86_64")]
@@ -882,7 +902,21 @@ pub fn read_phys_base_from_iomem() -> Option<u64> {
                 code_start = Some(u64::from_str_radix(start, 16).ok()?);
             }
         }
-        Some(code_start?.wrapping_sub(ram_start?))
+        // Debias the resource-start convention: "Kernel code" starts
+        // at `_stext` on ≤6.14 arm64, `_text` on newer — subtracting
+        // the same-boot kallsyms gap makes the result the IMAGE-BASE
+        // displacement on both (see the fn doc). `_stext` and `_text`
+        // share the KASLR virtual slide, so their difference equals
+        // the physical gap between the resource start and the image
+        // base exactly.
+        let stext = read_kallsyms_symbol_kva("_stext", &["T", "t"])?;
+        let text = read_kallsyms_symbol_kva("_text", &["T", "t"])?;
+        let stext_bias = stext.wrapping_sub(text);
+        Some(
+            code_start?
+                .wrapping_sub(ram_start?)
+                .wrapping_sub(stext_bias),
+        )
     }
 }
 

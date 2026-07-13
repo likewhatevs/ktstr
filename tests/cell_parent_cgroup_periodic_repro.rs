@@ -22,6 +22,13 @@ const CELL_PARENT_SCHED: Scheduler = Scheduler::named("ktstr_sched_cellparent")
     .sched_args(&["--cell-parent-cgroup", "/ktstr"]);
 
 fn assert_periodic_fired(result: &VmResult) -> Result<()> {
+    // Environmental starvation gate: zero real captures under a
+    // witnessed-contended host is a non-verdict (the readiness-gated
+    // capture chain was starved past the workload window), not a
+    // capture regression — SKIP instead of failing the assertions
+    // below. A quiet-host zero-capture run still falls through and
+    // fails with the specific diagnosis. See `periodic_starvation_gate`.
+    ktstr::prelude::periodic_starvation_gate(result)?;
     anyhow::ensure!(
         result.periodic_target == 2,
         "periodic_target must mirror num_snapshots = 2, got {}",

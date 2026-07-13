@@ -64,6 +64,13 @@ const STALL_AFTER_1S_SCHED: Scheduler = Scheduler::named("stall_after_1s")
 /// bind-without-dispatch regression (Op succeeds, scheduler never
 /// schedules) reads 0 across every sample and fails here.
 fn assert_post_op_dispatch(result: &VmResult) -> Result<()> {
+    // Environmental starvation gate: zero real captures under a
+    // witnessed-contended host is a non-verdict (the readiness-gated
+    // capture chain was starved past the workload window), not a
+    // capture regression — SKIP instead of failing the assertions
+    // below. A quiet-host zero-capture run still falls through and
+    // fails with the specific diagnosis. See `periodic_starvation_gate`.
+    ktstr::prelude::periodic_starvation_gate(result)?;
     let series = SampleSeries::from_drained_typed(
         result.snapshot_bridge.drain_ordered_with_stats(),
         result.monitor.clone(),

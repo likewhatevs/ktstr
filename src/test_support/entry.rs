@@ -3182,18 +3182,36 @@ pub fn default_post_vm_periodic_fired(result: &crate::vmm::VmResult) -> anyhow::
         return Ok(());
     }
     let real = result.snapshot_bridge.periodic_real_count();
-    anyhow::ensure!(
-        real >= 1,
+    if real >= 1 {
+        return Ok(());
+    }
+    // Witnessed starvation: the readiness-gated capture chain can
+    // legitimately produce zero real captures when the host was
+    // saturated enough that accessor-init / the KASLR publish outlasted
+    // the workload window (see `capture_starvation_witness`). SKIP —
+    // an environmental non-verdict — rather than fail; a quiet-host
+    // miss still fails below, which is the regression this floor
+    // exists to catch.
+    if let Some(d) = crate::test_support::eval::capture_starvation_witness(result) {
+        return Err(crate::test_support::eval::post_vm_skip(format!(
+            "no real periodic captures under witnessed host contention \
+             (D={d:.2}, periodic_fired={}, target={}): the readiness-gated \
+             capture chain was starved past the workload window — \
+             environmental non-verdict, not a capture-pipeline regression",
+            result.periodic_fired, result.periodic_target,
+        )));
+    }
+    anyhow::bail!(
         "no periodic snapshot produced real BPF state \
          (periodic_real_count=0, periodic_fired={}, target={}) — \
          scheduler attached but every snapshot was a placeholder \
          (typical cause: scheduler stalled during the workload and \
          the freeze rendezvous timed out fetching state; less \
-         commonly: gate suppression rejected every capture)",
+         commonly: gate suppression rejected every capture); the \
+         contention witness shows no host starvation to blame",
         result.periodic_fired,
         result.periodic_target,
     );
-    Ok(())
 }
 
 #[cfg(test)]

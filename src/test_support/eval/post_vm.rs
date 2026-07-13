@@ -242,6 +242,70 @@ pub fn post_vm_skip(reason: impl Into<String>) -> anyhow::Error {
     anyhow::anyhow!("{}", reason.into()).context(HostSkipRequest)
 }
 
+/// Witnessed-starvation evidence for capture-bearing assertions: the
+/// host dilation `D` that PROVES the run was contended enough to
+/// explain missing/degraded periodic captures, or `None` on a quiet
+/// (or unwitnessed) host.
+///
+/// The periodic capture chain is readiness-gated (KASLR publish +
+/// accessor-init worker) and its boundaries are wall-anchored inside
+/// the workload window; under heavy host saturation the cold-cache
+/// accessor build alone can outlast a short workload, so every
+/// boundary defers past run end and `periodic_fired == 0` with zero
+/// real captures — an ENVIRONMENTAL outcome, not a capture-pipeline
+/// regression (observed across the periodic/freeze test family on
+/// saturated 96-CPU CI runners; the same cells pass idle). Assertions
+/// that require captures consult this first and convert their failure
+/// into a host-side SKIP (`post_vm_skip`) when starvation is proven,
+/// mirroring the tri-state latency gates: a quiet-host miss still
+/// FAILS (the regression the assertion exists to catch).
+///
+/// Witness preference: Body-phase dilation (the capture boundaries
+/// live inside the workload window), falling back to the whole-run
+/// schedstat `D`. The 1.5 bar follows `PERF_ISOLATION_D_MAX`'s
+/// derivation (worst measured-quiet `D` ≈ 1.21; > 1.5 is unambiguous
+/// external contention). `None` (no witness sampled) is NOT proof —
+/// callers must fail in that case; absence of evidence cannot launder
+/// a regression.
+pub fn capture_starvation_witness(result: &crate::vmm::VmResult) -> Option<f64> {
+    const CAPTURE_STARVATION_D_MAX: f64 = 1.5;
+    let d = result
+        .contention_witness
+        .as_ref()
+        .and_then(|w| w.body_dilation())
+        .or_else(|| {
+            result
+                .host_vcpu_schedstat
+                .as_ref()
+                .and_then(|s| s.dilation())
+        })?;
+    (d > CAPTURE_STARVATION_D_MAX).then_some(d)
+}
+
+/// One-line starvation gate for capture-requiring post_vm assertions:
+/// `Err(post_vm_skip(..))` when the run produced ZERO real periodic
+/// captures AND [`capture_starvation_witness`] proves the host was
+/// contended enough to explain it; `Ok(())` otherwise (including the
+/// quiet-host zero-capture case, which the caller's own assertions
+/// then fail with their specific diagnosis). Call at the TOP of a
+/// post_vm callback: `periodic_starvation_gate(result)?;`.
+pub fn periodic_starvation_gate(result: &crate::vmm::VmResult) -> anyhow::Result<()> {
+    if result.periodic_target > 0
+        && result.snapshot_bridge.periodic_real_count() == 0
+        && let Some(d) = capture_starvation_witness(result)
+    {
+        return Err(post_vm_skip(format!(
+            "no real periodic captures under witnessed host contention \
+             (D={d:.2}, periodic_fired={} of {}): the readiness-gated \
+             capture chain (KASLR publish + accessor-init) was starved \
+             past the workload window — environmental non-verdict; the \
+             capture-dependent assertions below cannot be evaluated",
+            result.periodic_fired, result.periodic_target,
+        )));
+    }
+    Ok(())
+}
+
 /// Dispatch the entry's `post_vm` + `post_vm_unconditional`
 /// callbacks and combine their failure signals.
 ///
@@ -441,5 +505,62 @@ mod post_vm_skip_tests {
     fn combine_real_fail_plus_skip_does_not_skip() {
         let c = combine_post_vm_errs(Some(real_fail()), Some(post_vm_skip("ph"))).unwrap();
         assert!(c.downcast_ref::<HostSkipRequest>().is_none());
+    }
+}
+
+#[cfg(test)]
+mod starvation_witness_tests {
+    use super::*;
+    use crate::vmm::{HostVcpuSchedstat, VmResult};
+
+    fn with_dilation(on_cpu_ns: u64, run_delay_ns: u64) -> VmResult {
+        VmResult {
+            host_vcpu_schedstat: Some(HostVcpuSchedstat {
+                total_on_cpu_ns: on_cpu_ns,
+                total_run_delay_ns: run_delay_ns,
+                sampled_vcpus: 1,
+            }),
+            ..VmResult::test_fixture()
+        }
+    }
+
+    /// No witness sampled → None (absence of evidence cannot launder a
+    /// regression); quiet host (D ≈ 1.1) → None; contended (D = 3) →
+    /// Some(3.0). Whole-run fallback path (fixture has no per-phase
+    /// witness).
+    #[test]
+    fn capture_starvation_witness_thresholds() {
+        assert_eq!(capture_starvation_witness(&VmResult::test_fixture()), None);
+        assert_eq!(capture_starvation_witness(&with_dilation(10, 1)), None);
+        let d = capture_starvation_witness(&with_dilation(10, 20)).expect("D=3 is contended");
+        assert!((d - 3.0).abs() < 1e-9);
+    }
+
+    /// The gate skips ONLY on (target>0, zero real captures, witnessed
+    /// contention); every other combination returns Ok and lets the
+    /// caller's own assertions run.
+    #[test]
+    fn periodic_starvation_gate_arms() {
+        // No periodic target: Ok even when contended.
+        let r = with_dilation(10, 20);
+        assert!(periodic_starvation_gate(&r).is_ok());
+        // Target set, zero real captures, contended: Err carrying the
+        // HostSkipRequest marker.
+        let r = VmResult {
+            periodic_target: 2,
+            ..with_dilation(10, 20)
+        };
+        let err = periodic_starvation_gate(&r).expect_err("starved run must gate");
+        assert!(
+            err.downcast_ref::<HostSkipRequest>().is_some(),
+            "gate must carry the HostSkipRequest skip marker"
+        );
+        // Target set, zero captures, QUIET host: Ok (caller fails with
+        // its own diagnosis — the regression case stays catchable).
+        let r = VmResult {
+            periodic_target: 2,
+            ..with_dilation(10, 1)
+        };
+        assert!(periodic_starvation_gate(&r).is_ok());
     }
 }

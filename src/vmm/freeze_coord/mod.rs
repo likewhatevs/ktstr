@@ -2664,6 +2664,14 @@ impl KtstrVm {
         let watchdog_kill_reason: Arc<std::sync::atomic::AtomicU8> =
             Arc::new(std::sync::atomic::AtomicU8::new(KillReasonTag::Unset as u8));
         let watchdog_kill_reason_for_wd = watchdog_kill_reason.clone();
+        // Kill-time publish-state evidence for the watchdog dump (see the
+        // `kern_addrs_frames= (kill-time)` line): the pre-latch diag's
+        // one-shot ~10 s snapshot cannot distinguish a publish that never
+        // arrived from one that arrived late, so the dump re-reads the
+        // live counters at the kill.
+        let kern_addrs_frames_for_wd = kern_addrs_frames_for_coord.clone();
+        let kern_virt_kaslr_for_wd = kern_virt_kaslr.clone();
+        let kern_phys_base_for_wd = kern_phys_base.clone();
 
         // Freeze coordinator thread: triggers a failure-dump freeze when
         // the BPF probe's `ktstr_err_exit_detected` .bss latch fires
@@ -11737,6 +11745,24 @@ impl KtstrVm {
                             snapshot.progress_epoch,
                             Duration::from_nanos(wall_since_milestone_ns),
                             snapshot.runnable_demand,
+                        );
+                        // KILL-TIME publish-state evidence. The monitor's
+                        // pre-latch diag prints the same counters ONCE at
+                        // ~10 s; a starved boot can deliver KERN_ADDRS long
+                        // after that, so only a kill-time read separates
+                        // "the publish NEVER arrived across the whole run"
+                        // (frames=0 here — guest never sent, or the frame
+                        // was lost/mistyped upstream of the dispatcher)
+                        // from "arrived late but a derive input was absent"
+                        // (frames>0 with kaslr_raw=0 — e.g. the guest's
+                        // kallsyms `_text` read failed so the frame carried
+                        // no runtime KVA).
+                        eprintln!(
+                            "  kern_addrs_frames={} (kill-time), kaslr_raw={:#x}, \
+                             phys_base_raw={:#x}",
+                            kern_addrs_frames_for_wd.load(Ordering::Relaxed),
+                            kern_virt_kaslr_for_wd.load(Ordering::Acquire),
+                            kern_phys_base_for_wd.load(Ordering::Acquire),
                         );
                         eprintln!(
                             "  effective_deadline={effective_offset:?} from VM start \

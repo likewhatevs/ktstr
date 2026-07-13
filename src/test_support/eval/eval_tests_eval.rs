@@ -429,6 +429,46 @@ fn eval_cleanup_budget_overshoot_folds_failing_detail() {
     );
 }
 
+/// Cleanup-budget contention demotion: the SAME overshoot as
+/// `eval_cleanup_budget_overshoot_folds_failing_detail`, but with a
+/// contention witness proving the host was saturated (whole-run
+/// D = 3.0 > the 1.5 bar) — the overrun demotes to a non-blocking
+/// stderr warning and the guest's passing verdict survives. The
+/// join/drain teardown dilates with host load by design; only a
+/// quiet-host overrun is a teardown regression.
+#[test]
+fn eval_cleanup_budget_overshoot_demotes_under_witnessed_contention() {
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    let assert = build_assert_result(true, vec![]);
+    let mut entry = eevdf_entry("__eval_cleanup_overshoot_contended__");
+    entry.cleanup_budget = Some(std::time::Duration::from_secs(1));
+    let mut result = make_vm_result_with_assert("", "", 0, false, &assert);
+    result.cleanup_duration = Some(std::time::Duration::from_secs(10));
+    // Whole-run witness: D = 1 + 20/10 = 3.0 — unambiguous contention.
+    result.host_vcpu_schedstat = Some(crate::vmm::HostVcpuSchedstat {
+        total_on_cpu_ns: 10,
+        total_run_delay_ns: 20,
+        sampled_vcpus: 1,
+    });
+    let assertions = crate::assert::Assert::NO_OVERRIDES;
+    let res = evaluate_vm_result(
+        &entry,
+        &result,
+        &assertions,
+        &[],
+        &[],
+        &EVAL_TOPO,
+        &no_repro,
+        None,
+    );
+    assert!(
+        res.is_ok(),
+        "a witnessed-contended overrun must not fail the verdict, got: {:?}",
+        res.err(),
+    );
+}
+
 /// Cleanup-budget no-fire: when the run's `cleanup_duration` is
 /// strictly under the entry's `cleanup_budget`, the guest's
 /// passing `AssertResult` survives the merge and

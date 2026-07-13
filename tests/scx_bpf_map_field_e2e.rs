@@ -54,6 +54,21 @@ const WATCH: WatchBpfMap = WatchBpfMap::new(
 
 /// Host-side check that the watched `.bss` field surfaced as a run-level metric.
 fn assert_watch(result: &VmResult) -> Result<()> {
+    // Environmental starvation gate: the watch_bpf_maps read rides the
+    // monitor tick (data_valid latch + scheduler attach + accessor
+    // resolution); a saturated host can starve that chain past the whole
+    // run, leaving the metric absent with nothing to assert about the
+    // read path itself. SKIP under a witnessed-contended host; a
+    // quiet-host absence still fails below with the specific diagnosis.
+    if result.run_metric("bpf_bpf_alloc_count").is_none()
+        && let Some(d) = ktstr::prelude::capture_starvation_witness(result)
+    {
+        return Err(ktstr::prelude::post_vm_skip(format!(
+            "bpf_bpf_alloc_count absent under witnessed host contention \
+             (D={d:.2}) — the monitor/accessor chain was starved past the \
+             run; environmental non-verdict"
+        )));
+    }
     let v = result.run_metric("bpf_bpf_alloc_count").ok_or_else(|| {
         // Diagnostic: if the obj prefix is ever not `bpf_bpf`, surface what the
         // alternative `bpf` prefix would yield so a single boot is conclusive.

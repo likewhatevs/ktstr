@@ -34,11 +34,11 @@ use super::topo::TopoOverride;
 use super::{KtstrTestEntry, SchedulerSpec, Topology};
 mod kernel;
 mod post_vm;
-pub use post_vm::post_vm_skip;
 pub(crate) use post_vm::{
     ExpectAutoReproSatisfied, HostSkipRequest, PostVmAssertionFailure, SchedulerBuildRefused,
     ScxBpfErrorMatcherMismatch, SurvivesStormViolated, record_skip_sidecar, run_post_vm_callbacks,
 };
+pub use post_vm::{capture_starvation_witness, periodic_starvation_gate, post_vm_skip};
 mod reporting;
 mod scheduler;
 use crate::verifier::{SCHED_OUTPUT_START, parse_sched_output};
@@ -1964,20 +1964,70 @@ fn evaluate_verdict_folds(
     // `Ok(AssertResult)` (e.g. `Ok(AssertResult::pass())`) before
     // teardown begins, otherwise the budget knob is silently
     // inert.
+    // The budget is a WALL bound on a join/drain sequence (watchdog
+    // join, AP joins, monitor join, bulk drain — see
+    // `VmResult::cleanup_duration`) whose duration under host
+    // saturation is the wake latency of the joined threads, not work:
+    // observed 6-12 s overruns on saturated 96-CPU CI runners for cells
+    // that measure well under 5 s on the same hardware idle. A flat
+    // wall bound conflates "teardown regressed" with "the box was
+    // busy" — the disguised-wall-deadline anti-pattern. Judge the
+    // overrun against the run's contention witness, mirroring the
+    // tri-state latency gates: BLOCK only when the witness shows a
+    // quiet host (no contention to blame — a real teardown regression,
+    // which quiet CI legs and local dev still catch); on a
+    // witnessed-contended host demote to a non-blocking stderr warning
+    // carrying the measurement. Witness: the Teardown-phase dilation
+    // `D` (the guest-teardown window immediately preceding host
+    // cleanup) when the per-phase witness sampled it, else the
+    // whole-run `D`. The 1.5 bar follows `PERF_ISOLATION_D_MAX`'s
+    // derivation (worst measured-quiet `D` ≈ 1.21; > 1.5 is unambiguous
+    // external contention, not jitter). An absent witness (`None`)
+    // keeps the check BLOCKING — absence of evidence must not launder
+    // a regression.
+    const CLEANUP_CONTENTION_D_MAX: f64 = 1.5;
     if let (Some(budget), Some(measured)) = (entry.cleanup_budget, result.cleanup_duration)
         && measured > budget
     {
-        check_result.merge(AssertResult::fail(crate::assert::AssertDetail::new(
-            crate::assert::DetailKind::Other,
-            format!(
-                "vm cleanup overran budget: measured {:.3}s, budget {:.3}s. \
-                 Likely a regression in host-side teardown — investigate \
-                 the post-BSP-exit join/drain path \
-                 (`vmm::KtstrVm::collect_results`).",
+        let teardown_d = result.contention_witness.as_ref().and_then(|w| {
+            w.per_phase
+                .for_stage(crate::monitor::LifecycleStage::Teardown)
+                .dilation()
+        });
+        let witness_d = teardown_d.or(result
+            .host_vcpu_schedstat
+            .as_ref()
+            .and_then(|s| s.dilation()));
+        if witness_d.is_some_and(|d| d > CLEANUP_CONTENTION_D_MAX) {
+            eprintln!(
+                "vm cleanup overran budget under witnessed host contention: \
+                 measured {:.3}s, budget {:.3}s, witness D={:.2} ({}) — \
+                 non-blocking; the join/drain sequence dilates with host \
+                 load by design, and a quiet-host overrun would fail here.",
                 measured.as_secs_f64(),
                 budget.as_secs_f64(),
-            ),
-        )));
+                witness_d.unwrap_or(f64::NAN),
+                if teardown_d.is_some() {
+                    "teardown-phase"
+                } else {
+                    "whole-run"
+                },
+            );
+        } else {
+            check_result.merge(AssertResult::fail(crate::assert::AssertDetail::new(
+                crate::assert::DetailKind::Other,
+                format!(
+                    "vm cleanup overran budget: measured {:.3}s, budget {:.3}s \
+                     (witness D={} — no host contention explains the excess). \
+                     Likely a regression in host-side teardown — investigate \
+                     the post-BSP-exit join/drain path \
+                     (`vmm::KtstrVm::collect_results`).",
+                    measured.as_secs_f64(),
+                    budget.as_secs_f64(),
+                    witness_d.map_or("unsampled".to_string(), |d| format!("{d:.2}")),
+                ),
+            )));
+        }
     }
 
     // Reproducer-mode scx_bpf_error matcher. Runs the configured

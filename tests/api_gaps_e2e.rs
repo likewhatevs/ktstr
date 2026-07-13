@@ -53,6 +53,13 @@ const KTSTR_SCHED: Scheduler =
 const RATIO_CEILING: f64 = 1_000_000_000.0;
 
 fn assert_api_gap_helpers(result: &VmResult) -> Result<()> {
+    // Environmental starvation gate: zero real captures under a
+    // witnessed-contended host is a non-verdict (the readiness-gated
+    // capture chain was starved past the workload window), not a
+    // capture regression — SKIP instead of failing the assertions
+    // below. A quiet-host zero-capture run still falls through and
+    // fails with the specific diagnosis. See `periodic_starvation_gate`.
+    ktstr::prelude::periodic_starvation_gate(result)?;
     let periodic_target = result.periodic_target;
     let periodic_fired = result.periodic_fired;
     anyhow::ensure!(

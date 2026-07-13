@@ -847,7 +847,9 @@ pub mod prelude {
     };
     pub use crate::scenario::payload_run::{PayloadHandle, PayloadRun};
     pub use crate::scenario::scenarios;
-    pub use crate::test_support::post_vm_skip;
+    pub use crate::test_support::{
+        capture_starvation_witness, periodic_starvation_gate, post_vm_skip,
+    };
     pub use crate::timeline::StimulusEvent;
     // Snapshot accessor surface and the underlying report shapes
     // a test author needs to inspect the captured BTF-rendered
