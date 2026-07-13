@@ -457,14 +457,16 @@ The mode machinery is measured, not assumed. The committed evidence is
 the raw numbers live there, summarized here.
 
 **The reliability rework does not shift the measurements it annotates.**
-Across two perf-mode and two default-mode positives, every schbench
-percentile, throughput, and loop-count metric lands inside the baseline's
-run-to-run envelope or within integer-µs bucket noise. The perf-mode
-measurements are indistinguishable (steady-phase request p50 within 0.1%,
-loop count identical) because the perf-mode service threads were already
-FIFO-2 before the rework. The one systematic departure is a default-mode
-contended workload's request p99, where the branch is reproducibly
-*faster* — an improvement flagged for review, not a blunted threshold.
+The full matrix was re-run against the pre-branch baseline at the
+branch's final code state (release builds, N=6 per side, one run at a
+time on a load-gated host): across the perf-mode steady and
+across-detach cells, the default-mode pipe, split, and iteration-rate
+cells, and the narrow wakeup/request percentiles, every metric lands
+inside the baseline's run-to-run envelope or within integer-µs bucket
+noise, and negative-detection is 12/12 on both sides. The systematic
+departures are *improvements*: the default-mode split request tail and
+the wide request median are reproducibly faster — flagged for
+re-baselining, not blunted thresholds.
 
 **The dilation samples read as expected**, and are the reference points
 for what each mode's placement produces on a quiet host:
@@ -476,17 +478,34 @@ for what each mode's placement produces on a quiet host:
 - **~1.2x** — the per-phase-across-detach cell, where a mid-run scheduler
   swap widens the tail.
 
-**The wide-topology section is the honest one.** On wide (56–64 vCPU)
-no-perf cells run near 1:1, the unconditional FIFO-2 sensing threads
-preempt ~56 vCPU threads on the host and push wakeup-p99 up ~40% —
-throughput (loop count, rps) and median request latency are unaffected, so
-it is a latency-tail redistribution, not a regression. It surfaces only at
-width and only on the most preemption-sensitive metric, and only in a mode
-whose contract already declines timing fidelity: no-perf mode masks rather
-than pins, and its oversubscription warning states plainly that under it
-*"timing metrics are host artifacts."* A cross-commit absolute baseline on
-wide-cell wakeup-p99 should be re-taken; a threshold test, which gates on
-metric presence, is unaffected.
+**The wide-topology finding, re-measured on the final code.** An interim
+capture on wide (56 vCPU) near-1:1 no-perf cells showed the unconditional
+FIFO-2 sensing threads pushing wakeup-p99 up ~40%. Re-measured at the
+branch's final code state against the same baseline (release builds, N=6
+per side), **that tail is gone**: wide wakeup-p99 lands at 0.983x the
+baseline with a far tighter spread. What remains is a small, *constant*
+cost in its place — wide wakeup-**p50** shifts from ~6.5 µs to ~15.8 µs
+(+9.3 µs, spreads disjoint), the per-wakeup preemption charge of the RT
+sensing threads spread uniformly instead of erratically. It surfaces only
+at width (narrow wakeups are identical to the µs on both sides), only on
+the wakeup median, and only in a mode whose contract already declines
+timing fidelity: no-perf mode masks rather than pins, and its
+oversubscription warning states plainly that under it *"timing metrics
+are host artifacts."* Throughput is unaffected (rps +0.9%, loop count
++0.5%, in-envelope) and the wide request median is reproducibly ~8%
+*faster*. A cross-commit absolute baseline on wide-cell wakeup-p50 should
+be re-taken; a threshold test, which gates on metric presence, is
+unaffected.
+
+**Instrumentation overhead is unmeasurable on real workloads.** The two
+measurement-path additions — the monitor's per-tick host schedstat reads
+(the witness) and the worker's per-checkpoint CPU-clock read (the
+CPU-denominated stuck gate) — were laddered commit-by-commit on the
+steady perf schbench cell: every ratio lands 0.996–1.005, inside the
+pre-change envelope. The construction-worst-case fixture (pure SpinWait,
+nothing to amortize against) shows the predicted sub-1%-per-addition dip
+in iteration rate, cumulating to −1.2% and still inside the baseline's
+own run-to-run envelope.
 
 **The watchdog catches real wedges fast and leaves healthy cells alive.**
 The injected-wedge fixtures

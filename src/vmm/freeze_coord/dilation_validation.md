@@ -466,3 +466,109 @@ above quote the older `watchdog:` prefix verbatim as captured.)
   faster), plus the wide spin wedge killed « its deadman. The wide-idle
   miss (§2) is recorded as the summed-trickle detectors' documented width
   limit, not a pass/fail of this validation.
+
+## Final-product re-validation (B = `de820520`, the branch's final code state)
+
+Everything above was captured at intermediate commits. This section
+re-runs the COMPLETE comparison matrix against baseline A = `cc78f447`
+at the final code state — after the Tier-2 CPU-term drop, the
+contention witness, the CPU-second re-denomination, the CPU-time stuck
+gate, the tri-state latency seam, and the build-reservation work all
+landed — plus a three-point instrumentation-overhead ladder isolating
+the two measurement-path additions. 132 runs total, **zero
+contamination discards, zero failed runs**.
+
+PROFILE NOTE: this campaign is RELEASE-profile both sides (the guest
+schbench payload compiles into the test binary, so absolutes here are
+~12x the dev-profile numbers above — e.g. steady loop count ~7.9k vs
+658). No absolute below is comparable to the tables above; every ratio
+is release-vs-release. DELTA CONVENTION (this section): avg-to-avg.
+
+### Methodology deltas from the sections above
+
+- Sides built once, in detached worktrees, before any measurement; one
+  run at a time, rep-major interleaved across sides; 1-min loadavg <= 8
+  enforced at every launch (the driver waits out spikes).
+- The branch sides gate themselves with their own witness: every
+  perf-mode branch run's sidecar `host_dilation` was checked against a
+  D > 1.05 discard bar. Measured D = 1.0094-1.0270 across all 24 such
+  runs — the machinery dogfooding the methodology it exists for. The
+  wide no-perf cell read D = 1.126-1.154, confirming the near-1:1
+  regime (§"Why a wide shape needs near-1:1").
+
+### Instrumentation-overhead ladder (P0 `02603278` → P1 `213c355f` → P2 `94ef4735`)
+
+P1/P0 isolates the witness's per-tick host schedstat reads; P2/P1 the
+worker's per-checkpoint `CLOCK_THREAD_CPUTIME_ID` read; N=6/side.
+
+On the real workload (perf steady schbench), both additions are
+unmeasurable: every ratio 0.996-1.005, every metric inside P0's
+envelope (the lone 0.875 on wakeup-p99 is integer-µs bucketing on a
+[1-2] µs spread). On the amortization WORST CASE (the pure-SpinWait
+iteration cell, one checkpoint per 1024 spins and nothing else), the
+means dip monotonically ~0.6%/rung — the exact sign and scale the
+added hot-path clock read predicts — cumulating to P2/P0 = 0.988,
+with P2's avg still inside P0's own [min-max]. Rates were computed
+from raw carrier components on every side (P0/P1 predate the
+`cpu_sec` denomination marker), so the comparison is
+denomination-proof.
+
+### Final matrix — narrow cells (N=6/side, verdict = B avg inside A's [min-max])
+
+`performance_mode_schbench_steady` (perf): wakeup p50/p99 identical
+(1 µs both sides); request p50 0.996, request p99 0.993, rps 1.004,
+loop count 1.005 — all in-envelope.
+`performance_mode_perphase_metrics_across_detach` (perf): both phases
+in-envelope (scx 0.875 bucket noise; EEVDF 0.068 inside A's known
+[4-515] µs high-variance envelope).
+`schbench_pipe_runs_in_vm` / `schbench_split_runs_in_vm` (default):
+wakeups identical; split request p99 0.919 with B tighter — the same
+faster-split direction as note [3]. `demo_gate_iter_rate_perf_off_positive`:
+CPU-rate 0.994, in-envelope.
+
+### Final matrix — wide 56-vCPU cell (the §1 shape re-run, N=6/side)
+
+| metric | A avg [min-max] | B avg [min-max] | B/A | verdict |
+|---|---|---|---|---|
+| wakeup p50 (us) | 6.5 [5-10] | 15.83 [15-16] | 2.436 | OUT, B slower (+9.3 µs) — [F1] |
+| wakeup p99 (us) | 3893 [3828-3996] | 3827 [3820-3836] | 0.983 | B marginally FASTER, far tighter — [F2]: the [W1] tail is GONE |
+| request p50 (us) | 7229 [7160-7288] | 6613 [6536-6664] | 0.915 | OUT, B FASTER — [F3], the [W2] direction, larger |
+| request p99 (us) | 11790 [10640-13810] | 11330 [11150-11570] | 0.961 | in-envelope |
+| rps p50 | 7989 [7832-8168] | 8059 [8040-8072] | 1.009 | in-envelope |
+| schbench loop count | 120300 [116000-122900] | 120800 [120400-121200] | 1.005 | in-envelope |
+
+- **[F2] supersedes [W1].** The interim +40% wide wakeup-p99 tail does
+  NOT reproduce at the final code state: B/A = 0.983 with B's spread
+  at/below the bottom edge of A's, against a release-profile baseline
+  envelope of ±2% (the dev-profile capture's was ±30%), so the null is
+  sharp. The standing wide-tail concern recorded at [W1] is closed by
+  this measurement.
+- **[F1] is what remains of the sensing cost: a +9.3 µs wakeup-MEDIAN
+  offset, width-only.** 6.5 → 15.8 µs with disjoint spreads; narrow
+  wakeups are identical to the µs on both sides. The FIFO-2 sensing
+  threads' per-wakeup preemption charge shows up as a small CONSTANT
+  median shift instead of an erratic tail — a strictly better-behaved
+  cost. Throughput unaffected. Anyone using wide-cell wakeup-p50 as an
+  absolute cross-commit baseline should re-baseline.
+- **[F3]**: wide request p50 reproducibly −8.5% (B faster, disjoint
+  spreads) — the [W2]/note-[3] default-path improvement, larger at
+  width. An improvement to re-baseline against, not a regression.
+
+### Detection and the demotion path
+
+12/12 negatives detected on both sides (p99-wake and iteration-rate
+gates, 3 reps each per side). Zero `contention-indeterminate`
+occurrences across all 48 B-side runs: the p99-wake negative fails via
+the degraded scheduler's in-guest scx-watchdog exit (not the latency
+gate), and the iteration-rate gate is CPU-denominated — outside the
+demotion path by design. Detection is byte-for-byte unchanged at the
+final code state.
+
+### Verdict
+
+Measurement-neutral everywhere the narrow shapes can see; at width, the
+interim tail regression is gone, replaced by a small constant
+wakeup-median offset ([F1]) in the mode whose contract already declines
+timing fidelity; two reproducible improvements ([F3], split-tail); no
+blunted thresholds; instrumentation overhead bounded at −1.2% on a
+worst-case synthetic and unmeasurable on real workloads.
