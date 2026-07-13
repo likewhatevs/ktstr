@@ -299,14 +299,54 @@ pub fn starved_below_minimum_skip(
     need: usize,
     what: &str,
 ) -> anyhow::Result<()> {
-    if have < need
-        && let Some(d) = capture_starvation_witness(result)
-    {
+    if have >= need {
+        return Ok(());
+    }
+    // PRIMARY arm — readiness vs window: when the periodic prereqs
+    // (KASLR publish + accessors) became ready at/after the capture
+    // window's end, or never became ready at all, every boundary was
+    // structurally unreachable — zero/short captures were inevitable at
+    // ANY host dilation. This is the honest signal the D-threshold arm
+    // missed in the field: a ~7 s cold accessor build outruns a 4-5 s
+    // workload window at D ≈ 1.2, well under any defensible contention
+    // bar. Skip carries both timestamps.
+    let ready = result.periodic_prereqs_ready;
+    let window_end = result.periodic_window_end;
+    let structurally_impossible = match (ready, window_end) {
+        // Never ready: nothing could ever fire.
+        (None, _) => true,
+        // Ready, but at/after the window closed.
+        (Some(r), Some(w)) => r >= w,
+        // Ready but the window never resolved: the boundaries were
+        // never computed, so no capture could fire.
+        (Some(_), None) => true,
+    };
+    if result.periodic_target > 0 && structurally_impossible {
+        return Err(post_vm_skip(format!(
+            "only {have} of the required {need} {what}: the capture prereqs \
+             (KASLR publish + accessor init) {} the capture window \
+             (prereqs_ready={:?}, window_end={:?}) — captures were \
+             structurally impossible this run at any host dilation; \
+             environmental non-verdict",
+            if ready.is_none() {
+                "never became ready within"
+            } else {
+                "became ready only after"
+            },
+            ready,
+            window_end,
+        )));
+    }
+    // SECONDARY arm — witnessed contention: readiness landed in time
+    // but the captures still fell short (e.g. rendezvous degradation,
+    // data-bearing rows missing) under a provably saturated host.
+    if let Some(d) = capture_starvation_witness(result) {
         return Err(post_vm_skip(format!(
             "only {have} of the required {need} {what} under witnessed host \
-             contention (D={d:.2}): the readiness-gated capture chain was \
-             starved below the assertion's minimum — environmental \
-             non-verdict; the dependent assertions cannot be evaluated",
+             contention (D={d:.2}, prereqs_ready={ready:?}, \
+             window_end={window_end:?}): the capture chain was starved below \
+             the assertion's minimum — environmental non-verdict; the \
+             dependent assertions cannot be evaluated",
         )));
     }
     Ok(())
@@ -566,51 +606,75 @@ mod starvation_witness_tests {
         assert!((d - 3.0).abs() < 1e-9);
     }
 
-    /// The gate skips ONLY on (target>0, real captures BELOW the
-    /// caller's minimum, witnessed contention); every other combination
-    /// returns Ok and lets the caller's own assertions run. The
-    /// sub-minimum (not just zero) boundary is load-bearing: an
-    /// observed `1 of 6` starved run escaped a zero-only gate and then
-    /// failed its `>= 3` minimum under the identical environmental
-    /// condition.
+    /// Fixture with the readiness-vs-window fields set: prereqs ready
+    /// at `ready_s`, window ending at `end_s` (None = never/unresolved).
+    fn with_window(
+        base: VmResult,
+        target: u32,
+        ready_s: Option<u64>,
+        end_s: Option<u64>,
+    ) -> VmResult {
+        VmResult {
+            periodic_target: target,
+            periodic_prereqs_ready: ready_s.map(std::time::Duration::from_secs),
+            periodic_window_end: end_s.map(std::time::Duration::from_secs),
+            ..base
+        }
+    }
+
+    /// Gate arms, primary (readiness-vs-window) first:
+    ///   - readiness never / after the window end → structural skip at
+    ///     ANY dilation (the arm the D-threshold missed in the field:
+    ///     a ~7 s accessor build vs a 4-5 s window at D ≈ 1.2);
+    ///   - readiness in time + contended → witness skip;
+    ///   - readiness in time + quiet → Ok (the caller's own assertion
+    ///     fails — the real-regression case stays catchable);
+    ///   - no periodic target → Ok regardless.
     #[test]
     fn periodic_starvation_gate_arms() {
         // No periodic target: Ok even when contended.
         let r = with_dilation(10, 20);
         assert!(periodic_starvation_gate(&r, 1).is_ok());
-        // Target set, zero real captures below min 1, contended: Err
-        // carrying the HostSkipRequest marker.
-        let r = VmResult {
-            periodic_target: 2,
-            ..with_dilation(10, 20)
-        };
-        let err = periodic_starvation_gate(&r, 1).expect_err("starved run must gate");
-        assert!(
-            err.downcast_ref::<HostSkipRequest>().is_some(),
-            "gate must carry the HostSkipRequest skip marker"
-        );
-        // Target set, zero captures, QUIET host: Ok (caller fails with
-        // its own diagnosis — the regression case stays catchable).
-        let r = VmResult {
-            periodic_target: 2,
-            ..with_dilation(10, 1)
-        };
+        // Readiness AFTER the window end, QUIET host: structural skip.
+        let r = with_window(with_dilation(10, 1), 2, Some(9), Some(5));
+        let err = periodic_starvation_gate(&r, 1).expect_err("late readiness must gate");
+        assert!(err.downcast_ref::<HostSkipRequest>().is_some());
+        // Readiness NEVER, quiet host: structural skip.
+        let r = with_window(with_dilation(10, 1), 2, None, Some(5));
+        assert!(periodic_starvation_gate(&r, 1).is_err());
+        // Window never resolved (no boundary could fire): structural skip.
+        let r = with_window(with_dilation(10, 1), 2, Some(1), None);
+        assert!(periodic_starvation_gate(&r, 1).is_err());
+        // Readiness IN TIME + contended: witness skip.
+        let r = with_window(with_dilation(10, 20), 2, Some(1), Some(5));
+        let err = periodic_starvation_gate(&r, 1).expect_err("contended run must gate");
+        assert!(err.downcast_ref::<HostSkipRequest>().is_some());
+        // Readiness IN TIME + quiet + zero captures: Ok — the caller
+        // fails with its own diagnosis (a capture-pipeline regression).
+        let r = with_window(with_dilation(10, 1), 2, Some(1), Some(5));
         assert!(periodic_starvation_gate(&r, 1).is_ok());
     }
 
-    /// The generic sub-minimum gate: `have < need` + witness = skip;
-    /// `have >= need` never gates; quiet host never gates.
+    /// The generic sub-minimum gate: `have < need` + (structural OR
+    /// witnessed) = skip; `have >= need` never gates; readiness-in-time
+    /// quiet host never gates.
     #[test]
     fn starved_below_minimum_arms() {
-        let contended = with_dilation(10, 20);
-        // Sub-minimum + contended: skip (the 1-of-6 shape).
+        // Sub-minimum + contended (readiness in time): witness skip —
+        // the 1-of-6 shape.
+        let contended = with_window(with_dilation(10, 20), 6, Some(1), Some(5));
         let err = starved_below_minimum_skip(&contended, 1, 3, "captures")
             .expect_err("sub-minimum under contention must gate");
         assert!(err.downcast_ref::<HostSkipRequest>().is_some());
-        // At/above minimum: never gates, even contended.
-        assert!(starved_below_minimum_skip(&contended, 3, 3, "captures").is_ok());
-        // Sub-minimum on a quiet host: falls through (caller fails).
-        let quiet = with_dilation(10, 1);
+        // At/above minimum: never gates, even contended + late-ready.
+        let late = with_window(with_dilation(10, 20), 6, Some(9), Some(5));
+        assert!(starved_below_minimum_skip(&late, 3, 3, "captures").is_ok());
+        // Sub-minimum, quiet, readiness in time: falls through (caller
+        // fails with its own diagnosis).
+        let quiet = with_window(with_dilation(10, 1), 6, Some(1), Some(5));
         assert!(starved_below_minimum_skip(&quiet, 1, 3, "captures").is_ok());
+        // Sub-minimum, quiet, readiness LATE: structural skip.
+        let quiet_late = with_window(with_dilation(10, 1), 6, Some(9), Some(5));
+        assert!(starved_below_minimum_skip(&quiet_late, 1, 3, "captures").is_err());
     }
 }

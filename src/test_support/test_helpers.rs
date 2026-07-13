@@ -291,6 +291,8 @@ pub(crate) fn make_vm_result(
         final_guest_phase: crate::vmm::GuestLifecyclePhase::Boot,
         final_progress_epoch: 0,
         bpf_map_writes_delivered: None,
+        periodic_prereqs_ready: None,
+        periodic_window_end: None,
         output: output.to_string(),
         stderr: stderr.to_string(),
         monitor: None,

@@ -2520,6 +2520,19 @@ impl KtstrVm {
         let unknown_type_frames: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let unknown_type_frames_for_coord = unknown_type_frames.clone();
+        // Readiness-vs-window evidence for the capture-starvation gates
+        // (run-relative ns; 0 = never): WHEN the periodic prereqs (kaslr
+        // publish + both accessors) became ready, and WHERE the capture
+        // window ends. Readiness at-or-after the window end makes zero
+        // captures STRUCTURALLY inevitable at any host dilation — the
+        // honest environmental-skip signal the D-threshold missed (a
+        // ~7 s cold accessor build outruns a 4-5 s window at D ≈ 1.2).
+        let periodic_prereqs_ready_at: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let periodic_window_end_at: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let periodic_prereqs_ready_for_coord = periodic_prereqs_ready_at.clone();
+        let periodic_window_end_for_coord = periodic_window_end_at.clone();
         let monitor_handle = self.start_monitor(
             &vm,
             &kill,
@@ -9214,6 +9227,9 @@ impl KtstrVm {
                         periodic_prereqs_ready_ns = u64::try_from(run_start.elapsed().as_nanos())
                             .unwrap_or(u64::MAX)
                             .max(1);
+                        // Export for the post-run readiness-vs-window gate.
+                        periodic_prereqs_ready_for_coord
+                            .store(periodic_prereqs_ready_ns, Ordering::Release);
                     }
                     if freeze_coord_num_snapshots > 0 && !periodic_abandoned {
                         if periodic_boundaries_ns.is_none()
@@ -9317,6 +9333,12 @@ impl KtstrVm {
                                     "freeze-coord: periodic snapshot boundaries computed"
                                 );
                                 periodic_anchor_ns = window.anchor_ns;
+                                // Export for the post-run readiness-vs-window
+                                // gate. `window_end_ns` is in the SAME
+                                // run-relative frame as the prereq stamp,
+                                // `.max(1)` vs the 0 sentinel.
+                                periodic_window_end_for_coord
+                                    .store(window.window_end_ns.max(1), Ordering::Release);
                                 periodic_boundaries_ns = Some(boundaries);
                             }
                         }
@@ -12388,6 +12410,8 @@ impl KtstrVm {
             final_guest_phase_raw: final_ledger.phase,
             final_progress_epoch: final_ledger.progress_epoch,
             bpf_map_write_delivery_raw: bpf_map_write_delivery.load(Ordering::Acquire),
+            periodic_prereqs_ready_ns_raw: periodic_prereqs_ready_at.load(Ordering::Acquire),
+            periodic_window_end_ns_raw: periodic_window_end_at.load(Ordering::Acquire),
             ap_threads,
             monitor_handle,
             bpf_write_handle,
@@ -15000,6 +15024,11 @@ impl KtstrVm {
             // writes configured, 1 = configured but never delivered,
             // 2 = delivered-and-guest-signalled.
             bpf_map_writes_delivered: decode_bpf_map_write_delivery(run.bpf_map_write_delivery_raw),
+            // Readiness-vs-window evidence (0 sentinel → None).
+            periodic_prereqs_ready: (run.periodic_prereqs_ready_ns_raw != 0)
+                .then(|| Duration::from_nanos(run.periodic_prereqs_ready_ns_raw)),
+            periodic_window_end: (run.periodic_window_end_ns_raw != 0)
+                .then(|| Duration::from_nanos(run.periodic_window_end_ns_raw)),
             output: app_output,
             stderr: console_output,
             monitor: monitor_report,

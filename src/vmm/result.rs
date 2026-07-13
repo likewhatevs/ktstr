@@ -205,6 +205,19 @@ pub struct VmResult {
     /// never fired because the injection never landed" (environmental
     /// under witnessed contention) from a real detection failure.
     pub bpf_map_writes_delivered: Option<bool>,
+    /// Run-relative instant the periodic-capture prereqs (KASLR publish
+    /// and the map/prog accessors) became ready; `None` when they never
+    /// did. With [`Self::periodic_window_end`] this is the READINESS-VS-WINDOW
+    /// evidence: readiness at/after the window end (or never) makes zero
+    /// captures structurally inevitable at ANY host dilation — the
+    /// capture-starvation gates skip on it instead of a dilation
+    /// threshold (a ~7 s cold accessor build outruns a 4-5 s window at
+    /// D ≈ 1.2, below any honest contention bar).
+    pub periodic_prereqs_ready: Option<Duration>,
+    /// Run-relative instant the periodic capture window ends (the
+    /// workload-end clamp); `None` when the window never resolved —
+    /// which itself means no boundary could ever fire.
+    pub periodic_window_end: Option<Duration>,
     /// Captured guest stdout (and any non-dmesg serial console content).
     pub output: String,
     /// Captured guest stderr (separated from `output` when the guest
@@ -1267,6 +1280,8 @@ impl VmResult {
             final_guest_phase: GuestLifecyclePhase::Boot,
             final_progress_epoch: 0,
             bpf_map_writes_delivered: None,
+            periodic_prereqs_ready: None,
+            periodic_window_end: None,
             output: String::new(),
             stderr: String::new(),
             monitor: None,
@@ -1794,6 +1809,12 @@ pub(crate) struct VmRunState {
     /// thread (the join/drain performer) — closed by `collect_results`
     /// into [`VmResult::cleanup_sched_delta`].
     pub(crate) cleanup_sched_t0: Option<HostVcpuSchedstat>,
+    /// Run-relative ns when the periodic prereqs (kaslr + accessors)
+    /// became ready (0 = never) → [`VmResult::periodic_prereqs_ready`].
+    pub(crate) periodic_prereqs_ready_ns_raw: u64,
+    /// Run-relative ns of the periodic capture-window end (0 = the
+    /// window never resolved) → [`VmResult::periodic_window_end`].
+    pub(crate) periodic_window_end_ns_raw: u64,
     pub(crate) ap_threads: Vec<VcpuThread>,
     pub(crate) monitor_handle: Option<JoinHandle<monitor::reader::MonitorLoopResult>>,
     pub(crate) bpf_write_handle: Option<JoinHandle<()>>,

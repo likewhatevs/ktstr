@@ -400,6 +400,14 @@ fn eval_cleanup_budget_overshoot_folds_failing_detail() {
     entry.cleanup_budget = Some(std::time::Duration::from_secs(1));
     let mut result = make_vm_result_with_assert("", "", 0, false, &assert);
     result.cleanup_duration = Some(std::time::Duration::from_secs(10));
+    // Attest a QUIET host (whole-run D = 1.05 ≤ the 1.1 enforcement
+    // bar): the re-scoped gate enforces the budget only when the
+    // witness proves the box was idle enough for wall attribution.
+    result.host_vcpu_schedstat = Some(crate::vmm::HostVcpuSchedstat {
+        total_on_cpu_ns: 100,
+        total_run_delay_ns: 5,
+        sampled_vcpus: 1,
+    });
     let assertions = crate::assert::Assert::NO_OVERRIDES;
     let msg = format!(
         "{}",
@@ -431,8 +439,8 @@ fn eval_cleanup_budget_overshoot_folds_failing_detail() {
 
 /// Cleanup-budget contention demotion: the SAME overshoot as
 /// `eval_cleanup_budget_overshoot_folds_failing_detail`, but with a
-/// cleanup-window schedstat delta proving the window was contended
-/// (run-delay covers the excess; D_cleanup > 1.5) — the overrun demotes to a non-blocking
+/// whole-run witness proving the host was NOT quiet (D = 3.0 > the
+/// 1.1 enforcement bar) — the overrun demotes to a non-blocking
 /// stderr warning and the guest's passing verdict survives. The
 /// join/drain teardown dilates with host load by design; only a
 /// quiet-host overrun is a teardown regression.
@@ -445,12 +453,15 @@ fn eval_cleanup_budget_overshoot_demotes_under_witnessed_contention() {
     entry.cleanup_budget = Some(std::time::Duration::from_secs(1));
     let mut result = make_vm_result_with_assert("", "", 0, false, &assert);
     result.cleanup_duration = Some(std::time::Duration::from_secs(10));
-    // Cleanup-window instrument: the join/drain thread accrued 9 s of
-    // runnable-wait across the window — covering the 9 s excess
-    // (delay-covers arm) AND D_cleanup = 10 > 1.5 (contended-window arm).
-    result.cleanup_sched_delta = Some(crate::vmm::HostVcpuSchedstat {
-        total_on_cpu_ns: 1_000_000_000,
-        total_run_delay_ns: 9_000_000_000,
+    // NON-quiet whole-run witness (D = 3.0 > the 1.1 enforcement bar):
+    // the re-scoped gate demotes — join/drain wall on a loaded box is
+    // the joined threads' exit-path starvation, unattributable from
+    // the host side (the joiner-window instrument was field-falsified:
+    // it read D_cleanup = 1.00 on starved runs because the joiner
+    // SLEEPS while the joined threads starve).
+    result.host_vcpu_schedstat = Some(crate::vmm::HostVcpuSchedstat {
+        total_on_cpu_ns: 10,
+        total_run_delay_ns: 20,
         sampled_vcpus: 1,
     });
     let assertions = crate::assert::Assert::NO_OVERRIDES;
@@ -756,6 +767,8 @@ fn eval_monitor_fail_has_fingerprint() {
         final_guest_phase: crate::vmm::GuestLifecyclePhase::Boot,
         final_progress_epoch: 0,
         bpf_map_writes_delivered: None,
+        periodic_prereqs_ready: None,
+        periodic_window_end: None,
         output,
         stderr: String::new(),
         monitor: Some(crate::monitor::MonitorReport {
@@ -1112,6 +1125,8 @@ fn eval_sched_exit_includes_monitor() {
         final_guest_phase: crate::vmm::GuestLifecyclePhase::Boot,
         final_progress_epoch: 0,
         bpf_map_writes_delivered: None,
+        periodic_prereqs_ready: None,
+        periodic_window_end: None,
         output: String::new(),
         stderr: String::new(),
         monitor: Some(crate::monitor::MonitorReport {
@@ -1237,6 +1252,8 @@ fn eval_monitor_fail_includes_sched_log() {
         final_guest_phase: crate::vmm::GuestLifecyclePhase::Boot,
         final_progress_epoch: 0,
         bpf_map_writes_delivered: None,
+        periodic_prereqs_ready: None,
+        periodic_window_end: None,
         output,
         stderr: String::new(),
         monitor: Some(crate::monitor::MonitorReport {
@@ -3167,6 +3184,8 @@ fn eval_monitor_inconclusive_folds_into_verdict() {
         final_guest_phase: crate::vmm::GuestLifecyclePhase::Boot,
         final_progress_epoch: 0,
         bpf_map_writes_delivered: None,
+        periodic_prereqs_ready: None,
+        periodic_window_end: None,
         output: String::new(),
         stderr: String::new(),
         monitor: Some(crate::monitor::MonitorReport {

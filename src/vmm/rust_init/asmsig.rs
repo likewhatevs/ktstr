@@ -51,6 +51,32 @@ fn write_all_asm(fd: libc::c_int, bytes: &[u8]) {
     }
 }
 
+/// Port-independent guest console breadcrumb: write `msg` + newline
+/// straight to the serial devices (COM2 then COM1), the same channel
+/// the fatal-signal banner uses — demonstrably deliverable even when
+/// the virtio-console bulk port is the thing being diagnosed. Used by
+/// the KERN_ADDRS send-side breadcrumbs: a field run whose kill-time
+/// probe read `kern_addrs_frames=0, unknown_type_frames=0` exonerated
+/// the wire and the dispatcher, leaving the guest send path as the
+/// only unlit segment — these lines carry its story to the host log.
+/// Bounded by the callers (once-per-event / coarse intervals); no
+/// tcdrain (breadcrumbs are best-effort, not pre-reboot seals).
+pub(crate) fn console_breadcrumb(msg: &str) {
+    for path in [c"/dev/ttyS1", c"/dev/ttyS0"] {
+        // SAFETY: open/write/close on static NUL-terminated paths;
+        // O_NONBLOCK so a wedged tty cannot hang the caller.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+        if fd < 0 {
+            continue;
+        }
+        write_all_asm(fd, msg.as_bytes());
+        write_all_asm(fd, b"\n");
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
 /// Async-signal-safe handler for SIGSEGV / SIGBUS / SIGILL.
 ///
 /// The Rust panic hook installed in [`crate::vmm::rust_init::ktstr_guest_init`] does NOT

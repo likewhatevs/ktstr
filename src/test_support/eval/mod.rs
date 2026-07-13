@@ -1969,75 +1969,80 @@ fn evaluate_verdict_folds(
     // The budget is a WALL bound on a join/drain sequence (watchdog
     // join, AP joins, monitor join, bulk drain — see
     // `VmResult::cleanup_duration`) whose duration under host
-    // saturation is the wake latency of the joined threads, not work:
-    // observed 6-12 s overruns on saturated 96-CPU CI runners for cells
-    // that measure well under 5 s on the same hardware idle. A flat
-    // wall bound conflates "teardown regressed" with "the box was
-    // busy" — the disguised-wall-deadline anti-pattern.
+    // saturation is the wake latency of the JOINED threads, not work.
     //
-    // Judge the overrun against the CLEANUP WINDOW'S OWN dilation
-    // evidence (`VmResult::cleanup_sched_delta`: the join/drain
-    // performer thread's schedstat delta across exactly this window).
-    // The per-phase / whole-run witnesses are the WRONG instrument
-    // here and are deliberately not consulted: the monitor that feeds
-    // them is itself joined INSIDE the window, and join wake-latency
-    // is a tail phenomenon a whole-run average under-attests (field
-    // case: a 7.06 s cleanup failed a 5 s budget with whole-run
-    // D = 1.21 on a busy box). Demotion (non-blocking warn) when
-    // EITHER window-local instrument explains the overrun:
-    //   - excess ≤ Δrun_delay — the host scheduler ADDED at least the
-    //     overrun in runnable-wait to this thread during the window
-    //     (direct wall accounting, the strongest form);
-    //   - D_cleanup = 1 + Δdelay/Δon_cpu > 1.5 — the window itself was
-    //     contended past the established quiet-host bar (same
-    //     derivation as `PERF_ISOLATION_D_MAX`). Covers the
-    //     under-attestation of the first rule: a joined thread's own
-    //     wake latency surfaces as the joiner SLEEPING longer (not
-    //     runnable-waiting), while the joiner's remaining wakes still
-    //     dilate measurably.
-    // Absent/unattested evidence (no snapshot at either edge, or zero
-    // on-CPU — CONFIG_SCHEDSTATS off) keeps the check BLOCKING:
-    // absence of evidence must not launder a regression, and quiet
-    // hosts (local dev, unsaturated legs) still catch real teardown
-    // regressions.
-    const CLEANUP_CONTENTION_D_MAX: f64 = 1.5;
+    // Evidence-source history, because both prior instruments were
+    // field-falsified:
+    //   - whole-run/per-phase witness D as the demotion signal:
+    //     under-attested (a 7.06 s cleanup failed a 5 s budget at
+    //     whole-run D = 1.21 on a saturated box);
+    //   - the joiner thread's own window schedstat delta
+    //     (`VmResult::cleanup_sched_delta`): measures the WRONG
+    //     threads — every failing arm cell read `run-delay 0.001s,
+    //     D_cleanup=1.00` at 7-9 s measured, because the joiner SLEEPS
+    //     in `join(2)` while the joined vCPUs/APs/monitor (SCHED_OTHER
+    //     on CI) are starved through their exit paths; joiner sleep
+    //     never appears in joiner run-delay. Direct instrumentation of
+    //     the exiting threads is not cleanly possible (their /proc
+    //     task entries vanish mid-window).
+    //
+    // RE-SCOPE to what the assertion can honestly measure: it exists
+    // to catch host-side teardown REGRESSIONS (an added sleep, a busy
+    // drain), and those reproduce on quiet hosts. ENFORCE the budget
+    // only when the whole-run witness attests a QUIET host
+    // (D ≤ 1.1: the captured quiet-host whole-run measurements in
+    // `dilation_validation.md` read ≈ 1.08 at the noisy end, so 1.1
+    // sits just above the measured-quiet spread — any host that
+    // cannot even keep vCPUs at D ≤ 1.1 was carrying load, and wall
+    // in the join window cannot be attributed). Everything else —
+    // contended OR unattested (schedstats off) — demotes to the loud
+    // warning + metric: the measurement and the window-local
+    // instrument's readings stay in both message paths so a
+    // regression hunt on a busy box still has the numbers.
+    const CLEANUP_ENFORCE_QUIET_D_MAX: f64 = 1.1;
     if let (Some(budget), Some(measured)) = (entry.cleanup_budget, result.cleanup_duration)
         && measured > budget
     {
-        let excess = measured - budget;
+        let whole_run_d = result
+            .host_vcpu_schedstat
+            .as_ref()
+            .and_then(|s| s.dilation());
         let delta = result.cleanup_sched_delta.as_ref();
         let delay_ns = delta.map(|d| d.total_run_delay_ns).unwrap_or(0);
         let d_cleanup = delta.and_then(|d| d.dilation());
-        let delay_covers = delta.is_some() && excess.as_nanos() as u64 <= delay_ns;
-        let window_contended = d_cleanup.is_some_and(|d| d > CLEANUP_CONTENTION_D_MAX);
-        if delay_covers || window_contended {
-            eprintln!(
-                "vm cleanup overran budget under witnessed cleanup-window \
-                 contention: measured {:.3}s, budget {:.3}s, window run-delay \
-                 {:.3}s, D_cleanup={} — non-blocking; the join/drain sequence \
-                 dilates with host load by design. A quiet-window overrun \
-                 would fail here.",
-                measured.as_secs_f64(),
-                budget.as_secs_f64(),
-                delay_ns as f64 / 1e9,
-                d_cleanup.map_or("unsampled".to_string(), |d| format!("{d:.2}")),
-            );
-        } else {
+        let render_d = |d: Option<f64>| d.map_or("unsampled".to_string(), |d| format!("{d:.2}"));
+        let attested_quiet = whole_run_d.is_some_and(|d| d <= CLEANUP_ENFORCE_QUIET_D_MAX);
+        if attested_quiet {
             check_result.merge(AssertResult::fail(crate::assert::AssertDetail::new(
                 crate::assert::DetailKind::Other,
                 format!(
-                    "vm cleanup overran budget: measured {:.3}s, budget {:.3}s \
-                     (cleanup-window run-delay {:.3}s, D_cleanup={} — the \
-                     window's own dilation evidence does not explain the \
-                     excess). Likely a regression in host-side teardown — \
-                     investigate the post-BSP-exit join/drain path \
+                    "vm cleanup overran budget on an attested-quiet host: \
+                     measured {:.3}s, budget {:.3}s (whole-run D={}, \
+                     joiner-window run-delay {:.3}s, D_cleanup={}). Likely a \
+                     regression in host-side teardown — investigate the \
+                     post-BSP-exit join/drain path \
                      (`vmm::KtstrVm::collect_results`).",
                     measured.as_secs_f64(),
                     budget.as_secs_f64(),
+                    render_d(whole_run_d),
                     delay_ns as f64 / 1e9,
-                    d_cleanup.map_or("unsampled".to_string(), |d| format!("{d:.2}")),
+                    render_d(d_cleanup),
                 ),
             )));
+        } else {
+            eprintln!(
+                "vm cleanup overran budget on a non-quiet (or unattested) host: \
+                 measured {:.3}s, budget {:.3}s, whole-run D={}, joiner-window \
+                 run-delay {:.3}s, D_cleanup={} — non-blocking; join/drain wall \
+                 is the JOINED threads' exit-path starvation, which no \
+                 host-side instrument can attribute once they exit. A \
+                 quiet-host (D<={CLEANUP_ENFORCE_QUIET_D_MAX}) overrun fails here.",
+                measured.as_secs_f64(),
+                budget.as_secs_f64(),
+                render_d(whole_run_d),
+                delay_ns as f64 / 1e9,
+                render_d(d_cleanup),
+            );
         }
     }
 

@@ -336,6 +336,7 @@ pub(crate) fn send_sys_rdy_with_retry(
     };
 
     let mut kern_addrs_sent = false;
+    let mut first_attempt_logged = false;
     loop {
         #[cfg(test)]
         SEND_SYS_RDY_RETRY_ITERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -355,13 +356,46 @@ pub(crate) fn send_sys_rdy_with_retry(
                 // waitqueue until PORT_OPEN (host_connected) — kernel-
                 // evented, no poll/sleep needed here.
                 if !kern_addrs_sent {
+                    // Pre-attempt crumb, once: `send_kern_addrs`'s blocking
+                    // writev parks in the driver's `wait_port_writable`
+                    // (no timeout) until the host's PORT_OPEN — a park that
+                    // never wakes would swallow every post-attempt crumb, so
+                    // "attempting" with no following outcome line IS the
+                    // park-forever fingerprint.
+                    if !first_attempt_logged {
+                        crate::vmm::rust_init::console_breadcrumb(
+                            "ktstr-init: attempting first KERN_ADDRS send",
+                        );
+                    }
                     kern_addrs_sent = crate::vmm::guest_comms::send_kern_addrs(kern_addrs);
+                    // Send-side breadcrumb (port-independent serial channel —
+                    // see `console_breadcrumb`): the first attempt's outcome,
+                    // once. A field run with the wire + dispatcher exonerated
+                    // (kill-time frames=0) left this segment unlit.
+                    if !first_attempt_logged {
+                        first_attempt_logged = true;
+                        crate::vmm::rust_init::console_breadcrumb(if kern_addrs_sent {
+                            "ktstr-init: KERN_ADDRS first send ok"
+                        } else {
+                            "ktstr-init: KERN_ADDRS first send FAILED; retrying"
+                        });
+                    }
                 }
                 if kern_addrs_sent && crate::vmm::guest_comms::send_sys_rdy() {
+                    crate::vmm::rust_init::console_breadcrumb(
+                        "ktstr-init: KERN_ADDRS + SYS_RDY delivered (foreground)",
+                    );
                     return;
                 }
                 if std::time::Instant::now() >= deadline {
                     warn_timeout(kern_addrs_sent);
+                    crate::vmm::rust_init::console_breadcrumb(if kern_addrs_sent {
+                        "ktstr-init: publish budget expired (KERN_ADDRS sent, SYS_RDY \
+                         pending); background retry spawned"
+                    } else {
+                        "ktstr-init: publish budget expired with KERN_ADDRS UNSENT; \
+                         background retry spawned"
+                    });
                     spawn_background_publish_retry(kern_addrs_sent, *kern_addrs, port_path);
                     return;
                 }
@@ -382,6 +416,10 @@ pub(crate) fn send_sys_rdy_with_retry(
             }
             KernfsWaitOutcome::Timeout | KernfsWaitOutcome::NoEventedSource => {
                 warn_timeout(kern_addrs_sent);
+                crate::vmm::rust_init::console_breadcrumb(
+                    "ktstr-init: publish budget expired waiting for the port node; \
+                     background retry spawned",
+                );
                 spawn_background_publish_retry(kern_addrs_sent, *kern_addrs, port_path);
                 return;
             }
@@ -425,6 +463,9 @@ fn spawn_background_publish_retry(
                 .to_path_buf();
             let cadence = std::time::Duration::from_secs(1);
             let mut kern_addrs_sent = kern_addrs_sent;
+            let retry_t0 = std::time::Instant::now();
+            let mut attempts: u64 = 0;
+            let mut last_crumb = retry_t0;
             loop {
                 // Far-future deadline: the wait itself is evented and the
                 // loop is exit-on-success; a finite horizon only guards
@@ -439,15 +480,35 @@ fn spawn_background_publish_retry(
                     || port_path.exists().then_some(()),
                 ) {
                     KernfsWaitOutcome::Done(()) => {
+                        attempts += 1;
                         if !kern_addrs_sent {
                             kern_addrs_sent = crate::vmm::guest_comms::send_kern_addrs(&kern_addrs);
                         }
                         if kern_addrs_sent && crate::vmm::guest_comms::send_sys_rdy() {
-                            tracing::info!(
+                            // Serial, not tracing/stdout: by now stdio rides
+                            // the very bulk port under diagnosis.
+                            crate::vmm::rust_init::console_breadcrumb(
                                 "ktstr-init: background publish retry delivered \
-                                 KERN_ADDRS + SYS_RDY after the boot budget expired"
+                                 KERN_ADDRS + SYS_RDY",
                             );
                             return;
+                        }
+                        // Coarse-interval liveness breadcrumb (~30 s): the
+                        // retry is alive and how many attempts it has burned
+                        // — with the first-send and spawn crumbs this carries
+                        // the whole send-side story to the host log. Coarse
+                        // formatting only (attempt count bucketed) to keep
+                        // the line cheap and the volume run-bounded.
+                        if last_crumb.elapsed() >= std::time::Duration::from_secs(30) {
+                            last_crumb = std::time::Instant::now();
+                            let msg = if attempts < 10 {
+                                "ktstr-init: publish retry alive (attempts < 10)"
+                            } else if attempts < 100 {
+                                "ktstr-init: publish retry alive (attempts 10-99)"
+                            } else {
+                                "ktstr-init: publish retry alive (attempts >= 100)"
+                            };
+                            crate::vmm::rust_init::console_breadcrumb(msg);
                         }
                         // Fast-fail throttle, mirroring the foreground loop.
                         std::thread::sleep(std::time::Duration::from_millis(100));
