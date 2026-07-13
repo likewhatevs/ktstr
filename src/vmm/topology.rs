@@ -946,7 +946,7 @@ mod tests {
         assert_eq!(t.total_cpus(), 192); // (9*10 + 6) * 2
         // decompose partitions the dense 0..192 CPU space into 11 LLCs
         // sized {18 x10, 12 x1} — the guest-visible uneven layout.
-        let mut sizes = vec![0u32; 11];
+        let mut sizes = [0u32; 11];
         let mut prev_llc = 0;
         for cpu in 0..t.total_cpus() {
             let (llc, core, thread) = t.decompose(cpu);
