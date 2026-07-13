@@ -6260,6 +6260,14 @@ mod tests {
         let r = crate::vmm::VmResult {
             periodic_target: 3,
             periodic_fired: 3,
+            // Readiness landed WELL INSIDE the capture window: the
+            // structural starvation arm (readiness >= window end, or
+            // window never resolved) must NOT engage, so the
+            // placeholder-only shape exercises the real-count FAILURE
+            // path this test pins. The fixture default (both None)
+            // reads as window-never-resolved and would skip instead.
+            periodic_prereqs_ready: Some(std::time::Duration::from_secs(1)),
+            periodic_window_end: Some(std::time::Duration::from_secs(10)),
             ..crate::vmm::VmResult::test_fixture()
         };
         // All three fires produced placeholders.
@@ -6293,6 +6301,11 @@ mod tests {
         let r = crate::vmm::VmResult {
             periodic_target: 3,
             periodic_fired: 3,
+            // Readiness-in-time: keep the structural starvation arm
+            // disengaged so this test exercises its own failure path
+            // (see the placeholders-only sibling).
+            periodic_prereqs_ready: Some(std::time::Duration::from_secs(1)),
+            periodic_window_end: Some(std::time::Duration::from_secs(10)),
             ..crate::vmm::VmResult::test_fixture()
         };
         // Populate ONLY non-periodic-tagged reports — these come
@@ -6387,6 +6400,11 @@ mod tests {
         let r = crate::vmm::VmResult {
             periodic_target: 5,
             periodic_fired: 0,
+            // Readiness-in-time: keep the structural starvation arm
+            // disengaged so this test exercises its own failure path
+            // (see the placeholders-only sibling).
+            periodic_prereqs_ready: Some(std::time::Duration::from_secs(1)),
+            periodic_window_end: Some(std::time::Duration::from_secs(10)),
             ..crate::vmm::VmResult::test_fixture()
         };
         let err = super::default_post_vm_periodic_fired(&r)
