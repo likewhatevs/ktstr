@@ -315,7 +315,7 @@ impl LockDirWatch {
 /// Parks in the kernel's flock wait queue on [`queue_lock_path`]
 /// (`LOCK_EX`, blocking) — arrival-order FIFO across every
 /// invocation, tickets vanishing with their process. A
-/// [`QUEUE_PROGRESS_TICK`] heartbeat interrupts the wait to sample
+/// `QUEUE_PROGRESS_TICK` heartbeat interrupts the wait to sample
 /// the queue holder via `/proc/locks`: a CHANGED holder identity
 /// means the queue advanced (a head finished, or a waiter ahead gave
 /// up) and the patience clock resets. Only [`patience`] of zero

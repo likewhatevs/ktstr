@@ -274,7 +274,7 @@ pub enum FlockWait {
 ///  - `Err` on open / unexpected-errno failures.
 ///
 /// Mechanism: a thread-targeted `CLOCK_MONOTONIC` POSIX timer
-/// ([`DeadlineTimer`]) delivers `SIGRTMIN+4` (no-op handler, no
+/// (`DeadlineTimer`) delivers `SIGRTMIN+4` (no-op handler, no
 /// `SA_RESTART`) to this thread every `tick` (clamped to the
 /// remaining deadline budget), forcing the blocked `flock` to return
 /// `EINTR`; the step maps that to `Tick` or `DeadlineExpired` by the
