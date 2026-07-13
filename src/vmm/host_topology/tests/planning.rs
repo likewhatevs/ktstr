@@ -1283,6 +1283,50 @@ fn default_cpu_budget_30_percent_rounded_up_min_one() {
     assert_eq!(default_cpu_budget(100), 30, "exact 30%");
 }
 
+/// `no_perf_cpu_budget` sizes a no-perf VM to its EXACT vCPU count
+/// (clamped to the allowed cpuset, min-1) — the topology's real need,
+/// with the 30% `default_cpu_budget` acting as NEITHER a floor nor a
+/// ceiling. The regression this pins: a 2-vCPU interactive shell on a
+/// ~192-CPU host must ask ~3 CPUs (vCPUs + 1 service), never the 30% (58) it did when 30%
+/// was a `.max()` floor — that over-reservation walked ~30% of the
+/// host's LLCs and exhausted `acquire_llc_plan` under peer `LOCK_EX`
+/// contention (`could not reserve 58 CPU(s)`).
+#[test]
+fn no_perf_cpu_budget_sizes_to_vcpus_not_30_percent() {
+    // The exact CI-failure shape: a 2-vCPU guest on a 192-CPU box.
+    // Old (buggy) `max(30%, min(vcpus, allowed))` = max(58, 2) = 58;
+    // the clamp must yield vCPUs + 1 (the service-thread CPU).
+    assert_eq!(
+        no_perf_cpu_budget(192, 2),
+        3,
+        "2-vCPU VM on a 192-CPU host asks 3 CPUs (2 vCPUs + 1 service), never the 30% (58) floor",
+    );
+    // A small VM never inflates to 30% on a large host.
+    assert_eq!(
+        no_perf_cpu_budget(100, 4),
+        5,
+        "vcpus + 1 service, no 30%-of-100 = 30 floor"
+    );
+    // A WIDE VM still gets its full vCPU count plus the service CPU
+    // (test-validity: budget >= vcpus so the guest scheduler isn't
+    // confounded by host oversubscription; +1 keeps the host-side
+    // sensing threads off the vCPUs' CPUs).
+    assert_eq!(
+        no_perf_cpu_budget(100, 50),
+        51,
+        "wide VM keeps its vCPU count + 1 service CPU"
+    );
+    // `vcpus > allowed` clamps to the process cpuset (the
+    // overcommit-warning case). min-1 floor on degenerate inputs.
+    assert_eq!(
+        no_perf_cpu_budget(8, 32),
+        8,
+        "clamped to the allowed cpuset"
+    );
+    assert_eq!(no_perf_cpu_budget(0, 4), 1, "min-1 floor (empty allowed)");
+    assert_eq!(no_perf_cpu_budget(4, 0), 1, "min-1 floor (zero vCPUs)");
+}
+
 /// `overcommit_warning`: `None` when the budget covers the vCPUs; `Some`
 /// with the right severity (explicit opt-in vs silent auto-collapse) and
 /// the tight-watchdog caveat when the budget is below the vCPU count.

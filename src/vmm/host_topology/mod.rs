@@ -1007,7 +1007,16 @@ fn default_cpu_budget(allowed_cpus: usize) -> usize {
 }
 
 /// No-perf CPU budget when no explicit `--cpu-cap` (or `cpu_budget` knob) is
-/// set: at least the VM's own vCPU count, clamped to the allowed cpuset.
+/// set: the VM's own vCPU count PLUS ONE service CPU, clamped to the allowed
+/// cpuset (min-1). That is the topology's actual need: one host CPU per
+/// guest vCPU, plus headroom for the host-side service threads (monitor,
+/// watchdog, virtio, workload coordination) that live INSIDE the cell's
+/// cgroup and would otherwise CFS-contend with spinning vCPUs on an
+/// exactly-vcpus cpuset — the budgeted-path analog of perf mode's
+/// `reserve_service_cpu` +1 in `compute_pinning`. Sensing timeliness rides
+/// on this: on hosts without CAP_SYS_NICE the sensing threads run
+/// SCHED_OTHER, and a starved monitor thins the contention witness the
+/// latency verdicts consume.
 ///
 /// The rationale is TEST VALIDITY, not boot speed — do not "optimize" this
 /// back to a flat 30%. A scheduler test measures how the GUEST scheduler
@@ -1016,17 +1025,27 @@ fn default_cpu_budget(allowed_cpus: usize) -> usize {
 /// ~95 pCPUs = 2.7x), the HOST scheduler time-slices them, so guest vCPUs
 /// stall for reasons unrelated to the workload — a host-contention confound
 /// that invalidates the guest-scheduler measurement (the silent-wrong-answer
-/// class the project guards against). Sizing the budget to `>= vcpus` gives
+/// class the project guards against). Sizing the budget to `== vcpus` gives
 /// the guest's CPUs real host CPUs, so its scheduler view tracks real
 /// concurrency. (A wide boot also drops ~0.7s as the kernel's parallel AP
 /// bring-up runs unthrottled, but that is incidental.)
 ///
-/// Floored at the 30% `default_cpu_budget` so small VMs (vcpus < 30%) keep
-/// the cross-test concurrency headroom; clamped to `allowed_cpus` so it never
-/// exceeds the process cpuset. An explicit cap LOWER than vcpus is the
-/// deliberate opt-in to oversubscribe for contention testing.
+/// NOT floored at the 30% `default_cpu_budget`. That floor was a bug: it made
+/// a SMALL VM over-reserve on a LARGE host — a 2-vCPU interactive shell on a
+/// ~192-CPU box resolved to `max(58, 2) = 58` CPUs (~30%). The reservation
+/// walks WHOLE LLCs to reach the budget, so a bigger budget needs more LLCs
+/// that are free for `LOCK_SH`; when peer runners' perf-mode work holds LLCs
+/// `LOCK_EX` the plan cannot find 58 CPUs' worth and bails
+/// (`acquire_llc_plan: could not reserve 58 CPU(s) after 4 attempts`). A
+/// SMALLER reservation frees LLCs for peers, not the reverse, so a small VM
+/// asking ~30% is backwards. 30% is the right default for throughput-elastic
+/// kernel builds (`default_cpu_budget`, `make -j`), never a floor for a VM
+/// whose need is fixed by its vCPU count. `vcpus + 1 > allowed` clamps to
+/// `allowed` (the process-cpuset-too-small case), which
+/// [`overcommit_warning`] surfaces. An explicit cap LOWER than vcpus stays
+/// the deliberate opt-in to oversubscribe for contention testing.
 pub(crate) fn no_perf_cpu_budget(allowed_cpus: usize, vm_vcpus: usize) -> usize {
-    default_cpu_budget(allowed_cpus).max(vm_vcpus.min(allowed_cpus))
+    vm_vcpus.saturating_add(1).min(allowed_cpus).max(1)
 }
 
 /// Parsed `--cpu-cap N` value. N is a CPU count: the planner reserves
@@ -1065,8 +1084,8 @@ impl CpuCap {
     /// meaning "use the caller's auto-sized default": the
     /// kernel-build/planner path expands `None` to `default_cpu_budget`
     /// (30% of the allowed set); the no-perf VM-builder path expands it to
-    /// `no_perf_cpu_budget` (max(30%, min(vcpus, allowed)), usually the
-    /// vCPU count).
+    /// `no_perf_cpu_budget` (the vCPU count clamped to the allowed cpuset —
+    /// the topology's exact need, NOT floored at 30%).
     ///
     /// Env var is `KTSTR_CPU_CAP` (integer ≥ 1, CPU count). An empty
     /// or unset env var is treated as absent; a non-numeric value

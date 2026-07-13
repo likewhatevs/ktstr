@@ -1263,12 +1263,15 @@ impl KtstrVmBuilder {
             // actually starts.
             //
             // When the cap is absent (`CpuCap::resolve(None) ==
-            // Ok(None)`), the planner applies the 30%-of-allowed
-            // default (`default_cpu_budget`). The resulting plan
-            // reserves a subset of host LLCs, not "every LLC" as the
-            // prior every-LLC path did — so no-perf-mode VMs never
-            // fight concurrent builds or other no-perf peers for the
-            // full host, regardless of whether the user set the flag.
+            // Ok(None)`), `resolve_cpu_budget` below auto-sizes the
+            // budget to the VM's own vCPU count via `no_perf_cpu_budget`
+            // (NOT the 30%-of-allowed `default_cpu_budget`, which is the
+            // kernel-build default) and passes it to the planner as an
+            // explicit `Some(cap)`. The resulting plan reserves a subset
+            // of host LLCs sized to the guest topology — a 2-vCPU VM asks
+            // ~2 CPUs, not ~30% — so no-perf-mode VMs never over-reserve
+            // and fight concurrent builds or perf-mode peers for the full
+            // host, regardless of whether the user set the flag.
             //
             // `cached` returning `Err` (non-Linux, sysfs absent — the
             // process-wide cache replays the first sysfs probe's
@@ -1781,6 +1784,61 @@ mod tests {
             resolved.effective_count(allowed).unwrap(),
             host_topology::no_perf_cpu_budget(allowed, vcpus),
             "absent-both must delegate to no_perf_cpu_budget",
+        );
+    }
+
+    /// resolve_cpu_budget regression: the exact CI-failure shape — a
+    /// 2-vCPU interactive shell (no explicit cap, no per-test budget) on a
+    /// synthetic ~192-CPU host must resolve to 3 CPUs (vCPUs + 1 service), NEVER
+    /// the 30% (58) that the old `default_cpu_budget` floor produced and
+    /// that exhausted `acquire_llc_plan` under peer `LOCK_EX` contention.
+    #[test]
+    fn resolve_cpu_budget_small_vm_on_large_host_asks_vcpus_not_30_percent() {
+        let allowed = 192;
+        let vcpus = 2;
+        let resolved = resolve_cpu_budget(None, None, allowed, vcpus)
+            .unwrap()
+            .expect("auto-size resolves to Some");
+        assert_eq!(
+            resolved.effective_count(allowed).unwrap(),
+            3,
+            "2-vCPU shell on a 192-CPU host asks 3 CPUs (vCPUs + 1 service), not the 30% (58) floor",
+        );
+    }
+
+    /// resolve_cpu_budget: an explicit `--cpu-cap` is honored as the budget
+    /// verbatim — a CEILING the operator set, not overridden by the
+    /// vCPU-sized auto default. A cap ABOVE the vCPU count still stands (the
+    /// operator asked for headroom); a cap the host cannot satisfy is caught
+    /// later at `effective_count`, not here.
+    #[test]
+    fn resolve_cpu_budget_explicit_cap_is_the_ceiling() {
+        let cap = host_topology::CpuCap::new(8).unwrap();
+        let resolved = resolve_cpu_budget(Some(cap), None, 192, 2)
+            .unwrap()
+            .expect("explicit cap resolves to Some");
+        assert_eq!(
+            resolved.effective_count(192).unwrap(),
+            8,
+            "explicit --cpu-cap wins verbatim over the vCPU-sized default",
+        );
+    }
+
+    /// resolve_cpu_budget: a WIDE no-perf topology still gets its full
+    /// vCPU count plus the service CPU (test validity — budget >= vcpus so
+    /// the guest scheduler isn't confounded by host oversubscription;
+    /// the +1 keeps sensing threads off the vCPUs' CPUs).
+    #[test]
+    fn resolve_cpu_budget_wide_topo_gets_full_vcpu_count() {
+        let allowed = 192;
+        let vcpus = 50;
+        let resolved = resolve_cpu_budget(None, None, allowed, vcpus)
+            .unwrap()
+            .expect("auto-size resolves to Some");
+        assert_eq!(
+            resolved.effective_count(allowed).unwrap(),
+            51,
+            "a 50-vCPU no-perf VM gets its 50 host CPUs + 1 service CPU",
         );
     }
 

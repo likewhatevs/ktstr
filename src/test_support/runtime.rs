@@ -867,8 +867,8 @@ pub(crate) const EXPECT_AUTO_REPRO_SKIP_RATIO: f64 = 2.0;
 /// With an explicit `cpu_budget` the threads collapse onto
 /// `min(cpu_budget, allowed)` (the per-test cap); without one the
 /// default/no-perf path collapses onto the whole allowed cpuset
-/// (`no_perf_cpu_budget`'s `vcpus.min(allowed)` floor when
-/// `allowed < vcpus`, else a fitting 1:1 pin). Under
+/// (`no_perf_cpu_budget`'s `(vcpus + 1).min(allowed)` clamp when
+/// `allowed < vcpus + 1`, else a fitting 1:1 pin). Under
 /// `KTSTR_CARGO_TEST_MODE` the planner ignores the explicit budget and
 /// masks to the full allowed cpuset, so with a `cpu_budget` the
 /// returned ratio is an UPPER bound there (CI runs `cargo ktstr test`
