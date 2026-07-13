@@ -17,8 +17,8 @@
 //!
 //! These share the timeout-with-holder-list error shape that
 //! `crate::test_support::eval::kernel::is_flock_timeout_message`
-//! keys on to classify a flock timeout as a SKIP rather than a
-//! hard FAIL.
+//! keys on to classify a flock timeout as a typed, retryable
+//! `ResourceContention` rather than an unclassified hard FAIL.
 
 use anyhow::Result;
 use std::os::fd::OwnedFd;
@@ -320,13 +320,15 @@ mod tests {
     /// Pin the substring contract that
     /// `crate::test_support::eval::is_flock_timeout_message` keys on
     /// to classify a flock timeout as
-    /// [`crate::vmm::host_topology::ResourceContention`] (SKIP) vs
-    /// a plain anyhow error (hard FAIL). The seam tests for BOTH
+    /// [`crate::vmm::host_topology::ResourceContention`] (typed,
+    /// retryable) vs a plain anyhow error (unclassified hard FAIL).
+    /// The seam tests for BOTH
     /// `"flock LOCK_"` AND `"timed out after"` appearing in the
     /// rendered error; any wording change in
     /// [`acquire_flock_with_timeout`]'s bail format that drops
     /// either substring would silently regress the test-kernel-cache
-    /// flock-timeout path from a clean SKIP to a hard FAIL.
+    /// flock-timeout path from a typed contention verdict to an
+    /// unclassified hard FAIL.
     ///
     /// Drives a real contended flock: peer holds `LOCK_EX`, this
     /// thread requests `LOCK_SH` with a short timeout, the helper

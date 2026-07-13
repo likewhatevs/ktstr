@@ -91,8 +91,13 @@ exclusive reservation, and never contends with its own cells' locks.
 </svg></div>
 
 When the default path cannot map its topology 1:1 onto the host it
-does not fail: if a plan exists but every slot is busy, the run skips
-with `ResourceContention` and nextest retries; if no plan can exist
+does not fail: if a plan exists but every slot is busy, the run
+*waits* — acquisition polls the busy reservations (bounded by the
+run path's acquire-wait budget) until a holder releases, so a peer's
+transient `LOCK_EX` costs throughput, never coverage. Contention that
+outlives the wait surfaces as a `ResourceContention` *failure* that
+nextest retries — it is never a skip, because a skip is a pass nextest
+does not retry. If no plan can exist
 (host too small), the run proceeds *overcommitted* — every vCPU
 thread masked to the allowed CPUs — and warns when that means
 oversubscription (see below).
@@ -191,7 +196,11 @@ Budgeted acquisition runs three phases:
 3. **Acquire** — non-blocking shared locks on every selected LLC,
    all-or-nothing. If any lock is busy, every held lock is dropped
    and the whole cycle retries a few times with short ascending
-   backoff; after the final attempt it bails with a
+   backoff (absorbing plan/acquire races). Test-run acquisition then
+   keeps polling the full cycle until a holder releases, bounded by
+   the run path's acquire-wait budget; build-time and interactive
+   acquisition stop at the short backoff. When its budget is
+   exhausted, either bails with a
    `ResourceContention` error naming the winning holders.
 
 The lock granularity is per-LLC, but the reserved CPU list holds

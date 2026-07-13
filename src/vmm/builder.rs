@@ -716,7 +716,8 @@ impl KtstrVmBuilder {
     /// requested perf topology returns `PerfModeUnavailable` (a
     /// host-insufficiency: a visible skip by default, promoted to a hard
     /// fail under `KTSTR_NO_SKIP_MODE`); busy LLC slots return
-    /// `ResourceContention` (skip-class, transient); insufficient
+    /// `ResourceContention` (transient — a retryable failure nextest
+    /// re-runs); insufficient
     /// hugepages is a warning.
     #[allow(dead_code)]
     pub fn performance_mode(mut self, enabled: bool) -> Self {
@@ -1002,7 +1003,7 @@ impl KtstrVmBuilder {
     /// `performance_mode` requirements (a too-small host surfaces as
     /// `PerfModeUnavailable` — a host-insufficiency: skip-class by default,
     /// promoted to a hard fail under `KTSTR_NO_SKIP_MODE`; busy LLC slots
-    /// surface as `ResourceContention`, also skip-class). An operator
+    /// surface as `ResourceContention`, a transient retryable failure). An operator
     /// over-budget `--cpu-cap` surfaces as `CpuBudgetUnsatisfiable` (a hard
     /// error — a concrete number the host cannot satisfy); an author's per-test
     /// `cpu_budget` over the allowance instead surfaces as
@@ -1360,6 +1361,13 @@ impl KtstrVmBuilder {
                     &test_topo,
                     effective_cap,
                     host_topology::PlacementPolicy::spread_for_process(),
+                    // Build-time reservation stays non-blocking (TOCTOU-only):
+                    // the WAIT-for-holder policy lives in the run-time replan
+                    // (`acquire_run_locks`' no-perf arm), which re-plans against
+                    // live holder counts and waits there. A contention that
+                    // surfaces here still routes to a retryable failure via
+                    // `classify_host_error`, so coverage is never silently lost.
+                    None,
                 )?;
                 host_topology::warn_if_cross_node_spill(&plan, &host_topo);
                 // Keep the plan's `LOCK_SH` flock fds ALIVE — do NOT
@@ -1437,7 +1445,7 @@ impl KtstrVmBuilder {
     /// here and via the `compute_pinning` re-map in `acquire_slot_with_locks`),
     /// or `ResourceContention` when the host is
     /// big enough but all LLC slots are currently busy (transient →
-    /// skip/retry). Warnings are printed for degraded conditions
+    /// retryable failure, nextest re-runs). Warnings are printed for degraded conditions
     /// (hugepages, host load).
     fn validate_performance_mode(
         &mut self,
@@ -1655,8 +1663,8 @@ fn resolve_cpu_budget(
 /// too small for the perf topology (the isolation guarantee cannot be
 /// honored — a permanent host-insufficiency: a SKIP by default, a hard FAIL
 /// under `KTSTR_NO_SKIP_MODE`), or `ResourceContention` when the host fits
-/// but all slots are currently busy (transient; callers rely on nextest
-/// retry backoff for contention resolution).
+/// but all slots are currently busy (transient; a retryable failure —
+/// nextest's retry backoff re-runs the cell after the holder releases).
 fn acquire_slot_with_locks(
     host_topo: &host_topology::HostTopology,
     topo: &topology::Topology,

@@ -59,7 +59,7 @@ interact; the first two are mutually exclusive at every entry point.
 | `KTSTR_CPU_CAP` | Cap the host CPUs reserved by a no-perf-mode VM or kernel build. Flag `--cpu-cap N` takes precedence. | Integer ≥ 1; `0` / non-numeric rejected | Kernel build: 30% of allowed CPUs (min 1). No-perf VM: the vCPU count, floored at 30%. |
 | `KTSTR_BYPASS_LLC_LOCKS` | Skip host-side LLC flock acquisition entirely — no coordination against concurrent runs. | Any non-empty value | Coordinate |
 | `KTSTR_LOCK_DIR` | Directory for the per-LLC / per-CPU flock files. Use when `/tmp` is constrained on a runner. | Directory path | `/tmp` |
-| `KTSTR_CONTENTION_BYPASS` | Make transient KVM errnos hard failures instead of `ResourceContention` skips (only when the host is not near its limits) — stricter, for catching kernel-side regressions. | Exactly `"1"` | Skip on contention |
+| `KTSTR_CONTENTION_BYPASS` | Make transient KVM errnos immediate hard failures instead of retryable `ResourceContention` failures (only when the host is not near its limits) — stricter, for catching kernel-side regressions. | Exactly `"1"` | Retryable contention failure |
 | `KTSTR_HOST_CGROUP_PARENT` | cgroup-v2 parent under which `host_only` tests create per-test cgroups. Must be a non-root subdirectory of `/sys/fs/cgroup`. | Path under `/sys/fs/cgroup` | `/sys/fs/cgroup/ktstr` |
 | `KTSTR_CGROUP_WALK_ROOT` | Where the setup-time controller-enable walk starts, for delegated cgroup subtrees (systemd `Delegate=yes`, container `nsdelegate`). Must be a prefix of the configured parent. | Path prefix of the parent | `/sys/fs/cgroup` |
 | `KTSTR_STUCK_POLL_MS` | Host-mode stuck-monitor poll cadence. | Milliseconds; empty / `0` / unparseable falls back | 500 ms |

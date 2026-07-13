@@ -7,8 +7,9 @@ use anyhow::Result;
 
 // -- write_skip_sidecar --
 
-/// `write_skip_sidecar` is the path covered by the ResourceContention
-/// skip branch and any early-exit that bails before `run_ktstr_test_inner`
+/// `write_skip_sidecar` is the path covered by the host-incapacity
+/// skip classes (TopologyInsufficient / PerfModeUnavailable) and any
+/// early-exit that bails before `run_ktstr_test_inner`
 /// reaches the VM-run call site. The sidecar must be flagged
 /// `skipped: true, passed: false, inconclusive: false` so the strict
 /// 4-state mutex `(passed, skipped, inconclusive, fail)` holds and
@@ -136,7 +137,7 @@ fn skip_then_run_of_same_config_overwrites_one_sidecar() {
         ..KtstrTestEntry::DEFAULT
     };
 
-    // Attempt 1: pre-VM-boot host skip (e.g. ResourceContention).
+    // Attempt 1: pre-VM-boot host skip (e.g. TopologyInsufficient).
     write_skip_sidecar(&entry, &entry.topology).expect("skip sidecar must write");
     let skip_path = find_single_sidecar_by_prefix(tmp.path(), "__skip_run_overwrite__-");
     let skip: SidecarResult =
@@ -622,7 +623,7 @@ fn write_sidecar_forwards_payload_metrics_slice() {
 }
 
 /// `write_skip_sidecar` must also carry `entry.payload` through
-/// so a ResourceContention or early-skip on a payload-carrying
+/// so a host-incapacity or early-skip on a payload-carrying
 /// test still records the payload name. Missing this would
 /// drop skipped runs out of payload-grouped stats.
 #[test]

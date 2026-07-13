@@ -2465,6 +2465,18 @@ impl KtstrVm {
             .iter()
             .map(|(slot, _)| slot.clone())
             .collect();
+        // KERN_ADDRS observability counters (frames consumed / CRC-failed),
+        // incremented by the coordinator's dispatch arm and read by the
+        // monitor's pre-latch diagnostic (see `RqRefresh::kern_addrs_frames`):
+        // a dead-channel run self-reports "publish never arrived" (0) vs
+        // "arrived but a derive gate rejected it" (non-zero). Created here,
+        // before the monitor spawn, so both consumers share one instance.
+        let kern_addrs_frames: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let kern_addrs_crc_bad: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let kern_addrs_frames_for_coord = kern_addrs_frames.clone();
+        let kern_addrs_crc_bad_for_coord = kern_addrs_crc_bad.clone();
         let monitor_handle = self.start_monitor(
             &vm,
             &kill,
@@ -2483,6 +2495,8 @@ impl KtstrVm {
             kern_phys_base.clone(),
             kern_phys_base_evt.clone(),
             kern_virt_kaslr.clone(),
+            kern_addrs_frames,
+            kern_addrs_crc_bad,
         )?;
         // Hand the monitor handle to the guard so an early-return past here
         // joins it before guest_mem drops (the monitor holds a bare raw pointer
@@ -4806,6 +4820,8 @@ impl KtstrVm {
                                         kern_virt_kaslr: &kern_virt_kaslr,
                                         kern_virt_kaslr_evt: &kern_virt_kaslr_evt,
                                         kernel_text_link_kva,
+                                        kern_addrs_frames: &kern_addrs_frames_for_coord,
+                                        kern_addrs_crc_bad: &kern_addrs_crc_bad_for_coord,
                                         watchdog_reset: workload_duration_for_coord.map(|d| {
                                             (
                                                 watchdog_reset_for_coord.as_ref(),
@@ -12636,6 +12652,8 @@ impl KtstrVm {
         kern_phys_base_shared: Arc<std::sync::atomic::AtomicU64>,
         kern_phys_base_evt: Arc<EventFd>,
         kern_virt_kaslr_shared: Arc<std::sync::atomic::AtomicU64>,
+        kern_addrs_frames: Arc<std::sync::atomic::AtomicU64>,
+        kern_addrs_crc_bad: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<Option<JoinHandle<monitor::reader::MonitorLoopResult>>> {
         let Some(vmlinux) = find_vmlinux(&self.kernel) else {
             return Ok(None);
@@ -13301,6 +13319,8 @@ impl KtstrVm {
                     tcr_el1: tcr_el1.clone(),
                     kern_phys_base: Some(kern_phys_base_shared.clone()),
                     phys_base_guest_published,
+                    kern_addrs_frames: Some(kern_addrs_frames.clone()),
+                    kern_addrs_crc_bad: Some(kern_addrs_crc_bad.clone()),
                     runqueues_kva: symbols.runqueues,
                     kaslr_offset: kern_virt_kaslr_shared.clone(),
                     num_cpus,

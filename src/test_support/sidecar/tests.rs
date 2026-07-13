@@ -3513,13 +3513,14 @@ fn format_footer_no_sidecar_omits_last_run_hint() {
 
 #[test]
 fn render_host_skips_groups_by_class_with_counts_and_names() {
-    // Two classes; topology_insufficient has two tests, resource
-    // contention one. Rendered one line per class: "<class> (<n>): a, b".
+    // Two classes; topology_insufficient has two tests,
+    // perf_mode_unavailable one. Rendered one line per class:
+    // "<class> (<n>): a, b".
     let skips = vec![
         ("wide_smp".to_string(), "topology_insufficient".to_string()),
         (
             "big_gauntlet".to_string(),
-            "resource_contention".to_string(),
+            "perf_mode_unavailable".to_string(),
         ),
         ("fat_llc".to_string(), "topology_insufficient".to_string()),
     ];
@@ -3533,7 +3534,7 @@ fn render_host_skips_groups_by_class_with_counts_and_names() {
         "grouped class line missing/wrong: {out}"
     );
     assert!(
-        out.contains("resource_contention (1): big_gauntlet"),
+        out.contains("perf_mode_unavailable (1): big_gauntlet"),
         "{out}"
     );
     // Exactly one line per class (plus the header).

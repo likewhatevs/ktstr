@@ -1,9 +1,12 @@
 # ── Profiles ──────────────────────────────────────────────────────────
 
-# ResourceContention SKIPs cleanly at the macro layer so retries
-# only fire on true transient flakes, which typically resolve by
-# retry 2-3. max-delay=5s keeps the per-failure budget tight:
-# worst case 8 retries × 5s = 40s of delay (plus test execution).
+# The run path WAITS for a contended LLC/CPU reservation to free
+# (KtstrVm::RUN_LOCK_ACQUIRE_WAIT) rather than skipping, so most
+# contention never reaches nextest at all. A ResourceContention that
+# DOES surface (a peer wedged past the wait) is a RETRYABLE failure,
+# not a skip — these retries wait it out across re-runs, alongside the
+# true transient flakes, which typically resolve by retry 2-3.
+# max-delay keeps the per-failure budget tight.
 #
 # test-threads = 16 caps parallelism well below `num-cpus` on
 # high-core dev boxes so VM-pinning,

@@ -157,6 +157,14 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// defined in `vmlinux.lds.S` on every architecture so the
     /// host-side extraction is cross-arch.
     pub kernel_text_link_kva: u64,
+    /// KERN_ADDRS observability counters for the monitor's pre-latch
+    /// diagnostic: total frames consumed by this arm (CRC-valid or
+    /// not) and the CRC-failed subset. Field data distinguishing
+    /// "publish never arrived" from "publish arrived but a derive
+    /// gate rejected it" on dead-channel runs. Relaxed increments —
+    /// diagnostic-only.
+    pub kern_addrs_frames: &'a std::sync::atomic::AtomicU64,
+    pub kern_addrs_crc_bad: &'a std::sync::atomic::AtomicU64,
     /// Watchdog reset atomic + workload duration + `run_start` anchor +
     /// the parallel provenance tag. SCENARIO_START stores
     /// `(now - run_start + duration).as_nanos()` so the watchdog starts
@@ -553,6 +561,18 @@ pub(super) fn dispatch_bulk_message(
             // makes a future protocol extension that appends bytes
             // trip loudly at this arm rather than silently dropping
             // the new bytes.
+            // Observability first (before any gate): count every frame
+            // this arm consumes and the CRC-failed subset, so the
+            // monitor's pre-latch diagnostic can distinguish
+            // "never arrived" from "arrived but rejected".
+            sinks
+                .kern_addrs_frames
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !msg.crc_ok {
+                sinks
+                    .kern_addrs_crc_bad
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if msg.crc_ok
                 && let Some(addrs) = crate::vmm::wire::KernAddrs::from_payload(&msg.payload)
             {
@@ -1129,6 +1149,8 @@ mod stage_tests {
         kern_phys_base_evt: EventFd,
         kern_virt_kaslr: Arc<AtomicU64>,
         kern_virt_kaslr_evt: EventFd,
+        kern_addrs_frames: AtomicU64,
+        kern_addrs_crc_bad: AtomicU64,
         watchdog_pause_ns: AtomicU64,
         scenario_start_ns: AtomicU64,
         sched_swap_notify: AtomicBool,
@@ -1160,6 +1182,8 @@ mod stage_tests {
                 kern_phys_base_evt: EventFd::new(EFD_NONBLOCK).expect("phys_base eventfd"),
                 kern_virt_kaslr: Arc::new(AtomicU64::new(0)),
                 kern_virt_kaslr_evt: EventFd::new(EFD_NONBLOCK).expect("virt_kaslr eventfd"),
+                kern_addrs_frames: AtomicU64::new(0),
+                kern_addrs_crc_bad: AtomicU64::new(0),
                 watchdog_pause_ns: AtomicU64::new(0),
                 scenario_start_ns: AtomicU64::new(0),
                 sched_swap_notify: AtomicBool::new(false),
@@ -1193,6 +1217,8 @@ mod stage_tests {
                 kern_virt_kaslr: &self.kern_virt_kaslr,
                 kern_virt_kaslr_evt: &self.kern_virt_kaslr_evt,
                 kernel_text_link_kva: 0,
+                kern_addrs_frames: &self.kern_addrs_frames,
+                kern_addrs_crc_bad: &self.kern_addrs_crc_bad,
                 watchdog_reset: if self.wire_reset {
                     Some((
                         &self.reset_ns,

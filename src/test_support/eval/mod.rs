@@ -177,11 +177,13 @@ pub(crate) fn run_ktstr_test_inner(
     if let Err(ref e) = result
         && let Some(host_skip_class) = super::host_skip_class(e)
     {
-        // Late catch-all for a skip-class error (ResourceContention,
-        // TopologyInsufficient, or PerfModeUnavailable) from any early-bail
+        // Late catch-all for a PERMANENT host-incapacity skip-class error
+        // (TopologyInsufficient or PerfModeUnavailable) from any early-bail
         // path before the
         // existing per-site `record_skip_sidecar` calls in
-        // builder.build()/vm.run() arms below. All three predicates walk
+        // builder.build()/vm.run() arms below. ResourceContention is NOT in
+        // this set — `host_skip_class` excludes it, so transient contention
+        // never lands a `.host-skip.json` marker. The predicates walk
         // the FULL `anyhow::Error` chain via `e.chain().any(...)` so an error
         // wrapped in `.context(...)` (e.g. the `"build ktstr_test VM"` and
         // `"run ktstr_test VM"` wrappers in `evaluate_vm_result`) is still

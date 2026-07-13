@@ -70,9 +70,11 @@ pub enum HostClass {
     /// The host cannot run the test and no retry changes that
     /// (`KTSTR_NO_SKIP_MODE` unset). A visible, non-failing skip.
     Skip { reason: String },
-    /// A hard failure: an unconditional hard-fail type
-    /// (`CpuBudgetUnsatisfiable` / `TopologyUnrepresentable`) OR a
-    /// skip-class type promoted to a failure under `KTSTR_NO_SKIP_MODE`.
+    /// A failure: an unconditional hard-fail type
+    /// (`CpuBudgetUnsatisfiable` / `TopologyUnrepresentable`), a
+    /// `ResourceContention` (RETRYABLE — the run path already waited the
+    /// holder out, so a residual hit is re-run by nextest, never skipped),
+    /// or a skip-class type promoted to a failure under `KTSTR_NO_SKIP_MODE`.
     Fail { reason: String },
 }
 
@@ -99,21 +101,27 @@ where
 /// three host-insufficiency skip types.
 ///
 /// Scoped deliberately narrower than [`classify_host_error`]: only the
-/// three types whose skip is caused by THIS HOST's shape —
-/// [`TopologyInsufficient`] (host lacks the CPUs/LLCs to boot the
-/// topology), [`ResourceContention`] (host's slots are transiently
-/// busy), and [`PerfModeUnavailable`] (host too small for perf mode).
-/// The unconditional hard-fail types and `KernelUnavailable`
-/// ("harness not configured", not a host-shape fact) are excluded — the
-/// footer's host-skip block answers "what could THIS HOST not run", and
-/// only these three are host-shape driven. Chain-aware via the shared
-/// `is_*` predicates. Guard order is arbitrary (the three types are
-/// mutually exclusive).
+/// two types whose skip is caused by GENUINE, PERMANENT host
+/// incapacity — [`TopologyInsufficient`] (host lacks the CPUs/LLCs to
+/// boot the topology) and [`PerfModeUnavailable`] (host too small for
+/// perf mode). These are host-SHAPE facts: no retry and no waiting
+/// changes them, so the footer's "what could THIS HOST not run" block
+/// is the right home.
+///
+/// [`ResourceContention`] is DELIBERATELY excluded: a busy slot is
+/// TRANSIENT, not a host-shape fact. The run path now WAITS for a
+/// holder to release (see [`crate::vmm::KtstrVm`]'s
+/// `RUN_LOCK_ACQUIRE_WAIT`), and any contention that still surfaces is
+/// routed to a RETRYABLE failure by [`classify_host_error`], never a
+/// host-skip marker — so a colocated peer's `LOCK_EX` can never be
+/// mislabelled "this host cannot run". The unconditional hard-fail
+/// types and `KernelUnavailable` ("harness not configured", not a
+/// host-shape fact) are excluded for the same "not permanent host
+/// incapacity" reason. Chain-aware via the shared `is_*` predicates;
+/// guard order is arbitrary (the two types are mutually exclusive).
 pub(crate) fn host_skip_class(e: &anyhow::Error) -> Option<&'static str> {
     if is_topology_insufficient(e) {
         Some("topology_insufficient")
-    } else if is_resource_contention(e) {
-        Some("resource_contention")
     } else if is_perf_mode_unavailable(e) {
         Some("perf_mode_unavailable")
     } else {
@@ -192,19 +200,23 @@ pub fn classify_host_error(e: &anyhow::Error, no_skip: bool) -> HostClass {
     }
     if is_resource_contention(e) {
         let reason = extract_reason::<ResourceContention, _>(e, |rc| rc.reason.clone());
-        return if no_skip {
-            HostClass::Fail {
-                reason: format!(
-                    "resource contention under --no-skip-mode: {reason}. \
-                     Either provision hardware that satisfies the test's topology \
-                     requirement, or drop --no-skip-mode / KTSTR_NO_SKIP_MODE to \
-                     accept the skip."
-                ),
-            }
-        } else {
-            HostClass::Skip {
-                reason: format!("resource contention: {reason}"),
-            }
+        // TRANSIENT contention, never permanent host incapacity. Two
+        // producers reach here: the run-lock path (which already WAITED
+        // `RUN_LOCK_ACQUIRE_WAIT` for the holder — reaching here means a
+        // peer outlived the wait) and the transient-KVM-errno mapper in
+        // `crate::vmm::contention` (ENOMEM / EMFILE / EBUSY under host
+        // pressure). Both resolve on re-run, so route to a RETRYABLE
+        // failure nextest re-runs — NOT a silent skip (a skip is a pass
+        // nextest never retries, which silently guts suite coverage) and
+        // NOT a "this host cannot run" host-skip. `no_skip` does not
+        // change this: it is already a failure.
+        return HostClass::Fail {
+            reason: format!(
+                "transient resource contention: {reason}. Retryable — nextest \
+                 re-runs the cell; this is host busyness, not host incapacity. \
+                 A persistent hit means the host is oversubscribed, not unable \
+                 to run the test."
+            ),
         };
     }
     if is_topology_insufficient(e) {
@@ -284,25 +296,32 @@ mod tests {
         }
     }
 
-    /// Resource contention: skip default, fail under `no_skip`.
+    /// Resource contention is a RETRYABLE FAILURE, never a skip — under
+    /// BOTH `no_skip` settings. The run path already waited the holder out;
+    /// anything that still surfaces must be re-run by nextest, not silently
+    /// greened (a skip is EXIT_PASS, which nextest never retries) and never
+    /// tagged "this host cannot run".
     #[test]
-    fn resource_contention_skip_then_fail() {
+    fn resource_contention_is_retryable_fail() {
         let mk = || {
             anyhow::Error::new(ResourceContention {
                 reason: "all 3 LLC slots busy".into(),
             })
         };
-        assert_eq!(
-            classify_host_error(&mk(), false),
-            HostClass::Skip {
-                reason: "resource contention: all 3 LLC slots busy".into()
+        for no_skip in [false, true] {
+            match classify_host_error(&mk(), no_skip) {
+                HostClass::Fail { reason } => {
+                    assert!(
+                        reason.contains("resource contention") && reason.contains("transient"),
+                        "must name transient contention (no_skip={no_skip}); got: {reason}",
+                    );
+                    assert!(
+                        !reason.contains("this host cannot run"),
+                        "must NOT read as host incapacity (no_skip={no_skip}); got: {reason}",
+                    );
+                }
+                other => panic!("expected Fail (no_skip={no_skip}), got {other:?}"),
             }
-        );
-        match classify_host_error(&mk(), true) {
-            HostClass::Fail { reason } => {
-                assert!(reason.starts_with("resource contention under --no-skip-mode:"));
-            }
-            other => panic!("expected Fail, got {other:?}"),
         }
     }
 
@@ -368,10 +387,10 @@ mod tests {
         }
     }
 
-    /// `host_skip_class` tags exactly the three host-shape skip types and
-    /// nothing else — the footer's host-skip block is scoped to "what
-    /// could THIS HOST not run", so a hard-fail type, KernelUnavailable,
-    /// or a plain error must yield `None`.
+    /// `host_skip_class` tags exactly the two PERMANENT host-shape skip
+    /// types and nothing else — the footer's host-skip block is scoped to
+    /// "what could THIS HOST not run", so a hard-fail type, a transient
+    /// contention, KernelUnavailable, or a plain error must yield `None`.
     #[test]
     fn host_skip_class_tags_only_host_shape_skips() {
         assert_eq!(
@@ -381,18 +400,21 @@ mod tests {
             Some("topology_insufficient"),
         );
         assert_eq!(
-            host_skip_class(&anyhow::Error::new(ResourceContention {
-                reason: "slots busy".into()
-            })),
-            Some("resource_contention"),
-        );
-        assert_eq!(
             host_skip_class(&anyhow::Error::new(PerfModeUnavailable {
                 reason: "host too small".into()
             })),
             Some("perf_mode_unavailable"),
         );
-        // Chain-aware, matching the classifier.
+        // Transient contention is NOT a host-shape skip: a busy slot is
+        // waited out / retried, never "this host cannot run". Chain-aware
+        // form must also yield None so a `.context(...)`-wrapped contention
+        // can never leak into the host-skip footer.
+        assert_eq!(
+            host_skip_class(&anyhow::Error::new(ResourceContention {
+                reason: "slots busy".into()
+            })),
+            None,
+        );
         assert_eq!(
             host_skip_class(
                 &anyhow::Error::new(ResourceContention {
@@ -400,7 +422,7 @@ mod tests {
                 })
                 .context("run ktstr_test VM")
             ),
-            Some("resource_contention"),
+            None,
         );
         // Not host-shape: a hard-fail type, a missing kernel, a plain error.
         assert_eq!(
@@ -443,11 +465,16 @@ mod tests {
         })
         .context("build ktstr_test VM")
         .context("run ktstr_test VM");
-        assert_eq!(
-            classify_host_error(&wrapped, false),
-            HostClass::Skip {
-                reason: "resource contention: all 3 LLC slots busy".into()
+        match classify_host_error(&wrapped, false) {
+            HostClass::Fail { reason } => {
+                // Extracted reason is the inner typed reason, not the
+                // wrapping context layer.
+                assert!(
+                    reason.contains("all 3 LLC slots busy"),
+                    "must surface the inner typed reason; got: {reason}",
+                );
             }
-        );
+            other => panic!("expected Fail, got {other:?}"),
+        }
     }
 }

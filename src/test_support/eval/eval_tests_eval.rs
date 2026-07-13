@@ -2529,8 +2529,8 @@ fn acquire_test_kernel_lock_if_cached_returns_none_outside_cache() {
 /// substring contract so a rewording in
 /// `crate::flock`'s bail message that drops either substring is
 /// caught here rather than silently degrading flock-timeout
-/// classification (a SKIP-able `ResourceContention`) into a
-/// hard-error plain anyhow.
+/// classification (a typed, retryable `ResourceContention`) into an
+/// unclassified plain anyhow.
 ///
 /// The test feeds the seam a representative shared-lock-timeout
 /// rendering (matching the literal format produced at

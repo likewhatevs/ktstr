@@ -303,6 +303,23 @@ pub(crate) fn send_sys_rdy_with_retry(
     // Snapshots `port_exists` so the field reports the last-attempt
     // state, not a fresh stat that could observe the port appearing in
     // the gap between the final wait and the WARN call.
+    //
+    // The budget bounds how long BOOT blocks on the handshake — it must
+    // NOT cancel the publishes themselves. KERN_ADDRS is the host's only
+    // virt-KASLR / phys_base publisher on aarch64; the previous
+    // warn-and-abandon exit left the host's evidence channels dead for
+    // the whole run on starved boots (observed on arm64/6.14: a narrow
+    // cell whose 10.15 s budget expired mid-boot at a few % host CPU
+    // share reached Teardown with `kaslr_raw=0`, while the wide sibling
+    // — whose per-vCPU-scaled budget was ~2x larger — published fine in
+    // the same leg). Every budget-exhaustion exit therefore hands the
+    // unsent frames to [`spawn_background_publish_retry`], which keeps
+    // the SAME evented loop going without a deadline: boot proceeds
+    // immediately (unchanged blocking semantics) and the publish lands
+    // whenever the port comes up — the host adopts it per monitor tick
+    // (`RqRefresh::{kaslr_offset,kern_phys_base}` re-reads), so a late
+    // publish still lights the evidence channels. The WARN remains the
+    // operator signal that the budget was exceeded.
     let warn_timeout = |kern_addrs_sent: bool| {
         let port_exists_snapshot = port_path.exists();
         tracing::warn!(
@@ -312,6 +329,8 @@ pub(crate) fn send_sys_rdy_with_retry(
             port_exists = port_exists_snapshot,
             kern_addrs_sent,
             "ktstr-init: send_sys_rdy failed within boot budget; \
+             boot continues and a detached background retry keeps \
+             publishing KERN_ADDRS/SYS_RDY — \
              see https://ktstr.dev/guide/troubleshooting.html#send_sys_rdy-timeout",
         );
     };
@@ -343,6 +362,7 @@ pub(crate) fn send_sys_rdy_with_retry(
                 }
                 if std::time::Instant::now() >= deadline {
                     warn_timeout(kern_addrs_sent);
+                    spawn_background_publish_retry(kern_addrs_sent, *kern_addrs, port_path);
                     return;
                 }
                 // The send failed and reset the cached FD. Most send
@@ -362,10 +382,101 @@ pub(crate) fn send_sys_rdy_with_retry(
             }
             KernfsWaitOutcome::Timeout | KernfsWaitOutcome::NoEventedSource => {
                 warn_timeout(kern_addrs_sent);
+                spawn_background_publish_retry(kern_addrs_sent, *kern_addrs, port_path);
                 return;
             }
         }
     }
+}
+
+/// Continue the KERN_ADDRS / SYS_RDY publish on a detached background
+/// thread after [`send_sys_rdy_with_retry`]'s boot budget expired.
+///
+/// Rationale on the `warn_timeout` doc above: the budget bounds BOOT
+/// blocking, not the publish. This loop mirrors the foreground one —
+/// evented node wait, blocking sends, 1 s throttle between fast-fail
+/// retries — with no deadline: it parks in the inotify wait / the
+/// port's `wait_port_writable` queue between attempts, burning no CPU,
+/// and exits on success. The thread dies with the VM otherwise (init
+/// never reaps it; a still-parked sender at teardown is harmless — a
+/// late SYS_RDY is fire-once on the host and KERN_ADDRS stores are
+/// idempotent). No-op when both frames already went out.
+///
+/// `#[cfg(not(test))]`: the host-side unit tests drive
+/// `send_sys_rdy_with_retry` against paths that never become ports and
+/// assert on the retry-iteration counter; a detached forever-thread
+/// would leak retries into unrelated assertions.
+#[cfg(not(test))]
+fn spawn_background_publish_retry(
+    kern_addrs_sent: bool,
+    kern_addrs: crate::vmm::wire::KernAddrs,
+    port_path: &std::path::Path,
+) {
+    use crate::vmm::freeze_coord::evented_wait::{KernfsWaitOutcome, kernfs_evented_wait};
+    use nix::sys::inotify::AddWatchFlags;
+
+    let port_path = port_path.to_path_buf();
+    let spawn_res = std::thread::Builder::new()
+        .name("ktstr-publish-retry".into())
+        .spawn(move || {
+            let watch_dir = port_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("/dev"))
+                .to_path_buf();
+            let cadence = std::time::Duration::from_secs(1);
+            let mut kern_addrs_sent = kern_addrs_sent;
+            loop {
+                // Far-future deadline: the wait itself is evented and the
+                // loop is exit-on-success; a finite horizon only guards
+                // against Instant arithmetic overflow.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+                match kernfs_evented_wait(
+                    &watch_dir,
+                    AddWatchFlags::IN_CREATE | AddWatchFlags::IN_MOVED_TO,
+                    None::<&std::path::Path>,
+                    cadence,
+                    deadline,
+                    || port_path.exists().then_some(()),
+                ) {
+                    KernfsWaitOutcome::Done(()) => {
+                        if !kern_addrs_sent {
+                            kern_addrs_sent = crate::vmm::guest_comms::send_kern_addrs(&kern_addrs);
+                        }
+                        if kern_addrs_sent && crate::vmm::guest_comms::send_sys_rdy() {
+                            tracing::info!(
+                                "ktstr-init: background publish retry delivered \
+                                 KERN_ADDRS + SYS_RDY after the boot budget expired"
+                            );
+                            return;
+                        }
+                        // Fast-fail throttle, mirroring the foreground loop.
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    KernfsWaitOutcome::Timeout | KernfsWaitOutcome::NoEventedSource => {
+                        // Node still absent after an hour-scale horizon (or
+                        // no inotify available): re-arm and keep waiting —
+                        // the loop stays evented either way.
+                    }
+                }
+            }
+        });
+    if let Err(e) = spawn_res {
+        tracing::warn!(
+            err = %e,
+            "ktstr-init: could not spawn the background publish retry; \
+             KERN_ADDRS/SYS_RDY stay unsent for this run"
+        );
+    }
+}
+
+/// Test builds: no background thread (see the `#[cfg(not(test))]`
+/// sibling's doc); the WARN alone records the exhaustion.
+#[cfg(test)]
+fn spawn_background_publish_retry(
+    _kern_addrs_sent: bool,
+    _kern_addrs: crate::vmm::wire::KernAddrs,
+    _port_path: &std::path::Path,
+) {
 }
 
 /// Count online CPUs from /sys/devices/system/cpu/online.

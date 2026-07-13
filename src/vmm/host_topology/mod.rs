@@ -746,9 +746,13 @@ pub enum LockOutcome {
 /// - Skipped for `Exclusive` LLC mode (the LLC lock already provides
 ///   exclusivity over all CPUs in the group).
 ///
-/// Single non-blocking attempt. Returns `LockOutcome::Unavailable`
-/// immediately when any resource is busy. Callers rely on nextest
-/// retry backoff for contention resolution.
+/// Single non-blocking attempt — thin wrapper over
+/// [`acquire_resource_locks_waiting`] with no wait deadline. Returns
+/// `LockOutcome::Unavailable` immediately when any resource is busy.
+/// Used by the offset-scan probe in
+/// [`crate::vmm::KtstrVm::acquire_default_run_locks`] (which needs a
+/// fast "is this offset free?" answer per candidate) and by the
+/// locking tests.
 ///
 /// `KTSTR_CARGO_TEST_MODE` short-circuits the entire flock dance and
 /// returns `Acquired` with an empty fd list — bare `cargo test`
@@ -760,18 +764,73 @@ pub fn acquire_resource_locks(
     llc_indices: &[usize],
     llc_mode: LlcLockMode,
 ) -> Result<LockOutcome> {
+    acquire_resource_locks_waiting(plan, llc_indices, llc_mode, None)
+}
+
+/// Poll interval for the bounded-wait acquire paths
+/// ([`acquire_resource_locks_waiting`] and the holder-wait tail of
+/// [`acquire_llc_plan_with_acquire_fn`]). `flock(2)` has no timed
+/// blocking variant, so both emulate one by retrying the non-blocking
+/// form on this cadence. 100 ms matches `crate::flock::acquire`'s poll
+/// interval: responsive enough that a peer's release is picked up
+/// within one tick, cheap enough that a parked acquirer wakes only
+/// ~10×/s.
+pub(crate) const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Bounded-WAIT reservation acquire.
+///
+/// `wait_deadline == None` is a single non-blocking attempt — the
+/// interactive / one-shot `ktstr shell` path, which degrades a busy
+/// host to a lock-free overcommit rather than parking a human, and the
+/// per-offset probe in the default run path.
+///
+/// `wait_deadline == Some(instant)` is the TEST run path: when the
+/// reservation is busy the helper POLLS [`try_acquire_all`] every
+/// [`WAIT_POLL_INTERVAL`] until it acquires or `instant` passes. This
+/// is the resource-budget model's contract — a budgeted / shared
+/// acquirer WAITS for an exclusive holder: a colocated peer's
+/// perf-mode `LOCK_EX` releases when its VM run finishes and the
+/// waiter then proceeds, instead of converting a *transient* hold into
+/// a host-skip. The outer governor is nextest `terminate-after` (see
+/// [`crate::vmm::KtstrVm`]'s `RUN_LOCK_ACQUIRE_WAIT`): a peer that
+/// wedges past the deadline yields `Unavailable`, which the run path
+/// surfaces as a RETRYABLE contention failure (nextest re-runs the
+/// cell), never a silent "this host cannot run" skip.
+///
+/// All-or-nothing per poll: [`try_acquire_all`] drops every fd it
+/// took the instant one lock is busy, so a waiter never holds a
+/// partial reservation across a sleep — no lock-ordering deadlock
+/// between two waiters contending overlapping sets.
+///
+/// `KTSTR_CARGO_TEST_MODE` short-circuits to `Acquired` with an empty
+/// fd list, same as [`acquire_resource_locks`].
+pub fn acquire_resource_locks_waiting(
+    plan: &PinningPlan,
+    llc_indices: &[usize],
+    llc_mode: LlcLockMode,
+    wait_deadline: Option<std::time::Instant>,
+) -> Result<LockOutcome> {
     if crate::cargo_test_mode::cargo_test_mode_active() {
         return Ok(LockOutcome::Acquired {
             llc_offset: llc_indices.first().copied().unwrap_or(0),
             locks: Vec::new(),
         });
     }
-    match try_acquire_all(plan, llc_indices, llc_mode) {
-        Ok(locks) => Ok(LockOutcome::Acquired {
-            llc_offset: llc_indices.first().copied().unwrap_or(0),
-            locks,
-        }),
-        Err(reason) => Ok(LockOutcome::Unavailable(reason)),
+    loop {
+        match try_acquire_all(plan, llc_indices, llc_mode) {
+            Ok(locks) => {
+                return Ok(LockOutcome::Acquired {
+                    llc_offset: llc_indices.first().copied().unwrap_or(0),
+                    locks,
+                });
+            }
+            Err(reason) => match wait_deadline {
+                Some(d) if std::time::Instant::now() < d => {
+                    std::thread::sleep(WAIT_POLL_INTERVAL);
+                }
+                _ => return Ok(LockOutcome::Unavailable(reason)),
+            },
+        }
     }
 }
 
@@ -1588,7 +1647,13 @@ fn try_acquire_llc_plan_locks(
 ///
 /// Runs DISCOVER → PLAN → ACQUIRE with up to
 /// [`ACQUIRE_MAX_TOCTOU_RETRIES`] retries (each separated by a
-/// per-retry sleep from [`TOCTOU_RETRY_DELAYS`]). On
+/// per-retry sleep from [`TOCTOU_RETRY_DELAYS`]) to absorb
+/// plan/acquire races, then — when `wait_deadline` is `Some` — keeps
+/// polling on the [`WAIT_POLL_INTERVAL`] cadence until it acquires or
+/// the deadline passes, waiting out a genuine holder (a colocated
+/// perf-mode `LOCK_EX`) rather than skipping. `wait_deadline == None`
+/// bails the moment the TOCTOU budget is spent (the interactive path).
+/// On
 /// success returns an [`LlcPlan`] holding the selected LLCs, their
 /// flattened CPUs (intersected with the calling process's allowed
 /// cpuset), the derived `mems` set, the diagnostic snapshot, and the
@@ -1616,6 +1681,7 @@ pub fn acquire_llc_plan(
     test_topo: &crate::topology::TestTopology,
     cpu_cap: Option<CpuCap>,
     policy: PlacementPolicy,
+    wait_deadline: Option<std::time::Instant>,
 ) -> Result<LlcPlan> {
     if crate::cargo_test_mode::cargo_test_mode_active() {
         // Bare `cargo test` mode: no peer-coordination contract.
@@ -1668,7 +1734,14 @@ pub fn acquire_llc_plan(
             locks: Vec::new(),
         });
     }
-    acquire_llc_plan_with_acquire_fn(topo, test_topo, cpu_cap, policy, try_acquire_llc_plan_locks)
+    acquire_llc_plan_with_acquire_fn(
+        topo,
+        test_topo,
+        cpu_cap,
+        policy,
+        wait_deadline,
+        try_acquire_llc_plan_locks,
+    )
 }
 
 /// Parameterized form of [`acquire_llc_plan`] that takes the
@@ -1690,11 +1763,26 @@ pub fn acquire_llc_plan(
 /// holder diagnostics — is shared between both entry points so the
 /// test seam exercises the exact retry-and-diagnose sequence
 /// production uses, not a parallel implementation.
+///
+/// `wait_deadline` separates the two contention regimes the loop
+/// serves. The first [`ACQUIRE_MAX_TOCTOU_RETRIES`] retries always
+/// fire (with the short [`TOCTOU_RETRY_DELAYS`]) to absorb a
+/// plan/acquire *race* — a peer that grabbed a slot between our
+/// DISCOVER and ACQUIRE and is about to release it. Beyond that budget
+/// the behaviour forks: `None` (interactive / no-wait) bails with
+/// `ResourceContention` exactly as before; `Some(instant)` (the test
+/// run path) keeps re-running DISCOVER→PLAN→ACQUIRE on the
+/// [`WAIT_POLL_INTERVAL`] cadence until it acquires or `instant`
+/// passes — a genuine holder (a colocated perf-mode `LOCK_EX`) is
+/// WAITED OUT rather than skipped. Re-planning each poll (not just
+/// re-acquiring a frozen set) keeps the Spread policy honest against
+/// the live holder counts while it waits.
 fn acquire_llc_plan_with_acquire_fn<F>(
     topo: &HostTopology,
     test_topo: &crate::topology::TestTopology,
     cpu_cap: Option<CpuCap>,
     policy: PlacementPolicy,
+    wait_deadline: Option<std::time::Instant>,
     mut acquire_fn: F,
 ) -> Result<LlcPlan>
 where
@@ -1753,6 +1841,7 @@ where
     })?;
 
     let mut attempt: u32 = 0;
+    let wait_start = std::time::Instant::now();
     loop {
         let snapshots =
             discover_llc_snapshots(topo, &allowed, &mountinfo).map_err(|e| ResourceContention {
@@ -1827,7 +1916,16 @@ where
                 });
             }
             None => {
-                if attempt >= ACQUIRE_MAX_TOCTOU_RETRIES {
+                let toctou_exhausted = attempt >= ACQUIRE_MAX_TOCTOU_RETRIES;
+                // Keep polling past the TOCTOU budget only while a wait
+                // deadline is set AND unexpired — that is the "wait out
+                // a genuine holder" regime. With no deadline (or once it
+                // passes) the loop bails the instant the TOCTOU budget
+                // is spent, preserving the pre-wait behaviour exactly.
+                let keep_waiting = wait_deadline
+                    .map(|d| std::time::Instant::now() < d)
+                    .unwrap_or(false);
+                if toctou_exhausted && !keep_waiting {
                     // Rebuild holder diagnostics from a FRESH read so
                     // the error points at the peer that actually won.
                     let final_snapshots = discover_llc_snapshots(topo, &allowed, &mountinfo)?;
@@ -1847,21 +1945,35 @@ where
                     } else {
                         holders.join("; ")
                     };
+                    let waited = if wait_deadline.is_some() {
+                        format!(
+                            " after waiting {:?} for a peer to release",
+                            wait_start.elapsed()
+                        )
+                    } else {
+                        String::new()
+                    };
                     return Err(anyhow::Error::new(ResourceContention {
                         reason: format!(
                             "acquire_llc_plan: could not reserve {target_cpus} \
-                             CPU(s) after {attempts} attempts; holders: \
+                             CPU(s) after {attempts} attempts{waited}; holders: \
                              {holder_text}. Run `ktstr locks --json` to see \
                              every ktstr lock on this host.",
-                            attempts = ACQUIRE_MAX_TOCTOU_RETRIES + 1,
+                            attempts = attempt + 1,
                         ),
                     }));
                 }
-                // Sleep between attempts so a racing peer has time
-                // to drop its fds before the next DISCOVER. Indexed
-                // by `attempt` (0..RETRIES) — see TOCTOU_RETRY_DELAYS.
-                std::thread::sleep(TOCTOU_RETRY_DELAYS[attempt as usize]);
-                attempt += 1;
+                // Sleep between attempts. The first ACQUIRE_MAX_TOCTOU_RETRIES
+                // use the short TOCTOU backoff so a racing peer has time to
+                // drop its fds before the next DISCOVER; once that budget is
+                // spent the wait regime polls on the steady WAIT_POLL_INTERVAL
+                // cadence until the holder releases or the deadline passes.
+                let delay = TOCTOU_RETRY_DELAYS
+                    .get(attempt as usize)
+                    .copied()
+                    .unwrap_or(WAIT_POLL_INTERVAL);
+                std::thread::sleep(delay);
+                attempt = attempt.saturating_add(1);
             }
         }
     }

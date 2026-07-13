@@ -341,7 +341,9 @@ pub(crate) fn invoke_post_vm_callback(
 /// without propagating the error. Called wherever a run is skipped
 /// before producing a real result: the skip-class catch-all and the
 /// VM build / VM run arms in [`run_ktstr_test_inner`] (each fires on a
-/// `ResourceContention` or `TopologyInsufficient`), and the
+/// host-incapacity class — `TopologyInsufficient` or
+/// `PerfModeUnavailable`; transient `ResourceContention` is a
+/// retryable failure and records no skip), and the
 /// performance-mode / coverage gates at the plain-run entry points in
 /// the crate `dispatch` module. All must record the skip for stats
 /// tooling but cannot meaningfully handle a sidecar-write failure

@@ -37,13 +37,17 @@ macro_rules! skip {
 /// shared `crate::test_support::classify_host_error` — the single source
 /// of truth also used by `err_to_exit_code` and the `#[ktstr_test]` macro
 /// body — so this helper can never drift from them. A `HostClass::Skip`
-/// (no kernel resolved, resource contention, topology insufficient, or
-/// perf-mode unavailable — chain-aware, so a `.context(...)`-wrapped
+/// (no kernel resolved, topology insufficient, or perf-mode unavailable —
+/// chain-aware, so a `.context(...)`-wrapped
 /// instance still skips) emits
-/// the canonical SKIP banner and early-returns. Everything else panics
-/// with `{e:#}`: a `HostClass::Fail` (the hard-error
-/// `CpuBudgetUnsatisfiable` / `TopologyUnrepresentable`) and any
-/// non-host-class error are real failures, not skips. `no_skip` is passed
+/// the canonical SKIP banner and early-returns. Everything else panics:
+/// a `HostClass::Fail` (the hard-error
+/// `CpuBudgetUnsatisfiable` / `TopologyUnrepresentable`, or a
+/// `ResourceContention` — TRANSIENT peer contention is a RETRYABLE
+/// failure the nextest retry budget re-runs, never a silent skip) panics
+/// with the classified `ktstr: FAIL: {reason}` verdict, and any
+/// non-host-class error panics with the raw `{e:#}` rendering — both are
+/// real failures, not skips. `no_skip` is passed
 /// `false` — this helper always skips the skip-class errors and has no
 /// `KTSTR_NO_SKIP_MODE` promotion (unchanged from its prior behavior).
 ///
@@ -59,13 +63,21 @@ macro_rules! skip_on_contention {
                 $crate::test_support::HostClass::Skip { reason } => {
                     skip!("{reason}");
                 }
-                // Fail (cpu-budget / topology-unrepresentable) and any
-                // non-host-class error are real failures, not skips —
-                // panic, exactly as the prior open-coded catch-all did
-                // (those were never in this helper's skip set). no_skip is
-                // false above, so the skip-class errors classify as Skip
-                // here, never Fail.
-                _ => panic!("{e:#}"),
+                // Fail (cpu-budget / topology-unrepresentable /
+                // resource-contention, the last RETRYABLE via nextest) is
+                // a real failure, not a skip — panic with the classified
+                // verdict so the banner carries the class framing (e.g.
+                // "transient resource contention", never bare holder
+                // noise), mirroring the `#[ktstr_test]` codegen body's
+                // Fail arm. no_skip is false above, so the skip-class
+                // errors classify as Skip here, never Fail.
+                $crate::test_support::HostClass::Fail { reason } => {
+                    panic!("ktstr: FAIL: {reason}");
+                }
+                // Any non-host-class error is likewise a real failure —
+                // panic with the raw rendering, exactly as the prior
+                // open-coded catch-all did.
+                $crate::test_support::HostClass::NotHostClass => panic!("{e:#}"),
             },
         }
     };
@@ -133,61 +145,41 @@ mod tests {
         CpuBudgetUnsatisfiable, PerfModeUnavailable, ResourceContention, TopologyInsufficient,
     };
 
-    /// Regression for the error-chain fix: a ResourceContention wrapped
-    /// in `.context(...)` must still be recognized by the macro and
-    /// trigger the `skip!` branch instead of the `panic!` branch.
-    ///
-    /// `#[cfg(panic = "unwind")]`: this test uses `std::panic::catch_unwind`
-    /// to assert the macro does NOT panic. Under `panic = "abort"` (the
-    /// release profile's setting — see `Cargo.toml [profile.release]`)
-    /// panics cannot be caught; the panic aborts the whole test binary
-    /// instead of returning an `Err` from `catch_unwind`. Gating the
-    /// test on the panic strategy lets `cargo ktstr test --release`
-    /// skip it without false-failing the binary.
+    /// A ResourceContention — wrapped in `.context(...)` or not — is a
+    /// RETRYABLE FAILURE, not a skip: the run path already waited the
+    /// holder out (`RUN_LOCK_ACQUIRE_WAIT`), so a residual contention
+    /// must panic here (nextest re-runs the test), never silently green
+    /// the cell as a skip. Chain-awareness still matters: the classifier
+    /// must find the typed error under the context layers and produce
+    /// the transient-contention Fail wording, not fall into the
+    /// NotHostClass catch-all.
     #[test]
-    #[cfg(panic = "unwind")]
-    fn skip_on_contention_walks_context_chain() {
-        let result = std::panic::catch_unwind(|| {
-            fn skip_fn() {
-                let err: anyhow::Error = anyhow::Error::new(ResourceContention {
-                    reason: "simulated contention".into(),
-                })
-                .context("wrapping context layer 1")
-                .context("wrapping context layer 2");
-                let _: () = skip_on_contention!(Err::<(), _>(err));
-                unreachable!("skip_on_contention! should have early-returned");
-            }
-            skip_fn();
-        });
-        assert!(
-            result.is_ok(),
-            "context-wrapped ResourceContention must skip, not panic"
-        );
+    #[should_panic(expected = "resource contention")]
+    fn skip_on_contention_fails_context_wrapped_contention() {
+        fn skip_fn() {
+            let err: anyhow::Error = anyhow::Error::new(ResourceContention {
+                reason: "simulated contention".into(),
+            })
+            .context("wrapping context layer 1")
+            .context("wrapping context layer 2");
+            let _: () = skip_on_contention!(Err::<(), _>(err));
+        }
+        skip_fn();
     }
 
-    /// Unwrapped ResourceContention keeps working (no regression on the
-    /// simple path).
-    ///
-    /// `#[cfg(panic = "unwind")]`: same rationale as the sibling
-    /// context-chain test — `catch_unwind` is unusable under
-    /// `panic = "abort"`.
+    /// Unwrapped ResourceContention: same retryable-failure routing as
+    /// the context-wrapped case, and the panic message must carry the
+    /// transient framing — never "cannot run" host-incapacity wording.
     #[test]
-    #[cfg(panic = "unwind")]
-    fn skip_on_contention_recognizes_direct_error() {
-        let result = std::panic::catch_unwind(|| {
-            fn skip_fn() {
-                let err: anyhow::Error = anyhow::Error::new(ResourceContention {
-                    reason: "direct contention".into(),
-                });
-                let _: () = skip_on_contention!(Err::<(), _>(err));
-                unreachable!("skip_on_contention! should have early-returned");
-            }
-            skip_fn();
-        });
-        assert!(
-            result.is_ok(),
-            "direct ResourceContention must skip, not panic"
-        );
+    #[should_panic(expected = "transient")]
+    fn skip_on_contention_fails_direct_contention() {
+        fn skip_fn() {
+            let err: anyhow::Error = anyhow::Error::new(ResourceContention {
+                reason: "direct contention".into(),
+            });
+            let _: () = skip_on_contention!(Err::<(), _>(err));
+        }
+        skip_fn();
     }
 
     /// Non-contention errors still panic (negative case).
@@ -205,9 +197,13 @@ mod tests {
     /// hardware cap) routes to skip, including when wrapped in
     /// `.context(...)`.
     ///
-    /// `#[cfg(panic = "unwind")]`: same rationale as the
-    /// ResourceContention skip tests — `catch_unwind` is unusable
-    /// under `panic = "abort"`.
+    /// `#[cfg(panic = "unwind")]`: this test uses `std::panic::catch_unwind`
+    /// to assert the macro does NOT panic. Under `panic = "abort"` (the
+    /// release profile's setting — see `Cargo.toml [profile.release]`)
+    /// panics cannot be caught; the panic aborts the whole test binary
+    /// instead of returning an `Err` from `catch_unwind`. Gating the
+    /// test on the panic strategy lets `cargo ktstr test --release`
+    /// skip it without false-failing the binary.
     #[test]
     #[cfg(panic = "unwind")]
     fn skip_on_contention_skips_topology_insufficient() {
@@ -238,7 +234,7 @@ mod tests {
     /// compile but panic real perf-incapable hosts.
     ///
     /// `#[cfg(panic = "unwind")]`: same rationale as the
-    /// ResourceContention / TopologyInsufficient skip tests —
+    /// TopologyInsufficient skip test —
     /// `catch_unwind` is unusable under `panic = "abort"`.
     #[test]
     #[cfg(panic = "unwind")]
@@ -281,7 +277,7 @@ mod tests {
     /// satisfy), which the macro's `_ =>` arm panics — a typed hard-fail
     /// must never be swallowed as a skip. Pins the Fail->panic boundary the
     /// classify_host_error routing depends on; the skip tests cover the
-    /// Skip set (RC/TI/perf) and the plain-NotHostClass panics, but not
+    /// Skip set (TI/perf) and the plain-NotHostClass panics, but not
     /// this typed-Fail edge.
     #[test]
     #[should_panic(expected = "exceeds the allowed cpuset")]
@@ -383,81 +379,75 @@ mod tests {
     /// Pin the contract that the `#[ktstr_test]` macro's generated
     /// expect_ok body relies on: when `run_ktstr_test` returns
     /// `Err(ResourceContention)` (possibly wrapped in `.context(...)`),
-    /// the macro must NOT panic — it must emit the canonical
-    /// `ktstr: SKIP: resource contention: ...` banner and return. The
-    /// macro lives in `ktstr-macros` and expands to a `match` whose
-    /// catch-all `Err(e)` arm routes through the REAL
+    /// the macro must PANIC with the `ktstr: FAIL:` transient-contention
+    /// verdict — a retryable failure nextest re-runs — and must NOT emit
+    /// a SKIP banner (a skip is a libtest pass, which nextest never
+    /// retries: the silent-coverage-loss bug). The macro lives in
+    /// `ktstr-macros` and expands to a `match` whose catch-all `Err(e)`
+    /// arm routes through the REAL
     /// [`crate::test_support::classify_host_error`] (the shared
     /// single-source-of-truth classifier, also used by
-    /// `err_to_exit_code`) and maps a [`HostClass::Skip`] to
-    /// `eprintln! + return`. We can't invoke the proc-macro from a unit
-    /// test, but we CAN exercise the real classifier + the same
-    /// control-flow shape and assert the observable behaviour: the
-    /// canonical banner is emitted (the extracted reason, NOT the noisy
-    /// `.context(...)` chain), the post-arm sentinel never executes, and
-    /// the function never panics.
+    /// `err_to_exit_code`) and maps a [`HostClass::Fail`] to `panic!`.
+    /// We can't invoke the proc-macro from a unit test, but we CAN
+    /// exercise the real classifier + the same control-flow shape and
+    /// assert the observable behaviour: the panic fires, its message
+    /// carries the transient framing (extracted typed reason, not the
+    /// `.context(...)` chain), and it never claims host incapacity.
     ///
     /// `no_skip` is passed `false` directly (rather than read from the
-    /// env) so the test deterministically exercises the skip-default
-    /// path regardless of ambient `KTSTR_NO_SKIP_MODE` — the env read is
-    /// the macro's concern, not the classifier's (its env-independence is
-    /// the whole testability win).
+    /// env) so the test deterministically pins that contention is a Fail
+    /// EVEN in skip-default mode — the env read is the macro's concern,
+    /// not the classifier's (its env-independence is the whole
+    /// testability win).
     ///
-    /// `#[cfg(panic = "unwind")]`: same rationale as the sibling
-    /// `skip_on_contention_walks_context_chain` test —
-    /// `catch_unwind` is unusable under `panic = "abort"`.
+    /// `#[cfg(panic = "unwind")]`: `catch_unwind` is unusable under
+    /// `panic = "abort"` (the release profile's setting).
     #[test]
     #[cfg(panic = "unwind")]
-    fn ktstr_test_macro_body_skips_on_resource_contention() {
-        use crate::test_support::test_helpers::capture_stderr;
+    fn ktstr_test_macro_body_fails_retryably_on_resource_contention() {
         use crate::test_support::{HostClass, classify_host_error};
         use crate::vmm::host_topology::ResourceContention;
-        use std::sync::atomic::{AtomicBool, Ordering};
 
-        let reached_tail = AtomicBool::new(false);
         let result = std::panic::catch_unwind(|| {
-            let (_, bytes) = capture_stderr(|| {
-                // Simulates the catch-all `Err(e)` arm of the body that
-                // `ktstr-macros::ktstr_test` expands into for a
-                // non-`expect_err` test: classify via the real shared fn,
-                // map Skip -> SKIP banner + return. The trailing store
-                // must not execute.
-                #[allow(unused_variables, unreachable_code)]
-                fn helper(reached: &AtomicBool) {
-                    let result: Result<(), anyhow::Error> =
-                        Err(anyhow::Error::new(ResourceContention {
-                            reason: "all 3 LLC slots busy".into(),
-                        })
-                        .context("build ktstr_test VM"));
-                    match result {
-                        Ok(_) => {}
-                        Err(e) => match classify_host_error(&e, false) {
-                            HostClass::Skip { reason } => {
-                                eprintln!("ktstr: SKIP: {reason}");
-                                return;
-                            }
-                            HostClass::Fail { reason } => panic!("ktstr: FAIL: {reason}"),
-                            HostClass::NotHostClass => panic!("{e:#}"),
-                        },
-                    }
-                    reached.store(true, Ordering::SeqCst);
+            // Simulates the catch-all `Err(e)` arm of the body that
+            // `ktstr-macros::ktstr_test` expands into for a
+            // non-`expect_err` test: classify via the real shared fn,
+            // map Fail -> panic (the generated body's Fail arm).
+            fn helper() {
+                let result: Result<(), anyhow::Error> =
+                    Err(anyhow::Error::new(ResourceContention {
+                        reason: "all 3 LLC slots busy".into(),
+                    })
+                    .context("build ktstr_test VM"));
+                match result {
+                    Ok(_) => {}
+                    Err(e) => match classify_host_error(&e, false) {
+                        HostClass::Skip { reason } => {
+                            eprintln!("ktstr: SKIP: {reason}");
+                        }
+                        HostClass::Fail { reason } => panic!("ktstr: FAIL: {reason}"),
+                        HostClass::NotHostClass => panic!("{e:#}"),
+                    },
                 }
-                helper(&reached_tail);
-            });
-            let text = std::str::from_utf8(&bytes).expect("stderr is UTF-8");
-            assert_eq!(
-                text, "ktstr: SKIP: resource contention: all 3 LLC slots busy\n",
-                "expected the canonical SKIP banner with the extracted reason \
-                 (no .context(...) chain noise); got: {text:?}",
-            );
+            }
+            helper();
         });
+        let panic_payload = result.expect_err("contention must panic (retryable fail), not skip");
+        let msg = panic_payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
         assert!(
-            result.is_ok(),
-            "macro body must NOT panic on ResourceContention",
+            msg.contains("ktstr: FAIL:") && msg.contains("resource contention"),
+            "panic must carry the FAIL verdict with the contention reason; got: {msg:?}",
         );
         assert!(
-            !reached_tail.load(Ordering::SeqCst),
-            "macro body must early-return after emitting the SKIP banner",
+            msg.contains("all 3 LLC slots busy"),
+            "panic must surface the extracted typed reason; got: {msg:?}",
+        );
+        assert!(
+            msg.contains("transient") && !msg.contains("cannot run"),
+            "panic must frame contention as transient, never host incapacity; got: {msg:?}",
         );
     }
 }

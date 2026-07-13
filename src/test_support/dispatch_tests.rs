@@ -2297,31 +2297,36 @@ fn result_to_exit_code_post_vm_marker_wins_over_expect_auto_repro() {
 }
 
 // -- result_to_exit_code: ResourceContention + TopologyInsufficient
-// skip/no-skip arms --
+// arms --
 //
 // Both typed errors route through the shared `classify_host_error`
 // (the `HostClass::Skip` / `Fail` mapping), surfaced via
-// `result_to_exit_code` → `err_to_exit_code`:
-// with KTSTR_NO_SKIP_MODE unset they map to EXIT_PASS (the test
-// never ran — `crate::report::test_skip` is a bare eprintln!, no VM
-// needed); with KTSTR_NO_SKIP_MODE set they hard-FAIL (EXIT_FAIL).
-// The skip arms sit ABOVE the `Err(e) if expect_err` arm, so even
-// under expect_err=true a contention/insufficient error still skips
-// rather than being inverted. NOTE: the 3rd `result_to_exit_code`
+// `result_to_exit_code` → `err_to_exit_code`.
+// TopologyInsufficient: with KTSTR_NO_SKIP_MODE unset it maps to
+// EXIT_PASS (the test never ran — `crate::report::test_skip` is a bare
+// eprintln!, no VM needed); with KTSTR_NO_SKIP_MODE set it hard-FAILs
+// (EXIT_FAIL). ResourceContention: ALWAYS EXIT_FAIL — the run path
+// waits the holder out, so residual contention is a retryable failure
+// nextest re-runs, never a skip (EXIT_PASS is un-retried and would
+// silently drop coverage). The host-class arms sit ABOVE the
+// `Err(e) if expect_err` arm, so even under expect_err=true these
+// verdicts are not inverted. NOTE: the 3rd `result_to_exit_code`
 // param is `allow_inconclusive`, NOT no_skip — no_skip is read from
 // KTSTR_NO_SKIP_MODE_ENV inside the fn (its
 // `let no_skip = std::env::var_os(crate::KTSTR_NO_SKIP_MODE_ENV).is_some();`
-// binding), so the FAIL branch is reached ONLY by setting that env var.
+// binding).
 
 /// `ResourceContention` (direct and `.context`-wrapped) routes to
-/// EXIT_PASS when KTSTR_NO_SKIP_MODE is unset — including under
-/// expect_err=true, because the skip arm precedes the expect_err
-/// arm. The wrapped case exercises the `chain().find_map(...)`
-/// reason extraction + the `is_resource_contention` chain walk
-/// through the eval-layer "build/run ktstr_test VM" wrappers.
+/// EXIT_FAIL (retryable — nextest re-runs) even when
+/// KTSTR_NO_SKIP_MODE is unset, and even under expect_err=true (the
+/// host-class arm precedes the expect_err inversion). The wrapped
+/// case exercises the reason extraction + the
+/// `is_resource_contention` chain walk through the eval-layer
+/// "build/run ktstr_test VM" wrappers. The banner must frame the
+/// failure as transient contention, never host incapacity.
 #[test]
-fn result_to_exit_code_resource_contention_skips_when_not_no_skip() {
-    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+fn result_to_exit_code_resource_contention_fails_retryably() {
+    use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
     use anyhow::Context as _;
     let _env_lock = lock_env();
     let _no_skip = EnvVarGuard::remove(crate::KTSTR_NO_SKIP_MODE_ENV);
@@ -2333,12 +2338,28 @@ fn result_to_exit_code_resource_contention_skips_when_not_no_skip() {
             },
         ))
     };
-    assert_eq!(result_to_exit_code(direct(), false, false), EXIT_PASS);
-    // Skip arm precedes the expect_err arm: still EXIT_PASS.
-    assert_eq!(result_to_exit_code(direct(), true, false), EXIT_PASS);
+    let (code, captured) = capture_stderr(|| result_to_exit_code(direct(), false, false));
+    assert_eq!(
+        code, EXIT_FAIL,
+        "contention must FAIL (retryable), not skip"
+    );
+    let stderr = String::from_utf8(captured).expect("stderr is utf-8");
+    assert!(
+        stderr.contains("resource contention")
+            && stderr.contains("transient")
+            && stderr.contains("no 4 consecutive CPUs available"),
+        "banner must name transient contention + the typed reason; got: {stderr}",
+    );
+    assert!(
+        !stderr.contains("cannot run"),
+        "banner must never claim host incapacity for contention; got: {stderr}",
+    );
+    // Host-class arm precedes the expect_err arm: still EXIT_FAIL,
+    // never inverted to a pass.
+    assert_eq!(result_to_exit_code(direct(), true, false), EXIT_FAIL);
 
     // Context-wrapped (production shape) still recognised via the
-    // chain walk → EXIT_PASS.
+    // chain walk → EXIT_FAIL.
     let wrapped = || -> Result<crate::assert::AssertResult> {
         Err(anyhow::Error::new(
             crate::vmm::host_topology::ResourceContention {
@@ -2348,7 +2369,7 @@ fn result_to_exit_code_resource_contention_skips_when_not_no_skip() {
         .context("build ktstr_test VM")
         .context("run ktstr_test VM")
     };
-    assert_eq!(result_to_exit_code(wrapped(), false, false), EXIT_PASS);
+    assert_eq!(result_to_exit_code(wrapped(), false, false), EXIT_FAIL);
 }
 
 /// `TopologyInsufficient` (direct and `.context`-wrapped) routes to
@@ -2385,13 +2406,16 @@ fn result_to_exit_code_topology_insufficient_skips_when_not_no_skip() {
     assert_eq!(result_to_exit_code(wrapped(), false, false), EXIT_PASS);
 }
 
-/// Under KTSTR_NO_SKIP_MODE, all four skip-class errors hard-FAIL
+/// Under KTSTR_NO_SKIP_MODE, the skip-class errors hard-FAIL
 /// (EXIT_FAIL) instead of skipping, and the stderr banner names
 /// the cause/reason. Pins the no_skip branches (the `no_skip` →
 /// `HostClass::Fail` arms in the shared `classify_host_error` for
-/// kernel-unavailable, perf-mode, resource-contention, and
-/// topology-insufficient, surfaced via `result_to_exit_code`) and the
-/// reason extraction.
+/// kernel-unavailable, perf-mode, and topology-insufficient, surfaced
+/// via `result_to_exit_code`) and the reason extraction.
+/// ResourceContention also FAILs here, but not via a no_skip
+/// promotion — it is unconditionally a retryable failure (see
+/// `result_to_exit_code_resource_contention_fails_retryably`); this
+/// test pins that no_skip does not change that verdict.
 #[test]
 fn result_to_exit_code_skip_class_fails_under_no_skip_mode() {
     use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
@@ -2409,7 +2433,7 @@ fn result_to_exit_code_skip_class_fails_under_no_skip_mode() {
     assert_eq!(code, EXIT_FAIL);
     let stderr = String::from_utf8(captured).expect("stderr is utf-8");
     assert!(
-        stderr.contains("resource contention under --no-skip-mode")
+        stderr.contains("resource contention")
             && stderr.contains("no 4 consecutive CPUs available"),
         "no-skip RC banner must name the cause + reason; got: {stderr}",
     );

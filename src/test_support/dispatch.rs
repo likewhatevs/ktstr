@@ -1004,7 +1004,7 @@ pub const EXIT_INCONCLUSIVE: i32 = 2;
 /// [`EXIT_INCONCLUSIVE`] on Inconclusive — the 4-state lattice
 /// `Fail > Inconclusive > Pass > Skip` projects to 3 distinct exit
 /// codes (Skip degenerates to [`EXIT_PASS`] because the test never
-/// ran, mirroring `ResourceContention`). A Skip routes through the
+/// ran). A Skip routes through the
 /// dedicated FIRST match arm (`Ok(r) if r.is_skip()`), ahead of the
 /// expect_err arm, so an expect_err test that produced no verdict (e.g.
 /// a `post_vm_skip` on a load-starved placeholder dump) is not inverted
@@ -1012,23 +1012,20 @@ pub const EXIT_INCONCLUSIVE: i32 = 2;
 /// [`EXIT_INCONCLUSIVE`] lets
 /// downstream tooling (CI gates, nextest summary aggregation, the
 /// operator dashboard) triage zero-denominator runs distinctly from
-/// real regressions. `ResourceContention` returns [`EXIT_PASS`] —
-/// the test never ran, not a real failure. The skip sidecar for
-/// this case is written upstream in `run_ktstr_test_inner` at the
-/// ResourceContention propagation site so every caller (including
-/// the library entry point `run_ktstr_test`) records it, not just
-/// the nextest dispatch path.
+/// real regressions.
 ///
-/// `ResourceContention` detection walks the FULL error chain via
-/// [`is_resource_contention`] (chain-walk predicate) plus a
-/// matching `e.chain().find_map(...)` extraction for the reason
-/// string. The eval-side `crate::test_support::eval` `"build ktstr_test VM"` and
-/// `"run ktstr_test VM"` wrappers nest the contention error under
-/// `.context(...)`, so a top-level `downcast_ref` on the outer
-/// error misses the inner cause. Without the chain walk a wrapped
-/// contention would land in the `Err(e)` arm below as a regular
-/// failure (exit 1) rather than the skip path (exit 0), turning
-/// every host-resource-exhausted run into a hard test failure.
+/// `ResourceContention` does NOT map to a skip: the run path WAITS for
+/// a contended reservation to free (see [`crate::vmm::KtstrVm`]'s
+/// `RUN_LOCK_ACQUIRE_WAIT`), so a contention that still surfaces here is
+/// a peer holding past that wait — [`classify_host_error`] routes it to
+/// [`HostClass::Fail`] → [`EXIT_FAIL`], a RETRYABLE failure nextest
+/// re-runs once the holder releases. That is the correct mechanism: a
+/// skip is [`EXIT_PASS`], which nextest never retries, so the old
+/// skip-on-contention silently dropped suite coverage whenever a
+/// colocated peer's `LOCK_EX` overlapped the run. Chain-awareness (the
+/// eval-side `"build ktstr_test VM"` / `"run ktstr_test VM"`
+/// `.context(...)` wrappers nest the typed error) is handled inside
+/// `classify_host_error` via the chain-walking `is_*` predicates.
 fn result_to_exit_code(
     result: Result<AssertResult>,
     expect_err: bool,
@@ -1051,9 +1048,11 @@ fn result_to_exit_code(
 fn ok_to_exit_code(r: AssertResult, expect_err: bool, allow_inconclusive: bool) -> i32 {
     // A Skip degenerates to EXIT_PASS regardless of expect_err — the
     // test never evaluated, so there is no guest failure to "expect"
-    // (the `Fail > Inconclusive > Pass > Skip` projection; mirrors the
-    // ResourceContention Err branch in `err_to_exit_code`, but on the
-    // Ok side). Without this guard a post_vm_skip under expect_err
+    // (the `Fail > Inconclusive > Pass > Skip` projection). This is the
+    // `post_vm_skip` / host-incapacity (TopologyInsufficient,
+    // PerfModeUnavailable) skip channel — NOT ResourceContention, which
+    // `err_to_exit_code` routes to EXIT_FAIL (retryable). Without this
+    // guard a post_vm_skip under expect_err
     // falls into the `expect_err` guard below and surfaces as "expected
     // error but test passed" (EXIT_FAIL) — a load-starvation
     // placeholder-dump skip becomes a flaky failure. End-to-end chain:

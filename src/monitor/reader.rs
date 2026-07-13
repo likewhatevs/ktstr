@@ -1957,6 +1957,17 @@ pub(crate) struct RqRefresh {
     /// dump so a dead-channel run self-reports which arm produced the
     /// possibly-bad base).
     pub phys_base_guest_published: bool,
+    /// Count of KERN_ADDRS frames the coordinator's dispatcher has
+    /// consumed (CRC-valid or not), incremented at the dispatch arm.
+    /// Diagnostic-only, printed by the pre-latch dump: `0` alongside
+    /// `kaslr_raw=0` pins "the guest never sent / the coord never
+    /// consumed the publish" vs a non-zero count pinning "frame
+    /// arrived but a derive gate rejected it" — the discriminator a
+    /// field dead-channel report needs. `None` on the test path.
+    pub kern_addrs_frames: Option<std::sync::Arc<AtomicU64>>,
+    /// Count of KERN_ADDRS frames that failed CRC (a subset of
+    /// [`Self::kern_addrs_frames`]). Same provenance and consumer.
+    pub kern_addrs_crc_bad: Option<std::sync::Arc<AtomicU64>>,
     /// Number of CPUs (entries to read from `__per_cpu_offset[]`).
     pub num_cpus: u32,
     /// Link-time KVA of the `page_offset_base` symbol. When `Some`,
@@ -3747,27 +3758,19 @@ pub(crate) fn monitor_loop(
             // hold BSS zero. Walks for those APs would compute
             // `runqueues_kva + 0`, wrap to a non-DRAM PA, and
             // silently read zeros — the exact failure mode the gate
-            // exists to prevent. Require every slot to be populated
-            // (and the slice to be non-empty so a degenerate
-            // `num_cpus == 0` cannot vacuously pass).
+            // exists to prevent.
             //
-            // **Kernel-half check (bit 63)**: bare `v != 0` accepts
-            // garbage like `0x3` that can transiently appear when
-            // the host reads `__per_cpu_offset[]` before the guest
-            // BSP has populated it (the bytes at the target PA
-            // are whatever pre-init state holds, not necessarily
-            // zero). Every legitimate `__per_cpu_offset[cpu]` value
-            // has bit 63 set on both supported architectures: x86_64
-            // kernel-half starts at `0xffff_8800_0000_0000`, and on
-            // aarch64 the value is `pcpu_base_addr -
-            // link___per_cpu_start - kaslr_offset +
-            // pcpu_unit_offsets[cpu]` — a u64 subtraction of two
-            // high-half addresses whose result inherits bit 63.
-            // Rejecting `v & (1u64 << 63) == 0` catches `0x3` and
-            // every other small-magnitude garbage without
-            // arch-specific PAGE_OFFSET hardcoding (which would
-            // wrongly reject valid arm64 VA_BITS=47 values when the
-            // gate uses the VA_BITS=48 fallback).
+            // The populated-table judgment is
+            // [`super::symbols::per_cpu_offsets_populated`]: every
+            // slot non-zero (per-arch plausibility: bit 63 required
+            // on x86_64 only — aarch64 entries legitimately carry
+            // either bit-63 state depending on the boot's KASLR
+            // draw, the arm64/6.14 dead-channel root cause) AND the
+            // table identical to the PREVIOUS iteration's read
+            // (`per_cpu_offsets_buf`, assigned at the bottom of this
+            // block), which rejects pre-init residue in flux where a
+            // shape check cannot. See the predicate's doc for the
+            // per-arch kernel-source reasoning.
             // Per-iteration KASLR-slide re-read. The slide Arc may be
             // unpublished (raw 0) when `RqRefresh` is built (the
             // monitor's pre-sample sys_rdy wait can resolve via its
@@ -3786,8 +3789,7 @@ pub(crate) fn monitor_loop(
             if !data_valid
                 && page_offset_resolved
                 && kaslr_raw != 0
-                && !fresh.is_empty()
-                && fresh.iter().all(|&v| v & (1u64 << 63) != 0)
+                && super::symbols::per_cpu_offsets_populated(&per_cpu_offsets_buf, &fresh)
             {
                 data_valid = true;
                 latched_page_offset = page_offset;
@@ -3827,7 +3829,28 @@ pub(crate) fn monitor_loop(
                 pre_latch_ticks = pre_latch_ticks.saturating_add(1);
                 if pre_latch_ticks == PRE_LATCH_DIAG_TICKS && !pre_latch_diag_emitted {
                     pre_latch_diag_emitted = true;
+                    // bit63_set stays as raw field data (it discriminates the
+                    // per-boot aarch64 delta sign) even though it is no
+                    // longer a gate input; nonzero/stable are the actual
+                    // populated-predicate conjuncts.
                     let bit63_set = fresh.iter().filter(|&&v| v & (1u64 << 63) != 0).count();
+                    let nonzero = fresh.iter().filter(|&&v| v != 0).count();
+                    let stable = per_cpu_offsets_buf == fresh;
+                    // KERN_ADDRS observability: how many frames the coord
+                    // dispatcher has seen (and how many failed CRC). frames=0
+                    // with kaslr_raw=0 → the guest never sent (or the coord
+                    // never consumed) the publish; frames>0 with kaslr_raw=0
+                    // → the frame arrived but a derive gate rejected it.
+                    let ka_frames = refresh
+                        .kern_addrs_frames
+                        .as_ref()
+                        .map(|c| c.load(Ordering::Relaxed))
+                        .unwrap_or(0);
+                    let ka_crc_bad = refresh
+                        .kern_addrs_crc_bad
+                        .as_ref()
+                        .map(|c| c.load(Ordering::Relaxed))
+                        .unwrap_or(0);
                     // phys_base provenance: which arm produced the value the
                     // translations above are using right now. "adopted" = a
                     // per-tick Arc re-read replaced the construction value
@@ -3853,9 +3876,12 @@ pub(crate) fn monitor_loop(
                          (data_valid=false) after {PRE_LATCH_DIAG_TICKS} sample ticks; \
                          the progress watchdog will fall back to the Tier-3 deadman.\n  \
                          data_valid requires page_offset_resolved && kaslr_raw!=0 && a \
-                         non-empty __per_cpu_offset[] with every slot bit-63 set:\n  \
+                         non-empty __per_cpu_offset[] table, all slots nonzero \
+                         (x86_64: also bit-63) and stable across two reads:\n  \
                          page_offset_resolved={page_offset_resolved} kaslr_raw={kaslr_raw:#x} \
-                         num_cpus={num_cpus} pco_slots={pco_slots} bit63_set={bit63_set}\n  \
+                         num_cpus={num_cpus} pco_slots={pco_slots} nonzero={nonzero} \
+                         stable={stable} bit63_set={bit63_set}\n  \
+                         kern_addrs_frames={ka_frames} kern_addrs_crc_bad={ka_crc_bad}\n  \
                          first_pco={first_pco:#x} pco_pa={pco_pa:#x} \
                          pco_start_kernel_map={pco_start_kernel_map:#x}\n  \
                          per_cpu_offset_kva={per_cpu_offset_kva:#x} \
@@ -5369,6 +5395,8 @@ mod tests {
             page_offset_base_kva: None,
             kern_phys_base: None,
             phys_base_guest_published: false,
+            kern_addrs_frames: None,
+            kern_addrs_crc_bad: None,
             event: None,
             // Biased 1 = "published, KASLR-off" (slide 0): non-zero so the
             // data_valid latch fires, while saturating_sub(1) keeps the
@@ -5402,11 +5430,19 @@ mod tests {
         handle.join().unwrap();
 
         assert!(!samples.is_empty());
-        assert_eq!(samples[0].cpus.len(), 2);
-        assert_eq!(samples[0].cpus[0].rq_clock, 7777);
-        assert_eq!(samples[0].cpus[0].nr_running, 11);
-        assert_eq!(samples[0].cpus[1].rq_clock, 8888);
-        assert_eq!(samples[0].cpus[1].nr_running, 22);
+        // The populated predicate requires TWO identical reads (the
+        // stability conjunct — see `symbols::per_cpu_offsets_populated`),
+        // so the first sample legitimately precedes the latch; assert on
+        // the first latched sample instead of samples[0].
+        let latched = samples
+            .iter()
+            .find(|s| !s.cpus.is_empty())
+            .expect("data_valid never latched on a static, fully-populated table");
+        assert_eq!(latched.cpus.len(), 2);
+        assert_eq!(latched.cpus[0].rq_clock, 7777);
+        assert_eq!(latched.cpus[0].nr_running, 11);
+        assert_eq!(latched.cpus[1].rq_clock, 8888);
+        assert_eq!(latched.cpus[1].nr_running, 22);
     }
 
     /// Regression guard for the aarch64-6.14 dead-channel bug: the
@@ -5465,6 +5501,8 @@ mod tests {
             page_offset_base_kva: None,
             kern_phys_base: None,
             phys_base_guest_published: false,
+            kern_addrs_frames: None,
+            kern_addrs_crc_bad: None,
             event: None,
             kaslr_offset: std::sync::Arc::new(AtomicU64::new(1)),
         };
@@ -5561,6 +5599,8 @@ mod tests {
             page_offset_base_kva: None,
             kern_phys_base: Some(phys_base_arc.clone()),
             phys_base_guest_published: false,
+            kern_addrs_frames: None,
+            kern_addrs_crc_bad: None,
             event: None,
             kaslr_offset: std::sync::Arc::new(AtomicU64::new(1)),
         };
@@ -5681,6 +5721,8 @@ mod tests {
             page_offset_base_kva: None,
             kern_phys_base: None,
             phys_base_guest_published: false,
+            kern_addrs_frames: None,
+            kern_addrs_crc_bad: None,
             event: None,
             kaslr_offset: std::sync::Arc::clone(&kaslr),
         };
@@ -5779,6 +5821,8 @@ mod tests {
             page_offset_base_kva: None,
             kern_phys_base: None,
             phys_base_guest_published: false,
+            kern_addrs_frames: None,
+            kern_addrs_crc_bad: None,
             event: None,
             // Raw 0 = "no publisher yet": stays unlatched (this test
             // asserts cpus stays empty; the all-zero offset table also
@@ -8599,6 +8643,8 @@ mod tests {
             page_offset_base_kva: None,
             kern_phys_base: None,
             phys_base_guest_published: false,
+            kern_addrs_frames: None,
+            kern_addrs_crc_bad: None,
             event: None,
             kaslr_offset: std::sync::Arc::new(AtomicU64::new(0)),
         };
