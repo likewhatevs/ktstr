@@ -12898,8 +12898,17 @@ impl KtstrVm {
                 // from the guest's authoritative KERN_ADDRS publish, with
                 // a plausibility-gated CR3 page-table walk only as a last
                 // resort — see the inner comments for why the walk is not
-                // the primary path.
-                let phys_base = {
+                // the primary path. This bounded resolve is a FAST PATH
+                // only: the monitor loop re-reads `kern_phys_base_shared`
+                // per tick while `data_valid` is unlatched and adopts the
+                // guest publish the instant it lands (see
+                // `RqRefresh::kern_phys_base`), so a slow cold boot that
+                // outlives the ~10 s wait no longer freezes the fallback's
+                // garbage/zero into every translation for the whole run.
+                // `phys_base_guest_published` records which arm supplied
+                // the value (diagnostic provenance for the monitor's
+                // pre-latch dump).
+                let (phys_base, phys_base_guest_published) = {
                     let mut pb = 0u64;
                     let pb_fd = {
                         use std::os::unix::io::AsRawFd;
@@ -12967,7 +12976,7 @@ impl KtstrVm {
                             }
                         }
                     }
-                    pb
+                    (pb, guest_published)
                 };
                 if phys_base != 0 {
                     let _ = kern_phys_base_shared.compare_exchange(
@@ -13172,25 +13181,26 @@ impl KtstrVm {
                 // `KernelSymbols::from_vmlinux` returns `None` on
                 // aarch64 and on kernels built without the symbol —
                 // the per-iteration refresh tolerates that and
-                // leaves `page_offset` at the pre-loop default.
-                let page_offset_base_pa = symbols.page_offset_base_kva.map(|kva| {
-                    monitor::symbols::text_kva_to_pa_with_base(
-                        kva, start_kernel_map_for_thread, phys_base,
-                    )
-                });
+                // leaves `page_offset` at the pre-loop default. The
+                // read PA is recomputed per tick inside the loop (no
+                // base is baked here — see `RqRefresh`).
                 let rq_refresh = monitor::reader::RqRefresh {
-                    // Carry the link-time `__per_cpu_offset[]` KVA and the
-                    // TCR_EL1 cache so the monitor recomputes the read PA
-                    // per tick against the LIVE kernel-image base, rather
-                    // than the one-shot `start_kernel_map_for_thread` this
-                    // closure resolved (which can predate the guest's
-                    // TCR_EL1 program on aarch64 — see `RqRefresh`).
+                    // Carry link-time KVAs plus the live-input Arcs
+                    // (TCR_EL1 cache, biased kern_phys_base) so the
+                    // monitor recomputes every read PA per tick against
+                    // the LIVE kernel-image base and phys_base, rather
+                    // than the one-shot values this closure resolved —
+                    // which can predate the guest's TCR_EL1 program
+                    // (aarch64) or its KERN_ADDRS phys_base publish
+                    // (both arches) — see `RqRefresh`.
                     per_cpu_offset_kva: symbols.per_cpu_offset,
                     tcr_el1: tcr_el1.clone(),
+                    kern_phys_base: Some(kern_phys_base_shared.clone()),
+                    phys_base_guest_published,
                     runqueues_kva: symbols.runqueues,
                     kaslr_offset: kern_virt_kaslr_shared.clone(),
                     num_cpus,
-                    page_offset_base_pa,
+                    page_offset_base_kva: symbols.page_offset_base_kva,
                     event: event_refresh,
                 };
 

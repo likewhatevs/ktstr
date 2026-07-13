@@ -1929,20 +1929,52 @@ pub(crate) struct RqRefresh {
     /// gates on the raw value being non-zero so a pre-publish sample
     /// never latches garbage PAs.
     pub kaslr_offset: std::sync::Arc<AtomicU64>,
+    /// Shared `+1`-biased guest `phys_base` Arc (`kern_phys_base`),
+    /// **re-read every sample iteration while `data_valid` is
+    /// unlatched**. rust_init (PID 1) reads the authoritative value
+    /// from /proc/iomem and PLAIN-stores it (biased) over KERN_ADDRS;
+    /// the monitor-thread construction path only waits ~10 s for that
+    /// publish and then falls back to a plausibility-gated CR3 walk
+    /// whose result — garbage, or 0 when the walk is rejected — was
+    /// previously latched into every text-mapped PA for the whole
+    /// run. On a slow cold boot (observed: x86_64 6.14 in a 2-CPU
+    /// cgroup) the publish lands AFTER the bounded wait, so the baked
+    /// `phys_base` mis-translates `__per_cpu_offset[]` and
+    /// `page_offset_base` forever, `data_valid` never latches, and
+    /// the evidence channels stay dead (Tier-3 deadman kill). Per-tick
+    /// adoption makes the construction-time value a fast path, never a
+    /// permanent latch: the loop switches to `raw - 1` the instant
+    /// `raw != 0`. The guest's plain KERN_ADDRS store overwrites even
+    /// a fallback-seeded Arc value (the construction path CAS-seeds
+    /// its fallback into this same Arc), so a garbage fallback
+    /// self-heals too. `None` (test path) keeps the config's static
+    /// `phys_base`.
+    pub kern_phys_base: Option<std::sync::Arc<AtomicU64>>,
+    /// Construction-time provenance of [`MonitorConfig::phys_base`]:
+    /// `true` when the guest's KERN_ADDRS publish supplied it inside
+    /// the bounded wait, `false` when it came from the fallback CR3
+    /// walk or stayed 0. Diagnostic-only (surfaced by the pre-latch
+    /// dump so a dead-channel run self-reports which arm produced the
+    /// possibly-bad base).
+    pub phys_base_guest_published: bool,
     /// Number of CPUs (entries to read from `__per_cpu_offset[]`).
     pub num_cpus: u32,
-    /// PA of the `page_offset_base` symbol (text-mapped). When
-    /// `Some`, the monitor re-reads `PAGE_OFFSET` each sample so a
-    /// KASLR `CONFIG_RANDOMIZE_MEMORY` value (e.g.
+    /// Link-time KVA of the `page_offset_base` symbol. When `Some`,
+    /// the monitor re-reads `PAGE_OFFSET` each sample so a KASLR
+    /// `CONFIG_RANDOMIZE_MEMORY` value (e.g.
     /// `0xff11_0000_0000_0000`) replaces the
     /// [`super::symbols::DEFAULT_PAGE_OFFSET`] fallback once the
     /// guest kernel finishes randomization (which happens after
     /// the host monitor thread spawns — the same boot race that
-    /// motivates the `__per_cpu_offset[]` refresh). When `None`
-    /// (or when the read returns zero / fails the bit-63 check),
-    /// the per-iteration code keeps using the pre-loop resolved
-    /// `page_offset` value.
-    pub page_offset_base_pa: Option<u64>,
+    /// motivates the `__per_cpu_offset[]` refresh). The read PA is
+    /// recomputed per tick from this KVA + the live kernel-image
+    /// base + the live `phys_base` — baking the PA once at
+    /// construction would freeze a stale/garbage `phys_base` into
+    /// it (see [`Self::per_cpu_offset_kva`] and
+    /// [`Self::kern_phys_base`]). When `None` (or when the read
+    /// returns zero / fails the bit-63 check), the per-iteration
+    /// code keeps using the pre-loop resolved `page_offset` value.
+    pub page_offset_base_kva: Option<u64>,
     /// Optional refresh inputs for `event_pcpu_pas`. When `None`,
     /// the monitor leaves `event_pcpu_pas` at its initial value
     /// (typically `None` because `scx_root` was null at host
@@ -3144,7 +3176,18 @@ pub(crate) fn monitor_loop(
     // bounds-rejects to zero, so `rq_clock` reads as 0 forever.
     let mut page_offset = cfg.page_offset;
     let start_kernel_map = cfg.start_kernel_map;
-    let phys_base = cfg.phys_base;
+    // Mutable: while `data_valid` is unlatched, each iteration re-reads
+    // the shared `kern_phys_base` Arc and adopts the guest's
+    // authoritative publish the instant it lands, replacing whatever the
+    // construction-time bounded wait / CR3-walk fallback produced (see
+    // [`RqRefresh::kern_phys_base`]). Frozen once `data_valid` latches —
+    // the latch is proof the current value translates correctly, and a
+    // post-latch flip would tear the PAs mid-run.
+    let mut phys_base = cfg.phys_base;
+    // True once the per-tick adoption above replaced the construction
+    // value with a DIFFERENT one from the Arc (diagnostic provenance,
+    // surfaced by the pre-latch dump).
+    let mut phys_base_adopted = false;
     let rq_refresh = cfg.rq_refresh;
     let preemption_threshold_ns = if preemption_threshold_ns > 0 {
         preemption_threshold_ns
@@ -3438,9 +3481,50 @@ pub(crate) fn monitor_loop(
         // (kernel PAGE_OFFSET is page-aligned by construction), and
         // stability vs the previous read (rejects mid-decompression
         // garbage that briefly satisfied the bit-63 check).
+        // Per-iteration re-derivation of the two translation-base
+        // inputs that can resolve AFTER monitor construction. Hoisted
+        // above every text-KVA translation this iteration performs
+        // (page_offset_base, __per_cpu_offset[]) so they all see the
+        // same live values.
+        //
+        //   * `phys_base`: adopt the guest's authoritative KERN_ADDRS
+        //     publish from the shared Arc the instant it lands (raw
+        //     != 0 → value is `raw - 1`). The construction-time
+        //     bounded wait is only a fast path; its CR3-walk fallback
+        //     (garbage or 0 on a slow cold boot) must never be a
+        //     permanent latch — see [`RqRefresh::kern_phys_base`].
+        //     Only while `data_valid` is unlatched: the latch is proof
+        //     the current base translates correctly, and the guest's
+        //     publish is a boot-time constant thereafter.
+        //   * `iter_start_kernel_map`: aarch64 kernel-image base from
+        //     a freshly re-read TCR_EL1 (x86_64: compile-time
+        //     constant) — see [`RqRefresh::tcr_el1`].
+        let iter_start_kernel_map = rq_refresh
+            .and_then(|r| r.tcr_el1.as_ref())
+            .and_then(|c| super::symbols::start_kernel_map_for_tcr(c.load(Ordering::Acquire)))
+            .unwrap_or(start_kernel_map);
+        if !data_valid && let Some(pb) = rq_refresh.and_then(|r| r.kern_phys_base.as_ref()) {
+            let raw = pb.load(Ordering::Acquire);
+            if raw != 0 {
+                let live = raw.wrapping_sub(1);
+                if live != phys_base {
+                    phys_base = live;
+                    phys_base_adopted = true;
+                }
+            }
+        }
         let mut page_offset_resolved = false;
         if let Some(refresh) = rq_refresh {
-            if let Some(pob_pa) = refresh.page_offset_base_pa {
+            if let Some(pob_kva) = refresh.page_offset_base_kva {
+                // Recompute the read PA per tick from the live bases —
+                // a construction-baked PA would freeze a stale
+                // `phys_base` into every read (the exact permanent-
+                // latch failure the adoption above exists to undo).
+                let pob_pa = super::symbols::text_kva_to_pa_with_base(
+                    pob_kva,
+                    iter_start_kernel_map,
+                    phys_base,
+                );
                 let val = mem.read_u64(pob_pa, 0);
                 let pob_aligned = (val & 0xFFF) == 0;
                 let pob_stable = prev_pob == val;
@@ -3624,24 +3708,27 @@ pub(crate) fn monitor_loop(
             // carries the result into the data_valid latch below.
             //
             // Recompute the `__per_cpu_offset[]` read PA per iteration
-            // from a freshly re-read `TCR_EL1` rather than a
-            // construction-time bake. On aarch64 the kernel-image base
-            // (`KIMAGE_VADDR`) is derived from `TCR_EL1.T1SZ`/`TG1`, and
-            // the BSP loop's lazy `tcr_el1_cache` CAS can land AFTER the
-            // monitor thread resolved its one-shot base (which falls back
-            // to the 48-bit-VA default when TCR is still 0). A once-baked
-            // PA off that stale base reads silent zeros from every slot,
-            // the bit-63 latch never fires, and the guest evidence
-            // channels stay dead for the whole run. Re-deriving the base
-            // here self-heals the instant the guest programs TCR — the
-            // same per-iteration discipline the kaslr slide already uses.
-            // On x86_64 `start_kernel_map_for_tcr` ignores `tcr_el1` and
-            // returns the compile-time base, so this is a constant.
-            let pco_start_kernel_map = refresh
-                .tcr_el1
-                .as_ref()
-                .and_then(|c| super::symbols::start_kernel_map_for_tcr(c.load(Ordering::Acquire)))
-                .unwrap_or(start_kernel_map);
+            // from the live bases hoisted at the top of this iteration
+            // rather than a construction-time bake. Two once-baked
+            // inputs have burned us with this exact dead-channel
+            // signature:
+            //   * aarch64: the kernel-image base (`KIMAGE_VADDR`) is a
+            //     function of `TCR_EL1.T1SZ`/`TG1`, and the BSP loop's
+            //     lazy `tcr_el1_cache` CAS can land AFTER the monitor
+            //     thread resolved its one-shot base (48-bit-VA default
+            //     when TCR was still 0) — observed on arm64 6.14.
+            //   * x86_64: `phys_base` from the construction-time
+            //     bounded wait can be the CR3-walk fallback's garbage
+            //     (or 0) when the guest's KERN_ADDRS publish lands
+            //     after ~10 s on a slow cold boot — observed on
+            //     x86_64 6.14 under a 2-CPU cgroup budget.
+            // Either stale base points the read at the wrong PA, every
+            // slot reads a silent zero, the bit-63 latch never fires,
+            // and the guest evidence channels stay dead for the whole
+            // run. Re-deriving per tick self-heals the instant the
+            // late input lands — the same per-iteration discipline the
+            // kaslr slide already uses.
+            let pco_start_kernel_map = iter_start_kernel_map;
             let pco_pa = super::symbols::text_kva_to_pa_with_base(
                 refresh.per_cpu_offset_kva,
                 pco_start_kernel_map,
@@ -3722,25 +3809,44 @@ pub(crate) fn monitor_loop(
                 if pre_latch_ticks == PRE_LATCH_DIAG_TICKS && !pre_latch_diag_emitted {
                     pre_latch_diag_emitted = true;
                     let bit63_set = fresh.iter().filter(|&&v| v & (1u64 << 63) != 0).count();
-                    tracing::warn!(
-                        pre_latch_ticks,
-                        page_offset_resolved,
-                        kaslr_raw = format_args!("{kaslr_raw:#x}"),
+                    // phys_base provenance: which arm produced the value the
+                    // translations above are using right now. "adopted" = a
+                    // per-tick Arc re-read replaced the construction value
+                    // (guest publish landed after the bounded wait);
+                    // "guest-publish" = the authoritative KERN_ADDRS value
+                    // arrived inside the construction wait; "fallback" = the
+                    // CR3-walk fallback (or 0 when the walk was rejected) and
+                    // no differing Arc value has been adopted since — the
+                    // prime suspect when the pco/pob translations look dead.
+                    let phys_base_src = if phys_base_adopted {
+                        "adopted-from-arc-per-tick"
+                    } else if refresh.phys_base_guest_published {
+                        "guest-publish(pre-loop-wait)"
+                    } else {
+                        "fallback-walk-or-zero(pre-loop)"
+                    };
+                    // eprintln, NOT tracing: the in-VM test binaries wire no
+                    // tracing subscriber, so a tracing::warn here is invisible
+                    // in exactly the CI logs this diagnostic exists for. The
+                    // watchdog dumps use unbuffered stderr for the same reason.
+                    eprintln!(
+                        "monitor: guest evidence channels have not latched \
+                         (data_valid=false) after {PRE_LATCH_DIAG_TICKS} sample ticks; \
+                         the progress watchdog will fall back to the Tier-3 deadman.\n  \
+                         data_valid requires page_offset_resolved && kaslr_raw!=0 && a \
+                         non-empty __per_cpu_offset[] with every slot bit-63 set:\n  \
+                         page_offset_resolved={page_offset_resolved} kaslr_raw={kaslr_raw:#x} \
+                         num_cpus={num_cpus} pco_slots={pco_slots} bit63_set={bit63_set}\n  \
+                         first_pco={first_pco:#x} pco_pa={pco_pa:#x} \
+                         pco_start_kernel_map={pco_start_kernel_map:#x}\n  \
+                         per_cpu_offset_kva={per_cpu_offset_kva:#x} \
+                         runqueues_kva={runqueues_kva:#x} page_offset={page_offset:#x} \
+                         phys_base={phys_base:#x} phys_base_source={phys_base_src}",
                         num_cpus = refresh.num_cpus,
                         pco_slots = fresh.len(),
-                        bit63_set,
-                        first_pco = format_args!("{:#x}", fresh.first().copied().unwrap_or(0)),
-                        pco_pa = format_args!("{pco_pa:#x}"),
-                        pco_start_kernel_map = format_args!("{pco_start_kernel_map:#x}"),
-                        per_cpu_offset_kva = format_args!("{:#x}", refresh.per_cpu_offset_kva),
-                        runqueues_kva = format_args!("{:#x}", refresh.runqueues_kva),
-                        page_offset = format_args!("{page_offset:#x}"),
-                        phys_base = format_args!("{phys_base:#x}"),
-                        "monitor: guest evidence channels have not latched (data_valid=false) \
-                         after {PRE_LATCH_DIAG_TICKS} sample ticks; the progress watchdog will \
-                         fall back to the Tier-3 deadman. data_valid requires \
-                         page_offset_resolved && kaslr_raw!=0 && a non-empty __per_cpu_offset[] \
-                         with every slot bit-63 set — the fields above isolate the dead input."
+                        first_pco = fresh.first().copied().unwrap_or(0),
+                        per_cpu_offset_kva = refresh.per_cpu_offset_kva,
+                        runqueues_kva = refresh.runqueues_kva,
                     );
                 }
             }
@@ -5241,7 +5347,9 @@ mod tests {
             tcr_el1: None,
             runqueues_kva: 0,
             num_cpus: 2,
-            page_offset_base_pa: None,
+            page_offset_base_kva: None,
+            kern_phys_base: None,
+            phys_base_guest_published: false,
             event: None,
             // Biased 1 = "published, KASLR-off" (slide 0): non-zero so the
             // data_valid latch fires, while saturating_sub(1) keeps the
@@ -5335,7 +5443,9 @@ mod tests {
             tcr_el1: None,
             runqueues_kva: 0,
             num_cpus: 2,
-            page_offset_base_pa: None,
+            page_offset_base_kva: None,
+            kern_phys_base: None,
+            phys_base_guest_published: false,
             event: None,
             kaslr_offset: std::sync::Arc::new(AtomicU64::new(1)),
         };
@@ -5377,6 +5487,113 @@ mod tests {
         assert_eq!(latched.cpus[0].nr_running, 33);
         assert_eq!(latched.cpus[1].rq_clock, 5432);
         assert_eq!(latched.cpus[1].nr_running, 44);
+    }
+
+    /// Regression guard for the x86_64-6.14 dead-channel bug: a garbage
+    /// (or zero) construction-time `phys_base` — produced when the guest's
+    /// KERN_ADDRS publish lands after the monitor's ~10 s bounded wait and
+    /// the CR3-walk fallback misfires — must NOT be a permanent latch. The
+    /// monitor re-reads the shared `+1`-biased `kern_phys_base` Arc every
+    /// tick while `data_valid` is unlatched and adopts the authoritative
+    /// value the instant it lands.
+    ///
+    /// Shape: `cfg.phys_base` carries a WRONG displacement, so the pco_pa
+    /// translation initially points past the offset table (silent zeros →
+    /// latch held, cpus empty). Mid-run a helper thread plain-stores the
+    /// CORRECT biased phys_base into the Arc (modeling rust_init's late
+    /// KERN_ADDRS publish overwriting even a fallback-seeded value); the
+    /// next tick must adopt it, land the read on the table, latch
+    /// `data_valid`, and populate `cpus`. A regression to the once-baked
+    /// behavior keeps reading through the garbage base forever → no sample
+    /// ever carries cpus → this test fails on the `expect`.
+    #[test]
+    fn monitor_loop_rq_refresh_adopts_late_phys_base_publish() {
+        let offsets = test_offsets();
+        const TABLE_PA: u64 = 24;
+        let rq0_buf = make_rq_buffer(&offsets, 55, 1, 1, 6543, 0);
+        let rq0_pa = TABLE_PA + 8; // after the 1-slot (8-byte) table
+        const KERNEL_HALF: u64 = 1u64 << 63;
+        let pco0 = KERNEL_HALF | rq0_pa;
+
+        let mut combined = vec![0u8; TABLE_PA as usize];
+        combined.extend_from_slice(&pco0.to_ne_bytes());
+        combined.extend_from_slice(&rq0_buf);
+
+        // SAFETY: combined is a live local buffer whose backing storage
+        // outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(combined.as_ptr() as *mut u8, combined.len() as u64) };
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+
+        // Correct base: pco_pa = per_cpu_offset_kva - S + P == TABLE_PA.
+        let s = super::super::symbols::START_KERNEL_MAP;
+        let good_p: u64 = 0x10_0000; // authoritative guest phys_base
+        let bad_p: u64 = 0x40_0000; // construction fallback's garbage
+        let per_cpu_offset_kva = TABLE_PA.wrapping_add(s).wrapping_sub(good_p);
+
+        // Arc starts EMPTY (raw 0 = "guest has not published"): the loop
+        // must keep using the garbage cfg value until the publish lands.
+        let phys_base_arc = std::sync::Arc::new(AtomicU64::new(0));
+        let refresh = RqRefresh {
+            per_cpu_offset_kva,
+            tcr_el1: None,
+            runqueues_kva: 0,
+            num_cpus: 1,
+            page_offset_base_kva: None,
+            kern_phys_base: Some(phys_base_arc.clone()),
+            phys_base_guest_published: false,
+            event: None,
+            kaslr_offset: std::sync::Arc::new(AtomicU64::new(1)),
+        };
+
+        // Publish the authoritative value (biased +1, mirroring the
+        // KERN_ADDRS arm's plain store) at ~40 ms, then kill at ~120 ms —
+        // several 10 ms ticks on each side of the publish.
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            let arc = phys_base_arc.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(40));
+                arc.store(good_p.wrapping_add(1), Ordering::Release);
+                std::thread::sleep(Duration::from_millis(80));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let cfg = MonitorConfig {
+            rq_refresh: Some(&refresh),
+            page_offset: KERNEL_HALF,
+            start_kernel_map: s,
+            phys_base: bad_p, // the garbage the bounded wait latched
+            ..test_config()
+        };
+        let MonitorLoopResult { samples, .. } = monitor_loop(
+            &mem,
+            &[],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+
+        // Pre-publish ticks ran with the garbage base → gate held.
+        assert!(
+            samples.iter().any(|s| s.cpus.is_empty()),
+            "expected at least one pre-publish sample with the data_valid \
+             gate held (garbage phys_base must not latch)",
+        );
+        // Post-publish: adoption must flip the latch and populate cpus.
+        let latched = samples.iter().rev().find(|s| !s.cpus.is_empty()).expect(
+            "data_valid never latched after the authoritative phys_base \
+             publish — the per-tick kern_phys_base adoption regressed to \
+             the once-baked construction value",
+        );
+        assert_eq!(latched.cpus.len(), 1);
+        assert_eq!(latched.cpus[0].rq_clock, 6543);
+        assert_eq!(latched.cpus[0].nr_running, 55);
     }
 
     /// Regression: the monitor must RE-READ the KASLR-slide Arc each
@@ -5442,7 +5659,9 @@ mod tests {
             tcr_el1: None,
             runqueues_kva: KERNEL_HALF, // high-half → per_cpu_kva applies the slide
             num_cpus: 2,
-            page_offset_base_pa: None,
+            page_offset_base_kva: None,
+            kern_phys_base: None,
+            phys_base_guest_published: false,
             event: None,
             kaslr_offset: std::sync::Arc::clone(&kaslr),
         };
@@ -5538,7 +5757,9 @@ mod tests {
             tcr_el1: None,
             runqueues_kva: 0,
             num_cpus: 2,
-            page_offset_base_pa: None,
+            page_offset_base_kva: None,
+            kern_phys_base: None,
+            phys_base_guest_published: false,
             event: None,
             // Raw 0 = "no publisher yet": stays unlatched (this test
             // asserts cpus stays empty; the all-zero offset table also
@@ -8356,7 +8577,9 @@ mod tests {
             tcr_el1: None,
             runqueues_kva: 0,
             num_cpus: 1,
-            page_offset_base_pa: None,
+            page_offset_base_kva: None,
+            kern_phys_base: None,
+            phys_base_guest_published: false,
             event: None,
             kaslr_offset: std::sync::Arc::new(AtomicU64::new(0)),
         };
