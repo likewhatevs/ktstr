@@ -539,16 +539,40 @@ fn wants_reserved_prebuild(sub_argv: &[&str]) -> bool {
 }
 
 /// Append `--no-run` to a `cargo nextest run` passthrough argv so the
-/// reserved warm-up COMPILES every test binary but RUNS nothing.
+/// reserved warm-up COMPILES every test binary but RUNS nothing, and
+/// strip the run-phase flags nextest HARD-REJECTS beside `--no-run`
+/// (`--fail-fast` / `--no-fail-fast` / `--max-fail <N>` — probed on
+/// nextest 0.9: these three error out; the other run-phase flags,
+/// `--test-threads`/`-j`/`--retries`, only warn and are left alone to
+/// keep the argv-parity delta minimal). Run-phase flags never enter the
+/// build fingerprint, so stripping them cannot cache-miss the combined
+/// run.
 ///
 /// User filtersets (`-E`) and positional filters are left intact:
 /// `--no-run` ignores the run-selection dimension and builds the whole
 /// set, so the subsequent (filtered) combined run finds every artifact
 /// cached regardless of which subset it selects. `pub(crate)`: the
-/// verifier dispatcher's warm-up (`verifier.rs`) appends the same flag
-/// to its `build_nextest_args` argv.
+/// verifier dispatcher's warm-up (`verifier.rs`) builds its argv the
+/// same way.
 pub(crate) fn prebuild_no_run_args(args: &[String]) -> Vec<String> {
-    let mut v = args.to_vec();
+    let mut v: Vec<String> = Vec::with_capacity(args.len() + 1);
+    let mut skip_value = false;
+    for a in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        match a.as_str() {
+            "--fail-fast" | "--no-fail-fast" => continue,
+            "--max-fail" => {
+                // Value-taking form `--max-fail N`: drop the value too.
+                skip_value = true;
+                continue;
+            }
+            _ if a.starts_with("--max-fail=") => continue,
+            _ => v.push(a.clone()),
+        }
+    }
     v.push("--no-run".to_string());
     v
 }
@@ -1986,6 +2010,43 @@ mod tests {
                 "positional",
                 "--no-run"
             ]),
+        );
+    }
+
+    /// The run-phase flags nextest hard-rejects beside `--no-run` are
+    /// stripped from the warm-up argv — `just test` passes
+    /// `--no-fail-fast`, which killed the reserved pre-build with
+    /// "the argument '--no-fail-fast' cannot be used with '--no-run'".
+    /// Both `--max-fail` forms drop their value; build-affecting args
+    /// around them survive in order.
+    #[test]
+    fn prebuild_no_run_args_strips_no_run_incompatible_flags() {
+        let args = strs(&[
+            "--features",
+            "integration",
+            "--no-fail-fast",
+            "-j",
+            "8",
+            "--fail-fast",
+            "--max-fail",
+            "3",
+            "--max-fail=2",
+            "-E",
+            "test(x)",
+        ]);
+        let out = prebuild_no_run_args(&args);
+        assert_eq!(
+            out,
+            strs(&[
+                "--features",
+                "integration",
+                "-j",
+                "8",
+                "-E",
+                "test(x)",
+                "--no-run"
+            ]),
+            "fail-fast family stripped (values included); -j kept (warns only)",
         );
     }
 
