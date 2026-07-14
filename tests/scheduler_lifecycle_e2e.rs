@@ -139,6 +139,15 @@ fn assert_post_op_dispatch(result: &VmResult) -> Result<()> {
     duration_s = 5,
     cleanup_budget_ms = 5000,
     num_snapshots = 3,
+    // These tests churn the scheduler (cold attach / mid-experiment
+    // restart+replace), which opens a legitimate multi-second no-dispatch
+    // window that stretches under host contention. The tight 5s default
+    // guest scx watchdog evicts the scheduler on the saturated colocated
+    // runners before the periodic captures can observe dispatch; 30s (the
+    // kernel's SCX_WATCHDOG_MAX_TIMEOUT) gives the captures room to run.
+    // A real never-dispatch regression is still caught by the
+    // nr_dispatched > 0 check in assert_post_op_dispatch, not the watchdog.
+    watchdog_timeout_s = 30,
     post_vm = assert_post_op_dispatch,
 )]
 fn scheduler_replace_mid_experiment_swaps_via_staged_pack(ctx: &Ctx) -> Result<AssertResult> {
@@ -210,6 +219,15 @@ fn scheduler_replace_mid_experiment_swaps_via_staged_pack(ctx: &Ctx) -> Result<A
     duration_s = 5,
     cleanup_budget_ms = 5000,
     num_snapshots = 3,
+    // These tests churn the scheduler (cold attach / mid-experiment
+    // restart+replace), which opens a legitimate multi-second no-dispatch
+    // window that stretches under host contention. The tight 5s default
+    // guest scx watchdog evicts the scheduler on the saturated colocated
+    // runners before the periodic captures can observe dispatch; 30s (the
+    // kernel's SCX_WATCHDOG_MAX_TIMEOUT) gives the captures room to run.
+    // A real never-dispatch regression is still caught by the
+    // nr_dispatched > 0 check in assert_post_op_dispatch, not the watchdog.
+    watchdog_timeout_s = 30,
     post_vm = assert_post_op_dispatch,
 )]
 fn scheduler_attach_from_cold_start_succeeds(ctx: &Ctx) -> Result<AssertResult> {
@@ -437,6 +455,15 @@ fn replace_with_broken_binary_surfaces_startup_died(ctx: &Ctx) -> Result<AssertR
     duration_s = 5,
     cleanup_budget_ms = 5000,
     num_snapshots = 3,
+    // These tests churn the scheduler (cold attach / mid-experiment
+    // restart+replace), which opens a legitimate multi-second no-dispatch
+    // window that stretches under host contention. The tight 5s default
+    // guest scx watchdog evicts the scheduler on the saturated colocated
+    // runners before the periodic captures can observe dispatch; 30s (the
+    // kernel's SCX_WATCHDOG_MAX_TIMEOUT) gives the captures room to run.
+    // A real never-dispatch regression is still caught by the
+    // nr_dispatched > 0 check in assert_post_op_dispatch, not the watchdog.
+    watchdog_timeout_s = 30,
     post_vm = assert_post_op_dispatch,
 )]
 fn scheduler_restart_mid_experiment_reattaches_cleanly(ctx: &Ctx) -> Result<AssertResult> {
