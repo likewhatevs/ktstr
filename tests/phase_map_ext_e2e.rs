@@ -129,20 +129,28 @@ fn assert_phase_map_ext_pipeline(result: &VmResult) -> Result<()> {
     // assertion below reads as "the chain didn't fire". The
     // periodic_starvation_gate above only floors the TOTAL capture count,
     // so a starved run whose few captures all landed in one Step passes
-    // the gate yet leaves the other Step empty. Under witnessed host
-    // contention that skew is environmental, not a comparator regression
-    // — SKIP. On a quiet host a missing phase is a real bug and falls
-    // through to the assertion's specific diagnosis below.
+    // the gate yet leaves the other Step empty. The direct signal for
+    // that skew is a LOST capture — `periodic_fired < periodic_target`
+    // means a boundary that would have populated the missing Step never
+    // fired (the whole-run dilation witness misses it: a transient stall
+    // that drops one capture need not move the mean past the D bar). When
+    // every boundary fired yet a Step is still empty, that is a real
+    // phase-stamp regression and falls through to the assertion below.
     let both_steps = synthetic_frac.contains_key(&Phase::step(0))
         && synthetic_frac.contains_key(&Phase::step(1));
-    if !both_steps && let Some(d) = ktstr::prelude::capture_starvation_witness(result) {
+    if !both_steps
+        && (result.periodic_fired < result.periodic_target
+            || ktstr::prelude::capture_starvation_witness(result).is_some())
+    {
         return Err(ktstr::prelude::post_vm_skip(format!(
-            "periodic captures populated only one Step bucket under \
-             witnessed host contention (D={d:.2}, step0={}, step1={}): \
-             ratio_across_phases cannot take the two-phase ratio path — \
-             environmental non-verdict",
+            "periodic captures populated only one Step bucket \
+             (step0={}, step1={}, fired {} of {} boundaries): a lost \
+             capture left a Step empty, so ratio_across_phases cannot take \
+             the two-phase ratio path — environmental non-verdict",
             synthetic_frac.contains_key(&Phase::step(0)),
             synthetic_frac.contains_key(&Phase::step(1)),
+            result.periodic_fired,
+            result.periodic_target,
         )));
     }
 

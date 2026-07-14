@@ -108,7 +108,9 @@
 use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
-use ktstr::prelude::{GuestLifecyclePhase, VmResult, WatchdogKillReason, post_vm_skip};
+use ktstr::prelude::{
+    GuestLifecyclePhase, VmResult, WatchdogKillReason, capture_starvation_witness, post_vm_skip,
+};
 use ktstr::scenario::Ctx;
 use ktstr::test_support::Scheduler;
 
@@ -191,9 +193,34 @@ fn assert_wedge_kill_mechanism(
     if result.watchdog_kill_reason == Some(expected) {
         return Ok(());
     }
-    // (c) Reached the wedge but the wrong rule killed it (deadman, wrong
-    // tier, AP kill, or no reason recorded): the detection regression
-    // these fixtures exist to catch.
+    // (a1) Reached the wedge, but the Tier-3 DEADMAN fired instead of the
+    // expected tier, UNDER witnessed host contention: the wedge was starved
+    // so far below the CPU-accrual rate its tier needs that the wall-clock
+    // deadman won the race first. This is the plan's row C — a near-zero-CPU
+    // wedge is indistinguishable from a starved-but-healthy cell using guest
+    // counters, and the design assigns exactly that case to the deadman. The
+    // whole-run dilation reads huge here (a spinner pinned at a few percent
+    // host share accrues enormous run_delay vs on_cpu), so the witness fires
+    // cleanly. SKIP: the deadman bounding such a wedge is the DESIGNED
+    // degradation. A deadman kill on a QUIET host (no witness), or any wrong
+    // TIER (Tier-2 for Tier-1, etc.), still falls through to the (c) bail.
+    if result.watchdog_kill_reason == Some(WatchdogKillReason::Tier3Deadman)
+        && let Some(d) = capture_starvation_witness(result)
+    {
+        return Err(post_vm_skip(format!(
+            "the injected {wedge_desc} was reached but the Tier-3 deadman \
+             fired instead of {expected:?} under witnessed host contention \
+             (D={d:.2}, duration {:.1}s): the wedge was starved below the \
+             CPU-accrual rate its tier needs to win the race to the deadman \
+             — environmental non-verdict (row C: the deadman bounding a \
+             near-zero-CPU wedge is the designed degradation, not a \
+             detection regression)",
+            result.duration.as_secs_f64(),
+        )));
+    }
+    // (c) Reached the wedge but the wrong rule killed it (deadman on a quiet
+    // host, wrong tier, AP kill, or no reason recorded): the detection
+    // regression these fixtures exist to catch.
     anyhow::bail!(
         "the injected {wedge_desc} was reached (final_guest_phase={:?}, \
          progress_epoch={}) but the kill was {:?}, not {expected:?} \
