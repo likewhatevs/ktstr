@@ -285,7 +285,7 @@ pub fn capture_starvation_witness(result: &crate::vmm::VmResult) -> Option<f64> 
 /// Environmental skip for a zero-scheduler-activity reading (e.g.
 /// `nr_dispatched` / `nr_yielded` read 0 across every periodic sample)
 /// that the guest's OWN sched_ext runnable-stall watchdog explains: when
-/// the console carries a watchdog [`ScxExitKind::Stall`] exit AND
+/// the console carries a watchdog `ScxExitKind::Stall` exit AND
 /// [`capture_starvation_witness`] proves the host was contended, the BPF
 /// scheduler was ejected because a descheduling host dilated the 5s
 /// GUEST-time stall window past the timeout — not because the scheduler
