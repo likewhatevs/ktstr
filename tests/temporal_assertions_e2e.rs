@@ -98,6 +98,12 @@ fn assert_temporal_patterns(result: &VmResult) -> Result<()> {
     let any_progress = bpf_dispatched
         .iter_full()
         .any(|(_, _, slot)| matches!(slot, Ok(v) if *v > 0));
+    // A descheduling host can trip the guest's sched_ext runnable-stall
+    // watchdog (5s of GUEST time), ejecting scx-ktstr so the dispatch
+    // counter never advances — environmental, not a dispatch regression.
+    if !any_progress {
+        ktstr::prelude::stall_ejection_skip(result)?;
+    }
     anyhow::ensure!(
         any_progress,
         "BPF nr_dispatched read 0 across every periodic sample — the \

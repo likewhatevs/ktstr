@@ -39,7 +39,8 @@ pub(crate) use post_vm::{
     ScxBpfErrorMatcherMismatch, SurvivesStormViolated, record_skip_sidecar, run_post_vm_callbacks,
 };
 pub use post_vm::{
-    capture_starvation_witness, periodic_starvation_gate, post_vm_skip, starved_below_minimum_skip,
+    capture_starvation_witness, periodic_starvation_gate, post_vm_skip, stall_ejection_skip,
+    starved_below_minimum_skip,
 };
 mod reporting;
 mod scheduler;

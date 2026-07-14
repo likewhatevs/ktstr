@@ -90,27 +90,12 @@ fn assert_post_op_dispatch(result: &VmResult) -> Result<()> {
         .any(|(_, _, slot)| matches!(slot, Ok(v) if *v > 0));
 
     // A zero-dispatch reading can also mean the guest's OWN sched_ext
-    // watchdog ejected scx-ktstr for a runnable-task stall. That watchdog
-    // fires on 5s of GUEST time, so a host that descheduled the guest long
-    // enough dilates the window into a false stall — the scheduler was
-    // healthy but never got the CPU to touch the watchdog. When the console
-    // carries a watchdog Stall exit AND the host was witnessed-contended,
-    // the empty dispatch record is that ejection, not a bind-without-dispatch
-    // regression — environmental non-verdict. A Stall on a quiet host (no
-    // witness) or any non-Stall zero still falls through to the failure below.
+    // watchdog ejected scx-ktstr for a runnable-task stall under host
+    // contention — a descheduling host dilates the 5s GUEST-time stall
+    // window past the timeout though the scheduler was healthy. That is an
+    // environmental non-verdict, not a bind-without-dispatch regression.
     if !any_progress {
-        let stalled = ktstr::live_host::parse_kmsg_window(&result.stderr)
-            .iter()
-            .any(|e| e.kind == ktstr::live_host::ScxExitKind::Stall);
-        if stalled && let Some(d) = ktstr::prelude::capture_starvation_witness(result) {
-            return Err(ktstr::prelude::post_vm_skip(format!(
-                "scx-ktstr ejected by the guest sched_ext runnable-stall \
-                 watchdog under witnessed host contention (D={d:.2}): the 5s \
-                 stall timer measures GUEST time, which a descheduling host \
-                 dilates into a false stall — nr_dispatched=0 is that ejection, \
-                 not a bind-without-dispatch regression; environmental non-verdict",
-            )));
-        }
+        ktstr::prelude::stall_ejection_skip(result)?;
     }
     anyhow::ensure!(
         any_progress,

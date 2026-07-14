@@ -848,7 +848,7 @@ pub mod prelude {
     pub use crate::scenario::payload_run::{PayloadHandle, PayloadRun};
     pub use crate::scenario::scenarios;
     pub use crate::test_support::{
-        capture_starvation_witness, periodic_starvation_gate, post_vm_skip,
+        capture_starvation_witness, periodic_starvation_gate, post_vm_skip, stall_ejection_skip,
         starved_below_minimum_skip,
     };
     pub use crate::timeline::StimulusEvent;

@@ -86,7 +86,8 @@ pub(crate) use probe::PROBE_OUTPUT_END;
 mod probe_metrics;
 mod profraw;
 pub use eval::{
-    capture_starvation_witness, periodic_starvation_gate, post_vm_skip, starved_below_minimum_skip,
+    capture_starvation_witness, periodic_starvation_gate, post_vm_skip, stall_ejection_skip,
+    starved_below_minimum_skip,
 };
 pub use profraw::current_binary_is_coverage_instrumented;
 pub mod runtime;

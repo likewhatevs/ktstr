@@ -282,6 +282,40 @@ pub fn capture_starvation_witness(result: &crate::vmm::VmResult) -> Option<f64> 
     (d > CAPTURE_STARVATION_D_MAX).then_some(d)
 }
 
+/// Environmental skip for a zero-scheduler-activity reading (e.g.
+/// `nr_dispatched` / `nr_yielded` read 0 across every periodic sample)
+/// that the guest's OWN sched_ext runnable-stall watchdog explains: when
+/// the console carries a watchdog [`ScxExitKind::Stall`] exit AND
+/// [`capture_starvation_witness`] proves the host was contended, the BPF
+/// scheduler was ejected because a descheduling host dilated the 5s
+/// GUEST-time stall window past the timeout — not because the scheduler
+/// failed to dispatch. Returns `Err(post_vm_skip(..))` in that case; `Ok`
+/// otherwise, so a Stall on a quiet host (no witness) or any non-Stall
+/// zero still reaches the caller's own regression `ensure!`.
+///
+/// Callers gate their zero-activity failure on it:
+/// ```ignore
+/// if !any_progress {
+///     stall_ejection_skip(result)?;
+/// }
+/// anyhow::ensure!(any_progress, "... never dispatched ...");
+/// ```
+pub fn stall_ejection_skip(result: &crate::vmm::VmResult) -> anyhow::Result<()> {
+    let stalled = crate::monitor::dmesg_scx::parse_kmsg_window(&result.stderr)
+        .iter()
+        .any(|e| e.kind == crate::monitor::dmesg_scx::ScxExitKind::Stall);
+    if stalled && let Some(d) = capture_starvation_witness(result) {
+        return Err(post_vm_skip(format!(
+            "scx scheduler ejected by the guest sched_ext runnable-stall \
+             watchdog under witnessed host contention (D={d:.2}): the 5s stall \
+             timer measures GUEST time, which a descheduling host dilates into \
+             a false stall — the zero-activity reading is that ejection, not a \
+             scheduler regression; environmental non-verdict",
+        )));
+    }
+    Ok(())
+}
+
 /// Generic sub-minimum starvation skip: `Err(post_vm_skip(..))` when the
 /// run produced FEWER data-bearing units than the caller's assertion
 /// requires (`have < need`) AND [`capture_starvation_witness`] proves the
@@ -653,6 +687,39 @@ mod starvation_witness_tests {
         // fails with its own diagnosis (a capture-pipeline regression).
         let r = with_window(with_dilation(10, 1), 2, Some(1), Some(5));
         assert!(periodic_starvation_gate(&r, 1).is_ok());
+    }
+
+    /// stall_ejection_skip three-way: a watchdog Stall exit on a
+    /// CONTENDED host (D=3) is an environmental skip; the same Stall on a
+    /// QUIET host stays the caller's failure (Ok, so its `ensure!` fires);
+    /// a contended host with NO stall line is likewise the caller's to
+    /// fail — absence of the watchdog signature cannot launder a real
+    /// zero-activity regression.
+    #[test]
+    fn stall_ejection_skip_arms() {
+        const STALL: &str = "sched_ext: BPF scheduler \"scx_test\" disabled (runnable task stall)";
+
+        let contended_stall = VmResult {
+            stderr: STALL.into(),
+            ..with_dilation(10, 20)
+        };
+        let err = stall_ejection_skip(&contended_stall).expect_err("stall + contention must skip");
+        assert!(err.downcast_ref::<HostSkipRequest>().is_some());
+
+        let quiet_stall = VmResult {
+            stderr: STALL.into(),
+            ..with_dilation(10, 1)
+        };
+        assert!(
+            stall_ejection_skip(&quiet_stall).is_ok(),
+            "a stall on a quiet host is a real fail, not an environmental skip",
+        );
+
+        let contended_no_stall = with_dilation(10, 20);
+        assert!(
+            stall_ejection_skip(&contended_no_stall).is_ok(),
+            "contention without a watchdog stall line leaves the caller to fail",
+        );
     }
 
     /// The generic sub-minimum gate: `have < need` + (structural OR
