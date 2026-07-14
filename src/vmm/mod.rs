@@ -1103,14 +1103,28 @@ impl KtstrVm {
             }
         } else if self.performance_mode {
             if let Some(ref plan) = self.pinning_plan {
-                // Perf mode reserves a FIXED LLC set (LOCK_EX). Under
-                // `wait`, queue up and accumulate the set as head rather
-                // than skip; `wait == false` (interactive) keeps the
-                // single-shot behaviour.
+                // Perf mode reserves a FIXED set. The grain must MATCH the
+                // build-time reservation: whole-LLC `LOCK_EX` on validated
+                // small-LLC hosts, or per-CPU grain (shared LLC + per-CPU
+                // `LOCK_EX` over the plan's exact CPUs) on a host whose LLC
+                // dwarfs the cell. `perf_llc_lock_mode` is a pure function
+                // of the stored plan + host topology, so it re-derives the
+                // same mode `acquire_slot_with_locks` chose at build (the
+                // grain plan's per-LLC footprint still clears the ratio +
+                // floor). Without a cached host topology (degraded sysfs /
+                // cargo-test mode, where the acquire short-circuits anyway)
+                // fall back to whole-LLC Exclusive. Under `wait`, queue up
+                // and accumulate the set as head rather than skip; `wait ==
+                // false` (interactive) keeps the single-shot behaviour.
+                let llc_mode = self
+                    .host_topo
+                    .as_ref()
+                    .map(|ht| host_topology::perf_llc_lock_mode(ht, plan))
+                    .unwrap_or(host_topology::LlcLockMode::Exclusive);
                 match host_topology::acquire_resource_locks_waiting(
                     plan,
                     &plan.llc_indices,
-                    host_topology::LlcLockMode::Exclusive,
+                    llc_mode,
                     wait,
                 )? {
                     host_topology::LockOutcome::Acquired { locks, .. } => Ok(RunLocks {

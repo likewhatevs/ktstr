@@ -649,6 +649,118 @@ impl HostTopology {
         })
     }
 
+    /// Per-CPU-GRAIN perf placement: tile each occupied host LLC into
+    /// disjoint `(vcpus_per_llc + 1)`-CPU BLOCKS and map the guest onto
+    /// block index `block`.
+    ///
+    /// Block `b` in a host LLC owns CPUs
+    /// `[b*(V+1) .. b*(V+1)+V)` (V = `vcpus_per_llc`) as a contiguous,
+    /// cache-coherent vCPU window — the SAME topology-mirroring
+    /// [`Self::compute_pinning_at`] gives (each guest LLC's vCPUs stay a
+    /// coherent group inside one real host LLC; guest LLCs never
+    /// interleave or straddle a cache boundary). The guest's single
+    /// service CPU is the block's SPARE `+V` slot in the first occupied
+    /// host LLC, so it too lies INSIDE block `b`. Because every CPU a
+    /// block consumes — vCPUs AND service — is contained in that block,
+    /// DISTINCT block indices produce fully DISJOINT host-CPU sets: two
+    /// perf cells at different blocks take non-overlapping per-CPU
+    /// `LOCK_EX` sets and COEXIST under a shared (`LOCK_SH`) LLC lock.
+    ///
+    /// This is the placement half of the per-CPU-grain reservation (see
+    /// [`perf_llc_lock_mode`]) that unblocks perf-cell parallelism on a
+    /// host whose LLC DWARFS the cell — the AWS Graviton's single
+    /// 96-CPU L3 being the motivating case, where whole-LLC `LOCK_EX`
+    /// (the default [`Self::compute_pinning`] path) serializes EVERY
+    /// perf cell onto the whole machine. It exists as a SEPARATE method
+    /// rather than a `compute_pinning_at` flag precisely so the
+    /// whole-LLC-Exclusive placement the validated dilation campaign
+    /// measured stays byte-for-byte unchanged.
+    ///
+    /// Contrast [`Self::compute_pinning_at`], whose service CPU is the
+    /// global-first-free CPU (fine when the whole LLC is locked `LOCK_EX`,
+    /// but it would COLLIDE across grain blocks and break disjointness).
+    ///
+    /// Returns `TopologyInsufficient` when block `block` does not fit in
+    /// every occupied host LLC — the caller enumerating blocks treats
+    /// that as end-of-blocks (mirroring the `intra_offset` overflow in
+    /// [`Self::compute_pinning_at`]).
+    pub(crate) fn compute_pinning_grain(
+        &self,
+        topo: &super::topology::Topology,
+        block: usize,
+    ) -> Result<PinningPlan> {
+        let cores = topo.cores_per_llc;
+        let threads = topo.threads_per_core;
+        let llcs = topo.llcs;
+        let vcpus_per_llc = cores * threads;
+        // A block reserves V vCPUs + 1 service slot so the WHOLE cell
+        // footprint (including service) tiles at this stride and blocks
+        // never overlap — the property that lets disjoint-block cells
+        // coexist.
+        let block_size = vcpus_per_llc as usize + 1;
+
+        let num_llcs = self.llc_groups.len();
+        if llcs as usize > num_llcs {
+            return Err(anyhow::Error::new(TopologyInsufficient {
+                reason: format!(
+                    "performance_mode (per-CPU grain): need {llcs} LLCs for \
+                     {llcs} virtual LLCs, but host has {num_llcs} LLC groups"
+                ),
+            }));
+        }
+
+        // Distinct host LLCs per guest LLC (offset 0 — grain diversity
+        // comes from the BLOCK index within each LLC, not the LLC
+        // offset), so no two guest LLCs share a host LLC and the block
+        // windows never alias between guest LLCs.
+        let llc_order = self.numa_aware_llc_order(topo.numa_nodes, llcs, 0);
+        let block_start = block * block_size;
+
+        let mut assignments = Vec::with_capacity((llcs * vcpus_per_llc) as usize);
+        for llc in 0..llcs {
+            let llc_idx = llc_order[llc as usize];
+            let group = &self.llc_groups[llc_idx];
+            // The entire block (V vCPUs + the service slot) must fit in
+            // this host LLC's CPU list.
+            if group.cpus.len() < block_start + block_size {
+                return Err(anyhow::Error::new(TopologyInsufficient {
+                    reason: format!(
+                        "LLC group {} has {} CPUs, need block {} of size {} \
+                         (end {}) for virtual LLC {}",
+                        llc_idx,
+                        group.cpus.len(),
+                        block,
+                        block_size,
+                        block_start + block_size,
+                        llc,
+                    ),
+                }));
+            }
+            for vcpu_in_llc in 0..vcpus_per_llc {
+                let vcpu_id = llc * vcpus_per_llc + vcpu_in_llc;
+                let host_cpu = group.cpus[block_start + vcpu_in_llc as usize];
+                assignments.push((vcpu_id, host_cpu));
+            }
+        }
+
+        // Service CPU: the block's spare `+V` slot in the FIRST occupied
+        // host LLC — inside block `b`, so disjoint from every other
+        // block's footprint. The fit check above already reserved it.
+        let first_group = &self.llc_groups[llc_order[0]];
+        let service_cpu = Some(first_group.cpus[block_start + vcpus_per_llc as usize]);
+
+        let mut llc_indices = llc_order;
+        llc_indices.sort_unstable();
+        llc_indices.dedup();
+
+        Ok(PinningPlan {
+            assignments,
+            service_cpu,
+            llc_indices,
+            locks: Vec::new(),
+        })
+    }
+
     /// Build the virtual LLC to host LLC index mapping.
     ///
     /// Falls back to sequential offset mapping when any of these hold:
@@ -767,6 +879,111 @@ pub enum LlcLockMode {
     /// exclusive holder exists.
     #[allow(dead_code)]
     Shared,
+}
+
+/// Absolute lower bound, in host CPUs, on an LLC before perf-mode
+/// reservation may drop from whole-LLC exclusion to per-CPU grain.
+///
+/// This is the GUARD on the occupancy ratio below, not the decision
+/// axis itself. It is anchored ABOVE every validated host LLC — the
+/// dev box's 16-CPU L3s, x86 CI's (`scx-x64`) ~8-CPU L3s, and native
+/// arm's (`armly`) 4-CPU L2s — with margin, and far BELOW the
+/// pathological monolithic L3 the grain switch exists for (the AWS
+/// Graviton's single 96-CPU L3). Below this bar the reservation is
+/// ALWAYS whole-LLC [`LlcLockMode::Exclusive`], so the entire measured
+/// perf campaign (dilation_validation.md, the perf-isolation gates) is
+/// byte-for-byte unchanged on every host it was validated on.
+///
+/// Why a floor at all, when the author's model is a pure occupancy
+/// ratio: the real perf cells are SMALL (`cores = 2..4`, `threads = 1`
+/// → 2-4 vCPUs per LLC — see the `performance_mode` e2e fixtures), so on
+/// the dev box's 16-CPU L3 a cell occupies as little as `2/16 = 0.125`.
+/// A pure `>= 0.5`-occupancy gate (which assumes ~LLC-filling cells)
+/// would therefore reclassify the dev box AND x86 CI (`2/8 = 0.25`) to
+/// per-CPU grain and invalidate their measurements. The floor makes the
+/// ratio safe precisely because no validated host has an LLC anywhere
+/// near this size — 32 sits at 2× the largest validated LLC (16) and
+/// 1/3 of the Graviton's 96 — so the ratio only ever DECIDES on a
+/// genuinely monolithic cache domain, and the validated hosts are
+/// off-limits regardless of how small a cell they run.
+pub(crate) const PERF_GRAIN_LLC_MIN_CPUS: usize = 32;
+
+/// Maximum LLC OCCUPANCY (cell's per-LLC pinned CPUs ÷ host LLC CPUs) at
+/// which perf-mode still drops to per-CPU grain, expressed as an exact
+/// integer ratio to avoid float. A cell occupying `< 1/2` of the LLC is
+/// a minority slice: on a huge L3 its per-cell cache share is ample, and
+/// a per-CPU-grain neighbour is at most a comparable slice, so the
+/// perf-mode `D≈1` isolation contract still effectively holds (the
+/// dilation witness + the `D>1.5` perf-isolation gate catch any residual
+/// perturbation). A cell occupying `>= 1/2` of even a huge LLC wants the
+/// cache to itself — a neighbour would be a large fraction of its
+/// working set — so it keeps whole-LLC [`LlcLockMode::Exclusive`]
+/// regardless of the LLC's absolute size. This is the author's ratio
+/// gate; on our small cells it is trivially satisfied on the Graviton
+/// (`2/96 ≈ 0.02`) and only bites a hypothetical LLC-filling perf cell.
+const PERF_GRAIN_MAX_OCCUPANCY_NUM: usize = 1;
+const PERF_GRAIN_MAX_OCCUPANCY_DEN: usize = 2;
+
+/// Choose the LLC lock mode for a perf-mode reservation of `plan`.
+///
+/// The default perf-mode reservation is whole-LLC
+/// [`LlcLockMode::Exclusive`]: the cell owns its entire cache domain —
+/// the strongest isolation, and what the dilation campaign measured. On
+/// a host whose LLC DWARFS the cell (a single monolithic L3 spanning
+/// scores of CPUs — the AWS Graviton's 96-CPU L3), whole-LLC `LOCK_EX`
+/// means one small cell exclusively locks the WHOLE machine, so perf
+/// cells serialize globally (the 20-60× arm-CI makespan blowup). There
+/// we drop to per-CPU GRAIN: a SHARED (`LOCK_SH`) LLC lock so cells
+/// coexist on the giant L3, plus EXCLUSIVE per-CPU locks over exactly
+/// the pinned cores + service CPU — the SAME composition
+/// [`LlcLockMode::Shared`] already produces (`fixed_set_cpus` +
+/// `claim_for`), so the returned claim names the ACTUAL CPUs held, not
+/// the whole LLC, and peers see the freed capacity.
+///
+/// The switch requires BOTH gates, evaluated PER occupied host LLC and
+/// taken conservatively (any occupied LLC that is modest, or that the
+/// cell fills, keeps the WHOLE plan Exclusive):
+///
+/// 1. [`PERF_GRAIN_LLC_MIN_CPUS`] — the LLC is far larger than any
+///    validated CI/dev cache domain (the absolute guard that keeps
+///    every validated host on the unchanged whole-LLC path).
+/// 2. [`PERF_GRAIN_MAX_OCCUPANCY_NUM`]/[`PERF_GRAIN_MAX_OCCUPANCY_DEN`]
+///    — the cell occupies a minority (`< 1/2`) of that LLC (a cell that
+///    wants most of even a huge LLC keeps the whole L3).
+///
+/// On every validated host gate 1 fails (LLC ≤ 16 < 32), so this
+/// returns `Exclusive` there no matter how small the cell — behaviour
+/// is identical to the pre-change whole-LLC campaign.
+pub(crate) fn perf_llc_lock_mode(host_topo: &HostTopology, plan: &PinningPlan) -> LlcLockMode {
+    if plan.llc_indices.is_empty() {
+        return LlcLockMode::Exclusive;
+    }
+    // Per-host-LLC pinned footprint: vCPU assignments landing in the
+    // LLC, plus the service CPU if it lives there.
+    let footprint_in = |llc_idx: usize| -> usize {
+        let cpus = &host_topo.llc_groups[llc_idx].cpus;
+        let in_llc = |c: usize| cpus.contains(&c);
+        let vcpus = plan.assignments.iter().filter(|&&(_, c)| in_llc(c)).count();
+        vcpus + usize::from(plan.service_cpu.is_some_and(in_llc))
+    };
+    // Grain only when EVERY occupied host LLC is both huge and a
+    // minority-occupied slice — the fullest / smallest occupied LLC
+    // dominates the decision, so a plan touching one modest LLC stays
+    // Exclusive.
+    let all_grain = plan.llc_indices.iter().all(|&idx| {
+        let llc_cpus = host_topo.llc_groups[idx].cpus.len();
+        let footprint = footprint_in(idx);
+        let huge = llc_cpus >= PERF_GRAIN_LLC_MIN_CPUS;
+        // footprint / llc_cpus < NUM / DEN  ⇔  footprint*DEN < llc_cpus*NUM.
+        let minority = footprint.saturating_mul(PERF_GRAIN_MAX_OCCUPANCY_DEN)
+            < llc_cpus.saturating_mul(PERF_GRAIN_MAX_OCCUPANCY_NUM);
+        huge && minority
+    });
+    if all_grain {
+        LlcLockMode::Shared
+    } else {
+        LlcLockMode::Exclusive
+    }
 }
 
 /// Resource lock acquisition outcome.

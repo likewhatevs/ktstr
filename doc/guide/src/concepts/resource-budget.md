@@ -27,9 +27,53 @@ switches: `performance_mode` on the test or builder, and
 
 | Mode | Selected by | LLC lockfiles | Per-CPU lockfiles | Enforcement |
 |---|---|---|---|---|
-| Performance mode | `performance_mode = true` | exclusive (`LOCK_EX`), one per virtual LLC | none — the exclusive LLC lock covers its CPUs | vCPU pinning, RT scheduling, hugepages, NUMA mbind |
+| Performance mode | `performance_mode = true` | exclusive (`LOCK_EX`), one per virtual LLC — **or** shared (`LOCK_SH`) on a huge LLC (see below) | none — **or** exclusive (`LOCK_EX`) per pinned CPU on a huge LLC | vCPU pinning, RT scheduling, hugepages, NUMA mbind |
 | Budgeted (no-perf-mode) | `--no-perf-mode` / `KTSTR_NO_PERF_MODE` | shared (`LOCK_SH`) on the planned LLC set | none — the cgroup cpuset is the enforcement layer | cgroup v2 cpuset sandbox + soft affinity mask |
 | Default | neither | shared (`LOCK_SH`) on the 1:1 plan's LLCs | exclusive (`LOCK_EX`), one per assigned host CPU | none — reservation only |
+
+### Performance mode on a huge LLC: per-CPU grain
+
+Performance mode's default is whole-LLC exclusion — the cell owns its
+entire cache domain, the strongest isolation. That is right when the
+cell is a large fraction of its LLC (the validated hosts: the dev box's
+16-CPU L3s, x86 CI's ~8-CPU L3s, native arm's 4-CPU L2s, all running
+2-4-vCPU cells). It is pathological when the host presents ONE
+monolithic L3 spanning scores of CPUs: the AWS Graviton exposes a single
+96-CPU L3, so a 2-vCPU perf cell taking `LOCK_EX` on it exclusively locks
+the *whole machine*, and every perf cell serializes globally (a 20-60×
+makespan blowup versus a many-small-LLC x86 host).
+
+So when a host LLC **dwarfs** the cell, performance mode reserves at
+**per-CPU grain** instead: a *shared* (`LOCK_SH`) lock on the giant LLC
+so cells coexist on it, plus *exclusive* (`LOCK_EX`) per-CPU locks over
+exactly the cell's pinned cores and service CPU. Each cell is placed on a
+disjoint, cache-coherent block of the L3 (`vcpus_per_llc + 1` contiguous
+CPUs, service CPU included, so distinct blocks never overlap), and the
+published claim names those actual CPUs — so peers see the freed capacity
+and disjoint perf cells run in parallel. On a 96-CPU L3 a few-CPU
+neighbour perturbs the cell's cache share negligibly, so the `D≈1`
+isolation contract still effectively holds; the dilation witness and the
+`D>1.5` perf-isolation gate catch any residual perturbation.
+
+The switch is gated by two conditions, evaluated per occupied host LLC:
+
+1. **Absolute floor** — the LLC has at least 32 CPUs. This is set
+   comfortably above every validated host's LLC (≤ 16) and well below
+   the Graviton's 96, so *below the floor the reservation is always
+   whole-LLC exclusive* and the measured perf campaign is unchanged on
+   every host it was validated on. The floor is what makes the ratio
+   below safe: the real perf cells are small (2-4 vCPUs), so on a 16-CPU
+   dev-box L3 a cell occupies as little as `2/16 = 0.125` — a pure
+   occupancy ratio alone would misclassify the validated hosts.
+2. **Occupancy ratio** — the cell occupies less than half of that LLC.
+   A cell wanting most of even a huge L3 genuinely needs the cache to
+   itself and keeps whole-LLC exclusion regardless of absolute size.
+
+Both must hold on *every* LLC the plan touches; one modest or
+cell-filling LLC keeps the whole plan exclusive. Per-CPU-grain perf cells
+flow through the same acquisition queue and claim protocol as every other
+reservation (see below) — a queued grain cell holds nothing, and its head
+partials are the plan's exact per-CPU locks.
 
 Lockfiles live at `{KTSTR_LOCK_DIR or /tmp}/ktstr-llc-{N}.lock` and
 `{KTSTR_LOCK_DIR or /tmp}/ktstr-cpu-{C}.lock`. The modes compose:

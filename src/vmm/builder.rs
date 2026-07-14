@@ -1708,6 +1708,47 @@ fn acquire_slot_with_locks(
     host_topo: &host_topology::HostTopology,
     topo: &topology::Topology,
 ) -> Result<host_topology::PinningPlan> {
+    // Grain decision from the offset-0 mapping, which doubles as the
+    // host-fits gate: a `TopologyInsufficient` here is the host-too-small
+    // case → `PerfModeUnavailable` (the isolation guarantee cannot be
+    // honored; a SKIP by default, hard FAIL under `KTSTR_NO_SKIP_MODE`).
+    // The grain (whole-LLC-Exclusive vs per-CPU) is a function of host-LLC
+    // size vs the cell's per-LLC vCPU footprint — constant across LLC
+    // offsets on a homogeneous host — so one probe settles it for the
+    // whole scan. The two branches below re-probe as needed; this probe's
+    // only lasting output is the mode.
+    let base = match host_topo.compute_pinning(topo, true, 0) {
+        Ok(c) => c,
+        Err(e)
+            if e.downcast_ref::<host_topology::TopologyInsufficient>()
+                .is_some() =>
+        {
+            return Err(anyhow::Error::new(host_topology::PerfModeUnavailable {
+                reason: format!("performance_mode: {e:#}"),
+            }));
+        }
+        Err(e) => return Err(e).context("performance_mode: topology mapping"),
+    };
+
+    match host_topology::perf_llc_lock_mode(host_topo, &base) {
+        // Host LLC dwarfs the cell (e.g. the Graviton's 96-CPU L3):
+        // reserve at per-CPU grain so disjoint perf cells coexist.
+        host_topology::LlcLockMode::Shared => acquire_grain_slot_with_locks(host_topo, topo),
+        // Validated small-LLC hosts (dev box, x86 CI, native arm): the
+        // unchanged whole-LLC-Exclusive reservation the dilation campaign
+        // measured.
+        host_topology::LlcLockMode::Exclusive => acquire_exclusive_slot_with_locks(host_topo, topo),
+    }
+}
+
+/// Whole-LLC-Exclusive perf reservation — the historical path, unchanged.
+/// Scans LLC offsets, taking `LOCK_EX` on the whole LLC set; on all-busy
+/// hands the first mappable candidate (no locks) to the run path, which
+/// queues for its `llc_indices`.
+fn acquire_exclusive_slot_with_locks(
+    host_topo: &host_topology::HostTopology,
+    topo: &topology::Topology,
+) -> Result<host_topology::PinningPlan> {
     let num_llcs = host_topo.llc_groups.len();
     let llcs_needed = topo.llcs as usize;
     let max_slots = num_llcs.checked_div(llcs_needed).unwrap_or(num_llcs).max(1);
@@ -1767,6 +1808,83 @@ fn acquire_slot_with_locks(
          the run will queue for offset {} via the lock-dir acquisition \
          queue",
         plan.llc_indices.first().copied().unwrap_or(0),
+    );
+    Ok(plan)
+}
+
+/// Per-CPU-GRAIN perf reservation — the huge-LLC path. Enumerates
+/// disjoint `(vcpus_per_llc + 1)`-CPU grain BLOCKS
+/// ([`host_topology::HostTopology::compute_pinning_grain`]) and takes,
+/// per block, a SHARED (`LOCK_SH`) LLC lock plus per-CPU `LOCK_EX` over
+/// exactly the block's cores + service CPU (the [`LlcLockMode::Shared`]
+/// composition). Because distinct blocks are disjoint by construction,
+/// two perf cells on different blocks acquire non-overlapping per-CPU
+/// sets and COEXIST on the shared LLC — the parallelism that whole-LLC
+/// `LOCK_EX` denies on a monolithic L3.
+///
+/// Block probing is pid-ROTATED so simultaneously-launched cells start
+/// on DIFFERENT blocks instead of all bouncing on block 0's per-CPU
+/// locks (mirrors the default run path's intra-slot rotation). On
+/// all-busy it hands the first mappable block (no locks) to the run
+/// path, which queues for that block's exact CPUs via the acquisition
+/// queue — identical contract to the exclusive path, at CPU granularity.
+fn acquire_grain_slot_with_locks(
+    host_topo: &host_topology::HostTopology,
+    topo: &topology::Topology,
+) -> Result<host_topology::PinningPlan> {
+    let llc_mode = host_topology::LlcLockMode::Shared;
+
+    // Enumerate every grain block that fits (block windows shrink the
+    // available CPUs by one `(V+1)` stride each — `compute_pinning_grain`
+    // returns `TopologyInsufficient` past the last, our end-of-blocks
+    // signal). Block 0 mapped in the caller's grain probe, so non-empty.
+    let mut blocks: Vec<host_topology::PinningPlan> = Vec::new();
+    for block in 0.. {
+        match host_topo.compute_pinning_grain(topo, block) {
+            Ok(c) => blocks.push(c),
+            Err(_) => break,
+        }
+    }
+
+    // pid-rotate the probe order so concurrent cells fan across blocks.
+    let start = host_topology::pid_window_offset(std::process::id(), blocks.len().max(1));
+    let order: Vec<usize> = (0..blocks.len())
+        .map(|i| (start + i) % blocks.len())
+        .collect();
+
+    let mut first_mappable: Option<host_topology::PinningPlan> = None;
+    for &bi in &order {
+        let candidate = blocks[bi].clone_unlocked();
+        match host_topology::acquire_resource_locks(&candidate, &candidate.llc_indices, llc_mode)? {
+            host_topology::LockOutcome::Acquired { locks, .. } => {
+                let mut plan = candidate;
+                plan.locks = locks;
+                eprintln!(
+                    "performance_mode: reserved per-CPU-grain block {} of {} \
+                     on host LLC(s) {:?} (LLC dwarfs the cell; cells coexist \
+                     via shared LLC + exclusive per-CPU locks)",
+                    bi,
+                    blocks.len(),
+                    plan.llc_indices,
+                );
+                return Ok(plan);
+            }
+            host_topology::LockOutcome::Unavailable(_) => {
+                if first_mappable.is_none() {
+                    first_mappable = Some(candidate);
+                }
+            }
+        }
+    }
+
+    let plan = first_mappable
+        .expect("grain enumeration yields at least block 0 — the caller's probe mapped it");
+    let cpus: Vec<usize> = plan.assignments.iter().map(|&(_, c)| c).collect();
+    eprintln!(
+        "performance_mode: all {} per-CPU-grain blocks busy at build time; \
+         the run will queue for block CPUs {:?} via the acquisition queue",
+        blocks.len(),
+        cpus,
     );
     Ok(plan)
 }
