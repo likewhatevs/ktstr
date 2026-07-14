@@ -1922,6 +1922,28 @@ pub(crate) fn lz4_legacy_compress(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A SHM segment hash unique to THIS test process. Every SHM segment
+/// name (`shm_segment_name` / `shm_lz4_segment_name`) derives solely
+/// from its hash, and the colocated CI runner units share one
+/// `/dev/shm`; a fixed test hash lets a concurrent copy of the same
+/// test store, overwrite, or unlink the segment out from under this one
+/// — observed as `shm_load_base` returning `None` for a hash just
+/// stored. Mixing the PID — and a nanosecond clock, in case runner
+/// units share a PID namespace with recycled PIDs — gives each process
+/// its own segment namespace while still exercising the real
+/// store/load/unlink contract. `salt` separates the several segments a
+/// single test (or in-process `cargo test` peers) may use: distinct
+/// salts always yield distinct hashes, independent of the clock.
+#[cfg(test)]
+pub(crate) fn unique_test_shm_hash(salt: u64) -> u64 {
+    let pid = std::process::id() as u64;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    (pid.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ nanos) ^ salt
+}
+
 #[cfg(test)]
 #[path = "initramfs_tests.rs"]
 mod tests;
