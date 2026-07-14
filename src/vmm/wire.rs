@@ -639,6 +639,23 @@ pub const MSG_TYPE_LIFECYCLE: u32 = 0x4c49_4645; // "LIFE"
 /// values are final regardless of KASLR configuration.
 pub const MSG_TYPE_KERN_ADDRS: u32 = 0x4b41_4452; // "KADR"
 
+/// Guest→host: the running kernel's GNU build-id (from
+/// `/sys/kernel/notes`, `NT_GNU_BUILD_ID`), sent so the host can prove
+/// the vmlinux it is deriving symbols/offsets from is the SAME BUILD as
+/// the booted kernel. A stale/mismatched cache entry (a vmlinux whose
+/// struct layout or symbol addresses differ from the running Image)
+/// otherwise makes every host-side introspection read silent garbage
+/// with no error — see the host-side comparison in `freeze_coord`. The
+/// payload is the raw build-id bytes (typically a 20-byte SHA-1, capped
+/// at [`KERN_BUILD_ID_MAX`]); empty when the guest could not read it
+/// (the host then skips the check rather than false-failing).
+pub const MSG_TYPE_KERN_BUILD_ID: u32 = 0x4b42_4944; // "KBID"
+
+/// Upper bound on a GNU build-id payload. The `--build-id` styles the
+/// kernel uses are `sha1` (20 bytes) and `md5`/`uuid` (16); 64 leaves
+/// generous headroom for any future style without an unbounded read.
+pub const KERN_BUILD_ID_MAX: usize = 64;
+
 /// Typed payload for [`MSG_TYPE_KERN_ADDRS`].
 ///
 /// Three u64 fields published by the guest at boot so the host can

@@ -258,6 +258,15 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// Only advanced on `msg.crc_ok` frames — a torn or hostile-guest
     /// frame must not forge stage progress.
     pub progress_ledger: Option<&'a crate::monitor::ProgressLedger>,
+    /// The host vmlinux's GNU build-id, compared against the booted
+    /// kernel's build-id in the `MSG_TYPE_KERN_BUILD_ID` arm. `None`
+    /// (the vmlinux carried no note, or none was resolved) disables the
+    /// check — an absent expectation never fails a run. On a POSITIVE
+    /// mismatch the arm emits a loud `ktstr: FATAL:` diagnostic naming
+    /// both build-ids, so a stale/mismatched kernel-cache entry surfaces
+    /// as a clear "this vmlinux is not the booted kernel" signal instead
+    /// of downstream garbage offset reads.
+    pub expected_kernel_build_id: Option<&'a [u8]>,
 }
 
 /// Advance the shared lifecycle ledger to `stage`, stamping the frame's
@@ -534,6 +543,32 @@ pub(super) fn dispatch_bulk_message(
                 sinks
                     .sched_swap_notify
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            None
+        }
+        _ if msg.msg_type == crate::vmm::wire::MSG_TYPE_KERN_BUILD_ID => {
+            // The booted kernel's GNU build-id (payload) vs the vmlinux
+            // ktstr introspects (`expected_kernel_build_id`). Only a
+            // POSITIVE mismatch — both present and different — latches the
+            // fault; an absent expectation, an empty payload, or a torn
+            // frame leaves the flag clear so a valid run is never failed.
+            if msg.crc_ok
+                && !msg.payload.is_empty()
+                && let Some(expected) = sinks.expected_kernel_build_id
+                && &*msg.payload != expected
+            {
+                let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+                eprintln!(
+                    "ktstr: FATAL: booted-kernel build-id {} does not match the \
+                     vmlinux ktstr is introspecting ({}) — the kernel-cache \
+                     entry is STALE/MISMATCHED: this vmlinux is a different build \
+                     than the running Image, so every host-side symbol/offset \
+                     read this run is garbage. Delete the offending kernel-cache \
+                     entry (its dir under the ktstr kernel cache) and re-run to \
+                     rebuild a consistent Image+vmlinux pair.",
+                    hex(msg.payload.as_ref()),
+                    hex(expected),
+                );
             }
             None
         }
@@ -1251,6 +1286,7 @@ mod stage_tests {
                 run_start: self.run_start,
                 current_step: &self.current_step,
                 progress_ledger: Some(&self.ledger),
+                expected_kernel_build_id: None,
             }
         }
 

@@ -2481,10 +2481,20 @@ impl KtstrVm {
         // KVAs back distinct derivations that produce identical
         // offsets — guaranteeing the two writers don't race on
         // different values.
+        let host_vmlinux_path: Option<std::path::PathBuf> = find_vmlinux(&self.kernel);
+        let host_vmlinux_artifacts = host_vmlinux_path
+            .as_ref()
+            .and_then(|p| super::vmlinux::cached_vmlinux_artifacts(p));
         let host_kernel_symbols: Option<crate::monitor::symbols::KernelSymbols> =
-            find_vmlinux(&self.kernel)
-                .and_then(|p| super::vmlinux::cached_vmlinux_artifacts(&p))
-                .map(|a| a.symbols.clone());
+            host_vmlinux_artifacts.as_ref().map(|a| a.symbols.clone());
+        // This vmlinux's GNU build-id — compared in the KERN_BUILD_ID
+        // dispatch arm against the booted kernel's build-id to catch a
+        // stale/mismatched cache entry before its symbols/offsets
+        // silently mis-read guest memory. `None` (no note) disables the
+        // check.
+        let host_vmlinux_build_id: Option<Vec<u8>> = host_vmlinux_artifacts
+            .as_ref()
+            .and_then(|a| a.build_id.clone());
         let kernel_text_link_kva: u64 = host_kernel_symbols
             .as_ref()
             .and_then(|s| s.kernel_text_kva)
@@ -2515,6 +2525,9 @@ impl KtstrVm {
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let kern_addrs_frames_for_coord = kern_addrs_frames.clone();
         let kern_addrs_crc_bad_for_coord = kern_addrs_crc_bad.clone();
+        // Expected (vmlinux) build-id moved into the coord dispatch
+        // closure for the KERN_BUILD_ID consistency check.
+        let host_vmlinux_build_id_for_coord = host_vmlinux_build_id.clone();
         // Unknown-msg_type frame counter (the header-outside-CRC probe —
         // see `BulkDispatchSinks::unknown_type_frames`).
         let unknown_type_frames: Arc<std::sync::atomic::AtomicU64> =
@@ -4918,6 +4931,8 @@ impl KtstrVm {
                                         progress_ledger: Some(
                                             progress_ledger_for_coord.as_ref(),
                                         ),
+                                        expected_kernel_build_id:
+                                            host_vmlinux_build_id_for_coord.as_deref(),
                                     };
                                     for msg in &drained.messages {
                                         if let Some(entry) =

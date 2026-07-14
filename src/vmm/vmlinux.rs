@@ -139,6 +139,33 @@ pub(crate) struct VmlinuxArtifacts {
     /// `.artifacts` sidecar on a cross-process hit) instead of a second
     /// full `std::fs::read` + IKCONFIG scan of the ELF.
     pub guest_hz: Option<u64>,
+    /// This vmlinux's GNU build-id (`.note.gnu.build-id`), or `None` when
+    /// the note is absent. Compared host-side against the booted kernel's
+    /// build-id (published by the guest via `MSG_TYPE_KERN_BUILD_ID`) to
+    /// catch a stale/mismatched cache entry — a vmlinux whose layout or
+    /// symbol addresses differ from the running Image — before its
+    /// offsets silently mis-read guest memory. A pure function of the ELF
+    /// bytes, so it rides the same parse + sidecar as `symbols`.
+    pub build_id: Option<Vec<u8>>,
+}
+
+/// Extract the GNU build-id (`NT_GNU_BUILD_ID`, owner `"GNU"`) from a
+/// parsed vmlinux ELF's note headers. `None` when the note is absent
+/// (a build without `--build-id`) or unreadable.
+fn extract_vmlinux_build_id(elf: &goblin::elf::Elf, data: &[u8]) -> Option<Vec<u8>> {
+    const NT_GNU_BUILD_ID: u32 = 3;
+    let notes = elf.iter_note_headers(data)?;
+    for note in notes.flatten() {
+        if note.n_type == NT_GNU_BUILD_ID && note.name == "GNU" {
+            // Truncate to the same cap the guest applies to its published
+            // build-id ([`crate::vmm::wire::KERN_BUILD_ID_MAX`]) so a
+            // build-id longer than the cap compares equal on both sides
+            // instead of spuriously mismatching.
+            let end = note.desc.len().min(crate::vmm::wire::KERN_BUILD_ID_MAX);
+            return Some(note.desc[..end].to_vec());
+        }
+    }
+    None
 }
 
 /// The monitor-only subset of [`VmlinuxArtifacts`]: the BTF-backed
@@ -176,10 +203,12 @@ fn parse_vmlinux_artifacts(data: &[u8], path: &Path) -> Option<VmlinuxArtifacts>
     // scheduler symbols and vice versa, so a failed scan just yields
     // `None` (guest_kernel_hz then falls back to its .config paths).
     let guest_hz = crate::monitor::hz_from_vmlinux_bytes(data);
+    let build_id = extract_vmlinux_build_id(&elf, data);
     Some(VmlinuxArtifacts {
         symbols,
         monitor,
         guest_hz,
+        build_id,
     })
 }
 
@@ -197,7 +226,7 @@ fn parse_vmlinux_artifacts(data: &[u8], path: &Path) -> Option<VmlinuxArtifacts>
 /// mtime freshness rule covers vmlinux changes; only ktstr-version
 /// layout drift needs this tag.)
 const ARTIFACTS_SIDECAR_VERSION: &str =
-    concat!("ktstr-vmlinux-artifacts-v1 ", env!("CARGO_PKG_VERSION"));
+    concat!("ktstr-vmlinux-artifacts-v2 ", env!("CARGO_PKG_VERSION"));
 
 /// Plain-old-data mirror of the derived half of [`VmlinuxArtifacts`],
 /// serialized to the `<vmlinux>.artifacts` sidecar via postcard.
@@ -222,6 +251,8 @@ struct ArtifactsSidecar {
     prog_offsets: Option<crate::monitor::btf_offsets::BpfProgOffsets>,
     psi_offsets: Option<crate::monitor::btf_offsets::PsiGroupOffsets>,
     guest_hz: Option<u64>,
+    /// Mirror of [`VmlinuxArtifacts::build_id`].
+    build_id: Option<Vec<u8>>,
 }
 
 /// Sidecar path for a vmlinux: append `.artifacts` to the filename so
@@ -292,6 +323,7 @@ fn load_artifacts_sidecar(canon: &Path) -> Option<VmlinuxArtifacts> {
         prog_offsets,
         psi_offsets,
         guest_hz,
+        build_id,
     } = decoded;
     let monitor = match offsets {
         Some(offsets) => {
@@ -314,6 +346,7 @@ fn load_artifacts_sidecar(canon: &Path) -> Option<VmlinuxArtifacts> {
         symbols,
         monitor,
         guest_hz,
+        build_id,
     })
 }
 
@@ -332,6 +365,7 @@ fn write_artifacts_sidecar(sidecar: &Path, artifacts: &VmlinuxArtifacts) {
             .and_then(|m| m.prog_offsets.clone()),
         psi_offsets: artifacts.monitor.as_ref().and_then(|m| m.psi_offsets),
         guest_hz: artifacts.guest_hz,
+        build_id: artifacts.build_id.clone(),
     };
     let bytes = match postcard::to_allocvec(&payload) {
         Ok(b) => b,
@@ -859,6 +893,7 @@ mod tests {
             symbols: synthetic_symbols(),
             monitor: None,
             guest_hz: Some(1000),
+            build_id: None,
         };
         let sidecar = artifacts_sidecar_path(&canon);
         write_artifacts_sidecar(&sidecar, &original);
@@ -896,6 +931,7 @@ mod tests {
             prog_offsets: None,
             psi_offsets: None,
             guest_hz: Some(250),
+            build_id: None,
         };
         let bytes = postcard::to_allocvec(&payload).unwrap();
         atomic_write_sidecar(&artifacts_sidecar_path(&canon), &bytes).unwrap();
@@ -926,6 +962,7 @@ mod tests {
             symbols: synthetic_symbols(),
             monitor: None,
             guest_hz: Some(1000),
+            build_id: None,
         };
         let sidecar = artifacts_sidecar_path(&canon);
         write_artifacts_sidecar(&sidecar, &original);
@@ -970,6 +1007,7 @@ mod tests {
             prog_offsets: Some(synthetic_prog_offsets()),
             psi_offsets: Some(synthetic_psi_offsets()),
             guest_hz: Some(1000),
+            build_id: None,
         };
         let encoded = postcard::to_allocvec(&payload).unwrap();
         let decoded: ArtifactsSidecar = postcard::from_bytes(&encoded).unwrap();

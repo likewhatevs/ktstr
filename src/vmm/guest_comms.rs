@@ -761,6 +761,121 @@ pub fn send_kern_addrs(addrs: &super::wire::KernAddrs) -> bool {
     write_msg(super::wire::MSG_TYPE_KERN_ADDRS, &payload)
 }
 
+/// Send the running kernel's GNU build-id to the host
+/// (`MSG_TYPE_KERN_BUILD_ID`). Returns whether the frame was written
+/// (`false` on an empty build-id or a closed port). Empty is a benign
+/// "could not read" — the host skips the cache-consistency check rather
+/// than treating an absent build-id as a mismatch.
+pub fn send_kern_build_id(build_id: &[u8]) -> bool {
+    if build_id.is_empty() {
+        return false;
+    }
+    write_msg(super::wire::MSG_TYPE_KERN_BUILD_ID, build_id)
+}
+
+/// Read the running kernel's GNU build-id from `/sys/kernel/notes`.
+///
+/// `/sys/kernel/notes` exposes the raw bytes of the kernel image's
+/// `SHT_NOTE` sections. Walk the ELF-note records (each
+/// `namesz|descsz|type` header + 4-byte-aligned name + 4-byte-aligned
+/// desc) and return the descriptor of the `NT_GNU_BUILD_ID` (type 3)
+/// note whose owner name is `"GNU"`. Returns `None` when sysfs is
+/// absent, the file is unreadable, or no build-id note is present — the
+/// caller treats that as "no publish", and the host skips its check.
+/// The descriptor is truncated to `KERN_BUILD_ID_MAX` defensively.
+pub fn read_kernel_build_id() -> Option<Vec<u8>> {
+    let bytes = std::fs::read("/sys/kernel/notes").ok()?;
+    parse_gnu_build_id_note(&bytes)
+}
+
+/// Pure ELF-note walk over a `SHT_NOTE` blob (native endianness, the
+/// only layout `/sys/kernel/notes` exposes): return the descriptor of
+/// the first `NT_GNU_BUILD_ID` (type 3) note owned by `"GNU"`, truncated
+/// to [`super::wire::KERN_BUILD_ID_MAX`]. `None` on absence or a
+/// malformed/truncated record. Split out from [`read_kernel_build_id`]
+/// so the parse is unit-testable without a live sysfs.
+fn parse_gnu_build_id_note(bytes: &[u8]) -> Option<Vec<u8>> {
+    const NT_GNU_BUILD_ID: u32 = 3;
+    let align4 = |n: usize| n.div_ceil(4) * 4;
+    let mut off = 0usize;
+    while off + 12 <= bytes.len() {
+        let namesz = u32::from_ne_bytes(bytes[off..off + 4].try_into().ok()?) as usize;
+        let descsz = u32::from_ne_bytes(bytes[off + 4..off + 8].try_into().ok()?) as usize;
+        let ntype = u32::from_ne_bytes(bytes[off + 8..off + 12].try_into().ok()?);
+        let name_off = off + 12;
+        let desc_off = name_off + align4(namesz);
+        let next = desc_off + align4(descsz);
+        // Malformed/over-long record: stop rather than risk a runaway
+        // or an out-of-bounds slice on a truncated read.
+        if next > bytes.len() || next <= off {
+            break;
+        }
+        if ntype == NT_GNU_BUILD_ID
+            && namesz >= 3
+            && &bytes[name_off..name_off + 3] == b"GNU"
+            && descsz > 0
+        {
+            let end = desc_off + descsz.min(super::wire::KERN_BUILD_ID_MAX);
+            return Some(bytes[desc_off..end].to_vec());
+        }
+        off = next;
+    }
+    None
+}
+
+#[cfg(test)]
+mod build_id_tests {
+    use super::parse_gnu_build_id_note;
+
+    /// Encode one ELF note (native-endian header + 4-byte-aligned name
+    /// and desc), matching the `/sys/kernel/notes` layout.
+    fn note(name: &[u8], ntype: u32, desc: &[u8]) -> Vec<u8> {
+        let pad = |v: &mut Vec<u8>| {
+            while !v.len().is_multiple_of(4) {
+                v.push(0)
+            }
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(&(name.len() as u32).to_ne_bytes());
+        out.extend_from_slice(&(desc.len() as u32).to_ne_bytes());
+        out.extend_from_slice(&ntype.to_ne_bytes());
+        out.extend_from_slice(name);
+        pad(&mut out);
+        out.extend_from_slice(desc);
+        pad(&mut out);
+        out
+    }
+
+    #[test]
+    fn extracts_gnu_build_id_and_skips_other_notes() {
+        let id = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03];
+        let mut blob = note(b"GNU\0", 1, b"other"); // wrong type, skipped
+        blob.extend(note(b"Linux\0\0\0", 3, b"xxxx")); // right type, wrong owner
+        blob.extend(note(b"GNU\0", 3, &id)); // the real build-id
+        assert_eq!(parse_gnu_build_id_note(&blob).as_deref(), Some(&id[..]));
+    }
+
+    #[test]
+    fn none_when_absent_or_truncated() {
+        assert_eq!(parse_gnu_build_id_note(&[]), None);
+        assert_eq!(parse_gnu_build_id_note(&note(b"GNU\0", 1, b"x")), None);
+        // A header claiming a desc longer than the blob is rejected, not
+        // read out of bounds.
+        let mut torn = 4u32.to_ne_bytes().to_vec(); // namesz
+        torn.extend_from_slice(&999u32.to_ne_bytes()); // descsz (overlong)
+        torn.extend_from_slice(&3u32.to_ne_bytes()); // NT_GNU_BUILD_ID
+        torn.extend_from_slice(b"GNU\0");
+        assert_eq!(parse_gnu_build_id_note(&torn), None);
+    }
+
+    #[test]
+    fn caps_overlong_build_id() {
+        let long = vec![0xab; crate::vmm::wire::KERN_BUILD_ID_MAX + 16];
+        let got = parse_gnu_build_id_note(&note(b"GNU\0", 3, &long)).unwrap();
+        assert_eq!(got.len(), crate::vmm::wire::KERN_BUILD_ID_MAX);
+    }
+}
+
 /// Read the runtime virtual address of `_text` (the kernel image
 /// start symbol) from `/proc/kallsyms`.
 ///

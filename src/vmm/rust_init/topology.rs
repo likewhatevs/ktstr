@@ -337,6 +337,12 @@ pub(crate) fn send_sys_rdy_with_retry(
 
     let mut kern_addrs_sent = false;
     let mut first_attempt_logged = false;
+    // The booted kernel's build-id, read once (a boot constant). Sent
+    // best-effort alongside KERN_ADDRS so the host can prove the vmlinux
+    // it introspects is the same build as this running kernel; an empty
+    // read (no sysfs / no note) simply skips the host-side check.
+    let build_id = crate::vmm::guest_comms::read_kernel_build_id().unwrap_or_default();
+    let mut build_id_sent = build_id.is_empty();
     loop {
         #[cfg(test)]
         SEND_SYS_RDY_RETRY_ITERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -368,6 +374,13 @@ pub(crate) fn send_sys_rdy_with_retry(
                         );
                     }
                     kern_addrs_sent = crate::vmm::guest_comms::send_kern_addrs(kern_addrs);
+                    // Publish the build-id once the port is writable (same
+                    // gate as KERN_ADDRS). Best-effort: a failed write just
+                    // retries next iteration; the host skips its check if it
+                    // never arrives.
+                    if !build_id_sent {
+                        build_id_sent = crate::vmm::guest_comms::send_kern_build_id(&build_id);
+                    }
                     // Send-side breadcrumb (port-independent serial channel —
                     // see `console_breadcrumb`): the first attempt's outcome,
                     // once. A field run with the wire + dispatcher exonerated
