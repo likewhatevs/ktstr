@@ -135,9 +135,7 @@ fn assert_phase_map_ext_pipeline(result: &VmResult) -> Result<()> {
     // through to the assertion's specific diagnosis below.
     let both_steps = synthetic_frac.contains_key(&Phase::step(0))
         && synthetic_frac.contains_key(&Phase::step(1));
-    if !both_steps
-        && let Some(d) = ktstr::prelude::capture_starvation_witness(result)
-    {
+    if !both_steps && let Some(d) = ktstr::prelude::capture_starvation_witness(result) {
         return Err(ktstr::prelude::post_vm_skip(format!(
             "periodic captures populated only one Step bucket under \
              witnessed host contention (D={d:.2}, step0={}, step1={}): \
