@@ -123,15 +123,37 @@ fn assert_phase_map_ext_pipeline(result: &VmResult) -> Result<()> {
         }
     }
 
-    // PhaseMapExt::ratio_across_phases lands the verdict. This test
-    // self-zips both Step(0) and Step(1) (asserted above), so both
-    // phases are populated and the comparator takes the ratio path: a
-    // pass info note when the ratio is within the ceiling, or a
-    // failure detail when it exceeds the ceiling / is non-finite. (A
-    // genuinely missing phase would record an Inconclusive — neither
-    // an info note nor a failure detail — but the populated self-zip
-    // rules that out.) Pin that EITHER a pass note OR a failure detail
-    // mentioning the label landed, proving the comparator ran.
+    // ratio_across_phases takes the two-phase ratio path only when BOTH
+    // Step(0) and Step(1) are populated; a missing phase records an
+    // Inconclusive (neither an info note nor a failure detail), which the
+    // assertion below reads as "the chain didn't fire". The
+    // periodic_starvation_gate above only floors the TOTAL capture count,
+    // so a starved run whose few captures all landed in one Step passes
+    // the gate yet leaves the other Step empty. Under witnessed host
+    // contention that skew is environmental, not a comparator regression
+    // — SKIP. On a quiet host a missing phase is a real bug and falls
+    // through to the assertion's specific diagnosis below.
+    let both_steps = synthetic_frac.contains_key(&Phase::step(0))
+        && synthetic_frac.contains_key(&Phase::step(1));
+    if !both_steps
+        && let Some(d) = ktstr::prelude::capture_starvation_witness(result)
+    {
+        return Err(ktstr::prelude::post_vm_skip(format!(
+            "periodic captures populated only one Step bucket under \
+             witnessed host contention (D={d:.2}, step0={}, step1={}): \
+             ratio_across_phases cannot take the two-phase ratio path — \
+             environmental non-verdict",
+            synthetic_frac.contains_key(&Phase::step(0)),
+            synthetic_frac.contains_key(&Phase::step(1)),
+        )));
+    }
+
+    // PhaseMapExt::ratio_across_phases lands the verdict. With both
+    // Step(0) and Step(1) populated the comparator takes the ratio path:
+    // a pass info note when the ratio is within the ceiling, or a
+    // failure detail when it exceeds the ceiling / is non-finite. Pin
+    // that EITHER a pass note OR a failure detail mentioning the label
+    // landed, proving the comparator ran.
     let mut verdict = Verdict::new();
     synthetic_frac
         .ratio_across_phases(
