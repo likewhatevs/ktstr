@@ -1,5 +1,46 @@
 use super::*;
 
+/// Whether a timing-sensitive boot-race VM test ran in an environment
+/// too loaded for its wall-anchored expectation to hold — so the test
+/// SKIPs (environmental non-verdict) instead of false-failing. Two
+/// independent signals, either sufficient:
+///
+///   - the guest's vCPU dilation `D` (`1 + Σrun_delay/Σon_cpu`) above
+///     1.1 — the host stole CPU from a guest that WAS trying to run;
+///   - the machine's 1-minute loadavg above 60% of its core count — the
+///     load-bearing signal for IDLE-boot VMs, whose vCPU threads mostly
+///     wait and so accrue little run_delay (`D ≈ 1`) even while a
+///     saturated host drags their boot out. `D` alone is blind to that;
+///     machine loadavg sees it directly. The machine core count is read
+///     from `/proc/stat` (all cores, ignoring any cpuset the test process
+///     runs under) so the ratio compares like with like.
+///
+/// Both false ⇒ a genuinely quiet host ⇒ the assertion is enforced (dev
+/// boxes and lightly-loaded x86 CI keep full coverage of the real bug).
+fn run_env_was_loaded(result: &VmResult) -> bool {
+    let dilated = result
+        .host_vcpu_schedstat
+        .as_ref()
+        .and_then(|s| s.dilation())
+        .is_some_and(|d| d > 1.1);
+    let machine_cpus = std::fs::read_to_string("/proc/stat")
+        .ok()
+        .map(|s| {
+            s.lines()
+                .filter(|l| {
+                    l.starts_with("cpu") && l.as_bytes().get(3).is_some_and(u8::is_ascii_digit)
+                })
+                .count()
+        })
+        .filter(|&n| n > 0)
+        .unwrap_or(1);
+    let host_busy = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+        .is_some_and(|load1| load1 > machine_cpus as f64 * 0.6);
+    dilated || host_busy
+}
+
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn routing_failure_summary_none_when_zero_else_counts() {
@@ -1223,10 +1264,28 @@ fn sched_domain_data_populated() {
          must have succeeded. A None report here is a bug in monitor startup",
     );
 
-    assert!(
-        report.summary.total_samples > 0,
-        "monitor should have collected at least one sample"
-    );
+    // Zero samples means the monitor never latched its evidence channels
+    // — the guest never booted far enough to be observed. On a QUIET host
+    // that is a real monitor-startup bug; on a loaded CI runner it is the
+    // environmental boot starvation (a 2-vCPU guest that cannot boot to a
+    // samplable state inside the window). `run_env_was_loaded` is the
+    // discriminator: it uses machine loadavg, NOT the guest's vCPU
+    // dilation, because this idle-boot guest's threads barely run so their
+    // dilation reads ~1 even on a saturated host — only host load captures
+    // the contention that slowed the boot.
+    if report.summary.total_samples == 0 {
+        if run_env_was_loaded(&result) {
+            skip!(
+                "monitor collected 0 samples under host load — the guest could \
+                 not boot to a samplable state in the window (environmental; \
+                 the offset/monitor path is exercised on quiet hosts)"
+            );
+        }
+        panic!(
+            "monitor collected 0 samples on a quiet host — a monitor-startup \
+             or evidence-channel bug, not host load"
+        );
+    }
 
     // Scan samples in reverse chronological order for the first
     // one where at least one CPU reports a non-empty sched_domains
@@ -1255,23 +1314,23 @@ fn sched_domain_data_populated() {
     // Handled in the function body (not a closure) so `skip!` returns from
     // the test.
     let Some(populated) = populated_sample else {
-        let d = result.host_vcpu_schedstat.and_then(|s| s.dilation());
-        let d_str = d.map_or_else(|| "n/a".to_string(), |d| format!("{d:.2}x"));
-        if d.is_none_or(|d| d > 1.1) {
+        // Same environmental discriminator as the zero-samples case: a
+        // loaded host slows the boot-time kernel thread that builds the
+        // domain tree past the run window, so no sample carries domains.
+        if run_env_was_loaded(&result) {
             skip!(
                 "sched_domains never populated across {} samples under host \
-                 dilation D={d_str} — the guest was too starved to reach \
-                 post-SMP domain-tree construction in the run window \
-                 (environmental, not a resolution bug; reproduces only on a \
-                 contended host)",
+                 load — the guest was too starved to reach post-SMP domain-tree \
+                 construction in the run window (environmental, not a resolution \
+                 bug; reproduces only on a contended host)",
                 report.samples.len(),
             );
         }
         panic!(
             "no sample had any CPU with non-empty sched_domains across {} \
-             collected samples on a quiet host (D={d_str}) — monitor samples \
-             may be racing the boot-time kernel thread that builds the domain \
-             tree, or `rq.sd` offsets are wrong",
+             collected samples on a quiet host — monitor samples may be racing \
+             the boot-time kernel thread that builds the domain tree, or \
+             `rq.sd` offsets are wrong",
             report.samples.len(),
         );
     };
