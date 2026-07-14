@@ -1816,7 +1816,7 @@ fn acquire_exclusive_slot_with_locks(
 /// disjoint `(vcpus_per_llc + 1)`-CPU grain BLOCKS
 /// ([`host_topology::HostTopology::compute_pinning_grain`]) and takes,
 /// per block, a SHARED (`LOCK_SH`) LLC lock plus per-CPU `LOCK_EX` over
-/// exactly the block's cores + service CPU (the [`LlcLockMode::Shared`]
+/// exactly the block's cores + service CPU (the `LlcLockMode::Shared`
 /// composition). Because distinct blocks are disjoint by construction,
 /// two perf cells on different blocks acquire non-overlapping per-CPU
 /// sets and COEXIST on the shared LLC — the parallelism that whole-LLC
