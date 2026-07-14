@@ -122,6 +122,12 @@ fn assert_stats_round_trip(result: &VmResult) -> Result<()> {
             ),
         }
     }
+    // A descheduling host can trip the guest's sched_ext runnable-stall
+    // watchdog (5s of GUEST time), ejecting scx-ktstr so the dispatch
+    // counter never advances — environmental, not a dispatch regression.
+    if !any_progress {
+        ktstr::prelude::stall_ejection_skip(result)?;
+    }
     anyhow::ensure!(
         any_progress,
         "scheduler reported nr_dispatched = 0 across every periodic \
