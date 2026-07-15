@@ -90,7 +90,7 @@ use std::collections::BTreeSet;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::flock::{
@@ -251,12 +251,6 @@ pub(crate) struct LockDirWatch {
     ino: nix::sys::inotify::Inotify,
 }
 
-enum LockDirWake {
-    Changed,
-    Cancelled,
-    TimedOut,
-}
-
 impl LockDirWatch {
     /// Watch the protocol directory. `IN_CLOSE_NOWRITE` is included
     /// alongside `IN_CLOSE_WRITE` defensively: the mask that fires
@@ -304,54 +298,137 @@ impl LockDirWatch {
             Ok(false)
         }
     }
+}
 
-    /// Sleep until a lockfile closes, `cancel` is signalled, or the current
-    /// no-progress deadline expires. There is no periodic fallback tick: the
-    /// queue's blocked `flock` is the lossless availability wake, while this
-    /// monitor needs only real holder events and one deadline.
-    fn wait_or_cancel(
-        &self,
-        cancel: &vmm_sys_util::eventfd::EventFd,
-        timeout: Duration,
-    ) -> Result<LockDirWake> {
-        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-        use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+/// Cross-process queue progress notification stored in the queue lockfile's
+/// first word. A holder increments the generation and wakes the shared futex
+/// on acquire and release. Waiters therefore sleep in the kernel until real
+/// queue turnover or their full no-progress deadline; unlike one-inotify-per-
+/// waiter, this consumes no per-user watcher quota.
+struct QueueProgress {
+    map: memmap2::MmapMut,
+}
 
-        // vmm_sys_util's EventFd predates std::os::fd::AsFd but owns this
-        // descriptor for the full poll call. Borrow it explicitly so nix's
-        // PollFd gets the same lifetime guarantee as the inotify fd.
-        let cancel_fd = unsafe { BorrowedFd::borrow_raw(cancel.as_raw_fd()) };
+enum ProgressWait {
+    Woken,
+    TimedOut,
+    Interrupted,
+}
 
-        let mut fds = [
-            PollFd::new(self.ino.as_fd(), PollFlags::POLLIN),
-            PollFd::new(cancel_fd, PollFlags::POLLIN),
-        ];
-        let poll_timeout = PollTimeout::try_from(timeout.max(Duration::from_millis(1)))
-            .unwrap_or(PollTimeout::MAX);
-        let ready = loop {
-            match poll(&mut fds, poll_timeout) {
-                Ok(n) => break n,
-                Err(nix::errno::Errno::EINTR) => continue,
-                Err(e) => return Err(e.into()),
-            }
+impl QueueProgress {
+    const BYTES: u64 = std::mem::size_of::<AtomicU32>() as u64;
+
+    fn open(path: &str) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("open queue progress word {path}"))?;
+        if file.metadata()?.len() < Self::BYTES {
+            // Concurrent first-openers may all extend zero bytes to the same
+            // fixed size. No caller ever shrinks or replaces this inode.
+            file.set_len(Self::BYTES)
+                .with_context(|| format!("size queue progress word {path}"))?;
+        }
+        // SAFETY: the queue inode is stable for the process lifetime and is
+        // never truncated below BYTES. Every access to its naturally aligned
+        // first word is atomic; peers use the same representation.
+        let map = unsafe {
+            memmap2::MmapOptions::new()
+                .len(Self::BYTES as usize)
+                .map_mut(&file)
+        }
+        .with_context(|| format!("map queue progress word {path}"))?;
+        Ok(Self { map })
+    }
+
+    fn word(&self) -> &AtomicU32 {
+        // SAFETY: mmap bases are page-aligned, the map is at least one u32,
+        // and QueueProgress's safety invariant requires atomic-only access.
+        unsafe { &*self.map.as_ptr().cast::<AtomicU32>() }
+    }
+
+    fn generation(&self) -> u32 {
+        self.word().load(Ordering::Acquire)
+    }
+
+    fn advance(&self) {
+        self.word().fetch_add(1, Ordering::AcqRel);
+        // Wake every queued monitor: all of them use turnover to reset their
+        // own no-progress window, even though flock grants only the front one.
+        unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                self.word() as *const AtomicU32,
+                libc::FUTEX_WAKE,
+                libc::c_int::MAX,
+            );
+        }
+    }
+
+    fn wait(&self, expected: u32, timeout: Duration) -> Result<ProgressWait> {
+        let timeout = libc::timespec {
+            tv_sec: timeout.as_secs().try_into().unwrap_or(libc::time_t::MAX),
+            tv_nsec: timeout.subsec_nanos().into(),
         };
-        if ready == 0 {
-            return Ok(LockDirWake::TimedOut);
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                self.word() as *const AtomicU32,
+                libc::FUTEX_WAIT,
+                expected,
+                &timeout,
+            )
+        };
+        if rc == 0 {
+            return Ok(ProgressWait::Woken);
         }
-        if fds[1]
-            .revents()
-            .unwrap_or_else(PollFlags::empty)
-            .contains(PollFlags::POLLIN)
-        {
-            return Ok(LockDirWake::Cancelled);
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EAGAIN) => Ok(ProgressWait::Woken),
+            Some(libc::ETIMEDOUT) => Ok(ProgressWait::TimedOut),
+            Some(libc::EINTR) => Ok(ProgressWait::Interrupted),
+            _ => anyhow::bail!(
+                "queue progress futex wait: {}",
+                std::io::Error::last_os_error()
+            ),
         }
-        let revents = fds[0].revents().unwrap_or_else(PollFlags::empty);
-        if revents.contains(PollFlags::POLLIN) {
-            self.drain();
-            Ok(LockDirWake::Changed)
-        } else {
-            anyhow::bail!("lock-dir inotify poll woke without POLLIN: {revents:?}")
+    }
+}
+
+/// RAII queue-head license. Acquiring and releasing it both advance the
+/// shared generation; the underlying flock remains the authoritative FIFO
+/// ticket and still disappears automatically if the process crashes.
+pub(crate) struct QueueTurn {
+    fd: Option<OwnedFd>,
+    progress: Arc<QueueProgress>,
+}
+
+impl QueueTurn {
+    fn acquired(fd: OwnedFd, progress: Arc<QueueProgress>) -> Self {
+        progress.advance();
+        Self {
+            fd: Some(fd),
+            progress,
         }
+    }
+
+    fn acquired_already_announced(fd: OwnedFd, progress: Arc<QueueProgress>) -> Self {
+        Self {
+            fd: Some(fd),
+            progress,
+        }
+    }
+}
+
+impl Drop for QueueTurn {
+    fn drop(&mut self) {
+        // Publish release while the flock is still held, then close it. The
+        // woken monitors may run immediately, but the blocking flock remains
+        // the authoritative grant and follows within this same Drop call.
+        self.progress.advance();
+        drop(self.fd.take());
     }
 }
 
@@ -361,32 +438,32 @@ impl LockDirWatch {
 /// Parks one persistent fd in the kernel's flock wait queue on
 /// [`queue_lock_path`] (`LOCK_EX`, blocking) — arrival-order FIFO
 /// across every invocation, tickets vanishing with their process.
-/// A separate event-driven inotify monitor observes queue-holder
-/// close events and resets its no-progress deadline when the holder
-/// PID advances. Only after [`patience`] of zero turnover does it
-/// interrupt the blocked flock. The normal path never interrupts or
-/// reopens the fd, so the waiter keeps its kernel queue position
-/// instead of periodically moving itself to the tail.
+/// A separate monitor sleeps on the queue lockfile's shared generation
+/// futex. Queue-head RAII advances it on every acquire and release, so normal
+/// progress is entirely event-driven and allocates no per-waiter inotify
+/// instance. A holder-PID sample at the full deadline preserves compatibility
+/// with older ktstr processes that do not publish the generation. Only after
+/// [`patience`] of zero turnover does the monitor interrupt the blocked flock.
+/// The normal path never interrupts or reopens the fd, so the waiter keeps its
+/// kernel queue position instead of periodically moving itself to the tail.
 ///
 /// Queued waiters hold NO resource locks (their fast-path attempts
 /// were all-or-nothing and released everything), so parking here can
 /// never feed a deadlock cycle.
-pub(crate) fn wait_for_queue_turn() -> Result<Option<OwnedFd>> {
+pub(crate) fn wait_for_queue_turn() -> Result<Option<QueueTurn>> {
     let qpath = queue_lock_path();
     // Fast grab: empty queue is the common case.
     if let Some(fd) = try_flock(&qpath, FlockMode::Exclusive)? {
-        return Ok(Some(fd));
+        let progress = Arc::new(QueueProgress::open(&qpath)?);
+        return Ok(Some(QueueTurn::acquired(fd, progress)));
     }
     let wait_patience = patience();
-    let watch = LockDirWatch::new()?;
+    let progress = Arc::new(QueueProgress::open(&qpath)?);
+    let initial_generation = progress.generation();
     let initial_holders = holder_pids(&qpath);
-    let cancel = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
-        .map_err(|e| anyhow::anyhow!("create queue progress cancel eventfd: {e}"))?;
-    let cancel_for_monitor = cancel
-        .try_clone()
-        .map_err(|e| anyhow::anyhow!("clone queue progress cancel eventfd: {e}"))?;
-    let monitor_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let monitor_cancelled = Arc::new(AtomicBool::new(false));
     let monitor_cancelled_for_thread = monitor_cancelled.clone();
+    let progress_for_monitor = progress.clone();
 
     // Install before the monitor can reach its deadline. A deadline signal
     // that lands in the short monitor-ready -> blocking-flock gap is harmless;
@@ -401,29 +478,43 @@ pub(crate) fn wait_for_queue_turn() -> Result<Option<OwnedFd>> {
             let mut deadline = Instant::now() + wait_patience;
             let _ = ready_tx.send(());
             let monitor_result = (|| -> Result<()> {
+                let mut observed_generation = initial_generation;
                 let mut last_nonempty_holders = initial_holders;
                 loop {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    match watch.wait_or_cancel(&cancel_for_monitor, remaining)? {
-                        LockDirWake::Cancelled => return Ok(()),
-                        LockDirWake::Changed => {
-                            let holders = holder_pids(&qpath_for_monitor);
-                            // An empty sample is the release-to-grant seam. Do not
-                            // overwrite the last real identity: when the next head
-                            // later closes, its non-empty successor (or our own
-                            // immediate grant) proves progress without letting
-                            // unrelated open/close churn reset patience.
-                            if !holders.is_empty() && holders != last_nonempty_holders {
-                                last_nonempty_holders = holders;
-                                deadline = Instant::now() + wait_patience;
-                            }
+                    if monitor_cancelled_for_thread.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let generation = progress_for_monitor.generation();
+                    if generation != observed_generation {
+                        observed_generation = generation;
+                        let holders = holder_pids(&qpath_for_monitor);
+                        if !holders.is_empty() {
+                            last_nonempty_holders = holders;
                         }
-                        LockDirWake::TimedOut => {
-                            // Close the inotify-ready-vs-timeout boundary: the
-                            // monitor may have been descheduled while a holder
-                            // advanced. Re-read the authoritative holder set
-                            // before interrupting the waiter. If it advanced,
-                            // that is real progress and earns a fresh window.
+                        deadline = Instant::now() + wait_patience;
+                    }
+                    // This second check closes cancellation's load-to-futex
+                    // race: cancellation stores before advancing the word.
+                    if monitor_cancelled_for_thread.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        let holders = holder_pids(&qpath_for_monitor);
+                        if !holders.is_empty() && holders != last_nonempty_holders {
+                            last_nonempty_holders = holders;
+                            deadline = Instant::now() + wait_patience;
+                            continue;
+                        }
+                        return Ok(());
+                    }
+                    match progress_for_monitor.wait(observed_generation, remaining)? {
+                        ProgressWait::Woken | ProgressWait::Interrupted => continue,
+                        ProgressWait::TimedOut => {
+                            // A process from before the generation protocol does
+                            // not wake the futex. Preserve cross-version progress
+                            // semantics with one authoritative sample only after
+                            // the complete no-progress window.
                             let holders = holder_pids(&qpath_for_monitor);
                             if !holders.is_empty() && holders != last_nonempty_holders {
                                 last_nonempty_holders = holders;
@@ -456,7 +547,10 @@ pub(crate) fn wait_for_queue_turn() -> Result<Option<OwnedFd>> {
 
     let waited = block_flock_interruptible(&qpath, FlockMode::Exclusive);
     monitor_cancelled.store(true, Ordering::Release);
-    let _ = cancel.write(1);
+    // Acquiring, timing out, or erroring all remove this ticket from its old
+    // queue position, which is real queue progress for peers. The generation
+    // advance also wakes our monitor without any cancellation fd.
+    progress.advance();
     monitor.thread().unpark();
     let monitor_result = monitor
         .join()
@@ -464,12 +558,15 @@ pub(crate) fn wait_for_queue_turn() -> Result<Option<OwnedFd>> {
     monitor_result?;
 
     match waited? {
-        FlockWait::Granted(fd) => Ok(Some(fd)),
+        FlockWait::Granted(fd) => Ok(Some(QueueTurn::acquired_already_announced(fd, progress))),
         FlockWait::DeadlineExpired => {
             // Close the release-vs-deadline race: if the holder dropped as
             // the monitor interrupted us, take the now-free queue instead of
             // reporting a false contention timeout.
-            try_flock(&qpath, FlockMode::Exclusive)
+            Ok(
+                try_flock(&qpath, FlockMode::Exclusive)?
+                    .map(|fd| QueueTurn::acquired(fd, progress)),
+            )
         }
         FlockWait::Tick => unreachable!("persistent queue wait has no progress tick"),
     }

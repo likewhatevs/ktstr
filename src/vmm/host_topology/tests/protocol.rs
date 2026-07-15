@@ -258,10 +258,56 @@ fn queue_turnover_resets_patience() {
     );
 }
 
+/// A production [`protocol::QueueTurn`] release must wake both the kernel
+/// flock waiter and its generation-futex monitor. The latter is load-bearing:
+/// if only flock woke, `wait_for_queue_turn` would acquire the lock and then
+/// hang while joining a monitor parked until the full patience deadline.
+#[test]
+fn queue_turn_release_wakes_generation_monitor() {
+    let _prefixes = LockPrefixesGuard::new();
+    let holder = protocol::wait_for_queue_turn()
+        .expect("initial queue acquire")
+        .expect("fresh queue must be available");
+
+    // Lock-prefix overrides are thread-local. Copy them so the helper joins
+    // this test's isolated queue instead of the production one.
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|p| p.borrow().clone());
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|p| p.borrow().clone());
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    let waiter = std::thread::spawn(move || {
+        LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = llc_prefix);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = cpu_prefix);
+        let _patience = PatienceGuard::new(std::time::Duration::from_secs(20));
+        started_tx.send(()).expect("announce waiter start");
+        let start = std::time::Instant::now();
+        let acquired = protocol::wait_for_queue_turn()
+            .expect("queue wait must not error")
+            .is_some();
+        done_tx
+            .send((acquired, start.elapsed()))
+            .expect("report queue acquire");
+    });
+
+    started_rx.recv().expect("waiter start");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    drop(holder);
+
+    let (acquired, elapsed) = done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("queue release must wake the futex monitor before patience expires");
+    waiter.join().expect("queue waiter thread");
+    assert!(acquired, "released queue turn must pass to its waiter");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(80),
+        "the waiter must actually block behind the initial turn; elapsed={elapsed:?}",
+    );
+}
+
 /// Progress-based patience, wedged side: a queue holder that never
 /// releases (and never changes) times the waiter out within the
-/// no-progress window (plus tick slack) — the retryable-fail rail for
-/// a genuinely wedged peer.
+/// no-progress window — the retryable-fail rail for a genuinely
+/// wedged peer.
 #[test]
 fn wedged_queue_holder_times_out_within_patience() {
     let _prefixes = LockPrefixesGuard::new();

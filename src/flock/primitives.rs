@@ -191,9 +191,10 @@ pub(crate) fn prepare_flock_interrupt_handler() {
 
 /// Interrupt `target_tid`'s blocking flock immediately.
 ///
-/// This is the progress monitor's deadline wake and its fail-safe if inotify
-/// itself fails. It is intentionally thread-directed; no unrelated ktstr
-/// thread should observe the EINTR used to unwind the queue wait.
+/// This is the progress monitor's deadline wake and its fail-safe if the
+/// shared-futex observation fails. It is intentionally thread-directed; no
+/// unrelated ktstr thread should observe the EINTR used to unwind the queue
+/// wait.
 pub(crate) fn interrupt_flock_thread(target_tid: libc::pid_t) -> Result<()> {
     install_flock_deadline_handler();
     let rc = unsafe {
@@ -219,7 +220,7 @@ pub(crate) fn interrupt_flock_thread(target_tid: libc::pid_t) -> Result<()> {
 ///
 /// Keeping the same fd and issuing exactly one blocking syscall is important:
 /// an interrupted/re-opened loop loses its place in the kernel's flock wait
-/// queue. The host-topology queue's inotify monitor sends the interrupt only
+/// queue. The host-topology queue's futex monitor sends the interrupt only
 /// after a full no-progress deadline and a final holder-identity check.
 pub(crate) fn block_flock_interruptible<P: AsRef<Path>>(
     path: P,
