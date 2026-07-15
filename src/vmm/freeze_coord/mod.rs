@@ -3662,6 +3662,23 @@ impl KtstrVm {
                     None
                 }
             });
+        // Accessor-init consumes the same complete symbol map and BTF offset
+        // tables that run_vm already derived before any live-VM helper starts.
+        // Sharing these products keeps the worker's lifetime to finite guest-
+        // memory reads; it no longer reparses ELF/BTF or allocates a duplicate
+        // full symbol HashMap while teardown is waiting to join it.
+        let freeze_coord_guest_symbols = freeze_coord_symbol_cache
+            .as_ref()
+            .map(|cache| cache.symbols_arc());
+        let freeze_coord_kernel_symbols = host_kernel_symbols.clone();
+        let freeze_coord_bpf_map_offsets = host_vmlinux_artifacts
+            .as_ref()
+            .and_then(|a| a.monitor.as_ref())
+            .and_then(|m| crate::monitor::btf_offsets::BpfMapOffsets::from_btf(&m.btf).ok());
+        let freeze_coord_bpf_prog_offsets = host_vmlinux_artifacts
+            .as_ref()
+            .and_then(|a| a.monitor.as_ref())
+            .and_then(|m| m.prog_offsets.clone());
         // Optional file sink for the failure-dump JSON. Cloned out
         // of the builder field so the closure owns a copy and the
         // freeze coord can write the file without touching the env
@@ -4135,8 +4152,8 @@ impl KtstrVm {
                     kaslr_offset: u64,
                 }
                 // Lazy-construct BpfMapAccessorOwned. The constructor
-                // parses vmlinux ELF (goblin) and BTF (~MB-scale
-                // work) and reads guest-memory bootstrap symbols
+                // reuses the pre-parsed vmlinux symbol/BTF products and
+                // reads guest-memory bootstrap symbols
                 // (`page_offset_base`, `pgtable_l5_enabled`,
                 // `init_top_pgt`); the latter aren't readable until
                 // the guest kernel has populated them, so a
@@ -4144,49 +4161,28 @@ impl KtstrVm {
                 // a still-booting guest. The fix is the same lazy-
                 // discovery pattern that `cached_bss_pa` uses below:
                 // try each iteration until success, then cache —
-                // gated on `owned_accessor.is_none()` so the heavy
-                // parse runs at most once per coordinator (only the
-                // failed attempts re-pay it, and only until the
-                // first success). A single one-shot construct at
+                // gated on `owned_accessor.is_none()`. Failed attempts
+                // now repeat only the finite guest-memory handshake; the
+                // host-side parse/allocation work was completed once at
+                // run_vm setup. A single one-shot construct at
                 // coord-start would have left the accessor None
                 // permanently if the guest hadn't booted yet,
                 // disabling freeze detection AND the dump for the
                 // entire run.
-                // Cached vmlinux bytes shared across every retry of
-                // `try_init_owned_accessor` and
-                // `try_init_owned_prog_accessor`. The previous code
-                // re-ran `std::fs::read(vmlinux)` inside both helpers
-                // on every scan tick — at 50-340 MB per call on cold
-                // disk cache the pair could exceed the 12 s post-
-                // BSP-done kill timer before the coord ever reached
-                // its epoll wait. Reading once at coord scope cuts
-                // the per-iteration cost to a few-millisecond
-                // `goblin::elf::Elf::parse` against the cached bytes.
-                //
-                // The borrow lifetime constraint blocks caching the
-                // parsed `Elf<'static>` (it borrows from the Vec); the
-                // helpers re-parse the cached bytes per call instead.
-                // Parsing is microseconds — only the file read was
-                // slow.
+                // Cached vmlinux bytes remain available to dump/render
+                // consumers below, but accessor init does not touch them.
                 let _tvmr = std::time::Instant::now();
                 let vmlinux_data: Option<Arc<Vec<u8>>> = vmlinux_data_shared.clone();
                 // Worker-populated accessor pair. Built off the freeze
-                // coordinator thread so the slow ELF + BTF parse +
-                // symbol HashMap (~4 s on debug vmlinux) does not
-                // block the coordinator from servicing TOKEN_TX
-                // events on its epoll loop. The worker writes both
-                // accessors atomically via `OnceLock::set` once the
-                // GuestKernel handshake succeeds and both BTF parses
-                // land. Subsequent reads from the coordinator are
-                // nanosecond-scale `OnceLock::get` calls.
-                //
-                // `Arc<OnceLock<(...)>>` shape: `Arc` so the worker
-                // and coordinator share ownership; `OnceLock` so the
-                // publish is one-shot and lock-free on read; the
-                // tuple shape so both accessors land atomically — a
-                // failure-dump path that builds a `ScxWalkerCapture`
-                // must also have the matching `prog_runtime_stats`
-                // accessor, so partial pairs would skew the dump.
+                // coordinator thread because the guest bootstrap handshake
+                // can transiently fail while the kernel comes up. All host
+                // ELF/BTF/symbol work is already complete, so the worker can
+                // be cancelled and joined without host file I/O or a large
+                // allocation in flight. After the GuestKernel handshake,
+                // the worker publishes the map accessor and its optional
+                // program accessor together in one mutex-protected slot
+                // replacement; the coordinator adopts the same pair with
+                // one `take()`.
                 //
                 // `GuestMemMapAccessorOwned` and
                 // `GuestMemProgAccessorOwned` are `Send` because they
@@ -4311,20 +4307,23 @@ impl KtstrVm {
                 // Re-init drops the per-iteration 60 s budget — by
                 // the time the first re-init fires the guest has
                 // already booted to the point of having a live
-                // scheduler attached, so `from_elf_with_hint` should
+                // scheduler attached, so `from_precomputed` should
                 // succeed on the first attempt; the inner retry
                 // still tolerates the brief slab-reuse window between
                 // an old scheduler's BPF map free and the new
                 // scheduler's BPF map load.
                 let accessor_init_handle: Option<std::thread::JoinHandle<()>> = match (
                     freeze_coord_mem.as_ref(),
-                    freeze_coord_vmlinux.as_ref(),
-                    vmlinux_data.as_deref(),
+                    freeze_coord_guest_symbols.as_ref(),
+                    freeze_coord_kernel_symbols.as_ref(),
+                    freeze_coord_bpf_map_offsets.as_ref(),
                 ) {
-                    (Some(mem), Some(vmlinux), Some(data)) => {
+                    (Some(mem), Some(symbols), Some(kernel_symbols), Some(map_offsets)) => {
                         let mem_for_worker = mem.clone();
-                        let vmlinux_for_worker = vmlinux.clone();
-                        let data_for_worker = data.clone();
+                        let symbols_for_worker = symbols.clone();
+                        let kernel_symbols_for_worker = kernel_symbols.clone();
+                        let map_offsets_for_worker = map_offsets.clone();
+                        let prog_offsets_for_worker = freeze_coord_bpf_prog_offsets.clone();
                         let tcr_for_worker = freeze_coord_tcr_el1.clone();
                         let cr3_for_worker = freeze_coord_cr3.clone();
                         let kern_phys_base_for_worker = kern_phys_base.clone();
@@ -4352,31 +4351,6 @@ impl KtstrVm {
                                 let reinit_fd = {
                                     use std::os::unix::io::AsRawFd;
                                     reinit_for_worker.as_raw_fd()
-                                };
-                                let elf = match goblin::elf::Elf::parse(&data_for_worker) {
-                                    Ok(e) => e,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "accessor-init: vmlinux ELF parse failed"
-                                        );
-                                        // Mark FAILED_PERMANENTLY so
-                                        // a swap-op wait surfaces the
-                                        // terminal-worker diagnostic
-                                        // rather than the generic
-                                        // deadline-exceeded message.
-                                        worker_state_for_worker.store(
-                                            crate::scenario::snapshot::bridge::accessor_worker_state::FAILED_PERMANENTLY,
-                                            Ordering::Release,
-                                        );
-                                        // Wake any pending dispatcher
-                                        // wait so it surfaces the
-                                        // FAILED_PERMANENTLY bail
-                                        // immediately instead of
-                                        // waiting for its deadline.
-                                        let _ = dispatcher_wake_for_worker.write(1);
-                                        return;
-                                    }
                                 };
                                 let mut first_init = true;
                                 'reinit: loop {
@@ -4514,11 +4488,11 @@ impl KtstrVm {
                                             continue;
                                         };
                                         let map_res = crate::monitor::bpf_map::GuestMemMapAccessorOwned
-                                            ::from_elf_with_hint(
+                                            ::from_precomputed(
                                                 mem_for_worker.clone(),
-                                                &elf,
-                                                &data_for_worker,
-                                                &vmlinux_for_worker,
+                                                symbols_for_worker.clone(),
+                                                &kernel_symbols_for_worker,
+                                                map_offsets_for_worker.clone(),
                                                 tcr_val,
                                                 cr3_val,
                                                 pb_hint,
@@ -4563,16 +4537,18 @@ impl KtstrVm {
                                             // publish past the periodic-capture window so
                                             // no snapshot ever fired (periodic_fired=0).
                                             // Cloning shares the Arc-backed `mem` +
-                                            // `symbols` — cheap — and `finish` only adds the
-                                            // prog IDR symbol + BTF offsets.
-                                            let prog_res =
-                                                crate::monitor::bpf_prog::GuestMemProgAccessorOwned::finish(
-                                                    map.guest_kernel().clone(),
-                                                    &elf,
-                                                    &data_for_worker,
-                                                    &vmlinux_for_worker,
-                                                );
-                                            break Some((map, prog_res.ok()));
+                                            // `symbols` — cheap — and the precomputed prog
+                                            // offsets make completion an O(1) symbol lookup.
+                                            let prog = prog_offsets_for_worker.clone().and_then(
+                                                |offsets| {
+                                                    crate::monitor::bpf_prog::GuestMemProgAccessorOwned::finish_with_offsets(
+                                                        map.guest_kernel().clone(),
+                                                        offsets,
+                                                    )
+                                                    .ok()
+                                                },
+                                            );
+                                            break Some((map, prog));
                                         }
                                         // Wait on kill_evt with 200ms
                                         // timeout. Wakes instantly on

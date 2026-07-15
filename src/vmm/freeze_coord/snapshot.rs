@@ -140,7 +140,7 @@ pub(super) fn decode_snapshot_request(payload: &[u8]) -> Option<SnapshotRequest>
 /// `Op::WatchSnapshot` symbols without re-reading and re-parsing
 /// the 50MB+ vmlinux per request.
 pub(super) struct VmlinuxSymbolCache {
-    symbols: std::collections::HashMap<String, u64>,
+    symbols: std::sync::Arc<std::collections::HashMap<String, u64>>,
 }
 
 impl VmlinuxSymbolCache {
@@ -172,11 +172,20 @@ impl VmlinuxSymbolCache {
                 symbols.insert(name.to_string(), s.st_value);
             }
         }
-        Ok(Self { symbols })
+        Ok(Self {
+            symbols: std::sync::Arc::new(symbols),
+        })
     }
 
     pub(super) fn lookup(&self, symbol: &str) -> Option<u64> {
         self.symbols.get(symbol).copied()
+    }
+
+    /// Share the already-built complete ELF symbol map with consumers that
+    /// need to construct a [`crate::monitor::guest::GuestKernel`]. This is an
+    /// `Arc` clone, not a second multi-hundred-thousand-entry HashMap build.
+    pub(super) fn symbols_arc(&self) -> std::sync::Arc<std::collections::HashMap<String, u64>> {
+        self.symbols.clone()
     }
 
     /// Test-only constructor that bypasses the vmlinux ELF read /
@@ -192,7 +201,9 @@ impl VmlinuxSymbolCache {
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn from_symbols_for_test(symbols: std::collections::HashMap<String, u64>) -> Self {
-        Self { symbols }
+        Self {
+            symbols: std::sync::Arc::new(symbols),
+        }
     }
 }
 

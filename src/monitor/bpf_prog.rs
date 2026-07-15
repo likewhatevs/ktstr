@@ -812,6 +812,17 @@ impl GuestMemProgAccessorOwned {
         vmlinux: &std::path::Path,
     ) -> anyhow::Result<Self> {
         let offsets = BpfProgOffsets::from_elf(elf, data, vmlinux)?;
+        Self::finish_with_offsets(kernel, offsets)
+    }
+
+    /// Complete an owned program accessor with BTF offsets derived before
+    /// live-VM helper startup. Keeps offset semantics identical to [`finish`]
+    /// while removing BTF parsing and sidecar I/O from teardown-sensitive
+    /// worker lifetimes.
+    pub(crate) fn finish_with_offsets(
+        kernel: super::guest::GuestKernel,
+        offsets: BpfProgOffsets,
+    ) -> anyhow::Result<Self> {
         let prog_idr_kva = kernel
             .symbol_kva("prog_idr")
             .ok_or_else(|| anyhow::anyhow!("prog_idr symbol not found in vmlinux"))?;

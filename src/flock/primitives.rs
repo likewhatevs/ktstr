@@ -178,6 +178,69 @@ fn install_flock_deadline_handler() {
     });
 }
 
+/// Prepare the process-wide no-op handler used to interrupt a blocking
+/// `flock(2)` without restarting it.
+///
+/// The progress-aware host-topology queue installs this before it starts its
+/// monitor thread. Doing so closes the race where the monitor could reach its
+/// deadline before the waiter enters `flock`: the signal is harmless before
+/// the syscall, and the monitor re-fires until the waiter acknowledges it.
+pub(crate) fn prepare_flock_interrupt_handler() {
+    install_flock_deadline_handler();
+}
+
+/// Interrupt `target_tid`'s blocking flock immediately.
+///
+/// This is the progress monitor's deadline wake and its fail-safe if inotify
+/// itself fails. It is intentionally thread-directed; no unrelated ktstr
+/// thread should observe the EINTR used to unwind the queue wait.
+pub(crate) fn interrupt_flock_thread(target_tid: libc::pid_t) -> Result<()> {
+    install_flock_deadline_handler();
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_tgkill,
+            libc::getpid(),
+            target_tid,
+            flock_deadline_signal(),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "tgkill for progress-aware flock: {}",
+            std::io::Error::last_os_error()
+        )
+    }
+}
+
+/// Block once on a single open file description until the flock is granted or
+/// [`flock_deadline_signal`] interrupts the syscall.
+///
+/// Keeping the same fd and issuing exactly one blocking syscall is important:
+/// an interrupted/re-opened loop loses its place in the kernel's flock wait
+/// queue. The host-topology queue's inotify monitor sends the interrupt only
+/// after a full no-progress deadline and a final holder-identity check.
+pub(crate) fn block_flock_interruptible<P: AsRef<Path>>(
+    path: P,
+    mode: FlockMode,
+) -> Result<FlockWait> {
+    use rustix::fs::{FlockOperation, flock};
+
+    install_flock_deadline_handler();
+    let path = path.as_ref();
+    let fd = open_lockfile(path)?;
+    let op = match mode {
+        FlockMode::Exclusive => FlockOperation::LockExclusive,
+        FlockMode::Shared => FlockOperation::LockShared,
+    };
+    match flock(&fd, op) {
+        Ok(()) => Ok(FlockWait::Granted(fd)),
+        Err(e) if e == rustix::io::Errno::INTR => Ok(FlockWait::DeadlineExpired),
+        Err(e) => anyhow::bail!("flock (interruptible) {}: {e}", path.display()),
+    }
+}
+
 /// RAII POSIX per-thread interval timer that delivers
 /// [`flock_deadline_signal`] to the CREATING thread. Armed with a
 /// one-shot expiry at the deadline plus a periodic re-fire, so a
