@@ -1784,23 +1784,38 @@ fn complete_schedstat_delay_cap_ns(
     current: Option<HostVcpuSchedstat>,
 ) -> Option<u64> {
     let expected = u32::try_from(expected_vcpus).ok()?;
-    let (anchor, current) = (anchor?, current?);
+    let current = current?;
     if expected == 0
-        || anchor_tids != current_tids
         || current_tids.len() != expected_vcpus
         || current_tids.iter().any(|tid| *tid <= 0)
-        || anchor.sampled_vcpus != expected
         || current.sampled_vcpus != expected
         // CONFIG_SCHEDSTATS-off lines are readable as `0 0 0`.
-        || current.total_on_cpu_ns <= anchor.total_on_cpu_ns
+        || current.total_on_cpu_ns == 0
     {
         return None;
     }
-    Some(
-        current
-            .total_run_delay_ns
-            .saturating_sub(anchor.total_run_delay_ns),
-    )
+
+    // Prefer the tight delta over the conservatively widened Body span when
+    // the preceding lifecycle snapshot saw the same complete live vCPU set.
+    if anchor_tids == current_tids
+        && let Some(anchor) = anchor
+        && anchor.sampled_vcpus == expected
+        && current.total_on_cpu_ns > anchor.total_on_cpu_ns
+    {
+        return Some(
+            current
+                .total_run_delay_ns
+                .saturating_sub(anchor.total_run_delay_ns),
+        );
+    }
+
+    // The first usable vCPU snapshot can race Body entry (notably when the
+    // process is in cgroup-v2 root and PSI is deliberately unavailable).
+    // Every vCPU thread is born for this VM run and lives through Body, so its
+    // complete cumulative run-delay at Body exit encloses the Body interval.
+    // This is a looser upper bound than a boundary delta, but it cannot turn
+    // host contention into a false confirmed scheduler failure.
+    Some(current.total_run_delay_ns)
 }
 
 /// Event-anchored host-contention witness recorder.
@@ -1811,9 +1826,11 @@ fn complete_schedstat_delay_cap_ns(
 /// reads one width-independent runner-cgroup PSI counter to retain a localized
 /// `W(L)` series. Dispatch also samples that counter immediately at Body
 /// entry/exit, making the series complete even when the monitor is starved.
-/// A complete task-specific schedstat delta over the same widened Body span
-/// caps PSI so concurrent cells sharing the runner cgroup cannot inflate `W`
-/// beyond the target VM's own accumulated run delay.
+/// A complete task-specific schedstat delta over the widened Body span caps
+/// PSI so concurrent cells sharing the runner cgroup cannot inflate `W`
+/// beyond the target VM's own accumulated run delay. If the preceding
+/// boundary snapshot raced vCPU startup, the complete whole-thread-life total
+/// is a conservative enclosing fallback.
 pub(crate) struct ContentionWitnessRecorder {
     inner: std::sync::Mutex<ContentionWitnessRecorderInner>,
 }
@@ -2156,7 +2173,7 @@ mod schedstat_tests {
     }
 
     #[test]
-    fn schedstat_cap_requires_the_same_complete_live_tid_set() {
+    fn schedstat_cap_uses_tight_delta_or_complete_lifetime_fallback() {
         let anchor = HostVcpuSchedstat {
             total_on_cpu_ns: 1_000,
             total_run_delay_ns: 100,
@@ -2185,8 +2202,13 @@ mod schedstat_tests {
                 &[101, 103],
                 Some(current),
             ),
-            None,
-            "a replaced TID cannot share cumulative anchors"
+            Some(350),
+            "a mismatched anchor falls back to the complete current lifetime"
+        );
+        assert_eq!(
+            complete_schedstat_delay_cap_ns(2, &[], None, &[101, 102], Some(current)),
+            Some(350),
+            "a missing pre-Body anchor still has a sound whole-lifetime bound"
         );
         assert_eq!(
             complete_schedstat_delay_cap_ns(2, &[101, 102], Some(anchor), &[101, 0], Some(current),),

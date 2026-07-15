@@ -1677,8 +1677,9 @@ pub struct BodyContentionWindow {
     /// first/last monitor ticks.
     #[serde(default)]
     pub complete: bool,
-    /// Complete summed vCPU schedstat run-delay (ns) over the SAME
-    /// conservative wall span as this series. When
+    /// Complete summed vCPU schedstat run-delay (ns) over the conservative
+    /// wall span of this series, or (when the preceding lifecycle snapshot
+    /// raced vCPU startup) the enclosing whole-thread lifetime. When
     /// [`Self::schedstat_cap_complete`] is true, `W(L)` is capped by this
     /// value: a request cannot absorb more task-specific scheduling delay in
     /// one window than all vCPUs accumulated over the enclosing span. This
@@ -1686,9 +1687,11 @@ pub struct BodyContentionWindow {
     /// VM's delay.
     #[serde(default)]
     pub schedstat_cap_ns: u64,
-    /// True only when both cap snapshots sampled the exact same complete set
-    /// of vCPU TIDs. False for legacy witnesses and partial/read-raced
-    /// lifecycle snapshots; in that case the cap is ignored.
+    /// True when the closing snapshot sampled the complete live vCPU set and
+    /// the cap is therefore a sound upper bound. An exact matching opening
+    /// snapshot produces the tighter Body delta; otherwise the complete
+    /// whole-thread-life total is used. False for legacy witnesses and
+    /// partial/failed closing reads, in which case the cap is ignored.
     #[serde(default)]
     pub schedstat_cap_complete: bool,
     /// The host-side wall span (ns) covered by the Body witness. The start is

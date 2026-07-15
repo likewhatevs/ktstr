@@ -375,9 +375,11 @@ runner-cgroup CPU-pressure deltas during that phase — form the **contention
 witness** the wall-latency ceilings consume. Full vCPU schedstat sweeps happen
 only at lifecycle transitions; the Body hot path reads one PSI counter on the
 monitor's already-existing wake, independent of vCPU count. A complete
-task-specific schedstat delta over the same widened Body span caps the PSI
-result, so another concurrently running cell in the same runner cgroup cannot
-inflate `W` beyond this VM's own accumulated delay. From the series ktstr
+task-specific schedstat delta over the widened Body span caps the PSI result,
+so another concurrently running cell in the same runner cgroup cannot inflate
+`W` beyond this VM's own accumulated delay. If the opening snapshot races vCPU
+startup, the complete whole-vCPU-thread lifetime total provides a looser but
+sound enclosing cap. From the series ktstr
 derives `W(L)`, the worst host delay any interval of length `L` could have
 absorbed; pairing that with a gate's measured latency turns
 `max_p99_wake_latency_ns` from a plain threshold into the contention-aware
@@ -513,8 +515,9 @@ only at lifecycle transitions and uses one cumulative runner-cgroup
 CPU-pressure read per Body monitor tick. That scope retains delayed-vCPU
 coverage without charging pressure from unrelated host cgroups, and a
 task-specific lifecycle schedstat cap removes noise from other cells sharing
-the runner cgroup. If scoped PSI is unavailable, the same complete cap provides
-a coarser whole-span fallback. The worker's per-checkpoint CPU-clock read
+the runner cgroup. If scoped PSI or the opening lifecycle snapshot is
+unavailable, a complete whole-vCPU-thread lifetime total provides a coarser
+enclosing fallback. The worker's per-checkpoint CPU-clock read
 remains; its historical worst-case SpinWait cost and the original ladder are
 retained in the validation record.
 
