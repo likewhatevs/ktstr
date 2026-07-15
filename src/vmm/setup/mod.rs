@@ -1931,6 +1931,9 @@ impl KtstrVm {
             cmdline.push_str(" KTSTR_WPROF_ARGS=");
             cmdline.push_str(&wprof.args_cmdline());
         }
+        if !self.bpf_map_writes.is_empty() {
+            cmdline.push_str(" KTSTR_AWAIT_BPF_MAP_WRITE_READY=1");
+        }
         if !self.cmdline_extra.is_empty() {
             cmdline.push(' ');
             cmdline.push_str(&self.cmdline_extra);
@@ -2256,6 +2259,9 @@ impl KtstrVm {
         if let Some(wprof) = self.wprof.as_ref() {
             cmdline.push_str(" KTSTR_WPROF_ARGS=");
             cmdline.push_str(&wprof.args_cmdline());
+        }
+        if !self.bpf_map_writes.is_empty() {
+            cmdline.push_str(" KTSTR_AWAIT_BPF_MAP_WRITE_READY=1");
         }
         if !self.cmdline_extra.is_empty() {
             cmdline.push(' ');

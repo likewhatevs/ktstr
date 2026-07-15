@@ -540,7 +540,7 @@ pub(crate) fn wprof_trace_frames(buf: &[u8], cap: usize) -> Vec<(u32, &[u8])> {
 /// never cap — no trace bytes are dropped (an oversized single frame would
 /// otherwise be silently dropped by the host `HostAssembler`).
 #[cfg(feature = "wprof")]
-pub fn send_wprof_trace(buf: &[u8]) {
+pub fn send_wprof_trace(buf: &[u8]) -> bool {
     let cap = crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD as usize;
     for (msg_type, chunk) in wprof_trace_frames(buf, cap) {
         if !write_msg(msg_type, chunk) {
@@ -548,9 +548,10 @@ pub fn send_wprof_trace(buf: &[u8]) {
                 "ktstr: send_wprof_trace: bulk-port write failed at a {}-byte frame — wprof trace truncated",
                 chunk.len()
             );
-            return;
+            return false;
         }
     }
+    true
 }
 
 /// Send a stimulus event from the guest step executor.
@@ -669,6 +670,27 @@ pub fn send_scenario_start() {
          succeeded; periodic captures will see scenario_anchor=0 and \
          silently 0-fire"
     );
+}
+
+/// Publish the instrumentation-ready edge for a configured host BPF-map
+/// write. The guest calls this only when the host put
+/// `KTSTR_AWAIT_BPF_MAP_WRITE_READY=1` on the cmdline. By Phase 5 the bulk
+/// port is already established, but use the same bounded reopen/retry policy
+/// as [`send_scenario_start`] so a transient invalidated fd cannot silently
+/// turn a requested crash injection into an uninstrumented race.
+pub fn send_bpf_map_write_ready() -> bool {
+    for attempt in 0..5 {
+        if write_msg(MsgType::BpfMapWriteReady.wire_value(), &[]) {
+            return true;
+        }
+        if attempt + 1 < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    tracing::warn!(
+        "send_bpf_map_write_ready: 5 retries failed — host map injection remains safely gated"
+    );
+    false
 }
 
 /// Send a scenario-end marker. Payload: two LE u64s —

@@ -345,6 +345,19 @@ pub(crate) fn periodic_prereqs_ready_latch() -> Arc<Latch> {
         .clone()
 }
 
+/// Shared wprof-artifact acknowledgement latch. The host fires this only
+/// after it has drained the terminal trace frame and, for auto-repro, the
+/// probe payload terminator. Guest init waits after probe finalisation and
+/// before reboot, so the wait is outside the measured scenario and adds no
+/// workload wakeups.
+static WPROF_ARTIFACTS_RECEIVED_LATCH: OnceLock<Arc<Latch>> = OnceLock::new();
+
+pub(crate) fn wprof_artifacts_received_latch() -> Arc<Latch> {
+    WPROF_ARTIFACTS_RECEIVED_LATCH
+        .get_or_init(|| Arc::new(Latch::new()))
+        .clone()
+}
+
 /// Start the hvc0 wake-byte poll loop.
 ///
 /// Spawns a background thread that polls `/dev/hvc0` for host→guest
@@ -552,6 +565,9 @@ fn hvc0_poll_loop(
         }
         if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_PERIODIC_READY) {
             periodic_prereqs_ready_latch().set();
+        }
+        if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_WPROF_ARTIFACTS_RECEIVED) {
+            wprof_artifacts_received_latch().set();
         }
         if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_VC_SHUTDOWN) {
             tracing::info!("ktstr-init: shutdown request received, draining");

@@ -218,6 +218,42 @@ fn is_probe_output_end_frame(msg: &crate::vmm::bulk::BulkMessage) -> bool {
         && msg.payload.windows(needle.len()).any(|w| w == needle)
 }
 
+/// Order-independent artifact rendezvous for wprof runs.
+///
+/// A healthy probe stays attached until scheduler teardown, so its
+/// `PROBE_OUTPUT_END` normally follows the late wprof trace. A probe that
+/// cannot load (for example, because the guest kernel lacks the optional
+/// `sched_ext_exit` BTF tracepoint) emits its diagnostic payload before the
+/// scenario starts. Remember both events across drain batches so either order
+/// satisfies the rendezvous; requiring the terminator to arrive *after* the
+/// trace loses the already-shipped diagnostic and holds the VM until the grace
+/// backstop.
+#[derive(Default)]
+struct WprofShipState {
+    wprof_trace: bool,
+    probe_output: bool,
+    acknowledged: bool,
+}
+
+impl WprofShipState {
+    /// Observe a bulk-drain batch and return true exactly once, when every
+    /// artifact required by this run has arrived. Plain runs require only the
+    /// terminal trace; dual-snapshot auto-repro runs also require the probe
+    /// terminator. The one-shot return prevents duplicate host→guest acks if a
+    /// later batch happens to contain another matching frame.
+    fn observe(&mut self, messages: &[crate::vmm::bulk::BulkMessage], dual_snapshot: bool) -> bool {
+        self.wprof_trace |= messages.iter().any(is_wprof_ship_frame);
+        self.probe_output |= messages.iter().any(is_probe_output_end_frame);
+        let complete = self.wprof_trace && (!dual_snapshot || self.probe_output);
+        if complete && !self.acknowledged {
+            self.acknowledged = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Provenance tag for the shared `watchdog_reset_ns` deadline atomic.
 ///
 /// FOUR independent subsystems store into that single `AtomicU64`
@@ -402,6 +438,65 @@ fn decode_bpf_map_write_delivery(raw: u8) -> Option<bool> {
         0 => None,
         2 => Some(true),
         _ => Some(false),
+    }
+}
+
+/// Block a configured host BPF-map writer until the guest confirms that its
+/// probe pipeline and optional wprof capture are armed. Both readiness and VM
+/// teardown are eventfd edges, so this consumes no periodic wakeups. The
+/// readiness fd is level-triggered: a guest frame that arrives while the host
+/// is still resolving the map remains pending and releases this wait later.
+fn wait_for_bpf_map_write_ready(
+    ready_evt: &EventFd,
+    kill_evt: &EventFd,
+    kill: &AtomicBool,
+) -> bool {
+    loop {
+        if kill.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut fds = [
+            libc::pollfd {
+                fd: ready_evt.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: kill_evt.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: both descriptors are live for the duration of poll; poll
+        // writes only the two `revents` fields.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            tracing::warn!(err = %e, "BPF-map-write readiness poll failed");
+            return false;
+        }
+        if kill.load(Ordering::Acquire) || fds[1].revents & libc::POLLIN != 0 {
+            return false;
+        }
+        if fds[0].revents & libc::POLLIN != 0 {
+            // EFD_NONBLOCK plus POLLIN makes this read non-blocking and
+            // authoritative. A read error is harmless: the readiness Atomic
+            // is represented by the still-readable counter, so retry poll.
+            if ready_evt.read().is_ok() {
+                return true;
+            }
+            continue;
+        }
+        if fds
+            .iter()
+            .any(|fd| fd.revents & (libc::POLLERR | libc::POLLNVAL) != 0)
+        {
+            tracing::warn!("BPF-map-write readiness poll reported an invalid eventfd");
+            return false;
+        }
     }
 }
 
@@ -3383,6 +3478,20 @@ impl KtstrVm {
         let bpf_map_write_delivery: Arc<std::sync::atomic::AtomicU8> = Arc::new(
             std::sync::atomic::AtomicU8::new(if self.bpf_map_writes.is_empty() { 0 } else { 1 }),
         );
+        // Dedicated guest-instrumentation readiness edge for configured
+        // BPF-map writes. The map writer may resolve its target as soon as the
+        // scheduler loads, but must not mutate it until Phase 5 has armed the
+        // probe pipeline and optional wprof tracer. Runs without map writes
+        // allocate no fd and emit no guest frame.
+        let bpf_map_write_ready_evt = if self.bpf_map_writes.is_empty() {
+            None
+        } else {
+            Some(Arc::new(
+                EventFd::new(EFD_NONBLOCK)
+                    .context("create guest-ready eventfd for BPF map writes")?,
+            ))
+        };
+        let freeze_coord_bpf_map_write_ready_evt = bpf_map_write_ready_evt.clone();
         let bpf_write_handle = self.start_bpf_map_write(
             &vm,
             &kill,
@@ -3393,6 +3502,7 @@ impl KtstrVm {
             virtio_con.clone(),
             kern_phys_base.clone(),
             bpf_map_write_delivery.clone(),
+            bpf_map_write_ready_evt,
         )?;
         // Same as the monitor: the bpf-map-write thread holds a raw pointer into
         // guest_mem, so the guard must join it on an early-return past here.
@@ -5381,6 +5491,11 @@ impl KtstrVm {
                 // shipping. `None` = no ship pending (non-wprof runs never
                 // arm it).
                 let mut wprof_ship_deadline: Option<Instant> = None;
+                // Auto-repro additionally preserves the probe payload. The
+                // trace and probe terminator can arrive in either order and
+                // in different bulk-drain batches, so retain both edges until
+                // the rendezvous is complete.
+                let mut wprof_ship = WprofShipState::default();
                 // Mirror of `bsp_done_final_pass` for the SCHED_EXIT
                 // kill-promotion-without-bsp-done case: kill can be
                 // promoted by sources other than a clean BSP_DONE —
@@ -5443,9 +5558,10 @@ impl KtstrVm {
                             let grace_expired = bsp_done_final_pass_start
                                 .map(|t| t.elapsed() >= DEFERRED_DRAIN_GRACE)
                                 .unwrap_or(false);
-                            if !any_deferred
-                                || owned_accessor.is_some()
-                                || grace_expired
+                            if wprof_ship_deadline.is_none()
+                                && (!any_deferred
+                                    || owned_accessor.is_some()
+                                    || grace_expired)
                             {
                                 if grace_expired && any_deferred {
                                     eprintln!(
@@ -5457,12 +5573,14 @@ impl KtstrVm {
                                 }
                                 break 'coord;
                             }
-                            eprintln!(
-                                "freeze-coord: staying alive for deferred requests: captures={} kernel_ops={} accessor={}",
-                                capture_requests_deferred.len(),
-                                kernel_op_requests_deferred.len(),
-                                owned_accessor.is_some()
-                            );
+                            if any_deferred {
+                                eprintln!(
+                                    "freeze-coord: staying alive for deferred requests: captures={} kernel_ops={} accessor={}",
+                                    capture_requests_deferred.len(),
+                                    kernel_op_requests_deferred.len(),
+                                    owned_accessor.is_some()
+                                );
+                            }
                         } else {
                             bsp_done_final_pass_start = Some(Instant::now());
                         }
@@ -5479,7 +5597,16 @@ impl KtstrVm {
                         // — no deferred-capture-stay-alive semantics
                         // here because the scheduler has crashed,
                         // not exited cleanly.
-                        if sched_exit_final_pass {
+                        // A pending wprof ship outranks the ordinary one-extra-
+                        // iteration exit. The loop guard deliberately stays
+                        // live while the grace is armed; breaking here anyway
+                        // used to let an AP/watchdog kill terminate an
+                        // auto-repro VM roughly two seconds after its crash,
+                        // before the concurrently probing wprof process could
+                        // finish emitting. Once the trace/probe rendezvous or
+                        // grace backstop clears the deadline, this final pass
+                        // exits normally on the next iteration.
+                        if sched_exit_final_pass && wprof_ship_deadline.is_none() {
                             break 'coord;
                         }
                         sched_exit_final_pass = true;
@@ -5635,6 +5762,8 @@ impl KtstrVm {
                                         kill_evt: &freeze_coord_kill_evt,
                                         run_is_wprof: freeze_coord_wprof,
                                         sys_rdy_evt: &mut freeze_coord_sys_rdy_evt,
+                                        bpf_map_write_ready_evt:
+                                            freeze_coord_bpf_map_write_ready_evt.as_ref(),
                                         snapshot_requests_pending:
                                             &mut snapshot_requests_pending,
                                         kernel_op_requests_pending:
@@ -5721,52 +5850,51 @@ impl KtstrVm {
                                     // backstop below a no-op afterward.
                                     //
                                     // EXCEPTION — auto-repro (dual_snapshot)
-                                    // runs with an active probe stack: the
-                                    // guest ships its probe payload (Phase 6b,
-                                    // `PROBE_OUTPUT_END` over stdout,
-                                    // init.rs `finalize_probe_after_unwind`)
-                                    // AFTER the Phase-5 wprof trace. Killing on
-                                    // the WprofTrace frame here would preempt
-                                    // Phase 6b, so the `=== AUTO-PROBE ... ===`
-                                    // report never ships. On those runs, hold
-                                    // for the probe payload: skip the kill on
-                                    // the trace and instead promote it when the
-                                    // `PROBE_OUTPUT_END` stdout frame drains
-                                    // (arm below). The `WPROF_SHIP_GRACE`
-                                    // backstop still bounds teardown if the
-                                    // guest wedges before shipping the payload
-                                    // (e.g. a stall-exit repro that skipped
-                                    // probe attachment ships no payload) —
-                                    // keeping 7fe5cc7e's anti-hang property.
-                                    if freeze_coord_dual_snapshot {
-                                        if wprof_ship_deadline.is_some()
-                                            && drained
-                                                .messages
-                                                .iter()
-                                                .any(is_probe_output_end_frame)
-                                        {
-                                            eprintln!(
-                                                "freeze-coord: probe payload shipped \
-                                                 (PROBE_OUTPUT_END); kill triggered after ship"
-                                            );
+                                    // runs preserve BOTH the wprof trace and
+                                    // probe payload. Healthy probes emit
+                                    // PROBE_OUTPUT_END after the trace; a
+                                    // capability/load failure emits its
+                                    // diagnostic payload before the scenario
+                                    // starts. Retain both edges across drain
+                                    // batches and kill only after the
+                                    // order-independent rendezvous completes.
+                                    // The WPROF_SHIP_GRACE backstop still
+                                    // bounds a genuinely missing event (for
+                                    // example, a stall repro with no probe
+                                    // payload).
+                                    if freeze_coord_wprof
+                                        && wprof_ship.observe(
+                                            &drained.messages,
+                                            freeze_coord_dual_snapshot,
+                                        )
+                                    {
+                                        // Ack only after every artifact this
+                                        // run requires has reached host memory.
+                                        // The guest waits on this sticky edge
+                                        // after probe finalisation and before
+                                        // reboot, closing the virtio reset race.
+                                        freeze_coord_virtio_con.lock().queue_input(&[
+                                            crate::vmm::virtio_console::SIGNAL_WPROF_ARTIFACTS_RECEIVED,
+                                        ]);
+
+                                        if wprof_ship_deadline.is_some() {
+                                            if freeze_coord_dual_snapshot {
+                                                eprintln!(
+                                                    "freeze-coord: wprof trace and probe payload \
+                                                     shipped; kill triggered after rendezvous"
+                                                );
+                                            } else {
+                                                eprintln!(
+                                                    "freeze-coord: wprof trace received; \
+                                                     kill triggered after ship"
+                                                );
+                                            }
                                             trigger_freeze_coord_kill(
                                                 &freeze_coord_kill,
                                                 &freeze_coord_kill_evt,
                                             );
                                             wprof_ship_deadline = None;
                                         }
-                                    } else if wprof_ship_deadline.is_some()
-                                        && drained.messages.iter().any(is_wprof_ship_frame)
-                                    {
-                                        eprintln!(
-                                            "freeze-coord: wprof trace received; \
-                                             kill triggered after ship"
-                                        );
-                                        trigger_freeze_coord_kill(
-                                            &freeze_coord_kill,
-                                            &freeze_coord_kill_evt,
-                                        );
-                                        wprof_ship_deadline = None;
                                     }
                                     // Append the verdict-bearing entries
                                     // to the shared bucket so
@@ -14598,10 +14726,14 @@ impl KtstrVm {
         virtio_con: Arc<PiMutex<virtio_console::VirtioConsole>>,
         kern_phys_base: Arc<std::sync::atomic::AtomicU64>,
         delivery: Arc<std::sync::atomic::AtomicU8>,
+        ready_evt: Option<Arc<EventFd>>,
     ) -> Result<Option<JoinHandle<()>>> {
         if self.bpf_map_writes.is_empty() {
             return Ok(None);
         }
+        let ready_evt = ready_evt.context(
+            "configured BPF map writes require a guest-instrumentation readiness eventfd",
+        )?;
         let Some(vmlinux) = find_vmlinux(&self.kernel) else {
             eprintln!("bpf_map_write: vmlinux not found, skipping");
             return Ok(None);
@@ -14858,12 +14990,18 @@ impl KtstrVm {
 
                 // Phase 3: run every queued write.
                 //
-                // The legacy SHM signal slot 1 (`SIGNAL_PROBES_READY`)
-                // gate that waited for the guest's probe pipeline to
-                // attach has been removed along with the SHM
-                // signal-slot infrastructure. The writes now race
-                // against probe attachment; replacing the rendezvous
-                // with a virtio-console signal is a follow-up.
+                // The target is now fully resolved, but do not mutate it until
+                // the guest's explicit Phase-5 edge proves the probe pipeline
+                // and optional wprof tracer are armed. The dedicated eventfd
+                // is sticky if the guest got here first and is polled together
+                // with kill_evt, so both success and teardown wake immediately
+                // without a timeout or periodic retry.
+                if !wait_for_bpf_map_write_ready(&ready_evt, &kill_evt_clone, &kill_clone) {
+                    eprintln!(
+                        "bpf_map_write: VM exited before guest instrumentation became ready"
+                    );
+                    return;
+                }
 
                 // Rebind a fresh accessor for the writes. As in the retry
                 // loop, `maps()`/`load_program_btf` snapshot the map IDR once
@@ -16139,9 +16277,11 @@ mod wprof_grace_tests {
     //! [`is_sched_exit_frame`] (which drained frame ARMS the grace on a
     //! wprof run), [`is_probe_output_end_frame`] (which drained frame
     //! ends the grace on an auto-repro probe run), and
-    //! [`wprof_grace_should_kill`] (the bounded deadline backstop).
+    //! [`WprofShipState`] (the order-independent artifact
+    //! rendezvous), and [`wprof_grace_should_kill`] (the bounded deadline
+    //! backstop).
     use super::{
-        is_probe_output_end_frame, is_sched_exit_frame, is_wprof_ship_frame,
+        WprofShipState, is_probe_output_end_frame, is_sched_exit_frame, is_wprof_ship_frame,
         wprof_grace_should_kill,
     };
     use crate::vmm::bulk::BulkMessage;
@@ -16214,6 +16354,45 @@ mod wprof_grace_tests {
             !is_probe_output_end_frame(&frame(MSG_TYPE_WPROF_TRACE, end, true)),
             "the marker on a non-stdout frame type does not count"
         );
+    }
+
+    #[test]
+    fn auto_repro_ship_rendezvous_accepts_both_orders_across_batches() {
+        let end = crate::test_support::PROBE_OUTPUT_END.as_bytes();
+        let probe = frame(MSG_TYPE_STDOUT, end, true);
+        let trace = frame(MSG_TYPE_WPROF_TRACE, b"pb", true);
+
+        let mut probe_first = WprofShipState::default();
+        assert!(!probe_first.observe(std::slice::from_ref(&probe), true));
+        assert!(probe_first.observe(std::slice::from_ref(&trace), true));
+        assert!(!probe_first.observe(std::slice::from_ref(&trace), true));
+
+        let mut trace_first = WprofShipState::default();
+        assert!(!trace_first.observe(std::slice::from_ref(&trace), true));
+        assert!(trace_first.observe(std::slice::from_ref(&probe), true));
+    }
+
+    #[test]
+    fn auto_repro_ship_rendezvous_rejects_torn_or_incomplete_frames() {
+        let end = crate::test_support::PROBE_OUTPUT_END.as_bytes();
+        let mut state = WprofShipState::default();
+        assert!(!state.observe(
+            &[
+                frame(MSG_TYPE_WPROF_TRACE, b"pb", false),
+                frame(MSG_TYPE_STDOUT, end, false),
+            ],
+            true
+        ));
+        assert!(!state.observe(&[frame(MSG_TYPE_WPROF_TRACE, b"pb", true)], true));
+        assert!(!state.observe(&[frame(MSG_TYPE_STDOUT, b"not the marker", true)], true));
+    }
+
+    #[test]
+    fn plain_wprof_rendezvous_requires_only_trace_and_acks_once() {
+        let trace = frame(MSG_TYPE_WPROF_TRACE, b"pb", true);
+        let mut state = WprofShipState::default();
+        assert!(state.observe(std::slice::from_ref(&trace), false));
+        assert!(!state.observe(std::slice::from_ref(&trace), false));
     }
 
     #[test]

@@ -142,6 +142,14 @@ pub const SIGNAL_ACCESSOR_READY: u8 = 0xAC;
 /// KERN_ADDRS). Host side: `host_comms::request_periodic_prereqs_ready`.
 pub const SIGNAL_PERIODIC_READY: u8 = 0xAD;
 
+/// RX wake byte: the host has drained every artifact required for the
+/// current wprof run. A normal run requires the terminal WprofTrace frame;
+/// an auto-repro run additionally requires PROBE_OUTPUT_END. Guest init waits
+/// on the matching latch after probe finalisation and before reboot, closing
+/// the virtio-reset race where a successful bulk write was discarded before
+/// the host consumed its descriptor.
+pub const SIGNAL_WPROF_ARTIFACTS_RECEIVED: u8 = 0xAE;
+
 // `NUM_PORTS` lives in [`super::wire`]; re-exported here so existing
 // call sites keep working. Port 0 = console (hvc0); port 1 = bulk
 // TLV stream (`/dev/vport0p1`); port 2 = scheduler-stats relay

@@ -51,10 +51,234 @@ pub(crate) fn parse_topo_from_cmdline() -> Option<(u32, u32, u32, u32)> {
 }
 
 #[cfg(feature = "wprof")]
+const WPROF_READY_MARKER: &[u8] = b"Running...";
+
+#[cfg(feature = "wprof")]
+struct WprofStartupSignal {
+    sender: Option<std::sync::mpsc::SyncSender<bool>>,
+    suffix: Vec<u8>,
+}
+
+#[cfg(feature = "wprof")]
+impl WprofStartupSignal {
+    fn new(sender: std::sync::mpsc::SyncSender<bool>) -> Self {
+        Self {
+            sender: Some(sender),
+            suffix: Vec::with_capacity(WPROF_READY_MARKER.len() - 1),
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8]) {
+        if self.sender.is_none() {
+            return;
+        }
+
+        self.suffix.extend_from_slice(bytes);
+        if self
+            .suffix
+            .windows(WPROF_READY_MARKER.len())
+            .any(|window| window == WPROF_READY_MARKER)
+        {
+            if let Some(sender) = self.sender.take() {
+                let _ = sender.send(true);
+            }
+            self.suffix.clear();
+            return;
+        }
+
+        let keep = self.suffix.len().min(WPROF_READY_MARKER.len() - 1);
+        self.suffix.drain(..self.suffix.len() - keep);
+    }
+
+    fn finish_unready(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(false);
+        }
+    }
+}
+
+#[cfg(feature = "wprof")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WprofWait {
+    Exited,
+    TimedOut,
+    Failed,
+}
+
+#[cfg(feature = "wprof")]
+fn set_nonblocking(fd: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: `fd` is the live ChildStderr owned by the calling thread.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: preserving the existing status flags and adding O_NONBLOCK is
+    // valid for a pipe read end. The fd remains owned by ChildStderr.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wprof")]
+fn drain_wprof_stderr(
+    child_stderr: &mut std::process::ChildStderr,
+    guest_stderr: &mut std::io::Stderr,
+    startup: &mut WprofStartupSignal,
+) -> std::io::Result<()> {
+    let mut buf = [0u8; 4096];
+    loop {
+        match child_stderr.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                let bytes = &buf[..n];
+                startup.observe(bytes);
+                // Preserve the previous inherited-stderr behavior: wprof's
+                // diagnostics remain visible on the guest console as they
+                // arrive, including startup errors before the ready edge.
+                let _ = guest_stderr.write_all(bytes);
+                let _ = guest_stderr.flush();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(feature = "wprof")]
+fn wait_wprof_evented(
+    child: &mut std::process::Child,
+    child_stderr: &mut std::process::ChildStderr,
+    startup: &mut WprofStartupSignal,
+    timeout: std::time::Duration,
+) -> WprofWait {
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: pidfd_open(2) on this thread's live child, flags 0. The returned
+    // descriptor is wrapped in OwnedFd immediately below.
+    let raw_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) as libc::c_int };
+    if raw_pidfd < 0 {
+        startup.finish_unready();
+        return WprofWait::Failed;
+    }
+    // SAFETY: raw_pidfd is a newly-created owned descriptor and is consumed
+    // exactly once by this OwnedFd.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw_pidfd) };
+
+    if let Err(e) = set_nonblocking(child_stderr.as_raw_fd()) {
+        eprintln!("ktstr: failed to make wprof stderr evented: {e}");
+        startup.finish_unready();
+        return WprofWait::Failed;
+    }
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut guest_stderr = std::io::stderr();
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            startup.finish_unready();
+            return WprofWait::TimedOut;
+        }
+        let remaining = deadline - now;
+        let timeout_ms = remaining
+            .as_millis()
+            .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0))
+            .min(i32::MAX as u128) as libc::c_int;
+        let mut pollfds = [
+            libc::pollfd {
+                fd: child_stderr.as_raw_fd(),
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: both pollfds borrow live descriptors for the duration of
+        // this call. poll only writes their revents fields.
+        let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, timeout_ms) };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            eprintln!("ktstr: wprof event wait failed: {e}");
+            startup.finish_unready();
+            return WprofWait::Failed;
+        }
+        if rc == 0 {
+            startup.finish_unready();
+            return WprofWait::TimedOut;
+        }
+
+        let stderr_events = pollfds[0].revents;
+        if stderr_events & (libc::POLLIN | libc::POLLHUP) != 0
+            && let Err(e) = drain_wprof_stderr(child_stderr, &mut guest_stderr, startup)
+        {
+            eprintln!("ktstr: reading wprof stderr failed: {e}");
+            startup.finish_unready();
+            return WprofWait::Failed;
+        }
+        if stderr_events & libc::POLLNVAL != 0 {
+            startup.finish_unready();
+            return WprofWait::Failed;
+        }
+
+        let pidfd_events = pollfds[1].revents;
+        if pidfd_events & (libc::POLLIN | libc::POLLHUP) != 0 {
+            // A process can write its final stderr bytes immediately before
+            // exit. Drain once more after pidfd readiness so the ready marker
+            // cannot be lost when both edges coalesce into one poll wake.
+            let _ = drain_wprof_stderr(child_stderr, &mut guest_stderr, startup);
+            startup.finish_unready();
+            return WprofWait::Exited;
+        }
+        if pidfd_events & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            startup.finish_unready();
+            return WprofWait::Failed;
+        }
+    }
+}
+
+#[cfg(feature = "wprof")]
+pub(crate) struct WprofCapture {
+    startup: std::sync::mpsc::Receiver<bool>,
+    startup_timeout: std::time::Duration,
+    handle: std::thread::JoinHandle<Option<Vec<u8>>>,
+}
+
+#[cfg(feature = "wprof")]
+impl WprofCapture {
+    pub(crate) fn wait_until_ready(&self) -> bool {
+        match self
+            .startup
+            .recv_timeout(self.startup_timeout + std::time::Duration::from_secs(1))
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                eprintln!("ktstr: wprof exited or timed out before becoming ready");
+                false
+            }
+            Err(e) => {
+                eprintln!("ktstr: wprof readiness wait failed: {e}");
+                false
+            }
+        }
+    }
+
+    pub(crate) fn join(self) -> std::thread::Result<Option<Vec<u8>>> {
+        self.handle.join()
+    }
+}
+
+#[cfg(feature = "wprof")]
 /// Spawn `/bin/wprof` in a background thread if the host set
-/// `KTSTR_WPROF_ARGS` on the kernel cmdline. Returns a join handle
-/// whose `.join()` yields `Some(Vec<u8>)` (the `.pb` trace bytes)
-/// on success, or `None` on failure / no-op.
+/// `KTSTR_WPROF_ARGS` on the kernel cmdline. Returns a capture handle
+/// that exposes wprof's event-driven startup edge and whose `.join()`
+/// yields `Some(Vec<u8>)` (the `.pb` trace bytes) on success, or `None`
+/// on failure / no-op.
 ///
 /// The spawned thread:
 /// 1. Parses `KTSTR_WPROF_ARGS` from `/proc/cmdline`
@@ -66,15 +290,30 @@ pub(crate) fn parse_topo_from_cmdline() -> Option<(u32, u32, u32, u32)> {
 /// returns `None` (no thread spawned, no-op). The caller joins the
 /// handle after the test workload dispatch returns and ships the
 /// bytes via [`crate::vmm::guest_comms::send_wprof_trace`].
-pub(crate) fn spawn_wprof_if_configured() -> Option<std::thread::JoinHandle<Option<Vec<u8>>>> {
+pub(crate) fn spawn_wprof_if_configured() -> Option<WprofCapture> {
     let args_str = cmdline_val("KTSTR_WPROF_ARGS")?;
     let wprof_bin = std::path::Path::new("/bin/wprof");
     if !wprof_bin.exists() {
         tracing::warn!("KTSTR_WPROF_ARGS set but /bin/wprof missing from initramfs");
         return None;
     }
-    Some(
-        std::thread::Builder::new()
+    let mut cmd_args: Vec<String> = args_str.split('\x1f').map(String::from).collect();
+    cmd_args.extend([
+        "-T".to_string(),
+        "/tmp/wprof.pb".to_string(),
+        "-D".to_string(),
+        "/tmp/wprof.data".to_string(),
+    ]);
+    let capture_ms = cmd_args
+        .iter()
+        .position(|a| a == "-d")
+        .and_then(|i| cmd_args.get(i + 1))
+        .and_then(|d| d.parse::<u64>().ok())
+        .unwrap_or(500);
+    let deadline =
+        std::time::Duration::from_millis(capture_ms) + std::time::Duration::from_secs(10);
+    let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
+    let handle = std::thread::Builder::new()
             .name("wprof-capture".into())
             .spawn(move || {
                 // Host encodes args with ASCII Unit Separator (\x1F)
@@ -82,13 +321,7 @@ pub(crate) fn spawn_wprof_if_configured() -> Option<std::thread::JoinHandle<Opti
                 // cmdline tokenization would truncate a space-joined
                 // value at the first space. Split on the same
                 // delimiter here to recover the per-arg vec.
-                let mut cmd_args: Vec<String> = args_str.split('\x1f').map(String::from).collect();
-                cmd_args.extend([
-                    "-T".to_string(),
-                    "/tmp/wprof.pb".to_string(),
-                    "-D".to_string(),
-                    "/tmp/wprof.data".to_string(),
-                ]);
+                let mut startup = WprofStartupSignal::new(startup_tx);
                 tracing::debug!(args = ?cmd_args, "spawning /bin/wprof");
                 // Bounded wait for the wprof child. A wprof stranded by a
                 // crashing sched_ext scheduler — notably the 6.14
@@ -104,25 +337,24 @@ pub(crate) fn spawn_wprof_if_configured() -> Option<std::thread::JoinHandle<Opti
                 // and reboots within the host's grace. On the cap the trace
                 // is dropped (loudly) and teardown proceeds — a clean
                 // failure, never a hang. Mirrors `reap_child_bounded`.
-                let capture_ms = cmd_args
-                    .iter()
-                    .position(|a| a == "-d")
-                    .and_then(|i| cmd_args.get(i + 1))
-                    .and_then(|d| d.parse::<u64>().ok())
-                    .unwrap_or(500);
-                let deadline = std::time::Duration::from_millis(capture_ms)
-                    + std::time::Duration::from_secs(10);
                 let mut child = match std::process::Command::new("/bin/wprof")
                     .args(&cmd_args)
                     .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::piped())
                     .spawn()
                 {
                     Ok(c) => c,
                     Err(e) => {
+                        startup.finish_unready();
                         tracing::warn!(%e, "spawn /bin/wprof failed");
                         return None;
                     }
+                };
+                let Some(mut child_stderr) = child.stderr.take() else {
+                    startup.finish_unready();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
                 };
                 // Determine wprof's exit disposition, then ship the trace on
                 // FILE-PRESENCE (a non-empty /tmp/wprof.pb) regardless of exit
@@ -138,11 +370,16 @@ pub(crate) fn spawn_wprof_if_configured() -> Option<std::thread::JoinHandle<Opti
                 // truncated. This is the reliability backstop; it perturbs no
                 // scheduling priority.
                 let pid = child.id() as libc::pid_t;
-                match crate::sync::pidfd_poll_exited(pid, deadline) {
-                    crate::sync::PidfdWait::Exited => {
+                match wait_wprof_evented(
+                    &mut child,
+                    &mut child_stderr,
+                    &mut startup,
+                    deadline,
+                ) {
+                    WprofWait::Exited => {
                         let _ = child.wait();
                     }
-                    crate::sync::PidfdWait::TimedOut => {
+                    WprofWait::TimedOut => {
                         // wprof did not exit within the window — its userspace
                         // emit thread lost CPU (e.g. to the concurrent auto-repro
                         // probe pipeline during the crash-bypass window). SIGTERM
@@ -160,11 +397,13 @@ pub(crate) fn spawn_wprof_if_configured() -> Option<std::thread::JoinHandle<Opti
                         unsafe {
                             libc::kill(pid, libc::SIGTERM);
                         }
-                        match crate::sync::pidfd_poll_exited(
-                            pid,
+                        match wait_wprof_evented(
+                            &mut child,
+                            &mut child_stderr,
+                            &mut startup,
                             std::time::Duration::from_secs(8),
                         ) {
-                            crate::sync::PidfdWait::Exited => {
+                            WprofWait::Exited => {
                                 let _ = child.wait();
                             }
                             _ => {
@@ -173,7 +412,7 @@ pub(crate) fn spawn_wprof_if_configured() -> Option<std::thread::JoinHandle<Opti
                             }
                         }
                     }
-                    crate::sync::PidfdWait::NoPidfd => {
+                    WprofWait::Failed => {
                         if !matches!(child.try_wait(), Ok(Some(_))) {
                             let _ = child.kill();
                         }
@@ -195,8 +434,46 @@ pub(crate) fn spawn_wprof_if_configured() -> Option<std::thread::JoinHandle<Opti
                     }
                 }
             })
-            .expect("spawn wprof-capture thread"),
-    )
+            .expect("spawn wprof-capture thread");
+    Some(WprofCapture {
+        startup: startup_rx,
+        startup_timeout: deadline,
+        handle,
+    })
+}
+
+#[cfg(all(test, feature = "wprof"))]
+mod wprof_startup_tests {
+    use super::*;
+
+    #[test]
+    fn ready_marker_is_detected_across_read_boundaries() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut signal = WprofStartupSignal::new(tx);
+
+        signal.observe(b"Preparing...\nRun");
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        signal.observe(b"ning...\n");
+        assert_eq!(rx.recv().unwrap(), true);
+
+        signal.finish_unready();
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn exit_before_ready_reports_failure() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut signal = WprofStartupSignal::new(tx);
+        signal.observe(b"startup failed\n");
+        signal.finish_unready();
+        assert_eq!(rx.recv().unwrap(), false);
+    }
 }
 
 /// Loop-iteration counter for [`send_sys_rdy_with_retry`], bumped once

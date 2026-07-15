@@ -87,6 +87,12 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// hostile guest could in principle resend) skip the eventfd
     /// write.
     pub sys_rdy_evt: &'a mut Option<Arc<EventFd>>,
+    /// Dedicated readiness event for configured host BPF-map writes. A
+    /// CRC-valid empty [`crate::vmm::wire::MsgType::BpfMapWriteReady`]
+    /// frame writes this eventfd; the map-writer thread blocks on it after
+    /// resolving the target and before mutation. `None` on runs without a
+    /// configured write, so ordinary tests allocate no fd and take no arm.
+    pub bpf_map_write_ready_evt: Option<&'a Arc<EventFd>>,
     /// Scheduler-swap notification latch. Set `true` on a CRC-valid
     /// `MSG_TYPE_SCHED_SWAP_NOTIFY` frame; the freeze coordinator's
     /// run-loop reads-and-clears it each iteration and synchronously
@@ -541,6 +547,24 @@ pub(super) fn dispatch_bulk_message(
                 advance_stage(sinks, crate::monitor::LifecycleStage::Attach);
             }
             // SysRdy is coordinator-internal — do NOT bucket.
+            None
+        }
+        Some(crate::vmm::wire::MsgType::BpfMapWriteReady) => {
+            // Release a configured map writer only on the exact empty-frame
+            // shape. The eventfd is level-triggered and the writer consumes
+            // the edge once, so an early frame remains sticky until map
+            // discovery completes. Coordinator-internal — do NOT bucket.
+            if msg.crc_ok
+                && msg.payload.is_empty()
+                && let Some(evt) = sinks.bpf_map_write_ready_evt
+                && let Err(e) = evt.write(1)
+            {
+                tracing::warn!(
+                    err = %e,
+                    "freeze_coord: BPF-map-write readiness eventfd write failed; \
+                     injection remains safely gated"
+                );
+            }
             None
         }
         Some(crate::vmm::wire::MsgType::SchedSwapNotify) => {
@@ -1298,6 +1322,7 @@ mod stage_tests {
                 kill_evt: &self.kill_evt,
                 run_is_wprof: false,
                 sys_rdy_evt: &mut self.sys_rdy_evt,
+                bpf_map_write_ready_evt: None,
                 snapshot_requests_pending: &mut self.snapshot_requests_pending,
                 kernel_op_requests_pending: &mut self.kernel_op_requests_pending,
                 kern_phys_base: &self.kern_phys_base,

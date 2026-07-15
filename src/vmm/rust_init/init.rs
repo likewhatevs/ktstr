@@ -787,13 +787,52 @@ pub(crate) fn ktstr_guest_init() -> ! {
         }
     }
     crate::vmm::guest_comms::send_lifecycle(crate::vmm::wire::LifecyclePhase::PayloadStarting, "");
-    crate::vmm::guest_comms::send_scenario_start();
 
     #[cfg(feature = "wprof")]
-    let wprof_handle = spawn_wprof_if_configured();
+    let wprof_requested = crate::vmm::rust_init::cmdline_val("KTSTR_WPROF_ARGS").is_some();
+    #[cfg(feature = "wprof")]
+    let wprof_capture = spawn_wprof_if_configured();
+    #[cfg(feature = "wprof")]
+    let wprof_ready = match wprof_capture.as_ref() {
+        Some(capture) => capture.wait_until_ready(),
+        None => !wprof_requested,
+    };
+
+    #[cfg(feature = "wprof")]
+    let instrumentation_ready = wprof_ready;
+    #[cfg(not(feature = "wprof"))]
+    let instrumentation_ready = true;
+
+    // Host BPF-map writes are intentionally held behind a guest edge. The
+    // host can resolve the target map as soon as the scheduler loads it, but
+    // mutating a crash/stall field before the probe pipeline and optional
+    // wprof tracer are ready destroys the very observability the injection is
+    // meant to exercise. Only configured map-write runs carry the cmdline
+    // token, so ordinary runs send no frame and pay no cost.
+    let bpf_map_write_ready = if instrumentation_ready
+        && crate::vmm::rust_init::cmdline_val("KTSTR_AWAIT_BPF_MAP_WRITE_READY").is_some()
+    {
+        crate::vmm::guest_comms::send_bpf_map_write_ready()
+    } else {
+        true
+    };
+    let dispatch_ready = instrumentation_ready && bpf_map_write_ready;
+
+    // Do not open the host's scenario clock until optional instrumentation is
+    // actually armed. In particular, wprof emits `Running...` only after its
+    // BPF setup is complete; starting a crash workload before that edge can
+    // disable the scheduler while the tracer is still loading and lose the
+    // auto-repro artifact. The readiness wait is event-driven on wprof's
+    // existing stderr + pidfd and adds no guest thread or polling wake.
+    crate::vmm::guest_comms::send_scenario_start();
 
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
-    let code = if crate::test_support::is_verifier_workload(&args) {
+    let code = if !dispatch_ready {
+        eprintln!(
+            "ktstr-init: workload not dispatched because required instrumentation readiness failed"
+        );
+        1
+    } else if crate::test_support::is_verifier_workload(&args) {
         // Verifier sweep VM: no `#[ktstr_test]` body to dispatch. Instead
         // run the dispatch probe — spawn a SpinWait workload and, on
         // confirmed worker progress after the scheduler attached, emit a
@@ -811,11 +850,13 @@ pub(crate) fn ktstr_guest_init() -> ! {
     crate::vmm::guest_comms::send_scenario_pause();
 
     #[cfg(feature = "wprof")]
-    if let Some(handle) = wprof_handle
-        && let Ok(Some(pb_bytes)) = handle.join()
-    {
-        crate::vmm::guest_comms::send_wprof_trace(&pb_bytes);
-    }
+    let wprof_trace_sent = match wprof_capture {
+        Some(capture) => match capture.join() {
+            Ok(Some(pb_bytes)) => crate::vmm::guest_comms::send_wprof_trace(&pb_bytes),
+            _ => false,
+        },
+        None => false,
+    };
 
     drop(_s_phase5);
 
@@ -918,6 +959,27 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // cannot stall teardown. When no probes were stashed
     // (single-phase ctor path or EEVDF runs), the call is a no-op.
     crate::test_support::finalize_probe_after_unwind();
+
+    // A successful write to virtio-console means the descriptor was offered,
+    // not that the host consumed it. Reboot resets the device and can discard
+    // an offered trace/probe tail before the freeze coordinator drains it —
+    // particularly in auto-repro, where Phase 6 can finish within hundreds of
+    // milliseconds of the crash. Wait event-driven on the host's artifact
+    // rendezvous acknowledgement before stopping hvc0 or rebooting. The latch
+    // is sticky, so the normal case (host already drained the artifacts) is
+    // immediate. This is teardown-only: ScenarioPause was sent before the
+    // trace, so the wait cannot alter workload metrics or runtime behavior.
+    #[cfg(feature = "wprof")]
+    if wprof_trace_sent {
+        let acknowledged =
+            wprof_artifacts_received_latch().wait_timeout(std::time::Duration::from_secs(30));
+        if !acknowledged {
+            tracing::warn!(
+                "ktstr-init: host did not acknowledge wprof artifacts within 30s; \
+                 continuing bounded teardown"
+            );
+        }
+    }
 
     // Stop remaining background threads.
     if let Some(ref stop) = vc_poll_stop {

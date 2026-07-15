@@ -107,6 +107,7 @@ impl SinkState {
             kill_evt: &self.kill_evt,
             run_is_wprof: self.run_is_wprof,
             sys_rdy_evt: &mut self.sys_rdy_evt,
+            bpf_map_write_ready_evt: None,
             snapshot_requests_pending: &mut self.snapshot_requests_pending,
             kernel_op_requests_pending: &mut self.kernel_op_requests_pending,
             kern_phys_base: &self.kern_phys_base,

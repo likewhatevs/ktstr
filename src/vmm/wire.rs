@@ -259,6 +259,16 @@ pub enum MsgType {
     /// printk via `/dev/hvc0`), which depended on incidental
     /// console traffic rather than an explicit readiness signal.
     SysRdy,
+    /// Guest→host readiness edge for configured host BPF-map writes
+    /// (payload: empty).
+    ///
+    /// Emitted immediately before ScenarioStart, after the guest's probe
+    /// pipeline and optional wprof capture are armed. The host may discover
+    /// and resolve the target map earlier, but waits on this edge before
+    /// mutating it. This prevents a crash injection from killing the
+    /// scheduler before the instrumentation needed to observe that crash is
+    /// live. Coordinator-internal: carries no test verdict.
+    BpfMapWriteReady,
     /// Guest→host scheduler-swap notification (payload: empty).
     ///
     /// Emitted by the guest's `kill_current_scheduler`
@@ -302,6 +312,7 @@ impl MsgType {
             MsgType::KernelOpRequest => MSG_TYPE_KERNEL_OP_REQUEST,
             MsgType::KernelOpReply => MSG_TYPE_KERNEL_OP_REPLY,
             MsgType::SysRdy => MSG_TYPE_SYS_RDY,
+            MsgType::BpfMapWriteReady => MSG_TYPE_BPF_MAP_WRITE_READY,
             MsgType::SchedSwapNotify => MSG_TYPE_SCHED_SWAP_NOTIFY,
             MsgType::Stdout => MSG_TYPE_STDOUT,
             MsgType::Stderr => MSG_TYPE_STDERR,
@@ -339,6 +350,7 @@ impl MsgType {
             MSG_TYPE_KERNEL_OP_REQUEST => Some(MsgType::KernelOpRequest),
             MSG_TYPE_KERNEL_OP_REPLY => Some(MsgType::KernelOpReply),
             MSG_TYPE_SYS_RDY => Some(MsgType::SysRdy),
+            MSG_TYPE_BPF_MAP_WRITE_READY => Some(MsgType::BpfMapWriteReady),
             MSG_TYPE_SCHED_SWAP_NOTIFY => Some(MsgType::SchedSwapNotify),
             MSG_TYPE_STDOUT => Some(MsgType::Stdout),
             MSG_TYPE_STDERR => Some(MsgType::Stderr),
@@ -384,6 +396,8 @@ impl MsgType {
     ///     synchronous periodic-capture accessor teardown the freeze
     ///     coordinator performs on a CRC-valid frame; carries no test
     ///     verdict.
+    ///   - [`MsgType::BpfMapWriteReady`] — releases the configured
+    ///     host-side map writer after guest instrumentation is armed.
     pub const fn is_coordinator_internal(self) -> bool {
         matches!(
             self,
@@ -392,6 +406,7 @@ impl MsgType {
                 | MsgType::KernelOpRequest
                 | MsgType::KernelOpReply
                 | MsgType::SysRdy
+                | MsgType::BpfMapWriteReady
                 | MsgType::SchedSwapNotify
         )
     }
@@ -563,6 +578,12 @@ pub const MSG_TYPE_SNAPSHOT_REPLY: u32 = 0x534e_5250; // "SNRP"
 /// `MSG_TYPE_SYS_RDY` frame into the monitor's boot-complete
 /// eventfd. See [`MsgType::SysRdy`] for the protocol contract.
 pub const MSG_TYPE_SYS_RDY: u32 = 0x5352_4459; // "SRDY"
+
+/// Guest→host readiness edge for configured host BPF-map writes.
+/// Empty payload; promoted to a dedicated host eventfd only after CRC and
+/// shape validation. The guest emits it after probes and optional wprof are
+/// ready, immediately before ScenarioStart.
+pub const MSG_TYPE_BPF_MAP_WRITE_READY: u32 = 0x424D_5259; // "BMRY"
 
 /// Guest→host scheduler-swap notification (payload: empty).
 ///
@@ -1635,6 +1656,7 @@ mod tests {
             MSG_TYPE_KERNEL_OP_REQUEST,
             MSG_TYPE_KERNEL_OP_REPLY,
             MSG_TYPE_SYS_RDY,
+            MSG_TYPE_BPF_MAP_WRITE_READY,
             MSG_TYPE_SCHED_SWAP_NOTIFY,
             MSG_TYPE_STDOUT,
             MSG_TYPE_STDERR,
@@ -1777,6 +1799,10 @@ mod tests {
             MSG_TYPE_KERNEL_OP_REPLY
         );
         assert_eq!(MsgType::SysRdy.wire_value(), MSG_TYPE_SYS_RDY);
+        assert_eq!(
+            MsgType::BpfMapWriteReady.wire_value(),
+            MSG_TYPE_BPF_MAP_WRITE_READY
+        );
         assert_eq!(MsgType::Stdout.wire_value(), MSG_TYPE_STDOUT);
         assert_eq!(MsgType::Stderr.wire_value(), MSG_TYPE_STDERR);
         assert_eq!(MsgType::SchedLog.wire_value(), MSG_TYPE_SCHED_LOG);
