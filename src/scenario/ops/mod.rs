@@ -1176,9 +1176,16 @@ fn run_scenario(
     }
 
     // Workload-progress heartbeat: drives the host's periodic-capture clock
-    // off guest progress. Lives until this function returns (any path).
-    let _workload_heartbeat =
-        guest_comms::is_guest().then(|| WorkloadHeartbeat::spawn(scenario_start));
+    // off guest progress. Lives until this function returns (any path). Only
+    // spawned when this run actually declares periodic captures
+    // (`KTSTR_AWAIT_PERIODIC_READY`, set iff num_snapshots > 0): a run with
+    // no periodic captures gains nothing from it, and the extra 100ms-waking
+    // thread would only perturb the scenario — e.g. a watchdog idle-body
+    // exemption test on a single starved vCPU, where the added thread can
+    // tip a survive into a wall-clock kill.
+    let _workload_heartbeat = (guest_comms::is_guest()
+        && crate::vmm::rust_init::cmdline_val("KTSTR_AWAIT_PERIODIC_READY").is_some())
+    .then(|| WorkloadHeartbeat::spawn(scenario_start));
 
     wait_for_host_map_write(ctx);
 
