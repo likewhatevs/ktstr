@@ -1090,6 +1090,49 @@ fn finish_scenario(
     result
 }
 
+/// Guest workload-progress heartbeat. While alive, a detached background
+/// thread emits the scenario-elapsed time on a fixed GUEST-time cadence
+/// (see [`crate::vmm::wire::MSG_TYPE_WORKLOAD_PROGRESS`]) so the host can
+/// clock periodic captures off guest progress rather than host wall-clock.
+/// Dropping it (when `run_scenario` returns on ANY path) signals the thread
+/// to stop. The thread is DETACHED, never joined: at teardown the scheduler
+/// under test may be dead or mid-kill, so the heartbeat thread might not be
+/// scheduled to observe the stop flag promptly, and a join could hang the
+/// guest teardown. It exits on its next wake, or at guest reboot.
+struct WorkloadHeartbeat {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl WorkloadHeartbeat {
+    /// Cadence: frequent enough that the host's staleness backstop can
+    /// tell a wedge (heartbeats STOP) from mere load dilation (they SLOW)
+    /// even at large host oversubscription, yet cheap enough to be
+    /// negligible load on the scheduler under test.
+    const CADENCE: std::time::Duration = std::time::Duration::from_millis(100);
+
+    fn spawn(scenario_start: std::time::Instant) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_stop = std::sync::Arc::clone(&stop);
+        let _ = std::thread::Builder::new()
+            .name("ktstr-workload-hb".into())
+            .spawn(move || {
+                while !thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    crate::vmm::guest_comms::send_workload_progress(
+                        scenario_start.elapsed().as_millis() as u64,
+                    );
+                    std::thread::sleep(Self::CADENCE);
+                }
+            });
+        Self { stop }
+    }
+}
+
+impl Drop for WorkloadHeartbeat {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Internal driver: runs Backdrop setup, the Step loop with
 /// per-Step teardown, and final Backdrop teardown.
 fn run_scenario(
@@ -1131,6 +1174,11 @@ fn run_scenario(
     if guest_comms::is_guest() {
         crate::vmm::guest_comms::send_scenario_start();
     }
+
+    // Workload-progress heartbeat: drives the host's periodic-capture clock
+    // off guest progress. Lives until this function returns (any path).
+    let _workload_heartbeat =
+        guest_comms::is_guest().then(|| WorkloadHeartbeat::spawn(scenario_start));
 
     wait_for_host_map_write(ctx);
 

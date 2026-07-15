@@ -2820,6 +2820,12 @@ impl KtstrVm {
         // variants get independent atomics.
         let host_current_step: Arc<AtomicU16> = Arc::new(AtomicU16::new(0));
         let freeze_coord_current_step = Arc::clone(&host_current_step);
+        // Guest scenario-elapsed clock (ns) published by the workload-progress
+        // heartbeat; the run-loop reads it to clock periodic captures off
+        // guest progress. 0 until the first heartbeat.
+        let host_periodic_guest_elapsed: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let freeze_coord_periodic_guest_elapsed = Arc::clone(&host_periodic_guest_elapsed);
         // Optional virtio-blk handle for the failure-dump
         // worker-pause rendezvous. None when no disk is attached.
         // Cloned into the closure so the dump path can call
@@ -4580,25 +4586,31 @@ impl KtstrVm {
                 // post-workload idle. 0 = not yet ready.
                 let mut periodic_prereqs_ready_ns: u64 = 0;
                 let mut next_periodic_idx: u32 = 0;
-                // Highest scenario step for which a periodic capture has been
-                // forced at its start. The time-sliced boundaries below are a
-                // host-wall-clock schedule; under host oversubscription the
-                // guest's workload time dilates against that clock, so every
-                // boundary can fire while the guest is still in its FIRST phase,
-                // leaving later phases with NO periodic sample — a cross-phase
-                // reduction (counter_delta_per_phase) then sees a phase absent
-                // and its comparator records nothing (Inconclusive). To
-                // guarantee every phase the guest actually enters gets at least
-                // one periodic sample, force a capture the first time each new
-                // step is observed (edge-triggered on the guest-published
-                // `freeze_coord_current_step`, which the dispatch loop advances
-                // on each StepStart frame). The forced capture is a boundary
-                // spliced into the schedule at the current instant, so it fires
-                // through the SAME machinery, stamped with the live phase — it
-                // is a genuine periodic sample of the phase, not a host time
-                // guess at the dilation. Dilation-invariant by construction: a
-                // phase cannot be empty if entering it triggers a sample.
-                let mut last_periodic_step_forced: u16 = 0;
+                // Periodic-capture clock, driven off GUEST progress. The
+                // boundaries below are sliced over the workload in scenario-
+                // relative time; comparing them against host wall-clock makes
+                // every boundary fire while a host-oversubscribed (dilated)
+                // guest is still in its FIRST phase, starving later phases. So
+                // fire each boundary when the GUEST'S OWN scenario-elapsed clock
+                // (published by the workload-progress heartbeat) crosses it —
+                // the same fixed num_snapshots samples then spread across the
+                // guest's real phases regardless of host dilation, WITHOUT any
+                // extra captures/freezes. `periodic_prev_guest_elapsed_ns` is
+                // the last-seen guest clock; `periodic_last_hb_wall_ns` is the
+                // run-relative wall time it last ADVANCED, used to tell a wedge
+                // (heartbeats STOP) from load (they merely SLOW): past the
+                // staleness bound the host resumes on wall-clock so a degraded
+                // guest's stuck state is still captured. Both 0 until the first
+                // heartbeat, when the clock falls back to wall-clock exactly as
+                // before (old guest / pre-heartbeat window).
+                let mut periodic_prev_guest_elapsed_ns: u64 = 0;
+                let mut periodic_last_hb_wall_ns: u64 = 0;
+                // Wall-clock gap with no heartbeat advance that flips the clock
+                // from guest-progress back to wall-clock (wedge backstop). Must
+                // exceed the heartbeat cadence times the largest dilation a
+                // healthy-but-slow guest reaches, so load never looks like a
+                // wedge; 4 s covers the 100 ms cadence out past ~40x.
+                const PERIODIC_HB_STALE_NS: u64 = 4_000_000_000;
                 // Consecutive parked-vCPU rendezvous failures during
                 // periodic capture. Reset to 0 on every successful
                 // `freeze_and_dispatch(..)`. After 2 consecutive
@@ -4947,6 +4959,8 @@ impl KtstrVm {
                                             scenario_pause_cumulative_for_coord.as_ref(),
                                         run_start,
                                         current_step: &freeze_coord_current_step,
+                                        periodic_guest_elapsed_ns:
+                                            &freeze_coord_periodic_guest_elapsed,
                                         progress_ledger: Some(
                                             progress_ledger_for_coord.as_ref(),
                                         ),
@@ -9392,34 +9406,19 @@ impl KtstrVm {
                                 periodic_boundaries_ns = Some(boundaries);
                             }
                         }
-                        // Force a periodic sample at each step's start so no
-                        // phase the guest enters is left without one (see
-                        // `last_periodic_step_forced`). Splice a boundary at the
-                        // current instant into the schedule at the next-to-fire
-                        // slot; the loop below fires it this iteration through
-                        // the normal periodic machinery, stamped with the live
-                        // phase. Uses the same pause-adjusted clock as the fire
-                        // loop so the spliced offset is workload-relative.
-                        if let Some(ref mut boundaries) = periodic_boundaries_ns {
-                            let cur_step =
-                                freeze_coord_current_step.load(Ordering::Acquire);
-                            if cur_step > last_periodic_step_forced {
-                                let raw_now_ns = u64::try_from(run_start.elapsed().as_nanos())
-                                    .unwrap_or(u64::MAX);
-                                let cumulative_pause = scenario_pause_cumulative_for_coord
-                                    .load(Ordering::Acquire);
-                                let in_flight_pause_at =
-                                    watchdog_pause_for_coord.load(Ordering::Acquire);
-                                let in_flight_pause = if in_flight_pause_at > 0 {
-                                    raw_now_ns.saturating_sub(in_flight_pause_at)
-                                } else {
-                                    0
-                                };
-                                let now_ns = raw_now_ns
-                                    .saturating_sub(cumulative_pause)
-                                    .saturating_sub(in_flight_pause);
-                                boundaries.insert(next_periodic_idx as usize, now_ns);
-                                last_periodic_step_forced = cur_step;
+                        // Advance the guest-progress clock once per tick: when
+                        // the workload-progress heartbeat has published a newer
+                        // scenario-elapsed than last seen, adopt it and stamp
+                        // the wall time it advanced (the wedge-vs-load
+                        // discriminator the fire loop reads).
+                        {
+                            let g = freeze_coord_periodic_guest_elapsed
+                                .load(Ordering::Acquire);
+                            if g > periodic_prev_guest_elapsed_ns {
+                                periodic_prev_guest_elapsed_ns = g;
+                                periodic_last_hb_wall_ns =
+                                    u64::try_from(run_start.elapsed().as_nanos())
+                                        .unwrap_or(u64::MAX);
                             }
                         }
                         if let Some(ref boundaries) = periodic_boundaries_ns {
@@ -9452,7 +9451,33 @@ impl KtstrVm {
                                 let now_ns = raw_now_ns
                                     .saturating_sub(cumulative_pause)
                                     .saturating_sub(in_flight_pause);
-                                if boundaries[next_periodic_idx as usize] > now_ns {
+                                // Fire this boundary when the GUEST'S scenario
+                                // clock reaches it (see the periodic-clock state
+                                // above), not host wall-clock, so the fixed
+                                // num_snapshots budget spreads across the guest's
+                                // real phases under dilation. No heartbeat yet →
+                                // pause-adjusted wall-clock, byte-identical to
+                                // the prior behavior. Stale heartbeat (a wedge:
+                                // heartbeats stopped) → resume on wall-clock so
+                                // the stuck state is still captured. `boundaries`
+                                // and `periodic_anchor_ns` are run-relative, so
+                                // the boundary's scenario-relative offset shares
+                                // the guest clock's frame (both 0 at scenario
+                                // start).
+                                let boundary_offset = boundaries[next_periodic_idx as usize]
+                                    .saturating_sub(periodic_anchor_ns);
+                                let effective_scenario_elapsed = if periodic_last_hb_wall_ns == 0 {
+                                    now_ns.saturating_sub(periodic_anchor_ns)
+                                } else {
+                                    let stale =
+                                        raw_now_ns.saturating_sub(periodic_last_hb_wall_ns);
+                                    if stale > PERIODIC_HB_STALE_NS {
+                                        periodic_prev_guest_elapsed_ns.saturating_add(stale)
+                                    } else {
+                                        periodic_prev_guest_elapsed_ns
+                                    }
+                                };
+                                if boundary_offset > effective_scenario_elapsed {
                                     break;
                                 }
                                 if freeze_coord_kill.load(Ordering::Acquire) {

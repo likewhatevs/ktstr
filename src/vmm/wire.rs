@@ -656,6 +656,19 @@ pub const MSG_TYPE_KERN_BUILD_ID: u32 = 0x4b42_4944; // "KBID"
 /// generous headroom for any future style without an unbounded read.
 pub const KERN_BUILD_ID_MAX: usize = 64;
 
+/// Guest→host workload-progress heartbeat: the guest's own scenario-elapsed
+/// time in milliseconds (8-byte LE u64), emitted on a fixed GUEST-time
+/// cadence from scenario start through the workload. The host uses it to
+/// place periodic captures on the GUEST clock rather than host wall-clock,
+/// so under host oversubscription the fixed `num_snapshots` samples still
+/// spread across the guest's real phases instead of clustering in whatever
+/// phase the dilated guest is stuck in. It is a HINT, never a trigger: the
+/// host always retains capture control and falls back to wall-clock when
+/// the heartbeats go stale (a wedged scheduler stops running the guest
+/// thread that emits them) so a degraded guest is still captured.
+/// Coordinator-internal — never bucketed into the verdict frame log.
+pub const MSG_TYPE_WORKLOAD_PROGRESS: u32 = 0x5750_5247; // "WPRG"
+
 /// Typed payload for [`MSG_TYPE_KERN_ADDRS`].
 ///
 /// Three u64 fields published by the guest at boot so the host can

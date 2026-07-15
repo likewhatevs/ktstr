@@ -68,24 +68,11 @@ fn assert_periodic_captures(result: &VmResult) -> Result<()> {
         result.periodic_fired,
         result.periodic_target,
     );
-    // periodic_fired counts the time-sliced boundaries (up to
-    // periodic_target = num_snapshots) PLUS one capture forced at the start
-    // of each scenario step the guest enters — the coordinator guarantees
-    // every phase a periodic sample so a dilated run cannot leave a later
-    // phase empty. So fired may exceed the time-sliced target by up to the
-    // number of steps entered, but no more (no runaway captures).
-    let steps_entered = result
-        .stimulus_timeline()
-        .iter()
-        .filter(|e| e.label.starts_with("StepStart"))
-        .count() as u32;
     anyhow::ensure!(
-        result.periodic_fired <= result.periodic_target + steps_entered,
-        "periodic_fired ({}) must not exceed periodic_target ({}) + one \
-         forced capture per scenario step entered ({})",
+        result.periodic_fired <= result.periodic_target,
+        "periodic_fired ({}) must not exceed periodic_target ({})",
         result.periodic_fired,
         result.periodic_target,
-        steps_entered,
     );
 
     // Drain in insertion order so we can assert the tag sequence

@@ -70,6 +70,7 @@ struct SinkState {
     scenario_pause_cumulative_ns: AtomicU64,
     run_start: Instant,
     current_step: Arc<AtomicU16>,
+    periodic_guest_elapsed_ns: AtomicU64,
 }
 
 impl SinkState {
@@ -96,6 +97,7 @@ impl SinkState {
             scenario_pause_cumulative_ns: AtomicU64::new(0),
             run_start: Instant::now(),
             current_step: Arc::new(AtomicU16::new(0)),
+            periodic_guest_elapsed_ns: AtomicU64::new(0),
         }
     }
 
@@ -122,6 +124,7 @@ impl SinkState {
             scenario_pause_cumulative_ns: &self.scenario_pause_cumulative_ns,
             run_start: self.run_start,
             current_step: &self.current_step,
+            periodic_guest_elapsed_ns: &self.periodic_guest_elapsed_ns,
             // No ledger wired: these CRC-gate fixtures do not assert
             // lifecycle-stage side effects, so every advance site no-ops.
             progress_ledger: None,

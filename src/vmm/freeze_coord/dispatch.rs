@@ -244,6 +244,11 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// once the dispatch loop returns from the frame that
     /// promoted it.
     pub current_step: &'a std::sync::Arc<std::sync::atomic::AtomicU16>,
+    /// Guest scenario-elapsed clock in nanoseconds, published from each
+    /// `MSG_TYPE_WORKLOAD_PROGRESS` heartbeat. The run-loop reads it to
+    /// clock periodic captures off guest progress (0 until the first
+    /// heartbeat, then monotonic).
+    pub periodic_guest_elapsed_ns: &'a std::sync::atomic::AtomicU64,
     /// Live lifecycle-stage ledger shared with the monitor and (a LATER
     /// commit) the VM watchdog. The dispatch arms advance it
     /// FORWARD-ONLY as they observe the guest's lifecycle / scenario
@@ -543,6 +548,23 @@ pub(super) fn dispatch_bulk_message(
                 sinks
                     .sched_swap_notify
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            None
+        }
+        _ if msg.msg_type == crate::vmm::wire::MSG_TYPE_WORKLOAD_PROGRESS => {
+            // Guest scenario-elapsed heartbeat (see
+            // `MSG_TYPE_WORKLOAD_PROGRESS`). Publish the guest clock (ms→ns)
+            // so the run-loop can place periodic captures on guest progress
+            // rather than host wall-clock. CRC-gated and shape-gated to the
+            // exact 8-byte payload so a torn or oversized frame cannot forge
+            // a bogus clock. Coordinator-internal — do NOT bucket.
+            if msg.crc_ok
+                && let Ok(bytes) = <[u8; 8]>::try_from(&*msg.payload)
+            {
+                let elapsed_ns = u64::from_le_bytes(bytes).saturating_mul(1_000_000);
+                sinks
+                    .periodic_guest_elapsed_ns
+                    .store(elapsed_ns, std::sync::atomic::Ordering::Release);
             }
             None
         }
@@ -1205,6 +1227,7 @@ mod stage_tests {
         scenario_pause_cumulative_ns: AtomicU64,
         run_start: Instant,
         current_step: Arc<AtomicU16>,
+        periodic_guest_elapsed_ns: std::sync::atomic::AtomicU64,
         /// Watchdog-reset deadline atomic + provenance tag. Wired into
         /// `watchdog_reset` only when `wire_reset` is set (the default is
         /// `None`, matching the pre-C6 fixture so every stage test that
@@ -1239,6 +1262,7 @@ mod stage_tests {
                 scenario_pause_cumulative_ns: AtomicU64::new(0),
                 run_start: Instant::now(),
                 current_step: Arc::new(AtomicU16::new(0)),
+                periodic_guest_elapsed_ns: std::sync::atomic::AtomicU64::new(0),
                 reset_ns: AtomicU64::new(0),
                 reset_tag: std::sync::atomic::AtomicU8::new(0),
                 workload_duration: std::time::Duration::from_secs(60),
@@ -1285,6 +1309,7 @@ mod stage_tests {
                 scenario_pause_cumulative_ns: &self.scenario_pause_cumulative_ns,
                 run_start: self.run_start,
                 current_step: &self.current_step,
+                periodic_guest_elapsed_ns: &self.periodic_guest_elapsed_ns,
                 progress_ledger: Some(&self.ledger),
                 expected_kernel_build_id: None,
             }
