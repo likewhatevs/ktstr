@@ -379,7 +379,9 @@ task-specific schedstat delta over the widened Body span caps the PSI result,
 so another concurrently running cell in the same runner cgroup cannot inflate
 `W` beyond this VM's own accumulated delay. If the opening snapshot races vCPU
 startup, the complete whole-vCPU-thread lifetime total provides a looser but
-sound enclosing cap. From the series ktstr
+sound enclosing cap. Each AP records that cumulative total once immediately
+before its host thread exits, avoiding a teardown race with disappearing proc
+entries without adding any periodic work. From the series ktstr
 derives `W(L)`, the worst host delay any interval of length `L` could have
 absorbed; pairing that with a gate's measured latency turns
 `max_p99_wake_latency_ns` from a plain threshold into the contention-aware

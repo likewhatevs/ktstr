@@ -27,6 +27,7 @@ use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 use vmm_sys_util::timerfd::TimerFd;
 
 use super::exit_dispatch;
+use super::result::HostVcpuSchedstat;
 use crate::monitor;
 use crate::sync::Latch;
 
@@ -594,6 +595,12 @@ pub(crate) struct VcpuThread {
     /// drops while the coordinator is still iterating its
     /// captured handle Vec.
     pub(crate) alive: Arc<AtomicBool>,
+    /// Final cumulative schedstat sample taken by the AP on its own thread
+    /// immediately before exit. `/proc/self/task/<tid>` disappears when the
+    /// thread returns, so teardown consumers use this slot only when their
+    /// live proc read races that disappearance. One snapshot per vCPU
+    /// lifetime; never sampled from a timer path.
+    pub(crate) schedstat_at_exit: Arc<std::sync::Mutex<Option<HostVcpuSchedstat>>>,
 }
 
 /// Per-AP freeze-rendezvous state held outside `VcpuThread`. Cloned
@@ -1585,6 +1592,7 @@ mod tests {
             immediate_exit: None,
             exit_evt,
             alive,
+            schedstat_at_exit: Arc::new(std::sync::Mutex::new(None)),
         };
 
         // Before the AP signals, wait_for_exit must NOT short-circuit:
@@ -1796,6 +1804,7 @@ mod tests {
             immediate_exit: Some(ie),
             exit_evt,
             alive,
+            schedstat_at_exit: Arc::new(std::sync::Mutex::new(None)),
         };
         // Sanity: byte starts at 0 and alive is false — the test's
         // pre-condition.
@@ -1857,6 +1866,7 @@ mod tests {
             immediate_exit: Some(ie),
             exit_evt,
             alive,
+            schedstat_at_exit: Arc::new(std::sync::Mutex::new(None)),
         };
         let read_byte = || vt.immediate_exit.as_ref().unwrap().read_byte();
         assert_eq!(read_byte(), 0);

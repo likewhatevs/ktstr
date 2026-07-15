@@ -1669,20 +1669,45 @@ pub(crate) fn parse_schedstat_line(line: &str) -> Option<(u64, u64)> {
 /// deliberately absent from the monitor's 100 ms hot path. The whole-run
 /// [`VmResult::host_vcpu_schedstat`] read at teardown uses the same function.
 pub(crate) fn read_host_vcpu_schedstat(tids: &[i32]) -> Option<HostVcpuSchedstat> {
+    read_host_vcpu_schedstat_with_exit_snapshots(tids, &[])
+}
+
+/// Sum live vCPU schedstat, falling back to AP self-snapshots after exit.
+///
+/// A vCPU's proc task directory disappears at thread return. APs publish one
+/// final cumulative self-snapshot before that return; an aligned entry here is
+/// consulted only when the live proc read failed. This closes teardown's
+/// read-vs-exit race without adding any periodic per-vCPU work.
+fn read_host_vcpu_schedstat_with_exit_snapshots(
+    tids: &[i32],
+    exit_snapshots: &[Arc<std::sync::Mutex<Option<HostVcpuSchedstat>>>],
+) -> Option<HostVcpuSchedstat> {
     let mut acc = HostVcpuSchedstat::default();
-    for &tid in tids {
+    for (index, &tid) in tids.iter().enumerate() {
         if tid == 0 {
             continue;
         }
-        let Ok(s) = std::fs::read_to_string(format!("/proc/self/task/{tid}/schedstat")) else {
+        let live = std::fs::read_to_string(format!("/proc/self/task/{tid}/schedstat"))
+            .ok()
+            .and_then(|line| parse_schedstat_line(line.trim()))
+            .map(|(on_cpu, run_delay)| HostVcpuSchedstat {
+                total_on_cpu_ns: on_cpu,
+                total_run_delay_ns: run_delay,
+                sampled_vcpus: 1,
+            });
+        let sample = live.or_else(|| {
+            exit_snapshots
+                .get(index)
+                .and_then(|slot| *slot.lock_unpoisoned())
+        });
+        let Some(sample) = sample else {
             continue;
         };
-        let Some((on_cpu, run_delay)) = parse_schedstat_line(s.trim()) else {
-            continue;
-        };
-        acc.total_on_cpu_ns = acc.total_on_cpu_ns.saturating_add(on_cpu);
-        acc.total_run_delay_ns = acc.total_run_delay_ns.saturating_add(run_delay);
-        acc.sampled_vcpus += 1;
+        acc.total_on_cpu_ns = acc.total_on_cpu_ns.saturating_add(sample.total_on_cpu_ns);
+        acc.total_run_delay_ns = acc
+            .total_run_delay_ns
+            .saturating_add(sample.total_run_delay_ns);
+        acc.sampled_vcpus = acc.sampled_vcpus.saturating_add(sample.sampled_vcpus);
     }
     (acc.sampled_vcpus > 0).then_some(acc)
 }
@@ -1837,6 +1862,7 @@ pub(crate) struct ContentionWitnessRecorder {
 
 struct ContentionWitnessRecorderInner {
     tids: Vec<Arc<AtomicI32>>,
+    exit_schedstats: Vec<Arc<std::sync::Mutex<Option<HostVcpuSchedstat>>>>,
     run_start: Instant,
     stage: crate::monitor::LifecycleStage,
     schedstat_anchor: Option<HostVcpuSchedstat>,
@@ -1861,7 +1887,11 @@ struct ContentionWitnessRecorderInner {
 }
 
 impl ContentionWitnessRecorder {
-    pub(crate) fn new(tids: Vec<Arc<AtomicI32>>, run_start: Instant) -> Self {
+    pub(crate) fn new(
+        tids: Vec<Arc<AtomicI32>>,
+        exit_schedstats: Vec<Arc<std::sync::Mutex<Option<HostVcpuSchedstat>>>>,
+        run_start: Instant,
+    ) -> Self {
         let live_tids = tids
             .iter()
             .map(|tid| tid.load(Ordering::Acquire))
@@ -1877,6 +1907,7 @@ impl ContentionWitnessRecorder {
         Self {
             inner: std::sync::Mutex::new(ContentionWitnessRecorderInner {
                 tids,
+                exit_schedstats,
                 run_start,
                 stage: crate::monitor::LifecycleStage::Boot,
                 schedstat_anchor,
@@ -1965,8 +1996,9 @@ impl ContentionWitnessRecorder {
         }
     }
 
-    /// Close the final live stage while vCPU `/proc` entries still exist and
-    /// assemble the immutable result passed through `VmRunState`.
+    /// Close the final stage and assemble the immutable result passed through
+    /// `VmRunState`. A still-live vCPU is read from proc; an AP that already
+    /// returned contributes its one-shot exit snapshot.
     pub(crate) fn finish(&self) -> Option<super::result::ContentionWitness> {
         let mut inner = self.inner.lock_unpoisoned();
         if inner.finalized {
@@ -2080,7 +2112,7 @@ impl ContentionWitnessRecorderInner {
             .iter()
             .map(|tid| tid.load(Ordering::Acquire))
             .collect::<Vec<_>>();
-        let cur = read_host_vcpu_schedstat(&tids);
+        let cur = read_host_vcpu_schedstat_with_exit_snapshots(&tids, &self.exit_schedstats);
         if self.stage == crate::monitor::LifecycleStage::Body {
             if let Some(cap) = complete_schedstat_delay_cap_ns(
                 self.tids.len(),
@@ -2133,7 +2165,7 @@ mod schedstat_tests {
     use super::{
         HostCpuPressureReader, complete_schedstat_delay_cap_ns, conservative_pressure_delta_ns,
         parse_cpu_pressure_some_total_us, parse_schedstat_line, parse_unified_cgroup_path,
-        read_host_vcpu_schedstat,
+        read_host_vcpu_schedstat, read_host_vcpu_schedstat_with_exit_snapshots,
     };
     use crate::vmm::HostVcpuSchedstat;
 
@@ -2247,6 +2279,26 @@ mod schedstat_tests {
             ),
             None,
             "CONFIG_SCHEDSTATS-off zeros are not a complete cap"
+        );
+    }
+
+    #[test]
+    fn schedstat_sum_uses_exit_snapshot_after_proc_task_disappears() {
+        let missing_tid = i32::MAX;
+        let saved = HostVcpuSchedstat {
+            total_on_cpu_ns: 4_000,
+            total_run_delay_ns: 9_000,
+            sampled_vcpus: 1,
+        };
+        let slots = vec![std::sync::Arc::new(std::sync::Mutex::new(Some(saved)))];
+        assert_eq!(
+            read_host_vcpu_schedstat_with_exit_snapshots(&[missing_tid], &slots),
+            Some(saved),
+        );
+        assert_eq!(
+            read_host_vcpu_schedstat_with_exit_snapshots(&[missing_tid], &[]),
+            None,
+            "without the aligned exit slot a vanished proc task is unavailable",
         );
     }
 
@@ -2918,6 +2970,18 @@ impl KtstrVm {
             std::iter::once((bsp_tid_slot, bsp_latch))
                 .chain(ap_tid_slots.iter().cloned())
                 .collect();
+        // AP proc task directories disappear at thread return. Each AP keeps
+        // one final self-schedstat snapshot in its VcpuThread handle; align
+        // those slots with `vcpu_tid_slots`. The BSP remains live through
+        // witness finalization, so its fallback slot is intentionally empty.
+        let vcpu_exit_schedstats = std::iter::once(Arc::new(std::sync::Mutex::new(None)))
+            .chain(
+                guard
+                    .ap_threads
+                    .iter()
+                    .map(|thread| Arc::clone(&thread.schedstat_at_exit)),
+            )
+            .collect::<Vec<_>>();
 
         // Open per-vCPU `perf_event_open` counters once at run-vm
         // scope so both the monitor thread (per-tick timeline) and
@@ -3069,8 +3133,11 @@ impl KtstrVm {
         // Per-phase host-contention recorder. It owns the live TID handles for
         // rare lifecycle-boundary schedstat sweeps and a persistent O(1) CPU
         // PSI reader sampled from the monitor's existing timer wake.
-        let contention_recorder =
-            Arc::new(ContentionWitnessRecorder::new(vcpu_tid_atomics, run_start));
+        let contention_recorder = Arc::new(ContentionWitnessRecorder::new(
+            vcpu_tid_atomics,
+            vcpu_exit_schedstats.clone(),
+            run_start,
+        ));
         // KERN_ADDRS observability counters (frames consumed / CRC-failed),
         // incremented by the coordinator's dispatch arm and read by the
         // monitor's pre-latch diagnostic (see `RqRefresh::kern_addrs_frames`):
@@ -13046,9 +13113,9 @@ impl KtstrVm {
         // Host-side vCPU scheduling-dilation sample. Read HERE — after the
         // watchdog/freeze-coord joins above but BEFORE `ap_threads` move
         // into `VmRunState` (they are joined only later, in
-        // `collect_results`). The read must precede that join: once a vCPU
-        // thread terminates its `/proc/self/task/<tid>` dir vanishes and
-        // the schedstat becomes unreadable. TIDs come from the same
+        // `collect_results`). A live vCPU is read from proc; an AP that
+        // already returned contributes the one-shot self-snapshot it stored
+        // immediately before exit. TIDs come from the same
         // `vcpu_tid_slots` the monitor uses — index 0 is the BSP (this
         // thread), 1.. are the AP slots each AP stamped before entering
         // KVM_RUN; a slot still 0 means that AP never scheduled and is
@@ -13061,10 +13128,12 @@ impl KtstrVm {
             .iter()
             .map(|(slot, _)| slot.load(Ordering::Acquire))
             .collect();
-        let host_vcpu_schedstat = read_host_vcpu_schedstat(&host_vcpu_tids);
-        // Finalize while every vCPU task directory is still live. The monitor
-        // may take a later no-op sample, but the recorder's finalized latch
-        // prevents post-result mutation.
+        let host_vcpu_schedstat =
+            read_host_vcpu_schedstat_with_exit_snapshots(&host_vcpu_tids, &vcpu_exit_schedstats);
+        // Finalize before the AP handles move into VmRunState. Vanished proc
+        // task directories are covered by the aligned exit snapshots. The
+        // monitor may take a later no-op sample, but the recorder's finalized
+        // latch prevents post-result mutation.
         let contention_witness = contention_recorder.finish();
 
         // Final ledger snapshot for the VmResult phase/milestone fields.
@@ -13157,8 +13226,8 @@ impl KtstrVm {
             // invalidate `kind_host_ptr` and `request_kva` after
             // every vCPU thread joins but before `vm` drops.
             watchpoint,
-            // Host-side vCPU dilation sample read just above, while the
-            // vCPU threads are still alive. Forwarded verbatim to
+            // Host-side vCPU dilation sample read just above from live proc
+            // entries plus one-shot AP exit snapshots. Forwarded verbatim to
             // `VmResult::host_vcpu_schedstat` by `collect_results`.
             host_vcpu_schedstat,
         })
@@ -13240,6 +13309,8 @@ impl KtstrVm {
             let pci_bus_clone = pci_bus.cloned();
             let exited = Arc::new(AtomicBool::new(false));
             let exited_clone = exited.clone();
+            let schedstat_at_exit = Arc::new(std::sync::Mutex::new(None));
+            let schedstat_at_exit_thread = Arc::clone(&schedstat_at_exit);
             let parked = Arc::new(AtomicBool::new(false));
             let parked_clone = parked.clone();
             let regs = Arc::new(std::sync::Mutex::new(None));
@@ -13380,6 +13451,20 @@ impl KtstrVm {
                             thaw_evt_clone.as_ref(),
                         );
                     });
+                    // `/proc/self/task/<tid>` vanishes as soon as this closure
+                    // returns. Preserve one final self-snapshot so host
+                    // contention finalization cannot lose an AP that exited
+                    // between the last lifecycle frame and result assembly.
+                    // This is a single read per AP lifetime, never polling.
+                    if let Ok(line) = std::fs::read_to_string("/proc/thread-self/schedstat")
+                        && let Some((on_cpu, run_delay)) = parse_schedstat_line(line.trim())
+                    {
+                        *schedstat_at_exit_thread.lock_unpoisoned() = Some(HostVcpuSchedstat {
+                            total_on_cpu_ns: on_cpu,
+                            total_run_delay_ns: run_delay,
+                            sampled_vcpus: 1,
+                        });
+                    }
                     // wp_clone is held for the AP's entire lifetime
                     // so the strong count never drops to zero before
                     // the freeze coordinator joins.
@@ -13401,6 +13486,7 @@ impl KtstrVm {
                 immediate_exit: ie_handle,
                 exit_evt,
                 alive,
+                schedstat_at_exit,
             });
             freeze_parked.push(parked);
             freeze_regs.push(regs);
@@ -15744,13 +15830,12 @@ impl KtstrVm {
             // vm.run() returns, alongside entry_name; freeze_coord is
             // entry-agnostic, so `0` here is correct and overwritten.
             variant_hash: 0,
-            // Host-side vCPU scheduling dilation, read at `run_vm`
-            // teardown while the vCPU threads were still alive. Purely
-            // observational — never affects `success` above or the exit
-            // code.
+            // Host-side vCPU scheduling dilation, read at `run_vm` teardown
+            // from live proc entries plus one-shot AP exit snapshots. Purely
+            // observational — never affects `success` above or the exit code.
             host_vcpu_schedstat: run.host_vcpu_schedstat,
             // Event-anchored per-phase schedstat + constant-cost CPU-pressure
-            // series, finalized in `run_vm` before vCPU task dirs disappear.
+            // series, finalized from live proc entries plus AP exit snapshots.
             contention_witness: run.contention_witness,
             // Empty cache: the single bridge drain is deferred to the
             // first `captures_series()` call on the host (post_vm or

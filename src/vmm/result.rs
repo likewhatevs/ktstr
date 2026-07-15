@@ -599,12 +599,12 @@ pub struct VmResult {
     pub variant_hash: u64,
     /// Host-side vCPU scheduling dilation for this run — RAW schedstat
     /// totals summed over the vCPU host threads (see
-    /// `HostVcpuSchedstat`). Populated by `run_vm` teardown from each
-    /// vCPU thread's `/proc/self/task/<tid>/schedstat` while the threads
-    /// are still alive; `None` on hosts without `CONFIG_SCHEDSTATS`, on
-    /// synthesized/fixture results, and whenever no vCPU thread was
-    /// sampled. Consumers call `HostVcpuSchedstat::dilation` for the
-    /// derived `D` ratio. Purely observational — never affects the
+    /// `HostVcpuSchedstat`). Populated by `run_vm` teardown from live
+    /// `/proc/self/task/<tid>/schedstat` entries plus a one-shot self-snapshot
+    /// each AP stores immediately before exit; `None` on hosts without
+    /// `CONFIG_SCHEDSTATS`, on synthesized/fixture results, and whenever no
+    /// vCPU thread was sampled. Consumers call `HostVcpuSchedstat::dilation`
+    /// for the derived `D` ratio. Purely observational — never affects the
     /// verdict or exit code.
     pub host_vcpu_schedstat: Option<HostVcpuSchedstat>,
     /// Per-phase host-contention witness for the "weather witness" latency
@@ -1841,7 +1841,7 @@ pub(crate) struct VmRunState {
     /// window never resolved) → [`VmResult::periodic_window_end`].
     pub(crate) periodic_window_end_ns_raw: u64,
     /// Event-anchored per-phase dilation + Body contention intervals,
-    /// finalized while vCPU `/proc` entries are still alive.
+    /// finalized from live proc entries plus one-shot AP exit snapshots.
     pub(crate) contention_witness: Option<ContentionWitness>,
     pub(crate) ap_threads: Vec<VcpuThread>,
     pub(crate) monitor_handle: Option<JoinHandle<monitor::reader::MonitorLoopResult>>,
