@@ -816,7 +816,7 @@ impl GuestMemProgAccessorOwned {
     }
 
     /// Complete an owned program accessor with BTF offsets derived before
-    /// live-VM helper startup. Keeps offset semantics identical to [`finish`]
+    /// live-VM helper startup. Keeps offset semantics identical to `finish`
     /// while removing BTF parsing and sidecar I/O from teardown-sensitive
     /// worker lifetimes.
     pub(crate) fn finish_with_offsets(
