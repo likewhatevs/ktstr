@@ -4580,6 +4580,25 @@ impl KtstrVm {
                 // post-workload idle. 0 = not yet ready.
                 let mut periodic_prereqs_ready_ns: u64 = 0;
                 let mut next_periodic_idx: u32 = 0;
+                // Highest scenario step for which a periodic capture has been
+                // forced at its start. The time-sliced boundaries below are a
+                // host-wall-clock schedule; under host oversubscription the
+                // guest's workload time dilates against that clock, so every
+                // boundary can fire while the guest is still in its FIRST phase,
+                // leaving later phases with NO periodic sample — a cross-phase
+                // reduction (counter_delta_per_phase) then sees a phase absent
+                // and its comparator records nothing (Inconclusive). To
+                // guarantee every phase the guest actually enters gets at least
+                // one periodic sample, force a capture the first time each new
+                // step is observed (edge-triggered on the guest-published
+                // `freeze_coord_current_step`, which the dispatch loop advances
+                // on each StepStart frame). The forced capture is a boundary
+                // spliced into the schedule at the current instant, so it fires
+                // through the SAME machinery, stamped with the live phase — it
+                // is a genuine periodic sample of the phase, not a host time
+                // guess at the dilation. Dilation-invariant by construction: a
+                // phase cannot be empty if entering it triggers a sample.
+                let mut last_periodic_step_forced: u16 = 0;
                 // Consecutive parked-vCPU rendezvous failures during
                 // periodic capture. Reset to 0 on every successful
                 // `freeze_and_dispatch(..)`. After 2 consecutive
@@ -9371,6 +9390,36 @@ impl KtstrVm {
                                 periodic_window_end_for_coord
                                     .store(window.window_end_ns.max(1), Ordering::Release);
                                 periodic_boundaries_ns = Some(boundaries);
+                            }
+                        }
+                        // Force a periodic sample at each step's start so no
+                        // phase the guest enters is left without one (see
+                        // `last_periodic_step_forced`). Splice a boundary at the
+                        // current instant into the schedule at the next-to-fire
+                        // slot; the loop below fires it this iteration through
+                        // the normal periodic machinery, stamped with the live
+                        // phase. Uses the same pause-adjusted clock as the fire
+                        // loop so the spliced offset is workload-relative.
+                        if let Some(ref mut boundaries) = periodic_boundaries_ns {
+                            let cur_step =
+                                freeze_coord_current_step.load(Ordering::Acquire);
+                            if cur_step > last_periodic_step_forced {
+                                let raw_now_ns = u64::try_from(run_start.elapsed().as_nanos())
+                                    .unwrap_or(u64::MAX);
+                                let cumulative_pause = scenario_pause_cumulative_for_coord
+                                    .load(Ordering::Acquire);
+                                let in_flight_pause_at =
+                                    watchdog_pause_for_coord.load(Ordering::Acquire);
+                                let in_flight_pause = if in_flight_pause_at > 0 {
+                                    raw_now_ns.saturating_sub(in_flight_pause_at)
+                                } else {
+                                    0
+                                };
+                                let now_ns = raw_now_ns
+                                    .saturating_sub(cumulative_pause)
+                                    .saturating_sub(in_flight_pause);
+                                boundaries.insert(next_periodic_idx as usize, now_ns);
+                                last_periodic_step_forced = cur_step;
                             }
                         }
                         if let Some(ref boundaries) = periodic_boundaries_ns {
