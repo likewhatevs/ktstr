@@ -1573,22 +1573,28 @@ pub const NUM_LIFECYCLE_STAGES: usize = 5;
 /// `LifecycleStage::Body`.
 pub const BODY_STAGE_INDEX: usize = crate::monitor::LifecycleStage::Body as usize;
 
-/// Per-lifecycle-phase host-dilation witness: one [`HostVcpuSchedstat`] DELTA
-/// per stage, each covering exactly its own stage's span (the schedstat
-/// accrued between lifecycle-event boundary snapshots). Indexed by
-/// `LifecycleStage` `as usize`.
+/// Per-lifecycle-phase host-dilation witness: normally one
+/// [`HostVcpuSchedstat`] DELTA per stage, covering the schedstat accrued
+/// between lifecycle-event boundary snapshots. If the guest-reported
+/// scenario duration proves queued lifecycle frames did not bracket Body,
+/// Body instead carries the complete enclosing vCPU-thread lifetime. That
+/// conservative fallback can overstate Body contention but cannot hide it.
+/// Indexed by `LifecycleStage` `as usize`.
 ///
 /// Distinct from the whole-run [`VmResult::host_vcpu_schedstat`] (which is
-/// the verdict-line `D` over the entire run): here each phase gets its OWN
+/// the verdict-line `D` over the entire run): normally each phase gets its OWN
 /// `D` over its OWN span, so the Body phase's dilation — the only phase whose
 /// contention actually contaminates the workload measurement — is isolated
-/// from the Boot / Attach / Teardown INFRA phases. `Boot`/`Attach` `D` is
+/// from the Boot / Attach / Teardown INFRA phases. The batched-delivery
+/// fallback deliberately gives up that localization. `Boot`/`Attach` `D` is
 /// diagnostic; `Body` is the one the latency verdict consumes.
 ///
 /// The dispatch path takes each boundary snapshot immediately after accepting
-/// the CRC-valid lifecycle frame. A wide-VM snapshot is a sequential sweep of
-/// the vCPU TIDs rather than an atomic kernel operation, so its uncertainty is
-/// the duration of that rare sweep, not the monitor's sampling period.
+/// the CRC-valid lifecycle frame. ScenarioEnd's guest duration detects
+/// start/end frames accepted together after a starved dispatch loop. A wide-VM
+/// snapshot is a sequential sweep of the vCPU TIDs rather than an atomic
+/// kernel operation, so its uncertainty is the duration of that rare sweep,
+/// not the monitor's sampling period.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PerPhaseSchedstat {
     /// Per-stage schedstat delta, indexed by `LifecycleStage as usize`
@@ -1672,9 +1678,12 @@ pub struct BodyContentionWindow {
     /// True when lifecycle-event samples anchored BOTH ends of Body (the
     /// start is conservatively pulled back to the preceding lifecycle
     /// boundary to cover virtio dispatch lag), making the cumulative interval
-    /// series complete even if it contains only one coarse interval. False on
-    /// legacy sampled witnesses, whose coverage is inferred from their
-    /// first/last monitor ticks.
+    /// series complete even if it contains only one coarse interval. A host
+    /// acceptance span shorter than ScenarioEnd's guest duration invalidates
+    /// those edge samples; the complete whole-vCPU-lifetime fallback may then
+    /// restore completeness as one conservative interval. False on legacy
+    /// sampled witnesses, whose coverage is inferred from their first/last
+    /// monitor ticks.
     #[serde(default)]
     pub complete: bool,
     /// Complete summed vCPU schedstat run-delay (ns) over the conservative
@@ -1694,13 +1703,14 @@ pub struct BodyContentionWindow {
     /// partial/failed closing reads, in which case the cap is ignored.
     #[serde(default)]
     pub schedstat_cap_complete: bool,
-    /// The host-side wall span (ns) covered by the Body witness. The start is
+    /// The wall span (ns) covered by the Body witness. Normally the start is
     /// conservatively pinned to the accepted lifecycle boundary preceding
     /// Body, covering any time the guest's Body frame waited in virtio
     /// dispatch; the end is the first accepted transition after Body. It may
     /// therefore include adjacent-stage time, which makes `W` larger and can
-    /// only bias the verdict toward indeterminate. `0` when Body was never
-    /// observed.
+    /// only bias the verdict toward indeterminate. If that accepted span is
+    /// shorter than ScenarioEnd's guest duration, the guest duration widens
+    /// it for the whole-lifetime fallback. `0` when Body was never observed.
     pub body_wall_ns: u64,
     /// The wall span (ns) the series actually covered. For event-anchored
     /// complete witnesses this equals `body_wall_ns`; for legacy witnesses it

@@ -381,7 +381,10 @@ so another concurrently running cell in the same runner cgroup cannot inflate
 startup, the complete whole-vCPU-thread lifetime total provides a looser but
 sound enclosing cap. Each AP records that cumulative total once immediately
 before its host thread exits, avoiding a teardown race with disappearing proc
-entries without adding any periodic work. From the series ktstr
+entries without adding any periodic work. ScenarioEnd's guest duration also
+detects start/end lifecycle frames delivered together after host starvation;
+that case discards the falsely tiny localized span and uses the same complete
+lifetime as a conservative interval. From the series ktstr
 derives `W(L)`, the worst host delay any interval of length `L` could have
 absorbed; pairing that with a gate's measured latency turns
 `max_p99_wake_latency_ns` from a plain threshold into the contention-aware
@@ -519,7 +522,9 @@ coverage without charging pressure from unrelated host cgroups, and a
 task-specific lifecycle schedstat cap removes noise from other cells sharing
 the runner cgroup. If scoped PSI or the opening lifecycle snapshot is
 unavailable, a complete whole-vCPU-thread lifetime total provides a coarser
-enclosing fallback. The worker's per-checkpoint CPU-clock read
+enclosing fallback. The guest-reported scenario duration selects that fallback
+too when queued lifecycle frames under-cover the real workload. The worker's
+per-checkpoint CPU-clock read
 remains; its historical worst-case SpinWait cost and the original ladder are
 retained in the validation record.
 

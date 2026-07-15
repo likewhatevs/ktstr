@@ -102,7 +102,9 @@ Host-weather sensing uses two paths with different costs:
   `cpu.pressure` counter (`some total`) from ktstr's host cgroup. Real elapsed
   widths are stored with the deltas, so a starved monitor produces a coarse
   conservative interval instead of being treated as though it woke on time.
-  Lifecycle events sample the same counter at the Body edges.
+  Lifecycle events sample the same counter at the Body edges. ScenarioEnd's
+  guest duration detects when host starvation delivered those lifecycle
+  frames in a burst instead of actually bracketing Body.
 
 The cgroup clock includes every ktstr vCPU even when the competing task is in
 another cgroup, while avoiding pressure from unrelated jobs elsewhere on a
@@ -113,7 +115,9 @@ capped by the target VM's complete summed-vCPU schedstat delay over the same
 conservative Body span. Both values independently upper-bound a request's
 host scheduling contamination, so their minimum stays conservative. If scoped
 CPU PSI is unavailable, that lifecycle schedstat delta supplies a coarser
-whole-span fallback. The guest-side `struct rq` reads still measure the
+whole-span fallback. If lifecycle delivery itself was batched, the complete
+whole-vCPU-thread lifetime supplies the enclosing fallback instead. The
+guest-side `struct rq` reads still measure the
 scheduler *under test*; these host-side reads measure the host the cell ran in.
 See
 [Run Modes](../concepts/run-modes.md#dilation-reporting).

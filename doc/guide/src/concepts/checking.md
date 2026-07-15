@@ -305,11 +305,15 @@ New witnesses sample the cumulative pressure clock at both lifecycle edges;
 even one coarse interval can therefore cover the whole Body. Each interval
 also carries its real wall width. The window calculation charges an interval's
 entire pressure delta whenever the latency window could touch it, so a late
-monitor wake only makes `W` larger. If edge sampling fails, ktstr falls back to
-the complete Body vCPU-schedstat delta as one interval; if neither source can
-prove coverage, the failure is demoted rather than trusting an empty `W = 0`.
-Legacy sidecars without event-anchored widths retain the older ≥2-tick /
-≥50%-span coverage gate.
+monitor wake only makes `W` larger. ScenarioEnd carries the guest's scenario
+duration: if host starvation queues the start and end frames and their accepted
+span is impossibly short, ktstr rejects the localized series and uses the
+complete whole-vCPU-thread lifetime as one conservative interval. If only
+pressure edge sampling fails, ktstr instead uses the tighter complete Body
+schedstat delta when available (or the lifetime when its opening snapshot is
+unavailable). If neither source can prove coverage, the failure is demoted
+rather than trusting an empty `W = 0`. Legacy sidecars without event-anchored
+widths retain the older ≥2-tick / ≥50%-span coverage gate.
 
 Only ns-denominated latency exemplars take part. `max_wake_latency_cv`
 (a dimensionless ratio) and `max_spread_pct` (an off-CPU percentage)

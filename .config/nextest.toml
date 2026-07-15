@@ -121,6 +121,18 @@ filter = "test(disk_template_e2e)"
 slow-timeout = { period = "180s", terminate-after = 3 }
 retries = { backoff = "exponential", count = 12, delay = "3s", jitter = true, max-delay = "10s" }
 
+# This macro-expansion fixture is a real performance-mode VM cell because its
+# declaration exercises `perf_delta_assertions`. Under coverage, colocated CI
+# suites can occupy every perf slot for longer than the profile-wide seven
+# attempts; the Body isolation witness correctly rejects those runs at D>1.5
+# rather than accepting meaningless timing data. Keep that correctness ceiling
+# fixed and give this exact compile fixture enough delayed attempts for the
+# external load to drain. The narrow filter avoids extending functional VM
+# failures elsewhere.
+[[profile.ci.overrides]]
+filter = "test(perf_delta_assertions_array_compiles)"
+retries = { backoff = "exponential", count = 12, delay = "3s", jitter = true, max-delay = "10s" }
+
 [[profile.ci.overrides]]
 filter = "binary(compile_fail) & test(=compile_fail)"
 slow-timeout = { period = "180s", terminate-after = 3 }

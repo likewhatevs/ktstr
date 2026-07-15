@@ -1807,6 +1807,7 @@ fn complete_schedstat_delay_cap_ns(
     anchor: Option<HostVcpuSchedstat>,
     current_tids: &[i32],
     current: Option<HostVcpuSchedstat>,
+    force_current_lifetime: bool,
 ) -> Option<u64> {
     let expected = u32::try_from(expected_vcpus).ok()?;
     let current = current?;
@@ -1818,6 +1819,14 @@ fn complete_schedstat_delay_cap_ns(
         || current.total_on_cpu_ns == 0
     {
         return None;
+    }
+
+    // ScenarioEnd carries the guest's own scenario elapsed time. If queued
+    // lifecycle frames reach the host in a burst, the accepted Body span can
+    // be shorter than that guest duration and no boundary delta covers the
+    // actual workload. The complete current lifetime still encloses it.
+    if force_current_lifetime {
+        return Some(current.total_run_delay_ns);
     }
 
     // Prefer the tight delta over the conservatively widened Body span when
@@ -1843,6 +1852,16 @@ fn complete_schedstat_delay_cap_ns(
     Some(current.total_run_delay_ns)
 }
 
+fn lifecycle_body_under_covers_guest(
+    body_enter_wall_ns: Option<u64>,
+    guest_body_elapsed_ns: u64,
+    exit_wall_ns: u64,
+) -> bool {
+    guest_body_elapsed_ns > 0
+        && body_enter_wall_ns
+            .is_none_or(|enter| exit_wall_ns.saturating_sub(enter) < guest_body_elapsed_ns)
+}
+
 /// Event-anchored host-contention witness recorder.
 ///
 /// Expensive vCPU schedstat sweeps happen only at real lifecycle transitions
@@ -1851,11 +1870,13 @@ fn complete_schedstat_delay_cap_ns(
 /// reads one width-independent runner-cgroup PSI counter to retain a localized
 /// `W(L)` series. Dispatch also samples that counter immediately at Body
 /// entry/exit, making the series complete even when the monitor is starved.
-/// A complete task-specific schedstat delta over the widened Body span caps
-/// PSI so concurrent cells sharing the runner cgroup cannot inflate `W`
-/// beyond the target VM's own accumulated run delay. If the preceding
-/// boundary snapshot raced vCPU startup, the complete whole-thread-life total
-/// is a conservative enclosing fallback.
+/// ScenarioEnd's guest duration rejects those edge samples if lifecycle frames
+/// were instead delivered in a burst after Body. A complete task-specific
+/// schedstat delta over the widened Body span caps PSI so concurrent cells
+/// sharing the runner cgroup cannot inflate `W` beyond the target VM's own
+/// accumulated run delay. If the preceding boundary snapshot raced vCPU
+/// startup or lifecycle delivery was batched, the complete whole-thread-life
+/// total is a conservative enclosing fallback.
 pub(crate) struct ContentionWitnessRecorder {
     inner: std::sync::Mutex<ContentionWitnessRecorderInner>,
 }
@@ -1883,6 +1904,7 @@ struct ContentionWitnessRecorderInner {
     body_schedstat_anchor_tids: Vec<i32>,
     body_schedstat_cap_ns: u64,
     body_schedstat_cap_complete: bool,
+    guest_body_elapsed_ns: u64,
     finalized: bool,
 }
 
@@ -1928,6 +1950,7 @@ impl ContentionWitnessRecorder {
                 body_schedstat_anchor_tids: Vec::new(),
                 body_schedstat_cap_ns: 0,
                 body_schedstat_cap_complete: false,
+                guest_body_elapsed_ns: 0,
                 finalized: false,
             }),
         }
@@ -1941,6 +1964,20 @@ impl ContentionWitnessRecorder {
         }
         let now_ns = u64::try_from(inner.run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         inner.sample_pressure_at(now_ns);
+    }
+
+    /// Preserve the guest's event-driven scenario duration before the
+    /// ScenarioEnd transition closes Body. It is an independent check that
+    /// lifecycle delivery actually bracketed the workload rather than
+    /// accepting queued start/end frames together after the guest finished.
+    pub(crate) fn record_guest_body_elapsed_ms(&self, elapsed_ms: u64) {
+        let mut inner = self.inner.lock_unpoisoned();
+        if inner.finalized || inner.stage != crate::monitor::LifecycleStage::Body {
+            return;
+        }
+        inner.guest_body_elapsed_ns = inner
+            .guest_body_elapsed_ns
+            .max(elapsed_ms.saturating_mul(1_000_000));
     }
 
     /// Close the old lifecycle stage and enter `new_stage`. The caller invokes
@@ -1963,11 +2000,14 @@ impl ContentionWitnessRecorder {
             Vec::new()
         };
         let pressure_ok = inner.sample_pressure_at(now_ns);
-        inner.close_schedstat_stage();
+        let body_undercovered = inner.stage == crate::monitor::LifecycleStage::Body
+            && inner.body_acceptance_under_covers_guest(now_ns);
+        inner.close_schedstat_stage(body_undercovered);
 
         if inner.stage == crate::monitor::LifecycleStage::Body {
             inner.body_exit_wall_ns = Some(now_ns);
-            inner.body_pressure_complete = inner.body_pressure_anchored && pressure_ok;
+            inner.body_pressure_complete =
+                inner.body_pressure_anchored && pressure_ok && !body_undercovered;
         }
         inner.stage = new_stage;
         if new_stage == crate::monitor::LifecycleStage::Body {
@@ -2006,10 +2046,13 @@ impl ContentionWitnessRecorder {
         }
         let now_ns = u64::try_from(inner.run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let pressure_ok = inner.sample_pressure_at(now_ns);
-        inner.close_schedstat_stage();
+        let body_undercovered = inner.stage == crate::monitor::LifecycleStage::Body
+            && inner.body_acceptance_under_covers_guest(now_ns);
+        inner.close_schedstat_stage(body_undercovered);
         if inner.stage == crate::monitor::LifecycleStage::Body {
             inner.body_exit_wall_ns = Some(now_ns);
-            inner.body_pressure_complete = inner.body_pressure_anchored && pressure_ok;
+            inner.body_pressure_complete =
+                inner.body_pressure_anchored && pressure_ok && !body_undercovered;
         }
         inner.finalized = true;
 
@@ -2017,7 +2060,8 @@ impl ContentionWitnessRecorder {
             .body_enter_wall_ns
             .zip(inner.body_exit_wall_ns)
             .map(|(enter, exit)| exit.saturating_sub(enter))
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(inner.guest_body_elapsed_ns);
         let mut deltas = std::mem::take(&mut inner.body_deltas);
         let mut widths = std::mem::take(&mut inner.body_widths_ns);
         let mut saturated = inner.body_saturated;
@@ -2026,10 +2070,10 @@ impl ContentionWitnessRecorder {
             && !deltas.is_empty()
             && deltas.len() == widths.len();
 
-        // PSI unavailable or failed mid-Body: use the event-anchored summed
-        // vCPU run-delay over the WHOLE widened Body witness span as one
+        // PSI unavailable, failed mid-Body, or invalidated by batched
+        // lifecycle delivery: use the enclosing summed-vCPU run delay as one
         // coarse interval. It loses localization but remains a complete upper
-        // bound; never convert a missing PSI counter into W=0.
+        // bound; never convert a missing or falsely tiny PSI span into W=0.
         if !complete && body_wall_ns > 0 && inner.body_schedstat_cap_complete {
             deltas = vec![inner.body_schedstat_cap_ns];
             widths = vec![body_wall_ns];
@@ -2062,6 +2106,14 @@ impl ContentionWitnessRecorder {
 }
 
 impl ContentionWitnessRecorderInner {
+    fn body_acceptance_under_covers_guest(&self, exit_wall_ns: u64) -> bool {
+        lifecycle_body_under_covers_guest(
+            self.body_enter_wall_ns,
+            self.guest_body_elapsed_ns,
+            exit_wall_ns,
+        )
+    }
+
     /// Sample PSI at an explicit run-relative wall. Returns true when a valid
     /// counter value was read and installed as the new anchor.
     fn sample_pressure_at(&mut self, now_ns: u64) -> bool {
@@ -2106,7 +2158,7 @@ impl ContentionWitnessRecorderInner {
         }
     }
 
-    fn close_schedstat_stage(&mut self) {
+    fn close_schedstat_stage(&mut self, force_current_lifetime: bool) {
         let tids = self
             .tids
             .iter()
@@ -2120,6 +2172,7 @@ impl ContentionWitnessRecorderInner {
                 self.body_schedstat_anchor,
                 &tids,
                 cur,
+                force_current_lifetime,
             ) {
                 self.body_schedstat_cap_ns = cap;
                 self.body_schedstat_cap_complete = true;
@@ -2129,11 +2182,20 @@ impl ContentionWitnessRecorderInner {
         }
         match (self.schedstat_anchor, cur) {
             (Some(anchor), Some(cur)) => {
-                self.per_phase.phases[self.stage as usize] = cur.delta_from(&anchor);
+                self.per_phase.phases[self.stage as usize] =
+                    if self.stage == crate::monitor::LifecycleStage::Body && force_current_lifetime
+                    {
+                        cur
+                    } else {
+                        cur.delta_from(&anchor)
+                    };
                 self.schedstat_anchor = Some(cur);
                 self.saw_schedstat = true;
             }
             (_, Some(cur)) => {
+                if self.stage == crate::monitor::LifecycleStage::Body && force_current_lifetime {
+                    self.per_phase.phases[self.stage as usize] = cur;
+                }
                 self.schedstat_anchor = Some(cur);
                 self.saw_schedstat = true;
             }
@@ -2164,8 +2226,9 @@ pub(crate) fn read_self_thread_schedstat() -> Option<HostVcpuSchedstat> {
 mod schedstat_tests {
     use super::{
         HostCpuPressureReader, complete_schedstat_delay_cap_ns, conservative_pressure_delta_ns,
-        parse_cpu_pressure_some_total_us, parse_schedstat_line, parse_unified_cgroup_path,
-        read_host_vcpu_schedstat, read_host_vcpu_schedstat_with_exit_snapshots,
+        lifecycle_body_under_covers_guest, parse_cpu_pressure_some_total_us, parse_schedstat_line,
+        parse_unified_cgroup_path, read_host_vcpu_schedstat,
+        read_host_vcpu_schedstat_with_exit_snapshots,
     };
     use crate::vmm::HostVcpuSchedstat;
 
@@ -2205,6 +2268,22 @@ mod schedstat_tests {
     }
 
     #[test]
+    fn guest_elapsed_detects_batched_lifecycle_delivery() {
+        assert!(lifecycle_body_under_covers_guest(
+            Some(10_000),
+            12_000,
+            10_071,
+        ));
+        assert!(lifecycle_body_under_covers_guest(None, 12_000, 50_000));
+        assert!(!lifecycle_body_under_covers_guest(
+            Some(10_000),
+            12_000,
+            22_000,
+        ));
+        assert!(!lifecycle_body_under_covers_guest(Some(10_000), 0, 10_071,));
+    }
+
+    #[test]
     fn schedstat_cap_uses_tight_delta_or_complete_lifetime_fallback() {
         let anchor = HostVcpuSchedstat {
             total_on_cpu_ns: 1_000,
@@ -2223,6 +2302,7 @@ mod schedstat_tests {
                 Some(anchor),
                 &[101, 102],
                 Some(current),
+                false,
             ),
             Some(250)
         );
@@ -2231,19 +2311,39 @@ mod schedstat_tests {
                 2,
                 &[101, 102],
                 Some(anchor),
+                &[101, 102],
+                Some(current),
+                true,
+            ),
+            Some(350),
+            "a batched lifecycle uses the complete enclosing lifetime"
+        );
+        assert_eq!(
+            complete_schedstat_delay_cap_ns(
+                2,
+                &[101, 102],
+                Some(anchor),
                 &[101, 103],
                 Some(current),
+                false,
             ),
             Some(350),
             "a mismatched anchor falls back to the complete current lifetime"
         );
         assert_eq!(
-            complete_schedstat_delay_cap_ns(2, &[], None, &[101, 102], Some(current)),
+            complete_schedstat_delay_cap_ns(2, &[], None, &[101, 102], Some(current), false),
             Some(350),
             "a missing pre-Body anchor still has a sound whole-lifetime bound"
         );
         assert_eq!(
-            complete_schedstat_delay_cap_ns(2, &[101, 102], Some(anchor), &[101, 0], Some(current),),
+            complete_schedstat_delay_cap_ns(
+                2,
+                &[101, 102],
+                Some(anchor),
+                &[101, 0],
+                Some(current),
+                false,
+            ),
             None,
             "an unstamped vCPU makes the cap partial"
         );
@@ -2257,6 +2357,7 @@ mod schedstat_tests {
                     sampled_vcpus: 1,
                     ..current
                 }),
+                false,
             ),
             None,
             "a failed schedstat read makes the cap partial"
@@ -2276,6 +2377,7 @@ mod schedstat_tests {
                     total_run_delay_ns: 0,
                     sampled_vcpus: 2,
                 }),
+                false,
             ),
             None,
             "CONFIG_SCHEDSTATS-off zeros are not a complete cap"

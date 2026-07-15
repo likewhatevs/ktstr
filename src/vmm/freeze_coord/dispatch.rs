@@ -1046,6 +1046,11 @@ pub(super) fn dispatch_bulk_message(
             // only, so a later Exit/TestResult Teardown advance is a
             // no-op.
             if msg.crc_ok {
+                if let Some((elapsed_ms, _)) = crate::vmm::wire::parse_scenario_end(&msg.payload)
+                    && let Some(recorder) = sinks.contention_recorder
+                {
+                    recorder.record_guest_body_elapsed_ms(elapsed_ms);
+                }
                 advance_stage(sinks, crate::monitor::LifecycleStage::Teardown);
             }
             Some(crate::vmm::wire::ShmEntry {
