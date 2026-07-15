@@ -949,28 +949,16 @@ pub fn collect_host_context() -> HostContext {
         task_delayacct: Some(read_task_delayacct()),
         config_task_xacct: Some(read_config_task_xacct()),
         // `heap_state` is a post-run snapshot of the running ktstr
-        // process's jemalloc footprint. Captured here alongside the
-        // other dynamic fields so sidecar consumers can correlate
-        // test outcomes with runner memory pressure. libjemalloc is
-        // linked into every binary in this workspace (hard dep of
-        // `tikv-jemalloc-ctl`), so `collect()` always returns a
-        // populated struct when `#[global_allocator]` is jemalloc.
-        // Downstream consumers using ktstr without jemallocator
-        // installed see `allocated_bytes == Some(0)` and
-        // `active_bytes == Some(0)` because libjemalloc is linked
-        // but unused — collapse that shape to `None` so the sidecar
-        // does not carry a misleading empty row. `arenas.narenas` is
-        // still populated in the collapsed shape but alone carries
-        // no runner-pressure information, so it travels with the
-        // stats that give it meaning.
-        heap_state: {
-            let h = crate::host_heap::collect();
-            if h.allocated_bytes == Some(0) && h.active_bytes == Some(0) {
-                None
-            } else {
-                Some(h)
-            }
-        },
+        // process's jemalloc footprint. Every binary links jemalloc
+        // through tikv-jemalloc-ctl, but mallctl counters cannot tell
+        // whether Rust actually selected it: reading them initializes
+        // jemalloc and creates small allocator-internal allocations.
+        // Shipped binary roots mark their explicit allocator choice at
+        // process entry. Integration-test binaries (also used as guest
+        // `/init`) remain unmarked and avoid both the mallctl work and a
+        // misleading metadata-only sidecar row.
+        heap_state: crate::host_heap::jemalloc_is_global_allocator()
+            .then(crate::host_heap::collect),
     }
 }
 

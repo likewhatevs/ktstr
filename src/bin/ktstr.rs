@@ -1,5 +1,6 @@
-// Global allocator (jemalloc) is provided centrally by the ktstr
-// library crate (src/lib.rs) and inherited by this bin.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -1245,6 +1246,7 @@ mod psi_show_tests {
 }
 
 fn main() -> Result<()> {
+    ktstr::host_heap::mark_jemalloc_global_allocator();
     // Restore SIGPIPE so piping ktstr output to `head` / `less` /
     // similar doesn't panic inside `print!`. Shared helper lives
     // in `cli::restore_sigpipe_default`; see that doc for the

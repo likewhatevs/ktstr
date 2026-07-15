@@ -247,25 +247,11 @@
 // `extern crate self as ktstr` is a pure name-binding.
 extern crate self as ktstr;
 
-// Global allocator for every binary linking this crate — the shipped
-// bins (ktstr, cargo-ktstr, the jemalloc fixtures; all carry
-// `required-features = ["cli-bins"]`) and, since `integration` pulls
-// `cli-bins` (Cargo.toml), every `#[ktstr_test]` integration-test binary
-// (the framework packs it as the guest `/init` — vmm::initramfs
-// strip+packs the test binary as rdinit). The guest-`/init` use is
-// incidental, NOT a fix: a memory-constrained guest `/init` is kept alive
-// by `vm.overcommit_memory=1` on the guest cmdline
-// (vmm::setup::base_guest_cmdline), not by this allocator — the System
-// allocator boots the guest fine under that sysctl (verified by running
-// the shell-lifecycle suite with jemalloc disabled: 12/12 pass). Gated on
-// `cli-bins`, which provides `tikv-jemallocator`; lean
-// `default-features = false` library consumers (which never boot guests)
-// keep the System allocator. The bins/probe that previously declared
-// their own jemalloc now inherit this one; `jemalloc_alloc_worker`
-// keeps its own because it does not link this crate (pure `#[path]`).
-#[cfg(feature = "cli-bins")]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+// Keep the library allocator-agnostic for downstream crates and integration
+// test binaries. The latter are also packed as the guest `/init`; forcing
+// jemalloc into them makes an allocator that is irrelevant to the scenario
+// part of the guest's correctness surface. Each shipped binary that needs
+// jemalloc declares it at its own crate root instead.
 
 // Defense-in-depth for the e2e jemalloc-fixture invariant: `integration`
 // pulls `cli-bins` (Cargo.toml), so the jemalloc introspection fixtures

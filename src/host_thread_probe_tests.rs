@@ -392,10 +392,10 @@ fn compute_tls_address_dispatches_positionally_distinct() {
 }
 
 /// `extract_pt_tls_layout` against the test binary's own ELF.
-/// The lib's containing crate links `tikv_jemallocator` as the
-/// global allocator, so the compiled test binary carries
-/// jemalloc's `tsd_tls` in a real `PT_TLS` segment. Parsing it
-/// exercises the actual extraction function end-to-end and
+/// The unconditional `tikv-jemalloc-ctl` dependency links jemalloc-sys,
+/// so the compiled test binary carries jemalloc's `tsd_tls` in a real
+/// `PT_TLS` segment even though the library remains allocator-agnostic.
+/// Parsing it exercises the actual extraction function end-to-end and
 /// pins the toolchain-emitted invariants (power-of-two
 /// alignment; aligned size is a multiple of align) against a
 /// real program header.
