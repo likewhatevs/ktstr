@@ -2513,6 +2513,12 @@ impl KtstrVm {
             .iter()
             .map(|(slot, _)| slot.clone())
             .collect();
+        // A second handle set for the coordinator's own live schedstat read
+        // (the periodic-window dilation scale below). Cloned, not moved, so
+        // `start_monitor` still consumes `vcpu_tid_atomics` for its per-tick
+        // witness.
+        let vcpu_tid_atomics_for_coord: Vec<Arc<AtomicI32>> =
+            vcpu_tid_atomics.iter().map(Arc::clone).collect();
         // KERN_ADDRS observability counters (frames consumed / CRC-failed),
         // incremented by the coordinator's dispatch arm and read by the
         // monitor's pre-latch diagnostic (see `RqRefresh::kern_addrs_frames`):
@@ -9343,10 +9349,56 @@ impl KtstrVm {
                             // scenario-relative for build_phase_buckets. The
                             // slicer self-guards the degenerate/tiny window
                             // (returns empty).
+                            // Dilation-aware window. `now_ns` (the boundary
+                            // clock, below) is host wall-clock, but the guest's
+                            // workload time dilates against it under host
+                            // oversubscription. A fixed `anchor + duration`
+                            // window then closes while the guest is still in
+                            // its FIRST scenario phase, firing every boundary
+                            // into one phase bucket and starving later phases
+                            // (counter_delta_per_phase needs >=2 samples per
+                            // phase). Scale the window by the live vCPU
+                            // dilation D = 1 + run_delay/on_cpu so boundaries
+                            // spread across the actual (dilated) run and each
+                            // phase gets its share. D reads ~1.0 on an
+                            // unloaded host — an exact no-op there — and is
+                            // clamped so a transient boot-time run_delay spike
+                            // cannot stretch the window without bound. A
+                            // slightly-generous window is safe: captures are
+                            // bucketed by the LIVE scenario-phase stamp
+                            // (`freeze_coord_current_step` at fire time), not
+                            // the boundary offset, so extra span only wastes
+                            // late boundaries — it can never misattribute a
+                            // sample or empty a phase the window still covers.
+                            // Safety cap on the stretch: a pathological
+                            // early-run reading (a boot transient dominating the
+                            // still-small on_cpu denominator) could otherwise
+                            // over-stretch the window far past the run's flat
+                            // wall deadline (`vm_timeout_from_entry` =
+                            // max(watchdog_timeout, duration) + headroom, which
+                            // does NOT scale with dilation). Over-stretch never
+                            // empties a covered phase — captures bucket by the
+                            // live phase stamp — but boundaries scheduled past
+                            // the deadline never fire, thinning capture density;
+                            // the cap keeps enough boundaries inside the run to
+                            // preserve the >=2-per-phase floor at realistic CI
+                            // dilations (~2-3x).
+                            const PERIODIC_WINDOW_MAX_DILATION: f64 = 4.0;
+                            let live_tids: Vec<i32> = vcpu_tid_atomics_for_coord
+                                .iter()
+                                .map(|a| a.load(Ordering::Acquire))
+                                .collect();
+                            let dilation_scale = read_host_vcpu_schedstat(&live_tids)
+                                .and_then(|s| s.dilation())
+                                .unwrap_or(1.0)
+                                .clamp(1.0, PERIODIC_WINDOW_MAX_DILATION);
+                            let scaled_workload_ns = ((workload_d.as_nanos() as f64)
+                                * dilation_scale)
+                                as u64;
                             if let Some(window) = resolve_periodic_window(
                                 scenario_anchor,
                                 periodic_prereqs_ready_ns,
-                                workload_d.as_nanos() as u64,
+                                scaled_workload_ns,
                             ) {
                                 let boundaries = compute_periodic_boundaries_ns(
                                     window.window_start_ns,
@@ -9361,6 +9413,8 @@ impl KtstrVm {
                                     window_end_ns = window.window_end_ns,
                                     prereqs_ready_ns = periodic_prereqs_ready_ns,
                                     workload_duration_ns = workload_d.as_nanos() as u64,
+                                    dilation_scale,
+                                    scaled_workload_ns,
                                     "freeze-coord: periodic snapshot boundaries computed"
                                 );
                                 periodic_anchor_ns = window.anchor_ns;
