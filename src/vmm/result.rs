@@ -609,13 +609,12 @@ pub struct VmResult {
     pub host_vcpu_schedstat: Option<HostVcpuSchedstat>,
     /// Per-phase host-contention witness for the "weather witness" latency
     /// model (see [`ContentionWitness`]): the Body-phase dilation `D` plus
-    /// the Body-phase peak-window run-delay series that bounds `W(L)`. The
-    /// monitor assembles it per tick off the same lifecycle-stage machinery
-    /// the watchdog uses. `None` when the monitor did not run, ran without a
-    /// progress ledger, or sampled no vCPU TIDs. Consumed by a LATER seam
-    /// pass — `latency_verdict`
-    /// — to make latency threshold verdicts tri-state under contention;
-    /// purely observational until then.
+    /// the Body-phase peak-window CPU-pressure series that bounds `W(L)`.
+    /// Lifecycle events anchor the series and the monitor adds constant-cost
+    /// cgroup-PSI samples on its existing wakes. `None` when neither PSI nor
+    /// vCPU schedstat supplied evidence. Consumed by a LATER seam pass —
+    /// `latency_verdict` — to make latency threshold verdicts tri-state under
+    /// contention; purely observational until then.
     pub contention_witness: Option<ContentionWitness>,
     /// Memoized single drain of [`Self::snapshot_bridge`].
     ///
@@ -1576,8 +1575,7 @@ pub const BODY_STAGE_INDEX: usize = crate::monitor::LifecycleStage::Body as usiz
 
 /// Per-lifecycle-phase host-dilation witness: one [`HostVcpuSchedstat`] DELTA
 /// per stage, each covering exactly its own stage's span (the schedstat
-/// accrued between the phase-boundary snapshots the monitor takes when it
-/// observes a lifecycle stage advance). Indexed by
+/// accrued between lifecycle-event boundary snapshots). Indexed by
 /// `LifecycleStage` `as usize`.
 ///
 /// Distinct from the whole-run [`VmResult::host_vcpu_schedstat`] (which is
@@ -1587,12 +1585,10 @@ pub const BODY_STAGE_INDEX: usize = crate::monitor::LifecycleStage::Body as usiz
 /// from the Boot / Attach / Teardown INFRA phases. `Boot`/`Attach` `D` is
 /// diagnostic; `Body` is the one the latency verdict consumes.
 ///
-/// ONE-TICK BOUNDARY SLOP (conservative, documented): the monitor detects a
-/// stage advance one tick (≤ 100 ms) AFTER it happens, and snapshots on that
-/// tick — so each phase's span is shifted by up to one tick at each end. A
-/// phase absorbs up to one tick of its successor's schedstat and cedes up to
-/// one tick of its own tail. Over a minutes-long Body phase this is
-/// negligible, and it never mis-attributes a whole phase.
+/// The dispatch path takes each boundary snapshot immediately after accepting
+/// the CRC-valid lifecycle frame. A wide-VM snapshot is a sequential sweep of
+/// the vCPU TIDs rather than an atomic kernel operation, so its uncertainty is
+/// the duration of that rare sweep, not the monitor's sampling period.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PerPhaseSchedstat {
     /// Per-stage schedstat delta, indexed by `LifecycleStage as usize`
@@ -1625,80 +1621,106 @@ impl PerPhaseSchedstat {
     }
 }
 
-/// Body-phase peak-window contamination series: the per-tick TOTAL host
-/// run-delay deltas (Σ over the vCPU threads) the monitor accrued during the
-/// Body phase, one entry per monitor tick. Feeds
-/// `peak_window_delay_ns`, which
-/// slides a window of `ceil(L / tick_ns) + 1` ticks (the +1 covers grid
-/// straddle) to bound `W(L)` — the worst host contamination any `L`-long
-/// interval of the phase could contribute.
+/// Body-phase peak-window contamination series. New witnesses store deltas of
+/// the ktstr runner cgroup's CPU PSI `some total` clock: time during which at
+/// least one runnable task in that cgroup was stalled for CPU. This includes a
+/// delayed vCPU even when its competitor is outside the cgroup, without
+/// charging pressure in unrelated host cgroups. Each entry has its real
+/// observation width in [`Self::tick_widths_ns`], allowing the window
+/// calculation to remain sound when the monitor is starved and wakes much
+/// later than its nominal cadence.
 ///
-/// Bounded storage: ticks are 100 ms and Body phases run minutes, so a few
-/// thousand entries is typical; the series is capped and `saturated` is set
-/// if the cap is hit (see `BODY_TICK_CAP`). When
+/// Legacy/deserialized witnesses may have no width vector; those retain the
+/// fixed-grid `tick_ns` interpretation. Bounded storage: observations are
+/// nominally 100 ms apart and Body phases run minutes, so a few thousand
+/// entries is typical; the series is capped at 36,000 intervals and
+/// `saturated` is set if the cap is hit. When
 /// `saturated`, the series is a PREFIX of the phase, so `W` computed from it
 /// is a LOWER bound — a later verdict pass should treat that as reducing
 /// confidence in a `FailConfirmed` rather than trusting a possibly-short `W`.
 ///
-/// COVERAGE SOUNDNESS: `peak_window_delay_ns` is only a trustworthy `W`
-/// bound if the series' ticks actually SPANNED the Body phase. On a starved
-/// host (e.g. a CI cell whose SCHED_OTHER monitor thread shares a 1-host-CPU
-/// budget with the guest vCPUs) the monitor can tick rarely, or never, INSIDE
-/// the Body span — an empty series makes `W == 0`, and a bare `excess > W`
-/// gate would then wrongly CONFIRM a contention-caused failure, the one
-/// verdict the design forbids. [`Self::body_covered_ns`] (the wall the ticks
-/// actually spanned) and [`Self::body_wall_ns`] (the real Body phase wall) let
-/// the seam prove the series covered enough of the phase before trusting `W`
-/// for a `FailConfirmed` (see `body_series_covers_phase`).
+/// COVERAGE SOUNDNESS: new witnesses sample the cumulative PSI counter at
+/// accepted lifecycle boundaries as well as monitor wakes, so the first and
+/// last samples explicitly close the entire Body span. A starved monitor may
+/// produce one coarse interval instead of many fine ones, but charging that
+/// interval's entire delta remains an upper bound for every window it can
+/// touch. If either boundary sample fails or storage saturates, `complete` is
+/// false and the seam cannot use the series to confirm a failure.
 ///
-/// The measure is a SPAN ratio, not a tick-density ratio: a monitor that
-/// ticks coarsely but from Body start to Body end still WATCHED the whole
-/// phase (each `tick_delta` captures ALL run-delay accrued since the prior
-/// tick, so `W` over such a series over-counts if anything — safe); only a
-/// series whose ticks fail to reach across the phase (empty, or clustered in a
-/// sub-window) leaves `W` untrustworthy.
+/// Legacy witnesses have no explicit completeness bit. For them the seam
+/// retains the old conservative check that the fixed-grid samples span enough
+/// of Body; an empty or clustered series can only demote a result, never
+/// produce a false confirmation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BodyContentionWindow {
-    /// Per-monitor-tick Σ-run-delay delta (ns) over the Body phase, in tick
-    /// order.
+    /// Per-observation CPU-contention delta (ns) over the Body phase, in time
+    /// order. New witnesses use runner-cgroup CPU PSI `some total`; legacy
+    /// witnesses contain summed vCPU schedstat run-delay.
     pub tick_deltas: Vec<u64>,
+    /// Real wall width (ns) of each corresponding delta interval. Empty on
+    /// legacy witnesses. When present, length matches `tick_deltas` and the
+    /// peak-window calculation uses these widths instead of a nominal grid.
+    #[serde(default)]
+    pub tick_widths_ns: Vec<u64>,
     /// The nominal monitor tick period (ns) the deltas were sampled at
-    /// (100 ms in production) — the `tick_ns` the window math quantises with.
+    /// (100 ms in production). Used only by legacy witnesses without real
+    /// interval widths.
     pub tick_ns: u64,
     /// True when [`Self::tick_deltas`] hit its cap and later Body ticks were
     /// dropped — the series is then a prefix and `W` from it is a lower bound.
     pub saturated: bool,
-    /// The REAL wall span (ns) of the Body phase — measured host-side from the
-    /// monitor's elapsed clock at the Body enter/exit stage transitions,
-    /// conservatively over-estimated at both ends (enter pinned at the
-    /// observation BEFORE the first Body tick, exit at the observation AFTER
-    /// Body) so it can only be too LARGE, never too small → the coverage ratio
-    /// is under-stated → the verdict is biased toward demote, never a wrong
-    /// `FailConfirmed`. `0` when the Body phase was never observed.
+    /// True when lifecycle-event samples anchored BOTH ends of Body (the
+    /// start is conservatively pulled back to the preceding lifecycle
+    /// boundary to cover virtio dispatch lag), making the cumulative interval
+    /// series complete even if it contains only one coarse interval. False on
+    /// legacy sampled witnesses, whose coverage is inferred from their
+    /// first/last monitor ticks.
+    #[serde(default)]
+    pub complete: bool,
+    /// Complete summed vCPU schedstat run-delay (ns) over the SAME
+    /// conservative wall span as this series. When
+    /// [`Self::schedstat_cap_complete`] is true, `W(L)` is capped by this
+    /// value: a request cannot absorb more task-specific scheduling delay in
+    /// one window than all vCPUs accumulated over the enclosing span. This
+    /// removes unrelated runner-cgroup PSI without under-bounding the target
+    /// VM's delay.
+    #[serde(default)]
+    pub schedstat_cap_ns: u64,
+    /// True only when both cap snapshots sampled the exact same complete set
+    /// of vCPU TIDs. False for legacy witnesses and partial/read-raced
+    /// lifecycle snapshots; in that case the cap is ignored.
+    #[serde(default)]
+    pub schedstat_cap_complete: bool,
+    /// The host-side wall span (ns) covered by the Body witness. The start is
+    /// conservatively pinned to the accepted lifecycle boundary preceding
+    /// Body, covering any time the guest's Body frame waited in virtio
+    /// dispatch; the end is the first accepted transition after Body. It may
+    /// therefore include adjacent-stage time, which makes `W` larger and can
+    /// only bias the verdict toward indeterminate. `0` when Body was never
+    /// observed.
     pub body_wall_ns: u64,
-    /// The wall span (ns) the series' ticks actually COVERED: the elapsed
-    /// between the FIRST and LAST Body tick. `body_covered_ns / body_wall_ns`
-    /// is the fraction of the Body phase the witness spanned; a series that
-    /// spans too little of the phase cannot support an "excess > W"
-    /// refutation. `0` when fewer than two Body ticks landed (no span).
+    /// The wall span (ns) the series actually covered. For event-anchored
+    /// complete witnesses this equals `body_wall_ns`; for legacy witnesses it
+    /// is the elapsed between the first and last Body monitor tick.
     pub body_covered_ns: u64,
 }
 
-/// The Body-phase contention witness assembled by the monitor: the per-phase
-/// dilation array plus the Body-phase peak-window run-delay series. Carried
-/// on [`VmResult::contention_witness`] so a later seam pass can call
-/// `latency_verdict` to turn a
-/// latency threshold into a tri-state, contention-aware verdict.
+/// The event-anchored host-contention witness: per-phase vCPU schedstat
+/// dilation plus the Body-phase CPU-pressure interval series. The monitor
+/// contributes constant-cost samples on its existing timer wakes; lifecycle
+/// dispatch anchors the stage boundaries. Carried on
+/// [`VmResult::contention_witness`] so a later seam pass can call
+/// `latency_verdict` to turn a latency threshold into a tri-state,
+/// contention-aware verdict.
 ///
-/// `None` on [`VmResult`] when the monitor did not run, ran without a
-/// progress ledger (no lifecycle-stage signal), or sampled no vCPU TIDs
-/// (`CONFIG_SCHEDSTATS` off / early failure) — the same absence classes as
-/// the whole-run [`VmResult::host_vcpu_schedstat`].
+/// `None` on [`VmResult`] when neither vCPU schedstat nor CPU PSI supplied any
+/// evidence. A present but incomplete Body series is retained for diagnostics
+/// but cannot confirm a latency failure.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ContentionWitness {
     /// Per-lifecycle-phase host-dilation deltas (Boot..Teardown).
     pub per_phase: PerPhaseSchedstat,
-    /// Body-phase per-tick run-delay series for the `W(L)` bound.
+    /// Body-phase contention intervals for the `W(L)` bound.
     pub body_window: BodyContentionWindow,
 }
 
@@ -1815,6 +1837,9 @@ pub(crate) struct VmRunState {
     /// Run-relative ns of the periodic capture-window end (0 = the
     /// window never resolved) → [`VmResult::periodic_window_end`].
     pub(crate) periodic_window_end_ns_raw: u64,
+    /// Event-anchored per-phase dilation + Body contention intervals,
+    /// finalized while vCPU `/proc` entries are still alive.
+    pub(crate) contention_witness: Option<ContentionWitness>,
     pub(crate) ap_threads: Vec<VcpuThread>,
     pub(crate) monitor_handle: Option<JoinHandle<monitor::reader::MonitorLoopResult>>,
     pub(crate) bpf_write_handle: Option<JoinHandle<()>>,

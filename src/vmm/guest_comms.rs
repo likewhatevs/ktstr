@@ -699,9 +699,10 @@ pub fn send_scenario_resume() {
 
 /// Send a workload-progress heartbeat carrying the guest's own
 /// scenario-elapsed time in milliseconds (see
-/// [`crate::vmm::wire::MSG_TYPE_WORKLOAD_PROGRESS`]). Emitted on a fixed
-/// guest-time cadence so the host can place periodic captures on the guest
-/// clock; a no-op when the bulk port is not yet open.
+/// [`crate::vmm::wire::MSG_TYPE_WORKLOAD_PROGRESS`]). Emitted from the
+/// scenario driver's existing scheduler-liveness wakeups so the host can
+/// place periodic captures on the guest clock without a dedicated heartbeat
+/// thread; a no-op when the bulk port is not yet open.
 pub fn send_workload_progress(elapsed_ms: u64) {
     write_msg(
         crate::vmm::wire::MSG_TYPE_WORKLOAD_PROGRESS,

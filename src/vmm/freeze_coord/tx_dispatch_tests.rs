@@ -127,6 +127,7 @@ impl SinkState {
             // No ledger wired: these dispatch-arm fixtures do not assert
             // lifecycle-stage side effects, so every advance site no-ops.
             progress_ledger: None,
+            contention_recorder: None,
             expected_kernel_build_id: None,
         }
     }

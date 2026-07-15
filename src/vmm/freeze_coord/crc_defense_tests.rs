@@ -128,6 +128,7 @@ impl SinkState {
             // No ledger wired: these CRC-gate fixtures do not assert
             // lifecycle-stage side effects, so every advance site no-ops.
             progress_ledger: None,
+            contention_recorder: None,
             // No expected build-id: the KERN_BUILD_ID arm's check is
             // disabled (a `None` expectation never flags a mismatch).
             expected_kernel_build_id: None,

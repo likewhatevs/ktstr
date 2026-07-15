@@ -1090,46 +1090,27 @@ fn finish_scenario(
     result
 }
 
-/// Guest workload-progress heartbeat. While alive, a detached background
-/// thread emits the scenario-elapsed time on a fixed GUEST-time cadence
-/// (see [`crate::vmm::wire::MSG_TYPE_WORKLOAD_PROGRESS`]) so the host can
-/// clock periodic captures off guest progress rather than host wall-clock.
-/// Dropping it (when `run_scenario` returns on ANY path) signals the thread
-/// to stop. The thread is DETACHED, never joined: at teardown the scheduler
-/// under test may be dead or mid-kill, so the heartbeat thread might not be
-/// scheduled to observe the stop flag promptly, and a join could hang the
-/// guest teardown. It exits on its next wake, or at guest reboot.
+/// Guest workload-progress publisher. It emits scenario-elapsed time from the
+/// scenario driver's EXISTING scheduler-liveness wakeups (plus lifecycle
+/// boundaries), so the host can clock periodic captures off guest progress
+/// without adding a periodically-runnable guest thread of its own.
+///
+/// The driver's hold path already wakes every 100 ms to inspect the BPF
+/// err-exit latch / sched_ext state. Publishing from those wakes preserves the
+/// heartbeat's cadence while the capture-active workload is running at no
+/// additional scheduler wakeup cost. Setup and paused teardown publish only at
+/// their natural boundaries; there is no useful periodic-capture progress to
+/// report while the driver is not in a workload hold.
+#[derive(Clone, Copy)]
 struct WorkloadHeartbeat {
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    scenario_start: std::time::Instant,
 }
 
 impl WorkloadHeartbeat {
-    /// Cadence: frequent enough that the host's staleness backstop can
-    /// tell a wedge (heartbeats STOP) from mere load dilation (they SLOW)
-    /// even at large host oversubscription, yet cheap enough to be
-    /// negligible load on the scheduler under test.
-    const CADENCE: std::time::Duration = std::time::Duration::from_millis(100);
-
-    fn spawn(scenario_start: std::time::Instant) -> Self {
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let thread_stop = std::sync::Arc::clone(&stop);
-        let _ = std::thread::Builder::new()
-            .name("ktstr-workload-hb".into())
-            .spawn(move || {
-                while !thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    crate::vmm::guest_comms::send_workload_progress(
-                        scenario_start.elapsed().as_millis() as u64,
-                    );
-                    std::thread::sleep(Self::CADENCE);
-                }
-            });
-        Self { stop }
-    }
-}
-
-impl Drop for WorkloadHeartbeat {
-    fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    fn publish(self) {
+        crate::vmm::guest_comms::send_workload_progress(
+            self.scenario_start.elapsed().as_millis() as u64
+        );
     }
 }
 
@@ -1175,17 +1156,18 @@ fn run_scenario(
         crate::vmm::guest_comms::send_scenario_start();
     }
 
-    // Workload-progress heartbeat: drives the host's periodic-capture clock
-    // off guest progress. Lives until this function returns (any path). Only
-    // spawned when this run actually declares periodic captures
-    // (`KTSTR_AWAIT_PERIODIC_READY`, set iff num_snapshots > 0): a run with
-    // no periodic captures gains nothing from it, and the extra 100ms-waking
-    // thread would only perturb the scenario — e.g. a watchdog idle-body
-    // exemption test on a single starved vCPU, where the added thread can
-    // tip a survive into a wall-clock kill.
-    let _workload_heartbeat = (guest_comms::is_guest()
+    // Workload-progress publisher: drives the host's periodic-capture clock
+    // off guest progress. Only present when this run declares periodic
+    // captures (`KTSTR_AWAIT_PERIODIC_READY`, set iff num_snapshots > 0).
+    // Unlike the old detached heartbeat, this is passive state carried by the
+    // scenario driver; `hold_or_sched_died` publishes from wakeups the driver
+    // already performs for scheduler liveness.
+    let workload_heartbeat = (guest_comms::is_guest()
         && crate::vmm::rust_init::cmdline_val("KTSTR_AWAIT_PERIODIC_READY").is_some())
-    .then(|| WorkloadHeartbeat::spawn(scenario_start));
+    .then_some(WorkloadHeartbeat { scenario_start });
+    if let Some(heartbeat) = workload_heartbeat {
+        heartbeat.publish();
+    }
 
     wait_for_host_map_write(ctx);
 
@@ -1276,6 +1258,7 @@ fn run_scenario(
             effective_checks,
             &mut sched_died_during_hold,
             &mut final_total_iterations,
+            workload_heartbeat,
         );
 
         // Close this step's hold window for backdrop workers: write the
@@ -1441,7 +1424,11 @@ fn sched_crashed_unexpectedly() -> bool {
     crate::vmm::rust_init::sched_pid().is_some() && dispatch::scx_down()
 }
 
-fn hold_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
+fn hold_or_sched_died(
+    dur: Duration,
+    sched_pid: Option<libc::pid_t>,
+    workload_heartbeat: Option<WorkloadHeartbeat>,
+) -> bool {
     use crate::probe::process::{SchedExitKind, sched_exit_kind};
     use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
@@ -1459,6 +1446,9 @@ fn hold_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
     let crashed = || matches!(sched_exit_kind(), SchedExitKind::Crashed);
 
     if dur.is_zero() {
+        if let Some(heartbeat) = workload_heartbeat {
+            heartbeat.publish();
+        }
         return crashed()
             || (sched_pid.is_some() && dispatch::scx_down())
             || sched_pid.is_some_and(|pid| !process_alive(pid));
@@ -1470,6 +1460,9 @@ fn hold_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
         // crash — poll it in short intervals instead of sleeping blind
         // for the whole window.
         loop {
+            if let Some(heartbeat) = workload_heartbeat {
+                heartbeat.publish();
+            }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 return crashed();
@@ -1544,6 +1537,9 @@ fn hold_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
 
     let mut events = [EpollEvent::empty()];
     loop {
+        if let Some(heartbeat) = workload_heartbeat {
+            heartbeat.publish();
+        }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             // Hold elapsed without a wakeup. Re-probe ALL signals to
@@ -1651,6 +1647,7 @@ fn run_step<'a>(
     // a failed step does not overwrite a prior step's good value with a
     // misleading post-death count.
     final_total_iterations: &mut Option<(u64, u64)>,
+    workload_heartbeat: Option<WorkloadHeartbeat>,
 ) -> Result<()> {
     let mut scenario = ScenarioState::new(step_state, backdrop_state);
 
@@ -1703,7 +1700,11 @@ fn run_step<'a>(
                 // Live `sched_pid()` read so a mid-loop
                 // Op::ReplaceScheduler swap is watched at the NEW
                 // pid, not the stale boot snapshot in ctx.
-                if hold_or_sched_died(remaining.min(interval), crate::vmm::rust_init::sched_pid()) {
+                if hold_or_sched_died(
+                    remaining.min(interval),
+                    crate::vmm::rust_init::sched_pid(),
+                    workload_heartbeat,
+                ) {
                     *sched_died_during_hold = true;
                     return Ok(());
                 }
@@ -1765,7 +1766,11 @@ fn run_step<'a>(
             // Live `sched_pid()` read — matches the loop arm above
             // so the hold watches the post-Op::ReplaceScheduler
             // pid, not the stale boot snapshot.
-            if hold_or_sched_died(hold_dur, crate::vmm::rust_init::sched_pid()) {
+            if hold_or_sched_died(
+                hold_dur,
+                crate::vmm::rust_init::sched_pid(),
+                workload_heartbeat,
+            ) {
                 *sched_died_during_hold = true;
                 return Ok(());
             }

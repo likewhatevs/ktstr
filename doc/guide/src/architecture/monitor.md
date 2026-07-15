@@ -92,13 +92,31 @@ ratio, max DSQ depth, stuck-task detection), per-sample averages, and
 event-counter deltas. Averages are computed over valid samples only
 (excluding uninitialized guest memory — see below).
 
-Each tick the monitor also samples the HOST side: the vCPU threads'
-own `/proc/self/task/<tid>/schedstat` (on-CPU vs run-delay), which it
-attributes to the guest's current lifecycle phase. This is what feeds
-the per-cell host dilation `D` on verdict lines and the per-phase
-contention witness — the guest-side `struct rq` reads measure the
-scheduler *under test*, the host-side reads measure the weather the
-cell ran in. See [Run Modes](../concepts/run-modes.md#dilation-reporting).
+Host-weather sensing uses two paths with different costs:
+
+- CRC-valid lifecycle transitions take cumulative snapshots of the vCPU
+  threads' `/proc/self/task/<tid>/schedstat` (on-CPU vs run-delay). The full
+  O(vCPU) sweep therefore runs a handful of times per cell, not every 100 ms;
+  boundary deltas feed per-phase dilation `D`.
+- During Body, the monitor's existing tick reads one persistent
+  `cpu.pressure` counter (`some total`) from ktstr's host cgroup. Real elapsed
+  widths are stored with the deltas, so a starved monitor produces a coarse
+  conservative interval instead of being treated as though it woke on time.
+  Lifecycle events sample the same counter at the Body edges.
+
+The cgroup clock includes every ktstr vCPU even when the competing task is in
+another cgroup, while avoiding pressure from unrelated jobs elsewhere on a
+wide host. Other tasks sharing the runner cgroup can overstate the weather but
+cannot hide a runnable vCPU stalled for CPU. To prevent concurrently running
+cells in that same cgroup from making `W` noisy, the localized PSI result is
+capped by the target VM's complete summed-vCPU schedstat delay over the same
+conservative Body span. Both values independently upper-bound a request's
+host scheduling contamination, so their minimum stays conservative. If scoped
+CPU PSI is unavailable, that lifecycle schedstat delta supplies a coarser
+whole-span fallback. The guest-side `struct rq` reads still measure the
+scheduler *under test*; these host-side reads measure the host the cell ran in.
+See
+[Run Modes](../concepts/run-modes.md#dilation-reporting).
 
 ## Threshold evaluation
 

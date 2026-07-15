@@ -370,11 +370,16 @@ the overcommit** the mode accepted.
 
 ### The contention witness and the wall-latency verdict
 
-The Body (measurement) phase's dilation `D` — plus a per-tick series of
-the host run-delay accrued during that phase — form the **contention
-witness** the wall-latency ceilings consume. From the series ktstr
-derives `W(L)`, the worst host delay any interval of length `L` could
-have absorbed; pairing that with a gate's measured latency turns
+The Body (measurement) phase's dilation `D` — plus a variable-width series of
+runner-cgroup CPU-pressure deltas during that phase — form the **contention
+witness** the wall-latency ceilings consume. Full vCPU schedstat sweeps happen
+only at lifecycle transitions; the Body hot path reads one PSI counter on the
+monitor's already-existing wake, independent of vCPU count. A complete
+task-specific schedstat delta over the same widened Body span caps the PSI
+result, so another concurrently running cell in the same runner cgroup cannot
+inflate `W` beyond this VM's own accumulated delay. From the series ktstr
+derives `W(L)`, the worst host delay any interval of length `L` could have
+absorbed; pairing that with a gate's measured latency turns
 `max_p99_wake_latency_ns` from a plain threshold into the contention-aware
 tri-state (pass always sound / fail only when refutation-proof /
 indeterminate = a non-blocking annotated pass) described under
@@ -500,15 +505,18 @@ are host artifacts."* Throughput is unaffected (rps +0.9%, loop count
 be re-taken; a threshold test, which gates on metric presence, is
 unaffected.
 
-**Instrumentation overhead is unmeasurable on real workloads.** The two
-measurement-path additions — the monitor's per-tick host schedstat reads
-(the witness) and the worker's per-checkpoint CPU-clock read (the
-CPU-denominated stuck gate) — were laddered commit-by-commit on the
-steady perf schbench cell: every ratio lands 0.996–1.005, inside the
-pre-change envelope. The construction-worst-case fixture (pure SpinWait,
-nothing to amortize against) shows the predicted sub-1%-per-addition dip
-in iteration rate, cumulating to −1.2% and still inside the baseline's
-own run-to-run envelope.
+**The contention witness no longer scales its hot-path file reads with VM
+width.** Earlier validation laddered the original per-tick O(vCPU) schedstat
+sweep and found no measurable steady-schbench shift, but the shape was still
+an avoidable observer cost on wide cells. The current path takes those sweeps
+only at lifecycle transitions and uses one cumulative runner-cgroup
+CPU-pressure read per Body monitor tick. That scope retains delayed-vCPU
+coverage without charging pressure from unrelated host cgroups, and a
+task-specific lifecycle schedstat cap removes noise from other cells sharing
+the runner cgroup. If scoped PSI is unavailable, the same complete cap provides
+a coarser whole-span fallback. The worker's per-checkpoint CPU-clock read
+remains; its historical worst-case SpinWait cost and the original ladder are
+retained in the validation record.
 
 **The watchdog catches real wedges fast and leaves healthy cells alive.**
 The injected-wedge fixtures

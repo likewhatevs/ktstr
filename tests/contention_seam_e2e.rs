@@ -18,14 +18,14 @@
 //! (b) needs.)
 //!
 //! Both branches turn on the same lever — the size of the measured p99
-//! relative to `W`, the peak host run-delay over the (tick-quantised,
-//! ≥ 2-tick) window `latency_verdict` scores the p99 exemplar against:
+//! relative to `W`, the peak runner-cgroup CPU-pressure bound over the
+//! variable-width intervals `latency_verdict` scores the p99 exemplar against:
 //!
 //! (a) QUIET-HOST CONFIRMED FAIL — default (non-overcommit) placement, a
 //!     single Bursty worker with a large (~500 ms) sleep and a
 //!     `max_p99_wake_latency_ns` of 1 ns that always trips. The sole worker
-//!     is asleep most of the window so its vCPU is idle and the host accrues
-//!     little run-delay against it — `W` stays far below the ~500 ms gap, so
+//!     is asleep most of the window so its vCPU is idle and the runner cgroup
+//!     accrues little CPU pressure — `W` stays far below the ~500 ms gap, so
 //!     the tri-state CONFIRMS (excess > W) and the failure STAYS. `expect_err`
 //!     makes the confirmed-fail the green expected outcome — proving the
 //!     confirmed path survives.
@@ -35,8 +35,8 @@
 //!     host time-slices the two vCPU threads (Body dilation D ≈ 2). A single
 //!     Bursty worker with a small (~2 ms) sleep sees its wakeup inflated to a
 //!     ~22 ms p99 by host wakeup delay; the gate is tuned to trip only under
-//!     that inflation, and the witnessed host contention `W` (~300 ms over
-//!     the p99-long window) covers the excess, so the seam DEMOTES the
+//!     that inflation, and the witnessed host contention `W` covers the
+//!     excess, so the seam DEMOTES the
 //!     failure to a non-blocking `contention-indeterminate` pass. The test
 //!     PASSES with the annotation visible.
 
@@ -79,8 +79,8 @@ fn wake_latency_scenario(
 /// Bursty sleep per cycle. A single Bursty worker sleeps ~this long each
 /// iteration (a large intrinsic off-CPU gap the scheduler "allowed"),
 /// recording it as a wake latency. Because the sole worker is asleep for
-/// most of the window, its one vCPU is mostly halted — the host accrues
-/// little run-delay against it, so the Body-phase contamination bound `W`
+/// most of the window, its one vCPU is mostly halted — the runner cgroup
+/// accrues little CPU pressure, so the Body-phase contamination bound `W`
 /// stays FAR below this gap. The p99 (~this sleep) therefore exceeds `W`
 /// and the tri-state CONFIRMS: no witnessed host contention explains a
 /// half-second off-CPU gap.
@@ -99,9 +99,8 @@ const CONFIRM_BURST_MS: u64 = 50;
 /// confirmed failure to the green expected outcome, proving the confirmed
 /// path survives the seam.
 ///
-/// One vCPU (threads = 1) keeps the witnessed run-delay single-threaded
-/// (W is a Σ over vCPU threads, so fewer threads ⇒ smaller W for the same
-/// per-CPU steal), widening the excess-over-W margin on a busy host.
+/// One vCPU (threads = 1) keeps the quiet fixture free of deliberate host
+/// overcommit, widening the excess-over-W margin on a busy host.
 #[ktstr_test(
     scheduler = KTSTR_SCHED,
     expect_err,

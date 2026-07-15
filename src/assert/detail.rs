@@ -232,7 +232,7 @@ pub(crate) fn format_sched_died_survives_storm() -> String {
 ///
 /// The wall-latency ceilings fire IN-GUEST (`assert_benchmarks` runs
 /// inside the VM), but the per-phase contention witness — the Body
-/// dilation `D` and the peak-window run-delay series that bound
+/// dilation `D` and the peak-window host-contention series that bound
 /// `W(measured)` — is measured HOST-side (in `vmm::freeze_coord`) and is
 /// not available where the gate tripped. This struct rides the failing
 /// detail across the wire so the host can pair the guest's `measured_ns`

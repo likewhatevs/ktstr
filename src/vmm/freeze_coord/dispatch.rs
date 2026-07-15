@@ -263,6 +263,12 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// Only advanced on `msg.crc_ok` frames — a torn or hostile-guest
     /// frame must not forge stage progress.
     pub progress_ledger: Option<&'a crate::monitor::ProgressLedger>,
+    /// Event-anchored host-contention recorder. Production wires the same
+    /// shared recorder the monitor uses for constant-cost PSI samples; unit
+    /// fixtures leave it absent. Called only when the lifecycle ledger accepts
+    /// a real forward transition, so duplicate frames never trigger `/proc`
+    /// work.
+    pub contention_recorder: Option<&'a crate::vmm::freeze_coord::ContentionWitnessRecorder>,
     /// The host vmlinux's GNU build-id, compared against the booted
     /// kernel's build-id in the `MSG_TYPE_KERN_BUILD_ID` arm. `None`
     /// (the vmlinux carried no note, or none was resolved) disables the
@@ -283,7 +289,11 @@ pub(super) struct BulkDispatchSinks<'a> {
 fn advance_stage(sinks: &BulkDispatchSinks<'_>, stage: crate::monitor::LifecycleStage) {
     if let Some(ledger) = sinks.progress_ledger {
         let wall_ns = u64::try_from(sinks.run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        ledger.advance_phase(stage as u8, wall_ns);
+        if ledger.advance_phase(stage as u8, wall_ns)
+            && let Some(recorder) = sinks.contention_recorder
+        {
+            recorder.advance(stage);
+        }
     }
 }
 
@@ -1311,6 +1321,7 @@ mod stage_tests {
                 current_step: &self.current_step,
                 periodic_guest_elapsed_ns: &self.periodic_guest_elapsed_ns,
                 progress_ledger: Some(&self.ledger),
+                contention_recorder: None,
                 expected_kernel_build_id: None,
             }
         }

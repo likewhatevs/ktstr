@@ -2244,7 +2244,7 @@ pub(crate) fn apply_contention_verdict(
     use crate::assert::{AssertDetail, DetailKind, InfoNote, Outcome};
     use crate::vmm::freeze_coord::latency_verdict::{
         LatencyVerdict, PERF_ISOLATION_D_MAX, body_series_covers_phase, latency_verdict,
-        peak_window_delay_ns, perf_isolation_violated,
+        peak_window_delay_ns_with_widths, perf_isolation_violated,
     };
 
     let witness = result.contention_witness.as_ref();
@@ -2280,15 +2280,28 @@ pub(crate) fn apply_contention_verdict(
         // tick rarely or never inside Body: an empty series reads `W == 0` and
         // a bare "excess > W" would then CONFIRM a purely contention-caused
         // failure — the exact false verdict this gate prevents. Only confirm
-        // when the series SPANNED enough of the phase (>= 2 ticks AND the
-        // first→last Body-tick span covers >= 50% of the real Body wall).
+        // when the series SPANNED enough of the phase. Legacy sampled
+        // witnesses require >=2 ticks and >=50% first→last span; a new
+        // lifecycle-anchored cumulative series can prove completeness with
+        // one closed interval.
         let covered = body_series_covers_phase(
             n_ticks,
             w.body_window.body_covered_ns,
             w.body_window.body_wall_ns,
+            w.body_window.complete,
         );
         let verdict = latency_verdict(gate.measured_ns, gate.threshold_ns, phase_d, |l| {
-            peak_window_delay_ns(&w.body_window.tick_deltas, w.body_window.tick_ns, l)
+            let interval_bound = peak_window_delay_ns_with_widths(
+                &w.body_window.tick_deltas,
+                &w.body_window.tick_widths_ns,
+                w.body_window.tick_ns,
+                l,
+            );
+            if w.body_window.schedstat_cap_complete {
+                interval_bound.min(w.body_window.schedstat_cap_ns)
+            } else {
+                interval_bound
+            }
         });
         // `saturated` forces indeterminate: `W` is a lower bound, so an
         // "excess > W" refutation is not sound. Extract the excess / W the

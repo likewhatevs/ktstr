@@ -273,12 +273,19 @@ the reading directly. A plain `measured <= T` gate would blame the
 scheduler under test for the host's noise.
 
 So the wall-latency verdict is **tri-state**. Each run carries a
-contention *witness* over its Body (measurement) phase — the host
-dilation `D` and a peak-window bound `W(L)`, the worst host run-delay
-any interval of length `L` could have absorbed (both from the same
-shared machinery the [run modes](run-modes.md) page documents). The
-gate fires in the guest; the host re-judges it with the witness in
-hand:
+contention *witness* over its Body (measurement) phase — host vCPU
+dilation `D` from lifecycle-boundary schedstat snapshots and a peak-window
+bound `W(L)` from ktstr's host-cgroup CPU-pressure clock. CPU PSI `some` is the
+wall time during which at least one runnable task in that cgroup was stalled
+for CPU. It therefore sees a delayed vCPU even when the competitor is outside
+the cgroup, without charging arbitrary pressure elsewhere on a wide host.
+Other tasks sharing the runner cgroup can only bias the bound upward, toward
+indeterminate. ktstr removes that cross-cell noise by capping the localized
+PSI result with the target VM's complete summed-vCPU run delay over the same
+conservative Body span. Both are upper bounds on one request's host scheduling
+contamination, so taking their minimum is safe; if PSI is unavailable, the
+task-specific cap becomes a coarser whole-span fallback. The gate fires in the
+guest; the host re-judges it with the witness in hand:
 
 | Verdict | Condition | Result |
 |---|---|---|
@@ -290,18 +297,19 @@ An indeterminate demotion drops the failing outcome; if it was the only
 failure the whole result flips to `Pass`, and the annotation rides the
 [notes channel](#verdict-the-claim-accumulator) so it stays visible in
 the passing run's output and its sidecar. If the Body contention series
-*saturated* (it hit its tick cap and only a prefix survives), `W` is a
+*saturated* (it hit its interval cap and only a prefix survives), `W` is a
 lower bound, so the verdict never confirms on it — it is treated as
-indeterminate with a saturation note. The same guard applies when the
-witness **under-covered** the Body phase: a starved monitor (a
-`SCHED_OTHER` sensing thread sharing one host CPU with the guest vCPUs)
-can tick rarely or never inside Body, and an empty or sub-window series
-leaves `W` untrustworthy (an empty series reads `W = 0`, which would
-otherwise wrongly *confirm* a purely contention-caused failure), so a
-run confirms only when its ticks actually **spanned** at least half the
-Body wall (with ≥ 2 ticks); otherwise it demotes to indeterminate with
-an under-coverage note. Coarse-but-spanning sampling still confirms —
-span, not tick density, is what makes `W` trustworthy.
+indeterminate with a saturation note.
+
+New witnesses sample the cumulative pressure clock at both lifecycle edges;
+even one coarse interval can therefore cover the whole Body. Each interval
+also carries its real wall width. The window calculation charges an interval's
+entire pressure delta whenever the latency window could touch it, so a late
+monitor wake only makes `W` larger. If edge sampling fails, ktstr falls back to
+the complete Body vCPU-schedstat delta as one interval; if neither source can
+prove coverage, the failure is demoted rather than trusting an empty `W = 0`.
+Legacy sidecars without event-anchored widths retain the older ≥2-tick /
+≥50%-span coverage gate.
 
 Only ns-denominated latency exemplars take part. `max_wake_latency_cv`
 (a dimensionless ratio) and `max_spread_pct` (an off-CPU percentage)

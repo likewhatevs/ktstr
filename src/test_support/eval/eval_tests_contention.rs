@@ -18,7 +18,8 @@ const MS: u64 = 1_000_000;
 const TICK: u64 = 100 * MS;
 
 /// A Body-phase witness with the given on-CPU / run-delay sums (which set
-/// `body_dilation()`) and per-tick run-delay series (which set `W`). The Body
+/// `body_dilation()`) and legacy fixed-width contention series (which sets
+/// `W`). The Body
 /// wall AND covered span are both set to the series' nominal span
 /// (`len * TICK`), i.e. FULLY spanning — so the coverage soundness gate is
 /// satisfied and these fixtures exercise the confirm/demote/saturated arms as
@@ -54,8 +55,12 @@ fn witness_cover(
         per_phase,
         body_window: BodyContentionWindow {
             tick_deltas,
+            tick_widths_ns: Vec::new(),
             tick_ns: TICK,
             saturated,
+            complete: false,
+            schedstat_cap_ns: 0,
+            schedstat_cap_complete: false,
             body_wall_ns,
             body_covered_ns,
         },
@@ -88,7 +93,7 @@ fn latency_gate_fail(measured_ns: u64, threshold_ns: u64) -> AssertResult {
 
 #[test]
 fn quiet_witness_confirms_and_annotates() {
-    // Empty run-delay series → W ≈ 0. Any excess is refutation-proof:
+    // Empty contention series → W ≈ 0. Any excess is refutation-proof:
     // FailConfirmed. The failure STAYS and its message gains the
     // contention-checked note.
     let mut cr = latency_gate_fail(101 * MS, 100 * MS);
@@ -104,6 +109,31 @@ fn quiet_witness_confirms_and_annotates() {
         "confirmed failure must carry the contention-checked note: {msg}"
     );
     assert!(cr.info_notes.is_empty(), "confirm must not demote");
+}
+
+#[test]
+fn complete_schedstat_cap_removes_unrelated_psi_from_w() {
+    let mut w = witness(1_000 * MS, 20 * MS, vec![350 * MS, 350 * MS], false);
+    w.body_window.tick_widths_ns = vec![500 * MS, 500 * MS];
+    w.body_window.complete = true;
+    w.body_window.body_wall_ns = 1_000 * MS;
+    w.body_window.body_covered_ns = 1_000 * MS;
+    w.body_window.schedstat_cap_ns = 20 * MS;
+    w.body_window.schedstat_cap_complete = true;
+
+    let mut cr = latency_gate_fail(500 * MS, 1);
+    let vr = vm_with_witness(Some(w));
+    apply_contention_verdict(&mut cr, &vr, false);
+
+    assert!(
+        cr.is_fail(),
+        "700ms of runner-cgroup PSI cannot demote a VM whose complete task-specific cap is 20ms"
+    );
+    let msg = &cr.failure_details().next().unwrap().message;
+    assert!(
+        msg.contains("W 20.0ms"),
+        "the rendered bound must use the cap: {msg}"
+    );
 }
 
 #[test]

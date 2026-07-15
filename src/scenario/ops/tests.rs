@@ -1268,7 +1268,7 @@ fn hold_aborts_on_err_exit_latch_not_process_exit() {
     // any abort comes from the latch poll, not the pidfd backstop.
     let live_pid = unsafe { libc::getpid() };
     let start = std::time::Instant::now();
-    let died = hold_or_sched_died(Duration::from_secs(30), Some(live_pid));
+    let died = hold_or_sched_died(Duration::from_secs(30), Some(live_pid), None);
     let elapsed = start.elapsed();
     assert!(
         died,

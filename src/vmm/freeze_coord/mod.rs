@@ -14,6 +14,7 @@ mod kernel_op_dispatch;
 
 use anyhow::{Context, Result};
 use kvm_ioctls::VcpuExit;
+use std::io::{Read, Seek};
 use std::os::fd::AsRawFd;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::Arc;
@@ -1663,11 +1664,10 @@ pub(crate) fn parse_schedstat_line(line: &str) -> Option<(u64, u64)> {
 /// lives exactly one VM run, so these whole-thread-life totals ARE this
 /// run's totals — no baseline subtraction is needed.
 ///
-/// `pub(crate)`: the monitor loop calls this every tick with the LIVE vCPU
-/// TIDs to snapshot the running cumulative totals, then diffs consecutive
-/// snapshots for its per-phase / peak-window contention witness (see
-/// [`crate::monitor::reader::PhaseWitnessTracker`]). The whole-run
-/// [`VmResult::host_vcpu_schedstat`] read at teardown uses the same fn.
+/// `pub(crate)`: [`ContentionWitnessRecorder`] calls this at lifecycle
+/// boundaries to derive per-phase deltas and the task-specific Body cap; it is
+/// deliberately absent from the monitor's 100 ms hot path. The whole-run
+/// [`VmResult::host_vcpu_schedstat`] read at teardown uses the same function.
 pub(crate) fn read_host_vcpu_schedstat(tids: &[i32]) -> Option<HostVcpuSchedstat> {
     let mut acc = HostVcpuSchedstat::default();
     for &tid in tids {
@@ -1687,6 +1687,417 @@ pub(crate) fn read_host_vcpu_schedstat(tids: &[i32]) -> Option<HostVcpuSchedstat
     (acc.sampled_vcpus > 0).then_some(acc)
 }
 
+/// Maximum number of host-pressure intervals retained for one Body phase.
+/// At the monitor's nominal 100 ms cadence this is one hour. The cap bounds a
+/// wedged cell without affecting normal minute-scale scenarios.
+const BODY_CONTENTION_INTERVAL_CAP: usize = 36_000;
+
+/// Persistent reader for the current cgroup's `cpu.pressure` cumulative
+/// `some total`.
+///
+/// CPU PSI `some` is wall time during which at least one runnable host task is
+/// stalled for CPU. Every ktstr vCPU is in the process's cgroup, so a delayed
+/// vCPU is included even when the competing task is outside that cgroup.
+/// Scoping PSI to ktstr's cgroup avoids charging arbitrary pressure elsewhere
+/// on a wide host; other tasks deliberately sharing the runner cgroup can only
+/// increase the counter. The fd is opened once and rewound for each sample;
+/// the hot path performs no allocation.
+struct HostCpuPressureReader {
+    file: std::fs::File,
+}
+
+impl HostCpuPressureReader {
+    fn open() -> std::io::Result<Self> {
+        let cgroup = std::fs::read_to_string("/proc/self/cgroup")?;
+        let relative = parse_unified_cgroup_path(&cgroup).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "missing unified `0::` entry in /proc/self/cgroup",
+            )
+        })?;
+        // On an un-namespaced host, `/` is the machine-wide cgroup and has
+        // the same precision failure as `/proc/pressure/cpu`: unrelated work
+        // anywhere can make W approach wall time. Prefer the complete
+        // lifecycle schedstat fallback in that case. A cgroup namespace can
+        // also render its delegated root as `/`; rejecting it only loses
+        // localization, never witness soundness.
+        if relative == "/" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "current process is in the cgroup-v2 root",
+            ));
+        }
+        let pressure_path = std::path::Path::new("/sys/fs/cgroup")
+            .join(relative.trim_start_matches('/'))
+            .join("cpu.pressure");
+        Ok(Self {
+            file: std::fs::File::open(pressure_path)?,
+        })
+    }
+
+    fn read_some_total_ns(&mut self) -> std::io::Result<u64> {
+        self.file.rewind()?;
+        let mut buf = [0u8; 512];
+        let n = self.file.read(&mut buf)?;
+        let text = std::str::from_utf8(&buf[..n]).map_err(std::io::Error::other)?;
+        parse_cpu_pressure_some_total_us(text)
+            .map(|us| us.saturating_mul(1_000))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing `some ... total=` in cgroup cpu.pressure",
+                )
+            })
+    }
+}
+
+fn parse_unified_cgroup_path(text: &str) -> Option<&str> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .filter(|path| path.starts_with('/'))
+}
+
+fn parse_cpu_pressure_some_total_us(text: &str) -> Option<u64> {
+    let line = text.lines().find(|line| line.starts_with("some "))?;
+    line.split_ascii_whitespace()
+        .find_map(|field| field.strip_prefix("total="))?
+        .parse()
+        .ok()
+}
+
+/// `/sys/fs/cgroup/.../cpu.pressure` exposes a cumulative integer-microsecond
+/// counter. A difference of two truncated endpoints can be almost 1 µs below
+/// the real delta, so charge one full microsecond to every closed interval.
+/// A regressing counter means the source reset or changed and cannot anchor a
+/// complete series.
+fn conservative_pressure_delta_ns(cur_ns: u64, prev_ns: u64) -> Option<u64> {
+    cur_ns
+        .checked_sub(prev_ns)
+        .map(|delta| delta.saturating_add(1_000))
+}
+
+fn complete_schedstat_delay_cap_ns(
+    expected_vcpus: usize,
+    anchor_tids: &[i32],
+    anchor: Option<HostVcpuSchedstat>,
+    current_tids: &[i32],
+    current: Option<HostVcpuSchedstat>,
+) -> Option<u64> {
+    let expected = u32::try_from(expected_vcpus).ok()?;
+    let (anchor, current) = (anchor?, current?);
+    if expected == 0
+        || anchor_tids != current_tids
+        || current_tids.len() != expected_vcpus
+        || current_tids.iter().any(|tid| *tid <= 0)
+        || anchor.sampled_vcpus != expected
+        || current.sampled_vcpus != expected
+        // CONFIG_SCHEDSTATS-off lines are readable as `0 0 0`.
+        || current.total_on_cpu_ns <= anchor.total_on_cpu_ns
+    {
+        return None;
+    }
+    Some(
+        current
+            .total_run_delay_ns
+            .saturating_sub(anchor.total_run_delay_ns),
+    )
+}
+
+/// Event-anchored host-contention witness recorder.
+///
+/// Expensive vCPU schedstat sweeps happen only at real lifecycle transitions
+/// (Boot→Attach→Dispatch→Body→Teardown) and once at finalization.
+/// The monitor's already-existing tick calls [`Self::sample_pressure`], which
+/// reads one width-independent runner-cgroup PSI counter to retain a localized
+/// `W(L)` series. Dispatch also samples that counter immediately at Body
+/// entry/exit, making the series complete even when the monitor is starved.
+/// A complete task-specific schedstat delta over the same widened Body span
+/// caps PSI so concurrent cells sharing the runner cgroup cannot inflate `W`
+/// beyond the target VM's own accumulated run delay.
+pub(crate) struct ContentionWitnessRecorder {
+    inner: std::sync::Mutex<ContentionWitnessRecorderInner>,
+}
+
+struct ContentionWitnessRecorderInner {
+    tids: Vec<Arc<AtomicI32>>,
+    run_start: Instant,
+    stage: crate::monitor::LifecycleStage,
+    schedstat_anchor: Option<HostVcpuSchedstat>,
+    schedstat_anchor_tids: Vec<i32>,
+    saw_schedstat: bool,
+    per_phase: super::result::PerPhaseSchedstat,
+    pressure: Option<HostCpuPressureReader>,
+    pressure_prev_ns: Option<u64>,
+    pressure_prev_wall_ns: u64,
+    body_deltas: Vec<u64>,
+    body_widths_ns: Vec<u64>,
+    body_saturated: bool,
+    body_enter_wall_ns: Option<u64>,
+    body_exit_wall_ns: Option<u64>,
+    body_pressure_anchored: bool,
+    body_pressure_complete: bool,
+    body_schedstat_anchor: Option<HostVcpuSchedstat>,
+    body_schedstat_anchor_tids: Vec<i32>,
+    body_schedstat_cap_ns: u64,
+    body_schedstat_cap_complete: bool,
+    finalized: bool,
+}
+
+impl ContentionWitnessRecorder {
+    pub(crate) fn new(tids: Vec<Arc<AtomicI32>>, run_start: Instant) -> Self {
+        let live_tids = tids
+            .iter()
+            .map(|tid| tid.load(Ordering::Acquire))
+            .collect::<Vec<_>>();
+        let schedstat_anchor = read_host_vcpu_schedstat(&live_tids);
+        let schedstat_anchor_tids = live_tids;
+        let saw_schedstat = schedstat_anchor.is_some();
+        let mut pressure = HostCpuPressureReader::open().ok();
+        let pressure_prev_ns = pressure
+            .as_mut()
+            .and_then(|reader| reader.read_some_total_ns().ok());
+        let now_ns = u64::try_from(run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        Self {
+            inner: std::sync::Mutex::new(ContentionWitnessRecorderInner {
+                tids,
+                run_start,
+                stage: crate::monitor::LifecycleStage::Boot,
+                schedstat_anchor,
+                schedstat_anchor_tids,
+                saw_schedstat,
+                per_phase: super::result::PerPhaseSchedstat::default(),
+                pressure,
+                pressure_prev_ns,
+                pressure_prev_wall_ns: now_ns,
+                body_deltas: Vec::new(),
+                body_widths_ns: Vec::new(),
+                body_saturated: false,
+                body_enter_wall_ns: None,
+                body_exit_wall_ns: None,
+                body_pressure_anchored: false,
+                body_pressure_complete: false,
+                body_schedstat_anchor: None,
+                body_schedstat_anchor_tids: Vec::new(),
+                body_schedstat_cap_ns: 0,
+                body_schedstat_cap_complete: false,
+                finalized: false,
+            }),
+        }
+    }
+
+    /// One constant-cost sample from the monitor's existing timer wake.
+    pub(crate) fn sample_pressure(&self) {
+        let mut inner = self.inner.lock_unpoisoned();
+        if inner.finalized || inner.stage != crate::monitor::LifecycleStage::Body {
+            return;
+        }
+        let now_ns = u64::try_from(inner.run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        inner.sample_pressure_at(now_ns);
+    }
+
+    /// Close the old lifecycle stage and enter `new_stage`. The caller invokes
+    /// this only after `ProgressLedger::advance_phase` accepted the forward
+    /// transition, so duplicates and late frames cost nothing.
+    pub(crate) fn advance(&self, new_stage: crate::monitor::LifecycleStage) {
+        let mut inner = self.inner.lock_unpoisoned();
+        if inner.finalized || new_stage as u8 <= inner.stage as u8 {
+            return;
+        }
+        let now_ns = u64::try_from(inner.run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let pressure_anchor_ns = inner.pressure_prev_ns;
+        let pressure_anchor_wall_ns = inner.pressure_prev_wall_ns;
+        let schedstat_cap_anchor = (new_stage == crate::monitor::LifecycleStage::Body)
+            .then_some(inner.schedstat_anchor)
+            .flatten();
+        let schedstat_cap_anchor_tids = if new_stage == crate::monitor::LifecycleStage::Body {
+            inner.schedstat_anchor_tids.clone()
+        } else {
+            Vec::new()
+        };
+        let pressure_ok = inner.sample_pressure_at(now_ns);
+        inner.close_schedstat_stage();
+
+        if inner.stage == crate::monitor::LifecycleStage::Body {
+            inner.body_exit_wall_ns = Some(now_ns);
+            inner.body_pressure_complete = inner.body_pressure_anchored && pressure_ok;
+        }
+        inner.stage = new_stage;
+        if new_stage == crate::monitor::LifecycleStage::Body {
+            // The lifecycle frame can wait briefly in the virtio TX queue
+            // before dispatch accepts it. Start the W(L) witness at the
+            // PREVIOUS lifecycle boundary and charge that whole prelude to
+            // Body. This may include Dispatch contention (larger W →
+            // indeterminate), but cannot omit early Body contention that
+            // accrued before the host processed ScenarioStart.
+            inner.body_enter_wall_ns = Some(pressure_anchor_wall_ns);
+            inner.body_pressure_anchored = pressure_ok && pressure_anchor_ns.is_some();
+            // Match the PSI witness's deliberately widened start: retain the
+            // schedstat snapshot from the lifecycle boundary PRECEDING Body,
+            // not the just-taken accepted-Body snapshot. The resulting cap
+            // includes the same virtio-dispatch prelude and therefore cannot
+            // undercut early Body delay hidden behind frame delivery.
+            inner.body_schedstat_anchor = schedstat_cap_anchor;
+            inner.body_schedstat_anchor_tids = schedstat_cap_anchor_tids;
+            if let (Some(anchor), Some(cur)) = (pressure_anchor_ns, inner.pressure_prev_ns) {
+                if let Some(delta) = conservative_pressure_delta_ns(cur, anchor) {
+                    inner.push_body_interval(delta, now_ns.saturating_sub(pressure_anchor_wall_ns));
+                } else {
+                    inner.body_pressure_anchored = false;
+                }
+            }
+        }
+    }
+
+    /// Close the final live stage while vCPU `/proc` entries still exist and
+    /// assemble the immutable result passed through `VmRunState`.
+    pub(crate) fn finish(&self) -> Option<super::result::ContentionWitness> {
+        let mut inner = self.inner.lock_unpoisoned();
+        if inner.finalized {
+            return None;
+        }
+        let now_ns = u64::try_from(inner.run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let pressure_ok = inner.sample_pressure_at(now_ns);
+        inner.close_schedstat_stage();
+        if inner.stage == crate::monitor::LifecycleStage::Body {
+            inner.body_exit_wall_ns = Some(now_ns);
+            inner.body_pressure_complete = inner.body_pressure_anchored && pressure_ok;
+        }
+        inner.finalized = true;
+
+        let body_wall_ns = inner
+            .body_enter_wall_ns
+            .zip(inner.body_exit_wall_ns)
+            .map(|(enter, exit)| exit.saturating_sub(enter))
+            .unwrap_or(0);
+        let mut deltas = std::mem::take(&mut inner.body_deltas);
+        let mut widths = std::mem::take(&mut inner.body_widths_ns);
+        let mut saturated = inner.body_saturated;
+        let mut complete = inner.body_pressure_complete
+            && !saturated
+            && !deltas.is_empty()
+            && deltas.len() == widths.len();
+
+        // PSI unavailable or failed mid-Body: use the event-anchored summed
+        // vCPU run-delay over the WHOLE widened Body witness span as one
+        // coarse interval. It loses localization but remains a complete upper
+        // bound; never convert a missing PSI counter into W=0.
+        if !complete && body_wall_ns > 0 && inner.body_schedstat_cap_complete {
+            deltas = vec![inner.body_schedstat_cap_ns];
+            widths = vec![body_wall_ns];
+            complete = true;
+            // The replacement is a complete event-boundary delta, not
+            // the truncated PSI prefix that hit the cap.
+            saturated = false;
+        }
+
+        if !inner.saw_schedstat && deltas.is_empty() {
+            return None;
+        }
+        Some(super::result::ContentionWitness {
+            per_phase: inner.per_phase,
+            body_window: super::result::BodyContentionWindow {
+                tick_deltas: deltas,
+                tick_widths_ns: widths,
+                // Retained for legacy readers; new window math consumes the
+                // real widths above.
+                tick_ns: Duration::from_millis(100).as_nanos() as u64,
+                saturated,
+                complete,
+                schedstat_cap_ns: inner.body_schedstat_cap_ns,
+                schedstat_cap_complete: inner.body_schedstat_cap_complete,
+                body_wall_ns,
+                body_covered_ns: if complete { body_wall_ns } else { 0 },
+            },
+        })
+    }
+}
+
+impl ContentionWitnessRecorderInner {
+    /// Sample PSI at an explicit run-relative wall. Returns true when a valid
+    /// counter value was read and installed as the new anchor.
+    fn sample_pressure_at(&mut self, now_ns: u64) -> bool {
+        let Some(reader) = self.pressure.as_mut() else {
+            return false;
+        };
+        let cur = match reader.read_some_total_ns() {
+            Ok(cur) => cur,
+            Err(e) => {
+                tracing::warn!(err = %e, "host CPU PSI read failed; contention witness will use Body schedstat fallback");
+                self.pressure = None;
+                self.pressure_prev_ns = None;
+                return false;
+            }
+        };
+        if let Some(prev) = self.pressure_prev_ns {
+            let Some(delta) = conservative_pressure_delta_ns(cur, prev) else {
+                tracing::warn!(
+                    previous_ns = prev,
+                    current_ns = cur,
+                    "host CPU PSI counter regressed; contention witness will use Body schedstat fallback"
+                );
+                self.pressure = None;
+                self.pressure_prev_ns = None;
+                return false;
+            };
+            if self.stage == crate::monitor::LifecycleStage::Body {
+                self.push_body_interval(delta, now_ns.saturating_sub(self.pressure_prev_wall_ns));
+            }
+        }
+        self.pressure_prev_ns = Some(cur);
+        self.pressure_prev_wall_ns = now_ns;
+        true
+    }
+
+    fn push_body_interval(&mut self, delta_ns: u64, width_ns: u64) {
+        if self.body_deltas.len() < BODY_CONTENTION_INTERVAL_CAP {
+            self.body_deltas.push(delta_ns);
+            self.body_widths_ns.push(width_ns);
+        } else {
+            self.body_saturated = true;
+        }
+    }
+
+    fn close_schedstat_stage(&mut self) {
+        let tids = self
+            .tids
+            .iter()
+            .map(|tid| tid.load(Ordering::Acquire))
+            .collect::<Vec<_>>();
+        let cur = read_host_vcpu_schedstat(&tids);
+        if self.stage == crate::monitor::LifecycleStage::Body {
+            if let Some(cap) = complete_schedstat_delay_cap_ns(
+                self.tids.len(),
+                &self.body_schedstat_anchor_tids,
+                self.body_schedstat_anchor,
+                &tids,
+                cur,
+            ) {
+                self.body_schedstat_cap_ns = cap;
+                self.body_schedstat_cap_complete = true;
+            } else {
+                self.body_schedstat_cap_complete = false;
+            }
+        }
+        match (self.schedstat_anchor, cur) {
+            (Some(anchor), Some(cur)) => {
+                self.per_phase.phases[self.stage as usize] = cur.delta_from(&anchor);
+                self.schedstat_anchor = Some(cur);
+                self.saw_schedstat = true;
+            }
+            (_, Some(cur)) => {
+                self.schedstat_anchor = Some(cur);
+                self.saw_schedstat = true;
+            }
+            (_, None) => {
+                // Do not carry an old anchor across an unattested boundary;
+                // a later recovery must seed afresh rather than mix phases.
+                self.schedstat_anchor = None;
+            }
+        }
+        self.schedstat_anchor_tids = tids;
+    }
+}
+
 /// Snapshot the CALLING thread's own cumulative schedstat (on-CPU,
 /// run-delay) — the instrument for the cleanup-window dilation
 /// evidence. `read_host_vcpu_schedstat(&[gettid()])` with the same
@@ -1702,7 +2113,12 @@ pub(crate) fn read_self_thread_schedstat() -> Option<HostVcpuSchedstat> {
 
 #[cfg(test)]
 mod schedstat_tests {
-    use super::{parse_schedstat_line, read_host_vcpu_schedstat};
+    use super::{
+        HostCpuPressureReader, complete_schedstat_delay_cap_ns, conservative_pressure_delta_ns,
+        parse_cpu_pressure_some_total_us, parse_schedstat_line, parse_unified_cgroup_path,
+        read_host_vcpu_schedstat,
+    };
+    use crate::vmm::HostVcpuSchedstat;
 
     /// A valid three-field line yields `(on_cpu, run_delay)`; a
     /// two-field line still parses (field 3 is unused); a one-field or
@@ -1717,6 +2133,121 @@ mod schedstat_tests {
         assert_eq!(parse_schedstat_line("42"), None, "short: one field");
         assert_eq!(parse_schedstat_line("abc def"), None, "non-numeric");
         assert_eq!(parse_schedstat_line("100 x"), None, "second field bad");
+    }
+
+    #[test]
+    fn parse_cpu_pressure_some_total_ignores_averages_and_full() {
+        let text = "some avg10=1.25 avg60=2.50 avg300=3.75 total=987654\n\
+                    full avg10=0.00 avg60=0.00 avg300=0.00 total=42\n";
+        assert_eq!(parse_cpu_pressure_some_total_us(text), Some(987_654));
+        assert_eq!(parse_cpu_pressure_some_total_us("full total=42\n"), None);
+        assert_eq!(
+            parse_cpu_pressure_some_total_us("some avg10=0 total=wat\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn pressure_delta_rounds_up_and_rejects_counter_regression() {
+        assert_eq!(conservative_pressure_delta_ns(12_000, 10_000), Some(3_000));
+        assert_eq!(conservative_pressure_delta_ns(10_000, 10_000), Some(1_000));
+        assert_eq!(conservative_pressure_delta_ns(9_999, 10_000), None);
+        assert_eq!(conservative_pressure_delta_ns(u64::MAX, 0), Some(u64::MAX));
+    }
+
+    #[test]
+    fn schedstat_cap_requires_the_same_complete_live_tid_set() {
+        let anchor = HostVcpuSchedstat {
+            total_on_cpu_ns: 1_000,
+            total_run_delay_ns: 100,
+            sampled_vcpus: 2,
+        };
+        let current = HostVcpuSchedstat {
+            total_on_cpu_ns: 2_000,
+            total_run_delay_ns: 350,
+            sampled_vcpus: 2,
+        };
+        assert_eq!(
+            complete_schedstat_delay_cap_ns(
+                2,
+                &[101, 102],
+                Some(anchor),
+                &[101, 102],
+                Some(current),
+            ),
+            Some(250)
+        );
+        assert_eq!(
+            complete_schedstat_delay_cap_ns(
+                2,
+                &[101, 102],
+                Some(anchor),
+                &[101, 103],
+                Some(current),
+            ),
+            None,
+            "a replaced TID cannot share cumulative anchors"
+        );
+        assert_eq!(
+            complete_schedstat_delay_cap_ns(2, &[101, 102], Some(anchor), &[101, 0], Some(current),),
+            None,
+            "an unstamped vCPU makes the cap partial"
+        );
+        assert_eq!(
+            complete_schedstat_delay_cap_ns(
+                2,
+                &[101, 102],
+                Some(anchor),
+                &[101, 102],
+                Some(HostVcpuSchedstat {
+                    sampled_vcpus: 1,
+                    ..current
+                }),
+            ),
+            None,
+            "a failed schedstat read makes the cap partial"
+        );
+        assert_eq!(
+            complete_schedstat_delay_cap_ns(
+                2,
+                &[101, 102],
+                Some(HostVcpuSchedstat {
+                    total_on_cpu_ns: 0,
+                    total_run_delay_ns: 0,
+                    sampled_vcpus: 2,
+                }),
+                &[101, 102],
+                Some(HostVcpuSchedstat {
+                    total_on_cpu_ns: 0,
+                    total_run_delay_ns: 0,
+                    sampled_vcpus: 2,
+                }),
+            ),
+            None,
+            "CONFIG_SCHEDSTATS-off zeros are not a complete cap"
+        );
+    }
+
+    #[test]
+    fn unified_cgroup_path_requires_the_v2_entry_and_absolute_path() {
+        assert_eq!(
+            parse_unified_cgroup_path("11:cpu:/old\n0::/runner/job\n"),
+            Some("/runner/job")
+        );
+        assert_eq!(parse_unified_cgroup_path("0::/\n"), Some("/"));
+        assert_eq!(parse_unified_cgroup_path("0::relative\n"), None);
+        assert_eq!(parse_unified_cgroup_path("11:cpu:/old\n"), None);
+    }
+
+    #[test]
+    fn cpu_pressure_reader_rewinds_between_samples_when_available() {
+        let Ok(mut reader) = HostCpuPressureReader::open() else {
+            // CPU PSI is optional at runtime; parsing is covered separately.
+            return;
+        };
+        let first = reader.read_some_total_ns().expect("first PSI sample");
+        let second = reader.read_some_total_ns().expect("second PSI sample");
+        assert!(second >= first, "the cumulative PSI clock cannot decrease");
     }
 
     /// An all-zero (or empty) TID list samples nothing -> `None`. tid==0
@@ -2513,6 +3044,11 @@ impl KtstrVm {
             .iter()
             .map(|(slot, _)| slot.clone())
             .collect();
+        // Per-phase host-contention recorder. It owns the live TID handles for
+        // rare lifecycle-boundary schedstat sweeps and a persistent O(1) CPU
+        // PSI reader sampled from the monitor's existing timer wake.
+        let contention_recorder =
+            Arc::new(ContentionWitnessRecorder::new(vcpu_tid_atomics, run_start));
         // KERN_ADDRS observability counters (frames consumed / CRC-failed),
         // incremented by the coordinator's dispatch arm and read by the
         // monitor's pre-latch diagnostic (see `RqRefresh::kern_addrs_frames`):
@@ -2552,7 +3088,7 @@ impl KtstrVm {
             &kill_evt,
             run_start,
             vcpu_pthreads,
-            vcpu_tid_atomics,
+            contention_recorder.clone(),
             perf_capture.clone(),
             Some(virtio_con.clone()),
             sys_rdy_evt.clone(),
@@ -2581,6 +3117,7 @@ impl KtstrVm {
         // dispatch's forward-only stage stores and the monitor's per-tick
         // liveness stores land in one ledger.
         let progress_ledger_for_coord = progress_ledger.clone();
+        let contention_recorder_for_coord = contention_recorder.clone();
         let watchdog_pause_ns: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let watchdog_pause_for_coord = watchdog_pause_ns.clone();
@@ -4963,6 +5500,9 @@ impl KtstrVm {
                                             &freeze_coord_periodic_guest_elapsed,
                                         progress_ledger: Some(
                                             progress_ledger_for_coord.as_ref(),
+                                        ),
+                                        contention_recorder: Some(
+                                            contention_recorder_for_coord.as_ref(),
                                         ),
                                         expected_kernel_build_id:
                                             host_vmlinux_build_id_for_coord.as_deref(),
@@ -12500,6 +13040,10 @@ impl KtstrVm {
             .map(|(slot, _)| slot.load(Ordering::Acquire))
             .collect();
         let host_vcpu_schedstat = read_host_vcpu_schedstat(&host_vcpu_tids);
+        // Finalize while every vCPU task directory is still live. The monitor
+        // may take a later no-op sample, but the recorder's finalized latch
+        // prevents post-result mutation.
+        let contention_witness = contention_recorder.finish();
 
         // Final ledger snapshot for the VmResult phase/milestone fields.
         // The dispatch consumers that advance these are joined/dead by
@@ -12517,6 +13061,7 @@ impl KtstrVm {
             bpf_map_write_delivery_raw: bpf_map_write_delivery.load(Ordering::Acquire),
             periodic_prereqs_ready_ns_raw: periodic_prereqs_ready_at.load(Ordering::Acquire),
             periodic_window_end_ns_raw: periodic_window_end_at.load(Ordering::Acquire),
+            contention_witness,
             ap_threads,
             monitor_handle,
             bpf_write_handle,
@@ -12858,12 +13403,7 @@ impl KtstrVm {
         kill_evt: &Arc<EventFd>,
         run_start: Instant,
         vcpu_pthreads: Vec<libc::pthread_t>,
-        // Live vCPU-thread TID slots (`vcpu_tid_slots` handles), moved into
-        // the monitor closure and read every tick for the per-phase
-        // schedstat contention witness. Parallel to `vcpu_pthreads` — both
-        // index by vCPU id — and the same slots the teardown whole-run
-        // schedstat read polls.
-        vcpu_tid_atomics: Vec<Arc<AtomicI32>>,
+        contention_recorder: Arc<ContentionWitnessRecorder>,
         perf_capture: Arc<Option<monitor::perf_counters::PerfCountersCapture>>,
         virtio_con: Option<Arc<PiMutex<virtio_console::VirtioConsole>>>,
         sys_rdy_evt: Option<Arc<EventFd>>,
@@ -13156,7 +13696,6 @@ impl KtstrVm {
                             scx_event_counters_supported,
                             // Monitor torn down before sampling: no live prog seen.
                             verified_insns: Vec::new(),
-                            contention_witness: None,
                         };
                     }
                     let kill_fd = kill_evt_clone.as_raw_fd();
@@ -13216,7 +13755,6 @@ impl KtstrVm {
                             scx_event_counters_supported,
                             // Monitor torn down before sampling: no live prog seen.
                             verified_insns: Vec::new(),
-                            contention_witness: None,
                         };
                     }
                 }
@@ -13371,7 +13909,6 @@ impl KtstrVm {
                         scx_event_counters_supported,
                         // Monitor torn down before sampling: no live prog seen.
                         verified_insns: Vec::new(),
-                        contention_witness: None,
                     };
                 }
 
@@ -13473,7 +14010,6 @@ impl KtstrVm {
                         scx_event_counters_supported,
                         // Monitor torn down before sampling: no live prog seen.
                         verified_insns: Vec::new(),
-                        contention_witness: None,
                     };
                 }
 
@@ -13553,9 +14089,7 @@ impl KtstrVm {
 
                 let vcpu_timing = monitor::reader::VcpuTiming {
                     pthreads: vcpu_pthreads,
-                    // Live TID slots for the per-tick per-phase schedstat
-                    // witness — read `Acquire` each tick (see `VcpuTiming::tids`).
-                    tids: vcpu_tid_atomics,
+                    contention_recorder: Some(contention_recorder),
                 };
 
                 // The legacy SHM signal slot 1 (`SIGNAL_PROBES_READY`)
@@ -13636,7 +14170,6 @@ impl KtstrVm {
                         scx_event_counters_supported,
                         // Monitor torn down before sampling: no live prog seen.
                         verified_insns: Vec::new(),
-                        contention_witness: None,
                     };
                 }
                 // aarch64 TCR_EL1 (granule + T1SZ) for the
@@ -13719,7 +14252,6 @@ impl KtstrVm {
                         scx_event_counters_supported,
                         // Monitor torn down before sampling: no live prog seen.
                         verified_insns: Vec::new(),
-                        contention_witness: None,
                     };
                 }
 
@@ -14787,7 +15319,7 @@ impl KtstrVm {
             slot.hit.store(false, Ordering::Release);
         }
 
-        let (monitor_report, mid_flight_drain, mid_run_verified_insns, contention_witness) =
+        let (monitor_report, mid_flight_drain, mid_run_verified_insns) =
             match run.monitor_handle.and_then(|h| h.join().ok()) {
                 Some(monitor::reader::MonitorLoopResult {
                     samples,
@@ -14798,7 +15330,6 @@ impl KtstrVm {
                     boot_wait_outcome,
                     scx_event_counters_supported,
                     verified_insns,
-                    contention_witness,
                 }) => {
                     // `preemption_threshold_ns` was resolved once
                     // inside `start_monitor` (and threaded through
@@ -14823,9 +15354,9 @@ impl KtstrVm {
                         boot_wait_outcome,
                         scx_event_counters_supported,
                     };
-                    (Some(report), drain, verified_insns, contention_witness)
+                    (Some(report), drain, verified_insns)
                 }
-                None => (None, BulkDrainResult::default(), Vec::new(), None),
+                None => (None, BulkDrainResult::default(), Vec::new()),
             };
         if crate::vmm::debug_logging_enabled() {
             eprintln!("CLEANUP: monitor joined");
@@ -15196,13 +15727,9 @@ impl KtstrVm {
             // observational — never affects `success` above or the exit
             // code.
             host_vcpu_schedstat: run.host_vcpu_schedstat,
-            // Per-phase contention witness assembled by the monitor
-            // (per-phase D + Body-phase peak-window run-delay series). Moved
-            // out of the joined `MonitorLoopResult` above; `None` when the
-            // monitor did not run or seeded no witness. Observational —
-            // never affects `success` or the exit code (the seam that
-            // consumes it lands later).
-            contention_witness,
+            // Event-anchored per-phase schedstat + constant-cost CPU-pressure
+            // series, finalized in `run_vm` before vCPU task dirs disappear.
+            contention_witness: run.contention_witness,
             // Empty cache: the single bridge drain is deferred to the
             // first `captures_series()` call on the host (post_vm or
             // evaluate_vm_result). See the `periodic_series_cache`

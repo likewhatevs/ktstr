@@ -25,15 +25,15 @@
 //!     non-blocking = a pass, but it carries the D / W evidence so the seam
 //!     can annotate it).
 //!
-//! `W(L)` is the peak-window contamination bound: the maximum total host
-//! run-delay accrued by the vCPU threads over any contiguous run of monitor
-//! ticks spanning at least `L` ns ([`peak_window_delay_ns`]). The p99
-//! exemplar is treated as a SINGLE interval of length `measured` — one
-//! request cannot have waited longer than its own measured latency, so
-//! bounding its contamination by the worst `measured`-long window is
-//! conservative (a real p99 sample spans one request, never the whole
-//! phase). Every rounding in this module is biased toward MORE indeterminate
-//! / never a wrong `FailConfirmed`.
+//! `W(L)` is the peak-window contamination bound: the maximum witnessed host
+//! CPU stall that a contiguous interval of length `L` could have absorbed.
+//! New witnesses use real-width runner-cgroup PSI intervals; legacy witnesses
+//! use fixed-width summed vCPU run-delay ticks. The p99 exemplar is treated as
+//! a SINGLE interval of length `measured` — one request cannot have waited
+//! longer than its own measured latency, so bounding its contamination by the
+//! worst `measured`-long window is conservative. Every rounding in this
+//! module is biased toward MORE indeterminate / never a wrong
+//! `FailConfirmed`.
 //!
 //! CONSUMED BY THE EVAL SEAM: this module is the PURE verdict core; the seam
 //! that calls it — `crate::test_support::eval::apply_contention_verdict` —
@@ -107,7 +107,68 @@ pub(crate) fn peak_window_delay_ns(deltas: &[u64], tick_ns: u64, window_ns: u64)
     best
 }
 
-/// Minimum number of CLOSED Body ticks the witness series must hold before an
+/// Peak conservative contamination for a variable-width interval series.
+///
+/// Each `deltas[i]` is a cumulative counter delta over a consecutive interval
+/// of width `widths_ns[i]`. The counter does not reveal WHERE inside that
+/// interval the stall occurred, so a query window that can touch the interval
+/// must conservatively charge its ENTIRE delta. For a consecutive interval
+/// range `i..=j`, some `window_ns`-long window can touch every member iff the
+/// start of `j` is no later than `window_ns` after the end of `i`. Enumerating
+/// that maximal range for every `i` gives a safe peak without assuming the
+/// monitor woke on schedule.
+///
+/// Malformed/legacy width vectors fall back to [`peak_window_delay_ns`]. The
+/// arithmetic uses `u128` prefixes so even a saturated `u64` delta series
+/// cannot wrap or make subtraction unsound; the public result clamps to
+/// `u64::MAX`.
+pub(crate) fn peak_window_delay_ns_with_widths(
+    deltas: &[u64],
+    widths_ns: &[u64],
+    tick_ns: u64,
+    window_ns: u64,
+) -> u64 {
+    if deltas.is_empty() {
+        return 0;
+    }
+    if widths_ns.len() != deltas.len() || widths_ns.is_empty() {
+        return peak_window_delay_ns(deltas, tick_ns, window_ns);
+    }
+
+    let mut starts = Vec::with_capacity(widths_ns.len());
+    let mut ends = Vec::with_capacity(widths_ns.len());
+    let mut wall = 0u128;
+    for &width in widths_ns {
+        starts.push(wall);
+        wall = wall.saturating_add(u128::from(width));
+        ends.push(wall);
+    }
+    let mut prefix = Vec::with_capacity(deltas.len() + 1);
+    prefix.push(0u128);
+    for &delta in deltas {
+        let next = prefix
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(u128::from(delta));
+        prefix.push(next);
+    }
+
+    let window = u128::from(window_ns);
+    let mut best = 0u128;
+    let mut j = 0usize;
+    for i in 0..deltas.len() {
+        j = j.max(i);
+        let latest_start = ends[i].saturating_add(window);
+        while j + 1 < deltas.len() && starts[j + 1] <= latest_start {
+            j += 1;
+        }
+        best = best.max(prefix[j + 1].saturating_sub(prefix[i]));
+    }
+    best.min(u128::from(u64::MAX)) as u64
+}
+
+/// Minimum number of CLOSED Body ticks a LEGACY witness must hold before an
 /// "excess > W" refutation ([`LatencyVerdict::FailConfirmed`]) is sound.
 ///
 /// Below this the series cannot even define a covered SPAN: an empty series
@@ -117,9 +178,9 @@ pub(crate) fn peak_window_delay_ns(deltas: &[u64], tick_ns: u64, window_ns: u64)
 /// `peak_window_delay_ns` can slide a window over.
 pub(crate) const BODY_COVERAGE_MIN_TICKS: usize = 2;
 
-/// Minimum fraction of the Body phase's WALL span the witness series must
-/// actually SPAN (first Body tick → last Body tick) before a `FailConfirmed`
-/// is sound.
+/// Minimum fraction of the Body phase's WALL span a LEGACY witness series
+/// must actually SPAN (first Body tick → last Body tick) before a
+/// `FailConfirmed` is sound.
 ///
 /// `W` is trustworthy only if the ticks reached ACROSS the phase — a
 /// contention burst in an un-sampled sub-interval would otherwise be invisible
@@ -138,26 +199,32 @@ pub(crate) const BODY_COVERAGE_MIN_TICKS: usize = 2;
 /// can only push toward a pass, never a wrong confirm.
 pub(crate) const BODY_COVERAGE_MIN_FRAC: f64 = 0.5;
 
-/// Whether the Body witness series SPANNED enough of the Body phase for an
-/// "excess > W" refutation ([`LatencyVerdict::FailConfirmed`]) to be sound:
-/// at least [`BODY_COVERAGE_MIN_TICKS`] closed ticks AND a covered span
-/// (`body_covered_ns`, first→last Body tick) of at least
-/// [`BODY_COVERAGE_MIN_FRAC`] of the Body phase wall `body_wall_ns`.
-/// `body_wall_ns == 0` (the Body phase was never observed) is NOT covered —
-/// there is no phase span to prove the series watched.
+/// Whether the Body witness series covered enough of Body for an "excess > W"
+/// refutation ([`LatencyVerdict::FailConfirmed`]) to be sound. An
+/// event-anchored `complete` series needs one closed interval and the same
+/// covered-span check; a legacy series needs at least
+/// [`BODY_COVERAGE_MIN_TICKS`] ticks. `body_wall_ns == 0` is never covered.
 ///
 /// This ONLY gates `FailConfirmed`: a series that fails it demotes to
 /// indeterminate (non-blocking), never the reverse, so it can only push a
-/// verdict toward a pass. `body_wall_ns` is measured conservatively LARGE and
-/// `body_covered_ns` conservatively small host-side (see
-/// [`crate::vmm::result::BodyContentionWindow`]), so the ratio is under-stated
-/// — biasing further toward demote.
+/// verdict toward a pass. New event-anchored witnesses set the covered and
+/// wall spans equal only after both counter boundaries close successfully;
+/// legacy witnesses retain their conservative first-to-last tick span (see
+/// [`crate::vmm::result::BodyContentionWindow`]).
 pub(crate) fn body_series_covers_phase(
     n_ticks: usize,
     body_covered_ns: u64,
     body_wall_ns: u64,
+    complete: bool,
 ) -> bool {
-    if n_ticks < BODY_COVERAGE_MIN_TICKS {
+    let min_ticks = if complete {
+        // A cumulative counter explicitly sampled at Body entry and exit
+        // covers the whole phase with one closed interval.
+        1
+    } else {
+        BODY_COVERAGE_MIN_TICKS
+    };
+    if n_ticks < min_ticks {
         return false;
     }
     if body_wall_ns == 0 {
@@ -233,7 +300,7 @@ impl LatencyVerdict {
 /// `measured_ns` is the guest-wall latency exemplar (e.g. the wakeup p99),
 /// `threshold_ns` its gate, `phase_d` the Body-phase dilation for annotation
 /// only (it does NOT enter the decision — the operative bound is `W`, which
-/// is derived from the run-delay series directly; `D` is the summary the
+/// is derived from the contention series directly; `D` is the summary the
 /// seam renders alongside). `peak_window_fn` maps a window length `L` (ns)
 /// to `W(L)` — bind it as `|l| peak_window_delay_ns(&deltas, tick_ns, l)`.
 ///
@@ -245,7 +312,7 @@ impl LatencyVerdict {
 /// whole phase.
 ///
 /// Boundary: `excess > W` confirms, `excess <= W` is indeterminate — so when
-/// `W == 0` (a quiet host, `D ≈ 1`, empty/zero run-delay series) the
+/// `W == 0` (a quiet host, `D ≈ 1`, empty/zero contention series) the
 /// indeterminate band is empty and ANY excess confirms, exactly as a plain
 /// threshold would behave with no contention to blame.
 pub(crate) fn latency_verdict(
@@ -495,15 +562,15 @@ mod tests {
         // 0 ticks: the starved-CI shape (W==0), zero covered span — never
         // covered, whatever the wall. body_wall 0 (Body never observed) also
         // never covered even with a claimed span.
-        assert!(!body_series_covers_phase(0, 0, 0));
-        assert!(!body_series_covers_phase(0, 0, 10 * S));
-        assert!(!body_series_covers_phase(3, 5 * S, 0));
+        assert!(!body_series_covers_phase(0, 0, 0, false));
+        assert!(!body_series_covers_phase(0, 0, 10 * S, false));
+        assert!(!body_series_covers_phase(3, 5 * S, 0, false));
     }
 
     #[test]
     fn coverage_single_tick_never_covers() {
         // One tick is a point (zero span) — below the min-ticks floor.
-        assert!(!body_series_covers_phase(1, 0, S));
+        assert!(!body_series_covers_phase(1, 0, S, false));
     }
 
     #[test]
@@ -511,7 +578,7 @@ mod tests {
         // Ticks clustered in a 0.2 s slice of a 60 s Body wall (the
         // dense-then-silent shape): plenty of ticks, but they span < 1% of the
         // phase, so W is not trustworthy → not covered.
-        assert!(!body_series_covers_phase(3, 200_000_000, 60 * S));
+        assert!(!body_series_covers_phase(3, 200_000_000, 60 * S, false));
     }
 
     #[test]
@@ -520,15 +587,43 @@ mod tests {
         // (span ~= the whole wall) — the whole phase was watched, so W (which
         // over-counts a coarse series if anything) is trustworthy. Density
         // must NOT gate; span does.
-        assert!(body_series_covers_phase(2, 9 * S, 10 * S));
+        assert!(body_series_covers_phase(2, 9 * S, 10 * S, false));
     }
 
     #[test]
     fn coverage_boundary_at_fraction_is_covered() {
         // Exactly 50% span is INSIDE the covered band (`>=`), the permissive
         // side; just under is not.
-        assert!(body_series_covers_phase(5, 5 * S, 10 * S));
-        assert!(!body_series_covers_phase(5, 4 * S, 10 * S));
+        assert!(body_series_covers_phase(5, 5 * S, 10 * S, false));
+        assert!(!body_series_covers_phase(5, 4 * S, 10 * S, false));
+    }
+
+    #[test]
+    fn coverage_complete_boundary_interval_needs_only_one_delta() {
+        assert!(body_series_covers_phase(1, 10 * S, 10 * S, true));
+        assert!(!body_series_covers_phase(0, 10 * S, 10 * S, true));
+    }
+
+    #[test]
+    fn variable_width_peak_charges_every_interval_a_window_can_touch() {
+        // Intervals: [0,1], [1,11], [11,12] seconds. A 10-second window can
+        // conservatively touch all three at the two boundaries around the
+        // long middle interval, so all unknown-position stall is charged.
+        let deltas = [10, 20, 30];
+        let widths = [S, 10 * S, S];
+        assert_eq!(
+            peak_window_delay_ns_with_widths(&deltas, &widths, 100_000_000, 10 * S),
+            60
+        );
+
+        // With a gap wider than the query between the first interval's end
+        // and the third interval's start, the best range excludes one edge.
+        let deltas = [10, 20, 30, 40];
+        let widths = [10 * S, 10 * S, 10 * S, 10 * S];
+        assert_eq!(
+            peak_window_delay_ns_with_widths(&deltas, &widths, 100_000_000, S),
+            70
+        );
     }
 
     // ---- perf_isolation_violated ----

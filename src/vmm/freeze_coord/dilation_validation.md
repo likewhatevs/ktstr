@@ -498,6 +498,13 @@ is release-vs-release. DELTA CONVENTION (this section): avg-to-avg.
 
 ### Instrumentation-overhead ladder (P0 `02603278` → P1 `213c355f` → P2 `94ef4735`)
 
+Historical note: this ladder measured the first witness implementation, where
+P1 read every vCPU's host schedstat on each monitor tick. The current
+implementation keeps these results as provenance but removes that hot path:
+O(vCPU) schedstat sweeps now occur only on lifecycle transitions, while the
+Body timeline reads one system CPU-PSI cumulative counter per existing monitor
+wake and records each interval's real width.
+
 P1/P0 isolates the witness's per-tick host schedstat reads; P2/P1 the
 worker's per-checkpoint `CLOCK_THREAD_CPUTIME_ID` read; N=6/side.
 
