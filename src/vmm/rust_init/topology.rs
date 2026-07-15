@@ -182,7 +182,9 @@ fn wait_wprof_evented(
         let remaining = deadline - now;
         let timeout_ms = remaining
             .as_millis()
-            .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0))
+            .saturating_add(u128::from(
+                !remaining.subsec_nanos().is_multiple_of(1_000_000),
+            ))
             .min(i32::MAX as u128) as libc::c_int;
         let mut pollfds = [
             libc::pollfd {
@@ -457,7 +459,7 @@ mod wprof_startup_tests {
             Err(std::sync::mpsc::TryRecvError::Empty)
         ));
         signal.observe(b"ning...\n");
-        assert_eq!(rx.recv().unwrap(), true);
+        assert!(rx.recv().unwrap());
 
         signal.finish_unready();
         assert!(matches!(
@@ -472,7 +474,7 @@ mod wprof_startup_tests {
         let mut signal = WprofStartupSignal::new(tx);
         signal.observe(b"startup failed\n");
         signal.finish_unready();
-        assert_eq!(rx.recv().unwrap(), false);
+        assert!(!rx.recv().unwrap());
     }
 }
 
