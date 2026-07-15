@@ -859,8 +859,13 @@ fn discover_excludes_self_pid_from_holder_count() {
     // the child opens the same inode the parent's discover stats.
     let peer_lock_path = llc_lock_path(1);
     crate::flock::materialize(&peer_lock_path).expect("materialize peer lockfile");
+    // Lead a fresh process group so the kill below reaches `flock`'s
+    // `sleep` grandchild too, not just `flock` (mirrors the make(1)
+    // spawn+killpg pattern in cli::kernel_build::make).
+    use std::os::unix::process::CommandExt as _;
     let child = std::process::Command::new("flock")
-        .args(["-s", "-n", &peer_lock_path, "sleep", "2"])
+        .args(["-s", "-n", &peer_lock_path, "sleep", "300"])
+        .process_group(0)
         .spawn();
     let mut child = match child {
         Ok(c) => c,
@@ -873,11 +878,27 @@ fn discover_excludes_self_pid_from_holder_count() {
         }
         Err(e) => panic!("spawn flock(1): {e}"),
     };
-    std::thread::sleep(std::time::Duration::from_millis(50));
-
+    // The peer child must be SCHEDULED and take its LOCK_SH before we
+    // stat /proc/locks. A fixed sleep races that acquisition on a loaded
+    // host — a freshly spawned process can sit unscheduled far longer
+    // than any guessed delay — so poll discover until the peer's hold is
+    // visible instead of assuming a fixed settle time. The child holds
+    // for the poll's whole lifetime (killed below), so the observation
+    // window can never fall outside the peer's hold.
     let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo");
-    let snapshots =
-        discover_llc_snapshots(&topo, &allowed, &mountinfo).expect("discover must succeed");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let snapshots = loop {
+        let snaps =
+            discover_llc_snapshots(&topo, &allowed, &mountinfo).expect("discover must succeed");
+        let peer_seen = snaps
+            .iter()
+            .find(|s| s.llc_idx == 1)
+            .is_some_and(|s| s.holder_count == 1);
+        if peer_seen || std::time::Instant::now() >= deadline {
+            break snaps;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
 
     let llc0 = snapshots
         .iter()
@@ -913,7 +934,18 @@ fn discover_excludes_self_pid_from_holder_count() {
         llc1.holders,
     );
 
-    // Child exits after sleep 2; reap it so we don't leave zombies.
+    // The child holds until killed (sleep 300); sweep its whole process
+    // group so `flock` AND its `sleep` grandchild die, then reap `flock`
+    // so we leave neither a lingering process nor a zombie. Guard the
+    // pgid cast as make's killpg does: a non-positive pgid would broadcast
+    // to the caller's group.
+    if let Some(pgid) = libc::pid_t::try_from(child.id())
+        .ok()
+        .filter(|&p| p > 0)
+        .map(nix::unistd::Pid::from_raw)
+    {
+        let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+    }
     let _ = child.wait();
 }
 
