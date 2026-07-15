@@ -583,9 +583,11 @@ pub(crate) fn prebuild_no_run_args(args: &[String]) -> Vec<String> {
 /// starts unreserved.
 ///
 /// Mirrors the kernel build's reservation via the shared
-/// [`ktstr::cli::acquire_build_reservation`]: same Consolidate placement,
-/// same `KTSTR_BYPASS_LLC_LOCKS` / `KTSTR_CARGO_TEST_MODE` /
-/// degraded-sysfs short-circuits, and the same cgroup-degrade gating
+/// [`ktstr::cli::acquire_build_reservation_waiting`]: same Consolidate
+/// placement, `KTSTR_BYPASS_LLC_LOCKS` / `KTSTR_CARGO_TEST_MODE` /
+/// degraded-sysfs short-circuits, and cgroup-degrade gating as kernel builds,
+/// plus progress-aware waiting when perf-mode tests temporarily own the
+/// required capacity
 /// (hard error iff an explicit cap was set — here only via
 /// `KTSTR_CPU_CAP`, since `cargo ktstr test` exposes no `--cpu-cap` flag;
 /// warn-and-proceed otherwise). Errors abort the run BEFORE any test
@@ -595,14 +597,14 @@ pub(crate) fn prebuild_no_run_args(args: &[String]) -> Vec<String> {
 pub(crate) fn run_reserved_prebuild(mut warm_cmd: Command, cli_label: &str) -> Result<(), String> {
     // `cargo ktstr test` has no `--cpu-cap` flag; resolve from
     // `KTSTR_CPU_CAP` (env), else `None` → the same 30%-of-allowed default
-    // a cap-less kernel build uses. acquire_build_reservation enforces the
-    // `KTSTR_BYPASS_LLC_LOCKS` + cap conflict identically.
+    // a cap-less kernel build uses. acquire_build_reservation_waiting enforces
+    // the `KTSTR_BYPASS_LLC_LOCKS` + cap conflict identically.
     let cpu_cap = ktstr::cli::CpuCap::resolve(None)
         .map_err(|e| format!("{cli_label}: resolve harness-build CPU cap: {e:#}"))?;
     // RAII: `_reservation`'s cgroup sandbox drops before its LLC flocks per
     // `BuildReservation` field order; both are released when this fn
     // returns, ahead of the combined build+run the caller then spawns.
-    let reservation = ktstr::cli::acquire_build_reservation(cli_label, cpu_cap)
+    let reservation = ktstr::cli::acquire_build_reservation_waiting(cli_label, cpu_cap)
         .map_err(|e| format!("{cli_label}: acquire harness-build reservation: {e:#}"))?;
     // `CARGO_BUILD_JOBS` is the harness-compile analog of the kernel
     // build's `make -jN`: cap parallel rustc to the reserved CPU count so
@@ -2091,7 +2093,8 @@ mod tests {
     /// Integration: the harness-compile reservation the warm-up takes
     /// grabs a machine-global LLC `LOCK_SH` under `KTSTR_LOCK_DIR`
     /// isolation. Mirrors the host_topology planning tests' flock-presence
-    /// idiom, but drives the exact `ktstr::cli::acquire_build_reservation`
+    /// idiom, but drives the exact
+    /// `ktstr::cli::acquire_build_reservation_waiting`
     /// call `run_reserved_prebuild` makes — proving the cross-binary
     /// reservation wiring is live, not just the argv shape.
     ///
@@ -2111,7 +2114,7 @@ mod tests {
         let _g_testmode = EnvVar::remove(ktstr::KTSTR_CARGO_TEST_MODE_ENV);
         let _g_cap = EnvVar::remove(ktstr::KTSTR_CPU_CAP_ENV);
 
-        match ktstr::cli::acquire_build_reservation("test", None) {
+        match ktstr::cli::acquire_build_reservation_waiting("test", None) {
             Ok(reservation) => {
                 if reservation.make_jobs().is_none() {
                     eprintln!(

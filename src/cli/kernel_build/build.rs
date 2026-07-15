@@ -128,6 +128,29 @@ pub fn acquire_build_reservation(
     cli_label: &str,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
 ) -> Result<BuildReservation> {
+    acquire_build_reservation_impl(cli_label, cpu_cap, false)
+}
+
+/// Acquire a build reservation, joining the progress-aware host queue when
+/// perf-mode work temporarily owns too much LLC capacity.
+///
+/// Harness prebuilds use this variant because many independent CI invocations
+/// compile concurrently and have no source-tree lock to serialize them. A
+/// transient `LOCK_EX` holder must delay compilation, not abort the entire
+/// test job after four nonblocking probes. Kernel builds retain
+/// [`acquire_build_reservation`]'s interactive nonblocking behavior.
+pub fn acquire_build_reservation_waiting(
+    cli_label: &str,
+    cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
+) -> Result<BuildReservation> {
+    acquire_build_reservation_impl(cli_label, cpu_cap, true)
+}
+
+fn acquire_build_reservation_impl(
+    cli_label: &str,
+    cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
+    wait: bool,
+) -> Result<BuildReservation> {
     let bypass = crate::bypass_llc_locks_active();
     // INVARIANT: `_sandbox` is declared first and drops first per
     // Rust's declaration-order field-drop rule; this ensures the
@@ -157,12 +180,7 @@ pub fn acquire_build_reservation(
             &test_topo,
             cpu_cap,
             crate::vmm::host_topology::PlacementPolicy::Consolidate,
-            // Build-time reservation keeps the non-blocking (TOCTOU-only)
-            // fast path: the source-tree lock (acquire_source_tree_lock)
-            // already serialises concurrent builds with a try-then-wait,
-            // and a build is throughput-elastic. The queue-and-wait policy
-            // is the run path's (KtstrVm::run).
-            false,
+            wait,
         )?;
         crate::vmm::host_topology::warn_if_cross_node_spill(&acquired_plan, &host_topo);
         Some(acquired_plan)

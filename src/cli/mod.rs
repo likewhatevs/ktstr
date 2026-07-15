@@ -27,9 +27,10 @@ pub use kernel_list::{format_entry_row, kernel_clean, kernel_list, kernel_list_r
 
 pub(crate) use kernel_build::critical_config_options;
 pub use kernel_build::{
-    BuildReservation, KernelBuildResult, acquire_build_reservation, append_extra_kconfig_suffix,
-    kernel_build_pipeline, make_kernel_with_output, read_extra_kconfig, run_make,
-    run_make_with_output, validate_kernel_config,
+    BuildReservation, KernelBuildResult, acquire_build_reservation,
+    acquire_build_reservation_waiting, append_extra_kconfig_suffix, kernel_build_pipeline,
+    make_kernel_with_output, read_extra_kconfig, run_make, run_make_with_output,
+    validate_kernel_config,
 };
 
 pub use parse::{DISK_HELP, parse_disk_arg, parse_disk_size_mib, parse_topology_string};

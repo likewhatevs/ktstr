@@ -20,7 +20,8 @@ mod kconfig;
 mod make;
 
 pub use build::{
-    BuildReservation, KernelBuildResult, acquire_build_reservation, kernel_build_pipeline,
+    BuildReservation, KernelBuildResult, acquire_build_reservation,
+    acquire_build_reservation_waiting, kernel_build_pipeline,
 };
 pub(crate) use kconfig::critical_config_options;
 pub use kconfig::{append_extra_kconfig_suffix, read_extra_kconfig, validate_kernel_config};
