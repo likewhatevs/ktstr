@@ -186,6 +186,41 @@ fn burst_covers_excess_demotes_to_pass_with_annotation() {
         !note.contains("saturated"),
         "unsaturated must not note saturation"
     );
+    let reason = expect_err_contention_indeterminate_skip_reason(true, &cr)
+        .expect("expect_err + a fully demoted latency failure must skip");
+    assert!(reason.contains("1 latency gate(s)"), "{reason}");
+}
+
+#[test]
+fn contention_indeterminate_skip_requires_expect_err_and_a_clean_result() {
+    let mut demoted = AssertResult::pass();
+    demoted
+        .info_notes
+        .push(crate::assert::InfoNote::new(format!(
+            "{CONTENTION_INDETERMINATE_PREFIX} synthetic"
+        )));
+    assert_eq!(
+        expect_err_contention_indeterminate_skip_reason(false, &demoted),
+        None,
+        "an ordinary test keeps the documented indeterminate == pass result"
+    );
+
+    demoted.record_fail(AssertDetail::new(
+        DetailKind::Other,
+        "an unrelated failure must remain blocking",
+    ));
+    assert_eq!(
+        expect_err_contention_indeterminate_skip_reason(true, &demoted),
+        None,
+        "a sibling failure must never be hidden by the environmental skip"
+    );
+
+    let ordinary_pass = AssertResult::pass();
+    assert_eq!(
+        expect_err_contention_indeterminate_skip_reason(true, &ordinary_pass),
+        None,
+        "a genuinely clean expect_err run must still fail its inversion"
+    );
 }
 
 // ---- witness present: saturated never confirms ----

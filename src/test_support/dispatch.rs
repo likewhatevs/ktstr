@@ -1415,10 +1415,11 @@ pub(crate) fn final_outcome(
 
 /// Whether a base test entry is "ignored" (skipped by default).
 ///
-/// Tests whose names start with `demo_` are ignored -- they are
-/// demonstration/benchmarking tests that require manual opt-in.
+/// Entries declared with `#[ktstr_test(ignore)]` carry `ignored = true` from
+/// macro codegen. Tests whose names start with `demo_` are also ignored --
+/// they are demonstration/benchmarking tests that require manual opt-in.
 fn is_ignored(entry: &KtstrTestEntry) -> bool {
-    entry.name.starts_with("demo_")
+    entry.ignored || entry.name.starts_with("demo_")
 }
 
 /// Walk [`KTSTR_TESTS`] once per process and emit a stderr
@@ -1507,8 +1508,9 @@ fn warn_duplicate_test_names_inner<'a, W: std::io::Write>(
 /// - Without `--ignored`: prints ALL tests (ignored and non-ignored).
 /// - With `--ignored`: prints ONLY ignored tests.
 ///
-/// Gauntlet variants are always ignored. Base tests are ignored when
-/// their name starts with `demo_`.
+/// Gauntlet variants are always ignored. Base tests are ignored when their
+/// registered entry carries `ignored = true` or their name starts with
+/// `demo_`.
 ///
 /// When `KTSTR_BUDGET_SECS` is set, applies greedy coverage maximization
 /// to select the subset of tests that maximizes feature coverage within

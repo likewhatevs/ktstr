@@ -301,6 +301,12 @@ the passing run's output and its sidecar. If the Body contention series
 lower bound, so the verdict never confirms on it — it is treated as
 indeterminate with a saturation note.
 
+For an `expect_err` negative test, a run whose only expected failures became
+contention-indeterminate is a `Skip`, not a clean `Pass`: the environment
+prevented the harness from proving whether the expected failure remains. A
+confirmed failure still satisfies `expect_err`, an unrelated failure remains
+blocking, and `--no-skip-mode` promotes the environmental skip to a failure.
+
 New witnesses sample the cumulative pressure clock at both lifecycle edges;
 even one coarse interval can therefore cover the whole Body. Each interval
 also carries its real wall width. The window calculation charges an interval's

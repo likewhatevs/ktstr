@@ -1620,6 +1620,35 @@ fn run_ktstr_test_inner_impl(
         &repro_fn,
         post_vm_err.as_ref(),
     );
+    // `expect_err` asks the run to prove a failure. When the ONLY blocking
+    // wall-latency failures were demoted because the host-contention witness
+    // can explain them, the run did not prove either the expected failure or
+    // a clean pass: this host could not evaluate the negative assertion.
+    // Project that environmental outcome to SKIP before expect_err inversion.
+    // A confirmed latency failure (or any unrelated failure) remains Err and
+    // follows the ordinary expect_err path. Under KTSTR_NO_SKIP_MODE leave the
+    // contention-indeterminate pass intact, so expect_err promotes it to the
+    // usual hard failure instead of silently accepting a skip.
+    if let Ok(check_result) = &mut eval_result
+        && let Some(skip_reason) =
+            expect_err_contention_indeterminate_skip_reason(entry.expect_err, check_result)
+    {
+        if std::env::var_os(crate::KTSTR_NO_SKIP_MODE_ENV).is_some() {
+            eprintln!(
+                "ktstr: FAIL: {}: {skip_reason} \
+                 [KTSTR_NO_SKIP_MODE: contention skip promoted to fail]",
+                entry.name
+            );
+        } else {
+            crate::report::test_skip(format_args!("{}: {skip_reason}", entry.name));
+            // evaluate_vm_result already persisted the full telemetry-rich
+            // sidecar. Preserve that result (including the contention note,
+            // stats, and measurements) and replace only its terminal outcome;
+            // run_ktstr_test_inner finalizes the existing sidecar to SKIP.
+            check_result.outcomes.clear();
+            check_result.record_skip(skip_reason);
+        }
+    }
     // Reclassify a no-guest-result run that is a contention-caused
     // SchedulerNotAttached — the scheduler enable was still in flight
     // (state=enabling) when the startup budget expired under host
@@ -2164,6 +2193,35 @@ fn populate_run_stats_and_folded_timeline(
 /// ---`) and the stderr echo, so a passing-after-demotion run's captured
 /// output still names the demoted gate.
 pub(crate) const CONTENTION_INDETERMINATE_PREFIX: &str = "contention-indeterminate:";
+
+/// Explain why an `expect_err` run whose only latency failures became
+/// contention-indeterminate must skip rather than fail the inversion.
+///
+/// Pure so the boundary is pinned without a VM: ordinary passing runs, tests
+/// without `expect_err`, and results that retain any blocking outcome return
+/// `None`. Only a passing result carrying at least one annotation emitted by
+/// [`apply_contention_verdict`] qualifies. The caller then replaces only the
+/// result's terminal outcomes, preserving its telemetry and notes.
+fn expect_err_contention_indeterminate_skip_reason(
+    expect_err: bool,
+    check_result: &AssertResult,
+) -> Option<String> {
+    if !expect_err || !check_result.is_pass() {
+        return None;
+    }
+    let demoted = check_result
+        .info_notes
+        .iter()
+        .filter(|note| note.message.starts_with(CONTENTION_INDETERMINATE_PREFIX))
+        .count();
+    (demoted > 0).then(|| {
+        format!(
+            "expected wall-latency failure could not be confirmed: {demoted} \
+             latency gate(s) were contention-indeterminate because witnessed \
+             host contention could account for the excess"
+        )
+    })
+}
 
 /// Greppable prefix on the LOUD perf-mode host-isolation-fault verdict
 /// [`apply_contention_verdict`] records for a `performance_mode` cell

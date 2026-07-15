@@ -729,6 +729,7 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
             #survives_storm_field
             #allow_inconclusive_field
             #host_only_field
+            ignored: #ignore_test,
             #extra_include_files_field
             #cleanup_budget_field
             #post_vm_field

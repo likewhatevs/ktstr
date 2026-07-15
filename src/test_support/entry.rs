@@ -1967,6 +1967,16 @@ pub struct KtstrTestEntry {
     /// booting a VM. Used for tests that need host tools (cargo,
     /// nested VMs) unavailable in the guest initramfs.
     pub host_only: bool,
+    /// Whether the base test is ignored by default and runs only when the
+    /// harness is invoked with `--run-ignored`. Populated by
+    /// `#[ktstr_test(ignore)]` / `#[ktstr_test(ignore = true)]`.
+    ///
+    /// This lives on the registered entry in addition to the generated
+    /// libtest wrapper's `#[ignore]`: cargo-ktstr discovers `ktstr/<name>`
+    /// cases from [`KTSTR_TESTS`], so the
+    /// custom listing path must carry the same bit or it would run an ignored
+    /// VM fixture by default.
+    pub ignored: bool,
     /// Extra host-side file specs beyond what the entry's
     /// [`scheduler`](Self::scheduler) / [`payload`](Self::payload) /
     /// [`workloads`](Self::workloads) declare. Unions with those
@@ -2349,6 +2359,7 @@ impl KtstrTestEntry {
         survives_storm: false,
         allow_inconclusive: false,
         host_only: false,
+        ignored: false,
         extra_include_files: &[],
         cleanup_budget: None,
         config_content: None,
@@ -2614,6 +2625,13 @@ impl KtstrTestEntry {
     #[must_use = "builder methods consume self; bind the result"]
     pub fn with_host_only(mut self, host_only: bool) -> Self {
         self.host_only = host_only;
+        self
+    }
+
+    /// Override [`Self::ignored`].
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn with_ignored(mut self, ignored: bool) -> Self {
+        self.ignored = ignored;
         self
     }
 

@@ -3101,6 +3101,28 @@ fn run_gauntlet_test_perf_mode_entry_derives_topo_then_skips() {
 // ktstr_list_only / warn_duplicate_test_names_once
 // ---------------------------------------------------------------
 
+#[test]
+fn is_ignored_honors_registered_flag_and_demo_convention() {
+    let ordinary = KtstrTestEntry {
+        name: "ordinary",
+        ..KtstrTestEntry::DEFAULT
+    };
+    assert!(!is_ignored(&ordinary));
+
+    let attributed = KtstrTestEntry {
+        name: "compile_only_fixture",
+        ignored: true,
+        ..KtstrTestEntry::DEFAULT
+    };
+    assert!(is_ignored(&attributed));
+
+    let demo = KtstrTestEntry {
+        name: "demo_manual_benchmark",
+        ..KtstrTestEntry::DEFAULT
+    };
+    assert!(is_ignored(&demo));
+}
+
 /// `ktstr_list_only` (whose body is
 /// `args.iter().any(|a| a == "--ignored")` then `list_tests(ignored_only)`)
 /// reads argv for

@@ -229,7 +229,10 @@ and is rejected alongside `auto_repro = false`, `expect_err`, or
 
 `expect_err = true` asserts the run returns `Err` — the negative
 test: a scheduler crash or scenario failure is the expected outcome,
-and a clean pass fails the test. `survives_storm = true` is the
+and a clean pass fails the test. If the only expected wall-latency failure
+is demoted because witnessed host contention could explain it, the run skips:
+that host could not prove the negative assertion. `--no-skip-mode` promotes
+that environmental skip to a failure. `survives_storm = true` is the
 positive inverse: the scx scheduler must stay attached and alive
 through every hold; a death or ejection fails with a
 survival-specific explainer. It requires a scheduler and is mutually

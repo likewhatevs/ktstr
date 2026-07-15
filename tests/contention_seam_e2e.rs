@@ -28,7 +28,10 @@
 //!     accrues little CPU pressure — `W` stays far below the ~500 ms gap, so
 //!     the tri-state CONFIRMS (excess > W) and the failure STAYS. `expect_err`
 //!     makes the confirmed-fail the green expected outcome — proving the
-//!     confirmed path survives.
+//!     confirmed path survives. If external host contention instead makes
+//!     `W` cover the synthetic gap, the host could not prove this negative
+//!     assertion and the harness reports SKIP rather than treating an
+//!     indeterminate demotion as a clean pass under `expect_err`.
 //!
 //! (b) CONTENDED → INDETERMINATE → PASS — `no_perf_mode` + `cpu_budget = 1`
 //!     with 2 vCPUs plus a free-running burner on the sibling vCPU, so the
@@ -97,7 +100,10 @@ const CONFIRM_BURST_MS: u64 = 50;
 /// under 500 ms and the seam CONFIRMS the failure (excess > W), appending
 /// the `(contention-checked: ...)` note. `expect_err` inverts that
 /// confirmed failure to the green expected outcome, proving the confirmed
-/// path survives the seam.
+/// path survives the seam. Unbounded external host contention can make `W`
+/// cover even this large synthetic gap; that run is correctly SKIPPED because
+/// it cannot prove the expected failure, while a genuinely clean pass would
+/// still fail `expect_err`.
 ///
 /// One vCPU (threads = 1) keeps the quiet fixture free of deliberate host
 /// overcommit, widening the excess-over-W margin on a busy host.
