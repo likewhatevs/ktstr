@@ -590,7 +590,7 @@ int main(void) {{
         // reachable from a ref: it does today (master's tip) and stays
         // reachable as master advances (it becomes an ancestor); it
         // would only break if upstream rewrote history to orphan it.
-        const WPROF_REV: &str = "53162afea658b0474c88212228a94c8c50891781";
+        const WPROF_REV: &str = "aa60dbc9b358f1a59511d12befefa1bf89171058";
         let wprof_src = out_dir.join("wprof-src");
 
         // Prefer the wprof binary cargo-ktstr already embedded

@@ -275,8 +275,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov,cargo-nextest
-      - run: just kernel-build 6.14
-      - run: just coverage 6.14 wprof
+      - run: just kernel-build 7.1
+      - run: just coverage 7.1 wprof
       - if: ${{ !cancelled() }}
         run: just sccache-stats
       - name: Upload coverage to Codecov
@@ -301,8 +301,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov,cargo-nextest
-      - run: just kernel-build 6.14
-      - run: just coverage 6.14 wprof
+      - run: just kernel-build 7.1
+      - run: just coverage 7.1 wprof
       - if: ${{ !cancelled() }}
         run: just sccache-stats
       - name: Upload coverage to Codecov
