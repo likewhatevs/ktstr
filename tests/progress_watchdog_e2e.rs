@@ -25,7 +25,10 @@
 //!     regression guard for that.
 //!   - **Tier-3** — the dead-man wall deadline, deferring while the cell is
 //!     alive (busiest-vCPU CPU trickle above the floor, or a recent
-//!     milestone) and firing only on a dead monitor or a truly inert cell.
+//!     milestone), but only while the current phase remains within the
+//!     VM's whole effective-deadline busiest-vCPU CPU budget. This keeps
+//!     contention immunity without leaving an active Body livelock to the
+//!     outer nextest rail.
 //!
 //! Both progress tiers fire ONLY in INFRA stages (Boot / Attach / Dispatch
 //! / Teardown); the Body stage is exempt via the `u64::MAX` Body budgets in

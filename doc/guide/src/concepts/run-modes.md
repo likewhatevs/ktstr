@@ -307,11 +307,14 @@ CPU burn and runnable demand, not about pinning:
   Deliberately no CPU term: a wide idle guest's housekeeping-CPU burn
   scales with vCPU count, so no width-stable CPU floor exists.
 - **Tier-3 (deadman deferral)** — the guest-derived hard deadline fires at
-  the wall only if the monitor is dead or the cell is inert (its busiest
-  single vCPU's CPU trickle stalled below a currency-dependent floor for
-  two consecutive 10 s windows, *and* no milestone within a 60 s grace). A
-  merely-slow-but-alive cell outlives the wall deadline by design; its
-  outer bound is the harness `terminate-after`, not this deadman.
+  the wall if the monitor is dead or the cell is inert (its busiest single
+  vCPU's CPU trickle stalled below a currency-dependent floor for two
+  consecutive 10 s windows, *and* no milestone within a 60 s grace). An
+  active cell may outlive that wall deadline under contention, but not
+  forever: deferral also ends once the current phase has consumed more
+  busiest-vCPU CPU than the VM's entire effective deadline budget. That
+  backstop is width-independent and dilation-immune — starvation stretches
+  the wall needed to spend it instead of causing a false timeout.
 
 Only the CPU *currency* differs by host, not by mode: the PMU task-clock
 (guest-only time) uses the tight floors, and the pthread fallback (which

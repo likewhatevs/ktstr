@@ -22,11 +22,13 @@
 //!     conjunct alone carries the starvation protection (see the rule).
 //!   - Tier-3 (the guest-derived hard deadline) lives in the watchdog
 //!     thread ([`super`]); [`deadman_should_fire`] here is its deferral
-//!     gate. It fires at the wall deadline only when the monitor is dead
-//!     or the cell is inert (CPU trickle-stalled AND no milestone within
-//!     the grace) — so a merely starved-but-alive cell outlives the wall
-//!     deadline by design and a userspace-wedged cell on a live kernel is
-//!     still bounded.
+//!     gate. It fires at the wall deadline when the monitor is dead, the
+//!     cell is inert (CPU trickle-stalled AND no milestone within the
+//!     grace), or the current phase has consumed more busiest-vCPU CPU
+//!     than the VM's entire effective deadline budget. The last condition
+//!     is a dilation-immune bound for an active Body livelock: host
+//!     starvation stretches the wall needed to spend the budget, while a
+//!     guest that keeps burning CPU can no longer defer forever.
 //!
 //! The CPU-trickle discriminator ([`CpuTrickleTracker`]) serves the Tier-3
 //! deadman's deferral gate ONLY: a starved-but-alive cell (even at ~40x
@@ -296,6 +298,37 @@ pub(crate) fn widened_cpu_budget_ns(phase: u8, cpu_currency: u8) -> u64 {
     widen_budget_for_currency(phase_cpu_budget_ns(phase), cpu_currency)
 }
 
+/// Width- and dilation-independent CPU backstop for Tier-3 deferral.
+///
+/// `effective_deadline_budget_ns` is the effective VM deadline expressed
+/// as an offset from VM start. Charging that *entire* budget against the
+/// busiest single vCPU in the current phase is deliberately generous: a
+/// healthy phase cannot consume more single-vCPU CPU than the whole VM was
+/// allowed to run. Unlike a second wall deadline, this stays immune to host
+/// contention — a starved guest accrues the currency proportionally more
+/// slowly. Pthread currency gets the same 3/2 VM-exit-overhead allowance as
+/// Tier-1. With no trusted CPU currency the backstop is structurally off.
+pub(crate) const fn deadman_cpu_budget_ns(
+    effective_deadline_budget_ns: u64,
+    cpu_currency: u8,
+) -> u64 {
+    if cpu_currency == CPU_CURRENCY_NONE {
+        u64::MAX
+    } else {
+        widen_budget_for_currency(effective_deadline_budget_ns, cpu_currency)
+    }
+}
+
+/// Whether the active-cell Tier-3 CPU backstop has been exhausted.
+/// Strict `>` matches Tier-1: exactly at the budget is still permitted.
+pub(crate) const fn deadman_cpu_budget_exhausted(
+    max_vcpu_cpu_in_phase_ns: u64,
+    effective_deadline_budget_ns: u64,
+    cpu_currency: u8,
+) -> bool {
+    max_vcpu_cpu_in_phase_ns > deadman_cpu_budget_ns(effective_deadline_budget_ns, cpu_currency)
+}
+
 /// Fold one live [`LedgerSnapshot`] into a [`KillDecision`]: the glue
 /// between the ledger and the pure [`watchdog_step`]. Derives the wall
 /// in-phase delta and maps the lifecycle stage onto a [`PhaseClass`],
@@ -344,16 +377,16 @@ pub(crate) fn evaluate_progress(
 }
 
 /// Grace window for the Tier-3 deadman (the guest-derived hard deadline):
-/// once the wall deadline has elapsed, the deadman fires ONLY IF the
-/// monitor is dead OR the cell is inert — CPU trickle-stalled AND no
-/// milestone reached within this window.
+/// once the wall deadline has elapsed, an otherwise-unbounded active-cell
+/// deferral ends when its CPU backstop is exhausted; an inert-cell deferral
+/// ends after this milestone grace.
 ///
 /// TERMINATION STORY (exactly this shape):
 ///   - A starved-but-alive cell keeps accruing guest CPU (tens of ms/s
 ///     even at ~40x dilation), so it is NOT trickle-stalled and is
-///     DEFERRED past the wall deadline by design. Its outer bound becomes
-///     the harness / operator (nextest `terminate-after`), NOT this
-///     deadman — a slow cell is not a wedged cell.
+///     DEFERRED past the wall deadline by design. It remains bounded by the
+///     dilation-immune busiest-vCPU budget: a slow cell spends that budget
+///     slowly, while an active livelock eventually exhausts it.
 ///   - An idle userspace wedge on a LIVE kernel (the classic PID-1-blocked
 ///     shape) shows no runnable demand, so Tier-2 kills it at the wall
 ///     backstop long before this deadline; the deadman is its backstop-of-
@@ -369,8 +402,9 @@ pub(crate) fn evaluate_progress(
 ///     DEFERS; that residual is still bounded, by the guest scx watchdog
 ///     (`scx_tick` fires `SCX_EXIT_ERROR_STALL` on a stalled scheduler),
 ///     not by wall deferral here.
-///   - A spinning wedge never reaches here: Tier-1 bounds it on the CPU
-///     budget long before the deadline.
+///   - An INFRA spinning wedge never reaches here: Tier-1 bounds it on the
+///     phase CPU budget long before the deadline. Body deliberately has no
+///     Tier-1 budget, so the whole-VM CPU backstop closes that gap here.
 ///
 /// 60 s is generous against the 100 ms watchdog tick and any legitimate
 /// quiet span (so a live cell is never misjudged), yet small against the
@@ -393,15 +427,29 @@ pub(crate) const TIER3_PROGRESS_GRACE_NS: u64 = 60_000_000_000;
 ///     belt-and-braces): here a width residual can only DEFER a kill, and
 ///     the runnable-piled cell it would defer is bounded by the guest scx
 ///     watchdog instead.
+///   - `max_vcpu_cpu_in_phase_ns`, `effective_deadline_budget_ns`, and
+///     `cpu_currency`: the active-cell CPU backstop evidence, budget, and
+///     provenance. [`deadman_cpu_budget_exhausted`] owns the comparison and
+///     pthread widening.
 ///
-/// Fires iff the monitor is dead, OR the cell is inert: CPU trickle-stalled
-/// AND no milestone within the full [`TIER3_PROGRESS_GRACE_NS`].
+/// Fires iff the monitor is dead, the active-cell CPU backstop is exhausted,
+/// OR the cell is inert: CPU trickle-stalled AND no milestone within the full
+/// [`TIER3_PROGRESS_GRACE_NS`].
 pub(crate) fn deadman_should_fire(
     monitor_live: bool,
     wall_since_milestone_ns: u64,
     cpu_trickle_stalled: bool,
+    max_vcpu_cpu_in_phase_ns: u64,
+    effective_deadline_budget_ns: u64,
+    cpu_currency: u8,
 ) -> bool {
-    !monitor_live || (cpu_trickle_stalled && wall_since_milestone_ns > TIER3_PROGRESS_GRACE_NS)
+    !monitor_live
+        || deadman_cpu_budget_exhausted(
+            max_vcpu_cpu_in_phase_ns,
+            effective_deadline_budget_ns,
+            cpu_currency,
+        )
+        || (cpu_trickle_stalled && wall_since_milestone_ns > TIER3_PROGRESS_GRACE_NS)
 }
 
 /// Pure state machine that turns each tick's PER-vCPU cumulative CPU-time
@@ -912,22 +960,88 @@ mod tests {
     fn deadman_dead_monitor_always_fires() {
         // Monitor dead → fire regardless of wall / trickle (the machinery
         // that could defer is gone).
-        assert!(deadman_should_fire(false, 0, false));
-        assert!(deadman_should_fire(false, 100 * S, true));
+        assert!(deadman_should_fire(
+            false,
+            0,
+            false,
+            0,
+            100 * S,
+            CPU_CURRENCY_PMU
+        ));
+        assert!(deadman_should_fire(
+            false,
+            100 * S,
+            true,
+            0,
+            100 * S,
+            CPU_CURRENCY_PMU,
+        ));
     }
 
     #[test]
-    fn deadman_starved_but_alive_defers_forever() {
+    fn deadman_starved_but_alive_defers_while_cpu_budget_remains() {
         // Monitor live, NOT trickle-stalled (CPU still accruing) — a
-        // starved-but-alive cell defers past the wall deadline no matter
-        // how long since the last milestone. Bounded by the harness, not
-        // this deadman.
+        // starved-but-alive cell defers past the wall deadline while it has
+        // not spent the dilation-immune CPU backstop.
         assert!(!deadman_should_fire(
             true,
             TIER3_PROGRESS_GRACE_NS + S,
-            false
+            false,
+            99 * S,
+            100 * S,
+            CPU_CURRENCY_PMU,
         ));
-        assert!(!deadman_should_fire(true, 1_000 * S, false));
+        assert!(!deadman_should_fire(
+            true,
+            1_000 * S,
+            false,
+            99 * S,
+            100 * S,
+            CPU_CURRENCY_PMU,
+        ));
+    }
+
+    #[test]
+    fn deadman_active_cell_fires_when_cpu_budget_is_exhausted() {
+        assert!(deadman_should_fire(
+            true,
+            0,
+            false,
+            100 * S + 1,
+            100 * S,
+            CPU_CURRENCY_PMU,
+        ));
+    }
+
+    #[test]
+    fn deadman_cpu_backstop_is_width_independent_and_currency_widened() {
+        let budget = 100 * S;
+        assert_eq!(deadman_cpu_budget_ns(budget, CPU_CURRENCY_PMU), budget);
+        assert_eq!(
+            deadman_cpu_budget_ns(budget, CPU_CURRENCY_PTHREAD),
+            budget + budget / 2
+        );
+        assert_eq!(deadman_cpu_budget_ns(budget, CPU_CURRENCY_NONE), u64::MAX);
+        assert!(!deadman_cpu_budget_exhausted(
+            budget,
+            budget,
+            CPU_CURRENCY_PMU
+        ));
+        assert!(deadman_cpu_budget_exhausted(
+            budget + 1,
+            budget,
+            CPU_CURRENCY_PMU
+        ));
+        assert!(!deadman_cpu_budget_exhausted(
+            budget + 1,
+            budget,
+            CPU_CURRENCY_PTHREAD
+        ));
+        assert!(!deadman_cpu_budget_exhausted(
+            u64::MAX,
+            budget,
+            CPU_CURRENCY_NONE
+        ));
     }
 
     #[test]
@@ -935,9 +1049,23 @@ mod tests {
         // Monitor live, trickle-stalled, and no milestone for longer than
         // the grace → the cell is inert → fire (the idle-userspace-wedge /
         // stalled-scx bound). Strict `>` on the grace boundary.
-        assert!(deadman_should_fire(true, TIER3_PROGRESS_GRACE_NS + 1, true));
+        assert!(deadman_should_fire(
+            true,
+            TIER3_PROGRESS_GRACE_NS + 1,
+            true,
+            0,
+            100 * S,
+            CPU_CURRENCY_PMU,
+        ));
         assert!(
-            !deadman_should_fire(true, TIER3_PROGRESS_GRACE_NS, true),
+            !deadman_should_fire(
+                true,
+                TIER3_PROGRESS_GRACE_NS,
+                true,
+                0,
+                100 * S,
+                CPU_CURRENCY_PMU,
+            ),
             "exactly at the grace is not yet past it"
         );
     }
@@ -950,7 +1078,10 @@ mod tests {
         assert!(!deadman_should_fire(
             true,
             TIER3_PROGRESS_GRACE_NS - S,
-            true
+            true,
+            0,
+            100 * S,
+            CPU_CURRENCY_PMU,
         ));
     }
 

@@ -402,9 +402,10 @@ channels_live && !runnable_demand && wall_in_phase > backstop`. The trickle
 discriminator survives only as the Tier-3 deadman's deferral gate,
 re-denominated to the busiest single vCPU via per-vCPU window anchors (a
 summed or per-tick-max currency degrades to ~the sum at width because idle
-background burn rotates and serialises); a width misread there can only
-DEFER, and the deferred runnable-piled shape stays bounded by the guest scx
-watchdog.
+background burn rotates and serialises). A width misread there can only
+DEFER the wall verdict; the deferred runnable-piled shape remains bounded
+by the guest scx watchdog, and an active Body livelock now also has a
+whole-effective-deadline busiest-vCPU CPU backstop.
 
 The §2 scratch shapes are now COMMITTED fixtures
 (`tests/progress_watchdog_e2e.rs`,

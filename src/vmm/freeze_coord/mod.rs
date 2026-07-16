@@ -357,13 +357,12 @@ pub(crate) enum KillReasonTag {
     /// demand — a silent idle wedge (`KillDecision::Tier2IdleWedge`).
     Tier2Idle = 2,
     /// Tier-3: the guest-derived hard deadline expired AND the deadman was
-    /// not deferred — the monitor was dead (`!monitor_live`) or the cell
-    /// was inert (CPU trickle-stalled AND no milestone within
-    /// [`watchdog_step::TIER3_PROGRESS_GRACE_NS`]). NOT an unconditional
-    /// wall clock: a starved-but-alive cell (still accruing CPU) outlives
-    /// the wall deadline by design and is bounded by the harness/operator
-    /// instead; the deadman only kills when the machinery is dead or the
-    /// cell is wedged.
+    /// not deferred — the monitor was dead (`!monitor_live`), the cell was
+    /// inert (CPU trickle-stalled AND no milestone within
+    /// [`watchdog_step::TIER3_PROGRESS_GRACE_NS`]), or the current phase
+    /// exhausted the whole effective-deadline busiest-vCPU budget. NOT an
+    /// unconditional wall clock: a starved-but-alive cell accrues that CPU
+    /// budget slowly, while an active Body livelock is now finite.
     Tier3Deadman = 3,
     /// An AP set the kill flag (a panic-driven kill), not a watchdog
     /// timeout. Distinct so the dump does not mislabel it as an expiry.
@@ -12568,22 +12567,39 @@ impl KtstrVm {
                     let tier_fire = !matches!(progress_decision, watchdog_step::KillDecision::None);
                     let effective_deadline =
                         reset_deadline.map_or(hard_deadline, |r| r.max(hard_deadline));
+                    let effective_deadline_budget_ns = effective_deadline
+                        .saturating_duration_since(run_start)
+                        .as_nanos()
+                        .min(u64::MAX as u128) as u64;
+                    let deadman_cpu_budget = watchdog_step::deadman_cpu_budget_ns(
+                        effective_deadline_budget_ns,
+                        snapshot.cpu_currency,
+                    );
+                    let deadman_cpu_budget_exhausted =
+                        watchdog_step::deadman_cpu_budget_exhausted(
+                            snapshot.max_vcpu_cpu_in_phase_ns,
+                            effective_deadline_budget_ns,
+                            snapshot.cpu_currency,
+                        );
                     let kill_set = kill_for_watchdog.load(Ordering::Acquire);
                     let hard_deadline_reached = Instant::now() >= effective_deadline;
                     // Tier-3 deadman deferral: reaching the wall deadline
-                    // only KILLS when the monitor is dead or the cell is
+                    // only KILLS when the monitor is dead, the cell is
                     // inert (CPU trickle-stalled AND no milestone within
-                    // the grace). A starved-but-alive cell keeps accruing
-                    // CPU → not stalled → deferred past the wall deadline
-                    // by design (bounded by the harness/operator). A
-                    // userspace-wedged cell on a live kernel trickle-stalls
-                    // and reaches no milestone → fires here, BOUNDED. See
+                    // the grace), or the current phase has burned more
+                    // busiest-vCPU CPU than the VM's entire effective
+                    // deadline budget. That last bound closes Body's
+                    // intentional Tier-1 exemption without reintroducing
+                    // wall-clock false kills under host contention. See
                     // [`watchdog_step::deadman_should_fire`].
                     let deadman_fire = hard_deadline_reached
                         && watchdog_step::deadman_should_fire(
                             monitor_live,
                             wall_since_milestone_ns,
                             cpu_trickle_stalled,
+                            snapshot.max_vcpu_cpu_in_phase_ns,
+                            effective_deadline_budget_ns,
+                            snapshot.cpu_currency,
                         );
                     if kill_set || deadman_fire || tier_fire {
                         // A progress tier fired, an AP set kill, or the
@@ -12739,6 +12755,12 @@ impl KtstrVm {
                             render_budget(cpu_budget),
                             Duration::from_nanos(snapshot.cpu_ns_now),
                         );
+                        eprintln!(
+                            "  tier3_cpu_backstop={:?} vs budget={} (exhausted={})",
+                            Duration::from_nanos(max_vcpu_cpu_in_phase),
+                            render_budget(deadman_cpu_budget),
+                            deadman_cpu_budget_exhausted,
+                        );
                         // Deadman trickle evidence: the BUSIEST single
                         // vCPU's CPU accrued over the last closed 10 s
                         // window (monitor-computed via per-vCPU window
@@ -12867,6 +12889,9 @@ impl KtstrVm {
                             monitor_live,
                             wall_since_milestone_ns,
                             cpu_trickle_stalled,
+                            snapshot.max_vcpu_cpu_in_phase_ns,
+                            effective_deadline_budget_ns,
+                            snapshot.cpu_currency,
                         )
                     {
                         soft_fired = true;

@@ -47,8 +47,9 @@ pub enum WatchdogKillReason {
     /// Tier-2: wall past the phase backstop with live evidence channels
     /// and no runnable demand — a silent idle wedge.
     Tier2IdleWedge,
-    /// Tier-3: the hard deadline expired and the deadman was not
-    /// deferred (monitor dead, or cell inert past the grace).
+    /// Tier-3: the hard deadline expired and the deadman was not deferred
+    /// (monitor dead, cell inert past the grace, or the current phase
+    /// exhausted the effective-deadline busiest-vCPU CPU budget).
     Tier3Deadman,
     /// An AP set the kill flag (panic-driven), not a watchdog expiry.
     ApKill,

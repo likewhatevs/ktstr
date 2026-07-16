@@ -845,14 +845,13 @@ pub(crate) const OVERCOMMIT_SKIP_RATIO: f64 = 6.0;
 /// This is NOT a timeout bump. The progress watchdog's Tier-1
 /// (CPU-burned-without-progress) and Tier-2 (silent idle-wedge) rules in
 /// `vmm::freeze_coord::watchdog_step` are the primary hang
-/// detectors: a wedge dies on those tiers inside a bounded per-phase
-/// budget no matter how loose this deadline is, and a healthy-but-slow
-/// cell is progress-protected by the same tiers. So no healthy or wedged
-/// cell ever reaches Tier-3 — it fires only when the progress machinery
-/// itself is dead (a monitor-dead pathology or the unforeseen). That is
-/// why overcommit scaling is retired from this path: Tier-1/2, not a
-/// wall-clock oversub multiplier, now absorb a loaded host, and a flat
-/// generous factor suffices as the dead-man's switch.
+/// detectors for INFRA phases: a wedge dies on those tiers inside a bounded
+/// per-phase budget no matter how loose this deadline is. Tier-3 owns the
+/// remaining degradation paths: dead monitoring, an inert cell, and an
+/// active Body livelock after it burns the whole effective-deadline
+/// busiest-vCPU budget. The CPU backstop, like Tier-1, stretches with host
+/// starvation; no wall-clock oversub multiplier is needed. A flat generous
+/// headroom factor therefore suffices for the deadline itself.
 const DEADMAN_HEADROOM_MULT: u32 = 3;
 
 /// Stricter skip ratio for the `expect_auto_repro` chain. That inversion
@@ -959,10 +958,10 @@ pub(crate) fn overcommit_skip_reason(
 /// primary detectors are the progress watchdog's Tier-1
 /// (CPU-burned-without-progress) and Tier-2 (silent idle-wedge) rules in
 /// `vmm::freeze_coord::watchdog_step`: a wedge dies on those
-/// tiers inside a bounded per-phase budget, and a healthy-but-slow cell
-/// is progress-protected by them. So no healthy or wedged cell reaches
-/// this deadline; it fires only when the progress machinery itself is
-/// dead (a monitor-dead pathology or the unforeseen).
+/// tiers inside a bounded per-phase budget. Tier-3 also owns a dead
+/// monitor, an inert cell, and an active Body livelock after it consumes
+/// the whole effective-deadline busiest-vCPU CPU budget; that last bound
+/// remains dilation-immune because a starved cell accrues CPU slowly.
 ///
 /// Shape: `base + vm_boot_headroom(booted_vcpus) * DEADMAN_HEADROOM_MULT`.
 /// The vCPU-scaled boot headroom covers a slow boot on a large topology;

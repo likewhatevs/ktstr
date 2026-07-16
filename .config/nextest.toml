@@ -74,15 +74,15 @@ path = "junit.xml"
 # `just test 7.1.3` at 64 test-threads): ~500 lock-taking cells, suite
 # nextest wall 413 s, worst single cell 359 s (queue-inclusive), 82
 # cells above 60 s. CI runners are ~200 CPUs / 24 LLCs but share the
-# lock dir THREE ways (colocated runner units), so cross-invocation
-# drain can stack several suites deep — call it 3× the local drain
-# plus long-cell tails. 180 s × 20 = 60 min of rail keeps nextest
-# strictly behind the real detectors — the in-cell progress watchdog
-# (hangs) and the queue's no-progress patience (wedged holders, 120 s)
-# — which both fire orders of magnitude sooner on genuine faults.
+# lock dir across colocated runner units, so leave roughly three local
+# drains plus a long-cell tail. 180 s × 7 = 21 min: enough for the
+# measured queue-inclusive drain while still bounding a defect outside
+# the in-cell progress watchdog (or an unforeseen queue bug) near the
+# expected CI envelope instead of wasting an hour. A contention-killed
+# cell remains retryable and normally retries after the queue has drained.
 [[profile.ci.overrides]]
 filter = "test(/^ktstr\\//) | test(/^verifier\\//) | test(demo_) | test(gauntlet/) | test(boot_kernel) | test(bench_boot) | test(sched_perf_) | test(shell_exec_) | test(eevdf_) | test(disk_template_e2e) | test(cached_releases_with_non_singleton_bypasses_cache)"
-slow-timeout = { period = "180s", terminate-after = 20 }
+slow-timeout = { period = "180s", terminate-after = 7 }
 
 [[profile.ci.overrides]]
 filter = "test(boot_kernel) | test(bench_boot)"
@@ -141,9 +141,9 @@ retries = 6
 # re-run burns the same ~25-50s again). The Tier-3 dead-man deadline for
 # these 1-vCPU, watchdog_timeout_s=90 cells is ~150s (see the binary's
 # module doc); 150s x 2 keeps the framework watchdog — not nextest — the
-# arbiter even on the regression path where a broken tier falls through to
-# Tier-3 (idle shape) or defers the deadman entirely (spin shape, ended by
-# this terminate-after).
+# arbiter on the idle regression path. The terminate-after remains the
+# final rail if both Tier-1 and Tier-3's active-cell CPU backstop regress on
+# the spin shape.
 [[profile.ci.overrides]]
 filter = "binary(progress_watchdog_e2e)"
 slow-timeout = { period = "150s", terminate-after = 2 }
@@ -209,7 +209,7 @@ threads-required = 1
 # other settings.
 [[profile.default.overrides]]
 filter = "test(/^ktstr\\//) | test(/^verifier\\//) | test(demo_) | test(gauntlet/) | test(boot_kernel) | test(bench_boot) | test(sched_perf_) | test(shell_exec_) | test(eevdf_) | test(disk_template_e2e) | test(cached_releases_with_non_singleton_bypasses_cache)"
-slow-timeout = { period = "180s", terminate-after = 20 }
+slow-timeout = { period = "180s", terminate-after = 7 }
 
 [[profile.default.overrides]]
 filter = "test(vmm::sched_stats::)"
@@ -353,9 +353,9 @@ retries = 0
 # timeout is the EXPECTED outcome — retries=0. 150s x 2 sits above the
 # ~150s Tier-3 deadman of these 1-vCPU watchdog_timeout_s=90 cells so the
 # framework watchdog decides the cell on the idle regression path, and the
-# terminate-after bounds the spin regression path (a CPU-accruing cell
-# defers the deadman by design). See the binary's module doc for the full
-# timing derivation.
+# terminate-after remains the last rail if both Tier-1 and Tier-3's
+# active-cell CPU backstop regress. See the binary's module doc for the
+# full timing derivation.
 [[profile.default.overrides]]
 filter = "binary(progress_watchdog_e2e)"
 slow-timeout = { period = "150s", terminate-after = 2 }
