@@ -744,7 +744,7 @@ fn cpu_cap_effective_count_on_zero_llc_host() {
 /// ordering in `plan_from_snapshots`) requires the parent's
 /// plan to include the child's LLC.
 ///
-/// Uses `flock(1)` + `sleep 10` rather than Rust fork() so the
+/// Uses `flock(1)` + `sleep` rather than Rust fork() so the
 /// holder is a different process (different pid, different OFD)
 /// than the test thread — proving the /proc/locks cross-process
 /// enumeration path is exercised.
@@ -761,9 +761,9 @@ fn acquire_llc_plan_consolidates_on_peer_held_llc() {
     // against consolidation.
     let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
 
-    // Child process holds SH on LLC 1's lockfile via flock(1),
-    // sleeping long enough for the parent's acquire to complete
-    // inside the same SH window.
+    // Child process holds SH on LLC 1's lockfile via flock(1).
+    // Keep it alive until explicitly killed so host load cannot
+    // close the observation window before the parent's acquire.
     let target_lock = llc_lock_path(1);
     // Ensure the lockfile exists so flock(1) opens the right
     // inode (not a fresh one that /proc/locks would attribute
@@ -771,8 +771,10 @@ fn acquire_llc_plan_consolidates_on_peer_held_llc() {
     // sees).
     crate::flock::materialize(&target_lock).expect("materialize lockfile");
 
+    use std::os::unix::process::CommandExt as _;
     let child = std::process::Command::new("flock")
-        .args(["-s", "-n", &target_lock, "sleep", "2"])
+        .args(["-s", "-n", &target_lock, "sleep", "300"])
+        .process_group(0)
         .spawn();
     let mut child = match child {
         Ok(c) => c,
@@ -787,22 +789,58 @@ fn acquire_llc_plan_consolidates_on_peer_held_llc() {
         Err(e) => panic!("spawn flock(1): {e}"),
     };
 
-    // Brief sleep to let the child acquire SH before the parent
-    // reads /proc/locks in discover. 50ms is well past util-linux's
-    // exec + flock NB path and short enough that the child's
-    // `sleep 2` still covers the parent's acquire window.
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // Wait for the peer's LOCK_SH to become observable. A fixed sleep
+    // races process scheduling on a saturated runner: the child can
+    // remain runnable but unscheduled past any guessed delay.
+    let allowed: std::collections::BTreeSet<usize> = [0usize, 1].into_iter().collect();
+    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let peer_seen = loop {
+        let snapshots =
+            discover_llc_snapshots(&topo, &allowed, &mountinfo).expect("discover must succeed");
+        if snapshots
+            .iter()
+            .find(|s| s.llc_idx == 1)
+            .is_some_and(|s| s.holder_count == 1)
+        {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
 
     let test_topo = crate::topology::TestTopology::synthetic(2, 1);
     let cap = CpuCap::new(1).expect("cap=1 valid");
-    let plan = acquire_llc_plan(
-        &topo,
-        &test_topo,
-        Some(cap),
-        PlacementPolicy::Consolidate,
-        false,
-    )
-    .expect("SH is reentrant — parent SH must coexist with child SH");
+    let plan = peer_seen.then(|| {
+        acquire_llc_plan(
+            &topo,
+            &test_topo,
+            Some(cap),
+            PlacementPolicy::Consolidate,
+            false,
+        )
+    });
+
+    // Sweep both flock and its sleep child before any assertion can
+    // panic, then reap flock so the test leaves no process or zombie.
+    if let Some(pgid) = libc::pid_t::try_from(child.id())
+        .ok()
+        .filter(|&p| p > 0)
+        .map(nix::unistd::Pid::from_raw)
+    {
+        let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+    }
+    let _ = child.wait();
+
+    assert!(
+        peer_seen,
+        "peer LOCK_SH on LLC 1 did not become visible within 30s"
+    );
+    let plan = plan
+        .expect("peer was visible, so acquire was attempted")
+        .expect("SH is reentrant — parent SH must coexist with child SH");
 
     // Consolidation picked LLC 1 (the one with a holder) over
     // LLC 0 (fresh). The `holder_count DESC` ordering in
@@ -816,9 +854,6 @@ fn acquire_llc_plan_consolidates_on_peer_held_llc() {
     );
 
     drop(plan);
-    // Child exits naturally after sleep 2; reap it so we don't
-    // leave zombies.
-    let _ = child.wait();
 }
 
 /// `discover_llc_snapshots` EXCLUDES the calling process from the
