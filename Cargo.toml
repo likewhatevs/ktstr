@@ -9,7 +9,7 @@ repository = "https://github.com/likewhatevs/ktstr"
 
 [package]
 name = "ktstr"
-version = "0.34.1"
+version = "0.35.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -154,7 +154,7 @@ virtio-queue = "0.17"
 vm-superio = "0.8.1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 linkme = "0.3"
-ktstr-macros = { version = "0.34.1", path = "ktstr-macros" }
+ktstr-macros = { version = "0.35.0", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
 # Memory-map /proc/self/exe in the coverage-instrumentation detection
 # probe (`is_coverage_instrumented_binary` / `find_symbol_vaddrs` in
@@ -436,7 +436,7 @@ cli-bins = [
 export = ["dep:base64"]
 # Embed the wprof BPF tracer for Perfetto-format profiling in VMs.
 # Default off: first build clones github.com/anakryiko/wprof and
-# compiles libbpf + blazesym (requires git, make, gcc, clang,
+# compiles libbpf + blazesym (requires git, make, gcc, clang, mold,
 # elfutils-devel, zlib-devel on the host; takes several minutes).
 wprof = ["ktstr-macros/wprof"]
 # Pretty thread-name labels in `ctprof_compare` output. Enables

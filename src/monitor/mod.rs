@@ -733,6 +733,13 @@ impl LifecycleStage {
 /// stale scalar only defers a kill).
 #[derive(Debug, Default)]
 pub(crate) struct ProgressLedger {
+    /// Seqlock guarding the dispatch-owned lifecycle transition payload
+    /// (`phase`, `phase_epoch`, and the progress wall anchor). Even values
+    /// are quiescent; odd values mean a transition is being published.
+    /// Stage changes are rare, so serializing their writers and making the
+    /// watchdog retry a concurrent read has negligible cost and prevents a
+    /// new stage from being paired with the previous stage's anchors.
+    phase_transition_seq: AtomicU32,
     /// Lifecycle stage id ([`LifecycleStage`]; 0 = `Boot`, the initial
     /// value). Written FORWARD-ONLY by the guest scenario-dispatch thread
     /// via [`ProgressLedger::advance_phase`]. Not written by the monitor.
@@ -758,6 +765,13 @@ pub(crate) struct ProgressLedger {
     /// the max tiny no matter how many vCPUs sum into `cpu_ns_now`. Relaxed
     /// — one-tick staleness only under-counts, deferring a kill.
     pub(crate) max_vcpu_cpu_in_phase_ns: AtomicU64,
+    /// The `phase_epoch` for which
+    /// [`Self::max_vcpu_cpu_in_phase_ns`] was computed. The monitor publishes
+    /// the CPU value before this Release store; the watchdog Acquire-loads
+    /// the tag and accepts the value only when it matches the current phase
+    /// epoch. This closes the transition window where dispatch has entered a
+    /// new stage but the 100 ms monitor has not yet re-anchored its tracker.
+    max_vcpu_cpu_phase_epoch: AtomicU32,
 
     /// Summed available per-vCPU CPU-time (ns) as of the latest monitor
     /// tick. Relaxed — a one-tick-stale total only under-counts consumed
@@ -864,6 +878,7 @@ impl ProgressLedger {
         &self,
         cpu_ns_now: u64,
         max_vcpu_cpu_in_phase_ns: u64,
+        max_vcpu_cpu_phase_epoch: u32,
         cpu_trickle_stalled: bool,
         busiest_vcpu_window_ns: u64,
         cpu_currency: u8,
@@ -873,6 +888,8 @@ impl ProgressLedger {
         self.cpu_ns_now.store(cpu_ns_now, Ordering::Relaxed);
         self.max_vcpu_cpu_in_phase_ns
             .store(max_vcpu_cpu_in_phase_ns, Ordering::Relaxed);
+        self.max_vcpu_cpu_phase_epoch
+            .store(max_vcpu_cpu_phase_epoch, Ordering::Release);
         self.cpu_trickle_stalled
             .store(cpu_trickle_stalled, Ordering::Relaxed);
         self.busiest_vcpu_window_ns
@@ -918,10 +935,33 @@ impl ProgressLedger {
     /// `wall_ns_at_progress` via `record_progress`. Returns `true` iff
     /// the stage actually advanced.
     pub(crate) fn advance_phase(&self, new_stage: u8, wall_ns: u64) -> bool {
+        // Serialize transition writers and mark the lifecycle payload
+        // unstable. Dispatch is normally single-threaded, but keeping the
+        // exclusion here makes the ledger's atomic contract self-contained.
+        let mut transition_seq = self.phase_transition_seq.load(Ordering::Acquire);
+        loop {
+            if transition_seq & 1 != 0 {
+                std::hint::spin_loop();
+                transition_seq = self.phase_transition_seq.load(Ordering::Acquire);
+                continue;
+            }
+            match self.phase_transition_seq.compare_exchange_weak(
+                transition_seq,
+                transition_seq.wrapping_add(1),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => transition_seq = observed,
+            }
+        }
+
         let mut cur = self.phase.load(Ordering::Relaxed);
         loop {
             // Forward-only: equal or lower is a no-op (never regress).
             if new_stage <= cur {
+                self.phase_transition_seq
+                    .store(transition_seq.wrapping_add(2), Ordering::Release);
                 return false;
             }
             match self.phase.compare_exchange_weak(
@@ -947,6 +987,8 @@ impl ProgressLedger {
         let cpu_ns_now = self.cpu_ns_now.load(Ordering::Relaxed);
         self.phase_epoch.fetch_add(1, Ordering::Release);
         self.record_progress(cpu_ns_now, wall_ns);
+        self.phase_transition_seq
+            .store(transition_seq.wrapping_add(2), Ordering::Release);
         true
     }
 
@@ -958,22 +1000,55 @@ impl ProgressLedger {
     /// (Release — see [`Self::record_progress`]), so an Acquire load
     /// observing a given epoch also observes its payload. The remaining
     /// fields are Relaxed (per the ledger's one-tick-staleness contract);
-    /// a torn combination only makes a kill decision MORE conservative.
+    /// a torn combination only makes a kill decision MORE conservative. A
+    /// lifecycle transition is the exception: `phase_transition_seq` makes
+    /// the read retry until stage + anchors are from one stable generation,
+    /// while the max-vCPU epoch tag suppresses Tier-1 until the monitor has
+    /// re-anchored and published evidence for that generation.
     pub(crate) fn snapshot(&self) -> LedgerSnapshot {
-        let progress_epoch = self.progress_epoch.load(Ordering::Acquire);
-        let wall_ns_at_progress = self.wall_ns_at_progress.load(Ordering::Relaxed);
-        LedgerSnapshot {
-            phase: self.phase.load(Ordering::Relaxed),
-            cpu_ns_now: self.cpu_ns_now.load(Ordering::Relaxed),
-            max_vcpu_cpu_in_phase_ns: self.max_vcpu_cpu_in_phase_ns.load(Ordering::Relaxed),
-            cpu_trickle_stalled: self.cpu_trickle_stalled.load(Ordering::Relaxed),
-            busiest_vcpu_window_ns: self.busiest_vcpu_window_ns.load(Ordering::Relaxed),
-            wall_ns_at_progress,
-            progress_epoch,
-            monitor_heartbeat: self.monitor_heartbeat.load(Ordering::Relaxed),
-            runnable_demand: self.runnable_demand.load(Ordering::Relaxed),
-            cpu_currency: self.cpu_currency.load(Ordering::Relaxed),
-            evidence_channels_live: self.evidence_channels_live.load(Ordering::Relaxed),
+        loop {
+            let transition_seq = self.phase_transition_seq.load(Ordering::Acquire);
+            if transition_seq & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+
+            let progress_epoch = self.progress_epoch.load(Ordering::Acquire);
+            let wall_ns_at_progress = self.wall_ns_at_progress.load(Ordering::Relaxed);
+            let phase = self.phase.load(Ordering::Relaxed);
+            let phase_epoch = self.phase_epoch.load(Ordering::Acquire);
+            // Load the Release-published tag before its Relaxed payload.
+            let max_vcpu_cpu_phase_epoch = self.max_vcpu_cpu_phase_epoch.load(Ordering::Acquire);
+            let max_vcpu_cpu_in_phase_ns = self.max_vcpu_cpu_in_phase_ns.load(Ordering::Relaxed);
+
+            let snapshot = LedgerSnapshot {
+                phase,
+                cpu_ns_now: self.cpu_ns_now.load(Ordering::Relaxed),
+                // A mismatched tag means this is the previous phase's CPU
+                // burn. Zero is the conservative Tier-1 sentinel until the
+                // next monitor tick re-anchors and publishes this epoch.
+                max_vcpu_cpu_in_phase_ns: if max_vcpu_cpu_phase_epoch == phase_epoch {
+                    max_vcpu_cpu_in_phase_ns
+                } else {
+                    0
+                },
+                cpu_trickle_stalled: self.cpu_trickle_stalled.load(Ordering::Relaxed),
+                busiest_vcpu_window_ns: self.busiest_vcpu_window_ns.load(Ordering::Relaxed),
+                wall_ns_at_progress,
+                progress_epoch,
+                monitor_heartbeat: self.monitor_heartbeat.load(Ordering::Relaxed),
+                runnable_demand: self.runnable_demand.load(Ordering::Relaxed),
+                cpu_currency: self.cpu_currency.load(Ordering::Relaxed),
+                evidence_channels_live: self.evidence_channels_live.load(Ordering::Relaxed),
+            };
+
+            // Full reader barrier: none of the payload loads above may move
+            // after the validation load below, or a transition could begin
+            // between them and still appear stable.
+            std::sync::atomic::fence(Ordering::SeqCst);
+            if self.phase_transition_seq.load(Ordering::Acquire) == transition_seq {
+                return snapshot;
+            }
         }
     }
 }
@@ -1045,7 +1120,7 @@ mod progress_ledger_tests {
         let l = ProgressLedger::default();
         assert!(!l.snapshot().evidence_channels_live, "default is false");
 
-        l.record_liveness(123, 45, true, 30, CPU_CURRENCY_PTHREAD, true, true);
+        l.record_liveness(123, 45, 0, true, 30, CPU_CURRENCY_PTHREAD, true, true);
         let s = l.snapshot();
         assert!(s.evidence_channels_live);
         assert_eq!(s.cpu_ns_now, 123);
@@ -1057,13 +1132,53 @@ mod progress_ledger_tests {
 
         // The trickle verdict and window tracks exactly what the monitor
         // last wrote (both can drop back on a later tick).
-        l.record_liveness(200, 0, false, 12, CPU_CURRENCY_PTHREAD, false, false);
+        l.record_liveness(200, 0, 0, false, 12, CPU_CURRENCY_PTHREAD, false, false);
         let s2 = l.snapshot();
         assert!(!s2.evidence_channels_live);
         assert_eq!(s2.cpu_ns_now, 200);
         assert_eq!(s2.max_vcpu_cpu_in_phase_ns, 0);
         assert!(!s2.cpu_trickle_stalled);
         assert_eq!(s2.busiest_vcpu_window_ns, 12);
+    }
+
+    #[test]
+    fn phase_advance_suppresses_stale_max_vcpu_cpu_until_monitor_reanchors() {
+        let l = ProgressLedger::default();
+        // Simulate the last Body-adjacent monitor tick carrying enough CPU
+        // burn to exceed Teardown's Tier-1 budget.
+        l.record_liveness(
+            20_000_000_000,
+            18_000_000_000,
+            0,
+            false,
+            0,
+            CPU_CURRENCY_PTHREAD,
+            true,
+            true,
+        );
+        assert_eq!(l.snapshot().max_vcpu_cpu_in_phase_ns, 18_000_000_000);
+
+        assert!(l.advance_phase(LifecycleStage::Teardown as u8, 123));
+        let after_advance = l.snapshot();
+        assert_eq!(after_advance.phase, LifecycleStage::Teardown as u8);
+        assert_eq!(
+            after_advance.max_vcpu_cpu_in_phase_ns, 0,
+            "the new phase must not inherit the previous phase's CPU burn"
+        );
+
+        // The next monitor tick observes epoch 1, re-anchors, and publishes
+        // current-generation evidence. It becomes eligible immediately.
+        l.record_liveness(
+            20_100_000_000,
+            42,
+            1,
+            false,
+            0,
+            CPU_CURRENCY_PTHREAD,
+            false,
+            true,
+        );
+        assert_eq!(l.snapshot().max_vcpu_cpu_in_phase_ns, 42);
     }
 
     #[test]

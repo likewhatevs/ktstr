@@ -4282,6 +4282,7 @@ pub(crate) fn monitor_loop(
             ledger.record_liveness(
                 cpu_ns_now,
                 max_vcpu_cpu_in_phase_ns,
+                phase_epoch,
                 cpu_trickle_stalled,
                 busiest_vcpu_window_ns,
                 cpu_currency,
