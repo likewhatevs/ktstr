@@ -1968,6 +1968,13 @@ pub(crate) struct RqRefresh {
     /// returns zero / fails the bit-63 check), the per-iteration
     /// code keeps using the pre-loop resolved `page_offset` value.
     pub page_offset_base_kva: Option<u64>,
+    /// Link-time KVA of arm64's `memstart_addr`. The architectural
+    /// `PAGE_OFFSET` maps this physical address, which KASLR may place below
+    /// the VMM's first RAM GPA. Re-read per tick until `data_valid` latches so
+    /// the direct-map base used with `GuestMem` heals if monitor construction
+    /// raced early boot; the semantic `rq.cpu` gate then proves and freezes
+    /// the value. `None` on x86_64.
+    pub memstart_addr_kva: Option<u64>,
     /// Optional refresh inputs for `event_pcpu_pas`. When `None`,
     /// the monitor leaves `event_pcpu_pas` at its initial value
     /// (typically `None` because `scx_root` was null at host
@@ -3255,6 +3262,20 @@ pub(crate) fn monitor_loop(
     // arguments — there is no boot race to gate against and the
     // walks must run from the first iteration.
     let mut data_valid: bool = rq_refresh.is_none();
+    // Keep the architectural PAGE_OFFSET separate from `page_offset`: on
+    // arm64 the latter is rebased by `DRAM_BASE - memstart_addr` for
+    // GuestMem. This value persists across ticks so one unstable
+    // `page_offset_base` read cannot revert a previously validated x86 base.
+    let mut architectural_page_offset = if rq_refresh.and_then(|r| r.memstart_addr_kva).is_some() {
+        super::symbols::default_page_offset_for_tcr(
+            rq_refresh
+                .and_then(|r| r.tcr_el1.as_ref())
+                .map(|c| c.load(Ordering::Acquire))
+                .unwrap_or(0),
+        )
+    } else {
+        page_offset
+    };
     // `page_offset` value captured at the instant `data_valid`
     // latched, forwarded onto `MonitorReport.page_offset` via
     // `MonitorLoopResult.page_offset`. Stays 0 when the latch
@@ -3514,6 +3535,7 @@ pub(crate) fn monitor_loop(
             }
         }
         let mut page_offset_resolved = false;
+        let mut memstart_observation: Option<(u64, u64, u64)> = None;
         if let Some(refresh) = rq_refresh {
             if let Some(pob_kva) = refresh.page_offset_base_kva {
                 // Recompute the read PA per tick from the live bases —
@@ -3530,14 +3552,41 @@ pub(crate) fn monitor_loop(
                 let pob_stable = prev_pob == val;
                 prev_pob = val;
                 if val & (1u64 << 63) != 0 && pob_aligned && pob_stable {
-                    page_offset = val;
+                    architectural_page_offset = val;
                     page_offset_resolved = true;
                 }
             } else {
                 // No symbol available (aarch64 / stripped vmlinux):
-                // pre-loop `page_offset` is the best we have. Treat
-                // the page-offset side as already resolved.
+                // derive PAGE_OFFSET from the live TCR_EL1. The BSP may
+                // populate the cached register after monitor construction,
+                // so update this architectural input per tick.
+                architectural_page_offset = super::symbols::default_page_offset_for_tcr(
+                    refresh
+                        .tcr_el1
+                        .as_ref()
+                        .map(|c| c.load(Ordering::Acquire))
+                        .unwrap_or(0),
+                );
                 page_offset_resolved = true;
+            }
+
+            if let Some(memstart_kva) = refresh.memstart_addr_kva
+                && !data_valid
+            {
+                let memstart_pa = super::symbols::text_kva_to_pa_with_base(
+                    memstart_kva,
+                    iter_start_kernel_map,
+                    phys_base,
+                );
+                let memstart_addr = mem.read_u64(memstart_pa, 0);
+                memstart_observation = Some((memstart_kva, memstart_pa, memstart_addr));
+                page_offset = super::symbols::direct_map_base_for_guest_mem(
+                    architectural_page_offset,
+                    memstart_addr,
+                    crate::vmm::DRAM_BASE,
+                );
+            } else if refresh.memstart_addr_kva.is_none() {
+                page_offset = architectural_page_offset;
             }
         }
         // Scheduler-attach watchdog reset. Read `*scx_root` and,
@@ -3853,6 +3902,15 @@ pub(crate) fn monitor_loop(
                     let bit63_set = fresh.iter().filter(|&&v| v & (1u64 << 63) != 0).count();
                     let nonzero = fresh.iter().filter(|&&v| v != 0).count();
                     let stable = per_cpu_offsets_buf == fresh;
+                    let rq_cpu_match = rq_cpu_fields_match(mem, &rq_pas_buf, offsets.rq_cpu);
+                    let first_rq_pa = rq_pas_buf.first().copied().unwrap_or(u64::MAX);
+                    let first_rq_cpu = if first_rq_pa == u64::MAX {
+                        u32::MAX
+                    } else {
+                        mem.read_u32(first_rq_pa, offsets.rq_cpu)
+                    };
+                    let (memstart_kva, memstart_pa, memstart_addr) =
+                        memstart_observation.unwrap_or((0, 0, 0));
                     // KERN_ADDRS observability: how many frames the coord
                     // dispatcher has seen (and how many failed CRC). frames=0
                     // with kaslr_raw=0 → the guest never sent (or the coord
@@ -3894,19 +3952,25 @@ pub(crate) fn monitor_loop(
                          the progress watchdog will fall back to the Tier-3 deadman.\n  \
                          data_valid requires page_offset_resolved && kaslr_raw!=0 && a \
                          non-empty __per_cpu_offset[] table, all slots nonzero \
-                         (x86_64: also bit-63) and stable across two reads:\n  \
+                         (x86_64: also bit-63) and stable across two reads, plus \
+                         rq[i].cpu == i for every candidate rq PA:\n  \
                          page_offset_resolved={page_offset_resolved} kaslr_raw={kaslr_raw:#x} \
                          num_cpus={num_cpus} pco_slots={pco_slots} nonzero={nonzero} \
-                         stable={stable} bit63_set={bit63_set}\n  \
+                         stable={stable} bit63_set={bit63_set} rq_cpu_match={rq_cpu_match}\n  \
                          kern_addrs_frames={ka_frames} kern_addrs_crc_bad={ka_crc_bad}\n  \
                          first_pco={first_pco:#x} pco_pa={pco_pa:#x} \
                          pco_start_kernel_map={pco_start_kernel_map:#x}\n  \
+                         memstart_kva={memstart_kva:#x} memstart_pa={memstart_pa:#x} \
+                         memstart_addr={memstart_addr:#x}\n  \
+                         first_rq_pa={first_rq_pa:#x} first_rq_cpu={first_rq_cpu} \
+                         rq_cpu_offset={rq_cpu_offset:#x}\n  \
                          per_cpu_offset_kva={per_cpu_offset_kva:#x} \
                          runqueues_kva={runqueues_kva:#x} page_offset={page_offset:#x} \
                          phys_base={phys_base:#x} phys_base_source={phys_base_src}",
                         num_cpus = refresh.num_cpus,
                         pco_slots = fresh.len(),
                         first_pco = fresh.first().copied().unwrap_or(0),
+                        rq_cpu_offset = offsets.rq_cpu,
                         per_cpu_offset_kva = refresh.per_cpu_offset_kva,
                         runqueues_kva = refresh.runqueues_kva,
                     );
@@ -5388,6 +5452,7 @@ mod tests {
             runqueues_kva: 0,
             num_cpus: 2,
             page_offset_base_kva: None,
+            memstart_addr_kva: None,
             kern_phys_base: None,
             phys_base_guest_published: false,
             kern_addrs_frames: None,
@@ -5499,6 +5564,7 @@ mod tests {
             runqueues_kva: 0,
             num_cpus: 2,
             page_offset_base_kva: None,
+            memstart_addr_kva: None,
             kern_phys_base: None,
             phys_base_guest_published: false,
             kern_addrs_frames: None,
@@ -5597,6 +5663,7 @@ mod tests {
             runqueues_kva: 0,
             num_cpus: 1,
             page_offset_base_kva: None,
+            memstart_addr_kva: None,
             kern_phys_base: Some(phys_base_arc.clone()),
             phys_base_guest_published: false,
             kern_addrs_frames: None,
@@ -5724,6 +5791,7 @@ mod tests {
             runqueues_kva: KERNEL_HALF, // high-half → per_cpu_kva applies the slide
             num_cpus: 2,
             page_offset_base_kva: None,
+            memstart_addr_kva: None,
             kern_phys_base: None,
             phys_base_guest_published: false,
             kern_addrs_frames: None,
@@ -5824,6 +5892,7 @@ mod tests {
             runqueues_kva: 0,
             num_cpus: 2,
             page_offset_base_kva: None,
+            memstart_addr_kva: None,
             kern_phys_base: None,
             phys_base_guest_published: false,
             kern_addrs_frames: None,
@@ -8646,6 +8715,7 @@ mod tests {
             runqueues_kva: 0,
             num_cpus: 1,
             page_offset_base_kva: None,
+            memstart_addr_kva: None,
             kern_phys_base: None,
             phys_base_guest_published: false,
             kern_addrs_frames: None,

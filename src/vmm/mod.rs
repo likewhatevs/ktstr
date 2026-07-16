@@ -246,10 +246,10 @@ use std::time::{Duration, Instant};
 /// x86_64: PA 0 (sub-1MB legacy regions share the same PA space).
 /// aarch64: device MMIO below DRAM_START, RAM above.
 #[cfg(target_arch = "x86_64")]
-const DRAM_BASE: u64 = 0;
+pub(crate) const DRAM_BASE: u64 = 0;
 
 #[cfg(target_arch = "aarch64")]
-const DRAM_BASE: u64 = kvm::DRAM_START;
+pub(crate) const DRAM_BASE: u64 = kvm::DRAM_START;
 
 // ---------------------------------------------------------------------------
 // KtstrVm — builder + run

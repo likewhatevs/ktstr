@@ -226,7 +226,7 @@ fn parse_vmlinux_artifacts(data: &[u8], path: &Path) -> Option<VmlinuxArtifacts>
 /// mtime freshness rule covers vmlinux changes; only ktstr-version
 /// layout drift needs this tag.)
 const ARTIFACTS_SIDECAR_VERSION: &str =
-    concat!("ktstr-vmlinux-artifacts-v2 ", env!("CARGO_PKG_VERSION"));
+    concat!("ktstr-vmlinux-artifacts-v3 ", env!("CARGO_PKG_VERSION"));
 
 /// Plain-old-data mirror of the derived half of [`VmlinuxArtifacts`],
 /// serialized to the `<vmlinux>.artifacts` sidecar via postcard.
@@ -738,6 +738,7 @@ mod tests {
             runqueues: 0x1000,
             per_cpu_offset: 0x2000,
             page_offset_base_kva: Some(0x3000),
+            memstart_addr_kva: None,
             phys_base_kva: None,
             scx_root: Some(0x4000),
             scx_tasks: None,

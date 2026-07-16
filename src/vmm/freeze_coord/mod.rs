@@ -14423,6 +14423,7 @@ impl KtstrVm {
                     kaslr_offset: kern_virt_kaslr_shared.clone(),
                     num_cpus,
                     page_offset_base_kva: symbols.page_offset_base_kva,
+                    memstart_addr_kva: symbols.memstart_addr_kva,
                     event: event_refresh,
                 };
 

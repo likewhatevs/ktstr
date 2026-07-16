@@ -270,6 +270,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: None,
+            memstart_addr_kva: None,
             phys_base_kva: None,
             scx_root,
             scx_tasks,

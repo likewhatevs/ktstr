@@ -169,6 +169,15 @@ pub(crate) struct KernelSymbols {
     /// The runtime value must be read from guest memory via
     /// `resolve_page_offset`.
     pub page_offset_base_kva: Option<u64>,
+    /// Kernel virtual address of arm64's `memstart_addr` (`s64`).
+    ///
+    /// `PAGE_OFFSET` maps `memstart_addr`, not necessarily the VMM's first
+    /// RAM GPA. arm64 KASLR may move `memstart_addr` below `DRAM_START`, so
+    /// direct-map KVAs must be rebased before they can index
+    /// [`super::reader::GuestMem`],
+    /// whose offset zero is the VMM's [`crate::vmm::DRAM_BASE`]. Absent on
+    /// x86_64.
+    pub memstart_addr_kva: Option<u64>,
     /// Kernel virtual address of `phys_base`
     /// (`arch/x86/kernel/head_64.S`). Holds the runtime physical
     /// address offset between the kernel image's compile-time
@@ -416,6 +425,7 @@ impl KernelSymbols {
             .context("symbol '__per_cpu_offset' not found in vmlinux")?;
 
         let page_offset_base_kva = sym_addr("page_offset_base");
+        let memstart_addr_kva = sym_addr("memstart_addr");
         // x86_64-only KASLR randomization base; absent on aarch64
         // kernels (their kimage_voffset analogue is derived from
         // `start_kernel_map_for_tcr`, not a static symbol).
@@ -506,6 +516,7 @@ impl KernelSymbols {
             runqueues,
             per_cpu_offset,
             page_offset_base_kva,
+            memstart_addr_kva,
             phys_base_kva,
             scx_root,
             scx_tasks,
@@ -577,20 +588,52 @@ pub(crate) fn resolve_page_offset_with_tcr(
     tcr_el1: u64,
     phys_base: u64,
 ) -> u64 {
-    let Some(pob_kva) = symbols.page_offset_base_kva else {
-        return default_page_offset_for_tcr(tcr_el1);
-    };
-    let pob_pa = text_kva_to_pa_with_base(pob_kva, start_kernel_map, phys_base);
-    let val = mem.read_u64(pob_pa, 0);
-    // Valid PAGE_OFFSET has bit 63 set (upper-half virtual address).
-    // Kernels with CONFIG_RANDOMIZE_MEMORY use values like
-    // 0xff11000000000000 that are below the traditional canonical
-    // boundary (0xffff800000000000), so check bit 63 instead.
-    if val & (1u64 << 63) != 0 {
-        val
+    let architectural_page_offset = if let Some(pob_kva) = symbols.page_offset_base_kva {
+        let pob_pa = text_kva_to_pa_with_base(pob_kva, start_kernel_map, phys_base);
+        let val = mem.read_u64(pob_pa, 0);
+        // Valid PAGE_OFFSET has bit 63 set (upper-half virtual address).
+        // Kernels with CONFIG_RANDOMIZE_MEMORY use values like
+        // 0xff11000000000000 that are below the traditional canonical
+        // boundary (0xffff800000000000), so check bit 63 instead.
+        if val & (1u64 << 63) != 0 {
+            val
+        } else {
+            default_page_offset_for_tcr(tcr_el1)
+        }
     } else {
         default_page_offset_for_tcr(tcr_el1)
+    };
+
+    #[cfg(target_arch = "aarch64")]
+    if let Some(memstart_kva) = symbols.memstart_addr_kva {
+        let memstart_pa = text_kva_to_pa_with_base(memstart_kva, start_kernel_map, phys_base);
+        let memstart_addr = mem.read_u64(memstart_pa, 0);
+        return direct_map_base_for_guest_mem(
+            architectural_page_offset,
+            memstart_addr,
+            crate::vmm::DRAM_BASE,
+        );
     }
+
+    architectural_page_offset
+}
+
+/// Rebase the architectural direct-map base to
+/// [`super::reader::GuestMem`]'s offset zero.
+///
+/// arm64 defines `virt = PAGE_OFFSET | (phys - memstart_addr)`, while ktstr's
+/// `GuestMem` addresses RAM as `phys - guest_ram_base`. arm64's
+/// `__phys_to_virt` uses bitwise OR—not addition—because `memstart_addr` is an
+/// `s64` and a negative value leaves high bits set in the wrapped displacement.
+/// Therefore the base to subtract from a direct-map KVA is
+/// `PAGE_OFFSET | (guest_ram_base - memstart_addr)`.
+#[inline]
+pub(crate) fn direct_map_base_for_guest_mem(
+    page_offset: u64,
+    memstart_addr: u64,
+    guest_ram_base: u64,
+) -> u64 {
+    page_offset | guest_ram_base.wrapping_sub(memstart_addr)
 }
 
 /// Resolve the kernel's runtime `phys_base` value via a page-table
@@ -714,13 +757,12 @@ pub(crate) fn resolve_pgtable_l5(
 /// Translate a kernel virtual address in the direct mapping
 /// (PAGE_OFFSET region) to a DRAM-relative offset for GuestMem.
 ///
-/// On both x86_64 and aarch64, the direct mapping maps DRAM offset 0
-/// at PAGE_OFFSET: `kva = page_offset + dram_offset`. On aarch64 the
-/// kernel's `__phys_to_virt(gpa)` is `(gpa - PHYS_OFFSET) | PAGE_OFFSET`,
-/// and `PHYS_OFFSET = memstart_addr = DRAM_START`, so
-/// `kva = dram_offset | PAGE_OFFSET = PAGE_OFFSET + dram_offset`
-/// (the `|` is equivalent to `+` since the operands don't overlap).
-/// Subtracting PAGE_OFFSET recovers the DRAM offset directly.
+/// `page_offset` here means the direct-map base corresponding to
+/// `GuestMem` offset zero. On x86_64 that is the kernel's PAGE_OFFSET.
+/// On arm64 [`resolve_page_offset_with_tcr`] rebases the architectural
+/// PAGE_OFFSET by `DRAM_BASE - memstart_addr`, because arm64 KASLR may
+/// randomize `memstart_addr` below the VMM's first RAM GPA. Subtracting
+/// this effective base recovers the DRAM-relative offset on both arches.
 pub(crate) fn kva_to_pa(kva: u64, page_offset: u64) -> u64 {
     kva.wrapping_sub(page_offset)
 }
@@ -1142,6 +1184,36 @@ pub(crate) fn compute_rq_pas(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arm64_direct_map_base_rebases_randomized_memstart_to_guest_offsets() {
+        let page_offset = 0xffff_0000_0000_0000u64;
+        let guest_ram_base = 0x4000_0000u64;
+        // arm64 stores memstart_addr as s64; a KASLR draw below zero is
+        // observed here through its u64 two's-complement representation.
+        let memstart_addr = 0xffff_8a7c_4000_0000u64;
+        let guest_offset = 0x1234_5000u64;
+        let phys = guest_ram_base + guest_offset;
+        let direct_kva = page_offset | phys.wrapping_sub(memstart_addr);
+
+        let base = direct_map_base_for_guest_mem(page_offset, memstart_addr, guest_ram_base);
+        assert_eq!(direct_kva.wrapping_sub(base), guest_offset);
+        assert_eq!(
+            direct_map_base_for_guest_mem(page_offset, guest_ram_base, guest_ram_base),
+            page_offset,
+            "without a memstart displacement, the historical base is unchanged",
+        );
+
+        // Real armly/6.14 witness. Addition produced the low base
+        // 0x000e72e600000000 and a nonsensical 0xfff1... PA; mirroring the
+        // kernel's OR lands the first rq inside the 2 GiB guest.
+        let observed_memstart = 0xfff0_8d1a_4000_0000u64;
+        let observed_rq_kva = 0xffff_72e6_7beb_de40u64;
+        let observed_base =
+            direct_map_base_for_guest_mem(page_offset, observed_memstart, guest_ram_base);
+        assert_eq!(observed_base, 0xffff_72e6_0000_0000);
+        assert_eq!(observed_rq_kva.wrapping_sub(observed_base), 0x7beb_de40);
+    }
 
     #[test]
     fn plausible_cr3_phys_base_accepts_valid_rejects_garbage() {
@@ -1709,6 +1781,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
+            memstart_addr_kva: None,
             phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
@@ -1747,6 +1820,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: None,
+            memstart_addr_kva: None,
             phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
@@ -1787,6 +1861,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
+            memstart_addr_kva: None,
             phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
@@ -1830,6 +1905,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
+            memstart_addr_kva: None,
             phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
@@ -1876,6 +1952,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
+            memstart_addr_kva: None,
             phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
@@ -1918,6 +1995,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: None,
+            memstart_addr_kva: None,
             phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
@@ -1957,6 +2035,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: None,
+            memstart_addr_kva: None,
             phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
@@ -1992,6 +2071,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: None,
+            memstart_addr_kva: None,
             phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
