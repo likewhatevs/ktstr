@@ -1733,10 +1733,9 @@ impl Drop for PartialApSpawnGuard {
 /// `Some((0, 0))` — the caller's on-cpu==0 folds that into a `None`
 /// dilation, keeping "schedstats unavailable" distinct from a real 1.0.
 ///
-/// `pub(crate)`: shared with the monitor loop's per-tick per-phase
-/// contention witness ([`crate::monitor::reader`]), which reads the same
-/// schedstat file every tick to attribute host run-delay to lifecycle
-/// phases — one parser, one format contract.
+/// `pub(crate)`: shared by the lifecycle-boundary contention witness and the
+/// final whole-run snapshot. The monitor's periodic hot path does not read
+/// schedstat.
 pub(crate) fn parse_schedstat_line(line: &str) -> Option<(u64, u64)> {
     let mut it = line.split_whitespace();
     let on_cpu = it.next()?.parse::<u64>().ok()?;
@@ -3318,10 +3317,11 @@ impl KtstrVm {
             .unwrap_or(0);
         let accessor_ready_evt = Arc::new(EventFd::new(0).expect("eventfd for accessor_ready"));
 
-        // TID handles for the monitor's per-phase schedstat witness — one
-        // per `vcpu_tid_slots` entry (index 0 BSP, 1.. APs), read live each
-        // tick. Cloned (not moved) so the teardown whole-run schedstat read
-        // still has `vcpu_tid_slots`.
+        // TID handles for the per-phase contention witness — one per
+        // `vcpu_tid_slots` entry (index 0 BSP, 1.. APs). The recorder reads
+        // them only at lifecycle boundaries and finalization; monitor ticks
+        // perform a single O(1) CPU-pressure read. Cloned (not moved) so the
+        // teardown whole-run schedstat read still has `vcpu_tid_slots`.
         let vcpu_tid_atomics: Vec<Arc<AtomicI32>> = vcpu_tid_slots
             .iter()
             .map(|(slot, _)| slot.clone())
@@ -15791,9 +15791,8 @@ impl KtstrVm {
         // derived on demand from these entries via
         // `VmResult::stimulus_timeline()` — no separate pre-extracted
         // stimulus vec is stored, so every consumer sees the same
-        // complete timeline (the previous wire-only field omitted the
-        // terminal and silently dropped the last step's iteration_rate
-        // for post_vm re-derivation).
+        // complete boundary telemetry (the previous wire-only field omitted
+        // the terminal from post_vm reconstruction).
         let guest_messages =
             if !mid_flight_drain.entries.is_empty() || !bulk_drain.entries.is_empty() {
                 let mut all_entries = mid_flight_drain.entries;

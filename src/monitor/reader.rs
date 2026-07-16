@@ -4378,8 +4378,8 @@ pub(crate) fn monitor_loop(
             // idle wedges by the Tier-2 trickle-stall test.
 
             // Constant-cost Body contention series. The shared recorder reads
-            // one system CPU-PSI cumulative counter here; O(vCPU) schedstat
-            // sweeps are driven only by lifecycle transition events.
+            // one runner-cgroup CPU-PSI cumulative counter here; O(vCPU)
+            // schedstat sweeps are driven only by lifecycle transition events.
             if let Some(recorder) = vcpu_timing.and_then(|vt| vt.contention_recorder.as_ref()) {
                 recorder.sample_pressure();
             }

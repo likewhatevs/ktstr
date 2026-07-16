@@ -322,11 +322,11 @@ fn sidecar_result_roundtrip() {
             stuck_count: 0,
             event_deltas: Some(crate::monitor::ScxEventDeltas {
                 total_fallback: 7,
-                fallback_rate: 0.5,
+                fallback_rate: Some(0.5),
                 max_fallback_burst: 2,
                 total_dispatch_offline: 0,
                 total_dispatch_keep_last: 3,
-                keep_last_rate: 0.2,
+                keep_last_rate: Some(0.2),
                 total_enq_skip_exiting: 0,
                 total_enq_skip_migration_disabled: 0,
                 ..Default::default()
@@ -593,11 +593,11 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
             }],
             total_workers: 3,
             // ext_metrics carries the derived Rates + their Counter components
-            // (e.g. the pooled iterations_per_cpu_sec re-pool); it is the
+            // (e.g. the pooled iteration_rate re-pool); it is the
             // durable surface every cross-run compare reads, so it MUST survive
             // sidecar serialize -> deserialize.
             ext_metrics: std::collections::BTreeMap::from([
-                ("iterations_per_cpu_sec".to_string(), 101.0),
+                ("iteration_rate".to_string(), 101.0),
                 ("total_iterations_pooled".to_string(), 1010.0),
                 ("total_cpu_time_sec".to_string(), 10.0),
             ]),
@@ -683,15 +683,11 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
     assert_eq!(loaded.stats.total_workers, 3);
     assert_eq!(loaded.stats.cgroups.len(), 1);
     assert_eq!(loaded.stats.cgroups[0].num_workers, 3);
-    // ext_metrics (the pooled iterations_per_cpu_sec Rate + its Counter
+    // ext_metrics (the pooled iteration_rate + its Counter
     // components) must round-trip — the sidecar is the durable surface every
     // cross-run `perf-delta` reads.
     assert_eq!(
-        loaded
-            .stats
-            .ext_metrics
-            .get("iterations_per_cpu_sec")
-            .copied(),
+        loaded.stats.ext_metrics.get("iteration_rate").copied(),
         Some(101.0),
         "pooled rate must survive sidecar serialization",
     );

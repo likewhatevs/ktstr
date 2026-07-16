@@ -43,7 +43,7 @@ runs the opted-in checks against them:
   `max_wake_latency_cv` bound wake-to-run latency for work types
   that block and measure it (see [Work Types](work-types.md) for
   which do); `min_iteration_rate` floors outer-loop iterations per
-  second per worker.
+  delivered CPU-second per worker.
 
 ## The loop, end to end
 
@@ -79,7 +79,7 @@ fn throughput_gate(ctx: &Ctx) -> Result<AssertResult> {
 --- monitor ---
 samples=41 max_imbalance=2.00 max_dsq_depth=0 stuck=0
 avg: imbalance=1.32 nr_running/cpu=1.2 dsq/cpu=0.0
-events: fallback=0 (0.0/s) keep_last=210 (52.5/s) offline=0
+events: fallback=0 (0.0/vcpu-s) keep_last=210 (52.5/vcpu-s) offline=0
 ...
 <span class="t-grn">verdict: monitor OK</span></pre></div>
 
@@ -118,8 +118,8 @@ The defaults `with_monitor_defaults()` applies:
 | `max_local_dsq_depth` | 50 | Per-CPU dispatch queue overflow. Sustained depth above this means the scheduler is not consuming dispatched tasks. |
 | `fail_on_rq_clock_stuck` | true | Fail when `rq_clock` does not advance on a CPU with runnable tasks. Idle CPUs (NOHZ) and preempted vCPUs are exempt. |
 | `sustained_samples` | 5 | At ~100ms sample interval, requires ~500ms of sustained violation. Filters transient spikes from cpuset reconfiguration. |
-| `max_fallback_rate` | 200.0/s | `select_cpu_fallback` events per second across all CPUs. Sustained rate indicates systematic `select_cpu` failure. |
-| `max_keep_last_rate` | 100.0/s | `dispatch_keep_last` events per second across all CPUs. Sustained rate indicates the scheduler keeps reusing the previous dispatch target instead of making progress through the normal path. |
+| `max_fallback_rate` | 200.0/vCPU-s | `select_cpu_fallback` events across all CPUs per delivered average-vCPU CPU-second. Sustained activity indicates systematic `select_cpu` failure. |
+| `max_keep_last_rate` | 100.0/vCPU-s | `dispatch_keep_last` events across all CPUs per delivered average-vCPU CPU-second. Sustained activity indicates the scheduler keeps reusing the previous dispatch target instead of making progress through the normal path. |
 
 Every monitor threshold uses the `sustained_samples` window — a
 violation must persist for N consecutive samples before it counts.
@@ -360,7 +360,7 @@ accounts for their host contention.
   // wakeup latency is lower-better; 60 vs 50 fails, correctly
   v.claim_better(BuiltinMetric::WakeupP99LatencyUs, cand).than(base);
   // require a 10% margin, not just any improvement
-  v.claim_better(BuiltinMetric::TaobenchTotalQps, cand).than_by(base, 0.10);
+  v.claim_better(BuiltinMetric::TaobenchTotalOpsPerCpuSec, cand).than_by(base, 0.10);
   ```
 
   An unregistered metric yields Inconclusive, never a silent pass.

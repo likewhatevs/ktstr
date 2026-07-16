@@ -471,7 +471,7 @@ impl crate::test_support::KtstrTestEntry {
                 );
             }
             // A render-suppressed rate COMPONENT (the internal numerator/
-            // denominator of a derived rate — e.g. total_phase_iterations)
+            // denominator of a derived rate — e.g. total_cpu_time_sec)
             // keeps its registry slot for the cross-run re-pool but is never
             // emitted as a compare finding, so a gate on it can NEVER fire: a
             // guaranteed-dead gate that would pass this check on name alone.

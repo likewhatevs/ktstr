@@ -250,9 +250,8 @@ impl ScenarioStats {
     /// distributions and worst-cgroup iteration efficiencies
     /// (the `MetricKind::Distribution` / `MetricKind::WorstLowest`
     /// registry kinds — `worst_p99_wake_latency_us`, `worst_run_delay_us`,
-    /// `worst_iterations_per_cpu_sec`, …), the derived rates
-    /// (`iteration_rate`, and the pooled `iterations_per_cpu_sec` —
-    /// distinct from the `worst_iterations_per_cpu_sec` selector above),
+    /// `worst_iterations_per_cpu_sec`, …), the canonical pooled
+    /// `iteration_rate`,
     /// the per-thread-group `system_time_ns` / `user_time_ns`, and
     /// `avg_imbalance_ratio` / `avg_dsq_depth`. This is the
     /// run-level analogue of [`Self::phase_metric`] for that family:
@@ -283,10 +282,9 @@ impl ScenarioStats {
     /// key to tell an unregistered key from genuinely-absent data (built-in
     /// ids always resolve). (The map also carries any
     /// user-defined extensible-metric keys, plus the framework-internal
-    /// Rate-component Counters — `total_phase_iterations` /
-    /// `total_phase_duration_sec` / `total_iterations_pooled` /
+    /// Rate-component Counters — `total_iterations_pooled` /
     /// `total_cpu_time_sec`, the numerator/denominator plumbing behind
-    /// `iteration_rate` / `iterations_per_cpu_sec` — all of which resolve
+    /// `iteration_rate` — both of which resolve
     /// here too; prefer the derived rate over its raw components.)
     ///
     /// RESOLVED here None-aware, ahead of the ext lookup, via a typed dispatch
@@ -528,8 +526,8 @@ const TYPED_FIELD_NAMES: &[&str] = &[
 /// `PhaseBucket.metrics` but never reach `ext_metrics` via the
 /// SampleSeries path (their `read_sample` returns `None`):
 /// `avg_imbalance_ratio` (sourced from MonitorSample windowing
-/// inside [`build_phase_buckets`]), `iteration_rate` (sourced from
-/// stimulus event totals inside [`build_phase_buckets_with_stimulus`]),
+/// inside [`build_phase_buckets`]), `iteration_rate` (sourced from matching
+/// guest per-cgroup iteration and CPU-time carriers),
 /// and `system_time_ns` / `user_time_ns` (per-thread-group CPU-time
 /// deltas injected by `phase_group_cpu_delta` inside
 /// `buckets_from_grouped`). The fold is generic over every key
@@ -625,18 +623,16 @@ pub fn populate_run_ext_metrics_from_phases(
         // A phase that doesn't carry the key contributes nothing.
         // Lock-step shape enforced by the (f64, usize) pair type.
         // `sample_count.max(1)` is load-bearing for Gauge(Avg) keys: a
-        // synthesized zero-capture phase (the
-        // build_phase_buckets_with_stimulus seam) carrying a
+        // synthesized zero-capture phase carrying a
         // capture-independent Gauge(Avg) value at sample_count==0 gets
         // weight 1 (one phase observation) rather than being zero-weighted
         // out of the run-level mean. The floor is a no-op for
         // Counter/DeltaSum keys, which sum with weights ignored (see
-        // aggregate_finite): iteration_rate's components
-        // total_phase_iterations / total_phase_duration_sec are such
-        // Counters, so a synthesized step's iterations are INCLUDED in the
-        // re-pooled iteration_rate via the sum — the run-aggregate
-        // completion of the per-step rate handling (iteration_rate itself is a
-        // Rate, skipped above and re-derived below). A regression dropping
+        // aggregate_finite): iteration_rate's guest-carrier components
+        // total_iterations_pooled / total_cpu_time_sec are such Counters, so
+        // a zero-capture step's work is INCLUDED in the re-pooled rate
+        // (iteration_rate itself is a Rate, skipped above and re-derived
+        // below). A regression dropping
         // the floor would silently re-drop a zero-capture step's Gauge(Avg)
         // value from the sidecar aggregate.
         let pairs: Vec<(f64, usize)> = phases
@@ -680,54 +676,51 @@ pub fn populate_run_ext_metrics_from_phases(
 /// [`crate::vmm::VmResult::run_metric`], so the two produce byte-identical
 /// run-level ext maps for the same run. Reads `samples` + `stats.phases` +
 /// `stats.cgroups`, writes `stats.ext_metrics`, in the canonical order:
-/// 1. [`populate_run_ext_metrics`] — the `read_sample`-wired registry family
+/// 1. `derive_phase_metrics` — derive per-cgroup and pooled phase scalars,
+///    including the CPU-denominated `iteration_rate` components.
+/// 2. [`populate_run_ext_metrics`] — the `read_sample`-wired registry family
 ///    (over every freeze in `samples`), then the whole-run wall + IRQ rates.
-/// 2. [`populate_run_ext_metrics_from_phases`] — the phase-only ext metrics
+/// 3. [`populate_run_ext_metrics_from_phases`] — the phase-only ext metrics
 ///    whose `read_sample` is `None` (`avg_imbalance_ratio`, `iteration_rate`,
 ///    `system_time_ns`, `user_time_ns`, the per-CPU IRQ spatial maxes, and the
 ///    per-cgroup PSI-irq spatial maxes).
-/// 3. [`populate_run_pooled_iterations_per_cpu_sec`] — the pooled cross-cgroup
-///    `iterations_per_cpu_sec` Rate (from `stats.cgroups`).
-/// 4. [`populate_run_pooled_taobench`] — the whole-run taobench qps + hit Rates
+/// 4. [`populate_run_pooled_iteration_rate`] — add any whole-run
+///    cgroup carriers to the canonical `iteration_rate` pool.
+/// 5. [`populate_run_pooled_taobench`] — the whole-run taobench throughput + hit Rates
 ///    pooled cross-cgroup (from `stats.cgroups[].taobench_whole`).
-/// 5. [`populate_run_pooled_taobench_distribution`] — the taobench whole-run
+/// 6. [`populate_run_pooled_taobench_distribution`] — the taobench whole-run
 ///    open-loop serve-latency `*_whole` percentiles (union of the per-phase
 ///    per-cgroup serve `PlatStats` histograms, percentile re-derived over the union).
-/// 6. [`populate_run_pooled_schbench`] — the schbench whole-run loop Counter +
+/// 7. [`populate_run_pooled_schbench`] — the schbench whole-run loop Counter +
 ///    role-separate run-delay gate-Rates (from
 ///    `stats.phases[].per_cgroup[].schbench` raw pairs, summed over phases+cgroups).
-/// 7. [`populate_run_pooled_schbench_distribution`] — the schbench whole-run
+/// 8. [`populate_run_pooled_schbench_distribution`] — the schbench whole-run
 ///    latency/rps `*_whole` percentiles (union of the per-phase per-cgroup
 ///    `PlatStats` histograms, percentile re-derived over the union).
-/// 8. [`populate_run_distribution_metrics`] — the `Distribution` / `WorstLowest`
+/// 9. [`populate_run_distribution_metrics`] — the `Distribution` / `WorstLowest`
 ///    / `WakeLatencyTailRatio` / `WorstCrossNodeRatio` re-pools (from
 ///    `stats.phases[].per_cgroup` raw samples + `stats.cgroups`).
 ///
-/// ORDER IS LOAD-BEARING: step 1 must precede step 2 so the whole-run wall +
-/// whole-run IRQ-counter deltas land before step 2's `contains_key` skip (the
-/// multi-phase-rate fix); steps 3-8 fold the per-cgroup roll-up after the
+/// ORDER IS LOAD-BEARING: step 1 must precede step 3 so the canonical
+/// CPU-denominated phase rate exists before the run fold. Step 2 must also
+/// precede step 3 so whole-run IRQ-counter deltas land before step 3's
+/// `contains_key` skip; steps 4-9 fold the per-cgroup roll-up after the
 /// per-phase families.
 ///
-/// `stats.phases` SHOULD be the PRE-`derive_phase_metrics` fold (the host buckets
-/// with the guest per-cgroup carriers folded in, before the per-phase scalar
-/// derivation) — the exact phase shape the eval layer feeds to step 2, since the
-/// eval path runs `derive_phase_metrics` AFTER this call. Feeding the pre-derive
-/// fold reproduces the eval sequence by construction (eval-faithful). Post-derive
-/// phases (e.g. [`crate::vmm::VmResult::phase_buckets`]) yield the SAME map today —
-/// step 2 skips `is_derived` keys, and every pooled scalar `derive_phase_metrics`
-/// writes to `bucket.metrics` (the schbench / taobench scalars) is
-/// `MetricKind::PerPhase` (which `is_derived`), so step 2 drops them either way —
-/// but the pre-derive fold avoids DEPENDING on that skip: a pooled key ever
-/// registered as non-derived would be folded run-level under post-derive,
-/// diverging from the eval map, but not under pre-derive. Pass the pre-derive
-/// fold ([`crate::vmm::VmResult::run_metric`] uses `phase_buckets_pre_derive`).
+/// `stats.phases` may be pre- or post-derived. Step 1 is idempotent and
+/// deliberately owns this derivation so callers cannot accidentally omit the
+/// guest CPU-time components required by `iteration_rate`.
 pub fn populate_run_ext_all(
     stats: &mut ScenarioStats,
     samples: &crate::scenario::sample::SampleSeries,
 ) {
+    // CPU-denominated phase rates require the guest per-cgroup carriers. Derive
+    // them before the phase fold so both the per-phase and run-level views use
+    // the same delivered-CPU currency.
+    derive_phase_metrics(&mut stats.phases);
     populate_run_ext_metrics(samples, &mut stats.ext_metrics);
     populate_run_ext_metrics_from_phases(&stats.phases, &mut stats.ext_metrics);
-    populate_run_pooled_iterations_per_cpu_sec(stats);
+    populate_run_pooled_iteration_rate(stats);
     populate_run_pooled_taobench(stats);
     populate_run_pooled_taobench_distribution(stats);
     populate_run_pooled_schbench(stats);
@@ -735,13 +728,13 @@ pub fn populate_run_ext_all(
     populate_run_distribution_metrics(stats);
 }
 
-/// Inject the run-level POOLED `iterations_per_cpu_sec` Rate's two Counter
+/// Inject the canonical run-level pooled `iteration_rate` Rate's two Counter
 /// components into `stats.ext_metrics`, summed across the cgroups that have
 /// measured on-CPU time — the cross-cgroup re-pool axis. Rather than routing
 /// the per-cgroup efficiency through `AssertResult::merge`'s worst-by-polarity
 /// `ext_metrics` fold (which picks the WORST cgroup's value, not Σ, and has
 /// no derive post-pass), this reads the already-merged `stats.cgroups` vec
-/// directly: `iterations_per_cpu_sec` = Σ`total_iterations` /
+/// directly: `iteration_rate` = Σ`total_iterations` /
 /// Σ(`total_cpu_time_ns`/1e9) over cgroups with `total_cpu_time_ns > 0` — the
 /// per-cgroup [`CgroupStats::iterations_per_cpu_sec`] re-pooled, NOT a mean of
 /// per-cgroup ratios, NOT the worst single cgroup.
@@ -773,13 +766,13 @@ pub fn populate_run_ext_all(
 /// MEASURED cgroups, it is ≤ the merge-summed typed `total_iterations` (which
 /// includes any zero-cpu-time cgroups), and equals it unless an excluded
 /// zero-cpu-time cgroup carried iterations>0.
-pub fn populate_run_pooled_iterations_per_cpu_sec(stats: &mut ScenarioStats) {
+pub fn populate_run_pooled_iteration_rate(stats: &mut ScenarioStats) {
     // Exclude cgroups with no measured on-CPU time from BOTH sums (mirrors the
     // per-cgroup None-on-zero): crediting an unmeasured cgroup's iterations
     // against the measured cgroups' CPU-seconds would overstate efficiency.
     // saturating fold: pool the guest-runtime cpu-time-ns / iteration counters
     // across cgroups; a plain `.sum()` would debug-panic / release-wrap on a
-    // corrupt/hostile component, silently corrupting iterations_per_cpu_sec.
+    // corrupt/hostile component, silently corrupting iteration_rate.
     let summed_ns: u64 = stats
         .cgroups
         .iter()
@@ -804,7 +797,7 @@ pub fn populate_run_pooled_iterations_per_cpu_sec(stats: &mut ScenarioStats) {
     crate::stats::derive_rate_metrics(&mut stats.ext_metrics);
 }
 
-/// Inject the whole-run taobench engine's qps + hit Rate components into
+/// Inject the whole-run taobench engine's CPU-throughput + hit Rate components into
 /// `stats.ext_metrics`, pooled across the run's `WorkType::Taobench` cgroups.
 /// Each cgroup carries its workers' merged whole-run aggregate
 /// ([`crate::assert::CgroupStats::taobench_whole`]); this folds those across
@@ -812,28 +805,31 @@ pub fn populate_run_pooled_iterations_per_cpu_sec(stats: &mut ScenarioStats) {
 /// and writes the `total_taobench_*` Counter components (`ops`, `fast_ops`,
 /// `slow_ops`, `wall_sec`, `cpu_sec`, plus the command-time `get_cmds` /
 /// `get_hits`), from which `crate::stats::derive_rate_metrics` derives the
-/// CPU-SECOND-denominated `taobench_total_ops_per_sec`,
-/// `taobench_fast_ops_per_sec`, `taobench_slow_ops_per_sec` (Σops / Σclient
+/// CPU-SECOND-denominated `taobench_total_ops_per_cpu_sec_whole`,
+/// `taobench_fast_ops_per_cpu_sec_whole`,
+/// `taobench_slow_ops_per_cpu_sec_whole` (Σops / Σclient
 /// CPU-sec — dilation-safe; wall reconstructs as `rate / D` or exactly as
 /// `Σops / total_taobench_wall_sec`), the response-time
 /// `taobench_hit_fraction` (Σfast/Σcompleted), and the command-time
 /// `taobench_command_hit_rate` (Σhits/Σcmds). The whole-run Rate keys are
-/// registered METRICS, so — unlike the per-phase `taobench_*_qps`
+/// registered METRICS, so — unlike the per-phase
+/// `taobench_*_ops_per_cpu_sec`
 /// (`MetricKind::PerPhase`, invisible to the whole-run cross-run fold) — they
 /// reach the perf-delta `--noise-adjust` spread analysis. The open-loop
 /// serve-latency distribution is a SEPARATE pool
 /// ([`populate_run_pooled_taobench_distribution`], the `*_us_whole` keys).
 ///
 /// MUST run post-`merge` (after every cgroup-bearing merge has populated
-/// `stats.cgroups`), exactly like [`populate_run_pooled_iterations_per_cpu_sec`]:
+/// `stats.cgroups`), exactly like [`populate_run_pooled_iteration_rate`]:
 /// an earlier run would pool over an incomplete cgroup set. A run with no
 /// Taobench cgroup writes nothing (the pool is `None`) — the keys stay absent,
 /// keeping a non-taobench run distinct from a measured zero.
 ///
-/// Both-or-neither (the `derive_rate_metrics` co-location invariant): all six
-/// components are inserted together, gated on a measured wall window
-/// (`elapsed_ns > 0`) — the qps denominator. The three per-second Rates then
-/// derive unconditionally (wall_sec > 0); `taobench_hit_fraction` =
+/// Numerators are retained whenever a Taobench carrier exists. Wall and CPU
+/// denominators are inserted independently only when positive, so a missing
+/// wall window cannot suppress a valid CPU-denominated rate (and vice versa).
+/// The three throughput Rates derive only with measured client CPU time;
+/// `taobench_hit_fraction` =
 /// `total_taobench_fast_ops` / `total_taobench_ops` derives iff ops completed
 /// (`total_taobench_ops > 0`) and `taobench_command_hit_rate` =
 /// `total_taobench_get_hits` / `total_taobench_get_cmds` iff lookups issued
@@ -871,11 +867,6 @@ pub fn populate_run_pooled_taobench(stats: &mut ScenarioStats) {
         return;
     };
     let c = &w;
-    // qps is undefined without a measured wall window; write no components (so
-    // hit_fraction stays absent too) rather than a 0/0 rate.
-    if c.elapsed_ns == 0 {
-        return;
-    }
     stats
         .ext_metrics
         .insert(TOTAL_TAOBENCH_OPS.to_string(), c.total_ops() as f64);
@@ -885,12 +876,14 @@ pub fn populate_run_pooled_taobench(stats: &mut ScenarioStats) {
     stats
         .ext_metrics
         .insert(TOTAL_TAOBENCH_SLOW_OPS.to_string(), c.slow_ops as f64);
-    stats.ext_metrics.insert(
-        TOTAL_TAOBENCH_WALL_SEC.to_string(),
-        c.elapsed_ns as f64 / 1e9,
-    );
+    if c.elapsed_ns > 0 {
+        stats.ext_metrics.insert(
+            TOTAL_TAOBENCH_WALL_SEC.to_string(),
+            c.elapsed_ns as f64 / 1e9,
+        );
+    }
     // CPU-second window: Σ client-thread CLOCK_THREAD_CPUTIME_ID across the
-    // pooled cgroups — the `taobench_*_ops_per_sec` Rate DENOMINATOR (the
+    // pooled cgroups — the `taobench_*_ops_per_cpu_sec_whole` Rate DENOMINATOR (the
     // wall window above stays as a component: it is window evidence, not a
     // throughput rate, and preserves the exact wall reconstruction
     // `Σops / Σwall` alongside the `rate / D` approximation). Inserted only
@@ -1274,7 +1267,7 @@ pub fn populate_run_pooled_schbench_distribution(stats: &mut ScenarioStats) {
 /// counters survive stripping, so WorstLowest needs no fallback branch.
 ///
 /// Runs post-merge at the eval layer beside
-/// [`populate_run_pooled_iterations_per_cpu_sec`], AFTER the per-cgroup
+/// [`populate_run_pooled_iteration_rate`], AFTER the per-cgroup
 /// carriers are folded into `stats.phases` and BEFORE the sidecar write, so
 /// `stats.phases[].per_cgroup` is fully merged and `stats.cgroups` is the
 /// final per-cgroup roll-up.
@@ -1537,7 +1530,7 @@ pub(crate) fn populate_run_distribution_metrics_from<'a>(
             // appears once per step; this selects the lowest single
             // (handle, step) entry, NOT a per-name whole-run efficiency. That
             // preserves the deleted `fold_lowest_some` granularity exactly and
-            // mirrors `populate_run_pooled_iterations_per_cpu_sec`, which sums
+            // mirrors `populate_run_pooled_iteration_rate`, which sums
             // over the same per-(handle, step) entries.
             MetricKind::WorstLowest {
                 numerator: WorstLowestNumerator::Iterations,
@@ -1865,41 +1858,31 @@ pub fn populate_run_ext_metrics(
             target.insert(metric_def.name.to_string(), reduced);
         }
     }
-    // Run-level capture-window wall for the IRQ rates: the elapsed span of the
-    // per_cpu_time-bearing freezes — the SAME freezes the IRQ-counter numerators
-    // above were read_sampled from (whole-run last-minus-first via
-    // phase_counter_delta). Inserting it HERE (the direct/whole-run path) makes
-    // the run-level rate's numerator AND denominator share the whole-run span.
-    // Without it, derive_rate_metrics below finds the numerator but no
-    // denominator (total_phase_wall_sec has no read_sample arm), and the rate
-    // would instead be derived by populate_run_ext_metrics_from_phases over a
-    // Σ-per-phase-capture denominator — a NARROWER time base than this whole-run
-    // numerator (it excludes the inter-phase / cross-capture gaps the numerator
-    // counts), inflating the rate on MULTI-phase runs. Run-level analog of the
-    // per-phase assert::phase_build. Gated on total_hardirqs
-    // (irqtime-independent), so the count-rates derive even when
-    // CONFIG_IRQ_TIME_ACCOUNTING is off and total_irq_time_ns is absent. Min/max
-    // over the elapsed-bearing freezes: chronological periodic samples put the
-    // numerator's first/last reading at min/max elapsed, so num and den span the
-    // identical interval.
+    // Run-level delivered-guest-CPU denominator for IRQ activity/fraction
+    // metrics. Use the same earliest/latest per_cpu_time-bearing freezes as the
+    // whole-run counter deltas above. Excluding CPUTIME_STEAL makes the rates
+    // immune to host preemption without adding another observation source.
     if target.contains_key("total_hardirqs") {
-        let irq_elapsed_ms: Vec<u64> = samples
+        let placed: Vec<_> = samples
             .iter_samples()
             .filter(|s| !s.snapshot.per_cpu_time().is_empty())
-            .filter_map(|s| s.elapsed_ms)
+            .filter_map(|s| s.elapsed_ms.map(|elapsed_ms| (s, elapsed_ms)))
             .collect();
-        if let (Some(first), Some(last)) = (
-            irq_elapsed_ms.iter().min().copied(),
-            irq_elapsed_ms.iter().max().copied(),
-        ) && last > first
+        if let (Some((first, first_ms)), Some((last, last_ms))) = (
+            placed.iter().min_by_key(|(_, elapsed_ms)| *elapsed_ms),
+            placed.iter().max_by_key(|(_, elapsed_ms)| *elapsed_ms),
+        ) && last_ms > first_ms
+            && let Some(cpu_ns) = crate::assert::phase_build::guest_cpu_time_delta_ns(
+                first.snapshot.per_cpu_time(),
+                last.snapshot.per_cpu_time(),
+            )
         {
-            let wall_ms = (last - first) as f64;
             target
-                .entry("total_phase_wall_ns".to_string())
-                .or_insert(wall_ms * 1_000_000.0);
+                .entry("total_phase_guest_cpu_ns".to_string())
+                .or_insert(cpu_ns as f64);
             target
-                .entry("total_phase_wall_sec".to_string())
-                .or_insert(wall_ms / 1000.0);
+                .entry("total_phase_guest_cpu_sec".to_string())
+                .or_insert(cpu_ns as f64 / 1e9);
         }
     }
     // Re-derive Rate metrics from the read_sample components just folded
@@ -1993,6 +1976,33 @@ pub(crate) fn derive_phase_metrics(phases: &mut [PhaseBucket]) {
         if let Some(t) = pooled_taobench {
             write_taobench_scalars(&t, &mut bucket.metrics);
         }
+
+        // Cross-cgroup phase pool for the canonical iteration_rate. Exclude a
+        // carrier with no measured CPU time from BOTH sums: crediting its work
+        // against another cgroup's CPU time would overstate efficiency.
+        let total_cpu_time_ns = bucket
+            .per_cgroup
+            .values()
+            .filter(|pc| pc.total_cpu_time_ns > 0)
+            .map(|pc| pc.total_cpu_time_ns)
+            .fold(0u64, u64::saturating_add);
+        if total_cpu_time_ns > 0 {
+            let total_iterations = bucket
+                .per_cgroup
+                .values()
+                .filter(|pc| pc.total_cpu_time_ns > 0)
+                .map(|pc| pc.total_iterations)
+                .fold(0u64, u64::saturating_add);
+            bucket.metrics.insert(
+                "total_iterations_pooled".to_string(),
+                total_iterations as f64,
+            );
+            bucket.metrics.insert(
+                "total_cpu_time_sec".to_string(),
+                total_cpu_time_ns as f64 / 1e9,
+            );
+            crate::stats::derive_rate_metrics(&mut bucket.metrics);
+        }
     }
 }
 
@@ -2072,7 +2082,7 @@ fn write_carrier_scalars(pc: &mut PhaseCgroupStats) {
         m.insert("iterations_per_worker".to_string(), v);
     }
     if let Some(v) = ipcs {
-        m.insert("iterations_per_cpu_sec".to_string(), v);
+        m.insert("iteration_rate".to_string(), v);
     }
     // NUMA ratios only when pages were observed (mirrors the carrier's
     // numa_pages_total>0 gate; absent is more honest than a 0.0 default).
@@ -2199,28 +2209,36 @@ fn write_schbench_scalars(
 /// when ops completed (`total > 0`); hit_rate only when lookups were issued
 /// (`get_cmds > 0`) — a not-measured value reads as missing, never a false 0.
 ///
-/// DENOMINATION: the `taobench_*_qps` keys are CPU-SECOND denominated —
+/// DENOMINATION: the `taobench_*_ops_per_cpu_sec` keys are CPU-SECOND denominated —
 /// completed ops per CPU-second the phase's client threads actually received
 /// (Σ `CLOCK_THREAD_CPUTIME_ID`), not per wall second. Dilation-safe by
 /// construction; the wall picture reconstructs as `rate / D` via the
 /// sidecar's `host_dilation` (or exactly from the carrier's ops + wall
-/// window). Same key names as the historical wall rates — the sidecar-level
-/// `throughput_denomination` marker gates cross-era comparison.
+/// window).
 fn write_taobench_scalars(
     p: &crate::workload::taobench::run::TaobenchPhaseStats,
     out: &mut std::collections::BTreeMap<String, f64>,
 ) {
     use crate::stats::{
-        TAOBENCH_FAST_QPS, TAOBENCH_HIT_RATE, TAOBENCH_HIT_RATIO, TAOBENCH_SLOW_QPS,
-        TAOBENCH_TOTAL_QPS,
+        TAOBENCH_FAST_OPS_PER_CPU_SEC, TAOBENCH_HIT_RATE, TAOBENCH_HIT_RATIO,
+        TAOBENCH_SLOW_OPS_PER_CPU_SEC, TAOBENCH_TOTAL_OPS_PER_CPU_SEC,
     };
     let c = &p.counters;
     let total = c.total_ops();
     if c.cpu_time_ns > 0 {
         let cpu_secs = c.cpu_time_ns as f64 / 1e9;
-        out.insert(TAOBENCH_TOTAL_QPS.to_string(), total as f64 / cpu_secs);
-        out.insert(TAOBENCH_FAST_QPS.to_string(), c.fast_ops as f64 / cpu_secs);
-        out.insert(TAOBENCH_SLOW_QPS.to_string(), c.slow_ops as f64 / cpu_secs);
+        out.insert(
+            TAOBENCH_TOTAL_OPS_PER_CPU_SEC.to_string(),
+            total as f64 / cpu_secs,
+        );
+        out.insert(
+            TAOBENCH_FAST_OPS_PER_CPU_SEC.to_string(),
+            c.fast_ops as f64 / cpu_secs,
+        );
+        out.insert(
+            TAOBENCH_SLOW_OPS_PER_CPU_SEC.to_string(),
+            c.slow_ops as f64 / cpu_secs,
+        );
     }
     if total > 0 {
         out.insert(

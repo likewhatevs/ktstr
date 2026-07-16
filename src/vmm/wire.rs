@@ -1007,13 +1007,10 @@ pub const SCENARIO_END_PAYLOAD_SIZE: usize = 16;
 /// [`crate::vmm::guest_comms::send_scenario_end`]: `elapsed_ms`
 /// (LE `u64`, scenario-relative) followed by `total_iterations`
 /// (LE `u64`, the cumulative worker iteration count summed across
-/// every live handle at the LAST step's end). The iteration count is
-/// the right boundary the final step's `iteration_rate` delta needs —
-/// the host folds it into a synthetic terminal
-/// [`crate::timeline::StimulusEvent`] (see
-/// [`crate::timeline::StimulusEvent::terminal`]). Returns `None` for a
-/// short/torn payload so a CRC-bad or truncated frame is skipped
-/// rather than misread.
+/// every live handle at the LAST step's end). The host preserves the pair as a
+/// terminal [`crate::timeline::StimulusEvent`]; it is boundary telemetry, not
+/// the CPU-denominated iteration-rate source. Returns `None` for a short/torn
+/// payload so a CRC-bad or truncated frame is skipped rather than misread.
 pub fn parse_scenario_end(payload: &[u8]) -> Option<(u64, u64)> {
     if payload.len() < SCENARIO_END_PAYLOAD_SIZE {
         return None;
@@ -1594,8 +1591,7 @@ mod tests {
 
     /// `parse_scenario_end` round-trips the two LE u64s the guest
     /// writes, and rejects a short/torn payload (returns None rather
-    /// than misreading) — the host folds the parsed iteration count
-    /// into the terminal StimulusEvent for the last step's rate.
+    /// than misreading) before the host builds terminal boundary telemetry.
     #[test]
     fn parse_scenario_end_round_trip_and_short_payload() {
         let mut payload = [0u8; SCENARIO_END_PAYLOAD_SIZE];

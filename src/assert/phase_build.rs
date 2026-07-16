@@ -1,7 +1,7 @@
 use super::*;
 
-/// Phase buckets attributed against the guest stimulus timeline, then
-/// enriched with stimulus-event-derived per-phase `iteration_rate`.
+/// Build host-observed phase buckets attributed against the guest stimulus
+/// timeline.
 ///
 /// Unlike the plain [`build_phase_buckets`] (which groups by the
 /// bridge-stamped step_index), this re-groups each periodic capture by
@@ -20,73 +20,19 @@ use super::*;
 /// captured no periodic samples — the uniform whole-workload boundary
 /// placement (`compute_periodic_boundaries_ns`) is step-agnostic, so a
 /// short interior step can land zero captures and otherwise leave no
-/// bucket, silently dropping its capture-independent `iteration_rate`.
-/// The synthesized bucket carries the step's full stimulus window so its
-/// `iteration_rate` (from `StepStart`/`StepEnd` deltas) and
-/// `avg_imbalance_ratio` (from in-window monitor samples) are still
-/// recovered. The returned vec therefore holds one bucket per
+/// bucket. The synthesized bucket carries the step's full stimulus window so
+/// in-window monitor metrics are still recovered. The returned vec holds one
+/// bucket per
 /// (captured phase ∪ `StepStart`-step), sorted by `step_index` — NOT
 /// one-per-captured-phase, so `len()` is no longer "number of captured
 /// phases".
 ///
-/// The `iteration_rate` enrichment lets
-/// `crate::timeline::Timeline::from_phase_buckets` render the per-phase
-/// throughput annotation without going through the legacy
-/// `crate::timeline::Timeline::build` path.
-///
-/// For each `StepStart[k]` -> `StepEnd[k]` pair with
-/// `total_iterations: Some(_)`, the per-phase rate is
-/// `(later - earlier) / duration_s` where `duration_s` is the
-/// elapsed-ms delta BETWEEN THE TWO STIMULUS EVENTS (guest clock),
-/// not the PhaseBucket sample window. The rate is attributed to the
-/// step the EARLIER event starts (`prev.step_index`); the attribution
-/// loop skips any `is_step_end` (or `is_terminal`) `prev`, so only a
-/// StepStart is ever the earlier member. Phases that don't overlap a
-/// stimulus pair keep their PhaseBucket.metrics map unchanged (no
-/// iteration_rate key).
-///
-/// SEMANTICS: `total_iterations` is the sum of the worker handles
-/// alive at each event (see
-/// [`crate::timeline::StimulusEvent::total_iterations`]). Each step's
-/// rate is its STEP-LOCAL `StepStart[k]` -> `StepEnd[k]` delta — the
-/// step's own workers measured over its own hold — so a bucket is
-/// sourced ONLY by its own pair (the `is_step_end` guard drops the
-/// inter-step `StepEnd[k]` -> `StepStart[k+1]` pair entirely). This
-/// measures BOTH fresh-per-step workers (which read ~0 at each
-/// StepStart, so the old cross-step delta produced no rate) and
-/// persistent (Backdrop) workers (excluding the inter-step teardown
-/// wall-time a cross-step window would span). On a clean run the
-/// `(StepEnd[N], terminal)` pair is guard-skipped and the trailing
-/// `is_terminal` event is not consumed; it supplies a step's right
-/// boundary ONLY for legacy/synthetic data carrying a `ScenarioEnd`
-/// frame but no `StepEnd` frames. A sched-died step has neither frame
-/// (its early return skips both emissions), so the dead step's
-/// `StepStart` is never a `prev` with a successor and it reports no
-/// rate.
-///
-/// iteration_rate is registered as `MetricKind::Rate` with the Counter
-/// components `total_phase_iterations` / `total_phase_duration_sec` and
-/// `HigherBetter` polarity (more throughput is better). The per-step
-/// producer below emits those two components (the iteration delta and the
-/// window seconds — the ms→s `/1000` applied at the component, since
-/// `derive_rate_metrics` does a bare num/den) rather than a ready ratio,
-/// and the `derive_rate_metrics` post-pass re-derives `iteration_rate` =
-/// Σiterations / Σseconds at every in-map aggregation level. Its per-run
-/// run-scalar fold (one run's per-phase values → that run's `ext_metrics`)
-/// runs through `populate_run_ext_metrics_from_phases`, which SUMS the
-/// Counter components across phases (a synthesized zero-capture phase's
-/// components are summed in, not zero-weighted out — the run-aggregate
-/// completion of the per-step rate handling) and re-derives the rate. The
-/// cross-sidecar-run rollup `group_and_average_by` likewise re-pools via
-/// its `derive_rate_metrics` post-pass. `iteration_rate` has no cross-cgroup
-/// axis to re-pool: it is derived from run-level phase buckets and
-/// host-injected into the run `ext_metrics` by
-/// `populate_run_ext_metrics_from_phases` (the eval layer) AFTER the
-/// cross-cgroup `merge`, so `AssertResult::merge`'s worst-case
-/// (min/max-by-polarity) `ext_metrics` fold never sees its components. The rate whose components ARE per-cgroup is the separate
-/// pooled `iterations_per_cpu_sec`, re-pooled across a run's cgroups by
-/// `populate_run_pooled_iterations_per_cpu_sec` (reading `stats.cgroups`
-/// post-merge).
+/// This function deliberately does not derive `iteration_rate` from
+/// `StimulusEvent` wall-clock deltas. After the guest per-cgroup phase carriers
+/// are joined to these buckets, `derive_phase_metrics` derives
+/// the canonical rate as iterations per delivered guest CPU-second. A bucket
+/// with no carrier therefore has no `iteration_rate`, rather than a second
+/// wall-throughput metric under the same name.
 ///
 /// Live caller: `evaluate_vm_result` at `src/test_support/eval/mod.rs`
 /// — has both the SampleSeries and the stimulus_events vec in scope.
@@ -138,7 +84,6 @@ pub fn build_phase_buckets_with_stimulus(
     // matches the captured-bucket invariant and keeps rendered output
     // stable.
     buckets.sort_by_key(|b| b.step_index);
-    fill_phase_iteration_rates(&mut buckets, stimulus_events);
     buckets
 }
 
@@ -146,18 +91,14 @@ pub fn build_phase_buckets_with_stimulus(
 /// StepStart but produced no capture bucket. Periodic boundaries are
 /// placed uniformly over the whole workload (step-agnostic — see
 /// `compute_periodic_boundaries_ns`), so a short interior step can
-/// capture zero samples and leave no bucket. The iteration_rate
-/// attribution in [`fill_phase_iteration_rates`] only mutates EXISTING
-/// buckets, so without this seam that step's capture-independent rate
-/// (derived purely from the StepStart/StepEnd total_iterations deltas,
-/// needing no capture) would be silently dropped. The synthesized bucket
+/// capture zero samples and leave no bucket. The synthesized bucket
 /// carries the step's true stimulus window so `fold_monitor_into_bucket`
 /// still recovers its monitor-derived imbalance; `sample_count == 0` marks
-/// it capture-free for downstream consumers. `Timeline::from_phase_buckets`
-/// COMPARES this bucket's stimulus-derived throughput across the gap
-/// (the iteration_rate is real, not a sampling artifact) but GATES the
-/// monitor-derived metrics (imbalance/dsq/fallback/keep_last) behind
-/// both sides having samples — see `detect_boundary_changes`. BASELINE
+/// it capture-free for downstream consumers. A guest carrier can still attach
+/// a CPU-denominated `iteration_rate` during the later host/guest phase join.
+/// `Timeline::from_phase_buckets` gates monitor-derived metrics
+/// (imbalance/dsq/fallback/keep_last) behind both sides having samples — see
+/// `detect_boundary_changes`. BASELINE
 /// (step 0) is synthesized only if a StepStart carries
 /// `step_index == 0` — it is not special-cased.
 fn synthesize_missing_step_buckets(
@@ -243,123 +184,6 @@ fn synthesize_missing_step_buckets(
             preemption_threshold_ns,
         );
         buckets.push(bucket);
-    }
-}
-
-/// Fill each phase bucket's `iteration_rate` Rate components from the
-/// stimulus event `total_iterations` deltas. Walk events pairwise; for
-/// each pair compute the rate. Sort events by elapsed_ms first so an
-/// out-of-order arrival from the bulk-port drain doesn't silently lose the
-/// delta to saturating_sub (the legacy Timeline::build path at
-/// src/timeline.rs sorts the same way; without the sort, an inversion
-/// produces duration_ms == 0 → skipped, a silent drop).
-///
-/// Must run AFTER the synthesize seam and the step_index sort so it sees
-/// the full, ordered bucket set exactly as the returned vec will hold it.
-fn fill_phase_iteration_rates(
-    buckets: &mut [PhaseBucket],
-    stimulus_events: &[crate::timeline::StimulusEvent],
-) {
-    let mut sorted_events: Vec<&crate::timeline::StimulusEvent> = stimulus_events.iter().collect();
-    // Total-order on an elapsed_ms tie: StepEnd before StepStart
-    // (`!is_step_end` is false=0 for StepEnd) so a zero-length inter-step
-    // gap at the guest's coarse-ms clock attributes the step-local
-    // StepStart[k]->StepEnd[k] rate to bucket k, never the cross-step
-    // StepStart[k]->StepStart[k+1] delta (the is_step_end guard below only
-    // stops StepEnd from being `prev`; it does not order a StepEnd before
-    // the next StepStart on a tie). Mirrors Timeline::build's sort.
-    sorted_events.sort_by_key(|e| (e.elapsed_ms, !e.is_step_end));
-    for w in sorted_events.windows(2) {
-        let prev = w[0];
-        let curr = w[1];
-        // The terminal scenario-end event and per-step StepEnd events are
-        // right boundaries only — never the EARLIER member of a pair (the
-        // step a rate is attributed to). Both carry an end-of-hold count,
-        // not a step-start, so pairing them as `prev` would attribute the
-        // WRONG window to a bucket:
-        // - terminal sorts last so it is naturally only ever `curr`, but
-        //   guard explicitly so a future caller producing a non-last or
-        //   duplicate terminal can't fall into the `None` step_index
-        //   timestamp-window branch below and attach a bogus rate.
-        // - StepEnd[k] carries step_index k (same as StepStart[k]); if its
-        //   step's own StepStart[k] -> StepEnd[k] pair returned None (a
-        //   BACKWARD count, e < s — a counter reset; a stalled step e == s
-        //   instead yields a measured-ZERO rate, see
-        //   StimulusEvent::rate_components), the bucket k key is still empty,
-        //   so without this guard the next pair StepEnd[k] -> StepStart[k+1]
-        //   would or_insert an inter-step teardown-gap rate into bucket k,
-        //   mislabeling gap throughput as step k's. The guard keeps bucket k
-        //   sourced ONLY by its own StepStart[k] -> StepEnd[k] pair (whether
-        //   a measured zero or a real rate), never a leaked gap rate.
-        if prev.is_terminal || prev.is_step_end {
-            continue;
-        }
-        // Emit the iteration_rate Rate's two components (the per-step
-        // iteration delta + window seconds) rather than the ready ratio, so
-        // derive_rate_metrics re-pools Σiters/Σseconds at every aggregation
-        // level. rate_components is None only when the count went BACKWARD
-        // (e < s, a counter reset), an event lacks total_iterations, or the
-        // window is zero-length; a non-advancing count (e == s over a
-        // positive window) yields Some((0.0, secs)) — a measured zero, not
-        // None (the same shared formula Timeline::build's rate_to divides
-        // for display).
-        let Some((iters, secs)) = prev.rate_components(curr) else {
-            continue;
-        };
-        // Attribute the rate to the step PREV starts: the guards above
-        // leave `prev` as a StepStart (or a legacy/synthetic step event),
-        // so the pair (prev, curr) measures iterations accumulated from
-        // prev's step-start to curr's — the throughput DURING prev's step.
-        // Match by prev.step_index, NOT a timestamp window: the bucket
-        // windows here are workload-relative capture offsets (the step
-        // INTERIOR, 10-90% of the workload per
-        // compute_periodic_boundaries_ns), so prev.elapsed_ms — the
-        // step-START — lands in the inter-step gap, inside no bucket's
-        // [start_ms, end_ms) window; a window match would drop every
-        // rate. This mirrors the legacy Timeline::build alignment:
-        // phase[i] gets events[i]→events[i+1] where events[i] is
-        // phase[i]'s left boundary = prev.
-        //
-        // Stimulus events without a step stamp (step_index == None:
-        // legacy / synthetic callers) fall back to the timestamp
-        // window — half-open [start_ms, end_ms) with a single-sample
-        // (start == end) equality carve-out so a boundary event lands
-        // in exactly one bucket.
-        for bucket in buckets.iter_mut() {
-            let in_bucket = match prev.step_index {
-                Some(k) => bucket.step_index == k,
-                None => {
-                    if bucket.start_ms == bucket.end_ms {
-                        prev.elapsed_ms == bucket.start_ms
-                    } else {
-                        prev.elapsed_ms >= bucket.start_ms && prev.elapsed_ms < bucket.end_ms
-                    }
-                }
-            };
-            if in_bucket {
-                // Both components come from the SAME (prev, curr) pair and are
-                // inserted together; or_insert keeps the first pair that
-                // matched this bucket (mirrors the prior first-wins
-                // iteration_rate attribution). The derive_rate_metrics
-                // post-pass below produces iteration_rate from them.
-                bucket
-                    .metrics
-                    .entry("total_phase_iterations".to_string())
-                    .or_insert(iters);
-                bucket
-                    .metrics
-                    .entry("total_phase_duration_sec".to_string())
-                    .or_insert(secs);
-                break;
-            }
-        }
-    }
-    // Stimulus/monitor components are injected ABOVE, AFTER
-    // buckets_from_grouped's own derive_rate_metrics already ran; re-derive
-    // here so a Rate over a post-injected component is produced for these
-    // buckets too. Idempotent: re-deriving an unchanged map is a no-op.
-    for bucket in buckets.iter_mut() {
-        crate::stats::derive_rate_metrics(&mut bucket.metrics);
     }
 }
 
@@ -629,6 +453,53 @@ fn fold_per_cpu_spatial_max(
             }
         }
     }
+}
+
+/// Delivered guest CPU time between two per-CPU cpustat snapshots, summed
+/// across CPUs. This is the guest's own CPU-time currency: user, nice, system,
+/// irq, softirq, idle, and iowait advance only while a vCPU is executing;
+/// CPUTIME_STEAL is deliberately excluded. Require the same complete, unique
+/// CPU-id set at both endpoints: the IRQ numerator is a whole-VM sum, so an
+/// intersection-only denominator could fabricate a rate from a partial read.
+/// Every component delta and sum saturates so a reset or hostile snapshot
+/// cannot wrap into a huge denominator.
+pub(crate) fn guest_cpu_time_delta_ns(
+    first: &[crate::monitor::dump::PerCpuTimeStats],
+    last: &[crate::monitor::dump::PerCpuTimeStats],
+) -> Option<u64> {
+    if first.is_empty() || first.len() != last.len() {
+        return None;
+    }
+    let first_ids: std::collections::BTreeSet<u32> = first.iter().map(|c| c.cpu).collect();
+    let last_ids: std::collections::BTreeSet<u32> = last.iter().map(|c| c.cpu).collect();
+    if first_ids.len() != first.len() || last_ids.len() != last.len() || first_ids != last_ids {
+        return None;
+    }
+    let total_without_steal = |c: &crate::monitor::dump::PerCpuTimeStats| {
+        [
+            c.cpustat_user_ns,
+            c.cpustat_nice_ns,
+            c.cpustat_system_ns,
+            c.cpustat_softirq_ns,
+            c.cpustat_irq_ns,
+            c.cpustat_idle_ns,
+            c.cpustat_iowait_ns,
+        ]
+    };
+    let mut total = 0u64;
+    for before in first {
+        let after = last
+            .iter()
+            .find(|after| after.cpu == before.cpu)
+            .expect("equal unique CPU-id sets checked above");
+        let cpu_delta = total_without_steal(after)
+            .into_iter()
+            .zip(total_without_steal(before))
+            .map(|(after, before)| after.saturating_sub(before))
+            .fold(0u64, u64::saturating_add);
+        total = total.saturating_add(cpu_delta);
+    }
+    (total > 0).then_some(total)
 }
 
 /// Per-CPU scx_layered util-compensation SCALE over a freeze span: the factor by
@@ -995,11 +866,23 @@ fn buckets_from_grouped(
         // `phase_group_cpu_delta`). Observer-free: reads the frozen
         // task_struct.{s,u}time + thread-group signal_struct accumulator
         // already captured in each sample's enrichments.
-        if let Some(v) = phase_group_cpu_delta(&samples_in_phase, |t| t.stime, |t| t.signal_stime) {
+        let system_time_ns =
+            phase_group_cpu_delta(&samples_in_phase, |t| t.stime, |t| t.signal_stime);
+        let user_time_ns =
+            phase_group_cpu_delta(&samples_in_phase, |t| t.utime, |t| t.signal_utime);
+        if let Some(v) = system_time_ns {
             metrics.entry("system_time_ns".to_string()).or_insert(v);
         }
-        if let Some(v) = phase_group_cpu_delta(&samples_in_phase, |t| t.utime, |t| t.signal_utime) {
+        if let Some(v) = user_time_ns {
             metrics.entry("user_time_ns".to_string()).or_insert(v);
+        }
+        // Same task-group population and endpoints as the two components above.
+        // This denominator makes system_cpu_fraction immune to how much CPU the
+        // host happened to deliver during the fixed guest-wall phase.
+        if let (Some(system), Some(user)) = (system_time_ns, user_time_ns) {
+            metrics
+                .entry("observed_task_cpu_time_ns".to_string())
+                .or_insert(system + user);
         }
         // Per-CPU spatial axes (busiest-CPU counter delta + concentration) over
         // the per_cpu_time freezes: hardirqs (kstat.irqs_sum) and NET_RX softirqs
@@ -1060,30 +943,34 @@ fn buckets_from_grouped(
             monitor_to_window_offset_ms,
             preemption_threshold_ns,
         );
-        // Phase-wall denominators for the IRQ rates, co-inserted
-        // both-or-neither with the read_sample-folded IRQ numerators above so
-        // derive_rate_metrics pairs num/den from THIS bucket (never cross-paired
-        // with a stimulus event's total_phase_duration_sec — a distinct
-        // metric). The window is the CAPTURE span (start_ms/end_ms = first->last
-        // freeze offset), the same span the Counter numerators accrue over:
-        // self-consistent for the ns/ns fraction, and a capture-window rate for
-        // the per-second rates (the d/span factor cancels in an A/B compare with
-        // matched cadence). Gate on total_hardirqs (present iff per_cpu_time was
-        // captured; irqtime-independent, unlike total_irq_time_ns) + a positive
-        // window. ms->ns and ms->s scaling lives HERE (derive_rate_metrics does
-        // bare num/den). One insertion covers both derive sites:
-        // build_phase_buckets_with_stimulus folds over buckets_from_grouped's
-        // output, so its later re-derive sees these denominators too.
-        if bucket.metrics.contains_key("total_hardirqs") && bucket.end_ms > bucket.start_ms {
-            let wall_ms = (bucket.end_ms - bucket.start_ms) as f64;
-            bucket
-                .metrics
-                .entry("total_phase_wall_ns".to_string())
-                .or_insert(wall_ms * 1_000_000.0);
-            bucket
-                .metrics
-                .entry("total_phase_wall_sec".to_string())
-                .or_insert(wall_ms / 1000.0);
+        // Guest-CPU denominators for IRQ activity/fraction rates. Select the
+        // exact per_cpu_time endpoints by the same phase-window key used by the
+        // IRQ counters, then sum non-steal cpustat deltas across their CPU-id
+        // intersection. Host preemption therefore cannot dilute these metrics.
+        if bucket.metrics.contains_key("total_hardirqs") {
+            let placed: Vec<(&crate::scenario::sample::Sample<'_>, u64)> = samples_in_phase
+                .iter()
+                .filter(|s| !s.snapshot.per_cpu_time().is_empty())
+                .filter_map(|s| win(s).map(|w| (s, w)))
+                .collect();
+            if let (Some(&(first, first_win)), Some(&(last, last_win))) = (
+                placed.iter().min_by_key(|(_, w)| *w),
+                placed.iter().max_by_key(|(_, w)| *w),
+            ) && first_win < last_win
+                && let Some(cpu_ns) = guest_cpu_time_delta_ns(
+                    first.snapshot.per_cpu_time(),
+                    last.snapshot.per_cpu_time(),
+                )
+            {
+                bucket
+                    .metrics
+                    .entry("total_phase_guest_cpu_ns".to_string())
+                    .or_insert(cpu_ns as f64);
+                bucket
+                    .metrics
+                    .entry("total_phase_guest_cpu_sec".to_string())
+                    .or_insert(cpu_ns as f64 / 1e9);
+            }
         }
         // Derive Rate metrics AFTER every component source is folded in:
         // the METRICS reductions + system/user_time_ns above AND the
@@ -1152,7 +1039,9 @@ fn buckets_from_grouped(
 /// to the terminal rather than extending to end-of-monitor, and a
 /// synthesized bucket's dsq metrics come from the monitor
 /// `CpuSnapshot.local_dsq_depth` axis (vs a captured bucket's DSQ-walker
-/// axis) — same metric, different sampling axis.
+/// axis) — same metric, different sampling axis. Event rates are folded for
+/// every monitor-bearing bucket from endpoint-matched event counters and vCPU
+/// CPU clocks; they never fall back to bucket wall duration.
 ///
 /// `bucket`'s `[start_ms, end_ms)` IS the window basis and differs by
 /// bucket kind: a captured bucket's is the min/max of its samples'
@@ -1160,10 +1049,8 @@ fn buckets_from_grouped(
 /// `[StepStart, StepEnd)` stimulus window. The monitor sample's
 /// run-relative `elapsed_ms` is shifted into that frame (subtract
 /// `monitor_to_window_offset_ms`) before the half-open test so a sample
-/// on the boundary lands in exactly one bucket. `compute_metrics` returns
-/// fallback / keep_last as RATES; this re-derives the bucket-native
-/// counter DELTAS (so `phase_from_bucket` re-rates them over the bucket
-/// window like the read_sample path) using the same `counter_delta` clamp.
+/// on the boundary lands in exactly one bucket. Event-rate components use the
+/// same `counter_delta` clamp as the run-level monitor summary.
 fn fold_monitor_into_bucket(
     bucket: &mut PhaseBucket,
     monitor_samples: &[crate::monitor::MonitorSample],
@@ -1206,61 +1093,61 @@ fn fold_monitor_into_bucket(
     // captures, so monitor is its only source and it takes the full set
     // (Timeline::build render parity).
     let synthesized = bucket.sample_count == 0;
-    let mut put = |key: &str, v: f64| {
-        if v.is_finite() {
-            bucket.metrics.entry(key.to_string()).or_insert(v);
+    {
+        let mut put = |key: &str, v: f64| {
+            if v.is_finite() {
+                bucket.metrics.entry(key.to_string()).or_insert(v);
+            }
+        };
+        if let Some(v) = pm.avg_imbalance {
+            put("avg_imbalance_ratio", v);
         }
-    };
-    if let Some(v) = pm.avg_imbalance {
-        put("avg_imbalance_ratio", v);
-    }
-    // avg_nr_running (Gauge(Avg)) is a monitor-axis signal (full-class
-    // rq.nr_running, no read_sample dispatch arm), so like avg_imbalance_ratio
-    // it is folded for EVERY monitor-bearing bucket (not gated on synthesized)
-    // — captured buckets have no other source for it. It feeds per-phase
-    // rendering + boundary change-detection only; the run-level value stays
-    // MonitorSummary::avg_nr_running (fold_run_level_ext), so the run-level ext
-    // re-pool (populate_run_ext_metrics_from_phases) SKIPS this key to avoid a
-    // double-source.
-    if let Some(v) = pm.avg_nr_running {
-        put("avg_nr_running", v);
-    }
-    // max_imbalance_ratio (Peak) and stuck_count (Counter) have NO read_sample
-    // dispatch arm (both fall to `_ => None` in crate::stats read_sample), so
-    // the per-sample capture path never produces them and a CAPTURED bucket
-    // would otherwise never carry them — they would surface only on synthesized
-    // (zero-capture) buckets. Fold them for EVERY monitor-bearing bucket — like
-    // avg_imbalance_ratio above — so a captured (common-case) phase reports its
-    // per-phase imbalance peak and stuck count instead of dropping them. (Both
-    // are monitor-axis signals: imbalance from full-class rq.nr_running, stuck
-    // from non-advancing rq.clock across consecutive samples — neither is in
-    // the guest Snapshot read_sample observes. Both ALSO carry a typed
-    // run-level GauntletRow accessor, so this per-phase fold feeds per-phase
-    // RENDERING only; TYPED_FIELD_NAMES keeps them out of the run-level
-    // ext_metrics so the typed accessor stays the single run-level source.)
-    // `or_insert` still guards against overwriting a value already present.
-    if let Some(v) = pm.max_imbalance {
-        put("max_imbalance_ratio", v);
-    }
-    if pm.stuck_count > 0 {
-        put("stuck_count", pm.stuck_count as f64);
-    }
-    if synthesized {
-        if let Some(v) = pm.avg_dsq_depth {
-            put("avg_dsq_depth", v);
+        // avg_nr_running (Gauge(Avg)) is a monitor-axis signal (full-class
+        // rq.nr_running, no read_sample dispatch arm), so like avg_imbalance_ratio
+        // it is folded for EVERY monitor-bearing bucket (not gated on synthesized)
+        // — captured buckets have no other source for it. It feeds per-phase
+        // rendering + boundary change-detection only; the run-level value stays
+        // MonitorSummary::avg_nr_running (fold_run_level_ext), so the run-level ext
+        // re-pool (populate_run_ext_metrics_from_phases) SKIPS this key to avoid a
+        // double-source.
+        if let Some(v) = pm.avg_nr_running {
+            put("avg_nr_running", v);
         }
-        put("max_dsq_depth", pm.max_dsq_depth as f64);
-        // Bucket-native counter totals for fallback / keep_last: the first
-        // and last in-window samples carrying event counters, clamped with
-        // the same counter_delta MonitorSummary uses (a mid-phase scheduler
-        // restart can reset the counter, producing a negative raw delta).
-        // phase_from_bucket re-rates these over the bucket window, matching
-        // the read_sample representation captured buckets carry.
-        let has_events =
-            |s: &&crate::monitor::MonitorSample| s.cpus.iter().any(|c| c.event_counters.is_some());
+        // max_imbalance_ratio (Peak) and stuck_count (Counter) have NO read_sample
+        // dispatch arm (both fall to `_ => None` in crate::stats read_sample), so
+        // the per-sample capture path never produces them and a CAPTURED bucket
+        // would otherwise never carry them — they would surface only on synthesized
+        // (zero-capture) buckets. Fold them for EVERY monitor-bearing bucket — like
+        // avg_imbalance_ratio above — so a captured (common-case) phase reports its
+        // per-phase imbalance peak and stuck count instead of dropping them. (Both
+        // are monitor-axis signals: imbalance from full-class rq.nr_running, stuck
+        // from non-advancing rq.clock across consecutive samples — neither is in
+        // the guest Snapshot read_sample observes. Both ALSO carry a typed
+        // run-level GauntletRow accessor, so this per-phase fold feeds per-phase
+        // RENDERING only; TYPED_FIELD_NAMES keeps them out of the run-level
+        // ext_metrics so the typed accessor stays the single run-level source.)
+        // `or_insert` still guards against overwriting a value already present.
+        if let Some(v) = pm.max_imbalance {
+            put("max_imbalance_ratio", v);
+        }
+        if pm.stuck_count > 0 {
+            put("stuck_count", pm.stuck_count as f64);
+        }
+        if synthesized {
+            if let Some(v) = pm.avg_dsq_depth {
+                put("avg_dsq_depth", v);
+            }
+            put("max_dsq_depth", pm.max_dsq_depth as f64);
+        }
+        // Canonical event activity rates for both captured and synthesized
+        // buckets. Numerators and denominator share the same monitor endpoints.
+        let has_events = |s: &&crate::monitor::MonitorSample| s.has_complete_event_counters();
         let first_ev = phase_monitor_samples.iter().copied().find(has_events);
         let last_ev = phase_monitor_samples.iter().copied().rev().find(has_events);
-        if let (Some(first), Some(last)) = (first_ev, last_ev) {
+        if let (Some(first), Some(last)) = (first_ev, last_ev)
+            && let Some(vcpu_sec) =
+                crate::monitor::MonitorSummary::mean_vcpu_cpu_delta_secs(first, last)
+        {
             let fb = crate::monitor::counter_delta(
                 last.sum_event_field(|e| e.select_cpu_fallback).unwrap_or(0),
                 first
@@ -1271,10 +1158,12 @@ fn fold_monitor_into_bucket(
                 last.sum_event_field(|e| e.dispatch_keep_last).unwrap_or(0),
                 first.sum_event_field(|e| e.dispatch_keep_last).unwrap_or(0),
             );
-            put("total_fallback", fb as f64);
-            put("total_keep_last", kl as f64);
+            put("total_fallback_pooled", fb as f64);
+            put("total_keep_last_pooled", kl as f64);
+            put("total_event_vcpu_sec", vcpu_sec);
         }
     }
+    crate::stats::derive_rate_metrics(&mut bucket.metrics);
 }
 
 /// Clock skew (ms) between the host monitor's run-relative timeline and

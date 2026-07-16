@@ -619,9 +619,10 @@ pub enum WorkType {
     ///
     /// **`work_units` vs `iterations` — which assertion reads which:** the
     /// two `WorkerReport` counters are NOT interchangeable. Headline
-    /// throughput — `CgroupStats::total_iterations` and the derived rates
-    /// `iterations_per_worker` / `iterations_per_cpu_sec` and
-    /// `migration_ratio` — sums `WorkerReport::iterations`, NOT `work_units`.
+    /// throughput — `CgroupStats::total_iterations`, `iteration_rate`, and
+    /// `iterations_per_worker` — sums `WorkerReport::iterations`, NOT
+    /// `work_units`; `migration_ratio` uses that same counter as its
+    /// denominator.
     /// The default fairness/no-progress gate (`assert_not_stuck` and the
     /// `min_work_units` floor) and `assert_throughput_parity` read
     /// `WorkerReport::work_units`, NOT `iterations`. Populate BOTH (set them

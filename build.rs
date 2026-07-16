@@ -586,11 +586,10 @@ int main(void) {{
         // default-branch HEAD with no pin — that is how upstream's
         // wpb/wrust sub-crates silently appeared (HEAD moved). Bump
         // deliberately, re-verifying the wprof build at the new rev.
-        // The `--depth 1` bare-SHA fetch below works while the rev stays
-        // reachable from a ref: it does today (master's tip) and stays
-        // reachable as master advances (it becomes an ancestor); it
-        // would only break if upstream rewrote history to orphan it.
-        const WPROF_REV: &str = "aa60dbc9b358f1a59511d12befefa1bf89171058";
+        // v0.4, the latest published upstream release. Pin the release commit
+        // rather than unreleased master so ktstr does not silently absorb
+        // upstream build/API churn.
+        const WPROF_REV: &str = "9afa9ee5493814c7791586f2179aa93528fde54a";
         let wprof_src = out_dir.join("wprof-src");
 
         // Prefer the wprof binary cargo-ktstr already embedded

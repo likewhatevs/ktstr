@@ -37,8 +37,8 @@ cargo ktstr stats list-metrics --json   # machine-readable (includes kind + ever
  worst_p99_wake_latency_us               lower          50           0.25         µs
  worst_median_wake_latency_us            lower          20           0.25         µs
 ...
- iteration_rate                          higher         1            0.3          iter/s
- total_iterations                        higher         2            0.1
+ iteration_rate                          higher         10           0.1          iter/cpu-s
+ total_iterations                        info           2            0.1
 ```
 
 `list-metrics` reads only the static registry; it needs no sidecar
@@ -52,7 +52,7 @@ not its metric keys, so it cannot answer which metrics are present.)
 ## Registry fields
 
 - **name** — the metric key (e.g. `worst_spread`, `worst_gap_ms`,
-  `sched_count_per_sec`). This is the string a `PerfDeltaAssertion`
+  `sched_count_per_vcpu_sec`). This is the string a `PerfDeltaAssertion`
   names and the key `perf-delta` reports on.
 - **polarity** — the regression direction:
   - `LowerBetter` — an increase is a regression (latency, spread).
@@ -95,11 +95,11 @@ A metric only appears in a comparison if the run actually emitted it.
 | Family | Example metrics | Emitted by | Present when |
 |---|---|---|---|
 | Spread / gap | `worst_spread`, `worst_gap_ms` | every scenario (scheduling-latency capture) | always |
-| Iteration throughput | `total_iterations`, `worst_iterations_per_cpu_sec` | compute / spin workloads | the workload iterates; the `*_per_cpu_sec` form is overcommit-invariant |
-| schedstat counters / rates | `total_run_delay_ns_per_sched`, `total_ttwu_count`, `sched_count_per_sec` | schedstat sampling over the run | schedstat capture enabled |
+| Iteration efficiency | `iteration_rate`, `worst_iterations_per_cpu_sec` | compute / spin workloads | the workload iterates and reports CPU time; both are iterations per delivered guest CPU-second |
+| schedstat counters / rates | `total_run_delay_ns_per_sched`, `total_ttwu_count`, `sched_count_per_vcpu_sec` | schedstat sampling over the run | schedstat capture and complete vCPU CPU clocks enabled |
 | IRQ / pressure | `avg_irq_util`, `total_irq_pressure_us`, `max_cgroup_psi_irq_avg10` | IRQ-heavy scenarios, periodic host-pressure capture | those captures ran |
 | NUMA locality | `worst_page_locality`, `worst_cross_node_migration_ratio` | NUMA-aware scenarios | multi-node topology |
-| Built-in benchmark workloads | `sched_delay_msg_us`, `taobench_total_qps`, `schbench_loop_count` | the in-process `Schbench` / `Taobench` work types | a built-in `Schbench` / `Taobench` workload ran (not the `schbench`/`fio` binary payloads, which emit their own JSON keys) |
+| Built-in benchmark workloads | `sched_delay_msg_us`, `taobench_total_ops_per_cpu_sec`, `schbench_loops_per_cpu_sec` | the in-process `Schbench` / `Taobench` work types | a built-in `Schbench` / `Taobench` workload ran (not the `schbench`/`fio` binary payloads, which emit their own JSON keys) |
 
 Not every registry name can back a gate: `perf-delta --must-fail`
 rejects unknown names, internal rate components, per-phase-only

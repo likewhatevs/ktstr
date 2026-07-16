@@ -39,12 +39,17 @@ pub(crate) fn format_monitor_section(
     ];
 
     if let Some(ref ev) = s.event_deltas {
+        let rate = |value: Option<f64>| {
+            value
+                .map(|value| format!("{value:.1}"))
+                .unwrap_or_else(|| "n/a".to_string())
+        };
         lines.push(format!(
-            "events: fallback={} ({:.1}/s) keep_last={} ({:.1}/s) offline={}",
+            "events: fallback={} ({}/vcpu-s) keep_last={} ({}/vcpu-s) offline={}",
             ev.total_fallback,
-            ev.fallback_rate,
+            rate(ev.fallback_rate),
             ev.total_dispatch_keep_last,
-            ev.keep_last_rate,
+            rate(ev.keep_last_rate),
             ev.total_dispatch_offline,
         ));
         let mut extra = Vec::new();
@@ -84,25 +89,25 @@ pub(crate) fn format_monitor_section(
     }
 
     if let Some(ref ss) = s.schedstat_deltas {
-        // Per-second rates derived inline from the counters / the schedstat
-        // window. The cross-run-foldable forms live in the metric registry as
-        // *_per_sec Rates (Σnum/Σden); this single-run display computes the same
-        // quotient. 0.0 on a degenerate (single-sample) window.
-        let per_sec = |n: u64| {
-            if ss.total_schedstat_wall_sec > 0.0 {
-                n as f64 / ss.total_schedstat_wall_sec
-            } else {
-                0.0
-            }
-        };
-        lines.push(format!(
-            "schedstat: csw={} ({:.0}/s) run_delay={:.0}ns/s ttwu={} goidle={}",
-            ss.total_sched_count,
-            per_sec(ss.total_sched_count),
-            per_sec(ss.total_run_delay),
-            ss.total_ttwu_count,
-            ss.total_sched_goidle,
-        ));
+        if let Some(vcpu_sec) = ss.total_schedstat_vcpu_sec {
+            let per_vcpu_sec = |n: u64| n as f64 / vcpu_sec;
+            lines.push(format!(
+                "schedstat: csw={} ({:.0}/vcpu-s) run_delay={:.0}ns/vcpu-s ttwu={} goidle={}",
+                ss.total_sched_count,
+                per_vcpu_sec(ss.total_sched_count),
+                per_vcpu_sec(ss.total_run_delay),
+                ss.total_ttwu_count,
+                ss.total_sched_goidle,
+            ));
+        } else {
+            lines.push(format!(
+                "schedstat: csw={} run_delay={}ns ttwu={} goidle={} (rate unavailable: no vCPU CPU-time denominator)",
+                ss.total_sched_count,
+                ss.total_run_delay,
+                ss.total_ttwu_count,
+                ss.total_sched_goidle,
+            ));
+        }
     }
 
     if let Some(ref progs) = s.prog_stats_deltas {

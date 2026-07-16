@@ -586,18 +586,28 @@ impl MonitorSample {
         imbalance_ratio_of(&self.cpus)
     }
 
+    /// Whether every CPU in this non-empty sample has event counters.
+    pub(crate) fn has_complete_event_counters(&self) -> bool {
+        !self.cpus.is_empty() && self.cpus.iter().all(|cpu| cpu.event_counters.is_some())
+    }
+
+    /// Whether every CPU in this non-empty sample has runqueue schedstat data.
+    fn has_complete_schedstat(&self) -> bool {
+        !self.cpus.is_empty() && self.cpus.iter().all(|cpu| cpu.schedstat.is_some())
+    }
+
     /// Sum a field from event counters across all CPUs.
-    /// Returns `None` if no CPU has event counters.
+    ///
+    /// Returns `None` unless every CPU in this non-empty sample has counters.
+    /// A partial cross-CPU sum is not a valid numerator for rates whose
+    /// denominator covers every vCPU.
     pub fn sum_event_field(&self, f: fn(&ScxEventCounters) -> i64) -> Option<i64> {
-        let mut total = 0i64;
-        let mut any = false;
-        for cpu in &self.cpus {
-            if let Some(ev) = &cpu.event_counters {
-                total += f(ev);
-                any = true;
-            }
-        }
-        any.then_some(total)
+        self.has_complete_event_counters().then(|| {
+            self.cpus
+                .iter()
+                .map(|cpu| f(cpu.event_counters.as_ref().expect("completeness checked")))
+                .sum()
+        })
     }
 }
 
@@ -1591,9 +1601,10 @@ pub struct BpfMapFieldValue {
 /// Aggregate schedstat deltas computed from first/last monitor samples.
 ///
 /// All values are summed across CPUs and represent the delta over the
-/// monitoring window. `total_schedstat_wall_sec` carries that window's span in
-/// seconds — the denominator for the per-second schedstat Rate metrics
-/// (`*_per_sec`, derived in the metric registry).
+/// monitoring window. `total_schedstat_vcpu_sec` carries the average vCPU
+/// pthread CPU-clock advance over that same window — the denominator for the
+/// dilation-safe schedstat activity-density metrics (`*_per_vcpu_sec`, derived
+/// in the metric registry).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SchedstatDeltas {
     /// Total scheduling delay increase (ns) across all CPUs.
@@ -1610,10 +1621,12 @@ pub struct SchedstatDeltas {
     pub total_ttwu_count: u64,
     /// Total ttwu_local count increase across all CPUs.
     pub total_ttwu_local: u64,
-    /// Monitor-window span in seconds (last-first schedstat-bearing sample) —
-    /// the denominator for the per-second schedstat Rate metrics; 0.0 on a
-    /// degenerate single-sample window.
-    pub total_schedstat_wall_sec: f64,
+    /// Mean vCPU pthread CPU-clock advance in seconds over the first/last
+    /// schedstat-bearing samples. This is the CPU time an average vCPU actually
+    /// received, so host preemption does not inflate the denominator. `None`
+    /// when an endpoint lacks any vCPU clock, the vCPU vectors differ, a clock
+    /// regresses, or no CPU time accrued.
+    pub total_schedstat_vcpu_sec: Option<f64>,
 }
 
 /// Per-domain-level CFS load-balance counter deltas over the monitoring window.
@@ -1669,18 +1682,25 @@ pub struct SchedDomainLbDelta {
 /// Aggregate event counter statistics computed from first/last samples.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ScxEventDeltas {
+    /// Mean vCPU pthread CPU-clock advance over the event-counter endpoints.
+    /// Shared denominator for dilation-safe event activity rates.
+    pub total_event_vcpu_sec: Option<f64>,
     /// Total select_cpu_fallback events across all CPUs over the window.
     pub total_fallback: i64,
-    /// Fallback events per second (total_fallback / duration_secs).
-    pub fallback_rate: f64,
+    /// Fallback events per average vCPU CPU-second. The denominator is the
+    /// mean pthread CPU-clock advance across every vCPU over the same window,
+    /// so host preemption cannot dilute the rate. `None` when any endpoint
+    /// lacks a vCPU CPU clock or the window accrued no vCPU CPU time.
+    pub fallback_rate: Option<f64>,
     /// Max single-sample delta of fallback across all CPUs.
     pub max_fallback_burst: i64,
     /// Total dispatch_local_dsq_offline events.
     pub total_dispatch_offline: i64,
     /// Total dispatch_keep_last events.
     pub total_dispatch_keep_last: i64,
-    /// Keep-last events per second (total_dispatch_keep_last / duration_secs).
-    pub keep_last_rate: f64,
+    /// Keep-last events per average vCPU CPU-second. Same denominator and
+    /// loud-absent rules as [`Self::fallback_rate`].
+    pub keep_last_rate: Option<f64>,
     /// Total enq_skip_exiting events.
     pub total_enq_skip_exiting: i64,
     /// Total enq_skip_migration_disabled events.
@@ -1704,6 +1724,30 @@ pub struct ScxEventDeltas {
 }
 
 impl MonitorSummary {
+    /// Mean per-vCPU pthread CPU-clock advance between two monitor samples.
+    ///
+    /// Requiring a complete, stable vCPU vector is deliberate: event and
+    /// schedstat numerators are summed over every guest CPU, so estimating the
+    /// denominator from only the surviving clocks would silently fabricate a
+    /// rate. A blocked/idle vCPU contributes zero CPU time, which is correct for
+    /// this activity-density currency; host-preempted time contributes nothing.
+    pub(crate) fn mean_vcpu_cpu_delta_secs(
+        first: &MonitorSample,
+        last: &MonitorSample,
+    ) -> Option<f64> {
+        if first.cpus.is_empty() || first.cpus.len() != last.cpus.len() {
+            return None;
+        }
+        let mut total_ns = 0u64;
+        for (a, b) in first.cpus.iter().zip(&last.cpus) {
+            let (Some(a), Some(b)) = (a.vcpu_cpu_time_ns, b.vcpu_cpu_time_ns) else {
+                return None;
+            };
+            total_ns = total_ns.checked_add(b.checked_sub(a)?)?;
+        }
+        (total_ns > 0).then(|| total_ns as f64 / first.cpus.len() as f64 / 1_000_000_000.0)
+    }
+
     /// Summarize a run's monitor samples using the derived default
     /// preemption threshold (equivalent to
     /// [`from_samples_with_threshold`](Self::from_samples_with_threshold)
@@ -1750,22 +1794,48 @@ impl MonitorSummary {
         ext: &mut std::collections::BTreeMap<String, f64>,
         counter_keys: &mut std::collections::BTreeSet<String>,
     ) {
-        if self.total_samples == 0 {
-            return;
+        if self.total_samples > 0 {
+            ext.entry("avg_nr_running".to_string())
+                .or_insert(self.avg_nr_running);
+            if let Some(v) = self.avg_irq_util {
+                ext.entry("avg_irq_util".to_string()).or_insert(v);
+            }
+            if let Some(v) = self.max_avg_irq_util {
+                ext.entry("max_avg_irq_util".to_string()).or_insert(v);
+            }
+            if let Some(v) = self.psi_irq_full_avg10 {
+                ext.entry("psi_irq_full_avg10".to_string()).or_insert(v);
+            }
+            if let Some(v) = self.total_irq_pressure_us {
+                ext.entry("total_irq_pressure_us".to_string()).or_insert(v);
+            }
         }
-        ext.entry("avg_nr_running".to_string())
-            .or_insert(self.avg_nr_running);
-        if let Some(v) = self.avg_irq_util {
-            ext.entry("avg_irq_util".to_string()).or_insert(v);
+        if let Some(events) = &self.event_deltas
+            && let Some(vcpu_sec) = events.total_event_vcpu_sec
+        {
+            ext.entry("total_fallback_pooled".to_string())
+                .or_insert(events.total_fallback as f64);
+            ext.entry("total_keep_last_pooled".to_string())
+                .or_insert(events.total_dispatch_keep_last as f64);
+            ext.entry("total_event_vcpu_sec".to_string())
+                .or_insert(vcpu_sec);
         }
-        if let Some(v) = self.max_avg_irq_util {
-            ext.entry("max_avg_irq_util".to_string()).or_insert(v);
-        }
-        if let Some(v) = self.psi_irq_full_avg10 {
-            ext.entry("psi_irq_full_avg10".to_string()).or_insert(v);
-        }
-        if let Some(v) = self.total_irq_pressure_us {
-            ext.entry("total_irq_pressure_us".to_string()).or_insert(v);
+        if let Some(sd) = &self.schedstat_deltas {
+            for (key, value) in [
+                ("total_run_delay", sd.total_run_delay),
+                ("total_pcount", sd.total_pcount),
+                ("total_sched_count", sd.total_sched_count),
+                ("total_yld_count", sd.total_yld_count),
+                ("total_sched_goidle", sd.total_sched_goidle),
+                ("total_ttwu_count", sd.total_ttwu_count),
+                ("total_ttwu_local", sd.total_ttwu_local),
+            ] {
+                ext.entry(key.to_string()).or_insert(value as f64);
+            }
+            if let Some(vcpu_sec) = sd.total_schedstat_vcpu_sec {
+                ext.entry("total_schedstat_vcpu_sec".to_string())
+                    .or_insert(vcpu_sec);
+            }
         }
         // Per-domain-level CFS load-balance counters: one key set per topology
         // level present in the run, level-suffixed (e.g. lb_failed_mc). These
@@ -1979,8 +2049,8 @@ impl MonitorSummary {
     /// Compute event counter deltas from the sample series.
     /// Returns None if no samples have event counters.
     fn compute_event_deltas(samples: &[MonitorSample]) -> Option<ScxEventDeltas> {
-        // Find first and last samples that have event counters on any CPU.
-        let has_events = |s: &MonitorSample| s.cpus.iter().any(|c| c.event_counters.is_some());
+        // Find first and last samples with complete cross-vCPU event evidence.
+        let has_events = MonitorSample::has_complete_event_counters;
         let first = samples.iter().find(|s| has_events(s))?;
         let last = samples.iter().rev().find(|s| has_events(s))?;
 
@@ -1995,19 +2065,13 @@ impl MonitorSummary {
             first.sum_event_field(|e| e.dispatch_keep_last).unwrap_or(0),
         );
 
-        // Compute rates.
-        let duration_ms = last.elapsed_ms.saturating_sub(first.elapsed_ms);
-        let duration_secs = duration_ms as f64 / 1000.0;
-        let fallback_rate = if duration_secs > 0.0 {
-            total_fallback as f64 / duration_secs
-        } else {
-            0.0
-        };
-        let keep_last_rate = if duration_secs > 0.0 {
-            total_keep_last as f64 / duration_secs
-        } else {
-            0.0
-        };
+        // Dilation-safe activity density over the SAME endpoint pair as the
+        // event deltas. Dividing by mean vCPU CPU time preserves the historical
+        // total-events-per-second magnitude on an undilated fully-busy VM while
+        // excluding host-stolen time. Missing CPU-clock evidence stays absent.
+        let vcpu_secs = Self::mean_vcpu_cpu_delta_secs(first, last);
+        let fallback_rate = vcpu_secs.map(|secs| total_fallback as f64 / secs);
+        let keep_last_rate = vcpu_secs.map(|secs| total_keep_last as f64 / secs);
 
         // Max per-sample fallback burst: largest delta between consecutive
         // samples, summed across all CPUs. A counter reset between
@@ -2015,8 +2079,12 @@ impl MonitorSummary {
         // letting it decrease the running max.
         let mut max_fallback_burst: i64 = 0;
         for w in samples.windows(2) {
-            let prev_sum = w[0].sum_event_field(|e| e.select_cpu_fallback).unwrap_or(0);
-            let curr_sum = w[1].sum_event_field(|e| e.select_cpu_fallback).unwrap_or(0);
+            let (Some(prev_sum), Some(curr_sum)) = (
+                w[0].sum_event_field(|e| e.select_cpu_fallback),
+                w[1].sum_event_field(|e| e.select_cpu_fallback),
+            ) else {
+                continue;
+            };
             let delta = counter_delta(curr_sum, prev_sum);
             if delta > max_fallback_burst {
                 max_fallback_burst = delta;
@@ -2031,6 +2099,7 @@ impl MonitorSummary {
         };
 
         Some(ScxEventDeltas {
+            total_event_vcpu_sec: vcpu_secs,
             total_fallback,
             fallback_rate,
             max_fallback_burst,
@@ -2051,22 +2120,22 @@ impl MonitorSummary {
     }
 
     /// Compute schedstat deltas from the sample series.
-    /// Returns None if no samples have schedstat data on any CPU.
+    /// Returns None if no sample has complete cross-vCPU schedstat data.
     fn compute_schedstat_deltas(samples: &[MonitorSample]) -> Option<SchedstatDeltas> {
-        let has_schedstat = |s: &MonitorSample| s.cpus.iter().any(|c| c.schedstat.is_some());
+        let has_schedstat = MonitorSample::has_complete_schedstat;
         let first = samples.iter().find(|s| has_schedstat(s))?;
         let last = samples.iter().rev().find(|s| has_schedstat(s))?;
 
         let sum_field = |s: &MonitorSample, f: fn(&RqSchedstat) -> u64| -> u64 {
             s.cpus
                 .iter()
-                .filter_map(|c| c.schedstat.as_ref().map(&f))
+                .map(|c| f(c.schedstat.as_ref().expect("completeness checked")))
                 .sum()
         };
         let sum_field_u32 = |s: &MonitorSample, f: fn(&RqSchedstat) -> u32| -> u64 {
             s.cpus
                 .iter()
-                .filter_map(|c| c.schedstat.as_ref().map(|ss| f(ss) as u64))
+                .map(|c| f(c.schedstat.as_ref().expect("completeness checked")) as u64)
                 .sum()
         };
 
@@ -2085,14 +2154,10 @@ impl MonitorSummary {
         let total_ttwu_local = sum_field_u32(last, |ss| ss.ttwu_local)
             .saturating_sub(sum_field_u32(first, |ss| ss.ttwu_local));
 
-        // Window span over the SAME first/last schedstat-bearing samples the
-        // total_* deltas span — the provenance-correct per-second denominator
-        // (a different window than the IRQ total_phase_wall_sec, so this carries
-        // its own). The registry per-second Rates divide the total_* numerators
-        // by this; 0.0 on a single-sample window disables the rate (Rate
-        // derivation skips a zero/non-finite denominator).
-        let duration_ms = last.elapsed_ms.saturating_sub(first.elapsed_ms);
-        let duration_secs = duration_ms as f64 / 1000.0;
+        // CPU currency over the SAME first/last schedstat-bearing samples the
+        // total_* deltas span. Unlike wall duration, this does not grow while
+        // the host has preempted the guest's vCPU threads.
+        let total_schedstat_vcpu_sec = Self::mean_vcpu_cpu_delta_secs(first, last);
 
         Some(SchedstatDeltas {
             total_run_delay,
@@ -2102,7 +2167,7 @@ impl MonitorSummary {
             total_sched_goidle,
             total_ttwu_count,
             total_ttwu_local,
-            total_schedstat_wall_sec: duration_secs,
+            total_schedstat_vcpu_sec,
         })
     }
 
@@ -2384,9 +2449,11 @@ pub struct MonitorThresholds {
     pub fail_on_rq_clock_stuck: bool,
     /// Number of consecutive samples that must violate a threshold before flagging.
     pub sustained_samples: usize,
-    /// Max sustained select_cpu_fallback events/s across all CPUs.
+    /// Max sustained select_cpu_fallback events per average vCPU CPU-second
+    /// across all CPUs.
     pub max_fallback_rate: f64,
-    /// Max sustained dispatch_keep_last events/s across all CPUs.
+    /// Max sustained dispatch_keep_last events per average vCPU CPU-second
+    /// across all CPUs.
     pub max_keep_last_rate: f64,
     /// Promote threshold violations from report-only to pass/fail.
     /// When `false` (the default),
@@ -2458,10 +2525,10 @@ impl MonitorThresholds {
     ///   reconfiguration, cgroup creation, and scheduler restart.
     /// - max_fallback_rate 200.0: select_cpu_fallback fires when the
     ///   scheduler's ops.select_cpu() fails to find a CPU. Sustained
-    ///   200/s across all CPUs indicates systematic select_cpu failure.
+    ///   200/vCPU-s across all CPUs indicates systematic select_cpu failure.
     /// - max_keep_last_rate 100.0: dispatch_keep_last fires when a CPU
     ///   re-dispatches the previously running task because the scheduler
-    ///   provided nothing. Sustained 100/s indicates dispatch starvation.
+    ///   provided nothing. Sustained 100/vCPU-s indicates dispatch starvation.
     pub const fn new() -> Self {
         Self {
             max_imbalance_ratio: 4.0,
@@ -2716,7 +2783,7 @@ impl MonitorThresholds {
         if fallback_rate.sustained(self.sustained_samples) {
             failed = true;
             details.push(format!(
-                "fallback rate {:.1}/s exceeded threshold {:.1}/s for {} consecutive intervals (ending at sample {})",
+                "fallback rate {:.1}/vcpu-s exceeded threshold {:.1}/vcpu-s for {} consecutive intervals (ending at sample {})",
                 fallback_rate.worst_value,
                 self.max_fallback_rate,
                 fallback_rate.worst_run,
@@ -2726,7 +2793,7 @@ impl MonitorThresholds {
         if keep_last_rate.sustained(self.sustained_samples) {
             failed = true;
             details.push(format!(
-                "keep_last rate {:.1}/s exceeded threshold {:.1}/s for {} consecutive intervals (ending at sample {})",
+                "keep_last rate {:.1}/vcpu-s exceeded threshold {:.1}/vcpu-s for {} consecutive intervals (ending at sample {})",
                 keep_last_rate.worst_value,
                 self.max_keep_last_rate,
                 keep_last_rate.worst_run,
@@ -2822,12 +2889,11 @@ impl MonitorThresholds {
         stuck
     }
 
-    /// Per-interval event-counter rate computation against fallback /
-    /// keep_last thresholds. Returns `(fallback, keep_last)` trackers
-    /// keyed by sample index. Intervals with zero or negative duration,
-    /// or with missing event counters on either side, record a
-    /// non-violation `0.0` so the sustained-window state machine
-    /// continues to advance.
+    /// Per-interval event-counter activity density against fallback /
+    /// keep_last thresholds. The denominator is mean vCPU CPU-seconds, not
+    /// wall time, so host preemption cannot make a broken scheduler look quiet.
+    /// Intervals lacking a complete CPU-clock denominator or event counters
+    /// record a non-violation and reset the sustained streak.
     fn track_event_rates(
         &self,
         samples: &[MonitorSample],
@@ -2838,12 +2904,11 @@ impl MonitorThresholds {
         for i in 1..samples.len() {
             let prev = &samples[i - 1];
             let curr = &samples[i];
-            let interval_s = curr.elapsed_ms.saturating_sub(prev.elapsed_ms) as f64 / 1000.0;
-            if interval_s <= 0.0 {
+            let Some(interval_s) = MonitorSummary::mean_vcpu_cpu_delta_secs(prev, curr) else {
                 fallback_rate.record(false, 0.0, i);
                 keep_last_rate.record(false, 0.0, i);
                 continue;
-            }
+            };
 
             if let (Some(prev_fb), Some(curr_fb)) = (
                 prev.sum_event_field(|e| e.select_cpu_fallback),

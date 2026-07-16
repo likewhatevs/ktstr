@@ -376,7 +376,7 @@ fn derive_writes_non_schbench_per_cgroup_value_for_value() {
     // RATIOS — per-cgroup == single-carrier cgroup_stats value-for-value.
     assert!((m("migration_ratio") - cg_a.migration_ratio).abs() < 1e-12);
     assert!((m("iterations_per_worker") - cg_a.iterations_per_worker().unwrap()).abs() < 1e-9);
-    assert!((m("iterations_per_cpu_sec") - cg_a.iterations_per_cpu_sec().unwrap()).abs() < 1e-9);
+    assert!((m("iteration_rate") - cg_a.iterations_per_cpu_sec().unwrap()).abs() < 1e-9);
     assert!((m("cross_node_migration_ratio") - cg_a.cross_node_migration_ratio).abs() < 1e-12);
     // page_locality: cgroup_stats hardcodes 0.0 (no NUMA node context in the
     // reports-only builder), so parity is against the hand-derived value from
@@ -464,7 +464,7 @@ fn derive_non_schbench_absent_discipline() {
         "max_off_cpu_pct",
         "off_cpu_spread_pct",
         "iterations_per_worker",
-        "iterations_per_cpu_sec",
+        "iteration_rate",
         "page_locality",
         "cross_node_migration_ratio",
     ] {

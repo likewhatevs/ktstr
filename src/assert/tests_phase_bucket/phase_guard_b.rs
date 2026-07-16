@@ -240,16 +240,12 @@ fn build_phase_buckets_with_stimulus_none_offset_falls_back_to_stamped_step() {
     );
 }
 
-/// Iteration-rate attribution regression: in the production shape (periodic captures carry
-/// workload-relative boundary offsets in the step INTERIOR + stimulus
-/// events carry step_index), iteration_rate must attach to the step the
-/// rate was measured DURING — by step_index, NOT by a timestamp-window
-/// match against the capture-derived (interior) bucket window. The
-/// step-START (prev.elapsed_ms) falls in the inter-step gap, inside no
-/// interior bucket window, so the old window match dropped every rate.
-/// This pins the step_index attribution; it FAILS on the window match.
+/// Stimulus iteration deltas must not resurrect the former wall-denominated
+/// rate, even when interior captures and step indices provide enough data to
+/// attribute those deltas to a phase. The canonical rate additionally needs
+/// the matching guest CPU-time carrier.
 #[test]
-fn build_phase_buckets_with_stimulus_iteration_rate_attaches_by_step_not_interior_window() {
+fn build_phase_buckets_with_stimulus_interior_windows_do_not_create_wall_rate() {
     use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
     use crate::timeline::StimulusEvent;
     // One capture per step, each at the step INTERIOR (offset strictly
@@ -283,48 +279,37 @@ fn build_phase_buckets_with_stimulus_iteration_rate_attaches_by_step_not_interio
     };
     let stimulus = vec![stim(1000, 1, 0), stim(2000, 2, 1000), stim(3000, 3, 3000)];
     let phases = crate::assert::build_phase_buckets_with_stimulus(&samples, &stimulus);
-    // Step 1 bucket (step_index==1): rate for (step1@1000 -> step2@2000),
-    // iters 0->1000 over 1s = 1000/s. Its window is the single interior
-    // capture [1500,1500], which does NOT contain the step-start 1000 —
-    // the old window match dropped this rate.
+    // Step 1's stimulus delta is 1000 iterations over 1 wall second.
+    // It must remain absent because no matching guest CPU-time carrier exists.
     let step1 = phases
         .iter()
         .find(|p| p.step_index == 1)
         .expect("Step[0] bucket present");
     assert_eq!(
         step1.metrics.get("iteration_rate").copied(),
-        Some(1000.0),
-        "step 1 iteration_rate must attach by step_index to the interior \
-         bucket; got {:?} (start_ms={}, end_ms={})",
+        None,
+        "stimulus wall time must not produce the CPU-denominated iteration_rate; \
+         got {:?} (start_ms={}, end_ms={})",
         step1.metrics.get("iteration_rate"),
         step1.start_ms,
         step1.end_ms,
     );
-    // Step 2 bucket: rate for (step2@2000 -> step3@3000), iters
-    // 1000->3000 over 1s = 2000/s.
+    // The same holds for Step 2's 2000-iteration wall delta.
     let step2 = phases
         .iter()
         .find(|p| p.step_index == 2)
         .expect("Step[1] bucket present");
     assert_eq!(
         step2.metrics.get("iteration_rate").copied(),
-        Some(2000.0),
-        "step 2 iteration_rate must attach by step_index; got {:?}",
+        None,
+        "stimulus wall time must not produce iteration_rate; got {:?}",
         step2.metrics.get("iteration_rate"),
     );
 }
 
-/// Each step's `iteration_rate` is the STEP-LOCAL
-/// `StepStart[k]` -> `StepEnd[k]` delta (its OWN workers, start-to-end of
-/// hold), NOT the cross-step `StepStart[k]` -> `StepStart[k+1]` delta.
-/// Workers respawned per step read ~0 at every StepStart, so the
-/// cross-step delta is `0 - 0` and yields no rate (the old cross-step bug:
-/// every fresh-per-step phase silently had no throughput). Pairing each
-/// step's own StepStart -> StepEnd recovers the real per-step rate. The
-/// elapsed-sorted `windows(2)` walk pairs `StepStart[k]` -> `StepEnd[k]`
-/// first (both carry step_index `k`); `or_insert` keeps that step-local
-/// rate, and the intervening `StepEnd[k]` -> `StepStart[k+1]` pair reads
-/// `0 <= end` so `rate_to` returns None and never overwrites.
+/// Stimulus boundary deltas must not create `iteration_rate`. Respawned
+/// workers make wall-clock boundary arithmetic especially misleading; the
+/// canonical rate requires matching guest iteration and CPU-time carriers.
 #[test]
 fn build_phase_buckets_with_stimulus_pairs_step_local_for_respawned_workers() {
     use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
@@ -383,30 +368,23 @@ fn build_phase_buckets_with_stimulus_pairs_step_local_for_respawned_workers() {
         .expect("step 2 bucket present");
     assert_eq!(
         step1.metrics.get("iteration_rate").copied(),
-        Some(10_000.0),
-        "step 1 must report its step-local StepStart->StepEnd rate, not the \
-         cross-step 0->0 delta (the old cross-step silent None); got {:?}",
+        None,
+        "step 1 has no delivered-CPU carrier, so iteration_rate stays absent; got {:?}",
         step1.metrics.get("iteration_rate"),
     );
     assert_eq!(
         step2.metrics.get("iteration_rate").copied(),
-        Some(5_000.0),
-        "step 2 (respawned workers) must report its step-local rate; got {:?}",
+        None,
+        "step 2 has no delivered-CPU carrier, so iteration_rate stays absent; got {:?}",
         step2.metrics.get("iteration_rate"),
     );
 }
 
-/// A PERSISTENT (Backdrop) population keeps iterating through
-/// the inter-step teardown, so `StepStart[k+1]` reads MORE than
-/// `StepEnd[k]` and the cross-step `StepEnd[k]` -> `StepStart[k+1]` pair
-/// WOULD yield a rate. But that pair has an `is_step_end` `prev`, so the
-/// attribution loop's guard skips it before `rate_components`/`or_insert` ever
-/// run — the cross-step rate is never even computed, and each step
-/// reports only its own step-local `StepStart[k]` -> `StepEnd[k]`
-/// throughput. (`or_insert` is a redundant secondary safety here, not
-/// the operative mechanism — the guard is.)
+/// Persistent workers may advance during inter-step teardown. None of those
+/// wall-clock boundary deltas may become `iteration_rate`; only guest carrier
+/// CPU accounting is authoritative.
 #[test]
-fn build_phase_buckets_with_stimulus_step_local_wins_over_persistent_cross_step() {
+fn build_phase_buckets_with_stimulus_never_uses_persistent_cross_step_wall_delta() {
     use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
     use crate::timeline::StimulusEvent;
     let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
@@ -439,12 +417,8 @@ fn build_phase_buckets_with_stimulus_step_local_wins_over_persistent_cross_step(
         is_terminal: false,
         is_step_end: true,
     };
-    // Step 1 local: 0 -> 10000 over 1s (10000/s). Persistent workers add
-    // 500 in the 100ms teardown gap, so StepStart[2] reads 10500 — the
-    // cross-step StepEnd[1] -> StepStart[2] pair would compute 500/0.1s =
-    // 5000/s, but its is_step_end prev is skipped by the guard so that
-    // rate is never computed for step 1.
-    // Step 2 local: 10500 -> 15500 over 1s (5000/s).
+    // The event stream contains both large step-local deltas and an inter-step
+    // teardown delta. None may become the CPU-denominated metric.
     let stimulus = vec![
         start(1_000, 1, 0),
         end(2_000, 1, 10_000),
@@ -463,29 +437,22 @@ fn build_phase_buckets_with_stimulus_step_local_wins_over_persistent_cross_step(
         .expect("step 2 bucket present");
     assert_eq!(
         step1.metrics.get("iteration_rate").copied(),
-        Some(10_000.0),
-        "step-local rate must win over the 5000/s persistent cross-step \
-         delta (the is_step_end guard skips the cross-step pair); got {:?}",
+        None,
+        "stimulus deltas must not synthesize the CPU-denominated rate; got {:?}",
         step1.metrics.get("iteration_rate"),
     );
     assert_eq!(
         step2.metrics.get("iteration_rate").copied(),
-        Some(5_000.0),
-        "step 2 must report its own start-to-end-of-hold rate; got {:?}",
+        None,
+        "stimulus deltas must not synthesize the CPU-denominated rate; got {:?}",
         step2.metrics.get("iteration_rate"),
     );
 }
 
-/// A STALLED step (its own `StepStart[k] -> StepEnd[k]` delta is zero)
-/// must report its MEASURED-ZERO rate `Some(0.0)` — it must NOT leak the
-/// inter-step teardown-gap rate that the `StepEnd[k] -> StepStart[k+1]`
-/// pair would otherwise produce. StepEnd[k] carries step_index `k`, so
-/// without the `is_step_end` guard in the attribution loop that cross-step
-/// pair (prev = StepEnd[k], also step_index `k`) would `or_insert` a gap
-/// rate into bucket `k`. This pins the guard: bucket `k` is sourced ONLY
-/// by its own StepStart -> StepEnd pair (which here is a measured zero).
+/// A stalled wall-clock step and a busy teardown gap still provide no
+/// delivered-CPU rate without a guest carrier.
 #[test]
-fn build_phase_buckets_with_stimulus_stalled_step_reports_measured_zero() {
+fn build_phase_buckets_with_stimulus_stalled_wall_step_has_no_cpu_rate() {
     use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
     use crate::timeline::StimulusEvent;
     let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
@@ -518,13 +485,9 @@ fn build_phase_buckets_with_stimulus_stalled_step_reports_measured_zero() {
         is_terminal: false,
         is_step_end: true,
     };
-    // Step 1 STALLED: StepStart[1] == StepEnd[1] == 0, so its step-local
-    // pair is rate_components (0.0, secs), derived iteration_rate 0.0 —
-    // measured zero throughput. A persistent
-    // population then advances 500 during the 100ms teardown gap, so the
-    // cross-step StepEnd[1](0) -> StepStart[2](500) pair WOULD compute
-    // 500/0.1s = 5000/s — which must NOT land in bucket 1 (it is
-    // guard-skipped). Step 2 runs normally: 500 -> 1500 over 1s = 1000/s.
+    // Step 1 is stalled, then a persistent population advances during the
+    // teardown gap. Neither the flat hold nor the inter-step wall delta can
+    // produce a delivered-CPU rate without a carrier.
     let stimulus = vec![
         start(1_000, 1, 0),
         end(2_000, 1, 0),
@@ -543,32 +506,25 @@ fn build_phase_buckets_with_stimulus_stalled_step_reports_measured_zero() {
         .expect("step 2 bucket present");
     assert_eq!(
         step1.metrics.get("iteration_rate").copied(),
-        Some(0.0),
-        "a stalled step reports measured-zero throughput, not the leaked \
-         5000/s teardown gap rate from the StepEnd[1] -> StepStart[2] pair; \
-         got {:?}",
+        None,
+        "a wall-only stalled step has no delivered-CPU rate; got {:?}",
         step1.metrics.get("iteration_rate"),
     );
     assert_eq!(
         step2.metrics.get("iteration_rate").copied(),
-        Some(1_000.0),
-        "step 2 still reports its own step-local rate; got {:?}",
+        None,
+        "a wall-only step has no delivered-CPU rate; got {:?}",
         step2.metrics.get("iteration_rate"),
     );
 }
 
-/// Pins the ms→s unit conversion + end-to-end component emission for the
-/// iteration_rate Rate: a step over a 2000ms window with a 1000-iteration
-/// delta must emit total_phase_duration_sec == 2.0 (NOT 2000 — the /1000
-/// lives in the component because derive_rate_metrics does a bare num/den)
-/// and total_phase_iterations == 1000, so the re-derived iteration_rate is
-/// 1000 / 2.0 = 500/s. A regression leaving the denominator in ms would
-/// derive 1000/2000 = 0.5 and pass every type/naming gate silently.
+/// A wall-clock stimulus delta must emit neither the former wall-rate
+/// components nor `iteration_rate`.
 #[test]
-fn build_phase_buckets_with_stimulus_emits_rate_components_in_seconds() {
+fn build_phase_buckets_with_stimulus_does_not_emit_wall_rate_components() {
     use crate::timeline::StimulusEvent;
-    // No capture samples for step 1 → the synthesized-bucket seam creates
-    // it and the attribution loop fills the components from the stimulus.
+    // No capture samples for step 1: the synthesized-bucket seam creates it,
+    // but the wall-only stimulus stream contributes no rate components.
     let samples = SampleSeries::from_drained_typed(vec![], None);
     let stimulus = vec![
         StimulusEvent {
@@ -600,31 +556,27 @@ fn build_phase_buckets_with_stimulus_emits_rate_components_in_seconds() {
         .expect("step 1 bucket synthesized from stimulus");
     assert_eq!(
         step1.metrics.get("total_phase_duration_sec").copied(),
-        Some(2.0),
-        "duration component is SECONDS (2000ms / 1000), not ms; got {:?}",
+        None,
+        "wall duration is no longer an iteration-rate component; got {:?}",
         step1.metrics.get("total_phase_duration_sec"),
     );
     assert_eq!(
         step1.metrics.get("total_phase_iterations").copied(),
-        Some(1_000.0),
-        "iteration component is the 1000-iteration delta",
+        None,
+        "stimulus iteration deltas are no longer metric components",
     );
     assert_eq!(
         step1.metrics.get("iteration_rate").copied(),
-        Some(500.0),
-        "derived iteration_rate = 1000 iters / 2.0 s = 500/s (NOT 0.5 from a \
-         ms denominator); got {:?}",
+        None,
+        "no guest CPU-time carrier means no iteration_rate; got {:?}",
         step1.metrics.get("iteration_rate"),
     );
 }
 
-/// The LAST step has no successor step event, so its
-/// iteration_rate needs the terminal scenario-end boundary. The
-/// terminal supplies that boundary (last step's rate = delta to the
-/// terminal count) and must NOT seed a phantom bucket — the bucket set
-/// stays equal to the sample-derived phases.
+/// A terminal scenario event must not seed a phantom bucket or synthesize a
+/// wall-denominated rate for the last step.
 #[test]
-fn build_phase_buckets_with_stimulus_terminal_gives_last_step_rate_no_phantom_bucket() {
+fn build_phase_buckets_with_stimulus_terminal_adds_no_phantom_or_wall_rate() {
     use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
     use crate::timeline::StimulusEvent;
     let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
@@ -648,10 +600,8 @@ fn build_phase_buckets_with_stimulus_terminal_gives_last_step_rate_no_phantom_bu
         is_terminal: false,
         is_step_end: false,
     };
-    // Step starts at 1000/2000 (iters 0/1000); terminal at 3000 with
-    // final iters 3000 — the right boundary the LAST step (step 2)
-    // needs. The terminal carries step_index None + is_terminal so it
-    // seeds no bucket.
+    // The terminal carries step_index None + is_terminal, so it seeds no
+    // bucket and its wall delta is not a metric source.
     let stimulus = vec![
         stim(1000, 1, 0),
         stim(2000, 2, 1000),
@@ -664,27 +614,21 @@ fn build_phase_buckets_with_stimulus_terminal_gives_last_step_rate_no_phantom_bu
         vec![1, 2],
         "terminal must not add a phantom bucket; got {idxs:?}",
     );
-    // Step 2 is the LAST step: its rate comes from the terminal,
-    // 1000 -> 3000 over 1s = 2000/s. Without the terminal it would be
-    // None (the bug this fixes).
     let step2 = phases
         .iter()
         .find(|p| p.step_index == 2)
         .expect("step 2 bucket present");
     assert_eq!(
         step2.metrics.get("iteration_rate").copied(),
-        Some(2000.0),
-        "last step's iteration_rate must come from the terminal boundary",
+        None,
+        "terminal wall deltas must not produce a delivered-CPU rate",
     );
 }
 
-/// First-step zero-baseline rate, through the production aggregator + the FULL from_wire
-/// path (unit tests previously injected Some(0) directly, masking the
-/// wire 0->None collapse). The first step frame reads 0 cumulative
-/// iterations; after dropping the sentinel the first step's bucket gets
-/// a rate.
+/// A first-step zero iteration sentinel traversing the full wire path still
+/// must not create a CPU rate without delivered-CPU evidence.
 #[test]
-fn build_phase_buckets_with_stimulus_first_step_zero_baseline_from_wire() {
+fn build_phase_buckets_with_stimulus_wire_zero_does_not_create_cpu_rate() {
     use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
     use crate::timeline::StimulusEvent;
     let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
@@ -718,20 +662,15 @@ fn build_phase_buckets_with_stimulus_first_step_zero_baseline_from_wire() {
         .expect("step 1 bucket present");
     assert_eq!(
         step1.metrics.get("iteration_rate").copied(),
-        Some(2000.0),
-        "first step's iteration_rate must compute from the 0 baseline",
+        None,
+        "wire iteration counts without CPU time must not produce iteration_rate",
     );
 }
 
-/// Loop-hold attribution: once the guest emits a start frame
-/// for a Loop step (the run_step Loop arm), a scenario ending on a Loop
-/// step must attribute the final window's throughput to the LOOP step,
-/// NOT graft it onto the prior step. This pins the host-side contract
-/// the guest fix relies on: with the loop step's own start frame
-/// present, (loop_start -> terminal) lands on the loop step's bucket and
-/// (prior_start -> loop_start) lands on the prior step's bucket.
+/// Loop-step boundary events also remain wall-only and cannot graft a rate
+/// onto either the loop or its preceding step.
 #[test]
-fn build_phase_buckets_with_stimulus_loop_step_rate_no_prior_graft() {
+fn build_phase_buckets_with_stimulus_loop_events_do_not_create_cpu_rate() {
     use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
     use crate::timeline::StimulusEvent;
     let mk = |tag: &str, offset_ms: u64| DrainedSnapshotEntry {
@@ -771,19 +710,15 @@ fn build_phase_buckets_with_stimulus_loop_step_rate_no_prior_graft() {
         .iter()
         .find(|p| p.step_index == 2)
         .expect("loop step bucket");
-    // Prior step gets ONLY its own window (0 -> 1000 over 1s = 1000/s),
-    // NOT the loop window grafted on.
     assert_eq!(
         step1.metrics.get("iteration_rate").copied(),
-        Some(1000.0),
-        "prior step must not absorb the loop step's window",
+        None,
+        "prior step has no CPU-time carrier",
     );
-    // Loop step gets the (loop_start -> terminal) rate: 1000 -> 3000
-    // over 1s = 2000/s.
     assert_eq!(
         loop_step.metrics.get("iteration_rate").copied(),
-        Some(2000.0),
-        "loop step must get its own throughput from its start frame + terminal",
+        None,
+        "loop step has no CPU-time carrier",
     );
 }
 
@@ -1010,29 +945,24 @@ fn populate_run_ext_metrics_from_phases_skips_avg_nr_running() {
     );
 }
 
-/// A synthesized zero-capture phase (sample_count==0) still folds into
-/// the run aggregate — its capture-independent iteration_rate is
-/// INCLUDED, not dropped. iteration_rate is now a MetricKind::Rate, so
-/// inclusion is via its Counter components (total_phase_iterations /
-/// total_phase_duration_sec) SUMMING across phases (weights ignored — see
-/// aggregate_finite) and the rate re-deriving as Σiters/Σseconds. A
-/// regression dropping the synthesized phase would silently re-drop its
-/// iterations from the sidecar aggregate: the run-level variant of the
-/// synthesized-bucket bug. Unequal phase durations make the re-pool (450) distinct from both
-/// a mean-of-ratios (500) and a dropped-synthesized result (400).
+/// A synthesized zero-capture phase can still carry guest iteration and CPU
+/// components into the run aggregate. The rate re-pools as
+/// Σiterations/ΣCPU-seconds; capture count is irrelevant to guest CPU
+/// accounting. Unequal denominators distinguish this from averaging ratios or
+/// dropping the zero-capture carrier.
 #[test]
 fn populate_run_ext_metrics_repools_synthesized_zero_capture_phase() {
     use crate::assert::PhaseBucket;
     use std::collections::BTreeMap;
     // Captured phase: 1200 iters over 3s = 400/s.
     let cap = BTreeMap::from([
-        ("total_phase_iterations".to_string(), 1200.0),
-        ("total_phase_duration_sec".to_string(), 3.0),
+        ("total_iterations_pooled".to_string(), 1200.0),
+        ("total_cpu_time_sec".to_string(), 3.0),
     ]);
     // Synthesized zero-capture phase: 600 iters over 1s = 600/s.
     let synth = BTreeMap::from([
-        ("total_phase_iterations".to_string(), 600.0),
-        ("total_phase_duration_sec".to_string(), 1.0),
+        ("total_iterations_pooled".to_string(), 600.0),
+        ("total_cpu_time_sec".to_string(), 1.0),
     ]);
     let phases = vec![
         PhaseBucket {
@@ -1071,7 +1001,7 @@ fn populate_run_ext_metrics_repools_synthesized_zero_capture_phase() {
     );
     // The summed components survive for any further re-derivation.
     assert_eq!(
-        target.get("total_phase_iterations").copied(),
+        target.get("total_iterations_pooled").copied(),
         Some(1800.0),
         "components sum across phases (weights ignored for Counters)",
     );

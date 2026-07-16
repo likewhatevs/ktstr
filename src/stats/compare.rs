@@ -882,23 +882,52 @@ pub(crate) fn render_overcommit_warning(
     let over_b = overcommitted(rows_b);
     let mixed_a = mixed_folded(rows_a);
     let mixed_b = mixed_folded(rows_b);
+    let dilation_range = |rows: &[GauntletRow]| -> Option<(f64, f64)> {
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        for dilation in rows
+            .iter()
+            .filter(|row| !row.is_skip())
+            .filter_map(|row| row.host_dilation)
+            .filter(|dilation| dilation.is_finite() && *dilation > 0.0)
+        {
+            min = min.min(dilation);
+            max = max.max(dilation);
+        }
+        (max > 1.05).then_some((min, max))
+    };
+    let dilation_a = dilation_range(rows_a);
+    let dilation_b = dilation_range(rows_b);
 
-    if over_a.is_empty() && over_b.is_empty() && mixed_a.is_empty() && mixed_b.is_empty() {
+    if over_a.is_empty()
+        && over_b.is_empty()
+        && mixed_a.is_empty()
+        && mixed_b.is_empty()
+        && dilation_a.is_none()
+        && dilation_b.is_none()
+    {
         return None;
     }
 
     let any_overcommit = !over_a.is_empty() || !over_b.is_empty();
+    let any_dilation = dilation_a.is_some() || dilation_b.is_some();
     let mut out = String::new();
-    if any_overcommit {
-        // Host time-slicing actually occurred -> raw timing is confounded.
+    if any_dilation {
+        let _ = writeln!(
+            out,
+            "ktstr: WARNING: measured host dilation exceeds 1.05 in this \
+             comparison. CPU-denominated iteration, event, schedstat, and IRQ \
+             rates exclude host-preempted time; genuinely wall-semantic latency, \
+             off-CPU, gap, PSI, and upstream wall-throughput values remain raw and \
+             must be interpreted with the dilation shown below."
+        );
+    } else if any_overcommit {
         let _ = writeln!(
             out,
             "ktstr: WARNING: CPU-budget hazard in this comparison — a run was \
-             host-overcommitted, so its guest-scheduler timing metrics \
-             (wake-latency / off-CPU / run-delay) are host-contention-confounded. \
-             Compare the overcommit-invariant worst_iterations_per_cpu_sec metric \
-             instead of raw \
-             timing."
+             structurally host-overcommitted. CPU-denominated rates are robust, \
+             while wall-semantic latency / run-delay / off-CPU / gap / PSI / upstream wall-throughput \
+             values may be host-contention-confounded."
         );
     } else {
         // Mixed budgets with NO overcommit: no host contention, the hazard is
@@ -939,6 +968,18 @@ pub(crate) fn render_overcommit_warning(
     };
     emit_side("A", &over_a, &mixed_a);
     emit_side("B", &over_b, &mixed_b);
+    for (label, range) in [("A", dilation_a), ("B", dilation_b)] {
+        if let Some((min, max)) = range {
+            if (max - min).abs() < f64::EPSILON {
+                let _ = writeln!(out, "  side {label}: measured dilation D={max:.3}");
+            } else {
+                let _ = writeln!(
+                    out,
+                    "  side {label}: measured dilation D={min:.3}..{max:.3}"
+                );
+            }
+        }
+    }
     Some(out)
 }
 

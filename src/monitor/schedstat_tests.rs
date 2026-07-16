@@ -24,6 +24,7 @@ fn sample_with_schedstat(
             CpuSnapshot {
                 nr_running: 2,
                 rq_clock: clock_base,
+                vcpu_cpu_time_ns: Some(1_000_000_000 + elapsed_ms * 1_000_000),
                 schedstat: Some(RqSchedstat {
                     run_delay,
                     pcount,
@@ -36,6 +37,7 @@ fn sample_with_schedstat(
             CpuSnapshot {
                 nr_running: 2,
                 rq_clock: clock_base + 100,
+                vcpu_cpu_time_ns: Some(2_000_000_000 + elapsed_ms * 1_000_000),
                 schedstat: Some(RqSchedstat {
                     run_delay,
                     pcount,
@@ -63,10 +65,9 @@ fn schedstat_deltas_computed_from_samples() {
     assert_eq!(d.total_pcount, 20);
     assert_eq!(d.total_sched_count, 100);
     assert_eq!(d.total_ttwu_count, 60);
-    // Window = elapsed 0->1000ms = 1.0s; the per-second rates derive in the
-    // registry as total_X / total_schedstat_wall_sec (8000/1 = 8000 ns/s,
-    // 100/1 = 100 csw/s).
-    assert!((d.total_schedstat_wall_sec - 1.0).abs() < f64::EPSILON);
+    // Both vCPU clocks advance by 1s, so the mean vCPU CPU-time denominator is
+    // 1s. Registry rates therefore preserve their undilated historical scale.
+    assert_eq!(d.total_schedstat_vcpu_sec, Some(1.0));
 }
 
 #[test]
@@ -77,32 +78,66 @@ fn schedstat_deltas_none_without_schedstat() {
 }
 
 #[test]
+fn schedstat_deltas_none_with_partial_cross_cpu_data() {
+    let mut first = sample_with_schedstat(0, 1000, 1000, 10, 50, 30);
+    let mut last = sample_with_schedstat(1000, 2000, 5000, 20, 100, 60);
+    first.cpus[1].schedstat = None;
+    last.cpus[1].schedstat = None;
+
+    let summary = MonitorSummary::from_samples(&[first, last]);
+    assert!(
+        summary.schedstat_deltas.is_none(),
+        "a partial numerator must not be paired with the all-vCPU CPU-time denominator",
+    );
+}
+
+#[test]
 fn schedstat_deltas_single_sample() {
-    // Single sample -> first == last, duration=0 -> window 0.0 (the registry
-    // Rate derivation skips a zero denominator, so no per-second rate emits).
+    // Single sample -> first == last -> no CPU-time denominator.
     let samples = vec![sample_with_schedstat(100, 1000, 5000, 10, 50, 30)];
     let summary = MonitorSummary::from_samples(&samples);
     let d = summary.schedstat_deltas.unwrap();
-    assert_eq!(d.total_schedstat_wall_sec, 0.0);
+    assert_eq!(d.total_schedstat_vcpu_sec, None);
     assert_eq!(d.total_run_delay, 0);
 }
 
 #[test]
 fn schedstat_deltas_rates() {
-    // 500ms window; per-CPU run_delay +2000, sched_count +40. The per-second
-    // rates re-derive in the registry as total_X / total_schedstat_wall_sec.
+    // 500ms of mean vCPU CPU time; per-CPU run_delay +2000,
+    // sched_count +40. Rates re-derive against that CPU currency.
     let samples = vec![
         sample_with_schedstat(0, 1000, 1000, 5, 10, 20),
         sample_with_schedstat(500, 2000, 3000, 15, 50, 40),
     ];
     let summary = MonitorSummary::from_samples(&samples);
     let d = summary.schedstat_deltas.unwrap();
-    // Window = 0->500ms = 0.5s.
-    assert!((d.total_schedstat_wall_sec - 0.5).abs() < f64::EPSILON);
-    // 2 CPUs, each delta = 2000, total = 4000 (registry rate 4000/0.5 = 8000 ns/s).
+    assert_eq!(d.total_schedstat_vcpu_sec, Some(0.5));
+    // 2 CPUs, each delta = 2000, total = 4000 (4000/0.5 = 8000 ns/vcpu-s).
     assert_eq!(d.total_run_delay, 4000);
-    // 2 CPUs, each sched_count delta = 40, total = 80 (registry rate 80/0.5 = 160 csw/s).
+    // 2 CPUs, each sched_count delta = 40, total = 80 (160/vcpu-s).
     assert_eq!(d.total_sched_count, 80);
+}
+
+#[test]
+fn schedstat_cpu_denominator_ignores_elapsed_wall_dilation() {
+    let first = sample_with_schedstat(0, 1_000, 1000, 5, 10, 20);
+    let mut undilated = sample_with_schedstat(500, 2_000, 3000, 15, 50, 40);
+    let mut dilated = sample_with_schedstat(50_000, 2_000, 3000, 15, 50, 40);
+    for sample in [&mut undilated, &mut dilated] {
+        for (cpu, ns) in sample.cpus.iter_mut().zip([1_500_000_000, 2_500_000_000]) {
+            cpu.vcpu_cpu_time_ns = Some(ns);
+        }
+    }
+    let a = MonitorSummary::from_samples(&[first.clone(), undilated])
+        .schedstat_deltas
+        .expect("schedstat deltas");
+    let b = MonitorSummary::from_samples(&[first, dilated])
+        .schedstat_deltas
+        .expect("schedstat deltas");
+    assert_eq!(a.total_schedstat_vcpu_sec, Some(0.5));
+    assert_eq!(a.total_schedstat_vcpu_sec, b.total_schedstat_vcpu_sec);
+    assert_eq!(a.total_run_delay, b.total_run_delay);
+    assert_eq!(a.total_sched_count, b.total_sched_count);
 }
 
 #[test]

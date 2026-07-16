@@ -11,8 +11,8 @@
 //!   last-minus-first): the hardirq-counter wiring.
 //! * `total_softirq_net_rx` > 0 — the NET_RX softirq vector index: the
 //!   softirq-index wiring AND the NIC RX path.
-//! * `hardirq_rate` > 0 — count / capture-window-seconds: the rate
-//!   co-insertion + the wall-window denominator.
+//! * `hardirqs_per_cpu_sec` > 0 — count / delivered guest CPU-seconds:
+//!   the rate co-insertion + dilation-safe CPU denominator.
 //!
 //! `ok_or_else(absent -> Err)` + `ensure!(> 0)` is the skip-masks-bug guard: an
 //! ABSENT metric FAILS loudly (it does not vacuously pass), and `> 0` proves the
@@ -128,17 +128,16 @@ fn assert_irq_metrics(result: &VmResult) -> Result<()> {
         "NET_RX softirqs must rise under NetTraffic loopback, got {net_rx}"
     );
 
-    // hardirq_rate: total_hardirqs / capture-window-seconds. ABSENT means the
-    // wall-window denominator co-insertion (phase_build) was missed.
+    // hardirqs_per_cpu_sec: total_hardirqs / delivered guest CPU-seconds.
     let rate = result
-        .phase_metric(step, BuiltinMetric::HardirqRate)
+        .phase_metric(step, BuiltinMetric::HardirqsPerCpuSec)
         .ok_or_else(|| {
             anyhow!(
-                "hardirq_rate absent in Phase::step(0) — the wall-window \
-                 denominator (total_phase_wall_sec) was not co-inserted"
+                "hardirqs_per_cpu_sec absent in Phase::step(0) — the delivered \
+                 guest CPU denominator was not co-inserted"
             )
         })?;
-    ensure!(rate > 0.0, "hardirq_rate must be > 0, got {rate}");
+    ensure!(rate > 0.0, "hardirqs_per_cpu_sec must be > 0, got {rate}");
 
     // System-wide PSI-irq pressure, host-walked from the global `psi_system`
     // per monitor sample, folded run-level in MonitorSummary, and surfaced via

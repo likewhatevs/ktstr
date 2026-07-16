@@ -1188,23 +1188,11 @@ pub fn assert_benchmarks(
         for w in reports {
             let cpu_rate = iterations_per_cpu_sec_of(1, w.cpu_time_ns, w.iterations).unwrap_or(0.0);
             if cpu_rate < rate_floor {
-                // Wall-denominated rate for CONTEXT only. When it diverges
-                // from the CPU rate the gap is host scheduling delay (or
-                // the workload's own think-time) — the very confound the
-                // CPU-denominated verdict excludes, surfaced here so the
-                // divergence is visible in the failure text. The host adds
-                // the measured dilation D alongside this at render time
-                // (D is a host-side measurement, unavailable in-guest).
-                let wall_rate = if w.wall_time_ns > 0 {
-                    w.iterations as f64 / (w.wall_time_ns as f64 / 1e9)
-                } else {
-                    0.0
-                };
                 r.record_fail(AssertDetail::new(
                     DetailKind::Benchmark,
                     format!(
                         "worker {} iteration rate {cpu_rate:.1}/cpu-s below floor \
-                         {rate_floor:.1}/s (wall rate {wall_rate:.1}/s)",
+                         {rate_floor:.1}/cpu-s",
                         w.tid
                     ),
                 ));

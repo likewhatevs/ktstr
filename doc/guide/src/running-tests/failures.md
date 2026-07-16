@@ -32,7 +32,7 @@ and topology; the indented lines under it are the violated checks:
     topology: 1n1l2c1t (2 cpus)  scheduler: my_sched  scenario: throughput_gate  duration: 15.0s
 
     Phase 1: StepStart[0] ops=0 (4960ms, 0 samples):
-      imbalance: avg=1.2 max=5.0 | dsq: avg=0 max=0 | nr_run: avg=1.0 | fallback: 0/s | keep_last: 38/s | throughput: 79697 iter/s (stimulus-derived)
+      imbalance: avg=1.2 max=5.0 | dsq: avg=0 max=0 | nr_run: avg=1.0 | fallback: 0/vcpu-s | keep_last: 38/vcpu-s | iteration rate: 79697 iter/cpu-s
       per-cgroup:
         cg_a: off-cpu avg=0.3% min=0.3% max=0.3% spread=0.0% | run-delay mean=915µs worst=915µs | iters=209600 migrations=1 | gap=10ms@cpu0
         <span class="t-yel">cg_b: off-cpu avg=9.0% min=9.0% max=9.0% spread=0.0% | run-delay mean=5654µs worst=5654µs</span> | iters=189252 migrations=1 | gap=21ms@cpu0
@@ -63,9 +63,9 @@ Two more sections follow every failure when they have content:
     --- monitor ---
     samples=41 max_imbalance=2.00 max_dsq_depth=0 stuck=0
     avg: imbalance=1.32 nr_running/cpu=1.2 dsq/cpu=0.0
-    events: fallback=0 (0.0/s) keep_last=210 (52.5/s) offline=0
+    events: fallback=0 (0.0/vcpu-s) keep_last=210 (52.5/vcpu-s) offline=0
     events+: refill_slice_dfl=210
-    schedstat: csw=586 (146/s) run_delay=381246314ns/s ttwu=204 goidle=1
+    schedstat: csw=586 (146/vcpu-s) run_delay=381246314ns/vcpu-s ttwu=204 goidle=1
     bpf: ktstr_select_cp cnt=189 145ns/call
     bpf: ktstr_enqueue cnt=373 34ns/call
     bpf: ktstr_dispatch cnt=584 237ns/call

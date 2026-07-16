@@ -913,7 +913,7 @@ fn sched_goidle_fraction_derives_and_pools_sigma_over_sigma() {
     );
 }
 
-/// Whole-run taobench qps + hit Rates derive per-run from their Counter ext
+/// Whole-run taobench throughput + hit Rates derive per-run from their Counter ext
 /// components and pool Σ/Σ across runs (the `MetricKind::Rate` cross-run fold),
 /// NOT a mean of per-run qps. The denominator is the CPU-second window
 /// (`total_taobench_cpu_sec`); the wall window stays a pooled Counter
@@ -940,9 +940,18 @@ fn taobench_whole_run_rates_derive_and_pool_sigma_over_sigma() {
 
     // Single run: 900 fast + 100 slow over 1 s.
     let one = group_and_average_by(&[mk(900.0, 100.0, 1.0)], LEGACY_PAIRING_DIMS);
-    assert_eq!(read(&one[0].row, "taobench_total_ops_per_sec"), 1000.0);
-    assert_eq!(read(&one[0].row, "taobench_fast_ops_per_sec"), 900.0);
-    assert_eq!(read(&one[0].row, "taobench_slow_ops_per_sec"), 100.0);
+    assert_eq!(
+        read(&one[0].row, "taobench_total_ops_per_cpu_sec_whole"),
+        1000.0
+    );
+    assert_eq!(
+        read(&one[0].row, "taobench_fast_ops_per_cpu_sec_whole"),
+        900.0
+    );
+    assert_eq!(
+        read(&one[0].row, "taobench_slow_ops_per_cpu_sec_whole"),
+        100.0
+    );
     assert!((read(&one[0].row, "taobench_hit_fraction") - 0.9).abs() < 1e-9);
 
     // Two runs, unequal walls → pooled Σ/Σ, not mean-of-ratios.
@@ -970,13 +979,13 @@ fn taobench_whole_run_rates_derive_and_pool_sigma_over_sigma() {
         Some(100.0),
     );
     // Rates re-derive Σ/Σ (the pooled cohort throughput), NOT mean-of-ratios.
-    let total = read(row, "taobench_total_ops_per_sec");
+    let total = read(row, "taobench_total_ops_per_cpu_sec_whole");
     assert!(
         (total - 40.0).abs() < 1e-9,
         "Σops/Σcpu = 4000/100 = 40, got {total} (mean-of-ratios ~515)",
     );
-    assert!((read(row, "taobench_fast_ops_per_sec") - 10.0).abs() < 1e-9);
-    assert!((read(row, "taobench_slow_ops_per_sec") - 30.0).abs() < 1e-9);
+    assert!((read(row, "taobench_fast_ops_per_cpu_sec_whole") - 10.0).abs() < 1e-9);
+    assert!((read(row, "taobench_slow_ops_per_cpu_sec_whole") - 30.0).abs() < 1e-9);
     let hit = read(row, "taobench_hit_fraction");
     assert!(
         (hit - 0.25).abs() < 1e-9,
@@ -984,29 +993,27 @@ fn taobench_whole_run_rates_derive_and_pool_sigma_over_sigma() {
     );
 }
 
-/// Per-second schedstat rates (pcount_per_sec + run_delay_per_sec et al.) derive
-/// total_X / total_schedstat_wall_sec and pool Σ/Σ across runs (the Rate
-/// cross-run fold), NOT a mean of per-run rates. Unequal windows make the two
-/// disagree: run A pcount 1000 over 1 s (1000/s), run B pcount 1000 over 99 s
-/// (~10/s). Σpcount 2000, Σwall 100 s → 20/s; the mean-of-rates would give
-/// ~505/s. This duration-weighting is exactly why the rate exists — to compare a
-/// differing-duration cohort raw counts cannot.
+/// Per-vCPU-CPU-second schedstat rates derive total_X /
+/// total_schedstat_vcpu_sec and pool Σ/Σ across runs, NOT a mean of per-run
+/// rates. Unequal CPU-time windows make the two disagree: run A pcount 1000
+/// over 1 vcpu-s, run B pcount 1000 over 99 vcpu-s. Σpcount 2000, ΣCPU 100
+/// vcpu-s → 20/vcpu-s; the mean-of-rates would give ~505/vcpu-s.
 #[test]
-fn schedstat_per_second_rates_derive_and_pool_sigma_over_sigma() {
-    let mk = |pcount: f64, run_delay: f64, wall: f64| {
+fn schedstat_per_vcpu_second_rates_derive_and_pool_sigma_over_sigma() {
+    let mk = |pcount: f64, run_delay: f64, vcpu_sec: f64| {
         let mut r = make_row("t", "tiny-1llc", true, 0.0);
         r.ext_metrics.insert("total_pcount".into(), pcount);
         r.ext_metrics.insert("total_run_delay".into(), run_delay);
         r.ext_metrics
-            .insert("total_schedstat_wall_sec".into(), wall);
+            .insert("total_schedstat_vcpu_sec".into(), vcpu_sec);
         r
     };
     let read = |row: &_, name: &str| metric_def(name).unwrap().read(row).expect("rate derived");
 
-    // Single run: 1000 pcount + 6000 ns run_delay over 2 s.
+    // Single run: 1000 pcount + 6000 ns run_delay over 2 vcpu-s.
     let one = group_and_average_by(&[mk(1000.0, 6000.0, 2.0)], LEGACY_PAIRING_DIMS);
-    assert!((read(&one[0].row, "pcount_per_sec") - 500.0).abs() < 1e-9); // 1000/2
-    assert!((read(&one[0].row, "run_delay_per_sec") - 3000.0).abs() < 1e-9); // 6000/2
+    assert!((read(&one[0].row, "pcount_per_vcpu_sec") - 500.0).abs() < 1e-9);
+    assert!((read(&one[0].row, "run_delay_per_vcpu_sec") - 3000.0).abs() < 1e-9);
 
     // Two runs, unequal windows → pooled Σ/Σ, not mean-of-rates.
     let out = group_and_average_by(
@@ -1015,21 +1022,21 @@ fn schedstat_per_second_rates_derive_and_pool_sigma_over_sigma() {
     );
     assert_eq!(out.len(), 1);
     let row = &out[0].row;
-    // Numerators + the wall-sec denominator are Counters → SUM-fold.
+    // Numerators + the vCPU-sec denominator are Counters → SUM-fold.
     assert_eq!(row.ext_metrics.get("total_pcount").copied(), Some(2000.0));
     assert_eq!(
-        row.ext_metrics.get("total_schedstat_wall_sec").copied(),
+        row.ext_metrics.get("total_schedstat_vcpu_sec").copied(),
         Some(100.0),
     );
-    // Σpcount/Σwall = 2000/100 = 20/s (duration-weighted), NOT the mean-of-rates
+    // Σpcount/ΣCPU = 2000/100 = 20/vcpu-s, NOT the mean-of-rates
     // ((1000 + ~10.1)/2 ≈ 505).
-    let rate = read(row, "pcount_per_sec");
+    let rate = read(row, "pcount_per_vcpu_sec");
     assert!(
         (rate - 20.0).abs() < 1e-9,
-        "Σpcount/Σwall = 2000/100 = 20, got {rate} (mean-of-rates ~505)",
+        "Σpcount/ΣCPU = 2000/100 = 20, got {rate} (mean-of-rates ~505)",
     );
-    // run_delay_per_sec likewise: Σ2000 / Σ100 = 20 ns/s.
-    assert!((read(row, "run_delay_per_sec") - 20.0).abs() < 1e-9);
+    // run_delay_per_vcpu_sec likewise: Σ2000 / Σ100 = 20 ns/vcpu-s.
+    assert!((read(row, "run_delay_per_vcpu_sec") - 20.0).abs() < 1e-9);
 }
 
 /// schbench whole-run Class-3 gate-Rates (role-separate run-delay per-schedule
@@ -1331,7 +1338,7 @@ fn group_and_average_gauge_avg_floors_zero_sample_count_weight() {
     );
 }
 
-/// Cross-RUN re-pool of the pooled `iterations_per_cpu_sec` Rate:
+/// Cross-RUN re-pool of the canonical pooled `iteration_rate`:
 /// `group_and_average_by` SKIPS folding the Rate itself and re-derives it
 /// from the folded Counter components (`total_iterations_pooled`,
 /// `total_cpu_time_sec`). Registered Counters fold cross-RUN as a SUM
@@ -1347,21 +1354,19 @@ fn group_and_average_gauge_avg_floors_zero_sample_count_weight() {
 /// below discriminate. A stale per-run rate value is discarded by the
 /// skip-then-derive path.
 #[test]
-fn group_and_average_repools_iterations_per_cpu_sec_from_components() {
+fn group_and_average_repools_iteration_rate_from_components() {
     let mut a = make_row("t", "tiny-1llc", true, 0.0);
     a.ext_metrics
         .insert("total_iterations_pooled".to_string(), 1000.0);
     a.ext_metrics.insert("total_cpu_time_sec".to_string(), 1.0);
     // A stale per-run rate must be DISCARDED (a Rate is derived, never
     // folded from its own samples).
-    a.ext_metrics
-        .insert("iterations_per_cpu_sec".to_string(), 999.0);
+    a.ext_metrics.insert("iteration_rate".to_string(), 999.0);
     let mut b = make_row("t", "tiny-1llc", true, 0.0);
     b.ext_metrics
         .insert("total_iterations_pooled".to_string(), 10.0);
     b.ext_metrics.insert("total_cpu_time_sec".to_string(), 9.0);
-    b.ext_metrics
-        .insert("iterations_per_cpu_sec".to_string(), 999.0);
+    b.ext_metrics.insert("iteration_rate".to_string(), 999.0);
     let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
     assert_eq!(out.len(), 1);
     // Components fold as SUM (1000+10, 1.0+9.0), NOT mean (505, 5.0) — this
@@ -1383,7 +1388,7 @@ fn group_and_average_repools_iterations_per_cpu_sec_from_components() {
     let rate = out[0]
         .row
         .ext_metrics
-        .get("iterations_per_cpu_sec")
+        .get("iteration_rate")
         .copied()
         .expect("re-derived pooled rate present");
     // Σnum / Σdenom = 1010 / 10.0 = 101.0.
@@ -1396,7 +1401,7 @@ fn group_and_average_repools_iterations_per_cpu_sec_from_components() {
 
 /// Cross-RUN count-invariance vs a key-ABSENT run: two key-bearing passing
 /// runs PLUS a third passing run with NO pooled component keys (all its
-/// cgroups unmeasured, so populate_run_pooled_iterations_per_cpu_sec
+/// cgroups unmeasured, so populate_run_pooled_iteration_rate
 /// inserted neither). The components SUM over the runs that carry them
 /// (aggregate_finite Counter arm folds the present (value, weight) pairs),
 /// so the key-absent run contributes NOTHING — the folded components and
@@ -1437,11 +1442,7 @@ fn group_and_average_pooled_rate_unaffected_by_key_absent_run() {
     );
     // Rate identical to the two-run cohort: Σ/Σ = 1010/10.0 = 101.0.
     assert_eq!(
-        out[0]
-            .row
-            .ext_metrics
-            .get("iterations_per_cpu_sec")
-            .copied(),
+        out[0].row.ext_metrics.get("iteration_rate").copied(),
         Some(101.0),
         "key-absent run must not change the pooled rate (count-invariant)",
     );

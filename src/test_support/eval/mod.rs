@@ -2150,26 +2150,17 @@ fn populate_run_stats_and_folded_timeline(
         guest_phase_buckets,
     );
     // Populate the full run-level ext_metrics family (the read_sample registry
-    // metrics, the phase-only fold, the pooled iterations_per_cpu_sec, and the
+    // metrics, the phase-only fold, the pooled iteration_rate, and the
     // Distribution / WorstLowest re-pools) in the canonical order — the SAME
     // sequence VmResult::run_metric self-computes, so an in-test run_metric read
     // matches what the sidecar records. MUST run here: AFTER the cgroup-bearing
     // merges (check_result.stats.cgroups is complete) and the per-cgroup carrier
-    // fold above, BEFORE the sidecar write, and BEFORE the derive_phase_metrics
-    // below — it feeds on the PRE-derive phases (the eval-faithful input shape
-    // VmResult::run_metric reuses; post-derive yields the same map today via the
-    // is_derived skip, but pre-derive avoids depending on it). The trailing
-    // monitor-verdict merge below is verdict-only (inconclusive, empty stats),
-    // so it is safe to follow. See populate_run_ext_all for the step order.
+    // fold above, BEFORE the sidecar write. The helper itself derives the
+    // per-phase scalars before folding the run metrics, so there is no second
+    // derivation pass. The trailing monitor-verdict merge below is verdict-only
+    // (inconclusive, empty stats), so it is safe to follow. See
+    // populate_run_ext_all for the step order.
     crate::assert::populate_run_ext_all(&mut check_result.stats, early_periodic_series);
-    // Per-phase scalars: derive into each phase bucket from the folded per_cgroup
-    // carriers (post-fold, so the merge's is_derived skip can't drop them) — the
-    // non-schbench carrier scalars (every cgroup) into each pc.metrics, and the
-    // schbench scalars into pc.metrics + the pooled bucket.metrics. A no-op only
-    // when no phase carries a per-cgroup carrier. Mirrors the
-    // VmResult::phase_buckets derive so the sidecar / timeline render and the
-    // per-phase A/B claim agree.
-    crate::assert::derive_phase_metrics(&mut check_result.stats.phases);
 
     // POST-fold timeline for this (guest-AssertResult) path: rebuild from
     // the folded `check_result.stats.phases` so the per-cgroup sub-block

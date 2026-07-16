@@ -324,8 +324,8 @@ fn assert_benchmarks_iteration_rate_detects_below_floor_regardless_of_wall() {
         .find(|d| d.kind == DetailKind::Benchmark)
         .unwrap_or_else(|| panic!("expected Benchmark failure, got {:?}", r.outcomes));
     assert!(
-        reason.message.contains("1.0/cpu-s") && reason.message.contains("wall rate 10000.0/s"),
-        "message must show CPU verdict rate and wall context: {reason}"
+        reason.message.contains("1.0/cpu-s") && reason.message.contains("100.0/cpu-s"),
+        "message must show one CPU-denominated value and floor: {reason}"
     );
 }
 

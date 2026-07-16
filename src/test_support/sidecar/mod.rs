@@ -101,11 +101,11 @@ use super::entry::KtstrTestEntry;
 use super::timefmt::{generate_run_id, now_iso8601};
 
 /// Which time base denominates this sidecar's workload-THROUGHPUT rate
-/// metrics (`taobench_*_qps` / `taobench_*_ops_per_sec` /
-/// `schbench_*loops_per_cpu_sec` / `iterations_per_cpu_sec`, and any future
-/// throughput rate). The rate KEY NAMES did not change when the denomination
-/// moved from wall-clock to CPU-seconds, so a number from a wall-era sidecar
-/// is NOT comparable to the same key from a cpu-era sidecar — the compare
+/// metrics (`taobench_*_ops_per_cpu_sec` /
+/// `schbench_*loops_per_cpu_sec` / `iteration_rate`, and any future
+/// throughput rate). Some rate key names predate the denomination change, so
+/// a number from a wall-era sidecar is NOT comparable to a CPU-era sidecar —
+/// the compare
 /// pipeline keys its row pairing and its group-averaging on this marker so
 /// cross-denomination values are never silently folded or diffed (see
 /// `PairingKey::from_row` and the `denomination_mismatches` counter in

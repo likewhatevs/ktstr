@@ -1679,7 +1679,7 @@ pub(super) fn worker_main(
                 let outcome = crate::workload::taobench::run::run(config, stop, &progress, pe);
                 work_units = work_units.saturating_add(outcome.whole_run.total_ops());
                 // Ship the engine's authoritative whole-run aggregate for the
-                // host-side run-level qps/hit Rate keys (one taobench run per
+                // host-side run-level throughput/hit Rate keys (one taobench run per
                 // worker — the arm breaks below, so this is set at most once).
                 taobench_whole = Some(outcome.whole_run);
                 for (epoch, stats) in outcome.phases {
@@ -4416,7 +4416,7 @@ fn warn_custom_iterations_zero_once(name: &str) {
         eprintln!(
             "workload: Custom worker '{name}' returned work_units>0 but \
              iterations==0; headline throughput (total_iterations / \
-             iterations_per_worker / iterations_per_cpu_sec) reads \
+             iterations_per_worker / iteration_rate) reads \
              WorkerReport::iterations and will read zero — populate iterations \
              (commonly = work_units). See the WorkType::Custom telemetry contract."
         );

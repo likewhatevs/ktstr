@@ -151,17 +151,13 @@ fn compare_rows_zero_baseline_jump_above_abs_gate_is_an_improvement() {
         None,
         &ComparisonPolicy::default(),
     );
-    assert_eq!(
-        res.improvements, 1,
-        "0 -> 1000 total_iterations (>= abs gate 2, HigherBetter) must be \
-         an improvement, not hidden as unchanged",
-    );
+    assert_eq!(res.improvements, 0);
     assert_eq!(res.regressions, 0);
     assert!(
         res.findings
             .iter()
-            .any(|f| f.metric.name == "total_iterations" && f.kind == FindingKind::Improvement),
-        "a total_iterations Improvement finding must be emitted; got {:?}",
+            .any(|f| f.metric.name == "total_iterations" && f.kind == FindingKind::Informational),
+        "raw total_iterations must remain visible but informational; got {:?}",
         res.findings
             .iter()
             .map(|f| (f.metric.name, f.delta))
@@ -238,10 +234,8 @@ fn compare_rows_genuine_stuck_count_regression_is_flagged() {
 fn compare_rows_synthetic_regression_and_improvement() {
     // spread 10 -> 30: abs delta 20.0 >= 5.0, rel 2.0 >= 0.10 →
     // regression (higher_is_worse).
-    // total_iterations 1000 -> 500: abs delta 500 >= 2, rel 0.5
-    // >= 0.10, higher_is_worse=false so decrease is a regression.
-    // Net: 2 regressions, 0 improvements; one Finding per
-    // significant metric.
+    // Raw total_iterations also changes, but duration-sensitive raw totals are
+    // informational now; only their normalized rates are directional.
     let rows_a = vec![cmp_row("test1", "tiny-1llc", true, 10.0, 1000)];
     let rows_b = vec![cmp_row("test1", "tiny-1llc", true, 30.0, 500)];
     let res = compare_rows_by(
@@ -251,23 +245,17 @@ fn compare_rows_synthetic_regression_and_improvement() {
         None,
         &ComparisonPolicy::uniform(10.0),
     );
-    assert_eq!(
-        res.regressions, 2,
-        "spread up + iterations down both regress"
-    );
+    assert_eq!(res.regressions, 1, "only spread is directional");
     assert_eq!(res.improvements, 0);
     assert_eq!(res.excluded_pairs, 0);
     let metrics: Vec<&str> = res.findings.iter().map(|d| d.metric.name).collect();
     assert!(metrics.contains(&"worst_spread"));
     assert!(metrics.contains(&"total_iterations"));
-    for d in &res.findings {
-        assert!(
-            d.kind == FindingKind::Regression,
-            "all reported deltas should be regressions"
-        );
-        assert_eq!(d.scenario, "test1");
-        assert_eq!(d.topology, "tiny-1llc");
-    }
+    assert!(
+        res.findings.iter().any(|d| {
+            d.metric.name == "total_iterations" && d.kind == FindingKind::Informational
+        })
+    );
 
     // Reverse direction: improvements should also surface.
     let res_imp = compare_rows_by(
@@ -278,7 +266,7 @@ fn compare_rows_synthetic_regression_and_improvement() {
         &ComparisonPolicy::uniform(10.0),
     );
     assert_eq!(res_imp.regressions, 0);
-    assert_eq!(res_imp.improvements, 2);
+    assert_eq!(res_imp.improvements, 1);
     for d in &res_imp.findings {
         assert!(d.kind != FindingKind::Regression);
     }
@@ -287,7 +275,7 @@ fn compare_rows_synthetic_regression_and_improvement() {
 /// Rate-COMPONENT metrics are suppressed from compare findings, but the
 /// user-facing rate is not. `total_iterations_pooled` (a suppressed
 /// component) differs 1000->2000 — past the default gate, normally a
-/// finding — yet emits none; the pooled rate `iterations_per_cpu_sec`
+/// finding — yet emits none; the pooled `iteration_rate`
 /// differs 500->1000 and DOES emit. Pins the compare-emit suppression while
 /// the components stay in `ext_metrics` for the cross-run re-pool.
 #[test]
@@ -295,13 +283,11 @@ fn compare_rows_suppresses_rate_components_not_the_rate() {
     let mut a = cmp_row("t", "tiny-1llc", true, 0.0, 1000);
     a.ext_metrics
         .insert("total_iterations_pooled".to_string(), 1000.0);
-    a.ext_metrics
-        .insert("iterations_per_cpu_sec".to_string(), 500.0);
+    a.ext_metrics.insert("iteration_rate".to_string(), 500.0);
     let mut b = cmp_row("t", "tiny-1llc", true, 0.0, 1000);
     b.ext_metrics
         .insert("total_iterations_pooled".to_string(), 2000.0);
-    b.ext_metrics
-        .insert("iterations_per_cpu_sec".to_string(), 1000.0);
+    b.ext_metrics.insert("iteration_rate".to_string(), 1000.0);
     let res = compare_rows_by(
         &[a],
         &[b],
@@ -315,7 +301,7 @@ fn compare_rows_suppresses_rate_components_not_the_rate() {
         "the Rate component must be suppressed from compare findings; got {names:?}",
     );
     assert!(
-        names.contains(&"iterations_per_cpu_sec"),
+        names.contains(&"iteration_rate"),
         "the user-facing pooled rate must still emit a finding; got {names:?}",
     );
 }
@@ -339,11 +325,11 @@ fn compare_rows_higher_is_worse_inversion() {
         .find(|d| d.metric.name == "total_iterations")
         .expect("total_iterations should produce a delta");
     assert!(
-        iters_delta.kind == FindingKind::Regression,
-        "iterations decrease is a regression"
+        iters_delta.kind == FindingKind::Informational,
+        "raw iterations are duration-sensitive and must not gate"
     );
     assert_eq!(iters_delta.delta, -500.0);
-    assert_eq!(res.regressions, 1);
+    assert_eq!(res.regressions, 0);
     assert_eq!(res.improvements, 0);
 
     // worst_spread is higher_is_worse=true. An increase must be a
@@ -456,8 +442,8 @@ fn compare_rows_skips_failed_scenarios() {
         res.excluded_pairs, 2,
         "test_failed_a and test_failed_b skip"
     );
-    // test_ok regresses on worst_spread and total_iterations only.
-    assert_eq!(res.regressions, 2);
+    // test_ok regresses on worst_spread; raw iterations are informational.
+    assert_eq!(res.regressions, 1);
     assert_eq!(res.improvements, 0);
     for d in &res.findings {
         assert_eq!(d.scenario, "test_ok");
@@ -2050,18 +2036,18 @@ fn noise_side(scenario: &str, spread: f64, iters: u64) -> Vec<GauntletRow> {
 /// Under --noise-adjust a Rate's compared centroid must be the pooled
 /// Σnum/Σden (duration-weighted) the registry documents (metric.rs), NOT the
 /// mean of per-run ratios — the two differ when run denominators differ. A
-/// side with runs (run_delay=100, wall=1s)->100/s and (run_delay=100,
-/// wall=10s)->10/s has pooled 200/11 = 18.18/s but mean-of-ratios 55/s. The
+/// side with runs (run_delay=100, CPU=1s)->100/vcpu-s and (run_delay=100,
+/// CPU=10s)->10/vcpu-s has pooled 200/11 but mean-of-ratios 55. The
 /// per-run band ([10,100]) still measures run-to-run spread. This pins that
 /// the centroid is pooled (agreeing with the Averaged path).
 #[test]
 fn noise_findings_rate_centroid_is_pooled_not_mean_of_ratios() {
-    let mk = |run_delay: f64, wall: f64| {
+    let mk = |run_delay: f64, vcpu_sec: f64| {
         let mut r = cmp_row("rate", "tiny-1llc", true, 10.0, 0);
         r.ext_metrics
             .insert("total_run_delay".to_string(), run_delay);
         r.ext_metrics
-            .insert("total_schedstat_wall_sec".to_string(), wall);
+            .insert("total_schedstat_vcpu_sec".to_string(), vcpu_sec);
         r
     };
     // B identical to A so the only thing under test is A's reported centroid.
@@ -2071,10 +2057,10 @@ fn noise_findings_rate_centroid_is_pooled_not_mean_of_ratios() {
     let f = rep
         .findings
         .iter()
-        .find(|f| f.metric.name == "run_delay_per_sec")
+        .find(|f| f.metric.name == "run_delay_per_vcpu_sec")
         .unwrap_or_else(|| {
             panic!(
-                "run_delay_per_sec must appear: {:?}",
+                "run_delay_per_vcpu_sec must appear: {:?}",
                 rep.findings
                     .iter()
                     .map(|f| f.metric.name)
@@ -2269,16 +2255,16 @@ fn noise_phase_scoped_regression_is_render_only_not_gated() {
 
 #[test]
 fn noise_phase_rate_pooled_centroid_within_phase() {
-    // iteration_rate = total_phase_iterations / total_phase_duration_sec (Rate,
-    // HigherBetter). A side: run1 (100 iters, 1s)=100/s + run2 (100 iters,
-    // 10s)=10/s -> pooled 200/11 = 18.18, NOT mean-of-ratios 55; band [10,100].
+    // iteration_rate = total_iterations_pooled / total_cpu_time_sec (Rate,
+    // HigherBetter). A side: run1 (100 iters, 1 CPU-s)=100 + run2
+    // (100 iters, 10 CPU-s)=10 -> pooled 200/11 = 18.18, not 55.
     let bucket = |iters: f64, sec: f64| {
         make_phase_bucket(
             1,
             "Step[0]",
             &[
-                ("total_phase_iterations", iters),
-                ("total_phase_duration_sec", sec),
+                ("total_iterations_pooled", iters),
+                ("total_cpu_time_sec", sec),
                 ("iteration_rate", iters / sec),
             ],
         )
@@ -3053,9 +3039,8 @@ fn summarize_side_runs_categorizes_by_exclusion() {
 
 #[test]
 fn noise_findings_classifies_both_polarities() {
-    // Both polarities WORSEN: worst_spread (LowerBetter) rises 10->15;
-    // total_iterations (HigherBetter) drops 2000->1000. Both sides clean (spread
-    // 0), so each is a CONFIDENT regression.
+    // worst_spread (LowerBetter) rises 10->15. Raw total_iterations drops too,
+    // but is informational because it is duration-sensitive.
     let rep = noise_findings(
         &noise_side("regress", 10.0, 2000),
         &noise_side("regress", 15.0, 1000),
@@ -3066,17 +3051,21 @@ fn noise_findings_classifies_both_polarities() {
     assert_eq!(rep.paired_scenarios, 1);
     assert_eq!(
         rep.regressions(),
-        2,
-        "LowerBetter rose + HigherBetter dropped = 2 regressions: {:?}",
+        1,
+        "spread regresses while raw iterations remain informational: {:?}",
         rep.findings
             .iter()
             .map(|f| (f.metric.name, f.kind))
             .collect::<Vec<_>>(),
     );
     assert_eq!(rep.noisy(), 0);
-    assert!(rep.findings.iter().all(|f| f.kind == NoiseKind::Regression));
+    assert!(
+        rep.findings
+            .iter()
+            .any(|f| f.metric.name == "total_iterations" && f.kind == NoiseKind::Informational)
+    );
 
-    // Mirror: both polarities IMPROVE (worst_spread drops, total_iterations rises).
+    // Mirror: spread improves while raw total_iterations remains informational.
     let rep = noise_findings(
         &noise_side("improve", 15.0, 1000),
         &noise_side("improve", 10.0, 2000),
@@ -3090,8 +3079,8 @@ fn noise_findings_classifies_both_polarities() {
             .iter()
             .filter(|f| f.kind == NoiseKind::Improvement)
             .count(),
-        2,
-        "LowerBetter dropped + HigherBetter rose = 2 improvements",
+        1,
+        "only the normalized/duration-independent spread is directional",
     );
 }
 
@@ -3550,13 +3539,13 @@ fn noise_findings_declared_direction_override_flips_polarity() {
 #[test]
 fn noise_findings_unmatched_whole_run_gate_is_reported() {
     // A declared gate on a metric absent from the compared data
-    // (run_delay_per_sec — a Rate with no components on these rows) never reaches
+    // (run_delay_per_vcpu_sec — a Rate with no components on these rows) never reaches
     // classify_noise, so it surfaces as an un-evaluated declared gate rather than
     // a silent pass. The runtime analog of validate()'s registry typo check.
     let a = noise_side("cov", 10.0, 0);
     let b = with_gate(
         noise_side("cov", 10.0, 0),
-        perf_gate("run_delay_per_sec", Some(5.0), None, None, None),
+        perf_gate("run_delay_per_vcpu_sec", Some(5.0), None, None, None),
     );
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
     assert_eq!(
@@ -3565,7 +3554,7 @@ fn noise_findings_unmatched_whole_run_gate_is_reported() {
         "the absent-metric gate is reported as un-evaluated",
     );
     let c = &rep.assertion_coverage[0];
-    assert_eq!(c.assertion.metric, "run_delay_per_sec");
+    assert_eq!(c.assertion.metric, "run_delay_per_vcpu_sec");
     assert_eq!(c.assertion.phase, None);
     assert_eq!(
         rep.regressions(),
@@ -3624,7 +3613,7 @@ fn format_noise_assertion_coverage_lines_lists_unevaluated_gates() {
     let a = noise_side("fcov", 10.0, 0);
     let b = with_gate(
         noise_side("fcov", 10.0, 0),
-        perf_gate("run_delay_per_sec", Some(5.0), Some(0.5), None, None),
+        perf_gate("run_delay_per_vcpu_sec", Some(5.0), Some(0.5), None, None),
     );
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, true);
     let out = format_noise_assertion_coverage_lines(&rep.assertion_coverage).join("\n");
@@ -3633,7 +3622,7 @@ fn format_noise_assertion_coverage_lines_lists_unevaluated_gates() {
         "warning header present: {out}"
     );
     assert!(
-        out.contains("run_delay_per_sec"),
+        out.contains("run_delay_per_vcpu_sec"),
         "the un-evaluated metric is named: {out}",
     );
     assert!(
@@ -3837,9 +3826,9 @@ fn classify_noise_ignores_target_value_direction_on_the_sidecar_path() {
         .expect("total_iterations row");
     assert_eq!(
         f.kind,
-        NoiseKind::Improvement,
-        "a TargetValue direction on the Record must be ignored -> inherit \
-         HigherBetter -> a rise is an improvement, not a regression",
+        NoiseKind::Informational,
+        "a TargetValue direction on the Record must be ignored; the registry \
+         keeps raw total_iterations informational",
     );
     assert!(f.gated_by_assertion);
 }
@@ -4111,9 +4100,8 @@ fn compare_rows_scale_varying_low_throughput_regression_is_material() {
     assert!(
         res.findings
             .iter()
-            .any(|f| f.metric.name == "total_iterations" && f.kind == FindingKind::Regression),
-        "200 -> 120 total_iterations (40% drop, |delta| 80 < old floor 100) must \
-         be a regression after the near-idle floor recalibration; got {:?}",
+            .any(|f| f.metric.name == "total_iterations" && f.kind == FindingKind::Informational),
+        "200 -> 120 total_iterations must remain visible but not gate; got {:?}",
         res.findings
             .iter()
             .map(|f| (f.metric.name, f.delta))

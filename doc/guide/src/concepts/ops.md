@@ -387,7 +387,7 @@ Phase-bucketed metrics are queryable from the result:
 ```rust,ignore
 let baseline = r.stats.phase(Phase::BASELINE).expect("always populated");
 let step_0   = r.stats.phase(Phase::step(0)).expect("Step 0 ran");
-let thr      = r.stats.phase_metric(Phase::step(0), "throughput");
+let rate     = r.stats.phase_metric(Phase::step(0), "iteration_rate");
 ```
 
 Gate on `r.stats.has_steps()` before assuming step buckets exist —
@@ -406,7 +406,7 @@ The per-phase timeline also renders in every failure report:
 topology: 1n1l2c1t (2 cpus)  scheduler: my_sched  scenario: throughput_gate  duration: 15.0s
 
 Phase 1: StepStart[0] ops=0 (4960ms, 0 samples):
-  imbalance: avg=1.2 max=5.0 | dsq: avg=0 max=0 | nr_run: avg=1.0 | fallback: 0/s | keep_last: 38/s | throughput: 79697 iter/s (stimulus-derived)
+  imbalance: avg=1.2 max=5.0 | dsq: avg=0 max=0 | nr_run: avg=1.0 | fallback: 0/vcpu-s | keep_last: 38/vcpu-s | iteration rate: 79697 iter/cpu-s
   per-cgroup:
     cg_a: off-cpu avg=0.3% min=0.3% max=0.3% spread=0.0% | run-delay mean=915µs worst=915µs | iters=209600 migrations=1 | gap=10ms@cpu0
     cg_b: off-cpu avg=9.0% min=9.0% max=9.0% spread=0.0% | run-delay mean=5654µs worst=5654µs | iters=189252 migrations=1 | gap=21ms@cpu0

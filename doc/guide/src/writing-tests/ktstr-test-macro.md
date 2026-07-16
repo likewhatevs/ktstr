@@ -108,7 +108,7 @@ scenario:
 | `max_spread_pct` | percentage points | `max_spread_pct = 20.0` | max−min worker off-CPU% exceeds the cap |
 | `max_throughput_cv` | coefficient of variation | `max_throughput_cv = 0.35` | per-worker throughput CV exceeds the cap |
 | `min_work_rate` | work units / CPU-second | `min_work_rate = 1000.0` | a worker's work rate falls below the floor |
-| `min_iteration_rate` | iterations / second | `min_iteration_rate = 50000.0` | a worker's wall-clock iteration rate falls below the floor |
+| `min_iteration_rate` | iterations / CPU-second | `min_iteration_rate = 50000.0` | a worker's CPU-denominated iteration rate falls below the floor |
 | `max_migration_ratio` | migrations / iteration | `max_migration_ratio = 0.5` | a cgroup's migration ratio exceeds the cap |
 | `max_p99_wake_latency_ns` | ns | `max_p99_wake_latency_ns = 2000000` | p99 wake latency exceeds the cap |
 | `max_wake_latency_cv` | coefficient of variation | `max_wake_latency_cv = 1.0` | wake-latency CV exceeds the cap |
@@ -125,8 +125,8 @@ guest scheduler state:
 | `max_local_dsq_depth` | tasks | `max_local_dsq_depth = 8` | a local DSQ grows deeper than the cap |
 | `fail_on_rq_clock_stuck` | bool | `fail_on_rq_clock_stuck` | the monitor's stuck-task detection fails the test instead of reporting |
 | `sustained_samples` | samples | `sustained_samples = 3` | window size a violation must persist for before it counts |
-| `max_fallback_rate` | events/s | `max_fallback_rate = 5.0` | fallback-dispatch event rate exceeds the cap |
-| `max_keep_last_rate` | events/s | `max_keep_last_rate = 100.0` | keep-last event rate exceeds the cap |
+| `max_fallback_rate` | events/vCPU-s | `max_fallback_rate = 5.0` | fallback-dispatch activity exceeds the delivered-CPU cap |
+| `max_keep_last_rate` | events/vCPU-s | `max_keep_last_rate = 100.0` | keep-last activity exceeds the delivered-CPU cap |
 
 ### What a failing gate looks like
 
@@ -166,7 +166,7 @@ fn throughput_gate(ctx: &Ctx) -> Result<AssertResult> {
     --- monitor ---
     samples=41 max_imbalance=2.00 max_dsq_depth=0 stuck=0
     avg: imbalance=1.32 nr_running/cpu=1.2 dsq/cpu=0.0
-    events: fallback=0 (0.0/s) keep_last=210 (52.5/s) offline=0
+    events: fallback=0 (0.0/vcpu-s) keep_last=210 (52.5/vcpu-s) offline=0
 ...
     <span class="t-dim">verdict: monitor OK</span></pre></div>
 

@@ -8,6 +8,37 @@ use super::*;
 /// via the `df!` column name.
 pub(crate) type MetricAccessor = fn(&GauntletRow) -> f64;
 
+fn rate_or_zero(row: &GauntletRow, name: &str, numerator: &str, denominator: &str) -> f64 {
+    row.ext_metrics
+        .get(name)
+        .copied()
+        .or_else(|| {
+            let numerator = row.ext_metrics.get(numerator).copied()?;
+            let denominator = row.ext_metrics.get(denominator).copied()?;
+            let value = numerator / denominator;
+            value.is_finite().then_some(value)
+        })
+        .unwrap_or(0.0)
+}
+
+fn fallback_per_vcpu_sec(row: &GauntletRow) -> f64 {
+    rate_or_zero(
+        row,
+        "fallback_per_vcpu_sec",
+        "total_fallback_pooled",
+        "total_event_vcpu_sec",
+    )
+}
+
+fn keep_last_per_vcpu_sec(row: &GauntletRow) -> f64 {
+    rate_or_zero(
+        row,
+        "keep_last_per_vcpu_sec",
+        "total_keep_last_pooled",
+        "total_event_vcpu_sec",
+    )
+}
+
 /// Pinned list of `(display_name, registry_key, accessor)` for every
 /// metric that outlier detection considers. `display_name` appears in
 /// [`Outlier`] output verbatim ("scenario: imbalance 4.5 ..."); the
@@ -30,15 +61,22 @@ pub(crate) type MetricAccessor = fn(&GauntletRow) -> f64;
 pub(crate) const OUTLIER_METRICS: &[(&str, &str, MetricAccessor)] = &[
     ("spread", "worst_spread", |r| r.spread),
     ("gap_ms", "worst_gap_ms", |r| r.gap_ms as f64),
-    ("migrations", "total_migrations", |r| r.migrations as f64),
     ("migration_ratio", "worst_migration_ratio", |r| {
         r.migration_ratio
     }),
     ("imbalance", "max_imbalance_ratio", |r| r.imbalance_ratio),
     ("dsq_depth", "max_dsq_depth", |r| r.max_dsq_depth as f64),
     ("stuck", "stuck_count", |r| r.stuck_count),
-    ("fallback", "total_fallback", |r| r.fallback_count as f64),
-    ("keep_last", "total_keep_last", |r| r.keep_last_count as f64),
+    (
+        "fallback_per_vcpu_sec",
+        "fallback_per_vcpu_sec",
+        fallback_per_vcpu_sec,
+    ),
+    (
+        "keep_last_per_vcpu_sec",
+        "keep_last_per_vcpu_sec",
+        keep_last_per_vcpu_sec,
+    ),
     // Distribution-kind roll-ups are ext_metrics-sourced (no typed field):
     // read them through the ext map, 0.0 when absent (the prior typed-field
     // default), mirroring the deleted `worst_*` accessors. The 0.0-on-absent

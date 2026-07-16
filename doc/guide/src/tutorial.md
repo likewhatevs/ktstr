@@ -459,7 +459,7 @@ ktstr_test 'throughput_gate' [sched=scx-ktstr] [topo=1n1l2c1t] failed:
 --- monitor ---
 samples=41 max_imbalance=2.00 max_dsq_depth=0 stuck=0
 avg: imbalance=1.32 nr_running/cpu=1.2 dsq/cpu=0.0
-events: fallback=0 (0.0/s) keep_last=210 (52.5/s) offline=0
+events: fallback=0 (0.0/vcpu-s) keep_last=210 (52.5/vcpu-s) offline=0
 ...
 verdict: monitor OK
 

@@ -553,6 +553,7 @@ struct Accumulator<'a> {
     sum_fallback_count: i64,
     sum_keep_last_count: i64,
     sum_total_iterations: u64,
+    max_host_dilation: Option<f64>,
     // sum_page_locality + sum_cross_node_mig removed: both NUMA roll-ups are now
     // ext-sourced (worst_page_locality = WorstLowest, worst_cross_node_migration_ratio
     // = WorstCrossNodeRatio), re-pooled from the per-phase carriers and
@@ -629,6 +630,7 @@ impl<'a> Accumulator<'a> {
             sum_fallback_count: 0,
             sum_keep_last_count: 0,
             sum_total_iterations: 0,
+            max_host_dilation: None,
             max_gap_ms: 0,
             max_imbalance_ratio: 0.0,
             max_max_dsq_depth: 0,
@@ -704,6 +706,12 @@ impl<'a> Accumulator<'a> {
         self.sum_total_iterations = self
             .sum_total_iterations
             .saturating_add(row.total_iterations);
+        if let Some(dilation) = row.host_dilation.filter(|d| d.is_finite()) {
+            self.max_host_dilation = Some(
+                self.max_host_dilation
+                    .map_or(dilation, |current| current.max(dilation)),
+            );
+        }
         // Peak-kind typed fields: cross-RUN aggregation surfaces
         // the worst-instant observed across the cohort, NOT the
         // arithmetic mean (which dilutes a single peak across
@@ -870,6 +878,7 @@ impl<'a> Accumulator<'a> {
             fallback_count: round_i64(acc.sum_fallback_count),
             keep_last_count: round_i64(acc.sum_keep_last_count),
             total_iterations: round_u64(acc.sum_total_iterations),
+            host_dilation: acc.max_host_dilation,
             ext_metrics,
             // Carry the Dynamic counter-key tags forward so a second-level
             // cross-RUN fold of these already-aggregated rows keeps SUM-folding
@@ -1167,48 +1176,9 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
             }
         })
         .collect();
-    // System-wide schedstat aggregates, read host-side from guest memory
-    // at freeze (zero observer effect; `MonitorSummary::schedstat_deltas`,
-    // summed across CPUs over the run). Keys ABSENT when CONFIG_SCHEDSTATS
-    // is off (schedstat_deltas == None): absent != 0 for a no-data run, and
-    // a 0 would pollute the cross-run Counter SUM and the Rate denominators
-    // (`total_pcount`, `total_ttwu_count`). All seven
-    // insert under one `if let` so each Rate's numerator/denominator pair is
-    // always co-present (derive_rate_metrics needs both). `u64 -> f64` is
-    // exact below 2^53 and inherently finite, so these skip the finite
-    // filter the payload keys go through. The registry entries are
-    // `Polarity::Informational` Counter raw components that feed nine
-    // `MetricKind::Rate` derivations (per-schedule: total_run_delay_ns_per_sched,
-    // ttwu_local_fraction, sched_goidle_fraction; per-second: run_delay_per_sec,
-    // pcount_per_sec, sched_count_per_sec, yld_count_per_sec, ttwu_count_per_sec,
-    // sched_goidle_per_sec); see [`crate::stats::METRICS`].
-    if let Some(sd) = sc
-        .monitor
-        .as_ref()
-        .and_then(|m| m.schedstat_deltas.as_ref())
-    {
-        ext_metrics.insert("total_run_delay".to_string(), sd.total_run_delay as f64);
-        ext_metrics.insert("total_pcount".to_string(), sd.total_pcount as f64);
-        ext_metrics.insert("total_sched_count".to_string(), sd.total_sched_count as f64);
-        ext_metrics.insert("total_yld_count".to_string(), sd.total_yld_count as f64);
-        ext_metrics.insert(
-            "total_sched_goidle".to_string(),
-            sd.total_sched_goidle as f64,
-        );
-        ext_metrics.insert("total_ttwu_count".to_string(), sd.total_ttwu_count as f64);
-        ext_metrics.insert("total_ttwu_local".to_string(), sd.total_ttwu_local as f64);
-        // Per-second Rate denominator: the schedstat-window span, co-inserted
-        // both-or-neither with the total_* numerators above so every *_per_sec
-        // schedstat Rate has its matching-window denominator present (the
-        // derive_rate_metrics num+den co-presence invariant; the same window the
-        // total_* deltas span, so num/den share a time base).
-        ext_metrics.insert(
-            "total_schedstat_wall_sec".to_string(),
-            sd.total_schedstat_wall_sec,
-        );
-    }
     // Run-level ext-only monitor metrics (avg_nr_running + the PELT IRQ load
-    // pair + the PSI-irq pair), folded from the run's MonitorSummary. Inserted
+    // pair + the PSI-irq pair + event/schedstat CPU-time components), folded
+    // from the run's MonitorSummary. Inserted
     // only when the run has monitor samples (a 0-sample run carries no
     // occupancy / IRQ signal — absent, not a false 0.0); the IRQ fields insert
     // only on Some (loud-absent on a kernel without the source). Shared with
@@ -1238,6 +1208,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         // identity, so they don't pair into a "budget 0" bucket.
         cpu_budget: (sc.cpu_budget != 0).then_some(sc.cpu_budget),
         vcpus: (sc.vcpus != 0).then_some(sc.vcpus),
+        host_dilation: sc.host_dilation.filter(|d| d.is_finite()),
         throughput_denomination: sc.throughput_denomination,
         passed: sc.is_pass(),
         skipped: sc.is_skip(),

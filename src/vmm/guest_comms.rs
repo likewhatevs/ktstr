@@ -696,13 +696,9 @@ pub fn send_bpf_map_write_ready() -> bool {
 /// Send a scenario-end marker. Payload: two LE u64s —
 /// `elapsed_ms` (since scenario start) followed by
 /// `total_iterations`, the final cumulative worker iteration count
-/// summed across every live handle at the LAST step's end. The host
-/// folds the iteration count into a synthetic terminal
-/// [`crate::timeline::StimulusEvent`] so the last step has a successor
-/// to diff its `iteration_rate` against — without it the final step's
-/// throughput is never computed (the per-phase rate is the delta
-/// between consecutive step events, and the last step has no following
-/// step event). Parsed host-side by
+/// summed across every live handle at the LAST step's end. The host preserves
+/// both values as terminal boundary telemetry; CPU-denominated iteration rates
+/// come from guest per-cgroup CPU-time carriers. Parsed host-side by
 /// [`crate::vmm::wire::parse_scenario_end`].
 pub fn send_scenario_end(elapsed_ms: u64, total_iterations: u64) {
     let mut payload = [0u8; crate::vmm::wire::SCENARIO_END_PAYLOAD_SIZE];

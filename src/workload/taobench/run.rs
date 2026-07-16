@@ -563,21 +563,21 @@ pub struct TaobenchStats {
     pub slow_ops: u64,
     /// Wall-clock window this stat covers, ns. Per-phase: the phase segment;
     /// whole-run: the run window. Merged as MAX (the window is shared by the
-    /// concurrent threads/workers being pooled, not summed). NOT the qps
+    /// concurrent threads/workers being pooled, not summed). NOT the throughput
     /// denominator anymore (that is `cpu_time_ns`); kept for the standalone /
     /// validate surface (upstream wall-qps shape) and as the window evidence
     /// from which the wall picture reconstructs exactly (`ops / elapsed`).
     pub elapsed_ns: u64,
     /// Σ client-thread `CLOCK_THREAD_CPUTIME_ID` over the window, ns — the
-    /// CPU time the clients actually received, the `taobench_*_qps` /
-    /// `taobench_*_ops_per_sec` DENOMINATOR. CPU-clock denominated so the
+    /// CPU time the clients actually received, the
+    /// `taobench_*_ops_per_cpu_sec` DENOMINATOR. CPU-clock denominated so the
     /// throughput measures the workload, not host/guest scheduling delay;
     /// under host dilation the wall picture is `cpu_rate / D` (the sidecar's
     /// `host_dilation`). Dispatcher (slow-path service) CPU is EXCLUDED —
     /// dispatchers model backing-store latency (mostly sleeping), and ops
     /// complete on client threads. Merged as SUM (per-thread CPU is
     /// disjoint, unlike the shared wall window). `#[serde(default)]`:
-    /// pre-field sidecars deserialize with 0 (the qps keys then read
+    /// pre-field sidecars deserialize with 0 (the throughput keys then read
     /// absent, never a false rate).
     #[serde(default)]
     pub cpu_time_ns: u64,
@@ -1091,8 +1091,8 @@ pub fn run_standalone(config: &TaobenchConfig, run_secs: u64) -> TaobenchStandal
 /// DENOMINATION: the qps fields here are WALL-clock (`ops / elapsed`) on
 /// purpose — this is the standalone/validate surface whose output shape must
 /// stay byte-identical to the reference taobench report. The ktstr sidecar's
-/// `taobench_*_qps` / `taobench_*_ops_per_sec` metrics are CPU-second
-/// denominated instead (see [`TaobenchStats::cpu_time_ns`]).
+/// `taobench_*_ops_per_cpu_sec` metrics are CPU-second denominated instead
+/// (see [`TaobenchStats::cpu_time_ns`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TaobenchStandaloneReport {
     /// (fast + slow) ops per second over the measured window.

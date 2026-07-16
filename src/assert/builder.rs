@@ -140,11 +140,11 @@ pub struct Assert {
     /// monitor threshold before a verdict is raised. Smooths out
     /// single-sample spikes.
     pub sustained_samples: Option<usize>,
-    /// Max `select_cpu_fallback` rate (events/sec). Fails if the
-    /// scx event counter delta over the run exceeds this rate.
+    /// Max `select_cpu_fallback` activity per average delivered vCPU
+    /// CPU-second. Fails if a sustained monitor interval exceeds this rate.
     pub max_fallback_rate: Option<f64>,
-    /// Max `keep_last` rate (events/sec). Fails if the scx event
-    /// counter delta over the run exceeds this rate.
+    /// Max `keep_last` activity per average delivered vCPU CPU-second.
+    /// Fails if a sustained monitor interval exceeds this rate.
     pub max_keep_last_rate: Option<f64>,
     /// Promote monitor threshold violations from report-only to
     /// pass/fail. When `false` (the default), the monitor still walks

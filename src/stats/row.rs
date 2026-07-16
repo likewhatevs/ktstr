@@ -57,6 +57,12 @@ pub struct GauntletRow {
     /// timing metrics are then host-contention-confounded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vcpus: Option<u32>,
+    /// Measured host scheduling dilation (`wall / delivered vCPU CPU time`).
+    /// CPU-denominated rates exclude it; genuinely wall-semantic latency and
+    /// upstream wall-throughput metrics retain it as explicit comparison
+    /// context. `None` when the run could not measure vCPU schedstat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_dilation: Option<f64>,
     /// Denomination of this row's workload-throughput rate metrics,
     /// carried from `SidecarResult::throughput_denomination`
     /// (`#[serde(default)]` = `Wall` for pre-marker rows). NOT an

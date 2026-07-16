@@ -1488,8 +1488,7 @@ fn overcommit_warning_severity_and_polarity() {
     assert!(
         m.contains("worst_iterations_per_cpu_sec"),
         "must point at the per-cgroup overcommit-invariant rate \
-         (worst_iterations_per_cpu_sec, matching the stats.rs compare hint); \
-         the bare iterations_per_cpu_sec is the pooled cohort rate: {m}",
+         (worst_iterations_per_cpu_sec, matching the stats.rs compare hint): {m}",
     );
     assert!(
         !m.contains("NOTHING opted into"),

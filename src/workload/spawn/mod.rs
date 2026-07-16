@@ -473,8 +473,8 @@ pub struct WorkerReport {
     /// [`wake_sample_total`](Self::wake_sample_total) for `timer_latencies_ns`.
     pub timer_sample_total: u64,
     /// Outer-loop iteration count. What `CgroupStats::total_iterations` sums
-    /// and what the derived throughput rates (`iterations_per_worker` /
-    /// `iterations_per_cpu_sec`) and `migration_ratio` divide by; NOT read by
+    /// and what the derived `iteration_rate`, `iterations_per_worker`, and
+    /// `migration_ratio` divide by; NOT read by
     /// the zero-work-units gate, which reads [`work_units`](Self::work_units). A
     /// `Custom` worker that wants the starvation / `min_work_units` gate
     /// honored must also populate [`work_units`](Self::work_units).
@@ -652,7 +652,7 @@ pub struct WorkerReport {
     pub phase_slices: Vec<PhaseSlice>,
     /// Whole-run taobench COUNTER aggregate — `Some` only for a Taobench worker,
     /// `None` otherwise. Shipped so the host can derive run-level qps/hit Rate keys
-    /// (`taobench_*_ops_per_sec` / `taobench_hit_fraction` /
+    /// (`taobench_*_ops_per_cpu_sec_whole` / `taobench_hit_fraction` /
     /// `taobench_command_hit_rate`) for `--noise-adjust` spread analysis. The
     /// per-phase `PhaseSlice::taobench` carriers feed the per-phase metrics + the
     /// serve-latency distribution; this whole-run carrier holds COUNTERS only

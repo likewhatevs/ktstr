@@ -136,9 +136,9 @@ fn assert_phase_pipeline(result: &VmResult) -> Result<()> {
     // produce 2× the sample_count.
     let drained_len = drained.len();
     let series = SampleSeries::from_drained_typed(drained, result.monitor.clone());
-    // The COMPLETE timeline (step frames + scenario-end terminal) via
-    // the shared accessor — folding only the raw wire Stimulus frames
-    // would omit the terminal and drop the last step's iteration_rate.
+    // The complete boundary timeline (step frames + scenario-end terminal)
+    // via the shared accessor. Iteration rates come from guest CPU-time
+    // carriers, not these wall-clock events.
     let stimulus = result.stimulus_timeline();
     let phases = ktstr::assert::build_phase_buckets_with_stimulus(&series, &stimulus);
 
@@ -462,18 +462,10 @@ fn phase_pipeline_three_step_e2e(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-/// First-and-last-step iteration_rate end-to-end: a Backdrop-PERSISTENT workload (workers
-/// that survive across Steps — the documented pattern for cross-phase
-/// throughput; see [`ktstr::timeline::StimulusEvent::total_iterations`])
-/// must yield an `iteration_rate` for BOTH the FIRST Step (the
-/// 0-baseline first stimulus frame previously collapsed to `None`
-/// and dropped the rate) AND the LAST Step (previously no
-/// successor frame existed to diff against). Boots a real guest under
-/// scx-ktstr so the full path is exercised: per-step stimulus emission,
-/// the widened `ScenarioEnd` terminal frame (final cumulative count
-/// captured coincident with its elapsed), and host aggregation — not
-/// just the synthetic-fixture unit path that previously bypassed
-/// `from_wire`.
+/// First-and-last-step iteration_rate end-to-end: a Backdrop-persistent
+/// workload must yield the CPU-denominated carrier rate for both edge steps.
+/// Boots a real guest under scx-ktstr so the per-phase carrier, host/guest
+/// phase join, and run aggregation are exercised.
 fn assert_iteration_rate_first_and_last(result: &VmResult) -> Result<()> {
     // Environmental starvation gate: zero real captures under a
     // witnessed-contended host is a non-verdict (the readiness-gated
@@ -485,23 +477,23 @@ fn assert_iteration_rate_first_and_last(result: &VmResult) -> Result<()> {
     anyhow::ensure!(
         result.periodic_fired >= 2,
         "periodic_fired = {} of {} — need a capture in each Step window \
-         so both the first and last Step produce a bucket the rate can \
-         attach to",
+         so both the first and last Step exercise the captured-bucket \
+         carrier join",
         result.periodic_fired,
         result.periodic_target,
     );
     // The framework-canonical per-phase buckets via the phase-buckets accessor:
     // one shared captures_series() drain folded through
-    // build_phase_buckets_with_stimulus over the COMPLETE timeline
-    // (step frames + scenario-end terminal). Identical to the manual
+    // build_phase_buckets_with_stimulus over the complete timeline
+    // (step frames + scenario-end terminal), then joined with the guest
+    // CPU-time carriers. Identical to the manual
     // drain+build oracle in `assert_phase_pipeline`, but it does NOT
     // drain the bridge out from under the framework's own stats.phases
     // build (the drain-once starvation fixed).
     let phases = result.phase_buckets();
 
     // FIRST step = lowest step_index >= 1 (Step[0] under the 1-indexed
-    // encoding). Its rate is the (first_frame -> second_frame) delta —
-    // the zero-baseline case fixed.
+    // encoding).
     let first = phases
         .iter()
         .filter(|p| p.step_index >= 1)
@@ -509,14 +501,13 @@ fn assert_iteration_rate_first_and_last(result: &VmResult) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no Step bucket present in phases"))?;
     anyhow::ensure!(
         first.metrics.contains_key("iteration_rate"),
-        "first Step (step_index {}) has no iteration_rate — the \
-         0-baseline first frame was dropped. metric keys = {:?}",
+        "first Step (step_index {}) has no carrier-derived iteration_rate. \
+         metric keys = {:?}",
         first.step_index,
         first.metrics.keys().collect::<Vec<_>>(),
     );
 
-    // LAST step = highest step_index. Its rate comes from the terminal
-    // ScenarioEnd frame — the last-step terminal case fixed.
+    // LAST step = highest step_index.
     let last = phases
         .iter()
         .filter(|p| p.step_index >= 1)
@@ -524,8 +515,7 @@ fn assert_iteration_rate_first_and_last(result: &VmResult) -> Result<()> {
         .expect("at least one Step bucket (checked above)");
     anyhow::ensure!(
         last.metrics.contains_key("iteration_rate"),
-        "last Step (step_index {}) has no iteration_rate — the \
-         scenario-end terminal frame did not supply its right boundary. \
+        "last Step (step_index {}) has no carrier-derived iteration_rate. \
          metric keys = {:?}",
         last.step_index,
         last.metrics.keys().collect::<Vec<_>>(),

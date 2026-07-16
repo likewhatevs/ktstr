@@ -433,15 +433,46 @@ fn irq_read_sample_arms_saturate_on_per_cpu_overflow() {
     );
 }
 
+#[test]
+fn guest_cpu_time_denominator_excludes_host_steal() {
+    use crate::monitor::dump::PerCpuTimeStats;
+
+    let first = vec![PerCpuTimeStats {
+        cpu: 0,
+        cpustat_user_ns: 100,
+        cpustat_idle_ns: 200,
+        cpustat_steal_ns: 300,
+        ..Default::default()
+    }];
+    let last = vec![PerCpuTimeStats {
+        cpu: 0,
+        cpustat_user_ns: 500,
+        cpustat_idle_ns: 800,
+        cpustat_steal_ns: 10_300,
+        ..Default::default()
+    }];
+    assert_eq!(
+        crate::assert::guest_cpu_time_delta_ns(&first, &last),
+        Some(1_000),
+        "400 user + 600 idle count; 10,000 steal ns must not dilute the rate",
+    );
+    let mut partial = last.clone();
+    partial[0].cpu = 1;
+    assert_eq!(
+        crate::assert::guest_cpu_time_delta_ns(&first, &partial),
+        None,
+        "a changed CPU-id set must suppress the rate rather than cross-pair it",
+    );
+}
+
 /// End-to-end per-phase fold for the IRQ Counter — the CI-runnable pair of
 /// the host-gated `irq_metrics_e2e` (no VM). A two-freeze `SampleSeries` with
 /// RISING per-CPU `irqs_sum` / NET_RX softirqs, both stamped the same step,
 /// builds one bucket carrying the cross-CPU last-minus-first DELTA
 /// (`total_hardirqs` = (400+500)-(100+200) = 600; `total_softirq_net_rx` =
-/// (40+60)-(10+20) = 70) plus the derived `hardirq_rate` = 600 / 3.0 s = 200
-/// (the wall-window co-insertion + `derive_rate_metrics`). The window is
-/// [1000, 4000] ms from `elapsed_ms` (no `boundary_offset_ms`), so
-/// `total_phase_wall_sec` = 3.0. A SINGLE-freeze phase yields `None` for the
+/// (40+60)-(10+20) = 70) plus `hardirqs_per_cpu_sec` = 600 / 6 CPU-s = 100.
+/// Each of the two guest CPUs advances 3 CPU-s. A SINGLE-freeze phase yields
+/// `None` for the
 /// counter (a delta is unmeasurable from one point) and therefore no rate —
 /// proving the absent-vs-zero contract through the whole `read_sample` ->
 /// aggregate -> bucket pipeline.
@@ -453,11 +484,12 @@ fn irq_counter_folds_per_phase_delta_and_rate() {
     use crate::scenario::sample::SampleSeries;
     use crate::scenario::snapshot::{DrainedSnapshotEntry, MissingStatsReason};
 
-    let cpu = |cpu: u32, irqs_sum: u64, net_rx: u64| {
+    let cpu = |cpu: u32, irqs_sum: u64, net_rx: u64, cpu_time_ns: u64| {
         let mut softirqs = [0u64; NR_SOFTIRQS];
         softirqs[SOFTIRQ_NET_RX] = net_rx;
         PerCpuTimeStats {
             cpu,
+            cpustat_user_ns: cpu_time_ns,
             irqs_sum,
             softirqs,
             ..Default::default()
@@ -480,8 +512,18 @@ fn irq_counter_folds_per_phase_delta_and_rate() {
     // Two freezes 3_000 ms apart in the SAME stamped step -> one bucket.
     let two = SampleSeries::from_drained_typed(
         vec![
-            freeze("periodic_000", 1_000, cpu(0, 100, 10), cpu(1, 200, 20)),
-            freeze("periodic_001", 4_000, cpu(0, 400, 40), cpu(1, 500, 60)),
+            freeze(
+                "periodic_000",
+                1_000,
+                cpu(0, 100, 10, 1_000_000_000),
+                cpu(1, 200, 20, 1_000_000_000),
+            ),
+            freeze(
+                "periodic_001",
+                4_000,
+                cpu(0, 400, 40, 4_000_000_000),
+                cpu(1, 500, 60, 4_000_000_000),
+            ),
         ],
         None,
     );
@@ -501,9 +543,9 @@ fn irq_counter_folds_per_phase_delta_and_rate() {
         "cross-CPU NET_RX delta: (40+60)-(10+20)",
     );
     assert_eq!(
-        bucket.get("hardirq_rate"),
-        Some(200.0),
-        "600 hardirqs / 3.0 s capture window",
+        bucket.get("hardirqs_per_cpu_sec"),
+        Some(100.0),
+        "600 hardirqs / 6 delivered guest CPU-s",
     );
 
     // A single freeze in the phase: the Counter delta is unmeasurable from
@@ -512,8 +554,8 @@ fn irq_counter_folds_per_phase_delta_and_rate() {
         vec![freeze(
             "periodic_000",
             1_000,
-            cpu(0, 100, 10),
-            cpu(1, 200, 20),
+            cpu(0, 100, 10, 1_000_000_000),
+            cpu(1, 200, 20, 1_000_000_000),
         )],
         None,
     );
@@ -528,7 +570,7 @@ fn irq_counter_folds_per_phase_delta_and_rate() {
         "single-freeze phase: counter delta unmeasurable -> None",
     );
     assert_eq!(
-        bucket.get("hardirq_rate"),
+        bucket.get("hardirqs_per_cpu_sec"),
         None,
         "no counter component -> no rate co-insertion",
     );
@@ -537,13 +579,13 @@ fn irq_counter_folds_per_phase_delta_and_rate() {
 /// Run-level IRQ rate must NOT inflate on a MULTI-phase run (regression guard
 /// for the num/den time-base mismatch). The run-level numerator total_hardirqs
 /// is the DIRECT whole-run delta (populate_run_ext_metrics: read_sample over
-/// ALL freezes); the matching denominator total_phase_wall_sec must be the
-/// WHOLE-RUN freeze span (inserted by that same direct path), NOT the
+/// ALL freezes); the matching delivered-CPU denominator must use the
+/// WHOLE-RUN freeze endpoints, NOT the
 /// Σ-per-phase-capture span (which excludes the cross-capture gap the numerator
 /// counts). Two phases capturing [1s,4s] and [6s,9s] with the gap [4s,6s]
 /// carrying real (counted) IRQ activity: whole-run Δ = 900-100 = 800; whole-run
-/// span = 9-1 = 8 s → hardirq_rate = 100/s. The buggy Σ-phase denominator would
-/// be (4-1)+(9-6) = 6 s → 133.3/s (inflated 8/6). Calls BOTH run-level populate
+/// CPU span = 9-1 = 8 CPU-s → hardirqs_per_cpu_sec = 100. The buggy
+/// Σ-phase denominator would be 6 CPU-s → 133.3. Calls BOTH run-level populate
 /// fns in eval order to pin the real production path.
 #[test]
 fn run_level_irq_rate_uses_whole_run_span_not_phase_sum() {
@@ -560,6 +602,7 @@ fn run_level_irq_rate_uses_whole_run_span_not_phase_sum() {
             per_cpu_time: vec![PerCpuTimeStats {
                 cpu: 0,
                 irqs_sum,
+                cpustat_user_ns: elapsed_ms * 1_000_000,
                 ..Default::default()
             }],
             ..Default::default()
@@ -596,15 +639,15 @@ fn run_level_irq_rate_uses_whole_run_span_not_phase_sum() {
     );
     // Denominator = whole-run freeze span (9-1=8 s), NOT Σ-per-phase (3+3=6 s).
     assert_eq!(
-        ext.get("total_phase_wall_sec").copied(),
+        ext.get("total_phase_guest_cpu_sec").copied(),
         Some(8.0),
         "whole-run span 8 s, not the Σ-per-phase 6 s",
     );
     // Rate = 800/8 = 100, NOT the inflated 800/6 = 133.3.
     let rate = ext
-        .get("hardirq_rate")
+        .get("hardirqs_per_cpu_sec")
         .copied()
-        .expect("hardirq_rate derived at run level");
+        .expect("hardirqs_per_cpu_sec derived at run level");
     assert!(
         (rate - 100.0).abs() < 1e-9,
         "whole-run rate 800/8s=100, not the mismatched 800/6s=133.3; got {rate}",
@@ -616,7 +659,7 @@ fn run_level_irq_rate_uses_whole_run_span_not_phase_sum() {
 /// at 1s and 9s): each phase's within-window delta is `None` (a delta needs >=2
 /// freezes), so a per-phase-summed numerator would be absent → no run-level
 /// rate. The direct whole-run path still measures Δ = 500-100 = 400 over the
-/// [1s,9s] = 8 s span → hardirq_rate = 50/s. The rate's floor is >=2 TOTAL
+/// [1s,9s] = 8 CPU-s span → hardirqs_per_cpu_sec = 50. The rate's floor is >=2 TOTAL
 /// freezes (== the count's floor), NOT >=2 per phase.
 #[test]
 fn run_level_irq_rate_survives_sparse_multi_phase() {
@@ -633,6 +676,7 @@ fn run_level_irq_rate_survives_sparse_multi_phase() {
             per_cpu_time: vec![PerCpuTimeStats {
                 cpu: 0,
                 irqs_sum,
+                cpustat_user_ns: elapsed_ms * 1_000_000,
                 ..Default::default()
             }],
             ..Default::default()
@@ -669,12 +713,12 @@ fn run_level_irq_rate_survives_sparse_multi_phase() {
         "whole-run delta survives where per-phase deltas vanish",
     );
     assert_eq!(
-        ext.get("total_phase_wall_sec").copied(),
+        ext.get("total_phase_guest_cpu_sec").copied(),
         Some(8.0),
         "whole-run span 9-1=8 s",
     );
     let rate = ext
-        .get("hardirq_rate")
+        .get("hardirqs_per_cpu_sec")
         .copied()
         .expect("rate derives where a phase-summed numerator would vanish");
     assert!((rate - 50.0).abs() < 1e-9, "400/8s=50; got {rate}");
@@ -1854,11 +1898,15 @@ fn every_metric_has_kind_consistent_with_naming() {
         // signal (select the least-bad cgroup, mask the starved one); such a
         // metric must first make the lowest-wins fold polarity-aware.
         if matches!(m.kind, MetricKind::WorstLowest { .. }) {
-            assert_eq!(
-                m.polarity,
-                crate::test_support::Polarity::HigherBetter,
-                "WorstLowest-kind metric {:?} must be HigherBetter \
-                     (the lowest-wins fold treats lowest as worst); got {:?}",
+            assert!(
+                matches!(
+                    m.polarity,
+                    crate::test_support::Polarity::HigherBetter
+                        | crate::test_support::Polarity::Informational
+                ),
+                "WorstLowest-kind metric {:?} must be HigherBetter or \
+                 Informational (the lowest-wins selector is never valid for a \
+                 directional LowerBetter metric); got {:?}",
                 m.name,
                 m.polarity,
             );
@@ -1945,7 +1993,7 @@ fn every_metric_has_kind_consistent_with_naming() {
         // starvation signal selected lowest-wins), NOT a Σnum/Σdenom pooled
         // rate — so it is correctly NOT a Rate and keeps its accurate
         // `_per_cpu_sec` name. (The pooled cohort rate IS a Rate, under the
-        // distinct name `iterations_per_cpu_sec`.)
+        // distinct name `iteration_rate`.)
         let looks_like_rate = m.name.ends_with("_rate")
             || m.name.contains("_per_sec")
             || m.name.contains("_per_cpu_sec");
@@ -1955,7 +2003,7 @@ fn every_metric_has_kind_consistent_with_naming() {
         // mean-of-ratios bug this gate guards cannot apply.
         // schbench_loops_per_cpu_sec is the PER-PHASE CPU-second throughput
         // (derived at the producer from one phase's loop_count /
-        // worker_cpu_ns, like the taobench per-phase qps) — PerPhase is
+        // worker_cpu_ns, like the Taobench per-phase CPU throughput) — PerPhase is
         // skipped at the cross-run ext fold, so the mean-of-ratios bug this
         // gate guards cannot apply; the pooled cohort rate IS a Rate under
         // the distinct name `schbench_total_loops_per_cpu_sec`.
@@ -1963,6 +2011,12 @@ fn every_metric_has_kind_consistent_with_naming() {
             && m.name != "worst_iterations_per_cpu_sec"
             && m.name != "taobench_hit_rate"
             && m.name != "schbench_loops_per_cpu_sec"
+            && !matches!(
+                m.name,
+                "taobench_total_ops_per_cpu_sec"
+                    | "taobench_fast_ops_per_cpu_sec"
+                    | "taobench_slow_ops_per_cpu_sec"
+            )
         {
             assert!(
                 matches!(m.kind, MetricKind::Rate { .. }),

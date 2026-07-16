@@ -4013,7 +4013,7 @@ mod tests {
         fn good_test_func(_: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
         }
-        const GATE: PerfDeltaAssertion = PerfDeltaAssertion::new("total_phase_iterations");
+        const GATE: PerfDeltaAssertion = PerfDeltaAssertion::new("total_iterations_pooled");
         let entry = KtstrTestEntry {
             name: "gate_suppressed_component",
             func: good_test_func,
@@ -4026,7 +4026,7 @@ mod tests {
             .expect_err("a render-suppressed component gate must be rejected");
         let msg = format!("{err}");
         assert!(
-            msg.contains("total_phase_iterations") && msg.contains("render-suppressed"),
+            msg.contains("total_iterations_pooled") && msg.contains("render-suppressed"),
             "expected render-suppressed-component diagnostic, got: {msg}",
         );
     }

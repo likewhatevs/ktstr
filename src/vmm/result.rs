@@ -732,12 +732,9 @@ impl VmResult {
     /// [`crate::timeline::StimulusEvent::terminal`]).
     ///
     /// Fold THIS through
-    /// [`crate::assert::build_phase_buckets_with_stimulus`] — it is the
-    /// SAME timeline the framework's own `evaluate_vm_result` builds,
-    /// so the LAST step gets an `iteration_rate` (the terminal supplies
-    /// its right boundary). A hand-rolled map over only the guest
-    /// `Stimulus` frames would omit the terminal and silently drop the
-    /// final step's rate.
+    /// [`crate::assert::build_phase_buckets_with_stimulus`] to reproduce the
+    /// same phase windows and boundary telemetry as `evaluate_vm_result`.
+    /// Iteration rates are joined separately from guest CPU-time carriers.
     ///
     /// Non-destructive: reads the already-drained `guest_messages` TLV
     /// log (unlike the bridge-cache accessors [`Self::captures_series`]
@@ -762,8 +759,7 @@ impl VmResult {
                 }
                 Some(wire::MsgType::StepEnd) => {
                     // Per-step end-of-hold frame (reuses the StimulusPayload
-                    // body). Paired with its StepStart for step-local
-                    // iteration_rate in build_phase_buckets_with_stimulus.
+                    // body). Retained as raw boundary telemetry.
                     if let Some(ev) = wire::StimulusEvent::from_payload(&entry.payload) {
                         out.push(crate::timeline::StimulusEvent::from_step_end(&ev));
                     }
@@ -784,69 +780,49 @@ impl VmResult {
         out
     }
 
-    /// Worker-iteration throughput (iterations/sec) for one scenario
-    /// [`Phase`](crate::assert::Phase), from the stimulus timeline's
-    /// `StepStart[k]` -> `StepEnd[k]` step-local window (the per-event rate
-    /// via [`crate::timeline::StimulusEvent::rate_to`]).
+    /// Worker-iteration efficiency (iterations per delivered guest CPU-second)
+    /// for one scenario [`Phase`](crate::assert::Phase).
     ///
-    /// `None` when the phase has no `StepStart` ([`crate::assert::Phase::BASELINE`], or a
-    /// step the run never reached), no right boundary (no `StepEnd`, no
-    /// later step, and no scenario-end terminal), or the rate is
-    /// unmeasurable (zero-length window / counter went backward). A step
-    /// whose workers made zero forward progress over a positive hold
-    /// returns `Some(0.0)` (measured zero), not `None`.
+    /// This is an ergonomic alias for the canonical per-phase
+    /// `iteration_rate`; it is not a second wall-throughput calculation.
+    /// Both the iteration numerator and delivered-CPU denominator come from
+    /// the same guest per-cgroup phase carriers, so host preemption does not
+    /// dilute the result.
     ///
-    /// Collapse-immune: the stimulus timeline carries per-step boundaries
-    /// independent of the periodic-capture pipeline, so this works even for
-    /// `--cell-parent-cgroup` schedulers where the capture-derived
-    /// [`PhaseBucket`](crate::assert::PhaseBucket) path can collapse.
+    /// `None` when the phase has no guest carrier or its workers accumulated
+    /// no measurable CPU time. A measured zero iteration count over positive
+    /// CPU time returns `Some(0.0)`.
     pub fn step_throughput(&self, phase: crate::assert::Phase) -> Option<f64> {
-        Self::step_throughput_in(&self.stimulus_timeline(), phase)
+        Self::step_throughput_in(&self.phase_buckets(), phase)
     }
 
     /// Ratio `step_throughput(a) / step_throughput(b)` — e.g.
-    /// scheduler-vs-EEVDF throughput when phase `b` runs on the detached
+    /// scheduler-vs-EEVDF iteration efficiency when phase `b` runs on the detached
     /// kernel default ([`crate::scenario::ops::Op::detach_scheduler`]).
-    /// Walks the stimulus timeline once. `None` when either phase has no
-    /// measurable throughput; a `Some(0.0)` denominator yields `inf` so a
-    /// collapsed/stalled phase `b` surfaces rather than vanishing to `None`.
+    /// Builds the canonical phase buckets once. `None` when either phase has
+    /// no measurable rate; a `Some(0.0)` denominator yields `inf` so a stalled
+    /// phase `b` surfaces rather than vanishing to `None`.
     pub fn throughput_ratio(
         &self,
         a: crate::assert::Phase,
         b: crate::assert::Phase,
     ) -> Option<f64> {
-        let timeline = self.stimulus_timeline();
-        let ta = Self::step_throughput_in(&timeline, a)?;
-        let tb = Self::step_throughput_in(&timeline, b)?;
+        let buckets = self.phase_buckets();
+        let ta = Self::step_throughput_in(&buckets, a)?;
+        let tb = Self::step_throughput_in(&buckets, b)?;
         Some(ta / tb)
     }
 
     /// Shared core for [`Self::step_throughput`] / [`Self::throughput_ratio`]
-    /// over an already-built timeline: pair the phase's `StepStart` with its
-    /// own `StepEnd` (step-local), falling back to the next step's
-    /// `StepStart` then the scenario-end terminal for the last step on
-    /// legacy/sched-died data that lacks a `StepEnd`. Mirrors the boundary
-    /// selection in [`crate::timeline::Timeline::build`].
+    /// over already-built canonical phase buckets.
     fn step_throughput_in(
-        timeline: &[crate::timeline::StimulusEvent],
+        buckets: &[crate::assert::PhaseBucket],
         phase: crate::assert::Phase,
     ) -> Option<f64> {
-        let start = timeline
+        buckets
             .iter()
-            .find(|e| !e.is_terminal && !e.is_step_end && e.phase() == Some(phase))?;
-        let end = timeline
-            .iter()
-            .find(|e| e.is_step_end && e.phase() == Some(phase))
-            .or_else(|| {
-                timeline
-                    .iter()
-                    .filter(|e| {
-                        !e.is_terminal && !e.is_step_end && e.phase().is_some_and(|p| p > phase)
-                    })
-                    .min_by_key(|e| e.elapsed_ms)
-            })
-            .or_else(|| timeline.iter().find(|e| e.is_terminal))?;
-        start.rate_to(end)
+            .find(|b| b.step_index == phase.as_u16())
+            .and_then(|b| b.get("iteration_rate"))
     }
 
     /// The guest-side [`crate::assert::AssertResult`] decoded from this
@@ -869,7 +845,7 @@ impl VmResult {
     ///
     /// This is the GUEST view: the run-level distribution / `ext_metrics`
     /// re-pools (`worst_*` wake-latency / run-delay aggregates, pooled
-    /// `iterations_per_cpu_sec`) are applied HOST-side in `evaluate_vm_result`
+    /// `iteration_rate`) are applied HOST-side in `evaluate_vm_result`
     /// AFTER the body returns and are NOT on this value — only
     /// `stats.phases[].per_cgroup` and the per-cgroup `stats.cgroups`
     /// reductions are guest-authoritative. For the per-phase per-cgroup view
@@ -937,16 +913,10 @@ impl VmResult {
     /// [`Self::periodic_series`] + [`Self::stimulus_timeline`] with the guest
     /// per-cgroup carriers folded in, BEFORE the per-phase scalar derivation
     /// [`Self::phase_buckets`] applies. This is the exact phase state the eval
-    /// layer feeds to the run-level ext-metrics population
-    /// (`populate_run_ext_metrics_from_phases` runs on the pre-derive phases;
-    /// `derive_phase_metrics` runs AFTER, inside `evaluate_vm_result`), so
-    /// [`Self::run_metric`] reuses it to reproduce that sequence by construction
-    /// (eval-faithful): post-derive phases yield the same run-level map today (the
-    /// run-level phase fold skips `is_derived` keys, and the pooled scalars
-    /// `derive_phase_metrics` adds are all `PerPhase`), but the pre-derive fold
-    /// avoids depending on that skip, so a pooled key ever registered as
-    /// non-derived cannot diverge `run_metric` from the eval map. Non-destructive
-    /// on the snapshot bridge, like [`Self::phase_buckets`].
+    /// layer feeds to [`crate::assert::populate_run_ext_all`].
+    /// [`Self::run_metric`] reuses it, and that helper performs the same
+    /// idempotent phase derivation as the eval path before folding run metrics.
+    /// Non-destructive on the snapshot bridge, like [`Self::phase_buckets`].
     fn phase_buckets_pre_derive(&self) -> Vec<crate::assert::PhaseBucket> {
         let host = crate::assert::build_phase_buckets_with_stimulus(
             &self.periodic_series(),
@@ -983,14 +953,14 @@ impl VmResult {
     }
 
     /// One framework-computed per-phase metric for `phase` — the
-    /// metric-name analog of [`Self::step_throughput`] /
+    /// general metric-name form of [`Self::step_throughput`] /
     /// [`Self::throughput_ratio`]. Resolves `metric` (any `impl Into<MetricId>` —
     /// a typed `BuiltinMetric`, typo-proof, or a dynamic scheduler-runtime
     /// string) from the folded
     /// [`Self::phase_buckets`] bucket for `phase`, checking two stores:
     /// 1. [`crate::assert::PhaseBucket::metrics`] (via
     ///    [`crate::assert::PhaseBucket::get`]) — the host-folded
-    ///    per-sample / monitor / stimulus metrics: per-phase CPU time
+    ///    per-sample / monitor / guest-carrier metrics: per-phase CPU time
     ///    (`system_time_ns`, `user_time_ns`), scheduling quality
     ///    (`avg_imbalance_ratio`, `avg_dsq_depth`, ...), and
     ///    `iteration_rate`.
@@ -1026,8 +996,8 @@ impl VmResult {
     /// per-cgroup counter returns `Some(0.0)` when carriers exist but
     /// counted zero, `None` only when the phase has no carrier at all. A
     /// started-but-uncaptured step (a `StepStart` with zero captures) DOES
-    /// produce a synthesized bucket, so `phase_metric` returns its
-    /// stimulus-derived `iteration_rate` rather than `None`.
+    /// produce a synthesized bucket, and `phase_metric` can still return its
+    /// guest-carrier-derived `iteration_rate`.
     ///
     /// ```ignore
     /// // Typed (typo-proof) is the primary form; a dynamic scheduler-runtime
@@ -1053,7 +1023,7 @@ impl VmResult {
     /// One run-level extensible ("ext") metric by name — the whole-run analog of
     /// [`Self::phase_metric`], for a `post_vm` callback asserting a run-level
     /// aggregate (e.g. `avg_irq_util`, `max_cpu_hardirqs`,
-    /// `worst_p99_wake_latency_us`, `iterations_per_cpu_sec`). SELF-COMPUTES the
+    /// `worst_p99_wake_latency_us`, `iteration_rate`). SELF-COMPUTES the
     /// run-level `ext_metrics` map exactly as the framework's `evaluate_vm_result`
     /// does — a [`VmResult`](Self) carries no stored run-level stats (`post_vm`
     /// runs BEFORE the host populates them) — by replaying the shared
@@ -1069,7 +1039,7 @@ impl VmResult {
     /// phase-only ext metrics (`avg_imbalance_ratio`, `iteration_rate`,
     /// `system_time_ns`, `user_time_ns`, the IRQ counters/rates, the per-CPU
     /// spatial maxes `max_cpu_hardirqs` / `max_cpu_softirq_net_rx` and their
-    /// concentrations), the pooled `iterations_per_cpu_sec`, and the run-level
+    /// concentrations), the pooled `iteration_rate`, and the run-level
     /// `Distribution` / `WorstLowest` / `WakeLatencyTailRatio` / `WorstCrossNodeRatio`
     /// re-pools — and for
     /// those keys the two accessors return identical values (this one
@@ -2134,60 +2104,43 @@ mod tests {
         assert_eq!(d, None, "zero on-cpu -> None, not a synthetic 1.0");
     }
 
-    /// A StepStart/StepEnd/terminal `StimulusEvent` for the
-    /// `step_throughput_in` pairing tests.
-    fn ev(
-        elapsed_ms: u64,
-        step_index: Option<u16>,
-        iters: Option<u64>,
-        is_step_end: bool,
-        is_terminal: bool,
-    ) -> crate::timeline::StimulusEvent {
-        crate::timeline::StimulusEvent {
-            elapsed_ms,
-            label: String::new(),
-            op_kind: None,
-            detail: None,
-            total_iterations: iters,
-            step_index,
-            is_terminal,
-            is_step_end,
-        }
-    }
-
-    /// `step_throughput_in` pairs `StepStart[k]` -> `StepEnd[k]` of the SAME
-    /// `Phase` for the step-local rate; falls back to the next step then the
-    /// scenario-end terminal when a StepEnd is absent; a flat counter over a
-    /// positive window is measured-zero `Some(0.0)` (not `None`); BASELINE /
-    /// an absent step is `None`.
+    /// `step_throughput_in` reads the canonical CPU-denominated
+    /// `iteration_rate`; it neither reconstructs nor exposes a wall rate.
     #[test]
-    fn step_throughput_in_pairs_step_local_and_handles_edges() {
+    fn step_throughput_in_reads_canonical_iteration_rate() {
         use crate::assert::Phase;
-        let tl = vec![
-            ev(0, Some(1), Some(0), false, false),       // StepStart[0]
-            ev(1000, Some(1), Some(5000), true, false),  // StepEnd[0] -> 5000/s
-            ev(1100, Some(2), Some(5000), false, false), // StepStart[1]
-            ev(2100, Some(2), Some(5000), true, false),  // StepEnd[1] -> 0/s (flat)
-            ev(2200, Some(3), Some(5000), false, false), // StepStart[2] (no StepEnd)
-            crate::timeline::StimulusEvent::terminal(3200, 11000), // right boundary for step 2
+        let buckets = vec![
+            crate::assert::PhaseBucket {
+                step_index: 1,
+                metrics: [("iteration_rate".to_string(), 5_000.0)]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            crate::assert::PhaseBucket {
+                step_index: 2,
+                metrics: [("iteration_rate".to_string(), 0.0)].into_iter().collect(),
+                ..Default::default()
+            },
+            crate::assert::PhaseBucket {
+                step_index: 3,
+                ..Default::default()
+            },
         ];
-        // Step 0: (5000-0)/1s = 5000/s.
         assert_eq!(
-            VmResult::step_throughput_in(&tl, Phase::step(0)),
+            VmResult::step_throughput_in(&buckets, Phase::step(0)),
             Some(5000.0)
         );
-        // Step 1: counter flat over a positive window -> measured zero
-        // Some(0.0), NOT None.
-        assert_eq!(VmResult::step_throughput_in(&tl, Phase::step(1)), Some(0.0));
-        // Step 2: no StepEnd -> falls back to the terminal:
-        // (11000-5000)/1s = 6000/s.
         assert_eq!(
-            VmResult::step_throughput_in(&tl, Phase::step(2)),
-            Some(6000.0)
+            VmResult::step_throughput_in(&buckets, Phase::step(1)),
+            Some(0.0),
         );
-        // BASELINE and an absent step have no StepStart -> None.
-        assert_eq!(VmResult::step_throughput_in(&tl, Phase::BASELINE), None);
-        assert_eq!(VmResult::step_throughput_in(&tl, Phase::step(9)), None);
+        assert_eq!(VmResult::step_throughput_in(&buckets, Phase::step(2)), None);
+        assert_eq!(
+            VmResult::step_throughput_in(&buckets, Phase::BASELINE),
+            None
+        );
+        assert_eq!(VmResult::step_throughput_in(&buckets, Phase::step(9)), None);
     }
 
     #[test]
