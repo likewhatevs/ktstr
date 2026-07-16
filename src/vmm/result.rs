@@ -1132,7 +1132,8 @@ impl VmResult {
     /// (`better_than` / `by_at_least`) records the outcome into `verdict`.
     /// "Better" is oriented from the registry polarity, so the SAME call works
     /// for a LowerBetter latency (`BuiltinMetric::WakeupP99LatencyUs`) and a
-    /// HigherBetter throughput (`BuiltinMetric::SchbenchLoopCount`) with no
+    /// HigherBetter CPU-normalized throughput
+    /// (`BuiltinMetric::SchbenchLoopsPerCpuSec`) with no
     /// caller-specified direction.
     ///
     /// A post_vm callback collapses the verdict to its `anyhow::Result` via
