@@ -39,7 +39,7 @@ jobs:
   lint:
     runs-on: [ktstr-x64]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.0
       - name: Provision Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -58,13 +58,13 @@ jobs:
     env:
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.0
       - name: Provision Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
       - run: cargo install just
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.83.2
         with:
           tool: cargo-nextest
       - run: just compile-fail
@@ -95,7 +95,7 @@ jobs:
   devdep-isolation:
     runs-on: [ktstr-x64]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.0
       - name: Provision Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -107,7 +107,7 @@ jobs:
   docs-link-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.0
       - uses: ./.github/actions/setup
         with:
           tools: mdbook@0.5,lychee@0.20
@@ -124,13 +124,13 @@ jobs:
     env:
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.0
       - name: Provision Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
       - run: cargo install just
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.83.2
         with:
           tool: cargo-nextest
       - run: just kernel-build ${{ matrix.kernel-version }}
@@ -141,7 +141,7 @@ jobs:
         run: just stats
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: target/nextest/ci/junit.xml
@@ -158,13 +158,13 @@ jobs:
       CARGO_BUILD_JOBS: "32"
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.0
       - name: Provision Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
       - run: cargo install just
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.83.2
         with:
           tool: cargo-nextest
       - run: just kernel-build ${{ matrix.kernel-version }}
@@ -175,7 +175,7 @@ jobs:
         run: just stats
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: target/nextest/ci/junit.xml
@@ -197,13 +197,13 @@ jobs:
         runner: [ktstr-x64, ktstr-arm64]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.0
       - name: Provision Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
       - run: cargo install just
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.83.2
         with:
           tool: cargo-nextest
       - run: just test-distro-resolve
@@ -223,13 +223,13 @@ jobs:
     env:
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.0
       - name: Provision Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
       - run: cargo install just
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.83.2
         with:
           tool: cargo-nextest
       # Build the kernel the hermetic local-package boot repacks.
@@ -246,13 +246,13 @@ jobs:
       CARGO_BUILD_JOBS: "32"
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.0
       - name: Provision Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
       - run: cargo install just
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.83.2
         with:
           tool: cargo-nextest
       - run: just kernel-build 6.14
@@ -266,13 +266,13 @@ jobs:
     env:
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.0
       - name: Provision Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
       - run: cargo install just
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.83.2
         with:
           tool: cargo-llvm-cov,cargo-nextest
       - run: just kernel-build 7.1
@@ -280,7 +280,7 @@ jobs:
       - if: ${{ !cancelled() }}
         run: just sccache-stats
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
@@ -292,13 +292,13 @@ jobs:
       CARGO_BUILD_JOBS: "32"
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.0
       - name: Provision Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
       - run: cargo install just
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.83.2
         with:
           tool: cargo-llvm-cov,cargo-nextest
       - run: just kernel-build 7.1
@@ -306,7 +306,7 @@ jobs:
       - if: ${{ !cancelled() }}
         run: just sccache-stats
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info

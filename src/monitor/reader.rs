@@ -3555,11 +3555,14 @@ pub(crate) fn monitor_loop(
                     architectural_page_offset = val;
                     page_offset_resolved = true;
                 }
-            } else {
-                // No symbol available (aarch64 / stripped vmlinux):
-                // derive PAGE_OFFSET from the live TCR_EL1. The BSP may
-                // populate the cached register after monitor construction,
-                // so update this architectural input per tick.
+            } else if refresh.memstart_addr_kva.is_some() {
+                // On aarch64, derive PAGE_OFFSET from the live TCR_EL1. The
+                // BSP may populate the cached register after monitor
+                // construction, so update this architectural input per tick.
+                // `memstart_addr_kva` is the architecture discriminator here:
+                // host-side fixtures and stripped kernels without either
+                // arm64 symbol must retain the pre-loop `page_offset`, as the
+                // RqRefresh contract promises.
                 architectural_page_offset = super::symbols::default_page_offset_for_tcr(
                     refresh
                         .tcr_el1
@@ -3567,6 +3570,11 @@ pub(crate) fn monitor_loop(
                         .map(|c| c.load(Ordering::Acquire))
                         .unwrap_or(0),
                 );
+                page_offset_resolved = true;
+            } else {
+                // No live page-offset inputs are available. Keep the
+                // construction-time value rather than interpreting a missing
+                // TCR_EL1 as an arm64 TCR value.
                 page_offset_resolved = true;
             }
 

@@ -28,16 +28,16 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.0
       - uses: ./.github/actions/setup
         with:
           tools: just,mdbook
       - run: cargo install mdbook-linkcheck2 --locked
       - run: just site
 
-      - uses: actions/upload-pages-artifact@v5
+      - uses: actions/upload-pages-artifact@v5.0.0
         with:
           path: _site
 
       - id: deploy
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@v5.0.0
